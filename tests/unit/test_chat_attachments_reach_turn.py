@@ -53,8 +53,9 @@ def _upload(store, uid, data, purpose='reel_source', mime='video/mp4', name='VID
 
 
 def _ref(xid, purpose='reel_source', mime='video/mp4', name='VID.mp4'):
-    return {'kind': 'peerlink_file', 'ref': xid, 'purpose': purpose, 'name': name,
-            'mime': mime, 'size': 10, 'captured_at': 1_760_000_000_000}
+    """One attachments row in the documented shape (amendment A9 a)."""
+    return {'file_id': xid, 'sha256': xid, 'name': name, 'mime': mime, 'size': 10,
+            'purpose': purpose, 'captured_at': 1_760_000_000_000}
 
 
 @pytest.fixture
@@ -188,7 +189,16 @@ def test_a_turn_without_attachments_binds_nothing(phone, monkeypatch):
     assert phone.seen['clips'] == []
 
 
-@pytest.mark.parametrize('junk', ['a' * 64, {'ref': 'a' * 64}, [None, 'x'], 42])
+def test_the_retired_kind_ref_shape_binds_nothing(phone):
+    """One attachments shape (amendment A9 a): {kind, ref} is not read."""
+    a = _upload(phone.store, TOKEN_USER, b'retired' * 80)
+    phone.post([{'kind': 'peerlink_file', 'ref': a, 'purpose': 'reel_source'}])
+    assert phone.seen['where'] == 'gather_info'
+    assert phone.seen['clips'] == []
+    assert phone.store.resolve(TOKEN_USER, a).request_id is None
+
+
+@pytest.mark.parametrize('junk', ['a' * 64, {'file_id': 'a' * 64}, [None, 'x'], 42])
 def test_malformed_attachments_never_break_the_turn(phone, junk):
     phone.post(junk)
     assert phone.seen['where'] == 'gather_info'

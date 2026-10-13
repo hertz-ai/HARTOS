@@ -2,13 +2,19 @@
 
 Reel Studio (plan WS-8a).  The phone uploads clips, a logo and song audio
 into the user file store (core.user_file_store) over its device link, and a
-/chat turn carries only references to them (plan 4.2(e))::
+/chat turn carries only references to them (plan 4.2(e)), in the ONE
+attachments shape the chat mirror documents (ConversationEntry.attachments,
+U9; amendment A9 a)::
 
-    "attachments": [{"kind": "peerlink_file", "ref": "<64-hex xid>",
-                     "purpose": "reel_source|logo|song_audio", ...}]
+    "attachments": [{"file_id": "<64-hex xid>", "sha256": "<the same>",
+                     "name": ..., "mime": ..., "size": ...,
+                     "purpose": "reel_source|logo|song_audio",   # optional
+                     "captured_at": ..., "duration_ms": ...}]    # optional
 
-The reel the turn makes goes into the same store's outbox, and the reply that
-turn ends with carries it as ``media`` (plan 4.2(f)).
+``file_id`` is the store xid, which is the file's sha256.  The reel the turn
+makes goes into the same store's outbox, and the reply that turn ends with
+carries it as ``media`` (plan 4.2(f)) and its mirror row in the same shape
+(media_to_mirror): what goes out is what comes in.
 
 This module owns NO state.  It parses a turn's ``attachments`` (pure) and
 delegates every read and write to the store, which is the one place files,
@@ -25,9 +31,10 @@ reference was bad or the disk was unhappy.  A reference that does not resolve
 to this user's inbox is dropped and logged.
 
 LAYERING: core/ may not import integrations/, so the contract facts this
-module needs (the attachment kind; the inbound purposes come from the store)
-are repeated here and tests/unit/test_chat_attachments.py holds them equal to
-integrations.reel_studio.contracts.
+module needs (the inbound purposes) come from the store, and
+tests/unit/test_chat_attachments.py holds them equal to
+integrations.reel_studio.contracts, whose validate_attachment accepts every
+row parse_inbound keeps.
 """
 from __future__ import annotations
 
@@ -42,9 +49,6 @@ from core.user_file_store import INBOUND_PURPOSES, _is_xid, get_user_file_store
 
 logger = logging.getLogger(__name__)
 
-#: ``kind`` of an attachment that refers to a file in the user file store
-#: (contracts.ATTACHMENT_KIND).  Any other kind is not this module's.
-ATTACHMENT_KIND = 'peerlink_file'
 #: At most this many attachments are read from one turn (plan 4.2(e); Nunba's
 #: turn_attachments sends no more).
 MAX_ATTACHMENTS = 10
@@ -54,15 +58,24 @@ _SAFE_ID = re.compile(r'[A-Za-z0-9_-]{1,64}')
 
 # ── inbound: the turn's references ────────────────────────────────────────
 
+def _is_store_ref(item) -> bool:
+    """A row naming a file in the store: ``file_id`` is an xid and ``sha256``
+    is the same xid; ``purpose``, when given, is an inbound purpose."""
+    return (isinstance(item, Mapping) and _is_xid(item.get('file_id'))
+            and item.get('sha256') == item['file_id']
+            and ('purpose' not in item or item['purpose'] in INBOUND_PURPOSES))
+
+
 def parse_inbound(raw: Any) -> List[Dict[str, str]]:
     """The well-formed store references among a turn's ``attachments``.
 
-    Reads at most MAX_ATTACHMENTS entries of a list; keeps an entry whose
-    ``kind`` is ATTACHMENT_KIND, whose ``ref`` is an xid and whose
-    ``purpose`` is an inbound purpose, each reference once.  Returns
-    ``[{kind, ref, purpose}]`` in the order sent.  Anything else -- not a
-    list, a malformed entry -- is dropped, never raised on.  Pure: the store
-    is not consulted (bind_inbound does that).
+    Reads at most MAX_ATTACHMENTS rows of a list and keeps each row that
+    names a store file (_is_store_ref), each file once.  Returns
+    ``[{file_id}]`` -- plus ``purpose`` when the row gave one -- in the order
+    sent.  The row's name, mime and size are not read: the store's own record
+    of the file is what counts.  Anything else -- not a list, a malformed
+    row -- is dropped, never raised on.  Pure: the store is not consulted
+    (bind_inbound does that).
     """
     if not isinstance(raw, list):
         if raw:
@@ -75,15 +88,16 @@ def parse_inbound(raw: Any) -> List[Dict[str, str]]:
     kept: List[Dict[str, str]] = []
     seen = set()
     for item in raw[:MAX_ATTACHMENTS]:
-        if not (isinstance(item, Mapping) and item.get('kind') == ATTACHMENT_KIND
-                and _is_xid(item.get('ref')) and item.get('purpose') in INBOUND_PURPOSES):
+        if not _is_store_ref(item):
             logger.info('chat_attachments: dropped a malformed attachment entry')
             continue
-        if item['ref'] in seen:
+        if item['file_id'] in seen:
             continue
-        seen.add(item['ref'])
-        kept.append({'kind': ATTACHMENT_KIND, 'ref': item['ref'],
-                     'purpose': item['purpose']})
+        seen.add(item['file_id'])
+        ref = {'file_id': item['file_id']}
+        if 'purpose' in item:
+            ref['purpose'] = item['purpose']
+        kept.append(ref)
     return kept
 
 
@@ -95,8 +109,8 @@ def bind_inbound(user_id, prompt_id, request_id, items) -> List[Dict[str, Any]]:
     store's StoredFile dicts (``StoredFile.to_dict()``), in the order sent.
     Never raises: a store that refuses or fails binds nothing.
     """
-    refs = [it['ref'] for it in (items or ())
-            if isinstance(it, Mapping) and _is_xid(it.get('ref'))]
+    refs = [it['file_id'] for it in (items or ())
+            if isinstance(it, Mapping) and _is_xid(it.get('file_id'))]
     if not refs:
         return []
     try:
@@ -175,7 +189,7 @@ def media_to_mirror(media) -> List[Dict[str, Any]]:
     The documented ConversationEntry.attachments shape
     ``[{file_id, sha256, name, mime, size}]`` with ``file_id`` = the xid, so a
     device that dedups by xid sees the reply, the push and the mirror row as
-    one reel.  ``name`` is ``reel_<reel_id>.mp4`` (the xid's first 12 hex
+    one reel -- the same shape a turn's ``attachments`` use (parse_inbound).  ``name`` is ``reel_<reel_id>.mp4`` (the xid's first 12 hex
     when the reel id is not a safe name).  Items without an xid are skipped.
     """
     rows = []

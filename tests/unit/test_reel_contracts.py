@@ -576,26 +576,54 @@ def test_each_purpose_has_its_own_mime_list():
 
 
 def _attachment(**kw):
-    item = {'kind': 'peerlink_file', 'ref': SHA, 'purpose': 'reel_source',
-            'name': 'VID_20261012.mp4', 'mime': 'video/mp4', 'size': 123456789,
+    """The documented ConversationEntry.attachments row (U9) a /chat turn
+    carries and a reply's mirror row writes (amendment A9 a)."""
+    item = {'file_id': SHA, 'sha256': SHA, 'name': 'VID_20261012.mp4',
+            'mime': 'video/mp4', 'size': 123456789, 'purpose': 'reel_source',
             'duration_ms': 15000, 'captured_at': 1760247082000}
     item.update(kw)
     return item
 
 
-def test_a_chat_attachment_is_valid_with_or_without_capture_time():
+def test_a_chat_attachment_is_valid_with_or_without_its_optional_fields():
     assert C.validate_attachment(_attachment()) == []
     item = _attachment()
-    del item['captured_at'], item['duration_ms']
+    del item['captured_at'], item['duration_ms'], item['purpose']
     assert C.validate_attachment(item) == []
+    assert C.validate_attachment(dict(item, mime='application/octet-stream')) == [], (
+        'without a purpose there is no inbound MIME list to hold it to')
+
+
+def test_the_attachment_shape_is_the_mirror_row_shape():
+    """Inbound == outbound: the reply mirror's row {file_id, sha256, name, mime,
+    size} is a valid attachment as it stands."""
+    row = {'file_id': SHA, 'sha256': SHA, 'name': 'reel_r-1.mp4', 'mime': 'video/mp4',
+           'size': 4242}
+    assert C.validate_attachment(row) == []
+    assert not hasattr(C, 'ATTACHMENT_KIND'), 'the {kind, ref} shape is retired'
 
 
 @pytest.mark.parametrize('change', [
-    {'ref': SHA.upper()}, {'ref': 'abc'}, {'kind': 'file_url'}, {'purpose': 'reel'},
-    {'mime': 'application/pdf'}, {'size': -1}, {'captured_at': 'yesterday'},
+    {'file_id': SHA.upper()}, {'file_id': 'abc'}, {'sha256': 'e' * 64},
+    {'sha256': None}, {'purpose': 'reel'}, {'purpose': 'anything'},
+    {'mime': 'application/pdf'}, {'size': -1}, {'size': '10'}, {'name': '../x.mp4'},
+    {'captured_at': 'yesterday'}, {'duration_ms': -1},
 ])
 def test_a_bad_chat_attachment_is_refused(change):
     assert C.validate_attachment(_attachment(**change))
+
+
+@pytest.mark.parametrize('missing', ['file_id', 'sha256', 'name', 'mime', 'size'])
+def test_a_chat_attachment_missing_a_required_field_is_refused(missing):
+    item = _attachment()
+    del item[missing]
+    assert C.validate_attachment(item)
+
+
+def test_the_retired_kind_ref_attachment_is_refused():
+    assert C.validate_attachment({'kind': 'peerlink_file', 'ref': SHA,
+                                  'purpose': 'reel_source', 'name': 'VID.mp4',
+                                  'mime': 'video/mp4', 'size': 1})
 
 
 # ── trending songs ────────────────────────────────────────────────────────

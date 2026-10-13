@@ -107,11 +107,44 @@ def test_over_the_caption_limit_fails():
     assert _check(r, 'LENGTH')['status'] == 'FAIL'
 
 
+def test_glued_hashtags_count_each():
+    # Only a tag at the start or after whitespace was counted, so six tags
+    # written without spaces were one and slipped past the cap.
+    r = caption.lint_caption('Reception look in 40 minutes. DM for bookings.\n\n'
+                             '#a1#b2#c3#d4#e5#f6')
+    assert r['hashtags'] == ['#a1', '#b2', '#c3', '#d4', '#e5', '#f6']
+    assert _check(r, 'HASHTAGS')['status'] == 'FAIL'
+
+
+def test_a_hashtag_right_after_an_emoji_or_a_bracket_counts():
+    tamil = '#மணப்பெண்'
+    r = caption.lint_caption('Reception look in 40 minutes \u2728#bridalmakeup (' + tamil + ')')
+    assert r['hashtags'] == ['#bridalmakeup', tamil]
+
+
+@pytest.mark.parametrize('text', ['Rates at example.com/page#rates', 'Look#2 in 40 minutes',
+                                  'C# and F# are not tags', '## heading'])
+def test_a_hash_inside_a_word_or_alone_is_not_a_tag(text):
+    assert caption.lint_caption(text)['hashtags'] == []
+
+
+def test_a_long_run_is_linted_in_linear_time():
+    # LINK_RE's "\b[a-z0-9-]+\." restarted at every "-": 3.8 s on 20,000
+    # characters of "a-a-a-".
+    import time
+    started = time.perf_counter()
+    caption.lint_caption('Reception look. ' + 'a-' * 20000)
+    assert time.perf_counter() - started < 2.0
+
+
 @pytest.mark.parametrize('emoji', [
     '❤\ufe0f',                         # red heart with its selector
     '\U0001F470\u200d♀\ufe0f',         # bride: woman, joined
     '\U0001F44D\U0001F3FD',            # thumbs up with a skin tone
     '✨',
+    '1\ufe0f\u20e3',                   # keycap one
+    '\U0001F1EE\U0001F1F3',            # a flag: two regional indicators
+    '\u27a1\ufe0f',                    # right arrow, emoji style
 ])
 def test_one_emoji_counts_once(emoji):
     # Upstream counted the variation selector as an emoji of its own, so a
@@ -121,6 +154,23 @@ def test_one_emoji_counts_once(emoji):
 
 def test_emoji_side_by_side_count_each():
     assert caption.lint_caption('Reception look ✨✨ ❤\ufe0f❤\ufe0f')['emoji'] == 4
+
+
+@pytest.mark.parametrize('text', ['Bare face → bride', 'Rs 15k - 20k', '!! done', '#1 look'])
+def test_text_symbols_are_not_emoji(text):
+    # A plain arrow is typography; upstream counted the whole arrows block.
+    assert caption.lint_caption(text)['emoji'] == 0
+
+
+@pytest.mark.parametrize('piece', ['✨', '1\ufe0f\u20e3', '\U0001F1EE\U0001F1F3',
+                                   '❤\ufe0f', '→', '!!', '#1', 'plain'])
+def test_the_hook_check_and_the_caption_linter_share_one_emoji_definition(piece):
+    from integrations.reel_studio import igkit
+    from integrations.reel_studio.igkit import hooks
+    line = 'Bare face to bride in 20 minutes ' + piece
+    in_caption = caption.lint_caption(line)['emoji'] > 0
+    in_hook = any(f.startswith('Emoji') for f in hooks.rate_hook(line)['flags'])
+    assert in_caption == in_hook == bool(igkit.EMOJI_RE.search(piece))
 
 
 def test_two_hearts_in_a_seventy_character_caption_are_not_decoration():

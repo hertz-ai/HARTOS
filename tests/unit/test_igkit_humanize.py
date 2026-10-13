@@ -8,6 +8,7 @@ it flagged ✨ (a staple of makeup posts) and five hashtags (her cap) as AI
 tells (skill-port report findings 4 and (c)2-4).  These tests pin the port.
 """
 import pathlib
+import time
 
 import pytest
 
@@ -81,6 +82,55 @@ class TestHumanize:
     def test_an_allowlist_does_not_hide_other_emoji(self):
         out = humanize.humanize_text('Reception look 🔥 for Priya.', keep_emoji=['✨'])
         assert 'rocket' in _ids(out['report'])
+
+    @pytest.mark.parametrize('item', ['✨\U0001F484', '✨ \U0001F484'])
+    def test_an_allowlist_item_holding_several_emoji_keeps_each(self, item):
+        # A hand-built allowlist may hold "sparkle+lipstick" as one item; each
+        # emoji in it is hers, not only the pair as written.
+        out = humanize.humanize_text('Reception look ✨ for Priya.', keep_emoji=[item])
+        assert 'rocket' not in _ids(out['report'])
+
+    def test_emails_and_links_are_left_alone(self):
+        out = humanize.humanize_text('Leverage this — mail meena.mua@studio.in or '
+                                     'www.example.com/a—b')
+        assert 'meena.mua@studio.in' in out['text']
+        assert 'www.example.com/a—b' in out['text']
+        assert out['text'].startswith('Use this,')
+
+    def test_line_breaks_are_a_phones_and_blank_runs_fold(self):
+        out = humanize.humanize_text('Base done.  \r\n\r\n\r\n\r\n  Lips next.\rThen photos.')
+        assert out['text'] == 'Base done.\n\nLips next.\nThen photos.'
+
+    def test_unicode_line_and_space_runs_fold_too(self):
+        text = 'Base done.\u2028\u2028\u2028Lips next.\u3000\u3000Then photos.'
+        out = humanize.humanize_text(text)
+        assert out['text'] == 'Base done.\n\nLips next. Then photos.'
+
+    def test_a_run_of_hard_spaces_counts_each_as_a_fingerprint(self):
+        r = humanize.detect_machine_text('Base\u00a0\u00a0\u00a0done in 40 minutes')
+        assert '3 hard space' in r['checks']['FINGERPRINT']['detail']
+
+    @pytest.mark.parametrize('unit', ['a@', 'a@b.'])
+    def test_a_caption_length_run_of_addresses_is_quick(self, unit):
+        # URL_RE's "\S+@\S+\.\S+" backtracked to 5.9 s on a 2,200-character
+        # caption (Instagram's limit) of "a@a@...".
+        text = unit * (2200 // len(unit))
+        started = time.perf_counter()
+        humanize.humanize_text(text)
+        assert time.perf_counter() - started < 1.0
+
+    @pytest.mark.parametrize('unit', ['a', 'a.', '#a', '\n', ' \n', '\r\n', '\n-',
+                                      '\u00a0', '\u00a0\n', '\u2028'])
+    def test_a_long_run_is_checked_in_linear_time(self, unit):
+        # 40,000 characters: a quadratic pattern takes seconds here (URL_RE on
+        # "aaaa" 7 s, blank-line runs 6 s at 20,000, hard-space and line-separator
+        # runs 17 s to 50 s at 40,000); linear passes take well under one.
+        text = 'Reception look for Priya in 40 minutes, you know it. ' * 5 + unit * (
+            40000 // len(unit))
+        started = time.perf_counter()
+        humanize.humanize_text(text)
+        humanize.detect_machine_text(text)
+        assert time.perf_counter() - started < 3.0
 
     def test_words_she_uses_are_kept(self):
         text = 'Stunning reception look, 40 minutes.'

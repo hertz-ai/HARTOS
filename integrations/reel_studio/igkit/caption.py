@@ -7,8 +7,9 @@ package).  Modified for HARTOS Reel Studio: a pure function, hashtags in any
 script counted against the one cap (contracts.HASHTAG_LIMIT), the shared
 definition of "concrete", Indian booking asks (DM for bookings, bookings
 open, a WhatsApp number), more generic tags named, search terms matched
-case-insensitively in any script, and an emoji counted once with its
-variation selector, skin tone and joined parts.
+case-insensitively in any script, and igkit's one emoji definition and one
+hashtag rule (an emoji counted once with its variation selector, skin tone
+and joined parts; glued tags each counted).
 
 Instagram shows about 125 characters of a caption in the feed and hides the
 rest behind a tap; the real cut moves with the device and font, so aim for a
@@ -20,22 +21,18 @@ import re
 from typing import Any, Dict, Iterable, List, Optional
 
 from integrations.reel_studio.contracts import HASHTAG_LIMIT
-from integrations.reel_studio.igkit import concrete_markers, is_tag_char
+from integrations.reel_studio.igkit import EMOJI_RE, concrete_markers, hashtags
 
 LIMIT = 2200             # Instagram's hard caption limit.
 TRUNCATE = 125           # Roughly where the feed cuts to "... more".
 
 MENTION_RE = re.compile(r'(?:^|\s)(@[A-Za-z0-9_.]+)')
-LINK_RE = re.compile(r'https?://\S+|\bwww\.\S+|\b[a-z0-9-]+\.(?:com|co|io|net|org|ai|app)/\S*',
+#: A bare domain starts where no letter, digit or '-' is before it, not at
+#: every word boundary: "\b" let a run like "a-a-a-..." restart at each "-"
+#: (3.8 s on 20,000 characters); this is one pass.
+LINK_RE = re.compile(r'https?://\S+|\bwww\.\S+'
+                     r'|(?<![\w-])[a-z0-9-]+\.(?:com|co|io|net|org|ai|app)/\S*',
                      re.IGNORECASE)
-#: Emoji code points: pictographs, the miscellaneous-symbol and dingbat
-#: blocks, and arrows.
-_EMOJI_CHARS = '\U0001F300-\U0001FAFF☀-➿←-⇿'
-#: One emoji as she sees it: a code point with its variation selector or skin
-#: tone, and any more that a zero-width joiner adds (a bride, a family).
-#: Upstream counted the selector as an emoji of its own, so a red heart was 2.
-_ONE_EMOJI = '[{0}][\ufe0f\U0001F3FB-\U0001F3FF]?'.format(_EMOJI_CHARS)
-EMOJI_RE = re.compile(_ONE_EMOJI + '(?:\u200d' + _ONE_EMOJI + ')*')
 
 #: Calls to action, each with the name the result reports.  The last three
 #: are the asks Indian makeup artists use; a WhatsApp number is not
@@ -64,19 +61,6 @@ FILLER_TAGS = frozenset({
 })
 
 
-def _hashtags(text: str) -> List[tuple]:
-    """``[(tag, start, end)]`` for every hashtag at the start of the text or
-    after whitespace, in any script ("#சென்னைமேக்கப்" is one tag)."""
-    out = []
-    for m in re.finditer(r'(?:^|(?<=\s))#', text):
-        end = m.end()
-        while end < len(text) and is_tag_char(text[end]):
-            end += 1
-        if end > m.end():
-            out.append((text[m.start():end], m.start(), end))
-    return out
-
-
 def _visible_window(text: str, cut: int) -> str:
     """What the feed shows. Instagram cuts mid-word, so this does too."""
     return text if len(text) <= cut else text[:cut]
@@ -99,7 +83,7 @@ def lint_caption(text: str, keywords: Optional[Iterable[str]] = None, truncate: 
     stripped = (text if isinstance(text, str) else '').strip()
     chars = len(stripped)
     first_line = stripped.split('\n')[0].strip() if stripped else ''
-    found_tags = _hashtags(stripped)
+    found_tags = hashtags(stripped)
     tags = [t for t, _, _ in found_tags]
     mentions = MENTION_RE.findall(stripped)
     links = LINK_RE.findall(stripped)

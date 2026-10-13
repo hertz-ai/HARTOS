@@ -60,8 +60,17 @@ What was changed for HARTOS:
     implementation of the outlier maths.  Counts written as text keep their
     decimals and multipliers ("1.2M", "4.5k", "1.5 lakh"); upstream deleted
     every non-digit and read "1.2M" as 12.
-11. caption counts an emoji once with its variation selector, skin tone and
-    joined parts; upstream counted the selector as an emoji of its own.
+11. One emoji definition (``EMOJI_RE``) for the caption linter, the hook
+    check, the humanizer and her voice profile, where upstream's caption and
+    hook scripts each had their own list.  An emoji counts once with its
+    variation selector, skin tone and joined parts (upstream counted the
+    selector as an emoji of its own, so a red heart was 2); keycaps and flags
+    are emoji; a plain arrow, '!!' or '-' is not.
+12. One hashtag rule (``hashtags``) for the caption linter, the hook check
+    and her hashtag bank, where upstream had two: tags in any script, each of
+    "#a#b" counted (upstream counted it once, so leaving out spaces hid tags
+    from the cap), and a tag right after an emoji or a bracket counted;
+    a '#' inside a word ("page#rates") is not a tag.
 
 This module imports only the standard library.
 """
@@ -69,7 +78,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from typing import List
+from typing import List, Optional, Tuple
 
 #: The upstream revision this package was derived from.
 UPSTREAM = 'instagram-agent-skill@d03c56b'
@@ -174,6 +183,34 @@ def is_tag_char(ch: str) -> bool:
     return ch == '_' or ch in JOINERS or unicodedata.category(ch)[0] in 'LMN'
 
 
+def hashtags(text: str) -> List[Tuple[str, int, int]]:
+    """``[(tag, start, end)]`` for every hashtag in ``text``, in order.
+
+    A tag is '#' and the tag characters after it (``is_tag_char``), so
+    "#சென்னைமேக்கப்" is one tag.  A '#' starts a tag when it does not follow
+    a tag character, or right where the tag before it ends: "#a#b" is two
+    tags (leaving out the spaces never hides a tag from the cap), "✨#bridal"
+    and "(#bridal)" are tags, and "page#rates" and "C#" are not.  One pass
+    over the text.
+    """
+    text = text if isinstance(text, str) else ''
+    out: List[Tuple[str, int, int]] = []
+    end = -1
+    i = text.find('#')
+    while i != -1:
+        if i == end or i == 0 or not is_tag_char(text[i - 1]):
+            j = i + 1
+            while j < len(text) and is_tag_char(text[j]):
+                j += 1
+            if j > i + 1:
+                out.append((text[i:j], i, j))
+                end = j
+                i = text.find('#', j)
+                continue
+        i = text.find('#', i + 1)
+    return out
+
+
 def _has_letter_or_digit(token: str) -> bool:
     return any(unicodedata.category(ch)[0] in 'LN' for ch in token)
 
@@ -234,3 +271,63 @@ def concrete_markers(text: str) -> List[str]:
     found += [w for w in words(text)
               if w.lower().strip("'’") in CONCRETE_WORDS and w.casefold() not in named]
     return found
+
+
+# ── emoji ───────────────────────────────────────────────────────────────────
+
+#: Code points that are an emoji on their own: the pictograph planes (faces,
+#: hands, objects, food, and the regional-indicator letters of flags), the
+#: miscellaneous-symbol and dingbat blocks (sparkle, heart, check mark), and
+#: the few emoji in other blocks (watch, hourglass, play buttons, squares,
+#: star, circle).
+_EMOJI_BASE = ('\U0001F000-\U0001FAFF☀-➿⌚⌛⏩-⏳⏸-⏺'
+               '◽◾⬛⬜⭐⭕')
+#: Symbols that are text unless the emoji variation selector follows: (c),
+#: (r), !!, !?, TM, i, the arrows from left-right to hooked, keyboard, eject,
+#: circled M, small squares, play and reverse, curving arrows, left/up/down
+#: arrows, wavy dash, part mark, and the circled ideographs.
+_TEXT_SYMBOLS = ('©®‼⁉™ℹ↔-↙↩↪⌨⏏'
+                 'Ⓜ▪▫▶◀◻◼⤴⤵⬅-⬇'
+                 '〰〽㊗㊙')
+_ONE_EMOJI = (
+    '[0-9#*]\ufe0f?\u20e3'                               # keycap: 1, # or * in a box
+    '|[\U0001F1E6-\U0001F1FF]{2}'                        # flag: two regional indicators
+    '|\U0001F3F4[\U000E0020-\U000E007E]+\U000E007F'      # flag of a region (England)
+    '|[' + _EMOJI_BASE + '](?:\ufe0f|[\U0001F3FB-\U0001F3FF])?'  # with selector or skin tone
+    '|[' + _TEXT_SYMBOLS + ']\ufe0f'
+)
+#: One emoji as she sees it: a keycap, a flag, or a code point with its
+#: variation selector or skin tone and any more that a zero-width joiner adds
+#: (a bride, a family).  The one emoji definition for the caption linter, the
+#: hook check, the humanizer and her voice profile.
+EMOJI_RE = re.compile('(?:' + _ONE_EMOJI + ')(?:\u200d(?:' + _ONE_EMOJI + '))*')
+
+
+# ── small shared values ─────────────────────────────────────────────────────
+
+def clamp_score(n: float) -> float:
+    """``n`` within 0-100, the range of every igkit score, as a float."""
+    return float(max(0.0, min(100.0, n)))
+
+
+_YES = frozenset({'true', 'yes', 'y', '1', 'on'})
+_NO = frozenset({'false', 'no', 'n', '0', 'off'})
+
+
+def parse_flag(value) -> Optional[bool]:
+    """A yes/no value as True or False: a bool, the ints 1 and 0, or text
+    such as "yes", "true", "on", "1", "no", "false", "off" or "0" (any case,
+    spaces trimmed).  None for None, blank text and anything else, so the
+    caller decides what an unknown value means (the string "false" is
+    truthy, which is the bug this exists to prevent)."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return {1: True, 0: False}.get(value)
+    if isinstance(value, str):
+        key = value.strip().lower()
+        if key in _YES:
+            return True
+        if key in _NO:
+            return False
+    return None

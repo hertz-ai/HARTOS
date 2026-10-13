@@ -62,6 +62,17 @@ class TestRankReels:
         r = swipe.rank_reels(ROWS)
         assert r['dropped'] == {'should_mute': 1, 'no_views': 1}
 
+    @pytest.mark.parametrize('flag,muted', [
+        (True, True), ('true', True), ('yes', True), (1, True), ('1', True),
+        (False, False), ('false', False), ('False', False), ('no', False), (0, False),
+        ('0', False), (None, False), ('', False),
+    ])
+    def test_should_mute_written_as_text_or_a_number_is_read(self, flag, muted):
+        # The string 'false' is truthy: such rows were dropped as muted.
+        r = swipe.rank_reels([dict(ROWS[0], should_mute=flag)])
+        assert r['dropped']['should_mute'] == (1 if muted else 0)
+        assert r['n'] == (0 if muted else 1)
+
     def test_followers_are_the_fallback_baseline(self):
         rows = [dict(row, median=None) for row in ROWS[:3]]
         r = swipe.rank_reels(rows)

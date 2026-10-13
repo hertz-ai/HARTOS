@@ -12,7 +12,8 @@ its only intelligence_preference reader, dispatch_draft_first, is skipped for
 agent-bound turns, so the ways out are the body's ``model_config`` (a
 hive/cloud tier the turn's autogen agents then run on) and ``speculative``
 (the speculative dispatcher's background expert).  Both are refused for a
-reel agent; any other agent keeps them.
+reel agent; any other agent keeps them.  On the CENTRAL node the tag is inert
+(amendment A8 d): a reel record or hint pins nothing there.
 
 Driven through the REAL /chat (app.test_client).  Each turn stops where its
 agent would start working and records the model tier it would run on.
@@ -166,3 +167,25 @@ def test_any_other_agent_keeps_the_body_tier(turn):
 def test_any_other_agent_keeps_speculation(turn):
     turn.record(goal_tags=['news'])
     assert turn.post(speculative=True)['where'] == 'speculative_dispatcher'
+
+
+@pytest.fixture
+def on_central(monkeypatch):
+    from security import key_delegation
+    monkeypatch.setattr(key_delegation, 'get_node_tier', lambda: 'central')
+
+
+def test_on_central_a_reel_record_pins_nothing(turn, on_central):
+    turn.record(goal_tags=['reel_studio'])
+    seen = turn.post(model_config=HIVE_TIER)
+    assert seen['where'] == 'chat_agent'
+    assert seen['tier'] and seen['tier'][0]['model'] == 'hive-expert-70b', (
+        'central refused the body tier for a reel_studio record: %r' % (seen['tier'],))
+    assert turn.post(speculative=True)['where'] == 'speculative_dispatcher'
+
+
+def test_on_central_a_creation_hint_pins_nothing(turn, on_central):
+    seen = turn.post(create_agent=True, goal_tags=['reel_studio'],
+                     model_config=HIVE_TIER)
+    assert seen['where'] == 'gather_info'
+    assert seen['tier'] and seen['tier'][0]['model'] == 'hive-expert-70b'

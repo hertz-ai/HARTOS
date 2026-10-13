@@ -112,8 +112,6 @@ INBOUND_MIMES = _frozen({
 #: ``captured_at`` (MediaStore DATE_TAKEN, epoch ms; the phone falls back to
 #: DATE_MODIFIED*1000) and ``duration_ms``.
 INBOUND_META_KEYS = ('captured_at', 'duration_ms')
-#: ``kind`` of a chat attachment that refers to a file in the store.
-ATTACHMENT_KIND = 'peerlink_file'
 
 # ── delivery and style ────────────────────────────────────────────────────
 
@@ -1175,18 +1173,31 @@ def validate_file_offer(frame) -> List[str]:
 
 
 def validate_attachment(item) -> List[str]:
-    """Problems with one ``attachments`` entry of a /chat turn."""
+    """Problems with one ``attachments`` row of a /chat turn or chat-mirror
+    entry.
+
+    ONE shape in and out (amendment A9 a): the documented
+    ConversationEntry.attachments row ``{file_id, sha256, name, mime, size}``
+    (U9), ``file_id`` being the store xid, which is the file's sha256, plus
+    the optional ``purpose`` (an inbound purpose, whose MIME list then holds)
+    and INBOUND_META_KEYS.  A reply's mirror row (no purpose) is valid as it
+    stands.
+    """
     problems = _spec_problems(item, {
-        'kind': (lambda v: v == ATTACHMENT_KIND, repr(ATTACHMENT_KIND)),
-        'ref': (_is_hex64, 'a 64-hex store xid'),
-        'purpose': (lambda v: v in INBOUND_PURPOSES, 'one of %s' % (INBOUND_PURPOSES,)),
+        'file_id': (_is_hex64, 'a 64-hex store xid'),
+        'sha256': (_is_hex64, '64 lowercase hex'),
         'name': (_is_file_name, 'a bare file name'),
         'mime': (_is_str, 'a MIME type'),
         'size': (_is_nonneg_int, 'an int >= 0'),
+        'purpose': (lambda v: v in INBOUND_PURPOSES, 'one of %s' % (INBOUND_PURPOSES,)),
         'duration_ms': (_is_nonneg_int, 'an int >= 0'),
         'captured_at': (_is_capture_ms, 'epoch milliseconds (an int > 0)'),
-    }, 'attachment', optional=INBOUND_META_KEYS)
-    return problems or _mime_problems(item, 'attachment')
+    }, 'attachment', optional=('purpose',) + INBOUND_META_KEYS)
+    if problems:
+        return problems
+    if item['sha256'] != item['file_id']:
+        return ['attachment.file_id must be the sha256 of the file']
+    return _mime_problems(item, 'attachment') if 'purpose' in item else []
 
 
 # ── trending songs ────────────────────────────────────────────────────────

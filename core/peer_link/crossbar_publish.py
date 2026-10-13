@@ -210,10 +210,12 @@ def publish_agent_message(
     ``skip_crossbar``: keep the message on this node's own legs -- LOCAL,
     SSE and the user's own devices over PeerLink, which is how the phone
     receives agent messages (EVENTS) -- and off central's crossbar (decision
-    U4(d): a reel push names her clients).  The HARTOS publish_async takes no
-    such flag and Nunba wraps it as (topic, message, timeout), so this path
-    publishes through the MessageBus's own skip_crossbar instead, the call
-    publish_async's first leg makes.
+    U4(d): a reel push names her clients).  It is publish_async's own flag
+    (the one publisher, amendment A9 e), passed only when set: every other
+    message reaches publish_async -- and Nunba's (topic, message, timeout)
+    wrapper around it -- exactly as before.  A wrapper that does not forward
+    it raises, and the push is reported undelivered rather than sent to the
+    crossbar.
 
     Returns True only when the publisher was resolved and returned without
     raising; False for empty text or user, an unresolvable publisher, or a
@@ -244,12 +246,6 @@ def publish_agent_message(
         payload['media'] = items
     try:
         from core.peer_link.message_bus import chat_topic_for
-        if skip_crossbar:
-            from core.peer_link.message_bus import get_message_bus, resolve_legacy_topic
-            bus_topic, owner = resolve_legacy_topic(chat_topic_for(user_id))
-            get_message_bus().publish(bus_topic, payload, user_id=owner,
-                                      skip_crossbar=True)
-            return True
         from core.safe_hartos_attr import safe_hartos_attr
         publish_async = safe_hartos_attr('publish_async')
         if publish_async is None:
@@ -257,7 +253,8 @@ def publish_agent_message(
                 "publish_agent_message: HARTOS publish_async unresolvable; "
                 "message for user %s not delivered", user_id)
             return False
-        publish_async(chat_topic_for(user_id), payload)
+        flags = {'skip_crossbar': True} if skip_crossbar else {}
+        publish_async(chat_topic_for(user_id), payload, **flags)
         return True
     except Exception as e:
         logger.warning(

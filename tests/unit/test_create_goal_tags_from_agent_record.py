@@ -120,6 +120,17 @@ def test_her_reel_studio_record_unlocks_only_reel_studio(build):
     assert built.assistant._hart_unlocked_tags == {'reel_studio'}
 
 
+def test_on_central_a_stored_reel_studio_unlocks_nothing(build, monkeypatch):
+    """Amendment A8 d: central's own goals keep their families and get no
+    reel tools, whatever a record carries."""
+    from security import key_delegation
+    monkeypatch.setattr(key_delegation, 'get_node_tier', lambda: 'central')
+    built = build(_record(goal_tags=['reel_studio', 'news'],
+                          goal='Edit my reels with Tamil songs'))
+    assert built.assistant._hart_unlocked_tags == {'news'}
+    assert 'fetch_news_feeds' in _llm_names(built.helper)
+
+
 def test_a_junk_stored_value_is_not_read_as_tags(build):
     """The record is user-writable JSON: a bare string is not a tag list
     (iterating it would unlock one tag per character)."""

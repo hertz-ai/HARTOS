@@ -24,8 +24,9 @@ import statistics
 from collections.abc import Iterable, Mapping
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
-from integrations.reel_studio.igkit import (CONCRETE_WORDS, FIGURE_RE, ME_WORDS, YOU_WORDS,
-                                            concrete_markers, sentences, word_keys, words)
+from integrations.reel_studio.igkit import (CONCRETE_WORDS, EMOJI_RE, FIGURE_RE, ME_WORDS,
+                                            YOU_WORDS, clamp_score, concrete_markers, hashtags,
+                                            sentences, word_keys, words)
 from integrations.reel_studio.igkit.resources import load_json
 
 #: The five hook checks, in report order.
@@ -89,30 +90,27 @@ INDIC_IMPERATIVES = frozenset({
     'ਦੇਖੋ', 'ਵੇਖੋ',
 })
 
-_HASHTAG = re.compile(r'(?:^|\s)#\w+')
-_EMOJI = re.compile('[\U0001F300-\U0001FAFF☀-➿]')
 _CAPITALISED = re.compile(r'[A-Z][a-z]{2,}')
 _PRICE = re.compile(r'[$₹]\s?\d')
 
+#: ``(found(text) -> truthy, message)``: anything one of these finds makes a
+#: hook WEAK.  Hashtags and emoji use igkit's one definition of each, so a
+#: tag the caption linter counts is a tag here too.
 DEALBREAKERS = (
-    (re.compile(r"(?i)^\s*(?:stop scrolling|don'?t scroll)"),
+    (re.compile(r"(?i)^\s*(?:stop scrolling|don'?t scroll)").search,
      'Opens with "stop scrolling". Asking for attention proves you have not earned it.'),
     (re.compile(r"(?i)\b(?:in (?:this|today'?s) (?:video|reel)|i'?m going to show you"
-                r"|i'?ll show you how)\b"),
+                r"|i'?ll show you how)\b").search,
      'Video preamble. Delete it and open on the payoff.'),
     (re.compile(r"(?i)^\s*(?:hey |hi |hello |what'?s up |welcome |vanakkam\b|namaste\b"
-                r'|வணக்கம்|नमस्ते|ਸਤ ਸ੍ਰੀ ਅਕਾਲ)'),
+                r'|வணக்கம்|नमस्ते|ਸਤ ਸ੍ਰੀ ਅਕਾਲ)').search,
      'Greeting. Nobody came to the feed to be greeted.'),
-    (_HASHTAG,
+    (hashtags,
      'Hashtag in the hook. Hashtags belong at the bottom of the caption, if anywhere.'),
-    (_EMOJI,
+    (EMOJI_RE.search,
      'Emoji in the hook. On-screen text at hook size has room for words or for an emoji, '
      'not both.'),
 )
-
-
-def _clamp(n: float) -> float:
-    return float(max(0.0, min(100.0, n)))
 
 
 # ── the five checks ─────────────────────────────────────────────────────────
@@ -125,12 +123,12 @@ def _check_length(ws: List[str], text: str) -> Tuple[float, str]:
     if 5 <= n <= 12:
         score = 100.0
     elif n < 5:
-        score = _clamp(100 - (5 - n) * 20)
+        score = clamp_score(100 - (5 - n) * 20)
     else:
-        score = _clamp(100 - (n - 12) * 11)
+        score = clamp_score(100 - (n - 12) * 11)
     if chars > 60:                       # two lines of big on-screen text
         score -= 12
-    return _clamp(score), '%d words, %d chars, ~%.1fs spoken (want 5-12 words)' % (
+    return clamp_score(score), '%d words, %d chars, ~%.1fs spoken (want 5-12 words)' % (
         n, chars, secs)
 
 
@@ -138,7 +136,7 @@ def _check_specificity(text: str) -> Tuple[float, str]:
     """One concrete thing beats three abstract ones."""
     found = concrete_markers(text)
     hits = len(found)
-    score = 15.0 if hits == 0 else _clamp(45 + hits * 30)
+    score = 15.0 if hits == 0 else clamp_score(45 + hits * 30)
     detail = '%d concrete marker(s)' % hits
     detail += (': ' + ', '.join(found[:4])) if found else (
         ' - no number, no name, no occasion, nothing checkable')
@@ -154,7 +152,7 @@ def _check_stakes(keys: List[str], text: str) -> Tuple[float, str]:
     score = {0: 20.0, 1: 70.0}.get(n, 100.0)
     detail = '%d tension marker(s)' % n + (
         (': ' + ', '.join(markers[:4])) if markers else ' - nothing is at stake in this line')
-    return _clamp(score), detail
+    return clamp_score(score), detail
 
 
 def _weak_opener(keys: List[str]) -> Optional[str]:
@@ -187,7 +185,7 @@ def _check_frontload(ws: List[str], keys: List[str]) -> Tuple[float, str]:
     else:
         base, where = 40.0, 'payload at word %d, too late' % (payload + 1)
     detail = where + ('; weak opener "%s"' % opener if opener else '')
-    return _clamp(base - penalty), detail
+    return clamp_score(base - penalty), detail
 
 
 def _check_address(keys: List[str]) -> Tuple[float, str]:
@@ -224,11 +222,11 @@ def rate_hook(text: str) -> Dict[str, Any]:
         'FRONTLOAD': _check_frontload(ws, keys),
         'ADDRESS': _check_address(keys),
     }
-    flags = [msg for pattern, msg in DEALBREAKERS if pattern.search(text)]
+    flags = [msg for found, msg in DEALBREAKERS if found(text)]
     scores = [results[c][0] for c in CHECKS]
     # The weakest property caps the hook: one bad property is enough for the
     # thumb to keep moving.
-    overall = _clamp(statistics.mean(scores) * 0.6 + min(scores) * 0.4 - len(flags) * 15)
+    overall = clamp_score(statistics.mean(scores) * 0.6 + min(scores) * 0.4 - len(flags) * 15)
     checks = {c: {'score': round(results[c][0], 1), 'detail': results[c][1]} for c in CHECKS}
     weakest = min(CHECKS, key=lambda c: checks[c]['score'])
     return {'score': round(overall, 1), 'checks': checks, 'flags': flags, 'weakest': weakest,
@@ -321,9 +319,21 @@ def _rate_wps(wpm) -> float:
     return wpm / 60.0
 
 
+#: The digits a token ends with, tried only where their run starts.
+_TRAILING_DIGITS = re.compile(r'(?<!\d)\d+$')
+
+
 def _pretty(token: str) -> str:
-    """Put the thousands separator back for display."""
-    return re.sub(r'(\d)(?=(\d{3})+$)', r'\1,', token)
+    """Put the thousands separator back for display ("1500000" ->
+    "1,500,000"), in one pass: upstream's "(\\d)(?=(\\d{3})+$)" scanned to
+    the end of the token from every digit."""
+    m = _TRAILING_DIGITS.search(token)
+    if not m:
+        return token
+    digits = m.group()
+    lead = len(digits) % 3 or 3
+    groups = [digits[:lead]] + [digits[i:i + 3] for i in range(lead, len(digits), 3)]
+    return token[:m.start()] + ','.join(groups)
 
 
 def _split_beats(raw: str, wps: float) -> List[str]:

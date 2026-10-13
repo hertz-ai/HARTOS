@@ -7,8 +7,9 @@ logo corner.  The fields, their types and limits come from
 igkit/resources/voice_template.json (derived from instagram-agent-skill's
 voice.md, MIT); anything else is refused.
 
-Storage: ``get_agent_data_dir()/reel_studio/<sha256(user_id)[:16]>/voice.json``,
-one file per user, written only by this module.  User ids follow
+Storage: ``user_dir(user_id)/voice.json``, written only by this module.
+``user_dir`` is ``get_agent_data_dir()/reel_studio/<sha256(user_id)[:16]>``,
+the one rule for where Reel Studio keeps a user's own files.  User ids follow
 core.user_file_store's rule (any non-empty text or int; 10077 and '10077'
 are one user) and its directory naming, so every user the store takes has a
 profile and no id can steer the path.  The file records its user id; a file
@@ -27,7 +28,15 @@ launch or rotated, or the file damaged) is never written over: load_voice,
 save_voice and update_field raise VoiceProfileUnreadable and leave the file
 as it is, so her whole profile is back when the key is
 (security/node_integrity.py treats its key file the same way).  voice_brief
-says the profile exists and could not be read.
+says the profile exists and could not be read.  reset_voice is the
+deliberate way out once she confirms she wants to start over: it moves the
+file aside, never deletes it.
+
+Values are taken as an agent or a person writes them.  Emoji typed side by
+side, or with spaces or commas between them, are stored one emoji per item
+(igkit's one emoji definition), so the humanizer allows each of them; a list
+item must already be one emoji.  Hashtags in text may be separated by
+commas, spaces or nothing ("#a#b"), by igkit's one hashtag rule.
 
 voice_brief() is what reel_skill puts in front of a skill text, so a local
 model reads her profile before the instructions; it is bounded at
@@ -47,7 +56,7 @@ from types import MappingProxyType
 from typing import Any, Dict, List, Mapping, Optional
 
 from integrations.reel_studio import contracts
-from integrations.reel_studio.igkit import is_tag_char
+from integrations.reel_studio.igkit import EMOJI_RE, hashtags, parse_flag
 from integrations.reel_studio.igkit.resources import load_json
 
 logger = logging.getLogger(__name__)
@@ -57,9 +66,11 @@ MAX_BRIEF_CHARS = 1200
 #: Longest single line of the brief, so one long field cannot crowd out the rest.
 _BRIEF_LINE_CHARS = 240
 _FILE_NAME = 'voice.json'
+#: What reset_voice renames her profile to: voice.aside.<UTC time>.<6 hex>.json.
+_ASIDE_NAME = 'voice.aside.%s.%s.json'
 _XID = re.compile(r'[0-9a-f]{64}')
-_TRUE = frozenset({'true', 'yes', 'y', '1', 'on'})
-_FALSE = frozenset({'false', 'no', 'n', '0', 'off'})
+#: Where text for a list splits: commas or new lines, but not "15,000".
+_SEPARATORS = re.compile(r'\n|,(?!\d)')
 _EMPTY_BRIEF = ('No voice profile saved yet. Before writing for her, ask for three of her own '
                 'past captions, learn her language, tone and hashtags from them, and save each '
                 'field with reel_voice after she confirms it.')
@@ -68,7 +79,11 @@ _UNREADABLE_BRIEF = ('Her voice profile is saved on this desktop but could not b
                      'not rebuild it and do not save fields with reel_voice: saving is refused '
                      'until the key is restored, and then her whole profile is back. Write in a '
                      'plain, warm voice for now and tell her the desktop cannot read her saved '
-                     'style.')
+                     'style. Only if she says that profile is gone for good and confirms she '
+                     'wants to start over, reset it with reel_voice; the old file is kept aside, '
+                     'not deleted.')
+_NOT_EMOJI = ('%s: %r is not one emoji; give each emoji as its own item, or in text put '
+              'spaces, commas or nothing between them')
 
 
 class VoiceProfileUnreadable(RuntimeError):
@@ -76,7 +91,8 @@ class VoiceProfileUnreadable(RuntimeError):
     missing or is not the key it was saved with, or the file is damaged.
 
     Nothing was written; ``path`` is the file, left as it was.  Not a
-    ValueError: no value she gives can fix it, the key has to come back.
+    ValueError: no value she gives can fix it.  The key has to come back, or
+    she confirms she wants to start over and reset_voice moves the file aside.
     """
 
     def __init__(self, path: str):
@@ -84,8 +100,9 @@ class VoiceProfileUnreadable(RuntimeError):
         super().__init__(
             'her voice profile is saved on this desktop but could not be read: '
             'HEVOLVE_DATA_KEY is not set or is not the key it was saved with, or the file '
-            'is damaged. It was left untouched and nothing was saved; restore that '
-            'HEVOLVE_DATA_KEY and try again.')
+            'is damaged. It was left untouched and nothing was saved. Restore that '
+            'HEVOLVE_DATA_KEY and try again; or, only if she confirms she wants to start '
+            'over, reset it (reset_voice), which moves the old file aside.')
 
 
 def _field_specs() -> Mapping[str, Mapping[str, Any]]:
@@ -123,12 +140,27 @@ def _user_key(user_id) -> str:
     return key
 
 
-def _profile_path(key: str) -> str:
-    """Her profile file.  The directory is named like core.user_file_store's
-    user directories, sha256(user id)[:16], so an id never becomes a path."""
+def _user_dir(key: str) -> str:
     from core.platform_paths import get_agent_data_dir
     name = hashlib.sha256(key.encode('utf-8')).hexdigest()[:16]
-    return os.path.join(get_agent_data_dir(), 'reel_studio', name, _FILE_NAME)
+    return os.path.join(get_agent_data_dir(), 'reel_studio', name)
+
+
+def user_dir(user_id) -> str:
+    """Her Reel Studio folder,
+    ``get_agent_data_dir()/reel_studio/<sha256(user id)[:16]>``.
+
+    The one rule for where Reel Studio keeps a user's own files: her voice
+    profile is ``voice.json`` in it, and any other per-user Reel Studio file
+    belongs here too rather than in a copy of the rule.  The folder is named
+    like core.user_file_store's user folders, so an id never becomes a path.
+    Raises ValueError for a user id the store refuses.  Nothing is created.
+    """
+    return _user_dir(_user_key(user_id))
+
+
+def _profile_path(key: str) -> str:
+    return os.path.join(_user_dir(key), _FILE_NAME)
 
 
 def _lock_for(key: str) -> threading.Lock:
@@ -160,32 +192,66 @@ def _text(value, field: str, max_len: int, multiline: bool = False) -> Optional[
     return _no_controls(text, field, multiline)
 
 
+def _emoji_units(text: str, field: str) -> List[str]:
+    """Each emoji of ``text``, where she put commas, spaces, new lines or
+    nothing between them ("✨💄" is two).  Raises ValueError naming the first
+    piece that is not all emoji."""
+    units: List[str] = []
+    for piece in re.split(r'[\s,]+', text):
+        found = EMOJI_RE.findall(piece)
+        if ''.join(found) != piece:
+            raise ValueError(_NOT_EMOJI % (field, piece))
+        units.extend(found)
+    return units
+
+
+def _tag_units(piece: str) -> List[str]:
+    """Hashtags she wrote one after another in one piece of text ("#a #b",
+    "#a#b") as one item each; anything else stays one item, for _hashtag to
+    take or refuse."""
+    tags = [tag for tag, _, _ in hashtags(piece)]
+    if len(tags) > 1 and ''.join(tags) == ''.join(piece.split()):
+        return tags
+    return [piece]
+
+
 def _items(value, field: str, spec: Mapping[str, Any]) -> List[str]:
-    """A list value from a list, or from text split per the spec."""
+    """A list value from a list (each item as given), or from text split
+    per the spec.  Emoji and hashtags in text also split where she put
+    spaces or nothing between them."""
     if isinstance(value, str):
         split = spec.get('split', 'commas')
-        if split == 'none':
+        if spec['type'] == 'emoji':
+            value = _emoji_units(value, field)
+        elif spec['type'] == 'hashtags':
+            value = [tag for piece in re.split(r'[\n,]', value) for tag in _tag_units(piece)]
+        elif split == 'none':
             value = [value]
         elif split == 'lines':
             value = value.splitlines()
-        else:                              # commas or new lines; not "15,000"
-            value = re.split(r'\n|,(?!\d)', value)
+        else:
+            value = _SEPARATORS.split(value)
     if not isinstance(value, (list, tuple)):
         raise ValueError('%s must be a list or text, got %r' % (field, type(value).__name__))
     return list(value)
 
 
 def _hashtag(item: str, field: str, max_len: int) -> str:
+    """One hashtag, as igkit.hashtags reads it, with its '#' added if
+    missing."""
     tag = item if item.startswith('#') else '#' + item
-    if len(tag) < 2 or len(tag) > max_len or not all(is_tag_char(c) for c in tag[1:]):
+    if len(tag) > max_len or [t for t, _, _ in hashtags(tag)] != [tag]:
         raise ValueError('%s: %r is not one hashtag (letters, digits and _ only, at most %d '
-                         'characters)' % (field, item, max_len))
+                         'characters); separate tags with commas or spaces'
+                         % (field, item, max_len))
     return tag
 
 
 def _emoji(item: str, field: str, max_len: int) -> str:
-    if len(item) > max_len or any(unicodedata.category(c)[0] in 'LN' for c in item):
-        raise ValueError('%s: %r is not an emoji' % (field, item))
+    """Exactly one emoji, as igkit.EMOJI_RE reads it (a keycap, a flag, or
+    an emoji with its selector, skin tone and joined parts)."""
+    if len(item) > max_len or not EMOJI_RE.fullmatch(item):
+        raise ValueError(_NOT_EMOJI % (field, item))
     return item
 
 
@@ -225,17 +291,13 @@ def _choice(value, field: str, choices) -> Optional[str]:
 
 
 def _bool(value, field: str) -> Optional[bool]:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        key = value.strip().lower()
-        if not key:
-            return None
-        if key in _TRUE:
-            return True
-        if key in _FALSE:
-            return False
-    raise ValueError('%s must be yes or no, got %r' % (field, value))
+    """igkit.parse_flag's yes/no; blank text clears the field."""
+    if isinstance(value, str) and not value.strip():
+        return None
+    flag = parse_flag(value)
+    if flag is None:
+        raise ValueError('%s must be yes or no, got %r' % (field, value))
+    return flag
 
 
 def _int(value, field: str, lo: int, hi: int) -> Optional[int]:
@@ -263,8 +325,9 @@ def _coerce(field: str, value) -> Any:
     """The stored form of ``value`` for ``field``; None clears the field.
 
     Text from the agent is accepted for every type: "170" for a number,
-    "yes" for a flag, "#a, #b" for a list.  Raises ValueError for an unknown
-    field or a value its spec refuses.
+    "yes" (or 1) for a flag, "#a, #b" or "#a #b" for hashtags, "✨💄" or
+    "✨ 💄" for emoji.  Raises ValueError for an unknown field or a value
+    its spec refuses.
     """
     spec = FIELD_SPECS.get(field) if isinstance(field, str) else None
     if spec is None:
@@ -415,6 +478,35 @@ def update_field(user_id, field: str, value: Any) -> Dict[str, Any]:
         return dict(fields)
 
 
+def reset_voice(user_id) -> Optional[str]:
+    """Start her profile over: move her saved profile aside and return the
+    path it now has, or None when she has no profile.
+
+    For a profile that cannot be read (VoiceProfileUnreadable) once she has
+    confirmed she wants to start again; a readable profile is set aside the
+    same way.  The file is renamed, never rewritten or deleted, to
+    ``voice.aside.<UTC time>.<6 hex>.json`` in her folder, still encrypted
+    with the key it was saved with, so it can be put back by hand if that
+    key returns.  Saving works again afterwards.  Raises ValueError for a
+    bad user id, and PermissionError, moving nothing, for a readable file
+    another user id wrote.
+    """
+    key = _user_key(user_id)
+    with _lock_for(key):
+        path = _profile_path(key)
+        if not os.path.exists(path):
+            return None
+        try:
+            _read(key)                     # another user's file raises PermissionError
+        except VoiceProfileUnreadable as exc:
+            logger.info('voice profile %s cannot be read; setting it aside', exc.path)
+        aside = os.path.join(os.path.dirname(path), _ASIDE_NAME % (
+            time.strftime('%Y%m%dT%H%M%SZ', time.gmtime()), uuid.uuid4().hex[:6]))
+        os.replace(path, aside)
+        logger.warning('voice profile for %s set aside as %s; she starts over', key, aside)
+        return aside
+
+
 def _brief_value(value: Any, kind: str) -> str:
     if isinstance(value, bool):
         return 'yes' if value else 'no'
@@ -429,7 +521,12 @@ def voice_brief(user_id) -> str:
     ``brief: false`` (the logo id, sample captions) is left out, a long line
     is shortened, and fields that no longer fit are dropped.  With no
     profile it says so and how to start one; with a profile that exists but
-    cannot be read it says that, and not to rebuild it."""
+    cannot be read it says that, not to rebuild it, and to reset it only
+    after she confirms.
+
+    Raises, as load_voice does, ValueError for a user id that is not
+    non-empty text or an int and PermissionError for another user's file.
+    """
     try:
         fields = load_voice(user_id)
     except VoiceProfileUnreadable:

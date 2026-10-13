@@ -11,6 +11,11 @@ puts in front of a skill text, so it is bounded at 1,200 characters.
 A profile that exists but cannot be read (HEVOLVE_DATA_KEY missing for a
 launch, rotated, or the file damaged) is never overwritten: 46848b568 read it
 as empty and the next update_field replaced her whole profile with one field.
+reset_voice is the deliberate way out: it moves the file aside, never deletes it.
+
+Values arrive as an agent or a person writes them: 4a4c3f95 stored emoji
+typed side by side (or with a space) as ONE allowlist item, so the humanizer
+still flagged each of them, and refused space-separated hashtags.
 """
 import hashlib
 import os
@@ -20,6 +25,7 @@ import pytest
 from cryptography.fernet import Fernet
 
 XID = 'ab' * 32
+SPARKLE, LIPSTICK = '✨', '\U0001F484'
 FULL = {'name': 'Meena Studio', 'city': 'Madurai', 'hashtag_bank': ['#maduraimua', '#bridalmakeup'],
         'sample_captions': ['Reception look in 40 minutes, Chennai humidity and all.'],
         'style_notes': 'soft glam, no heavy contour'}
@@ -113,6 +119,100 @@ def test_values_given_as_text_are_read(vp):
     vp.update_field('u1', 'caption_language', 'TA')
     assert vp.load_voice('u1') == {'wpm': 170, 'code_mix': True, 'caption_language': 'ta',
                                    'hashtag_bank': ['#maduraimua', '#bridalmakeup']}
+
+
+def test_a_flag_may_be_given_as_one_or_zero(vp):
+    assert vp.update_field('u1', 'code_mix', 1) == {'code_mix': True}
+    assert vp.update_field('u1', 'code_mix', 0) == {'code_mix': False}
+    with pytest.raises(ValueError):
+        vp.update_field('u1', 'code_mix', 2)
+
+
+# ── emoji and hashtags as an agent or a person writes them ─────────────────
+
+@pytest.mark.parametrize('text', [
+    SPARKLE + LIPSTICK,                    # side by side, as a phone keyboard writes them
+    SPARKLE + ' ' + LIPSTICK,
+    SPARKLE + ', ' + LIPSTICK,
+    ' ' + SPARKLE + '\n' + LIPSTICK + ' ',
+])
+def test_emoji_given_as_text_are_stored_one_by_one(vp, text):
+    # 4a4c3f95 stored sparkle+lipstick (and sparkle-space-lipstick) as ONE
+    # item; the humanizer removes each allowlisted item as written, so a
+    # lone sparkle in her caption was still reported as an AI tell.
+    assert vp.update_field('u1', 'emoji', text) == {'emoji': [SPARKLE, LIPSTICK]}
+
+
+def test_her_emoji_saved_as_text_are_not_flagged_by_the_humanizer(vp):
+    from integrations.reel_studio.igkit import humanize
+    text = 'Reception look ' + SPARKLE + ' for Priya'
+    assert 'rocket' in [s['id'] for s in humanize.humanize_text(text)['report']['structures']]
+    vp.update_field('u1', 'emoji', SPARKLE + LIPSTICK)
+    keep = vp.load_voice('u1')['emoji']
+    report = humanize.humanize_text(text, keep_emoji=keep)['report']
+    assert 'rocket' not in [s['id'] for s in report['structures']]
+
+
+@pytest.mark.parametrize('emoji', [
+    '1\ufe0f\u20e3',                                   # keycap one
+    '\U0001F1EE\U0001F1F3',                            # a flag: two regional indicators
+    '\U0001F470\u200d♀\ufe0f',                    # bride: woman, joined
+    '❤\ufe0f',                                    # red heart with its selector
+    '\U0001F44D\U0001F3FD',                            # thumbs up with a skin tone
+    '\U0001F469\U0001F3FD\u200d❤\ufe0f\u200d\U0001F48B\u200d\U0001F468\U0001F3FF',
+])
+def test_one_emoji_of_several_code_points_is_one_item(vp, emoji):
+    assert vp.update_field('u1', 'emoji', emoji) == {'emoji': [emoji]}
+    assert vp.update_field('u1', 'emoji', [emoji]) == {'emoji': [emoji]}
+    assert vp.update_field('u1', 'emoji', emoji + SPARKLE) == {'emoji': [emoji, SPARKLE]}
+
+
+@pytest.mark.parametrize('value', [
+    '!!', '-', '#', '1', 'abc', SPARKLE + 'abc', SPARKLE + '!', SPARKLE + ' x',
+    ['!!'], ['-'], [SPARKLE + LIPSTICK], [SPARKLE + ' ' + LIPSTICK],
+])
+def test_what_is_not_one_emoji_is_refused(vp, value):
+    # Text is split into single emoji; a list item must already be one.
+    with pytest.raises(ValueError, match='emoji'):
+        vp.update_field('u1', 'emoji', value)
+    assert vp.load_voice('u1') == {}
+
+
+@pytest.mark.parametrize('text', [
+    '#maduraimua #bridalmakeup #chennaimua',
+    '#maduraimua  #bridalmakeup\t#chennaimua ',
+    '#maduraimua#bridalmakeup #chennaimua',
+    '#maduraimua, #bridalmakeup #chennaimua',
+    'maduraimua, bridalmakeup,\n#chennaimua',
+])
+def test_hashtags_given_as_text_may_be_separated_by_spaces(vp, text):
+    assert vp.update_field('u1', 'hashtag_bank', text) == {
+        'hashtag_bank': ['#maduraimua', '#bridalmakeup', '#chennaimua']}
+
+
+@pytest.mark.parametrize('text', ['bridal makeup', '#bridal makeup', 'chennai mua, #maduraimua'])
+def test_words_with_a_space_are_not_guessed_into_tags(vp, text):
+    # "bridal makeup" may be one tag or two: refused, and the message says
+    # how to write them.
+    with pytest.raises(ValueError, match='commas or spaces'):
+        vp.update_field('u1', 'hashtag_bank', text)
+
+
+# ── her folder and starting over ────────────────────────────────────────────
+
+def test_user_dir_is_her_profiles_folder_and_is_not_created(vp, tmp_path):
+    folder = vp.user_dir('u1')
+    assert folder == str(_file(tmp_path, 'u1').parent)
+    assert not os.path.exists(folder)
+    assert vp.user_dir(10077) == vp.user_dir(' 10077 ')
+    vp.update_field('u1', 'city', 'Madurai')
+    assert os.listdir(vp.user_dir('u1')) == ['voice.json']
+
+
+@pytest.mark.parametrize('bad', ['', '   ', None, True, b'u1'])
+def test_user_dir_refuses_a_user_id_the_store_refuses(vp, bad):
+    with pytest.raises(ValueError):
+        vp.user_dir(bad)
 
 
 def test_the_logo_xid_is_stored(vp):
@@ -316,6 +416,78 @@ def test_the_brief_says_her_profile_exists_but_could_not_be_read(vp, tmp_path, m
     # field by field.
     assert 'no voice profile' not in brief.lower()
     assert brief != vp.voice_brief('nobody')
+
+
+@pytest.mark.parametrize('how', ['no key', 'other key', 'damaged'])
+def test_a_reset_sets_an_unreadable_profile_aside_and_she_can_start_over(vp, tmp_path,
+                                                                        monkeypatch, how):
+    # Without a deliberate reset an unreadable profile blocks every save for
+    # good, and the only way out was deleting the file by hand.
+    vp.save_voice('u1', FULL)
+    path = _file(tmp_path, 'u1')
+    _lose_the_key(monkeypatch, path, how)
+    before = path.read_bytes()
+
+    aside = vp.reset_voice('u1')
+
+    assert not path.exists()
+    assert os.path.dirname(aside) == str(path.parent)
+    with open(aside, 'rb') as f:
+        assert f.read() == before                   # moved, never rewritten or deleted
+    assert vp.update_field('u1', 'city', 'Chennai') == {'city': 'Chennai'}
+    assert vp.load_voice('u1') == {'city': 'Chennai'}
+    assert 'could not be read' not in vp.voice_brief('u1')
+
+
+def test_a_set_aside_profile_is_whole_when_its_key_comes_back(vp, monkeypatch):
+    from security.crypto import decrypt_json_file
+    key = os.environ['HEVOLVE_DATA_KEY']
+    vp.save_voice('u1', FULL)
+    monkeypatch.delenv('HEVOLVE_DATA_KEY')
+    aside = vp.reset_voice('u1')
+    monkeypatch.setenv('HEVOLVE_DATA_KEY', key)
+    assert decrypt_json_file(aside)['fields'] == FULL
+
+
+def test_a_reset_keeps_a_readable_profile_aside_too(vp, tmp_path):
+    vp.save_voice('u1', FULL)
+    aside = vp.reset_voice('u1')
+    assert vp.load_voice('u1') == {}
+    assert sorted(os.listdir(_file(tmp_path, 'u1').parent)) == [os.path.basename(aside)]
+
+
+def test_a_reset_with_no_profile_does_nothing(vp, tmp_path):
+    assert vp.reset_voice('u1') is None
+    assert not _root(tmp_path).exists()
+
+
+def test_a_reset_never_moves_another_users_profile(vp, tmp_path):
+    from security.crypto import encrypt_json_file
+    path = _file(tmp_path, 'u1')
+    path.parent.mkdir(parents=True)
+    encrypt_json_file(str(path), {'schema': vp.VOICE_SCHEMA, 'user_id': 'someone-else',
+                                  'fields': {'city': 'Chennai'}})
+    before = path.read_bytes()
+    with pytest.raises(PermissionError):
+        vp.reset_voice('u1')
+    assert path.read_bytes() == before
+    assert os.listdir(path.parent) == ['voice.json']
+
+
+def test_the_unreadable_error_and_brief_say_how_to_start_over(vp, monkeypatch):
+    vp.save_voice('u1', FULL)
+    monkeypatch.delenv('HEVOLVE_DATA_KEY')
+    with pytest.raises(vp.VoiceProfileUnreadable, match='reset'):
+        vp.update_field('u1', 'city', 'Chennai')
+    brief = vp.voice_brief('u1')
+    assert 'confirm' in brief and 'reset' in brief
+    assert len(brief) <= vp.MAX_BRIEF_CHARS
+
+
+@pytest.mark.parametrize('bad', ['', None, True, b'u1'])
+def test_the_brief_refuses_a_bad_user_id_like_every_other_call(vp, bad):
+    with pytest.raises(ValueError):
+        vp.voice_brief(bad)
 
 
 def test_a_profile_saved_without_a_key_is_read_once_a_key_is_set(vp, tmp_path, monkeypatch):

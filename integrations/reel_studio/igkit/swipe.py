@@ -27,7 +27,7 @@ import re
 import statistics
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
-from integrations.reel_studio.igkit import words
+from integrations.reel_studio.igkit import parse_flag, words
 from integrations.reel_studio.igkit.hooks import classify_hook, rate_hook
 
 #: Most recent reels an account's baseline is taken from, and the fewest
@@ -165,8 +165,9 @@ def rank_reels(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any]:
     ``artist``, ``lang``, ``should_mute``, ``highlight_start_ms`` (an int or a
     list) and ``weight`` (default 1.0).  Counts may be ints, or text such
     as "412,000" or "1.2M"; text that is not one count is no count.
-    Rows whose song is muted, and rows with no views, are
-    dropped and counted.  The caller's rows are not changed.
+    Rows whose song is muted (``should_mute`` True, 1, or text such as
+    "true" or "yes"; the string "false" is not muted), and rows with no
+    views, are dropped and counted.  The caller's rows are not changed.
 
     Returns ``{'baseline': 'account median'|'follower count', 'n',
     'accounts', 'reels', 'top_formulas': [[name, count]], 'top_hook_score',
@@ -185,7 +186,7 @@ def rank_reels(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any]:
         if not isinstance(raw, Mapping):
             raise TypeError('a reel row must be a mapping, got %r' % (type(raw).__name__,))
         r = dict(raw)
-        if r.get('should_mute'):
+        if parse_flag(r.get('should_mute')):
             dropped['should_mute'] += 1
             continue
         views = _amount(r.get('views'))

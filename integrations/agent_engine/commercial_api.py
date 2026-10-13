@@ -11,7 +11,6 @@ Blueprint Pattern: Blueprint('commercial_api', __name__).
 import hashlib
 import hmac
 import logging
-import os
 import secrets
 import time
 from datetime import datetime, timedelta
@@ -54,21 +53,6 @@ def _invalid_tier_error(tier) -> str:
     """The ONE wording for a tier that is not in the table (service and route)."""
     return f'Invalid tier: {tier}. Valid: {list(TIER_CONFIG.keys())}'
 
-
-def _mock_payments_allowed(user) -> bool:
-    """May this caller's tier upgrade be settled by the MockPaymentGateway?
-
-    The mock authorizes any payment_method string, so for a paying customer
-    it is a free tier (review of 0cf610371: a plain user named
-    ``gateway: mock``, or hit a node without Stripe, and got enterprise for
-    nothing, with the $499 recorded in the ledger as paid).  Only an operator
-    (integrations.social.auth.holds_central_role) or a node in the existing
-    dev mode (HEVOLVE_DEV_MODE=true, which central forces to false at boot)
-    may settle through the mock.
-    """
-    from integrations.social.auth import holds_central_role
-    from security.master_key import is_dev_mode     # the ONE dev-mode switch
-    return holds_central_role(user) or is_dev_mode()
 
 COST_PER_1K_TOKENS = {
     'free': 0.0,
@@ -1072,7 +1056,8 @@ def upgrade_key(key_id):
         # MockPaymentGateway, which authorizes any payment_method string
         # (review of 0cf610371, measured on the real route).  A Mock result
         # is a paid tier for nothing, so it is refused unless the caller is an
-        # operator or the node is in dev mode (_mock_payments_allowed).
+        # operator or the node is in dev mode: ap2_protocol.mock_settlement_allowed,
+        # the one rule, which the McGroce cart settler reads too.
         #
         # PhonePe is intentionally NOT selected here even when registered —
         # it is a redirect-then-webhook flow.  Selecting it synchronously
@@ -1091,14 +1076,14 @@ def upgrade_key(key_id):
                          'Stripe (set STRIPE_API_KEY).',
             }), 501
         try:
-            from integrations.ap2 import PaymentGateway as _PG
+            from integrations.ap2 import PaymentGateway as _PG, mock_settlement_allowed
             _gateway_choice = payment_ledger.select_gateway('USD')
         except Exception as _sel_err:
             return jsonify({
                 'success': False,
                 'error': f'No payment gateway could be selected: {_sel_err}',
             }), 503
-        if _gateway_choice == _PG.MOCK and not _mock_payments_allowed(user):
+        if _gateway_choice == _PG.MOCK and not mock_settlement_allowed(user):
             return jsonify({
                 'success': False,
                 'error': 'No live USD payment gateway (Stripe) is configured on '

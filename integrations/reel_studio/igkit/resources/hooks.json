@@ -3,7 +3,8 @@
   "source": "Derived from instagram-agent-skill @d03c56b skills/ig-reel/hooks.json (MIT License, Copyright (c) 2026 Jake Schincariol; see ../LICENSE.txt).",
   "modified": [
     "Added formulas 27-30 for makeup reels (bare face to bride, shade match, jewellery or drape reveal, client reaction); their match patterns also read Tamil, Hindi and Punjabi words. They are classified first, so each pattern needs a makeup word beside its broad one: 'transformation' with bride/bridal/makeup, 'wait for the' with the piece, 'nath' with bridal/gold/kundan, 'reaction' with her/the bride/mom. A bare 'reaction' or 'nath' (also a surname) relabelled other niches' hooks in swipe's research.",
-    "Read by igkit.hooks (classify_hook) and igkit.swipe; upstream hookscore.py never loaded this file."
+    "Read by igkit.hooks (classify_hook) and igkit.swipe; upstream hookscore.py never loaded this file.",
+    "Formulas 4 and 23 match the same hooks as upstream with patterns that try each run of digits, each '$N' and each 'replaced' once; upstream's restarted at every one of them (0.9 s on a 10,000-character line, 7 s on 40,000)."
   ],
   "note": "30 hook formulas for Reels (26 upstream, 4 for makeup). A Reel has two hooks that fire at the same time and they are not the same sentence: the first thing you say, and the first thing on screen. The spoken hook has about two seconds. The on-screen hook has about one, because it is read before it is heard. Every formula here carries a template, a filled example, the on-screen version, what it is for, and the way it usually gets ruined. Each formula also carries a `match` regex, so the same vocabulary can name a hook found in the wild and not only write a new one. Walk them in `classify_order`, which is most specific first, case-insensitive.",
   "rules": [
@@ -53,7 +54,7 @@
       "on_screen": "$2,000 -> $12",
       "best_for": "Demos and tool videos. The price gap does the work.",
       "trap": "Overstating the replacement. If it replaced 60% of the job, say 60%, or the comments will say it for you.",
-      "match": "\\breplaced?\\b[^.!?]*\\$\\s?\\d|\\$\\s?\\d[^.!?]*\\breplaced?\\b|\\binstead of (?:paying|hiring)\\b"
+      "match": "\\breplaced?\\b(?:(?!\\breplaced?\\b)[^.!?])*\\$\\s?\\d|\\$\\s?\\d(?:(?!\\$\\s?\\d)[^.!?])*\\breplaced?\\b|\\binstead of (?:paying|hiring)\\b"
     },
     {
       "id": 5,
@@ -243,7 +244,7 @@
       "on_screen": "33% NEVER READ AGAIN",
       "best_for": "Sends. A number a person can repeat at dinner gets sent to somebody.",
       "trap": "A statistic you cannot source. Say where it came from in the video or do not use it.",
-      "match": "^\\s*\\d[\\d,.]*\\s?%|\\b\\d[\\d,.]*\\s?%\\s+of\\b"
+      "match": "^\\s*\\d[\\d,.]*\\s?%|(?<!\\d[,.])\\b\\d[\\d,.]*\\s?%\\s+of\\b"
     },
     {
       "id": 24,

@@ -2516,7 +2516,7 @@ _inject_http_transport()
 # (single source of truth — no duplicate mapping table here)
 
 
-def publish_async(topic, message, timeout=2.0):
+def publish_async(topic, message, timeout=2.0, skip_crossbar=False):
     """
     Publish to all available transports: LOCAL EventBus + PeerLink + Crossbar.
 
@@ -2549,6 +2549,13 @@ def publish_async(topic, message, timeout=2.0):
             f-strings.
         message: Message payload (JSON string or dict)
         timeout: Maximum time for HTTP Crossbar publish (default: 2.0 seconds)
+        skip_crossbar: True keeps the message on this node's own legs -- the
+            MessageBus (LOCAL + the user's own devices over PeerLink) and the
+            desktop's SSE -- and off the HTTP Crossbar leg, which reaches
+            central (Reel Studio decision U4(d): a reel push names her
+            clients).  Every stamp above still applies.  Nunba's wrapper must
+            forward it; callers pass it only when True, so a wrapper that
+            takes (topic, message, timeout) keeps working for everyone else.
 
     Where a chat reply came from: every chat.* envelope but the voice (a
     'TTS' payload) leaves here stamped ``served_by`` = local | hive | cloud
@@ -2681,8 +2688,9 @@ def publish_async(topic, message, timeout=2.0):
         except Exception as _sse_err:
             app.logger.debug(f"SSE fan-out skipped: {_sse_err}")
 
-    # 3. HTTP Crossbar for cloud telemetry + legacy mobile (when internet available)
-    if client is None:
+    # 3. HTTP Crossbar for cloud telemetry + legacy mobile (when internet
+    # available) -- unless the caller keeps this message on the node.
+    if client is None or skip_crossbar:
         return
 
     raw_message = message if isinstance(message, str) else json.dumps(message, default=str)
@@ -10194,11 +10202,14 @@ def chat():
     # record.  The creation hint is held until the gather save stamps it.
     if prompt_id is not None:
         from core.cache_loaders import load_agent_config as _load_agent_record
+        from core.intelligence_preference import IntelligencePreference
         from integrations.agent_engine.marketing_tools import (
-            hold_goal_tag_hint, is_local_only)
+            goal_tags_preference, hold_goal_tag_hint)
         _hint_tags = hold_goal_tag_hint(f'{user_id}_{prompt_id}', data.get('goal_tags'))
-        if is_local_only(_hint_tags) or is_local_only(
-                (_load_agent_record(prompt_id) or {}).get('goal_tags')):
+        _record_tags = (_load_agent_record(prompt_id) or {}).get('goal_tags')
+        _agent_pref = goal_tags_preference(
+            list(_hint_tags) + (_record_tags if isinstance(_record_tags, list) else []))
+        if _agent_pref is IntelligencePreference.LOCAL_ONLY:
             # This agent's turns stay on this node (decision U4: her clients'
             # faces), in memory only -- nothing is persisted.  An agent-bound
             # turn reads intelligence_preference nowhere below (draft-first
@@ -10208,7 +10219,7 @@ def chat():
             if model_config or speculative:
                 app.logger.info(f'chat: agent {prompt_id} keeps to this node; '
                                 f'ignoring the turn\'s model_config/speculative')
-            intelligence_preference = 'local_only'
+            intelligence_preference = _agent_pref
             model_config = None
             speculative = False
     # The turn's file references (plan 4.2(e)), bound to this user, agent and
@@ -10926,19 +10937,17 @@ def chat():
             def _save_and_enter_review(agent_config):
                 agent_config['prompt_id'] = prompt_id
                 agent_config['creator_user_id'] = user_id
-                # Reel Studio (plan WS-8a): the record carries the user-
-                # assignable goal tags of the held creation hint and of its
-                # own words, so CREATE and REUSE build her agent with its
+                # Reel Studio (plan WS-8a, amendment A8 c): the record carries
+                # the user-assignable goal tags of the held creation hint, and
+                # only those, so CREATE and REUSE build her agent with its
                 # tools.  Any other record is written exactly as before.
                 from integrations.agent_engine.marketing_tools import (
                     drop_goal_tag_hint, held_goal_tag_hint, is_local_only,
                     stamp_goal_tags)
-                _stamped = stamp_goal_tags(held_goal_tag_hint(turn_key), agent_config)
-                if _stamped:
-                    _stored = agent_config.get('goal_tags')
-                    agent_config['goal_tags'] = sorted(set(_stamped) | {
-                        t for t in (_stored if isinstance(_stored, list) else [])
-                        if isinstance(t, str) and t})
+                _stamped = stamp_goal_tags(held_goal_tag_hint(turn_key),
+                                           agent_config.get('goal_tags'))
+                if _stamped is not None:
+                    agent_config['goal_tags'] = _stamped
                 with _user_lock:
                     conversation_agent[_ak] = False
                     _touch_agent_timestamp(_ak)

@@ -5,10 +5,11 @@ Plan WS-8a step 2 (critique finding 2).  The phone's Reel Studio entry sends
 written only when gathering ends -- turns later, by _save_and_enter_review --
 and her instructions need not contain a single reel phrase.  So /chat holds
 the hint per '{user_id}_{prompt_id}' (the gather-turn key) until the save, and
-the save stamps ``goal_tags`` = the user-assignable tags of (hint plus what
-the saved goal itself says).  A reel agent's record is then not synced to the
-cloud prompt list (decision U4(c)).  Any other agent's record is written
-exactly as before.
+the save stamps ``goal_tags`` = the user-assignable tags of that hint -- ONLY
+the explicit hint: the saved goal's own words never stamp it (amendment A8 c).
+A reel agent's record is then not synced to the cloud prompt list (decision
+U4(c)).  Any other agent's record is written exactly as before, and on the
+CENTRAL node the hint stamps nothing (amendment A8 d).
 
 Driven through the REAL /chat (app.test_client) with the body Nunba's
 hevolve_chat forwards for a phone turn.  Boundaries replaced: gather_info
@@ -140,13 +141,49 @@ def test_a_hint_on_the_first_turn_is_stamped_when_gathering_ends(chat):
         "a reel_studio record must not be posted to the cloud's createpromptlist")
 
 
-def test_no_hint_but_the_saved_goal_names_it(chat):
-    chat.answers += [REVIEW, _completed('Make bridal makeup reels from my clips',
+def test_no_hint_no_stamp_even_when_the_saved_goal_names_reels(chat):
+    """Her words alone never stamp the tag: detection grants the reel tools
+    per turn, but only the explicit hint keeps an agent on this node."""
+    chat.answers += [REVIEW, _completed('Reel studio: edit my reels and edit my clips',
                                         ['Cut the clips to the beat'])]
     chat.turn('make my reels')
     chat.turn('yes')
-    assert chat.saved()['goal_tags'] == ['reel_studio']
-    assert chat.cloud_syncs() == []
+    assert 'goal_tags' not in chat.saved()
+    assert len(chat.cloud_syncs()) == 1
+
+
+def test_a_reel_tag_the_gather_llm_wrote_itself_is_dropped(chat):
+    """The gathered JSON is the record: a reel_studio in it without her hint
+    is not trusted (amendment A8 c); its other tags are kept."""
+    answer = dict(json.loads(_completed('Help my salon', ['Edit the clips'])),
+                  goal_tags=['reel_studio', 'news'])
+    chat.answers += [REVIEW, json.dumps(answer)]
+    chat.turn('help my salon')
+    chat.turn('yes')
+    assert chat.saved()['goal_tags'] == ['news']
+    assert len(chat.cloud_syncs()) == 1
+
+
+def test_a_commerce_lane_goal_is_saved_and_synced_as_before(chat):
+    answer = _completed('Find bridal makeup artists in Chennai and pitch our lash '
+                        'extensions', ['Post Instagram reels to makeup artists'])
+    chat.answers += [REVIEW, answer]
+    chat.turn('find makeup artists for our lash extensions')
+    chat.turn('yes')
+    assert chat.saved() == dict(json.loads(answer), prompt_id=chat.pid,
+                                creator_user_id=chat.user)
+    assert len(chat.cloud_syncs()) == 1
+
+
+def test_on_central_the_hint_stamps_nothing(chat, monkeypatch):
+    from security import key_delegation
+    monkeypatch.setattr(key_delegation, 'get_node_tier', lambda: 'central')
+    chat.answers += [REVIEW, _completed('Help my salon', ['Edit the clips'])]
+    chat.turn('help my salon', goal_tags=['reel_studio'])
+    chat.turn('yes')
+    assert 'goal_tags' not in chat.saved()
+    assert len(chat.cloud_syncs()) == 1, (
+        'central skipped the cloud prompt-list sync for a reel hint')
 
 
 def test_a_hint_that_is_not_user_assignable_is_ignored(chat):

@@ -62,6 +62,38 @@ class TestWords:
         assert igkit.concrete_markers('Base by Kryolan only') == ['Kryolan']
 
 
+class TestSharedPrimitives:
+    """One definition each of a hashtag, an emoji and a yes/no value, for
+    the caption linter, the hook check, the humanizer, swipe and her voice
+    profile."""
+
+    def test_hashtags_spaced_glued_or_after_an_emoji_in_any_script(self):
+        text = '#a #b#c ✨#மணப்பெண் (#d) x#y page#z ## C#'
+        assert [t for t, _, _ in igkit.hashtags(text)] == [
+            '#a', '#b', '#c', '#மணப்பெண்', '#d']
+
+    def test_hashtag_positions(self):
+        assert igkit.hashtags('ab #cd') == [('#cd', 3, 6)]
+        assert igkit.hashtags('') == [] and igkit.hashtags(None) == []
+
+    @pytest.mark.parametrize('text,units', [
+        ('✨\U0001F484', ['✨', '\U0001F484']),
+        ('1\ufe0f\u20e3 \U0001F1EE\U0001F1F3', ['1\ufe0f\u20e3', '\U0001F1EE\U0001F1F3']),
+        ('\U0001F470\u200d♀\ufe0f✨', ['\U0001F470\u200d♀\ufe0f', '✨']),
+        ('Bare face → bride!!', []),
+    ])
+    def test_emoji_as_she_sees_them(self, text, units):
+        assert igkit.EMOJI_RE.findall(text) == units
+
+    @pytest.mark.parametrize('value,flag', [
+        (True, True), (False, False), (1, True), (0, False), ('yes', True), (' TRUE ', True),
+        ('on', True), ('1', True), ('no', False), ('False', False), ('off', False), ('0', False),
+        (None, None), ('', None), ('  ', None), ('maybe', None), (2, None), (1.0, None),
+    ])
+    def test_parse_flag(self, value, flag):
+        assert igkit.parse_flag(value) is flag
+
+
 class TestRateHook:
     def test_a_tamil_hook_is_counted_not_empty(self):
         r = hooks.rate_hook(TAMIL_HOOK)
@@ -86,6 +118,21 @@ class TestRateHook:
     def test_a_tamil_greeting_is_a_dealbreaker(self):
         r = hooks.rate_hook('வணக்கம் friends, இன்னைக்கு ஒரு bridal look')
         assert any(f.startswith('Greeting') for f in r['flags'])
+
+    @pytest.mark.parametrize('hook', ['Bare face to bride in 20 minutes ✨#bridal',
+                                      'Bare face to bride in 20 minutes #a#b',
+                                      'மணப்பெண் லுக் 20 நிமிடத்தில் #மணப்பெண்'])
+    def test_a_hashtag_anywhere_is_one_dealbreaker(self, hook):
+        flags = hooks.rate_hook(hook)['flags']
+        assert sum(f.startswith('Hashtag') for f in flags) == 1
+
+    def test_a_hash_inside_a_word_is_not_a_hashtag(self):
+        flags = hooks.rate_hook('Look#2 in 20 minutes, no grey cast')['flags']
+        assert not any(f.startswith('Hashtag') for f in flags)
+
+    def test_a_keycap_in_the_hook_is_an_emoji(self):
+        flags = hooks.rate_hook('1\ufe0f\u20e3 base mistake brides make in humidity')['flags']
+        assert any(f.startswith('Emoji') for f in flags)
 
     def test_a_word_that_starts_with_hi_is_not_a_greeting_opener(self):
         # Upstream matched openers as prefixes, so "Highlighter" opened with "hi".
@@ -227,3 +274,21 @@ class TestBeatSheet:
     def test_a_bad_rate_is_refused(self, wpm):
         with pytest.raises(ValueError):
             hooks.beat_sheet('one line', wpm=wpm)
+
+    def test_a_loop_word_with_many_digits_keeps_its_separators(self):
+        a = hooks.beat_sheet('Rs 1500000 for the bridal look.\nWorth Rs 1500000.')
+        assert any('1,500,000' in n for n in a['notes'] if n.startswith('Loops:'))
+
+
+@pytest.mark.parametrize('unit', ['1,', '1.', '$1,', '1'])
+def test_a_long_line_is_checked_in_linear_time(unit):
+    # "The Statistic" ("\b\d[\d,.]*%") and "The Replacement" ("\$\d[^.!?]*
+    # replaced") restarted at every digit or "$" of a run, and the beat
+    # sheet's thousands separator scanned to the end from every digit: 7 s
+    # and 4 s on 40,000 characters of "1,1,1,".
+    import time
+    text = unit * (40000 // len(unit))
+    started = time.perf_counter()
+    hooks.score_hooks([text])
+    hooks.beat_sheet(text)
+    assert time.perf_counter() - started < 3.0

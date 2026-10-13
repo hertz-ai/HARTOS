@@ -15,7 +15,9 @@ humanize_text, three passes in this order:
   1. INVISIBLE   delete or normalise characters a keyboard never produces
                  (zero-width spaces, word joiners, soft hyphens, BOMs, tag
                  characters, non-breaking spaces).  Joiners inside Indic
-                 words and emoji stay.
+                 words and emoji stay.  Whitespace is then folded as a
+                 phone writes it (line breaks, at most one blank line,
+                 single spaces).
   2. TYPOGRAPHIC em dash -> comma, en dash -> hyphen, curly quotes ->
                  straight, ellipsis -> three dots, bullet -> hyphen.
   3. LEXICAL     the slop lexicon (resources/slop.json) -> plain words, keeping
@@ -36,13 +38,22 @@ import statistics
 import unicodedata
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
-from integrations.reel_studio.igkit import (JOINERS, ME_WORDS, YOU_WORDS, concrete_markers,
-                                            sentences, word_keys, words)
+from integrations.reel_studio.igkit import (EMOJI_RE, JOINERS, ME_WORDS, YOU_WORDS, clamp_score,
+                                            concrete_markers, sentences, word_keys, words)
 from integrations.reel_studio.igkit.resources import load_json
 
 logger = logging.getLogger(__name__)
 
-URL_RE = re.compile(r'https?://\S+|www\.\S+|\S+@\S+\.\S+')
+#: Links and e-mail addresses, left alone by every pass.  An address starts
+#: where its run of non-space, non-'@' characters does; upstream's
+#: "\S+@\S+\.\S+" restarted inside every run and backtracked over its own
+#: '@'s (5.9 s on a 2,200-character caption of "a@a@...", 7 s on 40,000
+#: letters with no space).  This is one pass.
+URL_RE = re.compile(r'https?://\S+|www\.\S+|(?<![^\s@])[^\s@]+@[^\s@]+\.[^\s@]+')
+#: A run of ASCII whitespace holding a line break, or of two or more spaces
+#: and tabs.  Hard spaces are not in it: the invisible pass reports and
+#: normalises them, and the detector counts them.
+_SPACE_RUN = re.compile(r'[ \t\f\v]*(?:\r\n?|\n)[ \t\r\n\f\v]*|[ \t\f\v]{2,}')
 #: The detector's five checks, in report order.
 DETECT_CHECKS = ('BURSTINESS', 'SPECIFICITY', 'SLOP DENSITY', 'FINGERPRINT', 'VOICE')
 
@@ -102,6 +113,23 @@ def _invisible(text: str, i: int) -> bool:
 
 
 # ── humanize ────────────────────────────────────────────────────────────────
+
+def _fold_space(text: str) -> str:
+    """Whitespace as a phone writes it, in one pass: "\\n" line breaks, at
+    most one blank line, no spaces or tabs beside a line break, and one
+    space for a run of spaces or tabs.
+
+    The lexical pass ends with the same folds; doing them first means no
+    later pattern meets a long whitespace run, where patterns such as
+    "\\s*X" restart at every character of it (6 s on 20,000 blank lines).
+    """
+    def fold(m: 're.Match') -> str:
+        run = m.group(0)
+        breaks = run.count('\n') + run.count('\r') - run.count('\r\n')
+        return '\n\n' if breaks > 1 else ('\n' if breaks else ' ')
+
+    return _SPACE_RUN.sub(fold, text)
+
 
 def _cp(spec: str):
     """'U+200B' -> 0x200B;  'U+E0000-U+E007F' -> (0xE0000, 0xE007F)."""
@@ -238,10 +266,13 @@ def _pass_lexical(text: str, lex: Mapping[str, Any],
 
 
 def _without_emoji(text: str, keep_emoji: Iterable[str]) -> str:
-    """``text`` with her allowlisted emoji removed, for the emoji tells."""
-    for emoji in keep_emoji or ():
-        emoji = emoji.strip() if isinstance(emoji, str) else ''
-        if emoji:
+    """``text`` with her allowlisted emoji removed, for the emoji tells.
+
+    Each emoji of an item counts on its own (an item "✨💄" keeps both, not
+    only the pair as written), with or without its variation selector.
+    """
+    for item in keep_emoji or ():
+        for emoji in EMOJI_RE.findall(item) if isinstance(item, str) else ():
             text = text.replace(emoji, '').replace(emoji.replace(_VS16, ''), '')
     return text
 
@@ -294,8 +325,10 @@ def humanize_text(text: str, lexicon: Optional[Mapping[str, Any]] = None, *,
     """Clean a caption or script; report what changed and what to rewrite.
 
     ``lexicon`` defaults to resources/slop.json.  ``keep_emoji`` (her voice
-    profile's emoji) are never reported as tells; ``keep_words`` (words she
-    uses) are never replaced.  Emoji are never deleted.
+    profile's emoji; each emoji of an item counts on its own) are never
+    reported as tells; ``keep_words`` (words she uses) are never replaced.
+    Emoji are never deleted.  Whitespace comes back as a phone writes it:
+    "\\n" line breaks, at most one blank line, single spaces.
 
     Returns ``{'text', 'report': {'invisible', 'typographic', 'lexical',
     'structures'}}``; ``structures`` entries are ``{'id', 'name', 'count',
@@ -305,9 +338,10 @@ def humanize_text(text: str, lexicon: Optional[Mapping[str, Any]] = None, *,
     original = text if isinstance(text, str) else ''
     out, urls = _protect_urls(original)
     out, invisible = _pass_invisible(out, lex)
+    out = _fold_space(out)
     out, typographic = _pass_typographic(out, lex)
     out, lexical = _pass_lexical(out, lex, keep_words)
-    out = _restore_capitals(original, out)
+    out = _restore_capitals(_fold_space(original), out)
     out = _restore_urls(out, urls).strip()
     structures = _structures(out, lex, keep_emoji)
     uniform = _uniformity(out)
@@ -319,15 +353,11 @@ def humanize_text(text: str, lexicon: Optional[Mapping[str, Any]] = None, *,
 
 # ── detect ──────────────────────────────────────────────────────────────────
 
-def _clamp(n: float) -> float:
-    return float(max(0.0, min(100.0, n)))
-
-
 def _scale(value: float, human: float, machine: float) -> float:
     """``value`` on 0-100 where ``human`` -> 100 and ``machine`` -> 0."""
     if human == machine:
         return 50.0
-    return _clamp((value - machine) / (human - machine) * 100)
+    return clamp_score((value - machine) / (human - machine) * 100)
 
 
 def _mostly_latin(text: str) -> bool:
@@ -404,7 +434,7 @@ def _check_voice(text: str, ws: List[str], lex: Mapping[str, Any],
     names = [t['id'] for t in tells]
     bullets = [len(b.split()) for b in re.findall(r'(?m)^\s*[-*•]\s+(.+)$', text)]
     uniform = len(bullets) >= 3 and statistics.pstdev(bullets) < 1.6
-    shape = _clamp(100 - n_tells * 22)
+    shape = clamp_score(100 - n_tells * 22)
     if _mostly_latin(text):
         contractions = len(_CONTRACTIONS.findall(text)) * per100
         score = (_scale(contractions, human=3.0, machine=0.0) * 0.35
@@ -422,11 +452,13 @@ def _check_voice(text: str, ws: List[str], lex: Mapping[str, Any],
     detail += ', %d structural tell(s)' % n_tells
     if names:
         detail += ' [' + ', '.join(names[:4]) + ']'
-    return _clamp(score), detail
+    return clamp_score(score), detail
 
 
 def _detect(text: str, lex: Mapping[str, Any], keep_emoji: Iterable[str],
             keep_words: Iterable[str]) -> Tuple[Dict[str, Any], float]:
+    # The structure patterns would restart inside a long run of blank lines.
+    text = _fold_space(text)
     ws = words(text)
     results = {
         'BURSTINESS': _check_burstiness(text),
@@ -460,7 +492,8 @@ def detect_machine_text(text: str, before: Optional[str] = None, *,
 
     Returns ``{'checks': {name: {'score', 'detail'}}, 'human_score',
     'verdict', 'weakest'}``.  These are local heuristics, not any public
-    detector's verdict; never tell her a text is undetectable.
+    detector's verdict; never tell her a text is undetectable.  Runs of
+    blank lines and spaces are folded first, as humanize_text does.
     """
     lex = _default_lexicon()
     text = text if isinstance(text, str) else ''

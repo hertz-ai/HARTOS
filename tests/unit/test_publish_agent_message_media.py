@@ -6,12 +6,15 @@ names her clients' faces and her captions, so it must not travel to central's
 crossbar: ``skip_crossbar=True`` keeps it on this node's own legs (LOCAL, SSE
 and her own devices over PeerLink, which is how the phone receives EVENTS).
 
-The HARTOS publish_async that publish_agent_message resolves takes no
-skip_crossbar, and Nunba wraps it as (topic, message, timeout), so the
-local-only push goes through the MessageBus's own skip_crossbar instead.
+publish_async is the one publisher (amendment A9 e): the flag is ITS flag, so
+the push still gets every stamp and leg publish_async gives a chat message
+(served_by, node_tier, the task.confirmation copy, the desktop's SSE leg) and
+loses only the HTTP crossbar leg.  The flag is passed only when set, so every
+other caller reaches Nunba's (topic, message, timeout) wrapper unchanged.
 
 Boundaries mocked: the hart_intelligence publish_async (as safe_hartos_attr
-resolves it) and the MessageBus legs.  Everything else is real.
+resolves it), or -- for the real publish_async -- the MessageBus legs, the SSE
+fan-out and the crossbar HTTP executor.  Everything else is real.
 """
 import json
 import sys
@@ -22,6 +25,7 @@ import pytest
 
 from core.peer_link import message_bus as mb
 from core.peer_link.crossbar_publish import publish_agent_message
+from tests.conftest import refuse_all_network
 
 XID = 'ab' * 32
 MEDIA = [{'kind': 'video', 'xid': XID, 'sha256': XID, 'mime': 'video/mp4',
@@ -88,37 +92,83 @@ def test_media_without_text_is_not_sent(publisher, bus):
     bus.legs['_route_local'].assert_not_called()
 
 
-def test_skip_crossbar_keeps_the_push_off_centrals_crossbar(publisher, bus):
+def test_skip_crossbar_is_publish_asyncs_own_flag(publisher, bus):
     assert publish_agent_message(text='Your reel is ready', user_id='u7',
                                  request_id='rid-1', prompt_id='42',
                                  media=MEDIA, skip_crossbar=True) is True
-    # Not through publish_async: its HTTP leg is the one that reaches central.
-    publisher.assert_not_called()
-    bus.legs['_route_crossbar'].assert_not_called()
-    # The phone's leg (her own devices over PeerLink EVENTS) and this node's
-    # own subscribers still get it, on the chat topic the phone listens to.
-    peer = bus.legs['_route_peerlink']
-    assert peer.call_count == 1
-    topic, data = peer.call_args[0][0], peer.call_args[0][1]
-    assert topic == 'chat.response'
-    assert data['media'] == MEDIA and data['text'] == ['Your reel is ready']
-    assert data['user_id'] == 'u7'
-    assert peer.call_args.kwargs.get('owner_user_id') == 'u7'
-    bus.legs['_route_local'].assert_called_once()
+    topic, payload = _sent(publisher)
+    assert topic == 'com.hertzai.hevolve.chat.u7'
+    assert payload['media'] == MEDIA
+    assert publisher.call_args.kwargs == {'skip_crossbar': True}
+    # No second path around the one publisher.
+    for leg in bus.legs.values():
+        leg.assert_not_called()
 
 
-def test_without_skip_crossbar_the_publish_async_path_is_unchanged(publisher, bus):
+def test_without_skip_crossbar_the_call_is_exactly_as_before(publisher):
+    """No new keyword for any other caller: Nunba's wrapper takes
+    (topic, message, timeout) and keeps working for them."""
     publish_agent_message(text='hi', user_id='u7', request_id='r', prompt_id='42',
                           media=MEDIA)
     assert publisher.call_count == 1
-    bus.legs['_route_peerlink'].assert_not_called()
+    assert publisher.call_args.kwargs == {}
 
 
-def test_a_failing_bus_reports_false(monkeypatch, publisher):
-    broken = SimpleNamespace(publish=MagicMock(side_effect=RuntimeError('bus down')))
-    monkeypatch.setattr(mb, 'get_message_bus', lambda: broken)
+def test_a_raising_publisher_reports_false(monkeypatch):
+    pub = MagicMock(side_effect=RuntimeError('bus down'))
+    monkeypatch.setitem(sys.modules, 'hart_intelligence', SimpleNamespace(publish_async=pub))
     assert publish_agent_message(text='hi', user_id='u7', request_id='r',
                                  prompt_id='42', skip_crossbar=True) is False
+
+
+# ── the real publish_async: skip_crossbar drops only the HTTP crossbar leg ──
+
+@pytest.fixture(scope='module')
+def hie():
+    import hart_intelligence_entry
+    return hart_intelligence_entry
+
+
+@pytest.fixture
+def real_publisher(hie, bus, monkeypatch):
+    """hart_intelligence's publish_async is the real one; its crossbar HTTP
+    executor, the SSE fan-out and the bus legs are recorded."""
+    refuse_all_network(monkeypatch)
+    from core.platform import events
+    monkeypatch.setitem(sys.modules, 'hart_intelligence',
+                        SimpleNamespace(publish_async=hie.publish_async))
+    monkeypatch.setattr(hie, 'client', object())          # crossbar configured
+    http = MagicMock(name='crossbar_executor')
+    monkeypatch.setattr(hie, 'crossbar_executor', http)
+    sse = MagicMock(name='broadcast_sse_safe')
+    monkeypatch.setattr(events, 'broadcast_sse_safe', sse)
+    return SimpleNamespace(http=http, sse=sse, bus=bus)
+
+
+def test_the_real_publisher_keeps_a_skip_crossbar_push_off_the_crossbar(real_publisher):
+    assert publish_agent_message(text='Your reel is ready', user_id='u7',
+                                 request_id='rid-1', prompt_id='42',
+                                 media=MEDIA, skip_crossbar=True) is True
+    real_publisher.http.submit.assert_not_called()
+    real_publisher.bus.legs['_route_crossbar'].assert_not_called()
+    # Her phone (PeerLink EVENTS) gets it on the chat topic, with the stamps
+    # every chat message gets.
+    peer = real_publisher.bus.legs['_route_peerlink']
+    sent = [c for c in peer.call_args_list if c.args[0] == 'chat.response']
+    assert len(sent) == 1
+    data = sent[0].args[1]
+    assert data['media'] == MEDIA and data['text'] == ['Your reel is ready']
+    assert data['user_id'] == 'u7' and data.get('served_by')
+    assert sent[0].kwargs.get('owner_user_id') == 'u7'
+    # The desktop's own chat (SSE) gets it too.
+    assert real_publisher.sse.call_count == 1
+    assert real_publisher.sse.call_args.args[1]['media'] == MEDIA
+
+
+def test_the_real_publisher_without_the_flag_still_reaches_the_crossbar(real_publisher):
+    assert publish_agent_message(text='hi', user_id='u7', request_id='r',
+                                 prompt_id='42') is True
+    assert real_publisher.http.submit.call_count == 1
 
 
 def test_media_entries_that_are_not_objects_are_dropped(publisher):

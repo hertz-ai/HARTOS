@@ -7,6 +7,12 @@ and rides the reply as ``media`` (4.2(f)).  chat_attachments holds no state of
 its own: it parses the turn's ``attachments`` and delegates every read and
 write to the store.
 
+ONE attachments shape in and out (amendment A9 a): the documented
+ConversationEntry.attachments row ``{file_id, sha256, name, mime, size}``
+(file_id = the store xid, which is the sha256) plus optional ``purpose``,
+``captured_at`` and ``duration_ms`` -- what media_to_mirror writes is what
+parse_inbound reads.
+
 These tests drive the REAL store on a temporary root (installed as the
 process singleton the module uses) and assert what a turn can see.
 """
@@ -16,8 +22,8 @@ import pytest
 
 from core import user_file_store as ufs
 from core.chat_attachments import (
-    ATTACHMENT_KIND, MAX_ATTACHMENTS, bind_inbound, latest_inbound,
-    media_to_mirror, parse_inbound, take_outbound,
+    MAX_ATTACHMENTS, bind_inbound, latest_inbound, media_to_mirror,
+    parse_inbound, take_outbound,
 )
 
 MP4 = 'video/mp4'
@@ -63,8 +69,10 @@ def _upload(store, uid, data, *, name='VID.mp4', mime=MP4, purpose='reel_source'
 
 
 def _att(ref, purpose='reel_source', **extra):
-    item = {'kind': ATTACHMENT_KIND, 'ref': ref, 'purpose': purpose,
-            'name': 'VID.mp4', 'mime': MP4, 'size': 10}
+    """One /chat attachments row in the documented shape (A9 a)."""
+    item = {'file_id': ref, 'sha256': ref, 'name': 'VID.mp4', 'mime': MP4, 'size': 10}
+    if purpose is not None:
+        item['purpose'] = purpose
     item.update(extra)
     return item
 
@@ -73,26 +81,50 @@ def _att(ref, purpose='reel_source', **extra):
 
 class TestParseInbound:
 
-    def test_a_well_formed_entry_comes_back_as_its_reference(self):
+    def test_a_well_formed_row_comes_back_as_its_reference(self):
         ref = 'a' * 64
         assert parse_inbound([_att(ref, captured_at=1_760_000_000_000)]) == [
-            {'kind': ATTACHMENT_KIND, 'ref': ref, 'purpose': 'reel_source'}]
+            {'file_id': ref, 'purpose': 'reel_source'}]
+
+    def test_purpose_is_optional(self):
+        ref = 'a' * 64
+        assert parse_inbound([_att(ref, purpose=None)]) == [{'file_id': ref}]
+
+    def test_the_contracts_validator_accepts_the_rows_this_module_reads(self):
+        """One shape: a row parse_inbound keeps is a valid contracts attachment."""
+        from integrations.reel_studio import contracts
+        for row in (_att('a' * 64), _att('b' * 64, purpose=None),
+                    _att('c' * 64, captured_at=1_760_000_000_000, duration_ms=4000)):
+            assert parse_inbound([row]), row
+            assert contracts.validate_attachment(row) == [], row
+
+    def test_what_the_mirror_writes_is_what_a_turn_reads(self):
+        """inbound == outbound: a reply's mirror row, sent back on a later turn,
+        parses as the same file."""
+        xid = 'ab' * 32
+        [row] = media_to_mirror([dict(_media('r-1'), xid=xid, sha256=xid, size=99)])
+        assert parse_inbound([row]) == [{'file_id': xid}]
+        from integrations.reel_studio import contracts
+        assert contracts.validate_attachment(row) == []
 
     def test_at_most_max_attachments_are_read(self):
         raw = [_att('%064x' % i) for i in range(MAX_ATTACHMENTS + 3)]
         got = parse_inbound(raw)
         assert len(got) == MAX_ATTACHMENTS
-        assert [g['ref'] for g in got] == [r['ref'] for r in raw[:MAX_ATTACHMENTS]]
+        assert [g['file_id'] for g in got] == [r['file_id'] for r in raw[:MAX_ATTACHMENTS]]
 
     def test_a_reference_named_twice_is_kept_once(self):
         ref = 'b' * 64
-        assert [g['ref'] for g in parse_inbound([_att(ref), _att(ref, 'logo')])] == [ref]
+        assert [g['file_id'] for g in parse_inbound([_att(ref), _att(ref, 'logo')])] == [ref]
 
     @pytest.mark.parametrize('bad', [
         'not a dict',
         None,
-        {'ref': 'c' * 64, 'purpose': 'reel_source'},              # no kind
-        _att('c' * 64) | {'kind': 'image_url'},                    # not a store file
+        {'sha256': 'c' * 64, 'purpose': 'reel_source'},           # no file_id
+        _att('c' * 64) | {'sha256': 'e' * 64},                     # file_id is not the sha
+        {k: v for k, v in _att('c' * 64).items() if k != 'sha256'},  # no sha256
+        {'kind': 'peerlink_file', 'ref': 'c' * 64,                 # the retired shape
+         'purpose': 'reel_source'},
         _att('C' * 64),                                            # not lowercase hex
         _att('c' * 63),                                            # too short
         _att('../../etc/passwd'),                                  # not an xid at all
@@ -101,16 +133,19 @@ class TestParseInbound:
     ])
     def test_a_malformed_entry_is_dropped_not_raised_on(self, bad):
         assert parse_inbound([bad, _att('d' * 64)]) == [
-            {'kind': ATTACHMENT_KIND, 'ref': 'd' * 64, 'purpose': 'reel_source'}]
+            {'file_id': 'd' * 64, 'purpose': 'reel_source'}]
 
-    @pytest.mark.parametrize('raw', [None, '', [], {}, 'a' * 64, 42, {'ref': 'a' * 64}])
+    @pytest.mark.parametrize('raw', [None, '', [], {}, 'a' * 64, 42, {'file_id': 'a' * 64}])
     def test_anything_but_a_list_reads_as_no_attachments(self, raw):
         assert parse_inbound(raw) == []
 
-    def test_the_kind_is_the_contracts_kind(self):
-        """core may not import integrations, so the value is repeated: held equal."""
+    def test_the_purposes_are_the_contracts_purposes(self):
+        """core may not import integrations, so the store repeats the values:
+        held equal."""
         from integrations.reel_studio import contracts
-        assert ATTACHMENT_KIND == contracts.ATTACHMENT_KIND
+        assert tuple(ufs.INBOUND_PURPOSES) == tuple(contracts.INBOUND_PURPOSES)
+        assert not hasattr(contracts, 'ATTACHMENT_KIND'), (
+            'the {kind, ref} attachment shape is retired (A9 a)')
 
 
 # ── bind_inbound: the store binds, foreign refs are dropped ─────────────

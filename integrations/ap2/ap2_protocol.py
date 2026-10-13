@@ -103,6 +103,36 @@ class PaymentGateway(str, Enum):
 REDIRECT_GATEWAYS = frozenset({PaymentGateway.PHONEPE})
 
 
+def mock_settlement_allowed(user=None) -> bool:
+    """May a payment the ledger routed to the MockPaymentGateway settle for
+    this caller?  The ONE rule for every settlement path.
+
+    The mock authorizes any payment_method and captures anything, so for a
+    customer it is a paid tier, or a placed order, for nothing: a plain user
+    named ``gateway: mock`` or hit a node without Stripe and got enterprise
+    with the $499 recorded as paid (review of 0cf610371, measured on the real
+    route); a McGroce cart on a node with no gateway keys settled through the
+    mock and the order was placed (claude-autostart-93, 2026-10-14, read at
+    903cd58c0).  select_gateway answers MOCK whenever no live gateway is
+    registered, so a missing key must read as "cannot take payments", never
+    as "paid".
+
+    Allowed only when the node is in the existing dev mode
+    (security.master_key.is_dev_mode, HEVOLVE_DEV_MODE=true, which central
+    forces to false at boot), or when the caller is a known operator
+    (integrations.social.auth.holds_central_role).  A settler that acts for
+    a person by id and holds no user object (the cart settler) passes none
+    and gets the dev-mode answer alone.
+    """
+    from security.master_key import is_dev_mode     # the ONE dev-mode switch
+    if is_dev_mode():
+        return True
+    if user is None:
+        return False
+    from integrations.social.auth import holds_central_role
+    return holds_central_role(user)
+
+
 #: Metadata keys that are credentials: kept in memory for the gateway call,
 #: never persisted or returned (PaymentRequest.to_dict).
 _SECRET_METADATA_KEYS = ('payment_method_token',)
