@@ -784,17 +784,22 @@ class TestRobotIntelligenceAPI(unittest.TestCase):
 
     def test_the_hive_strategy_is_the_words_of_the_hives_reply(self):
         """_invoke_hivemind hands the fusion the reply's words
-        (query_hivemind's one shape) and its source; nothing stays
-        'unavailable'."""
+        (query_hivemind's one shape), its source and, only with words, its
+        confidence: a reply with nothing to say vouches for nothing.  The
+        in-process core's CollectiveThought carries a confidence and no text
+        (task #135), and that confidence used to reach the plan on its own
+        (the review of d954f18ab).  Nothing stays 'unavailable'."""
         api = self._make_api()
-        for hive_result, strategy, source in (
+        for hive_result, strategy, source, confidence in (
                 ({'thought': 'Approach from the left.', 'source': 'http',
-                  'peer_count': 0, 'confidence': 0.9}, 'Approach from the left.', 'http'),
+                  'peer_count': 0, 'confidence': 0.9}, 'Approach from the left.', 'http', 0.9),
                 ({'thought': 'Slow down near the table.', 'source': 'peerlink',
-                  'peer_count': 2, 'confidence': 0.0}, 'Slow down near the table.', 'peerlink'),
+                  'peer_count': 2, 'confidence': 0.0}, 'Slow down near the table.', 'peerlink', 0.0),
                 ({'thought': 'plain', 'source': 'in_process', 'peer_count': 0,
-                  'confidence': 0.0}, 'plain', 'in_process'),
-                (None, '', 'unavailable')):
+                  'confidence': 0.0}, 'plain', 'in_process', 0.0),
+                ({'thought': '', 'source': 'in_process', 'peer_count': 0,
+                  'confidence': 0.9}, '', 'in_process', 0.0),
+                (None, '', 'unavailable', 0.0)):
             bridge = MagicMock()
             bridge.query_hivemind.return_value = hive_result
             with patch('integrations.agent_engine.world_model_bridge.'
@@ -802,6 +807,33 @@ class TestRobotIntelligenceAPI(unittest.TestCase):
                 out = api._invoke_hivemind('fetch the cup', {'camera': {}})
             self.assertEqual(out['best_strategy'], strategy, hive_result)
             self.assertEqual(out['source'], source, hive_result)
+            self.assertEqual(out['confidence'], confidence, hive_result)
+
+    def test_a_wordless_hive_reply_adds_no_confidence_to_the_plan(self):
+        """A plan built on a hive thought with no words: the hive's share of
+        the plan's confidence is 0.0, so with safety's 1.0 the plan reads
+        0.5.  Once d954f18ab passed the in-process core's confidence through
+        (a CollectiveThought has a confidence and no text), the same plan
+        read 1.0 (the review of d954f18ab measured 0.5 to 1.0): _fuse_results
+        averages whatever _invoke_hivemind reports, so the gate is there."""
+        api = self._make_api()
+        bridge = MagicMock()
+        bridge.query_hivemind.return_value = {
+            'thought': '', 'source': 'in_process', 'peer_count': 0, 'confidence': 1.0}
+        with patch.object(api, '_invoke_vision', return_value={'scene': 'no_camera', 'objects': [], 'obstacles': []}), \
+             patch.object(api, '_invoke_language', return_value={'response': '', 'intent': 'idle'}), \
+             patch.object(api, '_invoke_motor', return_value={'trajectory': [], 'speed': 1.0, 'source': 'basic'}), \
+             patch.object(api, '_invoke_spatial', return_value={'robot_position': {}, 'world_objects': [], 'sensor_summary': {}}), \
+             patch.object(api, '_invoke_social', return_value={'tone': 'neutral', 'urgency': 'normal', 'formality': 0.5, 'verbosity': 0.5}), \
+             patch.object(api, '_invoke_safety', return_value={'safe': True, 'warnings': [], 'estop': False}), \
+             patch('integrations.agent_engine.world_model_bridge.get_world_model_bridge',
+                   return_value=bridge):
+            result = api.think({'robot_id': 'bot', 'sensors': {}, 'context': ''})
+        hive = result['intelligences']['hivemind']
+        self.assertEqual((hive['best_strategy'], hive['source'], hive['confidence']),
+                         ('', 'in_process', 0.0), hive)
+        self.assertNotIn('hive_suggestion', result['action_plan'])
+        self.assertEqual(result['action_plan']['confidence'], 0.5, result['action_plan'])
 
     @patch.object(RobotIntelligenceAPI, '_invoke_vision',
                   return_value={'scene': 'kitchen', 'objects': ['cup'], 'obstacles': []})

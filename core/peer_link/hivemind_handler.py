@@ -91,15 +91,18 @@ def _handle_query(data: dict, sender_peer_id: str) -> Optional[dict]:
     except ImportError as e:
         # The bridge module is HARTOS's own and imports without the hive
         # core (central, with no core installed, runs it), so this is a copy
-        # of the tree that lacks it (the bundle carries more than one copy
-        # of HARTOS).  Said at WARNING once per process,
-        # debug after (a peer's robot loop can ask many times a second; the
-        # review of c10535351): every peer's query is otherwise answered
-        # with the empty reply and nothing logged (the review of fbeb16284).
+        # of the tree that lacks it, or an older bridge without
+        # HIVE_SOURCE_PEERLINK after a partial hot-swap (the bundle carries
+        # more than one copy of HARTOS); the exception names which.  Said at
+        # WARNING once per process, debug after (a peer's robot loop can ask
+        # many times a second; the review of c10535351): every peer's query
+        # is otherwise answered with the empty reply and nothing logged (the
+        # review of fbeb16284).
         said = _handle_query.__dict__.setdefault('import_failure_said', False)
         _handle_query.import_failure_said = True
         logger.log(logging.DEBUG if said else logging.WARNING,
-                   f"hivemind query: bridge import failed, answering empty: {e}")
+                   f"hivemind query: bridge import failed (module or name "
+                   f"missing), answering empty: {e}")
         return _EMPTY_REPLY
 
     try:

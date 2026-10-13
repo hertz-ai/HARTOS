@@ -22,6 +22,7 @@ GUARDRAILS applied at every layer:
 import atexit
 import json
 import logging
+import math
 import os
 import sys
 import time
@@ -1248,7 +1249,7 @@ class WorldModelBridge:
                     original_response=original_response[:5000],
                     corrected_response=corrected_response[:5000],
                     expert_id=expert_id,
-                    confidence=max(0.0, min(1.0, confidence)),
+                    confidence=_unit_confidence(confidence),
                     explanation=explanation[:2000] if explanation else None,
                     valid_until=valid_until,
                 )
@@ -1273,7 +1274,7 @@ class WorldModelBridge:
             'original_response': original_response[:5000],
             'corrected_response': corrected_response[:5000],
             'expert_id': expert_id,
-            'confidence': max(0.0, min(1.0, confidence)),
+            'confidence': _unit_confidence(confidence),
         }
         if explanation:
             body['explanation'] = explanation[:2000]
@@ -1505,7 +1506,9 @@ class WorldModelBridge:
         2. Publishes local thought to WAMP
         3. Waits for remote agent responses (timeout_ms)
         4. Fuses with attention-weighted method
-        5. Returns the collective thought (its words and confidence here)
+        5. Returns the collective thought: its confidence here, and its
+           text when the thought carries one (the core's CollectiveThought
+           carries none, task #135, so this leg's 'thought' is '')
 
         Use this for real-time multi-modal reasoning (tensor-level fusion).
         For coarse-grained task delegation, use agent-level dispatch instead.
@@ -2754,24 +2757,37 @@ def _peer_words(peer_resp) -> str:
     return ''
 
 
+def _unit_confidence(value) -> float:
+    """``value`` as a confidence in [0.0, 1.0]: a number out of range is
+    clamped; None, a non-finite number (nan, inf) or a string that is no
+    number is 0.0, no confidence.  The ONE clamp: ``max(0, min(1, x))`` at
+    the two correction sites answered 1.0 for nan (min(1.0, nan) is 1.0), and
+    the hive reply passed nan, inf and 7.0 through to readers that average
+    it (the review of d954f18ab)."""
+    try:
+        conf = float(value) if value is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(conf):
+        return 0.0
+    return max(0.0, min(1.0, conf))
+
+
 def _hive_reply(words, source, peer_count=0, confidence=None, **extra) -> dict:
     """The ONE shape query_hivemind returns, whichever leg answered:
     ``{'thought': <words or ''>, 'source': 'in_process' | 'peerlink' |
     'http' | 'cached', 'peer_count': <peers that replied>, 'confidence':
-    <float, 0.0 when the leg reports none>}``.  Every reader asks
-    ``result['thought']``: '' is a leg that answered with nothing to say,
-    None (no result at all) a leg that did not answer.  Before this the three
-    legs returned three shapes (the core's whole body, a list of peer dicts,
-    the in-process text or its repr) and six reader functions grew around
-    them in task #110's rounds two to six; the metered endpoint also handed
-    a customer the core's whole body (task #136)."""
+    <float in [0, 1], 0.0 when the leg reports none or no number>}``.  Every
+    reader asks ``result['thought']``: '' is a leg that answered with nothing
+    to say, None (no result at all) a leg that did not answer.  Before this
+    the three legs returned three shapes (the core's whole body, a list of
+    peer dicts, the in-process text or its repr) and six reader functions
+    grew around them in task #110's rounds two to six; the metered endpoint
+    also handed a customer the core's whole body (task #136)."""
     text = words if isinstance(words, str) and words.strip() else ''
-    try:
-        conf = float(confidence) if confidence is not None else 0.0
-    except (TypeError, ValueError):
-        conf = 0.0
     reply = {'thought': text, 'source': source,
-             'peer_count': int(peer_count or 0), 'confidence': conf}
+             'peer_count': int(peer_count or 0),
+             'confidence': _unit_confidence(confidence)}
     reply.update(extra)
     return reply
 

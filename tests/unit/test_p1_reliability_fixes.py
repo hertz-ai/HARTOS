@@ -98,6 +98,33 @@ class HiveMindHandlerTest(unittest.TestCase):
         self.assertEqual([r.levelno for r in said], [logging.WARNING, logging.DEBUG],
                          logs.output)
 
+    def test_an_older_bridge_without_the_source_name_is_said_out_loud(self):
+        """A bridge that imports but lacks HIVE_SOURCE_PEERLINK (a partial
+        hot-swap left core/ newer than integrations/) answers the empty reply
+        too, and the WARNING names the missing name, so the operator reads a
+        version skew and not a missing module (the review of d954f18ab: the
+        test above pins only the missing-module message).  The bridge is not
+        asked for a thought it could not relay by the one rule."""
+        import logging
+        from core.peer_link import hivemind_handler
+        from core.peer_link.hivemind_handler import (
+            handle_hivemind_message, _EMPTY_REPLY,
+        )
+        from tests.unit.module_swap import swap_modules
+        older = MagicMock(spec=['get_world_model_bridge'])
+        hivemind_handler._handle_query.__dict__.pop('import_failure_said', None)
+        try:
+            with swap_modules({'integrations.agent_engine.world_model_bridge': older}), \
+                 self.assertLogs('hevolve.peer_link.hivemind', level='DEBUG') as logs:
+                reply = handle_hivemind_message(
+                    {'type': 'query', 'query': 'q'}, 'peer_x')
+        finally:
+            hivemind_handler._handle_query.__dict__.pop('import_failure_said', None)
+        self.assertEqual(reply, _EMPTY_REPLY)
+        said = [r for r in logs.records if 'HIVE_SOURCE_PEERLINK' in r.getMessage()]
+        self.assertEqual([r.levelno for r in said], [logging.WARNING], logs.output)
+        older.get_world_model_bridge.assert_not_called()
+
     def test_deliver_missing_target_returns_ack_invalid(self):
         from core.peer_link.hivemind_handler import handle_hivemind_message
         result = handle_hivemind_message(
