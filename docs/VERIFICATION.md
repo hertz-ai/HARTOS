@@ -29,6 +29,12 @@ makes this worth more than another feature.
 
 ---
 
+Dated records of user journeys driven live against the hosted central node
+are kept under `docs/internal/verification/` (not served on the docs site;
+the probe scripts are not in the repository). Their measured passes and
+failures are to be lifted into the tables below as rows; the first record is
+`USER_JOURNEYS_LIVE_2026-10-13.md`, and none of its rows is here yet.
+
 ## Verified
 
 | Claim | Evidence | Last checked |
