@@ -128,6 +128,7 @@ from decimal import Decimal  # noqa: E402
 from integrations.ap2.ap2_protocol import (  # noqa: E402
     PaymentGateway, PaymentGatewayConnector, PaymentLedger,
 )
+from tests.unit.commercial_db import KEY, OWNER, key_db  # noqa: E402,F401  (a fixture)
 
 
 class _DecliningStripe(PaymentGatewayConnector):
@@ -144,8 +145,17 @@ class _DecliningStripe(PaymentGatewayConnector):
         return {'success': False, 'error': 'card_declined'}
 
 
-def _upgrade(client, tmp_path, monkeypatch, *, is_admin=False, stripe=False, dev_mode=False,
-             gateway='mock'):
+def _as_owner(key_db, is_admin=False):
+    """The key's owner signed in, handed a session of the real table (the
+    route reads the key by id AND user, and writes its tier through one
+    conditional UPDATE; a MagicMock session answered neither)."""
+    user = types.SimpleNamespace(id=OWNER, is_admin=is_admin)
+    return patch('integrations.social.auth._get_user_from_token',
+                 side_effect=lambda tok: (user, key_db.session()))
+
+
+def _upgrade(client, key_db, tmp_path, monkeypatch, *, is_admin=False, stripe=False,
+             dev_mode=False, gateway='mock'):
     ledger = PaymentLedger(ledger_path=str(tmp_path / 'ledger.json'))
     if stripe:
         ledger.add_gateway(_DecliningStripe())
@@ -153,36 +163,33 @@ def _upgrade(client, tmp_path, monkeypatch, *, is_admin=False, stripe=False, dev
         monkeypatch.setenv('HEVOLVE_DEV_MODE', 'true')
     else:
         monkeypatch.delenv('HEVOLVE_DEV_MODE', raising=False)
-    user = types.SimpleNamespace(id='u-9', is_admin=is_admin)
-    api_key = types.SimpleNamespace(id='k1', tier='free', rate_limit_per_day=100, monthly_quota=3000)
-    db = MagicMock()
-    db.query.return_value.filter_by.return_value.first.return_value = api_key
     body = {'target_tier': 'enterprise', 'payment_method': 'anything'}
     if gateway:
         body['gateway'] = gateway
-    with patch('integrations.social.auth._get_user_from_token', return_value=(user, db)), \
-            patch('integrations.ap2.payment_ledger', ledger):
-        r = client.post('/api/v1/intelligence/keys/k1/upgrade', json=body,
+    with _as_owner(key_db, is_admin), patch('integrations.ap2.payment_ledger', ledger):
+        r = client.post(f'/api/v1/intelligence/keys/{KEY}/upgrade', json=body,
                         headers={'Authorization': 'Bearer tok'})
-    return r, api_key, db, ledger
+    return r, ledger
+
+
+def _tier_of(key_db):
+    return key_db.key()[0]
 
 
 @pytest.mark.parametrize('gateway', ['mock', ' MOCK ', None])
 def test_a_person_cannot_upgrade_through_the_mock_when_no_live_gateway_exists(
-        client, tmp_path, monkeypatch, gateway):
-    r, api_key, db, ledger = _upgrade(client, tmp_path, monkeypatch, gateway=gateway)
+        client, key_db, tmp_path, monkeypatch, gateway):
+    r, ledger = _upgrade(client, key_db, tmp_path, monkeypatch, gateway=gateway)
     assert r.status_code == 503, r.get_json()
     assert 'STRIPE_API_KEY' in r.get_json()['error']
-    assert api_key.tier == 'free'
-    db.commit.assert_not_called()
+    assert _tier_of(key_db) == 'free'
     assert ledger.payments == {}                       # nothing recorded as paid
 
 
-def test_a_person_naming_the_mock_still_pays_through_stripe(client, tmp_path, monkeypatch):
-    r, api_key, db, ledger = _upgrade(client, tmp_path, monkeypatch, stripe=True, gateway='mock')
+def test_a_person_naming_the_mock_still_pays_through_stripe(client, key_db, tmp_path, monkeypatch):
+    r, ledger = _upgrade(client, key_db, tmp_path, monkeypatch, stripe=True, gateway='mock')
     assert r.status_code == 402, r.get_json()
-    assert api_key.tier == 'free'
-    db.commit.assert_not_called()
+    assert _tier_of(key_db) == 'free'
     (payment,) = ledger.payments.values()
     assert payment.gateway == PaymentGateway.STRIPE   # the card was asked, and declined
 
@@ -204,55 +211,49 @@ class _AuthorizingStripe(PaymentGatewayConnector):
         return {'success': True, 'transaction_id': gateway_transaction_id, 'status': 'captured'}
 
 
-def test_a_person_who_pays_through_stripe_gets_the_tier(client, tmp_path, monkeypatch):
+def test_a_person_who_pays_through_stripe_gets_the_tier(client, key_db, tmp_path, monkeypatch):
     """Review of b6502ac00, mutant M13: nothing pinned the honest path.  A
     refusal after a successful charge would take the money and keep the
     tier."""
     ledger = PaymentLedger(ledger_path=str(tmp_path / 'ledger.json'))
     ledger.add_gateway(_AuthorizingStripe())
     monkeypatch.delenv('HEVOLVE_DEV_MODE', raising=False)
-    user = types.SimpleNamespace(id='u-10', is_admin=False)
-    api_key = types.SimpleNamespace(id='k1', tier='free', rate_limit_per_day=100, monthly_quota=3000)
-    db = MagicMock()
-    db.query.return_value.filter_by.return_value.first.return_value = api_key
-    with patch('integrations.social.auth._get_user_from_token', return_value=(user, db)), \
-            patch('integrations.ap2.payment_ledger', ledger):
-        r = client.post('/api/v1/intelligence/keys/k1/upgrade',
+    with _as_owner(key_db), patch('integrations.ap2.payment_ledger', ledger):
+        r = client.post(f'/api/v1/intelligence/keys/{KEY}/upgrade',
                         json={'target_tier': 'pro', 'payment_method': 'pm_card_visa'},
                         headers={'Authorization': 'Bearer tok'})
     assert r.status_code == 200, r.get_json()
     body = r.get_json()
-    assert api_key.tier == 'pro' and body['api_key']['tier'] == 'pro'
+    assert _tier_of(key_db) == 'pro' and body['api_key']['tier'] == 'pro'
+    assert body['api_key']['monthly_quota'] == key_db.key()[2]
     assert body['payment']['status'] == 'completed' and 'revenue_split' in body
-    db.commit.assert_called_once()
     (payment,) = ledger.payments.values()
     assert payment.gateway == PaymentGateway.STRIPE
 
 
-def test_the_mock_gate_reads_the_one_dev_mode_switch(client, tmp_path, monkeypatch):
+def test_the_mock_gate_reads_the_one_dev_mode_switch(client, key_db, tmp_path, monkeypatch):
     """security.master_key.is_dev_mode is the switch the security layer reads;
     the money gate must read the same one, not its own copy of the env rule."""
     from security import master_key
     monkeypatch.delenv('HEVOLVE_DEV_MODE', raising=False)
     monkeypatch.setattr(master_key, 'is_dev_mode', lambda: True)
-    r, api_key, db, ledger = _upgrade(client, tmp_path, monkeypatch)
-    assert r.status_code == 200 and api_key.tier == 'enterprise'
+    r, ledger = _upgrade(client, key_db, tmp_path, monkeypatch)
+    assert r.status_code == 200 and _tier_of(key_db) == 'enterprise'
 
 
-def test_an_operator_may_settle_through_the_mock(client, tmp_path, monkeypatch):
-    r, api_key, db, ledger = _upgrade(client, tmp_path, monkeypatch, is_admin=True)
+def test_an_operator_may_settle_through_the_mock(client, key_db, tmp_path, monkeypatch):
+    r, ledger = _upgrade(client, key_db, tmp_path, monkeypatch, is_admin=True)
     assert r.status_code == 200, r.get_json()
-    assert api_key.tier == 'enterprise'
-    db.commit.assert_called_once()
+    assert _tier_of(key_db) == 'enterprise'
 
 
-def test_dev_mode_lets_a_dev_node_settle_through_the_mock(client, tmp_path, monkeypatch):
-    r, api_key, db, ledger = _upgrade(client, tmp_path, monkeypatch, dev_mode=True)
+def test_dev_mode_lets_a_dev_node_settle_through_the_mock(client, key_db, tmp_path, monkeypatch):
+    r, ledger = _upgrade(client, key_db, tmp_path, monkeypatch, dev_mode=True)
     assert r.status_code == 200, r.get_json()
-    assert api_key.tier == 'enterprise'
+    assert _tier_of(key_db) == 'enterprise'
 
 
-def test_phonepe_is_still_refused_on_the_synchronous_route(client, tmp_path, monkeypatch):
-    r, api_key, db, ledger = _upgrade(client, tmp_path, monkeypatch, gateway='phonepe')
+def test_phonepe_is_still_refused_on_the_synchronous_route(client, key_db, tmp_path, monkeypatch):
+    r, ledger = _upgrade(client, key_db, tmp_path, monkeypatch, gateway='phonepe')
     assert r.status_code == 501
-    assert api_key.tier == 'free' and ledger.payments == {}
+    assert _tier_of(key_db) == 'free' and ledger.payments == {}

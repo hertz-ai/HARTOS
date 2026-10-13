@@ -99,6 +99,41 @@ def test_tier_upgrade_path_is_unchanged(ctx):
     assert ctx['ledger'].get_payment(p.payment_id).status == PaymentStatus.FAILED
 
 
+from tests.unit.commercial_db import key_db  # noqa: E402,F401  (a fixture)
+
+
+def _tier(name):
+    from integrations.agent_engine.commercial_api import TIER_CONFIG
+    cfg = TIER_CONFIG[name]
+    return (name, cfg['rate_limit_per_day'], cfg['monthly_quota'])
+
+
+def test_a_tier_upgrade_callback_bumps_the_key(ctx, key_db):
+    p = _processing(ctx['ledger'], {'kind': 'tier_upgrade', 'api_key_id': 'k1',
+                                    'target_tier': 'starter'})
+    r = _callback(ctx['client'])
+    assert r.status_code == 200, r.get_json()
+    assert r.get_json()['status'] == 'completed' and r.get_json()['new_tier'] == 'starter'
+    assert key_db.key() == _tier('starter')
+    assert ctx['ledger'].get_payment(p.payment_id).status == PaymentStatus.COMPLETED
+
+
+def test_a_tier_upgrade_callback_never_lowers_the_key(ctx, key_db):
+    """The PhonePe rail writes the tier through the same rule as the card
+    rails: a confirmed payment for a cheaper tier completes (the money is
+    taken) and leaves the key where it is.  This callback bumped with no
+    guard, where the Stripe finalizer refused the downgrade (the review of
+    fd2b4773c: the policy differed per rail)."""
+    key_db.put_key_on('pro')
+    p = _processing(ctx['ledger'], {'kind': 'tier_upgrade', 'api_key_id': 'k1',
+                                    'target_tier': 'starter'})
+    r = _callback(ctx['client'])
+    assert r.status_code == 200, r.get_json()
+    assert r.get_json()['status'] == 'completed'
+    assert key_db.key() == _tier('pro')
+    assert ctx['ledger'].get_payment(p.payment_id).status == PaymentStatus.COMPLETED
+
+
 def test_bad_signature_changes_nothing(ctx):
     p = _processing(ctx['ledger'], {'kind': 'commerce_checkout'})
     assert _callback(ctx['client'], sig='bad').status_code == 401

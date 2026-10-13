@@ -1041,6 +1041,9 @@ def upgrade_key(key_id):
             id=key_id, user_id=str(user.id)).first()
         if not api_key:
             return jsonify({'success': False, 'error': 'API key not found'}), 404
+        refusal = _not_an_upgrade(api_key, target_tier)
+        if refusal is not None:
+            return refusal
 
         target_cfg = TIER_CONFIG[target_tier]
         amount_usd = float(target_cfg['monthly_price_usd'])
@@ -1137,11 +1140,13 @@ def upgrade_key(key_id):
                 'error': f'Payment error: {pay_err}',
             }), 502
 
-        # Payment succeeded — bump the key's tier and limits.
-        api_key.tier = target_tier
-        api_key.rate_limit_per_day = target_cfg['rate_limit_per_day']
-        api_key.monthly_quota = target_cfg['monthly_quota']
-        db.commit()
+        # Payment succeeded — the bought tier, through the one writer.
+        _changed, failure = _apply_bought_tier(db, api_key, target_tier)
+        if failure is not None:
+            payload, status = _bump_failed(
+                f'payment {payment_req.payment_id}', api_key.id, failure,
+                payment_request_id=payment_req.payment_id)
+            return jsonify(payload), status
 
         return jsonify({
             'success': True,
@@ -1241,6 +1246,9 @@ def initiate_phonepe_upgrade(key_id: str):
             id=key_id, user_id=str(user.id)).first()
         if not api_key:
             return jsonify({'success': False, 'error': 'API key not found'}), 404
+        refusal = _not_an_upgrade(api_key, target_tier)
+        if refusal is not None:
+            return refusal
 
         target_cfg = TIER_CONFIG[target_tier]
         amount_usd = float(target_cfg['monthly_price_usd'])
@@ -1568,7 +1576,9 @@ def phonepe_callback():
             'payment_request_id': payment_req.payment_id,
         }), 200
 
-    # Bump the API key tier.
+    # The bought tier, through the one writer (_apply_bought_tier: never a
+    # downgrade, whatever order confirmations land in; this rail used to
+    # bump with no rule, the review of fd2b4773c).
     try:
         from integrations.social.models import get_db, CommercialAPIKey
         db = get_db()
@@ -1584,11 +1594,9 @@ def phonepe_callback():
                     'error': 'API key not found',
                     'payment_request_id': payment_req.payment_id,
                 }), 200
-            target_cfg = TIER_CONFIG[target_tier]
-            api_key.tier = target_tier
-            api_key.rate_limit_per_day = target_cfg['rate_limit_per_day']
-            api_key.monthly_quota = target_cfg['monthly_quota']
-            db.commit()
+            _changed, failure = _apply_bought_tier(db, api_key, target_tier)
+            if failure is not None:
+                raise RuntimeError(failure)
         finally:
             db.close()
     except Exception as db_err:
@@ -1749,6 +1757,9 @@ def create_upgrade_checkout(key_id):
             id=key_id, user_id=str(user.id)).first()
         if not api_key:
             return jsonify({'success': False, 'error': 'API key not found'}), 404
+        refusal = _not_an_upgrade(api_key, target_tier)
+        if refusal is not None:
+            return refusal
 
         target_cfg = TIER_CONFIG[target_tier]
         amount_usd = float(target_cfg['monthly_price_usd'])
@@ -1817,32 +1828,90 @@ def create_upgrade_checkout(key_id):
             pass
 
 
-def _session_metadata(session) -> dict:
-    """A Stripe Checkout Session's metadata as a plain dict.
+def _session_metadata(session):
+    """A Stripe Checkout Session's metadata as a plain dict; ``None`` when
+    this node cannot read it.
 
     From stripe 15.0.0 (2026-03) StripeObject no longer subclasses dict:
     ``.get`` raises AttributeError, where 7.0.0 through 14.4.1 still answer
     it.  The review of 3153761b3 measured a 500 on every paid event with
     15.0.0 and 16.0.0, which is what central's next image installs
     (requirements.txt pins stripe>=7.0.0).  ``to_dict`` exists on every
-    version; a plain dict (the retrieve() of the older SDKs, or a test's)
-    is copied; None or anything else is nothing."""
+    version (a StripeObject on all of them, a plain dict in a test) and a
+    plain dict is copied.  No metadata is ``{}``, readable and not ours.
+    A ``to_dict`` that raises, or a shape that is neither, is ``None``:
+    unreadable is not "not ours", and a caller that treated it so answered
+    Stripe 200 ignored for a paid tier upgrade, stopping the retries on an
+    event no person had seen (the review of fd2b4773c measured it)."""
     meta = getattr(session, 'metadata', None)
     if meta is None:
         return {}
+    if isinstance(meta, dict):
+        return dict(meta)
     if hasattr(meta, 'to_dict'):
         try:
             return dict(meta.to_dict() or {})
-        except Exception:
-            return {}
-    if isinstance(meta, dict):
-        return dict(meta)
-    return {}
+        except Exception as e:
+            logger.error("Stripe session %s: metadata could not be read (%s: %s)",
+                         getattr(session, 'id', None), type(e).__name__, e)
+            return None
+    logger.error("Stripe session %s: metadata of type %s cannot be read",
+                 getattr(session, 'id', None), type(meta).__name__)
+    return None
+
+
+def _is_tier_upgrade_checkout(meta) -> bool:
+    """Is this (readable) Checkout metadata one of this node's tier
+    upgrades, as create_upgrade_checkout stamps it?"""
+    return isinstance(meta, dict) and meta.get('kind') == 'tier_upgrade_checkout'
 
 
 def _tier_rank(tier: str) -> float:
     """What a tier costs a month: the order a bought tier is compared in."""
     return float(TIER_CONFIG.get(tier, {}).get('monthly_price_usd', 0.0) or 0.0)
+
+
+def _is_tier_upgrade(current_tier, target_tier) -> bool:
+    """The ONE rule for selling a tier, on every rail (the card checkout,
+    the synchronous card charge, the PhonePe redirect) and for every writer
+    of a key's tier: ``target_tier`` is a paid tier that costs more than the
+    one the key is on.  There is no downgrade route (no writer lowers a
+    tier; revoke only deactivates), and the pricing page offers every paid
+    tier whatever the key holds, so a Pro user choosing starter was charged
+    $9 for nothing, and before fd2b4773c the same purchase lowered the key
+    (the review of fd2b4773c measured both).  A key on no known tier (None,
+    a legacy name) counts as free."""
+    if target_tier not in TIER_CONFIG or target_tier == 'free':
+        return False
+    return _tier_rank(target_tier) > _tier_rank(str(current_tier or ''))
+
+
+def _not_an_upgrade(api_key, target_tier):
+    """The 400 a rail answers before charging when ``target_tier`` is not an
+    upgrade for ``api_key`` (_is_tier_upgrade), else None."""
+    current = str(getattr(api_key, 'tier', '') or 'free')
+    if _is_tier_upgrade(current, target_tier):
+        return None
+    return jsonify({
+        'success': False,
+        'error': f'This key is on the {current} tier; {target_tier} is not an '
+                 f'upgrade from it (there is no downgrade; revoke the key to stop paying).',
+        'current_tier': current,
+        'target_tier': target_tier,
+    }), 400
+
+
+def _bump_failed(what_paid: str, api_key_id, failure: str, **payload_extra):
+    """The answer when money was taken and the tier write failed: an ERROR
+    line a person reconciles by, and a 500 (Stripe retries a 500; the
+    browser's reload tries again), never a success over a key still on the
+    old tier."""
+    logger.error(f"MANUAL RECONCILIATION NEEDED: {what_paid} paid but tier bump "
+                 f"failed for api_key {api_key_id}: {failure}")
+    return dict({
+        'success': False,
+        'error': f'Payment succeeded but tier bump failed: {failure}',
+    }, **payload_extra), 500
 
 
 def _recorded_checkout_unlocked(session_id: str):
@@ -1899,37 +1968,49 @@ def _checkout_payload(payment, api_key, already_completed: bool = False) -> dict
 
 
 def _apply_bought_tier(db, api_key, target_tier: str):
-    """Put ``api_key`` on the tier it bought; ``(changed, error)``.
+    """Put ``api_key`` on the tier it bought; ``(changed, error)``.  The ONE
+    writer of a key's tier for every rail.
 
-    Nothing to do when the key is already there, and nothing when it sits
-    on a tier that costs more: Stripe does not order deliveries and events
-    queue while the webhook secret is missing, so a starter session can be
-    finalized after the pro one (the review of 3153761b3 measured the
-    downgrade).  On a failure the key's attributes are put back and the
-    session rolled back, so a later call (Stripe's retry after the 500)
-    sees the key still below the bought tier and finishes the bump."""
-    current = str(getattr(api_key, 'tier', '') or '')
-    if current == target_tier:
-        return False, None
-    if current in TIER_CONFIG and _tier_rank(current) > _tier_rank(target_tier):
-        logger.info("Checkout: api_key %s stays on %s; the %s it bought costs less",
-                    getattr(api_key, 'id', None), current, target_tier)
-        return False, None
-    before = (api_key.tier, api_key.rate_limit_per_day, api_key.monthly_quota)
+    One conditional UPDATE: the row moves only while its tier costs less
+    than ``target_tier`` (an unknown or NULL tier counts as free), so a key
+    already there, or on a tier that costs more, is left alone WHATEVER
+    this process read a moment ago.  Stripe does not order deliveries and
+    events queue while the webhook secret is missing, so a starter session
+    can be finalized after the pro one; a read-then-write guard here lost
+    that race when the two landed together (the starter delivery read
+    'free', waited on the ledger lock while the pro bump committed, then
+    wrote starter: 16 to 23 of 40 rounds, the review of fd2b4773c).  On a
+    failure the session is rolled back, so a later call (Stripe's retry
+    after the 500, the buyer's reload) finds the key still below the
+    bought tier and finishes the bump.  ``api_key`` is refreshed from the
+    row afterwards, so the caller's payload shows what the table holds."""
+    from sqlalchemy import or_
+    from integrations.social.models import CommercialAPIKey
     cfg = TIER_CONFIG[target_tier]
+    at_least = [t for t in TIER_CONFIG if _tier_rank(t) >= _tier_rank(target_tier)]
     try:
-        api_key.tier = target_tier
-        api_key.rate_limit_per_day = cfg['rate_limit_per_day']
-        api_key.monthly_quota = cfg['monthly_quota']
+        rows = db.query(CommercialAPIKey).filter(
+            CommercialAPIKey.id == api_key.id,
+            or_(CommercialAPIKey.tier.is_(None),
+                CommercialAPIKey.tier.notin_(at_least)),
+        ).update({
+            CommercialAPIKey.tier: target_tier,
+            CommercialAPIKey.rate_limit_per_day: cfg['rate_limit_per_day'],
+            CommercialAPIKey.monthly_quota: cfg['monthly_quota'],
+        }, synchronize_session=False)
         db.commit()
-        return True, None
+        db.refresh(api_key)
     except Exception as e:
-        api_key.tier, api_key.rate_limit_per_day, api_key.monthly_quota = before
         try:
             db.rollback()
-        except Exception:
-            pass
+        except Exception as rb:
+            logger.debug("tier bump: rollback after %s also failed: %s", e, rb)
         return False, str(e)
+    if not rows:
+        logger.info("api_key %s stays on %s; the %s it bought costs no more",
+                    getattr(api_key, 'id', None), getattr(api_key, 'tier', None),
+                    target_tier)
+    return bool(rows), None
 
 
 def _finalize_paid_checkout_session(session, db):
@@ -1962,7 +2043,9 @@ def _finalize_paid_checkout_session(session, db):
 
     session_id = getattr(session, 'id', None) or ''
     meta = _session_metadata(session)
-    if meta.get('kind') != 'tier_upgrade_checkout':
+    if meta is None:
+        return {'success': False, 'error': 'Session metadata could not be read.'}, 500
+    if not _is_tier_upgrade_checkout(meta):
         return {'success': False, 'error': 'Session is not a tier upgrade.'}, 400
     api_key_id = meta.get('api_key_id', '')
     user_id = str(meta.get('user_id') or '')
@@ -2012,15 +2095,9 @@ def _finalize_paid_checkout_session(session, db):
     # still on the old tier, the review of 3153761b3).  Never a downgrade.
     _changed, failure = _apply_bought_tier(db, api_key, target_tier)
     if failure is not None:
-        logger.error(f"MANUAL RECONCILIATION NEEDED: Stripe session "
-                     f"{session_id} paid but tier bump failed for "
-                     f"api_key {api_key_id}: {failure}")
-        return {
-            'success': False,
-            'error': f'Payment succeeded but tier bump failed: {failure}',
-            'payment_request_id': payment.payment_id,
-            'session_id': session_id,
-        }, 500
+        return _bump_failed(f'Stripe session {session_id}', api_key_id, failure,
+                            payment_request_id=payment.payment_id,
+                            session_id=session_id)
 
     return _checkout_payload(payment, api_key, already_completed=already), 200
 
@@ -2067,18 +2144,27 @@ def complete_upgrade_checkout():
             return refusal
 
         # A replay (or the webhook got there first): answer the same page
-        # without asking Stripe, to the key's owner only.
+        # without asking Stripe, to the key's owner only, and finish the
+        # bump if the record outlived a failed one (the buyer's first visit
+        # recorded the payment and the bump failed; every reload then said
+        # success over a key still on free, the review of fd2b4773c).
         existing = _recorded_checkout(session_id)
         if existing is not None:
             from integrations.social.models import CommercialAPIKey
+            recorded = existing.metadata or {}
             api_key = db.query(CommercialAPIKey).filter_by(
-                id=(existing.metadata or {}).get('api_key_id'),
-                user_id=str(user.id)).first()
+                id=recorded.get('api_key_id'), user_id=str(user.id)).first()
             if not api_key:
                 return jsonify({
                     'success': False,
                     'error': 'Session belongs to a different user.',
                 }), 403
+            _changed, failure = _apply_bought_tier(db, api_key, recorded.get('target_tier'))
+            if failure is not None:
+                payload, status = _bump_failed(
+                    f'Stripe session {session_id}', api_key.id, failure,
+                    payment_request_id=existing.payment_id, session_id=session_id)
+                return jsonify(payload), status
             return jsonify(_checkout_payload(existing, api_key, already_completed=True)), 200
 
         try:
@@ -2099,7 +2185,12 @@ def complete_upgrade_checkout():
         # The kind before the user, as before the finalizer was lifted out:
         # a session that is no tier upgrade is a 400 whoever asks.
         meta = _session_metadata(session)
-        if meta.get('kind') != 'tier_upgrade_checkout':
+        if meta is None:
+            return jsonify({
+                'success': False,
+                'error': 'Session metadata could not be read.',
+            }), 500
+        if not _is_tier_upgrade_checkout(meta):
             return jsonify({
                 'success': False,
                 'error': 'Session is not a tier upgrade.',
@@ -2163,7 +2254,18 @@ def stripe_webhook():
     session_id = getattr(session, 'id', None)
     if getattr(session, 'payment_status', None) != 'paid':
         return jsonify({'success': True, 'status': 'unpaid', 'session_id': session_id}), 200
-    if _session_metadata(session).get('kind') != 'tier_upgrade_checkout':
+    meta = _session_metadata(session)
+    if meta is None:
+        # Unreadable is not "not ours": a 500 keeps Stripe delivering (for
+        # days) until a person has read the ERROR line _session_metadata
+        # wrote; a 200 here lost a paid tier upgrade with the retries
+        # stopped (the review of fd2b4773c).
+        logger.error("MANUAL RECONCILIATION NEEDED: Stripe session %s paid but its "
+                     "metadata could not be read; not finalized, Stripe will retry",
+                     session_id)
+        return jsonify({'success': False, 'status': 'metadata_unreadable',
+                        'session_id': session_id}), 500
+    if not _is_tier_upgrade_checkout(meta):
         # Not one of this node's tier upgrades: another product's checkout
         # on the same account, or the dashboard's test event.  Acknowledged
         # and ignored; it is not a reconciliation case.
