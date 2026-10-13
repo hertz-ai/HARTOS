@@ -59,7 +59,6 @@ KNOWN_UNMIGRATED = {
     # --- already reference request_id; migrating is DRY, not a bug fix ---
     'crossbar_server.py',
     'api_tracker.py',
-    'commercial_api.py',           # the paid API surface — user turns
     'model_bus_service.py',
     'speculative_dispatcher.py',
 }

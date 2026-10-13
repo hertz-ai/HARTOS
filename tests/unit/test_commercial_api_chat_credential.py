@@ -64,14 +64,13 @@ def _resp(status_code, payload):
     return r
 
 
-@pytest.mark.parametrize('route,body,prompt_id,resp_key', [
-    ('/api/v1/intelligence/chat', {'prompt': 'hello'},
-     'api_intelligence', 'response'),
+@pytest.mark.parametrize('route,body,resp_key', [
+    ('/api/v1/intelligence/chat', {'prompt': 'hello'}, 'response'),
     ('/api/v1/intelligence/analyze',
-     {'document': 'some doc', 'question': 'what?'}, 'api_analyze', 'analysis'),
+     {'document': 'some doc', 'question': 'what?'}, 'analysis'),
 ])
 def test_metered_chat_self_post_carries_daemon_credential(
-        app_client, passing_auth, route, body, prompt_id, resp_key):
+        app_client, passing_auth, route, body, resp_key):
     """Both metered endpoints send the credential dispatch._internal_auth_headers
     mints.  Bare, they are answered 401 by gate 2 on central/regional."""
     captured = {}
@@ -92,7 +91,9 @@ def test_metered_chat_self_post_carries_daemon_credential(
         'metered self-POST went out bare; gate 2 answers 401 on central')
     # HARTOS dialect preserved -- the backend reads `prompt`, not `text`.
     assert captured['json']['prompt']
-    assert captured['json']['prompt_id'] == prompt_id
+    # No agent: a made-up agent id sent every customer into CREATE mode
+    # (tests/unit/test_metered_chat_is_a_conversation.py).
+    assert 'prompt_id' in captured['json'] and captured['json']['prompt_id'] is None
     assert r.get_json()[resp_key] == 'the answer'
 
 

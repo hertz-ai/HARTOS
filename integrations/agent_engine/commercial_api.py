@@ -481,10 +481,24 @@ def require_api_key(f):
 commercial_api_bp = Blueprint('commercial_api', __name__)
 
 
-def _metered_backend_chat(prompt: str, prompt_id: str):
+def _metered_backend_chat(prompt: str, label: str):
     """The ONE self-POST the metered endpoints make to this node's own /chat.
 
-    Returns ``(ok, text, status_code)``.
+    Returns ``(ok, text, status_code)``.  ``label`` names the endpoint in
+    this function's log lines; it is NOT an agent.
+
+    The customer's call is a conversation with no agent (``prompt_id``
+    None, the casual companion session), never an agent creation.  It
+    used to send ``prompt_id`` 'api_intelligence' / 'api_analyze': no
+    such prompt file exists on any node, so /chat's ladder logged 'GATHER
+    JSON doesnot EXISTS', set create_agent and ran gather_info turn 1/12;
+    the model's non-JSON reply to the agent-building prompt went back to
+    the customer raw.  Measured live on central 2026-10-13 (e829b072):
+    "What is the capital of France?" was answered "I have the name and
+    goal, but not every step came through as a step I can build...",
+    success true, billed; the same question through /chat with prompt_id
+    None answered "Paris is the capital of France."  Guarded by
+    tests/unit/test_metered_chat_is_a_conversation.py.
 
     These two call sites were the 4th and 5th instances of the cdd379ad
     defect: ``cdd379ad`` fixed the speculative-dispatcher legs, ``272c4315``
@@ -503,19 +517,27 @@ def _metered_backend_chat(prompt: str, prompt_id: str):
     ``'deferred'``) which exists to stop *background* work stealing the LLM
     from a human.  A paying customer's synchronous request is not background
     work, so inheriting that gate would trade this bug for a worse one.  What
-    is shared with the other callers is the credential helper itself.
+    is shared with the other callers is the credential helper and the
+    canonical /chat client (``core.chat_client.post_chat``: the same pooled
+    path, with the request id this function mints passed through).
     """
     import uuid as _uuid
-    from core.http_pool import pooled_post
+    from core.chat_client import post_chat
     from core.llm_outbound_logger import LANE_REVENUE, LANE_USER
     from integrations.agent_engine.dispatch import _internal_auth_headers
 
     try:
-        result = pooled_post(
+        # The canonical /chat client (core.chat_client): the same pooled path,
+        # with the body normalised.  The id minted below passes through
+        # untouched, so this is the wire this function always sent.
+        result = post_chat(
             f'http://localhost:{get_port("backend")}/chat',
-            json={
+            {
                 'user_id': g.api_key['user_id'],
-                'prompt_id': prompt_id,
+                # No agent: the key is present (the route 400s without it)
+                # and None is the casual companion session.  See the
+                # docstring for what a made-up agent id did to customers.
+                'prompt_id': None,
                 'prompt': prompt,
                 'create_agent': False,
                 # A paying customer's call is a genuine turn, never background:
@@ -536,7 +558,7 @@ def _metered_backend_chat(prompt: str, prompt_id: str):
             timeout=120)
     except Exception as e:
         # 502: we could not reach our own backend at all.
-        logger.warning(f"Metered {prompt_id} /chat transport error: {e}")
+        logger.warning(f"Metered {label} /chat transport error: {e}")
         return False, '', 502
 
     status = getattr(result, 'status_code', 200)
@@ -545,7 +567,7 @@ def _metered_backend_chat(prompt: str, prompt_id: str):
         # which is why this leg was dead silently.  Same reasoning as the
         # sibling fixes in speculative_dispatcher.py and worker_loop.py.
         logger.warning(
-            f"Metered {prompt_id} /chat returned HTTP {status}")
+            f"Metered {label} /chat returned HTTP {status}")
         return False, '', status
 
     data = result.json() if hasattr(result, 'json') else {}
