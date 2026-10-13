@@ -1618,13 +1618,8 @@ class WorldModelBridge:
                 # raw thought here duplicated the query into chat history,
                 # ingested it as a user sensor once per peer, and (after the
                 # verification gate was added) still claimed it was trained.
-                observed = sum(
-                    1 for peer_resp in responses
-                    if isinstance(peer_resp, dict) and (
-                        peer_resp.get('thought')
-                        or peer_resp.get('response')
-                        or peer_resp.get('text'))
-                )
+                observed = sum(1 for peer_resp in responses
+                               if _peer_said_something(peer_resp))
                 with self._lock:
                     self._stats.setdefault('peerlink_responses_observed', 0)
                     self._stats['peerlink_responses_observed'] += observed
@@ -2729,6 +2724,35 @@ class WorldModelBridge:
 
 
 # ─── Module-level singleton ───
+def _peer_said_something(peer_resp) -> bool:
+    """True when one PeerLink hivemind reply carries a thought: a non-empty
+    'thought', 'response' or 'text'.  A connected peer with no hive core
+    answers core.peer_link.hivemind_handler._EMPTY_REPLY ({'thought': ''}),
+    which collect() keeps because it is a non-empty dict; this is the ONE
+    rule that tells it apart, read by query_hivemind's peer count and by
+    hivemind_result_has_a_thought."""
+    return bool(isinstance(peer_resp, dict) and (
+        peer_resp.get('thought') or peer_resp.get('response') or peer_resp.get('text')))
+
+
+def hivemind_result_has_a_thought(result) -> bool:
+    """True when a query_hivemind() result carries at least one thought.
+
+    The shapes query_hivemind returns: None (no hive core, no CCT for the
+    capability, the constitutional filter refused, every leg failed); the
+    in-process and cached shapes, ``{'thought': ...}``; the PeerLink
+    envelope, ``{'thoughts': [one reply per peer], 'source': 'peerlink',
+    ...}``; and the HTTP core's JSON, read like a single reply.  The metered
+    hivemind endpoint counts a call only when this is True (task #110; the
+    review of 2efb73519 measured the envelope of two silent peers billed as
+    a success)."""
+    if not isinstance(result, dict) or not result:
+        return False
+    if isinstance(result.get('thoughts'), list):
+        return any(_peer_said_something(p) for p in result['thoughts'])
+    return _peer_said_something(result)
+
+
 _bridge = None
 _bridge_lock = threading.Lock()
 

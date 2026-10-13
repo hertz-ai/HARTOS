@@ -141,11 +141,28 @@ def _hivemind(app_client, bridge_result=None, raises=None):
                               headers={'X-API-Key': 'k'})
 
 
-def test_hivemind_with_nothing_to_say_is_not_billed(app_client, passing_auth):
+def _empty_peer_reply():
+    """What a connected peer with no hive core answers (the real sentinel)."""
+    from core.peer_link.hivemind_handler import _EMPTY_REPLY
+    return dict(_EMPTY_REPLY)
+
+
+@pytest.mark.parametrize('nothing', [
+    pytest.param(None, id='none: no core, no CCT, filter refused, every leg failed'),
+    pytest.param({}, id='empty dict'),
+    pytest.param('peerlink-empty', id='two peers that answered the empty reply'),
+])
+def test_hivemind_with_nothing_to_say_is_not_billed(app_client, passing_auth, nothing):
     """query_hivemind returns None when the core is not installed, the node
-    has no CCT, or the user opted out: measured on central as
-    {"result": null, "success": true}, counted as a call."""
-    r = _hivemind(app_client, bridge_result=None)
+    has no CCT, or the filter refused the prompt: measured on central as
+    {"result": null, "success": true}, counted as a call.  A PeerLink
+    envelope whose every peer sent hivemind_handler's empty reply (a peer
+    with no core) is a non-empty dict and was still billed (the review of
+    2efb73519 measured it); the ONE rule is a non-empty thought."""
+    if nothing == 'peerlink-empty':
+        nothing = {'thoughts': [_empty_peer_reply(), _empty_peer_reply()],
+                   'source': 'peerlink', 'peer_count': 2}
+    r = _hivemind(app_client, bridge_result=nothing)
     _assert_not_billed(r, passing_auth)
 
 
@@ -157,11 +174,54 @@ def test_hivemind_whose_bridge_raised_is_not_billed(app_client, passing_auth):
 @pytest.mark.parametrize('thought', [
     {'thought': 'The hive thinks Paris.'},
     {'thoughts': [{'thought': 'Paris'}], 'source': 'peerlink', 'peer_count': 1},
+    # One silent peer and one that answered: a thought was had.
+    {'thoughts': [{'type': 'reply', 'thought': ''}, {'response': 'Paris'}],
+     'source': 'peerlink', 'peer_count': 2},
+    {'thought': 'cached answer', 'source': 'cached', 'cct_gated': True},
 ])
 def test_hivemind_with_a_thought_is_a_call(app_client, passing_auth, thought):
     r = _hivemind(app_client, bridge_result=thought)
     _assert_billed_as_a_call(r, passing_auth)
     assert r.get_json()['result'] == thought
+
+
+def test_the_hivemind_rule_is_the_bridges_own():
+    """The endpoint and the bridge's peer count read one predicate, and it
+    is driven here on the shapes query_hivemind returns."""
+    from integrations.agent_engine.world_model_bridge import (
+        hivemind_result_has_a_thought as has_thought)
+    assert not has_thought(None)
+    assert not has_thought({})
+    assert not has_thought({'thought': ''})
+    assert not has_thought({'thoughts': [_empty_peer_reply()], 'source': 'peerlink',
+                            'peer_count': 1})
+    assert not has_thought({'thoughts': [], 'source': 'peerlink', 'peer_count': 0})
+    assert has_thought({'thought': 'x'})
+    assert has_thought({'thoughts': [_empty_peer_reply(), {'text': 'x'}],
+                        'source': 'peerlink', 'peer_count': 2})
+    assert has_thought({'response': 'the http core answered'})
+
+
+# --------------------------------------------------------------------------
+# chat and analyze: the other 200s the one reader refuses
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize('route,body,resp_key', CHAT_ROUTES)
+@pytest.mark.parametrize('answer', [
+    pytest.param({'success': False, 'error': 'busy with another task'}, id='success-false'),
+    pytest.param({'response': 'Starting up', 'loading': True}, id='loading'),
+    pytest.param({'response': 'Pick a model first', 'source': 'system'}, id='source-system'),
+])
+def test_a_200_the_channel_bridge_would_not_pass_off_is_not_billed(
+        app_client, passing_auth, route, body, resp_key, answer):
+    """chat_contract.chat_turn_answer is the one reader: what it refuses to
+    speak in the agent's voice, the paid API does not bill."""
+    with patch('core.http_pool.pooled_post',
+               side_effect=lambda url, **kw: _resp(200, answer)), \
+            patch('integrations.agent_engine.dispatch._internal_auth_headers',
+                  return_value=MINTED):
+        r = app_client.post(route, json=body, headers={'X-API-Key': 'k'})
+    _assert_not_billed(r, passing_auth)
 
 
 # --------------------------------------------------------------------------

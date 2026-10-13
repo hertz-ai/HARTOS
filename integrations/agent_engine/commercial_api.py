@@ -593,19 +593,24 @@ def _metered_backend_chat(prompt: str, label: str):
         return False, '', status
 
     data = result.json() if hasattr(result, 'json') else {}
-    text = data.get('response') or ''
+    # The ONE reader of a /chat answer, integrations.channels.chat_contract
+    # .chat_turn_answer: the reply when the turn produced one, else None.
     # A turn that fails does not raise: the pipeline answers HTTP 200 with a
     # polite sentence (core.agent_tools.user_facing_error, the LLM_*_REPLY
-    # constants, BUILD_INCOMPLETE_REPLY), which is right for a person and
-    # wrong for a billed call.  Measured on central 2026-10-12 18:14Z: the
-    # "internal snag" sentence went to a paying customer as success:true and
-    # was billed (task #110).  core.agent_tools.is_user_facing_error is the
-    # ONE recogniser; dispatch, the hive worker and the channel contract read
-    # it the same way.  An empty 200 is no answer either.
-    from core.agent_tools import is_user_facing_error
-    if not text.strip() or is_user_facing_error(text):
+    # constants, BUILD_INCOMPLETE_REPLY), right for a person and wrong for a
+    # billed call.  Measured on central 2026-10-12 18:14Z: the "internal
+    # snag" sentence went to a paying customer as success:true and was billed
+    # (task #110).  The same reader also refuses an empty reply, 'success'
+    # False, an 'error', a 'loading' notice and a route speaking for itself,
+    # so what the channel bridge will not pass off as the agent's words, the
+    # paid API does not bill (the review of 2efb73519: this used to be a
+    # narrower inline copy of that rule).
+    from integrations.channels.chat_contract import chat_turn_answer
+    text = chat_turn_answer(status, data)
+    if text is None:
+        shown = data.get('response') if isinstance(data, dict) else data
         logger.warning(
-            f"Metered {label} /chat answered 200 without an answer: {text[:120]!r}")
+            f"Metered {label} /chat answered 200 without an answer: {str(shown)[:120]!r}")
         return False, '', 502
     return True, text, 200
 
@@ -762,23 +767,29 @@ def intelligence_hivemind():
 
     t0 = time.time()
     tokens_in = len(query.split())
-    result = None
+    result, has_thought = None, False
 
     try:
-        from integrations.agent_engine.world_model_bridge import get_world_model_bridge
+        from integrations.agent_engine.world_model_bridge import (
+            get_world_model_bridge, hivemind_result_has_a_thought)
         bridge = get_world_model_bridge()
         result = bridge.query_hivemind(query)
+        has_thought = hivemind_result_has_a_thought(result)
     except Exception as e:
         logger.warning(f"HiveMind endpoint error: {e}")
-        result = None
+        result, has_thought = None, False
 
     elapsed_ms = int((time.time() - t0) * 1000)
-    if not result:
-        # query_hivemind returns None when it has nothing: no hive core
-        # installed, no CCT for the capability, the user opted out, the
-        # constitutional filter refused the prompt, or every leg failed.
-        # Measured on central 2026-10-13: {"result": null, "success": true},
-        # counted as a call (task #110).
+    if not has_thought:
+        # No thought: query_hivemind returns None when no hive core is
+        # installed, the node holds no CCT for the capability, the
+        # constitutional filter refused the prompt or every leg failed
+        # (measured on central 2026-10-13: {"result": null, "success": true},
+        # counted as a call, task #110); and a PeerLink envelope whose every
+        # peer answered hivemind_handler's empty reply (a connected peer with
+        # no core) is no thought either (the review of 2efb73519 measured
+        # that envelope billed).  hivemind_result_has_a_thought is the ONE
+        # rule, the same one the bridge's own peer count applies.
         return _metered_backend_failure(
             '/v1/intelligence/hivemind', tokens_in, elapsed_ms, 502)
 
