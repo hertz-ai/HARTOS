@@ -1432,7 +1432,12 @@ def phonepe_callback():
          gateway.capture_payment — never trust the webhook body alone.
       6. On confirmed PAYMENT_SUCCESS, bump the API key's tier through the
          one writer and mark COMPLETED; a failed bump leaves the payment
-         PROCESSING and answers 500 so PhonePe's retry finishes it.
+         PROCESSING and answers 500 so PhonePe delivers the callback again
+         and the retry finishes it.  PhonePe retries a non-200 answer a
+         bounded number of times (its pages give no count for the PG
+         callback; three for the in-store one); past them the payment
+         stays PROCESSING and a person finishes it from the ERROR line
+         (the review of 38a881c35).
     """
     gateway, envelope, refusal = _verified_phonepe_envelope('callback')
     if refusal is not None:
@@ -1454,8 +1459,8 @@ def phonepe_callback():
         return jsonify({'success': False, 'error': 'Payment not found'}), 200
 
     # Idempotency: if we've already completed (or failed) this payment,
-    # do nothing.  PhonePe retries the callback if it doesn't get 2xx
-    # within ~30s, so duplicates are normal.
+    # do nothing.  PhonePe delivers the callback again when it does not get
+    # a 200 OK, so duplicates are normal.
     if payment_req.status == PaymentStatus.COMPLETED:
         return jsonify({
             'success': True,
@@ -1615,6 +1620,9 @@ def phonepe_callback():
         finally:
             db.close()
     except Exception as db_err:
+        # The traceback stays in the log (a locked database is diagnosed
+        # from it); the sentence goes to the reconciliation line.
+        logger.exception("PhonePe callback: tier bump for %s raised", api_key_id)
         failure = f'{type(db_err).__name__}: {db_err}'
     if failure is not None:
         payload, status = _bump_failed(
@@ -1927,11 +1935,14 @@ def _not_an_upgrade(api_key, target_tier):
 
 def _bump_failed(what_paid: str, api_key_id, failure: str, **payload_extra):
     """The answer when money was taken and the tier write failed: an ERROR
-    line a person reconciles by, and a 500 (Stripe retries a 500; the
-    browser's reload tries again), never a success over a key still on the
-    old tier."""
-    logger.error(f"MANUAL RECONCILIATION NEEDED: {what_paid} paid but tier bump "
-                 f"failed for api_key {api_key_id}: {failure}")
+    line a person reconciles by, and a 500 (Stripe and PhonePe deliver
+    again on a non-2xx; the browser's reload tries again), never a success
+    over a key still on the old tier.  The line says a retry follows, so one
+    occurrence is not yet a reconciliation case; a repeating one is (the
+    review of 38a881c35)."""
+    logger.error(f"MANUAL RECONCILIATION NEEDED if this repeats: {what_paid} paid but "
+                 f"the tier bump failed for api_key {api_key_id}: {failure}; the "
+                 f"gateway's redelivery or the buyer's reload retries it")
     return dict({
         'success': False,
         'error': f'Payment succeeded but tier bump failed: {failure}',
