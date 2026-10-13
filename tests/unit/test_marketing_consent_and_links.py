@@ -198,7 +198,7 @@ def test_enable_autonomous_marketing_consent_is_idempotent_and_covers_identities
 
 # ── 4. The same switch turns it OFF ────────────────────────────────
 #
-# Review of e45d8f769 (hartos-87's reviewer, 2026-10-12): the deploy writes
+# Review of "fix(deploy): owner-set keys, the review's fixes" (2026-10-12): the deploy writes
 # HEVOLVE_AUTONOMOUS_MARKETING into central's .env on every deploy, and boot
 # only ever GRANTED.  Setting the flag to 0 left the standing grant in place,
 # and POST /api/social/consent/revoke answers 404 for the system identities
@@ -263,6 +263,28 @@ def test_unset_or_unrecognised_flag_changes_nothing(consent_db, flag):
     _apply(consent_db, '1')
     assert _apply(consent_db, flag) == (None, 0)
     assert set(_posting_allowed(consent_db).values()) == {True}
+
+
+def test_flag_off_on_every_later_boot_changes_nothing(consent_db):
+    """Central reboots with the flag still 0. Only the first off-boot may
+    revoke: later boots must neither re-stamp the history rows (revoke_consent
+    on a combination with no active grant marks its first row again) nor
+    announce three more revocations."""
+    from integrations.social.consent_service import ConsentService
+    from integrations.social.models import UserConsent
+    _apply(consent_db, '1')
+    real = ConsentService.announce_revocation
+    with patch.object(ConsentService, 'announce_revocation',
+                      Mock(side_effect=real)) as announced:
+        assert _apply(consent_db, '0') == ('revoked', 3)
+        rows = [(r.id, r.granted, r.revoked_at)
+                for r in consent_db.query(UserConsent).order_by(UserConsent.id)]
+        assert _apply(consent_db, '0') == ('revoked', 0)
+        assert _apply(consent_db, 'off') == ('revoked', 0)
+    assert [(r.id, r.granted, r.revoked_at)
+            for r in consent_db.query(UserConsent).order_by(UserConsent.id)] == rows
+    assert announced.call_count == 3
+    assert set(_posting_allowed(consent_db).values()) == {False}
 
 
 def test_flag_off_with_nothing_granted_writes_no_row(consent_db):

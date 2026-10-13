@@ -2268,7 +2268,7 @@ def disable_autonomous_marketing_consent(db) -> int:
         Number of identities revoked this call.
     """
     from integrations.social.consent_service import ConsentService
-    revoked = 0
+    revoked, failed = 0, []
     for uid in _AUTONOMOUS_MARKETING_IDENTITIES:
         try:
             if not ConsentService.active_grant(db, uid, 'public_exposure', scope='*'):
@@ -2276,14 +2276,24 @@ def disable_autonomous_marketing_consent(db) -> int:
             ConsentService.revoke_consent(db, uid, 'public_exposure', scope='*')
             revoked += 1
         except Exception as e:
+            failed.append(uid)
             logger.warning(
                 "autonomous-marketing consent revoke for %s failed: %s", uid, e)
+    if failed:
+        # An off-switch that did not switch off must not read as done.
+        logger.error("Autonomous marketing OFF requested but the revoke failed "
+                     "for %s: external posting may continue as them", failed)
     return revoked
 
 
+_AUTONOMOUS_MARKETING_FLAG = 'HEVOLVE_AUTONOMOUS_MARKETING'
+
+
 def apply_autonomous_marketing_flag(db):
-    """Apply ``HEVOLVE_AUTONOMOUS_MARKETING`` at boot: 1/true/yes/on grants,
-    0/false/no/off revokes, anything else (unset included) changes nothing.
+    """Apply ``HEVOLVE_AUTONOMOUS_MARKETING`` at boot: an explicit on grants,
+    an explicit off revokes, unset or unrecognised changes nothing. On/off
+    are whatever ``core.config_cache.env_flag`` says they are (the one
+    parser): on = env_flag(.., False), off = not env_flag(.., True).
 
     The deploy writes the flag into central's .env from its repo secret on
     every deploy (deploy/deepbox_deploy.sh), so "set the secret to 0 and
@@ -2291,19 +2301,21 @@ def apply_autonomous_marketing_flag(db):
 
     Returns ('granted', n), ('revoked', n) or (None, 0).
     """
-    import os
-    flag = os.environ.get('HEVOLVE_AUTONOMOUS_MARKETING', '').strip().lower()
-    if flag in ('1', 'true', 'yes', 'on'):
+    from core.config_cache import env_flag
+    if env_flag(_AUTONOMOUS_MARKETING_FLAG, False):
         n = enable_autonomous_marketing_consent(db)
         if n:
             logger.info("Autonomous marketing enabled: granted public_exposure "
                         "for %d system identit(ies)", n)
         return 'granted', n
-    if flag in ('0', 'false', 'no', 'off'):
+    if not env_flag(_AUTONOMOUS_MARKETING_FLAG, True):
         n = disable_autonomous_marketing_consent(db)
         if n:
             logger.info("Autonomous marketing disabled: revoked public_exposure "
                         "for %d system identit(ies)", n)
+        else:
+            logger.info("Autonomous marketing is OFF (%s): no standing grant",
+                        _AUTONOMOUS_MARKETING_FLAG)
         return 'revoked', n
     return None, 0
 
