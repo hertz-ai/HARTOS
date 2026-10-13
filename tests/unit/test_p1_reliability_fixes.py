@@ -70,6 +70,28 @@ class HiveMindHandlerTest(unittest.TestCase):
             self.assertEqual(reply.get('type'), 'reply', reply)
             self.assertEqual(reply.get('thought'), relayed, local_result)
 
+    def test_a_tree_missing_the_bridges_reader_is_said_out_loud(self):
+        """A copy of the tree whose bridge lacks hivemind_thought_text (the
+        bundle carries more than one copy of HARTOS) used to answer every
+        peer's query with the empty reply and log nothing.  It still answers
+        the empty reply (the asking peer's collect() must not hang) and says
+        why at WARNING, naming the import (the review of fbeb16284)."""
+        import integrations.agent_engine.world_model_bridge as wmb
+        from core.peer_link.hivemind_handler import (
+            handle_hivemind_message, _EMPTY_REPLY,
+        )
+        real = wmb.hivemind_thought_text
+        del wmb.hivemind_thought_text
+        try:
+            with self.assertLogs('hevolve.peer_link.hivemind', level='WARNING') as logs:
+                reply = handle_hivemind_message(
+                    {'type': 'query', 'query': 'q'}, 'peer_x')
+        finally:
+            wmb.hivemind_thought_text = real
+        self.assertEqual(reply, _EMPTY_REPLY)
+        self.assertTrue(any('hivemind_thought_text' in line for line in logs.output),
+                        logs.output)
+
     def test_deliver_missing_target_returns_ack_invalid(self):
         from core.peer_link.hivemind_handler import handle_hivemind_message
         result = handle_hivemind_message(

@@ -87,8 +87,15 @@ def _handle_query(data: dict, sender_peer_id: str) -> Optional[dict]:
         from integrations.agent_engine.world_model_bridge import (
             get_world_model_bridge, hivemind_thought_text,
         )
-    except ImportError:
-        # HTTP-only central tier — hevolveai not loaded, nothing to think.
+    except ImportError as e:
+        # The bridge module is HARTOS's own and imports without the hive
+        # core (central, with no core installed, runs it), so this is a copy
+        # of the tree that lacks a name this handler needs
+        # (hivemind_thought_text arrived in fbeb16284; the bundle carries
+        # more than one copy of HARTOS).  Said at WARNING: every peer's
+        # query is otherwise answered with the empty reply and nothing logged
+        # (the review of fbeb16284).
+        logger.warning(f"hivemind query: bridge import failed, answering empty: {e}")
         return _EMPTY_REPLY
 
     try:
@@ -117,8 +124,8 @@ def _handle_query(data: dict, sender_peer_id: str) -> Optional[dict]:
     if not result:
         return _EMPTY_REPLY
 
-    # The words of the local result, through the bridge's ONE reader
-    # (hivemind_thought_text: 'thought', 'response', 'text' and the HTTP
+    # The words of the local result, through the bridge's reader of one
+    # reply (hivemind_thought_text: 'thought', 'response', 'text' and the HTTP
     # core's 'answer'), so a peer whose own core is reached over HTTP relays
     # the core's answer instead of an empty thought (this read only 'thought'
     # and 'response'; the review of c8a9e0c28 measured the empty reply).  A

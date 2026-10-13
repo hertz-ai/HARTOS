@@ -2610,20 +2610,20 @@ class WorldModelBridge:
                 hive_result = self.query_hivemind(
                     query_text, user_id=user_id, timeout_ms=200
                 )
-                if hive_result:
-                    if isinstance(hive_result, dict):
-                        hive_hint = (
-                            hive_result.get('thought')
-                            or hive_result.get('thoughts')
-                            or hive_result.get('source')
-                        )
-                    else:
-                        hive_hint = str(hive_result)[:400]
-                    if hive_hint:
-                        with self._lock:
-                            self._stats.setdefault(
-                                'hive_hints_on_output_error', 0)
-                            self._stats['hive_hints_on_output_error'] += 1
+                # What the hive SAID, through the bridge's own reader
+                # (hivemind_result_text): the in-process 'thought', a
+                # PeerLink envelope's peers one per line, the HTTP core's
+                # 'answer'.  This read 'thought', then the envelope's whole
+                # 'thoughts' list (a repr of the peer dicts went to the
+                # learner), then 'source' ('peerlink' as the hint when no
+                # peer said anything), and never the core's 'answer' (the
+                # review of fbeb16284 named this reader).
+                hive_hint = hivemind_result_text(hive_result)
+                if hive_hint:
+                    with self._lock:
+                        self._stats.setdefault(
+                            'hive_hints_on_output_error', 0)
+                        self._stats['hive_hints_on_output_error'] += 1
             except Exception as hive_err:
                 logger.debug(
                     f"[Bridge] hive hint query failed for output error: {hive_err}"
@@ -2632,7 +2632,7 @@ class WorldModelBridge:
 
             explanation = None
             if hive_hint:
-                explanation = f'hive_hint: {str(hive_hint)[:400]}'
+                explanation = f'hive_hint: {hive_hint[:400]}'
 
             self.submit_correction(
                 original_response=f'[{output_modality}] {context[:500]}',
@@ -2734,9 +2734,14 @@ _PEER_COUNT_KEYS = ('thought', 'response', 'text')
 #: /v1/hivemind/think with {"status": "ok", "query": ..., "answer": <text or
 #: None>, "reasoning_chain": ..., "contributing_agents": ..., "confidence":
 #: ..., ...}; the review of ca3e314de measured that reply refused as "no
-#: thought" while the list lacked 'answer').  Read by hivemind_thought_text,
-#: the ONE reader of a reply's words: the billing rule below and the peer
-#: reply handler (core.peer_link.hivemind_handler) both go through it.
+#: thought" while the list lacked 'answer').  Read by hivemind_thought_text
+#: (one reply) and hivemind_result_text (a whole query_hivemind result), the
+#: two readers of a reply's words; the billing rule below, the peer reply
+#: handler (core.peer_link.hivemind_handler), the output-error hive hint
+#: (submit_output_feedback) and the robotics API
+#: (integrations.robotics.intelligence_api._invoke_hivemind) all go through
+#: them (the review of fbeb16284 measured the last two reading their own
+#: keys while this said "the ONE reader").
 _THOUGHT_KEYS = _PEER_COUNT_KEYS + ('answer',)
 
 
@@ -2746,10 +2751,11 @@ def _peer_said_something(peer_resp) -> bool:
     core.peer_link.hivemind_handler._EMPTY_REPLY ({'thought': ''}), which
     collect() keeps because it is a non-empty dict; this is the rule
     query_hivemind's peer count (telemetry) applies, unchanged since it was
-    written.  Billing reads a DIFFERENT rule, _said_something below: only a
-    non-blank string counts there, and 'answer' counts there too; so a blank
-    or non-string thought is counted here and not billed, and a reply whose
-    words are under 'answer' is billed and not counted here."""
+    written.  Billing reads a DIFFERENT rule, hivemind_result_has_a_thought
+    below: only a non-blank string counts there, and 'answer' counts there
+    too; so a whitespace-only or truthy non-string thought is counted here
+    and not billed, a reply whose words are under 'answer' is billed and not
+    counted here, and an empty or None thought is neither."""
     return bool(isinstance(peer_resp, dict) and any(
         peer_resp.get(k) for k in _PEER_COUNT_KEYS))
 
@@ -2767,10 +2773,17 @@ def hivemind_thought_text(result) -> str:
     return ''
 
 
-def _said_something(reply) -> bool:
-    """The billing rule for one reply: it has words (hivemind_thought_text).
-    Not the peer count's rule (see _peer_said_something)."""
-    return bool(hivemind_thought_text(reply))
+def hivemind_result_text(result) -> str:
+    """The words of a whole query_hivemind() result.  A PeerLink envelope
+    ({'thoughts': [one reply per peer], ...}): every peer's words
+    (hivemind_thought_text), one per line, the silent peers left out.  Any
+    other shape (None; the in-process and cached {'thought': ...}; the HTTP
+    core's body): hivemind_thought_text of it.  '' when nothing was said;
+    hivemind_result_has_a_thought is its truth."""
+    if isinstance(result, dict) and isinstance(result.get('thoughts'), list):
+        said = (hivemind_thought_text(peer) for peer in result['thoughts'])
+        return '\n'.join(words for words in said if words)
+    return hivemind_thought_text(result)
 
 
 def hivemind_result_has_a_thought(result) -> bool:
@@ -2787,12 +2800,10 @@ def hivemind_result_has_a_thought(result) -> bool:
     HTTP core's real answer refused).  The HTTP leg is reached only when no
     peer answered at all: query_hivemind returns the PeerLink envelope as
     soon as any peer replies, so one connected core-less peer still leaves
-    this False (task #134)."""
-    if not isinstance(result, dict) or not result:
-        return False
-    if isinstance(result.get('thoughts'), list):
-        return any(_said_something(p) for p in result['thoughts'])
-    return _said_something(result)
+    this False (task #134).  The billing rule for one reply is "it has
+    words" (hivemind_thought_text); not the peer count's rule
+    (_peer_said_something)."""
+    return bool(hivemind_result_text(result))
 
 
 _bridge = None

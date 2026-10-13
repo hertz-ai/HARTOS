@@ -782,6 +782,33 @@ class TestRobotIntelligenceAPI(unittest.TestCase):
         }
         return api
 
+    def test_the_hive_strategy_is_the_words_of_the_hives_reply(self):
+        """_invoke_hivemind hands the fusion what the hive SAID, read with
+        the bridge's own reader (hivemind_result_text): the HTTP core's
+        'answer' and a PeerLink envelope's peers reached the robot as ''
+        while this read 'thought' alone (the review of fbeb16284); the
+        in-process 'thought' as before; nothing stays 'unavailable'."""
+        api = self._make_api()
+        core_body = {'status': 'ok', 'query': 'q', 'answer': 'Approach from the left.',
+                     'reasoning_chain': [], 'contributing_agents': ['inst-1'],
+                     'confidence': 0.9}
+        envelope = {'thoughts': [{'type': 'reply', 'thought': '', 'peer_id': 'p1'},
+                                 {'type': 'reply', 'thought': 'Slow down near the table.',
+                                  'peer_id': 'p2'}],
+                    'source': 'peerlink', 'peer_count': 2}
+        for hive_result, strategy, source in (
+                (core_body, 'Approach from the left.', 'hivemind'),
+                (envelope, 'Slow down near the table.', 'peerlink'),
+                ({'thought': 'plain'}, 'plain', 'hivemind'),
+                (None, '', 'unavailable')):
+            bridge = MagicMock()
+            bridge.query_hivemind.return_value = hive_result
+            with patch('integrations.agent_engine.world_model_bridge.'
+                       'get_world_model_bridge', return_value=bridge):
+                out = api._invoke_hivemind('fetch the cup', {'camera': {}})
+            self.assertEqual(out['best_strategy'], strategy, hive_result)
+            self.assertEqual(out['source'], source, hive_result)
+
     @patch.object(RobotIntelligenceAPI, '_invoke_vision',
                   return_value={'scene': 'kitchen', 'objects': ['cup'], 'obstacles': []})
     @patch.object(RobotIntelligenceAPI, '_invoke_language',

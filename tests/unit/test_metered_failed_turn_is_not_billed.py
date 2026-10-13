@@ -236,6 +236,35 @@ def test_the_hivemind_rule_is_the_bridges_own():
     assert not has_thought(dict(HTTP_CORE_BODY, answer=None))
 
 
+def test_the_words_of_a_result_are_one_reader_and_billing_is_its_truth():
+    """hivemind_result_text reads what a whole query_hivemind result SAID
+    (the words the output-error hive hint and the robotics API hand on), and
+    hivemind_result_has_a_thought is exactly its truth on every shape, so the
+    two cannot drift (the review of fbeb16284: two consumers read their own
+    keys while the bridge said "the ONE reader")."""
+    from integrations.agent_engine.world_model_bridge import (
+        hivemind_result_has_a_thought as has_thought,
+        hivemind_result_text as words)
+    shapes = {
+        'none': (None, ''),
+        'empty': ({}, ''),
+        'blank': ({'thought': ' '}, ''),
+        'non-string': ({'thought': ['x']}, ''),
+        'in-process': ({'thought': 'plain'}, 'plain'),
+        'core': (dict(HTTP_CORE_BODY), HTTP_CORE_BODY['answer']),
+        'core-no-answer': (dict(HTTP_CORE_BODY, answer=None), ''),
+        'silent-peers': ({'thoughts': [_empty_peer_reply(), _empty_peer_reply()],
+                          'source': 'peerlink', 'peer_count': 2}, ''),
+        'peers': ({'thoughts': [_empty_peer_reply(), {'text': 'use fp16'},
+                                {'response': 'free the VRAM first'}],
+                   'source': 'peerlink', 'peer_count': 3},
+                  'use fp16\nfree the VRAM first'),
+    }
+    for name, (result, said) in shapes.items():
+        assert words(result) == said, name
+        assert has_thought(result) is bool(said), name
+
+
 # --------------------------------------------------------------------------
 # hivemind: the HTTP core's real answer, through the real bridge
 # --------------------------------------------------------------------------
@@ -292,9 +321,9 @@ def test_the_http_core_with_no_answer_is_not_billed(app_client, passing_auth):
 def test_a_200_the_call_path_would_not_pass_off_is_not_billed(
         app_client, passing_auth, route, body, resp_key, answer):
     """chat_contract.chat_turn_answer is the reader the call path uses
-    (integrations.agentic_router.dispatch_to_agent, paired with
-    chat_turn_result): what it refuses to speak in the agent's voice, the
-    paid API does not bill."""
+    (integrations.agentic_router._call_turn_reply, reached through
+    dispatch_to_agent, paired with chat_turn_result): what it refuses to
+    speak in the agent's voice, the paid API does not bill."""
     with patch('core.http_pool.pooled_post',
                side_effect=lambda url, **kw: _resp(200, answer)), \
             patch('integrations.agent_engine.dispatch._internal_auth_headers',
@@ -322,21 +351,28 @@ def test_a_200_that_is_not_chats_json_is_not_billed(
 
 
 @pytest.mark.parametrize('route,body,resp_key', CHAT_ROUTES)
-def test_a_non_200_whose_body_cannot_be_read_is_still_a_logged_failure(
-        app_client, passing_auth, route, body, resp_key):
+@pytest.mark.parametrize('backend_status,recorded', [
+    pytest.param(401, 401, id='a refused self-POST keeps its status'),
+    pytest.param(200, 502, id='an unreadable 200 is answered-without-an-answer'),
+])
+def test_a_response_whose_body_cannot_be_read_is_still_a_logged_failure(
+        app_client, passing_auth, route, body, resp_key, backend_status, recorded):
     """chat_turn_result catches ValueError only; a response whose body read
     raises anything else must still end as an unbilled failure WITH its
     audit row, not a 500 and no row (the review of c8a9e0c28 measured the
-    500 on a non-200)."""
+    500 on a non-200), and the row records the backend's own status when it
+    is not 200 (the review of fbeb16284 measured a 401 recorded as 502); an
+    unreadable 200 is 502 like every other 200 without an answer."""
     page = MagicMock()
-    page.status_code = 502
+    page.status_code = backend_status
     page.json.side_effect = TypeError('body is not readable')
-    page.text = 'Bad Gateway'
+    page.text = 'not readable'
     with patch('core.http_pool.pooled_post', side_effect=lambda url, **kw: page), \
             patch('integrations.agent_engine.dispatch._internal_auth_headers',
                   return_value=MINTED):
         r = app_client.post(route, json=body, headers={'X-API-Key': 'k'})
     _assert_not_billed(r, passing_auth)
+    assert passing_auth.call_args.kwargs.get('status_code') == recorded
 
 
 # --------------------------------------------------------------------------

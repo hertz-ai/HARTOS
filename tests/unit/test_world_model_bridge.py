@@ -999,6 +999,40 @@ class TestSubmitOutputFeedback(unittest.TestCase):
         self.assertFalse(accepted)
         mock_rec.assert_not_called()
 
+    def test_the_hive_hint_is_the_words_of_the_hives_reply(self):
+        """The hint attached to the correction is what the hive SAID, read
+        with the bridge's own reader (hivemind_result_text): the HTTP core's
+        'answer' (this attached no hint from it), a PeerLink envelope's
+        peers' words one per line (this attached a repr of the peer dicts),
+        and nothing when no peer said anything (this attached the envelope's
+        'source', 'peerlink').  The review of fbeb16284 named this reader."""
+        core_body = {'status': 'ok', 'query': 'q', 'answer': 'Lower the batch size.',
+                     'reasoning_chain': [], 'contributing_agents': ['inst-1'],
+                     'confidence': 0.9}
+        envelope = {'thoughts': [{'type': 'reply', 'thought': '', 'peer_id': 'p1'},
+                                 {'type': 'reply', 'thought': 'Use fp16.', 'peer_id': 'p2'},
+                                 {'type': 'reply', 'thought': 'Free the VRAM first.',
+                                  'peer_id': 'p3'}],
+                    'source': 'peerlink', 'peer_count': 3}
+        silent = {'thoughts': [{'type': 'reply', 'thought': '', 'peer_id': 'p1'}],
+                  'source': 'peerlink', 'peer_count': 1}
+        for hive_result, hint in (
+                (core_body, 'hive_hint: Lower the batch size.'),
+                (envelope, 'hive_hint: Use fp16.\nFree the VRAM first.'),
+                (silent, None),
+                (None, None)):
+            bridge = _make_bridge()
+            with patch.object(bridge, 'query_hivemind', return_value=hive_result), \
+                 patch.object(bridge, 'submit_correction') as corr:
+                bridge.submit_output_feedback(
+                    output_modality='image', status='error',
+                    context='generate cat', error_message='OOM')
+            kwargs = corr.call_args.kwargs
+            self.assertEqual(kwargs['explanation'], hint, hive_result)
+            self.assertEqual(kwargs['context']['hive_hint_used'], hint is not None)
+            self.assertEqual(bridge._stats.get('hive_hints_on_output_error', 0),
+                             1 if hint else 0, hive_result)
+
 
 class TestPeerLinkLearningBoundary(unittest.TestCase):
     """Peer fanout is observed now; final verified work learns later."""
@@ -1047,7 +1081,7 @@ class TestPeerLinkLearningBoundary(unittest.TestCase):
         peers = [
             {'thought': ' '},                       # counted, not billed
             {'thought': ['a', 'list']},             # counted, not billed
-            {'answer': 'the http core, relayed'},   # billed, not counted
+            {'answer': 'words under answer'},       # billed, not counted
             dict(_EMPTY_REPLY),                     # neither
             {'response': 'a real reply'},           # both
         ]

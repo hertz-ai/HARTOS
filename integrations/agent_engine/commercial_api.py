@@ -607,8 +607,12 @@ def _metered_backend_chat(prompt: str, label: str):
         # whatever else a response raises while its body is read is still
         # "no answer" here, with its audit row, instead of a 500 and no row
         # (the review of c8a9e0c28 measured that on a non-200).
+        # The row keeps the backend's own status when it is not 200 (a 401
+        # stays a 401); an unreadable 200 is "answered, not with an answer",
+        # 502, like the other 200s below (the review of fbeb16284).
         logger.warning(f"Metered {label} /chat answer could not be read: {e}")
-        return False, '', 502
+        status = getattr(result, 'status_code', None)
+        return False, '', status if isinstance(status, int) and status != 200 else 502
     if status != 200:
         # WARNING, not DEBUG: central emits nothing below WARNING after boot,
         # which is why this leg was dead silently.  Same reasoning as the
@@ -803,9 +807,10 @@ def intelligence_hivemind():
         # count's (_peer_said_something: truthiness of thought/response/text,
         # telemetry) and the billing rule read here
         # (hivemind_result_has_a_thought: a non-blank string under thought/
-        # response/text/answer).  They differ on a blank or non-string
-        # thought (counted, not billed) and on words under 'answer' (billed,
-        # not counted); billing reads only the second.
+        # response/text/answer).  They differ on a whitespace-only or truthy
+        # non-string thought (counted, not billed) and on words under
+        # 'answer' (billed, not counted); an empty or None thought is
+        # neither; billing reads only the second.
         return _metered_backend_failure(
             '/v1/intelligence/hivemind', tokens_in, elapsed_ms, 502)
 

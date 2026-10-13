@@ -701,7 +701,7 @@ class RobotIntelligenceAPI:
         """
         try:
             from integrations.agent_engine.world_model_bridge import (
-                get_world_model_bridge,
+                get_world_model_bridge, hivemind_result_text,
             )
             bridge = get_world_model_bridge()
             query = (
@@ -714,8 +714,14 @@ class RobotIntelligenceAPI:
             if result:
                 return {
                     'similar_tasks': result.get('match_count', 0),
-                    'best_strategy': result.get('thought',
-                                                result.get('strategy', '')),
+                    # What the hive SAID, through the bridge's own reader
+                    # (hivemind_result_text): the HTTP core's 'answer' and a
+                    # PeerLink envelope's peers reached the robot as ''
+                    # while this read 'thought' alone (the review of
+                    # fbeb16284).  'strategy' stays the fallback it was; no
+                    # shape query_hivemind returns carries it today.
+                    'best_strategy': (hivemind_result_text(result)
+                                      or result.get('strategy', '')),
                     'confidence': result.get('confidence', 0.0),
                     'contributing_agents': result.get('agents', []),
                     'source': result.get('source', 'hivemind'),

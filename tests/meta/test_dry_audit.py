@@ -209,6 +209,7 @@ CANONICAL_OWNERS = {
     'generated_nothing': 'integrations/service_tools/media_agent.py',
     'hivemind_result_has_a_thought': 'integrations/agent_engine/world_model_bridge.py',
     'hivemind_thought_text': 'integrations/agent_engine/world_model_bridge.py',
+    'hivemind_result_text': 'integrations/agent_engine/world_model_bridge.py',
     'AGENT_WORK_TOOL_NAMES': 'core/constants.py',
     'flag_value': 'core/config_cache.py',
     'dump_all_thread_stacks': 'core/diag.py',
