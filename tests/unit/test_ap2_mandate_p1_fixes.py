@@ -175,12 +175,12 @@ class TestOwnGatewayUrls:
     def test_a_trusted_request_host_serves_as_the_base(self):
         from flask import Flask
         from integrations.ap2.ap2_protocol import own_gateway_urls
-        with patch.dict('os.environ', {'ALLOWED_HOSTS': 'shop.example'}, clear=False), \
-                Flask('t').test_request_context('/', headers={'Host': 'shop.example'}):
+        with patch.dict('os.environ', {'ALLOWED_HOSTS': 'shop.example.com'}, clear=False), \
+                Flask('t').test_request_context('/', headers={'Host': 'shop.example.com'}):
             import os
             os.environ.pop('HARTOS_PUBLIC_URL', None)
             out = own_gateway_urls()
-        assert out['callback_url'] == 'http://shop.example/api/v1/intelligence/phonepe/callback'
+        assert out['callback_url'] == 'http://shop.example.com/api/v1/intelligence/phonepe/callback'
 
     def test_nothing_without_a_base(self, monkeypatch):
         from integrations.ap2.ap2_protocol import own_gateway_urls

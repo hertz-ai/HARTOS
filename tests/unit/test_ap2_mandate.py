@@ -108,7 +108,12 @@ class TestCreate:
             m = store.create_cart_mandate('u1', 'mcgroce', CART)
         meta = store.ledger.get_payment(m.payment_id).metadata
         assert 'callback_url' not in meta and 'redirect_url' not in meta
-        assert not [r for r in caplog.records if 'public address' in r.getMessage()], caplog.records
+        # Any warning from the gateway module, whatever its wording (the
+        # review of f08ff3e4c: a check on the words passed on the parent).
+        gateway_warnings = [r for r in caplog.records
+                            if r.name == 'integrations.ap2.ap2_protocol'
+                            and r.levelno >= logging.WARNING]
+        assert gateway_warnings == [], gateway_warnings
 
     def test_over_cap_is_refused(self, store):
         with pytest.raises(MandateError, match='over the cap'):

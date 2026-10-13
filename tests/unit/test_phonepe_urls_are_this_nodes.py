@@ -122,12 +122,12 @@ class TestThePayRequestsUrls:
 
     def test_a_trusted_public_request_host_is_a_callback_address(self, monkeypatch):
         monkeypatch.delenv('HARTOS_PUBLIC_URL', raising=False)
-        monkeypatch.setenv('ALLOWED_HOSTS', 'shop.example')
+        monkeypatch.setenv('ALLOWED_HOSTS', 'shop.example.com')
         with patch('requests.post', return_value=_phonepe_says(_CHECKOUT_MINTED)) as post, \
-                Flask('t').test_request_context('/', headers={'Host': 'shop.example'}):
+                Flask('t').test_request_context('/', headers={'Host': 'shop.example.com'}):
             out = _gateway().create_payment(_request())
         assert out['success'] is True
-        assert _sent(post)['callbackUrl'] == 'http://shop.example' + CALLBACK
+        assert _sent(post)['callbackUrl'] == 'http://shop.example.com' + CALLBACK
 
 
 class TestTheRefundRequestsCallback:

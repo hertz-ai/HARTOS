@@ -14,11 +14,11 @@ import pytest
 
 from core.public_url import (
     PUBLIC_URL_VAR, allowed_hosts, configured_public_url, internet_base_url,
-    is_public_host, public_base_url, trusted_request_base,
+    is_public_host, trusted_request_base,
 )
 
 
-def _in_request(host, env, reader=public_base_url):
+def _in_request(host, env, reader=trusted_request_base):
     """``reader()`` inside a request carrying ``host``, with ``env`` applied
     and HARTOS_PUBLIC_URL absent unless ``env`` sets it."""
     app = Flask('t')
@@ -71,8 +71,20 @@ def test_allowed_hosts_is_the_operators_list_with_the_wildcard_kept(monkeypatch)
     # 203.0.113.0/24 (TEST-NET-3) is a reserved documentation range and NOT
     # global to ipaddress, which is the right answer for a callback address.
     ('203.0.113.5', False),
-    ('1.1.1.1', True), ('2606:4700:4700::1111', True),
-    ('shop.example', True), ('API.Example.Com', True),
+    # A port, a trailing dot and the shorthand IPv4 spellings the socket
+    # layer accepts must not turn a private literal into a "dotted name"
+    # (the review of f08ff3e4c measured each of these answering True).
+    ('10.0.0.5:6777', False), ('192.168.1.2:80', False), ('127.0.0.1.', False),
+    ('localhost.', False), ('127.1', False), ('0x7f.1', False),
+    # Names the public DNS never resolves: IANA special-use and the LAN
+    # conventions.  A trusted request from one is this node, but no gateway
+    # can reach it.
+    ('node.local', False), ('svc.cluster.local', False), ('hartos.lan', False),
+    ('host.docker.internal', False), ('nas.home.arpa', False),
+    ('box.localdomain', False), ('shop.example', False), ('api.test', False),
+    ('x.invalid', False), ('abc.onion', False),
+    ('1.1.1.1', True), ('2606:4700:4700::1111', True), ('1.1.1.1:443', True),
+    ('shop.example.com', True), ('API.Example.Com', True), ('api.hevolve.ai.', True),
 ])
 def test_is_public_host(host, public):
     assert is_public_host(host) is bool(public)
@@ -91,23 +103,27 @@ def test_internet_base_url_refuses_a_trusted_loopback_or_lan_root():
     assert _in_request('localhost:6777', {'ALLOWED_HOSTS': '*'}, internet_base_url) == ''
     assert _in_request('172.17.0.1:6777', {'ALLOWED_HOSTS': '172.17.0.1'}, internet_base_url) == ''
     assert _in_request('desktop:6777', {'ALLOWED_HOSTS': 'desktop'}, internet_base_url) == ''
+    assert _in_request('node.local:6777', {'ALLOWED_HOSTS': 'node.local'}, internet_base_url) == ''
 
 
 def test_internet_base_url_takes_a_trusted_public_root():
-    assert _in_request('shop.example', {'ALLOWED_HOSTS': 'shop.example'}, internet_base_url) == 'http://shop.example'
-    assert _in_request('evil.example', {'ALLOWED_HOSTS': 'shop.example'}, internet_base_url) == ''
+    assert _in_request('shop.example.com', {'ALLOWED_HOSTS': 'shop.example.com'},
+                       internet_base_url) == 'http://shop.example.com'
+    assert _in_request('evil.example.com', {'ALLOWED_HOSTS': 'shop.example.com'},
+                       internet_base_url) == ''
 
 
 def test_the_configured_url_wins_over_any_host_and_loses_its_trailing_slash():
     out = _in_request('evil.example', {'ALLOWED_HOSTS': '*',
-                                       PUBLIC_URL_VAR: 'https://node.example/'})
+                                       PUBLIC_URL_VAR: 'https://node.example/'},
+                      internet_base_url)
     assert out == 'https://node.example'
 
 
 def test_outside_a_request_without_a_configured_url_it_is_empty(monkeypatch):
     monkeypatch.delenv(PUBLIC_URL_VAR, raising=False)
     assert trusted_request_base() == ''
-    assert public_base_url() == ''
+    assert internet_base_url() == ''
 
 
 def test_the_configured_reader_alone(monkeypatch):

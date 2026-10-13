@@ -64,9 +64,10 @@ its Stripe-side registration are `deploy/go_live_stripe.md` Step 4b.
 fronts it on). PhonePe is sent `HARTOS_PUBLIC_URL` +
 `/api/v1/intelligence/phonepe/callback` as its server-to-server callback
 and the same base as the buyer's return page, and refund requests name
-`/api/v1/intelligence/phonepe/refund-callback`; without it a PhonePe
-payment is refused with a message naming the setting, never sent with a
-guessed host (`core/public_url.py`).
+`/api/v1/intelligence/phonepe/refund-callback`; without it (or with only
+a loopback or LAN request host, which no gateway can reach) a PhonePe
+payment is refused, never sent with a guessed host: the shopper sees a
+plain sentence and the ERROR log names the setting (`core/public_url.py`).
 
 The PhonePe keys below are not forwarded by the workflow, so they still
 go into the host-side `.env` by hand (the deploy never rewrites keys it

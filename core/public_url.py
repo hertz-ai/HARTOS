@@ -16,26 +16,41 @@ and that belongs to THIS node.
                           ALLOWED_HOSTS=* (the deploy default) a forged
                           Host would otherwise become the URL a gateway
                           sends the buyer and the signed confirmation to.
-  public_base_url         the configured URL, else the trusted request
-                          root, else ''.  A caller that needs a reachable
-                          URL refuses on '' rather than guess a host.
-  internet_base_url       the same, but a trusted root counts only when
-                          the internet can reach its host (is_public_host):
-                          a loopback or LAN root is this node, and nothing
-                          outside can post a payment confirmation to it.
+  internet_base_url       the configured URL, else the trusted request
+                          root when the internet can reach its host
+                          (is_public_host), else ''.  A loopback or LAN
+                          root is this node, and nothing outside can post a
+                          payment confirmation to it; a caller that needs a
+                          reachable URL refuses on '' rather than guess.
   allowed_hosts           the ALLOWED_HOSTS entries, the ONE parse (the
                           request gate in security.middleware reads it too).
 
 These were two private helpers of integrations/ap2/ap2_mandate.py while
-the channels' OAuth routes kept a second reader of the same variable.
+the channels' OAuth routes kept a second reader of the same variable.  (A
+``public_base_url``, the configured URL else any trusted root, lived here
+for two commits with no caller once the payments path required a
+reachable host; the review of f08ff3e4c found it orphaned.)
 """
 import ipaddress
 import os
+import socket
 from urllib.parse import urlparse
 
 PUBLIC_URL_VAR = 'HARTOS_PUBLIC_URL'
 ALLOWED_HOSTS_VAR = 'ALLOWED_HOSTS'
 LOOPBACK_HOSTS = frozenset({'localhost', '127.0.0.1', '::1'})
+
+#: Name suffixes the public DNS never resolves: IANA's special-use names
+#: (RFC 6761 and 2606: localhost, test, example, invalid, onion, home.arpa
+#: and the rest of .arpa) and the LAN conventions (.local, .localdomain,
+#: .lan, .internal, .intranet, .home, .corp, .private).  A trusted request
+#: from such a host is this node; no payment gateway can reach it (the
+#: review of f08ff3e4c measured node.local, host.docker.internal,
+#: svc.cluster.local and nas.home.arpa accepted as callback hosts).
+UNROUTABLE_NAME_SUFFIXES = frozenset({
+    'localhost', 'local', 'localdomain', 'lan', 'internal', 'intranet', 'home',
+    'corp', 'private', 'arpa', 'test', 'example', 'invalid', 'onion',
+})
 
 
 def allowed_hosts() -> frozenset:
@@ -48,19 +63,44 @@ def allowed_hosts() -> frozenset:
 
 
 def is_public_host(host) -> bool:
-    """Can the internet reach ``host``?  False for a loopback, private,
-    link-local or unspecified literal, for 'localhost' and for a bare name
-    without a dot (a LAN machine's name); True for a global address or a
-    dotted name.  An explicit ALLOWED_HOSTS entry can still be private
-    (central's list carries its docker bridge address), so trust and
-    reachability are two questions."""
-    h = str(host or '').strip().strip('[]').lower()
+    """Can the internet reach ``host``?
+
+    ``host`` may carry a port, IPv6 brackets or a trailing dot; they are
+    read off first.  False for a loopback, private, link-local, reserved or
+    unspecified literal (also in the shorthand spellings the socket layer
+    accepts, '127.1' and '0x7f.1'), for 'localhost', for a bare name without
+    a dot (a LAN machine's name) and for a name under
+    UNROUTABLE_NAME_SUFFIXES; True for a global address or any other dotted
+    name.  An explicit ALLOWED_HOSTS entry can still be private (central's
+    list carries its docker bridge address), so trust and reachability are
+    two questions.  No DNS is asked.
+    """
+    raw = str(host or '').strip().lower()
+    if not raw:
+        return False
+    if '[' not in raw and raw.count(':') >= 2:
+        # A bare IPv6 literal carries no port; urlparse would read
+        # '2606:4700:4700::1111' as host '2606' with a port.
+        h = raw
+    else:
+        h = (urlparse('//' + raw).hostname or '').rstrip('.')
     if not h or h in LOOPBACK_HOSTS:
         return False
     try:
         return ipaddress.ip_address(h).is_global
     except ValueError:
-        return '.' in h
+        pass
+    try:
+        # inet_aton accepts the shorthand and hex IPv4 spellings
+        # ipaddress refuses; what they name decides.
+        return ipaddress.ip_address(socket.inet_ntoa(socket.inet_aton(h))).is_global
+    except (OSError, ValueError):
+        pass
+    if '.' not in h:
+        return False
+    labels = h.split('.')
+    return not any('.'.join(labels[i:]) in UNROUTABLE_NAME_SUFFIXES
+                   for i in range(len(labels)))
 
 
 def configured_public_url() -> str:
@@ -89,11 +129,6 @@ def trusted_request_base() -> str:
     if host in allowed or host in LOOPBACK_HOSTS:
         return root
     return ''
-
-
-def public_base_url() -> str:
-    """The configured public URL, else the trusted request root, else ''."""
-    return configured_public_url() or trusted_request_base()
 
 
 def internet_base_url() -> str:

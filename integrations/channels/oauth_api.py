@@ -73,8 +73,8 @@ def _public_base_url() -> str:
          A redirect_uri must equal the one registered with the provider,
          so a Host a caller forged only fails that caller's own flow; the
          payment gateways' URLs, which a forged Host could misdirect, go
-         through core.public_url.public_base_url, which trusts a request's
-         Host only when ALLOWED_HOSTS names it.
+         through core.public_url.internet_base_url, which takes a request's
+         Host only when ALLOWED_HOSTS names it and the internet can reach it.
     """
     from core.public_url import configured_public_url
     return configured_public_url() or request.url_root.rstrip('/')
