@@ -65,16 +65,28 @@ _SAVE_CONFIG_LOCK = threading.Lock()
 admin_bp = Blueprint("admin", __name__, url_prefix="/api/admin")
 
 
+#: Node tiers that serve many people over the network.  On these the channel
+#: configuration is the operator's, not every user's.  The same env read the
+#: network gate uses (security/middleware.py, HEVOLVE_NODE_TIER).
+_OPERATOR_ONLY_TIERS = ('central', 'regional')
+
+
 @admin_bp.before_request
 def _admin_auth_gate():
-    """Require authenticated user for channel/device config endpoints.
+    """Require an authenticated user; on a public tier, the operator.
 
-    Channel config (settings, identity, channels, workflows) is local device
-    configuration — any registered (flat+) user can manage their own device.
-    Network-wide admin operations (user management, moderation) are protected
-    by separate @require_central decorators on the social admin blueprint.
+    Channel config (settings, identity, channels, workflows) is node
+    configuration.  On a flat desktop any registered user is the one person
+    using the device, so a valid token is enough.  On the central and
+    regional tiers the node serves strangers and Kong routes /api/admin on
+    the public API host, so the gate requires the operator
+    (``holds_central_role``, the ONE check ``require_central`` applies).
+    Measured 2026-10-13 on central: a self-registered user's JWT reached
+    /api/admin/channels (task #121).  Network-wide admin operations (user
+    management, moderation) stay behind @require_central on the social
+    admin blueprint.
     """
-    from integrations.social.auth import _get_user_from_token
+    from integrations.social.auth import _get_user_from_token, holds_central_role
     from flask import g
 
     auth_header = request.headers.get('Authorization', '')
@@ -87,6 +99,13 @@ def _admin_auth_gate():
         if db:
             db.close()
         return jsonify({'success': False, 'error': 'Invalid or expired token'}), 401
+
+    node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat').lower()
+    if node_tier in _OPERATOR_ONLY_TIERS and not holds_central_role(user):
+        if db:
+            db.close()
+        return jsonify({'success': False,
+                        'error': 'Operator access required on this node'}), 403
 
     g.user = user
     g.user_id = str(user.id)
