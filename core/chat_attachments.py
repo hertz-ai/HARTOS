@@ -49,10 +49,10 @@ import logging
 import re
 from typing import Any, Dict, List, Mapping, Optional
 
-# _is_xid is the store's own rule for an xid (64 lowercase hex); asked here
+# is_xid is the store's own rule for an xid (64 lowercase hex); asked here
 # rather than copied, so a reference is well-formed exactly when the store
 # would accept it.
-from core.user_file_store import INBOUND_PURPOSES, _is_xid, get_user_file_store
+from core.user_file_store import INBOUND_PURPOSES, get_user_file_store, is_xid
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +68,7 @@ _SAFE_ID = re.compile(r'[A-Za-z0-9_-]{1,64}')
 def _is_store_ref(item) -> bool:
     """A row naming a file in the store: ``file_id`` is an xid and ``sha256``
     is the same xid; ``purpose``, when given, is an inbound purpose."""
-    return (isinstance(item, Mapping) and _is_xid(item.get('file_id'))
+    return (isinstance(item, Mapping) and is_xid(item.get('file_id'))
             and item.get('sha256') == item['file_id']
             and ('purpose' not in item or item['purpose'] in INBOUND_PURPOSES))
 
@@ -117,7 +117,7 @@ def bind_inbound(user_id, prompt_id, request_id, items) -> List[Dict[str, Any]]:
     Never raises: a store that refuses or fails binds nothing.
     """
     refs = [it['file_id'] for it in (items or ())
-            if isinstance(it, Mapping) and _is_xid(it.get('file_id'))]
+            if isinstance(it, Mapping) and is_xid(it.get('file_id'))]
     if not refs:
         return []
     try:
@@ -202,7 +202,7 @@ def media_to_mirror(media) -> List[Dict[str, Any]]:
     """
     rows = []
     for item in media if isinstance(media, (list, tuple)) else ():
-        if not (isinstance(item, Mapping) and _is_xid(item.get('xid'))):
+        if not (isinstance(item, Mapping) and is_xid(item.get('xid'))):
             continue
         xid = item['xid']
         reel_id = item.get('reel_id')

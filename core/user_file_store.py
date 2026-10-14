@@ -160,7 +160,10 @@ def _is_num(v) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
-def _is_xid(v) -> bool:
+def is_xid(v) -> bool:
+    """Is ``v`` an xid: a file's sha256 as 64 lowercase hex?  The one rule
+    for an xid; core.chat_attachments asks it too, so a reference a turn
+    carries is well-formed exactly when this store would accept it."""
     return isinstance(v, str) and _HEX64.fullmatch(v) is not None
 
 
@@ -214,7 +217,7 @@ def _inbound_meta(meta) -> Dict[str, int]:
 
 def _refused(reason: str, xid=None, i=None) -> Dict[str, Any]:
     out = {'type': 'file_refused', 'reason': reason}
-    if _is_xid(xid):
+    if is_xid(xid):
         out['xid'] = xid
     if i is not None:
         out['i'] = i
@@ -441,7 +444,7 @@ class UserFileStore:
             raise PermissionError('user_file_store: %s belongs to another user' % user_dir)
         for box in BOXES:
             records = doc['files'][box]
-            for xid in [x for x, rec in records.items() if not (_is_xid(x) and _record_ok(rec))]:
+            for xid in [x for x, rec in records.items() if not (is_xid(x) and _record_ok(rec))]:
                 logger.error('user_file_store: dropped a malformed %s record %r in %s',
                              box, xid, path)
                 del records[xid]
@@ -535,7 +538,7 @@ class UserFileStore:
         out = []
         for name in names:
             stem, ext = os.path.splitext(name)
-            if ext == '.json' and _is_xid(stem):
+            if ext == '.json' and is_xid(stem):
                 part = self._load_part(user_dir, stem)
                 if part is not None:
                     out.append(part)
@@ -562,7 +565,7 @@ class UserFileStore:
         first, so stale uploads and expired files do not hold the quota.
         """
         uid = _user_key(user_id)
-        xid = sha256 if _is_xid(sha256) else None
+        xid = sha256 if is_xid(sha256) else None
         if xid is None or not _is_int(size) or size <= 0 or purpose not in INBOUND_PURPOSES:
             return _refused('bad_offer', xid)
         if not _is_file_name(name):
@@ -653,7 +656,7 @@ class UserFileStore:
         again and changes nothing; a chunk whose sha256 or length is wrong is
         refused as ``chunk_corrupt`` and stays missing."""
         uid = _user_key(user_id)
-        if not _is_xid(xid):
+        if not is_xid(xid):
             return _refused('unknown_xid', None, i)
         payload = bytes(data) if isinstance(data, (bytes, bytearray, memoryview)) else None
         digest = hashlib.sha256(payload).hexdigest() if payload is not None else None
@@ -695,7 +698,7 @@ class UserFileStore:
         hashed outside the user's lock; meanwhile an abort of it is ``busy``.
         """
         uid = _user_key(user_id)
-        if not _is_xid(xid):
+        if not is_xid(xid):
             return _refused('unknown_xid')
         user_dir = self._user_dir(uid)
         key = (_dir_key(user_dir), xid)
@@ -764,7 +767,7 @@ class UserFileStore:
         """Drop an upload in progress and its sidecar: ``file_aborted {xid}``
         (also when there was none).  Committed files are not touched."""
         uid = _user_key(user_id)
-        if not _is_xid(xid):
+        if not is_xid(xid):
             return _refused('unknown_xid')
         user_dir = self._user_dir(uid)
         with _lock_for(user_dir):
@@ -786,9 +789,9 @@ class UserFileStore:
             xids = [xids]
         wanted: List[str] = []
         for x in xids or ():
-            if _is_xid(x) and x not in wanted:
+            if is_xid(x) and x not in wanted:
                 wanted.append(x)
-            elif not _is_xid(x):
+            elif not is_xid(x):
                 logger.info('user_file_store: bind skipped a malformed ref %r', x)
         user_dir = self._user_dir(uid)
         with _lock_for(user_dir):
@@ -834,7 +837,7 @@ class UserFileStore:
             doc = self._load_index(user_dir, uid)
             now, changed = self._clock(), False
             for x in xids or ():
-                rec = doc['files']['in'].get(x) if _is_xid(x) else None
+                rec = doc['files']['in'].get(x) if is_xid(x) else None
                 if rec is not None:
                     rec['consumed_at'] = now
                     changed = True
@@ -941,7 +944,7 @@ class UserFileStore:
         user's outbox is served, never an inbound file."""
         uid = _user_key(user_id)
         cs = self._chunk_size(chunk_size)
-        if not _is_xid(xid):
+        if not is_xid(xid):
             return _refused('not_found', None, i)
         user_dir = self._user_dir(uid)
         with _lock_for(user_dir):
@@ -992,7 +995,7 @@ class UserFileStore:
         outbox (again True on a repeat); the GC removes it
         outbox_after_fetch_s after the first fetch."""
         uid = _user_key(user_id)
-        if not _is_xid(xid):
+        if not is_xid(xid):
             return False
         user_dir = self._user_dir(uid)
         with _lock_for(user_dir):
@@ -1013,7 +1016,7 @@ class UserFileStore:
         uid = _user_key(user_id)
         if box is not None and box not in BOXES:
             raise ValueError('box must be one of %s, got %r' % (BOXES, box))
-        if not _is_xid(xid):
+        if not is_xid(xid):
             return None
         user_dir = self._user_dir(uid)
         with _lock_for(user_dir):
