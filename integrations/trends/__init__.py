@@ -11,8 +11,8 @@ central node makes it, serves it or fetches it.
                             U6): starts ig_worker.py as a child process,
                             polls it on later ticks, ranks and publishes
                             what it brought back.  No thread, no LLM.  It
-                            needs a watchlist (the accounts to watch;
-                            nothing writes one yet, plan U1) and then her
+                            needs a watchlist (the accounts to watch,
+                            watchlist.py) and then her
                             research account (a DEDICATED Instagram account,
                             never her business account), read from this
                             desktop's vault, where the credential consent
@@ -47,12 +47,18 @@ central node makes it, serves it or fetches it.
                             from this node's own LLM; with no list, why
                             (daily_job.why_no_list) in words she can be
                             told, after asking the owner for the research
-                            account when that is why.
+                            account when that is why; a list older than
+                            two days is served as old, saying how old.
+  watchlist.py              the accounts watched (owner ruling A17b): the
+                            one writer and reader of watchlist.json, with
+                            Instagram handles only, each once, at most
+                            sources.MAX_ACCOUNTS, and a niche tag.  Her
+                            agent changes it with the reel_watchlist tool;
+                            no credential ever passes through it.
 
 Files (under core.platform_paths.get_data_dir()/trends/): watchlist.json
-(the accounts watched; nothing in HARTOS or Nunba writes it yet -- who
-chooses them on her desktop is the owner's open decision, plan U1 -- so a
-default install makes no list and asks for no account), state.json (the
+(the accounts watched, written only by watchlist.py; a default install has
+none, so it makes no list and asks for no account), state.json (the
 job's schedule and outcome), .ig_session.json (the research account's
 session, 0600), worker.log, run/, songs/latest.json and
 songs/YYYY-MM-DD.json, and song_lang.json (the language cache).

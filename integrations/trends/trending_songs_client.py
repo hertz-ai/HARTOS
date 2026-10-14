@@ -11,8 +11,10 @@ node, and nothing here runs in the background.
   whose ``note`` says it in words her agent can pass on, and that read just
   as well in the reel's push to her phone (never a code or a file path).
   On a default install that is 'no_watchlist': no Instagram accounts are
-  chosen to watch, so nothing is asked for and the note tells her to choose
-  a song in Instagram meanwhile.  With a watchlist, the next thing missing
+  chosen to watch (her agent's reel_watchlist tool names them, owner ruling
+  A17b), so nothing is asked for and the note says naming the accounts to
+  track comes first and to choose a song in Instagram meanwhile.  With a
+  watchlist, the next thing missing
   is the DEDICATED research Instagram account (never the business
   account): this read first asks the owner for whatever part of it is
   missing (daily_job.ask_for_account: the one credential consent card, one
@@ -25,6 +27,14 @@ node, and nothing here runs in the background.
 * A list kept after a failed day is served marked stale, with the reason;
   a paused one ('challenge', 'login') says how long the pause runs
   (daily_job.FREEZE_S, doubling, at most MAX_FREEZE_S).
+* A list made more than OLD_AFTER_S ago that nothing marked stale (the
+  computer never idle long enough, the job stopped) is never presented as
+  current (critic item 2.6): it is served marked stale, reason 'old_list'.
+  Every stale list's note ends saying how old the list is and from which
+  day, and ``age_hours`` carries it for any list.
+* ``list_status()``: the same reason, words and age without the songs (no
+  song is tagged, so no model is asked), for a reply that needs only where
+  the list stands (the reel_watchlist tool's).
 * Each song's language: the job's language_hint when it gave one, else the
   title's script (trending_songs.script_language, through the TTS router's
   detector: Tamil, Devanagari, Gurmukhi); only a Latin-script title asks
@@ -33,11 +43,12 @@ node, and nothing here runs in the background.
   in trends/song_lang.json.
 
 Output ``hart.trending_songs.client.v1``: ``{'schema', 'fetched_at',
-'generated_at', 'date', 'stale', 'reason', 'note', 'songs': [{'song_key',
-'title', 'artist', 'lang', 'suggested_start_ms', 'start_label', 'score',
-'accounts', 'reels', 'is_original_audio', 'is_explicit', 'duration_ms'}]}``,
-best first.  ``fetched_at`` is when the list was read here; ``note`` is
-None when there is nothing to explain.
+'generated_at', 'date', 'age_hours', 'stale', 'reason', 'note', 'songs':
+[{'song_key', 'title', 'artist', 'lang', 'suggested_start_ms',
+'start_label', 'score', 'accounts', 'reels', 'is_original_audio',
+'is_explicit', 'duration_ms'}]}``, best first.  ``fetched_at`` is when the
+list was read here; ``age_hours`` how long ago it was made (None with no
+list); ``note`` is None when there is nothing to explain.
 """
 import json
 import logging
@@ -57,6 +68,13 @@ logger = logging.getLogger(__name__)
 
 LLM_TIMEOUT_S = 20.0
 DEFAULT_LIMIT = 10
+#: A list made longer ago than this is not presented as current.  The job
+#: makes the next one a day after its last good run (daily_job.DAY_S, plus
+#: up to JITTER_S) once the computer is idle, so a list older than two days
+#: means at least one day's run is missing.
+OLD_AFTER_S = 2 * _job.DAY_S
+#: How the published list writes its time (daily_job._iso), and its day.
+_MADE_FORMATS = (('generated_at', '%Y-%m-%dT%H:%M:%SZ'), ('date', '%Y-%m-%d'))
 #: The most Latin titles one call asks the LLM about; the rest wait for a
 #: later call (they are asked in rank order, so the top songs come first).
 MAX_LLM_ASKS = 8
@@ -112,7 +130,8 @@ _NOTES = {
                          "asking again\" for it in Privacy settings."),
     'no_watchlist': ("Trending songs are not set up on this computer yet: no Instagram "
                      "accounts are chosen for it to watch, so there is no trending-song list "
-                     "to suggest a song from; choose a song in Instagram for now."),
+                     "to suggest a song from. Naming the Instagram accounts to track is the "
+                     "first step; choose a song in Instagram for now."),
     'no_disk': ("This computer has too little free disk space to install the trending-song "
                 "reader (it needs about %d MB free), so there is no trending-song list; it "
                 "tries again on its own once there is room."
@@ -157,8 +176,13 @@ _NOTES = {
     'install_timeout': _READER_UNINSTALLED,
     'stale': ("The trending-song list on this computer is not from today; a fresh one is "
               "made on its own."),
+    'old_list': ("The trending-song list on this computer has not been made fresh for more "
+                 "than %d days, so it may not show what is trending now."
+                 % (OLD_AFTER_S // _job.DAY_S)),
     'error': "Whether this computer has a trending-song list could not be checked just now.",
 }
+#: What every stale list's note ends with: how old the list is, and its day.
+_AGE_NOTE = "This list was made %s ago, on %s."
 
 _lock = threading.Lock()
 
@@ -201,6 +225,76 @@ def note_for(reason: Optional[str]) -> Optional[str]:
     return _NOTES.get(reason) or _NO_FRESH_LIST
 
 
+def _read() -> Optional[dict]:
+    """The published list (trending_songs.read_latest), or None when there
+    is none or it could not be read (logged)."""
+    try:
+        return ts.read_latest()
+    except Exception as e:
+        logger.warning("trending songs: the list could not be read: %s", e)
+        return None
+
+
+def _made_at(doc: dict) -> Optional[float]:
+    """When the list was made, in epoch seconds: its generated_at, else its
+    date at 00:00 UTC (_MADE_FORMATS); None when neither reads."""
+    for key, fmt in _MADE_FORMATS:
+        try:
+            made = datetime.strptime(doc.get(key), fmt)
+        except (TypeError, ValueError):
+            continue
+        return made.replace(tzinfo=timezone.utc).timestamp()
+    return None
+
+
+def _age_words(age_s: float) -> str:
+    """How old, in words: hours under two days, then days."""
+    hours = int(age_s // 3600)
+    if hours < 1:
+        return 'less than an hour'
+    if hours < 48:
+        return '1 hour' if hours == 1 else '%d hours' % hours
+    return '%d days' % int(age_s // _job.DAY_S)
+
+
+def _standing(doc: Optional[dict], now: float) -> Dict[str, Any]:
+    """``{'stale', 'reason', 'note', 'age_hours'}`` for ``doc`` (the
+    published list, or None) at ``now``.  No list: why (_why_no_list, which
+    first asks the owner for the research account when that is why).  A
+    list the job marked stale: its reason.  A list made more than
+    OLD_AFTER_S ago: 'old_list'.  Else it is current, with no reason and no
+    note.  A stale list's note ends with how old it is and its day."""
+    if doc is None:
+        reason = _why_no_list()
+        return {'stale': True, 'reason': reason, 'note': note_for(reason), 'age_hours': None}
+    made = _made_at(doc)
+    age = None if made is None else max(0.0, now - made)
+    hours = None if age is None else int(age // 3600)
+    marked = doc.get('stale_reason')
+    if doc.get('stale') is True:
+        reason = marked if isinstance(marked, str) and marked else 'stale'
+    elif age is not None and age > OLD_AFTER_S:
+        reason = 'old_list'
+    else:
+        return {'stale': False, 'reason': None, 'note': None, 'age_hours': hours}
+    note = note_for(reason)
+    if age is not None:
+        note += ' ' + _AGE_NOTE % (_age_words(age), doc.get('date'))
+    return {'stale': True, 'reason': reason, 'note': note, 'age_hours': hours}
+
+
+def list_status() -> Dict[str, Any]:
+    """Where this computer's trending-song list stands, without its songs:
+    ``{'stale', 'reason', 'note', 'age_hours', 'date'}`` as
+    get_trending_songs answers them (with no list, the owner is first asked
+    for the research account when that is what is missing).  No song is
+    tagged, so no model is asked.  Never raises."""
+    doc = _read()
+    out = _standing(doc, _now())
+    out['date'] = (doc or {}).get('date')
+    return out
+
+
 def _lang_filter(langs: Any) -> Optional[set]:
     if isinstance(langs, str):
         langs = langs.split(',')
@@ -237,18 +331,16 @@ def get_trending_songs(langs: Any = None, limit: int = DEFAULT_LIMIT) -> Dict[st
     watchlist but no research account set up here, the owner is first asked
     for one on the consent card and the reason is 'account_asked',
     'account_declined' or 'no_account'; else 'central', 'not_run_yet', ...);
-    a stale list keeps its songs and names the job's reason."""
+    a stale list keeps its songs and names the job's reason, and so does a
+    list older than OLD_AFTER_S ('old_list'), each saying how old it is
+    (_standing)."""
     want = _lang_filter(langs)
     try:
         limit = max(1, min(int(limit), ts.MAX_SONGS))
     except (TypeError, ValueError):
         limit = DEFAULT_LIMIT
     with _lock:
-        try:
-            doc = ts.read_latest()
-        except Exception as e:
-            logger.warning("trending songs: the list could not be read: %s", e)
-            doc = None
+        doc = _read()
         songs: List[Dict[str, Any]] = []
         asking = _asking()
         for song in (doc or {}).get('songs') or []:
@@ -260,18 +352,13 @@ def get_trending_songs(langs: Any = None, limit: int = DEFAULT_LIMIT) -> Dict[st
             if len(songs) >= limit:
                 break
         _save_langs(asking)
-    if doc is None:
-        stale, reason = True, _why_no_list()
-    elif doc.get('stale') is True:
-        stale = True
-        reason = doc.get('stale_reason') if isinstance(doc.get('stale_reason'), str) \
-            and doc.get('stale_reason') else 'stale'
-    else:
-        stale, reason = False, None
+    now = _now()
+    standing = _standing(doc, now)
     doc = doc or {}
-    return {'schema': TRENDING_CLIENT_SCHEMA, 'fetched_at': _iso(_now()),
+    return {'schema': TRENDING_CLIENT_SCHEMA, 'fetched_at': _iso(now),
             'generated_at': doc.get('generated_at'), 'date': doc.get('date'),
-            'stale': stale, 'reason': reason, 'note': note_for(reason), 'songs': songs}
+            'age_hours': standing['age_hours'], 'stale': standing['stale'],
+            'reason': standing['reason'], 'note': standing['note'], 'songs': songs}
 
 
 # ── a song's language ─────────────────────────────────────────────────────

@@ -245,6 +245,13 @@ CANONICAL_OWNERS = {
     # the filler.
     'REEL_HASHTAG_LIMIT_TOKEN': 'integrations/agent_engine/human_voice.py',
     'with_reel_hashtag_limit': 'integrations/agent_engine/human_voice.py',
+    # Her trending-song watchlist's one reader and one writer (owner ruling
+    # A17b): daily_job reads through it, the reel_watchlist tool writes
+    # through it.  And the one short-tag rule its niche and the published
+    # list's region/niche/source are kept with.
+    'read_watchlist': 'integrations/trends/watchlist.py',
+    'update_watchlist': 'integrations/trends/watchlist.py',
+    'clean_tag': 'integrations/trends/trending_songs.py',
 }
 
 #: module -> why it may walk sys._current_frames() itself.

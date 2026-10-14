@@ -166,6 +166,17 @@ def normalize_reel(raw: Any, *, account: Optional[str] = None) -> Optional[dict]
     }
 
 
+def clean_tag(value: Any) -> Optional[str]:
+    """A short tag, stripped: a letter, then letters, digits, '_' or '-', at
+    most 32 in all.  The one rule for a list's source and a watchlist's
+    region and niche (watchlist writes them with it, merge_days copies them
+    with it); None for anything else."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value if _TAG_RE.fullmatch(value) else None
+
+
 def _letters(title: Any) -> List[str]:
     return [ch for ch in title if ch.isalpha()] if isinstance(title, str) else []
 
@@ -401,9 +412,7 @@ def rank_batch(batch: Any, *, now: Optional[float] = None, previous: Any = None,
                            'dropped': dropped, 'songs': []}
     if not isinstance(batch, Mapping) or not isinstance(batch.get('accounts'), list):
         return out
-    source = batch.get('source')
-    if isinstance(source, str) and _TAG_RE.fullmatch(source.strip()):
-        out['source'] = source.strip()
+    out['source'] = clean_tag(batch.get('source')) or out['source']
     rows = [r for r in batch['accounts'] if isinstance(r, Mapping)]
     out['accounts_total'] = len(rows)
     out['accounts_ok'] = sum(1 for r in rows if r.get('ok') is True)
@@ -486,8 +495,9 @@ def merge_days(batch_rank: Mapping, prev_doc: Any, *, today: str,
         'songs': songs,
     }
     for key, value in (('region', region), ('niche', niche)):
-        if isinstance(value, str) and _TAG_RE.fullmatch(value.strip()):
-            doc[key] = value.strip()
+        tag = clean_tag(value)
+        if tag:
+            doc[key] = tag
     return doc
 
 

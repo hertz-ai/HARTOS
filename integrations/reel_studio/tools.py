@@ -1,7 +1,8 @@
-"""integrations.reel_studio.tools -- her seven reel_* agent tools.
+"""integrations.reel_studio.tools -- her seven reel_* agent tools, and
+reel_watchlist, the one asked for on demand.
 
 ``register_reel_studio_tools(helper, assistant, user_id, prompt_id=,
-request_id_getter=, with_schema=, executor=)`` builds seven closures with her
+request_id_getter=, with_schema=, executor=)`` builds the closures with her
 user id, her agent's prompt id and a getter for the current turn's request
 id bound in, so none of them is a tool argument, and registers them in the
 canonical Tier-2 shape (integrations.agent_engine.news_tools.
@@ -45,6 +46,21 @@ The seven (REEL_TOOL_NAMES):
 * ``reel_skill``: an adapted skill text with her voice brief in front.
 * ``reel_voice``: read or change her voice profile.
 
+On demand (REEL_ON_DEMAND_TOOL_NAMES): registered with the seven, on the
+same seats, but with no schema for any agent, her Reel Studio agent's
+included -- request_tools attaches it when an agent asks
+(core.agent_tool_menu.discover_and_attach matches the first line of its
+docstring).  It is used once in a while, and the seven's schema is held to
+900 tokens per seat (plan WS-8b; 893 measured with the seven):
+
+* ``reel_watchlist``: track, stop tracking or list the Instagram accounts
+  her trending songs come from, and their niche (owner ruling A17b;
+  integrations.trends.watchlist, the one writer of the list the daily job
+  watches).  It takes handles only: the research Instagram account's
+  username and password are asked for on the credential consent card
+  (integrations.trends.daily_job.ask_for_account), and its reply says
+  where that ask stands and never to take them in chat.
+
 Replies are JSON, except reel_skill's text.  A call that did not do its work
 answers in the executor's failure form, starting "Error:"
 (core.constants.TOOL_ERROR_REPLY_PREFIXES): for reel_make that is every
@@ -70,6 +86,9 @@ logger = logging.getLogger(__name__)
 
 REEL_TOOL_NAMES = ('reel_make', 'reel_trending_songs', 'reel_check_caption', 'reel_score_hooks',
                    'reel_beat_sheet', 'reel_skill', 'reel_voice')
+#: Registered with REEL_TOOL_NAMES on the same seats, shown to no agent:
+#: request_tools attaches them when asked (see the module note).
+REEL_ON_DEMAND_TOOL_NAMES = ('reel_watchlist',)
 
 #: The executor's failure form (core.constants.tool_reply_failed reads it).
 _FAILED = TOOL_ERROR_REPLY_PREFIXES[0]
@@ -85,6 +104,12 @@ UNLISTED_SONG_NOTE = ("The song named for this reel is not on this computer's tr
 NO_SONG_NOTE = ("Today's trending-song list on this computer has no song in the reel's "
                 "language.")
 UNREAD_LIST_NOTE = "The trending-song list on this computer could not be read."
+#: What every reel_watchlist reply tells her agent to do with it.
+WATCHLIST_MESSAGE = ("Tell her which Instagram accounts are tracked for her trending songs now, "
+                     "any handle not taken and why, and the trending note when there is one. "
+                     "The research Instagram account's username and password are entered on "
+                     "this computer's consent card only, never in chat: do not ask her for them "
+                     "or accept them here.")
 
 #: open_with values that ask for the final-look teaser (A1), and those that
 #: ask for the plain story; anything else is read as her words.
@@ -417,10 +442,34 @@ def _reel_voice(turn: _Turn, action, field, value) -> str:
     return _error('reel_voice', 'action must be get, set, clear, fields or reset, not %r' % act)
 
 
+def _reel_watchlist(track, untrack, niche) -> str:
+    """Change and list the accounts watched (integrations.trends.watchlist),
+    then say where her trending-song list stands (trending_songs_client.
+    list_status: with accounts tracked and no research account here, the
+    owner is asked on the consent card).  A call that asked for a change and
+    got none, every value it named refused, answers in the failure form."""
+    from integrations.trends import trending_songs_client, watchlist
+    track, untrack, niche = _text(track), _text(untrack), _text(niche)
+    try:
+        result = watchlist.update_watchlist(track=track, untrack=untrack, niche=niche or None)
+    except watchlist.WatchlistUnavailable as e:
+        return _error('reel_watchlist', 'the list of tracked accounts on this computer could '
+                      'not be changed (%s)' % e)
+    answered = (result['changed'] or result['already_tracked'] or result['not_tracked']
+                or result['over_limit'])
+    if (track or untrack or niche) and result['refused'] and not answered:
+        return _error('reel_watchlist', '; '.join('%r is %s' % (r['value'], r['why'])
+                                                  for r in result['refused']))
+    result['trending'] = trending_songs_client.list_status()
+    result['message'] = WATCHLIST_MESSAGE
+    return _ok_reply(result)
+
+
 def build_reel_tools(user_id, *, prompt_id,
                      request_id_getter: Optional[Callable[[], Any]] = None
                      ) -> List[Tuple[str, Callable[..., str]]]:
-    """The seven (name, closure) pairs for one user's agent, in REEL_TOOL_NAMES order."""
+    """The (name, closure) pairs for one user's agent: REEL_TOOL_NAMES, then
+    REEL_ON_DEMAND_TOOL_NAMES, in that order."""
     # The cap reel_make's hashtags parameter states is the one _hashtags
     # keeps (contracts.HASHTAG_LIMIT, the human-voice guide's reel cap).
     from integrations.reel_studio.contracts import HASHTAG_LIMIT
@@ -525,10 +574,23 @@ def build_reel_tools(user_id, *, prompt_id,
         """
         return _reel_voice(turn, action, field, value)
 
+    def reel_watchlist(
+        track: Annotated[str, 'Instagram handles to start tracking, comma-separated'] = '',
+        untrack: Annotated[str, 'Handles to stop tracking, comma-separated'] = '',
+        niche: Annotated[str, "What they post, e.g. bridal makeup; '' = unchanged"] = '',
+    ) -> str:
+        """Track or stop tracking the Instagram accounts her trending songs come from, or list them.
+
+        With nothing to change it lists them.  Handles only: the research
+        Instagram account's username and password are entered on this
+        computer's consent card, never here or in chat.
+        """
+        return _reel_watchlist(track, untrack, niche)
+
     return [('reel_make', reel_make), ('reel_trending_songs', reel_trending_songs),
             ('reel_check_caption', reel_check_caption), ('reel_score_hooks', reel_score_hooks),
             ('reel_beat_sheet', reel_beat_sheet), ('reel_skill', reel_skill),
-            ('reel_voice', reel_voice)]
+            ('reel_voice', reel_voice), ('reel_watchlist', reel_watchlist)]
 
 
 def _first_registration() -> None:
@@ -554,21 +616,23 @@ def _inert_here() -> bool:
 def register_reel_studio_tools(helper, assistant, user_id: str, *, prompt_id,
                                request_id_getter: Optional[Callable[[], Any]] = None,
                                with_schema: bool = True, executor=None) -> List[str]:
-    """Register the seven reel tools for ``user_id``'s agent ``prompt_id``,
-    in the canonical Tier-2 shape (see the module note; the same as
+    """Register the reel tools for ``user_id``'s agent ``prompt_id``, in the
+    canonical Tier-2 shape (see the module note; the same as
     news_tools.register_news_tools).
 
     ``request_id_getter()`` returns the current turn's request id, read each
     time reel_make runs.  ``with_schema``: True for her Reel Studio agent --
-    ``register_for_llm`` on ``helper`` and on ``assistant``, so whichever of
-    them proposes reel_make makes a structured call; False for any other
-    agent -- no schema anywhere, so request_tools can attach them on demand.
-    Either way ``assistant`` runs them (``register_for_execution``), and so
-    does ``executor`` when given: a group-chat agent distinct from the
-    proposer, which runs the assistant's own calls (REUSE passes its
-    executor to every Tier-2 family).  On the central node nothing is
-    registered (amendment A8 d).  Returns the names registered, in
-    REEL_TOOL_NAMES order ([] on central).
+    ``register_for_llm`` on ``helper`` and on ``assistant`` for the seven
+    REEL_TOOL_NAMES, so whichever of them proposes reel_make makes a
+    structured call; False for any other agent -- no schema anywhere, so
+    request_tools can attach them on demand.  REEL_ON_DEMAND_TOOL_NAMES get
+    no schema either way.  ``assistant`` runs them all
+    (``register_for_execution``), and so does ``executor`` when given: a
+    group-chat agent distinct from the proposer, which runs the assistant's
+    own calls (REUSE passes its executor to every Tier-2 family).  On the
+    central node nothing is registered (amendment A8 d).  Returns the names
+    registered, REEL_TOOL_NAMES then REEL_ON_DEMAND_TOOL_NAMES ([] on
+    central).
     """
     if _inert_here():
         logger.info('Reel tools not registered for user %s: reel_studio is inert on the '
@@ -577,7 +641,7 @@ def register_reel_studio_tools(helper, assistant, user_id: str, *, prompt_id,
     _first_registration()
     tools = build_reel_tools(user_id, prompt_id=prompt_id, request_id_getter=request_id_getter)
     for name, func in tools:
-        if with_schema:
+        if with_schema and name not in REEL_ON_DEMAND_TOOL_NAMES:
             description = _describe(func)
             helper.register_for_llm(name=name, description=description)(func)
             assistant.register_for_llm(name=name, description=description)(func)
@@ -591,5 +655,5 @@ def register_reel_studio_tools(helper, assistant, user_id: str, *, prompt_id,
     return names
 
 
-__all__ = ['REEL_TOOL_NAMES', 'HOOK_TEXT_MAX_CHARS', 'build_reel_tools',
-           'register_reel_studio_tools']
+__all__ = ['REEL_TOOL_NAMES', 'REEL_ON_DEMAND_TOOL_NAMES', 'HOOK_TEXT_MAX_CHARS',
+           'build_reel_tools', 'register_reel_studio_tools']

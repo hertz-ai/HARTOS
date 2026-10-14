@@ -174,14 +174,18 @@ def test_with_the_schema_both_seats_carry_it_and_the_executor_runs_them(env):
     Assistant carries the schema too, or a reel_make it proposes is free-
     formed as text that autogen never runs (measured live on the news family,
     2026-09-03); the executor runs them so the Assistant's own structured
-    call is not stranded by autogen's repeat-speaker rule."""
-    from integrations.reel_studio.tools import REEL_TOOL_NAMES
+    call is not stranded by autogen's repeat-speaker rule.  The on-demand
+    ones (reel_watchlist) run on the same seats with no schema
+    (test_reel_watchlist_tool.py)."""
+    from integrations.reel_studio.tools import REEL_ON_DEMAND_TOOL_NAMES, REEL_TOOL_NAMES
+    every = set(REEL_TOOL_NAMES) | set(REEL_ON_DEMAND_TOOL_NAMES)
     t = _tools(env, executor=True)
-    assert len(REEL_TOOL_NAMES) == 7 and t.names == list(REEL_TOOL_NAMES)
+    assert len(REEL_TOOL_NAMES) == 7
+    assert t.names == list(REEL_TOOL_NAMES) + list(REEL_ON_DEMAND_TOOL_NAMES)
     assert set(t.helper.llm) == set(REEL_TOOL_NAMES) and t.helper.exe == {}
     assert set(t.assistant.llm) == set(REEL_TOOL_NAMES)
-    assert set(t.assistant.exe) == set(REEL_TOOL_NAMES)
-    assert set(t.executor.exe) == set(REEL_TOOL_NAMES) and t.executor.llm == {}
+    assert set(t.assistant.exe) == every
+    assert set(t.executor.exe) == every and t.executor.llm == {}
     for seat in (t.helper, t.assistant):
         for name, (desc, func) in seat.llm.items():
             first = (func.__doc__ or '').strip().split('\n')[0].strip()
@@ -191,17 +195,18 @@ def test_with_the_schema_both_seats_carry_it_and_the_executor_runs_them(env):
 
 
 def test_without_an_executor_the_assistant_runs_them(env):
-    from integrations.reel_studio.tools import REEL_TOOL_NAMES
+    from integrations.reel_studio.tools import REEL_ON_DEMAND_TOOL_NAMES, REEL_TOOL_NAMES
     t = _tools(env)
-    assert set(t.helper.llm) == set(t.assistant.llm) == set(t.assistant.exe) \
-        == set(REEL_TOOL_NAMES)
+    assert set(t.helper.llm) == set(t.assistant.llm) == set(REEL_TOOL_NAMES)
+    assert set(t.assistant.exe) == set(REEL_TOOL_NAMES) | set(REEL_ON_DEMAND_TOOL_NAMES)
 
 
 def test_without_the_schema_only_execution_is_registered(env):
-    from integrations.reel_studio.tools import REEL_TOOL_NAMES
+    from integrations.reel_studio.tools import REEL_ON_DEMAND_TOOL_NAMES, REEL_TOOL_NAMES
     t = _tools(env, with_schema=False, executor=True)
     assert t.helper.llm == {} and t.assistant.llm == {} and t.executor.llm == {}
-    assert set(t.assistant.exe) == set(t.executor.exe) == set(REEL_TOOL_NAMES)
+    assert set(t.assistant.exe) == set(t.executor.exe) \
+        == set(REEL_TOOL_NAMES) | set(REEL_ON_DEMAND_TOOL_NAMES)
     # discover_and_attach reads the first docstring line of _function_map entries.
     for func in t.assistant.exe.values():
         assert (func.__doc__ or '').strip().split('\n')[0].strip()

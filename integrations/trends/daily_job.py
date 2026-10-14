@@ -30,9 +30,10 @@ Her research account: a DEDICATED Instagram account made for this research,
 never her business account.  Its username and password are owner-entered
 credentials in this desktop's own vault (hartos.ai_key_vault;
 USERNAME_CREDENTIAL and PASSWORD_CREDENTIAL), never tracked.  The way in is
-the one credential consent card: when her agent asks for trending songs, a
-watchlist names an account to watch and the research account is missing,
-``ask_for_account()`` (through trending_songs_client) files it with
+the one credential consent card: when her agent asks for trending songs
+(or changes or lists the watchlist), a watchlist names an account to watch
+and the research account is missing, ``ask_for_account()`` (through
+trending_songs_client) files it with
 hartos.ai_key_vault.request_credential, one card per part, for this
 computer's owner.  With no usable watchlist nothing is asked for: the job
 cannot run without one, so asking for a password then would collect a
@@ -78,10 +79,10 @@ answers and is not central.  Her desktop is a 'flat' node, the default; a
 research account and a watchlist there, and what it makes is read only on
 that node (nothing serves it to other nodes).
 
-Due means: the node runs it (above), ``trends/watchlist.json`` names at
-least one account, her research account is entered, nothing is frozen, and
-``state.json``'s next_run_at has passed (set a day after the last good run,
-plus up to JITTER_S).
+Due means: the node runs it (above), the watchlist names at least one
+account (integrations.trends.watchlist.read_watchlist), her research account
+is entered, nothing is frozen, and ``state.json``'s next_run_at has passed
+(set a day after the last good run, plus up to JITTER_S).
 
 Failures (goals-trends report 2.5):
 * challenge / login: frozen for FREEZE_S (doubling on each freeze in a row,
@@ -104,11 +105,12 @@ where the ask for her research account stands when that is why; the order
 is the tier, the watchlist, then the account (_not_ready).
 
 Files (get_data_dir()/trends/): watchlist.json ({"region", "niche",
-"accounts": [handle | {"handle", "pk"}]}; nothing writes it yet -- who
-chooses the accounts on her desktop is the owner's open decision, plan
-U1 -- so a default install makes no list and asks for nothing), state.json,
-.ig_session.json (the worker's, 0600), worker.log, run/ (the current
-spec and batch, removed after each run), songs/ (trending_songs).
+"accounts": [handle | {"handle", "pk"}]}; its one writer and reader is
+integrations.trends.watchlist, and her agent names the accounts through
+the reel_watchlist tool, owner ruling A17b -- a default install has none,
+so it makes no list and asks for nothing), state.json, .ig_session.json
+(the worker's, 0600), worker.log, run/ (the current spec and batch,
+removed after each run), songs/ (trending_songs).
 """
 import json
 import logging
@@ -124,6 +126,7 @@ from typing import Any, Dict, List, Optional
 from core.file_cache import atomic_json_write
 from integrations.trends import sources as _sources
 from integrations.trends import trending_songs as ts
+from integrations.trends import watchlist as _wl
 
 logger = logging.getLogger(__name__)
 
@@ -536,27 +539,13 @@ def _poll_install(run: Dict[str, Any], now: float) -> str:
     return 'installed'
 
 
-def _watchlist() -> Dict[str, Any]:
-    """trends/watchlist.json: ``{'region', 'niche', 'accounts'}``, the
-    accounts cleaned by sources.clean_accounts; no accounts when it is
-    missing or unreadable."""
-    try:
-        with open(os.path.join(ts.trends_dir(), 'watchlist.json'), encoding='utf-8') as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        data = None
-    if not isinstance(data, dict):
-        return {'region': None, 'niche': None, 'accounts': []}
-    return {'region': data.get('region'), 'niche': data.get('niche'),
-            'accounts': _sources.clean_accounts(data.get('accounts'))}
-
-
 def _has_watchlist() -> bool:
     """True when the watchlist names at least one account the worker can
-    read (_watchlist).  Nothing in HARTOS or Nunba writes it yet: who
-    chooses the accounts on her desktop is the owner's open decision (plan
-    U1), so on a default install this is False and nothing is asked."""
-    return bool(_watchlist()['accounts'])
+    read (integrations.trends.watchlist.read_watchlist, the one reader of
+    the file its update_watchlist writes; her agent's reel_watchlist tool
+    is the way in).  A default install has none, so this is False and
+    nothing is asked."""
+    return bool(_wl.read_watchlist()['accounts'])
 
 
 def _free_bytes() -> Optional[int]:
@@ -605,7 +594,7 @@ def _start(state: Dict[str, Any], now: float, python: str) -> str:
     username, password = _credentials()
     if not username or not password:
         return 'skip'
-    watch = _watchlist()
+    watch = _wl.read_watchlist()
     pks = state.get('pks') if isinstance(state.get('pks'), dict) else {}
     accounts = [{'handle': a['handle'],
                  'pk': a['pk'] or _sources.clean_id(pks.get(a['handle']))}

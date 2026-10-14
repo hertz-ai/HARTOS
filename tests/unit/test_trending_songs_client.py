@@ -231,7 +231,7 @@ _REASONS = ('central', 'tier_unknown', 'no_account', 'account_asked', 'account_d
             'challenge', 'login', 'throttled', 'feedback', 'transport', 'not_found',
             'unknown', 'dependency', 'install_failed', 'install_timeout', 'spawn_failed',
             'worker_failed', 'bad_output', 'interrupted', 'timeout', 'partial_run',
-            'empty_list', 'invalid_list', 'not_written', 'stale', 'error')
+            'empty_list', 'invalid_list', 'not_written', 'stale', 'error', 'old_list')
 
 
 @pytest.mark.parametrize('reason', _REASONS)
@@ -277,6 +277,105 @@ def test_a_stale_local_list_is_served_marked_stale_with_the_reason(client):
     assert out['stale'] is True and out['reason'] == 'challenge'
     assert len(out['songs']) == 4
     assert out['note']
+
+
+# ── how old the list is (critic item 2.6) ────────────────────────────────
+
+def _made(hours_before_now):
+    """``(generated_at, date)`` of a list made that many hours before NOW,
+    in the published list's own format (daily_job._iso)."""
+    from datetime import datetime, timezone
+    made = datetime.fromtimestamp(NOW - hours_before_now * 3600, timezone.utc)
+    return made.strftime('%Y-%m-%dT%H:%M:%SZ'), made.strftime('%Y-%m-%d')
+
+
+def _aged(hours_before_now, *songs):
+    doc = _doc(*(songs or SONGS))
+    doc['generated_at'], doc['date'] = _made(hours_before_now)
+    return doc
+
+
+def test_an_old_list_is_not_served_as_current_and_says_how_old(client):
+    """The job makes a list a day after its last good one, once the computer
+    is idle; a list nothing marked stale but made days ago (the computer
+    never idle, the job stopped) was served as today's.  It is served marked
+    stale, and the words say how old it is and from which day."""
+    from integrations.reel_studio.contracts import validate_trending_songs
+    c, st = client
+    _publish(_aged(74))
+    out = c.get_trending_songs()
+    assert out['stale'] is True and out['reason'] == 'old_list'
+    assert len(out['songs']) == 4                       # still offered, as old
+    assert out['age_hours'] == 74
+    assert '3 days' in out['note'] and _made(74)[1] in out['note']
+    assert validate_trending_songs(out) == []
+    assert st['asked'] == 0                             # a list: nothing to ask for
+
+
+def test_a_list_made_yesterday_is_current_and_says_its_age(client):
+    c, _ = client
+    _publish(_aged(30))
+    out = c.get_trending_songs()
+    assert out['stale'] is False and out['reason'] is None and out['note'] is None
+    assert out['age_hours'] == 30
+
+
+def test_a_list_at_the_two_day_line_is_still_current(client):
+    from integrations.trends import trending_songs_client as tsc
+    c, _ = client
+    _publish(_aged(tsc.OLD_AFTER_S / 3600))
+    assert c.get_trending_songs()['stale'] is False
+    _publish(_aged(tsc.OLD_AFTER_S / 3600 + 1))
+    assert c.get_trending_songs()['reason'] == 'old_list'
+
+
+def test_a_stale_list_says_how_old_it_is_too(client):
+    from integrations.trends.trending_songs import mark_stale
+    c, _ = client
+    _publish(_aged(5))
+    assert mark_stale('throttled') is True
+    out = c.get_trending_songs()
+    assert out['reason'] == 'throttled' and out['age_hours'] == 5
+    assert out['note'].startswith(c.note_for('throttled'))
+    assert '5 hours' in out['note'] and _made(5)[1] in out['note']
+
+
+def test_a_list_whose_time_does_not_read_is_aged_by_its_date(client):
+    c, _ = client
+    doc = _aged(80)
+    doc['generated_at'] = 'sometime'
+    _publish(doc)
+    out = c.get_trending_songs()
+    assert out['reason'] == 'old_list' and out['age_hours'] >= 72
+
+
+def test_no_list_has_no_age(client):
+    c, _ = client
+    out = c.get_trending_songs()
+    assert out['age_hours'] is None and out['reason'] == 'not_run_yet'
+
+
+def test_list_status_says_where_the_list_stands_without_its_songs(client):
+    """For a reply that needs only where the list stands (her watchlist
+    tool): the same reason, words and age, and no song is tagged, so no
+    local model is asked."""
+    c, st = client
+    _publish(_aged(74, _song('cluster:9', 'Saree Song', 3.0)))
+    status = c.list_status()
+    assert status == {'stale': True, 'reason': 'old_list', 'note': status['note'],
+                      'age_hours': 74, 'date': _made(74)[1]}
+    assert '3 days' in status['note']
+    assert st['posts'] == []
+    _publish(_aged(2))
+    assert c.list_status()['reason'] is None
+
+
+def test_list_status_with_no_list_asks_as_the_songs_read_does(client):
+    c, st = client
+    st['creds'].clear()
+    status = c.list_status()
+    assert status['reason'] == 'no_account' and status['age_hours'] is None
+    assert status['date'] is None and st['asked'] == 1
 
 
 def test_a_list_carrying_a_url_is_never_served(client, tmp_path):
