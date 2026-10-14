@@ -31,7 +31,11 @@ A file is removed when its last claim goes (the GC, or ``delete``).  Each
 claim counts the file's size against its purpose's quota; the user's quota
 counts the bytes on disk, once.  Callers that read the inbox name the purpose
 they want (query_inbox, resolve, bind, delete); a purpose the registry does
-not have is a caller bug (ValueError), never an empty answer.
+not have is a caller bug (ValueError), never an empty answer.  A reference
+that names no purpose (a bare /chat attachments row, the U9 chat-attachment
+shape) means her chat attachment when the file is one, else the file's first
+claim in PURPOSES order (``resolve``, ``bind``); and ``bind`` never moves a
+claim that is bound to another turn on such a reference.
 
 Layout, under ``get_data_dir()/user_files/`` (never the uploads dir, which
 the desktop serves without auth)::
@@ -55,7 +59,11 @@ v1 index had one purpose per file) is set aside, not read.
 Uploads resume.  The sidecar keeps a bitmap of the chunks written, so the
 same offer made again (after a dropped link, a relay/LAN switch or a phone
 restart) answers with only the missing chunk ranges.  A resume at another
-chunk size keeps every byte already written.
+chunk size keeps every byte already written.  The same bytes offered for
+another purpose while they upload (a second client) join the upload: the
+sidecar keeps every purpose offered, with the name and MIME type sent for
+it, and the commit gives each its claim.  Each purpose's quota is checked
+when it is offered, and the upload counts against it from then on.
 
 Door-facing calls (offer, put_chunk, commit, abort, get_chunk, put_file)
 answer with a frame-shaped dict and never raise on what a client sent: a bad
@@ -101,7 +109,7 @@ from core.platform_paths import get_data_dir
 logger = logging.getLogger(__name__)
 
 SCHEMA = 'hart.user_files.v2'           # v2: an inbound file holds a claim per purpose
-PART_SCHEMA = 'hart.user_files.part.v1'
+PART_SCHEMA = 'hart.user_files.part.v2'  # v2: an upload keeps every purpose offered
 
 # ── what may be uploaded: the purposes ────────────────────────────────────
 
@@ -535,6 +543,15 @@ def _record_ok(box: str, rec) -> bool:
                     for purpose, claim in rec['claims'].items()))
 
 
+def _part_claims_ok(claims) -> bool:
+    """Is ``claims`` an upload's purposes as its sidecar keeps them: at least
+    one ``{purpose: {name, mime}}``, in the order they were offered?"""
+    return (isinstance(claims, dict) and len(claims) > 0
+            and all(isinstance(purpose, str) and isinstance(claim, dict)
+                    and isinstance(claim.get('name'), str) and isinstance(claim.get('mime'), str)
+                    for purpose, claim in claims.items()))
+
+
 def _empty_index(uid: Optional[str]) -> Dict[str, Any]:
     return {'schema': SCHEMA, 'user_id': uid, 'seq': 0, 'files': {'in': {}, 'out': {}}}
 
@@ -703,16 +720,15 @@ class UserFileStore:
         return rec if rec is not None and os.path.isfile(self._file_path(user_dir, box, rec)) \
             else None
 
-    def _first_claim(self, rec: Mapping) -> str:
-        """The claim a lookup without a purpose reads: the first in PURPOSES
+    def _bare_claim(self, rec: Mapping) -> str:
+        """The claim a reference that names no purpose means (resolve, bind):
+        her chat attachment when the file is one (a bare /chat attachments
+        row is the U9 chat-attachment shape), else the first in PURPOSES
         order (a purpose no longer registered last), so it is stable."""
+        if CHAT_ATTACHMENT in rec['claims']:
+            return CHAT_ATTACHMENT
         order = list(self.purposes)
         return min(rec['claims'], key=lambda p: (order.index(p) if p in order else len(order), p))
-
-    @staticmethod
-    def _newest_claim(rec: Mapping) -> str:
-        """The purpose the file was last sent for."""
-        return max(rec['claims'], key=lambda p: rec['claims'][p]['seq'])
 
     def _known_purpose(self, purpose, *, outbound: bool = False) -> None:
         """Raise ValueError unless ``purpose`` is None or a registered one
@@ -739,7 +755,8 @@ class UserFileStore:
               and part.get('xid') == xid and _is_int(part.get('size')) and part['size'] > 0
               and _is_int(part.get('chunk_size')) and part['chunk_size'] > 0
               and part.get('n') == _n_chunks(part['size'], part['chunk_size'])
-              and _is_num(part.get('touched_at')) and isinstance(part.get('meta'), dict))
+              and _is_num(part.get('touched_at')) and isinstance(part.get('meta'), dict)
+              and _part_claims_ok(part.get('claims')))
         bits = _decode_bits(part.get('have'), part['n']) if ok else None
         if bits is None:
             logger.error('user_file_store: unreadable upload sidecar %s; upload removed',
@@ -784,8 +801,9 @@ class UserFileStore:
 
     def _usage(self, user_dir: str, doc: Mapping, purpose: Optional[str] = None) -> int:
         """Bytes held: committed files plus the full size of each upload in
-        progress.  Without ``purpose`` each file counts once (the disk it
-        takes); with it, each file that purpose has a claim on (its quota)."""
+        progress.  Without ``purpose`` each file and upload counts once (the
+        disk it takes); with it, each that purpose has a claim on, or was
+        offered for (its quota)."""
         inbox, outbox = doc['files']['in'].values(), doc['files']['out'].values()
         if purpose is None:
             held = sum(r['size'] for r in inbox) + sum(r['size'] for r in outbox)
@@ -793,7 +811,7 @@ class UserFileStore:
             held = (sum(r['size'] for r in inbox if purpose in r['claims'])
                     + sum(r['size'] for r in outbox if r['purpose'] == purpose))
         return held + sum(p['size'] for p in self._parts(user_dir)
-                          if purpose is None or p.get('purpose') == purpose)
+                          if purpose is None or purpose in p['claims'])
 
     # ── inbound: the phone uploads ──
 
@@ -810,11 +828,13 @@ class UserFileStore:
         {reason}``.  ``meta`` may be the whole offer frame: only
         INBOUND_META_KEYS with usable values are kept.  ``chunk_size`` is
         the door's (smaller on relayed links); a resume at another size keeps
-        the bytes already written, and a resume for another purpose makes the
-        upload that purpose's, within its quota.  The purpose's MIME types,
-        size cap and quota hold, inside the store-wide ones.  Runs this
-        user's GC first, so stale uploads and expired files do not hold the
-        quota.
+        the bytes already written.  An upload in progress offered for another
+        purpose (a second client sending the same bytes) adds that purpose,
+        within its quota, and keeps the ones already offered: each gets its
+        claim at commit, under the name and MIME type sent for it.  The
+        purpose's MIME types, size cap and quota hold, inside the store-wide
+        ones.  Runs this user's GC first, so stale uploads and expired files
+        do not hold the quota.
         """
         uid = user_key(user_id)
         xid = sha256 if is_xid(sha256) else None
@@ -850,7 +870,10 @@ class UserFileStore:
                 if refusal:
                     return _refused(refusal, xid)
             else:
-                if (part.get('purpose') != kind.name
+                # A purpose new to this upload is held to its quota now; the
+                # upload counts against it from then on (_usage), so the claim
+                # the commit gives it always fits.
+                if (kind.name not in part['claims']
                         and self._usage(user_dir, doc, kind.name) + size > kind.quota):
                     return _refused('quota', xid)
                 if part['chunk_size'] != cs:
@@ -862,8 +885,8 @@ class UserFileStore:
             try:
                 if fresh:
                     part = self._new_part(user_dir, uid, xid, size, cs, now)
-                part.update(name=name, mime=mime, purpose=purpose, touched_at=now,
-                            meta={**part['meta'], **keep})
+                part['claims'][kind.name] = {'name': name, 'mime': mime}
+                part.update(touched_at=now, meta={**part['meta'], **keep})
                 self._save_part(user_dir, part)
             except OSError as e:
                 if e.errno != errno.ENOSPC:
@@ -940,7 +963,7 @@ class UserFileStore:
             pass
         n = _n_chunks(size, cs)
         return {'schema': PART_SCHEMA, 'user_id': uid, 'xid': xid, 'size': size,
-                'chunk_size': cs, 'n': n, 'bits': _bits_new(n), 'meta': {},
+                'chunk_size': cs, 'n': n, 'bits': _bits_new(n), 'meta': {}, 'claims': {},
                 'started_at': now, 'touched_at': now}
 
     def _drop_part(self, user_dir: str, xid: str) -> bool:
@@ -990,9 +1013,11 @@ class UserFileStore:
         """Finish an upload: ``file_done {xid}`` once the whole file hashes to
         ``xid``; ``file_corrupt {xid, missing}`` when chunks are missing, or
         when every chunk is there but the file does not hash to ``xid`` (the
-        upload then starts over: ``missing`` is every chunk).  The file is
-        hashed outside the user's lock; meanwhile an abort of it is ``busy``.
-        Bytes put meanwhile through the other door gain the upload's claim.
+        upload then starts over: ``missing`` is every chunk).  Every purpose
+        the upload was offered for gains its claim, and a second client's
+        commit of it is ``file_done`` too.  The file is hashed outside the
+        user's lock; meanwhile an abort of it is ``busy``.  Bytes put
+        meanwhile through the other door gain the upload's claims.
         """
         uid = user_key(user_id)
         if not is_xid(xid):
@@ -1033,21 +1058,24 @@ class UserFileStore:
                     part['touched_at'] = self._clock()
                     self._save_part(user_dir, part)
                     return {'type': 'file_corrupt', 'xid': xid, 'missing': [[0, part['n'] - 1]]}
-                self._file_away(user_dir, self._load_index(user_dir, uid), xid, part,
-                                data_path)
+                self._file_away(user_dir, self._load_index(user_dir, uid), xid, part['size'],
+                                part['meta'], part['claims'], data_path)
                 _remove(self._part_paths(user_dir, xid)[1])
                 return {'type': 'file_done', 'xid': xid}
         finally:
             with lock:
                 _COMMITTING.discard(key)
 
-    def _file_away(self, user_dir: str, doc: Dict[str, Any], xid: str, part: Mapping,
+    def _file_away(self, user_dir: str, doc: Dict[str, Any], xid: str, size: int,
+                   meta: Mapping, claims: Mapping[str, Mapping[str, str]],
                    data_path: str) -> None:
-        """File a verified upload at ``data_path`` into the inbox as
-        ``part``'s purpose's claim (caller holds the lock; ``doc`` is the
-        index just read).  When the inbox already holds the bytes (put
-        meanwhile through the other door), they gain the claim and the
-        upload's copy is removed.
+        """File a verified upload of ``size`` bytes at ``data_path`` into the
+        inbox, with a claim per entry of ``claims`` (``{purpose: {name,
+        mime}}``, in the order offered; caller holds the lock; ``doc`` is the
+        index just read).  The file is named by the first purpose's MIME
+        type.  When the inbox already holds the bytes (put meanwhile through
+        the other door), they gain the claims and the upload's copy is
+        removed.
 
         A new record is written first: a crash before the rename leaves a
         record without a file, which every reader skips and the next commit
@@ -1055,10 +1083,13 @@ class UserFileStore:
         rec = self._on_disk(user_dir, doc, 'in', xid)
         fresh = rec is None
         if fresh:
-            rec = doc['files']['in'][xid] = {'file': xid + _EXT.get(part['mime'], ''),
-                                             'size': part['size'], 'meta': {}, 'claims': {}}
-        rec['meta'] = {**rec['meta'], **part['meta']}
-        self._put_claim(doc, rec, part['purpose'], part['name'], part['mime'], self._clock())
+            first = next(iter(claims.values()))
+            rec = doc['files']['in'][xid] = {'file': xid + _EXT.get(first['mime'], ''),
+                                             'size': size, 'meta': {}, 'claims': {}}
+        rec['meta'] = {**rec['meta'], **meta}
+        now = self._clock()
+        for purpose, claim in claims.items():
+            self._put_claim(doc, rec, purpose, claim['name'], claim['mime'], now)
         self._save_index(user_dir, doc)
         if fresh:
             os.makedirs(os.path.join(user_dir, 'in'), exist_ok=True)
@@ -1141,9 +1172,8 @@ class UserFileStore:
                     # The bytes are on the disk already: only the margin is left to keep.
                     refusal = self._room(user_dir, doc, size, kind, 0)
                     if not refusal:
-                        self._file_away(user_dir, doc, xid, {'name': name, 'mime': mime,
-                                                             'size': size, 'purpose': purpose,
-                                                             'meta': keep}, tmp)
+                        self._file_away(user_dir, doc, xid, size, keep,
+                                        {purpose: {'name': name, 'mime': mime}}, tmp)
                 return _refused(refusal, xid) if refusal else {'type': 'file_done', 'xid': xid}
         finally:
             _remove(tmp)
@@ -1187,13 +1217,19 @@ class UserFileStore:
     def bind(self, user_id, xids: Iterable[str], *, prompt_id, request_id,
              purpose: Optional[str] = None) -> List[StoredFile]:
         """Tie inbound files to a chat turn; returns the bound files in the
-        order given.  What is bound is one purpose's claim on each file:
-        ``purpose``'s, or without one the purpose the file was last sent for
-        (a reference that names no purpose means the file as she last sent
-        it), so binding never moves another purpose's file off its turn.  An
-        xid that is not in this user's inbox, or not held for ``purpose``, is
-        skipped and logged.  Binding a consumed claim makes it usable again
-        (the turn asked for it)."""
+        order given.  What is bound is one purpose's claim on each file, so
+        binding never moves another purpose's file off its turn.
+
+        With ``purpose``, that purpose's claim, wherever it was bound (the
+        reference names it: her phone's reel turn sends its clips' purpose).
+        Without one, the claim a bare reference means (_bare_claim): her
+        chat attachment when the file is one -- a bare /chat row is the U9
+        chat-attachment shape -- else the file's claim; and a claim that is
+        bound to another turn is left there, since a reference that names
+        no purpose is no reason to move it (her reel clip stays on her reel
+        turn).  An xid that is not in this user's inbox, not held for
+        ``purpose``, or left on another turn is skipped and logged.  Binding
+        a consumed claim makes it usable again (the turn asked for it)."""
         uid = user_key(user_id)
         self._known_purpose(purpose)
         pid, rid = _turn_id(prompt_id, 'prompt_id'), _turn_id(request_id, 'request_id')
@@ -1214,12 +1250,18 @@ class UserFileStore:
                 if rec is None:
                     logger.info('user_file_store: bind skipped %s, not in the inbox', x[:12])
                     continue
-                which = purpose if purpose is not None else self._newest_claim(rec)
+                which = purpose if purpose is not None else self._bare_claim(rec)
                 if which not in rec['claims']:
                     logger.info('user_file_store: bind skipped %s, not held as %s',
                                 x[:12], which)
                     continue
-                rec['claims'][which].update(prompt_id=pid, request_id=rid, consumed_at=None)
+                claim = rec['claims'][which]
+                turn = (claim.get('prompt_id'), claim.get('request_id'))
+                if purpose is None and turn != (None, None) and turn != (pid, rid):
+                    logger.info('user_file_store: bind skipped %s, its %s is bound to another '
+                                'turn and the reference names no purpose', x[:12], which)
+                    continue
+                claim.update(prompt_id=pid, request_id=rid, consumed_at=None)
                 bound.append(self._stored(user_dir, uid, 'in', x, self._view(rec, which)))
             if bound:
                 self._save_index(user_dir, doc)
@@ -1442,7 +1484,8 @@ class UserFileStore:
         only ``box``), or None.  A record whose file is gone is None.  An
         inbound file is seen through one claim: ``purpose``'s (then only the
         inbox is looked in, and a file not held for it is None), or without
-        one its first claim in PURPOSES order, so the answer is stable.  A
+        one her chat attachment when the file is one, else its first claim
+        in PURPOSES order (_bare_claim, as bind reads a bare reference).  A
         purpose the registry does not have, or a purpose with box 'out',
         raises ValueError."""
         uid = user_key(user_id)
@@ -1463,7 +1506,7 @@ class UserFileStore:
                     continue
                 if b == 'out':
                     return self._stored(user_dir, uid, b, xid, rec)
-                which = purpose if purpose is not None else self._first_claim(rec)
+                which = purpose if purpose is not None else self._bare_claim(rec)
                 if which in rec['claims']:
                     return self._stored(user_dir, uid, b, xid, self._view(rec, which))
         return None

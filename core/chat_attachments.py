@@ -38,8 +38,12 @@ integrations.reel_studio.contracts imports the same ones from the store
 
 A row's ``purpose`` matters: the same bytes can be held for two purposes
 (her clip is also a chat attachment), and a row binds only the purpose it
-names, or, naming none, the purpose the file was last sent for
-(core.user_file_store.UserFileStore.bind).
+names.  A row naming none -- the documented U9 shape, which is a chat
+attachment's -- binds her chat attachment when the file is one, else the
+file's claim, and never moves a claim that is bound to another turn: her
+clip stays on her reel turn (core.user_file_store.UserFileStore.bind).  A
+client that sends the same file in a later turn names its purpose to move
+it there (Nunba's /api/chat-sync/files/push answers with it).
 
 parse_inbound is the looser of the two readers of a row.  It reads only
 ``file_id``, ``sha256`` and ``purpose``, so it keeps a row that
@@ -117,13 +121,16 @@ def parse_inbound(raw: Any) -> List[Dict[str, str]]:
 def bind_inbound(user_id, prompt_id, request_id, items) -> List[Dict[str, Any]]:
     """Tie the parsed references of a turn to (user, prompt, request).
 
-    Each reference binds the purpose it names, or, naming none, the purpose
-    its file was last sent for; the file's other purposes stay on their own
-    turns.  Only files in this user's own inbox, held for that purpose, are
-    bound; another user's xid, an unknown one or a purpose the file was not
-    sent for is dropped and logged.  Returns the bound files as the store's
-    StoredFile dicts (``StoredFile.to_dict()``), in the order sent.  Never
-    raises: a store that refuses or fails binds nothing (of that purpose).
+    Each reference binds the purpose it names, or, naming none, her chat
+    attachment when the file is one, else the file's claim, unless that
+    claim is bound to another turn (UserFileStore.bind); the file's other
+    purposes stay on their own turns.  Only files in this user's own inbox,
+    held for that purpose, are bound; another user's xid, an unknown one, a
+    purpose the file was not sent for or a bare reference to a claim bound
+    to another turn is dropped and logged.  Returns the bound files as the
+    store's StoredFile dicts (``StoredFile.to_dict()``), in the order sent.
+    Never raises: a store that refuses or fails binds nothing (of that
+    purpose).
     """
     refs = [(it['file_id'], it.get('purpose')) for it in (items or ())
             if isinstance(it, Mapping) and is_xid(it.get('file_id'))]
@@ -146,7 +153,8 @@ def bind_inbound(user_id, prompt_id, request_id, items) -> List[Dict[str, Any]]:
     dropped = [x[:12] for x, _p in refs if x not in found]
     if dropped:
         logger.warning('chat_attachments: dropped %d attachment(s) not bound for user %r '
-                       '(not in the inbox, or not held for the purpose named): %s',
+                       '(not in the inbox, not held for the purpose named, or bound to '
+                       'another turn and named with no purpose): %s',
                        len(dropped), user_id, ', '.join(dropped))
     return [sf.to_dict() for sf in bound]
 

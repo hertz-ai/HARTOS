@@ -382,7 +382,10 @@ def cmd_ingest(args) -> int:
         elif offer['type'] != 'file_have':
             sys.stderr.write('%s refused: %s\n' % (path, offer))
             return EXIT_NO_REEL
-        store.bind(args.user, [xid], prompt_id=args.prompt, request_id=args.request)
+        # By purpose, as the phone's turn binds it: a file held from an
+        # earlier ingest moves to this turn (a bare reference would not).
+        store.bind(args.user, [xid], prompt_id=args.prompt, request_id=args.request,
+                   purpose=purpose)
         row = {'file_id': xid, 'sha256': xid, 'name': os.path.basename(path), 'mime': mime,
                'size': size, 'purpose': purpose}
         if at:

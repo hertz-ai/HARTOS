@@ -221,13 +221,43 @@ class TestBindInbound:
             [(xid, 'chat_attachment', '77')]
         assert [g['xid'] for g in latest_inbound('u1', '55', request_id='r1')] == [xid]
 
-    def test_a_row_without_purpose_binds_the_file_as_she_last_sent_it(self, store, clock):
+    def test_a_row_without_purpose_binds_her_chat_attachment(self, store, clock):
         xid = self._clip_also_sent_in_chat(store, clock)
 
         got = bind_inbound('u1', '77', 'r2', parse_inbound([_att(xid, purpose=None)]))
 
         assert [(g['xid'], g['purpose']) for g in got] == [(xid, 'chat_attachment')]
         assert [g['xid'] for g in latest_inbound('u1', '55', request_id='r1')] == [xid]
+
+    def test_a_row_without_purpose_binds_her_chat_attachment_when_the_clip_came_last(
+            self, store, clock):
+        """The review's probe of e475b8cd1, in the order it failed: her video
+        put as a chat attachment ('party.mp4'), then the phone offers the same
+        bytes as a reel clip and its turn (55) binds them by purpose, then the
+        desktop's /chat turn (77) sends the documented bare row.  Her reel
+        agent keeps its clip, and turn 77 sees her chat attachment."""
+        clip = b'party-and-reel' * 60
+        assert store.put_file('u1', clip, name='party.mp4', mime=MP4,
+                              purpose='chat_attachment')['type'] == 'file_done'
+        clock.now += 5
+        xid = _upload(store, 'u1', clip, name='VID_9.mp4')          # file_have
+        bind_inbound('u1', '55', 'r1', parse_inbound([_att(xid)]))
+
+        got = bind_inbound('u1', '77', 'r2', parse_inbound([_att(xid, purpose=None)]))
+
+        assert [(g['xid'], g['purpose'], g['name']) for g in got] == \
+            [(xid, 'chat_attachment', 'party.mp4')]
+        assert [g['xid'] for g in latest_inbound('u1', '55')] == [xid]
+        assert [g['xid'] for g in latest_inbound('u1', '55', request_id='r1')] == [xid]
+
+    def test_a_row_without_purpose_never_takes_a_clip_off_her_reel_turn(self, store, caplog):
+        xid = _upload(store, 'u1', b'only-her-clip' * 40)
+        bind_inbound('u1', '55', 'r1', parse_inbound([_att(xid)]))
+
+        assert bind_inbound('u1', '77', 'r2', parse_inbound([_att(xid, purpose=None)])) == []
+
+        assert 'dropped' in caplog.text.lower()
+        assert [g['xid'] for g in latest_inbound('u1', '55')] == [xid]
 
     def test_a_row_naming_a_purpose_the_file_was_not_sent_for_is_dropped(self, store, caplog):
         clip = _upload(store, 'u1', b'only-a-clip' * 40)
