@@ -520,6 +520,8 @@ _ENV_SECRET_MODULES = (
     'integrations.channels.agent_tools',
     'integrations.channels.memory.simplemem_store',
     'integrations.channels.oauth_api',
+    'integrations.commerce.commerce_api',
+    'integrations.commerce.mcgroce_client',
     'integrations.service_tools.gh_pr_tool',
     'integrations.social.api_channels',
     'integrations.social.livekit_service',

@@ -502,6 +502,50 @@ class FederatedAggregator:
             logger.info("Federation delta accepted again by %s (HTTP %s, was %s)",
                         peer_url, status, previous)
 
+    def _log_once(self, key, level, msg, *args) -> None:
+        """Log at ``level`` the first time ``key`` is seen, at DEBUG after.
+
+        For outcomes that repeat every round per peer (a consent block, a
+        consent check that keeps failing): visible once, never a flood.  The
+        key set is bounded; clearing it only means a line may repeat once.
+        """
+        seen = self.__dict__.setdefault('_logged_once', set())
+        if key in seen:
+            logger.debug(msg, *args)
+            return
+        if len(seen) >= 4096:
+            seen.clear()
+        seen.add(key)
+        logger.log(level, msg, *args)
+
+    #: Unchanged rounds between two INFO summaries.  The daemon runs a round
+    #: every other tick (about once a minute), so this is roughly half an hour.
+    _ROUND_SUMMARY_HEARTBEAT = 30
+
+    def _note_round(self, targets, delivered, via_link, refused, failed,
+                    unanswered, attested) -> None:
+        """Summarise one broadcast round: what it tried and what landed.
+
+        'Federation: epoch=N' only counts RECEIVED deltas that were aggregated,
+        and a successful delivery logged nothing, so a node's own log could not
+        say whether its deltas ever left (2026-09-26: 14 h, zero epochs, no
+        answer).  INFO when the outcome changes and as a heartbeat; DEBUG
+        otherwise, so a once-a-minute round cannot flood the log.
+        """
+        summary = (targets, delivered, via_link, refused, failed, unanswered,
+                   attested)
+        since = self.__dict__.get('_rounds_since_summary', 0) + 1
+        changed = summary != self.__dict__.get('_last_round_summary')
+        level = (logging.INFO if changed or since >= self._ROUND_SUMMARY_HEARTBEAT
+                 else logging.DEBUG)
+        logger.log(level,
+                   "Federation delta round: %d targets, delivered %d "
+                   "(peerlink %d), refused %d, failed %d, unanswered %d, "
+                   "attested=%s", targets, delivered, via_link, refused,
+                   failed, unanswered, 'yes' if attested else 'no')
+        self._last_round_summary = summary
+        self._rounds_since_summary = 0 if level == logging.INFO else since
+
     def broadcast_delta(self, delta: dict):
         """Gossip the delta to central seeds + a bounded sample of peers.
 
@@ -545,14 +589,20 @@ class FederatedAggregator:
         # Sign the delta with HMAC-SHA256 before broadcasting
         _sign_delta(delta)
 
-        # Attach origin attestation so peers can verify we're genuine HART OS
+        # Attach origin attestation so peers can verify we're genuine HART OS.
+        # Without it central's genuine-build gate refuses the delta as
+        # 'unverified build', so a failure here must be seen, not skipped.
+        attested = False
         try:
             from security.origin_attestation import get_attestation_for_federation
             att = get_attestation_for_federation()
             if att.get('valid'):
                 delta['origin_attestation'] = att['attestation']
-        except Exception:
-            pass
+                attested = True
+        except Exception as e:
+            logger.warning(
+                "Federation delta goes out WITHOUT origin attestation "
+                "(central refuses unattested deltas): %s", e, exc_info=True)
 
         try:
             from integrations.social.models import get_db, PeerNode
@@ -650,7 +700,7 @@ class FederatedAggregator:
                             # link, but a failed send trips _handle_disconnect,
                             # so a still-connected link means the frame went out.
                             if _link.is_connected:
-                                return (_peer_url, True)
+                                return (_peer_url, True, 'peerlink')
                         except Exception:
                             pass  # fall through to HTTP
                 # HTTP fallback — the authenticated, genuine-build-gated endpoint.
@@ -663,11 +713,11 @@ class FederatedAggregator:
                         f"{_peer_url}/api/social/peers/federation-delta",
                         json=delta, timeout=3)
                 except Exception:
-                    return (_peer_url, False)
+                    return (_peer_url, False, 'failed')
                 _status = getattr(_resp, 'status_code', None)
                 _ok = not isinstance(_status, int) or 200 <= _status < 300
                 self._note_delta_answer(_peer_url, _status, _ok, _resp)
-                return (_peer_url, _ok)
+                return (_peer_url, _ok, 'http' if _ok else 'refused')
 
             # ONE bounded, concurrent delivery for BOTH seeds and the peer
             # sample.  Nothing is synchronous: a single row — even a seed —
@@ -693,6 +743,8 @@ class FederatedAggregator:
                 _targets_by_url.setdefault(_url, (_nid, _url))
             _targets = list(_targets_by_url.values())
 
+            _tally = {'peerlink': 0, 'http': 0, 'refused': 0, 'failed': 0}
+            _unanswered = 0
             if _targets:
                 _ex = ThreadPoolExecutor(max_workers=min(12, len(_targets)))
                 try:
@@ -701,19 +753,26 @@ class FederatedAggregator:
                     _done, _pending = _fwait(_futs, timeout=8)
                     for _f in _done:
                         try:
-                            _u, _ok = _f.result()
+                            _u, _ok, _via = _f.result()
                             (self._peer_backoff.record_success if _ok
                              else self._peer_backoff.record_failure)(_u)
-                        except Exception:
-                            pass
+                            _tally[_via] += 1
+                        except Exception as e:
+                            _tally['failed'] += 1
+                            logger.warning("Federation delivery to %s raised: %s",
+                                           _futs[_f], e, exc_info=True)
                     for _f in _pending:
+                        _unanswered += 1
                         self._peer_backoff.record_failure(_futs[_f])
                 finally:
                     # Non-blocking: never wait on a straggler. Its worker
                     # thread finishes when its own socket times out.
                     _ex.shutdown(wait=False, cancel_futures=True)
+            self._note_round(len(_targets), _tally['peerlink'] + _tally['http'],
+                             _tally['peerlink'], _tally['refused'],
+                             _tally['failed'], _unanswered, attested)
         except Exception as e:
-            logger.debug(f"Federation broadcast error: {e}")
+            logger.warning(f"Federation broadcast error: {e}", exc_info=True)
 
     def _installs_ledger_path(self):
         """Durable cumulative-install ledger path — one canonical agent_data
@@ -1448,10 +1507,20 @@ class FederatedAggregator:
                 from integrations.social.models import db_session
                 with db_session() as db:
                     if not ConsentService.check_consent(db, user_id, 'public_exposure'):
-                        logger.debug(f"Recipe delta from {node_id} blocked: user {user_id} has not consented")
+                        self._log_once(
+                            ('recipe-blocked', node_id, user_id), logging.INFO,
+                            "Recipe delta from %s blocked: user %s has not "
+                            "consented to public_exposure on this node",
+                            node_id, user_id)
                         return
-            except (ImportError, ValueError, Exception):
-                pass  # consent service unavailable — allow (fail-open for dev)
+            except Exception as e:
+                # Fail-open (dev) is deliberate, but never silent: this admits
+                # a delta whose consent was never checked.
+                self._log_once(
+                    ('recipe-unchecked', node_id, type(e).__name__),
+                    logging.WARNING,
+                    "Recipe delta from %s accepted WITHOUT a consent check "
+                    "(consent service failed: %s)", node_id, e)
 
         with self._recipe_lock:
             self._recipe_deltas[node_id] = delta

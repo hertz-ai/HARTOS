@@ -159,6 +159,33 @@ def is_help_pause(reply) -> bool:
     return text.startswith((HELP_PAUSED_REPLY_PREFIX, HELP_EXPERT_REPLY_PREFIX))
 
 
+def user_pause_reply(action_id=None) -> str:
+    """The sentence a background turn answers when it stops for the user.
+
+    Owner ruling 2026-10-04: yield-to-user applies to every background agent
+    (the VLM loop, autogen group chats, daemon goals), pause all, resume
+    idempotently when the user is actually idle.  Written here, beside the
+    predicate that recognises it, so a reworded sentence cannot stop being
+    recognised.
+    """
+    from core.constants import PAUSED_FOR_USER_REPLY_PREFIX
+    step = f' step {action_id}' if action_id else ''
+    return (f"{PAUSED_FOR_USER_REPLY_PREFIX} the owner is using this computer, "
+            f"so{step} stopped between steps; it resumes when they are idle.")
+
+
+def is_user_pause(reply) -> bool:
+    """True when ``reply`` is user_pause_reply: a background turn stopped for
+    the user.  Neither a result nor a failure nor a parked goal.  The daemon
+    counts no failure and keeps the goal active; the hive worker releases the
+    task for a later claim; nobody records it as work done.  Recognised by
+    the prefix in core.constants, never by matching the sentence."""
+    if not isinstance(reply, str):
+        return False
+    from core.constants import PAUSED_FOR_USER_REPLY_PREFIX
+    return reply.strip().startswith(PAUSED_FOR_USER_REPLY_PREFIX)
+
+
 def is_action_error_reply(reply) -> bool:
     """True when ``reply`` is the CREATE pipeline's structured error envelope,
     {"status": "error", "action": ..., "action_id": ..., "message": ...} — the
@@ -368,6 +395,17 @@ def _tell_the_person_elsewhere(user_id, prompt_id, game_id, state, record):
         )
     except Exception as e:
         tool_logger.debug(f'game sound: no push to the phone ({e})')
+
+
+def _coding_workdir(working_dir):
+    """The directory a coding tool was handed, else HEVOLVE_CODING_WORKDIR.
+
+    Empty means "resolve it": vlm_adapter.resolve_task_workspace then takes
+    the agent's goal repo_path, else the user-data coding workspace, never
+    the process cwd (the install folder on the desktop).  One rule for
+    every coding tool an agent is given.
+    """
+    return working_dir or os.environ.get('HEVOLVE_CODING_WORKDIR', '')
 
 
 def build_core_tool_closures(ctx):
@@ -2462,7 +2500,7 @@ def build_core_tool_closures(ctx):
         task: Annotated[str, "The coding task to execute (e.g., 'review this function for bugs', 'implement a login form')"],
         task_type: Annotated[str, "Task type: code_review, feature, bug_fix, refactor, app_build, debugging, multi_session"] = "feature",
         preferred_tool: Annotated[str, "Optional tool override: kilocode, claude_code, opencode, aider_native, or claw_native (empty = auto-select best)"] = "",
-        working_dir: Annotated[str, "Working directory / repo path for the coding task (empty = use HEVOLVE_CODING_WORKDIR env or cwd)"] = "",
+        working_dir: Annotated[str, "Working directory / repo path for the coding task (empty = HEVOLVE_CODING_WORKDIR, else this agent's goal repo_path, else the coding workspace)"] = "",
     ) -> str:
         """Execute a coding task using the best available coding agent tool (KiloCode, Claude Code, OpenCode, or AiderNative).
 
@@ -2479,7 +2517,10 @@ def build_core_tool_closures(ctx):
                 preferred_tool=preferred_tool,
                 user_id=user_id,
                 model=os.environ.get('HEVOLVE_CODING_MODEL', ''),
-                working_dir=working_dir or os.environ.get('HEVOLVE_CODING_WORKDIR', ''),
+                working_dir=_coding_workdir(working_dir),
+                # The asking agent: the owner's permission and the ribbon
+                # name it (orchestrator._execute_local).
+                prompt_id=str(prompt_id or ''),
             )
             return json.dumps(result, indent=2)
         except Exception as e:
@@ -2499,7 +2540,7 @@ def build_core_tool_closures(ctx):
         from integrations.coding_agent.recipe_bridge import CodingRecipeBridge
 
         async def get_repository_map(
-            working_dir: Annotated[str, "Directory to map (default: current directory)"] = ".",
+            working_dir: Annotated[str, "Directory to map (empty = HEVOLVE_CODING_WORKDIR, else this agent's goal repo_path, else the coding workspace)"] = "",
             max_tokens: Annotated[int, "Maximum tokens for the map output"] = 2048,
         ) -> str:
             """Generate a tree-sitter based repository map showing key functions, classes, and their relationships.
@@ -2507,7 +2548,13 @@ def build_core_tool_closures(ctx):
             Use this to understand a codebase's structure before making changes.
             Returns a ranked summary of the most important code symbols.
             """
-            return CodingRecipeBridge.get_repository_map(working_dir, max_tokens)
+            # Never the process cwd.  The map writes its tags cache under the
+            # root it maps, and '.' put the 14 MB .aider.tags.cache.v4 in the
+            # installed app's own folder (review of cd99c540d).
+            from integrations.vlm.vlm_adapter import resolve_task_workspace
+            root = resolve_task_workspace(prompt_id=prompt_id,
+                                          explicit=_coding_workdir(working_dir))
+            return CodingRecipeBridge.get_repository_map(root, max_tokens)
 
         tools.append((
             "get_repository_map",
@@ -2578,7 +2625,9 @@ def build_core_tool_closures(ctx):
             result = {'local': {}, 'hive': {}}
 
             if task_type == 'all':
-                delta = tracker.export_learning_delta()
+                # None until a tool has MIN_SAMPLES rows under the current
+                # success rule (benchmark_tracker.SUCCESS_RULE).
+                delta = tracker.export_learning_delta() or {}
                 result['local'] = delta.get('coding_benchmarks', {})
             else:
                 best = tracker.get_best_tool(task_type)

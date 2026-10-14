@@ -886,6 +886,42 @@ class TestRecipeConsentCheck(unittest.TestCase):
             # Fail-open: should be stored
             self.assertIn('peer-4', agg._recipe_deltas)
 
+    # Both outcomes used to be invisible: a consent block logged at DEBUG,
+    # and a consent check that blew up was `pass`, letting the delta in with
+    # no trace.  Semantics are unchanged (fail-open stays, pinned above).
+
+    def test_a_blocked_delta_is_logged_once_per_peer_and_user(self):
+        from integrations.agent_engine.federated_aggregator import FederatedAggregator
+        agg = FederatedAggregator()
+        delta = {'user_id': 'user-123', 'recipes': [], 'node_id': 'peer-2'}
+        with patch('integrations.social.models.db_session') as mock_session, \
+             patch('integrations.social.consent_service.ConsentService') as mock_cs, \
+             self.assertLogs('hevolve_social', level='INFO') as logs:
+            mock_session.return_value.__enter__ = MagicMock(return_value=MagicMock())
+            mock_session.return_value.__exit__ = MagicMock(return_value=False)
+            mock_cs.check_consent.return_value = False
+            agg.receive_recipe_delta('peer-2', delta)
+            agg.receive_recipe_delta('peer-2', delta)
+        blocked = [m for m in logs.output
+                   if m.startswith('INFO') and 'blocked' in m and 'peer-2' in m]
+        self.assertEqual(len(blocked), 1, logs.output)
+
+    def test_a_failed_consent_check_says_it_let_the_delta_in(self):
+        from integrations.agent_engine.federated_aggregator import FederatedAggregator
+        agg = FederatedAggregator()
+        delta = {'user_id': 'user-789', 'recipes': [], 'node_id': 'peer-5'}
+        with patch('integrations.social.models.db_session') as mock_session, \
+             patch('integrations.social.consent_service.ConsentService') as mock_cs, \
+             self.assertLogs('hevolve_social', level='WARNING') as logs:
+            mock_session.return_value.__enter__ = MagicMock(return_value=MagicMock())
+            mock_session.return_value.__exit__ = MagicMock(return_value=False)
+            mock_cs.check_consent.side_effect = RuntimeError('database is locked')
+            agg.receive_recipe_delta('peer-5', delta)
+        self.assertTrue(any('without a consent check' in m.lower() and 'peer-5' in m
+                            for m in logs.output), logs.output)
+        with agg._recipe_lock:
+            self.assertIn('peer-5', agg._recipe_deltas)
+
 
 # ═══════════════════════════════════════════════════════════════
 # 8. Integration: DLP engine actual scan

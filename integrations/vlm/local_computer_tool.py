@@ -12,6 +12,7 @@ import os
 import re
 from core.subprocess_safe import no_window_kwargs
 import io
+import json
 import sys
 import time
 import base64
@@ -692,6 +693,29 @@ def _quick_image_diff(b64_a: str, b64_b: str) -> float:
 #: target window, so restoring immediately can paste the old content.
 CLIPBOARD_RESTORE_DELAY_S = 0.15
 
+#: What a 'wait' step sleeps when the model named no usable duration: the
+#: fixed wait every step took before the model's duration was carried.
+DEFAULT_WAIT_S = 2.0
+#: The longest one 'wait' step sleeps.  Since d2b6c6e4c the model's duration
+#: reaches this executor; obeyed unbounded, "wait 30" inside a 3 s run
+#: budget ended the run as a timeout and left the action thread asleep
+#: (review 2026-10-05 13:03Z).  A longer wait is several steps, each of
+#: which looks at the screen again.
+MAX_WAIT_S = 10.0
+
+
+def _wait_seconds(raw) -> float:
+    """The model's wait as seconds: a number, never negative, at most
+    MAX_WAIT_S; DEFAULT_WAIT_S when it is not a number.  Every tier hands
+    this executor the model's value, parsed or raw."""
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_WAIT_S
+    if seconds != seconds:      # NaN
+        return DEFAULT_WAIT_S
+    return min(max(0.0, seconds), MAX_WAIT_S)
+
 
 def _type_text(text: str, action=None) -> None:
     """Enter ``text`` into the focused field.
@@ -776,6 +800,29 @@ def _input_context_block(action):
         why = 'Foreground changed after capture; take a new screenshot before acting.'
         status = 'context_changed'
     return {'output': '', 'status': status, 'error': why, 'block_reason': why}
+
+def _run_path(path) -> str:
+    """A file action's path as the run means it.
+
+    A relative path resolves in the run's declared workspace
+    (hartos.threadlocal workspace, which local_loop sets for the run), the
+    folder the run's shell steps run in, so a script one step writes is the
+    one the next step runs.  An absolute path is kept, and outside a run
+    nothing is re-rooted.  '' stays '' for the caller to refuse.
+    """
+    path = str(path or '').strip()
+    if not path or os.path.isabs(path):
+        return path
+    try:
+        from hartos.threadlocal import thread_local_data
+        workspace = thread_local_data.get_workspace()
+    except Exception:
+        logger.debug('run workspace unreadable; path kept as given', exc_info=True)
+        workspace = None
+    if isinstance(workspace, str) and workspace:
+        return os.path.join(workspace, path)
+    return path
+
 
 def _execute_inprocess(action: dict) -> dict:
     """Execute action via direct pyautogui calls."""
@@ -871,16 +918,20 @@ def _execute_inprocess(action: dict) -> dict:
             return {'output': 'Screenshot taken', 'base64_image': take_screenshot('inprocess')}
 
         elif act == 'wait':
-            wait_time = action.get('duration', 2)
+            wait_time = _wait_seconds(action.get('duration'))
             time.sleep(wait_time)
-            return {'output': f'Waited {wait_time}s'}
+            capped = '' if wait_time < MAX_WAIT_S else (
+                f' (one wait step is at most {MAX_WAIT_S:g}s)')
+            return {'output': f'Waited {wait_time:g}s{capped}'}
 
         elif act == 'cursor_position':
             pos = pyautogui.position()
             return {'output': f'Cursor at ({pos.x}, {pos.y})'}
 
         elif act == 'list_folders_and_files':
-            path = action.get('path', '.')
+            # No folder named: the run's workspace (the process cwd outside
+            # a run, as before).
+            path = _run_path(action.get('path') or '.')
             try:
                 entries = os.listdir(path)
                 return {'output': '\n'.join(entries[:100])}
@@ -888,7 +939,10 @@ def _execute_inprocess(action: dict) -> dict:
                 return {'output': '', 'error': str(e)}
 
         elif act == 'read_file_and_understand':
-            path = action.get('path', '')
+            path = _run_path(action.get('path'))
+            if not path:
+                return {'output': '', 'error': (
+                    "read_file_and_understand needs the file's path in 'path'")}
             try:
                 with open(path, 'r', encoding='utf-8', errors='replace') as f:
                     content = f.read(10000)
@@ -897,8 +951,23 @@ def _execute_inprocess(action: dict) -> dict:
                 return {'output': '', 'error': str(e)}
 
         elif act == 'write_file':
-            path = action.get('path', '')
-            content = action.get('content', text)
+            # Named, never opened: open('') answered "[Errno 2] No such file
+            # or directory: ''", which the model read as a disk problem and
+            # repeated (live 2026-10-05 16:12 IST, twice in one run).
+            path = _run_path(action.get('path'))
+            if not path:
+                return {'output': '', 'error': (
+                    "write_file needs the file's path in 'path' and its full "
+                    "text in 'value'")}
+            content = action.get('content')
+            if content is None or content == '':
+                content = text or ''
+            # A model's 42 or JSON object failed write() with "argument must
+            # be str" AFTER open() had created the file, leaving it empty
+            # (review of d2b6c6e4c).  Text first, then the file.
+            if not isinstance(content, str):
+                content = (json.dumps(content, ensure_ascii=False, indent=2)
+                           if isinstance(content, (dict, list)) else str(content))
             try:
                 with open(path, 'w', encoding='utf-8') as f:
                     f.write(content)
@@ -958,7 +1027,12 @@ def _execute_inprocess(action: dict) -> dict:
             # fail CLOSED rather than falling back to a bare subprocess.run —
             # a bare fallback would skip the denylist and expose a command
             # injection channel that silently weakens safety posture.
-            cmd = action.get('command', text)
+            # The model's own command field first, else its value.  `or`, not
+            # a default: a caller that passes command='' (the parser once the
+            # prompt placeholder is filtered, an HTTP-tier client) still has
+            # the command in `value`, and the old `get('command', text)` read
+            # the empty field as "no command" and refused the step.
+            cmd = action.get('command') or text
             if not cmd:
                 return {'output': '', 'error': 'shell action needs command string'}
             from core.safe_hartos_attr import safe_hartos_attr
@@ -996,8 +1070,12 @@ def _execute_inprocess(action: dict) -> dict:
             }
 
         elif act == 'Open_file_and_copy_paste':
-            src = action.get('source_path', '')
-            dst = action.get('destination_path', '')
+            src = _run_path(action.get('source_path'))
+            dst = _run_path(action.get('destination_path'))
+            if not src or not dst:
+                return {'output': '', 'error': (
+                    "Open_file_and_copy_paste needs 'source_path' and "
+                    "'destination_path'")}
             try:
                 with open(src, 'r', encoding='utf-8', errors='replace') as f:
                     content = f.read()

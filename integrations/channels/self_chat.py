@@ -139,7 +139,8 @@ class SelfChatHandler:
                 logger.debug("self-chat session.add_message failed", exc_info=True)
 
         # 3. Dispatch to agent API with is_self_chat marker
-        from .chat_contract import chat_request_fields, chat_reply
+        from .chat_contract import (
+            chat_request_fields, chat_reply, agent_turn_timeout)
         payload = {
             "user_id": self.owner_user_id,
             "prompt_id": self.owner_prompt_id,
@@ -160,10 +161,27 @@ class SelfChatHandler:
             },
         }
         try:
-            resp = pooled_post(self.agent_api_url, json=payload, timeout=120)
+            # Same env-overridable budget flask_integration._handle_message
+            # uses for every other channel (HEVOLVE_CHANNEL_AGENT_TIMEOUT).
+            # This was hardcoded to 120 while every other channel already
+            # honored the operator-configured value — self-chat turns gave
+            # up 1st, 5+ minutes before a slow local multi-agent turn
+            # (delegate=local, is_casual=False -> synchronous get_ans, no
+            # background-expert delivery leg) could actually finish.
+            resp = pooled_post(self.agent_api_url, json=payload,
+                               timeout=agent_turn_timeout())
         except requests.Timeout:
+            # Found live 2026-08-31: this branch returned without ever
+            # calling _send_reply_in_thread (unlike every other return
+            # path below), so a timed-out turn delivered NOTHING to the
+            # user — not even this message, just silence. The agent
+            # keeps running server-side after the client gives up (this
+            # inline path has no leg-3-style late-delivery mechanism to
+            # catch that), so telling the user now is the only chance.
             logger.error("self-chat agent timeout")
-            return "(timed out — try again)"
+            reply = "(timed out — try again)"
+            self._send_reply_in_thread(message, reply)
+            return reply
         except Exception as e:  # noqa: BLE001
             logger.error("self-chat agent call failed: %s", e)
             return None

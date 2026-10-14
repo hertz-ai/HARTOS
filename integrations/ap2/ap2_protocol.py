@@ -67,6 +67,16 @@ class PaymentGateway(str, Enum):
     MOCK = "mock"  # For testing
 
 
+# Gateways whose create_payment returns a hosted-checkout redirect: the money
+# moves later, when the person pays, and a server callback confirms it.
+REDIRECT_GATEWAYS = frozenset({PaymentGateway.PHONEPE})
+
+
+#: Metadata keys that are credentials: kept in memory for the gateway call,
+#: never persisted or returned (PaymentRequest.to_dict).
+_SECRET_METADATA_KEYS = ('payment_method_token',)
+
+
 class PaymentRequest:
     """Represents a payment request from an agent"""
 
@@ -125,7 +135,10 @@ class PaymentRequest:
             'gateway_transaction_id': self.gateway_transaction_id,
             'approval_chain': self.approval_chain,
             'error_message': self.error_message,
-            'metadata': self.metadata
+            # A card/payment-method token is used once, in memory, by the
+            # gateway call; it is never written to the ledger or returned.
+            'metadata': {k: v for k, v in (self.metadata or {}).items()
+                         if k not in _SECRET_METADATA_KEYS}
         }
 
     def update_status(self, new_status: PaymentStatus, message: Optional[str] = None):
@@ -629,14 +642,36 @@ class PaymentLedger:
     Integrates with task_ledger to track payment workflows
     """
 
-    def __init__(self, ledger_path: str = "agent_data/payment_ledger.json"):
+    def __init__(self, ledger_path: Optional[str] = None):
         """
         Initialize payment ledger
 
         Args:
-            ledger_path: Path to persist payment ledger
+            ledger_path: Path to persist payment ledger.  Defaults to
+                ``payment_ledger.json`` under core.platform_paths'
+                agent-data dir -- the old CWD-relative default made a
+                frozen desktop install try to write beside the .exe
+                (Program Files on Windows), Gate 7.
         """
+        if ledger_path is None:
+            from core.platform_paths import get_agent_data_dir
+            ledger_path = os.path.join(get_agent_data_dir(), 'payment_ledger.json')
+            # One-time move of the old CWD-relative default: copy (never
+            # delete) so payments recorded before the path moved survive.
+            legacy = os.path.join(os.getcwd(), 'agent_data', 'payment_ledger.json')
+            self._legacy_path = legacy
+            if (os.path.exists(legacy) and not os.path.exists(ledger_path)
+                    and os.path.abspath(legacy) != os.path.abspath(ledger_path)):
+                try:
+                    import shutil
+                    os.makedirs(os.path.dirname(ledger_path), exist_ok=True)
+                    shutil.copy2(legacy, ledger_path)
+                    logger.info(f"Payment ledger migrated from {legacy}")
+                except OSError as e:
+                    logger.error(f"Payment ledger migration failed: {e}")
         self.ledger_path = ledger_path
+        if not hasattr(self, '_legacy_path'):
+            self._legacy_path = None
         self.payments: Dict[str, PaymentRequest] = {}
         self.lock = threading.Lock()
         self.gateways: Dict[PaymentGateway, PaymentGatewayConnector] = {}
@@ -652,8 +687,14 @@ class PaymentLedger:
             import os as _os
             if _os.environ.get('STRIPE_API_KEY'):
                 _stripe_gateway = StripePaymentGateway()
-                # Only register if connect succeeded (sdk available + key valid).
-                if _stripe_gateway.connected:
+                # Register only when connect() succeeds (SDK present, key set).
+                # connect() is what sets ``connected``; reading the flag before
+                # calling it meant NO node ever registered Stripe, so every
+                # paid tier settled through the mock, or, since b6502ac00,
+                # was refused with "set STRIPE_API_KEY" while it was set
+                # (review of b6502ac00, measured).  add_gateway connects once
+                # more; both connectors' connect() is idempotent.
+                if _stripe_gateway.connect():
                     self.add_gateway(_stripe_gateway)
                     logger.info(
                         "PaymentLedger: Stripe gateway auto-registered "
@@ -673,7 +714,7 @@ class PaymentLedger:
             import os as _os
             if _os.environ.get('PHONEPE_MERCHANT_ID') and _os.environ.get('PHONEPE_SALT_KEY'):
                 _phonepe_gateway = PhonePePaymentGateway()
-                if _phonepe_gateway.connected:
+                if _phonepe_gateway.connect():     # same rule as Stripe above
                     self.add_gateway(_phonepe_gateway)
                     logger.info(
                         "PaymentLedger: PhonePe gateway auto-registered "
@@ -686,6 +727,7 @@ class PaymentLedger:
             logger.debug(f"PaymentLedger: phonepe auto-register skipped: {_phonepe_err}")
 
         self.load_ledger()
+        self._merge_legacy()
 
     def add_gateway(self, gateway: PaymentGatewayConnector):
         """Add a payment gateway connector"""
@@ -693,6 +735,26 @@ class PaymentLedger:
             self.gateways[gateway.gateway] = gateway
             gateway.connect()
             logger.info(f"Added payment gateway: {gateway.gateway.value}")
+
+    def select_gateway(self, currency: str) -> PaymentGateway:
+        """The live gateway a new payment in ``currency`` should use.
+
+        INR prefers PhonePe (the India rail), then Stripe; any other
+        currency prefers Stripe.  Mock is the fallback when no real
+        gateway is registered, so a dev node keeps working and a node with
+        live credentials never silently routes real orders to Mock -- which
+        is what the hard-coded ``PaymentGateway.MOCK`` in request_payment
+        used to do whatever was configured.
+        """
+        with self.lock:
+            live = set(self.gateways)
+        order = ([PaymentGateway.PHONEPE, PaymentGateway.STRIPE]
+                 if (currency or '').upper() == 'INR'
+                 else [PaymentGateway.STRIPE])
+        for gw in order:
+            if gw in live:
+                return gw
+        return PaymentGateway.MOCK
 
     def create_payment_request(
         self,
@@ -702,7 +764,8 @@ class PaymentLedger:
         requester_agent_id: str,
         payment_method: PaymentMethod = PaymentMethod.INTERNAL_CREDITS,
         gateway: PaymentGateway = PaymentGateway.MOCK,
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
+        require_approval: bool = False,
     ) -> PaymentRequest:
         """
         Create a new payment request
@@ -715,6 +778,9 @@ class PaymentLedger:
             payment_method: Payment method
             gateway: Payment gateway to use
             metadata: Additional metadata
+            require_approval: Start in APPROVAL_REQUIRED instead of PENDING
+                -- the payment waits for a human answer on an approval card
+                (integrations.ap2.ap2_mandate) rather than for any caller.
 
         Returns:
             PaymentRequest object
@@ -730,6 +796,8 @@ class PaymentLedger:
             )
 
             payment.gateway = gateway
+            if require_approval:
+                payment.status = PaymentStatus.APPROVAL_REQUIRED
             self.payments[payment.payment_id] = payment
 
             logger.info(f"Created payment request: {payment.payment_id} - ${amount} {currency}")
@@ -743,11 +811,17 @@ class PaymentLedger:
 
         Args:
             payment_id: Payment ID to authorize
-            approver_id: ID of the approver (user or agent)
+            approver_id: ID of the approving PERSON.  Refused when empty, a
+                non-human id (ap2_mandate.NON_HUMAN_APPROVERS, e.g. 'system')
+                or the requesting agent's own id -- an agent can never
+                authorize its own request, whatever calls this.
 
         Returns:
             True if authorization successful
         """
+        from integrations.ap2.ap2_mandate import (NON_HUMAN_APPROVERS,
+                                                  PERSON_ID_PREFIX)
+        approver_id = str(approver_id or '').strip()
         with self.lock:
             if payment_id not in self.payments:
                 logger.error(f"Payment not found: {payment_id}")
@@ -755,8 +829,28 @@ class PaymentLedger:
 
             payment = self.payments[payment_id]
 
-            if payment.status != PaymentStatus.PENDING:
+            if payment.status not in (PaymentStatus.PENDING,
+                                      PaymentStatus.APPROVAL_REQUIRED):
                 logger.warning(f"Payment {payment_id} not in pending state: {payment.status}")
+                return False
+
+            if (approver_id.lower() in NON_HUMAN_APPROVERS
+                    or (approver_id == payment.requester_agent_id
+                        and not approver_id.startswith(PERSON_ID_PREFIX))):
+                logger.warning(f"Payment {payment_id}: approver {approver_id!r} "
+                               f"is not a person; refused")
+                return False
+
+            # A payment that belongs to a mandate is authorized only by the
+            # mandate's owner (MandateStore.approve passes exactly that).  Any
+            # other 'user:<id>' -- the CLI operator, an LLM naming a victim --
+            # is refused here, at the one gate every caller goes through.
+            _meta = payment.metadata or {}
+            if _meta.get('mandate_id') and approver_id != (
+                    PERSON_ID_PREFIX + str(_meta.get('user_id') or '')):
+                logger.warning(f"Payment {payment_id}: belongs to a mandate; "
+                               f"only its owner may authorize it, not "
+                               f"{approver_id!r}")
                 return False
 
             # Add to approval chain
@@ -773,9 +867,53 @@ class PaymentLedger:
             self.save_ledger()
             return True
 
-    def process_payment(self, payment_id: str) -> Dict[str, Any]:
+    def cancel_payment(self, payment_id: str, actor_id: str,
+                       reason: str = 'cancelled') -> bool:
+        """Cancel a payment that has not reached the gateway yet.
+
+        Allowed from PENDING, APPROVAL_REQUIRED or AUTHORIZED only: once a
+        payment is PROCESSING or terminal the gateway owns it.
+        """
+        with self.lock:
+            payment = self.payments.get(payment_id)
+            if payment is None or payment.status not in (
+                    PaymentStatus.PENDING, PaymentStatus.APPROVAL_REQUIRED,
+                    PaymentStatus.AUTHORIZED):
+                return False
+            payment.approval_chain.append({
+                'approver_id': actor_id,
+                'approved_at': datetime.now().isoformat(),
+                'action': 'cancelled',
+            })
+            payment.update_status(PaymentStatus.CANCELLED, reason)
+            self.save_ledger()
+            return True
+
+    def process_payment(self, payment_id: str, *,
+                        settler: bool = False) -> Dict[str, Any]:
         """
         Process an authorized payment through the gateway
+
+        ``settler=True`` is passed only by the code that settles a mandate
+        (ap2_mandate.settle and a kind's registered settler): a payment that
+        belongs to a mandate is taken only after the owner's approval and a
+        re-check of the live cart, so any other caller (the CLI, a generic
+        tool) is refused rather than moving money with no order placed.
+
+        The gateway calls are network I/O (Stripe SDK, PhonePe with a 15 s
+        timeout), so they run OUTSIDE ``self.lock``: the payment is reserved
+        as PROCESSING under the lock -- which is also what makes a concurrent
+        or replayed call refuse, since it is no longer AUTHORIZED -- the
+        gateway is called unlocked, and the outcome is committed under the
+        lock.  Holding the lock across the call blocked every ledger
+        operation behind one slow gateway.
+
+        A redirect gateway (PhonePe) has no money yet when create_payment
+        returns -- the person pays on the hosted page -- so capturing right
+        away would mark it FAILED.  Such a payment stays PROCESSING and the
+        result carries ``status='redirect_required'`` and the
+        ``redirect_url``; ``success`` stays False because nothing was
+        captured.
 
         Args:
             payment_id: Payment ID to process
@@ -788,6 +926,13 @@ class PaymentLedger:
                 return {'success': False, 'error': 'Payment not found'}
 
             payment = self.payments[payment_id]
+
+            if (payment.metadata or {}).get('mandate_id') and not settler:
+                return {
+                    'success': False,
+                    'error': 'this payment is settled only by the person who '
+                             'approves it; it cannot be processed directly'
+                }
 
             if payment.status != PaymentStatus.AUTHORIZED:
                 return {
@@ -802,51 +947,91 @@ class PaymentLedger:
                 self.save_ledger()
                 return {'success': False, 'error': 'Gateway not available'}
 
-            # Create payment in gateway
+            # Reserve: from here no other caller can process this payment.
             payment.update_status(PaymentStatus.PROCESSING)
             self.save_ledger()
 
-            try:
-                result = gateway.create_payment(payment)
-
-                if result.get('success'):
-                    payment.gateway_transaction_id = result.get('transaction_id')
-
-                    # Capture payment immediately for now
-                    capture_result = gateway.capture_payment(
-                        payment.payment_id,
-                        payment.gateway_transaction_id
-                    )
-
-                    if capture_result.get('success'):
-                        payment.update_status(PaymentStatus.COMPLETED)
-                        logger.info(f"Payment {payment_id} completed successfully")
-                    else:
-                        payment.update_status(
-                            PaymentStatus.FAILED,
-                            capture_result.get('error', 'Capture failed')
-                        )
-
-                    self.save_ledger()
-                    return capture_result
-                else:
-                    payment.update_status(
-                        PaymentStatus.FAILED,
-                        result.get('error', 'Gateway returned failure')
-                    )
-                    self.save_ledger()
-                    return result
-
-            except Exception as e:
-                logger.error(f"Error processing payment {payment_id}: {e}")
+        try:
+            result = gateway.create_payment(payment)
+            capture_result = None
+            if (result.get('success')
+                    and payment.gateway not in REDIRECT_GATEWAYS):
+                # Capture payment immediately for synchronous gateways
+                capture_result = gateway.capture_payment(
+                    payment.payment_id, result.get('transaction_id'))
+        except Exception as e:
+            logger.error(f"Error processing payment {payment_id}: {e}")
+            with self.lock:
                 payment.update_status(PaymentStatus.FAILED, str(e))
                 self.save_ledger()
-                return {'success': False, 'error': str(e)}
+            return {'success': False, 'error': str(e)}
+
+        with self.lock:
+            if not result.get('success'):
+                payment.update_status(
+                    PaymentStatus.FAILED,
+                    result.get('error', 'Gateway returned failure')
+                )
+                self.save_ledger()
+                return result
+
+            payment.gateway_transaction_id = result.get('transaction_id')
+
+            if capture_result is None:
+                # Redirect gateway: the person has not paid yet.
+                payment.update_status(PaymentStatus.PROCESSING,
+                                      'awaiting payment on the gateway page')
+                self.save_ledger()
+                return {
+                    'success': False,
+                    'status': 'redirect_required',
+                    'redirect_url': result.get('redirect_url'),
+                    'transaction_id': payment.gateway_transaction_id,
+                }
+
+            if capture_result.get('success'):
+                payment.update_status(PaymentStatus.COMPLETED)
+                logger.info(f"Payment {payment_id} completed successfully")
+            else:
+                payment.update_status(
+                    PaymentStatus.FAILED,
+                    capture_result.get('error', 'Capture failed')
+                )
+            self.save_ledger()
+            return capture_result
 
     def get_payment(self, payment_id: str) -> Optional[PaymentRequest]:
         """Get payment request by ID"""
         with self.lock:
             return self.payments.get(payment_id)
+
+    def find_by_gateway_transaction(self, gateway_transaction_id: str
+                                    ) -> Optional[PaymentRequest]:
+        """The payment a gateway transaction id belongs to, read under the
+        lock (a callback must not iterate the dict while another thread
+        writes it)."""
+        if not gateway_transaction_id:
+            return None
+        with self.lock:
+            for p in self.payments.values():
+                if p.gateway_transaction_id == gateway_transaction_id:
+                    return p
+        return None
+
+    def complete_once(self, payment_id: str, note: str) -> bool:
+        """Mark a payment COMPLETED if, and only if, this call is the one that
+        does it: True for the single caller that moved it from PROCESSING (or
+        AUTHORIZED), False for every other -- already completed, terminal, or
+        unknown.  A gateway delivers its confirmation more than once, and only
+        one delivery may go on to place the order."""
+        with self.lock:
+            p = self.payments.get(payment_id)
+            if p is None or p.status not in (PaymentStatus.PROCESSING,
+                                             PaymentStatus.AUTHORIZED):
+                return False
+            p.update_status(PaymentStatus.COMPLETED, note)
+            self.save_ledger()
+            return True
 
     def list_payments(
         self,
@@ -890,60 +1075,136 @@ class PaymentLedger:
                 'last_updated': datetime.now().isoformat()
             }
 
-            with open(self.ledger_path, 'w') as f:
-                json.dump(data, f, indent=2)
+            # Atomic (temp file + replace): a crash mid-write must not leave
+            # a truncated ledger that the next load reads as empty.
+            from core.file_cache import atomic_json_write
+            atomic_json_write(self.ledger_path, data)
 
             logger.debug(f"Payment ledger saved to {self.ledger_path}")
         except Exception as e:
             logger.error(f"Failed to save payment ledger: {e}")
 
-    def load_ledger(self):
-        """Load payment ledger from disk"""
+    @staticmethod
+    def _payment_from_dict(pid: str, payment_data: Dict[str, Any]) -> 'PaymentRequest':
+        payment = PaymentRequest(
+            amount=Decimal(payment_data['amount']),
+            currency=payment_data['currency'],
+            description=payment_data['description'],
+            requester_agent_id=payment_data['requester_agent_id'],
+            payment_method=PaymentMethod(payment_data['payment_method']),
+            metadata=payment_data.get('metadata', {})
+        )
+        payment.payment_id = pid
+        payment.status = PaymentStatus(payment_data['status'])
+        payment.created_at = datetime.fromisoformat(payment_data['created_at'])
+        payment.updated_at = datetime.fromisoformat(payment_data['updated_at'])
+        if payment_data.get('completed_at'):
+            payment.completed_at = datetime.fromisoformat(payment_data['completed_at'])
+        payment.gateway = PaymentGateway(payment_data['gateway']) if payment_data.get('gateway') else None
+        payment.gateway_transaction_id = payment_data.get('gateway_transaction_id')
+        payment.approval_chain = payment_data.get('approval_chain', [])
+        payment.error_message = payment_data.get('error_message')
+        return payment
+
+    def _preserve_unreadable(self, reason: str) -> None:
+        """Copy the ledger file aside before anything can overwrite it.
+
+        A load that fails (or skips records) followed by the next save would
+        otherwise replace real payment records with what little was read."""
         try:
-            if os.path.exists(self.ledger_path):
-                with open(self.ledger_path, 'r') as f:
-                    data = json.load(f)
-
-                # Reconstruct payment objects
-                for pid, payment_data in data.get('payments', {}).items():
-                    payment = PaymentRequest(
-                        amount=Decimal(payment_data['amount']),
-                        currency=payment_data['currency'],
-                        description=payment_data['description'],
-                        requester_agent_id=payment_data['requester_agent_id'],
-                        payment_method=PaymentMethod(payment_data['payment_method']),
-                        metadata=payment_data.get('metadata', {})
-                    )
-
-                    # Restore state
-                    payment.payment_id = pid
-                    payment.status = PaymentStatus(payment_data['status'])
-                    payment.created_at = datetime.fromisoformat(payment_data['created_at'])
-                    payment.updated_at = datetime.fromisoformat(payment_data['updated_at'])
-                    if payment_data.get('completed_at'):
-                        payment.completed_at = datetime.fromisoformat(payment_data['completed_at'])
-                    payment.gateway = PaymentGateway(payment_data['gateway']) if payment_data.get('gateway') else None
-                    payment.gateway_transaction_id = payment_data.get('gateway_transaction_id')
-                    payment.approval_chain = payment_data.get('approval_chain', [])
-                    payment.error_message = payment_data.get('error_message')
-
-                    self.payments[pid] = payment
-
-                logger.info(f"Loaded {len(self.payments)} payments from ledger")
+            import shutil
+            import time as _time
+            backup = f"{self.ledger_path}.unreadable-{int(_time.time())}"
+            shutil.copy2(self.ledger_path, backup)
+            logger.error(f"Payment ledger {self.ledger_path}: {reason}; the "
+                         f"original is kept at {backup}")
         except Exception as e:
-            logger.warning(f"Could not load payment ledger: {e}")
+            logger.error(f"Payment ledger {self.ledger_path}: {reason}, and it "
+                         f"could not be copied aside: {e}")
+
+    def load_ledger(self):
+        """Load payment ledger from disk.  A record that cannot be read is
+        skipped, and the file is copied aside first, so no save can lose it."""
+        if not os.path.exists(self.ledger_path):
+            return
+        try:
+            with open(self.ledger_path, 'r') as f:
+                data = json.load(f)
+        except Exception as e:
+            self._preserve_unreadable(f'could not be read ({e})')
+            return
+        skipped = []
+        for pid, payment_data in (data.get('payments') or {}).items():
+            try:
+                self.payments[pid] = self._payment_from_dict(pid, payment_data)
+            except Exception as e:
+                skipped.append(f'{pid}: {e}')
+        if skipped:
+            self._preserve_unreadable(f'{len(skipped)} record(s) unreadable '
+                                      f'({skipped[0]})')
+        logger.info(f"Loaded {len(self.payments)} payments from ledger")
+
+    def _merge_legacy(self) -> None:
+        """Bring in payments from the old CWD-relative ledger that the new one
+        lacks, once.  The one-time copy ran only when the new file did not
+        exist, so records written to the old path after that were invisible.
+        Copy-never-delete, as before; a marker file stops repeat merges."""
+        legacy = getattr(self, '_legacy_path', None)
+        if (not legacy or not os.path.exists(legacy)
+                or os.path.abspath(legacy) == os.path.abspath(self.ledger_path)):
+            return
+        marker = self.ledger_path + '.legacy_merged'
+        if os.path.exists(marker):
+            return
+        try:
+            with open(legacy, 'r') as f:
+                old = json.load(f).get('payments') or {}
+        except Exception as e:
+            logger.warning(f"Payment ledger: legacy {legacy} unreadable: {e}")
+            return
+        added = 0
+        with self.lock:
+            for pid, d in old.items():
+                if pid in self.payments:
+                    continue
+                try:
+                    self.payments[pid] = self._payment_from_dict(pid, d)
+                    added += 1
+                except Exception as e:
+                    logger.warning(f"Payment ledger: legacy record {pid} skipped: {e}")
+            if added:
+                self.save_ledger()
+        try:
+            with open(marker, 'w') as f:
+                f.write(f'merged {added} from {legacy}\n')
+        except OSError:
+            pass
+        if added:
+            logger.info(f"Payment ledger: merged {added} legacy payment(s) from {legacy}")
 
 
 # Global payment ledger instance
 payment_ledger = PaymentLedger()
 
 
-def create_payment_request_function(agent_name: str) -> Callable:
+def get_payment_ledger() -> PaymentLedger:
+    """The process-wide PaymentLedger -- the single writer of the payment
+    ledger file.  ``hart pay`` (hartos/hart_cli.py) imports this name; it
+    did not exist, so every ``hart pay`` command reported "AP2 not
+    available"."""
+    return payment_ledger
+
+
+def create_payment_request_function(agent_name: str,
+                                    user_id: Optional[str] = None) -> Callable:
     """
     Create a payment request function for an agent
 
     Args:
         agent_name: Name of the agent
+        user_id: The person the agent works for.  When given, every payment
+            gets an AP2 mandate owned by them (ap2_mandate), so only they can
+            approve it -- on the approval card, never through a tool.
 
     Returns:
         Function that can be registered with autogen
@@ -971,13 +1232,37 @@ def create_payment_request_function(agent_name: str) -> Callable:
         except ValueError:
             method = PaymentMethod.INTERNAL_CREDITS
 
+        if user_id:
+            from integrations.ap2.ap2_mandate import (
+                MandateError, get_mandate_store, request_human_approval)
+            store = get_mandate_store()
+            try:
+                m = store.create_cart_mandate(
+                    str(user_id), agent_name,
+                    {'lines': [{'sku_id': 'payment', 'qty': 1,
+                                'unit_price': amount}],
+                     'total': amount, 'currency': currency},
+                    description=description, requester_agent_id=agent_name)
+            except MandateError as e:
+                return json.dumps({'success': False, 'error': str(e)}, indent=2)
+            asked = request_human_approval(m.payment_id, store)
+            return json.dumps({
+                'payment_id': m.payment_id,
+                'amount': m.amount,
+                'currency': m.currency,
+                'status': 'approval_required',
+                'approval_card_shown': asked.get('approval_card_shown'),
+                'message': 'Payment request created. The person must approve '
+                           'it on their screen; approving also completes it.'
+            }, indent=2)
+
         payment = payment_ledger.create_payment_request(
             amount=Decimal(str(amount)),
             currency=currency,
             description=description,
             requester_agent_id=agent_name,
             payment_method=method,
-            gateway=PaymentGateway.MOCK
+            gateway=payment_ledger.select_gateway(currency)
         )
 
         return json.dumps({
@@ -991,20 +1276,45 @@ def create_payment_request_function(agent_name: str) -> Callable:
     return request_payment
 
 
-def create_payment_authorization_function() -> Callable:
+def create_payment_authorization_function(ask_only: bool = False) -> Callable:
     """
-    Create a payment authorization function
+    Create the ``authorize_payment`` tool.
+
+    ``ask_only`` (what agents get by default): the tool cannot authorize.  It
+    shows the payment's owner the approval card and returns
+    ``approval_required``; the person's answer reaches /api/agent/approval,
+    which authorizes as the identity in their token
+    (ap2_mandate.decide_payment).  The name is kept so saved recipes that
+    call authorize_payment still resolve.
 
     Returns:
-        Function that can be used to authorize payments
+        Function that can be registered with autogen
     """
-    def authorize_payment(payment_id: str, approver_id: str = "system") -> str:
+    if ask_only:
+        def authorize_payment(payment_id: str, approver_id: str = "") -> str:
+            """
+            Ask the person to approve a pending payment.  Agents cannot approve.
+
+            Args:
+                payment_id: Payment ID awaiting approval
+                approver_id: Ignored -- the approver is whoever the person's
+                    login token says.
+
+            Returns:
+                JSON with status 'approval_required' on success
+            """
+            from integrations.ap2.ap2_mandate import request_human_approval
+            return json.dumps(request_human_approval(payment_id), indent=2)
+
+        return authorize_payment
+
+    def authorize_payment(payment_id: str, approver_id: str = "") -> str:
         """
         Authorize a payment request
 
         Args:
             payment_id: Payment ID to authorize
-            approver_id: ID of the approver
+            approver_id: ID of the approving person (never 'system')
 
         Returns:
             Authorization result
@@ -1044,37 +1354,72 @@ def create_payment_processing_function() -> Callable:
         Returns:
             Processing result
         """
+        payment = payment_ledger.get_payment(payment_id)
+        if payment is not None and (payment.metadata or {}).get('mandate_id'):
+            # A payment that belongs to a mandate is taken only by its
+            # settler (ap2_mandate.settle / decide_payment), after the
+            # person's approval and, for a checkout, a re-check of the live
+            # cart.  This generic tool would charge it without either: money
+            # moves and no order is placed.
+            return json.dumps({
+                'success': False,
+                'payment_id': payment_id,
+                'error': 'this payment is settled only by the person who '
+                         'approves it; an agent cannot process it'},
+                indent=2)
         result = payment_ledger.process_payment(payment_id)
         return json.dumps(result, indent=2)
 
     return process_payment
 
 
-def get_ap2_tools_for_autogen(agent_name: str) -> List[Dict[str, Any]]:
+def get_ap2_tools_for_autogen(agent_name: str,
+                              user_id: Optional[str] = None,
+                              allow_llm_authorize: Optional[bool] = None
+                              ) -> List[Dict[str, Any]]:
     """
     Get AP2 payment tools for autogen agent registration
 
+    The model can never self-authorize by default: ``authorize_payment`` only
+    ASKS the payment's owner (an approval card), and the ledger refuses
+    'system' or the requesting agent as an approver in any case.  A node that
+    deliberately wants a tool that authorizes directly sets
+    ``AP2_ALLOW_LLM_AUTHORIZE=1`` (or passes ``allow_llm_authorize=True``);
+    the caller must then still name a person.
+
     Args:
         agent_name: Name of the agent
+        user_id: The person the agent works for (owner of its payments)
+        allow_llm_authorize: None reads ``AP2_ALLOW_LLM_AUTHORIZE`` (default
+            False).
 
     Returns:
         List of tool definitions for autogen
     """
+    if allow_llm_authorize is None:
+        from core.config_cache import env_flag
+        allow_llm_authorize = env_flag('AP2_ALLOW_LLM_AUTHORIZE', False)
     return [
         {
-            'function': create_payment_request_function(agent_name),
+            'function': create_payment_request_function(agent_name, user_id),
             'name': 'request_payment',
-            'description': 'Request a payment transaction for services or resources. Returns payment_id for tracking.'
+            'description': 'Request a payment transaction for services or resources. The person approves it on their screen. Returns payment_id for tracking.'
         },
         {
-            'function': create_payment_authorization_function(),
+            'function': create_payment_authorization_function(
+                ask_only=not allow_llm_authorize),
             'name': 'authorize_payment',
-            'description': 'Authorize a pending payment request. Requires payment_id.'
+            'description': (
+                'Authorize a pending payment request. Requires payment_id.'
+                if allow_llm_authorize else
+                'Ask the person to approve a pending payment (shows them an '
+                'approval card). Agents cannot approve payments; the result is '
+                'approval_required until the person answers. Requires payment_id.')
         },
         {
             'function': create_payment_processing_function(),
             'name': 'process_payment',
-            'description': 'Process an authorized payment through the gateway. Requires payment_id.'
+            'description': 'Process a payment the person has approved (approving usually completes it already). Requires payment_id.'
         }
     ]
 
@@ -1084,7 +1429,7 @@ __all__ = [
     'PaymentStatus', 'PaymentMethod', 'PaymentGateway',
     'PaymentRequest', 'PaymentLedger', 'PaymentGatewayConnector',
     'MockPaymentGateway', 'StripePaymentGateway', 'PhonePePaymentGateway',
-    'payment_ledger',
+    'payment_ledger', 'get_payment_ledger',
     'create_payment_request_function', 'create_payment_authorization_function',
     'create_payment_processing_function', 'get_ap2_tools_for_autogen'
 ]

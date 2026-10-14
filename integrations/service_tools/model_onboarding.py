@@ -37,44 +37,81 @@ def _is_nunba_bundled() -> bool:
     return 'hartos_backend_adapter' in sys.modules
 
 
+def _norm_model_name(name: str) -> str:
+    """Lowercase alphanumerics of a model's base name ('Qwen/Qwen3-8B' ->
+    'qwen38b'), for comparing a requested model to a served GGUF id."""
+    base = (name or '').rsplit('/', 1)[-1]
+    return re.sub(r'[^a-z0-9]', '', base.lower())
+
+
+def _served_model_matches(requested: str, served_ids) -> Optional[str]:
+    """The served id that IS the requested model, or None.
+
+    A served id is a GGUF name or alias ('Qwen3-8B-Q4_K_M.gguf'): it matches
+    when the requested base name is its prefix up to a quant/extension
+    boundary, so 'Qwen3-8B' does not match 'Qwen3-80B-...'.
+    """
+    want = _norm_model_name(requested)
+    if not want:
+        return None
+    for sid in served_ids or []:
+        base = (sid or '').rsplit('/', 1)[-1].lower()
+        stem = re.split(r'[-_.](?:i?q\d|f16|f32|bf16|gguf)', base, maxsplit=1)[0]
+        if re.sub(r'[^a-z0-9]', '', stem) == want:
+            return sid
+    return None
+
+
+def _probe_llm_server() -> dict:
+    """What the local LLM server is doing, from the canonical live probe.
+
+    {'status': 'up'|'down'|..., 'url': ..., 'models': [...]} -- the server
+    may have been started by Nunba or hart-llm.service rather than by this
+    process, so this is the only honest source; never a bare /health 200.
+    """
+    try:
+        from core.health_probe import probe_llm
+        return probe_llm(include_models=True) or {}
+    except Exception as e:
+        logger.warning("model_onboarding: LLM probe failed: %s", e, exc_info=True)
+        return {'status': 'probe_error', 'error': str(e)}
+
+
 def _onboard_via_nunba(model_name: str, quant: str, port: int) -> dict:
     """Onboard a model by delegating to Nunba's existing infrastructure.
 
-    Nunba already has llama.cpp running on port 8080. We just need to
-    tell it to load a different model via its adapter, or check if
-    the requested model is already active.
+    Nunba owns the llama.cpp server and its model.  This reports whether the
+    REQUESTED model is the one being served.  It used to answer 'ready' for
+    any model whenever port 8080 answered /health, a model that does not
+    exist included (tool sweep #682), and it ignored the port registry.
     """
-    import urllib.request
-    import urllib.error
-    import json
+    probe = _probe_llm_server()
+    endpoint = (probe.get('url') or '').rsplit('/v1', 1)[0] or None
+    base = {'model': model_name, 'endpoint': endpoint, 'source': 'nunba'}
 
-    # Check if Nunba's llama.cpp is already running
-    llm_port = 8080
-    try:
-        req = urllib.request.urlopen(f'http://127.0.0.1:{llm_port}/health', timeout=3)
-        if req.status == 200:
-            logger.info("Nunba's llama.cpp already running on port %d", llm_port)
-            return {
-                'status': 'ready',
-                'model': model_name,
-                'quant': quant,
-                'endpoint': f'http://127.0.0.1:{llm_port}',
-                'source': 'nunba',
-                'note': 'Nunba manages the llama.cpp server. '
-                        'Use Nunba settings to change models.',
-            }
-    except (urllib.error.URLError, OSError):
-        logger.warning("_onboard_via_nunba: swallowed urllib.error.URLError, OSError", exc_info=True)
+    if probe.get('status') != 'up':
+        return dict(base, status='waiting',
+                    note='HARTOS is bundled with Nunba. Start the Nunba desktop '
+                         'app to activate llama.cpp inference. Nunba manages '
+                         'model lifecycle.')
 
-    # Nunba not running yet — tell the user
-    return {
-        'status': 'waiting',
-        'model': model_name,
-        'endpoint': f'http://127.0.0.1:{llm_port}',
-        'source': 'nunba',
-        'note': 'HARTOS is bundled with Nunba. Start the Nunba desktop app '
-                'to activate llama.cpp inference. Nunba manages model lifecycle.',
-    }
+    served = probe.get('models') or []
+    if not served:
+        return dict(base, status='unverified', loaded_models=[],
+                    error="Nunba's LLM server is up but did not say which "
+                          "model it serves.")
+
+    match = _served_model_matches(model_name, served)
+    if match:
+        logger.info("Nunba's llama.cpp is serving %s", match)
+        return dict(base, status='ready', model=match, requested=model_name,
+                    quant=quant,
+                    note='Nunba manages the llama.cpp server. '
+                         'Use Nunba settings to change models.')
+
+    return dict(base, status='not_loaded', loaded_models=served,
+                error=f"Nunba's LLM server is serving {', '.join(served)}, "
+                      f"not {model_name}. Switch models in Nunba settings.")
 
 
 # ── Module-level state ──────────────────────────────────────────────
@@ -540,7 +577,18 @@ def status() -> Dict:
             healthy = lcpp.is_running() if hasattr(lcpp, 'is_running') else False
             result['server_healthy'] = healthy
         except Exception:
+            logger.warning("status: llama-server liveness check failed",
+                           exc_info=True)
             result['server_healthy'] = False
+    else:
+        # A server this process did not launch (Nunba on the desktop,
+        # hart-llm.service on HART OS).  Reporting False here told agents
+        # the LLM was down while it served chat.
+        probe = _probe_llm_server()
+        result['server_healthy'] = probe.get('status') == 'up'
+        result['serving_models'] = probe.get('models') or []
+        if probe.get('url'):
+            result['llm_url'] = probe['url']
 
     # VRAM info
     vm = _get_vram_manager()
@@ -787,11 +835,26 @@ def recommend_for_hardware() -> Dict:
 def needs_setup() -> bool:
     """True when no local model is active yet -- the first-boot AI setup step
     should then offer to provision one. REUSES get_active_model (no parallel
-    state). Fail-safe True: if the check errors, offer setup rather than skip it."""
+    state) and the canonical live probe: hart-llm.service (HART OS) and Nunba
+    start llama without onboard(), so get_active_model() alone offered setup
+    while a model was already serving.  Fail-safe True: if the checks error,
+    offer setup rather than skip it."""
     try:
-        return get_active_model() is None
+        if get_active_model() is not None:
+            return False
     except Exception:
-        return True
+        logger.warning("needs_setup: active-model check failed", exc_info=True)
+    return _probe_llm_server().get('status') != 'up'
+
+
+def onboard_succeeded(result) -> bool:
+    """THE definition of a successful onboard() result: status 'ready'.
+
+    One definition, so callers do not invent their own.  The first-boot
+    wizard tested status == 'ok', which onboard() never returns, so a
+    successful setup told the user it 'did not finish'.
+    """
+    return bool(result) and result.get('status') == 'ready'
 
 
 # ── Registration helpers ────────────────────────────────────────────

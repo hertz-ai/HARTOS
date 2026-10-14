@@ -82,6 +82,14 @@ class AiderNativeBackend(CodingToolBackend):
 
         Returns:
             {success, output, tool, execution_time_s, repo_map?, files_changed?, error?}
+
+        success means an edit was applied to a file: the receipt.  A reply
+        that only talks (no SEARCH/REPLACE block, or blocks that matched no
+        text) is a failed run with the reason in ``error`` and the reply in
+        ``output``.  Owner ruling 2026-10-04: a completion is real work, never
+        narration.  Until then any reply counted, and on the owner's desktop
+        442 runs in 25 hours (10-04/05) applied 0 edits and recorded 442
+        successes, which made the router pick this backend every time.
         """
         if not self.is_installed():
             return {
@@ -178,13 +186,30 @@ class AiderNativeBackend(CodingToolBackend):
             for edit in applied_edits:
                 output_parts.append(f"  {edit['file']}: {edit['status']}")
 
-        return {
-            'success': True,
+        files_changed = [e['file'] for e in applied_edits if e['status'] == 'applied']
+        result = {
+            'success': bool(files_changed),
             'output': '\n'.join(output_parts),
             'repo_map': repo_map_text[:2000] if repo_map_text else '',
-            'files_changed': [e['file'] for e in applied_edits if e['status'] == 'applied'],
+            'files_changed': files_changed,
             'edits': applied_edits,
         }
+        if not files_changed:
+            result['error'] = self._no_edit_reason(applied_edits)
+        return result
+
+    @staticmethod
+    def _no_edit_reason(edits: List[Dict]) -> str:
+        """Why a run applied nothing, in words the calling agent can act on."""
+        if not edits:
+            return ('No edit applied: the reply contained no SEARCH/REPLACE '
+                    'block naming a file.  This tool changes files; to read '
+                    'or search code, use a shell or file tool instead.')
+        tried = '; '.join(
+            f"{e['file']}: {e['status']}"
+            + (f" ({e['reason']})" if e.get('reason') else '')
+            for e in edits)
+        return f'No edit applied: {tried}.'
 
     def get_repo_map(self, working_dir: str = '.', files: Optional[List[str]] = None,
                      max_tokens: int = 2048) -> str:

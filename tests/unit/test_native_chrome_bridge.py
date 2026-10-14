@@ -506,30 +506,28 @@ def test_a_claimed_bar_keeps_its_hit_targets():
     assert "pointer-events" not in window, "nothing may turn the bar's input off"
 
 
-def test_onboarding_keeps_its_own_orb_because_the_compositor_cannot_draw_one_there():
-    """The stand-down's premise fails for exactly one surface, and it was applied
-    there anyway.
+def test_onboarding_backdrop_is_opaque_so_nothing_native_can_show_behind_it():
+    """The stand-down's premise fails for exactly one surface: the first-run
+    overlay. Every other selector in native_orb_css is safe because the bloom
+    claim makes the WALLPAPER transparent, so the compositor's layers show
+    through underneath. `.hart-onboarding` paints its own backdrop at
+    `inset:0; z-index:12000` in opaque black (Nunba's own ceremony root is
+    black too), so the transparent wallpaper buys it nothing and the native orb,
+    drawn BELOW the shell surface,
+    is OCCLUDED there (orb.rs calls that out by name).
 
-    Everything else in that list is safe because the bloom claim makes the WALLPAPER
-    transparent, so the compositor's layers show through underneath. `.hart-onboarding`
-    paints its own backdrop at `inset:0; z-index:12000` out of two fully opaque stops,
-    so the transparent wallpaper buys it nothing, and the native orb is drawn BELOW the
-    shell surface, which orb.rs describes as OCCLUDED whenever the shell paints an
-    opaque background.
-
-    So hiding `.hob-orb` did not hand the orb over to the compositor. It left the first
-    screen a new user sees with no orb at all, which is what the owner reported on
-    2026-09-11.
-
-    The positions never matched either: the native orb takes the HOME layout's slot at
-    0.72w/0.46h, while the ceremony centres its own above the name reveal.
-    """
+    History: on 2026-09-10 the overlay's own orb (`.hob-orb`) was listed in the
+    stand-down and the owner saw a ceremony with no orb at all (reverted
+    2026-09-11). Since 2026-10-12 the overlay has no orb of its own to lose: it
+    hosts Nunba's ceremony in `.hob-frame` (static/hartOnboarding.js), and
+    Nunba draws its particles and name reveal inside the frame. The backdrop
+    argument is what this test keeps honest."""
     src = _src()
     stand_down = _block(src, "native_orb_css = ''", "native_home_css = ''")
     css = _code(stand_down)
-    assert 'hob-orb' not in css, (
-        "the onboarding orb is standing down again; the compositor cannot draw an orb "
-        "behind an opaque full-screen ceremony, so this leaves onboarding with none")
+    assert 'hart-onboarding' not in css and 'hob-' not in css, (
+        "the first-run overlay is in the stand-down list again; the compositor "
+        "cannot draw anything behind an opaque full-screen ceremony")
 
     # The surfaces that CAN hand off must still do so, or this guard would pass by
     # gutting the bridge rather than by scoping it.
@@ -537,14 +535,11 @@ def test_onboarding_keeps_its_own_orb_because_the_compositor_cannot_draw_one_the
         "the hero and voice orbs must still stand down for a claimed orb")
     assert 'hart-orb-orbit' in css, "the orbit rings must still stand down"
 
-    # And the onboarding backdrop is still the opaque thing this argument rests on.
+    # The backdrop is still the opaque thing this argument rests on, and the
+    # ceremony inside it is Nunba's page.
     onb = _block(src, ".hart-onboarding{", "}")
-    assert 'z-index:12000' in onb and 'background:radial-gradient' in onb, (
+    assert 'z-index:12000' in onb and 'background:#000' in onb, (
         "the onboarding backdrop changed shape; re-check whether the native orb can "
         "now be seen behind it before trusting this test's reasoning")
-
-    # The software-floor ANIMATION gate is a different rule and must survive: it drops
-    # the breathing on a box that paints in software while keeping the orb visible.
-    assert 'body.webkit-flat .hart-onboarding .hob-orb,' in src, (
-        "the onboarding orb lost its software-floor animation gate, which is what "
-        "stopped it re-rasterising a 150px double box-shadow forever")
+    assert '.hart-onboarding .hob-frame{' in src, (
+        "the overlay lost the frame that hosts Nunba's ceremony")

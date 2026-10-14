@@ -399,7 +399,8 @@ def _computer_control_answer(owner: str, agent: Optional[str],
         return None
 
 
-def computer_control_block(agent_id, *, sleep=time.sleep) -> Optional[str]:
+def computer_control_block(agent_id, *, wait=True,
+                           sleep=time.sleep) -> Optional[str]:
     """Return a refusal when the owner has not allowed agents to control this
     computer, None when they have.  Same contract as is_window_blocked.
 
@@ -416,7 +417,10 @@ def computer_control_block(agent_id, *, sleep=time.sleep) -> Optional[str]:
     Without a grant the owner is asked through ConsentService, so the ask
     reaches their devices and the privacy page lists and revokes the grant.
     A turn someone is watching waits up to COMPUTER_CONTROL_WAIT_SECONDS for
-    the answer; a daemon run does not wait.  When the owner says no ("Don't
+    the answer; a daemon run does not wait, nor does a caller that passes
+    wait=False because it cannot be held (an HTTP request: POST
+    /coding/execute held one 108.6 s, past the 30-60 s its clients allow).
+    Either is asked all the same.  When the owner says no ("Don't
     allow" on the ask) the run is refused at once, and that agent's later
     runs are refused without asking until the owner allows agents again: a
     no stands (hartos-3e ruling (a)).  A grant covers every agent until
@@ -446,9 +450,9 @@ def computer_control_block(agent_id, *, sleep=time.sleep) -> Optional[str]:
         background = is_current_request_autonomous()
     except Exception:  # noqa: BLE001 -- unknown is a watched turn: it waits
         background = False
+    waits = bool(wait) and not background
     started = time.monotonic()
-    deadline = started + (0.0 if background
-                          else COMPUTER_CONTROL_WAIT_SECONDS)
+    deadline = started + (COMPUTER_CONTROL_WAIT_SECONDS if waits else 0.0)
     # One line when the wait starts and one for how it ends, not one per look.
     waited = False
     while True:
@@ -481,10 +485,12 @@ def computer_control_block(agent_id, *, sleep=time.sleep) -> Optional[str]:
                         f'{agent}, waiting up to '
                         f'{COMPUTER_CONTROL_WAIT_SECONDS:.0f}s')
         sleep(min(COMPUTER_CONTROL_POLL_SECONDS, remaining))
-    why = 'daemon run, not waited for' if background else 'no answer in time'
+    why = ('no answer in time' if waits
+           else 'daemon run, not waited for' if background
+           else 'caller cannot wait, not waited for')
     logger.warning(f'computer control refused for agent {agent}: owner '
                    f'{owner} has not allowed it ({why})')
-    if background:
+    if not waits:
         return ('Not run: the owner has not allowed agents to control this '
                 'computer. They have been asked; this can run once they '
                 'allow it.')

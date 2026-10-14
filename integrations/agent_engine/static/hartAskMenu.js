@@ -6,7 +6,7 @@
  * with the current text selection prefilled.
  *
  * DRY: reuses the ONE menu renderer (window.HartCtxMenu.open) and the ONE assistant
- * path (toggleAssistantChat + #ac-input, where acSend is the sole dispatcher) — no
+ * path (window.HartNunba.compose: Nunba's panel, Nunba's composer); no
  * parallel menu, no parallel chat. Classic script, WebKitGTK-safe (no optional
  * chaining, guarded throughout so a missing node is a no-op, never a throw).
  */
@@ -26,27 +26,17 @@
     } catch (e) { return ''; }
   }
 
-  // Open the floating assistant (reusing the canonical toggle) and prefill
-  // the given text. No backticks anywhere in this file, including comments:
+  // Open the assistant and prefill the given text. Nunba is the chat: HartNunba
+  // .compose fronts the pinned assistant panel and puts the selection in
+  // Nunba's composer WITHOUT sending, so the person finishes the question.
+  // No backticks anywhere in this file, including comments:
   // tests/test_orb_webkit_safety.py greps the raw source for them, because
   // old WebKitGTK cannot parse template literals.
-  // toggleAssistantChat TOGGLES, so only call it while the chat is closed, else a
-  // second right-click-Ask would close an already-open chat.
   function askOpen(text) {
     try {
-      var chat = document.getElementById('assistant-chat');
-      if (chat && chat.classList.contains('open')) {
-        // already open — just (re)fill + focus below
-      } else if (typeof window.toggleAssistantChat === 'function') {
-        window.toggleAssistantChat();
+      if (window.HartNunba && typeof window.HartNunba.compose === 'function') {
+        window.HartNunba.compose(text || '', false);
       }
-      setTimeout(function () {
-        var i = document.getElementById('ac-input');
-        if (i) {
-          if (text) { i.value = text; }
-          try { i.focus(); } catch (e) { /* dead pointer / test DOM */ }
-        }
-      }, 130);
     } catch (e) { console.debug('hartAskMenu: askOpen failed', e); }
   }
 

@@ -15,7 +15,8 @@ import re
 import threading
 from datetime import datetime, timezone
 from typing import Dict, Optional, Any
-from core.constants import BOOKKEEPING_TOOLS, tool_reply_failed
+from core.constants import (AGENT_MENTIONS, BOOKKEEPING_TOOLS,
+                            HISTORICAL_TOOL_PLACEHOLDER, tool_reply_failed)
 from core.session_cache import TTLCache
 
 try:
@@ -504,6 +505,21 @@ def resume_blocked_action(user_prompt: str, action_id: int,
         return False
     logger.info(f"Resumed blocked {task_id}: {reason}")
     return True
+
+
+def ledger_holds_no_block(user_prompt: str, action_id: int) -> bool:
+    """Whether the registered ledger holds this action's task and it is NOT
+    BLOCKED: a user-input block on it never landed (block_for_user_input
+    refuses a task that is not in progress) or is already gone, so there is
+    nothing durable to resume.
+
+    False when there is no ledger or no such task (nothing is known, so a gate
+    stays as it is) and when the task IS blocked (a resume that failed to save
+    must be retried, not dropped)."""
+    ledger = _ledger_registry.get(user_prompt)
+    task = ledger.tasks.get(f"action_{action_id}") if ledger else None
+    return (task is not None
+            and task.status != _get_ledger_task_status().BLOCKED)
 
 
 def resume_from_user_input(user_prompt: str, action_id: int,
@@ -1505,6 +1521,27 @@ def resolve_receipt(user_prompt: str, evidence) -> Optional[tuple]:
     return messages, index, message, agent
 
 
+def evidence_sources(group_chat, agents):
+    """The message lists a receipt can live in, each with its address.
+
+    Yields ``(source, messages)``: ``source`` is None for the group log, or
+    ``{'source': 'buffer', 'agent': <name>, 'peer': <name>}`` for one
+    participant's pairwise buffer -- the address resolve_receipt reads a
+    receipt back from.  The group log comes first.  The ONE definition: the
+    REUSE fabrication gate and its receipt finder read it through
+    reuse_recipe._reuse_evidence_sources, which delegates here, and
+    derive_completion_evidence below reads it for CREATE.
+    """
+    yield None, getattr(group_chat, 'messages', None) or []
+    for ag in (agents or []):
+        conv = getattr(ag, '_oai_messages', None)
+        if isinstance(conv, dict):
+            for peer, msgs in conv.items():
+                yield ({'source': 'buffer',
+                        'agent': getattr(ag, 'name', None),
+                        'peer': getattr(peer, 'name', peer)}, msgs)
+
+
 def tool_call_names(msg_lists) -> Dict[str, str]:
     """call_id -> function name, read off the PROPOSING assistant message.
 
@@ -1528,11 +1565,139 @@ def tool_call_names(msg_lists) -> Dict[str, str]:
     return out
 
 
+def action_named_tools(agents, action_text):
+    """(every tool these agents can SERVE, the ones the action's TEXT names).
+
+    The ONE rule for "this action names that tool".  Read by the REUSE
+    fabrication gate (reuse_recipe._reuse_fabricated_tools, through
+    _reuse_registered_and_referenced_tools, which delegates here), by the
+    completion gate below and by CREATE's trace banker
+    (create_recipe._bank_action_recipe_from_trace).  It lived in
+    reuse_recipe until 2026-10-05, so only REUSE asked it: the completion
+    gate took ANY tool's reply as the receipt of an action that names a
+    tool, so send_message_to_user's "Message sent" for "Please wait while
+    I read the file" completed "execute_coding_task: read error log file
+    ...", and the banker saved those messages as its recipe (live:
+    prompts/26251890627_0_recipe.json, 2026-09-15, replayed by the coding
+    daemon every dispatch since).
+
+    "Can serve" is three sources, not two: already REGISTERED
+    (_function_map), already in the SCHEMA (llm_config['tools']), and
+    ATTACHABLE BY NAME (_hart_core_tools), the source whose absence made
+    the REUSE gate blind (live 2026-09-10, agent 88719487304 action 4: an
+    action naming execute_coding_task read like a prose action and
+    advanced having run nothing).
+
+    "Names" is _text_names_tool's reading, not a bare substring: a tool whose
+    name is a plain English word (remember) is named only where the text
+    writes it as a call.
+    """
+    names = set()
+    for ag in (agents or []):
+        try:
+            names.update((getattr(ag, '_function_map', None) or {}).keys())
+        except Exception:
+            pass
+        cfg = getattr(ag, 'llm_config', None)
+        if isinstance(cfg, dict):
+            for t in (cfg.get('tools') or []):
+                fn = ((t or {}).get('function') or {}).get('name')
+                if fn:
+                    names.add(fn)
+        # Closures this leg can attach BY NAME but has not attached yet.
+        # attach_for_names(core_tools=...) serves exactly these, unpacking the
+        # same (name, description, func) tuples build_core_tool_closures
+        # returns -- so read [0] the way it does.
+        #
+        # Without this the two sources above only see tools ALREADY attached,
+        # so a recipe-named closure was invisible until something else had
+        # attached it, and _reuse_fabricated_tools returned [] at its
+        # `if not referenced` early-return, which sits ABOVE its log line.
+        # Measured live 2026-09-10, agent 88719487304 action 4 (rid
+        # d60c-223537, taken AFTER 7fd83678f made these closures buildable):
+        # watermark 12 -> 13, and it was the ONLY action of nine with no
+        # `[FAB-GUARD] action N names tool(s)` verdict line at all.  An action
+        # naming execute_coding_task read exactly like a prose action naming
+        # nothing, and advanced having run nothing.
+        # Population: 87 actions across 35 agents name execute_coding_task.
+        for _ct in (getattr(ag, '_hart_core_tools', None) or []):
+            try:
+                _cn = _ct[0]
+            except Exception:
+                continue
+            if _cn:
+                names.add(_cn)
+    text = str(action_text or '').lower()
+    referenced = [n for n in names if _text_names_tool(text, n)]
+    return names, referenced
+
+
+#: A verb that calls a one-word tool name, with an optional article between:
+#: "call remember", "use the remember", "calling remember", "via remember".
+#: Not "with": "start with remember the names" is prose.
+_TOOL_CALL_CUE = re.compile(
+    r'\b(?:call|calls|calling|use|uses|using|run|runs|running|invoke|invokes|'
+    r'invoking|execute|executes|executing|via)\s+(?:(?:the|this|your|a|an)\s+)?'
+    r'[`"\']?$')
+#: ... or the noun after it: "the remember tool", "remember function".
+_TOOL_NOUN_AFTER = re.compile(r'[`"\']?\s+(?:tool|function)\b')
+
+
+def _text_names_tool(text: str, name: str) -> bool:
+    """Whether the (lowercased) action ``text`` names the tool ``name``.
+
+    A name shaped like an identifier (an underscore, a digit, or a capital
+    inside it: save_data_in_memory, crawl4ai, Generate_video) is not a word of
+    prose, so it names the tool wherever it stands, as it always has.  A name
+    that is one plain word is an English word too: live 2026-10-10, agent
+    54's written reply step said "remember the interrupted one" and read as
+    naming the memory tool `remember`, so the completion gate wanted that
+    tool's result and the step GAVE_UP on a correct reply.  Such a name counts
+    only where the text writes it as a call: followed by "(", after a calling
+    verb (_TOOL_CALL_CUE), before "tool" / "function", or in quotes or
+    backticks.  That is "written as a call", not "is a call": prose shaped
+    like one still names the tool ("students use remember and recall as
+    study skills", "do not call remember here").  Measured on the desktop's
+    1,087 configs (5,889 actions, remember and recall among the names): of
+    1,664 (action, tool) matches, 13 change and none has that shape -- 3
+    English "remember", 3 English "recall", and 7 "recall" read inside
+    "recall_memory", which those actions still name."""
+    n = str(name or '').lower()
+    if len(n) <= 3 or n not in text:
+        return False
+    if '_' in name or any(c.isdigit() for c in name) or any(
+            c.isupper() for c in name[1:]):
+        return True
+    for m in re.finditer(r'(?<![a-z0-9_])' + re.escape(n) + r'(?![a-z0-9_])',
+                         text):
+        after = text[m.end():m.end() + 1]
+        if after == '(' or _TOOL_NOUN_AFTER.match(text, m.end()):
+            return True
+        if _TOOL_CALL_CUE.search(text[max(0, m.start() - 24):m.start()]):
+            return True
+        if (m.start() and text[m.start() - 1] in '`"\''
+                and after and after in '`"\''):
+            return True
+    return False
+
+
+def _tools_this_action_names(user_prompt: str, action_id: int):
+    """(the action's text, the registered tools it names): the action read
+    the way the completion gate reads it -- its ledger description -- and
+    the tools this session's group chat can serve."""
+    ledger = get_registered_ledger(user_prompt)
+    task = (getattr(ledger, 'tasks', None) or {}).get(f'action_{action_id}')
+    action_text = str(getattr(task, 'description', '') or '').lower()
+    group_chat = get_registered_groupchat(user_prompt)
+    return action_text, action_named_tools(
+        getattr(group_chat, 'agents', None), action_text)[1]
+
+
 def _receipt_is_real_work(user_prompt: str, action_id: int, messages,
                           message: dict) -> bool:
     """Whether a role='tool' receipt shows the action's work being done.
 
-    Two things a tool message can carry that are not that work:
+    Four things a tool message can carry that are not that work:
 
       * a FAILED reply (core.constants.tool_reply_failed): the executor's
         "Error: ...", the tool_logging envelope, or a TOOL_FAILURE_RESULTS
@@ -1543,15 +1708,36 @@ def _receipt_is_real_work(user_prompt: str, action_id: int, messages,
         not itself name: live 2026-09-27, CREATE daemon_255bd83f, two
         execute_coding_task actions completed on save_data_in_memory writes of
         {"status": "completed"} the model composed, with no coding run.
+      * ANY other tool's reply when the action names a tool
+        (action_named_tools): an action that names a tool is done by that
+        tool's work.  send_message_to_user's "Message sent" completed
+        "execute_coding_task: read error log file ..." (#147).
+      * the PLACEHOLDER helper.py back-fills for a call that returned nothing
+        (core.constants.HISTORICAL_TOOL_PLACEHOLDER).  tool_reply_failed does
+        not cover it by design and the REUSE readers skip it on their own;
+        here it is skipped for the same reason, which matters most for
+        derive_completion_evidence, where no model chose the message.
 
     An aggregate message (autogen's ``tool_responses``) is a receipt when any
     one of its results qualifies.  A result whose function cannot be resolved
-    is judged on its content alone: it cannot be shown to be bookkeeping.
+    is judged on its content alone: it cannot be shown to be bookkeeping.  For
+    an action that names a tool it is no receipt: it cannot be shown to be
+    that tool's work either, the way the REUSE fabrication gate counts only a
+    result it can resolve to a tool the action names.
     """
-    names = tool_call_names([messages])
-    ledger = get_registered_ledger(user_prompt)
-    task = (getattr(ledger, 'tasks', None) or {}).get(f'action_{action_id}')
-    action_text = str(getattr(task, 'description', '') or '').lower()
+    action_text, named = _tools_this_action_names(user_prompt, action_id)
+    return any(True for _ in _work_results(
+        message, tool_call_names([messages]), action_text, named))
+
+
+def _work_results(message: dict, names: Dict[str, str], action_text: str,
+                  named):
+    """The tool name of each result in a role='tool' ``message`` that is the
+    action's work, by _receipt_is_real_work's rule (its docstring gives the
+    four exclusions); None for a result whose function cannot be resolved,
+    which only an action naming no tool accepts.  ``names`` is
+    tool_call_names of the message's list; ``action_text`` and ``named`` are
+    _tools_this_action_names of the action."""
     responses = message.get('tool_responses')
     results = responses if isinstance(responses, list) and responses else [message]
     for result in results:
@@ -1560,13 +1746,15 @@ def _receipt_is_real_work(user_prompt: str, action_id: int, messages,
         body = result.get('content')
         if body is None:
             body = message.get('content')
-        if not str(body or '').strip() or tool_reply_failed(body):
+        if (not str(body or '').strip() or tool_reply_failed(body)
+                or HISTORICAL_TOOL_PLACEHOLDER in str(body)):
             continue
         name = names.get(result.get('tool_call_id') or message.get('tool_call_id'))
         if name in BOOKKEEPING_TOOLS and name.lower() not in action_text:
             continue
-        return True
-    return False
+        if named and name not in named:
+            continue
+        yield name
 
 
 def _verifier_completion_has_conversation_evidence(
@@ -1600,10 +1788,301 @@ def _verifier_completion_has_conversation_evidence(
         return (message.get('role') == 'tool'
                 and _receipt_is_real_work(user_prompt, action_id, messages,
                                           message))
-    # A written answer is only ever cited from the group log.
-    return (agent is None
-            and message.get('role') == 'assistant'
-            and message.get('name') == 'Assistant')
+    # A written answer is only ever cited from the group log, and is the work
+    # only of an action that names no tool: "I will read the error log file
+    # and share what I find" was accepted as the read itself (#147).
+    if _tools_this_action_names(user_prompt, action_id)[1]:
+        return False
+    return agent is None and is_written_answer(message)
+
+
+def tool_result_is_action_work(user_prompt: str, action_id: int,
+                               index: int) -> bool:
+    """Whether the group log's message ``index`` finishes this action's own
+    work: a result the completion gate accepts as its receipt
+    (_verifier_completion_has_conversation_evidence: in the action's dispatch
+    window, not failed, not the placeholder, from a tool the action names),
+    after which every tool the action names has returned its work in that
+    window (_work_results, the gate's per-result rule).  CREATE's speaker
+    selector hands such a result to the StatusVerifier, as REUSE's selector
+    hands it every result the Assistant ran: live 2026-10-10, agent 54 action
+    3, the save to teach.10202 succeeded at 16:38:36 (attempt 2) and the 28
+    tool results after it, like all 42 of the three attempts, went back to
+    the Assistant, so the verifier never spoke in any attempt
+    (16:36:56-16:41:12).
+
+    Every named tool, not the first: agent 54's action 1 names get_user_id
+    and then get_data_by_key, and the user id alone is not the progress the
+    action reads.  An action that names alternatives ("google_search or
+    crawl4ai") therefore never qualifies and keeps going back to the
+    Assistant, as every action did before.
+
+    False for an action that names no tool: it is done by its written
+    answer, and a tool reply in its window is not its receipt
+    (derive_completion_evidence splits the same way).  Never raises: it sits
+    on the speaker-selection path."""
+    try:
+        action_text, named = _tools_this_action_names(user_prompt, action_id)
+        if not named:
+            return False
+        if not _verifier_completion_has_conversation_evidence(
+                user_prompt, action_id,
+                {'evidence': {'message_index': index, 'kind': 'tool_receipt'}}):
+            return False
+        messages = getattr(get_registered_groupchat(user_prompt), 'messages', None)
+        names = tool_call_names([messages])
+        done = set()
+        for i, msg in enumerate(messages[:index + 1]):
+            if (isinstance(msg, dict) and msg.get('role') == 'tool'
+                    and latest_dispatch_before(messages, i + 1) == action_id):
+                done.update(_work_results(msg, names, action_text, named))
+        return set(named) <= done
+    except Exception:
+        logger.warning(
+            "tool_result_is_action_work: action %s in %s: the receipt check "
+            "failed", action_id, user_prompt, exc_info=True)
+        return False
+
+
+# The roles the Assistant's own message carries in a group log.  A plain reply
+# is 'user' there -- autogen's manager stores what it RECEIVED from a speaker
+# as 'user' -- and a message that carries tool_calls is 'assistant'; a log
+# rebuilt from the manager's buffer (#725, reuse_recipe._reuse_sync_group_log)
+# can hold a plain reply as 'assistant' too.  Measured live 2026-10-06 (agent
+# 54, state_transition's "Last message role" line): user/Assistant 15 times,
+# every plain reply, and assistant/Assistant 26 times, the tool-calling ones.
+# The receipt of a prose action was accepted only as 'assistant', so a plain
+# lesson could never be one.  'tool' and 'function' are somebody's result.
+_ASSISTANT_WRITTEN_ROLES = ('assistant', 'user')
+
+# The tags that make a message routing.  The shared list (AGENT_MENTIONS: the
+# seats REUSE's loop routes by) plus the two seats the CREATE loop also routes
+# to, which that list does not name: 4b049241d moved this rule onto the shared
+# list and, with it, let "@ChatInstructor Action 1 is done, please move on"
+# complete a prose action again (reviewer finding D1).  They are not added to
+# the shared list because REUSE's loop and send_message_to_user read their own
+# copies of it for other decisions (task #166).
+_ROUTING_MENTIONS = AGENT_MENTIONS + ("@chatinstructor", "@userproxy")
+
+
+def _answer_value_is_text(value) -> bool:
+    """Whether the value of a ``message2userfinal`` / ``message2`` answer key
+    is text a person can read: not empty, and not an unfilled ``<...>``
+    placeholder (the synthesis steer's own template, ``<your answer here>``).
+    The rule of reuse_recipe._reuse_is_written_answer, which has to stay
+    literal in that module (its extract-and-exec tests); a test pins the two
+    equal."""
+    text = str(value or '').strip()
+    return bool(text) and not (text.startswith('<') and text.endswith('>'))
+
+
+# What the pipeline's own prompts show as the example of a message to the
+# person (create_recipe.py: "Your message here", "message here", "Your clear
+# and useful message here"; reuse_recipe.py shows the last two under
+# message2userfinal); a model that sends the example back has sent nothing.
+_PROMPT_EXAMPLE_MESSAGES = ('your message here', 'message here',
+                            'your clear and useful message here')
+
+# The keys a message to the person travels under: REUSE's two answer keys,
+# and message2user, the one CREATE's prompts teach (@user {"message2user":
+# ...}), which REUSE's reply filter also reads as the answer.  REUSE's answer
+# extractors (reuse_recipe.get_agent_response) unwrap the same keys.
+ANSWER_KEYS = ('message2userfinal', 'message2', 'message2user')
+
+
+#: What may wrap a prompt example and still leave it the example: spaces,
+#: quotes, and closing or trailing marks (an ellipsis too).
+_EXAMPLE_TRIM = ' .!?,;:"\'…'
+
+
+def _is_answer_text(value) -> bool:
+    """Whether an answer key's value is a message: readable text
+    (_answer_value_is_text) that is not one of the prompts' own examples,
+    however it is spaced, quoted or punctuated at its ends."""
+    return (_answer_value_is_text(value)
+            and ' '.join(str(value).split()).strip(_EXAMPLE_TRIM).lower()
+            not in _PROMPT_EXAMPLE_MESSAGES)
+
+
+def _is_control_message(text: str) -> bool:
+    """Whether ``text`` is the pipeline's control JSON rather than prose: a
+    status verdict object in any dress (bare, in a code fence, single-quoted,
+    after a line of prose), or an answer-key envelope whose value is empty, an
+    unfilled placeholder or one of the prompts' own examples.  It is the
+    parse REUSE's reply filter uses (helper.retrieve_json), in REUSE's order:
+    an answer key first (ANSWER_KEYS), so a status object that carries a real
+    message to the person is the answer, as it is there; then status.  The
+    Assistant's own ``{"status": "completed"}`` report, or the steer's
+    template sent back as it stands, is refused here exactly where REUSE
+    refuses it.  Fails closed: a text that cannot be read is control.  (A
+    lesson that quotes a ``{"status": 404}`` example is refused too, as in
+    REUSE.)
+
+    A verdict or an answer key is an object, so text with no brace cannot be
+    control and is not handed to the parser, which logs two INFO lines per
+    call on prose."""
+    if '{' not in text:
+        return False
+    try:
+        from hartos.helper import retrieve_json
+        parsed = retrieve_json(text)
+    except Exception:
+        return True
+    if not isinstance(parsed, dict):
+        return False
+    for key in ANSWER_KEYS:
+        if key in parsed:
+            return not _is_answer_text(parsed[key])
+    return 'status' in parsed
+
+
+def is_written_answer(message) -> bool:
+    """An Assistant message that is written work, as the completion gate, the
+    CREATE derivation below and REUSE's receipt finder
+    (reuse_recipe._reuse_completion_evidence) judge it.
+
+    REUSE asks this AFTER its own reply filter (reuse_recipe.
+    _reuse_message_is_user_answer), which also refuses the pipeline's own text
+    (a steer, a dispatch echoed without its marker), the steering and verifier
+    seats and a placeholder answer key.  CREATE asks only this, so those
+    REUSE-only rules do not reach CREATE yet (task #171); what is here is the
+    part the two share.
+
+    It is the Assistant's (the seat name, in either role a log holds it), not
+    the dispatch echoed back (a seat name does not always survive a log, and a
+    dispatch is the pipeline's text, never the work), not a control JSON (the
+    Assistant's own ``{"status": ...}`` report, or the steer's unfilled answer
+    template, in any dress: _is_control_message),
+    not an unexecuted tool call in the model's own markup, and not routing: a
+    message that tags another agent (_ROUTING_MENTIONS: core.constants.
+    AGENT_MENTIONS, ``@Helper``, ``@StatusVerifier``..., plus the loop's own
+    ``@ChatInstructor`` and ``@UserProxy``) is addressed to that agent whatever
+    else it says, the way REUSE reads it.  "Step 1 done. @StatusVerifier
+    please verify." is a note, and the pipeline appends its memory-skeleton
+    line to exactly such messages (create_recipe.state_transition).  A reply
+    tagged to the person (``@user {"message2user": ...}``) is an answer."""
+    if not (isinstance(message, dict) and message.get('name') == 'Assistant'
+            and message.get('role') in _ASSISTANT_WRITTEN_ROLES):
+        return False
+    text = str(message.get('content') or '').strip()
+    low = text.lower()
+    if (not text or text == 'TERMINATE' or _DISPATCH_MARKER.match(text)
+            or any(mention in low for mention in _ROUTING_MENTIONS)
+            or '<tool_call>' in low or '<function=' in low):
+        return False
+    return not _is_control_message(text)
+
+
+def _derive_written_answer(user_prompt: str, action_id: int,
+                           group_chat) -> Optional[dict]:
+    """The action's written answer, for an action that names no tool.
+
+    The longest answer in the action's dispatch window (the lesson, not the
+    one-line handoff that follows it; a tie goes to the newer), judged by the
+    same gate a cited answer faces.  Read from the group log only: that gate
+    accepts a written answer from no other list.
+    """
+    msgs = getattr(group_chat, 'messages', None)
+    if not isinstance(msgs, list):
+        return None
+    best, best_size = None, -1
+    for index, msg in enumerate(msgs):
+        if not is_written_answer(msg):
+            continue
+        size = len(str(msg.get('content')).strip())
+        if size < best_size:
+            continue
+        candidate = {'message_index': index, 'kind': 'user_visible_result'}
+        if _verifier_completion_has_conversation_evidence(
+                user_prompt, action_id, {'evidence': candidate}):
+            best, best_size = candidate, size
+    if best is not None:
+        logger.info(
+            "[COMPLETION-RECEIPT] action %s in %s: the verdict cited no "
+            "answer the gate accepts; the action's written answer at group "
+            "log message %s stands in", action_id, user_prompt,
+            best['message_index'])
+    else:
+        logger.warning(
+            "[COMPLETION-RECEIPT] action %s in %s: no written answer of "
+            "this action in the group log (len=%s)",
+            action_id, user_prompt, len(msgs))
+    return best
+
+
+def derive_completion_evidence(user_prompt: str,
+                               action_id: int) -> Optional[dict]:
+    """The action's own tool receipt, found by the pipeline.
+
+    A completion has to cite a result from this action's dispatch window
+    (_verifier_completion_has_conversation_evidence).  REUSE finds that result
+    itself (reuse_recipe._reuse_completion_evidence); CREATE left it to the
+    verifier MODEL, which has to count message indexes in a transcript of
+    hundreds of messages.  Measured live on the 4B, 2026-10-05 23:53 (task
+    #162): action 1, "get_data_by_key: read key tutor.progress ...", ran
+    get_data_by_key and got a real answer; the verdict cited message 14, a
+    get_chat_history reply; and every action of the run was refused three
+    times and GAVE_UP -- no recipe banked, no agent built.
+
+    This only LOCATES a candidate.  Every tool message, newest first, in the
+    group log and then each participant's buffer (evidence_sources), is judged
+    by the very gate a cited receipt faces, so a failed call, a note saved to
+    memory, another tool's reply, a placeholder or another action's result is
+    no receipt here either.  Returns the evidence in the shape resolve_receipt
+    reads, or None.
+
+    An action that names no tool is done by its WRITTEN ANSWER, not by a tool
+    reply (_derive_written_answer): measured live on the same 4B 2026-10-06
+    01:11, agent 54 as one prose action ("Teach exactly one next step ...
+    Write the lesson as your reply to the learner") -- the Assistant wrote a
+    good lesson and the verdict that cited the dispatch instead was refused.
+
+    It never raises -- it sits on the verdict path -- and a miss says what
+    was looked at.
+    """
+    try:
+        group_chat = get_registered_groupchat(user_prompt)
+        if group_chat is None:
+            return None
+        # REUSE splits the same way: a tool receipt for an action that names a
+        # tool, the written answer for one that does not.  A tool reply in a
+        # prose action's window is not its receipt.
+        if not _tools_this_action_names(user_prompt, action_id)[1]:
+            return _derive_written_answer(user_prompt, action_id, group_chat)
+        looked = []
+        for source, msgs in evidence_sources(
+                group_chat, getattr(group_chat, 'agents', None)):
+            if not isinstance(msgs, list):
+                continue
+            where = ('group log' if source is None
+                     else f"{source['agent']}->{source['peer']} buffer")
+            tool_messages = 0
+            for index in range(len(msgs) - 1, -1, -1):
+                msg = msgs[index]
+                if not isinstance(msg, dict) or msg.get('role') != 'tool':
+                    continue
+                tool_messages += 1
+                candidate = {**(source or {}), 'message_index': index,
+                             'kind': 'tool_receipt'}
+                if _verifier_completion_has_conversation_evidence(
+                        user_prompt, action_id, {'evidence': candidate}):
+                    logger.info(
+                        "[COMPLETION-RECEIPT] action %s in %s: the verdict "
+                        "cited no receipt the gate accepts; the action's own "
+                        "tool result at %s message %s stands in",
+                        action_id, user_prompt, where, index)
+                    return candidate
+            looked.append(f"{where}(len={len(msgs)}, "
+                          f"tool_messages={tool_messages})")
+        logger.warning(
+            "[COMPLETION-RECEIPT] action %s in %s: no tool result of this "
+            "action's work in %s", action_id, user_prompt,
+            ', '.join(looked) or 'any list')
+    except Exception:
+        logger.warning(
+            "[COMPLETION-RECEIPT] action %s in %s: the receipt search failed",
+            action_id, user_prompt, exc_info=True)
+    return None
 
 
 def _record_verifier_evidence(user_prompt: str, action_id: int,
@@ -1757,6 +2236,18 @@ def _promote_verified_outcome(user_prompt: str, action_id: int,
         logger.exception('Unable to record verified world-model outcome')
 
 
+def _flow_has_action(user_prompt: str, action_id: int) -> bool:
+    """Whether this session's flow has an action with that id.
+
+    The registered ledger holds one ``action_<id>`` task per action
+    (add_actions_to_ledger, for CREATE and REUSE alike), and a completion is
+    only ever recorded against it (_record_verifier_evidence), so the flow a
+    completion is judged in always has one.
+    """
+    return f'action_{action_id}' in (
+        getattr(get_registered_ledger(user_prompt), 'tasks', None) or {})
+
+
 def commit_verified_action_completion(user_prompt: str, action_id: int,
                                       evidence: dict,
                                       reason: str = 'verified complete',
@@ -1771,19 +2262,26 @@ def commit_verified_action_completion(user_prompt: str, action_id: int,
     caller from advancing the pointer while silently skipping the flywheel.
 
     ``claimed_action_id`` is the action_id the verdict itself names, when it
-    names one.  A verdict completes only that action: live 2026-09-27 (REUSE
-    daemon_goal_..._b18bba6f, 17:35:28) a StatusVerifier verdict for action_id
-    2 -- "System health check completed successfully" -- completed action 4.
+    names one.  A verdict completes only the action it names: live 2026-09-27
+    (REUSE daemon_goal_..._b18bba6f, 17:35:28) a StatusVerifier verdict for
+    action_id 2 -- "System health check completed successfully" -- completed
+    action 4.  That is a verdict about ANOTHER ACTION OF THE FLOW.  An id the
+    flow does not have names no action, so it cannot be a stale verdict for
+    one; it is a wrong number, and live 2026-10-06 the 4B verifier wrote 2, 4
+    and 6 on the verdicts of agent 54, whose recipe has ONE action (18
+    refusal lines in the two retained logs).
     settled_action_id still decides which action a verdict is ABOUT (its
     recipe, its log line); this decides only whether it may COMPLETE one.  A
-    verdict that names no action_id is not contradicting anything.
+    verdict that names no action_id, or one the flow does not have, is not
+    contradicting anything.
     """
     if claimed_action_id is not None:
         try:
             _claimed = int(float(claimed_action_id))
         except (TypeError, ValueError):
             _claimed = None
-        if _claimed is not None and _claimed != int(action_id):
+        if (_claimed is not None and _claimed != int(action_id)
+                and _flow_has_action(user_prompt, _claimed)):
             logger.warning(
                 "Refusing completion of action %s in %s: the verdict names "
                 "action %s", action_id, user_prompt, _claimed)
@@ -1875,8 +2373,18 @@ def lifecycle_hook_process_verifier_response(user_prompt: str, json_obj: dict, u
         return {'action': 'allow', 'message': None}
 
     if status in ('completed', 'success'):
+        # The citation is the verifier model's to get right, and a small
+        # model's to get wrong; the receipt is the pipeline's to find.  A
+        # citation the gate accepts is used as cited, so a model that does
+        # count the transcript is unchanged.  The verdict still has to name
+        # THIS action (claimed_action_id below).
+        evidence = json_obj.get('evidence')
+        if not _verifier_completion_has_conversation_evidence(
+                user_prompt, current_action_id, json_obj):
+            evidence = derive_completion_evidence(
+                user_prompt, current_action_id) or evidence
         if not commit_verified_action_completion(
-                user_prompt, current_action_id, json_obj.get('evidence'),
+                user_prompt, current_action_id, evidence,
                 "hook tracking lifecycle_hook_process_verifier_response",
                 claimed_action_id=json_obj.get('action_id')):
             # Bounded, on the same per-action counter a 'pending' verdict

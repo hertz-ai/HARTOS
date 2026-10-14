@@ -56,6 +56,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 import types
 from typing import Any, Callable, Mapping, Optional
 
@@ -94,6 +95,30 @@ def _install_api_gate(app) -> None:
         logger.critical(f"HARTOS API gate not installed on the host app: {e}")
 
 
+#: A phone whose device ask is already on file re-shows its one card at most
+#: this often, however often it re-dials (each re-dial is a HELLO: a DB read
+#: and, past this, a consent event).  Its first ask spends the shared announce
+#: budget; repeats spend this per-key allowance instead (#187 R5).
+_REASK_EVERY_SECONDS = 30.0
+_reask_at: dict = {}            # device public key -> when its card was last re-shown
+_reask_lock = threading.Lock()
+_reask_clock = time.monotonic   # a seam for tests
+
+
+def _reask_due(public_key: str) -> bool:
+    """True (and noted) when this key's card may be re-shown now.  Entries
+    older than the window go on the way in, so the table holds only keys
+    seen in the last _REASK_EVERY_SECONDS."""
+    now = _reask_clock()
+    with _reask_lock:
+        for key in [k for k, at in _reask_at.items() if now - at >= _REASK_EVERY_SECONDS]:
+            del _reask_at[key]
+        if public_key in _reask_at:
+            return False
+        _reask_at[public_key] = now
+        return True
+
+
 def _install_device_verifier() -> None:
     """Step 1c: the verifier a phone's PeerLink HELLO is checked with (HARTOS
     #111): the same verify_device_jwt the API gate uses, against the same
@@ -104,7 +129,8 @@ def _install_device_verifier() -> None:
         from core.peer_link.link_manager import get_link_manager
         from integrations.social.auth import (
             file_device_access_ask, verify_device_jwt)
-        from integrations.social.consent_service import device_fingerprint
+        from integrations.social.consent_service import (
+            ConsentService, device_fingerprint, device_scope)
         from integrations.social.models import db_session
 
         def verify(token: str, peer_address: str) -> dict:
@@ -116,7 +142,20 @@ def _install_device_verifier() -> None:
                 if verdict.get('status') == 'pending':
                     from integrations.social.discovery import _check_announce_rate
                     peer_host = peer_address.rsplit(':', 1)[0]
-                    if _check_announce_rate(peer_host):
+                    # A phone already asked about re-dials on every backoff;
+                    # its repeat re-shows the one card (at most every
+                    # _REASK_EVERY_SECONDS) and costs no shared budget.
+                    # That matters on the relay, where every phone's address
+                    # is 'relay' and all share one budget (#187 R5).
+                    asked = ConsentService.ask_on_file(
+                        db, owner, 'device_access',
+                        scope=device_scope(verdict['public_key']))
+                    if asked is not None:
+                        if _reask_due(verdict['public_key']):
+                            file_device_access_ask(
+                                db, owner, verdict['public_key'],
+                                verdict.get('claims') or {})
+                    elif _check_announce_rate(peer_host):
                         file_device_access_ask(
                             db, owner, verdict['public_key'],
                             verdict.get('claims') or {})
@@ -171,6 +210,50 @@ def _install_peer_admission_ask() -> None:
         get_link_manager().set_peer_admission_ask(ask)
     except Exception as e:
         logger.critical(f"PeerLink admission ask not installed: {e}")
+
+
+def _install_peer_link_relay() -> None:
+    """Step 1e: put this node on the PeerLink relay (core.peer_link.relay),
+    after the verifier and the admission ask so the first relayed HELLO meets
+    the same gates as a websocket one.  The rung a phone or a peer reaches
+    from behind any NAT; every frame after the handshake is end-to-end
+    encrypted.  Central hosts the router and is not a relay endpoint.
+    Non-blocking: the session joins in the background and rejoins on loss."""
+    try:
+        from security.key_delegation import get_node_tier
+        if get_node_tier() == 'central':
+            return
+    except Exception as e:
+        # Tier unreadable: a node that is not central is the common case, and
+        # the relay only carries what the existing gates admit.
+        logger.debug(f"PeerLink relay: node tier unreadable ({e}); joining")
+    try:
+        from core.peer_link.relay import start_relay_hub
+        if start_relay_hub() is None:
+            logger.info("PeerLink relay not started (switched off or no WAMP client)")
+    except Exception as e:
+        logger.warning(f"PeerLink relay not started: {e}")
+
+
+def _install_mobile_adapter(app) -> None:
+    """Step 5c: a person's own phone's cloud API calls, answered by this
+    desktop over the device link (integrations.mobile_adapter), one alias
+    row per call, through the API gate _install_api_gate put on ``app``.
+    After the route steps, so the rows it claims are the routes ``app``
+    serves.  Central answers the cloud calls itself and is not a device's
+    desktop."""
+    try:
+        from security.key_delegation import get_node_tier
+        if get_node_tier() == 'central':
+            return
+    except Exception as e:
+        logger.debug(f"Mobile adapter: node tier unreadable ({e}); installing")
+    try:
+        from integrations.mobile_adapter.adapter import install
+        if not install(app):
+            logger.warning("Mobile adapter not installed: phones keep every call on the cloud")
+    except Exception as e:
+        logger.warning(f"Mobile adapter not installed: {e}")
 
 
 def bootstrap(
@@ -272,6 +355,9 @@ def _run_bootstrap(app, cfg: dict) -> None:
           the standalone hart_intelligence_entry path registered these,
           so bundled nodes served the SPA shell to every peer directory
           fetch (see _init_a2a_server)
+      5c. the mobile adapter (integrations.mobile_adapter) -- added
+          2026-10-06: a phone's cloud calls answered by the routes above,
+          over the device link
       6. init_db + run_migrations
       7. channel adapters (config + env-var + web)
       8. init_agent_engine
@@ -293,6 +379,7 @@ def _run_bootstrap(app, cfg: dict) -> None:
             _install_api_gate(app)
             _install_device_verifier()
             _install_peer_admission_ask()
+            _install_peer_link_relay()
             _init_social_subsystem(app)
             _register_core_blueprints(app)
             _run_consumer_hook(app, cfg)
@@ -301,6 +388,7 @@ def _run_bootstrap(app, cfg: dict) -> None:
             # window with the other route steps.  See _init_a2a_server for
             # why the bundle needs this (peers got the SPA shell for /a2a/*).
             _init_a2a_server(app, cfg)
+            _install_mobile_adapter(app)
             _init_database(cfg)
             _init_channel_adapters(app, cfg)
             # IMPORTANT: spawn hevolveai BEFORE the agent-engine subsystem
@@ -639,7 +727,9 @@ def _init_channel_adapters(app, cfg: dict) -> None:
         try:
             channels.register_webhook_routes(app)
         except Exception as _wh_e:
-            logger.debug(f"webhook route registration skipped: {_wh_e}")
+            logger.warning(
+                "Inbound channel webhook routes NOT registered; webhook-based "
+                "channels cannot receive messages on this node: %s", _wh_e)
 
         # Auto-activate channels saved in admin config
         activated_from_cfg = 0
@@ -650,23 +740,16 @@ def _init_channel_adapters(app, cfg: dict) -> None:
                     tok = ch_cfg.get('token') or ch_cfg.get('api_key')
                     if channels.register_channel(ch_type, token=tok):
                         activated_from_cfg += 1
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Admin-config channels NOT activated: %s", e,
+                           exc_info=True)
 
-        # Env-var-driven channels (only if credentials present — heavy
-        # SDK modules are NOT imported speculatively).
-        env_creds = {
-            'telegram': os.environ.get('TELEGRAM_BOT_TOKEN'),
-            'discord':  os.environ.get('DISCORD_BOT_TOKEN'),
-            'whatsapp': os.environ.get('WHATSAPP_ACCESS_TOKEN'),
-            'slack':    os.environ.get('SLACK_BOT_TOKEN'),
-            'signal':   os.environ.get('SIGNAL_SERVICE_URL'),
-        }
-        registered_from_env = 0
-        for ch_type, tok in env_creds.items():
-            if tok and ch_type not in (channels.registry._adapters or {}):
-                if channels.register_channel(ch_type, token=tok):
-                    registered_from_env += 1
+        # Env-var channels are registered by channels.start() below, from
+        # FlaskChannelIntegration._ENV_FALLBACKS -- the one list
+        # register_channel itself reads.  This function used to keep its own
+        # five-entry dict whose names disagreed with it: SIGNAL_SERVICE_URL
+        # was passed as Signal's phone number, and WHATSAPP_ACCESS_TOKEN built
+        # the identity-less WhatsApp adapter _RESTORE_EXCLUDED rules out.
 
         # `web` adapter is in-process, cheap, always register
         if 'web' not in (channels.registry._adapters or {}):
@@ -675,11 +758,11 @@ def _init_channel_adapters(app, cfg: dict) -> None:
         channels.start()
         logger.info(
             f"Channel adapters initialised "
-            f"({activated_from_cfg} from config, "
-            f"{registered_from_env} from env, web)"
+            f"({activated_from_cfg} from config, web; env channels via start())"
         )
     except Exception as e:
-        logger.debug(f"Channel adapters skipped: {e}")
+        logger.warning("Channel adapters NOT started; no channel will send or "
+                       "receive on this node: %s", e, exc_info=True)
 
 
 # ─── Step 9: Agent engine ───────────────────────────────────────────────
@@ -796,6 +879,19 @@ def _init_livekit_supervisor(cfg: dict) -> None:
                 info.get('reason') or info.get('mode'))
     except Exception as e:
         logger.warning(f"LiveKit supervisor init failed: {e}")
+        return
+    if not info.get('should_run'):
+        return
+    # A person's own phone reaches this SFU's signal port over its device
+    # link (integrations.social.livekit_link); only a node that hosts the SFU
+    # names tunnels in its handshake.
+    try:
+        from integrations.social.livekit_link import install as install_tunnel
+        if not install_tunnel():
+            logger.warning("LiveKit tunnel not installed: a phone cannot reach this "
+                           "SFU over its link")
+    except Exception as e:
+        logger.warning(f"LiveKit tunnel not installed: {e}")
 
 
 def _init_whatsapp_supervisor(cfg: dict) -> None:

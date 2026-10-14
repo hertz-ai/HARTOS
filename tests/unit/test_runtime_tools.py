@@ -616,6 +616,11 @@ class TestDynamicPort:
 # Voice Transcription Endpoint Tests
 # ══════════════════════════════════════════════════════════════════
 
+# A phone always sends its Bearer; a multipart POST without one is refused by
+# the CSRF check before the handler runs.
+PHONE = {'Authorization': 'Bearer phone-device-token'}
+
+
 class TestVoiceTranscription:
     """Tests for /api/voice/transcribe endpoint."""
 
@@ -636,17 +641,33 @@ class TestVoiceTranscription:
         assert resp.status_code == 400
 
     @patch('integrations.service_tools.whisper_tool.whisper_transcribe')
-    def test_transcribe_json_path(self, mock_transcribe, client):
-        """Transcribe from audio_path in JSON body."""
-        mock_transcribe.return_value = json.dumps({
-            'text': 'hello world',
-            'language': 'en',
-        })
+    def test_a_path_in_the_body_is_never_read(self, mock_transcribe, client):
+        """A caller names no file on the node: a JSON audio_path read any file
+        the node could open (review of Nunba b07e025f; same rule as #67)."""
+        for body in ({'audio_path': 'C:/Users/owner/private.wav'},
+                     {'audio_path': r'\\attacker\share\x.wav'}):
+            resp = client.post('/api/voice/transcribe', json=body)
+            assert resp.status_code == 400
         resp = client.post('/api/voice/transcribe',
-                          json={'audio_path': '/tmp/test.wav'})
+                           data=json.dumps({'audio_path': '/etc/passwd'}),
+                           content_type='text/plain', headers=PHONE)
+        assert resp.status_code == 400
+        mock_transcribe.assert_not_called()
+
+    @patch('integrations.service_tools.whisper_tool.whisper_transcribe')
+    def test_an_upload_is_transcribed_with_its_language(self, mock_transcribe, client):
+        """What the phone (DesktopTranscriber) and hart_cli send: multipart."""
+        import io
+        mock_transcribe.return_value = json.dumps({'text': 'vanakkam', 'language': 'ta'})
+        resp = client.post('/api/voice/transcribe', data={
+            'audio': (io.BytesIO(b'RIFF....WAVE'), 'call.wav'),
+            'language': 'ta', 'source': 'call',
+        }, content_type='multipart/form-data', headers=PHONE)
         assert resp.status_code == 200
-        data = resp.get_json()
-        assert data['text'] == 'hello world'
+        assert resp.get_json()['text'] == 'vanakkam'
+        path, language = mock_transcribe.call_args[0]
+        assert language == 'ta'
+        assert not os.path.exists(path), 'the upload temp file was left behind'
 
 
 # ══════════════════════════════════════════════════════════════════

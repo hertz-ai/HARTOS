@@ -253,7 +253,7 @@ class SlackAdapter(ChannelAdapter, RoomCapableAdapter):
             return SendResult(
                 success=True,
                 message_id=response.get("ts"),
-                raw=dict(response),
+                raw=dict(response.data),
             )
 
         except SlackApiError as e:
@@ -303,7 +303,7 @@ class SlackAdapter(ChannelAdapter, RoomCapableAdapter):
             return SendResult(
                 success=True,
                 message_id=file_info.get("id"),
-                raw=dict(response),
+                raw=dict(response.data),
             )
 
         except SlackApiError as e:
@@ -370,7 +370,7 @@ class SlackAdapter(ChannelAdapter, RoomCapableAdapter):
             return SendResult(
                 success=True,
                 message_id=response.get("ts"),
-                raw=dict(response),
+                raw=dict(response.data),
             )
 
         except SlackApiError as e:

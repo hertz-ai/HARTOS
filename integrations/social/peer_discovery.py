@@ -1009,7 +1009,21 @@ class GossipProtocol:
             # rows; random so unrevivable rows cannot starve the rotation.
             dead_ids = [r[0] for r in db.query(PeerNode.id)
                         .filter(PeerNode.status == 'dead').all()]
-            for _id in random.sample(dead_ids, min(5, len(dead_ids))):
+            _revive = random.sample(dead_ids, min(5, len(dead_ids)))
+            # A seed's own row is re-probed EVERY round, not by lottery: the
+            # gossip round talks to central each round, yet central's row,
+            # aged out while this node was offline, waited on the random
+            # sample.  Measured on the owner's desktop 2026-10-04: 3,016 dead
+            # rows, 6 of them central, central 'dead' two hours into a boot
+            # during which every gossip exchange with it succeeded, so the
+            # node admitted 0 peers.
+            _seeds = getattr(self, 'seed_peers', None) or []
+            if _seeds:
+                _seed_urls = [u.rstrip('/') for u in _seeds]
+                _revive += [r[0] for r in db.query(PeerNode.id).filter(
+                    PeerNode.status == 'dead', PeerNode.url.in_(_seed_urls)
+                ).all() if r[0] not in _revive]
+            for _id in _revive:
                 if not self._running:
                     break
                 peer = db.query(PeerNode).filter(PeerNode.id == _id).first()

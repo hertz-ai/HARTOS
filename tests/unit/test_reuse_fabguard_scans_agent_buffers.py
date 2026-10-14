@@ -31,16 +31,45 @@ class ReuseFabGuardScansAgentBuffers(unittest.TestCase):
         self.src = open(SRC, encoding='utf-8').read()
         self.tree = ast.parse(self.src)  # also proves the module still parses
 
+    # The two checks below were text anchors on the lines that read the
+    # lists.  That definition moved to lifecycle_hooks.evidence_sources (#162,
+    # one definition for REUSE and CREATE), so a text anchor here would go on
+    # naming the wrong file.  Pinned behaviourally through the real gate.
+    TOOL = 'google_search'
+    RESULT = {'role': 'tool', 'name': 'google_search', 'tool_call_id': 'c1',
+              'content': '3 results found'}
+
+    def _unrun(self, group_messages, agent):
+        from hartos import reuse_recipe as rr
+        from tests.unit.test_fab_guard_counts_real_execution import (
+            _GroupChat, _Task)
+        key = 'u1_p1'
+        rr.user_tasks[key] = _Task(f'Run {self.TOOL} to find the news')
+        try:
+            return rr._reuse_fabricated_tools(
+                key, 1, _GroupChat(group_messages), [agent])
+        finally:
+            rr.user_tasks.pop(key, None)
+
     def test_scans_agent_oai_messages(self):
-        self.assertIn("getattr(ag, '_oai_messages', None)", self.src,
-                      "the fab-guard executed-detection must read each agent's "
-                      "_oai_messages buffer (where tool activity actually lands "
-                      "in the reuse flow), not only group_chat.messages")
+        from tests.unit.test_fab_guard_counts_real_execution import _Agent
+        agent = _Agent([self.TOOL], conv={'ChatInstructor': [self.RESULT]})
+        self.assertEqual(
+            self._unrun([], agent), [],
+            "a result held ONLY in an agent's _oai_messages buffer (where tool "
+            "activity actually lands in the reuse flow) must clear the tool")
 
     def test_still_scans_group_chat(self):
-        self.assertIn("getattr(group_chat, 'messages', None)", self.src,
-                      "the group-chat log must still be scanned (union, not "
-                      "replacement)")
+        from tests.unit.test_fab_guard_counts_real_execution import _Agent
+        self.assertEqual(
+            self._unrun([self.RESULT], _Agent([self.TOOL])), [],
+            "the group-chat log must still be scanned (union, not "
+            "replacement)")
+
+    def test_no_result_in_either_list_leaves_the_tool_unrun(self):
+        """Control: the two checks above can fail."""
+        from tests.unit.test_fab_guard_counts_real_execution import _Agent
+        self.assertEqual(self._unrun([], _Agent([self.TOOL])), [self.TOOL])
 
     def test_still_keyed_on_specific_function_name(self):
         """Never "any tool ran" — the executed set is keyed by tool NAME.

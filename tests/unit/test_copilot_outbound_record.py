@@ -54,6 +54,7 @@ import pytest  # noqa: E402
 import core.llm_outbound_logger as outbound  # noqa: E402
 import integrations.coding_agent.claude_code_backend as cc  # noqa: E402
 from core.circuit_breaker import CircuitState, llm_provider_breaker
+from core.subprocess_safe import BoundedResult
 
 
 @pytest.fixture(autouse=True)
@@ -84,17 +85,14 @@ def _records(log_path):
 
 
 def _run(stdout='ok', stderr='', rc=0):
-    class _P:
-        pass
-    p = _P()
-    p.returncode, p.stdout, p.stderr = rc, stdout, stderr
-    return p
+    """What the bounded runner hands back for a run that completed."""
+    return BoundedResult(rc, stdout, stderr)
 
 
 # ── the record ──────────────────────────────────────────────────────────────
 
 def test_every_invoke_writes_one_outbound_record(_desktop):
-    with patch('subprocess.run', return_value=_run('4')):
+    with patch.object(cc, 'run_bounded', return_value=_run('4')):
         r = cc.invoke_claude('2+2?', mode='inference', system='answer tersely')
     assert r['ok']
     recs = _records(_desktop)
@@ -111,7 +109,7 @@ def test_every_invoke_writes_one_outbound_record(_desktop):
 
 
 def test_a_failure_to_run_is_recorded_by_its_category(_desktop):
-    with patch('subprocess.run', side_effect=FileNotFoundError('gone')):
+    with patch.object(cc, 'run_bounded', side_effect=FileNotFoundError('gone')):
         r = cc.invoke_claude('q', mode='inference')
     assert r['ok'] is False and r['category'] == 'notfound'
     rec = _records(_desktop)[-1]
@@ -120,7 +118,7 @@ def test_a_failure_to_run_is_recorded_by_its_category(_desktop):
 
 def test_the_switch_refusal_is_recorded_and_spawns_nothing(_desktop, monkeypatch):
     monkeypatch.setenv('HARTOS_COPILOT_ENABLED', '0')
-    with patch('subprocess.run', return_value=_run()) as sr:
+    with patch.object(cc, 'run_bounded', return_value=_run()) as sr:
         r = cc.invoke_claude('q', mode='inference')
     sr.assert_not_called()
     assert r['category'] == 'off'
@@ -132,7 +130,7 @@ def test_the_switch_refusal_is_recorded_and_spawns_nothing(_desktop, monkeypatch
 def test_pii_is_scrubbed_on_the_wire_and_raw_in_the_local_record(_desktop):
     prompt = 'mail the owner at sathi@example.com, card 4111 1111 1111 1111'
     system = 'you serve user 555-123-4567'
-    with patch('subprocess.run', return_value=_run()) as sr:
+    with patch.object(cc, 'run_bounded', return_value=_run()) as sr:
         cc.invoke_claude(prompt, mode='inference', system=system)
     cmd = sr.call_args[0][0]
     sent_prompt = cmd[cmd.index('-p') + 1]
@@ -152,13 +150,13 @@ def test_pii_is_scrubbed_on_the_wire_and_raw_in_the_local_record(_desktop):
 
 def test_a_refusal_records_no_egress(_desktop, monkeypatch):
     monkeypatch.setenv('HARTOS_COPILOT_ENABLED', '0')
-    with patch('subprocess.run', return_value=_run()):
+    with patch.object(cc, 'run_bounded', return_value=_run()):
         cc.invoke_claude('q', mode='inference')
     assert _records(_desktop)[-1]['body']['egress'] == 'none'
 
 
 def test_agentic_runs_are_scrubbed_too(_desktop):
-    with patch('subprocess.run', return_value=_run()) as sr:
+    with patch.object(cc, 'run_bounded', return_value=_run()) as sr:
         cc.invoke_claude('ping 203.0.113.9 and mail a@b.io', mode='agentic', cwd='/repo')
     sent = sr.call_args[0][0][-1]
     assert 'a@b.io' not in sent and '203.0.113.9' not in sent
@@ -166,7 +164,7 @@ def test_agentic_runs_are_scrubbed_too(_desktop):
 
 def test_no_redactor_means_no_egress(_desktop, caplog):
     with patch.dict(sys.modules, {'security.dlp_engine': None}), \
-            patch('subprocess.run', return_value=_run()) as sr:
+            patch.object(cc, 'run_bounded', return_value=_run()) as sr:
         r = cc.invoke_claude('q', mode='inference')
     sr.assert_not_called()
     assert r['ok'] is False and r['category'] == 'other'
@@ -188,12 +186,12 @@ def _client():
 
 def test_auth_failures_trip_the_claude_breaker_and_the_shim_refuses_fast(_desktop):
     login = _run('', 'Error: not logged in. Please run /login', rc=1)
-    with patch('subprocess.run', return_value=login):
+    with patch.object(cc, 'run_bounded', return_value=login):
         for _ in range(llm_provider_breaker._threshold):
             r = cc.invoke_claude('q', mode='inference')
             assert cc.classify_failure(r) == 'auth'
     assert llm_provider_breaker.state(cc.CLAUDE_CODE_PROVIDER_KEY) is CircuitState.OPEN
-    with patch('subprocess.run', return_value=_run()) as sr:
+    with patch.object(cc, 'run_bounded', return_value=_run()) as sr:
         resp = _client().post('/api/claude/v1/chat/completions',
                               json={'messages': [{'role': 'user', 'content': 'q'}]})
     sr.assert_not_called()
@@ -207,13 +205,13 @@ def test_auth_failures_trip_the_claude_breaker_and_the_shim_refuses_fast(_deskto
 def test_a_success_closes_the_claude_breaker(_desktop):
     for _ in range(llm_provider_breaker._threshold - 1):
         llm_provider_breaker.record_failure(cc.CLAUDE_CODE_PROVIDER_KEY)
-    with patch('subprocess.run', return_value=_run('fine')):
+    with patch.object(cc, 'run_bounded', return_value=_run('fine')):
         cc.invoke_claude('q', mode='inference')
     assert llm_provider_breaker.state(cc.CLAUDE_CODE_PROVIDER_KEY) is CircuitState.CLOSED
 
 
 def test_a_non_auth_failure_does_not_count_against_the_breaker(_desktop):
-    with patch('subprocess.run', return_value=_run('', '529 overloaded', rc=1)):
+    with patch.object(cc, 'run_bounded', return_value=_run('', '529 overloaded', rc=1)):
         for _ in range(llm_provider_breaker._threshold + 1):
             cc.invoke_claude('q', mode='inference')
     assert llm_provider_breaker.state(cc.CLAUDE_CODE_PROVIDER_KEY) is CircuitState.CLOSED
@@ -222,7 +220,7 @@ def test_a_non_auth_failure_does_not_count_against_the_breaker(_desktop):
 # ── the shim joins the caller's record ──────────────────────────────────────
 
 def test_the_shim_binds_the_callers_request_id_to_the_record(_desktop):
-    with patch('subprocess.run', return_value=_run('the answer')):
+    with patch.object(cc, 'run_bounded', return_value=_run('the answer')):
         resp = _client().post('/api/claude/v1/chat/completions',
                               json={'messages': [{'role': 'user', 'content': 'q'}]},
                               headers={'X-HARTOS-Request-ID': 'daemon_goal_abc'})

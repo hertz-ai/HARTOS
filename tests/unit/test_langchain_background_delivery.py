@@ -289,6 +289,41 @@ class TestLocalDispatch:
                 local, 'tell me a story', 'u', 'pid', 'general', None)
         assert out == 'collapsed answer'
         post.assert_called_once()
+
+    def test_local_non_bundled_honors_channel_agent_timeout_env_var(
+            self, monkeypatch):
+        """Found live 2026-08-31: this re-entrant /chat call hardcoded
+        timeout=60, but it runs the SAME full multi-agent turn as any
+        other channel's /chat call, which routinely takes well over 60s
+        locally — the future completed "cleanly" (no exception, no log)
+        exactly 60.0s after starting, silently discarding a real answer
+        that was still generating. Must honor the same
+        HEVOLVE_CHANNEL_AGENT_TIMEOUT every other channel already does."""
+        monkeypatch.delenv('NUNBA_BUNDLED', raising=False)
+        monkeypatch.setattr(sys, 'frozen', False, raising=False)
+        monkeypatch.setenv('HEVOLVE_CHANNEL_AGENT_TIMEOUT', '300')
+
+        from integrations.agent_engine.speculative_dispatcher import (
+            SpeculativeDispatcher,
+        )
+        from integrations.agent_engine.model_registry import (
+            ModelRegistry, ModelBackend, ModelTier,
+        )
+        d = SpeculativeDispatcher(model_registry=ModelRegistry())
+        local = ModelBackend(
+            model_id='qwen-4b-local', display_name='4B', tier=ModelTier.FAST,
+            config_list_entry={
+                'model': 'qwen-4b', 'api_key': 'k',
+                'base_url': 'http://127.0.0.1:8080/v1',
+            },
+            is_local=True,
+        )
+        fake_resp = MagicMock(status_code=200)
+        fake_resp.json.return_value = {'response': 'collapsed answer'}
+        with patch('requests.post', return_value=fake_resp) as post:
+            d._dispatch_expert_langchain(
+                local, 'tell me a story', 'u', 'pid', 'general', None)
+        assert post.call_args.kwargs['timeout'] == 300
         body = post.call_args.kwargs['json']
         # Re-entry guard: inner /chat reads these and skips dispatcher
         assert body['speculative'] is False
@@ -471,6 +506,71 @@ class TestCollapsedPathDelivery:
                 'u', 'pid', None, 'general')
         assert rec.call_args.kwargs['escalation_reason'] == 'refusal_override'
 
+
+# ─────────────────────────────────────────────────────────────────────
+# _deliver_expert_response — a failed expert turn must not leak its raw
+# internal error string to the user (2026-08-31: found live on Signal —
+# a malformed tool-call from the local model 500'd, and the literal
+# "Error getting response: Error code: 500 - {...}" was delivered to the
+# channel as if it were the real answer, landing right after the standby
+# and reading as a second, broken reply).
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestExpertChannelLeg:
+    """The expert's answer reaches the messaging channel the turn came from.
+
+    Legs 1-2 of _deliver_expert_response are UI-only (SSE + TTS); a Discord
+    or Slack user used to see only the draft standby.  The third leg hands
+    the answer to ChannelResponseRouter.deliver_to_chat, the one path from a
+    worker thread to an adapter.
+    """
+
+    @staticmethod
+    def _deliver(dispatcher, spec, entry, monkeypatch):
+        import core.safe_hartos_attr as sha
+        import integrations.channels.response.router as router_mod
+        monkeypatch.setattr(sha, 'safe_hartos_attr', lambda name: None)
+        router = MagicMock()
+        monkeypatch.setattr(router_mod, 'get_response_router', lambda: router)
+        with dispatcher._lock:
+            dispatcher._active[spec] = entry
+        dispatcher._deliver_expert_response('u', 'pid', spec, 'the answer')
+        return router
+
+    def test_answer_is_delivered_to_the_originating_chat(
+            self, dispatcher, monkeypatch):
+        router = self._deliver(dispatcher, 'spec-ch', {
+            'channel_context': {'channel': 'discord', 'chat_id': 'c1'},
+            'started_at': 0}, monkeypatch)
+        router.deliver_to_chat.assert_called_once_with(
+            'discord', 'c1', 'the answer')
+
+    def test_no_channel_context_means_no_channel_send(
+            self, dispatcher, monkeypatch):
+        router = self._deliver(dispatcher, 'spec-ui',
+                               {'started_at': 0}, monkeypatch)
+        router.deliver_to_chat.assert_not_called()
+
+    def test_channel_context_is_captured_on_the_request_thread(
+            self, dispatcher, monkeypatch):
+        """Thread-locals do not cross the pool boundary, so the context must
+        be read (from hartos.threadlocal) before the task is submitted."""
+        from hartos.threadlocal import thread_local_data
+        monkeypatch.setattr(dispatcher._expert_pool, 'submit', MagicMock())
+        ctx = {'channel': 'slack', 'chat_id': 'C9'}
+        thread_local_data.set_channel_context(ctx)
+        try:
+            expert = dispatcher._registry.get_fast_model()
+            scheduled = dispatcher._schedule_expert_background(
+                speculation_id='spec-cap', prompt='p', fast_response='f',
+                expert_model=expert, user_id='u', prompt_id='pid',
+                goal_id=None, goal_type='general', origin_model_id='draft')
+        finally:
+            thread_local_data.clear_channel_context()
+        if not scheduled:
+            pytest.skip('expert refused by a scheduling guard in this env')
+        assert dispatcher._active['spec-cap']['channel_context'] == ctx
 
 # ─────────────────────────────────────────────────────────────────────
 # The expert's reply is spoken once, as the user's turn's avatar

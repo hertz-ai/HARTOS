@@ -62,6 +62,17 @@ class TestDaemonAuthHeaders(unittest.TestCase):
                                  'Bearer fake.jwt.token')
                 self.assertNotIn('X-API-Key', headers)
 
+    def test_daemon_keeps_admin_and_a_relay_can_mint_a_user(self):
+        dispatch = self._import()
+        with patch.dict(os.environ, {'HEVOLVE_API_KEY': ''}, clear=False):
+            with patch('integrations.social.auth.generate_jwt',
+                       return_value='t') as mint:
+                dispatch._internal_auth_headers()
+                self.assertEqual(mint.call_args.kwargs['role'], 'admin')
+                dispatch._internal_auth_headers(user_id='u1', role='user')
+                self.assertEqual(mint.call_args.kwargs['role'], 'user')
+                self.assertEqual(mint.call_args.kwargs['user_id'], 'u1')
+
 
 class TestPhonePeGateway(unittest.TestCase):
     def _import(self):

@@ -1,207 +1,183 @@
 /*
- * Behavioural tests for the NON-LOCKOUT + keyboard-navigation logic in
- * hartOnboarding.js (#134: a dead pointer must never lock the user out of the
- * full-screen onboarding overlay).
+ * Behavioural tests for hartOnboarding.js: the first-run overlay that hosts
+ * Nunba's own "Light Your HART" ceremony (2026-10-12), and its NON-LOCKOUT
+ * contract (#134: a dead pointer must never lock the user out of a full-screen
+ * overlay).
  *
- * Drives the REAL static module through a tiny dependency-free DOM shim (CI here
- * has no jsdom) and asserts OBSERVABLE behaviour:
- *   [1] an actionable Skip control is rendered in the overlay (not just the static
- *       "Press Esc to skip" text), focus is pulled INTO the modal on open (onto
- *       the first option), Tab / Shift+Tab CYCLE focus among the overlay's own
- *       controls (a focus trap — never escaping into the hidden desktop) with
- *       preventDefault called, and Esc finishes (the never-trap hatch).
- *   [2] clicking the Skip control finishes (closes) the overlay — the same exit
- *       path Esc uses.
- *
- * The shim adds focus()/document.activeElement/setAttribute + a document-level
- * keydown dispatcher on top of the companion test's pattern, and uses a
- * synchronous-thenable fetch + synchronous requestAnimationFrame so the render +
- * focus run inline and can be asserted deterministically.
+ * Drives the REAL static module through the shared DOM shim
+ * (shell_dom_shim.mjs; CI here has no jsdom) and asserts OBSERVABLE behaviour:
+ *   [1] with Nunba up and no seal, the overlay opens with Nunba's /local page
+ *       in a frame, an actionable Skip control, focus pulled onto it, a Tab
+ *       trap between the Skip control and the frame, and Esc finishing
+ *   [2] clicking Skip finishes through the same exit path
+ *   [3] Nunba's own gate (localStorage hart_sealed) decides: sealed -> nothing
+ *       is asked, not even the status route
+ *   [4] the seal written by Nunba's frame (the storage event) closes the overlay
+ *   [5] Nunba's nunba:onboarding message closes it, and only from the frame
+ *   [6] Nunba not up (companion_ready false) -> no overlay, a bounded reprobe
+ *   [7] the owner's seal on record (onboarded true) -> no overlay
+ *   [8] the poll under the storage event closes the overlay too
  *
  * Run:  node tests/unit/test_onboarding_skip_keyboard.mjs
  */
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import vm from 'node:vm';
+import { makeRealm, mkEv } from './shell_dom_shim.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const STATIC = join(HERE, '..', '..', 'integrations', 'agent_engine', 'static');
 const SRC = readFileSync(join(STATIC, 'hartOnboarding.js'), 'utf8');
+const ORIGIN = 'http://127.0.0.1:6800';
 
 let failures = 0;
 function ok(c, m) { if (c) { console.log('  OK   ' + m); } else { failures++; console.log(' FAIL  ' + m); } }
 function eq(a, b, m) { ok(a === b, m + '  (got ' + JSON.stringify(a) + ', want ' + JSON.stringify(b) + ')'); }
 
+// A synchronous thenable so fetch().then(...).then(...) resolves inline.
 function sync(v) {
   function isThen(x) { return x && typeof x.then === 'function'; }
   return { then(cb) { var r = cb ? cb(v) : v; return isThen(r) ? r : sync(r); }, catch() { return this; } };
 }
 
-function makeRealm() {
-  const registry = {};
-  const timers = [];
-  const state = { active: null };
-  function makeEl(tag) {
-    const el = {
-      tagName: (tag || 'div').toUpperCase(),
-      _kids: [], _listeners: {}, _innerHTML: '', _attrs: {},
-      style: {}, textContent: '', type: '', parentNode: null,
-      classList: {
-        _s: new Set(),
-        add(c) { this._s.add(c); }, remove(c) { this._s.delete(c); },
-        contains(c) { return this._s.has(c); }
-      },
-      get innerHTML() { return this._innerHTML; },
-      set innerHTML(v) { this._innerHTML = v; this._kids = []; },
-      get children() { return this._kids; },
-      appendChild(c) { c.parentNode = el; this._kids.push(c); return c; },
-      insertBefore(node, ref) {
-        node.parentNode = el;
-        const i = this._kids.indexOf(ref);
-        if (i < 0) this._kids.push(node); else this._kids.splice(i, 0, node);
-        return node;
-      },
-      addEventListener(t, fn) { (this._listeners[t] = this._listeners[t] || []).push(fn); },
-      dispatch(t, ev) { (this._listeners[t] || []).slice().forEach(fn => fn(ev || {})); },
-      setAttribute(k, v) { this._attrs[k] = v; },
-      // The real DOM contract this guards: focus() moves document.activeElement.
-      focus() { state.active = el; },
-      // No querySelector on the shim -> the driver's legacy-hint hide path is
-      // exercised as a guarded no-op (which is the real WebKitGTK-safe behaviour).
-      get className() { return this._className || ''; },
-      set className(v) { this._className = v; },
-      get id() { return this._id || ''; },
-      set id(v) { this._id = String(v); }
-    };
-    return el;
-  }
-  const document = {
-    readyState: 'complete', documentElement: makeEl('html'), _listeners: {},
-    createElement: (t) => makeEl(t),
-    getElementById(id) { return registry[id] || null; },
-    addEventListener(t, fn) { (this._listeners[t] = this._listeners[t] || []).push(fn); },
-    get activeElement() { return state.active; }
-  };
-  function reg(id) { const e = makeEl('div'); e.id = id; registry[id] = e; return e; }
-  function fireKey(key, opts) {
-    let prevented = false;
-    const ev = {
-      key: key,
-      shiftKey: !!(opts && opts.shiftKey),
-      preventDefault() { prevented = true; }
-    };
-    (document._listeners.keydown || []).slice().forEach(fn => fn(ev));
-    return prevented;
-  }
-  const sandbox = {
-    document, console, JSON,
-    setTimeout: (fn) => { timers.push(fn); return timers.length; },
-    clearTimeout() {},
-    requestAnimationFrame: (fn) => { fn(); return 1; },
-    HartTimeoutSignal: () => null
-  };
-  sandbox.window = sandbox;
-  vm.createContext(sandbox);
-  return {
-    sandbox, document, registry, reg, timers, fireKey,
-    activeEl() { return state.active; },
-    step() { if (timers.length) { timers.shift()(); return true; } return false; }
-  };
-}
-
-function walk(el, pred) {
-  if (!el) return null;
-  if (pred(el)) return el;
-  for (const k of (el._kids || [])) { const r = walk(k, pred); if (r) return r; }
-  return null;
-}
-function byClass(el, cls) { return walk(el, (e) => ((e._className || '').split(' ').indexOf(cls) >= 0)); }
-function byText(el, txt) { return walk(el, (e) => e.textContent === txt); }
-function isDescendant(root, node) { return !!walk(root, (e) => e === node); }
-
-// A realm whose /start lands on an OPTIONS screen (the language phase renders a
-// button per language synchronously), so focus-first-option + Tab cycling are
-// observable without stepping the typeLines timer.
-function setup() {
+function setup(status, opts) {
+  opts = opts || {};
   const R = makeRealm();
-  const overlay = R.reg('hart-onboarding');
-  const name = R.reg('hart-onboarding-name');
-  const narr = R.reg('hart-onboarding-narr');
-  const opts = R.reg('hart-onboarding-opts');
-  overlay.appendChild(name); overlay.appendChild(narr); overlay.appendChild(opts);
-
+  const overlay = R.el('hart-onboarding');
+  const fetched = [];
+  R.sandbox.location = { origin: ORIGIN };
   R.sandbox.fetch = function (url) {
-    let resp = {};
-    if (url.indexOf('/api/onboarding/status') >= 0) resp = { onboarded: false };
-    else if (url.indexOf('/api/onboarding/start') >= 0) {
-      resp = { phase: 'language', language_prompt: { en: 'English', es: 'Espanol' } };
-    } else resp = {};
-    return sync({ json: () => sync(resp) });
+    fetched.push(String(url));
+    return sync({ json: () => sync(status) });
   };
-  return { R, overlay, name, narr, opts };
+  if (opts.sealed) R.sandbox.localStorage.setItem('hart_sealed', 'true');
+  R.run(SRC, 'hartOnboarding.js');
+  return { R, overlay, fetched,
+    frame() { return overlay.querySelector('.hob-frame'); },
+    skip() { return overlay.querySelector('.hob-skip-btn'); },
+    key(key, extra) { return R.document.dispatch('keydown', mkEv(R.document.body, Object.assign({ key }, extra || {}))); },
+    open() { return overlay.classList.contains('open'); },
+    active() { return R.docEl.classList.contains('onboarding-active'); } };
 }
 
-// ── [1] Skip control + focus-into-modal + Tab focus-trap + Esc ──────────────
-(function navTrap() {
-  console.log('\n[1] non-lockout: visible Skip, focus into modal, Tab trap, Esc finishes');
-  const E = setup();
-  vm.runInContext(SRC, E.R.sandbox, { filename: 'hartOnboarding.js' });
+// ── [1] Nunba's page in a frame, Skip control, focus, Tab trap, Esc ────────
+(function hostsNunba() {
+  console.log('\n[1] with Nunba up and no seal: Nunba\'s page is hosted, Skip + Esc never trap');
+  const E = setup({ onboarded: false, companion_ready: true });
+  ok(E.fetched.length === 1 && E.fetched[0].indexOf('/api/onboarding/status') >= 0, 'asked the status route once');
+  ok(E.fetched[0].indexOf('user_id=') < 0, 'no hard-coded user_id: the server names the desktop owner');
+  ok(E.open(), 'overlay shown');
+  ok(E.active(), 'onboarding-active set on <html> (hartSessionUI reads it)');
 
-  ok(E.overlay.classList.contains('open'), 'overlay shown after /start returns content');
+  const f = E.frame();
+  ok(!!f && f.tagName === 'IFRAME', 'Nunba\'s page is mounted in an <iframe class="hob-frame">');
+  eq(f && f.src, '/local', 'the frame points at Nunba\'s /local (its first-run state is the ceremony)');
+  ok(!!f && f.getAttribute('allow') && f.getAttribute('allow').indexOf('microphone') >= 0, 'the frame may use the mic (the ceremony speaks and listens)');
 
-  // A real, actionable Skip control exists in the overlay (a <button>, NOT in the
-  // options row) — the visible Skip the static "Press Esc to skip" text lacked.
-  const skip = byClass(E.overlay, 'hob-skip-btn');
-  ok(!!skip, 'an actionable Skip control (.hob-skip-btn) is rendered in the overlay');
-  ok(skip && skip.tagName === 'BUTTON', 'the Skip control is a native <button> (Enter-activatable)');
+  const skip = E.skip();
+  ok(!!skip && skip.tagName === 'BUTTON', 'an actionable Skip control (.hob-skip-btn) is a native <button>');
   eq(skip && skip.textContent, 'Skip setup', 'the Skip control is visibly labelled');
-  ok(!isDescendant(E.opts, skip), 'the Skip control is NOT inside the options row (always present, every screen)');
-  ok(!!byText(E.overlay, 'Esc to skip'), 'an "Esc to skip" hint is shown');
+  ok(!!overlayText(E.overlay, 'Esc to skip'), 'an "Esc to skip" hint is shown');
+  ok(E.R.state.active === skip, 'focus pulled INTO the modal onto the Skip control (a dead pointer can drive it)');
 
-  // The language phase rendered two option buttons; focus was pulled onto the FIRST.
-  const en = byText(E.opts, 'English');
-  const es = byText(E.opts, 'Espanol');
-  ok(!!en && !!es, 'language options rendered');
-  ok(E.R.activeEl() === en, 'focus moved INTO the modal onto the first option (dead-pointer can drive it)');
+  // Tab cycles Skip -> frame -> Skip, with preventDefault, never the desktop behind.
+  let ev = E.key('Tab');
+  ok(ev.defaultPrevented, 'Tab calls preventDefault (focus stays trapped)');
+  ok(E.R.state.active === f, 'Tab from Skip moves focus INTO Nunba\'s frame');
+  ev = E.key('Tab');
+  ok(E.R.state.active === skip, 'Tab from the frame returns to the Skip control (the trap)');
+  ev = E.key('Tab', { shiftKey: true });
+  ok(E.R.state.active === f, 'Shift+Tab also moves between the two stops');
 
-  // Tab forward cycles option1 -> option2 -> skip -> wraps to option1, never
-  // leaving the overlay (the focus trap), and preventDefault is called each time.
-  let p = E.R.fireKey('Tab', {});
-  ok(p, 'Tab calls preventDefault (focus stays trapped in the modal)');
-  ok(E.R.activeEl() === es, 'Tab moves focus to the second option');
-  ok(isDescendant(E.overlay, E.R.activeEl()), 'focus stays inside the overlay');
-
-  E.R.fireKey('Tab', {});
-  ok(E.R.activeEl() === skip, 'Tab reaches the Skip control');
-
-  E.R.fireKey('Tab', {});
-  ok(E.R.activeEl() === en, 'Tab WRAPS from Skip back to the first option (trap, never escapes)');
-
-  // Shift+Tab goes backward (and wraps).
-  E.R.fireKey('Tab', { shiftKey: true });
-  ok(E.R.activeEl() === skip, 'Shift+Tab wraps backward from the first option to Skip');
-
-  // Esc is the never-trap hatch — it finishes regardless of where focus is.
-  E.R.fireKey('Escape', {});
-  ok(!E.overlay.classList.contains('open'), 'Esc finishes (closes) the overlay');
-  ok(!E.R.document.documentElement.classList.contains('onboarding-active'),
-     'Esc clears the onboarding-active flag (desktop interactive again)');
+  E.key('Escape');
+  ok(!E.open(), 'Esc finishes (closes) the overlay');
+  ok(!E.active(), 'Esc clears onboarding-active (desktop interactive again)');
+  ok(!E.frame(), 'the frame is dropped on finish (the assistant panel is the one chat from here)');
 })();
 
-// ── [2] clicking the Skip control finishes (same exit path as Esc) ──────────
+// ── [2] clicking Skip finishes (same exit path as Esc) ─────────────────────
 (function skipClick() {
   console.log('\n[2] clicking Skip finishes the overlay (reuses finish())');
-  const E = setup();
-  vm.runInContext(SRC, E.R.sandbox, { filename: 'hartOnboarding.js' });
-  ok(E.overlay.classList.contains('open'), 'overlay open before Skip');
-  const skip = byClass(E.overlay, 'hob-skip-btn');
-  ok(!!skip, 'Skip control present');
-  skip.dispatch('click', {});
-  ok(!E.overlay.classList.contains('open'), 'clicking Skip closed the overlay');
-  ok(!E.R.document.documentElement.classList.contains('onboarding-active'),
-     'Skip clears the onboarding-active flag');
+  const E = setup({ onboarded: false, companion_ready: true });
+  ok(E.open(), 'overlay open before Skip');
+  E.skip().click();
+  ok(!E.open() && !E.active(), 'clicking Skip closed the overlay and cleared the flag');
 })();
+
+// ── [3] Nunba's own gate decides ───────────────────────────────────────────
+(function sealedGate() {
+  console.log('\n[3] localStorage hart_sealed=true (Nunba\'s gate): no ceremony, nothing asked');
+  const E = setup({ onboarded: false, companion_ready: true }, { sealed: true });
+  ok(!E.open(), 'overlay never opens for a sealed person');
+  eq(E.fetched.length, 0, 'the status route is not even asked: the flag is the same truth Nunba reads');
+})();
+
+// ── [4] the storage event from Nunba's frame closes it ─────────────────────
+(function storageEvent() {
+  console.log('\n[4] Nunba\'s frame writes hart_sealed: the storage event closes the overlay');
+  const E = setup({ onboarded: false, companion_ready: true });
+  ok(E.open(), 'open');
+  E.R.window.dispatch('storage', { key: 'nunba_media_mode' });
+  ok(E.open(), 'an unrelated key changing does nothing');
+  E.R.sandbox.localStorage.setItem('hart_sealed', 'true');
+  E.R.window.dispatch('storage', { key: 'hart_sealed' });
+  ok(!E.open() && !E.active(), 'hart_sealed=true -> finished');
+})();
+
+// ── [5] nunba:onboarding, from the frame only ──────────────────────────────
+(function sealedMessage() {
+  console.log('\n[5] nunba:onboarding {state:sealed} from the frame closes the overlay; other sources/origins do not');
+  const E = setup({ onboarded: false, companion_ready: true });
+  const f = E.frame();
+  f.contentWindow = { id: 'nunba-frame' };
+  const msg = (extra) => Object.assign({ origin: ORIGIN, source: f.contentWindow, data: { type: 'nunba:onboarding', state: 'sealed' } }, extra || {});
+  E.R.window.dispatch('message', msg({ origin: 'https://attacker.example' }));
+  ok(E.open(), 'a foreign origin is ignored');
+  E.R.window.dispatch('message', msg({ source: { id: 'some-other-window' } }));
+  ok(E.open(), 'another window of our origin (the assistant panel) is ignored');
+  E.R.window.dispatch('message', msg({ data: { type: 'nunba:turn', state: 'done' } }));
+  ok(E.open(), 'another nunba: message type is ignored');
+  E.R.window.dispatch('message', msg());
+  ok(!E.open() && !E.active(), 'the frame\'s own nunba:onboarding sealed -> finished');
+})();
+
+// ── [6] Nunba not up: no overlay, bounded reprobe ──────────────────────────
+(function nunbaDown() {
+  console.log('\n[6] companion_ready=false: never show a page that cannot load; reprobe later');
+  const E = setup({ onboarded: false, companion_ready: false });
+  ok(!E.open(), 'overlay stays closed');
+  ok(E.R.timers.length >= 1 && E.R.timers.some((t) => t.ms === 5000), 'a 5 s reprobe is queued');
+  // Nunba comes up: the reprobe shows it.
+  E.R.sandbox.fetch = () => sync({ json: () => sync({ onboarded: false, companion_ready: true }) });
+  E.R.flushTimers();
+  ok(E.open(), 'once Nunba answers, the ceremony is hosted');
+})();
+
+// ── [7] the owner's seal on record ─────────────────────────────────────────
+(function sealOnRecord() {
+  console.log('\n[7] onboarded=true from the server: no overlay');
+  const E = setup({ onboarded: true, companion_ready: true });
+  ok(!E.open(), 'a sealed owner never sees the ceremony again');
+  eq(E.R.timers.length, 0, 'and nothing is re-asked');
+})();
+
+// ── [8] the poll under the storage event ───────────────────────────────────
+(function pollFloor() {
+  console.log('\n[8] the 2 s poll closes the overlay when the flag flips without an event');
+  const E = setup({ onboarded: false, companion_ready: true });
+  ok(E.R.intervals.some((i) => i.ms === 2000), 'a 2 s poll runs while the overlay is open');
+  E.R.tick();
+  ok(E.open(), 'unsealed: still open after a tick');
+  E.R.sandbox.localStorage.setItem('hart_sealed', 'true');
+  E.R.tick();
+  ok(!E.open(), 'sealed: the poll finished the overlay');
+})();
+
+function overlayText(root, txt) {
+  const out = [];
+  (function walk(n) { for (const k of n._kids || []) { if (k.textContent === txt) out.push(k); walk(k); } })(root);
+  return out[0] || null;
+}
 
 console.log(failures ? ('\nRESULT: ' + failures + ' FAILED') : '\nRESULT: ALL PASS');
 process.exit(failures ? 1 : 0);

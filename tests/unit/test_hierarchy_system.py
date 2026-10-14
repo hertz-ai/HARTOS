@@ -1027,6 +1027,26 @@ class TestSyncEngine:
         assert len(result['processed']) == 3
         assert len(result['errors']) == 0
 
+    def test_users_synced_without_a_handle_all_land(self, db):
+        """A handle is unique, and NULL is the 'no handle' every other user
+        creator leaves: users synced without one (no key, or an empty one)
+        each get NULL, so the second is not refused as a duplicate of the
+        first's handle."""
+        from integrations.social.models import User
+        from integrations.social.sync_engine import SyncEngine
+        ids = [f'sync-nohandle-{uuid.uuid4().hex[:8]}' for _ in range(3)]
+        payloads = [{'user_id': ids[0], 'username': ids[0]},
+                    {'user_id': ids[1], 'username': ids[1], 'handle': ''},
+                    {'user_id': ids[2], 'username': ids[2], 'handle': ''}]
+        result = SyncEngine.receive_sync_batch(db, [
+            {'id': f'q-{p["user_id"]}', 'operation_type': 'sync_user', 'payload': p}
+            for p in payloads])
+        db.flush()
+        assert result['errors'] == []
+        rows = db.query(User).filter(User.id.in_(ids)).all()
+        assert sorted(r.id for r in rows) == sorted(ids)
+        assert [r.handle for r in rows] == [None, None, None]
+
     def test_is_connected_to_success(self):
         from integrations.social.sync_engine import SyncEngine
         # SyncEngine.is_connected_to uses pooled_get imported at module level.

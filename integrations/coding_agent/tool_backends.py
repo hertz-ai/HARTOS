@@ -1,5 +1,5 @@
 """
-Coding Agent Tool Backends — KiloCode, Claude Code, OpenCode, Aider Native.
+Coding Agent Tool Backends — KiloCode, Claude Code, OpenCode, pi, Hermes, Aider Native.
 
 Subprocess backends wrap CLI tools via subprocess. AiderNativeBackend runs
 in-process using vendored Aider modules for zero-latency code intelligence.
@@ -10,9 +10,8 @@ This is a leaf tool — never re-dispatches to /chat.
 import json
 import logging
 import os
-from core.subprocess_safe import no_window_kwargs
+from core.subprocess_safe import run_bounded
 import shutil
-import subprocess
 import time
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional
@@ -95,35 +94,20 @@ class CodingToolBackend(ABC):
                 'error': f'{self.name} not installed',
             }
 
-        cmd = self.build_command(task, context)
-        logger.info(f"Executing {self.name}: {cmd[0]} ...")
-
+        from .installer import launch_argv
         start = time.time()
         try:
-            result = subprocess.run(
+            cmd = launch_argv(self.build_command(task, context))
+            logger.info(f"Executing {self.name}: {cmd[0]} ...")
+            # run_bounded kills the whole tree on timeout (an npm tool's
+            # node child keeps the pipes open otherwise) and closes stdin so
+            # a first-run prompt cannot wait out the timeout.
+            result = run_bounded(
                 cmd,
-                capture_output=True,
-                text=True,
                 timeout=timeout,
                 env=self.get_env(),
-                cwd=context.get('working_dir') if context else None,
-             **no_window_kwargs())
-            elapsed = time.time() - start
-            parsed = self.parse_output(result.stdout, result.stderr, result.returncode)
-            parsed['tool'] = self.name
-            parsed['execution_time_s'] = round(elapsed, 2)
-            return parsed
-
-        except subprocess.TimeoutExpired:
-            elapsed = time.time() - start
-            return {
-                'success': False,
-                'output': '',
-                'tool': self.name,
-                'execution_time_s': round(elapsed, 2),
-                'error': f'Timeout after {timeout}s',
-            }
-        except (OSError, FileNotFoundError) as e:
+                cwd=context.get('working_dir') if context else None)
+        except (ValueError, OSError) as e:
             return {
                 'success': False,
                 'output': '',
@@ -131,6 +115,19 @@ class CodingToolBackend(ABC):
                 'execution_time_s': 0,
                 'error': str(e),
             }
+        elapsed = round(time.time() - start, 2)
+        if result.timed_out:
+            return {
+                'success': False,
+                'output': '',
+                'tool': self.name,
+                'execution_time_s': elapsed,
+                'error': f'Timeout after {timeout}s',
+            }
+        parsed = self.parse_output(result.stdout, result.stderr, result.returncode)
+        parsed['tool'] = self.name
+        parsed['execution_time_s'] = elapsed
+        return parsed
 
 
 class KiloCodeBackend(CodingToolBackend):
@@ -163,20 +160,66 @@ class KiloCodeBackend(CodingToolBackend):
 
 
 class ClaudeCodeBackend(CodingToolBackend):
-    """Claude Code CLI wrapper — Proprietary (Anthropic Commercial ToS).
+    """Claude Code as a coding backend — Proprietary (Anthropic Commercial ToS).
 
-    User must install themselves and provide their own ANTHROPIC_API_KEY.
+    The user installs it and signs in themselves.  Every run starts in
+    claude_code_backend.invoke_claude, the one place a `claude -p` starts on
+    this node: the owner's copilot switch, the DLP scrub of what leaves the
+    device, the llm_outbound.jsonl record and the provider breaker are all
+    there.  This backend used to spawn claude itself, a second launcher with
+    none of them.  Measured 2026-10-05 on the owner's desktop: 23 runs in 25
+    hours while the switch was off (marker since 2026-09-16) and no outbound
+    record of any of them.
+
+    The base class's metered-key stripping (get_env, for 'hive'/'idle' task
+    sources) does not reach these runs; it never did in practice, since no
+    code sets _CURRENT_TASK_SOURCE.
     """
 
     name = 'claude_code'
     binary = 'claude'
     strengths = ['code_review', 'debugging', 'terminal_workflows', 'complex_reasoning']
 
+    #: What a coding run asks the launcher for beyond the prompt and model.
+    _EXTRA_ARGS = ('--output-format', 'json')
+
+    def is_installed(self) -> bool:
+        """MAY and CAN: the launcher's own answer (switch on, binary
+        resolves, a login exists), so the router never offers a run the
+        launcher would refuse."""
+        from .claude_code_backend import claude_code_available
+        return claude_code_available()
+
     def build_command(self, task: str, context: Optional[Dict] = None) -> List[str]:
-        cmd = [self.binary, '-p', task, '--output-format', 'json', '--print']
+        """The argv invoke_claude starts for this task (before its scrub)."""
+        cmd = [self.binary, '-p', task]
         if context and context.get('model'):
             cmd.extend(['--model', context['model']])
+        cmd.extend(self._EXTRA_ARGS)
         return cmd
+
+    def execute(self, task: str, context: Optional[Dict] = None,
+                timeout: int = 300) -> Dict:
+        """One agentic Claude Code run through invoke_claude (full tools,
+        cwd = the task's working_dir)."""
+        from .claude_code_backend import invoke_claude
+        context = context or {}
+        start = time.time()
+        run = invoke_claude(task, mode='agentic',
+                            cwd=context.get('working_dir') or None,
+                            timeout_s=timeout,
+                            model=context.get('model') or None,
+                            extra_args=list(self._EXTRA_ARGS))
+        if 'returncode' in run:      # the run completed, whatever its exit code
+            result = self.parse_output(run.get('stdout') or '',
+                                       run.get('stderr') or '', run['returncode'])
+        else:                        # refused or never ran: switch, binary, timeout
+            result = {'success': False, 'output': '',
+                      'error': run.get('error') or 'claude run failed',
+                      'category': run.get('category')}
+        result['tool'] = self.name
+        result['execution_time_s'] = round(time.time() - start, 2)
+        return result
 
     def parse_output(self, stdout: str, stderr: str, returncode: int) -> Dict:
         try:
@@ -227,6 +270,53 @@ class OpenCodeBackend(CodingToolBackend):
                 'success': returncode == 0,
                 'output': stdout or stderr,
             }
+
+
+class _PlainTextBackend(CodingToolBackend):
+    """A CLI whose one-shot mode prints the agent's final answer as text."""
+
+    def parse_output(self, stdout: str, stderr: str, returncode: int) -> Dict:
+        return {
+            'success': returncode == 0,
+            'output': stdout.strip() or stderr.strip(),
+        }
+
+
+class PiBackend(_PlainTextBackend):
+    """pi coding agent CLI — MIT (npm: @mariozechner/pi-coding-agent).
+
+    `-p/--print` runs one prompt and prints the response; `--model` takes
+    `provider/id`.  The user's own provider key or /login is used.
+    """
+
+    name = 'pi'
+    binary = 'pi'
+    strengths = ['terminal_coding', 'multi_provider', 'feature']
+
+    def build_command(self, task: str, context: Optional[Dict] = None) -> List[str]:
+        cmd = [self.binary, '-p', task]
+        if context and context.get('model'):
+            cmd.extend(['--model', context['model']])
+        return cmd
+
+
+class HermesBackend(_PlainTextBackend):
+    """Hermes Agent CLI (Nous Research) — MIT.
+
+    `hermes chat -q` runs a single non-interactive query; `-Q` keeps stdout
+    to the final reply only (no banner, spinner or tool previews);
+    `--model` takes `provider/model`.
+    """
+
+    name = 'hermes'
+    binary = 'hermes'
+    strengths = ['terminal_workflows', 'multi_provider', 'complex_reasoning']
+
+    def build_command(self, task: str, context: Optional[Dict] = None) -> List[str]:
+        cmd = [self.binary, 'chat', '-Q', '-q', task]
+        if context and context.get('model'):
+            cmd.extend(['--model', context['model']])
+        return cmd
 
 
 # Lazy import for AiderNativeBackend to avoid hard dependency
@@ -337,6 +427,8 @@ BACKENDS = {
     'kilocode': KiloCodeBackend,
     'claude_code': ClaudeCodeBackend,
     'opencode': OpenCodeBackend,
+    'pi': PiBackend,
+    'hermes': HermesBackend,
     'aider_native': _LazyAiderNative(),
     'claw_native': _LazyClaw(),
 }

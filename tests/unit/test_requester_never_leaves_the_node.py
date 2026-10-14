@@ -357,9 +357,8 @@ def test_another_nodes_handle_notifies_nobody(Session):
 
 def test_the_handle_tables_live_beside_the_coordinator_ledger(_tables):
     """The coordinator's store is a JSON ledger in its storage directory
-    (the Redis backend never builds: coordinator_backends._try_redis_backend
-    names an undefined `host`).  The handle tables are written into that same
-    directory, so they are shared exactly when the coordinator's store is."""
+    (what a node builds when no Redis answers: _create_inmemory_backend).  The
+    handle tables are written into that same directory, beside the ledger."""
     from integrations.distributed_agent.coordinator_backends import (
         _create_inmemory_backend, coordinator_storage_dir)
     coord = _create_inmemory_backend('local')

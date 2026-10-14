@@ -119,9 +119,6 @@ _IDLE_KEEP = {
     "hha-breathe": "the orb's brand aura rings: c2/c8, breathing default ON",
     "hha-halo": "the orb's brand aura halo: c2/c8, breathing default ON",
     "tbOrbBreathe": "the top-bar orb: the same orb presence, gpu-hardware only",
-    "hob-breathe": ("the onboarding orb on the Light Your HART screen: the orb, "
-                    "c2; paused by selector on webkit-flat, where it measured "
-                    "97.4 percent of a core"),
     # THE LIVING CANVAS (hartHome.css). Ambient blobs, hue drift, the orb float
     # and breathe, the ring spin and the live dots are the home's own life
     # (checklist b4/i3 audit), each on a --hart-motion-* var the user and the
@@ -266,22 +263,20 @@ def test_the_gate_still_exists():
         "the named-selector half of the gate is gone, or lost its !important")
 
 
-def test_the_onboarding_orb_is_gated():
-    """The specific regression, pinned by name.
+def test_the_onboarding_overlay_paints_no_orb_of_its_own():
+    """The regression this file was written for, by name.
 
-    `.hob-orb` is 150px with `0 0 70px` and `0 0 150px` box-shadows, scaling
-    forever, on the first screen a new user sees. It is gated because it matches
-    the gate's own criterion, not because it was shown to cause the 97.4% burn
-    measured on the node that day -- context-switch counts later showed that
-    burn to be a synchronous busy loop, not an animation. See the correction in
-    this file's module docstring.
+    `.hob-orb` was 150px with `0 0 70px` and `0 0 150px` box-shadows, scaling
+    forever, on the first screen a new user saw. Since 2026-10-12 the first-run
+    overlay hosts Nunba's own ceremony in a frame (static/hartOnboarding.js)
+    and paints nothing of its own, so the orb and its keyframe are gone rather
+    than gated. If either comes back it needs the gate again.
     """
-    gate = _gate_rule()
-    assert "body.webkit-flat .hart-onboarding .hob-orb" in gate, (
-        "the onboarding orb must be in the software-paint gate: two large "
-        "box-shadows re-rasterised per frame in software is the single most "
-        "expensive idle animation in the shell, and it runs on the FIRST "
-        "screen a new user sees")
+    assert ".hart-onboarding .hob-orb{" not in _src(), (
+        "the onboarding overlay paints an orb again; put it back in the "
+        "software-paint gate or let Nunba's page draw the ceremony")
+    assert "hob-breathe" not in _infinite_animations(), (
+        "the onboarding orb's breathing keyframe is back without its gate")
 
 
 @pytest.mark.parametrize("name", sorted(_infinite_animations()))

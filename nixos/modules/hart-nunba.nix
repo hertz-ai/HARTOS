@@ -1,4 +1,4 @@
-{ config, lib, pkgs, hartSrc ? /etc/hart, ... }:
+{ config, lib, pkgs, hartSrc ? /etc/hart, hartRev ? "unknown", ... }:
 
 # HART OS Nunba Module — the FULL Nunba (Python + React) as a NATIVE OS daemon
 #
@@ -28,7 +28,14 @@ let
   cfg = config.hart;
   # ONE package expression (the same file hart-liquid-ui.nix callPackages for the
   # NUNBA_STATIC_DIR floor) → the daemon and the floor share the SAME store path.
-  nunbaPkg = pkgs.callPackage ../packages/nunba.nix { inherit hartSrc; };
+  # hartRev rides along so the package's BUILD_INFO.txt names the HARTOS it ships in.
+  # apiBaseUrl: the origin the shell page is loaded from (hart-liquid-ui.nix's
+  # http://localhost:<port>), so the bundle's calls stay same-origin and ride
+  # the shell's proxy to this daemon (nunba.nix explains the measured CORS wall).
+  nunbaPkg = pkgs.callPackage ../packages/nunba.nix {
+    inherit hartSrc hartRev;
+    apiBaseUrl = "http://localhost:${toString config.hart.liquidUI.port}";
+  };
   # The NATIVE HARTOS tree (the SAME derivation the backend runs). Nunba's own code
   # imports HARTOS packages directly — models/catalog.py does an unguarded
   # `import integrations.service_tools.model_catalog` (→ integrations/__init__ →
@@ -80,6 +87,18 @@ in
   # ─── Options ──────────────────────────────────────────────
   options.hart.nunba = {
     enable = lib.mkEnableOption "Nunba full daemon (Python + React) as a native HART OS unix-socket service";
+
+    package = lib.mkOption {
+      type = lib.types.package;
+      default = nunbaPkg;
+      defaultText = lib.literalExpression "pkgs.callPackage ../packages/nunba.nix { inherit hartSrc hartRev; }";
+      description = ''
+        THE Nunba package every consumer uses: this daemon's ExecStart and the
+        LiquidUI static floor (hart-liquid-ui.nix NUNBA_STATIC_DIR). One call
+        site, so the store holds one Nunba tree; a second callPackage with
+        different arguments produced a second 155M tree on generation 14.
+      '';
+    };
 
     socket = lib.mkOption {
       type = lib.types.str;
@@ -175,6 +194,37 @@ in
           # Call main.py directly via the package's Python env (same pattern as
           # hart-backend.nix). main.py IS the headless server; it binds
           # unix:$HART_NUNBA_SOCKET from its existing Hypercorn/Waitress block.
+          # Seed Nunba's OWN llama config (~/.nunba/llama_config.json for the hart
+          # user) to the ONE OS LLM before every start. Measured on the Samsung
+          # node, generations 11 to 14 (2026-09-24 to 2026-10-11): the daemon's
+          # default file said first_run=true, auto_start_server=true, server_port
+          # 8080, so Nunba's LlamaConfig probed :8080, logged "UNREACHABLE via HTTP
+          # probe, queueing restart" on every watchdog tick (48 times in 30 min on
+          # gen 11), and on Nunba main 4dbde904 went on to "llama-server not found.
+          # Please install llama.cpp first" and "Nunba LLM restart RETURNED FALSE"
+          # (gen 14), all while hart-llm served on :808. The keys below are the
+          # exact shape LlamaConfig's own external-endpoint branch writes when it
+          # adopts a server (use_external_llm + external_llm_endpoint), so the
+          # daemon takes the "External LLM endpoint configured" path at init and
+          # never launches or probes a llama of its own. Merged with jq so any
+          # other key the daemon wrote survives; written as the service user.
+          ExecStartPre = pkgs.writeShellScript "hart-nunba-seed-llm" ''
+            set -eu
+            d="${cfg.dataDir}/.nunba"
+            f="$d/llama_config.json"
+            mkdir -p "$d"
+            [ -s "$f" ] || echo '{}' > "$f"
+            ${pkgs.jq}/bin/jq \
+              --arg base "http://127.0.0.1:${toString cfg.ports.llm}" \
+              --argjson port ${toString cfg.ports.llm} \
+              '. + {first_run: false, auto_start_server: false, llm_mode: "local",
+                    use_external_llm: true, server_port: $port, custom_api_base: $base,
+                    external_llm_endpoint: {name: "hart-llm", base_url: $base,
+                                            completions: ($base + "/v1/chat/completions"),
+                                            type: "openai"}}' \
+              "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+            chmod 600 "$f"
+          '';
           ExecStart = "${nunbaPkg.python}/bin/python ${nunbaPkg}/lib/nunba/main.py";
 
           Restart = "on-failure";
@@ -187,6 +237,14 @@ in
 
           # ── Security hardening (mirror hart-backend.nix) ──
           NoNewPrivileges = true;
+          # Nunba's main starts whisper_tool's streaming STT server on
+          # core.port_registry 'stt_stream', which is 801 in OS mode, a privileged
+          # port; as the unprivileged hart user it died "bind ... 801: permission
+          # denied" on every boot (gen 14 journal). Same grant hart-llm.nix makes
+          # for :808 and hart-discovery.nix for :678: exactly CAP_NET_BIND_SERVICE,
+          # bounding set tightened to it. Ambient caps coexist with NoNewPrivileges.
+          AmbientCapabilities = [ "CAP_NET_BIND_SERVICE" ];
+          CapabilityBoundingSet = [ "CAP_NET_BIND_SERVICE" ];
           ProtectSystem = "strict";
           ProtectHome = true;
           # /run/hart must be writable so main.py can create/unlink the socket under

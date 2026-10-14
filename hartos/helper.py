@@ -1548,6 +1548,109 @@ def ensure_tool_call_arguments_json(messages):
     return messages
 
 
+def has_pending_tool_calls(messages):
+    """Check if the last message contains tool calls that need execution."""
+    if not messages:
+        return False
+    last_msg = messages[-1]
+    return (last_msg.get('role') == 'assistant' and
+            'tool_calls' in last_msg and
+            last_msg['tool_calls'])
+
+
+# The pause a speaker selector asked for, kept for the TURN that asked it:
+# the thread running that turn, since autogen runs a group chat's speaker
+# selection on the thread that called initiate_chat.  Kept on the session's
+# task, it outlived its turn: a daemon turn that set it after its loop's last
+# read handed it to the session's next turn, a person's own, which answered
+# 'Paused for the user' (review of 96a9ca9f8, 2026-10-05).  Per thread,
+# another turn of the session never sees it, and clear_pause_request() starts
+# every turn with none.
+_turn_pause = threading.local()
+
+
+def yield_between_rounds(messages=None):
+    """Stop a background group chat between rounds while a person is using
+    the computer.
+
+    Owner ruling 2026-10-04 (#129).  Every speaker selector of the two
+    pipelines (create_recipe.state_transition / state_transition1,
+    reuse_recipe's four, the persona-selection chat's among them) asks this
+    FIRST.  True means: return None, which ends autogen's round (run_chat
+    breaks on NoEligibleSpeaker) before the next model call, and the turn
+    running on this thread is marked (pause_requested).  Every exit of the
+    turn loops reads the mark and answers through answer_the_pause, leaving
+    every action and ledger state exactly as it was, so the goal's next
+    dispatch -- which the daemon issues only once the gate is open -- resumes
+    the same session.  Idempotent: a second call while the person is still
+    there sets the same mark and ends the round again with no model call.
+    The question is dispatch.background_work_must_yield: a person's own turn
+    never yields to them, and a failing check never stops work.
+
+    Never between a tool call and its execution (owner, 2026-10-04): while
+    the last of ``messages`` is an unanswered tool call the round goes on,
+    so the executor answers it, and the pause lands on the next choice.
+    Ending the round there would strand the call -- the orphan that kept
+    agent 20 answering 'Processing a tool now please try later'.
+    """
+    if messages and has_pending_tool_calls(messages):
+        return False
+    try:
+        from integrations.agent_engine.dispatch import background_work_must_yield
+        if not background_work_must_yield():
+            return False
+    except Exception:
+        return False
+    _turn_pause.requested = True
+    try:
+        current_app.logger.info(
+            '[YIELD-TO-USER] a person is using this computer: ending this '
+            'chat round; the turn resumes when they are idle')
+    except Exception:
+        pass
+    return True
+
+
+def pause_requested():
+    """True when a speaker selector of the turn running on this thread ended
+    a round for the person (yield_between_rounds).
+
+    The turn loops read it at every exit that can follow such a round
+    (create_recipe.get_response_group, reuse_recipe.get_agent_response and
+    chat_agent).  A read does not clear it: once a turn was asked to stop it
+    answers only the pause, so an outer frame of create's recursive turn sees
+    the pause its inner frame answered.  It stays set until the next turn on
+    this thread begins (clear_pause_request)."""
+    return bool(getattr(_turn_pause, 'requested', False))
+
+
+def clear_pause_request():
+    """Begin a turn on this thread with no pause pending.
+
+    Called where a turn begins (create_recipe.recipe, reuse_recipe.chat_agent)
+    and nowhere else: a pooled request thread can still carry the mark of an
+    earlier turn, one that set it after its last read and answered with
+    something else."""
+    _turn_pause.requested = False
+
+
+def answer_the_pause(session, action_id, where):
+    """The reply of a turn whose round a speaker selector ended for the
+    person (pause_requested): core.agent_tools.user_pause_reply, which the
+    dispatchers hold for later (dispatch._turn_failure, the hive worker's
+    DeferredForRetry) and never count as a result or a failure.  The caller
+    has touched no action or ledger state, so the goal's next dispatch
+    resumes the session where it stopped."""
+    try:
+        current_app.logger.info(
+            f"[YIELD-TO-USER] {where}: action {action_id} of {session} paused "
+            f"for the person; it resumes on the next dispatch")
+    except Exception:
+        pass
+    from core.agent_tools import user_pause_reply
+    return user_pause_reply(action_id)
+
+
 def answered_call_ids(m):
     """Every tool_call_id a single message answers.
 
@@ -2261,6 +2364,13 @@ class ToolMessageHandler:
         # Check if the last message contains "Execute action" pattern
         last_message = messages[-1]
         last_content = last_message.get('content', '')
+        # A tool call carries content=None and a multimodal turn carries a list;
+        # neither can be an "Execute action" instruction, and re.search on them
+        # raised TypeError (live 2026-10-04 on central: the whole reuse turn died
+        # inside get_agent_response).  Older messages are already filtered by
+        # isinstance below; the last one gets the same treatment.
+        if not isinstance(last_content, str):
+            return messages
 
         # Use regex to match "Execute Action" followed by optional number and colon
         execute_action_pattern = r'execute\s+action\s*\d*\s*:?'
@@ -3118,15 +3228,52 @@ class ToolActivityAsEvidence:
                 changed)
 
 
-def give_judge_view(seat):
-    """Give a judging seat ToolActivityAsEvidence.
+# A verdict is a JSON object, and the 4B sometimes writes it inside a code
+# fence.  Only a fenced JSON OBJECT is matched: a fenced python block is code
+# and stays one.
+_FENCED_JSON_OBJECT = re.compile(
+    r'```[A-Za-z]*[ \t]*\r?\n?\s*(\{.*?\})\s*\r?\n?```', re.DOTALL)
 
-    Call it after the seat's shared TransformMessages: hooks run in the order
-    they were registered, and the shared chain fills the real tool answers
-    this view reports.
+
+def unfence_verdict_before_send(sender, message, recipient, silent):
+    """autogen ``process_message_before_send`` hook for a judging seat: a
+    verdict leaves it as plain JSON, never as a code block.
+
+    Live 2026-10-06 02:35 (REUSE agent 54, task #163): the verifier fenced its
+    verdict; on the learner's next message the Assistant, whose code execution
+    scans every trailing user message since it last spoke, RAN the fence
+    ("unknown language json", exitcode 1), state_transition handed the turn
+    straight back to it, and ten ~20 s rounds later the turn had taken 231 s.
+    Unwrapped where it is sent, no seat's buffer, the group log or the history
+    ever holds the fence, so there is nothing for a later turn to execute.
+
+    Text around the fence is kept; the input message is not mutated.
+    """
+    content = message.get('content') if isinstance(message, dict) else message
+    if not isinstance(content, str) or '```' not in content:
+        return message
+    plain = _FENCED_JSON_OBJECT.sub(lambda match: match.group(1), content)
+    if plain == content:
+        return message
+    return {**message, 'content': plain} if isinstance(message, dict) else plain
+
+
+def give_judge_view(seat):
+    """Configure a judging seat: what it sees and how it speaks.
+
+    SEES: ToolActivityAsEvidence, the other seats' tool calls told as a report.
+    Call this after the seat's shared TransformMessages: hooks run in the order
+    they were registered, and the shared chain fills the real tool answers this
+    view reports.
+
+    SPEAKS: unfence_verdict_before_send.  Every StatusVerifier seat (CREATE,
+    REUSE, time and visual groups) is configured here, so the verdict rule
+    lives in one place.
     """
     transform_messages.TransformMessages(
         transforms=[ToolActivityAsEvidence(seat)], verbose=False).add_to_agent(seat)
+    seat.register_hook('process_message_before_send',
+                       unfence_verdict_before_send)
 
 
 class Action:

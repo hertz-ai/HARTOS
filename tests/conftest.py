@@ -118,6 +118,14 @@ collect_ignore_glob = [
 # fixture-not-found errors to 48 passing).
 
 
+# The suite never joins the PeerLink relay (core.peer_link.relay): a test that
+# runs the real bootstrap would otherwise open a session to central's
+# production router (CI installs autobahn) and leave a process-wide hub behind
+# for every test after it.  Relay tests build their hubs on an in-memory
+# router.  An explicit value set before pytest starts is kept.
+os.environ.setdefault('HEVOLVE_PEER_LINK_RELAY', '0')
+
+
 def pytest_configure(config):
     """Register custom markers for optional dependencies."""
     config.addinivalue_line("markers", "requires_pyautogui: test needs pyautogui")
@@ -169,23 +177,45 @@ def reopen_owner_feed_answers():
 
 
 @pytest.fixture
-def computer_control_granted(monkeypatch):
+def idle_desktop(monkeypatch):
+    """Nobody is at this computer and nothing presses on it.
+
+    A background run reads the live machine three ways: the VLM loop's own
+    physical-input check, the one definition of a person at the computer
+    that every background turn asks between steps
+    (dispatch.person_using_the_machine, read by background_work_must_yield,
+    #129), and the tick gate a daemon asks before it starts work
+    (dispatch.should_yield_to_user).  On a box with someone at it all three
+    say "stop", so a test that drives a background run passed or failed with
+    the state of the desk: measured 2026-10-05, test_computer_control_consent's
+    two acting tests failed once in five runs, and fail every time with the
+    gate read as busy.  Tests that assume an idle desktop declare it here;
+    tests of yielding patch the predicate themselves
+    (tests/unit/test_yield_pauses_every_agent.py), and dedicated takeover
+    tests override the input signal with transitions.
+    """
+    from core import resource_governor
+    monkeypatch.setattr(resource_governor, 'get_physical_input_state',
+                        lambda **_kw: (0, None))
+    from integrations.agent_engine import dispatch
+    monkeypatch.setattr(dispatch, 'person_using_the_machine', lambda: None)
+    monkeypatch.setattr(dispatch, 'should_yield_to_user', lambda: False)
+
+
+@pytest.fixture
+def computer_control_granted(monkeypatch, idle_desktop):
     """The desktop owner has allowed agents to control this computer.
 
     run_local_agentic_loop and hart_intelligence_entry._handle_shell_command_tool
     ask integrations.vlm.safety.computer_control_block first.  Tests of what
     they do once allowed declare that precondition with this fixture; the
     permission itself is tested against a real consent table in
-    tests/unit/test_computer_control_consent.py.
+    tests/unit/test_computer_control_consent.py.  These model tests mock OS
+    actions and assume an idle desktop (idle_desktop).
     """
     from integrations.vlm import safety
     monkeypatch.setattr(safety, 'computer_control_block',
                         lambda agent_id, **_kw: None)
-    # These model tests mock OS actions and assume an idle desktop.
-    # Dedicated takeover tests override the signal with event transitions.
-    from core import resource_governor
-    monkeypatch.setattr(resource_governor, 'get_physical_input_state',
-                        lambda **_kw: (0, None))
 
 
 @pytest.fixture

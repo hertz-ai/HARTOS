@@ -97,6 +97,15 @@ def register_all_blueprints(app) -> dict:
         .marketplace_bp
     ))
 
+    # ── McGroce agentic commerce (/api/commerce/*) ──
+    # Mirrors marketplace: the standalone entry registers it too, and the
+    # name check above makes the second registration a no-op.
+    _try_register('commerce', lambda: (
+        __import__('integrations.commerce.commerce_api',
+                   fromlist=['commerce_bp'])
+        .commerce_bp
+    ))
+
     # ── Robotics Hardware Bridge ──
     _try_register('robotics', lambda: (
         __import__('integrations.robotics.hardware_bridge',

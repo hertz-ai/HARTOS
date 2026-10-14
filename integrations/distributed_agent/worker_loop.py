@@ -99,6 +99,9 @@ class DistributedWorkerLoop:
     # Jitter factor so N workers don't all reconnect in the same second
     # when Redis comes back.  ±25% of the current backoff window.
     _BACKOFF_JITTER: float = 0.25
+    # A reason for claiming nothing that was said this recently is not said
+    # again when the worker comes back to it (_note_idle).
+    _IDLE_RESAY_S: float = 600.0
 
     def __init__(self):
         self._interval = int(os.environ.get('HEVOLVE_WORKER_POLL_INTERVAL', '15'))
@@ -109,6 +112,10 @@ class DistributedWorkerLoop:
         self._capabilities = self._detect_capabilities()
         # Current Redis backoff state — reset to 0 when a tick succeeds.
         self._redis_backoff: float = 0.0
+        # Why the last tick claimed nothing, or None after a claim, and when
+        # each reason was last said (_note_idle).
+        self._idle_reason = None
+        self._idle_said_at = {}
 
     def _detect_capabilities(self):
         """Detect this node's capabilities from system_requirements."""
@@ -241,8 +248,45 @@ class DistributedWorkerLoop:
                 msg = str(e).lower()
                 if 'connection' in msg or 'timeout' in msg or 'redis' in msg:
                     self._bump_redis_backoff()
-                logger.debug(f"Distributed worker tick error: {e}")
+                logger.debug(f"Distributed worker tick error: {e}",
+                             exc_info=True)
+                self._note_idle(f'its tick failed: {e}')
             self._wd_heartbeat()
+
+    def _note_idle(self, reason) -> None:
+        """Say why this worker claims nothing, once per change of reason.
+
+        Every reason used to be a DEBUG line, and the bundled desktop logs
+        hevolve_social at INFO, so a worker that claimed nothing for five
+        days (2026-10-05 to 10-10, ledger untouched) left no line at all:
+        nobody could tell a closed gate from an empty queue from a failing
+        tick.  Measured that day, it was the queue: 46 PENDING tasks, each
+        demanding its own goal type as a capability this worker does not
+        advertise, all of goals already completed or paused.  ``None`` means
+        the worker claimed again.  Said when the reason changes, so a steady
+        state costs one line, not one per 15 s tick, and a reason said in the
+        last _IDLE_RESAY_S is not said again: during a daemon's turn the local
+        LLM is busy for each model call and free between them, so the reason
+        swapped between "local LLM busy" and the queue's own reason every
+        tick or two (measured on the owner's desktop 2026-10-10 11:04-11:09
+        IST, eight lines in five minutes, after the first version of this).
+        """
+        if reason == self._idle_reason:
+            return
+        was, self._idle_reason = self._idle_reason, reason
+        if reason is None:
+            logger.info("Distributed worker claiming again (was: %s)", was)
+            return
+        now = time.monotonic()
+        said = self._idle_said_at.get(reason)
+        if said is not None and now - said < self._IDLE_RESAY_S:
+            return
+        # Only reasons said within the window are kept; a tick error's reason
+        # carries its message, so the set would otherwise grow without bound.
+        self._idle_said_at = {r: t for r, t in self._idle_said_at.items()
+                              if now - t < self._IDLE_RESAY_S}
+        self._idle_said_at[reason] = now
+        logger.info("Distributed worker claiming nothing: %s", reason)
 
     def _bump_redis_backoff(self) -> None:
         """Double the backoff window, clamped to [MIN, MAX]."""
@@ -277,7 +321,7 @@ class DistributedWorkerLoop:
         # copy of them.
         deferral = self._dispatch_would_defer()
         if deferral:
-            logger.debug("Worker claiming nothing this tick: %s", deferral)
+            self._note_idle(f'waiting ({deferral})')
             return
 
         # Claim next matching task
@@ -286,8 +330,11 @@ class DistributedWorkerLoop:
             capabilities=self._capabilities,
         )
         if not task:
+            self._note_idle(f'no pending task its capabilities '
+                            f'{sorted(self._capabilities)} can claim')
             return
 
+        self._note_idle(None)
         logger.info(f"Worker claimed task {task.task_id}: {task.description[:80]}")
 
         # HIVE_DEPTH enforcement — defense in depth.  Coordinators stamp
@@ -559,7 +606,20 @@ class DistributedWorkerLoop:
         # orphan recovery re-queues the task once the claim is old: the same
         # rule that recovers a dead worker paces the retry, which is the
         # backoff a rate-limited endpoint needs.
-        from core.agent_tools import is_help_pause, is_user_facing_error
+        from core.agent_tools import is_help_pause, is_user_facing_error, is_user_pause
+        # The turn stopped between steps because the owner is using the
+        # computer (#129): nothing was done and nothing is parked.  That is
+        # this worker's own 'yielded to an active user' case, so it takes the
+        # same canonical DEFERRED lifecycle as the 'deferred' dispatch status
+        # above -- never None, which _tick logs as an execution failure and
+        # abandons.  The next claim, admitted by _dispatch_would_defer only
+        # once the gate is open, runs it again from where it stopped.
+        if is_user_pause(response):
+            logger.info(
+                f"Worker task {task.task_id}: paused for the user "
+                f"({response[:80]!r}); deferring it until they are idle")
+            return DeferredForRetry('paused between steps: the owner is using '
+                                    'this computer')
         if is_user_facing_error(response):
             logger.warning(
                 f"Worker task {task.task_id}: the turn failed "

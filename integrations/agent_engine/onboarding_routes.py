@@ -8,6 +8,11 @@ the onboarding state machine.
   POST /api/onboarding/advance  — Advance to next phase
   GET  /api/onboarding/status   — Current phase for a user
   GET  /api/onboarding/profile  — Get sealed HART identity
+
+On HART OS the ceremony itself is Nunba's (static/hartOnboarding.js hosts
+Nunba's /local page); the shell asks /status for two things before showing
+it: `onboarded` (the desktop owner's seal is on record) and `companion_ready`
+(the Nunba daemon answered, so the page can load).
 """
 
 import logging
@@ -15,8 +20,28 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def register_onboarding_routes(app):
-    """Register onboarding ceremony routes on a Flask app."""
+def register_onboarding_routes(app, resolve_user=None):
+    """Register onboarding ceremony routes on a Flask app.
+
+    ``resolve_user`` names the desktop owner when a request carries no
+    user_id: on HART OS that is LiquidUIService._desktop_owner_id (the owner
+    Nunba knows, else Nunba's hardware-stable guest id, else None while the
+    Nunba daemon is still coming up). Without it the historical default '1'
+    stands, which is what the standalone test apps use.
+    """
+
+    def _user(params):
+        """-> (user_id, companion_ready). companion_ready is False only when
+        the resolver was consulted and had nobody to name (Nunba not up)."""
+        uid = (params or {}).get('user_id')
+        if uid:
+            return str(uid), True
+        if resolve_user is None:
+            return '1', True
+        resolved = resolve_user()
+        if resolved:
+            return str(resolved), True
+        return '1', False
 
     @app.route('/api/onboarding/start', methods=['POST'])
     def _onboarding_start():
@@ -27,7 +52,7 @@ def register_onboarding_routes(app):
         )
 
         data = request.get_json(silent=True) or {}
-        user_id = data.get('user_id', '1')
+        user_id, _ = _user(data)
 
         # Already onboarded?
         if has_hart_name(user_id):
@@ -57,7 +82,7 @@ def register_onboarding_routes(app):
         )
 
         data = request.get_json(silent=True) or {}
-        user_id = data.get('user_id', '1')
+        user_id, _ = _user(data)
         action = data.get('action')
         action_data = data.get('data', {})
 
@@ -107,18 +132,22 @@ def register_onboarding_routes(app):
         from flask import request, jsonify
         from hartos.hart_onboarding import has_hart_name, get_hart_profile
 
-        user_id = request.args.get('user_id', '1')
+        user_id, companion_ready = _user(request.args)
 
         if has_hart_name(user_id):
             return jsonify({
                 'success': True,
                 'onboarded': True,
+                'user_id': user_id,
+                'companion_ready': companion_ready,
                 'profile': get_hart_profile(user_id),
             })
 
         return jsonify({
             'success': True,
             'onboarded': False,
+            'user_id': user_id,
+            'companion_ready': companion_ready,
         })
 
     @app.route('/api/onboarding/profile', methods=['GET'])
@@ -126,7 +155,7 @@ def register_onboarding_routes(app):
         from flask import request, jsonify
         from hartos.hart_onboarding import get_hart_profile
 
-        user_id = request.args.get('user_id', '1')
+        user_id, _ = _user(request.args)
         profile = get_hart_profile(user_id)
 
         if profile:

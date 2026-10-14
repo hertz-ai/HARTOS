@@ -371,7 +371,7 @@ class TestDaemonParallelIntegration:
     """Tests for AgentDaemon parallel dispatch wiring."""
 
     def test_try_parallel_dispatch_with_parallel_tasks(self):
-        """_try_parallel_dispatch returns count > 0 when parallel tasks exist."""
+        """_try_parallel_dispatch says how the fanned-out subtasks ended."""
         from integrations.agent_engine.agent_daemon import AgentDaemon
 
         daemon = AgentDaemon()
@@ -387,12 +387,12 @@ class TestDaemonParallelIntegration:
         with patch.object(daemon, '_get_goal_ledger', return_value=ledger), \
              patch('integrations.agent_engine.parallel_dispatch.dispatch_parallel_tasks',
                    return_value={'completed': 2, 'failed': 0, 'results': {}}):
-            count = daemon._try_parallel_dispatch(mock_goal, idle_agents, 0, 10)
+            outcome = daemon._try_parallel_dispatch(mock_goal, idle_agents, 0, 10)
 
-        assert count == 2
+        assert outcome == {'completed': 2, 'failed': 0, 'deferred': 0}
 
     def test_try_parallel_dispatch_no_ledger(self):
-        """_try_parallel_dispatch returns 0 when no ledger exists."""
+        """_try_parallel_dispatch reports nothing run when no ledger exists."""
         from integrations.agent_engine.agent_daemon import AgentDaemon
 
         daemon = AgentDaemon()
@@ -400,9 +400,9 @@ class TestDaemonParallelIntegration:
         mock_goal.id = 'test_goal'
 
         with patch.object(daemon, '_get_goal_ledger', return_value=None):
-            count = daemon._try_parallel_dispatch(mock_goal, [], 0, 10)
+            outcome = daemon._try_parallel_dispatch(mock_goal, [], 0, 10)
 
-        assert count == 0
+        assert outcome == {'completed': 0, 'failed': 0, 'deferred': 0}
 
     def test_get_goal_ledger_returns_none_single_task(self):
         """_get_goal_ledger returns None for single-task ledger."""

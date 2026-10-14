@@ -16,12 +16,12 @@ WHY this exists:
       path used for post / comment / message mentions.  GuardrailEnforcer
       (before_dispatch + after_response) gates every agent action — the
       agent never has a privileged path.
-    - TTS-ifies the agent's reply via PocketTTS and publishes the audio
+    - TTS-ifies the agent's reply via the TTS router and publishes the audio
       frames into the LiveKit room.
 
 This module ships the SCAFFOLDING + the worker contract.  The actual
 audio frame plumbing depends on the LiveKit Python SDK
-(`livekit-api`, `livekit-rtc`) and the existing PocketTTS + Whisper
+(`livekit-api`, `livekit-rtc`) and the existing TTS router + Whisper
 modules.  Each integration point is marked with a comment + a stub
 return so the module is importable + testable without those packages
 installed.
@@ -59,15 +59,27 @@ from typing import Any, Deque, Dict, List, Optional
 logger = logging.getLogger('hevolve_social')
 
 
-# Best-effort imports — all of these may be absent on flat /
-# Nunba bundled deploys.  The bridge degrades to a no-op stub
-# in that case so importing this module is always safe.
-try:
-    from livekit import rtc as livekit_rtc  # type: ignore
-    _HAS_LIVEKIT_RTC = True
-except Exception:
-    livekit_rtc = None
-    _HAS_LIVEKIT_RTC = False
+# The realtime SDK may be absent (or fail to import) on flat / Nunba bundled
+# deploys; the bridge then degrades to a logged no-op, so importing this
+# module is always safe.  _livekit_room makes the one import and keeps its
+# error, which the warnings below name.
+from integrations.social import _livekit_room
+
+_HAS_LIVEKIT_RTC = _livekit_room.HAS_LIVEKIT_RTC
+
+
+def _hosts_rooms() -> bool:
+    """Does this deploy have LiveKit rooms at all (LiveKitService.hosts_rooms)?
+    Where it does not (central, LIVEKIT_DISABLE) a call is p2p mesh and an
+    agent has no room to speak into or hear from, so nothing about the
+    realtime SDK is the reason a reply goes unvoiced."""
+    try:
+        from integrations.social.livekit_service import LiveKitService
+    except Exception as e:  # pragma: no cover — import-only failure
+        logger.warning("AgentVoiceBridge: the LiveKit service did not import "
+                       "(%s); treating this deploy as having no rooms", e)
+        return False
+    return LiveKitService.hosts_rooms()
 
 
 # Active workers keyed by (call_id, agent_id).  Module-level dict +
@@ -90,8 +102,8 @@ _ACTIVE_SUBSCRIBERS: Dict[str, 'LiveKitTranscriptSubscriber'] = {}
 # queue.  agentic_router._post_agent_reply for source_kind='call'
 # enqueues the agent's reply text here; the audio publisher (the
 # bridge worker's TTS half OR an external adapter — LiveKit-rtc
-# producer / Discord voice client) drains it, synthesizes via
-# PocketTTS, and publishes audio frames into the room.
+# producer / Discord voice client) drains it, synthesizes through
+# the TTS router, and publishes audio frames into the room.
 #
 # Single canonical home for outbound agent-text-on-calls.  No parallel
 # queues elsewhere — every producer pushes here, every consumer reads
@@ -173,7 +185,7 @@ class AgentBridgeWorker:
     publisher token, runs the STT/dispatch/TTS loop until detach.
 
     Scaffolded — actual frame I/O is wired alongside livekit-rtc +
-    PocketTTS + whisper integrations.  The contract here lets the
+    TTS router + whisper integrations.  The contract here lets the
     rest of the system call attach_agent / detach_agent today."""
 
     def __init__(self, call_id: str, agent_id: str, owner_id: str,
@@ -204,6 +216,9 @@ class AgentBridgeWorker:
         # first reply that needs voicing (so attach is cheap + no room is joined
         # for a silent agent).  None until then / when no LiveKit room exists.
         self._publisher: Any = None
+        # Why _ensure_publisher last found no room to publish into, for the
+        # reply's warning.
+        self._no_room: Optional[str] = None
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -282,7 +297,7 @@ class AgentBridgeWorker:
 
     def _tick(self) -> None:
         """One worker iteration — lazy-importing the integrations so
-        unit tests don't drag in livekit/whisper/PocketTTS modules
+        unit tests don't drag in livekit/whisper/TTS modules
         that may not be installed.
 
         Drains finalized STT segments from
@@ -465,54 +480,69 @@ class AgentBridgeWorker:
                     self.call_id, self.agent_id, e)
 
     def _publish_audio_for(self, text: str) -> None:
-        """Synthesize ``text`` via PocketTTS and publish the audio frames into
+        """Synthesize ``text`` (the TTS router) and publish the audio frames into
         the LiveKit room through this worker's ``LiveKitAudioPublisher`` (the
         agent's "mouth").
 
-        Degrades cleanly: when the realtime SDK is absent (flat / Nunba bundled)
-        OR the call has no LiveKit room (p2p mesh / central), we log the reply at
-        INFO so the call audit trail still records the agent's spoken
-        contribution; no audio is published.  Best-effort — never raises out of
-        the tick loop.
+        Degrades cleanly.  On a deploy with no LiveKit rooms (p2p mesh /
+        central) the reply is logged at INFO: there is nothing to voice into.
+        Where there are rooms, a reply that cannot be voiced is a WARNING naming
+        why: the realtime SDK's import error, or no room token (its reason).
+        Either way the call audit trail records the agent's contribution and no
+        audio is published.  Best-effort — never raises out of the tick loop.
         """
         if not text:
             return
-        if not _HAS_LIVEKIT_RTC:
-            logger.info(
-                "AgentBridgeWorker._publish_audio_for: livekit (rtc) "
-                "absent; reply queued but not voiced — "
-                "call=%s agent=%s text=%r",
-                self.call_id, self.agent_id, text[:120])
-            return
-        pub = self._ensure_publisher()
-        if pub is None:
+        if not _hosts_rooms():
             logger.info(
                 "AgentBridgeWorker._publish_audio_for: no LiveKit room for "
                 "this call (p2p/central) — reply not voiced — "
                 "call=%s agent=%s text=%r",
                 self.call_id, self.agent_id, text[:120])
             return
+        if not _HAS_LIVEKIT_RTC:
+            logger.warning(
+                "AgentBridgeWorker._publish_audio_for: %s; reply not voiced "
+                "— call=%s agent=%s text=%r",
+                _livekit_room.rtc_unavailable_reason(),
+                self.call_id, self.agent_id, text[:120])
+            return
+        pub = self._ensure_publisher()
+        if pub is None:
+            logger.warning(
+                "AgentBridgeWorker._publish_audio_for: %s; reply not voiced "
+                "— call=%s agent=%s text=%r",
+                self._no_room or 'no room to publish into',
+                self.call_id, self.agent_id, text[:120])
+            return
         pcm, rate, channels = self._synthesize_pcm(text)
         if not pcm:
             return
-        pub.push_pcm(pcm, src_rate=rate, src_channels=channels)
+        if not pub.push_pcm(pcm, src_rate=rate, src_channels=channels):
+            logger.warning(
+                "AgentBridgeWorker._publish_audio_for: the room did not take "
+                "the reply's audio (publisher stopped or not yet connected, or "
+                "the audio could not be converted to its format) — "
+                "call=%s agent=%s text=%r",
+                self.call_id, self.agent_id, text[:120])
 
     def _ensure_publisher(self):
         """Return this worker's LiveKitAudioPublisher, creating + starting it on
-        first use.  Returns None when there is no LiveKit room to publish into
-        (issue_token returns a non-'livekit' mode) or the SDK/connect fails — the
-        caller then logs the reply text instead of voicing it."""
+        first use.  Returns None when there is no room to publish into (no room
+        token, the publisher would not start or stopped), keeping why in
+        ``self._no_room`` for the caller's warning."""
         if self._publisher is not None:
-            return self._publisher if self._publisher.is_alive() else None
+            if self._publisher.is_alive():
+                return self._publisher
+            self._no_room = 'the room publisher stopped'
+            return None
         try:
             from integrations.social.livekit_service import LiveKitService
             from integrations.social.livekit_audio_publisher import (
                 LiveKitAudioPublisher,
             )
         except Exception as e:  # pragma: no cover — import-only failure
-            logger.debug(
-                "AgentBridgeWorker._ensure_publisher: imports unavailable "
-                "(%s)", e)
+            self._no_room = f'the room publisher did not import ({e})'
             return None
         # Mint the agent's publisher token via the SAME issuer humans use; the
         # agent joins the room as identity=agent_id with publish rights.
@@ -524,43 +554,51 @@ class AgentBridgeWorker:
             logger.warning(
                 "AgentBridgeWorker._ensure_publisher: issue_token failed "
                 "(call=%s): %s", self.call_id, e)
+            self._no_room = f'no room token ({e})'
             return None
         if (tok.get('mode') != 'livekit' or not tok.get('token')
                 or not tok.get('url')):
-            # p2p mesh / livekit_pending / central — nothing to publish into.
+            # livekit_pending: issue_token logged the whole cause.
+            self._no_room = f"no room token ({tok.get('reason') or tok.get('mode')})"
             return None
         pub = LiveKitAudioPublisher(self.call_id, tok['url'], tok['token'])
         if not pub.start():
+            self._no_room = 'the room publisher did not start'
             return None
         self._publisher = pub
+        self._no_room = None
         return pub
 
     def _synthesize_pcm(self, text: str):
-        """``text`` → (pcm_bytes, sample_rate, channels) via PocketTTS.
+        """``text`` → (pcm_bytes, sample_rate, channels) through the one TTS
+        router (TTSRouter.synthesize: its engine ladder, text normalisation and
+        fallbacks, the canonical synth entry), as source 'call' -- urgency
+        'live': this node's best voice, and no LLM rewrite of the text, which
+        a person waiting on the line cannot wait for.
 
-        PocketTTS writes a .wav (``pocket_tts_synthesize`` → JSON ``{path}``);
-        we read it back as PCM16 with the stdlib ``wave`` module.  The publisher
-        resamples to the LiveKit publish format, so we pass the wav's native
-        rate/channels straight through.  Returns ``(b'', 0, 1)`` on any failure
-        (TTS error, missing file, unreadable wav) — never raises."""
+        The engine writes a .wav, in whatever sample format it uses (a float
+        tensor becomes an IEEE-float WAV); whisper_tool.read_wav_f32, the one
+        WAV reader, reads either, and it becomes mono PCM16 here.  The
+        publisher resamples to the LiveKit publish format.  Returns
+        ``(b'', 0, 1)`` on any failure (no engine, missing file, unreadable
+        wav), logged with the router's reason — never raises."""
         try:
-            import json
-            import wave
-            from integrations.service_tools.pocket_tts_tool import (
-                pocket_tts_synthesize,
-            )
-            res = json.loads(pocket_tts_synthesize(text))
-            path = res.get('path')
-            if not path:
+            import numpy as np
+            from integrations.channels.media.tts_router import get_tts_router
+            from integrations.service_tools.whisper_tool import read_wav_f32
+            res = get_tts_router().synthesize(text, source='call')
+            path = res.path
+            if res.error or not path:
                 logger.warning(
                     "AgentBridgeWorker._synthesize_pcm: TTS produced no audio "
-                    "(call=%s): %s", self.call_id, res.get('error', res))
+                    "(call=%s): %s", self.call_id, res.error or 'no file')
                 return b'', 0, 1
-            with wave.open(path, 'rb') as wf:
-                channels = wf.getnchannels()
-                rate = wf.getframerate()
-                pcm = wf.readframes(wf.getnframes())
-            return pcm, rate, channels
+            rate, samples = read_wav_f32(path)
+            # x32768 is exact for a PCM16 file (read as int16 / 32768); a float
+            # at full scale clips to the int16 range.
+            pcm = np.clip(np.round(samples * 32768.0), -32768, 32767
+                          ).astype('<i2').tobytes()
+            return pcm, rate, 1
         except Exception as e:
             logger.warning(
                 "AgentBridgeWorker._synthesize_pcm failed (call=%s): %s",
@@ -628,10 +666,17 @@ def _ensure_call_subscriber(call_id: str) -> None:
 
     Reuses the existing subscriber class + ``LiveKitService.issue_token`` and the
     same canonical per-call STT queue the worker drains — no parallel path.  No-op
-    when livekit-rtc is absent or the call has no LiveKit room (p2p/central): the
-    worker then drains an empty queue exactly as before.  Best-effort; never
-    raises out to the caller."""
+    on a deploy with no LiveKit rooms (p2p/central: nothing to hear from), and
+    where there are rooms but the agent cannot join one -- livekit-rtc cannot be
+    used, or no room token -- a warning names why: the worker then drains an
+    empty queue exactly as before.  Best-effort; never raises out to the
+    caller."""
+    if not _hosts_rooms():
+        return
     if not _HAS_LIVEKIT_RTC:
+        logger.warning("AgentVoiceBridge._ensure_call_subscriber: %s; the "
+                       "agent cannot hear call=%s",
+                       _livekit_room.rtc_unavailable_reason(), call_id)
         return
     with _WORKERS_LOCK:
         sub = _ACTIVE_SUBSCRIBERS.get(call_id)
@@ -657,7 +702,10 @@ def _ensure_call_subscriber(call_id: str) -> None:
         return
     if (tok.get('mode') != 'livekit' or not tok.get('token')
             or not tok.get('url')):
-        return  # p2p mesh / central / pending — no room to subscribe to
+        logger.warning("AgentVoiceBridge._ensure_call_subscriber: no room token "
+                       "(%s); the agent cannot hear call=%s",
+                       tok.get('reason') or tok.get('mode'), call_id)
+        return
     sub = LiveKitTranscriptSubscriber(call_id, tok['url'], tok['token'])
     if not sub.start():
         return

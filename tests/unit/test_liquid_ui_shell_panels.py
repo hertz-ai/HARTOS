@@ -36,3 +36,21 @@ def test_shell_panels_never_blank_and_open_maximized():
     r = subprocess.run([node, MJS], capture_output=True, text=True, timeout=120)
     assert r.returncode == 0, 'panel-manager harness failed:\n' + r.stdout + r.stderr
     assert 'RESULT: ALL PASS' in r.stdout, r.stdout
+
+
+def test_the_pinned_assistant_bubble_opens_nunbas_chat_page():
+    """The floating 'assistant' bubble is an iframe on a Nunba route through
+    the shell's proxy. It named '/social/assistant', which Nunba's router
+    does not have (its chat page is '/local'; '/' redirects to hevolve.ai
+    when online), so the pinned bubble opened NotFound. Found tracing N7
+    gate 1 on generation 17 (2026-10-11). The harness stub above mirrors
+    the real entry so the two cannot drift apart unnoticed."""
+    from integrations.agent_engine.shell_manifest import PANEL_MANIFEST, PINNED_PANEL_IDS
+    entry = PANEL_MANIFEST['assistant']
+    assert entry['route'] == '/local', entry
+    assert entry.get('floating') is True
+    assert 'assistant' in PINNED_PANEL_IDS
+    with open(MJS, encoding='utf-8') as fh:
+        stub = fh.read()
+    assert "assistant: { title:'Assistant', route:'/local'" in stub, (
+        'the .mjs harness stubs the assistant entry; keep its route the real one')

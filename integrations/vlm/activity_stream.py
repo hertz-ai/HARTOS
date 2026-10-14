@@ -50,6 +50,7 @@ _ACTION_LABELS = {
     'open_file_gui': 'Opening an app or file',
     'write_file': 'Writing a local file',
     'read_file_and_understand': 'Reading a local file',
+    'coding': 'Working on code',
 }
 
 #: Step phases a client may receive.  ``executing`` is the only non-terminal
@@ -156,8 +157,16 @@ def _payload(*, user_id: str, prompt_id: str, run_id: str, task_id: str,
     return {
         'type': 'computer_use.update',
         # Each (step, phase) is a distinct transport message; clients reduce
-        # by task_id, so one run collapses to one card.
-        'msg_id': f'computer-use:{task_id}:{int(sequence)}:{phase}',
+        # by task_id, so one run collapses to one card.  The run close gets
+        # its own id: finish_run sends the LAST step's sequence with the exit
+        # phase, which for action_error / done / stopped is the phase that
+        # step already carried, and the page drops a repeated msg_id (Nunba
+        # realtimeService._isDuplicate, 10 s window).  Live 2026-10-04
+        # 17:02:12, task computer_use_443f86f06cd9: the close was the only
+        # message with run_done=True, it was deduped against the third failed
+        # step, and the floating window showed ': step failed' for hours.
+        'msg_id': (f'computer-use:{task_id}:{int(sequence)}:{phase}'
+                   + (':run_done' if run_done else '')),
         'user_id': user_id,
         # This is a database goal id, not an assumed prompt-id alias.  It is
         # the only id accepted by the existing GroupChat injection endpoint.

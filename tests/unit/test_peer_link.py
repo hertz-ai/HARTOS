@@ -569,6 +569,7 @@ class TestChannels(unittest.TestCase):
         expected = {
             'control', 'compute', 'dispatch', 'gossip', 'federation',
             'hivemind', 'events', 'ralt', 'sensor', 'messages', 'learning',
+            'tunnel',
         }
         self.assertEqual(set(CHANNEL_REGISTRY.keys()), expected)
 
@@ -1904,3 +1905,205 @@ class TestVerifySameUserProof(unittest.TestCase):
         with patch.dict(os.environ, {'HEVOLVE_USER_ID': 'user1'}):
             out = self.link._verify_same_user_proof('garbage', 'garbagekey')
         self.assertFalse(out)
+
+
+# ── Request/reply over a real link pair ──────────────────────────────
+
+import queue as _queue
+
+
+class _PairedWS:
+    """One end of an in-memory socket pair: send() lands in the other end's
+    inbox, recv() times out the way an idle websocket does."""
+
+    def __init__(self, inbox, outbox):
+        self._inbox, self._outbox = inbox, outbox
+
+    def send(self, data):
+        self._outbox.put(data)
+
+    def recv(self, timeout=None):
+        try:
+            return self._inbox.get(timeout=min(timeout or 0.1, 0.1))
+        except _queue.Empty:
+            raise TimeoutError()
+
+
+def _linked_pair():
+    """Two real PeerLink objects wired to each other, receive loops running."""
+    a_in, b_in = _queue.Queue(), _queue.Queue()
+    a = PeerLink('peer-b', 'b:1', TrustLevel.SAME_USER)
+    b = PeerLink('peer-a', 'a:1', TrustLevel.SAME_USER)
+    a._ws, b._ws = _PairedWS(a_in, b_in), _PairedWS(b_in, a_in)
+    a._state = b._state = LinkState.CONNECTED
+    for link in (a, b):
+        threading.Thread(target=link._receive_loop, daemon=True).start()
+    return a, b
+
+
+def _stop(*links):
+    for link in links:
+        link._state = LinkState.DISCONNECTED
+
+
+class TestRequestReply(unittest.TestCase):
+    """send(wait_response=True) returns what the far side's handler returned.
+
+    Before this, the receive loop ignored a handler's return value and never
+    sent a frame carrying 're', so a waiting send always timed out (the PeerLink
+    'compute' offload waited its whole 120 s, then fell back to HTTP).
+    """
+
+    def test_a_handler_return_value_comes_back_as_the_reply(self):
+        a, b = _linked_pair()
+        try:
+            b.on_message('compute', lambda ch, data, peer: {'echo': data['q'], 'from': peer})
+            reply = a.send('compute', {'q': 'hi'}, wait_response=True, timeout=3)
+            self.assertEqual(reply, {'echo': 'hi', 'from': 'peer-a'})
+        finally:
+            _stop(a, b)
+
+    def test_a_request_to_a_channel_with_no_handler_gets_no_reply(self):
+        # Callers that wait on a channel (dispatch, gossip, hivemind collect)
+        # read ANY reply as an answer and would skip their HTTP fallback, so
+        # "nobody handles this" is silence and the sender's timeout is unchanged.
+        a, b = _linked_pair()
+        try:
+            self.assertIsNone(a.send('dispatch', {'q': 'hi'}, wait_response=True, timeout=0.6))
+        finally:
+            _stop(a, b)
+
+    def test_a_handler_that_returns_nothing_sends_no_reply(self):
+        a, b = _linked_pair()
+        try:
+            b.on_message('gossip', lambda ch, data, peer: None)
+            self.assertIsNone(a.send('gossip', {'q': 1}, wait_response=True, timeout=0.6))
+        finally:
+            _stop(a, b)
+
+    def test_a_slow_handler_does_not_stall_the_links_receive_loop(self):
+        # inference can take seconds; a reply to OUR request on the same link
+        # must not wait behind it.
+        a, b = _linked_pair()
+        try:
+            gate = threading.Event()
+            b.on_message('compute', lambda ch, data, peer: (gate.wait(5), {'slow': True})[1])
+            a.on_message('control', lambda ch, data, peer: {'pong': True})
+            out = {}
+            t = threading.Thread(
+                target=lambda: out.setdefault('slow', a.send('compute', {}, wait_response=True, timeout=8)))
+            t.start()
+            time.sleep(0.3)                    # b is now inside the slow handler
+            # b asks a something; a answers at once; b's loop must still be reading
+            self.assertEqual(b.send('control', {}, wait_response=True, timeout=3), {'pong': True})
+            gate.set()
+            t.join(5)
+            self.assertEqual(out.get('slow'), {'slow': True})
+        finally:
+            gate.set()
+            _stop(a, b)
+
+    def test_a_burst_of_requests_cannot_start_unbounded_handlers(self):
+        from core.peer_link.link import _MAX_CONCURRENT_REQUESTS
+        a, b = _linked_pair()
+        try:
+            running, peak, lock = [0], [0], threading.Lock()
+            gate = threading.Event()
+
+            def slow(ch, data, peer):
+                with lock:
+                    running[0] += 1
+                    peak[0] = max(peak[0], running[0])
+                gate.wait(5)
+                with lock:
+                    running[0] -= 1
+                return {'ok': True}
+
+            b.on_message('compute', slow)
+            for _ in range(_MAX_CONCURRENT_REQUESTS * 4):
+                threading.Thread(
+                    target=lambda: a.send('compute', {}, wait_response=True, timeout=1),
+                    daemon=True).start()
+            time.sleep(0.8)
+            self.assertLessEqual(peak[0], _MAX_CONCURRENT_REQUESTS)
+            gate.set()
+            time.sleep(0.5)
+            # slots come back once handlers finish: a new request is answered
+            self.assertEqual(a.send('compute', {}, wait_response=True, timeout=3), {'ok': True})
+        finally:
+            gate.set()
+            _stop(a, b)
+
+    def test_a_thread_that_cannot_start_gives_its_slot_back(self):
+        from core.peer_link.link import _MAX_CONCURRENT_REQUESTS
+        a, b = _linked_pair()
+        try:
+            b.on_message('compute', lambda ch, data, peer: {'ok': True})
+            with patch('core.peer_link.link.threading.Thread') as T:
+                T.return_value.start.side_effect = RuntimeError("can't start new thread")
+                for _ in range(_MAX_CONCURRENT_REQUESTS * 2):
+                    a.send('compute', {}, wait_response=True, timeout=0.05)
+            # every slot is free again: a real request is answered
+            self.assertEqual(a.send('compute', {}, wait_response=True, timeout=3), {'ok': True})
+        finally:
+            _stop(a, b)
+
+    def test_a_late_reply_is_dropped_not_handed_to_the_channel_handler(self):
+        # The sender timed out, then its reply arrived: it carries 're' but
+        # matches nothing pending.  It must not reach the handler as a request.
+        a, b = _linked_pair()
+        try:
+            seen = []
+            b.on_message('compute', lambda ch, data, peer: seen.append(data))
+            a.send('control', {})                      # keep both loops busy and warm
+            a._ws_send(json.dumps(
+                {'ch': 'compute', 'id': 'x1', 're': 'no-such-request', 'd': {'prompt': 'hi'}}
+            ).encode('utf-8'))
+            time.sleep(0.6)
+            self.assertEqual(seen, [])
+        finally:
+            _stop(a, b)
+
+    def test_a_compute_frame_that_asks_for_nothing_is_ignored(self):
+        # compute is request-only: work started inline on the receive thread
+        # with nobody waiting for the result is exactly what the bound prevents.
+        a, b = _linked_pair()
+        try:
+            ran = []
+            b.on_message('compute', lambda ch, data, peer: ran.append(data) or {'ok': True})
+            a.send('compute', {'prompt': 'hi'})                      # no wait_response
+            time.sleep(0.6)
+            self.assertEqual(ran, [])
+            self.assertEqual(a.send('compute', {'prompt': 'hi'}, wait_response=True, timeout=3),
+                             {'ok': True})                           # a real request still works
+        finally:
+            _stop(a, b)
+
+    def test_a_handler_return_is_not_sent_when_nobody_asked(self):
+        a, b = _linked_pair()
+        try:
+            seen = []
+            a.on_message('events', lambda ch, data, peer: seen.append(data))
+            b.on_message('events', lambda ch, data, peer: {'noise': True})
+            self.assertIsNone(a.send('events', {'x': 1}))
+            time.sleep(0.5)
+            self.assertEqual(seen, [])        # no unsolicited frame came back
+        finally:
+            _stop(a, b)
+
+    def test_every_channel_handler_still_fires_with_its_own_arguments(self):
+        a, b = _linked_pair()
+        try:
+            got = {}
+            # 'compute' is request-only (see the tests below), so not here
+            names = ('events', 'learning', 'hivemind', 'dispatch')
+            for name in names:
+                b.on_message(name, lambda ch, data, peer, n=name: got.setdefault(n, (ch, data, peer)))
+                a.send(name, {'n': name})
+            deadline = time.monotonic() + 3
+            while len(got) < len(names) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            for name in names:
+                self.assertEqual(got.get(name), (name, {'n': name}, 'peer-a'))
+        finally:
+            _stop(a, b)

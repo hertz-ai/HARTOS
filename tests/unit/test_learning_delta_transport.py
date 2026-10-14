@@ -16,6 +16,7 @@ These tests prove, without a live stack:
   3. broadcast_delta prefers PeerLink when a link is live, and falls back to
      the authenticated HTTP endpoint when there is no link (or the send drops).
 """
+import logging
 import time
 from unittest.mock import patch, MagicMock
 
@@ -93,11 +94,19 @@ class TestLearningDeltaBootstrap:
 class TestBroadcastTransportSelection:
     """broadcast_delta delivers each sampled peer PeerLink-first."""
 
-    def _run_broadcast(self, link, status_code=200, agg=None):
+    def _run_broadcast(self, link, status_code=200, agg=None,
+                       attestation=None):
         """Drive broadcast_delta against ONE active peer 'peerB', with a
         PeerLink manager whose get_link returns `link` (or None). Returns the
         pooled_post mock so the caller can assert HTTP was / was not used.
-        `status_code` is what the receiver answers an HTTP POST with."""
+        `status_code` is what the receiver answers an HTTP POST with.
+        `attestation` is what get_attestation_for_federation returns, or an
+        exception instance for it to raise (default: an invalid one)."""
+        if attestation is None:
+            attestation = {'valid': False}
+        att_patch = (dict(side_effect=attestation)
+                     if isinstance(attestation, BaseException)
+                     else dict(return_value=attestation))
         agg = agg or fa.FederatedAggregator()
         delta = {'version': 1, 'node_id': 'selfNode', 'timestamp': time.time()}
 
@@ -124,7 +133,7 @@ class TestBroadcastTransportSelection:
         with patch.object(fa, '_sign_delta'), \
              patch('security.edge_privacy.get_scope_guard', return_value=guard), \
              patch('security.origin_attestation.get_attestation_for_federation',
-                   return_value={'valid': False}), \
+                   **att_patch), \
              patch('integrations.social.models.get_db', return_value=sess), \
              patch('integrations.social.peer_discovery.gossip', fake_gossip), \
              patch('core.http_pool.pooled_post', pooled_post), \
@@ -214,3 +223,95 @@ class TestTheReceiversAnswerCounts:
             run(None, status_code=200, agg=agg)
         assert any('accepted' in r.getMessage() and self.URL in r.getMessage()
                    for r in caplog.records), [r.getMessage() for r in caplog.records]
+
+
+# ── 5. Every round says what it delivered ──────────────────────────────────
+
+class TestTheRoundIsSummarised:
+    """A node's own log could not say whether it delivered ANYTHING.
+    'Federation: epoch=N' is printed only when RECEIVED deltas are
+    aggregated, and a successful delivery logged nothing, so on 2026-09-26 a
+    14 h session showed zero epochs and no way to tell whether its deltas
+    ever left.  Each round now summarises its targets and outcomes at INFO
+    when the outcome changes (and as a heartbeat), DEBUG otherwise, so a
+    once-a-minute tick cannot flood the log."""
+
+    PREFIX = 'Federation delta round:'
+
+    def _summaries(self, caplog):
+        return [r for r in caplog.records
+                if r.getMessage().startswith(self.PREFIX)
+                and r.levelno == logging.INFO]
+
+    def _agg(self):
+        return TestTheReceiversAnswerCounts()._agg()
+
+    def test_the_first_round_is_summarised_with_what_it_delivered(self, caplog):
+        agg = self._agg()
+        with caplog.at_level(logging.INFO):
+            TestBroadcastTransportSelection()._run_broadcast(None, 200, agg=agg)
+        lines = [r.getMessage() for r in self._summaries(caplog)]
+        assert len(lines) == 1, lines
+        assert 'delivered 1' in lines[0] and 'refused 0' in lines[0], lines
+
+    def test_an_unchanged_round_is_not_repeated_at_info(self, caplog):
+        agg = self._agg()
+        run = TestBroadcastTransportSelection()._run_broadcast
+        with caplog.at_level(logging.INFO):
+            run(None, 200, agg=agg)
+            run(None, 200, agg=agg)
+        assert len(self._summaries(caplog)) == 1
+
+    def test_a_changed_outcome_is_summarised_again(self, caplog):
+        agg = self._agg()
+        run = TestBroadcastTransportSelection()._run_broadcast
+        with caplog.at_level(logging.INFO):
+            run(None, 200, agg=agg)
+            run(None, 403, agg=agg)
+        lines = [r.getMessage() for r in self._summaries(caplog)]
+        assert len(lines) == 2, lines
+        assert 'refused 1' in lines[1], lines
+
+    def test_a_steady_outcome_still_heartbeats(self, caplog):
+        agg = self._agg()
+        agg._ROUND_SUMMARY_HEARTBEAT = 2
+        run = TestBroadcastTransportSelection()._run_broadcast
+        with caplog.at_level(logging.INFO):
+            for _ in range(3):
+                run(None, 200, agg=agg)
+        assert len(self._summaries(caplog)) == 2
+
+    def test_a_peerlink_delivery_counts_as_delivered(self, caplog):
+        link = MagicMock()
+        link.is_connected = True
+        with caplog.at_level(logging.INFO):
+            TestBroadcastTransportSelection()._run_broadcast(link, agg=self._agg())
+        line = self._summaries(caplog)[0].getMessage()
+        assert 'delivered 1 (peerlink 1)' in line, line
+
+    def test_a_failing_attestation_is_a_warning_not_a_silent_skip(self, caplog):
+        """RED before: `except Exception: pass` sent the delta unattested,
+        which central refuses as 'unverified build', with no trace here."""
+        with caplog.at_level(logging.WARNING):
+            TestBroadcastTransportSelection()._run_broadcast(
+                None, agg=self._agg(), attestation=RuntimeError('LICENSE gone'))
+        assert any('attestation' in r.getMessage().lower()
+                   and r.levelno >= logging.WARNING for r in caplog.records), \
+            [r.getMessage() for r in caplog.records]
+
+    def test_a_broadcast_that_cannot_reach_the_db_is_a_warning(self, caplog):
+        """RED before: logged at DEBUG, invisible in every shipped log."""
+        agg = self._agg()
+        guard = MagicMock()
+        guard.check_egress.return_value = (True, 'ok')
+        with patch.object(fa, '_sign_delta'), \
+             patch('security.edge_privacy.get_scope_guard', return_value=guard), \
+             patch('security.origin_attestation.get_attestation_for_federation',
+                   return_value={'valid': False}), \
+             patch('integrations.social.models.get_db',
+                   side_effect=RuntimeError('db locked')), \
+             caplog.at_level(logging.WARNING):
+            agg.broadcast_delta({'version': 1, 'node_id': 'selfNode'})
+        assert any('Federation broadcast error' in r.getMessage()
+                   and r.levelno >= logging.WARNING for r in caplog.records), \
+            [r.getMessage() for r in caplog.records]

@@ -239,6 +239,10 @@ def test_a_venv_worker_heals_into_its_own_interpreter_not_the_user_site(
     assert captured['args'][0] == venv_py, "pip must run under the child's python"
     assert '--target' not in captured['args'], captured['args']
     assert captured['args'][-1] == 'pyloudnorm'
+    # pip's scripts-not-on-PATH scan resolves every PATH entry; a junction
+    # on PATH raised WinError 448 and rolled venv installs back (Nunba
+    # d3eef389, 2026-10-03).  The venv branch has no --target to skip it.
+    assert '--no-warn-script-location' in captured['args'], captured['args']
     he_mock.assert_not_called()
 
 

@@ -179,14 +179,27 @@ def resolve_upload_url(file_url) -> Optional[Path]:
     return target if target.is_file() else None
 
 
-def save_pdf(data: bytes, original_name: str = '') -> Path:
-    """Validate and store an uploaded or downloaded PDF under uploads/files."""
+#: save_pdf's default cap: MAX_PDF_BYTES as it is when save_pdf is called (a
+#: default argument would freeze the value it had at import).
+_MAX_PDF_BYTES_AT_CALL = object()
+
+
+def save_pdf(data: bytes, original_name: str = '',
+             max_bytes=_MAX_PDF_BYTES_AT_CALL) -> Path:
+    """Validate and store an uploaded or downloaded PDF under uploads/files.
+
+    `max_bytes` None: no size cap -- a local caller's own book (owner
+    2026-10-10, "local need not have a cap").  A download (fetch_pdf) and a
+    remote upload keep MAX_PDF_BYTES.
+    """
     from werkzeug.utils import secure_filename
+    if max_bytes is _MAX_PDF_BYTES_AT_CALL:
+        max_bytes = MAX_PDF_BYTES
     if not data:
         raise BookParseError('the file is empty')
-    if len(data) > MAX_PDF_BYTES:
+    if max_bytes is not None and len(data) > max_bytes:
         raise BookParseError(
-            f'the file is larger than {MAX_PDF_BYTES // (1024 * 1024)} MB')
+            f'the file is larger than {max_bytes // (1024 * 1024)} MB')
     if b'%PDF-' not in data[:1024]:
         raise BookParseError('the file is not a PDF')
     stem = secure_filename(Path(original_name or 'book').stem) or 'book'

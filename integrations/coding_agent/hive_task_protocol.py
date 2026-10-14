@@ -642,6 +642,11 @@ class HiveTaskDispatcher:
         with self._lock:
             task = self._tasks.get(task_id)
             if not task:
+                # Silent before: with two queues on one machine a result sent
+                # to the dispatcher that does not hold the task vanished here.
+                logger.warning(
+                    "Result for task %s dropped: this dispatcher (%s) does not "
+                    "hold it", task_id, _TASKS_FILE)
                 return {'spark_awarded': 0, 'quality_score': 0.0,
                         'validated': False, 'error': 'unknown_task'}
 

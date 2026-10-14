@@ -24,6 +24,7 @@ os.environ['CLAUDE_CONFIG_DIR'] = tempfile.mkdtemp(prefix='claude_code_frontier_
 import pytest  # noqa: E402
 
 import integrations.coding_agent.claude_code_backend as be  # noqa: E402
+from core.subprocess_safe import BoundedResult  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -39,16 +40,12 @@ def _copilot_on(monkeypatch):
 # ─── the shared invocation primitive ─────────────────────────────────────────
 
 def _fake_run(stdout='', stderr='', rc=0):
-    class _P:
-        returncode = rc
-    p = _P()
-    p.stdout = stdout
-    p.stderr = stderr
-    return p
+    """What the bounded runner hands back for a run that completed."""
+    return BoundedResult(rc, stdout, stderr)
 
 
 def test_inference_mode_constrains_tools_and_text_output():
-    with patch('subprocess.run', return_value=_fake_run('4')) as sr:
+    with patch.object(be, 'run_bounded', return_value=_fake_run('4')) as sr:
         r = be.invoke_claude('2+2?', mode='inference')
     assert r['ok'] and r['stdout'] == '4'
     cmd = sr.call_args[0][0]
@@ -67,7 +64,7 @@ def test_inference_mode_constrains_tools_and_text_output():
 
 
 def test_agentic_mode_is_a_plain_run_no_tool_gating():
-    with patch('subprocess.run', return_value=_fake_run('done')) as sr:
+    with patch.object(be, 'run_bounded', return_value=_fake_run('done')) as sr:
         r = be.invoke_claude('fix the bug', mode='agentic', cwd='/repo')
     assert r['ok'] and r['returncode'] == 0
     cmd = sr.call_args[0][0]
@@ -92,7 +89,7 @@ def test_daemon_run_claude_delegates_and_preserves_shape():
         'hart_copilot_daemon', os.path.join(root, 'scripts', 'hart_copilot_daemon.py'))
     dae = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(dae)
-    with patch('subprocess.run', return_value=_fake_run('ok', 'warn', 0)):
+    with patch.object(be, 'run_bounded', return_value=_fake_run('ok', 'warn', 0)):
         out = dae.run_claude('do it')
     # same keys the daemon always returned; truncation preserved
     assert out['ok'] is True and out['returncode'] == 0
