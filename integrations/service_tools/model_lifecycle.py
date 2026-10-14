@@ -1876,6 +1876,10 @@ class ModelLifecycleManager:
             if os.name == 'nt':
                 _popen_kwargs['creationflags'] = _sp.CREATE_NO_WINDOW
             proc = _sp.Popen(cmd, **_popen_kwargs)
+            # Die with this process: an orphaned llama-server keeps its RAM
+            # and CPU, and the next launch reuses it as "external".
+            from core.child_lifecycle import bind_to_parent
+            bind_to_parent(proc)
             # Store handle so it stays open for the child process
             self._direct_log_fh = log_fh
             log_fh = None  # Prevent close in finally

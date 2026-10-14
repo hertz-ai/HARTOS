@@ -416,6 +416,10 @@ class GPUWorker:
             encoding='utf-8',
             errors='replace',
         )
+        # Die with this process.  Nunba quits via os._exit(0), and a worker
+        # left behind holds its RAM until reboot.
+        from core.child_lifecycle import bind_to_parent
+        bind_to_parent(self._proc)
 
         # Drain stderr in a thread so it doesn't fill the pipe buffer.
         # Also forward worker log lines to our logger.
