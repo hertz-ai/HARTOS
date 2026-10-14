@@ -106,8 +106,15 @@ def test_stored_news_tag_brings_the_news_family_into_create(build):
 
 def test_a_record_without_stored_tags_builds_exactly_as_before(build):
     built = build(_record())
-    assert len(built.resolved) == 1
-    stored, text = built.resolved[0]
+    # The constructor's own resolution is the one over the session's task.
+    # The build may ask resolve_goal_tags other questions -- the reel family
+    # asks whether reel_studio is inert on this node (amendment A8 d,
+    # integrations.reel_studio.tools) -- but this agent's tags are resolved
+    # once, from the same inputs as before the fix.
+    own = [(stored, text) for stored, text in built.resolved
+           if text is built.task]
+    assert len(own) == 1
+    stored, text = own[0]
     assert stored is None and text is built.task, (
         'a legacy record must resolve with the same inputs as before the fix')
     assert 'fetch_news_feeds' not in _llm_names(built.helper)

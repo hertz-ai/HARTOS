@@ -3068,6 +3068,31 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
         # without acting.  Caught loud so future regressions surface.
         current_app.logger.warning(f"Goal-aware tool loading FAILED: {e}")
 
+    # Reel Studio (integrations/reel_studio): her Instagram-reel tools, a
+    # Tier-2 family in its own try after the shared one, so a failure on
+    # either side costs the other nothing (plan WS-8b).  Her Reel Studio agent
+    # (reel_studio in goal_tags) is shown them on the Helper and the
+    # Assistant; every other agent can only RUN them, so they cost it no
+    # schema and request_tools still finds them (core.agent_tool_menu.
+    # discover_and_attach reads the assistant's function map).  The executor
+    # runs the Assistant's own structured calls, as for every family above.
+    # The tools read the turn's request id from this module's request_id_list
+    # (chat_agent writes it per turn) when they run.  On the central node it
+    # registers nothing (amendment A8 d).  _attach_named_tools_for_action's
+    # fit keeps the family while reel_studio is unlocked.  CREATE makes the
+    # same call.
+    try:
+        from integrations.agent_engine.marketing_tools import REEL_STUDIO_TAG
+        from integrations.reel_studio.tools import register_reel_studio_tools
+        register_reel_studio_tools(
+            helper, assistant, user_id, prompt_id=prompt_id,
+            request_id_getter=lambda: request_id_list.get(user_prompt),
+            with_schema=REEL_STUDIO_TAG in goal_tags, executor=executor)
+    except Exception as e:
+        # Loud for the reason the shared block above is: an agent built
+        # without its reel tools talks about reels without making one.
+        current_app.logger.warning(f"Reel Studio tool loading FAILED: {e}")
+
     assistant.description = 'Designed to handle specific tasks by interacting directly with other agents or the user. It acts as the primary orchestrator for task management and ensures tasks are completed efficiently'
     user_proxy.description = 'Acts as a user, performing tasks assigned by the Assistant Agent. It simulates user actions and provides results or feedback as required.'
     helper.description = 'this is a helper agent that calls tools, facilitates task completion & assists other agents it cal perform tools/function like [send_message_in_seconds,send_message_to_user,send_presynthesized_video_to_user,text_2_image, get_user_camera_inp, get_user_uploaded_file, create_scheduled_jobs, get_text_from_image, Generate_video, get_user_id, get_prompt_id, get_data_by_key, get_saved_metadata, save_data_in_memory, search_long_term_memory and save_to_long_term_memory] calls and supporting backend processes. '
@@ -7470,6 +7495,31 @@ def _attach_named_tools_for_action(user_prompt):
             # schema, and only when the schema does not fit.
             from core.agent_tools import fit_schema_to_ctx
             _protect = set(named or ()) | {'send_message_to_user'}
+            # Her Reel Studio family, whole, while reel_studio is unlocked for
+            # the session (arm_turn_attach at construction, or attach_for_turn
+            # when a turn's words detect it) -- not only the tool this action
+            # names: reel_make is her agent's whole action, and its song list
+            # and caption checks feed it (plan WS-8b).  It registers last, so
+            # without this it is the first family the fit defers.  Only the
+            # reel tools this agent can RUN are kept: on the central node
+            # none is registered (register_reel_studio_tools, amendment A8 d),
+            # so a turn there that unlocks the tag -- attach_for_turn reads
+            # detect_goal_tags, which does not ask the node -- keeps nothing.
+            # Inline, not a helper of this module: the guard tests lift this
+            # function out of the file and run it on its own.
+            _unlocked = getattr(assistant, '_hart_unlocked_tags', None) or ()
+            if _unlocked:
+                from integrations.agent_engine.marketing_tools import REEL_STUDIO_TAG
+                if REEL_STUDIO_TAG in _unlocked:
+                    try:
+                        from integrations.reel_studio.tools import (
+                            REEL_TOOL_NAMES as _reel_names)
+                    except ImportError:
+                        # Then the family never registered (the constructor's
+                        # own try logged why): there is nothing to keep.
+                        _reel_names = ()
+                    _runs = getattr(assistant, '_function_map', None) or {}
+                    _protect |= {n for n in _reel_names if n in _runs}
             fit_schema_to_ctx(helper, protect=_protect, turn_protect=True)
             fit_schema_to_ctx(assistant, protect=_protect, turn_protect=True)
 

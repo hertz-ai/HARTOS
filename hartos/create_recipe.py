@@ -2155,6 +2155,30 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         # before being caught.  Loud now so any future regression surfaces.
         tool_logger.warning(f"Goal-aware tool loading FAILED: {e}")
 
+    # Reel Studio (integrations/reel_studio): her Instagram-reel tools, a
+    # Tier-2 family in its own try after the shared one, so a failure on
+    # either side costs the other nothing (plan WS-8b).  Her Reel Studio agent
+    # (reel_studio in goal_tags) is shown them; every other agent can only RUN
+    # them, so they cost it no schema and request_tools still finds them
+    # (core.agent_tool_menu.discover_and_attach reads the assistant's
+    # function map).  The same call as REUSE's, including the executor: the
+    # canonical Tier-2 shape register_reel_studio_tools documents.  The tools
+    # read the turn's request id from this module's request_id_list when they
+    # run.  On the central node it registers nothing (amendment A8 d).
+    # Registered after _pre_tier2_tools, so create_helper_keep below keeps
+    # her family on the Helper as it does every Tier-2 family.
+    try:
+        from integrations.agent_engine.marketing_tools import REEL_STUDIO_TAG
+        from integrations.reel_studio.tools import register_reel_studio_tools
+        register_reel_studio_tools(
+            helper, assistant, user_id, prompt_id=prompt_id,
+            request_id_getter=lambda: request_id_list.get(user_prompt),
+            with_schema=REEL_STUDIO_TAG in goal_tags, executor=executor)
+    except Exception as e:
+        # Loud for the reason the shared block above is: an agent built
+        # without its reel tools talks about reels without making one.
+        tool_logger.warning(f"Reel Studio tool loading FAILED: {e}")
+
     # ── Bound the HELPER's schema to what CREATE actually uses ─────────────
     # register_dual puts the schema on the helper and execution on the
     # assistant, so the helper accumulates EVERY family registered above while
