@@ -441,11 +441,11 @@ class ModelStorageManager:
         deletes or renames a file therefore leaves no stale copy behind
         (peer validation of 38a220495).  Only listed files are touched:
         node_modules, the browser a prepare script downloaded there, npm's
-        lock file and anything else not copied by a setup stay.  The list
+        lock file and anything else not copied by a setup stay
+        (_remove_listed_files says how a listed path is checked).  The list
         is written before the copy, so a copy that fails half way still
         names every file it may have placed.  Raises OSError.
         """
-        root = os.path.normpath(os.path.abspath(str(tool_dir)))
         files = [rel.replace(os.sep, '/') for rel in self._npm_project_files(project_dir)]
         listing = tool_dir / NPM_COPIED_LIST
         try:
@@ -457,40 +457,69 @@ class ModelStorageManager:
                            listing, e)
             before = []
         keep = set(files)
-        for rel in before if isinstance(before, list) else ():
-            if not isinstance(rel, str) or rel in keep:
-                continue
-            # A list entry is data on disk, not trusted.  An absolute one, or
-            # one naming a drive, is never ours: refused before it is joined
-            # (on Windows os.path.relpath raises ValueError for a path on
-            # another drive -- A23a N2 -- where setup_tool expects only
-            # NpmSetupFailed).
-            if os.path.isabs(rel) or os.path.splitdrive(rel)[0] or rel.startswith(('/', '\\')):
-                continue
-            path = os.path.normpath(os.path.join(root, rel))
-            inside = os.path.relpath(path, root).replace(os.sep, '/')
-            # Never outside the tool dir, never into what npm or a prepare
-            # script own.
-            if inside.startswith('../') or inside == '..' \
-                    or inside.split('/')[0] in _NPM_SKIP_DIRS or inside == NPM_COPIED_LIST:
-                continue
-            try:
-                os.remove(path)
-            except FileNotFoundError:
-                pass
-            parent = os.path.dirname(path)
-            while parent != root and parent.startswith(root + os.sep):
-                try:
-                    os.rmdir(parent)            # only when empty
-                except OSError:
-                    break
-                parent = os.path.dirname(parent)
+        self._remove_listed_files(tool_dir, [rel for rel in (before if isinstance(before, list) else ())
+                                             if isinstance(rel, str) and rel not in keep])
         tool_dir.mkdir(parents=True, exist_ok=True)
         listing.write_text(json.dumps(files), encoding='utf-8')
         for rel in files:
             dest = tool_dir / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(os.path.join(project_dir, rel), dest)
+
+    @staticmethod
+    def _remove_listed_files(tool_dir: Path, entries: List[str]) -> None:
+        """Remove each file an earlier setup listed (NPM_COPIED_LIST) and the
+        folders that leaves empty.  Never raises.
+
+        The list is data on disk, not trusted (amendment A24a).  An entry is
+        removed only when it resolves -- os.path.realpath, so through links,
+        junctions and 8.3 short names; compared after os.path.normcase, so in
+        any letter case -- to a FILE strictly inside the tool dir, not inside
+        what npm or a prepare script own (_NPM_SKIP_DIRS, resolved the same
+        way) and not the list itself.  '.', '', a folder, an absolute path, a
+        path on another drive or through a link that leads out is skipped.
+        An entry that cannot be checked or removed (OSError, or ValueError
+        for a name such as one with a NUL) is logged and skipped, so one bad
+        entry never fails the setup -- nor every later one, since the list
+        is rewritten only after this runs.  Review of a47b8c883: the lexical,
+        case-sensitive guard before this removed node_modules/x/keep.js for
+        'Node_Modules/x/keep.js', a file outside the tool dir for an entry
+        through a junction, and raised PermissionError for '.'.
+        """
+        def resolved(path) -> str:
+            return os.path.realpath(str(path))
+
+        def inside(path: str, top: str) -> bool:
+            """``path`` is ``top`` or below it (both resolved)."""
+            path, top = os.path.normcase(path), os.path.normcase(top)
+            try:
+                return os.path.commonpath([path, top]) == top
+            except ValueError:          # another drive, or not comparable
+                return False
+
+        root = resolved(tool_dir)
+        fenced = [resolved(os.path.join(root, d)) for d in sorted(_NPM_SKIP_DIRS)]
+        listing = resolved(os.path.join(root, NPM_COPIED_LIST))
+        for rel in entries:
+            try:
+                path = resolved(os.path.join(root, rel))
+                if (not inside(path, root) or os.path.normcase(path) == os.path.normcase(root)
+                        or os.path.normcase(path) == os.path.normcase(listing)
+                        or any(inside(path, top) for top in fenced)
+                        or not os.path.isfile(path)):
+                    continue
+                os.remove(path)
+            except (OSError, ValueError) as e:
+                logger.warning("an earlier project file listed as %r in %s was left in place: %s",
+                               rel, tool_dir, e)
+                continue
+            parent = os.path.dirname(path)
+            while inside(parent, root) and os.path.normcase(parent) != os.path.normcase(root):
+                try:
+                    os.rmdir(parent)            # only when empty
+                except OSError:
+                    break
+                parent = os.path.dirname(parent)
 
     @staticmethod
     def _check_free_disk(tool_dir: Path, need: int) -> None:

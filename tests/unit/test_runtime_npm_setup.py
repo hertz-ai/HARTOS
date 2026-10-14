@@ -16,6 +16,7 @@ here) and the Node locator; the storage, the manifest and the copy are real.
 import importlib
 import json
 import os
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -206,6 +207,139 @@ def test_an_absolute_or_other_drive_list_entry_is_skipped_not_raised(env):
     if sys.platform == 'win32':
         # The other-drive entry is the one that used to raise ValueError.
         assert os.path.splitdrive(other)[0] != drive
+
+
+# ── the copied-files list is data on disk (amendment A24a) ───────────────
+#
+# Review of a47b8c883, measured on D: against the real mirror: its guard
+# compared lexical paths, case-sensitively.  The entry 'Node_Modules/x/keep.js'
+# removed node_modules/x/keep.js and then the folders that emptied; the entry
+# 'link/victim.txt', through a junction, removed a file outside the tool dir;
+# the entry '.' raised PermissionError out of the mirror, and since the list
+# is rewritten only after the removals, every later setup failed the same
+# way.  An entry is now removed only when it resolves (links, junctions, 8.3
+# names, case) to a FILE strictly inside the tool dir and outside
+# node_modules; anything else is skipped, and an entry that cannot be
+# removed is logged and skipped.
+
+def _relist(env, entries):
+    """Make ``entries`` the copied-files list, and change the project so the
+    next setup mirrors again (a complete setup of the same project returns
+    at once)."""
+    tool_dir = env.storage.get_tool_dir(TOOL)
+    (tool_dir / model_storage.NPM_COPIED_LIST).write_text(json.dumps(entries))
+    with open(env.project / 'index.js', 'a') as fh:
+        fh.write('// changed\n')
+    return tool_dir
+
+
+def _npm_owned(tool_dir):
+    """A file npm put in node_modules, in a folder of its own."""
+    keep = tool_dir / 'node_modules' / 'x' / 'keep.js'
+    keep.parent.mkdir(parents=True, exist_ok=True)
+    keep.write_text('npm')
+    return keep
+
+
+@pytest.mark.parametrize('entry', ['Node_Modules/x/keep.js', 'NODE_MODULES/x/keep.js',
+                                   './node_modules/x/keep.js', 'node_modules/x/../x/keep.js'])
+def test_no_spelling_of_node_modules_reaches_it(env, entry):
+    env.rtm.setup_tool(TOOL)
+    keep = _npm_owned(env.storage.get_tool_dir(TOOL))
+    _relist(env, [entry])
+    result = env.rtm.setup_tool(TOOL)
+    assert result.get('ready') is True, result
+    assert keep.read_text() == 'npm' and keep.parent.is_dir()
+
+
+def _short_name(path):
+    """The 8.3 short name Windows keeps for ``path``, or None (another OS,
+    or a volume with short names off, as D: on the dev box is)."""
+    if sys.platform != 'win32':
+        return None
+    import ctypes
+    buf = ctypes.create_unicode_buffer(32768)
+    if not ctypes.windll.kernel32.GetShortPathNameW(str(path), buf, len(buf)):
+        return None
+    short = os.path.basename(buf.value)
+    return short if short.lower() != os.path.basename(str(path)).lower() else None
+
+
+def test_an_8dot3_short_name_never_reaches_node_modules(env):
+    env.rtm.setup_tool(TOOL)
+    tool_dir = env.storage.get_tool_dir(TOOL)
+    keep = _npm_owned(tool_dir)
+    short = _short_name(tool_dir / 'node_modules')
+    if not short:
+        pytest.skip('no 8.3 short name for node_modules on this volume (%s)' % tool_dir)
+    _relist(env, [short + '/x/keep.js'])
+    assert env.rtm.setup_tool(TOOL).get('ready') is True
+    assert keep.read_text() == 'npm'
+
+
+@pytest.mark.parametrize('entry', ['.', '', './', 'templates', 'templates/', 'node_modules'])
+def test_a_folder_entry_removes_nothing_and_every_setup_completes(env, entry):
+    (env.project / 'templates').mkdir()
+    (env.project / 'templates' / 'kept.tsx').write_text('kept')
+    env.rtm.setup_tool(TOOL)
+    tool_dir = _relist(env, [entry])
+    for _ in range(2):
+        result = env.rtm.setup_tool(TOOL)
+        assert result.get('ready') is True, result
+        _relist(env, [entry])
+    assert (tool_dir / 'templates' / 'kept.tsx').read_text() == 'kept'
+    assert (tool_dir / 'node_modules' / 'remotion' / 'index.js').is_file()
+
+
+def _link_dir(link, target):
+    """A folder link: an NTFS junction on Windows (what mklink /J makes, no
+    privilege needed), a symlink elsewhere."""
+    if sys.platform == 'win32':
+        import _winapi
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        os.symlink(str(target), str(link), target_is_directory=True)
+
+
+def test_a_link_out_of_the_tool_dir_is_never_followed(env):
+    env.rtm.setup_tool(TOOL)
+    tool_dir = env.storage.get_tool_dir(TOOL)
+    elsewhere = env.tmp / 'elsewhere'
+    (elsewhere / 'sub').mkdir(parents=True)
+    victim = elsewhere / 'sub' / 'victim.txt'
+    victim.write_text('keep')
+    _link_dir(tool_dir / 'link', elsewhere)
+    try:
+        _relist(env, ['link/sub/victim.txt'])
+        assert env.rtm.setup_tool(TOOL).get('ready') is True
+        assert victim.read_text() == 'keep' and (elsewhere / 'sub').is_dir()
+    finally:
+        # The link itself, never what it points at.
+        link = str(tool_dir / 'link')
+        if os.path.lexists(link):
+            os.rmdir(link) if sys.platform == 'win32' else os.unlink(link)
+
+
+def test_an_entry_that_cannot_be_removed_is_logged_and_skipped(env, monkeypatch, caplog):
+    (env.project / 'a.js').write_text('a')
+    (env.project / 'b.js').write_text('b')
+    env.rtm.setup_tool(TOOL)
+    tool_dir = env.storage.get_tool_dir(TOOL)
+    (env.project / 'a.js').unlink()
+    (env.project / 'b.js').unlink()
+    real_remove = os.remove
+
+    def remove(path, *a, **k):
+        if os.path.basename(str(path)) == 'a.js':
+            raise PermissionError(13, 'Access is denied', str(path))
+        return real_remove(path, *a, **k)
+    monkeypatch.setattr(os, 'remove', remove)
+    with caplog.at_level('WARNING', logger=model_storage.logger.name):
+        result = env.rtm.setup_tool(TOOL)
+    assert result.get('ready') is True, result
+    assert (tool_dir / 'a.js').is_file() and not (tool_dir / 'b.js').exists()
+    assert any('a.js' in r.getMessage() and 'Access is denied' in r.getMessage()
+               for r in caplog.records)
 
 
 def test_a_project_without_package_json_is_refused_before_npm_runs(env):
