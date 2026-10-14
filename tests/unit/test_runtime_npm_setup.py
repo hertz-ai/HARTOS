@@ -239,6 +239,36 @@ def test_a_project_with_no_dependencies_is_complete_without_node_modules(env, mo
     assert env.rtm.tool_ready(TOOL) is False, 'dependencies named, none installed'
 
 
+def test_the_install_bound_is_the_callers(env):
+    """install_npm_project takes the npm install bound from its caller (the
+    WhatsApp gateway keeps its 180 s); the default stays NPM_INSTALL_TIMEOUT_S."""
+    env.storage.install_npm_project(TOOL, str(env.project), timeout_s=180.0)
+    assert [r.timeout for r in env.runs if r.kind == 'npm'] == [180.0]
+    other = model_storage.ModelStorageManager(base_dir=env.tmp / 'models2')
+    env.runs.clear()
+    other.install_npm_project(TOOL, str(env.project))
+    assert [r.timeout for r in env.runs if r.kind == 'npm'] == [model_storage.NPM_INSTALL_TIMEOUT_S]
+
+
+def test_npm_is_asked_to_prefer_its_cache(env):
+    env.rtm.setup_tool(TOOL)
+    npm = next(r for r in env.runs if r.kind == 'npm')
+    assert '--prefer-offline' in npm.cmd
+
+
+def test_a_failed_npm_logs_its_output_and_where(env, caplog):
+    """The person is told a short reason; the log keeps npm's own words and
+    the folder it ran in (what the WhatsApp gateway's own log kept, for the
+    EPERM-under-Program-Files diagnosis)."""
+    env.answers['npm'] = BoundedResult(1, 'x' * 1500 + ' EPERM mkdir node_modules', '')
+    with caplog.at_level('WARNING', logger=model_storage.logger.name):
+        result = env.rtm.setup_tool(TOOL)
+    assert 'npm install failed' in result['error'] and len(result['error']) < 600
+    logged = '\n'.join(r.getMessage() for r in caplog.records)
+    assert 'EPERM mkdir node_modules' in logged and 'x' * 1400 in logged
+    assert str(env.storage.get_tool_dir(TOOL)) in logged
+
+
 @pytest.mark.parametrize('kind, answer, said', [
     ('npm', BoundedResult(1, '', 'ERR! 404 Not Found'), 'npm install failed'),
     ('npm', BoundedResult(-1, '', '', timed_out=True), 'timed out'),

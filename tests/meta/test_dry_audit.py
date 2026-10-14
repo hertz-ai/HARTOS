@@ -261,6 +261,10 @@ CANONICAL_OWNERS = {
     # WhatsApp gateway supervisor and the runtime's npm setup import it.
     'find_node': 'core/node_bin.py',
     'find_npm': 'core/node_bin.py',
+    # The one npm installer (A16/A18/A20): RuntimeToolManager's npm rows and
+    # the WhatsApp gateway (whatsapp_supervisor.ensure_baileys_deps) set up
+    # through it.
+    'install_npm_project': 'integrations/service_tools/model_storage.py',
 }
 
 #: module -> why it may walk sys._current_frames() itself.

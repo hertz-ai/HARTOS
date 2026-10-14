@@ -108,11 +108,17 @@ def test_the_whatsapp_gateway_says_node_is_missing(monkeypatch, tmp_path):
 
 
 def test_the_whatsapp_deps_need_the_located_npm(monkeypatch, tmp_path):
+    """The gateway's deps go through the one npm installer
+    (model_storage.install_npm_project), which asks the locator."""
     from integrations.social import whatsapp_supervisor as ws
-    monkeypatch.setenv('HEVOLVE_HOME', str(tmp_path))
-    monkeypatch.setattr(ws, '_bundled_gateway_dir', lambda: tmp_path / 'bundle')
-    monkeypatch.setattr(shutil, 'which', _which({}))
+    monkeypatch.setenv('HEVOLVE_HOME', str(tmp_path / 'home'))
+    bundle = tmp_path / 'bundle'
+    bundle.mkdir()
+    (bundle / 'package.json').write_text('{"name": "gw", "dependencies": {"express": "^4"}}')
+    monkeypatch.setattr(ws, '_bundled_gateway_dir', lambda: bundle)
+    monkeypatch.setattr(shutil, 'which', _which({'node': '/opt/node/bin/node'}))
     assert ws.ensure_baileys_deps() is False
+    assert not (tmp_path / 'home' / 'whatsapp' / 'gateway' / 'node_modules').exists()
 
 
 @pytest.mark.parametrize('module, gone', [

@@ -508,22 +508,34 @@ class ModelStorageManager:
         except (OSError, ValueError) as e:
             raise NpmSetupFailed(f'{what} could not be started: {e}') from e
         if result.timed_out:
+            logger.warning("%s timed out after %d s in cwd=%s", what, int(timeout_s), cwd)
             raise NpmSetupFailed(f'{what} timed out after {int(timeout_s)} s')
         if result.returncode != 0:
+            # The log keeps the step's own words and where it ran (a failure
+            # such as EPERM under a read-only install folder diagnoses itself
+            # from them); the person is told a short tail.
+            logger.warning("%s returned %d in cwd=%s:\n%s", what, result.returncode, cwd,
+                           ((result.stdout or '') + (result.stderr or '')).strip()[-2000:]
+                           or '<no output>')
             tail = ' '.join((result.stderr or result.stdout or '').split())[-400:]
             raise NpmSetupFailed(f'{what} failed (exit {result.returncode}): {tail}')
         logger.info("%s finished in %s: %s", what, cwd,
                     ' '.join((result.stdout or '').split())[-300:])
 
     def install_npm_project(self, tool_name: str, project_dir: str, *,
-                            prepare: Optional[str] = None) -> Path:
+                            prepare: Optional[str] = None,
+                            timeout_s: float = NPM_INSTALL_TIMEOUT_S) -> Path:
         """Set the npm project at ``project_dir`` up in this tool's directory.
+
+        THE npm installer: RuntimeToolManager's npm rows and the WhatsApp
+        gateway (integrations/social/whatsapp_supervisor.ensure_baileys_deps,
+        with its own storage root) both set up through it.
 
         Mirrors the project's files there (_mirror_npm_project: copied, and
         files an earlier setup copied that the project no longer has
-        removed), runs ``npm install``
-        there, then ``node <prepare>`` when the project names a prepare
-        script, and records the receipt.  Idempotent: a complete setup of
+        removed), runs ``npm install --prefer-offline`` there (bounded by
+        ``timeout_s``), then ``node <prepare>`` when the project names a
+        prepare script, and records the receipt.  Idempotent: a complete setup of
         this exact project returns at once; one setup per tool directory
         runs at a time.  Returns the tool directory; raises NpmSetupFailed
         (no package.json in the project, Node.js or npm missing, a step
@@ -550,9 +562,11 @@ class ModelStorageManager:
                 raise NpmSetupFailed(f'the project could not be copied into {tool_dir}: {e}') from e
             # npm on Windows is a .cmd shim; launch_argv is how a shim is run.
             from integrations.coding_agent.installer import launch_argv
+            # --prefer-offline: what npm's cache already holds is not fetched
+            # again (a re-setup after an update changes little).
             self._npm_step(launch_argv([npm, 'install', '--no-audit', '--no-fund',
-                                        '--loglevel=error']),
-                           'npm install', tool_dir, NPM_INSTALL_TIMEOUT_S)
+                                        '--loglevel=error', '--prefer-offline']),
+                           'npm install', tool_dir, timeout_s)
             if not (tool_dir / 'node_modules').is_dir() \
                     and self._npm_declares_dependencies(project_dir):
                 raise NpmSetupFailed('npm install finished but made no node_modules in %s'

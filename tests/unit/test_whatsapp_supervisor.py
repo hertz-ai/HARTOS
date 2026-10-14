@@ -1,19 +1,32 @@
 """Unit tests for integrations.social.whatsapp_supervisor.
 
-Tests the gating + path-resolution logic without spawning Node.  The
-actual subprocess lifecycle is covered by an integration test that
-runs only when Node + npm are present (skipped on CI without Node).
+Tests the gating, the paths and the gateway's npm setup (through the one
+npm installer, model_storage.install_npm_project, with npm mocked) without
+spawning Node.  The actual subprocess lifecycle is covered by an
+integration test that runs only when Node + npm are present (skipped on CI
+without Node).
 """
 
+import importlib
+import json
 import os
+import shutil
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest import mock
+
+import pytest
 
 # Make HARTOS importable regardless of pytest invocation cwd.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
-from integrations.social import whatsapp_supervisor as ws
+from core.subprocess_safe import BoundedResult  # noqa: E402
+from integrations.social import whatsapp_supervisor as ws  # noqa: E402
+
+# By module path: the package re-exports the storage SINGLETON under the
+# module's own name, so the attribute form would be the instance.
+model_storage = importlib.import_module('integrations.service_tools.model_storage')
 
 
 class GatingTests(unittest.TestCase):
@@ -93,83 +106,106 @@ class PathTests(unittest.TestCase):
             os.environ.pop('HEVOLVE_HOME', None)
 
 
-class GatewayDirIsUserWritableTests(unittest.TestCase):
-    """Regression for 2026-05-17→23 production failure:
-    _gateway_dir() returned the read-only Program Files install path,
-    npm install hit EPERM every boot, gateway never started, WhatsApp
-    channel unreachable.  Fix routes gateway.js + package.json into
-    ~/.hevolve/whatsapp/gateway/ which is user-writable, and copies
-    the bundled files in idempotently on first call."""
+@pytest.fixture
+def gateway(tmp_path, monkeypatch):
+    """The gateway's npm setup with npm mocked at its one boundary
+    (model_storage.run_bounded) and the bundled project copied, so a test
+    can change it.  HEVOLVE_HOME is a tmp dir.
 
-    def setUp(self):
-        import tempfile
-        self._tmp = tempfile.mkdtemp(prefix='whatsapp_supervisor_test_')
-        os.environ['HEVOLVE_HOME'] = self._tmp
+    Regression for the 2026-05-17..23 production failure: the gateway ran
+    npm install inside the read-only Program Files install path (EPERM every
+    boot, WhatsApp unreachable).  The gateway is set up in
+    HEVOLVE_HOME/whatsapp/gateway, user-writable, by the one npm installer
+    (model_storage.install_npm_project, amendment A18/A20)."""
+    home = tmp_path / 'home'
+    monkeypatch.setenv('HEVOLVE_HOME', str(home))
+    bundle = tmp_path / 'bundle'
+    bundle.mkdir()
+    real = ws._bundled_gateway_dir()
+    for name in ('gateway.js', 'package.json', 'package-lock.json'):
+        shutil.copy2(str(real / name), str(bundle / name))
+    monkeypatch.setattr(ws, '_bundled_gateway_dir', lambda: bundle)
+    monkeypatch.setattr(model_storage, 'find_node', lambda beside=None: '/opt/node/bin/node')
+    monkeypatch.setattr(model_storage, 'find_npm', lambda: '/opt/node/bin/npm')
+    runs = []
+    answer = {'npm': BoundedResult(0, 'added 80 packages', '')}
 
-    def tearDown(self):
-        import shutil
-        os.environ.pop('HEVOLVE_HOME', None)
-        try:
-            shutil.rmtree(self._tmp, ignore_errors=True)
-        except OSError:
-            pass
+    def run_bounded(cmd, timeout=5.0, **kw):
+        runs.append(SimpleNamespace(cmd=list(cmd), timeout=timeout, cwd=kw.get('cwd')))
+        if answer['npm'].returncode == 0:
+            os.makedirs(os.path.join(kw['cwd'], 'node_modules', '@whiskeysockets'), exist_ok=True)
+        return answer['npm']
+    monkeypatch.setattr(model_storage, 'run_bounded', run_bounded)
+    return SimpleNamespace(home=home, bundle=bundle, runs=runs, answer=answer)
 
-    def test_gateway_dir_returns_writable_path_under_hevolve_home(self):
-        gw = ws._gateway_dir()
-        # Must be under HEVOLVE_HOME, NOT under the install path —
-        # this is the core invariant the fix establishes.
-        self.assertTrue(str(gw).startswith(self._tmp),
-            f"_gateway_dir() returned {gw!r} which is not under "
-            f"HEVOLVE_HOME={self._tmp!r} — fix regressed back to "
-            f"the read-only Program Files path.")
-        # Should be the gateway/ subfolder of whatsapp/
-        self.assertTrue(gw.name == 'gateway')
-        self.assertTrue(gw.parent.name == 'whatsapp')
 
-    def test_gateway_dir_copies_bundled_files_on_first_call(self):
-        # First call to _gateway_dir() must copy gateway.js +
-        # package.json from the bundled location so the subsequent
-        # `npm install` has something to install against.
-        gw = ws._gateway_dir()
-        self.assertTrue((gw / 'gateway.js').exists(),
-            "gateway.js was not staged into the writable dir on "
-            "first call — npm install will fail with ENOENT.")
-        self.assertTrue((gw / 'package.json').exists(),
-            "package.json was not staged into the writable dir on "
-            "first call — npm install has no spec to install.")
+def test_the_gateway_is_set_up_in_a_writable_dir_under_hevolve_home(gateway):
+    gw = ws._gateway_dir()
+    assert gw == gateway.home / 'whatsapp' / 'gateway'
+    assert gw.resolve() != ws._bundled_gateway_dir().resolve()
+    assert ws.ensure_baileys_deps() is True
+    # The project's files are staged where npm runs, never in the bundle.
+    for name in ('gateway.js', 'package.json', 'package-lock.json'):
+        assert (gw / name).read_bytes() == (gateway.bundle / name).read_bytes(), name
+    [npm] = gateway.runs
+    assert os.path.samefile(npm.cwd, gw) and 'install' in npm.cmd
+    assert not (gateway.bundle / 'node_modules').exists()
 
-    def test_gateway_dir_idempotent(self):
-        # Second call must NOT re-copy (would clobber any in-place
-        # edits the gateway makes to its own files post-install, and
-        # is the literal definition of idempotent per the docstring).
-        gw1 = ws._gateway_dir()
-        # Touch the staged gateway.js with a sentinel mtime; if the
-        # second call recopies, the mtime changes back to the
-        # source's.
-        target = gw1 / 'gateway.js'
-        from datetime import datetime, timedelta
-        old_mtime = (datetime.now() - timedelta(days=7)).timestamp()
-        os.utime(str(target), (old_mtime, old_mtime))
-        first_mtime = target.stat().st_mtime
-        gw2 = ws._gateway_dir()
-        second_mtime = target.stat().st_mtime
-        self.assertEqual(gw1, gw2)
-        # mtime should be unchanged: the staged file is newer than
-        # the source check (we artificially aged it but the comparison
-        # in _gateway_dir uses dst_mtime < src_mtime so an older dst
-        # WOULD trigger recopy).  Use file content equality as the
-        # real idempotency proof.
-        self.assertEqual((gw1 / 'gateway.js').read_bytes(),
-                         (ws._bundled_gateway_dir() / 'gateway.js').read_bytes())
 
-    def test_gateway_dir_distinct_from_bundled(self):
-        """The writable dir and the bundled dir must NOT be the same
-        path — that's the entire point of the fix."""
-        writable = ws._gateway_dir()
-        bundled = ws._bundled_gateway_dir()
-        self.assertNotEqual(writable.resolve(), bundled.resolve(),
-            f"_gateway_dir() ({writable}) and _bundled_gateway_dir() "
-            f"({bundled}) resolved to the same path — the fix regressed.")
+def test_the_gateway_install_keeps_its_180_second_bound(gateway):
+    """It runs in the HARTOS bootstrap thread, before Nunba's chat start."""
+    ws.ensure_baileys_deps()
+    assert [r.timeout for r in gateway.runs] == [ws.GATEWAY_NPM_TIMEOUT_S] == [180.0]
+    assert '--prefer-offline' in gateway.runs[0].cmd
+
+
+def test_a_second_start_installs_nothing(gateway):
+    assert ws.ensure_baileys_deps() is True
+    gateway.runs.clear()
+    assert ws.ensure_baileys_deps() is True
+    assert gateway.runs == []
+
+
+def test_a_changed_package_json_installs_again(gateway):
+    """The drift the review of 38a220495 found: the old copy returned True
+    as soon as node_modules existed, so a HARTOS update that changed
+    package.json (staged by _gateway_dir) never reinstalled.  The one
+    installer's receipt names the project's files."""
+    assert ws.ensure_baileys_deps() is True
+    doc = json.loads((gateway.bundle / 'package.json').read_text(encoding='utf-8'))
+    doc['dependencies']['express'] = '^4.22.0'
+    (gateway.bundle / 'package.json').write_text(json.dumps(doc), encoding='utf-8')
+    gateway.runs.clear()
+    assert ws.ensure_baileys_deps() is True
+    assert len(gateway.runs) == 1, 'the changed project is installed again'
+    staged = json.loads((ws._gateway_dir() / 'package.json').read_text(encoding='utf-8'))
+    assert staged['dependencies']['express'] == '^4.22.0'
+
+
+def test_a_failed_install_is_false_and_retried_next_start(gateway):
+    gateway.answer['npm'] = BoundedResult(1, 'npm ERR! EPERM', '')
+    assert ws.ensure_baileys_deps() is False
+    gateway.answer['npm'] = BoundedResult(0, 'added 80 packages', '')
+    gateway.runs.clear()
+    assert ws.ensure_baileys_deps() is True
+    assert len(gateway.runs) == 1
+
+
+def test_a_timed_out_install_is_false(gateway):
+    gateway.answer['npm'] = BoundedResult(-1, '', '', timed_out=True)
+    assert ws.ensure_baileys_deps() is False
+
+
+def test_the_supervisor_keeps_no_npm_installer_of_its_own(gateway, monkeypatch):
+    """One installer (A18): the gateway's npm runs only through
+    model_storage, so with model_storage's runner refusing, nothing else
+    launches npm."""
+    import subprocess as sp
+    spawned = []
+    monkeypatch.setattr(sp, 'run', lambda *a, **k: spawned.append(a) or None)
+    monkeypatch.setattr(sp, 'Popen', lambda *a, **k: spawned.append(a) or None)
+    assert ws.ensure_baileys_deps() is True
+    assert spawned == [] and len(gateway.runs) == 1
 
 
 class StartSupervisorTests(unittest.TestCase):
