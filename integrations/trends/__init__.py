@@ -10,14 +10,18 @@ central node makes it, serves it or fetches it.
                             one whose tier cannot be read (owner ruling
                             U6): starts ig_worker.py as a child process,
                             polls it on later ticks, ranks and publishes
-                            what it brought back.  No thread, no LLM.  Her
+                            what it brought back.  No thread, no LLM.  It
+                            needs a watchlist (the accounts to watch;
+                            nothing writes one yet, plan U1) and then her
                             research account (a DEDICATED Instagram account,
-                            never her business account) is read from this
+                            never her business account), read from this
                             desktop's vault, where the credential consent
                             card puts it (ask_for_account files the card
-                            when her agent asks for songs and it is
-                            missing); the worker's own venv is built by
-                            Nunba's installer on the owner's yes.
+                            when her agent asks for songs, a watchlist
+                            exists and the account is missing; never
+                            without a watchlist); the worker's own venv is
+                            built by Nunba's installer on the owner's yes,
+                            when the disk has room for it.
   ig_worker.py              the child.  Runs in the worker's own venv under
                             the data dir (core.venv_paths, WORKER_VENV),
                             where instagrapi is installed; instagrapi never
@@ -46,10 +50,12 @@ central node makes it, serves it or fetches it.
                             account when that is why.
 
 Files (under core.platform_paths.get_data_dir()/trends/): watchlist.json
-(the accounts watched, kept by hand), state.json (the job's schedule and
-outcome), .ig_session.json (the research account's session, 0600),
-worker.log, run/, songs/latest.json and songs/YYYY-MM-DD.json, and
-song_lang.json (the language cache).
+(the accounts watched; nothing in HARTOS or Nunba writes it yet -- who
+chooses them on her desktop is the owner's open decision, plan U1 -- so a
+default install makes no list and asks for no account), state.json (the
+job's schedule and outcome), .ig_session.json (the research account's
+session, 0600), worker.log, run/, songs/latest.json and
+songs/YYYY-MM-DD.json, and song_lang.json (the language cache).
 
 The published list carries no URLs and no session data
 (integrations.reel_studio.contracts.validate_trending_songs refuses both).

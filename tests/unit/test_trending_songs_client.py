@@ -204,12 +204,53 @@ def test_a_list_made_earlier_is_still_served_after_the_account_is_removed(client
     assert [s['song_key'] for s in out['songs']] == ['cluster:1']
 
 
-def test_with_no_watchlist_it_says_so(client, tmp_path):
-    c, _ = client
+def test_with_no_watchlist_it_says_so_in_words_she_can_act_on(client, tmp_path):
+    """Reviewer on d73704a5e: the note named a file in the data folder
+    (trends/watchlist.json), which neither she nor her agent can do anything
+    with.  It says what is missing and what she can do meanwhile, and asks
+    her for no account."""
+    c, st = client
     (tmp_path / 'trends' / 'watchlist.json').unlink()
+    st['creds'].clear()                              # nor is the account entered
     out = c.get_trending_songs()
     assert out['songs'] == [] and out['reason'] == 'no_watchlist'
-    assert 'watch' in out['note']
+    note = out['note']
+    assert 'watch' in note
+    assert 'choose a song in Instagram' in note      # what she can do meanwhile
+    for path_word in ('watchlist.json', 'trends/', 'data folder', '.json'):
+        assert path_word not in note
+    assert 'password' not in note and 'consent card' not in note
+
+
+#: Every reason a read can carry: daily_job.why_no_list's own, the job's
+#: run errors (daily_job, ig_worker, sources.collect) and why a list was
+#: not published (trending_songs.why_not_published), and the client's own.
+_REASONS = ('central', 'tier_unknown', 'no_account', 'account_asked', 'account_declined',
+            'no_watchlist', 'setup_asked', 'setup_declined', 'setup_unavailable',
+            'no_installer', 'no_disk', 'installing', 'running', 'not_run_yet',
+            'challenge', 'login', 'throttled', 'feedback', 'transport', 'not_found',
+            'unknown', 'dependency', 'install_failed', 'install_timeout', 'spawn_failed',
+            'worker_failed', 'bad_output', 'interrupted', 'timeout', 'partial_run',
+            'empty_list', 'invalid_list', 'not_written', 'stale', 'error')
+
+
+@pytest.mark.parametrize('reason', _REASONS)
+def test_every_reason_has_its_own_words_and_no_mechanism_code(client, reason):
+    """Reviewer on d73704a5e: most reasons fell back to 'There is no fresh
+    trending-song list on this computer (install_failed).', a mechanism
+    code that also rode the reel's push to her phone."""
+    c, _ = client
+    note = c.note_for(reason)
+    assert note and note != c.note_for('a_reason_nobody_wrote')
+    assert '(' + reason + ')' not in note
+    if '_' in reason:
+        assert reason not in note
+
+
+def test_a_reason_nobody_wrote_words_for_still_names_no_code(client):
+    c, _ = client
+    note = c.note_for('a_reason_nobody_wrote')
+    assert note and 'a_reason_nobody_wrote' not in note
 
 
 def test_on_central_there_is_no_list(client, monkeypatch):

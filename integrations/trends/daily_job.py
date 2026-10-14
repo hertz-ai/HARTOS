@@ -11,9 +11,9 @@ yield gate (dispatch.should_yield_to_user: nobody is using the computer),
 before its "no active goals" stop: her list does not depend on goals.  It
 runs no thread and no LLM:
 
-* on a central node (or one whose tier cannot be read), without her
-  research account, or without a watchlist it returns 'skip', and between
-  checks it only compares two numbers;
+* on a central node (or one whose tier cannot be read), without a
+  watchlist, or without her research account it returns 'skip', and
+  between checks it only compares two numbers;
 * when the run is due it starts the worker as a child process
   (``<worker venv python> -I ig_worker.py <spec> <out>``) and returns
   'started'; the research account's credentials are written to the child's
@@ -30,10 +30,13 @@ Her research account: a DEDICATED Instagram account made for this research,
 never her business account.  Its username and password are owner-entered
 credentials in this desktop's own vault (hartos.ai_key_vault;
 USERNAME_CREDENTIAL and PASSWORD_CREDENTIAL), never tracked.  The way in is
-the one credential consent card: when her agent asks for trending songs and
-the account is missing, ``ask_for_account()`` (through
-trending_songs_client) files it with hartos.ai_key_vault.request_credential,
-one card per part, for this computer's owner.  The card's Accept keeps the
+the one credential consent card: when her agent asks for trending songs, a
+watchlist names an account to watch and the research account is missing,
+``ask_for_account()`` (through trending_songs_client) files it with
+hartos.ai_key_vault.request_credential, one card per part, for this
+computer's owner.  With no usable watchlist nothing is asked for: the job
+cannot run without one, so asking for a password then would collect a
+credential nothing can use.  The card's Accept keeps the
 value in Nunba's desktop vault, which hands it to this vault
 (hold_credential) now and at every boot, and grants the consent row that
 names it; that row is what survives a restart.  A value sent to the
@@ -52,17 +55,33 @@ under the data dir (core.venv_paths, the per-backend venv store; name
 WORKER_VENV, packages WORKER_PACKAGES).  When that venv is missing, its last
 install did not finish (failed, timed out, or cut short by a restart), or a
 run found no instagrapi in it, the owner is asked first
-(capability_setup.ask_owner_for_setup, capability SETUP_CAPABILITY); on yes
+(capability_setup.ask_owner_for_setup, capability SETUP_CAPABILITY) --
+unless the disk under the venv root has less than INSTALL_FREE_BYTES free,
+when nothing is asked or installed and the job waits ('no_disk'); on yes
 Nunba's installer builds it on its own thread
 (tts.backend_venv.install_in_background) and later ticks only ask how it
 went ('installing', then 'installed').  HARTOS run without Nunba has no
-installer, so the job waits and says so.
+installer, so the job waits and says so ('no_installer').
+Gate 4, a second route recorded: owner ruling A16 names
+integrations.service_tools.runtime_manager.RuntimeToolManager the one place
+for runtime setup and says to extend it when a mechanism is missing.  It has
+no pip-in-venv setup today, and its tool_dir/.venv is not core.venv_paths'
+venv store, so this job goes through Nunba's tts.backend_venv
+(install_into_venv, the one pip-into-a-venv path) instead.  TODO(delete by
+2026-11-30, pending the owner's or lead's choice of the one home -- for
+example an RTM pip-venv type that delegates to install_into_venv): route
+_installer through that home and delete it.
 
-Due means: the node is a desktop (security.key_delegation.get_node_tier
-answers and is not central), her research account is entered,
-``trends/watchlist.json`` names at least one account, nothing is frozen,
-and ``state.json``'s next_run_at has passed (set a day after the last good
-run, plus up to JITTER_S).
+Where it runs: any node whose tier (security.key_delegation.get_node_tier)
+answers and is not central.  Her desktop is a 'flat' node, the default; a
+'regional' or 'local' node runs it only once its own owner has entered a
+research account and a watchlist there, and what it makes is read only on
+that node (nothing serves it to other nodes).
+
+Due means: the node runs it (above), ``trends/watchlist.json`` names at
+least one account, her research account is entered, nothing is frozen, and
+``state.json``'s next_run_at has passed (set a day after the last good run,
+plus up to JITTER_S).
 
 Failures (goals-trends report 2.5):
 * challenge / login: frozen for FREEZE_S (doubling on each freeze in a row,
@@ -81,10 +100,13 @@ process adopts the child's batch when it is written, or records the run as
 interrupted once TIMEOUT_S has passed.
 
 ``why_no_list()`` says why there is no list (for her agent's reply), and
-where the ask for her research account stands when that is why.
+where the ask for her research account stands when that is why; the order
+is the tier, the watchlist, then the account (_not_ready).
 
-Files (get_data_dir()/trends/): watchlist.json (kept by hand: {"region",
-"niche", "accounts": [handle | {"handle", "pk"}]}), state.json,
+Files (get_data_dir()/trends/): watchlist.json ({"region", "niche",
+"accounts": [handle | {"handle", "pk"}]}; nothing writes it yet -- who
+chooses the accounts on her desktop is the owner's open decision, plan
+U1 -- so a default install makes no list and asks for nothing), state.json,
 .ig_session.json (the worker's, 0600), worker.log, run/ (the current
 spec and batch, removed after each run), songs/ (trending_songs).
 """
@@ -92,6 +114,7 @@ import json
 import logging
 import os
 import random
+import shutil
 import subprocess
 import threading
 import time
@@ -169,9 +192,19 @@ SETUP_REASON = ("Find the songs trending in makeup reels on Instagram once a day
                 "this computer is not in use? It installs a small Instagram reader "
                 "(instagrapi) on this computer and signs in with the research account "
                 "entered here, never your business account.")
-#: An install still running after this long is given up (Nunba's installer
-#: allows each package 30 minutes).
-INSTALL_TIMEOUT_S = 3 * 3600.0
+#: An install still running after this long is given up.  A backstop only:
+#: Nunba's install_into_venv bounds itself (a 300 s pip upgrade, then for
+#: each package up to 3 pip attempts of at most 1800 s each -- a timed-out
+#: attempt ends the install -- and a 90 s import check), which for these 7
+#: packages is about 10.8 h at the very worst, so a slow but legitimate
+#: install is waited on, and only an install whose record never ends trips
+#: this.
+INSTALL_TIMEOUT_S = 12 * 3600.0
+#: The free disk the worker's venv needs before the owner is asked to allow
+#: it: instagrapi and its dependencies (on the order of 100 MB installed),
+#: pip's downloads and temp files, and a margin so the install never fills
+#: the disk.
+INSTALL_FREE_BYTES = 512 * 1024 * 1024
 
 WORKER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ig_worker.py')
 #: All the child's environment holds: what an interpreter needs to start and
@@ -234,14 +267,16 @@ def _tick(now: float) -> str:
 def why_no_list() -> str:
     """Why this computer has no trending-song list (for her agent's reply):
     'central' (never made on a central node), 'tier_unknown' (the node's
-    tier could not be read, so nothing runs), no research account entered
-    here -- 'account_asked' (its consent card is waiting), 'account_declined'
-    (the owner said no to it) or 'no_account' (nobody asked, or nobody here
-    to ask) --, 'no_watchlist', 'running', 'installing' (this process is
-    installing the worker's venv), 'setup_asked' / 'setup_declined' /
-    'setup_unavailable' (the owner's answer to installing the worker),
-    'no_installer' (HARTOS without Nunba), the last run's error code, or
-    'not_run_yet'."""
+    tier could not be read, so nothing runs), 'no_watchlist' (no account to
+    watch is listed; checked before the research account, which is not
+    asked for until there is one), no research account entered here --
+    'account_asked' (its consent card is waiting), 'account_declined' (the
+    owner said no to it) or 'no_account' (nobody asked, or nobody here to
+    ask) --, 'running', 'installing' (this process is installing the
+    worker's venv), 'setup_asked' / 'setup_declined' / 'setup_unavailable'
+    (the owner's answer to installing the worker), 'no_installer' (HARTOS
+    without Nunba), 'no_disk' (too little free disk to install the worker),
+    the last run's error code, or 'not_run_yet'."""
     why = _not_ready()
     if why == 'no_account':
         return _account_ask_state()
@@ -278,14 +313,18 @@ def _tier_refusal() -> Optional[str]:
 
 
 def _not_ready() -> Optional[str]:
+    """What keeps the job from running on this node, first things first:
+    the tier, then the watchlist, then her research account (whose card is
+    filed only once there is a watchlist, ask_for_account); None when
+    nothing does."""
     why = _tier_refusal()
     if why:
         return why
+    if not _has_watchlist():
+        return 'no_watchlist'
     username, password = _credentials()
     if not username or not password:
         return 'no_account'
-    if not _watchlist()['accounts']:
-        return 'no_watchlist'
     return None
 
 
@@ -334,10 +373,12 @@ def ask_for_account() -> List[str]:
     one credential ask: one card per part however often it is asked (each
     ask sends it again to whatever screen is up, as one card), never again
     after the owner's no, nothing filed when nobody here can be asked.
-    Nothing is asked on a central node or one whose tier cannot be read.
-    Returns the names asked for ([] when nothing is missing or nothing was
-    asked).  Never raises."""
-    if _tier_refusal():
+    Nothing is asked on a central node or one whose tier cannot be read,
+    nor while no usable watchlist exists: the job could not run with the
+    account, so its password would be a credential nothing uses.  Returns
+    the names asked for ([] when nothing is missing or nothing was asked).
+    Never raises."""
+    if _tier_refusal() or not _has_watchlist():
         return []
     missing = [name for name, value in _entered().items() if not value]
     if missing:
@@ -447,6 +488,11 @@ def _install(state: Dict[str, Any], now: float) -> str:
     installer = _installer()
     if installer is None:
         return _wait(state, 'no_installer')
+    free = _free_bytes()
+    if free is not None and free < INSTALL_FREE_BYTES:
+        # Not asked: a yes to an install that cannot fit would end in a
+        # failed install and a full disk.  Looked at again on the next check.
+        return _wait(state, 'no_disk')
     from integrations.agent_engine.capability_setup import ask_owner_for_setup
     answer = ask_owner_for_setup(SETUP_CAPABILITY, reason=SETUP_REASON)
     if answer != 'granted':
@@ -503,6 +549,26 @@ def _watchlist() -> Dict[str, Any]:
         return {'region': None, 'niche': None, 'accounts': []}
     return {'region': data.get('region'), 'niche': data.get('niche'),
             'accounts': _sources.clean_accounts(data.get('accounts'))}
+
+
+def _has_watchlist() -> bool:
+    """True when the watchlist names at least one account the worker can
+    read (_watchlist).  Nothing in HARTOS or Nunba writes it yet: who
+    chooses the accounts on her desktop is the owner's open decision (plan
+    U1), so on a default install this is False and nothing is asked."""
+    return bool(_watchlist()['accounts'])
+
+
+def _free_bytes() -> Optional[int]:
+    """Free disk where the worker's venv goes (core.venv_paths.venv_root),
+    or None when it cannot be read (the installer then reports a full disk
+    itself)."""
+    try:
+        from core.venv_paths import venv_root
+        return int(shutil.disk_usage(venv_root()).free)
+    except (OSError, ValueError) as e:
+        logger.info("trending songs: free disk for the worker's venv unknown (%s)", e)
+        return None
 
 
 # ── state ─────────────────────────────────────────────────────────────────

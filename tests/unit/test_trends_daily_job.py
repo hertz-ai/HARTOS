@@ -7,22 +7,26 @@ tick starts and then only polls: no thread, no LLM).
 
 What these tests hold the job to:
 * never on a central node, nor on one whose tier cannot be read; on her
-  desktop only when she has entered the DEDICATED research account on this
-  computer (an owner-entered credential in the desktop's vault,
-  hartos.ai_key_vault -- never an environment variable or the node's own
-  secrets) and a watchlist exists;
+  desktop only when a watchlist names an account to watch and she has
+  entered the DEDICATED research account on this computer (an owner-entered
+  credential in the desktop's vault, hartos.ai_key_vault -- never an
+  environment variable or the node's own secrets);
 * the account's way in: her agent's ask (ask_for_account) files the one
   credential consent card (hartos.ai_key_vault.request_credential) for each
   missing part, one card each however often she asks, none after the
-  owner's no; what the card stores (the desktop vault's value, the grant
-  that names it) runs the job and survives a restart;
+  owner's no, and none while no usable watchlist exists (the job could not
+  run with the account, so its password is not asked for); what the card
+  stores (the desktop vault's value, the grant that names it) runs the job
+  and survives a restart;
 * a refused login pauses the job for FREEZE_S and asks the owner, on the
   same card, to enter the account again;
 * the worker runs in its own interpreter under the data dir (the per-backend
   venv core.venv_paths resolves); when that venv is missing, or its last
   install failed, timed out or was cut short by a restart, the owner is
   asked first (capability_setup) and, on yes, Nunba's installer
-  (tts.backend_venv.install_in_background) builds it off the tick;
+  (tts.backend_venv.install_in_background) builds it off the tick; with too
+  little free disk for it nothing is asked or installed; an install is
+  waited on for as long as Nunba's installer can legitimately take;
 * the credentials reach the child on its stdin only: never argv, the spec,
   its environment or a log line;
 * once a day plus jitter; 900 s kill; restarts adopt a finished batch;
@@ -147,7 +151,11 @@ def job(tmp_path, monkeypatch):
     env = types.SimpleNamespace(dj=dj, asked=[], consent='granted', tmp=tmp_path,
                                 creds={dj.USERNAME_CREDENTIAL: USER,
                                        dj.PASSWORD_CREDENTIAL: PASSWORD},
-                                inst={'calls': [], 'status': None})
+                                inst={'calls': [], 'status': None},
+                                free=dj.INSTALL_FREE_BYTES * 20)
+    # Free disk where the worker's venv goes: plenty unless a test says
+    # otherwise (this box's own disk must not decide the outcome).
+    monkeypatch.setattr(dj, '_free_bytes', lambda: env.free)
     vault = FakeVault(env.creds)
     monkeypatch.setattr('hartos.ai_key_vault.get_ai_key_vault', lambda: vault)
     py = tmp_path / 'venvs' / dj.WORKER_VENV / 'python'
@@ -401,6 +409,65 @@ def test_a_central_node_asks_for_no_account(job, cards, monkeypatch):
 
 def test_an_entered_account_is_not_asked_for(job):
     assert job.dj.ask_for_account() == []
+
+
+def _set_watchlist(job, watchlist):
+    path = job.tmp / 'trends' / 'watchlist.json'
+    if watchlist is None:
+        path.unlink()
+    else:
+        path.write_text(watchlist if isinstance(watchlist, str) else json.dumps(watchlist),
+                        encoding='utf-8')
+
+
+@pytest.mark.parametrize('watchlist', [None, '{damaged', {'accounts': []},
+                                       {'accounts': ['not a handle!', '']}])
+def test_with_no_usable_watchlist_no_research_account_is_asked_for(job, cards, watchlist):
+    """Reviewer's measurement on d73704a5e, on the real card path (owner
+    set, flat tier, no watchlist: every install's default, since nothing in
+    HARTOS or Nunba writes one): her first trending read filed both
+    IG_RESEARCH_* cards, and once she entered the account the job still
+    skipped ('no_watchlist').  A password asked for a job that cannot run.
+    With no usable watchlist nothing is asked for, nothing runs, and the
+    reason says what is missing."""
+    from integrations.trends import trending_songs_client as tsc
+    dj = job.dj
+    _set_watchlist(job, watchlist)
+    out = tsc.get_trending_songs()                       # her agent's read
+    assert out['songs'] == [] and out['reason'] == 'no_watchlist'
+    assert dj.ask_for_account() == []
+    assert _asks(cards) == [] and _rows(cards) == []     # no card, no row
+    assert dj.maybe_tick(now=NOW) == 'skip'
+    assert FakePopen.made == [] and job.asked == [] and job.inst['calls'] == []
+    assert dj.why_no_list() == 'no_watchlist'
+
+
+def test_once_a_watchlist_names_an_account_her_read_asks_for_the_research_account(
+        job, cards):
+    """The order of what is missing: the watchlist first, then the account."""
+    from integrations.trends import trending_songs_client as tsc
+    dj = job.dj
+    _set_watchlist(job, None)
+    assert tsc.get_trending_songs()['reason'] == 'no_watchlist'
+    _set_watchlist(job, {'accounts': ['mua_a']})
+    out = tsc.get_trending_songs()
+    assert out['reason'] == 'account_asked'
+    assert sorted(a['scope'] for a, _ in _asks(cards)) == sorted(
+        ['secret:' + dj.USERNAME_CREDENTIAL, 'secret:' + dj.PASSWORD_CREDENTIAL])
+
+
+def test_with_the_account_entered_but_no_watchlist_it_still_says_the_watchlist(job, cards):
+    from integrations.social.consent_service import ConsentService
+    dj = job.dj
+    _set_watchlist(job, None)
+    with cards.session() as db:
+        for name in (dj.USERNAME_CREDENTIAL, dj.PASSWORD_CREDENTIAL):
+            ConsentService.grant_consent(db, OWNER, 'credential', 'secret:' + name)
+    cards.vault.hold_credential(dj.USERNAME_CREDENTIAL, USER)
+    cards.vault.hold_credential(dj.PASSWORD_CREDENTIAL, PASSWORD)
+    assert dj.maybe_tick(now=NOW) == 'skip'
+    assert dj.why_no_list() == 'no_watchlist'
+    assert FakePopen.made == []
 
 
 # ── one run ──────────────────────────────────────────────────────────────
@@ -704,6 +771,65 @@ def test_an_install_that_never_ends_is_given_up(job):
     assert dj.maybe_tick(now=NOW + dj.INSTALL_TIMEOUT_S - 1) == 'installing'
     assert dj.maybe_tick(now=NOW + dj.INSTALL_TIMEOUT_S) == 'failed'
     assert _state(job.tmp)['last_run']['error'] == 'install_timeout'
+
+
+def test_a_slow_install_inside_nunbas_own_bound_is_waited_on(job):
+    """Nunba's install_into_venv bounds itself: a 300 s pip upgrade, then
+    for each package up to 3 pip attempts of at most 1800 s each and a 90 s
+    import check.  Reviewer on d73704a5e: the 3 h backstop recorded a slow
+    but legitimate install as 'install_timeout' (7 packages at their full
+    1800 s is about 3.6 h), and the state and notes flapped."""
+    dj = job.dj
+    job.python = None
+    worst = 300 + len(dj.WORKER_PACKAGES) * (3 * 1800 + 90)
+    assert dj.maybe_tick(now=NOW) == 'installing'
+    assert dj.maybe_tick(now=NOW + worst) == 'installing'
+    assert dj.why_no_list() == 'installing'
+    assert len(job.inst['calls']) == 1
+
+
+def test_without_room_for_the_worker_nothing_is_asked_or_installed(job):
+    """The worker's venv needs room under the data dir (instagrapi and its
+    dependencies, pip's downloads, a margin).  With too little free, the
+    owner is not asked to allow an install that cannot fit, nothing is
+    installed, and the reason says why; once there is room, the next due
+    check asks."""
+    dj = job.dj
+    job.python = None
+    job.free = dj.INSTALL_FREE_BYTES - 1
+    assert dj.maybe_tick(now=NOW) == 'skip'
+    assert job.asked == [] and job.inst['calls'] == [] and FakePopen.made == []
+    assert dj.why_no_list() == 'no_disk'
+    job.free = dj.INSTALL_FREE_BYTES
+    _fresh_tick(dj)
+    assert dj.maybe_tick(now=NOW + 60) == 'installing'
+    assert [c for c, _ in job.asked] == ['trends:' + dj.WORKER_VENV]
+
+
+def test_free_disk_that_cannot_be_read_does_not_hold_the_install(job):
+    """The installer reports a full disk itself; an unreadable reading here
+    is no reason to keep her waiting."""
+    job.python = None
+    job.free = None
+    assert job.dj.maybe_tick(now=NOW) == 'installing'
+
+
+def test_free_disk_is_read_where_the_worker_venv_goes(tmp_path, monkeypatch):
+    from integrations.trends import daily_job as dj
+    monkeypatch.setenv('NUNBA_VENV_ROOT_OVERRIDE', str(tmp_path / 'venvs'))
+    seen = []
+
+    def _usage(path):
+        seen.append(os.path.abspath(path))
+        return types.SimpleNamespace(total=100, used=40, free=60)
+    monkeypatch.setattr(dj.shutil, 'disk_usage', _usage)
+    assert dj._free_bytes() == 60
+    assert seen == [os.path.abspath(str(tmp_path / 'venvs'))]
+
+    def _unreadable(path):
+        raise OSError('no such device')
+    monkeypatch.setattr(dj.shutil, 'disk_usage', _unreadable)
+    assert dj._free_bytes() is None
 
 
 @pytest.mark.parametrize('how', ['install_failed', 'install_timeout'])

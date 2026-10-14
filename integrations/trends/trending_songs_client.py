@@ -9,13 +9,17 @@ node, and nothing here runs in the background.
 
 * No list -> an empty one whose ``reason`` is daily_job.why_no_list() and
   whose ``note`` says it in words her agent can pass on, and that read just
-  as well in the reel's push to her phone.  Above all: no DEDICATED research
-  Instagram account is set up on this computer (never the business
-  account).  With no list, this read first asks the owner for whatever part
-  of that account is missing (daily_job.ask_for_account: the one credential
-  consent card, one per part, never again after a no) and the reason says
-  where that ask stands: 'account_asked', 'account_declined', or
-  'no_account' when nobody here could be asked.  A list the contract refuses
+  as well in the reel's push to her phone (never a code or a file path).
+  On a default install that is 'no_watchlist': no Instagram accounts are
+  chosen to watch, so nothing is asked for and the note tells her to choose
+  a song in Instagram meanwhile.  With a watchlist, the next thing missing
+  is the DEDICATED research Instagram account (never the business
+  account): this read first asks the owner for whatever part of it is
+  missing (daily_job.ask_for_account: the one credential consent card, one
+  per part, never again after a no; nothing while there is no usable
+  watchlist) and the reason says where that ask stands: 'account_asked',
+  'account_declined', or 'no_account' when nobody here could be asked.
+  A list the contract refuses
   (contracts.validate_trending_songs: a URL, session data, malformed) is
   never served: read_latest drops it.
 * A list kept after a failed day is served marked stale, with the reason;
@@ -66,10 +70,29 @@ _LANG_CACHE = 'song_lang.json'
 _PAUSE = ('at least %d hours (longer if it happens again, up to %d hours)'
           % (_job.FREEZE_S // 3600, _job.MAX_FREEZE_S // 3600))
 
+#: The words shared by the run errors that end the same way for her
+#: (daily_job._failed, ig_worker, sources.collect, trending_songs.
+#: why_not_published): what happened, and that the job tries again itself.
+_INSTAGRAM_UNANSWERED = ("Instagram did not answer well enough today to make a fresh "
+                         "trending-song list; this computer tries again on its own later.")
+_READER_FAILED = ("The trending-song reader on this computer ran into a problem, so the "
+                  "list was not made fresh; it tries again on its own later.")
+_READER_UNINSTALLED = ("Installing the trending-song reader on this computer did not "
+                       "finish, so there is no fresh trending-song list; it is installed "
+                       "again on its own later.")
+_SLOWED = ("Instagram asked the research account to slow down, so the trending-song list "
+           "was not made fresh today; it tries again on its own after a pause of at least "
+           "%d hours." % (_job.COOLDOWN_S // 3600))
+#: A reason no entry below names (one added later): said without its code.
+_NO_FRESH_LIST = ("There is no fresh trending-song list on this computer right now; a new "
+                  "one is made on its own.")
+
 #: What her agent is told when there is no list, or the list is old, by
 #: reason (daily_job.why_no_list, or the stale reason the job recorded).
 #: Written about nobody in particular ("the business account", "the owner
-#: of this computer"), so the reel's push to her phone can carry them too.
+#: of this computer"), so the reel's push to her phone can carry them too,
+#: and never naming a mechanism code or a file: the ``reason`` carries the
+#: code.
 _NOTES = {
     'central': ("Trending songs are made on a desktop, never on a server, so this node "
                 "keeps no list."),
@@ -87,9 +110,13 @@ _NOTES = {
                          "account here (or it was turned off after Instagram refused it too "
                          "often), so there is no trending-song list. They can choose \"Allow "
                          "asking again\" for it in Privacy settings."),
-    'no_watchlist': ("No Instagram accounts to watch are listed on this computer yet "
-                     "(trends/watchlist.json in its data folder), so there is no "
-                     "trending-song list."),
+    'no_watchlist': ("Trending songs are not set up on this computer yet: no Instagram "
+                     "accounts are chosen for it to watch, so there is no trending-song list "
+                     "to suggest a song from; choose a song in Instagram for now."),
+    'no_disk': ("This computer has too little free disk space to install the trending-song "
+                "reader (it needs about %d MB free), so there is no trending-song list; it "
+                "tries again on its own once there is room."
+                % (_job.INSTALL_FREE_BYTES // (1024 * 1024))),
     'setup_asked': ("The trending-song reader is waiting for the owner of this computer to "
                     "allow installing it (a card on the desktop)."),
     'setup_declined': ("The owner of this computer chose not to install the trending-song "
@@ -110,6 +137,27 @@ _NOTES = {
               "%s. The owner of this computer is asked on the consent card to enter its "
               "username and password again; the next try, after the pause, uses what is "
               "entered by then." % _PAUSE),
+    'throttled': _SLOWED,
+    'feedback': _SLOWED,
+    'transport': _INSTAGRAM_UNANSWERED,
+    'not_found': _INSTAGRAM_UNANSWERED,
+    'partial_run': _INSTAGRAM_UNANSWERED,
+    'empty_list': ("Today's run found no songs in the watched accounts' reels, so the "
+                   "earlier trending-song list is kept; it tries again on its own later."),
+    'unknown': _READER_FAILED,
+    'worker_failed': _READER_FAILED,
+    'bad_output': _READER_FAILED,
+    'spawn_failed': _READER_FAILED,
+    'timeout': _READER_FAILED,
+    'interrupted': _READER_FAILED,
+    'invalid_list': _READER_FAILED,
+    'not_written': _READER_FAILED,
+    'dependency': _READER_UNINSTALLED,
+    'install_failed': _READER_UNINSTALLED,
+    'install_timeout': _READER_UNINSTALLED,
+    'stale': ("The trending-song list on this computer is not from today; a fresh one is "
+              "made on its own."),
+    'error': "Whether this computer has a trending-song list could not be checked just now.",
 }
 
 _lock = threading.Lock()
@@ -134,8 +182,8 @@ def _why_no_list() -> str:
     any part of her research account missing, its card is filed (or sent
     again to whatever screen is up now; never after the owner's no), so the
     reason says where that ask stands.  ask_for_account asks for nothing
-    when the account is entered or the node is not a desktop.  'error' when
-    it cannot be told."""
+    when the account is entered, the node is not a desktop, or no usable
+    watchlist exists.  'error' when it cannot be told."""
     try:
         _job.ask_for_account()
         return _job.why_no_list()
@@ -145,11 +193,12 @@ def _why_no_list() -> str:
 
 
 def note_for(reason: Optional[str]) -> Optional[str]:
-    """The sentence her agent passes on for ``reason``, or None for none."""
+    """The sentence her agent passes on for ``reason``, or None for none.
+    It never carries the reason's code (it rides the reel's push to her
+    phone); a reason no entry names gets the general _NO_FRESH_LIST."""
     if not reason:
         return None
-    return _NOTES.get(reason) or ('There is no fresh trending-song list on this computer '
-                                  '(%s).' % reason)
+    return _NOTES.get(reason) or _NO_FRESH_LIST
 
 
 def _lang_filter(langs: Any) -> Optional[set]:
@@ -184,11 +233,11 @@ def get_trending_songs(langs: Any = None, limit: int = DEFAULT_LIMIT) -> Dict[st
     comma-separated text or a list of them; contracts.STYLE_LANGUAGES plus
     'other') when given.  Never raises.  With no list on this computer the
     songs are empty and ``reason`` / ``note`` say why (daily_job.why_no_list:
-    with no research account set up here, the owner is first asked for one
-    on the consent card and the reason is 'account_asked',
-    'account_declined' or 'no_account'; else 'central', 'no_watchlist',
-    'not_run_yet', ...); a stale list keeps its songs and names the job's
-    reason."""
+    'no_watchlist' on a default install, and nothing is asked; with a
+    watchlist but no research account set up here, the owner is first asked
+    for one on the consent card and the reason is 'account_asked',
+    'account_declined' or 'no_account'; else 'central', 'not_run_yet', ...);
+    a stale list keeps its songs and names the job's reason."""
     want = _lang_filter(langs)
     try:
         limit = max(1, min(int(limit), ts.MAX_SONGS))

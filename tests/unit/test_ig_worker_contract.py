@@ -113,6 +113,8 @@ def _fake_instagrapi(script):
             hit = script.get('login')
             if isinstance(hit, BaseException) or (isinstance(hit, type) and issubclass(hit, BaseException)):
                 raise hit
+            if callable(hit):                      # what the client does meanwhile
+                hit(username, password)
             return True
 
         def dump_settings(self, path):
@@ -334,6 +336,31 @@ def test_a_bad_credentials_line_is_no_credentials(run, line):
     rc, out, calls, _, _ = run({}, stdin=line)
     assert out['error'] == 'login' and out['error_detail'] == 'no_credentials'
     assert calls['init'] == [] and 'pw-fixture' not in json.dumps(out)
+
+
+def test_what_instagrapi_logs_never_carries_the_research_account(run, capsys):
+    """instagrapi logs through the standard logging module, and the worker's
+    stderr is trends/worker.log on her desktop.  Reviewer on d73704a5e: not
+    checked whether its WARNING lines carry the username.  Whatever it logs,
+    the username and password are blanked out, the line itself is kept, and
+    the worker leaves the logging set-up as it found it."""
+    import logging
+    root = logging.getLogger()
+    before = list(root.handlers)
+
+    def _chatty_login(username, password):
+        log = logging.getLogger('instagrapi')
+        log.warning('Status 400: login as %s with %s refused', username, password)
+        try:
+            raise RuntimeError('{"username": "%s"}' % username)
+        except RuntimeError:
+            log.exception('private_request failed')
+    rc, out, calls, _, _ = run({'login': _chatty_login})
+    assert rc == 0 and calls['login'] == [('research_fixture', 'pw-fixture')]
+    err = capsys.readouterr().err
+    assert 'Status 400: login as' in err and 'private_request failed' in err
+    assert 'research_fixture' not in err and 'pw-fixture' not in err
+    assert root.handlers == before
 
 
 def test_bad_arguments_exit_2(tmp_path):

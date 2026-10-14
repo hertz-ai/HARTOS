@@ -28,7 +28,11 @@ The research account's credentials (a dedicated research account, never
 her business account) arrive as ONE JSON line on stdin,
 ``{"username": ..., "password": ...}``, which daily_job writes from the
 desktop's vault and closes.  They are never in argv, the environment, the
-spec, the batch or a log line.
+spec, the batch or a log line: instagrapi logs through the standard logging
+module, and while the worker runs every record reaches its stderr (which
+daily_job sends to trends/worker.log) through one handler that blanks both
+values out (_logs_without), so no record falls through to logging's
+last-resort handler, which would print them as they are.
 
 What it does, read from instagrapi 3.0.24's own source:
 * ``Client(with_challenge_flow=False, delay_range=...)``: a challenge
@@ -50,8 +54,10 @@ Exit codes: 0 a batch was written (its "error" says how the run went),
 2 bad arguments, 3 instagrapi is not installed (a "dependency" batch is
 still written), 1 an unexpected failure (an "unknown" batch is written).
 """
+import contextlib
 import importlib.util
 import json
+import logging
 import os
 import sys
 import time
@@ -87,6 +93,42 @@ _CODE_OF = {
     'RequestException': 'transport', 'ConnectionError': 'transport',
     'TimeoutError': 'transport',
 }
+
+
+#: What a blanked-out username or password reads as in a log line.
+HIDDEN = '[hidden]'
+
+
+class _Blanking(logging.Formatter):
+    """A log line (with its traceback) with each of ``secrets`` replaced by
+    HIDDEN, longest first, so a password holding the username is blanked
+    whole."""
+
+    def __init__(self, secrets):
+        super().__init__('%(levelname)s %(name)s: %(message)s')
+        self._secrets = sorted({s for s in secrets if s}, key=len, reverse=True)
+
+    def format(self, record):
+        text = super().format(record)
+        for secret in self._secrets:
+            text = text.replace(secret, HIDDEN)
+        return text
+
+
+@contextlib.contextmanager
+def _logs_without(*secrets):
+    """While inside: WARNING and above from any logger (instagrapi's
+    included) go to stderr with ``secrets`` blanked out.  The handler is
+    removed on the way out, so the process's logging is left as found."""
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setLevel(logging.WARNING)
+    handler.setFormatter(_Blanking(secrets))
+    root = logging.getLogger()
+    root.addHandler(handler)
+    try:
+        yield
+    finally:
+        root.removeHandler(handler)
 
 
 def error_code(exc: BaseException) -> str:
@@ -299,24 +341,25 @@ def main(argv=None) -> int:
     if not username or not password:
         return _failed('login', 'no_credentials')
     client = None
-    try:
-        client = instagrapi.Client(with_challenge_flow=False,
-                                   delay_range=list(spec['delay_range']))
-        _load_session(client, spec['session_path'])
+    with _logs_without(username, password):
         try:
-            client.login(username, password)
+            client = instagrapi.Client(with_challenge_flow=False,
+                                       delay_range=list(spec['delay_range']))
+            _load_session(client, spec['session_path'])
+            try:
+                client.login(username, password)
+            except Exception as e:
+                return _failed(error_code(e), type(e).__name__, client)
+            _save_session(client, spec['session_path'])
+            batch = sources.collect(InstagrapiSource(client, sources), spec.get('accounts'),
+                                    budget=spec['budget'],
+                                    known_song_keys=spec['known_song_keys'],
+                                    deadline=time.monotonic() + spec['deadline_s'])
+            _save_session(client, spec['session_path'])
+            return _finish(batch, 0)
         except Exception as e:
-            return _failed(error_code(e), type(e).__name__, client)
-        _save_session(client, spec['session_path'])
-        batch = sources.collect(InstagrapiSource(client, sources), spec.get('accounts'),
-                                budget=spec['budget'],
-                                known_song_keys=spec['known_song_keys'],
-                                deadline=time.monotonic() + spec['deadline_s'])
-        _save_session(client, spec['session_path'])
-        return _finish(batch, 0)
-    except Exception as e:
-        sys.stderr.write('trends worker failed: %s\n' % type(e).__name__)
-        return _failed('unknown', type(e).__name__, client, rc=1)
+            sys.stderr.write('trends worker failed: %s\n' % type(e).__name__)
+            return _failed('unknown', type(e).__name__, client, rc=1)
 
 
 if __name__ == '__main__':

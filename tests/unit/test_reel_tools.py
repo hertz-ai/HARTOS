@@ -627,13 +627,15 @@ def test_her_song_audio_gives_the_beats(env):
     assert media['song']['title'] == 'Vaathi Coming'
 
 
-def test_with_no_research_account_the_reel_says_why_and_names_no_song(env, monkeypatch):
+def test_on_a_default_install_the_reel_says_why_and_names_no_song(env, monkeypatch):
     """Reviewer's measurement on c17513ec4, a fresh data dir with no owner
-    credentials (every install's default): reel_trending_songs said why
-    there was no list, but reel_make dropped the reason, pushed no word
-    about songs, and still told her agent to give her "the song to add in
-    Instagram".  Here the real trending read and the real job, a fresh vault
-    and nobody on this computer to ask."""
+    credentials: reel_trending_songs said why there was no list, but
+    reel_make dropped the reason, pushed no word about songs, and still told
+    her agent to give her "the song to add in Instagram".  And on
+    d73704a5e: every install's default also has no watchlist (nothing writes
+    one), so that is the reason she is told, in words she can act on, and no
+    research account is asked for.  Here the real trending read and the real
+    job, a fresh vault, no watchlist and nobody on this computer to ask."""
     from hartos import ai_key_vault
     from integrations.trends import trending_songs_client as tsc
     monkeypatch.setattr(tsc, 'get_trending_songs', REAL_TRENDING)
@@ -644,14 +646,15 @@ def test_with_no_research_account_the_reel_says_why_and_names_no_song(env, monke
     _upload(env, b'clip' * 500)
     t = _tools(env)
     listed = _ok(t.run['reel_trending_songs']())
-    assert listed['songs'] == [] and listed['reason'] == 'no_account'
-    assert listed['note'] == tsc.note_for('no_account')
+    assert listed['songs'] == [] and listed['reason'] == 'no_watchlist'
+    assert listed['note'] == tsc.note_for('no_watchlist')
     body = _ok(t.run['reel_make']())
     assert body['media']['song'] is None
     assert listed['note'] in body['notes']
     assert 'song to add' not in body['message'] and listed['note'] in body['message']
     (_topic, payload, _flags), = _media_pushes(env)
     assert 'No song is suggested' in payload['text'][0]
+    assert listed['note'] in payload['text'][0]
 
 
 def test_a_song_key_the_list_does_not_hold_is_not_offered_as_a_song(env):
