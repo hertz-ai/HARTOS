@@ -10,8 +10,10 @@ write to the store.
 ONE attachments shape in and out (amendment A9 a): the documented
 ConversationEntry.attachments row ``{file_id, sha256, name, mime, size}``
 (file_id = the store xid, which is the sha256) plus optional ``purpose``,
-``captured_at`` and ``duration_ms`` -- what media_to_mirror writes is what
-parse_inbound reads.
+``captured_at`` and ``duration_ms``, judged by ONE rule
+(chat_attachments.validate_attachment, which contracts.validate_attachment
+is): parse_inbound keeps exactly the rows it accepts and media_to_mirror
+writes only rows it accepts, so what goes out is what comes in.
 
 These tests drive the REAL store on a temporary root (installed as the
 process singleton the module uses) and assert what a turn can see.
@@ -69,13 +71,51 @@ def _upload(store, uid, data, *, name='VID.mp4', mime=MP4, purpose='reel_source'
     return xid
 
 
+#: A MIME type each purpose takes, so a row naming that purpose is well-formed
+#: (the one rule holds a row's mime to the purpose it names).
+_MIME_FOR = {'logo': 'image/png', 'song_audio': 'audio/mpeg'}
+
+
 def _att(ref, purpose='reel_source', **extra):
     """One /chat attachments row in the documented shape (A9 a)."""
-    item = {'file_id': ref, 'sha256': ref, 'name': 'VID.mp4', 'mime': MP4, 'size': 10}
+    item = {'file_id': ref, 'sha256': ref, 'name': 'VID.mp4',
+            'mime': _MIME_FOR.get(purpose, MP4), 'size': 10}
     if purpose is not None:
         item['purpose'] = purpose
     item.update(extra)
     return item
+
+
+_GOOD = 'a' * 64
+
+
+def _without(key, **extra):
+    row = _att(_GOOD, **extra)
+    del row[key]
+    return row
+
+
+#: Rows the one rule refuses for a field other than file_id, sha256 and
+#: purpose -- the three parse_inbound used to read, so it bound all of these.
+_OUTSIDE_THE_SHAPE = [
+    pytest.param(_without('name'), id='no-name'),
+    pytest.param(_without('mime'), id='no-mime'),
+    pytest.param(_without('size'), id='no-size'),
+    pytest.param({'file_id': _GOOD, 'sha256': _GOOD, 'purpose': 'reel_source'}, id='bare-ref'),
+    pytest.param(_att(_GOOD, name='../evil.mp4'), id='name-traversal'),
+    pytest.param(_att(_GOOD, name='C:\\Videos\\VID.mp4'), id='name-path'),
+    pytest.param(_att(_GOOD, name=''), id='name-empty'),
+    pytest.param(_att(_GOOD, mime='application/pdf'), id='mime-not-a-clip'),
+    pytest.param(_att(_GOOD, 'logo', mime=MP4), id='mime-not-a-logo'),
+    pytest.param(_att(_GOOD, mime=None), id='mime-null'),
+    pytest.param(_att(_GOOD, size=-1), id='size-negative'),
+    pytest.param(_att(_GOOD, size='10'), id='size-text'),
+    pytest.param(_att(_GOOD, size=True), id='size-bool'),
+    pytest.param(_att(_GOOD, captured_at=0), id='captured-zero'),
+    pytest.param(_att(_GOOD, captured_at='2026-10-12'), id='captured-text'),
+    pytest.param(_att(_GOOD, duration_ms=-1), id='duration-negative'),
+    pytest.param(_att(_GOOD, duration_ms=1.5), id='duration-float'),
+]
 
 
 # ── parse_inbound: pure ─────────────────────────────────────────────────
@@ -91,16 +131,49 @@ class TestParseInbound:
         ref = 'a' * 64
         assert parse_inbound([_att(ref, purpose=None)]) == [{'file_id': ref}]
 
-    def test_the_contracts_validator_accepts_the_rows_this_module_reads(self):
-        """One shape: each documented row form, which parse_inbound keeps, is
-        a valid contracts attachment.  (parse_inbound also keeps rows the
-        validator refuses for fields it never reads; see the module
-        docstring.)"""
+    @pytest.mark.parametrize('row', [
+        _att(_GOOD), _att(_GOOD, purpose=None),
+        _att(_GOOD, captured_at=1_760_000_000_000, duration_ms=4000),
+        _att(_GOOD, 'chat_attachment', name='plan.pdf', mime='application/pdf'),
+        _att(_GOOD, 'logo', name='logo.png'),
+        _att(_GOOD, purpose=None, mime='application/octet-stream'),   # no purpose to hold it to
+        dict(_att(_GOOD), path='C:\\Videos\\VID.mp4'),                # a key the shape has not
+    ], ids=['clip', 'no-purpose', 'meta', 'pdf', 'logo', 'any-mime', 'extra-key'])
+    def test_a_row_in_the_one_shape_is_kept(self, row):
         from integrations.reel_studio import contracts
-        for row in (_att('a' * 64), _att('b' * 64, purpose=None),
-                    _att('c' * 64, captured_at=1_760_000_000_000, duration_ms=4000)):
-            assert parse_inbound([row]), row
-            assert contracts.validate_attachment(row) == [], row
+        assert contracts.validate_attachment(row) == []
+        assert [r['file_id'] for r in parse_inbound([row])] == [_GOOD]
+
+    @pytest.mark.parametrize('row', _OUTSIDE_THE_SHAPE)
+    def test_a_row_the_one_rule_refuses_is_dropped(self, row):
+        """ONE rule (A9 a): a row the contracts refuse for any field is not
+        read, whichever field it is.  parse_inbound used to read only
+        file_id, sha256 and purpose, so these were bound."""
+        from integrations.reel_studio import contracts
+        assert contracts.validate_attachment(row), row
+        assert parse_inbound([row, _att('d' * 64)]) == [
+            {'file_id': 'd' * 64, 'purpose': 'reel_source'}]
+
+    def test_source_guard_one_attachment_rule(self):
+        """One rule, not two held equal: the contracts' attachment validator
+        is this module's (core may not import integrations, so it lives
+        here and the contracts re-export it)."""
+        from core import chat_attachments
+        from integrations.reel_studio import contracts
+        assert contracts.validate_attachment is chat_attachments.validate_attachment
+
+    def test_a_refused_row_never_raises_and_never_echoes_its_values(self):
+        """A /chat turn must not fail on what a client sent, and a problem
+        names the field, not the value (a row is whatever a client sent).
+        Python refuses to print an int of more than 4300 digits."""
+        from core.chat_attachments import validate_attachment
+        rows = [_att(_GOOD, size=-(10 ** 5000)), _att(_GOOD, name='C:\\secret\\x.mp4'),
+                _att(_GOOD, mime=['secret']), _att(_GOOD, captured_at='secret')]
+        for row in rows:
+            problems = validate_attachment(row)
+            assert problems and not any('secret' in p for p in problems), problems
+        assert parse_inbound(rows + [_att('d' * 64)]) == [
+            {'file_id': 'd' * 64, 'purpose': 'reel_source'}]
 
     def test_what_the_mirror_writes_is_what_a_turn_reads(self):
         """inbound == outbound: a reply's mirror row, sent back on a later turn,
@@ -407,6 +480,18 @@ class TestMediaToMirror:
         assert media_to_mirror([item]) == [{
             'file_id': xid, 'sha256': xid, 'name': 'reel_r-77.mp4',
             'mime': MP4, 'size': 4242}]
+
+    def test_the_mirror_writes_no_row_the_one_rule_refuses(self):
+        """Outbound is inbound: an item that would make a row the rule
+        refuses (no size, no MIME type) gets no mirror row, so every row a
+        device reads back is one a later turn may send."""
+        from integrations.reel_studio import contracts
+        ok, no_size, bare = 'ab' * 32, 'cd' * 32, 'ef' * 32
+        rows = media_to_mirror([dict(_media('r-1'), xid=ok, sha256=ok, size=99),
+                                dict(_media('r-2'), xid=no_size, sha256=no_size, size=None),
+                                {'xid': bare, 'reel_id': 'r-3'}])
+        assert [r['file_id'] for r in rows] == [ok]
+        assert [contracts.validate_attachment(r) for r in rows] == [[]]
 
     def test_a_reel_id_unfit_for_a_name_falls_back_to_the_xid(self):
         xid = 'cd' * 32

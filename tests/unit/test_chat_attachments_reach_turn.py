@@ -203,6 +203,25 @@ def test_the_retired_kind_ref_shape_binds_nothing(phone):
     assert phone.store.resolve(TOKEN_USER, a).request_id is None
 
 
+@pytest.mark.parametrize('outside', [
+    lambda a: {'file_id': a, 'sha256': a, 'purpose': 'reel_source'},   # no name, mime or size
+    lambda a: dict(_ref(a), name='../../prompts/x.mp4'),
+    lambda a: dict(_ref(a), mime='application/x-msdownload'),
+    lambda a: dict(_ref(a), captured_at=0),
+], ids=['bare-ref', 'name-traversal', 'mime-not-a-clip', 'captured-zero'])
+def test_a_row_outside_the_one_shape_binds_nothing(phone, outside):
+    """ONE attachments rule (amendment A9 a): a row the contracts refuse for
+    any field is not read by /chat either, so it binds nothing."""
+    from integrations.reel_studio.contracts import validate_attachment
+    a = _upload(phone.store, TOKEN_USER, b'outside-the-shape' * 80)
+    row = outside(a)
+    assert validate_attachment(row)
+    phone.post([row])
+    assert phone.seen['where'] == 'gather_info'
+    assert phone.seen['clips'] == []
+    assert phone.store.resolve(TOKEN_USER, a).request_id is None
+
+
 @pytest.mark.parametrize('junk', ['a' * 64, {'file_id': 'a' * 64}, [None, 'x'], 42])
 def test_malformed_attachments_never_break_the_turn(phone, junk):
     phone.post(junk)

@@ -229,6 +229,9 @@ CANONICAL_OWNERS = {
     'is_file_name': 'core/user_file_store.py',
     'is_capture_ms': 'core/user_file_store.py',
     'user_dir_name': 'core/user_file_store.py',
+    # The ONE /chat attachments rule (amendment A9 a): integrations.
+    # reel_studio.contracts re-exports it; Nunba's turn_attachments reads it.
+    'validate_attachment': 'core/chat_attachments.py',
 }
 
 #: module -> why it may walk sys._current_frames() itself.

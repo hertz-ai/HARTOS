@@ -9,15 +9,16 @@ below.  It holds:
 * the value types passed between the parts (ClipInfo, Candidate, Moment,
   BeatGrid, ClipCapture, ClipSource, ClipAnalysis, RenderResult, ...);
 * pure validators for the EDL, moment list, QA report, reply media item,
-  outbox listing item, inbound file offer, chat attachment, trending-song
-  lists and the style dict;
+  outbox listing item, inbound file offer, trending-song lists and the style
+  dict, and (re-exported from core.chat_attachments) the chat attachment;
 * the capture-order rule (user amendment A1): clips play in the order they
   were filmed, the reel ends on the final-look reveal, and a <= 1 s
   final-look teaser at the start is optional (``hook_first``).
 
-It imports only the standard library and core.user_file_store (itself
-standard library plus two small core helpers), so the agent tools can import
-it at construction time without pulling cv2, numpy or ffmpeg.
+It imports only the standard library, core.user_file_store (itself standard
+library plus two small core helpers) and core.chat_attachments (standard
+library plus the store), so the agent tools can import it at construction
+time without pulling cv2, numpy or ffmpeg.
 
 Validators never raise on bad input; they return a list of problems, empty
 when the document is good.  Each problem reads ``"<id>: <what is wrong>"``.
@@ -32,7 +33,11 @@ the purposes and their MIME types (INBOUND_PURPOSES, INBOUND_MIMES), the
 offer's meta keys (INBOUND_META_KEYS), OUTBOUND_PURPOSE, and the xid,
 file-name and capture-time rules (is_xid, is_file_name, is_capture_ms).  A
 purpose added to the store's registry is one the contracts accept, and a
-captured_at the store keeps is one they accept.
+captured_at the store keeps is one they accept.  For the same reason the ONE
+/chat attachments rule (amendment A9 a) is core.chat_attachments.
+validate_attachment, re-exported here as validate_attachment: what a turn
+sends, what /chat reads (parse_inbound) and what a reply's mirror row is are
+judged by that one function.
 """
 from __future__ import annotations
 
@@ -43,6 +48,8 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
+# The /chat attachments rule, re-exported (see LAYERING above).
+from core.chat_attachments import validate_attachment  # noqa: F401
 # The store's own facts about inbound files (see LAYERING above).  All are
 # re-exported; OUTBOUND_PURPOSE is read here by the pipeline only.
 from core.user_file_store import (INBOUND_META_KEYS, INBOUND_MIMES, INBOUND_PURPOSES,
@@ -1159,32 +1166,8 @@ def validate_file_offer(frame) -> List[str]:
     return problems or _mime_problems(frame, 'file_offer')
 
 
-def validate_attachment(item) -> List[str]:
-    """Problems with one ``attachments`` row of a /chat turn or chat-mirror
-    entry.
-
-    ONE shape in and out (amendment A9 a): the documented
-    ConversationEntry.attachments row ``{file_id, sha256, name, mime, size}``
-    (U9), ``file_id`` being the store xid, which is the file's sha256, plus
-    the optional ``purpose`` (an inbound purpose, whose MIME list then holds)
-    and INBOUND_META_KEYS.  A reply's mirror row (no purpose) is valid as it
-    stands.
-    """
-    problems = _spec_problems(item, {
-        'file_id': (is_xid, 'a 64-hex store xid'),
-        'sha256': (is_xid, '64 lowercase hex'),
-        'name': (is_file_name, 'a bare file name'),
-        'mime': (_is_str, 'a MIME type'),
-        'size': (_is_nonneg_int, 'an int >= 0'),
-        'purpose': (lambda v: v in INBOUND_PURPOSES, 'one of %s' % (INBOUND_PURPOSES,)),
-        'duration_ms': (_is_nonneg_int, 'an int >= 0'),
-        'captured_at': (is_capture_ms, 'epoch milliseconds (an int > 0)'),
-    }, 'attachment', optional=('purpose',) + INBOUND_META_KEYS)
-    if problems:
-        return problems
-    if item['sha256'] != item['file_id']:
-        return ['attachment.file_id must be the sha256 of the file']
-    return _mime_problems(item, 'attachment') if 'purpose' in item else []
+# A /chat turn's ``attachments`` row (and a chat-mirror row) is judged by
+# validate_attachment, core.chat_attachments' one rule, imported above.
 
 
 # ── trending songs ────────────────────────────────────────────────────────

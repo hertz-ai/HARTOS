@@ -17,10 +17,21 @@ makes goes into the same store's outbox, and the reply that turn ends with
 carries it as ``media`` (plan 4.2(f)) and its mirror row in the same shape
 (media_to_mirror): what goes out is what comes in.
 
-This module owns NO state.  It parses a turn's ``attachments`` (pure) and
-delegates every read and write to the store, which is the one place files,
-turn bindings, consumption and delivery are recorded:
+ONE rule judges a row, in and out: validate_attachment.  parse_inbound keeps
+exactly the rows it accepts, media_to_mirror writes only rows it accepts,
+integrations.reel_studio.contracts.validate_attachment IS this function, and
+Nunba's turn_attachments forwards only the rows it accepts.  A row is not
+half-read: one the rule refuses for any field (a name such as
+'../evil.mp4', a MIME type its purpose does not take, no size) binds
+nothing.  A row it accepts binds by its file_id and purpose, and from then
+on the store's own record of the file counts, not the row's name, mime or
+size.
 
+This module owns NO file state.  It judges and parses a turn's
+``attachments`` (pure) and delegates every read and write to the store, which
+is the one place files, turn bindings, consumption and delivery are recorded:
+
+    validate_attachment(row)      what is wrong with one row (pure)
     parse_inbound(raw)            the turn's well-formed references (pure)
     bind_inbound(...)             tie them to (user, prompt, request)
     latest_inbound(...)           what a reel turn may use
@@ -31,10 +42,12 @@ The store-facing calls never raise: a /chat turn must not fail because a
 reference was bad or the disk was unhappy.  A reference that does not resolve
 to this user's inbox is dropped and logged.
 
-LAYERING: core/ may not import integrations/, so the contract facts this
-module needs (the inbound purposes, the xid rule) are the store's, and
-integrations.reel_studio.contracts imports the same ones from the store
-(amendment A9 d): there is one copy, not two held equal.
+LAYERING: core/ may not import integrations/, so the row rule lives here and
+the facts it is built from (the inbound purposes and their MIME types, the
+offer's meta keys, the xid, file-name and capture-time rules) are the
+store's; integrations.reel_studio.contracts imports the rule from here and
+the facts from the store (amendment A9 d): there is one copy, not two held
+equal.
 
 A row's ``purpose`` matters: the same bytes can be held for two purposes
 (her clip is also a chat attachment), and a row binds only the purpose it
@@ -44,25 +57,20 @@ file's claim, and never moves a claim that is bound to another turn: her
 clip stays on her reel turn (core.user_file_store.UserFileStore.bind).  A
 client that sends the same file in a later turn names its purpose to move
 it there (Nunba's /api/chat-sync/files/push answers with it).
-
-parse_inbound is the looser of the two readers of a row.  It reads only
-``file_id``, ``sha256`` and ``purpose``, so it keeps a row that
-contracts.validate_attachment refuses for its other fields: one without
-``name``, ``mime`` or ``size``, or with a name such as '../evil.mp4'.  That
-is harmless here, since those fields are never read (the store's own record
-of the file is what counts), but a row a client sends should still pass
-validate_attachment.
 """
 from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
-# is_xid is the store's own rule for an xid (64 lowercase hex); asked here
-# rather than copied, so a reference is well-formed exactly when the store
-# would accept it.
-from core.user_file_store import INBOUND_PURPOSES, REEL_SOURCE, get_user_file_store, is_xid
+# The store's own facts and rules (an xid is 64 lowercase hex, a bare file
+# name, a capture time in epoch ms, the purposes and their MIME types), asked
+# here rather than copied, so a row is well-formed exactly when the store
+# would accept what it names.
+from core.user_file_store import (INBOUND_META_KEYS, INBOUND_MIMES, INBOUND_PURPOSES,
+                                  REEL_SOURCE, get_user_file_store, is_capture_ms,
+                                  is_file_name, is_xid)
 
 logger = logging.getLogger(__name__)
 
@@ -73,26 +81,76 @@ MAX_ATTACHMENTS = 10
 _SAFE_ID = re.compile(r'[A-Za-z0-9_-]{1,64}')
 
 
+# ── the one attachments row ───────────────────────────────────────────────
+
+def _is_count(v) -> bool:
+    """An int >= 0 (a bool is not one)."""
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+#: An attachments row's fields and what each must be: the documented U9 row
+#: (every row carries these five), then the optional ones -- the store
+#: purpose it was sent for and the offer's meta (INBOUND_META_KEYS).
+_ROW_FIELDS: Tuple[Tuple[str, Callable[[Any], bool], str], ...] = (
+    ('file_id', is_xid, 'a store xid (64 lowercase hex)'),
+    ('sha256', is_xid, '64 lowercase hex'),
+    ('name', is_file_name, 'a bare file name'),
+    ('mime', lambda v: isinstance(v, str), 'a MIME type'),
+    ('size', _is_count, 'an int >= 0'),
+    ('purpose', lambda v: v in INBOUND_PURPOSES, 'one of %s' % (INBOUND_PURPOSES,)),
+    ('captured_at', is_capture_ms, 'epoch milliseconds (an int > 0)'),
+    ('duration_ms', _is_count, 'an int >= 0'),
+)
+_OPTIONAL_FIELDS = ('purpose',) + INBOUND_META_KEYS
+
+
+def validate_attachment(item) -> List[str]:
+    """Problems with one ``attachments`` row; empty when it is the ONE shape.
+
+    The documented ConversationEntry.attachments row (U9; amendment A9 a)
+    ``{file_id, sha256, name, mime, size}``: ``file_id`` is the store xid,
+    which is the file's sha256, so ``sha256`` equals it; ``name`` is a bare
+    file name; ``size`` an int >= 0.  Optional: ``purpose`` (an inbound
+    purpose of the store, whose MIME list then holds ``mime``),
+    ``captured_at`` (epoch ms, > 0) and ``duration_ms`` (an int >= 0).  Other
+    keys are not read.  A reply's mirror row (no purpose) is valid as it
+    stands.
+
+    The one rule for a row (see the module docstring).  Pure and never
+    raises; a problem names the field and what it must be, never the value,
+    which is whatever a client sent.
+    """
+    if not isinstance(item, Mapping):
+        return ['attachment is not an object']
+    problems = []
+    for key, ok, want in _ROW_FIELDS:
+        if key not in item:
+            if key not in _OPTIONAL_FIELDS:
+                problems.append('attachment.%s is missing' % key)
+        elif not ok(item[key]):
+            problems.append('attachment.%s (a %s) is not %s'
+                            % (key, type(item[key]).__name__, want))
+    if problems:
+        return problems
+    if item['sha256'] != item['file_id']:
+        return ['attachment.file_id must be the sha256 of the file']
+    if 'purpose' in item and item['mime'] not in INBOUND_MIMES[item['purpose']]:
+        return ['attachment.mime is not a type purpose %r takes (%s)'
+                % (item['purpose'], ', '.join(sorted(INBOUND_MIMES[item['purpose']])))]
+    return []
+
+
 # ── inbound: the turn's references ────────────────────────────────────────
-
-def _is_store_ref(item) -> bool:
-    """A row naming a file in the store: ``file_id`` is an xid and ``sha256``
-    is the same xid; ``purpose``, when given, is an inbound purpose."""
-    return (isinstance(item, Mapping) and is_xid(item.get('file_id'))
-            and item.get('sha256') == item['file_id']
-            and ('purpose' not in item or item['purpose'] in INBOUND_PURPOSES))
-
 
 def parse_inbound(raw: Any) -> List[Dict[str, str]]:
     """The well-formed store references among a turn's ``attachments``.
 
     Reads at most MAX_ATTACHMENTS rows of a list and keeps each row that
-    names a store file (_is_store_ref), each file once.  Returns
-    ``[{file_id}]`` -- plus ``purpose`` when the row gave one -- in the order
-    sent.  The row's name, mime and size are not read: the store's own record
-    of the file is what counts.  Anything else -- not a list, a malformed
-    row -- is dropped, never raised on.  Pure: the store is not consulted
-    (bind_inbound does that).
+    validate_attachment accepts, each file once.  Returns ``[{file_id}]`` --
+    plus ``purpose`` when the row gave one -- in the order sent; the store's
+    own record of the file is what a bound row then counts.  Anything else --
+    not a list, a row the rule refuses -- is dropped, never raised on.  Pure:
+    the store is not consulted (bind_inbound does that).
     """
     if not isinstance(raw, list):
         if raw:
@@ -105,8 +163,9 @@ def parse_inbound(raw: Any) -> List[Dict[str, str]]:
     kept: List[Dict[str, str]] = []
     seen = set()
     for item in raw[:MAX_ATTACHMENTS]:
-        if not _is_store_ref(item):
-            logger.info('chat_attachments: dropped a malformed attachment entry')
+        if validate_attachment(item):
+            logger.info('chat_attachments: dropped an attachment row outside the '
+                        'attachments shape')
             continue
         if item['file_id'] in seen:
             continue
@@ -220,9 +279,11 @@ def media_to_mirror(media) -> List[Dict[str, Any]]:
     The documented ConversationEntry.attachments shape
     ``[{file_id, sha256, name, mime, size}]`` with ``file_id`` = the xid, so a
     device that dedups by xid sees the reply, the push and the mirror row as
-    one reel -- the same shape a turn's ``attachments`` use (parse_inbound).
-    ``name`` is ``reel_<reel_id>.mp4`` (the xid's first 12 hex when the reel
-    id is not a safe name).  Items without an xid are skipped.
+    one reel -- the same shape a turn's ``attachments`` use: every row it
+    writes is one validate_attachment accepts, so a later turn may send it
+    back.  ``name`` is ``reel_<reel_id>.mp4`` (the xid's first 12 hex when the
+    reel id is not a safe name).  An item without an xid, or whose row the
+    rule refuses (no MIME type or size), is skipped.
     """
     rows = []
     for item in media if isinstance(media, (list, tuple)) else ():
@@ -232,6 +293,8 @@ def media_to_mirror(media) -> List[Dict[str, Any]]:
         reel_id = item.get('reel_id')
         label = reel_id if isinstance(reel_id, str) and _SAFE_ID.fullmatch(reel_id) \
             else xid[:12]
-        rows.append({'file_id': xid, 'sha256': xid, 'name': 'reel_%s.mp4' % label,
-                     'mime': item.get('mime'), 'size': item.get('size')})
+        row = {'file_id': xid, 'sha256': xid, 'name': 'reel_%s.mp4' % label,
+               'mime': item.get('mime'), 'size': item.get('size')}
+        if not validate_attachment(row):
+            rows.append(row)
     return rows
