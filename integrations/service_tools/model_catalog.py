@@ -606,6 +606,48 @@ def model_weight_provenance(file_name: str) -> Optional[str]:
     return row[1] if row else None
 
 
+# ── Is a downloaded weight file complete? ONE rule, beside the table ─────
+#
+# Nunba wrote it first, in LlamaInstaller.get_model_path (+ _is_gguf_complete):
+# a weight file counts only when it holds at least 90% of its registered size,
+# never less than 100 MB, and starts with the GGUF magic.  The size is the one
+# in MODEL_WEIGHT_BYTES above (Nunba reads it through model_weight_bytes), so
+# the rule lives here, where both repos can reach it -- the same import
+# direction that put the table here.  The 10% covers re-quantisation of an
+# upload, not a unit error (see get_model_path's history in Nunba).
+#
+#: A weight file is complete at this share of its registered size ...
+GGUF_COMPLETE_SHARE = 0.90
+#: ... and is never complete under this many bytes, whatever is registered
+#: (Nunba's original floor; what is left when no size is registered at all).
+GGUF_MIN_BYTES = 100_000_000
+
+
+def gguf_min_bytes(expected_bytes) -> int:
+    """The fewest bytes a complete weight file of ``expected_bytes`` holds:
+    GGUF_COMPLETE_SHARE of it, never under GGUF_MIN_BYTES.  An unknown size
+    (None or 0) leaves the floor."""
+    return max(GGUF_MIN_BYTES, int((expected_bytes or 0) * GGUF_COMPLETE_SHARE))
+
+
+def gguf_complete(path, min_bytes: int = 0) -> bool:
+    """True iff ``path`` is a file of at least ``min_bytes`` that starts with
+    the GGUF magic (``b'GGUF'``).  Never raises.
+
+    Size catches a partial download, the magic catches a truncated or wrong
+    file (an error page saved under the weight's name).  With the default
+    ``min_bytes`` of 0 only the magic is asked.  Pass gguf_min_bytes(...) of
+    the registered size to ask the whole rule.
+    """
+    try:
+        if not os.path.isfile(path) or os.path.getsize(path) < min_bytes:
+            return False
+        with open(path, 'rb') as fh:
+            return fh.read(4) == b'GGUF'
+    except Exception:
+        return False
+
+
 # Download sources
 SOURCES = {
     'huggingface': 'HuggingFace Hub',
