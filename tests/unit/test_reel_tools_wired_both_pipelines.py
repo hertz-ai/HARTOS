@@ -4,12 +4,12 @@ integrations/reel_studio/tools.register_reel_studio_tools is a goal-gated
 Tier-2 family, wired into the two agent constructors the way the other
 families are, in its own ``try`` after the shared Tier-2 one:
 
-* her Reel Studio agent (``reel_studio`` in the turn's goal tags, which only
-  her explicit creation hint stamps on a record) gets the schema on the
-  Helper AND the Assistant, and execution on the Assistant and the group
-  chat's Executor -- the canonical Tier-2 shape WS-9 adopted;
-* every other agent gets execution only, so the model is not shown them but
-  ``request_tools`` can attach them (test_reel_tools_discoverable.py);
+* her Reel Studio agent (``reel_studio`` STORED on its record, which only
+  her explicit creation hint stamps) gets the schema on the Helper AND the
+  Assistant, and execution on the Assistant and the group chat's Executor --
+  the canonical Tier-2 shape WS-9 adopted;
+* every other agent gets no reel tool at all, so ``request_tools`` can never
+  offer one to it (critic report 2.6; test_reel_tools_discoverable.py);
 * on the central node nothing is registered (amendment A8 d);
 * the tools read the turn's request id from the running pipeline's own
   ``request_id_list``, when they run;
@@ -185,18 +185,17 @@ def test_her_reel_studio_agent_is_shown_the_family_and_runs_it(seats, pipeline):
 
 
 @pytest.mark.parametrize('pipeline', PIPELINES)
-def test_any_other_agent_runs_them_but_is_not_shown_them(seats, pipeline):
+def test_any_other_agent_carries_no_reel_tool(seats, pipeline):
+    """Neither shown nor runnable: a reel tool on any other agent's function
+    map is one request_tools can attach to it for an unrelated need
+    (critic report 2.6: "trending news today" -> reel_trending_songs)."""
+    from integrations.reel_studio.tools import REEL_ON_DEMAND_TOOL_NAMES
     built = seats(pipeline)
-    reel = reel_names()
+    every = reel_names() | set(REEL_ON_DEMAND_TOOL_NAMES)
     for seat in (built.helper, built.assistant, built.executor):
-        assert not reel & schema(seat), (
-            f'{pipeline}: an agent that is not her Reel Studio agent was shown '
-            f'{sorted(reel & schema(seat))}: the family costs ~900 schema '
-            f'tokens per seat and belongs to her agent only')
-    assert reel <= runs(built.assistant), (
-        f'{pipeline}: not registered for execution, so request_tools has '
-        f'nothing to re-attach when this agent is asked for a reel')
-    assert reel <= runs(built.executor), pipeline
+        assert not every & (schema(seat) | runs(seat)), (
+            f'{pipeline}: an agent that is not her Reel Studio agent carries '
+            f'{sorted(every & (schema(seat) | runs(seat)))} on {seat.name}')
 
 
 @pytest.mark.parametrize('pipeline', PIPELINES)
@@ -244,7 +243,10 @@ def test_the_tools_answer_for_the_turn_this_pipeline_is_running(
     assert args[0] is built.helper and args[1] is built.assistant
     assert str(args[2]) == str(USER_ID)
     assert str(kwargs['prompt_id']) == str(PROMPT_ID)
-    assert kwargs['with_schema'] is shown
+    # The record's own stored tags, as written: the family asks the one rule
+    # (resolve_goal_tags) whether they make this agent hers.
+    assert kwargs['stored_tags'] == goal_tags
+    assert (reel_names() <= runs(built.assistant)) is shown
     assert kwargs['executor'] is built.executor
     other = rr.request_id_list if built.module is cr else cr.request_id_list
     getter = kwargs['request_id_getter']
@@ -315,7 +317,9 @@ def _reel_branch_problems(src, constructor):
     """What is wrong with ``constructor``'s reel branch, read from the AST:
     [] when it is one register_reel_studio_tools call, alone in its own try
     after the shared goal-gated Tier-2 try, that catches and does not
-    re-raise, passing this pipeline's turn and its executor."""
+    re-raise, passing this pipeline's turn, its executor and the record's
+    stored goal tags (``stored_goal_tags``; not the resolved ``goal_tags``,
+    whose detected reel_studio would make any agent hers)."""
     fn = next((n for n in ast.walk(ast.parse(src))
                if isinstance(n, ast.FunctionDef) and n.name == constructor), None)
     if fn is None:
@@ -356,8 +360,8 @@ def _reel_branch_problems(src, constructor):
             and [getattr(a, 'id', None) for a in body.args] == ['user_prompt']):
         problems.append('request_id_getter does not read '
                         'request_id_list.get(user_prompt) when called')
-    if not _gates_on_goal_tags([kw['with_schema']] if 'with_schema' in kw else []):
-        problems.append('with_schema is not a goal_tags test')
+    if getattr(kw.get('stored_tags'), 'id', None) != 'stored_goal_tags':
+        problems.append("stored_tags is not the record's stored_goal_tags")
     if getattr(kw.get('executor'), 'id', None) != 'executor':
         problems.append('the group chat executor is not passed')
     if getattr(kw.get('prompt_id'), 'id', None) != 'prompt_id':
@@ -397,7 +401,7 @@ def test_the_branch_guard_flags_a_reel_call_inside_the_shared_try():
         '        register_reel_studio_tools(\n'
         '            helper, assistant, user_id, prompt_id=prompt_id,\n'
         '            request_id_getter=lambda: request_id_list.get(user_prompt),\n'
-        '            with_schema=TAG in goal_tags, executor=executor)\n'
+        '            stored_tags=stored_goal_tags, executor=executor)\n'
         '    except Exception as e:\n'
         '        log(e)\n')
     assert any('also loads' in p
@@ -414,10 +418,15 @@ def test_the_branch_guard_flags_a_reel_call_inside_the_shared_try():
         '        register_reel_studio_tools(\n'
         '            helper, assistant, user_id, prompt_id=prompt_id,\n'
         '            request_id_getter=lambda: rid,\n'
-        '            with_schema=TAG in goal_tags, executor=executor)\n'
+        '            stored_tags=stored_goal_tags, executor=executor)\n'
         '    except Exception as e:\n'
         '        log(e)\n')
     assert any('request_id_getter' in p
                for p in _reel_branch_problems(stale_turn, 'create_agents'))
     good = stale_turn.replace('lambda: rid', 'lambda: request_id_list.get(user_prompt)')
     assert _reel_branch_problems(good, 'create_agents') == []
+    # The resolved tags carry a DETECTED reel_studio; passing them would make
+    # an agent hers from its words alone (amendment A8 b).
+    resolved = good.replace('stored_tags=stored_goal_tags', 'stored_tags=goal_tags')
+    assert any('stored_goal_tags' in p
+               for p in _reel_branch_problems(resolved, 'create_agents'))

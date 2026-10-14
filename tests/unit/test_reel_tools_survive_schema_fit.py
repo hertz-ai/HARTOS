@@ -8,9 +8,9 @@ anything not protected may be deferred when the window is tight, and the reel
 family registers last, so it is the first to go.  Most of her turns are REUSE
 turns and reel_make is her agent's whole action, so when ``reel_studio`` is
 unlocked for the session the fit keeps REEL_TOOL_NAMES -- the ones this agent
-can run, which on the central node is none (amendment A8 d: a turn there that
-says "edit my clips" unlocks the tag through attach_for_turn, which does not
-ask the node, and must protect nothing).
+can run, which on the central node is none (amendment A8 d: there no reel
+tool is registered, and a turn that says "edit my clips" does not unlock the
+tag either, since attach_for_turn resolves turns through resolve_goal_tags).
 
 The agents are built by the real REUSE constructor (the ``seats`` harness of
 test_reel_tools_wired_both_pipelines.py); the live window is a stub
@@ -111,22 +111,27 @@ def test_without_reel_studio_unlocked_the_same_fit_defers_them(door):
     assert reel <= runs(built.assistant)
 
 
-def test_on_central_a_turn_that_unlocks_reel_studio_protects_nothing(
+def test_on_central_a_turn_that_says_edit_my_clips_protects_nothing(
         door, monkeypatch):
-    """Amendment A8 d.  On central no reel tool is registered, and
-    attach_for_turn still unlocks reel_studio when a turn's words detect it
-    (it reads detect_goal_tags, which does not ask the node).  The fit keeps
-    only reel tools this agent can run, so it keeps none here."""
+    """Amendment A8 d.  On central no reel tool is registered, and a turn
+    whose words detect reel_studio does not unlock it either:
+    attach_for_turn resolves the turn through resolve_goal_tags, which
+    drops the tag on central.  Should the tag ever be unlocked there, the
+    fit keeps only reel tools this agent can run -- none; so the fit
+    protects no reel tool either way."""
     from security import key_delegation
     monkeypatch.setattr(key_delegation, 'get_node_tier', lambda: 'central')
     built = door(['reel_studio'], ALWAYS_KEPT)
     assert 'reel_studio' not in built.assistant._hart_unlocked_tags
     from core.agent_tool_menu import attach_for_turn
+    from integrations.agent_engine.marketing_tools import detect_goal_tags
     from integrations.service_tools import service_tool_registry
-    new, _n = attach_for_turn('Please edit my clips for Instagram',
-                              built.helper, built.assistant,
+    turn = 'Please edit my clips for Instagram'
+    assert 'reel_studio' in detect_goal_tags(turn), 'the premise: the words detect it'
+    new, _n = attach_for_turn(turn, built.helper, built.assistant,
                               service_tool_registry)
-    assert new == ['reel_studio'], 'the premise: the turn unlocked the tag'
+    assert 'reel_studio' not in new
+    assert 'reel_studio' not in built.assistant._hart_unlocked_tags
     import core.agent_tools as agent_tools
     real_fit = agent_tools.fit_schema_to_ctx
     protected = []

@@ -2,7 +2,7 @@
 reel_watchlist, the one asked for on demand.
 
 ``register_reel_studio_tools(helper, assistant, user_id, prompt_id=,
-request_id_getter=, with_schema=, executor=)`` builds the closures with her
+stored_tags=, request_id_getter=, executor=)`` builds the closures with her
 user id, her agent's prompt id and a getter for the current turn's request
 id bound in, so none of them is a tool argument, and registers them in the
 canonical Tier-2 shape (integrations.agent_engine.news_tools.
@@ -13,12 +13,18 @@ speaker selection lets it propose a tool it has no schema for, the model
 free-forms the call as plain text that autogen never runs (measured live on
 the news family, 2026-09-03), and reel_make is her agent's whole action.
 The executor runs the assistant's own structured call, which autogen's
-repeat-speaker rule would otherwise strand.  With ``with_schema=False`` (an
-agent that is not her Reel Studio agent) only execution is registered, so
-the tools are not in the model's schema but
-core.agent_tool_menu.discover_and_attach finds them by the first line of
-their docstrings when the agent asks request_tools for them.  On the central
-node nothing is registered: reel_studio is inert there (amendment A8 d).
+repeat-speaker rule would otherwise strand.
+
+Only her Reel Studio agent gets them: an agent whose record STORES
+reel_studio (``stored_tags``; only her explicit creation hint stamps it,
+amendment A8 c), on a node where the tag is live.  Any other agent gets
+none, so core.agent_tool_menu.discover_and_attach -- which finds a tool on
+an agent's function map by the first line of its docstring -- can never
+offer one to it for an unrelated need (critic report 2.6: "trending news
+today" attached reel_trending_songs to a non-reel agent).  On her agent it
+gives a deferred one back when she asks request_tools ("make a reel from my
+videos").  On the central node nothing is registered: reel_studio is inert
+there (amendment A8 d).
 
 The seven (REEL_TOOL_NAMES):
 
@@ -47,8 +53,8 @@ The seven (REEL_TOOL_NAMES):
 * ``reel_voice``: read or change her voice profile.
 
 On demand (REEL_ON_DEMAND_TOOL_NAMES): registered with the seven, on the
-same seats, but with no schema for any agent, her Reel Studio agent's
-included -- request_tools attaches it when an agent asks
+same seats of her Reel Studio agent, but with no schema up front --
+request_tools attaches it when she asks
 (core.agent_tool_menu.discover_and_attach matches the first line of its
 docstring).  It is used once in a while, and the seven's schema is held to
 900 tokens per seat (plan WS-8b; 893 measured with the seven):
@@ -613,35 +619,55 @@ def _inert_here() -> bool:
     return REEL_STUDIO_TAG not in resolve_goal_tags([REEL_STUDIO_TAG], '')
 
 
-def register_reel_studio_tools(helper, assistant, user_id: str, *, prompt_id,
+def _her_agent(stored_tags) -> bool:
+    """Is this her Reel Studio agent: does its record STORE reel_studio?
+
+    Asked of marketing_tools.resolve_goal_tags with no text, so only the
+    stored tags speak (her words never make an agent hers, amendment A8 b/c)
+    and a junk stored value reads as no tags -- this module holds no second
+    rule for what a record's goal_tags mean."""
+    from integrations.agent_engine.marketing_tools import REEL_STUDIO_TAG, resolve_goal_tags
+    return REEL_STUDIO_TAG in resolve_goal_tags(stored_tags, '')
+
+
+def register_reel_studio_tools(helper, assistant, user_id: str, *, prompt_id, stored_tags,
                                request_id_getter: Optional[Callable[[], Any]] = None,
-                               with_schema: bool = True, executor=None) -> List[str]:
-    """Register the reel tools for ``user_id``'s agent ``prompt_id``, in the
-    canonical Tier-2 shape (see the module note; the same as
-    news_tools.register_news_tools).
+                               executor=None) -> List[str]:
+    """Register the reel tools for ``user_id``'s agent ``prompt_id`` when it
+    is her Reel Studio agent, in the canonical Tier-2 shape (see the module
+    note; the same as news_tools.register_news_tools).
+
+    ``stored_tags`` is the agent record's own ``goal_tags``, as stored (not
+    the tags resolved from its words): only an agent whose record stores
+    reel_studio is hers (_her_agent).  For any other agent nothing is
+    registered and [] is returned.  On the central node nothing is
+    registered for any agent (amendment A8 d); elsewhere the first call in
+    a process sweeps the reel jobs a restart interrupted, whichever agent it
+    is building (_first_registration).
 
     ``request_id_getter()`` returns the current turn's request id, read each
-    time reel_make runs.  ``with_schema``: True for her Reel Studio agent --
-    ``register_for_llm`` on ``helper`` and on ``assistant`` for the seven
-    REEL_TOOL_NAMES, so whichever of them proposes reel_make makes a
-    structured call; False for any other agent -- no schema anywhere, so
-    request_tools can attach them on demand.  REEL_ON_DEMAND_TOOL_NAMES get
-    no schema either way.  ``assistant`` runs them all
-    (``register_for_execution``), and so does ``executor`` when given: a
-    group-chat agent distinct from the proposer, which runs the assistant's
-    own calls (REUSE passes its executor to every Tier-2 family).  On the
-    central node nothing is registered (amendment A8 d).  Returns the names
-    registered, REEL_TOOL_NAMES then REEL_ON_DEMAND_TOOL_NAMES ([] on
-    central).
+    time reel_make runs.  ``register_for_llm`` on ``helper`` and on
+    ``assistant`` for the seven REEL_TOOL_NAMES, so whichever of them
+    proposes reel_make makes a structured call; REEL_ON_DEMAND_TOOL_NAMES
+    get no schema up front (request_tools attaches them when she asks).
+    ``assistant`` runs them all (``register_for_execution``), and so does
+    ``executor`` when given: a group-chat agent distinct from the proposer,
+    which runs the assistant's own calls (REUSE passes its executor to every
+    Tier-2 family).  Returns the names registered, REEL_TOOL_NAMES then
+    REEL_ON_DEMAND_TOOL_NAMES.
     """
     if _inert_here():
         logger.info('Reel tools not registered for user %s: reel_studio is inert on the '
                     'central node', user_id)
         return []
     _first_registration()
+    if not _her_agent(stored_tags):
+        logger.info('Reel tools not registered for agent %s of user %s: its record stores '
+                    'no reel_studio, so it is not her Reel Studio agent', prompt_id, user_id)
+        return []
     tools = build_reel_tools(user_id, prompt_id=prompt_id, request_id_getter=request_id_getter)
     for name, func in tools:
-        if with_schema and name not in REEL_ON_DEMAND_TOOL_NAMES:
+        if name not in REEL_ON_DEMAND_TOOL_NAMES:
             description = _describe(func)
             helper.register_for_llm(name=name, description=description)(func)
             assistant.register_for_llm(name=name, description=description)(func)
@@ -649,8 +675,8 @@ def register_reel_studio_tools(helper, assistant, user_id: str, *, prompt_id,
         if executor is not None:
             executor.register_for_execution(name=name)(func)
     names = [name for name, _func in tools]
-    logger.info('Registered %d reel tools for user %s (%s%s)', len(names), user_id,
-                'schema on helper + assistant, execution' if with_schema else 'execution only',
+    logger.info('Registered %d reel tools for agent %s of user %s (schema on helper + '
+                'assistant, execution%s)', len(names), prompt_id, user_id,
                 ' + executor' if executor is not None else '')
     return names
 

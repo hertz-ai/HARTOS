@@ -3,12 +3,13 @@ watchlist with (owner ruling A17b): "track these accounts", "stop tracking
 X", "which accounts do you track".
 
 It is registered with the reel family, by register_reel_studio_tools on the
-same seats (the Assistant and the group chat's Executor run it; nothing on
-the central node, amendment A8 d), but no agent is shown its schema up
-front: the owner names the accounts once in a while, and the family's
-schema is held to 900 tokens per seat (plan WS-8b; measured 893 with the
-seven).  request_tools, the never-say-unavailable escape, attaches it when
-an agent asks for it, her Reel Studio agent included, in CREATE and REUSE.
+same seats of her Reel Studio agent only (the Assistant and the group chat's
+Executor run it; nothing on any other agent, nothing on the central node,
+amendment A8 d), but her agent is not shown its schema up front: the owner
+names the accounts once in a while, and the family's schema is held to 900
+tokens per seat (plan WS-8b; measured 893 with the seven).  request_tools,
+the never-say-unavailable escape, attaches it when she asks for it, in
+CREATE and REUSE.
 
 The research Instagram account's username and password never pass through
 it: it has no parameter for them, and once a watchlist exists the reply
@@ -82,13 +83,15 @@ def desktop(tmp_path, monkeypatch):
     platform_paths.reset_cache()
 
 
-def _register(with_schema=True, executor=True):
+def _register(executor=True):
+    """The family as her Reel Studio agent gets it (its record stores
+    reel_studio)."""
     from integrations.reel_studio.tools import register_reel_studio_tools
     helper, assistant = _Agent(), _Agent()
     kw = {'executor': _Agent()} if executor else {}
     names = register_reel_studio_tools(helper, assistant, '10077', prompt_id='42',
                                        request_id_getter=lambda: None,
-                                       with_schema=with_schema, **kw)
+                                       stored_tags=['reel_studio'], **kw)
     return names, helper, assistant, kw.get('executor')
 
 
@@ -100,12 +103,11 @@ def _ok(reply):
 
 # ── how it is registered ─────────────────────────────────────────────────
 
-@pytest.mark.parametrize('with_schema', [True, False])
-def test_it_rides_with_the_family_on_the_running_seats_and_no_agent_is_shown_it(
-        desktop, with_schema):
+def test_it_rides_with_the_family_on_the_running_seats_and_is_not_shown_up_front(
+        desktop):
     from integrations.reel_studio.tools import REEL_ON_DEMAND_TOOL_NAMES, REEL_TOOL_NAMES
     assert TOOL in REEL_ON_DEMAND_TOOL_NAMES and TOOL not in REEL_TOOL_NAMES
-    names, helper, assistant, executor = _register(with_schema=with_schema)
+    names, helper, assistant, executor = _register()
     assert names == list(REEL_TOOL_NAMES) + list(REEL_ON_DEMAND_TOOL_NAMES)
     assert TOOL in assistant.exe and assistant.exe[TOOL] is executor.exe[TOOL]
     assert TOOL not in helper.llm and TOOL not in assistant.llm and TOOL not in helper.exe

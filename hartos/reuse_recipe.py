@@ -2789,9 +2789,11 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
         _attached_names = set(svc_tools)
         # Shared per-conversation state for the per-turn attach hook in
         # get_agent_response — same set object request_tools mutates, so
-        # both layers see one attach ledger.
+        # both layers see one attach ledger.  It carries the record's stored
+        # tags, so each turn is resolved by the same rule as this build (her
+        # stored reel_studio keeps media quiet mid-chat).
         from core.agent_tool_menu import arm_turn_attach
-        arm_turn_attach(assistant, _attached_names, goal_tags)
+        arm_turn_attach(assistant, _attached_names, goal_tags, stored_goal_tags)
         # The FULL core closure list, for the per-turn named attach in
         # get_agent_response — that runs in a different function, so the list
         # built at L2141 is out of scope there and has to ride the agent like
@@ -3070,24 +3072,26 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
 
     # Reel Studio (integrations/reel_studio): her Instagram-reel tools, a
     # Tier-2 family in its own try after the shared one, so a failure on
-    # either side costs the other nothing (plan WS-8b).  Her Reel Studio agent
-    # (reel_studio in goal_tags) is shown them on the Helper and the
-    # Assistant; every other agent can only RUN them, so they cost it no
-    # schema and request_tools still finds them (core.agent_tool_menu.
-    # discover_and_attach reads the assistant's function map).  The executor
-    # runs the Assistant's own structured calls, as for every family above.
-    # The tools read the turn's request id from this module's request_id_list
-    # (chat_agent writes it per turn) when they run.  On the central node it
-    # registers nothing (amendment A8 d).  _attach_named_tools_for_action's
-    # fit keeps the family while reel_studio is unlocked.  CREATE makes the
-    # same call.
+    # either side costs the other nothing (plan WS-8b).  Only her Reel Studio
+    # agent -- its record STORES reel_studio (stored_goal_tags), which only
+    # her explicit creation hint stamps -- gets them, on the Helper and the
+    # Assistant; every other agent gets none, so request_tools
+    # (core.agent_tool_menu.discover_and_attach, which reads the assistant's
+    # function map) can never offer one to it for an unrelated need (critic
+    # report 2.6).  Hence the stored tags, not goal_tags, whose detected
+    # reel_studio would make an agent hers from its words alone (amendment
+    # A8 b).  The executor runs the Assistant's own structured calls, as for
+    # every family above.  The tools read the turn's request id from this
+    # module's request_id_list (chat_agent writes it per turn) when they run.
+    # On the central node it registers nothing (amendment A8 d).
+    # _attach_named_tools_for_action's fit keeps the family while reel_studio
+    # is unlocked.  CREATE makes the same call.
     try:
-        from integrations.agent_engine.marketing_tools import REEL_STUDIO_TAG
         from integrations.reel_studio.tools import register_reel_studio_tools
         register_reel_studio_tools(
             helper, assistant, user_id, prompt_id=prompt_id,
             request_id_getter=lambda: request_id_list.get(user_prompt),
-            with_schema=REEL_STUDIO_TAG in goal_tags, executor=executor)
+            stored_tags=stored_goal_tags, executor=executor)
     except Exception as e:
         # Loud for the reason the shared block above is: an agent built
         # without its reel tools talks about reels without making one.
@@ -7501,10 +7505,11 @@ def _attach_named_tools_for_action(user_prompt):
             # names: reel_make is her agent's whole action, and its song list
             # and caption checks feed it (plan WS-8b).  It registers last, so
             # without this it is the first family the fit defers.  Only the
-            # reel tools this agent can RUN are kept: on the central node
-            # none is registered (register_reel_studio_tools, amendment A8 d),
-            # so a turn there that unlocks the tag -- attach_for_turn reads
-            # detect_goal_tags, which does not ask the node -- keeps nothing.
+            # reel tools this agent can RUN are kept: they are registered on
+            # her Reel Studio agent alone (register_reel_studio_tools: its
+            # record stores reel_studio, and never on the central node,
+            # amendment A8 d), so another agent whose turn's words unlock the
+            # tag keeps nothing here.
             # Inline, not a helper of this module: the guard tests lift this
             # function out of the file and run it on its own.
             _unlocked = getattr(assistant, '_hart_unlocked_tags', None) or ()

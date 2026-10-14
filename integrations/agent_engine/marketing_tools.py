@@ -780,10 +780,12 @@ def detect_goal_tags(prompt) -> list:
     # outreach goal that sources makeup artists as leads, or posts reels to
     # sell them a product, is not a reel studio and keeps its own tools.
     # Measured against the in-repo goal corpus plus such goals: 0 hits
-    # (tests/unit/test_reel_studio_goal_tag.py).  Detection grants the tools
-    # only: it never stamps the tag on a record, never quiets a family and
-    # never keeps an agent on this node -- only the stored tag, which only
-    # her explicit creation hint stamps, does that.
+    # (tests/unit/test_reel_studio_goal_tag.py).  Detection alone makes no
+    # agent hers: it never stamps the tag on a record, never quiets a family,
+    # never keeps an agent on this node and never gets an agent the reel
+    # tools -- only the stored tag, which only her explicit creation hint
+    # stamps, does that (integrations.reel_studio.tools.
+    # register_reel_studio_tools registers the family on her agent alone).
     reel_studio_keywords = [
         'reel studio', 'edit my reel', 'edit my videos', 'edit my clips',
     ]

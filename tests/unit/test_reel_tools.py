@@ -3,14 +3,14 @@
 register_reel_studio_tools binds her user id, her agent's prompt id and a
 getter for the turn's request id into seven closures, so none of them is a
 tool argument.  It registers them in the canonical Tier-2 shape
-(news_tools.register_news_tools; commerce, finance and revenue follow it):
-with the schema (her Reel Studio agent) both the helper and the assistant
-carry the LLM schema, so an Assistant-proposed reel_make is a structured
-call, not text autogen never runs (measured live on the news family
-2026-09-03); the assistant and, when given, the executor run them.  Without
-the schema (any other agent) they are execution-only on the assistant and
-the executor, which is what lets request_tools find them.  On the central
-node it registers nothing (amendment A8 d).
+(news_tools.register_news_tools; commerce, finance and revenue follow it)
+on her Reel Studio agent only -- an agent whose record stores reel_studio:
+both the helper and the assistant carry the LLM schema, so an
+Assistant-proposed reel_make is a structured call, not text autogen never
+runs (measured live on the news family 2026-09-03); the assistant and, when
+given, the executor run them.  Any other agent gets none, so request_tools
+can never offer it one (critic report 2.6).  On the central node it
+registers nothing (amendment A8 d).
 
 reel_make turns a chat turn into a reel request: this turn's clips (else her
 newest unused batch), her style (tool arguments over her agent record's
@@ -43,6 +43,8 @@ from integrations.trends import trending_songs_client as _trending_client
 
 UID = '10077'
 PID = '42'
+#: Her Reel Studio agent's stored goal tags (her creation hint stamps them).
+HER_TAGS = ('reel_studio',)
 #: The real trending read, taken before any fixture replaces it (``env``
 #: does: most tests here supply their own list).
 REAL_TRENDING = _trending_client.get_trending_songs
@@ -125,15 +127,17 @@ def env(tmp_path, monkeypatch):
     platform_paths.reset_cache()
 
 
-def _tools(env, user=UID, prompt=PID, with_schema=True, executor=False):
-    """Register the reel tools on recording agents; ``executor`` adds the
-    group chat's distinct executor (REUSE passes one to every Tier-2 family)."""
+def _tools(env, user=UID, prompt=PID, stored_tags=HER_TAGS, executor=False):
+    """Register the reel tools on recording agents, for an agent whose record
+    stores ``stored_tags`` (her Reel Studio agent unless told otherwise);
+    ``executor`` adds the group chat's distinct executor (REUSE passes one to
+    every Tier-2 family)."""
     from integrations.reel_studio.tools import register_reel_studio_tools
     helper, assistant = _Agent(), _Agent()
     kw = {'executor': _Agent()} if executor else {}
     names = register_reel_studio_tools(helper, assistant, user, prompt_id=prompt,
                                        request_id_getter=lambda: env.request['id'],
-                                       with_schema=with_schema, **kw)
+                                       stored_tags=stored_tags, **kw)
     return SimpleNamespace(names=names, helper=helper, assistant=assistant,
                            executor=kw.get('executor'), run=assistant.exe)
 
@@ -169,7 +173,7 @@ def _media_pushes(env):
 
 # ── registration ──────────────────────────────────────────────────────────
 
-def test_with_the_schema_both_seats_carry_it_and_the_executor_runs_them(env):
+def test_her_agent_carries_it_on_both_seats_and_the_executor_runs_them(env):
     """The canonical Tier-2 shape (news_tools.register_news_tools): the
     Assistant carries the schema too, or a reel_make it proposes is free-
     formed as text that autogen never runs (measured live on the news family,
@@ -201,14 +205,25 @@ def test_without_an_executor_the_assistant_runs_them(env):
     assert set(t.assistant.exe) == set(REEL_TOOL_NAMES) | set(REEL_ON_DEMAND_TOOL_NAMES)
 
 
-def test_without_the_schema_only_execution_is_registered(env):
-    from integrations.reel_studio.tools import REEL_ON_DEMAND_TOOL_NAMES, REEL_TOOL_NAMES
-    t = _tools(env, with_schema=False, executor=True)
-    assert t.helper.llm == {} and t.assistant.llm == {} and t.executor.llm == {}
-    assert set(t.assistant.exe) == set(t.executor.exe) \
-        == set(REEL_TOOL_NAMES) | set(REEL_ON_DEMAND_TOOL_NAMES)
-    # discover_and_attach reads the first docstring line of _function_map entries.
-    for func in t.assistant.exe.values():
+@pytest.mark.parametrize('stored', [None, [], ['news'], 'reel_studio', [None, 42]])
+def test_an_agent_that_is_not_hers_is_given_no_reel_tool(env, stored):
+    """Only an agent whose record STORES reel_studio is hers.  Every other
+    agent -- no stored tags, other tags, or a junk value (a bare string is
+    not a tag list) -- gets nothing: not the schema, and not execution
+    either, because discover_and_attach finds any tool on an agent's
+    function map by its docstring, so request_tools would offer it the
+    family for an unrelated need (critic report 2.6: "trending news today"
+    -> reel_trending_songs, "Immediately CALL")."""
+    t = _tools(env, stored_tags=stored, executor=True)
+    assert t.names == []
+    for seat in (t.helper, t.assistant, t.executor):
+        assert seat.llm == {} and seat.exe == {}, stored
+
+
+def test_every_tool_says_what_it_does_on_its_first_docstring_line(env):
+    """discover_and_attach matches, and attaches with, the first docstring
+    line of a function-map entry: it is how a deferred tool comes back."""
+    for func in _tools(env).run.values():
         assert (func.__doc__ or '').strip().split('\n')[0].strip()
 
 
@@ -223,11 +238,10 @@ def test_on_the_central_node_no_reel_tool_is_registered(env, monkeypatch):
     monkeypatch.setattr(jobs, '_SWEPT', False)
     swept = []
     monkeypatch.setattr(jobs, 'sweep_interrupted', lambda **k: swept.append(1) or [])
-    for with_schema in (True, False):
-        t = _tools(env, with_schema=with_schema, executor=True)
-        assert t.names == []
-        for seat in (t.helper, t.assistant, t.executor):
-            assert seat.llm == {} and seat.exe == {}
+    t = _tools(env, executor=True)              # her stored tag, on central
+    assert t.names == []
+    for seat in (t.helper, t.assistant, t.executor):
+        assert seat.llm == {} and seat.exe == {}
     assert swept == []
 
 
@@ -243,7 +257,8 @@ def test_real_autogen_agents_take_the_tools(env):
     executor = autogen.UserProxyAgent('executor', human_input_mode='NEVER',
                                       code_execution_config=False)
     register_reel_studio_tools(helper, assistant, UID, prompt_id=PID,
-                               request_id_getter=lambda: None, executor=executor)
+                               request_id_getter=lambda: None, stored_tags=['reel_studio'],
+                               executor=executor)
     from core.llm_outbound_logger import _schema_tokens
     for seat in (helper, assistant):
         schema = {t['function']['name']: t['function'] for t in seat.llm_config['tools']}
@@ -290,8 +305,8 @@ def test_the_first_registration_sweeps_interrupted_jobs(env, monkeypatch):
     monkeypatch.setattr(jobs, '_SWEPT', False)
     calls = []
     monkeypatch.setattr(jobs, 'sweep_interrupted', lambda **k: calls.append(1) or [])
+    _tools(env, stored_tags=None)       # any agent built here: not her agent's alone
     _tools(env)
-    _tools(env, with_schema=False)
     assert calls == [1]
 
 
