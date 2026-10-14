@@ -426,6 +426,43 @@ def test_another_persons_phone_reaches_none_of_these_files(store, tmp_path):
     assert store.usage(OTHER) == 0
 
 
+# ── her own devices: nothing here is egress, so nothing is DLP-scanned ────
+
+#: A name the remote-desktop file scan refuses: it carries an email and a
+#: phone number (integrations.remote_desktop.security.scan_file_transfer, the
+#: DLP engine's check_outbound on the file name).
+PII_NAME = 'Bride Priya 415-555-0199 priya.k@example.com.mp4'
+
+
+@pytest.mark.parametrize('relayed', [False, True], ids=['lan', 'relay'])
+def test_her_files_move_between_her_own_devices_unscanned(store, tmp_path, relayed):
+    """Her phone and her desktop are one person's devices: a device link of
+    its token's user, every file keyed by that user.  security.edge_privacy
+    scans only what reaches OTHER people's nodes (owner ruling 2026-09-26;
+    a USER_DEVICES destination runs no DLP), so this door scans nothing: a
+    clip she named after her client's phone and email uploads, and a reel so
+    named comes back, the name unchanged, on the LAN and on the relay.  Fails
+    if the door grows the remote-desktop scan, which refuses this name
+    (inventory D35, judged clean)."""
+    from integrations.remote_desktop.security import scan_file_transfer
+    assert scan_file_transfer(PII_NAME)[0] is False     # the scan this door must not run
+    _, ws = device_link(requires_e2e=relayed)
+    clip = blob(1000, seed=20)
+    _, done = upload(ws, clip, name=PII_NAME)
+    assert done == {'type': 'file_done', 'xid': sha(clip)}
+    assert store.resolve(USER, sha(clip)).name == PII_NAME
+    src = tmp_path / 'reel-pii.mp4'
+    src.write_bytes(blob(1000, seed=21))
+    reel = store.offer_to_device(USER, str(src), mime='video/mp4', purpose='reel',
+                                 prompt_id='7001', request_id='req-7001-0002', name=PII_NAME)
+    listed = ask(ws, {'type': 'file_list'})
+    assert [(i['xid'], i['name']) for i in listed['items']] == [(reel.xid, PII_NAME)]
+    got = ask(ws, {'type': 'file_get', 'xid': reel.xid, 'i': 0})
+    assert got['type'] == 'file_chunk', got
+    assert got['last'] is True
+    assert base64.b64decode(got['b64'], validate=True) == src.read_bytes()
+
+
 # ── who may ask, and how ──────────────────────────────────────────────────
 
 def _spy(link):

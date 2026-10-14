@@ -53,6 +53,15 @@ names no xid; on file_put and file_get it names the frame's i.  REFUSALS
 lists them all, and tests/fixtures/peerlink_file_vector.json pins them with
 the frames for the phone (DesktopFilesVectorTest).
 
+No DLP scan, by design (inventory D35, judged clean).  Every byte here moves
+between one person's own devices: her phone's device link and the store
+keyed by that link's user.  security.edge_privacy scans only what goes to
+OTHER people's nodes (owner ruling 2026-09-26; a USER_DEVICES destination
+runs no DLP), and a relayed link is end-to-end sealed, so the relay reads
+nothing.  integrations.remote_desktop's file scan does another job (a session
+copy whose far end may be another person's device), and it would refuse her
+own clip named after her client's phone or email.
+
 install() binds the handler, named in this node's handshake so a phone asks
 only a desktop that answers, and applies the store's retention once.
 hartos/hartos_bootstrap.py installs it on every node but central.  core
