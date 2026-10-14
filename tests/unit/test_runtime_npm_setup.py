@@ -95,8 +95,10 @@ def test_setup_installs_the_project_into_its_storage_dir_and_prepares_it(env):
     tool_dir = env.storage.get_tool_dir(TOOL)
     assert result.get('downloaded') is True and result.get('ready') is True, result
     assert 'error' not in result
-    # Our files are copied; Python files and caches never are.
-    assert sorted(p.name for p in tool_dir.iterdir() if p.is_file()) == [
+    # Our files are copied; Python files and caches never are.  The list of
+    # what was copied stays beside them for the next setup's mirror.
+    assert sorted(p.name for p in tool_dir.iterdir()
+                  if p.is_file() and p.name != model_storage.NPM_COPIED_LIST) == [
         'index.js', 'package.json', 'prepare.js']
     assert not (tool_dir / '__pycache__').exists()
     npm, node = env.runs
@@ -129,6 +131,57 @@ def test_a_changed_project_is_installed_again(env):
     assert env.rtm.setup_tool(TOOL).get('ready') is True
     assert [r.kind for r in env.runs] == ['npm', 'node']
     assert (env.storage.get_tool_dir(TOOL) / 'index.js').read_text() == 'module.exports = 2;\n'
+
+
+def test_a_file_the_project_no_longer_has_is_gone_after_re_setup(env):
+    """A HARTOS update that deletes or renames a project file: the re-setup
+    mirrors the source, so the old file cannot linger and be bundled.  What
+    npm and the prepare script put there (node_modules, the downloaded
+    browser, npm's lock file) is left alone."""
+    legacy = env.project / 'templates' / 'legacy'
+    legacy.mkdir(parents=True)
+    (legacy / 'old.tsx').write_text('old')
+    (env.project / 'templates' / 'kept.tsx').write_text('kept')
+    assert env.rtm.setup_tool(TOOL).get('ready') is True
+    tool_dir = env.storage.get_tool_dir(TOOL)
+    assert (tool_dir / 'templates' / 'legacy' / 'old.tsx').is_file()
+    chrome = (tool_dir / 'node_modules' / '.remotion' / 'chrome-headless-shell' / 'win64'
+              / 'chrome-headless-shell.exe')
+    chrome.parent.mkdir(parents=True)
+    chrome.write_bytes(b'chrome')
+    (tool_dir / 'package-lock.json').write_text('{}')
+
+    (legacy / 'old.tsx').unlink()
+    legacy.rmdir()
+    (env.project / 'index.js').rename(env.project / 'main.js')
+    result = env.rtm.setup_tool(TOOL)
+
+    assert result.get('ready') is True, result
+    assert not (tool_dir / 'templates' / 'legacy').exists(), 'removed with its folder'
+    assert not (tool_dir / 'index.js').exists(), 'a renamed file leaves no old copy'
+    assert (tool_dir / 'main.js').read_text() == 'module.exports = 1;\n'
+    assert (tool_dir / 'templates' / 'kept.tsx').read_text() == 'kept'
+    assert chrome.read_bytes() == b'chrome'
+    assert (tool_dir / 'node_modules' / 'remotion' / 'index.js').is_file()
+    assert (tool_dir / 'package-lock.json').is_file()
+    assert env.rtm.tool_ready(TOOL) is True
+
+
+def test_the_mirror_never_removes_outside_the_projects_own_files(env):
+    """A copied-files list naming node_modules or a path outside the tool
+    dir (hand-edited, or corrupt) removes nothing there."""
+    env.rtm.setup_tool(TOOL)
+    tool_dir = env.storage.get_tool_dir(TOOL)
+    outside = env.tmp / 'models' / 'outside.txt'
+    outside.write_text('keep')
+    listing = tool_dir / model_storage.NPM_COPIED_LIST
+    listing.write_text(json.dumps(['node_modules/remotion/index.js', '../outside.txt',
+                                   'index.js', 42]))
+    (env.project / 'index.js').write_text('module.exports = 3;\n')
+    assert env.rtm.setup_tool(TOOL).get('ready') is True
+    assert outside.read_text() == 'keep'
+    assert (tool_dir / 'node_modules' / 'remotion' / 'index.js').is_file()
+    assert (tool_dir / 'index.js').read_text() == 'module.exports = 3;\n'
 
 
 @pytest.mark.parametrize('kind, answer, said', [

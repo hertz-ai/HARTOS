@@ -32,6 +32,10 @@ NPM_INSTALL_TIMEOUT_S = 900.0
 NPM_PREPARE_TIMEOUT_S = 900.0
 #: Directories of an npm project that are never copied or fingerprinted.
 _NPM_SKIP_DIRS = frozenset({'node_modules', '__pycache__'})
+#: In a tool dir: the project files the last setup copied there (sorted
+#: '/'-separated relative paths), so the next setup removes the ones the
+#: project no longer has (_mirror_npm_project).
+NPM_COPIED_LIST = '.hart_project_files.json'
 #: One npm setup per tool directory at a time (two npm installs in one
 #: folder corrupt it); the second caller waits, then finds the receipt.
 _NPM_LOCKS: Dict[str, threading.Lock] = {}
@@ -410,6 +414,59 @@ class ModelStorageManager:
             return False
         return (self.get_tool_dir(tool_name) / 'node_modules').is_dir()
 
+    def _mirror_npm_project(self, project_dir: str, tool_dir: Path) -> None:
+        """Make the project's files in ``tool_dir`` the source's own.
+
+        Removes each file an earlier setup copied (NPM_COPIED_LIST) that the
+        project no longer has, and the folders that leaves empty; writes the
+        new list; then copies every project file.  A HARTOS update that
+        deletes or renames a file therefore leaves no stale copy behind
+        (peer validation of 38a220495).  Only listed files are touched:
+        node_modules, the browser a prepare script downloaded there, npm's
+        lock file and anything else not copied by a setup stay.  The list
+        is written before the copy, so a copy that fails half way still
+        names every file it may have placed.  Raises OSError.
+        """
+        root = os.path.normpath(os.path.abspath(str(tool_dir)))
+        files = [rel.replace(os.sep, '/') for rel in self._npm_project_files(project_dir)]
+        listing = tool_dir / NPM_COPIED_LIST
+        try:
+            before = json.loads(listing.read_text(encoding='utf-8'))
+        except FileNotFoundError:
+            before = []
+        except (OSError, ValueError) as e:
+            logger.warning("%s is unreadable (%s); no earlier project file is removed",
+                           listing, e)
+            before = []
+        keep = set(files)
+        for rel in before if isinstance(before, list) else ():
+            if not isinstance(rel, str) or rel in keep:
+                continue
+            path = os.path.normpath(os.path.join(root, rel))
+            inside = os.path.relpath(path, root).replace(os.sep, '/')
+            # Never outside the tool dir, never into what npm or a prepare
+            # script own (a list entry is data on disk, not trusted).
+            if inside.startswith('../') or inside == '..' or os.path.isabs(inside) \
+                    or inside.split('/')[0] in _NPM_SKIP_DIRS or inside == NPM_COPIED_LIST:
+                continue
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            parent = os.path.dirname(path)
+            while parent != root and parent.startswith(root + os.sep):
+                try:
+                    os.rmdir(parent)            # only when empty
+                except OSError:
+                    break
+                parent = os.path.dirname(parent)
+        tool_dir.mkdir(parents=True, exist_ok=True)
+        listing.write_text(json.dumps(files), encoding='utf-8')
+        for rel in files:
+            dest = tool_dir / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(os.path.join(project_dir, rel), dest)
+
     @staticmethod
     def _npm_lock(tool_dir: Path) -> threading.Lock:
         key = os.path.normcase(os.path.abspath(str(tool_dir)))
@@ -438,7 +495,9 @@ class ModelStorageManager:
                             prepare: Optional[str] = None) -> Path:
         """Set the npm project at ``project_dir`` up in this tool's directory.
 
-        Copies the project's files (_npm_project_files), runs ``npm install``
+        Mirrors the project's files there (_mirror_npm_project: copied, and
+        files an earlier setup copied that the project no longer has
+        removed), runs ``npm install``
         there, then ``node <prepare>`` when the project names a prepare
         script, and records the receipt.  Idempotent: a complete setup of
         this exact project returns at once; one setup per tool directory
@@ -457,10 +516,7 @@ class ModelStorageManager:
                     % ' and '.join(n for n, p in (('node', node), ('npm', npm)) if not p))
             fingerprint = self.npm_project_fingerprint(project_dir)
             try:
-                for rel in self._npm_project_files(project_dir):
-                    dest = tool_dir / rel
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(os.path.join(project_dir, rel), dest)
+                self._mirror_npm_project(project_dir, tool_dir)
             except OSError as e:
                 raise NpmSetupFailed(f'the project could not be copied into {tool_dir}: {e}') from e
             # npm on Windows is a .cmd shim; launch_argv is how a shim is run.
