@@ -11,8 +11,9 @@
 //   Title      a kinetic title: its words spring in one after another on a
 //              soft dark plate, then fade together.
 //   EndCard    a booking/price card that rises in: the first line large
-//              (her service), the second in the accent colour (the price),
-//              the rest smaller (how to book).
+//              (her service), her price -- the row priceRow names, none when
+//              it is -1 -- in the accent colour, the rest smaller (how to
+//              book).
 //   LogoSting  her logo pops in with a ring of the accent colour behind it
 //              and a light sweep across it.
 //   Wipe       her "before" frame covers the picture and a glowing line
@@ -63,10 +64,11 @@ function Title({text, accent}) {
       })));
 }
 
-function EndCard({lines, accent}) {
+function EndCard({lines, priceRow, accent}) {
   const frame = useCurrentFrame();
   const {fps, width, height, durationInFrames} = useVideoConfig();
   const rows = (Array.isArray(lines) ? lines : []).map((l) => String(l)).filter(Boolean);
+  const price = Number.isInteger(priceRow) ? priceRow : -1;
   const rise = spring({frame, fps, config: {damping: 16, stiffness: 120}});
   const base = Math.round(Math.min(height / (rows.length * 1.9 + 0.6), width / 13));
   return h(AbsoluteFill, {style: {alignItems: 'center', justifyContent: 'center',
@@ -82,11 +84,12 @@ function EndCard({lines, accent}) {
       rows.map((row, i) => {
         const s = spring({frame: frame - Math.round(fps * (0.18 + 0.14 * i)), fps,
                           config: {damping: 14, stiffness: 160}});
-        const size = i === 0 ? base * 1.15 : (i === 1 ? base * 1.05 : base * 0.8);
+        const isPrice = i === price;
+        const size = i === 0 ? base * 1.15 : (isPrice ? base * 1.05 : base * 0.8);
         return h('div', {key: i, style: {
-          fontFamily: FONT, fontWeight: i === 2 ? 600 : 800, fontSize: Math.round(size),
-          lineHeight: 1.18, color: i === 1 ? accent : '#1D1D1F',
-          textShadow: i === 1 ? '0 1px 0 rgba(0, 0, 0, 0.25)' : 'none',
+          fontFamily: FONT, fontWeight: i === 0 || isPrice ? 800 : 600, fontSize: Math.round(size),
+          lineHeight: 1.18, color: isPrice ? accent : '#1D1D1F',
+          textShadow: isPrice ? '0 1px 0 rgba(0, 0, 0, 0.25)' : 'none',
           opacity: s, transform: `translateY(${Math.round((1 - s) * base * 0.5)}px)`,
         }}, row);
       })));
@@ -147,7 +150,8 @@ const metadata = ({props}) => ({
 const SIZE = {width: 770, height: 300, fps: 30, durationInFrames: 75, accent: '#E8A0B4'};
 const TEMPLATES = [
   ['Title', Title, {...SIZE, text: 'Bridal glow'}],
-  ['EndCard', EndCard, {...SIZE, height: 360, lines: ['Bridal makeup', 'From 15,000', 'DM to book']}],
+  ['EndCard', EndCard, {...SIZE, height: 360, lines: ['Bridal makeup', 'From 15,000', 'DM to book'],
+                        priceRow: 1}],
   ['LogoSting', LogoSting, {...SIZE, width: 300, logo: ''}],
   ['Wipe', Wipe, {...SIZE, width: 1080, height: 1920, before: ''}],
 ];

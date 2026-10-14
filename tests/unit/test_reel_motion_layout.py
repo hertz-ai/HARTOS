@@ -143,13 +143,50 @@ def test_without_a_finished_look_there_is_no_wipe():
 
 
 def test_card_lines_keep_her_words_short():
-    assert L.card_lines(['bridal and reception makeup, saree draping', '', 'Rs 15k',
+    assert L.card_lines(['bridal and reception makeup', '', 'Rs 15k',
                          'DM for bookings', 'a fourth line']) == [
         'bridal and reception makeup', 'Rs 15k', 'DM for bookings']
     long = 'airbrush bridal makeup for destination weddings across Tamil Nadu'
     out = L.card_lines([long])[0]
-    assert len(out) <= L.CARD_LINE_CHARS and long.startswith(out)
+    assert len(out) <= L.CARD_LINE_CHARS and long.startswith(out[:-1]) and out.endswith('…')
     assert L.card_lines([None, 7, '  ']) == []
+
+
+@pytest.mark.parametrize('line, card', [
+    # Review of b0fa8c26e: a long line kept only its first clause.
+    ('Bridal, reception and engagement makeup with saree draping and hair',
+     'Bridal, reception and engagement makeup…'),
+    # ... and a cut at a word boundary could end on a dangling word ('to').
+    ('DM on Instagram or WhatsApp 98xxxxxx to book now',
+     'DM on Instagram or WhatsApp 98xxxxxx…'),
+    ('Airbrush, HD; bridal & party makeup, nail art, hair styling', 'Airbrush, HD; bridal & party makeup…'),
+    ('x' * 60, 'x' * (L.CARD_LINE_CHARS - 1) + '…'),
+    # Tamil: cut at a space, never inside a word (so never inside a letter's
+    # vowel sign).
+    ('மணப்பெண் அலங்காரம் மற்றும் சேலை கட்டுதல் சிகை அலங்காரம்',
+     'மணப்பெண் அலங்காரம் மற்றும் சேலை…'),
+])
+def test_a_long_card_line_keeps_whole_words_and_shows_it_was_cut(line, card):
+    [out] = L.card_lines([line])
+    assert out == card and len(out) <= L.CARD_LINE_CHARS
+
+
+@pytest.mark.parametrize('card_text, price_row', [
+    (['Bridal makeup', 'Bridal from Rs 15k', 'DM for bookings'], 1),
+    (['Bridal makeup', '', 'DM for bookings'], -1),
+    (['Bridal makeup', None, 'DM for bookings'], -1),
+    (['', 'Bridal from Rs 15k', 'DM for bookings'], 0),
+    (['Bridal makeup'], -1),
+])
+def test_the_end_card_says_which_row_is_her_price(card_text, price_row):
+    """Review of b0fa8c26e: the EndCard template drew its second row in the
+    accent colour as the price, so with no price band her booking ask showed
+    as the price.  card_text is her services, price band and ask, in that
+    order (tools.reel_make); the card names the price's row, -1 for none."""
+    card = _item(L.plan_motion(golden_edl(), ['end_card'], card_text=card_text), 'end_card')
+    assert card.props['priceRow'] == price_row
+    if price_row >= 0:
+        assert card.props['lines'][price_row] == 'Bridal from Rs 15k'
 
 
 def test_the_same_reel_gets_the_same_plan_and_unknown_templates_are_ignored():

@@ -25,7 +25,6 @@ reel asks for the same clips.
 """
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -57,6 +56,13 @@ STING_PX = 300
 #: The end card's lines: at most this many, each at most this long.
 CARD_LINES = 3
 CARD_LINE_CHARS = 40
+#: What ends a line card_lines shortened.
+CARD_CUT_MARK = '…'
+#: Where her price is in plan_motion's card_text: her services, price band
+#: and booking ask, in that order (tools.reel_make's motion request).
+CARD_PRICE_INDEX = 1
+#: Trailing characters a shortened line drops before CARD_CUT_MARK.
+_CARD_CUT_TRIM = ' ,;:-–—/&·|+'
 
 #: Why a template she asked for was left out (MotionPlan.notes:
 #: 'motion_skipped:<template>:<why>').
@@ -121,24 +127,52 @@ def _free_bands(lo: float, hi: float, taken: Sequence[Tuple[float, float]]) -> L
     return [(a, b) for a, b in bands if b > a]
 
 
+def _card_line(raw: Any) -> str:
+    """One end-card line from one of her profile's words ('' for none).
+
+    Spaces collapsed.  Longer than CARD_LINE_CHARS: cut at the last space
+    that leaves room for CARD_CUT_MARK, never inside a word (so never inside
+    a letter of an Indic script either); a trailing word of one or two ASCII
+    letters or signs ('to', 'or', '&') and trailing separators go, then
+    CARD_CUT_MARK shows the line was cut.  Review of b0fa8c26e: the rule
+    before this kept a long line's first clause only ('Bridal, reception and
+    engagement makeup with saree draping and hair' became 'Bridal') and could
+    end on a dangling 'to'."""
+    text = ' '.join(raw.split()) if isinstance(raw, str) else ''
+    if len(text) <= CARD_LINE_CHARS:
+        return text
+    room = CARD_LINE_CHARS - len(CARD_CUT_MARK)
+    head = text[:room + 1]
+    words = (head.rsplit(' ', 1)[0] if ' ' in head else text[:room]).split(' ')
+    while len(words) > 1 and len(words[-1]) <= 2 and words[-1].isascii() \
+            and not words[-1].isdigit():
+        words.pop()
+    return ' '.join(words).rstrip(_CARD_CUT_TRIM) + CARD_CUT_MARK
+
+
 def card_lines(lines: Sequence[Any]) -> List[str]:
     """The end card's lines from her profile's words: at most CARD_LINES
-    non-empty lines; one longer than CARD_LINE_CHARS keeps its first clause
-    (to a comma or semicolon), then whole words up to the limit."""
+    non-empty lines, each at most CARD_LINE_CHARS long (_card_line)."""
     out = []
     for raw in lines or ():
-        text = ' '.join(str(raw).split()) if isinstance(raw, str) else ''
-        if not text:
-            continue
-        if len(text) > CARD_LINE_CHARS:
-            text = re.split(r'[,;]', text)[0].strip() or text
-        if len(text) > CARD_LINE_CHARS:
-            cut = text[:CARD_LINE_CHARS + 1].rsplit(' ', 1)[0]
-            text = cut if cut else text[:CARD_LINE_CHARS]
-        out.append(text)
+        text = _card_line(raw)
+        if text:
+            out.append(text)
         if len(out) == CARD_LINES:
             break
     return out
+
+
+def card_price_row(lines: Sequence[Any]) -> int:
+    """The row of card_lines(lines) that is her price (lines[CARD_PRICE_INDEX]),
+    or -1 when she has none.  The EndCard template draws that row in the
+    accent colour; review of b0fa8c26e: it coloured the second row whatever
+    it was, so with no price band her booking ask showed as the price."""
+    lines = list(lines or ())
+    if len(lines) <= CARD_PRICE_INDEX or not _card_line(lines[CARD_PRICE_INDEX]):
+        return -1
+    row = len(card_lines(lines[:CARD_PRICE_INDEX]))
+    return row if row < CARD_LINES else -1
 
 
 def _logo(edl: Mapping) -> Optional[Mapping]:
@@ -195,7 +229,8 @@ def _card_box(taken: Sequence[Tuple[float, float]]) -> Optional[Tuple[float, flo
     return _box(zone['x_min'] + SIDE_INSET_PX, bottom - _even(h), width, h)
 
 
-def _end_card(edl: Mapping, lines: List[str], bar: Mapping) -> Tuple[Optional[MotionItem], str]:
+def _end_card(edl: Mapping, lines: List[str], price_row: int,
+              bar: Mapping) -> Tuple[Optional[MotionItem], str]:
     dur = float(edl['duration_s'])
     hold = float(bar['reveal']['min_hold_s'])
     taken = []
@@ -206,7 +241,8 @@ def _end_card(edl: Mapping, lines: List[str], bar: Mapping) -> Tuple[Optional[Mo
     face = None
     if edl['final_look_found']:
         face = segment_face_box(edl, edl['segments'][-1])
-    props = {'lines': lines, 'accent': ACCENT}
+    # priceRow: the EndCard template's prop (camelCase, as Remotion's props).
+    props = {'lines': lines, 'priceRow': price_row, 'accent': ACCENT}
     start = max(0.0, dur - END_CARD_S)
     box = _card_box(taken + ([(face[1], face[3])] if face is not None else []))
     if box is not None:
@@ -243,8 +279,10 @@ def plan_motion(edl: Mapping, wanted: Sequence[str], *, hook_text: str = '',
                 card_text: Sequence[Any] = (), bar: Mapping = QUALITY_BAR) -> MotionPlan:
     """Where and when each template in ``wanted`` plays on ``edl`` (see the
     module note).  ``hook_text`` is the reel's on-screen hook (the title's
-    words); ``card_text`` her end card's words (card_lines cleans them).
-    Unknown templates are ignored; one asked for twice is planned once."""
+    words); ``card_text`` her end card's words, her services, price band
+    and booking ask in that order (card_lines cleans them; card_price_row
+    says which row is the price).  Unknown templates are ignored; one asked
+    for twice is planned once."""
     plan = MotionPlan()
     asked = [t for t in dict.fromkeys(wanted or ()) if t in MOTION_TEMPLATES]
     sting = None
@@ -264,7 +302,8 @@ def plan_motion(edl: Mapping, wanted: Sequence[str], *, hook_text: str = '',
             plan.items.append(title)
     if 'end_card' in asked:
         lines = card_lines(card_text)
-        card, why = _end_card(edl, lines, bar) if lines else (None, NO_CARD_TEXT)
+        card, why = (_end_card(edl, lines, card_price_row(card_text), bar) if lines
+                     else (None, NO_CARD_TEXT))
         if card is None:
             plan.notes.append(SKIP_NOTE % ('end_card', why))
         else:
@@ -280,6 +319,7 @@ def plan_motion(edl: Mapping, wanted: Sequence[str], *, hook_text: str = '',
 
 
 __all__ = ['TEMPLATE_IDS', 'TITLE_S', 'LOGO_STING_S', 'END_CARD_S', 'WIPE_S', 'MIN_WIPE_S',
-           'MIN_CARD_S', 'ACCENT', 'CARD_LINES', 'CARD_LINE_CHARS', 'SKIP_NOTE', 'NO_LOGO',
-           'NO_TEXT', 'NO_CARD_TEXT', 'NO_FINAL_LOOK', 'REVEAL_TOO_SHORT', 'NO_BEFORE_SHOT',
-           'NO_ROOM', 'MotionItem', 'MotionPlan', 'card_lines', 'plan_motion']
+           'MIN_CARD_S', 'ACCENT', 'CARD_LINES', 'CARD_LINE_CHARS', 'CARD_CUT_MARK',
+           'CARD_PRICE_INDEX', 'SKIP_NOTE', 'NO_LOGO', 'NO_TEXT', 'NO_CARD_TEXT',
+           'NO_FINAL_LOOK', 'REVEAL_TOO_SHORT', 'NO_BEFORE_SHOT', 'NO_ROOM', 'MotionItem',
+           'MotionPlan', 'card_lines', 'card_price_row', 'plan_motion']
