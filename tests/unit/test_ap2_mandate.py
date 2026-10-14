@@ -309,6 +309,26 @@ class TestRequestPaymentTool:
         p = store.ledger.get_payment(out['payment_id'])
         assert p.status == PaymentStatus.APPROVAL_REQUIRED and p.gateway == PaymentGateway.STRIPE
 
+    @pytest.mark.parametrize('currency', ['', 'inr'])
+    def test_the_gate_reads_the_currency_the_way_the_mandate_does(self, store, currency):
+        """The review of 3ec90cc58 measured: the before-asking gate read
+        select_gateway with the raw tool argument while the mandate reads
+        INR for none and upper-cases, so on a PhonePe-only node
+        request_payment(10, '', ...) was refused "no live payment gateway"
+        (and an operator WARNING asked for keys the node has) where 'inr'
+        minted on PhonePe.  One reading now, before both."""
+        store.ledger.gateways.pop(PaymentGateway.STRIPE)
+        store.ledger.add_gateway(CardRailDouble(PaymentGateway.PHONEPE))
+        with patch('integrations.ap2.ap2_mandate.get_mandate_store', return_value=store), \
+                patch('integrations.agent_engine.liquid_ui_service.push_agent_ui',
+                      return_value=True) as push:
+            out = json.loads(self._tool(store)(10.0, currency, 'a thing'))
+        assert out.get('status') == 'approval_required', out
+        assert out['currency'] == 'INR'
+        assert push.call_count == 1
+        p = store.ledger.get_payment(out['payment_id'])
+        assert p.gateway == PaymentGateway.PHONEPE and p.currency == 'INR'
+
     def test_dev_mode_still_settles_a_generic_mandate_on_the_mock(self, store, monkeypatch):
         from security import master_key
         from integrations.ap2.ap2_mandate import decide_payment

@@ -1428,6 +1428,13 @@ def create_payment_request_function(agent_name: str,
             method = PaymentMethod(payment_method.lower())
         except ValueError:
             method = PaymentMethod.INTERNAL_CREDITS
+        # The currency as the mandate reads it (ap2_mandate.create_cart_mandate:
+        # INR when the tool names none, upper-cased), decided ONCE so the gate
+        # below and the mandate pick the same gateway: the gate read the raw
+        # argument, so on a PhonePe-only node request_payment(10, '', ...)
+        # was refused "no live payment gateway" where 'inr' minted on PhonePe
+        # (the review of 3ec90cc58 measured it).
+        currency = str(currency or 'INR').upper()
 
         if user_id:
             from integrations.ap2.ap2_mandate import (

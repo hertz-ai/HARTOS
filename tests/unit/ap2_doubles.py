@@ -14,8 +14,12 @@ from integrations.ap2 import ap2_protocol
 
 
 class CardRailDouble(ap2_protocol.PaymentGatewayConnector):
-    def __init__(self):
-        super().__init__(ap2_protocol.PaymentGateway.STRIPE)
+    """``gateway`` names the rail it stands in for: Stripe by default; a
+    test of the INR order passes PaymentGateway.PHONEPE (the double keeps
+    Stripe's synchronous shape, which is all a mint or a settle needs)."""
+
+    def __init__(self, gateway=ap2_protocol.PaymentGateway.STRIPE):
+        super().__init__(gateway)
         self.captures = []
 
     def connect(self):
