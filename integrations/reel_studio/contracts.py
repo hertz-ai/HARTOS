@@ -16,9 +16,10 @@ below.  It holds:
   final-look teaser at the start is optional (``hook_first``).
 
 It imports only the standard library, core.user_file_store (itself standard
-library plus two small core helpers) and core.chat_attachments (standard
-library plus the store), so the agent tools can import it at construction
-time without pulling cv2, numpy or ffmpeg.
+library plus two small core helpers), core.chat_attachments (standard
+library plus the store) and integrations.agent_engine.human_voice (standard
+library only), so the agent tools can import it at construction time
+without pulling cv2, numpy or ffmpeg.
 
 Validators never raise on bad input; they return a list of problems, empty
 when the document is good.  Each problem reads ``"<id>: <what is wrong>"``.
@@ -38,6 +39,13 @@ captured_at the store keeps is one they accept.  For the same reason the ONE
 validate_attachment, re-exported here as validate_attachment: what a turn
 sends, what /chat reads (parse_inbound) and what a reply's mirror row is are
 judged by that one function.
+
+HASHTAGS.  The human-voice guide (integrations.agent_engine.human_voice,
+which goal_manager's HUMAN_VOICE_GUIDE is) is the one source of
+published-text style (owner ruling A10c): a reel caption may carry up to its
+REEL_HASHTAG_LIMIT hashtags, any other published text up to its
+POST_HASHTAG_LIMIT.  HASHTAG_LIMIT here is REEL_HASHTAG_LIMIT, imported,
+never a second literal.
 """
 from __future__ import annotations
 
@@ -55,6 +63,8 @@ from core.chat_attachments import validate_attachment  # noqa: F401
 from core.user_file_store import (INBOUND_META_KEYS, INBOUND_MIMES, INBOUND_PURPOSES,
                                   OUTBOUND_PURPOSE, is_capture_ms, is_file_name,  # noqa: F401
                                   is_xid)
+# The reel hashtag cap is the human-voice guide's (see HASHTAGS above).
+from integrations.agent_engine.human_voice import REEL_HASHTAG_LIMIT as HASHTAG_LIMIT
 
 
 def _frozen(value):
@@ -124,8 +134,8 @@ NOTE_NO_FINAL_LOOK = 'no_final_look'
 
 # ── delivery and style ────────────────────────────────────────────────────
 
-#: Hashtags per post (plan U8).
-HASHTAG_LIMIT = 5
+# HASHTAG_LIMIT, the most hashtags a reel caption may carry, is the
+# human-voice guide's REEL_HASHTAG_LIMIT, imported above (owner ruling A10c).
 STYLE_LANGUAGES = ('ta', 'hi', 'pa', 'en')
 STYLE_PACES = ('beat', 'calm')
 #: The style dict reel_make hands the planner.  The story is chronological;

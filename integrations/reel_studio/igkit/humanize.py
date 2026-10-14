@@ -20,8 +20,11 @@ humanize_text, three passes in this order:
                  single spaces).
   2. TYPOGRAPHIC em dash -> comma, en dash -> hyphen, curly quotes ->
                  straight, ellipsis -> three dots, bullet -> hyphen.
-  3. LEXICAL     the slop lexicon (resources/slop.json) -> plain words, keeping
+  3. LEXICAL     the AI-sounding words and phrases -> plain words, keeping
                  capitalisation and leaving links alone.
+The lexicon for all three (and for the detector) is the human-voice guide's
+one list, integrations.agent_engine.human_voice.machine_text_lexicon() (owner
+ruling A10c); it was igkit's resources/slop.json.
 Structural tells (rule-of-three, "not just X, it's Y", emoji bullets) are
 REPORTED, never rewritten: changing a sentence's shape needs judgement.
 
@@ -31,16 +34,15 @@ cannot promise their verdict.
 """
 from __future__ import annotations
 
-import functools
 import logging
 import re
 import statistics
 import unicodedata
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
+from integrations.agent_engine import human_voice
 from integrations.reel_studio.igkit import (EMOJI_RE, JOINERS, ME_WORDS, YOU_WORDS, clamp_score,
                                             concrete_markers, sentences, word_keys, words)
-from integrations.reel_studio.igkit.resources import load_json
 
 logger = logging.getLogger(__name__)
 
@@ -66,9 +68,11 @@ _HARD_SPACES = '\u00a0\u202f\u2009'
 _VS16 = '\ufe0f'
 
 
-@functools.lru_cache(maxsize=1)
 def _default_lexicon() -> Mapping[str, Any]:
-    return load_json('slop.json')
+    """The one list of machine-text tells: the human-voice guide's (owner
+    ruling A10c), read through its module on every call, so igkit never
+    holds a second copy."""
+    return human_voice.machine_text_lexicon()
 
 
 def _lexicon(lexicon: Optional[Mapping[str, Any]]) -> Mapping[str, Any]:
@@ -328,7 +332,8 @@ def humanize_text(text: str, lexicon: Optional[Mapping[str, Any]] = None, *,
                   keep_words: Iterable[str] = ()) -> Dict[str, Any]:
     """Clean a caption or script; report what changed and what to rewrite.
 
-    ``lexicon`` defaults to resources/slop.json.  ``keep_emoji`` (her voice
+    ``lexicon`` defaults to the human-voice guide's list
+    (human_voice.machine_text_lexicon()).  ``keep_emoji`` (her voice
     profile's emoji; each emoji of an item counts on its own) are never
     reported as tells; ``keep_words`` (words she uses) are never replaced.
     Emoji are never deleted.  Whitespace comes back as a phone writes it:

@@ -13,6 +13,7 @@ import os
 
 import pytest
 
+from integrations.agent_engine.human_voice import REEL_HASHTAG_LIMIT
 from integrations.reel_studio import igkit
 from integrations.reel_studio.igkit import skills
 from integrations.skills import registry
@@ -46,7 +47,10 @@ def test_each_skill_is_short_and_read_with_the_registry_parser(name):
     assert isinstance(meta['description'], str)
     assert meta['description'] not in ('', '>-', '>', '|', '|-')
     assert meta['disable-model-invocation'] is True
-    assert skills.get_skill_text(name) == body
+    # The one change the loader makes: the reel hashtag cap's token becomes
+    # the human-voice guide's number (owner ruling A10c).
+    assert skills.get_skill_text(name) == body.replace(skills.HASHTAG_LIMIT_TOKEN,
+                                                       str(REEL_HASHTAG_LIMIT))
     assert body.startswith('# ' + name)
 
 
@@ -91,6 +95,8 @@ def test_skill_folders_are_packages_so_pip_ships_their_text():
         mod = importlib.import_module('integrations.reel_studio.igkit.skills.' + name)
         assert os.path.isfile(os.path.join(os.path.dirname(mod.__file__), 'SKILL.md'))
     res = importlib.import_module('integrations.reel_studio.igkit.resources')
-    for fn in ('hooks.json', 'slop.json', 'rubric.json', 'safe_zones.json',
-               'voice_template.json'):
+    # slop.json is not one of them: its list is the human-voice guide's.
+    assert res.DATA_FILES == ('hooks.json', 'rubric.json', 'safe_zones.json',
+                              'voice_template.json')
+    for fn in res.DATA_FILES:
         assert os.path.isfile(os.path.join(os.path.dirname(res.__file__), fn))

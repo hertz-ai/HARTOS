@@ -232,6 +232,14 @@ CANONICAL_OWNERS = {
     # The ONE /chat attachments rule (amendment A9 a): integrations.
     # reel_studio.contracts re-exports it; Nunba's turn_attachments reads it.
     'validate_attachment': 'core/chat_attachments.py',
+    # The human-voice guide, the one source of published-text style (owner
+    # ruling A10c): goal_manager imports the guide; Reel Studio's contracts
+    # (as HASHTAG_LIMIT), caption linter and skills import the reel cap;
+    # igkit.humanize reads the word list.
+    'HUMAN_VOICE_GUIDE': 'integrations/agent_engine/human_voice.py',
+    'REEL_HASHTAG_LIMIT': 'integrations/agent_engine/human_voice.py',
+    'POST_HASHTAG_LIMIT': 'integrations/agent_engine/human_voice.py',
+    'machine_text_lexicon': 'integrations/agent_engine/human_voice.py',
 }
 
 #: module -> why it may walk sys._current_frames() itself.

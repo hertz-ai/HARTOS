@@ -1,5 +1,9 @@
-"""igkit's data files: hook formulas, the slop lexicon, the profile rubric,
-the on-screen text rules and the voice-profile template.
+"""igkit's data files: hook formulas, the profile rubric, the on-screen text
+rules and the voice-profile template.
+
+The AI-sounding word list (upstream's slop.json) is not here: it is the
+human-voice guide's one list, integrations.agent_engine.human_voice (owner
+ruling A10c), and igkit.humanize reads it from there.
 
 This folder is a package, not a plain directory, so setuptools'
 package-data rule (``*.json``) ships the files with a pip install, and
@@ -19,8 +23,7 @@ from typing import Any
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
 #: The files this package ships.
-DATA_FILES = ('hooks.json', 'slop.json', 'rubric.json', 'safe_zones.json',
-              'voice_template.json')
+DATA_FILES = ('hooks.json', 'rubric.json', 'safe_zones.json', 'voice_template.json')
 
 
 def load_json(name: str) -> Any:

@@ -13,7 +13,9 @@ Where each part came from:
   humanize.py            skills/ig-human/humanize.py and skills/ig-human/detect.py
   swipe.py               skills/ig-viral/swipe.py (the outlier maths)
   resources/hooks.json   skills/ig-reel/hooks.json
-  resources/slop.json    skills/ig-human/slop.json
+  (the word list)        skills/ig-human/slop.json, folded into the human-voice
+                         guide's one list (integrations/agent_engine/
+                         human_voice.py, owner ruling A10c)
   resources/rubric.json  skills/ig-profile/rubric.json
   resources/safe_zones.json  the on-screen text rules of ig-reel and ig-story SKILL.md
   resources/voice_template.json  templates/voice.md, as typed fields
@@ -44,9 +46,10 @@ What was changed for HARTOS:
     score: upstream measured AUC 0.56 at telling a creator's hits from her
     misses.  Two upstream bugs are fixed: "hi" no longer marks "highlighter"
     as a weak opener, and a capitalised name now counts as the payload word.
- 6. Hashtags in any script, against the one cap
-    (``contracts.HASHTAG_LIMIT``).  The "hashtag wall" tell is gone: five
-    tags is her cap, not a wall.
+ 6. Hashtags in any script, against the one reel cap, the human-voice
+    guide's ``REEL_HASHTAG_LIMIT`` (``contracts.HASHTAG_LIMIT`` is the same
+    constant).  The "hashtag wall" tell is gone: five tags is a reel's cap,
+    not a wall.
  7. Per-user allowlists: emoji she uses (a sparkle is a staple of makeup
     posts) and words she uses are not reported as machine tells.
  8. Indian booking asks: "DM for bookings", "bookings open", a WhatsApp
@@ -71,6 +74,10 @@ What was changed for HARTOS:
     "#a#b" counted (upstream counted it once, so leaving out spaces hid tags
     from the cap), and a tag right after an emoji or a bracket counted;
     a '#' inside a word ("page#rates") is not a tag.
+13. One list of AI-sounding words, the human-voice guide's
+    (``integrations.agent_engine.human_voice``): the tells HARTOS's prompts
+    ban by name are tells the humanizer replaces, and upstream's slop.json
+    is no longer a second list beside it.
 
 This module imports only the standard library.
 """

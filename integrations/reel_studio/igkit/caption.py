@@ -4,7 +4,8 @@ before "... more".
 Derived from instagram-agent-skill @d03c56b skills/ig-caption/caption.py,
 Copyright (c) 2026 Jake Schincariol, MIT License (see LICENSE.txt in this
 package).  Modified for HARTOS Reel Studio: a pure function, hashtags in any
-script counted against the one cap (contracts.HASHTAG_LIMIT), the shared
+script counted against the one reel cap (the human-voice guide's
+REEL_HASHTAG_LIMIT, which contracts.HASHTAG_LIMIT also is), the shared
 definition of "concrete", Indian booking asks (DM for bookings, bookings
 open, a WhatsApp number), more generic tags named, search terms matched
 case-insensitively in any script, and igkit's one emoji definition and one
@@ -20,7 +21,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, Iterable, List, Optional
 
-from integrations.reel_studio.contracts import HASHTAG_LIMIT
+from integrations.agent_engine.human_voice import REEL_HASHTAG_LIMIT
 from integrations.reel_studio.igkit import EMOJI_RE, concrete_markers, hashtags
 
 LIMIT = 2200             # Instagram's hard caption limit.
@@ -67,7 +68,7 @@ def _visible_window(text: str, cut: int) -> str:
 
 
 def lint_caption(text: str, keywords: Optional[Iterable[str]] = None, truncate: int = TRUNCATE,
-                 hashtag_limit: int = HASHTAG_LIMIT) -> Dict[str, Any]:
+                 hashtag_limit: int = REEL_HASHTAG_LIMIT) -> Dict[str, Any]:
     """Check a caption the way a scrolling stranger reads it.
 
     Checks LENGTH, FIRST LINE, HOOK IS CONCRETE, HASHTAGS, TAG PLACEMENT,
