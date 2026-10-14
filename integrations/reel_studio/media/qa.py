@@ -33,12 +33,14 @@ ADVISORY: color_tags; bitrate_floor (a calm face shot at CRF can sit below
 it); reveal_render (the frame reveal_render.from_end_s before the end
 against the expected source frame, overlay regions masked: a text overlay's
 band, a logo's box, an animated (motion) overlay's whole box);
-segment_fidelity (each segment's middle frame, masked the same way);
-beats_render (each EDL cut seen in the picture; consecutive shots of the
-same scene can hide a cut); no_bars_render (cropdetect and blackdetect,
-which dark hair or a black dupatta can trigger); face_render (Haar finds a
-face in each segment the EDL framed one in); shot_quality (from the
-analysis arrays, when ``analyses`` are given).
+segment_fidelity (each segment's middle frame, masked the same way; a
+frame wholly under overlays, a full-frame wipe, is skipped and marked
+'masked'); beats_render (each EDL cut seen in the picture; consecutive
+shots of the same scene can hide a cut); no_bars_render (cropdetect and
+blackdetect, which dark hair or a black dupatta can trigger); face_render
+(Haar finds a face in each segment the EDL framed one in, except where an
+animated overlay covers that face in the frame checked: 'covered');
+shot_quality (from the analysis arrays, when ``analyses`` are given).
 
 The expected source frame is made with render.geometry_filter, the same
 scale/tone-map/crop chain the render used, at the comparison size, for the
@@ -66,7 +68,7 @@ import numpy as np
 from core import media_bin
 from integrations.reel_studio.contracts import (
     CANVAS, EDL_CHECKS, QA_SCHEMA, QUALITY_BAR, ClipInfo, ClipUnsupported, logo_box,
-    validate_edl)
+    segment_face_box, validate_edl)
 from integrations.reel_studio.media import render
 from integrations.reel_studio.media.face import HaarFaceDetector
 from integrations.reel_studio.media.probe import parse_ffmpeg_info
@@ -281,6 +283,21 @@ def _mask(edl: Mapping, t_s: float) -> np.ndarray:
     return mask
 
 
+def _face_under_motion(edl: Mapping, seg: Mapping, t_s: float) -> bool:
+    """Does an animated ('motion') overlay on screen at ``t_s`` cover any of
+    the segment's face box (contracts.segment_face_box)?"""
+    face = segment_face_box(edl, seg)
+    if face is None:
+        return False
+    for ov in edl['overlays']:
+        if ov['type'] != 'motion' or t_s < ov['from_s'] - 1e-6 or t_s >= ov['to_s']:
+            continue
+        x0, y0, x1, y1 = ov['box']
+        if x0 < face[2] and face[0] < x1 and y0 < face[3] and face[1] < y1:
+            return True
+    return False
+
+
 def _masked_corr(a: np.ndarray, b: np.ndarray, mask: np.ndarray) -> Optional[float]:
     """Pearson correlation of two frames' unmasked pixels (B, G, R) at CORR_W x CORR_H.
 
@@ -443,12 +460,18 @@ def _advisory_rows(facts: _Facts, frames: Optional[_Frames], edl: Mapping, bar: 
     fidelity = []
     for i, seg in enumerate(segs):
         mid = (seg['out_start_s'] + seg['out_end_s']) / 2.0
+        mask = _mask(edl, mid)
+        if not mask.any():
+            # Every pixel is under an overlay (a full-frame wipe): there is
+            # no footage to compare, which is not a wrong frame.
+            fidelity.append({'segment': i, 'corr': None, 'masked': True})
+            continue
         expected, got = sources.get(i), frames.kept.get(_frame_index(mid))
-        c = (_masked_corr(got, expected, _mask(edl, mid))
+        c = (_masked_corr(got, expected, mask)
              if expected is not None and got is not None else None)
         fidelity.append({'segment': i, 'corr': c})
-    add('segment_fidelity', all(f['corr'] is not None
-                                and f['corr'] >= bar['segment_fidelity']['min_corr']
+    add('segment_fidelity', all(f.get('masked') or (f['corr'] is not None
+                                                     and f['corr'] >= bar['segment_fidelity']['min_corr'])
                                 for f in fidelity), fidelity)
 
     tol = max(bar['beats']['tol_s'], 1.5 / FPS)
@@ -461,14 +484,22 @@ def _advisory_rows(facts: _Facts, frames: Optional[_Frames], edl: Mapping, bar: 
 
     detector = HaarFaceDetector()
     framed = [i for i, s in enumerate(segs) if s['face'] is not None]
-    found = []
+    found, covered = [], []
     for i in framed:
         mid = (segs[i]['out_start_s'] + segs[i]['out_end_s']) / 2.0
+        if _face_under_motion(edl, segs[i], mid):
+            # An animated overlay is over her face in the frame checked
+            # (allowed outside the final hold): Haar cannot see a face it
+            # covers, which says nothing about the framing.
+            covered.append(i)
+            continue
         frame = frames.kept.get(_frame_index(mid))
         if frame is not None and detector.detect(frame) is not None:
             found.append(i)
-    add('face_render', len(found) == len(framed),
-        {'segments_with_face': len(framed), 'found': len(found)})
+    value = {'segments_with_face': len(framed), 'found': len(found)}
+    if covered:
+        value['covered'] = len(covered)
+    add('face_render', len(found) == len(framed) - len(covered), value)
 
     if analyses is not None:
         add(*_shot_quality(edl, analyses, bar))
