@@ -26,24 +26,19 @@ import functools
 import os
 from typing import Dict, List
 
-from integrations.agent_engine.human_voice import REEL_HASHTAG_LIMIT
+# Where a skill text names the reel hashtag cap, it writes the human-voice
+# guide's token (HASHTAG_LIMIT_TOKEN here); the loader fills it with the
+# guide's REEL_HASHTAG_LIMIT, so the text never holds a second copy of the
+# number (owner ruling A10c).
+from integrations.agent_engine.human_voice import (  # noqa: F401
+    REEL_HASHTAG_LIMIT_TOKEN as HASHTAG_LIMIT_TOKEN, with_reel_hashtag_limit)
 
 #: The skills her agent can read, in the order list_skills reports them.
 SKILL_NAMES = ('ig_reel', 'ig_caption', 'ig_human')
 #: The most characters a skill file may have (frontmatter included).
 MAX_SKILL_CHARS = 2000
-#: Where a skill text names the reel hashtag cap, it writes this token; the
-#: loader puts the human-voice guide's REEL_HASHTAG_LIMIT in its place, so
-#: the text never holds a second copy of the number (owner ruling A10c).
-HASHTAG_LIMIT_TOKEN = '{reel_hashtag_limit}'
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-
-
-def _render(text: str) -> str:
-    """A skill file's text as her agent reads it: the hashtag-cap token
-    replaced by the guide's number."""
-    return text.replace(HASHTAG_LIMIT_TOKEN, str(REEL_HASHTAG_LIMIT))
 
 
 def _canonical(name) -> str:
@@ -62,7 +57,8 @@ def _load(key: str):
     from integrations.skills.registry import SkillInfo
     path = os.path.join(_HERE, key, 'SKILL.md')
     with open(path, encoding='utf-8') as fh:
-        return SkillInfo.from_skill_md(_render(fh.read()), source='builtin', source_path=path)
+        return SkillInfo.from_skill_md(with_reel_hashtag_limit(fh.read()), source='builtin',
+                                       source_path=path)
 
 
 def get_skill_text(name: str) -> str:

@@ -240,6 +240,11 @@ CANONICAL_OWNERS = {
     'REEL_HASHTAG_LIMIT': 'integrations/agent_engine/human_voice.py',
     'POST_HASHTAG_LIMIT': 'integrations/agent_engine/human_voice.py',
     'machine_text_lexicon': 'integrations/agent_engine/human_voice.py',
+    # The reel cap's token in texts an agent reads (skills, her profile's
+    # labels) and the one filler: igkit.skills imports both, voice_profile
+    # the filler.
+    'REEL_HASHTAG_LIMIT_TOKEN': 'integrations/agent_engine/human_voice.py',
+    'with_reel_hashtag_limit': 'integrations/agent_engine/human_voice.py',
 }
 
 #: module -> why it may walk sys._current_frames() itself.

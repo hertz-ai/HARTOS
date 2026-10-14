@@ -4,7 +4,9 @@ of published-text style (owner ruling A10c, lane review P6).
 * Hashtags: a reel caption may carry up to REEL_HASHTAG_LIMIT (5); every
   other published text keeps 0 to POST_HASHTAG_LIMIT (2).  The guide says
   both, and Reel Studio's contracts, caption linter and caption skill read
-  the reel number from the guide, so there is no second literal to drift.
+  the reel number from the guide, so there is no second literal to drift;
+  so does every text her agent reads that states the cap (reel_make's
+  hashtags parameter, her profile's hashtag-bank label and help).
 * AI-sounding words: igkit's lexicon (its old resources/slop.json) lives in
   the guide's source.  The guide quotes a few of its tells; igkit's
   humanizer and detector read the whole list from there.
@@ -195,8 +197,50 @@ def test_the_caption_skill_names_the_guides_reel_cap(monkeypatch):
     assert 'five' not in text and '{' not in text and '{' not in described
 
 
-def test_her_profile_states_no_hashtag_cap_of_its_own():
-    from integrations.reel_studio import voice_profile
+def test_her_profile_takes_the_reel_hashtag_cap_from_the_guide(monkeypatch):
+    # Her template writes the guide's token, never a number of its own; the
+    # profile's label (her brief) and help (reel_voice fields) say the cap.
+    real = _guide().REEL_HASHTAG_LIMIT
+    raw = load_json('voice_template.json')['fields']['hashtag_bank']
+    assert not re.search(r'\b%d\b' % real, raw['label'] + ' ' + raw['help']), raw
+    monkeypatch.setattr(_guide(), 'REEL_HASHTAG_LIMIT', 7)
+    voice_profile = _fresh(monkeypatch, 'integrations.reel_studio.voice_profile')
     spec = voice_profile.FIELD_SPECS['hashtag_bank']
-    said = spec['label'] + ' ' + spec['help']
-    assert not re.search(r'\b%d\b' % _guide().REEL_HASHTAG_LIMIT, said), said
+    assert 'up to 7' in spec['label'] and 'up to 7' in spec['help'], dict(spec)
+    for field, spec in voice_profile.FIELD_SPECS.items():
+        said = spec.get('label', '') + ' ' + spec.get('help', '')
+        assert '{' not in said, (field, said)
+
+
+def test_her_brief_tells_her_agent_the_reel_hashtag_cap(tmp_path, monkeypatch):
+    # The brief reel_skill puts in front of every skill: her hashtag bank
+    # comes with the cap, so the agent does not offer tags the reel drops.
+    monkeypatch.setenv('NUNBA_DATA_DIR', str(tmp_path))
+    monkeypatch.delenv('HEVOLVE_DATA_KEY', raising=False)
+    import security.secrets_manager as secrets_manager
+    monkeypatch.setattr(secrets_manager, 'get_secret', lambda name, default='': default)
+    from core import platform_paths
+    platform_paths.reset_cache()
+    try:
+        from integrations.reel_studio import voice_profile
+        voice_profile.update_field('10077', 'hashtag_bank', '#maduraimua #bridalmakeup')
+        brief = voice_profile.voice_brief('10077')
+    finally:
+        platform_paths.reset_cache()
+    line = [ln for ln in brief.splitlines() if '#maduraimua' in ln]
+    assert len(line) == 1 and 'up to %d' % _guide().REEL_HASHTAG_LIMIT in line[0], brief
+
+
+def test_reel_make_tells_the_model_the_cap_it_clamps_to(monkeypatch):
+    # What the model reads in reel_make's schema and what reel_make keeps
+    # are the same number: the guide's, through contracts.HASHTAG_LIMIT.
+    pytest.importorskip('autogen')
+    from autogen.function_utils import get_function_schema
+    monkeypatch.setattr(_guide(), 'REEL_HASHTAG_LIMIT', 7)
+    _fresh(monkeypatch, 'integrations.reel_studio.contracts')
+    from integrations.reel_studio import tools
+    reel_make = dict(tools.build_reel_tools('10077', prompt_id='42'))['reel_make']
+    schema = get_function_schema(reel_make, name='reel_make', description='make a reel')
+    said = schema['function']['parameters']['properties']['hashtags']['description']
+    assert 'Up to 7' in said and '5' not in said and '{' not in said, said
+    assert tools._hashtags(' '.join(_tags(8)), {}) == _tags(7)

@@ -30,8 +30,10 @@ The seven (REEL_TOOL_NAMES):
   reel_trending_songs, her attached song audio, else the top trending song
   in her language; with none, why -- the trending list's own note, such as
   no research account on this computer -- rides the reply, and the reply
-  names no song), a caption (else one from her profile) and at most five
-  hashtags (else from her hashtag bank).
+  names no song), a caption (else one from her profile) and at most
+  contracts.HASHTAG_LIMIT hashtags, the human-voice guide's reel cap (else
+  from her hashtag bank); its hashtags parameter tells the model that
+  number, read from the same constant.
 * ``reel_trending_songs``: trending songs in her language
   (integrations.trends.trending_songs_client; with none, its reason and
   note, after asking the owner for the research account when that is why).
@@ -331,8 +333,9 @@ def _caption_from_profile(profile: Mapping) -> str:
 
 
 def _hashtags(text: str, profile: Mapping) -> List[str]:
-    """At most five '#tags' from what the agent wrote (commas, spaces, with
-    or without '#'), else from her hashtag bank; repeats dropped."""
+    """At most contracts.HASHTAG_LIMIT '#tags' (the human-voice guide's
+    reel cap) from what the agent wrote (commas, spaces, with or without
+    '#'), else from her hashtag bank; repeats dropped."""
     from integrations.reel_studio.contracts import HASHTAG_LIMIT
     from integrations.reel_studio.igkit import hashtags as find_tags, is_tag_char
     tags: List[str] = []
@@ -418,6 +421,9 @@ def build_reel_tools(user_id, *, prompt_id,
                      request_id_getter: Optional[Callable[[], Any]] = None
                      ) -> List[Tuple[str, Callable[..., str]]]:
     """The seven (name, closure) pairs for one user's agent, in REEL_TOOL_NAMES order."""
+    # The cap reel_make's hashtags parameter states is the one _hashtags
+    # keeps (contracts.HASHTAG_LIMIT, the human-voice guide's reel cap).
+    from integrations.reel_studio.contracts import HASHTAG_LIMIT
     turn = _Turn(user_id, prompt_id, request_id_getter)
 
     def reel_make(
@@ -425,7 +431,7 @@ def build_reel_tools(user_id, *, prompt_id,
         open_with: Annotated[str, "final_look (1 s teaser first), story, or '' = her instructions"] = '',
         hook_text: Annotated[str, 'On-screen text for 2 s, max 6 words'] = '',
         caption: Annotated[str, "Caption; '' = from her profile"] = '',
-        hashtags: Annotated[str, "Up to 5 #tags; '' = her bank"] = '',
+        hashtags: Annotated[str, "Up to %d #tags; '' = her bank" % HASHTAG_LIMIT] = '',
         song_key: Annotated[str, "From reel_trending_songs; '' = auto"] = '',
         use_logo: Annotated[str, "yes, no, or '' = her instructions"] = '',
         clips: Annotated[str, "Clip ids; '' = attached clips"] = '',

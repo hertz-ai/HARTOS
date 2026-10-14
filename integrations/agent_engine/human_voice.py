@@ -12,7 +12,11 @@ Owner ruling A10c (2026-10-14) keeps the guide the single source for:
 * hashtags: a reel caption may carry up to REEL_HASHTAG_LIMIT; every other
   published text keeps POST_HASHTAG_LIMIT or fewer.  Reel Studio's contracts
   (their HASHTAG_LIMIT), its caption linter and its caption skill read
-  REEL_HASHTAG_LIMIT from here, so no second literal can drift.
+  REEL_HASHTAG_LIMIT from here, so no second literal can drift.  A text her
+  agent reads that states the cap (a skill file, her profile's hashtag-bank
+  label and help) writes REEL_HASHTAG_LIMIT_TOKEN, which
+  with_reel_hashtag_limit fills; reel_make's parameter text is built from
+  contracts.HASHTAG_LIMIT.
 * the AI-sounding word list: WORDS and PHRASES (the tells and the plain
   words they become), plus the INVISIBLE and TYPOGRAPHIC characters and the
   sentence STRUCTURES that give machine text away.  The guide names the
@@ -57,6 +61,17 @@ from typing import Any, Mapping, NamedTuple
 REEL_HASHTAG_LIMIT = 5
 #: Hashtags any other published text may carry (zero is fine).
 POST_HASHTAG_LIMIT = 2
+#: Where a text an agent reads states the reel cap (a Reel Studio skill
+#: file, her profile's field labels), it writes this token, and
+#: with_reel_hashtag_limit puts REEL_HASHTAG_LIMIT in its place: no such
+#: text holds a second copy of the number.
+REEL_HASHTAG_LIMIT_TOKEN = '{reel_hashtag_limit}'
+
+
+def with_reel_hashtag_limit(text: str) -> str:
+    """``text`` with each REEL_HASHTAG_LIMIT_TOKEN replaced by
+    REEL_HASHTAG_LIMIT, read at the call."""
+    return text.replace(REEL_HASHTAG_LIMIT_TOKEN, str(REEL_HASHTAG_LIMIT))
 
 
 class Tell(NamedTuple):

@@ -5,6 +5,7 @@
     "The free-text voice.md became typed fields with limits, read and written only by integrations.reel_studio.voice_profile.",
     "Added what a bridal makeup artist in India needs: city, price band, caption language and code-mix, hashtag bank, emoji she uses, booking contact, brands, logo and logo corner.",
     "choices_from names a tuple in integrations.reel_studio.contracts, so the allowed values have one source.",
+    "A label or help that states the reel hashtag cap writes {reel_hashtag_limit}; voice_profile fills it with the human-voice guide's REEL_HASHTAG_LIMIT, so the number has one source.",
     "Field order is the order voice_brief() lists them; brief=false keeps a field out of the brief.",
     "An emoji item is one emoji as igkit.EMOJI_RE reads it; item_max_len 16 code points fits a kiss or a couple with two skin tones (10)."
   ],
@@ -19,7 +20,7 @@
     "words_used": {"type": "list", "max_items": 20, "item_max_len": 40, "label": "Words she uses", "help": "Words and phrases she really says; the humanizer keeps them."},
     "words_never": {"type": "list", "max_items": 20, "item_max_len": 40, "label": "Never write", "help": "Words she would never say."},
     "emoji": {"type": "emoji", "max_items": 12, "item_max_len": 16, "label": "Emoji she uses", "help": "Each emoji she uses, side by side or separated by spaces or commas; the humanizer does not flag these."},
-    "hashtag_bank": {"type": "hashtags", "max_items": 15, "item_max_len": 40, "label": "Hashtag bank", "help": "About 15 specific tags, separated by commas or spaces; each reel caption picks a few of them, within the reel cap the caption skill names."},
+    "hashtag_bank": {"type": "hashtags", "max_items": 15, "item_max_len": 40, "label": "Hashtag bank (up to {reel_hashtag_limit} per reel)", "help": "About 15 specific tags, separated by commas or spaces; each reel caption uses up to {reel_hashtag_limit} of them."},
     "search_terms": {"type": "list", "max_items": 5, "item_max_len": 60, "label": "Search terms", "help": "What brides type into search, e.g. bridal makeup artist Madurai."},
     "cta": {"type": "text", "max_len": 120, "label": "Her ask", "help": "The one ask at the end, e.g. DM for bookings."},
     "contact": {"type": "choice", "choices": ["dm", "whatsapp", "dm_and_whatsapp"], "label": "Bookings by", "help": "dm, whatsapp or dm_and_whatsapp."},

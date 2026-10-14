@@ -59,6 +59,7 @@ from typing import Any, Dict, List, Mapping, Optional
 
 from core.config_cache import flag_value
 from core.user_file_store import is_xid, user_dir_name, user_key
+from integrations.agent_engine.human_voice import with_reel_hashtag_limit
 from integrations.reel_studio import contracts
 from integrations.reel_studio.igkit import EMOJI_RE, hashtags
 from integrations.reel_studio.igkit.resources import load_json
@@ -109,6 +110,9 @@ class VoiceProfileUnreadable(RuntimeError):
 
 
 def _field_specs() -> Mapping[str, Mapping[str, Any]]:
+    """The template's fields, read-only: choices named by ``choices_from``
+    come from contracts, and a label or help that states the reel hashtag
+    cap gets the human-voice guide's number (its token in the template)."""
     specs = {}
     for name, raw in load_json('voice_template.json')['fields'].items():
         spec = dict(raw)
@@ -117,6 +121,9 @@ def _field_specs() -> Mapping[str, Mapping[str, Any]]:
             spec['choices'] = tuple(getattr(contracts, source))
         elif 'choices' in spec:
             spec['choices'] = tuple(spec['choices'])
+        for key in ('label', 'help'):
+            if isinstance(spec.get(key), str):
+                spec[key] = with_reel_hashtag_limit(spec[key])
         specs[name] = MappingProxyType(spec)
     return MappingProxyType(specs)
 
