@@ -15,6 +15,7 @@ fails on its own instead of failing the whole file at collection.
 import importlib
 import importlib.util
 import re
+import sys
 
 import pytest
 
@@ -39,12 +40,20 @@ def _guide():
     return importlib.import_module('integrations.agent_engine.human_voice')
 
 
-def _fresh(name):
-    """A private copy of module ``name``, executed now, so it reads what the
-    guide holds at this moment (the copy in sys.modules read it at first
-    import).  Nothing is added to sys.modules."""
+def _fresh(monkeypatch, name):
+    """A new copy of module ``name``, executed now, so it reads what the
+    guide holds at this moment (the module already imported read it at its
+    first import).
+
+    The copy stands in sys.modules under ``name`` while it runs and for the
+    rest of the test, the way an import registers a module before running
+    it: a dataclass in the module (contracts has frozen ones) looks its own
+    module up there while the class is built.  monkeypatch puts back what
+    was there afterwards, the real module, or nothing if it was never
+    imported, so no other test sees the copy."""
     spec = importlib.util.find_spec(name)
     module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, module)
     spec.loader.exec_module(module)
     return module
 
@@ -163,7 +172,7 @@ def test_the_folded_list_keeps_igkits_rules():
 
 def test_contracts_take_the_reel_hashtag_cap_from_the_guide(monkeypatch):
     monkeypatch.setattr(_guide(), 'REEL_HASHTAG_LIMIT', 7)
-    contracts = _fresh('integrations.reel_studio.contracts')
+    contracts = _fresh(monkeypatch, 'integrations.reel_studio.contracts')
     assert contracts.HASHTAG_LIMIT == 7
     assert contracts.validate_media_item(_media(_tags(7))) == []
     assert contracts.validate_media_item(_media(_tags(8)))
@@ -171,7 +180,7 @@ def test_contracts_take_the_reel_hashtag_cap_from_the_guide(monkeypatch):
 
 def test_the_caption_linter_takes_the_reel_hashtag_cap_from_the_guide(monkeypatch):
     monkeypatch.setattr(_guide(), 'REEL_HASHTAG_LIMIT', 7)
-    caption = _fresh('integrations.reel_studio.igkit.caption')
+    caption = _fresh(monkeypatch, 'integrations.reel_studio.igkit.caption')
     r = caption.lint_caption('Reception look for Priya in 40 minutes.\n\n' + ' '.join(_tags(7)))
     assert r['hashtag_limit'] == 7
     assert [c['status'] for c in r['checks'] if c['check'] == 'HASHTAGS'] == ['PASS']
@@ -179,7 +188,7 @@ def test_the_caption_linter_takes_the_reel_hashtag_cap_from_the_guide(monkeypatc
 
 def test_the_caption_skill_names_the_guides_reel_cap(monkeypatch):
     monkeypatch.setattr(_guide(), 'REEL_HASHTAG_LIMIT', 7)
-    skills = _fresh('integrations.reel_studio.igkit.skills')
+    skills = _fresh(monkeypatch, 'integrations.reel_studio.igkit.skills')
     text = skills.get_skill_text('ig_caption')
     described = {s['name']: s['description'] for s in skills.list_skills()}['ig_caption']
     assert 'up to 7' in text and 'up to 7' in described
