@@ -56,6 +56,9 @@ PORT_LISTEN_TIMEOUT_S = 600
 # servers/ and is the only working video server in the tree.
 VISION_DIR = os.path.join(
     os.path.dirname(os.path.dirname(__file__)), 'vision')
+# Reel Studio's Remotion project (our templates and scripts, HARTOS source).
+REEL_MOTION_PROJECT = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)), 'reel_studio', 'motion', 'project')
 
 # Tool configuration: name → {repo_url, server_script, hf_repo_id, is_inprocess, catalog_id}
 # catalog_id links RTM tools to ModelCatalog entries so the orchestrator stays in sync.
@@ -153,6 +156,31 @@ TOOL_CONFIGS = {
         # "Server script not found: None" and the RTM half was never exercised.
         'server_script': os.path.join(VISION_DIR, 'minicpm_server.py'),
         'catalog_id': 'vlm-minicpm-v2',
+    },
+    # Reel Studio's animated overlays (amendment A14): Remotion renders our
+    # templates (integrations/reel_studio/motion).  Its npm packages (the
+    # versions package.json and package-lock.json pin) and the headless
+    # browser its prepare.js downloads are set up here at runtime, never
+    # packaged (A16).  OFF until the owner confirms which Remotion license
+    # applies (NOTICE); then each node's owner is asked on the consent card.
+    'reel_motion': {
+        'download_type': 'npm',
+        'npm_project': REEL_MOTION_PROJECT,
+        'npm_prepare': 'prepare.js',
+        # The npm packages are 184 MB unpacked for win32-x64 (measured
+        # 2026-10-15 from the registry sizes of the lock's 186 packages, six
+        # with none recorded); the browser's size is not measured here.  1 GiB
+        # leaves room for both.
+        'npm_min_free_bytes': 1 << 30,
+        'on_demand': True,
+        'enabled_by': 'HEVOLVE_REEL_MOTION',
+        'consent': 'reel:motion',
+        'consent_reason': (
+            "Animated overlays for her reels (a moving title, a logo sting, a booking "
+            "card at the end, a before-and-after wipe) need Remotion on this computer: "
+            "its packages and a headless browser, a few hundred MB, downloaded once into "
+            "the models folder. Set it up?"),
+        'catalog_id': None,
     },
 }
 

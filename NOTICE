@@ -50,3 +50,45 @@ instagram-agent-skill
    License: MIT. Full text: integrations/reel_studio/igkit/LICENSE.txt.
    The changes made are listed in integrations/reel_studio/igkit/__init__.py
    and, for the tables, in human_voice.py's docstring.
+
+THIRD-PARTY SOFTWARE SET UP AT RUNTIME (NOT INCLUDED)
+
+The following is not part of HART OS: it is not in this repository and not
+in any build.  A node downloads it at runtime, only once its operator has
+switched the feature on and its owner has said yes on the consent card.
+
+Remotion
+   Used by: Reel Studio's animated overlays, integrations/reel_studio/motion/
+   (the templates and scripts there are HART OS's own, Apache-2.0).  The npm
+   packages remotion, @remotion/renderer and @remotion/bundler (4.0.530,
+   with the packages they depend on) and the headless browser Remotion
+   downloads for rendering are set up in the node's models folder by
+   integrations/service_tools/runtime_manager.py (row 'reel_motion').
+   Copyright (c) 2026 Remotion, https://www.remotion.dev.
+   License: the Remotion License,
+   https://github.com/remotion-dev/remotion/blob/main/LICENSE.md, which is
+   NOT an open-source license.  As read on 2026-10-14 it says:
+   - Free License: an individual, a for-profit organization with up to 3
+     employees, a non-profit or not-for-profit organization, or anyone
+     evaluating whether Remotion is a good fit and not yet using it in a
+     commercial way may use it free of charge, non-commercially or
+     commercially, for the purpose of creating videos and images, and may
+     modify it for their own use case or to contribute improvements back.
+     It is not allowed to copy or modify Remotion code for the purpose of
+     selling, renting, licensing, relicensing or sublicensing your own
+     derivative of Remotion.
+   - Company License: required for anyone not eligible for the Free
+     License; pricing at https://www.remotion.pro/license.  Its FAQ
+     (https://www.remotion.dev/docs/license/faq) counts a company's whole
+     headcount, and calls code that programmatically calls Remotion's
+     rendering APIs an automation: one may run under the Free License, and
+     for Company License holders it falls under the "Remotion for
+     Automators" plan.
+   - The software is provided "as is", without warranty of any kind.
+   - The license is to change in Remotion 5.0
+     (https://github.com/remotion-dev/remotion/pull/3750).
+   Which license applies depends on who runs the node, so the feature is
+   OFF by default: HEVOLVE_REEL_MOTION unset, nothing of Remotion is
+   downloaded or run, and reels use plain ffmpeg overlays.  Set it only once
+   the license that applies to you is in place.  The headless browser comes
+   under the terms shipped with that download.
