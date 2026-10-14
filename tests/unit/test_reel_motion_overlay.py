@@ -187,14 +187,38 @@ def test_the_final_args_lay_the_clip_at_its_box_from_its_start():
     assert graph.endswith('[out]')
 
 
-def _alpha_clip(d, name, size, seconds, *, color='red'):
-    """A ProRes 4444 clip, opaque ``color`` on its left half, clear on its right."""
+def test_the_wipe_is_laid_on_the_cut_before_text_logos_and_other_overlays():
+    """The real Remotion render (48948fd70) showed the wipe's "before"
+    picture, laid last, hiding the still logo and the end card while it
+    played.  The wipe is part of the picture: pass 2 lays it on the cut
+    first, then the text, the logos and the other animated overlays."""
+    edl = golden_edl()
+    edl['overlays'] += [_motion('end_card', [40.0, 1000.0, 810.0, 1400.0], 15.0, 20.0,
+                                src='C:/work/card.mov'),
+                        _motion('wipe', FULL, 15.0, 16.2, src='C:/work/wipe.mov')]
+    args = R.plan_final_args(edl, 'C:/work/list.txt', 'C:/work/out.mp4', encoder='libx264',
+                             textfiles={0: ('C:/work/t.txt', 'C:/fonts/f.ttf')},
+                             canvas={'w': 216, 'h': 384})
+    inputs = [args[i + 1] for i, a in enumerate(args) if a == '-i']
+    wipe, logo, card = (inputs.index(p) for p in ('C:/work/wipe.mov', edl['overlays'][1]['src'],
+                                                    'C:/work/card.mov'))
+    graph = args[args.index('-filter_complex') + 1]
+    order = [graph.index('[%d:v]setpts' % wipe), graph.index('drawtext'),
+             graph.index('[%d:v]format=rgba' % logo), graph.index('[%d:v]setpts' % card)]
+    assert order == sorted(order), graph
+    assert graph.startswith('[%d:v]setpts' % wipe), graph
+    assert graph.endswith('[out]')
+
+
+def _alpha_clip(d, name, size, seconds, *, color='red', alpha="if(lt(X,W/2),255,0)"):
+    """A ProRes 4444 clip of ``color`` with ``alpha`` (default: opaque on its
+    left half, clear on its right)."""
     out = os.path.join(str(d), name)
     w, h = size
     result = media_bin.run_ffmpeg(
         ['-y', '-loglevel', 'error', '-f', 'lavfi',
          '-i', 'color=c=%s:size=%dx%d:rate=30:duration=%g' % (color, w, h, seconds),
-         '-vf', "format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lt(X,W/2),255,0)'",
+         '-vf', "format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='%s'" % alpha,
          '-c:v', 'prores_ks', '-profile:v', '4444', '-pix_fmt', 'yuva444p10le', out],
         timeout_s=120)
     assert result.returncode == 0, result.stderr[-800:]
@@ -260,6 +284,48 @@ def test_the_clip_is_composited_with_its_alpha_only_inside_its_window(tmp_path):
         frame = _frame(out, t, small['w'], small['h'])
         assert _black(frame[left]), 'outside its window the picture passes through (t=%s)' % t
     assert probe(out).duration_s == pytest.approx(3.0, abs=0.05)
+
+
+@requires_ffmpeg
+def test_her_logo_stays_on_screen_while_the_wipe_plays(tmp_path):
+    """Rendered: an opaque full-frame wipe clip (blue) over the reveal's
+    opening and her still logo (red) top-left: during the wipe the logo is
+    drawn on the wipe, and the wipe covers the cut everywhere else."""
+    from tests.unit.reel_media_fixtures import make_png
+    small = {'w': 216, 'h': 384}
+    f = small['w'] / 1080.0
+    src = make_clip(tmp_path, 'black.mp4', size=(216, 384), source='color', color='black',
+                    duration_s=3.0)
+    x = 'd' * 64
+    clip = probe(src).to_edl_clip(ClipCapture(clip=x, order=0, captured_at_ms=1760247082000,
+                                              src='phone'))
+    seg = {'clip': x, 'in_s': 0.0, 'out_s': 3.0, 'speed': 1.0, 'out_start_s': 0.0,
+           'out_end_s': 3.0, 'crop': {'cx': 0.5, 'cy': 0.5, 'zoom': 1.0}, 'face': None,
+           'transition': {'type': 'cut', 'dur_s': 0.0}, 'stage': 'final_look', 'appeal': 7.0,
+           'role': 'reveal'}
+    wipe = _alpha_clip(tmp_path, 'wipe.mov', (216, 384), 1.0, color='blue', alpha='255')
+    logo = {'type': 'logo', 'src': make_png(tmp_path, 'logo.png', color='red'),
+            'corner': 'top_left', 'width_px': 180, 'height_px': 90, 'margin_px': 48,
+            'opacity': 1.0, 'from_s': 0.0, 'to_s': None}
+    edl = {'schema': C.EDL_SCHEMA, 'canvas': dict(C.CANVAS), 'target_s': 5.0,
+           'duration_s': 3.0, 'audio': None, 'final_look_found': True, 'hook_first': False,
+           'capture_src': 'phone', 'reveal': {'clip': x, 't_s': 1.5},
+           'notes': [C.capture_note('phone')],
+           'beats': {'source': 'synthetic', 'song_key': None, 'bpm': 120.0,
+                     'times_s': [0.5 * k for k in range(0, 8)], 'confidence': 0.0},
+           'clips': {x: clip}, 'segments': [seg],
+           'overlays': [logo, _motion('wipe', FULL, 0.0, 1.0, src=wipe)]}
+    assert [p for p in C.validate_edl(edl) if p.startswith('overlays:')] == []
+    out = str(tmp_path / 'reel.mp4')
+    R.render_reel(edl, out, workdir=str(tmp_path / 'work'), encoder='libx264', canvas=small,
+                  timeout_s=120)
+    x0, y0, x1, y1 = C.logo_box(logo)
+    inside = (int((y0 + y1) / 2 * f), int((x0 + x1) / 2 * f))      # (row, col)
+    elsewhere = (int(1200 * f), int(700 * f))
+    during = _frame(out, 0.5, small['w'], small['h'])
+    assert _red(during[inside]), 'her logo is drawn on the wipe: %s' % (during[inside],)
+    b, g, r = (int(v) for v in during[elsewhere])
+    assert b > 170 and r < 90, 'the wipe covers the cut: %s' % (during[elsewhere],)
 
 
 @requires_ffmpeg

@@ -17,14 +17,16 @@ at once):
     tpad + -frames:v N                exactly N = round(length x 30) frames
     -an, libx264 veryfast CRF 14      a near-lossless mezzanine in workdir
 
-PASS 2 joins the mezzanines with the concat demuxer, draws the hook text
+PASS 2 joins the mezzanines with the concat demuxer, lays a full-frame
+animated overlay (the before->after wipe, contracts.MOTION_FULL_FRAME) on
+the cut first, as part of the picture, then draws the hook text
 with drawtext reading a UTF-8 ``textfile=`` (so ``:`` ``'`` ``%`` and Tamil
 need no filter escaping; ``expansion=none`` keeps ``%`` literal) and an
 escaped ``fontfile``, lays the logo in its corner (contracts.logo_box, the
-box the EDL check used), lays each animated ('motion') overlay's clip with
-its alpha at its box from its from_s (amendment A14: rendered beforehand by
-integrations.reel_studio.motion; the cut passes through outside its
-window), and encodes once: h264_nvenc VBR CQ 21, else
+box the EDL check used), lays each other animated ('motion') overlay's clip
+with its alpha at its box from its from_s (amendment A14: rendered
+beforehand by integrations.reel_studio.motion; the cut passes through
+outside its window), and encodes once: h264_nvenc VBR CQ 21, else
 libx264 medium CRF 20, both under a 12 Mbps maxrate (never a fixed
 bitrate: a calm face shot needs far less), High profile, yuv420p, BT.709
 tags, silent, faststart.  If NVENC fails at run time (no free session, the
@@ -49,7 +51,7 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 from core import media_bin
 from integrations.reel_studio.contracts import (
-    CANVAS, SAFE_ZONE, RenderResult, crop_window, logo_box, validate_edl)
+    CANVAS, MOTION_FULL_FRAME, SAFE_ZONE, RenderResult, crop_window, logo_box, validate_edl)
 from integrations.reel_studio.media import fonts
 from integrations.reel_studio.media.decode import tonemap_filter
 
@@ -225,12 +227,36 @@ def plan_final_args(edl: Mapping, concat_list: str, out_path: str, *, encoder: s
     args = ['-y', '-loglevel', 'error', '-f', 'concat', '-safe', '0', '-i', concat_list]
     graph: List[str] = []
     label = '0:v'
+    inputs = 1
+
+    def lay_motion(ov: Mapping) -> None:
+        # An animated overlay (amendment A14): its clip with alpha starts at
+        # from_s, sits at its box, and once it ends the cut passes through.
+        nonlocal label, inputs
+        args.extend(['-i', ov['src']])
+        x0, y0, x1, y1 = ov['box']
+        w, h = max(1, int(round((x1 - x0) * f))), max(1, int(round((y1 - y0) * f)))
+        graph.append('[%d:v]setpts=PTS-STARTPTS+%s/TB,scale=%d:%d[mo%d]'
+                     % (inputs, _num(ov['from_s']), w, h, inputs))
+        graph.append('[%s][mo%d]overlay=x=%d:y=%d:format=auto:eof_action=pass:enable=%s[vm%d]'
+                     % (label, inputs, round(x0 * f), round(y0 * f),
+                        _enable(ov['from_s'], ov['to_s']), inputs))
+        label = 'vm%d' % inputs
+        inputs += 1
+
+    # A full-frame animated overlay (the before->after wipe,
+    # contracts.MOTION_FULL_FRAME) is part of the picture: it is laid on the
+    # cut first, so the text, her logo and the other animated overlays stay
+    # on top of it while it plays (the first real Remotion render showed the
+    # wipe, laid last, hiding the still logo and the end card).
+    for ov in edl['overlays']:
+        if ov['type'] == 'motion' and ov['template'] in MOTION_FULL_FRAME:
+            lay_motion(ov)
     texts = [_drawtext(ov, textfiles[i][0], textfiles[i][1], canvas)
              for i, ov in enumerate(edl['overlays']) if ov['type'] == 'text' and i in textfiles]
     if texts:
-        graph.append('[0:v]%s[vt]' % ','.join(texts))
+        graph.append('[%s]%s[vt]' % (label, ','.join(texts)))
         label = 'vt'
-    inputs = 1
     for ov in edl['overlays']:
         if ov['type'] != 'logo':
             continue
@@ -245,20 +271,8 @@ def plan_final_args(edl: Mapping, concat_list: str, out_path: str, *, encoder: s
         label = 'vl%d' % inputs
         inputs += 1
     for ov in edl['overlays']:
-        # An animated overlay (amendment A14): its clip with alpha starts at
-        # from_s, sits at its box, and once it ends the cut passes through.
-        if ov['type'] != 'motion':
-            continue
-        args += ['-i', ov['src']]
-        x0, y0, x1, y1 = ov['box']
-        w, h = max(1, int(round((x1 - x0) * f))), max(1, int(round((y1 - y0) * f)))
-        graph.append('[%d:v]setpts=PTS-STARTPTS+%s/TB,scale=%d:%d[mo%d]'
-                     % (inputs, _num(ov['from_s']), w, h, inputs))
-        graph.append('[%s][mo%d]overlay=x=%d:y=%d:format=auto:eof_action=pass:enable=%s[vm%d]'
-                     % (label, inputs, round(x0 * f), round(y0 * f),
-                        _enable(ov['from_s'], ov['to_s']), inputs))
-        label = 'vm%d' % inputs
-        inputs += 1
+        if ov['type'] == 'motion' and ov['template'] not in MOTION_FULL_FRAME:
+            lay_motion(ov)
     graph.append('[%s]%s,format=yuv420p[out]' % (label, BT709))
     args += ['-filter_complex', ';'.join(graph), '-map', '[out]', '-an', '-sn', '-dn']
     args += list(NVENC_FINAL if encoder == 'h264_nvenc' else X264_FINAL) + list(RATE_CAP)
