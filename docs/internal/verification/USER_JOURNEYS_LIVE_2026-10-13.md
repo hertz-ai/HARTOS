@@ -187,6 +187,59 @@ the next restart of this node or the next push.
 | A plain chat turn, the text she reads | `POST /chat` in Nunba's body shape (`text`, `user_id`, `request_id msg_proof_plain2_20261014173613`) with a throwaway JWT at 17:36:14Z | 200 in 3.8 s; the reply text: "The capital of France is Paris."; `served_by local`, `source langchain_local`, `node_tier flat`, `agent_status Draft-First Mode`; the node's log at the same second: `[CHAT] turn received ... agent_id=local_assistant agent_type=local text_len=54 request_id=msg_proof_plain2_20261014173613`, then `TTS _bg: thread started` for it. An identical turn at 17:34:26Z answered 200 in 8.8 s (its text was not kept by that run). Contract fact: the same door answers 400 "Text is required" to HARTOS's own `/chat` shape (`prompt`); Nunba's field is `text` | measured | WORKS on the 2B |
 | The outbound record for the two plain turns | the two plain turns above | Written. A developer run writes the record to the `logs-dev/` folder, not `logs/` (the provenance rule of 2026-08-16 in `core/platform_paths.get_log_dir`; the installed build keeps `logs/`); the first reading looked only in `logs/` and called it missing, which was wrong. In `logs-dev/llm_outbound.jsonl` (mtime 23:11 IST), one row per turn: `msg_proof_plain2_20261014173425` at 23:04:28,125 and `msg_proof_plain2_20261014173613` at 23:06:15,964, both `source dispatcher.draft`, `response_status 200`, with body and latency (1937 ms, 1350 ms). Re-read by hartos-45. A row has no lane field: the lane rides as a request header and is stamped and metered only for a configured hosted endpoint (central's gateway path), never for the local model, so the lane-on-the-record proof belongs to central after the push | measured | WORKS; the lane proof moves to central |
 
+### 11.1 The seven listed agents of the chat page (hartos-94, 17:32:26 to 17:43:56 UTC)
+
+What "listed" is: the chat page's sidebar is a hard-coded literal of seven
+agents, the same seven ids in the web page and the desktop page (web commit
+3d01621 of 2024-12-23; first in the desktop tree with the 2026-03-16 import):
+Personalised Learning 54, Speech Therapy Agent 49, Spoken English Agent 20,
+News Agent 5, Podcast Agent 12, Story Narrator Agent 13, Casual Conversation
+Agent 48. Central stores other personas under six of those ids (49 "Great
+India", 20 "talk as if you are my kid", 5 a Naruto teacher, 12 "create an
+alaram after an hour", 13 "play music for 6 month old", 48 "Spoken English
+tutor"; 54 is the Radha persona on central and the rebuilt local tutor on this
+desktop), and the desktop's landing cards carry a third mapping (31
+Mathematician as "Personalised Learning", 54 as "Speech Therapist"). The
+mismatch sits inside the literal (the prompt text was copied in with the
+wrong label); the catalogue did not drift. Read, not measured.
+
+Same node as above; its process started 22:45 IST at HARTOS f203e7d3b (the
+node's harthash answered the git HEAD of the moment, 23848e35a, `live-git`,
+one commit later), Nunba b83f6540, the local model Qwen3.5 2B, 3.07 GB VRAM
+free. Contention during the first turn: two other sessions' proof turns
+(17:34:26Z, 17:36:14Z, section 11 above), the goal daemon dispatching, and a
+743 MB cuDNN download by the node itself. Gate before the first turn:
+`GET /prompts?user_id=10202&type=all` (10202 is agent 54's creator) listed 54
+as `teach.local.radha`, `has_recipe true`, among 29 rows, so the node serves
+the real data directory and not the repository's dev copy (which has no 54);
+the answering route is the desktop's own prompts route by its response
+vocabulary (`origin`, `available`); Flask's order among the four `/prompts`
+handlers was not read. Each turn: `POST /chat` in the chat page's own body
+shape (`text`, `agent_id`, `prompt_id`, a fresh `conversation_id`,
+`intelligence_preference auto`), as the desktop's own guest identity, one at
+a time; the reply is the HTTP body, and the pushed messages are the node's
+agent log (`send_message_to_user`). Sidebar order.
+
+| Step | Probe | Result | Label | Verdict |
+|---|---|---|---|---|
+| Personalised Learning (54: the rebuilt local tutor, recipe on disk) | "Teach me fractions, first step only." `request_id 3ed9648c-48dc-4d6a-abbc-a5e4788d4d5f` at 17:32:26Z | 200 after 505.4 s, `served_by local`, `agent_status Reuse Mode`; the HTTP text: "I see that `get_user_id` is not available, but I can try to use `get_user_details` instead to get user information. Let me try that first." (false: the same session's log shows `get_user_id` succeeding 16 times). Meanwhile FIVE messages were pushed to the learner, at 17:37:17, 17:38:01, 17:38:37, 17:38:42 and 17:40:06Z: four separate fraction introductions, each with its own greeting and its own check question ("What's your question or confusion about fractions?", "What is the main difference between a fraction and a decimal representation of the same value?", "What is one-half in different ways?", "what's the main focus of this lesson? What do fractions mean to you?"), and between them "I see you've been working on fractions. Let me check your progress!". Between pushes the recipe looped `get_user_id` then `get_data_by_key teach.<user>` = "Key not found" 16 times | measured | BROKEN: a learner who asked for the first step only gets four overlapping lessons, a progress note and a tool remark, over 8 min 25 s on the 2B |
+| Speech Therapy Agent (49) | "Help me practise the s sound. Give me the first exercise." `3fa325e7-e5bd-40e4-a0ee-ed05edc32254` at 17:40:51Z | 200 in 3.2 s, `Draft-First Mode`, no `prompt_id` in the reply. The node's log: `prompt_id=49 has no recipe on this node - cloud-only agent, forwarding the turn to the cloud`, then `Cloud agent 49 not answered by the cloud (not signed in) - answering here as local_assistant`. Reply: "Here's a simple exercise for the 's' sound: try saying 'see' without the 'ee' sound, just like 'see'." | measured | BROKEN: the generic local assistant stands in silently, with no persona and no page notice; no speech-therapy agent is reached (central's 49 is "Great India" in any case) |
+| Spoken English Agent (20: a salvage stub, no recipe) | "Help me practise spoken English. Start with a greeting." `d34ecfe4-239a-4b9f-b956-cc3847d97f23` at 17:40:54Z | 200 in 10.1 s, `Creation Mode`; the log: `GATHER JSON EXISTS`, `0 Recipe JSON doesnot EXISTS`. Reply: "I need your input to finish building this agent. Step 1 ("Respond to user") isn't coming together from what I have so far — tell me more about how this step should work, and I'll continue building from there." | measured | BROKEN: the builder's dead-end, the 2026-10-04 finding again on this build |
+| News Agent (5) | "Give me today's top three news headlines." `43d6ae57-76d6-408a-a39b-ce4906f275a3` at 17:41:04Z | 200 in 2.7 s, `Draft-First Mode`; the same forward-then-fallback as 49. Reply: "Hey there! Ready to dive into some spoken English practice with you? Just let me know what specific skills or topics you'd like to focus on first!" | measured | BROKEN: no news, and the answer continues the PREVIOUS agent's topic (the Spoken English turn, same person, a different conversation id): the stand-in's history is per person, not per agent or conversation; mechanism not read |
+| Podcast Agent (12) | "Suggest a five minute podcast episode outline about sleep." `230a3f47-e8e8-467c-b060-6544dfbe942f` at 17:41:07Z | 200 in 5.6 s, no `agent_status`; the same fallback. Reply: a four-part outline (Hook 0:00-0:45, The Science, The Fix, The Takeaway) ending "Ready to record?" | measured | answers usefully, as the generic assistant; agent 12 ("create an alaram after an hour") never ran. WORKS by the label's letter, not as an agent |
+| Story Narrator Agent (13: a salvage stub, no recipe) | "Tell me a short bedtime story about a brave rabbit." `88dc73c5-64c8-4bd7-9c02-8f7cb1ebd4e7` at 17:41:13Z | 200 after 161.0 s, `Creation Mode`; the HTTP text is the same builder dead-end as 20. Meanwhile the build loop pushed 50 messages to the person in 2 min 29 s (17:41:22 to 17:43:51Z) and saved `user.bedtime_story_request`, `user.bedtime_story_response` ("Once upon a time, in a quiet little meadow...") and `user.bedtime_story_complete`; the agent log holds no argument line for this session, so what each of the 50 bubbles said is not checked | measured (count, final text), not checked (the bubbles' texts) | BROKEN: a story may have been written, but the person's screen gets a 50-message flood and ends on "I need your input to finish building this agent" |
+| Casual Conversation Agent (48) | "Hi, how are you today?" `c1c89ecf-fbce-4b7d-b77a-5605a32396db` at 17:43:54Z | 200 in 2.2 s, `Draft-First Mode`; the same fallback. Reply: "Hi there! I'm ready to help with whatever you need, whether it's solving a math problem, writing code, or chatting about your day." | measured | WORKS as casual chat, by the generic assistant (central's 48 "Spoken English tutor" never ran) |
+
+Count: 5 of 7 BROKEN, 1 works by the generic assistant's grace (48), 1
+answers usefully but not as an agent (12). Residue on the node's data
+directory: session and ledger state for 54, 20 and 13 as the desktop guest
+(CREATE state for the two stubs), the three `user.bedtime_story_*` memory
+keys, seven conversation rows. The sweep script and its raw output live on
+the dev box, not in this repository. The web half of this sweep (the same
+seven on hevolve.ai through the cloud chat route) is not run: the route
+answers 401 without a signed-in token, and central's free model tier is
+capped (section 8).
+
 ## 10. What this proves
 
 Measured on the public host: the social feed read and the public agent
