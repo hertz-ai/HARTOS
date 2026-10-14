@@ -1,24 +1,46 @@
 """
 Model Storage Manager — centralized model storage at ~/.hevolve/models/
 
-Tracks all downloaded models (git repos, HuggingFace weights) in a single
-manifest.json so the user can see where their disk space is going and
-the RuntimeToolManager can skip re-downloads.
+Tracks all downloaded models (git repos, HuggingFace weights, npm projects
+set up at runtime) in a single manifest.json so the user can see where their
+disk space is going and the RuntimeToolManager can skip re-downloads.
 
 Pattern from: integrations/vision/minicpm_installer.py
 """
 
+import hashlib
 import json
 import logging
 import os
 import shutil
 import subprocess
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
+
+from core.node_bin import find_node, find_npm
+from core.subprocess_safe import run_bounded
 
 logger = logging.getLogger(__name__)
+
+#: Bounds on the two steps of an npm project's setup (install_npm_project):
+#: ``npm install`` and the project's prepare script (which may download a
+#: browser).  A step past its bound is killed and the setup fails.
+NPM_INSTALL_TIMEOUT_S = 900.0
+NPM_PREPARE_TIMEOUT_S = 900.0
+#: Directories of an npm project that are never copied or fingerprinted.
+_NPM_SKIP_DIRS = frozenset({'node_modules', '__pycache__'})
+#: One npm setup per tool directory at a time (two npm installs in one
+#: folder corrupt it); the second caller waits, then finds the receipt.
+_NPM_LOCKS: Dict[str, threading.Lock] = {}
+_NPM_LOCKS_GUARD = threading.Lock()
+
+
+class NpmSetupFailed(RuntimeError):
+    """An npm project could not be set up; the message says why in words a
+    person can be told (Node.js missing, npm install failed, timed out)."""
 
 DEFAULT_BASE_DIR = Path.home() / '.hevolve' / 'models'
 
@@ -340,6 +362,116 @@ class ModelStorageManager:
                 return tool_dir
             logger.error(f"HF download failed for {tool_name}: {e}")
             return None
+
+    # ── npm project (Node packages set up at runtime) ────────────
+    #
+    # Owner ruling A16 (2026-10-14): an optional capability is set up on
+    # demand at runtime, into this storage, never packaged into a build.  An
+    # npm project is HARTOS's own source (package.json naming exact versions,
+    # plus its scripts); the packages it names arrive here through npm, and
+    # its prepare script (run with Node afterwards) fetches anything else it
+    # needs, such as a headless browser, into the same folder.  The receipt
+    # (mark_downloaded) names the project's fingerprint, so a HARTOS update
+    # that changes the project sets it up again.
+
+    @staticmethod
+    def _npm_project_files(project_dir: str) -> List[str]:
+        """The project's files to copy, as sorted relative paths: everything
+        but Python files (the project folder is also a Python package, so
+        package-data ships it) and the _NPM_SKIP_DIRS."""
+        out = []
+        for root, dirs, files in os.walk(project_dir):
+            dirs[:] = sorted(d for d in dirs if d not in _NPM_SKIP_DIRS)
+            for name in files:
+                if name.endswith(('.py', '.pyc')):
+                    continue
+                out.append(os.path.relpath(os.path.join(root, name), project_dir))
+        return sorted(out)
+
+    def npm_project_fingerprint(self, project_dir: str) -> str:
+        """sha256 over the project's files (each relative path, then its bytes)."""
+        digest = hashlib.sha256()
+        for rel in self._npm_project_files(project_dir):
+            digest.update(rel.replace(os.sep, '/').encode('utf-8') + b'\0')
+            with open(os.path.join(project_dir, rel), 'rb') as fh:
+                digest.update(fh.read())
+            digest.update(b'\0')
+        return digest.hexdigest()
+
+    def npm_install_is_complete(self, tool_name: str, project_dir: str) -> bool:
+        """True when this exact project was set up here and its packages are
+        still on disk: the receipt names the project's current fingerprint
+        and ``node_modules`` exists.  A partly finished setup leaves no
+        receipt (mark_downloaded is its last step)."""
+        row = self._read_manifest().get("tools", {}).get(tool_name)
+        if not row or not os.path.isdir(project_dir):
+            return False
+        if row.get("source_url") != 'npm:' + self.npm_project_fingerprint(project_dir):
+            return False
+        return (self.get_tool_dir(tool_name) / 'node_modules').is_dir()
+
+    @staticmethod
+    def _npm_lock(tool_dir: Path) -> threading.Lock:
+        key = os.path.normcase(os.path.abspath(str(tool_dir)))
+        with _NPM_LOCKS_GUARD:
+            return _NPM_LOCKS.setdefault(key, threading.Lock())
+
+    @staticmethod
+    def _npm_step(cmd: List[str], what: str, cwd: Path, timeout_s: float) -> None:
+        """Run one setup step in ``cwd``, bounded; NpmSetupFailed unless it exits 0."""
+        env = dict(os.environ, npm_config_update_notifier='false', npm_config_fund='false',
+                   npm_config_audit='false')
+        try:
+            result = run_bounded(cmd, timeout=timeout_s, cwd=str(cwd), env=env,
+                                 encoding='utf-8', errors='replace')
+        except (OSError, ValueError) as e:
+            raise NpmSetupFailed(f'{what} could not be started: {e}') from e
+        if result.timed_out:
+            raise NpmSetupFailed(f'{what} timed out after {int(timeout_s)} s')
+        if result.returncode != 0:
+            tail = ' '.join((result.stderr or result.stdout or '').split())[-400:]
+            raise NpmSetupFailed(f'{what} failed (exit {result.returncode}): {tail}')
+        logger.info("%s finished in %s: %s", what, cwd,
+                    ' '.join((result.stdout or '').split())[-300:])
+
+    def install_npm_project(self, tool_name: str, project_dir: str, *,
+                            prepare: Optional[str] = None) -> Path:
+        """Set the npm project at ``project_dir`` up in this tool's directory.
+
+        Copies the project's files (_npm_project_files), runs ``npm install``
+        there, then ``node <prepare>`` when the project names a prepare
+        script, and records the receipt.  Idempotent: a complete setup of
+        this exact project returns at once; one setup per tool directory
+        runs at a time.  Returns the tool directory; raises NpmSetupFailed
+        (Node.js or npm missing, a step failed or ran past its bound, the
+        copy failed), leaving no receipt.
+        """
+        tool_dir = self.get_tool_dir(tool_name)
+        with self._npm_lock(tool_dir):
+            if self.npm_install_is_complete(tool_name, project_dir):
+                return tool_dir
+            node, npm = find_node(), find_npm()
+            if not node or not npm:
+                raise NpmSetupFailed(
+                    'Node.js is not installed on this computer (%s not found)'
+                    % ' and '.join(n for n, p in (('node', node), ('npm', npm)) if not p))
+            fingerprint = self.npm_project_fingerprint(project_dir)
+            try:
+                for rel in self._npm_project_files(project_dir):
+                    dest = tool_dir / rel
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(os.path.join(project_dir, rel), dest)
+            except OSError as e:
+                raise NpmSetupFailed(f'the project could not be copied into {tool_dir}: {e}') from e
+            # npm on Windows is a .cmd shim; launch_argv is how a shim is run.
+            from integrations.coding_agent.installer import launch_argv
+            self._npm_step(launch_argv([npm, 'install', '--no-audit', '--no-fund',
+                                        '--loglevel=error']),
+                           'npm install', tool_dir, NPM_INSTALL_TIMEOUT_S)
+            if prepare:
+                self._npm_step([node, prepare], prepare, tool_dir, NPM_PREPARE_TIMEOUT_S)
+            self.mark_downloaded(tool_name, 'npm:' + fingerprint, self.get_tool_size(tool_name))
+            return tool_dir
 
     # ── Cleanup ──────────────────────────────────────────────────
 

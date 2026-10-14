@@ -6,6 +6,13 @@ Persists state to ~/.hevolve/tool_state.json so restarts skip completed setup.
 
 All sidecar servers use dynamic port allocation (no fixed ports).
 Whisper runs in-process (no sidecar).
+
+On-demand tools (``on_demand: True``, owner ruling A16) have no server: a
+Node project whose packages are set up at runtime (``download_type: 'npm'``,
+model_storage.install_npm_project) when a task asks for it, after the
+owner's consent, and then run by that task.  setup_tool installs and
+prepares them and stops there (no VRAM, no sidecar); setup_available_tools
+never sets them up; tool_ready says whether one is usable.
 """
 
 import atexit
@@ -19,7 +26,7 @@ from pathlib import Path
 from threading import Lock, Thread
 from typing import Dict, Optional
 
-from .model_storage import ModelStorageManager, model_storage
+from .model_storage import ModelStorageManager, NpmSetupFailed, model_storage
 from .vram_manager import VRAMManager, vram_manager
 from .registry import service_tool_registry
 
@@ -39,6 +46,9 @@ VISION_DIR = os.path.join(
 # Tool configuration: name → {repo_url, server_script, hf_repo_id, is_inprocess, catalog_id}
 # catalog_id links RTM tools to ModelCatalog entries so the orchestrator stays in sync.
 # None = no catalog entry (tool is a wrapper or resolved dynamically).
+# An npm row (download_type 'npm') names npm_project (the project folder HARTOS
+# ships as source), optionally npm_prepare (a script in it run with Node after
+# npm install) and on_demand: True (no server; see the module note).
 TOOL_CONFIGS = {
     # Video generation
     'wan2gp': {
@@ -198,6 +208,16 @@ class RuntimeToolManager:
             path = (self.storage.get_tool_dir(tool_name)
                     if self.storage.is_downloaded(tool_name)
                     else self.storage.clone_repo(tool_name, config['repo_url']))
+        elif dl_type == 'npm':
+            # Idempotent and one-at-a-time (install_npm_project): a set-up
+            # project returns at once; the reason a setup failed is kept
+            # for the caller, who tells the person.
+            try:
+                path = self.storage.install_npm_project(
+                    tool_name, config['npm_project'], prepare=config.get('npm_prepare'))
+            except NpmSetupFailed as e:
+                logger.warning(f"Setup of {tool_name} failed: {e}")
+                return dict(result, error=str(e))
         else:
             return {'error': f'Unknown download_type: {dl_type}'}
 
@@ -205,6 +225,12 @@ class RuntimeToolManager:
             return {'error': f'Download failed for {tool_name}'}
 
         result['downloaded'] = True
+
+        if config.get('on_demand'):
+            # No server and no GPU: set up is ready, the task runs it.
+            result['ready'] = True
+            self.save_state()
+            return result
 
         # Step 2: Check VRAM and decide offload mode
         offload = self.vram.suggest_offload_mode(tool_name)
@@ -225,10 +251,16 @@ class RuntimeToolManager:
 
     def start_tool(self, tool_name: str) -> Dict:
         """Start a tool that's already downloaded."""
+        config = TOOL_CONFIGS.get(tool_name)
+        if config and config.get('on_demand'):
+            # Nothing to start: set up means ready.
+            if self.tool_ready(tool_name):
+                return {'tool': tool_name, 'ready': True}
+            return {'error': f'{tool_name} is not set up. Use setup_tool() first.'}
+
         if not self.storage.is_downloaded(tool_name):
             return {'error': f'{tool_name} not downloaded. Use setup_tool() first.'}
 
-        config = TOOL_CONFIGS.get(tool_name)
         if not config:
             return {'error': f'Unknown tool: {tool_name}'}
 
@@ -287,22 +319,42 @@ class RuntimeToolManager:
             return {'error': f'Unknown tool: {tool_name}'}
 
         is_running = self._is_server_alive(tool_name)
-        return {
+        status = {
             'tool': tool_name,
             'downloaded': self.storage.is_downloaded(tool_name),
             'running': is_running,
             'port': self._ports.get(tool_name),
             'is_inprocess': config.get('is_inprocess', False),
-            'vram_allocated_gb': self.vram.get_allocations().get(tool_name, 0),
-            'offload_mode': self.vram.suggest_offload_mode(tool_name),
         }
+        if config.get('on_demand'):
+            # No server and no GPU to report: whether it is set up is the answer.
+            status.update(on_demand=True, ready=self.tool_ready(tool_name))
+            return status
+        status.update(vram_allocated_gb=self.vram.get_allocations().get(tool_name, 0),
+                      offload_mode=self.vram.suggest_offload_mode(tool_name))
+        return status
+
+    def tool_ready(self, tool_name: str) -> bool:
+        """Is ``tool_name`` usable now: an on-demand tool completely set up
+        (an npm project: model_storage.npm_install_is_complete), any other
+        tool serving (_is_server_alive)."""
+        config = TOOL_CONFIGS.get(tool_name)
+        if not config:
+            return False
+        if config.get('download_type') == 'npm':
+            return self.storage.npm_install_is_complete(tool_name, config['npm_project'])
+        return self._is_server_alive(tool_name)
 
     # ── Bulk operations ──────────────────────────────────────────
 
     def setup_available_tools(self) -> Dict:
         """Setup all tools that can fit in available VRAM."""
         results = {}
-        for name in TOOL_CONFIGS:
+        for name, config in TOOL_CONFIGS.items():
+            if config.get('on_demand'):
+                # Set up only when a task asks, after the owner's consent.
+                results[name] = {'skipped': 'set up on demand only'}
+                continue
             if self.vram.can_fit(name):
                 results[name] = self.setup_tool(name)
             else:
