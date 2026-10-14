@@ -11,8 +11,13 @@ loser holding its VRAM).
 
 Now, when Nunba is handling the start -- its subscriber is on this process's
 event bus, or its per-port lock is held -- HARTOS spawns nothing and waits
-for Nunba's server within the bound its own launch had (5 s + 30 s).  A
-HARTOS-only node (no subscriber, no lock) keeps the standalone launch, and
+for Nunba's server within the bound its own launch had (5 s + 30 s).  The
+lock is held by Nunba's own rule (start_caption_server, llama_config.py
+~:2851-2872): only while it is under 120 s old.  An older one was left by a
+start that died (a Nunba killed mid-start) and stops nobody -- not Nunba's
+next start, and not HARTOS's (review of 6067e8806: a lock of any age stopped
+HARTOS for good).  A HARTOS-only node (no subscriber, no lock) keeps the
+standalone launch, and
 that launch finds the 0.8B's weights and projector by the catalog row's file
 names (model_catalog 'llm-qwen3.5-0.8b'): in the folder the row recorded, in
 Nunba's models folder (LlamaInstaller.resolve_models_dir) when that is
@@ -246,6 +251,68 @@ def test_the_2026_09_26_shape_a_start_in_progress_elsewhere_is_not_raced(box):
     assert box.port.spawned == []
     assert len(box.port.servers) == 1, 'a second 0.8B server was spawned on the port'
     assert ok is True and box.clock.t <= BOUND_S
+
+
+def test_nunbas_subscriber_alone_before_it_takes_its_lock_gets_no_second_server(box):
+    """Nunba's subscriber took the event, but its start has not written the
+    per-port lock yet (it is still probing the port or building its
+    LlamaConfig), and its server takes 20 s.  The subscriber alone says Nunba
+    is starting it: HARTOS spawns nothing.  (Review of 6067e8806, mutant M1:
+    with the subscriber check deleted every other test here still passed --
+    each one that had a subscriber also had the lock.)"""
+    _files_in(box.models)
+
+    def start_caption_server_before_its_lock(topic, data):
+        box.port.start(20.0)
+    box.bus.on('vlm_caption.requested', start_caption_server_before_its_lock)
+    ok, _ = _ensure(box)
+    assert not _lock(box).exists()
+    assert box.port.spawned == [], 'HARTOS spawned beside a start Nunba had taken'
+    assert ok is True and len(box.port.servers) == 1
+    assert box.clock.t <= BOUND_S
+
+
+def _lock_aged(box, age_s):
+    """Nunba's per-port start lock, last written ``age_s`` seconds ago."""
+    lock = _lock(box)
+    lock.write_text('31337')
+    then = time.time() - age_s
+    os.utime(lock, (then, then))
+    return lock
+
+
+def test_a_stale_lock_left_by_a_killed_nunba_does_not_stop_the_standalone_launch(box):
+    """Review of 6067e8806, measured: a HARTOS with no Nunba subscriber (a
+    standalone hart_intelligence_entry) on a box where Nunba was hard-killed
+    mid-start, so its lock is a day old.  It took any lock as 'Nunba is
+    starting it': every ensure_running waited 35 s, spawned nothing and said
+    False, then a 120 s cooldown, until Nunba ran again -- captions,
+    read_document and a reel's frame ratings dead.  Nunba's own rule calls
+    that lock stale (its next start removes it); so does HARTOS now: one
+    spawn, ready.  The lock is Nunba's: HARTOS leaves it where it is."""
+    _files_in(box.models)
+    lock = _lock_aged(box, 24 * 3600)
+    ok, _ = _ensure(box)
+    assert len(box.port.spawned) == 1, 'a stale Nunba lock stopped the standalone launch'
+    assert ok is True
+    assert lock.exists(), "HARTOS removed Nunba's lock file"
+
+
+@pytest.mark.parametrize('age_s, held', [(118, True), (122, False)],
+                         ids=['under_120s_held', 'over_120s_stale'])
+def test_the_lock_is_held_by_nunbas_own_age_rule(box, age_s, held):
+    """Nunba's start_caption_server waits on a lock under 120 s old and
+    removes an older one (llama_config.py ~:2853-2872, `lock_age < 120`;
+    Nunba's tests/test_caption_server_spawn_lock.py::
+    test_a_stale_lock_does_not_block_the_spawn).  HARTOS reads the same lock
+    by the same rule, so the two never disagree about whether a start is in
+    progress: 2 s either side of 120 s."""
+    _files_in(box.models)
+    _lock_aged(box, age_s)
+    box.port.start(12.0 if held else None)      # Nunba's start, when there is one
+    ok, _ = _ensure(box)
+    assert len(box.port.spawned) == (0 if held else 1)
+    assert ok is True
 
 
 def test_a_server_already_up_spawns_nothing_and_asks_nothing(box):

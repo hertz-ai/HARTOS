@@ -833,6 +833,15 @@ class Qwen08BBackend(VisionBackend):
     #: The event ensure_running sends; Nunba's subscriber (main.py ~:669)
     #: answers it with llama_config.start_caption_server.
     START_EVENT = 'vlm_caption.requested'
+    #: Nunba's per-port start lock means "a start is in progress" only while
+    #: it is younger than this; an older one was left by a start that died
+    #: (Nunba killed mid-start), and Nunba's next start removes it.  Nunba's
+    #: own rule, which HARTOS reads the lock by: start_caption_server,
+    #: llama_config.py ~:2853-2872 (`lock_age < 120`).  Nunba writes the lock
+    #: and keeps the number as a literal there (and the same 120 s for its
+    #: main server's lock, ~:1805); HARTOS cannot import it -- a HARTOS-only
+    #: process, the one a stale lock stopped, has no Nunba to import.
+    START_LOCK_STALE_S = 120
     #: The model catalog row whose files this backend serves (the 0.8B and
     #: its projector, as Nunba's start_caption_server runs them):
     #: model_catalog._populate_llm_models.
@@ -858,12 +867,18 @@ class Qwen08BBackend(VisionBackend):
         * its per-port start lock, ~/.nunba/.caption_server_starting.<port>
           .lock (llama_config.py start_caption_server ~:2850; Nunba's config
           dir, ~:395), which serializes that start across Nunba's own
-          callers and processes.  It exists while a start is in progress; one
-          left by a Nunba killed mid-start is cleared by Nunba's next start.
+          callers and processes -- by Nunba's own rule, held only while it
+          is younger than START_LOCK_STALE_S.  One older than that was left
+          by a start that died (a Nunba killed mid-start): Nunba's next
+          start removes it, and it stops nobody here either.  HARTOS reads
+          the lock and never writes or removes it.
 
         Spawning while either holds is how two 0.8B servers landed on one
-        port (2026-09-26).
+        port (2026-09-26).  A stale lock taken as held stopped a HARTOS-only
+        process for good (review of 6067e8806): every start waited 35 s,
+        spawned nothing and failed, until Nunba ran again.
         """
+        import time
         try:
             from core.platform.registry import get_registry
             bus = get_registry().get_or_none('events')
@@ -873,8 +888,14 @@ class Qwen08BBackend(VisionBackend):
             logger.debug(f"Qwen3.5-0.8B: event bus not readable ({e})")
         lock = os.path.join(os.path.expanduser('~'), '.nunba',
                             f'.caption_server_starting.{self._port}.lock')
-        if os.path.exists(lock):
-            return f"Nunba's start lock {lock} is held"
+        try:
+            age = time.time() - os.path.getmtime(lock)
+        except OSError:             # no lock, or it went as we looked: no start
+            return ''
+        if age < self.START_LOCK_STALE_S:
+            return f"Nunba's start lock {lock} is held ({age:.0f} s old)"
+        logger.info(f"Qwen3.5-0.8B: Nunba's start lock {lock} is stale ({age:.0f} s "
+                    f"old): no start in progress")
         return ''
 
     def _model_files(self) -> tuple:
@@ -925,9 +946,10 @@ class Qwen08BBackend(VisionBackend):
         HARTOS emits 'vlm_caption.requested' event. In bundled mode, Nunba
         subscribes to this event and calls its own start_caption_server().
         While Nunba is starting it (_launch_owner: its subscriber took the
-        event, or its per-port start lock is held) HARTOS spawns nothing and
-        waits for Nunba's server, 5 s + 30 s at most, the bound its own
-        launch has.  In standalone mode (neither), HARTOS uses
+        event, or its per-port start lock is held, i.e. younger than
+        START_LOCK_STALE_S) HARTOS spawns nothing and waits for Nunba's
+        server, 5 s + 30 s at most, the bound its own launch has.  In
+        standalone mode (neither; a stale lock is neither), HARTOS uses
         model_lifecycle to launch directly, with the files _model_files
         finds through the model catalog.
 
