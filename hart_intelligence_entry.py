@@ -10097,7 +10097,6 @@ def chat():
     autonomous = data.get('autonomous', False)
     probe = data.get('probe', None)
     intermediate = data.get('intermediate', None)
-    speculative = data.get('speculative', False)
     # Tier ladder preference forwarded from Nunba Demopage toggle (see
     # routes/hartos_backend_adapter.py + routes/chatbot_routes.py).
     # Values: 'local_only' | 'auto' | 'hive_preferred'.  Default 'auto'
@@ -10144,7 +10143,6 @@ def chat():
     # that branch, every /chat without a prompt_id raised UnboundLocalError
     # there (live 2026-09-13 13:38).
     _system_agent_pid = None
-    model_config = data.get('model_config', None)
     task_source = data.get('task_source', 'own')
     thread_local_data.set_task_source(task_source)
     channel_context = data.get('channel_context', None)
@@ -10197,36 +10195,77 @@ def chat():
         if not re.fullmatch(r'[a-zA-Z0-9_-]+', prompt_id):
             return jsonify({'error': 'Invalid prompt_id format', 'response': None}), 400
 
-    # Reel Studio (plan WS-8a): read here, where the turn's identity is known
-    # and before the REUSE ladder below replaces `data` with the agent's own
-    # record.  The creation hint is held until the gather save stamps it.
+    # Reel Studio (plan WS-8a): the creation hint is held here, where the
+    # turn's identity is known and before the REUSE ladder below replaces
+    # `data` with the agent's own record, until the gather save stamps it.
+    from core.intelligence_preference import IntelligencePreference
+    from integrations.agent_engine.marketing_tools import (
+        agent_is_local_only, hold_goal_tag_hint)
     if prompt_id is not None:
-        from core.cache_loaders import load_agent_config as _load_agent_record
-        from core.intelligence_preference import IntelligencePreference
-        from integrations.agent_engine.marketing_tools import (
-            goal_tags_preference, hold_goal_tag_hint)
-        _hint_tags = hold_goal_tag_hint(f'{user_id}_{prompt_id}', data.get('goal_tags'))
-        _record_tags = (_load_agent_record(prompt_id) or {}).get('goal_tags')
-        _agent_pref = goal_tags_preference(
-            list(_hint_tags) + (_record_tags if isinstance(_record_tags, list) else []))
-        if _agent_pref is IntelligencePreference.LOCAL_ONLY:
-            # This agent's turns stay on this node (decision U4: her clients'
-            # faces), in memory only -- nothing is persisted.  An agent-bound
-            # turn reads intelligence_preference nowhere below (draft-first
-            # is skipped for it); what can take it off the node is the body's
-            # model_config (a hive/cloud tier for its autogen agents) and
-            # speculative (the background expert), so both are refused.
-            if model_config or speculative:
-                app.logger.info(f'chat: agent {prompt_id} keeps to this node; '
-                                f'ignoring the turn\'s model_config/speculative')
-            intelligence_preference = _agent_pref
-            model_config = None
-            speculative = False
+        hold_goal_tag_hint(f'{user_id}_{prompt_id}', data.get('goal_tags'))
+    # Does this turn keep to this node?  ONE rule over every source
+    # (amendment A9 e, ruled with the lanes lane 2026-10-13): the person's
+    # own toggle (Nunba's Demopage switch), or the goal tags of the turn's
+    # agent (Reel Studio, decision U4) -- this prompt_id's, and the agent an
+    # agentic_execute plan names, which the turn is routed to only below.
+    # Strictness only goes up.  An input to the lane and model decision
+    # below, never a decision of its own; in memory only, nothing persisted.
+    _plan = data.get('agentic_plan') if data.get('agentic_execute') else None
+    local_only = (intelligence_preference == IntelligencePreference.LOCAL_ONLY
+                  or agent_is_local_only(user_id, prompt_id)
+                  or (isinstance(_plan, dict)
+                      and agent_is_local_only(user_id, _plan.get('matched_agent_id'))))
+    if local_only:
+        from core.autogen_config import llm_stays_on_premises
+        # The one answer every reader of the turn's preference sees
+        # (dispatch_draft_first's user_pref below).
+        intelligence_preference = IntelligencePreference.LOCAL_ONLY
+        # The known limit (agreed with the lanes lane): local-only refuses
+        # the body's tier, speculation and the revenue lane, and the turn
+        # runs on this node's own backend (core.autogen_config
+        # .get_autogen_config_list).  When that backend is a public API, the
+        # turn's text still leaves this machine.  Said once per process.
+        if not llm_stays_on_premises() and not getattr(chat, '_local_only_offsite_warned', False):
+            app.logger.warning(
+                'chat: local-only turns run on this node\'s own LLM, and it is a '
+                'public API endpoint (core.autogen_config.llm_stays_on_premises '
+                'is False): their text leaves this machine')
+            chat._local_only_offsite_warned = True
     # The turn's file references (plan 4.2(e)), bound to this user, agent and
     # request before anything runs, so the agent's reel tool finds them.
     if data.get('attachments'):
         from core.chat_attachments import bind_inbound, parse_inbound
         bind_inbound(user_id, prompt_id, request_id, parse_inbound(data['attachments']))
+
+    # The lane this turn runs on (revenue or user; daemon is the id's own
+    # prefix), decided here where the request's auth is in hand and
+    # registered by request id so the autogen worker thread and the wire
+    # header read the same answer (core.request_lane, owner policy 2026-10-12).
+    # The node's own daemon turn is left to the id's prefix rule and to the
+    # lane dispatch_goal registered for a goal that earns; every other caller
+    # is registered by what its request proves, replacing whatever the id
+    # held, so nobody inherits a goal's lane by naming its request id.  A
+    # turn that keeps to this node is never left on the revenue lane.
+    try:
+        from core.constants import SYSTEM_IDENTITIES as _SYSTEM_IDENTITIES
+        from core.request_lane import register_chat_lane
+        from integrations.agent_engine.dispatch import (
+            is_genuine_user_request as _lane_is_genuine)
+        from integrations.commerce.bindings import TENANT as _COMMERCE_TENANT
+        from integrations.social.auth import decode_jwt as _lane_decode_jwt
+        register_chat_lane(request_id, _bearer_token, data, getattr(g, 'auth_source', None),
+                           decode_jwt=_lane_decode_jwt, tenant=_COMMERCE_TENANT,
+                           system_identities=_SYSTEM_IDENTITIES, is_genuine=_lane_is_genuine,
+                           local_only=local_only)
+    except Exception as _lane_err:
+        app.logger.warning('lane not registered for %s (the id rule decides it): %s',
+                           request_id, _lane_err)
+
+    # The turn's model tier and speculation: the body's, unless the turn
+    # keeps to this node.  core.request_lane decides both (amendment A9 e:
+    # one owner of the turn's model decision); chat() decides neither.
+    from core.request_lane import chat_turn_models
+    model_config, speculative = chat_turn_models(data, local_only=local_only)
 
     # Per-request model config override (speculative execution).
     #
@@ -10310,27 +10349,6 @@ def chat():
     # `_req_rid` is '' and the worker's re-bind at :1580 (`if request_id:`)
     # cannot fire.  Attributing that caller is the open work, not this line.
     thread_local_data.set_request_id(request_id=request_id)
-    # The lane this turn runs on (revenue or user; daemon is the id's own
-    # prefix), decided here where the request's auth is in hand and
-    # registered by request id so the autogen worker thread and the wire
-    # header read the same answer (core.request_lane, owner policy 2026-10-12).
-    # The node's own daemon turn is left to the id's prefix rule and to the
-    # lane dispatch_goal registered for a goal that earns; every other caller
-    # is registered by what its request proves, replacing whatever the id
-    # held, so nobody inherits a goal's lane by naming its request id.
-    try:
-        from core.constants import SYSTEM_IDENTITIES as _SYSTEM_IDENTITIES
-        from core.request_lane import register_chat_lane
-        from integrations.agent_engine.dispatch import (
-            is_genuine_user_request as _lane_is_genuine)
-        from integrations.commerce.bindings import TENANT as _COMMERCE_TENANT
-        from integrations.social.auth import decode_jwt as _lane_decode_jwt
-        register_chat_lane(request_id, _bearer_token, data, getattr(g, 'auth_source', None),
-                           decode_jwt=_lane_decode_jwt, tenant=_COMMERCE_TENANT,
-                           system_identities=_SYSTEM_IDENTITIES, is_genuine=_lane_is_genuine)
-    except Exception as _lane_err:
-        app.logger.warning('lane not registered for %s (the id rule decides it): %s',
-                           request_id, _lane_err)
 
     # Speculative dispatch: fast response + background expert
     if speculative and prompt and user_id and prompt_id:
@@ -10956,10 +10974,12 @@ def chat():
                     json.dump(agent_config, json_file)
                 app.logger.info(f"Agent config saved to {name}")
                 # Sync to cloud DB (non-fatal) -- except a local-only agent's
-                # goal, which stays on this node (decision U4(c)).
+                # gathered goal (decision U4(c)): neither this prompt-list row
+                # nor, when CREATE completes, its prompts bundle
+                # (create_recipe.update_agent_creation_to_db) goes to the cloud.
                 if is_local_only(agent_config.get('goal_tags')):
-                    app.logger.info(f'Agent {prompt_id} keeps to this node: '
-                                    f'not synced to the cloud prompt list')
+                    app.logger.info(f'Agent {prompt_id} is local-only: its gathered '
+                                    f'goal is not synced to the cloud prompt list')
                 else:
                     try:
                         pooled_post(

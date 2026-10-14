@@ -137,3 +137,49 @@ def test_a_junk_stored_value_is_not_read_as_tags(build):
     built = build(_record(goal_tags='news'))
     assert built.assistant._hart_unlocked_tags == set()
     assert 'fetch_news_feeds' not in _llm_names(built.helper)
+
+
+# --- CREATE's end: a local-only agent's bundle stays on this node -----------
+# update_agent_creation_to_db marks the cloud row created, then pushes the
+# whole prompts/{pid}* bundle -- goal, goal_tags, flows, extra_information,
+# recipes -- to central's /prompts/sync (core.recipe_sync.push_recipe).
+# Decision U4(c): her Reel Studio agent's goal is not synced to the cloud, so
+# its bundle is not pushed either.  Every other agent's still is, and on the
+# central node the tag is inert (amendment A8 d).
+
+@pytest.fixture
+def finish(temp_prompts_dir, mock_flask_app, monkeypatch):
+    """Write the record, then run CREATE's completion step on it."""
+    import core.recipe_sync as recipe_sync
+    pushes, marks = [], []
+    monkeypatch.setattr(recipe_sync, 'push_recipe',
+                        lambda prompts_dir, pid, user_id='', **_k:
+                        pushes.append((prompts_dir, str(pid))) or True)
+    monkeypatch.setattr(cr, 'pooled_patch', lambda url, **_k: marks.append(url))
+
+    def _finish(record):
+        (temp_prompts_dir / f'{PID}.json').write_text(json.dumps(record))
+        del pushes[:], marks[:]
+        cr.update_agent_creation_to_db(PID)
+        return SimpleNamespace(pushes=list(pushes), marks=list(marks))
+    return _finish
+
+
+def test_her_reel_agents_bundle_is_not_pushed_when_create_completes(finish):
+    done = finish(_record(goal_tags=['reel_studio']))
+    assert done.pushes == [], (
+        "a reel_studio agent's goal, flows and recipes were pushed to the cloud")
+    assert len(done.marks) == 1, "the cloud row's created flag is still set, as before"
+
+
+def test_any_other_agents_bundle_is_pushed_as_before(finish, temp_prompts_dir):
+    for tags in (None, ['news'], 'reel_studio'):
+        done = finish(_record(goal_tags=tags))
+        assert done.pushes == [(str(temp_prompts_dir), str(PID))], tags
+        assert len(done.marks) == 1
+
+
+def test_on_central_a_reel_record_is_pushed_as_before(finish, monkeypatch):
+    from security import key_delegation
+    monkeypatch.setattr(key_delegation, 'get_node_tier', lambda: 'central')
+    assert len(finish(_record(goal_tags=['reel_studio'])).pushes) == 1

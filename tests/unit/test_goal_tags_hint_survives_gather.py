@@ -61,8 +61,13 @@ def chat(hie, tmp_path, monkeypatch):
     import core.cache_loaders as cache_loaders
     import core.recipe_sync as recipe_sync
     from core import user_file_store as ufs
+    from integrations.agent_engine import dispatch
     from integrations.social import chat_messages, rate_limiter
     refuse_all_network(monkeypatch)
+    # A genuine request id marks the person active for the daemon's yield
+    # gate; leave that gate as found (test_flagship_agents' tutor defers
+    # behind it otherwise).
+    monkeypatch.setattr(dispatch, '_last_user_chat_at', dispatch._last_user_chat_at)
     monkeypatch.delenv('HEVOLVE_API_KEY', raising=False)
     monkeypatch.setenv('HEVOLVE_NODE_TIER', 'flat')
     monkeypatch.setitem(hie.app.config, 'PROPAGATE_EXCEPTIONS', True)

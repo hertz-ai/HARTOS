@@ -6974,12 +6974,24 @@ def update_agent_creation_to_db(prompt_id):
     # core/recipe_sync.py - without it the agent is local-only and
     # the user hits the silent-fallback bug when switching devices.
     # Best-effort: never raises, never blocks the user.
+    # Except a local-only agent's bundle (decision U4(c); marketing_tools
+    # .is_local_only over the record's goal_tags, e.g. her Reel Studio agent):
+    # its goal, goal_tags, flows, extra_information and recipes are not
+    # pushed, like its prompt-list row (hart_intelligence_entry
+    # ._save_and_enter_review).  Asked inside the try: a record that cannot
+    # be read is not pushed.
     try:
         from core.recipe_sync import push_recipe
-        # user_id not in scope here; recipe_sync accepts '' as
-        # creator-unknown.  The {prompt_id}.json file itself carries
-        # creator_user_id so the cloud side can still attribute.
-        push_recipe(PROMPTS_DIR, prompt_id, user_id='')
+        from integrations.agent_engine.marketing_tools import is_local_only
+        if is_local_only(get_prompt_config_json(prompt_id).get('goal_tags')):
+            current_app.logger.info(
+                f'recipe_sync: prompt_id={prompt_id} is local-only; its '
+                f'bundle is not pushed to the cloud')
+        else:
+            # user_id not in scope here; recipe_sync accepts '' as
+            # creator-unknown.  The {prompt_id}.json file itself carries
+            # creator_user_id so the cloud side can still attribute.
+            push_recipe(PROMPTS_DIR, prompt_id, user_id='')
     except Exception as _push_err:
         current_app.logger.debug(
             f'recipe_sync push for prompt_id={prompt_id} failed: {_push_err}')

@@ -36,6 +36,16 @@ request id's ``daemon_`` prefix decides it on the wire
     what the id held.  That is what stops a stranger from inheriting a
     goal's revenue lane by naming its request id.
 
+A turn that keeps to this node (``local_only``) is the third input.  /chat
+decides it from ONE rule (the person's own local_only toggle, or the goal
+tags of the turn's agent, e.g. a Reel Studio agent, decision U4) and passes
+it here; it is never a second decision beside this module (amendment A9 e,
+ruled with the lanes lane 2026-10-13).  Such a turn never runs on, and is
+never left on, the revenue lane, the one lane the configured expert is
+offered to.  ``chat_turn_models`` is the other half of the same decision:
+the model tier and speculation the turn's body asks for, refused for a turn
+that keeps to this node.  /chat sets neither itself.
+
 Pure: the JWT decoder, the tenant name, the system identities and the
 genuine-user rule are passed in by the caller (hart_intelligence_entry's
 /chat), so core imports nothing from integrations and the rule is testable
@@ -43,7 +53,7 @@ without the app.  The lane names are the ones core.llm_outbound_logger stamps
 on the wire.
 """
 from core.llm_outbound_logger import (
-    LANE_REVENUE, LANE_USER, lane_for_request, register_request_lane,
+    LANE_DAEMON, LANE_REVENUE, LANE_USER, lane_for_request, register_request_lane,
 )
 
 #: auth_source values that mean "no credential was presented": the desktop's
@@ -87,11 +97,19 @@ def lane_for_chat(bearer_token, body, auth_source, decode_jwt=None, tenant=None,
 
 
 def register_chat_lane(request_id, bearer_token, body, auth_source, decode_jwt=None,
-                       tenant=None, system_identities=(), is_genuine=None):
+                       tenant=None, system_identities=(), is_genuine=None,
+                       local_only=False):
     # type: (...) -> object
     """/chat's one registration decision.  Returns the lane the turn runs on
     when this call decided or confirmed it, or None when the turn is left to
-    the prefix rule and to earlier registrations."""
+    the prefix rule and to earlier registrations.
+
+    ``local_only``: the turn keeps to this node.  Wherever the answer would
+    be revenue (what the request proves, or what the id already holds), the
+    turn is registered on its own lane instead, replacing the revenue
+    registration: 'daemon' for the node's own daemon turn, 'user' for anyone
+    else's.  Every other answer is unchanged, and False (the default) changes
+    nothing."""
     payload = _payload(bearer_token, decode_jwt)
     internal = is_internal_caller(auth_source, payload, system_identities)
     credentialless = auth_source in CREDENTIALLESS_AUTH
@@ -102,12 +120,37 @@ def register_chat_lane(request_id, bearer_token, body, auth_source, decode_jwt=N
         except Exception:
             genuine = True
     if not genuine and (internal or credentialless):
-        return None                                   # the node's own daemon turn
+        # The node's own daemon turn.
+        if local_only and lane_for_request(request_id) == LANE_REVENUE:
+            register_request_lane(request_id, LANE_DAEMON)
+            return LANE_DAEMON
+        return None
     claim = body.get('lane') if isinstance(body, dict) else None
     if internal and not claim:
-        return lane_for_request(request_id) or None   # the node's own inner call
+        # The node's own inner call.
+        lane = lane_for_request(request_id) or None
+        if local_only and lane == LANE_REVENUE:
+            register_request_lane(request_id, LANE_USER)
+            return LANE_USER
+        return lane
     lane = lane_for_chat(bearer_token, body, auth_source, decode_jwt=decode_jwt,
                          tenant=tenant, system_identities=system_identities,
                          jwt_payload=payload)
+    if local_only and lane == LANE_REVENUE:
+        lane = LANE_USER
     register_request_lane(request_id, lane)
     return lane
+
+
+def chat_turn_models(body, local_only=False):
+    # type: (object, bool) -> tuple
+    """``(model_config, speculative)`` for one /chat turn: the model tier its
+    body names for the turn's autogen agents (the speculative dispatcher's
+    expert reroute and dispatch.py send one) and whether to hand the turn to
+    the speculative dispatcher's background expert.  A turn that keeps to
+    this node (``local_only``) gets neither: ``(None, False)``.  Otherwise
+    the body's own values, as /chat read them before (absent: None, False).
+    Never raises."""
+    if local_only or not isinstance(body, dict):
+        return None, False
+    return body.get('model_config', None), body.get('speculative', False)

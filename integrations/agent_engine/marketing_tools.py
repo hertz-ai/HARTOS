@@ -930,6 +930,20 @@ def drop_goal_tag_hint(key) -> None:
     _creation_hints.pop(key, None)
 
 
+def agent_is_local_only(user_id, prompt_id) -> bool:
+    """Do the goal tags of the agent ``prompt_id`` keep its turns on this
+    node (is_local_only)?  Its saved record's ``goal_tags``, and the creation
+    hint held for it under '{user_id}_{prompt_id}' before that record exists.
+    The per-agent half of /chat's one local-only rule.  False for no id, an
+    unsafe id or no readable record and no hint."""
+    if prompt_id is None or prompt_id == '':
+        return False
+    from core.cache_loaders import load_agent_config
+    stored = (load_agent_config(prompt_id) or {}).get('goal_tags')
+    return is_local_only(held_goal_tag_hint(f'{user_id}_{prompt_id}')
+                         + (stored if isinstance(stored, list) else []))
+
+
 def stamp_goal_tags(hint, stored=None) -> Optional[list]:
     """The ``goal_tags`` an agent record is saved with, or None when the
     record's own value stays exactly as it is.

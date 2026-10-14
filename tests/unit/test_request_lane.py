@@ -238,3 +238,78 @@ def test_a_shopper_is_registered_revenue_and_a_person_user(lanes):
                               tenant=TENANT, is_genuine=_genuine) == 'user'
     assert lanes.lane_for_request('msg_1') == 'revenue'
     assert lanes.lane_for_request('msg_2') == 'user'
+
+
+# ─── a turn that keeps to this node (local_only, amendment A9 e) ─────────────
+# /chat passes local_only when the person's own toggle says local_only or the
+# turn's agent's goal tags keep it on this node (Reel Studio, decision U4).
+# Such a turn is never registered on, or left on, the revenue lane: the
+# configured expert is offered there, and it is not on this node.  Its body's
+# model tier and speculation are refused by the same module
+# (chat_turn_models), so /chat decides neither itself.
+
+def test_a_local_only_turn_is_never_registered_revenue(lanes):
+    from core.request_lane import register_chat_lane
+    shopper = _decoder({'user_id': 'c1', 'tid': TENANT})
+    assert register_chat_lane('msg_local_1', 'tok', {'lane': 'revenue'}, 'jwt', decode_jwt=shopper,
+                              tenant=TENANT, is_genuine=_genuine, local_only=True) == 'user'
+    assert lanes.lane_for_request('msg_local_1') == 'user'
+    assert register_chat_lane('api_1760300000_local', '', {'lane': 'revenue'}, 'api_key',
+                              tenant=TENANT, is_genuine=_genuine, local_only=True) == 'user'
+    assert lanes.lane_for_request('api_1760300000_local') == 'user'
+    # The same turns without it: exactly as before.
+    assert register_chat_lane('msg_local_2', 'tok', {}, 'jwt', decode_jwt=shopper,
+                              tenant=TENANT, is_genuine=_genuine, local_only=False) == 'revenue'
+
+
+@pytest.mark.parametrize('auth, tok, dec', [
+    ('jwt', 'tok', _decoder({'user_id': 'system_daemon'})),
+    ('api_key', '', None),
+    ('body', '', None),
+    (None, '', None),
+])
+def test_a_local_only_daemon_turn_is_not_left_on_a_goals_revenue_lane(lanes, auth, tok, dec):
+    from core.request_lane import register_chat_lane
+    lanes.register_request_lane('daemon_goal-rev-9', 'revenue')
+    assert register_chat_lane('daemon_goal-rev-9', tok, {'prompt': 'x'}, auth, decode_jwt=dec,
+                              tenant=TENANT, system_identities=SYSTEM, is_genuine=_genuine,
+                              local_only=True) == 'daemon'
+    assert lanes.lane_for_request('daemon_goal-rev-9') == 'daemon'
+    # A plain goal's turn is still left to the prefix rule.
+    assert register_chat_lane('daemon_goal-plain-9', tok, {'prompt': 'x'}, auth, decode_jwt=dec,
+                              tenant=TENANT, system_identities=SYSTEM, is_genuine=_genuine,
+                              local_only=True) is None
+    assert lanes.lane_for_request('daemon_goal-plain-9') == ''
+
+
+@pytest.mark.parametrize('auth, tok, dec', [
+    ('jwt', 'tok', _decoder({'user_id': 'system_daemon'})),
+    ('api_key', '', None),
+])
+def test_a_local_only_inner_call_does_not_keep_a_revenue_lane(lanes, auth, tok, dec):
+    from core.request_lane import register_chat_lane
+    lanes.register_request_lane('msg_shopper_9', 'revenue')
+    inner = {'user_id': 'c1', 'prompt': 'add milk', 'request_id': 'msg_shopper_9'}
+    assert register_chat_lane('msg_shopper_9', tok, inner, auth, decode_jwt=dec, tenant=TENANT,
+                              system_identities=SYSTEM, is_genuine=_genuine,
+                              local_only=True) == 'user'
+    assert lanes.lane_for_request('msg_shopper_9') == 'user'
+    lanes.register_request_lane('msg_person_9', 'user')
+    assert register_chat_lane('msg_person_9', tok, dict(inner, request_id='msg_person_9'), auth,
+                              decode_jwt=dec, tenant=TENANT, system_identities=SYSTEM,
+                              is_genuine=_genuine, local_only=True) == 'user'
+    assert register_chat_lane('msg_nobody_9', tok, dict(inner, request_id='msg_nobody_9'), auth,
+                              decode_jwt=dec, tenant=TENANT, system_identities=SYSTEM,
+                              is_genuine=_genuine, local_only=True) is None
+    assert lanes.lane_for_request('msg_nobody_9') == ''
+
+
+def test_the_turns_models_are_the_bodys_unless_it_keeps_to_this_node():
+    from core.request_lane import chat_turn_models
+    tier = [{'model': 'hive-expert-70b', 'base_url': 'http://hive-peer.invalid/v1'}]
+    body = {'model_config': tier, 'speculative': True}
+    assert chat_turn_models(body) == (tier, True)
+    assert chat_turn_models(body, local_only=False)[0] is tier
+    assert chat_turn_models(body, local_only=True) == (None, False)
+    assert chat_turn_models({}) == (None, False)
+    assert chat_turn_models(None) == (None, False)

@@ -318,3 +318,52 @@ class TestHintAndStamp:
     ])
     def test_local_only_is_read_from_a_collection_of_tags(self, tags, want):
         assert is_local_only(tags) is want
+
+
+class TestAnAgentKeepsToThisNode:
+    """agent_is_local_only: the per-agent half of /chat's one local-only rule
+    (amendment A9 e) -- the agent's saved record's goal_tags and the creation
+    hint held for it, before the record exists."""
+
+    @pytest.fixture
+    def record(self, tmp_path, monkeypatch):
+        import json
+        import uuid
+        import core.cache_loaders as cache_loaders
+        monkeypatch.setattr(cache_loaders, 'PROMPTS_DIR', str(tmp_path))
+
+        def write(**fields):
+            pid = str(uuid.uuid4().int % 10 ** 11)
+            (tmp_path / f'{pid}.json').write_text(json.dumps(dict(name='Studio', **fields)))
+            return pid
+        return write
+
+    def test_her_saved_reel_record(self, record):
+        pid = record(goal_tags=['news', 'reel_studio'])
+        assert marketing_tools.agent_is_local_only('u1', pid) is True
+        assert marketing_tools.agent_is_local_only('u1', int(pid)) is True
+
+    def test_her_creation_hint_before_the_record_exists(self):
+        drop_goal_tag_hint('u1_5102')
+        hold_goal_tag_hint('u1_5102', ['reel_studio'])
+        try:
+            assert marketing_tools.agent_is_local_only('u1', '5102') is True
+            assert marketing_tools.agent_is_local_only('u2', '5102') is False, (
+                "another person's hint keeps nobody else's agent here")
+        finally:
+            drop_goal_tag_hint('u1_5102')
+
+    @pytest.mark.parametrize('fields', [{}, {'goal_tags': ['news']},
+                                        {'goal_tags': 'reel_studio'},
+                                        {'goal_tags': None}])
+    def test_any_other_agent(self, record, fields):
+        assert marketing_tools.agent_is_local_only('u1', record(**fields)) is False
+
+    @pytest.mark.parametrize('pid', [None, '', '../x', '42424242424', {'id': 1}])
+    def test_no_agent_or_no_readable_record(self, record, pid):
+        record(goal_tags=['reel_studio'])
+        assert marketing_tools.agent_is_local_only('u1', pid) is False
+
+    def test_on_central_her_record_keeps_nothing(self, record, central):
+        pid = record(goal_tags=['reel_studio'])
+        assert marketing_tools.agent_is_local_only('u1', pid) is False
