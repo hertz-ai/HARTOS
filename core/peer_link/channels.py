@@ -29,11 +29,40 @@ class DataClass:
 #: device_access grant, HARTOS #111) may do on a channel: 'in' (the device
 #: may send on it), 'out' (the node may deliver on it), 'both', or absent
 #: (nothing).  A device is not a node: every channel that carries node
-#: authority -- compute, dispatch, gossip, federation, hivemind, ralt,
-#: sensor, messages, learning -- is closed to it unless a maintainer opens it
-#: here, so a new channel starts closed.  link.py drops what a device sends
-#: elsewhere; link_manager.broadcast/collect never deliver elsewhere.
+#: authority -- compute, gossip, federation, hivemind, ralt, sensor,
+#: messages, learning -- is closed to it unless a maintainer opens it here,
+#: so a new channel starts closed.  A channel opened 'in' may name the only
+#: frame types a device may send there (DEVICE_TYPES_KEY): 'dispatch' opens
+#: to a person's own phone for its API requests and nothing else, because
+#: embedded nodes act on 'device_control' frames on that same channel.  On a
+#: typed channel a device's frame must also be a request (link.py), so the
+#: work it starts has someone waiting for the answer -- except a type the
+#: channel names in DEVICE_UNASKED_TYPES_KEY (a stream's bytes and close once
+#: a request has opened it, 'tunnel').  link.py drops what a
+#: device sends elsewhere; link_manager.broadcast/collect never deliver
+#: elsewhere.
 DEVICE_POLICY_KEY = 'device'
+DEVICE_TYPES_KEY = 'device_types'
+#: A person's own phone asking its desktop to answer one of its cloud API
+#: calls, its chat turns included (integrations.mobile_adapter): the one
+#: frame type a device may send on 'dispatch', only as a request, and the
+#: request a desktop that answers it names in its handshake (link_manager.
+#: device_requests_answered).
+API_REQUEST = 'api_request'
+#: A channel's frame types a DEVICE link may send WITHOUT asking (no 'rq'):
+#: the bytes of a stream that flows both ways once it is open.  Every other
+#: type on a typed channel must still be a request (link.py).
+DEVICE_UNASKED_TYPES_KEY = 'device_unasked_types'
+#: A person's own phone's LiveKit signal tunnel (integrations.social.
+#: livekit_link): opened by a request, then bytes and a close either way.
+TUNNEL_OPEN = 'tunnel_open'
+TUNNEL_DATA = 'tunnel_data'
+TUNNEL_CLOSE = 'tunnel_close'
+#: A person's own phone starting and ending a voice call with their agent on
+#: this desktop (integrations.social.phone_call), beside the call's signal
+#: tunnel: requests, answered with the call and its room token.
+CALL_OPEN = 'call_open'
+CALL_END = 'call_end'
 
 CHANNEL_REGISTRY = {
     'control': {
@@ -53,6 +82,12 @@ CHANNEL_REGISTRY = {
     },
     'dispatch': {
         'id': 0x02,
+        # A person's own phone sends its cloud API calls here, as requests
+        # (the phone's DesktopRouteInterceptor); the node answers them with
+        # its own routes (integrations.mobile_adapter).  Typed:
+        # device_control and every other dispatch frame stay node-only.
+        DEVICE_POLICY_KEY: 'in',
+        DEVICE_TYPES_KEY: (API_REQUEST,),
         'data_class': DataClass.PRIVATE,  # Agent tasks are private
         'priority': 1,
         'reliable': True,
@@ -122,6 +157,23 @@ CHANNEL_REGISTRY = {
         'description': 'Federation learning deltas — FedAvg metric sync '
                        '(peer transport for FederatedAggregator.receive_peer_delta)',
     },
+    'tunnel': {
+        'id': 0x0B,
+        # A person's own phone's LiveKit signalling (integrations.social.
+        # livekit_link): opened by a request, then bytes both ways for the
+        # life of a call; the handler joins them only to this node's own
+        # LiveKit signal port and answers nothing but a device.  The call
+        # itself is started and ended here too, by request (phone_call).
+        DEVICE_POLICY_KEY: 'both',
+        DEVICE_TYPES_KEY: (TUNNEL_OPEN, TUNNEL_DATA, TUNNEL_CLOSE,
+                           CALL_OPEN, CALL_END),
+        DEVICE_UNASKED_TYPES_KEY: (TUNNEL_DATA, TUNNEL_CLOSE),
+        'data_class': DataClass.PRIVATE,  # a person's call signalling
+        'priority': 1,      # interactive: a call's setup waits on it
+        'reliable': True,
+        'description': "A phone's LiveKit signal socket, tunnelled to this "
+                       "node's own LiveKit signal port",
+    },
 }
 
 # Reverse lookup: id -> name
@@ -138,9 +190,32 @@ def get_channel_config(channel: str) -> dict:
     return CHANNEL_REGISTRY.get(channel, {})
 
 
-def device_may_send(channel: str) -> bool:
-    """May a DEVICE link send on this channel (inbound to the node)?"""
-    return get_channel_config(channel).get(DEVICE_POLICY_KEY) in ('in', 'both')
+def device_send_types(channel: str) -> tuple:
+    """The only frame types a DEVICE link may send on this channel, or ()
+    when the channel does not narrow them."""
+    return tuple(get_channel_config(channel).get(DEVICE_TYPES_KEY) or ())
+
+
+def device_unasked_types(channel: str) -> tuple:
+    """The frame types a DEVICE link may send on this channel without
+    asking (DEVICE_UNASKED_TYPES_KEY), or ()."""
+    return tuple(get_channel_config(channel).get(DEVICE_UNASKED_TYPES_KEY) or ())
+
+
+def device_may_send(channel: str, frame: Any = None) -> bool:
+    """May a DEVICE link send this frame on this channel (inbound to the node)?
+
+    On a channel that names its device frame types (device_send_types)
+    the frame must be a dict whose 'type' is one of them; no frame (a
+    binary frame, or a caller asking about the channel alone) is refused
+    there.
+    """
+    if get_channel_config(channel).get(DEVICE_POLICY_KEY) not in ('in', 'both'):
+        return False
+    types = device_send_types(channel)
+    if not types:
+        return True
+    return isinstance(frame, dict) and frame.get('type') in types
 
 
 def device_may_receive(channel: str) -> bool:

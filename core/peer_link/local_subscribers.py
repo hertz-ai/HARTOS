@@ -119,6 +119,12 @@ class DeliveryTracker:
 
         tracking_key = data.get('request_id') or data.get('msg_id', '')
 
+        # A push this node handed to central's relay (core.fcm_sync) rides this
+        # same topic as a pending confirmation, for CENTRAL to push.  Tracking
+        # it here would expire it, push it again through the relay, and loop.
+        if 'push_title' in data:
+            return
+
         if 'confirmation' in data:
             if not data['confirmation']:
                 # confirmation=False → new unconfirmed message, track it
@@ -175,10 +181,12 @@ class DeliveryTracker:
                 # unconfirmed after TTL means the user's device never acked
                 # locally (typically a backgrounded phone), so push it via FCM
                 # using the LOCALLY-cached token (core.fcm_sync) — no crossbar,
-                # no cloud round-trip.  No-op without a registered token / edge
-                # credential, so it is safe on every node; the send stamps the
-                # privacy-tier notice (we left the local tier to reach the
-                # device).  Generic body — the content renders in-app on open.
+                # no cloud round-trip.  A node with no FCM credential or token
+                # hands the push to central's relay instead (send_fcm_push), so
+                # a consumer install reaches the phone too, 30-40 s later; the
+                # send stamps the privacy-tier notice (we left the local tier to
+                # reach the device).  Generic body — the content renders in-app
+                # on open.
                 _uid = info.get('user_id')
                 if _uid:
                     try:
@@ -276,6 +284,40 @@ def get_longrunning_tracker() -> LongRunningTracker:
             if _longrunning_tracker is None:
                 _longrunning_tracker = LongRunningTracker()
     return _longrunning_tracker
+
+
+def on_recipe_delta(topic, data) -> None:
+    """'federation.recipe_delta' -> FederatedAggregator.receive_recipe_delta.
+
+    skill_exporter publishes exported skills on this topic and PeerLink
+    relays them, but nothing consumed it, so aggregate_recipes() (the agent
+    router's "Hive recipes") was always empty.  The delta names its node;
+    this node's own echo and an unnamed delta are not filed as a peer's.
+    """
+    try:
+        if isinstance(data, str):
+            data = json.loads(data)
+    except Exception as e:
+        logger.warning("Recipe delta dropped: unparseable payload: %s", e)
+        return
+    node_id = (data or {}).get('node_id') if isinstance(data, dict) else None
+    if not node_id:
+        logger.debug("Recipe delta dropped: it names no node")
+        return
+    try:
+        from security.node_integrity import get_node_identity
+        if node_id == (get_node_identity() or {}).get('node_id'):
+            return
+    except Exception as e:
+        logger.debug("Recipe delta: own node id unavailable (%s)", e)
+    try:
+        from integrations.agent_engine.federated_aggregator import (
+            get_federated_aggregator,
+        )
+        get_federated_aggregator().receive_recipe_delta(node_id, data)
+    except Exception as e:
+        logger.warning("Recipe delta from %s not filed: %s", node_id, e,
+                       exc_info=True)
 
 
 def bootstrap_local_subscribers() -> None:
@@ -417,8 +459,13 @@ def bootstrap_local_subscribers() -> None:
         logger.debug(f"Learning-delta ingress not wired: {e}")
         _learning_leg = ""
 
+    # 10. Recipe sharing: 'federation.recipe_delta' (skill_exporter publishes,
+    #     PeerLink relays) -> FederatedAggregator.receive_recipe_delta, the
+    #     consumer that was never wired.
+    bus.subscribe('federation.recipe_delta', on_recipe_delta)
+
     logger.info(
         "Local subscribers bootstrapped: confirmation, longrunning, "
-        "intermediate, exception, timeout, probe"
+        "intermediate, exception, timeout, probe, recipe-sharing"
         + _ota_leg + _ingress_leg + _learning_leg
     )

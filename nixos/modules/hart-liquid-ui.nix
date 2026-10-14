@@ -1,4 +1,4 @@
-{ config, lib, pkgs, hartSrc ? /etc/hart, ... }:
+{ config, lib, pkgs, hartSrc ? /etc/hart, hartRev ? "unknown", ... }:
 
 # ═══════════════════════════════════════════════════════════════
 # HART OS LiquidUI — AI Generates the Interface
@@ -835,7 +835,11 @@ in
           HART_THEME_DIR = "/run/current-system/sw/share/hart/conky-themes";
           HART_LIQUID_UI_PORT = toString ui.port;
           NUNBA_STATIC_DIR = lib.mkIf ui.embedNunba
-            "${pkgs.callPackage ../packages/nunba.nix { inherit hartSrc; }}/lib/nunba/static";
+            # THE Nunba package, from hart-nunba.nix's option: one call site, one store
+            # tree. A second callPackage here (even with the same arguments, which it
+            # did not have on generation 14: a 155M HARTOS_SHA=unknown twin) is a
+            # parallel path.
+            "${config.hart.nunba.package}/lib/nunba/static";
           # When the native Nunba daemon runs (hart.nunba.enable), LiquidUI reverse-
           # proxies the FULL Nunba (Python + React) over its unix socket instead of
           # only serving the static React dist — same origin, no host port. The

@@ -144,3 +144,89 @@ def test_longrunning_prunes_over_200():
     for i in range(210):
         lt.on_progress('lr.log', {'request_id': f'q{i}', 'status': 'RUNNING'})
     assert lt.get_stats()['tracked_tasks'] <= 200
+
+
+# ── federation.recipe_delta reaches the aggregator ──────────────────────────
+#
+# skill_exporter publishes exported skills on 'federation.recipe_delta' and
+# PeerLink relays them (VERIFICATION 2026-09-05 saw one arrive on the peer),
+# but nothing ever called FederatedAggregator.receive_recipe_delta, so
+# aggregate_recipes() -- the agent router's "Hive recipes" -- was always empty.
+
+class _Agg:
+    def __init__(self):
+        self.got = []
+
+    def receive_recipe_delta(self, node_id, delta):
+        self.got.append((node_id, delta))
+
+
+def _wire(monkeypatch, self_node='self-node'):
+    agg = _Agg()
+    monkeypatch.setattr(
+        'integrations.agent_engine.federated_aggregator.get_federated_aggregator',
+        lambda: agg)
+    monkeypatch.setattr('security.node_integrity.get_node_identity',
+                        lambda *a, **k: {'node_id': self_node})
+    return agg
+
+
+def test_a_peers_recipe_delta_reaches_the_aggregator(monkeypatch):
+    """RED before: there was no consumer at all."""
+    from core.peer_link import local_subscribers as ls
+    agg = _wire(monkeypatch)
+    delta = {'node_id': 'peer-b', 'recipes': [{'id': 'r1', 'name': 'Book a table'}]}
+    ls.on_recipe_delta('federation.recipe_delta', delta)
+    assert agg.got == [('peer-b', delta)]
+
+
+def test_this_nodes_own_recipe_delta_is_not_stored_as_a_peers(monkeypatch):
+    from core.peer_link import local_subscribers as ls
+    agg = _wire(monkeypatch)
+    ls.on_recipe_delta('federation.recipe_delta',
+                       {'node_id': 'self-node', 'recipes': []})
+    assert agg.got == []
+
+
+def test_a_recipe_delta_that_names_no_node_is_dropped(monkeypatch):
+    from core.peer_link import local_subscribers as ls
+    agg = _wire(monkeypatch)
+    ls.on_recipe_delta('federation.recipe_delta', {'recipes': []})
+    assert agg.got == []
+
+
+def test_a_json_string_recipe_payload_is_accepted(monkeypatch):
+    from core.peer_link import local_subscribers as ls
+    agg = _wire(monkeypatch)
+    delta = {'node_id': 'peer-c', 'recipes': []}
+    ls.on_recipe_delta('federation.recipe_delta', json.dumps(delta))
+    assert agg.got == [('peer-c', delta)]
+
+
+def test_bootstrap_subscribes_recipe_sharing(monkeypatch):
+    """The wiring itself, through the REAL bootstrap (boundaries faked), so
+    the channel cannot silently come unwired again."""
+    from types import SimpleNamespace
+    from core.peer_link import local_subscribers as ls
+
+    subs = []
+    bus = SimpleNamespace(
+        subscribe=lambda topic, handler: subs.append((topic, handler)),
+        publish=lambda *a, **k: None,
+        bootstrap_peerlink_ingress=lambda: False)
+    tracker = SimpleNamespace(start=lambda: None,
+                              on_confirmation_message=lambda *a: None,
+                              get_stats=lambda: {})
+    monkeypatch.setattr(ls, '_bootstrapped', False)
+    monkeypatch.setattr(ls, 'get_delivery_tracker', lambda: tracker)
+    monkeypatch.setattr(ls, 'get_longrunning_tracker',
+                        lambda: SimpleNamespace(on_progress=lambda *a: None,
+                                                get_stats=lambda: {}))
+    monkeypatch.setattr('core.peer_link.message_bus.get_message_bus', lambda: bus)
+    monkeypatch.setattr(
+        'integrations.agent_engine.federated_aggregator.bootstrap_learning_delta_ingress',
+        lambda: False)
+
+    ls.bootstrap_local_subscribers()
+
+    assert ('federation.recipe_delta', ls.on_recipe_delta) in subs

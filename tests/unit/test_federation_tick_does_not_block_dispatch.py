@@ -140,3 +140,30 @@ def test_result_is_logged_not_returned(monkeypatch, caplog):
     assert any('epoch=7' in r.message or 'epoch=7' in r.getMessage()
                for r in caplog.records), (
         "aggregated epoch was not logged -- operators lose federation visibility")
+
+
+def test_a_failing_epoch_is_a_warning_operators_can_see(monkeypatch, caplog):
+    """Swallowed, yes; silent, no.  RED before: logged at DEBUG, which no
+    shipped log carries, so a federation loop that failed every minute looked
+    exactly like one with nothing to do."""
+    d = AgentDaemon()
+
+    class _BrokenAggregator:
+        def tick(self):
+            raise RuntimeError("peer broadcast failed")
+
+    import integrations.agent_engine.federated_aggregator as fa
+    monkeypatch.setattr(fa, 'get_federated_aggregator',
+                        lambda: _BrokenAggregator())
+
+    with caplog.at_level('WARNING'):
+        d._spawn_federation_tick_async()
+        for _ in range(40):
+            prior = getattr(d, '_federation_thread', None)
+            if prior is None or not prior.is_alive():
+                break
+            time.sleep(0.05)
+
+    assert any('peer broadcast failed' in r.getMessage()
+               and r.levelname == 'WARNING' for r in caplog.records), (
+        [(r.levelname, r.getMessage()) for r in caplog.records])

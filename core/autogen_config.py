@@ -52,6 +52,46 @@ def _report_once(key, msg):
         log.error(msg)
 
 
+def configured_api_endpoint():
+    """The endpoint this node's LLM calls go to when it runs on an API, or ''
+    when it runs its own llama-server.
+
+    The ONE answer to "local or api", read from the environment alone: no
+    probe, no entry, no report.  resolve_llm_backend builds its entry on it;
+    core.constants.canonical_served_by asks it where a reply nobody tagged
+    was written (a node on an API sends every prompt off the box, and a
+    reply from it is not on-device).
+    """
+    endpoint = os.environ.get(ENDPOINT_VAR, '')
+    if os.environ.get('HEVOLVE_NODE_TIER', 'flat') in ('regional', 'central') and endpoint:
+        return endpoint
+    provider = os.environ.get('HEVOLVE_ACTIVE_CLOUD_PROVIDER', '')
+    if provider and os.environ.get(API_KEY_VAR, '') and (endpoint or provider == 'openai'):
+        return endpoint or OPENAI_SDK_DEFAULT_BASE
+    return ''
+
+
+def llm_stays_on_premises():
+    """True when this node's own LLM runs on this machine or this LAN: its own
+    llama-server, or an API endpoint whose host is loopback or a non-global
+    address (a LAN box).  A public endpoint (openrouter.ai, api.openai.com)
+    is not, and neither is a host NAME other than localhost: it is not
+    provably local, and saying 'on-device' about bytes that left is the
+    wrong way to be wrong.  Pure: no probe."""
+    api = configured_api_endpoint()
+    if not api:
+        return True
+    from urllib.parse import urlparse
+    import ipaddress
+    host = (urlparse(api).hostname or '').lower()
+    if host == 'localhost':
+        return True
+    try:
+        return not ipaddress.ip_address(host).is_global
+    except ValueError:
+        return False
+
+
 def resolve_llm_backend():
     """Return ``(kind, entry)``.
 
@@ -69,8 +109,11 @@ def resolve_llm_backend():
     endpoint = os.environ.get(ENDPOINT_VAR, '')
     api_key = os.environ.get(API_KEY_VAR, '')
     model = os.environ.get(MODEL_VAR, '')
+    # The kind is configured_api_endpoint's answer; the branches below only
+    # build the entry for it.
+    api_endpoint = configured_api_endpoint()
 
-    if node_tier in ('regional', 'central') and endpoint:
+    if api_endpoint and node_tier in ('regional', 'central') and endpoint:
         if not model:
             _report_once('model', "%s is set but %s is empty: the configured "
                          "endpoint decides the model, HARTOS will not guess one"
@@ -92,27 +135,33 @@ def resolve_llm_backend():
         # spawn); LLM_THINKING_OFF_KWARGS travels with the request, and autogen
         # hands extra_body to the openai client's create().  OpenAI and Azure
         # OpenAI reject an unknown request field, so they are left alone.
+        # OpenRouter takes the switch in its own `reasoning` field.
         from urllib.parse import urlparse
         host = (urlparse(endpoint).hostname or '').lower()
-        if host != 'api.openai.com' and not host.endswith('.openai.azure.com'):
+        if host == 'openrouter.ai':
+            from core.constants import LLM_THINKING_OFF_REASONING
+            entry["extra_body"] = {
+                "reasoning": dict(LLM_THINKING_OFF_REASONING)}
+        elif host != 'api.openai.com' and not host.endswith('.openai.azure.com'):
             from core.constants import LLM_THINKING_OFF_KWARGS
             entry["extra_body"] = {
                 "chat_template_kwargs": dict(LLM_THINKING_OFF_KWARGS)}
         return 'api', entry
 
+    if api_endpoint:
+        if not model:
+            _report_once('model', "provider %s is active but %s is empty: "
+                         "HARTOS will not guess a model" % (provider, MODEL_VAR))
+        entry = {
+            "model": model,
+            "api_key": api_key,
+            "price": [0.0025, 0.01],
+        }
+        if endpoint:
+            entry["base_url"] = endpoint
+        return 'api', entry
+
     if provider and api_key:
-        if endpoint or provider == 'openai':
-            if not model:
-                _report_once('model', "provider %s is active but %s is empty: "
-                             "HARTOS will not guess a model" % (provider, MODEL_VAR))
-            entry = {
-                "model": model,
-                "api_key": api_key,
-                "price": [0.0025, 0.01],
-            }
-            if endpoint:
-                entry["base_url"] = endpoint
-            return 'api', entry
         # anthropic / google_gemini / groq with no endpoint exported: only the
         # vendor SDK ladder in get_llm() can reach them.  autogen and the raw
         # callers speak OpenAI-compatible chat/completions only, and posting
@@ -239,3 +288,97 @@ def get_autogen_config_list() -> list:
     except Exception:
         pass
     return cfgs
+
+
+# ─── The configured EXPERT (owner policy 2026-10-12) ──────────────────────
+# A second configured trio, for the one model the owner wants spent only where
+# it drives revenue (Claude on central).  It is NOT a vendor side door (#69):
+# nothing here reads ANTHROPIC_API_KEY or any vendor variable; the owner names
+# the endpoint and the model explicitly, and on central the endpoint is the
+# same gateway the node's own LLM uses (Kong -> gpt3), so one wire, one set of
+# fuses.  The registry offers it as the EXPERT tier to the lanes in
+# HEVOLVE_EXPERT_LANES only (default: revenue); every other lane never sees it.
+EXPERT_ENDPOINT_VAR = 'HEVOLVE_EXPERT_LLM_ENDPOINT_URL'
+EXPERT_MODEL_VAR = 'HEVOLVE_EXPERT_LLM_MODEL_NAME'
+EXPERT_API_KEY_VAR = 'HEVOLVE_EXPERT_LLM_API_KEY'
+EXPERT_LANES_VAR = 'HEVOLVE_EXPERT_LANES'
+DEFAULT_EXPERT_LANES = 'revenue'
+# Dollars per 1k tokens (input, output) by model family, list prices.  The
+# ONE price table: the expert entry's autogen ``price`` below and the
+# budget gate's dollar meter (integrations.agent_engine.budget_gate) both
+# read it, so the ledger and the registry never disagree on what Claude costs.
+EXPERT_USD_PER_1K = {
+    'claude': (0.003, 0.015),     # Sonnet-class
+}
+OTHER_MODEL_FAMILY = 'other'
+
+
+def model_family(model_name) -> str:
+    """The priced family a model name belongs to ('claude'), else 'other'.
+    Substring match, the ONE rule the dollar meter, the day cap and the wire
+    header X-HARTOS-Model-Family share."""
+    lower = str(model_name or '').lower()
+    for family in EXPERT_USD_PER_1K:
+        if family in lower:
+            return family
+    return OTHER_MODEL_FAMILY
+
+
+def family_usd_per_1k(family):
+    """(input, output) dollars per 1k tokens for a priced family, with the
+    owner's pin HEVOLVE_<FAMILY>_USD_PER_1K_IN / _OUT applied; None for an
+    unpriced one.  The ONE place a family's price is read: the expert entry's
+    autogen ``price`` below and the budget gate's meter both come here, so an
+    owner's pin reaches the ledger and the registry alike (review of
+    8947e2753: a pin used to move one and not the other)."""
+    base = EXPERT_USD_PER_1K.get(family)
+    if base is None:
+        return None
+
+    def _pinned(name, default):
+        try:
+            return float(os.environ.get(name, '') or default)
+        except (TypeError, ValueError):
+            return default
+    upper = str(family).upper()
+    return (_pinned('HEVOLVE_%s_USD_PER_1K_IN' % upper, base[0]),
+            _pinned('HEVOLVE_%s_USD_PER_1K_OUT' % upper, base[1]))
+
+
+def resolve_expert_backend():
+    """A fresh autogen entry for the configured expert, or None when the owner
+    configured none.  Endpoint AND model are required; a half-set pair is
+    reported once and treated as none (nothing is guessed, as for the main
+    trio).  No thinking-off kwargs: this entry is for a hosted frontier model,
+    and an unknown request field is how a provider says 400."""
+    endpoint = os.environ.get(EXPERT_ENDPOINT_VAR, '').strip()
+    model = os.environ.get(EXPERT_MODEL_VAR, '').strip()
+    if not endpoint and not model:
+        return None
+    # Topology agnostic on purpose: no node-tier branch here or anywhere this
+    # tier is read.  The owner wants it on central only, and central is the
+    # only node whose configuration carries the trio; a desktop or regional
+    # node without it runs exactly as before.  Configuration, never a tier
+    # check, is what decides (owner ruling 2026-10-12).
+    if not endpoint or not model:
+        _report_once('expert', "%s and %s must both be set for the expert "
+                     "tier; one alone configures nothing"
+                     % (EXPERT_ENDPOINT_VAR, EXPERT_MODEL_VAR))
+        return None
+    entry = {
+        "model": model,
+        "api_key": os.environ.get(EXPERT_API_KEY_VAR, '') or 'dummy',
+        "base_url": endpoint,
+    }
+    # autogen's ``price`` is optional: a priced family gets the table's (pinned)
+    # price, an unpriced one gets no invented number.
+    price = family_usd_per_1k(model_family(model))
+    if price:
+        entry["price"] = list(price)
+    return entry
+
+
+def expert_lanes() -> frozenset:
+    """The lanes the configured expert is offered to."""
+    raw = os.environ.get(EXPERT_LANES_VAR, '') or DEFAULT_EXPERT_LANES
+    return frozenset(p.strip() for p in raw.split(',') if p.strip())

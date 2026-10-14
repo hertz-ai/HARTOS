@@ -302,3 +302,22 @@ class FederatedAggregatorAlarmTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+
+class TestHiveMindReachesAPeerOverARealLink(unittest.TestCase):
+    """A hivemind query sent over a PeerLink is answered, not dropped."""
+
+    def test_the_registered_link_handler_answers_a_waiting_peer(self):
+        from tests.unit.test_peer_link import _linked_pair, _stop
+        from core.peer_link import hivemind_handler
+        asker, server = _linked_pair()
+        # exactly how bootstrap registers it on the link manager
+        server.on_message('hivemind', hivemind_handler._link_handler)
+        try:
+            reply = asker.send('hivemind', {'type': 'query', 'query': 'q'},
+                               wait_response=True, timeout=5)
+        finally:
+            _stop(asker, server)
+        self.assertIsNotNone(reply)
+        self.assertEqual(reply.get('type'), 'reply')

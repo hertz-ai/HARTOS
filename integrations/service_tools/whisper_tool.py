@@ -24,8 +24,12 @@ import logging
 import math
 import os
 import re
+import shutil
 import sys
 import tarfile
+import tempfile
+import threading
+import time
 import urllib.request
 import wave
 from pathlib import Path
@@ -757,8 +761,47 @@ def _get_stt_dir() -> Path:
     return stt_dir
 
 
+def _sherpa_model_cached(model_name: str) -> bool:
+    """True when this sherpa-onnx model is already downloaded and extracted.
+
+    Same check _download_model uses to skip re-downloading, exposed so
+    select_whisper_model can prefer an already-cached model over the
+    catalog's raw top score. ModelCatalog.select_best only gives
+    "downloaded" a +50 scoring bonus (not a hard requirement, see
+    model_catalog.py select_best), so a large not-yet-downloaded model
+    can outscore a small cached one and trigger a live multi-GB download
+    inside the request's timeout window. Found 2026-09-25.
+    """
+    try:
+        cfg = _SHERPA_MODELS[model_name]
+    except KeyError:
+        return False
+    model_dir = _get_stt_dir() / cfg["dir"]
+    # EVERY file the recognizer loads, not just tokens: an extraction cut
+    # short (crash, full disk) used to leave a folder with tokens.txt and no
+    # encoder, which then read as cached forever and failed every load.
+    return model_dir.exists() and all(
+        (model_dir / f).exists() for f in cfg["files"].values())
+
+
+# One lock per model: a background fetch and a foreground one for the same
+# model must not write the same archive and folder at once.
+_model_download_locks: dict = {}
+_model_download_locks_guard = threading.Lock()
+
+
+def _model_download_lock(model_name: str) -> threading.Lock:
+    with _model_download_locks_guard:
+        return _model_download_locks.setdefault(model_name, threading.Lock())
+
+
 def _download_model(model_name: str) -> Path:
     """Download and extract a sherpa-onnx model if not already present.
+
+    The archive is fetched and unpacked in a private work folder, checked for
+    every file the recognizer loads, and only then moved into place, so the
+    model folder is either absent or complete -- never half-written for a
+    concurrent selection to pick up.
 
     Returns the path to the extracted model directory.
     """
@@ -766,25 +809,39 @@ def _download_model(model_name: str) -> Path:
     stt_dir = _get_stt_dir()
     model_dir = stt_dir / cfg["dir"]
 
-    if model_dir.exists() and (model_dir / cfg["files"]["tokens"]).exists():
+    if _sherpa_model_cached(model_name):
         return model_dir
 
-    archive_url = f"{_SHERPA_MODEL_BASE}/{cfg['archive']}"
-    archive_path = stt_dir / cfg["archive"]
+    with _model_download_lock(model_name):
+        if _sherpa_model_cached(model_name):  # another thread just finished it
+            return model_dir
 
-    logger.info(f"Downloading STT model '{model_name}' from {archive_url}...")
-    try:
-        urllib.request.urlretrieve(archive_url, str(archive_path))
-        logger.info(f"Extracting {cfg['archive']}...")
-        with tarfile.open(str(archive_path), "r:bz2") as tar:
-            tar.extractall(path=str(stt_dir))
-        # Clean up archive
-        archive_path.unlink(missing_ok=True)
-        logger.info(f"STT model '{model_name}' ready at {model_dir}")
-    except Exception as e:
-        logger.error(f"Failed to download model '{model_name}': {e}")
-        archive_path.unlink(missing_ok=True)
-        raise
+        archive_url = f"{_SHERPA_MODEL_BASE}/{cfg['archive']}"
+        work = Path(tempfile.mkdtemp(prefix=f".{cfg['dir']}.", dir=str(stt_dir)))
+        archive_path = work / cfg["archive"]
+
+        logger.info(f"Downloading STT model '{model_name}' from {archive_url}...")
+        try:
+            urllib.request.urlretrieve(archive_url, str(archive_path))
+            logger.info(f"Extracting {cfg['archive']}...")
+            with tarfile.open(str(archive_path), "r:bz2") as tar:
+                tar.extractall(path=str(work))
+            extracted = work / cfg["dir"]
+            missing = [f for f in cfg["files"].values()
+                       if not (extracted / f).exists()]
+            if missing:
+                raise RuntimeError(
+                    f"archive {cfg['archive']} lacks {missing}")
+            if model_dir.exists():
+                # An incomplete leftover: it failed the cache check above.
+                shutil.rmtree(model_dir)
+            os.replace(str(extracted), str(model_dir))
+            logger.info(f"STT model '{model_name}' ready at {model_dir}")
+        except Exception as e:
+            logger.error(f"Failed to download model '{model_name}': {e}")
+            raise
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
 
     return model_dir
 
@@ -830,33 +887,87 @@ def _get_sherpa_recognizer(model_name: str = "whisper-tiny"):
     return _sherpa_recognizer
 
 
-def _read_wav_f32(audio_path: str):
-    """Read a PCM WAV into ``(sample_rate, float32 mono samples in [-1, 1])``.
+def read_wav_f32(audio_path: str):
+    """Read a WAV into ``(sample_rate, float32 mono samples in [-1, 1])``.
 
     sherpa-onnx's ``OfflineStream.accept_waveform`` wants normalized float32
     samples + the source sample rate.  The realtime STT pipeline writes 16-bit
     PCM WAV (see the streaming writer ~L1229).  Uses ONLY stdlib ``wave`` +
     numpy — no libsndfile / ffmpeg native dependency — so it behaves
     identically in the frozen bundle on Windows, macOS and Linux.
+
+    Also the reader for a TTS engine's output (agent_voice_bridge speaks it
+    into a call).  Engines that write a float tensor write an IEEE-float WAV
+    (scipy.io.wavfile in pocket_tts_tool and gpu_worker's numpy_24k,
+    torchaudio.save in chatterbox_tool and cosyvoice_tool), which ``wave``
+    refuses with 'unknown format: 3'; _read_wav_float reads those.
+    (gpu_worker still keeps its own scipy fallback for a file's duration.)
     """
     import wave
     import numpy as np
-    with wave.open(audio_path, 'rb') as wf:
-        sample_rate = wf.getframerate()
-        n_channels = wf.getnchannels()
-        sampwidth = wf.getsampwidth()
-        raw = wf.readframes(wf.getnframes())
-    if sampwidth == 2:
-        data = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-    elif sampwidth == 4:
-        data = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
-    elif sampwidth == 1:  # 8-bit PCM is unsigned, centred at 128
-        data = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+    try:
+        with wave.open(audio_path, 'rb') as wf:
+            sample_rate = wf.getframerate()
+            n_channels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
+            raw = wf.readframes(wf.getnframes())
+    except wave.Error:
+        sample_rate, n_channels, data = _read_wav_float(audio_path)
     else:
-        raise ValueError(f"unsupported WAV sample width: {sampwidth} bytes")
+        if sampwidth == 2:
+            data = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        elif sampwidth == 4:
+            data = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+        elif sampwidth == 1:  # 8-bit PCM is unsigned, centred at 128
+            data = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+        else:
+            raise ValueError(f"unsupported WAV sample width: {sampwidth} bytes")
     if n_channels > 1:  # down-mix to mono
         data = data.reshape(-1, n_channels).mean(axis=1)
     return sample_rate, data
+
+
+#: WAV format tags (the fmt chunk's first field).  WAVE_FORMAT_EXTENSIBLE
+#: names its real format in the first two bytes of its sub-format GUID.
+_WAVE_FORMAT_IEEE_FLOAT = 3
+_WAVE_FORMAT_EXTENSIBLE = 0xFFFE
+
+
+def _read_wav_float(audio_path: str):
+    """``(sample_rate, channels, float32 interleaved samples)`` of an
+    IEEE-float WAV, 32 or 64 bit, plain or WAVE_FORMAT_EXTENSIBLE.  Anything
+    else raises ValueError naming what the file holds."""
+    import struct
+    import numpy as np
+    with open(audio_path, 'rb') as f:
+        blob = f.read()
+    if blob[:4] != b'RIFF' or blob[8:12] != b'WAVE':
+        raise ValueError(f"not a WAV file: {audio_path}")
+    fmt = samples = None
+    pos = 12
+    while pos + 8 <= len(blob):
+        chunk_id = blob[pos:pos + 4]
+        size = struct.unpack('<I', blob[pos + 4:pos + 8])[0]
+        body = blob[pos + 8:pos + 8 + size]
+        if chunk_id == b'fmt ':
+            fmt = body
+        elif chunk_id == b'data':
+            samples = body
+        pos += 8 + size + (size & 1)  # chunks are word-aligned
+    if fmt is None or len(fmt) < 16 or samples is None:
+        raise ValueError(f"WAV has no fmt or data chunk: {audio_path}")
+    tag, n_channels, sample_rate = struct.unpack('<HHI', fmt[:8])
+    bits = struct.unpack('<H', fmt[14:16])[0]
+    if tag == _WAVE_FORMAT_EXTENSIBLE and len(fmt) >= 26:
+        tag = struct.unpack('<H', fmt[24:26])[0]
+    if tag != _WAVE_FORMAT_IEEE_FLOAT or bits not in (32, 64):
+        raise ValueError(
+            f"unsupported WAV format {tag} at {bits} bits: {audio_path}")
+    dtype = '<f4' if bits == 32 else '<f8'
+    frame = (bits // 8) * max(n_channels, 1)
+    usable = len(samples) - len(samples) % frame  # a cut-off last frame
+    data = np.frombuffer(samples[:usable], dtype=dtype).astype(np.float32)
+    return sample_rate, max(n_channels, 1), data
 
 
 def _sherpa_transcribe(audio_path: str, model_name: str) -> Optional[str]:
@@ -869,7 +980,7 @@ def _sherpa_transcribe(audio_path: str, model_name: str) -> Optional[str]:
         # The old call raised AttributeError on every utterance, so STT
         # returned empty text — mic captured, nothing transcribed/sent/shown
         # (incident 2026-06-17).
-        sample_rate, samples = _read_wav_f32(audio_path)
+        sample_rate, samples = read_wav_f32(audio_path)
         stream = recognizer.create_stream()
         stream.accept_waveform(sample_rate, samples)
         recognizer.decode_stream(stream)
@@ -1074,6 +1185,102 @@ def _catalog_stt_entry(exclude=None):
         return None
 
 
+_background_lock = threading.Lock()
+_background_downloads: set = set()
+# model -> (consecutive failures, time.monotonic() of the last one)
+_background_failures: dict = {}
+_BACKGROUND_RETRY_BASE_S = 300.0
+_BACKGROUND_RETRY_MAX_S = 6 * 3600.0
+
+
+def _background_retry_wait(failures: int) -> float:
+    """Seconds a failed pick waits before a selection may fetch it again:
+    5 min, doubling per consecutive failure, at most 6 h."""
+    return min(_BACKGROUND_RETRY_BASE_S * (2 ** max(failures - 1, 0)),
+               _BACKGROUND_RETRY_MAX_S)
+
+
+def _download_in_background(model_name: str) -> bool:
+    """Fetch a sherpa model off the request path, one fetch per model.
+
+    select_whisper_model serves a cached model when the catalog's pick is
+    not on disk (a live multi-GB fetch would outlast the request).  Without
+    this, nothing ever downloaded the pick, since _download_model runs only
+    for the model actually chosen, so the node stayed on the smaller cached
+    model for good.  Once this finishes, the next selection finds the pick
+    cached.  A failed fetch is logged and retried by a later selection once
+    its wait (_background_retry_wait) has passed -- every STT request
+    selects, so without the wait an offline node restarted a multi-GB fetch
+    on each one.  Returns whether a download was started.
+    """
+    with _background_lock:
+        if model_name in _background_downloads:
+            return False
+        failed = _background_failures.get(model_name)
+        if failed and (time.monotonic() - failed[1]
+                       < _background_retry_wait(failed[0])):
+            return False
+        _background_downloads.add(model_name)
+
+    def _run():
+        try:
+            _download_model(model_name)
+            with _background_lock:
+                _background_failures.pop(model_name, None)
+            logger.info("STT model '%s' downloaded in the background; the next "
+                        "selection uses it", model_name)
+        except Exception as e:
+            with _background_lock:
+                failures = (_background_failures.get(model_name) or (0, 0))[0] + 1
+                _background_failures[model_name] = (failures, time.monotonic())
+            logger.warning("Background download of STT model '%s' failed; a "
+                           "selection retries it in %ds: %s", model_name,
+                           int(_background_retry_wait(failures)), e)
+        finally:
+            with _background_lock:
+                _background_downloads.discard(model_name)
+
+    try:
+        threading.Thread(target=_run, name=f'stt-download-{model_name}',
+                         daemon=True).start()
+    except Exception as e:
+        with _background_lock:
+            _background_downloads.discard(model_name)
+        logger.warning("Background download of STT model '%s' could not "
+                       "start: %s", model_name, e)
+        return False
+    return True
+
+
+def _best_cached_sherpa_after(first_id: str):
+    """The catalog's next-best sherpa STT model that is already on disk.
+
+    Walks the catalog's own ranking (select_best with a growing exclude list)
+    rather than a hardcoded preference list, so model choice stays owned by
+    the catalog; "on disk" is read from the files (_sherpa_model_cached), not
+    the catalog's downloaded flag, which depends on a loader HARTOS itself
+    does not register.  Returns None when no cached sherpa model fits.
+    """
+    # Walk the WHOLE ranking: non-sherpa entries (faster-whisper) are ranked
+    # alongside, so bounding the walk by the sherpa count could stop before
+    # reaching a cached sherpa model.  It ends when the catalog runs out,
+    # since every returned id is excluded from the next query.
+    excluded = [first_id]
+    while True:
+        entry = _catalog_stt_entry(exclude=excluded)
+        if entry is None:
+            return None
+        if entry.id in excluded:
+            logger.warning(
+                "select_whisper_model: the catalog returned %r although it "
+                "was excluded; stopping the cached-model search", entry.id)
+            return None
+        excluded.append(entry.id)
+        key = _CATALOG_ID_TO_SHERPA.get(entry.id)
+        if key in _SHERPA_MODELS and _sherpa_model_cached(key):
+            return key
+
+
 def select_whisper_model() -> str:
     """Select best STT model for this hardware.
 
@@ -1091,9 +1298,36 @@ def select_whisper_model() -> str:
         if sherpa_key and sherpa_key in _SHERPA_MODELS:
             try:
                 import sherpa_onnx  # noqa: F401
+                if _sherpa_model_cached(sherpa_key):
+                    return sherpa_key
+                # Catalog's top pick isn't downloaded — downloading it now
+                # would take far longer than the request's timeout window
+                # (#677-style: a multi-GB model fetched on-demand crashes
+                # the worker on timeout instead of ever answering). Prefer
+                # whichever sherpa model is already on disk instead of
+                # kicking off a live download. Found 2026-09-25.
+                fallback_key = _best_cached_sherpa_after(entry.id)
+                if fallback_key:
+                    started = _download_in_background(sherpa_key)
+                    logger.warning(
+                        "select_whisper_model: catalog picked '%s' but it "
+                        "is not downloaded; using cached '%s' for now%s",
+                        sherpa_key, fallback_key,
+                        "; downloading the pick in the background" if started
+                        else " (the pick's download is running or waiting "
+                             "to retry)")
+                    return fallback_key
+                logger.warning(
+                    "select_whisper_model: catalog picked '%s' but it is not "
+                    "downloaded and no cached sherpa model exists either; "
+                    "proceeding with '%s' (will trigger a download)",
+                    sherpa_key, sherpa_key)
                 return sherpa_key
             except ImportError:
-                logger.debug("select_whisper_model: swallowed ImportError")
+                logger.warning(
+                    "select_whisper_model: catalog picked sherpa model '%s' "
+                    "but sherpa_onnx is not installed; falling back to the "
+                    "catalog's faster-whisper/whisper mapping", sherpa_key)
         # faster-whisper size
         fw_size = _CATALOG_ID_TO_FASTER_WHISPER_SIZE.get(entry.id)
         if fw_size:

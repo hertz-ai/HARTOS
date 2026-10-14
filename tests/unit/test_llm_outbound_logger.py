@@ -718,3 +718,256 @@ def test_argument_string_is_capped_so_the_log_stays_bounded(
     import core.llm_outbound_logger as mod
     assert len(got) <= mod._RESP_ARG_CAP + 32
     assert got.startswith('{"content":"xxx')
+
+
+# ─── Lane + model headers (owner policy 2026-10-12) ───────────────────────
+# Every outbound LLM call names its lane (revenue / user / daemon) and the
+# model it asks for, so the gateway in front of the provider can cap requests
+# per lane and per model without parsing bodies, and so the budget gate and
+# the expert selector read the SAME lane the wire carries.
+
+
+def _install_with_rid(monkeypatch, tmp_path, rid):
+    _reset_module(monkeypatch, tmp_path)
+    fake_httpx = _build_fake_httpx_module()
+    monkeypatch.setitem(sys.modules, 'httpx', fake_httpx)
+    fake_tl = types.ModuleType('threadlocal')
+    fake_tl.thread_local_data = types.SimpleNamespace(get_request_id=lambda: rid)
+    monkeypatch.setitem(sys.modules, 'hartos.threadlocal', fake_tl)
+    import core.llm_outbound_logger as mod
+    mod.install()
+    return mod, fake_httpx
+
+
+def test_user_turn_stamps_user_lane_and_the_model(tmp_path, monkeypatch):
+    mod, fake_httpx = _install_with_rid(monkeypatch, tmp_path, 'msg_1760160492473_k3j9x1')
+    request = _FakeRequest(body=json.dumps(
+        {'model': 'qwen3-27b', 'messages': [{'role': 'user', 'content': 'hi'}]}).encode())
+    fake_httpx.Client.send(_FakeClient(), request)
+    assert request.headers.get('X-HARTOS-Lane') == 'user'
+    assert request.headers.get('X-HARTOS-Model') == 'qwen3-27b'
+    assert request.headers.get('X-HARTOS-Model-Family') == 'other'
+    assert mod.current_lane() == 'user'
+
+
+def test_daemon_turn_stamps_daemon_lane(tmp_path, monkeypatch):
+    mod, fake_httpx = _install_with_rid(monkeypatch, tmp_path, 'daemon_goal_20261012_abc')
+    request = _FakeRequest(body=json.dumps({'model': 'qwen3-27b', 'messages': []}).encode())
+    fake_httpx.Client.send(_FakeClient(), request)
+    assert request.headers.get('X-HARTOS-Lane') == 'daemon'
+
+
+def test_registered_revenue_lane_reaches_the_wire_from_the_worker_thread(tmp_path, monkeypatch):
+    """/chat registers the lane by request id; the autogen entry point runs on
+    a worker thread and binds it through with_llm_context, so the header on
+    the wire says 'revenue' there and only there."""
+    import threading
+    mod, fake_httpx = _install_with_rid(monkeypatch, tmp_path, '')
+    mod.register_request_lane('req-rev-1', 'revenue')
+    seen = {}
+
+    @mod.with_llm_context('autogen.reuse')
+    def chat_agent(user_id, text, prompt_id, request_id):
+        request = _FakeRequest(body=json.dumps({'model': 'claude-sonnet-4-5', 'messages': []}).encode())
+        fake_httpx.Client.send(_FakeClient(), request)
+        seen['lane'] = request.headers.get('X-HARTOS-Lane')
+        seen['model'] = request.headers.get('X-HARTOS-Model')
+        seen['current'] = mod.current_lane()
+
+    t = threading.Thread(target=chat_agent, args=('u1', 'buy milk', '54', 'req-rev-1'))
+    t.start()
+    t.join(10)
+    assert seen == {'lane': 'revenue', 'model': 'claude-sonnet-4-5', 'current': 'revenue'}
+    # Outside the bound context the lane is not revenue.
+    assert mod.current_lane() != 'revenue'
+
+
+def test_a_turn_with_no_registered_lane_falls_back_to_the_request_id_rule(tmp_path, monkeypatch):
+    mod, _ = _install_with_rid(monkeypatch, tmp_path, 'req-plain')
+    assert mod.lane_for_request('req-plain') == ''
+    assert mod.current_lane() == 'user'
+
+
+def test_lane_registry_is_bounded_and_ignores_unknown_lanes(tmp_path, monkeypatch):
+    mod, _ = _install_with_rid(monkeypatch, tmp_path, '')
+    monkeypatch.setattr(mod, '_REQUEST_LANE_CAP', 3)
+    for i in range(5):
+        mod.register_request_lane('r%d' % i, 'revenue')
+    assert mod.lane_for_request('r0') == '' and mod.lane_for_request('r1') == ''
+    assert mod.lane_for_request('r4') == 'revenue'
+    mod.register_request_lane('r9', 'vip')
+    assert mod.lane_for_request('r9') == ''
+    mod.register_request_lane('', 'revenue')
+    assert mod.lane_for_request('') == ''
+
+
+def test_registering_again_replaces_the_lane(tmp_path, monkeypatch):
+    """The registry always takes the latest answer; WHO may register what is
+    the callers' decision (core.request_lane.register_chat_lane leaves the
+    node's own daemon turn alone).  The keep_existing flag that let /chat keep
+    a goal's revenue lane also let a stranger naming that goal's request id
+    inherit it (review of 7086adff8, finding 3), so it is gone."""
+    import inspect
+    mod, _ = _install_with_rid(monkeypatch, tmp_path, '')
+    mod.register_request_lane('daemon_goal_rev', 'revenue')
+    mod.register_request_lane('daemon_goal_rev', 'user')
+    assert mod.lane_for_request('daemon_goal_rev') == 'user'
+    assert 'keep_existing' not in inspect.signature(mod.register_request_lane).parameters
+
+
+# ─── Dollar meter from the response's usage block (any node; pricing decides) ─
+
+def _usage_response():
+    return _FakeResponse({'id': 'c', 'model': 'claude-sonnet-4-5',
+                          'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}],
+                          'usage': {'prompt_tokens': 120, 'completion_tokens': 30,
+                                    'total_tokens': 150}})
+
+
+def _install_with_usage(monkeypatch, tmp_path, tier, factory=_usage_response):
+    _reset_module(monkeypatch, tmp_path)
+    monkeypatch.setenv('HEVOLVE_NODE_TIER', tier)
+    fake_httpx = _build_fake_httpx_module(response_factory=factory)
+    monkeypatch.setitem(sys.modules, 'httpx', fake_httpx)
+    fake_tl = types.ModuleType('threadlocal')
+    fake_tl.thread_local_data = types.SimpleNamespace(get_request_id=lambda: 'req-m')
+    monkeypatch.setitem(sys.modules, 'hartos.threadlocal', fake_tl)
+    import core.llm_outbound_logger as mod
+    mod.install()
+    import integrations.agent_engine.budget_gate as bg
+    seen = []
+    monkeypatch.setattr(bg, 'meter_llm_call', lambda **kw: seen.append(kw))
+    return mod, fake_httpx, seen
+
+
+@pytest.mark.parametrize('tier', ['flat', 'regional', 'central'])
+def test_a_completed_call_is_metered_from_its_usage_block_on_any_tier(tmp_path, monkeypatch, tier):
+    """Topology agnostic: the hook hands every completed call to the ONE meter
+    (budget_gate.meter_llm_call); whether it costs anything is the meter's
+    pricing decision (local and free families price at zero), never a tier
+    branch here."""
+    mod, fake_httpx, seen = _install_with_usage(monkeypatch, tmp_path, tier)
+    request = _FakeRequest(body=json.dumps({'model': 'claude-sonnet-4-5', 'messages': []}).encode())
+    fake_httpx.Client.send(_FakeClient(), request)
+    assert seen == [{'model': 'claude-sonnet-4-5', 'tokens_in': 120, 'tokens_out': 30,
+                     'task_source': 'own'}]
+
+
+_HARTOS_HEADERS = ('X-HARTOS-Lane', 'X-HARTOS-Model', 'X-HARTOS-Model-Family',
+                   'X-HARTOS-Request-ID')
+_KONG = 'http://172.17.0.1:8100/llm/v1'
+
+
+def _claude_body():
+    return json.dumps({'model': 'claude-sonnet-4-5',
+                       'messages': [{'role': 'user', 'content': 'x'}],
+                       'tools': [{'type': 'function', 'function': {'name': 't'}}]}).encode()
+
+
+def test_the_hosted_path_stamps_and_meters_only_the_configured_endpoint(tmp_path, monkeypatch):
+    """Review of 065cef8bb, C1: on central the configured endpoint is Kong at
+    /llm/v1/..., which is NOT the local target (port or path), so every Claude
+    call took the hosted branch: no lane header for Kong's routes and no
+    metered row for the day cap.  The hosted branch now stamps and meters a
+    call to a CONFIGURED endpoint; it still never trims and never rewrites
+    the body.  Review of 8947e2753, M3: a call to any other host (a person's
+    own cloud key through some other path) stays header-for-header as it was
+    (owner rule 2026-10-06, the cloud request is unchanged)."""
+    monkeypatch.setenv('OPENAI_BASE_URL', _KONG)          # one of the three configured keys
+    monkeypatch.delenv('HEVOLVE_EXPERT_LLM_ENDPOINT_URL', raising=False)
+    mod, fake_httpx, seen = _install_with_usage(monkeypatch, tmp_path, 'central')
+    from integrations.gateway import kong_onboard as ko
+    from integrations.agent_engine import budget_gate as bg
+    body = _claude_body()
+
+    kong = _FakeRequest(body=body, url=_FakeURL(host='172.17.0.1', port=8100,
+                                                path='/llm/v1/chat/completions'))
+    fake_httpx.Client.send(_FakeClient(), kong)
+    assert kong.headers.get('X-HARTOS-Lane') == 'user'
+    assert kong.headers.get('X-HARTOS-Model') == 'claude-sonnet-4-5'
+    assert kong.headers.get('X-HARTOS-Request-ID') == 'req-m'
+    # The family header is what Kong's Claude fuse matches, by the ONE rule
+    # the dollar meter prices with: no list of model names in Kong.
+    assert kong.headers.get(ko.LLM_MODEL_FAMILY_HEADER) == ko.CAPPED_MODEL_FAMILY
+    assert ko.CAPPED_MODEL_FAMILY == bg.CAPPED_FAMILY == 'claude'
+    assert fake_httpx._captured['send_calls'][-1]['content'] == body   # untouched
+    assert seen == [{'model': 'claude-sonnet-4-5', 'tokens_in': 120, 'tokens_out': 30,
+                     'task_source': 'own'}]
+
+    # An unconfigured third-party host: no HARTOS header, no metered row.
+    direct = _FakeRequest(body=body, url=_FakeURL(host='api.anthropic.com', port=443,
+                                                  path='/v1/chat/completions'))
+    fake_httpx.Client.send(_FakeClient(), direct)
+    assert not any(h in direct.headers for h in _HARTOS_HEADERS), dict(direct.headers)
+    assert fake_httpx._captured['send_calls'][-1]['content'] == body
+    assert len(seen) == 1
+
+    # The same host becomes a configured endpoint when the owner points the
+    # expert trio at it: then it is stamped and metered like the gateway.
+    monkeypatch.setenv('HEVOLVE_EXPERT_LLM_ENDPOINT_URL', 'https://api.anthropic.com/v1')
+    monkeypatch.setenv('HEVOLVE_EXPERT_LLM_MODEL_NAME', 'claude-sonnet-4-5')
+    mod._configured_endpoints_cache = (0.0, frozenset())
+    configured = _FakeRequest(body=body, url=_FakeURL(host='api.anthropic.com', port=443,
+                                                      path='/v1/chat/completions'))
+    fake_httpx.Client.send(_FakeClient(), configured)
+    assert configured.headers.get('X-HARTOS-Lane') == 'user'
+    assert configured.headers.get(ko.LLM_MODEL_FAMILY_HEADER) == 'claude'
+    assert len(seen) == 2
+
+    # A hosted request that is not chat/completions is left alone entirely.
+    other = _FakeRequest(body=b'{"input": "x"}',
+                         url=_FakeURL(host='172.17.0.1', port=8100, path='/llm/v1/embeddings'))
+    fake_httpx.Client.send(_FakeClient(), other)
+    assert not any(h in other.headers for h in _HARTOS_HEADERS) and len(seen) == 2
+
+
+def test_the_async_hosted_path_stamps_and_meters_the_configured_endpoint_too(
+        tmp_path, monkeypatch):
+    """The AsyncClient twin of the test above (review of 8947e2753: both
+    'async path does not meter' and 'does not stamp' mutants survived)."""
+    import asyncio
+    monkeypatch.setenv('OPENAI_BASE_URL', _KONG)
+    _reset_module(monkeypatch, tmp_path)
+    monkeypatch.setenv('HEVOLVE_NODE_TIER', 'central')
+    fake_httpx = _build_fake_httpx_module(response_factory=_usage_response)
+
+    async def _async_send(self, request, **kwargs):          # answers with a usage block
+        fake_httpx._captured['send_calls'].append({'content': bytes(request._content or b''),
+                                                   'url': str(request.url)})
+        return _usage_response()
+    fake_httpx.AsyncClient.send = _async_send
+    monkeypatch.setitem(sys.modules, 'httpx', fake_httpx)
+    fake_tl = types.ModuleType('threadlocal')
+    fake_tl.thread_local_data = types.SimpleNamespace(get_request_id=lambda: 'req-m')
+    monkeypatch.setitem(sys.modules, 'hartos.threadlocal', fake_tl)
+    import core.llm_outbound_logger as mod
+    mod.install()
+    import integrations.agent_engine.budget_gate as bg
+    seen = []
+    monkeypatch.setattr(bg, 'meter_llm_call', lambda **kw: seen.append(kw))
+
+    body = _claude_body()
+    kong = _FakeRequest(body=body, url=_FakeURL(host='172.17.0.1', port=8100,
+                                                path='/llm/v1/chat/completions'))
+    asyncio.run(fake_httpx.AsyncClient().send(kong))
+    assert kong.headers.get('X-HARTOS-Lane') == 'user'
+    assert kong.headers.get('X-HARTOS-Model-Family') == 'claude'
+    assert fake_httpx._captured['send_calls'][-1]['content'] == body
+    assert seen == [{'model': 'claude-sonnet-4-5', 'tokens_in': 120, 'tokens_out': 30,
+                     'task_source': 'own'}]
+    direct = _FakeRequest(body=body, url=_FakeURL(host='api.anthropic.com', port=443,
+                                                  path='/v1/chat/completions'))
+    asyncio.run(fake_httpx.AsyncClient().send(direct))
+    assert not any(h in direct.headers for h in _HARTOS_HEADERS) and len(seen) == 1
+
+
+def test_a_failed_call_or_a_body_without_usage_is_not_metered(tmp_path, monkeypatch):
+    mod, fake_httpx, seen = _install_with_usage(
+        monkeypatch, tmp_path, 'central',
+        factory=lambda: _FakeResponse({'error': {'message': 'nope'}}, status_code=429))
+    request = _FakeRequest(body=json.dumps({'model': 'claude-sonnet-4-5', 'messages': []}).encode())
+    fake_httpx.Client.send(_FakeClient(), request)
+    assert seen == []
+    assert mod._response_usage(_FakeResponse({'choices': []})) is None
+    assert mod._response_usage(_FakeResponse({'usage': {'prompt_tokens': 0,
+                                                        'completion_tokens': 0}})) is None

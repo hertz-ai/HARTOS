@@ -9,7 +9,7 @@ Follows the exact same idempotent seed pattern as:
   - AdService.seed_placements()
 """
 import logging
-from typing import Optional
+from typing import List, Optional, Tuple
 
 logger = logging.getLogger('hevolve_social')
 
@@ -2230,9 +2230,11 @@ def enable_autonomous_marketing_consent(db) -> int:
     agent reach the public internet under the operator's identity.
 
     Idempotent: only grants where no active consent already exists, so reboots
-    don't stack audit rows. Revoke via ``POST /api/social/consent/revoke`` (or
-    ``ConsentService.revoke_consent``) to stop all autonomous external posting;
-    unsetting the flag merely stops *re-granting* — it does not revoke.
+    don't stack audit rows. The off-switch is the same flag set to 0/false/no/
+    off (``apply_autonomous_marketing_flag``, which boot calls): that revokes
+    these grants. Unsetting the flag revokes nothing, and
+    ``POST /api/social/consent/revoke`` cannot reach them (it revokes the
+    caller's own rows; nobody signs in as these system identities).
 
     Args:
         db: SQLAlchemy session (caller owns the transaction / commit).
@@ -2251,6 +2253,72 @@ def enable_autonomous_marketing_consent(db) -> int:
             logger.warning(
                 "autonomous-marketing consent grant for %s failed: %s", uid, e)
     return granted
+
+
+def disable_autonomous_marketing_consent(db) -> Tuple[int, List[str]]:
+    """End the standing ``public_exposure`` grants that
+    ``enable_autonomous_marketing_consent`` made, so the external-post gate
+    blocks again. Only identities holding an active blanket grant are revoked:
+    ``revoke_consent`` on an empty combination would record a declined ask,
+    and this runs on every boot.
+
+    Args:
+        db: SQLAlchemy session (caller owns the transaction / commit).
+    Returns:
+        (revoked, failed): the number of identities revoked this call and
+        the identities whose lookup or revoke raised (still able to post).
+    """
+    from integrations.social.consent_service import ConsentService
+    revoked, failed = 0, []
+    for uid in _AUTONOMOUS_MARKETING_IDENTITIES:
+        try:
+            if not ConsentService.active_grant(db, uid, 'public_exposure', scope='*'):
+                continue
+            ConsentService.revoke_consent(db, uid, 'public_exposure', scope='*')
+            revoked += 1
+        except Exception as e:
+            failed.append(uid)
+            logger.warning(
+                "autonomous-marketing consent revoke for %s failed: %s", uid, e)
+    if failed:
+        # An off-switch that did not switch off must not read as done.
+        logger.error("Autonomous marketing OFF requested but the revoke failed "
+                     "for %s: external posting may continue as them", failed)
+    return revoked, failed
+
+
+_AUTONOMOUS_MARKETING_FLAG = 'HEVOLVE_AUTONOMOUS_MARKETING'
+
+
+def apply_autonomous_marketing_flag(db):
+    """Apply ``HEVOLVE_AUTONOMOUS_MARKETING`` at boot: an explicit on grants,
+    an explicit off revokes, unset or unrecognised changes nothing. On/off
+    are whatever ``core.config_cache.env_flag`` says they are (the one
+    parser): on = env_flag(.., False), off = not env_flag(.., True).
+
+    The deploy writes the flag into central's .env from its repo secret on
+    every deploy (deploy/deepbox_deploy.sh), so "set the secret to 0 and
+    redeploy" is the operator's off-switch.
+
+    Returns ('granted', n), ('revoked', n) or (None, 0).
+    """
+    from core.config_cache import env_flag
+    if env_flag(_AUTONOMOUS_MARKETING_FLAG, False):
+        n = enable_autonomous_marketing_consent(db)
+        if n:
+            logger.info("Autonomous marketing enabled: granted public_exposure "
+                        "for %d system identit(ies)", n)
+        return 'granted', n
+    if not env_flag(_AUTONOMOUS_MARKETING_FLAG, True):
+        n, failed = disable_autonomous_marketing_consent(db)
+        if n:
+            logger.info("Autonomous marketing disabled: revoked public_exposure "
+                        "for %d system identit(ies)", n)
+        elif not failed:
+            logger.info("Autonomous marketing is OFF (%s): no standing grant",
+                        _AUTONOMOUS_MARKETING_FLAG)
+        return 'revoked', n
+    return None, 0
 
 
 def seed_bootstrap_goals(db, platform_product_id: Optional[str] = None) -> int:

@@ -137,5 +137,44 @@ class TextModeReplyIsStillMirrored(unittest.TestCase):
         self.assertEqual(persist.call_args.kwargs['lang'], 'ta')
 
 
+class MirroredTurnNamesItsDeviceAndAgent(unittest.TestCase):
+    """The mirrored turn carries the device it came from and the agent it was
+    for, from the /chat body.  Only caller kwargs were read, and no caller
+    passes device_id, so every row was device_id=None: a client could not
+    tell its own turns from another device's, and could not tell which
+    agent's conversation a turn belongs to on the draft-first paths."""
+
+    def _persisted(self, body, **kwargs):
+        import hart_intelligence_entry as hie
+        from integrations.social import chat_messages
+
+        with patch.object(hie, '_tts_synthesize_and_publish',
+                          lambda *a, **k: None), \
+                patch.object(chat_messages,
+                             'persist_and_publish_async') as persist:
+            with hie.app.test_request_context('/chat', json=body):
+                hie._chat_reply('t-dv-user', 't-dv-req', 'hello there',
+                                user_prompt='hi', **kwargs)
+        return [c.kwargs for c in persist.call_args_list]
+
+    def test_both_sides_carry_the_bodys_device_and_agent(self):
+        rows = self._persisted({'prompt': 'hi', 'device_id': 'dev-desk',
+                                'prompt_id': '8888'})
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({r['device_id'] for r in rows}, {'dev-desk'})
+        self.assertEqual({r['prompt_id'] for r in rows}, {'8888'})
+
+    def test_a_callers_own_values_win(self):
+        rows = self._persisted({'prompt': 'hi', 'device_id': 'dev-desk',
+                                'prompt_id': '8888'},
+                               device_id='dev-kw', prompt_id='9999')
+        self.assertEqual({r['device_id'] for r in rows}, {'dev-kw'})
+        self.assertEqual({r['prompt_id'] for r in rows}, {'9999'})
+
+    def test_a_body_without_them_records_none(self):
+        rows = self._persisted({'prompt': 'hi'})
+        self.assertEqual({r['device_id'] for r in rows}, {None})
+
+
 if __name__ == '__main__':
     unittest.main()

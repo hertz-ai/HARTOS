@@ -4,7 +4,7 @@ livekit_audio_publisher — the PUBLISH (TTS → room) half, symmetric to
 
 An ``AgentBridgeWorker`` (``agent_voice_bridge``) holds the agent's seat in a
 call.  When the agent replies, ``agentic_router`` enqueues the reply text and the
-worker drains it (Half-B of ``_tick``) → synthesizes via PocketTTS → and this
+worker drains it (Half-B of ``_tick``) → synthesizes via the TTS router → and this
 publishes the audio frames into the LiveKit room: connect as the agent
 participant, publish ONE audio track, stream PCM into it.
 

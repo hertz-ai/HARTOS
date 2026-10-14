@@ -16,7 +16,7 @@ goal is **ONE** sync registry/dispatcher/producer/transport — never a second.
 |---|---|---|
 | post/community content up-sync | `federation.sync_to_parent` → `sync_post` op → `_handle_sync_post` | C-series #146–149 |
 | public-agent up-sync | `federation.sync_agent_to_parent` → `register_agent` op → `_handle_sync_agent` | bespoke twin of the above |
-| user/profile/FCM down+up | `sync_user` op → `_handle_sync_user` (caches FCM via `store_local_fcm_token`) | bespoke again |
+| user/profile/FCM down+up | `sync_user` op → `_handle_sync_user` (the user row only; the FCM token and central-id mapping come by the person's own pull, `core.profile_sync`, never from a batch: #188) | bespoke again |
 | dispatch | `SyncEngine.receive_sync_batch` — a hand-written `if op == … elif …` ladder | every new entity adds an `elif` |
 | producer | one inline producer per entity (post create hook, register_agent hook, consent re-sync hook) | N producers, each re-deriving the gate |
 | transport | up = HTTP POST `/api/social/hierarchy/sync`; down = (none / was an IDOR pull) | direction asymmetry |

@@ -66,20 +66,49 @@ def _route_iteration_budget(route, requested):
     # multi_step, and any verdict route_task gains later: never over-cap.
     return requested
 
+def _shell_dialect_note(os_name):
+    """Which shell the `shell` action actually runs, stated to the model.
+
+    hart_intelligence_entry._handle_shell_command_tool runs cmd.exe on
+    Windows and /bin/sh elsewhere.  The action list used to promise "any
+    shell/PowerShell/bash command", so on Windows the model sent `cat`, `ls`
+    and heredocs, got "'cat' is not recognized", retried a missing program
+    under new spellings, and hit the 3-error abort (six times in one
+    measured window, 2026-09-30 10:56-11:03).
+    """
+    if os_name == 'Windows':
+        return (
+            "      On Windows, shell runs in cmd.exe: Unix tools (cat, ls, "
+            "grep, heredocs such as << 'EOF') do NOT exist. Use dir, type, "
+            "findstr, and write_file to create a file. For PowerShell, "
+            "start the command with 'powershell: '. If a program is "
+            "reported 'not recognized' it is not on PATH: do not retry "
+            "other spellings of it, report that as a blocker.\n")
+    return (
+        "      On Linux/macOS, shell runs in /bin/sh; start the command "
+        "with 'bash: ' to use bash.\n")
+
+
 # Action list — single source of truth for both the legacy SYSTEM_PROMPT
 # and the unified-mode combined_prompt. Keeping one string means the
 # legacy OmniParser path and the unified Qwen3-VL path can never drift
 # on which actions the model is allowed to emit.
+# The prompts below show the model the SHAPE of the shell/open fields with
+# these placeholders; the parser filters the same constants when a model
+# echoes them back as values (parser.is_template_echo, live 2026-10-04).
+from integrations.vlm.parser import OPEN_PATH_PLACEHOLDER, SHELL_COMMAND_PLACEHOLDER
+
 _VLM_ACTION_LIST = (
     "Available actions:\n"
     "- GUI: left_click, right_click, double_click, type, key, hotkey, hover, "
     "mouse_move, wait, scroll_up, scroll_down\n"
     "- Deterministic (PREFER these when the task is expressible as a "
     "command — they're 100x faster than GUI grounding):\n"
-    "    * shell: run any shell/PowerShell/bash command. Use for launching "
+    "    * shell: run a command in this machine's shell. Use for launching "
     "apps (command='notepad'), opening files in specific apps "
     "(command='notepad hello.txt'), running git/npm/python, file ops, etc. "
     "Put the full command in the 'command' field.\n"
+    + _shell_dialect_note(platform.system()) +
     "      REFUSED by the safety denylist, do NOT emit them: interpreter "
     "one-liners — python -c, perl -e, ruby -e, node -e, powershell -enc. "
     "For scripted work, write_file the script to disk first, then shell it "
@@ -92,8 +121,14 @@ _VLM_ACTION_LIST = (
     "the task's declared workspace. Open only the resolved path. If it is "
     "absent there, report that blocker; do not retry the same bare name or "
     "inspect a different checkout.\n"
-    "- File: list_folders_and_files, Open_file_and_copy_paste, write_file, "
-    "read_file_and_understand\n"
+    "- File (no screen needed). A relative path means the task's declared "
+    "workspace, the folder shell commands run in too:\n"
+    "    * write_file: the file's path in 'path', its full text in 'value'.\n"
+    "    * read_file_and_understand: the file's path in 'path'; its text "
+    "comes back as the result.\n"
+    "    * list_folders_and_files: the folder in 'path' (empty means the "
+    "workspace).\n"
+    "    * Open_file_and_copy_paste: 'source_path' and 'destination_path'.\n"
 )
 
 # System prompt matching OmniParser vlm_agent.py _get_system_prompt()
@@ -121,8 +156,8 @@ SYSTEM_PROMPT = (
     '    "Box ID": <element_id if clicking an element>,\n'
     '    "coordinate": [x, y],\n'
     '    "value": "text for type/hotkey actions",\n'
-    '    "command": "shell command string when Next Action is shell",\n'
-    '    "path": "file or app name when Next Action is open_file_gui",\n'
+    '    "command": "' + SHELL_COMMAND_PLACEHOLDER + '",\n'
+    '    "path": "' + OPEN_PATH_PLACEHOLDER + '",\n'
     '    "Status": "IN_PROGRESS or DONE"\n'
     '}\n'
     "\n"
@@ -182,6 +217,18 @@ def _unregister_session(user_id: str, prompt_id: str) -> None:
     key = _stop_key(user_id, prompt_id)
     with _vlm_stop_lock:
         _vlm_stop_flags.pop(key, None)
+
+
+def _background_run_must_yield() -> bool:
+    """dispatch.background_work_must_yield for the loop: a background run stops
+    between steps while the owner is using the computer (#129); a run the
+    owner asked for in chat never yields to its own owner.  Fail-open: a
+    missing gate never stops a run."""
+    try:
+        from integrations.agent_engine.dispatch import background_work_must_yield
+        return bool(background_work_must_yield())
+    except Exception:
+        return False
 
 
 def _is_stop_requested(user_id: str, prompt_id: str) -> bool:
@@ -443,7 +490,13 @@ def run_local_agentic_loop(
     prior_prompt_id = thread_local_data.get_prompt_id()
     thread_local_data.set_prompt_id(prompt_id)
     try:
-        return _drive_local_agentic_loop(message, tier, max_iterations)
+        # The run works in its declared workspace: its file actions resolve
+        # relative paths there and its shell steps run there
+        # (hartos.threadlocal workspace; actions on a worker get it through
+        # carry()).  Measured 2026-10-05: both ran in the process cwd, the
+        # install folder, while the task was told the workspace.
+        with thread_local_data.workspace(message.get('workspace_root')):
+            return _drive_local_agentic_loop(message, tier, max_iterations)
     finally:
         thread_local_data.set_prompt_id(prior_prompt_id)
 
@@ -605,6 +658,18 @@ def _drive_local_agentic_loop(
             exit_reason = 'stopped'
             break
 
+        # YIELD-TO-USER (#129): a background run stops between steps while the
+        # owner is using this computer -- the same exit the foreground-window
+        # check already takes ('user_active' -> USER_STOPPED), and the goal's
+        # next dispatch, issued once the gate is open, runs the action again.
+        if _background_run_must_yield():
+            logger.info(
+                f"VLM loop paused for the user at iteration {iteration + 1} "
+                f"(user={user_id}, prompt={prompt_id})")
+            exit_reason = 'user_active'
+            _finish_error = 'Paused: the owner is using this computer'
+            break
+
         elapsed = time.time() - start_time
         if elapsed > max_eta:
             logger.warning(f"VLM loop hit ETA limit ({max_eta}s) at iteration {iteration}")
@@ -762,11 +827,13 @@ def _drive_local_agentic_loop(
                         '  "Reasoning": "What you see and why this action",\n'
                         '  "Next Action": "left_click|right_click|double_click|'
                         'type|key|hotkey|scroll_up|scroll_down|wait|shell|'
-                        'open_file_gui|None",\n'
+                        'open_file_gui|write_file|read_file_and_understand|'
+                        'list_folders_and_files|None",\n'
                         '  "coordinate": [x, y],\n'
-                        '  "value": "text to type or key name",\n'
-                        '  "command": "shell command when Next Action is shell",\n'
-                        '  "path": "file or app name when Next Action is open_file_gui",\n'
+                        '  "value": "text to type, key name, or the file '
+                        'text for write_file",\n'
+                        '  "command": "' + SHELL_COMMAND_PLACEHOLDER + '",\n'
+                        '  "path": "' + OPEN_PATH_PLACEHOLDER + '",\n'
                         '  "Status": "IN_PROGRESS|DONE"\n'
                         "}\n\n"
                         "For click actions: provide <point>x,y</point> normalized "
@@ -934,8 +1001,14 @@ def _drive_local_agentic_loop(
                     _shown = (action_json.get('value')
                               or action_json.get('command')
                               or action_json.get('path') or '')
+                    # The path too: a write_file shows its text as the value,
+                    # and the step whose path never arrived (2026-10-05) was
+                    # unattributable from this line.
+                    _where = (f" path='{action_json.get('path')}'"
+                              if action_json.get('path')
+                              and action_json.get('path') != _shown else '')
                     logger.info(f"Action: {next_action} "
-                                f"value='{str(_shown)[:50]}'")
+                                f"value='{str(_shown)[:50]}'{_where}")
 
                 parsed = {'screen_info': '', 'parsed_content_list': []}
             else:

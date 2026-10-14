@@ -253,6 +253,9 @@ def code(ctx, task, task_type, tool, working_dir, files):
         from integrations.coding_agent.orchestrator import get_coding_orchestrator
 
         orchestrator = get_coding_orchestrator()
+        # The person at their own terminal asked for this run: no agent is
+        # asking for their computer, so the run does not ask them (it
+        # refused with 'nobody is signed in' wherever no owner was set).
         result = orchestrator.execute(
             task=task,
             task_type=task_type,
@@ -260,6 +263,7 @@ def code(ctx, task, task_type, tool, working_dir, files):
             user_id=user_id,
             model=model,
             working_dir=working_dir,
+            requested_by_person=True,
         )
 
         if json_output:
@@ -1782,7 +1786,10 @@ def pay_authorize(ctx, payment_id):
         from integrations.ap2.ap2_protocol import get_payment_ledger
 
         ledger = get_payment_ledger()
-        success = ledger.authorize_payment(payment_id, approver_id=user_id)
+        # The CLI operator is a person: 'user:' names one (a bare id is
+        # indistinguishable from the requesting agent's own id).
+        success = ledger.authorize_payment(
+            payment_id, approver_id=f'user:{user_id}')
 
         if json_output:
             click.echo(json.dumps({'success': success, 'payment_id': payment_id}))
@@ -1994,6 +2001,10 @@ def model_status(ctx):
         if active:
             click.echo(f"Active: {active.get('model', active.get('model_name', 'unknown'))} ({active.get('quant', '?')})")
             click.echo(f"  Endpoint: {active.get('endpoint', '?')}")
+        elif s.get('server_healthy') and s.get('serving_models'):
+            # Started by Nunba or hart-llm.service, not by this process.
+            click.echo(f"Serving: {', '.join(s['serving_models'])} (not started by hart)")
+            click.echo(f"  Endpoint: {s.get('llm_url', '?')}")
         else:
             click.echo("No model running")
         gpu = s.get('vram', s.get('gpu', {}))

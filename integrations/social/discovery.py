@@ -1425,8 +1425,7 @@ def _sender_signature_valid(db, data: dict, node_id=None) -> bool:
     Two policies over one verify: _verify_sync_sender layers the migration
     escape (apply unsigned/invalid under non-hard enforcement) on top of this
     for hierarchy_sync's un-upgraded senders.  A route that CREATES or
-    AUTHORIZES — /api/social/auth/sync-user (#59, an admin-takeover: a synced
-    user can be role 'central' which passes require_admin) — calls THIS
+    AUTHORIZES (admitted_peer_sender, the A2A invoke gate) calls THIS
     directly, so a soft/warn node cannot be spoofed by an unsigned or forged
     batch.  The signed/verified surface excludes only 'signature'
     (node_integrity.canonical_payload); keep the payload otherwise clean or
@@ -1492,7 +1491,7 @@ def _verify_sync_sender(db, data: dict) -> bool:
     'hard' mode requires a valid signature — fail-closed.
 
     The signature check itself is _sender_signature_valid (strict, shared with
-    the sync-user route); this function adds ONLY the migration escape."""
+    admitted_peer_sender); this function adds ONLY the migration escape."""
     if _sender_signature_valid(db, data):
         return True
     # No valid signature. Apply ONLY outside hard enforcement (migration path).

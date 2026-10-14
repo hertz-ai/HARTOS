@@ -80,6 +80,26 @@ in
     # ── Ensure systemd-resolved is the system resolver ──
     networking.nameservers = selected.addresses;
 
+    # ── Root DNSSEC trust anchors ──
+    # systemd 256's built-in anchor is the 2017 root KSK (key tag 20326) alone,
+    # and resolved implements no RFC 5011 key rollover. ICANN's root zone has
+    # been signed by the 2024 KSK (key tag 38696) since 2026-10-11. Measured on
+    # the Samsung node, generation 18, that day: from 23:16 UTC every lookup
+    # failed "DNSSEC validation failed: missing-key" (194,529 refusals in
+    # 2 h 50 min, 7.5 min of CPU in resolved; the previous boot had none), and
+    # nixos-rebuild could not resolve api.github.com, so the OTA could not
+    # start. Transport made no difference: strict DoT to Cloudflare failed the
+    # same way, because the answers were fine and the anchor was wrong. This
+    # file carries both keys so the old one keeps validating until ICANN
+    # revokes it. Values from https://data.iana.org/root-anchors/root-anchors.xml
+    # (KeyDigest ids Klajeyz and Kmyv6jo).
+    environment.etc."dnssec-trust-anchors.d/root.positive" = lib.mkIf cfg.dnssec {
+      text = ''
+        . IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D
+        . IN DS 38696 8 2 683D2D0ACB8C9B712A1948B27F741219298D0A450D612C483AF444A4C0FB2B16
+      '';
+    };
+
     # ── DoH mode: use dns-over-https-proxy ──
     systemd.services.hart-doh-proxy = lib.mkIf (cfg.mode == "doh") {
       description = "HART OS DNS-over-HTTPS Proxy";

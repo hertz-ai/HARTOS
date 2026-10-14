@@ -10,6 +10,10 @@
 #   HEVOLVE_LLM_ENDPOINT_URL HEVOLVE_LLM_MODEL_NAME HEVOLVE_LLM_API_KEY
 #   GROQ_API_KEY LANGCHAIN_API_KEY ALLOWED_HOSTS CORS_ORIGINS HART_OTA_HOST
 #   HEVOLVE_ENFORCEMENT_MODE HEVOLVE_NODE_TIER LANGCHAIN_PROJECT
+#   COMMERCE_SESSION_SECRET
+#   HEVOLVE_EXPERT_LLM_ENDPOINT_URL HEVOLVE_EXPERT_LLM_MODEL_NAME
+#   HEVOLVE_EXPERT_LLM_API_KEY HEVOLVE_CLAUDE_BUDGET_USD_DAY
+#   HEVOLVE_AUTONOMOUS_MARKETING HEVOLVE_API_KEY STRIPE_API_KEY
 #
 # Why this file exists: any `with:` value carrying a ${{ }} expression
 # compiles to ONE GitHub expression, hard-capped at 21,000 chars of the
@@ -23,11 +27,14 @@ echo "=== Ensure .env exists ==="
 # Create ONLY when absent. An existing .env is the node's live
 # configuration and may carry values this workflow does not know,
 # so it is never rewritten -- the reset above leaves it alone
-# because .env is untracked. The two exceptions are the keys the
-# workflow itself owns, ensured further down on every deploy: the
-# OTA host and the configured LLM trio. On a rebuilt or fresh box there was
-# previously nothing to recreate it from, which meant the LLM
-# routing existed solely on one machine and would have been lost.
+# because .env is untracked. The exceptions are the keys the workflow
+# itself owns, ensured further down on every deploy: the OTA host, the
+# configured LLM trio, the McGroce session secret and the owner-set keys
+# (expert tier, Claude budget, autonomous marketing, the node's API key,
+# the Stripe key).
+# On a rebuilt or fresh box there was previously nothing to recreate
+# it from, which meant the LLM routing existed solely on one machine
+# and would have been lost.
 #
 # Everything written here is either non-secret or a placeholder.
 # HARTOS holds no provider credential in this arrangement: it
@@ -123,6 +130,18 @@ else
   fi
 fi
 
+# ── _env_append: the ONE way a line is added to a live .env ──
+# A file whose last line has no newline would otherwise get the new line
+# glued onto it: `LAST=xNEW=y` sets neither key and puts NEW's value inside
+# LAST's (measured on the old `echo >> .env` appends, review of 5100ca104).
+# A file that already ends in a newline gets no blank line.
+_env_append() {   # $1 the whole KEY=value line
+  if [ -s .env ] && [ -n "$(tail -c 1 .env)" ]; then
+    echo >> .env
+  fi
+  echo "$1" >> .env
+}
+
 # ── The OTA host, guaranteed on EVERY deploy (not just a fresh box) ──
 # The block above writes .env only when it is ABSENT, which is the
 # right rule (a live .env carries values this workflow does not
@@ -145,7 +164,7 @@ fi
 _OTA_HOST="${HART_OTA_HOST:-etime.hertzai.com}"
 if [ -n "$_OTA_HOST" ] && [ -f .env ]; then
   if ! grep -q '^ALLOWED_HOSTS=' .env; then
-    echo "ALLOWED_HOSTS=$_OTA_HOST" >> .env
+    _env_append "ALLOWED_HOSTS=$_OTA_HOST"
     echo "  ALLOWED_HOSTS absent — created it with $_OTA_HOST"
   else
     _CUR="$(grep -E '^ALLOWED_HOSTS=' .env | head -1 | cut -d= -f2-)"
@@ -161,6 +180,20 @@ if [ -n "$_OTA_HOST" ] && [ -f .env ]; then
   fi
 fi
 
+# ── _set_env_key: how a deploy sets ONE key in a live .env ──
+# Defined unconditionally, before every block that calls it: the LLM
+# trio and the McGroce secret below are independent, so neither may
+# depend on the other's secrets being present to have the helper.
+_set_env_key() {   # $1 key, $2 value: replace the line or append it
+  if grep -q "^$1=" .env; then
+    # a key may carry sed's replacement metacharacters; neutralise them
+    _v="$(printf '%s' "$2" | sed -e 's/[\\&|]/\\&/g')"
+    sed -i "s|^$1=.*|$1=$_v|" .env
+  else
+    _env_append "$1=$2"
+  fi
+}
+
 # ── The configured LLM, guaranteed on EVERY deploy ──
 # Same lesson as the OTA host above: the create-block is skipped on
 # every box that already has a .env, so central kept the model name
@@ -172,15 +205,6 @@ fi
 # .env follows it, key by key, idempotently. Without the secrets the
 # file is left exactly as it is (the additive contract above).
 if [ -n "$_LLM_MODEL" ] && [ -f .env ]; then
-  _set_env_key() {   # $1 key, $2 value: replace the line or append it
-    if grep -q "^$1=" .env; then
-      # a key may carry sed's replacement metacharacters; neutralise them
-      _v="$(printf '%s' "$2" | sed -e 's/[\\&|]/\\&/g')"
-      sed -i "s|^$1=.*|$1=$_v|" .env
-    else
-      echo "$1=$2" >> .env
-    fi
-  }
   _set_env_key HEVOLVE_LLM_ENDPOINT_URL "$_LLM_ENDPOINT"
   _set_env_key HEVOLVE_LLM_MODEL_NAME "$_LLM_MODEL"
   _set_env_key OPENAI_MODEL "$_LLM_MODEL"
@@ -189,6 +213,53 @@ if [ -n "$_LLM_MODEL" ] && [ -f .env ]; then
   fi
   echo "  configured LLM: $_LLM_MODEL at $_LLM_ENDPOINT (key $([ -n "$_LLM_KEY" ] && echo from secret || echo unchanged))"
 fi
+
+# ── The McGroce session secret, guaranteed on EVERY deploy ──
+# Same reason as the blocks above: the create-block never runs on a box that
+# already has a .env, so a secret added to the repo later would reach this
+# script and stop. McGroce's Tomcat presents the same value as
+# X-Commerce-Secret (integrations/commerce/commerce_api.py); while the
+# container has none (environment first, then config.json: core/config_cache)
+# POST /api/commerce/session answers 503. An absent secret leaves .env alone,
+# and the log says which of the two states that leaves the box in.
+if [ -n "${COMMERCE_SESSION_SECRET}" ] && [ -f .env ]; then
+  _set_env_key COMMERCE_SESSION_SECRET "$COMMERCE_SESSION_SECRET"
+  echo "  COMMERCE_SESSION_SECRET set from the secret (value not shown)"
+elif [ -z "${COMMERCE_SESSION_SECRET}" ]; then
+  # `=.`: an empty value is no secret (config_cache.get_secret treats '' as
+  # unset), so it is reported as absent, not kept.
+  if [ -f .env ] && grep -q '^COMMERCE_SESSION_SECRET=.' .env; then
+    echo "  COMMERCE_SESSION_SECRET secret absent — .env keeps its existing value (not shown)"
+  else
+    echo "  note: COMMERCE_SESSION_SECRET secret absent and not in .env — /api/commerce/session answers 503 unless config.json carries it"
+  fi
+fi
+
+# ── Owner-set keys, each guaranteed on EVERY deploy its secret is set ──
+# The configured expert tier (core.autogen_config: endpoint, model, key), its
+# day budget (budget_gate), the autonomous-marketing switch (goal_seeding: it
+# grants the public_exposure consent at boot, i.e. lets the marketing agent
+# post publicly under the operator's identity), and the node's own API key
+# (a full credential: security/middleware.py accepts it as X-API-Key on the
+# admin paths and on every network-protected path, and internal calls to
+# /chat carry it), and the Stripe key (integrations/ap2/ap2_protocol.py
+# registers the Stripe gateway at boot only when it is set; without it the
+# paid-tier checkout answers 503 and no payment can be taken). Same rule as the McGroce secret: written key by key only
+# when its secret is non-empty, the value never logged, and an absent secret
+# leaves .env as it is. So deleting a repo secret changes nothing on the box,
+# and editing .env while the secret is still set is undone by the next
+# deploy: to remove a key, delete the secret FIRST, then the .env line. To
+# turn marketing OFF, set its secret to 0 and redeploy: boot revokes the
+# standing consent on 0/false/no/off (goal_seeding.
+# apply_autonomous_marketing_flag); removing the flag alone revokes nothing.
+for _k in HEVOLVE_EXPERT_LLM_ENDPOINT_URL HEVOLVE_EXPERT_LLM_MODEL_NAME \
+          HEVOLVE_EXPERT_LLM_API_KEY HEVOLVE_CLAUDE_BUDGET_USD_DAY \
+          HEVOLVE_AUTONOMOUS_MARKETING HEVOLVE_API_KEY STRIPE_API_KEY; do
+  if [ -n "${!_k}" ] && [ -f .env ]; then
+    _set_env_key "$_k" "${!_k}"
+    echo "  $_k set from the secret (value not shown)"
+  fi
+done
 
 DEPLOY_COMMIT="$(git rev-parse HEAD)"
 DEPLOY_COMMIT_SHORT="$(git rev-parse --short HEAD)"

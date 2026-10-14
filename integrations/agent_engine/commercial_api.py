@@ -11,6 +11,7 @@ Blueprint Pattern: Blueprint('commercial_api', __name__).
 import hashlib
 import hmac
 import logging
+import os
 import secrets
 import time
 from datetime import datetime, timedelta
@@ -38,6 +39,36 @@ TIER_CONFIG = {
     'enterprise': {'rate_limit_per_day': 100000, 'monthly_quota': 10000000, 'priority': 'critical',
                    'monthly_price_usd': 499.0,    'description': 'For scale. Dedicated hive lane + SLA.'},
 }
+
+# The tiers a person may issue to themselves.  Every other tier is BOUGHT
+# through the upgrade routes (AP2 ledger, Stripe, PhonePe), never self-issued:
+# before this, POST /keys passed the body's tier straight through, so any
+# signed-in person could mint a pro key with pro quotas for nothing, and with
+# the lanes (owner policy 2026-10-12) a paid-tier key runs on the revenue lane
+# where the Claude expert serves.  Operators (holds_central_role) may still
+# issue a paid key by hand.
+SELF_ISSUABLE_TIERS = frozenset(t for t, c in TIER_CONFIG.items() if not c['monthly_price_usd'])
+
+
+def _invalid_tier_error(tier) -> str:
+    """The ONE wording for a tier that is not in the table (service and route)."""
+    return f'Invalid tier: {tier}. Valid: {list(TIER_CONFIG.keys())}'
+
+
+def _mock_payments_allowed(user) -> bool:
+    """May this caller's tier upgrade be settled by the MockPaymentGateway?
+
+    The mock authorizes any payment_method string, so for a paying customer
+    it is a free tier (review of 0cf610371: a plain user named
+    ``gateway: mock``, or hit a node without Stripe, and got enterprise for
+    nothing, with the $499 recorded in the ledger as paid).  Only an operator
+    (integrations.social.auth.holds_central_role) or a node in the existing
+    dev mode (HEVOLVE_DEV_MODE=true, which central forces to false at boot)
+    may settle through the mock.
+    """
+    from integrations.social.auth import holds_central_role
+    from security.master_key import is_dev_mode     # the ONE dev-mode switch
+    return holds_central_role(user) or is_dev_mode()
 
 COST_PER_1K_TOKENS = {
     'free': 0.0,
@@ -82,7 +113,7 @@ class CommercialAPIService:
         from integrations.social.models import CommercialAPIKey
 
         if tier not in TIER_CONFIG:
-            return {'error': f'Invalid tier: {tier}. Valid: {list(TIER_CONFIG.keys())}'}
+            return {'error': _invalid_tier_error(tier)}
 
         raw_key = secrets.token_urlsafe(48)
         key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
@@ -474,7 +505,9 @@ def _metered_backend_chat(prompt: str, prompt_id: str):
     work, so inheriting that gate would trade this bug for a worse one.  What
     is shared with the other callers is the credential helper itself.
     """
+    import uuid as _uuid
     from core.http_pool import pooled_post
+    from core.llm_outbound_logger import LANE_REVENUE, LANE_USER
     from integrations.agent_engine.dispatch import _internal_auth_headers
 
     try:
@@ -485,6 +518,19 @@ def _metered_backend_chat(prompt: str, prompt_id: str):
                 'prompt_id': prompt_id,
                 'prompt': prompt,
                 'create_agent': False,
+                # A paying customer's call is a genuine turn, never background:
+                # a request id of its own (unique per call, so two calls in the
+                # same second cannot share a lane entry) makes /chat and the
+                # wire treat it so (core.chat_client: a missing id reads as
+                # background), and keys the lane below.
+                'request_id': 'api_%d_%s' % (int(time.time()), _uuid.uuid4().hex[:8]),
+                # Owner policy 2026-10-12: a paying tier's turn is revenue-
+                # bearing (may use the expert model, never throttled); the
+                # free tier runs on the free model like any person's turn.
+                # /chat believes this field only from the node itself: the
+                # key or the system JWT _internal_auth_headers sends
+                # (core.request_lane.is_internal_caller).
+                'lane': LANE_REVENUE if (g.api_key.get('tier') or 'free') != 'free' else LANE_USER,
             },
             headers=_internal_auth_headers(),
             timeout=120)
@@ -692,10 +738,26 @@ def create_key():
 
     try:
         data = request.get_json() or {}
+        raw_tier = data.get('tier')
+        if raw_tier in (None, ''):
+            raw_tier = 'free'
+        if not isinstance(raw_tier, str):
+            return jsonify({'success': False, 'error': _invalid_tier_error(raw_tier)}), 400
+        tier = raw_tier.strip().lower()
+        if tier not in TIER_CONFIG:
+            return jsonify({'success': False, 'error': _invalid_tier_error(tier)}), 400
+        if tier not in SELF_ISSUABLE_TIERS:
+            from integrations.social.auth import holds_central_role
+            if not holds_central_role(user):
+                return jsonify({
+                    'success': False,
+                    'error': (f"Tier '{tier}' is bought, not issued: create a free key, then "
+                              f"POST /api/v1/intelligence/keys/<key_id>/upgrade"),
+                }), 400
         result = CommercialAPIService.create_api_key(
             db, str(user.id),
             name=data.get('name', ''),
-            tier=data.get('tier', 'free'),
+            tier=tier,
         )
         if 'error' in result:
             return jsonify({'success': False, 'error': result['error']}), 400
@@ -865,7 +927,7 @@ def upgrade_key(key_id):
         if not payment_method:
             return jsonify({
                 'success': False,
-                'error': 'payment_method required (card token, AP2 method id, or mock id)',
+                'error': 'payment_method required (card token or AP2 method id)',
             }), 400
 
         # Look up the API key being upgraded — must belong to this user.
@@ -878,9 +940,9 @@ def upgrade_key(key_id):
         target_cfg = TIER_CONFIG[target_tier]
         amount_usd = float(target_cfg['monthly_price_usd'])
 
-        # Route through AP2's PaymentLedger.  Falls back to MockPaymentGateway
-        # by default (registered in PaymentLedger.__init__); real connectors
-        # can be added via payment_ledger.add_gateway() at app start.
+        # Route through AP2's PaymentLedger, which registers Stripe and
+        # PhonePe at boot from their env keys; the gateway for this call is
+        # chosen below, and the mock settles nothing for a customer.
         try:
             from decimal import Decimal as _Decimal
             from integrations.ap2 import payment_ledger, PaymentMethod, PaymentStatus
@@ -890,12 +952,14 @@ def upgrade_key(key_id):
                 'error': f'AP2 payment surface unavailable: {_imp_err}',
             }), 503
 
-        # Pick the live gateway for the SYNCHRONOUS upgrade flow.
-        # Preference order:
-        #   1. Caller-requested gateway via `data['gateway']` (when registered
-        #      AND known to be synchronous — currently Stripe and Mock).
-        #   2. Stripe (USD/international cards, synchronous capture).
-        #   3. MockPaymentGateway (dev/test fallback).
+        # The gateway for the SYNCHRONOUS upgrade flow is the ledger's own
+        # choice for USD (PaymentLedger.select_gateway: Stripe when it is
+        # registered, else Mock).  The caller never picks it: a caller-named
+        # ``gateway: mock`` let a plain user settle a $499 tier through the
+        # MockPaymentGateway, which authorizes any payment_method string
+        # (review of 0cf610371, measured on the real route).  A Mock result
+        # is a paid tier for nothing, so it is refused unless the caller is an
+        # operator or the node is in dev mode (_mock_payments_allowed).
         #
         # PhonePe is intentionally NOT selected here even when registered —
         # it is a redirect-then-webhook flow.  Selecting it synchronously
@@ -905,35 +969,29 @@ def upgrade_key(key_id):
         # — to be added when the webhook handler is wired — can use it
         # without further code changes.  Until then, requests for
         # `gateway: 'phonepe'` are rejected with 501.
+        requested = str(data.get('gateway') or '').strip().lower()
+        if requested == 'phonepe':
+            return jsonify({
+                'success': False,
+                'error': 'PhonePe upgrades require the async redirect '
+                         'flow — not yet exposed on /upgrade.  Use '
+                         'Stripe (set STRIPE_API_KEY).',
+            }), 501
         try:
             from integrations.ap2 import PaymentGateway as _PG
-            requested = (data.get('gateway') or '').strip().lower()
-
-            _SYNC_OK = {_PG.STRIPE, _PG.MOCK}
-
-            if requested == 'phonepe':
-                return jsonify({
-                    'success': False,
-                    'error': 'PhonePe upgrades require the async redirect '
-                             'flow — not yet exposed on /upgrade.  Use '
-                             'Stripe (set STRIPE_API_KEY) or the dev mock.',
-                }), 501
-
-            _gateway_choice = None
-            if requested:
-                try:
-                    pg = _PG(requested)
-                    if pg in payment_ledger.gateways and pg in _SYNC_OK:
-                        _gateway_choice = pg
-                except ValueError:
-                    pass
-            if _gateway_choice is None:
-                _gateway_choice = (
-                    _PG.STRIPE if _PG.STRIPE in payment_ledger.gateways
-                    else _PG.MOCK
-                )
-        except Exception:
-            _gateway_choice = None  # PaymentLedger will pick a default
+            _gateway_choice = payment_ledger.select_gateway('USD')
+        except Exception as _sel_err:
+            return jsonify({
+                'success': False,
+                'error': f'No payment gateway could be selected: {_sel_err}',
+            }), 503
+        if _gateway_choice == _PG.MOCK and not _mock_payments_allowed(user):
+            return jsonify({
+                'success': False,
+                'error': 'No live USD payment gateway (Stripe) is configured on '
+                         'this node (set STRIPE_API_KEY); the dev mock settles '
+                         'nothing.',
+            }), 503
 
         # Three-step AP2 flow.  We do all synchronously here for the simple
         # upgrade case; long-lived subscriptions would split across webhooks.
@@ -951,8 +1009,7 @@ def upgrade_key(key_id):
                     'payment_method_token': payment_method,
                 },
             )
-            if _gateway_choice is not None:
-                _create_kwargs['gateway'] = _gateway_choice
+            _create_kwargs['gateway'] = _gateway_choice
             payment_req = payment_ledger.create_payment_request(**_create_kwargs)
             authorized = payment_ledger.authorize_payment(
                 payment_req.payment_id, approver_id=f'user:{user.id}')
@@ -1236,12 +1293,8 @@ def phonepe_callback():
         logger.warning("PhonePe callback: payload missing merchantTransactionId")
         return jsonify({'success': False, 'error': 'Missing merchantTransactionId'}), 400
 
-    # Recover our payment record by gateway_transaction_id.
-    payment_req = None
-    for p in payment_ledger.payments.values():
-        if p.gateway_transaction_id == merchant_txn_id:
-            payment_req = p
-            break
+    # Recover our payment record by gateway_transaction_id (under the lock).
+    payment_req = payment_ledger.find_by_gateway_transaction(merchant_txn_id)
     if payment_req is None:
         logger.warning(f"PhonePe callback: no payment found for txn {merchant_txn_id}")
         # Don't 5xx — PhonePe would retry forever.  Return 200 with success=False.
@@ -1267,6 +1320,20 @@ def phonepe_callback():
     # Defense in depth: re-query PhonePe status, never trust webhook body alone.
     status_result = gateway.capture_payment(
         payment_req.payment_id, payment_req.gateway_transaction_id)
+    if not status_result.get('success') and 'status' not in status_result:
+        # The status API could not be asked (network, timeout): that says
+        # nothing about the money.  Leave the payment PROCESSING and answer
+        # non-2xx so PhonePe delivers the callback again.
+        logger.warning(f"PhonePe callback: status check for "
+                       f"{payment_req.payment_id} failed, will retry: "
+                       f"{status_result.get('error')}")
+        return jsonify({'success': False, 'status': 'status_check_failed',
+                        'payment_request_id': payment_req.payment_id}), 503
+    if not status_result.get('success') and             status_result.get('status') == 'PAYMENT_PENDING':
+        # Not decided yet: the buyer's bank has not answered.  PhonePe sends
+        # the final callback when it does; the payment stays PROCESSING.
+        return jsonify({'success': False, 'status': 'pending',
+                        'payment_request_id': payment_req.payment_id}), 200
     if not status_result.get('success'):
         payment_req.update_status(
             PaymentStatus.FAILED,
@@ -1279,8 +1346,76 @@ def phonepe_callback():
             'payment_request_id': payment_req.payment_id,
         }), 200
 
-    # Status check confirmed PAYMENT_SUCCESS — finalize.
+    # Status check confirmed PAYMENT_SUCCESS.  The amount PhonePe took must be
+    # the amount this payment asked for (when the status API reports one).
+    _gw_data = (status_result.get('gateway_response') or {}).get('data') or {}
+    if _gw_data.get('amount') is not None:
+        try:
+            _paid = int(_gw_data['amount'])
+            _expected = gateway._to_paise(payment_req)
+        except (TypeError, ValueError):
+            _paid, _expected = None, None
+        if _paid is None or _paid != _expected:
+            logger.error(f"MANUAL RECONCILIATION NEEDED: PhonePe captured "
+                         f"{_gw_data.get('amount')} paise for "
+                         f"{payment_req.payment_id}, which expected "
+                         f"{_expected}; not finalized")
+            payment_req.update_status(
+                PaymentStatus.FAILED,
+                f"amount mismatch: captured {_gw_data.get('amount')} paise, "
+                f"expected {_expected}")
+            payment_ledger.save_ledger()
+            return jsonify({'success': False, 'status': 'amount_mismatch',
+                            'payment_request_id': payment_req.payment_id}), 200
+
+    # Finalize.
     meta = payment_req.metadata or {}
+
+    # Not every AP2 PhonePe payment is a tier upgrade: an agent's
+    # request_payment and a McGroce cart mandate route INR to PhonePe too
+    # (PaymentLedger.select_gateway).  The money is confirmed above, so
+    # such a payment COMPLETES here -- the tier-upgrade metadata check
+    # below would otherwise mark a captured payment FAILED.  A commerce
+    # checkout then places its McGroce order (integrations/commerce).
+    if meta.get('kind') != 'tier_upgrade':
+        # Only the delivery that completes the payment places the order: two
+        # concurrent callbacks both pass the COMPLETED check above.
+        if not payment_ledger.complete_once(
+                payment_req.payment_id, 'PhonePe payment captured via callback'):
+            return jsonify({
+                'success': True,
+                'status': 'already_completed',
+                'payment_request_id': payment_req.payment_id,
+            }), 200
+        order = None
+        if meta.get('mandate_id') and meta.get('kind') != 'commerce_checkout':
+            # A generic mandate has no order step to consume it; the money is
+            # taken, so it is used (a commerce checkout is consumed when its
+            # order is placed).
+            try:
+                from integrations.ap2.ap2_mandate import get_mandate_store
+                get_mandate_store().consume(meta['mandate_id'])
+            except Exception as e:
+                logger.warning(f"PhonePe callback: could not consume mandate "
+                               f"{meta.get('mandate_id')}: {e}")
+        if meta.get('kind') == 'commerce_checkout':
+            try:
+                from integrations.commerce.commerce_tools import (
+                    complete_redirect_checkout)
+                order = complete_redirect_checkout(payment_req.payment_id)
+            except Exception:
+                logger.exception(
+                    "MANUAL RECONCILIATION NEEDED: PhonePe payment "
+                    f"{payment_req.payment_id} captured but the commerce "
+                    "order step raised")
+        return jsonify({
+            'success': True,
+            'status': 'completed',
+            'payment_request_id': payment_req.payment_id,
+            'kind': meta.get('kind'),
+            'order': order,
+        }), 200
+
     api_key_id = meta.get('api_key_id')
     target_tier = meta.get('target_tier')
 
@@ -1442,9 +1577,9 @@ def create_upgrade_checkout(key_id):
                 or stripe_gw._stripe is None:
             return jsonify({
                 'success': False,
-                'error': 'Stripe gateway not registered.  Set STRIPE_API_KEY '
-                         'on the central deploy and restart (see '
-                         'deploy/go_live_stripe.md Step 4).',
+                'error': 'Card checkout (Stripe) is not configured on this node '
+                         '(set STRIPE_API_KEY; on central it is a repo secret, '
+                         'see deploy/go_live_stripe.md Step 4).',
             }), 503
 
         try:

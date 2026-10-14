@@ -18,7 +18,7 @@ from datetime import datetime
 logger = logging.getLogger('hevolve_social')
 
 
-_HARTOS_HANDLER_TAG = '_hartos_root_handler'  # same tag hart_intelligence_entry uses
+from core.log_handlers import HARTOS_HANDLER_TAG as _HARTOS_HANDLER_TAG  # one tag, one rule
 
 
 def _give_the_journal_a_root_handler(root=None):
@@ -35,18 +35,11 @@ def _give_the_journal_a_root_handler(root=None):
     that already configured root (Nunba, pytest) is left exactly as found.
     Returns the handler it attached, or None.
     """
-    root = root if root is not None else logging.getLogger()
-    if root.handlers:
-        return None
-    import sys as _sys
-    h = logging.StreamHandler(_sys.stdout)
-    h.setFormatter(logging.Formatter(
-        '%(asctime)s - %(name)s - [%(threadName)s] - %(levelname)s - %(message)s'))
-    setattr(h, _HARTOS_HANDLER_TAG, True)
-    root.addHandler(h)
-    if root.level == logging.NOTSET or root.level > logging.INFO:
-        root.setLevel(logging.INFO)
-    return h
+    # The rule itself lives in core.log_handlers, shared with
+    # hart_intelligence_entry; this is the daemon's call site, kept so
+    # run_forever reads as it did and the measurement above stays with it.
+    from core.log_handlers import install_console_handler_if_bare
+    return install_console_handler_if_bare(root)
 
 # Lock protecting module-level mutable state accessed from daemon thread + API threads
 _module_lock = threading.Lock()
@@ -161,11 +154,8 @@ def _idle_only_blocked(cfg) -> bool:
     """
     if not (cfg or {}).get('idle_only', False):
         return False
-    try:
-        from core.resource_governor import get_governor, MODE_IDLE
-        return get_governor().get_mode() != MODE_IDLE
-    except Exception:
-        return True
+    from .dispatch import machine_is_idle
+    return not machine_is_idle()
 
 
 def _get_blocked_hitl_tasks(ledger, goal_id):
@@ -384,7 +374,8 @@ def _settle_expert_turn(db, goal, served) -> bool:
     return True
 
 
-def _settle_dispatched_goal(db, goal, goal_key, served_escalation=None):
+def _settle_dispatched_goal(db, goal, goal_key, served_escalation=None,
+                            handed_to_hive=False):
     """The ONE completion gate every dispatched goal must pass through.
 
     Dispatch-style-independent by construction: it re-reads the goal from
@@ -414,6 +405,19 @@ def _settle_dispatched_goal(db, goal, goal_key, served_escalation=None):
                               strike, bounded by HEVOLVE_GOAL_VERIFY_TIMEOUT_S
       noop                  — no new spark at all; unchanged 5-strike pause
     Continuous goals still never auto-complete.
+
+    ``handed_to_hive`` (dispatch.handed_to_hive): the dispatch gave the goal
+    to the coordinator, so it returned before any work existed and "this
+    dispatch spent no spark" says nothing.  Judged by the hive run instead:
+    while the run holds work the goal is awaiting_verification (no noop
+    strike, the same timeout bound); once every task is done it completes on
+    the spark charged since the handoff, which charge_goal_work_completed
+    adds when the worker's flow completes, i.e. between two ticks and after
+    the tick's own spark_at_dispatch snapshot.  spark_at_handoff keeps the
+    figure from the handoff and marks the run as waiting to be settled.
+    Measured on the owner's desktop 2026-10-10: 21 seed goals were paused
+    with "5 dispatches produced 0 spark" because every handoff, returned
+    instantly, was judged as a turn that had done nothing.
     """
     # MERGE, never blind-write, the config this tick staged before the
     # dispatch.  The tick copied config_json and added spark_at_dispatch
@@ -467,11 +471,12 @@ def _settle_dispatched_goal(db, goal, goal_key, served_escalation=None):
     # A turn handed to the expert settles that action first (#106d).
     if served_escalation and _settle_expert_turn(db, goal, served_escalation):
         return
-    # COPY, never mutate-in-place.  config_json is a plain JSON column, not a
-    # MutableDict: mutating the dict the attribute already holds and assigning
-    # that same object back compares equal at flush time, so the column is
-    # never written.  Every marker this gate records -- completion_grounding,
-    # noop_dispatch_count, awaiting_verification -- was lost that way.
+    # COPY, never mutate-in-place.  The model's column is
+    # MutableDict.as_mutable(JSON) (_models_local.py), which tracks in-place
+    # changes, but this gate is also handed goals whose config_json is a plain
+    # dict (tests, other callers' stand-ins), where mutating the dict the
+    # attribute already holds and assigning that same object back is no
+    # change at all.  A new dict is written under every column type.
     cfg = dict(goal.config_json or {})
     is_continuous = cfg.get('continuous', False)
     spark_spent = goal.spark_spent or 0
@@ -493,58 +498,87 @@ def _settle_dispatched_goal(db, goal, goal_key, served_escalation=None):
     if is_continuous:
         # Continuous goals never auto-complete; cooldown gate
         # higher up already prevents re-dispatch storms.
-        pass
+        return
+    # goal_key IS str(goal.id) at every call site, and it is the same string
+    # dispatch_goal_distributed submits as the coordinator goal id.  Using it
+    # keeps this gate judging its own arguments rather than reaching into the
+    # ORM object.
+    if handed_to_hive:
+        grounded = _goal_ledger_grounding(goal_key)
+        base = cfg.get('spark_at_handoff')
+        if base is None:
+            base = spark_spent if spark_at_dispatch is None else spark_at_dispatch
+        earned = spark_spent - int(base or 0)
+        if grounded is False:
+            cfg['spark_at_handoff'] = int(base or 0)
+            outcome = 'awaiting'
+        elif grounded and earned > 0:
+            outcome = 'completed'
+        else:
+            # Finished with nothing charged, or no task set at all: this run
+            # did no work.  Its marks go, so the next dispatch starts afresh.
+            cfg.pop('spark_at_handoff', None)
+            cfg.pop('awaiting_verification_since', None)
+            outcome = 'noop'
     elif spark_this_dispatch > 0:
         # Work cost something this time round. Now: did it LAND?
-        # goal_key IS str(goal.id) at the only call site, and it is the
-        # same string dispatch_goal_distributed submits as the coordinator
-        # goal id.  Using it keeps this gate judging its own arguments
-        # rather than reaching into the ORM object.
         grounded = _goal_ledger_grounding(goal_key)
-        if grounded is False:
-            # In flight. Not a noop — do not touch the noop counter, and do
-            # not re-spin the goal — but do not sit here silently forever
-            # either: the pause below is the bound.
-            since = cfg.get('awaiting_verification_since')
-            if not since:
-                since = datetime.utcnow().isoformat()
-                cfg['awaiting_verification_since'] = since
-            cfg['last_verification_check'] = datetime.utcnow().isoformat()
-            waited = _seconds_since_iso(since)
-            timeout_s = int(os.environ.get(
-                'HEVOLVE_GOAL_VERIFY_TIMEOUT_S', '1800'))
-            if waited is not None and waited > timeout_s:
-                goal.status = 'paused'
-                cfg['pause_reason'] = (
-                    f'Auto-paused: work was dispatched and spark was spent, '
-                    f'but the ledger never reported every task done after '
-                    f'{int(waited)}s.  Check the distributed worker on this '
-                    f'node before resuming.')
-                cfg['paused_at'] = datetime.utcnow().isoformat()
-                logger.warning(
-                    f"Goal {goal_key} AUTO-PAUSED after {int(waited)}s "
-                    f"awaiting ledger grounding")
-            else:
-                logger.info(
-                    f"Goal {goal_key} awaiting verification "
-                    f"(spark_this_dispatch={spark_this_dispatch}, "
-                    f"ledger tasks outstanding)")
-            goal.config_json = cfg
-        else:
-            # grounded is True (every ledger task done) or None (no ledger
-            # entry for this goal — a purely local dispatch, where spend on
-            # this dispatch is the only evidence that exists).
-            goal.status = 'completed'
-            cfg['completed_at'] = datetime.utcnow().isoformat()
-            cfg['completion_grounding'] = (
-                'ledger_tasks_complete' if grounded else 'local_dispatch_spend')
-            cfg.pop('noop_dispatch_count', None)
+        outcome = 'awaiting' if grounded is False else 'completed'
+    else:
+        outcome = 'noop'
+    if outcome == 'awaiting':
+        # In flight. Not a noop — do not touch the noop counter, and do
+        # not re-spin the goal — but do not sit here silently forever
+        # either: the pause below is the bound.
+        since = cfg.get('awaiting_verification_since')
+        if not since:
+            since = datetime.utcnow().isoformat()
+            cfg['awaiting_verification_since'] = since
+        cfg['last_verification_check'] = datetime.utcnow().isoformat()
+        waited = _seconds_since_iso(since)
+        timeout_s = int(os.environ.get(
+            'HEVOLVE_GOAL_VERIFY_TIMEOUT_S', '1800'))
+        if waited is not None and waited > timeout_s:
+            goal.status = 'paused'
+            cfg['pause_reason'] = (
+                f'Auto-paused: '
+                + ('work was handed to the hive'
+                   if handed_to_hive else
+                   'work was dispatched and spark was spent')
+                + f', but the ledger never reported every task done after '
+                f'{int(waited)}s.  Check the distributed worker on this '
+                f'node before resuming.')
+            cfg['paused_at'] = datetime.utcnow().isoformat()
+            # The wait ends with the pause.  Left in place, the mark made
+            # a resumed goal's first settle read the old wait as expired
+            # and pause it again on the spot.
             cfg.pop('awaiting_verification_since', None)
-            goal.config_json = cfg
+            cfg.pop('spark_at_handoff', None)
+            logger.warning(
+                f"Goal {goal_key} AUTO-PAUSED after {int(waited)}s "
+                f"awaiting ledger grounding")
+        else:
             logger.info(
-                f"Goal {goal_key} COMPLETED "
+                f"Goal {goal_key} awaiting verification "
                 f"(spark_this_dispatch={spark_this_dispatch}, "
-                f"grounding={cfg['completion_grounding']})")
+                f"ledger tasks outstanding)")
+        goal.config_json = cfg
+    elif outcome == 'completed':
+        # grounded is True (every ledger task done) or None (no ledger
+        # entry for this goal — a purely local dispatch, where spend on
+        # this dispatch is the only evidence that exists).
+        goal.status = 'completed'
+        cfg['completed_at'] = datetime.utcnow().isoformat()
+        cfg['completion_grounding'] = (
+            'ledger_tasks_complete' if grounded else 'local_dispatch_spend')
+        cfg.pop('noop_dispatch_count', None)
+        cfg.pop('awaiting_verification_since', None)
+        cfg.pop('spark_at_handoff', None)
+        goal.config_json = cfg
+        logger.info(
+            f"Goal {goal_key} COMPLETED "
+            f"(spark_this_dispatch={spark_this_dispatch}, "
+            f"grounding={cfg['completion_grounding']})")
     else:
         # Dispatched but zero real work — track and back off.
         noop_count = int(cfg.get('noop_dispatch_count', 0)) + 1
@@ -563,9 +597,45 @@ def _settle_dispatched_goal(db, goal, goal_key, served_escalation=None):
                 f"{noop_count} noop dispatches")
         else:
             logger.info(
-                f"Goal {goal_key} dispatched but this dispatch spent no "
-                f"spark (lifetime={spark_spent}, noop #{noop_count})")
+                f"Goal {goal_key} dispatched but "
+                f"{'its hive run finished with no spark charged' if handed_to_hive else 'this dispatch spent no spark'}"
+                f" (lifetime={spark_spent}, noop #{noop_count})")
         goal.config_json = cfg
+
+def _reply_failure(result):
+    """Why a reply dispatch_goal returned is not work done, or None: the
+    CREATE pipeline's {"status": "error"} envelope, or a help pause (the
+    action was handed to a person or the expert).  The rule the hive worker
+    applies (HeldForHelp), for the tick and for a parallel subtask alike.
+    Counted as success, it cleared the backoff and, for a continuous goal,
+    re-ran the impossible action every 5 minutes for five months
+    (593beaf08); a parallel subtask that ended that way was marked
+    COMPLETED and unblocked its dependents."""
+    from core.agent_tools import is_action_error_reply, is_help_pause
+    if is_action_error_reply(result) or is_help_pause(result):
+        return ' '.join(str(result).split())[:200]
+    return None
+
+
+def _subtask_outcome(goal_id, result) -> dict:
+    """One parallel subtask's turn as parallel_dispatch records it: done,
+    failed with its reason, or deferred (it did not run: a person is using
+    this computer, the local model is busy; the subtask goes back to the
+    queue).  Read from the thread that dispatched it (dispatch keys the
+    reason by thread)."""
+    from .dispatch import dispatch_failure_reason, is_transient_deferral
+    if result is None:
+        if is_transient_deferral(goal_id):
+            return {'success': False, 'deferred': True, 'response': None,
+                    'error': dispatch_failure_reason(goal_id) or 'deferred'}
+        return {'success': False, 'response': None,
+                'error': dispatch_failure_reason(goal_id)
+                or 'dispatch returned no response'}
+    why = _reply_failure(result)
+    if why:
+        return {'success': False, 'response': result, 'error': why}
+    return {'success': True, 'response': result}
+
 
 class AgentDaemon:
     """Background daemon: active goals (any type) + idle agents → /chat dispatch."""
@@ -751,18 +821,23 @@ class AgentDaemon:
             logger.debug("Auto-evolve daemon tick skipped: %s", exc)
 
     def _try_parallel_dispatch(self, goal, idle_agents, dispatched, max_concurrent):
-        """Check if a goal has parallel subtasks and dispatch them concurrently.
+        """Fan a goal's parallel-ready subtasks out to concurrent turns.
 
-        Returns number of tasks dispatched (0 if no parallel tasks found).
+        Returns how many subtasks ended each way, {'completed', 'failed',
+        'deferred'}, all 0 when the goal has none to run.  A deferred subtask
+        did not run (a person is using this computer, the local model is
+        busy): it is PENDING again for a later tick, and the caller neither
+        settles nor penalises the goal for it.
         """
+        nothing = {'completed': 0, 'failed': 0, 'deferred': 0}
         try:
             ledger = self._get_goal_ledger(goal)
             if not ledger:
-                return 0
+                return nothing
 
             parallel_tasks = ledger.get_parallel_executable_tasks()
             if not parallel_tasks:
-                return 0
+                return nothing
 
             from .parallel_dispatch import dispatch_parallel_tasks
             from .dispatch import dispatch_goal
@@ -773,36 +848,30 @@ class AgentDaemon:
                 max_concurrent - dispatched,
             )
             if batch_count <= 0:
-                return 0
+                return nothing
 
             def _dispatch_task(task):
                 """Dispatch a single parallel subtask via /chat."""
                 goal_id = str(goal.id) if hasattr(goal, 'id') else ''
                 goal_type = goal.goal_type if hasattr(goal, 'goal_type') else 'marketing'
                 user_id = str(goal.user_id) if hasattr(goal, 'user_id') else 'system'
-                result = dispatch_goal(
-                    task.description, user_id, goal_id, goal_type)
-                if result is None:
-                    # parallel_dispatch marks the task FAILED with this error.
-                    from .dispatch import dispatch_failure_reason
-                    return {'success': False, 'response': None,
-                            'error': dispatch_failure_reason(goal_id)
-                            or 'dispatch returned no response'}
-                return {'success': True, 'response': result}
+                return _subtask_outcome(goal_id, dispatch_goal(
+                    task.description, user_id, goal_id, goal_type))
 
             result = dispatch_parallel_tasks(
                 ledger, _dispatch_task, max_concurrent=batch_count)
 
-            count = result['completed'] + result['failed']
-            if count > 0:
+            outcome = {k: int(result.get(k, 0)) for k in nothing}
+            if any(outcome.values()):
                 logger.info(
                     f"Parallel dispatch for goal {goal.id}: "
-                    f"{result['completed']} completed, {result['failed']} failed")
-            return count
+                    f"{outcome['completed']} completed, {outcome['failed']} "
+                    f"failed, {outcome['deferred']} back in the queue")
+            return outcome
 
         except Exception as e:
             logger.debug(f"Parallel dispatch check failed: {e}")
-            return 0
+            return nothing
 
     def _get_goal_ledger(self, goal):
         """Get a SmartLedger for a goal's task graph (if one exists).
@@ -848,22 +917,21 @@ class AgentDaemon:
         Delegates to the canonical ``NodeWatchdog.sleep_with_heartbeat``
         helper so a 480s exponential-backoff sleep can't silently age
         the heartbeat past the 300s frozen threshold. See the helper's
-        docstring for the full incident context. When the watchdog
-        isn't available (test mode, early boot) this falls back to a
-        plain ``time.sleep`` so behavior is unchanged.
+        docstring for the full incident context.  The module-level
+        helper re-resolves the watchdog every chunk, so a watchdog that
+        appears mid-sleep (this daemon can start before it exists) is
+        heartbeated from its next chunk instead of never.
         """
         try:
-            from security.node_watchdog import get_watchdog
-            wd = get_watchdog()
-            if wd is not None:
-                wd.sleep_with_heartbeat(
-                    'agent_daemon', seconds,
-                    stop_check=lambda: not self._running,
-                )
-                return
-        except Exception:
-            pass
-        time.sleep(seconds)
+            from security.node_watchdog import sleep_with_heartbeat
+        except Exception as e:
+            logger.warning("agent_daemon: heartbeat sleep unavailable, falling "
+                           "back to a plain sleep (no heartbeats, the "
+                           "watchdog may restart this thread): %s", e, exc_info=True)
+            time.sleep(seconds)
+            return
+        sleep_with_heartbeat('agent_daemon', seconds,
+                             stop_check=lambda: not self._running)
 
     def _proactive_hive_tick(self):
         """Proactive hive daemon tick — exploration, self-promotion, and compute optimization.
@@ -1397,7 +1465,9 @@ class AgentDaemon:
                         f"Federation: epoch={fed_result.get('epoch')}, "
                         f"convergence={fed_result.get('convergence', 0):.3f}")
             except Exception as e:
-                logger.debug(f"Federation tick: {e}")
+                # Swallowed so the next tick can retry, but never silently: at
+                # DEBUG a loop failing every minute looked idle.
+                logger.warning(f"Federation tick failed: {e}", exc_info=True)
 
         t = threading.Thread(
             target=_runner, daemon=True, name='federation_tick')
@@ -1442,8 +1512,8 @@ class AgentDaemon:
         from integrations.social.models import get_db, AgentGoal, Product
         from integrations.coding_agent.idle_detection import IdleDetectionService
         from .goal_manager import GoalManager, CODING_GOAL_TYPES
-        from .dispatch import (dispatch_goal, should_yield_to_user,
-                               max_autonomous_concurrency)
+        from .dispatch import (dispatch_goal, handed_to_hive,
+                               should_yield_to_user, max_autonomous_concurrency)
 
         # Single canonical yield gate — user activity + system pressure.
         # See dispatch.should_yield_to_user() docstring for the contract.
@@ -1465,38 +1535,28 @@ class AgentDaemon:
                 logger.debug(
                     "Agent daemon: yielding (reason=%s)", _yreason)
                 return
-            # B1: never override while a user request is in flight RIGHT NOW.
-            # The starvation override is for IDLE starvation (user away, governor
-            # self-throttling) — NOT for stealing the shared model from a live
-            # chat turn.  foreground_request is the most direct "serve me now".
-            try:
-                from core.foreground import foreground_active
-                if foreground_active() or _yreason == 'foreground_request':
-                    logger.debug(
-                        "Agent daemon: foreground request in flight — yielding "
-                        "(starvation override suppressed)")
-                    return
-            except Exception:
-                pass
-            # A person at the desk is neither a foreground request nor
-            # "recently active" (that means chatted), so neither check above
-            # sees them.  The ResourceGovernor is the ONE idle detector (its
-            # Linux backend reads the compositor's input-alive marker), and a
-            # forced tick is idle-only work by definition, so it goes through
-            # the SAME reader every idle_only goal goes through:
-            # _idle_only_blocked, get_mode() != MODE_IDLE, fail closed when
-            # the governor cannot be consulted.  Measured 2026-09-22 on the
-            # Samsung box: this override force-ticked every 120 s on
-            # 'model_pressure' and put llama-server at 207 percent CPU once a
-            # minute while the owner was clicking around the desktop; press
-            # p50 122 ms against a 25 ms budget, clock 1.3 GHz of 3.4,
-            # package 94 C.  With the daemons paused for 120 s: 3.19 GHz,
-            # 84 C, press p50 12 ms.  That headroom belongs to the person.
-            if _idle_only_blocked({'idle_only': True}):
+            # The starvation override is for IDLE starvation (user away,
+            # governor self-throttling), never for taking the machine from a
+            # person: a user request in flight (foreground_request, the most
+            # direct "serve me now"), or the ONE idle detector (the
+            # ResourceGovernor; its Linux backend reads the compositor's
+            # input-alive marker) saying the machine is not idle, suppresses
+            # it.  Measured 2026-09-22 on the Samsung box: this override
+            # force-ticked every 120 s on 'model_pressure' and put
+            # llama-server at 207 percent CPU once a minute while the owner
+            # was clicking around the desktop; press p50 122 ms against a
+            # 25 ms budget, clock 1.3 GHz of 3.4, package 94 C.  With the
+            # daemons paused for 120 s: 3.19 GHz, 84 C, press p50 12 ms.
+            # That headroom belongs to the person.  The answer is read from
+            # dispatch.gate_closed_for_the_person -- the same one the
+            # between-steps yield reads (#129) -- so a turn admitted here is
+            # never paused a moment later by the reason it was admitted under.
+            from .dispatch import gate_closed_for_the_person
+            if gate_closed_for_the_person():
                 logger.debug(
-                    "Agent daemon: governor says the machine is not idle, "
-                    "yielding on '%s' (starvation override suppressed)",
-                    _yreason)
+                    "Agent daemon: a request is in flight or the governor says "
+                    "the machine is not idle, yielding on '%s' (starvation "
+                    "override suppressed)", _yreason)
                 return
             _override_active = True
             logger.warning(
@@ -1862,9 +1922,8 @@ class AgentDaemon:
                 # subsequent tick without doing any new work.  Written to
                 # config_json (no schema change) and consumed by
                 # _settle_dispatched_goal below.
-                # dict(...) copies: config_json is a plain JSON column, so
-                # mutating the dict it already holds and assigning the SAME
-                # object back compares equal at flush time and never writes.
+                # dict(...) copies: a new dict is written whatever the
+                # column type (see the note in _settle_dispatched_goal).
                 _cfg_pre = dict(goal.config_json or {})
                 _cfg_pre['spark_at_dispatch'] = goal.spark_spent or 0
                 goal.config_json = _cfg_pre
@@ -1889,14 +1948,29 @@ class AgentDaemon:
                 # dispatching the goal prompt once.  Treated as a handoff
                 # exactly like speculation: truthy result, backoff cleared,
                 # and the completion gate below still judges it.
-                parallel_dispatched = 0 if _expert_cfg else self._try_parallel_dispatch(
-                    goal, idle_agents, dispatched, max_concurrent)
-                if parallel_dispatched > 0:
-                    dispatched += parallel_dispatched
+                fan_out = ({'completed': 0, 'failed': 0, 'deferred': 0}
+                           if _expert_cfg else self._try_parallel_dispatch(
+                               goal, idle_agents, dispatched, max_concurrent))
+                _ran = fan_out['completed'] + fan_out['failed']
+                _held = fan_out['deferred']
+                if _ran > 0:
+                    dispatched += _ran + _held
                     with _module_lock:
                         _dispatch_backoff.pop(goal_key, None)
                     handed_off = True
                     result = 'parallel-handoff'
+                elif _held > 0:
+                    # Every subtask it fanned out is waiting (a person is
+                    # using this computer, the local model is busy): nothing
+                    # ran.  Not a handoff to settle and not a failure: the
+                    # transient arm below holds it as it holds a paused turn,
+                    # and the subtasks are PENDING again for a later tick.
+                    # Handed off all the same, so the goal prompt is never
+                    # also dispatched whole.
+                    dispatched += _held
+                    handed_off = True
+                    logger.debug(f"Goal {goal_key}: {_held} parallel "
+                                 f"subtask(s) held for later")
                 elif speculative_enabled and not _expert_cfg:
                     try:
                         from .speculative_dispatcher import get_speculative_dispatcher
@@ -1920,49 +1994,57 @@ class AgentDaemon:
                     except ImportError:
                         pass
 
+                _to_hive = False
                 if not handed_off:
                     result = dispatch_goal(
                         prompt, str(agent['user_id']), goal.id, goal.goal_type,
                         **({'model_config': _expert_cfg} if _expert_cfg else {}))
+                    _to_hive = handed_to_hive(goal.id)
                     dispatched += 1
                     self._wd_heartbeat()
 
                 # Track failures for exponential backoff.  A reply that SAYS the
                 # action failed — the {"status":"error"} envelope the CREATE
                 # prompt tells the agent to return, or a help pause — is a
-                # failure too, not a success (the same rule the hive worker
-                # applies via HeldForHelp).  Counted as success it cleared the
-                # backoff and, for a continuous goal, re-ran the impossible
-                # action every 5 minutes for five months.
-                from core.agent_tools import is_action_error_reply, is_help_pause
-                _reply_failed = result is not None and (
-                    is_action_error_reply(result) or is_help_pause(result))
-                if result is None or _reply_failed:
+                # failure too, not a success (_reply_failure, the rule the hive
+                # worker and the parallel subtasks apply).  Counted as success
+                # it cleared the backoff and, for a continuous goal, re-ran the
+                # impossible action every 5 minutes for five months.
+                _reply_why = _reply_failure(result) if result is not None else None
+                if result is None or _reply_why:
                     # dispatch_goal returns None for TRANSIENT defers too (user
-                    # actively chatting / Tier-2 breaker open), not just real
-                    # failures.  Counting those toward the 5-strike AUTO-PAUSE
-                    # below would pause a healthy goal just because the user was
-                    # using the machine — the "goals stuck / 0 progress" bug.
-                    # Reuse the SAME canonical checks dispatch_goal defers on
-                    # (single source — never drifts) and skip without penalty.
-                    # An explicit error reply is never transient: the turn ran.
-                    _transient = False
-                    if result is None:
+                    # actively chatting / Tier-2 breaker open / this goal's
+                    # turn paused between steps for a person, #129), not just
+                    # real failures.  Counting those toward the 5-strike
+                    # AUTO-PAUSE below would pause a healthy goal just because
+                    # the user was using the machine — the "goals stuck / 0
+                    # progress" bug.  Reuse the SAME canonical checks
+                    # dispatch_goal defers on (single source — never drifts)
+                    # and skip without penalty: the goal stays active, the gate
+                    # above re-admits it once they are idle, and a paused
+                    # session resumes where it stopped.  An explicit error
+                    # reply is never transient: the turn ran.
+                    # A fan-out whose every subtask waited says so itself:
+                    # their reasons were recorded on the threads that ran
+                    # them, which this thread cannot read.
+                    _transient = _held > 0
+                    if result is None and not _transient:
                         try:
                             from .dispatch import is_transient_deferral
-                            _transient = is_transient_deferral()
+                            _transient = is_transient_deferral(goal_key)
                         except Exception:
                             _transient = False
                     if _transient:
                         logger.debug(
                             f"Goal {goal_key}: transient defer (user active / "
-                            f"breaker open) — no backoff, no auto-pause")
+                            f"breaker open / paused for the person) — no "
+                            f"backoff, no auto-pause")
                         continue
                     # Why the turn failed, when it ran, so a paused goal says
                     # what to fix (a 402 from the hosted LLM, say) instead of
                     # only counting failures.  An error reply carries its own.
-                    if _reply_failed:
-                        _why = ' '.join(str(result).split())[:200]
+                    if _reply_why:
+                        _why = _reply_why
                     else:
                         try:
                             from .dispatch import dispatch_failure_reason
@@ -2007,7 +2089,8 @@ class AgentDaemon:
                     # skip it again (defect (b) was a `continue` doing exactly
                     # that).
                     _settle_dispatched_goal(db, goal, goal_key,
-                                            served_escalation=_served_escalation)
+                                            served_escalation=_served_escalation,
+                                            handed_to_hive=_to_hive)
             # ── HITL: notify owners of APPROVAL_REQUIRED tasks ──
             try:
                 for goal in goals:

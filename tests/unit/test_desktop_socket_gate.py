@@ -42,7 +42,8 @@ PEER = ['/api/social/peers/announce', '/api/social/peers/health',
 # wiring can be driven without a real boot.
 _BOOT_STEPS = ('_init_social_subsystem', '_register_core_blueprints',
                '_run_consumer_hook', '_register_hive_blueprints',
-               '_init_a2a_server', '_init_database', '_init_channel_adapters',
+               '_init_a2a_server', '_install_mobile_adapter', '_init_database',
+               '_init_channel_adapters',
                '_init_hevolveai_subprocess', '_init_agent_engine_subsystem',
                '_init_livekit_supervisor', '_init_whatsapp_supervisor',
                '_run_on_bootstrap_complete')

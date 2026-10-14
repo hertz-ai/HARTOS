@@ -301,6 +301,222 @@ def test_grant_agent_only_owner_can_grant(fresh_db):
             scope={'can_voice': True})
 
 
+def _machine_owner_and_stranger_agent(db, monkeypatch):
+    """On a flat node -- a machine a person owns -- this machine's owner
+    (HEVOLVE_OWNER_USER_ID, set by Nunba at boot) and an agent someone else
+    wrote, in a community the owner is in."""
+    me, author = _seed_users(db, 2)
+    # The tier is read by security.key_delegation.get_node_tier; with no
+    # master key in the environment it never reaches key material.
+    monkeypatch.delenv('HEVOLVE_MASTER_PRIVATE_KEY', raising=False)
+    monkeypatch.setenv('HEVOLVE_NODE_TIER', 'flat')
+    monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', me.id)
+    agent = _seed_agent(db, owner_id=author.id)
+    com = _seed_community(db, owner_id=me.id)
+    return me, author, agent, com
+
+
+def test_on_a_regional_node_the_machine_owner_variable_grants_nothing(
+        fresh_db, monkeypatch, tmp_path):
+    """A regional node serves many people: whoever runs it is not every
+    agent's owner there, even when HEVOLVE_OWNER_USER_ID names them (Nunba
+    exports it on every tier)."""
+    db, _ = fresh_db
+    me, author, agent, com = _machine_owner_and_stranger_agent(db, monkeypatch)
+    cert = tmp_path / 'regional.cert'
+    cert.write_text('cert')
+    monkeypatch.setenv('HEVOLVE_NODE_TIER', 'regional')
+    monkeypatch.setenv('HEVOLVE_REGIONAL_CERT', str(cert))
+    from integrations.social.call_service import CallService, CallError
+    with pytest.raises(CallError):
+        CallService.grant_agent(db, agent.id, me.id, 'community', com.id,
+                                scope={'can_voice': True})
+
+
+@pytest.mark.parametrize('claimed_tier', ['regional', 'central', 'local'])
+def test_a_node_that_claims_a_shared_tier_gives_the_machine_owner_nothing(
+        fresh_db, monkeypatch, claimed_tier):
+    """The tier a node claims is what withholds the right: Nunba's own
+    promotion sets HEVOLVE_NODE_TIER=regional with no certificate, and a
+    desktop upgraded to central keeps no key, and get_node_tier answers
+    'flat' for both.  'local' (a node under a regional host) keeps the old
+    rule too.  No key material is involved: the claim alone refuses."""
+    db, _ = fresh_db
+    me, author, agent, com = _machine_owner_and_stranger_agent(db, monkeypatch)
+    monkeypatch.setenv('HEVOLVE_NODE_TIER', claimed_tier)
+    monkeypatch.delenv('HEVOLVE_REGIONAL_CERT', raising=False)
+    from integrations.social.call_service import CallService, CallError
+    with pytest.raises(CallError):
+        CallService.grant_agent(db, agent.id, me.id, 'community', com.id,
+                                scope={'can_voice': True})
+    grant = CallService.grant_agent(db, agent.id, author.id, 'community', com.id,
+                                    scope={'can_voice': True})
+    with pytest.raises(CallError):
+        CallService.revoke_agent(db, grant['id'], me.id)
+
+
+@pytest.mark.parametrize('claimed', [None, 'flat', ' Flat '])
+def test_a_desktop_that_claims_no_shared_tier_keeps_the_machine_owners_right(
+        fresh_db, monkeypatch, claimed):
+    """A Nunba desktop sets no tier at all: unset is flat, as a claim
+    written with spaces or capitals is."""
+    db, _ = fresh_db
+    me, author, agent, com = _machine_owner_and_stranger_agent(db, monkeypatch)
+    if claimed is None:
+        monkeypatch.delenv('HEVOLVE_NODE_TIER', raising=False)
+    else:
+        monkeypatch.setenv('HEVOLVE_NODE_TIER', claimed)
+    from integrations.social.call_service import CallService
+    grant = CallService.grant_agent(db, agent.id, me.id, 'community', com.id,
+                                    scope={'can_voice': True})
+    assert grant['owner_id'] == me.id
+
+
+def test_the_machine_owner_changes_their_own_grant(fresh_db, monkeypatch):
+    db, _ = fresh_db
+    me, author, agent, com = _machine_owner_and_stranger_agent(db, monkeypatch)
+    from integrations.social.call_service import CallService
+    first = CallService.grant_agent(db, agent.id, me.id, 'community', com.id,
+                                    scope={'can_voice': True})
+    second = CallService.grant_agent(db, agent.id, me.id, 'community', com.id,
+                                     scope={'can_voice': True, 'can_screen': True})
+    assert second['id'] == first['id'] and second['owner_id'] == me.id
+    assert second['scope'] == {'can_voice': True, 'can_screen': True}
+
+
+def test_a_node_its_key_made_central_gives_the_machine_owner_nothing(
+        fresh_db, monkeypatch):
+    """Claiming nothing (flat) is not enough when the node has proven a
+    shared tier: get_node_tier promotes a key-holding node to central.
+    Stood in for here; no key material is involved."""
+    db, _ = fresh_db
+    me, author, agent, com = _machine_owner_and_stranger_agent(db, monkeypatch)
+    from security import key_delegation
+    monkeypatch.setattr(key_delegation, 'get_node_tier', lambda: 'central')
+    from integrations.social.call_service import CallService, CallError
+    with pytest.raises(CallError):
+        CallService.grant_agent(db, agent.id, me.id, 'community', com.id,
+                                scope={'can_voice': True})
+
+
+def test_the_author_cannot_take_back_a_grant_the_machine_owner_made(
+        fresh_db, monkeypatch):
+    """On the owner's machine the owner decides: once they set an agent's
+    grant, its author changing it would make the owner's calls run, and be
+    filed, as the author."""
+    db, _ = fresh_db
+    me, author, agent, com = _machine_owner_and_stranger_agent(db, monkeypatch)
+    from integrations.social.call_service import CallService, CallError
+    mine = CallService.grant_agent(db, agent.id, me.id, 'community', com.id,
+                                   scope={'can_voice': True})
+    with pytest.raises(CallError, match="machine's owner"):
+        CallService.grant_agent(db, agent.id, author.id, 'community', com.id,
+                                scope={'can_voice': True, 'can_screen': True})
+    kept = CallService.get_active_grant(db, agent.id, 'community', com.id)
+    assert kept['owner_id'] == me.id and kept['scope'] == {'can_voice': True}
+    assert kept['id'] == mine['id']
+
+
+def test_the_machine_owners_update_makes_the_grant_theirs(fresh_db, monkeypatch):
+    """The author granted; the machine owner changes it: the grant is now
+    the machine owner's, so the call it opens runs as them (the bridge is
+    handed the grant's owner)."""
+    db, _ = fresh_db
+    me, author, agent, com = _machine_owner_and_stranger_agent(db, monkeypatch)
+    from integrations.social.call_service import CallService
+    first = CallService.grant_agent(db, agent.id, author.id, 'community', com.id,
+                                    scope={'can_voice': False})
+    assert first['owner_id'] == author.id
+    second = CallService.grant_agent(db, agent.id, me.id, 'community', com.id,
+                                     scope={'can_voice': True})
+    assert second['id'] == first['id']
+    assert second['owner_id'] == me.id and second['scope'] == {'can_voice': True}
+
+
+def test_the_machine_owner_revokes_a_grant_someone_else_made(fresh_db, monkeypatch):
+    db, _ = fresh_db
+    me, author, agent, com = _machine_owner_and_stranger_agent(db, monkeypatch)
+    guest, = _seed_users(db, 1)
+    from integrations.social.call_service import CallService, CallError
+    grant = CallService.grant_agent(db, agent.id, author.id, 'community', com.id,
+                                    scope={'can_voice': True})
+    with pytest.raises(CallError):
+        CallService.revoke_agent(db, grant['id'], guest.id)
+    assert CallService.revoke_agent(db, grant['id'], me.id) is True
+    assert CallService.get_active_grant(db, agent.id, 'community', com.id) is None
+
+
+def test_the_machine_owner_cannot_grant_a_person(fresh_db, monkeypatch):
+    db, _ = fresh_db
+    me, author, agent, com = _machine_owner_and_stranger_agent(db, monkeypatch)
+    from integrations.social.call_service import CallService, CallError
+    with pytest.raises(CallError, match='not an agent'):
+        CallService.grant_agent(db, author.id, me.id, 'community', com.id,
+                                scope={'can_voice': True})
+
+
+def test_a_machine_owner_written_with_spaces_is_still_the_owner(fresh_db, monkeypatch):
+    """Read as every other owner gate reads it (capability_setup.setup_owner)."""
+    db, _ = fresh_db
+    me, author, agent, com = _machine_owner_and_stranger_agent(db, monkeypatch)
+    monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', f' {me.id} ')
+    from integrations.social.call_service import CallService
+    grant = CallService.grant_agent(db, agent.id, me.id, 'community', com.id,
+                                    scope={'can_voice': True})
+    assert grant['owner_id'] == me.id
+
+
+def test_this_machines_owner_grants_any_agent_on_it(fresh_db, monkeypatch):
+    """Owner ruling 2026-10-08: an agent is shared as a recipe; whoever runs
+    it on their own machine trusts it with their data, so that machine's
+    owner decides whether it joins their calls, not its author."""
+    db, _ = fresh_db
+    me, author, agent, com = _machine_owner_and_stranger_agent(db, monkeypatch)
+    from integrations.social.call_service import CallService
+    grant = CallService.grant_agent(db, agent.id, me.id, 'community', com.id,
+                                    scope={'can_voice': True})
+    assert grant['owner_id'] == me.id and grant['scope'] == {'can_voice': True}
+
+
+def test_this_machines_owner_grants_a_system_agent_on_it(fresh_db, monkeypatch):
+    db, _ = fresh_db
+    me, _author, agent, com = _machine_owner_and_stranger_agent(db, monkeypatch)
+    from integrations.social.models import User
+    agent_row = db.query(User).filter(User.id == agent.id).first()
+    agent_row.owner_id = None              # ownerless: made by an agent
+    db.commit()
+    from integrations.social.call_service import CallService
+    grant = CallService.grant_agent(db, agent.id, me.id, 'community', com.id,
+                                    scope={'can_voice': True})
+    assert grant['agent_id'] == agent.id
+
+
+def test_someone_else_on_the_machine_still_cannot_grant(fresh_db, monkeypatch):
+    """Only the machine's owner gains the right: another person signed in on
+    it is not the agent's owner and not the machine's."""
+    db, _ = fresh_db
+    me, author, agent, com = _machine_owner_and_stranger_agent(db, monkeypatch)
+    guest, = _seed_users(db, 1)
+    from integrations.social.call_service import CallService, CallError
+    with pytest.raises(CallError):
+        CallService.grant_agent(db, agent.id, guest.id, 'community', com.id,
+                                scope={'can_voice': True})
+
+
+def test_no_machine_owner_grants_nobody_the_machine_owners_right(fresh_db, monkeypatch):
+    """Central and regional nodes set no HEVOLVE_OWNER_USER_ID: the unset
+    owner matches no caller, not even one with no id."""
+    db, _ = fresh_db
+    monkeypatch.delenv('HEVOLVE_OWNER_USER_ID', raising=False)
+    a, = _seed_users(db, 1)
+    agent = _seed_agent(db, owner_id=None)
+    com = _seed_community(db, owner_id=a.id)
+    from integrations.social.call_service import CallService, CallError
+    with pytest.raises(CallError):
+        CallService.grant_agent(db, agent.id, '', 'community', com.id,
+                                scope={'can_voice': True})
+
+
 def test_grant_system_agent_refused_for_non_admin(fresh_db):
     """Pass-4 P4-3 fix: ownerless (system) agents must NOT be
     grantable by arbitrary authenticated users.  Previously the
@@ -664,6 +880,33 @@ def test_decide_media_mode_agent_always_livekit(monkeypatch):
     from integrations.social.api_calls import _decide_media_mode
     sess = {'kind': 'voice'}
     assert _decide_media_mode(sess, [], is_agent=True) == 'livekit'
+
+
+def test_decide_media_mode_a_person_calling_an_agent_gets_livekit(monkeypatch):
+    """A person's token for a call an agent is in: livekit.  The agent is
+    present through its AgentVoiceBridge, which has no media path but the
+    SFU room -- on a mesh it can neither hear the person nor speak."""
+    monkeypatch.delenv('LIVEKIT_MESH_THRESHOLD', raising=False)
+    _patch_g_user(monkeypatch)
+    from integrations.social.api_calls import _decide_media_mode
+    parts = [{'user_id': 'agent-7', 'left_at': None, 'agent_kind': 'agent',
+              'device_kind': 'agent_bridge'}]
+    assert _decide_media_mode({'kind': 'voice'}, parts, is_agent=False) == 'livekit'
+    # An agent that has left the call no longer holds it on the SFU.
+    gone = [dict(parts[0], left_at='2026-10-07 10:00:00')]
+    assert _decide_media_mode({'kind': 'voice'}, gone, is_agent=False) == 'p2p_mesh'
+
+
+def test_decide_media_mode_a_person_naming_their_device_agent_bridge_stays_on_the_mesh(monkeypatch):
+    """device_kind is whatever a joining client says (join_call); only
+    attach_agent writes agent_kind 'agent'.  A person who joins with
+    device_kind 'agent_bridge' is not an agent and moves no one to LiveKit."""
+    monkeypatch.delenv('LIVEKIT_MESH_THRESHOLD', raising=False)
+    _patch_g_user(monkeypatch)
+    from integrations.social.api_calls import _decide_media_mode
+    parts = [{'user_id': 'person-9', 'left_at': None, 'agent_kind': 'human',
+              'device_kind': 'agent_bridge'}]
+    assert _decide_media_mode({'kind': 'voice'}, parts, is_agent=False) == 'p2p_mesh'
 
 
 def test_decide_media_mode_screen_share_always_livekit(monkeypatch):
@@ -1262,6 +1505,277 @@ def test_router_source_kind_call_enqueues_tts(clean_bridge_outbox,
     assert out[0]['text'] == 'hello from the agent'
     # outbox is now drained
     assert tts_outbox_depth('call-X', 'agent-99') == 0
+
+
+# ── A call turn is a turn of the agent: its own prompt through /chat ──────
+
+
+def _call_turn_rig(db, monkeypatch, chat_status=200, chat_body=None,
+                   trained_id='54_0', prompt_file=True, flows=2, flows_built=2,
+                   prompt_name='54'):
+    """A trained agent (agent_bridge.sync_trained_agents names its row
+    'agent_{prompt_id}_{flow_id}' and keeps '{prompt_id}_{flow_id}' as its
+    agent_id; one a person built keeps the bare prompt_id), its prompt and
+    recipes on this node (prompt 54, ``flows`` flows of which the first
+    ``flows_built`` have a recipe), the local /chat it reaches, and the plain
+    model it must not need.  Returns (agent, speaker, posts,
+    plain_model_calls, minted)."""
+    import json as _json
+    import tempfile
+    from integrations.social.models import User
+    prompts = tempfile.mkdtemp(prefix='call_prompts_')
+    if prompt_file:
+        with open(os.path.join(prompts, f'{prompt_name}.json'), 'w') as f:
+            _json.dump({'flows': [{'flow_name': f'f{n}'} for n in range(flows)]}, f)
+    for n in range(flows_built):
+        with open(os.path.join(prompts, f'{prompt_name}_{n}_recipe.json'), 'w') as f:
+            _json.dump({'recipe': []}, f)
+    import core.platform_paths
+    monkeypatch.setattr(core.platform_paths, 'get_recipe_prompts_dir', lambda: prompts)
+    speaker, = _seed_users(db, 1)
+    agent = User(id=str(uuid.uuid4()), username=f'agent_{uuid.uuid4().hex[:6]}',
+                 display_name='Tutor', email=f'a_{uuid.uuid4().hex[:6]}@x.test',
+                 password_hash='x:y', user_type='agent', agent_id=trained_id)
+    db.add(agent)
+    db.commit()
+    posts, plain, minted = [], [], []
+
+    def fake_post(url, json=None, headers=None, timeout=None, **kw):
+        posts.append({'url': url, 'json': json, 'headers': headers,
+                      'timeout': timeout})
+        from unittest.mock import Mock
+        return Mock(status_code=chat_status,
+                    json=lambda: (chat_body if chat_body is not None
+                                  else {'response': 'Halves are two equal parts.'}),
+                    text='')
+
+    class _PlainModel:
+        def invoke(self, prompt):
+            plain.append(prompt)
+            return type('R', (), {'content': 'a plain answer'})()
+
+    def fake_mint(user_id='system_daemon', username=None, role='admin'):
+        minted.append({'user_id': user_id, 'role': role})
+        return {'Authorization': 'Bearer t'}
+
+    import core.http_pool
+    import core.port_registry
+    import core.safe_hartos_attr
+    from integrations.agent_engine import dispatch
+    from integrations.social import chat_messages
+    # The reply's transcript row is written by chat_messages' own background
+    # thread; left running it writes into this test's database while the
+    # fixture disposes it (an access violation in sqlite).  Not this test's
+    # concern: recorded, not run.
+    monkeypatch.setattr(chat_messages, 'persist_external_room_event',
+                        lambda **kw: None)
+    monkeypatch.setattr(core.http_pool, 'pooled_post', fake_post)
+    monkeypatch.setattr(core.port_registry, 'get_local_backend_url',
+                        lambda: 'http://this-node')
+    monkeypatch.setattr(dispatch, '_internal_auth_headers', fake_mint)
+    monkeypatch.setattr(core.safe_hartos_attr, 'safe_hartos_attr',
+                        lambda name: (lambda **kw: _PlainModel())
+                        if name == 'get_llm' else None)
+    monkeypatch.delenv('HEVOLVE_FLAG_DISPATCH_VIA_CHAT', raising=False)
+    return agent, speaker, posts, plain, minted
+
+
+def _speak_in_call(agent, speaker, words='teach me fractions', call_id='call-7',
+                   author_id=None):
+    from integrations import agentic_router
+    agentic_router.dispatch_to_agent(
+        agent_id=agent.id, prompt=words, synchronous=True,
+        context={'source_kind': 'call', 'source_id': call_id,
+                 'author_id': author_id or speaker.id,
+                 'owner_id': 'whoever-granted-it', 'platform': 'livekit'})
+
+
+def _answered_by_the_plain_model_and_said_so(agent, posts_expected, posts, plain,
+                                             caplog):
+    assert len(posts) == posts_expected
+    assert plain == ['teach me fractions']
+    assert any(agent.id in r.getMessage() and r.levelname == 'WARNING'
+               for r in caplog.records)
+
+
+def test_a_call_turn_runs_the_agents_own_prompt_through_chat(
+        fresh_db, clean_bridge_outbox, monkeypatch):
+    """Owner rule: a turn from the phone is agentic (CREATE/REUSE).  The
+    agent answers as itself -- /chat with its prompt_id, as the person who
+    spoke -- and its reply is what the call hears; the bridge speaks it, so
+    /chat is asked for text only (media_mode='text': no second voice)."""
+    db, _ = fresh_db
+    agent, speaker, posts, plain, minted = _call_turn_rig(db, monkeypatch)
+    _speak_in_call(agent, speaker)
+
+    assert len(posts) == 1, 'the call turn reached the local /chat once'
+    sent = posts[0]
+    assert sent['url'] == 'http://this-node/chat'
+    body = sent['json']
+    assert str(body['prompt_id']) == '54'
+    assert body['user_id'] == speaker.id
+    assert body['prompt'] == body['text'] == 'teach me fractions'
+    assert body['create_agent'] is False
+    assert body['media_mode'] == 'text'
+    assert body['channel_context'] == {'source_kind': 'call',
+                                       'source_id': 'call-7'}
+    # Someone speaking is a person's turn: it takes the model ahead of the
+    # daemons, and they yield to it (the one discriminator /chat applies).
+    from integrations.agent_engine.dispatch import is_genuine_user_request
+    assert is_genuine_user_request(body['request_id'])
+    assert minted == [{'user_id': speaker.id, 'role': 'user'}]
+    assert sent['headers'] == {'Authorization': 'Bearer t'}
+    assert plain == [], 'the plain model never answered for the agent'
+    from integrations.social.agent_voice_bridge import dequeue_tts_text
+    spoken = [r['text'] for r in dequeue_tts_text('call-7', agent.id)]
+    assert spoken == ['Halves are two equal parts.']
+
+
+def test_a_call_turn_is_sent_by_the_one_chat_client(
+        fresh_db, clean_bridge_outbox, monkeypatch):
+    """core.chat_client.post_chat is the one way anything inside HARTOS
+    calls /chat.  The call turn's body already carries its request_id
+    (chat_turn_request), so it reaches the transport unchanged."""
+    db, _ = fresh_db
+    agent, speaker, posts, plain, _ = _call_turn_rig(db, monkeypatch)
+    import core.chat_client
+    real, through_the_client = core.chat_client.post_chat, []
+
+    def _spy(url, body=None, **kw):
+        through_the_client.append((url, dict(body or {})))
+        return real(url, body, **kw)
+
+    monkeypatch.setattr(core.chat_client, 'post_chat', _spy)
+    _speak_in_call(agent, speaker)
+    assert [url for url, _ in through_the_client] == ['http://this-node/chat']
+    assert len(posts) == 1 and posts[0]['json'] == through_the_client[0][1]
+
+
+def test_the_bundled_desktops_chat_answer_is_read_too(
+        fresh_db, clean_bridge_outbox, monkeypatch):
+    """On a bundled desktop Nunba's /chat answers, under 'text'."""
+    db, _ = fresh_db
+    agent, speaker, posts, plain, _ = _call_turn_rig(
+        db, monkeypatch, chat_body={'text': 'From the desktop.'})
+    _speak_in_call(agent, speaker)
+    from integrations.social.agent_voice_bridge import dequeue_tts_text
+    assert [r['text'] for r in dequeue_tts_text('call-7', agent.id)] == [
+        'From the desktop.']
+    assert plain == []
+
+
+def test_an_agent_a_person_built_keeps_its_bare_prompt_id_and_gets_its_turn(
+        fresh_db, clean_bridge_outbox, monkeypatch):
+    """hart_intelligence_entry._create_social_agent_from_prompt registers a
+    person's agent with agent_id=str(prompt_id): '54', not '54_0'."""
+    db, _ = fresh_db
+    agent, speaker, posts, plain, _ = _call_turn_rig(db, monkeypatch, trained_id='54')
+    _speak_in_call(agent, speaker)
+    assert len(posts) == 1 and str(posts[0]['json']['prompt_id']) == '54'
+    assert plain == []
+
+
+@pytest.mark.parametrize('trained_id', [None, '', 'skills_agent', 'x_y', 'abc_0'])
+def test_an_agent_with_no_trained_prompt_is_answered_by_the_plain_model_and_says_so(
+        fresh_db, clean_bridge_outbox, monkeypatch, caplog, trained_id):
+    db, _ = fresh_db
+    agent, speaker, posts, plain, _ = _call_turn_rig(
+        db, monkeypatch, trained_id=trained_id)
+    with caplog.at_level('WARNING'):
+        _speak_in_call(agent, speaker)
+    _answered_by_the_plain_model_and_said_so(agent, 0, posts, plain, caplog)
+
+
+def test_an_agent_whose_prompt_id_is_not_a_number_gets_no_turn_through_chat(
+        fresh_db, clean_bridge_outbox, monkeypatch, caplog):
+    """Complete here, but its prompt_id is a UUID: Nunba's /chat (a bundled
+    desktop) would run it as its default agent, answering in its name."""
+    db, _ = fresh_db
+    uid = 'f3a9c2d1-0b7e-4c55-9a21-6d0f2e8b1c44'
+    agent, speaker, posts, plain, _ = _call_turn_rig(
+        db, monkeypatch, trained_id=f'{uid}_0', prompt_name=uid)
+    with caplog.at_level('WARNING'):
+        _speak_in_call(agent, speaker)
+    _answered_by_the_plain_model_and_said_so(agent, 0, posts, plain, caplog)
+
+
+@pytest.mark.parametrize('prompt_file,flows_built', [
+    # No prompt here: /chat would start gathering a new agent, and Nunba's
+    # /chat would send the words to the cloud.
+    (False, 0),
+    # A flow still unbuilt: /chat would resume building the agent.
+    (True, 1),
+])
+def test_an_agent_not_complete_on_this_node_gets_no_turn_through_chat(
+        fresh_db, clean_bridge_outbox, monkeypatch, caplog, prompt_file, flows_built):
+    """Words in a call never build an agent, and never leave the node: only
+    an agent whose every flow has its recipe here (/chat's REUSE condition)
+    is asked."""
+    db, _ = fresh_db
+    agent, speaker, posts, plain, _ = _call_turn_rig(
+        db, monkeypatch, prompt_file=prompt_file, flows_built=flows_built)
+    with caplog.at_level('WARNING'):
+        _speak_in_call(agent, speaker)
+    _answered_by_the_plain_model_and_said_so(agent, 0, posts, plain, caplog)
+
+
+@pytest.mark.parametrize('author', ['unknown', 'PA_xK2j9', 'agent'])
+def test_words_from_no_person_here_run_as_nobody(
+        fresh_db, clean_bridge_outbox, monkeypatch, caplog, author):
+    """A turn runs as the person who spoke.  An author who is no person here
+    -- an unattributed speaker, a LiveKit session id, another agent -- is
+    never minted a token: every such speaker would share one agent session."""
+    db, _ = fresh_db
+    agent, speaker, posts, plain, minted = _call_turn_rig(db, monkeypatch)
+    with caplog.at_level('WARNING'):
+        _speak_in_call(agent, speaker,
+                       author_id=agent.id if author == 'agent' else author)
+    _answered_by_the_plain_model_and_said_so(agent, 0, posts, plain, caplog)
+    assert minted == []
+
+
+def _hartos_generic_error():
+    from core.constants import LLM_GENERIC_ERROR_REPLY
+    return {'response': LLM_GENERIC_ERROR_REPLY}
+
+
+@pytest.mark.parametrize('status,body', [
+    (503, {'error': 'busy'}),
+    # A refusal is not the agent's answer, whatever key carries its words.
+    (503, {'response': 'Your local AI is busy with another task right now.'}),
+    (200, {'response': '   '}),
+    # What /chat really answers with when it did not run the agent, as
+    # HTTP 200: Nunba's busy and starting notices, its refusal, the adapter's
+    # still-loading notice, and HARTOS's own failure sentence.
+    (200, {'text': 'Your local AI is busy with another task right now. '
+                   'Send your message again in a moment.',
+           'error': 'local_llm_starting', 'llm_starting': True, 'success': False}),
+    (200, {'text': 'Starting the local AI engine for you now.',
+           'error': 'local_llm_starting', 'success': False}),
+    (200, {'text': 'Request could not be processed: blocked',
+           'error': 'blocked', 'success': False}),
+    (200, {'text': 'Still waking up.', 'loading': True, 'source': 'hartos_loading'}),
+    (200, 'hartos-generic-error'),
+    # Nunba answering for itself while no model is loaded: its setup card.
+    (200, {'text': 'Setting up Qwen3.5-4B... Click below to start.',
+           'agent_type': 'local', 'source': 'system', 'success': True,
+           'llm_setup_card': {'model_type': 'llm'}}),
+    # Any answer that says it failed, with or without an error code.
+    (200, {'text': 'That did not work.', 'success': False}),
+])
+def test_a_call_turn_chat_cannot_answer_falls_to_the_plain_model_and_says_so(
+        fresh_db, clean_bridge_outbox, monkeypatch, caplog, status, body):
+    db, _ = fresh_db
+    if body == 'hartos-generic-error':
+        body = _hartos_generic_error()
+    agent, speaker, posts, plain, _ = _call_turn_rig(
+        db, monkeypatch, chat_status=status, chat_body=body)
+    with caplog.at_level('WARNING'):
+        _speak_in_call(agent, speaker)
+    _answered_by_the_plain_model_and_said_so(agent, 1, posts, plain, caplog)
+    from integrations.social.agent_voice_bridge import dequeue_tts_text
+    assert [r['text'] for r in dequeue_tts_text('call-7', agent.id)] == [
+        'a plain answer']
 
 
 def test_decide_media_mode_excludes_left_participants(monkeypatch):

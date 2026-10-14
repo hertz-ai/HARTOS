@@ -31,6 +31,16 @@ def _default_db_path() -> str:
 # Minimum samples before a tool is considered "benchmarked" for a task type
 MIN_SAMPLES = 5
 
+#: What a row's ``success`` means.  1: whatever the backend said; aider_native
+#: said True for any model reply, edit or not (all 1,797 of its rows on the
+#: owner's desktop, 2026-10-05, with 0 edits applied in the 442 runs the logs
+#: still held).  2: an edit backend succeeds only when an edit was applied, a
+#: receipt (owner ruling 2026-10-04).  Routing, the summary and the hive export
+#: read only rows recorded under the current rule: rows recorded under another
+#: measure a different thing, and the old lie would elect its own tool.  The
+#: old rows stay on disk, untouched.
+SUCCESS_RULE = 2
+
 
 class BenchmarkTracker:
     """SQLite benchmark tracker — thread-safe singleton."""
@@ -53,9 +63,17 @@ class BenchmarkTracker:
                     completion_time_s REAL NOT NULL,
                     success INTEGER NOT NULL DEFAULT 0,
                     offloaded INTEGER NOT NULL DEFAULT 0,
-                    timestamp REAL NOT NULL
+                    timestamp REAL NOT NULL,
+                    success_rule INTEGER NOT NULL DEFAULT 1
                 )
             ''')
+            # A table made before the column existed gets it, every old row
+            # marked rule 1 by the column default.
+            columns = {row[1] for row in conn.execute(
+                'PRAGMA table_info(benchmarks)')}
+            if 'success_rule' not in columns:
+                conn.execute('ALTER TABLE benchmarks ADD COLUMN '
+                             'success_rule INTEGER NOT NULL DEFAULT 1')
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS hive_routing (
                     task_type TEXT PRIMARY KEY,
@@ -82,10 +100,11 @@ class BenchmarkTracker:
             conn.execute(
                 'INSERT INTO benchmarks '
                 '(task_type, tool_name, model_name, user_id, completion_time_s, '
-                ' success, offloaded, timestamp) '
-                'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                ' success, offloaded, timestamp, success_rule) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
                 (task_type, tool_name, model_name, user_id,
-                 completion_time_s, int(success), int(offloaded), time.time())
+                 completion_time_s, int(success), int(offloaded), time.time(),
+                 SUCCESS_RULE)
             )
             conn.commit()
             conn.close()
@@ -104,12 +123,12 @@ class BenchmarkTracker:
                        AVG(completion_time_s) as avg_time,
                        COUNT(*) as cnt
                 FROM benchmarks
-                WHERE task_type = ?
+                WHERE task_type = ? AND success_rule = ?
                 GROUP BY tool_name
                 HAVING cnt >= ?
                 ORDER BY success_rate DESC, avg_time ASC
                 LIMIT 1
-            ''', (task_type, MIN_SAMPLES)).fetchall()
+            ''', (task_type, SUCCESS_RULE, MIN_SAMPLES)).fetchall()
             conn.close()
 
         if rows:
@@ -135,15 +154,18 @@ class BenchmarkTracker:
         """Dashboard summary data."""
         with self._lock:
             conn = sqlite3.connect(self._db_path)
-            total = conn.execute('SELECT COUNT(*) FROM benchmarks').fetchone()[0]
+            total = conn.execute(
+                'SELECT COUNT(*) FROM benchmarks WHERE success_rule = ?',
+                (SUCCESS_RULE,)).fetchone()[0]
             by_tool = conn.execute('''
                 SELECT tool_name,
                        COUNT(*) as total,
                        AVG(success) as success_rate,
                        AVG(completion_time_s) as avg_time
                 FROM benchmarks
+                WHERE success_rule = ?
                 GROUP BY tool_name
-            ''').fetchall()
+            ''', (SUCCESS_RULE,)).fetchall()
             by_task = conn.execute('''
                 SELECT task_type,
                        tool_name,
@@ -151,9 +173,10 @@ class BenchmarkTracker:
                        AVG(success) as success_rate,
                        AVG(completion_time_s) as avg_time
                 FROM benchmarks
+                WHERE success_rule = ?
                 GROUP BY task_type, tool_name
                 ORDER BY task_type, success_rate DESC
-            ''').fetchall()
+            ''', (SUCCESS_RULE,)).fetchall()
             conn.close()
 
         return {
@@ -185,9 +208,10 @@ class BenchmarkTracker:
                        AVG(success) as sr, AVG(completion_time_s) as at,
                        COUNT(*) as cnt
                 FROM benchmarks
+                WHERE success_rule = ?
                 GROUP BY task_type, tool_name
                 HAVING cnt >= ?
-            ''', (MIN_SAMPLES,)).fetchall()
+            ''', (SUCCESS_RULE, MIN_SAMPLES)).fetchall()
             conn.close()
 
         if not rows:

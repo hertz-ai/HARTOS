@@ -81,15 +81,19 @@ CHANNEL_CATALOG = {
             # Slack's bot_user_id comes from auth.test at adapter
             # connect time (slack_adapter.py:101), not from this map —
             # that's why we only persist bot.access_token here.
-            # signing_secret is operator-paste-only (not in OAuth resp).
             'bot.access_token': 'bot_token',
         },
         'external_url': 'https://api.slack.com/apps',
+        # The adapter runs in Socket Mode (slack_adapter.py), so what it
+        # needs is the bot token plus the APP's xapp- token.  The app token
+        # belongs to whoever registered the Slack app (the operator, for the
+        # shared OAuth app), so it is read from SLACK_APP_TOKEN
+        # (flask_integration._CHANNEL_SPECS['slack']) and never asked of the
+        # user.  The old signing_secret field was read by nothing, and asking
+        # for it made every OAuth connect end "partial config".
         'setup_fields': [
             {'key': 'bot_token', 'label': 'Bot Token (xoxb-...)', 'type': 'password',
              'help': 'Create a Slack App, install it to your workspace, and copy the Bot User OAuth Token.'},
-            {'key': 'signing_secret', 'label': 'Signing Secret', 'type': 'password',
-             'help': 'Found in your Slack App settings under Basic Information.'},
         ],
         'capabilities': {
             'text': True, 'image': True, 'video': False, 'audio': False,
@@ -117,7 +121,10 @@ CHANNEL_CATALOG = {
         # phone number instead, no QR scan needed.
         'auth_method': 'gateway_qr',
         'setup_fields': [
+            # optional: the QR scan links without it, so it must not make a
+            # QR connect read as "partial config".
             {'key': 'phone_number', 'label': 'Your WhatsApp Number', 'type': 'tel',
+             'optional': True,
              'help': 'Your own E.164 number (e.g. +<country><number>). '
                      'Required only for "Link with phone number"; QR scan '
                      'works without it.'},
@@ -828,6 +835,21 @@ def get_channels_by_category(category: str):
 def get_channels_by_auth_method(method: str):
     """Filter channels by auth method."""
     return {k: v for k, v in CHANNEL_CATALOG.items() if v.get('auth_method') == method}
+
+
+def required_setup_keys(meta: dict) -> list:
+    """The setup-field keys a user must supply before a channel can run.
+
+    A field is NOT required when it is ``auto`` (server-provisioned from env
+    or its default), ``optional`` (e.g. WhatsApp's phone number: the QR scan
+    links without it), or carries a ``default``.  Every other field is.
+    One definition, so the connect tool, the OAuth callback and the forms
+    agree on when a connect is complete.
+    """
+    return [
+        f['key'] for f in (meta or {}).get('setup_fields') or []
+        if not (f.get('auto') or f.get('optional') or 'default' in f)
+    ]
 
 
 def is_oauth_capable(channel_type: str) -> bool:

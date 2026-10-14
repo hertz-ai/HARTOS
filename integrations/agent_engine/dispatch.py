@@ -24,6 +24,7 @@ from typing import Dict, List, Optional
 
 from core.http_pool import pooled_post
 from core.chat_client import daemon_request_id, normalize_chat_body
+from core.constants import SYSTEM_DAEMON_IDENTITY
 from core.port_registry import get_port
 
 logger = logging.getLogger('hevolve_social')
@@ -81,7 +82,9 @@ def _local_dispatch_base_url() -> str:
     return get_local_backend_url()
 
 
-def _internal_auth_headers() -> Optional[Dict[str, str]]:
+def _internal_auth_headers(user_id: str = SYSTEM_DAEMON_IDENTITY,
+                            username: str = None,
+                            role: str = 'admin') -> Optional[Dict[str, str]]:
     """Build auth headers for internal /chat dispatch.
 
     Why: on central/regional tiers, security/middleware.py Gate 2 rejects
@@ -90,9 +93,34 @@ def _internal_auth_headers() -> Optional[Dict[str, str]]:
     autonomous outreach flywheel silently 401'd from 2026-03-14 onward.
 
     Prefers HEVOLVE_API_KEY (X-API-Key) if set; otherwise mints a
-    short-lived system_daemon JWT via integrations.social.auth.
-    Returns None on flat-tier deployments where auth is unneeded
-    (caller passes None to pooled_post → no header attached).
+    short-lived JWT via integrations.social.auth. Returns None on
+    flat-tier deployments where auth is unneeded (caller passes None to
+    pooled_post → no header attached).
+
+    Args:
+        user_id: identity the minted JWT represents. Defaults to the
+            generic 'system_daemon' admin identity for genuinely
+            autonomous callers in this module (outreach flywheel,
+            coding/agent daemon dispatch — no real end-user behind the
+            call). Real channel-message relays (flask_integration.py's
+            _handle_message) MUST pass the actual resolved end-user
+            user_id here instead of accepting this default.
+
+            2026-08-06 fix: /chat's JWT-vs-body user_id check (Layer 1
+            auth, hart_intelligence_entry.py) always trusts the JWT
+            over the request body — correct security behavior, prevents
+            a caller from spoofing a different user_id in the body. But
+            every channel message (Discord/Telegram/WhatsApp/...) was
+            relayed through this SAME function with the hardcoded
+            'system_daemon' default, so the JWT silently overrode each
+            real user's resolved identity with 'system_daemon' —
+            collapsing every channel user, across every channel, into
+            one shared, cross-contaminated cached agent session. This
+            is what caused replies to go missing/empty: concurrent
+            unrelated turns (real users' messages AND genuine autonomous
+            daemon calls) all corrupting the same autogen GroupChat.
+        username: display name for the minted token. Defaults to
+            ``user_id`` when not given.
     """
     headers: Dict[str, str] = {}
     try:
@@ -101,15 +129,20 @@ def _internal_auth_headers() -> Optional[Dict[str, str]]:
             headers['X-API-Key'] = api_key
         else:
             from integrations.social.auth import generate_jwt as _mint_jwt
+            # 'admin' for the node's own autonomous callers (the default);
+            # a relay acting for a person passes role='user' -- a channel
+            # sender is a stranger until bound, never an administrator.
             jwt = _mint_jwt(
-                user_id='system_daemon',
-                username='system_daemon',
-                role='admin',
+                user_id=user_id,
+                username=username or user_id,
+                role=role,
             )
             if jwt:
                 headers['Authorization'] = f'Bearer {jwt}'
     except Exception as e:
-        logger.debug(f"daemon-dispatch auth header mint failed (non-fatal): {e}")
+        # Sent without credentials: fine on flat, a 401 on central/regional.
+        logger.warning("internal /chat auth header mint failed, sending "
+                       "unauthenticated (central/regional will answer 401): %s", e)
     return headers or None
 
 
@@ -484,6 +517,38 @@ def _user_chat_marker_recent() -> bool:
         return False
 
 
+# Owner policy 2026-10-12: Claude is used only where it drives revenue, and it
+# can never block the org's own revenue-driving work.  An org goal that earns
+# (marketing, SEO, revenue monitoring, hive growth and economics, the McGroce
+# merchant and shopper agents, every P2P vertical) runs on the REVENUE lane:
+# it may use the expert model and falls back to the free model when the day
+# fuse trips, so it never stops.  Every other goal type is background work on
+# the free model.  HEVOLVE_REVENUE_GOAL_TYPES (comma list) replaces the set.
+REVENUE_GOAL_TYPES = frozenset({
+    'marketing', 'seo', 'revenue', 'hive_growth', 'hive_economics',
+    'mcgroce_merchant', 'mcgroce_shopper',
+})
+REVENUE_GOAL_TYPE_PREFIXES = ('p2p_',)
+
+
+def is_revenue_goal_type(goal_type) -> bool:
+    """Does a goal of this type earn, so its turns run on the revenue lane?"""
+    gt = str(goal_type or '').strip().lower()
+    if not gt:
+        return False
+    override = os.environ.get('HEVOLVE_REVENUE_GOAL_TYPES', '')
+    if override.strip():
+        return gt in {p.strip().lower() for p in override.split(',') if p.strip()}
+    return gt in REVENUE_GOAL_TYPES or gt.startswith(REVENUE_GOAL_TYPE_PREFIXES)
+
+
+def lane_for_goal_type(goal_type) -> str:
+    """The lane a goal's turns run on: 'revenue' for a goal that earns, else
+    'daemon'.  The daemon-side twin of core.request_lane.lane_for_chat."""
+    from core.llm_outbound_logger import LANE_REVENUE, LANE_DAEMON
+    return LANE_REVENUE if is_revenue_goal_type(goal_type) else LANE_DAEMON
+
+
 def is_genuine_user_request(request_id) -> bool:
     """True when a /chat request comes from a real user (so it should
     mark user activity + make daemons yield), False when it's the
@@ -545,6 +610,108 @@ def is_current_request_autonomous() -> bool:
         return False
 
 
+def machine_is_idle() -> bool:
+    """The ONE idle detector's answer: ResourceGovernor.get_mode() == MODE_IDLE
+    (no input past IDLE_THRESHOLD_SECONDS and no external load).  Fail-CLOSED:
+    a governor that cannot be consulted is not idle, the rule
+    agent_daemon._idle_only_blocked has always applied."""
+    try:
+        from core.resource_governor import MODE_IDLE, get_governor
+        return get_governor().get_mode() == MODE_IDLE
+    except Exception:
+        return False
+
+
+def person_using_the_machine() -> Optional[str]:
+    """Whether a PERSON is using this computer right now, and how that is
+    known: 'foreground_request' (a person's request is being served:
+    core.foreground.foreground_active, in this process or another on the
+    machine), 'user_present' (the governor's live input monitor last read the
+    OS idle probe as not idle: ResourceGovernor.user_present), or None.
+
+    The ONE definition (owner ruling 2026-10-04: "not multiple user idles
+    paths").  should_yield_to_user names its person reasons (#0 and #1b)
+    from it, and background_work_must_yield asks only it, so the tick gate
+    and the between-steps pause cannot disagree about who is at the
+    computer.  The tick gate holds NEW work back for more than a person (a
+    chat in the last ten minutes, a CREATE in flight, model or CPU
+    pressure); a RUNNING turn stops only for a person.  Review of 96a9ca9f8
+    (2026-10-05, measured): a step that re-asked the whole tick gate paused a
+    daemon CREATE turn on the create_in_flight its own mark_create_start had
+    set, or on a governor in ACTIVE mode with nobody at the desk, and the
+    daemon re-dispatched it every tick.
+
+    The daemon's starvation override admits work only while
+    gate_closed_for_the_person is False, which needs an idle machine, and
+    the governor never reports MODE_IDLE while user_present() is True: its
+    monitor, the only writer of the mode, decides both from one sample.  So a
+    turn the override admits is not paused by its first step.
+
+    Fail-open: an unreadable signal reads as nobody, so a broken read never
+    stops work.
+    """
+    try:
+        from core.foreground import foreground_active
+        if foreground_active():
+            return 'foreground_request'
+    except Exception:
+        logger.debug('person check: foreground read failed', exc_info=True)
+    try:
+        from core.resource_governor import get_governor
+        present = getattr(get_governor(), 'user_present', None)
+        # `is True`, not truthiness: a fake governor in a test is often a
+        # MagicMock, whose every attribute call is truthy.
+        if callable(present) and present() is True:
+            return 'user_present'
+    except Exception:
+        logger.debug('person check: user-presence read failed', exc_info=True)
+    return None
+
+
+def gate_closed_for_the_person() -> bool:
+    """True when the yield gate is closed because the machine is not free for
+    background work now: a user request in flight, or the machine's own idle
+    detector says it is not idle (the owner at the desk, external load).
+    False when the gate is closed only on a timer or a reading the idle
+    detector contradicts (the ten-minute chat cooldown with nobody at the
+    desk): that is idle starvation, which the daemon's starvation override
+    admits work through.  The override's own judgement, and stricter than
+    person_using_the_machine, which is what pauses a running turn: it is True
+    whenever that one names a person, so a turn the override admits is not
+    paused by its first step.  Fail-closed like the override: an unreadable
+    foreground or governor means the machine is not free."""
+    try:
+        from core.foreground import foreground_active
+        if foreground_active() or get_last_yield_reason() == 'foreground_request':
+            return True
+    except Exception:
+        return True
+    return not machine_is_idle()
+
+
+def background_work_must_yield() -> bool:
+    """The ONE question a long-running background agent asks BETWEEN STEPS:
+    is a person using this computer right now?
+
+    Owner ruling 2026-10-04: yield-to-user is not only the VLM loop's: every
+    autogen group chat and every daemon goal pauses while the owner is
+    active and resumes, idempotently, once they are actually idle; there is
+    no second "user is idle" rule.  Composes is_current_request_autonomous
+    (whose turn this is: a person's own turn never yields to them) with
+    person_using_the_machine (the one definition the tick gate names its
+    person reasons from).  Measured before this existed (gui_app.log
+    2026-10-04): the gate was CLOSED on user_present 19:12:55-19:20:56 while
+    coding-daemon turn daemon_d69d24f8 ran autogen rounds straight through
+    it, holding the local LLM.  Fail-open: a raising check never stops work.
+    """
+    try:
+        return bool(is_current_request_autonomous() and person_using_the_machine())
+    except Exception:
+        logger.debug('background_work_must_yield: check failed, not yielding',
+                     exc_info=True)
+        return False
+
+
 def mark_create_start(request_id=None):
     """Call when a CREATE pipeline starts.
 
@@ -589,10 +756,13 @@ def is_user_recently_active() -> bool:
     return _user_chat_marker_recent()
 
 
-def is_transient_deferral() -> bool:
+def is_transient_deferral(goal_id=None) -> bool:
     """True when a ``dispatch_goal`` ``None`` is a TRANSIENT defer — the user is
-    actively using the LLM, or the Tier-2 circuit breaker is open — rather than a
-    real dispatch failure.
+    actively using the LLM, or the Tier-2 circuit breaker is open, or (given
+    ``goal_id``, asked from the thread that dispatched it) that goal's turn
+    stopped between steps for a person (#129) — rather than a real dispatch
+    failure.  The goal's own recorded reason is read first: a turn paused for
+    the person is held whatever the other checks say by now.
 
     ``dispatch_goal`` returns ``None`` for BOTH cases, so the daemon can't tell
     them apart from the return value alone.  The daemon calls this to avoid
@@ -603,6 +773,11 @@ def is_transient_deferral() -> bool:
     breaker-open), so the daemon's notion of "transient" never drifts from the
     dispatcher's."""
     try:
+        if goal_id is not None:
+            with _turn_failures_lock:
+                _reason = _turn_failures.get(_failure_key(goal_id))
+            if _reason and _reason.startswith(_DEFERRED_PREFIX):
+                return True
         if is_user_recently_active() or _cb_is_open():
             return True
         # The node's own LLM provider refusing the account (#106b b) is a
@@ -630,57 +805,148 @@ def is_transient_deferral() -> bool:
         return False
 
 
-# Why dispatch_goal last returned None for a goal whose turn ran and failed,
-# by goal id, for the callers that report it (the daemon's pause reason, the
-# MCP tool, a parallel subtask's ledger error).  Each dispatch_goal call
-# clears its goal's entry first and a read removes it, so a reason always
-# describes the latest call; the cap only bounds callers that never read.
+# Why dispatch_goal last returned None for a goal whose turn ran and failed
+# or stopped, for the callers that report it (the daemon's pause reason, the
+# MCP tool, a parallel subtask's ledger error), keyed by the goal AND the
+# calling thread.  A goal's parallel subtasks are concurrent dispatch_goal
+# calls under one goal id: keyed by the goal alone, one subtask's call
+# erased the other's reason before it was read, so a paused subtask read as
+# failed (review of 96a9ca9f8).  Every reader asks from the thread that
+# dispatched.  Each dispatch_goal call clears its own entry first and a read
+# removes it, so a reason always describes the latest call; the cap only
+# bounds callers that never read.
 _TURN_FAILURES_MAX = 256
-_turn_failures: Dict[str, str] = {}
+_turn_failures: Dict[tuple, str] = {}
 _turn_failures_lock = threading.Lock()
+
+# The prefix of a reason that means "not done, not failed: retry later,
+# without spending an attempt or a strike".  The instruction queue's drain
+# and is_transient_deferral read it.
+_DEFERRED_PREFIX = 'deferred:'
+#: Why a turn that stopped between steps for a person (#129) returned nothing.
+_PAUSED_FOR_THE_PERSON = (f'{_DEFERRED_PREFIX} paused between steps; a person '
+                          f'is using this computer')
+
+
+def _failure_key(goal_id) -> tuple:
+    return (str(goal_id), threading.get_ident())
 
 
 def _turn_failure(reply) -> Optional[str]:
-    """Why ``reply`` is a failed turn dressed as an answer, or None when it is
-    a real reply.
+    """Why ``reply`` is not the turn's result, or None when it is a real
+    reply.
 
-    The pipeline does not raise when its LLM call fails: user_facing_error()
-    turns the exception into a polite sentence and the turn returns it as the
-    reply.  core.agent_tools.is_user_facing_error is the one recogniser;
-    worker_loop._after_response uses it the same way."""
-    from core.agent_tools import is_user_facing_error
+    Two kinds, told apart by the reason's prefix.  A turn that stopped
+    between steps because a person is using this computer
+    (core.agent_tools.is_user_pause, #129) is held: retry later, never
+    counted as done or failed ('deferred: ...').  A turn whose LLM call
+    failed is a failure: the pipeline does not raise, user_facing_error()
+    turns the exception into a polite sentence and the turn returns it as
+    the reply ('turn failed: ...').  core.agent_tools holds the one
+    recogniser of each; worker_loop._after_response uses them the same way."""
+    from core.agent_tools import is_user_facing_error, is_user_pause
+    if is_user_pause(reply):
+        return _PAUSED_FOR_THE_PERSON
     if not is_user_facing_error(reply):
         return None
     return f'turn failed: {reply.strip()[:160]}'
 
 
+def _record_turn_failure(goal_id, reason) -> None:
+    with _turn_failures_lock:
+        _turn_failures[_failure_key(goal_id)] = reason
+        while len(_turn_failures) > _TURN_FAILURES_MAX:
+            _turn_failures.pop(next(iter(_turn_failures)))
+
+
 def _failed_turn(goal_id, reply) -> bool:
-    """True when ``reply`` is a failed turn, recording why for
-    dispatch_failure_reason(goal_id).
+    """True when ``reply`` is not the turn's result (_turn_failure), recording
+    why for dispatch_failure_reason(goal_id) and is_transient_deferral(goal_id).
 
     dispatch_goal used to return a failed turn's sentence as the goal's
     response, so its callers counted it as work: a parallel subtask was
     marked COMPLETED and unblocked its dependents, the daemon cleared the
     goal's backoff, and a goal whose every turn failed (every hosted call
     402 on central, 2026-09-14) was dispatched again each tick with no
-    backoff.  dispatch_goal now returns None for it, which every caller
-    treats as no result."""
+    backoff.  A paused turn's sentence was counted the same way (review of
+    96a9ca9f8: one-shot dispatches recorded it as their result).
+    dispatch_goal now returns None for both, which every caller treats as
+    no result; the reason says whether to retry later."""
     reason = _turn_failure(reply)
     if reason is None:
         return False
-    with _turn_failures_lock:
-        _turn_failures[str(goal_id)] = reason
-        while len(_turn_failures) > _TURN_FAILURES_MAX:
-            _turn_failures.pop(next(iter(_turn_failures)))
-    logger.warning(f"Goal {goal_id}: {reason[:140]!r}; no response returned")
+    _record_turn_failure(goal_id, reason)
+    held = reason.startswith(_DEFERRED_PREFIX)
+    (logger.info if held else logger.warning)(
+        f"Goal {goal_id}: {reason[:140]!r}; no response returned")
     return True
 
 
 def dispatch_failure_reason(goal_id) -> Optional[str]:
     """Why the latest dispatch_goal for ``goal_id`` returned None after its
-    turn ran and failed, or None.  Read once: the entry is removed."""
+    turn ran and failed or stopped, or None.  Read once, from the thread
+    that dispatched: the entry is removed."""
     with _turn_failures_lock:
-        return _turn_failures.pop(str(goal_id), None)
+        return _turn_failures.pop(_failure_key(goal_id), None)
+
+
+# Where the latest dispatch_goal for a goal went: 'hive' (handed to the
+# coordinator; whichever worker claims the task runs it later) or 'local'
+# (the turn ran here before dispatch_goal returned).  The daemons' completion
+# gate needs it: a hive handoff returns before any work exists, so "this
+# dispatch spent no spark" is not a noop for it
+# (agent_daemon._settle_dispatched_goal).  Keyed like _turn_failures, by goal
+# AND thread, and cleared at the start of every dispatch_goal call.
+_dispatch_routes: Dict[tuple, str] = {}
+# The last route logged per goal, so a goal that moves between the hive and
+# this node says so once, not every tick.  Measured 2026-10-09/10 on the
+# owner's desktop: goals resumed 22-36 minutes late, and no line said which
+# way their dispatches went (R1, fix-all-log-observed-issues).
+_routes_logged: Dict[str, str] = {}
+
+
+def _record_route(goal_id, route, why='') -> None:
+    with _turn_failures_lock:
+        _dispatch_routes[_failure_key(goal_id)] = route
+        while len(_dispatch_routes) > _TURN_FAILURES_MAX:
+            _dispatch_routes.pop(next(iter(_dispatch_routes)))
+        was = _routes_logged.get(str(goal_id))
+        _routes_logged[str(goal_id)] = route
+        while len(_routes_logged) > _TURN_FAILURES_MAX:
+            _routes_logged.pop(next(iter(_routes_logged)))
+    if was != route:
+        logger.info(f"Goal {goal_id}: dispatched "
+                    f"{'to the hive' if route == 'hive' else 'here'}"
+                    f"{f' ({why})' if why else ''}; was "
+                    f"{was or 'not dispatched yet'}")
+
+
+def handed_to_hive(goal_id) -> bool:
+    """True when the latest dispatch_goal for ``goal_id``, from this thread,
+    handed the goal to the hive rather than running its turn here."""
+    with _turn_failures_lock:
+        return _dispatch_routes.get(_failure_key(goal_id)) == 'hive'
+
+
+def _hive_run_open(coordinator, goal_id) -> Optional[bool]:
+    """Does the goal's task set in the coordinator still hold work: a task
+    that is not in a terminal state (TaskStatus.is_terminal_state, the
+    ledger's own rule)?  None when the coordinator cannot say."""
+    try:
+        from agent_ledger.core import TaskStatus
+        progress = coordinator.get_goal_progress(str(goal_id))
+        if not isinstance(progress, dict) or progress.get('error'):
+            return None
+        tasks = progress.get('tasks') or []
+        if not tasks:
+            return None
+        return any(not TaskStatus.is_terminal_state(TaskStatus(t.get('status')))
+                   for t in tasks)
+    except Exception:
+        logger.warning('Could not read the hive task set of goal %s; '
+                       'treating the submit as a handoff', goal_id,
+                       exc_info=True)
+        return None
 
 
 def _dispatch_provider_host(model_config) -> str:
@@ -844,17 +1110,14 @@ def should_yield_to_user() -> bool:
     yield reason (e.g. battery-saver mode, network-pressure)
     means editing exactly this function — no per-daemon copy-paste.
     """
-    reason = None
+    # The person reasons (#0 and #1b) come from person_using_the_machine, the
+    # one definition the between-steps pause asks too.
+    person = person_using_the_machine()
     # Reason #0 — a user-facing request is in flight RIGHT NOW (finer + higher
     # priority than the 10-min "recently active" window below).  Background LLM
     # work must never steal the shared model mid-turn; the daemon's starvation
     # override also refuses to fire while this is set (see agent_daemon._tick).
-    try:
-        from core.foreground import foreground_active
-        if foreground_active():
-            reason = 'foreground_request'
-    except Exception:
-        logger.debug('yield gate: foreground check failed', exc_info=True)
+    reason = 'foreground_request' if person == 'foreground_request' else None
     # Reason #1 — user recently active (is_user_recently_active stays the
     # single source; we only LABEL which sub-condition fired).
     if reason is None:
@@ -865,18 +1128,10 @@ def should_yield_to_user() -> bool:
         except Exception:
             logger.debug('yield gate: user-activity check failed',
                          exc_info=True)
+    # Reason #1b — a person at the desk.
+    if reason is None and person == 'user_present':
+        reason = 'user_present'
     # Reason #2 — LLM throttle collapsed under VRAM/CPU pressure.
-    if reason is None:
-        try:
-            from core.resource_governor import get_governor
-            _present = getattr(get_governor(), 'user_present', None)
-            # `is True`, not truthiness: a fake governor in a test is often a
-            # MagicMock, whose every attribute call is truthy.
-            if callable(_present) and _present() is True:
-                reason = 'user_present'
-        except Exception:
-            logger.debug('yield gate: user-presence check failed',
-                         exc_info=True)
     if reason is None:
         try:
             from integrations.service_tools.model_lifecycle import (
@@ -1059,12 +1314,17 @@ def dispatch_goal_distributed(prompt: str, user_id: str, goal_id: str,
     # checks.  A failed lookup means "not continuous": a missed re-arm, never
     # a wrong one.
     continuous = False
+    # A hive run of this goal handed off earlier and not yet settled: the
+    # daemon's completion gate marks it (spark_at_handoff) and clears the mark
+    # when it settles the run.
+    run_awaiting = False
     try:
         from integrations.social.models import db_session, AgentGoal
         with db_session(commit=False) as _cdb:
             _crow = _cdb.query(AgentGoal).filter_by(id=goal_id).first()
-            continuous = bool(_crow is not None
-                              and (_crow.config_json or {}).get('continuous'))
+            _ccfg = (_crow.config_json or {}) if _crow is not None else {}
+            continuous = bool(_ccfg.get('continuous'))
+            run_awaiting = _ccfg.get('spark_at_handoff') is not None
     except Exception as _cerr:
         logger.debug(f"continuous lookup failed for goal {goal_id}: {_cerr}")
 
@@ -1096,6 +1356,21 @@ def dispatch_goal_distributed(prompt: str, user_id: str, goal_id: str,
             context=context,
             goal_id=str(goal_id),  # STABLE id → re-dispatch dedups, no ledger flood
         )
+        # submit_goal dedups a goal it has seen onto the task set it already
+        # holds, and re-opens that set only for a continuous goal.  For any
+        # other goal whose set is finished the submit did nothing, yet its id
+        # came back as if work had been handed off: measured on the owner's
+        # desktop 2026-10-10, two self-heal goals were "submitted" every 30 s
+        # into a set completed on 09-15, and the worker had nothing to claim.
+        # A finished set is a handoff only while the daemon still has to
+        # settle the run that finished it; otherwise nothing went to the hive
+        # and the goal runs here, through the same fallback as a failed submit.
+        if (not run_awaiting
+                and _hive_run_open(coordinator, distributed_goal_id) is False):
+            logger.info(f"Goal {goal_id}: its hive task set is finished and "
+                        f"no run of it is waiting to be settled, so nothing "
+                        f"was handed to the hive")
+            return None
         logger.info(f"Distributed dispatch: goal {goal_id} submitted as "
                     f"{distributed_goal_id} with {len(tasks)} tasks")
         return distributed_goal_id
@@ -1192,9 +1467,24 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
     Returns:
         Response text or None on failure
     """
-    # A failure reason describes this call only (dispatch_failure_reason).
+    # A failure reason and a route describe this call only
+    # (dispatch_failure_reason, handed_to_hive).
     with _turn_failures_lock:
-        _turn_failures.pop(str(goal_id), None)
+        _turn_failures.pop(_failure_key(goal_id), None)
+        _dispatch_routes.pop(_failure_key(goal_id), None)
+
+    # The lane this goal's turns run on (owner policy 2026-10-12): a goal that
+    # earns is revenue work and may use the expert model; registered by the
+    # daemon request id BOTH dispatch paths carry (local_chat_dispatch and the
+    # HTTP self-POST both name the turn daemon_request_id(goal_id)), before the
+    # budget gate so the gate can read it.  /chat leaves the node's own daemon
+    # turn alone (core.request_lane.register_chat_lane), so this stands.
+    try:
+        from core.llm_outbound_logger import register_request_lane, LANE_REVENUE
+        if is_revenue_goal_type(goal_type):
+            register_request_lane(daemon_request_id(goal_id), LANE_REVENUE)
+    except Exception as _lane_err:
+        logger.debug(f"lane not registered for goal {goal_id}: {_lane_err}")
 
     # BUDGET GATE: check goal budget + platform affordability before dispatch
     try:
@@ -1282,13 +1572,16 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
 
     # ROBOT: capability-matched dispatch — prefer distributed for hardware mismatches
     _tried_distributed = False
+    _why_here = '' if _can_distribute else 'a turn on a named model runs here'
     if _can_distribute and not _check_robot_capability_match(goal_type, goal_id):
         coordinator = _get_distributed_coordinator()
         if coordinator and _has_hive_peers():
             _tried_distributed = True
             result = dispatch_goal_distributed(prompt, user_id, goal_id, goal_type)
             if result is not None:
+                _record_route(goal_id, 'hive')
                 return result
+            _why_here = 'the hive took nothing'
         # Fall through to local if no capable peer found
 
     # DISTRIBUTED: auto-distribute when coordinator is reachable and hive has peers
@@ -1298,9 +1591,14 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
         if coordinator and _has_hive_peers():
             result = dispatch_goal_distributed(prompt, user_id, goal_id, goal_type)
             if result is not None:
+                _record_route(goal_id, 'hive')
                 return result
             # Fall through to local dispatch if distributed fails
             logger.info(f"Distributed fallback -> local dispatch for {goal_type} goal {goal_id}")
+            _why_here = 'the hive took nothing'
+        else:
+            _why_here = ('no coordinator' if not coordinator
+                         else 'no other active node')
 
     # NUMERIC prompt_id (same format as hart_intelligence_entry._next_prompt_id)
     # so it passes the isdigit() check in the adapter and /chat handler.
@@ -1353,8 +1651,7 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
             if llm_provider_breaker.state(_prov_host) == CircuitState.OPEN:
                 _reason = (f'provider {_prov_host} is refusing the account '
                            f'(breaker open)')
-                with _turn_failures_lock:
-                    _turn_failures[str(goal_id)] = _reason
+                _record_turn_failure(goal_id, _reason)
                 logger.warning(f"Goal {goal_id}: {_reason}; not dispatching "
                                f"this tick")
                 return None
@@ -1367,6 +1664,7 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
     # local_chat_dispatch now, so the instruction queue and the distributed
     # worker reach /chat exactly the way this goal path does instead of
     # hand-rolling a raw POST that lands on Nunba's route.
+    _record_route(goal_id, 'local', _why_here)
     _status, response = local_chat_dispatch(
         prompt, user_id, prompt_id, daemon_id=goal_id, model_config=model_config)
     if _status == 'deferred':
@@ -1511,14 +1809,16 @@ def _dispatch_single_instruction(base_url: str, user_id: str, inst,
         inst.text, user_id, body['prompt_id'], daemon_id=batch_id,
         native_fallback=False)
     if _status == 'ok' and _text:
-        # A failed turn is not the instruction's result (_turn_failure).
+        # A failed or paused turn is not the instruction's result
+        # (_turn_failure); a pause comes back 'deferred:', which the drain
+        # re-queues without spending an attempt.
         _failed = _turn_failure(_text)
         return (inst.id, None, _failed) if _failed else (inst.id, _text[:500], None)
     if _status == 'deferred':
         # A human has the LLM, or it is saturated. NOT a failure: reporting it
         # as one burns an attempt and (once instructions get an attempt cap)
         # would dead-letter healthy work just because the user was typing.
-        return (inst.id, None, 'deferred: user active or LLM busy')
+        return (inst.id, None, f'{_DEFERRED_PREFIX} user active or LLM busy')
 
     try:
         # Same daemon_<batch_id> tag as the in-process call above (#97).
@@ -1601,7 +1901,7 @@ def drain_instruction_queue(user_id: str, max_tokens: int = 8000) -> Optional[st
                         # was busy or a human was using it. Burning an attempt
                         # would dead-letter healthy work because someone was
                         # typing.
-                        _transient = str(error).startswith('deferred:')
+                        _transient = str(error).startswith(_DEFERRED_PREFIX)
                         q.fail_instruction(iid, error, transient=_transient)
                         logger.warning(f"Instruction [{iid}] failed: {error}")
                     else:
@@ -1634,7 +1934,7 @@ def drain_instruction_queue(user_id: str, max_tokens: int = 8000) -> Optional[st
                                 # Same deferral exemption as the single-
                                 # instruction branch above: a busy LLM must
                                 # not burn an attempt.
-                                _transient = str(error).startswith('deferred:')
+                                _transient = str(error).startswith(_DEFERRED_PREFIX)
                                 q.fail_instruction(iid, error,
                                                    transient=_transient)
                                 logger.warning(f"Instruction [{iid}] failed: {error}")

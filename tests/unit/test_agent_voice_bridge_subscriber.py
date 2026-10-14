@@ -56,9 +56,13 @@ def _reset():
     bridge.AgentVoiceBridge.shutdown_all()
 
 
-def _isolate(es, has_rtc=True, token_fn=_livekit_token, sub_cls=None):
-    """Patch the bridge's worker + livekit boundary into the ExitStack."""
+def _isolate(es, has_rtc=True, token_fn=_livekit_token, sub_cls=None,
+             hosts_rooms=True):
+    """Patch the bridge's worker + livekit boundary into the ExitStack.
+    Whether this deploy hosts rooms is set here, not read from the
+    environment the tests run in (a central image sets LIVEKIT_DISABLE)."""
     sub_cls = sub_cls if sub_cls is not None else MagicMock()
+    es.enter_context(patch.object(bridge, '_hosts_rooms', lambda: hosts_rooms))
     es.enter_context(patch.object(bridge, '_HAS_LIVEKIT_RTC', has_rtc))
     es.enter_context(patch.object(bridge, 'AgentBridgeWorker', _FakeWorker))
     es.enter_context(patch(
@@ -123,7 +127,7 @@ def test_no_subscriber_when_no_livekit_room():
     _reset()
     SubCls = MagicMock()
     with contextlib.ExitStack() as es:
-        _isolate(es, token_fn=_p2p_token, sub_cls=SubCls)
+        _isolate(es, token_fn=_p2p_token, sub_cls=SubCls, hosts_rooms=False)
         bridge.AgentVoiceBridge.attach_agent(None, call_id='C1', agent_id='A',
                                              owner_id='O', scope={})
         assert SubCls.call_count == 0  # p2p/central -> no room to subscribe to

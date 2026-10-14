@@ -349,3 +349,131 @@ class TestAffordabilityCache:
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
+
+
+def test_claude_is_priced_with_the_gpt4o_class_not_as_unknown():
+    """Owner policy 2026-10-12: Claude is the expert tier on central.  Priced
+    by family like every other cloud model, so the Spark estimate and the
+    expert selector's cost gate see the same number.  Before this row the
+    name fell to the unknown-model default."""
+    from integrations.agent_engine.budget_gate import spark_per_1k
+    assert spark_per_1k('claude-sonnet-4-5') == spark_per_1k('gpt-4o') == 4
+    assert spark_per_1k('claude-haiku-4-5') == 4
+    assert spark_per_1k('some-unknown-model') == 2
+    assert spark_per_1k('qwen3-27b') == 0
+
+
+# ── Dollar meter + the Claude day cap (owner policy 2026-10-12) ─────────────
+
+class TestClaudeDayCap:
+
+    @pytest.fixture(autouse=True)
+    def _central(self, monkeypatch):
+        for v in ('HEVOLVE_CLAUDE_BUDGET_USD_DAY', 'HEVOLVE_CLAUDE_USD_PER_1K_IN',
+                  'HEVOLVE_CLAUDE_USD_PER_1K_OUT'):
+            monkeypatch.delenv(v, raising=False)
+
+    def test_claude_is_priced_in_dollars_blended_over_in_and_out(self, monkeypatch):
+        from integrations.agent_engine import budget_gate as bg
+        assert bg.usd_price_per_1k('claude-sonnet-4-5') == (0.003, 0.015)
+        assert bg.usd_price_per_1k('qwen3-27b') is None
+        # 1000 in + 1000 out = $0.018 -> blended $0.009 per 1k
+        assert bg.blended_usd_per_1k('claude-sonnet-4-5', 1000, 1000) == pytest.approx(0.009)
+        assert bg.blended_usd_per_1k('claude-haiku-4-5', 0, 0) == 0.003
+        monkeypatch.setenv('HEVOLVE_CLAUDE_USD_PER_1K_IN', '0.001')
+        monkeypatch.setenv('HEVOLVE_CLAUDE_USD_PER_1K_OUT', '0.005')
+        assert bg.blended_usd_per_1k('claude-haiku-4-5', 1000, 1000) == pytest.approx(0.003)
+
+    def test_meter_llm_call_stores_the_exact_dollar_cost_for_claude(self, monkeypatch):
+        from integrations.agent_engine import budget_gate as bg
+        monkeypatch.setattr(bg, '_is_local_model', lambda: False)
+        monkeypatch.setattr(bg, '_this_node_id', lambda: 'central-1')
+        monkeypatch.setattr(bg, '_resolve_model_name', lambda m: m)
+        seen = {}
+        monkeypatch.setattr(bg, 'record_metered_usage',
+                            lambda **kw: seen.update(kw) or 'row-1')
+        assert bg.meter_llm_call('claude-sonnet-4-5', 6000, 600, task_source='own') == 'row-1'
+        # (6000*0.003 + 600*0.015)/1000 = 0.027 dollars, stored as a rate over 6600 tokens
+        assert seen['cost_per_1k'] * 6.6 == pytest.approx(0.027)
+        assert seen['model_id'] == 'claude-sonnet-4-5' and seen['task_source'] == 'own'
+        seen.clear()
+        bg.meter_llm_call('gpt-4o', 1000, 0, task_source='own')
+        assert seen['cost_per_1k'] == pytest.approx(4 / 100)     # the Spark-derived rate stays
+
+    def test_cap_refuses_claude_only_past_six_dollars(self, monkeypatch):
+        from integrations.agent_engine import budget_gate as bg
+        monkeypatch.setattr(bg, 'claude_usd_spent_today', lambda: 5.99)
+        assert bg.expert_budget_allows('claude-sonnet-4-5')[0] is True
+        monkeypatch.setattr(bg, 'claude_usd_spent_today', lambda: 6.0)
+        allowed, why = bg.expert_budget_allows('claude-sonnet-4-5')
+        assert allowed is False and '6.00' in why
+        assert bg.expert_budget_allows('gpt-4o')[0] is True        # only the capped family
+        monkeypatch.setenv('HEVOLVE_CLAUDE_BUDGET_USD_DAY', '10')
+        assert bg.expert_budget_allows('claude-sonnet-4-5')[0] is True
+        # Topology agnostic: the tier never enters the decision.
+        monkeypatch.setenv('HEVOLVE_NODE_TIER', 'flat')
+        monkeypatch.setenv('HEVOLVE_CLAUDE_BUDGET_USD_DAY', '5')
+        assert bg.expert_budget_allows('claude-sonnet-4-5')[0] is False
+
+    def test_an_unreadable_ledger_fails_closed_and_withholds_the_expert(self, monkeypatch):
+        """Withholding the expert is not blocking (the turn runs on the node's
+        own model), so an unread ledger must not let the cap be overrun
+        (review of 065cef8bb, M1)."""
+        from integrations.agent_engine import budget_gate as bg
+        import integrations.social.models as models
+
+        def boom(**kw):
+            raise RuntimeError('db down')
+        monkeypatch.setattr(models, 'db_session', boom)
+        from datetime import datetime
+        assert bg.usd_spent_since(datetime(2026, 10, 12), 'claude') is None
+        allowed, why = bg.expert_budget_allows('claude-sonnet-4-5')
+        assert allowed is False and 'unreadable' in why
+        assert bg.expert_budget_allows('gpt-4o')[0] is True       # uncapped families unaffected
+
+    def test_one_price_table_and_one_pin_shared_with_the_expert_entry(self, monkeypatch):
+        """The meter's price and the expert entry's autogen price are the same
+        number, pinned or not (review of 8947e2753: an owner's pin moved the
+        meter and left the registry at the list price)."""
+        from integrations.agent_engine import budget_gate as bg
+        from core import autogen_config as ac
+        assert bg.USD_PER_1K_BY_FAMILY is ac.EXPERT_USD_PER_1K
+        monkeypatch.setenv('HEVOLVE_EXPERT_LLM_ENDPOINT_URL', 'http://gw/llm/v1')
+        monkeypatch.setenv('HEVOLVE_EXPERT_LLM_MODEL_NAME', 'anthropic/claude-sonnet-4-6')
+        monkeypatch.delenv('HEVOLVE_CLAUDE_USD_PER_1K_IN', raising=False)
+        monkeypatch.delenv('HEVOLVE_CLAUDE_USD_PER_1K_OUT', raising=False)
+        assert ac.resolve_expert_backend()['price'] == [0.003, 0.015]
+        assert bg.usd_price_per_1k('anthropic/claude-sonnet-4-6') == (0.003, 0.015)
+        monkeypatch.setenv('HEVOLVE_CLAUDE_USD_PER_1K_IN', '0.001')
+        monkeypatch.setenv('HEVOLVE_CLAUDE_USD_PER_1K_OUT', '0.005')
+        assert ac.resolve_expert_backend()['price'] == [0.001, 0.005]
+        assert bg.usd_price_per_1k('anthropic/claude-sonnet-4-6') == (0.001, 0.005)
+        # An unpriced family gets no invented price, in the entry or the meter.
+        monkeypatch.setenv('HEVOLVE_EXPERT_LLM_MODEL_NAME', 'gpt-4o')
+        assert 'price' not in ac.resolve_expert_backend()
+        assert bg.usd_price_per_1k('gpt-4o') is None
+
+    def test_usd_spent_since_reads_this_nodes_own_rows_for_the_family(self, monkeypatch):
+        from integrations.agent_engine import budget_gate as bg
+        import integrations.social.models as models
+        from contextlib import contextmanager
+        monkeypatch.setattr(bg, '_this_node_id', lambda: 'central-1')
+        db = MagicMock()
+        db.query.return_value.filter.return_value.scalar.return_value = 4.25
+
+        @contextmanager
+        def fake_session(**kw):
+            yield db
+        monkeypatch.setattr(models, 'db_session', fake_session)
+        from datetime import datetime
+        assert bg.usd_spent_since(datetime(2026, 10, 12), 'claude') == 4.25
+        filters = db.query.return_value.filter.call_args[0]
+        rendered = ' '.join(str(f) for f in filters)
+        for col in ('node_id', 'task_source', 'model_id', 'created_at'):
+            assert col in rendered, col
+        # The family is matched by substring, the same rule pricing uses, so a
+        # row named 'anthropic/claude-sonnet-4-5' counts (review M3).
+        like_params = [f.right.value for f in filters if hasattr(f, 'right')
+                       and getattr(getattr(f, 'right', None), 'value', None) is not None
+                       and 'claude' in str(f.right.value)]
+        assert like_params == ['%claude%']

@@ -132,7 +132,10 @@ class NATTraversal:
                 return ws_url
 
         # Strategy 4: Relay through seed peer (not implemented yet - placeholder)
-        # In future: find a mutual peer with public IP and relay through them
+        # In future: find a mutual peer with public IP and relay through them.
+        # The rung that answers from behind any NAT today is the peer's inbox
+        # on the shared router (core.peer_link.relay), which
+        # link_manager._try_auto_upgrade dials after the direct address.
 
         # Strategy 5: Crossbar relay (legacy fallback)
         ws_url = self._try_crossbar_relay()

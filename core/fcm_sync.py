@@ -62,33 +62,6 @@ def fetch_central_fcm_token(user_id, timeout=8):
         return None
 
 
-def fetch_central_fcm_token_by_node(node_id, timeout=8):
-    """GET the FCM token registered for a peer_link ``node_id`` from the central
-    registry (``GET {registry}/get_node_token/{node_id}``, written by the
-    pre-login ``POST /register_node_token``).
-
-    Sibling of ``fetch_central_fcm_token``, keyed by the node's ed25519 device
-    identity rather than a user account — the reach for a device that has NOT yet
-    logged in (the desktop already auto-discovers the same node_id on the LAN).
-    Returns the token, or None when unregistered / unreachable.  Robust to both
-    the bare-string body ``get_node_token`` returns and a ``{"token": ...}`` wrap.
-    Timeout-bounded + exception-handled (never raises)."""
-    if not node_id:
-        return None
-    try:
-        import requests
-        resp = requests.get(f"{_FCM_REGISTRY}/get_node_token/{node_id}", timeout=timeout)
-        if resp.status_code != 200:
-            return None
-        body = resp.json()
-        if isinstance(body, str):
-            return body.strip() or None
-        return parse_fcm_token_response(body)
-    except Exception as e:
-        logger.debug("fetch_central_fcm_token_by_node(%s) failed: %s", node_id, e)
-        return None
-
-
 _CREATE_TABLE = (
     "CREATE TABLE IF NOT EXISTS fcm_tokens ("
     "user_id TEXT PRIMARY KEY, token TEXT NOT NULL, synced_at TEXT)"
@@ -146,8 +119,8 @@ def get_local_fcm_token(user_id):
 # The central FCM registry is keyed by the central Hevolve account id (the
 # phone / account-number, e.g. 9003054371), but the local notification path
 # carries the local social ``User.id`` (a UUID).  When HARTOS knows the central
-# id for a user — it learns it at login with the central account, or central
-# pushes it down in the user-sync payload — we stash it on the canonical local
+# id for a user — from the person's own profile pull (core.profile_sync), never
+# from a sync batch (#188) — we stash it on the canonical local
 # record (``User.settings['central_user_id']``, a migration-free JSON field) so
 # the pull can query the registry by the id it is actually keyed with, instead
 # of the UUID that always missed (#90).  No mapping known → callers fall back to
@@ -183,8 +156,8 @@ def set_central_id(user_id, central_id):
     it knows both ids.  Idempotent, best-effort; returns True on a stored value.
 
     Note: writes through a fresh session, so the local User row must already be
-    committed.  Sync-time capture (a User created in the same transaction) sets
-    ``settings`` inline instead — see sync_engine._handle_sync_user."""
+    committed (core.profile_sync.sync_profile calls it after its user write
+    commits)."""
     if not user_id or not central_id:
         return False
     try:
@@ -291,7 +264,7 @@ def _fcm_credential():
     trigger a blocking token fetch just to discover it cannot send. Before this
     ordering, send_fcm_push fired an up-to-8s blocking GET per expired message in
     DeliveryTracker's cleanup loop, then no-op'd (2026-06-05 sweep, same family
-    as the governor hang). Shared by the user-keyed and node-keyed send paths."""
+    as the governor hang)."""
     access = _fcm_access_token()
     project = os.environ.get('HART_FCM_PROJECT', '')
     if not access or not project:
@@ -301,9 +274,8 @@ def _fcm_credential():
 
 def _post_fcm_message(access, project, token, title, body, data, timeout):
     """POST one built message to FCM v1.  Returns True on a 200, else False.
-    Never raises.  The SINGLE FCM-send implementation shared by both push paths
-    (send_fcm_push by user_id, send_fcm_push_to_node by node_id) — no parallel
-    send."""
+    Never raises.  The single FCM-send implementation (send_fcm_push's direct
+    leg)."""
     try:
         import requests
         resp = requests.post(
@@ -322,47 +294,135 @@ def _post_fcm_message(access, project, token, title, body, data, timeout):
         return False
 
 
-def send_fcm_push(user_id, title, body, data=None, timeout=8):
-    """Push an FCM notification to ``user_id``'s device using the LOCALLY-cached
-    token (syncing it first if absent) — the decentralized, no-crossbar send.
+# Keys central builds for itself (confirmation.py) or drops from a relayed push.
+_CENTRAL_OWNED_PUSH_KEYS = ('type', 'topic_reply', 'user_id', 'request_id', 'action',
+                            'title', 'body', 'bot_type', 'topic_name', 'response')
 
-    Best-effort, never raises.  Returns True on a 200 from FCM, else False (no
-    token, no credential/project, network/HTTP error).  The edge credential
-    (HART_FCM_SA_FILE / HART_FCM_ACCESS_TOKEN) + HART_FCM_PROJECT gate the real
-    send, so a node with no push credential degrades cleanly to a no-op.
+
+def hand_push_to_central(user_id, title, body, data=None):
+    """Give a push to central's relay when this node has no FCM credential.
+
+    A consumer install has no Firebase service account, and must not: central
+    already holds one (chatbot_pipeline/confirmation.py).  The node publishes
+    the message as a PENDING confirmation on the bus (topic 'task.confirmation',
+    which the default relay bridge carries to central); central looks up the
+    user's token and pushes it after its own delay, carrying ``push_title`` and
+    ``push_data`` through so the phone receives what was meant to be sent.
+
+    Central keys the token by the numeric account id (it does int() on the
+    topic suffix), so a local id with no known central mapping is not handed
+    off -- a non-numeric suffix would raise inside central's loop.
+
+    Reach depends on the node's mode.  The message leaves on the bus's
+    crossbar leg; Nunba points that at central only in Hybrid/Hive mode
+    (main.py), and at the local Flask bridge in local-only mode, where it
+    never reaches central.  Central also pushes only a pending message that is
+    still unacknowledged after 30 s and sweeps every 10 s, so a relayed push
+    lands 30-40 s late.  A consent prompt uses this path too (it is the only
+    way a credential-less node can reach a phone that is not looking at the
+    app); the consent itself stays pending, and is also a notification record
+    and a fleet command, so a prompt that arrives late is still honoured -- the
+    overlay's own 60 s dismiss only hides the overlay.  Its message is shaped
+    the way central's existing consent path expects: bot_type='consent_prompt'
+    and the consent's own request_id, so the phone's answer maps back.
+
+    Returns True only when a crossbar transport ACCEPTED (queued) the message,
+    as the bus counts it.  The transport posts asynchronously, so a later
+    failure of the post is not seen here, and True is neither a delivery receipt
+    nor proof the message reached central.  False when there is nothing to hand
+    off or no transport took it.  Best-effort, never raises.
+    """
+    try:
+        central_id = resolve_central_id(user_id) or str(user_id)
+        if not str(central_id).isdigit():
+            logger.debug("hand_push_to_central(%s): no numeric central id", user_id)
+            return False
+        import uuid
+        from core.peer_link.message_bus import get_message_bus
+        data = data or {}
+        consent = str(data.get('type', '')) == 'consent_prompt'
+        # central keys a consent's answer by this id, so keep the consent's own
+        request_id = (str(data['request_id']) if consent and data.get('request_id')
+                      else 'push-' + uuid.uuid4().hex)
+        # Central derives these itself or drops them, and the shared-URI egress
+        # scrub would rewrite a 10-digit id inside them (a reply topic became
+        # '...pupit.[PHONE_REDACTED]'), so none of them belong in push_data.
+        push_data = {str(k): str(v) for k, v in data.items()
+                     if k not in _CENTRAL_OWNED_PUSH_KEYS}
+        # type is central's to decide for a consent; a game-sound review names its own
+        if not consent and data.get('type'):
+            push_data['type'] = str(data['type'])
+        push_data['privacy_tier_skipped'] = 'true'
+        push_data['privacy_notice'] = _PRIVACY_TIER_NOTICE
+        message = {
+            'request_id': request_id,
+            'topic_name': f'com.hertzai.pupit.{central_id}',
+            'bot_type': 'consent_prompt' if consent else 'Hevolve',
+            'confirmation': False,
+            'user_id': str(central_id),
+            'text': [body or ''],
+            'push_title': title or '',
+            'push_data': push_data,
+        }
+        if consent:
+            message['action'] = 'consent_prompt'
+        bus = get_message_bus()
+        before = bus.get_stats().get('delivered_crossbar', 0)
+        bus.publish('task.confirmation', message,
+                    user_id=str(user_id), skip_sse=True, skip_peerlink=True)
+        return bus.get_stats().get('delivered_crossbar', 0) > before
+    except Exception as e:
+        logger.debug("hand_push_to_central failed: %s", e)
+        return False
+
+
+def _relay_push(user_id, title, body, data):
+    """The relay leg of send_fcm_push: central sends it.  A consent that could
+    not be queued must not vanish quietly."""
+    handed = hand_push_to_central(user_id, title, body, data)
+    if not handed and str((data or {}).get('type', '')) == 'consent_prompt':
+        logger.warning("consent prompt for %s was not queued for the phone "
+                       "(the direct send did not go and no relay transport "
+                       "accepted it); it remains pending as a notification "
+                       "and in the app", user_id)
+    return handed
+
+
+def send_fcm_push(user_id, title, body, data=None, timeout=8, relay=True):
+    """Push an FCM notification to ``user_id``'s device.
+
+    One push takes exactly one path.  The direct send comes first: this node's
+    own FCM credential plus the LOCALLY-cached token (synced first if absent).
+    When that did not send (no credential, no token, FCM refused or timed out)
+    the push goes to central's relay instead (see ``hand_push_to_central`` for
+    its limits, notably the 30-40 s it takes).  The relay is only tried after
+    the direct send reported failure, so a push goes down one path per reported
+    result.  (A POST that timed out after FCM accepted it reads as a failure
+    and can be duplicated by the relay; that is the cost of a best-effort send.)
+
+    The relay is on by default: a consumer install has no Firebase credential,
+    and nobody opts in to being reachable.  ``relay=False`` is for a caller
+    that must never leave this node.
+
+    Best-effort, never raises.  Returns True when FCM answered 200 (direct) or
+    the bus queued the message for central (relay; that is not a delivery
+    receipt), else False.  The edge credential (HART_FCM_SA_FILE /
+    HART_FCM_ACCESS_TOKEN) + HART_FCM_PROJECT gate the direct send.
     """
     if not user_id:
         return False
     access, project = _fcm_credential()
-    if not access:
-        logger.debug("send_fcm_push(%s): no FCM credential/project — push disabled", user_id)
+    if access:
+        token = get_local_fcm_token(user_id) or sync_fcm_token(user_id)
+        if token and _post_fcm_message(access, project, token, title, body,
+                                       data, timeout):
+            return True
+    else:
+        logger.debug("send_fcm_push(%s): no FCM credential/project, direct send off",
+                     user_id)
+    if not relay:
         return False
-    token = get_local_fcm_token(user_id) or sync_fcm_token(user_id)
-    if not token:
-        return False
-    return _post_fcm_message(access, project, token, title, body, data, timeout)
-
-
-def send_fcm_push_to_node(node_id, title, body, data=None, timeout=8):
-    """Push an FCM notification to a device by its peer_link ``node_id`` — the
-    PRE-LOGIN reach.  The token was registered centrally against the node's
-    ed25519 identity (POST /register_node_token); the desktop, having
-    auto-discovered that node_id on the LAN, wakes the phone off-LAN through it.
-
-    Same credential gate + FCM send as send_fcm_push (the shared _fcm_credential
-    / _post_fcm_message helpers) — ONLY the token resolution differs, by node
-    rather than user.  Best-effort, never raises; returns True on a 200, else
-    False (no token, no credential/project, network/HTTP error)."""
-    if not node_id:
-        return False
-    access, project = _fcm_credential()
-    if not access:
-        logger.debug("send_fcm_push_to_node(%s): no FCM credential/project — push disabled", node_id)
-        return False
-    token = fetch_central_fcm_token_by_node(node_id)
-    if not token:
-        return False
-    return _post_fcm_message(access, project, token, title, body, data, timeout)
+    return _relay_push(user_id, title, body, data)
 
 
 # Read from the environment as this node's own configuration or key

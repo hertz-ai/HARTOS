@@ -1,0 +1,234 @@
+"""An action that names a tool is done by that tool's work.
+
+LIVE, installed build: prompts/26251890627_0_recipe.json, the recipe the coding
+daemon replays for self-heal goal cff5c272 (cosyvoice3 probe failure), was
+banked 2026-09-15 as status "completed" with every action "done".  Its plan is
+five "execute_coding_task: read <file>" actions; every banked step is a
+send_message_to_user saying "Please wait while I read the file" -- nothing was
+read.  Replayed 2026-10-05 16:08 IST: execute_coding_task failed honestly and
+the agent asked the absent user to paste the log.
+
+Reproduced on the real completion gate (scratchpad repro_147.py, 2026-10-05):
+for the action "execute_coding_task: read error log file ...", both a
+send_message_to_user reply ("Message sent successfully ...") and the
+Assistant's promise "I will read the error log file and share what I find"
+were accepted as the action's receipt.  And CREATE's trace banker banks a
+window of messages as the recipe of an action that names a coding tool.
+
+The REUSE fabrication gate already holds the rule: an action that names a
+registered tool is unrun until that tool returns a real result
+(reuse_recipe._reuse_fabricated_tools).  The completion gate and the trace
+banker now ask the same question by the same derivation
+(lifecycle_hooks.action_named_tools), so the three cannot disagree.
+"""
+import json
+import os
+import sys
+from types import SimpleNamespace
+
+import pytest
+
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+from hartos import lifecycle_hooks as lh  # noqa: E402
+from tests.unit.test_completion_needs_real_work import (  # noqa: E402
+    _CODING_RESULT, _Harness, _Ledger, _call, _result)
+from tests.unit.test_trace_action_banking import banked  # noqa: E402,F401
+
+S = lh.ActionState
+
+# The live action text and the live steps, verbatim from the banked recipe.
+_LIVE_ACTION = ('execute_coding_task: read error log file C:\\Users\\sathi\\Documents'
+                '\\Nunba\\logs\\tts_cosyvoice3.err to get full traceback')
+_SENT = 'Message sent successfully to user with request_id: daemon_cff5c272'
+_PROMISE = 'I will read the error log file and share what I find.'
+
+
+def _agent(*tools):
+    """A group-chat participant that serves ``tools`` (its function map)."""
+    return SimpleNamespace(name='Helper', llm_config=None,
+                           _function_map={t: (lambda **_kw: None) for t in tools})
+
+
+_SERVED = ('execute_coding_task', 'send_message_to_user',
+           'execute_windows_or_android_command', 'save_data_in_memory')
+
+
+class TestTheCompletionGate(_Harness):
+    def setUp(self):
+        super().setUp()
+        self.gc.agents = [_agent(*_SERVED)]
+        self.ledger = _Ledger(_LIVE_ACTION)
+
+    def _commit(self, index, kind='tool_receipt'):
+        self._state(S.IN_PROGRESS, S.STATUS_VERIFICATION_REQUESTED)
+        return lh.commit_verified_action_completion(
+            self.UP, 1, {'message_index': index, 'kind': kind})
+
+    def test_a_message_to_the_person_is_not_the_coding_work(self):
+        self._log(_call('m', 'send_message_to_user',
+                        '{"text": "Please wait while I read the file!"}'),
+                  _result('m', _SENT))
+        self.assertFalse(self._commit(2))
+        self.assertEqual(lh.get_action_state(self.UP, 1),
+                         S.STATUS_VERIFICATION_REQUESTED)
+
+    def test_a_promise_is_not_the_coding_work(self):
+        self._log({'role': 'assistant', 'name': 'Assistant', 'content': _PROMISE})
+        self.assertFalse(self._commit(1, kind='user_visible_result'))
+
+    def test_the_named_tools_own_result_completes_it(self):
+        """Control: the work the action names still completes it."""
+        self._log(_call('c', 'execute_coding_task'), _result('c', _CODING_RESULT))
+        self.assertTrue(self._commit(2))
+        self.assertEqual(lh.get_action_state(self.UP, 1), S.COMPLETED)
+
+    def test_a_written_answer_completes_an_action_that_names_no_tool(self):
+        """Unchanged: a prose action is done by its answer."""
+        self.ledger = _Ledger('Summarize the findings for the person')
+        self._log({'role': 'assistant', 'name': 'Assistant',
+                   'content': 'The probe failed because the worker timed out.'})
+        self.assertTrue(self._commit(1, kind='user_visible_result'))
+
+    def test_a_message_completes_an_action_that_names_messaging(self):
+        self.ledger = _Ledger('send_message_to_user: tell the owner the backup finished')
+        self._log(_call('m', 'send_message_to_user'), _result('m', _SENT))
+        self.assertTrue(self._commit(2))
+
+    def test_a_result_no_call_names_is_not_the_named_tools_work(self):
+        """A tool result whose call id resolves to no proposed call cannot be
+        shown to be execute_coding_task's work, the way the REUSE gate counts
+        only a result it resolves to a tool the action names."""
+        self._log({'role': 'assistant', 'name': 'Assistant', 'content': 'ok'},
+                  _result('orphan', _CODING_RESULT))
+        self.assertFalse(self._commit(2))
+
+    def test_a_result_no_call_names_still_completes_a_prose_action(self):
+        """Unchanged: for an action that names no tool such a result is
+        judged on its content alone."""
+        self.ledger = _Ledger('Summarize the findings for the person')
+        self._log({'role': 'assistant', 'name': 'Assistant', 'content': 'ok'},
+                  _result('orphan', _CODING_RESULT))
+        self.assertTrue(self._commit(2))
+
+    def test_a_word_that_spells_a_tool_does_not_make_prose_a_tool_step(self):
+        """LIVE 2026-10-10 15:35-15:42 IST, agent 54 CREATE (a54-addc628e387c):
+        step 2 is the tutor's written reply, and its rule (i) reads "remember
+        the interrupted one".  The memory tool `remember` is registered on the
+        same agents, so the step read as naming it: every completed verdict was
+        refused ("no tool result of this action's work") and the step GAVE_UP
+        on a correct reply.  A plain word is not a tool's name."""
+        self.gc.agents = [_agent(*_SERVED, 'remember', 'recall_memory')]
+        self.ledger = _Ledger(_TUTOR_STEP)
+        self._log({'role': 'assistant', 'name': 'Assistant',
+                   'content': 'I am confirming this. The Water Cycle chapter '
+                              'is pages 1 to 2. Shall we start?'})
+        self.assertTrue(self._commit(1, kind='user_visible_result'))
+        self.assertEqual(lh.get_action_state(self.UP, 1), S.COMPLETED)
+
+
+# The live step, shortened: agent 54's step 2 as the 10-10 interview saved it.
+_TUTOR_STEP = ("Write this turn's reply to the learner yourself, as your own chat "
+               "message to them. (i) a new topic in the middle of a lesson: "
+               "remember the interrupted one, then start the new one.")
+
+
+@pytest.mark.parametrize('text,named', [
+    # The live shape, and two more measured in the desktop's 1,087 configs:
+    # the only three of 1,653 (action, tool) matches the narrower rule drops.
+    (_TUTOR_STEP, []),
+    ("send_message_to_user with content='I will remember your preferences'",
+     ['send_message_to_user']),
+    ('Remember: real wellness beats screen time.', []),
+    # A one-word name written as a call still names the tool.
+    ('Call remember with the learner\'s progress.', ['remember']),
+    ('use remember to store it', ['remember']),
+    ('remember(text=progress)', ['remember']),
+    ('The `remember` tool stores it.', ['remember']),
+    ('Store it in "remember".', ['remember']),
+    # ... and only as a whole word: another word that starts with it is not.
+    ('use remembered notes', []),
+    # The way a person writes the call (review of d5c8c49bf, hartos-87): an
+    # article between the verb and the name, "tool" / "function" after it,
+    # and more verb forms.
+    ("Call the remember tool to store the learner's progress.", ['remember']),
+    ('invoke the remember function', ['remember']),
+    ('calling remember now', ['remember']),
+    ('it uses remember for that', ['remember']),
+    ('execute remember', ['remember']),
+    # Each of those signals alone: the noun after, the article, a long verb.
+    ('the remember tool stores the progress', ['remember']),
+    ('Call the remember action with the progress', ['remember']),
+    ('executing your remember action now', ['remember']),
+    # Prose that puts "with" (or a stray "tool") before the word is not a call.
+    ('start with remember the names of the learners', []),
+    ('be careful with remember and recall of facts', []),
+    ('I will tool remember', []),
+    # recall is the other one-word servable name (the MCP bridge).
+    ('recall the last lesson, then continue', []),
+    ('use recall to find the last lesson', ['recall']),
+    # An unbalanced quote at the very end of the text is not a quoted name.
+    ('save it as "remember', []),
+    # A name shaped like an identifier names the tool wherever it stands, as
+    # before: unchanged for every other match on the desktop.
+    ('call_save_data_in_memory with the progress', ['save_data_in_memory']),
+    ('Call save_data_in_memory, then stop.', ['save_data_in_memory']),
+])
+def test_what_an_action_names(text, named):
+    agents = [_agent('remember', 'recall', 'recall_memory', 'save_data_in_memory',
+                     'send_message_to_user')]
+    assert sorted(lh.action_named_tools(agents, text)[1]) == named, text
+
+
+class TestTheTraceBanker:
+    @pytest.fixture(autouse=True)
+    def _live_action(self, monkeypatch):
+        from tests.unit import test_trace_action_banking as tab
+        monkeypatch.setattr(tab._FakeTask, 'get_action', lambda self, i: {
+            'action': _LIVE_ACTION, 'fallback_action': ''})
+
+    @staticmethod
+    def _trace(calls):
+        msgs = [{'content': f'Execute Action 2: {_LIVE_ACTION}'}]
+        for i, (name, body) in enumerate(calls):
+            msgs.append({'content': '', 'tool_calls': [{'id': f'c{i}', 'function': {
+                'name': name, 'arguments': '{}'}}]})
+            msgs.append({'content': body, 'role': 'tool', 'tool_responses': [
+                {'tool_call_id': f'c{i}', 'role': 'tool', 'content': body}]})
+        return msgs
+
+    def test_the_live_window_of_messages_is_not_banked(self, banked):
+        """The 09-15 recipe's steps: three messages, no read."""
+        ok, data, _ = banked(self._trace([('send_message_to_user', _SENT)] * 3),
+                             agents=[_agent(*_SERVED)])
+        assert ok is False and data is None, data
+
+    def test_the_coding_tools_run_is_banked(self, banked):
+        ok, data, _ = banked(self._trace([('send_message_to_user', _SENT),
+                                          ('execute_coding_task', _CODING_RESULT)]),
+                             agents=[_agent(*_SERVED)])
+        assert ok is True
+        assert 'execute_coding_task' in [s['tool_name'] for s in data['recipe']]
+
+    def test_no_workless_marker_for_an_action_that_names_a_tool(self, banked):
+        """"no-op: action completed without tool execution" is a recipe that
+        replays nothing; for an action that names a tool it is a phantom."""
+        ok, data, _ = banked([{'content': f'Execute Action 2: {_LIVE_ACTION}'},
+                              {'content': _PROMISE}],
+                             agents=[_agent(*_SERVED)])
+        assert ok is False and data is None, data
+
+
+def test_reuse_and_completion_name_tools_by_one_rule():
+    """The REUSE fabrication gate's derivation and the completion gate's are
+    one function, so the two ends cannot disagree about what an action
+    names."""
+    from hartos import reuse_recipe
+    agents = [_agent(*_SERVED)]
+    for text in (_LIVE_ACTION, 'Summarize the findings',
+                 'send_message_to_user: tell the owner'):
+        assert (reuse_recipe._reuse_registered_and_referenced_tools(agents, text)
+                == lh.action_named_tools(agents, text)), text
+    assert lh.action_named_tools(agents, _LIVE_ACTION)[1] == ['execute_coding_task']

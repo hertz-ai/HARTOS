@@ -199,30 +199,39 @@ def test_autogen_tool_functions():
     print("TEST 6: Autogen Tool Functions")
     print("=" * 80)
 
-    # Get tools for autogen
-    tools = get_ap2_tools_for_autogen("test_agent")
+    # Get tools for autogen.  authorize_payment is still offered (saved
+    # recipes call it) but by default it only ASKS the payment's owner; the
+    # ledger refuses 'system' / the requesting agent as an approver anyway.
+    tools = get_ap2_tools_for_autogen("test_agent", allow_llm_authorize=False)
 
-    assert len(tools) == 3  # request, authorize, process
+    assert len(tools) == 3  # request, authorize (ask-only), process
     assert all('function' in tool for tool in tools)
     assert all('name' in tool for tool in tools)
     assert all('description' in tool for tool in tools)
 
     tool_names = [tool['name'] for tool in tools]
-    assert 'request_payment' in tool_names
-    assert 'authorize_payment' in tool_names
-    assert 'process_payment' in tool_names
+    assert tool_names == ['request_payment', 'authorize_payment', 'process_payment']
+    ask = next(t for t in tools if t['name'] == 'authorize_payment')
+    assert 'cannot approve' in ask['description']
 
     print(f"[OK] Autogen tools generated correctly")
     print(f"   Tools: {', '.join(tool_names)}")
 
     # Test using the request_payment function
     request_func = next(t['function'] for t in tools if t['name'] == 'request_payment')
-    result_json = request_func(
-        amount=25.50,
-        currency="EUR",
-        description="Tool function test",
-        payment_method="internal_credits"
-    )
+    # The tool writes to the module ledger: point it at a tmp file, never at
+    # the user's real payment_ledger.json.
+    import tempfile
+    from unittest.mock import patch
+    from integrations.ap2 import ap2_protocol
+    with tempfile.TemporaryDirectory() as tmp,             patch.object(ap2_protocol, 'payment_ledger', PaymentLedger(
+                ledger_path=os.path.join(tmp, 'payment_ledger.json'))):
+        result_json = request_func(
+            amount=25.50,
+            currency="EUR",
+            description="Tool function test",
+            payment_method="internal_credits"
+        )
 
     result = json.loads(result_json)
     assert 'payment_id' in result

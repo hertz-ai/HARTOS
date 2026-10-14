@@ -182,6 +182,36 @@ class ThreadLocalData:
                     setattr(self._local, key, value)
         return _cm()
 
+    # --- Where the reply being published came from (local | hive | cloud) ---
+    # hart_intelligence_entry.publish_async stamps served_by on every chat
+    # envelope but the voice (a 'TTS' payload carries none).  The one
+    # site that KNOWS the backend (the dispatcher, once an expert answers) names
+    # it here around its delivery.  A context and not a keyword on purpose:
+    # Nunba rebinds hart_intelligence.publish_async with a wrapper that takes
+    # (topic, message, timeout) only, and safe_hartos_attr hands the dispatcher
+    # that wrapper, so a new keyword is a TypeError on the desktop and the
+    # expert's reply is never published.
+
+    def get_served_by(self):
+        """The origin the enclosing reply_from() block names, or None."""
+        return getattr(self._local, 'served_by', None)
+
+    def reply_from(self, served_by):
+        """Context manager: replies published inside the block are served by
+        ``served_by`` (any tag core.constants.canonical_served_by accepts),
+        then this thread gets its previous origin back."""
+        import contextlib
+
+        @contextlib.contextmanager
+        def _cm():
+            saved = self.get_served_by()
+            self._local.served_by = served_by
+            try:
+                yield
+            finally:
+                self._local.served_by = saved
+        return _cm()
+
     # --- Computer-use run context (set by integrations.vlm.local_loop) ---
     # The run a desktop action belongs to, so a tool that executes DURING a
     # run can announce itself as a step of that run instead of inventing its
@@ -207,6 +237,41 @@ class ThreadLocalData:
 
     def clear_activity_run(self):
         self._local.activity_run = None
+
+    # --- The run's workspace (set by integrations.vlm.local_loop) ---
+    # The folder a computer-use run works in: its declared task workspace
+    # (vlm_adapter.resolve_task_workspace).  A file action's relative path
+    # resolves here and every shell step of the run runs here, so a script
+    # one step writes is the script the next step runs.  Until 2026-10-05
+    # the workspace was only a sentence in the model's prompt: relative
+    # paths resolved in the process cwd and shell steps ran there (the
+    # install folder on the desktop), so the prompt's own route for a
+    # refused `python -c` -- write_file the script, then shell it -- could
+    # not find the file it had just written.  A context and not a keyword,
+    # as prompt_id is: the shell tool is reached through safe_hartos_attr
+    # with the command alone, on the run's thread or on an action worker
+    # that carry() hands this state to.
+
+    def get_workspace(self):
+        """The enclosing run's workspace folder, or None outside a run."""
+        return getattr(self._local, 'workspace', None)
+
+    def workspace(self, path):
+        """Context manager: the block is a run working in ``path``, then the
+        thread gets its previous workspace back.  An empty ``path`` names no
+        workspace, so the enclosing one, if any, stands."""
+        import contextlib
+
+        @contextlib.contextmanager
+        def _cm():
+            saved = self.get_workspace()
+            if path and str(path).strip():
+                self._local.workspace = str(path).strip()
+            try:
+                yield
+            finally:
+                self._local.workspace = saved
+        return _cm()
 
     # --- Agent creation signals (set by LangChain Create_Agent tool) ---
 
@@ -292,6 +357,14 @@ class ThreadLocalData:
     # module-level singleton, which is SHARED across threads, so concurrent
     # requests clobbered each other's channel; see set_/get_request_id for the
     # canonical _local-backed pattern every other per-request field follows.)
+
+    def set_client_user_agent(self, user_agent):
+        """The User-Agent of the request this thread serves ('' when none):
+        what a tool reads to tell a phone from a desktop."""
+        self._local.client_user_agent = user_agent or ''
+
+    def get_client_user_agent(self):
+        return getattr(self._local, 'client_user_agent', '')
 
     def set_channel_context(self, channel_context):
         self._local.channel_context = channel_context

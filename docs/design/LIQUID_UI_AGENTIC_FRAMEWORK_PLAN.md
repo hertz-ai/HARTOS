@@ -243,3 +243,64 @@ test_theme_service TestThemeAPI blueprint-fixture 404s, unchanged).
 
 Local test env: a fresh venv from base Python 3.12.10 (working ctypes) + flask/cryptography/
 pytest; `.mjs` run via `HART_TEST_PYTHON=<venv>` + node. Both are also exercised in CI.
+
+---
+
+## 2026-10-10: AI-native protocol, slice 1 (typed contract + readable verdict)
+
+Compared against OpenUI (Thesys), OpenAI's ChatKit widgets and Open-JSON-UI. What the
+protocol lacked for a MODEL to compose UI, each read from this file, not assumed:
+
+1. `agent_ui_update` returned a bare bool; every refusal went to the log only.
+2. 28 of 29 specs said every attribute is `'any'`; props were never validated.
+3. Whole-component replace only (no id, no patch, no streaming) - NOT in this slice.
+4. User answers reach an agent through bespoke per-card endpoints - NOT in this slice.
+
+Slice 1 (all in `liquid_ui_service.py`, one registry, no second path):
+- `COMPONENT_TYPES` entries gain `attributes` (the `metric` grammar: `str|number|bool|
+  list|dict|any|a|b|c`), `required`, `doc`, `example`, `aliases`. `props` is untouched
+  (tests and the shell read it). 25 types typed; `home`, `home_compose`, `app_installed`
+  stay untyped (owned by hartHome's sanitizers); `metric` keeps its own `spec`.
+- `validate_component()` (pure, total) -> issues `{path, code, level, expected, got, hint}`.
+- `agent_ui_compose(..., strict=False)` returns a verdict `{ok, valid, type, refused,
+  issues, hint}`. `agent_ui_update` is `compose(...)['ok']` with lenient checking, so the
+  17 production callers see the exact old contract. `strict=True` refuses schema errors.
+- `component_prompt()` / `component_json_schema()` are GENERATED from the registry.
+- `register_component_type` accepts typed `attributes`/`required`/`doc`/`example` and
+  refuses a contradictory declaration with the reason.
+- Tests: `tests/unit/test_a2ui_ai_native_registry.py` (41). Payload fixtures are copied
+  from the real emit sites, so the schema is pinned to what is sent.
+
+Contract mismatches the typed schema surfaced (NOT fixed here; each is a renderer or
+emitter change with its own evidence):
+- `toast`: `integrations/channels/agent_tools.py` sends `text` in two places. Nunba's
+  AgentOverlay `NotificationCard` reads `message`/`content`, so the reason is blank there.
+  The HART OS shell (`renderAgentOverlay` in this file) has no `toast` branch: it falls to
+  the generic fallback `ev.content||ev.message||JSON.stringify(ev)`, so `text` is not read
+  there either and the card shows a JSON dump.
+- `media`: `core/agent_tools.py` (game sound) sends `src`, the declared prop. The shell
+  reads `ev.src||ev.url`, so it plays; Nunba's AgentOverlay `MediaOverlay` plays `url`
+  only, so the mismatch is on the Nunba side.
+- `qr_pair`: declared `url`/`caption`; the emitter sends and the renderer reads `qr`.
+
+Catalogue readers: `component_prompt()` / `component_json_schema()` have NO in-tree
+caller yet. `_build_ui_prompt` (the `/api/ui` generator) still hand-writes "Valid types:
+card, metric, notification, list, progress, markdown" and `_generate_ai_ui` returns the
+model's JSON unvalidated. The first reader should be that pair: build the prompt from
+`component_prompt()` and drop components whose `validate_component` has an error-level
+issue. Not done; it changes what `/api/ui` serves, so it waits for the owner.
+
+`props` and `attributes` are two lists for one fact while `props` stays. It is deleted
+when `test_consent_fanout_p0`, `test_home_compose_feed` and `test_liquid_ui_meet_copilot`
+assert on `attributes`; the date is the owner's to name.
+
+Hand-edited custom-types file: every catalogue reader (`validate_component`,
+`component_prompt`, `component_json_schema`) goes through `_contract_of`, which reads a
+non-string or invalid-grammar spec as `'any'` and keeps only string names. A peer review
+reproduced `component_json_schema` raising on an int or list spec; that is pinned by
+`test_every_catalogue_reader_survives_a_hand_edited_custom_entry`.
+
+Next slices, in order: component `id` + `patch`/`append` with a `streaming|final`
+lifecycle (AgentOverlay already replaces `qr_pair` in place by channel); one `ui.event`
+back-channel so a click reaches the owning agent as a structured observation; a
+server-side `summary` recorded in the agent's history.

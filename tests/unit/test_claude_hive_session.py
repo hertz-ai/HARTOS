@@ -270,6 +270,18 @@ class TestClaudeHiveSessionReportResult(unittest.TestCase):
         s.connect(user_id='u1')
         return s
 
+    def test_a_dispatcher_failure_on_report_is_a_warning(
+            self, mock_emit, mock_peer):
+        """RED before: logged at DEBUG, so a task whose result never reached
+        the dispatcher (status stuck at 'assigned') left no visible trace."""
+        session = self._connected_session()
+        with patch('integrations.coding_agent.hive_task_protocol.get_dispatcher',
+                   side_effect=RuntimeError('tasks file locked')), \
+             self.assertLogs('hevolve.hive_session', level='WARNING') as logs:
+            session._report_result('t9', {'status': 'completed', 'changes': []})
+        self.assertTrue(any('tasks file locked' in m for m in logs.output),
+                        logs.output)
+
     def test_report_result_completed_updates_stats(
             self, mock_emit, mock_peer):
         session = self._connected_session()
@@ -654,6 +666,23 @@ class TestFlaskBlueprint(unittest.TestCase):
         data = resp.get_json()
         self.assertTrue(data['success'])
         self.assertIn('session_id', data)
+
+    @patch(f'{_PATCH_PREFIX}.get_link_manager', create=True, side_effect=ImportError)
+    @patch(f'{_PATCH_PREFIX}.emit_event', create=True)
+    def test_result_route_reports_a_dispatcher_failure(self, mock_emit, mock_peer):
+        """RED before: `except Exception: pass` answered success with an empty
+        reward, so the reporter believed the hive had the result while the
+        task's status never moved."""
+        self.client.post('/api/hive/session/connect', json={'user_id': 'tester'})
+        with patch('integrations.coding_agent.hive_task_protocol.get_dispatcher',
+                   side_effect=RuntimeError('tasks file locked')), \
+             self.assertLogs('hevolve.hive_session', level='WARNING') as logs:
+            resp = self.client.post('/api/hive/session/task/t9/result',
+                                    json={'status': 'completed'})
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn('tasks file locked',
+                      resp.get_json().get('dispatcher_error', ''))
+        self.assertTrue(any('t9' in m for m in logs.output), logs.output)
 
     @patch(f'{_PATCH_PREFIX}.get_link_manager', create=True, side_effect=ImportError)
     @patch(f'{_PATCH_PREFIX}.emit_event', create=True)

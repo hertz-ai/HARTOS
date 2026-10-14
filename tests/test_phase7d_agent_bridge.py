@@ -152,3 +152,150 @@ def test_worker_survives_transient_tick_exception(monkeypatch):
     assert len(bridges) == 1
     assert bridges[0]['alive'] is True
     assert raised['count'] >= 1  # the crash actually fired
+
+
+# ── The agent's voice in a call: the one TTS router ─────────────────────────
+
+
+def _wav(path, frames=b'\x01\x00\x02\x00' * 80, rate=22050, channels=1):
+    import wave
+    with wave.open(str(path), 'wb') as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(2)
+        wf.setframerate(rate)
+        wf.writeframes(frames)
+    return frames
+
+
+def _router_and_pocket(monkeypatch, result):
+    """The canonical TTS router (recording its calls, answering ``result``)
+    and the PocketTTS tool the bridge used to call directly (recording)."""
+    from integrations.channels.media import tts_router
+    from integrations.service_tools import pocket_tts_tool
+    calls, pocket = [], []
+
+    class _Router:
+        def synthesize(self, text, **kw):
+            calls.append((text, kw))
+            return result
+
+    monkeypatch.setattr(tts_router, 'get_tts_router', lambda: _Router())
+    monkeypatch.setattr(pocket_tts_tool, 'pocket_tts_synthesize',
+                        lambda *a, **k: pocket.append(a) or '{"error": "unused"}')
+    return calls, pocket
+
+
+def _router_result(path):
+    from integrations.channels.media.tts_router import TTSResult
+    return TTSResult(
+        path=str(path), duration=0.1, engine_id='pocket_tts', device='cpu',
+        location='local', latency_ms=5, sample_rate=24000, voice='default',
+        quality_score=0.85)
+
+
+def test_the_agents_call_reply_is_spoken_by_the_one_tts_router(monkeypatch, tmp_path):
+    """One TTS path: the call's voice comes from TTSRouter.synthesize -- the
+    canonical synth entry, with its engine ladder and text normalisation --
+    never from one engine called directly, and as a call (tests/unit/
+    test_tts_router.py TestACallIsSpokenLive: which voice a call gets)."""
+    from integrations.social.agent_voice_bridge import AgentBridgeWorker
+    frames = _wav(tmp_path / 'reply.wav', rate=24000)
+    calls, pocket = _router_and_pocket(
+        monkeypatch, _router_result(tmp_path / 'reply.wav'))
+    worker = AgentBridgeWorker('call-1', 'agent-1', 'owner-1', {})
+    assert worker._synthesize_pcm('Halves are two equal parts.') == (frames, 24000, 1)
+    assert calls == [('Halves are two equal parts.', {'source': 'call'})]
+    assert pocket == []
+
+
+@pytest.mark.parametrize('dtype', ['float32', 'float64'])
+def test_a_reply_an_engine_wrote_as_float_is_voiced(monkeypatch, tmp_path, dtype):
+    """pocket_tts_tool writes its tensor with scipy.io.wavfile, which makes a
+    float tensor an IEEE-float WAV; the stdlib ``wave`` module refuses one
+    ('unknown format: 3'), and the call heard nothing (review of ca1de342a,
+    finding 2)."""
+    import numpy as np
+    import scipy.io.wavfile
+    from integrations.social.agent_voice_bridge import AgentBridgeWorker
+    samples = np.array([0.0, 0.25, -0.5, 1.0, -1.0, 1.5], dtype=dtype)
+    scipy.io.wavfile.write(str(tmp_path / 'reply.wav'), 24000, samples)
+    _router_and_pocket(monkeypatch, _router_result(tmp_path / 'reply.wav'))
+    worker = AgentBridgeWorker('call-1', 'agent-1', 'owner-1', {})
+    pcm, rate, channels = worker._synthesize_pcm('Halves are two equal parts.')
+    assert (rate, channels) == (24000, 1)
+    assert list(np.frombuffer(pcm, dtype='<i2')) == [
+        0, 8192, -16384, 32767, -32768, 32767]
+
+
+def test_a_float_sample_lands_on_the_nearest_16_bit_step(monkeypatch, tmp_path):
+    """1.7 and -1.7 sixteen-bit steps are 2 and -2, not cut toward zero."""
+    import numpy as np
+    import scipy.io.wavfile
+    from integrations.social.agent_voice_bridge import AgentBridgeWorker
+    step = 1.0 / 32768
+    scipy.io.wavfile.write(str(tmp_path / 'reply.wav'), 24000,
+                           np.array([1.7 * step, -1.7 * step], dtype='float32'))
+    _router_and_pocket(monkeypatch, _router_result(tmp_path / 'reply.wav'))
+    worker = AgentBridgeWorker('call-1', 'agent-1', 'owner-1', {})
+    pcm, _, _ = worker._synthesize_pcm('hi')
+    assert list(np.frombuffer(pcm, dtype='<i2')) == [2, -2]
+
+
+def test_a_pcm16_reply_reaches_the_room_sample_for_sample(monkeypatch, tmp_path):
+    """Reading through floats must not move a 16-bit sample, full range."""
+    import struct
+    from integrations.social.agent_voice_bridge import AgentBridgeWorker
+    full = struct.pack('<6h', -32768, -32767, -1, 0, 32766, 32767)
+    _wav(tmp_path / 'reply.wav', frames=full, rate=24000)
+    _router_and_pocket(monkeypatch, _router_result(tmp_path / 'reply.wav'))
+    worker = AgentBridgeWorker('call-1', 'agent-1', 'owner-1', {})
+    assert worker._synthesize_pcm('hi') == (full, 24000, 1)
+
+
+def test_a_stereo_reply_is_spoken_as_one_voice(monkeypatch, tmp_path):
+    """Left 1000 and right 3000 are one voice at 2000, not their sum."""
+    import struct
+    from integrations.social.agent_voice_bridge import AgentBridgeWorker
+    _wav(tmp_path / 'reply.wav', frames=struct.pack('<hh', 1000, 3000) * 4,
+         rate=16000, channels=2)
+    _router_and_pocket(monkeypatch, _router_result(tmp_path / 'reply.wav'))
+    worker = AgentBridgeWorker('call-1', 'agent-1', 'owner-1', {})
+    assert worker._synthesize_pcm('hi') == (struct.pack('<h', 2000) * 4, 16000, 1)
+
+
+def test_a_reply_the_room_does_not_take_is_said(monkeypatch, caplog):
+    """push_pcm answers False when the publisher is stopped or not yet
+    connected; the reply was dropped without a word."""
+    import integrations.social.agent_voice_bridge as avb
+    pushed = []
+
+    class _Publisher:
+        def push_pcm(self, pcm, src_rate, src_channels):
+            pushed.append((pcm, src_rate, src_channels))
+            return False
+
+    monkeypatch.setattr(avb, '_HAS_LIVEKIT_RTC', True)
+    monkeypatch.setattr(avb, '_hosts_rooms', lambda: True)
+    worker = avb.AgentBridgeWorker('call-1', 'agent-1', 'owner-1', {})
+    monkeypatch.setattr(worker, '_ensure_publisher', lambda: _Publisher())
+    monkeypatch.setattr(worker, '_synthesize_pcm',
+                        lambda text: (b'\x01\x00', 24000, 1))
+    with caplog.at_level('WARNING'):
+        worker._publish_audio_for('Halves are two equal parts.')
+    assert pushed == [(b'\x01\x00', 24000, 1)]
+    assert any('call-1' in r.getMessage() and 'Halves' in r.getMessage()
+               for r in caplog.records if r.levelname == 'WARNING')
+
+
+def test_a_call_reply_the_router_cannot_speak_says_why(monkeypatch, caplog):
+    from integrations.channels.media.tts_router import TTSResult
+    from integrations.social.agent_voice_bridge import AgentBridgeWorker
+    _router_and_pocket(monkeypatch, TTSResult(
+        path='', duration=0, engine_id='none', device='none', location='none',
+        latency_ms=0, sample_rate=0, voice='', quality_score=0,
+        error='no engine installed'))
+    worker = AgentBridgeWorker('call-1', 'agent-1', 'owner-1', {})
+    with caplog.at_level('WARNING'):
+        assert worker._synthesize_pcm('hello') == (b'', 0, 1)
+    assert any('no engine installed' in r.getMessage() and 'call-1' in r.getMessage()
+               for r in caplog.records)

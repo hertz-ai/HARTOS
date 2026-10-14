@@ -1037,6 +1037,31 @@ class _Supervisor(ProcessSupervisor):
                     env['HEVOLVE_LOCAL_LLM_URL'] = _llm_url
             except Exception:
                 pass
+        # THE NODE'S HIVE IDENTITY (hevolveai C310). Every hive message the child
+        # publishes names a role ("thinking_engine") or its storage namespace
+        # ("default" on every unconfigured install), so peers could not tell one
+        # node from another. Hand it the ONE canonical node id this node already
+        # gossips under (GossipProtocol.node_id, persisted by
+        # security.node_integrity). HEVOLVE_NODE_NAME is NOT reused: it names the
+        # child's checkpoint folder, and changing it would orphan learned state.
+        # Resolved by the SAME helper the distributed stack uses
+        # (worker_loop._worker_node_id: SyncEngine.canonical_node_id first, then
+        # a configured HEVOLVE_NODE_ID, never a shared placeholder such as
+        # 'unknown'), so the child's identity, precedence and placeholder filter
+        # match the rest of HARTOS. Best-effort: identity trouble never blocks
+        # the spawn. With no identity the variable is REMOVED from the child's
+        # env, so an inherited placeholder cannot reach it; the child then sends
+        # no node id and behaves exactly as before C310 (no gate).
+        _nid = ''
+        try:
+            from integrations.distributed_agent.worker_loop import _worker_node_id
+            _nid = _worker_node_id()
+        except Exception:
+            logger.debug("hevolveai child: node identity unavailable", exc_info=True)
+        if _nid:
+            env['HEVOLVE_NODE_ID'] = _nid
+        else:
+            env.pop('HEVOLVE_NODE_ID', None)
         if self.pythonpath:
             existing = env.get('PYTHONPATH', '')
             env['PYTHONPATH'] = (

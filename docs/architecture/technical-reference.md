@@ -999,7 +999,8 @@ Three modes per adapter: `pairing` (require code), `open`, `closed`.
 3. Filter: GPU available? VRAM fits? Engine installed?
 4. Filter: compute_policy (local_only/preferred/any)
 5. Hive peer offload if GPU needed but unavailable
-6. Rank by urgency (instant/normal/quality)
+6. Rank by urgency (instant/normal/quality/live; live = a call: local engines
+   by quality, a hive peer only when none here can speak, no LLM rewrite)
 7. Execute top candidate, fallback chain
 8. espeak-ng ultimate fallback (100+ languages, CPU)
 ```

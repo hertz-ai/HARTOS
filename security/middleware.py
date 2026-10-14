@@ -28,7 +28,17 @@ def _apply_security_headers(app: Flask):
 
     @app.after_request
     def add_security_headers(response):
-        response.headers['X-Frame-Options'] = 'DENY'
+        # SAMEORIGIN, not DENY: under HART OS the shell (hart-liquid-ui on
+        # :6800) frames every Nunba route panel (assistant, agents, recipes,
+        # communities) through its same-origin proxy, and a browser refuses
+        # to paint a DENY'd frame without a word in any log. Measured on the
+        # Samsung node, generation 18 (f8685023, 2026-10-11): the pinned
+        # assistant panel loaded Nunba's bundle (the proxy logged the 200s)
+        # and stayed blank. The page's own origin is the ONLY ancestor
+        # admitted; every other site is refused exactly as before. The
+        # CSP's frame-ancestors below says the same thing and wins when both
+        # are present. Nunba's main.py carries its own copy of this policy.
+        response.headers['X-Frame-Options'] = 'SAMEORIGIN'
         response.headers['X-Content-Type-Options'] = 'nosniff'
         response.headers['X-XSS-Protection'] = '1; mode=block'
         response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
@@ -48,23 +58,36 @@ def _apply_security_headers(app: Flask):
                 "style-src 'self'; "
                 "img-src 'self' data:; "
                 "connect-src 'self'; "
-                "frame-ancestors 'none'"
+                "frame-ancestors 'self'"
             )
 
         return response
 
 
+#: Env vars whose comma-separated origins together form the CORS allowlist.
+#: MCGROCE_ORIGINS carries the McGroce storefront origins the Nunba embed is
+#: served from, kept apart so an operator can manage
+#: them without touching the node's own CORS_ORIGINS.
+CORS_ORIGIN_ENV_VARS = ('CORS_ORIGINS', 'MCGROCE_ORIGINS')
+
+
+def cors_allowed_origins() -> set:
+    """The CORS allowlist: the union of every CORS_ORIGIN_ENV_VARS entry."""
+    return set(
+        o.strip()
+        for var in CORS_ORIGIN_ENV_VARS
+        for o in os.environ.get(var, '').split(',')
+        if o.strip()
+    )
+
+
 def _apply_cors(app: Flask):
     """CORS with explicit origin allowlist.
 
-    If CORS_ORIGINS is not set, no origins are allowed (fail-closed).
-    Set CORS_ORIGINS=* for development only.
+    If neither CORS_ORIGINS nor MCGROCE_ORIGINS is set, no origins are
+    allowed (fail-closed).  Set CORS_ORIGINS=* for development only.
     """
-    raw_origins = os.environ.get('CORS_ORIGINS', '')
-    allowed_origins = set(
-        o.strip() for o in raw_origins.split(',')
-        if o.strip()
-    )
+    allowed_origins = cors_allowed_origins()
     if not allowed_origins:
         logger.warning(
             "CORS_ORIGINS not configured - no cross-origin requests allowed. "

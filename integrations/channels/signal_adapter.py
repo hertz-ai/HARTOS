@@ -24,6 +24,7 @@ Docker setup:
 from __future__ import annotations
 
 import asyncio
+import collections
 import logging
 import os
 import base64
@@ -52,6 +53,11 @@ from .base import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Bound on SignalAdapter._own_sent_timestamps (an echo-suppression cache,
+# not a real message store) -- old entries are evicted LRU-style well
+# before any real backlog could accumulate.
+_MAX_OWN_SENT_TIMESTAMPS = 200
 
 
 class SignalAdapter(ChannelAdapter):
@@ -85,6 +91,15 @@ class SignalAdapter(ChannelAdapter):
         self._reconnect_delay = 5  # seconds
         self._max_reconnect_delay = 300  # 5 minutes max
         self._running = False
+        # 2026-08-28: when this adapter SENDS a reply, Signal syncs that
+        # "sent" event back to every linked device -- including this one.
+        # Without tracking our own sends, the syncMessage.sentMessage
+        # handling added for Note-to-Self support (see _convert_message)
+        # re-processed the adapter's OWN reply as a brand-new inbound
+        # self-chat message, producing a visible duplicate standby reply.
+        # Bounded (see _MAX_OWN_SENT_TIMESTAMPS) so a long-running process
+        # can't leak memory here.
+        self._own_sent_timestamps: "collections.OrderedDict[str, None]" = collections.OrderedDict()
 
     @property
     def name(self) -> str:
@@ -112,8 +127,20 @@ class SignalAdapter(ChannelAdapter):
                 f"{self._api_url}/v1/accounts"
             ) as response:
                 if response.status == 200:
-                    accounts = await response.json()
-                    if self._phone_number not in [acc.get("number") for acc in accounts]:
+                    accounts = await response.json(content_type=None)
+                    # bbernhard/signal-cli-rest-api's /v1/accounts shape has drifted:
+                    # current releases return a plain list of phone-number strings
+                    # (e.g. ["+1555..."]), not the list-of-dict shape acc.get("number")
+                    # assumed. That AttributeError ("'str' object has no attribute
+                    # 'get'") propagated out of this purely-advisory check and made
+                    # connect() report the WHOLE connection as failed even when
+                    # /v1/about already succeeded and the account was genuinely
+                    # linked -- found live 2026-08-28 against a real linked account.
+                    _registered_numbers = [
+                        (acc.get("number") if isinstance(acc, dict) else acc)
+                        for acc in accounts
+                    ]
+                    if self._phone_number not in _registered_numbers:
                         logger.warning(f"Phone number {self._phone_number} not found in registered accounts")
                         # Continue anyway - might be registered differently
 
@@ -164,7 +191,16 @@ class SignalAdapter(ChannelAdapter):
                     timeout=aiohttp.ClientTimeout(total=30)
                 ) as response:
                     if response.status == 200:
-                        messages = await response.json()
+                        # content_type=None: found live 2026-08-28 against a real
+                        # signal-cli-rest-api instance -- every endpoint on the
+                        # current release mislabels its body as text/plain (with
+                        # or without a charset) even though it's valid JSON.
+                        # aiohttp's default strict content-type check turned that
+                        # into "Signal polling error: ... unexpected mimetype",
+                        # which silently broke receiving on every poll cycle
+                        # (30s timeout) without ever surfacing as a connect
+                        # failure -- connect() had already returned CONNECTED.
+                        messages = await response.json(content_type=None)
                         for msg_data in messages:
                             message = self._convert_message(msg_data)
                             if message:
@@ -214,12 +250,68 @@ class SignalAdapter(ChannelAdapter):
         except Exception as e:
             logger.error(f"Reconnection failed: {e}")
 
+    def _remember_own_sent_timestamp(self, timestamp: str) -> None:
+        """Record a timestamp this adapter itself just sent, so the
+        syncMessage.sentMessage echo Signal delivers back to every linked
+        device (including this one) can be recognized and ignored rather
+        than re-processed as a new inbound self-chat message."""
+        self._own_sent_timestamps[timestamp] = None
+        while len(self._own_sent_timestamps) > _MAX_OWN_SENT_TIMESTAMPS:
+            self._own_sent_timestamps.popitem(last=False)
+
+    def _is_own_sent_echo(self, sent_message: Dict[str, Any]) -> bool:
+        """True iff `sent_message` (a syncMessage.sentMessage payload) is
+        the sync-echo of a message THIS adapter sent, identified by the
+        exact timestamp match /v2/send returns and the envelope carries
+        back. Consumes the entry on match (one echo per send)."""
+        ts = str(sent_message.get("timestamp", ""))
+        if ts and ts in self._own_sent_timestamps:
+            del self._own_sent_timestamps[ts]
+            return True
+        return False
+
+    def _is_note_to_self(self, sent_message: Dict[str, Any]) -> bool:
+        """True iff a syncMessage.sentMessage is addressed to this account's
+        own number (Signal's Note-to-Self), not to another person or group."""
+        if sent_message.get("groupInfo"):
+            return False
+        destination = (sent_message.get("destination")
+                       or sent_message.get("destinationNumber"))
+        return bool(destination) and destination == self._phone_number
+
     def _convert_message(self, msg_data: Dict[str, Any]) -> Optional[Message]:
         """Convert Signal message to unified Message format."""
         envelope = msg_data.get("envelope", {})
 
-        # Skip non-data messages
         data_message = envelope.get("dataMessage")
+        if not data_message:
+            # 2026-08-28: a Note-to-Self (or any message synced from the
+            # account's own primary device to this linked device) arrives
+            # as syncMessage.sentMessage, not dataMessage -- envelope.source
+            # is already the account's own number in this shape. Recognizing
+            # it here is what lets self_chat.py's SelfChatHandler
+            # .is_self_message() route it as a self-chat, mirroring
+            # WhatsApp's existing self-chat flow. Before this, it was
+            # silently dropped -- found live testing against a real linked
+            # account with no second Signal account available to send a
+            # genuine third-party dataMessage.
+            data_message = (envelope.get("syncMessage") or {}).get("sentMessage")
+            if data_message and not self._is_note_to_self(data_message):
+                # The owner's outgoing message to SOMEONE ELSE (or a group),
+                # synced from their phone.  It is not addressed to this
+                # account, so it must not re-enter as inbound -- otherwise
+                # self_chat would treat "hey mum" as a Note-to-Self and the
+                # agent would answer the owner's private conversations.
+                return None
+            if data_message and self._is_own_sent_echo(data_message):
+                # This adapter's OWN reply, synced back to itself as a
+                # linked device (Signal syncs every sent message to all
+                # linked devices, including the sender). Without this
+                # check, the self-chat handling above would re-process
+                # our own standby/reply as if the user had just sent it
+                # again -- found live 2026-08-28: every self-chat reply
+                # was visibly delivered twice.
+                return None
         if not data_message:
             return None
 
@@ -315,9 +407,28 @@ class SignalAdapter(ChannelAdapter):
                 payload["recipients"] = [chat_id]
                 endpoint = f"{self._api_url}/v2/send"
 
-            # Handle quote/reply
-            if reply_to:
-                payload["quote_timestamp"] = int(reply_to)
+            # `reply_to` is deliberately NOT turned into quote_timestamp.
+            # bbernhard/signal-cli-rest-api's real /v2/send validates a
+            # quote as a group: quote_timestamp WITHOUT quote_author (and
+            # quote_message) is rejected outright with "Quote author
+            # parameter is missing", which fails the ENTIRE send, not just
+            # the quote styling. Found live 2026-08-28: every in-thread
+            # reply (registry.py sends reply_to=message.id unconditionally
+            # whenever it replies in the same thread) was silently dropped
+            # this way -- the caller never even sees a partial success.
+            # This method's signature only ever received the bare
+            # reply_to id/timestamp, never the quoted author or text, so a
+            # complete quote can't be built from here; better to deliver
+            # the reply unquoted than to drop it. Revisit if/when the
+            # author+message text are threaded through to this call.
+            if reply_to and not getattr(self, '_warned_unquoted', False):
+                # Once per adapter: every in-thread reply takes this path.
+                self._warned_unquoted = True
+                logger.warning(
+                    "Signal replies are sent UNQUOTED: a quote needs the "
+                    "original author and text, which send_message does not "
+                    "receive (reply_to=%s). Applies to all later replies.",
+                    reply_to)
 
             # Handle attachments
             if media:
@@ -335,10 +446,13 @@ class SignalAdapter(ChannelAdapter):
                 timeout=aiohttp.ClientTimeout(total=30)
             ) as response:
                 if response.status in (200, 201):
-                    result = await response.json()
+                    result = await response.json(content_type=None)
+                    _sent_ts = str(result.get("timestamp", ""))
+                    if _sent_ts:
+                        self._remember_own_sent_timestamp(_sent_ts)
                     return SendResult(
                         success=True,
-                        message_id=str(result.get("timestamp", "")),
+                        message_id=_sent_ts,
                         raw=result,
                     )
                 else:
@@ -448,7 +562,7 @@ class SignalAdapter(ChannelAdapter):
                     f"{self._api_url}/v1/groups/{self._phone_number}/{group_id}"
                 ) as response:
                     if response.status == 200:
-                        data = await response.json()
+                        data = await response.json(content_type=None)
                         return {
                             "id": chat_id,
                             "type": "group",
@@ -461,7 +575,7 @@ class SignalAdapter(ChannelAdapter):
                     f"{self._api_url}/v1/identities/{self._phone_number}/{chat_id}"
                 ) as response:
                     if response.status == 200:
-                        data = await response.json()
+                        data = await response.json(content_type=None)
                         return {
                             "id": chat_id,
                             "type": "direct",
@@ -535,7 +649,7 @@ class SignalAdapter(ChannelAdapter):
                 json=payload,
             ) as response:
                 if response.status in (200, 201):
-                    data = await response.json()
+                    data = await response.json(content_type=None)
                     return f"group.{data.get('id', '')}"
 
         except Exception as e:
@@ -591,7 +705,11 @@ def create_signal_adapter(
 
     config = ChannelConfig(
         token=phone_number,
-        extra={"api_url": api_url, **kwargs.get("extra", {})},
+        # phone_number here (read by self_chat.py's is_self_message via
+        # extra.get("owner_phone") or extra.get("phone_number")) is what
+        # lets a Note-to-Self message route as a self-chat instead of
+        # being treated as an unrecognized/unbound sender.
+        extra={"api_url": api_url, "phone_number": phone_number, **kwargs.get("extra", {})},
         **{k: v for k, v in kwargs.items() if k != "extra"},
     )
     return SignalAdapter(config)

@@ -123,6 +123,16 @@ let
     # Cryptography (Ed25519 identity, signing)
     cryptography
 
+    # PyJWT: the ONE token format every hart service and the Nunba daemon
+    # verify. security/jwt_manager.py guards `import jwt` with try/except and,
+    # without it, mints an HMAC hex digest that NOTHING can decode. Measured on
+    # the Samsung node, generation 16 (11bfb9a, 2026-10-11): hart-liquid-ui's
+    # shell turn asked Nunba for the desktop guest id with such a token, Nunba
+    # (whose own env HAS pyjwt, nunba.nix) answered 401 "Invalid or expired
+    # Bearer token", and the turn fell back to the backend's fixed identity.
+    # Same minted token with pyjwt present: 200 and the turn lands in Nunba.
+    pyjwt
+
     # systemd integration — REQUIRED by every Type="notify" service
     # (hart-liquid-ui, hart-app-bridge, hart-model-bus). Their ExecStart
     # Python does `import systemd.daemon; systemd.daemon.notify('READY=1')`.

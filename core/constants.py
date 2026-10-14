@@ -777,6 +777,13 @@ BUILD_INCOMPLETE_REPLY: str = (
 # hashed result.
 HELP_PAUSED_REPLY_PREFIX: str = "Paused for help:"
 HELP_EXPERT_REPLY_PREFIX: str = "Handed to the expert model:"
+#: The reply of a background turn that stopped BETWEEN STEPS because the owner
+#: is using this computer (yield-to-user, owner ruling 2026-10-04).  Not a
+#: result, not a failure, not a parked goal: the goal stays active, and its
+#: next dispatch -- which the daemon issues only once the yield gate is open
+#: -- resumes the same session where it stopped.  core.agent_tools.is_user_pause
+#: recognises it by this prefix; user_pause_reply writes it.
+PAUSED_FOR_USER_REPLY_PREFIX: str = "Paused for the user:"
 
 
 # ── The per-request switch that turns a hybrid-reasoning model's thinking OFF ──
@@ -797,6 +804,13 @@ HELP_EXPERT_REPLY_PREFIX: str = "Handed to the expert model:"
 # started; this travels with the request, so it also covers an external, remote
 # or cloud endpoint.
 LLM_THINKING_OFF_KWARGS: dict = {'enable_thinking': False}
+
+# The same switch in OpenRouter's own request field.  OpenRouter normalises
+# requests across providers and documents `reasoning.effort: "none"` as
+# "disables reasoning entirely"; a llama.cpp/vLLM chat_template_kwargs is not
+# one of its parameters, so sent there it would not reach the model and every
+# agent turn would think at length.
+LLM_THINKING_OFF_REASONING: dict = {'effort': 'none'}
 
 
 TOOL_LABELS: dict = {
@@ -1117,6 +1131,13 @@ DEFAULT_SINGLE_ROLE = 'assistant'
 #: tests/unit/test_goal_owner_machine_authors.py AST-scans the tree and
 #: fails if a new bare-label `created_by=` literal appears unregistered,
 #: so this set cannot silently fall behind the producers.
+#: The identity the node mints its OWN JWT for when it calls itself with no
+#: person behind the call (dispatch._internal_auth_headers).  A request whose
+#: JWT names it is the node talking to itself: /chat trusts its body's lane
+#: claim on that basis (core.request_lane.is_internal_caller).
+SYSTEM_DAEMON_IDENTITY = 'system_daemon'
+SYSTEM_IDENTITIES = frozenset({SYSTEM_DAEMON_IDENTITY})
+
 MACHINE_GOAL_AUTHORS = frozenset({
     'error_advice',
     'system_bootstrap',
@@ -1124,13 +1145,15 @@ MACHINE_GOAL_AUTHORS = frozenset({
     'intelligence_milestone',
     'self_healing_dispatcher',
     'revenue_aggregator',
-    'system_daemon',
+    SYSTEM_DAEMON_IDENTITY,
 })
 
 
 # ── HTTP payload policy (ONE source, two consumers) ──────────────────────
-# hart_intelligence_entry sets Flask's MAX_CONTENT_LENGTH from this, and
-# core.serve passes it to Hypercorn's AsyncioWSGIMiddleware as max_body_size.
+# The cap for a REMOTE caller's request body; a local caller has none (owner
+# 2026-10-10).  core.serve.max_body_size owns that rule; through it,
+# hart_intelligence_entry's request class answers Flask's cap per request and
+# core.serve gives Hypercorn's AsyncioWSGIMiddleware its max_body_size.
 # Before 2026-08-21 the transport side was never set, so the middleware's
 # library default of 2**16 (64 KB) silently rejected every POST body larger
 # than that with an empty 400 — measured live: a 50 KB multipart reached the
@@ -1393,6 +1416,71 @@ def action_is_autonomous(value) -> bool:
     return str(value or '').strip().lower() == 'yes'
 
 
+# ── Where a chat reply came from: the THREE values a client badge reads ──
+# Owner, 2026-10-04: 'local' is a reply this node's own LLM wrote, 'hive' is a
+# reply that was escalated to a hive peer, 'cloud' is a reply from a cloud
+# agent (an agent that exists only on central).  The page's badge
+# (landing-page/src/utils/tier.js formatTier) reads exactly these three, so a
+# reply that carries none is labelled by the page's own guess -- which
+# measured wrong: a reply written by the local llama-server was badged "Cloud"
+# (frozen_debug.log 2026-10-04 17:10, agent 20, all 24 model calls on
+# 127.0.0.1:8080).  ONE rule names it, here, so the envelope publisher, the
+# /chat response and the speculative dispatcher cannot each grow their own.
+# The spoken reply (a 'TTS' payload) is the voice, not a bubble, and carries
+# none.  Guarded, with a source guard against a second writer, by
+# tests/unit/test_served_by_is_one_rule.py.
+SERVED_BY_LOCAL: str = 'local'
+SERVED_BY_HIVE: str = 'hive'
+SERVED_BY_CLOUD: str = 'cloud'
+SERVED_BY_VALUES = (SERVED_BY_LOCAL, SERVED_BY_HIVE, SERVED_BY_CLOUD)
+
+
+def canonical_served_by(value=None, node_tier=None) -> str:
+    """The origin of a chat reply, in the vocabulary a client badge reads.
+
+    ``value`` is whatever the dispatch site said: an exact 'local' / 'hive' /
+    'cloud', or the speculative dispatcher's telemetry tags
+    'hive_langchain_bg' / 'local_langchain_bg'.  Matched as WORDS of the tag
+    (split on anything not a letter or digit), so 'archive' is not 'hive' and
+    'cloudless' is not 'cloud'.  'hive' wins over 'cloud' in a tag naming both.
+
+    On the central node every reply its own LLM writes is 'cloud', the cloud
+    each client of central talks to (owner call open: tier.js labels local +
+    central 'On-host').  ``node_tier`` is the tier the envelope names (a node
+    relaying central's reply keeps 'central'); None reads HEVOLVE_NODE_TIER,
+    the one place this rule does.
+
+    Otherwise the reply was written by this node's own LLM, tagged 'local'
+    or not tagged at all: the dispatcher tags its own (non-escalated) path
+    'local_langchain_bg' whatever that LLM is.  So it is where that LLM runs
+    (core.autogen_config.llm_stays_on_premises): 'local' on this machine or
+    LAN, 'cloud' when the node sends its prompts to a public API -- a reply
+    from openrouter.ai is not on-device (tier.js: local = no cloud egress).
+    Review of 028a8a959: answering 'local' for the tag before asking badged
+    an openrouter node's reply On-device while its untagged reply said Cloud.
+    A value that is not a string (a device id, a number) is no tag.  Never
+    raises: an unreadable configuration reads 'cloud', the page's own answer
+    for an unknown origin."""
+    import re
+    tag = value.strip().lower() if isinstance(value, str) else ''
+    words = set(re.split(r'[^a-z0-9]+', tag))
+    if 'hive' in words:
+        return SERVED_BY_HIVE
+    if 'cloud' in words:
+        return SERVED_BY_CLOUD
+    if node_tier is None:
+        import os
+        node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
+    if str(node_tier or '').strip().lower() == 'central':
+        return SERVED_BY_CLOUD
+    try:
+        from core.autogen_config import llm_stays_on_premises
+        on_premises = llm_stays_on_premises()
+    except Exception:
+        on_premises = False
+    return SERVED_BY_LOCAL if on_premises else SERVED_BY_CLOUD
+
+
 # Tools that record, recall or look up the agent's OWN state -- the scratchpad
 # around an action, never the action's work.  A call to one proves only that
 # the agent kept notes.
@@ -1418,6 +1506,18 @@ BOOKKEEPING_TOOLS: frozenset = frozenset({
     'save_to_long_term_memory', 'search_long_term_memory',
     'get_user_id', 'get_prompt_id', 'get_chat_history', 'request_tools',
 })
+
+# The agents the Assistant hands work to.  A message that tags one of them is
+# addressed to that agent, never to the person: routing, not an answer.
+# Lowercase, to be compared against lowercased text.  Read by the completion
+# gate's written-answer rule (lifecycle_hooks.is_written_answer).  The REUSE
+# loop (hartos.reuse_recipe._REUSE_AGENT_MENTIONS) and send_message_to_user
+# (core.agent_tools) carry the same five literally -- the REUSE module's
+# extract-and-exec tests need its constants literal -- and
+# tests/unit/test_written_answer_in_a_native_group_log.py pins the REUSE copy
+# equal to this one.
+AGENT_MENTIONS: tuple = ("@statusverifier", "@status verifier", "@verification",
+                         "@helper", "@executor")
 
 # How much of what a tool OBSERVED may ride back in its return string.
 #

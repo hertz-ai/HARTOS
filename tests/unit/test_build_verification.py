@@ -197,6 +197,22 @@ class TestDependencyVersions(unittest.TestCase):
         import langchain_classic
         self.assertIsNotNone(langchain_classic.__version__)
 
+    def test_av_is_bounded_below_the_release_that_breaks_faster_whisper(self):
+        """PyAV 19.0.1 dropped av.open(metadata_errors=...), which faster-whisper
+        1.2.1 passes on every decode, so the 10-08 nightly (av 19.0.1) could not
+        transcribe at all. 16.1.0 to 18.0.0 decode the same file."""
+        import re
+        from packaging.requirements import Requirement
+        root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        for name in ('pyproject.toml', 'setup.py'):
+            with open(os.path.join(root, name), encoding='utf-8') as f:
+                text = f.read()
+            lines = re.findall(r'"(av[<>=!~][^"]*)"', text)
+            self.assertEqual(len(lines), 1, '%s: expected one av requirement, got %r' % (name, lines))
+            spec = Requirement(lines[0]).specifier
+            self.assertNotIn('19.0.1', spec, '%s lets av 19.0.1 in: %s' % (name, lines[0]))
+            self.assertIn('16.1.0', spec, '%s excludes the version the lock file pins' % name)
+
 
 if __name__ == '__main__':
     unittest.main()

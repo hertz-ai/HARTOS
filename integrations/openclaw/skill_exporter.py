@@ -179,7 +179,17 @@ def _broadcast_skill_via_p2p(skill_dir: str, slug: Optional[str] = None):
         actions = recipe_data.get('actions', recipe_data.get('steps', []))
         skill_id = slug or skill_name or os.path.basename(skill_dir)
 
+        # The receiver files catalogs per node and skips its own echo, so the
+        # delta must say which node it came from (it never did).
+        try:
+            from security.node_integrity import get_node_identity
+            node_id = (get_node_identity() or {}).get('node_id', '')
+        except Exception as e:
+            logger.warning("Skill broadcast: node id unavailable (%s)", e)
+            node_id = ''
+
         delta = {
+            'node_id': node_id,
             'recipes': [{
                 'id': skill_id,
                 'name': skill_name,

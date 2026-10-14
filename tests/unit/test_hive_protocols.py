@@ -730,6 +730,17 @@ class TestHiveTaskDispatcher(unittest.TestCase):
             import shutil
             shutil.rmtree(self._tmpdir, ignore_errors=True)
 
+    def test_a_result_for_a_task_this_dispatcher_does_not_hold_is_a_warning(self):
+        """RED before: returned unknown_task with no log line.  With two
+        queues on one machine (VERIFICATION 2026-09-10) a result reported to
+        the dispatcher that does not hold the task vanished this way."""
+        import integrations.coding_agent.hive_task_protocol as mod
+        dispatcher = self._make_dispatcher()
+        with self.assertLogs(mod.logger.name, level='WARNING') as logs:
+            out = dispatcher.on_task_result('no-such-task', {'output': 'x'})
+        self.assertEqual(out.get('error'), 'unknown_task')
+        self.assertTrue(any('no-such-task' in m for m in logs.output), logs.output)
+
     def test_create_task_generates_uuid(self):
         """create_task() generates a UUID task_id."""
         dispatcher = self._make_dispatcher()
