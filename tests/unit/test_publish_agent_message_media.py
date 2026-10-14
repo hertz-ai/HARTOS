@@ -10,7 +10,9 @@ publish_async is the one publisher (amendment A9 e): the flag is ITS flag, so
 the push still gets every stamp and leg publish_async gives a chat message
 (served_by, node_tier, the task.confirmation copy, the desktop's SSE leg) and
 loses only the HTTP crossbar leg.  The flag is passed only when set, so every
-other caller reaches Nunba's (topic, message, timeout) wrapper unchanged.
+other caller reaches any wrapper around publish_async unchanged.  Nunba's
+thinking-trace wrapper forwards the flag when set; an older Nunba's takes
+(topic, message, timeout) only, and a reel push behind it fails closed.
 
 Boundaries mocked: the hart_intelligence publish_async (as safe_hartos_attr
 resolves it), or -- for the real publish_async -- the MessageBus legs, the SSE
@@ -106,8 +108,9 @@ def test_skip_crossbar_is_publish_asyncs_own_flag(publisher, bus):
 
 
 def test_without_skip_crossbar_the_call_is_exactly_as_before(publisher):
-    """No new keyword for any other caller: Nunba's wrapper takes
-    (topic, message, timeout) and keeps working for them."""
+    """No new keyword for any other caller: a wrapper that takes
+    (topic, message, timeout), as an older Nunba's does, keeps working for
+    them."""
     publish_agent_message(text='hi', user_id='u7', request_id='r', prompt_id='42',
                           media=MEDIA)
     assert publisher.call_count == 1
@@ -173,10 +176,10 @@ def test_the_real_publisher_without_the_flag_still_reaches_the_crossbar(real_pub
 
 def test_behind_a_three_argument_wrapper_a_reel_push_fails_closed(real_publisher, hie,
                                                                    monkeypatch):
-    """Nunba wraps publish_async as (topic, message, timeout).  Until that
-    wrapper forwards the flag, every other message still goes through it, and
-    a skip_crossbar push is reported undelivered -- never sent to the
-    crossbar without it."""
+    """An older Nunba wraps publish_async as (topic, message, timeout).
+    Every other message still goes through that wrapper, and a
+    skip_crossbar push is reported undelivered -- never sent to the crossbar
+    without the flag."""
     seen = []
 
     def nunba_wrapper(topic, message, timeout=2.0):
@@ -193,6 +196,36 @@ def test_behind_a_three_argument_wrapper_a_reel_push_fails_closed(real_publisher
                                  request_id='rid-1', prompt_id='42', media=MEDIA,
                                  skip_crossbar=True) is False
     real_publisher.http.submit.assert_not_called()
+
+
+def test_behind_a_wrapper_that_forwards_the_flag_a_reel_push_stays_off_the_crossbar(
+        real_publisher, hie, monkeypatch):
+    """Nunba's thinking-trace wrapper (routes/hartos_backend_adapter
+    ._capturing_thinking) forwards skip_crossbar when it is set, and calls
+    publish_async as (topic, message, timeout) for everything else.  Behind
+    that shape, the reel reaches her own legs and not the crossbar, and every
+    other message still reaches the crossbar."""
+    seen = []
+
+    def nunba_wrapper(topic, message, timeout=2.0, skip_crossbar=False):
+        flags = {'skip_crossbar': True} if skip_crossbar else {}
+        hie.publish_async(topic, message, timeout, **flags)
+        seen.append((topic, skip_crossbar))
+
+    monkeypatch.setitem(sys.modules, 'hart_intelligence',
+                        SimpleNamespace(publish_async=nunba_wrapper))
+    assert publish_agent_message(text='Your reel is ready', user_id='u7',
+                                 request_id='rid-1', prompt_id='42', media=MEDIA,
+                                 skip_crossbar=True) is True
+    real_publisher.http.submit.assert_not_called()
+    peer = real_publisher.bus.legs['_route_peerlink']
+    sent = [c.args[1] for c in peer.call_args_list if c.args[0] == 'chat.response']
+    assert [d['media'] for d in sent] == [MEDIA]
+    assert publish_agent_message(text='hi', user_id='u7', request_id='r',
+                                 prompt_id='42') is True
+    assert real_publisher.http.submit.call_count == 1
+    assert seen == [('com.hertzai.hevolve.chat.u7', True),
+                    ('com.hertzai.hevolve.chat.u7', False)]
 
 
 def test_media_entries_that_are_not_objects_are_dropped(publisher):

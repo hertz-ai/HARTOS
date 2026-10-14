@@ -212,10 +212,11 @@ def publish_agent_message(
     receives agent messages (EVENTS) -- and off central's crossbar (decision
     U4(d): a reel push names her clients).  It is publish_async's own flag
     (the one publisher, amendment A9 e), passed only when set: every other
-    message reaches publish_async -- and Nunba's (topic, message, timeout)
-    wrapper around it -- exactly as before.  A wrapper that does not forward
-    it raises, and the push is reported undelivered rather than sent to the
-    crossbar.
+    message reaches publish_async, and any wrapper around it, exactly as
+    before.  Nunba's thinking-trace wrapper (routes/hartos_backend_adapter
+    ._capturing_thinking) forwards it when set.  A wrapper that does not
+    (an older Nunba's, which takes (topic, message, timeout)) raises, and
+    the push is reported undelivered rather than sent to the crossbar.
 
     Returns True only when the publisher was resolved and returned without
     raising; False for empty text or user, an unresolvable publisher, or a
