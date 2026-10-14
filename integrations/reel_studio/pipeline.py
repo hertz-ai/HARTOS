@@ -25,11 +25,13 @@ at a time):
    crossbar (decision U4(d)), and the clips (and song audio) it used are
    marked consumed, so the store's retention removes them a day later.
 
-The work dir is removed whatever happens, the job is finished with the
-status the call returns, and the store's GC runs once the job is done (so
-retention does not wait for her next upload).  Progress is shown on her chat
-through the existing publish_chat_stage (action 'Status'), with generic
-texts only.
+The work dir is removed whatever happens (and, when the process dies
+mid-reel, by jobs when the job is interrupted or taken over), the job is
+finished with the status the call returns, and the store's GC runs once the
+job is done (so retention does not wait for her next upload).  Progress is
+shown on her chat through the existing publish_chat_stage (action 'Status'),
+with generic texts only; each step also beats the job (jobs.beat), so a slow
+reel is never taken for a dead one.
 
 Every result is a dict with ``status`` (contracts.REEL_STATUSES) and a
 ``message`` for her agent to act on; ``ok`` adds reel_id, media, qa,
@@ -52,6 +54,9 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from integrations.reel_studio import contracts as C
 from integrations.reel_studio import jobs
+# A job's work dir belongs to the job (jobs removes it when a job dies);
+# the names stay importable from here for the E2E CLI.
+from integrations.reel_studio.jobs import remove_work_dir, work_root
 
 logger = logging.getLogger(__name__)
 
@@ -106,55 +111,19 @@ class Production:
     song_start_s: float = 0.0
 
 
-# ── where, and how much room ──────────────────────────────────────────────
-
-def work_root() -> str:
-    """``get_data_dir()/reel_studio/work``: each job's work dir lives in it."""
-    from core.platform_paths import get_data_dir
-    return os.path.join(get_data_dir(), 'reel_studio', 'work')
-
+# ── how much room ─────────────────────────────────────────────────────────
 
 def free_bytes(path: str) -> int:
-    """Free disk where ``path`` is (created first: disk_usage needs a path)."""
-    os.makedirs(path, exist_ok=True)
-    return shutil.disk_usage(path).free
-
-
-def remove_work_dir(path: str) -> None:
-    """Remove a job's work dir and everything in it; never raises.
-
-    shutil.rmtree first.  An interpreter whose frozen ``os`` is older than
-    its Lib cannot run it (measured on a dev box: Python 3.12.3's DLL with
-    an August 2024 shutil.py, where rmtree raises AttributeError for
-    os._walk_symlinks_as_files before removing anything), and the work dir
-    must not stay behind -- it holds frames of her clients' faces -- so the
-    same bottom-up walk is then done here.
-    """
-    try:
-        shutil.rmtree(path)
-        return
-    except FileNotFoundError:
-        return
-    except AttributeError as e:
-        logger.debug('shutil.rmtree unusable on this interpreter (%s); removing by hand', e)
-    except OSError as e:
-        logger.warning('work dir %s not removed by rmtree (%s); trying file by file', path, e)
-    for root, dirs, files in os.walk(path, topdown=False):
-        for name in files:
-            try:
-                os.remove(os.path.join(root, name))
-            except OSError as e:
-                logger.warning('could not remove %s: %s', os.path.join(root, name), e)
-        for name in dirs:
-            try:
-                os.rmdir(os.path.join(root, name))
-            except OSError as e:
-                logger.warning('could not remove %s: %s', os.path.join(root, name), e)
-    if os.path.isdir(path):
-        try:
-            os.rmdir(path)
-        except OSError as e:
-            logger.warning('work dir %s left behind: %s', path, e)
+    """Free disk where ``path`` is or will be.  shutil.disk_usage needs a
+    path that exists, so it is asked of ``path``'s nearest existing
+    ancestor; nothing is created to measure it (amendment A11b)."""
+    probe = os.path.abspath(path)
+    while not os.path.isdir(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:         # a drive or root that is not there: let it say so
+            break
+        probe = parent
+    return shutil.disk_usage(probe).free
 
 
 def reel_bytes_cap(target_s: float) -> int:
@@ -171,21 +140,19 @@ def _source(clip) -> C.ClipSource:
     return clip if isinstance(clip, C.ClipSource) else C.ClipSource.from_stored(clip)
 
 
-def _dedupe(items) -> List[str]:
-    return list(dict.fromkeys(i for i in items if isinstance(i, str) and i))
-
-
 def _gib(n: int) -> str:
     return '%.1f GB' % (n / float(1 << 30))
 
 
-def _say(user_id, request_id) -> Callable[[str, str], None]:
-    """Progress on her chat: publish_chat_stage with a generic text."""
+def _say(job) -> Callable[[str, str], None]:
+    """Each step of the reel: the job beats (jobs.beat), and her chat shows
+    the step through publish_chat_stage with a generic text."""
     def say(stage: str, text: str) -> None:
+        jobs.beat(job.reel_id)
         try:
             from core.peer_link.crossbar_publish import publish_chat_stage
-            publish_chat_stage(stage, user_id=str(user_id), request_id=str(request_id or ''),
-                               text=text)
+            publish_chat_stage(stage, user_id=str(job.user_id),
+                               request_id=str(job.request_id or ''), text=text)
         except Exception as e:      # progress never stops the reel
             logger.debug('reel progress %s not shown: %s', stage, e)
     return say
@@ -389,7 +356,7 @@ def _reel_notes(production: Production) -> List[str]:
         notes.append(NOTE_SYNTHETIC_BEATS)
     notes += [ADVISORY_NOTE % row.get('id') for row in production.qa.get('advisory') or ()
               if isinstance(row, Mapping) and not row.get('ok')]
-    return _dedupe(notes)
+    return list(dict.fromkeys(n for n in notes if isinstance(n, str) and n))
 
 
 def _ready_text(media: Mapping) -> str:
@@ -408,9 +375,15 @@ def _ready_text(media: Mapping) -> str:
 
 
 def _ok_message(media: Mapping, notes: Sequence[str]) -> str:
+    """What her agent is told to say.  It carries what the push's text says
+    too (decision U2: the steady beat), because her phone shows one of the
+    reply and the push (it dedups them by xid), not always the push."""
     text = ('The reel is made, checked and on its way to her phone (it also rides this '
             'reply). Tell her it is ready, give her the caption and the hashtags to paste, and '
             'the song to add in Instagram at the start time given.')
+    if NOTE_SYNTHETIC_BEATS in notes:
+        text += (" The cuts follow a steady beat, not the song's own: say so, and that "
+                 "attaching the song's audio next time cuts the reel on its beats.")
     if C.NOTE_NO_FINAL_LOOK in notes:
         text += (' No finished look was found in the clips, so the reel ends on the last shot; '
                  'say so.')
@@ -469,7 +442,7 @@ def _make(job, store, sources: List[C.ClipSource], style: Dict[str, Any],
                          'a day after each reel; ask her to send fewer or shorter clips, or to try '
                          'again tomorrow.')
 
-    say = _say(job.user_id, job.request_id)
+    say = _say(job)
     out_path = os.path.join(workdir, 'reel_%s.mp4' % job.reel_id)
     song = song if isinstance(song, Mapping) else None
     start_ms = (song or {}).get('start_ms')
@@ -534,14 +507,22 @@ def make_reel(*, user_id, prompt_id, request_id, clips: Sequence[Any], style: Ma
     if not sources:
         return _status('needs_clips', NEEDS_CLIPS_MESSAGE)
     style = C.make_style(dict(style or {}))
-    job = jobs.start_job(user_id, prompt_id, request_id)
+    try:
+        job = jobs.start_job(user_id, prompt_id, request_id)
+    except Exception as e:      # e.g. the disk filled writing its record: no job holds the machine
+        logger.exception('reel for user %s: the job could not be started', user_id)
+        return _status('render_failed', RENDER_FAILED_MESSAGE, detail=_detail(e))
     if job is None:
         return _status('busy', BUSY_MESSAGE)
-    if store is None:
-        from core.user_file_store import get_user_file_store
-        store = get_user_file_store()
-    workdir = os.path.join(work_root(), job.reel_id)
+    workdir = None
     try:
+        # Both inside the job (amendment A11a): a store or data dir that
+        # cannot be opened ends this job like any failure, and never leaves
+        # it holding the machine.
+        if store is None:
+            from core.user_file_store import get_user_file_store
+            store = get_user_file_store()
+        workdir = jobs.work_dir(job.reel_id)
         result = _make(job, store, sources, style, song, logo_path, caption, hashtags, backend,
                        encoder, workdir)
     except ReelFailed as e:
@@ -550,18 +531,25 @@ def make_reel(*, user_id, prompt_id, request_id, clips: Sequence[Any], style: Ma
     except Exception as e:      # a bug: report it, never crash the agent's turn
         logger.exception('reel %s for user %s failed', job.reel_id, job.user_id)
         result = _status('render_failed', RENDER_FAILED_MESSAGE, reel_id=job.reel_id,
-                         detail=('%s: %s' % (type(e).__name__, e))[:300])
+                         detail=_detail(e))
     finally:
-        remove_work_dir(workdir)
+        if workdir is not None:
+            remove_work_dir(workdir)
     try:
         jobs.finish_job(job.reel_id, result['status'], result.get('detail') or '')
     except Exception as e:
         logger.error('reel %s: job record not finished: %s', job.reel_id, e)
-    try:
-        store.gc()
-    except Exception as e:
-        logger.warning('reel %s: store retention pass failed: %s', job.reel_id, e)
+    if store is not None:
+        try:
+            store.gc()
+        except Exception as e:
+            logger.warning('reel %s: store retention pass failed: %s', job.reel_id, e)
     return result
+
+
+def _detail(e: BaseException) -> str:
+    """An unexpected error, for the result's ``detail`` and the job record."""
+    return ('%s: %s' % (type(e).__name__, e))[:300]
 
 
 __all__ = ['MIN_FREE_BYTES', 'MAX_CLIPS', 'MIME', 'NOTE_SYNTHETIC_BEATS', 'NOTE_PUSH_NOT_SENT',

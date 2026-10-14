@@ -25,6 +25,9 @@ from types import SimpleNamespace
 import pytest
 
 from integrations.reel_studio import contracts as C
+# The real disk check, taken before any fixture replaces it (_env does: this
+# box's own free disk must not decide the tests).
+from integrations.reel_studio.pipeline import free_bytes as REAL_FREE_BYTES
 from tests.unit.reel_media_fixtures import make_clip, make_png, requires_ffmpeg
 
 UID = '10077'
@@ -293,6 +296,35 @@ def test_low_disk_is_no_space_before_any_decode(turn):
                                     for p in turn.pushes)
 
 
+def test_measuring_free_disk_creates_nothing(tmp_path):
+    """Amendment A11b: the disk check reads the free space where the work
+    dir will be, and makes no dir to read it."""
+    where = tmp_path / 'reel_studio' / 'work'
+    free = REAL_FREE_BYTES(str(where))
+    assert isinstance(free, int) and free > 0
+    assert not (tmp_path / 'reel_studio').exists()
+
+
+def test_a_low_disk_refusal_leaves_no_work_dir_behind(turn):
+    """The real disk check on a fresh data root: refused for no_space, and
+    the work root was never made just to measure it (amendment A11b)."""
+    from integrations.reel_studio import jobs
+    from integrations.reel_studio import pipeline as P
+    clip = _small_clip(turn)
+    turn.mp.setattr(P, 'free_bytes', REAL_FREE_BYTES)
+    asked = []
+
+    def disk_usage(path):
+        asked.append(path)
+        return SimpleNamespace(total=1 << 40, used=1 << 39, free=P.MIN_FREE_BYTES - 1)
+    turn.mp.setattr(P.shutil, 'disk_usage', disk_usage)
+    result = P.make_reel(user_id=UID, prompt_id=PID, request_id='r', clips=[clip.to_dict()],
+                         style=C.make_style({}))
+    assert result['status'] == 'no_space', result
+    assert asked and all(os.path.isdir(p) for p in asked)        # measured where it exists
+    assert not os.path.exists(jobs.work_root())
+
+
 def test_a_full_quota_is_quota_before_any_decode(turn):
     from core import user_file_store as ufs
     from integrations.reel_studio import pipeline as P
@@ -422,6 +454,64 @@ def test_an_unexpected_bug_is_a_render_failure_not_a_crash(turn):
     assert jobs.active_job() is None                             # the machine is free again
 
 
+def _fails_once(calls, real, error=(13, 'Permission denied')):
+    """``real``, except that its first call raises OSError(*error)."""
+    def once(*a, **k):
+        if not calls:
+            calls.append(1)
+            raise OSError(*error)
+        return real(*a, **k)
+    return once
+
+
+@pytest.mark.parametrize('broken', ['store', 'work_dir'])
+def test_a_store_or_work_dir_that_cannot_be_opened_never_holds_the_machine(turn, broken):
+    """Amendment A11a: the store and the job's work dir are resolved inside
+    the job.  One that cannot be opened ends that job as render_failed (never
+    a raise), the machine is free at once, and the next reel is made -- not
+    answered 'busy' while a dead job holds the claim."""
+    from core import user_file_store as ufs
+    from integrations.reel_studio import jobs
+    from integrations.reel_studio import pipeline as P
+    clip = _small_clip(turn)
+    calls = []
+    if broken == 'store':
+        turn.mp.setattr(ufs, 'get_user_file_store', _fails_once(calls, ufs.get_user_file_store))
+    else:
+        turn.mp.setattr(jobs, 'work_dir', _fails_once(calls, jobs.work_dir))
+    turn.mp.setattr(P, 'produce_reel', _fake_production(P))
+    first = P.make_reel(user_id=UID, prompt_id=PID, request_id='r', clips=[clip.to_dict()],
+                        style=C.make_style({}))
+    assert calls == [1]
+    assert first['status'] == 'render_failed' and first['message'], first
+    assert 'Permission denied' in first['detail']
+    assert jobs.active_job() is None
+    assert jobs.reel_job(first['reel_id']).status == 'render_failed'
+    again = P.make_reel(user_id=UID, prompt_id=PID, request_id='r2', clips=[clip.to_dict()],
+                        style=C.make_style({}))
+    assert again['status'] == 'ok', again
+
+
+def test_a_job_record_that_cannot_be_written_is_a_status_not_a_raise(turn):
+    """make_reel never raises: the disk filling as the job's record is first
+    written is answered (render_failed with the reason), and frees the
+    machine for the next reel."""
+    from integrations.reel_studio import jobs
+    from integrations.reel_studio import pipeline as P
+    clip = _small_clip(turn)
+    calls = []
+    turn.mp.setattr(jobs, 'atomic_json_write', _fails_once(
+        calls, jobs.atomic_json_write, (28, 'No space left on device')))
+    result = P.make_reel(user_id=UID, prompt_id=PID, request_id='r', clips=[clip.to_dict()],
+                         style=C.make_style({}))
+    assert calls == [1]
+    assert result['status'] == 'render_failed' and result['message'], result
+    assert 'No space left' in result['detail']
+    nxt = jobs.start_job('20088', '7', 'next')
+    assert nxt is not None
+    jobs.finish_job(nxt.reel_id, 'ok')
+
+
 def test_a_delivered_reel_carries_every_note_and_the_beat_source(turn):
     from integrations.reel_studio import pipeline as P
     clip = _small_clip(turn)
@@ -436,6 +526,31 @@ def test_a_delivered_reel_carries_every_note_and_the_beat_source(turn):
     # The push says the cuts follow a steady beat, not a song's (decision U2).
     push = [p for p in turn.pushes if isinstance(p[1], dict) and p[1].get('media')][0]
     assert 'beat' in push[1]['text'][0].lower()
+    # ... and so does what her agent is told to say: the phone shows the reply
+    # or the push (one per xid), so the push alone may never reach her.
+    assert 'steady beat' in result['message']
+
+
+def test_each_step_of_the_reel_beats_its_job(turn):
+    """A slow reel (ten long HDR clips) is still working, not stale: every
+    progress step beats its job, so it is never taken over (jobs.MAX_JOB_S
+    counts from the last beat)."""
+    from integrations.reel_studio import jobs
+    from integrations.reel_studio import pipeline as P
+    clip = _small_clip(turn)
+    beats = []
+    turn.mp.setattr(jobs, 'beat', lambda reel_id: beats.append(reel_id))
+    fake = _fake_production(P)
+
+    def produce(sources, **kw):
+        kw['progress']('reel_analyse', 'Watching clip 1 of 1...')
+        kw['progress']('reel_render', 'Rendering your reel...')
+        return fake(sources, **kw)
+    turn.mp.setattr(P, 'produce_reel', produce)
+    result = P.make_reel(user_id=UID, prompt_id=PID, request_id='r', clips=[clip.to_dict()],
+                         style=C.make_style({}))
+    assert result['status'] == 'ok', result
+    assert len(beats) >= 2 and set(beats) == {result['reel_id']}
 
 
 def test_a_song_whose_beats_were_heard_is_labelled_so(turn):
@@ -458,5 +573,6 @@ def test_a_song_whose_beats_were_heard_is_labelled_so(turn):
     assert result['status'] == 'ok', result
     assert seen['song_audio'] == audio.path
     assert result['media']['song']['beats'] == 'local_audio'
+    assert 'steady beat' not in result['message']
     # The song file was used too, so it goes with the clips.
     assert turn.store.query_inbox(UID, purpose='song_audio') == []

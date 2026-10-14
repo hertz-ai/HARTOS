@@ -1,14 +1,23 @@
 """integrations.reel_studio.tools -- her seven reel_* agent tools.
 
 ``register_reel_studio_tools(helper, assistant, user_id, prompt_id=,
-request_id_getter=, with_schema=)`` builds seven closures with her user id,
-her agent's prompt id and a getter for the current turn's request id bound
-in, so none of them is a tool argument, and registers them the way the
-other Tier-2 families are (helper: the LLM schema; assistant: execution).
-With ``with_schema=False`` (an agent that is not her Reel Studio agent) only
-execution is registered, so the tools are not in the model's schema but
+request_id_getter=, with_schema=, executor=)`` builds seven closures with her
+user id, her agent's prompt id and a getter for the current turn's request
+id bound in, so none of them is a tool argument, and registers them in the
+canonical Tier-2 shape (integrations.agent_engine.news_tools.
+register_news_tools; commerce, finance and revenue follow it): the LLM
+schema on the helper AND the assistant, execution on the assistant and, when
+given, on the group chat's executor.  The assistant needs the schema: when
+speaker selection lets it propose a tool it has no schema for, the model
+free-forms the call as plain text that autogen never runs (measured live on
+the news family, 2026-09-03), and reel_make is her agent's whole action.
+The executor runs the assistant's own structured call, which autogen's
+repeat-speaker rule would otherwise strand.  With ``with_schema=False`` (an
+agent that is not her Reel Studio agent) only execution is registered, so
+the tools are not in the model's schema but
 core.agent_tool_menu.discover_and_attach finds them by the first line of
-their docstrings when the agent asks request_tools for them.
+their docstrings when the agent asks request_tools for them.  On the central
+node nothing is registered: reel_studio is inert there (amendment A8 d).
 
 The seven (REEL_TOOL_NAMES):
 
@@ -16,7 +25,8 @@ The seven (REEL_TOOL_NAMES):
   (pipeline.make_reel).  It reads this turn's clips (else her newest unused
   batch, or the clip ids named), her style (the arguments, over her agent
   record's words through style.parse_style_hints, over her voice profile),
-  her newest logo (kept in her profile as logo_xid), her song (a key from
+  her newest uploaded logo (else her profile's logo_xid; her profile is
+  read, never written, by making a reel), her song (a key from
   reel_trending_songs, her attached song audio, else the top trending song
   in her language), a caption (else one from her profile) and at most five
   hashtags (else from her hashtag bank).
@@ -111,11 +121,11 @@ def _int(value) -> Optional[int]:
 
 
 def _flag(value) -> Optional[bool]:
-    """'' or None: not given; else core.config_cache.flag_value."""
-    if value is None or (isinstance(value, str) and not value.strip()):
-        return None
+    """core.config_cache.flag_value's reading, with anything it does not
+    recognise ('', None, 'nah') as None: not given, so an unclear argument
+    never overrides what she said."""
     from core.config_cache import flag_value
-    return flag_value(value, True)
+    return flag_value(value, None)
 
 
 def _opening(value) -> Optional[bool]:
@@ -214,29 +224,29 @@ def _song_audio(turn: _Turn, rid: Optional[str]) -> Optional[Dict[str, Any]]:
 
 
 def _logo_path(turn: _Turn, profile: Mapping) -> Optional[str]:
-    """Her newest uploaded logo (saved to her profile as logo_xid when it is
-    new), else the one her profile names, else None."""
-    from integrations.reel_studio import voice_profile
+    """Her newest uploaded logo, else the one her profile names (logo_xid),
+    else None.  Her profile is read, never written: making a reel changes
+    nothing she keeps (amendment A11b); reel_voice is where logo_xid is set.
+
+    The newest upload wins over the profile's logo_xid (plan WS-9 put the
+    profile first): uploading a logo is how she changes it, and the store's
+    retention keeps only her newest logo (user_file_store GC), so an older
+    one the profile still names is about to go anyway."""
     store = _store()
     try:
         logos = store.query_inbox(turn.user_id, purpose='logo', unconsumed_only=False)
     except Exception as e:
         logger.warning('reel tools: logos of %s not read: %s', turn.user_id, e)
         logos = []
-    newest = logos[-1] if logos else None
+    if logos:
+        return logos[-1].path
     saved = profile.get('logo_xid')
-    if newest is not None:
-        if newest.xid != saved:
-            try:
-                voice_profile.update_field(turn.user_id, 'logo_xid', newest.xid)
-            except Exception as e:      # the reel still gets the logo
-                logger.warning('reel tools: logo not saved to the profile of %s: %s',
-                               turn.user_id, e)
-        return newest.path
     if saved:
         try:
             held = store.resolve(turn.user_id, saved, box='in')
-        except Exception:
+        except Exception as e:          # the reel is made without it
+            logger.warning('reel tools: saved logo %s of %s not read: %s', str(saved)[:12],
+                           turn.user_id, e)
             held = None
         return held.path if held is not None else None
     return None
@@ -281,14 +291,13 @@ def _song(song_key: str, language: Optional[str],
 
 
 def _caption_from_profile(profile: Mapping) -> str:
-    """A plain caption from her own profile, never invented: what she does,
-    where, and her ask.  '' when her profile has none of them."""
+    """A plain caption from her own profile, never invented: what she does
+    (and where, when she says what she does), then her ask.  '' when her
+    profile names neither her services nor her ask."""
     services = _text(profile.get('services')).rstrip('.')
     city, cta = _text(profile.get('city')), _text(profile.get('cta'))
-    first = services or ('Bridal makeup' if city else '')
-    line = (first + (' in %s' % city if city else '')).strip()
-    parts = [line + '.' if line else '', cta]
-    return ' '.join(p for p in parts if p)
+    line = (services + (' in %s' % city if city else '') + '.') if services else ''
+    return ' '.join(p for p in (line, cta) if p)
 
 
 def _hashtags(text: str, profile: Mapping) -> List[str]:
@@ -315,11 +324,16 @@ def _hashtags(text: str, profile: Mapping) -> List[str]:
 
 def _reel_make(turn: _Turn, target_seconds, open_with, hook_text, caption, hashtags, song_key,
                use_logo, clips) -> str:
-    from integrations.reel_studio import pipeline
+    from integrations.reel_studio import jobs, pipeline
     rid = turn.request_id()
     files = _clips(turn, rid, _text(clips))
     if not files:
         return _failure_reply({'status': 'needs_clips', 'message': pipeline.NEEDS_CLIPS_MESSAGE})
+    # Busy is said before anything is done for this reel (her logo looked
+    # up, the trending list asked).  make_reel still takes the job itself,
+    # so a reel started in between is still refused there.
+    if jobs.active_job() is not None:
+        return _failure_reply({'status': 'busy', 'message': pipeline.BUSY_MESSAGE})
     profile, note = _profile(turn.user_id)
     target = _int(target_seconds)
     try:
@@ -488,26 +502,55 @@ def _first_registration() -> None:
     jobs.sweep_once()
 
 
+def _inert_here() -> bool:
+    """Is reel_studio inert on this node (amendment A8 d: the central node)?
+
+    Asked of marketing_tools.resolve_goal_tags, the one rule for the goal
+    tags an agent carries: an agent whose stored tags are [reel_studio] keeps
+    that tag on every node but central (its node test is
+    security.key_delegation.get_node_tier, asked there), so this module holds
+    no second node-tier test."""
+    from integrations.agent_engine.marketing_tools import REEL_STUDIO_TAG, resolve_goal_tags
+    return REEL_STUDIO_TAG not in resolve_goal_tags([REEL_STUDIO_TAG], '')
+
+
 def register_reel_studio_tools(helper, assistant, user_id: str, *, prompt_id,
                                request_id_getter: Optional[Callable[[], Any]] = None,
-                               with_schema: bool = True) -> List[str]:
-    """Register the seven reel tools for ``user_id``'s agent ``prompt_id``.
+                               with_schema: bool = True, executor=None) -> List[str]:
+    """Register the seven reel tools for ``user_id``'s agent ``prompt_id``,
+    in the canonical Tier-2 shape (see the module note; the same as
+    news_tools.register_news_tools).
 
     ``request_id_getter()`` returns the current turn's request id, read each
-    time reel_make runs.  ``with_schema``: True for her Reel Studio agent
-    (``helper.register_for_llm`` plus ``assistant.register_for_execution``);
-    False registers execution on ``assistant`` only.  Returns the names
-    registered, in REEL_TOOL_NAMES order.
+    time reel_make runs.  ``with_schema``: True for her Reel Studio agent --
+    ``register_for_llm`` on ``helper`` and on ``assistant``, so whichever of
+    them proposes reel_make makes a structured call; False for any other
+    agent -- no schema anywhere, so request_tools can attach them on demand.
+    Either way ``assistant`` runs them (``register_for_execution``), and so
+    does ``executor`` when given: a group-chat agent distinct from the
+    proposer, which runs the assistant's own calls (REUSE passes its
+    executor to every Tier-2 family).  On the central node nothing is
+    registered (amendment A8 d).  Returns the names registered, in
+    REEL_TOOL_NAMES order ([] on central).
     """
+    if _inert_here():
+        logger.info('Reel tools not registered for user %s: reel_studio is inert on the '
+                    'central node', user_id)
+        return []
     _first_registration()
     tools = build_reel_tools(user_id, prompt_id=prompt_id, request_id_getter=request_id_getter)
     for name, func in tools:
         if with_schema:
-            helper.register_for_llm(name=name, description=_describe(func))(func)
+            description = _describe(func)
+            helper.register_for_llm(name=name, description=description)(func)
+            assistant.register_for_llm(name=name, description=description)(func)
         assistant.register_for_execution(name=name)(func)
+        if executor is not None:
+            executor.register_for_execution(name=name)(func)
     names = [name for name, _func in tools]
-    logger.info('Registered %d reel tools for user %s (%s)', len(names), user_id,
-                'schema + execution' if with_schema else 'execution only')
+    logger.info('Registered %d reel tools for user %s (%s%s)', len(names), user_id,
+                'schema on helper + assistant, execution' if with_schema else 'execution only',
+                ' + executor' if executor is not None else '')
     return names
 
 

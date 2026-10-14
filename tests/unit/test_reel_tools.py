@@ -2,14 +2,21 @@
 
 register_reel_studio_tools binds her user id, her agent's prompt id and a
 getter for the turn's request id into seven closures, so none of them is a
-tool argument.  With the schema (her Reel Studio agent) the helper gets the
-LLM schema and the assistant runs them; without it (any other agent) only
-the assistant can run them, which is what lets request_tools find them.
+tool argument.  It registers them in the canonical Tier-2 shape
+(news_tools.register_news_tools; commerce, finance and revenue follow it):
+with the schema (her Reel Studio agent) both the helper and the assistant
+carry the LLM schema, so an Assistant-proposed reel_make is a structured
+call, not text autogen never runs (measured live on the news family
+2026-09-03); the assistant and, when given, the executor run them.  Without
+the schema (any other agent) they are execution-only on the assistant and
+the executor, which is what lets request_tools find them.  On the central
+node it registers nothing (amendment A8 d).
 
 reel_make turns a chat turn into a reel request: this turn's clips (else her
 newest unused batch), her style (tool arguments over her agent record's
-words over her voice profile), her logo (the newest she uploaded, kept in her
-profile), the song, a caption and at most five hashtags; then
+words over her voice profile), her logo (the newest she uploaded, else the one
+her profile names: her profile is read, never written), the song, a caption
+and at most five hashtags; then
 pipeline.make_reel delivers it.  A reel_make that made no reel answers in the
 executor's failure form ("Error: ..."), so neither the CREATE recipe banker,
 the REUSE fabrication gate nor the completion gate can count it as the
@@ -23,6 +30,7 @@ publish_agent_message with publish_async as the recorded boundary.
 """
 import hashlib
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -64,6 +72,9 @@ def env(tmp_path, monkeypatch):
     monkeypatch.delenv('HEVOLVE_DATA_KEY', raising=False)
     import security.secrets_manager as secrets_manager
     monkeypatch.setattr(secrets_manager, 'get_secret', lambda name, default='': default)
+    # Her desktop, whatever this box's env says (a test below makes it central).
+    from security import key_delegation
+    monkeypatch.setattr(key_delegation, 'get_node_tier', lambda: 'flat')
     from core import platform_paths
     platform_paths.reset_cache()
     from core import cache_loaders
@@ -109,13 +120,17 @@ def env(tmp_path, monkeypatch):
     platform_paths.reset_cache()
 
 
-def _tools(env, user=UID, prompt=PID, with_schema=True):
+def _tools(env, user=UID, prompt=PID, with_schema=True, executor=False):
+    """Register the reel tools on recording agents; ``executor`` adds the
+    group chat's distinct executor (REUSE passes one to every Tier-2 family)."""
     from integrations.reel_studio.tools import register_reel_studio_tools
     helper, assistant = _Agent(), _Agent()
+    kw = {'executor': _Agent()} if executor else {}
     names = register_reel_studio_tools(helper, assistant, user, prompt_id=prompt,
                                        request_id_getter=lambda: env.request['id'],
-                                       with_schema=with_schema)
-    return SimpleNamespace(names=names, helper=helper, assistant=assistant, run=assistant.exe)
+                                       with_schema=with_schema, **kw)
+    return SimpleNamespace(names=names, helper=helper, assistant=assistant,
+                           executor=kw.get('executor'), run=assistant.exe)
 
 
 def _upload(env, data, *, name='VID.mp4', mime='video/mp4', purpose='reel_source',
@@ -149,47 +164,91 @@ def _media_pushes(env):
 
 # ── registration ──────────────────────────────────────────────────────────
 
-def test_seven_tools_with_schema_on_the_helper_and_execution_on_the_assistant(env):
+def test_with_the_schema_both_seats_carry_it_and_the_executor_runs_them(env):
+    """The canonical Tier-2 shape (news_tools.register_news_tools): the
+    Assistant carries the schema too, or a reel_make it proposes is free-
+    formed as text that autogen never runs (measured live on the news family,
+    2026-09-03); the executor runs them so the Assistant's own structured
+    call is not stranded by autogen's repeat-speaker rule."""
     from integrations.reel_studio.tools import REEL_TOOL_NAMES
-    t = _tools(env)
+    t = _tools(env, executor=True)
     assert len(REEL_TOOL_NAMES) == 7 and t.names == list(REEL_TOOL_NAMES)
     assert set(t.helper.llm) == set(REEL_TOOL_NAMES) and t.helper.exe == {}
-    assert set(t.assistant.exe) == set(REEL_TOOL_NAMES) and t.assistant.llm == {}
-    for name, (desc, func) in t.helper.llm.items():
-        first = (func.__doc__ or '').strip().split('\n')[0].strip()
-        assert desc == first and len(desc) > 20, name
+    assert set(t.assistant.llm) == set(REEL_TOOL_NAMES)
+    assert set(t.assistant.exe) == set(REEL_TOOL_NAMES)
+    assert set(t.executor.exe) == set(REEL_TOOL_NAMES) and t.executor.llm == {}
+    for seat in (t.helper, t.assistant):
+        for name, (desc, func) in seat.llm.items():
+            first = (func.__doc__ or '').strip().split('\n')[0].strip()
+            assert desc == first and len(desc) > 20, name
+            # One closure per tool, whichever seat proposes or runs it.
+            assert func is t.assistant.exe[name] is t.executor.exe[name], name
+
+
+def test_without_an_executor_the_assistant_runs_them(env):
+    from integrations.reel_studio.tools import REEL_TOOL_NAMES
+    t = _tools(env)
+    assert set(t.helper.llm) == set(t.assistant.llm) == set(t.assistant.exe) \
+        == set(REEL_TOOL_NAMES)
 
 
 def test_without_the_schema_only_execution_is_registered(env):
     from integrations.reel_studio.tools import REEL_TOOL_NAMES
-    t = _tools(env, with_schema=False)
-    assert t.helper.llm == {} and set(t.assistant.exe) == set(REEL_TOOL_NAMES)
+    t = _tools(env, with_schema=False, executor=True)
+    assert t.helper.llm == {} and t.assistant.llm == {} and t.executor.llm == {}
+    assert set(t.assistant.exe) == set(t.executor.exe) == set(REEL_TOOL_NAMES)
     # discover_and_attach reads the first docstring line of _function_map entries.
     for func in t.assistant.exe.values():
         assert (func.__doc__ or '').strip().split('\n')[0].strip()
 
 
+def test_on_the_central_node_no_reel_tool_is_registered(env, monkeypatch):
+    """Amendment A8 d: reel_studio is inert on central, so no reel tool sits
+    on any of central's agents, not even execution-only for request_tools to
+    re-attach ("instagram reels for our lash extensions" would match
+    reel_make's docstring)."""
+    from integrations.reel_studio import jobs
+    from security import key_delegation
+    monkeypatch.setattr(key_delegation, 'get_node_tier', lambda: 'central')
+    monkeypatch.setattr(jobs, '_SWEPT', False)
+    swept = []
+    monkeypatch.setattr(jobs, 'sweep_interrupted', lambda **k: swept.append(1) or [])
+    for with_schema in (True, False):
+        t = _tools(env, with_schema=with_schema, executor=True)
+        assert t.names == []
+        for seat in (t.helper, t.assistant, t.executor):
+            assert seat.llm == {} and seat.exe == {}
+    assert swept == []
+
+
 def test_real_autogen_agents_take_the_tools(env):
     autogen = pytest.importorskip('autogen')
     from integrations.reel_studio.tools import REEL_TOOL_NAMES, register_reel_studio_tools
-    helper = autogen.AssistantAgent('helper', llm_config={
-        'config_list': [{'model': 'local', 'api_key': 'none', 'base_url': 'http://127.0.0.1:9'}]})
-    assistant = autogen.UserProxyAgent('assistant', human_input_mode='NEVER',
-                                       code_execution_config=False)
+
+    def llm_config():
+        return {'config_list': [{'model': 'local', 'api_key': 'none',
+                                 'base_url': 'http://127.0.0.1:9'}]}
+    helper = autogen.AssistantAgent('helper', llm_config=llm_config())
+    assistant = autogen.AssistantAgent('assistant', llm_config=llm_config())
+    executor = autogen.UserProxyAgent('executor', human_input_mode='NEVER',
+                                      code_execution_config=False)
     register_reel_studio_tools(helper, assistant, UID, prompt_id=PID,
-                               request_id_getter=lambda: None)
-    schema = {t['function']['name']: t['function'] for t in helper.llm_config['tools']}
-    assert set(schema) == set(REEL_TOOL_NAMES)
-    assert set(REEL_TOOL_NAMES) <= set(assistant.function_map)
-    props = schema['reel_make']['parameters']['properties']
-    assert {'target_seconds', 'open_with', 'hook_text', 'caption', 'hashtags', 'song_key',
-            'use_logo', 'clips'} == set(props)
-    for bound in ('user_id', 'prompt_id', 'request_id'):
-        assert all(bound not in s['parameters'].get('properties', {}) for s in schema.values())
-    # The family rides her agent's CREATE helper next to the core tools: its
-    # schema stays within 900 tokens by the counter fit_schema_to_ctx uses.
+                               request_id_getter=lambda: None, executor=executor)
     from core.llm_outbound_logger import _schema_tokens
-    assert _schema_tokens({'tools': helper.llm_config['tools']}) <= 900
+    for seat in (helper, assistant):
+        schema = {t['function']['name']: t['function'] for t in seat.llm_config['tools']}
+        assert set(schema) == set(REEL_TOOL_NAMES), seat.name
+        props = schema['reel_make']['parameters']['properties']
+        assert {'target_seconds', 'open_with', 'hook_text', 'caption', 'hashtags', 'song_key',
+                'use_logo', 'clips'} == set(props)
+        for bound in ('user_id', 'prompt_id', 'request_id'):
+            assert all(bound not in s['parameters'].get('properties', {})
+                       for s in schema.values())
+        # The family rides each seat next to the core tools: its schema stays
+        # within 900 tokens by the counter fit_schema_to_ctx uses.
+        assert _schema_tokens({'tools': seat.llm_config['tools']}) <= 900, seat.name
+    assert set(REEL_TOOL_NAMES) <= set(assistant.function_map)
+    assert set(REEL_TOOL_NAMES) <= set(executor.function_map)
 
 
 def test_importing_the_tools_is_cheap():
@@ -244,24 +303,81 @@ def test_no_clips_asks_her_for_clips_and_is_not_the_actions_work(env):
     assert env.produced == [] and _media_pushes(env) == []
 
 
-def test_the_needs_clips_reply_cannot_complete_the_action():
-    """The completion gate itself (hartos.lifecycle_hooks) refuses it as a receipt."""
+REEL_ACTION = ('Call reel_make to make the reel from the clips she attached and send it '
+               'to her phone.')
+
+
+@pytest.fixture
+def create_action(env, monkeypatch):
+    """One CREATE action, "make the reel", as create_recipe runs it: the
+    session's group log and ledger registered the way create_recipe
+    registers them, the action in progress, its Assistant serving the real
+    reel tools.  ``verdict(reply)`` puts the dispatch, the Assistant's
+    reel_make call and ``reply`` in the log, then hands the StatusVerifier's
+    "completed" verdict to the real verifier hook, as CREATE's loop does."""
     lh = pytest.importorskip('hartos.lifecycle_hooks')
-    from integrations.reel_studio.tools import _failure_reply
-    reply = _failure_reply({'status': 'needs_clips', 'message': 'Ask her to attach clips.'})
-    message = {'role': 'tool', 'tool_call_id': 'c1', 'content': reply}
-    assert list(lh._work_results(message, {'c1': 'reel_make'}, 'make a reel with reel_make',
-                                 ['reel_make'])) == []
-    ok = dict(message, content=json.dumps({'status': 'ok'}))
-    assert list(lh._work_results(ok, {'c1': 'reel_make'}, 'make a reel with reel_make',
-                                 ['reel_make'])) == ['reel_make']
+    up = 'reelcreatesession'        # no '_': the ledger registry makes nothing on disk
+    t = _tools(env)
+    serving = SimpleNamespace(name='Assistant', _function_map=dict(t.run),
+                              llm_config={'tools': []})
+    group = SimpleNamespace(messages=[], agents=[serving])
+    ledger = SimpleNamespace(
+        tasks={'action_1': SimpleNamespace(description=REEL_ACTION, context={})},
+        save=lambda: True)
+    monkeypatch.setattr(lh, 'get_registered_groupchat', lambda _up: group)
+    monkeypatch.setattr(lh, 'get_registered_ledger', lambda _up: ledger)
+    monkeypatch.setattr(lh, '_promote_verified_outcome', lambda *a, **k: None)
+    lh.action_states.pop(up, None)
+    lh.retry_tracker.reset_count(up, 1)
+    lh.set_action_state(up, 1, lh.ActionState.IN_PROGRESS, 'test')
+
+    def verdict(reply):
+        group.messages[:] = [
+            {'role': 'user', 'name': 'ChatInstructor',
+             'content': 'Execute Action 1: %s ,Latest User message: make my reel' % REEL_ACTION},
+            {'role': 'assistant', 'name': 'Assistant', 'content': None,
+             'tool_calls': [{'id': 'c1', 'type': 'function',
+                             'function': {'name': 'reel_make', 'arguments': '{}'}}]},
+            {'role': 'tool', 'name': 'Assistant', 'content': reply,
+             'tool_responses': [{'tool_call_id': 'c1', 'role': 'tool', 'content': reply}]}]
+        answer = lh.lifecycle_hook_process_verifier_response(
+            up, {'status': 'completed', 'action_id': 1,
+                 'evidence': {'message_index': 2, 'kind': 'tool_receipt'}},
+            SimpleNamespace(current_action=1))
+        return answer, lh.get_action_state(up, 1)
+    yield SimpleNamespace(run=t.run, verdict=verdict, lh=lh, up=up)
+    lh.action_states.pop(up, None)
+    lh.retry_tracker.reset_count(up, 1)
+
+
+def test_a_create_action_whose_reel_make_needs_clips_is_not_completed(create_action):
+    """plan section 5: the needs_clips answer is never banked as the action's
+    work -- the verifier's "completed" is refused and the action steered."""
+    lh = create_action.lh
+    reply = create_action.run['reel_make']()                 # no clips attached
+    assert _failed(reply)['status'] == 'needs_clips'
+    answer, state = create_action.verdict(reply)
+    assert answer['action'] == 'force_completion', answer
+    assert state is not lh.ActionState.COMPLETED
+    assert not lh.tool_result_is_action_work(create_action.up, 1, 2)
+
+
+def test_a_create_action_whose_reel_make_made_the_reel_is_completed(env, create_action):
+    """Control: the same action with her clips attached completes on the reel."""
+    lh = create_action.lh
+    _upload(env, b'clip' * 500)
+    reply = create_action.run['reel_make']()
+    assert _ok(reply)['status'] == 'ok'
+    answer, state = create_action.verdict(reply)
+    assert answer['action'] == 'force_fallback', answer
+    assert state is lh.ActionState.COMPLETED
 
 
 def test_this_turns_clips_make_a_reel_that_reaches_her_with_the_turns_request_id(env):
     a = _upload(env, b'clip-a' * 500, captured_at=1_760_247_082_000)
     b = _upload(env, b'clip-b' * 500, captured_at=1_760_247_382_000)
     _upload(env, b'old-batch' * 500, request_id='req-0')
-    env.request['id'] = 'req-1'
+    env.request['id'] = 'req-at-registration'
     t = _tools(env)
     env.request['id'] = 'req-1'                 # read at call time, not at registration
     body = _ok(t.run['reel_make'](target_seconds=15))
@@ -304,8 +420,19 @@ def test_another_users_clip_is_never_used(env):
     assert body['status'] == 'needs_clips'
 
 
-def test_her_newest_logo_is_used_and_kept_in_her_profile(env):
+def _voice_file():
+    """Her voice profile on disk (voice_profile.user_dir: 'voice.json' in it)."""
     from integrations.reel_studio import voice_profile
+    return os.path.join(voice_profile.user_dir(UID), 'voice.json')
+
+
+def test_her_newest_logo_is_used_and_her_profile_is_not_written(env):
+    """Amendment A11b: making a reel reads her profile and never writes it;
+    the logo she uploaded last is used as it is."""
+    from integrations.reel_studio import voice_profile
+    voice_profile.update_field(UID, 'city', 'Madurai')
+    with open(_voice_file(), 'rb') as f:
+        before = f.read()
     _upload(env, b'clip' * 500)
     logo = _upload(env, b'\x89PNG-new' + b'1' * 64, name='logo.png', mime='image/png',
                    purpose='logo', request_id=None)
@@ -313,7 +440,18 @@ def test_her_newest_logo_is_used_and_kept_in_her_profile(env):
     _ok(t.run['reel_make']())
     held = env.store.resolve(UID, logo, box='in')
     assert env.produced[0]['logo_path'] == held.path
-    assert voice_profile.load_voice(UID)['logo_xid'] == logo
+    with open(_voice_file(), 'rb') as f:
+        assert f.read() == before
+    assert 'logo_xid' not in voice_profile.load_voice(UID)
+
+
+def test_a_reel_for_her_with_no_profile_creates_none(env):
+    _upload(env, b'clip' * 500)
+    logo = _upload(env, b'\x89PNG-new' + b'6' * 64, name='logo.png', mime='image/png',
+                   purpose='logo', request_id=None)
+    _ok(_tools(env).run['reel_make']())
+    assert env.produced[0]['logo_path'] == env.store.resolve(UID, logo, box='in').path
+    assert not os.path.exists(_voice_file())
 
 
 def test_the_logo_in_her_profile_is_used_when_nothing_newer_was_uploaded(env):
@@ -333,6 +471,67 @@ def test_no_logo_when_she_says_so(env):
     t = _tools(env)
     _ok(t.run['reel_make'](use_logo='no'))
     assert env.produced[0]['logo_path'] is None
+
+
+@pytest.mark.parametrize('junk', ['nah', 'maybe', 'the usual'])
+def test_an_unclear_use_logo_leaves_her_own_no_logo_standing(env, junk):
+    """An argument the one flag reading does not recognise is "not given":
+    it never overrides what she said ("no logo")."""
+    (env.prompts / ('%s.json' % PID)).write_text(json.dumps(
+        {'goal': 'Bridal reels in 20s, no logo please'}), encoding='utf-8')
+    _upload(env, b'\x89PNG' + b'4' * 64, name='logo.png', mime='image/png', purpose='logo')
+    _upload(env, b'clip' * 500)
+    _ok(_tools(env).run['reel_make'](use_logo=junk))
+    assert env.produced[0]['style']['use_logo'] is False
+    assert env.produced[0]['logo_path'] is None
+
+
+def test_a_profile_with_only_her_city_invents_no_caption(env):
+    from integrations.reel_studio import voice_profile
+    voice_profile.update_field(UID, 'city', 'Madurai')
+    _upload(env, b'clip' * 500)
+    media = _ok(_tools(env).run['reel_make']())['media']
+    assert media['caption'] == ''
+
+
+def test_a_busy_desktop_answers_before_touching_her_profile_or_the_trending_list(
+        env, monkeypatch):
+    from integrations.reel_studio import jobs, voice_profile
+    from integrations.trends import trending_songs_client as tsc
+    asked = []
+    monkeypatch.setattr(tsc, 'get_trending_songs', lambda langs=None, limit=10: asked.append(
+        langs) or {'schema': C.TRENDING_CLIENT_SCHEMA, 'songs': [], 'stale': True,
+                   'reason': 'no_central'})
+    _upload(env, b'clip' * 500)
+    _upload(env, b'\x89PNG-new' + b'5' * 64, name='logo.png', mime='image/png',
+            purpose='logo', request_id=None)
+    other = jobs.start_job('20088', '7', 'x')
+    try:
+        body = _failed(_tools(env).run['reel_make']())
+    finally:
+        jobs.finish_job(other.reel_id, 'ok')
+    assert body['status'] == 'busy' and body['message']
+    assert asked == [] and env.produced == []
+    assert 'logo_xid' not in voice_profile.load_voice(UID)
+
+
+def test_a_saved_logo_the_store_cannot_read_is_logged_and_left_out(env, monkeypatch, caplog):
+    from integrations.reel_studio import voice_profile
+    saved = hashlib.sha256(b'gone').hexdigest()
+    voice_profile.update_field(UID, 'logo_xid', saved)
+    _upload(env, b'clip' * 500)
+    real = env.store.resolve
+
+    def resolve(user_id, xid, *a, **k):
+        if xid == saved:
+            raise OSError(5, 'Input/output error')
+        return real(user_id, xid, *a, **k)
+    monkeypatch.setattr(env.store, 'resolve', resolve)
+    with caplog.at_level(logging.WARNING, logger='integrations.reel_studio.tools'):
+        _ok(_tools(env).run['reel_make']())
+    assert env.produced[0]['logo_path'] is None
+    assert any(saved[:12] in r.getMessage() and r.levelno >= logging.WARNING
+               for r in caplog.records), [r.getMessage() for r in caplog.records]
 
 
 def test_her_agent_record_sets_the_style_and_arguments_override_it(env):

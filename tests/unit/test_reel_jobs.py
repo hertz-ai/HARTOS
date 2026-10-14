@@ -8,6 +8,12 @@ honest word when the desktop restarted in the middle of one.
 * sweep_interrupted() finds jobs a dead process left 'running', marks them
   'interrupted' and tells each user once, on her own chat topic and never
   through central's crossbar (decision U4(d)).
+* A job that ends without finishing -- interrupted, or taken over as stale --
+  loses its work dir (get_data_dir()/reel_studio/work/<reel_id>/): it holds
+  near-lossless frames of her clients' faces.  The once-per-process sweep
+  also removes every work dir no live job owns.
+* A live job beats (beat()) at each step of the reel; it is stale only after
+  MAX_JOB_S without a beat, so a slow reel is never taken over.
 * Records live under get_data_dir()/reel_studio/jobs/ and are written
   atomically by this module alone.
 
@@ -128,9 +134,14 @@ def test_finishing_an_unknown_job_frees_nothing_it_does_not_hold(jobs):
 
 # ── a desktop that restarted mid-reel ─────────────────────────────────────
 
+def _claim_path(J):
+    return os.path.join(J.jobs_dir(), J.CLAIM_NAME)
+
+
 def _orphan(J, pid, *, user='10077', prompt='42', request='req-9', reel='a' * 32,
-            started=None):
-    """A 'running' record (and the machine claim) left by a process that died."""
+            started=None, beat=None, claim=True):
+    """A 'running' record (and the machine claim) left by a process that
+    died.  The claim was last beaten at ``beat`` (default: when it started)."""
     started = time.time() - 30 if started is None else started
     os.makedirs(J.jobs_dir(), exist_ok=True)
     record = {'schema': J.JOB_SCHEMA, 'reel_id': reel, 'user_id': user, 'prompt_id': prompt,
@@ -138,9 +149,24 @@ def _orphan(J, pid, *, user='10077', prompt='42', request='req-9', reel='a' * 32
               'finished_at': None, 'detail': ''}
     with open(_record_path(J, reel), 'w', encoding='utf-8') as f:
         json.dump(record, f)
-    with open(os.path.join(J.jobs_dir(), J.CLAIM_NAME), 'w', encoding='utf-8') as f:
-        json.dump({'reel_id': reel, 'pid': pid, 'started_at': started}, f)
+    if claim:
+        with open(_claim_path(J), 'w', encoding='utf-8') as f:
+            json.dump({'reel_id': reel, 'pid': pid, 'started_at': started}, f)
+        last = started if beat is None else beat
+        os.utime(_claim_path(J), (last, last))
     return reel
+
+
+def _work_dir(J, reel):
+    """A work dir as render pass 1 leaves it mid-reel: a near-lossless
+    mezzanine of her client's face."""
+    path = os.path.join(J.work_root(), reel)
+    os.makedirs(os.path.join(path, 'frames'), exist_ok=True)
+    with open(os.path.join(path, 'reel_seg_000.mp4'), 'wb') as f:
+        f.write(b'\x00\x00\x00\x18ftypmp42' + b'\x00' * 256)
+    with open(os.path.join(path, 'frames', 'k_000.jpg'), 'wb') as f:
+        f.write(b'\xff\xd8\xff')
+    return path
 
 
 def test_a_dead_process_job_is_interrupted_and_she_is_told_once(jobs, pushes):
@@ -182,11 +208,143 @@ def test_a_record_with_this_pid_this_process_never_started_is_interrupted(jobs, 
     assert len(pushes) == 1
 
 
-def test_a_job_running_past_its_bound_is_interrupted_even_if_the_pid_lives(jobs, pushes):
-    # A pid can be reused by an unrelated process; past MAX_JOB_S no reel is still working.
+def test_a_job_silent_past_its_bound_is_interrupted_even_if_the_pid_lives(jobs, pushes):
+    # A pid can be reused by an unrelated process; a reel that has not beaten
+    # for MAX_JOB_S is not being worked on.
     reel = _orphan(jobs, os.getppid(), started=time.time() - jobs.MAX_JOB_S - 60)
     swept = jobs.sweep_interrupted()
     assert [j.reel_id for j in swept] == [reel] and len(pushes) == 1
+
+
+def test_a_slow_job_that_still_beats_is_never_taken_over(jobs, pushes):
+    # Ten long HDR clips: started well over MAX_JOB_S ago, beat a minute ago.
+    started = time.time() - jobs.MAX_JOB_S - 600
+    reel = _orphan(jobs, os.getppid(), started=started, beat=time.time() - 60)
+    work = _work_dir(jobs, reel)
+    assert jobs.start_job('20088', '7', 'x') is None              # busy, not taken over
+    assert jobs.sweep_interrupted() == [] and pushes == []
+    assert jobs.reel_job(reel).status == 'running' and os.path.isdir(work)
+
+
+def test_beat_keeps_this_process_job_fresh(jobs):
+    job = jobs.start_job('10077', '42', 'r')
+    old = time.time() - jobs.MAX_JOB_S + 5
+    os.utime(_claim_path(jobs), (old, old))
+    jobs.beat(job.reel_id)
+    assert os.path.getmtime(_claim_path(jobs)) > time.time() - 60
+    jobs.beat('f' * 32)                         # not its job: nothing, no error
+    jobs.finish_job(job.reel_id, 'ok')
+    jobs.beat(job.reel_id)                      # finished: nothing, no error
+    assert not os.path.exists(_claim_path(jobs))
+
+
+# ── her clients' faces never stay behind ─────────────────────────────────
+
+def test_an_interrupted_jobs_work_dir_is_removed(jobs, pushes):
+    reel = _orphan(jobs, _dead_pid())
+    work = _work_dir(jobs, reel)
+    assert [j.reel_id for j in jobs.sweep_interrupted()] == [reel]
+    assert not os.path.exists(work)
+
+
+def test_taking_over_a_stale_claim_removes_its_work_dir(jobs, pushes):
+    # The reviewer's probe: a dead-pid 'running' job, then a new job starts.
+    reel = _orphan(jobs, _dead_pid())
+    work = _work_dir(jobs, reel)
+    job = jobs.start_job('20088', '7', 'mine')
+    assert job is not None and jobs.reel_job(reel).status == 'interrupted'
+    assert not os.path.exists(work)
+
+
+def _ended(J, reel, status='ok'):
+    """Rewrite job ``reel``'s record as ended with ``status``."""
+    with open(_record_path(J, reel), encoding='utf-8') as f:
+        record = json.load(f)
+    record.update(status=status, finished_at=time.time())
+    with open(_record_path(J, reel), 'w', encoding='utf-8') as f:
+        json.dump(record, f)
+
+
+def test_a_stale_claim_whose_record_ended_still_loses_its_work_dir(jobs, pushes):
+    # The process died after writing its end but before freeing the machine.
+    reel = _orphan(jobs, _dead_pid())
+    _ended(jobs, reel, 'render_failed')
+    work = _work_dir(jobs, reel)
+    assert jobs.start_job('20088', '7', 'mine') is not None
+    assert not os.path.exists(work)
+    assert jobs.reel_job(reel).status == 'render_failed' and pushes == []   # it had ended
+
+
+def test_the_sweep_removes_every_work_dir_no_live_job_owns(jobs, pushes):
+    mine = jobs.start_job('10077', '42', 'r')                        # this process, working
+    theirs = _orphan(jobs, os.getppid(), reel='b' * 32, claim=False)  # the CLI, working
+    done = _orphan(jobs, os.getppid(), reel='c' * 32, claim=False)
+    _ended(jobs, done)
+    keep = [_work_dir(jobs, mine.reel_id), _work_dir(jobs, theirs)]
+    gone = [_work_dir(jobs, done), _work_dir(jobs, 'e' * 32), _work_dir(jobs, 'not-a-reel')]
+    with open(os.path.join(jobs.work_root(), 'stray.mp4'), 'wb') as f:
+        f.write(b'\x00')
+    assert jobs.sweep_interrupted() == []
+    assert all(os.path.isdir(p) for p in keep)
+    assert not any(os.path.exists(p) for p in gone)
+    assert sorted(os.listdir(jobs.work_root())) == sorted([mine.reel_id, theirs])
+    jobs.finish_job(mine.reel_id, 'ok')
+
+
+# ── two processes at the claim ────────────────────────────────────────────
+
+def test_a_claim_still_being_written_is_held_not_stale(jobs, pushes):
+    # Another process has just made the claim (exclusive create) and not yet
+    # written it: it is not stale, and it is not removed.
+    os.makedirs(jobs.jobs_dir(), exist_ok=True)
+    open(_claim_path(jobs), 'w').close()
+    assert jobs.start_job('20088', '7', 'x') is None
+    assert os.path.exists(_claim_path(jobs))
+
+
+def test_a_claim_that_cannot_be_written_does_not_hold_the_machine(jobs, monkeypatch):
+    # The disk fills between the claim's exclusive create and its write: the
+    # start fails, and the empty claim it made does not answer every later
+    # reel 'busy' (an empty claim reads as one still being written).
+    def full(obj, f, **k):
+        raise OSError(28, 'No space left on device')
+    with monkeypatch.context() as mp:
+        mp.setattr(jobs, 'json', SimpleNamespace(dump=full, load=json.load, loads=json.loads))
+        with pytest.raises(OSError):
+            jobs.start_job('10077', '42', 'r')
+    assert not os.path.exists(_claim_path(jobs))
+    assert jobs.start_job('10077', '42', 'again') is not None
+
+
+def test_an_unreadable_claim_left_long_ago_is_taken_over(jobs, pushes):
+    os.makedirs(jobs.jobs_dir(), exist_ok=True)
+    with open(_claim_path(jobs), 'w') as f:
+        f.write('{not js')
+    old = time.time() - jobs.CLAIM_WRITE_GRACE_S - 5
+    os.utime(_claim_path(jobs), (old, old))
+    assert jobs.start_job('20088', '7', 'x') is not None
+
+
+def test_a_stale_claim_replaced_meanwhile_by_another_process_is_kept(jobs, pushes,
+                                                                     monkeypatch):
+    # Both processes judge the same dead claim; the other one takes over first
+    # and makes its own live claim.  This one must not remove that claim.
+    dead = _dead_pid()
+    stale = _orphan(jobs, dead)
+    live = {'reel_id': 'f' * 32, 'pid': os.getppid(), 'started_at': time.time()}
+    real = jobs._pid_alive
+
+    def the_other_process_wins(pid):
+        if pid == dead and jobs.reel_job(stale).status == 'running':
+            with open(_claim_path(jobs), 'w', encoding='utf-8') as f:
+                json.dump(live, f)
+            return False
+        return real(pid)
+    monkeypatch.setattr(jobs, '_pid_alive', the_other_process_wins)
+    assert jobs.start_job('20088', '7', 'x') is None              # busy
+    with open(_claim_path(jobs), encoding='utf-8') as f:
+        assert json.load(f) == live                                # their claim stands
+    assert not [n for n in os.listdir(jobs.jobs_dir()) if n.startswith(jobs.CLAIM_NAME + '.')]
 
 
 def test_start_takes_over_a_dead_claim(jobs, pushes):
@@ -207,6 +365,7 @@ def test_sweep_once_runs_once_per_process(jobs, pushes):
 def test_sweeping_an_empty_machine_creates_nothing(jobs):
     assert jobs.sweep_interrupted() == []
     assert not os.path.exists(jobs.jobs_dir())
+    assert not os.path.exists(jobs.work_root())
 
 
 def test_a_damaged_record_is_skipped_not_fatal(jobs, pushes):
