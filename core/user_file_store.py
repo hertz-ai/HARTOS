@@ -910,10 +910,17 @@ class UserFileStore:
                      max_age_s: float = 1800) -> List[StoredFile]:
         """Outbound files for this turn that no reply has carried yet, made
         within ``max_age_s``; each is marked replied, so one reply carries
-        it.  ``request_id=None`` takes any request of the prompt."""
+        it.  ``request_id=None`` takes any request of the prompt.
+
+        Asked for every chat reply that has a prompt (core.chat_attachments
+        .take_outbound), on every node: a user with no directory here has
+        nothing to take, and is answered without a lock -- the lock registry
+        is never evicted -- or an index read."""
         uid = _user_key(user_id)
         pid, rid = _turn_id(prompt_id, 'prompt_id'), _turn_id(request_id, 'request_id')
         user_dir = self._user_dir(uid)
+        if not os.path.isdir(user_dir):
+            return []
         with _lock_for(user_dir):
             now = self._clock()
             doc = self._load_index(user_dir, uid)
