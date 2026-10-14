@@ -321,7 +321,8 @@ def test_a_low_disk_refusal_leaves_no_work_dir_behind(turn):
     def disk_usage(path):
         asked.append(path)
         return SimpleNamespace(total=1 << 40, used=1 << 39, free=P.MIN_FREE_BYTES - 1)
-    turn.mp.setattr(P.shutil, 'disk_usage', disk_usage)
+    import shutil       # the boundary of core.platform_paths.free_bytes, the one rule (D27)
+    turn.mp.setattr(shutil, 'disk_usage', disk_usage)
     result = P.make_reel(user_id=UID, prompt_id=PID, request_id='r', clips=[clip.to_dict()],
                          style=C.make_style({}))
     assert result['status'] == 'no_space', result

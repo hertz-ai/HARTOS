@@ -50,11 +50,12 @@ import errno
 import logging
 import math
 import os
-import shutil
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
+# Free disk where the work dir goes: the one rule (D27), read by _make.
+from core.platform_paths import free_bytes
 from integrations.reel_studio import contracts as C
 from integrations.reel_studio import jobs
 # A job's work dir belongs to the job (jobs removes it when a job dies);
@@ -115,19 +116,9 @@ class Production:
 
 
 # ── how much room ─────────────────────────────────────────────────────────
-
-def free_bytes(path: str) -> int:
-    """Free disk where ``path`` is or will be.  shutil.disk_usage needs a
-    path that exists, so it is asked of ``path``'s nearest existing
-    ancestor; nothing is created to measure it (amendment A11b)."""
-    probe = os.path.abspath(path)
-    while not os.path.isdir(probe):
-        parent = os.path.dirname(probe)
-        if parent == probe:         # a drive or root that is not there: let it say so
-            break
-        probe = parent
-    return shutil.disk_usage(probe).free
-
+# Free disk at the work dir is core.platform_paths.free_bytes, imported
+# above (the one free-disk rule, D27): its nearest existing folder,
+# nothing created to measure it (amendment A11b).
 
 def reel_bytes_cap(target_s: float) -> int:
     """The most bytes a reel of ``target_s`` may have: QA's size cap at the
