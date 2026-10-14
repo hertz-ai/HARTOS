@@ -328,9 +328,18 @@ class TestTheWebhookFinalizesAPaidSession:
         already_completed over a key still on the old tier (the review of
         3153761b3 measured that answer)."""
         ctx['db'].fail_next_commit()
-        r = _deliver(ctx, _event(_session()))
-        assert r.status_code == 500
+        log = logging.getLogger('hevolve_social')
+        with patch.object(log, 'error') as said:
+            r = _deliver(ctx, _event(_session()))
+        assert r.status_code == 500 and r.get_json()['status'] == 'bump_failed'
         assert ctx['db'].key() == FREE
+        # This rail's own retry sentence (the review of 7c8431c2e): Stripe
+        # redelivers, the buyer's reload re-POSTs; one line, asking for a
+        # person only if it repeats.
+        assert said.call_count == 1
+        line = said.call_args.args[0]
+        assert 'cs_test_1' in line and 'if this repeats' in line
+        assert 'Stripe redelivers the event' in line
         r2 = _deliver(ctx, _event(_session()))
         assert r2.status_code == 200, r2.get_json()
         assert ctx['db'].key() == PRO
@@ -380,8 +389,16 @@ class TestTheBrowserRouteSharesTheFinalizer:
         assert r.status_code == 500 and ctx['db'].key() == FREE
         assert len(ctx['ledger'].payments) == 1
         ctx['db'].fail_next_commit()
-        r2 = _complete(ctx)                       # the reload, bump fails again
+        log = logging.getLogger('hevolve_social')
+        with patch.object(log, 'error') as said:
+            r2 = _complete(ctx)                   # the reload, bump fails again
         assert r2.status_code == 500 and r2.get_json()['success'] is False
+        assert r2.get_json()['status'] == 'bump_failed'
+        # The fast path's own retry sentence (the review of 7c8431c2e).
+        assert said.call_count == 1
+        line = said.call_args.args[0]
+        assert 'cs_test_1' in line and 'if this repeats' in line
+        assert 're-POSTs the session' in line
         assert ctx['db'].key() == FREE
         r3 = _complete(ctx)                       # the next reload finishes it
         assert r3.status_code == 200, r3.get_json()

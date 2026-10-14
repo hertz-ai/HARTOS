@@ -127,7 +127,7 @@ def test_self_issuable_tiers_are_exactly_the_free_ones():
 from decimal import Decimal  # noqa: E402
 
 from integrations.ap2.ap2_protocol import (  # noqa: E402
-    PaymentGateway, PaymentGatewayConnector, PaymentLedger,
+    PaymentGateway, PaymentGatewayConnector, PaymentLedger, PaymentStatus,
 )
 from tests.unit.commercial_db import KEY, OTHER, OWNER, key_db  # noqa: E402,F401  (a fixture)
 
@@ -237,6 +237,38 @@ def test_a_person_who_pays_through_stripe_gets_the_tier(client, key_db, tmp_path
     assert body['payment']['status'] == 'completed' and 'revenue_split' in body
     (payment,) = ledger.payments.values()
     assert payment.gateway == PaymentGateway.STRIPE
+
+
+def test_a_charge_whose_tier_bump_fails_asks_for_a_person_now(client, key_db, tmp_path,
+                                                                monkeypatch):
+    """The card was charged and the tier write failed: 500 with status
+    bump_failed, the payment recorded as taken, and ONE ERROR line that
+    names the payment and says no retry follows, since a re-POST of
+    /upgrade would charge the card again; so it asks for a person now, not
+    'if this repeats' (the review of 7c8431c2e: one wording claimed the
+    gateway's redelivery or the buyer's reload on every rail)."""
+    ledger = PaymentLedger(ledger_path=str(tmp_path / 'ledger.json'))
+    ledger.add_gateway(_AuthorizingStripe())
+    monkeypatch.delenv('HEVOLVE_DEV_MODE', raising=False)
+    key_db.fail_next_commit()
+    log = logging.getLogger('hevolve_social')
+    with _as_owner(key_db), patch('integrations.ap2.payment_ledger', ledger), \
+            patch.object(log, 'error') as said, patch.object(log, 'exception') as traced:
+        r = client.post(f'/api/v1/intelligence/keys/{KEY}/upgrade',
+                        json={'target_tier': 'pro', 'payment_method': 'pm_card_visa'},
+                        headers={'Authorization': 'Bearer tok'})
+    assert r.status_code == 500, r.get_json()
+    body = r.get_json()
+    assert body['success'] is False and body['status'] == 'bump_failed'
+    (payment,) = ledger.payments.values()
+    assert body['payment_request_id'] == payment.payment_id
+    assert payment.status == PaymentStatus.COMPLETED          # the money was taken
+    traced.assert_not_called()
+    assert said.call_count == 1
+    line = said.call_args.args[0]
+    assert payment.payment_id in line and 'charge the card again' in line
+    assert 'if this repeats' not in line
+    assert _tier_of(key_db) == 'free'
 
 
 def test_the_mock_gate_reads_the_one_dev_mode_switch(client, key_db, tmp_path, monkeypatch):

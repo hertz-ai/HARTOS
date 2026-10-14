@@ -1143,9 +1143,13 @@ def upgrade_key(key_id):
         # Payment succeeded — the bought tier, through the one writer.
         _changed, failure = _apply_bought_tier(db, api_key, target_tier)
         if failure is not None:
+            # No retry follows on this rail: a re-POST of /upgrade would
+            # charge the card again, so the line asks for a person now.
             payload, status = _bump_failed(
                 f'payment {payment_req.payment_id}', api_key.id, failure,
-                payment_request_id=payment_req.payment_id)
+                retry='no retry follows: a re-POST of /upgrade would charge the card '
+                      'again; apply the bought tier by hand',
+                retries=False, payment_request_id=payment_req.payment_id)
             return jsonify(payload), status
 
         return jsonify({
@@ -1428,11 +1432,12 @@ def phonepe_callback():
       6. On confirmed PAYMENT_SUCCESS, bump the API key's tier through the
          one writer and mark COMPLETED; a failed bump leaves the payment
          PROCESSING and answers 500 so PhonePe delivers the callback again
-         and the retry finishes it.  PhonePe retries a non-200 answer a
-         bounded number of times (its pages give no count for the PG
-         callback; three for the in-store one); past them the payment
-         stays PROCESSING and a person finishes it from the ERROR line
-         (the review of 38a881c35).
+         and that retry runs the bump again.  PhonePe retries a non-200
+         answer a bounded number of times (its pages give no count for the
+         PG callback; three for the in-store one), and the buyer's return
+         page bumps nothing; past the retries the payment stays PROCESSING
+         and a person finishes it from the ERROR line (the reviews of
+         38a881c35 and 7c8431c2e).
     """
     gateway, envelope, refusal = _verified_phonepe_envelope('callback')
     if refusal is not None:
@@ -1590,12 +1595,12 @@ def phonepe_callback():
     # downgrade, whatever order confirmations land in; this rail used to
     # bump with no rule, the review of fd2b4773c).  Money confirmed and the
     # write failed: the payment stays PROCESSING and PhonePe is answered a
-    # 500, so its retry runs the status check and the bump again, as
-    # Stripe's retry does for the Checkout finalizer; it used to answer 200
-    # completed and mark the payment COMPLETED, so the retry was told
-    # already_completed and nothing ever re-applied the tier (the review of
-    # ec0dbe7be).
-    failure = None
+    # 500, so its redelivery (a bounded number of them; the buyer's return
+    # page bumps nothing) runs the status check and the bump again; it used
+    # to answer 200 completed and mark the payment COMPLETED, so the retry
+    # was told already_completed and nothing ever re-applied the tier (the
+    # review of ec0dbe7be).
+    failure, raised = None, None
     try:
         from integrations.social.models import get_db, CommercialAPIKey
         db = get_db()
@@ -1615,14 +1620,17 @@ def phonepe_callback():
         finally:
             db.close()
     except Exception as db_err:
-        # The traceback stays in the log (a locked database is diagnosed
-        # from it); the sentence goes to the reconciliation line.
-        logger.exception("PhonePe callback: tier bump for %s raised", api_key_id)
-        failure = f'{type(db_err).__name__}: {db_err}'
+        # The traceback (a locked database is diagnosed from it) rides on
+        # the one reconciliation line below; logger.exception here made a
+        # second ERROR record for the same failure (the review of 7c8431c2e).
+        failure, raised = f'{type(db_err).__name__}: {db_err}', db_err
     if failure is not None:
         payload, status = _bump_failed(
             f'PhonePe payment {payment_req.payment_id}', api_key_id, failure,
-            payment_request_id=payment_req.payment_id, status='bump_failed')
+            retry='PhonePe delivers this callback again on the 500, a bounded number '
+                  "of times, and that retry runs the bump again; the buyer's return "
+                  'page bumps nothing',
+            retries=True, exc_info=raised, payment_request_id=payment_req.payment_id)
         return jsonify(payload), status
 
     payment_req.update_status(PaymentStatus.COMPLETED,
@@ -1928,18 +1936,31 @@ def _not_an_upgrade(api_key, target_tier):
     }), 400
 
 
-def _bump_failed(what_paid: str, api_key_id, failure: str, **payload_extra):
-    """The answer when money was taken and the tier write failed: an ERROR
-    line a person reconciles by, and a 500 (Stripe and PhonePe deliver
-    again on a non-2xx; the browser's reload tries again), never a success
-    over a key still on the old tier.  The line says a retry follows, so one
-    occurrence is not yet a reconciliation case; a repeating one is (the
-    review of 38a881c35)."""
-    logger.error(f"MANUAL RECONCILIATION NEEDED if this repeats: {what_paid} paid but "
-                 f"the tier bump failed for api_key {api_key_id}: {failure}; the "
-                 f"gateway's redelivery or the buyer's reload retries it")
+def _bump_failed(what_paid: str, api_key_id, failure: str, *, retry: str,
+                 retries: bool, exc_info=None, **payload_extra):
+    """The answer when money was taken and the tier write failed: ONE ERROR
+    line a person reconciles by, and a 500 with ``status`` 'bump_failed',
+    never a success over a key still on the old tier.
+
+    Whether a retry follows differs per rail, so each caller says so in
+    ``retry``, its own sentence in the line: Stripe redelivers its event on
+    a non-2xx and the buyer's reload re-POSTs the session, either of which
+    runs the bump again; PhonePe delivers its callback again a bounded
+    number of times, and the buyer's return page bumps nothing; the
+    synchronous card charge has no retry at all, since a re-POST of
+    /upgrade charges the card again.  ``retries`` True means the line asks
+    for a person only if it repeats; False means it asks now.  One wording
+    used to claim "the gateway's redelivery or the buyer's reload retries
+    it" on every rail (the review of 7c8431c2e, which measured the sync
+    route and PhonePe's return page against it).  ``exc_info`` is the
+    exception the caller caught, when it caught one, so the traceback rides
+    on this line and not on a second ERROR record."""
+    logger.error(f"MANUAL RECONCILIATION NEEDED{' if this repeats' if retries else ''}: "
+                 f"{what_paid} paid but the tier bump failed for api_key {api_key_id}: "
+                 f"{failure}; {retry}", exc_info=exc_info)
     return dict({
         'success': False,
+        'status': 'bump_failed',
         'error': f'Payment succeeded but tier bump failed: {failure}',
     }, **payload_extra), 500
 
@@ -2136,7 +2157,9 @@ def _finalize_paid_checkout_session(session, db):
     _changed, failure = _apply_bought_tier(db, api_key, target_tier)
     if failure is not None:
         return _bump_failed(f'Stripe session {session_id}', api_key_id, failure,
-                            payment_request_id=payment.payment_id,
+                            retry="Stripe redelivers the event on the 500 and the buyer's "
+                                  'reload re-POSTs the session; either runs the bump again',
+                            retries=True, payment_request_id=payment.payment_id,
                             session_id=session_id)
 
     return _checkout_payload(payment, api_key, already_completed=already), 200
@@ -2203,7 +2226,10 @@ def complete_upgrade_checkout():
             if failure is not None:
                 payload, status = _bump_failed(
                     f'Stripe session {session_id}', api_key.id, failure,
-                    payment_request_id=existing.payment_id, session_id=session_id)
+                    retry="the buyer's reload re-POSTs the session, and Stripe's event, "
+                          'when it is still due, finalizes it; either runs the bump again',
+                    retries=True, payment_request_id=existing.payment_id,
+                    session_id=session_id)
                 return jsonify(payload), status
             return jsonify(_checkout_payload(existing, api_key, already_completed=True)), 200
 

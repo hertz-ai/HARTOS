@@ -127,14 +127,47 @@ def test_a_tier_bump_that_fails_is_retried_by_phonepe(ctx, key_db):
     with patch.object(log, 'error') as said:
         r = _callback(ctx['client'])
     assert r.status_code == 500, r.get_json()
-    assert r.get_json()['success'] is False
-    assert said.called and p.payment_id in said.call_args.args[0]
+    assert r.get_json()['success'] is False and r.get_json()['status'] == 'bump_failed'
+    assert said.call_count == 1 and p.payment_id in said.call_args.args[0]
+    # This rail's own retry sentence: PhonePe delivers the callback again,
+    # the buyer's return page does not bump (the review of 7c8431c2e).
+    line = said.call_args.args[0]
+    assert 'if this repeats' in line and 'PhonePe delivers this callback again' in line
+    assert 'return page bumps nothing' in line
     assert ctx['ledger'].get_payment(p.payment_id).status == PaymentStatus.PROCESSING
     assert key_db.key() == _tier('free')
     r2 = _callback(ctx['client'])                  # PhonePe's retry
     assert r2.status_code == 200 and r2.get_json()['status'] == 'completed'
     assert ctx['ledger'].get_payment(p.payment_id).status == PaymentStatus.COMPLETED
     assert key_db.key() == _tier('starter')
+
+
+def test_a_tier_bump_that_raises_is_one_record_and_the_payment_waits(ctx, key_db):
+    """The database itself fails inside the bump (get_db raises: a lost
+    connection, a locked file): the payment stays PROCESSING, PhonePe is
+    answered 500 with status bump_failed, and the failure is ONE ERROR
+    record carrying the traceback and naming the payment; it used to be
+    logger.exception plus the reconciliation line, two records for one
+    failure (the review of 7c8431c2e)."""
+    import logging
+    p = _processing(ctx['ledger'], {'kind': 'tier_upgrade', 'api_key_id': 'k1',
+                                    'target_tier': 'starter'})
+    log = logging.getLogger('hevolve_social')
+    boom = RuntimeError('database is locked')
+    with patch('integrations.social.models.get_db', side_effect=boom), \
+            patch.object(log, 'error') as said, patch.object(log, 'exception') as traced:
+        r = _callback(ctx['client'])
+    assert r.status_code == 500, r.get_json()
+    body = r.get_json()
+    assert body['success'] is False and body['status'] == 'bump_failed'
+    assert body['payment_request_id'] == p.payment_id
+    traced.assert_not_called()
+    assert said.call_count == 1
+    line = said.call_args.args[0]
+    assert p.payment_id in line and 'database is locked' in line
+    assert said.call_args.kwargs.get('exc_info') is boom
+    assert ctx['ledger'].get_payment(p.payment_id).status == PaymentStatus.PROCESSING
+    assert key_db.key() == _tier('free')
 
 
 def test_a_tier_upgrade_callback_never_lowers_the_key(ctx, key_db):
