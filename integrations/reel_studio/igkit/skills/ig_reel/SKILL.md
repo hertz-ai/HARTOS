@@ -9,9 +9,6 @@ disable-model-invocation: true
 
 reel_make cuts the reel from her clips. You write the words around it. How it cuts, and what you choose for it: reel_skill reel_edit.
 
-## The story
-Her clips play in the order she filmed them, and the reel ends on the finished look, held at least 1.5 s. Open with a short final-look teaser only when she asks for it ("start with the result").
-
 ## The hook
 1. Write three hook lines from different angles: the time ("Bare face to bride in 20 seconds"), the problem solved ("Dusky skin, no grey cast in flash"), the reveal ("Wait for the temple jewellery").
 2. Run reel_score_hooks on them. It flags weak hooks; it does not predict views. Fix the weakest check it names, or drop that line.
