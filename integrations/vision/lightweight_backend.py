@@ -830,6 +830,13 @@ class Qwen08BBackend(VisionBackend):
     #: How long a FAILED launch suppresses the next attempt.  Not forever:
     #: see ensure_running for why permanence was a defect (#102).
     LAUNCH_RETRY_S = 120
+    #: The event ensure_running sends; Nunba's subscriber (main.py ~:669)
+    #: answers it with llama_config.start_caption_server.
+    START_EVENT = 'vlm_caption.requested'
+    #: The model catalog row whose files this backend serves (the 0.8B and
+    #: its projector, as Nunba's start_caption_server runs them):
+    #: model_catalog._populate_llm_models.
+    CATALOG_ID = 'llm-qwen3.5-0.8b'
 
     def __init__(self, port: int = None):
         from core.port_registry import get_port
@@ -838,6 +845,75 @@ class Qwen08BBackend(VisionBackend):
         self._launch_attempted_at = 0.0
         self._last_describe_time = 0.0
         self._server_proc = None  # subprocess.Popen object (not just PID)
+
+    def _launch_owner(self) -> str:
+        """Why this backend must not spawn the caption server itself --
+        Nunba is starting it -- or '' when nobody is.
+
+        Both are Nunba's existing records, read here, never written:
+
+        * its START_EVENT subscriber on this process's platform event bus
+          (Nunba main.py ~:669): it answers the event ensure_running has
+          just sent with llama_config.start_caption_server;
+        * its per-port start lock, ~/.nunba/.caption_server_starting.<port>
+          .lock (llama_config.py start_caption_server ~:2850; Nunba's config
+          dir, ~:395), which serializes that start across Nunba's own
+          callers and processes.  It exists while a start is in progress; one
+          left by a Nunba killed mid-start is cleared by Nunba's next start.
+
+        Spawning while either holds is how two 0.8B servers landed on one
+        port (2026-09-26).
+        """
+        try:
+            from core.platform.registry import get_registry
+            bus = get_registry().get_or_none('events')
+            if bus is not None and bus.has_listeners(self.START_EVENT):
+                return f"Nunba's {self.START_EVENT} subscriber is starting it"
+        except Exception as e:
+            logger.debug(f"Qwen3.5-0.8B: event bus not readable ({e})")
+        lock = os.path.join(os.path.expanduser('~'), '.nunba',
+                            f'.caption_server_starting.{self._port}.lock')
+        if os.path.exists(lock):
+            return f"Nunba's start lock {lock} is held"
+        return ''
+
+    def _model_files(self) -> tuple:
+        """(model, mmproj) on disk for the standalone launch; None for a
+        file that is not there.
+
+        Names from the catalog row CATALOG_ID: files['model'], and the
+        projector under the name Nunba's installer stores it by,
+        files['mmproj'] (mmproj-Qwen3.5-0.8B-F16.gguf), or where
+        scripts/setup_vlm.py puts it, files['mmproj_source'] in a 'qwen08b'
+        folder.  Folders, first hit wins: the one the row's local_path names
+        (where the loader that fetched the weights put them); the LLM models
+        folder by Nunba's one storage rule, LlamaInstaller.resolve_models_dir
+        (llama_installer.py ~:446), where Nunba is importable, else that
+        rule's default ~/.nunba/models; then ~/.trueflow/models.
+        """
+        from integrations.service_tools.model_catalog import get_catalog
+        entry = get_catalog().get(self.CATALOG_ID)
+        if entry is None:
+            logger.warning(f"Qwen3.5-0.8B: catalog row {self.CATALOG_ID} is missing")
+            return None, None
+        files = entry.files or {}
+        home = os.path.expanduser('~')
+        try:
+            from llama.llama_installer import LlamaInstaller   # Nunba, when present
+            models_dir = str(LlamaInstaller.resolve_models_dir())
+        except Exception as e:
+            logger.debug(f"Qwen3.5-0.8B: Nunba's models folder rule not here ({e})")
+            models_dir = os.path.join(home, '.nunba', 'models')
+        dirs = [os.path.dirname(entry.local_path)] if entry.local_path else []
+        dirs += [models_dir, os.path.join(home, '.trueflow', 'models')]
+
+        def first(*parts):
+            if not all(parts):
+                return None
+            return next((p for p in (os.path.join(d, *parts) for d in dirs)
+                         if os.path.isfile(p)), None)
+        return (first(files.get('model')),
+                first(files.get('mmproj')) or first('qwen08b', files.get('mmproj_source')))
 
     def ensure_running(self, on_wait: Optional[Callable[[], None]] = None) -> bool:
         """Lazy-start: launch 0.8B server on first frame, not at boot.
@@ -848,7 +924,12 @@ class Qwen08BBackend(VisionBackend):
 
         HARTOS emits 'vlm_caption.requested' event. In bundled mode, Nunba
         subscribes to this event and calls its own start_caption_server().
-        In standalone mode, HARTOS uses model_lifecycle to launch directly.
+        While Nunba is starting it (_launch_owner: its subscriber took the
+        event, or its per-port start lock is held) HARTOS spawns nothing and
+        waits for Nunba's server, 5 s + 30 s at most, the bound its own
+        launch has.  In standalone mode (neither), HARTOS uses
+        model_lifecycle to launch directly, with the files _model_files
+        finds through the model catalog.
 
         ``on_wait`` is called once, after the server was found not serving
         and before the event is sent: not when it is up, not while a failed
@@ -856,7 +937,10 @@ class Qwen08BBackend(VisionBackend):
         line that raises never skips the start it announces (review of
         42735064e).
 
-        Dependency direction: Nunba → HARTOS (never HARTOS → Nunba).
+        Dependency direction: Nunba → HARTOS (never HARTOS → Nunba).  What
+        is read of Nunba (its event subscriber, its start lock, its models
+        folder rule when importable) is optional: a HARTOS-only node has none
+        of it and launches standalone.
 
         Every "is it up" check here is _is_serving(), never is_available():
         is_available() is also True when only the weights are on disk, and
@@ -877,11 +961,10 @@ class Qwen08BBackend(VisionBackend):
             # per frame.
             #
             # Transient failure is the normal case here, not the exception:
-            # the event wait below is only 5x1s so a still-booting Nunba
-            # loses the race, the standalone path needs a llama-server
-            # binary that aborts on this box, and it competes for VRAM with
-            # the resident LLM.  Any of those should cost one cooldown, not
-            # the feature.
+            # a still-booting Nunba can take longer than the wait below, the
+            # standalone path needs a llama-server binary that aborts on
+            # this box, and it competes for VRAM with the resident LLM.  Any
+            # of those should cost one cooldown, not the feature.
             if _t.time() - self._launch_attempted_at < self.LAUNCH_RETRY_S:
                 return False
             logger.info(
@@ -910,7 +993,7 @@ class Qwen08BBackend(VisionBackend):
         # Emit event — Nunba subscribes in bundled mode and starts the server
         try:
             from core.platform.events import emit_event
-            emit_event('vlm_caption.requested', {'port': self._port})
+            emit_event(self.START_EVENT, {'port': self._port})
         except Exception:
             pass
 
@@ -922,74 +1005,75 @@ class Qwen08BBackend(VisionBackend):
                 logger.info(f"Qwen3.5-0.8B started (event-driven) on port {self._port}")
                 return True
 
-        # Nobody started it — standalone mode, use model_lifecycle
-        try:
-            from integrations.service_tools.model_lifecycle import ModelLifecycleManager
-            server = ModelLifecycleManager._find_llama_server_binary()
-            if not server:
-                logger.info("Qwen3.5-0.8B: llama-server not found")
-                return False
-
-            home = os.path.expanduser('~')
-            model = mmproj = None
-            for d in [os.path.join(home, '.nunba', 'models'),
-                      os.path.join(home, '.trueflow', 'models')]:
-                p = os.path.join(d, 'Qwen3.5-0.8B-UD-Q4_K_XL.gguf')
-                if os.path.isfile(p) and not model:
-                    model = p
-                p = os.path.join(d, 'qwen08b', 'mmproj-F16.gguf')
-                if os.path.isfile(p) and not mmproj:
-                    mmproj = p
-            if not model or not mmproj:
-                logger.info("Qwen3.5-0.8B: model files not found")
-                return False
-
-            import subprocess
-            # 512 is correct for this backend and is NOT a main-model size:
-            # a caption turn is one 512x288 JPEG plus one sentence of prompt,
-            # and the whole point of the 0.8B captioner is that it costs
-            # almost nothing.  It is a legitimately separate model class, so
-            # it keeps a fixed small window — what it must not keep is its own
-            # copy of that number.  core.llama_geometry.ROLE_CTX['caption'] is
-            # where the value lives, beside the tier table, so "the captioner
-            # runs at 512" is a policy statement one grep can answer rather
-            # than a literal repeated at each subprocess.Popen.
-            #
-            # This spawn also does NOT publish_geometry: it is a caption
-            # server on the vlm_caption port, not the main engine, and
-            # publishing 512 would tell HARTOS's wire trimmer that every
-            # agentic request must fit in 512 tokens.
-            from core.llama_geometry import ctx_for_role
-            cmd = [server, '--model', model, '--mmproj', mmproj,
-                   '--port', str(self._port),
-                   '--ctx-size', str(ctx_for_role('caption')),
-                   '--n-gpu-layers', '99', '--threads', '4', '--flash-attn', 'on']
-            log_path = os.path.join(os.environ.get('TEMP', '/tmp'), f'llama_{self._port}.log')
-            # APPEND mode — same root-cause class as the caption-server
-            # launch above.  Preserves prior run's log across restarts.
-            log_fh = open(log_path, 'a')
+        # Not up yet.  If Nunba is starting it (its subscriber took the event,
+        # or its per-port lock is held), a spawn here is a second 0.8B server
+        # on the port -- the 2026-09-26 incident class.  Spawn nothing; wait
+        # for its server the 30 s this backend waits for its own.  Nobody
+        # starting it — standalone mode, use model_lifecycle.
+        owner = self._launch_owner()
+        if owner:
+            logger.info(f"Qwen3.5-0.8B: not spawning on port {self._port}: {owner}; "
+                        f"waiting for it")
+        else:
             try:
-                import datetime as _lb_dt
-                log_fh.write(
-                    f"\n===== llama-caption (standalone) session "
-                    f"{_lb_dt.datetime.now().isoformat()} port={self._port} =====\n"
-                )
-                log_fh.flush()
-            except Exception:
-                pass
-            _kw = dict(stdout=log_fh, stderr=subprocess.STDOUT)
-            if os.name == 'nt':
-                _kw['creationflags'] = subprocess.CREATE_NO_WINDOW
-            self._server_proc = subprocess.Popen(cmd, **_kw)
-            self._log_fh = log_fh
-            logger.info(f"Qwen3.5-0.8B launching PID={self._server_proc.pid} port={self._port}")
-            for _ in range(30):
-                time.sleep(1)
-                if self._is_serving():
-                    logger.info(f"Qwen3.5-0.8B ready on port {self._port}")
-                    return True
-        except Exception as e:
-            logger.error(f"Qwen3.5-0.8B standalone start failed: {e}")
+                from integrations.service_tools.model_lifecycle import ModelLifecycleManager
+                server = ModelLifecycleManager._find_llama_server_binary()
+                if not server:
+                    logger.info("Qwen3.5-0.8B: llama-server not found")
+                    return False
+
+                model, mmproj = self._model_files()
+                if not model or not mmproj:
+                    logger.info("Qwen3.5-0.8B: model files not found")
+                    return False
+
+                import subprocess
+                # 512 is correct for this backend and is NOT a main-model size:
+                # a caption turn is one 512x288 JPEG plus one sentence of prompt,
+                # and the whole point of the 0.8B captioner is that it costs
+                # almost nothing.  It is a legitimately separate model class, so
+                # it keeps a fixed small window — what it must not keep is its own
+                # copy of that number.  core.llama_geometry.ROLE_CTX['caption'] is
+                # where the value lives, beside the tier table, so "the captioner
+                # runs at 512" is a policy statement one grep can answer rather
+                # than a literal repeated at each subprocess.Popen.
+                #
+                # This spawn also does NOT publish_geometry: it is a caption
+                # server on the vlm_caption port, not the main engine, and
+                # publishing 512 would tell HARTOS's wire trimmer that every
+                # agentic request must fit in 512 tokens.
+                from core.llama_geometry import ctx_for_role
+                cmd = [server, '--model', model, '--mmproj', mmproj,
+                       '--port', str(self._port),
+                       '--ctx-size', str(ctx_for_role('caption')),
+                       '--n-gpu-layers', '99', '--threads', '4', '--flash-attn', 'on']
+                log_path = os.path.join(os.environ.get('TEMP', '/tmp'), f'llama_{self._port}.log')
+                # APPEND mode — same root-cause class as the caption-server
+                # launch above.  Preserves prior run's log across restarts.
+                log_fh = open(log_path, 'a')
+                try:
+                    import datetime as _lb_dt
+                    log_fh.write(
+                        f"\n===== llama-caption (standalone) session "
+                        f"{_lb_dt.datetime.now().isoformat()} port={self._port} =====\n"
+                    )
+                    log_fh.flush()
+                except Exception:
+                    pass
+                _kw = dict(stdout=log_fh, stderr=subprocess.STDOUT)
+                if os.name == 'nt':
+                    _kw['creationflags'] = subprocess.CREATE_NO_WINDOW
+                self._server_proc = subprocess.Popen(cmd, **_kw)
+                self._log_fh = log_fh
+                logger.info(f"Qwen3.5-0.8B launching PID={self._server_proc.pid} port={self._port}")
+            except Exception as e:
+                logger.error(f"Qwen3.5-0.8B standalone start failed: {e}")
+                return False
+        for _ in range(30):
+            time.sleep(1)
+            if self._is_serving():
+                logger.info(f"Qwen3.5-0.8B ready on port {self._port}")
+                return True
         return False
 
     def stop(self):
