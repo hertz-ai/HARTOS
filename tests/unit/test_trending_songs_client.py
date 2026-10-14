@@ -70,7 +70,7 @@ def client(tmp_path, monkeypatch):
     from integrations.trends import daily_job
     from integrations.trends import trending_songs_client as c
     state = {'gets': [], 'posts': [], 'answers': [], 'now': NOW, 'premises': True,
-             'asked': 0,
+             'asked': 0, 'ensured': [],
              'creds': {daily_job.USERNAME_CREDENTIAL: 'research_fixture',
                        daily_job.PASSWORD_CREDENTIAL: 'pw-fixture'}}
 
@@ -105,6 +105,14 @@ def client(tmp_path, monkeypatch):
     monkeypatch.delenv('HEVOLVE_OWNER_USER_ID', raising=False)
     monkeypatch.setattr('integrations.social.sync_engine.SyncEngine.parent_tier_url',
                         staticmethod(lambda: 'https://central.example.invalid'))
+    class _Orchestrator:
+        """The model orchestrator's one "bring me a model" entry: recorded,
+        never run, so no test starts a model."""
+        def ensure_loaded_async(self, model_type, language=None, caller='unknown', **kw):
+            state['ensured'].append((model_type, caller))
+
+    monkeypatch.setattr('integrations.service_tools.model_orchestrator.get_orchestrator',
+                        lambda: _Orchestrator())
     monkeypatch.setattr('core.http_pool.pooled_get', _get)
     monkeypatch.setattr('core.http_pool.pooled_post', _post)
     monkeypatch.setattr('core.autogen_config.llm_stays_on_premises', lambda: state['premises'])
@@ -449,6 +457,54 @@ def test_a_failing_llm_stops_asking_for_the_rest_of_the_call(client):
     out = c.get_trending_songs()
     assert [s['lang'] for s in out['songs']] == [None] * 4
     assert len(st['posts']) == 1
+
+
+# ── her own LLM down: the existing ensure is asked (amendment A13) ─────────
+
+def _latin_list():
+    _publish(_doc(*[_song('cluster:%d' % i, 'Latin Title %d' % i, 10.0 - i) for i in range(4)]))
+
+
+def test_a_refused_local_llm_is_asked_up_through_the_existing_ensure(client, monkeypatch):
+    """This node's own llama-server refuses the connection: the list is still
+    served (languages unknown), and the orchestrator's existing "bring me a
+    model" entry, ensure_loaded_async('llm'), is asked once for the call --
+    what Nunba's /chat does when its /health probe finds the server down --
+    so the next read can ask it.  Nothing new starts a model here."""
+    c, st = client
+    monkeypatch.setattr('core.autogen_config.configured_api_endpoint', lambda: None)
+    _latin_list()
+    st['answers'] = [requests.exceptions.ConnectionError('refused')] * 4
+    out = c.get_trending_songs()
+    assert [s['lang'] for s in out['songs']] == [None] * 4
+    assert st['ensured'] == [('llm', 'trending_songs')]
+
+
+@pytest.mark.parametrize('failure', ['timeout', 'http_500'])
+def test_a_local_llm_that_answers_is_never_asked_to_start(client, monkeypatch, failure):
+    """A busy (timed out) or erroring server is up: asking it to load again
+    could restart the model her chat is using.  Only a refused connection
+    asks."""
+    c, st = client
+    monkeypatch.setattr('core.autogen_config.configured_api_endpoint', lambda: None)
+    if failure == 'timeout':
+        st['answers'] = [requests.exceptions.ReadTimeout('busy')]
+    else:
+        monkeypatch.setattr('core.http_pool.pooled_post', lambda url, **kw: _Resp(500))
+    assert c.tag_language({'song_key': 'cluster:9', 'title': 'Saree Song'}) is None
+    assert st['ensured'] == []
+
+
+def test_a_configured_api_endpoint_is_never_replaced_by_a_local_start(client, monkeypatch):
+    """Her LLM is an endpoint on her LAN, not this node's llama-server: a
+    refused connection there is not a local model to bring up (Nunba's LLM
+    loader would also switch her setting to local)."""
+    c, st = client
+    monkeypatch.setattr('core.autogen_config.configured_api_endpoint',
+                        lambda: 'http://192.168.1.20:8000/v1')
+    st['answers'] = [requests.exceptions.ConnectionError('refused')]
+    assert c.tag_language({'song_key': 'cluster:9', 'title': 'Saree Song'}) is None
+    assert st['ensured'] == []
 
 
 def test_langs_filter_and_limit(client):

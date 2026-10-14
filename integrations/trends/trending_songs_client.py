@@ -40,7 +40,10 @@ node, and nothing here runs in the background.
   detector: Tamil, Devanagari, Gurmukhi); only a Latin-script title asks
   this node's own LLM, once per song, and only when that LLM stays on the
   premises (core.autogen_config.llm_stays_on_premises).  Answers are cached
-  in trends/song_lang.json.
+  in trends/song_lang.json.  When this node's own llama-server refuses the
+  connection (no API endpoint configured), the model orchestrator's existing
+  ensure_loaded_async('llm') is asked once for the call (amendment A13);
+  a busy or erroring server is never asked to start.
 
 Output ``hart.trending_songs.client.v1``: ``{'schema', 'fetched_at',
 'generated_at', 'date', 'age_hours', 'stale', 'reason', 'note', 'songs':
@@ -405,6 +408,17 @@ def _ask_llm(song: Dict[str, Any], asking: Dict[str, Any]) -> Optional[str]:
     except Exception as e:
         asking['failed'] = True
         logger.info("trending songs: language not asked of the local model (%s)", e)
+        # Its own llama-server refused the connection (down, not busy): the
+        # existing ensure brings it up for the next read, as Nunba's /chat does.
+        import requests
+        from core.autogen_config import configured_api_endpoint
+        if isinstance(e, requests.ConnectionError) and not configured_api_endpoint():
+            try:
+                from integrations.service_tools.model_orchestrator import get_orchestrator
+                get_orchestrator().ensure_loaded_async('llm', caller='trending_songs')
+            except Exception as ensure_error:
+                logger.warning("trending songs: the local model was not asked to start (%s)",
+                               ensure_error)
         return None
     return _parse_lang(content)
 
