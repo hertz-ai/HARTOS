@@ -92,13 +92,9 @@ def test_iter_frames_refuses_bad_arguments_before_running_ffmpeg():
         iter_frames(_info(1080, 1920), long_side=767)
 
 
-@pytest.mark.parametrize('fps_avg, want_s', [
-    (30.0, 60.0 + 2.0 * 10),
-    (24.0, 60.0 + 2.0 * 10),        # never below the 30 fps allowance
-    (60.0, 60.0 + 2.0 * 10 * 2),
-    (240.0, 60.0 + 2.0 * 10 * 8),   # slow motion decodes 8x the frames of 30 fps
-])
-def test_the_decode_bound_scales_with_the_source_frame_rate(monkeypatch, fps_avg, want_s):
+@pytest.fixture
+def decode_bound_seen(monkeypatch):
+    """The bound iter_frames hands to media_bin.ffmpeg_stream (nothing runs)."""
     seen = {}
 
     def fake_stream(args, *, frame_bytes, timeout_s):
@@ -106,11 +102,43 @@ def test_the_decode_bound_scales_with_the_source_frame_rate(monkeypatch, fps_avg
         return iter(())
 
     monkeypatch.setattr(media_bin, 'ffmpeg_stream', fake_stream)
+    return seen
+
+
+@pytest.mark.parametrize('fps_avg, want_s', [
+    (30.0, 60.0 + 2.0 * 10),
+    (24.0, 60.0 + 2.0 * 10),        # never below the 30 fps allowance
+    (60.0, 60.0 + 2.0 * 10 * 2),
+    (240.0, 60.0 + 2.0 * 10 * 8),   # slow motion decodes 8x the frames of 30 fps
+    # ...and 8x is the most any frame rate earns.  probe takes fps_avg from
+    # the stream's 'fps' or, failing that, its 'tbr' timebase rate ('1k',
+    # '90k' parse to 1000 and 90000), which would stretch the bound to days.
+    (960.0, 60.0 + 2.0 * 10 * 8),
+    (90000.0, 60.0 + 2.0 * 10 * 8),
+])
+def test_the_decode_bound_scales_with_the_source_frame_rate(decode_bound_seen, fps_avg, want_s):
     iter_frames(_info(1920, 1080, duration_s=10.0, fps_avg=fps_avg))
-    assert seen['timeout_s'] == pytest.approx(want_s)
+    assert decode_bound_seen['timeout_s'] == pytest.approx(want_s)
     # An explicit bound is used as given.
     iter_frames(_info(1920, 1080, duration_s=10.0, fps_avg=fps_avg), timeout_s=5.0)
-    assert seen['timeout_s'] == 5.0
+    assert decode_bound_seen['timeout_s'] == 5.0
+
+
+@pytest.mark.parametrize('duration_s, fps_avg', [
+    (100 * 3600.0, 30.0),           # a container claiming 100 hours
+    (2.0 ** 31, 90000.0),           # a lying mvhd duration at a '90k tbr' rate
+])
+def test_the_default_decode_bound_never_outlives_the_reel_job(decode_bound_seen,
+                                                              duration_s, fps_avg):
+    """A reel job whose claim goes MAX_JOB_S without a beat is stale, and the
+    pipeline beats between clips, not inside one decode; so the default bound
+    stops at MAX_JOB_S.  That also keeps it under threading.TIMEOUT_MAX, past
+    which media_bin refuses a bound (ValueError) instead of decoding."""
+    from integrations.reel_studio.jobs import MAX_JOB_S
+    info = _info(1920, 1080, duration_s=duration_s, fps_avg=fps_avg)
+    assert decode.decode_bound_s(info) == MAX_JOB_S
+    iter_frames(info)
+    assert decode_bound_seen['timeout_s'] == MAX_JOB_S
 
 
 # ── the tone-map capability check ─────────────────────────────────────────
@@ -130,14 +158,10 @@ _FILTERS_WITH_ZIMG = """Filters:
 
 @pytest.fixture
 def fresh_filter_listing():
-    """decode lists ffmpeg's filters once per process; start and end each test clean."""
-    def clear():
-        cached = getattr(decode, '_ffmpeg_filters', None)
-        if cached is not None:
-            cached.cache_clear()
-    clear()
+    """media_bin lists ffmpeg's filters once per process; start and end each test clean."""
+    media_bin.ffmpeg_filters.cache_clear()
     yield
-    clear()
+    media_bin.ffmpeg_filters.cache_clear()
 
 
 def test_the_tonemap_check_lists_filters_only(monkeypatch, fresh_filter_listing):
@@ -177,6 +201,22 @@ def test_the_tonemap_check_without_zimg_or_after_a_failed_listing(monkeypatch,
     assert decode._has_tonemap_filters() is False    # the listing failed: untoned
     assert decode._has_tonemap_filters() is False    # listed again (a failure is not kept)
     assert len(calls) == 2
+
+
+def test_the_tonemap_check_shares_media_bins_one_filter_listing(monkeypatch,
+                                                                fresh_filter_listing):
+    # One `ffmpeg -filters` per process, whoever asks first (lane review P7):
+    # once media_bin has listed them, decode lists nothing of its own.
+    calls = []
+
+    def fake_run(args, *, timeout_s):
+        calls.append(list(args))
+        return BoundedResult(0, _FILTERS_WITH_ZIMG, '')
+
+    monkeypatch.setattr(media_bin, 'run_ffmpeg', fake_run)
+    assert 'zscale' in media_bin.ffmpeg_filters()
+    assert decode._has_tonemap_filters() is True
+    assert calls == [['-filters']]
 
 
 # ── the real binary ───────────────────────────────────────────────────────

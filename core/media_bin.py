@@ -3,10 +3,11 @@
 WHY THIS EXISTS
 ---------------
 Reel Studio decodes, analyses, renders and checks phone video with ffmpeg,
-and HARTOS had no single answer to "which ffmpeg?".  The few existing call
-sites shell a bare ``'ffmpeg'`` and degrade when it is not on PATH, which on
-a Windows desktop it never is.  This module is the one place that answers
-the question and the one way to run the binary.
+and HARTOS had no single answer to "which ffmpeg?".  Older call sites shell
+a bare ``'ffmpeg'`` and degrade when it is not on PATH, and on the
+development desktop it is not (measured 2026-10-14; see REMAINING BARE
+CALLERS below).  This module is the one place that answers the question and
+the one way to run the binary.
 
 WHERE THE BINARY COMES FROM (first hit wins)
   1. ``IMAGEIO_FFMPEG_EXE`` -- an explicit override, used when it names an
@@ -31,6 +32,43 @@ HOW IT RUNS
   early kills the process.  ffmpeg runs no children, so killing the one
   process ends it; the pipes are closed only by their own readers, never
   from the timeout path (subprocess_safe D36).
+* Every bound must be finite, > 0 and at most ``threading.TIMEOUT_MAX``;
+  anything else is a ValueError before ffmpeg starts.
+
+WHAT IT CAN DO
+--------------
+* ``ffmpeg_filters()`` -- filter names from one ``-filters`` listing, for
+  "has it zscale and tonemap?".  Nothing else runs.
+* ``ffmpeg_caps()`` -- encoders, the same filters, the version, and
+  ``nvenc_ok`` from a 0.2 s h264_nvenc test encode (a GPU encoder session).
+Each is measured once per process; a failed listing is not kept.
+
+CALLERS
+-------
+integrations/reel_studio (probe, decode, beats, render, qa and the test
+fixtures) and integrations/service_tools/whisper_tool._container_to_pcm
+(the WebM / Ogg / WAV chunks on the streaming STT socket).
+
+REMAINING BARE CALLERS -- TODO (dated 2026-10-14; delete this list by 2026-12-31)
+---------------------------------------------------------------------------------
+These still run an ffmpeg or ffprobe found on PATH rather than the one
+get_ffmpeg() locates, so where PATH has none they degrade (a parallel path,
+Gate 4).  Each moves onto run_ffmpeg / get_ffmpeg; the ffprobe ones parse
+``ffmpeg -i`` instead, as integrations/reel_studio/media/probe.py does.
+Line numbers are as of 2026-10-14.
+  * integrations/agent_engine/shell_os_apis.py:1312 -- screen recording,
+    ``ffmpeg -f x11grab`` through Popen (after wf-recorder).
+  * integrations/agent_engine/shell_system_apis.py:1938 and :1956 -- the
+    media index runs ``ffprobe`` on every music and video file.
+  * integrations/agent_engine/shell_system_apis.py:2161 -- webcam capture,
+    ``ffmpeg -f v4l2``.
+  * hartos/hartos_speech_stitch.py:41 and
+    integrations/audio/diarization_server.py:156 -- pydub's mp3 decode and
+    export, which find ffmpeg by pydub's own lookup.
+  * integrations/service_tools/acestep_tool.py:66-76 and
+    integrations/service_tools/media_agent.py:683 and :1213 -- the ACE-Step
+    sidecar's mp3/opus/aac writer needs ffmpeg on the sidecar's PATH;
+    worked around today by asking it for wav.
 
 core never imports integrations; everything here is generic ffmpeg.
 """
@@ -238,13 +276,28 @@ def _nvenc_works() -> bool:
 
 
 @functools.lru_cache(maxsize=1)
+def ffmpeg_filters() -> frozenset:
+    """Filter names of the located binary, from one ``-filters`` listing.
+
+    THE answer to "does this ffmpeg have filter X?" (zscale and tonemap for
+    HDR, say).  It runs nothing else: ffmpeg_caps() would also run its NVENC
+    test encode, which opens an encoder session on the GPU.  Listed once per
+    process and shared with ffmpeg_caps(); a failed listing raises
+    FFmpegFailed and is not cached.
+    """
+    return parse_caps('', _listing('-filters'), '').filters
+
+
+@functools.lru_cache(maxsize=1)
 def ffmpeg_caps() -> FFmpegCaps:
     """Encoders, filters and version of the located binary, measured once.
 
-    ``nvenc_ok`` comes from one 0.2 s test encode, run only when h264_nvenc
-    is listed.  A failed listing raises FFmpegFailed and is not cached.
+    ``filters`` is ffmpeg_filters() (one listing for both).  ``nvenc_ok``
+    comes from one 0.2 s test encode, run only when h264_nvenc is listed.
+    A failed listing raises FFmpegFailed and is not cached.
     """
-    caps = parse_caps(_listing('-encoders'), _listing('-filters'), _listing('-version'))
+    caps = dataclasses.replace(parse_caps(_listing('-encoders'), '', _listing('-version')),
+                               filters=ffmpeg_filters())
     if 'h264_nvenc' in caps.encoders:
         caps = dataclasses.replace(caps, nvenc_ok=_nvenc_works())
     return caps
@@ -253,9 +306,18 @@ def ffmpeg_caps() -> FFmpegCaps:
 # ── running ───────────────────────────────────────────────────────────────
 
 def _bound(timeout_s) -> float:
+    """``timeout_s`` in seconds: finite, > 0 and at most threading.TIMEOUT_MAX.
+
+    Anything else raises ValueError before ffmpeg starts.  Past TIMEOUT_MAX
+    (~49.7 days on Windows) the waits under the bound raise OverflowError
+    instead of waiting.  Measured with the pinned ffmpeg 7.1: run_ffmpeg
+    spawned ffmpeg and then raised it from communicate(), and ffmpeg_stream's
+    watchdog Timer thread died of it, leaving the stream with no bound.
+    """
     seconds = float(timeout_s)
-    if not (math.isfinite(seconds) and seconds > 0):
-        raise ValueError('ffmpeg needs a finite timeout_s > 0, got %r' % (timeout_s,))
+    if not (math.isfinite(seconds) and 0 < seconds <= threading.TIMEOUT_MAX):
+        raise ValueError('ffmpeg needs a finite timeout_s > 0 and <= threading.TIMEOUT_MAX '
+                         '(%.0f s), got %r' % (threading.TIMEOUT_MAX, timeout_s))
     return seconds
 
 
@@ -384,5 +446,5 @@ def _stream_chunks(cmd: List[str], size: int, seconds: float) -> Iterator[bytes]
 
 
 __all__ = ['ENV_FFMPEG_EXE', 'MediaToolMissing', 'FFmpegFailed', 'FFmpegCaps',
-           'get_ffmpeg', 'require_ffmpeg', 'parse_caps', 'ffmpeg_caps',
+           'get_ffmpeg', 'require_ffmpeg', 'parse_caps', 'ffmpeg_filters', 'ffmpeg_caps',
            'run_ffmpeg', 'ffmpeg_stream']

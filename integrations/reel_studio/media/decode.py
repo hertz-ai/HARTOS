@@ -31,13 +31,12 @@ outright; 16:9, 4:3 and 1:1 happen to land on even sizes.
 
 ``tonemap_filter`` is THE HDR->SDR chain; the renderer (WS-4) uses the same
 string so analysis and render tone-map alike, under the same even-size
-precondition.  Whether this ffmpeg has the filters for it comes from its
-``-filters`` listing alone (``media_bin.ffmpeg_caps()`` would also run an
-NVENC test encode on the GPU).
+precondition.  Whether this ffmpeg has the filters for it comes from
+``media_bin.ffmpeg_filters()``, the process's one ``-filters`` listing
+(``media_bin.ffmpeg_caps()`` would also run an NVENC test encode on the GPU).
 """
 from __future__ import annotations
 
-import functools
 import logging
 from typing import Iterator, Optional, Tuple
 
@@ -45,6 +44,7 @@ import numpy as np
 
 from core import media_bin
 from integrations.reel_studio.contracts import TRANSFERS, ClipInfo
+from integrations.reel_studio.jobs import MAX_JOB_S
 
 logger = logging.getLogger(__name__)
 
@@ -56,12 +56,18 @@ LONG_SIDE = 768
 #: at about 2.3x real time on the development desktop, so 2 s per second
 #: leaves room for a busy box.  The decoder decodes every source frame before
 #: the fps filter drops most of them, so a faster source scales the
-#: allowance (a 240 fps slow-motion clip gets 8x).
+#: allowance (a 240 fps slow-motion clip gets 8x), up to
+#: DECODE_TIMEOUT_MAX_LOAD: probe takes fps_avg from the stream's 'fps' or,
+#: failing that, its 'tbr' timebase rate ('90k' parses to 90000), and an
+#: uncapped factor would stretch a 30 s clip's bound past two days.
+#: The whole bound stops at jobs.MAX_JOB_S.  The pipeline beats the reel's
+#: job claim between clips, not during a decode, so a longer decode would
+#: outlive the claim; and a container that lies about its duration cannot
+#: push the bound past the threading.TIMEOUT_MAX media_bin refuses.
 DECODE_TIMEOUT_BASE_S = 60.0
 DECODE_TIMEOUT_PER_S = 2.0
 DECODE_TIMEOUT_REF_FPS = 30.0
-#: Bound on the one ``ffmpeg -filters`` listing.
-FILTERS_TIMEOUT_S = 30.0
+DECODE_TIMEOUT_MAX_LOAD = 8.0
 
 #: zscale input transfer per HDR transfer.
 _TIN = {'hlg': 'arib-std-b67', 'pq': 'smpte2084'}
@@ -108,25 +114,10 @@ def tonemap_filter(transfer: str) -> str:
             % _TIN[transfer])
 
 
-@functools.lru_cache(maxsize=1)
-def _ffmpeg_filters() -> frozenset:
-    """The located ffmpeg's filter names, listed once (a failure is not kept).
-
-    Only ``-filters`` runs, parsed by media_bin.parse_caps: ffmpeg_caps()
-    would also open an h264_nvenc session on the GPU for its test encode.
-    """
-    result = media_bin.run_ffmpeg(['-filters'], timeout_s=FILTERS_TIMEOUT_S)
-    if result.timed_out or result.returncode != 0:
-        raise media_bin.FFmpegFailed('ffmpeg -filters failed', returncode=result.returncode,
-                                     stderr_tail=result.stderr[-2000:],
-                                     timed_out=result.timed_out)
-    return media_bin.parse_caps('', result.stdout, '').filters
-
-
 def _has_tonemap_filters() -> bool:
     """True when the located ffmpeg has zscale and tonemap (zimg builds)."""
     try:
-        filters = _ffmpeg_filters()
+        filters = media_bin.ffmpeg_filters()
     except media_bin.FFmpegFailed as e:
         logger.warning('could not list ffmpeg filters (%s); decoding HDR without tone-mapping', e)
         return False
@@ -149,9 +140,12 @@ def _num(value: float) -> str:
 
 
 def decode_bound_s(info: ClipInfo) -> float:
-    """The default bound on decoding ``info``'s clip (see DECODE_TIMEOUT_*)."""
-    load = max(1.0, float(info.fps_avg) / DECODE_TIMEOUT_REF_FPS)
-    return DECODE_TIMEOUT_BASE_S + DECODE_TIMEOUT_PER_S * max(0.0, float(info.duration_s)) * load
+    """The default bound on decoding ``info``'s clip (see DECODE_TIMEOUT_*):
+    the frame-rate factor at most DECODE_TIMEOUT_MAX_LOAD, the whole at most
+    jobs.MAX_JOB_S."""
+    load = min(DECODE_TIMEOUT_MAX_LOAD, max(1.0, float(info.fps_avg) / DECODE_TIMEOUT_REF_FPS))
+    bound = DECODE_TIMEOUT_BASE_S + DECODE_TIMEOUT_PER_S * max(0.0, float(info.duration_s)) * load
+    return min(bound, MAX_JOB_S)
 
 
 def iter_frames(info: ClipInfo, *, fps: float = DECODE_FPS, long_side: int = LONG_SIDE,
@@ -161,9 +155,11 @@ def iter_frames(info: ClipInfo, *, fps: float = DECODE_FPS, long_side: int = LON
     ``t_s`` is k/fps, the source time the frame is on screen; the size is
     frame_size(info, long_side=long_side), both sides even.  Arguments and
     the ffmpeg binary are checked now; decoding starts on the first next().
-    Raises ValueError for fps <= 0 or a long_side that is not an even number
-    >= 2, and media_bin.FFmpegFailed if ffmpeg fails or passes ``timeout_s``
-    (default: decode_bound_s(info)).  Closing the iterator early stops ffmpeg.
+    Raises ValueError for fps <= 0, a long_side that is not an even number
+    >= 2, or a ``timeout_s`` media_bin refuses (not finite, <= 0, or past
+    threading.TIMEOUT_MAX), and media_bin.FFmpegFailed if ffmpeg fails or
+    passes ``timeout_s`` (default: decode_bound_s(info)).  Closing the
+    iterator early stops ffmpeg.
     """
     if not (fps > 0):
         raise ValueError('fps must be > 0, got %r' % (fps,))
@@ -186,5 +182,5 @@ def _frames(stream, w: int, h: int, fps: float) -> Iterator[Tuple[float, np.ndar
 
 
 __all__ = ['DECODE_FPS', 'LONG_SIDE', 'DECODE_TIMEOUT_BASE_S', 'DECODE_TIMEOUT_PER_S',
-           'DECODE_TIMEOUT_REF_FPS', 'FILTERS_TIMEOUT_S', 'frame_size', 'tonemap_filter',
+           'DECODE_TIMEOUT_REF_FPS', 'DECODE_TIMEOUT_MAX_LOAD', 'frame_size', 'tonemap_filter',
            'decode_bound_s', 'iter_frames']

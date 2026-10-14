@@ -68,12 +68,14 @@ VERSION_TEXT = ("ffmpeg version 7.1-essentials_build-www.gyan.dev Copyright (c) 
 
 @pytest.fixture(autouse=True)
 def _fresh_caches():
-    """get_ffmpeg / ffmpeg_caps are process-cached; every test starts cold."""
-    media_bin.get_ffmpeg.cache_clear()
-    media_bin.ffmpeg_caps.cache_clear()
+    """get_ffmpeg / ffmpeg_filters / ffmpeg_caps are process-cached; every
+    test starts cold."""
+    caches = (media_bin.get_ffmpeg, media_bin.ffmpeg_filters, media_bin.ffmpeg_caps)
+    for cached in caches:
+        cached.cache_clear()
     yield
-    media_bin.get_ffmpeg.cache_clear()
-    media_bin.ffmpeg_caps.cache_clear()
+    for cached in caches:
+        cached.cache_clear()
 
 
 def _fake_binary(directory, name='ffmpeg'):
@@ -213,18 +215,19 @@ def test_parse_caps_on_empty_text_finds_nothing():
 class _ScriptedFFmpeg:
     """Stands in for run_bounded: answers the listings, records every call."""
 
-    def __init__(self, *, encoders=ENCODERS_TEXT, nvenc_rc=0, listing_rc=0):
+    def __init__(self, *, encoders=ENCODERS_TEXT, nvenc_rc=0, listing_rc=0, filters_rc=0):
         self.calls = []
         self.encoders = encoders
         self.nvenc_rc = nvenc_rc
         self.listing_rc = listing_rc
+        self.filters_rc = filters_rc
 
     def __call__(self, cmd, timeout=5.0, **kwargs):
         self.calls.append((list(cmd), timeout, kwargs))
         if '-encoders' in cmd:
             return BoundedResult(self.listing_rc, self.encoders, '')
         if '-filters' in cmd:
-            return BoundedResult(0, FILTERS_TEXT, '')
+            return BoundedResult(self.filters_rc, FILTERS_TEXT, '')
         if '-version' in cmd:
             return BoundedResult(0, VERSION_TEXT, '')
         if 'h264_nvenc' in cmd:
@@ -234,6 +237,9 @@ class _ScriptedFFmpeg:
 
     def probe_calls(self):
         return [c for c in self.calls if 'h264_nvenc' in c[0]]
+
+    def listings(self, flag):
+        return [c for c in self.calls if flag in c[0]]
 
 
 def _scripted(monkeypatch, **kw):
@@ -282,6 +288,38 @@ def test_a_failed_listing_raises_and_is_not_remembered(monkeypatch):
     assert 'libx264' in media_bin.ffmpeg_caps().encoders
 
 
+def test_ffmpeg_filters_lists_only_filters_and_only_once(monkeypatch):
+    """The filter names alone, without the NVENC test encode ffmpeg_caps runs
+    (asking "can it tone-map?" must not open a GPU encoder session)."""
+    fake = _scripted(monkeypatch)
+    filters = media_bin.ffmpeg_filters()
+    assert {'zscale', 'tonemap', 'scale', 'drawtext'} <= filters
+    assert isinstance(filters, frozenset)
+    assert media_bin.ffmpeg_filters() is filters
+    assert [c[0][1:] for c in fake.calls] == [['-hide_banner', '-nostdin', '-filters']]
+    assert fake.probe_calls() == []
+
+
+def test_ffmpeg_caps_reuses_the_one_filter_listing(monkeypatch):
+    fake = _scripted(monkeypatch)
+    filters = media_bin.ffmpeg_filters()
+    caps = media_bin.ffmpeg_caps()
+    assert caps.filters is filters
+    assert len(fake.listings('-filters')) == 1
+
+
+def test_a_failed_filter_listing_raises_and_is_not_remembered(monkeypatch):
+    fake = _scripted(monkeypatch, filters_rc=1)
+    with pytest.raises(media_bin.FFmpegFailed) as err:
+        media_bin.ffmpeg_filters()
+    assert '-filters' in str(err.value)
+    with pytest.raises(media_bin.FFmpegFailed):
+        media_bin.ffmpeg_caps()
+    fake.filters_rc = 0
+    assert 'zscale' in media_bin.ffmpeg_filters()
+    assert 'zscale' in media_bin.ffmpeg_caps().filters
+
+
 # ── running ───────────────────────────────────────────────────────────────
 
 def test_run_ffmpeg_runs_the_located_binary_bounded(monkeypatch):
@@ -311,6 +349,45 @@ def test_run_ffmpeg_refuses_a_missing_bound(monkeypatch, bad):
     monkeypatch.setattr(media_bin, 'get_ffmpeg', lambda: 'ffmpeg-under-test')
     with pytest.raises(ValueError):
         media_bin.run_ffmpeg(['-version'], timeout_s=bad)
+
+
+def _nothing_may_start(monkeypatch):
+    started = []
+    monkeypatch.setattr(media_bin, 'get_ffmpeg', lambda: 'ffmpeg-under-test')
+    monkeypatch.setattr(media_bin.subprocess_safe, 'run_bounded',
+                        lambda cmd, timeout=5.0, **kw: started.append(cmd))
+    monkeypatch.setattr(media_bin.subprocess, 'Popen',
+                        lambda *a, **kw: started.append(a))
+    return started
+
+
+def test_a_bound_past_threading_timeout_max_is_refused_before_anything_starts(monkeypatch):
+    """Past threading.TIMEOUT_MAX (~49.7 days on Windows) the waits under the
+    bound raise OverflowError instead of waiting: measured on the pinned
+    ffmpeg 7.1, run_ffmpeg spawned ffmpeg and then raised it from
+    communicate(), and ffmpeg_stream's watchdog thread died of it, leaving
+    the stream with no bound at all.  So such a bound is refused up front."""
+    started = _nothing_may_start(monkeypatch)
+    too_long = threading.TIMEOUT_MAX * 2
+    with pytest.raises(ValueError) as err:
+        media_bin.run_ffmpeg(['-version'], timeout_s=too_long)
+    assert 'TIMEOUT_MAX' in str(err.value)
+    with pytest.raises(ValueError):
+        media_bin.ffmpeg_stream(['-f', 'rawvideo', 'pipe:1'], frame_bytes=16, timeout_s=too_long)
+    assert started == []
+
+
+def test_a_bound_of_exactly_threading_timeout_max_is_kept(monkeypatch):
+    seen = {}
+
+    def _record(cmd, timeout=5.0, **kwargs):
+        seen['timeout'] = timeout
+        return BoundedResult(0, '', '')
+
+    monkeypatch.setattr(media_bin, 'get_ffmpeg', lambda: 'ffmpeg-under-test')
+    monkeypatch.setattr(media_bin.subprocess_safe, 'run_bounded', _record)
+    media_bin.run_ffmpeg(['-version'], timeout_s=threading.TIMEOUT_MAX)
+    assert seen['timeout'] == threading.TIMEOUT_MAX
 
 
 def test_a_vanished_binary_is_reported_as_missing(monkeypatch, tmp_path):
