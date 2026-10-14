@@ -131,6 +131,17 @@ def init_agent_engine(app):
     except Exception as e:
         logger.debug(f"Regional host blueprint skipped: {e}")
 
+    # Register the trending-songs list (GET /api/trends/songs/latest), the
+    # one route desktops pull her agent's song suggestions from.  Central
+    # only: register_trends_api declines on any other node, where a public
+    # route would serve nothing (critique finding 42).
+    try:
+        from integrations.trends.api_trends import register_trends_api
+        if register_trends_api(app):
+            logger.info("Trending-songs endpoint registered")
+    except Exception as e:
+        logger.warning(f"Trending-songs endpoint skipped: {e}")
+
     # ── Phase 2: defer heavy work to background thread ──────────────────
     #
     # Why: 2026-05-14 py-spy dump of the deadlocked Nunba.exe (PID 21752)
