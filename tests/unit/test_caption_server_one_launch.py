@@ -23,13 +23,16 @@ scripts/setup_vlm.py puts it (qwen08b/mmproj-F16.gguf).
 Real code throughout: the real backend, the real platform EventBus and
 registry, the real model catalog.  Replaced: the caption port's HTTP
 (pooled_get), the event delivery (synchronous, to the real bus), the process
-spawn (subprocess.Popen and the llama-server lookup), sleep (a clock), and
-the home folder (a temp dir).
+spawn (subprocess.Popen and the llama-server lookup), sleep (a clock, for the
+thread the start runs on only: time.sleep is process-wide), and the home
+folder (a temp dir).
 
     python -m pytest tests/unit/test_caption_server_one_launch.py -q -p no:cacheprovider
 """
 import os
 import sys
+import threading
+import time
 import types
 from unittest.mock import MagicMock, patch
 
@@ -45,6 +48,8 @@ STANDALONE_BINARY = ('integrations.service_tools.model_lifecycle.'
                      'ModelLifecycleManager._find_llama_server_binary')
 #: The bound the start had before: the 5 x 1 s event wait, then 30 x 1 s.
 BOUND_S = 35
+#: time.sleep as it is, before any test replaces it.
+REAL_SLEEP = time.sleep
 
 
 @pytest.fixture(autouse=True)
@@ -135,18 +140,31 @@ def _nunba_in_this_process(box, start_s):
 
 
 def _ensure(box, backend=None):
-    """ensure_running on the real backend; returns (ok, backend)."""
+    """ensure_running on the real backend; returns (ok, backend).
+
+    The clock is the start's: it runs on this thread, and only this
+    thread's sleeps move the clock.  Another thread's sleep is its own,
+    really slept -- finding F1 (2026-10-14): a VisionService that
+    hart_intelligence_entry's import-time vision_init thread started keeps a
+    description loop sleeping every 4 s."""
     backend = backend or lvb.Qwen08BBackend(port=PORT)
     asked = []
+    me = threading.get_ident()
 
     def deliver(topic, data=None, *a, **kw):
         asked.append(topic)
         box.bus.emit(topic, data)
+
+    def sleep(seconds=0):
+        if threading.get_ident() == me:
+            box.clock.sleep(seconds)
+        else:
+            REAL_SLEEP(seconds)
     with patch.object(lvb, 'pooled_get', side_effect=box.port.health), \
          patch('core.platform.events.emit_event', side_effect=deliver), \
          patch(STANDALONE_BINARY, return_value=str(box.tmp / 'llama-server.exe')), \
          patch('subprocess.Popen', side_effect=box.port.popen), \
-         patch('time.sleep', side_effect=box.clock.sleep):
+         patch('time.sleep', sleep):
         ok = backend.ensure_running()
     box.asked = asked
     log = getattr(backend, '_log_fh', None)
@@ -183,6 +201,34 @@ def test_a_nunba_start_that_never_finishes_is_waited_for_within_the_bound(box):
     ok, _ = _ensure(box)
     assert ok is False
     assert box.port.spawned == []
+    assert box.clock.sleeps == BOUND_S and box.clock.t == BOUND_S
+
+
+def test_another_threads_sleeps_do_not_move_the_starts_clock(box):
+    """Finding F1 (2026-10-14), simulated: time.sleep is process-wide, and a
+    VisionService started by hart_intelligence_entry's import-time
+    vision_init thread keeps a description loop that sleeps every 4 s
+    (vision_service.py ~:905).  It ticks while a start waits for a Nunba
+    start that never finishes: the start still waits its whole bound, by
+    its own clock, and spawns nothing."""
+    _files_in(box.models, ('qwen08b', 'mmproj-F16.gguf'))
+    _files_in(box.models)
+    _nunba_in_this_process(box, start_s=None)
+    ticks = []
+
+    def description_loop():
+        for _ in range(3):
+            time.sleep(0.01)
+            ticks.append(1)
+
+    def vision_service_meanwhile(topic, data):
+        loop = threading.Thread(target=description_loop, name='vision-desc', daemon=True)
+        loop.start()
+        loop.join(10)
+    box.bus.on('vlm_caption.requested', vision_service_meanwhile)
+    ok, _ = _ensure(box)
+    assert ticks == [1, 1, 1]
+    assert ok is False and box.port.spawned == []
     assert box.clock.sleeps == BOUND_S and box.clock.t == BOUND_S
 
 

@@ -24,11 +24,21 @@ lightweight_backend's pooled_get / pooled_post), the platform event Nunba
 subscribes to (core.platform.events.emit_event), the standalone launcher's
 binary lookup, and sleep.
 
+What the reel did is counted on the reel's own backend (``_Reel``: its starts
+and its /health probes), and the waits on the thread the reel runs on, never
+as every call of a patched module function: those are process-wide, and any
+other thread may call them meanwhile.  Finding F1 (2026-10-14): in a batch,
+hart_intelligence_entry's import-time vision_init thread ran
+VisionService().start() inside a reel's window, and its two probes of the
+same /health URL were counted as the reel's (5 for 3 keyframes).
+
     python -m pytest tests/unit/test_reel_vision_ready.py -q -p no:cacheprovider
 """
 import contextlib
 import io
 import json
+import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -48,6 +58,8 @@ STANDALONE_BINARY = ('integrations.service_tools.model_lifecycle.'
                      'ModelLifecycleManager._find_llama_server_binary')
 #: score_moments as moments defines it, before any test wraps it.
 REAL_SCORE_MOMENTS = M.score_moments
+#: time.sleep as it is, before any test replaces it.
+REAL_SLEEP = time.sleep
 
 
 @pytest.fixture(autouse=True)
@@ -95,7 +107,9 @@ class _CaptionServer:
     ``reply``: what the model answers (None: a usable rating).
     ``asks``: every 'vlm_caption.requested' event; ``clock``/``start_s``:
     simulated time the start takes, read by moments' budget.  ``chat``: her
-    chat's progress list; ``shown`` records its last line at each ask."""
+    chat's progress list; ``shown`` records its last line at each ask.
+    ``health_urls``: every /health probe the port answered, from any backend
+    on any thread (a reel's own are counted on its backend: _Reel.probes)."""
 
     def __init__(self, *, up=False, nunba_starts_it=True, clock=None, start_s=0.0,
                  reply=None, chat=None):
@@ -137,25 +151,73 @@ class _Clock:
         return self.t
 
 
+class _Reel:
+    """The vision backends the reel's moments step resolved
+    (moments._default_backend: get_vision_backend(REEL_VLM_DEFAULT), one per
+    score_moments call with keyframes), and what THEY did: ``starts``, calls
+    of their ensure_running, and ``probes``, calls of their _is_serving (one
+    GET /health each).  Another backend in this process probing the same URL,
+    on any thread, is not counted (finding F1, module docstring)."""
+
+    def __init__(self):
+        self.backends = []
+
+    @property
+    def starts(self):
+        return sum(b.ensure_running.call_count for b in self.backends)
+
+    @property
+    def probes(self):
+        return sum(b._is_serving.call_count for b in self.backends)
+
+
 @contextlib.contextmanager
-def _caption_port(srv, spy=True):
+def _the_reels_backend(start=None):
+    """Yields a ``_Reel`` for the backends moments resolves inside the
+    block, each with a spy on its own health check (the real one runs) and
+    on its own ensure_running: the real one, or ``start`` as its side effect
+    when given."""
+    reel = _Reel()
+    resolve = M._default_backend
+
+    def resolved():
+        backend = resolve()
+        if backend is not None:
+            backend._is_serving = MagicMock(wraps=backend._is_serving)
+            backend.ensure_running = (MagicMock(side_effect=start) if start is not None
+                                      else MagicMock(wraps=backend.ensure_running))
+            reel.backends.append(backend)
+        return backend
+    with patch.object(M, '_default_backend', side_effect=resolved):
+        yield reel
+
+
+@contextlib.contextmanager
+def _caption_port(srv):
     """Every boundary of the caption server replaced by ``srv``.  Yields
-    ``lazy`` (a spy on the backend's real ensure_running; None when ``spy``
-    is False), ``post`` (the chat-completions POST) and ``sleep``; nothing
-    may be spawned."""
+    ``reel`` (the reel's backend: its own starts and probes, ``_Reel``),
+    ``post`` (the chat-completions POST) and ``slept`` (the waits asked for
+    on this thread, the one the reel runs on; they return at once); nothing
+    may be spawned.  time.sleep is process-wide: another thread's sleep (a
+    running VisionService's description loop sleeps every 4 s,
+    vision_service.py ~:905) stays its own, really slept and not recorded."""
+    me = threading.get_ident()
+    slept = []
+
+    def sleep(seconds=0):
+        if threading.get_ident() == me:
+            slept.append(seconds)
+        else:
+            REAL_SLEEP(seconds)
     with contextlib.ExitStack() as stack:
-        lazy = None
-        if spy:
-            lazy = stack.enter_context(patch.object(
-                lvb.Qwen08BBackend, 'ensure_running', autospec=True,
-                side_effect=lvb.Qwen08BBackend.ensure_running))
+        reel = stack.enter_context(_the_reels_backend())
         stack.enter_context(patch.object(lvb, 'pooled_get', side_effect=srv.health))
         post = stack.enter_context(patch.object(lvb, 'pooled_post', side_effect=srv.complete))
         stack.enter_context(patch('core.platform.events.emit_event', side_effect=srv.emit))
         stack.enter_context(patch(STANDALONE_BINARY, return_value=None))
         popen = stack.enter_context(patch('subprocess.Popen'))
-        sleep = stack.enter_context(patch('time.sleep'))
-        yield SimpleNamespace(lazy=lazy, post=post, sleep=sleep)
+        stack.enter_context(patch('time.sleep', sleep))
+        yield SimpleNamespace(reel=reel, post=post, slept=slept)
         popen.assert_not_called()
 
 
@@ -164,15 +226,16 @@ def server(tmp_path):
     """Run score_moments the way a reel does (no backend named: moments'
     REEL_VLM_DEFAULT through get_vision_backend), against ``_CaptionServer``.
 
-    Returns ``score(srv, keys, **kw) -> (doc, lazy_starts, completions)``:
-    ``lazy_starts`` counts calls of the backend's real ensure_running,
-    ``completions`` is the mocked chat-completions POST.  Calls in one test
-    share one rating cache."""
+    Returns ``score(srv, keys, **kw) -> (doc, reel, completions)``:
+    ``reel`` is the reel's backend (``_Reel``: ``starts`` counts calls of its
+    real ensure_running, ``probes`` its health checks), ``completions`` is
+    the mocked chat-completions POST.  Calls in one test share one rating
+    cache."""
     def score(srv, keys, **kw):
         with _caption_port(srv) as port:
             doc = M.score_moments(keys, cache_dir=str(tmp_path / 'cache'), **kw)
         assert C.validate_moments(doc) == [], C.validate_moments(doc)
-        return doc, port.lazy.call_count, port.post
+        return doc, port.reel, port.post
     return score
 
 
@@ -184,8 +247,8 @@ def test_a_reel_with_the_caption_server_down_asks_for_it_and_is_rated(server):
     subscriber answers with start_caption_server), and the frames are then
     rated by the model, not the deterministic fallback."""
     srv = _CaptionServer(up=False, nunba_starts_it=True)
-    doc, lazy_starts, post = server(srv, _keys(3))
-    assert lazy_starts == 1
+    doc, reel, post = server(srv, _keys(3))
+    assert reel.starts == 1
     assert len(srv.asks) == 1, 'the existing vlm_caption.requested event was never sent'
     assert doc['src'] == 'vlm' and doc['stats']['vlm'] == 3, doc
     assert M.NOTE_VLM_FALLBACK not in doc['notes']
@@ -198,8 +261,8 @@ def test_the_lazy_start_is_asked_once_per_reel_not_once_per_frame(server):
     the standalone launch): one ask for the reel, every frame falls back,
     and no frame is sent to a server that is not there."""
     srv = _CaptionServer(up=False, nunba_starts_it=False)
-    doc, lazy_starts, post = server(srv, _keys(4))
-    assert lazy_starts == 1 and len(srv.asks) == 1
+    doc, reel, post = server(srv, _keys(4))
+    assert reel.starts == 1 and len(srv.asks) == 1
     assert doc['src'] == 'fallback' and M.NOTE_VLM_FALLBACK in doc['notes']
     post.assert_not_called()
 
@@ -209,8 +272,8 @@ def test_a_shared_server_already_running_is_reused_never_restarted(server):
     returns at once -- nothing is asked for, nothing spawned (the fixture
     asserts no Popen) -- and the frames go to it."""
     srv = _CaptionServer(up=True)
-    doc, lazy_starts, post = server(srv, _keys(2))
-    assert lazy_starts == 1
+    doc, reel, post = server(srv, _keys(2))
+    assert reel.starts == 1
     assert srv.asks == []
     assert doc['src'] == 'vlm' and post.call_count == 2
 
@@ -228,8 +291,8 @@ def test_the_start_counts_against_the_moments_budget_and_is_not_capped_by_it(
     clock = _Clock()
     monkeypatch.setattr(M, 'monotonic', clock)
     srv = _CaptionServer(up=False, nunba_starts_it=True, clock=clock, start_s=start_s)
-    doc, lazy_starts, post = server(srv, _keys(2), budget_s=10.0)
-    assert lazy_starts == 1
+    doc, reel, post = server(srv, _keys(2), budget_s=10.0)
+    assert reel.starts == 1
     post.assert_not_called()
     assert M.NOTE_VLM_BUDGET in doc['notes'] and M.NOTE_VLM_FALLBACK in doc['notes']
     assert doc['stats']['elapsed_s'] == pytest.approx(start_s)
@@ -240,16 +303,16 @@ def test_a_budget_under_min_call_s_asks_for_no_start(server, budget_s):
     """Under MIN_CALL_S no frame can be asked, so nothing is started for
     them: no lazy start, no event, no health probe, no request."""
     srv = _CaptionServer(up=False, nunba_starts_it=True)
-    doc, lazy_starts, post = server(srv, _keys(2), budget_s=budget_s)
-    assert lazy_starts == 0 and srv.asks == [] and srv.health_urls == []
+    doc, reel, post = server(srv, _keys(2), budget_s=budget_s)
+    assert reel.starts == 0 and srv.asks == [] and reel.probes == 0
     post.assert_not_called()
     assert doc['src'] == 'fallback' and M.NOTE_VLM_BUDGET in doc['notes']
 
 
 def test_no_keyframes_asks_for_no_server(server):
     srv = _CaptionServer(up=False)
-    doc, lazy_starts, post = server(srv, [])
-    assert lazy_starts == 0 and srv.asks == []
+    doc, reel, post = server(srv, [])
+    assert reel.starts == 0 and srv.asks == []
     post.assert_not_called()
 
 
@@ -259,20 +322,20 @@ def test_the_start_is_asked_at_the_first_frame_that_is_not_cached(server):
     keys = _keys(3)
     server(_CaptionServer(up=True), keys[:1])
     srv = _CaptionServer(up=False, nunba_starts_it=True)
-    doc, lazy_starts, post = server(srv, keys)
-    assert lazy_starts == 1 and len(srv.asks) == 1
+    doc, reel, post = server(srv, keys)
+    assert reel.starts == 1 and len(srv.asks) == 1
     assert doc['stats']['cached'] == 1 and post.call_count == 2
     assert doc['src'] == 'vlm'
 
 
 # ── a start that raises ───────────────────────────────────────────────────
 
-@requires_ffmpeg
-def test_a_lazy_start_that_raises_still_finishes_the_reel(clip_files, tmp_path, monkeypatch):
-    """The backend's ensure_running raises.  The raise is logged, every
-    keyframe is still offered to rate_frame one by one and falls back on its
-    own, and the real reel is made, checked and delivered -- not a
-    'could not render' failure."""
+def _a_reel_whose_start_raises(clip_files, tmp_path, monkeypatch, *, meanwhile=None):
+    """make_reel on three real clips with the caption server down, nobody to
+    start it, and the reel's backend's ensure_running raising.  ``meanwhile``
+    runs inside that start, just before it raises: while the reel is being
+    made.  Returns (result, reel (``_Reel``), picked keyframes, srv, POST
+    mock)."""
     from integrations.reel_studio import pipeline as P
     from integrations.reel_studio.media import keyframes
     store, _pushes = _env(monkeypatch, tmp_path)
@@ -285,21 +348,96 @@ def test_a_lazy_start_that_raises_still_finishes_the_reel(clip_files, tmp_path, 
         picked[:] = real_pick(analyses)
         return list(picked)
     monkeypatch.setattr(keyframes, 'pick_keyframes', pick)
+
+    def broken_start(on_wait=None):
+        if meanwhile is not None:
+            meanwhile()
+        raise RuntimeError('the launcher broke')
     srv = _CaptionServer(up=False, nunba_starts_it=False)
-    with patch.object(lvb, 'pooled_get', side_effect=srv.health), \
-         patch.object(lvb, 'pooled_post', side_effect=srv.complete) as post, \
-         patch.object(lvb.Qwen08BBackend, 'ensure_running', autospec=True,
-                      side_effect=RuntimeError('the launcher broke')) as lazy:
+    with _the_reels_backend(start=broken_start) as reel, \
+         patch.object(lvb, 'pooled_get', side_effect=srv.health), \
+         patch.object(lvb, 'pooled_post', side_effect=srv.complete) as post:
         result = P.make_reel(user_id=UID, prompt_id=PID, request_id='req-3',
                              clips=[sf.to_dict() for sf in clips],
                              style=C.make_style({'target_s': 5}), encoder='libx264')
+    return result, reel, picked, srv, post
+
+
+def _assert_each_frame_asked_once(reel, picked):
+    """One /health probe per keyframe, by the reel's own backend.  Its start
+    is the mock that raises, so every probe it made was a frame's rate_frame
+    asking /health (and, the server being down, nothing more)."""
+    assert picked and len(reel.backends) == 1, (picked, reel.backends)
+    assert reel.probes == len(picked), (reel.probes, len(picked))
+
+
+@requires_ffmpeg
+def test_a_lazy_start_that_raises_still_finishes_the_reel(clip_files, tmp_path, monkeypatch):
+    """The backend's ensure_running raises.  The raise is logged, every
+    keyframe is still offered to rate_frame one by one and falls back on its
+    own, and the real reel is made, checked and delivered -- not a
+    'could not render' failure."""
+    result, reel, picked, _srv, post = _a_reel_whose_start_raises(
+        clip_files, tmp_path, monkeypatch)
     assert result['status'] == 'ok', result
-    assert lazy.call_count == 1
-    assert picked and len(srv.health_urls) == len(picked)   # each frame asked, one by one
+    assert reel.starts == 1
+    _assert_each_frame_asked_once(reel, picked)             # each frame asked, one by one
     post.assert_not_called()
     assert result['moments']['src'] == 'fallback'
     assert M.NOTE_VLM_FALLBACK in result['notes']
     assert C.validate_media_item(result['media']) == []
+
+
+@requires_ffmpeg
+def test_another_threads_vision_start_is_not_counted_as_the_reels(clip_files, tmp_path,
+                                                                   monkeypatch):
+    """Finding F1 (2026-10-14), simulated: hart_intelligence_entry's
+    import-time vision_init thread runs VisionService().start() while a reel
+    is being made.  Its get_vision_backend() asks a new Qwen08BBackend
+    is_available(), then start(): two GETs of the same /health URL, through
+    the same lightweight_backend.pooled_get, from another thread.  The port
+    answers them; the reel's own counts do not change."""
+    joined = []
+
+    def vision_init():
+        stray = lvb.Qwen08BBackend()        # the env's caption port, as the reel's
+        stray.is_available()
+        stray.start()
+
+    def meanwhile():
+        thread = threading.Thread(target=vision_init, name='vision_init', daemon=True)
+        thread.start()
+        thread.join(30)
+        joined.append(not thread.is_alive())
+    result, reel, picked, srv, post = _a_reel_whose_start_raises(
+        clip_files, tmp_path, monkeypatch, meanwhile=meanwhile)
+    assert joined == [True]
+    assert result['status'] == 'ok', result
+    # The other thread's two probes reached the port, at the reel's own URL:
+    # every pooled_get, or every probe of that URL, is the frames plus two.
+    assert srv.health_urls == ['http://127.0.0.1:18081/health'] * (len(picked) + 2)
+    assert reel.starts == 1
+    _assert_each_frame_asked_once(reel, picked)
+    post.assert_not_called()
+
+
+@requires_ffmpeg
+def test_a_reel_that_probes_twice_per_frame_fails_the_one_probe_check(clip_files, tmp_path,
+                                                                      monkeypatch):
+    """The reel's own count still sees all of the reel: a rate_frame that
+    asks /health twice per frame fails the check the two tests above make."""
+    rate_frame = lvb.Qwen08BBackend.rate_frame
+
+    def asks_twice(self, *a, **kw):
+        self._is_serving()
+        return rate_frame(self, *a, **kw)
+    monkeypatch.setattr(lvb.Qwen08BBackend, 'rate_frame', asks_twice)
+    result, reel, picked, srv, _post = _a_reel_whose_start_raises(
+        clip_files, tmp_path, monkeypatch)
+    assert result['status'] == 'ok', result
+    assert reel.probes == 2 * len(picked) == len(srv.health_urls)
+    with pytest.raises(AssertionError):
+        _assert_each_frame_asked_once(reel, picked)
 
 
 # ── what she sees ─────────────────────────────────────────────────────────
@@ -350,7 +488,7 @@ def test_her_chat_says_the_vision_model_is_being_readied_when_the_start_is_asked
     srv = _CaptionServer(up=False, nunba_starts_it=True, chat=said)
     with _caption_port(srv) as port:
         doc = _moments_step(turn, _keys(2), said)
-    assert port.lazy.call_count == 1 and len(srv.asks) == 1
+    assert port.reel.starts == 1 and len(srv.asks) == 1
     assert len(_readies(said)) == 1, said
     assert srv.shown == _readies(said), (srv.shown, said)
     assert _readies(said)[0][0] == 'reel_moments'
@@ -363,7 +501,7 @@ def test_her_chat_is_not_told_the_model_is_being_readied_when_it_is_already_up(t
     not say the vision model is being made ready."""
     said = []
     srv = _CaptionServer(up=True, chat=said)
-    with _caption_port(srv, spy=False):
+    with _caption_port(srv):
         doc = _moments_step(turn, _keys(2), said)
     assert srv.asks == []
     assert _readies(said) == [], said
@@ -377,7 +515,7 @@ def test_a_progress_line_that_fails_never_skips_the_start(tmp_path):
     def broken():
         raise RuntimeError('her chat is unreachable')
     srv = _CaptionServer(up=False, nunba_starts_it=True)
-    with _caption_port(srv, spy=False) as port:
+    with _caption_port(srv) as port:
         doc = M.score_moments(_keys(2), cache_dir=str(tmp_path / 'cache'), on_start=broken)
     assert len(srv.asks) == 1, 'the start was skipped because its progress line raised'
     assert doc['src'] == 'vlm' and port.post.call_count == 2
@@ -396,8 +534,8 @@ def test_a_retried_reel_whose_frames_are_all_cached_neither_waits_nor_starts_a_s
     down = _CaptionServer(up=False, nunba_starts_it=True, chat=said)
     with _caption_port(down) as port:
         again = _moments_step(turn, keys, said)
-    assert port.lazy.call_count == 0 and down.asks == [] and down.health_urls == []
-    port.sleep.assert_not_called()
+    assert port.reel.starts == 0 and down.asks == [] and port.reel.probes == 0
+    assert port.slept == []
     port.post.assert_not_called()
     assert again['src'] == 'vlm' and again['stats']['cached'] == 3
     assert _readies(said) == [], said
@@ -408,7 +546,7 @@ def test_a_reel_with_no_keyframes_never_says_the_vision_model_is_being_readied(t
     srv = _CaptionServer(up=False, nunba_starts_it=True, chat=said)
     with _caption_port(srv) as port:
         _moments_step(turn, [], said)
-    assert port.lazy.call_count == 0 and srv.asks == []
+    assert port.reel.starts == 0 and srv.asks == []
     assert _readies(said) == [], said
 
 

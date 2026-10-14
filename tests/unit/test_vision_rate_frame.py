@@ -18,12 +18,18 @@ makes per frame.  Its contract:
 The page reader (read_document) now goes through the same transport; its
 request must be exactly what it was.
 
-Only the HTTP layer (pooled_get / pooled_post) is mocked.
+Only the HTTP layer (pooled_get / pooled_post) is mocked.  A backend's
+health probes are the calls of pooled_get made on the test's thread, where
+the backend under test runs (_pooled_get): the module function is one for
+every backend on every thread of the process.
 """
 import base64
+import contextlib
 import io
 import json
-from unittest.mock import MagicMock, patch
+import threading
+from types import SimpleNamespace
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import requests
@@ -58,6 +64,28 @@ def _health(status=200):
     return MagicMock(status_code=status)
 
 
+@contextlib.contextmanager
+def _pooled_get(**answer):
+    """lightweight_backend.pooled_get answering every caller as
+    ``MagicMock(**answer)`` would.  Yields ``get``: ``get.calls``, the calls
+    made on THIS thread (the backend under test runs here), and
+    ``get.every``, the mock that answered every thread.  Another thread's
+    probes are not this backend's.  Finding F1 (2026-10-14): the import-time
+    vision_init thread of hart_intelligence_entry runs
+    VisionService().start(), whose Qwen08BBackend probes /health through
+    this same function."""
+    me = threading.get_ident()
+    every = MagicMock(**answer)
+    calls = []
+
+    def pooled_get(*a, **kw):
+        if threading.get_ident() == me:
+            calls.append(call(*a, **kw))
+        return every(*a, **kw)
+    with patch.object(lvb, 'pooled_get', pooled_get):
+        yield SimpleNamespace(calls=calls, every=every)
+
+
 def _sent_image(post):
     from PIL import Image
     url = post.call_args.kwargs['json']['messages'][0]['content'][0]['image_url']['url']
@@ -72,13 +100,13 @@ PROMPT = 'Rate this frame. Answer with JSON only.'
 
 def test_the_caption_server_rates_a_portrait_frame_at_768_px():
     backend = lvb.Qwen08BBackend(port=9555)
-    with patch.object(lvb, 'pooled_get', return_value=_health()) as get, \
+    with _pooled_get(return_value=_health()) as get, \
          patch.object(lvb, 'pooled_post', return_value=_answer()) as post:
         out = backend.rate_frame(_jpeg((1080, 1920)), PROMPT, timeout_s=7.5)
     assert out == '{"stage": "eyes", "appeal": 7, "face_visible": true}'
     # Health first, on the caption server's own port, with a short bound.
-    assert get.call_args.args[0] == 'http://127.0.0.1:9555/health'
-    assert get.call_args.kwargs['timeout'] == lvb.HEALTH_TIMEOUT == (1, 2)
+    assert get.calls[-1].args[0] == 'http://127.0.0.1:9555/health'
+    assert get.calls[-1].kwargs['timeout'] == lvb.HEALTH_TIMEOUT == (1, 2)
     # Then one completion on the same server.
     assert post.call_count == 1
     assert post.call_args.args[0] == 'http://127.0.0.1:9555/v1/chat/completions'
@@ -131,13 +159,34 @@ def test_a_server_that_is_not_serving_is_never_started(health):
     post.assert_not_called()
 
 
+def test_a_probe_from_another_thread_is_not_the_backends():
+    """Finding F1 (2026-10-14), simulated: while a backend here is under
+    test, another thread probes a caption server on the same port through
+    the same lightweight_backend.pooled_get -- as hart_intelligence_entry's
+    import-time vision_init thread does (VisionService().start() -> a
+    Qwen08BBackend's start()).  Its probe is answered and is not this
+    backend's: a frame with no time left still asks nobody."""
+    backend = lvb.Qwen08BBackend(port=9555)
+    with _pooled_get(return_value=_health()) as get, \
+         patch.object(lvb, 'pooled_post') as post:
+        vision_init = threading.Thread(target=lvb.Qwen08BBackend(port=9555).start,
+                                       name='vision_init', daemon=True)
+        vision_init.start()
+        vision_init.join(10)
+        assert backend.rate_frame(_jpeg(), PROMPT, timeout_s=0) is None
+    assert get.every.call_args_list == [call('http://127.0.0.1:9555/health',
+                                             timeout=lvb.HEALTH_TIMEOUT)]
+    assert get.calls == []
+    post.assert_not_called()
+
+
 def test_no_time_left_means_no_request():
     backend = lvb.Qwen08BBackend(port=9555)
-    with patch.object(lvb, 'pooled_get', return_value=_health()) as get, \
+    with _pooled_get(return_value=_health()) as get, \
          patch.object(lvb, 'pooled_post') as post:
         for spent in (0, -1.0, float('nan'), float('inf'), None, 'soon'):
             assert backend.rate_frame(_jpeg(), PROMPT, timeout_s=spent) is None
-    get.assert_not_called()
+    assert get.calls == []
     post.assert_not_called()
 
 
@@ -180,11 +229,11 @@ def _qwen3vl(base='http://127.0.0.1:8080/v1'):
 
 def test_qwen3vl_rates_through_its_own_endpoint_after_a_health_probe():
     backend = _qwen3vl('http://127.0.0.1:8080/v1/')
-    with patch.object(lvb, 'pooled_get', return_value=_health()) as get, \
+    with _pooled_get(return_value=_health()) as get, \
          patch.object(lvb, 'pooled_post', return_value=_answer('{"stage": "base"}')) as post:
         assert backend.rate_frame(_jpeg(), PROMPT, timeout_s=12.0) == '{"stage": "base"}'
-    assert get.call_args.args[0] == 'http://127.0.0.1:8080/health'
-    assert get.call_args.kwargs['timeout'] == lvb.HEALTH_TIMEOUT
+    assert get.calls[-1].args[0] == 'http://127.0.0.1:8080/health'
+    assert get.calls[-1].kwargs['timeout'] == lvb.HEALTH_TIMEOUT
     assert post.call_args.args[0] == 'http://127.0.0.1:8080/v1/chat/completions'
     assert post.call_args.kwargs['headers'] == {'Authorization': 'Bearer k'}
     assert post.call_args.kwargs['timeout'] == 12.0
@@ -208,19 +257,19 @@ def test_qwen3vl_whose_endpoint_cannot_be_built_is_none():
     backend = lvb.Qwen3VLVisionBackend()
     with patch('integrations.vlm.qwen3vl_backend.get_qwen3vl_backend',
                side_effect=RuntimeError('no endpoint')), \
-         patch.object(lvb, 'pooled_get') as get, \
+         _pooled_get() as get, \
          patch.object(lvb, 'pooled_post') as post:
         assert backend.rate_frame(_jpeg(), PROMPT) is None
-    get.assert_not_called()
+    assert get.calls == []
     post.assert_not_called()
 
 
 def test_qwen3vl_with_a_broken_endpoint_record_is_none_not_an_exception():
     backend = lvb.Qwen3VLVisionBackend()
     backend._backend = MagicMock(base_url=None, model_name='m', api_key='k')
-    with patch.object(lvb, 'pooled_get') as get, patch.object(lvb, 'pooled_post') as post:
+    with _pooled_get() as get, patch.object(lvb, 'pooled_post') as post:
         assert backend.rate_frame(_jpeg(), PROMPT) is None
-    get.assert_not_called()
+    assert get.calls == []
     post.assert_not_called()
 
 
@@ -229,9 +278,9 @@ def test_qwen3vl_with_a_broken_endpoint_record_is_none_not_an_exception():
 @pytest.mark.parametrize('cls', [lvb.MiniCPMBackend, lvb.MobileVLMBackend,
                                  lvb.CLIPBackend, lvb.NoneBackend])
 def test_a_backend_that_cannot_rate_a_frame_says_none_without_asking_anyone(cls):
-    with patch.object(lvb, 'pooled_get') as get, patch.object(lvb, 'pooled_post') as post:
+    with _pooled_get() as get, patch.object(lvb, 'pooled_post') as post:
         assert cls().rate_frame(_jpeg(), PROMPT) is None
-    get.assert_not_called()
+    assert get.calls == []
     post.assert_not_called()
 
 
@@ -330,9 +379,9 @@ def test_read_document_on_qwen3vl_sends_the_same_bytes_as_before():
     page = _page((2400, 1600))
     backend = _qwen3vl('http://10.0.0.5:7000/v1/')
     with patch.object(lvb, 'pooled_post', return_value=_answer('p')) as post, \
-         patch.object(lvb, 'pooled_get') as get:
+         _pooled_get() as get:
         assert backend.read_document(page, 'x') == 'p'
-    get.assert_not_called()               # pages keep their old path: no health probe
+    assert get.calls == []                # pages keep their old path: no health probe
     assert post.call_args.args == ('http://10.0.0.5:7000/v1/chat/completions',)
     assert set(post.call_args.kwargs) == {'json', 'timeout', 'headers'}
     assert post.call_args.kwargs['headers'] == {'Authorization': 'Bearer k'}
