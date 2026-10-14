@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 import pytest
 from unittest.mock import patch, MagicMock
+from tests.unit.module_swap import swap_modules
 
 
 # ─── Installer Tests ───
@@ -48,6 +49,135 @@ class TestInstaller:
         result = install('nonexistent_tool')
         assert result['success'] is False
         assert 'Unknown tool' in result['error']
+
+    def test_pi_and_hermes_in_registry(self):
+        from integrations.coding_agent.installer import TOOL_REGISTRY
+        assert TOOL_REGISTRY['pi'] == ('pi', '@mariozechner/pi-coding-agent', 'MIT')
+        assert TOOL_REGISTRY['hermes'][0] == 'hermes'
+        assert TOOL_REGISTRY['hermes'][2] == 'MIT'
+
+    @patch('shutil.which', return_value=None)
+    def test_hermes_install_is_never_a_piped_remote_script(self, mock_which):
+        """Hermes ships only as an official install script; HARTOS hands the
+        user the command instead of running a remote script itself."""
+        from integrations.coding_agent import installer
+        with patch.object(installer, 'run_bounded') as run:
+            result = installer.install_tool('hermes')
+        run.assert_not_called()
+        assert result['success'] is False
+        assert 'hermes-agent.nousresearch.com' in result['error']
+
+    def test_npm_install_and_version_go_through_launch_argv(self):
+        """install() and get_versions() launch via launch_argv + run_bounded,
+        never a bare name (WinError 2 on a .cmd shim)."""
+        from integrations.coding_agent import installer
+        from core.subprocess_safe import BoundedResult
+        installed = set()
+        paths = {'npm': '/opt/node/bin/npm', 'pi': '/opt/node/bin/pi'}
+        with patch.object(installer.shutil, 'which',
+                          side_effect=lambda n: paths.get(n) if n == 'npm' or n in installed else None), \
+             patch.object(installer, 'run_bounded',
+                          return_value=BoundedResult(0, '0.73.1', '')) as run:
+            installer.install_tool('pi')
+            assert run.call_args[0][0] == [
+                '/opt/node/bin/npm', 'install', '-g', '@mariozechner/pi-coding-agent']
+            installed.add('pi')
+            versions = installer.get_versions()
+        assert versions['pi'] == '0.73.1'
+        assert ['/opt/node/bin/pi', '--version'] in [c[0][0] for c in run.call_args_list]
+
+    def test_pip_install_in_a_frozen_host_uses_the_hosts_pip(self):
+        """In Nunba sys.executable is Nunba.exe, so `sys.executable -m pip`
+        would start a second app, not pip.  A frozen host installs through
+        its own pip runner (python-embed, user site, HARTOS pins)."""
+        from integrations.coding_agent import installer
+        import types
+        host = types.ModuleType('tts.package_installer')
+        host._run_pip = MagicMock(return_value=(True, 'ok'))
+        with patch.object(installer.sys, 'frozen', True, create=True), \
+             swap_modules({'tts.package_installer': host}), \
+             patch.object(installer, 'run_bounded') as run:
+            result = installer.pip_install('diskcache grep-ast')
+        run.assert_not_called()
+        host._run_pip.assert_called_once()
+        assert host._run_pip.call_args[0][0] == ['install', 'diskcache', 'grep-ast']
+        assert result['success'] is True
+
+    def test_pip_install_frozen_without_a_host_runner_refuses(self):
+        from integrations.coding_agent import installer
+        with patch.object(installer.sys, 'frozen', True, create=True), \
+             swap_modules({'tts.package_installer': None}), \
+             patch.object(installer, 'run_bounded') as run:
+            result = installer.pip_install('diskcache')
+        run.assert_not_called()
+        assert result['success'] is False
+
+    def test_pip_install_unfrozen_runs_bounded_pip(self):
+        from integrations.coding_agent import installer
+        from core.subprocess_safe import BoundedResult
+        with patch.object(installer, 'run_bounded',
+                          return_value=BoundedResult(0, '', '')) as run:
+            result = installer.pip_install('diskcache')
+        assert run.call_args[0][0] == [sys.executable, '-m', 'pip', 'install', 'diskcache']
+        assert result['success'] is True
+
+    def _shim(self, tmp_path, name, target_line):
+        shim = tmp_path / f'{name}.cmd'
+        shim.write_text('@ECHO off\r\nSETLOCAL\r\nCALL :find_dp0\r\n' + target_line + '\r\n')
+        return str(shim)
+
+    def test_npm_node_shim_launches_node_and_script_not_cmd_exe(self, tmp_path):
+        """cmd.exe re-parses a .cmd's arguments: a task carrying `" & cmd`
+        executes, a newline truncates it, %VAR% expands.  An npm shim is
+        launched as node + its script, so the task reaches the tool intact."""
+        from integrations.coding_agent import installer
+        shim = self._shim(tmp_path, 'pi',
+                          r'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & '
+                          r'"%_prog%"  "%dp0%\node_modules\pi\dist\cli.js" %*')
+        task = 'fix "it" & echo PWNED > x.txt\nsecond line %PATH%'
+        with patch.object(installer.sys, 'platform', 'win32'), \
+             patch.object(installer.shutil, 'which',
+                          side_effect=lambda n: {'pi': shim, 'node': r'C:\node\node.exe'}.get(n)):
+            argv = installer.launch_argv(['pi', '-p', task])
+        assert argv == [r'C:\node\node.exe',
+                        os.path.join(str(tmp_path), r'node_modules\pi\dist\cli.js'),
+                        '-p', task]
+
+    def test_npm_exe_shim_launches_the_exe(self, tmp_path):
+        from integrations.coding_agent import installer
+        shim = self._shim(tmp_path, 'claude',
+                          r'"%dp0%\node_modules\@anthropic-ai\claude-code\bin\claude.exe"   %*')
+        with patch.object(installer.sys, 'platform', 'win32'), \
+             patch.object(installer.shutil, 'which', return_value=shim):
+            argv = installer.launch_argv(['claude', '-p', 'a & b'])
+        assert argv == [os.path.join(str(tmp_path),
+                                     r'node_modules\@anthropic-ai\claude-code\bin\claude.exe'),
+                        '-p', 'a & b']
+
+    def test_unresolvable_batch_file_refuses_cmd_metacharacters(self, tmp_path):
+        from integrations.coding_agent import installer
+        shim = self._shim(tmp_path, 'odd', 'some-other-launcher %*')
+        with patch.object(installer.sys, 'platform', 'win32'), \
+             patch.object(installer.shutil, 'which', return_value=shim):
+            assert installer.launch_argv(['odd', '--version']) == [shim, '--version']
+            for bad in ('a & b', 'a\nb', '%PATH%', 'a"b', 'a|b', 'a>b'):
+                with pytest.raises(ValueError):
+                    installer.launch_argv(['odd', '-p', bad])
+
+    def test_launch_argv_rejects_empty(self):
+        from integrations.coding_agent import installer
+        with pytest.raises(ValueError):
+            installer.launch_argv([])
+
+    def test_no_tools_message_names_every_registered_tool(self):
+        from integrations.coding_agent.installer import TOOL_REGISTRY
+        from integrations.coding_agent.orchestrator import CodingAgentOrchestrator
+        with patch('integrations.coding_agent.tool_router.get_available_backends',
+                   return_value={}):
+            result = CodingAgentOrchestrator()._execute_local(
+                'task', 'feature', '', 'u1', '', '')
+        for name in TOOL_REGISTRY:
+            assert name in result['error']
 
     @patch('shutil.which', return_value=None)
     def test_install_without_npm(self, mock_which):
@@ -124,6 +254,68 @@ class TestToolBackends:
         result = backend.parse_output('plain text output', '', 0)
         assert result['success'] is True
         assert result['output'] == 'plain text output'
+
+    def test_pi_command_build(self):
+        from integrations.coding_agent.tool_backends import PiBackend
+        cmd = PiBackend().build_command('refactor module', {'model': 'anthropic/claude-sonnet-4'})
+        assert cmd == ['pi', '-p', 'refactor module', '--model', 'anthropic/claude-sonnet-4']
+
+    def test_hermes_command_build(self):
+        from integrations.coding_agent.tool_backends import HermesBackend
+        cmd = HermesBackend().build_command('fix the failing test')
+        # -Q: only the final response on stdout (no banner/spinner/previews)
+        assert cmd == ['hermes', 'chat', '-Q', '-q', 'fix the failing test']
+
+    def test_plain_text_backends_report_stdout(self):
+        from integrations.coding_agent.tool_backends import HermesBackend, PiBackend
+        for backend in (PiBackend(), HermesBackend()):
+            ok = backend.parse_output('  done: 3 files changed\n', '', 0)
+            assert ok == {'success': True, 'output': 'done: 3 files changed'}
+            bad = backend.parse_output('', 'no API key', 1)
+            assert bad == {'success': False, 'output': 'no API key'}
+
+    def test_pi_and_hermes_are_selectable(self):
+        """Registered, so the router's user override can pick them."""
+        from integrations.coding_agent.tool_backends import BACKENDS, HermesBackend, PiBackend
+        from integrations.coding_agent.tool_router import CodingToolRouter
+        assert BACKENDS['pi'] is PiBackend
+        assert BACKENDS['hermes'] is HermesBackend
+        with patch('integrations.coding_agent.tool_router.get_available_backends',
+                   return_value={'pi': PiBackend(), 'hermes': HermesBackend()}):
+            assert CodingToolRouter().route('t', 'feature', user_override='hermes').name == 'hermes'
+            assert CodingToolRouter().route('t', 'feature', user_override='pi').name == 'pi'
+
+    def test_execute_launches_via_launch_argv_and_run_bounded(self):
+        """execute() launches what launch_argv resolved, through run_bounded
+        (tree kill on timeout, stdin closed so a first-run prompt cannot hang)."""
+        from integrations.coding_agent import tool_backends
+        from core.subprocess_safe import BoundedResult
+        with patch.object(tool_backends.shutil, 'which', return_value='/usr/bin/pi'), \
+             patch('integrations.coding_agent.installer.launch_argv',
+                   return_value=['/usr/bin/node', '/x/cli.js', '-p', 'task']), \
+             patch.object(tool_backends, 'run_bounded',
+                          return_value=BoundedResult(0, 'ok', '')) as run:
+            result = tool_backends.PiBackend().execute('task', timeout=7)
+        assert run.call_args[0][0] == ['/usr/bin/node', '/x/cli.js', '-p', 'task']
+        assert run.call_args[1]['timeout'] == 7
+        assert result['success'] is True and result['tool'] == 'pi'
+        assert result['output'] == 'ok'
+
+    def test_execute_reports_timeout_and_refused_launch(self):
+        from integrations.coding_agent import tool_backends
+        from core.subprocess_safe import BoundedResult
+        with patch.object(tool_backends.shutil, 'which', return_value='/usr/bin/pi'), \
+             patch.object(tool_backends, 'run_bounded',
+                          return_value=BoundedResult(-1, '', '', timed_out=True)):
+            timed = tool_backends.PiBackend().execute('task', timeout=2)
+        assert timed['success'] is False and timed['error'] == 'Timeout after 2s'
+        with patch.object(tool_backends.shutil, 'which', return_value='/usr/bin/pi'), \
+             patch('integrations.coding_agent.installer.launch_argv',
+                   side_effect=ValueError('refused')), \
+             patch.object(tool_backends, 'run_bounded') as run:
+            refused = tool_backends.PiBackend().execute('a & b')
+        run.assert_not_called()
+        assert refused['success'] is False and 'refused' in refused['error']
 
     def test_env_passthrough(self):
         from integrations.coding_agent.tool_backends import KiloCodeBackend
@@ -238,7 +430,8 @@ class TestFeatureTierMap:
     def test_new_feature_entries_exist(self):
         from security.system_requirements import FEATURE_TIER_MAP, NodeTierLevel
         assert 'coding_aggregator' in FEATURE_TIER_MAP
-        assert 'vlm_computer_use' in FEATURE_TIER_MAP
+        assert 'vlm_computer_use' not in FEATURE_TIER_MAP   # no reader; removed
+        assert 'whisper' not in FEATURE_TIER_MAP
         assert 'crawl4ai' in FEATURE_TIER_MAP
         assert 'minicpm_vision' in FEATURE_TIER_MAP
         assert 'video_captioning' in FEATURE_TIER_MAP
@@ -247,7 +440,6 @@ class TestFeatureTierMap:
     def test_tier_assignments(self):
         from security.system_requirements import FEATURE_TIER_MAP, NodeTierLevel
         assert FEATURE_TIER_MAP['coding_aggregator'][0] == NodeTierLevel.STANDARD
-        assert FEATURE_TIER_MAP['vlm_computer_use'][0] == NodeTierLevel.STANDARD
         assert FEATURE_TIER_MAP['crawl4ai'][0] == NodeTierLevel.LITE
         assert FEATURE_TIER_MAP['minicpm_vision'][0] == NodeTierLevel.FULL
         assert FEATURE_TIER_MAP['vlm_omniparser'][0] == NodeTierLevel.FULL

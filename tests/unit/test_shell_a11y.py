@@ -53,7 +53,6 @@ def test_global_focus_ring_present():
 def test_live_regions_announce_dynamic_content():
     html = _render()
     assert 'id="agent-status" role="status" aria-live="polite"' in html
-    assert 'id="ac-messages" role="log" aria-live="polite"' in html
     assert 'id="toast-container" role="status" aria-live="polite"' in html
 
 

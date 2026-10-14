@@ -161,14 +161,15 @@ def client_address() -> str:
     A header never makes a request local either way (_is_local_request).
     """
     return _client_from(request.remote_addr,
-                        request.headers.get('X-Forwarded-For'))
+                        request.headers.get('X-Forwarded-For'),
+                        request.headers.get('Host'))
 
 
-def _client_from(remote, forwarded) -> str:
-    """client_address over raw values: the socket peer and the
-    X-Forwarded-For header, as a Flask request or a WSGI environ has them.
-    The only place either is interpreted."""
-    peer = _norm_ip(remote or '')
+def _client_from(remote, forwarded, host=None) -> str:
+    """client_address over raw values: the socket peer, the X-Forwarded-For
+    header and the Host (which names the unix socket, _peer), as a Flask
+    request or a WSGI environ has them. The only place they are interpreted."""
+    peer = _peer(remote, host)
     if not _is_forwarder(peer):
         return peer
     hops = [_norm_ip(h) for h in (forwarded or '').split(',') if h.strip()]
@@ -177,13 +178,50 @@ def _client_from(remote, forwarded) -> str:
     return '' if peer in _trusted_proxies() else peer
 
 
-def _local_from(remote, forwarded) -> bool:
+def _peer(remote, host=None) -> str:
+    """The socket peer as an address: the one input every reader below
+    interprets.
+
+    A client on this node's unix socket has NO address. Hypercorn hands
+    Flask REMOTE_ADDR None over a `unix:` bind (measured on the Samsung
+    node, generation 17, 2026-10-11, with a throwaway Hypercorn+Flask echo
+    on a unix socket: remote_addr None, REMOTE_ADDR None), so the loopback
+    rule could never be true for the Liquid UI shell's proxy, and every
+    page of the preinstalled Nunba (/local, /static/js/main.js, all of it)
+    answered 401 to the desktop's own browser. The Host allowlist on that
+    bind admits only core.serve.UNIX_SOCKET_SERVER_NAME, and a TCP client
+    always carries an address, so "no address AND exactly that Host" names
+    the unix socket and nothing else. The socket is a path only this
+    machine can open (/run/hart/nunba.sock, hart:hart, srwxr-xr-x), the
+    same trust as a loopback TCP peer, so it is reported AS the loopback
+    peer: a forwarder this node runs, whose last X-Forwarded-For hop names
+    the client (the shell proxy appends it: peer_address). A missing
+    address under any other Host stays '' and is trusted with nothing.
+    """
+    peer = _norm_ip(remote or '')
+    if peer:
+        return peer
+    from core.serve import UNIX_SOCKET_SERVER_NAME
+    if (host or '').strip() == UNIX_SOCKET_SERVER_NAME:
+        return '127.0.0.1'
+    return ''
+
+
+def peer_address() -> str:
+    """The socket peer of the current request, for a forwarder this node
+    runs to send on as the next X-Forwarded-For hop (the Liquid UI shell's
+    Nunba proxy). The peer only, never a header the client wrote: the rule
+    reads the LAST hop, the one the forwarder appended."""
+    return _peer(request.remote_addr, request.headers.get('Host'))
+
+
+def _local_from(remote, forwarded, host=None) -> bool:
     """_is_local_request's rule over raw values (see there)."""
     if ci_trusts_every_caller():
         return True
-    if not _is_loopback(remote or ''):
+    if not _is_loopback(_peer(remote, host)):
         return False
-    return _is_loopback(_client_from(remote, forwarded))
+    return _is_loopback(_client_from(remote, forwarded, host))
 
 
 def client_key() -> str:
@@ -191,14 +229,16 @@ def client_key() -> str:
     client: the key rate limiters and caller identities charge.  Never ''
     for a request that has a socket peer (every such request would share one
     empty key)."""
-    return client_address() or _norm_ip(request.remote_addr or '')
+    return client_address() or _peer(request.remote_addr,
+                                     request.headers.get('Host'))
 
 
 def is_local_environ(environ) -> bool:
     """_is_local_request for a raw WSGI environ (Nunba's app.py dispatcher
     decides before any Flask app has the request).  Same rule, same code."""
     return _local_from(environ.get('REMOTE_ADDR', ''),
-                       environ.get('HTTP_X_FORWARDED_FOR', ''))
+                       environ.get('HTTP_X_FORWARDED_FOR', ''),
+                       environ.get('HTTP_HOST', ''))
 
 
 def _is_local_request() -> bool:
@@ -216,7 +256,8 @@ def _is_local_request() -> bool:
     routes.auth.is_local_environ does through the same function.
     """
     return _local_from(request.remote_addr,
-                       request.headers.get('X-Forwarded-For'))
+                       request.headers.get('X-Forwarded-For'),
+                       request.headers.get('Host'))
 
 
 # ── CSRF defense-in-depth (Phase 9.5) ──────────────────────────────

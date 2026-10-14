@@ -1,4 +1,8 @@
 { lib, pkgs
+, hartRev ? "unknown"  # HART OS short rev (flake.nix hartRev, the same value /etc/hart/image-rev
+                       # carries), passed by hart-nunba.nix so BUILD_INFO.txt below names the
+                       # HARTOS this Nunba was shipped inside. "unknown" only when a caller
+                       # does not pass it (hart-liquid-ui.nix's floor call).
 , hartSrc ? null   # Accepted only for call-site compatibility: hart-liquid-ui.nix
                    # and hart-nunba.nix both `callPackage` this file with
                    # `{ inherit hartSrc; }`, and callPackage passes the override
@@ -6,15 +10,30 @@
                    # "called with unexpected argument 'hartSrc'". The Nunba daemon
                    # is HARTOS-EXCLUDED — it fetches ONLY the Nunba repo, never the
                    # HART tree — so hartSrc is intentionally unused here.
-, nunbaRev ? "776c40797d702a62a78990efb1c39824c89e566f"  # Nunba HEAD carrying the
-                   # HART_NUNBA_SOCKET bind (main.py, commit cb849ba9). nunbaHash +
-                   # npmDepsHash are now BOTH pinned for THIS rev (CI hash-pin R3,
-                   # 2026-07-12); if the rev is bumped, re-pin all three in ONE commit
-                   # (npm ci fails the lock-vs-deps integrity check if the rev and the
-                   # lock drift apart).
-, nunbaHash ? "sha256-vTg24p5EQbYBPJO5ek8z2l9JQ4YODewrYzHMrjswR38="  # pinned 2026-08-14 for nunbaRev 776c4079 (nunba-hash-pin run 31810930513, build verified GREEN)
-, npmDepsHash ? "sha256-IpqZKwHw5v9lO2H+Wq2Jptru+5a2bVwk8DP+xKEINXQ="  # pinned 2026-08-14 for nunbaRev 776c4079 (nunba-hash-pin run 31810930513 round B); prefetch-npm-deps landing-page/package-lock.json
-, backendUrl ? "http://127.0.0.1:6777"
+, nunbaRev ? "c620a840dc79160f7607b09f91de1f73edf7f766"  # Nunba main c620a840 (2026-10-12): the orb's frame
+                   # budget (VoiceVisualizer.jsx nextFramePolicy: the resting orb
+                   # breathes at 12 fps, sleeps hidden/off-screen, holds still under
+                   # reduced motion; measured 96% of a core at rest in the assistant
+                   # panel on generation 22). Carries 53bd28e9 (the shell bridge:
+                   # nunba:ready / compose / turn / onboarding, the clock-driven
+                   # letter-by-letter text) and de8a6d92's frame policy.
+                   # nunbaHash + npmDepsHash are pinned for THIS rev; if the rev
+                   # is bumped, re-pin all three in ONE commit (npm ci fails the
+                   # lock-vs-deps integrity check if the rev and the lock drift).
+, nunbaHash ? "sha256-f9LkpN3AHKKKOBK9nBI9EziGFFFh1vX7L6u1+QVJzBU="  # pinned 2026-10-12 for nunbaRev c620a840 (nunba-hash-pin dry run 38286721117, build verified GREEN)
+, npmDepsHash ? "sha256-mSce+t2+m46xpuz59Ng63U4vkbANa1oCbonPpo2E70M="  # pinned 2026-10-12 for nunbaRev c620a840 (nunba-hash-pin dry run 38286721117; the lock did not move since de8a6d92); prefetch-npm-deps landing-page/package-lock.json
+# The API base baked into the React bundle. It MUST be the origin the shell
+# page is loaded from (hart-liquid-ui.nix loads http://localhost:<port>), not
+# the HART backend: the bundle runs INSIDE the shell's WebKit, and a browser
+# sends a cross-origin XHR only after a CORS preflight the backend does not
+# answer (measured on generation 22, 2026-10-12: OPTIONS /prompts answered
+# 200 with no Access-Control headers, so Nunba's page in the assistant panel
+# could not load its agents or send a turn, showed "Network glitch", and the
+# ceremony's seal never left the browser). On its own origin every call lands
+# on the shell's catch-all proxy, which carries it over the unix socket to the
+# Nunba daemon: the SPA, its daemon and the ONE HART backend behind it, one
+# path, no CORS. hart-nunba.nix passes the configured shell port.
+, apiBaseUrl ? "http://localhost:6800"
 }:
 
 # ═══════════════════════════════════════════════════════════════
@@ -130,7 +149,7 @@ let
 
     PUBLIC_URL = "/";                     # root-absolute assets (/static/...) — the
                                           # no-basename <BrowserRouter> contract.
-    REACT_APP_API_BASE_URL = backendUrl;  # bake the API base onto the HART backend.
+    REACT_APP_API_BASE_URL = apiBaseUrl;  # the shell's own origin (see the arg above).
     DISABLE_ESLINT_PLUGIN = "true";
     ESLINT_NO_DEV_ERRORS = "true";
     CI = "false";                         # CRA: CI=true makes warnings fatal.
@@ -223,6 +242,30 @@ pkgs.stdenv.mkDerivation {
     mkdir -p $out/lib/nunba/landing-page
     ln -sfn ${nunbaStatic} $out/lib/nunba/landing-page/build
     ln -sfn ${nunbaStatic} $out/lib/nunba/static
+
+    # routes/chatbot_routes.py loads APP_DIR/config.json at import and logs
+    # "Failed to load config.json: No such file" when it is absent (gen 14
+    # journal, Nunba main 4dbde904); the repo ships config.example.json only.
+    # The Windows installer lays the example down as the default; do the same.
+    if [ ! -e $out/lib/nunba/config.json ] && [ -e $out/lib/nunba/config.example.json ]; then
+      cp $out/lib/nunba/config.example.json $out/lib/nunba/config.json
+    fi
+
+    # BUILD_INFO.txt: the SAME keys the Windows nightly ships beside Nunba.exe
+    # (since Nunba 99af812), so a node can say which Nunba it runs and which
+    # HARTOS it was shipped inside, and two installs can be diffed by one file.
+    # Measured gap 2026-10-05: the owner's PC answered BUILD_SHA/HARTOS_SHA from
+    # C:\\Program Files (x86)\\HevolveAI\\Nunba\\BUILD_INFO.txt in one read; the HART OS
+    # node (generation 13) had no such file under /nix/store/*-nunba-1.0.0/lib/nunba
+    # and its Nunba rev could only be recovered from this .nix. BUILD_SHA is the
+    # full Nunba sha; HARTOS_SHA is the short rev (what /etc/hart/image-rev holds);
+    # BUILD_TIME is not available in a reproducible Nix build and says so.
+    cat > $out/lib/nunba/BUILD_INFO.txt <<EOF
+BUILD_SHA=${nunbaRev}
+HARTOS_SHA=${hartRev}
+BUILD_TIME=reproducible-nix-build
+BUILD_PLATFORM=nixos
+EOF
 
     runHook postInstall
   '';

@@ -1,0 +1,3071 @@
+{
+ "generated_by": "scripts/gen_mobile_contract.py",
+ "calls": [
+  {
+   "method": "GET",
+   "path": "/",
+   "base": "mailer _apiBase /api/goals",
+   "client": "js goalsGet",
+   "caller": "services/socialApi.js:687"
+  },
+  {
+   "method": "GET",
+   "path": "/",
+   "base": "mailer _apiBase /api/goals",
+   "client": "js goalsGet",
+   "caller": "services/socialApi.js:967"
+  },
+  {
+   "method": "POST",
+   "path": "/",
+   "base": "mailer _apiBase /api/goals",
+   "client": "js goalsPost",
+   "caller": "services/socialApi.js:689"
+  },
+  {
+   "method": "POST",
+   "path": "/",
+   "base": "mailer _apiBase /api/goals",
+   "client": "js goalsPost",
+   "caller": "services/socialApi.js:954"
+  },
+  {
+   "method": "POST",
+   "path": "/Comment",
+   "base": "https://mailer.hertzai.com",
+   "client": "js fetch",
+   "caller": "components/CommunityView/components/Post/components/Footer/CommentsList.js:247"
+  },
+  {
+   "method": "POST",
+   "path": "/Comment",
+   "base": "https://mailer.hertzai.com",
+   "client": "js fetch",
+   "caller": "components/CommunityView/components/Post/components/Footer/CommentsList.js:273"
+  },
+  {
+   "method": "POST",
+   "path": "/Like",
+   "base": "https://mailer.hertzai.com",
+   "client": "js fetch",
+   "caller": "components/CommunityView/components/Post/components/Footer/CommentsList.js:95"
+  },
+  {
+   "method": "GET",
+   "path": "/achievements",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:456"
+  },
+  {
+   "method": "GET",
+   "path": "/achievements/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:457"
+  },
+  {
+   "method": "POST",
+   "path": "/achievements/{param}/showcase",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:459"
+  },
+  {
+   "method": "POST",
+   "path": "/agent-grants",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:1086"
+  },
+  {
+   "method": "DELETE",
+   "path": "/agent-grants/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js del",
+   "caller": "services/socialApi.js:1087"
+  },
+  {
+   "method": "GET",
+   "path": "/agents/leaderboard",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:503"
+  },
+  {
+   "method": "GET",
+   "path": "/agents/showcase",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:508"
+  },
+  {
+   "method": "GET",
+   "path": "/agents/specialization-trees",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:504"
+  },
+  {
+   "method": "POST",
+   "path": "/agents/{param}/collaborate",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:507"
+  },
+  {
+   "method": "GET",
+   "path": "/agents/{param}/collaborations",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:506"
+  },
+  {
+   "method": "GET",
+   "path": "/agents/{param}/evolution",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:501"
+  },
+  {
+   "method": "GET",
+   "path": "/agents/{param}/evolution-history",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:509"
+  },
+  {
+   "method": "POST",
+   "path": "/agents/{param}/specialize",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:502"
+  },
+  {
+   "method": "GET",
+   "path": "/allgoals2",
+   "base": "https://azurekong.hertzai.com/db/",
+   "client": "retrofit TopicApi.getgoalbyuserid",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/TopicApi.java:41"
+  },
+  {
+   "method": "POST",
+   "path": "/analyze",
+   "base": "mailer _apiBase /api/v1/intelligence",
+   "client": "js intelPost",
+   "caller": "services/socialApi.js:727"
+  },
+  {
+   "method": "POST",
+   "path": "/api/agent/approval",
+   "base": "resolved desktop (HartosBaseUrlResolver)",
+   "client": "raw",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/AbstractChatActivity.java:2055"
+  },
+  {
+   "method": "POST",
+   "path": "/api/kids/recommendations",
+   "base": "resolved base (endpointResolver)",
+   "client": "js post",
+   "caller": "services/kidsLearningApi.js:34"
+  },
+  {
+   "method": "POST",
+   "path": "/api/social/auth/link-hevolve",
+   "base": "resolved base (endpointResolver / module base)",
+   "client": "js fetch",
+   "caller": "services/socialAuth.js:24"
+  },
+  {
+   "method": "GET",
+   "path": "/api/social/sync",
+   "base": "resolved desktop (HartosBaseUrlResolver)",
+   "client": "raw",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/sync/HartChatSyncManager.java:208"
+  },
+  {
+   "method": "POST",
+   "path": "/api/social/tts/quick",
+   "base": "resolved base (endpointResolver)",
+   "client": "js post",
+   "caller": "services/kidsMediaApi.js:95"
+  },
+  {
+   "method": "GET",
+   "path": "/api/social/tts/status/{param}",
+   "base": "resolved base (endpointResolver)",
+   "client": "js get",
+   "caller": "services/kidsMediaApi.js:86"
+  },
+  {
+   "method": "POST",
+   "path": "/api/social/tts/submit",
+   "base": "resolved base (endpointResolver)",
+   "client": "js post",
+   "caller": "services/kidsMediaApi.js:80"
+  },
+  {
+   "method": "POST",
+   "path": "/api/tts/pocket-tts/synthesize",
+   "base": "resolved base (endpointResolver / module base)",
+   "client": "js fetch",
+   "caller": "services/PocketTTSService.js:35"
+  },
+  {
+   "method": "GET",
+   "path": "/api/tts/pocket-tts/voices",
+   "base": "resolved base (endpointResolver / module base)",
+   "client": "js fetch",
+   "caller": "services/PocketTTSService.js:69"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/stt",
+   "base": "resolved base (endpointResolver / module base)",
+   "client": "js fetch",
+   "caller": "hooks/useSpeechRecognition.js:57"
+  },
+  {
+   "method": "GET",
+   "path": "/api/vault/has",
+   "base": "resolved base (endpointResolver / module base)",
+   "client": "js fetch",
+   "caller": "services/vaultApi.js:37"
+  },
+  {
+   "method": "GET",
+   "path": "/api/vault/keys",
+   "base": "resolved base (endpointResolver / module base)",
+   "client": "js fetch",
+   "caller": "services/vaultApi.js:23"
+  },
+  {
+   "method": "POST",
+   "path": "/api/vault/store",
+   "base": "resolved base (endpointResolver / module base)",
+   "client": "js fetch",
+   "caller": "services/vaultApi.js:11"
+  },
+  {
+   "method": "GET",
+   "path": "/api/vision/health",
+   "base": "resolved base (endpointResolver / module base)",
+   "client": "js fetch",
+   "caller": "services/visionApi.js:18"
+  },
+  {
+   "method": "POST",
+   "path": "/api/voice/transcribe",
+   "base": "resolved desktop (HartosBaseUrlResolver)",
+   "client": "raw",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/service/DesktopTranscriber.java:100"
+  },
+  {
+   "method": "GET",
+   "path": "/auth/me",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:638"
+  },
+  {
+   "method": "GET",
+   "path": "/backend/health",
+   "base": "resolved base (endpointResolver)",
+   "client": "js get",
+   "caller": "services/chatApi.js:89"
+  },
+  {
+   "method": "POST",
+   "path": "/book_parsing/book_parsing_upload_api",
+   "base": "https://azurekong.hertzai.com/",
+   "client": "retrofit ChatAttachImageUploadApi.getUrl_fileUpload",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/ChatAttachImageUploadApi.java:21"
+  },
+  {
+   "method": "POST",
+   "path": "/book_parsing/book_parsing_upload_api",
+   "base": "https://azurekong.hertzai.com/",
+   "client": "retrofit ChatAttachImageUploadApi.getUrl_fileUpload",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/ChatAttachImageUploadApi.java:24"
+  },
+  {
+   "method": "POST",
+   "path": "/calls",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:1069"
+  },
+  {
+   "method": "GET",
+   "path": "/calls/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:1070"
+  },
+  {
+   "method": "POST",
+   "path": "/calls/{param}/agents",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:1079"
+  },
+  {
+   "method": "POST",
+   "path": "/calls/{param}/end",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:1074"
+  },
+  {
+   "method": "POST",
+   "path": "/calls/{param}/join",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:1072"
+  },
+  {
+   "method": "POST",
+   "path": "/calls/{param}/leave",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:1073"
+  },
+  {
+   "method": "GET",
+   "path": "/calls/{param}/participants",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:1076"
+  },
+  {
+   "method": "POST",
+   "path": "/calls/{param}/token",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:1071"
+  },
+  {
+   "method": "GET",
+   "path": "/campaigns",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:531"
+  },
+  {
+   "method": "POST",
+   "path": "/campaigns",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:533"
+  },
+  {
+   "method": "GET",
+   "path": "/campaigns/leaderboard",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:538"
+  },
+  {
+   "method": "DELETE",
+   "path": "/campaigns/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js del",
+   "caller": "services/socialApi.js:535"
+  },
+  {
+   "method": "GET",
+   "path": "/campaigns/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:532"
+  },
+  {
+   "method": "PATCH",
+   "path": "/campaigns/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js patch",
+   "caller": "services/socialApi.js:534"
+  },
+  {
+   "method": "POST",
+   "path": "/campaigns/{param}/execute-step",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:537"
+  },
+  {
+   "method": "POST",
+   "path": "/campaigns/{param}/generate-strategy",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:536"
+  },
+  {
+   "method": "GET",
+   "path": "/challenges",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:464"
+  },
+  {
+   "method": "GET",
+   "path": "/challenges/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:465"
+  },
+  {
+   "method": "POST",
+   "path": "/challenges/{param}/claim",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:467"
+  },
+  {
+   "method": "POST",
+   "path": "/challenges/{param}/progress",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:466"
+  },
+  {
+   "method": "GET",
+   "path": "/channels/bindings",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:883"
+  },
+  {
+   "method": "POST",
+   "path": "/channels/bindings",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:884"
+  },
+  {
+   "method": "DELETE",
+   "path": "/channels/bindings/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js del",
+   "caller": "services/socialApi.js:885"
+  },
+  {
+   "method": "PATCH",
+   "path": "/channels/bindings/{param}/preferred",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js patch",
+   "caller": "services/socialApi.js:886"
+  },
+  {
+   "method": "GET",
+   "path": "/channels/catalog",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:882"
+  },
+  {
+   "method": "GET",
+   "path": "/channels/conversations",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:899"
+  },
+  {
+   "method": "POST",
+   "path": "/channels/notify",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:903"
+  },
+  {
+   "method": "POST",
+   "path": "/channels/oauth/start",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:896"
+  },
+  {
+   "method": "POST",
+   "path": "/channels/pair/generate",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:887"
+  },
+  {
+   "method": "POST",
+   "path": "/channels/pair/verify",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:888"
+  },
+  {
+   "method": "GET",
+   "path": "/channels/presence",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:897"
+  },
+  {
+   "method": "POST",
+   "path": "/channels/send",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:901"
+  },
+  {
+   "method": "POST",
+   "path": "/channels/typing",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:905"
+  },
+  {
+   "method": "POST",
+   "path": "/chat",
+   "base": "resolved base (endpointResolver)",
+   "client": "js post",
+   "caller": "services/chatApi.js:75"
+  },
+  {
+   "method": "POST",
+   "path": "/chat",
+   "base": "mailer _apiBase /api/v1/intelligence",
+   "client": "js intelPost",
+   "caller": "services/socialApi.js:726"
+  },
+  {
+   "method": "POST",
+   "path": "/chat/assessments",
+   "base": "user_retrofit(resolved: local > LAN > cloud)",
+   "client": "retrofit AssessChatApi.getReply",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/AssessChatApi.java:15"
+  },
+  {
+   "method": "POST",
+   "path": "/chat/assessments",
+   "base": "resolved base (endpointResolver)",
+   "client": "js post",
+   "caller": "services/kidsLearningApi.js:48"
+  },
+  {
+   "method": "POST",
+   "path": "/chat/custom_gpt",
+   "base": "user_retrofit(resolved: local > LAN > cloud)",
+   "client": "retrofit CustomChatBotAPI.getReply",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/CustomChatBotAPI.java:14"
+  },
+  {
+   "method": "POST",
+   "path": "/chat/custom_gpt",
+   "base": "resolved base (endpointResolver)",
+   "client": "js post",
+   "caller": "services/chatApi.js:81"
+  },
+  {
+   "method": "POST",
+   "path": "/chat/custom_gpt",
+   "base": "resolved base (endpointResolver)",
+   "client": "js post",
+   "caller": "services/kidsLearningApi.js:131"
+  },
+  {
+   "method": "POST",
+   "path": "/chat/custom_gpt",
+   "base": "resolved base (endpointResolver)",
+   "client": "js post",
+   "caller": "services/kidsLearningApi.js:155"
+  },
+  {
+   "method": "POST",
+   "path": "/chat/custom_gpt",
+   "base": "resolved base (endpointResolver)",
+   "client": "js post",
+   "caller": "services/kidsLearningApi.js:183"
+  },
+  {
+   "method": "POST",
+   "path": "/chat/custom_gpt",
+   "base": "resolved base (endpointResolver)",
+   "client": "js post",
+   "caller": "services/kidsLearningApi.js:59"
+  },
+  {
+   "method": "POST",
+   "path": "/chat/custom_gpt",
+   "base": "resolved base (endpointResolver)",
+   "client": "js post",
+   "caller": "services/kidsLearningApi.js:98"
+  },
+  {
+   "method": "POST",
+   "path": "/chat/revision",
+   "base": "user_retrofit(resolved: local > LAN > cloud)",
+   "client": "retrofit RevisionChatApi.getReply",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/RevisionChatApi.java:14"
+  },
+  {
+   "method": "POST",
+   "path": "/chat/revision",
+   "base": "resolved desktop (HartosBaseUrlResolver)",
+   "client": "raw",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/service/WearDataSyncService.java:430"
+  },
+  {
+   "method": "POST",
+   "path": "/chat/teachme2",
+   "base": "user_retrofit(resolved: local > LAN > cloud)",
+   "client": "retrofit TeachYourselfChatApi.getReply",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/TeachYourselfChatApi.java:16"
+  },
+  {
+   "method": "GET",
+   "path": "/comment_bypost",
+   "base": "https://mailer.hertzai.com",
+   "client": "js fetch",
+   "caller": "components/CommunityView/components/Post/components/Footer/CommentsList.js:219"
+  },
+  {
+   "method": "GET",
+   "path": "/comment_like",
+   "base": "https://mailer.hertzai.com",
+   "client": "js fetch",
+   "caller": "components/CommunityView/components/Post/components/Footer/CommentsList.js:51"
+  },
+  {
+   "method": "DELETE",
+   "path": "/comments/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js del",
+   "caller": "services/socialApi.js:569"
+  },
+  {
+   "method": "PATCH",
+   "path": "/comments/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js patch",
+   "caller": "services/socialApi.js:568"
+  },
+  {
+   "method": "POST",
+   "path": "/comments/{param}/downvote",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:571"
+  },
+  {
+   "method": "GET",
+   "path": "/comments/{param}/reactions",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:1142"
+  },
+  {
+   "method": "POST",
+   "path": "/comments/{param}/reactions",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:1144"
+  },
+  {
+   "method": "DELETE",
+   "path": "/comments/{param}/reactions/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js del",
+   "caller": "services/socialApi.js:1146"
+  },
+  {
+   "method": "POST",
+   "path": "/comments/{param}/reply",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:567"
+  },
+  {
+   "method": "POST",
+   "path": "/comments/{param}/upvote",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:570"
+  },
+  {
+   "method": "GET",
+   "path": "/communities",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:609"
+  },
+  {
+   "method": "POST",
+   "path": "/communities",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:610"
+  },
+  {
+   "method": "GET",
+   "path": "/communities/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:611"
+  },
+  {
+   "method": "POST",
+   "path": "/communities/{param}/join",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:613"
+  },
+  {
+   "method": "POST",
+   "path": "/communities/{param}/leave",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:614"
+  },
+  {
+   "method": "GET",
+   "path": "/communities/{param}/members",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:615"
+  },
+  {
+   "method": "GET",
+   "path": "/communities/{param}/posts",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:612"
+  },
+  {
+   "method": "GET",
+   "path": "/compute/community-impact",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:925"
+  },
+  {
+   "method": "POST",
+   "path": "/compute/health-check",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:926"
+  },
+  {
+   "method": "GET",
+   "path": "/compute/impact",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:924"
+  },
+  {
+   "method": "POST",
+   "path": "/compute/opt-in",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:921"
+  },
+  {
+   "method": "POST",
+   "path": "/compute/opt-out",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:922"
+  },
+  {
+   "method": "GET",
+   "path": "/compute/status",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:923"
+  },
+  {
+   "method": "GET",
+   "path": "/consent",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:436"
+  },
+  {
+   "method": "POST",
+   "path": "/consent",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:418"
+  },
+  {
+   "method": "POST",
+   "path": "/consent/revoke",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:428"
+  },
+  {
+   "method": "GET",
+   "path": "/conversations",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:1103"
+  },
+  {
+   "method": "POST",
+   "path": "/conversations",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:1106"
+  },
+  {
+   "method": "GET",
+   "path": "/conversations/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:1107"
+  },
+  {
+   "method": "POST",
+   "path": "/conversations/{param}/members",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:1119"
+  },
+  {
+   "method": "DELETE",
+   "path": "/conversations/{param}/members/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js del",
+   "caller": "services/socialApi.js:1121"
+  },
+  {
+   "method": "GET",
+   "path": "/conversations/{param}/messages",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:1109"
+  },
+  {
+   "method": "POST",
+   "path": "/conversations/{param}/messages",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:1112"
+  },
+  {
+   "method": "DELETE",
+   "path": "/conversations/{param}/messages/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js del",
+   "caller": "services/socialApi.js:1117"
+  },
+  {
+   "method": "PATCH",
+   "path": "/conversations/{param}/messages/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js patch",
+   "caller": "services/socialApi.js:1115"
+  },
+  {
+   "method": "POST",
+   "path": "/conversations/{param}/read-receipt",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:1126"
+  },
+  {
+   "method": "POST",
+   "path": "/conversations/{param}/typing",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:1124"
+  },
+  {
+   "method": "POST",
+   "path": "/create_activity",
+   "base": "https://mailer.hertzai.com",
+   "client": "js fetch",
+   "caller": "components/CommunityView/components/Post/components/Footer/CommentsList.js:79"
+  },
+  {
+   "method": "POST",
+   "path": "/create_prompt",
+   "base": "https://azurekong.hertzai.com/db/",
+   "client": "retrofit GetPromptListApi.create_bot",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/GetPromptListApi.java:21"
+  },
+  {
+   "method": "POST",
+   "path": "/createclient",
+   "base": "mailer _apiBase",
+   "client": "js _mailerPost",
+   "caller": "services/socialApi.js:1254"
+  },
+  {
+   "method": "GET",
+   "path": "/dashboard/agents",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:643"
+  },
+  {
+   "method": "GET",
+   "path": "/dashboard/finance/health",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:787"
+  },
+  {
+   "method": "GET",
+   "path": "/dashboard/finance/invite-participation",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:791"
+  },
+  {
+   "method": "GET",
+   "path": "/dashboard/finance/revenue-split",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:788"
+  },
+  {
+   "method": "GET",
+   "path": "/dashboard/finance/sustainability",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:789"
+  },
+  {
+   "method": "GET",
+   "path": "/dashboard/health",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:644"
+  },
+  {
+   "method": "GET",
+   "path": "/defensive-publications",
+   "base": "mailer _apiBase /api/ip",
+   "client": "js ipGet",
+   "caller": "services/socialApi.js:779"
+  },
+  {
+   "method": "POST",
+   "path": "/defensive-publications",
+   "base": "mailer _apiBase /api/ip",
+   "client": "js ipPost",
+   "caller": "services/socialApi.js:780"
+  },
+  {
+   "method": "DELETE",
+   "path": "/delete_comment",
+   "base": "https://mailer.hertzai.com",
+   "client": "js fetch",
+   "caller": "components/CommunityView/components/Post/components/Footer/CommentsList.js:312"
+  },
+  {
+   "method": "POST",
+   "path": "/delete_comment",
+   "base": "https://azurekong.hertzai.com/db/",
+   "client": "retrofit DeleteReportPostAPI.delete_comment",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/DeleteReportPostAPI.java:15"
+  },
+  {
+   "method": "POST",
+   "path": "/delete_post/{postid}",
+   "base": "https://azurekong.hertzai.com/db/",
+   "client": "retrofit DeleteReportPostAPI.deleteandreport",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/DeleteReportPostAPI.java:13"
+  },
+  {
+   "method": "GET",
+   "path": "/devices",
+   "base": "resolved base (endpointResolver / module base)",
+   "client": "js fetch",
+   "caller": "services/deviceApi.js:35"
+  },
+  {
+   "method": "GET",
+   "path": "/download/{param}",
+   "base": "mailer _apiBase /api/v1/builds",
+   "client": "js buildsGet",
+   "caller": "services/socialApi.js:756"
+  },
+  {
+   "method": "GET",
+   "path": "/encounter/discoverable",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:331"
+  },
+  {
+   "method": "POST",
+   "path": "/encounter/discoverable",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:354"
+  },
+  {
+   "method": "POST",
+   "path": "/encounter/icebreaker/approve",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:392"
+  },
+  {
+   "method": "POST",
+   "path": "/encounter/icebreaker/decline",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:394"
+  },
+  {
+   "method": "POST",
+   "path": "/encounter/icebreaker/draft",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:388"
+  },
+  {
+   "method": "GET",
+   "path": "/encounter/map-pins",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:384"
+  },
+  {
+   "method": "GET",
+   "path": "/encounter/matches",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:381"
+  },
+  {
+   "method": "GET",
+   "path": "/encounter/persona",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:359"
+  },
+  {
+   "method": "PUT",
+   "path": "/encounter/persona",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js put",
+   "caller": "services/socialApi.js:360"
+  },
+  {
+   "method": "POST",
+   "path": "/encounter/register-pubkey",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:364"
+  },
+  {
+   "method": "POST",
+   "path": "/encounter/sighting",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:368"
+  },
+  {
+   "method": "POST",
+   "path": "/encounter/swipe",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:378"
+  },
+  {
+   "method": "GET",
+   "path": "/encounter/topics",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:399"
+  },
+  {
+   "method": "POST",
+   "path": "/encounters/location-ping",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:271"
+  },
+  {
+   "method": "GET",
+   "path": "/encounters/location-settings",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:280"
+  },
+  {
+   "method": "PATCH",
+   "path": "/encounters/location-settings",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js patch",
+   "caller": "services/socialApi.js:283"
+  },
+  {
+   "method": "GET",
+   "path": "/encounters/missed-connections",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:296"
+  },
+  {
+   "method": "POST",
+   "path": "/encounters/missed-connections",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:294"
+  },
+  {
+   "method": "GET",
+   "path": "/encounters/missed-connections/mine",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:298"
+  },
+  {
+   "method": "GET",
+   "path": "/encounters/missed-connections/suggest-locations",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:311"
+  },
+  {
+   "method": "DELETE",
+   "path": "/encounters/missed-connections/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js del",
+   "caller": "services/socialApi.js:308"
+  },
+  {
+   "method": "GET",
+   "path": "/encounters/missed-connections/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:300"
+  },
+  {
+   "method": "POST",
+   "path": "/encounters/missed-connections/{param}/accept/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:306"
+  },
+  {
+   "method": "POST",
+   "path": "/encounters/missed-connections/{param}/respond",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:303"
+  },
+  {
+   "method": "GET",
+   "path": "/encounters/nearby-now",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:273"
+  },
+  {
+   "method": "GET",
+   "path": "/encounters/proximity-matches",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:275"
+  },
+  {
+   "method": "POST",
+   "path": "/encounters/proximity/{param}/reveal",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:278"
+  },
+  {
+   "method": "GET",
+   "path": "/encounters/suggestions",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:290"
+  },
+  {
+   "method": "POST",
+   "path": "/encounters/{param}/acknowledge",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:292"
+  },
+  {
+   "method": "GET",
+   "path": "/experiments",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:797"
+  },
+  {
+   "method": "POST",
+   "path": "/experiments",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:799"
+  },
+  {
+   "method": "GET",
+   "path": "/experiments/discover",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:796"
+  },
+  {
+   "method": "GET",
+   "path": "/experiments/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:798"
+  },
+  {
+   "method": "POST",
+   "path": "/experiments/{param}/contribute",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:802"
+  },
+  {
+   "method": "GET",
+   "path": "/experiments/{param}/metrics",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:801"
+  },
+  {
+   "method": "GET",
+   "path": "/experiments/{param}/timeline",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:803"
+  },
+  {
+   "method": "POST",
+   "path": "/experiments/{param}/vote",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:800"
+  },
+  {
+   "method": "GET",
+   "path": "/experiments/{param}/votes",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:804"
+  },
+  {
+   "method": "POST",
+   "path": "/federation/boost/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:945"
+  },
+  {
+   "method": "GET",
+   "path": "/federation/feed",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:942"
+  },
+  {
+   "method": "POST",
+   "path": "/federation/follow",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:933"
+  },
+  {
+   "method": "GET",
+   "path": "/federation/followers",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:940"
+  },
+  {
+   "method": "GET",
+   "path": "/federation/following",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:938"
+  },
+  {
+   "method": "GET",
+   "path": "/federation/peers",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:947"
+  },
+  {
+   "method": "POST",
+   "path": "/federation/unfollow",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:936"
+  },
+  {
+   "method": "GET",
+   "path": "/feed",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:576"
+  },
+  {
+   "method": "GET",
+   "path": "/feed/agents",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:579"
+  },
+  {
+   "method": "GET",
+   "path": "/feed/all",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:577"
+  },
+  {
+   "method": "GET",
+   "path": "/feed/trending",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:578"
+  },
+  {
+   "method": "GET",
+   "path": "/fleet-commands",
+   "base": "resolved base (endpointResolver / module base)",
+   "client": "js fetch",
+   "caller": "services/deviceApi.js:70"
+  },
+  {
+   "method": "POST",
+   "path": "/fleet-commands/ack",
+   "base": "resolved base (endpointResolver / module base)",
+   "client": "js fetch",
+   "caller": "services/deviceApi.js:50"
+  },
+  {
+   "method": "GET",
+   "path": "/friends",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:1039"
+  },
+  {
+   "method": "GET",
+   "path": "/friends",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:1040"
+  },
+  {
+   "method": "GET",
+   "path": "/friends/blocks",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:1041"
+  },
+  {
+   "method": "POST",
+   "path": "/friends/request",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:1029"
+  },
+  {
+   "method": "POST",
+   "path": "/friends/request/{param}/accept",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:1031"
+  },
+  {
+   "method": "POST",
+   "path": "/friends/request/{param}/cancel",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:1035"
+  },
+  {
+   "method": "POST",
+   "path": "/friends/request/{param}/reject",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:1033"
+  },
+  {
+   "method": "POST",
+   "path": "/friends/{param}/block",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:1043"
+  },
+  {
+   "method": "POST",
+   "path": "/friends/{param}/unblock",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:1044"
+  },
+  {
+   "method": "POST",
+   "path": "/friends/{param}/unfriend",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:1037"
+  },
+  {
+   "method": "GET",
+   "path": "/games",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:811"
+  },
+  {
+   "method": "POST",
+   "path": "/games",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:810"
+  },
+  {
+   "method": "GET",
+   "path": "/games/catalog",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:809"
+  },
+  {
+   "method": "POST",
+   "path": "/games/from-encounter/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:834"
+  },
+  {
+   "method": "GET",
+   "path": "/games/history",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:831"
+  },
+  {
+   "method": "POST",
+   "path": "/games/quick-match",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:832"
+  },
+  {
+   "method": "GET",
+   "path": "/games/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:812"
+  },
+  {
+   "method": "POST",
+   "path": "/games/{param}/ai_move",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:825"
+  },
+  {
+   "method": "POST",
+   "path": "/games/{param}/join",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:813"
+  },
+  {
+   "method": "POST",
+   "path": "/games/{param}/leave",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:829"
+  },
+  {
+   "method": "POST",
+   "path": "/games/{param}/move",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:816"
+  },
+  {
+   "method": "POST",
+   "path": "/games/{param}/ready",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:814"
+  },
+  {
+   "method": "GET",
+   "path": "/games/{param}/results",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:830"
+  },
+  {
+   "method": "POST",
+   "path": "/games/{param}/start",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:815"
+  },
+  {
+   "method": "POST",
+   "path": "/generate",
+   "base": "mailer _apiBase /api/v1/intelligence",
+   "client": "js intelPost",
+   "caller": "services/socialApi.js:728"
+  },
+  {
+   "method": "POST",
+   "path": "/get-posts",
+   "base": "https://azurekong.hertzai.com/db/",
+   "client": "retrofit GetAllPostsAPI.getUrl",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/GetAllPostsAPI.java:12"
+  },
+  {
+   "method": "GET",
+   "path": "/get_all_cartoonimages",
+   "base": "https://azurekong.hertzai.com/data/",
+   "client": "retrofit SignLoginApi.getTeacher",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/SignLoginApi.java:40"
+  },
+  {
+   "method": "GET",
+   "path": "/get_all_cartoonimages",
+   "base": "https://azurekong.hertzai.com/db/",
+   "client": "retrofit SignLoginApi.getTeacher",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/SignLoginApi.java:40"
+  },
+  {
+   "method": "GET",
+   "path": "/get_all_images/{user_id}",
+   "base": "https://azurekong.hertzai.com/db/",
+   "client": "retrofit VirtualTeacherApi.createVirtualTeacher",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/VirtualTeacherApi.java:19"
+  },
+  {
+   "method": "GET",
+   "path": "/get_subscriptions/{user_id}",
+   "base": "https://mailer.hertzai.com/",
+   "client": "retrofit SubscriptionService.getSubscription",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/SubscriptionService.java:12"
+  },
+  {
+   "method": "GET",
+   "path": "/getchapterbyuserid",
+   "base": "https://azurekong.hertzai.com/db/",
+   "client": "retrofit TopicApi.getchapterbyuserid",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/TopicApi.java:38"
+  },
+  {
+   "method": "GET",
+   "path": "/getcoursebyuserid",
+   "base": "https://azurekong.hertzai.com/db/",
+   "client": "retrofit TopicApi.getcoursebyuserid",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/TopicApi.java:32"
+  },
+  {
+   "method": "GET",
+   "path": "/getfilebyuserid",
+   "base": "https://azurekong.hertzai.com/db/",
+   "client": "retrofit TopicApi.getfilebyuserid",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/TopicApi.java:35"
+  },
+  {
+   "method": "GET",
+   "path": "/getplandetails_userid",
+   "base": "https://mailer.hertzai.com/",
+   "client": "retrofit SubscriptionService.getPlanDetails",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/SubscriptionService.java:16"
+  },
+  {
+   "method": "GET",
+   "path": "/getprompt_userid/",
+   "base": "https://mailer.hertzai.com/",
+   "client": "retrofit GetPromptListApi.getCustomChats",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/GetPromptListApi.java:18"
+  },
+  {
+   "method": "GET",
+   "path": "/getprompt_userid/",
+   "base": "resolved base (endpointResolver)",
+   "client": "js get",
+   "caller": "services/chatApi.js:87"
+  },
+  {
+   "method": "GET",
+   "path": "/getstandard_category",
+   "base": "https://azurekong.hertzai.com/data/",
+   "client": "retrofit SignLoginApi.getstandard_category",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/SignLoginApi.java:58"
+  },
+  {
+   "method": "GET",
+   "path": "/getstandard_category",
+   "base": "https://azurekong.hertzai.com/db/",
+   "client": "retrofit SignLoginApi.getstandard_category",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/SignLoginApi.java:58"
+  },
+  {
+   "method": "POST",
+   "path": "/getstudent_by_user_id",
+   "base": "https://azurekong.hertzai.com/db/",
+   "client": "retrofit GetFavouriteTeacherApi.getFavouriteTeacher",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/GetFavouriteTeacherApi.java:12"
+  },
+  {
+   "method": "POST",
+   "path": "/getstudent_by_user_id",
+   "base": "https://azurekong.hertzai.com/data/",
+   "client": "retrofit SignLoginApi.getstudent_by_user_id",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/SignLoginApi.java:55"
+  },
+  {
+   "method": "POST",
+   "path": "/getstudent_by_user_id",
+   "base": "https://azurekong.hertzai.com/db/",
+   "client": "retrofit SignLoginApi.getstudent_by_user_id",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/SignLoginApi.java:55"
+  },
+  {
+   "method": "GET",
+   "path": "/getsubscription_by_id/{user_id}",
+   "base": "https://azurekong.hertzai.com/data/",
+   "client": "retrofit SignLoginApi.getsubscription_by_id",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/SignLoginApi.java:52"
+  },
+  {
+   "method": "GET",
+   "path": "/getsubscription_by_id/{user_id}",
+   "base": "https://azurekong.hertzai.com/db/",
+   "client": "retrofit SignLoginApi.getsubscription_by_id",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/SignLoginApi.java:52"
+  },
+  {
+   "method": "GET",
+   "path": "/gettopicbyuserid",
+   "base": "https://azurekong.hertzai.com/db/",
+   "client": "retrofit TopicApi.gettopicbyuserid",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/TopicApi.java:29"
+  },
+  {
+   "method": "GET",
+   "path": "/goals",
+   "base": "mailer _apiBase /api/coding",
+   "client": "js codingGet",
+   "caller": "services/socialApi.js:661"
+  },
+  {
+   "method": "POST",
+   "path": "/goals",
+   "base": "mailer _apiBase /api/coding",
+   "client": "js codingPost",
+   "caller": "services/socialApi.js:663"
+  },
+  {
+   "method": "GET",
+   "path": "/goals/{param}",
+   "base": "mailer _apiBase /api/coding",
+   "client": "js codingGet",
+   "caller": "services/socialApi.js:662"
+  },
+  {
+   "method": "GET",
+   "path": "/hivemind",
+   "base": "mailer _apiBase /api/v1/intelligence",
+   "client": "js intelGet",
+   "caller": "services/socialApi.js:729"
+  },
+  {
+   "method": "GET",
+   "path": "/idle-stats",
+   "base": "mailer _apiBase /api/coding",
+   "client": "js codingGet",
+   "caller": "services/socialApi.js:666"
+  },
+  {
+   "method": "POST",
+   "path": "/invites",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:1200"
+  },
+  {
+   "method": "GET",
+   "path": "/invites/code/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:1209"
+  },
+  {
+   "method": "GET",
+   "path": "/invites/incoming",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:1207"
+  },
+  {
+   "method": "POST",
+   "path": "/invites/{param}/accept",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:1204"
+  },
+  {
+   "method": "POST",
+   "path": "/invites/{param}/reject",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:1205"
+  },
+  {
+   "method": "GET",
+   "path": "/keys",
+   "base": "mailer _apiBase /api/v1/intelligence",
+   "client": "js intelGet",
+   "caller": "services/socialApi.js:733"
+  },
+  {
+   "method": "POST",
+   "path": "/keys",
+   "base": "mailer _apiBase /api/v1/intelligence",
+   "client": "js intelPost",
+   "caller": "services/socialApi.js:732"
+  },
+  {
+   "method": "DELETE",
+   "path": "/keys/{param}",
+   "base": "mailer _apiBase /api/v1/intelligence",
+   "client": "js intelDel",
+   "caller": "services/socialApi.js:734"
+  },
+  {
+   "method": "GET",
+   "path": "/licenses",
+   "base": "mailer _apiBase /api/v1/builds",
+   "client": "js buildsGet",
+   "caller": "services/socialApi.js:757"
+  },
+  {
+   "method": "POST",
+   "path": "/link-device",
+   "base": "resolved base (endpointResolver / module base)",
+   "client": "js fetch",
+   "caller": "services/deviceApi.js:13"
+  },
+  {
+   "method": "GET",
+   "path": "/list-of-topic",
+   "base": "https://azurekong.hertzai.com/db/",
+   "client": "retrofit TopicApi.getTopics",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/TopicApi.java:19"
+  },
+  {
+   "method": "GET",
+   "path": "/list-of-topic-userid",
+   "base": "https://azurekong.hertzai.com/db/",
+   "client": "retrofit TopicApi.getTopicsByUserId",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/TopicApi.java:23"
+  },
+  {
+   "method": "GET",
+   "path": "/list-of-topic-userid2",
+   "base": "https://azurekong.hertzai.com/db/",
+   "client": "retrofit TopicApi.getAllTopicsByUserId",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/TopicApi.java:26"
+  },
+  {
+   "method": "POST",
+   "path": "/login",
+   "base": "https://azurekong.hertzai.com/data/",
+   "client": "retrofit SignLoginApi.login",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/SignLoginApi.java:33"
+  },
+  {
+   "method": "POST",
+   "path": "/login",
+   "base": "https://azurekong.hertzai.com/db/",
+   "client": "retrofit SignLoginApi.login",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/SignLoginApi.java:33"
+  },
+  {
+   "method": "POST",
+   "path": "/makeit/add-post/",
+   "base": "https://azurekong.hertzai.com/",
+   "client": "retrofit AddPostApi.getUrl",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/AddPostApi.java:13"
+  },
+  {
+   "method": "GET",
+   "path": "/marketing/intents",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:1283"
+  },
+  {
+   "method": "GET",
+   "path": "/marketing/stats",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:1281"
+  },
+  {
+   "method": "GET",
+   "path": "/marketplace/categories",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:1299"
+  },
+  {
+   "method": "GET",
+   "path": "/marketplace/listings",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:1293"
+  },
+  {
+   "method": "POST",
+   "path": "/marketplace/listings",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:1295"
+  },
+  {
+   "method": "GET",
+   "path": "/marketplace/listings/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:1294"
+  },
+  {
+   "method": "POST",
+   "path": "/marketplace/listings/{param}/hire",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:1296"
+  },
+  {
+   "method": "GET",
+   "path": "/marketplace/listings/{param}/reviews",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:1297"
+  },
+  {
+   "method": "POST",
+   "path": "/marketplace/listings/{param}/reviews",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:1298"
+  },
+  {
+   "method": "GET",
+   "path": "/mcp/discover",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:1221"
+  },
+  {
+   "method": "POST",
+   "path": "/mcp/register",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:1220"
+  },
+  {
+   "method": "GET",
+   "path": "/mcp/servers",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:1218"
+  },
+  {
+   "method": "GET",
+   "path": "/mcp/servers/{param}/tools",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:1219"
+  },
+  {
+   "method": "GET",
+   "path": "/media/available/{param}",
+   "base": "resolved base (endpointResolver)",
+   "client": "js get",
+   "caller": "services/kidsMediaApi.js:200"
+  },
+  {
+   "method": "GET",
+   "path": "/media/jobs/active",
+   "base": "resolved base (endpointResolver)",
+   "client": "js get",
+   "caller": "services/kidsMediaApi.js:212"
+  },
+  {
+   "method": "POST",
+   "path": "/media/jobs/cancel",
+   "base": "resolved base (endpointResolver)",
+   "client": "js post",
+   "caller": "services/kidsMediaApi.js:207"
+  },
+  {
+   "method": "GET",
+   "path": "/media/music/status/{param}",
+   "base": "resolved base (endpointResolver)",
+   "client": "js get",
+   "caller": "services/kidsMediaApi.js:109"
+  },
+  {
+   "method": "POST",
+   "path": "/media/music/submit",
+   "base": "resolved base (endpointResolver)",
+   "client": "js post",
+   "caller": "services/kidsMediaApi.js:104"
+  },
+  {
+   "method": "GET",
+   "path": "/media/video/status/{param}",
+   "base": "resolved base (endpointResolver)",
+   "client": "js get",
+   "caller": "services/kidsMediaApi.js:188"
+  },
+  {
+   "method": "POST",
+   "path": "/media/video/submit",
+   "base": "resolved base (endpointResolver)",
+   "client": "js post",
+   "caller": "services/kidsMediaApi.js:183"
+  },
+  {
+   "method": "GET",
+   "path": "/mentions",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:1019"
+  },
+  {
+   "method": "POST",
+   "path": "/mentions/read",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:1020"
+  },
+  {
+   "method": "GET",
+   "path": "/messages/{param}/reactions",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:1148"
+  },
+  {
+   "method": "POST",
+   "path": "/messages/{param}/reactions",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:1150"
+  },
+  {
+   "method": "DELETE",
+   "path": "/messages/{param}/reactions/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js del",
+   "caller": "services/socialApi.js:1152"
+  },
+  {
+   "method": "GET",
+   "path": "/milestone",
+   "base": "mailer _apiBase /api/ip",
+   "client": "js ipGet",
+   "caller": "services/socialApi.js:782"
+  },
+  {
+   "method": "POST",
+   "path": "/mock_interview",
+   "base": "https://azurekong.hertzai.com/mock/",
+   "client": "retrofit ChatAttachImageUploadApi.getUrl",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/ChatAttachImageUploadApi.java:28"
+  },
+  {
+   "method": "GET",
+   "path": "/notifications",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:602"
+  },
+  {
+   "method": "POST",
+   "path": "/notifications/read",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:603"
+  },
+  {
+   "method": "POST",
+   "path": "/notifications/read-all",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:604"
+  },
+  {
+   "method": "POST",
+   "path": "/onboarding/complete-step",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:544"
+  },
+  {
+   "method": "POST",
+   "path": "/onboarding/dismiss",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:545"
+  },
+  {
+   "method": "GET",
+   "path": "/onboarding/progress",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:543"
+  },
+  {
+   "method": "GET",
+   "path": "/onboarding/suggestion",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:546"
+  },
+  {
+   "method": "POST",
+   "path": "/opt-in/{param}",
+   "base": "mailer _apiBase /api/coding",
+   "client": "js codingPost",
+   "caller": "services/socialApi.js:664"
+  },
+  {
+   "method": "POST",
+   "path": "/opt-out/{param}",
+   "base": "mailer _apiBase /api/coding",
+   "client": "js codingPost",
+   "caller": "services/socialApi.js:665"
+  },
+  {
+   "method": "GET",
+   "path": "/posts",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:551"
+  },
+  {
+   "method": "POST",
+   "path": "/posts",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:552"
+  },
+  {
+   "method": "DELETE",
+   "path": "/posts/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js del",
+   "caller": "services/socialApi.js:555"
+  },
+  {
+   "method": "GET",
+   "path": "/posts/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:553"
+  },
+  {
+   "method": "PATCH",
+   "path": "/posts/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js patch",
+   "caller": "services/socialApi.js:554"
+  },
+  {
+   "method": "GET",
+   "path": "/posts/{param}/comments",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:559"
+  },
+  {
+   "method": "GET",
+   "path": "/posts/{param}/comments",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:565"
+  },
+  {
+   "method": "POST",
+   "path": "/posts/{param}/comments",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:560"
+  },
+  {
+   "method": "POST",
+   "path": "/posts/{param}/comments",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:566"
+  },
+  {
+   "method": "POST",
+   "path": "/posts/{param}/downvote",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:557"
+  },
+  {
+   "method": "GET",
+   "path": "/posts/{param}/reactions",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:1136"
+  },
+  {
+   "method": "POST",
+   "path": "/posts/{param}/reactions",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:1138"
+  },
+  {
+   "method": "DELETE",
+   "path": "/posts/{param}/reactions/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js del",
+   "caller": "services/socialApi.js:1140"
+  },
+  {
+   "method": "POST",
+   "path": "/posts/{param}/upvote",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:556"
+  },
+  {
+   "method": "DELETE",
+   "path": "/posts/{param}/vote",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js del",
+   "caller": "services/socialApi.js:558"
+  },
+  {
+   "method": "GET",
+   "path": "/prompts",
+   "base": "resolved base (endpointResolver)",
+   "client": "js get",
+   "caller": "services/chatApi.js:78"
+  },
+  {
+   "method": "GET",
+   "path": "/provenance",
+   "base": "mailer _apiBase /api/ip",
+   "client": "js ipGet",
+   "caller": "services/socialApi.js:781"
+  },
+  {
+   "method": "GET",
+   "path": "/providers",
+   "base": "mailer _apiBase /api/admin",
+   "client": "js adminGet",
+   "caller": "services/socialApi.js:996"
+  },
+  {
+   "method": "GET",
+   "path": "/providers/efficiency/leaderboard",
+   "base": "mailer _apiBase /api/admin",
+   "client": "js adminGet",
+   "caller": "services/socialApi.js:997"
+  },
+  {
+   "method": "GET",
+   "path": "/providers/gateway/stats",
+   "base": "mailer _apiBase /api/admin",
+   "client": "js adminGet",
+   "caller": "services/socialApi.js:998"
+  },
+  {
+   "method": "POST",
+   "path": "/providers/{param}/api-key",
+   "base": "mailer _apiBase /api/admin",
+   "client": "js adminPost",
+   "caller": "services/socialApi.js:1004"
+  },
+  {
+   "method": "POST",
+   "path": "/providers/{param}/enable",
+   "base": "mailer _apiBase /api/admin",
+   "client": "js adminPost",
+   "caller": "services/socialApi.js:1002"
+  },
+  {
+   "method": "POST",
+   "path": "/providers/{param}/test",
+   "base": "mailer _apiBase /api/admin",
+   "client": "js adminPost",
+   "caller": "services/socialApi.js:1000"
+  },
+  {
+   "method": "POST",
+   "path": "/pupit/",
+   "base": "R.string.base_url",
+   "client": "retrofit Video_API.getUrl",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/Video_API.java:15"
+  },
+  {
+   "method": "POST",
+   "path": "/purchase",
+   "base": "mailer _apiBase /api/v1/builds",
+   "client": "js buildsPost",
+   "caller": "services/socialApi.js:755"
+  },
+  {
+   "method": "POST",
+   "path": "/ratings",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:514"
+  },
+  {
+   "method": "GET",
+   "path": "/ratings/context/{param}/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:518"
+  },
+  {
+   "method": "GET",
+   "path": "/ratings/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:515"
+  },
+  {
+   "method": "GET",
+   "path": "/ratings/{param}/given",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:517"
+  },
+  {
+   "method": "GET",
+   "path": "/ratings/{param}/received",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:516"
+  },
+  {
+   "method": "GET",
+   "path": "/recipes",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:630"
+  },
+  {
+   "method": "POST",
+   "path": "/recipes/share",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:632"
+  },
+  {
+   "method": "GET",
+   "path": "/recipes/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:631"
+  },
+  {
+   "method": "POST",
+   "path": "/recipes/{param}/fork",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:633"
+  },
+  {
+   "method": "GET",
+   "path": "/referral/code",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:524"
+  },
+  {
+   "method": "GET",
+   "path": "/referral/stats",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:526"
+  },
+  {
+   "method": "POST",
+   "path": "/referral/use",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:525"
+  },
+  {
+   "method": "GET",
+   "path": "/regions",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:484"
+  },
+  {
+   "method": "POST",
+   "path": "/regions",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:486"
+  },
+  {
+   "method": "GET",
+   "path": "/regions/nearby",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:496"
+  },
+  {
+   "method": "GET",
+   "path": "/regions/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:485"
+  },
+  {
+   "method": "PATCH",
+   "path": "/regions/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js patch",
+   "caller": "services/socialApi.js:487"
+  },
+  {
+   "method": "POST",
+   "path": "/regions/{param}/demote",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:495"
+  },
+  {
+   "method": "GET",
+   "path": "/regions/{param}/feed",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:491"
+  },
+  {
+   "method": "GET",
+   "path": "/regions/{param}/governance",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:493"
+  },
+  {
+   "method": "POST",
+   "path": "/regions/{param}/join",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:488"
+  },
+  {
+   "method": "GET",
+   "path": "/regions/{param}/leaderboard",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:492"
+  },
+  {
+   "method": "DELETE",
+   "path": "/regions/{param}/leave",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js del",
+   "caller": "services/socialApi.js:489"
+  },
+  {
+   "method": "GET",
+   "path": "/regions/{param}/members",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:490"
+  },
+  {
+   "method": "POST",
+   "path": "/regions/{param}/promote",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:494"
+  },
+  {
+   "method": "POST",
+   "path": "/register_node_token",
+   "base": "https://azurekong.hertzai.com/data/",
+   "client": "retrofit SignLoginApi.registerNodeToken",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/SignLoginApi.java:49"
+  },
+  {
+   "method": "POST",
+   "path": "/register_node_token",
+   "base": "https://azurekong.hertzai.com/db/",
+   "client": "retrofit SignLoginApi.registerNodeToken",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/SignLoginApi.java:49"
+  },
+  {
+   "method": "POST",
+   "path": "/register_student",
+   "base": "https://azurekong.hertzai.com/data/",
+   "client": "retrofit SignLoginApi.signUp",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/SignLoginApi.java:27"
+  },
+  {
+   "method": "POST",
+   "path": "/register_student",
+   "base": "https://azurekong.hertzai.com/db/",
+   "client": "retrofit SignLoginApi.signUp",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/SignLoginApi.java:27"
+  },
+  {
+   "method": "POST",
+   "path": "/resonance/boost",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:449"
+  },
+  {
+   "method": "GET",
+   "path": "/resonance/boosts/{param}/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:451"
+  },
+  {
+   "method": "GET",
+   "path": "/resonance/breakdown/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:447"
+  },
+  {
+   "method": "POST",
+   "path": "/resonance/daily-checkin",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:445"
+  },
+  {
+   "method": "GET",
+   "path": "/resonance/leaderboard",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:444"
+  },
+  {
+   "method": "GET",
+   "path": "/resonance/level-info",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:448"
+  },
+  {
+   "method": "GET",
+   "path": "/resonance/streak",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:446"
+  },
+  {
+   "method": "GET",
+   "path": "/resonance/transactions",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:443"
+  },
+  {
+   "method": "GET",
+   "path": "/resonance/wallet",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:441"
+  },
+  {
+   "method": "GET",
+   "path": "/resonance/wallet/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:442"
+  },
+  {
+   "method": "GET",
+   "path": "/resources/stats",
+   "base": "mailer _apiBase /api/admin",
+   "client": "js adminGet",
+   "caller": "services/socialApi.js:999"
+  },
+  {
+   "method": "GET",
+   "path": "/search",
+   "base": "https://nominatim.openstreetmap.org",
+   "client": "js fetch",
+   "caller": "components/CommunityView/components/Encounters/AutoSuggestInput.js:56"
+  },
+  {
+   "method": "GET",
+   "path": "/search",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:597"
+  },
+  {
+   "method": "GET",
+   "path": "/seasons/current",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:475"
+  },
+  {
+   "method": "GET",
+   "path": "/seasons/past",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:477"
+  },
+  {
+   "method": "GET",
+   "path": "/seasons/upcoming",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:476"
+  },
+  {
+   "method": "GET",
+   "path": "/seasons/{param}/achievements",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:479"
+  },
+  {
+   "method": "GET",
+   "path": "/seasons/{param}/leaderboard",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:478"
+  },
+  {
+   "method": "POST",
+   "path": "/send_otp",
+   "base": "mailer _apiBase",
+   "client": "js _mailerPost",
+   "caller": "services/socialApi.js:1252"
+  },
+  {
+   "method": "POST",
+   "path": "/share/link",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:840"
+  },
+  {
+   "method": "GET",
+   "path": "/share/stats",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:845"
+  },
+  {
+   "method": "GET",
+   "path": "/share/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:841"
+  },
+  {
+   "method": "GET",
+   "path": "/share/{param}/check-consent",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:843"
+  },
+  {
+   "method": "POST",
+   "path": "/share/{param}/consent",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:844"
+  },
+  {
+   "method": "POST",
+   "path": "/share/{param}/view",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:842"
+  },
+  {
+   "method": "GET",
+   "path": "/subject_by_user_id",
+   "base": "https://azurekong.hertzai.com/db/",
+   "client": "retrofit SubjectApi.getSubjects",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/SubjectApi.java:13"
+  },
+  {
+   "method": "GET",
+   "path": "/sync",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:1171"
+  },
+  {
+   "method": "POST",
+   "path": "/sync/backup",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:1177"
+  },
+  {
+   "method": "GET",
+   "path": "/sync/backup/metadata",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:1178"
+  },
+  {
+   "method": "GET",
+   "path": "/sync/devices",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:1186"
+  },
+  {
+   "method": "DELETE",
+   "path": "/sync/devices/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js del",
+   "caller": "services/socialApi.js:1187"
+  },
+  {
+   "method": "GET",
+   "path": "/sync/inbox",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:1057"
+  },
+  {
+   "method": "POST",
+   "path": "/sync/link-device",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:1185"
+  },
+  {
+   "method": "POST",
+   "path": "/sync/restore",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:1180"
+  },
+  {
+   "method": "GET",
+   "path": "/tasks",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:620"
+  },
+  {
+   "method": "GET",
+   "path": "/tasks",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:625"
+  },
+  {
+   "method": "POST",
+   "path": "/tasks",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:621"
+  },
+  {
+   "method": "GET",
+   "path": "/tasks/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:622"
+  },
+  {
+   "method": "POST",
+   "path": "/tasks/{param}/assign",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:623"
+  },
+  {
+   "method": "POST",
+   "path": "/tasks/{param}/complete",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:624"
+  },
+  {
+   "method": "GET",
+   "path": "/theme/active",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:1264"
+  },
+  {
+   "method": "POST",
+   "path": "/theme/apply",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:1265"
+  },
+  {
+   "method": "POST",
+   "path": "/theme/customize",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:1266"
+  },
+  {
+   "method": "GET",
+   "path": "/theme/fonts",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:1267"
+  },
+  {
+   "method": "POST",
+   "path": "/theme/generate",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:1269"
+  },
+  {
+   "method": "GET",
+   "path": "/theme/presets",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:1263"
+  },
+  {
+   "method": "GET",
+   "path": "/topics_by_file_id",
+   "base": "https://azurekong.hertzai.com/db/",
+   "client": "retrofit TopicApi.getTopicsByFileId",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/TopicApi.java:16"
+  },
+  {
+   "method": "POST",
+   "path": "/tracker/dual-context",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:915"
+  },
+  {
+   "method": "GET",
+   "path": "/tracker/encounters",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:916"
+  },
+  {
+   "method": "GET",
+   "path": "/tracker/experiments",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:910"
+  },
+  {
+   "method": "GET",
+   "path": "/tracker/experiments/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:911"
+  },
+  {
+   "method": "GET",
+   "path": "/tracker/experiments/{param}/conversations",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:912"
+  },
+  {
+   "method": "POST",
+   "path": "/tracker/experiments/{param}/inject",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:913"
+  },
+  {
+   "method": "POST",
+   "path": "/tracker/experiments/{param}/interview",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:914"
+  },
+  {
+   "method": "GET",
+   "path": "/trust/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:519"
+  },
+  {
+   "method": "POST",
+   "path": "/update_fav_teacher_avatar",
+   "base": "https://azurekong.hertzai.com/db/",
+   "client": "retrofit VirtualTeacherApi.getUrl",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/VirtualTeacherApi.java:22"
+  },
+  {
+   "method": "POST",
+   "path": "/update_fcm_token",
+   "base": "https://azurekong.hertzai.com/data/",
+   "client": "retrofit SignLoginApi.updateFCMToken",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/SignLoginApi.java:43"
+  },
+  {
+   "method": "POST",
+   "path": "/update_fcm_token",
+   "base": "https://azurekong.hertzai.com/db/",
+   "client": "retrofit SignLoginApi.updateFCMToken",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/SignLoginApi.java:43"
+  },
+  {
+   "method": "POST",
+   "path": "/update_student",
+   "base": "https://azurekong.hertzai.com/data/",
+   "client": "retrofit SignLoginApi.update_student",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/SignLoginApi.java:29"
+  },
+  {
+   "method": "POST",
+   "path": "/update_student",
+   "base": "https://azurekong.hertzai.com/db/",
+   "client": "retrofit SignLoginApi.update_student",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/SignLoginApi.java:29"
+  },
+  {
+   "method": "POST",
+   "path": "/update_student_image",
+   "base": "https://azurekong.hertzai.com/db/",
+   "client": "retrofit UpdateStudentImage.update_student_image",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/UpdateStudentImage.java:12"
+  },
+  {
+   "method": "POST",
+   "path": "/update_student_lang",
+   "base": "https://azurekong.hertzai.com/db/",
+   "client": "retrofit LanguageUpdateApi.getUrl",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/LanguageUpdateApi.java:11"
+  },
+  {
+   "method": "POST",
+   "path": "/upload_audio/",
+   "base": "https://azurekong.hertzai.com/makeit/",
+   "client": "retrofit Audio_upload_api.getUrl",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/Audio_upload_api.java:14"
+  },
+  {
+   "method": "POST",
+   "path": "/upload_file",
+   "base": "https://azurekong.hertzai.com/makeit/",
+   "client": "retrofit ChatAttachImageUploadApi.getUrl",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/ChatAttachImageUploadApi.java:14"
+  },
+  {
+   "method": "POST",
+   "path": "/upload_file",
+   "base": "https://azurekong.hertzai.com/makeit/",
+   "client": "retrofit ChatAttachImageUploadApi.getUrl",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/ChatAttachImageUploadApi.java:17"
+  },
+  {
+   "method": "POST",
+   "path": "/upload_image/",
+   "base": "https://azurekong.hertzai.com/makeit/",
+   "client": "retrofit Image_Upload_Api.getUrl",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/Image_Upload_Api.java:14"
+  },
+  {
+   "method": "GET",
+   "path": "/usage",
+   "base": "mailer _apiBase /api/v1/intelligence",
+   "client": "js intelGet",
+   "caller": "services/socialApi.js:730"
+  },
+  {
+   "method": "GET",
+   "path": "/users",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:584"
+  },
+  {
+   "method": "GET",
+   "path": "/users/autocomplete",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:1017"
+  },
+  {
+   "method": "GET",
+   "path": "/users/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:585"
+  },
+  {
+   "method": "PATCH",
+   "path": "/users/{param}",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js patch",
+   "caller": "services/socialApi.js:586"
+  },
+  {
+   "method": "DELETE",
+   "path": "/users/{param}/follow",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js del",
+   "caller": "services/socialApi.js:590"
+  },
+  {
+   "method": "POST",
+   "path": "/users/{param}/follow",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js post",
+   "caller": "services/socialApi.js:589"
+  },
+  {
+   "method": "GET",
+   "path": "/users/{param}/followers",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:591"
+  },
+  {
+   "method": "GET",
+   "path": "/users/{param}/following",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:592"
+  },
+  {
+   "method": "GET",
+   "path": "/users/{param}/karma",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:588"
+  },
+  {
+   "method": "GET",
+   "path": "/users/{param}/posts",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:587"
+  },
+  {
+   "method": "GET",
+   "path": "/users/{param}/theme",
+   "base": "/api/social (resolved peer, else central)",
+   "client": "js get",
+   "caller": "services/socialApi.js:1270"
+  },
+  {
+   "method": "POST",
+   "path": "/validate_otp",
+   "base": "mailer _apiBase",
+   "client": "js _mailerPost",
+   "caller": "services/socialApi.js:1253"
+  },
+  {
+   "method": "POST",
+   "path": "/varify_otp",
+   "base": "https://azurekong.hertzai.com/data/",
+   "client": "retrofit SignLoginApi.verifyOTP",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/SignLoginApi.java:37"
+  },
+  {
+   "method": "POST",
+   "path": "/varify_otp",
+   "base": "https://azurekong.hertzai.com/db/",
+   "client": "retrofit SignLoginApi.verifyOTP",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/SignLoginApi.java:37"
+  },
+  {
+   "method": "POST",
+   "path": "/verify",
+   "base": "mailer _apiBase /api/v1/builds",
+   "client": "js buildsPost",
+   "caller": "services/socialApi.js:758"
+  },
+  {
+   "method": "POST",
+   "path": "/xtranslit/indic/",
+   "base": "https://azurekong.hertzai.com/",
+   "client": "retrofit TransliterateApi.getResult",
+   "caller": "android/app/src/main/java/com/hertzai/hevolve/api/TransliterateApi.java:14"
+  },
+  {
+   "method": "GET",
+   "path": "/{param}",
+   "base": "resolved base (endpointResolver / module base)",
+   "client": "js fetch",
+   "caller": "services/kidsMediaApi.js:26"
+  },
+  {
+   "method": "GET",
+   "path": "/{param}",
+   "base": "mailer _apiBase /api/goals",
+   "client": "js goalsGet",
+   "caller": "services/socialApi.js:688"
+  },
+  {
+   "method": "POST",
+   "path": "/{param}",
+   "base": "resolved base (endpointResolver / module base)",
+   "client": "js fetch",
+   "caller": "services/kidsLearningApi.js:7"
+  },
+  {
+   "method": "POST",
+   "path": "/{param}",
+   "base": "resolved base (endpointResolver / module base)",
+   "client": "js fetch",
+   "caller": "services/kidsMediaApi.js:7"
+  },
+  {
+   "method": "POST",
+   "path": "/{param}/pause",
+   "base": "mailer _apiBase /api/goals",
+   "client": "js goalsPost",
+   "caller": "services/socialApi.js:969"
+  },
+  {
+   "method": "POST",
+   "path": "/{param}/resume",
+   "base": "mailer _apiBase /api/goals",
+   "client": "js goalsPost",
+   "caller": "services/socialApi.js:970"
+  },
+  {
+   "method": "POST",
+   "path": "{param}",
+   "base": "resolved base (endpointResolver / module base)",
+   "client": "js fetch",
+   "caller": "services/socialApi.js:1243"
+  },
+  {
+   "method": "GET",
+   "path": "{url}",
+   "base": "variable url (RNFetchBlob download)",
+   "client": "js RNFetchBlob",
+   "caller": "components/CommunityView/components/KidsLearning/shared/MediaCacheManager.js:147"
+  }
+ ]
+}

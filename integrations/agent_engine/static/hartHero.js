@@ -6,9 +6,10 @@
  * central command bar (Windows-search style, but voice-native). It reuses the
  * shell's own globals so there is ONE pipeline, never a parallel one:
  *   window.toggleVoice()        — start/stop the mic (push-to-talk)
- *   window.acSend() + #ac-input — dispatch a command into the assistant
+ *   window.acSend(text)         — dispatch a command (free-form intent lands in
+ *                                 Nunba, the one chat, in its assistant panel)
  *   window.openPanel(id)        — launch an app/panel
- *   window.toggleAssistantChat()— surface the conversation
+ *   window.toggleAssistantChat()— open/close the Nunba assistant panel
  *   isRecording (script global) — live listening flag
  *
  * Plain classic script: loaded AFTER the inline shell script, so all of the
@@ -251,21 +252,18 @@
       return false;
     }
 
-    // The slow brain: open chat -> fill #ac-input -> acSend. This is the EXISTING
-    // assistant pipeline (one dispatch path). Only reached once the deterministic
+    // The slow brain: acSend(text). This is the EXISTING assistant pipeline (one
+    // dispatch path): acSend opens the Nunba assistant panel, the one chat, and
+    // lands the text in its composer. Only reached once the deterministic
     // app-launch AND the local media index have both missed.
     function brainDispatch(text) {
-      var chat = $('assistant-chat'), aci = $('ac-input');
-      if (chat && !chat.classList.contains('open') && typeof window.toggleAssistantChat === 'function') {
-        window.toggleAssistantChat();
-      }
       // acSend is the SOLE owner of window._hartThinking here: it sets it now and
-      // clears it on its REAL terminal paths (response arrived / error / fast-path).
-      // The hero must NOT arm a fixed-duration clear — the brain can run far longer
+      // clears it on its REAL terminal paths (Nunba's turn ends / error / fast-path).
+      // The hero must NOT arm a fixed-duration clear: the brain can run far longer
       // than any guess, and a premature flip would make the "thinking" lamp lie
-      // (then snap off again when acSend resolves). We only paint our local status
+      // (then snap off again when the turn ends). We only paint our local status
       // text; the reflect loop below resets it off the real flag, never a timer.
-      if (aci) { aci.value = text; if (typeof window.acSend === 'function') window.acSend(); }
+      if (typeof window.acSend === 'function') window.acSend(text);
       input.value = '';
       setStatus('Hevolve AI is thinking…', 'thinking');
     }
@@ -426,6 +424,7 @@
       try { return !!(_acAudio && !_acAudio.paused && !_acAudio.ended); } catch (e) { return false; }
     }
     setInterval(function () {
+      syncChat();
       var l = listening(), think = !!window._hartThinking;
       var speak = ttsPlaying();
       var st = think ? 'thinking'
@@ -725,19 +724,17 @@
       orb.addEventListener('dblclick', function (e) { e.preventDefault(); e.stopPropagation(); setCompact(!B.compact); });
     }
 
-    // ── ATTACH / DETACH TO THE HART CHAT: when the conversation is open the orb
-    // docks beside it (compose surface stays next to the thread); when the chat
-    // closes it detaches and free-floats. Subtle, and it never traps focus (we
-    // only read the chat's open state; we never focus() into it). ──
-    var chatEl = $('assistant-chat');
+    // ── ATTACH / DETACH TO THE HART CHAT: when Nunba's assistant panel is open
+    // the orb docks beside it (compose surface stays next to the thread); when
+    // the panel closes it detaches and free-floats. Subtle, and it never traps
+    // focus (we only read whether the panel exists; we never focus() into it).
+    // openPanel/closePanel create and remove #panel-assistant, so its presence
+    // IS the state, read by the reflect loop above (no second observer). ──
     function syncChat() {
-      var open = !!(chatEl && chatEl.classList.contains('open'));
+      var open = !!$('panel-assistant');
       if (open !== B.chatOpen) { B.chatOpen = open; if (open) B.compact = false; place(); }
     }
-    if (chatEl && typeof MutationObserver === 'function') {
-      new MutationObserver(syncChat).observe(chatEl, { attributes: true, attributeFilter: ['class'] });
-      syncChat();
-    }
+    syncChat();
 
     // ── DOCK aside when ANY panel/window opens (the existing behaviour, now
     // routed through the single place() writer instead of a parallel transform).

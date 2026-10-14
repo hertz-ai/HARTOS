@@ -87,18 +87,12 @@ class RepoMap:
             )
 
     def token_count(self, text):
-        len_text = len(text)
-        if len_text < 200:
-            return self.main_model.token_count(text)
-
-        lines = text.splitlines(keepends=True)
-        num_lines = len(lines)
-        step = num_lines // 100 or 1
-        lines = lines[::step]
-        sample_text = "".join(lines)
-        sample_tokens = self.main_model.token_count(sample_text)
-        est_tokens = sample_tokens / len(sample_text) * len_text
-        return est_tokens
+        # Counted in full, never sampled.  Upstream sampled every Nth line to
+        # spare a slow counter; HartModelAdapter counts with tiktoken.  A tree
+        # of untagged files alternates a blank line and a file name, an even N
+        # sampled only the blank lines, and a 15,311-token map read as 1,927:
+        # the native coding request overflowed the 12,288-token context.
+        return self.main_model.token_count(text)
 
     def get_repo_map(
         self,

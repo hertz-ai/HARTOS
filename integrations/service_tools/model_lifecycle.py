@@ -403,17 +403,15 @@ class ModelLifecycleManager:
         both problem classes to one primitive.
         """
         try:
-            from security.node_watchdog import get_watchdog
-            wd = get_watchdog()
-            if wd is not None:
-                wd.sleep_with_heartbeat(
-                    'model_lifecycle', seconds,
-                    stop_check=lambda: not self._running,
-                )
-                return
-        except Exception:
-            logger.exception("_wd_sleep: swallowed Exception")
-        time.sleep(seconds)
+            from security.node_watchdog import sleep_with_heartbeat
+        except Exception as e:
+            logger.warning("model_lifecycle: heartbeat sleep unavailable, falling "
+                           "back to a plain sleep (no heartbeats, the "
+                           "watchdog may restart this thread): %s", e, exc_info=True)
+            time.sleep(seconds)
+            return
+        sleep_with_heartbeat('model_lifecycle', seconds,
+                             stop_check=lambda: not self._running)
 
     def _tick(self):
         """Single lifecycle pass with heartbeat checkpoints between phases."""

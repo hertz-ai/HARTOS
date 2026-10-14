@@ -123,23 +123,12 @@ def send_completion(
 
         result_text = response.choices[0].message.content
 
-        # Record metered usage. This called record_metered_usage with keywords
-        # it does not accept; the TypeError escaped `except ImportError` into
-        # the outer handler below, which returned None, so EVERY completion
-        # was lost and every native coding edit failed (hevolveai Master 11.435
-        # S1). meter_llm_call owns the contract and never raises; the extra
-        # guard keeps a missing budget module from costing the completion too.
-        try:
-            from integrations.agent_engine.budget_gate import meter_llm_call
-            usage = response.usage
-            meter_llm_call(
-                model=model,
-                tokens_in=usage.prompt_tokens if usage else 0,
-                tokens_out=usage.completion_tokens if usage else 0,
-                task_source='own',
-            )
-        except Exception as e:
-            logger.warning(f"Metering skipped (completion kept): {e}")
+        # Metering: NOT here.  This call rides the openai SDK's httpx client,
+        # and core.llm_outbound_logger meters every completed chat/completions
+        # response from its usage block (one meter, one row per call).  The
+        # caller-side meter that used to sit here (hevolveai Master 11.435 S1)
+        # wrote a second row for the same call once the wire meter landed
+        # (review of 065cef8bb, M2).
 
         return result_text
 

@@ -101,6 +101,9 @@ def test_p0b_start_gateway_pushes_notification_with_consent_prefix():
         'integrations.social.services': MagicMock(),
         'integrations.social.models': MagicMock(),
         'integrations.channels.metadata': MagicMock(),
+        # The flow reaches the gateway through the ONE client,
+        # api_channels._proxy_gateway (not requests).
+        'integrations.social.api_channels': _gateway_module(),
     }
     # Make the gateway "responses" believable.
     fake_post = MagicMock()
@@ -276,6 +279,9 @@ def test_p0e_fleet_publish_uses_canonical_message_bus():
         'integrations.social.services': MagicMock(),
         'integrations.social.models': MagicMock(),
         'integrations.channels.metadata': MagicMock(),
+        # The flow reaches the gateway through the ONE client,
+        # api_channels._proxy_gateway (not requests).
+        'integrations.social.api_channels': _gateway_module(),
     }
     fake_post = MagicMock()
     fake_post.ok = True
@@ -361,6 +367,23 @@ def test_source_guard_no_legacy_type_strings():
         f" into production code: {hits}.  Canonical is "
         f"type='consent.channel_pair_code'."
     )
+
+
+# ─── Helpers — function isolation for behavioural tests ──────────────
+def _gateway_module():
+    """A stand-in api_channels whose gateway answers like a live one:
+    session started, pair code minted, never linked (the watcher then
+    runs out quietly in its daemon thread)."""
+    def proxy(method, path, **_kw):
+        if path.endswith('/start'):
+            return {'success': True}, 201
+        if path.endswith('/request-pair-code'):
+            return {'success': True, 'code': 'ABCD-EFGH'}, 200
+        return {'authenticated': False, 'qr': None}, 200
+    mod = MagicMock()
+    mod._proxy_gateway.side_effect = proxy
+    mod._whatsapp_gateway_base.return_value = 'http://127.0.0.1:3000'
+    return mod
 
 
 # ─── Helpers — function isolation for behavioural tests ──────────────

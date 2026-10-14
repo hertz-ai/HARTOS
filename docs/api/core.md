@@ -39,12 +39,27 @@ Primary endpoint for agent interaction.
 ```json
 {
   "response": "Here are the latest trends...",
+  "served_by": "local",
   "prompt_id": "99999",
   "flow_id": "1",
   "actions_completed": 3,
   "recipe_saved": true
 }
 ```
+
+`served_by` says where the reply came from, always one of three values
+(`core.constants.canonical_served_by` is the one rule that names it):
+
+| Value | Meaning |
+|-------|---------|
+| `local` | This node's own LLM wrote the reply, and it runs on this machine or its LAN. |
+| `hive` | The turn was escalated to a hive peer's model. |
+| `cloud` | A cloud agent (an agent that exists only on central); central's own LLM when this node is central; or this node's own LLM when the node sends its prompts to a public API (openrouter.ai, OpenAI). |
+
+The same field is stamped on the chat envelopes published through
+`publish_async` (message bus and SSE legs), so a client's badge reads it
+instead of guessing.  The spoken reply (a `TTS` payload) carries none: it is
+played, never drawn as a bubble.
 
 ### Security
 

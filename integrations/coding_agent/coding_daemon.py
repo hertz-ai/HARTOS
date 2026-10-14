@@ -17,6 +17,19 @@ from datetime import datetime
 logger = logging.getLogger('hevolve_social')
 
 
+def _held_for_later(goal_id) -> bool:
+    """dispatch.is_transient_deferral for a coding goal's empty dispatch: the
+    one rule the agent daemon applies to the same None (#139).  A broken
+    check reads as not held, so a real failure is still counted."""
+    try:
+        from integrations.agent_engine.dispatch import is_transient_deferral
+        return bool(is_transient_deferral(goal_id))
+    except Exception:
+        logger.debug('is_transient_deferral unavailable; counting the failure',
+                     exc_info=True)
+        return False
+
+
 class CodingAgentDaemon:
     """Background daemon: active goals + idle agents → /chat dispatch."""
 
@@ -35,8 +48,24 @@ class CodingAgentDaemon:
         with self._lock:
             if self._running:
                 return
-            self._running = True
             self._stop_event.clear()
+            # Never spawn beside a worker that is still alive (the guard
+            # AgentDaemon.start has had since 2026-08-17).  stop() gives the
+            # worker ten seconds to leave, and one inside a dispatch_to_chat
+            # turn takes far longer; the watchdog's restart then called
+            # start(), which spawned a second worker, and the first, seeing
+            # _running True again, kept going.  Measured on the owner's
+            # desktop 2026-10-10: two live threads named coding_daemon (py-spy),
+            # and "dispatched 2 goal(s)" 341 times in 107 minutes, every ~19 s
+            # against a 30 s tick.  Re-arm the live worker instead.
+            if self._thread is not None and self._thread.is_alive():
+                self._running = True
+                logger.warning(
+                    "coding daemon start(): worker %s still alive with "
+                    "_running=False -- re-arming it instead of spawning a "
+                    "second", self._thread.name)
+                return
+            self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True,
                                         name='coding_daemon')
         self._thread.start()
@@ -67,28 +96,24 @@ class CodingAgentDaemon:
         single primitive the agent_daemon uses, so a long sleep
         (e.g. during platform-affordability back-off) can't age the
         heartbeat past the 300s frozen threshold. See the helper
-        docstring for the 2026-04-11 incident context.
+        docstring for the 2026-04-11 incident context.  The module-level
+        helper re-resolves the watchdog every chunk (this daemon can start
+        before it exists), and ``wait=self._stop_event.wait`` keeps the sleep
+        interruptible: a bare time.sleep() could not be woken, so stop()
+        blocked for the whole interval (join(timeout=10) expired in full —
+        measured 10.00s / 10.01s in test_start_stop / test_double_start).
         """
         try:
-            from security.node_watchdog import get_watchdog
-            wd = get_watchdog()
-            if wd is not None:
-                wd.sleep_with_heartbeat(
-                    'coding_daemon', seconds,
-                    stop_check=lambda: not self._running,
-                )
-                return
-        except Exception:
-            pass
-        # FALLBACK — must keep the interruptibility the watchdog path
-        # provides via stop_check. A bare time.sleep() does not: it
-        # cannot be woken, so stop() blocked for the WHOLE interval
-        # (join(timeout=10) then expired in full — measured 10.00s and
-        # 10.01s in test_start_stop / test_double_start, the giveaway
-        # constant). That hits any node where get_watchdog() returns
-        # None or raises, i.e. exactly the degraded case. Event.wait()
-        # sleeps the same duration but returns immediately on stop().
-        self._stop_event.wait(seconds)
+            from security.node_watchdog import sleep_with_heartbeat
+        except Exception as e:
+            logger.warning("coding_daemon: heartbeat sleep unavailable, falling "
+                           "back to a plain sleep (no heartbeats, the "
+                           "watchdog may restart this thread): %s", e, exc_info=True)
+            self._stop_event.wait(seconds)
+            return
+        sleep_with_heartbeat('coding_daemon', seconds,
+                             stop_check=lambda: not self._running,
+                             wait=self._stop_event.wait)
 
     def _loop(self):
         # Boot grace period: let user chat have exclusive LLM access
@@ -240,10 +265,23 @@ class CodingAgentDaemon:
                 used_agents.add(agent['user_id'])
 
                 goal.last_dispatched_at = now
+                # The spark snapshot the completion gate reads, staged the way
+                # the agent daemon stages it.
+                cfg = dict(goal.config_json or {})
+                cfg['spark_at_dispatch'] = goal.spark_spent or 0
+                goal.config_json = cfg
                 result = dispatch_to_chat(prompt, str(agent['user_id']), goal.id,
                                           goal_type=goal.goal_type or 'coding')
 
-                if result is None:
+                if result is None and _held_for_later(goal.id):
+                    # Not a failure: the turn stopped between steps for a
+                    # person (#129), or never started (a user chatting, the
+                    # breaker open).  The goal stays active and is dispatched
+                    # again once the gate opens; five of these auto-paused a
+                    # healthy coding goal.
+                    logger.debug(f"Coding goal {goal.id}: held for later; no "
+                                 f"dispatch failure counted")
+                elif result is None:
                     # Dispatch failed — track for backoff
                     fails = (goal.config_json or {}).get('_dispatch_failures', 0) + 1
                     cfg = goal.config_json or {}
@@ -255,7 +293,22 @@ class CodingAgentDaemon:
                         goal.config_json = cfg
                         logger.warning(f"Coding goal {goal.id} AUTO-PAUSED after {fails} failures")
                 else:
-                    # Success — clear failure count
+                    # The ONE completion gate (agent_daemon's docstring: "every
+                    # dispatched goal must pass through").  This daemon never
+                    # called it, so a coding goal could neither complete nor
+                    # stop: the two self-heal goals on the owner's desktop were
+                    # dispatched every 30 s from 09-15 to 10-10, into a hive
+                    # task set long finished, and nothing ever settled them.
+                    from integrations.agent_engine.agent_daemon import (
+                        _settle_dispatched_goal)
+                    from integrations.agent_engine.dispatch import (
+                        handed_to_hive)
+                    _settle_dispatched_goal(
+                        db, goal, str(goal.id),
+                        handed_to_hive=handed_to_hive(goal.id))
+                    # Success — clear failure count.  After the gate: it
+                    # reloads the committed config, which would bring back a
+                    # count popped before it.
                     cfg = goal.config_json or {}
                     cfg.pop('_dispatch_failures', None)
                     goal.config_json = cfg

@@ -490,7 +490,10 @@ class ClaudeHiveSession:
         except ImportError:
             logger.debug("HiveTaskDispatcher not available for result reporting")
         except Exception as e:
-            logger.debug("Dispatcher result notification failed: %s", e)
+            # The task's status only advances here; failing at DEBUG left it
+            # stuck at 'assigned' with nothing in any shipped log.
+            logger.warning("Result for task %s never reached the dispatcher: %s",
+                           task_id, e, exc_info=True)
 
     # ─── Task Execution ──────────────────────────────────────────────
 
@@ -1494,15 +1497,24 @@ def _create_blueprint():
                 'error': data.get('error'),
             }
             reward_info = dispatcher.on_task_result(task_id, dispatcher_result)
-        except Exception:
-            pass
+        except Exception as e:
+            # Published, but the dispatcher never took it, so the task's status
+            # cannot advance.  Say so to the reporter instead of a bare success.
+            dispatcher_error = str(e) or type(e).__name__
+            logger.warning("Result for task %s never reached the dispatcher: %s",
+                           task_id, e, exc_info=True)
+        else:
+            dispatcher_error = None
 
-        return jsonify({
+        body = {
             'success': True,
             'task_id': task_id,
             'published': published,
             'reward': reward_info,
-        }), 200
+        }
+        if dispatcher_error:
+            body['dispatcher_error'] = dispatcher_error
+        return jsonify(body), 200
 
     return bp
 

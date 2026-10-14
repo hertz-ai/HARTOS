@@ -380,7 +380,7 @@ from hartos.lifecycle_hooks import (
     ActionState, safe_set_state, force_state_through_valid_path, get_action_state,
     clear_action_states, settled_action_id, commit_verified_action_completion,
     dispatch_action_id, ACTION_STATES_AWAITING_USER, autonomy_needs_user,
-    action_is_autonomous,
+    action_is_autonomous, action_named_tools, is_written_answer, ANSWER_KEYS,
 )
 from hartos.cultural_wisdom import get_cultural_prompt
 
@@ -789,6 +789,15 @@ def execute_python_file(task_description: str, user_id: int, prompt_id: int, act
     return 'done'
 
 
+# A failed action-details poll pauses that URL for a while instead of failing
+# again 2s later.  Live 2026-10-04 (central, bridge-network container whose
+# config.json named localhost:6006): 2,544 "Error getting user action details"
+# in 29 min, one per job run, ~80/min, for an endpoint that was never going to
+# answer.  One ERROR line per pause is the whole signal an operator needs.
+_VISUAL_POLL_PAUSE_S = 300
+_visual_poll_paused_until: dict = {}
+
+
 def call_visual_task(task_description: str, user_id: int, prompt_id: int):
     # NOTE on logging: this function runs inside the APScheduler
     # BackgroundScheduler thread (created at line 174), which has NO Flask
@@ -817,8 +826,10 @@ def call_visual_task(task_description: str, user_id: int, prompt_id: int):
     now_utc = datetime.utcnow()
 
     # Get user action data to check for Video Reasoning entries
+    action_url = f"{ACTION_API}?user_id={user_id}"
+    if time.monotonic() < _visual_poll_paused_until.get(action_url, 0.0):
+        return None
     try:
-        action_url = f"{ACTION_API}?user_id={user_id}"
         payload = {}
         headers_api = {}
 
@@ -873,11 +884,15 @@ def call_visual_task(task_description: str, user_id: int, prompt_id: int):
                 return None
 
         else:
-            logger.error(f"Failed to get user actions: {response.status_code}")
+            _visual_poll_paused_until[action_url] = time.monotonic() + _VISUAL_POLL_PAUSE_S
+            logger.error(f"Failed to get user actions: {response.status_code}; "
+                         f"this poll pauses for {_VISUAL_POLL_PAUSE_S}s")
             return 'error'
 
     except Exception as e:
-        logger.error(f"Error getting user action details: {e}")
+        _visual_poll_paused_until[action_url] = time.monotonic() + _VISUAL_POLL_PAUSE_S
+        logger.error(f"Error getting user action details: {e}; "
+                     f"this poll pauses for {_VISUAL_POLL_PAUSE_S}s")
         return 'error'
 
 
@@ -1156,6 +1171,10 @@ def create_agents_for_role(user_id: str, prompt_id):
 
         def state_transition(last_speaker, groupchat):
             messages = groupchat.messages
+            # A background turn stops between rounds while the owner is using
+            # the computer (#129).
+            if helper_fun.yield_between_rounds(groupchat.messages):
+                return None
             if last_speaker == user_proxy:
                 return assistant
             # update_persona is registered for execution on Helper only, so its
@@ -2962,7 +2981,7 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
         current_app.logger.info("Initializing AP2 (Agent Protocol 2) - Agentic Commerce...")
 
         # Get AP2 payment tools for this agent
-        ap2_tools = get_ap2_tools_for_autogen('assistant')
+        ap2_tools = get_ap2_tools_for_autogen('assistant', user_id=user_id)
 
         # Register payment tools — wrap with @log_tool_execution so payment
         # operations fire UI status emits + structured-error envelopes
@@ -3037,6 +3056,12 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
             from integrations.agent_engine.news_tools import register_news_tools
             register_news_tools(helper, assistant, user_id, executor=executor)
             current_app.logger.info("News tools loaded (Tier 2) for reuse agent")
+        if 'commerce' in goal_tags:
+            # Parity with create_recipe.py: a McGroce recipe authored under the
+            # 'commerce' tag must replay with its cart / checkout tools.
+            from integrations.commerce.commerce_tools import register_commerce_tools
+            register_commerce_tools(helper, assistant, user_id, executor=executor)
+            current_app.logger.info("Commerce tools loaded (Tier 2) for reuse agent")
     except Exception as e:
         # Same observability promotion as create_recipe.py — a failure
         # here strips the agent of goal-specific tools, agent talks
@@ -3062,6 +3087,10 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
 
     def state_transition(last_speaker, groupchat):
         messages = groupchat.messages
+        # A background turn stops between rounds while a person is using the
+        # computer (#129); get_agent_response answers for it.
+        if helper_fun.yield_between_rounds(groupchat.messages):
+            return None
         try:
             request_id = f'{request_id_list[user_prompt]}'
             # Check for specific agent mentions FIRST - this should take precedence
@@ -3216,9 +3245,14 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
             current_app.logger.info(
                 f'Inside state_transition with message :10 {messages[-1]["content"][:10]} & last_speaker {last_speaker.name}')
 
+            # Helper is deliberately NOT routed here: its turn falls through,
+            # so a message2userfinal it writes (its prompt's rule 9: push
+            # proactive data to the user) is delivered and its TERMINATE is
+            # honoured, and it reaches the Assistant at the last line.  The
+            # old "helper" comparison here never matched (the agent is named
+            # "Helper"); matching it skipped both of those.
             if (last_speaker.name == f"user_proxy_{user_id}" or
                     last_speaker.name == "multi_role_agent" or
-                    last_speaker.name == "helper" or
                     last_speaker.name == "Executor" or
                     last_speaker.name == "ChatInstructor"):
                 return assistant
@@ -3270,8 +3304,9 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
             # Assistant with a plain turn (no tool call, no mention, no
             # verdict: its work is done -> verify it) and the StatusVerifier
             # or another agent with an unparseable turn (-> back to the
-            # Assistant); Helper, Executor, user_proxy and ChatInstructor were
-            # routed at the name check above.  Returning "auto" would spend an
+            # Assistant); Executor, user_proxy and ChatInstructor were routed
+            # at the name check above, and Helper (whose user-bound message
+            # and TERMINATE are handled above) reaches the Assistant here.  Returning "auto" would spend an
             # extra model call per hop to guess what this state already
             # knows, and that call runs outside the AgentLightningWrapper, so
             # any engine failure inside it ends the whole turn (measured
@@ -3284,6 +3319,8 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
 
     def state_transition1(last_speaker, groupchat):
         current_app.logger.info('INSIDE TIMER STATE TRANSITION')
+        if helper_fun.yield_between_rounds(groupchat.messages):
+            return None
         messages = groupchat.messages
         # visual_context = helper_fun.get_visual_context(user_id)
         # if visual_context:
@@ -3351,6 +3388,8 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
 
     def state_transition2(last_speaker, groupchat):
         current_app.logger.info('INSIDE VISUAL STATE TRANSITION')
+        if helper_fun.yield_between_rounds(groupchat.messages):
+            return None
         messages = groupchat.messages
         # visual_context = helper_fun.get_visual_context(user_id)
         # if visual_context:
@@ -4463,7 +4502,14 @@ def _reuse_message_is_user_answer(message):
             # synthesis.
             _ans = retrieve_json(content)
             if isinstance(_ans, dict):
-                for _ak in ('message2userfinal', 'message2'):
+                # lifecycle_hooks.ANSWER_KEYS, in its order: the key judged
+                # here is the key get_agent_response's extractors return.
+                # Written out because the tests exec this function from the
+                # source; a test pins it to ANSWER_KEYS.  message2user was
+                # missing, so any message2user tail passed as an answer and
+                # the loop handed over '' or a placeholder (review of
+                # b9c755da6).
+                for _ak in ('message2userfinal', 'message2', 'message2user'):
                     if _ak in _ans:
                         return _reuse_is_written_answer(_ans[_ak])
             return True                      # the answer is already there
@@ -4668,8 +4714,14 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
             return None
         for idx in range(len(messages) - 1, dispatch_index, -1):
             if messages[idx] is answer or messages[idx] == answer:
-                if (answer.get('role') == 'assistant'
-                        and answer.get('name') == 'Assistant'):
+                # The Assistant's, in whichever role this log holds it: a
+                # native autogen log reads a plain reply as role 'user', a
+                # resynced one as 'assistant'.  Measured live 2026-10-06 01:26
+                # (agent 54): the role was tested here as 'assistant' only, so
+                # a lesson the Assistant had just written was "no canonical
+                # receipt" and the action GAVE_UP.  The same predicate the
+                # shared gate applies to this message afterwards.
+                if is_written_answer(answer):
                     return {
                         'message_index': idx,
                         'kind': 'user_visible_result',
@@ -5351,15 +5403,13 @@ def _reuse_evidence_sources(group_chat, agents):
     ``{'source': 'buffer', 'agent': <name>, 'peer': <name>}`` for one
     participant's pairwise buffer -- the address lifecycle_hooks.resolve_receipt
     reads a receipt back from.  The group log comes first.
+
+    The ONE definition lives in hartos.lifecycle_hooks.evidence_sources, which
+    CREATE's receipt finder (derive_completion_evidence) reads too; this name
+    stays for its callers here.
     """
-    yield None, getattr(group_chat, 'messages', None) or []
-    for ag in (agents or []):
-        conv = getattr(ag, '_oai_messages', None)
-        if isinstance(conv, dict):
-            for peer, msgs in conv.items():
-                yield ({'source': 'buffer',
-                        'agent': getattr(ag, 'name', None),
-                        'peer': getattr(peer, 'name', peer)}, msgs)
+    from hartos.lifecycle_hooks import evidence_sources
+    return evidence_sources(group_chat, agents)
 
 
 def _reuse_evidence_msg_lists(group_chat, agents):
@@ -5451,54 +5501,11 @@ def _stamp_action_result_vacuity(user_prompt, action_id):
 def _reuse_registered_and_referenced_tools(agents, action_text):
     """(every tool name this leg can SERVE, the ones this action's TEXT names).
 
-    Lifted verbatim out of _reuse_fabricated_tools so the vacuity stamp asks
-    the same question by the same rule.  Two callers, ONE derivation: a
-    second copy would drift the moment either side changed what counts as
-    "this action names that tool".
-
-    "Can serve" is three sources, not two: already REGISTERED (_function_map),
-    already in the SCHEMA (llm_config['tools']), and ATTACHABLE BY NAME
-    (_hart_core_tools).  The third was missing and made the gate structurally
-    blind -- see the loop below.
+    The ONE derivation lives in hartos.lifecycle_hooks.action_named_tools,
+    which the completion gate and CREATE's trace banker read too (#147);
+    this name stays for its callers here and in create_recipe.
     """
-    names = set()
-    for ag in (agents or []):
-        try:
-            names.update((getattr(ag, '_function_map', None) or {}).keys())
-        except Exception:
-            pass
-        cfg = getattr(ag, 'llm_config', None)
-        if isinstance(cfg, dict):
-            for t in (cfg.get('tools') or []):
-                fn = ((t or {}).get('function') or {}).get('name')
-                if fn:
-                    names.add(fn)
-        # Closures this leg can attach BY NAME but has not attached yet.
-        # attach_for_names(core_tools=...) serves exactly these, unpacking the
-        # same (name, description, func) tuples build_core_tool_closures
-        # returns -- so read [0] the way it does.
-        #
-        # Without this the two sources above only see tools ALREADY attached,
-        # so a recipe-named closure was invisible until something else had
-        # attached it, and _reuse_fabricated_tools returned [] at its
-        # `if not referenced` early-return, which sits ABOVE its log line.
-        # Measured live 2026-09-10, agent 88719487304 action 4 (rid
-        # d60c-223537, taken AFTER 7fd83678f made these closures buildable):
-        # watermark 12 -> 13, and it was the ONLY action of nine with no
-        # `[FAB-GUARD] action N names tool(s)` verdict line at all.  An action
-        # naming execute_coding_task read exactly like a prose action naming
-        # nothing, and advanced having run nothing.
-        # Population: 87 actions across 35 agents name execute_coding_task.
-        for _ct in (getattr(ag, '_hart_core_tools', None) or []):
-            try:
-                _cn = _ct[0]
-            except Exception:
-                continue
-            if _cn:
-                names.add(_cn)
-    text = str(action_text or '').lower()
-    referenced = [n for n in names if n and len(n) > 3 and n.lower() in text]
-    return names, referenced
+    return action_named_tools(agents, action_text)
 
 
 def _reuse_call_id_to_tool_name(msg_lists):
@@ -5866,6 +5873,17 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
         _reuse_advanced_actions = set()  # one robust completion-advance per action id
         while True:
             current_app.logger.info('inside reuse while1')
+            # YIELD-TO-USER (#129): the same contract as create_recipe's outer
+            # loop, where the measurement (daemon_d69d24f8 running through the
+            # closed gate 19:12:55-19:20:56 on 2026-10-04) and the rationale
+            # live.  The round ended because a speaker selector of this turn
+            # asked yield_between_rounds and a person is using the computer:
+            # answer for the turn, touch no action or ledger state, and the
+            # goal's next dispatch continues this same session.
+            if helper_fun.pause_requested():
+                return helper_fun.answer_the_pause(
+                    user_prompt, _reuse_current_action_id(user_prompt),
+                    'reuse turn, at the loop top')
 
             # #725 ROOT-CAUSE FIX (proven live 2026-09-05: nappend=0, conversation in
             # manager._oai_messages).  In this reuse flow autogen accumulates the
@@ -6311,7 +6329,7 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                     'turn instead of raising IndexError')
                 break
             last_message = group_chat.messages[-1]
-            content_lower = last_message['content'].lower()
+            content_lower = (last_message.get('content') or '').lower()
             # ONE notion of "the user's answer" at this return too (D84, #850).
             # The two branches below hand any tail carrying the answer key to
             # the user on the spot; the post-loop pick asks
@@ -6355,11 +6373,14 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                 # Extract and process message
                 try:
                     json_obj = retrieve_json(last_message['content'])
-                    if json_obj and 'message2' in json_obj:
-                        # Same as the message2userfinal branch above.
-                        _reuse_answer_off_box(
-                            user_id, json_obj['message2'], prompt_id)
-                        return json_obj['message2']
+                    _key = next((k for k in ANSWER_KEYS if isinstance(json_obj, dict)
+                                 and k in json_obj), None)
+                    if _key:
+                        # Same as the message2userfinal branch above, for every
+                        # key the pipeline reads as the answer (ANSWER_KEYS):
+                        # message2user was handed over as its JSON envelope.
+                        _reuse_answer_off_box(user_id, json_obj[_key], prompt_id)
+                        return json_obj[_key]
                 except Exception as e:
                     current_app.logger.error(f"Error extracting JSON: {e}")
             elif f'@user'.lower() not in content_lower:
@@ -6419,6 +6440,13 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
 
         # if individual_recipe[currentaction_id-1]['can_perform_without_user_input'] == 'yes':
         #     return assistant
+        # A loop exit that followed a round a speaker selector ended for the
+        # person answers the pause, and asks no synthesis round of a session
+        # it will resume (review of 96a9ca9f8, blocker 3).
+        if helper_fun.pause_requested():
+            return helper_fun.answer_the_pause(
+                user_prompt, _reuse_current_action_id(user_prompt),
+                'reuse turn, after the loop')
         if not group_chat.messages:
             current_app.logger.warning(
                 'reuse: no messages to extract a reply from after trimming')
@@ -6428,6 +6456,13 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
         # to the user verbatim.  Ask for the answer first — once, here, where
         # the turn is finalised exactly once (#799/D33).
         _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor)
+        # The synthesis round runs after the loop's last read of the mark.  A
+        # person who arrives during it gets the pause, not the steer or the
+        # verdict left at the tail (review of 96a9ca9f8, blocker 3).
+        if helper_fun.pause_requested():
+            return helper_fun.answer_the_pause(
+                user_prompt, _reuse_current_action_id(user_prompt),
+                'reuse turn, synthesis round')
         last_message = group_chat.messages[-1]
         # THE SYNTHESIS ROUND CAN LEAVE ITS OWN STEER AS THE TAIL.  It posts
         # the steer and then depends on the group taking a turn; when no turn
@@ -6463,7 +6498,7 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
         if last_message['content'] == 'TERMINATE' and len(group_chat.messages) > 1:
             last_message = group_chat.messages[-2]
 
-        content_lower = last_message['content'].lower()
+        content_lower = (last_message.get('content') or '').lower()
 
         if f'message2userfinal'.lower() in content_lower:
             try:
@@ -6484,14 +6519,17 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
         elif f'message2'.lower() in content_lower:
             try:
                 json_obj = retrieve_json(last_message['content'])
-                if json_obj and 'message2' in json_obj:
-                    last_message['content'] = json_obj['message2']
+                _key = next((k for k in ANSWER_KEYS if isinstance(json_obj, dict)
+                             and k in json_obj), None)
+                if _key:
+                    # Every answer key (ANSWER_KEYS), as in the loop above.
+                    last_message['content'] = json_obj[_key]
                     return last_message['content']
 
             except Exception as e:
                 current_app.logger.error(f"Error extracting JSON: {e}")
                 # Fallback to a basic pattern match if retrieve_json fails
-                pattern = r'@user\s*{[\'"]message2[\'"]\s*:\s*[\'"](.+?)[\'"]}'
+                pattern = r'@user\s*{[\'"]message2(?:user)?[\'"]\s*:\s*[\'"](.+?)[\'"]}'
                 match = re.search(pattern, last_message['content'], re.DOTALL)
                 if match:
                     last_message['content'] = match.group(1)
@@ -7420,15 +7458,32 @@ def _attach_named_tools_for_action(user_prompt):
             return False
         assistant = agents[0]
         helper = agents[4]
+
+        def _fit(named=()):
+            # The live-n_ctx reconciliation, run WHETHER OR NOT the named
+            # attach below ran.  It used to sit at the tail, behind the two
+            # early returns, so a session with no armed attach set or no
+            # current action was never fitted: measured 2026-09-30..10-01,
+            # 296 "TOOL SCHEMA alone is N tokens" lines against 5 fits, the
+            # Helper seat sending 70-76 tools (9,497 tok vs a room of 9,216)
+            # and getting HTTP 400.  The fit only removes a tool from the
+            # schema, and only when the schema does not fit.
+            from core.agent_tools import fit_schema_to_ctx
+            _protect = set(named or ()) | {'send_message_to_user'}
+            fit_schema_to_ctx(helper, protect=_protect, turn_protect=True)
+            fit_schema_to_ctx(assistant, protect=_protect, turn_protect=True)
+
         # Gate on the set this actually mutates, not on the tags sibling the
         # inline version tested.  Both are written on adjacent lines at
         # construction (:2446-2447), so this is the same condition — it just
         # names the thing it uses.
         _attached = getattr(assistant, '_hart_attached_tools', None)
         if _attached is None:
+            _fit()
             return False
         _aid = user_tasks[user_prompt].current_action
         if not _aid:
+            _fit()
             return False
 
         from integrations.service_tools import service_tool_registry
@@ -7512,10 +7567,7 @@ def _attach_named_tools_for_action(user_prompt):
         # asks for (see core.agent_tools.defer_helper_schema).  The action's
         # own named tools are protected, so the authoritative selector above is
         # never undone by the budget below it.
-        from core.agent_tools import fit_schema_to_ctx
-        _protect = set(_named or ()) | {'send_message_to_user'}
-        fit_schema_to_ctx(helper, protect=_protect, turn_protect=True)
-        fit_schema_to_ctx(assistant, protect=_protect, turn_protect=True)
+        _fit(_named)
         return _nn
     except Exception as err:
         # WARNING, not debug -- same class as d6495f499.  A failure here
@@ -7526,6 +7578,17 @@ def _attach_named_tools_for_action(user_prompt):
         # be found by ABSENCE of the attach line.
         _ctx_safe_log('warning',
                       f"named attach skipped: {err} for session: {user_prompt}")
+        # A failed attach must not also leave the schema unbounded.  It
+        # protects the names this action resolved: the attach may have bound
+        # them before the failure, and turn_protect makes this fit the turn's
+        # record, so an empty one would let this fit and every later one in
+        # the turn evict the action's own tools.
+        _late_fit = locals().get('_fit')
+        if _late_fit is not None:
+            try:
+                _late_fit(locals().get('_named') or ())
+            except Exception:
+                pass
         return False
 
 
@@ -7539,6 +7602,8 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
     user_prompt = f'{user_id}_{prompt_id}'
 
     request_id_list[user_prompt] = request_id
+    # A turn begins with no pause pending (helper_fun.clear_pause_request).
+    helper_fun.clear_pause_request()
     try:
         if file_id:
             recent_file_id[user_id] = file_id
@@ -7591,6 +7656,12 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
             assistant, user_proxy, group_chat, manager, helper, stop = role_agents[user_prompt]
             result = user_proxy.initiate_chat(manager, message=user_message, speaker_selection={"speaker": "assistant"},
                                               clear_history=False)
+            # The persona-selection chat's selector yields too (#129): a
+            # round it ended for the person is the turn's pause, not the
+            # role chat's last line.
+            if helper_fun.pause_requested():
+                return helper_fun.answer_the_pause(
+                    user_prompt, None, 'reuse persona selection')
             # Print the chat summary
             current_app.logger.info("\n=== Chat Summary ===")
             # current_app.logger.info(result.summary)

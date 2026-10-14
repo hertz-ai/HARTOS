@@ -242,12 +242,51 @@ class ModelRegistry:
                 if m.accuracy_score >= min_accuracy
                 and m.tier != ModelTier.DRAFT
                 and m.is_dispatchable()
+                # The configured expert is an EXPERT: only the expert
+                # selectors may pick it (review of 065cef8bb, C2: with a high
+                # accuracy and a slow own model it won the fast path for a
+                # user's turn, around the lane gate).
+                and m.model_id != CONFIGURED_EXPERT_ID
             ]
         if not candidates:
             return None
         return min(candidates, key=lambda m: m.avg_latency_ms)
 
-    def get_expert_model(self, max_cost: float = float('inf')) -> Optional[ModelBackend]:
+    @staticmethod
+    def _offered(m: 'ModelBackend', lane: Optional[str]) -> bool:
+        """May ``m`` be offered to the call being selected for?
+
+        Only the configured expert is lane-gated (owner policy 2026-10-12:
+        Claude only where it drives revenue).  ``lane`` is the caller's
+        answer when it knows (the daemon knows its goal), else the lane of
+        the call in flight (core.llm_outbound_logger.current_lane).  When the
+        lane cannot be read, the expert is not offered: spending it by
+        accident is the failure the policy exists to prevent."""
+        if m.model_id != CONFIGURED_EXPERT_ID:
+            return True
+        try:
+            from core.autogen_config import expert_lanes
+            if lane is None:
+                from core.llm_outbound_logger import current_lane
+                lane = current_lane()
+            if lane not in expert_lanes():
+                return False
+            # The day cap (owner: $6/day on Claude, never a blocker): past it
+            # the expert is simply not offered and the turn runs on the node's
+            # own model.  An unreadable ledger withholds it too (fail closed).
+            # Called OUTSIDE the registry lock: this reads the ledger.
+            from integrations.agent_engine.budget_gate import expert_budget_allows
+            allowed, why = expert_budget_allows(m.config_list_entry.get('model'))
+            if not allowed:
+                logger.warning("configured expert not offered: %s", why)
+            return allowed
+        except Exception as exc:
+            logger.warning("configured expert withheld: lane or budget unreadable (%s)",
+                           type(exc).__name__)
+            return False
+
+    def get_expert_model(self, max_cost: float = float('inf'),
+                         lane: Optional[str] = None) -> Optional[ModelBackend]:
         """Get the highest-accuracy model within budget. DRAFT models are
         excluded — they answer via the draft-first path, never as an
         expert cross-check."""
@@ -258,11 +297,14 @@ class ModelRegistry:
                 and m.tier != ModelTier.DRAFT
                 and m.is_dispatchable()
             ]
+        # The lane and budget gate reads the spend ledger: outside the lock,
+        # so a slow DB never stalls model selection for every other caller.
+        candidates = [m for m in candidates if self._offered(m, lane)]
         if not candidates:
             return None
         return max(candidates, key=lambda m: m.accuracy_score)
 
-    def get_escalation_expert(self) -> Optional[ModelBackend]:
+    def get_escalation_expert(self, lane: Optional[str] = None) -> Optional[ModelBackend]:
         """The model a stuck goal action is handed to before a person (#106d).
 
         An EXPERT-tier backend this node can dispatch to, other than the model
@@ -279,6 +321,7 @@ class ModelRegistry:
                 and m.is_dispatchable()
                 and _llm_target(m.config_list_entry) != own
             ]
+        candidates = [m for m in candidates if self._offered(m, lane)]   # outside the lock
         if not candidates:
             return None
         return max(candidates, key=lambda m: m.accuracy_score)
@@ -296,7 +339,11 @@ class ModelRegistry:
                           # is_local=True with high accuracy scores, so
                           # 'local_only' and 'local_preferred' policies resolved
                           # to a speech engine instead of the local Qwen.
-                          and m.is_dispatchable()]
+                          and m.is_dispatchable()
+                          # A hosted expert is not this node's compute, whatever
+                          # its is_local flag says to the dispatcher; the
+                          # 'local' policies must never resolve to it.
+                          and m.model_id != CONFIGURED_EXPERT_ID]
         if not candidates:
             return None
         return max(candidates, key=lambda m: m.accuracy_score)
@@ -327,7 +374,7 @@ class ModelRegistry:
 
         return self.get_fast_model(min_accuracy)
 
-    def speculation_pair(self, min_accuracy: float = 0.0):
+    def speculation_pair(self, min_accuracy: float = 0.0, lane: Optional[str] = None):
         """The (fast, expert) pair speculation would use, or (None, None).
 
         Speculation needs two DIFFERENT dispatchable backends: a fast one to
@@ -340,7 +387,7 @@ class ModelRegistry:
         and any probe ask the SAME question rather than each rebuilding it.
         """
         fast = self.get_fast_model(min_accuracy)
-        expert = self.get_expert_model()
+        expert = self.get_expert_model(lane=lane)
         if not fast or not expert or fast.model_id == expert.model_id:
             return None, None
         return fast, expert
@@ -404,8 +451,57 @@ class ModelRegistry:
             model.accuracy_score = capped
 
 
+# The configured expert's registry id (owner policy 2026-10-12).  Referenced by
+# the lane gate in ModelRegistry._offered and by the daemon's escalation record.
+CONFIGURED_EXPERT_ID = 'configured-expert'
+
+
 # ─── Module-level singleton ───
 model_registry = ModelRegistry()
+
+
+def ensure_configured_expert_registered() -> bool:
+    """Keep the configured expert's registration equal to its configuration
+    (core.autogen_config.resolve_expert_backend); True when registered.
+
+    Registered as the EXPERT tier when the owner set the expert trio and it
+    names a different endpoint-or-model than the node's own LLM (the same
+    target would be a retry, not an expert: get_escalation_expert's rule).
+    Priced through spark_per_1k like every cloud model, so the budget gate and
+    get_expert_model's cost cap see one number.  is_local=True for the same
+    reason as 'configured-api': a dispatch to it runs this node's full /chat
+    pipeline with a model_config override, not the hive-peer POST.  Called at
+    boot from _register_defaults; calling it again after the trio changed or
+    went re-registers or unregisters accordingly (a running node re-reads its
+    configuration only when something calls this)."""
+    try:
+        from core.autogen_config import resolve_expert_backend
+        entry = resolve_expert_backend()
+    except Exception as _err:                        # never break registry init
+        logger.debug("configured expert not resolved: %s", _err)
+        entry = None
+    if entry is None or _llm_target(entry) == _own_llm_target():
+        if model_registry.unregister(CONFIGURED_EXPERT_ID):
+            logger.info("configured expert unregistered: no expert trio, or it "
+                        "names the node's own model")
+        return False
+    existing = model_registry.get_model(CONFIGURED_EXPERT_ID)
+    if existing is not None and _llm_target(existing.config_list_entry) == _llm_target(entry):
+        return True
+    from integrations.agent_engine.budget_gate import spark_per_1k
+    model_registry.register(ModelBackend(
+        model_id=CONFIGURED_EXPERT_ID,
+        display_name='Configured expert (%s)' % entry.get('model'),
+        tier=ModelTier.EXPERT,
+        config_list_entry=dict(entry),
+        avg_latency_ms=4000.0,             # a hosted frontier model; record_latency moves it
+        accuracy_score=0.95,
+        cost_per_1k_tokens=spark_per_1k(entry.get('model', '')),
+        is_local=True,
+        hardware_dependent=False,
+        gpu_tdp_watts=0.0,
+    ))
+    return True
 
 
 # ─── Default backend registration ───
@@ -617,6 +713,9 @@ def _register_defaults():
         ))
 
     ensure_claude_code_registered()
+    # 5b. The configured expert (Claude on central), offered to the revenue
+    #     lane only; see ensure_configured_expert_registered.
+    ensure_configured_expert_registered()
 
     # 5c. Distributed shard cluster (WAN pipeline-parallel inference) — feature-flagged.
     #     A model too big for one node is served by K peers, each holding a

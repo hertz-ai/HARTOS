@@ -18,11 +18,12 @@ there.  Two tables stand in for it:
   contribution notification (task_coordinator._notify_goal_contribution).
 
 Where they live: the coordinator's own storage directory
-(coordinator_backends.coordinator_storage_dir), beside its ledger.  The
-coordinator's store is that JSON ledger (the Redis backend never builds:
-_try_redis_backend names an undefined ``host``), so the tables are shared
-exactly when the coordinator's store is -- a remote worker's submit_result
-lands on the node holding the ledger, and that node holds the tables too.
+(coordinator_backends.coordinator_storage_dir), beside its JSON ledger.  With
+the JSON ledger the tables are shared exactly when the store is -- a remote
+worker's submit_result lands on the node holding the ledger, and that node
+holds the tables too.  They are node-local files on EVERY backend, so a Redis
+ledger shared by several nodes splits from them: a worker on another node
+finds no person for a handle it did not mint and sends no notification.
 
 Both tables are bounded (the oldest record goes first; re-recording makes a
 row the newest) and written atomically under one lock.

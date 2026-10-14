@@ -65,6 +65,7 @@ except Exception:
     PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'prompts'))
 os.makedirs(PROMPTS_DIR, exist_ok=True)
 from hartos import helper as helper_fun
+import contextlib
 import threading
 from concurrent.futures import ThreadPoolExecutor
 # transform_messages is an autogen.agentchat.contrib.capabilities submodule —
@@ -255,12 +256,14 @@ from hartos.lifecycle_hooks import (
     lifecycle_hook_track_recipe_completion,
     lifecycle_hook_check_all_actions_terminated, StateTransitionError, lifecycle_hook_validate_final_agent_creation,
     mark_action_waiting_for_user, resume_blocked_action, resume_from_user_input,
+    ledger_holds_no_block,
     sync_action_state_to_ledger,  # Sync ActionState to SmartLedger
     register_ledger_for_session,  # Register ledger for auto-sync
     stall_guard_step,             # No-progress stall tracker (reachable guard)
     cycle_guard_step,             # No-NET-progress tracker: cycling action (#485)
     recipe_correction_directive,  # Escalating "emit ONLY JSON" recipe fix (#89)
     is_recipe_creation_request,   # Deterministic recipe-prompt detector (speaker routing)
+    tool_result_is_action_work,   # The action's own tool result -> StatusVerifier (#220)
     RECIPE_CREATE_PROMPT_PREFIX,  # canonical recipe-prompt prefix (single source)
 )
 
@@ -810,14 +813,109 @@ class SubscriptionHandler:
         await component.stop()  # Stop the component after getting the response
 
 
-def has_pending_tool_calls(messages):
-    """Check if the last message contains tool calls that need execution."""
+# The one "is the last message an unanswered tool call" rule lives in
+# hartos.helper, where the yield-to-user check also asks it; re-exported here
+# for this module's two readers.
+from hartos.helper import has_pending_tool_calls  # noqa: E402
+
+
+# Every thread running a session's turn, by user_prompt (recipe() marks
+# them), each with how deep it has re-entered.  get_response_group re-enters
+# itself (safe_action_boundary_check, the flow-increment sites), so the SAME
+# thread entering again is still its one turn; any OTHER thread in the set is
+# "another turn in flight".  A set, not one owner: with one owner, three
+# overlapping requests for one session emptied the table when the first
+# returned, and the third settled the second's live tool call (review of
+# ff160f057, 2026-10-05).
+_TURNS_IN_FLIGHT = {}
+_TURNS_IN_FLIGHT_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def _turn_in_flight(user_prompt):
+    """Mark this thread as running ``user_prompt``'s turn for the duration
+    of the block.  Re-entrant: an inner block on the same thread deepens the
+    mark and leaving it only undoes its own level; every thread is counted
+    on its own, so one leaving never clears another's."""
+    me = threading.get_ident()
+    with _TURNS_IN_FLIGHT_LOCK:
+        running = _TURNS_IN_FLIGHT.setdefault(user_prompt, {})
+        running[me] = running.get(me, 0) + 1
+    try:
+        yield
+    finally:
+        with _TURNS_IN_FLIGHT_LOCK:
+            running = _TURNS_IN_FLIGHT.get(user_prompt)
+            if running is not None:
+                depth = running.get(me, 0) - 1
+                if depth > 0:
+                    running[me] = depth
+                else:
+                    running.pop(me, None)
+                    if not running:
+                        del _TURNS_IN_FLIGHT[user_prompt]
+
+
+def _another_turn_in_flight(user_prompt):
+    """True when a thread other than this one is running ``user_prompt``'s
+    turn right now.  The per-user lock is not held across LLM calls
+    (hart_intelligence_entry chat()), so /chat requests for one session can
+    overlap, and that is the only case in which a pending tool call at the
+    end of the group chat is really being processed."""
+    me = threading.get_ident()
+    with _TURNS_IN_FLIGHT_LOCK:
+        return any(t != me for t in _TURNS_IN_FLIGHT.get(user_prompt, ()))
+
+
+def _settle_orphaned_tool_calls(group_chat, manager=None):
+    """Answer the tool calls of the group chat's last message that no turn
+    will execute.
+
+    A turn that ends on a tool call -- autogen's max_round cap (live
+    2026-10-04 17:16:36, agent 20, save_data_in_memory) or the user-input
+    gate -- leaves the call unanswered at the end of the group chat, and
+    get_response_group then refused every later message with 'Processing a
+    tool now please try later' until the process restarted.  Each call gets
+    a tool message carrying HISTORICAL_TOOL_PLACEHOLDER, the one vocabulary
+    every reader (ToolMessageHandler.real_tool_answer, the fabrication gate)
+    already knows means "no real result", so nothing can take the settle for
+    the tool having run.  No real answer exists to look up (what
+    ToolMessageHandler.real_tool_answer does for a call a peer DID run): the
+    turn ended before any agent executed it.
+
+    The answer takes the shape autogen's own generate_tool_calls_reply gives
+    one (role 'tool', 'tool_responses', the contents joined) and goes where
+    run_chat puts a reply: onto the group chat, and through the manager into
+    every agent's own history.  The model reads each agent's history, not
+    the group list, and there the call was still the newest assistant tool
+    call, which ToolMessageHandler treats as active and leaves unanswered.
+    Returns how many calls were settled.
+    """
+    from core.constants import HISTORICAL_TOOL_PLACEHOLDER
+    messages = group_chat.messages
     if not messages:
-        return False
-    last_msg = messages[-1]
-    return (last_msg.get('role') == 'assistant' and
-            'tool_calls' in last_msg and
-            last_msg['tool_calls'])
+        return 0
+    last = messages[-1]
+    calls = last.get('tool_calls') if isinstance(last, dict) else None
+    ids = [c.get('id') for c in (calls or [])
+           if isinstance(c, dict) and c.get('id')]
+    if not ids:
+        return 0
+    responses = [{'tool_call_id': call_id, 'role': 'tool',
+                  'content': HISTORICAL_TOOL_PLACEHOLDER} for call_id in ids]
+    settle = {'role': 'tool', 'tool_responses': responses,
+              'content': '\n\n'.join(r['content'] for r in responses)}
+    messages.append(settle)
+    if manager is not None:
+        for agent in (getattr(group_chat, 'agents', None) or []):
+            try:
+                manager.send(dict(settle), agent, request_reply=False,
+                             silent=True)
+            except Exception as _send_err:
+                current_app.logger.warning(
+                    f'[ORPHAN-TOOL-CALL] could not hand the settle to '
+                    f'{getattr(agent, "name", agent)}: {_send_err}')
+    return len(ids)
 
 
 def _seed_messages(user_id, prompt_id=None):
@@ -1954,7 +2052,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         tool_logger.info("Initializing AP2 (Agent Protocol 2) - Agentic Commerce...")
 
         # Get AP2 payment tools for this agent
-        ap2_tools = get_ap2_tools_for_autogen('assistant')
+        ap2_tools = get_ap2_tools_for_autogen('assistant', user_id=user_id)
 
         # Register payment tools — wrap with @log_tool_execution so payment
         # operations fire UI status emits + structured-error envelopes
@@ -2038,6 +2136,14 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             from integrations.agent_engine.news_tools import register_news_tools
             register_news_tools(helper, assistant, user_id)
             tool_logger.info("News tools loaded (Tier 2) based on prompt content")
+        if 'commerce' in goal_tags:
+            # McGroce shopping / checkout / merchant onboarding.  Checkout is
+            # human-gated (AP2 CartMandate approved on the approval card), and
+            # the McGroce customer comes from the commerce binding for this
+            # user_id -- never from a tool argument.
+            from integrations.commerce.commerce_tools import register_commerce_tools
+            register_commerce_tools(helper, assistant, user_id)
+            tool_logger.info("Commerce tools loaded (Tier 2) based on prompt content")
     except Exception as e:
         # Promoted from debug to warning: a failure here means the agent
         # boots without its goal-specific tools, so it can talk about the
@@ -2117,6 +2223,12 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
 
         user_prompt = f'{user_id}_{prompt_id}'
         current_action_id = user_tasks[user_prompt].current_action
+
+        # A background turn stops between rounds while a person is using
+        # the computer (#129); the turn's loop answers for it and the goal's
+        # next dispatch resumes this same session.
+        if helper_fun.yield_between_rounds(groupchat.messages):
+            return None
 
         # ─── STUCK-LOOP GUARD (#485) ───────────────────────────────────
         # Detects when the same (last_speaker, last_message_content) pair
@@ -2440,6 +2552,18 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
 
         # current_app.logger.info(messages[-1])
         if messages[-1]['role'] == 'tool':
+            # Every tool the action names has returned its work: the
+            # StatusVerifier judges it now, as REUSE's selector hands it a
+            # result the Assistant ran.  Back to the Assistant, the verifier
+            # never spoke while the model kept calling tools (live 2026-10-10,
+            # agent 54 action 3: three attempts in 4 min 16 s, 42 tool
+            # results, no verdict, [NEEDS-INPUT]).
+            if tool_result_is_action_work(user_prompt, current_action_id,
+                                          len(messages) - 1):
+                current_app.logger.info(
+                    f'[OWN-WORK] action {current_action_id}: every tool it '
+                    f'names has returned its work -> StatusVerifier')
+                return verify
             current_app.logger.info('Message role is tool returning assistant')
             return assistant
 
@@ -2534,11 +2658,33 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                     f"[USER-INPUT-GATE] flag set failed (non-blocking): {_gate_err}"
                                 )
                             if _needs_user_input:
-                                mark_action_waiting_for_user(
-                                    user_prompt, current_action_id,
-                                    json_obj.get('message') or 'Waiting for user input')
-                            else:
-                                safe_set_state(user_prompt, current_action_id, ActionState.PENDING, "verifier pending")
+                                if not mark_action_waiting_for_user(
+                                        user_prompt, current_action_id,
+                                        json_obj.get('message') or 'Waiting for user input'):
+                                    # Not silent: the person is still asked,
+                                    # and _resume_prior_user_input_block lets
+                                    # their answer release a block the ledger
+                                    # never held (live 2026-10-10, agent 54).
+                                    current_app.logger.warning(
+                                        f"[USER-INPUT-GATE] Action "
+                                        f"{current_action_id} waits for the "
+                                        f"person, but the ledger refused the "
+                                        f"block (its task is not in progress)")
+                                # END the chat round here, the way the loop-break
+                                # (#485) and the TERMINATE guard do: autogen's
+                                # run_chat breaks on a None speaker, and the OUTER
+                                # loop's gate asks the user on its first iteration.
+                                # Returning the Assistant kept the chat running to
+                                # max_round=30 -- live 2026-10-04 17:10, agent 20:
+                                # six flags in one turn, each re-execution of
+                                # 'Respond to user' sending the user another
+                                # greeting, and turn 2 capped on an unanswered tool
+                                # call (see get_response_group's orphan settle).
+                                current_app.logger.info(
+                                    f"[USER-INPUT-GATE] ending the chat round: action "
+                                    f"{current_action_id} is waiting for the user")
+                                return None
+                            safe_set_state(user_prompt, current_action_id, ActionState.PENDING, "verifier pending")
                             return assistant
                         elif json_obj['status'].lower() == 'requires_breakdown':
                             # Handle subtask breakdown request from StatusVerifier
@@ -3530,6 +3676,10 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
 
     def state_transition1(last_speaker, groupchat):
         current_app.logger.info('INSIDE TIMER STATE TRANSITION')
+        # Same between-round stop as state_transition (#129); the scheduler
+        # runs this job again later.
+        if helper_fun.yield_between_rounds(groupchat.messages):
+            return None
         messages = groupchat.messages
         if not messages:
             current_app.logger.warning("state_transition1 called with empty messages list")
@@ -3865,6 +4015,26 @@ def should_continue_autonomously(user_prompt: str) -> bool:
 
     return False
 
+def _stub_action_text(entry):
+    """The text of a gather-info salvage stub's action, else ``entry`` as is.
+
+    The salvage writers (hart_intelligence_entry) used to bank their one
+    placeholder action as {'action': 'Respond to user', 'action_id': 1,
+    'status': 'pending'}; 420 such configs were live on 2026-10-04, and every
+    CREATE prompt plus the help question printed the dict verbatim ('Step 1
+    ("{'action': 'Respond to user', ...}")').  Unwrapped: a dict whose
+    action is text and whose keys are nothing but that stub's own (action,
+    action_id, status) -- 420 of 420 live matches on 2026-10-05 were the
+    stub.  A real action dict (tool_name, depends_on, ...) and a string pass
+    through untouched, so REUSE's dict readers (Action.
+    get_action_byaction_id) and the ledger see what they always saw.
+    """
+    if (isinstance(entry, dict) and isinstance(entry.get('action'), str)
+            and set(entry) <= {'action', 'action_id', 'status'}):
+        return entry['action']
+    return entry
+
+
 def create_action_with_ledger(actions: List[Dict], user_id: int, prompt_id: int, user_prompt: str,
                               flow_id: Optional[int] = None) -> Action:
     """
@@ -3892,6 +4062,10 @@ def create_action_with_ledger(actions: List[Dict], user_id: int, prompt_id: int,
     Returns:
         Action instance with Smart Ledger attached
     """
+    # The ONE CREATE-side reader of a config's actions: a salvage stub's dict
+    # reads as its text here, so every prompt, the help question and the
+    # ledger task carry 'Respond to user', not the dict.
+    actions = [_stub_action_text(a) for a in (actions or [])]
     action_instance = Action(actions)
 
     # Resolve the active flow for this ledger.  Caller can override; if
@@ -4313,6 +4487,17 @@ def _resume_prior_user_input_block(user_prompt, text, failure=False):
     # Clear the CREATE-loop gate only after the canonical ledger accepted the
     # resume.  If storage is unavailable the same attributed answer can be
     # retried; clearing the marker here would strand the still-BLOCKED task.
+    # A block the ledger never held is the other case: block_for_user_input
+    # refuses a task that is not in progress, and the gate was flagged anyway
+    # (live 2026-10-10, agent 54: a resumed session's FAILED action_2), so no
+    # resume can ever succeed and every answer got the same question back.
+    # Nothing durable is waiting there; this attributed answer releases it.
+    if not resumed and ledger_holds_no_block(user_prompt, action_id):
+        logging.getLogger(__name__).warning(
+            '[USER-INPUT-GATE] Releasing action %s: the ledger never held its '
+            'block, so %s answers it', action_id,
+            'a genuine user reply' if is_user else 'its assigned expert turn')
+        resumed = True
     if not resumed:
         logging.getLogger(__name__).warning(
             '[USER-INPUT-GATE] Keeping action %s blocked: durable resume from '
@@ -4352,6 +4537,16 @@ def _attach_for_create_turn(agents_object, text, user_prompt):
             exc_info=True)
 
 
+def _answer_the_pause(user_prompt, group_chat, where):
+    """get_response_group's reply once a round ended for the person
+    (helper_fun.pause_requested): the transcript is kept for the session's
+    next turn and nothing else is touched (helper_fun.answer_the_pause)."""
+    messages[user_prompt] = group_chat.messages
+    return helper_fun.answer_the_pause(
+        user_prompt, getattr(user_tasks.get(user_prompt), 'current_action', None),
+        where)
+
+
 def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
     """
     Handles the response generation process for an agent group.
@@ -4387,12 +4582,22 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
         author, assistant_agent, executor, group_chat, manager, chat_instructor,agents_object = user_agents[user_prompt]
     clear_history = False
 
-    # TOOL CALL AND RESPONSE CHECK with TIMEOUT
-    tool_timeout = 2  # Timeout in seconds (adjust as needed)
-    current_time = time.time()
-    if len(group_chat.messages)>2 and 'tool_calls' in group_chat.messages[-1]:
-        current_app.logger.warning('GOT INPUT BUT LAST MESSAGE IS tool_calls should wait for tool response')
-        return 'Processing a tool now please try later'
+    # TOOL CALL AND RESPONSE CHECK.  A turn that ends while a tool call is the
+    # last message leaves it unanswered: autogen's max_round cap can land there
+    # (live 2026-10-04 17:16:36, agent 20, save_data_in_memory) and so can the
+    # user-input gate.  Only a turn STILL RUNNING on another thread owns that
+    # call; with none, it is an orphan, and answering the canned line to every
+    # later message kept agent 20 unreachable until a restart.
+    if len(group_chat.messages) > 2 and has_pending_tool_calls(group_chat.messages):
+        if _another_turn_in_flight(user_prompt):
+            current_app.logger.warning(
+                'GOT INPUT BUT LAST MESSAGE IS tool_calls and another turn of '
+                f'{user_prompt} is still running: asking the user to retry')
+            return 'Processing a tool now please try later'
+        _settled = _settle_orphaned_tool_calls(group_chat, manager)
+        current_app.logger.warning(
+            f'[ORPHAN-TOOL-CALL] settled {_settled} unanswered call(s) left by '
+            f'an ended turn of {user_prompt}; this turn proceeds')
 
     if Failure:
         current_app.logger.warning(f'CHECK THIS OUT group_chat.messages:{group_chat.messages[-5:]}')
@@ -4522,6 +4727,36 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             json_obj = None  # Reset each iteration — set by state_transition JSON parse paths
 
             current_app.logger.info(f"WHILE LOOP ITERATION #{while_loop_iterations} , Current Action Id:{current_action_id}")
+
+            # YIELD-TO-USER (#129).  Owner ruling 2026-10-04: every background
+            # agent pauses while the person is using the computer and resumes,
+            # idempotently, once they are actually idle; the VLM loop's own
+            # pause was never enough.  Measured that day (gui_app.log): the
+            # one gate (dispatch.should_yield_to_user) was CLOSED on
+            # user_present 19:12:55-19:20:56 while coding-daemon turn
+            # daemon_d69d24f8 ran autogen rounds straight through it, holding
+            # the single local-LLM permit -- the gate was consulted only per
+            # daemon tick, never between the rounds of a turn already
+            # running.  Now every speaker selector asks helper_fun.
+            # yield_between_rounds first and returns None, which ends the
+            # round before the next model call and marks this turn
+            # (helper_fun.pause_requested).  This read, and the one after the
+            # loop for its own exits, answer for it.
+            #
+            # RETURN, not break: break falls to the tail-message return and
+            # hands the user the group chat's last line (the 2026-09-06
+            # lesson of the USER-INPUT-GATE below).  Nothing else is touched:
+            # the action keeps its state, the ledger its task, messages[] the
+            # transcript, so the goal's next dispatch -- which the daemon
+            # issues only once the gate is open -- re-enters this session and
+            # continues the same round; a second pause while the person is
+            # still there is the same reply again, with no model call.  The
+            # dispatchers hold the reply for later (core.agent_tools.
+            # is_user_pause): not a result, not a failure, not a parked goal.
+            if helper_fun.pause_requested():
+                return _answer_the_pause(
+                    user_prompt, group_chat,
+                    f"OUTER loop at iteration #{while_loop_iterations}")
 
             # USER-INPUT GATE (code-level enforcement):  if state_transition
             # has flagged this action as blocked on user input
@@ -5508,6 +5743,14 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
         else:
             current_app.logger.info(f"Exited while loop after {while_loop_iterations} iterations")
 
+        # The loop's own exits -- its 30-minute bound, max_iterations, the
+        # guards that break -- can follow a round a selector ended for the
+        # person.  Answering the group chat's tail then reported a paused
+        # turn as its result and left the mark for the next turn (review of
+        # 96a9ca9f8, blocker 3: the timeout was checked before the mark).
+        if helper_fun.pause_requested():
+            return _answer_the_pause(user_prompt, group_chat, 'after the loop')
+
         # Store messages and prepare final response
         messages[user_prompt] = group_chat.messages
 
@@ -6100,6 +6343,24 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
                 f"({', '.join(sorted({s['tool_name'] for s in steps}))}); "
                 f"not banking that as its recipe")
             return False
+        # An action that names a tool is done by that tool's work, the rule
+        # the completion gate and the REUSE fabrication gate read
+        # (lifecycle_hooks.action_named_tools).  A window where none of the
+        # named tools ran successfully is not that action's recipe, and the
+        # no-op marker below is not one either.  Live: 26251890627_0_recipe
+        # .json (2026-09-15) banked three send_message_to_user "Please wait
+        # while I read the file" steps as the recipe of
+        # "execute_coding_task: read error log file ...", and the coding
+        # daemon replays it.
+        from hartos.lifecycle_hooks import action_named_tools
+        _named = action_named_tools(getattr(group_chat, 'agents', None),
+                                    _action_text)[1]
+        if _named and not any(s['tool_name'] in _named for s in steps):
+            current_app.logger.warning(
+                f"[TRACE-BANK] action {action_id} names "
+                f"{', '.join(sorted(_named))} and none of them ran "
+                f"successfully; not banking that as its recipe")
+            return False
         if not steps:
             steps = [{
                 'steps': 'no-op: action completed without tool execution',
@@ -6588,6 +6849,8 @@ from core.llm_outbound_logger import with_llm_context as _with_llm_context
 def recipe(user_id, text, prompt_id, file_id, request_id):
     user_prompt = f'{user_id}_{prompt_id}'
     request_id_list[user_prompt] = request_id
+    # A turn begins with no pause pending (helper_fun.clear_pause_request).
+    helper_fun.clear_pause_request()
     current_app.logger.info('--' * 100)
 
     # [OK] NEW: Initialize persistent storage for this prompt_id
@@ -6613,13 +6876,17 @@ def recipe(user_id, text, prompt_id, file_id, request_id):
     else:
         current_app.logger.info(f"♻️ Using existing session for {user_prompt}")
 
-    try:
-        last_response = get_response_group(user_id, text, prompt_id)
-    except Exception as e:
-        current_app.logger.error(f"Error occurred in create Recipe: {str(e)}")
-        error_message = traceback.format_exc()
-        current_app.logger.error(f"Error occurred in create Recipe stack trace:\n{error_message}")
-        last_response = get_response_group(user_id, text, prompt_id, True, e)
+    # This thread owns the session's turn until it returns: get_response_group
+    # tells a pending tool call owned by a RUNNING turn from one orphaned by
+    # an ended turn by asking _another_turn_in_flight.
+    with _turn_in_flight(user_prompt):
+        try:
+            last_response = get_response_group(user_id, text, prompt_id)
+        except Exception as e:
+            current_app.logger.error(f"Error occurred in create Recipe: {str(e)}")
+            error_message = traceback.format_exc()
+            current_app.logger.error(f"Error occurred in create Recipe stack trace:\n{error_message}")
+            last_response = get_response_group(user_id, text, prompt_id, True, e)
 
     # Rest of the function remains the same...
     if scheduler_check.get(user_prompt) is True:

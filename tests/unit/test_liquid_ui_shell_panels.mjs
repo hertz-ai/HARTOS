@@ -182,7 +182,7 @@ var MANIFEST = {
   agents_browse: { title:'Agents', route:'/agents', default_size:[900,700] },
   recipes: { title:'Recipes', route:'/social/recipes', default_size:[800,600] },
   communities: { title:'Communities', route:'/social/communities', default_size:[800,600] },
-  assistant: { title:'Assistant', route:'/social/assistant', floating:true, default_size:[400,600] }
+  assistant: { title:'Assistant', route:'/local', floating:true, default_size:[400,600] }
 };
 var SYSTEM_PANELS = {};
 var NUNBA_BASE = 'http://127.0.0.1:5000';

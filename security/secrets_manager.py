@@ -66,6 +66,11 @@ NODE_SECRET_KEYS = (
 )
 
 
+#: Marks a value encrypt_value sealed; decrypt_value reads anything else as
+#: plain text.
+SEALED_PREFIX = 'fernet:'
+
+
 class SecretsManager:
     """Thread-safe singleton for encrypted secret access."""
 
@@ -180,6 +185,28 @@ class SecretsManager:
         with open(vault_path, 'wb') as f:
             f.write(encrypted)
         logger.info("Secrets vault saved.")
+
+    def encrypt_value(self, value: str) -> str:
+        """Seal one value with the vault's key, for a secret kept outside the
+        vault file (a channel binding's token).  Raises RuntimeError when
+        HEVOLVE_MASTER_KEY is not set, as set_secret does."""
+        if self._fernet is None:
+            raise RuntimeError("Cannot encrypt: HEVOLVE_MASTER_KEY not set")
+        return SEALED_PREFIX + self._fernet.encrypt(value.encode()).decode()
+
+    def decrypt_value(self, stored: str) -> str:
+        """Open a value encrypt_value sealed.  A value without SEALED_PREFIX
+        was stored in plain text and is returned as it is.  Raises ValueError
+        when a sealed value cannot be opened (no key, or a different one)."""
+        if not stored.startswith(SEALED_PREFIX):
+            return stored
+        if self._fernet is None:
+            raise ValueError("value is encrypted but HEVOLVE_MASTER_KEY is not set")
+        try:
+            return self._fernet.decrypt(stored[len(SEALED_PREFIX):].encode()).decode()
+        except InvalidToken:
+            raise ValueError("value was encrypted under a different "
+                             "HEVOLVE_MASTER_KEY") from None
 
     def has_secret(self, name: str) -> bool:
         """Check if a secret exists (env or vault)."""

@@ -8,7 +8,8 @@ for create / join / leave / end / invite, plus the AgentJoinGrant
 gate for agents joining as participants.
 
 What lives here:
-  - CallService.create / get / end — CallSession bookkeeping.
+  - CallService.create / start / active_call / get / end — CallSession
+    bookkeeping (start also says whether it opened the call).
   - CallService.join / leave — CallParticipant lifecycle, with
     UNIQUE-WHERE-left_at-IS-NULL invariant ensuring exactly one
     active participant row per (call, user).
@@ -41,6 +42,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -75,16 +77,31 @@ class CallService:
                max_participants: int = DEFAULT_MAX_PARTICIPANTS,
                settings: Optional[Dict[str, Any]] = None,
                tenant_id: Optional[str] = None) -> Dict[str, Any]:
-        """Create a CallSession row.
+        """The parent's call: the one in progress, or a new one (start)."""
+        return CallService.start(
+            db, parent_kind, parent_id, started_by, kind=kind, title=title,
+            max_participants=max_participants, settings=settings,
+            tenant_id=tenant_id)[0]
+
+    @staticmethod
+    def start(db, parent_kind: str, parent_id: str, started_by: str,
+              kind: str = 'voice', title: Optional[str] = None,
+              max_participants: int = DEFAULT_MAX_PARTICIPANTS,
+              settings: Optional[Dict[str, Any]] = None,
+              tenant_id: Optional[str] = None) -> Tuple[Dict[str, Any], bool]:
+        """Create a CallSession row, or return the parent's call in progress;
+        with it, whether this start opened it.  Only start can say: a caller
+        that looked first and then created would take a call someone else
+        opened in between for its own.
 
         The starter must be a member of the parent (community or
         conversation) — gated by Membership lookup.  Non-members
         raise CallError so we don't leak the existence of the parent.
 
-        Idempotency: a parent already has-an-active-call short-circuits
-        and returns the existing row instead of creating a duplicate.
-        Two clients racing on the Start Call button get the same call,
-        which is what users expect.
+        Idempotency: a parent's call in progress is returned instead of a
+        duplicate.  Not a guarantee: nothing in the schema stops two open
+        calls on one parent, so two starts that both pass the lookup before
+        either INSERTs each open one (P4-1 below).
         """
         if kind not in ALLOWED_CALL_KINDS:
             raise CallError(f"unsupported call kind: {kind!r}")
@@ -104,15 +121,9 @@ class CallService:
         # partial index isn't in the migration today (deferred to
         # Phase 7d.B alongside the MySQL workaround for #2), but the
         # try/except on insert + recheck closes the window in code.
-        existing = db.execute(text(
-            "SELECT id FROM call_sessions "
-            "WHERE parent_kind = :pk AND parent_id = :pid "
-            "AND ended_at IS NULL "
-            "ORDER BY started_at DESC LIMIT 1"),
-            {'pk': parent_kind, 'pid': parent_id}
-        ).fetchone()
+        existing = CallService.active_call(db, parent_kind, parent_id)
         if existing is not None:
-            return CallService.get(db, existing[0])
+            return existing, False
 
         call_id = str(uuid.uuid4())
         try:
@@ -131,18 +142,12 @@ class CallService:
             # Concurrent starter beat us to the INSERT — re-SELECT
             # the now-active call and return it.  Reviewer P4-1.
             logger.info(
-                "CallService.create concurrent INSERT collision "
+                "CallService.start concurrent INSERT collision "
                 "for parent=%s/%s: %s; re-reading", parent_kind,
                 parent_id, e)
-            existing = db.execute(text(
-                "SELECT id FROM call_sessions "
-                "WHERE parent_kind = :pk AND parent_id = :pid "
-                "AND ended_at IS NULL "
-                "ORDER BY started_at DESC LIMIT 1"),
-                {'pk': parent_kind, 'pid': parent_id}
-            ).fetchone()
+            existing = CallService.active_call(db, parent_kind, parent_id)
             if existing is not None:
-                return CallService.get(db, existing[0])
+                return existing, False
             raise CallError(f"could not create call: {e}")
         db.commit()
 
@@ -150,7 +155,21 @@ class CallService:
         # query reflects them immediately.
         CallService.join(db, call_id, started_by,
                          device_kind='mobile', tenant_id=tenant_id)
-        return CallService.get(db, call_id)
+        return CallService.get(db, call_id), True
+
+    @staticmethod
+    def active_call(db, parent_kind: str,
+                    parent_id: str) -> Optional[Dict[str, Any]]:
+        """The parent's call in progress (the newest, the one create returns
+        instead of starting another), or None."""
+        row = db.execute(text(
+            "SELECT id FROM call_sessions "
+            "WHERE parent_kind = :pk AND parent_id = :pid "
+            "AND ended_at IS NULL "
+            "ORDER BY started_at DESC LIMIT 1"),
+            {'pk': parent_kind, 'pid': parent_id}
+        ).fetchone()
+        return CallService.get(db, row[0]) if row is not None else None
 
     @staticmethod
     def get(db, call_id: str) -> Dict[str, Any]:
@@ -179,6 +198,7 @@ class CallService:
         """
         sess = CallService.get(db, call_id)
         if sess.get('ended_at'):
+            _stop_agents(call_id)
             return sess  # idempotent — already ended
         is_starter = sess['started_by'] == ended_by_id
         is_admin = _is_parent_admin(
@@ -195,6 +215,7 @@ class CallService:
                 "WHERE id = :id AND ended_at IS NULL"),
                 {'id': call_id})
         db.commit()
+        _stop_agents(call_id)
         return CallService.get(db, call_id)
 
     # ── Participant lifecycle ────────────────────────────────────────
@@ -272,7 +293,9 @@ class CallService:
                     scope: Dict[str, Any],
                     source: str = 'user_explicit',
                     tenant_id: Optional[str] = None) -> Dict[str, Any]:
-        """Owner grants an agent permission to join a parent.
+        """The agent's owner grants it permission to join a parent -- or,
+        on a machine a person owns, that machine's owner does, for any
+        agent on it (HEVOLVE_OWNER_USER_ID; see below).
 
         Idempotent on (agent_id, parent_kind, parent_id) — a re-grant
         with the same triple updates the scope rather than inserting
@@ -295,7 +318,15 @@ class CallService:
         if agent_row[0] != 'agent':
             raise CallError("user is not an agent")
         agent_owner = agent_row[1]
-        if agent_owner is None:
+        # This machine's owner decides which agents join calls on it, whoever
+        # wrote them (_machine_owner): an agent is shared as a recipe, and
+        # whoever runs it on their own compute trusts it with their data, not
+        # its author (owner ruling 2026-10-08).  Elsewhere, and for anyone
+        # else, the rule below.
+        machine_owner = _machine_owner()
+        if machine_owner and str(owner_id) == machine_owner:
+            pass
+        elif agent_owner is None:
             # Pass-4 P4-3 fix: system / ownerless agents must NOT be
             # granted by an arbitrary user.  Previously the
             # `agent_row[1] is not None` short-circuit allowed any
@@ -312,18 +343,27 @@ class CallService:
         elif agent_owner != owner_id:
             raise CallError("only the agent's owner can grant join")
 
-        # Existing active grant? Update scope in place.
+        # Existing active grant? Update it in place.  It is then the
+        # updater's (attach_agent runs the call as the grant's owner), so the
+        # machine owner changing a grant its author made makes it theirs --
+        # and on their machine nobody else changes one they made.  (The first
+        # granter of a grant someone else has updated can no longer revoke it.)
         existing = db.execute(text(
-            "SELECT id FROM agent_join_grants "
+            "SELECT id, owner_id FROM agent_join_grants "
             "WHERE agent_id = :aid AND parent_kind = :pk "
             "AND parent_id = :pid AND revoked_at IS NULL"),
             {'aid': agent_id, 'pk': parent_kind, 'pid': parent_id}
         ).fetchone()
         scope_json = json.dumps(scope or {})
         if existing is not None:
+            if (machine_owner and str(existing[1]) == machine_owner
+                    and str(owner_id) != machine_owner):
+                raise CallError(
+                    "this machine's owner set this grant; only they change it")
             db.execute(text(
-                "UPDATE agent_join_grants SET scope = :s WHERE id = :id"),
-                {'s': scope_json, 'id': existing[0]})
+                "UPDATE agent_join_grants SET scope = :s, owner_id = :oid "
+                "WHERE id = :id"),
+                {'s': scope_json, 'oid': owner_id, 'id': existing[0]})
             db.commit()
             return CallService._grant_dict(db, existing[0])
 
@@ -341,7 +381,8 @@ class CallService:
 
     @staticmethod
     def revoke_agent(db, grant_id: str, revoker_id: str) -> bool:
-        """Owner revokes an active grant. Idempotent."""
+        """The granter revokes an active grant -- or this machine's owner
+        does, for any grant on it (_machine_owner). Idempotent."""
         row = db.execute(text(
             "SELECT owner_id, revoked_at FROM agent_join_grants "
             "WHERE id = :id"),
@@ -349,7 +390,9 @@ class CallService:
         ).fetchone()
         if not row:
             raise CallError("grant not found")
-        if row[0] != revoker_id:
+        machine_owner = _machine_owner()
+        if row[0] != revoker_id and not (
+                machine_owner and str(revoker_id) == machine_owner):
             raise CallError("only the granter can revoke")
         if row[1] is not None:
             return False  # already revoked
@@ -486,6 +529,40 @@ def _is_parent_member(db, parent_kind: str, parent_id: str,
         ).fetchone()
         return row is not None
     return False
+
+
+def _stop_agents(call_id: str) -> None:
+    """Stop the agent bridges in an ended call.  attach_agent starts one per
+    agent; until it is detached its worker keeps ticking and its publisher
+    keeps a seat in the room, and nothing else detaches it."""
+    try:
+        from .agent_voice_bridge import AgentVoiceBridge
+        for worker in AgentVoiceBridge.list_active(call_id):
+            AgentVoiceBridge.detach_agent(call_id, worker['agent_id'])
+    except Exception as e:
+        logger.warning("CallService.end: the agents in call=%s were not "
+                       "stopped: %s", call_id, e)
+
+
+def _machine_owner() -> Optional[str]:
+    """Who owns the machine this node runs on, where one person does: on a
+    flat node, HEVOLVE_OWNER_USER_ID as every owner gate reads it
+    (capability_setup.setup_owner).  None on a node that serves many people
+    -- Nunba exports the variable on every tier, so its presence says
+    nothing about whose machine it is.
+
+    Flat means flat both as claimed and as proven.  The claim
+    (HEVOLVE_NODE_TIER) withholds the right: the product's own promotions
+    set 'regional' with no certificate and leave an upgraded central with
+    no key, and get_node_tier, which asks what a node has PROVEN, answers
+    'flat' for both.  The proof catches the converse, a node promoted to
+    central by its key with no claim set."""
+    from security.key_delegation import get_node_tier
+    claimed = (os.environ.get('HEVOLVE_NODE_TIER') or 'flat').strip().lower()
+    if claimed != 'flat' or get_node_tier() != 'flat':
+        return None
+    from integrations.agent_engine.capability_setup import setup_owner
+    return setup_owner()
 
 
 def _is_parent_admin(db, parent_kind: str, parent_id: str,

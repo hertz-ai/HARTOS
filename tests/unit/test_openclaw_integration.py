@@ -601,3 +601,27 @@ class TestOpenClawAPIs:
         with app.test_client() as c:
             resp = c.get('/api/openclaw/skills/search')
             assert resp.status_code == 400
+
+
+class TestSkillBroadcastNamesItsNode:
+    """A broadcast skill names the node it came from, so a receiving node can
+    file it per peer (FederatedAggregator.receive_recipe_delta keys by node)
+    and skip its own echo.  RED before: the delta carried no node_id, so even
+    a wired receiver could not file it."""
+
+    def test_the_broadcast_delta_carries_this_nodes_id(self, tmp_path):
+        from integrations.openclaw import skill_exporter as se
+        (tmp_path / 'hart_recipe.json').write_text(
+            json.dumps({'actions': [{'a': 1}, {'a': 2}]}), encoding='utf-8')
+        published = []
+        bus = MagicMock()
+        bus.publish.side_effect = lambda topic, data: published.append((topic, data))
+        with patch('core.peer_link.message_bus.get_message_bus', return_value=bus), \
+             patch('security.node_integrity.get_node_identity',
+                   return_value={'node_id': 'node-A'}):
+            se._broadcast_skill_via_p2p(str(tmp_path), slug='book-a-table')
+        assert [t for t, _ in published] == ['federation.recipe_delta']
+        data = published[0][1]
+        assert data['node_id'] == 'node-A'
+        assert data['recipes'][0]['id'] == 'book-a-table'
+        assert data['recipes'][0]['action_count'] == 2

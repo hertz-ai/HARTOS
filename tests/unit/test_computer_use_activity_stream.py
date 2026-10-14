@@ -241,3 +241,34 @@ def test_a_joined_run_whose_stamp_is_closed_takes_no_steps(ledger, wired):
         assert ledger.get_task('computer_use_run1').status == TaskStatus.IN_PROGRESS
     finally:
         tld.clear_activity_run()
+
+
+def test_the_run_close_never_shares_a_msg_id_with_the_last_step(ledger, wired):
+    """Live 2026-10-04 17:02:12, task computer_use_443f86f06cd9: the loop's
+    third consecutive failed step and the close finish_run sent for exit
+    'action_error' both carried msg_id computer-use:<task>:4:failed.  The
+    page dedupes transport messages by msg_id (Nunba realtimeService
+    _isDuplicate, 10 s window), so the close -- the ONLY message with
+    run_done=True -- was dropped, and the floating window kept ': step
+    failed' on screen for hours (47 such exits that day).  Clients reduce by
+    task_id, so the two ids only have to DIFFER; they must differ for every
+    exit reason whose close phase equals the last step's phase."""
+    for exit_reason, last_phase in (('action_error', 'failed'),
+                                    ('done', 'completed'),
+                                    ('stopped', 'stopped')):
+        run = f'run-{exit_reason}'
+        last = activity_stream.record_activity(
+            user_id='guest', prompt_id='42', run_id=run, iteration=4,
+            action='shell', phase=last_phase, agent_id='42')
+        closed = activity_stream.finish_run(
+            user_id='guest', prompt_id='42', run_id=run,
+            exit_reason=exit_reason, iteration=4)
+        assert closed['task_id'] == last['task_id']
+        assert (last['run_done'], closed['run_done']) == (False, True)
+        assert closed['msg_id'] != last['msg_id'], (
+            f'{exit_reason}: the close reuses the last step msg_id '
+            f'{last["msg_id"]!r}; a client that dedupes by msg_id never '
+            f'learns the run ended')
+        sent = [c.args[1]['msg_id'] for c in wired.call_args_list
+                if c.args[1]['run_id'] == run]
+        assert sent == [last['msg_id'], closed['msg_id']]

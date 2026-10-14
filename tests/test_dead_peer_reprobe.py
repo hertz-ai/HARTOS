@@ -84,6 +84,27 @@ def test_dead_reprobe_is_bounded(db_session_factory, gossip, monkeypatch):
         f'one round must probe a bounded dead batch, got {len(pinged)}')
 
 
+def test_a_dead_seed_is_reprobed_every_round_not_by_lottery(
+        db_session_factory, gossip, monkeypatch):
+    """Central's own row, aged out while the node was offline, waited on the
+    random sample: 3,016 dead rows on the owner's desktop, 2026-10-04, and
+    central stayed dead for hours while every gossip exchange with it
+    succeeded.  A seed row is in every round's re-probe."""
+    for i in range(40):
+        _seed(db_session_factory, f'http://10.9.9.{i + 1}:6100', 'dead',
+              f'dead-node-{i:02d}')
+    _seed(db_session_factory, 'https://central.example', 'dead', 'central-node')
+    gossip.seed_peers = ['https://central.example']
+    monkeypatch.setattr(gossip, '_ping_peer',
+                        lambda url: url == 'https://central.example')
+
+    gossip._health_check_round()
+
+    db = db_session_factory()
+    assert db.query(PeerNode).filter_by(node_id='central-node').one().status == 'active'
+    db.close()
+
+
 def test_unreachable_dead_peer_stays_dead(db_session_factory, gossip, monkeypatch):
     _seed(db_session_factory, 'http://10.9.9.9:6100', 'dead', 'dead-node-1')
     monkeypatch.setattr(gossip, '_ping_peer', lambda url: False)

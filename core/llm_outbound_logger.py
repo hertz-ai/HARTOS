@@ -155,6 +155,99 @@ _user_id_var: 'contextvars.ContextVar[str]' = contextvars.ContextVar(
     'llm_outbound_user_id', default='')
 
 
+# ─── Lanes (owner policy 2026-10-12) ──────────────────────────────────────
+# Every LLM call runs on ONE of three lanes, and the lane travels on the wire
+# as ``X-HARTOS-Lane`` beside the request id and source:
+#
+#   revenue  a conversation that is paying for itself: a McGroce commerce
+#            session (JWT tenant claim) or a paying API tier.  May use the
+#            expert model; never throttled, never budget-blocked.
+#   user     a person's ordinary turn.  Runs on the free model.
+#   daemon   autonomous background work (request id ``daemon_*`` or absent,
+#            the rule is dispatch.is_genuine_user_request).  Free model,
+#            capped first when money is tight.
+#
+# /chat decides revenue-or-user where the request's auth is in hand
+# (core.request_lane) and REGISTERS it by request id here, because the
+# autogen entry points run on worker threads that neither the Flask ``g``
+# nor a thread-local reaches.  The lane needs no hop of its own across that
+# boundary: ``with_llm_context`` binds the request id, and ``current_lane``
+# reads the registry by it; ``current_lane`` is the one reader the wire
+# header, the budget gate and the expert selector all consult.
+LANE_REVENUE = 'revenue'
+LANE_USER = 'user'
+LANE_DAEMON = 'daemon'
+LANES = (LANE_REVENUE, LANE_USER, LANE_DAEMON)
+
+_lane_var: 'contextvars.ContextVar[str]' = contextvars.ContextVar(
+    'llm_outbound_lane', default='')
+
+# request_id -> lane, insertion-ordered, bounded.  A turn's lane is read a
+# handful of times within seconds of registration; the cap only stops a
+# long-lived process from growing without end.
+_REQUEST_LANE_CAP = 4096
+_request_lanes = {}  # type: dict
+_request_lanes_lock = threading.Lock()
+
+
+def register_request_lane(request_id, lane) -> None:
+    """Record which lane the turn ``request_id`` runs on, replacing any earlier
+    answer for that id.  Unknown lanes and empty ids are ignored: a lane is
+    one of LANES or it is nothing.  Who may register what is decided by the
+    callers (core.request_lane.register_chat_lane for /chat, dispatch_goal for
+    a goal that earns), not here."""
+    rid = str(request_id or '')
+    if not rid or lane not in LANES:
+        return
+    with _request_lanes_lock:
+        _request_lanes.pop(rid, None)
+        _request_lanes[rid] = lane
+        while len(_request_lanes) > _REQUEST_LANE_CAP:
+            _request_lanes.pop(next(iter(_request_lanes)))
+
+
+def lane_for_request(request_id) -> str:
+    """The registered lane of ``request_id``, or '' when none was registered."""
+    rid = str(request_id or '')
+    if not rid:
+        return ''
+    with _request_lanes_lock:
+        return _request_lanes.get(rid, '')
+
+
+@contextlib.contextmanager
+def lane_context(lane: str):
+    """Bind the lane for LLM calls issued from this context; restored on exit."""
+    token = _lane_var.set(lane if lane in LANES else '')
+    try:
+        yield
+    finally:
+        _lane_var.reset(token)
+
+
+def current_lane() -> str:
+    """The lane of the LLM call being made right now.
+
+    An explicitly bound lane first (``lane_context``, a test and tooling
+    seam), then the registry by the current request id (the one
+    with_llm_context binds for the worker thread), then the request-id rule
+    every other caller already uses: a ``daemon_`` or absent id is background,
+    anything else is a person.
+    """
+    lane = _lane_var.get() or ''
+    if lane in LANES:
+        return lane
+    rid = _get_request_id()
+    lane = lane_for_request(rid)
+    if lane in LANES:
+        return lane
+    try:
+        from integrations.agent_engine.dispatch import is_genuine_user_request
+        return LANE_USER if is_genuine_user_request(rid) else LANE_DAEMON
+    except Exception:
+        return LANE_DAEMON if (not rid or str(rid).startswith('daemon_')) else LANE_USER
+
+
 def set_source(name: str) -> 'contextvars.Token':
     """Set the origin label for LLM calls issued from this context.
     Returns a Token; pass to ``reset_source`` to restore the prior
@@ -297,6 +390,8 @@ def with_llm_context(source_name: str, request_id_arg: str = 'request_id'):
             # The user the elided-text store scopes a pointer to (see
             # _elision_scope): the same contextvar hop as the request id.
             _uid_token = _user_id_var.set(uid) if uid else None
+            # The lane needs no hop of its own: current_lane() reads the
+            # registry by the request id this context binds.
             try:
                 with source_context(source_name), request_id_context(rid):
                     return fn(*args, **kwargs)
@@ -469,13 +564,159 @@ def _feed_provider_breaker(url, status) -> None:
         pass
 
 
+def _response_usage(response):
+    """``(prompt_tokens, completion_tokens)`` from an ALREADY-BUFFERED
+    chat/completions response, or None.  Same read discipline as
+    _response_tool_calls: only ``_content``, never ``.content`` (which would
+    consume a stream the real caller is waiting for)."""
+    try:
+        raw = getattr(response, '_content', None)
+        if not raw:
+            return None
+        data = json.loads(bytes(raw).decode('utf-8', 'replace'))
+        usage = data.get('usage') if isinstance(data, dict) else None
+        if not isinstance(usage, dict):
+            return None
+        tin = int(usage.get('prompt_tokens') or 0)
+        tout = int(usage.get('completion_tokens') or 0)
+        if tin <= 0 and tout <= 0:
+            return None
+        return tin, tout
+    except Exception:
+        return None
+
+
+def _meter_response(body, response, status) -> None:
+    """Meter this node's own completed LLM call in dollars from the provider's
+    usage block (owner policy 2026-10-12: the Claude day cap needs a ledger).
+
+    Topology agnostic: no tier branch.  Pricing and the row belong to
+    budget_gate.meter_llm_call (the ONE meter): a local or free-family model
+    prices at zero and writes no row, so a desktop on its own llama-server
+    meters nothing and a node on a paid API meters what it spends.  Only a
+    2xx with a usage block is a completed call.  Never raises and never
+    touches the response stream."""
+    try:
+        if not (isinstance(status, int) and 200 <= status < 300):
+            return
+        usage = _response_usage(response)
+        if usage is None:
+            return
+        from integrations.agent_engine.budget_gate import meter_llm_call
+        meter_llm_call(model=(body or {}).get('model') if isinstance(body, dict) else None,
+                       tokens_in=usage[0], tokens_out=usage[1], task_source='own')
+    except Exception as e:
+        logger.debug("[outbound] metering skipped: %s", e)
+
+
+def _hosted_body(request):
+    """The JSON body of a hosted chat/completions request, read without
+    mutation, or None.  Only for header stamping and metering: the hosted
+    path never trims (the n_ctx trim is the local llama-server's)."""
+    try:
+        raw = bytes(request.content or b'')
+        body = json.loads(raw.decode('utf-8')) if raw else None
+        return body if isinstance(body, dict) else None
+    except Exception:
+        return None
+
+
+_CONFIGURED_ENDPOINTS_TTL = 30.0
+_configured_endpoints_cache = (0.0, frozenset())
+
+
+def _host_port(url_text):
+    """(host, port) of a URL string, the port defaulted by scheme; None when
+    there is no host."""
+    try:
+        from urllib.parse import urlsplit
+        parts = urlsplit(str(url_text or ''))
+        host = (parts.hostname or '').lower()
+        if not host:
+            return None
+        port = parts.port
+        if port is None:
+            port = 443 if parts.scheme == 'https' else 80 if parts.scheme == 'http' else None
+        return (host, port)
+    except Exception:
+        return None
+
+
+def _configured_endpoints() -> frozenset:
+    """(host, port) of every LLM endpoint this node is CONFIGURED to call:
+    the main backend (core.autogen_config.resolve_llm_backend), the expert
+    trio (resolve_expert_backend) and OPENAI_BASE_URL (the langchain path's
+    base).  Re-read every _CONFIGURED_ENDPOINTS_TTL seconds."""
+    global _configured_endpoints_cache
+    now = time.time()
+    if now - _configured_endpoints_cache[0] < _CONFIGURED_ENDPOINTS_TTL:
+        return _configured_endpoints_cache[1]
+    found = set()
+    try:
+        from core.autogen_config import resolve_expert_backend, resolve_llm_backend
+        for resolver in (lambda: (resolve_llm_backend() or (None, None))[1],
+                         resolve_expert_backend):
+            try:
+                entry = resolver()
+                hp = _host_port((entry or {}).get('base_url')) if isinstance(entry, dict) else None
+                if hp:
+                    found.add(hp)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    # The three keys the deploy check names (HEVOLVE_LLM_ENDPOINT_URL,
+    # OPENAI_BASE_URL, HEVOLVE_LOCAL_LLM_URL) are read directly too: a node
+    # that names an endpoint has configured it, whatever its tier resolves to.
+    for var in ('HEVOLVE_LLM_ENDPOINT_URL', 'OPENAI_BASE_URL', 'HEVOLVE_LOCAL_LLM_URL'):
+        hp = _host_port(os.environ.get(var, ''))
+        if hp:
+            found.add(hp)
+    _configured_endpoints_cache = (now, frozenset(found))
+    return _configured_endpoints_cache[1]
+
+
+def _is_configured_endpoint(url) -> bool:
+    """Is this hosted URL one of the node's configured LLM endpoints (the
+    gateway, or a provider the owner pointed a trio at)?  Only those calls
+    carry HARTOS's lane and model headers and feed the dollar meter; a call
+    to any other host (a person's own cloud key through some other path) is
+    left byte-for-byte and header-for-header as it was (owner rule
+    2026-10-06: the cloud request stays unchanged where the routing does not
+    apply; review of 8947e2753, M3)."""
+    try:
+        host = str(getattr(url, 'host', '') or '').lower()
+        port = getattr(url, 'port', None)
+        if port is None:
+            scheme = str(getattr(url, 'scheme', '') or '')
+            port = 443 if scheme == 'https' else 80 if scheme == 'http' else None
+        return bool(host) and (host, port) in _configured_endpoints()
+    except Exception:
+        return False
+
+
 def _send_and_feed(orig_send, client, request, kwargs):
-    """Run a HOSTED (non-target) chat/completions send unchanged and feed the
-    provider breaker with its real status.  Byte-transparent: the response
+    """Run a HOSTED (non-target) chat/completions send and feed the provider
+    breaker with its real status.  Body bytes are never touched; the response
     object is returned as-is and an exception is re-raised bare (exceptions do
-    not feed the breaker)."""
+    not feed the breaker).
+
+    When the host is one of the node's CONFIGURED endpoints, the lane and
+    model headers are stamped and the completed call is metered here too
+    (review of 065cef8bb, C1): the configured endpoint on central is Kong at
+    /llm/v1/..., whose path is not the local target's, so every Claude call
+    took this branch unlabelled and unmetered, the day cap never saw a dollar
+    and Kong routed the calls to its default lane.  Any other host is left
+    exactly as it was (_is_configured_endpoint)."""
+    gateway = _is_configured_endpoint(request.url)
+    body = _hosted_body(request) if gateway else None
+    if gateway:
+        _annotate_request(request, body)
     response = orig_send(client, request, **kwargs)
-    _feed_provider_breaker(request.url, getattr(response, 'status_code', None))
+    _status = getattr(response, 'status_code', None)
+    _feed_provider_breaker(request.url, _status)
+    if gateway:
+        _meter_response(body, response, _status)
     return response
 
 
@@ -2008,6 +2249,18 @@ def _annotate_request(request, body):
             request.headers['X-HARTOS-Request-ID'] = rid
         if src:
             request.headers['X-HARTOS-Source'] = src
+        # The lane and the model, so a gateway in front of the provider can
+        # cap requests per lane and per model without parsing bodies (owner
+        # policy 2026-10-12: revenue never throttled, Claude capped per day).
+        request.headers['X-HARTOS-Lane'] = current_lane()
+        model = body.get('model') if isinstance(body, dict) else None
+        if model:
+            request.headers['X-HARTOS-Model'] = str(model)
+            # The family ('claude' or 'other') by the ONE rule the dollar
+            # meter prices with, so Kong's Claude fuse matches a header value
+            # instead of keeping its own list of model names.
+            from core.autogen_config import model_family
+            request.headers['X-HARTOS-Model-Family'] = model_family(model)
     except Exception as e:
         logger.debug("[outbound] header-stamp failed: %s", e)
 
@@ -2136,6 +2389,7 @@ def _install_sync_patch(httpx_module) -> None:
             # breaker the real status (#106b b) before logging.
             _status = getattr(response, 'status_code', None)
             _feed_provider_breaker(request.url, _status)
+            _meter_response(body, response, _status)
             elapsed = (time.time() - start) * 1000
             log_outbound(body or {},
                          response_status=_status,
@@ -2162,10 +2416,18 @@ def _install_async_patch(httpx_module) -> None:
 
     async def _patched(self, request, **kwargs):
         if not _is_target_request(request.url, request.method):
-            # Hosted chat/completions still feeds the provider breaker (#106b b).
+            # Hosted chat/completions: lane and model headers, the provider
+            # breaker (#106b b) and the dollar meter, as in _send_and_feed.
             if _is_chat_completions_post(request):
+                _gateway = _is_configured_endpoint(request.url)
+                _hbody = _hosted_body(request) if _gateway else None
+                if _gateway:
+                    _annotate_request(request, _hbody)
                 _resp = await _orig(self, request, **kwargs)
-                _feed_provider_breaker(request.url, getattr(_resp, 'status_code', None))
+                _hstatus = getattr(_resp, 'status_code', None)
+                _feed_provider_breaker(request.url, _hstatus)
+                if _gateway:
+                    _meter_response(_hbody, _resp, _hstatus)
                 return _resp
             return await _orig(self, request, **kwargs)
         try:
@@ -2182,6 +2444,7 @@ def _install_async_patch(httpx_module) -> None:
             response = await _orig(self, request, **kwargs)
             _status = getattr(response, 'status_code', None)
             _feed_provider_breaker(request.url, _status)
+            _meter_response(body, response, _status)
             elapsed = (time.time() - start) * 1000
             log_outbound(body or {},
                          response_status=_status,

@@ -1,22 +1,21 @@
-"""#59: /api/social/auth/sync-user must verify the sender against a TRUSTED key.
+"""#59 / #65: a user sync must verify its sender against a TRUSTED key, and a
+synced profile never grants or removes authority.
 
-Until 2026-09-14 the route verified a hive token against a `node_public_key`
-taken FROM THE REQUEST BODY, so any caller could sign with their own key,
-send that key alongside, pass verification, and create/overwrite ANY user —
-including role 'central', which passes require_admin — from the open
-internet (/api/social/ is gate-exempt). It's the orphaned twin of
-/api/social/hierarchy/sync (0 calls in 52 days of central nginx logs); the
-live sync path drains through hierarchy_sync, which already verifies the
-sender via discovery._verify_sync_sender.
+Until 2026-09-14 the /api/social/auth/sync-user route verified a hive token
+against a `node_public_key` taken FROM THE REQUEST BODY, so any caller could
+create or overwrite ANY user, including role 'central', from the open
+internet.  The route was fixed that day and deleted on 10-06: nothing ever
+called it (0 calls in 52 days of central nginx logs, no client in any repo).
+A user profile reaches a node through one ingress, /api/social/hierarchy/sync,
+which checks the sender with discovery._verify_sync_sender.
 
-The fix reuses that primitive, extracted as discovery._sender_signature_valid
-(strict: a signature verified against the sender's REGISTERED
-PeerNode.public_key by the DECLARED node_id, NO enforcement-mode escape), and
-strips any privileged role from a synced profile. This file pins:
+This file pins:
   - _sender_signature_valid is strict and key-on-file only (never a body key);
-  - _verify_sync_sender is unchanged for hierarchy_sync (delegates + mode escape);
-  - the sync-user route requires a valid signature from a known peer;
-  - a synced profile never confers central/regional/admin/moderator.
+  - _verify_sync_sender keeps hierarchy_sync's contract (delegates + mode escape);
+  - hierarchy_sync applies a signed user sync from a known peer, and refuses an
+    unsigned, forged or unknown sender under hard enforcement;
+  - a synced profile never confers central/regional/admin/moderator, and never
+    demotes a local privileged user.
 
     python -m pytest tests/unit/test_sync_user_identity.py --noconftest -q
 """
@@ -153,22 +152,19 @@ def test_verify_sync_sender_unsigned_hard_rejected(monkeypatch):
     assert disc._verify_sync_sender(_FakeDB(None), {'node_id': 'n1', 'items': []}) is False
 
 
-# ── the sync-user route + role strip ──
+# ── the live user-sync ingress (hierarchy_sync) + role strip ──
 
 @pytest.fixture
 def client(monkeypatch):
     monkeypatch.setenv('HEVOLVE_DB_PATH', ':memory:')
     from flask import Flask
     from integrations.social.models import Base, get_engine, get_db, PeerNode
-    from integrations.social.api import social_bp
-    from integrations.social.rate_limiter import get_limiter
     app = Flask(__name__)
     app.config['TESTING'] = True
-    app.register_blueprint(social_bp)
+    app.register_blueprint(disc.discovery_bp)
     engine = get_engine()
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
-    get_limiter()._buckets.clear()
     priv, pub = _keypair()
     db = get_db()
     try:
@@ -181,11 +177,15 @@ def client(monkeypatch):
 
 
 def _post(client_priv, user_data, node_id='node-1', sign=True, priv_override=None):
+    """A user sync the way a child node sends it: one 'sync_user' item in a
+    batch signed over {items, node_id} (SyncEngine._signed_send_payload)."""
     client, priv = client_priv
-    body = {'node_id': node_id, 'user_data': user_data}
+    body = {'items': [{'id': 'item-' + str(user_data.get('user_id')),
+                       'operation_type': 'sync_user', 'payload': user_data}],
+            'node_id': node_id}
     if sign:
         body['signature'] = _sign(priv_override or priv, body)
-    return client.post('/api/social/auth/sync-user', json=body)
+    return client.post('/api/social/hierarchy/sync', json=body)
 
 
 def _get_user(uid):
@@ -197,28 +197,38 @@ def _get_user(uid):
         db.close()
 
 
-def test_route_rejects_an_unsigned_body(client):
+def _hard(monkeypatch):
+    import security.master_key as mk
+    monkeypatch.setattr(mk, 'get_enforcement_mode', lambda: 'hard')
+
+
+def test_hard_enforcement_refuses_an_unsigned_user_sync(client, monkeypatch):
+    _hard(monkeypatch)
     resp = _post(client, {'user_id': 'u1', 'username': 'a'}, sign=False)
-    assert resp.status_code == 401
+    assert resp.status_code == 403
     assert _get_user('u1') is None
 
 
-def test_route_rejects_a_forged_signature(client):
+def test_hard_enforcement_refuses_a_forged_signature(client, monkeypatch):
+    _hard(monkeypatch)
     other, _ = _keypair()
     resp = _post(client, {'user_id': 'u1', 'username': 'a'}, priv_override=other)
-    assert resp.status_code == 401
+    assert resp.status_code == 403
     assert _get_user('u1') is None
 
 
-def test_route_rejects_an_unknown_node(client):
+def test_hard_enforcement_refuses_an_unknown_node(client, monkeypatch):
+    _hard(monkeypatch)
     resp = _post(client, {'user_id': 'u1', 'username': 'a'}, node_id='ghost')
-    assert resp.status_code == 401
+    assert resp.status_code == 403
     assert _get_user('u1') is None
 
 
-def test_route_accepts_a_signed_batch_from_a_known_peer(client):
+def test_a_signed_user_sync_from_a_known_peer_lands(client, monkeypatch):
+    _hard(monkeypatch)
     resp = _post(client, {'user_id': 'u1', 'username': 'alice'})
     assert resp.status_code == 200
+    assert resp.get_json()['processed'] == ['item-u1']
     u = _get_user('u1')
     assert u is not None and u.username == 'alice'
 

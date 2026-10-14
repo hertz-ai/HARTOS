@@ -26,8 +26,8 @@ from typing import Any, Callable, Dict, List, Optional
 from core.foreground import should_yield_to_user
 
 from .channels import device_may_receive
-from .link import (PeerLink, TrustLevel, LinkState, provable_user_id,
-                   set_device_verifier, set_peer_admission_ask)
+from .link import (PeerLink, TrustLevel, LinkState, hello_names_device,
+                   provable_user_id, set_device_verifier, set_peer_admission_ask)
 
 logger = logging.getLogger('hevolve.peer_link')
 
@@ -48,6 +48,18 @@ _IDLE_TIMEOUT = 300  # 5 minutes
 _RECONNECT_MIN = 5
 _RECONNECT_MAX = 120
 
+#: A peer whose relay inbox did not answer is not dialled there again for a
+#: while: each relay dial to a peer off the relay waits out the handshake
+#: (link.py, 10 s) on the gossip thread that called _try_auto_upgrade.  The
+#: first miss skips it for _RELAY_ABSENT_FIRST_SECONDS, each further miss in a
+#: row doubles that up to _RELAY_ABSENT_SECONDS, and an answer clears it, so a
+#: peer reachable only on the relay is not cut off long by one transient miss.
+_RELAY_ABSENT_FIRST_SECONDS = 60
+_RELAY_ABSENT_SECONDS = 600
+
+#: The clock the relay skip table reads (a seam for tests; time.monotonic).
+_now = time.monotonic
+
 
 class PeerLinkManager:
     """Manages all peer connections. Singleton via get_link_manager()."""
@@ -59,8 +71,19 @@ class PeerLinkManager:
         self._maintenance_thread: Optional[threading.Thread] = None
         self._http_exchange_counts: Dict[str, int] = {}  # peer_id -> successful exchanges
         self._channel_handlers: Dict[str, List[Callable]] = {}
+        # Device request types a bound handler answers, named in this
+        # node's handshake (link._get_local_capabilities) so a phone asks
+        # over the link only a node that answers.
+        self._device_requests: set = set()
+        # Further facts the handshake names (link._get_local_capabilities),
+        # set by the subsystem that owns them: the mobile adapter's
+        # 'mobile_paths'.  core never imports the subsystem.
+        self._advertised: Dict[str, Any] = {}
         self._reconnect_backoff: Dict[str, float] = {}  # peer_id -> backoff duration (seconds)
         self._reconnect_last_attempt: Dict[str, float] = {}  # peer_id -> last attempt timestamp
+        self._relay_absent_until: Dict[str, float] = {}  # peer_id -> monotonic deadline
+        self._relay_misses: Dict[str, int] = {}          # peer_id -> misses in a row
+        self._relay_absent_lock = threading.Lock()       # gossip threads share the table
 
         # Determine connection budget from tier
         try:
@@ -120,6 +143,15 @@ class PeerLinkManager:
             if link and link.is_connected:
                 return link
             return None
+
+    def get_device_link(self, peer_id: str) -> Optional[PeerLink]:
+        """The live link to a person's own phone (kind 'device', with the
+        token's user), or None: the one lookup every handler that answers
+        only a phone uses (the mobile adapter, the LiveKit tunnel)."""
+        link = self.get_link(peer_id)
+        if link is None or link.kind != 'device' or not link.user_id:
+            return None
+        return link
 
     def has_link(self, peer_id: str) -> bool:
         """Check if an active link exists to a peer."""
@@ -291,7 +323,7 @@ class PeerLinkManager:
         Returns the live PeerLink, or None when the handshake failed or the
         connection budget refused it.
         """
-        is_device = bool(hello.get('device_token'))
+        is_device = hello_names_device(hello)
         if is_device:
             # A phone (HARTOS #111): its identity is the key its token proves,
             # named by link.accept() from the verdict, never the node_id it
@@ -415,19 +447,45 @@ class PeerLinkManager:
         if link:
             link.close()
 
-    def register_channel_handler(self, channel: str, handler: Callable):
+    def register_channel_handler(self, channel: str, handler: Callable,
+                                 answers: tuple = ()):
         """Register handler for incoming messages on a channel.
 
-        Applied to all current and future links.
+        Applied to all current and future links.  Registering the same
+        handler again is a no-op, so a subsystem that binds on every
+        start() is called once per frame, not once per start.
+
+        ``answers``: the device request types (a frame's ``type``) the
+        handler answers with a reply.  The handshake names them
+        (device_requests_answered): a node that answers nothing sends no
+        reply at all, and a phone that asked it would wait out its whole
+        budget.
         """
+        if answers:
+            self._device_requests.update(answers)
         if channel not in self._channel_handlers:
             self._channel_handlers[channel] = []
+        if handler in self._channel_handlers[channel]:
+            return
         self._channel_handlers[channel].append(handler)
 
         # Apply to existing links
         with self._lock:
             for link in self._links.values():
                 link.on_message(channel, handler)
+
+    def device_requests_answered(self) -> List[str]:
+        """The device request types a bound handler answers, sorted
+        (register_channel_handler's ``answers``)."""
+        return sorted(self._device_requests)
+
+    def advertise(self, key: str, value: Any) -> None:
+        """Name ``value`` under ``key`` in this node's handshake (additive:
+        an older peer ignores a key it does not read)."""
+        self._advertised[key] = value
+
+    def advertised(self) -> Dict[str, Any]:
+        return dict(self._advertised)
 
     def record_http_exchange(self, peer_id: str):
         """Record a successful HTTP exchange with a peer.
@@ -601,21 +659,29 @@ class PeerLinkManager:
                     # ws://host:8088/ws.  The strip above would mangle it into
                     # "host:8088/ws" and upgrade_peer would dial a WAMP router
                     # expecting the PeerLink protocol — a connect that can
-                    # never handshake.  PeerLink has no WAMP relay mode; the
-                    # canonical WAN relay is MessageBus's CROSSBAR leg
-                    # (core/peer_link/message_bus.py), so skip the upgrade
-                    # honestly instead of dialing garbage.
+                    # never handshake.  The relay rung is the peer's inbox on
+                    # that router instead (relay_address below).
                     logger.debug(
                         f"NAT resolved a relay URL for {peer_id[:8]} "
-                        f"({ws_url}); not dialable as PeerLink — leaving "
-                        f"transport to the MessageBus crossbar leg")
+                        f"({ws_url}); the relay rung dials its inbox")
             except Exception as e:
                 logger.debug(f"NAT traversal unavailable for {peer_id[:8]}: {e}")
 
             if not address:
                 address = (peer_info.get('url', '')
                            .replace('http://', '').replace('https://', '').rstrip('/'))
-            if not address:
+            # The relay rung (core.peer_link.relay): the peer's inbox on the
+            # router both ends dial out to, which answers from behind any NAT.
+            # Tried after the direct address, never instead of it.
+            relay_address = ''
+            try:
+                from core.peer_link.relay import RELAY_ADDRESS_SCHEME, get_relay_hub
+                hub = get_relay_hub()
+                if hub is not None and hub.joined and not self._relay_skipped(peer_id):
+                    relay_address = RELAY_ADDRESS_SCHEME + peer_id
+            except Exception as e:
+                logger.debug(f"PeerLink relay rung unavailable for {peer_id[:8]}: {e}")
+            if not address and not relay_address:
                 # Was a bare `return`. Every exit from this function was silent,
                 # so a hive that never formed looked identical to one that was
                 # never asked to: three machines discovered each other on the
@@ -681,18 +747,53 @@ class PeerLinkManager:
             # The success path logs too. "Attempted and failed to connect" and
             # "never attempted" produced identical silence before this, which is
             # why connected_nodes=0 was unattributable.
-            logger.info(
-                "PeerLink upgrade for %s ATTEMPTING: address=%s trust=%s",
-                peer_id[:8], address, getattr(trust, 'name', trust))
-            self.upgrade_peer(
-                peer_id=peer_id,
-                address=address,
-                trust=trust,
-                x25519_public=peer_info.get('x25519_public', ''),
-                ed25519_public=peer_info.get('public_key', ''),
-            )
+            for candidate in (address, relay_address):
+                if not candidate:
+                    continue
+                logger.info(
+                    "PeerLink upgrade for %s ATTEMPTING: address=%s trust=%s",
+                    peer_id[:8], candidate, getattr(trust, 'name', trust))
+                if self.upgrade_peer(
+                        peer_id=peer_id,
+                        address=candidate,
+                        trust=trust,
+                        x25519_public=peer_info.get('x25519_public', ''),
+                        ed25519_public=peer_info.get('public_key', ''),
+                ):
+                    self._clear_relay_absent(peer_id)
+                    break
+                if candidate == relay_address:
+                    self._note_relay_absent(peer_id)
         except Exception as e:
             logger.debug(f"Auto-upgrade failed for {peer_id[:8]}: {e}")
+
+    def _relay_skipped(self, peer_id: str) -> bool:
+        """True while the peer's relay rung is skipped after a miss."""
+        with self._relay_absent_lock:
+            return _now() < self._relay_absent_until.get(peer_id, 0)
+
+    def _note_relay_absent(self, peer_id: str) -> None:
+        """The peer's relay inbox did not answer: skip that rung for it, 60 s
+        after one miss, doubling with each miss in a row up to
+        _RELAY_ABSENT_SECONDS.  Entries whose window ended long enough ago
+        to have reset go on the way in, so the table stays small."""
+        now = _now()
+        with self._relay_absent_lock:
+            for pid in [p for p, until in self._relay_absent_until.items()
+                        if until + _RELAY_ABSENT_SECONDS <= now]:
+                self._relay_absent_until.pop(pid, None)
+                self._relay_misses.pop(pid, None)
+            misses = self._relay_misses.get(peer_id, 0) + 1
+            self._relay_misses[peer_id] = misses
+            window = min(_RELAY_ABSENT_FIRST_SECONDS * 2 ** (misses - 1),
+                         _RELAY_ABSENT_SECONDS)
+            self._relay_absent_until[peer_id] = now + window
+
+    def _clear_relay_absent(self, peer_id: str) -> None:
+        """The peer answered (either rung): its relay misses are forgotten."""
+        with self._relay_absent_lock:
+            self._relay_absent_until.pop(peer_id, None)
+            self._relay_misses.pop(peer_id, None)
 
     @staticmethod
     def _http_fallback(peer_url: str, channel: str, data: dict,

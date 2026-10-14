@@ -566,6 +566,11 @@ class GPUWorker:
                     self.python_exe, '-m', 'pip', 'install',
                     '--no-build-isolation', '--progress-bar', 'off',
                     '--disable-pip-version-check',
+                    # pip's scripts-not-on-PATH scan resolves every PATH
+                    # entry; a junction on PATH raised WinError 448 and
+                    # rolled venv installs back (2026-10-03).  --target
+                    # skips the scan already; the venv branch needs this.
+                    '--no-warn-script-location',
                 ]
                 if target:
                     pip_args.extend(['--target', target])

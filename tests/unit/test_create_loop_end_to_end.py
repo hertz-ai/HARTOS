@@ -168,7 +168,11 @@ class _Script:
 
 
 @pytest.fixture
-def create_env(tmp_path, monkeypatch):
+def create_env(tmp_path, monkeypatch, idle_desktop):
+    # The run is a daemon turn (request id daemon_e2e_create), which asks
+    # between steps whether a person is using this computer; nobody is at
+    # this desk (tests/conftest.py idle_desktop), and the pause tests below
+    # say when someone sits down.
     import faulthandler
     # A misrouted script spins inside the loop, and a blocked call never
     # returns: either way, dump every thread's stack and exit instead of
@@ -554,3 +558,77 @@ def test_notes_to_self_complete_nothing(create_env, caplog):
     assert not completed, f'an action completed on a note to self: {completed}'
     banked = [n for n in (1, 2, 3) if _action_file(env, n) is not None]
     assert not banked, f'notes were banked as the recipe of action(s) {banked}'
+
+
+def test_a_background_turn_pauses_for_the_owner_and_resumes_where_it_stopped(create_env, monkeypatch):
+    """#129 (owner ruling 2026-10-04): a daemon turn stops between steps the
+    moment the owner is using the computer, records nothing as done or
+    failed, and the goal's next dispatch -- once the gate is open -- resumes
+    the same session from the action it stopped at.
+
+    Measured gap this pins: coding-daemon turn daemon_d69d24f8 ran autogen
+    rounds straight through two gate-CLOSED windows (user_present,
+    19:08-19:10 and 19:12-19:20) because nothing between steps asked.
+    """
+    from core import agent_tools
+    from integrations.agent_engine import dispatch
+    env = create_env
+    gate = {'open': False}
+
+    def present():
+        # The owner sits down the moment action 1 is banked.
+        if not gate['open'] and _action_file(env, 1) is not None:
+            return 'user_present'
+        return None
+    monkeypatch.setattr(dispatch, 'person_using_the_machine', present)
+
+    replies = _run(env, turns=1)
+    assert agent_tools.is_user_pause(replies[-1]), replies
+    assert _action_file(env, 1) is not None, 'action 1 ran before the owner sat down'
+    assert _action_file(env, 2) is None, 'the turn went on past the pause'
+    assert env.lh.get_action_state(UP, 2).value not in _DONE_STATES
+    assert not (env.prompts / f'{PROMPT_ID}_0_recipe.json').exists()
+    paused_events = len(env.events)
+
+    # Still active: the same answer, nothing moves.
+    again = _run(env, turns=1)
+    assert agent_tools.is_user_pause(again[-1]), again
+    assert _action_file(env, 2) is None
+    assert len(env.events) == paused_events, env.events[paused_events:]
+
+    # Actually idle: the flow resumes at action 2 and finishes.
+    gate['open'] = True
+    resumed = _run(env, turns=2)
+    assert (env.prompts / f'{PROMPT_ID}_0_recipe.json').exists(), resumed
+    for n in (1, 2, 3):
+        assert _action_file(env, n) is not None, f'action {n} has no file after the resume'
+    assert not env.llm_calls, env.llm_calls
+
+
+def test_the_timeout_exit_answers_a_pause_made_in_the_last_round(create_env, monkeypatch):
+    """Review of 96a9ca9f8, blocker 3: the create loop checked its 30-minute
+    bound before the pause, so a round the selector ended for the owner,
+    followed by that exit, answered the group chat's tail as the turn's
+    result and left the pause for whoever's turn came next."""
+    import time as real_time
+    from core import agent_tools
+    from integrations.agent_engine import dispatch
+    env = create_env
+    late = {'s': 0.0}
+    clock = SimpleNamespace(**{name: getattr(real_time, name)
+                               for name in dir(real_time) if not name.startswith('_')})
+    clock.time = lambda: real_time.time() + late['s']
+    monkeypatch.setattr(env.cr, 'time', clock)
+
+    def present():
+        if _action_file(env, 1) is None:
+            return None
+        # The owner sits down in the round that is this turn's last before
+        # its bound.
+        late['s'] = 1801.0
+        return 'user_present'
+    monkeypatch.setattr(dispatch, 'person_using_the_machine', present)
+
+    replies = _run(env, turns=1)
+    assert agent_tools.is_user_pause(replies[-1]), replies
+    assert _action_file(env, 2) is None, 'the turn went on past the pause'

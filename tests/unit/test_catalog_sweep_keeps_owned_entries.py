@@ -44,6 +44,24 @@ import pytest
 from integrations.service_tools.model_catalog import ModelCatalog, ModelEntry
 
 
+@pytest.fixture(autouse=True)
+def _restore_engine_registry():
+    """populate_tts_catalog overlays ENGINE_REGISTRY from the catalogue
+    entries it finds (the #58 snapshot semantics), so driving it with
+    stand-in entries mutates a module global that later tests read.
+    Measured: it rewrote chatterbox_turbo, cosyvoice3 and espeak, and
+    test_tts_router's clone-ladder case then failed -- in THIS file's run
+    order only, which is exactly how such a leak hides.  Every test here:
+    get_catalog() runs the real populators too (measured 2026-10-08:
+    TestANodeLearnsAboutModelsShippedLater left chatterbox_turbo at
+    quality 0.5, and two of test_tts_router's call-voice cases failed)."""
+    from integrations.channels.media import tts_router
+    saved = dict(tts_router.ENGINE_REGISTRY)
+    yield
+    tts_router.ENGINE_REGISTRY.clear()
+    tts_router.ENGINE_REGISTRY.update(saved)
+
+
 @pytest.fixture
 def catalog(tmp_path, monkeypatch):
     """A catalogue with the built-in populators silenced, so a test says
@@ -166,21 +184,7 @@ class TestClaimsDoNotLeakBetweenRuns:
 class TestTheRealPopulatorsClaimWhatTheySkip:
     """The two populators whose skip idiom the sweep contradicted must use
     the claiming question, or the fix does not reach the entries it was
-    written for."""
-
-    @pytest.fixture(autouse=True)
-    def _restore_engine_registry(self):
-        """populate_tts_catalog overlays ENGINE_REGISTRY from the catalogue
-        entries it finds (the #58 snapshot semantics), so driving it with
-        stand-in entries mutates a module global that later tests read.
-        Measured: it rewrote chatterbox_turbo, cosyvoice3 and espeak, and
-        test_tts_router's clone-ladder case then failed -- in THIS file's
-        run order only, which is exactly how such a leak hides."""
-        from integrations.channels.media import tts_router
-        saved = dict(tts_router.ENGINE_REGISTRY)
-        yield
-        tts_router.ENGINE_REGISTRY.clear()
-        tts_router.ENGINE_REGISTRY.update(saved)
+    written for.  (The module's autouse fixture restores ENGINE_REGISTRY.)"""
 
     def test_tts_populator_keeps_engines_already_in_the_catalogue(self, catalog):
         from integrations.channels.media.tts_router import (

@@ -79,6 +79,25 @@ def _enforcement_is_hard() -> bool:
 #: all. Sized well above any plausible burst of genuine timeouts.
 _MAX_EMPTY_RECVS = 100
 
+#: Requests a link answers at once (frames flagged 'rq', see _answer_request).
+#: Each runs on its own thread so a slow handler cannot stall the receive loop;
+#: this bounds how many a connected peer can start.  Past it a request is
+#: dropped unanswered and the sender's own timeout applies, as it would with a
+#: busy node.
+_MAX_CONCURRENT_REQUESTS = 8
+
+#: Channels whose handlers do real work for the asking peer and whose result is
+#: only useful as a reply.  A frame there that does not ask for a reply (no
+#: 'rq') is ignored, so a peer cannot start that work inline on the receive
+#: thread, outside the bound above, with nobody waiting for the result.
+_REQUEST_ONLY_CHANNELS = frozenset({'compute'})
+
+#: A peer leaving says so on 'control' before it closes: link.close() sends
+#: 'bye', a phone's PeerLinkClient.disconnect() sends 'disconnect'.  On a relay
+#: socket this frame, sealed, is the only close that ends a link (relay.py
+#: ignores a bare close once the link is sealed).
+_GOODBYE_TYPES = frozenset({'bye', 'disconnect'})
+
 
 def _is_recv_timeout(exc: BaseException) -> bool:
     """Is this exception "no message arrived in time", as opposed to a real fault?
@@ -136,7 +155,7 @@ class LinkState(Enum):
 # Channel IDs for binary frames — single source of truth is CHANNEL_REGISTRY
 # in core.peer_link.channels. Re-exported here for backwards compatibility.
 from core.peer_link.channels import (  # noqa: E402
-    CHANNEL_IDS, CHANNEL_NAMES, device_may_send)
+    CHANNEL_IDS, CHANNEL_NAMES, device_may_send, device_send_types, device_unasked_types)
 
 #: Verifies a phone's device_token from a HELLO (HARTOS #111): callable(token, peer_address)
 #: -> the verdict shape of integrations.social.auth.verify_device_jwt, plus
@@ -183,6 +202,89 @@ def set_peer_admission_ask(fn: Optional[Callable[[str, str], bool]]) -> None:
 
 # Key rotation interval (seconds)
 KEY_ROTATION_INTERVAL = 3600
+
+#: X.509 SubjectPublicKeyInfo of an X25519 key: this 12-byte prefix, then the
+#: 32-byte key.  An Android phone's JCA key encodes itself that way
+#: (PeerLinkCrypto.getX25519PublicHex sent `public.encoded`), while a node sends
+#: the raw 32 bytes -- the same split Ed25519 had (PeerLinkCrypto's
+#: ED25519_SPKI_PREFIX).
+_X25519_SPKI_PREFIX = bytes.fromhex('302a300506032b656e032100')
+
+
+def _x25519_raw(public_hex: str) -> bytes:
+    """A peer's X25519 public key as the 32 bytes X25519PublicKey reads,
+    whether it arrived raw or X.509-wrapped."""
+    key = bytes.fromhex(public_hex)
+    if len(key) == len(_X25519_SPKI_PREFIX) + 32 and key.startswith(_X25519_SPKI_PREFIX):
+        return key[len(_X25519_SPKI_PREFIX):]
+    return key
+
+
+def session_key_from(our_private, peer_public_hex: str) -> bytes:
+    """The AES-256-GCM session key between our X25519 private key and a
+    peer's public key (hex, raw or X.509-wrapped): X25519, then HKDF-SHA256.
+
+    A phone derives the same 32 bytes (PeerLinkCrypto.sessionKeyFrom); one
+    fixed-key vector pins both sides (tests/unit/test_peer_link_x25519_vector.py
+    here, PeerLinkCryptoX25519InteropTest in the phone repo).
+    """
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    from cryptography.hazmat.primitives import hashes
+
+    shared_secret = our_private.exchange(
+        X25519PublicKey.from_public_bytes(_x25519_raw(peer_public_hex)))
+    return HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=b'hart-peerlink-session-v1',
+        info=b'hart-peerlink-v1',
+    ).derive(shared_secret)
+
+
+#: A phone's device token sealed to this node (PeerLinkHandshake): AES-256-GCM
+#: under the session key both ends derive from the phone's X25519 key in the
+#: HELLO and this node's (session_key_from), nonce first, base64.  The phone
+#: learned this node's key meeting it on its LAN (the hello_ack), so on the
+#: relay -- where the desktop's router leg can be plaintext ws:// (relay.py
+#: falls back when the TLS router is unreachable) -- the token crosses unread.
+SEALED_DEVICE_TOKEN = 'device_token_sealed'
+
+
+#: What a refused device HELLO is answered with, before the socket closes
+#: (PeerLink._refuse_device): the reason and the refused HELLO's signature
+#: ('answers'), under this node's signature and with its keys, the shape of a
+#: hello_ack.  On the relay a phone has no HTTP call
+#: to the desktop to learn its state from, so without this every refusal was
+#: a 20-second wait for an ack that never came, and a phone whose seal no
+#: longer opened re-dialled into that silence forever.
+HELLO_REFUSED = 'hello_refused'
+#: The reason a seal does not open here: the frame names this node's X25519
+#: key, and a phone that pinned this node's Ed25519 key re-seals to it.
+SEAL_NOT_OPENED = 'seal_not_opened'
+
+
+def hello_names_device(hello: dict) -> bool:
+    """Does this HELLO come from a phone: a device token, clear or sealed?"""
+    return bool(hello.get('device_token') or hello.get(SEALED_DEVICE_TOKEN))
+
+
+def open_sealed_device_token(sealed: str, peer_x25519_public: str) -> Optional[str]:
+    """The device token a phone sealed to this node, or None (logged) when it
+    does not open under this node's key."""
+    try:
+        import base64
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        from security.channel_encryption import get_x25519_keypair
+        our_private, _ = get_x25519_keypair()
+        key = session_key_from(our_private, peer_x25519_public)
+        data = base64.b64decode(str(sealed), validate=True)
+        if len(data) < 13:  # 12 nonce + at least 1 byte
+            raise ValueError('too short to be a sealed token')
+        return AESGCM(key).decrypt(data[:12], data[12:], None).decode('utf-8')
+    except Exception as e:
+        logger.warning(f"A sealed device token did not open under this node's key: {e}")
+        return None
 
 
 def provable_user_id() -> str:
@@ -237,6 +339,10 @@ class PeerLink:
     # sees a node unless the handshake said otherwise.
     kind = 'node'
     user_id = ''
+    # True when the transport is shared with strangers (the relay,
+    # core.peer_link.relay): the link then carries the X25519/AES-GCM
+    # session whatever its trust, and refuses to run without one.
+    requires_e2e = False
 
     def __init__(self, peer_id: str, address: str, trust: TrustLevel,
                  x25519_public_hex: str = '', ed25519_public_hex: str = '',
@@ -253,6 +359,7 @@ class PeerLink:
         # budget and eviction.
         self.kind = 'node'
         self.user_id = ''
+        self.requires_e2e = False
         self._device_channel_warned: set = set()
 
         # G9: Trust ratchet — once trust is established at a level,
@@ -271,6 +378,7 @@ class PeerLink:
         self._pending_responses: Dict[str, threading.Event] = {}
         self._response_data: Dict[str, Any] = {}
         self._recv_thread: Optional[threading.Thread] = None
+        self._request_slots = threading.BoundedSemaphore(_MAX_CONCURRENT_REQUESTS)
 
         # Stats
         self._connected_at = 0.0
@@ -290,8 +398,16 @@ class PeerLink:
 
     @property
     def is_encrypted(self) -> bool:
-        """E2E encryption active (PEER/RELAY trust only)."""
+        """E2E encryption active (PEER/RELAY trust, or a relay transport)."""
         return self._session_key is not None
+
+    def _wants_session_key(self) -> bool:
+        """PEER/RELAY trust always; any trust on a shared transport."""
+        return self.trust in (TrustLevel.PEER, TrustLevel.RELAY) or self.requires_e2e
+
+    def _encrypting(self) -> bool:
+        """Frames after the handshake are sealed with the session key."""
+        return self._session_key is not None and self._wants_session_key()
 
     @property
     def min_trust_level(self) -> TrustLevel:
@@ -348,27 +464,42 @@ class PeerLink:
 
         self._state = LinkState.CONNECTING
         try:
-            ws_url = self._resolve_ws_url()
-
-            try:
-                import websockets.sync.client as ws_client
-                self._ws = ws_client.connect(ws_url, open_timeout=10,
-                                              close_timeout=5)
-            except ImportError:
-                # Fallback: use websocket-client library
-                try:
-                    import websocket
-                    self._ws = websocket.WebSocket()
-                    self._ws.connect(ws_url, timeout=10)
-                except ImportError:
-                    logger.warning("No WebSocket library available (need websockets or websocket-client)")
+            from core.peer_link.relay import RELAY_ADDRESS_SCHEME
+            if self.address.startswith(RELAY_ADDRESS_SCHEME):
+                # The peer's inbox on the relay (core.peer_link.relay): the
+                # rung that answers from behind any NAT.
+                from core.peer_link.relay import get_relay_hub
+                hub = get_relay_hub()
+                if hub is None or not hub.joined:
+                    logger.debug(f"PeerLink relay dial to {self.peer_id[:8]}: "
+                                 f"this node is not on the relay")
                     self._state = LinkState.DISCONNECTED
                     return False
+                self._ws = hub.dial(self.address[len(RELAY_ADDRESS_SCHEME):])
+                self.requires_e2e = True
+            else:
+                ws_url = self._resolve_ws_url()
+
+                try:
+                    import websockets.sync.client as ws_client
+                    self._ws = ws_client.connect(ws_url, open_timeout=10,
+                                                  close_timeout=5)
+                except ImportError:
+                    # Fallback: use websocket-client library
+                    try:
+                        import websocket
+                        self._ws = websocket.WebSocket()
+                        self._ws.connect(ws_url, timeout=10)
+                    except ImportError:
+                        logger.warning("No WebSocket library available (need websockets or websocket-client)")
+                        self._state = LinkState.DISCONNECTED
+                        return False
 
             self._state = LinkState.HANDSHAKING
             if not self._perform_handshake():
                 self.close()
                 return False
+            self._seal_transport()
 
             self._state = LinkState.CONNECTED
             self._connected_at = time.monotonic()
@@ -386,6 +517,14 @@ class PeerLink:
 
         except Exception as e:
             logger.debug(f"PeerLink connect failed to {self.peer_id[:8]}: {e}")
+            # Give the socket back: a relay conversation left open counts
+            # against the hub's cap, and past it every inbound HELLO is dropped.
+            ws, self._ws = self._ws, None
+            if ws is not None and hasattr(ws, 'close'):
+                try:
+                    ws.close()
+                except Exception as close_err:
+                    logger.debug(f"PeerLink socket close after a failed connect: {close_err}")
             self._state = LinkState.DISCONNECTED
             return False
 
@@ -393,11 +532,14 @@ class PeerLink:
         """Accept incoming connection (called by link_manager's WS server)."""
         self._ws = ws
         self._state = LinkState.HANDSHAKING
+        # A socket on a shared transport (core.peer_link.relay) says so.
+        self.requires_e2e = bool(getattr(ws, 'requires_e2e', False))
 
         try:
             if not self._complete_handshake(handshake_data):
                 self.close()
                 return False
+            self._seal_transport()
 
             self._state = LinkState.CONNECTED
             self._connected_at = time.monotonic()
@@ -416,15 +558,27 @@ class PeerLink:
             self._state = LinkState.DISCONNECTED
             return False
 
+    def _seal_transport(self) -> None:
+        """Tell a shared transport (core.peer_link.relay) that this link holds
+        its session key, so a bare close from the realm no longer ends it."""
+        if self.requires_e2e and self._session_key is not None:
+            seal = getattr(self._ws, 'seal', None)
+            if callable(seal):
+                seal()
+
     def send(self, channel: str, data: dict, wait_response: bool = False,
-             timeout: float = 30.0) -> Optional[dict]:
+             timeout: float = 30.0, reply_to: str = '') -> Optional[dict]:
         """Send JSON message on a channel.
 
         Args:
             channel: Channel name (gossip, federation, compute, etc.)
             data: JSON-serializable dict
-            wait_response: If True, block until response received
+            wait_response: If True, block until response received.  The frame
+                is flagged ('rq') so the far side's handler return value comes
+                back as the reply; without the flag nothing is sent back.
             timeout: Max wait time for response
+            reply_to: the id of the request this frame answers ('re').  Set
+                only by the receive loop when it returns a handler's result.
 
         Returns:
             Response dict if wait_response=True, else None
@@ -433,16 +587,21 @@ class PeerLink:
             return None
 
         msg_id = uuid.uuid4().hex[:12]
-        frame = json.dumps({
+        envelope = {
             'ch': channel,
             'id': msg_id,
             'd': data,
-        }, separators=(',', ':'))
+        }
+        if wait_response:
+            envelope['rq'] = 1
+        if reply_to:
+            envelope['re'] = reply_to
+        frame = json.dumps(envelope, separators=(',', ':'))
 
         frame_bytes = frame.encode('utf-8')
 
-        # Encrypt for PEER/RELAY trust
-        if self.trust in (TrustLevel.PEER, TrustLevel.RELAY) and self._session_key:
+        # Encrypt for PEER/RELAY trust, and on a shared transport
+        if self._encrypting():
             frame_bytes = self._encrypt(frame_bytes)
 
         event = None
@@ -477,7 +636,7 @@ class PeerLink:
         msg_id_bytes = struct.pack('>I', hash(time.time()) & 0xFFFFFFFF)
         frame = bytes([ch_id]) + msg_id_bytes + data
 
-        if self.trust in (TrustLevel.PEER, TrustLevel.RELAY) and self._session_key:
+        if self._encrypting():
             frame = self._encrypt(frame)
 
         try:
@@ -683,9 +842,13 @@ class PeerLink:
         self.peer_x25519_public = resp.get('x25519_public', '')
         self.capabilities = resp.get('capabilities', {})
 
-        # Derive session key for PEER/RELAY trust
-        if self.trust in (TrustLevel.PEER, TrustLevel.RELAY) and self.peer_x25519_public:
+        # Derive session key for PEER/RELAY trust, and on a shared transport
+        if self._wants_session_key() and self.peer_x25519_public:
             self._derive_session_key()
+        if self.requires_e2e and self._session_key is None:
+            logger.warning(f"PeerLink relay link to {self.peer_id[:8]} refused: "
+                           f"no session key, and a relay link is never plaintext")
+            return False
 
         return True
 
@@ -727,11 +890,29 @@ class PeerLink:
         # filed and paced.  Trust is SAME_USER -- the owner said this device
         # is theirs -- with kind 'device' bounding everything else.
         device_token = hello_data.get('device_token')
+        if not device_token and hello_data.get(SEALED_DEVICE_TOKEN):
+            device_token = open_sealed_device_token(
+                hello_data[SEALED_DEVICE_TOKEN], self.peer_x25519_public)
+            if not device_token:
+                logger.warning("Device HELLO refused: its sealed token does not open here")
+                return self._refuse_device(SEAL_NOT_OPENED, peer_sig)
         if device_token:
-            if not self._admit_device(peer_ed25519, peer_sig, str(device_token)):
-                return False
+            refusal = self._device_refusal(peer_ed25519, peer_sig, str(device_token))
+            if refusal:
+                return self._refuse_device(refusal, peer_sig)
         elif not self._decide_node_trust(hello_data, peer_ed25519):
             return False
+
+        # A shared transport carries nothing in the clear after this ack, so
+        # the session key must exist BEFORE the ack goes out: without one the
+        # HELLO is refused unanswered.
+        if self.requires_e2e:
+            if self.peer_x25519_public:
+                self._derive_session_key()
+            if self._session_key is None:
+                logger.warning("PeerLink relay HELLO refused: no session key, "
+                               "and a relay link is never plaintext")
+                return False
 
         # Send ack
         ack = {
@@ -747,8 +928,9 @@ class PeerLink:
         ack_bytes = json.dumps(ack, separators=(',', ':')).encode('utf-8')
         self._ws_send(ack_bytes)
 
-        # Derive session key for PEER/RELAY trust
-        if self.trust in (TrustLevel.PEER, TrustLevel.RELAY) and self.peer_x25519_public:
+        # Derive session key for PEER/RELAY trust (a relay link has one already)
+        if (self._session_key is None and self._wants_session_key()
+                and self.peer_x25519_public):
             self._derive_session_key()
 
         return True
@@ -760,7 +942,7 @@ class PeerLink:
         refuses THIS attempt -- which is the whole point, since nothing has
         been proved -- but by then the ask is filed and the card is in front
         of them, so an Allow admits the peer on its next try.  That is the
-        device path's behaviour (``_admit_device`` -> 'pending' -> ask ->
+        device path's behaviour (``_device_refusal`` -> 'pending' -> ask ->
         refuse -> granted -> admitted), and these two refusals sit in the
         same function; only one of them used to speak.
 
@@ -793,39 +975,68 @@ class PeerLink:
             f"enforcement); the owner has been asked and can admit it.")
         return False
 
-    def _admit_device(self, peer_ed25519: str, peer_sig: str, device_token: str) -> bool:
+    def _device_refusal(self, peer_ed25519: str, peer_sig: str, device_token: str) -> str:
         """The verifier's word on a device HELLO (HARTOS #111): 'ok' for the
         key that signed the HELLO opens a SAME_USER link of kind 'device' for
-        the token's user; anything else, or no verifier, refuses."""
+        the token's user and returns ''; anything else, or no verifier,
+        returns why it is refused (the verifier's own status where it gave
+        one: 'pending', 'denied', 'invalid'; 'unavailable' when this node
+        cannot verify a device now, whichever of its parts failed)."""
         if not (peer_ed25519 and peer_sig):
             logger.warning("Device HELLO without a signed key refused")
-            return False
+            return 'unsigned'
         if _DEVICE_VERIFIER is None:
             logger.warning("Device HELLO refused: no device verifier installed")
-            return False
+            return 'unavailable'
         try:
             verdict = _DEVICE_VERIFIER(device_token, self.address) or {}
         except Exception as e:
             logger.warning(f"Device verifier failed; refusing: {e}")
-            return False
+            return 'unavailable'
         if verdict.get('status') != 'ok':
-            logger.info(f"Device HELLO refused: {verdict.get('status', 'invalid')}")
-            return False
+            status = str(verdict.get('status') or 'invalid')
+            logger.info(f"Device HELLO refused: {status}")
+            return status
         if str(verdict.get('public_key', '')).lower() != str(peer_ed25519).lower():
             logger.warning("Device HELLO refused: token key is not the socket's key")
-            return False
+            return 'key_mismatch'
         user_id = str((verdict.get('payload') or {}).get('user_id') or '')
         if not user_id:
             logger.warning("Device HELLO refused: token names no user")
-            return False
+            return 'no_user'
         self.kind = 'device'
         self.user_id = user_id
         if verdict.get('peer_id'):
             self.peer_id = str(verdict['peer_id'])
         if not self.set_trust(TrustLevel.SAME_USER):
             logger.warning("Trust ratchet rejected SAME_USER for a device (should not happen)")
-            return False
-        return True
+            return 'trust'
+        return ''
+
+    def _refuse_device(self, reason: str, hello_signature: str) -> bool:
+        """Answer a refused device HELLO (HELLO_REFUSED) before the socket
+        closes, signed like a hello_ack and naming this node's keys, so the
+        phone hears why instead of waiting out its ack timeout.  'answers'
+        is the refused HELLO's own signature: on the relay anyone in the realm
+        can read a conversation, and a refusal replayed into another dial is
+        not that dial's answer (the phone checks).  Returns False, the
+        refusal, whether or not the answer could be sent."""
+        try:
+            from security.node_integrity import get_public_key_hex, sign_json_payload
+            from security.channel_encryption import get_x25519_public_hex
+            frame = {
+                'type': HELLO_REFUSED,
+                'reason': reason,
+                'answers': str(hello_signature or ''),
+                'ed25519_public': get_public_key_hex(),
+                'x25519_public': get_x25519_public_hex(),
+                'timestamp': time.time(),
+            }
+            frame['signature'] = sign_json_payload(frame)
+            self._ws_send(json.dumps(frame, separators=(',', ':')).encode('utf-8'))
+        except Exception as e:
+            logger.warning(f"Device HELLO refused ({reason}); the refusal was not sent: {e}")
+        return False
 
     def _decide_node_trust(self, hello_data: dict, peer_ed25519: str) -> bool:
         """A node's HELLO: trust decided locally, then its pre-trust contract."""
@@ -880,12 +1091,24 @@ class PeerLink:
 
         return True
 
-    def _device_may_send(self, channel: str) -> bool:
+    def _device_may_send(self, channel: str, frame: Any = None,
+                         is_request: bool = False) -> bool:
         """Inbound frames from a device link reach a handler only on a
-        channel the registry opens to devices; the first refusal per channel
-        is logged, the rest are dropped quietly."""
-        if self.kind != 'device' or device_may_send(channel):
+        channel the registry opens to devices, and on a channel that names
+        its device frame types only as one of those types sent as a request
+        (a turn nobody waits for is never started) -- or as one the channel
+        names as sent unasked (a stream's bytes once it is open).  The first
+        refusal per channel is logged, the rest are dropped quietly."""
+        if self.kind != 'device':
             return True
+        if device_may_send(channel, frame):
+            if is_request or not device_send_types(channel):
+                return True
+            if frame.get('type') in device_unasked_types(channel):
+                return True
+            logger.debug(f"Device {self.peer_id} sent a non-request frame on "
+                         f"'{channel}', where a device may only ask; dropped")
+            return False
         if channel not in self._device_channel_warned:
             self._device_channel_warned.add(channel)
             logger.warning(f"Device {self.peer_id} sent on '{channel}', "
@@ -896,21 +1119,9 @@ class PeerLink:
         """Derive AES-256-GCM session key from X25519 ECDH."""
         try:
             from security.channel_encryption import get_x25519_keypair
-            from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
-            from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-            from cryptography.hazmat.primitives import hashes
 
             our_private, _ = get_x25519_keypair()
-            peer_pub = X25519PublicKey.from_public_bytes(
-                bytes.fromhex(self.peer_x25519_public))
-            shared_secret = our_private.exchange(peer_pub)
-
-            self._session_key = HKDF(
-                algorithm=hashes.SHA256(),
-                length=32,
-                salt=b'hart-peerlink-session-v1',
-                info=b'hart-peerlink-v1',
-            ).derive(shared_secret)
+            self._session_key = session_key_from(our_private, self.peer_x25519_public)
 
             self._key_established_at = time.monotonic()
             self._session_nonce_counter = 0
@@ -1020,6 +1231,34 @@ class PeerLink:
                 return None
             raise
 
+    def _answer_request(self, channel: str, data: Any, msg_id: str) -> None:
+        """Run a channel's handlers for a request whose sender is waiting, and
+        send the first handler's dict back as the reply ('re' = the request id).
+
+        No reply when no handler returned a dict.  Callers that wait on a
+        channel (dispatch, gossip, hivemind collect) read ANY reply as an
+        answer, so an error reply for "nobody handles this" would stop them
+        falling back to HTTP; silence leaves their timeout and fallback as they
+        were.
+        """
+        try:
+            reply = None
+            for handler in self._message_handlers.get(channel, []):
+                try:
+                    result = handler(channel, data, self.peer_id)
+                    if reply is None and isinstance(result, dict):
+                        reply = result
+                except Exception as e:
+                    logger.debug(f"Handler error on {channel}: {e}")
+            if reply is None:
+                return
+            try:
+                self.send(channel, reply, reply_to=msg_id)
+            except Exception as e:
+                logger.debug(f"Reply on {channel} failed: {e}")
+        finally:
+            self._request_slots.release()
+
     def _receive_loop(self):
         """Background thread: receive and dispatch messages."""
         # Second line of defence behind _ws_recv's timeout/error split. That
@@ -1052,7 +1291,7 @@ class PeerLink:
                     raw = raw.encode('utf-8')
 
                 # Decrypt if needed
-                if self.trust in (TrustLevel.PEER, TrustLevel.RELAY) and self._session_key:
+                if self._encrypting():
                     decrypted = self._decrypt(raw)
                     if decrypted is None:
                         continue
@@ -1069,17 +1308,74 @@ class PeerLink:
                     msg_id = msg.get('id', '')
                     data = msg.get('d', {})
 
+                    if (channel == 'control' and isinstance(data, dict)
+                            and data.get('type') in _GOODBYE_TYPES):
+                        logger.debug(f"PeerLink {self.peer_id[:8]} said goodbye")
+                        ws = self._ws
+                        self._handle_disconnect()
+                        if ws is not None and hasattr(ws, 'close'):
+                            try:
+                                ws.close()
+                            except Exception as close_err:
+                                logger.debug(f"PeerLink socket close after a goodbye: {close_err}")
+                        break
+
+                    if (self.kind == 'device' and channel == 'control'
+                            and isinstance(data, dict)
+                            and data.get('type') == 'heartbeat'
+                            and not data.get('reply')):
+                        # Answered: on the relay the phone's socket is to
+                        # central, alive whether or not this desktop still is,
+                        # so this answer is how the phone knows it is.  Marked
+                        # a reply, and a reply is never answered, so a device
+                        # that echoes heartbeats cannot start a ping-pong.
+                        self.send('control', {'type': 'heartbeat', 'reply': True})
+
                     # Check if this is a response to a pending request
-                    if msg.get('re') and msg['re'] in self._pending_responses:
-                        self._response_data[msg['re']] = data
-                        self._pending_responses[msg['re']].set()
+                    if msg.get('re'):
+                        waiter = self._pending_responses.get(msg['re'])
+                        if waiter is not None:
+                            self._response_data[msg['re']] = data
+                            waiter.set()
+                        # A reply nobody is waiting on any more (the sender
+                        # timed out first) is dropped.  Letting it fall through
+                        # would hand a reply dict to the channel's handler as if
+                        # it were a request: on 'compute', an inference.
                         continue
 
                     # Dispatch to handlers
-                    if not self._device_may_send(channel):
+                    if not self._device_may_send(
+                            channel, data, bool(msg.get('rq') and msg_id)):
                         continue
-                    handlers = self._message_handlers.get(channel, [])
-                    for handler in handlers:
+                    if msg.get('rq') and msg_id:
+                        # The sender is waiting (send(wait_response=True) flags
+                        # the frame).  The handler may be slow (inference), so it
+                        # runs on its own thread: this loop must keep reading, or
+                        # replies to OUR pending requests on this link queue
+                        # behind it and their timeouts fire spuriously.
+                        if not self._request_slots.acquire(blocking=False):
+                            logger.debug(
+                                "PeerLink %s: %d requests in flight, dropping "
+                                "one on %s", self.peer_id[:8],
+                                _MAX_CONCURRENT_REQUESTS, channel)
+                            if self.kind == 'device':
+                                # A phone hears it at once and goes to the
+                                # cloud; a node keeps its own timeout and
+                                # fallback, which read any reply as an answer.
+                                self.send(channel, {'type': 'busy'}, reply_to=msg_id)
+                            continue
+                        try:
+                            threading.Thread(
+                                target=self._answer_request,
+                                args=(channel, data, msg_id), daemon=True).start()
+                        except Exception as e:
+                            # no thread to run it: give the slot back
+                            self._request_slots.release()
+                            logger.debug(f"Could not start request thread: {e}")
+                        continue
+                    if channel in _REQUEST_ONLY_CHANNELS:
+                        continue
+                    for handler in self._message_handlers.get(channel, []):
                         try:
                             handler(channel, data, self.peer_id)
                         except Exception as e:
@@ -1195,4 +1491,40 @@ class PeerLink:
             caps['tier'] = get_node_tier()
         except Exception:
             caps['tier'] = 'flat'
+
+        # The device requests this node answers (a phone's api_request):
+        # a phone asks over the link only a node that names them, because
+        # one that answers nothing sends no reply at all.  Additive, so an
+        # older peer ignores it.
+        try:
+            from core.peer_link.link_manager import get_link_manager
+            manager = get_link_manager()
+            answered = manager.device_requests_answered()
+            if answered:
+                caps['device_requests'] = answered
+            for key, value in manager.advertised().items():
+                caps.setdefault(key, value)
+        except Exception as e:
+            logger.debug("peer_link: device requests not advertised: %s", e)
+        # Reachable on the relay (core.peer_link.relay): the inbox this node
+        # answers at, relay://<inbox>.  A phone that met this node on the LAN
+        # keeps it (with the node's key) and reaches the node there from
+        # anywhere.  Additive, like device_requests.
+        try:
+            from core.peer_link.relay import get_relay_hub
+            hub = get_relay_hub()
+            if hub is not None and hub.joined:
+                caps['relay'] = hub.endpoint_id
+        except Exception as e:
+            logger.debug("peer_link: relay reachability not advertised: %s", e)
+        # A device's heartbeat is answered (_receive_loop), so a phone that
+        # hears nothing for a few of its heartbeats takes this node for gone
+        # (asleep, or off the relay without a goodbye) and sends its calls to
+        # the cloud at once.  Additive: a phone waits for an answer only from
+        # a node that names it.
+        caps['heartbeat_reply'] = True
+        # A phone's device token sealed to this node's X25519 key opens here
+        # (open_sealed_device_token): a phone that met this node on its LAN
+        # seals the token on the relay.  Additive, like heartbeat_reply.
+        caps['sealed_hello'] = True
         return caps

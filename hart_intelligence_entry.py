@@ -954,9 +954,13 @@ def _install_root_handlers(root, bundled, file_handler, console_handler):
         setattr(console_handler, _HARTOS_HANDLER_TAG, True)
         root.addHandler(file_handler)
         root.addHandler(console_handler)
-    elif not root.handlers:
-        setattr(console_handler, _HARTOS_HANDLER_TAG, True)
-        root.addHandler(console_handler)
+    else:
+        # The bare-root case is ONE rule shared with the agent daemon's
+        # entrypoint (core.log_handlers); it attaches `console_handler`
+        # only when root has no handler at all, tagged with the same tag.
+        from core.log_handlers import install_console_handler_if_bare
+        install_console_handler_if_bare(root, handler=console_handler,
+                                        tag=_HARTOS_HANDLER_TAG)
 
 
 _root = logging.getLogger()
@@ -969,6 +973,10 @@ app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY') or secrets.token_h
 # otherwise transport-rejects bodies Flask's own cap here would accept).
 from core.constants import MAX_PAYLOAD_BYTES, SHELL_COMMAND_TIMEOUT_S
 app.config['MAX_CONTENT_LENGTH'] = MAX_PAYLOAD_BYTES  # 2MB default, HEVOLVE_MAX_PAYLOAD_BYTES to override
+# ...for a remote caller.  A local caller's body has no cap (owner
+# 2026-10-10); the per-request rule is core.serve.max_body_size.
+from core.serve import caller_capped_request
+app.request_class = caller_capped_request(app.request_class)
 
 # ── LLM outbound logger ───────────────────────────────────────────────
 # Monkey-patches httpx.Client.send (+ AsyncClient) to (a) inject the
@@ -1325,6 +1333,18 @@ except ImportError:
     app.logger.info("App Marketplace not available, skipping")
 except Exception as e:
     app.logger.warning(f"App Marketplace init skipped: {e}")
+
+# McGroce agentic commerce — /api/commerce/session (Tomcat -> HARTOS token
+# exchange), /mandates/<id>, /health.  Also in blueprint_registry for the
+# Nunba path; _try_register skips it there when this one already ran.
+try:
+    from integrations.commerce.commerce_api import commerce_bp
+    app.register_blueprint(commerce_bp)
+    app.logger.info("Commerce API registered at /api/commerce/")
+except ImportError:
+    app.logger.info("Commerce API not available, skipping")
+except Exception as e:
+    app.logger.warning(f"Commerce API init skipped: {e}")
 
 # Resource Governor — start background monitoring (task #260: watchdog-registered)
 try:
@@ -2526,6 +2546,15 @@ def publish_async(topic, message, timeout=2.0):
             f-strings.
         message: Message payload (JSON string or dict)
         timeout: Maximum time for HTTP Crossbar publish (default: 2.0 seconds)
+
+    Where a chat reply came from: every chat.* envelope but the voice (a
+    'TTS' payload) leaves here stamped ``served_by`` = local | hive | cloud
+    (core.constants.canonical_served_by).
+    The envelope's own key wins; else the thread's reply_from() context
+    (hartos.threadlocal) -- a context and NOT a keyword, because the wrapper
+    Nunba installs above takes (topic, message, timeout) only; else the node's
+    own LLM.  The Crossbar HTTP leg below still sends a bare-text message as
+    the bare text it always was.
     """
     # Parse message if JSON string
     data = message
@@ -2547,6 +2576,32 @@ def publish_async(topic, message, timeout=2.0):
         resolve_legacy_topic = None
     bus_topic, user_id = resolve_legacy_topic(topic) if resolve_legacy_topic else (None, '')
     if bus_topic:
+        # Where a chat reply came from: local | hive | cloud, named by the
+        # ONE rule (core.constants.canonical_served_by).  Stamped before the
+        # bus is touched so the SSE leg below carries it even when the bus
+        # is down.  The envelope's own key, else the dispatch site's
+        # reply_from() context, else the node's own LLM.  Never absent: the
+        # page's fallback for a missing value is 'cloud', which badged a
+        # reply the local llama-server wrote "Cloud" (2026-10-04).  Local
+        # imports: test_egress_one_rule exec's this function's source in a
+        # namespace that holds none of this module's globals.
+        # A failure here costs the badge, never the delivery.
+        # Not the voice: a 'TTS' payload is played and never drawn as a
+        # bubble, and it reaches here on chat.pupit, from the synthesis
+        # thread that no longer knows the reply's origin -- a hive expert's
+        # spoken answer was stamped 'local' on the bus envelope and its
+        # task.confirmation copy (review of 028a8a959).
+        if (isinstance(data, dict) and bus_topic.startswith('chat.')
+                and data.get('action') != 'TTS'):
+            try:
+                from core.constants import canonical_served_by
+                from hartos.threadlocal import thread_local_data as _tld_origin
+                data['served_by'] = canonical_served_by(
+                    data.get('served_by') or _tld_origin.get_served_by(),
+                    data.get('node_tier'))
+            except Exception as _origin_err:
+                app.logger.warning(
+                    f"publish_async: served_by not stamped: {_origin_err}")
         try:
             bus = get_message_bus()
             # Ensure user_id is in data for per-user routing
@@ -2559,10 +2614,9 @@ def publish_async(topic, message, timeout=2.0):
             # this is a strict additive safety net for the audit gap
             # task #149 might have missed.
             #
-            # served_by stays caller-set because it identifies WHICH
-            # backend served THIS reply, which the infrastructure here
-            # doesn't know (only the dispatch site does — see
-            # speculative_dispatcher.py:1578).
+            # served_by is stamped above, before the bus is touched: the
+            # dispatch site names it through reply_from() (speculative_
+            # dispatcher's expert delivery), canonical_served_by defaults it.
             if (isinstance(data, dict)
                     and bus_topic
                     and bus_topic.startswith('chat.')):
@@ -3308,11 +3362,24 @@ def _handle_shell_command_tool(input_text: str) -> str:
     # Dispatched directly the same command returns rc=1 with 'Property
     # "FreeGB" cannot be found' — a failure the model can act on.
     shell_override = None
-    m = _re_shell.match(r'^(powershell|pwsh|bash|sh|cmd)\s*:\s*(.+)$', text, _re_shell.IGNORECASE)
+    # 'shell:' / 'terminal:' name the DEFAULT shell: the VLM loop's models
+    # write the tool's name in front of the command ("shell: dir", measured
+    # 2026-10-04 in the daemon's runs), and cmd.exe answered "'shell:' is not
+    # recognized" to every one.  They select nothing (the argv builder below
+    # falls to its default for any other spelling) and only lose the prefix.
+    m = _re_shell.match(r'^(powershell|pwsh|bash|sh|cmd|shell|terminal)\s*:\s*(.+)$',
+                        text, _re_shell.IGNORECASE)
     if m:
         shell_override = m.group(1).lower()
         text = m.group(2).strip()
-    else:
+    # Having named no shell, a 'shell:' / 'terminal:' command is read exactly
+    # like an unprefixed one, the native form included.  Stripping the prefix
+    # and stopping there ran `shell: powershell -Command "Get-Date -Format
+    # yyyy"` as `cmd /c powershell -Command "..."`: exit 0 with the command
+    # text as its output, the D73 false success below (review of 0cfa782cf,
+    # measured on the MSI 2026-10-05; before that commit the same input failed
+    # honestly with exit 1).
+    if shell_override in (None, 'shell', 'terminal'):
         # -enc / -EncodedCommand is deliberately NOT accepted as a selector:
         # it is obfuscation, and leaving it unstripped keeps it in front of
         # the denylist pattern that blocks it.  Only the execute-this-string
@@ -3463,8 +3530,20 @@ def _handle_shell_command_tool(input_text: str) -> str:
                        prompt_id=thread_local_data.get_prompt_id() or '')
     _run.step(iteration=1, action='shell', phase='executing', caption=_caption)
     _phase, _err = 'completed', ''
+    # Inside a computer-use run the command runs in the run's workspace
+    # (hartos.threadlocal workspace, set by integrations.vlm.local_loop),
+    # where the run's file actions resolve too: the prompt's route for a
+    # refused python -c is "write_file the script, then shell it".
+    # Measured 2026-10-05: every shell step ran in the process cwd, the
+    # install folder.  Only an existing folder is handed to the OS; a missing
+    # one would fail the spawn and read as "interpreter not found".
+    # Outside a run (the chat's Shell_Command) nothing changes.
+    _bounded_kw = {}
+    _workspace = thread_local_data.get_workspace()
+    if isinstance(_workspace, str) and _workspace and os.path.isdir(_workspace):
+        _bounded_kw['cwd'] = _workspace
     try:
-        proc = run_bounded(argv, timeout=SHELL_COMMAND_TIMEOUT_S)
+        proc = run_bounded(argv, timeout=SHELL_COMMAND_TIMEOUT_S, **_bounded_kw)
     except FileNotFoundError as e:
         _phase, _err = 'failed', f'interpreter not found — {e}'
         return f"Shell_Command: interpreter not found — {e}"
@@ -3739,37 +3818,55 @@ def _wire_qr_pair_emitter(channel_type: str, meta: dict) -> None:
         logger.debug("Connect_Channel: _wire_qr_pair_emitter failed: %s", e)
 
 
-def _start_gateway_qr_pair_push(channel_type: str, meta: dict) -> None:
-    """Conversational pair-code OTP flow for gateway_qr channels (WhatsApp).
+# A phone or tablet: its browser (Android / iPhone / iPad / iPod / Mobile) or
+# a React Native app's HTTP client (okhttp on Android, CFNetwork on iOS).
+# A desktop browser, Nunba's desktop webview and a server-side python client
+# match none of these.
+_PHONE_USER_AGENT = re.compile(
+    r'\b(?:Android|iPhone|iPad|iPod|Mobile|okhttp|CFNetwork)\b', re.IGNORECASE)
 
-    Orchestrates the steps the steward proved manually on 2026-05-25:
-      1. Ensure the embedded gateway session is started (idempotent —
-         Baileys gateway short-circuits if session already exists for
-         this user under ~/.hevolve/whatsapp/auth/<sid>/).
-      2. Mint an 8-char pair code at the gateway.
-      3. Emit agent_ui_update kind='pair_code' for the in-chat copy
-         card (LiquidUIService routes via WAMP to the user's Demopage).
-      4. Persist a Notification of type='consent.channel_pair_code'
-         with the payload as JSON in the message field.  The
-         consent.* prefix is the canonical route — NotificationBell
-         resolveTargetPath catches it on web/desktop, and Android
-         AutobahnConnectionManager onEventSocial dispatches consent.*
-         events to ConsentOverlayService.  RN ConsentOverlayService
-         (Hevolve_React_Native) reads kind/code/clipboard_payload/
-         deeplink from there, does Clipboard.setString(code), and shows
-         the "Open WhatsApp" banner.  When user taps it, WhatsApp opens
-         to Linked Devices and the code is already on the system
-         clipboard ready to paste.
-      5. Spawn a daemon thread polling /api/sessions/<sid>/status.
-         When WhatsApp confirms pairing (state=connected, authenticated
-         =true — happens after baileys auto-reconnects on code 515
-         restart-required), emit agent_ui_update kind='channel_connected'
-         so chat shows the success card with no further user action.
 
-    Fail-safe at every step: any branch logs at debug and returns.
-    The agent's text reply (composed by _handle_connect_channel_tool)
-    is the only guaranteed surface — UI cards and mobile push are
-    additive.
+def _user_agent_is_phone(user_agent) -> bool:
+    """Does this User-Agent belong to a phone or tablet?  One that is the
+    device a WhatsApp QR would have to be scanned WITH, so showing it a QR
+    leaves nothing to scan it."""
+    return bool(_PHONE_USER_AGENT.search(user_agent or ''))
+
+
+def _start_gateway_qr_pair_push(channel_type: str, meta: dict,
+                                phone: str = None, owner=None):
+    """Link a gateway_qr channel (WhatsApp) from chat, by the method that
+    works on the device the user is holding.
+
+      * A number is known -- given (the phone form, or 'whatsapp +91...'),
+        HEVOLVE_WHATSAPP_PHONE (operator choice) or the user's profile --
+        the pair code: chat card, consent.* notification that puts the code
+        on the phone's clipboard with an "Open WhatsApp" banner, and the iOS
+        fleet command.  One tap on the phone, on any device.
+      * No number and the request came from a phone or tablet
+        (_user_agent_is_phone): the form asking for the number.  A QR shown
+        on the phone cannot be scanned by that same phone.
+      * No number, on a desktop: WhatsApp's linked-device QR (``qr_pair``
+        cards), refreshed as WhatsApp rotates it (~20s) until it is scanned,
+        with "Link with phone number" on the card as the alternative.
+
+    The gateway serves the two methods on different sockets
+    (request-pair-code tears the QR socket down), so one attempt uses one.
+    One watcher polls /api/sessions/<sid>/status; when WhatsApp confirms, it
+    registers the binding, wires the live adapter and sends the
+    channel_connected card.  Every failure (gateway down, no code, the
+    window running out, a card or push not delivered) is a warning in the
+    log, and the ones the user must act on are a toast in chat.
+
+    Args:
+        phone: explicit number for "Link with phone number"; any format,
+            digits are kept.
+        owner: the user the cards are for, when the caller is a request
+            handler without a thread-local user (the re-entry route).
+
+    Returns 'pair_code', 'qr' or 'ask_phone': what the user was shown, for
+    the reply to describe.  None when the link could not start (the user
+    was told why in chat).
     """
     import os
     import json as _json
@@ -3777,7 +3874,12 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict) -> None:
     import threading
     import time
 
-    import requests as _req
+    # The ONE gateway client (api_channels): same base URL resolution as
+    # the /whatsapp/qr route and the X-Api-Key a remote WAHA needs.  Never
+    # raises; an unreachable gateway is (None, 503).
+    from integrations.social.api_channels import (
+        _proxy_gateway, _whatsapp_gateway_base,
+    )
 
     # Self-contained logger so the helper works whether the module's
     # global `logger` is initialised yet or not (helps in standalone
@@ -3786,7 +3888,7 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict) -> None:
 
     # _owner is who the cards are FOR (None -> agent_ui_update's resolved
     # owner); user_id keeps its 'system' placeholder for the gateway session.
-    _owner = thread_local_data.get_user_id() or None
+    _owner = owner or thread_local_data.get_user_id() or None
     user_id = _owner or 'system'
     sid = user_id if str(user_id).startswith('user_') else f"user_{user_id}"
     display_name = meta.get('display_name') or channel_type
@@ -3798,28 +3900,146 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict) -> None:
         else meta.get('mobile_deeplink')
     )
 
-    # Phone resolution: env override > stored user profile > ask in chat.
+    def _emit(payload: dict) -> None:
+        """One card to this user's chat; a missing service is logged."""
+        try:
+            from core.platform.registry import get_registry
+            _lui = get_registry().get_or_none('LiquidUIService')
+            if _lui is None:
+                _log.warning("gateway_qr: %s card not delivered, no "
+                             "LiquidUIService", payload.get('type'))
+                return
+            _lui.agent_ui_update(user_id, payload, user_id=_owner)
+        except Exception as e:
+            _log.warning("gateway_qr: %s card not delivered: %s",
+                         payload.get('type'), e)
+
+    def _fail(text: str) -> None:
+        _log.warning("gateway_qr: %s: %s", channel_type, text)
+        _emit({'type': 'toast', 'severity': 'error',
+               'channel': channel_type, 'channel_type': channel_type,
+               'text': text})
+
+    # The number, in order: given, the operator's, the user's profile.
     # WhatsApp's pair-code endpoint REQUIRES E.164 digits-only.
-    phone = (os.environ.get('HEVOLVE_WHATSAPP_PHONE', '') or '').strip()
-    phone = ''.join(ch for ch in phone if ch.isdigit())
-    if not phone:
+    phone = phone or os.environ.get('HEVOLVE_WHATSAPP_PHONE', '') or ''
+    if not phone and _owner:
         try:
             from integrations.social.models import db_session, User as _SocialUser
             with db_session(commit=False) as db:
-                u = db.query(_SocialUser).filter_by(
-                    id=str(user_id)).first()
-                _p = (
-                    ((u and getattr(u, 'phone', '') or '') or '').strip()
-                    if u else ''
+                u = db.query(_SocialUser).filter_by(id=str(_owner)).first()
+                phone = (getattr(u, 'phone_number', '') or getattr(u, 'phone', '') or '') if u else ''
+        except Exception as e:
+            _log.warning("gateway_qr: profile phone not read for %s (%s); "
+                         "linking without it", _owner, e)
+    phone = ''.join(ch for ch in str(phone) if ch.isdigit())
+
+    if not phone and _user_agent_is_phone(thread_local_data.get_client_user_agent()):
+        # On the phone itself: ask for the number, then send the pair code.
+        # The form posts to the re-entry route, which calls back here with
+        # the number.
+        _emit({
+            'type': 'form',
+            'title': f"Connect {display_name}",
+            'channel': channel_type,
+            'fields': [{
+                'name': 'phone',
+                'label': f'Your {display_name} number, with country code',
+                'placeholder': '+91 ...',
+                'help': ("Used once to get a linking code for this phone. "
+                         "Not stored."),
+                'type': 'tel',
+                'secret': False,
+            }],
+            'submit_label': 'Send me a code',
+            'action': f'/api/social/channels/{channel_type}/connect-pair-code',
+        })
+        return 'ask_phone'
+
+    base = _whatsapp_gateway_base()
+    started, start_status = _proxy_gateway('POST', f'/api/sessions/{sid}/start')
+    if started is None or start_status >= 400:
+        _fail(f"Couldn't reach the {display_name} link service on this "
+              f"computer (HTTP {start_status}"
+              f"{': ' + str(started.get('error')) if started and started.get('error') else ''}"
+              f"). It may still be starting; try again in a minute.")
+        return None
+
+    # One live attempt per session: a newer connect (say, the phone form
+    # after the QR) supersedes this watcher, so two never both announce.
+    # An attempt removes itself when it ends (_retire), so the map holds
+    # only live attempts.
+    _attempts = _start_gateway_qr_pair_push.__dict__.setdefault('attempts', {})
+    attempt = object()
+    _attempts[sid] = attempt
+
+    def _retire() -> None:
+        if _attempts.get(sid) is attempt:
+            _attempts.pop(sid, None)
+
+    if phone:
+        # Baileys needs ~3s for the WA noise handshake before
+        # requestPairingCode succeeds — manual probe earlier today (the
+        # FA9K4NHK code) verified this timing.
+        time.sleep(3)
+        body, _st = _proxy_gateway(
+            'POST', f'/api/sessions/{sid}/request-pair-code',
+            json={'phone': phone})
+        body = body or {}
+        code = body.get('code') if _st < 400 else None
+        if not code:
+            _retire()
+            _fail(f"{display_name} didn't return a pairing code "
+                  f"({body.get('error') or 'no code'}). Say 'connect "
+                  f"{channel_type}' without a number to scan a QR instead.")
+            return None
+
+        push_payload = {
+            'kind': 'channel_pair_code',
+            'channel': channel_type,
+            'display_name': display_name,
+            'color': color,
+            'icon': icon,
+            'code': code,
+            'clipboard_payload': code,
+            'deeplink': deeplink,
+            'expires_in': 60,
+        }
+
+        # Mobile push via existing NotificationService.  Type uses the
+        # canonical 'consent.*' prefix so the existing NotificationBell
+        # resolveTargetPath route (consent.* → /admin/consent/{ref}) and
+        # AutobahnConnectionManager 'consent.*' Intent dispatch (P0-D)
+        # catch it without per-type bell code.  target_id carries the
+        # channel name so /admin/consent/{whatsapp} lands on the right
+        # channel admin context.  Message JSON keeps the deeplink so the
+        # generic P0-C deeplink override in resolveTargetPath wins on
+        # click — that takes the user to the channel pair page directly.
+        #
+        # Order matters: NotificationService.create runs BEFORE the
+        # LiquidUI emit so we can pass notif.id into the chat-card
+        # payload.  PairCodeOverlay (P1-S3) calls notificationsApi.markRead
+        # with that id on countdown expiry so the bell doesn't carry an
+        # orphan unread row for an expired pair code.
+        notif_id = None
+        try:
+            from integrations.social.services import NotificationService
+            from integrations.social.models import db_session
+            with db_session() as db:
+                notif = NotificationService.create(
+                    db,
+                    user_id=str(user_id),
+                    type='consent.channel_pair_code',
+                    target_id=channel_type,
+                    target_type='channel',
+                    message=_json.dumps(push_payload),
                 )
-                phone = ''.join(ch for ch in _p if ch.isdigit())
-        except Exception:
-            logging.getLogger(__name__).exception("_start_gateway_qr_pair_push: swallowed Exception")
-    if not phone:
-        # Fall through to the existing form path — surface a one-field
-        # form asking for the phone number.  Re-running connect with
-        # HEVOLVE_WHATSAPP_PHONE set, or after the user submits the
-        # form, will land in this branch with phone populated.
+                notif_id = getattr(notif, 'id', None)
+        except Exception as e:
+            _log.warning("gateway_qr: pair code not pushed to %s's phone "
+                         "(it is still in chat): %s", user_id, e)
+
+        # In-chat card via the existing LiquidUI emit pipe.
         try:
             from core.platform.registry import get_registry
             _lui = get_registry().get('LiquidUIService')
@@ -3827,261 +4047,169 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict) -> None:
                 _lui.agent_ui_update(
                     user_id,
                     {
-                        'type': 'form',
-                        'title': f"Connect {display_name}",
+                        'type': 'pair_code',
                         'channel': channel_type,
-                        'fields': [{
-                            'name': 'phone',
-                            'label': 'WhatsApp phone (E.164, e.g. +91 90030 54371)',
-                            'placeholder': '+91...',
-                            'help': (
-                                'Used once to mint the linked-device '
-                                'pair-code.  Not stored on our servers.'
-                            ),
-                            'type': 'text',
-                            'secret': False,
-                        }],
-                        'submit_label': 'Send pair code',
-                        # FormOverlay (AgentOverlay.jsx:362) reads `data.action`,
-                        # not `submit_action` — the latter was a stale name used
-                        # by the pre-existing register_channel form that no
-                        # caller wires.  This URL re-enters
-                        # _start_gateway_qr_pair_push with phone bound in
-                        # request body.
-                        'action': f'/api/social/channels/{channel_type}/connect-pair-code',
+                        'channel_type': channel_type,
+                        'display_name': display_name,
+                        'color': color,
+                        'icon': icon,
+                        'code': code,
+                        'expires_in': 60,
+                        'clipboard_payload': code,
+                        'deeplink': deeplink,
+                        'notification_id': notif_id,
+                        'instructions': (
+                            f"Open {display_name} on your phone → "
+                            f"Settings → Linked Devices → Link a Device → "
+                            f"Link with phone number → enter {code} "
+                            f"(60-second window).  I've also pushed it "
+                            f"to your phone with auto-copy to clipboard."
+                        ),
                     }, user_id=_owner,
                 )
-        except Exception:
-            logging.getLogger(__name__).exception("_start_gateway_qr_pair_push: swallowed Exception")
-        return
+        except Exception as e:
+            _log.warning("gateway_qr: pair-code card not delivered: %s", e)
 
-    base = (os.environ.get('WHATSAPP_GATEWAY_URL', '') or 'http://localhost:3000').rstrip('/')
-    try:
-        _req.post(f"{base}/api/sessions/{sid}/start", timeout=5)
-    except Exception as e:
-        _log.warning("gateway_qr: session start failed: %s", e)
-        return
-    # Baileys needs ~3s for the WA noise handshake before
-    # requestPairingCode succeeds — manual probe earlier today (the
-    # FA9K4NHK code) verified this timing.
-    time.sleep(3)
-    try:
-        r = _req.post(
-            f"{base}/api/sessions/{sid}/request-pair-code",
-            json={'phone': phone},
-            timeout=10,
-        )
-        body = r.json() if r.ok else {}
-        code = body.get('code')
-    except Exception as e:
-        _log.warning("gateway_qr: pair-code request error: %s", e)
-        return
-    if not code:
-        _log.warning(
-            "gateway_qr: gateway did not return a pair-code: %s", body)
-        return
-
-    push_payload = {
-        'kind': 'channel_pair_code',
-        'channel': channel_type,
-        'display_name': display_name,
-        'color': color,
-        'icon': icon,
-        'code': code,
-        'clipboard_payload': code,
-        'deeplink': deeplink,
-        'expires_in': 60,
-    }
-
-    # Mobile push via existing NotificationService.  Type uses the
-    # canonical 'consent.*' prefix so the existing NotificationBell
-    # resolveTargetPath route (consent.* → /admin/consent/{ref}) and
-    # AutobahnConnectionManager 'consent.*' Intent dispatch (P0-D)
-    # catch it without per-type bell code.  target_id carries the
-    # channel name so /admin/consent/{whatsapp} lands on the right
-    # channel admin context.  Message JSON keeps the deeplink so the
-    # generic P0-C deeplink override in resolveTargetPath wins on
-    # click — that takes the user to the channel pair page directly.
-    #
-    # Order matters: NotificationService.create runs BEFORE the
-    # LiquidUI emit so we can pass notif.id into the chat-card
-    # payload.  PairCodeOverlay (P1-S3) calls notificationsApi.markRead
-    # with that id on countdown expiry so the bell doesn't carry an
-    # orphan unread row for an expired pair code.
-    notif_id = None
-    try:
-        from integrations.social.services import NotificationService
-        from integrations.social.models import db_session
-        with db_session() as db:
-            notif = NotificationService.create(
-                db,
-                user_id=str(user_id),
-                type='consent.channel_pair_code',
-                target_id=channel_type,
-                target_type='channel',
-                message=_json.dumps(push_payload),
-            )
-            notif_id = getattr(notif, 'id', None)
-    except Exception as e:
-        _log.debug("gateway_qr: mobile push skipped: %s", e)
-
-    # In-chat card via the existing LiquidUI emit pipe.
-    try:
-        from core.platform.registry import get_registry
-        _lui = get_registry().get('LiquidUIService')
-        if _lui:
-            _lui.agent_ui_update(
-                user_id,
+        # ── 2026-05-26 P0-E ──────────────────────────────────────────────
+        # Fleet fanout for iOS native (Nunba-Companion-iOS) which
+        # subscribes to com.hertzai.hevolve.fleet.user.{user_id} and routes
+        # the existing 'agent_consent' cmd_type via FleetCommandReceiver
+        # allowlist — no iOS code change required.  Per
+        # core/peer_link/ui_commands.py module docstring: consent flows
+        # MUST use cmd_type='agent_consent' (NOT ui_overlay_show); the
+        # helper is "future work" per that docstring, so we publish via
+        # message_bus directly with the documented shape.  Web/desktop
+        # already get this card via the agent_ui_update + Notification
+        # emits above; Android gets it via the consent.* WAMP dispatcher
+        # (P0-D); this closes the iOS gap with one canonical route.
+        try:
+            from core.peer_link.message_bus import get_message_bus
+            get_message_bus().publish(
+                'fleet.command.user',
                 {
-                    'type': 'pair_code',
+                    'cmd_type': 'agent_consent',
+                    'id': f"consent-{channel_type}-{int(time.time())}",
+                    'title': f"Connect {display_name}",
+                    'body': (
+                        f"Code {code} auto-copied to clipboard.  Open "
+                        f"{display_name} → Linked Devices and enter the "
+                        f"code within 60s."
+                    ),
+                    'code': code,
+                    'clipboard_payload': code,
+                    'deeplink': deeplink,
+                    'expires_in_seconds': 60,
+                    'channel': channel_type,
+                    'display_name': display_name,
+                },
+                user_id=str(user_id),
+            )
+        except Exception as e:
+            _log.warning("gateway_qr: pair code not sent to the iOS "
+                         "companion: %s", e)
+
+    def _watch():
+        """Show each fresh QR; on pairing, register, go live and confirm.
+
+        Window covers 4 pair-code retries (each WA expires after ~60s) and
+        several QR rotations.  Daemon, so shutdown never waits on it.
+        """
+        deadline = time.time() + 240
+        last_qr = None
+        shown = 0
+        while time.time() < deadline:
+            if _attempts.get(sid) is not attempt:
+                _log.info("gateway_qr: %s watcher for %s superseded by a "
+                          "newer connect", channel_type, sid)
+                return
+            body, _st = _proxy_gateway('GET', f'/api/sessions/{sid}/status')
+            if body is None or _st >= 400:
+                _log.debug("gateway_qr: status poll HTTP %s", _st)
+                body = {}
+            if body.get('authenticated'):
+                # Register binding so Hevolve/Nunba see channel as
+                # connected.  Re-uses the SAME register_channel
+                # closure Connect_Channel calls — single code path.
+                try:
+                    from integrations.channels.agent_tools import (
+                        build_channel_tool_closures,
+                    )
+                    _tools = build_channel_tool_closures(
+                        {'user_id': str(user_id),
+                         'prompt_id': thread_local_data.get_prompt_id()},
+                    ) or []
+                    _reg = next(
+                        (t[2] for t in _tools
+                         if isinstance(t, tuple) and len(t) >= 3
+                         and t[0] == 'register_channel'),
+                        None,
+                    )
+                    if _reg is not None:
+                        reg_out = _reg(channel_type, '{}')
+                        _log.info(
+                            "gateway_qr: register_channel after "
+                            "pair: %s", str(reg_out)[:200])
+                except Exception as reg_err:
+                    _log.warning(
+                        "gateway_qr: register_channel after pair "
+                        "failed: %s", reg_err)
+                # Live adapter: register_channel above only writes the
+                # UserChannelBinding row (so the UI shows "connected")
+                # — it never wires a real WhatsAppAdapter into the
+                # running ChannelRegistry, so inbound messages never
+                # reached the agent.  This is the actual transport.
+                if channel_type == 'whatsapp':
+                    _adapter_out = _ensure_whatsapp_live_adapter(
+                        user_id, sid=sid, base=base)
+                    _log.info(
+                        "gateway_qr: live adapter registration: %s",
+                        _adapter_out)
+                # Chat success card.
+                _emit({
+                    'type': 'channel_connected',
                     'channel': channel_type,
                     'channel_type': channel_type,
                     'display_name': display_name,
                     'color': color,
                     'icon': icon,
-                    'code': code,
-                    'expires_in': 60,
-                    'clipboard_payload': code,
-                    'deeplink': deeplink,
-                    'notification_id': notif_id,
-                    'instructions': (
-                        f"Open {display_name} on your phone → "
-                        f"Settings → Linked Devices → Link a Device → "
-                        f"Link with phone number → enter {code} "
-                        f"(60-second window).  I've also pushed it "
-                        f"to your phone with auto-copy to clipboard."
-                    ),
-                }, user_id=_owner,
-            )
-    except Exception as e:
-        _log.debug("gateway_qr: chat card emit failed: %s", e)
+                    'message': f"✅ {display_name} connected.",
+                })
+                _retire()
+                return
+            qr = body.get('qr')
+            if qr and qr != last_qr and not phone:
+                last_qr = qr
+                shown += 1
+                _emit({
+                    'type': 'qr_pair',
+                    'channel': channel_type,
+                    'channel_type': channel_type,
+                    'title': f"Scan to connect {display_name}",
+                    'help': (f"Open {display_name} on your phone → Settings "
+                             f"→ Linked devices → Link a device, and scan "
+                             f"this code."),
+                    'qr': qr,
+                    # One id per code; the overlay replaces the channel's
+                    # card in place with each newer code.
+                    'msg_id': f"qr_pair-{channel_type}-{sid}-{shown}",
+                    # The alternative for someone whose only device is the
+                    # phone: "Link with phone number" posts {phone} here.
+                    'pair_code_action': (
+                        f'/api/social/channels/{channel_type}/connect-pair-code'),
+                })
+            time.sleep(2)
+        if _attempts.get(sid) is not attempt:
+            return
+        _retire()
+        _fail(f"The {display_name} link expired before it was completed. "
+              f"Say 'connect {channel_type}' to get a new "
+              f"{'code' if phone else 'QR code'}.")
 
-    # ── 2026-05-26 P0-E ──────────────────────────────────────────────
-    # Fleet fanout for iOS native (Nunba-Companion-iOS) which
-    # subscribes to com.hertzai.hevolve.fleet.user.{user_id} and routes
-    # the existing 'agent_consent' cmd_type via FleetCommandReceiver
-    # allowlist — no iOS code change required.  Per
-    # core/peer_link/ui_commands.py module docstring: consent flows
-    # MUST use cmd_type='agent_consent' (NOT ui_overlay_show); the
-    # helper is "future work" per that docstring, so we publish via
-    # message_bus directly with the documented shape.  Web/desktop
-    # already get this card via the agent_ui_update + Notification
-    # emits above; Android gets it via the consent.* WAMP dispatcher
-    # (P0-D); this closes the iOS gap with one canonical route.
-    try:
-        from core.peer_link.message_bus import get_message_bus
-        get_message_bus().publish(
-            'fleet.command.user',
-            {
-                'cmd_type': 'agent_consent',
-                'id': f"consent-{channel_type}-{int(time.time())}",
-                'title': f"Connect {display_name}",
-                'body': (
-                    f"Code {code} auto-copied to clipboard.  Open "
-                    f"{display_name} → Linked Devices and enter the "
-                    f"code within 60s."
-                ),
-                'code': code,
-                'clipboard_payload': code,
-                'deeplink': deeplink,
-                'expires_in_seconds': 60,
-                'channel': channel_type,
-                'display_name': display_name,
-            },
-            user_id=str(user_id),
-        )
-    except Exception as e:
-        _log.debug("gateway_qr: iOS fleet publish skipped: %s", e)
-
-    # Polling thread — emits the success card to chat AND registers
-    # the channel binding in HARTOS DB when WhatsApp confirms pairing.
-    # Window covers 4 pair-code retries (each WA expires after ~60s).
-    # Daemon so the server can shut down at any time without joining
-    # this thread.
-    #
-    # Why the binding-register call inside the thread (not before):
-    # the user's manual pair on 2026-05-25 (FA9K4NHK) bypassed
-    # register_channel entirely — gateway state was 'connected' but
-    # HARTOS had no UserChannelBinding row, so neither the
-    # whatsapp_adapter daemon nor the admin Channels page nor any
-    # agent tool could see WhatsApp as a usable channel.  Registering
-    # in the success branch retroactively closes that loop for ANY
-    # path (chat conversational OR manual-via-curl) — single canonical
-    # success handler.  Idempotent: register_channel's UserChannelBinding
-    # query at agent_tools.py:204 short-circuits on existing rows.
-    def _poll():
-        deadline = time.time() + 240
-        while time.time() < deadline:
-            try:
-                rr = _req.get(
-                    f"{base}/api/sessions/{sid}/status", timeout=5)
-                if rr.ok and rr.json().get('authenticated'):
-                    # Register binding so Hevolve/Nunba see channel as
-                    # connected.  Re-uses the SAME register_channel
-                    # closure Connect_Channel calls — single code path.
-                    try:
-                        from integrations.channels.agent_tools import (
-                            build_channel_tool_closures,
-                        )
-                        _tools = build_channel_tool_closures(
-                            {'user_id': str(user_id),
-                             'prompt_id': thread_local_data.get_prompt_id()},
-                        ) or []
-                        _reg = next(
-                            (t[2] for t in _tools
-                             if isinstance(t, tuple) and len(t) >= 3
-                             and t[0] == 'register_channel'),
-                            None,
-                        )
-                        if _reg is not None:
-                            reg_out = _reg(channel_type, '{}')
-                            _log.info(
-                                "gateway_qr: register_channel after "
-                                "pair: %s", str(reg_out)[:200])
-                    except Exception as reg_err:
-                        _log.warning(
-                            "gateway_qr: register_channel after pair "
-                            "failed: %s", reg_err)
-                    # Live adapter: register_channel above only writes the
-                    # UserChannelBinding row (so the UI shows "connected")
-                    # — it never wires a real WhatsAppAdapter into the
-                    # running ChannelRegistry, so inbound messages never
-                    # reached the agent.  This is the actual transport.
-                    if channel_type == 'whatsapp':
-                        _adapter_out = _ensure_whatsapp_live_adapter(
-                            user_id, sid=sid, base=base)
-                        _log.info(
-                            "gateway_qr: live adapter registration: %s",
-                            _adapter_out)
-                    # Chat success card.
-                    try:
-                        from core.platform.registry import get_registry
-                        _lui = get_registry().get('LiquidUIService')
-                        if _lui:
-                            _lui.agent_ui_update(
-                                user_id,
-                                {
-                                    'type': 'channel_connected',
-                                    'channel': channel_type,
-                                    'channel_type': channel_type,
-                                    'display_name': display_name,
-                                    'color': color,
-                                    'icon': icon,
-                                    'message': (
-                                        f"✅ {display_name} connected."
-                                    ),
-                                }, user_id=_owner,
-                            )
-                    except Exception:
-                        logging.getLogger(__name__).exception("_poll: swallowed Exception")
-                    return
-            except Exception:
-                logging.getLogger(__name__).exception("_poll: swallowed Exception")
-            time.sleep(3)
     threading.Thread(
-        target=_poll, daemon=True,
+        target=_watch, daemon=True,
         name=f'connect_channel_poll_{channel_type}',
     ).start()
+    return 'pair_code' if phone else 'qr'
 
 
 _whatsapp_adapter_lock = threading.Lock()
@@ -4207,32 +4335,16 @@ def _ensure_whatsapp_live_adapter(
             )
             integration.registry.register(adapter)
 
-            loop = integration._loop
-            started_integration = False
-            if not (loop and loop.is_running()):
-                # Entrypoints that skip hartos_bootstrap's full sequence (e.g.
-                # the standalone hart_intelligence_entry.py used for local/dev
-                # testing) never call FlaskChannelIntegration.start() at all,
-                # so _loop stays None forever and every adapter sits
-                # registered-but-never-started — messages reach the gateway
-                # but nothing is listening. start() is idempotent (no-ops if
-                # already running) and cheap (an empty registry.start_all()
-                # the first time), so it's safe to trigger on-demand here
-                # rather than requiring the full boot sequence to have run.
-                integration.start()
-                started_integration = True
-                for _ in range(50):  # ~5s for the background thread to spin up
-                    loop = integration._loop
-                    if loop and loop.is_running():
-                        break
-                    time.sleep(0.1)
-                else:
-                    return {
-                        'success': False,
-                        'error': 'channel event loop failed to start '
-                                 '(FlaskChannelIntegration.start() ran but '
-                                 '_loop never became live)',
-                    }
+            # Entry points that skip hartos_bootstrap never call start(), so
+            # the loop may not exist yet; ensure_running() starts it on demand.
+            loop, started_integration = integration.ensure_running()
+            if loop is None:
+                return {
+                    'success': False,
+                    'error': 'channel event loop failed to start '
+                             '(FlaskChannelIntegration.start() ran but '
+                             '_loop never became live)',
+                }
             # A newly started integration invokes registry.start_all(), which
             # starts this adapter exactly once. An already-running loop needs
             # this explicit start because registry.start_all() has completed.
@@ -4465,7 +4577,11 @@ def _handle_connect_channel_tool(input_text: str) -> str:
                                 # before pasting the resulting token.
                                 'external_url': meta.get('external_url'),
                                 'submit_label': 'Connect',
-                                'submit_action': 'register_channel',
+                                # The renderer POSTs the field values to
+                                # `action` (Nunba FormOverlay).  The old
+                                # submit_action name was read by nothing,
+                                # so Connect dropped the typed token.
+                                'action': f'/api/social/channels/{channel_type}/connect',
                             },
                             user_id=thread_local_data.get_user_id() or None,
                         )
@@ -4519,9 +4635,43 @@ def _handle_connect_channel_tool(input_text: str) -> str:
             from integrations.channels.metadata import get_channel_metadata
             meta = get_channel_metadata(channel_type) or {}
             if meta.get('auth_method') == 'gateway_qr':
-                _start_gateway_qr_pair_push(channel_type, meta)
+                # A number in the input asks for a pair code.  Accepts the
+                # JSON form ('whatsapp {"phone": "+91..."}') or a bare number
+                # ('whatsapp +91 90030 54371'); fewer than 8 digits is not a
+                # phone number.  With none, the helper picks by the number on
+                # file and the device (_start_gateway_qr_pair_push).
+                try:
+                    _cfg = _json.loads(config_json or '{}')
+                except ValueError:
+                    _cfg = config_json
+                if isinstance(_cfg, dict):
+                    _cfg = _cfg.get('phone') or _cfg.get('phone_number') or ''
+                _phone = ''.join(ch for ch in str(_cfg or '') if ch.isdigit())
+                if len(_phone) < 8:
+                    _phone = ''
+                _how = _start_gateway_qr_pair_push(channel_type, meta,
+                                                   phone=_phone or None)
+                _name = meta.get('display_name') or channel_type
+                result = f"{result} " + {
+                    'pair_code': (
+                        f"I sent a linking code to this chat and to your "
+                        f"phone, where it is already copied: in {_name} open "
+                        f"Linked devices > Link a device > Link with phone "
+                        f"number and paste it."),
+                    'ask_phone': (
+                        f"Enter your {_name} number in the form I sent and "
+                        f"I'll send you a linking code: a QR code can't be "
+                        f"scanned by the phone showing it."),
+                    'qr': (
+                        f"Scan the QR code in this chat from {_name} on your "
+                        f"phone (Linked devices > Link a device). If you "
+                        f"can't scan, use 'Link with phone number' on the "
+                        f"card."),
+                }.get(_how, f"But the {_name} link couldn't start; the "
+                            f"message in chat says why.")
         except Exception as e:
-            logger.debug("Connect_Channel: gateway_qr push skipped: %s", e)
+            logger.warning("Connect_Channel: %s link not started: %s",
+                           channel_type, e)
         return result
     except Exception as e:
         return f"Channel connect error: {str(e)[:200]}"
@@ -5528,8 +5678,11 @@ def get_tools(req_tool, is_first: bool = False):
                     # LLM call. Doubling escapes them to literals. See
                     # langchain.log 2026-04-11 22:46:01 for the crash.
                     "with credentials (e.g. 'telegram {{\"bot_token\":\"123:ABC\"}}'). "
-                    "For WhatsApp specifically, passing just 'whatsapp' starts a QR "
-                    "authentication flow. Do NOT ask the user for credentials first — "
+                    "For WhatsApp specifically, passing just 'whatsapp' shows a QR "
+                    "code to scan; if the user can't scan (WhatsApp is on the same "
+                    "phone) or asks to link with their number, pass 'whatsapp "
+                    "<their phone number>' to send a pairing code instead. "
+                    "Do NOT ask the user for credentials first — "
                     "call this tool with just the channel name and it will tell you "
                     "what's needed."
                 ),
@@ -8206,6 +8359,12 @@ _state_lock = threading.Lock()  # Protects review_agents, conversation_agent, fi
 # After MAX_GATHER_TURNS without completion, force-complete with available data
 MAX_GATHER_TURNS = 12
 _gather_turn_counts = {}  # f'{user_id}_{prompt_id}' -> int
+# The gather sessions a review of the agent has been shown to, and what it
+# showed: the steps of the config shown (_config_steps of what
+# _config_review_text rendered), or None for the model's own review_details,
+# which is text.  A completed config is saved only for these, and only with
+# the steps that were shown (#205).  Same keys and lifetime as the turn counts.
+_gather_reviews_shown = {}
 
 # --- TTL-based cleanup for review_agents / conversation_agent (M2 fix) ---
 _AGENT_TTL = 3600  # 1 hour
@@ -8234,6 +8393,9 @@ def _cleanup_stale_agents():
     for tk in list(_gather_turn_counts.keys()):
         if tk not in _agent_timestamps:
             _gather_turn_counts.pop(tk, None)
+    for tk in list(_gather_reviews_shown):
+        if tk not in _agent_timestamps:
+            _gather_reviews_shown.pop(tk, None)
 
 # Per-user locks to prevent race conditions when concurrent requests
 # for the same user modify review_agents / conversation_agent dicts.
@@ -8621,7 +8783,7 @@ def _autonomous_gather_info(user_id, description, prompt_id):
         'goal': description or 'General assistant',
         'broadcast_agent': 'no',
         'personas': [{'name': 'Assistant', 'description': 'General purpose assistant'}],
-        'flows': [{'flow_name': 'main', 'persona': 'Assistant', 'actions': [{'action': 'Respond to user', 'action_id': 1, 'status': 'pending'}], 'sub_goal': description or 'Help the user'}],
+        'flows': [{'flow_name': 'main', 'persona': 'Assistant', 'actions': ['Respond to user'], 'sub_goal': description or 'Help the user'}],
         'extra_information': f'Auto-generated after {max_iterations} autonomous gather iterations',
         'prompt_id': prompt_id,
         'creator_user_id': user_id,
@@ -8786,6 +8948,13 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
     # core.llm_outbound_logger.strip_elided_pointers).
     from core.llm_outbound_logger import strip_elided_pointers
     response_text = strip_elided_pointers(response_text)
+    # Where this reply came from (local | hive | cloud): ONE rule, named once
+    # per reply, on the /chat JSON below, HARTOS's own reply API (Nunba's
+    # route rebuilds its reply and still writes its own 'local' there, its
+    # follow-up).  Local import: _chat_reply's source is exec'd in an
+    # isolated namespace by tests.
+    from core.constants import canonical_served_by
+    _served_by = canonical_served_by(payload.get('served_by'))
     if response_text:
         # media_mode honor: the Nunba adapter has forwarded the user's
         # chosen mode ('audio'|'video'|'text') in the /chat body all
@@ -8822,6 +8991,24 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
                 app.logger.debug(f"_chat_reply: avatar id unread: {_ae}")
         except RuntimeError:
             pass  # outside a request — keep speaking, as before
+        # A background goal turn ('daemon_<goal>' request id) has no listener:
+        # its audio is published to the agent's own user id, which no client
+        # holds.  Measured 2026-09-30..10-01: 37 syntheses, all targeted=0,
+        # each ~30 s of the same Piper engine a real reply needs.  Only a
+        # NON-EMPTY id that is not a genuine user's is silenced; an empty id
+        # keeps speaking (callers that predate request ids), so the one
+        # discriminator is dispatch.is_genuine_user_request, never a prefix
+        # test here.
+        try:
+            from integrations.agent_engine.dispatch import (
+                is_genuine_user_request as _is_user_rid)
+            if request_id and not _is_user_rid(request_id):
+                _tts_wanted = False
+                app.logger.info(
+                    '_chat_reply: TTS suppressed (background turn) for '
+                    f'request_id={request_id}')
+        except Exception as _dm_err:
+            app.logger.debug(f"_chat_reply: daemon-turn gate skipped: {_dm_err}")
         # preferred_lang resolution must match the chat entry path:
         # body/kwarg → canonical persisted reader → 'en'.  Bare
         # 'en' default forced English Piper on Tamil replies.  Resolved
@@ -8903,9 +9090,22 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
         # via **payload when known.
         try:
             from integrations.social import chat_messages as _cm
-            _dev = payload.get('device_id')
+            # Order of precedence for the turn's fields: explicit payload
+            # kwarg -> /chat request body -> default.  device_id and
+            # prompt_id are passed by no caller, so the body is what names
+            # the device a turn came from (a client drops its own turns by
+            # it) and the agent it was for.
+            _req_body = {}
+            try:
+                from flask import has_request_context
+                from flask import request as _flask_req
+                if has_request_context():
+                    _req_body = _flask_req.get_json(silent=True) or {}
+            except Exception:
+                _req_body = {}
+            _dev = payload.get('device_id') or _req_body.get('device_id')
             _agent = payload.get('agent_id')
-            _prompt_id = payload.get('prompt_id')
+            _prompt_id = payload.get('prompt_id') or _req_body.get('prompt_id')
             _lang_hint = (payload.get('preferred_lang')
                           or payload.get('language') or _lang)
             _atts = payload.get('attachments')
@@ -8915,20 +9115,8 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
             # land in a separate logical thread from regular chat
             # without forking the persist pipeline.  Default 'chat'
             # preserves existing behaviour for every other caller.
-            # Order of precedence: explicit payload kwarg → request
-            # body → 'chat' default.
-            _chan_type = payload.get('channel_type')
-            if not _chan_type:
-                try:
-                    from flask import has_request_context
-                    from flask import request as _flask_req
-                    if has_request_context():
-                        _body = _flask_req.get_json(silent=True) or {}
-                        _chan_type = _body.get('channel_type') or 'chat'
-                    else:
-                        _chan_type = 'chat'
-                except Exception:
-                    _chan_type = 'chat'
+            _chan_type = (payload.get('channel_type')
+                          or _req_body.get('channel_type') or 'chat')
             if _prompt:
                 _cm.persist_and_publish_async(
                     str(user_id), 'user', _prompt,
@@ -8948,6 +9136,7 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
             app.logger.debug(
                 f"_chat_reply: chat-sync mirror skipped: {_chat_sync_err}")
 
+    payload['served_by'] = _served_by
     payload['response'] = response_text
     return jsonify(payload)
 
@@ -9148,7 +9337,8 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language=None,
             # timed with the canonical latency_ms= key.
             #
             # use_llm is True here for chat_response (SOURCE_URGENCY says
-            # 'normal', and use_llm = urgency != 'instant'), so this stage can
+            # 'normal', and tts_router.llm_rewrite_allowed allows the rewrite
+            # for it), so this stage can
             # make an LLM round-trip on the SAME contended server that just
             # served the reply.  budget: the docstring's "never let
             # normalization block speech" promise is about crashes; the
@@ -9157,12 +9347,14 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language=None,
             if not audio_path:
                 try:
                     from core.tool_logging import timed_stage
-                    from integrations.channels.media.tts_router import SOURCE_URGENCY
+                    from integrations.channels.media.tts_router import (
+                        SOURCE_URGENCY, llm_rewrite_allowed,
+                    )
                     from integrations.channels.media.tts_text_normalizer import (
                         normalize_for_tts,
                     )
                     _urgency = SOURCE_URGENCY.get('chat_response', 'normal')
-                    _use_llm = (_urgency != 'instant')
+                    _use_llm = llm_rewrite_allowed(_urgency)
                     with timed_stage('tts.normalize', logger=app.logger,
                                      warn_over_ms=1500, use_llm=_use_llm,
                                      chars=len(_clean), lang=language):
@@ -9367,8 +9559,9 @@ def _optional_capability_missing(exc):
 
 
 _EMPTY_BUILD_REPLY = (
-    "I have the name and goal, but not the steps yet. Tell me the actions "
-    "this agent should take, in order, and I will build it from those."
+    "I have the name and goal, but not every step came through as a step I "
+    "can build. Tell me the actions this agent should take, in order, and I "
+    "will build it from those."
 )
 
 
@@ -9386,13 +9579,178 @@ def _config_is_buildable(cfg) -> bool:
     "completed" meant buildable.  It was saved with is_active=true and can
     never produce a flow recipe, because there are no actions to execute.
     That shape is 485 of the 624-config corpus (#718).
+
+    Every action must be readable as one, too: text, or the {'action': text}
+    dict saved configs also carry.  LIVE 2026-10-08 18:47 (prompt_id 54): the
+    person confirmed a review of three actions and the model's final JSON held
+    two of them and the flow's sub_goal as an object in their place; saved as
+    is, the confirmed third step was gone and the flow carried an entry no
+    step can be built from.
     """
+    def _is_action(action):
+        if isinstance(action, dict):
+            action = action.get('action')
+        return isinstance(action, str) and bool(action.strip())
+
     try:
-        flows = (cfg or {}).get('flows') or []
-        return any((f or {}).get('actions') for f in flows
-                   if isinstance(f, dict))
+        flows = [f for f in ((cfg or {}).get('flows') or [])
+                 if isinstance(f, dict)]
+        listed = [f.get('actions') for f in flows if f.get('actions')]
+        return bool(listed) and all(
+            isinstance(actions, list) and all(_is_action(a) for a in actions)
+            for actions in listed)
     except (AttributeError, TypeError):
         return False
+
+
+#: The list fields of an agent config.  gather_info's own completed template
+#: shows personas and tools as strings, and the model sometimes writes them,
+#: and flows, as JSON text of the list it means.
+_CONFIG_LIST_FIELDS = ('personas', 'tools', 'flows')
+
+
+def _decode_config_lists(cfg):
+    """The config with each list field the model wrote as JSON text decoded,
+    and the names of the fields decoded.
+
+    LIVE 2026-10-08 20:39:45 (prompt_id 54): the confirmed config came back
+    with personas, tools and flows each as the JSON text of the right list
+    (one flow, three plain-text actions, the sub_goal in place).  Left as
+    text, flows holds no flow and the config is refused as unbuildable, and a
+    personas string breaks every reader that indexes it.  Only text that
+    parses as a JSON list is decoded: anything else stays as it came, for
+    _config_is_buildable to judge.  The input is not changed.
+    """
+    if not isinstance(cfg, dict):
+        return cfg, ()
+    out, decoded = dict(cfg), []
+    for key in _CONFIG_LIST_FIELDS:
+        value = out.get(key)
+        if not (isinstance(value, str) and value.strip().startswith('[')):
+            continue
+        try:
+            items = json.loads(value)
+        except ValueError:
+            continue
+        if isinstance(items, list):
+            out[key] = items
+            decoded.append(key)
+    return out, tuple(decoded)
+
+
+#: What the gather model is told, in the same turn, when its completed config
+#: cannot be built (#205).  The steps are the ones the person confirmed, so the
+#: model is asked to write them again before the person is asked to.
+_BUILDABLE_REASK = (
+    'That configuration cannot be built: in "flows", every item of "actions" '
+    'must be one step written as plain text. Send the same configuration '
+    'again as one JSON object with "status": "completed" and the steps the '
+    'person confirmed, each step as its own string in "actions".')
+
+
+def _read_gather_config(response, prompt_id):
+    """The agent config in a gather_info reply, with its list fields decoded
+    (_decode_config_lists).  Raises ValueError when the reply holds none.
+
+    Moved out of chat() unchanged, so the model's second answer (#205) is read
+    the same way as its first."""
+    # Detect context-exceeded errors before parsing
+    if 'Context size has been exceeded' in response:
+        raise ValueError('LLM context size exceeded — cannot parse gather_info response')
+
+    new_response = response.replace('true','True').replace("false", "False")
+    try:
+        new_res = retrieve_json(new_response)
+        app.logger.info(f"new_res: {new_res}")
+    except Exception as e:
+        app.logger.error(f'Got some error while will try with re match error:{e}')
+        json_match = re.search(r'{[\s\S]*}', response)
+        if json_match:
+            new_res = json.loads(json_match.group(0))
+        else:
+            raise ValueError('No JSON in response')
+
+    # retrieve_json can return None without raising — catch it early
+    if new_res is None:
+        json_match = re.search(r'{[\s\S]*}', response)
+        if json_match:
+            new_res = json.loads(json_match.group(0))
+        else:
+            raise ValueError('retrieve_json returned None and no JSON found in response')
+
+    # LLM sometimes returns a list of conversation turns instead of a single dict
+    if isinstance(new_res, list):
+        app.logger.info(f'new_res is a list (len={len(new_res)}), extracting last dict with status')
+        for item in reversed(new_res):
+            if isinstance(item, dict) and 'status' in item:
+                new_res = item
+                break
+        else:
+            for item in reversed(new_res):
+                if isinstance(item, dict):
+                    new_res = item
+                    break
+            else:
+                raise ValueError(f'List response has no usable dict: {new_res}')
+        app.logger.info(f'Extracted dict: status={new_res.get("status")}')
+
+    if new_res is None:
+        raise ValueError('new_res is None after parsing')
+
+    new_res, _decoded = _decode_config_lists(new_res)
+    if _decoded:
+        app.logger.info(
+            "[GATHER] %s came as JSON text for %s - decoded",
+            ', '.join(_decoded), prompt_id)
+    return new_res
+
+
+#: A step's own number, as the model sometimes writes it ("1. Call ...").
+#: The space after it is required, so a step that begins with a decimal
+#: ("1.5 litres of water ...") keeps its number.
+_STEP_NUMBER = re.compile(r'^\s*\d+\s*[.)](?:\s+|$)')
+
+
+def _step_text(action):
+    """One action as the person reads it: its text (an action is text or
+    {'action': text}), spaces collapsed, without a number of its own, which
+    the review adds."""
+    text = action.get('action') if isinstance(action, dict) else action
+    return _STEP_NUMBER.sub('', ' '.join(str(text or '').split()))
+
+
+def _config_steps(cfg):
+    """Every flow's steps, in order, as _step_text reads them: what a review
+    of the config shows, and what a completed config is compared by before
+    it is built (#205).  Only the steps, on purpose: they are what gets
+    built and what the person checks.  A name, goal, flow name or persona
+    the model rewrites after the review does not show the config again."""
+    return tuple(tuple(_step_text(a) for a in (flow.get('actions') or []))
+                 for flow in (cfg.get('flows') or [])
+                 if isinstance(flow, dict))
+
+
+def _config_review_text(cfg):
+    """The config as the person reads it before it is built: its name, goal
+    and every flow's steps, numbered, and how to answer.  Shown when the model
+    finished without showing a review, or with steps other than the ones
+    shown (#205), so what the person confirms is the config that is built.
+    Only called on a buildable config."""
+    lines = ['Before I build it, here is the agent as I have it:', '']
+    if cfg.get('name'):
+        lines.append(f"Name: {cfg['name']}")
+    if cfg.get('goal'):
+        lines.append(f"Goal: {cfg['goal']}")
+    for flow in cfg.get('flows') or []:
+        if not isinstance(flow, dict):
+            continue
+        title = flow.get('flow_name') or 'Steps'
+        lines += ['', f"{title} ({flow['persona']}):" if flow.get('persona')
+                  else f"{title}:"]
+        for number, action in enumerate(flow.get('actions') or [], 1):
+            lines.append(f"{number}. {_step_text(action)}")
+    lines += ['', 'Reply yes to build it, or tell me what to change.']
+    return '\n'.join(lines)
 
 
 @app.route('/chat', methods=['POST'])
@@ -9410,9 +9768,17 @@ def chat():
         # API key is configured — validate it first (Layer 0)
         # Accept either API key directly or a valid JWT
         import hmac as _hmac_mod
+        # The key arrives as X-API-Key, the header security/middleware.py's
+        # gate accepts and dispatch._internal_auth_headers sends; before this,
+        # every metered self-POST on a keyed node (the PAID calls) was
+        # admitted by the middleware and then 401'd here (review of
+        # 7086adff8, finding 2).  The Bearer form of the key only reaches
+        # here from a caller the middleware does not gate (a bundled
+        # desktop's own local caller): the gate decodes a Bearer as a JWT.
+        _x_api_key = request.headers.get('X-API-Key', '')
         _api_key_match = (
-            _bearer_token and
-            _hmac_mod.compare_digest(_bearer_token, _api_key)
+            (_bearer_token and _hmac_mod.compare_digest(_bearer_token, _api_key)) or
+            (_x_api_key and _hmac_mod.compare_digest(_x_api_key, _api_key))
         )
         if _api_key_match:
             g.auth_source = 'api_key'
@@ -9694,6 +10060,10 @@ def chat():
     # each other's (the old `thread_local_data.channel_context = …` put it on the
     # shared singleton instance, not _local — a cross-request leak).
     thread_local_data.set_channel_context(channel_context)
+    # Which device asked (always set, like channel_context): connecting
+    # WhatsApp on the phone itself needs a pair code, not a QR that phone
+    # cannot scan (_start_gateway_qr_pair_push).
+    thread_local_data.set_client_user_agent(request.headers.get('User-Agent', ''))
 
     # USER PRIORITY: mark user activity so daemon dispatch yields the LLM.
     #
@@ -9816,6 +10186,27 @@ def chat():
     # `_req_rid` is '' and the worker's re-bind at :1580 (`if request_id:`)
     # cannot fire.  Attributing that caller is the open work, not this line.
     thread_local_data.set_request_id(request_id=request_id)
+    # The lane this turn runs on (revenue or user; daemon is the id's own
+    # prefix), decided here where the request's auth is in hand and
+    # registered by request id so the autogen worker thread and the wire
+    # header read the same answer (core.request_lane, owner policy 2026-10-12).
+    # The node's own daemon turn is left to the id's prefix rule and to the
+    # lane dispatch_goal registered for a goal that earns; every other caller
+    # is registered by what its request proves, replacing whatever the id
+    # held, so nobody inherits a goal's lane by naming its request id.
+    try:
+        from core.constants import SYSTEM_IDENTITIES as _SYSTEM_IDENTITIES
+        from core.request_lane import register_chat_lane
+        from integrations.agent_engine.dispatch import (
+            is_genuine_user_request as _lane_is_genuine)
+        from integrations.commerce.bindings import TENANT as _COMMERCE_TENANT
+        from integrations.social.auth import decode_jwt as _lane_decode_jwt
+        register_chat_lane(request_id, _bearer_token, data, getattr(g, 'auth_source', None),
+                           decode_jwt=_lane_decode_jwt, tenant=_COMMERCE_TENANT,
+                           system_identities=_SYSTEM_IDENTITIES, is_genuine=_lane_is_genuine)
+    except Exception as _lane_err:
+        app.logger.warning('lane not registered for %s (the id rule decides it): %s',
+                           request_id, _lane_err)
 
     # Speculative dispatch: fast response + background expert
     if speculative and prompt and user_id and prompt_id:
@@ -10193,6 +10584,17 @@ def chat():
                     # escalates (Computer_Action/Shell are casual-only, so tasks
                     # route via Create_Agent -> CREATE).
                 else:
+                    # Only now — having decided to serve the draft's reply
+                    # as the final answer — fire the background expert.
+                    # The three branches above this one fall through to
+                    # their OWN synchronous full turn for this same prompt
+                    # instead of returning here; scheduling unconditionally
+                    # at classification time (the old behaviour) ran that
+                    # same turn again in the background for those cases —
+                    # the root cause of the 2026-08 duplicate-turn
+                    # investigation. See
+                    # speculative_dispatcher.schedule_expert_for_draft.
+                    dispatcher.schedule_expert_for_draft(result)
                     return _chat_reply(
                         user_id, request_id, result['response'],
                         Agent_status='Draft-First Mode',
@@ -10317,6 +10719,7 @@ def chat():
                 auto_response = _autonomous_gather_info(user_id, prompt, prompt_id)
 
                 # Now immediately create the recipe so next dispatch enters REUSE
+                recipe_response = None
                 _config_path = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
                 if os.path.exists(_config_path):
                     try:
@@ -10366,8 +10769,16 @@ def chat():
                 _record_lifecycle('Review Mode', user_id, prompt_id,
                                  f'Autonomous creation via dispatch: {prompt[:100]}')
                 _push_workflow_flowchart(user_id, prompt_id, request_id)
+                # A recipe() that stopped between steps for the person (#129)
+                # answers that, not the gather output: the dispatcher holds
+                # the goal only on a pause it can see (review of 96a9ca9f8:
+                # it took the gather output for the turn's result and
+                # recorded a 0-spark strike).  The flags above send the next
+                # dispatch back into recipe(), which resumes the session.
+                from core.agent_tools import is_user_pause
                 return _chat_reply(
-                    user_id, request_id, auto_response,
+                    user_id, request_id,
+                    recipe_response if is_user_pause(recipe_response) else auto_response,
                     intent=['FINAL_ANSWER'],
                     req_token_count=0, res_token_count=0,
                     history_request_id=[],
@@ -10390,7 +10801,6 @@ def chat():
                           'Return the full JSON immediately.')
 
             response = gather_info(user_id, prompt, prompt_id)
-            new_response = response.replace('true','True').replace("false", "False")
             app.logger.info('AFTER GATHER INFO')
 
             # --- Helper: save completed agent config and transition to Review ---
@@ -10423,56 +10833,39 @@ def chat():
                     review_agents[_ak] = True
                     _touch_agent_timestamp(_ak)
                 _gather_turn_counts.pop(turn_key, None)  # Reset turn counter
+                _gather_reviews_shown.pop(turn_key, None)
                 _record_lifecycle('Review Mode', user_id, prompt_id, 'Agent details gathered, entering review')
 
             try:
                 # Parse gather_info response
-                new_res = None
+                new_res = _read_gather_config(response, prompt_id)
 
-                # Detect context-exceeded errors before parsing
-                if 'Context size has been exceeded' in response:
-                    raise ValueError('LLM context size exceeded — cannot parse gather_info response')
-
-                try:
-                    new_res = retrieve_json(new_response)
-                    app.logger.info(f"new_res: {new_res}")
-                except Exception as e:
-                    app.logger.error(f'Got some error while will try with re match error:{e}')
-                    json_match = re.search(r'{[\s\S]*}', response)
-                    if json_match:
-                        new_res = json.loads(json_match.group(0))
-                    else:
-                        raise ValueError('No JSON in response')
-
-                # retrieve_json can return None without raising — catch it early
-                if new_res is None:
-                    json_match = re.search(r'{[\s\S]*}', response)
-                    if json_match:
-                        new_res = json.loads(json_match.group(0))
-                    else:
-                        raise ValueError('retrieve_json returned None and no JSON found in response')
-
-                # LLM sometimes returns a list of conversation turns instead of a single dict
-                if isinstance(new_res, list):
-                    app.logger.info(f'new_res is a list (len={len(new_res)}), extracting last dict with status')
-                    for item in reversed(new_res):
-                        if isinstance(item, dict) and 'status' in item:
-                            new_res = item
-                            break
-                    else:
-                        for item in reversed(new_res):
-                            if isinstance(item, dict):
-                                new_res = item
-                                break
-                        else:
-                            raise ValueError(f'List response has no usable dict: {new_res}')
-                    app.logger.info(f'Extracted dict: status={new_res.get("status")}')
-
-                if new_res is None:
-                    raise ValueError('new_res is None after parsing')
+                if (new_res.get('status') != 'pending'
+                        and turn_num < MAX_GATHER_TURNS
+                        and not _config_is_buildable(new_res)):
+                    # The steps are the ones the person confirmed; the MODEL
+                    # wrote them in a shape that cannot be built.  Ask the
+                    # model again, once, in this turn, before the person is
+                    # asked to type them again (#205).  Its answer goes through
+                    # the same exits as the first one.
+                    app.logger.warning(
+                        "[EMPTY-BUILD] status='completed' but not every action "
+                        "is a step for %s (flows: %.300s) - asking the model "
+                        "again (#205)", prompt_id, new_res.get('flows'))
+                    try:
+                        new_res = _read_gather_config(
+                            gather_info(user_id, _BUILDABLE_REASK, prompt_id),
+                            prompt_id)
+                    except Exception as _reask_err:
+                        app.logger.warning(
+                            "[EMPTY-BUILD] the model's second answer for %s "
+                            "could not be read (%s) - asking the person",
+                            prompt_id, _reask_err)
 
                 if new_res.get('status') == 'pending' and turn_num < MAX_GATHER_TURNS:
                     app.logger.info('PENDING STATUS')
+                    if new_res.get('review_details'):
+                        _gather_reviews_shown[turn_key] = None  # text, no steps
                     ans = new_res.get('question') or new_res.get('review_details', response)
                     _record_lifecycle('Creation Mode', user_id, prompt_id, f'Agent creation turn {turn_num}')
                     return _chat_reply(
@@ -10486,13 +10879,41 @@ def chat():
                     # Completed (or forced completion after max turns)
                     if turn_num < MAX_GATHER_TURNS and not _config_is_buildable(new_res):
                         app.logger.warning(
-                            "[EMPTY-BUILD] status='completed' with no actions for %s "
-                            "- asking for the steps instead of saving a config that "
-                            "can never build (#718)", prompt_id)
+                            "[EMPTY-BUILD] status='completed' but not every action "
+                            "is a step for %s (flows: %.300s) - asking for the steps "
+                            "instead of saving a config that cannot build (#718)",
+                            prompt_id, new_res.get('flows'))
                         _record_lifecycle('Creation Mode', user_id, prompt_id,
-                                          'Completed with no actions - re-asking')
+                                          'Completed without a step for every '
+                                          'action - re-asking')
                         return _chat_reply(
                             user_id, request_id, _EMPTY_BUILD_REPLY,
+                            intent=['FINAL_ANSWER'],
+                            req_token_count=0, res_token_count=0, history_request_id=[],
+                            Agent_status='Creation Mode', prompt_id=prompt_id,
+                            user_prompt=_user_turn_text,
+                        )
+                    _steps = _config_steps(new_res)
+                    _shown = _gather_reviews_shown.get(turn_key, _steps)
+                    if (turn_num < MAX_GATHER_TURNS
+                            and (turn_key not in _gather_reviews_shown
+                                 or _shown not in (None, _steps))):
+                        # The person confirms what is built (#205).  The model
+                        # finished without showing a review, or with steps
+                        # other than the ones shown, so this config is shown,
+                        # and nothing is saved until the person answers it.
+                        _gather_reviews_shown[turn_key] = _steps
+                        app.logger.warning(
+                            "[GATHER] completed %s for %s - showing the config "
+                            "to the person (#205)",
+                            'before any review was shown'
+                            if _shown is _steps else
+                            'with steps other than the ones shown', prompt_id)
+                        _record_lifecycle('Creation Mode', user_id, prompt_id,
+                                          'Completed before a review was '
+                                          'shown - showing the config')
+                        return _chat_reply(
+                            user_id, request_id, _config_review_text(new_res),
                             intent=['FINAL_ANSWER'],
                             req_token_count=0, res_token_count=0, history_request_id=[],
                             Agent_status='Creation Mode', prompt_id=prompt_id,
@@ -10538,7 +10959,7 @@ def chat():
                         'goal': prompt or 'General assistant',
                         'broadcast_agent': 'no',
                         'personas': [{'name': 'Assistant', 'description': 'General purpose assistant'}],
-                        'flows': [{'flow_name': 'main', 'persona': 'Assistant', 'actions': [{'action': 'Respond to user', 'action_id': 1, 'status': 'pending'}], 'sub_goal': prompt or 'Help the user'}],
+                        'flows': [{'flow_name': 'main', 'persona': 'Assistant', 'actions': ['Respond to user'], 'sub_goal': prompt or 'Help the user'}],
                         'extra_information': f'Auto-generated after {turn_num} gather turns'
                     }
                     _save_and_enter_review(partial)
@@ -11248,6 +11669,32 @@ def agent_approval():
         if decision not in ('approve', 'approved', 'allow', 'yes', 'deny', 'denied', 'no'):
             return jsonify({'status': 'error', 'reason': 'invalid decision'}), 400
         approved = decision in ('approve', 'approved', 'allow', 'yes')
+        # A McGroce payment (ap2_pay:<payment_id>) or merchant / product
+        # draft (merchant_onboard: / merchant_sku:<draft_id>).  Not a
+        # capability consent, so answered before the consent record below,
+        # and the approver is the caller's VERIFIED JWT identity -- never a
+        # body field: an agent must not be able to pay on its own say-so.
+        # One implementation: integrations/commerce/approvals.py.
+        try:
+            from integrations.commerce.approvals import (
+                answer_commerce_approval, approver_from_request,
+                is_commerce_action)
+        except Exception as _com_exc:   # never costs a consent answer
+            app.logger.warning(f'agent_approval: commerce unavailable: {_com_exc}')
+            is_commerce_action = None
+            # ...but a commerce answer must not fall through to the consent
+            # record below: that would write a consent row against the owner
+            # for a payment and answer as if something were applied.
+            from integrations.commerce import COMMERCE_ACTION_PREFIXES
+            if action.startswith(COMMERCE_ACTION_PREFIXES):
+                return jsonify({'status': 'error', 'action': action_raw,
+                                'reason': 'payments are unavailable on this '
+                                          'node right now; nothing was '
+                                          'approved or charged'}), 503
+        if is_commerce_action and is_commerce_action(action):
+            _c_body, _c_code = answer_commerce_approval(
+                action_raw, approved, approver_from_request(request))
+            return jsonify(_c_body), _c_code
         # Record first, on BOTH branches: the row is the answer, and writing
         # it also stops or starts the feed through the one actuator and tells
         # every other surface to drop its copy of the card.  The owner of
@@ -12539,14 +12986,22 @@ def coding_execute():
         return jsonify({'error': 'task is required'}), 400
 
     from integrations.coding_agent.orchestrator import get_coding_orchestrator
-    result = get_coding_orchestrator().execute(
-        task=task,
-        task_type=data.get('task_type', 'feature'),
-        preferred_tool=data.get('preferred_tool', ''),
-        user_id=data.get('user_id', ''),
-        model=data.get('model', ''),
-        working_dir=data.get('working_dir', ''),
-    )
+    from hartos.threadlocal import thread_local_data
+    # Detached: this request thread may still carry the last /chat turn's
+    # prompt, user and activity run; the run then worked in that agent's goal
+    # repo and was announced as that user (review of cd99c540d).  And an HTTP
+    # caller cannot be held for the owner's answer (it held one 108.6 s, past
+    # the 30-60 s its clients wait): the owner is asked, the caller told so.
+    with thread_local_data.detached():
+        result = get_coding_orchestrator().execute(
+            task=task,
+            task_type=data.get('task_type', 'feature'),
+            preferred_tool=data.get('preferred_tool', ''),
+            user_id=data.get('user_id', ''),
+            model=data.get('model', ''),
+            working_dir=data.get('working_dir', ''),
+            wait_for_owner=False,
+        )
 
     # If request came from hive peer, encrypt the response back
     if encrypted:
@@ -12572,13 +13027,14 @@ def coding_benchmarks():
 @app.route('/coding/install', methods=['POST'])
 @_json_endpoint
 def coding_install():
-    """Install a coding tool via npm. JSON body: {tool_name}"""
+    """Install a coding tool (npm, pip, or the official-script command for
+    the user to run — installer.install_tool picks). JSON body: {tool_name}"""
     data = request.get_json(force=True)
     tool_name = data.get('tool_name', '')
     if not tool_name:
         return jsonify({'error': 'tool_name is required'}), 400
-    from integrations.coding_agent.installer import install
-    result = install(tool_name)
+    from integrations.coding_agent.installer import install_tool
+    result = install_tool(tool_name)
     code = 200 if result.get('success') else 500
     return jsonify(result), code
 
@@ -12587,35 +13043,36 @@ def coding_install():
 def voice_transcribe():
     """Transcribe audio to text using Whisper STT.
 
-    Accepts multipart/form-data with 'audio' file or JSON with 'audio_path'.
+    multipart/form-data: 'audio' (the recording), optional 'language'.
+
+    The audio is the upload, never a path.  A JSON 'audio_path' made any
+    caller this node admits -- a consented phone on a desktop, any user on
+    central -- able to have any file on the node read and transcribed, and a
+    UNC path made it dial out (review of Nunba b07e025f, 2026-10-03).  Same
+    rule as /api/voice/speak's voice/output_path (#67).  In-process callers
+    use whisper_transcribe(path) directly.
     """
+    if not (request.content_type and 'multipart' in request.content_type):
+        return jsonify({'error': "upload the audio as multipart field 'audio'"}), 400
     try:
         from integrations.service_tools.whisper_tool import whisper_transcribe
         import tempfile
         import json as _json
 
-        if request.content_type and 'multipart' in request.content_type:
-            audio_file = request.files.get('audio')
-            if not audio_file:
-                return jsonify({'error': 'No audio file provided'}), 400
-            # Save to temp file
-            suffix = os.path.splitext(audio_file.filename)[1] or '.wav'
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                audio_file.save(tmp)
-                tmp_path = tmp.name
-            try:
-                result = whisper_transcribe(tmp_path)
-                return jsonify(_json.loads(result))
-            finally:
-                os.unlink(tmp_path)
-        else:
-            data = request.get_json() or {}
-            audio_path = data.get('audio_path', '')
-            if not audio_path:
-                return jsonify({'error': 'audio_path is required'}), 400
-            language = data.get('language')
-            result = whisper_transcribe(audio_path, language)
+        audio_file = request.files.get('audio')
+        if not audio_file:
+            return jsonify({'error': 'No audio file provided'}), 400
+        language = request.form.get('language') or None
+        # Save to temp file
+        suffix = os.path.splitext(audio_file.filename or '')[1] or '.wav'
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            audio_file.save(tmp)
+            tmp_path = tmp.name
+        try:
+            result = whisper_transcribe(tmp_path, language)
             return jsonify(_json.loads(result))
+        finally:
+            os.unlink(tmp_path)
 
     except ImportError as e:
         return jsonify({'error': f'Whisper not available: {e}'}), 503
@@ -13566,6 +14023,56 @@ def main():
         logging.getLogger(__name__).error(
             "Agent engine init failed — no seeded goal will ever execute on "
             "this node: %s", e, exc_info=True)
+
+    # Channel adapters: same class of gap as the agent engine above.
+    # hartos_bootstrap.py calls FlaskChannelIntegration.start() as part of the
+    # bundled boot sequence, but this standalone launcher never did — so
+    # `_loop` stayed None and every persisted UserChannelBinding sat dead
+    # until an unrelated WhatsApp code path happened to trigger start() on
+    # demand (see _ensure_whatsapp_live_adapter).  In practice that meant
+    # Discord/Telegram/Slack had to be re-bound by hand after every restart,
+    # even though the bindings table exists precisely to survive one.
+    #
+    # start() rehydrates adapters from those bindings and is idempotent, so a
+    # launcher that already started channels (Nunba) is unaffected.
+    try:
+        from integrations.channels.flask_integration import (
+            get_channel_integration, register_status_routes,
+        )
+        _channels = get_channel_integration()
+        # Inbound webhook seam, same omission as above: hartos_bootstrap and
+        # run_debug both call this, standalone never did — so the
+        # /channels/webhook/<channel_type> route did not exist here at all and
+        # EVERY webhook-based channel (google_chat, line, messenger,
+        # instagram, twitter, viber, wechat, zalo) was unreachable inbound,
+        # returning 404 to the provider. Must run before _serve_app.
+        try:
+            _channels.register_webhook_routes(app)
+        except Exception as e:
+            logging.getLogger(__name__).warning(
+                "Inbound channel webhook routes not registered — webhook-based "
+                "channels cannot receive messages on this node: %s", e,
+                exc_info=True)
+        # Same class of gap again: hartos_bootstrap/run_debug reach these two
+        # routes via init_channels(app), which standalone never called — so
+        # GET /channels/status and POST /channels/send 404'd here even
+        # though _channels itself is live. register_status_routes wires them
+        # onto the SAME get_channel_integration() singleton rather than
+        # going through init_channels(), which would construct a second,
+        # separate FlaskChannelIntegration and orphan whatever this one
+        # already has running (e.g. a WhatsApp adapter started early by
+        # _ensure_whatsapp_live_adapter).
+        try:
+            register_status_routes(app, _channels)
+        except Exception as e:
+            logging.getLogger(__name__).warning(
+                "/channels/status and /channels/send not registered: %s", e,
+                exc_info=True)
+        _channels.start()
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            "Channel adapters not started — persisted channel bindings will "
+            "stay disconnected on this node: %s", e, exc_info=True)
 
     from core.port_registry import get_port
     _serve_app(app, host='0.0.0.0', port=get_port('backend'))

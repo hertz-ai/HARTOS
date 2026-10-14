@@ -41,6 +41,8 @@ _MODEL_COST_MAP = {
     'gpt-4o': 4,
     'gpt-4': 6,
     'gpt-3.5': 1,
+    'claude': 4,    # Anthropic, the expert tier on central (2026-10-12): the
+                    # gpt-4o class, not the unknown-model default of 2
     'groq': 0,      # Groq free tier — zero Spark
     'llama': 0,      # Local model — zero metered cost
     'mistral': 0,    # Local model
@@ -594,8 +596,16 @@ def meter_llm_call(model: str, tokens_in: int, tokens_out: int,
         if _is_local_model():
             usd_per_1k = 0.0
         else:
-            spark_per_usd = float(os.environ.get('HEVOLVE_SPARK_PER_USD', '100') or 100)
-            usd_per_1k = spark_per_1k(_resolve_model_name(model)) / max(spark_per_usd, 1e-9)
+            # A family with a real dollar price (Claude) is metered at it,
+            # blended over this call's input and output tokens so the stored
+            # actual_usd_cost is exact; every other cloud family keeps the
+            # Spark-derived rate.
+            blended = blended_usd_per_1k(_resolve_model_name(model), tokens_in, tokens_out)
+            if blended is not None:
+                usd_per_1k = blended
+            else:
+                spark_per_usd = float(os.environ.get('HEVOLVE_SPARK_PER_USD', '100') or 100)
+                usd_per_1k = spark_per_1k(_resolve_model_name(model)) / max(spark_per_usd, 1e-9)
         return record_metered_usage(
             node_id=node_id or 'local', model_id=model or 'unknown',
             task_source=task_source, tokens_in=int(tokens_in or 0),
@@ -604,6 +614,122 @@ def meter_llm_call(model: str, tokens_in: int, tokens_out: int,
     except Exception as e:
         logger.warning(f"LLM metering failed (the call itself is unaffected): {e}")
         return None
+
+
+# ─── Dollar meter and the Claude day cap (owner policy 2026-10-12) ─────────
+#
+# "No more than $6 a day on Claude in central", and "Claude can never become
+# its own blocker": the cap is enforced where the expert is OFFERED
+# (ModelRegistry._offered asks expert_budget_allows), so a turn past the cap
+# is served by the node's own model instead of failing.  The ledger it reads
+# is MeteredAPIUsage, fed by the wire hook from every response's usage block
+# (core.llm_outbound_logger._meter_response) at a real dollar price.
+# Topology agnostic: no node-tier branch.  The cap only has anything to cap
+# where an expert trio is configured (core.autogen_config), which is central
+# by configuration; a node whose LLM is local meters at zero and writes no
+# row.  The gate fails CLOSED: an unreadable ledger withholds the expert, and
+# withholding is never blocking (the turn runs on the node's own model).
+# Kong has no fuse on revenue-lane Claude by design; this day budget is its
+# only cap.  Prices are list prices per 1k tokens; the owner can pin them.
+# ONE price table and ONE pin reader, owned by core.autogen_config beside the
+# expert entry whose autogen ``price`` they also fill; imported here, never a
+# second copy.
+from core.autogen_config import (  # noqa: E402
+    EXPERT_USD_PER_1K as USD_PER_1K_BY_FAMILY, OTHER_MODEL_FAMILY, family_usd_per_1k,
+    model_family,
+)
+CLAUDE_USD_PER_1K_IN_VAR = 'HEVOLVE_CLAUDE_USD_PER_1K_IN'      # read by family_usd_per_1k
+CLAUDE_USD_PER_1K_OUT_VAR = 'HEVOLVE_CLAUDE_USD_PER_1K_OUT'
+CLAUDE_BUDGET_USD_DAY_VAR = 'HEVOLVE_CLAUDE_BUDGET_USD_DAY'
+DEFAULT_CLAUDE_BUDGET_USD_DAY = 6.0
+CAPPED_FAMILY = 'claude'
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, '') or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def usd_price_per_1k(model_name) -> Optional[Tuple[float, float]]:
+    """(input, output) dollars per 1k tokens for a model with a real price
+    table row, else None (the Spark-derived rate applies).  The family and
+    its (pinned) price come from the one rule in core.autogen_config."""
+    family = model_family(model_name)
+    if family == OTHER_MODEL_FAMILY:
+        return None
+    return family_usd_per_1k(family)
+
+
+def blended_usd_per_1k(model_name, tokens_in, tokens_out) -> Optional[float]:
+    """One cost_per_1k that makes ``(tin+tout)/1000 * rate`` equal the exact
+    input-plus-output dollar cost of this call; None for an unpriced family."""
+    price = usd_price_per_1k(model_name)
+    if price is None:
+        return None
+    tin = max(0, int(tokens_in or 0))
+    tout = max(0, int(tokens_out or 0))
+    total = tin + tout
+    if total <= 0:
+        return price[0]
+    return (tin * price[0] + tout * price[1]) / total
+
+
+def usd_spent_since(since, family: str) -> Optional[float]:
+    """Dollars this node's own calls spent on models of ``family`` (matched
+    by substring, the same rule usd_price_per_1k prices by, so a row named
+    'anthropic/claude-sonnet-4-5' counts) since ``since`` (UTC), from the
+    metered-usage ledger.  None when the ledger cannot be read: the caller
+    fails CLOSED on None (the expert is withheld, the turn runs on the
+    node's own model), because withholding is not blocking and an unread
+    ledger must not let the cap be overrun."""
+    try:
+        from sqlalchemy import func as sa_func
+        from integrations.social.models import db_session, MeteredAPIUsage
+        node_id = _this_node_id() or 'local'
+        with db_session() as db:
+            total = db.query(
+                sa_func.coalesce(sa_func.sum(MeteredAPIUsage.actual_usd_cost), 0.0)
+            ).filter(
+                MeteredAPIUsage.node_id == node_id,
+                MeteredAPIUsage.task_source == 'own',
+                sa_func.lower(MeteredAPIUsage.model_id).like('%' + family.lower() + '%'),
+                MeteredAPIUsage.created_at >= since,
+            ).scalar()
+            return float(total or 0.0)
+    except Exception as e:
+        logger.warning(f"usd_spent_since: ledger unreadable, the expert is withheld: {e}")
+        return None
+
+
+def claude_budget_usd_day() -> float:
+    return max(0.0, _env_float(CLAUDE_BUDGET_USD_DAY_VAR, DEFAULT_CLAUDE_BUDGET_USD_DAY))
+
+
+def claude_usd_spent_today() -> Optional[float]:
+    from datetime import datetime
+    day_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    return usd_spent_since(day_start, CAPPED_FAMILY)
+
+
+def expert_budget_allows(model_name) -> Tuple[bool, str]:
+    """May the expert model ``model_name`` be offered right now?
+
+    Only the capped family is ever refused: once today's metered dollars
+    reach the day budget, or while the ledger cannot be read.  A refusal is
+    not an error anywhere: the selector simply does not offer the expert and
+    the turn runs on the node's own model.
+    """
+    if model_family(model_name) != CAPPED_FAMILY:
+        return True, 'not a capped family'
+    cap = claude_budget_usd_day()
+    spent = claude_usd_spent_today()
+    if spent is None:
+        return False, f'{CAPPED_FAMILY} ledger unreadable: expert withheld'
+    if spent >= cap:
+        return False, f'{CAPPED_FAMILY} day budget spent: ${spent:.2f} of ${cap:.2f}'
+    return True, f'{CAPPED_FAMILY} day budget: ${spent:.2f} of ${cap:.2f}'
 
 
 def _this_node_id() -> str:

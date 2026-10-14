@@ -291,19 +291,13 @@ def init_agent_engine(app):
             if count > 0:
                 logger.info(f"Seeded {count} bootstrap goal(s)")
 
-            # Autonomous external marketing is opt-in. When the operator sets
-            # HEVOLVE_AUTONOMOUS_MARKETING, grant the standing public_exposure
-            # consent the external-post gate requires so the marketing agent can
-            # publish to external channels without a human in the loop per post.
-            # Default off → the gate stays fail-closed (nothing posts off-platform).
-            if os.environ.get('HEVOLVE_AUTONOMOUS_MARKETING', '').strip().lower() \
-                    in ('1', 'true', 'yes', 'on'):
-                from .goal_seeding import enable_autonomous_marketing_consent
-                n_consent = enable_autonomous_marketing_consent(db)
-                if n_consent:
-                    logger.info(
-                        "Autonomous marketing enabled: granted public_exposure "
-                        "for %d system identit(ies)", n_consent)
+            # Autonomous external marketing is opt-in, and the same flag turns
+            # it off: 1/true/yes/on grants the standing public_exposure consent
+            # the external-post gate requires, 0/false/no/off revokes it.
+            # Default (unset) → nothing changes; a node that never opted in
+            # stays fail-closed (nothing posts off-platform).
+            from .goal_seeding import apply_autonomous_marketing_flag
+            apply_autonomous_marketing_flag(db)
 
             db.commit()
 

@@ -179,8 +179,25 @@ class DiscordAdapter(ChannelAdapter, RoomCapableAdapter):
 
     def _convert_message(self, discord_msg: DiscordMessage) -> Message:
         """Convert Discord message to unified Message format."""
-        # Check if bot is mentioned
-        is_mentioned = self._bot.user in discord_msg.mentions if self._bot.user else False
+        # Check if bot is mentioned.  discord_msg.mentions holds USER
+        # mentions only — but Discord auto-creates a managed role named
+        # after the bot when it joins a guild, and the @-autocomplete
+        # offers that ROLE.  Picking it (the natural thing to do, and
+        # often the only suggestion) sends '<@&role_id> hi', which lands
+        # in role_mentions and leaves mentions empty.  The user plainly
+        # mentioned the bot, so honour a role mention for any role the
+        # bot actually holds — otherwise require_mention_in_groups drops
+        # the message and the channel looks dead.
+        is_mentioned = False
+        if self._bot.user:
+            is_mentioned = self._bot.user in discord_msg.mentions
+            if not is_mentioned and discord_msg.role_mentions:
+                me = getattr(discord_msg.guild, 'me', None)
+                if me is not None:
+                    bot_role_ids = {r.id for r in me.roles}
+                    is_mentioned = any(
+                        r.id in bot_role_ids for r in discord_msg.role_mentions
+                    )
 
         # Process attachments
         media = []

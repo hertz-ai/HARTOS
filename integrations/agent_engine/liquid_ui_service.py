@@ -28,6 +28,7 @@ Multi-modal output:
   Haptic  -> Vibration patterns (phone, via Android bridge)
 """
 import copy
+import difflib
 import json
 import logging
 import os
@@ -104,15 +105,32 @@ _A2UI_XSS_RE = re.compile(
     re.I)
 
 
+def _a2ui_xss_path(value, path: str = '') -> Optional[str]:
+    """Path of the first nested string that carries an XSS vector, else None.
+
+    The path is what lets a refusal tell the composing model WHERE the markup
+    is (``items[1].text``) instead of only that some string somewhere is bad.
+    A top-level string answers with '' (falsy), so callers test ``is not None``.
+    """
+    if isinstance(value, str):
+        return path if _A2UI_XSS_RE.search(value) else None
+    if isinstance(value, dict):
+        for k, v in value.items():
+            hit = _a2ui_xss_path(v, f'{path}.{k}' if path else str(k))
+            if hit is not None:
+                return hit
+        return None
+    if isinstance(value, list):
+        for i, v in enumerate(value):
+            hit = _a2ui_xss_path(v, f'{path}[{i}]')
+            if hit is not None:
+                return hit
+    return None
+
+
 def _a2ui_has_xss(value) -> bool:
     """True if any nested string in the component carries an XSS vector."""
-    if isinstance(value, str):
-        return bool(_A2UI_XSS_RE.search(value))
-    if isinstance(value, dict):
-        return any(_a2ui_has_xss(v) for v in value.values())
-    if isinstance(value, list):
-        return any(_a2ui_has_xss(v) for v in value)
-    return False
+    return _a2ui_xss_path(value) is not None
 
 
 # ── GPU render verdict (#137 — reduced effects on software render) ───────────
@@ -910,17 +928,109 @@ _connectivity_cache = _ConnectivityCache()
 # UI Component Schema (A2UI protocol)
 # ═══════════════════════════════════════════════════════════════
 
+#
+# AI-native contract (2026-10-10).  ``props`` is the LEGACY declared name list and
+# stays exactly as shipped (tests and the shell read it).  An entry that also
+# carries ``attributes`` has a TYPED contract: a name -> type map in the grammar
+# the enriched ``metric`` spec already used (str | number | bool | list | dict |
+# any | a|b|c for one-of), plus ``required``, a one-line ``doc`` and an
+# ``example`` that must validate against its own schema (a test enforces it).
+# An attribute is the union of what is declared, what the real emit sites send
+# and what Nunba's AgentOverlay reads; ``aliases`` maps a name a producer was
+# MEASURED to send onto the prop the renderer reads.  validate_component() and
+# agent_ui_compose() are the readers.  component_prompt() / component_json_schema()
+# generate, from these entries, the catalogue a model should be handed; NO in-tree
+# model reads them yet (_build_ui_prompt still hand-writes its type list), so that
+# wiring is the next step, not a given.  ``props`` stays only while tests read it
+# (test_consent_fanout_p0, test_home_compose_feed, test_liquid_ui_meet_copilot):
+# once they assert on ``attributes`` it is deleted and ``attributes`` is the one list.
 COMPONENT_TYPES = {
-    'card': {'props': ['title', 'content', 'icon', 'actions']},
-    'list': {'props': ['items', 'ordered', 'interactive']},
-    'form': {'props': ['fields', 'submit_label', 'action']},
-    'chart': {'props': ['type', 'data', 'labels', 'title']},
-    'progress': {'props': ['value', 'max', 'label', 'color']},
-    'notification': {'props': ['title', 'message', 'severity', 'actions']},
-    'approval': {'props': ['agent_id', 'action', 'description', 'options']},
-    'code': {'props': ['language', 'content', 'filename']},
-    'markdown': {'props': ['content']},
-    'media': {'props': ['type', 'src', 'alt', 'controls']},
+    'card': {
+        'props': ['title', 'content', 'icon', 'actions'],
+        'attributes': {'title': 'str', 'content': 'str', 'message': 'str',
+                       'icon': 'str', 'actions': 'list', 'intent': 'str'},
+        'doc': 'Titled text card; the body is `content` (or `message`).',
+        'example': {'title': 'Q3 numbers', 'content': 'Ready to review.'},
+    },
+    'list': {
+        'props': ['items', 'ordered', 'interactive'],
+        'attributes': {'items': 'list', 'ordered': 'bool',
+                       'interactive': 'bool', 'title': 'str'},
+        'required': ['items'],
+        'doc': 'Bulleted or numbered list; each item is a string or {text|label}.',
+        'example': {'items': ['Milk', 'Tea'], 'ordered': False},
+    },
+    'form': {
+        'props': ['fields', 'submit_label', 'action'],
+        'attributes': {'title': 'str', 'fields': 'list', 'submit_label': 'str',
+                       'action': 'str', 'submit_action': 'str',
+                       'channel': 'str', 'external_url': 'str'},
+        'required': ['fields'],
+        'doc': ('Input form. Each field is {name, label, type, required, secret, '
+                'placeholder, help, value, default, readonly}. `action` is the '
+                'endpoint the values are POSTed to.'),
+        'example': {'title': 'Your name',
+                    'fields': [{'name': 'name', 'label': 'Name', 'type': 'text'}],
+                    'submit_label': 'Save', 'action': '/api/example/save'},
+    },
+    'chart': {
+        'props': ['type', 'data', 'labels', 'title'],
+        'attributes': {'title': 'str', 'data': 'list', 'items': 'list',
+                       'labels': 'list'},
+        'doc': 'Bar chart; each data item is {label, value}.',
+        'example': {'title': 'Sales', 'data': [{'label': 'Mon', 'value': 3}]},
+    },
+    'progress': {
+        'props': ['value', 'max', 'label', 'color'],
+        'attributes': {'value': 'number', 'max': 'number', 'percent': 'number',
+                       'label': 'str', 'title': 'str', 'color': 'str'},
+        'doc': 'Progress bar; `value` (or `percent`) is 0-100.',
+        'example': {'label': 'Download', 'value': 40},
+    },
+    'notification': {
+        'props': ['title', 'message', 'severity', 'actions'],
+        'attributes': {'title': 'str', 'message': 'str', 'content': 'str',
+                       'severity': 'info|success|warning|error',
+                       'actions': 'list'},
+        'doc': ('Notice card. Each action is {label, kind: navigate|external, '
+                'target}.'),
+        'example': {'title': 'Backup done', 'message': 'All files saved.',
+                    'severity': 'success'},
+    },
+    'approval': {
+        'props': ['agent_id', 'action', 'description', 'options'],
+        'attributes': {'agent_id': 'str', 'action': 'str', 'description': 'str',
+                       'title': 'str', 'options': 'list', 'user_id': 'str'},
+        'required': ['action'],
+        'doc': ('Approve / deny / later card. `options` relabels the three '
+                'buttons in that order. The answer is recorded against `action`.'),
+        'example': {'agent_id': 'agent_1', 'action': 'delete_old_logs',
+                    'description': 'Delete logs older than 30 days?'},
+    },
+    'code': {
+        'props': ['language', 'content', 'filename'],
+        'attributes': {'language': 'str', 'content': 'str', 'code': 'str',
+                       'filename': 'str'},
+        'doc': 'Code block; the text is `content` (or `code`).',
+        'example': {'language': 'python', 'content': 'print(1)',
+                    'filename': 'a.py'},
+    },
+    'markdown': {
+        'props': ['content'],
+        'attributes': {'content': 'str', 'text': 'str'},
+        'doc': 'Short markdown: bold, italic, links and bullets.',
+        'example': {'content': '**Done**: 3 files.'},
+    },
+    'media': {
+        'props': ['type', 'src', 'alt', 'controls'],
+        'attributes': {'media_type': 'image|video|audio', 'src': 'str',
+                       'url': 'str', 'alt': 'str', 'title': 'str',
+                       'controls': 'bool'},
+        'doc': ("Image, video or audio. Nunba's AgentOverlay plays `url`; `src` "
+                'is the declared prop and AgentOverlay does not read it.'),
+        'example': {'media_type': 'audio', 'url': 'https://example.com/a.mp3',
+                    'alt': 'Sample', 'controls': True},
+    },
     # ``metric`` is the worked example of the ENRICHED interface shape (§6b): the
     # flat ``props`` stays (the attribute schema every consumer already reads), and
     # the entry additionally DECLARES the events it emits, its behaviours, and an
@@ -942,44 +1052,167 @@ COMPONENT_TYPES = {
             'compose': 'agent_ui_update(agent_id, {"type": "metric", ...attrs})',
         },
     },
-    'layout': {'props': ['type', 'children', 'gap']},
+    'layout': {
+        'props': ['type', 'children', 'gap'],
+        'attributes': {'children': 'list', 'gap': 'number',
+                       'direction': 'row|column'},
+        'required': ['children'],
+        'doc': 'Stack of other components; each child is a full component dict.',
+        'example': {'direction': 'row',
+                    'children': [{'type': 'metric', 'label': 'CPU',
+                                  'value': 12}]},
+    },
     # ── Ecommerce / Agent Action Live Fragments ──
-    'product_card': {'props': ['name', 'price', 'image', 'rating', 'description',
-                               'buy_action', 'compare_action']},
-    'cart': {'props': ['items', 'total', 'currency', 'checkout_action']},
-    'checkout': {'props': ['items', 'total', 'payment_methods', 'shipping_options',
-                           'confirm_action']},
-    'payment_status': {'props': ['status', 'amount', 'method', 'transaction_id']},
-    'order_tracking': {'props': ['order_id', 'status', 'steps', 'eta']},
-    'comparison': {'props': ['apps', 'features', 'winner']},
-    'agent_action': {'props': ['agent_id', 'action_type', 'description',
-                               'status', 'result', 'timestamp']},
-    'navigate': {'props': ['target', 'params', 'transition']},
+    'product_card': {
+        'props': ['name', 'price', 'image', 'rating', 'description',
+                  'buy_action', 'compare_action'],
+        'attributes': {'name': 'str', 'price': 'any', 'currency': 'str',
+                       'image': 'str', 'image_url': 'str', 'rating': 'number',
+                       'description': 'str', 'buy_action': 'str',
+                       'compare_action': 'str', 'sku': 'str',
+                       'product_id': 'str', 'category_id': 'str'},
+        'required': ['name'],
+        'doc': ('Product with an add-to-cart button. `price` is a number or a '
+                'preformatted string; `currency` is an ISO code such as INR.'),
+        'example': {'name': 'Masala tea', 'price': 120, 'currency': 'INR',
+                    'buy_action': 'cart.add'},
+    },
+    'cart': {
+        'props': ['items', 'total', 'currency', 'checkout_action'],
+        'attributes': {'items': 'list', 'total': 'any', 'currency': 'str',
+                       'checkout_action': 'str', 'superseded': 'bool',
+                       'ordered': 'bool'},
+        'required': ['items'],
+        'doc': 'Cart lines {name, qty, price} with a total and a checkout button.',
+        'example': {'items': [{'name': 'Tea', 'qty': 2, 'price': 40}],
+                    'total': 80, 'currency': 'INR'},
+    },
+    'checkout': {
+        'props': ['items', 'total', 'payment_methods', 'shipping_options',
+                  'confirm_action'],
+        'attributes': {'items': 'list', 'items_count': 'number', 'total': 'any',
+                       'amount': 'any', 'currency': 'str',
+                       'payment_methods': 'list', 'shipping_options': 'list',
+                       'confirm_action': 'str', 'approval_action': 'str',
+                       'paid': 'bool', 'cancelled': 'bool', 'order_id': 'str'},
+        'doc': 'Order summary with payment methods and a confirm button.',
+        'example': {'items_count': 2, 'total': 80, 'currency': 'INR',
+                    'payment_methods': ['UPI', 'Card']},
+    },
+    'payment_status': {
+        'props': ['status', 'amount', 'method', 'transaction_id'],
+        'attributes': {'status': 'success|pending|error', 'amount': 'any',
+                       'method': 'str', 'transaction_id': 'str'},
+        'required': ['status'],
+        'doc': ('Payment result. Use the CLIENT words success|pending|error; the '
+                'commerce words completed/failed are mapped by push_agent_ui.'),
+        'example': {'status': 'success', 'amount': 'INR 80', 'method': 'UPI'},
+    },
+    'order_tracking': {
+        'props': ['order_id', 'status', 'steps', 'current_step', 'eta'],
+        'attributes': {'order_id': 'str', 'status': 'str', 'steps': 'list',
+                       'current_step': 'number', 'eta': 'str'},
+        'required': ['order_id'],
+        'doc': 'Order progress; each step is {label, completed, current}.',
+        'example': {'order_id': 'A100', 'status': 'Packed',
+                    'steps': [{'label': 'Placed', 'completed': True}]},
+    },
+    'comparison': {
+        'props': ['apps', 'features', 'winner'],
+        'attributes': {'apps': 'list', 'features': 'list', 'winner': 'str'},
+        'required': ['apps'],
+        'doc': 'Side-by-side options; each app is {name, rating}.',
+        'example': {'apps': [{'name': 'A', 'rating': 4.5},
+                             {'name': 'B', 'rating': 3.5}], 'winner': 'A'},
+    },
+    'agent_action': {
+        'props': ['agent_id', 'action_type', 'description',
+                  'status', 'result', 'timestamp'],
+        'attributes': {'agent_id': 'str', 'action_type': 'str', 'action': 'str',
+                       'description': 'str', 'status': 'running|completed|error',
+                       'result': 'str', 'title': 'str', 'timestamp': 'any'},
+        'doc': 'What an agent is doing right now, and its result when done.',
+        'example': {'action': 'Searching', 'description': 'Looking up prices',
+                    'status': 'running'},
+    },
+    'navigate': {
+        'props': ['target', 'params', 'transition'],
+        'attributes': {'target': 'str', 'params': 'dict', 'transition': 'str',
+                       'title': 'str'},
+        'required': ['target'],
+        'doc': 'Open an in-app page; renders nothing itself.',
+        'example': {'target': '/social/settings/privacy'},
+    },
     # ── External-room copilot (UNIF-G5) ──
     # Live transcript + decisions + action items for an external Discord
     # audio room / Teams meet / WhatsApp group voice / Reddit voice room
     # joined via UNIF-G2 Join_External_Room.  Idempotent overwrite — backend
     # emits the FULL state on every transcript chunk; frontend replaces.
-    'meet_copilot': {'props': ['call_id', 'platform', 'room_id', 'state',
-                               'transcript_lines', 'decisions',
-                               'action_items', 'participants',
-                               'agent_role']},
+    'meet_copilot': {
+        'props': ['call_id', 'platform', 'room_id', 'state',
+                  'transcript_lines', 'decisions',
+                  'action_items', 'participants',
+                  'agent_role'],
+        'attributes': {'call_id': 'str', 'platform': 'str', 'room_id': 'str',
+                       'state': 'str', 'transcript_lines': 'list',
+                       'decisions': 'list', 'action_items': 'list',
+                       'participants': 'list', 'agent_role': 'str'},
+        'required': ['call_id'],
+        'doc': ('Live meeting copilot. Send the FULL state every time; the card '
+                'replaces itself.'),
+        'example': {'call_id': 'c1', 'platform': 'livekit', 'state': 'live',
+                    'transcript_lines': [], 'decisions': []},
+    },
     # ── Device pairing QR (used by hart_intelligence_entry) ──
     # WAS missing from allowlist while the emit site + web QRPairOverlay
     # renderer both existed — emits were silently rejected here.  Added
     # 2026-05-14 after probe_liquid_ui_audit found the gap.
-    'qr_pair': {'props': ['url', 'caption', 'expires_in_seconds',
-                          'session_id']},
+    'qr_pair': {
+        'props': ['url', 'caption', 'expires_in_seconds',
+                  'session_id'],
+        'attributes': {'qr': 'str', 'channel': 'str', 'title': 'str',
+                       'help': 'str', 'pair_code_action': 'str', 'url': 'str',
+                       'caption': 'str', 'expires_in_seconds': 'number',
+                       'session_id': 'str'},
+        'required': ['qr'],
+        'doc': ("QR to scan. Nunba's AgentOverlay draws `qr`; `url` and "
+                '`caption` are declared but it does not read them.'),
+        'example': {'qr': '2@abc123', 'channel': 'whatsapp',
+                    'title': 'Scan to connect WhatsApp'},
+    },
     # ── OAuth deep-link prompt ──
     # hart_intelligence_entry emits when a tool needs an OAuth handshake
     # (e.g. Reddit/Discord/Google sign-in).  Frontend renders as a
     # notification with a single navigate-to-external-URL action.
-    'oauth_link': {'props': ['title', 'provider', 'authorize_url',
-                             'description', 'scopes']},
+    'oauth_link': {
+        'props': ['title', 'provider', 'authorize_url',
+                  'description', 'scopes'],
+        'attributes': {'title': 'str', 'provider': 'str', 'authorize_url': 'str',
+                       'description': 'str', 'scopes': 'list', 'channel': 'str',
+                       'channel_type': 'str', 'display_name': 'str',
+                       'color': 'str', 'icon': 'str', 'url': 'str',
+                       'external_url': 'str', 'cta_label': 'str',
+                       'severity': 'str'},
+        'required': ['authorize_url'],
+        'doc': ("Sign-in prompt with one button that opens `authorize_url`. "
+                "The web renderer ignores `url`."),
+        'example': {'provider': 'Google', 'title': 'Sign in to Google',
+                    'authorize_url': 'https://example.com/auth'},
+    },
     # ── Transient toast (channels/agent_tools success/error feedback) ──
     # Lightweight notification with short auto-dismiss; web maps to the
     # same NotificationCard renderer with `severity` driving the colour.
-    'toast': {'props': ['title', 'message', 'severity']},
+    'toast': {
+        'props': ['title', 'message', 'severity'],
+        'attributes': {'title': 'str', 'message': 'str',
+                       'severity': 'info|success|warning|error',
+                       'channel': 'str', 'channel_type': 'str'},
+        'required': ['message'],
+        'aliases': {'text': 'message'},
+        'doc': ('Short notice. The body is `message`; AgentOverlay does not read '
+                '`text`, which two channel emitters send.'),
+        'example': {'message': 'Discord disconnected.', 'severity': 'info'},
+    },
     # ── Channel pair-code consent card (gateway_qr auth_method) ──
     # Emitted by hart_intelligence_entry._start_gateway_qr_pair_push
     # while a user is conversationally connecting WhatsApp / Telegram /
@@ -988,15 +1221,35 @@ COMPONENT_TYPES = {
     # the LiquidUI validator stops silently dropping the card on the
     # desktop shell.  Added 2026-05-26 after the consent-fanout audit
     # (memory/consent_fanout_p0_p3_plan.md, P0-A).
-    'pair_code': {'props': ['channel', 'channel_type', 'display_name',
-                            'color', 'icon', 'code', 'expires_in',
-                            'clipboard_payload', 'deeplink',
-                            'instructions']},
+    'pair_code': {
+        'props': ['channel', 'channel_type', 'display_name',
+                  'color', 'icon', 'code', 'expires_in',
+                  'clipboard_payload', 'deeplink',
+                  'instructions'],
+        'attributes': {'channel': 'str', 'channel_type': 'str',
+                       'display_name': 'str', 'color': 'str', 'icon': 'str',
+                       'code': 'str', 'expires_in': 'number',
+                       'clipboard_payload': 'str', 'deeplink': 'str',
+                       'instructions': 'str', 'notification_id': 'any'},
+        'required': ['code'],
+        'doc': 'One-time code to type on the phone; counts down `expires_in` seconds.',
+        'example': {'channel': 'whatsapp', 'display_name': 'WhatsApp',
+                    'code': 'ABCD1234', 'expires_in': 60},
+    },
     # ── Channel connected success card ──
     # Sibling of pair_code; rendered as a brief success toast once the
     # gateway confirms authentication.  Self-dismisses after 6s on web.
-    'channel_connected': {'props': ['channel', 'display_name', 'color',
-                                    'message']},
+    'channel_connected': {
+        'props': ['channel', 'display_name', 'color',
+                  'message'],
+        'attributes': {'channel': 'str', 'channel_type': 'str',
+                       'display_name': 'str', 'color': 'str', 'icon': 'str',
+                       'message': 'str'},
+        'required': ['channel'],
+        'doc': 'Brief success card once a channel is linked; it dismisses itself.',
+        'example': {'channel': 'discord', 'display_name': 'Discord',
+                    'message': 'Discord connected.'},
+    },
     # ── App installed → desktop icon (NixOS-style: install an app, its icon
     # appears) ── Emitted by app_installer._auto_register_app on a successful
     # install.  The desktop (hartDesktop.js) merges {id,title,icon,exec} into
@@ -1037,15 +1290,202 @@ def _component_spec_for(name: str, entry: dict) -> dict:
     if isinstance(entry.get('spec'), dict):
         return entry['spec']
     props = entry.get('props') or []
-    return {
+    typed = entry.get('attributes') if isinstance(
+        entry.get('attributes'), dict) and entry.get('attributes') else None
+    spec = {
         'name': name,
-        'attributes': {p: 'any' for p in props},
+        'attributes': dict(typed) if typed else {p: 'any' for p in props},
         'emits': list(entry.get('events') or []),
         'behaviors': list(entry.get('behaviors') or []),
         'mount': 'a2ui',
         'compose': ('agent_ui_update(agent_id, {"type": "%s", ...attributes})'
                     % name),
     }
+    if typed:
+        # The AI-native contract rides the same spec an agent already reads.
+        for key in ('required', 'doc', 'example', 'aliases'):
+            if entry.get(key):
+                spec[key] = copy.deepcopy(entry[key])
+    return spec
+
+
+# ── Typed attribute grammar + validation (AI-native registry, 2026-10-10) ────
+# One grammar for every reader (the validator, the prompt, the JSON schema, the
+# runtime registrar): str | number | bool | list | dict | any | a|b|c (one of).
+_ATTR_PY_TYPES = {
+    'str': (str,), 'list': (list, tuple), 'dict': (dict,), 'bool': (bool,),
+}
+_ATTR_SCALARS = frozenset({'str', 'number', 'bool', 'list', 'dict', 'any'})
+_ATTR_ENUM_VALUE_RE = re.compile(r'^[A-Za-z0-9_.:-]+$')
+_ATTR_NAME_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]{0,39}$')
+
+# Keys that belong to the push envelope or to the transport, not to a
+# component's own contract.  ``_``-prefixed keys (``_ts``, ``_spec`` ...) are
+# the service's own stamps and are skipped by rule.
+_ENVELOPE_KEYS = frozenset({
+    'type', 'component_type', 'agent_id', 'agent_name', 'msg_id', 'user_id',
+    'timestamp',
+})
+
+
+def _attr_grammar_ok(spec) -> bool:
+    """True if ``spec`` is a type this grammar defines."""
+    if not isinstance(spec, str):
+        return False
+    if spec in _ATTR_SCALARS:
+        return True
+    parts = spec.split('|')
+    return len(parts) > 1 and all(
+        p and _ATTR_ENUM_VALUE_RE.match(p) for p in parts)
+
+
+def _attr_value_ok(spec: str, value) -> bool:
+    """Does ``value`` satisfy the already-valid grammar ``spec``?"""
+    if spec == 'any':
+        return True
+    if spec == 'number':
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if spec in _ATTR_PY_TYPES:
+        return isinstance(value, _ATTR_PY_TYPES[spec])
+    return isinstance(value, str) and value in spec.split('|')
+
+
+def _attributes_for(entry: dict) -> Optional[dict]:
+    """The name -> type map of a registry entry, or None if it declares none.
+
+    An entry-level ``attributes`` wins; the enriched ``metric`` keeps its map
+    under ``spec`` (the shape this grammar came from), and a runtime-registered
+    type keeps whatever ``register_component_type`` stored there.
+    """
+    attrs = entry.get('attributes')
+    if isinstance(attrs, dict) and attrs:
+        return attrs
+    spec = entry.get('spec')
+    if isinstance(spec, dict) and isinstance(spec.get('attributes'), dict):
+        return spec['attributes'] or None
+    return None
+
+
+def _contract_of(entry: dict):
+    """``(attributes, required)`` of a registry entry, normalised.  Total.
+
+    The ONE reader of an entry's shape: the validator, the catalogue line and the
+    JSON schema all go through it, so none of them can be the one that still
+    trusts a hand-editable custom-types file.  A type this grammar does not define
+    is read as 'any' (guessing would refuse every value), non-string names are
+    dropped, and ``required`` keeps only names that are declared.
+    """
+    raw = _attributes_for(entry)
+    if raw is None:
+        props = entry.get('props')
+        raw = ({p: 'any' for p in props if isinstance(p, str)}
+               if isinstance(props, list) else {})
+    attrs = {k: (v if _attr_grammar_ok(v) else 'any')
+             for k, v in raw.items() if isinstance(k, str) and k != 'type'}
+    req = entry.get('required')
+    required = ([r for r in req if isinstance(r, str) and r in attrs]
+                if isinstance(req, list) else [])
+    return attrs, required
+
+
+def _short(value) -> str:
+    """A bounded repr, so one huge field cannot bloat a verdict."""
+    text = repr(value)
+    return text if len(text) <= 80 else text[:77] + '...'
+
+
+def validate_component(comp_type: str, component: dict, entry: dict) -> List[dict]:
+    """Check a component against its registry entry.  Pure and total: a
+    malformed entry or component yields fewer checks, never an exception.
+
+    Returns issues the composing model can act on, each
+    ``{path, code, level, expected, got, hint}``:
+
+    * ``required``     (error)   a required attribute is absent or None
+    * ``type``         (error)   the value is not the declared type
+    * ``enum``         (error)   the value is not one of the declared choices
+    * ``unknown_prop`` (warning) a key the type does not declare
+
+    Errors mean "the renderer will not show what you meant"; a warning means
+    "this key is ignored".  Legacy callers are never blocked by either (see
+    ``agent_ui_compose``); only a strict, AI-composed push is.
+    """
+    issues: List[dict] = []
+    attrs, required = _contract_of(entry)
+    if not attrs:
+        return issues
+    aliases = entry.get('aliases') if isinstance(entry.get('aliases'), dict) else {}
+    for name in required:
+        if component.get(name) is None:
+            issues.append({
+                'path': name, 'code': 'required', 'level': 'error',
+                'expected': attrs.get(name, 'any'), 'got': None,
+                'hint': f"{comp_type} needs '{name}'"})
+    for key, value in component.items():
+        if not isinstance(key, str) or key.startswith('_'):
+            continue
+        if key in _ENVELOPE_KEYS and key not in attrs:
+            continue
+        spec = attrs.get(key)
+        if spec is None:
+            if key in aliases:
+                hint = f"use '{aliases[key]}' instead of '{key}'"
+            else:
+                near = difflib.get_close_matches(key, list(attrs), n=1, cutoff=0.6)
+                hint = (f"did you mean '{near[0]}'?" if near else
+                        f"{comp_type} declares: " + ', '.join(sorted(attrs)[:12]))
+            issues.append({
+                'path': key, 'code': 'unknown_prop', 'level': 'warning',
+                'expected': None, 'got': _short(value), 'hint': hint})
+            continue
+        if (value is None or not isinstance(spec, str)
+                or _attr_value_ok(spec, value)):
+            continue
+        code = 'enum' if '|' in spec else 'type'
+        issues.append({
+            'path': key, 'code': code, 'level': 'error', 'expected': spec,
+            'got': _short(value),
+            'hint': (f"'{key}' must be one of {spec.replace('|', ', ')}"
+                     if code == 'enum' else f"'{key}' must be {spec}")})
+    return issues
+
+
+def _prompt_line(name: str, entry: dict) -> str:
+    """One catalogue line: ``name(req!: type, opt: type) - doc``."""
+    attrs, required = _contract_of(entry)
+    ordered = sorted(attrs.items(), key=lambda kv: kv[0] not in required)
+    args = ', '.join(
+        f"{k}{'!' if k in required else ''}: {v}" for k, v in ordered)
+    doc = _doc_of(entry)
+    return f"- {name}({args})" + (f" - {doc}" if doc else '')
+
+
+def _doc_of(entry: dict) -> Optional[str]:
+    """The one-line doc of an entry (entry-level, else its ``spec``), or None."""
+    doc = entry.get('doc')
+    if not isinstance(doc, str):
+        spec = entry.get('spec')
+        doc = spec.get('doc') if isinstance(spec, dict) else None
+    return doc if isinstance(doc, str) and doc else None
+
+
+def _json_schema_for(name: str, entry: dict) -> dict:
+    """A JSON Schema for one component, generated from its registry entry."""
+    attrs, required = _contract_of(entry)
+    scalar = {'str': {'type': 'string'}, 'number': {'type': 'number'},
+              'bool': {'type': 'boolean'}, 'list': {'type': 'array'},
+              'dict': {'type': 'object'}, 'any': {}}
+    props = {'type': {'const': name}}
+    for key, spec in attrs.items():
+        props[key] = (scalar[spec] if spec in scalar
+                      else {'type': 'string', 'enum': spec.split('|')})
+    schema = {'type': 'object', 'properties': props,
+              'required': ['type'] + required,
+              'additionalProperties': True}
+    doc = _doc_of(entry)
+    if doc:
+        schema['description'] = doc
+    return schema
 
 # ── Agentic HOME composition — the producer's schema allow-sets ──────────────
 # compose_home pushes a {hero, rows} payload; hartHome.js (compose -> render) is
@@ -1712,7 +2152,37 @@ class LiquidUIService:
 
     def agent_ui_update(self, agent_id: str, component: dict,
                         user_id: Optional[str] = None) -> bool:
+        """Push a UI component; True if it was accepted.
+
+        The bool contract the production emitters rely on (17 call sites).  A
+        model that composes UI should call ``agent_ui_compose`` instead: the
+        same gates, but it says WHY a push was refused and what is wrong with
+        it.  This is that call with lenient schema checking, so nothing that was
+        accepted before is refused now.
+        """
+        return bool(self.agent_ui_compose(agent_id, component, user_id)['ok'])
+
+    def agent_ui_compose(self, agent_id: str, component: dict,
+                         user_id: Optional[str] = None,
+                         strict: bool = False) -> dict:
         """Push a UI component from an agent to all connected frontends.
+
+        Returns a VERDICT the composing model can read and act on, instead of a
+        bare bool plus a log line it never sees::
+
+            {'ok': bool,          # was it accepted and stored
+             'valid': bool|None,  # no schema errors (None: refused before checking)
+             'type': str,
+             'refused': None | 'not_an_object' | 'disabled' | 'unknown_type' |
+                        'hive_halted' | 'rate_capped' | 'guardrail' |
+                        'unsafe_content' | 'invalid',
+             'issues': [{path, code, level, expected, got, hint}],
+             'hint': str|None}    # what to change
+
+        ``strict=False`` (the legacy ``agent_ui_update``) delivers a component
+        whose schema has errors and reports them; ``strict=True`` (an AI-composed
+        push) refuses it with ``refused='invalid'`` and stores nothing.  Warnings
+        (an unknown prop) never block.
 
         Delivery paths (best-effort once accepted):
           1. In-memory store → the :6800 shell's /api/notifications/stream
@@ -1731,18 +2201,35 @@ class LiquidUIService:
         Constitutional controls (an agent painting the screen is governed
         like an agent dispatch): the push is REFUSED while the human has
         halted the HiveCircuitBreaker, and every accepted push is recorded
-        in the immutable audit log.  Returns False if disabled, the type is
-        unknown, or the hive is halted.
+        in the immutable audit log.  Refused (``ok`` False) if disabled, the type
+        is unknown, or the hive is halted.
         """
+        comp_type = component.get('type', '') if isinstance(component, dict) else ''
+
+        def verdict(ok, refused=None, hint=None, issues=None):
+            return {
+                'ok': ok,
+                'valid': (None if issues is None else
+                          not any(i['level'] == 'error' for i in issues)),
+                'type': comp_type, 'refused': refused,
+                'issues': list(issues or []), 'hint': hint}
+
+        if not isinstance(component, dict):
+            return verdict(False, 'not_an_object',
+                           'a component is a dict with a "type" key')
         if not self.a2ui_enabled:
-            return False
-        comp_type = component.get('type', '')
+            return verdict(False, 'disabled', 'A2UI is switched off on this node')
         # The ONE allowlist gate, now runtime-extensible (§6b): a builtin type OR a
         # component a HART agent registered at runtime.  No second gate, no fork.
         if (comp_type not in COMPONENT_TYPES
                 and comp_type not in self._custom_component_types):
             logger.warning("Invalid A2UI component type: %s", comp_type)
-            return False
+            known = sorted(set(COMPONENT_TYPES) | set(self._custom_component_types))
+            near = difflib.get_close_matches(str(comp_type), known, n=3, cutoff=0.6)
+            return verdict(False, 'unknown_type', (
+                f"unknown component type {comp_type!r}; did you mean: "
+                f"{', '.join(near)}?" if near else
+                f"unknown component type {comp_type!r}; see component_prompt()"))
 
         # Kill-switch: when the human halts the hive, agent UI pushes stop
         # too — the constitution governs an agent painting the screen exactly
@@ -1755,7 +2242,8 @@ class LiquidUIService:
                 logger.warning(
                     "A2UI push refused (hive halted): %s from %s",
                     comp_type, agent_id)
-                return False
+                return verdict(False, 'hive_halted',
+                               'the human halted the hive; do not retry')
         except Exception:
             logger.exception("agent_ui_update: swallowed Exception")
 
@@ -1764,19 +2252,38 @@ class LiquidUIService:
         if not self._a2ui_rate_ok(agent_id):
             logger.warning("A2UI push rate-capped: %s from %s",
                            comp_type, agent_id)
-            return False
+            return verdict(False, 'rate_capped',
+                           'at most 20 pushes in a burst, then 2 per second per agent')
 
         # Destructive verbs (window.close / fullscreen takeover, Phase 6) pass
         # the FULL fail-CLOSED guardrail; benign display cards do not.
         if (comp_type in DESTRUCTIVE_COMPONENT_TYPES
                 and not self._a2ui_guardrail_ok(component)):
-            return False
+            return verdict(False, 'guardrail',
+                           'blocked by the destructive-verb guardrail')
 
         # Server-side defense-in-depth: reject obvious XSS vectors.
-        if _a2ui_has_xss(component):
+        bad_path = _a2ui_xss_path(component)
+        if bad_path is not None:
             logger.warning("A2UI push rejected (unsafe content): %s from %s",
                            comp_type, agent_id)
-            return False
+            return verdict(False, 'unsafe_content', (
+                f"{bad_path or 'the component'} contains markup that is not "
+                "allowed (script/iframe/on*= handlers/javascript: URIs)"))
+
+        # The typed contract.  Lenient (legacy) pushes report these and go on;
+        # a strict (AI-composed) push stops here so nothing half-right is shown.
+        issues = validate_component(
+            comp_type, component,
+            COMPONENT_TYPES.get(comp_type)
+            or self._custom_component_types.get(comp_type) or {})
+        if issues:
+            logger.debug("A2UI %s from %s: %d schema issue(s): %s", comp_type,
+                         agent_id, len(issues),
+                         [(i['code'], i['path']) for i in issues])
+        if strict and any(i['level'] == 'error' for i in issues):
+            return verdict(False, 'invalid',
+                           'fix the listed issues and push again', issues)
 
         import time as _time
         component['_ts'] = _time.time()
@@ -1869,7 +2376,7 @@ class LiquidUIService:
             logger.exception("agent_ui_update: swallowed Exception")  # EventBus emission is best-effort
 
         logger.info("A2UI: agent %s pushed %s component", agent_id, comp_type)
-        return True
+        return verdict(True, issues=issues)
 
     def _a2ui_rate_ok(self, agent_id: str) -> bool:
         """Per-agent token bucket (20 burst, +2/s) — a runaway agent cannot
@@ -1957,6 +2464,30 @@ class LiquidUIService:
                                        self._custom_component_types[type_name])
         return None
 
+    def _all_component_entries(self) -> Dict[str, dict]:
+        """Builtin + runtime-registered entries; a builtin is never shadowed."""
+        return {**self._custom_component_types, **COMPONENT_TYPES}
+
+    def component_prompt(self, types: Optional[List[str]] = None) -> str:
+        """The catalogue a model is handed, GENERATED from the registry.
+
+        One line per component, ``name(required!: type, optional: type) - doc``.
+        It is derived from the same entries the validator reads, so the text the
+        model is shown and the check its push meets cannot drift apart.
+        """
+        entries = self._all_component_entries()
+        names = [n for n in entries if types is None or n in types]
+        head = ('Liquid UI components. Push one with '
+                'agent_ui_compose(agent_id, {"type": <name>, ...props}). '
+                '`!` marks a required prop. Types: str, number, bool, list, '
+                'dict, any, or a|b|c (one of).')
+        return '\n'.join([head] + [_prompt_line(n, entries[n]) for n in names])
+
+    def component_json_schema(self, type_name: str) -> Optional[dict]:
+        """JSON Schema for one component (for a function-calling tool), or None."""
+        entry = self._all_component_entries().get(type_name)
+        return None if entry is None else _json_schema_for(type_name, entry)
+
     def register_component_type(self, agent_id: str, type_name: str,
                                 spec: dict) -> dict:
         """A HART agent registers a NEW self-sufficient, interface-declared,
@@ -2012,6 +2543,42 @@ class LiquidUIService:
         }
         if isinstance(spec.get('template'), str):
             entry['template'] = spec['template']
+        # The typed contract (optional): an agent that declares attribute TYPES
+        # gets its pushes validated and its component listed in the catalogue.
+        # A malformed declaration is refused with the reason, not stored.
+        attrs = spec.get('attributes')
+        if isinstance(attrs, dict) and attrs:
+            typed = {}
+            for key, kind in list(attrs.items())[:40]:
+                if not _ATTR_NAME_RE.match(str(key)):
+                    return {'error': f'attribute name {str(key)[:40]!r} must be '
+                                     'an identifier of at most 40 characters'}
+                if not _attr_grammar_ok(kind):
+                    return {'error': (
+                        f'attribute "{key}" has type {str(kind)[:40]!r}; use '
+                        'str, number, bool, list, dict, any or a|b|c')}
+                typed[str(key)] = kind
+            entry['attributes'] = typed
+            entry['props'] = list(typed)
+            required = spec.get('required') or []
+            if (not isinstance(required, list)
+                    or any(r not in typed for r in required)):
+                return {'error': '"required" must list declared attributes'}
+            if required:
+                entry['required'] = [str(r) for r in required]
+            if isinstance(spec.get('doc'), str):
+                entry['doc'] = spec['doc'][:200]
+            example = spec.get('example')
+            if example is not None:
+                bad = ([] if not isinstance(example, dict) else [
+                    i for i in validate_component(
+                        name, {'type': name, **example}, entry)
+                    if i['level'] == 'error'])
+                if not isinstance(example, dict) or bad:
+                    return {'error': 'the example contradicts the declared '
+                                     'attributes: ' + (bad[0]['hint'] if bad
+                                                       else 'it must be an object')}
+                entry['example'] = example
         entry['spec'] = _component_spec_for(name, {**entry,
                                                    'spec': spec.get('spec')})
         with self._lock:
@@ -2031,6 +2598,108 @@ class LiquidUIService:
         logger.info("A2UI: agent %s registered component type %s",
                     agent_id, name)
         return {'status': 'registered', 'type': name}
+
+    # The file Nunba's own desktop/guest_identity.get_user_data_file_path()
+    # reads for the signed-in owner, relative to the service user's HOME; both
+    # daemons run as `hart` on HART OS so the path is the same one Nunba writes.
+    _NUNBA_OWNER_FILE_PARTS = ("Documents", "HevolveAi Agent Companion", "storage", "user_data.json")
+
+    def _desktop_owner_id(self):
+        """Who the shell speaks as: the signed-in owner Nunba knows, else
+        Nunba's hardware-stable guest id, else None (the fallback path then
+        carries its old fixed identity). Mirrors Nunba's
+        get_desktop_owner_id(): the file is read on every turn so a sign-in
+        after boot is seen by the next one."""
+        try:
+            path = os.path.join(os.path.expanduser('~'), *self._NUNBA_OWNER_FILE_PARTS)
+            with open(path, encoding='utf-8') as fh:
+                uid = (json.load(fh) or {}).get('user_id')
+            if uid:
+                return str(uid)
+        except Exception:
+            pass
+        cached = getattr(self, '_nunba_guest_id', None)
+        if cached:
+            return cached
+        try:
+            client = self._nunba_chat_client()
+            resp = client.get('http://nunba/api/guest-id',
+                              headers=self._nunba_auth_headers('hart_shell'),
+                              timeout=5.0)
+            if resp.status_code == 200:
+                data = resp.json() or {}
+                gid = data.get('guest_id') or data.get('id')
+                if gid:
+                    self._nunba_guest_id = str(gid)
+                    return self._nunba_guest_id
+        except Exception as e:
+            logger.debug("shell chat: Nunba guest id unavailable: %s", e)
+        return None
+
+    def _nunba_auth_headers(self, user_id: str) -> dict:
+        """A JWT the Nunba daemon verifies: both units run as `hart` with the
+        same HEVOLVE_DB_PATH, so integrations.social.auth signs and
+        security/middleware.py decodes with the one .social_secret_key in the
+        data dir. Same mint internal /chat dispatch uses (dispatch.py)."""
+        # dispatch._internal_auth_headers is the ONE internal-caller credential
+        # builder (HEVOLVE_API_KEY as X-API-Key, else a minted JWT); the shell
+        # adds only the Host the unix-socket proxy uses.
+        from integrations.agent_engine.dispatch import _internal_auth_headers
+        headers = dict(_internal_auth_headers(user_id=user_id, username=user_id,
+                                             role='flat') or {})
+        headers['Host'] = getattr(self, '_nunba_server_name', 'Nunba')
+        headers['Content-Type'] = 'application/json'
+        return headers
+
+    def _shell_chat_via_nunba(self, text: str):
+        """POST the shell's turn to the Nunba daemon's /chat over its unix
+        socket as the desktop owner. Returns Nunba's payload with a 'response'
+        key the bubble and the composer read, or None when the daemon cannot
+        be reached (caller falls back to the backend)."""
+        get_client = getattr(self, '_nunba_chat_client', None)
+        if get_client is None:
+            return None
+        user_id = self._desktop_owner_id()
+        if not user_id:
+            return None
+        # core.chat_client.normalize_chat_body is the ONE request_id mint: a
+        # user id (not daemon_-prefixed), so every hop downstream classifies
+        # the turn as a genuine user request (dispatch.is_genuine_user_request).
+        from core.chat_client import normalize_chat_body
+        body = normalize_chat_body({
+            'text': text,
+            'user_id': user_id,
+            'agent_id': 'local_assistant',
+            'agent_type': 'local',
+            'media_mode': 'text',
+            'source': 'hart_shell',
+        })
+        try:
+            client = get_client()
+            resp = client.post('http://nunba/chat', json=body,
+                               headers=self._nunba_auth_headers(user_id),
+                               timeout=300.0)
+        except Exception as e:
+            logger.warning("shell chat: Nunba daemon unreachable, falling back to the backend: %s", e)
+            return None
+        if resp.status_code != 200:
+            logger.warning("shell chat: Nunba /chat answered HTTP %s, falling back to the backend", resp.status_code)
+            return None
+        try:
+            payload = resp.json() or {}
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if 'response' not in payload:
+            for k in ('text', 'reply', 'message'):
+                if isinstance(payload.get(k), str):
+                    payload['response'] = payload[k]
+                    break
+        payload.setdefault('source', 'nunba')
+        logger.info("shell chat -> Nunba over the socket as %s (request %s)",
+                    user_id, body['request_id'])
+        return payload
 
     def _compose_intent_result(self, intent_text: str, chat_result: dict) -> bool:
         """M1 — turn a brain /chat decomposition into COMPOSED desktop UI.
@@ -2762,41 +3431,18 @@ class LiquidUIService:
         if 'orb' in native_chrome:
             native_orb_css = (
                 '.hart-hero-orbwrap>canvas,#hart-voice-orb,'
-                # ── `.hart-onboarding .hob-orb` IS DELIBERATELY NOT IN THIS LIST ──
-                #
-                # It was added 2026-09-10 and REMOVED 2026-09-11 after the owner
-                # reported the orb simply gone from onboarding. It was: standing
-                # it down leaves the ceremony with NO orb at all, because the
-                # compositor cannot draw one there.
-                #
-                # Every other selector here is safe because the bloom claim makes
-                # the WALLPAPER transparent, so the compositor's layers show
-                # through underneath. `.hart-onboarding` paints its OWN backdrop:
-                #     position:fixed; inset:0; z-index:12000;
-                #     background:radial-gradient(circle at 50% 38%,#16142e,#07060f 72%)
-                # Both stops are fully opaque and it covers the viewport, so the
-                # wallpaper being transparent buys nothing. The native orb is
-                # drawn BELOW the shell surface, and orb.rs says exactly what that
-                # means: "when the shell paints its own opaque background this is
-                # OCCLUDED, exactly as the bloom is."
-                #
-                # The positions do not match either. The native orb sits at
-                # 0.72w/0.46h, the slot the HOME layout gives it. The onboarding's
-                # is centred in a flex column above the name reveal. It is the
-                # ceremony's composition, not a second copy of the desktop's.
-                #
-                # And the report that prompted the original change said the screen
-                # was ALTERNATING between two scenes. That is the DrmCompositor
-                # damage race, where a dropped frame on the shell surface lets the
-                # native bloom+orb flash through. Hiding the onboarding's orb never
-                # addressed the alternation; it removed one of the two things that
-                # alternate, so onboarding then flickered between having no orb and
-                # showing the desktop's.
-                #
-                # The animation-only gate on the software floor
-                # (`body.webkit-flat .hart-onboarding .hob-orb{animation:none}`) is
-                # a different rule and stays: it drops the breathing on a box that
-                # paints in software while KEEPING the orb visible.
+                # ── The first-run overlay (`.hart-onboarding`) has no orb of its
+                # own to stand down. Until 2026-10-12 it carried `.hob-orb`, and
+                # listing that here (2026-09-10) left the ceremony with NO orb at
+                # all (reverted 2026-09-11): `.hart-onboarding` paints its OWN
+                # opaque backdrop (position:fixed; inset:0; z-index:12000; two
+                # fully opaque radial stops), so a transparent wallpaper buys it
+                # nothing and the compositor's orb, drawn BELOW the shell surface,
+                # is OCCLUDED there (orb.rs says so by name). Today the overlay
+                # hosts Nunba's own ceremony (static/hartOnboarding.js mounts its
+                # /local page in `.hob-frame`), which draws its particles and name
+                # reveal inside the frame. The backdrop argument is unchanged:
+                # nothing behind it can show.
                 '.hart-orb-orbit,.hart-orb-orbit2{visibility:hidden;animation:none}'
             )
         # The HOME SURFACE half. The compositor claims this only for a frame that
@@ -3012,7 +3658,7 @@ html, body { font-family: var(--ds-font-body); line-height: 1.5 }
    draw no ring), matching Win11/macOS. The shell chrome controls had NO focus
    style at all, so keyboard users couldn't see where they were. */
 :focus-visible{outline:2px solid var(--hart-accent);outline-offset:2px}
-.start-btn:focus-visible,.tray-btn:focus-visible,.start-item:focus-visible,.power-btn:focus-visible,.taskbar-chip:focus-visible,.agent-pill:focus-visible,.ctx-menu-item:focus-visible{outline:2px solid var(--hart-accent);outline-offset:-2px}
+.start-btn:focus-visible,.tray-btn:focus-visible,.start-item:focus-visible,.power-btn:focus-visible,.taskbar-chip:focus-visible,.ctx-menu-item:focus-visible{outline:2px solid var(--hart-accent);outline-offset:-2px}
 /* Skip link (a11y): jump straight to content; off-screen until keyboard-focused. */
 .skip-link{position:fixed;top:-200px;left:8px;z-index:100000;padding:8px 16px;background:var(--hart-accent);color:var(--hart-on-accent);border-radius:8px;font-weight:600;text-decoration:none;transition:top 0.2s}
 .skip-link:focus{top:8px}
@@ -3601,31 +4247,29 @@ html.a11y-rmotion .panel{animation:none}
 /* Orb closes its eyes when the human cuts the AI's senses */
 .hart-hero.ai-blind #hart-voice-orb{opacity:.12;filter:grayscale(1) brightness(.4);transition:opacity .5s,filter .5s}
 .hart-hero.ai-blind .hart-hero-orbwrap{cursor:default;box-shadow:none}
-/* ── First-run "Light Your HART" ceremony overlay ── */
-.hart-onboarding{position:fixed;inset:0;z-index:12000;display:none;flex-direction:column;align-items:center;justify-content:center;
-  gap:26px;text-align:center;padding:48px;background:radial-gradient(circle at 50% 38%,#16142e,#07060f 72%)}
-.hart-onboarding.open{display:flex}
-/* Brand duotone (b1.2 / GF3): the orb reads TEAL core with a teal-inner +
-   VIOLET-outer layered halo (the mockup look), NOT the deprecated indigo
-   #6C63FF. Teal LEADS the functional surfaces (orb core, name reveal, option
-   chips); violet ACCENTS (the outer halo + the option hover glow). */
-.hart-onboarding .hob-orb{width:150px;height:150px;border-radius:50%;flex-shrink:0;
-  background:radial-gradient(circle at 50% 40%,rgba(0,230,195,.95),rgba(0,230,195,.34) 45%,transparent 70%);
-  box-shadow:0 0 70px rgba(0,230,195,.5),0 0 150px rgba(155,92,255,.24);animation:hob-breathe 3.2s ease-in-out infinite}
-@keyframes hob-breathe{0%,100%{transform:scale(1);opacity:.85}50%{transform:scale(1.08);opacity:1}}
-.hart-onboarding .hob-name{font-size:34px;font-weight:600;letter-spacing:1px;color:#fff;min-height:0;opacity:0;
-  transform:translateY(8px);transition:opacity .6s,transform .6s}
-.hart-onboarding .hob-name.show{opacity:1;transform:none;text-shadow:0 0 30px rgba(0,230,195,.55)}
-.hart-onboarding .hob-narr{max-width:640px;min-height:84px;display:flex;flex-direction:column;gap:10px}
-.hart-onboarding .hob-line{font-size:20px;line-height:1.5;color:#e9f7f3;font-family:var(--ds-font-body);
-  opacity:0;transform:translateY(6px);transition:opacity .6s,transform .6s}
-.hart-onboarding .hob-line.in{opacity:1;transform:none}
-.hart-onboarding .hob-opts{display:flex;flex-wrap:wrap;gap:10px;justify-content:center;max-width:700px}
-.hart-onboarding .hob-opt{padding:12px 22px;border-radius:999px;border:1px solid rgba(0,230,195,.4);
-  background:rgba(0,230,195,.12);color:#fff;font-size:15px;font-family:var(--ds-font-body);cursor:pointer;
-  transition:background .18s,transform .18s cubic-bezier(.175,.885,.32,1.275),box-shadow .18s}
-.hart-onboarding .hob-opt:hover{background:rgba(0,230,195,.22);transform:translateY(-2px);box-shadow:0 8px 24px rgba(155,92,255,.35)}
-.hart-onboarding .hob-skip{position:fixed;bottom:20px;font-size:12px;color:rgba(255,255,255,.4)}
+/* ── First-run "Light Your HART": Nunba's ceremony, hosted full-screen ── */
+/* The overlay is a host, nothing more: no padding, no flex centering (the
+   retired OS ceremony needed those; a 48px padding here left a 96px band of
+   backdrop under Nunba's page on generation 21, because the frame's percentage
+   height resolved against the content box). Black, like Nunba's own ceremony
+   root, so the backdrop is invisible before and behind the page. Opaque on
+   purpose: the native orb cannot show through it (see native_orb_css). */
+.hart-onboarding{position:fixed;inset:0;z-index:12000;display:none;margin:0;padding:0;background:#000}
+.hart-onboarding.open{display:block}
+.hart-onboarding .hob-frame{position:absolute;inset:0;border:0;background:transparent}
+/* The one control the shell draws over Nunba's page, in Nunba's chip language
+   (its LightYourHART optionChip: a thin white hairline pill, muted text, Inter,
+   no fill) so it reads as part of the ceremony. Brand teal (b1.2) only on the
+   keyboard focus ring, where Nunba has no colour of its own. */
+.hart-onboarding .hob-skip-wrap{position:fixed;left:0;right:0;bottom:22px;z-index:1;display:flex;flex-direction:column;align-items:center;gap:8px}
+.hart-onboarding .hob-skip-btn{appearance:none;-webkit-appearance:none;margin:0;padding:9px 24px;border-radius:24px;
+  border:1px solid rgba(255,255,255,.15);background:transparent;color:rgba(255,255,255,.7);
+  font-size:14px;font-weight:400;letter-spacing:.01em;font-family:"Inter","SF Pro Text",-apple-system,var(--ds-font-body),sans-serif;
+  cursor:pointer;transition:border-color .4s ease,color .4s ease,background .4s ease}
+.hart-onboarding .hob-skip-btn:hover{border-color:rgba(255,255,255,.35);color:rgba(255,255,255,.9);background:rgba(255,255,255,.04)}
+.hart-onboarding .hob-skip-btn:focus-visible{outline:1px solid rgba(0,230,195,.6);outline-offset:3px}
+.hart-onboarding .hob-skip-hint{font-size:12px;letter-spacing:.02em;color:rgba(255,255,255,.35);
+  font-family:"Inter","SF Pro Text",-apple-system,var(--ds-font-body),sans-serif}
 '''
 
         # ═══ "Living Glass" unified design system (overhaul) ═══
@@ -3961,17 +4605,13 @@ html.a11y-rmotion .lg-empty-offline .lg-empty-disc .mi{animation:none}
                 'body.webkit-flat .hart-hero-hevolve .dot,'
                 'body.webkit-flat .top-bar-orb,'
                 'body.webkit-flat .hart-hero-go,'
-                # The ONBOARDING orb, added 2026-09-10 after finding it on the
-                # live node. `.hob-orb` is 150px carrying `0 0 70px` AND
-                # `0 0 150px` box-shadows and scaling to 1.08 forever -- the
-                # exact shape this rule was written for, and it is strictly
-                # worse than `.hart-hero-orb` because it is the FIRST screen a
-                # new user sees and it stays up for the whole of onboarding.
-                # On the Samsung, sitting on "Light Your HART" with no
-                # onboarding state written, WebKit's main thread measured 487
-                # of 500 jiffies (97.4% of a core) continuously from boot while
-                # hart-comp idled at 2.2%: the cost was re-rasterising two large
-                # blurs per frame in software, not compositing them.
+                # The ONBOARDING orb (`.hob-orb`) was listed here 2026-09-10 after
+                # the live node measured 97.4% of a core on "Light Your HART":
+                # 150px, two large box-shadows, scaling to 1.08 forever, on the
+                # first screen a new user sees. Since 2026-10-12 the overlay
+                # hosts Nunba's own ceremony in a frame and paints no orb, so
+                # there is no selector to gate; test_liquid_ui_idle_motion_gate
+                # pins that it stays gone (or comes back gated).
                 # The SENSES eye, added 2026-09-10 after reading how it is lit.
                 # I had kept this out of the gate on the grounds that it is
                 # "state-driven -- runs only while a sense is active". That
@@ -3994,7 +4634,6 @@ html.a11y-rmotion .lg-empty-offline .lg-empty-disc .mi{animation:none}
                 # can hear. What goes is the 2.4s pulse re-rasterising it
                 # forever on a box that paints in software.
                 'body.webkit-flat .hart-senses-btn.is-sensing .mi,'
-                'body.webkit-flat .hart-onboarding .hob-orb,'
                 'body.webkit-flat .ds-skeleton{animation:none!important}'
             )
 
@@ -4137,67 +4776,6 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
   border-radius:8px;cursor:pointer;font-size:12px;transition:background var(--hart-anim-speed)}}
 .start-footer .power-btn:hover{{background:var(--hart-surface-hover,rgba(255,255,255,0.08))}}
 .start-footer .power-btn .mi{{font-size:16px}}
-
-/* ── Agent Pill (collapsed floating bubble) ── */
-.agent-pill{{position:fixed;bottom:56px;right:16px;z-index:1500;display:flex;
-  align-items:center;gap:8px;padding:8px 14px;cursor:pointer;
-  transition:all var(--hart-anim-speed);max-width:360px}}
-.agent-pill:hover{{transform:translateY(-2px);box-shadow:0 8px 24px rgba(0,0,0,0.3)}}
-.agent-pill.expanded{{max-width:400px;padding:12px}}
-.agent-pill.hidden{{display:none}}
-.agent-pill .mi{{font-size:20px;color:var(--hart-accent);flex-shrink:0}}
-.agent-pill input{{flex:1;background:transparent;border:none;color:var(--hart-text);
-  font-family:var(--ds-font-body);font-size:13px;outline:none;min-width:0}}
-.agent-pill input::placeholder{{color:var(--hart-muted)}}
-.agent-response{{font-size:12px;color:var(--hart-muted);padding-top:6px;
-  border-top:1px solid var(--hart-glass-border);display:none;width:100%}}
-.agent-response.visible{{display:block}}
-
-/* ── Floating Assistant Chat Panel ── */
-.assistant-chat{{position:fixed;bottom:56px;right:16px;z-index:1600;
-  width:380px;height:520px;display:none;flex-direction:column;
-  border-radius:var(--hart-radius);overflow:hidden;
-  resize:both;min-width:320px;min-height:400px;max-width:600px;max-height:80vh}}
-.assistant-chat.open{{display:flex}}
-.assistant-chat .ac-header{{display:flex;align-items:center;gap:8px;
-  padding:10px 14px;cursor:grab;user-select:none;
-  border-bottom:1px solid var(--hart-glass-border);flex-shrink:0}}
-.assistant-chat .ac-header:active{{cursor:grabbing}}
-.assistant-chat .ac-title{{flex:1;font-size:13px;font-weight:500}}
-.assistant-chat .ac-btn{{background:none;border:none;color:var(--hart-muted);
-  cursor:pointer;padding:2px;font-size:18px}}
-.assistant-chat .ac-btn:hover{{color:var(--hart-text)}}
-.assistant-chat .ac-caps{{display:flex;gap:6px;padding:8px 14px;overflow-x:auto;
-  flex-shrink:0;border-bottom:1px solid var(--hart-glass-border)}}
-.assistant-chat .ac-cap{{display:flex;align-items:center;gap:4px;
-  padding:4px 10px;border-radius:12px;font-size:11px;white-space:nowrap;
-  background:var(--hart-glass-bg);border:1px solid var(--hart-glass-border);
-  cursor:pointer;transition:background 120ms}}
-.assistant-chat .ac-cap:hover{{background:var(--hart-surface-hover,rgba(255,255,255,0.1))}}
-.assistant-chat .ac-cap.active{{background:var(--hart-accent);color:#fff;border-color:var(--hart-accent)}}
-.assistant-chat .ac-cap .mi{{font-size:14px}}
-.assistant-chat .ac-messages{{flex:1;overflow-y:auto;padding:12px 14px;
-  display:flex;flex-direction:column;gap:8px}}
-.assistant-chat .ac-msg{{max-width:85%;padding:8px 12px;border-radius:12px;
-  font-size:13px;line-height:1.4;word-break:break-word}}
-.assistant-chat .ac-msg.user{{align-self:flex-end;
-  background:var(--hart-accent);color:#fff;border-bottom-right-radius:4px}}
-.assistant-chat .ac-msg.assistant{{align-self:flex-start;
-  background:var(--hart-glass-bg);border:1px solid var(--hart-glass-border);
-  border-bottom-left-radius:4px}}
-.assistant-chat .ac-msg.typing{{opacity:0.6;font-style:italic}}
-.assistant-chat .ac-input-row{{display:flex;align-items:center;gap:6px;
-  padding:8px 10px;border-top:1px solid var(--hart-glass-border);flex-shrink:0}}
-.assistant-chat .ac-input{{flex:1;background:transparent;border:1px solid var(--hart-glass-border);
-  border-radius:20px;padding:8px 14px;color:var(--hart-text);
-  font-family:var(--ds-font-body);font-size:13px;outline:none;resize:none}}
-.assistant-chat .ac-input:focus{{border-color:var(--hart-accent)}}
-.assistant-chat .ac-input::placeholder{{color:var(--hart-muted)}}
-.assistant-chat .ac-send{{background:var(--hart-accent);border:none;
-  width:32px;height:32px;border-radius:50%;display:flex;align-items:center;
-  justify-content:center;cursor:pointer;flex-shrink:0;transition:opacity 120ms}}
-.assistant-chat .ac-send:hover{{opacity:0.85}}
-.assistant-chat .ac-send .mi{{font-size:16px;color:#fff}}
 
 /* ── Context Menu ── */
 .ctx-menu{{position:fixed;z-index:3000;min-width:180px;padding:4px;
@@ -4374,7 +4952,6 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 <!-- Panel Container -->
 <div class="panel-container" id="panels" role="main" aria-label="Open windows"></div>
 
-<!-- Agent Pill (click to expand floating chat) -->
 <!-- Voice orb visualiser + hero orchestrator. The orb canvas now lives inside
      #hart-hero (centerpiece); initHartOrb still finds #hart-voice-orb and drives
      it. hartHero.js fuses the orb with the command bar, reusing toggleVoice /
@@ -4487,32 +5064,6 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
      create more install sticks. Exposes window.loadFlashWizard. -->
 <script defer src="/shell/static/hartFlash.js"></script>
 
-<!-- Agent Pill (click to expand floating chat) -->
-<div class="agent-pill glass hidden" id="agent-pill" onclick="toggleAssistantChat()">
-  <span class="mi material-icons-round" style="color:var(--hart-accent)">chat_bubble</span>
-  <input id="agent-input" placeholder="Ask HART..." onclick="event.stopPropagation();toggleAssistantChat()" onkeydown="if(event.key==='Enter'){{event.stopPropagation();toggleAssistantChat();setTimeout(function(){{var i=document.getElementById('ac-input');if(i){{i.value=document.getElementById('agent-input').value;document.getElementById('agent-input').value=''}}}},100)}}">
-  <div class="agent-response" id="agent-resp"></div>
-</div>
-
-<!-- Floating Assistant Chat Panel -->
-<div class="assistant-chat glass" id="assistant-chat" role="dialog" aria-label="HART Assistant" aria-modal="false">
-  <div class="ac-header" id="ac-drag-handle">
-    <span class="mi material-icons-round" style="font-size:20px;color:var(--hart-accent)">chat_bubble</span>
-    <span class="ac-title">HART Assistant</span>
-    <button class="ac-btn mi material-icons-round" onclick="minimizeAssistant()" title="Minimize">remove</button>
-    <button class="ac-btn mi material-icons-round" onclick="toggleAssistantChat()" title="Close">close</button>
-  </div>
-  <div class="ac-caps" id="ac-caps"></div>
-  <div class="ac-messages" id="ac-messages" role="log" aria-live="polite">
-    <div class="ac-msg assistant">Hi! I can help with anything - chat, code, agents, vision, voice, remote desktop, and 3,200+ OpenClaw skills. What would you like to do?</div>
-  </div>
-  <div class="ac-input-row">
-    <span class="mi material-icons-round ac-btn" onclick="acVoiceInput()" title="Voice input" style="font-size:20px">mic</span>
-    <input class="ac-input" id="ac-input" placeholder="Ask anything..." onkeydown="if(event.key==='Enter'&&!event.shiftKey){{event.preventDefault();acSend()}}">
-    <button class="ac-send" onclick="acSend()"><span class="mi material-icons-round">send</span></button>
-  </div>
-</div>
-
 <!-- Start Menu -->
 <div class="start-menu glass" id="start-menu">
   <input class="start-search" id="start-search" placeholder="Search..." oninput="filterStart(this.value)" onkeydown="if(event.key==='Enter'){{event.preventDefault();startSearchEnter()}}">
@@ -4564,14 +5115,8 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
   </div>
 </div>
 
-<!-- First-run "Light Your HART" ceremony (web, in-shell; auto-runs after OS install when not onboarded) -->
-<div class="hart-onboarding" id="hart-onboarding" role="dialog" aria-modal="true" aria-label="Light Your HART">
-  <div class="hob-orb" aria-hidden="true"></div>
-  <div class="hob-name" id="hart-onboarding-name"></div>
-  <div class="hob-narr" id="hart-onboarding-narr" role="status" aria-live="polite"></div>
-  <div class="hob-opts" id="hart-onboarding-opts"></div>
-  <div class="hob-skip">Press Esc to skip</div>
-</div>
+<!-- First-run "Light Your HART": Nunba's own ceremony, hosted full-screen by hartOnboarding.js while hart_sealed is unset -->
+<div class="hart-onboarding" id="hart-onboarding" role="dialog" aria-modal="true" aria-label="Light Your HART"></div>
 
 <!-- Toast Notifications -->
 <div class="toast-container" id="toast-container" role="status" aria-live="polite"></div>
@@ -5907,7 +6452,8 @@ function loadHartIdentityPanel(el, apis) {{
         '<div class="ds-flex ds-flex-center ds-flex-col ds-gap-3" style="padding:40px 0">'+
         '<span class="mi material-icons-round ds-text-muted" style="font-size:48px">person_outline</span>'+
         '<div class="ds-body-md ds-text-muted">You haven&#39;t lit your HART yet.</div>'+
-        dsBtn('Light Your HART',{{variant:'primary', onclick:"fetch(SHELL+'/api/onboarding/start',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{user_id:'1'}})}}).then(()=>showToast('Onboarding','Opening onboarding...','info')).catch(()=>{{}})"}})+'</div></div>';
+        // Nunba runs the ceremony (its /local page, unsealed): the assistant panel is the wizard.
+        dsBtn('Light Your HART',{{variant:'primary', onclick:"openPanel('assistant')"}})+'</div></div>';
       return;
     }}
     fetch(SHELL+profileUrl,{{signal:_sig(3000)}}).then(r=>r.json()).then(p=>{{
@@ -7120,146 +7666,119 @@ function loadRemoteDesktopPanel(el, apis) {{
     }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted ds-flex ds-flex-center" style="height:100px"><span class="mi material-icons-round" style="margin-right:8px">error_outline</span>Remote desktop unavailable</div>'; }});
 }}
 
-// ═══ Agent Pill ═══
-// focusAgent() (Super+A) focuses the pill input; the pill's onkeydown opens the
-// assistant chat and copies the text into #ac-input, where acSend() is the SOLE
-// intent dispatcher (theme/open fast-paths + the default /api/agent/ask compose).
-// The old askAgent() was a DEAD parallel copy of that same M1 block - no handler
-// invoked it - so it was removed (acSend is the one live path).
-function focusAgent() {{
-  document.getElementById('agent-input').focus();
-  document.getElementById('agent-pill').classList.add('expanded');
-}}
-
-// ═══ Floating Assistant Chat ═══
-const AC_CAPS = [
-  {{id:'chat',name:'Chat',icon:'chat'}},
-  {{id:'recipe',name:'Recipes',icon:'receipt_long'}},
-  {{id:'agents',name:'Agents',icon:'smart_toy'}},
-  {{id:'vision',name:'Vision',icon:'visibility'}},
-  {{id:'voice',name:'Voice',icon:'record_voice_over'}},
-  {{id:'expert',name:'Experts',icon:'psychology'}},
-  {{id:'openclaw',name:'OpenClaw',icon:'extension'}},
-  {{id:'code',name:'Code',icon:'code'}},
-  {{id:'remote',name:'Remote',icon:'desktop_windows'}},
-  {{id:'channels',name:'Channels',icon:'forum'}},
-];
-let acMessages = [];
-let acActiveCap = 'chat';
-let acDragging = false;
-let acInit = false;
-let acDragOfs = {{x:0,y:0}};
-
-function initAssistantChat() {{
-  // Render capability pills
-  const capsEl = document.getElementById('ac-caps');
-  if(!capsEl) return;
-  capsEl.innerHTML = AC_CAPS.map(c=>
-    '<div class="ac-cap'+(c.id===acActiveCap?' active':'')+'" data-cap-id="'+c.id+'" onclick="acSelectCap(this.dataset.capId)" title="'+c.name+'">'+
-    '<span class="mi material-icons-round">'+c.icon+'</span>'+c.name+'</div>'
-  ).join('');
-
-  // Drag support — bind the global mousemove/mouseup listeners ONCE. This fn runs
-  // on EVERY chat open, so without this guard each open added another live
-  // document listener (a growing perf leak on the low-end target).
-  if(acInit) return;
-  const handle = document.getElementById('ac-drag-handle');
-  const chat = document.getElementById('assistant-chat');
-  if(!handle||!chat) return;
-  acInit = true;
-  handle.addEventListener('mousedown', function(e) {{
-    if(e.target.closest('.ac-btn')) return;
-    acDragging = true;
-    const rect = chat.getBoundingClientRect();
-    acDragOfs = {{x: e.clientX - rect.left, y: e.clientY - rect.top}};
-    e.preventDefault();
-  }});
-  document.addEventListener('mousemove', function(e) {{
-    if(!acDragging) return;
-    const chat = document.getElementById('assistant-chat');
-    let nx = e.clientX - acDragOfs.x, ny = e.clientY - acDragOfs.y;
-    nx = Math.min(Math.max(nx, 8), window.innerWidth - 80);
-    ny = Math.min(Math.max(ny, 40), window.innerHeight - 80);
-    chat.style.left = nx + 'px';
-    chat.style.top = ny + 'px';
-    chat.style.right = 'auto';
-    chat.style.bottom = 'auto';
-  }});
-  document.addEventListener('mouseup', function() {{ acDragging = false; }});
-}}
-
-function toggleAssistantChat() {{
-  const chat = document.getElementById('assistant-chat');
-  const pill = document.getElementById('agent-pill');
-  if(!chat) return;
-  const isOpen = chat.classList.contains('open');
-  if(isOpen) {{
-    chat.classList.remove('open');
-    pill.classList.remove('hidden');
-  }} else {{
-    chat.classList.add('open');
-    pill.classList.add('hidden');
-    initAssistantChat();
-    const input = document.getElementById('ac-input');
-    if(input) setTimeout(function(){{input.focus()}},100);
+// ═══ Nunba is the chat ═══
+// The shell's own chat bubble (the #agent-pill, #assistant-chat, its capability
+// chips and transcript) retired 2026-10-12. Nunba, preinstalled as
+// hart-nunba.service and framed same-origin in the pinned 'assistant' panel,
+// is the ONE chat surface: its transcript, LiquidUI cards and voice paint
+// there. Everything that used to fill #ac-input goes through HartNunba.compose,
+// which carries the text into Nunba's composer over postMessage (Nunba's half:
+// landing-page/src/utils/shellBridge.js: nunba:ready / nunba:compose /
+// nunba:turn). acSend stays the ONE intent dispatcher: the deterministic
+// fast-paths (theme words, a named app) still resolve locally; free-form
+// intent is a conversation and lands in Nunba.
+window.HartNunba = (function() {{
+  const PANEL = 'assistant', READY_WAIT_MS = 15000;
+  let ready = false, knownFrame = null, queue = [], readyTimer = null;
+  function frame() {{
+    const body = document.getElementById('panel-body-'+PANEL);
+    const f = body ? body.querySelector('.route-frame') : null;
+    if(f !== knownFrame) {{ knownFrame = f; ready = false; }}   // a new frame announces itself again
+    return f;
   }}
-}}
-
-function minimizeAssistant() {{
-  const chat = document.getElementById('assistant-chat');
-  const pill = document.getElementById('agent-pill');
-  if(chat) chat.classList.remove('open');
-  if(pill) pill.classList.remove('hidden');
-}}
-
-function acSelectCap(id) {{
-  acActiveCap = id;
-  document.querySelectorAll('.ac-cap').forEach(function(el) {{
-    el.classList.toggle('active', el.dataset.capId === id);
+  function open() {{
+    // openPanel reuses + fronts an open instance, and bringToFront restores a
+    // minimised one (reloading a potato-destroyed frame). Potato's tap-to-load
+    // placeholder is loaded here: a composed line must reach a live page.
+    openPanel(PANEL);
+    const body = document.getElementById('panel-body-'+PANEL);
+    if(body && body.dataset.loaded === '0' && body.dataset.route) loadIframe(PANEL, body.dataset.route);
+  }}
+  function flush() {{
+    const f = frame();
+    if(!f || !f.contentWindow) return;
+    while(queue.length) {{
+      const m = queue.shift();
+      try {{ f.contentWindow.postMessage(m, location.origin); }}
+      catch(e) {{ console.debug('HartNunba: post failed', e); }}
+    }}
+  }}
+  function compose(text, send) {{
+    text = (text || '').trim();
+    open();
+    if(!text) return;
+    queue.push({{type:'nunba:compose', text:text, send:!!send}});
+    if(ready) {{ flush(); return; }}
+    // Nunba's page announces itself with nunba:ready; until then the text
+    // waits. A page without the bridge never announces: say so, do not hang.
+    if(!readyTimer) readyTimer = setTimeout(function() {{
+      readyTimer = null;
+      if(!ready && queue.length) {{
+        queue = [];
+        window._hartThinking = false;
+        showToast('Assistant', 'Nunba is still loading. Try again in a moment.', 'warning');
+      }}
+    }}, READY_WAIT_MS);
+  }}
+  window.addEventListener('message', function(e) {{
+    if(e.origin !== location.origin) return;
+    const d = e.data;
+    if(!d || typeof d !== 'object' || typeof d.type !== 'string' || d.type.indexOf('nunba:') !== 0) return;
+    const f = frame();
+    // Only the assistant panel's page; the first-run overlay has its own listener.
+    if(!f || e.source !== f.contentWindow) return;
+    if(d.type === 'nunba:ready') {{
+      ready = true;
+      if(readyTimer) {{ clearTimeout(readyTimer); readyTimer = null; }}
+      flush();
+    }} else if(d.type === 'nunba:turn') {{
+      // The orb lamp mirrors Nunba's turn: lit from send to reply, never a guess.
+      window._hartThinking = (d.state === 'start');
+    }}
   }});
+  // The panel closing mid-turn must not leave the orb thinking forever.
+  const pc = document.getElementById('panels');
+  if(pc && typeof MutationObserver === 'function') {{
+    new MutationObserver(function() {{
+      if(!document.getElementById('panel-'+PANEL)) {{
+        ready = false; knownFrame = null; queue = []; window._hartThinking = false;
+      }}
+    }}).observe(pc, {{childList:true}});
+  }}
+  return {{ open: open, compose: compose, isOpen: function() {{ return !!panels[PANEL]; }} }};
+}})();
+
+// Super+A and the hero's "surface the conversation": the Nunba panel, fronted.
+function focusAgent() {{ HartNunba.open(); }}
+// Open/close under its historical name for the modules that call it
+// (hartHero.js, hartAskMenu.js, hartHome.js, hartMarketplace.js).
+function toggleAssistantChat() {{
+  if(HartNunba.isOpen()) {{ closePanel('assistant'); return; }}
+  HartNunba.open();
 }}
 
-function acAddMsg(role, text) {{
-  const msgsEl = document.getElementById('ac-messages');
-  if(!msgsEl) return;
-  const div = document.createElement('div');
-  div.className = 'ac-msg ' + role;
-  div.textContent = text;
-  msgsEl.appendChild(div);
-  msgsEl.scrollTop = msgsEl.scrollHeight;
-  return div;
-}}
-
-function acSend() {{
-  const input = document.getElementById('ac-input');
-  if(!input) return;
-  const text = input.value.trim();
+function acSend(text) {{
+  text = (typeof text === 'string' ? text : '').trim();
   if(!text) return;
-  input.value = '';
-
-  acAddMsg('user', text);
-
-  // Show typing indicator
-  const typing = acAddMsg('assistant', 'Thinking...');
-  typing.classList.add('typing');
+  // A fast-path's outcome ('Opened Files', 'Applied aura') reports through the
+  // shell's own toast, the surface every other local action uses.
+  const resp = {{ set textContent(v) {{ if(v) showToast('Assistant', v, 'info'); }} }};
   // Drive the voice orb's energetic animation for the whole PROCESSING window
   // (not just TTS/mic) so it never looks frozen while the brain is thinking.
-  // Cleared on EVERY terminal path below (theme/open fast-paths, success, error)
-  // so it can't get stuck true. The orb poll ORs this flag in.
+  // Cleared on EVERY terminal path: the fast-paths here, and Nunba's own
+  // nunba:turn 'done' (HartNunba) for a conversation. The orb poll ORs this in.
   window._hartThinking = true;
 
   // M1 — INTENT IS THE DEFAULT OPERATING SURFACE.
   // The orb/command bar composes the desktop from what the human wants: the
-  // DEFAULT path sends free-form intent to /api/agent/ask, which routes it
-  // through the brain's EXISTING decompose (/chat → CREATE/REUSE) and PUSHES
-  // the result as a composed A2UI card via agent_ui_update (the SSE stream
-  // paints it through renderAgentOverlay).  'open <named app>' and theme words
-  // are demoted to explicit FALLBACK fast-paths, not the spine.
+  // DEFAULT path hands free-form intent to Nunba, the one chat, whose /chat
+  // runs the brain's EXISTING decompose and whose LiquidUI paints the result.
+  // 'open <named app>' and theme words are explicit FALLBACK fast-paths, not
+  // the spine.
   const lower = text.toLowerCase();
   if(lower.includes('theme')||lower.includes('font')||lower.includes('bigger')||
      lower.includes('smaller')||lower.includes('dark')||lower.includes('light')) {{
-    const fakeResp = {{set textContent(v){{typing.textContent=v;typing.classList.remove('typing')}}}};
-    handleThemeCommand(lower, fakeResp);
+    handleThemeCommand(lower, resp);
     window._hartThinking = false;  // terminal: handled locally, no brain wait
     return;
   }}
@@ -7294,40 +7813,19 @@ function acSend() {{
             title(v).includes(target) || k.toLowerCase().includes(target)) : null);
     if(match) {{
       openPanel(match[0]);
-      typing.textContent = 'Opened ' + match[1].title;
-      typing.classList.remove('typing');
+      resp.textContent = 'Opened ' + match[1].title;
       window._hartThinking = false;  // terminal: launched locally, no brain wait
       return;
     }}
   }}
 
-  // Default: route the intent through the brain and COMPOSE the desktop.
-  // Bound the client wait (server /chat caps at 30s): without a signal a wedged
-  // brain or a saturated shell pool left this fetch — and the 'Thinking...'
-  // bubble — hung forever. _sig aborts at 32s into the friendly catch below.
-  fetch(SHELL+'/api/agent/ask',{{method:'POST',headers:{{'Content-Type':'application/json'}},
-    body:JSON.stringify({{text:text,capability:acActiveCap}}),signal:_sig(32000)}})
-    .then(function(r){{return r.json()}}).then(function(data){{
-      const reply = data.response || data.error || 'No response';
-      // The composed card is painted on the desktop by the SSE overlay stream;
-      // the bubble is the spoken acknowledgement (casual chat still replies).
-      typing.textContent = data.composed ? ('✦ ' + reply) : reply;
-      typing.classList.remove('typing');
-      window._hartThinking = false;  // terminal: response arrived
-      speakText(reply, 'chat_response');
-    }}).catch(function(){{
-      typing.textContent = 'Assistant unavailable. It may still be starting - try again in a moment.';
-      typing.classList.remove('typing');
-      window._hartThinking = false;  // terminal: request failed
-    }});
+  // Default: a conversation. Nunba owns it: the text lands in its composer and
+  // is sent; its reply, LiquidUI cards and voice paint inside the assistant
+  // panel, and its nunba:turn clears the orb lamp. The brain hop stays
+  // reachable for API callers at /api/agent/ask (the same Nunba /chat over the
+  // socket); the shell no longer renders a second transcript of it.
+  HartNunba.compose(text, true);
 }}
-
-function acVoiceInput() {{
-  toggleVoice();
-}}
-
-// Init on load
-setTimeout(initAssistantChat, 500);
 
 function handleThemeCommand(text, resp) {{
   let customization = {{}};
@@ -7554,20 +8052,19 @@ async function startRecording() {{
       const blob = new Blob(audioChunks, {{type: mediaRecorder.mimeType || 'audio/webm'}});
       const formData = new FormData();
       formData.append('audio', blob, 'voice.webm');
-      const resp = document.getElementById('agent-resp');
-      resp.textContent = 'Transcribing...';
-      resp.classList.add('visible');
+      // The transcript shows on the hero bar (HartHeroShowTranscript, the one
+      // transcript surface) and is dispatched like typed text: acSend lands a
+      // conversation in Nunba. Errors report through the shell's toast.
       try {{
         const r = await fetch(SHELL+'/api/voice', {{method:'POST', body:formData}});
         const data = await r.json();
         if(data.text) {{
           if(window.HartHeroShowTranscript) window.HartHeroShowTranscript(data.text);
-          const aci = document.getElementById('ac-input');
-          if(aci) {{ aci.value = data.text; acSend(); }}
+          acSend(data.text);
         }} else if(data.error) {{
-          resp.textContent = data.error;
+          showToast('Voice', data.error, 'warning');
         }}
-      }} catch(err) {{ resp.textContent = 'Voice processing failed'; }}
+      }} catch(err) {{ showToast('Voice', 'Voice processing failed', 'error'); }}
     }};
     acStopSpeaking();  // barge-in: stop any in-progress TTS the instant the user starts speaking
     mediaRecorder.start();
@@ -7786,9 +8283,13 @@ if(!PERF.potato && HartShellState.isHost()) {{
 // ═══ Approval Helper ═══
 function _postApproval(agentId, action, decision) {{
   try {{
+    // The node names the approver from the caller's Bearer, never the body.
+    var _tok = ''; try {{ _tok = localStorage.getItem('access_token') || ''; }} catch(e) {{}}
+    var _hdr = {{'Content-Type':'application/json'}};
+    if(_tok) _hdr['Authorization'] = 'Bearer ' + _tok;
     fetch(SHELL+'/api/agent/approval', {{
       method:'POST',
-      headers:{{'Content-Type':'application/json'}},
+      headers:_hdr,
       body:JSON.stringify({{agent_id:agentId, action:action, decision:decision}})
     }}).catch(function(){{}});
   }} catch(e) {{}}
@@ -8354,6 +8855,11 @@ function renderAgentOverlay(ev) {{
                                                write=30.0, pool=5.0))
                 return _nunba_proxy['client']
 
+            # The shell's own chat turn (agent_ask below) rides THIS client to
+            # THIS socket: one Nunba, one transport, no second HTTP path.
+            self._nunba_chat_client = _nunba_client
+            self._nunba_server_name = UNIX_SOCKET_SERVER_NAME
+
             # Hop-by-hop headers must not be forwarded (RFC 7230 §6.1).
             _HOP = {'host', 'connection', 'keep-alive', 'proxy-authenticate',
                     'proxy-authorization', 'te', 'trailer',
@@ -8381,6 +8887,19 @@ function renderAgentOverlay(ev) {{
                 # SPA redirect). _HOP already strips the inbound Host; this
                 # sets the one the daemon's allowlist accepts.
                 fwd['Host'] = UNIX_SOCKET_SERVER_NAME
+                # The daemon's gate (security/middleware.py, bundled mode)
+                # admits this machine's callers by their socket peer, and a
+                # unix-socket peer has no address: core.auth_local._peer
+                # reports it as the loopback forwarder and reads the client
+                # from the LAST X-Forwarded-For hop. This proxy IS that
+                # forwarder: it names the browser it serves, the peer it saw
+                # and nothing the browser wrote, so the desktop's own browser
+                # is local and a LAN browser (this shell binds 0.0.0.0:6800)
+                # stays remote. Measured on generation 17 (2026-10-11):
+                # without it /local, /static/js/main.js, every Nunba page
+                # answered 401 to the shell, and no panel could show Nunba.
+                from core.auth_local import peer_address
+                fwd['X-Forwarded-For'] = peer_address()
                 try:
                     client = _nunba_client()
                     upstream = client.build_request(
@@ -8490,6 +9009,23 @@ function renderAgentOverlay(ev) {{
             decision = data.get('decision', '')  # approve / deny / later
             if decision not in ('approve', 'deny', 'later'):
                 return jsonify({'error': 'Invalid decision, must be approve/deny/later'}), 400
+            # A payment or merchant-onboarding card is DECIDED, not just marked:
+            # the one commerce handler, with the approver taken from the
+            # caller's Bearer token (the same call /api/agent/approval on the
+            # backend makes).  'later' leaves the card pending, as below.
+            if decision != 'later':
+                try:
+                    from integrations.commerce.approvals import (
+                        answer_commerce_approval, approver_from_request,
+                        is_commerce_action)
+                except Exception:   # never costs a non-commerce answer
+                    logger.exception("handle_agent_approval: commerce unavailable")
+                    answer_commerce_approval = is_commerce_action = None
+                if is_commerce_action and is_commerce_action(action):
+                    payload, status = answer_commerce_approval(
+                        action, decision == 'approve',
+                        approver_from_request(request))
+                    return jsonify(payload), status
             # Resolve matching pending approval in _agent_components
             resolved = False
             if agent_id in self._agent_components:
@@ -8589,18 +9125,30 @@ function renderAgentOverlay(ev) {{
             # flywheel load, so the old timeout was shorter than the p50 and this
             # loop could only ever time out.  post_chat's default is generous
             # because a CPU-floor decomposition legitimately takes minutes.
-            from core.chat_client import post_chat
-            try:
-                resp = post_chat(
-                    f'http://localhost:{self.backend_port}/chat',
-                    {
-                        'user_id': 'hart_desktop_user',
-                        'prompt_id': 'desktop_agent',
-                        'prompt': text,
-                    })
-                payload = resp.json()
-            except Exception as e:
-                return jsonify({'error': str(e)})
+            # N7 gate 1 (NATIVE_OS_PROGRAM.md 3.11): the shell's chat IS Nunba.
+            # Until 2026-10-11 this posted straight to the backend's /chat as a
+            # fixed 'hart_desktop_user' with prompt_id 'desktop_agent', so a turn
+            # typed in the shell had no owner identity and no Nunba history,
+            # while the preinstalled Nunba daemon ran the same backend behind its
+            # own /chat (agent resolution, the tier ladder, server TTS, the
+            # owner's conversation) one socket away. The turn now goes to that
+            # daemon as the desktop owner; the direct backend call is the
+            # fallback for a daemon that is down or absent (no socket configured,
+            # no httpx), never a parallel path when it is up.
+            payload = self._shell_chat_via_nunba(text)
+            if payload is None:
+                from core.chat_client import post_chat
+                try:
+                    resp = post_chat(
+                        f'http://localhost:{self.backend_port}/chat',
+                        {
+                            'user_id': 'hart_desktop_user',
+                            'prompt_id': 'desktop_agent',
+                            'prompt': text,
+                        })
+                    payload = resp.json()
+                except Exception as e:
+                    return jsonify({'error': str(e)})
             payload['composed'] = self._compose_intent_result(text, payload)
             return jsonify(payload)
 
@@ -9787,7 +10335,10 @@ function renderAgentOverlay(ev) {{
         try:
             from integrations.agent_engine.onboarding_routes import (
                 register_onboarding_routes)
-            register_onboarding_routes(app)
+            # No user_id on the request: the owner the shell chat speaks as
+            # (Nunba's owner file, else its guest id; None while Nunba is down,
+            # which /status reports as companion_ready=false).
+            register_onboarding_routes(app, resolve_user=self._desktop_owner_id)
         except Exception as e:
             logger.warning("Onboarding APIs registration: %s", e)
 
@@ -9855,6 +10406,17 @@ function renderAgentOverlay(ev) {{
 
     def serve_forever(self):
         """Start the glass desktop shell service."""
+        # hart-liquid-ui.nix starts this process as `python -c "...
+        # LiquidUIService(...).serve_forever()"`: nobody configures logging, so
+        # every INFO line went to Python's lastResort handler and was dropped.
+        # Measured on the Samsung node, generations 16 and 17 (2026-10-11):
+        # `journalctl -u hart-liquid-ui -b` held 24 lines, all WARNING, through
+        # a shell turn that DID reach the Nunba daemon; the "shell chat ->
+        # Nunba over the socket as <id>" line this file logs at INFO never
+        # appeared, and the hop had to be proven from Nunba's journal instead.
+        # The one rule the backend entry and the agent daemon already apply.
+        from core.log_handlers import install_console_handler_if_bare
+        install_console_handler_if_bare()
         self._running = True
 
         # Ensure platform substrate is ready (EventBus, AppRegistry, Extensions)
@@ -10700,3 +11262,106 @@ def run_home_compose(reason: str = 'idle') -> bool:
     except Exception as e:
         logger.debug("run_home_compose cross-process failed: %s", e)
         return False
+
+
+#: commerce status words -> what every renderer already accepts
+#: (shell JS, Nunba AgentOverlay, Android): success | pending | error.
+_PAYMENT_STATUS_CLIENT = {'completed': 'success', 'processing': 'pending',
+                          'failed': 'error', 'cancelled': 'error'}
+
+
+def _to_client_vocabulary(component: dict):
+    """The ONE place commerce payment_status / order_tracking props are put
+    into the vocabulary the renderers read.  Returns ``(component, link)``:
+    payment_status has no redirect_url prop in any client, so the gateway
+    link is returned separately to be shown as the card's action link."""
+    ctype = component.get('type')
+    if ctype == 'payment_status':
+        component = dict(component)
+        component['status'] = _PAYMENT_STATUS_CLIENT.get(
+            component.get('status'), component.get('status'))
+        return component, component.pop('redirect_url', None)
+    if ctype == 'order_tracking' and isinstance(component.get('steps'), list):
+        component = dict(component)
+        steps = [dict(st) if isinstance(st, dict) else {'label': st}
+                 for st in component['steps']]
+        for st in steps:
+            st['completed'] = bool(st.get('completed', st.get('done')))
+        component['steps'] = steps
+        component['current_step'] = sum(1 for st in steps if st['completed'])
+        return component, None
+    return component, None
+
+
+def push_agent_ui(agent_id: str, component: dict,
+                  user_id: Optional[str] = None) -> bool:
+    """Push one agent UI component to its user, from code that holds no
+    reference to the shell.  The in-process form of agent_ui_update.
+
+    Two legs, each for a surface the other does not reach:
+
+      1. The live LiquidUIService, when this process serves one (the
+         registry entry _register_self writes).  agent_ui_update applies the
+         allowlist, kill switch, rate cap and XSS gate, stores the card for the
+         shell's SSE stream and emits ``agent.ui.update`` (the WAMP topic the
+         Android AgentOverlayBridge subscribes to).
+      2. When ``user_id`` is given, the user's own stream:
+         ``publish_event('chat.social', ..., user_id)``, which MessageBus maps
+         to WAMP ``com.hertzai.hevolve.social.{user_id}`` and to the per-user
+         SSE event ``chat.social``.  A node without a shell (the cloud gateway
+         the McGroce embed talks to) has only this leg, so the same gates run
+         here first: an unknown type, a halted hive or unsafe content is not
+         published.
+
+    Returns True if either leg accepted the push.  Never raises.
+    """
+    if not isinstance(component, dict):
+        return False
+    component, _link = _to_client_vocabulary(component)
+    if _link:
+        push_agent_ui(agent_id, {
+            'type': 'oauth_link', 'title': 'Complete your payment',
+            'provider': component.get('method') or 'payment',
+            'authorize_url': _link,
+            'description': 'Finish paying on your bank or UPI page.'},
+            user_id=user_id)
+    comp_type = component.get('type', '')
+    svc = None
+    try:
+        from core.platform.registry import get_registry
+        svc = get_registry().get_or_none('LiquidUIService')
+    except Exception:
+        svc = None
+    delivered = False
+    if svc is not None:
+        try:
+            delivered = bool(svc.agent_ui_update(
+                agent_id, dict(component), user_id=user_id))
+        except Exception:
+            logger.exception("push_agent_ui: shell push failed")
+    if not user_id:
+        return delivered
+    if comp_type not in COMPONENT_TYPES or _a2ui_has_xss(component):
+        logger.warning("push_agent_ui: %s from %s not published", comp_type,
+                       agent_id)
+        return delivered
+    try:
+        from security.hive_guardrails import HiveCircuitBreaker
+        if HiveCircuitBreaker.is_halted():
+            return delivered
+    except Exception:
+        logger.exception("push_agent_ui: swallowed Exception")
+    try:
+        from integrations.social.realtime import publish_event
+        card = dict(component)
+        card.setdefault('_ts', time.time())
+        card.setdefault('_agent_id', agent_id)
+        publish_event('chat.social', {
+            'type': 'agent_ui_update',
+            'agent_id': agent_id,
+            'component': card,
+        }, user_id=str(user_id))
+        return True
+    except Exception:
+        logger.exception("push_agent_ui: per-user publish failed")
+        return delivered

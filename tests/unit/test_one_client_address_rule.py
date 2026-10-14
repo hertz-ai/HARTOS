@@ -39,21 +39,48 @@ def _ctx(app, remote, headers=None):
 
 # ── the one rule, as a WSGI environ (Nunba's dispatcher) ────────────────
 
-@pytest.mark.parametrize('remote, xff, local', [
-    ('127.0.0.1', '', True),
-    ('::ffff:127.0.0.1', '', True),
-    ('127.0.0.1', '203.0.113.9', False),       # a local proxy, remote client
-    (PROXY, '127.0.0.1', False),               # a forwarded claim is remote
-    (PROXY, '127.0.0.1, 203.0.113.9', False),
-    ('192.168.0.9', '127.0.0.1', False),
+@pytest.mark.parametrize('remote, xff, local, host', [
+    ('127.0.0.1', '', True, ''),
+    ('::ffff:127.0.0.1', '', True, ''),
+    ('127.0.0.1', '203.0.113.9', False, ''),       # a local proxy, remote client
+    (PROXY, '127.0.0.1', False, ''),               # a forwarded claim is remote
+    (PROXY, '127.0.0.1, 203.0.113.9', False, ''),
+    ('192.168.0.9', '127.0.0.1', False, ''),
+    # This node's unix socket: Hypercorn gives the peer NO address (measured
+    # on the Samsung node, generation 17, 2026-10-11) and the bind's Host
+    # allowlist admits only 'Nunba'. It is this machine, so it is the
+    # loopback forwarder: the shell proxy's last X-Forwarded-For hop is the
+    # client.
+    ('', '', True, 'Nunba'),
+    ('', '127.0.0.1', True, 'Nunba'),              # the shell, desktop browser
+    ('', '192.168.0.9', False, 'Nunba'),           # the shell, a LAN browser
+    ('', '', False, 'localhost'),                  # no address, any other Host
+    ('', '127.0.0.1', False, 'localhost:6800'),
+    ('', '', False, 'nunba'),                      # exact, like the allowlist
+    ('192.168.0.9', '', False, 'Nunba'),           # a TCP peer keeps its address
 ])
-def test_is_local_environ_is_the_request_rule(monkeypatch, remote, xff, local):
+def test_is_local_environ_is_the_request_rule(monkeypatch, remote, xff, local, host):
     from core.auth_local import is_local_environ
     monkeypatch.setenv('TRUSTED_PROXY', PROXY)
     environ = {'REMOTE_ADDR': remote}
     if xff:
         environ['HTTP_X_FORWARDED_FOR'] = xff
+    if host:
+        environ['HTTP_HOST'] = host
     assert is_local_environ(environ) is local
+
+
+def test_a_unix_socket_peer_is_none_not_empty_and_still_this_machine():
+    """Werkzeug's request.remote_addr over Hypercorn's unix bind is None,
+    not '': the Flask-request path must read it the same as the environ
+    path does."""
+    from core.auth_local import _local_from, _client_from, _peer
+    assert _peer(None, 'Nunba') == '127.0.0.1'
+    assert _peer(None, None) == ''
+    assert _local_from(None, None, 'Nunba') is True
+    assert _local_from(None, '10.0.0.7', 'Nunba') is False
+    assert _client_from(None, '10.0.0.7', 'Nunba') == '10.0.0.7'
+    assert _client_from(None, None, 'Nunba') == '127.0.0.1'
 
 
 def test_client_key_falls_back_to_the_socket_peer(app, monkeypatch):
