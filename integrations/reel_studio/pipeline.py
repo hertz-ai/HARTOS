@@ -285,9 +285,12 @@ def produce_reel(sources: Sequence[Any], *, style: Mapping, workdir: str, out_pa
             analyses.append(analysis)
         lap('analyse')
 
-        say('reel_moments', 'Getting the vision model ready and finding the best moments...')
+        say('reel_moments', 'Finding the best moments...')
         keys = keyframes_mod.pick_keyframes(analyses)
-        moments = moments_mod.score_moments(keys, backend=backend)
+        # Her chat says the vision model is being made ready only when
+        # score_moments asks for its lazy start (a frame needs the model).
+        moments = moments_mod.score_moments(keys, backend=backend, on_start=lambda: say(
+            'reel_moments', 'Getting the vision model ready and finding the best moments...'))
         lap('moments')
 
         grid, start_used = _beat_grid(beats_mod, song_audio, song_start_s, style, song_key)
@@ -412,8 +415,9 @@ def _ok_message(media: Mapping, notes: Sequence[str], song_note: Optional[str] =
                  'say so.')
     from integrations.reel_studio.media.moments import NOTE_VLM_FALLBACK
     if NOTE_VLM_FALLBACK in notes:
-        text += (' The vision model on this computer did not answer, so the shots were chosen '
-                 'by sharpness and filming order instead; say so.')
+        text += (' The vision model on this computer gave no answer, or an answer that could '
+                 'not be used, so the shots were chosen by sharpness and filming order '
+                 'instead; say so.')
     return text
 
 

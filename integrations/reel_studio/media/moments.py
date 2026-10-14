@@ -29,16 +29,21 @@ moments stay in the order they were filmed, because the reel is told in
 capture order and ends on the reveal.  Stage labels may later decide which
 shots are dropped or kept per stage; they never reorder the story.
 
-Time is bounded: BUDGET_S for the whole list, and each request gets
-min(what is left, PER_CALL_CAP_S) as its timeout.  rate_frame never starts
-a model server; before the first frame, score_moments asks the backend's
-own existing lazy start once (Qwen08BBackend._ensure_running, the one
-describe() uses: the 'vlm_caption.requested' event Nunba answers with
-start_caption_server, then the standalone launch), and the time that takes
-counts against BUDGET_S (amendment A13).  Ratings are cached under the data dir
-(<data>/reel_studio/cache/moments/), keyed by the frame's bytes, the
-backend, the prompt and the request size; only parsed ratings are cached,
-never a fallback, and entries older than CACHE_MAX_AGE_S are pruned.
+The requests are bounded: BUDGET_S for the whole list, and each request
+gets min(what is left, PER_CALL_CAP_S) as its timeout.  rate_frame never
+starts a model server; just before the first frame that is not cached,
+score_moments asks the backend's own existing lazy start once
+(Qwen08BBackend._ensure_running, the one describe() uses: the
+'vlm_caption.requested' event Nunba answers with start_caption_server, then
+the standalone launch; amendment A13).  That start keeps its own waits: the
+time it takes COUNTS AGAINST BUDGET_S and is NOT capped by it, so a slow
+start leaves the frames less time or none, and the step can run past
+BUDGET_S.  A reel whose frames are all cached asks for no start.
+
+Ratings are cached under the data dir (<data>/reel_studio/cache/moments/),
+keyed by the frame's bytes, the backend, the prompt and the request size;
+only parsed ratings are cached, never a fallback, and entries older than
+CACHE_MAX_AGE_S are pruned.
 
 The result is a ``hart.reel.moments.v1`` document (contracts.
 validate_moments), plus ``stats`` (frames, rated, cached, calls, seconds).
@@ -54,7 +59,7 @@ import re
 import time
 from dataclasses import replace
 from time import monotonic
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from core.config_cache import flag_value
 from core.file_cache import atomic_json_write
@@ -451,17 +456,25 @@ def _ask(backend, keyframe: Keyframe, timeout_s: float) -> Optional[str]:
 
 
 def score_moments(keyframes: Sequence[Keyframe], *, backend=None, cache_dir: Optional[str] = None,
-                  budget_s: float = BUDGET_S, per_call_cap_s: float = PER_CALL_CAP_S) -> dict:
+                  budget_s: float = BUDGET_S, per_call_cap_s: float = PER_CALL_CAP_S,
+                  on_start: Optional[Callable[[], None]] = None) -> dict:
     """Rate ``keyframes`` (story order) and return the moment list document.
 
     ``backend``: a VisionBackend (anything with ``name`` and ``rate_frame``);
     None means get_vision_backend(REEL_VLM_DEFAULT).  ``cache_dir``: where
     ratings are cached; None means <data dir>/reel_studio/cache/moments.
-    ``budget_s`` bounds the whole list (0 asks nobody), including the
-    backend's own lazy start (``_ensure_running``, when it has one), asked
-    once before the first frame; each request gets min(what is left,
-    ``per_call_cap_s``) and none starts with under MIN_CALL_S left.  Frames
-    the model does not rate fall back one by one.
+    ``budget_s`` bounds the requests (0 asks nobody): each gets min(what is
+    left, ``per_call_cap_s``) and none starts with under MIN_CALL_S left.
+    Just before the first frame that is not cached and still has MIN_CALL_S
+    left, the backend's own lazy start (``_ensure_running``, when it has
+    one) is asked, once, and ``on_start()`` is called right before it, so
+    the caller can say the vision model is being made ready.  All frames
+    cached, a budget under MIN_CALL_S, or no keyframes: no start is asked.
+    The start keeps its own waits, which this cannot shorten: the time it
+    takes COUNTS AGAINST ``budget_s`` and is NOT capped by it, so this call
+    can take longer than ``budget_s`` (review of b263da313, 2026-10-14: a
+    2.0 s budget took 11.05 s).  Frames the model does not rate fall back
+    one by one, also when the start raises.
 
     Returns ``{'schema': 'hart.reel.moments.v1', 'src': 'vlm'|'fallback'|
     'mixed', 'model': backend name or None, 'final_look_found', 'notes',
@@ -483,13 +496,7 @@ def score_moments(keyframes: Sequence[Keyframe], *, backend=None, cache_dir: Opt
         root = _cache_root(cache_dir)
         if root:
             cache = _RatingCache(root, _backend_name(backend))
-    # The backend's own lazy start (the one describe() uses), once per reel,
-    # on this budget (amendment A13); rate_frame itself never starts a server.
-    if keys and budget_s >= MIN_CALL_S and callable(getattr(backend, '_ensure_running', None)):
-        try:
-            backend._ensure_running()
-        except Exception as e:      # the frames fall back one by one
-            logger.warning('moments: the vision model could not be started (%s)', e)
+    lazy_start = getattr(backend, '_ensure_running', None)
 
     ratings: List[Optional[Dict[str, Any]]] = []
     calls = cached = 0
@@ -500,6 +507,19 @@ def score_moments(keyframes: Sequence[Keyframe], *, backend=None, cache_dir: Opt
             cached += 1
         elif backend is not None:
             left = budget_s - (monotonic() - started)
+            if callable(lazy_start) and left >= MIN_CALL_S:
+                # The first frame the model is needed for asks the backend's
+                # own lazy start (the one describe() uses), once per reel; its
+                # time counts against the budget, uncapped (amendment A13).
+                # rate_frame itself never starts a server.
+                try:
+                    if on_start is not None:
+                        on_start()
+                    lazy_start()
+                except Exception as e:      # the frames fall back one by one
+                    logger.warning('moments: the vision model could not be started (%s)', e)
+                lazy_start = None
+                left = budget_s - (monotonic() - started)
             if left < MIN_CALL_S:
                 out_of_time = True
             else:
