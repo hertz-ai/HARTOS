@@ -791,11 +791,13 @@ class Qwen08BBackend(VisionBackend):
         literal name in ~/.nunba/models and ~/.trueflow/models only, so
         weights the launch would start (a custom NUNBA_MODELS_DIR, a saved
         models_dir, the catalog's folder) were never selected (review of
-        6067e8806).  The weights alone make it selectable, not the
+        6067e8806).  Whole weights alone make it selectable, not the
         projector: Nunba's start fetches a missing projector itself
-        (llama_config._do_start_caption_server, _download_mmproj_only).  A
-        lookup that fails -- the catalog unreadable, so the launch could not
-        find the files either -- is not selectable.
+        (llama_config._do_start_caption_server, _download_mmproj_only).
+        Whole by the one completeness rule (see _model_files): a partial
+        download, which the launch could only fail to load, is not
+        selectable.  A lookup that fails -- the catalog unreadable, so the
+        launch could not find the files either -- is not selectable.
         """
         if self._is_serving():
             return True
@@ -924,8 +926,17 @@ class Qwen08BBackend(VisionBackend):
         folder by Nunba's one storage rule, LlamaInstaller.resolve_models_dir
         (llama_installer.py ~:446), where Nunba is importable, else that
         rule's default ~/.nunba/models; then ~/.trueflow/models.
+
+        The weights count only when whole, by the one completeness rule
+        Nunba's get_model_path asks too: model_catalog.gguf_complete at
+        gguf_min_bytes of the registered size (90% of it, the GGUF magic).
+        A partial download is not found, so it is neither selected nor
+        spawned, and a whole copy in a later folder is found past it.  The
+        projector has no registered size and is taken as any file of its
+        name, as before.
         """
-        from integrations.service_tools.model_catalog import get_catalog
+        from integrations.service_tools.model_catalog import (
+            get_catalog, gguf_complete, gguf_min_bytes, model_weight_bytes)
         entry = get_catalog().get(self.CATALOG_ID)
         if entry is None:
             logger.warning(f"Qwen3.5-0.8B: catalog row {self.CATALOG_ID} is missing")
@@ -941,12 +952,13 @@ class Qwen08BBackend(VisionBackend):
         dirs = [os.path.dirname(entry.local_path)] if entry.local_path else []
         dirs += [models_dir, os.path.join(home, '.trueflow', 'models')]
 
-        def first(*parts):
+        def first(*parts, usable=os.path.isfile):
             if not all(parts):
                 return None
             return next((p for p in (os.path.join(d, *parts) for d in dirs)
-                         if os.path.isfile(p)), None)
-        return (first(files.get('model')),
+                         if usable(p)), None)
+        whole = gguf_min_bytes(model_weight_bytes(files.get('model') or ''))
+        return (first(files.get('model'), usable=lambda p: gguf_complete(p, whole)),
                 first(files.get('mmproj')) or first('qwen08b', files.get('mmproj_source')))
 
     def ensure_running(self, on_wait: Optional[Callable[[], None]] = None) -> bool:

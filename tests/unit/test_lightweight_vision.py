@@ -833,11 +833,17 @@ def test_weights_on_disk_do_not_stand_in_for_a_running_server(
     mean "serving", so it returned True without ever asking Nunba to start
     the server, and every describe() failed at debug level."""
     from unittest.mock import patch
+    from integrations.service_tools import model_catalog as mc
     from integrations.vision import lightweight_backend as lvb
 
+    # Whole weights by the one completeness rule (gguf_complete at
+    # gguf_min_bytes of the registered size), scaled to a kilobyte.
+    model = 'Qwen3.5-0.8B-UD-Q4_K_XL.gguf'
+    monkeypatch.setitem(mc.MODEL_WEIGHT_BYTES, model, (1000, 'test: scaled down'))
+    monkeypatch.setattr(mc, 'GGUF_MIN_BYTES', 0)
     models = tmp_path / '.nunba' / 'models'
     models.mkdir(parents=True)
-    (models / 'Qwen3.5-0.8B-UD-Q4_K_XL.gguf').write_bytes(b'gguf')
+    (models / model).write_bytes(b'GGUF' + b'\0' * 996)
     monkeypatch.setenv('HOME', str(tmp_path))
     monkeypatch.setenv('USERPROFILE', str(tmp_path))
 

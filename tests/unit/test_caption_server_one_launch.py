@@ -25,14 +25,20 @@ importable, else its default ~/.nunba/models, and ~/.trueflow/models; the
 projector under the installer's name (mmproj-Qwen3.5-0.8B-F16.gguf) or where
 scripts/setup_vlm.py puts it (qwen08b/mmproj-F16.gguf).  Selection
 (is_available, which get_vision_backend asks) finds the weights by that same
-lookup, so a 0.8B the launch would start is never passed over.
+lookup, so a 0.8B the launch would start is never passed over.  Weights count
+only when whole, by the one completeness rule (model_catalog.gguf_complete at
+gguf_min_bytes of the registered size, Nunba's get_model_path rule): a
+partial download is neither selected nor spawned, and does not hide a whole
+copy in a later folder.
 
 Real code throughout: the real backend, the real platform EventBus and
-registry, the real model catalog.  Replaced: the caption port's HTTP
-(pooled_get), the event delivery (synchronous, to the real bus), the process
-spawn (subprocess.Popen and the llama-server lookup), sleep (a clock, for the
-thread the start runs on only: time.sleep is process-wide), and the home
-folder (a temp dir).
+registry, the real model catalog and completeness rule.  Replaced: the caption
+port's HTTP (pooled_get), the event delivery (synchronous, to the real bus),
+the process spawn (subprocess.Popen and the llama-server lookup), sleep (a
+clock, for the thread the start runs on only: time.sleep is process-wide), the
+home folder (a temp dir), and the 0.8B's registered size and the rule's
+100 MB floor (scaled to WEIGHTS bytes, so whole weights are real files of a
+kilobyte rather than half a gigabyte).
 
     python -m pytest tests/unit/test_caption_server_one_launch.py -q -p no:cacheprovider
 """
@@ -46,11 +52,14 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests
 
+import integrations.service_tools.model_catalog as mc
 import integrations.vision.lightweight_backend as lvb
 from tests.conftest import refuse_all_network
 
 PORT = 18491
 MODEL = 'Qwen3.5-0.8B-UD-Q4_K_XL.gguf'
+#: The 0.8B's registered size in these tests (the real row is 558,772,480).
+WEIGHTS = 1000
 STANDALONE_BINARY = ('integrations.service_tools.model_lifecycle.'
                      'ModelLifecycleManager._find_llama_server_binary')
 #: The bound the start had before: the 5 x 1 s event wait, then 30 x 1 s.
@@ -108,6 +117,9 @@ def box(tmp_path, monkeypatch):
     monkeypatch.setenv('HOME', str(home))
     monkeypatch.setenv('TEMP', str(tmp_path))
     monkeypatch.delenv('NUNBA_MODELS_DIR', raising=False)
+    # The one completeness rule, at a kilobyte: whole is WEIGHTS bytes.
+    monkeypatch.setitem(mc.MODEL_WEIGHT_BYTES, MODEL, (WEIGHTS, 'test: scaled down'))
+    monkeypatch.setattr(mc, 'GGUF_MIN_BYTES', 0)
     from core.platform import registry as reg
     from core.platform.events import EventBus
     bus = EventBus()
@@ -126,9 +138,16 @@ def _put(path, data=b'GGUF'):
     return path
 
 
+def _weights(path, size=WEIGHTS, magic=b'GGUF'):
+    """0.8B weights at ``path``: whole by default (WEIGHTS bytes, the GGUF
+    magic first); fewer bytes or other first bytes for a bad download."""
+    return _put(path, magic + b'\0' * (size - len(magic)))
+
+
 def _files_in(folder, mmproj=('mmproj-Qwen3.5-0.8B-F16.gguf',)):
-    """The 0.8B weights and its projector in ``folder`` (projector path parts)."""
-    return _put(folder / MODEL), _put(folder.joinpath(*mmproj))
+    """Whole 0.8B weights and its projector in ``folder`` (projector path
+    parts)."""
+    return _weights(folder / MODEL), _put(folder.joinpath(*mmproj))
 
 
 def _lock(box):
@@ -389,10 +408,52 @@ def test_nunbas_models_folder_rule_decides_when_its_installer_is_importable(box)
 
 
 def test_no_projector_on_disk_means_no_spawn(box):
-    _put(box.models / MODEL)
+    _weights(box.models / MODEL)
     _put(box.models / 'mmproj-F16.gguf')        # a projector of unknown model: not taken
     ok, _ = _ensure(box)
     assert ok is False and box.port.spawned == []
+
+
+# ── a weight file counts only when whole: the one completeness rule ──────
+
+#: Bad downloads of the 0.8B: one byte under 90% of its registered size (the
+#: rule's floor, int(WEIGHTS * 0.90) = 900), and a whole-size file whose first
+#: bytes are not the GGUF magic (an error page saved under the weight's name).
+BAD_WEIGHTS = {'partial': dict(size=899), 'not_a_gguf': dict(magic=b'<htm')}
+
+
+@pytest.mark.parametrize('bad', sorted(BAD_WEIGHTS))
+def test_a_bad_download_is_never_spawned(box, bad):
+    """It took any file of the right name, so a partial download was spawned
+    and failed to load: 30 s, False, a 120 s cooldown, every time
+    (77a8b166b's minor).  Nunba's get_model_path has refused it all along;
+    the 0.8B lookup now asks the same rule."""
+    _weights(box.models / MODEL, **BAD_WEIGHTS[bad])
+    _put(box.models / 'mmproj-Qwen3.5-0.8B-F16.gguf')
+    ok, _ = _ensure(box)
+    assert box.port.spawned == [], 'a download that is not whole was spawned'
+    assert ok is False
+
+
+def test_the_rules_floor_itself_is_whole(box):
+    """Exactly 90% of the registered size is complete (Nunba: >= the floor)."""
+    model, proj = _weights(box.models / MODEL, size=900), \
+        _put(box.models / 'mmproj-Qwen3.5-0.8B-F16.gguf')
+    ok, _ = _ensure(box)
+    assert _arg(box.port.spawned[0], '--model') == str(model)
+    assert ok is True
+
+
+def test_a_partial_copy_does_not_hide_a_whole_one_further_on(box):
+    """A partial in Nunba's folder, whole weights in ~/.trueflow/models: the
+    launch takes the whole ones (as Nunba's walk skips a short file and goes
+    on to the next folder)."""
+    _weights(box.models / MODEL, size=899)
+    model, proj = _files_in(box.home / '.trueflow' / 'models')
+    ok, _ = _ensure(box)
+    cmd = box.port.spawned[0]
+    assert (_arg(cmd, '--model'), _arg(cmd, '--mmproj')) == (str(model), str(proj))
+    assert ok is True
 
 
 # ── selection: the 0.8B is found where the launch finds it ───────────────
@@ -435,8 +496,17 @@ def test_the_weights_without_their_projector_are_still_selectable(box):
     """Selection asks for the weights only, as before: Nunba's start fetches
     a missing projector itself (llama_config._do_start_caption_server,
     _download_mmproj_only).  Only HARTOS's own spawn needs both."""
-    _put(box.models / MODEL)
+    _weights(box.models / MODEL)
     assert _selectable(box) is True
+
+
+@pytest.mark.parametrize('bad', sorted(BAD_WEIGHTS))
+def test_a_bad_download_is_not_selectable(box, bad):
+    """A file of the right name that is not whole made qwen08b selectable
+    (23848e35a's point 6), so VisionService picked a backend whose launch
+    could only fail to load it, over Qwen3-VL / MiniCPM."""
+    _weights(box.models / MODEL, **BAD_WEIGHTS[bad])
+    assert _selectable(box) is False
 
 
 def test_a_lookup_that_fails_is_not_selectable_and_never_raises(box):
