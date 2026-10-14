@@ -78,7 +78,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 #: The upstream revision this package was derived from.
 UPSTREAM = 'instagram-agent-skill@d03c56b'
@@ -306,28 +306,7 @@ EMOJI_RE = re.compile('(?:' + _ONE_EMOJI + ')(?:\u200d(?:' + _ONE_EMOJI + '))*')
 # ── small shared values ─────────────────────────────────────────────────────
 
 def clamp_score(n: float) -> float:
-    """``n`` within 0-100, the range of every igkit score, as a float."""
+    """``n`` within 0-100, the range of every igkit score, as a float.  The
+    one clamp in igkit (hooks and humanize import it).  A yes/no is not read
+    here: core.config_cache.flag_value is the one reading in HARTOS."""
     return float(max(0.0, min(100.0, n)))
-
-
-_YES = frozenset({'true', 'yes', 'y', '1', 'on'})
-_NO = frozenset({'false', 'no', 'n', '0', 'off'})
-
-
-def parse_flag(value) -> Optional[bool]:
-    """A yes/no value as True or False: a bool, the ints 1 and 0, or text
-    such as "yes", "true", "on", "1", "no", "false", "off" or "0" (any case,
-    spaces trimmed).  None for None, blank text and anything else, so the
-    caller decides what an unknown value means (the string "false" is
-    truthy, which is the bug this exists to prevent)."""
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, int):
-        return {1: True, 0: False}.get(value)
-    if isinstance(value, str):
-        key = value.strip().lower()
-        if key in _YES:
-            return True
-        if key in _NO:
-            return False
-    return None

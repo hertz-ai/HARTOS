@@ -63,15 +63,23 @@ class TestRankReels:
         assert r['dropped'] == {'should_mute': 1, 'no_views': 1}
 
     @pytest.mark.parametrize('flag,muted', [
-        (True, True), ('true', True), ('yes', True), (1, True), ('1', True),
-        (False, False), ('false', False), ('False', False), ('no', False), (0, False),
-        ('0', False), (None, False), ('', False),
+        (True, True), ('true', True), ('yes', True), (1, True), ('1', True), (2, True),
+        (' ON ', True), (False, False), ('false', False), ('False', False), ('no', False),
+        (0, False), ('0', False), (None, False), ('', False), ('y', False), ('maybe', False),
     ])
     def test_should_mute_written_as_text_or_a_number_is_read(self, flag, muted):
-        # The string 'false' is truthy: such rows were dropped as muted.
+        # The string 'false' is truthy: such rows were dropped as muted.  The
+        # reading is core.config_cache.flag_value's, the one in HARTOS: a
+        # number is its truth and junk ('y', 'maybe') is not muted.
         r = swipe.rank_reels([dict(ROWS[0], should_mute=flag)])
         assert r['dropped']['should_mute'] == (1 if muted else 0)
         assert r['n'] == (0 if muted else 1)
+
+    def test_source_guard_igkit_keeps_no_flag_table_of_its_own(self):
+        # Amendment A9 d / Gate 4: core.config_cache.flag_value is the one
+        # yes/no reader; igkit.parse_flag was a second table that disagreed.
+        from integrations.reel_studio import igkit
+        assert not hasattr(igkit, 'parse_flag')
 
     def test_followers_are_the_fallback_baseline(self):
         rows = [dict(row, median=None) for row in ROWS[:3]]

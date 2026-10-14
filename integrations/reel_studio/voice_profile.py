@@ -8,13 +8,14 @@ igkit/resources/voice_template.json (derived from instagram-agent-skill's
 voice.md, MIT); anything else is refused.
 
 Storage: ``user_dir(user_id)/voice.json``, written only by this module.
-``user_dir`` is ``get_agent_data_dir()/reel_studio/<sha256(user_id)[:16]>``,
-the one rule for where Reel Studio keeps a user's own files.  User ids follow
-core.user_file_store's rule (any non-empty text or int; 10077 and '10077'
-are one user) and its directory naming, so every user the store takes has a
-profile and no id can steer the path.  The file records its user id; a file
-holding another id (a hash collision) raises PermissionError and is never
-shown or written over.
+``user_dir`` is ``get_agent_data_dir()/reel_studio/<user_dir_name(user_id)>``,
+the one place Reel Studio keeps a user's own files.  The user-id rule
+(user_key: any non-empty text or int; 10077 and '10077' are one user) and the
+folder rule (user_dir_name) are core.user_file_store's, imported, not copied
+(amendment A9 d): every user the store files uploads under has a profile,
+in a folder of the same name, and no id can steer the path.  The file
+records its user id; a file holding another id (a hash collision) raises
+PermissionError and is never shown or written over.
 
 The file goes through security.crypto.encrypt_json_file: Fernet-encrypted
 with HEVOLVE_DATA_KEY when that key is set, plaintext JSON when it is not (a
@@ -34,9 +35,11 @@ file aside, never deletes it.
 
 Values are taken as an agent or a person writes them.  Emoji typed side by
 side, or with spaces or commas between them, are stored one emoji per item
-(igkit's one emoji definition), so the humanizer allows each of them; a list
-item must already be one emoji.  Hashtags in text may be separated by
-commas, spaces or nothing ("#a#b"), by igkit's one hashtag rule.
+(igkit's one emoji definition, EMOJI_RE, which igkit.caption uses too), so
+the humanizer allows each of them; a list item must already be one emoji.
+Hashtags in text may be separated by commas, spaces or nothing ("#a#b"), by
+igkit's one hashtag rule.  A yes/no is read by core.config_cache.flag_value,
+the one reading in HARTOS; a store id by core.user_file_store.is_xid.
 
 voice_brief() is what reel_skill puts in front of a skill text, so a local
 model reads her profile before the instructions; it is bounded at
@@ -44,7 +47,6 @@ MAX_BRIEF_CHARS.
 """
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 import re
@@ -55,8 +57,10 @@ import uuid
 from types import MappingProxyType
 from typing import Any, Dict, List, Mapping, Optional
 
+from core.config_cache import flag_value
+from core.user_file_store import is_xid, user_dir_name, user_key
 from integrations.reel_studio import contracts
-from integrations.reel_studio.igkit import EMOJI_RE, hashtags, parse_flag
+from integrations.reel_studio.igkit import EMOJI_RE, hashtags
 from integrations.reel_studio.igkit.resources import load_json
 
 logger = logging.getLogger(__name__)
@@ -68,7 +72,6 @@ _BRIEF_LINE_CHARS = 240
 _FILE_NAME = 'voice.json'
 #: What reset_voice renames her profile to: voice.aside.<UTC time>.<6 hex>.json.
 _ASIDE_NAME = 'voice.aside.%s.%s.json'
-_XID = re.compile(r'[0-9a-f]{64}')
 #: Where text for a list splits: commas or new lines, but not "15,000".
 _SEPARATORS = re.compile(r'\n|,(?!\d)')
 _EMPTY_BRIEF = ('No voice profile saved yet. Before writing for her, ask for three of her own '
@@ -129,34 +132,23 @@ _user_locks: Dict[str, threading.Lock] = {}
 
 # ── paths and locks ─────────────────────────────────────────────────────────
 
-def _user_key(user_id) -> str:
-    """The user id as text, by core.user_file_store's rule: any non-empty
-    text or int (10077 and '10077' are one user)."""
-    if isinstance(user_id, bool) or not isinstance(user_id, (str, int)):
-        raise ValueError('user_id must be text or an int, got %r' % (user_id,))
-    key = str(user_id).strip()
-    if not key:
-        raise ValueError('user_id is empty')
-    return key
-
-
 def _user_dir(key: str) -> str:
     from core.platform_paths import get_agent_data_dir
-    name = hashlib.sha256(key.encode('utf-8')).hexdigest()[:16]
-    return os.path.join(get_agent_data_dir(), 'reel_studio', name)
+    return os.path.join(get_agent_data_dir(), 'reel_studio', user_dir_name(key))
 
 
 def user_dir(user_id) -> str:
     """Her Reel Studio folder,
-    ``get_agent_data_dir()/reel_studio/<sha256(user id)[:16]>``.
+    ``get_agent_data_dir()/reel_studio/<user_dir_name(user id)>``.
 
-    The one rule for where Reel Studio keeps a user's own files: her voice
-    profile is ``voice.json`` in it, and any other per-user Reel Studio file
-    belongs here too rather than in a copy of the rule.  The folder is named
-    like core.user_file_store's user folders, so an id never becomes a path.
-    Raises ValueError for a user id the store refuses.  Nothing is created.
+    The one place Reel Studio keeps a user's own files: her voice profile is
+    ``voice.json`` in it, and any other per-user Reel Studio file belongs
+    here too rather than in a copy of the rule.  The folder has the name of
+    her core.user_file_store folder (user_dir_name, imported), so an id never
+    becomes a path.  Raises ValueError for a user id the store refuses
+    (user_key).  Nothing is created.
     """
-    return _user_dir(_user_key(user_id))
+    return _user_dir(user_key(user_id))
 
 
 def _profile_path(key: str) -> str:
@@ -291,10 +283,12 @@ def _choice(value, field: str, choices) -> Optional[str]:
 
 
 def _bool(value, field: str) -> Optional[bool]:
-    """igkit.parse_flag's yes/no; blank text clears the field."""
+    """A yes/no as core.config_cache.flag_value reads one (a bool, a number's
+    truth, or yes/no/true/false/on/off/1/0 text); blank text clears the
+    field, and anything else is refused."""
     if isinstance(value, str) and not value.strip():
         return None
-    flag = parse_flag(value)
+    flag = flag_value(value, None)
     if flag is None:
         raise ValueError('%s must be yes or no, got %r' % (field, value))
     return flag
@@ -316,7 +310,7 @@ def _int(value, field: str, lo: int, hi: int) -> Optional[int]:
 def _xid(value, field: str) -> Optional[str]:
     if isinstance(value, str) and not value.strip():
         return None
-    if not (isinstance(value, str) and _XID.fullmatch(value.strip())):
+    if not (isinstance(value, str) and is_xid(value.strip())):
         raise ValueError('%s must be a store id (64 lowercase hex), got %r' % (field, value))
     return value.strip()
 
@@ -440,7 +434,7 @@ def load_voice(user_id) -> Dict[str, Any]:
     not non-empty text or an int, VoiceProfileUnreadable when her profile
     exists but cannot be read, and PermissionError for another user's file.
     """
-    key = _user_key(user_id)
+    key = user_key(user_id)
     with _lock_for(key):
         return _read(key)
 
@@ -454,7 +448,7 @@ def save_voice(user_id, data: Mapping[str, Any]) -> None:
     saved profile exists but cannot be read (VoiceProfileUnreadable): a
     profile the key would bring back is never replaced.
     """
-    key = _user_key(user_id)
+    key = user_key(user_id)
     fields = _clean(data)
     with _lock_for(key):
         _read(key)
@@ -466,7 +460,7 @@ def update_field(user_id, field: str, value: Any) -> Dict[str, Any]:
     whole profile.  Raises ValueError for an unknown field or a value the
     field refuses, and VoiceProfileUnreadable when her saved profile exists
     but cannot be read; either way nothing changes."""
-    key = _user_key(user_id)
+    key = user_key(user_id)
     clean = _coerce(field, value)
     with _lock_for(key):
         fields = _read(key)
@@ -491,7 +485,7 @@ def reset_voice(user_id) -> Optional[str]:
     bad user id, and PermissionError, moving nothing, for a readable file
     another user id wrote.
     """
-    key = _user_key(user_id)
+    key = user_key(user_id)
     with _lock_for(key):
         path = _profile_path(key)
         if not os.path.exists(path):

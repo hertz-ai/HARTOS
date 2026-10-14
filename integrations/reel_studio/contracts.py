@@ -15,19 +15,23 @@ below.  It holds:
   were filmed, the reel ends on the final-look reveal, and a <= 1 s
   final-look teaser at the start is optional (``hook_first``).
 
-It imports only the standard library, so the agent tools can import it at
-construction time without pulling cv2, numpy or ffmpeg.
+It imports only the standard library and core.user_file_store (itself
+standard library plus two small core helpers), so the agent tools can import
+it at construction time without pulling cv2, numpy or ffmpeg.
 
 Validators never raise on bad input; they return a list of problems, empty
 when the document is good.  Each problem reads ``"<id>: <what is wrong>"``.
 For the EDL the id is the QUALITY_BAR check that failed, which is what
 qa.run_qa reports.
 
-LAYERING.  core/ may not import integrations/, so the store
-(core/user_file_store.py), the device door (core/peer_link/file_channel.py)
-and core/chat_attachments.py cannot import this module.  Where they need the
-same facts (INBOUND_PURPOSES, INBOUND_MIMES, INBOUND_META_KEYS) their own
-tests should assert equality with the values here, so the two cannot drift.
+LAYERING.  core/ may not import integrations/, so the facts about inbound
+files that the store (core/user_file_store.py, the one upload service), the
+device door and core/chat_attachments.py need as much as these validators do
+live in the store, and this module imports them from there (amendment A9 d):
+the purposes and their MIME types (INBOUND_PURPOSES, INBOUND_MIMES), the
+offer's meta keys (INBOUND_META_KEYS), OUTBOUND_PURPOSE, and the xid and
+file-name rules (is_xid, is_file_name).  A purpose added to the store's
+registry is one the contracts accept.
 """
 from __future__ import annotations
 
@@ -37,6 +41,11 @@ import re
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+
+# The store's own facts about inbound files (see LAYERING above).  All are
+# re-exported; OUTBOUND_PURPOSE is read here by the pipeline only.
+from core.user_file_store import (INBOUND_META_KEYS, INBOUND_MIMES, INBOUND_PURPOSES,
+                                  OUTBOUND_PURPOSE, is_file_name, is_xid)  # noqa: F401
 
 
 def _frozen(value):
@@ -97,21 +106,12 @@ MIN_CAPTURE_MS = 10 ** 12
 NOTE_NO_FINAL_LOOK = 'no_final_look'
 
 # ── inbound files (phone -> desktop) ──────────────────────────────────────
-
-INBOUND_PURPOSES = ('reel_source', 'logo', 'song_audio')
-OUTBOUND_PURPOSE = 'reel'
-#: Accepted MIME types per inbound purpose (plan 4.2(d)).  audio/x-wav is
-#: what Android's MediaStore reports for WAV.
-INBOUND_MIMES = _frozen({
-    'reel_source': frozenset({'video/mp4', 'video/quicktime', 'video/3gpp'}),
-    'logo': frozenset({'image/png', 'image/jpeg', 'image/webp'}),
-    'song_audio': frozenset({'audio/mpeg', 'audio/mp4', 'audio/aac', 'audio/ogg',
-                             'audio/wav', 'audio/x-wav'}),
-})
-#: Optional fields of a file_offer that the store keeps in StoredFile.meta:
-#: ``captured_at`` (MediaStore DATE_TAKEN, epoch ms; the phone falls back to
-#: DATE_MODIFIED*1000) and ``duration_ms``.
-INBOUND_META_KEYS = ('captured_at', 'duration_ms')
+#
+# INBOUND_PURPOSES, INBOUND_MIMES (accepted MIME types per purpose),
+# INBOUND_META_KEYS (the optional ``captured_at``, MediaStore DATE_TAKEN in
+# epoch ms with DATE_MODIFIED*1000 as the phone's fallback, and
+# ``duration_ms`` of a file_offer, kept in StoredFile.meta) and
+# OUTBOUND_PURPOSE are core.user_file_store's, imported above.
 
 # ── delivery and style ────────────────────────────────────────────────────
 
@@ -205,7 +205,6 @@ class PlanError(Exception):
 
 # ── small predicates ──────────────────────────────────────────────────────
 
-_HEX64 = re.compile(r'[0-9a-f]{64}')
 _DATE = re.compile(r'\d{4}-\d{2}-\d{2}')
 _URL = re.compile(r'(?i)^\s*https?://')
 #: Keys a published or cached song list must never carry.
@@ -219,10 +218,6 @@ def _is_num(v) -> bool:
 
 def _is_int(v) -> bool:
     return isinstance(v, int) and not isinstance(v, bool)
-
-
-def _is_hex64(v) -> bool:
-    return isinstance(v, str) and _HEX64.fullmatch(v) is not None
 
 
 def _is_str(v) -> bool:
@@ -239,12 +234,6 @@ def _is_opt_str(v) -> bool:
 
 def _is_str_list(v) -> bool:
     return isinstance(v, (list, tuple)) and all(isinstance(x, str) for x in v)
-
-
-def _is_file_name(v) -> bool:
-    """A bare file name: no directories, no traversal, no control characters."""
-    return (isinstance(v, str) and 0 < len(v) <= 255 and v not in ('.', '..')
-            and not any(c in v for c in '/\\') and all(ord(c) >= 32 for c in v))
 
 
 _Spec = Mapping[str, Tuple[Callable[[Any], bool], str]]
@@ -1062,8 +1051,8 @@ def _is_hashtags(v) -> bool:
 
 _MEDIA_SPEC = {
     'kind': (lambda v: v == 'video', "'video'"),
-    'xid': (_is_hex64, '64 lowercase hex'),
-    'sha256': (_is_hex64, '64 lowercase hex'),
+    'xid': (is_xid, '64 lowercase hex'),
+    'sha256': (is_xid, '64 lowercase hex'),
     'mime': (lambda v: v == 'video/mp4', "'video/mp4'"),
     'size': (_is_pos_int, 'an int > 0'),
     'width': (lambda v: v == CANVAS['w'] and _is_int(v), str(CANVAS['w'])),
@@ -1113,9 +1102,9 @@ def validate_media_item(item, *, bar: Mapping = QUALITY_BAR) -> List[str]:
 def validate_outbox_item(item) -> List[str]:
     """Problems with one ``file_items`` entry of a ``file_list`` reply."""
     problems = _spec_problems(item, {
-        'xid': (_is_hex64, '64 lowercase hex'), 'name': (_is_file_name, 'a bare file name'),
+        'xid': (is_xid, '64 lowercase hex'), 'name': (is_file_name, 'a bare file name'),
         'mime': (_is_text, 'a MIME type'), 'size': (_is_nonneg_int, 'an int >= 0'),
-        'sha256': (_is_hex64, '64 lowercase hex'), 'created_at': (_is_num, 'epoch seconds'),
+        'sha256': (is_xid, '64 lowercase hex'), 'created_at': (_is_num, 'epoch seconds'),
         'fetched': (lambda v: isinstance(v, bool), 'true or false'),
         'meta': (lambda v: isinstance(v, Mapping), 'an object'),
     }, 'item')
@@ -1161,9 +1150,9 @@ def validate_file_offer(frame) -> List[str]:
     """
     problems = _spec_problems(frame, {
         'type': (lambda v: v == 'file_offer', "'file_offer'"),
-        'name': (_is_file_name, 'a bare file name'),
+        'name': (is_file_name, 'a bare file name'),
         'size': (_is_pos_int, 'an int > 0'),
-        'sha256': (_is_hex64, '64 lowercase hex'),
+        'sha256': (is_xid, '64 lowercase hex'),
         'mime': (_is_str, 'a MIME type'),
         'purpose': (lambda v: v in INBOUND_PURPOSES, 'one of %s' % (INBOUND_PURPOSES,)),
         'captured_at': (_is_capture_ms, 'epoch milliseconds (an int > 0)'),
@@ -1184,9 +1173,9 @@ def validate_attachment(item) -> List[str]:
     stands.
     """
     problems = _spec_problems(item, {
-        'file_id': (_is_hex64, 'a 64-hex store xid'),
-        'sha256': (_is_hex64, '64 lowercase hex'),
-        'name': (_is_file_name, 'a bare file name'),
+        'file_id': (is_xid, 'a 64-hex store xid'),
+        'sha256': (is_xid, '64 lowercase hex'),
+        'name': (is_file_name, 'a bare file name'),
         'mime': (_is_str, 'a MIME type'),
         'size': (_is_nonneg_int, 'an int >= 0'),
         'purpose': (lambda v: v in INBOUND_PURPOSES, 'one of %s' % (INBOUND_PURPOSES,)),

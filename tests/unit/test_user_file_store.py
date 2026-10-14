@@ -12,9 +12,17 @@ bind/query/consume; take_replied marks once; list_outbox(prompt_id=); the GC
 windows; another user's xid is not found; prompt_id 123 and "123" bind the
 same.  Plus amendment A1: the phone's captured_at rides the offer into the
 index, and a bad one is dropped rather than refusing the upload.
+
+Owner ruling A10a (2026-10-14): ONE upload service.  The store keeps a
+registry of upload purposes (reel clip, logo, song audio, and a general chat
+attachment that may be a document such as a PDF), each with its own size cap,
+quota and retention, under one GC; Nunba's /api/chat-sync/files routes put
+whole files through put_file and delete them through delete, and keep no
+storage of their own.  The contracts read the store's facts (A9 d).
 """
 import errno
 import hashlib
+import io
 import json
 import os
 import random
@@ -800,7 +808,7 @@ def test_gc_removes_consumed_sources_a_day_after_use(store, clock):
     store.mark_consumed('u1', [used])
     path = store.resolve('u1', used).path
 
-    clock.now += POLICY['source_after_use_s'] - 1
+    clock.now += ufs.PURPOSES['reel_source'].after_use_s - 1
     assert store.gc() == 0 and os.path.isfile(path)
     clock.now += 2
     assert store.gc() == 1
@@ -814,9 +822,11 @@ def test_gc_removes_unused_sources_after_three_days(store, clock):
     song = upload(store, 'u1', blob(20 * KB, 52), name='s.mp3', mime='audio/mpeg',
                   purpose='song_audio')
     clip = upload(store, 'u1', blob(20 * KB, 53))
+    unused_s = ufs.PURPOSES['reel_source'].unused_s
+    assert ufs.PURPOSES['song_audio'].unused_s == unused_s
 
-    assert store.gc(now=clock.now + POLICY['source_unused_s'] - 1) == 0
-    assert store.gc(now=clock.now + POLICY['source_unused_s'] + 1) == 2
+    assert store.gc(now=clock.now + unused_s - 1) == 0
+    assert store.gc(now=clock.now + unused_s + 1) == 2
     assert store.resolve('u1', song) is None and store.resolve('u1', clip) is None
 
 
@@ -889,7 +899,7 @@ def test_a_new_offer_runs_the_users_gc_first(root, clock):
                           clock=clock)
     old = upload(store, 'u1', blob(200 * KB, 60))
     store.mark_consumed('u1', [old])
-    clock.now += POLICY['source_after_use_s'] + 1
+    clock.now += ufs.PURPOSES['reel_source'].after_use_s + 1
 
     assert store.offer('u1', 'new.mp4', 200 * KB, 'a' * 64, 'video/mp4',
                        'reel_source')['type'] == 'file_accept'
@@ -944,8 +954,7 @@ def test_the_default_store_lives_under_the_data_dir_not_the_served_uploads_dir(
 def test_the_policy_carries_the_plan_limits_and_is_read_only():
     assert POLICY['max_file'] == 1 << 30 and POLICY['user_quota'] == 5 << 30
     assert POLICY['max_active_uploads'] == 2 and POLICY['free_margin'] == 2 << 30
-    assert POLICY['part_ttl_s'] == 48 * HOUR and POLICY['source_after_use_s'] == 24 * HOUR
-    assert POLICY['source_unused_s'] == 72 * HOUR
+    assert POLICY['part_ttl_s'] == 48 * HOUR
     assert POLICY['outbox_after_fetch_s'] == 48 * HOUR
     assert POLICY['outbox_max_s'] == 7 * 24 * HOUR
     with pytest.raises(TypeError):
@@ -954,14 +963,303 @@ def test_the_policy_carries_the_plan_limits_and_is_read_only():
         UserFileStore('x', policy={'no_such_limit': 1})
 
 
-def test_the_store_shares_the_contract_facts():
-    # core/ cannot import integrations/, so the store keeps its own copy of
-    # these; this is what stops the two from drifting.
-    assert ufs.INBOUND_PURPOSES == C.INBOUND_PURPOSES
-    assert ufs.OUTBOUND_PURPOSE == C.OUTBOUND_PURPOSE
-    assert ufs.INBOUND_META_KEYS == C.INBOUND_META_KEYS
-    assert {k: set(v) for k, v in ufs.INBOUND_MIMES.items()} == \
-        {k: set(v) for k, v in C.INBOUND_MIMES.items()}
+# ── one upload service: the purposes (owner ruling A10a) ──────────────────
+
+def put_doc(store, user, data, *, name='plan.pdf', mime='application/pdf',
+            purpose='chat_attachment', meta=None):
+    """A whole file in one call, as Nunba's /api/chat-sync/files/push sends it."""
+    return store.put_file(user, io.BytesIO(data), name=name, mime=mime, purpose=purpose,
+                          meta=meta)
+
+
+def pdf(n, seed):
+    return b'%PDF-1.7\n' + blob(n, seed)
+
+
+def test_every_upload_purpose_is_registered_with_its_own_limits():
+    purposes = ufs.PURPOSES
+
+    assert tuple(purposes) == ufs.INBOUND_PURPOSES == (
+        'reel_source', 'logo', 'song_audio', 'chat_attachment')
+    for name, kind in purposes.items():
+        assert kind.name == name
+        assert set(kind.types) == set(ufs.INBOUND_MIMES[name])
+        assert 0 < kind.max_file <= POLICY['max_file']
+        assert 0 < kind.quota <= POLICY['user_quota']
+        # a MIME type is stored under one extension, whatever the purpose
+        assert all(ufs._EXT[mime] == ext for mime, ext in kind.types.items())
+    clip, logo, doc = purposes['reel_source'], purposes['logo'], purposes['chat_attachment']
+    assert clip.max_file == 1 << 30
+    assert (clip.after_use_s, clip.unused_s) == (24 * HOUR, 72 * HOUR)
+    assert logo.newest_only and not doc.newest_only
+    assert 'application/pdf' in doc.types
+    assert (doc.max_file, doc.quota, doc.after_use_s, doc.unused_s) == (
+        50 << 20, 500 << 20, None, None)
+    with pytest.raises(TypeError):
+        purposes['logo'] = clip
+
+
+def test_a_purpose_override_names_a_known_purpose_and_a_known_limit():
+    store = UserFileStore('x', purposes={'chat_attachment': {'quota': 7}})
+    assert store.purposes['chat_attachment'].quota == 7
+    assert store.purposes['reel_source'] == ufs.PURPOSES['reel_source']
+    assert ufs.PURPOSES['chat_attachment'].quota == 500 << 20
+    with pytest.raises(ValueError):
+        UserFileStore('x', purposes={'no_such_purpose': {'quota': 1}})
+    with pytest.raises(ValueError):
+        UserFileStore('x', purposes={'logo': {'types': {'text/html': '.html'}}})
+
+
+def test_a_document_uploads_in_one_call_as_a_chat_attachment(store, root, clock):
+    data = pdf(120 * KB, 70)
+
+    reply = put_doc(store, 'u1', data)
+
+    assert reply == {'type': 'file_done', 'xid': sha(data)}
+    got = store.resolve('u1', sha(data))
+    assert (got.box, got.name, got.mime, got.size, got.purpose, got.created_at) == \
+        ('in', 'plan.pdf', 'application/pdf', len(data), 'chat_attachment', clock.now)
+    assert got.path.endswith('.pdf') and read(got.path) == data
+    assert os.path.commonpath([root, got.path]) == root
+    assert [f.xid for f in store.query_inbox('u1', purpose='chat_attachment')] == [sha(data)]
+    assert [f for f in all_files(root) if f.split(os.sep)[1] == 'part'] == []
+
+
+def test_put_file_takes_bytes_and_what_the_phones_door_takes(store):
+    data = blob(40 * KB, 71)
+
+    reply = store.put_file('u1', data, name='VID_1.mp4', mime='video/mp4',
+                           purpose='reel_source', meta={'captured_at': CAPTURED, 'x': 1})
+
+    assert reply == {'type': 'file_done', 'xid': sha(data)}
+    assert store.resolve('u1', sha(data)).meta == {'captured_at': CAPTURED}
+    # one store: the phone offering the same bytes already has them here
+    assert store.offer('u1', 'VID_1.mp4', len(data), sha(data), 'video/mp4',
+                       'reel_source') == {'type': 'file_have', 'xid': sha(data)}
+
+
+@pytest.mark.parametrize('mime', ['text/html', 'image/svg+xml', 'application/javascript',
+                                  'application/x-msdownload', 'application/octet-stream',
+                                  'APPLICATION/PDF', None])
+def test_a_chat_attachment_is_never_a_page_or_a_program(store, root, mime):
+    reply = put_doc(store, 'u1', b'<script>alert(1)</script>', name='x.html', mime=mime)
+
+    assert reply == {'type': 'file_refused', 'reason': 'bad_mime'}
+    assert all_files(root) == []
+
+
+@pytest.mark.parametrize('kw,reason', [
+    ({'name': '../evil.pdf'}, 'bad_name'), ({'name': 'a\\b.pdf'}, 'bad_name'),
+    ({'name': ''}, 'bad_name'), ({'name': None}, 'bad_name'),
+    ({'purpose': 'reel_source'}, 'bad_mime'),             # a PDF is not a clip
+    ({'purpose': 'reel'}, 'bad_offer'),                   # outbound only
+    ({'purpose': 'payload'}, 'bad_offer'), ({'purpose': None}, 'bad_offer'),
+])
+def test_put_file_refuses_what_an_offer_refuses_and_leaves_nothing(store, root, kw, reason):
+    args = {'name': 'plan.pdf', 'mime': 'application/pdf', 'purpose': 'chat_attachment'}
+    args.update(kw)
+
+    reply = store.put_file('u1', io.BytesIO(pdf(5 * KB, 85)), **args)
+
+    assert reply == {'type': 'file_refused', 'reason': reason}
+    assert all_files(root) == []
+
+
+def test_an_empty_upload_is_refused(store, root):
+    assert put_doc(store, 'u1', b'') == {'type': 'file_refused', 'reason': 'bad_offer'}
+    assert all_files(root) == []
+
+
+def test_each_purpose_has_its_own_size_cap_and_reads_no_further(root, clock):
+    store = UserFileStore(root, purposes={'chat_attachment': {'max_file': 100 * KB}},
+                          disk_free=lambda p: 1 << 40, clock=clock)
+    asked = []
+
+    class Endless(io.RawIOBase):
+        def readable(self):
+            return True
+
+        def read(self, n=-1):
+            n = n if n and n > 0 else 1 << 20
+            asked.append(n)
+            return b'\x01' * n
+
+    reply = store.put_file('u1', Endless(), name='big.pdf', mime='application/pdf',
+                           purpose='chat_attachment')
+
+    assert reply == {'type': 'file_refused', 'reason': 'too_large'}
+    assert sum(asked) <= 100 * KB + 1                    # never past the cap
+    assert all_files(root) == []
+    assert store.offer('u1', 'big.pdf', 100 * KB + 1, 'a' * 64, 'application/pdf',
+                       'chat_attachment')['reason'] == 'too_large'
+    assert put_doc(store, 'u1', blob(100 * KB, 72))['type'] == 'file_done'
+    # another purpose keeps its own cap
+    assert store.offer('u1', 'clip.mp4', 100 * KB + 1, 'b' * 64, 'video/mp4',
+                       'reel_source')['type'] == 'file_accept'
+
+
+def test_each_purpose_has_its_own_quota_inside_the_users(root, clock):
+    store = UserFileStore(root, policy={'user_quota': 600 * KB},
+                          purposes={'chat_attachment': {'quota': 300 * KB}},
+                          disk_free=lambda p: 1 << 40, clock=clock)
+    first = put_doc(store, 'u1', blob(150 * KB, 73))['xid']
+    assert put_doc(store, 'u1', blob(150 * KB, 74))['type'] == 'file_done'
+
+    assert put_doc(store, 'u1', blob(10 * KB, 75))['reason'] == 'quota'
+    assert store.offer('u1', 'more.pdf', 10 * KB, 'c' * 64, 'application/pdf',
+                       'chat_attachment')['reason'] == 'quota'
+    assert store.usage('u1', purpose='chat_attachment') == 300 * KB
+    # clips do not count against her attachments, but everything counts
+    # against her own quota
+    assert store.offer('u1', 'clip.mp4', 250 * KB, 'd' * 64, 'video/mp4',
+                       'reel_source')['type'] == 'file_accept'
+    assert store.usage('u1') == 550 * KB and store.usage('u1', purpose='reel_source') == 250 * KB
+    assert store.offer('u1', 'clip2.mp4', 100 * KB, 'e' * 64, 'video/mp4',
+                       'reel_source')['reason'] == 'quota'
+    assert put_doc(store, 'u2', blob(150 * KB, 76))['type'] == 'file_done'   # per user
+    assert store.delete('u1', first) is True
+    assert put_doc(store, 'u1', blob(10 * KB, 75))['type'] == 'file_done'
+
+
+def test_the_same_bytes_put_again_are_one_file(store, clock):
+    data = pdf(60 * KB, 77)
+    put_doc(store, 'u1', data, name='a.pdf')
+    clock.now += 60
+
+    assert put_doc(store, 'u1', data, name='renamed.pdf') == {'type': 'file_done',
+                                                               'xid': sha(data)}
+
+    assert store.usage('u1') == len(data)
+    got = store.resolve('u1', sha(data))
+    assert (got.name, got.created_at) == ('renamed.pdf', clock.now)
+    assert [f.xid for f in store.query_inbox('u1', unconsumed_only=False)] == [sha(data)]
+
+
+def test_put_file_refuses_an_upload_that_would_leave_too_little_disk(root, clock):
+    store = UserFileStore(root, disk_free=lambda p: POLICY['free_margin'] - 1, clock=clock)
+
+    reply = put_doc(store, 'u1', pdf(10 * KB, 81))
+
+    assert reply['type'] == 'file_refused' and reply['reason'] == 'no_space'
+    assert all_files(root) == []
+
+
+def test_a_full_disk_while_receiving_refuses_and_leaves_nothing(store, root, monkeypatch):
+    real_open = open
+
+    class FullDisk:
+        """The file being received, on a disk that fills up at the first write."""
+
+        def __init__(self, handle):
+            self._handle = handle
+
+        def write(self, data):
+            raise OSError(errno.ENOSPC, 'No space left on device')
+
+        def __getattr__(self, name):
+            return getattr(self._handle, name)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._handle.close()
+            return False
+
+    def full_disk_open(path, mode='r', *args, **kwargs):
+        handle = real_open(path, mode, *args, **kwargs)
+        return FullDisk(handle) if 'w' in mode or 'x' in mode else handle
+
+    monkeypatch.setattr('builtins.open', full_disk_open)
+    reply = put_doc(store, 'u1', pdf(10 * KB, 86))
+    monkeypatch.undo()
+
+    assert reply == {'type': 'file_refused', 'reason': 'no_space'}
+    assert all_files(root) == []
+
+
+def test_a_chat_attachment_is_kept_until_she_deletes_it(store, clock):
+    xid = put_doc(store, 'u1', pdf(30 * KB, 78))['xid']
+    store.mark_consumed('u1', [xid])
+
+    assert store.gc(now=clock.now + 365 * 24 * HOUR) == 0
+    assert store.resolve('u1', xid) is not None
+
+    assert store.delete('u1', xid) is True
+    assert store.resolve('u1', xid) is None and store.usage('u1') == 0
+
+
+def test_delete_removes_one_of_her_inbound_files_and_nothing_else(store, tmp_path):
+    doc = put_doc(store, 'u1', pdf(30 * KB, 79))['xid']
+    clip = upload(store, 'u1', blob(30 * KB, 80))
+    path = store.resolve('u1', doc).path
+    theirs = put_doc(store, 'u2', pdf(30 * KB, 79))['xid']
+    reel = send_reel(store, tmp_path, 'u1').xid
+
+    assert store.delete('u1', clip, purpose='chat_attachment') is False   # not one
+    assert store.resolve('u1', clip) is not None
+    assert store.delete('u1', doc) is True
+    assert not os.path.exists(path) and store.resolve('u1', doc) is None
+    assert store.delete('u1', doc) is False
+    assert store.resolve('u2', theirs) is not None
+    assert store.delete('u1', reel) is False                  # the outbox is not hers to edit
+    assert store.resolve('u1', reel) is not None
+    for bad in ('f' * 64, '../index', None, 7):
+        assert store.delete('u1', bad) is False
+
+
+def test_a_document_put_over_http_can_be_attached_to_a_chat_turn(store, monkeypatch):
+    from core import chat_attachments
+    monkeypatch.setattr(chat_attachments, 'get_user_file_store', lambda: store)
+    data = pdf(20 * KB, 82)
+    xid = put_doc(store, 'u1', data)['xid']
+    row = {'file_id': xid, 'sha256': xid, 'name': 'plan.pdf', 'mime': 'application/pdf',
+           'size': len(data), 'purpose': 'chat_attachment'}
+
+    assert C.validate_attachment(row) == []
+    bound = chat_attachments.bind_inbound('u1', '123', 'req-1',
+                                          chat_attachments.parse_inbound([row]))
+
+    assert [(b['xid'], b['purpose'], b['prompt_id']) for b in bound] == \
+        [(xid, 'chat_attachment', '123')]
+
+
+@pytest.mark.parametrize('purpose,mime,ok', [
+    ('chat_attachment', 'application/pdf', True), ('chat_attachment', 'image/jpeg', True),
+    ('chat_attachment', 'text/html', False), ('reel_source', 'application/pdf', False),
+    ('logo', 'image/png', True), ('song_audio', 'audio/x-wav', True),
+    ('reel', 'video/mp4', False), ('anything', 'video/mp4', False),
+])
+def test_the_contract_accepts_exactly_the_offers_the_store_accepts(store, purpose, mime, ok):
+    data = blob(10 * KB, 83)
+    frame = {'type': 'file_offer', 'name': 'f.bin', 'size': len(data), 'sha256': sha(data),
+             'mime': mime, 'purpose': purpose}
+
+    accepted = store.offer('u1', 'f.bin', len(data), sha(data), mime, purpose)
+
+    assert (accepted['type'] == 'file_accept') == ok
+    assert (C.validate_file_offer(frame) == []) == ok
+
+
+def test_source_guard_the_contract_facts_are_the_stores_own():
+    # core/ cannot import integrations/, so the contracts import these from
+    # the store (A9 d): one place to change a purpose, a MIME type, a meta
+    # key, the xid rule or the file-name rule.
+    for name in ('INBOUND_PURPOSES', 'INBOUND_MIMES', 'INBOUND_META_KEYS', 'OUTBOUND_PURPOSE'):
+        assert getattr(C, name) is getattr(ufs, name), name
+    assert C.is_xid is ufs.is_xid and C.is_file_name is ufs.is_file_name
+
+
+def test_the_user_rule_and_the_folder_name_are_public(store, root):
+    assert ufs.user_key(10077) == ufs.user_key(' 10077 ') == '10077'
+    for bad in ('', '   ', None, True, 1.5, ['u']):
+        with pytest.raises(ValueError):
+            ufs.user_key(bad)
+    assert ufs.user_dir_name(10077) == ufs.user_dir_name('10077')
+
+    upload(store, 'a.b@example.com', blob(10 * KB, 84))
+
+    assert os.listdir(root) == [ufs.user_dir_name('a.b@example.com')]
 
 
 def test_the_store_loads_no_transport_and_no_integrations():

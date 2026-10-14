@@ -121,11 +121,21 @@ def test_values_given_as_text_are_read(vp):
                                    'hashtag_bank': ['#maduraimua', '#bridalmakeup']}
 
 
-def test_a_flag_may_be_given_as_one_or_zero(vp):
-    assert vp.update_field('u1', 'code_mix', 1) == {'code_mix': True}
-    assert vp.update_field('u1', 'code_mix', 0) == {'code_mix': False}
-    with pytest.raises(ValueError):
-        vp.update_field('u1', 'code_mix', 2)
+@pytest.mark.parametrize('value', [True, False, 1, 0, 2, 0.0, 'yes', ' TRUE ', 'on', '1', 'no',
+                                   'False', 'off', '0', 'y', 'n', 'maybe', [True]])
+def test_a_flag_is_read_as_every_flag_in_hartos_is(vp, value):
+    # core.config_cache.flag_value is the one reading of a yes/no (/chat's
+    # agent_tools, every env flag).  igkit kept a table of its own that
+    # disagreed with it: 'y' was yes there and junk in core, 2 was refused
+    # there and yes in core.
+    from core.config_cache import flag_value
+    want = flag_value(value, None)
+    if want is None:
+        with pytest.raises(ValueError, match='yes or no'):
+            vp.update_field('u1', 'code_mix', value)
+        assert vp.load_voice('u1') == {}
+    else:
+        assert vp.update_field('u1', 'code_mix', value) == {'code_mix': want}
 
 
 # ── emoji and hashtags as an agent or a person writes them ─────────────────
@@ -247,20 +257,31 @@ def test_any_user_id_the_file_store_takes_gets_a_profile_inside_the_root(vp, tmp
     assert [p.name for p in _root(tmp_path).iterdir()] == [path.parent.name]
 
 
-@pytest.mark.parametrize('uid', ['u1', ' u1 ', 'a.b@example.com', 10077, '', '   ', None, True,
-                                 1.5, b'u1'])
-def test_the_user_id_rule_is_the_file_stores(vp, tmp_path, uid):
+@pytest.mark.parametrize('uid', ['u1', ' u1 ', 'a.b@example.com', 10077, 'மீனா'])
+def test_her_profile_folder_is_named_like_her_store_folder(vp, tmp_path, uid):
+    # The reel tools hand voice_profile the user her uploads are filed under;
+    # the same user is the same folder name in both places.
     from core.user_file_store import UserFileStore
-    store = UserFileStore(root=str(tmp_path / 'store'))
+    store = UserFileStore(root=str(tmp_path / 'store'), disk_free=lambda path: 1 << 40)
+    logo = b'\x89PNG\r\n\x1a\n' + b'logo' * 64
+    assert store.put_file(uid, logo, name='logo.png', mime='image/png',
+                          purpose='logo')['type'] == 'file_done'
 
-    def refused(call):
-        try:
-            call()
-        except ValueError:
-            return True
-        return False
+    vp.update_field(uid, 'city', 'Madurai')
 
-    assert refused(lambda: vp.load_voice(uid)) == refused(lambda: store.usage(uid))
+    [store_folder] = os.listdir(tmp_path / 'store')
+    assert os.path.basename(vp.user_dir(uid)) == store_folder
+    assert _file(tmp_path, uid).parent.name == store_folder
+
+
+def test_source_guard_voice_profile_keeps_no_user_rule_of_its_own(vp):
+    # Amendment A9 d: one user-id rule and one folder rule, the store's.
+    # A copy here drifted from the store's once already (it refused ids the
+    # store took, so the reel tools failed for those users).
+    import core.user_file_store as ufs
+    assert vp.user_key is ufs.user_key
+    assert vp.user_dir_name is ufs.user_dir_name
+    assert not hasattr(vp, '_user_key')
 
 
 def test_an_int_and_its_text_are_one_user(vp):

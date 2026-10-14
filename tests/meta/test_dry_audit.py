@@ -218,6 +218,16 @@ CANONICAL_OWNERS = {
     'is_public_host': 'core/public_url.py',
     'allowed_hosts': 'core/public_url.py',
     'own_gateway_urls': 'integrations/ap2/ap2_protocol.py',
+    # The one upload store's facts (owner ruling A10a, amendment A9 d):
+    # integrations.reel_studio.contracts and voice_profile import them.
+    'UploadPurpose': 'core/user_file_store.py',
+    'INBOUND_PURPOSES': 'core/user_file_store.py',
+    'INBOUND_MIMES': 'core/user_file_store.py',
+    'INBOUND_META_KEYS': 'core/user_file_store.py',
+    'OUTBOUND_PURPOSE': 'core/user_file_store.py',
+    'is_xid': 'core/user_file_store.py',
+    'is_file_name': 'core/user_file_store.py',
+    'user_dir_name': 'core/user_file_store.py',
 }
 
 #: module -> why it may walk sys._current_frames() itself.

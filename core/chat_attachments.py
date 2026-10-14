@@ -8,7 +8,7 @@ U9; amendment A9 a)::
 
     "attachments": [{"file_id": "<64-hex xid>", "sha256": "<the same>",
                      "name": ..., "mime": ..., "size": ...,
-                     "purpose": "reel_source|logo|song_audio",   # optional
+                     "purpose": "<one of the store's INBOUND_PURPOSES>",  # optional
                      "captured_at": ..., "duration_ms": ...}]    # optional
 
 ``file_id`` is the store xid, which is the file's sha256.  The reel the turn

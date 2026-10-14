@@ -85,14 +85,6 @@ class TestSharedPrimitives:
     def test_emoji_as_she_sees_them(self, text, units):
         assert igkit.EMOJI_RE.findall(text) == units
 
-    @pytest.mark.parametrize('value,flag', [
-        (True, True), (False, False), (1, True), (0, False), ('yes', True), (' TRUE ', True),
-        ('on', True), ('1', True), ('no', False), ('False', False), ('off', False), ('0', False),
-        (None, None), ('', None), ('  ', None), ('maybe', None), (2, None), (1.0, None),
-    ])
-    def test_parse_flag(self, value, flag):
-        assert igkit.parse_flag(value) is flag
-
 
 class TestRateHook:
     def test_a_tamil_hook_is_counted_not_empty(self):
