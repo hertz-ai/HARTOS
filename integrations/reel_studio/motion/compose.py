@@ -49,8 +49,11 @@ REFUSED = 'refused'
 #: How long a reel waits for a Remotion setup it starts (seconds); the setup
 #: goes on after that and the next reel uses it.
 SETUP_WAIT_S = 60.0
-#: The plain end card: one boxed line of text (the renderer wraps it).
+#: The plain end card: one boxed text (the renderer wraps it), CARD_TEXT_PX
+#: when that fits the card's box, else the largest size down to
+#: CARD_TEXT_MIN_PX that does (_card_text_px).
 CARD_TEXT_PX = 56
+CARD_TEXT_MIN_PX = 24
 CARD_TEXT_COLOR = '#FFFFFF'
 CARD_JOIN = ' · '
 #: Largest image put into a template as a data: URI.
@@ -113,18 +116,39 @@ def _overlays_without(edl: Mapping, kind: str) -> List[Dict[str, Any]]:
     return [dict(ov) for ov in edl['overlays'] if ov.get('type') != kind]
 
 
+def _card_text_px(text: str, box_h: float) -> int:
+    """The plain end card's text size: the largest from CARD_TEXT_PX down to
+    CARD_TEXT_MIN_PX at which the drawn block (media.render.text_block_size:
+    pass 2's own wrap and padding) is no wider than the safe zone and no
+    taller than the card's box.  Layout placed the box clear of her face in
+    the final hold; validate_edl's face rule sees motion boxes only, so the
+    text must stay inside it (review of b0fa8c26e/e054a3d88: a three-line
+    card at a fixed 56 px drew 344 px tall over a 220 px band)."""
+    from integrations.reel_studio.media import render
+    width = SAFE_ZONE['x_max'] - SAFE_ZONE['x_min']
+    for size in range(CARD_TEXT_PX, CARD_TEXT_MIN_PX - 1, -2):
+        _lines, w, h = render.text_block_size(text, size, width)
+        if w <= width and h <= box_h:
+            return size
+    logger.warning('reel motion: the plain end card does not fit its %.0f px box even at %d px',
+                   box_h, CARD_TEXT_MIN_PX)
+    return CARD_TEXT_MIN_PX
+
+
 def plain_overlays(edl: Mapping, plan: layout.MotionPlan) -> List[Dict[str, Any]]:
     """The planner's overlays plus the plain-ffmpeg stand-ins for ``plan``:
     only the end card needs one (a boxed text overlay at the card's centre,
-    for the card's time); the title is the hook text already there, the
-    logo stays still, the wipe is the cut."""
+    for the card's time, sized to stay inside the card's box:
+    _card_text_px); the title is the hook text already there, the logo
+    stays still, the wipe is the cut."""
     out = [dict(ov) for ov in edl['overlays']]
     for item in plan.items:
         if item.template != 'end_card':
             continue
         x0, y0, x1, y1 = item.box
-        out.append({'type': 'text', 'text': CARD_JOIN.join(item.props['lines']), 'font': 'auto',
-                    'size_px': CARD_TEXT_PX, 'color': CARD_TEXT_COLOR, 'box': True,
+        text = CARD_JOIN.join(item.props['lines'])
+        out.append({'type': 'text', 'text': text, 'font': 'auto',
+                    'size_px': _card_text_px(text, y1 - y0), 'color': CARD_TEXT_COLOR, 'box': True,
                     'x': round((SAFE_ZONE['x_min'] + SAFE_ZONE['x_max']) / 2.0 / CANVAS['w'], 6),
                     'y': round((y0 + y1) / 2.0 / CANVAS['h'], 6), 'anchor': 'center',
                     'from_s': item.from_s, 'to_s': item.to_s})
@@ -260,5 +284,5 @@ def add_motion(edl: Mapping, request: Optional[Mapping], *, workdir: str,
     return composed, notes + [NOTE_MOTION % state]
 
 
-__all__ = ['NOTE_MOTION', 'RENDERED', 'REFUSED', 'SETUP_WAIT_S', 'CARD_TEXT_PX', 'message',
-           'plain_overlays', 'before_frame', 'add_motion']
+__all__ = ['NOTE_MOTION', 'RENDERED', 'REFUSED', 'SETUP_WAIT_S', 'CARD_TEXT_PX',
+           'CARD_TEXT_MIN_PX', 'message', 'plain_overlays', 'before_frame', 'add_motion']

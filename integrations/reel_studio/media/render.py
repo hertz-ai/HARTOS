@@ -78,6 +78,12 @@ TEXT_BOX_COLOR = '0x000000@0.45'
 TEXT_PAD = 0.3
 TEXT_LINE_SPACING = 0.2
 TEXT_MAX_LINES = 4
+#: Drawn height of one line in ems (the font's ascent plus descent, as
+#: drawtext lays it; see text_block_size).  Measured 2026-10-15 on Windows
+#: with Nirmala.ttc, the font fonts.resolve_font picks there for Latin and
+#: Tamil: 1.18-1.26 em per line, sizes 28-56 px, 2-4 lines, the boxed block
+#: drawn through _drawtext on a white frame.  Rounded up, so an over-estimate.
+TEXT_LINE_EM = 1.3
 #: Estimated advance widths in ems (see text_width): a Latin letter or digit
 #: of a bold sans, an Indic letter, a spacing vowel sign, a space.
 TEXT_EM_LATIN = 0.62
@@ -176,10 +182,16 @@ def _scaled_zone(f: float) -> Dict[str, float]:
     return {k: v * f for k, v in SAFE_ZONE.items()}
 
 
+def _text_pad(size_px: float, f: float = 1.0) -> int:
+    """The box padding (pixels) around text of ``size_px`` drawn at scale
+    ``f`` (the canvas over contracts.CANVAS)."""
+    return max(1, int(round(TEXT_PAD * size_px * f)))
+
+
 def _drawtext(ov: Mapping, textfile: str, fontfile: str, canvas: Mapping) -> str:
     f = canvas['w'] / float(CANVAS['w'])
     size = max(8, int(round(ov['size_px'] * f)))
-    pad = max(1, int(round(TEXT_PAD * ov['size_px'] * f)))
+    pad = _text_pad(ov['size_px'], f)
     zone = _scaled_zone(f)
     cx, cy = ov['x'] * canvas['w'], ov['y'] * canvas['h']
     x = 'max(%d\\,min(%d-text_w\\,%d-text_w/2))' % (
@@ -304,6 +316,25 @@ def wrap_text(text: str, size_px: int, max_width_px: float) -> List[str]:
     return lines
 
 
+def text_block_size(text: str, size_px: int, max_width_px: float) -> Tuple[List[str], float, float]:
+    """``text`` as pass 2 draws it boxed at ``size_px`` in a column
+    ``max_width_px`` wide (the safe zone's width, for a reel): its lines
+    (wrap_text inside the box's padding, as _write_texts wraps), and the
+    estimated width and height of the drawn block, padding included.
+
+    Estimates, over rather than under (text_width; TEXT_LINE_EM per line,
+    TEXT_LINE_SPACING between lines).  A width over ``max_width_px`` means a
+    word, or the run-on last line past TEXT_MAX_LINES, does not fit."""
+    pad = _text_pad(size_px)
+    lines = wrap_text(text, size_px, max_width_px - 2 * pad)
+    if not lines:
+        return [], 0.0, 0.0
+    n = len(lines)
+    width = max(text_width(line, size_px) for line in lines) + 2 * pad
+    height = size_px * (TEXT_LINE_EM * n + TEXT_LINE_SPACING * (n - 1)) + 2 * pad
+    return lines, width, height
+
+
 def _write_texts(edl: Mapping, workdir: str, canvas: Mapping, notes: List[str],
                  made: List[str]) -> Dict[int, Tuple[str, str]]:
     f = canvas['w'] / float(CANVAS['w'])
@@ -323,7 +354,7 @@ def _write_texts(edl: Mapping, workdir: str, canvas: Mapping, notes: List[str],
             logger.info('no font on this machine draws the hook text; leaving it out')
             continue
         size = max(8, int(round(ov['size_px'] * f)))
-        pad = max(1, int(round(TEXT_PAD * ov['size_px'] * f)))
+        pad = _text_pad(ov['size_px'], f)
         lines = wrap_text(text, size, zone['x_max'] - zone['x_min'] - 2 * pad)
         path = os.path.join(workdir, 'reel_text_%d.txt' % i)
         made.append(path)
@@ -458,7 +489,8 @@ def render_reel(edl: Mapping, out_path: str, *, workdir: str, encoder: str = 'au
 
 __all__ = ['FPS', 'ENCODERS', 'RENDER_TIMEOUT_S', 'SEGMENT_TIMEOUT_BASE_S',
            'SEGMENT_TIMEOUT_PER_S', 'PASS1_ENCODE', 'X264_FINAL', 'NVENC_FINAL', 'RATE_CAP',
-           'BT709', 'TEXT_MAX_LINES', 'TEXT_EM_LATIN', 'TEXT_EM_INDIC', 'TEXT_EM_MARK',
-           'TEXT_EM_SPACE', 'NOTE_TEXT_NO_FONT', 'NOTE_EMOJI_DROPPED', 'NOTE_NVENC_FAILED',
-           'NOTE_HDR_UNTONED', 'escape_filter_path', 'segment_frames', 'geometry_filter',
-           'plan_segment_args', 'plan_final_args', 'text_width', 'wrap_text', 'render_reel']
+           'BT709', 'TEXT_MAX_LINES', 'TEXT_LINE_EM', 'TEXT_EM_LATIN', 'TEXT_EM_INDIC',
+           'TEXT_EM_MARK', 'TEXT_EM_SPACE', 'NOTE_TEXT_NO_FONT', 'NOTE_EMOJI_DROPPED',
+           'NOTE_NVENC_FAILED', 'NOTE_HDR_UNTONED', 'escape_filter_path', 'segment_frames',
+           'geometry_filter', 'plan_segment_args', 'plan_final_args', 'text_width', 'wrap_text',
+           'text_block_size', 'render_reel']

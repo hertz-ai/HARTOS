@@ -27,7 +27,7 @@ import pytest
 from core.subprocess_safe import BoundedResult
 from integrations.reel_studio import contracts as C
 from integrations.reel_studio.motion import compose, layout, runtime
-from tests.unit.reel_media_fixtures import golden_edl
+from tests.unit.reel_media_fixtures import golden_edl, make_clip, requires_ffmpeg
 
 runtime_manager = importlib.import_module('integrations.service_tools.runtime_manager')
 model_storage = importlib.import_module('integrations.service_tools.model_storage')
@@ -346,3 +346,104 @@ def test_a_skipped_template_is_said(tmp_path, monkeypatch):
     _out, notes = compose.add_motion(edl, {'overlays': ['wipe']}, workdir=str(tmp_path))
     assert notes == [layout.SKIP_NOTE % ('wipe', layout.NO_FINAL_LOOK)]
     assert 'finished look' in compose.message(notes)
+
+
+# ── the plain end card fits its box ───────────────────────────────────────
+#
+# Review of b0fa8c26e/e054a3d88: the plain end card was a 56 px boxed text
+# whatever its words, and a three-line profile wraps to four lines there
+# (about 269 px, the review's estimate; 344 px drawn, measured here), while a
+# card band can be CARD_MIN_H (220 px) tall.  validate_edl's face rule checks
+# motion boxes, not text, so in a tight layout the plain card could reach her
+# face.  Its size is now the largest that keeps the drawn block inside the
+# card's box (render.text_block_size, the renderer's own wrap and padding).
+
+LONG_CARD = ['Bridal, reception and engagement makeup with saree draping and hair',
+             'Bridal from Rs 15,000 with a trial session',
+             'DM on Instagram or WhatsApp 98xxxxxx to book now']
+TAMIL_CARD = ['மணப்பெண் அலங்காரம் மற்றும் சேலை கட்டுதல் சிகை அலங்காரம்',
+              'ரூ 15,000 முதல் ஒத்திகை உடன்', 'இன்ஸ்டாகிராமில் DM செய்யுங்கள் முன்பதிவு செய்ய']
+
+
+def _plain_card(lines, box, start=17.0, end=20.0):
+    item = layout.MotionItem('end_card', box, start, end,
+                             {'lines': layout.card_lines(lines), 'priceRow': 1,
+                              'accent': layout.ACCENT})
+    out = compose.plain_overlays(golden_edl(), layout.MotionPlan(items=[item]))
+    card = out[-1]          # laid after the planner's own overlays
+    assert card['type'] == 'text' and (card['from_s'], card['to_s']) == (start, end)
+    return card
+
+
+def test_a_short_plain_card_keeps_its_size():
+    card = _plain_card(CARD, (40.0, 1060.0, 810.0, 1420.0))
+    assert card['size_px'] == compose.CARD_TEXT_PX
+
+
+@pytest.mark.parametrize('lines', [LONG_CARD, TAMIL_CARD], ids=['latin', 'tamil'])
+def test_a_long_plain_card_is_sized_to_its_box(lines):
+    from integrations.reel_studio.media import render
+    box = (40.0, 1200.0, 810.0, 1200.0 + 220.0)
+    card = _plain_card(lines, box)
+    zone_w = C.SAFE_ZONE['x_max'] - C.SAFE_ZONE['x_min']
+    _rows, width, height = render.text_block_size(card['text'], card['size_px'], zone_w)
+    assert width <= zone_w and height <= box[3] - box[1], card
+    assert compose.CARD_TEXT_MIN_PX <= card['size_px'] < compose.CARD_TEXT_PX
+
+
+@requires_ffmpeg
+@pytest.mark.parametrize('lines, within_zone_width', [(LONG_CARD, True), (TAMIL_CARD, False)],
+                         ids=['latin', 'tamil'])
+def test_the_plain_end_card_is_drawn_inside_its_box(tmp_path, lines, within_zone_width):
+    """The user-visible check: the card rendered by pass 2 (real drawtext, the
+    font fonts.resolve_font picks) over a white picture, its dark box measured
+    in the frame: never above or below the card's box (her face is beside it).
+
+    Its width is checked for the Latin card only: render.text_width, which
+    wraps every reel text, estimates Tamil narrower than Nirmala draws it
+    (measured 2026-10-15: 1.04 em per Tamil letter against its 0.9), so a
+    long Tamil card can run past the safe zone's right edge.  That estimate is
+    render's (it also wraps the hook text) and is left to its owner; the lines
+    drawn are the lines estimated, so the height holds either way."""
+    import numpy as np
+    from core import media_bin
+    from integrations.reel_studio.contracts import ClipCapture
+    from integrations.reel_studio.media import fonts, render
+    from integrations.reel_studio.media.probe import probe
+    box = (40.0, 1100.0, 810.0, 1100.0 + 220.0)
+    card = _plain_card(lines, box, 0.0, 1.0)
+    if fonts.resolve_font(card['text']) is None:
+        pytest.skip('no font here draws this text')
+    src = make_clip(tmp_path, 'white.mp4', size=(1080, 1920), source='color', color='white',
+                    duration_s=1.5)
+    x = 'c' * 64
+    clip = probe(src).to_edl_clip(ClipCapture(clip=x, order=0, captured_at_ms=1760247082000,
+                                              src='phone'))
+    seg = {'clip': x, 'in_s': 0.0, 'out_s': 1.0, 'speed': 1.0, 'out_start_s': 0.0,
+           'out_end_s': 1.0, 'crop': {'cx': 0.5, 'cy': 0.5, 'zoom': 1.0}, 'face': None,
+           'transition': {'type': 'cut', 'dur_s': 0.0}, 'stage': 'final_look', 'appeal': 7.0,
+           'role': 'reveal'}
+    edl = {'schema': C.EDL_SCHEMA, 'canvas': dict(C.CANVAS), 'target_s': 5.0,
+           'duration_s': 1.0, 'audio': None, 'final_look_found': True, 'hook_first': False,
+           'capture_src': 'phone', 'reveal': {'clip': x, 't_s': 0.5},
+           'notes': [C.capture_note('phone')],
+           'beats': {'source': 'synthetic', 'song_key': None, 'bpm': 120.0,
+                     'times_s': [0.5 * k for k in range(0, 4)], 'confidence': 0.0},
+           'clips': {x: clip}, 'segments': [seg], 'overlays': [card]}
+    out = str(tmp_path / 'card.mp4')
+    render.render_reel(edl, out, workdir=str(tmp_path / 'work'), encoder='libx264', timeout_s=300)
+    stream = media_bin.ffmpeg_stream(
+        ['-loglevel', 'error', '-ss', '0.5', '-i', out, '-frames:v', '1', '-f', 'rawvideo',
+         '-pix_fmt', 'gray', 'pipe:1'], frame_bytes=1080 * 1920, timeout_s=60)
+    try:
+        frame = np.frombuffer(next(stream), np.uint8).reshape(1920, 1080)
+    finally:
+        stream.close()
+    rows = np.where((frame < 200).any(axis=1))[0]
+    cols = np.where((frame < 200).any(axis=0))[0]
+    assert len(rows), 'the card was drawn'
+    slack = 3       # encoder edge blur
+    assert box[1] - slack <= rows.min() and rows.max() <= box[3] + slack, \
+        (rows.min(), rows.max(), card['size_px'])
+    if within_zone_width:
+        assert cols.max() <= C.SAFE_ZONE['x_max'] + slack, (cols.min(), cols.max())
