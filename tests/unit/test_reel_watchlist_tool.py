@@ -7,7 +7,8 @@ same seats of her Reel Studio agent only (the Assistant and the group chat's
 Executor run it; nothing on any other agent, nothing on the central node,
 amendment A8 d), but her agent is not shown its schema up front: the owner
 names the accounts once in a while, and the family's schema is held to 900
-tokens per seat (plan WS-8b; measured 893 with the seven).  request_tools,
+tokens per seat (plan WS-8b; the seven's measured cost is stated once, in
+integrations/reel_studio/tools.py's module note).  request_tools,
 the never-say-unavailable escape, attaches it when she asks for it, in
 CREATE and REUSE.
 
