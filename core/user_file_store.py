@@ -19,6 +19,20 @@ the store binds inbound files to a chat turn (``bind`` / ``query_inbox`` /
 Everything else (the two doors, core.chat_attachments, the reel pipeline)
 delegates here and keeps no file state of its own.
 
+One file, one claim per purpose.  The same bytes may be held for more than
+one purpose: her clip is also a chat attachment, her logo a picture she sent
+in chat.  The inbox keeps them as one file with a claim per purpose, and each
+claim has its own name, MIME type, turn binding, consumption, retention and
+quota.  Bytes sent again for a purpose they are held for refresh that claim;
+bytes sent for a purpose they are not held for gain a claim, within that
+purpose's size cap and quota (else ``too_large`` or ``quota``); no upload
+changes another purpose's claim.
+A file is removed when its last claim goes (the GC, or ``delete``).  Each
+claim counts the file's size against its purpose's quota; the user's quota
+counts the bytes on disk, once.  Callers that read the inbox name the purpose
+they want (query_inbox, resolve, bind, delete); a purpose the registry does
+not have is a caller bug (ValueError), never an empty answer.
+
 Layout, under ``get_data_dir()/user_files/`` (never the uploads dir, which
 the desktop serves without auth)::
 
@@ -32,7 +46,11 @@ user.  Files are named by xid, never by the name the phone sent, so a name
 can never steer a write.  ``index.json`` and each upload's sidecar are
 written with core.file_cache.atomic_json_write; this module is their only
 writer.  The index is read from disk on every call (no in-process cache), so
-a restart, or a second UserFileStore on the same root, sees everything.
+a restart, or a second UserFileStore on the same root, sees everything.  An
+inbound record is ``{file, size, meta, claims: {purpose: {name, mime, seq,
+created_at, prompt_id, request_id, consumed_at}}}``; an outbound one is flat
+(its purpose is always OUTBOUND_PURPOSE).  An index of another schema (the
+v1 index had one purpose per file) is set aside, not read.
 
 Uploads resume.  The sidecar keeps a bitmap of the chunks written, so the
 same offer made again (after a dropped link, a relay/LAN switch or a phone
@@ -53,9 +71,11 @@ not write while the app is running.
 Transport-agnostic: no PeerLink and no HTTP import.  core/ never imports
 integrations/, so the facts integrations.reel_studio.contracts validates
 against (INBOUND_PURPOSES, INBOUND_MIMES, INBOUND_META_KEYS, OUTBOUND_PURPOSE,
-is_xid, is_file_name) live here and the contracts import them (A9 d); so do
-the user-id rule (user_key) and the folder rule (user_dir_name) that Reel
-Studio's voice profile files a user under.
+is_xid, is_file_name, is_capture_ms) live here and the contracts import them
+(A9 d); so do the user-id rule (user_key) and the folder rule
+(user_dir_name) that Reel Studio's voice profile files a user under.  The
+purpose names (REEL_SOURCE, LOGO, SONG_AUDIO, CHAT_ATTACHMENT) are constants
+here for every caller that names one.
 """
 from __future__ import annotations
 
@@ -80,7 +100,7 @@ from core.platform_paths import get_data_dir
 
 logger = logging.getLogger(__name__)
 
-SCHEMA = 'hart.user_files.v1'
+SCHEMA = 'hart.user_files.v2'           # v2: an inbound file holds a claim per purpose
 PART_SCHEMA = 'hart.user_files.part.v1'
 
 # ── what may be uploaded: the purposes ────────────────────────────────────
@@ -114,35 +134,46 @@ class UploadPurpose:
 #: What a store's ``purposes`` argument may change (tests, operators).
 _PURPOSE_LIMITS = ('max_file', 'quota', 'after_use_s', 'unused_s')
 
-#: The registry: every inbound purpose, in this order.  audio/x-wav is what
+#: The purpose names, for every caller that names one (a misspelt or renamed
+#: purpose is then an ImportError or a ValueError, never an empty inbox).
+REEL_SOURCE = 'reel_source'
+LOGO = 'logo'
+SONG_AUDIO = 'song_audio'
+CHAT_ATTACHMENT = 'chat_attachment'
+
+#: The registry: every inbound purpose, in this order (also the order a
+#: lookup without a purpose reads a file's claims in).  audio/x-wav is what
 #: Android's MediaStore reports for WAV.  A clip or a song goes a day after a
 #: reel used it, or three days after upload if none did (U4/finding 23).  A
 #: chat attachment is a file she sends her agent or her other devices
-#: (WhatsApp-style, U9): images, documents, audio and video, kept until she
-#: deletes it, within its quota; never a page (HTML, SVG, script) or a
-#: program, so nothing served back can run.
+#: (WhatsApp-style, U9): images, documents, audio (a phone's voice notes:
+#: AMR, 3GPP, Opus) and video, kept until she deletes it, within its quota;
+#: never a page (HTML, SVG, script), a program or an archive, and never a
+#: file of no stated type (application/octet-stream), so nothing served back
+#: can run and every stored file has a type and an extension.
 PURPOSES = MappingProxyType({p.name: p for p in (
     UploadPurpose(
-        'reel_source',
+        REEL_SOURCE,
         MappingProxyType({'video/mp4': '.mp4', 'video/quicktime': '.mov',
                           'video/3gpp': '.3gp'}),
         max_file=1 << 30, quota=5 << 30, after_use_s=24 * _HOUR, unused_s=72 * _HOUR),
     UploadPurpose(
-        'logo',
+        LOGO,
         MappingProxyType({'image/png': '.png', 'image/jpeg': '.jpg', 'image/webp': '.webp'}),
         max_file=50 << 20, quota=200 << 20, after_use_s=None, unused_s=None,
         newest_only=True),
     UploadPurpose(
-        'song_audio',
+        SONG_AUDIO,
         MappingProxyType({'audio/mpeg': '.mp3', 'audio/mp4': '.m4a', 'audio/aac': '.aac',
                           'audio/ogg': '.ogg', 'audio/wav': '.wav', 'audio/x-wav': '.wav'}),
         max_file=200 << 20, quota=1 << 30, after_use_s=24 * _HOUR, unused_s=72 * _HOUR),
     UploadPurpose(
-        'chat_attachment',
+        CHAT_ATTACHMENT,
         MappingProxyType({
             'image/png': '.png', 'image/jpeg': '.jpg', 'image/webp': '.webp',
-            'image/gif': '.gif', 'image/heic': '.heic',
+            'image/gif': '.gif', 'image/heic': '.heic', 'image/heif': '.heif',
             'application/pdf': '.pdf', 'text/plain': '.txt', 'text/csv': '.csv',
+            'text/markdown': '.md',
             'application/msword': '.doc',
             'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
             'application/vnd.ms-excel': '.xls',
@@ -152,9 +183,10 @@ PURPOSES = MappingProxyType({p.name: p for p in (
                 '.pptx',
             'audio/mpeg': '.mp3', 'audio/mp4': '.m4a', 'audio/aac': '.aac',
             'audio/ogg': '.ogg', 'audio/wav': '.wav', 'audio/x-wav': '.wav',
-            'audio/webm': '.weba',
+            'audio/webm': '.weba', 'audio/amr': '.amr', 'audio/3gpp': '.3gp',
+            'audio/opus': '.opus',
             'video/mp4': '.mp4', 'video/quicktime': '.mov', 'video/3gpp': '.3gp',
-            'video/webm': '.webm',
+            'video/webm': '.webm', 'video/x-matroska': '.mkv',
         }),
         max_file=50 << 20, quota=500 << 20, after_use_s=None, unused_s=None),
 )})
@@ -200,10 +232,13 @@ class StoredFile:
     """One committed file, as the index records it.
 
     ``box`` is 'in' (from the phone) or 'out' (to the phone); ``sha256`` is
-    ``xid``.  ``prompt_id`` and ``request_id`` bind it to a chat turn (both
-    strings).  ``meta`` holds the offer's captured_at/duration_ms for an
-    inbound file, and the caller's meta (the reply ``media`` item) for an
-    outbound one.
+    ``xid``.  An inbound file is seen through one purpose's claim on it:
+    ``purpose``, ``name``, ``mime``, ``created_at`` (when it was last sent
+    for that purpose), ``prompt_id`` / ``request_id`` (the chat turn that
+    claim is bound to, both strings) and ``consumed_at`` are that claim's;
+    ``path``, ``size`` and ``meta`` are the file's.  ``meta`` holds the
+    offer's captured_at/duration_ms for an inbound file, and the caller's
+    meta (the reply ``media`` item) for an outbound one.
     """
     xid: str
     user_id: str
@@ -253,6 +288,14 @@ def is_file_name(v) -> bool:
             and not any(c in v for c in '/\\') and all(ord(c) >= 32 for c in v))
 
 
+def is_capture_ms(v) -> bool:
+    """A capture time the store keeps: epoch milliseconds as an int > 0
+    (the phone's MediaStore DATE_TAKEN; amendment A1).  The one rule: an
+    offer's captured_at is kept exactly when integrations.reel_studio.
+    contracts accepts it, and ClipSource reads it back by the same rule."""
+    return _is_int(v) and v > 0
+
+
 def user_key(user_id) -> str:
     """The user id as the store keys it: any non-empty text or int, stripped
     (10077, '10077' and ' 10077 ' are one user).  Raises ValueError for
@@ -291,7 +334,7 @@ def _inbound_meta(meta) -> Dict[str, int]:
         return {}
     out = {}
     captured, duration = meta.get('captured_at'), meta.get('duration_ms')
-    if _is_int(captured) and captured > 0:
+    if is_capture_ms(captured):
         out['captured_at'] = captured
     elif captured is not None:
         logger.info('user_file_store: dropped captured_at=%r (not epoch ms)', captured)
@@ -458,21 +501,38 @@ def _lock_for(user_dir: str) -> threading.RLock:
 
 # ── the index ─────────────────────────────────────────────────────────────
 
-_RECORD_TYPES = {
+#: An outbound record's typed fields; and an inbound file's, and each of its
+#: claims' (see the module docstring for the two shapes).
+_OUT_TYPES = {
     'file': str, 'name': str, 'mime': str, 'size': int, 'purpose': str, 'seq': int,
     'created_at': (int, float), 'meta': dict, 'replied': bool, 'fetched': bool,
 }
+_IN_TYPES = {'file': str, 'size': int, 'meta': dict, 'claims': dict}
+_CLAIM_TYPES = {'name': str, 'mime': str, 'seq': int, 'created_at': (int, float)}
 
 
-def _record_ok(rec) -> bool:
-    return (isinstance(rec, dict)
-            and all(isinstance(rec.get(k), t) and not (t is int and isinstance(rec.get(k), bool))
-                    for k, t in _RECORD_TYPES.items())
-            and is_file_name(rec['file'])
-            and all(rec.get(k) is None or _is_num(rec.get(k))
-                    for k in ('consumed_at', 'fetched_at'))
+def _typed(rec, types: Mapping[str, Any]) -> bool:
+    return all(isinstance(rec.get(k), t) and not (t is int and isinstance(rec.get(k), bool))
+               for k, t in types.items())
+
+
+def _turn_fields_ok(rec: Mapping) -> bool:
+    return (all(rec.get(k) is None or _is_num(rec.get(k)) for k in ('consumed_at', 'fetched_at'))
             and all(rec.get(k) is None or isinstance(rec.get(k), str)
                     for k in ('prompt_id', 'request_id')))
+
+
+def _record_ok(box: str, rec) -> bool:
+    """Is ``rec`` a well-formed record of ``box``: an outbound file, or an
+    inbound file with at least one well-formed claim?"""
+    if not isinstance(rec, dict):
+        return False
+    if box == 'out':
+        return _typed(rec, _OUT_TYPES) and is_file_name(rec['file']) and _turn_fields_ok(rec)
+    return (_typed(rec, _IN_TYPES) and is_file_name(rec['file']) and len(rec['claims']) > 0
+            and all(isinstance(purpose, str) and isinstance(claim, dict)
+                    and _typed(claim, _CLAIM_TYPES) and _turn_fields_ok(claim)
+                    for purpose, claim in rec['claims'].items()))
 
 
 def _empty_index(uid: Optional[str]) -> Dict[str, Any]:
@@ -578,7 +638,8 @@ class UserFileStore:
             raise PermissionError('user_file_store: %s belongs to another user' % user_dir)
         for box in BOXES:
             records = doc['files'][box]
-            for xid in [x for x, rec in records.items() if not (is_xid(x) and _record_ok(rec))]:
+            for xid in [x for x, rec in records.items()
+                        if not (is_xid(x) and _record_ok(box, rec))]:
                 logger.error('user_file_store: dropped a malformed %s record %r in %s',
                              box, xid, path)
                 del records[xid]
@@ -606,6 +667,8 @@ class UserFileStore:
         atomic_json_write(os.path.join(user_dir, 'index.json'), doc)
 
     def _stored(self, user_dir: str, uid: str, box: str, xid: str, rec: Mapping) -> StoredFile:
+        """The StoredFile of an outbound record, or of an inbound claim's
+        view (_view)."""
         return StoredFile(
             xid=xid, user_id=uid, box=box, path=self._file_path(user_dir, box, rec),
             name=rec['name'], mime=rec['mime'], size=rec['size'], sha256=xid,
@@ -614,11 +677,52 @@ class UserFileStore:
             meta=json.loads(json.dumps(rec['meta'])), consumed_at=rec.get('consumed_at'),
             replied=rec['replied'], fetched=rec['fetched'])
 
+    @staticmethod
+    def _view(rec: Mapping, purpose: str) -> Dict[str, Any]:
+        """An inbound file as ``purpose``'s claim on it sees it, in the flat
+        shape of an outbound record (a copy: changes go to the claim)."""
+        return {**rec['claims'][purpose], 'file': rec['file'], 'size': rec['size'],
+                'meta': rec['meta'], 'purpose': purpose, 'replied': False, 'fetched': False}
+
     def _live(self, user_dir: str, doc: Mapping, box: str) -> List[Tuple[str, dict]]:
-        """(xid, record) of a box whose file exists, in commit order."""
-        rows = [(x, r) for x, r in doc['files'][box].items()
-                if os.path.isfile(self._file_path(user_dir, box, r))]
+        """(xid, record) of a box whose file exists, in commit order.  The
+        inbox has a row per claim, the file as that claim sees it (_view)."""
+        rows: List[Tuple[str, dict]] = []
+        for x, r in doc['files'][box].items():
+            if not os.path.isfile(self._file_path(user_dir, box, r)):
+                continue
+            if box == 'out':
+                rows.append((x, r))
+            else:
+                rows.extend((x, self._view(r, p)) for p in r['claims'])
         return sorted(rows, key=lambda row: row[1]['seq'])
+
+    def _on_disk(self, user_dir: str, doc: Mapping, box: str, xid) -> Optional[dict]:
+        """The record of ``xid`` in ``box`` when its file exists, else None."""
+        rec = doc['files'][box].get(xid) if is_xid(xid) else None
+        return rec if rec is not None and os.path.isfile(self._file_path(user_dir, box, rec)) \
+            else None
+
+    def _first_claim(self, rec: Mapping) -> str:
+        """The claim a lookup without a purpose reads: the first in PURPOSES
+        order (a purpose no longer registered last), so it is stable."""
+        order = list(self.purposes)
+        return min(rec['claims'], key=lambda p: (order.index(p) if p in order else len(order), p))
+
+    @staticmethod
+    def _newest_claim(rec: Mapping) -> str:
+        """The purpose the file was last sent for."""
+        return max(rec['claims'], key=lambda p: rec['claims'][p]['seq'])
+
+    def _known_purpose(self, purpose, *, outbound: bool = False) -> None:
+        """Raise ValueError unless ``purpose`` is None or a registered one
+        (or, with ``outbound``, OUTBOUND_PURPOSE): a caller asking for a
+        purpose the registry does not have is told so, never answered with an
+        empty inbox."""
+        if (purpose is None or purpose in self.purposes
+                or (outbound and purpose == OUTBOUND_PURPOSE)):
+            return
+        raise ValueError('unknown purpose %r (known: %s)' % (purpose, list(self.purposes)))
 
     # ── upload sidecars (caller holds the user's lock) ──
 
@@ -680,9 +784,14 @@ class UserFileStore:
 
     def _usage(self, user_dir: str, doc: Mapping, purpose: Optional[str] = None) -> int:
         """Bytes held: committed files plus the full size of each upload in
-        progress, of ``purpose`` only when given."""
-        held = sum(r['size'] for box in BOXES for r in doc['files'][box].values()
-                   if purpose is None or r['purpose'] == purpose)
+        progress.  Without ``purpose`` each file counts once (the disk it
+        takes); with it, each file that purpose has a claim on (its quota)."""
+        inbox, outbox = doc['files']['in'].values(), doc['files']['out'].values()
+        if purpose is None:
+            held = sum(r['size'] for r in inbox) + sum(r['size'] for r in outbox)
+        else:
+            held = (sum(r['size'] for r in inbox if purpose in r['claims'])
+                    + sum(r['size'] for r in outbox if r['purpose'] == purpose))
         return held + sum(p['size'] for p in self._parts(user_dir)
                           if purpose is None or p.get('purpose') == purpose)
 
@@ -694,15 +803,18 @@ class UserFileStore:
 
         Answers ``file_accept {xid, chunk_size, n, missing, max_inflight}``
         (``missing``: inclusive [first, last] chunk ranges still needed),
-        ``file_have {xid}`` when the bytes are already held (the record is
-        refreshed as if uploaded again: name, purpose, meta, and no longer
-        consumed), or ``file_refused {reason}``.  ``meta`` may be the whole
-        offer frame: only INBOUND_META_KEYS with usable values are kept.
-        ``chunk_size`` is the door's (smaller on relayed links); a resume at
-        another size keeps the bytes already written.  The purpose's MIME
-        types, size cap and quota hold, inside the store-wide ones.  Runs
-        this user's GC first, so stale uploads and expired files do not hold
-        the quota.
+        ``file_have {xid}`` when the bytes are already held (that purpose's
+        claim on them is recorded as sent now: name, MIME type and meta as
+        offered, no longer consumed; a new claim must fit the purpose's size
+        cap and quota; other purposes' claims are untouched), or ``file_refused
+        {reason}``.  ``meta`` may be the whole offer frame: only
+        INBOUND_META_KEYS with usable values are kept.  ``chunk_size`` is
+        the door's (smaller on relayed links); a resume at another size keeps
+        the bytes already written, and a resume for another purpose makes the
+        upload that purpose's, within its quota.  The purpose's MIME types,
+        size cap and quota hold, inside the store-wide ones.  Runs this
+        user's GC first, so stale uploads and expired files do not hold the
+        quota.
         """
         uid = user_key(user_id)
         xid = sha256 if is_xid(sha256) else None
@@ -722,8 +834,10 @@ class UserFileStore:
             now = self._clock()
             doc = self._load_index(user_dir, uid)
             self._gc_user(user_dir, doc, now)
-            if self._refresh_held(user_dir, doc, xid, name, mime, purpose, keep, now):
-                return {'type': 'file_have', 'xid': xid}
+            held = self._on_disk(user_dir, doc, 'in', xid)
+            if held is not None:
+                refusal = self._claim(user_dir, doc, held, kind, name, mime, keep, now)
+                return _refused(refusal, xid) if refusal else {'type': 'file_have', 'xid': xid}
             if (_dir_key(user_dir), xid) in _COMMITTING:
                 return _refused('busy', xid)
             part = self._load_part(user_dir, xid)
@@ -736,6 +850,9 @@ class UserFileStore:
                 if refusal:
                     return _refused(refusal, xid)
             else:
+                if (part.get('purpose') != kind.name
+                        and self._usage(user_dir, doc, kind.name) + size > kind.quota):
+                    return _refused('quota', xid)
                 if part['chunk_size'] != cs:
                     part['bits'] = _remap(part['bits'], part['n'], part['chunk_size'], cs, size)
                     part['chunk_size'], part['n'] = cs, _n_chunks(size, cs)
@@ -762,19 +879,37 @@ class UserFileStore:
         """The registered purpose called ``name``, or None."""
         return self.purposes.get(name) if isinstance(name, str) else None
 
-    def _refresh_held(self, user_dir: str, doc: Dict[str, Any], xid: str, name: str,
-                      mime: str, purpose: str, keep: Mapping, now: float) -> bool:
-        """When this user's inbox already holds ``xid``, record it as
-        uploaded again now (name, MIME type, purpose and meta as sent, no
-        longer consumed) and return True; caller holds the lock."""
-        held = doc['files']['in'].get(xid) if xid else None
-        if held is None or not os.path.isfile(self._file_path(user_dir, 'in', held)):
-            return False
-        doc['seq'] += 1
-        held.update(name=name, mime=mime, purpose=purpose, consumed_at=None,
-                    created_at=now, seq=doc['seq'], meta={**held['meta'], **keep})
+    def _claim(self, user_dir: str, doc: Dict[str, Any], rec: Dict[str, Any],
+               kind: UploadPurpose, name: str, mime: str, keep: Mapping,
+               now: float) -> Optional[str]:
+        """Record bytes this user already holds as sent now for ``kind``, and
+        save the index; caller holds the lock.  The file's claim of that
+        purpose is refreshed, or added when it has none: a new claim is held
+        to the purpose's size cap ('too_large', read from the file itself,
+        not the size an offer claims) and counts the file against its quota
+        ('quota'); a refused claim changes nothing.  No other purpose's
+        claim changes.  Returns the refusal, or None."""
+        if kind.name not in rec['claims']:
+            if rec['size'] > self._max_file(kind):
+                return 'too_large'
+            if self._usage(user_dir, doc, kind.name) + rec['size'] > kind.quota:
+                return 'quota'
+        self._put_claim(doc, rec, kind.name, name, mime, now)
+        rec['meta'] = {**rec['meta'], **keep}
         self._save_index(user_dir, doc)
-        return True
+        return None
+
+    @staticmethod
+    def _put_claim(doc: Dict[str, Any], rec: Dict[str, Any], purpose: str, name: str,
+                   mime: str, now: float) -> None:
+        """Set ``purpose``'s claim on inbound record ``rec`` as sent now: the
+        newest in commit order, no longer consumed, its turn binding kept."""
+        old = rec['claims'].get(purpose) or {}
+        doc['seq'] += 1
+        rec['claims'][purpose] = {
+            'name': name, 'mime': mime, 'seq': doc['seq'], 'created_at': now,
+            'prompt_id': old.get('prompt_id'), 'request_id': old.get('request_id'),
+            'consumed_at': None}
 
     def _admit(self, user_dir: str, doc: Mapping, size: int, kind: UploadPurpose,
                now: float) -> Optional[str]:
@@ -849,9 +984,7 @@ class UserFileStore:
             return {'type': 'file_ack', 'xid': xid, 'i': i}
 
     def _held(self, user_dir: str, uid: str, xid: str, box: str = 'in') -> Optional[dict]:
-        rec = self._load_index(user_dir, uid)['files'][box].get(xid)
-        return rec if rec is not None and os.path.isfile(self._file_path(user_dir, box, rec)) \
-            else None
+        return self._on_disk(user_dir, self._load_index(user_dir, uid), box, xid)
 
     def commit(self, user_id, xid) -> Dict[str, Any]:
         """Finish an upload: ``file_done {xid}`` once the whole file hashes to
@@ -859,6 +992,7 @@ class UserFileStore:
         when every chunk is there but the file does not hash to ``xid`` (the
         upload then starts over: ``missing`` is every chunk).  The file is
         hashed outside the user's lock; meanwhile an abort of it is ``busy``.
+        Bytes put meanwhile through the other door gain the upload's claim.
         """
         uid = user_key(user_id)
         if not is_xid(xid):
@@ -899,32 +1033,38 @@ class UserFileStore:
                     part['touched_at'] = self._clock()
                     self._save_part(user_dir, part)
                     return {'type': 'file_corrupt', 'xid': xid, 'missing': [[0, part['n'] - 1]]}
-                self._file_away(user_dir, uid, xid, part, data_path)
+                self._file_away(user_dir, self._load_index(user_dir, uid), xid, part,
+                                data_path)
+                _remove(self._part_paths(user_dir, xid)[1])
                 return {'type': 'file_done', 'xid': xid}
         finally:
             with lock:
                 _COMMITTING.discard(key)
 
-    def _file_away(self, user_dir: str, uid: str, xid: str, part: Mapping,
+    def _file_away(self, user_dir: str, doc: Dict[str, Any], xid: str, part: Mapping,
                    data_path: str) -> None:
-        """Move a verified upload into the inbox (caller holds the lock).
+        """File a verified upload at ``data_path`` into the inbox as
+        ``part``'s purpose's claim (caller holds the lock; ``doc`` is the
+        index just read).  When the inbox already holds the bytes (put
+        meanwhile through the other door), they gain the claim and the
+        upload's copy is removed.
 
-        The record is written first: a crash before the rename leaves a
+        A new record is written first: a crash before the rename leaves a
         record without a file, which every reader skips and the next commit
         of the same upload rewrites."""
-        doc = self._load_index(user_dir, uid)
-        doc['seq'] += 1
-        name = xid + _EXT.get(part['mime'], '')
-        doc['files']['in'][xid] = {
-            'file': name, 'name': part['name'], 'mime': part['mime'], 'size': part['size'],
-            'purpose': part['purpose'], 'seq': doc['seq'], 'created_at': self._clock(),
-            'meta': dict(part['meta']), 'prompt_id': None, 'request_id': None,
-            'consumed_at': None, 'replied': False, 'fetched': False, 'fetched_at': None,
-        }
+        rec = self._on_disk(user_dir, doc, 'in', xid)
+        fresh = rec is None
+        if fresh:
+            rec = doc['files']['in'][xid] = {'file': xid + _EXT.get(part['mime'], ''),
+                                             'size': part['size'], 'meta': {}, 'claims': {}}
+        rec['meta'] = {**rec['meta'], **part['meta']}
+        self._put_claim(doc, rec, part['purpose'], part['name'], part['mime'], self._clock())
         self._save_index(user_dir, doc)
-        os.makedirs(os.path.join(user_dir, 'in'), exist_ok=True)
-        os.replace(data_path, os.path.join(user_dir, 'in', name))
-        _remove(self._part_paths(user_dir, xid)[1])
+        if fresh:
+            os.makedirs(os.path.join(user_dir, 'in'), exist_ok=True)
+            os.replace(data_path, os.path.join(user_dir, 'in', rec['file']))
+        else:
+            _remove(data_path)
 
     def abort(self, user_id, xid) -> Dict[str, Any]:
         """Drop an upload in progress and its sidecar: ``file_aborted {xid}``
@@ -951,9 +1091,11 @@ class UserFileStore:
         record a commit's: answers ``file_done {xid}``, or ``file_refused
         {reason[, xid]}`` -- bad_offer (an unknown purpose, an empty file),
         bad_name, bad_mime, too_large, quota or no_space.  Bytes this user
-        already holds are one file, recorded as uploaded again (as an offer
-        of them is).  A refusal leaves nothing behind.  Runs this user's GC
-        first, as an offer does.
+        already holds are one file: they are recorded as sent now for
+        ``purpose`` (as an offer of them is), a new claim within that
+        purpose's size cap and quota, and no other purpose's claim changes.
+        A refusal leaves nothing behind.  Runs this user's GC first, as an
+        offer does.
         """
         uid = user_key(user_id)
         kind = self._purpose(purpose)
@@ -992,26 +1134,33 @@ class UserFileStore:
                 now = self._clock()
                 doc = self._load_index(user_dir, uid)
                 self._gc_user(user_dir, doc, now)
-                if self._refresh_held(user_dir, doc, xid, name, mime, purpose, keep, now):
-                    return {'type': 'file_done', 'xid': xid}
-                # The bytes are on the disk already: only the margin is left to keep.
-                refusal = self._room(user_dir, doc, size, kind, 0)
-                if refusal:
-                    return _refused(refusal, xid)
-                self._file_away(user_dir, uid, xid, {'name': name, 'mime': mime, 'size': size,
-                                                     'purpose': purpose, 'meta': keep}, tmp)
-                return {'type': 'file_done', 'xid': xid}
+                held = self._on_disk(user_dir, doc, 'in', xid)
+                if held is not None:
+                    refusal = self._claim(user_dir, doc, held, kind, name, mime, keep, now)
+                else:
+                    # The bytes are on the disk already: only the margin is left to keep.
+                    refusal = self._room(user_dir, doc, size, kind, 0)
+                    if not refusal:
+                        self._file_away(user_dir, doc, xid, {'name': name, 'mime': mime,
+                                                             'size': size, 'purpose': purpose,
+                                                             'meta': keep}, tmp)
+                return _refused(refusal, xid) if refusal else {'type': 'file_done', 'xid': xid}
         finally:
             _remove(tmp)
 
     def delete(self, user_id, xid, *, purpose: Optional[str] = None) -> bool:
-        """Remove one of this user's inbound files, and its record: what she
-        deletes from her chat attachments.  With ``purpose``, only a file of
-        that purpose.  True when it was there and is gone; False for an xid
-        that is not in her inbox (another user's, an outbound reel, a
-        malformed one), a file of another purpose, or a file another handle
-        holds open (logged; the call can be repeated)."""
+        """Remove one of this user's inbound files: what she deletes from her
+        chat attachments.  With ``purpose``, only that purpose's claim on it
+        goes, and the file stays for its other purposes (her chat attachment
+        deleted, the same bytes stay her reel clip); without, the file goes
+        under every purpose.  The file and its record go with the last claim.
+        True when it was there and is gone; False for an xid that is not in
+        her inbox (another user's, an outbound reel, a malformed one), a file
+        not held for ``purpose``, or a file another handle holds open (logged;
+        the call can be repeated).  A purpose the registry does not have
+        raises ValueError."""
         uid = user_key(user_id)
+        self._known_purpose(purpose)
         if not is_xid(xid):
             return False
         user_dir = self._user_dir(uid)
@@ -1020,24 +1169,33 @@ class UserFileStore:
         with _lock_for(user_dir):
             doc = self._load_index(user_dir, uid)
             rec = doc['files']['in'].get(xid)
-            if rec is None or (purpose is not None and rec['purpose'] != purpose):
+            if rec is None or (purpose is not None and purpose not in rec['claims']):
                 return False
             path = self._file_path(user_dir, 'in', rec)
             there = os.path.isfile(path)
-            if not _remove(path):
+            if purpose is not None and len(rec['claims']) > 1:
+                del rec['claims'][purpose]
+            elif _remove(path):
+                del doc['files']['in'][xid]
+            else:
                 return False
-            del doc['files']['in'][xid]
             self._save_index(user_dir, doc)
             return there
 
     # ── inbound: turns use the files ──
 
-    def bind(self, user_id, xids: Iterable[str], *, prompt_id, request_id) -> List[StoredFile]:
+    def bind(self, user_id, xids: Iterable[str], *, prompt_id, request_id,
+             purpose: Optional[str] = None) -> List[StoredFile]:
         """Tie inbound files to a chat turn; returns the bound files in the
-        order given.  An xid that is not in this user's inbox is skipped and
-        logged.  Binding a consumed file makes it usable again (the turn
-        asked for it)."""
+        order given.  What is bound is one purpose's claim on each file:
+        ``purpose``'s, or without one the purpose the file was last sent for
+        (a reference that names no purpose means the file as she last sent
+        it), so binding never moves another purpose's file off its turn.  An
+        xid that is not in this user's inbox, or not held for ``purpose``, is
+        skipped and logged.  Binding a consumed claim makes it usable again
+        (the turn asked for it)."""
         uid = user_key(user_id)
+        self._known_purpose(purpose)
         pid, rid = _turn_id(prompt_id, 'prompt_id'), _turn_id(request_id, 'request_id')
         if isinstance(xids, str):
             xids = [xids]
@@ -1052,21 +1210,31 @@ class UserFileStore:
             doc = self._load_index(user_dir, uid)
             bound = []
             for x in wanted:
-                rec = doc['files']['in'].get(x)
-                if rec is None or not os.path.isfile(self._file_path(user_dir, 'in', rec)):
+                rec = self._on_disk(user_dir, doc, 'in', x)
+                if rec is None:
                     logger.info('user_file_store: bind skipped %s, not in the inbox', x[:12])
                     continue
-                rec.update(prompt_id=pid, request_id=rid, consumed_at=None)
-                bound.append(self._stored(user_dir, uid, 'in', x, rec))
+                which = purpose if purpose is not None else self._newest_claim(rec)
+                if which not in rec['claims']:
+                    logger.info('user_file_store: bind skipped %s, not held as %s',
+                                x[:12], which)
+                    continue
+                rec['claims'][which].update(prompt_id=pid, request_id=rid, consumed_at=None)
+                bound.append(self._stored(user_dir, uid, 'in', x, self._view(rec, which)))
             if bound:
                 self._save_index(user_dir, doc)
             return bound
 
     def query_inbox(self, user_id, *, prompt_id=None, request_id=None, purpose=None,
                     max_age_s=None, unconsumed_only=True) -> List[StoredFile]:
-        """Inbound files in upload (commit) order.  Each filter applies only
-        when given: ``prompt_id=None`` means any prompt, not unbound files."""
+        """Inbound files in upload (commit) order, one per claim: a file held
+        for two purposes is listed under each, unless ``purpose`` picks one.
+        Each filter applies only when given and reads the claim (its turn,
+        its age, its consumption): ``prompt_id=None`` means any prompt, not
+        unbound files.  A purpose the registry does not have raises
+        ValueError."""
         uid = user_key(user_id)
+        self._known_purpose(purpose)
         pid, rid = _turn_id(prompt_id, 'prompt_id'), _turn_id(request_id, 'request_id')
         user_dir = self._user_dir(uid)
         with _lock_for(user_dir):
@@ -1081,9 +1249,11 @@ class UserFileStore:
                     and (not unconsumed_only or r.get('consumed_at') is None)]
 
     def mark_consumed(self, user_id, xids: Iterable[str]) -> None:
-        """Record that a turn (a reel) used these inbound files now; the GC
-        removes each its purpose's after_use_s later (a logo, or a chat
-        attachment, is kept)."""
+        """Record that a turn (a reel) used these inbound files now, under
+        every purpose they are held for (the turn used the bytes).  Each
+        claim then goes its own purpose's after_use_s later (a clip or a
+        song a day later; a logo, or a chat attachment, is kept), and the
+        file with its last claim."""
         uid = user_key(user_id)
         if isinstance(xids, str):
             xids = [xids]
@@ -1094,7 +1264,8 @@ class UserFileStore:
             for x in xids or ():
                 rec = doc['files']['in'].get(x) if is_xid(x) else None
                 if rec is not None:
-                    rec['consumed_at'] = now
+                    for claim in rec['claims'].values():
+                        claim['consumed_at'] = now
                     changed = True
             if changed:
                 self._save_index(user_dir, doc)
@@ -1265,28 +1436,46 @@ class UserFileStore:
 
     # ── lookups ──
 
-    def resolve(self, user_id, xid, *, box: Optional[str] = None) -> Optional[StoredFile]:
+    def resolve(self, user_id, xid, *, box: Optional[str] = None,
+                purpose: Optional[str] = None) -> Optional[StoredFile]:
         """This user's committed file ``xid`` (inbox first, then outbox, or
-        only ``box``), or None.  A record whose file is gone is None."""
+        only ``box``), or None.  A record whose file is gone is None.  An
+        inbound file is seen through one claim: ``purpose``'s (then only the
+        inbox is looked in, and a file not held for it is None), or without
+        one its first claim in PURPOSES order, so the answer is stable.  A
+        purpose the registry does not have, or a purpose with box 'out',
+        raises ValueError."""
         uid = user_key(user_id)
         if box is not None and box not in BOXES:
             raise ValueError('box must be one of %s, got %r' % (BOXES, box))
+        self._known_purpose(purpose)
+        if purpose is not None and box == 'out':
+            raise ValueError('a purpose names an inbound claim; the outbox has none')
         if not is_xid(xid):
             return None
         user_dir = self._user_dir(uid)
+        boxes = (box,) if box else (('in',) if purpose is not None else BOXES)
         with _lock_for(user_dir):
             doc = self._load_index(user_dir, uid)
-            for b in ((box,) if box else BOXES):
-                rec = doc['files'][b].get(xid)
-                if rec is not None and os.path.isfile(self._file_path(user_dir, b, rec)):
+            for b in boxes:
+                rec = self._on_disk(user_dir, doc, b, xid)
+                if rec is None:
+                    continue
+                if b == 'out':
                     return self._stored(user_dir, uid, b, xid, rec)
+                which = purpose if purpose is not None else self._first_claim(rec)
+                if which in rec['claims']:
+                    return self._stored(user_dir, uid, b, xid, self._view(rec, which))
         return None
 
     def usage(self, user_id, purpose: Optional[str] = None) -> int:
         """Bytes this user holds: committed files plus the full size of each
-        upload in progress (what the quota counts); with ``purpose``, that
-        purpose's only (what its own quota counts)."""
+        upload in progress, each file once (what the quota counts); with
+        ``purpose``, every file held for that purpose (what its own quota
+        counts).  A purpose the registry does not have raises ValueError
+        (OUTBOUND_PURPOSE counts the outbox)."""
         uid = user_key(user_id)
+        self._known_purpose(purpose, outbound=True)
         user_dir = self._user_dir(uid)
         with _lock_for(user_dir):
             return self._usage(user_dir, self._load_index(user_dir, uid), purpose)
@@ -1296,16 +1485,17 @@ class UserFileStore:
     def gc(self, *, now: Optional[float] = None) -> int:
         """Apply the retention windows to every user; returns files removed.
 
-        Removes: uploads untouched for part_ttl_s; an inbound file its
-        purpose's after_use_s after a turn used it, or its unused_s after
-        upload if none did (a clip or a song: a day, or three; a chat
-        attachment stays until she deletes it); of a newest_only purpose (a
-        logo) every file but the newest; an inbound file whose purpose is no
-        longer registered once older than part_ttl_s; outbound files
+        Retention is per claim, and an inbound file goes with its last claim.
+        A claim goes: its purpose's after_use_s after a turn used the file,
+        or its unused_s after it was sent if none did (a clip or a song: a
+        day, or three; a chat attachment stays until she deletes it); of a
+        newest_only purpose (a logo), every claim but the newest; of a
+        purpose no longer registered, once older than part_ttl_s.  Also
+        removed: uploads untouched for part_ttl_s; outbound files
         outbox_after_fetch_s after the fetch, or outbox_max_s after creation;
         and files no record or upload refers to once older than part_ttl_s
-        (left by a crash).  A file another handle holds open stays for the
-        next run.
+        (left by a crash).  A file another handle holds open stays, with its
+        claims, for the next run.
         """
         now = self._clock() if now is None else now
         root = self.root
@@ -1326,7 +1516,7 @@ class UserFileStore:
 
     def _gc_user(self, user_dir: str, doc: Dict[str, Any], now: float) -> int:
         """One user's GC pass over ``doc`` (caller holds the lock); saves
-        the index when a record goes.  Returns files removed."""
+        the index when a record or a claim goes.  Returns files removed."""
         p = self.policy
         removed, changed = 0, False
         dkey = _dir_key(user_dir)
@@ -1339,10 +1529,10 @@ class UserFileStore:
             else:
                 live_parts.add(part['xid'])
         newest: Dict[str, str] = {}             # newest_only purpose -> its newest xid
-        for x, r in self._live(user_dir, doc, 'in'):   # commit order: the last one wins
-            kind = self.purposes.get(r['purpose'])
+        for x, view in self._live(user_dir, doc, 'in'):   # claims in commit order: last wins
+            kind = self.purposes.get(view['purpose'])
             if kind is not None and kind.newest_only:
-                newest[r['purpose']] = x
+                newest[view['purpose']] = x
         for box in BOXES:
             records = doc['files'][box]
             for x in list(records):
@@ -1352,43 +1542,57 @@ class UserFileStore:
                     del records[x]
                     changed = True
                     continue
-                if self._expired(box, x, rec, now, newest):
-                    if _remove(path):
-                        del records[x]
-                        removed += 1
+                if box == 'out':
+                    gone = self._outbound_expired(rec, now)
+                else:
+                    stale = [purpose for purpose, claim in rec['claims'].items()
+                             if self._claim_expired(x, purpose, claim, now, newest)]
+                    gone = len(stale) == len(rec['claims'])
+                    if stale and not gone:          # the file stays for its other claims
+                        for purpose in stale:
+                            del rec['claims'][purpose]
                         changed = True
+                if gone and _remove(path):
+                    del records[x]
+                    removed += 1
+                    changed = True
         removed += self._sweep_unreferenced(user_dir, doc, live_parts, now)
         if changed and doc.get('user_id'):
             self._save_index(user_dir, doc)
         return removed
 
-    def _expired(self, box: str, xid: str, rec: Mapping, now: float,
-                 newest: Mapping[str, str]) -> bool:
+    def _outbound_expired(self, rec: Mapping, now: float) -> bool:
         p = self.policy
-        if box == 'out':
-            fetched_at = rec.get('fetched_at')
-            return (now - rec['created_at'] > p['outbox_max_s']
-                    or (rec['fetched'] and fetched_at is not None
-                        and now - fetched_at > p['outbox_after_fetch_s']))
-        kind = self.purposes.get(rec['purpose'])
+        fetched_at = rec.get('fetched_at')
+        return (now - rec['created_at'] > p['outbox_max_s']
+                or (rec['fetched'] and fetched_at is not None
+                    and now - fetched_at > p['outbox_after_fetch_s']))
+
+    def _claim_expired(self, xid: str, purpose: str, claim: Mapping, now: float,
+                       newest: Mapping[str, str]) -> bool:
+        kind = self.purposes.get(purpose)
         if kind is None:
-            return now - rec['created_at'] > p['part_ttl_s']
+            return now - claim['created_at'] > self.policy['part_ttl_s']
         if kind.newest_only:
             return xid != newest.get(kind.name)
-        used = rec.get('consumed_at')
+        used = claim.get('consumed_at')
         if used is not None:
             return kind.after_use_s is not None and now - used > kind.after_use_s
-        return kind.unused_s is not None and now - rec['created_at'] > kind.unused_s
+        return kind.unused_s is not None and now - claim['created_at'] > kind.unused_s
 
     def _sweep_unreferenced(self, user_dir: str, doc: Mapping, live_parts: set,
                             now: float) -> int:
         """Remove files in in/, out/ and part/ that nothing refers to, once
-        older than part_ttl_s (a young one may be a copy in progress)."""
+        older than part_ttl_s (a young one may be a copy in progress, such
+        as put_file's upload being received).  A file's age is read against
+        the earlier of ``now`` and the wall clock that wrote its mtime, so a
+        store clock running ahead never makes a file just written look old."""
         keep = {
             'in': {r['file'] for r in doc['files']['in'].values()},
             'out': {r['file'] for r in doc['files']['out'].values()},
             'part': {x + ext for x in live_parts for ext in ('.part', '.json')},
         }
+        at = min(now, time.time())
         removed = 0
         for sub, names in keep.items():
             folder = os.path.join(user_dir, sub)
@@ -1400,7 +1604,7 @@ class UserFileStore:
                 if entry.name in names or not entry.is_file():
                     continue
                 try:
-                    old = now - entry.stat().st_mtime > self.policy['part_ttl_s']
+                    old = at - entry.stat().st_mtime > self.policy['part_ttl_s']
                 except OSError:
                     continue
                 if old and _remove(entry.path):

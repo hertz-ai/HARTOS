@@ -2,9 +2,10 @@
 
 Reel Studio (plan WS-8a).  The phone uploads clips, a logo and song audio
 into the user file store (core.user_file_store) over its device link, and a
-/chat turn carries only references to them (plan 4.2(e)), in the ONE
-attachments shape the chat mirror documents (ConversationEntry.attachments,
-U9; amendment A9 a)::
+device sends chat attachments into the same store over HTTP (Nunba's
+desktop/file_sync); a /chat turn carries only references to them (plan
+4.2(e)), in the ONE attachments shape the chat mirror documents
+(ConversationEntry.attachments, U9; amendment A9 a)::
 
     "attachments": [{"file_id": "<64-hex xid>", "sha256": "<the same>",
                      "name": ..., "mime": ..., "size": ...,
@@ -31,9 +32,14 @@ reference was bad or the disk was unhappy.  A reference that does not resolve
 to this user's inbox is dropped and logged.
 
 LAYERING: core/ may not import integrations/, so the contract facts this
-module needs (the inbound purposes) come from the store, and
-tests/unit/test_chat_attachments.py holds them equal to
-integrations.reel_studio.contracts.
+module needs (the inbound purposes, the xid rule) are the store's, and
+integrations.reel_studio.contracts imports the same ones from the store
+(amendment A9 d): there is one copy, not two held equal.
+
+A row's ``purpose`` matters: the same bytes can be held for two purposes
+(her clip is also a chat attachment), and a row binds only the purpose it
+names, or, naming none, the purpose the file was last sent for
+(core.user_file_store.UserFileStore.bind).
 
 parse_inbound is the looser of the two readers of a row.  It reads only
 ``file_id``, ``sha256`` and ``purpose``, so it keeps a row that
@@ -52,7 +58,7 @@ from typing import Any, Dict, List, Mapping, Optional
 # is_xid is the store's own rule for an xid (64 lowercase hex); asked here
 # rather than copied, so a reference is well-formed exactly when the store
 # would accept it.
-from core.user_file_store import INBOUND_PURPOSES, get_user_file_store, is_xid
+from core.user_file_store import INBOUND_PURPOSES, REEL_SOURCE, get_user_file_store, is_xid
 
 logger = logging.getLogger(__name__)
 
@@ -111,31 +117,41 @@ def parse_inbound(raw: Any) -> List[Dict[str, str]]:
 def bind_inbound(user_id, prompt_id, request_id, items) -> List[Dict[str, Any]]:
     """Tie the parsed references of a turn to (user, prompt, request).
 
-    Only files in this user's own inbox are bound; another user's xid or an
-    unknown one is dropped and logged.  Returns the bound files as the
-    store's StoredFile dicts (``StoredFile.to_dict()``), in the order sent.
-    Never raises: a store that refuses or fails binds nothing.
+    Each reference binds the purpose it names, or, naming none, the purpose
+    its file was last sent for; the file's other purposes stay on their own
+    turns.  Only files in this user's own inbox, held for that purpose, are
+    bound; another user's xid, an unknown one or a purpose the file was not
+    sent for is dropped and logged.  Returns the bound files as the store's
+    StoredFile dicts (``StoredFile.to_dict()``), in the order sent.  Never
+    raises: a store that refuses or fails binds nothing (of that purpose).
     """
-    refs = [it['file_id'] for it in (items or ())
+    refs = [(it['file_id'], it.get('purpose')) for it in (items or ())
             if isinstance(it, Mapping) and is_xid(it.get('file_id'))]
     if not refs:
         return []
-    try:
-        bound = get_user_file_store().bind(user_id, refs, prompt_id=prompt_id,
-                                           request_id=request_id)
-    except Exception as e:  # a bad id, a corrupt index, a full disk
-        logger.warning('chat_attachments: could not bind %d attachment(s) for '
-                       'user %r: %s', len(refs), user_id, e)
-        return []
+    bound = []
+    for purpose in dict.fromkeys(p for _x, p in refs):      # each purpose named, in order
+        group = [x for x, p in refs if p == purpose]
+        try:
+            bound += get_user_file_store().bind(user_id, group, prompt_id=prompt_id,
+                                                request_id=request_id, purpose=purpose)
+        except Exception as e:  # a bad id, a corrupt index, a full disk
+            logger.warning('chat_attachments: could not bind %d attachment(s) for '
+                           'user %r: %s', len(group), user_id, e)
+    order: Dict[str, int] = {}
+    for i, (x, _p) in enumerate(refs):
+        order.setdefault(x, i)
+    bound.sort(key=lambda sf: order[sf.xid])                # the order sent
     found = {sf.xid for sf in bound}
-    dropped = [r[:12] for r in refs if r not in found]
+    dropped = [x[:12] for x, _p in refs if x not in found]
     if dropped:
-        logger.warning('chat_attachments: dropped %d attachment(s) not in user '
-                       '%r\'s inbox: %s', len(dropped), user_id, ', '.join(dropped))
+        logger.warning('chat_attachments: dropped %d attachment(s) not bound for user %r '
+                       '(not in the inbox, or not held for the purpose named): %s',
+                       len(dropped), user_id, ', '.join(dropped))
     return [sf.to_dict() for sf in bound]
 
 
-def latest_inbound(user_id, prompt_id, *, request_id=None, purpose='reel_source',
+def latest_inbound(user_id, prompt_id, *, request_id=None, purpose=REEL_SOURCE,
                    max_age_s: Optional[float] = 21600) -> List[Dict[str, Any]]:
     """The inbound files a reel turn may use, in upload order.
 

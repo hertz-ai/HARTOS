@@ -144,8 +144,9 @@ class TestParseInbound:
         assert parse_inbound(raw) == []
 
     def test_the_purposes_are_the_contracts_purposes(self):
-        """core may not import integrations, so the store repeats the values:
-        held equal."""
+        """core may not import integrations, so the store owns the purposes
+        and the contracts import them (A9 d): a purpose a row may name is one
+        the contracts accept."""
         from integrations.reel_studio import contracts
         assert tuple(ufs.INBOUND_PURPOSES) == tuple(contracts.INBOUND_PURPOSES)
         assert not hasattr(contracts, 'ATTACHMENT_KIND'), (
@@ -198,6 +199,55 @@ class TestBindInbound:
             raise OSError('disk gone')
         monkeypatch.setattr(store, 'bind', broken)
         assert bind_inbound('u1', '777', 'rid', parse_inbound([_att('f' * 64)])) == []
+
+    def _clip_also_sent_in_chat(self, store, clock):
+        """Her clip, bound to reel turn (55, r1), whose bytes she later sent
+        in chat as an attachment (the same file, a second purpose)."""
+        clip = b'clip-and-attachment' * 40
+        xid = _upload(store, 'u1', clip)
+        bind_inbound('u1', '55', 'r1', parse_inbound([_att(xid)]))
+        clock.now += 5
+        assert store.put_file('u1', clip, name='v.mp4', mime=MP4,
+                              purpose='chat_attachment')['type'] == 'file_done'
+        return xid
+
+    def test_a_row_binds_the_purpose_it_names_and_leaves_the_others(self, store, clock):
+        xid = self._clip_also_sent_in_chat(store, clock)
+
+        got = bind_inbound('u1', '77', 'r2',
+                           parse_inbound([_att(xid, 'chat_attachment', name='v.mp4')]))
+
+        assert [(g['xid'], g['purpose'], g['prompt_id']) for g in got] == \
+            [(xid, 'chat_attachment', '77')]
+        assert [g['xid'] for g in latest_inbound('u1', '55', request_id='r1')] == [xid]
+
+    def test_a_row_without_purpose_binds_the_file_as_she_last_sent_it(self, store, clock):
+        xid = self._clip_also_sent_in_chat(store, clock)
+
+        got = bind_inbound('u1', '77', 'r2', parse_inbound([_att(xid, purpose=None)]))
+
+        assert [(g['xid'], g['purpose']) for g in got] == [(xid, 'chat_attachment')]
+        assert [g['xid'] for g in latest_inbound('u1', '55', request_id='r1')] == [xid]
+
+    def test_a_row_naming_a_purpose_the_file_was_not_sent_for_is_dropped(self, store, caplog):
+        clip = _upload(store, 'u1', b'only-a-clip' * 40)
+
+        assert bind_inbound('u1', '9', 'r', parse_inbound([_att(clip, 'logo')])) == []
+        assert 'dropped' in caplog.text.lower()
+        assert store.resolve('u1', clip).prompt_id is None
+
+    def test_rows_of_several_purposes_come_back_in_the_order_sent(self, store):
+        clip = _upload(store, 'u1', b'clip' * 60)
+        logo = _upload(store, 'u1', b'\x89PNG' * 60, name='logo.png', mime='image/png',
+                       purpose='logo')
+        song = _upload(store, 'u1', b'ID3' * 60, name='s.mp3', mime='audio/mpeg',
+                       purpose='song_audio')
+
+        got = bind_inbound('u1', '9', 'r', parse_inbound(
+            [_att(song, 'song_audio'), _att(clip), _att(logo, 'logo')]))
+
+        assert [(g['xid'], g['purpose']) for g in got] == \
+            [(song, 'song_audio'), (clip, 'reel_source'), (logo, 'logo')]
 
 
 # ── latest_inbound: what a reel turn sees ───────────────────────────────

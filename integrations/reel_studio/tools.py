@@ -197,10 +197,11 @@ def _store():
 
 
 def _clips(turn: _Turn, rid: Optional[str], named: str) -> List[Dict[str, Any]]:
-    """The clips to use: the ids named (hers, purpose reel_source), else this
-    turn's, else her newest unused batch for this agent."""
+    """The clips to use: the ids named (hers, held as reel clips: the same
+    bytes may also be her chat attachment), else this turn's, else her
+    newest unused batch for this agent."""
     from core import chat_attachments
-    from core.user_file_store import is_xid
+    from core.user_file_store import REEL_SOURCE, is_xid
     from integrations.reel_studio.pipeline import MAX_CLIPS
     if named:
         store, out, seen = _store(), [], set()
@@ -209,11 +210,11 @@ def _clips(turn: _Turn, rid: Optional[str], named: str) -> List[Dict[str, Any]]:
                 continue
             seen.add(ref)
             try:
-                held = store.resolve(turn.user_id, ref, box='in')
+                held = store.resolve(turn.user_id, ref, purpose=REEL_SOURCE)
             except Exception as e:
                 logger.warning('reel tools: clip %s not resolved: %s', ref[:12], e)
                 held = None
-            if held is not None and held.purpose == 'reel_source':
+            if held is not None:
                 out.append(held.to_dict())
         return out[:MAX_CLIPS]
     files = chat_attachments.latest_inbound(turn.user_id, turn.prompt_id, request_id=rid) \
@@ -225,11 +226,12 @@ def _clips(turn: _Turn, rid: Optional[str], named: str) -> List[Dict[str, Any]]:
 
 def _song_audio(turn: _Turn, rid: Optional[str]) -> Optional[Dict[str, Any]]:
     from core import chat_attachments
+    from core.user_file_store import SONG_AUDIO
     files = chat_attachments.latest_inbound(turn.user_id, turn.prompt_id, request_id=rid,
-                                            purpose='song_audio') if rid else []
+                                            purpose=SONG_AUDIO) if rid else []
     if not files:
         files = chat_attachments.latest_inbound(turn.user_id, turn.prompt_id,
-                                                purpose='song_audio')
+                                                purpose=SONG_AUDIO)
     return files[-1] if files else None
 
 
@@ -242,9 +244,10 @@ def _logo_path(turn: _Turn, profile: Mapping) -> Optional[str]:
     profile first): uploading a logo is how she changes it, and the store's
     retention keeps only her newest logo (user_file_store GC), so an older
     one the profile still names is about to go anyway."""
+    from core.user_file_store import LOGO
     store = _store()
     try:
-        logos = store.query_inbox(turn.user_id, purpose='logo', unconsumed_only=False)
+        logos = store.query_inbox(turn.user_id, purpose=LOGO, unconsumed_only=False)
     except Exception as e:
         logger.warning('reel tools: logos of %s not read: %s', turn.user_id, e)
         logos = []

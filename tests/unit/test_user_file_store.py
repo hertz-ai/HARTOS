@@ -29,6 +29,7 @@ import random
 import subprocess
 import sys
 import threading
+import time
 
 import pytest
 
@@ -1248,6 +1249,7 @@ def test_source_guard_the_contract_facts_are_the_stores_own():
     for name in ('INBOUND_PURPOSES', 'INBOUND_MIMES', 'INBOUND_META_KEYS', 'OUTBOUND_PURPOSE'):
         assert getattr(C, name) is getattr(ufs, name), name
     assert C.is_xid is ufs.is_xid and C.is_file_name is ufs.is_file_name
+    assert C.is_capture_ms is ufs.is_capture_ms
 
 
 def test_the_user_rule_and_the_folder_name_are_public(store, root):
@@ -1278,3 +1280,312 @@ def test_a_stored_file_round_trips_through_json(store):
                                      meta={'duration_ms': 1500}))
 
     assert StoredFile(**json.loads(json.dumps(got.to_dict()))) == got
+
+
+# ── one file, one claim per purpose (review of ba27dfa94) ─────────────────
+#
+# The same bytes can be her chat attachment and her reel clip, or her logo
+# and a picture she sent in chat.  The store keeps them as one file with a
+# claim per purpose: each claim keeps its own name, binding, consumption,
+# retention and quota, and the file goes only when no claim is left.
+
+def put_as(store, user, data, purpose, *, name, mime, prompt_id=None, request_id=None):
+    """Put ``data`` for ``purpose`` through the HTTP door; bind it when asked."""
+    assert store.put_file(user, data, name=name, mime=mime,
+                          purpose=purpose)['type'] == 'file_done'
+    xid = sha(data)
+    if prompt_id is not None:
+        store.bind(user, [xid], prompt_id=prompt_id, request_id=request_id, purpose=purpose)
+    return xid
+
+
+def inbox(store, user, purpose, **kw):
+    return [(f.xid, f.name, f.prompt_id) for f in
+            store.query_inbox(user, purpose=purpose, unconsumed_only=False, **kw)]
+
+
+def test_a_chat_attachment_outlives_the_reel_that_used_the_same_clip(store, clock):
+    # (A) She sends a video to her agent, later picks the same clip for a reel.
+    clip = blob(60 * KB, 90)
+    xid = put_as(store, 'u1', clip, 'chat_attachment', name='party.mp4', mime='video/mp4')
+
+    assert store.offer('u1', 'VID_9.mp4', len(clip), xid, 'video/mp4',
+                       'reel_source') == {'type': 'file_have', 'xid': xid}
+    store.mark_consumed('u1', [xid])
+    clock.now += ufs.PURPOSES['reel_source'].after_use_s + 3600
+
+    assert store.gc() == 0                                # her attachment keeps the file
+    kept = store.resolve('u1', xid, purpose='chat_attachment')
+    assert kept is not None and read(kept.path) == clip and kept.name == 'party.mp4'
+    assert store.resolve('u1', xid, purpose='reel_source') is None   # the reel's claim went
+    assert inbox(store, 'u1', 'reel_source') == []
+
+
+def test_her_logo_stays_her_logo_when_she_sends_it_in_chat(store, clock):
+    # (B) The same PNG uploaded as her logo, then sent in chat.
+    png = b'\x89PNG\r\n\x1a\n' + blob(8 * KB, 91)
+    xid = upload(store, 'u1', png, name='logo.png', mime='image/png', purpose='logo')
+    clock.now += 60
+
+    assert store.put_file('u1', png, name='IMG_20261014.png', mime='image/png',
+                          purpose='chat_attachment') == {'type': 'file_done', 'xid': xid}
+
+    assert inbox(store, 'u1', 'logo') == [(xid, 'logo.png', None)]
+    assert inbox(store, 'u1', 'chat_attachment') == [(xid, 'IMG_20261014.png', None)]
+    assert store.gc(now=clock.now + 365 * 24 * HOUR) == 0
+    assert inbox(store, 'u1', 'logo') == [(xid, 'logo.png', None)]
+
+
+def test_a_bound_reel_clip_stays_bound_when_the_same_bytes_arrive_as_a_chat_attachment(store):
+    # (C) A clip bound to prompt 55 is pushed again as a chat attachment.
+    clip = blob(50 * KB, 92)
+    xid = upload(store, 'u1', clip, name='VID_1.mp4')
+    store.bind('u1', [xid], prompt_id='55', request_id='r1')
+
+    assert put_as(store, 'u1', clip, 'chat_attachment', name='VID_1.mp4',
+                  mime='video/mp4') == xid
+
+    assert [f.xid for f in store.query_inbox('u1', prompt_id='55', request_id='r1',
+                                             purpose='reel_source')] == [xid]
+    assert inbox(store, 'u1', 'chat_attachment') == [(xid, 'VID_1.mp4', None)]
+
+
+def test_a_second_purpose_for_held_bytes_is_held_to_that_purposes_quota(root, clock):
+    # (D) A claim counts against its own purpose's quota, or it is refused.
+    store = UserFileStore(root, purposes={'chat_attachment': {'quota': 100 * KB}},
+                          disk_free=lambda p: 1 << 40, clock=clock)
+    clip = blob(60 * KB, 93)
+    xid = upload(store, 'u1', clip)
+    put_as(store, 'u1', pdf(50 * KB, 94), 'chat_attachment', name='a.pdf',
+           mime='application/pdf')
+
+    assert store.put_file('u1', clip, name='VID.mp4', mime='video/mp4',
+                          purpose='chat_attachment') == {'type': 'file_refused',
+                                                         'reason': 'quota', 'xid': xid}
+    assert store.offer('u1', 'VID.mp4', len(clip), xid, 'video/mp4',
+                       'chat_attachment') == {'type': 'file_refused', 'reason': 'quota',
+                                              'xid': xid}
+    assert store.usage('u1', purpose='chat_attachment') == 50 * KB + len(b'%PDF-1.7\n')
+    assert store.resolve('u1', xid, purpose='chat_attachment') is None
+    assert inbox(store, 'u1', 'reel_source') == [(xid, 'clip.mp4', None)]   # untouched
+
+
+def test_a_second_purpose_for_held_bytes_is_held_to_that_purposes_size_cap(root, clock):
+    # The cap reads the held file's own size, not the size an offer claims.
+    store = UserFileStore(root, purposes={'chat_attachment': {'max_file': 50 * KB}},
+                          disk_free=lambda p: 1 << 40, clock=clock)
+    clip = blob(60 * KB, 110)
+    xid = upload(store, 'u1', clip)
+
+    assert store.offer('u1', 'VID.mp4', 10, xid, 'video/mp4',
+                       'chat_attachment') == {'type': 'file_refused', 'reason': 'too_large',
+                                              'xid': xid}
+    assert store.resolve('u1', xid, purpose='chat_attachment') is None
+
+
+def test_one_file_held_for_two_purposes_is_one_file_on_disk(store, root):
+    clip = blob(40 * KB, 95)
+    xid = upload(store, 'u1', clip)
+
+    put_as(store, 'u1', clip, 'chat_attachment', name='VID.mp4', mime='video/mp4')
+
+    assert store.usage('u1') == len(clip)                     # the bytes, once
+    assert store.usage('u1', purpose='reel_source') == len(clip)
+    assert store.usage('u1', purpose='chat_attachment') == len(clip)
+    assert [f for f in all_files(root) if f.endswith('.mp4')] == \
+        [os.path.relpath(store.resolve('u1', xid).path, root)]
+
+
+def test_deleting_her_chat_attachment_leaves_her_logo(store):
+    png = b'\x89PNG\r\n\x1a\n' + blob(6 * KB, 96)
+    xid = upload(store, 'u1', png, name='logo.png', mime='image/png', purpose='logo')
+    put_as(store, 'u1', png, 'chat_attachment', name='pic.png', mime='image/png')
+    path = store.resolve('u1', xid).path
+
+    assert store.delete('u1', xid, purpose='chat_attachment') is True
+    assert store.delete('u1', xid, purpose='chat_attachment') is False
+    assert os.path.isfile(path) and inbox(store, 'u1', 'logo') == [(xid, 'logo.png', None)]
+    assert inbox(store, 'u1', 'chat_attachment') == []
+
+    assert store.delete('u1', xid, purpose='logo') is True      # her last claim
+    assert not os.path.exists(path) and store.resolve('u1', xid) is None
+    assert store.usage('u1') == 0
+
+
+def test_delete_without_a_purpose_removes_the_file_under_every_purpose(store):
+    clip = blob(30 * KB, 97)
+    xid = upload(store, 'u1', clip)
+    put_as(store, 'u1', clip, 'chat_attachment', name='v.mp4', mime='video/mp4')
+    path = store.resolve('u1', xid).path
+
+    assert store.delete('u1', xid) is True
+
+    assert not os.path.exists(path)
+    assert store.query_inbox('u1', unconsumed_only=False) == []
+
+
+def test_a_row_binds_one_purpose_and_a_bare_one_the_purpose_last_sent(store, clock):
+    clip = blob(30 * KB, 98)
+    xid = upload(store, 'u1', clip)
+    store.bind('u1', [xid], prompt_id='55', request_id='r1', purpose='reel_source')
+    clock.now += 5
+    put_as(store, 'u1', clip, 'chat_attachment', name='v.mp4', mime='video/mp4')
+
+    bound = store.bind('u1', [xid], prompt_id='77', request_id='r2')
+
+    assert [(f.xid, f.purpose, f.prompt_id) for f in bound] == \
+        [(xid, 'chat_attachment', '77')]
+    assert inbox(store, 'u1', 'reel_source') == [(xid, 'clip.mp4', '55')]
+    assert store.bind('u1', [xid], prompt_id='9', request_id='r', purpose='logo') == []
+    assert inbox(store, 'u1', 'reel_source') == [(xid, 'clip.mp4', '55')]
+
+
+def test_a_bare_lookup_reads_the_file_under_its_first_registered_purpose(store, clock):
+    clip = blob(30 * KB, 99)
+    xid = put_as(store, 'u1', clip, 'chat_attachment', name='v.mp4', mime='video/mp4')
+    clock.now += 5
+    assert store.offer('u1', 'VID.mp4', len(clip), xid, 'video/mp4',
+                       'reel_source') == {'type': 'file_have', 'xid': xid}
+
+    assert store.resolve('u1', xid).purpose == 'reel_source'      # PURPOSES order
+    assert store.resolve('u1', xid, purpose='chat_attachment').name == 'v.mp4'
+    assert [f.purpose for f in store.query_inbox('u1')] == ['chat_attachment', 'reel_source']
+
+
+def test_a_turn_using_the_bytes_consumes_every_claim_but_retention_is_per_claim(store, clock):
+    song = b'ID3' + blob(20 * KB, 100)
+    xid = upload(store, 'u1', song, name='s.mp3', mime='audio/mpeg', purpose='song_audio')
+    put_as(store, 'u1', song, 'chat_attachment', name='s.mp3', mime='audio/mpeg')
+
+    store.mark_consumed('u1', [xid])
+
+    assert store.query_inbox('u1') == []
+    assert store.gc(now=clock.now + ufs.PURPOSES['song_audio'].after_use_s + 1) == 0
+    assert inbox(store, 'u1', 'song_audio') == []
+    assert inbox(store, 'u1', 'chat_attachment') == [(xid, 's.mp3', None)]
+
+
+def test_a_picture_sent_in_chat_does_not_make_an_old_logo_the_newest(store, clock):
+    old = b'\x89PNG' + blob(5 * KB, 101)
+    new = b'\x89PNG' + blob(5 * KB, 102)
+    upload(store, 'u1', old, name='old.png', mime='image/png', purpose='logo')
+    clock.now += 10
+    upload(store, 'u1', new, name='new.png', mime='image/png', purpose='logo')
+    clock.now += 10
+    put_as(store, 'u1', old, 'chat_attachment', name='old.png', mime='image/png')
+
+    assert store.gc() == 0                         # the old bytes stay: her attachment
+    assert inbox(store, 'u1', 'logo') == [(sha(new), 'new.png', None)]
+    clock.now += 10
+    assert store.offer('u1', 'old.png', len(old), sha(old), 'image/png',
+                       'logo')['type'] == 'file_have'      # uploading it again: newest
+    assert store.gc() == 1
+    assert inbox(store, 'u1', 'logo') == [(sha(old), 'old.png', None)]
+
+
+def test_an_upload_resumed_under_another_purpose_is_held_to_that_purposes_quota(root, clock):
+    store = UserFileStore(root, purposes={'chat_attachment': {'quota': 100 * KB}},
+                          disk_free=lambda p: 1 << 40, clock=clock)
+    put_as(store, 'u1', pdf(80 * KB, 103), 'chat_attachment', name='a.pdf',
+           mime='application/pdf')
+    data = blob(150 * KB, 104)
+    store.offer('u1', 'v.mp4', len(data), sha(data), 'video/mp4', 'reel_source', chunk_size=CS)
+    put(store, 'u1', data, 0)
+
+    assert store.offer('u1', 'v.mp4', len(data), sha(data), 'video/mp4', 'chat_attachment',
+                       chunk_size=CS) == {'type': 'file_refused', 'reason': 'quota',
+                                          'xid': sha(data)}
+    resumed = store.offer('u1', 'v.mp4', len(data), sha(data), 'video/mp4', 'reel_source',
+                          chunk_size=CS)
+    assert resumed['missing'] == [[1, 2]]                     # nothing was lost
+
+
+def test_an_upload_committed_after_the_same_bytes_were_put_adds_its_claim(store, root):
+    data = blob(100 * KB, 105)
+    store.offer('u1', 'VID.mp4', len(data), sha(data), 'video/mp4', 'reel_source',
+                chunk_size=CS)
+    for i in range(2):
+        put(store, 'u1', data, i)
+    put_as(store, 'u1', data, 'chat_attachment', name='v.mp4', mime='video/mp4')
+
+    assert store.commit('u1', sha(data)) == {'type': 'file_done', 'xid': sha(data)}
+
+    assert inbox(store, 'u1', 'reel_source') == [(sha(data), 'VID.mp4', None)]
+    assert inbox(store, 'u1', 'chat_attachment') == [(sha(data), 'v.mp4', None)]
+    assert [f for f in all_files(root) if 'part' in f.split(os.sep)] == []
+    assert len([f for f in all_files(root) if f.endswith('.mp4')]) == 1
+
+
+@pytest.mark.parametrize('call', [
+    lambda s: s.query_inbox('u1', purpose='reel_clip'),
+    lambda s: s.resolve('u1', 'a' * 64, purpose='reel_clip'),
+    lambda s: s.bind('u1', ['a' * 64], prompt_id='1', request_id='r', purpose='reel_clip'),
+    lambda s: s.delete('u1', 'a' * 64, purpose='reel_clip'),
+    lambda s: s.resolve('u1', 'a' * 64, box='out', purpose='reel_source'),
+])
+def test_a_purpose_the_registry_does_not_name_is_a_caller_bug(store, call):
+    # A renamed purpose fails loudly instead of reading as an empty inbox.
+    with pytest.raises(ValueError):
+        call(store)
+
+
+def test_the_purpose_names_are_the_registrys(store):
+    names = (ufs.REEL_SOURCE, ufs.LOGO, ufs.SONG_AUDIO, ufs.CHAT_ATTACHMENT)
+    assert names == ('reel_source', 'logo', 'song_audio', 'chat_attachment')
+    assert names == ufs.INBOUND_PURPOSES
+
+
+def test_an_index_of_the_old_schema_is_set_aside_not_misread(store, caplog):
+    xid = upload(store, 'u1', blob(10 * KB, 106))
+    user_dir = os.path.dirname(os.path.dirname(store.resolve('u1', xid).path))
+    old = {'schema': 'hart.user_files.v1', 'user_id': 'u1', 'seq': 1,
+           'files': {'in': {xid: {'file': xid + '.mp4', 'name': 'a.mp4', 'mime': 'video/mp4',
+                                  'size': 10 * KB, 'purpose': 'reel_source', 'seq': 1,
+                                  'created_at': T0, 'meta': {}, 'replied': False,
+                                  'fetched': False}}, 'out': {}}}
+    with open(os.path.join(user_dir, 'index.json'), 'w', encoding='utf-8') as f:
+        json.dump(old, f)
+
+    with caplog.at_level('ERROR', logger='core.user_file_store'):
+        assert store.query_inbox('u1') == []
+
+    assert any('not a hart.user_files' in r.getMessage() for r in caplog.records)
+    assert [n for n in os.listdir(user_dir) if n.startswith('index.corrupt')]
+
+
+def test_put_file_on_a_store_whose_clock_runs_ahead_keeps_the_file(root):
+    # The sweep of unreferenced files ages them by the file system's clock:
+    # a store clock days ahead must not remove the upload being received.
+    ahead = UserFileStore(root, disk_free=lambda p: 1 << 40,
+                          clock=lambda: time.time() + 30 * 24 * HOUR)
+
+    reply = put_doc(ahead, 'u1', pdf(20 * KB, 107))
+
+    assert reply['type'] == 'file_done'
+    assert ahead.resolve('u1', reply['xid']) is not None
+
+
+@pytest.mark.parametrize('captured', [CAPTURED, 1, 0, -5, True, '1760000000000', 1.5e12,
+                                      None, [CAPTURED]])
+def test_the_store_keeps_exactly_the_capture_times_the_contract_accepts(store, captured):
+    data = blob(10 * KB, 108)
+    frame = {'type': 'file_offer', 'name': 'a.mp4', 'size': len(data), 'sha256': sha(data),
+             'mime': 'video/mp4', 'purpose': 'reel_source', 'captured_at': captured}
+
+    xid = upload(store, 'u1', data, meta={'captured_at': captured})
+
+    kept = 'captured_at' in store.resolve('u1', xid).meta
+    assert kept == (C.validate_file_offer(frame) == [])
+    assert kept == (C.ClipSource.from_stored(store.resolve('u1', xid)).captured_at_ms
+                    is not None)
+
+
+@pytest.mark.parametrize('mime,ok', [
+    ('audio/amr', True), ('audio/3gpp', True), ('audio/opus', True), ('image/heif', True),
+    ('video/x-matroska', True), ('text/markdown', True),
+    ('application/octet-stream', False), ('application/zip', False),
+])
+def test_a_chat_attachment_takes_what_a_phone_records(store, mime, ok):
+    reply = put_doc(store, 'u1', blob(4 * KB, 109), name='f.bin', mime=mime)
+
+    assert (reply['type'] == 'file_done') == ok

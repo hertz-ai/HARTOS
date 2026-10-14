@@ -227,6 +227,7 @@ CANONICAL_OWNERS = {
     'OUTBOUND_PURPOSE': 'core/user_file_store.py',
     'is_xid': 'core/user_file_store.py',
     'is_file_name': 'core/user_file_store.py',
+    'is_capture_ms': 'core/user_file_store.py',
     'user_dir_name': 'core/user_file_store.py',
 }
 

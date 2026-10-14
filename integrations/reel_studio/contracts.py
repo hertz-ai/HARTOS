@@ -29,9 +29,10 @@ files that the store (core/user_file_store.py, the one upload service), the
 device door and core/chat_attachments.py need as much as these validators do
 live in the store, and this module imports them from there (amendment A9 d):
 the purposes and their MIME types (INBOUND_PURPOSES, INBOUND_MIMES), the
-offer's meta keys (INBOUND_META_KEYS), OUTBOUND_PURPOSE, and the xid and
-file-name rules (is_xid, is_file_name).  A purpose added to the store's
-registry is one the contracts accept.
+offer's meta keys (INBOUND_META_KEYS), OUTBOUND_PURPOSE, and the xid,
+file-name and capture-time rules (is_xid, is_file_name, is_capture_ms).  A
+purpose added to the store's registry is one the contracts accept, and a
+captured_at the store keeps is one they accept.
 """
 from __future__ import annotations
 
@@ -45,7 +46,8 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 # The store's own facts about inbound files (see LAYERING above).  All are
 # re-exported; OUTBOUND_PURPOSE is read here by the pipeline only.
 from core.user_file_store import (INBOUND_META_KEYS, INBOUND_MIMES, INBOUND_PURPOSES,
-                                  OUTBOUND_PURPOSE, is_file_name, is_xid)  # noqa: F401
+                                  OUTBOUND_PURPOSE, is_capture_ms, is_file_name,  # noqa: F401
+                                  is_xid)
 
 
 def _frozen(value):
@@ -501,7 +503,7 @@ class ClipSource:
                    mime=str(get('mime') or ''), size=int(get('size') or 0),
                    sha256=str(get('sha256') or ''),
                    committed_at=float(get('created_at') or 0.0),
-                   captured_at_ms=captured if _is_int(captured) and captured > 0 else None,
+                   captured_at_ms=captured if is_capture_ms(captured) else None,
                    duration_ms=duration if _is_int(duration) and duration >= 0 else None)
 
 
@@ -1128,10 +1130,6 @@ def validate_outbox_item(item) -> List[str]:
 
 # ── inbound files (phone -> desktop) ──────────────────────────────────────
 
-def _is_capture_ms(v) -> bool:
-    return _is_int(v) and v > 0
-
-
 def _mime_problems(obj, where: str) -> List[str]:
     allowed = INBOUND_MIMES.get(obj['purpose'], frozenset())
     if obj['mime'] not in allowed:
@@ -1155,7 +1153,7 @@ def validate_file_offer(frame) -> List[str]:
         'sha256': (is_xid, '64 lowercase hex'),
         'mime': (_is_str, 'a MIME type'),
         'purpose': (lambda v: v in INBOUND_PURPOSES, 'one of %s' % (INBOUND_PURPOSES,)),
-        'captured_at': (_is_capture_ms, 'epoch milliseconds (an int > 0)'),
+        'captured_at': (is_capture_ms, 'epoch milliseconds (an int > 0)'),
         'duration_ms': (_is_nonneg_int, 'an int >= 0'),
     }, 'file_offer', optional=INBOUND_META_KEYS)
     return problems or _mime_problems(frame, 'file_offer')
@@ -1180,7 +1178,7 @@ def validate_attachment(item) -> List[str]:
         'size': (_is_nonneg_int, 'an int >= 0'),
         'purpose': (lambda v: v in INBOUND_PURPOSES, 'one of %s' % (INBOUND_PURPOSES,)),
         'duration_ms': (_is_nonneg_int, 'an int >= 0'),
-        'captured_at': (_is_capture_ms, 'epoch milliseconds (an int > 0)'),
+        'captured_at': (is_capture_ms, 'epoch milliseconds (an int > 0)'),
     }, 'attachment', optional=('purpose',) + INBOUND_META_KEYS)
     if problems:
         return problems

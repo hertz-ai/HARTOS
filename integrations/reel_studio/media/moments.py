@@ -52,6 +52,7 @@ from dataclasses import replace
 from time import monotonic
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
+from core.config_cache import flag_value
 from core.file_cache import atomic_json_write
 from integrations.reel_studio.contracts import (
     FINAL_LOOK, MOMENTS_SCHEMA, PROGRESSION, STAGES, Keyframe, Moment)
@@ -151,8 +152,6 @@ _FIELD_KEYS = {
     'face_visible': ('face_visible', 'facevisible', 'face'),
 }
 _APPEAL_TEXT = re.compile(r'\s*([-+]?\d+(?:\.\d+)?)\s*(?:/\s*10)?\s*')
-_TRUE = frozenset({'true', 'yes', 'y', '1'})
-_FALSE = frozenset({'false', 'no', 'n', '0'})
 
 #: What changing one label costs the smoothing: a label the model gave is
 #: worth four position guesses (fallback frames' capture-order stages).
@@ -202,17 +201,16 @@ def _appeal(value) -> Optional[float]:
 
 
 def _flag(value) -> Optional[bool]:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)) and value in (0, 1):
-        return bool(value)
-    if isinstance(value, str):
-        word = value.strip().lower()
-        if word in _TRUE:
-            return True
-        if word in _FALSE:
-            return False
-    return None
+    """face_visible as the model said it, or None when it did not say.
+
+    Booleans and words are read by HARTOS's one yes/no table
+    (core.config_cache.flag_value).  A number is an answer only as 0 or 1: a
+    model's 0.7 is a confidence, not a yes, so the Haar face box decides
+    (flag_value reads any non-zero number as yes, right for a setting, wrong
+    for a model's score)."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value not in (0, 1):
+        return None
+    return flag_value(value, None)
 
 
 def _rating(data: Any) -> Optional[Dict[str, Any]]:

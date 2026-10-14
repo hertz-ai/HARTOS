@@ -151,6 +151,11 @@ def test_appeal_is_clamped_to_0_10(raw, appeal):
 @pytest.mark.parametrize('raw,face', [
     (True, True), (False, False), ('yes', True), ('No', False), ('true', True),
     ('false', False), (1, True), (0, False), ('maybe', None),
+    # HARTOS's one yes/no table (core.config_cache.flag_value) ...
+    ('on', True), (' OFF ', False), ('1', True), ('0', False), ('y', None), ('n', None),
+    # ... but a model's number other than 0 or 1 is a confidence, not an
+    # answer: the Haar face box decides.
+    (0.7, None), (2, None), (-1, None),
 ])
 def test_face_visible_is_read_when_it_can_be(raw, face):
     rating = M.parse_rating(json.dumps({'stage': 'lips', 'appeal': 5, 'face_visible': raw}))
