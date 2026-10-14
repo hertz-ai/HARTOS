@@ -120,8 +120,10 @@ def generate_jwt(user_id: str, username: str, role: str = 'flat',
     dispatch._internal_auth_headers passes it, for the metered API's
     self-POST on the customer's behalf), and `rid` the 'rid' claim that
     binds the word to that one turn's request id (task #157).  No login
-    path sets either, so a person's own token never names a lane.
-    Carried by both signers.
+    path sets either, so a person's own token never names a lane.  Both
+    signers add the claims through security.jwt_manager.turn_claims, and
+    a token carrying the lane word lives TURN_TOKEN_EXPIRY seconds
+    (token_lifetime), not the session's TOKEN_EXPIRY.
 
     SECURITY: When the hardened JWTManager is available, ALL JWTs
     are issued through it — including tenant-scoped tokens, which
@@ -138,22 +140,19 @@ def generate_jwt(user_id: str, username: str, role: str = 'flat',
                                          tenant_id=tenant_id, lane=lane, rid=rid)
     if HAS_JWT:
         import uuid
+        from security.jwt_manager import token_lifetime, turn_claims
+        now = int(time.time())
         payload = {
             'user_id': str(user_id),
             'username': username,
             'role': role or 'flat',
             'jti': str(uuid.uuid4()),
-            'iat': int(time.time()),
-            'exp': int(time.time()) + TOKEN_EXPIRY,
+            'iat': now,
+            'exp': now + token_lifetime(TOKEN_EXPIRY, lane),
             'type': 'access',
             'scope': 'local',
         }
-        if tenant_id:
-            payload['tid'] = str(tenant_id)
-        if lane:
-            payload['lane'] = str(lane)
-        if rid:
-            payload['rid'] = str(rid)
+        payload.update(turn_claims(tenant_id, lane, rid))
         return pyjwt.encode(payload, SECRET_KEY, algorithm='HS256')
     return generate_api_token()
 

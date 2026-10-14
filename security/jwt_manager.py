@@ -41,6 +41,44 @@ REFRESH_TOKEN_EXPIRY = int(os.environ.get(
     90 * 86400 if _BUNDLED else 86400 * 7))  # 90 days bundled, 7 days server
 GRACE_PERIOD_EXPIRY = 86400 * 30    # 30 days - accept old tokens during migration
 
+#: Lifetime of a token the node mints for ONE turn it relays on a person's
+#: behalf: the token that carries the 'lane' claim
+#: (chat_contract.chat_turn_request -> dispatch._internal_auth_headers).  It
+#: travels one loopback hop to this node's own /chat and is verified there at
+#: once; five minutes covers that hop and a queue ahead of it with room to
+#: spare, where ACCESS_TOKEN_EXPIRY (an hour on a server, 30 days bundled) is
+#: what made a captured token worth replaying with the same request id
+#: (reviews of af5c75099 and f431b73d7, task #157).
+TURN_TOKEN_EXPIRY = 300
+
+
+def turn_claims(tenant_id=None, lane=None, rid=None):
+    # type: (object, object, object) -> dict
+    """The optional claims of an access token, built ONCE for both signers
+    (JWTManager._generate_token and the legacy encoder in
+    integrations.social.auth.generate_jwt): 'tid' (the commerce tenant),
+    'lane' (the node's word about the one turn the token is minted for) and
+    'rid' (that turn's request id, which binds the word to it).  A claim is
+    present only when its value is given, so a person's own login token
+    carries none of the last two."""
+    claims = {}
+    if tenant_id:
+        claims['tid'] = str(tenant_id)
+    if lane:
+        claims['lane'] = str(lane)
+    if rid:
+        claims['rid'] = str(rid)
+    return claims
+
+
+def token_lifetime(expiry, lane=None):
+    # type: (int, object) -> int
+    """Seconds a token lives: ``expiry`` as the caller asked, cut to
+    TURN_TOKEN_EXPIRY when the token carries the node's lane word, since that
+    token is for one turn and nothing after it.  The one rule for both
+    signers."""
+    return min(int(expiry), TURN_TOKEN_EXPIRY) if lane else int(expiry)
+
 
 class TokenBlocklist:
     """In-memory token blocklist with optional Redis backend."""
@@ -179,7 +217,9 @@ class JWTManager:
     def generate_access_token(self, user_id: str, username: str,
                               tenant_id: str = None, lane: str = None,
                               rid: str = None) -> str:
-        """Generate a short-lived LOCAL access token (1 hour).
+        """Generate a short-lived LOCAL access token (ACCESS_TOKEN_EXPIRY:
+        an hour on a server, 30 days bundled; TURN_TOKEN_EXPIRY when it
+        carries a lane).
 
         Optional `tenant_id` adds a 'tid' claim — used by central
         cloud deploys for tenant isolation. The claim flows through
@@ -194,8 +234,11 @@ class JWTManager:
         taken from a request, and a person's own login token carries none.
         `rid` (the turn's request id) travels beside it as the 'rid' claim
         and binds the word to that one turn: the reader believes the lane
-        only for the request whose id the token names, so a captured token
-        buys nothing for a later turn (task #157).
+        only for the request whose id the token names, and the token lives
+        TURN_TOKEN_EXPIRY seconds (token_lifetime), so a captured token buys
+        nothing for a turn with another request id and nothing at all for
+        long (task #157).  The three claims come from turn_claims, the one
+        builder both signers use.
         """
         return self._generate_token(
             user_id, username, 'access', ACCESS_TOKEN_EXPIRY, scope='local',
@@ -245,23 +288,19 @@ class JWTManager:
             return self._generate_hmac_token(user_id, username)
 
         node_id = _get_node_id()
+        now = int(time.time())
         payload = {
             'user_id': user_id,
             'username': username,
             'jti': str(uuid.uuid4()),
-            'iat': int(time.time()),
-            'exp': int(time.time()) + expiry,
+            'iat': now,
+            'exp': now + token_lifetime(expiry, lane),
             'type': token_type,
             'scope': scope,
             'node_id': node_id,
             'iss': f'node:{node_id}' if scope == 'local' else 'hive:hevolve',
         }
-        if tenant_id:
-            payload['tid'] = str(tenant_id)
-        if lane:
-            payload['lane'] = str(lane)
-        if rid:
-            payload['rid'] = str(rid)
+        payload.update(turn_claims(tenant_id, lane, rid))
         return pyjwt.encode(payload, self._secret_key, algorithm='HS256')
 
     def _generate_hmac_token(self, user_id: str, username: str) -> str:

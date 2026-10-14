@@ -8,12 +8,14 @@ are things /chat can verify itself:
   * the caller's JWT carries the commerce tenant claim (a McGroce shopper or
     store owner, minted by POST /api/commerce/session);
   * the metered API endpoints' own self-POST says so for a paying tier, and
-    the request is the node itself: its own key (auth_source 'api_key') or
-    the JWT it mints for its system identity, neither of which an outside
-    client holds.
+    the word travels with the node's credential: in the body beside the
+    node's own key (auth_source 'api_key'), or as the 'lane' claim of the
+    JWT the node mints for the customer, bound to the turn by its 'rid'
+    claim; neither credential an outside client holds.
 
 Anything else, including a body that merely claims 'lane': 'revenue' over a
-stranger's JWT or body auth, is a user turn.  The daemon lane is not decided
+stranger's JWT, the node's own system JWT or body auth, is a user turn (a JWT
+carries the word as its claim or not at all).  The daemon lane is not decided
 here: the request id's 'daemon_' prefix decides that on the wire
 (is_genuine_user_request), and register_chat_lane leaves the node's own
 daemon turn to it.
@@ -129,6 +131,20 @@ def test_the_lane_claim_buys_the_lane_only_for_the_turn_it_was_minted_for():
                          tenant=TENANT, request_id='msg_other') == 'revenue'
 
 
+def test_a_lane_claim_with_no_rid_buys_nothing_for_a_request_with_no_id():
+    """The ``request_id and`` half of the rid check is load-bearing (review
+    of f431b73d7, F2: read as ``rid or '' == request_id or ''`` it passed
+    every test here): a token with the lane word and no rid must not buy the
+    lane for a /chat call that omits its request_id."""
+    unbound = _decoder({'user_id': 'cust-42', 'lane': 'revenue'})
+    for rid in (None, ''):
+        assert lane_for_chat('tok', {}, 'jwt', decode_jwt=unbound, tenant=TENANT,
+                             request_id=rid) == 'user'
+    assert lane_for_chat('tok', {}, 'jwt', decode_jwt=unbound, tenant=TENANT) == 'user'
+    assert lane_for_chat('tok', {'lane': 'revenue'}, 'jwt', decode_jwt=unbound,
+                         tenant=TENANT, request_id=None) == 'user'
+
+
 # ─── Which org goals earn (dispatch.is_revenue_goal_type) ────────────────────
 
 def test_goals_that_earn_run_on_the_revenue_lane(monkeypatch):
@@ -168,12 +184,21 @@ def test_internal_caller_is_the_nodes_key_or_its_system_jwt():
     assert not is_internal_caller(None, {'user_id': 'system_daemon'}, ())   # no identity named
 
 
-def test_paid_tier_claim_is_trusted_from_the_system_jwt_too():
+def test_the_body_word_beside_the_nodes_system_jwt_is_just_a_word():
+    """A JWT carries the node's word as its claim or not at all.  Nothing
+    mints a system-identity JWT with a body lane (the relay mints the
+    customer's; the daemon's turn and the expert's inner call send no lane
+    field), so the rule that believed one was a carrier with no producer
+    (review of af5c75099, F4) and went with task #157.  is_internal_caller
+    still names the system JWT, for register_chat_lane's daemon-turn and
+    inner-call cases."""
     body = {'prompt': 'x', 'lane': 'revenue'}
     assert lane_for_chat('tok', body, 'jwt', decode_jwt=_decoder({'user_id': 'system_daemon'}),
-                         tenant=TENANT, system_identities=SYSTEM) == 'revenue'
+                         tenant=TENANT) == 'user'
     assert lane_for_chat('tok', body, 'jwt', decode_jwt=_decoder({'user_id': 'u1'}),
-                         tenant=TENANT, system_identities=SYSTEM) == 'user'
+                         tenant=TENANT) == 'user'
+    # Beside the node's key the body is the word's only carrier: unchanged.
+    assert lane_for_chat('', body, 'api_key', tenant=TENANT) == 'revenue'
 
 
 # ─── /chat's one registration decision (register_chat_lane) ──────────────────
@@ -265,19 +290,22 @@ def test_a_stranger_naming_a_goals_request_id_does_not_inherit_its_lane(lanes):
 def test_the_metered_self_post_is_registered_revenue_from_either_credential(lanes):
     """A keyed node sends its key and the word in the body; a keyless node
     sends the customer's JWT with the word as its claim (task #153).  The
-    node's system JWT with the word in the body stays an internal caller's
-    word too (is_internal_caller)."""
+    node's system JWT with the word in the body is nobody's self-POST (no
+    producer; review of af5c75099, F4) and is registered a user turn."""
     from core.request_lane import register_chat_lane
     for n, (auth, tok, dec) in enumerate((
             ('api_key', '', None),
             ('jwt', 'tok', _decoder({'user_id': 'cust-42', 'lane': 'revenue',
-                                     'rid': 'api_1760300000_jwt_1'})),
-            ('jwt', 'tok', _decoder({'user_id': 'system_daemon'})))):
+                                     'rid': 'api_1760300000_jwt_1'})))):
         rid = 'api_1760300000_%s_%d' % (auth, n)
         assert register_chat_lane(rid, tok, {'lane': 'revenue'}, auth, decode_jwt=dec,
                                   tenant=TENANT, system_identities=SYSTEM,
                                   is_genuine=_genuine) == 'revenue'
         assert lanes.lane_for_request(rid) == 'revenue'
+    assert register_chat_lane('api_1760300000_sys', 'tok', {'lane': 'revenue'}, 'jwt',
+                              decode_jwt=_decoder({'user_id': 'system_daemon'}), tenant=TENANT,
+                              system_identities=SYSTEM, is_genuine=_genuine) == 'user'
+    assert lanes.lane_for_request('api_1760300000_sys') == 'user'
     assert register_chat_lane('api_1760300000_free', '', {'lane': 'user'}, 'api_key',
                               tenant=TENANT, is_genuine=_genuine) == 'user'
     # The free tier's customer JWT carries the user lane as its claim.

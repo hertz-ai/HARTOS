@@ -52,30 +52,38 @@ def chat_turn_request(user_id, prompt_id, content: str,
 
     ``fields`` are the request's other /chat keys (create_agent,
     channel_context, media_mode, ...), added after the person, the agent
-    ``prompt_id`` and both request keys.  The body carries a request_id
+    ``prompt_id`` and both request keys (chat_request_fields: ``text``
+    repeats ``prompt``, for the metered relay too, whose /chat reads
+    ``prompt``; a long /analyze document travels twice over the loopback
+    hop, the price of one builder for both dialects, measured by the review
+    of af5c75099).  The body carries a request_id
     (core.chat_client.normalize_chat_body: one a field names passes through,
     else one is minted), so /chat takes it as a person's turn -- ahead of
     the daemons, which yield to it -- and not as background work, which is
     what a turn with no id is (dispatch.is_genuine_user_request; the steward
     rule of 2026-08-09: a conversation-backed turn is priority).
 
-    The headers carry the person's own identity, minted with role 'user' by
-    the one internal-auth helper
-    (agent_engine.dispatch._internal_auth_headers): /chat trusts the token
-    over the body, so a default identity would put every person's turn in
-    one shared agent session (its docstring has the 2026-08-06 incident; the
-    metered API's self-POST had the same collapse until it came here, task
-    #153), and a person sent for is never an administrator.  A token is
-    minted on every tier (or HEVOLVE_API_KEY sent); None only when minting
-    fails (logged): central and regional then answer 401.
+    The headers carry the person's own identity, minted by the one
+    internal-auth helper (agent_engine.dispatch._internal_auth_headers):
+    /chat trusts the token over the body, so a default identity would put
+    every person's turn in one shared agent session (its docstring has the
+    2026-08-06 incident; the metered API's self-POST had the same collapse
+    until it came here, task #153).  The mint is asked for role 'user',
+    never an administrator's; the identity is what the token carries (the
+    hardened signer writes no role claim, the legacy encoder does, and
+    nothing reads one from a JWT).  A token is minted on every tier (or
+    HEVOLVE_API_KEY sent); None only when minting fails (logged): central
+    and regional then answer 401.
 
     A ``lane`` among ``fields`` is the node's own word about the turn
     (core.request_lane; the metered API says 'revenue' for a paying tier).
-    It stays in the body, and when a JWT is minted it is also that token's
-    claim, bound to this turn's request id by the token's 'rid' claim: a
-    person's credential is not the node's, so /chat believes the word from
-    it only as a claim the node's secret signed, and only for the one turn
-    it was signed for (task #157).
+    It stays in the body, which /chat believes beside the node's key, and
+    when a JWT is minted it is also that token's claim, bound to this
+    turn's request id by the token's 'rid' claim and alive for minutes
+    (security.jwt_manager.TURN_TOKEN_EXPIRY): a person's credential is not
+    the node's, so /chat believes the word from it only as a claim the
+    node's secret signed, and only for the request id it was signed for
+    (task #157).
     """
     from core.chat_client import normalize_chat_body
     payload = {"user_id": user_id, "prompt_id": prompt_id,

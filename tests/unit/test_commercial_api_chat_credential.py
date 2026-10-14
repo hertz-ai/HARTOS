@@ -72,11 +72,13 @@ def _resp(status_code, payload):
 def test_metered_chat_self_post_carries_the_customers_credential(
         app_client, passing_auth, route, body, resp_key):
     """Both metered endpoints send the credential dispatch._internal_auth_headers
-    mints, and mint it FOR THE KEY'S OWNER, as a user (chat_turn_request, the
-    one builder of a person's turn sent for them): bare, the self-POST is
-    answered 401 by gate 2 on central/regional; minted with the helper's
-    default identity, every paying customer ran as the node's own
-    system_daemon in one shared agent session (task #153)."""
+    mints, and mint it FOR THE KEY'S OWNER, asking for role 'user'
+    (chat_turn_request, the one builder of a person's turn sent for them;
+    the identity is what the token carries, the role claim only the legacy
+    encoder writes and nothing reads): bare, the self-POST is answered 401
+    by gate 2 on central/regional; minted with the helper's default
+    identity, every paying customer ran as the node's own system_daemon in
+    one shared agent session (task #153)."""
     captured = {}
 
     def fake_post(url, **kwargs):

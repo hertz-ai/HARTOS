@@ -1145,8 +1145,11 @@ DEFAULT_SINGLE_ROLE = 'assistant'
 #: so this set cannot silently fall behind the producers.
 #: The identity the node mints its OWN JWT for when it calls itself with no
 #: person behind the call (dispatch._internal_auth_headers).  A request whose
-#: JWT names it is the node talking to itself: /chat trusts its body's lane
-#: claim on that basis (core.request_lane.is_internal_caller).
+#: JWT names it is the node talking to itself (core.request_lane
+#: .is_internal_caller): /chat leaves such a daemon turn to the lane its goal
+#: registered and lets its claim-less inner call keep a turn's lane.  The
+#: body's lane word /chat believes beside the node's KEY only; a JWT carries
+#: the word as its own claim or not at all (task #157).
 SYSTEM_DAEMON_IDENTITY = 'system_daemon'
 SYSTEM_IDENTITIES = frozenset({SYSTEM_DAEMON_IDENTITY})
 

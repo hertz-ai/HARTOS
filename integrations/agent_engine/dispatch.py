@@ -103,11 +103,12 @@ def _internal_auth_headers(user_id: str = SYSTEM_DAEMON_IDENTITY,
     (core.request_lane: 'revenue' for a paying API tier's turn), carried
     as the minted JWT's 'lane' claim, which /chat believes because only
     the node's secret mints one; ``rid`` is that turn's request id, carried
-    as the 'rid' claim so the word holds for that one turn and a captured
-    token buys nothing later (task #157).  When the key is sent instead,
-    the claim has nowhere to ride and the caller's body carries the word,
-    which /chat believes from the node's key
-    (core.request_lane.is_internal_caller).  Only
+    as the 'rid' claim so the word holds for the request id it names, and
+    such a token lives minutes (security.jwt_manager.TURN_TOKEN_EXPIRY):
+    a captured one buys nothing for a turn with another id (task #157).
+    When the key is sent instead, the claim has nowhere to ride and the
+    caller's body carries the word, which /chat believes beside the node's
+    key only (core.request_lane.lane_for_chat).  Only
     chat_contract.chat_turn_request passes them, for a person's turn
     relayed with that person's own identity (task #153: the metered API's
     self-POST, which used to carry this helper's default identity and so

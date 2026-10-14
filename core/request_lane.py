@@ -11,16 +11,21 @@ Two facts make a turn revenue-bearing, and /chat can verify both itself:
   2. The node itself says ``lane: revenue`` for a paying tier's turn: the
      metered API endpoints' self-POST (commercial_api._metered_backend_chat,
      built for the key's owner by chat_contract.chat_turn_request).  The
-     node's word travels in the credential it sends.  Beside its own key
-     (``auth_source == 'api_key'``) it is the body's ``lane`` field; so is
-     the word beside the JWT the node mints for its own system identity
-     (dispatch._internal_auth_headers' default; is_internal_caller).  In the
-     JWT the node mints for the CUSTOMER it is the token's ``lane`` claim,
-     since only the node's secret mints one (task #153: the relay used to
-     carry the system identity, so every paying customer ran as
-     system_daemon), read only when the token's ``rid`` claim names this
-     request's id, so a captured token buys nothing for a later turn (task
-     #157).  The same word in any other body is just a word.
+     node's word travels with the credential it sends, one carrier per
+     credential.  Beside its own key (``auth_source == 'api_key'``) it is
+     the body's ``lane`` field: a key is a header, no claim rides in it, so
+     the body is the only place for the word there.  In the JWT the node
+     mints for the CUSTOMER it is the token's ``lane`` claim, since only
+     the node's secret mints one (task #153: the relay used to carry the
+     system identity, so every paying customer ran as system_daemon), read
+     only when the token's ``rid`` claim names this request's id, and the
+     token lives minutes (security.jwt_manager.TURN_TOKEN_EXPIRY), so a
+     captured token buys nothing for a turn with another request id and
+     nothing at all for long (task #157).  The same word in any other body
+     is just a word, under anyone's JWT: the node's own system identity
+     included, since nothing mints a system JWT with a body lane (the rule
+     that believed one was a carrier with no producer, review of af5c75099,
+     and went with task #157).
 
 Everything else is a user turn.  The daemon lane is not decided here: the
 request id's ``daemon_`` prefix decides it on the wire
@@ -91,22 +96,28 @@ def is_internal_caller(auth_source, jwt_payload, system_identities=()):
 
 
 def lane_for_chat(bearer_token, body, auth_source, decode_jwt=None, tenant=None,
-                  system_identities=(), jwt_payload=None, request_id=None):
+                  jwt_payload=None, request_id=None):
     # type: (...) -> str
     """'revenue' or 'user' for one /chat request; never raises.
     ``request_id`` is the request's own id: the node's lane claim in a JWT
-    is believed only when the token's ``rid`` claim names it."""
+    is believed only when the token's ``rid`` claim names it, so a request
+    with no id is never bought the lane by a claim."""
     payload = jwt_payload if isinstance(jwt_payload, dict) else _payload(bearer_token, decode_jwt)
     if tenant and payload.get('tid') == tenant:
         return LANE_REVENUE
     # The node's word as the claim of a JWT it minted for ONE person's turn
-    # (chat_turn_request -> _internal_auth_headers(lane=..., rid=...));
-    # nobody else can sign one, and it holds for the turn it names only.
+    # (chat_turn_request -> _internal_auth_headers(lane=..., rid=...)):
+    # nobody else can sign one, it holds for the request id it names only,
+    # and the token itself lives minutes (security.jwt_manager
+    # .TURN_TOKEN_EXPIRY).
     if (payload.get('lane') == LANE_REVENUE and request_id
             and str(payload.get('rid') or '') == str(request_id)):
         return LANE_REVENUE
-    if (isinstance(body, dict) and body.get('lane') == LANE_REVENUE
-            and is_internal_caller(auth_source, payload, system_identities)):
+    # The node's word in the body beside its own key: a header carries no
+    # claim, so the body is the word's only carrier there, and the key is
+    # the only credential it is believed beside.  A JWT carries the word as
+    # its claim or not at all, the node's own system identity included.
+    if auth_source == 'api_key' and isinstance(body, dict) and body.get('lane') == LANE_REVENUE:
         return LANE_REVENUE
     return LANE_USER
 
@@ -149,8 +160,7 @@ def register_chat_lane(request_id, bearer_token, body, auth_source, decode_jwt=N
             return LANE_USER
         return lane
     lane = lane_for_chat(bearer_token, body, auth_source, decode_jwt=decode_jwt,
-                         tenant=tenant, system_identities=system_identities,
-                         jwt_payload=payload, request_id=request_id)
+                         tenant=tenant, jwt_payload=payload, request_id=request_id)
     if local_only and lane == LANE_REVENUE:
         lane = LANE_USER
     register_request_lane(request_id, lane)
