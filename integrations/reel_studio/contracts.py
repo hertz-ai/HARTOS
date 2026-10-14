@@ -338,6 +338,23 @@ def crop_window(clip: Mapping, crop: Mapping, *,
     return cx - half_w, cy - half_h, cx + half_w, cy + half_h, scale
 
 
+def segment_face_box(edl: Mapping, seg: Mapping) -> Optional[Tuple[float, float, float, float]]:
+    """(x0, y0, x1, y1) canvas pixels of a segment's face box, or None when
+    the segment has none.  The face is fractions of its clip's display
+    frame; the segment's crop window (crop_window, the one the renderer
+    crops) maps it onto the canvas.  The overlay rules and the overlay
+    layout (motion/layout.py) both read this."""
+    face = seg.get('face')
+    if not isinstance(face, Mapping):
+        return None
+    clip = edl['clips'][seg['clip']]
+    dw, dh = float(clip['display_w']), float(clip['display_h'])
+    x0, y0, _x1, _y1, scale = crop_window(clip, seg['crop'])
+    fx0, fy0 = float(face['x']) * dw, float(face['y']) * dh
+    fx1, fy1 = fx0 + float(face['w']) * dw, fy0 + float(face['h']) * dh
+    return ((fx0 - x0) * scale, (fy0 - y0) * scale, (fx1 - x0) * scale, (fy1 - y0) * scale)
+
+
 def failed_checks(problems: Sequence[str]) -> List[str]:
     """The distinct check ids in a validator's problem list, sorted."""
     return sorted({p.split(':', 1)[0] for p in problems})
@@ -990,7 +1007,30 @@ def _check_overlays(edl, bar) -> List[str]:
                     and zone['y_min'] <= y0 and y1 <= zone['y_max']):
                 out.append('%s %d box (%.0f, %.0f)-(%.0f, %.0f) px leaves the safe zone'
                            % (ov['template'], i, x0, y0, x1, y1))
+            out += _face_hold_problems(i, ov, edl, bar)
     return out
+
+
+def _face_hold_problems(i: int, ov: Mapping, edl: Mapping, bar: Mapping) -> List[str]:
+    """A motion box (other than the full-frame wipe, which leaves the whole
+    final look uncovered for reveal.min_hold_s) never covers her face during
+    the final look's last reveal.min_hold_s: A1, the reel ends on the
+    reveal, and QA masks the whole box, so reveal_render cannot see it."""
+    if not edl['final_look_found']:
+        return []
+    face = segment_face_box(edl, edl['segments'][-1])
+    if face is None:
+        return []
+    eps, hold = bar['contiguous']['eps_s'], bar['reveal']['min_hold_s']
+    if ov['to_s'] <= edl['duration_s'] - hold + eps:
+        return []
+    x0, y0, x1, y1 = ov['box']
+    if x1 <= face[0] + _PX_EPS or face[2] <= x0 + _PX_EPS or y1 <= face[1] + _PX_EPS \
+            or face[3] <= y0 + _PX_EPS:
+        return []
+    return ['%s %d box (%.0f, %.0f)-(%.0f, %.0f) px covers her face (%.0f, %.0f)-(%.0f, %.0f) '
+            'in the final look\'s last %.1f s' % (ov['template'], i, x0, y0, x1, y1, face[0],
+                                                   face[1], face[2], face[3], hold)]
 
 
 def _full_frame_problems(i: int, ov: Mapping, edl: Mapping, bar: Mapping) -> List[str]:
@@ -1060,7 +1100,9 @@ def validate_edl(edl, *, bar: Mapping = QUALITY_BAR) -> List[str]:
     overlays    inside SAFE_ZONE and inside the reel's time; a full-frame
                 motion overlay (MOTION_FULL_FRAME: the before->after wipe)
                 fills the frame over the reveal's opening only, leaving the
-                final look uncovered for reveal.min_hold_s at the end
+                final look uncovered for reveal.min_hold_s at the end; any
+                other motion box keeps off her face (segment_face_box of the
+                reveal) during that last reveal.min_hold_s
     transition  cuts only
     audio       the posted reel is silent (U2)
     """

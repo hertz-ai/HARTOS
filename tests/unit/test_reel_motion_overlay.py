@@ -101,6 +101,53 @@ def test_a_wipe_that_hides_the_reveal_fails_overlays(start, end, why):
     assert _problems(edl), why
 
 
+def test_the_reveals_face_box_in_canvas_pixels():
+    """The golden reveal: clip B (1920x1080) at zoom 1, face x .45 y .3
+    w .1 h .2 -> canvas px 369.3-710.7 x 576-960 (the review's probe)."""
+    edl = golden_edl()
+    box = C.segment_face_box(edl, edl['segments'][-1])
+    assert box == pytest.approx((369.333, 576.0, 710.667, 960.0), abs=0.01)
+    no_face = dict(edl['segments'][-1], face=None)
+    assert C.segment_face_box(edl, no_face) is None
+
+
+@pytest.mark.parametrize('template, box, start, end', [
+    # The review's probe of 4fab306ff: an end card over her face for the
+    # whole 15-20 s reveal validated clean.
+    ('end_card', [0.0, 230.0, 850.0, 1440.0], 15.0, 20.0),
+    ('end_card', [40.0, 900.0, 810.0, 1260.0], 17.0, 20.0),       # its top edge on her chin
+    ('title', [60.0, 600.0, 790.0, 900.0], 18.6, 19.9),            # any non-wipe template
+    ('logo_sting', [400.0, 700.0, 700.0, 1000.0], 19.0, 20.0),
+])
+def test_a_motion_box_over_her_face_in_the_final_hold_fails_overlays(template, box, start, end):
+    """A1: the reel ends on the reveal.  The wipe must leave the final look
+    uncovered for reveal.min_hold_s; every other motion box must leave her
+    FACE uncovered for that long (QA masks the whole box, so reveal_render
+    cannot see this)."""
+    edl = golden_edl()
+    edl['overlays'].append(_motion(template, box, start, end))
+    problems = _problems(edl)
+    assert problems and any('face' in p for p in problems), C.validate_edl(edl)
+
+
+@pytest.mark.parametrize('box, start, end, why', [
+    ([40.0, 1000.0, 810.0, 1400.0], 17.0, 20.0, 'below her face, through the hold'),
+    ([40.0, 260.0, 810.0, 540.0], 17.0, 20.0, 'above her face, through the hold'),
+    ([0.0, 230.0, 850.0, 1440.0], 15.0, 18.4, 'over her face, but gone before the last 1.5 s'),
+])
+def test_a_motion_box_that_leaves_her_face_in_the_final_hold_is_valid(box, start, end, why):
+    edl = golden_edl()
+    edl['overlays'].append(_motion('end_card', box, start, end))
+    assert C.validate_edl(edl) == [], why
+
+
+def test_without_a_face_box_the_face_rule_has_nothing_to_keep_clear():
+    edl = golden_edl()
+    edl['segments'][-1]['face'] = None
+    edl['overlays'].append(_motion('end_card', [0.0, 230.0, 850.0, 1440.0], 15.0, 20.0))
+    assert C.validate_edl(edl) == []
+
+
 def test_a_wipe_must_fill_the_frame():
     edl = golden_edl()
     edl['overlays'].append(_motion('wipe', TITLE_BOX, 15.0, 16.0))
