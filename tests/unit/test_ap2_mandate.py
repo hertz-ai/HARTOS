@@ -6,6 +6,7 @@ mocked except time where expiry is under test, and the UI push in
 TestDecidePayment.  The Mock gateway alone is the no-payment-keys case.
 """
 import json
+import logging
 from unittest.mock import patch
 
 import pytest
@@ -250,7 +251,7 @@ class TestDecidePayment:
         assert self.push.call_args.args[1]['type'] == 'payment_status'
         assert self.push.call_args.kwargs['user_id'] == 'u1'
 
-    def test_a_node_with_no_payment_keys_refuses_and_cancels_a_generic_mandate(self, store):
+    def test_a_node_with_no_payment_keys_refuses_and_cancels_a_generic_mandate(self, store, caplog):
         # Any agent's request_payment creates such a mandate; with no gateway
         # keys select_gateway answers MOCK, and before this the mock "paid" it
         # (review of abb2dcfaf, measured): completed, consumed, card shown,
@@ -259,7 +260,8 @@ class TestDecidePayment:
         store.ledger.gateways.pop(PaymentGateway.STRIPE)
         m = store.create_cart_mandate('u1', 'shop', CART)
         assert store.ledger.get_payment(m.payment_id).gateway == PaymentGateway.MOCK
-        payload, code = decide_payment(m.payment_id, 'u1', True, store=store)
+        with caplog.at_level(logging.WARNING, logger='integrations.ap2.ap2_protocol'):
+            payload, code = decide_payment(m.payment_id, 'u1', True, store=store)
         assert code == 200 and payload['result']['success'] is False
         assert 'no live payment gateway' in payload['result']['error']
         assert store.ledger.get_payment(m.payment_id).status == PaymentStatus.CANCELLED
@@ -267,6 +269,45 @@ class TestDecidePayment:
         card = self.push.call_args.args[1]
         assert card['type'] == 'notification' and card['title'] == 'Payment not available'
         assert self.push.call_args.kwargs['user_id'] == 'u1'
+        # The operator's side: one WARNING naming the setting, never a value.
+        warned = [r.getMessage() for r in caplog.records
+                  if r.name == 'integrations.ap2.ap2_protocol' and r.levelno == logging.WARNING]
+        assert len(warned) == 1 and 'STRIPE_API_KEY' in warned[0] and m.payment_id in warned[0]
+        assert '=' not in warned[0]
+
+
+class TestRequestPaymentTool:
+    """The agent's request_payment on a keyless node refuses BEFORE the person
+    is asked (review of 3a07d3989, F1: the mandate was minted on the mock and
+    the Approve card shown, and only the approval was refused)."""
+
+    def _tool(self, store):
+        from integrations.ap2.ap2_protocol import create_payment_request_function
+        return create_payment_request_function('agent', user_id='u1')
+
+    def test_a_keyless_node_refuses_before_asking_the_person(self, store, caplog):
+        store.ledger.gateways.pop(PaymentGateway.STRIPE)
+        with patch('integrations.ap2.ap2_mandate.get_mandate_store', return_value=store), \
+                patch('integrations.agent_engine.liquid_ui_service.push_agent_ui',
+                      return_value=True) as push, \
+                caplog.at_level(logging.WARNING, logger='integrations.ap2.ap2_protocol'):
+            out = json.loads(self._tool(store)(10.0, 'INR', 'a thing'))
+        assert out['success'] is False and 'no live payment gateway' in out['error']
+        assert push.call_count == 0                    # no Approve card
+        assert store.ledger.payments == {}             # no mandate, no payment
+        warned = [r.getMessage() for r in caplog.records
+                  if r.name == 'integrations.ap2.ap2_protocol' and r.levelno == logging.WARNING]
+        assert len(warned) == 1 and 'STRIPE_API_KEY' in warned[0]
+
+    def test_a_keyed_node_still_asks_the_person(self, store):
+        with patch('integrations.ap2.ap2_mandate.get_mandate_store', return_value=store), \
+                patch('integrations.agent_engine.liquid_ui_service.push_agent_ui',
+                      return_value=True) as push:
+            out = json.loads(self._tool(store)(10.0, 'INR', 'a thing'))
+        assert out['status'] == 'approval_required'
+        assert push.call_count == 1 and push.call_args.args[1]['type'] == 'approval'
+        p = store.ledger.get_payment(out['payment_id'])
+        assert p.status == PaymentStatus.APPROVAL_REQUIRED and p.gateway == PaymentGateway.STRIPE
 
     def test_dev_mode_still_settles_a_generic_mandate_on_the_mock(self, store, monkeypatch):
         from security import master_key

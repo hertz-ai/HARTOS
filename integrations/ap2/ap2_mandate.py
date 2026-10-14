@@ -547,7 +547,10 @@ _settlers_lock = threading.Lock()
 
 def register_settler(kind: str, fn) -> None:
     """``fn(mandate) -> dict`` settles an APPROVED mandate of ``kind``.
-    Without one, settling is ledger.process_payment."""
+    Without one, settling is the no-live-gateway gate
+    (ap2_protocol.mock_would_settle) and then ledger.process_payment.  A
+    registered settler owns that gate itself (commerce_tools.settle_checkout
+    does): a kind registered without it would settle on the mock."""
     with _settlers_lock:
         _settlers[kind] = fn
 
@@ -560,7 +563,8 @@ def settle(m: CartMandate, store: Optional[MandateStore] = None) -> Dict[str, An
         return fn(m)
     store = store or get_mandate_store()
     from integrations.ap2.ap2_protocol import (
-        LIVE_GATEWAY_SETTINGS, NO_LIVE_GATEWAY, mock_would_settle)
+        NO_LIVE_GATEWAY, NO_LIVE_GATEWAY_REASON, mock_would_settle,
+        refuse_no_live_gateway)
     payment = store.ledger.get_payment(m.payment_id)
     if payment is not None and mock_would_settle(payment.gateway):
         # The same gate the cart settler has (commerce_tools.settle_checkout):
@@ -570,9 +574,8 @@ def settle(m: CartMandate, store: Optional[MandateStore] = None) -> Dict[str, An
         # Refused BEFORE process_payment so no PROCESSING reservation is
         # left; the approval is void, so the payment is cancelled, not left
         # AUTHORIZED for anything else to take.
-        store.withdraw(m.mandate_id, 'no live payment gateway')
-        logger.warning('ap2: payment %s for %s refused: %s (set %s)',
-                       m.payment_id, m.user_id, NO_LIVE_GATEWAY, LIVE_GATEWAY_SETTINGS)
+        store.withdraw(m.mandate_id, NO_LIVE_GATEWAY_REASON)
+        refuse_no_live_gateway('ap2', m.user_id, m.payment_id)
         push_card(m.user_id, no_live_gateway_card())
         return {'success': False, 'payment_id': m.payment_id,
                 'error': f'payment refused: {NO_LIVE_GATEWAY}; nothing was charged'}

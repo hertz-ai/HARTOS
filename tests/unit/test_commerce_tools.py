@@ -10,6 +10,7 @@ TestNoLiveGateway.
 """
 import inspect
 import json
+import logging
 import time
 from unittest.mock import MagicMock, patch
 
@@ -504,18 +505,29 @@ class TestNoLiveGateway:
         assert env['ledger'].get_payment(m.payment_id).gateway == ap2_protocol.PaymentGateway.MOCK
         return m
 
-    def test_prepare_refuses_before_any_approval_is_asked(self, env):
+    @staticmethod
+    def _warnings(caplog):
+        """The operator's WARNINGs on the one refusal logger."""
+        return [r.getMessage() for r in caplog.records
+                if r.name == 'integrations.ap2.ap2_protocol' and r.levelno == logging.WARNING]
+
+    def test_prepare_refuses_before_any_approval_is_asked(self, env, caplog):
         self._mock_only(env)
-        out = json.loads(ct.commerce_prepare_checkout(UID))
+        with caplog.at_level(logging.WARNING, logger='integrations.ap2.ap2_protocol'):
+            out = json.loads(ct.commerce_prepare_checkout(UID))
         assert out['success'] is False and 'cannot take payments' in out['error']
         assert pushed(env, 'approval') == [] and pushed(env, 'checkout') == []
         assert env['ledger'].payments == {}
+        warned = self._warnings(caplog)
+        assert len(warned) == 1 and 'STRIPE_API_KEY' in warned[0] and '=' not in warned[0]
+        assert 'STRIPE_API_KEY' not in out['error']       # the shopper reads no setting
 
-    def test_settle_refuses_a_mock_payment_and_cancels_it(self, env):
+    def test_settle_refuses_a_mock_payment_and_cancels_it(self, env, caplog):
         self._mock_only(env)
         m = self._mandate_on_the_mock(env)
         env['mandates'].approve(m.mandate_id, UID)
-        res = json.loads(ct.commerce_checkout(UID, m.mandate_id))
+        with caplog.at_level(logging.WARNING, logger='integrations.ap2.ap2_protocol'):
+            res = json.loads(ct.commerce_checkout(UID, m.mandate_id))
         assert res['success'] is False and 'cannot take payments' in res['error']
         assert not env['fake'].called('POST', '/cart/checkout/payment')
         assert not env['fake'].called('POST', '/cart/checkout')
@@ -523,6 +535,8 @@ class TestNoLiveGateway:
         assert env['ledger'].get_payment(m.payment_id).status == PaymentStatus.CANCELLED
         assert pushed(env, 'notification')[-1]['title'] == 'Payment not available'
         assert pushed(env, 'payment_status') == []
+        warned = self._warnings(caplog)
+        assert len(warned) == 1 and 'STRIPE_API_KEY' in warned[0] and m.payment_id in warned[0]
 
     def test_the_shoppers_approval_is_refused_the_same_way(self, env):
         from integrations.ap2.ap2_mandate import decide_payment

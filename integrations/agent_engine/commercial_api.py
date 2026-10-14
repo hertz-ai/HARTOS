@@ -1076,7 +1076,8 @@ def upgrade_key(key_id):
                          'Stripe (set STRIPE_API_KEY).',
             }), 501
         try:
-            from integrations.ap2 import mock_would_settle
+            from integrations.ap2 import (
+                NO_LIVE_GATEWAY, mock_would_settle, refuse_no_live_gateway)
             _gateway_choice = payment_ledger.select_gateway('USD')
         except Exception as _sel_err:
             return jsonify({
@@ -1084,11 +1085,12 @@ def upgrade_key(key_id):
                 'error': f'No payment gateway could be selected: {_sel_err}',
             }), 503
         if mock_would_settle(_gateway_choice, user):
+            # The one refusal wording and the one operator WARNING (which
+            # names the setting; the body, read by the customer, does not).
+            refuse_no_live_gateway('upgrade', user.id)
             return jsonify({
                 'success': False,
-                'error': 'No live USD payment gateway (Stripe) is configured on '
-                         'this node (set STRIPE_API_KEY); the dev mock settles '
-                         'nothing.',
+                'error': f'{NO_LIVE_GATEWAY}; the dev mock settles nothing',
             }), 503
 
         # Three-step AP2 flow.  We do all synchronously here for the simple

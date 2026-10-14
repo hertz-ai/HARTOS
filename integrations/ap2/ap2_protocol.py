@@ -152,6 +152,23 @@ def mock_would_settle(gateway, user=None) -> bool:
     return gateway == PaymentGateway.MOCK and not mock_settlement_allowed(user)
 
 
+#: The reason a withdrawn mandate's payment is cancelled with, the one
+#: spelling for every settler (review of 3a07d3989, F5).
+NO_LIVE_GATEWAY_REASON = 'no live payment gateway'
+
+
+def refuse_no_live_gateway(where: str, user_id, payment_id=None) -> None:
+    """The operator's side of every no-live-gateway refusal: ONE WARNING
+    shape, on this module's logger, naming the settings to set
+    (LIVE_GATEWAY_SETTINGS) and never a value.  The person's reply or card
+    names no setting.  ``where`` is the path that refused ('ap2' for the
+    generic settler and the agent's request, 'commerce' for the cart,
+    'upgrade' for the paid tier)."""
+    logger.warning('%s: payment%s for %s refused: %s (set %s)', where,
+                   f' {payment_id}' if payment_id else '', user_id,
+                   NO_LIVE_GATEWAY, LIVE_GATEWAY_SETTINGS)
+
+
 #: Metadata keys that are credentials: kept in memory for the gateway call,
 #: never persisted or returned (PaymentRequest.to_dict).
 _SECRET_METADATA_KEYS = ('payment_method_token',)
@@ -1416,6 +1433,17 @@ def create_payment_request_function(agent_name: str,
             from integrations.ap2.ap2_mandate import (
                 MandateError, get_mandate_store, request_human_approval)
             store = get_mandate_store()
+            # Refused before the person is asked (the cart's prepare step
+            # does the same): on a node with no gateway keys the mandate
+            # would be minted on the mock and the Approve card shown, and
+            # only the approval would be refused (review of 3a07d3989, F1).
+            # settle()'s own gate stays for mandates minted earlier.
+            if mock_would_settle(store.ledger.select_gateway(currency)):
+                refuse_no_live_gateway('ap2', user_id)
+                return json.dumps({
+                    'success': False,
+                    'error': f'{NO_LIVE_GATEWAY}; nothing was charged and the '
+                             'person was not asked'}, indent=2)
             try:
                 m = store.create_cart_mandate(
                     str(user_id), agent_name,
@@ -1615,7 +1643,7 @@ __all__ = [
     'own_gateway_urls', 'PHONEPE_CALLBACK_PATH', 'PHONEPE_REFUND_CALLBACK_PATH',
     'PHONEPE_SENT_AMOUNT_KEY',
     'mock_settlement_allowed', 'mock_would_settle', 'NO_LIVE_GATEWAY',
-    'LIVE_GATEWAY_SETTINGS',
+    'LIVE_GATEWAY_SETTINGS', 'NO_LIVE_GATEWAY_REASON', 'refuse_no_live_gateway',
 ]
 
 

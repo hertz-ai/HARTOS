@@ -12,6 +12,7 @@ PhonePe) are the one way a key gains a paid tier.
 These drive the real blueprint route; only the token-to-user lookup and the
 database are stubbed.
 """
+import logging
 import sys
 import types
 from unittest.mock import MagicMock, patch
@@ -178,10 +179,17 @@ def _tier_of(key_db):
 
 @pytest.mark.parametrize('gateway', ['mock', ' MOCK ', None])
 def test_a_person_cannot_upgrade_through_the_mock_when_no_live_gateway_exists(
-        client, key_db, tmp_path, monkeypatch, gateway):
-    r, ledger = _upgrade(client, key_db, tmp_path, monkeypatch, gateway=gateway)
+        client, key_db, tmp_path, monkeypatch, gateway, caplog):
+    with caplog.at_level(logging.WARNING, logger='integrations.ap2.ap2_protocol'):
+        r, ledger = _upgrade(client, key_db, tmp_path, monkeypatch, gateway=gateway)
     assert r.status_code == 503, r.get_json()
-    assert 'STRIPE_API_KEY' in r.get_json()['error']
+    # The one refusal wording for the customer (no setting named), and the
+    # one operator WARNING that names it (review of 3a07d3989, F3).
+    assert 'no live payment gateway is configured on this node' in r.get_json()['error']
+    assert 'STRIPE_API_KEY' not in r.get_json()['error']
+    warned = [rec.getMessage() for rec in caplog.records
+              if rec.name == 'integrations.ap2.ap2_protocol' and rec.levelno == logging.WARNING]
+    assert len(warned) == 1 and 'STRIPE_API_KEY' in warned[0] and '=' not in warned[0]
     assert _tier_of(key_db) == 'free'
     assert ledger.payments == {}                       # nothing recorded as paid
 

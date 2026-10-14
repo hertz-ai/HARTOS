@@ -36,7 +36,8 @@ import re
 from typing import Annotated, Any, Dict, List, Optional
 
 from integrations.ap2.ap2_protocol import (
-    LIVE_GATEWAY_SETTINGS, NO_LIVE_GATEWAY, mock_would_settle)
+    NO_LIVE_GATEWAY, NO_LIVE_GATEWAY_REASON, mock_would_settle,
+    refuse_no_live_gateway)
 
 logger = logging.getLogger('tool_execution')
 
@@ -364,14 +365,6 @@ def commerce_apply_promo(
 _NO_LIVE_GATEWAY = f'this store cannot take payments right now: {NO_LIVE_GATEWAY}'
 
 
-def _refuse_no_live_gateway(user_id, payment_id=None) -> None:
-    """The operator's side of a refusal: which setting is missing (the
-    shopper's card and tool result name no setting)."""
-    logger.warning('commerce: checkout for %s%s refused: %s (set %s)', user_id,
-                   f' (payment {payment_id})' if payment_id else '',
-                   NO_LIVE_GATEWAY, LIVE_GATEWAY_SETTINGS)
-
-
 def commerce_prepare_checkout(
     user_id: str,
     cap: Annotated[Optional[float], "The most the shopper said they want to spend, in INR"] = None,
@@ -392,7 +385,7 @@ def commerce_prepare_checkout(
         return _fail('the cart is empty')
     from integrations.ap2.ap2_protocol import get_payment_ledger
     if mock_would_settle(get_payment_ledger().select_gateway(CURRENCY)):
-        _refuse_no_live_gateway(user_id)
+        refuse_no_live_gateway('commerce', user_id)
         return _fail(_NO_LIVE_GATEWAY)
     from integrations.ap2.ap2_mandate import MandateError
     try:
@@ -470,8 +463,8 @@ def settle_checkout(m) -> Dict[str, Any]:
         # The money gate itself, whatever created the mandate (an older
         # build, keys removed after the approval): nothing can be charged, so
         # the approval is void and the payment must not stay AUTHORIZED.
-        store.withdraw(m.mandate_id, 'no live payment gateway')
-        _refuse_no_live_gateway(user_id, m.payment_id)
+        store.withdraw(m.mandate_id, NO_LIVE_GATEWAY_REASON)
+        refuse_no_live_gateway('commerce', user_id, m.payment_id)
         from integrations.ap2.ap2_mandate import no_live_gateway_card
         push_fragment(user_id, no_live_gateway_card(
             'This store cannot take payments right now, so nothing was '
