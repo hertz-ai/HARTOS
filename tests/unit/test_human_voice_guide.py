@@ -45,10 +45,11 @@ def _guide():
     return importlib.import_module('integrations.agent_engine.human_voice')
 
 
-def _fresh(monkeypatch, name):
-    """A new copy of module ``name``, executed now, so it reads what the
-    guide holds at this moment (the module already imported read it at its
-    first import).
+def fresh_module(monkeypatch, name):
+    """A new copy of module ``name``, executed now, so it reads what its
+    imports hold at this moment (here: the guide) and starts with empty
+    caches of its own (test_igkit_skills: the skill texts it caches on
+    first read).  The module already imported did both at its first import.
 
     The copy stands in sys.modules under ``name`` while it runs and for the
     rest of the test, the way an import registers a module before running
@@ -248,7 +249,7 @@ def test_the_folded_list_keeps_igkits_rules():
 
 def test_contracts_take_the_reel_hashtag_cap_from_the_guide(monkeypatch):
     monkeypatch.setattr(_guide(), 'REEL_HASHTAG_LIMIT', 7)
-    contracts = _fresh(monkeypatch, 'integrations.reel_studio.contracts')
+    contracts = fresh_module(monkeypatch, 'integrations.reel_studio.contracts')
     assert contracts.HASHTAG_LIMIT == 7
     assert contracts.validate_media_item(_media(_tags(7))) == []
     assert contracts.validate_media_item(_media(_tags(8)))
@@ -256,7 +257,7 @@ def test_contracts_take_the_reel_hashtag_cap_from_the_guide(monkeypatch):
 
 def test_the_caption_linter_takes_the_reel_hashtag_cap_from_the_guide(monkeypatch):
     monkeypatch.setattr(_guide(), 'REEL_HASHTAG_LIMIT', 7)
-    caption = _fresh(monkeypatch, 'integrations.reel_studio.igkit.caption')
+    caption = fresh_module(monkeypatch, 'integrations.reel_studio.igkit.caption')
     r = caption.lint_caption('Reception look for Priya in 40 minutes.\n\n' + ' '.join(_tags(7)))
     assert r['hashtag_limit'] == 7
     assert [c['status'] for c in r['checks'] if c['check'] == 'HASHTAGS'] == ['PASS']
@@ -264,7 +265,7 @@ def test_the_caption_linter_takes_the_reel_hashtag_cap_from_the_guide(monkeypatc
 
 def test_the_caption_skill_names_the_guides_reel_cap(monkeypatch):
     monkeypatch.setattr(_guide(), 'REEL_HASHTAG_LIMIT', 7)
-    skills = _fresh(monkeypatch, 'integrations.reel_studio.igkit.skills')
+    skills = fresh_module(monkeypatch, 'integrations.reel_studio.igkit.skills')
     text = skills.get_skill_text('ig_caption')
     described = {s['name']: s['description'] for s in skills.list_skills()}['ig_caption']
     assert 'up to 7' in text and 'up to 7' in described
@@ -278,7 +279,7 @@ def test_her_profile_takes_the_reel_hashtag_cap_from_the_guide(monkeypatch):
     raw = load_json('voice_template.json')['fields']['hashtag_bank']
     assert not re.search(r'\b%d\b' % real, raw['label'] + ' ' + raw['help']), raw
     monkeypatch.setattr(_guide(), 'REEL_HASHTAG_LIMIT', 7)
-    voice_profile = _fresh(monkeypatch, 'integrations.reel_studio.voice_profile')
+    voice_profile = fresh_module(monkeypatch, 'integrations.reel_studio.voice_profile')
     spec = voice_profile.FIELD_SPECS['hashtag_bank']
     assert 'up to 7' in spec['label'] and 'up to 7' in spec['help'], dict(spec)
     for field, spec in voice_profile.FIELD_SPECS.items():
@@ -311,7 +312,7 @@ def test_reel_make_tells_the_model_the_cap_it_clamps_to(monkeypatch):
     pytest.importorskip('autogen')
     from autogen.function_utils import get_function_schema
     monkeypatch.setattr(_guide(), 'REEL_HASHTAG_LIMIT', 7)
-    _fresh(monkeypatch, 'integrations.reel_studio.contracts')
+    fresh_module(monkeypatch, 'integrations.reel_studio.contracts')
     from integrations.reel_studio import tools
     reel_make = dict(tools.build_reel_tools('10077', prompt_id='42'))['reel_make']
     schema = get_function_schema(reel_make, name='reel_make', description='make a reel')

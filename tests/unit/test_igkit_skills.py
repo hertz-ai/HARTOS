@@ -13,7 +13,6 @@ skill (inventory D38, judged clean).  ig_viral is not shipped: its own text
 forbids the collector the trends job is.
 """
 import hashlib
-import importlib.util
 import os
 
 import pytest
@@ -23,6 +22,7 @@ from integrations.agent_engine.human_voice import REEL_HASHTAG_LIMIT
 from integrations.reel_studio import igkit
 from integrations.reel_studio.igkit import skills
 from integrations.skills import registry
+from tests.unit.test_human_voice_guide import fresh_module
 
 #: sha256 of upstream's LICENSE (instagram-agent-skill @d03c56b), LF endings.
 UPSTREAM_LICENSE_SHA256 = '857c8d5276809c8196b3cd7cb3300324768bfc562b2b6281b06d6865058e186c'
@@ -93,18 +93,6 @@ def test_the_global_skill_registry_is_never_touched():
     assert not set(skills.SKILL_NAMES) & set(after)
 
 
-def _fresh_copy():
-    """A new copy of the skills module with its own empty read cache, run
-    now and kept out of sys.modules, so reel_skill and the other tests keep
-    the module they imported.  (test_human_voice_guide's _fresh puts its
-    copy in sys.modules under the real name because a dataclass in the
-    module it reloads looks its module up there; this module has none.)"""
-    spec = importlib.util.spec_from_file_location('_igkit_skills_fresh_copy', skills.__file__)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
 @pytest.fixture
 def user_skills(monkeypatch, tmp_path):
     """An empty SkillRegistry standing in for the process-wide one under
@@ -150,8 +138,8 @@ def _users_skills(user_skills):
 
 #: The two orders production has.  Her module is imported when her reel
 #: tools are built (tools.build_reel_tools), but her texts load on her
-#: agent's first reel_skill read (the loader caches them then, not at
-#: import), so each D38 test loads the copy first and runs both:
+#: import), so each D38 test loads a fresh copy (fresh_module: its read
+#: cache empty, the real module's restored after the test) and runs both:
 #: - the user's same-named skill is in the registry before her first read:
 #:   _init_skills (hart_intelligence_entry.py) loads skills.json and
 #:   ~/.claude/skills on a boot thread, and an upload may come before her
@@ -166,7 +154,7 @@ _PRODUCTION_ORDERS = pytest.mark.parametrize(
 
 
 @_PRODUCTION_ORDERS
-def test_a_same_named_upload_never_becomes_her_text(user_skills, read_first):
+def test_a_same_named_upload_never_becomes_her_text(monkeypatch, user_skills, read_first):
     """Inventory D38, judged clean (2026-10-14): her texts are the
     reel_skill tool's closed, shipped set, not entries of the global
     SkillRegistry, the open, persisted, admin-managed set of user skills
@@ -174,7 +162,7 @@ def test_a_same_named_upload_never_becomes_her_text(user_skills, read_first):
     (~/.claude/skills), POST /api/skills/ingest or a GitHub pull puts there
     must never become the text her agent reads, and her reads must never
     replace it: the user's skill keeps its own text."""
-    loaded = _fresh_copy()
+    loaded = fresh_module(monkeypatch, skills.__name__)
     if read_first:
         assert _her_texts(loaded) == _shipped_texts()
     _upload_same_named_skills(user_skills)
@@ -184,11 +172,11 @@ def test_a_same_named_upload_never_becomes_her_text(user_skills, read_first):
 
 
 @_PRODUCTION_ORDERS
-def test_deleting_a_same_named_skill_never_removes_her_text(user_skills, read_first):
+def test_deleting_a_same_named_skill_never_removes_her_text(monkeypatch, user_skills, read_first):
     """Inventory D38: DELETE /api/skills/<name> (unregister_skill drops the
     entry of that bare name, then save_config) must never take her text
     away, and her reads must never put back the skill the user deleted."""
-    loaded = _fresh_copy()
+    loaded = fresh_module(monkeypatch, skills.__name__)
     if read_first:
         assert _her_texts(loaded) == _shipped_texts()
     _upload_same_named_skills(user_skills)
