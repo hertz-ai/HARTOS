@@ -523,8 +523,9 @@ REEL_STUDIO_TAG = 'reel_studio'
 #: Goal tags a client may ASK for when it creates an agent (the /chat body's
 #: ``goal_tags``, held by hold_goal_tag_hint until the record is saved and
 #: stamped by stamp_goal_tags).  Every other tag is only ever detected from
-#: the goal text, never taken from a request.  Nunba's turn_goal_tags reads
-#: this set to bound what it forwards.
+#: the goal text, never taken from a request.  Read through the one filter,
+#: user_assignable_goal_tags: Nunba's turn_goal_tags forwards what that
+#: filter keeps of a turn's tags and keeps no list or filter of its own.
 USER_ASSIGNABLE_GOAL_TAGS = frozenset({REEL_STUDIO_TAG})
 
 #: The inference preference a goal tag sets for its agent (decision U4), in
