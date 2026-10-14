@@ -1,8 +1,12 @@
 """integrations.reel_studio.media.face -- where the face is.
 
-Scope (owner ruling 2026-10-14, recorded in CLAUDE.md as the named exception
-to "HARTOS has no ML code"): OpenCV Haar face DETECTION is allowed in HARTOS
-for crop framing ONLY.  Never recognition, identity, embeddings or stored
+Scope (owner ruling 2026-10-14, widened the same day; recorded in CLAUDE.md
+as the named exception to "HARTOS has no ML code"): OpenCV Haar face
+DETECTION is allowed in HARTOS for crop framing (edl.frame_face) AND for
+face-region shot quality: sharpness measured inside the face box
+(quality.quality_from_gray, run by analyze.py), the face-area ranking term
+in that score, and the post-render face-in-frame check (qa.py face_render).
+Detection only.  Never recognition, identity, embeddings or stored
 biometrics: nothing here may tell one face from another or say whose face it
 is.  The only output is a Box, where a face sits as fractions of the frame.
 

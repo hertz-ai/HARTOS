@@ -134,7 +134,7 @@ Mobile lives under `StudioProjects/`, server/desktop under
 | `C:\Users\sathi\PycharmProjects\Hevolve` | **Hevolve web** — the hevolve.ai web product. |
 | `C:\Users\sathi\PycharmProjects\hevolveai` | **HevolveAI** — closed-source intelligence layer (Cython-compiled `.pyd`). All ML lives here; **HARTOS has no ML code**. |
 
-**Named exception to "HARTOS has no ML code"** (owner ruling 2026-10-14): `integrations/reel_studio/media/face.py` may run OpenCV Haar face DETECTION for crop framing ONLY — never recognition, identity, embeddings or stored biometrics.
+**Named exception to "HARTOS has no ML code"** (owner ruling 2026-10-14, widened the same day): `integrations/reel_studio/media/face.py` may run OpenCV Haar face DETECTION for crop framing AND face-region shot quality (sharpness inside the face box, the face-area ranking term, the post-render face-in-frame check) — never recognition, identity, embeddings or stored biometrics.
 
 ### StudioProjects/
 | Path | Role |
