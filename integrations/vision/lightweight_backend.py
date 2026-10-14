@@ -847,14 +847,17 @@ class Qwen08BBackend(VisionBackend):
     #: The event ensure_running sends; Nunba's subscriber (main.py ~:669)
     #: answers it with llama_config.start_caption_server.
     START_EVENT = 'vlm_caption.requested'
-    #: Nunba's per-port start lock means "a start is in progress" only while
-    #: it is younger than this; an older one was left by a start that died
-    #: (Nunba killed mid-start), and Nunba's next start removes it.  Nunba's
-    #: own rule, which HARTOS reads the lock by: start_caption_server,
-    #: llama_config.py ~:2853-2872 (`lock_age < 120`).  Nunba writes the lock
-    #: and keeps the number as a literal there (and the same 120 s for its
-    #: main server's lock, ~:1805); HARTOS cannot import it -- a HARTOS-only
-    #: process, the one a stale lock stopped, has no Nunba to import.
+    #: Nunba's per-port caption start lock (start_lock_path) means "a start
+    #: is in progress" only while it is younger than this; an older one was
+    #: left by a start that died (Nunba killed mid-start), and Nunba's next
+    #: start removes it.  ONE number for the writer and the reader: Nunba's
+    #: start_caption_server (llama/llama_config.py) waits on and removes the
+    #: lock by this attribute, and _launch_owner reads it by the same one.
+    #: It lives here, not in Nunba, because HARTOS cannot import Nunba (a
+    #: HARTOS-only process is the one a stale lock stopped).  Nunba's MAIN
+    #: server lock (.server_starting.lock, llama_config.start_server) keeps
+    #: its own 120 s: another file, guarding another server's start, which
+    #: nothing in HARTOS reads -- its bound is its own question.
     START_LOCK_STALE_S = 120
     #: The model catalog row whose files this backend serves (the 0.8B and
     #: its projector, as Nunba's start_caption_server runs them):
@@ -869,6 +872,21 @@ class Qwen08BBackend(VisionBackend):
         self._last_describe_time = 0.0
         self._server_proc = None  # subprocess.Popen object (not just PID)
 
+    @staticmethod
+    def start_lock_path(port, config_dir=None) -> str:
+        """Nunba's per-port caption start lock, named once for both sides:
+        <config_dir>/.caption_server_starting.<port>.lock.
+
+        ``config_dir`` is Nunba's config folder (LlamaConfig.config_dir);
+        left out, its default ~/.nunba, where Nunba keeps it (no LlamaConfig
+        outside tests is built with another folder).  Nunba's
+        start_caption_server writes the lock here, holds it while it starts
+        the server and removes it; HARTOS only reads it (_launch_owner).
+        """
+        folder = (config_dir if config_dir is not None
+                  else os.path.join(os.path.expanduser('~'), '.nunba'))
+        return os.path.join(str(folder), f'.caption_server_starting.{port}.lock')
+
     def _launch_owner(self) -> str:
         """Why this backend must not spawn the caption server itself --
         Nunba is starting it -- or '' when nobody is.
@@ -878,11 +896,10 @@ class Qwen08BBackend(VisionBackend):
         * its START_EVENT subscriber on this process's platform event bus
           (Nunba main.py ~:669): it answers the event ensure_running has
           just sent with llama_config.start_caption_server;
-        * its per-port start lock, ~/.nunba/.caption_server_starting.<port>
-          .lock (llama_config.py start_caption_server ~:2850; Nunba's config
-          dir, ~:395), which serializes that start across Nunba's own
-          callers and processes -- by Nunba's own rule, held only while it
-          is younger than START_LOCK_STALE_S.  One older than that was left
+        * its per-port start lock, start_lock_path(port), which serializes
+          that start across Nunba's own callers and processes -- held only
+          while it is younger than START_LOCK_STALE_S, the number Nunba's
+          start_caption_server ages it by too.  One older than that was left
           by a start that died (a Nunba killed mid-start): Nunba's next
           start removes it, and it stops nobody here either.  HARTOS reads
           the lock and never writes or removes it.
@@ -900,8 +917,7 @@ class Qwen08BBackend(VisionBackend):
                 return f"Nunba's {self.START_EVENT} subscriber is starting it"
         except Exception as e:
             logger.debug(f"Qwen3.5-0.8B: event bus not readable ({e})")
-        lock = os.path.join(os.path.expanduser('~'), '.nunba',
-                            f'.caption_server_starting.{self._port}.lock')
+        lock = self.start_lock_path(self._port)
         try:
             age = time.time() - os.path.getmtime(lock)
         except OSError:             # no lock, or it went as we looked: no start

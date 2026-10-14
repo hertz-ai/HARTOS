@@ -12,12 +12,13 @@ loser holding its VRAM).
 Now, when Nunba is handling the start -- its subscriber is on this process's
 event bus, or its per-port lock is held -- HARTOS spawns nothing and waits
 for Nunba's server within the bound its own launch had (5 s + 30 s).  The
-lock is held by Nunba's own rule (start_caption_server, llama_config.py
-~:2851-2872): only while it is under 120 s old.  An older one was left by a
-start that died (a Nunba killed mid-start) and stops nobody -- not Nunba's
-next start, and not HARTOS's (review of 6067e8806: a lock of any age stopped
-HARTOS for good).  A HARTOS-only node (no subscriber, no lock) keeps the
-standalone launch, and
+lock's name and the age under which it is held are one definition both sides
+read, Qwen08BBackend.start_lock_path and START_LOCK_STALE_S (120 s): Nunba's
+start_caption_server writes the lock there and waits on it while it is
+younger, HARTOS only reads it.  An older one was left by a start that died (a
+Nunba killed mid-start) and stops nobody -- not Nunba's next start, and not
+HARTOS's (review of 6067e8806: a lock of any age stopped HARTOS for good).  A
+HARTOS-only node (no subscriber, no lock) keeps the standalone launch, and
 that launch finds the 0.8B's weights and projector by the catalog row's file
 names (model_catalog 'llm-qwen3.5-0.8b'): in the folder the row recorded, in
 Nunba's models folder (LlamaInstaller.resolve_models_dir) when that is
@@ -322,17 +323,55 @@ def test_a_stale_lock_left_by_a_killed_nunba_does_not_stop_the_standalone_launch
 @pytest.mark.parametrize('age_s, held', [(118, True), (122, False)],
                          ids=['under_120s_held', 'over_120s_stale'])
 def test_the_lock_is_held_by_nunbas_own_age_rule(box, age_s, held):
-    """Nunba's start_caption_server waits on a lock under 120 s old and
-    removes an older one (llama_config.py ~:2853-2872, `lock_age < 120`;
-    Nunba's tests/test_caption_server_spawn_lock.py::
-    test_a_stale_lock_does_not_block_the_spawn).  HARTOS reads the same lock
-    by the same rule, so the two never disagree about whether a start is in
-    progress: 2 s either side of 120 s."""
+    """A lock under START_LOCK_STALE_S (120 s) old is a start in progress;
+    an older one was left by a start that died.  Nunba's
+    start_caption_server ages the lock by this same number (it reads
+    Qwen08BBackend.START_LOCK_STALE_S; Nunba's
+    tests/test_caption_server_spawn_lock.py pins its side at 118 / 122 s),
+    so writer and reader cannot disagree about whether a start is in
+    progress."""
     _files_in(box.models)
     _lock_aged(box, age_s)
     box.port.start(12.0 if held else None)      # Nunba's start, when there is one
     ok, _ = _ensure(box)
     assert len(box.port.spawned) == (0 if held else 1)
+    assert ok is True
+
+
+def test_the_age_rule_is_the_one_number(box):
+    """HARTOS ages the lock by START_LOCK_STALE_S itself, not a copy of
+    120: with the number at 300 s, a 200 s lock is a start in progress."""
+    _files_in(box.models)
+    _lock_aged(box, 200)
+    box.mp.setattr(lvb.Qwen08BBackend, 'START_LOCK_STALE_S', 300)
+    box.port.start(12.0)
+    ok, _ = _ensure(box)
+    assert box.port.spawned == [] and ok is True
+
+
+def test_the_lock_has_one_name_for_both_sides(box):
+    """start_lock_path names Nunba's per-port start lock for Nunba (which
+    writes it in its config folder) and for HARTOS (which reads it in
+    Nunba's default config folder, ~/.nunba)."""
+    assert lvb.Qwen08BBackend.start_lock_path(PORT) == str(_lock(box))
+    other = box.tmp / 'cfg'
+    assert lvb.Qwen08BBackend.start_lock_path(PORT, other) == \
+        os.path.join(str(other), f'.caption_server_starting.{PORT}.lock')
+
+
+def test_hartos_reads_the_lock_where_start_lock_path_says(box):
+    """No private spelling of the lock's name: a fresh lock at the place
+    start_lock_path names is a start in progress, and HARTOS spawns
+    nothing beside it."""
+    elsewhere = box.tmp / 'moved' / f'start.{PORT}.lock'
+    elsewhere.parent.mkdir(parents=True)
+    elsewhere.write_text('31337')
+    box.mp.setattr(lvb.Qwen08BBackend, 'start_lock_path',
+                   staticmethod(lambda port, config_dir=None: str(elsewhere)))
+    _files_in(box.models)
+    box.port.start(12.0)
+    ok, _ = _ensure(box)
+    assert box.port.spawned == [], 'HARTOS looked for the lock under its own name'
     assert ok is True
 
 
