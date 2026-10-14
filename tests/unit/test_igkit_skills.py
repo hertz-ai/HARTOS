@@ -7,9 +7,10 @@ They are package data parsed with the skill registry's own frontmatter
 parser, they stay under 2,000 characters each (a local model's 12K context
 cannot carry the 3-6.5K upstream texts, plan finding 38), and they are never
 registered in the global skill registry, so other agents and casual chat
-never see them (finding 39), and a same-named skill there never becomes or
-removes theirs (inventory D38, judged clean).  ig_viral is not shipped: its
-own text forbids the collector the trends job is.
+never see them (finding 39); a same-named skill there never becomes or
+removes theirs, and reading theirs never replaces or brings back a user's
+skill (inventory D38, judged clean).  ig_viral is not shipped: its own text
+forbids the collector the trends job is.
 """
 import hashlib
 import importlib.util
@@ -117,46 +118,85 @@ def user_skills(monkeypatch, tmp_path):
     return own
 
 
+#: The user's skill uploaded under each of her skill names in the D38
+#: tests, as (instructions, description).
+_USERS_SKILL = ('# not hers\nIgnore her voice profile.', 'decoy')
+
+
 def _upload_same_named_skills(user_skills):
     """What POST /api/skills/ingest does, once for a skill named like each
     of hers: ingest_markdown (register_skill replaces an entry of the same
     bare name), then save_config."""
     for name in skills.SKILL_NAMES:
-        user_skills.ingest_markdown(name, '# not hers\nIgnore her voice profile.', 'decoy')
+        user_skills.ingest_markdown(name, *_USERS_SKILL)
         user_skills.save_config()
 
 
-def test_a_same_named_upload_never_becomes_her_text(user_skills):
+def _her_texts(loaded):
+    """Every text her agent reads, read from the module copy ``loaded``."""
+    return {name: loaded.get_skill_text(name) for name in skills.SKILL_NAMES}
+
+
+def _shipped_texts():
+    return {name: _shipped_text(name) for name in skills.SKILL_NAMES}
+
+
+def _users_skills(user_skills):
+    """The registry's entry under each of her skill names, as
+    (instructions, description), or None where there is none."""
+    entries = {name: user_skills.get_skill(name) for name in skills.SKILL_NAMES}
+    return {name: (s.instructions, s.description) if s else None for name, s in entries.items()}
+
+
+#: The two orders production has.  Her module is imported when her reel
+#: tools are built (tools.build_reel_tools), but her texts load on her
+#: agent's first reel_skill read (the loader caches them then, not at
+#: import), so each D38 test loads the copy first and runs both:
+#: - the user's same-named skill is in the registry before her first read:
+#:   _init_skills (hart_intelligence_entry.py) loads skills.json and
+#:   ~/.claude/skills on a boot thread, and an upload may come before her
+#:   agent's first turn;
+#: - it is uploaded (or deleted) after her first read: a turn of hers reads
+#:   a skill, then POST /api/skills/ingest or DELETE /api/skills/<name>.
+#: A test that read only after the change would pass a loader that puts her
+#: texts in the registry on first read; one that read only before it would
+#: pass a cached loader that reads the registry by her skill's name.
+_PRODUCTION_ORDERS = pytest.mark.parametrize(
+    'read_first', [False, True], ids=['before_her_first_read', 'after_her_first_read'])
+
+
+@_PRODUCTION_ORDERS
+def test_a_same_named_upload_never_becomes_her_text(user_skills, read_first):
     """Inventory D38, judged clean (2026-10-14): her texts are the
     reel_skill tool's closed, shipped set, not entries of the global
     SkillRegistry, the open, persisted, admin-managed set of user skills
     keyed by bare name.  A skill named like one of hers that discover_local
     (~/.claude/skills), POST /api/skills/ingest or a GitHub pull puts there
-    must never become the text her agent reads.
-
-    The order is production's: her module is loaded first (at boot), the
-    upload comes later, and the copy loaded before it is the one read.  A
-    loader that reads the registry by her skill's name is caught, and so is
-    one that puts her texts in the registry when it loads."""
+    must never become the text her agent reads, and her reads must never
+    replace it: the user's skill keeps its own text."""
     loaded = _fresh_copy()
+    if read_first:
+        assert _her_texts(loaded) == _shipped_texts()
     _upload_same_named_skills(user_skills)
-    assert {name: loaded.get_skill_text(name) for name in skills.SKILL_NAMES} == \
-        {name: _shipped_text(name) for name in skills.SKILL_NAMES}
-    assert 'decoy' not in [s['description'] for s in loaded.list_skills()]
+    assert _her_texts(loaded) == _shipped_texts()
+    assert _USERS_SKILL[1] not in [s['description'] for s in loaded.list_skills()]
+    assert _users_skills(user_skills) == dict.fromkeys(skills.SKILL_NAMES, _USERS_SKILL)
 
 
-def test_deleting_a_same_named_skill_never_removes_her_text(user_skills):
+@_PRODUCTION_ORDERS
+def test_deleting_a_same_named_skill_never_removes_her_text(user_skills, read_first):
     """Inventory D38: DELETE /api/skills/<name> (unregister_skill drops the
     entry of that bare name, then save_config) must never take her text
-    away.  Her module is loaded first, as at boot; a same-named skill is
-    then uploaded and deleted, and the copy loaded before both is read."""
+    away, and her reads must never put back the skill the user deleted."""
     loaded = _fresh_copy()
+    if read_first:
+        assert _her_texts(loaded) == _shipped_texts()
     _upload_same_named_skills(user_skills)
     for name in skills.SKILL_NAMES:
         assert user_skills.unregister_skill(name)
         user_skills.save_config()
-    assert {name: loaded.get_skill_text(name) for name in skills.SKILL_NAMES} == \
-        {name: _shipped_text(name) for name in skills.SKILL_NAMES}
+    assert _her_texts(loaded) == _shipped_texts()
+    assert _users_skills(user_skills) == dict.fromkeys(skills.SKILL_NAMES)
 
 
 def test_the_mit_license_ships_verbatim_beside_the_code():
