@@ -269,6 +269,144 @@ def test_a_failed_npm_logs_its_output_and_where(env, caplog):
     assert str(env.storage.get_tool_dir(TOOL)) in logged
 
 
+# ── a row that is off by a flag, needs the owner's yes and free disk ─────
+#
+# Amendment A14/A16: Remotion's row ships OFF behind one flag until the owner
+# confirms its license, is set up only after the one consent card says yes,
+# and checks free disk first.  The gate sits in setup_tool itself, so every
+# caller -- a reel, the reel_motion tool, POST /api/tools/<name>/setup -- meets
+# it (review of 38a220495: the route calls setup_tool for any row).
+
+GATED = 'demo_gated'
+FLAG = 'HEVOLVE_DEMO_GATED_TOOL'
+
+
+@pytest.fixture
+def gated(env, monkeypatch):
+    monkeypatch.setitem(runtime_manager.TOOL_CONFIGS, GATED, {
+        'download_type': 'npm', 'npm_project': str(env.project), 'npm_prepare': 'prepare.js',
+        'on_demand': True, 'catalog_id': None, 'enabled_by': FLAG,
+        'consent': 'demo:gated', 'consent_reason': 'Set the demo up? It downloads 1 GB.',
+        'npm_min_free_bytes': 1 << 30})
+    monkeypatch.delenv(FLAG, raising=False)
+    asks = []
+    answer = {'value': 'granted'}
+
+    def ask_owner_for_setup(capability, *, reason):
+        asks.append((capability, reason))
+        return answer['value']
+    import integrations.agent_engine.capability_setup as capability_setup
+    monkeypatch.setattr(capability_setup, 'ask_owner_for_setup', ask_owner_for_setup)
+    free = {'bytes': 5 << 30}
+    measured = []
+
+    def free_bytes(path):
+        measured.append(str(path))
+        return free['bytes']
+    monkeypatch.setattr(model_storage, 'free_bytes', free_bytes)
+    return SimpleNamespace(asks=asks, answer=answer, free=free, measured=measured)
+
+
+def test_a_flagged_row_is_off_by_default_and_setup_refuses(env, gated):
+    assert env.rtm.tool_enabled(GATED) is False
+    result = env.rtm.setup_tool(GATED)
+    assert result.get('disabled') is True and FLAG in result.get('error', ''), result
+    assert env.runs == [] and gated.asks == [], 'off: nobody is asked, nothing runs'
+    assert env.rtm.get_tool_status(GATED)['enabled'] is False
+    assert env.rtm.tool_ready(GATED) is False
+
+
+@pytest.mark.parametrize('value', ['1', 'true', 'yes', 'on'])
+def test_the_flag_switches_it_on(env, gated, monkeypatch, value):
+    monkeypatch.setenv(FLAG, value)
+    assert env.rtm.tool_enabled(GATED) is True
+    assert env.rtm.setup_tool(GATED).get('ready') is True
+    assert gated.asks == [('demo:gated', 'Set the demo up? It downloads 1 GB.')]
+
+
+@pytest.mark.parametrize('answer', ['asked', 'declined', 'unavailable'])
+def test_without_the_owners_yes_setup_runs_nothing(env, gated, monkeypatch, answer):
+    monkeypatch.setenv(FLAG, '1')
+    gated.answer['value'] = answer
+    result = env.rtm.setup_tool(GATED)
+    assert result.get('consent') == answer and 'error' in result, result
+    assert env.runs == []
+    assert GATED not in env.storage.get_manifest().get('tools', {})
+
+
+def test_a_row_without_consent_or_flag_is_unchanged(env, gated):
+    """Existing rows name neither: they are on and need no card."""
+    assert env.rtm.tool_enabled(TOOL) is True
+    assert env.rtm.ask_tool_consent(TOOL) == 'granted'
+    assert env.rtm.setup_tool(TOOL).get('ready') is True and gated.asks == []
+
+
+def test_too_little_free_disk_refuses_before_anything_is_copied(env, gated, monkeypatch):
+    monkeypatch.setenv(FLAG, '1')
+    gated.free['bytes'] = (1 << 30) - 1
+    result = env.rtm.setup_tool(GATED)
+    assert 'disk' in result.get('error', '') and 'GB' in result['error'], result
+    assert env.runs == []
+    assert not env.storage.get_tool_dir(GATED).exists(), 'nothing copied'
+    assert gated.measured and os.path.normcase(gated.measured[0]) == \
+        os.path.normcase(str(env.storage.get_tool_dir(GATED)))
+    gated.free['bytes'] = 1 << 30
+    assert env.rtm.setup_tool(GATED).get('ready') is True
+
+
+def test_an_unreadable_disk_is_a_failed_setup(env, gated, monkeypatch):
+    monkeypatch.setenv(FLAG, '1')
+
+    def no_drive(path):
+        raise FileNotFoundError(2, 'The system cannot find the path specified', str(path))
+    monkeypatch.setattr(model_storage, 'free_bytes', no_drive)
+    result = env.rtm.setup_tool(GATED)
+    assert 'disk' in result.get('error', '') and env.runs == [], result
+
+
+def test_a_complete_setup_is_not_measured_again(env, gated, monkeypatch):
+    monkeypatch.setenv(FLAG, '1')
+    env.rtm.setup_tool(GATED)
+    gated.free['bytes'] = 0
+    env.runs.clear()
+    assert env.rtm.setup_tool(GATED).get('ready') is True and env.runs == []
+
+
+def test_setup_in_the_background_is_one_setup_however_often_asked(env, gated, monkeypatch):
+    """setup_tool_async: a caller waits as long as it can afford
+    (Future.result(timeout)); asking again while it runs joins the same
+    setup."""
+    monkeypatch.setenv(FLAG, '1')
+    release = threading.Event()
+    real = model_storage.run_bounded
+
+    def slow(cmd, timeout=5.0, **kw):
+        release.wait(10)
+        return real(cmd, timeout=timeout, **kw)
+    monkeypatch.setattr(model_storage, 'run_bounded', slow)
+    first = env.rtm.setup_tool_async(GATED)
+    second = env.rtm.setup_tool_async(GATED)
+    assert first is second
+    import concurrent.futures
+    with pytest.raises(concurrent.futures.TimeoutError):
+        first.result(timeout=0.2)
+    release.set()
+    assert first.result(timeout=10).get('ready') is True
+    assert [r.kind for r in env.runs] == ['npm', 'node']
+    again = env.rtm.setup_tool_async(GATED)
+    assert again is not first and again.result(timeout=10).get('ready') is True
+
+
+def test_a_background_setup_that_raises_hands_the_error_to_its_waiter(env, gated, monkeypatch):
+    monkeypatch.setenv(FLAG, '1')
+
+    def boom(*a, **k):
+        raise RuntimeError('a bug in the installer')
+    monkeypatch.setattr(model_storage.ModelStorageManager, 'install_npm_project', boom)
+    with pytest.raises(RuntimeError):
+        env.rtm.setup_tool_async(GATED).result(timeout=10)
+
+
 @pytest.mark.parametrize('kind, answer, said', [
     ('npm', BoundedResult(1, '', 'ERR! 404 Not Found'), 'npm install failed'),
     ('npm', BoundedResult(-1, '', '', timed_out=True), 'timed out'),

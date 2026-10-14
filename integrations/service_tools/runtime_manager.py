@@ -13,6 +13,19 @@ model_storage.install_npm_project) when a task asks for it, after the
 owner's consent, and then run by that task.  setup_tool installs and
 prepares them and stops there (no VRAM, no sidecar); setup_available_tools
 never sets them up; tool_ready says whether one is usable.
+
+A row may also carry (amendment A14, for Remotion's row), each checked IN
+setup_tool so no caller -- an agent tool, POST /api/tools/<name>/setup --
+gets past it:
+  ``enabled_by``   an env flag; the row is off unless it is set
+                   (core.config_cache.env_flag, default off: tool_enabled);
+  ``consent``      a capability id ('<family>:<id>') set up only after the
+                   owner's yes on the one consent card
+                   (capability_setup.ask_owner_for_setup with
+                   ``consent_reason``, the card's words: ask_tool_consent);
+  ``npm_min_free_bytes``  the free disk an npm setup checks first.
+setup_tool_async runs a setup on a thread of its own, one per tool, so a
+caller can wait as long as it can afford and leave it running.
 """
 
 import atexit
@@ -22,6 +35,7 @@ import os
 import subprocess
 import sys
 import time
+from concurrent.futures import Future
 from pathlib import Path
 from threading import Lock, Thread
 from typing import Dict, Optional
@@ -153,6 +167,8 @@ class RuntimeToolManager:
         self._processes: Dict[str, subprocess.Popen] = {}
         self._ports: Dict[str, int] = {}
         self._lock = Lock()
+        # setup_tool_async: the one setup in flight per tool.
+        self._setups: Dict[str, Future] = {}
         # Lifecycle hooks — ModelLifecycleManager subscribes to these
         self._lifecycle_hooks = {
             'on_tool_started': [],
@@ -185,6 +201,18 @@ class RuntimeToolManager:
 
         result = {'tool': tool_name}
 
+        # Step 0: a row that is switched off, or needs the owner's yes, sets
+        # nothing up without it -- whoever asks (see the module note).
+        if not self.tool_enabled(tool_name):
+            return dict(result, disabled=True,
+                        error=f"{tool_name} is switched off on this node "
+                              f"({config['enabled_by']} is not set)")
+        answer = self.ask_tool_consent(tool_name)
+        if answer != 'granted':
+            return dict(result, consent=answer,
+                        error=f"setting {tool_name} up needs the owner's yes on the consent "
+                              f"card ({answer})")
+
         # Step 1: Download if needed.
         #
         # The hf branch deliberately does NOT pre-check is_downloaded():
@@ -214,7 +242,8 @@ class RuntimeToolManager:
             # for the caller, who tells the person.
             try:
                 path = self.storage.install_npm_project(
-                    tool_name, config['npm_project'], prepare=config.get('npm_prepare'))
+                    tool_name, config['npm_project'], prepare=config.get('npm_prepare'),
+                    min_free_bytes=int(config.get('npm_min_free_bytes') or 0))
             except NpmSetupFailed as e:
                 logger.warning(f"Setup of {tool_name} failed: {e}")
                 return dict(result, error=str(e))
@@ -249,6 +278,55 @@ class RuntimeToolManager:
 
         return result
 
+    def setup_tool_async(self, tool_name: str) -> Future:
+        """setup_tool(tool_name) on a thread of its own; the Future gets its
+        result dict (or the exception a bug raised).  While one is running
+        for this tool, asking again returns that same Future, so a caller
+        waits for it as long as it can afford (``result(timeout=...)``) and
+        leaves it running; the next ask after it finished starts a new one
+        (setup_tool is idempotent, so a set-up tool answers at once)."""
+        with self._lock:
+            running = self._setups.get(tool_name)
+            if running is not None and not running.done():
+                return running
+            future: Future = Future()
+            self._setups[tool_name] = future
+
+        def run():
+            try:
+                future.set_result(self.setup_tool(tool_name))
+            except BaseException as e:      # handed to whoever waits
+                logger.error(f"Setup of {tool_name} raised: {e}", exc_info=True)
+                future.set_exception(e)
+        Thread(target=run, name=f"{tool_name}-setup", daemon=True).start()
+        return future
+
+    def tool_enabled(self, tool_name: str) -> bool:
+        """Is the row switched on?  A row naming an ``enabled_by`` env flag
+        is on only when that flag is set (core.config_cache.env_flag,
+        default off); any other known row is on."""
+        config = TOOL_CONFIGS.get(tool_name)
+        if not config:
+            return False
+        flag = config.get('enabled_by')
+        if not flag:
+            return True
+        from core.config_cache import env_flag
+        return env_flag(flag, False)
+
+    def ask_tool_consent(self, tool_name: str) -> str:
+        """The owner's answer to setting this row up: 'granted' for a row
+        that names no ``consent``; else capability_setup.ask_owner_for_setup
+        (the one consent card, filed once with the row's consent_reason):
+        'granted', 'asked', 'declined' or 'unavailable'."""
+        config = TOOL_CONFIGS.get(tool_name) or {}
+        capability = config.get('consent')
+        if not capability:
+            return 'granted'
+        from integrations.agent_engine.capability_setup import ask_owner_for_setup
+        return ask_owner_for_setup(
+            capability, reason=config.get('consent_reason') or f'Set {tool_name} up here?')
+
     def start_tool(self, tool_name: str) -> Dict:
         """Start a tool that's already downloaded."""
         config = TOOL_CONFIGS.get(tool_name)
@@ -256,6 +334,9 @@ class RuntimeToolManager:
             # Nothing to start: set up means ready.
             if self.tool_ready(tool_name):
                 return {'tool': tool_name, 'ready': True}
+            if not self.tool_enabled(tool_name):
+                return {'tool': tool_name, 'disabled': True,
+                        'error': f'{tool_name} is switched off on this node'}
             return {'error': f'{tool_name} is not set up. Use setup_tool() first.'}
 
         if not self.storage.is_downloaded(tool_name):
@@ -327,19 +408,22 @@ class RuntimeToolManager:
             'is_inprocess': config.get('is_inprocess', False),
         }
         if config.get('on_demand'):
-            # No server and no GPU to report: whether it is set up is the answer.
-            status.update(on_demand=True, ready=self.tool_ready(tool_name))
+            # No server and no GPU to report: whether it is on and set up is
+            # the answer.
+            status.update(on_demand=True, enabled=self.tool_enabled(tool_name),
+                          ready=self.tool_ready(tool_name))
             return status
         status.update(vram_allocated_gb=self.vram.get_allocations().get(tool_name, 0),
                       offload_mode=self.vram.suggest_offload_mode(tool_name))
         return status
 
     def tool_ready(self, tool_name: str) -> bool:
-        """Is ``tool_name`` usable now: an on-demand tool completely set up
-        (an npm project: model_storage.npm_install_is_complete), any other
-        tool serving (_is_server_alive)."""
+        """Is ``tool_name`` usable now: switched on (tool_enabled) and, for an
+        on-demand tool, completely set up (an npm project:
+        model_storage.npm_install_is_complete), for any other tool serving
+        (_is_server_alive)."""
         config = TOOL_CONFIGS.get(tool_name)
-        if not config:
+        if not config or not self.tool_enabled(tool_name):
             return False
         if config.get('download_type') == 'npm':
             return self.storage.npm_install_is_complete(tool_name, config['npm_project'])

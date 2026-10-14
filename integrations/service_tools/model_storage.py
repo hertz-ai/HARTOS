@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from core.node_bin import find_node, find_npm
+from core.platform_paths import free_bytes
 from core.subprocess_safe import run_bounded
 
 logger = logging.getLogger(__name__)
@@ -492,6 +493,20 @@ class ModelStorageManager:
             shutil.copy2(os.path.join(project_dir, rel), dest)
 
     @staticmethod
+    def _check_free_disk(tool_dir: Path, need: int) -> None:
+        """NpmSetupFailed unless ``need`` bytes are free where ``tool_dir``
+        goes (core.platform_paths.free_bytes: its nearest existing folder,
+        nothing created to measure it)."""
+        try:
+            free = free_bytes(tool_dir)
+        except OSError as e:
+            raise NpmSetupFailed('the free disk where it goes (%s) could not be read: %s'
+                                 % (tool_dir, e)) from e
+        if free < need:
+            raise NpmSetupFailed('setting it up needs about %.1f GB of free disk where it goes '
+                                 '(%s) and there is %.1f GB' % (need / 1e9, tool_dir, free / 1e9))
+
+    @staticmethod
     def _npm_lock(tool_dir: Path) -> threading.Lock:
         key = os.path.normcase(os.path.abspath(str(tool_dir)))
         with _NPM_LOCKS_GUARD:
@@ -524,7 +539,8 @@ class ModelStorageManager:
 
     def install_npm_project(self, tool_name: str, project_dir: str, *,
                             prepare: Optional[str] = None,
-                            timeout_s: float = NPM_INSTALL_TIMEOUT_S) -> Path:
+                            timeout_s: float = NPM_INSTALL_TIMEOUT_S,
+                            min_free_bytes: int = 0) -> Path:
         """Set the npm project at ``project_dir`` up in this tool's directory.
 
         THE npm installer: RuntimeToolManager's npm rows and the WhatsApp
@@ -537,10 +553,14 @@ class ModelStorageManager:
         ``timeout_s``), then ``node <prepare>`` when the project names a
         prepare script, and records the receipt.  Idempotent: a complete setup of
         this exact project returns at once; one setup per tool directory
-        runs at a time.  Returns the tool directory; raises NpmSetupFailed
-        (no package.json in the project, Node.js or npm missing, a step
-        failed or ran past its bound, npm made no node_modules for a project
-        that names dependencies, the copy failed), leaving no receipt.
+        runs at a time.  ``min_free_bytes``: the free disk the setup needs
+        where the tool dir goes (core.platform_paths.free_bytes), checked
+        before anything is copied (A13/A14: a download checks the disk
+        first).  Returns the tool directory; raises NpmSetupFailed
+        (not enough free disk, or it cannot be read; no package.json in the
+        project; Node.js or npm missing; a step failed or ran past its
+        bound; npm made no node_modules for a project that names
+        dependencies; the copy failed), leaving no receipt.
         """
         tool_dir = self.get_tool_dir(tool_name)
         with self._npm_lock(tool_dir):
@@ -550,6 +570,8 @@ class ModelStorageManager:
                 # npm install in a folder with no package.json walks up to the
                 # nearest ancestor that has one and installs there.
                 raise NpmSetupFailed('the project at %s has no package.json' % project_dir)
+            if min_free_bytes > 0:
+                self._check_free_disk(tool_dir, min_free_bytes)
             node, npm = find_node(), find_npm()
             if not node or not npm:
                 raise NpmSetupFailed(
