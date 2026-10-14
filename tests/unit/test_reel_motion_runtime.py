@@ -278,11 +278,17 @@ def test_not_ready_lays_the_plain_versions_and_says_why(tmp_path, monkeypatch, s
     assert said and 'plain' in said
 
 
-def test_off_tells_her_agent_it_waits_for_the_owner_and_the_license(tmp_path, monkeypatch):
+def test_off_tells_her_agent_it_waits_on_the_license_and_asks_nothing_of_her(tmp_path,
+                                                                            monkeypatch):
+    """Review of e054a3d88: the words said the overlays were off 'until its
+    owner confirms the Remotion license'.  The only switch is the
+    HEVOLVE_REEL_MOTION flag of the build, not a setting she (usually the
+    computer's owner) can reach, so the words name no remedy for her."""
     monkeypatch.setattr(runtime, 'ensure_ready', lambda **kw: runtime.Readiness(runtime.OFF))
     _out, notes = compose.add_motion(golden_edl(), REQUEST, workdir=str(tmp_path))
-    said = compose.message(notes)
-    assert 'license' in said.lower() and 'owner' in said.lower()
+    said = compose.message(notes).lower()
+    assert 'license' in said and 'nothing she needs to do' in said
+    assert 'owner' not in said and 'switch' not in said
 
 
 def test_ready_lays_the_rendered_clips_and_the_edl_stays_valid(tmp_path, monkeypatch):

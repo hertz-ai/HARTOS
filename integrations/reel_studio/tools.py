@@ -146,10 +146,13 @@ MOTION_NEEDS = {
 }
 #: What reel_motion tells her agent, by where Remotion stands.
 MOTION_MESSAGES = {
-    'off': ("Her choice is saved. Animated overlays are switched off on this computer until "
-            "its owner confirms the Remotion license; until then her reels get the plain "
-            "versions (the end card as a text box, the title as the hook text, the still logo, "
-            "a cut for the wipe). Tell her that."),
+    # Off is the build's state (the HEVOLVE_REEL_MOTION flag, kept off until
+    # Remotion's license is confirmed: NOTICE), not a setting she can reach.
+    'off': ("Her choice is saved. Animated overlays are not available in this version of the "
+            "app yet (the license of Remotion, the tool that draws them, is still being "
+            "confirmed); until then her reels get the plain versions (the end card as a text "
+            "box, the title as the hook text, the still logo, a cut for the wipe). Tell her "
+            "that, and that there is nothing she needs to do."),
     'not_set_up': ("Animated overlays are not set up on this computer yet; choosing overlays "
                    "asks its owner to set them up."),
     'ready': "Animated overlays are set up; her next reel gets them. Tell her.",

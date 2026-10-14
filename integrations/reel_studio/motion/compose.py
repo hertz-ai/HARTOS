@@ -58,9 +58,13 @@ IMAGE_MAX_BYTES = 8 << 20
 
 #: What her agent says, per outcome, when it is not a rendered reel.
 _SAY = {
-    runtime.OFF: ('Animated overlays are switched off on this computer until its owner confirms '
-                  'the Remotion license, so this reel has the plain versions (the end card as a '
-                  'text box, the title as the hook text); say so.'),
+    # Off is the build's state (the HEVOLVE_REEL_MOTION flag, kept off until
+    # Remotion's license is confirmed: NOTICE), not a setting in the app, so
+    # nothing here asks her to switch anything on.
+    runtime.OFF: ('Animated overlays are not available in this version of the app yet (the '
+                  'license of Remotion, the tool that draws them, is still being confirmed), so '
+                  'this reel has the plain versions (the end card as a text box, the title as '
+                  'the hook text). Say so, and that there is nothing she needs to do.'),
     runtime.ASKED: ('Animated overlays need a one-time setup on this computer, and its owner has '
                     'been asked on the consent card; this reel has the plain versions. Say so.'),
     runtime.DECLINED: ('The owner of this computer said no to setting animated overlays up, so '

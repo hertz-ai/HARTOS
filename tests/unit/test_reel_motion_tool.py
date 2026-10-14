@@ -76,7 +76,13 @@ def test_with_remotion_off_by_default_her_choice_is_kept_and_the_reply_says_why(
     assert reply['overlays'] == ['end_card', 'logo_sting']
     assert _profile()['motion_overlays'] == ['end_card', 'logo_sting']
     assert reply['animated'] == 'off'
-    assert 'license' in reply['message'].lower() and 'plain' in reply['message'].lower()
+    said = reply['message'].lower()
+    assert 'license' in said and 'plain' in said
+    # Review of e054a3d88: no remedy she cannot act on.  The only switch is
+    # the build's HEVOLVE_REEL_MOTION flag, not a setting of hers, and she is
+    # usually the computer's owner.
+    assert 'nothing she needs to do' in said
+    assert 'owner' not in said and 'switch' not in said
     assert asked == [], 'off: the owner is not asked'
 
 

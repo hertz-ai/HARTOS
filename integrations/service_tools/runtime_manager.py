@@ -168,16 +168,19 @@ TOOL_CONFIGS = {
         'npm_project': REEL_MOTION_PROJECT,
         'npm_prepare': 'prepare.js',
         # The npm packages are 184 MB unpacked for win32-x64 (measured
-        # 2026-10-15 from the registry sizes of the lock's 186 packages, six
-        # with none recorded); the browser's size is not measured here.  1 GiB
-        # leaves room for both.
+        # 2026-10-15 from the registry sizes of the 186 of the lock's 226
+        # packages that install on win32-x64 -- the other 40 are builds for
+        # other platforms -- six with no size recorded); the browser's size
+        # is not measured here.  1 GiB leaves room for both.
         'npm_min_free_bytes': 1 << 30,
         'on_demand': True,
         'enabled_by': 'HEVOLVE_REEL_MOTION',
         'consent': 'reel:motion',
+        # The card is read by this computer's owner, who is usually the
+        # person making the reels: the words do not talk about "her".
         'consent_reason': (
-            "Animated overlays for her reels (a moving title, a logo sting, a booking "
-            "card at the end, a before-and-after wipe) need Remotion on this computer: "
+            "Animated overlays for reels made on this computer (a moving title, a logo "
+            "sting, a booking card at the end, a before-and-after wipe) need Remotion: "
             "its packages and a headless browser, a few hundred MB, downloaded once into "
             "the models folder. Set it up?"),
         'catalog_id': None,
