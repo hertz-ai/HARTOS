@@ -1,5 +1,11 @@
 """integrations.reel_studio.media.face -- where the face is.
 
+Scope (owner ruling 2026-10-14, recorded in CLAUDE.md as the named exception
+to "HARTOS has no ML code"): OpenCV Haar face DETECTION is allowed in HARTOS
+for crop framing ONLY.  Never recognition, identity, embeddings or stored
+biometrics: nothing here may tell one face from another or say whose face it
+is.  The only output is a Box, where a face sits as fractions of the frame.
+
 V1 uses the Haar cascades that ship inside opencv-python (``cv2.data``):
 frontal first, then profile on the frame and on its mirror image (the
 profile cascade only knows one side).  No model file is added (plan U12;
