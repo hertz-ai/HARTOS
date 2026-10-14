@@ -54,11 +54,25 @@ def _setup(row, tool):
                                                rtm.storage.get_tool_dir(tool)))
 
 
+def _fixtures():
+    """tests/unit/reel_media_fixtures.py, loaded by its path.  Importing
+    HARTOS puts agent-ledger-opensource, which has a ``tests`` package of
+    its own, ahead of the repo root on sys.path (measured 2026-10-15: index
+    0 against the root's 1), so ``from tests.unit.reel_media_fixtures``
+    found the wrong ``tests`` and this script died before rendering."""
+    import importlib.util
+    path = os.path.join(ROOT, 'tests', 'unit', 'reel_media_fixtures.py')
+    spec = importlib.util.spec_from_file_location('reel_media_fixtures', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _edl(work):
     from integrations.reel_studio import contracts as C
     from integrations.reel_studio.contracts import ClipCapture
     from integrations.reel_studio.media.probe import probe
-    from tests.unit.reel_media_fixtures import make_clip
+    make_clip = _fixtures().make_clip
     src = make_clip(work, 'reel_src.mp4', size=(1080, 1920), fps=30, duration_s=7.0)
     x = 'a' * 64
     clip = probe(src).to_edl_clip(ClipCapture(clip=x, order=0, captured_at_ms=1760247082000,
@@ -151,7 +165,10 @@ def main(argv=None) -> int:
     render.render_reel(dict(edl, overlays=[]), plain, workdir=os.path.join(work, 'r2'),
                        encoder='libx264')
     report = qa.run_qa(reel, composed)
-    hard_failed = [r['id'] for r in report['checks'] if not r['ok'] and r['id'] != 'duration']
+    # Every hard check (report['checks'] holds the hard rows only), duration
+    # included: the test EDL's 6 s cut is its 6 s target (review of
+    # 0b3441092: this left 'duration' out without saying why).
+    hard_failed = [r['id'] for r in report['checks'] if not r['ok']]
     if hard_failed:
         failures.append('hard QA checks failed: %s' % hard_failed)
     fx, fy = 270 / 1080.0, 480 / 1920.0
