@@ -21,6 +21,9 @@ Where each part came from:
   resources/voice_template.json  templates/voice.md, as typed fields
   skills/ig_reel, ig_caption, ig_human   the three SKILL.md texts, rewritten
 
+skills/reel_edit is not derived from upstream: it is HARTOS's own text,
+under HARTOS's Apache-2.0 license (see igkit.skills).
+
 What was changed for HARTOS:
 
  1. Pure functions that return dicts.  No command line and no printing

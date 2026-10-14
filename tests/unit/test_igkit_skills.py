@@ -1,5 +1,7 @@
-"""integrations.reel_studio.igkit.skills: the three adapted SKILL.md texts
-(ig_reel, ig_caption, ig_human) her agent reads through reel_skill.
+"""integrations.reel_studio.igkit.skills: the SKILL.md texts her agent reads
+through reel_skill -- the three adapted ones (ig_reel, ig_caption, ig_human)
+and reel_edit, HARTOS's own (owner ruling A15; tests/unit/
+test_reel_edit_skill.py).
 
 They are package data parsed with the skill registry's own frontmatter
 parser, they stay under 2,000 characters each (a local model's 12K context
@@ -32,11 +34,11 @@ def _read(path):
 
 
 def test_the_shipped_skills():
-    assert skills.SKILL_NAMES == ('ig_reel', 'ig_caption', 'ig_human')
+    assert skills.SKILL_NAMES == ('ig_reel', 'ig_caption', 'ig_human', 'reel_edit')
     assert skills.MAX_SKILL_CHARS == 2000
 
 
-@pytest.mark.parametrize('name', ['ig_reel', 'ig_caption', 'ig_human'])
+@pytest.mark.parametrize('name', ['ig_reel', 'ig_caption', 'ig_human', 'reel_edit'])
 def test_each_skill_is_short_and_read_with_the_registry_parser(name):
     raw = _read(_skill_file(name))
     assert len(raw) <= skills.MAX_SKILL_CHARS

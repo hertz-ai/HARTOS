@@ -49,7 +49,9 @@ The seven (REEL_TOOL_NAMES):
 * ``reel_score_hooks``: weak-hook flags (verdict and weakest check only; no
   score: it does not predict performance).
 * ``reel_beat_sheet``: a voice-over script timed at her speaking rate.
-* ``reel_skill``: an adapted skill text with her voice brief in front.
+* ``reel_skill``: a skill text with her voice brief in front: one of the
+  three adapted writing skills, or reel_edit, HARTOS's own on how reel_make
+  cuts (igkit.skills.SKILL_NAMES, which its name parameter lists).
 * ``reel_voice``: read or change her voice profile.
 
 On demand (REEL_ON_DEMAND_TOOL_NAMES): registered with the seven, on the
@@ -57,7 +59,8 @@ same seats of her Reel Studio agent, but with no schema up front --
 request_tools attaches it when she asks
 (core.agent_tool_menu.discover_and_attach matches the first line of its
 docstring).  It is used once in a while, and the seven's schema is held to
-900 tokens per seat (plan WS-8b; 893 measured with the seven):
+900 tokens per seat (plan WS-8b; 895 measured with the seven once reel_skill
+named reel_edit):
 
 * ``reel_watchlist``: track, stop tracking or list the Instagram accounts
   her trending songs come from, and their niche (owner ruling A17b;
@@ -479,6 +482,9 @@ def build_reel_tools(user_id, *, prompt_id,
     # The cap reel_make's hashtags parameter states is the one _hashtags
     # keeps (contracts.HASHTAG_LIMIT, the human-voice guide's reel cap).
     from integrations.reel_studio.contracts import HASHTAG_LIMIT
+    # reel_skill's name parameter names every skill there is, from the one list.
+    from integrations.reel_studio.igkit.skills import SKILL_NAMES
+    skill_choice = '%s or %s' % (', '.join(SKILL_NAMES[:-1]), SKILL_NAMES[-1])
     turn = _Turn(user_id, prompt_id, request_id_getter)
 
     def reel_make(
@@ -552,11 +558,11 @@ def build_reel_tools(user_id, *, prompt_id,
             return _error('reel_beat_sheet', e)
 
     def reel_skill(
-        name: Annotated[str, 'ig_reel, ig_caption or ig_human'],
+        name: Annotated[str, skill_choice],
     ) -> str:
-        """Read a Reel Studio writing skill with her voice profile in front."""
+        """Read a Reel Studio skill with her voice profile in front."""
         from integrations.reel_studio import voice_profile
-        from integrations.reel_studio.igkit.skills import SKILL_NAMES, get_skill_text
+        from integrations.reel_studio.igkit.skills import get_skill_text
         try:
             text = get_skill_text(_text(name))
         except KeyError:

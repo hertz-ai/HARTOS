@@ -7,7 +7,7 @@ disable-model-invocation: true
 
 # ig_reel
 
-reel_make cuts the reel from her clips. You write the words around it.
+reel_make cuts the reel from her clips. You write the words around it. How it cuts, and what you choose for it: reel_skill reel_edit.
 
 ## The story
 Her clips play in the order she filmed them, and the reel ends on the finished look, held at least 1.5 s. Open with a short final-look teaser only when she asks for it ("start with the result").

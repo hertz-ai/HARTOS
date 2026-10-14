@@ -1,5 +1,6 @@
-"""igkit.skills: the three adapted skill texts her agent reads through the
-reel_skill tool.
+"""igkit.skills: the skill texts her agent reads through the reel_skill tool:
+three adapted from instagram-agent-skill on the words of a reel, and
+reel_edit, HARTOS's own, on how reel_make cuts it.
 
 ig_reel, ig_caption and ig_human are derived from instagram-agent-skill
 @d03c56b skills/ig-reel, skills/ig-caption and skills/ig-human SKILL.md,
@@ -10,6 +11,14 @@ reel_* tools instead of command-line scripts, single-line frontmatter
 values (the registry parser reads a YAML '>-' block as the literal '>-').
 ig_viral is not shipped: its own text forbids the collector the trends job
 is.
+
+reel_edit is not derived from anything: it is HARTOS's own text, written
+for HARTOS under its Apache-2.0 license (owner ruling A15, 2026-10-14).  It
+says what reel_make decides by itself (filmed order, cuts on the beat, the
+reveal held last, cuts only, text clear of Instagram's buttons) and what her
+agent chooses.  OpenMontage (AGPL-3.0) was read as a reference only; none of
+its code, prompts or skill files is in it.  Its figures are the planner's
+own (tests/unit/test_reel_edit_skill.py).
 
 They are parsed with the skill registry's own parser
 (integrations.skills.registry.SkillInfo.from_skill_md) and are NEVER
@@ -33,8 +42,9 @@ from typing import Dict, List
 from integrations.agent_engine.human_voice import (  # noqa: F401
     REEL_HASHTAG_LIMIT_TOKEN as HASHTAG_LIMIT_TOKEN, with_reel_hashtag_limit)
 
-#: The skills her agent can read, in the order list_skills reports them.
-SKILL_NAMES = ('ig_reel', 'ig_caption', 'ig_human')
+#: The skills her agent can read, in the order list_skills reports them;
+#: reel_skill's name parameter names each one from here.
+SKILL_NAMES = ('ig_reel', 'ig_caption', 'ig_human', 'reel_edit')
 #: The most characters a skill file may have (frontmatter included).
 MAX_SKILL_CHARS = 2000
 
