@@ -14,8 +14,11 @@ that is not already cached.  Her chat says the vision model is being made
 ready only when that start has to wait for the server (not when it is
 already up), and a progress line that fails never skips the start.  The
 start keeps its own waits: the time it takes COUNTS AGAINST the moments
-budget and is NOT capped by it, and when it used all of it, the reply says
-the model was still starting.  rate_frame itself still never starts anything.
+budget and is NOT capped by it, and when it used all of it -- no frame was
+asked at all (the moment list's stats.calls is 0) -- the reply says the model
+was still starting.  A model that was asked and did not answer in time is
+"no answer", never "still starting" (review of 3b0473794).  rate_frame itself
+still never starts anything.
 
 Real code throughout: get_vision_backend(REEL_VLM_DEFAULT) builds the real
 Qwen08BBackend and its real ensure_running runs.  Only the boundaries are
@@ -83,7 +86,8 @@ def _jpeg(shade):
 
 def _keys(n=3):
     """``n`` keyframes, each a real (distinct) JPEG, in story order."""
-    return [Candidate(clip='a' * 64, t_s=float(i + 1), segment=0, jpeg=_jpeg(30 + 60 * i),
+    return [Candidate(clip='a' * 64, t_s=float(i + 1), segment=0,
+                      jpeg=_jpeg((30 + 60 * i) % 256),
                       quality=Quality(score=0.5, sharp=100.0, luma=0.5, clipped=0.0),
                       face=Box(0.4, 0.2, 0.2, 0.15))
             for i in range(n)]
@@ -106,17 +110,20 @@ class _CaptionServer:
     'vlm_caption.requested' subscriber (main.py) brings it up when asked.
     ``reply``: what the model answers (None: a usable rating).
     ``asks``: every 'vlm_caption.requested' event; ``clock``/``start_s``:
-    simulated time the start takes, read by moments' budget.  ``chat``: her
+    simulated time the start takes, read by moments' budget.  ``request_s``:
+    each chat-completions request takes that long, or its timeout when that
+    is shorter, and then times out (None: it answers at once).  ``chat``: her
     chat's progress list; ``shown`` records its last line at each ask.
     ``health_urls``: every /health probe the port answered, from any backend
     on any thread (a reel's own are counted on its backend: _Reel.probes)."""
 
     def __init__(self, *, up=False, nunba_starts_it=True, clock=None, start_s=0.0,
-                 reply=None, chat=None):
+                 reply=None, chat=None, request_s=None):
         self.up = up
         self.nunba_starts_it = nunba_starts_it
         self.clock = clock
         self.start_s = start_s
+        self.request_s = request_s
         self.reply = reply
         self.chat = chat
         self.asks = []
@@ -130,6 +137,9 @@ class _CaptionServer:
         return MagicMock(status_code=200)
 
     def complete(self, url, json=None, timeout=None, **kw):
+        if self.request_s is not None:
+            self.clock.t += min(timeout, self.request_s)
+            raise requests.Timeout('read timed out')
         return _answer(self.reply)
 
     def emit(self, topic, data=None, *a, **kw):
@@ -583,28 +593,92 @@ def test_the_reply_says_why_the_fallback_ran(turn, model):
     assert 'still starting' not in message, result['message']
 
 
-def test_the_reply_says_the_model_was_still_starting_when_its_start_used_the_time(turn):
-    """Review of 42735064e: the start used the whole moments budget, so no
-    frame was asked (moments' NOTE_VLM_BUDGET beside NOTE_VLM_FALLBACK; no
-    new reason record).  Her agent is told the vision model was still
-    starting when the time ran out, not that it gave no answer."""
+def _reply_for(turn, moments):
+    """What her agent is told (make_reel's message, lower case) for a reel
+    whose moments step returned ``moments``; the rest of the reel is the
+    pipeline tests' fake production."""
     from integrations.reel_studio import pipeline as P
     fake = _fake_production(P)
 
     def produce(*a, **kw):
         production = fake(*a, **kw)
-        production.moments = {'src': 'fallback', 'final_look_found': True,
-                              'notes': [M.NOTE_VLM_FALLBACK, M.NOTE_VLM_BUDGET]}
+        production.moments = moments
         return production
     turn.mp.setattr(P, 'produce_reel', produce)
     clip = _small_clip(turn)
     result = P.make_reel(user_id=UID, prompt_id=PID, request_id='r', clips=[clip.to_dict()],
                          style=C.make_style({}))
     assert result['status'] == 'ok', result
-    message = result['message'].lower()
-    assert 'vision model' in message and 'still starting' in message, result['message']
-    assert 'ran out' in message, result['message']
-    assert 'no answer' not in message, result['message']
+    return result['message'].lower()
+
+
+def _scored(turn, srv, keys):
+    """The real score_moments on the reel's default budget, against ``srv``,
+    on ``srv.clock``.  Returns (moment list, chat-completions POST mock)."""
+    turn.mp.setattr(M, 'monotonic', srv.clock)
+    with _caption_port(srv) as port:
+        doc = M.score_moments(keys, cache_dir=str(turn.tmp / 'cache'))
+    assert C.validate_moments(doc) == [], C.validate_moments(doc)
+    return doc, port.post
+
+
+def test_a_server_that_is_up_but_never_answers_in_time_is_not_called_still_starting(turn):
+    """Review of 3b0473794, P3 (measured with the real score_moments and
+    _ok_message): the shared caption server is up -- ensure_running returns
+    at once, on_wait never fires -- and every rating runs to its timeout (a
+    busy shared :8081, a slow CPU).  Six keyframes on the 90 s budget: five
+    requests (4 x 20 s + 10 s), then the time runs out: vlm_fallback with
+    vlm_budget, stats.calls 5.  3b0473794 told her agent the model 'was still
+    starting when the time for judging the shots ran out': false, nothing
+    was starting.  It gave no answer, and the reply says that."""
+    srv = _CaptionServer(up=True, clock=_Clock(), request_s=60.0)
+    moments, post = _scored(turn, srv, _keys(6))
+    assert srv.asks == [] and post.call_count == 5
+    assert moments['notes'] == [M.NOTE_VLM_FALLBACK, M.NOTE_VLM_BUDGET], moments['notes']
+    assert moments['stats']['calls'] == 5
+    message = _reply_for(turn, moments)
+    assert 'still starting' not in message, message
+    assert 'vision model' in message and 'no answer' in message, message
+
+
+def test_a_start_that_gave_up_before_the_frames_says_the_model_gave_no_answer(turn):
+    """Review of 3b0473794, P4: the start waited 35 s of the budget and the
+    server never came up (nobody to start it); each frame then asked /health
+    and fell back, with time left: vlm_fallback only.  The reply says the
+    model gave no answer -- the start had ended before any frame was asked."""
+    srv = _CaptionServer(up=False, nunba_starts_it=False, clock=_Clock(), start_s=35.0)
+    moments, post = _scored(turn, srv, _keys(3))
+    assert len(srv.asks) == 1 and post.call_count == 0
+    assert moments['notes'] == [M.NOTE_VLM_FALLBACK], moments['notes']
+    message = _reply_for(turn, moments)
+    assert 'still starting' not in message, message
+    assert 'vision model' in message and 'no answer' in message, message
+
+
+def test_a_start_that_used_the_whole_budget_says_the_model_was_still_starting(turn):
+    """P5: the start took longer than the moments budget (95 s of 90), so no
+    frame was asked at all: stats.calls 0, with vlm_fallback and vlm_budget.
+    That, and only that, is a start that used the time: her agent is told the
+    vision model was still starting when the time ran out."""
+    srv = _CaptionServer(up=False, nunba_starts_it=True, clock=_Clock(), start_s=95.0)
+    moments, post = _scored(turn, srv, _keys(2))
+    assert len(srv.asks) == 1 and post.call_count == 0
+    assert moments['notes'] == [M.NOTE_VLM_FALLBACK, M.NOTE_VLM_BUDGET], moments['notes']
+    assert moments['stats']['calls'] == 0
+    message = _reply_for(turn, moments)
+    assert 'vision model' in message and 'still starting' in message, message
+    assert 'ran out' in message, message
+    assert 'no answer' not in message, message
+
+
+def test_a_moment_list_that_does_not_say_what_was_asked_claims_no_start(turn):
+    """Both notes but no stats (the shape 3b0473794's own test wrote by
+    hand): nothing says the start used the time, so the reply says only what
+    is known -- the model gave no answer."""
+    message = _reply_for(turn, {'src': 'fallback', 'final_look_found': True,
+                                'notes': [M.NOTE_VLM_FALLBACK, M.NOTE_VLM_BUDGET]})
+    assert 'still starting' not in message, message
+    assert 'no answer' in message, message
 
 
 def test_a_reel_the_model_rated_does_not_say_it_fell_back(turn):

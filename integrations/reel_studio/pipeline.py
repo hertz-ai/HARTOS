@@ -391,12 +391,14 @@ def _ready_text(media: Mapping, song_note: Optional[str] = None) -> str:
     return ' '.join(parts)
 
 
-def _ok_message(media: Mapping, notes: Sequence[str], song_note: Optional[str] = None) -> str:
+def _ok_message(media: Mapping, notes: Sequence[str], song_note: Optional[str] = None,
+                moments: Optional[Mapping] = None) -> str:
     """What her agent is told to say.  It carries what the push's text says
     too (decision U2: the steady beat; no song, and why), because her phone
     shows one of the reply and the push (it dedups them by xid), not always
     the push.  With no song suggested it asks for none: a song named here
-    would be one the reel does not have."""
+    would be one the reel does not have.  ``moments`` is the reel's moment
+    list (moments.score_moments): its stats say whether any frame was asked."""
     text = ('The reel is made, checked and on its way to her phone (it also rides this '
             'reply). Tell her it is ready, ')
     if _suggests_song(media.get('song')):
@@ -414,8 +416,13 @@ def _ok_message(media: Mapping, notes: Sequence[str], song_note: Optional[str] =
         text += (' No finished look was found in the clips, so the reel ends on the last shot; '
                  'say so.')
     from integrations.reel_studio.media.moments import NOTE_VLM_BUDGET, NOTE_VLM_FALLBACK
-    if NOTE_VLM_FALLBACK in notes and NOTE_VLM_BUDGET in notes:
-        # No frame rated and the time ran out: its start used the budget.
+    stats = moments.get('stats') if isinstance(moments, Mapping) else None
+    none_asked = isinstance(stats, Mapping) and stats.get('calls') == 0
+    if NOTE_VLM_FALLBACK in notes and NOTE_VLM_BUDGET in notes and none_asked:
+        # No frame rated, the time ran out, and not one frame was asked: the
+        # start (asked before the first frame, its time counted against the
+        # budget) used it all.  A frame asked that timed out is a model that
+        # gave no answer, not one still starting (review of 3b0473794).
         text += (' The vision model on this computer was still starting when the time for '
                  'judging the shots ran out, so the shots were chosen by sharpness and '
                  'filming order instead; say so.')
@@ -528,7 +535,8 @@ def _make(job, store, sources: List[C.ClipSource], style: Dict[str, Any],
     return {'status': 'ok', 'reel_id': job.reel_id, 'media': media, 'qa': qa,
             'moments': {'src': production.moments.get('src'),
                         'final_look_found': bool(production.moments.get('final_look_found'))},
-            'notes': out_notes, 'message': _ok_message(media, notes, song_note)}
+            'notes': out_notes,
+            'message': _ok_message(media, notes, song_note, moments=production.moments)}
 
 
 def make_reel(*, user_id, prompt_id, request_id, clips: Sequence[Any], style: Mapping,
