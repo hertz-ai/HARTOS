@@ -476,8 +476,8 @@ def test_a_bad_download_is_never_spawned(box, bad):
 
 def test_the_rules_floor_itself_is_whole(box):
     """Exactly 90% of the registered size is complete (Nunba: >= the floor)."""
-    model, proj = _weights(box.models / MODEL, size=900), \
-        _put(box.models / 'mmproj-Qwen3.5-0.8B-F16.gguf')
+    model = _weights(box.models / MODEL, size=900)
+    _put(box.models / 'mmproj-Qwen3.5-0.8B-F16.gguf')
     ok, _ = _ensure(box)
     assert _arg(box.port.spawned[0], '--model') == str(model)
     assert ok is True
