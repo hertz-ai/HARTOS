@@ -58,6 +58,10 @@ class FakeVLM:
         self.cost_s = cost_s
         self.calls = []
 
+    def ensure_running(self, on_wait=None):
+        """VisionBackend's: a fake has no server to start."""
+        return True
+
     def rate_frame(self, image_bytes, prompt, *, long_side=768, max_tokens=80, timeout_s=20.0):
         self.calls.append({'jpeg': image_bytes, 'prompt': prompt, 'long_side': long_side,
                            'max_tokens': max_tokens, 'timeout_s': timeout_s})

@@ -5,8 +5,9 @@ Reel Studio scores at most 25 keyframes per reel with a rubric prompt
 makes per frame.  Its contract:
 
 * it never starts a server: the caption backend's lazy launch
-  (_ensure_running -> vlm_caption.requested -> a llama-server spawn) is for
-  the live captioner, and a tool that rates frames must not spawn one;
+  (ensure_running -> vlm_caption.requested -> a llama-server spawn) is asked
+  by its callers -- describe(), read_document(), and a reel's score_moments
+  once before its first uncached frame -- never by rate_frame itself;
 * it asks GET /health first and answers None when the server is not up;
 * the request is the shared vision transport's (_vision_complete), with the
   frame at a 768 px long side, temperature 0, thinking off, an 80-token
@@ -120,7 +121,7 @@ def test_a_server_that_is_not_serving_is_never_started(health):
     backend = lvb.Qwen08BBackend(port=9555)
     with patch.object(lvb, 'pooled_get', **health), \
          patch.object(lvb, 'pooled_post') as post, \
-         patch.object(lvb.Qwen08BBackend, '_ensure_running') as launch, \
+         patch.object(lvb.Qwen08BBackend, 'ensure_running') as launch, \
          patch('subprocess.Popen') as popen, \
          patch('core.platform.events.emit_event') as emit:
         assert backend.rate_frame(_jpeg(), PROMPT, timeout_s=5.0) is None
@@ -315,7 +316,7 @@ def _expected_page_body(page, prompt, model):
 def test_read_document_sends_the_same_bytes_as_before():
     page = _page()
     backend = lvb.Qwen08BBackend(port=9555)
-    with patch.object(backend, '_ensure_running', return_value=True), \
+    with patch.object(backend, 'ensure_running', return_value=True), \
          patch.object(lvb, 'pooled_post', return_value=_answer('page text')) as post:
         assert backend.read_document(page, 'read every line') == 'page text'
     assert post.call_args.args == ('http://127.0.0.1:9555/v1/chat/completions',)

@@ -17,7 +17,7 @@ import functools
 import logging
 import os
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Callable, Optional
 
 from core.http_pool import LLM_COMPLETION_TIMEOUT, pooled_get, pooled_post
 
@@ -133,7 +133,9 @@ class VisionBackend(AutoReportSubsystemFailures, ABC):
 
         Unlike describe() and read_document(), it never starts a model
         server: a server that does not answer /health is a None, and the
-        caller falls back.  ``timeout_s`` bounds the request itself, so a
+        caller falls back.  A caller that rates many frames asks
+        ensure_running() itself, once, before its first frame (Reel Studio's
+        score_moments does).  ``timeout_s`` bounds the request itself, so a
         caller with a time budget passes what is left of it.  It never
         raises, and it is not an auto-reported method (see
         AUTO_REPORTED_METHODS).
@@ -144,6 +146,27 @@ class VisionBackend(AutoReportSubsystemFailures, ABC):
             the request failed.  The default is None.
         """
         return None
+
+    def ensure_running(self, on_wait: Optional[Callable[[], None]] = None) -> bool:
+        """Make this backend able to answer now, starting its model server
+        when it has one to start.  True when it can answer.
+
+        describe() and read_document() ask it before they send anything;
+        rate_frame() never does, its caller asks it once (Reel Studio's
+        score_moments, before the first frame it needs the model for).
+
+        ``on_wait`` is called once, just before this method waits for a
+        server or starts one -- never when the backend is ready as it is --
+        so a caller can say the model is being made ready only when it is
+        (a reel's chat line).  A callback that raises is logged; the start
+        goes on.
+
+        The default is True and calls nothing: this backend has no server to
+        start (it loads its model in start(), talks to a server something
+        else runs, or has no model).  Qwen08BBackend's is the caption
+        server's lazy launch.
+        """
+        return True
 
     def start(self) -> bool:
         """Initialize the backend model. Returns True if ready."""
@@ -723,8 +746,13 @@ class Qwen08BBackend(VisionBackend):
 
     Purpose: always-on frame captioning → FrameStore activity table,
     reading document pages (read_document) for the book pipeline, and
-    rating Reel Studio keyframes (rate_frame, only while it is serving).
+    rating Reel Studio keyframes (rate_frame).
     NOT for computer use (use 4B Qwen3VLVisionBackend for that).
+
+    The server starts lazily, in ensure_running: describe() and
+    read_document() ask it per call; a reel asks it ONCE, before its first
+    keyframe that is not cached (score_moments), and rate_frame never asks
+    it, so 25 frames cost at most one start.
 
     Model: Qwen3.5-0.8B-UD-Q4_K_XL.gguf (~558MB) + mmproj-F16.gguf (~195MB)
     Download: unsloth/Qwen3.5-0.8B-GGUF (model + mmproj)
@@ -788,18 +816,19 @@ class Qwen08BBackend(VisionBackend):
         # DELETED 2026-09-22: ~60 lines of a SECOND caption-server launcher
         # used to sit here, after that unconditional `return True`.  It was
         # unreachable — dead since the lazy-start contract moved the launch
-        # into _ensure_running — but it was a byte-for-byte duplicate of the
-        # launcher below, including its own hardcoded 512-token window.  A dead
-        # parallel path still costs: it is the copy a reader greps up first,
-        # and it is the copy a future edit lands in.  The live launcher is
-        # _ensure_running; there is now exactly one.
+        # into ensure_running (then private: _ensure_running) — but it was a
+        # byte-for-byte duplicate of the launcher below, including its own
+        # hardcoded 512-token window.  A dead parallel path still costs: it is
+        # the copy a reader greps up first, and it is the copy a future edit
+        # lands in.  The live launcher is ensure_running; there is now exactly
+        # one.
 
     # 0.8B optimal: 512x288 (11KB JPEG) — only needs scene understanding, not coords
     CAPTION_WIDTH = 512
     CAPTION_HEIGHT = 288
     IDLE_TIMEOUT_S = 300  # Unload after 5 min with no frames
     #: How long a FAILED launch suppresses the next attempt.  Not forever:
-    #: see _ensure_running for why permanence was a defect (#102).
+    #: see ensure_running for why permanence was a defect (#102).
     LAUNCH_RETRY_S = 120
 
     def __init__(self, port: int = None):
@@ -810,12 +839,22 @@ class Qwen08BBackend(VisionBackend):
         self._last_describe_time = 0.0
         self._server_proc = None  # subprocess.Popen object (not just PID)
 
-    def _ensure_running(self) -> bool:
+    def ensure_running(self, on_wait: Optional[Callable[[], None]] = None) -> bool:
         """Lazy-start: launch 0.8B server on first frame, not at boot.
+
+        VisionBackend.ensure_running for the caption server (it was the
+        private _ensure_running until 2026-10-14; describe(),
+        read_document() and Reel Studio's score_moments call it).
 
         HARTOS emits 'vlm_caption.requested' event. In bundled mode, Nunba
         subscribes to this event and calls its own start_caption_server().
         In standalone mode, HARTOS uses model_lifecycle to launch directly.
+
+        ``on_wait`` is called once, after the server was found not serving
+        and before the event is sent: not when it is up, not while a failed
+        launch's cooldown holds.  In its own try, so a caller's progress
+        line that raises never skips the start it announces (review of
+        42735064e).
 
         Dependency direction: Nunba → HARTOS (never HARTOS → Nunba).
 
@@ -861,6 +900,12 @@ class Qwen08BBackend(VisionBackend):
                 self.stop()
         self._launch_attempted = True
         self._launch_attempted_at = _t.time()
+
+        if on_wait is not None:
+            try:
+                on_wait()
+            except Exception as e:
+                logger.warning(f"Qwen3.5-0.8B: on_wait raised ({e}); starting anyway")
 
         # Emit event — Nunba subscribes in bundled mode and starts the server
         try:
@@ -991,7 +1036,7 @@ class Qwen08BBackend(VisionBackend):
     def describe(self, frame_bytes: bytes, prompt: str = '') -> Optional[str]:
         import base64, time
         # Lazy-start on first frame
-        if not self._ensure_running():
+        if not self.ensure_running():
             return None
         self._last_describe_time = time.time()
         try:
@@ -1034,7 +1079,7 @@ class Qwen08BBackend(VisionBackend):
         as describe(), none of its caption shrink (512x288 at 100 tokens is
         far too little to read a page)."""
         import time
-        if not self._ensure_running():
+        if not self.ensure_running():
             return None
         self._last_describe_time = time.time()
         return _read_page_with(self.completions_url(), image_bytes, prompt, model='local')
@@ -1044,10 +1089,12 @@ class Qwen08BBackend(VisionBackend):
         """A keyframe rating on the caption server, ONLY if it is already
         serving (see VisionBackend.rate_frame).
 
-        Never _ensure_running: that lazy start emits vlm_caption.requested
-        and, standalone, spawns a llama-server -- right for the live
-        captioner, wrong for a tool that rates 25 frames and has a
-        deterministic fallback.  Not serving is a None.
+        Never ensure_running per frame: that start emits
+        vlm_caption.requested and waits for the server, and a reel rates up
+        to 25 frames on a time budget with a deterministic fallback.  The
+        rule: the reel (score_moments) asks ensure_running ONCE, before its
+        first frame that is not cached; each frame then only asks /health.
+        Not serving is a None.
         """
         return _rate_frame_at(self.completions_url(), self._is_serving, image_bytes, prompt,
                               model='local', long_side=long_side, max_tokens=max_tokens,

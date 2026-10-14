@@ -287,8 +287,8 @@ def produce_reel(sources: Sequence[Any], *, style: Mapping, workdir: str, out_pa
 
         say('reel_moments', 'Finding the best moments...')
         keys = keyframes_mod.pick_keyframes(analyses)
-        # Her chat says the vision model is being made ready only when
-        # score_moments asks for its lazy start (a frame needs the model).
+        # Her chat says the vision model is being made ready only when a frame
+        # needs the model AND its start (ensure_running) has to wait for it.
         moments = moments_mod.score_moments(keys, backend=backend, on_start=lambda: say(
             'reel_moments', 'Getting the vision model ready and finding the best moments...'))
         lap('moments')
@@ -413,8 +413,13 @@ def _ok_message(media: Mapping, notes: Sequence[str], song_note: Optional[str] =
     if C.NOTE_NO_FINAL_LOOK in notes:
         text += (' No finished look was found in the clips, so the reel ends on the last shot; '
                  'say so.')
-    from integrations.reel_studio.media.moments import NOTE_VLM_FALLBACK
-    if NOTE_VLM_FALLBACK in notes:
+    from integrations.reel_studio.media.moments import NOTE_VLM_BUDGET, NOTE_VLM_FALLBACK
+    if NOTE_VLM_FALLBACK in notes and NOTE_VLM_BUDGET in notes:
+        # No frame rated and the time ran out: its start used the budget.
+        text += (' The vision model on this computer was still starting when the time for '
+                 'judging the shots ran out, so the shots were chosen by sharpness and '
+                 'filming order instead; say so.')
+    elif NOTE_VLM_FALLBACK in notes:
         text += (' The vision model on this computer gave no answer, or an answer that could '
                  'not be used, so the shots were chosen by sharpness and filming order '
                  'instead; say so.')

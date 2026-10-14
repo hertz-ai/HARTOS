@@ -6,16 +6,19 @@ Before b263da313, score_moments only ever called rate_frame, which by design
 never starts a server (tests/unit/test_vision_rate_frame.py): a reel made
 while the 0.8B caption server was down rated nothing and nothing asked for
 the server.  Now score_moments asks the backend's own lazy start -- the one
-describe() and read_document() already use, Qwen08BBackend._ensure_running:
-a 'vlm_caption.requested' event that Nunba's subscriber answers with
-llama_config.start_caption_server, then the standalone launch -- ONCE per
-reel, just before the first frame that is not already cached, and her chat
-says the vision model is being made ready only then.  The start keeps its own
-waits: the time it takes COUNTS AGAINST the moments budget and is NOT capped
-by it.  rate_frame itself still never starts anything.
+describe() and read_document() already use, the public
+VisionBackend.ensure_running (Qwen08BBackend's: a 'vlm_caption.requested'
+event that Nunba's subscriber answers with llama_config.start_caption_server,
+then the standalone launch) -- ONCE per reel, just before the first frame
+that is not already cached.  Her chat says the vision model is being made
+ready only when that start has to wait for the server (not when it is
+already up), and a progress line that fails never skips the start.  The
+start keeps its own waits: the time it takes COUNTS AGAINST the moments
+budget and is NOT capped by it, and when it used all of it, the reply says
+the model was still starting.  rate_frame itself still never starts anything.
 
 Real code throughout: get_vision_backend(REEL_VLM_DEFAULT) builds the real
-Qwen08BBackend and its real _ensure_running runs.  Only the boundaries are
+Qwen08BBackend and its real ensure_running runs.  Only the boundaries are
 replaced: the caption server's HTTP (/health and /v1/chat/completions, at
 lightweight_backend's pooled_get / pooled_post), the platform event Nunba
 subscribes to (core.platform.events.emit_event), the standalone launcher's
@@ -135,21 +138,25 @@ class _Clock:
 
 
 @contextlib.contextmanager
-def _caption_port(srv):
+def _caption_port(srv, spy=True):
     """Every boundary of the caption server replaced by ``srv``.  Yields
-    ``lazy`` (a spy on the backend's real _ensure_running), ``post`` (the
-    chat-completions POST) and ``sleep``; nothing may be spawned."""
-    real = lvb.Qwen08BBackend._ensure_running
-    with patch.object(lvb, 'pooled_get', side_effect=srv.health), \
-         patch.object(lvb, 'pooled_post', side_effect=srv.complete) as post, \
-         patch.object(lvb.Qwen08BBackend, '_ensure_running', autospec=True,
-                      side_effect=real) as lazy, \
-         patch('core.platform.events.emit_event', side_effect=srv.emit), \
-         patch(STANDALONE_BINARY, return_value=None), \
-         patch('subprocess.Popen') as popen, \
-         patch('time.sleep') as sleep:
+    ``lazy`` (a spy on the backend's real ensure_running; None when ``spy``
+    is False), ``post`` (the chat-completions POST) and ``sleep``; nothing
+    may be spawned."""
+    with contextlib.ExitStack() as stack:
+        lazy = None
+        if spy:
+            lazy = stack.enter_context(patch.object(
+                lvb.Qwen08BBackend, 'ensure_running', autospec=True,
+                side_effect=lvb.Qwen08BBackend.ensure_running))
+        stack.enter_context(patch.object(lvb, 'pooled_get', side_effect=srv.health))
+        post = stack.enter_context(patch.object(lvb, 'pooled_post', side_effect=srv.complete))
+        stack.enter_context(patch('core.platform.events.emit_event', side_effect=srv.emit))
+        stack.enter_context(patch(STANDALONE_BINARY, return_value=None))
+        popen = stack.enter_context(patch('subprocess.Popen'))
+        sleep = stack.enter_context(patch('time.sleep'))
         yield SimpleNamespace(lazy=lazy, post=post, sleep=sleep)
-    popen.assert_not_called()
+        popen.assert_not_called()
 
 
 @pytest.fixture
@@ -158,7 +165,7 @@ def server(tmp_path):
     REEL_VLM_DEFAULT through get_vision_backend), against ``_CaptionServer``.
 
     Returns ``score(srv, keys, **kw) -> (doc, lazy_starts, completions)``:
-    ``lazy_starts`` counts calls of the backend's real _ensure_running,
+    ``lazy_starts`` counts calls of the backend's real ensure_running,
     ``completions`` is the mocked chat-completions POST.  Calls in one test
     share one rating cache."""
     def score(srv, keys, **kw):
@@ -262,7 +269,7 @@ def test_the_start_is_asked_at_the_first_frame_that_is_not_cached(server):
 
 @requires_ffmpeg
 def test_a_lazy_start_that_raises_still_finishes_the_reel(clip_files, tmp_path, monkeypatch):
-    """The backend's _ensure_running raises.  The raise is logged, every
+    """The backend's ensure_running raises.  The raise is logged, every
     keyframe is still offered to rate_frame one by one and falls back on its
     own, and the real reel is made, checked and delivered -- not a
     'could not render' failure."""
@@ -281,7 +288,7 @@ def test_a_lazy_start_that_raises_still_finishes_the_reel(clip_files, tmp_path, 
     srv = _CaptionServer(up=False, nunba_starts_it=False)
     with patch.object(lvb, 'pooled_get', side_effect=srv.health), \
          patch.object(lvb, 'pooled_post', side_effect=srv.complete) as post, \
-         patch.object(lvb.Qwen08BBackend, '_ensure_running', autospec=True,
+         patch.object(lvb.Qwen08BBackend, 'ensure_running', autospec=True,
                       side_effect=RuntimeError('the launcher broke')) as lazy:
         result = P.make_reel(user_id=UID, prompt_id=PID, request_id='req-3',
                              clips=[sf.to_dict() for sf in clips],
@@ -350,6 +357,32 @@ def test_her_chat_says_the_vision_model_is_being_readied_when_the_start_is_asked
     assert doc['src'] == 'vlm'
 
 
+def test_her_chat_is_not_told_the_model_is_being_readied_when_it_is_already_up(turn):
+    """Review of 42735064e: the shared caption server is up (draft-first
+    chat keeps it so), the start has nothing to wait for, and her chat must
+    not say the vision model is being made ready."""
+    said = []
+    srv = _CaptionServer(up=True, chat=said)
+    with _caption_port(srv, spy=False):
+        doc = _moments_step(turn, _keys(2), said)
+    assert srv.asks == []
+    assert _readies(said) == [], said
+    assert doc['src'] == 'vlm'
+
+
+def test_a_progress_line_that_fails_never_skips_the_start(tmp_path):
+    """Review of 42735064e: on_start sat inside the try that guards the
+    start, so a progress line that raised skipped the start and every frame
+    fell back.  The start is still asked and the frames are rated."""
+    def broken():
+        raise RuntimeError('her chat is unreachable')
+    srv = _CaptionServer(up=False, nunba_starts_it=True)
+    with _caption_port(srv, spy=False) as port:
+        doc = M.score_moments(_keys(2), cache_dir=str(tmp_path / 'cache'), on_start=broken)
+    assert len(srv.asks) == 1, 'the start was skipped because its progress line raised'
+    assert doc['src'] == 'vlm' and port.post.call_count == 2
+
+
 def test_a_retried_reel_whose_frames_are_all_cached_neither_waits_nor_starts_a_server(turn):
     """Her reel is made again from the same clips (a retry): every keyframe
     was rated and cached the first time.  The retry asks the model nothing,
@@ -409,6 +442,31 @@ def test_the_reply_says_why_the_fallback_ran(turn, model):
     assert 'vision model' in message and 'no answer' in message, result['message']
     assert 'could not be used' in message, result['message']
     assert 'did not answer' not in message, result['message']
+    assert 'still starting' not in message, result['message']
+
+
+def test_the_reply_says_the_model_was_still_starting_when_its_start_used_the_time(turn):
+    """Review of 42735064e: the start used the whole moments budget, so no
+    frame was asked (moments' NOTE_VLM_BUDGET beside NOTE_VLM_FALLBACK; no
+    new reason record).  Her agent is told the vision model was still
+    starting when the time ran out, not that it gave no answer."""
+    from integrations.reel_studio import pipeline as P
+    fake = _fake_production(P)
+
+    def produce(*a, **kw):
+        production = fake(*a, **kw)
+        production.moments = {'src': 'fallback', 'final_look_found': True,
+                              'notes': [M.NOTE_VLM_FALLBACK, M.NOTE_VLM_BUDGET]}
+        return production
+    turn.mp.setattr(P, 'produce_reel', produce)
+    clip = _small_clip(turn)
+    result = P.make_reel(user_id=UID, prompt_id=PID, request_id='r', clips=[clip.to_dict()],
+                         style=C.make_style({}))
+    assert result['status'] == 'ok', result
+    message = result['message'].lower()
+    assert 'vision model' in message and 'still starting' in message, result['message']
+    assert 'ran out' in message, result['message']
+    assert 'no answer' not in message, result['message']
 
 
 def test_a_reel_the_model_rated_does_not_say_it_fell_back(turn):

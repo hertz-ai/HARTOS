@@ -46,6 +46,10 @@ class FakeVision:
         self.answer = answer
         self.calls = 0
 
+    def ensure_running(self, on_wait=None):
+        """VisionBackend's: a fake has no server to start."""
+        return True
+
     def rate_frame(self, image_bytes, prompt, *, long_side=768, max_tokens=80, timeout_s=20.0):
         self.calls += 1
         if not self.answer:
