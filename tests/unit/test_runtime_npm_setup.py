@@ -535,10 +535,73 @@ def test_a_background_setup_that_raises_hands_the_error_to_its_waiter(env, gated
     monkeypatch.setenv(FLAG, '1')
 
     def boom(*a, **k):
-        raise RuntimeError('a bug in the installer')
-    monkeypatch.setattr(model_storage.ModelStorageManager, 'install_npm_project', boom)
+        raise RuntimeError('a bug in setup_tool')
+    monkeypatch.setattr(runtime_manager.RuntimeToolManager, 'setup_tool', boom)
     with pytest.raises(RuntimeError):
         env.rtm.setup_tool_async(GATED).result(timeout=10)
+
+
+# ── setup_tool's npm branch never raises (amendment A24b ii) ─────────────
+#
+# Review of 38a220495: the npm branch caught only NpmSetupFailed.  With
+# manifest.json unwritable the receipt write raised PermissionError out of
+# setup_tool, so POST /api/tools/<name>/setup answered from the exception and
+# a reel's background setup handed it to its waiter.
+
+def test_a_receipt_that_cannot_be_written_is_a_failed_setup_not_a_raise(env):
+    env.storage.base_dir.mkdir(parents=True, exist_ok=True)
+    env.storage.manifest_file.mkdir()       # a folder where the file goes: never writable
+    result = env.rtm.setup_tool(TOOL)
+    assert 'error' in result and not result.get('ready'), result
+    assert str(env.storage.get_tool_dir(TOOL)) in result['error']
+    assert env.rtm.tool_ready(TOOL) is False
+
+
+def test_the_installer_raises_only_npm_setup_failed(env):
+    env.storage.base_dir.mkdir(parents=True, exist_ok=True)
+    env.storage.manifest_file.mkdir()
+    with pytest.raises(model_storage.NpmSetupFailed):
+        env.storage.install_npm_project(TOOL, str(env.project))
+
+
+def test_a_bug_in_the_installer_is_a_failed_setup_not_a_raise(env, monkeypatch, caplog):
+    def boom(*a, **k):
+        raise RuntimeError('a bug in the installer')
+    monkeypatch.setattr(model_storage.ModelStorageManager, 'install_npm_project', boom)
+    with caplog.at_level('ERROR', logger=runtime_manager.logger.name):
+        result = env.rtm.setup_tool(TOOL)
+    assert 'a bug in the installer' in result.get('error', '') and not result.get('ready'), result
+    assert any(r.exc_info for r in caplog.records), 'the traceback is logged'
+
+
+# ── one flag says "on demand" (amendment A24b iii) ────────────────────────
+#
+# Review of 38a220495: tool_ready keyed off download_type == 'npm' while
+# setup_tool, start_tool, get_tool_status and setup_available_tools key off
+# on_demand.  ``on_demand`` is the one answer: an npm row without it is a
+# server tool to all of them, so it is ready when it serves, not because its
+# packages are installed.
+
+def test_on_demand_is_the_one_flag_tool_ready_reads(env, monkeypatch):
+    row = dict(runtime_manager.TOOL_CONFIGS[TOOL])
+    del row['on_demand']
+    monkeypatch.setitem(runtime_manager.TOOL_CONFIGS, 'demo_npm_server', row)
+    env.storage.install_npm_project('demo_npm_server', row['npm_project'])
+    assert env.storage.npm_install_is_complete('demo_npm_server', row['npm_project'])
+    assert env.rtm.tool_ready('demo_npm_server') is False, 'nothing serves it'
+    env.rtm.start_tool('demo_npm_server')
+    assert env.popens == ['demo_npm_server'], 'start_tool treats it as a server too'
+    # The on-demand row is ready once set up, and nothing is started for it.
+    env.rtm.setup_tool(TOOL)
+    assert env.rtm.tool_ready(TOOL) is True and env.popens == ['demo_npm_server']
+
+
+def test_every_on_demand_row_is_an_npm_project():
+    """tool_ready answers an on-demand row from its npm setup, the one kind
+    of on-demand setup there is (setup_tool's npm branch)."""
+    for name, row in runtime_manager.TOOL_CONFIGS.items():
+        if row.get('on_demand'):
+            assert row.get('download_type') == 'npm' and row.get('npm_project'), name
 
 
 @pytest.mark.parametrize('kind, answer, said', [

@@ -589,43 +589,56 @@ class ModelStorageManager:
         (not enough free disk, or it cannot be read; no package.json in the
         project; Node.js or npm missing; a step failed or ran past its
         bound; npm made no node_modules for a project that names
-        dependencies; the copy failed), leaving no receipt.
+        dependencies; the copy failed; any other OSError, such as a
+        project file that cannot be read or a receipt that cannot be
+        written), leaving no receipt.  NpmSetupFailed is the only error it
+        raises for a setup that did not finish (amendment A24b ii).
         """
         tool_dir = self.get_tool_dir(tool_name)
         with self._npm_lock(tool_dir):
-            if self.npm_install_is_complete(tool_name, project_dir):
-                return tool_dir
-            if not os.path.isfile(os.path.join(project_dir, 'package.json')):
-                # npm install in a folder with no package.json walks up to the
-                # nearest ancestor that has one and installs there.
-                raise NpmSetupFailed('the project at %s has no package.json' % project_dir)
-            if min_free_bytes > 0:
-                self._check_free_disk(tool_dir, min_free_bytes)
-            node, npm = find_node(), find_npm()
-            if not node or not npm:
-                raise NpmSetupFailed(
-                    'Node.js is not installed on this computer (%s not found)'
-                    % ' and '.join(n for n, p in (('node', node), ('npm', npm)) if not p))
-            fingerprint = self.npm_project_fingerprint(project_dir)
             try:
-                self._mirror_npm_project(project_dir, tool_dir)
+                return self._install_npm_project_locked(tool_name, project_dir, tool_dir,
+                                                        prepare, timeout_s, min_free_bytes)
             except OSError as e:
-                raise NpmSetupFailed(f'the project could not be copied into {tool_dir}: {e}') from e
-            # npm on Windows is a .cmd shim; launch_argv is how a shim is run.
-            from integrations.coding_agent.installer import launch_argv
-            # --prefer-offline: what npm's cache already holds is not fetched
-            # again (a re-setup after an update changes little).
-            self._npm_step(launch_argv([npm, 'install', '--no-audit', '--no-fund',
-                                        '--loglevel=error', '--prefer-offline']),
-                           'npm install', tool_dir, timeout_s)
-            if not (tool_dir / 'node_modules').is_dir() \
-                    and self._npm_declares_dependencies(project_dir):
-                raise NpmSetupFailed('npm install finished but made no node_modules in %s'
-                                     % tool_dir)
-            if prepare:
-                self._npm_step([node, prepare], prepare, tool_dir, NPM_PREPARE_TIMEOUT_S)
-            self.mark_downloaded(tool_name, 'npm:' + fingerprint, self.get_tool_size(tool_name))
+                raise NpmSetupFailed(f'the setup in {tool_dir} could not finish: {e}') from e
+
+    def _install_npm_project_locked(self, tool_name: str, project_dir: str, tool_dir: Path,
+                                    prepare: Optional[str], timeout_s: float,
+                                    min_free_bytes: int) -> Path:
+        """install_npm_project's steps, under its per-folder lock."""
+        if self.npm_install_is_complete(tool_name, project_dir):
             return tool_dir
+        if not os.path.isfile(os.path.join(project_dir, 'package.json')):
+            # npm install in a folder with no package.json walks up to the
+            # nearest ancestor that has one and installs there.
+            raise NpmSetupFailed('the project at %s has no package.json' % project_dir)
+        if min_free_bytes > 0:
+            self._check_free_disk(tool_dir, min_free_bytes)
+        node, npm = find_node(), find_npm()
+        if not node or not npm:
+            raise NpmSetupFailed(
+                'Node.js is not installed on this computer (%s not found)'
+                % ' and '.join(n for n, p in (('node', node), ('npm', npm)) if not p))
+        fingerprint = self.npm_project_fingerprint(project_dir)
+        try:
+            self._mirror_npm_project(project_dir, tool_dir)
+        except OSError as e:
+            raise NpmSetupFailed(f'the project could not be copied into {tool_dir}: {e}') from e
+        # npm on Windows is a .cmd shim; launch_argv is how a shim is run.
+        from integrations.coding_agent.installer import launch_argv
+        # --prefer-offline: what npm's cache already holds is not fetched
+        # again (a re-setup after an update changes little).
+        self._npm_step(launch_argv([npm, 'install', '--no-audit', '--no-fund',
+                                    '--loglevel=error', '--prefer-offline']),
+                       'npm install', tool_dir, timeout_s)
+        if not (tool_dir / 'node_modules').is_dir() \
+                and self._npm_declares_dependencies(project_dir):
+            raise NpmSetupFailed('npm install finished but made no node_modules in %s'
+                                 % tool_dir)
+        if prepare:
+            self._npm_step([node, prepare], prepare, tool_dir, NPM_PREPARE_TIMEOUT_S)
+        self.mark_downloaded(tool_name, 'npm:' + fingerprint, self.get_tool_size(tool_name))
+        return tool_dir
 
     # ── Cleanup ──────────────────────────────────────────────────
 

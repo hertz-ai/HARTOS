@@ -267,7 +267,12 @@ class RuntimeToolManager:
         elif dl_type == 'npm':
             # Idempotent and one-at-a-time (install_npm_project): a set-up
             # project returns at once; the reason a setup failed is kept
-            # for the caller, who tells the person.
+            # for the caller, who tells the person.  Nothing raises out of
+            # here (amendment A24b ii): the installer turns an OSError into
+            # NpmSetupFailed, and anything else (a bug) is logged with its
+            # traceback and answered like a failed setup, so neither POST
+            # /api/tools/<name>/setup nor a background setup's waiter gets an
+            # exception in place of the reason.
             try:
                 path = self.storage.install_npm_project(
                     tool_name, config['npm_project'], prepare=config.get('npm_prepare'),
@@ -275,6 +280,10 @@ class RuntimeToolManager:
             except NpmSetupFailed as e:
                 logger.warning(f"Setup of {tool_name} failed: {e}")
                 return dict(result, error=str(e))
+            except Exception as e:
+                logger.error(f"Setup of {tool_name} raised {type(e).__name__}: {e}",
+                             exc_info=True)
+                return dict(result, error=f'setting {tool_name} up failed: {e}')
         else:
             return {'error': f'Unknown download_type: {dl_type}'}
 
@@ -447,13 +456,17 @@ class RuntimeToolManager:
 
     def tool_ready(self, tool_name: str) -> bool:
         """Is ``tool_name`` usable now: switched on (tool_enabled) and, for an
-        on-demand tool, completely set up (an npm project:
+        on-demand tool, completely set up (its npm project:
         model_storage.npm_install_is_complete), for any other tool serving
-        (_is_server_alive)."""
+        (_is_server_alive).  ``on_demand`` is the one flag that says which,
+        here as in setup_tool, start_tool, get_tool_status and
+        setup_available_tools (amendment A24b iii); an on-demand row is an
+        npm project (download_type 'npm', npm_project), the one kind of
+        on-demand setup."""
         config = TOOL_CONFIGS.get(tool_name)
         if not config or not self.tool_enabled(tool_name):
             return False
-        if config.get('download_type') == 'npm':
+        if config.get('on_demand'):
             return self.storage.npm_install_is_complete(tool_name, config['npm_project'])
         return self._is_server_alive(tool_name)
 
