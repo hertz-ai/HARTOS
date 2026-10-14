@@ -82,25 +82,51 @@ def test_tenant_claim_wins_over_a_free_tier_body():
     assert lane == 'revenue'
 
 
+RID = 'api_1760300000_abcd1234'
+
+
 def test_the_nodes_lane_claim_in_the_customers_jwt_is_revenue():
     """On a keyless node the metered self-POST carries the CUSTOMER's JWT
     (chat_turn_request mints it for the key's owner, task #153), so the
     request is not the node talking to itself and the body's word is not
     believed; the node's word travels instead as the token's ``lane`` claim,
-    which only the node's secret can mint.  A claim naming any other lane,
-    or no claim, leaves the person's turn a user turn."""
-    customer = _decoder({'user_id': 'cust-42', 'lane': 'revenue'})
+    which only the node's secret can mint, bound to the one turn it was
+    minted for by its ``rid`` claim.  A claim naming any other lane, or no
+    claim, leaves the person's turn a user turn."""
+    customer = _decoder({'user_id': 'cust-42', 'lane': 'revenue', 'rid': RID})
     assert lane_for_chat('tok', {'prompt': 'x', 'lane': 'revenue'}, 'jwt',
-                         decode_jwt=customer, tenant=TENANT) == 'revenue'
+                         decode_jwt=customer, tenant=TENANT, request_id=RID) == 'revenue'
     # The claim alone is enough: the body is not consulted for it.
     assert lane_for_chat('tok', {'prompt': 'x'}, 'jwt',
-                         decode_jwt=customer, tenant=TENANT) == 'revenue'
+                         decode_jwt=customer, tenant=TENANT, request_id=RID) == 'revenue'
     assert lane_for_chat('tok', {'prompt': 'x', 'lane': 'revenue'}, 'jwt',
-                         decode_jwt=_decoder({'user_id': 'cust-42', 'lane': 'user'}),
-                         tenant=TENANT) == 'user'
+                         decode_jwt=_decoder({'user_id': 'cust-42', 'lane': 'user', 'rid': RID}),
+                         tenant=TENANT, request_id=RID) == 'user'
     assert lane_for_chat('tok', {'prompt': 'x', 'lane': 'revenue'}, 'jwt',
                          decode_jwt=_decoder({'user_id': 'cust-42'}),
-                         tenant=TENANT) == 'user'
+                         tenant=TENANT, request_id=RID) == 'user'
+
+
+def test_the_lane_claim_buys_the_lane_only_for_the_turn_it_was_minted_for():
+    """Replay (task #157): the token is minted per self-POST and sent only to
+    this node's own /chat, but a captured one must not buy the revenue lane
+    for any later turn of that user: the claim is read only when the token's
+    ``rid`` is the request's id.  A claim with no rid, another turn's rid, or
+    a request with no id is a user turn."""
+    minted = _decoder({'user_id': 'cust-42', 'lane': 'revenue', 'rid': RID})
+    assert lane_for_chat('tok', {}, 'jwt', decode_jwt=minted, tenant=TENANT,
+                         request_id=RID) == 'revenue'
+    assert lane_for_chat('tok', {}, 'jwt', decode_jwt=minted, tenant=TENANT,
+                         request_id='api_1760300999_ffff0000') == 'user'
+    assert lane_for_chat('tok', {}, 'jwt', decode_jwt=minted, tenant=TENANT,
+                         request_id=None) == 'user'
+    assert lane_for_chat('tok', {}, 'jwt', decode_jwt=minted, tenant=TENANT) == 'user'
+    unbound = _decoder({'user_id': 'cust-42', 'lane': 'revenue'})
+    assert lane_for_chat('tok', {}, 'jwt', decode_jwt=unbound, tenant=TENANT,
+                         request_id=RID) == 'user'
+    # The commerce tenant claim is the session's, not one turn's: unchanged.
+    assert lane_for_chat('tok', {}, 'jwt', decode_jwt=_decoder({'user_id': 'c1', 'tid': TENANT}),
+                         tenant=TENANT, request_id='msg_other') == 'revenue'
 
 
 # ─── Which org goals earn (dispatch.is_revenue_goal_type) ────────────────────
@@ -244,7 +270,8 @@ def test_the_metered_self_post_is_registered_revenue_from_either_credential(lane
     from core.request_lane import register_chat_lane
     for n, (auth, tok, dec) in enumerate((
             ('api_key', '', None),
-            ('jwt', 'tok', _decoder({'user_id': 'cust-42', 'lane': 'revenue'})),
+            ('jwt', 'tok', _decoder({'user_id': 'cust-42', 'lane': 'revenue',
+                                     'rid': 'api_1760300000_jwt_1'})),
             ('jwt', 'tok', _decoder({'user_id': 'system_daemon'})))):
         rid = 'api_1760300000_%s_%d' % (auth, n)
         assert register_chat_lane(rid, tok, {'lane': 'revenue'}, auth, decode_jwt=dec,
@@ -255,8 +282,16 @@ def test_the_metered_self_post_is_registered_revenue_from_either_credential(lane
                               tenant=TENANT, is_genuine=_genuine) == 'user'
     # The free tier's customer JWT carries the user lane as its claim.
     assert register_chat_lane('api_1760300000_free_jwt', 'tok', {'lane': 'user'}, 'jwt',
-                              decode_jwt=_decoder({'user_id': 'cust-42', 'lane': 'user'}),
+                              decode_jwt=_decoder({'user_id': 'cust-42', 'lane': 'user',
+                                                   'rid': 'api_1760300000_free_jwt'}),
                               tenant=TENANT, is_genuine=_genuine) == 'user'
+    # A captured customer token replayed with another request id registers
+    # the user lane, whatever the body says (task #157).
+    replay = _decoder({'user_id': 'cust-42', 'lane': 'revenue', 'rid': 'api_1760300000_jwt_1'})
+    assert register_chat_lane('api_1760300777_replay', 'tok', {'lane': 'revenue'}, 'jwt',
+                              decode_jwt=replay, tenant=TENANT, system_identities=SYSTEM,
+                              is_genuine=_genuine) == 'user'
+    assert lanes.lane_for_request('api_1760300777_replay') == 'user'
 
 
 def test_a_shopper_is_registered_revenue_and_a_person_user(lanes):
@@ -290,7 +325,8 @@ def test_a_local_only_turn_is_never_registered_revenue(lanes):
     assert lanes.lane_for_request('api_1760300000_local') == 'user'
     # The node's lane claim in a customer's JWT is refused the same way.
     assert register_chat_lane('api_1760300000_local_jwt', 'tok', {}, 'jwt',
-                              decode_jwt=_decoder({'user_id': 'cust-42', 'lane': 'revenue'}),
+                              decode_jwt=_decoder({'user_id': 'cust-42', 'lane': 'revenue',
+                                                   'rid': 'api_1760300000_local_jwt'}),
                               tenant=TENANT, is_genuine=_genuine, local_only=True) == 'user'
     # The same turns without it: exactly as before.
     assert register_chat_lane('msg_local_2', 'tok', {}, 'jwt', decode_jwt=shopper,

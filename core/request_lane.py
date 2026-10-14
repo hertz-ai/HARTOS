@@ -18,7 +18,9 @@ Two facts make a turn revenue-bearing, and /chat can verify both itself:
      JWT the node mints for the CUSTOMER it is the token's ``lane`` claim,
      since only the node's secret mints one (task #153: the relay used to
      carry the system identity, so every paying customer ran as
-     system_daemon).  The same word in any other body is just a word.
+     system_daemon), read only when the token's ``rid`` claim names this
+     request's id, so a captured token buys nothing for a later turn (task
+     #157).  The same word in any other body is just a word.
 
 Everything else is a user turn.  The daemon lane is not decided here: the
 request id's ``daemon_`` prefix decides it on the wire
@@ -89,16 +91,19 @@ def is_internal_caller(auth_source, jwt_payload, system_identities=()):
 
 
 def lane_for_chat(bearer_token, body, auth_source, decode_jwt=None, tenant=None,
-                  system_identities=(), jwt_payload=None):
+                  system_identities=(), jwt_payload=None, request_id=None):
     # type: (...) -> str
-    """'revenue' or 'user' for one /chat request; never raises."""
+    """'revenue' or 'user' for one /chat request; never raises.
+    ``request_id`` is the request's own id: the node's lane claim in a JWT
+    is believed only when the token's ``rid`` claim names it."""
     payload = jwt_payload if isinstance(jwt_payload, dict) else _payload(bearer_token, decode_jwt)
     if tenant and payload.get('tid') == tenant:
         return LANE_REVENUE
-    # The node's word as the claim of a JWT it minted for a person's turn
-    # (chat_turn_request -> _internal_auth_headers(lane=...)); nobody else
-    # can sign one.
-    if payload.get('lane') == LANE_REVENUE:
+    # The node's word as the claim of a JWT it minted for ONE person's turn
+    # (chat_turn_request -> _internal_auth_headers(lane=..., rid=...));
+    # nobody else can sign one, and it holds for the turn it names only.
+    if (payload.get('lane') == LANE_REVENUE and request_id
+            and str(payload.get('rid') or '') == str(request_id)):
         return LANE_REVENUE
     if (isinstance(body, dict) and body.get('lane') == LANE_REVENUE
             and is_internal_caller(auth_source, payload, system_identities)):
@@ -145,7 +150,7 @@ def register_chat_lane(request_id, bearer_token, body, auth_source, decode_jwt=N
         return lane
     lane = lane_for_chat(bearer_token, body, auth_source, decode_jwt=decode_jwt,
                          tenant=tenant, system_identities=system_identities,
-                         jwt_payload=payload)
+                         jwt_payload=payload, request_id=request_id)
     if local_only and lane == LANE_REVENUE:
         lane = LANE_USER
     register_request_lane(request_id, lane)

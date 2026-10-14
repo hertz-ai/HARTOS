@@ -72,18 +72,21 @@ def chat_turn_request(user_id, prompt_id, content: str,
     A ``lane`` among ``fields`` is the node's own word about the turn
     (core.request_lane; the metered API says 'revenue' for a paying tier).
     It stays in the body, and when a JWT is minted it is also that token's
-    claim: a person's credential is not the node's, so /chat believes the
-    word from it only as a claim the node's secret signed.
+    claim, bound to this turn's request id by the token's 'rid' claim: a
+    person's credential is not the node's, so /chat believes the word from
+    it only as a claim the node's secret signed, and only for the one turn
+    it was signed for (task #157).
     """
     from core.chat_client import normalize_chat_body
     payload = {"user_id": user_id, "prompt_id": prompt_id,
                **chat_request_fields(content)}
     payload.update(fields)
     payload = normalize_chat_body(payload)
+    lane = fields.get('lane')
     try:
         from integrations.agent_engine.dispatch import _internal_auth_headers
-        headers = _internal_auth_headers(user_id=str(user_id), role='user',
-                                         lane=fields.get('lane'))
+        headers = _internal_auth_headers(user_id=str(user_id), role='user', lane=lane,
+                                         rid=payload.get('request_id') if lane else None)
     except Exception as e:  # never block a turn on this
         logger.warning(
             "internal auth header unavailable, calling /chat "

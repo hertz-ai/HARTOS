@@ -155,6 +155,23 @@ def test_a_paid_call_on_a_keyless_node_runs_as_the_customer_on_the_revenue_lane(
     assert r.status_code == 200
 
 
+def test_a_captured_customer_token_does_not_buy_the_revenue_lane_for_another_turn(
+        hie, lanes, monkeypatch):
+    """Task #157: the self-POST's token carries the node's lane word for ONE
+    turn (its rid claim).  Replayed at the real /chat by the same user with a
+    fresh request id and the same body word, the turn is admitted (the
+    identity is good) but registered on the user lane."""
+    monkeypatch.delenv('HEVOLVE_API_KEY', raising=False)
+    monkeypatch.setenv('HEVOLVE_NODE_TIER', 'central')
+    _r, sent = _metered_call(hie, monkeypatch)
+    assert lanes.lane_for_request(sent['json']['request_id']) == 'revenue'
+    replay = dict(sent['json'], request_id='api_replay_' + sent['json']['request_id'][-8:])
+    assert _chat(hie, monkeypatch, replay, sent['headers']) == 'registered'
+    assert lanes.lane_for_request(replay['request_id']) == 'user'
+    # The original turn's registration is untouched.
+    assert lanes.lane_for_request(sent['json']['request_id']) == 'revenue'
+
+
 def test_two_customers_on_a_keyless_node_never_share_an_identity(hie, lanes, monkeypatch):
     monkeypatch.delenv('HEVOLVE_API_KEY', raising=False)
     monkeypatch.setenv('HEVOLVE_NODE_TIER', 'central')

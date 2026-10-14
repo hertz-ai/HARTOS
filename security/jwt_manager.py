@@ -177,7 +177,8 @@ class JWTManager:
             logger.warning("SOCIAL_SECRET_KEY is shorter than 32 characters. Consider using a longer key.")
 
     def generate_access_token(self, user_id: str, username: str,
-                              tenant_id: str = None, lane: str = None) -> str:
+                              tenant_id: str = None, lane: str = None,
+                              rid: str = None) -> str:
         """Generate a short-lived LOCAL access token (1 hour).
 
         Optional `tenant_id` adds a 'tid' claim — used by central
@@ -191,10 +192,14 @@ class JWTManager:
         person's turn it relays to its own /chat (the metered API's
         self-POST through dispatch._internal_auth_headers); it is never
         taken from a request, and a person's own login token carries none.
+        `rid` (the turn's request id) travels beside it as the 'rid' claim
+        and binds the word to that one turn: the reader believes the lane
+        only for the request whose id the token names, so a captured token
+        buys nothing for a later turn (task #157).
         """
         return self._generate_token(
             user_id, username, 'access', ACCESS_TOKEN_EXPIRY, scope='local',
-            tenant_id=tenant_id, lane=lane
+            tenant_id=tenant_id, lane=lane, rid=rid
         )
 
     def generate_refresh_token(self, user_id: str, username: str,
@@ -219,7 +224,8 @@ class JWTManager:
     def _generate_token(self, user_id: str, username: str,
                         token_type: str, expiry: int,
                         scope: str = 'local',
-                        tenant_id: str = None, lane: str = None) -> str:
+                        tenant_id: str = None, lane: str = None,
+                        rid: str = None) -> str:
         if not HAS_JWT:
             # HMAC fallback cannot encode tenant_id (no JSON payload).
             # In cloud mode this is a hard failure — refuse rather than
@@ -254,6 +260,8 @@ class JWTManager:
             payload['tid'] = str(tenant_id)
         if lane:
             payload['lane'] = str(lane)
+        if rid:
+            payload['rid'] = str(rid)
         return pyjwt.encode(payload, self._secret_key, algorithm='HS256')
 
     def _generate_hmac_token(self, user_id: str, username: str) -> str:

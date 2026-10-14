@@ -59,13 +59,16 @@ class TestLocalTokenScope:
         """The node's own word that a turn it relays is revenue-bearing travels
         as a signed claim (core.request_lane reads it); a token minted without
         it carries none, so a person's own login token never says a lane."""
-        token = mgr.generate_access_token('cust-42', 'Customer', lane='revenue')
+        token = mgr.generate_access_token('cust-42', 'Customer', lane='revenue',
+                                          rid='api_1760300000_abcd1234')
         payload = mgr.decode_token(token, expected_type='access')
         assert payload['user_id'] == 'cust-42'
         assert payload['lane'] == 'revenue'
+        # Bound to the one turn it was minted for (task #157).
+        assert payload['rid'] == 'api_1760300000_abcd1234'
         plain = mgr.decode_token(mgr.generate_access_token('cust-42', 'Customer'),
                                  expected_type='access')
-        assert 'lane' not in plain
+        assert 'lane' not in plain and 'rid' not in plain
 
     def test_refresh_token_has_local_scope(self, mgr):
         token = mgr.generate_refresh_token('u1', 'alice')
@@ -329,8 +332,11 @@ class TestAuthModuleHiveFunctions:
         (the hardened manager or the legacy encoder), and a token minted
         without it has no lane."""
         from integrations.social.auth import generate_jwt, decode_jwt
-        assert decode_jwt(generate_jwt('cust-42', 'Customer', 'user', lane='revenue'))['lane'] == 'revenue'
-        assert 'lane' not in decode_jwt(generate_jwt('cust-42', 'Customer', 'user'))
+        claims = decode_jwt(generate_jwt('cust-42', 'Customer', 'user', lane='revenue',
+                                         rid='api_1760300000_abcd1234'))
+        assert claims['lane'] == 'revenue' and claims['rid'] == 'api_1760300000_abcd1234'
+        plain = decode_jwt(generate_jwt('cust-42', 'Customer', 'user'))
+        assert 'lane' not in plain and 'rid' not in plain
 
 
 # ═══════════════════════════════════════════════════════════════════════

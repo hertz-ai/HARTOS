@@ -85,7 +85,8 @@ def _local_dispatch_base_url() -> str:
 def _internal_auth_headers(user_id: str = SYSTEM_DAEMON_IDENTITY,
                             username: str = None,
                             role: str = 'admin',
-                            lane: str = None) -> Optional[Dict[str, str]]:
+                            lane: str = None,
+                            rid: str = None) -> Optional[Dict[str, str]]:
     """Build auth headers for internal /chat dispatch.
 
     Why: on central/regional tiers, security/middleware.py Gate 2 rejects
@@ -101,10 +102,13 @@ def _internal_auth_headers(user_id: str = SYSTEM_DAEMON_IDENTITY,
     ``lane``: the node's own word about the turn these headers are for
     (core.request_lane: 'revenue' for a paying API tier's turn), carried
     as the minted JWT's 'lane' claim, which /chat believes because only
-    the node's secret mints one.  When the key is sent instead, the claim
-    has nowhere to ride and the caller's body carries the word, which
-    /chat believes from the node's key (core.request_lane.is_internal_caller).
-    Only chat_contract.chat_turn_request passes it, for a person's turn
+    the node's secret mints one; ``rid`` is that turn's request id, carried
+    as the 'rid' claim so the word holds for that one turn and a captured
+    token buys nothing later (task #157).  When the key is sent instead,
+    the claim has nowhere to ride and the caller's body carries the word,
+    which /chat believes from the node's key
+    (core.request_lane.is_internal_caller).  Only
+    chat_contract.chat_turn_request passes them, for a person's turn
     relayed with that person's own identity (task #153: the metered API's
     self-POST, which used to carry this helper's default identity and so
     ran every paying customer as system_daemon in one shared session).
@@ -149,6 +153,7 @@ def _internal_auth_headers(user_id: str = SYSTEM_DAEMON_IDENTITY,
                 username=username or user_id,
                 role=role,
                 lane=lane,
+                rid=rid,
             )
             if jwt:
                 headers['Authorization'] = f'Bearer {jwt}'

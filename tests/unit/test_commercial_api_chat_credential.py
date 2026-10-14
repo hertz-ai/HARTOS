@@ -226,13 +226,20 @@ def test_each_metered_call_mints_its_own_request_id(app_client):
 @pytest.mark.parametrize('tier,lane', [('pro', 'revenue'), ('free', 'user')])
 def test_the_credential_is_minted_for_the_key_owner_with_the_tiers_lane(app_client, tier, lane):
     """The self-POST's credential names the customer and carries the tier's
-    lane as the node's word: free keys say user, paid keys say revenue."""
+    lane as the node's word: free keys say user, paid keys say revenue; the
+    word is bound to this one turn by its request id (task #157)."""
+    captured = {}
+
+    def fake_post(url, **kwargs):
+        captured['json'] = kwargs.get('json')
+        return _resp(200, {'response': 'ok'})
+
     patches = _tier_auth(tier)
     with patches[0], patches[1], patches[2], patches[3], patches[4], \
-            patch('core.http_pool.pooled_post',
-                  side_effect=lambda url, **kw: _resp(200, {'response': 'ok'})), \
+            patch('core.http_pool.pooled_post', side_effect=fake_post), \
             patch('integrations.agent_engine.dispatch._internal_auth_headers',
                   return_value=MINTED) as mint:
         app_client.post('/api/v1/intelligence/chat', json={'prompt': 'hello'},
                         headers={'X-API-Key': 'k'})
-    assert mint.call_args.kwargs == {'user_id': 'cust-42', 'role': 'user', 'lane': lane}
+    assert mint.call_args.kwargs == {'user_id': 'cust-42', 'role': 'user', 'lane': lane,
+                                     'rid': captured['json']['request_id']}
