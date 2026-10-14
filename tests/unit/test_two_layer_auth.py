@@ -55,6 +55,18 @@ class TestLocalTokenScope:
         payload = mgr.decode_token(token, expected_type='access')
         assert payload['iss'].startswith('node:')
 
+    def test_access_token_carries_the_nodes_lane_claim_only_when_asked(self, mgr):
+        """The node's own word that a turn it relays is revenue-bearing travels
+        as a signed claim (core.request_lane reads it); a token minted without
+        it carries none, so a person's own login token never says a lane."""
+        token = mgr.generate_access_token('cust-42', 'Customer', lane='revenue')
+        payload = mgr.decode_token(token, expected_type='access')
+        assert payload['user_id'] == 'cust-42'
+        assert payload['lane'] == 'revenue'
+        plain = mgr.decode_token(mgr.generate_access_token('cust-42', 'Customer'),
+                                 expected_type='access')
+        assert 'lane' not in plain
+
     def test_refresh_token_has_local_scope(self, mgr):
         token = mgr.generate_refresh_token('u1', 'alice')
         payload = mgr.decode_token(token, expected_type='refresh')
@@ -311,6 +323,14 @@ class TestAuthModuleHiveFunctions:
         token = generate_jwt('u1', 'alice', 'flat')
         payload = decode_jwt(token)
         assert payload.get('scope') == 'local'
+
+    def test_generate_jwt_carries_the_nodes_lane_claim_through_either_signer(self):
+        """generate_jwt(lane=...) reaches the claim whichever signer is in use
+        (the hardened manager or the legacy encoder), and a token minted
+        without it has no lane."""
+        from integrations.social.auth import generate_jwt, decode_jwt
+        assert decode_jwt(generate_jwt('cust-42', 'Customer', 'user', lane='revenue'))['lane'] == 'revenue'
+        assert 'lane' not in decode_jwt(generate_jwt('cust-42', 'Customer', 'user'))
 
 
 # ═══════════════════════════════════════════════════════════════════════

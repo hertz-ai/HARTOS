@@ -8,12 +8,17 @@ Two facts make a turn revenue-bearing, and /chat can verify both itself:
 
   1. The caller's JWT carries the commerce tenant claim (``tid``): a McGroce
      shopper or store owner whose token POST /api/commerce/session minted.
-  2. The body says ``lane: revenue`` AND the caller is the node itself: the
-     metered API endpoints' self-POST for a paying tier
-     (commercial_api._metered_backend_chat) arrives either with the node's
-     own key (``auth_source == 'api_key'``) or with the JWT the node mints
-     for its own system identity (dispatch._internal_auth_headers).  Nobody
-     else holds either.  The same word in any other body is just a word.
+  2. The node itself says ``lane: revenue`` for a paying tier's turn: the
+     metered API endpoints' self-POST (commercial_api._metered_backend_chat,
+     built for the key's owner by chat_contract.chat_turn_request).  The
+     node's word travels in the credential it sends.  Beside its own key
+     (``auth_source == 'api_key'``) it is the body's ``lane`` field; so is
+     the word beside the JWT the node mints for its own system identity
+     (dispatch._internal_auth_headers' default; is_internal_caller).  In the
+     JWT the node mints for the CUSTOMER it is the token's ``lane`` claim,
+     since only the node's secret mints one (task #153: the relay used to
+     carry the system identity, so every paying customer ran as
+     system_daemon).  The same word in any other body is just a word.
 
 Everything else is a user turn.  The daemon lane is not decided here: the
 request id's ``daemon_`` prefix decides it on the wire
@@ -89,6 +94,11 @@ def lane_for_chat(bearer_token, body, auth_source, decode_jwt=None, tenant=None,
     """'revenue' or 'user' for one /chat request; never raises."""
     payload = jwt_payload if isinstance(jwt_payload, dict) else _payload(bearer_token, decode_jwt)
     if tenant and payload.get('tid') == tenant:
+        return LANE_REVENUE
+    # The node's word as the claim of a JWT it minted for a person's turn
+    # (chat_turn_request -> _internal_auth_headers(lane=...)); nobody else
+    # can sign one.
+    if payload.get('lane') == LANE_REVENUE:
         return LANE_REVENUE
     if (isinstance(body, dict) and body.get('lane') == LANE_REVENUE
             and is_internal_caller(auth_source, payload, system_identities)):

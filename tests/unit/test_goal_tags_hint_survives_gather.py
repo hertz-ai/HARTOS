@@ -116,12 +116,16 @@ def chat(hie, tmp_path, monkeypatch):
         with open(prompts / f'{pid}.json', encoding='utf-8') as f:
             return json.load(f)
 
+    def saved_bytes():
+        return (prompts / f'{pid}.json').read_bytes()
+
     def cloud_syncs():
         return [c for c in posts.call_args_list
                 if 'createpromptlist' in str(c.args[0] if c.args else '')]
 
     yield SimpleNamespace(turn=turn, answers=answers, saved=saved, pid=pid,
-                          user=user, cloud_syncs=cloud_syncs, hie=hie)
+                          user=user, cloud_syncs=cloud_syncs, hie=hie,
+                          saved_bytes=saved_bytes)
     key = f'{user}_{pid}'
     for table in (hie.review_agents, hie.conversation_agent, hie._gather_turn_counts,
                   hie._gather_reviews_shown):
@@ -200,14 +204,16 @@ def test_a_hint_that_is_not_user_assignable_is_ignored(chat):
 
 def test_any_other_agents_record_is_written_as_before(chat):
     """Byte-for-byte what the save wrote before this change: the gathered
-    config plus prompt_id and creator_user_id, and the cloud sync posted."""
+    config plus prompt_id and creator_user_id, in that key order, as
+    json.dump writes it with its defaults (no goal_tags key, not even a null
+    one), and the cloud sync posted."""
     answer = _completed('Plan my week and compose a jingle', ['List my tasks'],
                         extra='weekdays only')
     chat.answers += [REVIEW, answer]
     chat.turn('plan my week')
     chat.turn('yes')
     expected = dict(json.loads(answer), prompt_id=chat.pid, creator_user_id=chat.user)
-    assert chat.saved() == expected
+    assert chat.saved_bytes() == json.dumps(expected).encode('ascii')
     assert len(chat.cloud_syncs()) == 1
 
 

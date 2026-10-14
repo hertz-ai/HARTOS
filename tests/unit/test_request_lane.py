@@ -82,6 +82,27 @@ def test_tenant_claim_wins_over_a_free_tier_body():
     assert lane == 'revenue'
 
 
+def test_the_nodes_lane_claim_in_the_customers_jwt_is_revenue():
+    """On a keyless node the metered self-POST carries the CUSTOMER's JWT
+    (chat_turn_request mints it for the key's owner, task #153), so the
+    request is not the node talking to itself and the body's word is not
+    believed; the node's word travels instead as the token's ``lane`` claim,
+    which only the node's secret can mint.  A claim naming any other lane,
+    or no claim, leaves the person's turn a user turn."""
+    customer = _decoder({'user_id': 'cust-42', 'lane': 'revenue'})
+    assert lane_for_chat('tok', {'prompt': 'x', 'lane': 'revenue'}, 'jwt',
+                         decode_jwt=customer, tenant=TENANT) == 'revenue'
+    # The claim alone is enough: the body is not consulted for it.
+    assert lane_for_chat('tok', {'prompt': 'x'}, 'jwt',
+                         decode_jwt=customer, tenant=TENANT) == 'revenue'
+    assert lane_for_chat('tok', {'prompt': 'x', 'lane': 'revenue'}, 'jwt',
+                         decode_jwt=_decoder({'user_id': 'cust-42', 'lane': 'user'}),
+                         tenant=TENANT) == 'user'
+    assert lane_for_chat('tok', {'prompt': 'x', 'lane': 'revenue'}, 'jwt',
+                         decode_jwt=_decoder({'user_id': 'cust-42'}),
+                         tenant=TENANT) == 'user'
+
+
 # ─── Which org goals earn (dispatch.is_revenue_goal_type) ────────────────────
 
 def test_goals_that_earn_run_on_the_revenue_lane(monkeypatch):
@@ -215,16 +236,26 @@ def test_a_stranger_naming_a_goals_request_id_does_not_inherit_its_lane(lanes):
     assert lanes.lane_for_request('daemon_goal-rev-1') == 'user'
 
 
-def test_the_metered_self_post_is_registered_by_its_body_from_either_credential(lanes):
+def test_the_metered_self_post_is_registered_revenue_from_either_credential(lanes):
+    """A keyed node sends its key and the word in the body; a keyless node
+    sends the customer's JWT with the word as its claim (task #153).  The
+    node's system JWT with the word in the body stays an internal caller's
+    word too (is_internal_caller)."""
     from core.request_lane import register_chat_lane
-    for auth, tok, dec in (('api_key', '', None),
-                           ('jwt', 'tok', _decoder({'user_id': 'system_daemon'}))):
-        rid = 'api_1760300000_' + auth
+    for n, (auth, tok, dec) in enumerate((
+            ('api_key', '', None),
+            ('jwt', 'tok', _decoder({'user_id': 'cust-42', 'lane': 'revenue'})),
+            ('jwt', 'tok', _decoder({'user_id': 'system_daemon'})))):
+        rid = 'api_1760300000_%s_%d' % (auth, n)
         assert register_chat_lane(rid, tok, {'lane': 'revenue'}, auth, decode_jwt=dec,
                                   tenant=TENANT, system_identities=SYSTEM,
                                   is_genuine=_genuine) == 'revenue'
         assert lanes.lane_for_request(rid) == 'revenue'
     assert register_chat_lane('api_1760300000_free', '', {'lane': 'user'}, 'api_key',
+                              tenant=TENANT, is_genuine=_genuine) == 'user'
+    # The free tier's customer JWT carries the user lane as its claim.
+    assert register_chat_lane('api_1760300000_free_jwt', 'tok', {'lane': 'user'}, 'jwt',
+                              decode_jwt=_decoder({'user_id': 'cust-42', 'lane': 'user'}),
                               tenant=TENANT, is_genuine=_genuine) == 'user'
 
 
@@ -257,6 +288,10 @@ def test_a_local_only_turn_is_never_registered_revenue(lanes):
     assert register_chat_lane('api_1760300000_local', '', {'lane': 'revenue'}, 'api_key',
                               tenant=TENANT, is_genuine=_genuine, local_only=True) == 'user'
     assert lanes.lane_for_request('api_1760300000_local') == 'user'
+    # The node's lane claim in a customer's JWT is refused the same way.
+    assert register_chat_lane('api_1760300000_local_jwt', 'tok', {}, 'jwt',
+                              decode_jwt=_decoder({'user_id': 'cust-42', 'lane': 'revenue'}),
+                              tenant=TENANT, is_genuine=_genuine, local_only=True) == 'user'
     # The same turns without it: exactly as before.
     assert register_chat_lane('msg_local_2', 'tok', {}, 'jwt', decode_jwt=shopper,
                               tenant=TENANT, is_genuine=_genuine, local_only=False) == 'revenue'

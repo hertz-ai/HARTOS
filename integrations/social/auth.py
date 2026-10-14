@@ -106,7 +106,7 @@ def generate_api_token() -> str:
 
 
 def generate_jwt(user_id: str, username: str, role: str = 'flat',
-                 tenant_id: str = None) -> str:
+                 tenant_id: str = None, lane: str = None) -> str:
     """Generate a LOCAL-scoped JWT (Layer 1). Works offline, survives kill switch.
 
     Optional `tenant_id` adds a 'tid' claim used by central-cloud
@@ -114,6 +114,12 @@ def generate_jwt(user_id: str, username: str, role: str = 'flat',
     Flat / regional pass tenant_id=None — the claim is omitted and
     every downstream query treats the request as untenanted (NULL
     pass-through).  See plan Part E.1.
+
+    Optional `lane` adds a 'lane' claim: the node's own word about the
+    turn it mints this token for (core.request_lane reads it; only
+    dispatch._internal_auth_headers passes it, for the metered API's
+    self-POST on the customer's behalf).  No login path sets it, so a
+    person's own token never names a lane.  Carried by both signers.
 
     SECURITY: When the hardened JWTManager is available, ALL JWTs
     are issued through it — including tenant-scoped tokens, which
@@ -127,7 +133,7 @@ def generate_jwt(user_id: str, username: str, role: str = 'flat',
     mgr = _get_jwt_manager()
     if mgr:
         return mgr.generate_access_token(str(user_id), username,
-                                         tenant_id=tenant_id)
+                                         tenant_id=tenant_id, lane=lane)
     if HAS_JWT:
         import uuid
         payload = {
@@ -142,6 +148,8 @@ def generate_jwt(user_id: str, username: str, role: str = 'flat',
         }
         if tenant_id:
             payload['tid'] = str(tenant_id)
+        if lane:
+            payload['lane'] = str(lane)
         return pyjwt.encode(payload, SECRET_KEY, algorithm='HS256')
     return generate_api_token()
 

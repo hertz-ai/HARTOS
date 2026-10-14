@@ -17,6 +17,7 @@ These tests drive the REAL store on a temporary root (installed as the
 process singleton the module uses) and assert what a turn can see.
 """
 import hashlib
+import os
 
 import pytest
 
@@ -302,6 +303,17 @@ class TestTakeOutbound:
         store.offer_to_device('u1', reel, mime=MP4, purpose='reel', prompt_id='42',
                               request_id='rid-9', meta={'note': 'no media item'})
         assert take_outbound('u1', '42', 'rid-9') == []
+
+    def test_a_reply_for_a_user_with_no_files_leaves_no_store_state(self, store):
+        """_chat_reply asks on every reply that has a prompt, on every node,
+        central included.  A user the store holds nothing for gets nothing
+        and leaves nothing behind: no directory, and no entry in the per-user
+        lock registry, which is never evicted (one lock per user ever seen)."""
+        before = set(ufs._LOCKS)
+        assert take_outbound('never-sent-a-file', '42', 'rid-1') == []
+        assert set(ufs._LOCKS) == before, (
+            'a reply registered a store lock for a user with no files')
+        assert not os.path.exists(store.root), 'a reply created the store root'
 
 
 class TestMediaToMirror:

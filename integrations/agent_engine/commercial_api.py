@@ -518,55 +518,63 @@ def _metered_backend_chat(prompt: str, label: str):
     ``'deferred'``) which exists to stop *background* work stealing the LLM
     from a human.  A paying customer's synchronous request is not background
     work, so inheriting that gate would trade this bug for a worse one.  What
-    is shared with the other callers is the credential helper and the
-    canonical /chat client (``core.chat_client.post_chat``: the same pooled
-    path, with the request id this function mints passed through).
+    is shared with the other callers is the one builder of a person's turn
+    sent for them (``chat_contract.chat_turn_request``: the body and the
+    credential) and the canonical /chat client (``core.chat_client.post_chat``:
+    the same pooled path, with the request id this function mints passed
+    through).
+
+    The turn is the CUSTOMER's.  The self-POST used to carry the credential
+    helper's default identity, so on a keyless node (no HEVOLVE_API_KEY) the
+    JWT named system_daemon and /chat, trusting the token over the body
+    (correctly), ran every paying customer as the node's own system identity
+    in ONE shared agent session with history and memory tools (task #153;
+    measured 2026-10-14; the channel relays had the same collapse on
+    2026-08-06).  chat_turn_request mints the token for the key's owner, as
+    a user, and carries the lane below as that token's claim, so the paid
+    lane no longer depends on the node holding a key.
     """
     import uuid as _uuid
     from core.chat_client import post_chat
     from core.llm_outbound_logger import LANE_REVENUE, LANE_USER
-    from integrations.agent_engine.dispatch import _internal_auth_headers
+    from integrations.channels.chat_contract import chat_turn_request
 
+    # The customer's turn: their identity in the body and in the minted
+    # credential, no agent (the key is present, the route 400s without it,
+    # and None is an agent-less conversation turn: see the docstring for what
+    # a made-up agent id did to customers), and the flags the docstring
+    # explains.  casual_conv is deliberately NOT sent (False): the casual
+    # tool set carries Shell_Command / Computer_Action.
+    payload, headers = chat_turn_request(
+        g.api_key['user_id'], None, prompt,
+        create_agent=False,
+        # Never the draft: see the docstring.  HEVOLVE_DRAFT_FIRST=1 in the
+        # node's env still overrides this body flag.
+        draft_first=False,
+        # Never agent work: /chat withholds Create_Agent and Agentic_Router
+        # from this turn (task #120), so the model cannot hand the customer
+        # an interview or a consent question as the billed answer.
+        agent_tools=False,
+        # A paying customer's call is a genuine turn, never background: a
+        # request id of its own (unique per call, so two calls in the same
+        # second cannot share a lane entry) makes /chat and the wire treat it
+        # so (core.chat_client: a missing id reads as background), and keys
+        # the lane below.
+        request_id='api_%d_%s' % (int(time.time()), _uuid.uuid4().hex[:8]),
+        # Owner policy 2026-10-12: a paying tier's turn is revenue-bearing
+        # (may use the expert model, never throttled); the free tier runs on
+        # the free model like any person's turn.  The node's word: in the
+        # body beside the node's key, and as the claim of the JWT minted for
+        # the customer (core.request_lane.lane_for_chat believes either from
+        # the node alone).
+        lane=LANE_REVENUE if (g.api_key.get('tier') or 'free') != 'free' else LANE_USER)
     try:
         # The canonical /chat client (core.chat_client): the same pooled path,
-        # with the body normalised.  The id minted below passes through
+        # with the body normalised.  The id minted above passes through
         # untouched, so this is the wire this function always sent.
         result = post_chat(
-            f'http://localhost:{get_port("backend")}/chat',
-            {
-                'user_id': g.api_key['user_id'],
-                # No agent: the key is present (the route 400s without it)
-                # and None is an agent-less conversation turn.  See the
-                # docstring for what a made-up agent id did to customers.
-                'prompt_id': None,
-                'prompt': prompt,
-                'create_agent': False,
-                # Never the draft: see the docstring.  HEVOLVE_DRAFT_FIRST=1
-                # in the node's env still overrides this body flag.
-                'draft_first': False,
-                # Never agent work: /chat withholds Create_Agent and
-                # Agentic_Router from this turn (task #120), so the model
-                # cannot hand the customer an interview or a consent question
-                # as the billed answer.
-                'agent_tools': False,
-                # casual_conv is deliberately NOT sent (False): the casual
-                # tool set carries Shell_Command / Computer_Action.
-                # A paying customer's call is a genuine turn, never background:
-                # a request id of its own (unique per call, so two calls in the
-                # same second cannot share a lane entry) makes /chat and the
-                # wire treat it so (core.chat_client: a missing id reads as
-                # background), and keys the lane below.
-                'request_id': 'api_%d_%s' % (int(time.time()), _uuid.uuid4().hex[:8]),
-                # Owner policy 2026-10-12: a paying tier's turn is revenue-
-                # bearing (may use the expert model, never throttled); the
-                # free tier runs on the free model like any person's turn.
-                # /chat believes this field only from the node itself: the
-                # key or the system JWT _internal_auth_headers sends
-                # (core.request_lane.is_internal_caller).
-                'lane': LANE_REVENUE if (g.api_key.get('tier') or 'free') != 'free' else LANE_USER,
-            },
-            headers=_internal_auth_headers(),
-            timeout=120)
+            f'http://localhost:{get_port("backend")}/chat', payload,
+            headers=headers, timeout=120)
     except Exception as e:
         # 502: we could not reach our own backend at all.
         logger.warning(f"Metered {label} /chat transport error: {e}")

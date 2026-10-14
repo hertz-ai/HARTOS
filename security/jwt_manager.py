@@ -177,17 +177,24 @@ class JWTManager:
             logger.warning("SOCIAL_SECRET_KEY is shorter than 32 characters. Consider using a longer key.")
 
     def generate_access_token(self, user_id: str, username: str,
-                              tenant_id: str = None) -> str:
+                              tenant_id: str = None, lane: str = None) -> str:
         """Generate a short-lived LOCAL access token (1 hour).
 
         Optional `tenant_id` adds a 'tid' claim — used by central
         cloud deploys for tenant isolation. The claim flows through
         the same hardened signing pipeline as every other claim;
         callers MUST NOT bypass JWTManager when adding tenancy.
+
+        Optional `lane` adds a 'lane' claim: the node's own word that the
+        turn this token is minted for is revenue-bearing (or not), read by
+        core.request_lane.lane_for_chat.  Only the node mints it, for a
+        person's turn it relays to its own /chat (the metered API's
+        self-POST through dispatch._internal_auth_headers); it is never
+        taken from a request, and a person's own login token carries none.
         """
         return self._generate_token(
             user_id, username, 'access', ACCESS_TOKEN_EXPIRY, scope='local',
-            tenant_id=tenant_id
+            tenant_id=tenant_id, lane=lane
         )
 
     def generate_refresh_token(self, user_id: str, username: str,
@@ -212,7 +219,7 @@ class JWTManager:
     def _generate_token(self, user_id: str, username: str,
                         token_type: str, expiry: int,
                         scope: str = 'local',
-                        tenant_id: str = None) -> str:
+                        tenant_id: str = None, lane: str = None) -> str:
         if not HAS_JWT:
             # HMAC fallback cannot encode tenant_id (no JSON payload).
             # In cloud mode this is a hard failure — refuse rather than
@@ -221,6 +228,14 @@ class JWTManager:
                 raise RuntimeError(
                     "Cloud mode requires PyJWT to issue tenant-scoped tokens; "
                     "HMAC fallback cannot carry the 'tid' claim safely.")
+            if lane:
+                # The same rule for the node's lane word: a token that
+                # silently dropped it would run a paying customer's turn
+                # on the user lane.  Refuse; the relay logs it and the
+                # turn is answered 401 on central, never mis-laned.
+                raise RuntimeError(
+                    "PyJWT is required to issue a token carrying the 'lane' "
+                    "claim; the HMAC fallback cannot carry it.")
             return self._generate_hmac_token(user_id, username)
 
         node_id = _get_node_id()
@@ -237,6 +252,8 @@ class JWTManager:
         }
         if tenant_id:
             payload['tid'] = str(tenant_id)
+        if lane:
+            payload['lane'] = str(lane)
         return pyjwt.encode(payload, self._secret_key, algorithm='HS256')
 
     def _generate_hmac_token(self, user_id: str, username: str) -> str:
