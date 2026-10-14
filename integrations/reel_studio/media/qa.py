@@ -31,7 +31,8 @@ overlays, transition).
 
 ADVISORY: color_tags; bitrate_floor (a calm face shot at CRF can sit below
 it); reveal_render (the frame reveal_render.from_end_s before the end
-against the expected source frame, overlay regions masked);
+against the expected source frame, overlay regions masked: a text overlay's
+band, a logo's box, an animated (motion) overlay's whole box);
 segment_fidelity (each segment's middle frame, masked the same way);
 beats_render (each EDL cut seen in the picture; consecutive shots of the
 same scene can hide a cut); no_bars_render (cropdetect and blackdetect,
@@ -268,8 +269,10 @@ def _mask(edl: Mapping, t_s: float) -> np.ndarray:
     for ov in edl['overlays']:
         if t_s < ov['from_s'] - 1e-6 or (ov['to_s'] is not None and t_s >= ov['to_s']):
             continue
-        if ov['type'] == 'logo':
-            x0, y0, x1, y1 = logo_box(ov)
+        if ov['type'] in ('logo', 'motion'):
+            # A motion clip's box (amendment A14) is masked whole: its alpha
+            # varies frame to frame, so any of the box may hide footage.
+            x0, y0, x1, y1 = logo_box(ov) if ov['type'] == 'logo' else ov['box']
             mask[int(y0 * fy):int(math.ceil(y1 * fy)), int(x0 * fx):int(math.ceil(x1 * fx))] = 0
         else:
             y = ov['y'] * CANVAS['h']

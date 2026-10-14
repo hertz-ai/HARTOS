@@ -21,7 +21,10 @@ PASS 2 joins the mezzanines with the concat demuxer, draws the hook text
 with drawtext reading a UTF-8 ``textfile=`` (so ``:`` ``'`` ``%`` and Tamil
 need no filter escaping; ``expansion=none`` keeps ``%`` literal) and an
 escaped ``fontfile``, lays the logo in its corner (contracts.logo_box, the
-box the EDL check used), and encodes once: h264_nvenc VBR CQ 21, else
+box the EDL check used), lays each animated ('motion') overlay's clip with
+its alpha at its box from its from_s (amendment A14: rendered beforehand by
+integrations.reel_studio.motion; the cut passes through outside its
+window), and encodes once: h264_nvenc VBR CQ 21, else
 libx264 medium CRF 20, both under a 12 Mbps maxrate (never a fixed
 bitrate: a calm face shot needs far less), High profile, yuv420p, BT.709
 tags, silent, faststart.  If NVENC fails at run time (no free session, the
@@ -228,6 +231,21 @@ def plan_final_args(edl: Mapping, concat_list: str, out_path: str, *, encoder: s
                      % (label, inputs, round(x0 * f), round(y0 * f),
                         _enable(ov['from_s'], ov['to_s']), inputs))
         label = 'vl%d' % inputs
+        inputs += 1
+    for ov in edl['overlays']:
+        # An animated overlay (amendment A14): its clip with alpha starts at
+        # from_s, sits at its box, and once it ends the cut passes through.
+        if ov['type'] != 'motion':
+            continue
+        args += ['-i', ov['src']]
+        x0, y0, x1, y1 = ov['box']
+        w, h = max(1, int(round((x1 - x0) * f))), max(1, int(round((y1 - y0) * f)))
+        graph.append('[%d:v]setpts=PTS-STARTPTS+%s/TB,scale=%d:%d[mo%d]'
+                     % (inputs, _num(ov['from_s']), w, h, inputs))
+        graph.append('[%s][mo%d]overlay=x=%d:y=%d:format=auto:eof_action=pass:enable=%s[vm%d]'
+                     % (label, inputs, round(x0 * f), round(y0 * f),
+                        _enable(ov['from_s'], ov['to_s']), inputs))
+        label = 'vm%d' % inputs
         inputs += 1
     graph.append('[%s]%s,format=yuv420p[out]' % (label, BT709))
     args += ['-filter_complex', ';'.join(graph), '-map', '[out]', '-an', '-sn', '-dn']

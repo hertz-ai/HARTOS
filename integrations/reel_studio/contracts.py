@@ -111,6 +111,14 @@ BEAT_SOURCES = ('song', 'local_audio', 'synthetic')
 #: capture order, the reveal last.
 ROLES = ('teaser', 'process', 'reveal')
 LOGO_CORNERS = ('top_left', 'top_right', 'bottom_left')
+#: Animated overlays (amendment A14), each a clip with alpha the motion
+#: runtime renders (integrations.reel_studio.motion) and pass 2 lays over
+#: the cut: a kinetic title, a logo sting, a booking/price end card, and a
+#: before->after wipe over the reveal's opening.
+MOTION_TEMPLATES = ('title', 'logo_sting', 'end_card', 'wipe')
+#: The motion templates that are a picture covering the whole frame (her
+#: "before" face), not text or a logo, so SAFE_ZONE does not bound them.
+MOTION_FULL_FRAME = ('wipe',)
 MOMENT_SOURCES = ('vlm', 'fallback')
 
 #: Where each clip's capture time came from (A1 precedence): the phone's
@@ -675,6 +683,21 @@ _LOGO_OVERLAY_SPEC = {
     'opacity': (lambda v: _is_num(v) and 0 < v <= 1, 'a number in (0, 1]'),
     'from_s': (_is_num, 'a number'), 'to_s': (lambda v: v is None or _is_num(v), 'null or a number'),
 }
+
+
+def _is_box(v) -> bool:
+    """[x0, y0, x1, y1] canvas pixels with x0 < x1 and y0 < y1."""
+    return (isinstance(v, (list, tuple)) and len(v) == 4 and all(_is_num(n) for n in v)
+            and v[0] < v[2] and v[1] < v[3])
+
+
+_MOTION_OVERLAY_SPEC = {
+    'template': (lambda v: v in MOTION_TEMPLATES, 'one of %s' % (MOTION_TEMPLATES,)),
+    'src': (_is_text, 'a non-empty string'),
+    'box': (_is_box, '[x0, y0, x1, y1] canvas pixels, x0 < x1 and y0 < y1'),
+    # A motion clip has a length: it ends.
+    'from_s': (_is_num, 'a number'), 'to_s': (_is_num, 'a number'),
+}
 _BEATS_SPEC = {
     'source': (lambda v: v in BEAT_SOURCES, 'one of %s' % (BEAT_SOURCES,)),
     'song_key': (_is_opt_str, 'null or a string'),
@@ -731,8 +754,10 @@ def _edl_schema(edl) -> List[str]:
             problems += _spec_problems(ov, _TEXT_OVERLAY_SPEC, where)
         elif kind == 'logo':
             problems += _spec_problems(ov, _LOGO_OVERLAY_SPEC, where)
+        elif kind == 'motion':
+            problems += _spec_problems(ov, _MOTION_OVERLAY_SPEC, where)
         else:
-            problems.append("%s.type must be 'text' or 'logo'" % where)
+            problems.append("%s.type must be 'text', 'logo' or 'motion'" % where)
     if (isinstance(edl['reveal'], Mapping) and edl['reveal'].get('clip') not in edl['clips']
             and not problems):
         problems.append('reveal.clip names no clip in clips')
@@ -951,12 +976,43 @@ def _check_overlays(edl, bar) -> List[str]:
             if not (zone['x_min'] <= x <= zone['x_max']
                     and zone['y_min'] <= y - half and y + half <= zone['y_max']):
                 out.append('text overlay %d at (%.0f, %.0f) px leaves the safe zone' % (i, x, y))
-        else:
+        elif ov['type'] == 'logo':
             x0, y0, x1, y1 = logo_box(ov)
             if not (zone['x_min'] <= x0 and x1 <= zone['x_max']
                     and zone['y_min'] <= y0 and y1 <= zone['y_max']):
                 out.append('logo %d box (%.0f, %.0f)-(%.0f, %.0f) px leaves the safe zone'
                            % (i, x0, y0, x1, y1))
+        elif ov['template'] in MOTION_FULL_FRAME:
+            out += _full_frame_problems(i, ov, edl, bar)
+        else:
+            x0, y0, x1, y1 = ov['box']
+            if not (zone['x_min'] <= x0 and x1 <= zone['x_max']
+                    and zone['y_min'] <= y0 and y1 <= zone['y_max']):
+                out.append('%s %d box (%.0f, %.0f)-(%.0f, %.0f) px leaves the safe zone'
+                           % (ov['template'], i, x0, y0, x1, y1))
+    return out
+
+
+def _full_frame_problems(i: int, ov: Mapping, edl: Mapping, bar: Mapping) -> List[str]:
+    """A full-frame motion overlay (the before->after wipe) fills the frame,
+    only over the reveal's opening, and leaves the final look uncovered for
+    reveal.min_hold_s at the end: A1, the reel ends on the reveal."""
+    eps, name = bar['contiguous']['eps_s'], ov['template']
+    out = []
+    if any(abs(a - b) > _PX_EPS for a, b in zip(ov['box'], (0, 0, CANVAS['w'], CANVAS['h']))):
+        out.append('%s %d box %s does not fill the %dx%d frame'
+                   % (name, i, list(ov['box']), CANVAS['w'], CANVAS['h']))
+    if not edl['final_look_found']:
+        out.append('%s %d has no final look to reveal' % (name, i))
+        return out
+    opening = edl['segments'][-1]['out_start_s']
+    if ov['from_s'] < opening - eps:
+        out.append('%s %d starts at %.3f s, before the reveal at %.3f s'
+                   % (name, i, ov['from_s'], opening))
+    left, hold = edl['duration_s'] - ov['to_s'], bar['reveal']['min_hold_s']
+    if left < hold - eps:
+        out.append('%s %d leaves the final look uncovered for %.3f s, under %.3f s'
+                   % (name, i, left, hold))
     return out
 
 
@@ -1001,7 +1057,10 @@ def validate_edl(edl, *, bar: Mapping = QUALITY_BAR) -> List[str]:
                 reveal, shows final_look, holds >= min_hold_s and covers the
                 chosen shot; without one: no reveal and a 'no_final_look' note
     teaser      hook_first <=> one final-look teaser first, <= max_s (A1)
-    overlays    inside SAFE_ZONE and inside the reel's time
+    overlays    inside SAFE_ZONE and inside the reel's time; a full-frame
+                motion overlay (MOTION_FULL_FRAME: the before->after wipe)
+                fills the frame over the reveal's opening only, leaving the
+                final look uncovered for reveal.min_hold_s at the end
     transition  cuts only
     audio       the posted reel is silent (U2)
     """
