@@ -16,7 +16,9 @@ at a time):
    streaming analysis pass per clip -> at most 25 keyframes -> the VLM's
    judgement of them (falls back per frame) -> the beat grid (her song audio
    when she attached it, else a steady 120 BPM grid) -> the plan (EDL) ->
-   the two-pass render -> QA.
+   her animated overlays when she asked for them (motion.compose: Remotion
+   when it is on and set up here, else their plain-ffmpeg versions) -> the
+   two-pass render -> QA.
 3. A reel that fails a hard QA check is withheld (``qa_failed``): it is
    never put in her outbox or pushed, and her clips are kept for a retry.
 4. Otherwise it goes into her outbox (user_file_store.offer_to_device, which
@@ -138,17 +140,25 @@ def _gib(n: int) -> str:
     return '%.1f GB' % (n / float(1 << 30))
 
 
+def chat_stage(user_id, request_id, stage: str, text: str) -> None:
+    """Show ``text`` on her chat for this turn through the existing
+    publish_chat_stage (action 'Status').  Progress never stops the work it
+    reports, so a failure to show it is logged, not raised.  The reel's
+    steps (_say) and the reel tools' own waits (reel_motion) use it."""
+    try:
+        from core.peer_link.crossbar_publish import publish_chat_stage
+        publish_chat_stage(stage, user_id=str(user_id), request_id=str(request_id or ''),
+                           text=text)
+    except Exception as e:
+        logger.debug('reel progress %s not shown: %s', stage, e)
+
+
 def _say(job) -> Callable[[str, str], None]:
     """Each step of the reel: the job beats (jobs.beat), and her chat shows
-    the step through publish_chat_stage with a generic text."""
+    the step (chat_stage) with a generic text."""
     def say(stage: str, text: str) -> None:
         jobs.beat(job.reel_id)
-        try:
-            from core.peer_link.crossbar_publish import publish_chat_stage
-            publish_chat_stage(stage, user_id=str(job.user_id),
-                               request_id=str(job.request_id or ''), text=text)
-        except Exception as e:      # progress never stops the reel
-            logger.debug('reel progress %s not shown: %s', stage, e)
+        chat_stage(job.user_id, job.request_id, stage, text)
     return say
 
 
@@ -208,7 +218,7 @@ def produce_reel(sources: Sequence[Any], *, style: Mapping, workdir: str, out_pa
                  song_key: Optional[str] = None, logo_path: Optional[str] = None,
                  backend=None, encoder: str = 'auto',
                  progress: Optional[Callable[[str, str], None]] = None,
-                 detector=None) -> Production:
+                 detector=None, motion: Optional[Mapping] = None) -> Production:
     """Make the reel from ``sources`` (ClipSource, or StoredFile dicts, in
     upload order) into ``out_path``, working in ``workdir`` (the caller
     removes it).
@@ -217,7 +227,10 @@ def produce_reel(sources: Sequence[Any], *, style: Mapping, workdir: str, out_pa
     file (store purpose 'song_audio') read from ``song_start_s``;
     ``backend`` is the vision backend (None: moments.REEL_VLM_DEFAULT);
     ``encoder`` is render_reel's; ``progress(stage, text)`` is told what is
-    happening; ``detector`` is the face detector (None: Haar).
+    happening; ``detector`` is the face detector (None: Haar).  ``motion``
+    is her animated-overlay request (motion.compose.add_motion's: overlays,
+    hook_text, card_text), laid between the plan and the render; its notes
+    join the production's.
 
     Raises ReelFailed with status clip_unsupported (xid, reason),
     not_enough_footage (need_s) or render_failed (detail).  The QA report is
@@ -303,6 +316,17 @@ def produce_reel(sources: Sequence[Any], *, style: Mapping, workdir: str, out_pa
             raise ReelFailed('render_failed', RENDER_FAILED_MESSAGE, detail='plan: %s' % e)
         lap('plan')
 
+        motion_notes: List[str] = []
+        if motion and motion.get('overlays'):
+            # Her animated overlays (amendment A14): rendered with Remotion
+            # when it is set up here, else their plain-ffmpeg versions; the
+            # EDL stays valid either way (motion.compose).
+            from integrations.reel_studio.motion import compose as motion_mod
+            say('reel_motion', 'Adding your overlays...')
+            edl, motion_notes = motion_mod.add_motion(
+                edl, motion, workdir=workdir, progress=lambda text: say('reel_motion', text))
+            lap('motion')
+
         say('reel_render', 'Rendering your reel...')
         rendered = render_mod.render_reel(edl, out_path, workdir=workdir, encoder=encoder)
         lap('render')
@@ -317,8 +341,8 @@ def produce_reel(sources: Sequence[Any], *, style: Mapping, workdir: str, out_pa
         raise ReelFailed('render_failed', RENDER_FAILED_MESSAGE,
                          detail=('ffmpeg timed out' if e.timed_out else str(e))[:300])
     return Production(path=out_path, edl=edl, moments=moments, qa=report, render=rendered,
-                      beats_source=grid.source, notes=list(rendered.notes), timings=timings,
-                      analyses=analyses, song_start_s=start_used)
+                      beats_source=grid.source, notes=list(rendered.notes) + motion_notes,
+                      timings=timings, analyses=analyses, song_start_s=start_used)
 
 
 # ── what she gets ─────────────────────────────────────────────────────────
@@ -421,6 +445,12 @@ def _ok_message(media: Mapping, notes: Sequence[str], song_note: Optional[str] =
         text += (' The vision model on this computer gave no answer, or an answer that could '
                  'not be used, so the shots were chosen by sharpness and filming order '
                  'instead; say so.')
+    # Her animated overlays: off, waiting for the owner, still setting up,
+    # failed, or one left out -- and why (motion.compose's words).
+    from integrations.reel_studio.motion.compose import message as motion_message
+    said = motion_message(notes)
+    if said:
+        text += ' ' + said
     return text
 
 
@@ -464,7 +494,8 @@ def _deliver(job, store, out_path: str, item: Dict[str, Any]) -> Dict[str, Any]:
 def _make(job, store, sources: List[C.ClipSource], style: Dict[str, Any],
           song: Optional[Mapping], logo_path: Optional[str], caption: str,
           hashtags: Sequence[str], backend, encoder: str, workdir: str,
-          song_note: Optional[str] = None) -> Dict[str, Any]:
+          song_note: Optional[str] = None,
+          motion: Optional[Mapping] = None) -> Dict[str, Any]:
     need = MIN_FREE_BYTES + sum(max(0, int(s.size)) for s in sources)
     free = free_bytes(work_root())
     if free < need:
@@ -481,12 +512,14 @@ def _make(job, store, sources: List[C.ClipSource], style: Dict[str, Any],
     out_path = os.path.join(workdir, 'reel_%s.mp4' % job.reel_id)
     song = song if isinstance(song, Mapping) else None
     start_ms = (song or {}).get('start_ms')
+    # Her overlay request rides only when she asked for overlays.
+    extra = {'motion': dict(motion)} if motion and motion.get('overlays') else {}
     production = produce_reel(
         sources, style=style, workdir=workdir, out_path=out_path,
         song_audio=(song or {}).get('audio_path') or None,
         song_start_s=(start_ms / 1000.0 if isinstance(start_ms, int) and start_ms > 0 else 0.0),
         song_key=(song or {}).get('song_key') or None, logo_path=logo_path, backend=backend,
-        encoder=encoder, progress=say)
+        encoder=encoder, progress=say, **extra)
 
     qa = C.qa_summary(production.qa)
     if not qa['passed']:
@@ -533,7 +566,8 @@ def _make(job, store, sources: List[C.ClipSource], style: Dict[str, Any],
 def make_reel(*, user_id, prompt_id, request_id, clips: Sequence[Any], style: Mapping,
               song: Optional[Mapping] = None, logo_path: Optional[str] = None, caption: str = '',
               hashtags: Sequence[str] = (), backend=None, encoder: str = 'auto',
-              store=None, song_note: Optional[str] = None) -> Dict[str, Any]:
+              store=None, song_note: Optional[str] = None,
+              motion: Optional[Mapping] = None) -> Dict[str, Any]:
     """Make, check and deliver one reel for this turn (see the module note).
 
     ``clips``: StoredFile dicts (or contracts.ClipSource), at most MAX_CLIPS
@@ -547,7 +581,11 @@ def make_reel(*, user_id, prompt_id, request_id, clips: Sequence[Any], style: Ma
     ``logo_path``: her logo image, or None.  ``hashtags``: '#tags', at most
     contracts.HASHTAG_LIMIT used.  ``backend``: the vision backend (None:
     moments.REEL_VLM_DEFAULT).  ``store``: the user file store (None: the
-    process's).  Returns the reel_make result; never raises.
+    process's).  ``motion``: her animated overlays (``{'overlays':
+    [contracts.MOTION_TEMPLATES], 'hook_text', 'card_text'}``, from her
+    voice profile's motion_overlays) or None; produce_reel lays them, and
+    what her agent is told says when they are off, waiting or plain.
+    Returns the reel_make result; never raises.
     """
     sources = [_source(c) for c in (clips or [])][:MAX_CLIPS]
     if not sources:
@@ -570,7 +608,7 @@ def make_reel(*, user_id, prompt_id, request_id, clips: Sequence[Any], style: Ma
             store = get_user_file_store()
         workdir = jobs.work_dir(job.reel_id)
         result = _make(job, store, sources, style, song, logo_path, caption, hashtags, backend,
-                       encoder, workdir, song_note=song_note)
+                       encoder, workdir, song_note=song_note, motion=motion)
     except ReelFailed as e:
         logger.info('reel %s for user %s: %s', job.reel_id, job.user_id, e)
         result = dict(_status(e.status, e.message or e.status, **e.data), reel_id=job.reel_id)
@@ -601,5 +639,5 @@ def _detail(e: BaseException) -> str:
 __all__ = ['MIN_FREE_BYTES', 'MAX_CLIPS', 'MIME', 'NOTE_SYNTHETIC_BEATS', 'NOTE_PUSH_NOT_SENT',
            'ADVISORY_NOTE', 'NEEDS_CLIPS_MESSAGE', 'BUSY_MESSAGE', 'RENDER_FAILED_MESSAGE',
            'ReelFailed', 'Production', 'work_root', 'free_bytes', 'remove_work_dir',
-           'reel_bytes_cap',
+           'reel_bytes_cap', 'chat_stage',
            'produce_reel', 'make_reel']

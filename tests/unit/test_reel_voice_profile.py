@@ -321,6 +321,8 @@ def _max_value(spec, i):
     kind = spec['type']
     if kind == 'text':
         return 'x' * spec['max_len']
+    if kind == 'list' and spec.get('choices'):
+        return list(spec['choices'][:spec['max_items']])
     if kind == 'list':
         return [('%02d' % n) + 'y' * (spec['item_max_len'] - 2) for n in range(spec['max_items'])]
     if kind == 'hashtags':

@@ -33,6 +33,7 @@
     "handle": {"type": "text", "max_len": 31, "label": "Instagram handle", "help": "e.g. @meena.mua"},
     "logo_corner": {"type": "choice", "choices_from": "LOGO_CORNERS", "label": "Logo corner", "help": "top_left, top_right or bottom_left."},
     "logo_xid": {"type": "xid", "brief": false, "label": "Logo file", "help": "Store id of her logo image; set by the reel tools."},
+    "motion_overlays": {"type": "list", "choices_from": "MOTION_TEMPLATES", "max_items": 4, "item_max_len": 20, "brief": false, "label": "Animated overlays", "help": "Any of title, logo_sting, end_card, wipe, comma-separated; every reel gets them. reel_motion sets it."},
     "sample_captions": {"type": "list", "split": "none", "multiline": true, "max_items": 3, "item_max_len": 600, "brief": false, "label": "Sample captions", "help": "Up to three of her own past captions, to match her voice."}
   }
 }

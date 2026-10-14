@@ -40,7 +40,8 @@ The seven (REEL_TOOL_NAMES):
   names no song), a caption (else one from her profile) and at most
   contracts.HASHTAG_LIMIT hashtags, the human-voice guide's reel cap (else
   from her hashtag bank); its hashtags parameter tells the model that
-  number, read from the same constant.
+  number, read from the same constant.  The animated overlays she chose
+  with reel_motion (her profile's motion_overlays) ride every reel.
 * ``reel_trending_songs``: trending songs in her language
   (integrations.trends.trending_songs_client; with none, its reason and
   note, after asking the owner for the research account when that is why).
@@ -69,6 +70,17 @@ named reel_edit):
   username and password are asked for on the credential consent card
   (integrations.trends.daily_job.ask_for_account), and its reply says
   where that ask stands and never to take them in chat.
+* ``reel_motion``: the animated overlays her reels get -- a kinetic title,
+  a logo sting, a booking/price end card, a before->after wipe (amendment
+  A14, integrations.reel_studio.motion).  It keeps her choice in her voice
+  profile (motion_overlays; voice_profile.update_field, the one writer) and
+  says where Remotion stands on this computer: switched off until the
+  owner confirms its license (one flag, off by default), asked on the
+  consent card, being set up (a bounded wait, shown on her chat), ready.
+  Choosing overlays asks for that one-time setup (motion.runtime.
+  ensure_ready, through RuntimeToolManager).  reel_make hands every reel
+  her choice; a reel made while Remotion is not ready gets the plain
+  versions and says so.
 
 Replies are JSON, except reel_skill's text.  A call that did not do its work
 answers in the executor's failure form, starting "Error:"
@@ -97,7 +109,7 @@ REEL_TOOL_NAMES = ('reel_make', 'reel_trending_songs', 'reel_check_caption', 're
                    'reel_beat_sheet', 'reel_skill', 'reel_voice')
 #: Registered with REEL_TOOL_NAMES on the same seats, shown to no agent:
 #: request_tools attaches them when asked (see the module note).
-REEL_ON_DEMAND_TOOL_NAMES = ('reel_watchlist',)
+REEL_ON_DEMAND_TOOL_NAMES = ('reel_watchlist', 'reel_motion')
 
 #: The executor's failure form (core.constants.tool_reply_failed reads it).
 _FAILED = TOOL_ERROR_REPLY_PREFIXES[0]
@@ -119,6 +131,42 @@ WATCHLIST_MESSAGE = ("Tell her which Instagram accounts are tracked for her tren
                      "The research Instagram account's username and password are entered on "
                      "this computer's consent card only, never in chat: do not ask her for them "
                      "or accept them here.")
+
+#: How long reel_motion waits for a Remotion setup it asks for (seconds);
+#: the setup goes on after that (motion.runtime.ensure_ready).
+MOTION_SETUP_WAIT_S = 90.0
+#: Words that stop her overlays.
+_MOTION_NONE = frozenset({'none', 'no', 'off', 'stop', 'clear', 'remove'})
+#: What each template needs to appear, for her agent to pass on.
+MOTION_NEEDS = {
+    'title': "the reel's hook text (reel_make's hook_text), animated",
+    'logo_sting': 'her logo (upload one, or reel_voice logo_xid), popping in before it stays',
+    'end_card': "her profile's services, price_band and cta, as a card at the end",
+    'wipe': 'a filmed finished look: her before shot wiped away to the reveal',
+}
+#: What reel_motion tells her agent, by where Remotion stands.
+MOTION_MESSAGES = {
+    'off': ("Her choice is saved. Animated overlays are switched off on this computer until "
+            "its owner confirms the Remotion license; until then her reels get the plain "
+            "versions (the end card as a text box, the title as the hook text, the still logo, "
+            "a cut for the wipe). Tell her that."),
+    'not_set_up': ("Animated overlays are not set up on this computer yet; choosing overlays "
+                   "asks its owner to set them up."),
+    'ready': "Animated overlays are set up; her next reel gets them. Tell her.",
+    'asked': ("Her choice is saved. The owner of this computer has been asked on the consent "
+              "card to set animated overlays up (a one-time download of a few hundred MB); "
+              "until then her reels get the plain versions. Tell her that."),
+    'declined': ("Her choice is saved, but the owner of this computer said no to setting "
+                 "animated overlays up, so her reels get the plain versions. Tell her that."),
+    'unavailable': ("Her choice is saved, but animated overlays cannot be set up on this "
+                    "computer: there is nobody to ask. Her reels get the plain versions; tell "
+                    "her that."),
+    'setting_up': ("Her choice is saved. Animated overlays are being set up on this computer "
+                   "now; the next reel after it finishes gets them, until then the plain "
+                   "versions. Tell her that."),
+    'failed': ("Her choice is saved, but animated overlays could not be set up on this "
+               "computer (%s); her reels get the plain versions. Tell her that."),
+}
 
 #: open_with values that ask for the final-look teaser (A1), and those that
 #: ask for the plain story; anything else is read as her words.
@@ -419,12 +467,62 @@ def _reel_make(turn: _Turn, target_seconds, open_with, hook_text, caption, hasht
         style=style, song=song, song_note=song_note,
         logo_path=_logo_path(turn, profile) if style['use_logo'] else None,
         caption=_text(caption) or _caption_from_profile(profile),
-        hashtags=_hashtags(_text(hashtags), profile))
+        hashtags=_hashtags(_text(hashtags), profile), motion=_motion_request(profile, style))
     if result.get('status') != 'ok':
         return _failure_reply(result)
     if note:
         result['notes'] = list(result.get('notes') or []) + [note]
     return _ok_reply(result)
+
+
+def _motion_request(profile: Mapping, style: Mapping) -> Optional[Dict[str, Any]]:
+    """Her animated overlays for one reel (motion.compose.add_motion's
+    request), from her voice profile's motion_overlays, or None when she
+    chose none: the reel's hook text for the title, and her services, price
+    band and ask for the end card."""
+    overlays = [t for t in (profile.get('motion_overlays') or ()) if isinstance(t, str)]
+    if not overlays:
+        return None
+    return {'overlays': overlays, 'hook_text': style.get('hook_text') or '',
+            'card_text': [profile.get('services'), profile.get('price_band'), profile.get('cta')]}
+
+
+def _reel_motion(turn: _Turn, overlays) -> str:
+    """Set (or stop, or list) her animated overlays and say where Remotion
+    stands; choosing some asks for its setup with a bounded wait whose
+    progress shows on her chat."""
+    from integrations.reel_studio import pipeline, voice_profile
+    from integrations.reel_studio.motion import runtime
+    text = _text(overlays)
+    try:
+        if text.lower() in _MOTION_NONE:
+            chosen = list(voice_profile.update_field(turn.user_id, 'motion_overlays', None)
+                          .get('motion_overlays') or [])
+        elif text:
+            chosen = list(voice_profile.update_field(turn.user_id, 'motion_overlays', text)
+                          .get('motion_overlays') or [])
+        else:
+            chosen = list(voice_profile.load_voice(turn.user_id).get('motion_overlays') or [])
+    except voice_profile.VoiceProfileUnreadable as e:
+        return _error('reel_motion', str(e))
+    except (ValueError, PermissionError) as e:
+        return _error('reel_motion', e)
+    detail = ''
+    if text and chosen:
+        rid = turn.request_id()
+        readiness = runtime.ensure_ready(
+            wait_s=MOTION_SETUP_WAIT_S,
+            progress=lambda said: pipeline.chat_stage(turn.user_id, rid, 'reel_motion', said))
+        state, detail = readiness.state, readiness.detail
+    else:
+        state = runtime.status()
+    message = MOTION_MESSAGES.get(state, MOTION_MESSAGES['not_set_up'])
+    if '%s' in message:
+        message = message % (detail or 'no reason given')
+    if not chosen:
+        message = 'Her reels get no animated overlays. ' + (message if not text else '')
+    return _ok_reply({'overlays': chosen, 'animated': state, 'templates': dict(MOTION_NEEDS),
+                      'message': message.strip()})
 
 
 def _reel_voice(turn: _Turn, action, field, value) -> str:
@@ -599,10 +697,25 @@ def build_reel_tools(user_id, *, prompt_id,
         """
         return _reel_watchlist(track, untrack, niche)
 
+    def reel_motion(
+        overlays: Annotated[str, "title, logo_sting, end_card, wipe (comma-separated); "
+                                 "'none' stops them; '' lists"] = '',
+    ) -> str:
+        """Add animated overlays to her reels: a kinetic title, a logo sting, a booking/price end card, a before-after wipe.
+
+        Her choice is kept for every reel she makes.  Deterministic: the
+        reel places them; no model draws them.  Says whether they can be
+        animated on this computer yet (the owner may first have to confirm
+        the Remotion license or allow its one-time setup); until then her
+        reels get plain versions.
+        """
+        return _reel_motion(turn, overlays)
+
     return [('reel_make', reel_make), ('reel_trending_songs', reel_trending_songs),
             ('reel_check_caption', reel_check_caption), ('reel_score_hooks', reel_score_hooks),
             ('reel_beat_sheet', reel_beat_sheet), ('reel_skill', reel_skill),
-            ('reel_voice', reel_voice), ('reel_watchlist', reel_watchlist)]
+            ('reel_voice', reel_voice), ('reel_watchlist', reel_watchlist),
+            ('reel_motion', reel_motion)]
 
 
 def _first_registration() -> None:

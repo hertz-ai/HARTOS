@@ -3,7 +3,9 @@
 What her Reel Studio agent knows about how she writes and works: city,
 services, caption language and code-mix, tone, the words and emoji she uses,
 her hashtag bank, booking ask, brands, proof she is happy to post, logo and
-logo corner.  The fields, their types and limits come from
+logo corner, and the animated overlays her reels get (motion_overlays, a
+list whose items must be contracts.MOTION_TEMPLATES; the reel_motion tool
+sets it).  The fields, their types and limits come from
 igkit/resources/voice_template.json (derived from instagram-agent-skill's
 voice.md, MIT); anything else is refused.
 
@@ -254,6 +256,15 @@ def _emoji(item: str, field: str, max_len: int) -> str:
     return item
 
 
+def _list_choice(item: str, field: str, choices) -> str:
+    """One item of a list whose items are ``choices`` (motion_overlays):
+    case, spaces and hyphens do not matter ("End card" is end_card)."""
+    key = re.sub(r'[\s-]+', '_', item.strip().lower())
+    if key not in choices:
+        raise ValueError('%s: %r is not one of %s' % (field, item, ', '.join(choices)))
+    return key
+
+
 def _list(value, field: str, spec: Mapping[str, Any]) -> Optional[List[str]]:
     kind, max_len = spec['type'], spec['item_max_len']
     out: List[str] = []
@@ -269,6 +280,8 @@ def _list(value, field: str, spec: Mapping[str, Any]) -> Optional[List[str]]:
             item = _emoji(item, field, max_len) if item else None
         else:
             item = _text(raw, field, max_len, multiline=bool(spec.get('multiline')))
+            if item is not None and spec.get('choices'):
+                item = _list_choice(item, field, spec['choices'])
         if item is None or item.casefold() in seen:
             continue
         seen.add(item.casefold())
