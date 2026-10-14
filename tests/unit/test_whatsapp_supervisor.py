@@ -183,11 +183,12 @@ class StartSupervisorTests(unittest.TestCase):
         self.assertEqual(info['reason'], 'gated_off')
 
     def test_skipped_when_node_missing(self):
-        # supervisor_should_run True, but ensure_node returns None →
-        # last_error is the "install Node" hint, no spawn attempted.
+        # supervisor_should_run True, but the Node locator (core.node_bin,
+        # imported as find_node) finds none → last_error is the "install
+        # Node" hint, no spawn attempted.
         with (
             mock.patch.object(ws, 'supervisor_should_run', return_value=True),
-            mock.patch.object(ws, 'ensure_node', return_value=None),
+            mock.patch.object(ws, 'find_node', return_value=None),
             mock.patch.object(ws, 'ensure_baileys_deps', return_value=False),
         ):
             # Reset the singleton so this test runs cleanly even after

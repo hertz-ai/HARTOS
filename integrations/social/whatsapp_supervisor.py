@@ -39,6 +39,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from core.node_bin import find_node, find_npm
+
 logger = logging.getLogger(__name__)
 
 
@@ -165,18 +167,8 @@ def _gateway_port() -> int:
 
 
 # ── Node + dep ensures (one-time on first start) ─────────────────────
-def ensure_node() -> Optional[str]:
-    """Return path to ``node`` executable, or None if Node isn't on
-    PATH.  Caller surfaces a "please install Node" message to the user
-    when this returns None."""
-    return shutil.which('node')
-
-
-def ensure_npm() -> Optional[str]:
-    """Return path to ``npm``, or None.  Same docs as ensure_node."""
-    return shutil.which('npm')
-
-
+# Node and npm are found by core.node_bin, the one locator (find_node /
+# find_npm return None when absent; start() then says Node.js is missing).
 def ensure_baileys_deps() -> bool:
     """Idempotent: install gateway.js's npm deps under the gateway dir
     if its ``node_modules/`` doesn't yet exist.  Returns True iff the
@@ -192,7 +184,7 @@ def ensure_baileys_deps() -> bool:
     if node_modules.exists() and node_modules.is_dir():
         return True
 
-    npm = ensure_npm()
+    npm = find_npm()
     if npm is None:
         logger.warning(
             "whatsapp_supervisor: npm not on PATH; cannot install Baileys "
@@ -266,7 +258,7 @@ class _Supervisor(ProcessSupervisor):
         if self.thread is not None and self.thread.is_alive():
             return self.info()
 
-        node = ensure_node()
+        node = find_node()
         if node is None:
             self.last_error = (
                 'Node.js not on PATH; install Node ≥18 or set '
@@ -292,7 +284,7 @@ class _Supervisor(ProcessSupervisor):
 
     def _build_popen(self):
         from core.subprocess_safe import hidden_popen_kwargs
-        node = ensure_node() or 'node'
+        node = find_node() or 'node'
         gateway_js = _gateway_dir() / 'gateway.js'
         env = os.environ.copy()
         env['WHATSAPP_GATEWAY_PORT'] = str(_gateway_port())

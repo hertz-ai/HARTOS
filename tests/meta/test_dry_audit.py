@@ -252,6 +252,10 @@ CANONICAL_OWNERS = {
     'read_watchlist': 'integrations/trends/watchlist.py',
     'update_watchlist': 'integrations/trends/watchlist.py',
     'clean_tag': 'integrations/trends/trending_songs.py',
+    # The one Node.js locator (amendment A14): the coding-tool launcher, the
+    # WhatsApp gateway supervisor and the runtime's npm setup import it.
+    'find_node': 'core/node_bin.py',
+    'find_npm': 'core/node_bin.py',
 }
 
 #: module -> why it may walk sys._current_frames() itself.
