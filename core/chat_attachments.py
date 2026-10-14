@@ -33,8 +33,15 @@ to this user's inbox is dropped and logged.
 LAYERING: core/ may not import integrations/, so the contract facts this
 module needs (the inbound purposes) come from the store, and
 tests/unit/test_chat_attachments.py holds them equal to
-integrations.reel_studio.contracts, whose validate_attachment accepts every
-row parse_inbound keeps.
+integrations.reel_studio.contracts.
+
+parse_inbound is the looser of the two readers of a row.  It reads only
+``file_id``, ``sha256`` and ``purpose``, so it keeps a row that
+contracts.validate_attachment refuses for its other fields: one without
+``name``, ``mime`` or ``size``, or with a name such as '../evil.mp4'.  That
+is harmless here, since those fields are never read (the store's own record
+of the file is what counts), but a row a client sends should still pass
+validate_attachment.
 """
 from __future__ import annotations
 
@@ -189,8 +196,9 @@ def media_to_mirror(media) -> List[Dict[str, Any]]:
     The documented ConversationEntry.attachments shape
     ``[{file_id, sha256, name, mime, size}]`` with ``file_id`` = the xid, so a
     device that dedups by xid sees the reply, the push and the mirror row as
-    one reel -- the same shape a turn's ``attachments`` use (parse_inbound).  ``name`` is ``reel_<reel_id>.mp4`` (the xid's first 12 hex
-    when the reel id is not a safe name).  Items without an xid are skipped.
+    one reel -- the same shape a turn's ``attachments`` use (parse_inbound).
+    ``name`` is ``reel_<reel_id>.mp4`` (the xid's first 12 hex when the reel
+    id is not a safe name).  Items without an xid are skipped.
     """
     rows = []
     for item in media if isinstance(media, (list, tuple)) else ():

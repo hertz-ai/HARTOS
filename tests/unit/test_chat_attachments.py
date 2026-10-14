@@ -92,7 +92,10 @@ class TestParseInbound:
         assert parse_inbound([_att(ref, purpose=None)]) == [{'file_id': ref}]
 
     def test_the_contracts_validator_accepts_the_rows_this_module_reads(self):
-        """One shape: a row parse_inbound keeps is a valid contracts attachment."""
+        """One shape: each documented row form, which parse_inbound keeps, is
+        a valid contracts attachment.  (parse_inbound also keeps rows the
+        validator refuses for fields it never reads; see the module
+        docstring.)"""
         from integrations.reel_studio import contracts
         for row in (_att('a' * 64), _att('b' * 64, purpose=None),
                     _att('c' * 64, captured_at=1_760_000_000_000, duration_ms=4000)):
