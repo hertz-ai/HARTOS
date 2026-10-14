@@ -24,6 +24,12 @@ Owner ruling A10c (2026-10-14) keeps the guide the single source for:
   (integrations.reel_studio.igkit.humanize) read the whole list through
   machine_text_lexicon().  The list used to be igkit's resources/slop.json,
   a second lexicon beside the guide's; that file is gone.
+* the public docs' tells: scripts/check_docs_claims.py reports WORDS and
+  PHRASES in the docs a stranger lands on, and DOCS_TELLS, this list's
+  docs-only extension (amendment A20, D30: the checker's own FILLER list
+  folded in).  CI runs that checker on a bare Python and it loads this file
+  directly, so this module must keep importing only the standard library.
+* how a tell matches: tell_pattern, for every reader of the list.
 
 The guide is kept deliberately tight: the local ~4B model executes these
 prompts and a wall of rules hurts its completion rate, so it names a few
@@ -49,11 +55,15 @@ other platforms.  Changed for HARTOS:
   - Structures marked ``emoji`` ignore the emoji in her allowlist.
   - The entries commented ``guide`` are HARTOS's: tells the guide banned by
     name before the fold that upstream's list lacked.
+  - The entries commented ``docs`` are HARTOS's: forms the docs checker's
+    FILLER list caught that the tables lacked ('effortless' beside
+    'effortlessly', 'revolutionizing' beside 'revolutionize').
   - Characters a reader cannot tell apart are written as escapes.
 """
 from __future__ import annotations
 
 import functools
+import re
 from types import MappingProxyType
 from typing import Any, Mapping, NamedTuple
 
@@ -77,13 +87,31 @@ def with_reel_hashtag_limit(text: str) -> str:
 class Tell(NamedTuple):
     """An AI-sounding word or phrase and the plain words it becomes.
 
-    ``find`` matches whole words, in any case, across any run of spaces;
-    ``replace`` '' deletes it; ``quoted`` means the guide names it.
+    ``find`` matches as tell_pattern says: whole words, in any case, across
+    any run of spaces; ``replace`` '' deletes it; ``quoted`` means the guide
+    names it.
     """
     find: str
     replace: str
     family: str
     quoted: bool = False
+
+
+def tell_pattern(find: str, any_ending: bool = False) -> re.Pattern:
+    """The one way a tell's ``find`` matches text: as whole words, in any
+    case, across any run of spaces.  A find that ends on punctuation ('what
+    are your thoughts?') ends there: the next character only has to be one
+    that is not part of a word.
+
+    ``any_ending`` also matches the word with any ending ('honest' finds
+    'honestly', 'leverage' finds 'leveraged'), for REPORTING a word's family
+    as scripts/check_docs_claims.py does.  A rewrite must match the exact
+    form, since each form has its own replacement, so igkit.humanize never
+    sets it.
+    """
+    ending = r'\w*' if any_ending and find[-1:].isalnum() else ''
+    return re.compile(r'(?<!\w)' + re.escape(find).replace(r'\ ', r'\s+') + ending + r'(?!\w)',
+                      re.IGNORECASE)
 
 
 class Structure(NamedTuple):
@@ -169,6 +197,7 @@ WORDS = (
     Tell('curated', 'picked', 'verbs'),
     Tell('empower', 'let', 'verbs'),
     Tell('revolutionize', 'change', 'verbs'),
+    Tell('revolutionizing', 'changing', 'verbs'),                     # docs
     Tell('revolutionary', 'new', 'adjectives', quoted=True),          # guide
     Tell('transformative', 'big', 'adjectives', quoted=True),
     Tell('robust', 'solid', 'adjectives', quoted=True),
@@ -230,6 +259,7 @@ WORDS = (
     Tell('supercharge', 'speed up', 'verbs'),
     Tell('skyrocket', 'raise', 'verbs'),
     Tell('unleash', 'release', 'verbs', quoted=True),
+    Tell('effortless', 'easy', 'adjectives'),                         # docs
     Tell('effortlessly', 'easily', 'adjectives'),
     Tell('captivating', 'interesting', 'adjectives'),
     Tell('stunning', 'good', 'adjectives'),
@@ -307,6 +337,15 @@ PHRASES = (
     Tell('beat the algorithm', 'get reach', 'nouns'),
     Tell('go viral overnight', 'get reach', 'nouns'),
 )
+
+#: The docs-only extension of WORDS and PHRASES (HARTOS's own): the words
+#: the Hacker News thread on HARTOS's README (2026-07-27) counted, or
+#: grepped for, to call the docs machine-written.  scripts/check_docs_claims.py
+#: reports them as tells, beside WORDS and PHRASES, each with any ending.
+#: Never rewritten, so machine_text_lexicon() leaves them out: in a reel
+#: caption "an honest review" or "genuine lashes" is plain speech.
+DOCS_TELLS = ('load-bearing', 'load bearing', 'honest', 'genuine',
+              'earns its keep', 'earned its keep')
 
 #: Sentence shapes, reported for a person to rewrite.
 STRUCTURES = (

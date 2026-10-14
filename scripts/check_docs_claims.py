@@ -18,17 +18,41 @@ documentation, and the failures it catches were all found by hand first:
                      Hacker News. So did em dashes, "No X, no Y" runs, and
                      "honest" / "genuine" used as filler.
 
+The words are not listed here. HARTOS has one list of words that read as
+machine writing, in the human-voice guide's module
+(integrations/agent_engine/human_voice.py): its DOCS_TELLS, the words that
+thread counted in these docs, are reported as tells, and its WORDS and
+PHRASES, the stock vocabulary the same readers grep for, as filler. Each
+matches with any ending ("honest" finds "honestly"), and a word is reported
+once, under the longest tell that covers it.
+
 Usage:
     python scripts/check_docs_claims.py            # report
     python scripts/check_docs_claims.py --strict   # exit 1 on any finding
 """
 from __future__ import annotations
 
+import importlib.util
 import os
 import re
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _load_human_voice():
+    """integrations/agent_engine/human_voice.py, loaded from its file. It
+    imports only the standard library; importing it through its package would
+    run core/__init__.py, which needs requests and the rest of HARTOS's
+    requirements, and the docs CI job runs on a bare Python."""
+    path = os.path.join(REPO, 'integrations', 'agent_engine', 'human_voice.py')
+    spec = importlib.util.spec_from_file_location('human_voice', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+human_voice = _load_human_voice()
 
 # The docs a stranger actually lands on. Internal notes are out of scope on
 # purpose: the removed instruction log alone held 8,272 em dashes and
@@ -59,15 +83,20 @@ PATHY = re.compile(r'\.(py|rs|toml|nix|sh|json|md|txt|db|yml|yaml)$')
 # its condition removed ("90% faster", minus "on cache-equivalent inputs").
 NUMBER_RE = re.compile(r'\b(\d+(?:\.\d+)?%)\s+(\w+)')
 NO_X_NO_Y = re.compile(r'\bno [a-z]+.{0,40}?,\s*no [a-z]+', re.I | re.S)
-TELLS = ('load-bearing', 'load bearing')
-# Words and phrases that read as machine writing. honest/genuine/load-bearing
-# were literally counted by name in our HN thread; the rest are the stock
-# vocabulary those same readers grep for. Reported, not build-failing, since a
-# quote or a technical use ("robust to noise") can be legitimate.
-FILLER = ('honest', 'genuine', 'load-bearing', 'earns its keep', 'earned its keep',
-          'delve', 'seamless', 'leverage', 'empower', 'unleash', 'elevate',
-          'revolutioniz', 'game-chang', 'cutting-edge', 'supercharge',
-          'effortless', 'testament to', 'tapestry', 'dive into')
+
+
+def _word_tells() -> list:
+    """[(kind, find, pattern)] for every word the human-voice guide lists:
+    'tell' for its DOCS_TELLS, 'filler' for its WORDS and PHRASES, longest
+    find first so a phrase is reported rather than a word inside it. Read on
+    every check, so a tell the guide learns is reported here too. Reported,
+    not build-failing, since a quote or a technical use ("robust to noise")
+    can be legitimate."""
+    rows = [('tell', find) for find in human_voice.DOCS_TELLS]
+    rows += [('filler', t.find) for t in human_voice.WORDS + human_voice.PHRASES]
+    rows.sort(key=lambda row: len(row[1]), reverse=True)
+    return [(kind, find, human_voice.tell_pattern(find, any_ending=True))
+            for kind, find in rows]
 
 
 def resolve(token: str) -> bool:
@@ -97,20 +126,22 @@ def check(path: str) -> list:
     text = open(full, encoding='utf-8', errors='replace').read()
     lines = text.split('\n')
     out = []
+    word_tells = _word_tells()
 
     for i, line in enumerate(lines, 1):
         if EM_DASH in line or EN_DASH in line:
             # A verbatim quote of source may legitimately contain one.
             if '"' not in line:
                 out.append((path, i, 'dash', line.strip()[:70]))
-        for t in TELLS:
-            if t in line.lower():
-                out.append((path, i, 'tell', t))
         for m in NO_X_NO_Y.finditer(line):
             out.append((path, i, 'no-x-no-y', m.group(0)[:60]))
-        for f in FILLER:
-            if re.search(r'\b' + f + r'\w*\b', line, re.I):
-                out.append((path, i, 'filler', f))
+        taken = []      # spans already reported on this line
+        for kind, find, pattern in word_tells:
+            spans = [m.span() for m in pattern.finditer(line)
+                     if not any(m.start() < end and start < m.end() for start, end in taken)]
+            if spans:
+                taken.extend(spans)
+                out.append((path, i, kind, find))
 
         # A number claim with no file cited on the same line is uncheckable.
         for m in NUMBER_RE.finditer(line):

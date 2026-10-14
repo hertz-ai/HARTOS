@@ -245,6 +245,11 @@ CANONICAL_OWNERS = {
     # the filler.
     'REEL_HASHTAG_LIMIT_TOKEN': 'integrations/agent_engine/human_voice.py',
     'with_reel_hashtag_limit': 'integrations/agent_engine/human_voice.py',
+    # The one way a tell matches text (igkit.humanize rewrites and scores
+    # with it; scripts/check_docs_claims.py reports with it) and the docs'
+    # own tells, which that checker reads beside the guide's list.
+    'tell_pattern': 'integrations/agent_engine/human_voice.py',
+    'DOCS_TELLS': 'integrations/agent_engine/human_voice.py',
     # Her trending-song watchlist's one reader and one writer (owner ruling
     # A17b): daily_job reads through it, the reel_watchlist tool writes
     # through it.  And the one short-tag rule its niche and the published

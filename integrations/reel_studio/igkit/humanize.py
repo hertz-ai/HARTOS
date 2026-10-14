@@ -24,7 +24,8 @@ humanize_text, three passes in this order:
                  capitalisation and leaving links alone.
 The lexicon for all three (and for the detector) is the human-voice guide's
 one list, integrations.agent_engine.human_voice.machine_text_lexicon() (owner
-ruling A10c); it was igkit's resources/slop.json.
+ruling A10c); it was igkit's resources/slop.json.  Each word and phrase
+matches through the guide's tell_pattern, as every reader of the list does.
 Structural tells (rule-of-three, "not just X, it's Y", emoji bullets) are
 REPORTED, never rewritten: changing a sentence's shape needs judgement.
 
@@ -226,10 +227,6 @@ def _match_case(src: str, repl: str) -> str:
     return repl
 
 
-def _lexicon_pattern(find: str) -> 're.Pattern':
-    return re.compile(r'\b' + re.escape(find).replace(r'\ ', r'\s+') + r'\b', re.IGNORECASE)
-
-
 def _kept(keep_words: Iterable[str]) -> set:
     return {w.strip().casefold() for w in (keep_words or ()) if isinstance(w, str) and w.strip()}
 
@@ -245,7 +242,7 @@ def _pass_lexical(text: str, lex: Mapping[str, Any],
         find = entry['find']
         if find.casefold() in kept:
             continue
-        pattern = _lexicon_pattern(find)
+        pattern = human_voice.tell_pattern(find)
         found = pattern.findall(text)
         if not found:
             continue
@@ -406,7 +403,7 @@ def _check_slop(text: str, ws: List[str], lex: Mapping[str, Any],
     for entry in list(lex['words']) + list(lex['phrases']):
         if entry['find'].casefold() in kept:
             continue
-        n = len(_lexicon_pattern(entry['find']).findall(text))
+        n = len(human_voice.tell_pattern(entry['find']).findall(text))
         if n:
             hits += n
             found.append(entry['find'])

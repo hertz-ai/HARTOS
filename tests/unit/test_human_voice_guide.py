@@ -9,7 +9,10 @@ of published-text style (owner ruling A10c, lane review P6).
   hashtags parameter, her profile's hashtag-bank label and help).
 * AI-sounding words: igkit's lexicon (its old resources/slop.json) lives in
   the guide's source.  The guide quotes a few of its tells; igkit's
-  humanizer and detector read the whole list from there.
+  humanizer and detector read the whole list from there, and so does
+  scripts/check_docs_claims.py (its FILLER list folded in, amendment A20
+  D30), with the docs-only DOCS_TELLS beside it.  Every reader matches a
+  tell through the guide's one tell_pattern.
 
 The guide's module is imported inside each test, so a test that needs it
 fails on its own instead of failing the whole file at collection.
@@ -158,6 +161,77 @@ def test_the_list_is_sound_and_read_only():
         lex['words'] = ()
     with pytest.raises(TypeError):
         lex['words'][0]['replace'] = 'x'
+
+
+def test_the_forms_the_docs_list_had_are_rewritten_too():
+    # scripts/check_docs_claims.py's FILLER caught 'effortless' and
+    # 'revolutionizing'; the list had only 'effortlessly' and 'revolutionize'.
+    out = humanize.humanize_text('An effortless look, revolutionizing bridal glam.')
+    assert out['text'] == 'An easy look, changing bridal glam.', out
+    assert sorted(h['find'] for h in out['report']['lexical']) == ['effortless',
+                                                                   'revolutionizing']
+
+
+def test_the_docs_extension_adds_and_never_reaches_the_humanizer():
+    # The words Hacker News counted in HARTOS's docs are docs-only: in her
+    # caption "an honest review" is plain speech.
+    hv = _guide()
+    listed = {t.find.casefold() for t in hv.WORDS + hv.PHRASES}
+    assert hv.DOCS_TELLS and not listed & {f.casefold() for f in hv.DOCS_TELLS}
+    text = 'An honest review of a genuine lash glue that earns its keep.'
+    assert humanize.humanize_text(text)['text'] == text
+
+
+# ── the one matcher ─────────────────────────────────────────────────────────
+
+def test_a_tell_matches_as_whole_words_in_any_case_across_spaces():
+    pattern = _guide().tell_pattern('dive into')
+    assert pattern.search('Time to DIVE   into it')
+    assert pattern.search('dive\ninto')
+    assert not pattern.search('skydive into') and not pattern.search('dive intolerance')
+    leverage = _guide().tell_pattern('leverage')
+    assert leverage.search('We Leverage it.') and not leverage.search('We leveraged it.')
+
+
+def test_any_ending_finds_a_words_family_for_reports():
+    hv = _guide()
+    assert hv.tell_pattern('honest', any_ending=True).search('It is honestly fine.')
+    assert not hv.tell_pattern('honest').search('It is honestly fine.')
+    assert not hv.tell_pattern('honest', any_ending=True).search('It is dishonest.')
+
+
+def test_the_humanizer_rewrites_exact_forms_only():
+    # Each form has its own replacement: 'leveraged' is not 'leverage'.
+    assert humanize.humanize_text('We leveraged it.')['text'] == 'We leveraged it.'
+
+
+def test_a_tell_that_ends_on_punctuation_is_found_and_deleted():
+    # 'what are your thoughts?' never matched before a space or the end:
+    # "\b" after '?' needs a letter next.
+    out = humanize.humanize_text('Love this look. What are your thoughts?')
+    assert out['text'] == 'Love this look.', out
+    assert [h['find'] for h in out['report']['lexical']] == ['what are your thoughts?']
+    slop = humanize.detect_machine_text('Love this look. What are your thoughts?')
+    assert slop['checks']['SLOP DENSITY']['detail'].startswith('1 stock terms'), slop
+    assert not _guide().tell_pattern('what are your thoughts?').search(
+        'what are your thoughts?x')
+
+
+def test_the_humanizer_and_detector_match_through_the_one_matcher(monkeypatch):
+    hv = _guide()
+    asked = []
+    real = hv.tell_pattern
+
+    def spy(find, any_ending=False):
+        asked.append((find, any_ending))
+        return real(find, any_ending)
+
+    monkeypatch.setattr(hv, 'tell_pattern', spy)
+    humanize.humanize_text('We leverage it.')
+    assert ('leverage', False) in asked
+    asked.clear()
+    humanize.detect_machine_text('We leverage it.')
+    assert ('leverage', False) in asked
 
 
 def test_the_folded_list_keeps_igkits_rules():
