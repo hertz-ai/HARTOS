@@ -402,17 +402,34 @@ class ModelStorageManager:
             digest.update(b'\0')
         return digest.hexdigest()
 
+    @staticmethod
+    def _npm_declares_dependencies(project_dir: str) -> bool:
+        """Does the project's package.json name any dependency?  npm makes no
+        node_modules for a project that names none.  An unreadable
+        package.json counts as naming some (its install then has to show
+        them)."""
+        try:
+            with open(os.path.join(project_dir, 'package.json'), encoding='utf-8') as fh:
+                doc = json.load(fh)
+        except (OSError, ValueError):
+            return True
+        if not isinstance(doc, dict):
+            return True
+        return any(doc.get(key) for key in ('dependencies', 'optionalDependencies'))
+
     def npm_install_is_complete(self, tool_name: str, project_dir: str) -> bool:
         """True when this exact project was set up here and its packages are
         still on disk: the receipt names the project's current fingerprint
-        and ``node_modules`` exists.  A partly finished setup leaves no
-        receipt (mark_downloaded is its last step)."""
+        and ``node_modules`` exists (or the project names no dependency, for
+        which npm makes none).  A partly finished setup leaves no receipt
+        (mark_downloaded is its last step)."""
         row = self._read_manifest().get("tools", {}).get(tool_name)
         if not row or not os.path.isdir(project_dir):
             return False
         if row.get("source_url") != 'npm:' + self.npm_project_fingerprint(project_dir):
             return False
-        return (self.get_tool_dir(tool_name) / 'node_modules').is_dir()
+        return ((self.get_tool_dir(tool_name) / 'node_modules').is_dir()
+                or not self._npm_declares_dependencies(project_dir))
 
     def _mirror_npm_project(self, project_dir: str, tool_dir: Path) -> None:
         """Make the project's files in ``tool_dir`` the source's own.
@@ -442,11 +459,18 @@ class ModelStorageManager:
         for rel in before if isinstance(before, list) else ():
             if not isinstance(rel, str) or rel in keep:
                 continue
+            # A list entry is data on disk, not trusted.  An absolute one, or
+            # one naming a drive, is never ours: refused before it is joined
+            # (on Windows os.path.relpath raises ValueError for a path on
+            # another drive -- A23a N2 -- where setup_tool expects only
+            # NpmSetupFailed).
+            if os.path.isabs(rel) or os.path.splitdrive(rel)[0] or rel.startswith(('/', '\\')):
+                continue
             path = os.path.normpath(os.path.join(root, rel))
             inside = os.path.relpath(path, root).replace(os.sep, '/')
             # Never outside the tool dir, never into what npm or a prepare
-            # script own (a list entry is data on disk, not trusted).
-            if inside.startswith('../') or inside == '..' or os.path.isabs(inside) \
+            # script own.
+            if inside.startswith('../') or inside == '..' \
                     or inside.split('/')[0] in _NPM_SKIP_DIRS or inside == NPM_COPIED_LIST:
                 continue
             try:
@@ -502,13 +526,18 @@ class ModelStorageManager:
         script, and records the receipt.  Idempotent: a complete setup of
         this exact project returns at once; one setup per tool directory
         runs at a time.  Returns the tool directory; raises NpmSetupFailed
-        (Node.js or npm missing, a step failed or ran past its bound, the
-        copy failed), leaving no receipt.
+        (no package.json in the project, Node.js or npm missing, a step
+        failed or ran past its bound, npm made no node_modules for a project
+        that names dependencies, the copy failed), leaving no receipt.
         """
         tool_dir = self.get_tool_dir(tool_name)
         with self._npm_lock(tool_dir):
             if self.npm_install_is_complete(tool_name, project_dir):
                 return tool_dir
+            if not os.path.isfile(os.path.join(project_dir, 'package.json')):
+                # npm install in a folder with no package.json walks up to the
+                # nearest ancestor that has one and installs there.
+                raise NpmSetupFailed('the project at %s has no package.json' % project_dir)
             node, npm = find_node(), find_npm()
             if not node or not npm:
                 raise NpmSetupFailed(
@@ -524,6 +553,10 @@ class ModelStorageManager:
             self._npm_step(launch_argv([npm, 'install', '--no-audit', '--no-fund',
                                         '--loglevel=error']),
                            'npm install', tool_dir, NPM_INSTALL_TIMEOUT_S)
+            if not (tool_dir / 'node_modules').is_dir() \
+                    and self._npm_declares_dependencies(project_dir):
+                raise NpmSetupFailed('npm install finished but made no node_modules in %s'
+                                     % tool_dir)
             if prepare:
                 self._npm_step([node, prepare], prepare, tool_dir, NPM_PREPARE_TIMEOUT_S)
             self.mark_downloaded(tool_name, 'npm:' + fingerprint, self.get_tool_size(tool_name))

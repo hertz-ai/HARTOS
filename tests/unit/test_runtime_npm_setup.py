@@ -184,6 +184,61 @@ def test_the_mirror_never_removes_outside_the_projects_own_files(env):
     assert (tool_dir / 'index.js').read_text() == 'module.exports = 3;\n'
 
 
+def test_an_absolute_or_other_drive_list_entry_is_skipped_not_raised(env):
+    """A23a N2: the copied-files list is data on disk.  An entry naming an
+    absolute path (on Windows, on another drive: os.path.relpath raises
+    ValueError there, not OSError) is skipped, the file it names is left
+    alone, and the setup still completes instead of setup_tool raising."""
+    import sys
+    env.rtm.setup_tool(TOOL)
+    tool_dir = env.storage.get_tool_dir(TOOL)
+    outside = env.tmp / 'abs_outside.txt'
+    outside.write_text('keep')
+    drive = os.path.splitdrive(str(tool_dir))[0]
+    other = ('Q:' if drive.upper() != 'Q:' else 'R:') + '/elsewhere/x.txt'
+    entries = [str(outside), outside.as_posix(), other, '/rooted/x.txt']
+    (tool_dir / model_storage.NPM_COPIED_LIST).write_text(json.dumps(entries))
+    (env.project / 'index.js').write_text('module.exports = 4;\n')
+    result = env.rtm.setup_tool(TOOL)
+    assert result.get('ready') is True, result
+    assert outside.read_text() == 'keep'
+    assert (tool_dir / 'index.js').read_text() == 'module.exports = 4;\n'
+    if sys.platform == 'win32':
+        # The other-drive entry is the one that used to raise ValueError.
+        assert os.path.splitdrive(other)[0] != drive
+
+
+def test_a_project_without_package_json_is_refused_before_npm_runs(env):
+    """npm install in a folder with no package.json walks up to the nearest
+    ancestor that has one and installs THERE: such a project is refused, and
+    npm never runs."""
+    (env.project / 'package.json').unlink()
+    result = env.rtm.setup_tool(TOOL)
+    assert 'package.json' in result.get('error', ''), result
+    assert env.runs == []
+    assert TOOL not in env.storage.get_manifest().get('tools', {})
+
+
+def test_a_project_with_no_dependencies_is_complete_without_node_modules(env, monkeypatch):
+    """npm makes no node_modules for a project with no dependencies, so the
+    receipt alone says it is set up: a second setup installs nothing."""
+    def run_bounded(cmd, timeout=5.0, **kw):          # npm that creates nothing
+        env.runs.append(SimpleNamespace(cmd=list(cmd), kind='npm' if 'install' in cmd else 'node'))
+        return BoundedResult(0, 'up to date', '')
+    monkeypatch.setattr(model_storage, 'run_bounded', run_bounded)
+    assert env.rtm.setup_tool(TOOL).get('ready') is True
+    assert not (env.storage.get_tool_dir(TOOL) / 'node_modules').exists()
+    env.runs.clear()
+    assert env.rtm.tool_ready(TOOL) is True
+    assert env.rtm.setup_tool(TOOL).get('ready') is True and env.runs == []
+    # A project that names dependencies still needs its node_modules: an npm
+    # that exits 0 without making it is a failed setup, never 'ready'.
+    (env.project / 'package.json').write_text('{"name": "demo", "dependencies": {"a": "1.0.0"}}')
+    result = env.rtm.setup_tool(TOOL)
+    assert 'node_modules' in result.get('error', '') and not result.get('ready'), result
+    assert env.rtm.tool_ready(TOOL) is False, 'dependencies named, none installed'
+
+
 @pytest.mark.parametrize('kind, answer, said', [
     ('npm', BoundedResult(1, '', 'ERR! 404 Not Found'), 'npm install failed'),
     ('npm', BoundedResult(-1, '', '', timed_out=True), 'timed out'),
