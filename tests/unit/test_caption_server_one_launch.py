@@ -23,7 +23,9 @@ names (model_catalog 'llm-qwen3.5-0.8b'): in the folder the row recorded, in
 Nunba's models folder (LlamaInstaller.resolve_models_dir) when that is
 importable, else its default ~/.nunba/models, and ~/.trueflow/models; the
 projector under the installer's name (mmproj-Qwen3.5-0.8B-F16.gguf) or where
-scripts/setup_vlm.py puts it (qwen08b/mmproj-F16.gguf).
+scripts/setup_vlm.py puts it (qwen08b/mmproj-F16.gguf).  Selection
+(is_available, which get_vision_backend asks) finds the weights by that same
+lookup, so a 0.8B the launch would start is never passed over.
 
 Real code throughout: the real backend, the real platform EventBus and
 registry, the real model catalog.  Replaced: the caption port's HTTP
@@ -356,24 +358,30 @@ def test_the_folder_the_catalog_recorded_is_asked_first(box):
     assert ok is True
 
 
-def test_nunbas_models_folder_rule_decides_when_its_installer_is_importable(box):
-    """Where Nunba's llama_installer can be imported, its one storage rule
+def _nunbas_models_dir_is(box, folder):
+    """Nunba's llama_installer importable here, its one storage rule
     (LlamaInstaller.resolve_models_dir: explicit, NUNBA_MODELS_DIR, saved
-    config, default) names the models folder."""
-    chosen = box.tmp / 'chosen_models'
-    model, proj = _files_in(chosen)
+    config, default) naming ``folder``."""
     installer = types.ModuleType('llama.llama_installer')
 
     class LlamaInstaller:
         @staticmethod
         def resolve_models_dir(models_dir=None, *, config_dir=None):
             from pathlib import Path
-            return Path(chosen)
+            return Path(folder)
     installer.LlamaInstaller = LlamaInstaller
     package = types.ModuleType('llama')
     package.llama_installer = installer
     box.mp.setitem(sys.modules, 'llama', package)
     box.mp.setitem(sys.modules, 'llama.llama_installer', installer)
+
+
+def test_nunbas_models_folder_rule_decides_when_its_installer_is_importable(box):
+    """Where Nunba's llama_installer can be imported, its one storage rule
+    names the models folder."""
+    chosen = box.tmp / 'chosen_models'
+    model, proj = _files_in(chosen)
+    _nunbas_models_dir_is(box, chosen)
     ok, _ = _ensure(box)
     cmd = box.port.spawned[0]
     assert (_arg(cmd, '--model'), _arg(cmd, '--mmproj')) == (str(model), str(proj))
@@ -385,3 +393,56 @@ def test_no_projector_on_disk_means_no_spawn(box):
     _put(box.models / 'mmproj-F16.gguf')        # a projector of unknown model: not taken
     ok, _ = _ensure(box)
     assert ok is False and box.port.spawned == []
+
+
+# ── selection: the 0.8B is found where the launch finds it ───────────────
+
+def _selectable(box):
+    """is_available() on the real backend, its server not answering."""
+    with patch.object(lvb, 'pooled_get', side_effect=box.port.health):
+        return lvb.Qwen08BBackend(port=PORT).is_available()
+
+
+@pytest.mark.parametrize('where', ['nunba_default', 'trueflow', 'catalog_recorded',
+                                   'nunbas_models_dir_rule'])
+def test_the_0_8b_is_selectable_wherever_the_launch_would_find_it(box, where):
+    """get_vision_backend() selects qwen08b by is_available().  It looked for
+    the weights by a literal name in ~/.nunba/models and ~/.trueflow/models
+    only, while the launch (_model_files) also asks the folder the catalog
+    recorded and Nunba's models-folder rule (NUNBA_MODELS_DIR, a saved
+    models_dir): weights there were launched but never selected (review of
+    6067e8806).  One lookup now answers both."""
+    folder = {'nunba_default': box.models,
+              'trueflow': box.home / '.trueflow' / 'models',
+              'catalog_recorded': box.tmp / 'drive_f' / 'models',
+              'nunbas_models_dir_rule': box.tmp / 'chosen_models'}[where]
+    model, _ = _files_in(folder)
+    if where == 'catalog_recorded':
+        from integrations.service_tools.model_catalog import get_catalog
+        box.mp.setattr(get_catalog().get(lvb.Qwen08BBackend.CATALOG_ID),
+                       'local_path', str(model))
+    if where == 'nunbas_models_dir_rule':
+        _nunbas_models_dir_is(box, folder)
+    assert _selectable(box) is True
+
+
+def test_no_0_8b_anywhere_is_not_selectable(box):
+    _files_in(box.tmp / 'somewhere_nobody_looks')
+    assert _selectable(box) is False
+
+
+def test_the_weights_without_their_projector_are_still_selectable(box):
+    """Selection asks for the weights only, as before: Nunba's start fetches
+    a missing projector itself (llama_config._do_start_caption_server,
+    _download_mmproj_only).  Only HARTOS's own spawn needs both."""
+    _put(box.models / MODEL)
+    assert _selectable(box) is True
+
+
+def test_a_lookup_that_fails_is_not_selectable_and_never_raises(box):
+    """The catalog cannot be read: the launch could not find the files
+    either, so the backend is not offered (it was, by the literal name)."""
+    _files_in(box.models)
+    with patch('integrations.service_tools.model_catalog.get_catalog',
+               side_effect=RuntimeError('catalog unreadable')):
+        assert _selectable(box) is False

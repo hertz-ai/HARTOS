@@ -784,15 +784,27 @@ class Qwen08BBackend(VisionBackend):
         actually arrives.
 
         "Selectable", not "serving": the launch path asks _is_serving().
+
+        The weights are looked for by the launch's own lookup, _model_files
+        (the catalog row's file name; the folder it recorded, Nunba's
+        models-folder rule, ~/.trueflow/models).  It was a second lookup, a
+        literal name in ~/.nunba/models and ~/.trueflow/models only, so
+        weights the launch would start (a custom NUNBA_MODELS_DIR, a saved
+        models_dir, the catalog's folder) were never selected (review of
+        6067e8806).  The weights alone make it selectable, not the
+        projector: Nunba's start fetches a missing projector itself
+        (llama_config._do_start_caption_server, _download_mmproj_only).  A
+        lookup that fails -- the catalog unreadable, so the launch could not
+        find the files either -- is not selectable.
         """
         if self._is_serving():
             return True
-        home = os.path.expanduser('~')
-        for d in [os.path.join(home, '.nunba', 'models'),
-                  os.path.join(home, '.trueflow', 'models')]:
-            if os.path.isfile(os.path.join(d, 'Qwen3.5-0.8B-UD-Q4_K_XL.gguf')):
-                return True
-        return False
+        try:
+            model, _mmproj = self._model_files()
+        except Exception as e:
+            logger.warning(f"Qwen3.5-0.8B: model lookup failed ({e}); not selectable")
+            return False
+        return model is not None
 
     def _is_serving(self) -> bool:
         """True only when the caption server answers /health on its port."""
@@ -900,7 +912,8 @@ class Qwen08BBackend(VisionBackend):
 
     def _model_files(self) -> tuple:
         """(model, mmproj) on disk for the standalone launch; None for a
-        file that is not there.
+        file that is not there.  is_available() asks it too, for the model,
+        so selection and the launch find the 0.8B in the same places.
 
         Names from the catalog row CATALOG_ID: files['model'], and the
         projector under the name Nunba's installer stores it by,
