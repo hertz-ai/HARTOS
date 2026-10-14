@@ -1,9 +1,9 @@
-"""integrations.trends.sources: where central's trending songs come from.
+"""integrations.trends.sources: where her desktop's trending songs come from.
 
-Standard library only.  Two processes use this file: HARTOS (central_job,
+Standard library only.  Two processes use this file: HARTOS (daily_job,
 trending_songs and the tests) imports it as integrations.trends.sources,
-and the trends worker (ig_worker.py, central's separate interpreter run
-with -I, where nothing from HARTOS is importable) loads this same file by
+and the trends worker (ig_worker.py, run with -I in its own venv under the
+data dir, where nothing from HARTOS is imported) loads this same file by
 path.  So it holds what both sides must agree on, once:
 
 * ``TrendSource``: what the run loop asks of a source (instagrapi today, a
@@ -29,7 +29,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Protocol
 
-#: The worker's output file, read by central_job.
+#: The worker's output file, read by daily_job.
 BATCH_SCHEMA = 'hart.trends.batch.v1'
 
 #: Most accounts one run watches, the request budget of one run (each

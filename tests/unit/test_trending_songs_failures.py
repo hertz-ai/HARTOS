@@ -1,4 +1,4 @@
-"""What a bad day does to central's trending-songs run.
+"""What a bad day does to the trending-songs run on her desktop.
 
 Two halves:
 * sources.collect, the loop the worker runs over the watchlist, driven here
@@ -7,10 +7,10 @@ Two halves:
   (and freezes it); throttled or feedback stops it (and cools it down); the
   request budget caps the run; tracks are looked up only for songs not yet
   known.
-* central_job finishing a run whose batch carries those outcomes: freeze or
-  cool-down in state.json, the owner told (NotificationService, mocked) of a
-  freeze, yesterday's list left in place marked stale, and no second worker
-  started while the freeze holds.
+* daily_job finishing a run whose batch carries those outcomes: freeze or
+  cool-down in state.json, the owner of the desktop told
+  (NotificationService, mocked) of a freeze, yesterday's list left in place
+  marked stale, and no second worker started while the freeze holds.
 """
 import json
 import os
@@ -200,7 +200,15 @@ def test_the_slimmed_track_carries_no_url_or_manifest():
     assert slim_track(None) is None and slim_track('x') is None
 
 
-# ── central_job finishing a bad run ──────────────────────────────────────
+# ── daily_job finishing a bad run ────────────────────────────────────────
+
+class _Stdin:
+    def write(self, data):
+        return len(data)
+
+    def close(self):
+        pass
+
 
 class FakePopen:
     made = []
@@ -210,6 +218,7 @@ class FakePopen:
         self.pid = 4242
         self.returncode = None
         self.killed = False
+        self.stdin = _Stdin()
         FakePopen.made.append(self)
 
     def poll(self):
@@ -235,18 +244,25 @@ def job(tmp_path, monkeypatch):
     monkeypatch.setenv('NUNBA_DATA_DIR', str(tmp_path))
     from core import platform_paths
     platform_paths.reset_cache()
-    from integrations.trends import central_job as cj
+    from integrations.trends import daily_job as cj
     monkeypatch.setattr(cj, '_run', None)
     monkeypatch.setattr(cj, '_next_check_at', 0.0)
-    monkeypatch.setattr('security.key_delegation.get_node_tier', lambda: 'central')
-    creds = {'HEVOLVE_IG_RESEARCH_USERNAME': 'research_fixture',
-             'HEVOLVE_IG_RESEARCH_PASSWORD': 'pw-fixture'}
-    monkeypatch.setattr('security.secrets_manager.get_secret',
-                        lambda name, default='': creds.get(name, default))
-    py = tmp_path / 'trends-venv' / 'python'
-    py.parent.mkdir()
+    monkeypatch.setattr('security.key_delegation.get_node_tier', lambda: 'flat')
+    creds = {cj.USERNAME_CREDENTIAL: 'research_fixture',
+             cj.PASSWORD_CREDENTIAL: 'pw-fixture'}
+
+    class _Vault:
+        def owner_credential_names(self):
+            return set(creds)
+
+        def owner_credential(self, name, names=None):
+            return creds.get(name, '')
+    monkeypatch.setattr('hartos.ai_key_vault.get_ai_key_vault', lambda: _Vault())
+    py = tmp_path / 'venvs' / cj.WORKER_VENV / 'python'
+    py.parent.mkdir(parents=True)
     py.write_text('', encoding='utf-8')
-    monkeypatch.setenv('HEVOLVE_TRENDS_PYTHON', str(py))
+    monkeypatch.setattr('core.venv_paths.venv_python_if_exists',
+                        lambda backend: str(py) if backend == cj.WORKER_VENV else None)
     (tmp_path / 'trends').mkdir(exist_ok=True)
     (tmp_path / 'trends' / 'watchlist.json').write_text(json.dumps(
         {'region': 'IN', 'niche': 'makeup', 'accounts': ['mua_a', 'mua_b', 'mua_c']}),

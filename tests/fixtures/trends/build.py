@@ -1,7 +1,7 @@
 """Builders for the trending-songs tests: reels from reels.json, varied.
 
 Imported as ``tests.fixtures.trends.build``.  Nothing here touches the
-network or the data root; it only shapes dicts the way central's worker
+network or the data root; it only shapes dicts the way the trends worker
 (integrations/trends/ig_worker.py) hands them back.
 """
 import copy

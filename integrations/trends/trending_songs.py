@@ -1,7 +1,8 @@
-"""integrations.trends.trending_songs: central's trending-song list.
+"""integrations.trends.trending_songs: her desktop's trending-song list.
 
 A day's batch from the trends worker (sources.BATCH_SCHEMA) becomes the
-published ``hart.trending_songs.v1`` list her desktop suggests songs from.
+``hart.trending_songs.v1`` list her agent suggests songs from, published on
+her own desktop by daily_job and read there by trending_songs_client.
 
 * ``normalize_reel``: one reel, as the private API sends it or as
   instagrapi's Media model dumps it, read into one record.
@@ -46,9 +47,6 @@ logger = logging.getLogger(__name__)
 
 #: Where the songs come from when the batch does not say.
 SOURCE = 'instagrapi'
-#: The route central serves the published list on (api_trends) and
-#: desktops fetch it from (trending_songs_client).
-SONGS_ROUTE = '/api/trends/songs/latest'
 #: Reels newer than this count toward songs (every reel counts toward its
 #: account's median), and a reel this old weighs half (goals-trends 2.3).
 WINDOW_DAYS = 7
@@ -184,7 +182,7 @@ def script_language(title: Any) -> Optional[str]:
     """A song's language from its title's script alone: 'ta', 'hi' or 'pa'
     (her languages written in their own scripts), 'other' for any other
     script, None for a Latin-script title (is_latin_title: the script
-    cannot tell; the desktop client may ask its own LLM), a title with no
+    cannot tell; trending_songs_client may ask the local LLM), a title with no
     letters, or one the detector cannot place.  The detector is the one the
     TTS router uses (integrations.channels.media.tts_router.detect_language)."""
     if not _letters(title) or is_latin_title(title):
@@ -213,7 +211,7 @@ def _songs_of(doc: Any) -> List[Mapping]:
 def known_song_keys(previous: Any) -> List[str]:
     """Every name the published list already resolves: each song's key,
     'canonical:<id>' for its music_canonical_id and 'audio:<id>' for its
-    audio asset.  The worker looks up no track for these (central_job puts
+    audio asset.  The worker looks up no track for these (daily_job puts
     them in its spec), and rank_batch joins them through ``previous``."""
     keys: List[str] = []
     for song in _songs_of(previous):
@@ -496,8 +494,8 @@ def merge_days(batch_rank: Mapping, prev_doc: Any, *, today: str,
 # ── the published list: one writer ───────────────────────────────────────
 
 def trends_dir() -> str:
-    """``get_data_dir()/trends``: central's watchlist, state and session,
-    and the published songs; on a desktop, its client cache."""
+    """``get_data_dir()/trends``: her desktop's watchlist, the daily job's
+    state and session, the published songs and the song-language cache."""
     return os.path.join(get_data_dir(), 'trends')
 
 

@@ -66,18 +66,6 @@ RUN pip install --no-cache-dir --no-deps -r requirements.txt && \
         bs4 \
         youtube-transcript-api
 
-# ── Layer 2e: the trending-songs worker's own venv (used on central only) ──
-#    instagrapi pins pydantic and requests above requirements.txt's, so it
-#    never enters the app's site-packages: it gets a second venv.  The agent
-#    daemon's central job (integrations/trends/central_job.py) runs
-#    integrations/trends/ig_worker.py with this interpreter and `-I`, the
-#    research account's credentials in the child's environment only.  On a
-#    node that is not central, or has no credentials, nothing runs it.
-COPY requirements-trends.txt .
-RUN python -m venv /opt/trends-venv && \
-    /opt/trends-venv/bin/pip install --no-cache-dir -r requirements-trends.txt
-ENV HEVOLVE_TRENDS_PYTHON=/opt/trends-venv/bin/python
-
 # ── Layer 3: Application code (rebuilds on any code change — fast, no pip) ──
 COPY . .
 

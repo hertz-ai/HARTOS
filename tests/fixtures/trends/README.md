@@ -1,7 +1,8 @@
 Fixtures for the trending-songs tests (tests/unit/test_trending_songs_*.py,
-test_ig_worker_contract.py, test_trends_*.py; package integrations/trends).
+test_ig_worker_contract.py, test_trends_daily_job.py; package
+integrations/trends).
 
-- reels.json: one reel of each kind central's worker meets, shaped like
+- reels.json: one reel of each kind the trends worker meets, shaped like
   Instagram's private clips/user/ items[].media as instagrapi 3.0.24 receives
   it (the field names were read from instagrapi's types.py, extractors.py and
   mixins, not captured live): a licensed song with its music_asset_info, an

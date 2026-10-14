@@ -1,20 +1,23 @@
-"""integrations/trends/ig_worker.py: the child central's job starts in its
-own venv (``HEVOLVE_TRENDS_PYTHON -I ig_worker.py <spec> <out>``).
+"""integrations/trends/ig_worker.py: the child her desktop's daily job starts
+in the worker's own venv under the data dir
+(``<venv python> -I ig_worker.py <spec> <out>``, the research account's
+credentials on its stdin).
 
-instagrapi is never installed into the HARTOS venv (its pydantic and
+instagrapi is never installed into the HARTOS interpreter (its pydantic and
 requests pins conflict, goals-trends 1.7), so these tests stand a fake
 ``instagrapi`` in through tests.unit.module_swap.swap_modules and drive the
 worker's main() in-process.  They pin the contract read from instagrapi
 3.0.24's own source: Client(with_challenge_flow=False, delay_range=[3, 8])
-so a challenge raises instead of reading stdin; the saved session is
-loaded, login() reuses or renews it, and the session is written back with
-mode 0600; credentials come from the environment only; one
-user_clips_paginated_v1(pk, amount=12) page per account; each exception
-class maps to one error code.  One more test runs the real file with
-``python -I`` and no instagrapi, which proves it imports nothing from
-HARTOS.
+so a challenge raises instead of prompting; the saved session is loaded,
+login() reuses or renews it, and the session is written back with mode
+0600; credentials come from one JSON line on stdin only (never the
+environment); one user_clips_paginated_v1(pk, amount=12) page per account;
+each exception class maps to one error code.  One more test runs the real
+file with ``python -I`` and no instagrapi, which proves it imports nothing
+from HARTOS.
 """
 import importlib.util
+import io
 import json
 import os
 import stat
@@ -153,16 +156,19 @@ def _fake_instagrapi(script):
 
 # ── harness ──────────────────────────────────────────────────────────────
 
+CREDS_LINE = json.dumps({'username': 'research_fixture', 'password': 'pw-fixture'}) + '\n'
+
+
 @pytest.fixture
 def run(tmp_path, monkeypatch):
     from tests.conftest import refuse_all_network
     refuse_all_network(monkeypatch)
-    monkeypatch.setenv('HEVOLVE_IG_RESEARCH_USERNAME', 'research_fixture')
-    monkeypatch.setenv('HEVOLVE_IG_RESEARCH_PASSWORD', 'pw-fixture')
     from tests.unit.module_swap import swap_modules
     from integrations.trends import ig_worker
 
-    def _run(script, accounts=('mua_a',), *, budget=60, known=(), session=None):
+    def _run(script, accounts=('mua_a',), *, budget=60, known=(), session=None,
+             stdin=CREDS_LINE):
+        monkeypatch.setattr('sys.stdin', io.StringIO(stdin))
         mod, exc, calls = _fake_instagrapi(script)
         session_path = str(tmp_path / '.ig_session.json')
         if session is not None:
@@ -308,11 +314,26 @@ def test_unknown_canonical_songs_are_looked_up_once(run):
     assert 'example.invalid' not in json.dumps(got)
 
 
-def test_credentials_come_only_from_the_environment(run, monkeypatch):
-    monkeypatch.delenv('HEVOLVE_IG_RESEARCH_PASSWORD')
-    rc, out, calls, _, _ = run({})
+def test_credentials_come_only_from_stdin(run, monkeypatch):
+    """Her research account reaches the worker as one JSON line on stdin:
+    an environment that names one is not read."""
+    monkeypatch.setenv('HEVOLVE_IG_RESEARCH_USERNAME', 'research_fixture')
+    monkeypatch.setenv('HEVOLVE_IG_RESEARCH_PASSWORD', 'pw-fixture')
+    monkeypatch.setenv('IG_RESEARCH_USERNAME', 'research_fixture')
+    monkeypatch.setenv('IG_RESEARCH_PASSWORD', 'pw-fixture')
+    rc, out, calls, _, _ = run({}, stdin='')
     assert out['error'] == 'login' and out['error_detail'] == 'no_credentials'
     assert calls['init'] == []
+
+
+@pytest.mark.parametrize('line', [
+    'not json\n', '[]\n', json.dumps({'username': 'research_fixture'}) + '\n',
+    json.dumps({'username': '  ', 'password': 'pw-fixture'}) + '\n',
+    json.dumps({'username': 5, 'password': 'pw-fixture'}) + '\n'])
+def test_a_bad_credentials_line_is_no_credentials(run, line):
+    rc, out, calls, _, _ = run({}, stdin=line)
+    assert out['error'] == 'login' and out['error_detail'] == 'no_credentials'
+    assert calls['init'] == [] and 'pw-fixture' not in json.dumps(out)
 
 
 def test_bad_arguments_exit_2(tmp_path):
@@ -336,11 +357,9 @@ def test_the_worker_runs_isolated_with_nothing_from_hartos(tmp_path):
     out = tmp_path / 'out.json'
     env = {k: v for k, v in os.environ.items()
            if k in ('PATH', 'SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP', 'TMPDIR', 'HOME')}
-    env.update({'HEVOLVE_IG_RESEARCH_USERNAME': 'research_fixture',
-                'HEVOLVE_IG_RESEARCH_PASSWORD': 'pw-fixture'})
     proc = subprocess.run([sys.executable, '-I', ig_worker.__file__, str(spec), str(out)],
-                          cwd=str(tmp_path), env=env, capture_output=True, text=True,
-                          timeout=120)
+                          cwd=str(tmp_path), env=env, input=CREDS_LINE,
+                          capture_output=True, text=True, timeout=120)
     assert proc.returncode == 3, proc.stderr[-2000:]
     batch = json.loads(out.read_text(encoding='utf-8'))
     assert batch['error'] == 'dependency' and batch['schema'] == 'hart.trends.batch.v1'

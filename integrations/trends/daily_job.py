@@ -1,16 +1,23 @@
-"""integrations.trends.central_job: central's daily trending-songs run,
-driven from the agent daemon's tick (owner ruling U6).
+"""integrations.trends.daily_job: the daily trending-songs run on HER
+desktop, driven from the agent daemon's tick.
 
-``maybe_tick()`` is called on every daemon tick, before the daemon's "no
-active goals" stop: the list serves every desktop whether or not central
-has goals of its own.  It runs no thread and no LLM:
+Owner rulings: A10d ("all in local nunba build not in central": the list is
+made on her desktop, which adds value while she is away; never on a central
+node, and nothing is served to or fetched from one) and U6 (a child process
+the daemon's tick starts and then only polls).
 
-* off a central node it returns at once ('skip'), and between checks it
-  only compares two numbers;
-* on central, when the run is due, it starts the worker as a child process
-  (``HEVOLVE_TRENDS_PYTHON -I ig_worker.py <spec> <out>``) and returns
-  'started'; the research account's credentials go in the child's
-  environment only, never in argv, the spec or a log line;
+``maybe_tick()`` is called on every daemon tick that gets past the daemon's
+yield gate (dispatch.should_yield_to_user: nobody is using the computer),
+before its "no active goals" stop: her list does not depend on goals.  It
+runs no thread and no LLM:
+
+* on a central node, without her research account, or without a watchlist
+  it returns 'skip', and between checks it only compares two numbers;
+* when the run is due it starts the worker as a child process
+  (``<worker venv python> -I ig_worker.py <spec> <out>``) and returns
+  'started'; the research account's credentials are written to the child's
+  stdin as one JSON line and nowhere else (not argv, not the spec, not its
+  environment, not a log line);
 * later ticks only ``poll()`` the child ('running'); when it exits, its
   batch is ranked (trending_songs.rank_batch, through igkit.swipe), merged
   with yesterday's list and published ('published'), or the run is
@@ -18,23 +25,44 @@ has goals of its own.  It runs no thread and no LLM:
 * after TIMEOUT_S the child is killed ('timeout').  The worker stops itself
   earlier (its spec's deadline_s), so this is the backstop.
 
-Due means: the node is central (security.key_delegation.get_node_tier),
-the research credentials are set (security.secrets_manager.get_secret),
-the trends interpreter exists, ``trends/watchlist.json`` names at least one
-account, nothing is frozen, and ``state.json``'s next_run_at has passed
+Her research account: a DEDICATED Instagram account made for this research,
+never her business account.  Its username and password are owner-entered
+credentials in this desktop's own vault (hartos.ai_key_vault: the consent
+card or the localhost credential submit put them there; USERNAME_CREDENTIAL
+and PASSWORD_CREDENTIAL), read only through
+AIKeyVault.owner_credential -- never from an environment variable or the
+node's own secrets, and never tracked.
+
+The worker's interpreter: instagrapi pins pydantic and requests above what
+HARTOS and Nunba's bundled python-embed carry, so it lives in its own venv
+under the data dir (core.venv_paths, the per-backend venv store; name
+WORKER_VENV, packages WORKER_PACKAGES).  When that venv is missing (or a run
+found no instagrapi in it) the owner is asked first
+(capability_setup.ask_owner_for_setup, capability SETUP_CAPABILITY); on yes
+Nunba's installer builds it on its own thread
+(tts.backend_venv.install_in_background) and later ticks only ask how it
+went ('installing', then 'installed').  HARTOS run without Nunba has no
+installer, so the job waits and says so.
+
+Due means: the node is not central (security.key_delegation.get_node_tier),
+her research account is entered, ``trends/watchlist.json`` names at least
+one account, nothing is frozen, and ``state.json``'s next_run_at has passed
 (set a day after the last good run, plus up to JITTER_S).
 
 Failures (goals-trends report 2.5):
 * challenge / login: frozen for FREEZE_S (doubling on each freeze in a row,
-  at most MAX_FREEZE_S), and the node's owner is told (NotificationService)
-  that the research account needs a person;
+  at most MAX_FREEZE_S), and the desktop's owner is told
+  (NotificationService) that the research account needs a person;
 * throttled / feedback: cooled down COOLDOWN_S (doubling, at most
   MAX_COOLDOWN_S);
 * anything else (a partial run, a dead or killed worker, bad output, no
-  instagrapi): retried after RETRY_S, doubling, at most MAX_RETRY_S.
+  instagrapi, a failed install): retried after RETRY_S, doubling, at most
+  MAX_RETRY_S.
 A restart while the child runs leaves ``state.json`` saying so; the next
 process adopts the child's batch when it is written, or records the run as
 interrupted once TIMEOUT_S has passed.
+
+``why_no_list()`` says why there is no list (for her agent's reply).
 
 Files (get_data_dir()/trends/): watchlist.json (kept by hand: {"region",
 "niche", "accounts": [handle | {"handle", "pk"}]}), state.json,
@@ -81,20 +109,46 @@ COOLDOWN_CODES = ('throttled', 'feedback')
 #: The notification type the owner gets when the run is frozen.
 PAUSED_NOTIFICATION = 'trends_paused'
 
-USERNAME_SECRET = 'HEVOLVE_IG_RESEARCH_USERNAME'
-PASSWORD_SECRET = 'HEVOLVE_IG_RESEARCH_PASSWORD'
-PYTHON_ENV = 'HEVOLVE_TRENDS_PYTHON'
+#: Her research account, as owner-entered credentials in this desktop's
+#: vault (hartos.ai_key_vault.AIKeyVault.credential_name form).  Never her
+#: business account.
+USERNAME_CREDENTIAL = 'IG_RESEARCH_USERNAME'
+PASSWORD_CREDENTIAL = 'IG_RESEARCH_PASSWORD'
+
+#: The worker's own venv under the data dir (core.venv_paths.venv_path), and
+#: what Nunba's installer puts in it, in install order.  Exact pins of
+#: instagrapi and the direct dependencies whose import name is their
+#: distribution name (tts.backend_venv.install_into_venv imports each spec it
+#: installed to verify it).  PySocks, Pillow and pycryptodomex come from
+#: instagrapi's own requirements.  instagrapi ships almost daily: bump it on
+#: purpose and re-read ig_worker.py against the new source.
+WORKER_VENV = 'ig_trends'
+WORKER_PACKAGES = ('pydantic==2.12.5', 'requests==2.34.2', 'curl_cffi==0.15.0',
+                   'instagrapi==3.0.24')
+#: The owner's yes to building it (capability_setup scope), and what the
+#: card says.
+SETUP_CAPABILITY = 'trends:' + WORKER_VENV
+SETUP_REASON = ("Find the songs trending in makeup reels on Instagram once a day, while "
+                "this computer is not in use? It installs a small Instagram reader "
+                "(instagrapi) on this computer and signs in with the research account "
+                "entered here, never your business account.")
+#: An install still running after this long is given up (Nunba's installer
+#: allows each package 30 minutes).
+INSTALL_TIMEOUT_S = 3 * 3600.0
+
 WORKER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ig_worker.py')
-#: All the child's environment holds besides the credentials: what an
-#: interpreter needs to start and reach the network.  Nothing else of the
-#: daemon's environment (keys, tokens, HARTOS settings) reaches it.
+#: All the child's environment holds: what an interpreter needs to start and
+#: reach the network.  Nothing else of the daemon's environment (keys,
+#: tokens, HARTOS settings) reaches it, and no credential: those go on its
+#: stdin.
 _CHILD_ENV_KEYS = ('PATH', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'HOME', 'USERPROFILE', 'LANG',
                    'LC_ALL', 'TMPDIR', 'TEMP', 'TMP', 'SSL_CERT_FILE', 'SSL_CERT_DIR',
                    'REQUESTS_CA_BUNDLE', 'HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY')
 
 _lock = threading.Lock()
-#: The child this process started: {'proc', 'pid', 'started_at', 'spec',
-#: 'out', 'region', 'niche'}, or None.
+#: What this process is waiting on: the worker it started ({'kind': 'worker',
+#: 'proc', 'pid', 'started_at', 'spec', 'out', 'region', 'niche'}) or the
+#: install it asked Nunba for ({'kind': 'install', 'started_at'}), or None.
 _run: Optional[Dict[str, Any]] = None
 #: The tick before which a skip is not re-examined (a cheap no-op).
 _next_check_at = 0.0
@@ -102,9 +156,9 @@ _last_skip: Optional[str] = None
 
 
 def maybe_tick(*, now: Optional[float] = None) -> str:
-    """One daemon tick's worth of the run: 'skip', 'started', 'running',
-    'published', 'failed' or 'timeout'.  Never raises and never blocks: a
-    second caller while one is inside gets 'running'."""
+    """One daemon tick's worth of the run: 'skip', 'installing', 'installed',
+    'started', 'running', 'published', 'failed' or 'timeout'.  Never raises
+    and never blocks: a second caller while one is inside gets 'running'."""
     now = time.time() if now is None else float(now)
     if not _lock.acquire(blocking=False):
         return 'running'
@@ -134,7 +188,34 @@ def _tick(now: float) -> str:
         return _adopt(state, running, now)
     if not _due(state, now):
         return 'skip'
-    return _start(state, now)
+    python = _worker_python(state)
+    if python is None:
+        return _install(state, now)
+    return _start(state, now, python)
+
+
+def why_no_list(*, now: Optional[float] = None) -> str:
+    """Why this computer has no trending-song list (for her agent's reply):
+    'central' (never made on a central node), 'no_account' (no research
+    account entered here), 'no_watchlist', 'running', 'installing',
+    'setup_asked' / 'setup_declined' / 'setup_unavailable' (the owner's
+    answer to installing the worker), 'no_installer' (HARTOS without
+    Nunba), the last run's error code, or 'not_run_yet'."""
+    now = time.time() if now is None else float(now)
+    why = _not_ready()
+    if why:
+        return why
+    state = _load_state()
+    if isinstance(state.get('running'), dict):
+        return 'running'
+    if now - _number(state.get('installing_since')) < INSTALL_TIMEOUT_S:
+        return 'installing'
+    if isinstance(state.get('waiting'), str) and state['waiting']:
+        return state['waiting']
+    last = state.get('last_run') if isinstance(state.get('last_run'), dict) else {}
+    if last.get('error'):
+        return str(last['error'])[:40]
+    return 'not_run_yet'
 
 
 # ── readiness ─────────────────────────────────────────────────────────────
@@ -142,40 +223,131 @@ def _tick(now: float) -> str:
 def _not_ready() -> Optional[str]:
     try:
         from security.key_delegation import get_node_tier
-        if get_node_tier() != 'central':
-            return 'not_central'
+        if get_node_tier() == 'central':
+            return 'central'
     except Exception as e:
         logger.debug("trending songs: node tier unreadable (%s)", e)
-        return 'not_central'
+        return 'central'
     username, password = _credentials()
     if not username or not password:
-        return 'no_credentials'
-    if not _python():
-        return 'no_interpreter'
+        return 'no_account'
     if not _watchlist()['accounts']:
         return 'no_watchlist'
     return None
 
 
 def _note_skip(why: str) -> None:
-    """Say once why a central node is not running the job (a desktop, which
+    """Say once why this node is not running the job (a central node, which
     never runs it, says nothing)."""
     global _last_skip
-    if why != _last_skip and why != 'not_central':
-        logger.info("trending songs: not running on this central node (%s)", why)
+    if why != _last_skip and why != 'central':
+        logger.info("trending songs: not running on this computer yet (%s)", why)
     _last_skip = why
 
 
 def _credentials():
-    from security.secrets_manager import get_secret
-    username = (get_secret(USERNAME_SECRET, '') or '').strip()
-    password = get_secret(PASSWORD_SECRET, '') or ''
+    """Her research account from this desktop's vault: owner-entered
+    credentials only (AIKeyVault.owner_credential), so an environment
+    variable or the node's own secrets never stand in for it.  ('', '')
+    when it is not entered or the vault cannot be read."""
+    try:
+        from hartos.ai_key_vault import get_ai_key_vault
+        vault = get_ai_key_vault()
+        names = vault.owner_credential_names()
+        username = (vault.owner_credential(USERNAME_CREDENTIAL, names) or '').strip()
+        password = vault.owner_credential(PASSWORD_CREDENTIAL, names) or ''
+    except Exception as e:
+        logger.warning("trending songs: the research account could not be read: %s", e)
+        return '', ''
     return username, password
 
 
-def _python() -> Optional[str]:
-    path = (os.environ.get(PYTHON_ENV) or '').strip()
-    return path if path and os.path.isfile(path) else None
+# ── the worker's interpreter ──────────────────────────────────────────────
+
+def _worker_python(state: Dict[str, Any]) -> Optional[str]:
+    """The worker venv's python when the worker can run in it, else None:
+    the venv is missing (or another interpreter built it,
+    core.venv_paths.venv_python_if_exists), or the last run found no
+    instagrapi there and nothing was installed since."""
+    from core.venv_paths import venv_python_if_exists
+    python = venv_python_if_exists(WORKER_VENV)
+    if not python:
+        return None
+    last = state.get('last_run') if isinstance(state.get('last_run'), dict) else {}
+    if (last.get('error') == 'dependency'
+            and _number(last.get('at')) >= _number(state.get('installed_at'))):
+        return None
+    return python
+
+
+def _installer():
+    """Nunba's venv installer (tts.backend_venv): ``(install_in_background,
+    background_install)``, or None where HARTOS runs without Nunba."""
+    try:
+        from tts.backend_venv import background_install, install_in_background
+    except ImportError:
+        return None
+    return install_in_background, background_install
+
+
+def _wait(state: Dict[str, Any], why: str) -> str:
+    """The run is due but waits on the owner or on Nunba: say why once."""
+    if state.get('waiting') != why:
+        state['waiting'] = why
+        _save_state(state)
+    _note_skip(why)
+    return 'skip'
+
+
+def _install(state: Dict[str, Any], now: float) -> str:
+    """Build the worker's venv: ask the owner first, then hand the install
+    to Nunba's installer, which runs it on its own thread; later ticks only
+    ask how it went (_poll_install)."""
+    global _run
+    installer = _installer()
+    if installer is None:
+        return _wait(state, 'no_installer')
+    from integrations.agent_engine.capability_setup import ask_owner_for_setup
+    answer = ask_owner_for_setup(SETUP_CAPABILITY, reason=SETUP_REASON)
+    if answer != 'granted':
+        return _wait(state, 'setup_' + answer)
+    state.pop('waiting', None)
+    try:
+        installer[0](WORKER_VENV, list(WORKER_PACKAGES))
+    except Exception as e:
+        return _failed(state, now, 'install_failed', str(e)[:200])
+    _run = {'kind': 'install', 'started_at': now}
+    state['installing_since'] = now
+    _save_state(state)
+    logger.info("trending songs: the owner allowed it; installing the worker's venv %r",
+                WORKER_VENV)
+    return 'installing'
+
+
+def _poll_install(run: Dict[str, Any], now: float) -> str:
+    global _run, _next_check_at
+    installer = _installer()
+    status = installer[1](WORKER_VENV) if installer else None
+    if isinstance(status, dict) and status.get('running'):
+        if now - run['started_at'] < INSTALL_TIMEOUT_S:
+            return 'installing'
+        _run = None
+        state = _load_state()
+        state.pop('installing_since', None)
+        return _failed(state, now, 'install_timeout',
+                       'still running after %d s' % INSTALL_TIMEOUT_S)
+    _run = None
+    state = _load_state()
+    state.pop('installing_since', None)
+    if not isinstance(status, dict) or status.get('ok') is not True:
+        message = status.get('message') if isinstance(status, dict) else None
+        return _failed(state, now, 'install_failed',
+                       message[-200:] if isinstance(message, str) else 'no result')
+    state['installed_at'] = now
+    _save_state(state)
+    _next_check_at = now                 # the run it was built for starts next tick
+    logger.info("trending songs: the worker's venv %r is installed", WORKER_VENV)
+    return 'installed'
 
 
 def _watchlist() -> Dict[str, Any]:
@@ -222,10 +394,10 @@ def _due(state: Dict[str, Any], now: float) -> bool:
 
 # ── one run ───────────────────────────────────────────────────────────────
 
-def _start(state: Dict[str, Any], now: float) -> str:
+def _start(state: Dict[str, Any], now: float, python: str) -> str:
     global _run
-    python = _python()
-    if not python:
+    username, password = _credentials()
+    if not username or not password:
         return 'skip'
     watch = _watchlist()
     pks = state.get('pks') if isinstance(state.get('pks'), dict) else {}
@@ -248,10 +420,13 @@ def _start(state: Dict[str, Any], now: float) -> str:
     except OSError as e:
         _remove(spec_path)
         return _failed(state, now, 'spawn_failed', str(e)[:200])
-    _run = {'proc': proc, 'pid': proc.pid, 'started_at': now, 'spec': spec_path,
-            'out': out_path, 'region': watch['region'], 'niche': watch['niche']}
+    _hand_credentials(proc, username, password)
+    _run = {'kind': 'worker', 'proc': proc, 'pid': proc.pid, 'started_at': now,
+            'spec': spec_path, 'out': out_path, 'region': watch['region'],
+            'niche': watch['niche']}
     state['running'] = {k: _run[k] for k in ('pid', 'started_at', 'spec', 'out', 'region',
                                               'niche')}
+    state.pop('waiting', None)
     _save_state(state)
     logger.info("trending songs: worker started (pid %s, %d account(s))", proc.pid,
                 len(accounts))
@@ -259,19 +434,17 @@ def _start(state: Dict[str, Any], now: float) -> str:
 
 
 def _spawn(argv, cwd: str):
-    """Start the worker with only _CHILD_ENV_KEYS and the credentials in its
-    environment, stdin closed, output to trends/worker.log."""
-    username, password = _credentials()
+    """Start the worker with only _CHILD_ENV_KEYS in its environment, a pipe
+    for its stdin (the credentials, _hand_credentials), output to
+    trends/worker.log."""
     env = {k: os.environ[k] for k in _CHILD_ENV_KEYS if k in os.environ}
-    env[USERNAME_SECRET] = username
-    env[PASSWORD_SECRET] = password
     from core.subprocess_safe import no_window_kwargs
     log = open(os.path.join(cwd, 'worker.log'), 'wb')
     try:
-        kwargs = dict(env=env, cwd=cwd, stdin=subprocess.DEVNULL, stdout=log,
+        kwargs = dict(env=env, cwd=cwd, stdin=subprocess.PIPE, stdout=log,
                       stderr=subprocess.STDOUT, close_fds=True, **no_window_kwargs())
         if os.name == 'posix':
-            # Its own session: a signal meant for the daemon's terminal or
+            # Its own session: a signal meant for the desktop's terminal or
             # process group never reaches the worker mid-run.
             kwargs['start_new_session'] = True
         return subprocess.Popen(argv, **kwargs)
@@ -279,8 +452,29 @@ def _spawn(argv, cwd: str):
         log.close()
 
 
+def _hand_credentials(proc, username: str, password: str) -> None:
+    """Write her research account to the worker's stdin as one JSON line and
+    close it: the only way the credentials leave this process.  The line is
+    ASCII (json escapes anything else), so the child's stdin encoding cannot
+    garble a password.  A worker that died before reading it exits on its
+    own and its batch says why."""
+    line = (json.dumps({'username': username, 'password': password}) + '\n').encode('utf-8')
+    try:
+        proc.stdin.write(line)
+    except (OSError, ValueError) as e:
+        logger.warning("trending songs: the worker did not take its sign-in (%s)",
+                       type(e).__name__)
+    finally:
+        try:
+            proc.stdin.close()
+        except (OSError, ValueError):
+            pass
+
+
 def _poll(now: float) -> str:
     run = _run
+    if run.get('kind') == 'install':
+        return _poll_install(run, now)
     rc = run['proc'].poll()
     if rc is not None:
         return _finish(_load_state(), run, rc, now)

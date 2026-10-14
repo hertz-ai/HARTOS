@@ -1,36 +1,40 @@
-"""integrations/trends/ig_worker.py: the trending-songs worker, run by
-central_job as a child process in central's trends interpreter:
+"""integrations/trends/ig_worker.py: the trending-songs worker, run by her
+desktop's daily job (integrations.trends.daily_job) as a child process in
+the worker's own venv under the data dir:
 
-    HEVOLVE_TRENDS_PYTHON -I ig_worker.py <spec.json> <out.json>
+    <worker venv python> -I ig_worker.py <spec.json> <out.json>
 
-instagrapi lives only in that interpreter's venv (requirements-trends.txt):
-its pydantic and requests pins conflict with HARTOS's, so it never enters
-the HARTOS venv.  ``-I`` keeps the HARTOS tree and environment out of the
-child; the one HARTOS file it uses, sources.py beside it (standard library
-only), is loaded by path.  Imported as integrations.trends.ig_worker (the
-tests), it uses integrations.trends.sources instead: the same file.
+instagrapi lives only in that venv (daily_job.WORKER_PACKAGES, installed by
+Nunba's tts.backend_venv): its pydantic and requests pins conflict with
+HARTOS's, so it never enters the HARTOS interpreter.  ``-I`` keeps the
+HARTOS tree and environment out of the child; the one HARTOS file it uses,
+sources.py beside it (standard library only), is loaded by path.  Imported
+as integrations.trends.ig_worker (the tests), it uses
+integrations.trends.sources instead: the same file.
 
-The spec (written by central_job, no secrets in it):
+The spec (written by daily_job, no secrets in it):
     {"accounts": [{"handle", "pk"}], "budget": 60, "known_song_keys": [...],
      "session_path": ".../trends/.ig_session.json", "delay_range": [3, 8],
      "deadline_s": 780}
-The research account's credentials come from this process's environment
-only (HEVOLVE_IG_RESEARCH_USERNAME / _PASSWORD, which central_job puts in
-the child's environment and nowhere else); they are never in argv, the
+The research account's credentials (a dedicated research account, never
+her business account) arrive as ONE JSON line on stdin,
+``{"username": ..., "password": ...}``, which daily_job writes from the
+desktop's vault and closes.  They are never in argv, the environment, the
 spec, the batch or a log line.
 
 What it does, read from instagrapi 3.0.24's own source:
 * ``Client(with_challenge_flow=False, delay_range=...)``: a challenge
-  raises ChallengeRequired instead of prompting on stdin, and every private
-  request waits 3-8 s.
+  raises ChallengeRequired instead of prompting for a code, and every
+  private request waits 3-8 s.
 * The saved session is loaded with ``override_app_version=True`` (a session
   from an older app profile otherwise fails the CAA login), then
   ``login()`` reuses or renews it, and the session is written back with
   mode 0600, atomically.  A refused login keeps no session.
 * One ``user_clips_paginated_v1(pk, amount=12)`` page per account (the
   account's pk looked up once with ``user_info_by_username_v1`` unless
-  central cached it), and ``track_info_by_canonical_id`` for each song
-  known only by its canonical id that central does not already know.
+  the job cached it), and ``track_info_by_canonical_id`` for each song
+  known only by its canonical id that the published list does not already
+  know.
 * Every instagrapi exception maps to one code (error_code); the run's stop
   rules, budget and deadline are sources.collect's.
 
@@ -44,12 +48,10 @@ import os
 import sys
 import time
 
-#: Read from this process's environment as central's own configuration
-#: (central_job puts it there); a vault or consent-card value never sets it.
-#: tests/unit/test_env_secrets_declared.py checks the declaration.
-ENV_NOT_FROM_VAULT = ('HEVOLVE_IG_RESEARCH_PASSWORD',)
+#: The longest credentials line read from stdin.
+MAX_CREDENTIALS_LINE = 4096
 
-#: The worker's own deadline when the spec names none, under central_job's
+#: The worker's own deadline when the spec names none, under daily_job's
 #: 900 s kill, so the batch is written before the job gives up on it.
 DEFAULT_DEADLINE_S = 780.0
 DEFAULT_DELAY_RANGE = [3, 8]
@@ -184,6 +186,29 @@ def _read_spec(path):
     return spec
 
 
+def _read_credentials():
+    """``(username, password)`` from the one JSON line daily_job wrote to
+    stdin; ``('', '')`` for no line, a line that is not that object, or a
+    blank field."""
+    stream = sys.stdin
+    if stream is None:
+        return '', ''
+    try:
+        line = stream.readline(MAX_CREDENTIALS_LINE)
+        data = json.loads(line) if line and line.strip() else None
+    except (OSError, ValueError):
+        return '', ''
+    if not isinstance(data, dict):
+        return '', ''
+    username, password = data.get('username'), data.get('password')
+    if not isinstance(username, str) or not isinstance(password, str):
+        return '', ''
+    username = username.strip()
+    if not username or not password:
+        return '', ''
+    return username, password
+
+
 def _write_json(path, data, mode=0o644):
     """Write ``data`` to a temp file beside ``path``, then os.replace."""
     tmp = '%s.%d.tmp' % (path, os.getpid())
@@ -257,12 +282,11 @@ def main(argv=None) -> int:
         return _finish(sources.failed_batch(code, detail, spec.get('accounts'),
                                             requests=used, budget=spec['budget']), rc)
 
+    username, password = _read_credentials()
     try:
         import instagrapi
     except ImportError:
         return _failed('dependency', 'instagrapi is not installed', rc=3)
-    username = os.environ.get('HEVOLVE_IG_RESEARCH_USERNAME', '').strip()
-    password = os.environ.get('HEVOLVE_IG_RESEARCH_PASSWORD', '')
     if not username or not password:
         return _failed('login', 'no_credentials')
     client = None

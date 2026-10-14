@@ -1493,13 +1493,13 @@ class AgentDaemon:
 
     @staticmethod
     def _trends_tick() -> None:
-        """Central's daily trending-songs run (integrations.trends.
-        central_job, owner ruling U6): a child process it starts and then
-        only polls, so a tick costs one poll() at most -- no thread, no
-        LLM.  Off central it returns at once.  Its own failures never
+        """Her desktop's daily trending-songs run (integrations.trends.
+        daily_job, owner rulings U6 and A10d): a child process it starts and
+        then only polls, so a tick costs one poll() at most -- no thread, no
+        LLM.  On a central node it returns at once.  Its own failures never
         reach the tick."""
         try:
-            from integrations.trends.central_job import maybe_tick
+            from integrations.trends.daily_job import maybe_tick
             maybe_tick()
         except Exception as e:
             logger.warning("Trending-songs tick failed (retried next tick): %s", e)
@@ -1605,9 +1605,10 @@ class AgentDaemon:
             if self._tick_count % self._remediate_every == 0:
                 self._settle_metered_usage(db)
 
-            # Central's trending-song list serves every desktop, so it is
-            # refreshed whether or not central has goals of its own: before
-            # the no-goals stop on purpose, like settlement.
+            # Her trending-song list is made on her desktop whether or not
+            # it has goals: before the no-goals stop on purpose, like
+            # settlement.  Past the yield gate above, so it runs while she
+            # is away from the computer.
             self._trends_tick()
 
             # DETERMINISTIC STOP: no goals = no action = system is inert
