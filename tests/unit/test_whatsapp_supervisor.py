@@ -196,6 +196,69 @@ def test_a_timed_out_install_is_false(gateway):
     assert ws.ensure_baileys_deps() is False
 
 
+# ── an install from before the fold (review of c4c73dd41) ────────────────
+#
+# The old ensure_baileys_deps returned True as soon as node_modules existed,
+# so a working gateway was never set up again.  Its folder holds gateway.js
+# and package.json (copied), npm's own package-lock.json and node_modules,
+# and no receipt; the first start after the fold therefore runs one setup
+# there.  With the shipped lock now matching package.json, npm installs that
+# locked tree; measured on a copy of a live gateway (baileys 7.0.0-rc13):
+# online with an empty npm cache 'added 1 package, removed 1 package, and
+# changed 28 packages in 6s'; offline with an empty cache npm failed
+# ENOTCACHED (exit 1) and left node_modules as it was.
+
+def _an_install_from_before_the_fold(gateway):
+    gw = gateway.home / 'whatsapp' / 'gateway'
+    baileys = gw / 'node_modules' / '@whiskeysockets' / 'baileys'
+    baileys.mkdir(parents=True)
+    (baileys / 'package.json').write_text('{"version": "7.0.0-rc13"}')
+    for name in ('gateway.js', 'package.json'):
+        shutil.copy2(str(gateway.bundle / name), str(gw / name))
+    (gw / 'package-lock.json').write_text('{"lockfileVersion": 3, "packages": {}}')
+    return gw
+
+
+def test_an_install_from_before_the_fold_is_set_up_once(gateway):
+    gw = _an_install_from_before_the_fold(gateway)
+    assert ws.ensure_baileys_deps() is True
+    [npm] = gateway.runs
+    assert os.path.samefile(npm.cwd, gw) and '--prefer-offline' in npm.cmd
+    # The shipped lock is what npm installs from; npm's packages stay.
+    assert (gw / 'package-lock.json').read_bytes() == \
+        (gateway.bundle / 'package-lock.json').read_bytes()
+    assert (gw / 'node_modules' / '@whiskeysockets' / 'baileys' / 'package.json').is_file()
+    gateway.runs.clear()
+    assert ws.ensure_baileys_deps() is True and gateway.runs == [], 'set up: never again'
+
+
+def test_an_install_from_before_the_fold_keeps_running_when_its_setup_fails(gateway, caplog):
+    """The old code started the gateway on the node_modules it had; so does
+    this when the setup fails (offline, say), and says why.  No receipt is
+    written, so the next start tries the setup again."""
+    _an_install_from_before_the_fold(gateway)
+    gateway.answer['npm'] = BoundedResult(1, '', 'npm error code ENOTCACHED')
+    with caplog.at_level('WARNING', logger=ws.logger.name):
+        assert ws.ensure_baileys_deps() is True
+    assert 'ENOTCACHED' in caplog.text and 'node_modules' in caplog.text
+    gateway.runs.clear()
+    assert ws.ensure_baileys_deps() is True
+    assert len(gateway.runs) == 1, 'no receipt: the next start sets it up again'
+
+
+@pytest.mark.parametrize('error', [PermissionError(13, 'Access is denied'),
+                                   RuntimeError('a bug in the installer')])
+def test_no_failure_of_the_setup_escapes(gateway, monkeypatch, error):
+    """ensure_baileys_deps runs in the HARTOS bootstrap thread: whatever the
+    setup raises is a failed setup, never an exception into start()."""
+    def boom(*a, **k):
+        raise error
+    monkeypatch.setattr(model_storage.ModelStorageManager, 'install_npm_project', boom)
+    assert ws.ensure_baileys_deps() is False, 'nothing set up before: no gateway'
+    _an_install_from_before_the_fold(gateway)
+    assert ws.ensure_baileys_deps() is True, 'a working install keeps running'
+
+
 def test_the_supervisor_keeps_no_npm_installer_of_its_own(gateway, monkeypatch):
     """One installer (A18): the gateway's npm runs only through
     model_storage, so with model_storage's runner refusing, nothing else

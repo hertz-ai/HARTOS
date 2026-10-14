@@ -53,15 +53,9 @@ def test_the_row_is_our_project_on_demand_off_by_default_with_consent_and_a_disk
         assert version[0].isdigit(), '%s %s: an exact version, not a range' % (name, version)
     for name in (row['npm_prepare'], 'render.js', 'templates.js', 'index.js'):
         assert os.path.isfile(os.path.join(project, name)), name
-    # The lock file pins every package npm installs, from the public
-    # registry, with its integrity hash, at the versions package.json names.
-    with open(os.path.join(project, 'package-lock.json'), encoding='utf-8') as fh:
-        lock = json.load(fh)
-    assert lock['packages']['']['dependencies'] == pkg['dependencies']
-    for path, entry in lock['packages'].items():
-        if path:
-            assert entry.get('resolved', '').startswith('https://registry.npmjs.org/'), path
-            assert entry.get('integrity', '').startswith('sha512-'), path
+    # Its package-lock.json pins what package.json names, from the public
+    # registry, hashed: test_runtime_npm_setup.py
+    # test_every_shipped_npm_project_locks_what_its_package_json_asks.
     # Nothing installed or built lives in the repo (A16).
     for name in ('node_modules', 'bundle'):
         assert not os.path.exists(os.path.join(project, name)), name

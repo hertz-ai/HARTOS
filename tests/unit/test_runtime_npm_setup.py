@@ -671,3 +671,47 @@ def test_the_state_file_lists_it_without_running(env):
     state = json.loads(runtime_manager.STATE_FILE.read_text())
     assert state['tools'][TOOL]['downloaded'] is True
     assert state['tools'][TOOL]['was_running'] is False
+
+
+# ── every npm project HARTOS ships locks what its package.json asks ──────
+#
+# Review of c4c73dd41: the WhatsApp gateway's package-lock.json pinned
+# @whiskeysockets/baileys ^6.7.18 (locked at 6.7.23) while package.json asked
+# ^7.0.0-rc13.  npm treats a lock whose root does not name package.json's
+# dependencies as stale: it resolved the ranges afresh, so copying that lock
+# (the one installer mirrors every project file) did not pin anything and
+# upgraded every gateway on its next setup.  The installer sets up two
+# shipped projects: the npm rows of RuntimeToolManager (Remotion) and the
+# WhatsApp gateway.
+
+def _shipped_npm_projects():
+    from integrations.social import whatsapp_supervisor
+    rows = sorted(row['npm_project'] for row in runtime_manager.TOOL_CONFIGS.values()
+                  if row.get('download_type') == 'npm')
+    return rows + [str(whatsapp_supervisor._bundled_gateway_dir())]
+
+
+@pytest.mark.parametrize('project', _shipped_npm_projects(),
+                         ids=lambda p: os.path.basename(os.path.dirname(p)) + '/'
+                         + os.path.basename(p))
+def test_every_shipped_npm_project_locks_what_its_package_json_asks(project):
+    with open(os.path.join(project, 'package.json'), encoding='utf-8') as fh:
+        pkg = json.load(fh)
+    with open(os.path.join(project, 'package-lock.json'), encoding='utf-8') as fh:
+        lock = json.load(fh)
+    assert lock['lockfileVersion'] >= 2, 'a lock with a packages map'
+    root = lock['packages']['']
+    for key in ('dependencies', 'optionalDependencies', 'devDependencies'):
+        assert root.get(key) == pkg.get(key), key
+    for name, wanted in pkg['dependencies'].items():
+        got = lock['packages']['node_modules/' + name]['version']
+        if wanted[:1].isdigit():
+            assert got == wanted, (name, wanted, got)
+        elif wanted.startswith('^'):
+            assert got.split('.')[0] == wanted[1:].split('.')[0], (name, wanted, got)
+    # Every package from the public registry, with its integrity hash (no
+    # git URL that needs git and a key, nothing unhashed).
+    for path, entry in lock['packages'].items():
+        if path:
+            assert entry.get('resolved', '').startswith('https://registry.npmjs.org/'), path
+            assert entry.get('integrity', '').startswith('sha512-'), path

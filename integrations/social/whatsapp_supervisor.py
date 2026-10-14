@@ -167,21 +167,45 @@ def ensure_baileys_deps() -> bool:
     integrations.service_tools.model_storage.install_npm_project (A18/A20:
     this was a second copy of it).  Idempotent: a complete setup of the
     shipped project returns at once; a HARTOS update that changes any of
-    its files sets it up again (its receipt names their fingerprint).
-    Returns True iff the deps are ready; False when the setup failed (the
-    installer logs npm's output and folder) -- the caller logs and falls
-    back."""
+    its files sets it up again (its receipt names their fingerprint), and
+    npm installs the tree package-lock.json pins.
+
+    Returns True iff the gateway can start: the setup finished, or it
+    failed (offline, say) where an earlier install left node_modules and
+    gateway.js -- the gateway then starts on the packages it has, as it
+    always did before the fold, and the next start tries the setup again
+    (no receipt was written).  False when it failed with nothing to start
+    on.  Never raises: it runs in the HARTOS bootstrap thread, so anything
+    the setup raises is a failed setup (logged)."""
     from integrations.service_tools.model_storage import NpmSetupFailed
     try:
         _gateway_storage().install_npm_project(
             GATEWAY_TOOL, str(_bundled_gateway_dir()), timeout_s=GATEWAY_NPM_TIMEOUT_S)
+        return True
     except NpmSetupFailed as e:
+        why = str(e)
+    except Exception as e:      # a bug in the setup: logged, never into start()
+        logger.error("whatsapp_supervisor: the gateway's npm setup raised %s: %s",
+                     type(e).__name__, e, exc_info=True)
+        why = '%s: %s' % (type(e).__name__, e)
+    gateway_dir = _gateway_dir()
+    try:
+        installed = (gateway_dir / 'node_modules').is_dir() \
+            and (gateway_dir / 'gateway.js').is_file()
+    except OSError as e:
+        logger.warning("whatsapp_supervisor: %s could not be read: %s", gateway_dir, e)
+        installed = False
+    if installed:
         logger.warning(
-            "whatsapp_supervisor: the gateway's npm setup failed: %s.  Set "
-            "WHATSAPP_API_URL to a managed WAHA endpoint, or install Node.js "
-            "(which provides npm).", e)
-        return False
-    return True
+            "whatsapp_supervisor: the gateway's npm setup failed (%s); starting it on "
+            "the node_modules already in %s, and setting it up again next start.",
+            why, gateway_dir)
+        return True
+    logger.warning(
+        "whatsapp_supervisor: the gateway's npm setup failed: %s.  Set "
+        "WHATSAPP_API_URL to a managed WAHA endpoint, or install Node.js "
+        "(which provides npm).", why)
+    return False
 
 
 from core.process_supervisor import ProcessSupervisor
