@@ -209,41 +209,48 @@ one commit later), Nunba b83f6540, the local model Qwen3.5 2B, 3.07 GB VRAM
 free. Contention during the first turn: two other sessions' proof turns
 (17:34:26Z, 17:36:14Z, section 11 above), the goal daemon dispatching, and a
 743 MB cuDNN download by the node itself. Gate before the first turn:
-`GET /prompts?user_id=10202&type=all` (10202 is agent 54's creator) listed 54
+`GET /prompts?user_id=<the id of agent 54's creator>&type=all` listed 54
 as `teach.local.radha`, `has_recipe true`, among 29 rows, so the node serves
 the real data directory and not the repository's dev copy (which has no 54);
 the answering route is the desktop's own prompts route by its response
 vocabulary (`origin`, `available`); Flask's order among the four `/prompts`
 handlers was not read. Each turn: `POST /chat` in the chat page's own body
 shape (`text`, `agent_id`, `prompt_id`, a fresh `conversation_id`,
-`intelligence_preference auto`), as the desktop's own guest identity, one at
-a time; the reply is the HTTP body, and the pushed messages are the node's
-agent log (`send_message_to_user`). Sidebar order. Where this developer run
-writes its logs, by mtime and by the request ids found in each file: the
-chat log (`server.log`, 3,876 lines with these ids) and the agent tool log
-(`agent_system.log`, 55 lines) under the data directory's `logs/`, while the
-outbound LLM record (`llm_outbound.jsonl`, 231 lines with these ids) goes
-under `logs-dev/`, and `logs/`'s own `llm_outbound.jsonl`,
-`frozen_debug.log` and `gui_app.log` have not been written since the
-installed build was quit on 2026-10-13 20:49 IST. So a developer run splits
-one turn's trail across two folders, and a reader of either folder alone
-sees half of it. Every row below ran on the 2B.
+`intelligence_preference auto`), as the owner's own desktop identity (the
+guest account the owner uses at the screen), so every side effect below
+landed on the owner's real profile; one turn at a time; the reply is the
+HTTP body, and the pushed messages are the node's agent log
+(`send_message_to_user`). Sidebar order. Where this developer run writes its
+logs, by mtime and by the request ids found in each file: under the data
+directory's `logs/`, the chat log (`server.log`, 3,876 lines with these ids)
+and the agent tool log (`agent_system.log`, 55 lines); under `logs-dev/`, the
+chain trace (`langchain.log` and its two rotated files, 35,292 lines with
+these ids, including the cloud-fallback lines), `indicator_window.log`
+(3,887) and the outbound LLM record (`llm_outbound.jsonl`, 236); and
+`logs/`'s own `llm_outbound.jsonl`, `frozen_debug.log` and `gui_app.log` have
+not been written since the installed build was quit on 2026-10-13 20:49 IST.
+So a developer run splits one turn's trail across two folders by file kind,
+and a reader who knows only the installed build's `logs/` misses the chain
+trace and the outbound record. Every row below ran on the 2B.
 
 | Step | Probe | Result | Label | Verdict |
 |---|---|---|---|---|
-| Personalised Learning (54: the rebuilt local tutor, recipe on disk) | "Teach me fractions, first step only." `request_id 3ed9648c-48dc-4d6a-abbc-a5e4788d4d5f` at 17:32:26Z | 200 after 505.4 s, `served_by local`, `agent_status Reuse Mode`; the HTTP text: "I see that `get_user_id` is not available, but I can try to use `get_user_details` instead to get user information. Let me try that first." (false: the same session's log shows `get_user_id` succeeding 16 times). Meanwhile FIVE messages were pushed to the learner, at 17:37:17, 17:38:01, 17:38:37, 17:38:42 and 17:40:06Z: four separate fraction introductions, each with its own greeting and its own check question ("What's your question or confusion about fractions?", "What is the main difference between a fraction and a decimal representation of the same value?", "What is one-half in different ways?", "what's the main focus of this lesson? What do fractions mean to you?"), and between them "I see you've been working on fractions. Let me check your progress!". Between pushes the recipe looped `get_user_id` then `get_data_by_key teach.<user>` = "Key not found" 16 times | measured | BROKEN: a learner who asked for the first step only gets four overlapping lessons, a progress note and a tool remark, over 8 min 25 s on the 2B |
+| Personalised Learning (54: the rebuilt local tutor, recipe on disk) | "Teach me fractions, first step only." `request_id 3ed9648c-48dc-4d6a-abbc-a5e4788d4d5f` at 17:32:26Z | 200 after 505.4 s, `served_by local`, `agent_status Reuse Mode`; the HTTP text: "I see that `get_user_id` is not available, but I can try to use `get_user_details` instead to get user information. Let me try that first." (false: the same session's log shows `get_user_id` succeeding 29 times, with no tool failure in the turn). Meanwhile FIVE messages were pushed to the learner, at 17:37:17, 17:38:01, 17:38:37, 17:38:42 and 17:40:06Z: four separate fraction introductions, each with its own greeting and its own check question ("What's your question or confusion about fractions?", "What is the main difference between a fraction and a decimal representation of the same value?", "What is one-half in different ways?", "what's the main focus of this lesson? What do fractions mean to you?"), and between them "I see you've been working on fractions. Let me check your progress!". Between pushes the recipe looped `get_user_id` then `get_data_by_key teach.<user>` (22 reads, 20 "Key not found"), and it did more than teach: it called the computer-control tool twice with "Create directory teach if it does not exist" (as windows at 17:34:21Z, 47.7 s, and as macos at 17:35:15Z, 5.9 s, both answered "Successfully ran the command in user's computer."), sent one presynthesized video (17:36:38Z), read the uploaded-file list twice, and saved a `teach` progress key ("Fractions ... check_question", 17:35:30Z) and one more memory key; the shell commands are the GAP row below | measured | BROKEN on the 2B: a learner who asked for the first step only gets four overlapping lessons, a progress note and a tool remark, over 8 min 25 s, and the agent ran shell commands on the desktop on the way |
 | Speech Therapy Agent (49) | "Help me practise the s sound. Give me the first exercise." `3fa325e7-e5bd-40e4-a0ee-ed05edc32254` at 17:40:51Z | 200 in 3.2 s, `Draft-First Mode`, no `prompt_id` in the reply. The node's log: `prompt_id=49 has no recipe on this node - cloud-only agent, forwarding the turn to the cloud`, then `Cloud agent 49 not answered by the cloud (not signed in) - answering here as local_assistant`. Reply: "Here's a simple exercise for the 's' sound: try saying 'see' without the 'ee' sound, just like 'see'." | measured | BROKEN on the 2B: the generic local assistant stands in silently, with no persona and no page notice; no speech-therapy agent is reached (central's 49 is "Great India" in any case) |
 | Spoken English Agent (20: a salvage stub, no recipe) | "Help me practise spoken English. Start with a greeting." `d34ecfe4-239a-4b9f-b956-cc3847d97f23` at 17:40:54Z | 200 in 10.1 s, `Creation Mode`; the log: `GATHER JSON EXISTS`, `0 Recipe JSON doesnot EXISTS`. Reply: "I need your input to finish building this agent. Step 1 ("Respond to user") isn't coming together from what I have so far — tell me more about how this step should work, and I'll continue building from there." | measured | BROKEN on the 2B: the builder's dead-end, the 2026-10-04 finding again on this build |
 | News Agent (5) | "Give me today's top three news headlines." `43d6ae57-76d6-408a-a39b-ce4906f275a3` at 17:41:04Z | 200 in 2.7 s, `Draft-First Mode`; the same forward-then-fallback as 49. Reply: "Hey there! Ready to dive into some spoken English practice with you? Just let me know what specific skills or topics you'd like to focus on first!" | measured | BROKEN on the 2B: no news, and the answer continues the PREVIOUS agent's topic (the Spoken English turn, same person, a different conversation id): the stand-in's history is per person, not per agent or conversation; mechanism not read |
 | Podcast Agent (12) | "Suggest a five minute podcast episode outline about sleep." `230a3f47-e8e8-467c-b060-6544dfbe942f` at 17:41:07Z | 200 in 5.6 s, no `agent_status`; the same fallback. Reply: a four-part outline (Hook 0:00-0:45, The Science, The Fix, The Takeaway) ending "Ready to record?" | measured | answers usefully on the 2B, as the generic assistant; agent 12 ("create an alaram after an hour") never ran. WORKS by the label's letter, not as an agent |
 | Story Narrator Agent (13: a salvage stub, no recipe) | "Tell me a short bedtime story about a brave rabbit." `88dc73c5-64c8-4bd7-9c02-8f7cb1ebd4e7` at 17:41:13Z | 200 after 161.0 s, `Creation Mode`; the HTTP text is the same builder dead-end as 20. Meanwhile the build loop pushed 50 messages to the person in 2 min 29 s (17:41:22 to 17:43:51Z) and saved `user.bedtime_story_request`, `user.bedtime_story_response` ("Once upon a time, in a quiet little meadow...") and `user.bedtime_story_complete`; the agent log holds no argument line for this session, so what each of the 50 bubbles said is not checked | measured (count, final text), not checked (the bubbles' texts) | BROKEN on the 2B: a story may have been written, but the person's screen gets a 50-message flood and ends on "I need your input to finish building this agent" |
 | Casual Conversation Agent (48) | "Hi, how are you today?" `c1c89ecf-fbce-4b7d-b77a-5605a32396db` at 17:43:54Z | 200 in 2.2 s, `Draft-First Mode`; the same fallback. Reply: "Hi there! I'm ready to help with whatever you need, whether it's solving a math problem, writing code, or chatting about your day." | measured | WORKS as casual chat on the 2B, by the generic assistant (central's 48 "Spoken English tutor" never ran) |
+| A tutoring agent's REUSE turn ran OS commands on the owner's desktop, and no consent was asked (inside the 54 turn above) | the two computer-control calls of `3ed9648c-48dc-4d6a-abbc-a5e4788d4d5f` | The chat log: `reuse: tool_call ['execute_windows_or_android_command'] -> Assistant (holds the function)` at 17:34:21Z, then the unified VLM loop (Qwen3-VL, in-process) started for the owner and prompt 54 with the task "Create directory teach if it does not exist", routed single-shot: iteration 1 dispatched the shell action `mkdir <data directory>\coding\teach` at 17:34:27Z, iteration 2 `mkdir teach`, "3 actions in 44.5s (exit_reason=done)", ledger task `computer_use_480200ab9389` COMPLETED, tool result "Successfully ran the command in user's computer."; the directory `coding/teach` under the data directory exists, creation time 17:34:27Z, empty. The second call (`os_to_control macos`) ran the same loop for 5.9 s with the same result. Consent: zero lines containing "consent" in the chat log across the whole turn (17:32 to 17:41Z); zero rows added to `user_consents` on the node's database on 2026-10-14 (53 rows, all older); no consent file touched that evening. Where the tool came from: agent 54's definition names no tools, and its three recipe actions name only `get_user_id`, `get_data_by_key` and `save_data_in_memory`, with the reply "written by the agent itself, never through a messaging tool"; the chat log shows the recipe matcher comparing "Create directory teach if it does not exist" against each of the three actions and running it anyway. The tool is in the default set registered for every agent's team (`hartos/create_recipe.py`, `register_dual(... execute_windows_or_android_command ...)`; advertised through `core/agent_tool_menu.py`), not in the agent's config. The same turn used `send_message_to_user` five times and `send_presynthesized_video_to_user` once, against its own action 2 | measured (logs, directory, database); read (the registration) | GAP: a tutoring recipe executed shell commands on the owner's desktop unasked, through the default tool set, with no consent card and no consent row; the recipe's own text forbids the messaging tool the turn used |
 
 Count: 5 of 7 BROKEN, 1 works by the generic assistant's grace (48), 1
-answers usefully but not as an agent (12). Residue on the node's data
-directory: session and ledger state for 54, 20 and 13 as the desktop guest
-(CREATE state for the two stubs), the three `user.bedtime_story_*` memory
-keys, seven conversation rows. The sweep script and its raw output live on
+answers usefully but not as an agent (12), and one GAP. Residue on the
+owner's profile and the node's data directory: session and ledger state for
+54, 20 and 13 (CREATE state for the two stubs; the computer-use ledger task),
+the `teach` progress key and a second memory key from the 54 turn, the three
+`user.bedtime_story_*` keys from the 13 turn, seven conversation rows, and
+the empty `coding/teach` directory the tutor's shell command created. The sweep script and its raw output live on
 the dev box, not in this repository. The web half of this sweep (the same
 seven on hevolve.ai through the cloud chat route) is not run: the route
 answers 401 without a signed-in token, and central's free model tier is
@@ -267,4 +274,9 @@ the rest of the day is expected to fail too; whether central has a second LLM
 endpoint was not checked, section 8). Gaps that are not journeys:
 tasks #121 (fixed in this chain, not deployed), #127 (the goals listing),
 #123 and #125 (not measured). The admin UI and the marketplace UI exist in
-the deployed bundle and were not driven in a browser.
+the deployed bundle and were not driven in a browser. The desktop node's
+proofs of 2026-10-14 are in section 11 above (left there rather than moved,
+two writers were editing this file): the revenue chain rows, the plain chat
+turn that works on the 2B, and the listed-agents sweep in 11.1, where 5 of 7
+sidebar agents are broken as a visitor sees them and a tutoring recipe ran
+shell commands on the owner's desktop with no consent asked.
