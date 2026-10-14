@@ -164,6 +164,26 @@ path is public and its gate is fixed in this chain (task #121), and two
 routes that act on a body user id need measuring (task #125). `/prompts` is
 served on the web hosts, not the API host.
 
+## 11. The desktop node, 2026-10-14 (owner ruling: every agentic flow is continuously live proven)
+
+Node: the owner's desktop running Nunba from source with HARTOS in-process
+(HARTOS f203e7d3b, Nunba b83f6540, local model Qwen3.5 2B, not the
+recommended 4B; the HARTOS port is not open in this mode). The build carries
+the revenue chain (af5c75099, f431b73d7, 4151c1dec, abb2dcfaf, 3a07d3989)
+that central does not. Measured by hartos-87 at 17:31:51 to 17:31:59 UTC with a
+throwaway user and a free key, both left on the node's SQLite as residue
+(user `198b63eb-76ba-4224-aeb5-8e30e86eba17`, key `fd06044a-f043-4d8e-83d2-b9a280025deb`).
+Every row is **measured** unless it says otherwise. A row is re-proven after
+the next restart of this node or the next push.
+
+| Step | Probe | Result | Label | Verdict |
+|---|---|---|---|---|
+| A login token carries no lane claim (f431b73d7, 4151c1dec) | `POST /api/social/auth/login`, then decode the JWT | 200; the claims are exactly `exp, iat, iss, jti, node_id, scope, type, user_id, username`: no `lane`, no `rid` | measured | WORKS |
+| A paid-tier upgrade never settles through the mock on a node with no rail (abb2dcfaf, 3a07d3989) | `POST /api/v1/intelligence/keys/<id>/upgrade` `{target_tier: starter, payment_method: mock}` at 17:31:56Z | 503 `{"success": false, "error": "no live payment gateway is configured on this node; the dev mock settles nothing"}`; `GET /keys` afterwards: tier still free; the node's log at the same second: `ap2_protocol WARNING upgrade: payment for 198b63eb-... refused: no live payment gateway is configured on this node (set STRIPE_API_KEY, or PHONEPE_MERCHANT_ID with ...)`, settings by name only. So dev mode is off on this node, or the rule's dev branch would have settled | measured | WORKS (a verified refusal) |
+| A paid chat turn as the customer (af5c75099) | `POST /api/v1/intelligence/chat` with the key, "Reply with the single word OK." at 17:31:52Z | 503 after 4.1 s `{"success": false, "error": "Intelligence backend unavailable; this call was not billed", usage 0/0, compute_ms 4082}`; the log at 17:31:56Z: `Metered api_intelligence /chat transport error: HTTPConnectionPool(host='localhost', port=<the HARTOS port>) ... NewConnectionError`. The metered self-POST goes to the HARTOS port over HTTP, and this in-process mode opens none, so the paid API cannot answer on a node run this way. Two things read back as intended: not billed (cost 0) and an honest 503. Nit: `GET /usage?days=1` afterwards shows `total_calls 1` with cost 0, so a failed, unbilled call still counts as a call in the customer's usage view | measured | BLOCKED on this node (topology): needs the HARTOS port open, or the self-POST folded onto the in-process app, which is the second half of the report-3 fold; the usage count is a defect |
+| The cart settler and the generic mandate settler (abb2dcfaf, 3a07d3989) | none | both are agent tools, not routes; `/api/commerce/health` says `configured: false`, so no cart session can start; the one HTTP surface of the same refusal rule is the upgrade rail above | not checked beyond that | NO SURFACE here |
+| The lane on the outbound record | a plain turn in Nunba's body shape | a first attempt with HARTOS's `prompt` field answered 400 "Text is required" (Nunba's /chat takes `text`); the run with the right shape was in flight when this was written; `llm_outbound.jsonl` on this box was last written 2026-10-13 20:49, so whether this mode writes it at all is part of what the turn shows | in flight | NOT YET |
+
 ## 10. What this proves
 
 Measured on the public host: the social feed read and the public agent
