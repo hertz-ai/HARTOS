@@ -11,8 +11,9 @@ yield gate (dispatch.should_yield_to_user: nobody is using the computer),
 before its "no active goals" stop: her list does not depend on goals.  It
 runs no thread and no LLM:
 
-* on a central node, without her research account, or without a watchlist
-  it returns 'skip', and between checks it only compares two numbers;
+* on a central node (or one whose tier cannot be read), without her
+  research account, or without a watchlist it returns 'skip', and between
+  checks it only compares two numbers;
 * when the run is due it starts the worker as a child process
   (``<worker venv python> -I ig_worker.py <spec> <out>``) and returns
   'started'; the research account's credentials are written to the child's
@@ -27,32 +28,49 @@ runs no thread and no LLM:
 
 Her research account: a DEDICATED Instagram account made for this research,
 never her business account.  Its username and password are owner-entered
-credentials in this desktop's own vault (hartos.ai_key_vault: the consent
-card or the localhost credential submit put them there; USERNAME_CREDENTIAL
-and PASSWORD_CREDENTIAL), read only through
-AIKeyVault.owner_credential -- never from an environment variable or the
-node's own secrets, and never tracked.
+credentials in this desktop's own vault (hartos.ai_key_vault;
+USERNAME_CREDENTIAL and PASSWORD_CREDENTIAL), never tracked.  The way in is
+the one credential consent card: when her agent asks for trending songs and
+the account is missing, ``ask_for_account()`` (through
+trending_songs_client) files it with hartos.ai_key_vault.request_credential,
+one card per part, for this computer's owner.  The card's Accept keeps the
+value in Nunba's desktop vault, which hands it to this vault
+(hold_credential) now and at every boot, and grants the consent row that
+names it; that row is what survives a restart.  A value sent to the
+localhost submit (/api/credentials/submit, store_credential) is not owner-
+entered past a restart: it names the credential only in the process that
+stored it.  The values are read only through AIKeyVault.owner_credential,
+so a name the owner never entered reads as nothing, whatever an
+environment variable or the node's own secrets hold.  Once her grant names
+it, the vault's own lookup order applies: an environment variable of the
+same name is read before the value she entered
+(SecretsManager.get_secret reads os.environ first).
 
 The worker's interpreter: instagrapi pins pydantic and requests above what
 HARTOS and Nunba's bundled python-embed carry, so it lives in its own venv
 under the data dir (core.venv_paths, the per-backend venv store; name
-WORKER_VENV, packages WORKER_PACKAGES).  When that venv is missing (or a run
-found no instagrapi in it) the owner is asked first
+WORKER_VENV, packages WORKER_PACKAGES).  When that venv is missing, its last
+install did not finish (failed, timed out, or cut short by a restart), or a
+run found no instagrapi in it, the owner is asked first
 (capability_setup.ask_owner_for_setup, capability SETUP_CAPABILITY); on yes
 Nunba's installer builds it on its own thread
 (tts.backend_venv.install_in_background) and later ticks only ask how it
 went ('installing', then 'installed').  HARTOS run without Nunba has no
 installer, so the job waits and says so.
 
-Due means: the node is not central (security.key_delegation.get_node_tier),
-her research account is entered, ``trends/watchlist.json`` names at least
-one account, nothing is frozen, and ``state.json``'s next_run_at has passed
-(set a day after the last good run, plus up to JITTER_S).
+Due means: the node is a desktop (security.key_delegation.get_node_tier
+answers and is not central), her research account is entered,
+``trends/watchlist.json`` names at least one account, nothing is frozen,
+and ``state.json``'s next_run_at has passed (set a day after the last good
+run, plus up to JITTER_S).
 
 Failures (goals-trends report 2.5):
 * challenge / login: frozen for FREEZE_S (doubling on each freeze in a row,
   at most MAX_FREEZE_S), and the desktop's owner is told
-  (NotificationService) that the research account needs a person;
+  (NotificationService) that the research account needs a person; after a
+  refused login the credential card asks the owner to enter the account
+  again (request_credential, "rejected").  Entering it does not end the
+  pause: the run after it uses what is entered by then;
 * throttled / feedback: cooled down COOLDOWN_S (doubling, at most
   MAX_COOLDOWN_S);
 * anything else (a partial run, a dead or killed worker, bad output, no
@@ -62,7 +80,8 @@ A restart while the child runs leaves ``state.json`` saying so; the next
 process adopts the child's batch when it is written, or records the run as
 interrupted once TIMEOUT_S has passed.
 
-``why_no_list()`` says why there is no list (for her agent's reply).
+``why_no_list()`` says why there is no list (for her agent's reply), and
+where the ask for her research account stands when that is why.
 
 Files (get_data_dir()/trends/): watchlist.json (kept by hand: {"region",
 "niche", "accounts": [handle | {"handle", "pk"}]}), state.json,
@@ -77,7 +96,7 @@ import subprocess
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from core.file_cache import atomic_json_write
 from integrations.trends import sources as _sources
@@ -114,17 +133,35 @@ PAUSED_NOTIFICATION = 'trends_paused'
 #: business account.
 USERNAME_CREDENTIAL = 'IG_RESEARCH_USERNAME'
 PASSWORD_CREDENTIAL = 'IG_RESEARCH_PASSWORD'
+#: What the credential card says for each part (request_credential builds
+#: the card from label, used_by and description).  The job reads the values
+#: itself, so no agent is handed their {{secret:...}} alias.
+ACCOUNT_LABELS = {USERNAME_CREDENTIAL: 'The research Instagram account username',
+                  PASSWORD_CREDENTIAL: 'The research Instagram account password'}
+ACCOUNT_USED_BY = 'the daily trending-song list'
+ACCOUNT_DESCRIPTION = ("Use a separate Instagram account made only for this research, never "
+                       "your business account: this computer signs in to it once a day, "
+                       "while it is not in use, to see which songs makeup reels use.")
 
 #: The worker's own venv under the data dir (core.venv_paths.venv_path), and
-#: what Nunba's installer puts in it, in install order.  Exact pins of
-#: instagrapi and the direct dependencies whose import name is their
-#: distribution name (tts.backend_venv.install_into_venv imports each spec it
-#: installed to verify it).  PySocks, Pillow and pycryptodomex come from
-#: instagrapi's own requirements.  instagrapi ships almost daily: bump it on
-#: purpose and re-read ig_worker.py against the new source.
+#: what Nunba's installer puts in it, in install order: instagrapi's direct
+#: dependencies first, then instagrapi, all exact pins.
+#: tts.backend_venv.install_into_venv imports each spec it installed to
+#: verify it, through tts.package_installer._PIP_TO_IMPORT for the three
+#: whose import name differs (pysocks -> socks, pillow -> PIL,
+#: pycryptodomex -> Cryptodome; that table's keys are lowercase, as pip's
+#: names are case-insensitive).  No hashed lock: pip resolves what these
+#: pins leave open.  instagrapi ships almost daily: bump it on purpose and
+#: re-read ig_worker.py against the new source.
 WORKER_VENV = 'ig_trends'
 WORKER_PACKAGES = ('pydantic==2.12.5', 'requests==2.34.2', 'curl_cffi==0.15.0',
+                   'pysocks==1.7.1', 'pillow==12.2.0', 'pycryptodomex==3.23.0',
                    'instagrapi==3.0.24')
+#: A last run that ended this way leaves no usable venv behind, so the next
+#: due run installs again (asking first) instead of starting the worker:
+#: no instagrapi in it, or an install that failed or timed out after
+#: ensure_venv had already made its interpreter.
+REINSTALL_ERRORS = ('dependency', 'install_failed', 'install_timeout')
 #: The owner's yes to building it (capability_setup scope), and what the
 #: card says.
 SETUP_CAPABILITY = 'trends:' + WORKER_VENV
@@ -194,21 +231,27 @@ def _tick(now: float) -> str:
     return _start(state, now, python)
 
 
-def why_no_list(*, now: Optional[float] = None) -> str:
+def why_no_list() -> str:
     """Why this computer has no trending-song list (for her agent's reply):
-    'central' (never made on a central node), 'no_account' (no research
-    account entered here), 'no_watchlist', 'running', 'installing',
-    'setup_asked' / 'setup_declined' / 'setup_unavailable' (the owner's
-    answer to installing the worker), 'no_installer' (HARTOS without
-    Nunba), the last run's error code, or 'not_run_yet'."""
-    now = time.time() if now is None else float(now)
+    'central' (never made on a central node), 'tier_unknown' (the node's
+    tier could not be read, so nothing runs), no research account entered
+    here -- 'account_asked' (its consent card is waiting), 'account_declined'
+    (the owner said no to it) or 'no_account' (nobody asked, or nobody here
+    to ask) --, 'no_watchlist', 'running', 'installing' (this process is
+    installing the worker's venv), 'setup_asked' / 'setup_declined' /
+    'setup_unavailable' (the owner's answer to installing the worker),
+    'no_installer' (HARTOS without Nunba), the last run's error code, or
+    'not_run_yet'."""
     why = _not_ready()
+    if why == 'no_account':
+        return _account_ask_state()
     if why:
         return why
     state = _load_state()
     if isinstance(state.get('running'), dict):
         return 'running'
-    if now - _number(state.get('installing_since')) < INSTALL_TIMEOUT_S:
+    run = _run
+    if isinstance(run, dict) and run.get('kind') == 'install':
         return 'installing'
     if isinstance(state.get('waiting'), str) and state['waiting']:
         return state['waiting']
@@ -220,14 +263,24 @@ def why_no_list(*, now: Optional[float] = None) -> str:
 
 # ── readiness ─────────────────────────────────────────────────────────────
 
-def _not_ready() -> Optional[str]:
+def _tier_refusal() -> Optional[str]:
+    """'central' on a central node, which never runs the job; 'tier_unknown'
+    when security.key_delegation.get_node_tier cannot answer (failing closed:
+    nothing runs, and the reason says what happened rather than calling her
+    desktop a server); None on a desktop."""
     try:
         from security.key_delegation import get_node_tier
-        if get_node_tier() == 'central':
-            return 'central'
-    except Exception as e:
-        logger.debug("trending songs: node tier unreadable (%s)", e)
-        return 'central'
+        tier = get_node_tier()
+    except Exception as e:      # said once per change by _note_skip
+        logger.debug("trending songs: this node's tier could not be read (%s)", e)
+        return 'tier_unknown'
+    return 'central' if tier == 'central' else None
+
+
+def _not_ready() -> Optional[str]:
+    why = _tier_refusal()
+    if why:
+        return why
     username, password = _credentials()
     if not username or not password:
         return 'no_account'
@@ -245,21 +298,102 @@ def _note_skip(why: str) -> None:
     _last_skip = why
 
 
-def _credentials():
-    """Her research account from this desktop's vault: owner-entered
-    credentials only (AIKeyVault.owner_credential), so an environment
-    variable or the node's own secrets never stand in for it.  ('', '')
-    when it is not entered or the vault cannot be read."""
+def _entered() -> Dict[str, str]:
+    """Her research account's parts as the owner entered them here:
+    ``{USERNAME_CREDENTIAL: ..., PASSWORD_CREDENTIAL: ...}``, '' for a part
+    not entered.  Owner-entered credentials only
+    (AIKeyVault.owner_credential), so a name she never entered reads as ''
+    whatever the environment or the node's own secrets hold.  Both '' when
+    the vault cannot be read."""
     try:
         from hartos.ai_key_vault import get_ai_key_vault
         vault = get_ai_key_vault()
         names = vault.owner_credential_names()
-        username = (vault.owner_credential(USERNAME_CREDENTIAL, names) or '').strip()
-        password = vault.owner_credential(PASSWORD_CREDENTIAL, names) or ''
+        return {USERNAME_CREDENTIAL: (vault.owner_credential(USERNAME_CREDENTIAL, names)
+                                      or '').strip(),
+                PASSWORD_CREDENTIAL: vault.owner_credential(PASSWORD_CREDENTIAL, names) or ''}
     except Exception as e:
         logger.warning("trending songs: the research account could not be read: %s", e)
-        return '', ''
-    return username, password
+        return {USERNAME_CREDENTIAL: '', PASSWORD_CREDENTIAL: ''}
+
+
+def _credentials():
+    """``(username, password)`` of her research account (_entered); ('', '')
+    when it is not entered or the vault cannot be read."""
+    entered = _entered()
+    return entered[USERNAME_CREDENTIAL], entered[PASSWORD_CREDENTIAL]
+
+
+# ── asking the owner for her research account ─────────────────────────────
+
+def ask_for_account() -> List[str]:
+    """File the credential consent card for each part of her research
+    account not entered on this computer yet, for its owner: called when her
+    agent asks for trending songs and there is no list
+    (trending_songs_client).  hartos.ai_key_vault.request_credential is the
+    one credential ask: one card per part however often it is asked (each
+    ask sends it again to whatever screen is up, as one card), never again
+    after the owner's no, nothing filed when nobody here can be asked.
+    Nothing is asked on a central node or one whose tier cannot be read.
+    Returns the names asked for ([] when nothing is missing or nothing was
+    asked).  Never raises."""
+    if _tier_refusal():
+        return []
+    missing = [name for name, value in _entered().items() if not value]
+    if missing:
+        _ask_owner_for(missing)
+    return missing
+
+
+def _ask_owner_for(names: List[str], *, rejected: bool = False) -> None:
+    """request_credential for each of ``names``, as this job (no agent);
+    ``rejected`` says Instagram refused the value entered, so the card
+    comes back for one that was already entered.  Its answer is for an
+    agent that uses the {{secret:...}} alias; the job needs none of it
+    (where the ask stands is read from the consent table,
+    _account_ask_state)."""
+    try:
+        from hartos.ai_key_vault import request_credential
+    except ImportError as e:
+        logger.warning("trending songs: the owner cannot be asked for the research "
+                       "account (%s)", e)
+        return
+    for name in names:
+        ask = {'key_name': name, 'label': ACCOUNT_LABELS[name], 'used_by': ACCOUNT_USED_BY,
+               'description': ACCOUNT_DESCRIPTION}
+        if rejected:
+            ask['rejected'] = True
+        try:
+            request_credential(json.dumps(ask), agent_id=None)
+        except Exception as e:
+            logger.warning("trending songs: the card for %s could not be filed: %s", name, e)
+
+
+def _account_ask_state() -> str:
+    """Where the ask for her research account stands, as the consent table
+    says (the cards ask_for_account files, for no agent): 'account_declined'
+    when the owner said no to a missing part, 'account_asked' when a card
+    for a missing part is on file and undecided, else 'no_account' (never
+    asked, nobody here to ask, or the table unreadable)."""
+    from integrations.agent_engine.capability_setup import setup_owner
+    owner = setup_owner()
+    missing = [name for name, value in _entered().items() if not value]
+    if not owner or not missing:
+        return 'no_account'
+    try:
+        from integrations.social.consent_service import CREDENTIAL_SCOPE_PREFIX, ConsentService
+        from integrations.social.models import db_session
+        scopes = [CREDENTIAL_SCOPE_PREFIX + name for name in missing]
+        with db_session(commit=False) as db:
+            if any(ConsentService.declined(db, owner, 'credential', scope=s) for s in scopes):
+                return 'account_declined'
+            if any(ConsentService.ask_on_file(db, owner, 'credential', scope=s) is not None
+                   for s in scopes):
+                return 'account_asked'
+    except Exception as e:
+        logger.warning("trending songs: where the research account ask stands is "
+                       "unknown: %s", e)
+    return 'no_account'
 
 
 # ── the worker's interpreter ──────────────────────────────────────────────
@@ -267,14 +401,18 @@ def _credentials():
 def _worker_python(state: Dict[str, Any]) -> Optional[str]:
     """The worker venv's python when the worker can run in it, else None:
     the venv is missing (or another interpreter built it,
-    core.venv_paths.venv_python_if_exists), or the last run found no
-    instagrapi there and nothing was installed since."""
+    core.venv_paths.venv_python_if_exists); an install was started and this
+    process is not running it (a restart cut it short: ``installing_since``
+    is still in the state); or the last run ended in REINSTALL_ERRORS and
+    nothing was installed since.  Only called with no install running here."""
     from core.venv_paths import venv_python_if_exists
     python = venv_python_if_exists(WORKER_VENV)
     if not python:
         return None
+    if _number(state.get('installing_since')):
+        return None
     last = state.get('last_run') if isinstance(state.get('last_run'), dict) else {}
-    if (last.get('error') == 'dependency'
+    if (last.get('error') in REINSTALL_ERRORS
             and _number(last.get('at')) >= _number(state.get('installed_at'))):
         return None
     return python
@@ -302,7 +440,9 @@ def _wait(state: Dict[str, Any], why: str) -> str:
 def _install(state: Dict[str, Any], now: float) -> str:
     """Build the worker's venv: ask the owner first, then hand the install
     to Nunba's installer, which runs it on its own thread; later ticks only
-    ask how it went (_poll_install)."""
+    ask how it went (_poll_install).  ``installing_since`` stays in the
+    state until it ends, so a process that finds it there without running
+    the install knows a restart cut it short (_worker_python)."""
     global _run
     installer = _installer()
     if installer is None:
@@ -617,16 +757,26 @@ def _freeze(state: Dict[str, Any], now: float, error: str, detail: Optional[str]
     ts.mark_stale(error)
     logger.warning("trending songs: frozen %.0f h, the research account needs a person (%s)",
                    span / 3600, error)
+    if error == 'login':
+        # The owner's rule for a refused sign-in: ask again, on the same
+        # card (request_credential "rejected"; it stops asking after the
+        # owner's no or MAX_CREDENTIAL_ENTRIES tries in a day).
+        _ask_owner_for([USERNAME_CREDENTIAL, PASSWORD_CREDENTIAL], rejected=True)
     _tell_owner(error, span)
     return 'failed'
 
 
 def _tell_owner(error: str, span: float) -> None:
     """Tell this node's owner that the research account needs a person."""
-    what = ('asked the research account to prove it is a person' if error == 'challenge'
-            else 'refused the research account\'s login')
-    message = ('Trending songs are paused for %d hours: Instagram %s. Sign in to that '
-               'account by hand; the daily list resumes on its own.' % (span // 3600, what))
+    if error == 'challenge':
+        message = ('Trending songs are paused for %d hours: Instagram asked the research '
+                   'account to prove it is a person. Sign in to that account by hand; the '
+                   'daily list tries again on its own after the pause.' % (span // 3600))
+    else:
+        message = ('Trending songs are paused for %d hours: Instagram refused the research '
+                   'account\'s sign-in. Enter its username and password again on the card '
+                   'this computer shows; the daily list tries again on its own after the '
+                   'pause, with what is entered by then.' % (span // 3600))
     try:
         from integrations.agent_engine.capability_setup import setup_owner
         owner = setup_owner()

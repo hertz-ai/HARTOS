@@ -6,8 +6,11 @@ Only when the tool asks.  The list is the one trending_songs.publish wrote
 on this computer (read_latest): nothing is fetched from central or any
 other node.  With no list, the answer is an empty list whose ``reason`` and
 ``note`` say why -- above all, that no dedicated research Instagram account
-is set up here (never her business account) -- so the reel reply can tell
-her.  Each song's language comes from its title's script
+is set up here (never the business account) -- so the reel reply can tell
+her.  With no account, the read first asks the owner for one
+(daily_job.ask_for_account: the consent card) and then says where that ask
+stands.  A paused list says how long the pause runs.  Each song's language
+comes from its title's script
 (tts_router.detect_language: Tamil, Devanagari, Gurmukhi); only a Latin
 title asks the local LLM, once per song, and only when this node's LLM stays
 on the premises (core.autogen_config.llm_stays_on_premises); the answer is
@@ -67,8 +70,13 @@ def client(tmp_path, monkeypatch):
     from integrations.trends import daily_job
     from integrations.trends import trending_songs_client as c
     state = {'gets': [], 'posts': [], 'answers': [], 'now': NOW, 'premises': True,
+             'asked': 0,
              'creds': {daily_job.USERNAME_CREDENTIAL: 'research_fixture',
                        daily_job.PASSWORD_CREDENTIAL: 'pw-fixture'}}
+
+    def _ask_for_account():
+        state['asked'] += 1
+        return []
 
     class _Vault:
         def owner_credential_names(self):
@@ -90,6 +98,11 @@ def client(tmp_path, monkeypatch):
 
     monkeypatch.setattr('security.key_delegation.get_node_tier', lambda: 'flat')
     monkeypatch.setattr('hartos.ai_key_vault.get_ai_key_vault', lambda: _Vault())
+    # The card itself is daily_job's (test_trends_daily_job.py runs it on a
+    # real consent table); here only that the read asks, and no owner is
+    # named, so where the ask stands is 'no_account' unless a test says so.
+    monkeypatch.setattr(daily_job, 'ask_for_account', _ask_for_account)
+    monkeypatch.delenv('HEVOLVE_OWNER_USER_ID', raising=False)
     monkeypatch.setattr('integrations.social.sync_engine.SyncEngine.parent_tier_url',
                         staticmethod(lambda: 'https://central.example.invalid'))
     monkeypatch.setattr('core.http_pool.pooled_get', _get)
@@ -130,6 +143,7 @@ def test_the_local_list_is_read_tagged_and_shaped_for_her_agent(client):
     assert (saree['suggested_start_ms'], saree['start_label']) == (61000, '1:01')
     assert len(st['posts']) == 1                      # only the Latin title asked
     assert st['gets'] == []                           # nothing fetched from central
+    assert st['asked'] == 0                           # a list: nothing to ask for
 
 
 def test_with_no_research_account_the_list_is_empty_and_says_so(client):
@@ -138,11 +152,48 @@ def test_with_no_research_account_the_list_is_empty_and_says_so(client):
     st['creds'].clear()
     out = c.get_trending_songs()
     assert out['songs'] == [] and out['reason'] == 'no_account'
+    assert st['asked'] == 1                           # her agent's read asked first
     note = out['note']
     assert 'research Instagram account' in note
-    assert 'never her business account' in note
+    assert 'never the business account' in note
+    assert 'could not be asked' in note               # nobody here to ask
     assert validate_trending_songs(out) == []
     assert st['gets'] == [] and st['posts'] == []
+
+
+@pytest.mark.parametrize('answer,words', [
+    ('account_asked', ('consent card', 'username and password',
+                       'never the business account')),
+    ('account_declined', ('chose not to', 'Allow asking again')),
+])
+def test_the_note_says_where_the_ask_for_the_account_stands(client, monkeypatch, answer,
+                                                             words):
+    from integrations.reel_studio.contracts import validate_trending_songs
+    c, st = client
+    st['creds'].clear()
+    monkeypatch.setattr('integrations.trends.daily_job._account_ask_state', lambda: answer)
+    out = c.get_trending_songs()
+    assert out['songs'] == [] and out['reason'] == answer and st['asked'] == 1
+    for word in words:
+        assert word in out['note']
+    assert validate_trending_songs(out) == []
+
+
+@pytest.mark.parametrize('code', ['login', 'challenge'])
+def test_a_paused_list_says_how_long_the_pause_runs(client, code):
+    """The pause is daily_job.FREEZE_S (doubling on a pause in a row) and
+    entering the account again does not shorten it: the note says so, and
+    never promises the list back once something is entered."""
+    from integrations.trends import daily_job
+    from integrations.trends.trending_songs import mark_stale
+    c, _ = client
+    _publish(_doc(*SONGS))
+    assert mark_stale(code) is True
+    out = c.get_trending_songs()
+    assert out['reason'] == code and len(out['songs']) == 4
+    note = out['note']
+    assert '%d hours' % (daily_job.FREEZE_S // 3600) in note
+    assert ('consent card' if code == 'login' else 'by hand') in note
 
 
 def test_a_list_made_earlier_is_still_served_after_the_account_is_removed(client):
@@ -166,7 +217,7 @@ def test_on_central_there_is_no_list(client, monkeypatch):
     monkeypatch.setattr('security.key_delegation.get_node_tier', lambda: 'central')
     out = c.get_trending_songs()
     assert out['songs'] == [] and out['reason'] == 'central'
-    assert out['note']
+    assert out['note']           # and nothing is asked there: test_trends_daily_job.py
 
 
 def test_before_the_first_run_it_says_the_list_is_not_made_yet(client):

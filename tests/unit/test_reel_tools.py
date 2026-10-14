@@ -39,9 +39,13 @@ from types import SimpleNamespace
 import pytest
 
 from integrations.reel_studio import contracts as C
+from integrations.trends import trending_songs_client as _trending_client
 
 UID = '10077'
 PID = '42'
+#: The real trending read, taken before any fixture replaces it (``env``
+#: does: most tests here supply their own list).
+REAL_TRENDING = _trending_client.get_trending_songs
 
 
 class _Agent:
@@ -110,10 +114,11 @@ def env(tmp_path, monkeypatch):
             beats_source='local_audio' if kw.get('song_audio') else 'synthetic', notes=[],
             timings={}, analyses=[])
     monkeypatch.setattr(pipeline, 'produce_reel', produce)
-    # No central here: an empty trending list unless a test supplies one.
+    # No list on this desktop: an empty trending list unless a test supplies
+    # one (the real read on a fresh data dir: REAL_TRENDING).
     from integrations.trends import trending_songs_client as tsc
     monkeypatch.setattr(tsc, 'get_trending_songs', lambda langs=None, limit=10: {
-        'schema': C.TRENDING_CLIENT_SCHEMA, 'songs': [], 'stale': True, 'reason': 'no_central'})
+        'schema': C.TRENDING_CLIENT_SCHEMA, 'songs': [], 'stale': True, 'reason': 'not_run_yet'})
     request = {'id': 'req-1'}
     yield SimpleNamespace(store=store, pushes=pushes, produced=produced, tmp=tmp_path,
                           prompts=prompts, request=request, mp=monkeypatch)
@@ -620,6 +625,43 @@ def test_her_song_audio_gives_the_beats(env):
     assert env.produced[0]['song_audio'] == env.store.resolve(UID, audio).path
     assert media['song']['beats'] == 'local_audio'
     assert media['song']['title'] == 'Vaathi Coming'
+
+
+def test_with_no_research_account_the_reel_says_why_and_names_no_song(env, monkeypatch):
+    """Reviewer's measurement on c17513ec4, a fresh data dir with no owner
+    credentials (every install's default): reel_trending_songs said why
+    there was no list, but reel_make dropped the reason, pushed no word
+    about songs, and still told her agent to give her "the song to add in
+    Instagram".  Here the real trending read and the real job, a fresh vault
+    and nobody on this computer to ask."""
+    from hartos import ai_key_vault
+    from integrations.trends import trending_songs_client as tsc
+    monkeypatch.setattr(tsc, 'get_trending_songs', REAL_TRENDING)
+    vault = ai_key_vault.AIKeyVault()
+    monkeypatch.setattr(ai_key_vault, 'get_ai_key_vault', lambda: vault)
+    for name in ('HEVOLVE_OWNER_USER_ID', 'IG_RESEARCH_USERNAME', 'IG_RESEARCH_PASSWORD'):
+        monkeypatch.delenv(name, raising=False)
+    _upload(env, b'clip' * 500)
+    t = _tools(env)
+    listed = _ok(t.run['reel_trending_songs']())
+    assert listed['songs'] == [] and listed['reason'] == 'no_account'
+    assert listed['note'] == tsc.note_for('no_account')
+    body = _ok(t.run['reel_make']())
+    assert body['media']['song'] is None
+    assert listed['note'] in body['notes']
+    assert 'song to add' not in body['message'] and listed['note'] in body['message']
+    (_topic, payload, _flags), = _media_pushes(env)
+    assert 'No song is suggested' in payload['text'][0]
+
+
+def test_a_song_key_the_list_does_not_hold_is_not_offered_as_a_song(env):
+    from integrations.reel_studio.tools import UNLISTED_SONG_NOTE
+    _upload(env, b'clip' * 500)
+    body = _ok(_tools(env).run['reel_make'](song_key='cluster:404'))
+    assert body['media']['song']['song_key'] == 'cluster:404'
+    assert body['media']['song']['title'] == ''
+    assert UNLISTED_SONG_NOTE in body['notes'] and UNLISTED_SONG_NOTE in body['message']
+    assert 'song to add' not in body['message']
 
 
 def test_a_busy_desktop_says_so_in_the_failure_form(env):

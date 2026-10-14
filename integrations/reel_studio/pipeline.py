@@ -24,6 +24,9 @@ at a time):
    her chat topic with the turn's request id and never through central's
    crossbar (decision U4(d)), and the clips (and song audio) it used are
    marked consumed, so the store's retention removes them a day later.
+   A reel with no song to suggest says so, and why (``song_note``, the
+   trending list's note), in the push, the reply's message and its notes,
+   and her agent is asked to name no song.
 
 The work dir is removed whatever happens (and, when the process dies
 mid-reel, by jobs when the job is interrupted or taken over), the job is
@@ -359,28 +362,48 @@ def _reel_notes(production: Production) -> List[str]:
     return list(dict.fromkeys(n for n in notes if isinstance(n, str) and n))
 
 
-def _ready_text(media: Mapping) -> str:
-    """The push's text (never empty): the reel, the song, and which beat the
-    cuts follow (decision U2: the reply says when they follow a steady one)."""
+def _suggests_song(song: Optional[Mapping]) -> bool:
+    """Does the reel suggest a song: one with a title (from the trending
+    list, or her own audio's name)?  A key the list does not hold has none."""
+    return isinstance(song, Mapping) and bool(song.get('title'))
+
+
+def _ready_text(media: Mapping, song_note: Optional[str] = None) -> str:
+    """The push's text (never empty): the reel, the song -- or that none is
+    suggested, and ``song_note``, why -- and which beat the cuts follow
+    (decision U2: the reply says when they follow a steady one)."""
     parts = ['Your reel is ready (%d s).' % int(round(media['duration_s']))]
     song = media.get('song')
-    if song and song.get('title'):
+    if _suggests_song(song):
         who = (' by %s' % song['artist']) if song.get('artist') else ''
         parts.append('Suggested song: %s%s, start it at %s in Instagram.'
                      % (song['title'], who, song['start_label']))
+    else:
+        parts.append('No song is suggested.')
+        if song_note:
+            parts.append(song_note)
     if (song or {}).get('beats', 'synthetic') == 'synthetic':
         parts.append("The cuts follow a steady beat, not a song's own; attach the song's audio "
                      'next time to cut on its beats.')
     return ' '.join(parts)
 
 
-def _ok_message(media: Mapping, notes: Sequence[str]) -> str:
+def _ok_message(media: Mapping, notes: Sequence[str], song_note: Optional[str] = None) -> str:
     """What her agent is told to say.  It carries what the push's text says
-    too (decision U2: the steady beat), because her phone shows one of the
-    reply and the push (it dedups them by xid), not always the push."""
+    too (decision U2: the steady beat; no song, and why), because her phone
+    shows one of the reply and the push (it dedups them by xid), not always
+    the push.  With no song suggested it asks for none: a song named here
+    would be one the reel does not have."""
     text = ('The reel is made, checked and on its way to her phone (it also rides this '
-            'reply). Tell her it is ready, give her the caption and the hashtags to paste, and '
-            'the song to add in Instagram at the start time given.')
+            'reply). Tell her it is ready, ')
+    if _suggests_song(media.get('song')):
+        text += ('give her the caption and the hashtags to paste, and the song to add in '
+                 'Instagram at the start time given.')
+    else:
+        text += ('and give her the caption and the hashtags to paste. No song is suggested '
+                 'for this reel, so do not name one.')
+        if song_note:
+            text += ' Tell her why: ' + song_note
     if NOTE_SYNTHETIC_BEATS in notes:
         text += (" The cuts follow a steady beat, not the song's own: say so, and that "
                  "attaching the song's audio next time cuts the reel on its beats.")
@@ -429,7 +452,8 @@ def _deliver(job, store, out_path: str, item: Dict[str, Any]) -> Dict[str, Any]:
 
 def _make(job, store, sources: List[C.ClipSource], style: Dict[str, Any],
           song: Optional[Mapping], logo_path: Optional[str], caption: str,
-          hashtags: Sequence[str], backend, encoder: str, workdir: str) -> Dict[str, Any]:
+          hashtags: Sequence[str], backend, encoder: str, workdir: str,
+          song_note: Optional[str] = None) -> Dict[str, Any]:
     need = MIN_FREE_BYTES + sum(max(0, int(s.size)) for s in sources)
     free = free_bytes(work_root())
     if free < need:
@@ -465,8 +489,13 @@ def _make(job, store, sources: List[C.ClipSource], style: Dict[str, Any],
     say('reel_deliver', 'Sending the reel to your phone...')
     media = _deliver(job, store, out_path, item)
 
+    # Why no song is suggested, when none is (the trending list's note, from
+    # reel_make): in the push, what her agent is told, and the notes.
+    song_note = (song_note.strip() if isinstance(song_note, str) else '') or None
+    if _suggests_song(media.get('song')):
+        song_note = None
     from core.peer_link.crossbar_publish import publish_agent_message
-    sent = publish_agent_message(text=_ready_text(media), user_id=job.user_id,
+    sent = publish_agent_message(text=_ready_text(media, song_note), user_id=job.user_id,
                                  request_id=job.request_id, prompt_id=job.prompt_id,
                                  media=[media], skip_crossbar=True)
     from core.user_file_store import is_xid
@@ -478,26 +507,31 @@ def _make(job, store, sources: List[C.ClipSource], style: Dict[str, Any],
     except Exception as e:      # the reel is out; retention just waits longer
         logger.warning('reel %s: could not mark %d source file(s) used: %s', job.reel_id,
                        len(used), e)
-    out_notes = notes + ([] if sent else [NOTE_PUSH_NOT_SENT])
+    out_notes = (notes + ([] if sent else [NOTE_PUSH_NOT_SENT])
+                 + ([song_note] if song_note else []))
     logger.info('reel %s for user %s: ok, %.1f s, %d bytes, moments %s, timings %s',
                 job.reel_id, job.user_id, media['duration_s'], media['size'],
                 production.moments.get('src'), production.timings)
     return {'status': 'ok', 'reel_id': job.reel_id, 'media': media, 'qa': qa,
             'moments': {'src': production.moments.get('src'),
                         'final_look_found': bool(production.moments.get('final_look_found'))},
-            'notes': out_notes, 'message': _ok_message(media, notes)}
+            'notes': out_notes, 'message': _ok_message(media, notes, song_note)}
 
 
 def make_reel(*, user_id, prompt_id, request_id, clips: Sequence[Any], style: Mapping,
               song: Optional[Mapping] = None, logo_path: Optional[str] = None, caption: str = '',
               hashtags: Sequence[str] = (), backend=None, encoder: str = 'auto',
-              store=None) -> Dict[str, Any]:
+              store=None, song_note: Optional[str] = None) -> Dict[str, Any]:
     """Make, check and deliver one reel for this turn (see the module note).
 
     ``clips``: StoredFile dicts (or contracts.ClipSource), at most MAX_CLIPS
     used, in upload order.  ``style``: a style dict (contracts.make_style).
     ``song``: ``{song_key, title, artist, lang, start_ms}`` plus, when she
     attached the song's audio, ``audio_path`` and ``audio_xid``; or None.
+    The reel suggests a song only when it has a title.  ``song_note``: why
+    it suggests none (the trending list's note, e.g. no research account on
+    this computer); with no song suggested, the push, what her agent is told
+    and the result's notes carry it, and her agent is asked to name no song.
     ``logo_path``: her logo image, or None.  ``hashtags``: '#tags', at most
     contracts.HASHTAG_LIMIT used.  ``backend``: the vision backend (None:
     moments.REEL_VLM_DEFAULT).  ``store``: the user file store (None: the
@@ -524,7 +558,7 @@ def make_reel(*, user_id, prompt_id, request_id, clips: Sequence[Any], style: Ma
             store = get_user_file_store()
         workdir = jobs.work_dir(job.reel_id)
         result = _make(job, store, sources, style, song, logo_path, caption, hashtags, backend,
-                       encoder, workdir)
+                       encoder, workdir, song_note=song_note)
     except ReelFailed as e:
         logger.info('reel %s for user %s: %s', job.reel_id, job.user_id, e)
         result = dict(_status(e.status, e.message or e.status, **e.data), reel_id=job.reel_id)

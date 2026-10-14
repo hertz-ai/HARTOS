@@ -6,12 +6,21 @@ made on her desktop, never on central) and U6 (a child process the daemon's
 tick starts and then only polls: no thread, no LLM).
 
 What these tests hold the job to:
-* never on a central node; on her desktop only when she has entered the
-  DEDICATED research account on this computer (an owner-entered credential
-  in the desktop's vault, hartos.ai_key_vault -- never an environment
-  variable or the node's own secrets) and a watchlist exists;
+* never on a central node, nor on one whose tier cannot be read; on her
+  desktop only when she has entered the DEDICATED research account on this
+  computer (an owner-entered credential in the desktop's vault,
+  hartos.ai_key_vault -- never an environment variable or the node's own
+  secrets) and a watchlist exists;
+* the account's way in: her agent's ask (ask_for_account) files the one
+  credential consent card (hartos.ai_key_vault.request_credential) for each
+  missing part, one card each however often she asks, none after the
+  owner's no; what the card stores (the desktop vault's value, the grant
+  that names it) runs the job and survives a restart;
+* a refused login pauses the job for FREEZE_S and asks the owner, on the
+  same card, to enter the account again;
 * the worker runs in its own interpreter under the data dir (the per-backend
-  venv core.venv_paths resolves); when that venv is missing the owner is
+  venv core.venv_paths resolves); when that venv is missing, or its last
+  install failed, timed out or was cut short by a restart, the owner is
   asked first (capability_setup) and, on yes, Nunba's installer
   (tts.backend_venv.install_in_background) builds it off the tick;
 * the credentials reach the child on its stdin only: never argv, the spec,
@@ -20,6 +29,7 @@ What these tests hold the job to:
 * the daemon calls it only past its yield gate (so while she is away) and
   before its "no goals" stop.
 """
+import contextlib
 import json
 import os
 import subprocess
@@ -34,6 +44,7 @@ NOW = 1792000000.0
 HOUR = 3600.0
 USER = 'research_fixture'
 PASSWORD = 'pw-fixture'
+OWNER = 'owner-trends'
 
 
 class FakeStdin:
@@ -83,7 +94,7 @@ class FakePopen:
 
 class FakeVault:
     """hartos.ai_key_vault's AIKeyVault as the job reads it: only names the
-    owner entered (the consent card / localhost submit) resolve."""
+    owner entered resolve (the real vault on the card's path: ``cards``)."""
 
     def __init__(self, creds):
         self.creds = creds
@@ -130,6 +141,9 @@ def job(tmp_path, monkeypatch):
     monkeypatch.setattr(dj, '_run', None)
     monkeypatch.setattr(dj, '_next_check_at', 0.0)
     monkeypatch.setattr('security.key_delegation.get_node_tier', lambda: 'flat')
+    # No owner unless a test names one (``cards``): this box's own
+    # environment must not decide who is asked.
+    monkeypatch.delenv('HEVOLVE_OWNER_USER_ID', raising=False)
     env = types.SimpleNamespace(dj=dj, asked=[], consent='granted', tmp=tmp_path,
                                 creds={dj.USERNAME_CREDENTIAL: USER,
                                        dj.PASSWORD_CREDENTIAL: PASSWORD},
@@ -230,6 +244,165 @@ def test_without_a_watchlist_it_does_nothing(job):
     assert job.dj.why_no_list() == 'no_watchlist'
 
 
+def test_a_node_whose_tier_cannot_be_read_runs_nothing_and_says_so(job, monkeypatch):
+    """Failing closed, but not as 'central': on her desktop that reason
+    would tell her this node is a server."""
+    def _unreadable():
+        raise RuntimeError('certificate chain unreadable')
+    monkeypatch.setattr('security.key_delegation.get_node_tier', _unreadable)
+    assert job.dj.maybe_tick(now=NOW) == 'skip'
+    assert FakePopen.made == [] and job.asked == [] and job.inst['calls'] == []
+    assert job.dj.why_no_list() == 'tier_unknown'
+    assert job.dj.ask_for_account() == []
+
+
+# ── her research account: the one way in ─────────────────────────────────
+
+@pytest.fixture
+def cards(job, monkeypatch):
+    """The consent card's real path: hartos.ai_key_vault.request_credential
+    (the one credential ask) and a real, fresh AIKeyVault, on a private
+    consent table, with this computer's owner named and every card the
+    owner would see recorded.  The same table shape as
+    tests/unit/test_capability_setup_on_demand.py."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+    from hartos import ai_key_vault
+    from integrations.social import models
+    from integrations.social.models import UserConsent
+    from security.secrets_manager import SecretsManager
+    engine = create_engine('sqlite://', poolclass=StaticPool,
+                           connect_args={'check_same_thread': False})
+    UserConsent.__table__.create(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+
+    @contextlib.contextmanager
+    def _session(commit=True):
+        db = factory()
+        try:
+            yield db
+            if commit:
+                db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+    monkeypatch.setattr(models, 'db_session', _session)
+    monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', OWNER)
+    monkeypatch.delenv('HEVOLVE_MASTER_KEY', raising=False)
+    for name in (job.dj.USERNAME_CREDENTIAL, job.dj.PASSWORD_CREDENTIAL):
+        monkeypatch.delenv(name, raising=False)
+    SecretsManager.reset()
+    vault = ai_key_vault.AIKeyVault()
+    monkeypatch.setattr(ai_key_vault, 'get_ai_key_vault', lambda: vault)
+    sent = []
+    monkeypatch.setattr('integrations.social.consent_service._emit',
+                        lambda topic, data, msg_id=None: sent.append((topic, dict(data), msg_id)))
+    yield types.SimpleNamespace(vault=vault, sent=sent, session=_session, mp=monkeypatch)
+    SecretsManager.reset()
+    engine.dispose()
+
+
+def _asks(cards):
+    return [(data, msg_id) for topic, data, msg_id in cards.sent if topic == 'consent.request']
+
+
+def _rows(cards):
+    from integrations.social.models import UserConsent
+    with cards.session() as db:
+        return [(r.consent_type, r.scope, r.agent_id, bool(r.granted))
+                for r in db.query(UserConsent).all()]
+
+
+def test_with_no_account_her_agents_ask_files_one_card_per_part(job, cards):
+    dj = job.dj
+    assert dj.why_no_list() == 'no_account'               # nobody asked yet
+    assert dj.ask_for_account() == [dj.USERNAME_CREDENTIAL, dj.PASSWORD_CREDENTIAL]
+    asks = _asks(cards)
+    assert sorted(a['scope'] for a, _ in asks) == sorted(
+        ['secret:' + dj.USERNAME_CREDENTIAL, 'secret:' + dj.PASSWORD_CREDENTIAL])
+    for ask, _ in asks:
+        assert ask['consent_type'] == 'credential' and ask['user_id'] == OWNER
+        assert ask['agent_id'] is None                    # the job asks, not an agent
+        assert 'never your business account' in ask['reason']
+    assert dj.why_no_list() == 'account_asked'
+    for _ in range(2):                                    # she asks again, and again
+        dj.ask_for_account()
+    assert sorted(_rows(cards)) == sorted(
+        [('credential', 'secret:' + dj.USERNAME_CREDENTIAL, None, False),
+         ('credential', 'secret:' + dj.PASSWORD_CREDENTIAL, None, False)])
+    assert len({msg_id for _, msg_id in _asks(cards)}) == 2     # still two cards
+    assert FakePopen.made == [] and job.built == []
+
+
+def test_what_the_card_stores_runs_the_job_and_survives_a_restart(job, cards):
+    """The card's Accept: Nunba's desktop vault keeps the value and hands it
+    to this vault (export_to_env -> hold_credential), and the grant names
+    it.  A restart is a fresh vault, the same grant rows, and the same
+    hand-over at boot."""
+    from hartos.ai_key_vault import AIKeyVault
+    from integrations.social.consent_service import ConsentService
+    dj = job.dj
+    dj.ask_for_account()
+    with cards.session() as db:
+        for name in (dj.USERNAME_CREDENTIAL, dj.PASSWORD_CREDENTIAL):
+            ConsentService.grant_consent(db, OWNER, 'credential', 'secret:' + name)
+    cards.vault.hold_credential(dj.USERNAME_CREDENTIAL, USER)
+    cards.vault.hold_credential(dj.PASSWORD_CREDENTIAL, PASSWORD)
+    assert dj.maybe_tick(now=NOW) == 'started'
+    assert json.loads(FakePopen.made[0].stdin.data.decode('utf-8')) == {
+        'username': USER, 'password': PASSWORD}
+    restarted = AIKeyVault()
+    restarted.hold_credential(dj.USERNAME_CREDENTIAL, USER)
+    restarted.hold_credential(dj.PASSWORD_CREDENTIAL, PASSWORD)
+    cards.mp.setattr('hartos.ai_key_vault.get_ai_key_vault', lambda: restarted)
+    assert dj.why_no_list() == 'running'                  # the account still reads
+
+
+def test_a_value_held_without_the_owners_grant_is_not_her_account(job, cards):
+    dj = job.dj
+    cards.vault.hold_credential(dj.USERNAME_CREDENTIAL, USER)
+    cards.vault.hold_credential(dj.PASSWORD_CREDENTIAL, PASSWORD)
+    assert dj.maybe_tick(now=NOW) == 'skip'
+    assert FakePopen.made == []
+    assert dj.why_no_list() == 'no_account'
+
+
+def test_after_the_owners_no_she_is_told_and_that_card_is_not_shown_again(job, cards):
+    from integrations.social.consent_service import ConsentService
+    dj = job.dj
+    dj.ask_for_account()
+    with cards.session() as db:
+        ConsentService.decline(db, OWNER, 'credential', 'secret:' + dj.USERNAME_CREDENTIAL)
+    cards.sent.clear()
+    dj.ask_for_account()
+    scopes = {a['scope'] for a, _ in _asks(cards)}
+    assert 'secret:' + dj.USERNAME_CREDENTIAL not in scopes        # her no stands
+    assert 'secret:' + dj.PASSWORD_CREDENTIAL in scopes            # the other card waits
+    assert dj.why_no_list() == 'account_declined'
+
+
+def test_with_nobody_to_ask_no_card_is_filed(job, cards, monkeypatch):
+    dj = job.dj
+    monkeypatch.delenv('HEVOLVE_OWNER_USER_ID')
+    dj.ask_for_account()
+    assert _asks(cards) == [] and _rows(cards) == []
+    assert dj.why_no_list() == 'no_account'
+
+
+def test_a_central_node_asks_for_no_account(job, cards, monkeypatch):
+    dj = job.dj
+    monkeypatch.setattr('security.key_delegation.get_node_tier', lambda: 'central')
+    assert dj.ask_for_account() == []
+    assert _asks(cards) == [] and _rows(cards) == []
+
+
+def test_an_entered_account_is_not_asked_for(job):
+    assert job.dj.ask_for_account() == []
+
+
 # ── one run ──────────────────────────────────────────────────────────────
 
 def test_a_due_run_starts_one_isolated_child_with_credentials_only_on_its_stdin(
@@ -274,7 +447,7 @@ def test_while_the_child_runs_a_tick_only_polls(job):
     for i in range(1, 4):
         assert dj.maybe_tick(now=NOW + 30 * i) == 'running'
     assert len(FakePopen.made) == 1 and proc.polls == 3
-    assert dj.why_no_list(now=NOW + 100) == 'running'
+    assert dj.why_no_list() == 'running'
     assert job.built == []
 
 
@@ -391,12 +564,63 @@ def test_a_failed_run_is_why_there_is_no_list(job):
     assert dj.why_no_list() == 'worker_failed'
 
 
+def _record_credential_asks(monkeypatch):
+    asked = []
+
+    def request_credential(text, agent_id=None):
+        asked.append((json.loads(text), agent_id))
+        return "Asked the owner of this computer on the consent card."
+    monkeypatch.setattr('hartos.ai_key_vault.request_credential', request_credential)
+    return asked
+
+
+def test_a_refused_login_pauses_and_asks_the_owner_to_enter_the_account_again(
+        job, monkeypatch):
+    """Owner 2026-09-25: "agent shd ask user when login attempts fails".
+    The pause is FREEZE_S whatever is entered meanwhile; the next run uses
+    what the card stored by then."""
+    dj = job.dj
+    asked = _record_credential_asks(monkeypatch)
+    assert dj.maybe_tick(now=NOW) == 'started'
+    FakePopen.made[0].exit_with(fx.batch({}, error='login'))
+    assert dj.maybe_tick(now=NOW + 60) == 'failed'
+    state = _state(job.tmp)
+    assert state['frozen_until'] == NOW + 60 + dj.FREEZE_S
+    assert sorted(a['key_name'] for a, _ in asked) == sorted(
+        [dj.USERNAME_CREDENTIAL, dj.PASSWORD_CREDENTIAL])
+    assert all(a['rejected'] is True and agent is None for a, agent in asked)
+    assert dj.why_no_list() == 'login'
+    _fresh_tick(dj)
+    assert dj.maybe_tick(now=NOW + dj.FREEZE_S) == 'skip'          # the pause holds
+    _fresh_tick(dj)
+    assert dj.maybe_tick(now=NOW + 61 + dj.FREEZE_S) == 'started'
+    assert len(FakePopen.made) == 2
+
+
+def test_a_challenge_pauses_without_asking_for_the_account_again(job, monkeypatch):
+    """A challenge wants a person to sign in by hand, not a new password."""
+    dj = job.dj
+    asked = _record_credential_asks(monkeypatch)
+    dj.maybe_tick(now=NOW)
+    FakePopen.made[0].exit_with(fx.batch({}, error='challenge'))
+    assert dj.maybe_tick(now=NOW + 60) == 'failed'
+    assert _state(job.tmp)['frozen_until'] == NOW + 60 + dj.FREEZE_S
+    assert asked == []
+
+
 # ── the worker's own interpreter ─────────────────────────────────────────
 
 def test_the_worker_interpreter_is_exact_pins_with_instagrapi():
+    """instagrapi and every direct dependency it names, pinned (the pins
+    requirements-trends.txt carried; Nunba's install_into_venv verifies
+    each by its import name, tts.package_installer._PIP_TO_IMPORT), and
+    instagrapi last, so its own requirements find them in place."""
     from integrations.trends import daily_job as dj
     assert dj.WORKER_PACKAGES and all('==' in spec for spec in dj.WORKER_PACKAGES)
-    assert any(spec.startswith('instagrapi==') for spec in dj.WORKER_PACKAGES)
+    names = [spec.split('==')[0] for spec in dj.WORKER_PACKAGES]
+    assert set(names) >= {'pydantic', 'requests', 'curl_cffi', 'pysocks', 'pillow',
+                          'pycryptodomex', 'instagrapi'}
+    assert names[-1] == 'instagrapi'
     from core.venv_paths import validate_backend_name
     validate_backend_name(dj.WORKER_VENV)                 # a name the venv store takes
 
@@ -428,7 +652,7 @@ def test_on_yes_nunbas_installer_builds_it_off_the_tick(job):
     assert job.inst['calls'] == [(dj.WORKER_VENV, list(dj.WORKER_PACKAGES))]
     assert dj.maybe_tick(now=NOW + 30) == 'installing'       # it only asks how it goes
     assert len(job.inst['calls']) == 1 and FakePopen.made == []
-    assert dj.why_no_list(now=NOW + 30) == 'installing'
+    assert dj.why_no_list() == 'installing'
     job.inst['status'].update(running=False, ok=True, finished_at=2.0)
     job.python = str(job.tmp / 'venvs' / dj.WORKER_VENV / 'python')
     assert dj.maybe_tick(now=NOW + 60) == 'installed'
@@ -480,6 +704,44 @@ def test_an_install_that_never_ends_is_given_up(job):
     assert dj.maybe_tick(now=NOW + dj.INSTALL_TIMEOUT_S - 1) == 'installing'
     assert dj.maybe_tick(now=NOW + dj.INSTALL_TIMEOUT_S) == 'failed'
     assert _state(job.tmp)['last_run']['error'] == 'install_timeout'
+
+
+@pytest.mark.parametrize('how', ['install_failed', 'install_timeout'])
+def test_after_an_install_that_did_not_finish_the_next_run_installs_again(job, how):
+    """ensure_venv makes the venv's interpreter before pip runs, so a failed
+    or timed-out install leaves one behind.  The next due run installs
+    again; it never starts a worker there that can only exit 'dependency'
+    (a whole backoff cycle lost), and never while that install may still be
+    writing into the venv."""
+    dj = job.dj
+    job.python = None
+    assert dj.maybe_tick(now=NOW) == 'installing'
+    job.python = str(job.tmp / 'venvs' / dj.WORKER_VENV / 'python')
+    if how == 'install_failed':
+        job.inst['status'].update(running=False, ok=False, message='pip install failed',
+                                  finished_at=2.0)
+        assert dj.maybe_tick(now=NOW + 60) == 'failed'
+    else:
+        assert dj.maybe_tick(now=NOW + dj.INSTALL_TIMEOUT_S) == 'failed'
+    state = _state(job.tmp)
+    assert state['last_run']['error'] == how
+    _fresh_tick(dj)
+    assert dj.maybe_tick(now=state['next_run_at'] + 1) == 'installing'
+    assert len(job.inst['calls']) == 2 and FakePopen.made == []
+
+
+def test_an_install_cut_short_by_a_restart_is_installed_again_not_run(job):
+    dj = job.dj
+    job.python = None
+    assert dj.maybe_tick(now=NOW) == 'installing'
+    job.python = str(job.tmp / 'venvs' / dj.WORKER_VENV / 'python')
+    # The process restarts: its install thread and Nunba's record are gone.
+    dj._run = None
+    job.inst['status'] = None
+    assert dj.why_no_list() != 'installing'                # nothing is installing
+    _fresh_tick(dj)
+    assert dj.maybe_tick(now=NOW + 60) == 'installing'
+    assert len(job.inst['calls']) == 2 and FakePopen.made == []
 
 
 def test_a_worker_without_instagrapi_gets_its_interpreter_reinstalled(job):

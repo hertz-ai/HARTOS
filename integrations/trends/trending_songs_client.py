@@ -8,12 +8,19 @@ the one integrations.trends.daily_job publishes on this computer
 node, and nothing here runs in the background.
 
 * No list -> an empty one whose ``reason`` is daily_job.why_no_list() and
-  whose ``note`` says it in words her agent can pass on: above all
-  'no_account', no DEDICATED research Instagram account is set up on this
-  computer (never her business account), so there is no list.  A list the
-  contract refuses (contracts.validate_trending_songs: a URL, session data,
-  malformed) is never served: read_latest drops it.
-* A list kept after a failed day is served marked stale, with the reason.
+  whose ``note`` says it in words her agent can pass on, and that read just
+  as well in the reel's push to her phone.  Above all: no DEDICATED research
+  Instagram account is set up on this computer (never the business
+  account).  With no list, this read first asks the owner for whatever part
+  of that account is missing (daily_job.ask_for_account: the one credential
+  consent card, one per part, never again after a no) and the reason says
+  where that ask stands: 'account_asked', 'account_declined', or
+  'no_account' when nobody here could be asked.  A list the contract refuses
+  (contracts.validate_trending_songs: a URL, session data, malformed) is
+  never served: read_latest drops it.
+* A list kept after a failed day is served marked stale, with the reason;
+  a paused one ('challenge', 'login') says how long the pause runs
+  (daily_job.FREEZE_S, doubling, at most MAX_FREEZE_S).
 * Each song's language: the job's language_hint when it gave one, else the
   title's script (trending_songs.script_language, through the TTS router's
   detector: Tamil, Devanagari, Gurmukhi); only a Latin-script title asks
@@ -39,6 +46,7 @@ from typing import Any, Dict, List, Optional
 
 from core.file_cache import atomic_json_write
 from integrations.reel_studio.contracts import TRENDING_CLIENT_SCHEMA, start_label
+from integrations.trends import daily_job as _job
 from integrations.trends import trending_songs as ts
 
 logger = logging.getLogger(__name__)
@@ -53,16 +61,32 @@ _MAX_CACHED_LANGS = 2000
 _LANG_NAMES = {'tamil': 'ta', 'hindi': 'hi', 'punjabi': 'pa', 'english': 'en'}
 _LANG_CACHE = 'song_lang.json'
 
+#: The pause after a challenge or a refused sign-in, in words
+#: (daily_job.FREEZE_S, doubling on a pause in a row, at most MAX_FREEZE_S).
+_PAUSE = ('at least %d hours (longer if it happens again, up to %d hours)'
+          % (_job.FREEZE_S // 3600, _job.MAX_FREEZE_S // 3600))
+
 #: What her agent is told when there is no list, or the list is old, by
 #: reason (daily_job.why_no_list, or the stale reason the job recorded).
+#: Written about nobody in particular ("the business account", "the owner
+#: of this computer"), so the reel's push to her phone can carry them too.
 _NOTES = {
-    'central': ("Trending songs are made on her own desktop, never on a server, so this "
-                "node keeps no list."),
+    'central': ("Trending songs are made on a desktop, never on a server, so this node "
+                "keeps no list."),
+    'tier_unknown': ("This computer could not tell whether it is a desktop or a server, so "
+                     "it makes no trending-song list for now."),
     'no_account': ("No research Instagram account is set up on this computer, so there is no "
-                   "trending-song list. It needs a separate Instagram account made only for "
-                   "this research, never her business account; its username and password "
-                   "are entered on this computer (as IG_RESEARCH_USERNAME and "
-                   "IG_RESEARCH_PASSWORD) and stay in its encrypted vault."),
+                   "trending-song list, and the owner of this computer could not be asked "
+                   "for one here. It needs a separate Instagram account made only for this "
+                   "research, never the business account."),
+    'account_asked': ("No research Instagram account is set up on this computer yet, so there "
+                      "is no trending-song list. The owner of this computer is asked on the "
+                      "consent card for the username and password of a separate Instagram "
+                      "account made only for this research, never the business account."),
+    'account_declined': ("The owner of this computer chose not to enter a research Instagram "
+                         "account here (or it was turned off after Instagram refused it too "
+                         "often), so there is no trending-song list. They can choose \"Allow "
+                         "asking again\" for it in Privacy settings."),
     'no_watchlist': ("No Instagram accounts to watch are listed on this computer yet "
                      "(trends/watchlist.json in its data folder), so there is no "
                      "trending-song list."),
@@ -79,10 +103,13 @@ _NOTES = {
     'running': "Today's trending-song list is being made right now; ask again in a few minutes.",
     'not_run_yet': ("The first trending-song list has not been made yet; it is made once a "
                     "day while the computer is not in use."),
-    'challenge': ("Instagram asked the research account to prove it is a person; the list "
-                  "is paused until someone signs in to that account by hand."),
-    'login': ("Instagram refused the research account's sign-in; the list is paused until "
-              "its username and password are entered again on this computer."),
+    'challenge': ("Instagram asked the research account to prove it is a person, so the "
+                  "list is paused for %s; someone should sign in to that account by hand "
+                  "meanwhile. Then it tries again on its own." % _PAUSE),
+    'login': ("Instagram refused the research account's sign-in, so the list is paused for "
+              "%s. The owner of this computer is asked on the consent card to enter its "
+              "username and password again; the next try, after the pause, uses what is "
+              "entered by then." % _PAUSE),
 }
 
 _lock = threading.Lock()
@@ -103,9 +130,15 @@ def _lang_cache_path() -> str:
 # ── the list ──────────────────────────────────────────────────────────────
 
 def _why_no_list() -> str:
+    """daily_job.why_no_list(), asked after daily_job.ask_for_account(): with
+    any part of her research account missing, its card is filed (or sent
+    again to whatever screen is up now; never after the owner's no), so the
+    reason says where that ask stands.  ask_for_account asks for nothing
+    when the account is entered or the node is not a desktop.  'error' when
+    it cannot be told."""
     try:
-        from integrations.trends.daily_job import why_no_list
-        return why_no_list()
+        _job.ask_for_account()
+        return _job.why_no_list()
     except Exception as e:
         logger.warning("trending songs: why there is no list is unknown: %s", e)
         return 'error'
@@ -151,9 +184,11 @@ def get_trending_songs(langs: Any = None, limit: int = DEFAULT_LIMIT) -> Dict[st
     comma-separated text or a list of them; contracts.STYLE_LANGUAGES plus
     'other') when given.  Never raises.  With no list on this computer the
     songs are empty and ``reason`` / ``note`` say why (daily_job.why_no_list:
-    'no_account' when no research account is set up here, 'central',
-    'no_watchlist', 'not_run_yet', ...); a stale list keeps its songs and
-    names the job's reason."""
+    with no research account set up here, the owner is first asked for one
+    on the consent card and the reason is 'account_asked',
+    'account_declined' or 'no_account'; else 'central', 'no_watchlist',
+    'not_run_yet', ...); a stale list keeps its songs and names the job's
+    reason."""
     want = _lang_filter(langs)
     try:
         limit = max(1, min(int(limit), ts.MAX_SONGS))

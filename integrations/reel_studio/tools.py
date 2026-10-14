@@ -28,10 +28,13 @@ The seven (REEL_TOOL_NAMES):
   her newest uploaded logo (else her profile's logo_xid; her profile is
   read, never written, by making a reel), her song (a key from
   reel_trending_songs, her attached song audio, else the top trending song
-  in her language), a caption (else one from her profile) and at most five
+  in her language; with none, why -- the trending list's own note, such as
+  no research account on this computer -- rides the reply, and the reply
+  names no song), a caption (else one from her profile) and at most five
   hashtags (else from her hashtag bank).
 * ``reel_trending_songs``: trending songs in her language
-  (integrations.trends.trending_songs_client).
+  (integrations.trends.trending_songs_client; with none, its reason and
+  note, after asking the owner for the research account when that is why).
 * ``reel_check_caption``: igkit's caption lint, how machine-written it
   reads, and a cleaned-up version, with her own emoji and words kept.
 * ``reel_score_hooks``: weak-hook flags (verdict and weakest check only; no
@@ -73,6 +76,13 @@ HOOK_TEXT_MAX_CHARS = 120
 #: Trending songs looked through for a song key the agent names.
 SONG_LOOKUP_LIMIT = 100
 DEFAULT_SONG_LIMIT = 5
+#: Why a reel suggests no song, when the trending list gave no note of its
+#: own (its note -- no research account here, no list yet -- comes first).
+UNLISTED_SONG_NOTE = ("The song named for this reel is not on this computer's trending-song "
+                      "list, so its title and start time are not known.")
+NO_SONG_NOTE = ("Today's trending-song list on this computer has no song in the reel's "
+                "language.")
+UNREAD_LIST_NOTE = "The trending-song list on this computer could not be read."
 
 #: open_with values that ask for the final-look teaser (A1), and those that
 #: ask for the plain story; anything else is read as her words.
@@ -259,7 +269,8 @@ def _trending(langs=None, limit: int = DEFAULT_SONG_LIMIT) -> Dict[str, Any]:
     except Exception as e:      # documented never to raise; held to it here too
         logger.warning('reel tools: trending songs unavailable: %s', e)
         doc = None
-    return doc if isinstance(doc, dict) else {'songs': [], 'stale': True, 'reason': 'error'}
+    return doc if isinstance(doc, dict) else {'songs': [], 'stale': True, 'reason': 'error',
+                                              'note': UNREAD_LIST_NOTE}
 
 
 def _song_from(entry: Mapping) -> Dict[str, Any]:
@@ -270,24 +281,40 @@ def _song_from(entry: Mapping) -> Dict[str, Any]:
 
 
 def _song(song_key: str, language: Optional[str],
-          audio: Optional[Mapping]) -> Optional[Dict[str, Any]]:
-    """The song the reel suggests: the key named (from the trending list),
-    her attached audio, else the top trending song in her language."""
-    song = None
+          audio: Optional[Mapping]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """``(song, why_none)``: the song the reel suggests -- the key named
+    (from the trending list), her attached audio, else the top trending song
+    in her language -- and, when it suggests none (no song, or a key the
+    list does not hold, so no title), why: the trending list's own note (no
+    research account on this computer, no list yet, ...), else
+    UNLISTED_SONG_NOTE or NO_SONG_NOTE.  ``why_none`` is None when a song
+    is suggested."""
+    song, why = None, None
     if song_key:
-        hit = next((s for s in _trending(None, SONG_LOOKUP_LIMIT).get('songs') or []
+        doc = _trending(None, SONG_LOOKUP_LIMIT)
+        hit = next((s for s in doc.get('songs') or []
                     if isinstance(s, Mapping) and s.get('song_key') == song_key), None)
-        song = _song_from(hit) if hit else {'song_key': song_key, 'title': '', 'artist': '',
-                                            'lang': None, 'start_ms': 0}
+        if hit:
+            song = _song_from(hit)
+        else:
+            song = {'song_key': song_key, 'title': '', 'artist': '', 'lang': None, 'start_ms': 0}
+            why = doc.get('note') or UNLISTED_SONG_NOTE
     if audio is not None:
         song = song or {'song_key': None, 'artist': '', 'lang': language, 'start_ms': 0,
-                        'title': os.path.splitext(str(audio.get('name') or ''))[0]}
+                        'title': ''}
+        # Her own audio is the song; a key the list does not hold leaves it
+        # its file's name.
+        song['title'] = song['title'] or os.path.splitext(str(audio.get('name') or ''))[0]
         song.update(audio_path=audio.get('path'), audio_xid=audio.get('xid'))
-        return song
+        return song, None
     if song is None:
-        top = [s for s in _trending(language, 1).get('songs') or [] if isinstance(s, Mapping)]
-        song = _song_from(top[0]) if top else None
-    return song
+        doc = _trending(language, 1)
+        top = [s for s in doc.get('songs') or [] if isinstance(s, Mapping)]
+        if top:
+            song = _song_from(top[0])
+        else:
+            why = doc.get('note') or NO_SONG_NOTE
+    return song, why
 
 
 def _caption_from_profile(profile: Mapping) -> str:
@@ -346,9 +373,10 @@ def _reel_make(turn: _Turn, target_seconds, open_with, hook_text, caption, hasht
         })
     except ValueError as e:
         return _error('reel_make', 'bad style: %s' % e)
+    song, song_note = _song(_text(song_key), style['language'], _song_audio(turn, rid))
     result = pipeline.make_reel(
         user_id=turn.user_id, prompt_id=turn.prompt_id, request_id=rid, clips=files,
-        style=style, song=_song(_text(song_key), style['language'], _song_audio(turn, rid)),
+        style=style, song=song, song_note=song_note,
         logo_path=_logo_path(turn, profile) if style['use_logo'] else None,
         caption=_text(caption) or _caption_from_profile(profile),
         hashtags=_hashtags(_text(hashtags), profile))

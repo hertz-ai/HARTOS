@@ -6,15 +6,18 @@ agent (owner ruling A10d: "all in local nunba build not in central").  No
 central node makes it, serves it or fetches it.
 
   daily_job.py              the daily run, driven from the agent daemon's
-                            tick on any node but a central one (owner
-                            ruling U6): starts ig_worker.py as a child
-                            process, polls it on later ticks, ranks and
-                            publishes what it brought back.  No thread, no
-                            LLM.  Her research account (a DEDICATED
-                            Instagram account, never her business account)
-                            is read from this desktop's vault; the worker's
-                            own venv is built by Nunba's installer on the
-                            owner's yes.
+                            tick on her desktop, never on a central node or
+                            one whose tier cannot be read (owner ruling
+                            U6): starts ig_worker.py as a child process,
+                            polls it on later ticks, ranks and publishes
+                            what it brought back.  No thread, no LLM.  Her
+                            research account (a DEDICATED Instagram account,
+                            never her business account) is read from this
+                            desktop's vault, where the credential consent
+                            card puts it (ask_for_account files the card
+                            when her agent asks for songs and it is
+                            missing); the worker's own venv is built by
+                            Nunba's installer on the owner's yes.
   ig_worker.py              the child.  Runs in the worker's own venv under
                             the data dir (core.venv_paths, WORKER_VENV),
                             where instagrapi is installed; instagrapi never
@@ -38,7 +41,9 @@ central node makes it, serves it or fetches it.
                             reel_trending_songs tool: each song's language
                             from its title's script, or for a Latin title
                             from this node's own LLM; with no list, why
-                            (daily_job.why_no_list) in words she can be told.
+                            (daily_job.why_no_list) in words she can be
+                            told, after asking the owner for the research
+                            account when that is why.
 
 Files (under core.platform_paths.get_data_dir()/trends/): watchlist.json
 (the accounts watched, kept by hand), state.json (the job's schedule and

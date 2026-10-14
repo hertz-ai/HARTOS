@@ -7,9 +7,17 @@ the worker's own venv under the data dir:
 instagrapi lives only in that venv (daily_job.WORKER_PACKAGES, installed by
 Nunba's tts.backend_venv): its pydantic and requests pins conflict with
 HARTOS's, so it never enters the HARTOS interpreter.  ``-I`` keeps the
-HARTOS tree and environment out of the child; the one HARTOS file it uses,
-sources.py beside it (standard library only), is loaded by path.  Imported
-as integrations.trends.ig_worker (the tests), it uses
+PYTHON* environment variables, the user site-packages and the working and
+script directories out of the child's sys.path.  It does not keep the app
+packages out: tts.backend_venv.ensure_venv writes core.venv_paths'
+nunba_parent_packages.pth into every venv it builds, this one included, and
+site still reads a .pth under ``-I``, so the directory holding the app's
+core and integrations packages (the HARTOS root from source, the install
+dir on the frozen build; core.venv_paths.parent_package_roots) is APPENDED
+to sys.path, after the venv's own site-packages (the venv's pins win any
+module both hold).  The worker imports nothing from there: the one HARTOS
+file it uses, sources.py beside it (standard library only), is loaded by
+path.  Imported as integrations.trends.ig_worker (the tests), it uses
 integrations.trends.sources instead: the same file.
 
 The spec (written by daily_job, no secrets in it):
@@ -93,8 +101,9 @@ def error_code(exc: BaseException) -> str:
 
 def _load_sources():
     """sources.py: the package module when imported as part of HARTOS, else
-    the file beside this one, loaded by path (under -I the HARTOS tree is
-    not on sys.path)."""
+    the file beside this one, loaded by path (the worker never relies on
+    the app's packages being on its sys.path: only the venv's appended .pth
+    puts them there)."""
     if __package__:
         from . import sources
         return sources

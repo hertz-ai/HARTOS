@@ -531,6 +531,57 @@ def test_a_delivered_reel_carries_every_note_and_the_beat_source(turn):
     assert 'steady beat' in result['message']
 
 
+def _media_push(turn):
+    return [p for p in turn.pushes if isinstance(p[1], dict) and p[1].get('media')][0][1]
+
+
+NO_ACCOUNT = ('No research Instagram account is set up on this computer, so there is no '
+              'trending-song list.')
+
+
+@pytest.mark.parametrize('song', [
+    None,
+    # a key her agent named that the list does not hold: no title, no start
+    {'song_key': 'cluster:404', 'title': '', 'artist': '', 'lang': None, 'start_ms': 0},
+])
+def test_a_reel_with_no_song_to_suggest_says_why_and_asks_for_none(turn, song):
+    """Reviewer's measurement on c17513ec4: with no research account (every
+    fresh install) the reel's reply still told her agent to give her "the
+    song to add in Instagram", a song that does not exist, and nobody said
+    why.  Now neither what her agent is told nor the push names a song, and
+    both carry the reason her tools were given (the trending list's note)."""
+    from integrations.reel_studio import pipeline as P
+    clip = _small_clip(turn)
+    turn.mp.setattr(P, 'produce_reel', _fake_production(P))
+    result = P.make_reel(user_id=UID, prompt_id=PID, request_id='r', clips=[clip.to_dict()],
+                         style=C.make_style({}), song=song, song_note=NO_ACCOUNT)
+    assert result['status'] == 'ok', result
+    assert NO_ACCOUNT in result['notes']
+    message = result['message']
+    assert 'song to add' not in message
+    assert 'do not name one' in message and NO_ACCOUNT in message
+    text = _media_push(turn)['text'][0]
+    assert 'No song is suggested' in text and NO_ACCOUNT in text
+    assert 'Suggested song' not in text
+
+
+def test_a_suggested_song_is_given_with_its_start_and_no_reason_against_it(turn):
+    from integrations.reel_studio import pipeline as P
+    clip = _small_clip(turn)
+    turn.mp.setattr(P, 'produce_reel', _fake_production(P))
+    result = P.make_reel(user_id=UID, prompt_id=PID, request_id='r', clips=[clip.to_dict()],
+                         style=C.make_style({}),
+                         song={'song_key': 'cluster:7', 'title': 'Kannazhaga', 'artist': 'Anirudh',
+                               'lang': 'ta', 'start_ms': 38_500},
+                         song_note=NO_ACCOUNT)
+    assert result['status'] == 'ok', result
+    assert 'the song to add in Instagram at the start time given' in result['message']
+    assert NO_ACCOUNT not in result['message'] and NO_ACCOUNT not in result['notes']
+    text = _media_push(turn)['text'][0]
+    assert 'Suggested song: Kannazhaga by Anirudh, start it at 0:38' in text
+    assert 'No song is suggested' not in text
+
+
 def test_each_step_of_the_reel_beats_its_job(turn):
     """A slow reel (ten long HDR clips) is still working, not stale: every
     progress step beats its job, so it is never taken over (jobs.MAX_JOB_S
