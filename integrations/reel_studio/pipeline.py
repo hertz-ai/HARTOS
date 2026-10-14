@@ -285,7 +285,7 @@ def produce_reel(sources: Sequence[Any], *, style: Mapping, workdir: str, out_pa
             analyses.append(analysis)
         lap('analyse')
 
-        say('reel_moments', 'Finding the best moments...')
+        say('reel_moments', 'Getting the vision model ready and finding the best moments...')
         keys = keyframes_mod.pick_keyframes(analyses)
         moments = moments_mod.score_moments(keys, backend=backend)
         lap('moments')
@@ -410,6 +410,10 @@ def _ok_message(media: Mapping, notes: Sequence[str], song_note: Optional[str] =
     if C.NOTE_NO_FINAL_LOOK in notes:
         text += (' No finished look was found in the clips, so the reel ends on the last shot; '
                  'say so.')
+    from integrations.reel_studio.media.moments import NOTE_VLM_FALLBACK
+    if NOTE_VLM_FALLBACK in notes:
+        text += (' The vision model on this computer did not answer, so the shots were chosen '
+                 'by sharpness and filming order instead; say so.')
     return text
 
 
