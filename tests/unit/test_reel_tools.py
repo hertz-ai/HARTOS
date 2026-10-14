@@ -1,0 +1,524 @@
+"""integrations.reel_studio.tools: her seven reel_* tools.
+
+register_reel_studio_tools binds her user id, her agent's prompt id and a
+getter for the turn's request id into seven closures, so none of them is a
+tool argument.  With the schema (her Reel Studio agent) the helper gets the
+LLM schema and the assistant runs them; without it (any other agent) only
+the assistant can run them, which is what lets request_tools find them.
+
+reel_make turns a chat turn into a reel request: this turn's clips (else her
+newest unused batch), her style (tool arguments over her agent record's
+words over her voice profile), her logo (the newest she uploaded, kept in her
+profile), the song, a caption and at most five hashtags; then
+pipeline.make_reel delivers it.  A reel_make that made no reel answers in the
+executor's failure form ("Error: ..."), so neither the CREATE recipe banker,
+the REUSE fabrication gate nor the completion gate can count it as the
+action's work (core.constants.tool_reply_failed is the one rule all three
+read).
+
+Production (the media work) is replaced by a fake here: the end-to-end path
+is tests/unit/test_reel_pipeline.py's.  Everything else is real: the store on
+a temporary root, her voice profile, igkit, the skills, and
+publish_agent_message with publish_async as the recorded boundary.
+"""
+import hashlib
+import json
+import os
+import subprocess
+import sys
+from types import SimpleNamespace
+
+import pytest
+
+from integrations.reel_studio import contracts as C
+
+UID = '10077'
+PID = '42'
+
+
+class _Agent:
+    """Records what autogen's register_for_llm / register_for_execution get."""
+
+    def __init__(self):
+        self.llm = {}
+        self.exe = {}
+
+    def register_for_llm(self, *, name, description):
+        def put(func):
+            self.llm[name] = (description, func)
+            return func
+        return put
+
+    def register_for_execution(self, *, name):
+        def put(func):
+            self.exe[name] = func
+            return func
+        return put
+
+
+@pytest.fixture
+def env(tmp_path, monkeypatch):
+    from tests.conftest import refuse_all_network
+    refuse_all_network(monkeypatch)
+    monkeypatch.setenv('NUNBA_DATA_DIR', str(tmp_path))
+    monkeypatch.delenv('HEVOLVE_DATA_KEY', raising=False)
+    import security.secrets_manager as secrets_manager
+    monkeypatch.setattr(secrets_manager, 'get_secret', lambda name, default='': default)
+    from core import platform_paths
+    platform_paths.reset_cache()
+    from core import cache_loaders
+    prompts = tmp_path / 'prompts'
+    prompts.mkdir()
+    monkeypatch.setattr(cache_loaders, 'PROMPTS_DIR', str(prompts))
+    monkeypatch.setattr(cache_loaders, '_agent_config_cache', {})
+    from core import user_file_store as ufs
+    store = ufs.UserFileStore(str(tmp_path / 'user_files'), disk_free=lambda _p: 1 << 40)
+    monkeypatch.setattr(ufs, '_STORE', store)
+    from integrations.reel_studio import jobs, pipeline
+    monkeypatch.setattr(jobs, '_ACTIVE', set())
+    monkeypatch.setattr(jobs, '_SWEPT', True)
+    monkeypatch.setattr(pipeline, 'free_bytes', lambda _p: 1 << 40)
+    pushes = []
+
+    def publish_async(topic, message, timeout=2.0, skip_crossbar=False):
+        pushes.append((topic, message, {'skip_crossbar': skip_crossbar}))
+    monkeypatch.setitem(sys.modules, 'hart_intelligence', SimpleNamespace(publish_async=publish_async))
+    produced = []
+
+    def produce(sources, *, style, workdir, out_path, **kw):
+        produced.append(dict(kw, sources=list(sources), style=dict(style)))
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        with open(out_path, 'wb') as f:
+            f.write(b'\x00\x00\x00\x18ftypmp42' + os.urandom(1024))
+        qa = {'schema': C.QA_SCHEMA, 'passed': True, 'checks': [], 'advisory': []}
+        render = C.RenderResult(path=out_path, duration_s=float(style['target_s']),
+                                size_bytes=os.path.getsize(out_path), encoder='libx264')
+        return pipeline.Production(
+            path=out_path, edl={'notes': ['capture_order:phone']},
+            moments={'src': 'vlm', 'final_look_found': True, 'notes': []}, qa=qa, render=render,
+            beats_source='local_audio' if kw.get('song_audio') else 'synthetic', notes=[],
+            timings={}, analyses=[])
+    monkeypatch.setattr(pipeline, 'produce_reel', produce)
+    # No central here: an empty trending list unless a test supplies one.
+    from integrations.trends import trending_songs_client as tsc
+    monkeypatch.setattr(tsc, 'get_trending_songs', lambda langs=None, limit=10: {
+        'schema': C.TRENDING_CLIENT_SCHEMA, 'songs': [], 'stale': True, 'reason': 'no_central'})
+    request = {'id': 'req-1'}
+    yield SimpleNamespace(store=store, pushes=pushes, produced=produced, tmp=tmp_path,
+                          prompts=prompts, request=request, mp=monkeypatch)
+    platform_paths.reset_cache()
+
+
+def _tools(env, user=UID, prompt=PID, with_schema=True):
+    from integrations.reel_studio.tools import register_reel_studio_tools
+    helper, assistant = _Agent(), _Agent()
+    names = register_reel_studio_tools(helper, assistant, user, prompt_id=prompt,
+                                       request_id_getter=lambda: env.request['id'],
+                                       with_schema=with_schema)
+    return SimpleNamespace(names=names, helper=helper, assistant=assistant, run=assistant.exe)
+
+
+def _upload(env, data, *, name='VID.mp4', mime='video/mp4', purpose='reel_source',
+            captured_at=None, request_id='req-1', prompt_id=PID, user=UID):
+    xid = hashlib.sha256(data).hexdigest()
+    meta = {'captured_at': captured_at} if captured_at else None
+    ans = env.store.offer(user, name, len(data), xid, mime, purpose, meta=meta)
+    assert ans['type'] == 'file_accept', ans
+    assert env.store.put_chunk(user, xid, 0, data, xid)['type'] == 'file_ack'
+    assert env.store.commit(user, xid)['type'] == 'file_done'
+    if request_id is not None:
+        env.store.bind(user, [xid], prompt_id=prompt_id, request_id=request_id)
+    return xid
+
+
+def _ok(reply):
+    from core.constants import tool_reply_failed
+    assert not tool_reply_failed(reply), reply
+    return json.loads(reply)
+
+
+def _failed(reply):
+    from core.constants import tool_reply_failed
+    assert tool_reply_failed(reply), reply
+    return json.loads(reply.split('\n', 1)[1])
+
+
+def _media_pushes(env):
+    return [p for p in env.pushes if isinstance(p[1], dict) and p[1].get('media')]
+
+
+# ── registration ──────────────────────────────────────────────────────────
+
+def test_seven_tools_with_schema_on_the_helper_and_execution_on_the_assistant(env):
+    from integrations.reel_studio.tools import REEL_TOOL_NAMES
+    t = _tools(env)
+    assert len(REEL_TOOL_NAMES) == 7 and t.names == list(REEL_TOOL_NAMES)
+    assert set(t.helper.llm) == set(REEL_TOOL_NAMES) and t.helper.exe == {}
+    assert set(t.assistant.exe) == set(REEL_TOOL_NAMES) and t.assistant.llm == {}
+    for name, (desc, func) in t.helper.llm.items():
+        first = (func.__doc__ or '').strip().split('\n')[0].strip()
+        assert desc == first and len(desc) > 20, name
+
+
+def test_without_the_schema_only_execution_is_registered(env):
+    from integrations.reel_studio.tools import REEL_TOOL_NAMES
+    t = _tools(env, with_schema=False)
+    assert t.helper.llm == {} and set(t.assistant.exe) == set(REEL_TOOL_NAMES)
+    # discover_and_attach reads the first docstring line of _function_map entries.
+    for func in t.assistant.exe.values():
+        assert (func.__doc__ or '').strip().split('\n')[0].strip()
+
+
+def test_real_autogen_agents_take_the_tools(env):
+    autogen = pytest.importorskip('autogen')
+    from integrations.reel_studio.tools import REEL_TOOL_NAMES, register_reel_studio_tools
+    helper = autogen.AssistantAgent('helper', llm_config={
+        'config_list': [{'model': 'local', 'api_key': 'none', 'base_url': 'http://127.0.0.1:9'}]})
+    assistant = autogen.UserProxyAgent('assistant', human_input_mode='NEVER',
+                                       code_execution_config=False)
+    register_reel_studio_tools(helper, assistant, UID, prompt_id=PID,
+                               request_id_getter=lambda: None)
+    schema = {t['function']['name']: t['function'] for t in helper.llm_config['tools']}
+    assert set(schema) == set(REEL_TOOL_NAMES)
+    assert set(REEL_TOOL_NAMES) <= set(assistant.function_map)
+    props = schema['reel_make']['parameters']['properties']
+    assert {'target_seconds', 'open_with', 'hook_text', 'caption', 'hashtags', 'song_key',
+            'use_logo', 'clips'} == set(props)
+    for bound in ('user_id', 'prompt_id', 'request_id'):
+        assert all(bound not in s['parameters'].get('properties', {}) for s in schema.values())
+    # The family rides her agent's CREATE helper next to the core tools: its
+    # schema stays within 900 tokens by the counter fit_schema_to_ctx uses.
+    from core.llm_outbound_logger import _schema_tokens
+    assert _schema_tokens({'tools': helper.llm_config['tools']}) <= 900
+
+
+def test_importing_the_tools_is_cheap():
+    code = ('import sys, integrations.reel_studio\n'
+            'before = set(sys.modules)\n'
+            'import integrations.reel_studio.tools\n'
+            'new = sorted(set(sys.modules) - before)\n'
+            'print("\\n".join(new))\n')
+    here = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    out = subprocess.run([sys.executable, '-c', code], cwd=here, capture_output=True,
+                         text=True, timeout=120)
+    assert out.returncode == 0, out.stderr[-2000:]
+    loaded = out.stdout.split()
+    heavy = [m for m in loaded if m.split('.')[0] in ('cv2', 'numpy', 'autogen', 'langchain')
+             or m.startswith(('integrations.reel_studio.media', 'integrations.reel_studio.pipeline',
+                              'integrations.vision'))]
+    assert heavy == []
+
+
+def test_the_closures_answer_for_the_user_they_were_built_for(env):
+    a, b = _tools(env, user='10077'), _tools(env, user='20088', prompt='7')
+    _ok(a.run['reel_voice'](action='set', field='city', value='Madurai'))
+    assert _ok(a.run['reel_voice'](action='get'))['profile']['city'] == 'Madurai'
+    assert _ok(b.run['reel_voice'](action='get'))['profile'] == {}
+
+
+def test_the_first_registration_sweeps_interrupted_jobs(env, monkeypatch):
+    from integrations.reel_studio import jobs
+    monkeypatch.setattr(jobs, '_SWEPT', False)
+    calls = []
+    monkeypatch.setattr(jobs, 'sweep_interrupted', lambda **k: calls.append(1) or [])
+    _tools(env)
+    _tools(env, with_schema=False)
+    assert calls == [1]
+
+
+def test_each_reel_runs_the_stores_retention_pass(env, monkeypatch):
+    gcs = []
+    monkeypatch.setattr(env.store, 'gc', lambda **k: gcs.append(1) or 0)
+    _upload(env, b'clip' * 500)
+    _ok(_tools(env).run['reel_make']())
+    assert gcs == [1]
+
+
+# ── reel_make ─────────────────────────────────────────────────────────────
+
+def test_no_clips_asks_her_for_clips_and_is_not_the_actions_work(env):
+    t = _tools(env)
+    reply = t.run['reel_make']()
+    body = _failed(reply)
+    assert body['status'] == 'needs_clips' and body['message'].strip()
+    assert env.produced == [] and _media_pushes(env) == []
+
+
+def test_the_needs_clips_reply_cannot_complete_the_action():
+    """The completion gate itself (hartos.lifecycle_hooks) refuses it as a receipt."""
+    lh = pytest.importorskip('hartos.lifecycle_hooks')
+    from integrations.reel_studio.tools import _failure_reply
+    reply = _failure_reply({'status': 'needs_clips', 'message': 'Ask her to attach clips.'})
+    message = {'role': 'tool', 'tool_call_id': 'c1', 'content': reply}
+    assert list(lh._work_results(message, {'c1': 'reel_make'}, 'make a reel with reel_make',
+                                 ['reel_make'])) == []
+    ok = dict(message, content=json.dumps({'status': 'ok'}))
+    assert list(lh._work_results(ok, {'c1': 'reel_make'}, 'make a reel with reel_make',
+                                 ['reel_make'])) == ['reel_make']
+
+
+def test_this_turns_clips_make_a_reel_that_reaches_her_with_the_turns_request_id(env):
+    a = _upload(env, b'clip-a' * 500, captured_at=1_760_247_082_000)
+    b = _upload(env, b'clip-b' * 500, captured_at=1_760_247_382_000)
+    _upload(env, b'old-batch' * 500, request_id='req-0')
+    env.request['id'] = 'req-1'
+    t = _tools(env)
+    env.request['id'] = 'req-1'                 # read at call time, not at registration
+    body = _ok(t.run['reel_make'](target_seconds=15))
+    assert body['status'] == 'ok'
+    media = body['media']
+    assert C.validate_media_item(media) == []
+    assert [s.xid for s in env.produced[0]['sources']] == [a, b]
+    assert env.store.resolve(UID, media['xid'], box='out') is not None
+    (topic, payload, flags), = _media_pushes(env)
+    assert payload['request_id'] == 'req-1' and payload['prompt_id'] == PID
+    assert payload['text'][0].strip() and flags == {'skip_crossbar': True}
+    assert env.store.query_inbox(UID, request_id='req-1') == []        # consumed
+    assert env.produced[0]['style']['target_s'] == 15
+
+
+def test_with_none_attached_this_turn_the_newest_unused_batch_is_used(env):
+    _upload(env, b'first' * 500, request_id='req-a')
+    newest = _upload(env, b'second' * 500, request_id='req-b')
+    env.request['id'] = 'req-c'
+    t = _tools(env)
+    _ok(t.run['reel_make']())
+    assert [s.xid for s in env.produced[0]['sources']] == [newest]
+
+
+def test_named_clips_are_used_and_anything_else_is_ignored(env):
+    a = _upload(env, b'one' * 500)
+    b = _upload(env, b'two' * 500)
+    logo = _upload(env, b'\x89PNG' + b'0' * 64, name='logo.png', mime='image/png', purpose='logo')
+    t = _tools(env)
+    _ok(t.run['reel_make'](clips='%s, %s, nonsense, %s' % (b, logo, 'f' * 64)))
+    assert [s.xid for s in env.produced[0]['sources']] == [b]
+    assert a  # the other clip stays unused
+    assert [s.xid for s in env.store.query_inbox(UID, purpose='reel_source')] == [a]
+
+
+def test_another_users_clip_is_never_used(env):
+    theirs = _upload(env, b'theirs' * 500, user='20088', prompt_id='7')
+    t = _tools(env)
+    body = _failed(t.run['reel_make'](clips=theirs))
+    assert body['status'] == 'needs_clips'
+
+
+def test_her_newest_logo_is_used_and_kept_in_her_profile(env):
+    from integrations.reel_studio import voice_profile
+    _upload(env, b'clip' * 500)
+    logo = _upload(env, b'\x89PNG-new' + b'1' * 64, name='logo.png', mime='image/png',
+                   purpose='logo', request_id=None)
+    t = _tools(env)
+    _ok(t.run['reel_make']())
+    held = env.store.resolve(UID, logo, box='in')
+    assert env.produced[0]['logo_path'] == held.path
+    assert voice_profile.load_voice(UID)['logo_xid'] == logo
+
+
+def test_the_logo_in_her_profile_is_used_when_nothing_newer_was_uploaded(env):
+    from integrations.reel_studio import voice_profile
+    logo = _upload(env, b'\x89PNG-saved' + b'2' * 64, name='logo.png', mime='image/png',
+                   purpose='logo', request_id=None)
+    voice_profile.update_field(UID, 'logo_xid', logo)
+    _upload(env, b'clip' * 500)
+    t = _tools(env)
+    _ok(t.run['reel_make']())
+    assert env.produced[0]['logo_path'] == env.store.resolve(UID, logo).path
+
+
+def test_no_logo_when_she_says_so(env):
+    _upload(env, b'\x89PNG' + b'3' * 64, name='logo.png', mime='image/png', purpose='logo')
+    _upload(env, b'clip' * 500)
+    t = _tools(env)
+    _ok(t.run['reel_make'](use_logo='no'))
+    assert env.produced[0]['logo_path'] is None
+
+
+def test_her_agent_record_sets_the_style_and_arguments_override_it(env):
+    (env.prompts / ('%s.json' % PID)).write_text(json.dumps(
+        {'goal': 'Bridal reels: open with the final look, 25s, Tamil songs, logo top right',
+         'flows': []}), encoding='utf-8')
+    _upload(env, b'clip' * 500)
+    t = _tools(env)
+    _ok(t.run['reel_make'](target_seconds=12))
+    style = env.produced[0]['style']
+    assert style['target_s'] == 12                       # the argument
+    assert style['hook_first'] is True and style['language'] == 'ta'
+    assert style['logo_corner'] == 'top_right'
+    assert C.validate_style(style) == []
+
+
+@pytest.mark.parametrize('open_with,want', [('final_look', True), ('story', False),
+                                            ('bare_face', False)])
+def test_open_with_sets_the_teaser(env, open_with, want):
+    (env.prompts / ('%s.json' % PID)).write_text(json.dumps(
+        {'goal': 'start with the result'}), encoding='utf-8')
+    _upload(env, b'clip' * 500)
+    t = _tools(env)
+    _ok(t.run['reel_make'](open_with=open_with))
+    assert env.produced[0]['style']['hook_first'] is want
+
+
+def test_hashtags_are_cleaned_and_capped_at_five(env):
+    _upload(env, b'clip' * 500)
+    t = _tools(env)
+    body = _ok(t.run['reel_make'](hashtags='#bridalmakeup, chennaimua #mua #mua #a #b #c #d'))
+    assert body['media']['hashtags'] == ['#bridalmakeup', '#chennaimua', '#mua', '#a', '#b']
+
+
+def test_hashtags_and_caption_come_from_her_profile_when_not_given(env):
+    from integrations.reel_studio import voice_profile
+    voice_profile.update_field(UID, 'hashtag_bank', '#a #b #c #d #e #f #g')
+    voice_profile.update_field(UID, 'services', 'Bridal and reception makeup')
+    voice_profile.update_field(UID, 'city', 'Madurai')
+    voice_profile.update_field(UID, 'cta', 'DM for bookings')
+    _upload(env, b'clip' * 500)
+    t = _tools(env)
+    media = _ok(t.run['reel_make']())['media']
+    assert media['hashtags'] == ['#a', '#b', '#c', '#d', '#e']
+    assert 'Madurai' in media['caption'] and 'DM for bookings' in media['caption']
+
+
+def test_a_trending_song_named_by_key_rides_the_reel(env, monkeypatch):
+    from integrations.trends import trending_songs_client as tsc
+    songs = {'schema': C.TRENDING_CLIENT_SCHEMA, 'fetched_at': '2026-10-14T00:00:00Z',
+             'stale': False, 'reason': None,
+             'songs': [{'song_key': 'cluster:9', 'title': 'Vaathi', 'artist': 'Anirudh',
+                        'lang': 'ta', 'suggested_start_ms': 38_500, 'start_label': '0:38',
+                        'score': 3.2}]}
+    monkeypatch.setattr(tsc, 'get_trending_songs', lambda langs=None, limit=10: songs)
+    _upload(env, b'clip' * 500)
+    t = _tools(env)
+    song = _ok(t.run['reel_make'](song_key='cluster:9'))['media']['song']
+    assert song == {'song_key': 'cluster:9', 'title': 'Vaathi', 'artist': 'Anirudh', 'lang': 'ta',
+                    'start_ms': 38_500, 'start_label': '0:38', 'beats': 'synthetic'}
+
+
+def test_without_a_song_key_the_top_song_in_her_language_is_suggested(env, monkeypatch):
+    from integrations.trends import trending_songs_client as tsc
+    asked = []
+
+    def trending(langs=None, limit=10):
+        asked.append(langs)
+        return {'songs': [{'song_key': 'cluster:1', 'title': 'Top', 'artist': 'X', 'lang': 'hi',
+                           'suggested_start_ms': 0, 'start_label': '0:00', 'score': 1.0}]}
+    monkeypatch.setattr(tsc, 'get_trending_songs', trending)
+    (env.prompts / ('%s.json' % PID)).write_text(json.dumps({'goal': 'Hindi songs'}),
+                                                 encoding='utf-8')
+    _upload(env, b'clip' * 500)
+    t = _tools(env)
+    song = _ok(t.run['reel_make']())['media']['song']
+    assert song['song_key'] == 'cluster:1' and asked[-1] == 'hi'
+
+
+def test_her_song_audio_gives_the_beats(env):
+    _upload(env, b'clip' * 500)
+    audio = _upload(env, b'ID3' + b'9' * 500, name='Vaathi Coming.mp3', mime='audio/mpeg',
+                    purpose='song_audio')
+    t = _tools(env)
+    media = _ok(t.run['reel_make']())['media']
+    assert env.produced[0]['song_audio'] == env.store.resolve(UID, audio).path
+    assert media['song']['beats'] == 'local_audio'
+    assert media['song']['title'] == 'Vaathi Coming'
+
+
+def test_a_busy_desktop_says_so_in_the_failure_form(env):
+    from integrations.reel_studio import jobs
+    _upload(env, b'clip' * 500)
+    other = jobs.start_job('20088', '7', 'x')
+    try:
+        body = _failed(_tools(env).run['reel_make']())
+    finally:
+        jobs.finish_job(other.reel_id, 'ok')
+    assert body['status'] == 'busy' and body['message']
+
+
+# ── the writing tools ─────────────────────────────────────────────────────
+
+def test_check_caption_lints_detects_and_humanizes_in_her_voice(env):
+    from integrations.reel_studio import voice_profile
+    caption = 'Meena did this bride in Madurai ✨ DM for bookings #bridalmakeup'
+    t = _tools(env)
+
+    def structures(body):
+        return [s['id'] for s in body['humanized']['report']['structures']]
+    before = _ok(t.run['reel_check_caption'](caption=caption, keywords='bridal makeup Madurai'))
+    assert 'rocket' in structures(before)        # a sparkle reads as a machine tell ...
+    voice_profile.update_field(UID, 'emoji', '✨')
+    body = _ok(t.run['reel_check_caption'](caption=caption, keywords='bridal makeup Madurai'))
+    assert 'rocket' not in structures(body)      # ... unless it is one of hers
+    assert body['lint']['verdict'] in ('READY', 'REVIEW', 'FIX')
+    assert any(c['check'] == 'SEARCH TERMS' for c in body['lint']['checks'])
+    assert body['detection']['verdict'] in ('PASS', 'REVIEW', 'FLAGGED')
+    assert body['humanized']['text'].strip()
+
+
+def test_score_hooks_gives_verdicts_and_never_a_number(env):
+    t = _tools(env)
+    body = _ok(t.run['reel_score_hooks'](hooks='Hi guys welcome back\n₹15k bridal look in 20s'))
+    assert [h['verdict'] for h in body['hooks']] == ['WEAK', body['hooks'][1]['verdict']]
+    assert body['note']
+    for h in body['hooks']:
+        assert set(h) >= {'hook', 'verdict', 'weakest'} and 'score' not in h
+
+
+def test_beat_sheet_times_at_her_own_rate(env):
+    from integrations.reel_studio import voice_profile
+    voice_profile.update_field(UID, 'wpm', 120)
+    t = _tools(env)
+    body = _ok(t.run['reel_beat_sheet'](script='Bare face to bride in twenty seconds.\nDM me.',
+                                        target_seconds=20))
+    assert body['wpm'] == 120 and body['target'] == 20 and body['beats']
+
+
+def test_skill_text_comes_with_her_voice_brief_in_front(env):
+    from integrations.reel_studio import voice_profile
+    from integrations.reel_studio.igkit.skills import get_skill_text
+    voice_profile.update_field(UID, 'city', 'Madurai')
+    t = _tools(env)
+    text = t.run['reel_skill'](name='ig-caption')
+    assert text.startswith(voice_profile.voice_brief(UID))
+    assert text.endswith(get_skill_text('ig_caption'))
+
+
+def test_an_unknown_skill_names_the_ones_there_are(env):
+    from core.constants import tool_reply_failed
+    t = _tools(env)
+    reply = t.run['reel_skill'](name='ig_viral')
+    assert tool_reply_failed(reply) and 'ig_reel' in reply
+
+
+def test_voice_set_get_clear_and_fields(env):
+    t = _tools(env)
+    profile = _ok(t.run['reel_voice'](action='set', field='hashtag_bank', value='#a, #b'))['profile']
+    assert profile['hashtag_bank'] == ['#a', '#b']
+    _ok(t.run['reel_voice'](action='clear', field='hashtag_bank'))
+    assert 'hashtag_bank' not in _ok(t.run['reel_voice']())['profile']
+    fields = _ok(t.run['reel_voice'](action='fields'))['fields']
+    assert 'caption_language' in fields and fields['caption_language']['help']
+
+
+def test_a_value_her_profile_refuses_is_reported_not_raised(env):
+    from core.constants import tool_reply_failed
+    t = _tools(env)
+    reply = t.run['reel_voice'](action='set', field='wpm', value='9000')
+    assert tool_reply_failed(reply) and 'wpm' in reply
+    assert tool_reply_failed(t.run['reel_voice'](action='set', field='colour', value='pink'))
+    assert tool_reply_failed(t.run['reel_voice'](action='dance'))
+
+
+def test_trending_songs_default_to_her_caption_language(env, monkeypatch):
+    from integrations.reel_studio import voice_profile
+    from integrations.trends import trending_songs_client as tsc
+    voice_profile.update_field(UID, 'caption_language', 'pa')
+    asked = []
+    monkeypatch.setattr(tsc, 'get_trending_songs',
+                        lambda langs=None, limit=10: asked.append((langs, limit)) or
+                        {'schema': C.TRENDING_CLIENT_SCHEMA, 'songs': [], 'stale': True,
+                         'reason': 'no_central'})
+    t = _tools(env)
+    body = _ok(t.run['reel_trending_songs']())
+    assert asked == [('pa', 5)] and body['reason'] == 'no_central'
+    _ok(t.run['reel_trending_songs'](language='ta', limit=3))
+    assert asked[-1] == ('ta', 3)
