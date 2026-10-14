@@ -1,15 +1,22 @@
-"""The phone's creation hint outlives the gather turns and is stamped on save.
+"""The phone's creation hint survives the gather: the turn that ends it carries it.
 
-Plan WS-8a step 2 (critique finding 2).  The phone's Reel Studio entry sends
-``goal_tags: ["reel_studio"]`` with a create turn, but the agent record is
+Plan WS-8a step 2 (critique finding 2), amendment A19.  The agent record is
 written only when gathering ends -- turns later, by _save_and_enter_review --
-and her instructions need not contain a single reel phrase.  So /chat holds
-the hint per '{user_id}_{prompt_id}' (the gather-turn key) until the save, and
-the save stamps ``goal_tags`` = the user-assignable tags of that hint -- ONLY
-the explicit hint: the saved goal's own words never stamp it (amendment A8 c).
-A reel agent's record is then not synced to the cloud prompt list (decision
-U4(c)).  Any other agent's record is written exactly as before, and on the
-CENTRAL node the hint stamps nothing (amendment A8 d).
+and her instructions need not contain a single reel phrase.  The phone sends
+her agent's ``goal_tags: ["reel_studio"]`` on EVERY turn of it
+(ReelInbox.markTurn), so the save stamps ``goal_tags`` = the user-assignable
+tags of the hint the saving turn itself carries -- ONLY the explicit hint: the
+saved goal's own words never stamp it (amendment A8 c).  Nothing holds a hint
+between turns.  The in-memory hold this replaced
+(marketing_tools._creation_hints, 2 h) lost it when this node restarted
+mid-gather or a gather ran longer, and her agent was then saved without
+reel_studio for good (A19); and no gather state this node keeps outlives a
+restart either (review_agents and the turn counts are in memory and expire
+after an idle hour).  So a gather across a restart, or over hours, still
+stamps it, and a hint that came only on an earlier turn stamps nothing.  A
+reel agent's record is not synced to the cloud prompt list (decision U4(c)).
+Any other agent's record is written exactly as before, and on the CENTRAL
+node the hint stamps nothing (amendment A8 d).
 
 Driven through the REAL /chat (app.test_client) with the body Nunba's
 hevolve_chat forwards for a phone turn.  Boundaries replaced: gather_info
@@ -19,6 +26,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import uuid
 
 os.environ.setdefault('HEVOLVE_DB_PATH', ':memory:')
@@ -78,6 +86,7 @@ def chat(hie, tmp_path, monkeypatch):
     monkeypatch.setattr(chat_messages, 'persist_and_publish_async', MagicMock())
     monkeypatch.setattr(ufs, '_STORE', ufs.UserFileStore(
         str(tmp_path / 'user_files'), disk_free=lambda _p: 1 << 40))
+    real_cleanup = hie._cleanup_stale_agents
     for name in ('_persist_language', '_cleanup_stale_agents', '_record_lifecycle',
                  '_tts_synthesize_and_publish', 'publish_async'):
         monkeypatch.setattr(hie, name, lambda *a, **k: None)
@@ -123,31 +132,89 @@ def chat(hie, tmp_path, monkeypatch):
         return [c for c in posts.call_args_list
                 if 'createpromptlist' in str(c.args[0] if c.args else '')]
 
+    key = f'{user}_{pid}'
+
+    def forget():
+        """Every per-agent table chat() keeps in memory loses this agent."""
+        for table in (hie.review_agents, hie.conversation_agent, hie._gather_turn_counts,
+                      hie._gather_reviews_shown, hie._agent_timestamps):
+            table.pop(key, None)
+        if pid in hie.first_promts:
+            hie.first_promts.remove(pid)
+
+    def idle(hours):
+        """``hours`` pass with no turn, and the node's own stale-state sweep
+        (_cleanup_stale_agents, run at the start of each /chat) runs."""
+        hie._agent_timestamps[key] = time.time() - hours * 3600
+        real_cleanup()
+
     yield SimpleNamespace(turn=turn, answers=answers, saved=saved, pid=pid,
                           user=user, cloud_syncs=cloud_syncs, hie=hie,
-                          saved_bytes=saved_bytes)
-    key = f'{user}_{pid}'
-    for table in (hie.review_agents, hie.conversation_agent, hie._gather_turn_counts,
-                  hie._gather_reviews_shown):
-        table.pop(key, None)
-    if pid in hie.first_promts:
-        hie.first_promts.remove(pid)
+                          saved_bytes=saved_bytes, restart=forget, idle=idle)
+    forget()
 
 
-def test_a_hint_on_the_first_turn_is_stamped_when_gathering_ends(chat):
+HER_TAGS = ['reel_studio']        # what the phone puts on every turn of her agent
+
+
+def test_her_hint_is_stamped_when_gathering_ends(chat):
     """Her instructions carry no reel phrase; only the hint says it."""
     chat.answers += [PLAIN, REVIEW,
                      _completed('Help my salon with weekend bookings',
                                 ['Edit the clips she sends', 'Write a caption'])]
-    chat.turn('I want help with my salon', goal_tags=['reel_studio'])
-    chat.turn('weekend bookings, captions')            # no hint on later turns
-    done = chat.turn('yes, build it')
+    chat.turn('I want help with my salon', goal_tags=HER_TAGS)
+    chat.turn('weekend bookings, captions', goal_tags=HER_TAGS)
+    done = chat.turn('yes, build it', goal_tags=HER_TAGS)
     assert done['Agent_status'] == 'Review Mode'
-    assert chat.saved()['goal_tags'] == ['reel_studio'], (
-        'the hint sent on gather turn 1 was gone by the turn that saved the '
-        'record, so her agent was saved without its tag')
+    assert chat.saved()['goal_tags'] == ['reel_studio']
     assert chat.cloud_syncs() == [], (
         "a reel_studio record must not be posted to the cloud's createpromptlist")
+
+
+def test_a_restart_mid_gather_still_stamps_her_tag(chat):
+    """Amendment A19: this node restarts between her turns, so everything it
+    kept in memory for the gather is gone.  The turn that ends the gather
+    carries her hint, and her agent is saved a Reel Studio one."""
+    chat.answers += [PLAIN, REVIEW, _completed('Help my salon', ['Edit the clips'])]
+    chat.turn('I want help with my salon', goal_tags=HER_TAGS)
+    chat.restart()
+    chat.turn('weekend bookings, captions', goal_tags=HER_TAGS)
+    done = chat.turn('yes, build it', goal_tags=HER_TAGS)
+    assert done['Agent_status'] == 'Review Mode'
+    assert chat.saved()['goal_tags'] == ['reel_studio'], (
+        'a restart mid-gather saved her agent without reel_studio: it can '
+        'never get the reel tools after that')
+    assert chat.cloud_syncs() == []
+
+
+def test_a_gather_over_two_hours_still_stamps_her_tag(chat):
+    """Amendment A19: she answers the next question three hours later.  The
+    node's own sweep has forgotten the idle gather by then (an hour), and
+    the old hint hold had expired (two hours); her turn carries the hint."""
+    chat.answers += [PLAIN, REVIEW, _completed('Help my salon', ['Edit the clips'])]
+    chat.turn('I want help with my salon', goal_tags=HER_TAGS)
+    chat.idle(hours=3)
+    assert f'{chat.user}_{chat.pid}' not in chat.hie._gather_turn_counts, (
+        'precondition: the sweep forgot the idle gather')
+    chat.turn('weekend bookings, captions', goal_tags=HER_TAGS)
+    chat.turn('yes, build it', goal_tags=HER_TAGS)
+    assert chat.saved()['goal_tags'] == ['reel_studio']
+    assert chat.cloud_syncs() == []
+
+
+def test_a_hint_on_an_earlier_turn_alone_stamps_nothing(chat):
+    """Nothing holds a hint between turns (A19 / A20: the 2 h in-memory hold
+    is gone): only the saving turn's own hint is stamped.  A client that
+    sent it on its first turn alone gets an ordinary record, written and
+    synced as any other -- the same record a restart would have left."""
+    chat.answers += [PLAIN, REVIEW, _completed('Help my salon', ['Edit the clips'])]
+    chat.turn('I want help with my salon', goal_tags=HER_TAGS)
+    chat.turn('weekend bookings, captions')
+    chat.turn('yes, build it')
+    assert 'goal_tags' not in chat.saved(), (
+        'a hint from an earlier turn was held in memory and stamped: a restart '
+        'or a long gather would have lost it, so the record depended on luck')
+    assert len(chat.cloud_syncs()) == 1
 
 
 def test_no_hint_no_stamp_even_when_the_saved_goal_names_reels(chat):
@@ -188,8 +255,8 @@ def test_on_central_the_hint_stamps_nothing(chat, monkeypatch):
     from security import key_delegation
     monkeypatch.setattr(key_delegation, 'get_node_tier', lambda: 'central')
     chat.answers += [REVIEW, _completed('Help my salon', ['Edit the clips'])]
-    chat.turn('help my salon', goal_tags=['reel_studio'])
-    chat.turn('yes')
+    chat.turn('help my salon', goal_tags=HER_TAGS)
+    chat.turn('yes', goal_tags=HER_TAGS)
     assert 'goal_tags' not in chat.saved()
     assert len(chat.cloud_syncs()) == 1, (
         'central skipped the cloud prompt-list sync for a reel hint')
@@ -198,7 +265,7 @@ def test_on_central_the_hint_stamps_nothing(chat, monkeypatch):
 def test_a_hint_that_is_not_user_assignable_is_ignored(chat):
     chat.answers += [REVIEW, _completed('Plan my week', ['List my tasks'])]
     chat.turn('plan my week', goal_tags=['marketing', 'coding'])
-    chat.turn('yes')
+    chat.turn('yes', goal_tags=['marketing', 'coding'])
     assert 'goal_tags' not in chat.saved()
 
 
@@ -215,12 +282,3 @@ def test_any_other_agents_record_is_written_as_before(chat):
     expected = dict(json.loads(answer), prompt_id=chat.pid, creator_user_id=chat.user)
     assert chat.saved_bytes() == json.dumps(expected).encode('ascii')
     assert len(chat.cloud_syncs()) == 1
-
-
-def test_the_hint_is_dropped_once_the_record_is_saved(chat):
-    from integrations.agent_engine.marketing_tools import held_goal_tag_hint
-    chat.answers += [REVIEW, _completed('Help my salon', ['Edit the clips'])]
-    chat.turn('help my salon', goal_tags=['reel_studio'])
-    assert held_goal_tag_hint(f'{chat.user}_{chat.pid}') == ['reel_studio']
-    chat.turn('yes')
-    assert held_goal_tag_hint(f'{chat.user}_{chat.pid}') == []

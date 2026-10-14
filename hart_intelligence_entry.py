@@ -10195,26 +10195,30 @@ def chat():
         if not re.fullmatch(r'[a-zA-Z0-9_-]+', prompt_id):
             return jsonify({'error': 'Invalid prompt_id format', 'response': None}), 400
 
-    # Reel Studio (plan WS-8a): the creation hint is held here, where the
-    # turn's identity is known and before the REUSE ladder below replaces
-    # `data` with the agent's own record, until the gather save stamps it.
+    # Reel Studio (plan WS-8a, amendment A19): the turn's creation hint, the
+    # user-assignable tags of the body's goal_tags.  Read here, before the
+    # REUSE ladder below replaces `data` with the agent's own record.  Held
+    # nowhere between turns: her client puts her agent's tags on every turn
+    # of it (the phone's ReelInbox.markTurn), so the turn whose gather saves
+    # the record carries them, after a restart or a long gather alike, and
+    # _save_and_enter_review stamps them.
     from core.intelligence_preference import IntelligencePreference
     from integrations.agent_engine.marketing_tools import (
-        agent_is_local_only, hold_goal_tag_hint)
-    if prompt_id is not None:
-        hold_goal_tag_hint(f'{user_id}_{prompt_id}', data.get('goal_tags'))
+        agent_is_local_only, user_assignable_goal_tags)
+    _creation_hint = user_assignable_goal_tags(data.get('goal_tags'))
     # Does this turn keep to this node?  ONE rule over every source
     # (amendment A9 e, ruled with the lanes lane 2026-10-13): the person's
     # own toggle (Nunba's Demopage switch), or the goal tags of the turn's
-    # agent (Reel Studio, decision U4) -- this prompt_id's, and the agent an
-    # agentic_execute plan names, which the turn is routed to only below.
-    # Strictness only goes up.  An input to the lane and model decision
-    # below, never a decision of its own; in memory only, nothing persisted.
+    # agent (Reel Studio, decision U4) -- this prompt_id's, with the hint
+    # this turn carries for it, and the agent an agentic_execute plan names,
+    # which the turn is routed to only below.  Strictness only goes up.  An
+    # input to the lane and model decision below, never a decision of its
+    # own; in memory only, nothing persisted.
     _plan = data.get('agentic_plan') if data.get('agentic_execute') else None
     local_only = (intelligence_preference == IntelligencePreference.LOCAL_ONLY
-                  or agent_is_local_only(user_id, prompt_id)
+                  or agent_is_local_only(prompt_id, _creation_hint)
                   or (isinstance(_plan, dict)
-                      and agent_is_local_only(user_id, _plan.get('matched_agent_id'))))
+                      and agent_is_local_only(_plan.get('matched_agent_id'))))
     if local_only:
         from core.autogen_config import llm_stays_on_premises
         # The one answer every reader of the turn's preference sees
@@ -10955,14 +10959,14 @@ def chat():
             def _save_and_enter_review(agent_config):
                 agent_config['prompt_id'] = prompt_id
                 agent_config['creator_user_id'] = user_id
-                # Reel Studio (plan WS-8a, amendment A8 c): the record carries
-                # the user-assignable goal tags of the held creation hint, and
-                # only those, so CREATE and REUSE build her agent with its
-                # tools.  Any other record is written exactly as before.
+                # Reel Studio (plan WS-8a, amendments A8 c and A19): the record
+                # carries the user-assignable goal tags of the creation hint
+                # this saving turn carries, and only those, so CREATE and
+                # REUSE build her agent with its tools.  Any other record is
+                # written exactly as before.
                 from integrations.agent_engine.marketing_tools import (
-                    drop_goal_tag_hint, held_goal_tag_hint, is_local_only,
-                    stamp_goal_tags)
-                _stamped = stamp_goal_tags(held_goal_tag_hint(turn_key),
+                    is_local_only, stamp_goal_tags)
+                _stamped = stamp_goal_tags(_creation_hint,
                                            agent_config.get('goal_tags'))
                 if _stamped is not None:
                     agent_config['goal_tags'] = _stamped
@@ -11000,7 +11004,6 @@ def chat():
                     _touch_agent_timestamp(_ak)
                 _gather_turn_counts.pop(turn_key, None)  # Reset turn counter
                 _gather_reviews_shown.pop(turn_key, None)
-                drop_goal_tag_hint(turn_key)
                 _record_lifecycle('Review Mode', user_id, prompt_id, 'Agent details gathered, entering review')
 
             try:

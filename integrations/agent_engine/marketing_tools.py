@@ -15,7 +15,6 @@ from types import MappingProxyType
 from typing import Annotated, Optional
 
 from core.intelligence_preference import IntelligencePreference
-from core.session_cache import TTLCache
 
 logger = logging.getLogger('hevolve_social')
 
@@ -521,11 +520,13 @@ def register_marketing_tools(helper, assistant, user_id: str):
 REEL_STUDIO_TAG = 'reel_studio'
 
 #: Goal tags a client may ASK for when it creates an agent (the /chat body's
-#: ``goal_tags``, held by hold_goal_tag_hint until the record is saved and
-#: stamped by stamp_goal_tags).  Every other tag is only ever detected from
-#: the goal text, never taken from a request.  Read through the one filter,
-#: user_assignable_goal_tags: Nunba's turn_goal_tags forwards what that
-#: filter keeps of a turn's tags and keeps no list or filter of its own.
+#: ``goal_tags``: the phone puts her agent's on every turn of it,
+#: ReelInbox.markTurn, and stamp_goal_tags stamps the ones the turn that
+#: saves the record carries; nothing holds them between turns).  Every other
+#: tag is only ever detected from the goal text, never taken from a request.
+#: Read through the one filter, user_assignable_goal_tags: Nunba's
+#: turn_goal_tags forwards what that filter keeps of a turn's tags and keeps
+#: no list or filter of its own.
 USER_ASSIGNABLE_GOAL_TAGS = frozenset({REEL_STUDIO_TAG})
 
 #: The inference preference a goal tag sets for its agent (decision U4), in
@@ -879,7 +880,7 @@ def goal_tags_preference(tags) -> Optional[IntelligencePreference]:
     """The inference preference these goal tags set for their agent
     (GOAL_TAG_PREFERENCES), or None when they set none.
 
-    ``tags`` is a record's stored ``goal_tags`` or a held creation hint --
+    ``tags`` is a record's stored ``goal_tags`` or a turn's creation hint --
     never detected tags.  When several tags set one, the strictest wins
     (IntelligencePreference's own order: local_only, auto, hive_preferred).
     reel_studio sets none on the central node (_reel_studio_inert).  None
@@ -901,49 +902,20 @@ def is_local_only(tags) -> bool:
     return goal_tags_preference(tags) is IntelligencePreference.LOCAL_ONLY
 
 
-# The creation hint a client sent (the /chat body's ``goal_tags``, as far as
-# USER_ASSIGNABLE_GOAL_TAGS allows), per agent being created --
-# '{user_id}_{prompt_id}', the key hart_intelligence_entry counts gather turns
-# by -- until the saved record is stamped (Reel Studio, plan WS-8a).  The
-# phone's Reel Studio entry sends it with its create turns, but the record is
-# written on the turn gathering ends, which need not carry it; held here, it
-# is not lost.  An abandoned creation's hint expires with the cache.
-_creation_hints = TTLCache(ttl_seconds=7200, max_size=500,
-                           name='goal_tag_creation_hints')
-
-
-def hold_goal_tag_hint(key, raw) -> list:
-    """Hold the user-assignable tags of this turn's hint ``raw`` for the
-    agent ``key``; returns every tag held for it so far (sorted)."""
-    held = set(_creation_hints.get(key) or ())
-    asked = set(user_assignable_goal_tags(raw))
-    if not asked <= held:
-        held |= asked
-        _creation_hints[key] = sorted(held)
-    return sorted(held)
-
-
-def held_goal_tag_hint(key) -> list:
-    """The tags held for the agent ``key`` ([] when none)."""
-    return list(_creation_hints.get(key) or ())
-
-
-def drop_goal_tag_hint(key) -> None:
-    """Forget the agent ``key``'s hint (its record has been saved)."""
-    _creation_hints.pop(key, None)
-
-
-def agent_is_local_only(user_id, prompt_id) -> bool:
+def agent_is_local_only(prompt_id, hint=None) -> bool:
     """Do the goal tags of the agent ``prompt_id`` keep its turns on this
-    node (is_local_only)?  Its saved record's ``goal_tags``, and the creation
-    hint held for it under '{user_id}_{prompt_id}' before that record exists.
-    The per-agent half of /chat's one local-only rule.  False for no id, an
+    node (is_local_only)?  Its saved record's ``goal_tags``, and ``hint``:
+    the creation hint the turn itself carries for it (the /chat body's
+    ``goal_tags``, read by user_assignable_goal_tags), which is all there is
+    before that record exists.  Nothing is held between turns (amendment
+    A19): the phone puts her agent's tags on every turn of it.  The
+    per-agent half of /chat's one local-only rule.  False for no id, an
     unsafe id or no readable record and no hint."""
     if prompt_id is None or prompt_id == '':
         return False
     from core.cache_loaders import load_agent_config
     stored = (load_agent_config(prompt_id) or {}).get('goal_tags')
-    return is_local_only(held_goal_tag_hint(f'{user_id}_{prompt_id}')
+    return is_local_only(user_assignable_goal_tags(hint)
                          + (stored if isinstance(stored, list) else []))
 
 

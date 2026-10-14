@@ -32,8 +32,7 @@ from integrations.agent_engine import marketing_tools
 from integrations.agent_engine.goal_seeding import SEED_BOOTSTRAP_GOALS
 from integrations.agent_engine.marketing_tools import (
     GOAL_TAG_PREFERENCES, USER_ASSIGNABLE_GOAL_TAGS, detect_goal_tags,
-    drop_goal_tag_hint, goal_tags_preference, held_goal_tag_hint,
-    hold_goal_tag_hint, is_local_only, resolve_goal_tags, stamp_goal_tags,
+    goal_tags_preference, is_local_only, resolve_goal_tags, stamp_goal_tags,
     user_assignable_goal_tags,
 )
 
@@ -300,17 +299,6 @@ class TestHintAndStamp:
         assert stamp_goal_tags(None, ['reel_studio']) == []
         assert stamp_goal_tags(['marketing'], ['reel_studio']) == []
 
-    def test_a_hint_is_held_across_turns_until_dropped(self):
-        key = 'u-hint_9001'
-        drop_goal_tag_hint(key)
-        assert hold_goal_tag_hint(key, ['reel_studio', 'marketing']) == ['reel_studio']
-        assert hold_goal_tag_hint(key, None) == ['reel_studio'], (
-            'a later turn without the hint must not lose it')
-        assert held_goal_tag_hint(key) == ['reel_studio']
-        assert held_goal_tag_hint('u-hint_other') == []
-        drop_goal_tag_hint(key)
-        assert held_goal_tag_hint(key) == []
-
     @pytest.mark.parametrize('tags,want', [
         (['reel_studio'], True), (('news', 'reel_studio'), True),
         ({'reel_studio'}, True), (['news'], False), ([], False),
@@ -323,7 +311,8 @@ class TestHintAndStamp:
 class TestAnAgentKeepsToThisNode:
     """agent_is_local_only: the per-agent half of /chat's one local-only rule
     (amendment A9 e) -- the agent's saved record's goal_tags and the creation
-    hint held for it, before the record exists."""
+    hint the turn itself carries, which is all there is before the record
+    exists.  Nothing is held between turns (amendment A19)."""
 
     @pytest.fixture
     def record(self, tmp_path, monkeypatch):
@@ -340,30 +329,45 @@ class TestAnAgentKeepsToThisNode:
 
     def test_her_saved_reel_record(self, record):
         pid = record(goal_tags=['news', 'reel_studio'])
-        assert marketing_tools.agent_is_local_only('u1', pid) is True
-        assert marketing_tools.agent_is_local_only('u1', int(pid)) is True
+        assert marketing_tools.agent_is_local_only(pid) is True
+        assert marketing_tools.agent_is_local_only(int(pid)) is True
+        assert marketing_tools.agent_is_local_only(pid, []) is True, (
+            'a turn without a hint does not undo her saved record')
 
     def test_her_creation_hint_before_the_record_exists(self):
-        drop_goal_tag_hint('u1_5102')
-        hold_goal_tag_hint('u1_5102', ['reel_studio'])
-        try:
-            assert marketing_tools.agent_is_local_only('u1', '5102') is True
-            assert marketing_tools.agent_is_local_only('u2', '5102') is False, (
-                "another person's hint keeps nobody else's agent here")
-        finally:
-            drop_goal_tag_hint('u1_5102')
+        assert marketing_tools.agent_is_local_only('5102', ['reel_studio']) is True
+
+    def test_a_hint_counts_only_on_the_turn_that_carries_it(self):
+        """Amendment A19: no hint is held for a later turn.  The 2 h hold
+        this replaced kept a hint-less turn local-only for a while, then not,
+        and never after a restart."""
+        assert marketing_tools.agent_is_local_only('5103', ['reel_studio']) is True
+        assert marketing_tools.agent_is_local_only('5103') is False
+        assert marketing_tools.agent_is_local_only('5103', None) is False
+
+    @pytest.mark.parametrize('hint', [['marketing'], 'reel_studio', {'reel_studio': 1},
+                                      [None, 3], ()])
+    def test_only_an_assignable_hint_counts(self, hint):
+        """The hint is read by the one rule a client's goal_tags are read by
+        (user_assignable_goal_tags): a list of names, assignable ones only."""
+        assert marketing_tools.agent_is_local_only('5104', hint) is False
 
     @pytest.mark.parametrize('fields', [{}, {'goal_tags': ['news']},
                                         {'goal_tags': 'reel_studio'},
                                         {'goal_tags': None}])
     def test_any_other_agent(self, record, fields):
-        assert marketing_tools.agent_is_local_only('u1', record(**fields)) is False
+        assert marketing_tools.agent_is_local_only(record(**fields)) is False
 
     @pytest.mark.parametrize('pid', [None, '', '../x', '42424242424', {'id': 1}])
     def test_no_agent_or_no_readable_record(self, record, pid):
         record(goal_tags=['reel_studio'])
-        assert marketing_tools.agent_is_local_only('u1', pid) is False
+        assert marketing_tools.agent_is_local_only(pid) is False
+
+    @pytest.mark.parametrize('pid', [None, ''])
+    def test_a_hint_with_no_agent_keeps_nothing(self, pid):
+        assert marketing_tools.agent_is_local_only(pid, ['reel_studio']) is False
 
     def test_on_central_her_record_keeps_nothing(self, record, central):
         pid = record(goal_tags=['reel_studio'])
-        assert marketing_tools.agent_is_local_only('u1', pid) is False
+        assert marketing_tools.agent_is_local_only(pid) is False
+        assert marketing_tools.agent_is_local_only(pid, ['reel_studio']) is False
