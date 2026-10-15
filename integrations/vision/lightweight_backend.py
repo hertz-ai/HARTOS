@@ -1007,9 +1007,9 @@ class Qwen08BBackend(VisionBackend):
 
     @staticmethod
     def _launch_geometry(model: str) -> tuple:
-        """(--ctx-size, --n-gpu-layers) for the standalone launch of the
-        weights at ``model``, decided as the other start of this server
-        decides them.
+        """(--ctx-size, --n-gpu-layers or None) for the standalone launch of
+        the weights at ``model``, decided as the other start of this server
+        decides them.  None: pass no --n-gpu-layers.
 
         The context is the one Nunba's start_caption_server gives the 0.8B
         (llama_config._derive_ctx_size, the 0.8B preset being a Qwen3.5
@@ -1022,23 +1022,40 @@ class Qwen08BBackend(VisionBackend):
         2026-10-14, A13 proof D2), and a page read (PAGE_LONG_SIDE,
         PAGE_MAX_TOKENS) never fitted either.
 
-        The GPU layers are llamacpp_manager.get_optimal_params', HARTOS's one
-        placement of a GGUF on this box: every layer (-1) where
-        model_catalog.gguf_fits_gpu says it fits, a partial offload sized
-        from the file's blocks where it does not, none without a usable GPU.
-        It reads the sample just forced.  The launch passed 99 whatever the
-        card held.
+        On a CUDA card (the sample's cuda_available) the GPU layers are
+        llamacpp_manager.get_optimal_params', HARTOS's one placement of a
+        GGUF on a CUDA card: every layer (-1) where model_catalog.gguf_fits_gpu
+        says it fits, a partial offload sized from the file's blocks where it
+        does not.  It reads the sample just forced.  The launch passed 99
+        whatever the card held.
+
+        On any other sample -- Apple Metal, AMD ROCm, an NVIDIA card whose
+        driver cannot run CUDA 12, no GPU, a probe that failed -- None:
+        llama-server places the layers itself (--n-gpu-layers defaults to
+        'auto', fitted to the device's memory by --fit, on by default;
+        llama-server --help, build 7909 on this box), as Nunba's start of this
+        server leaves them on a GPU that is not CUDA
+        (llama_config._do_start_caption_server passes -ngl only when
+        installer.gpu_available is 'cuda').  get_optimal_params is not asked
+        there: it reads only cuda_available (llamacpp_manager._gguf_footprint)
+        and calls every other box CPU-only, so a Mac's 0.8B, which
+        vram_manager.suggest_offload_mode places on its GPU, went to the CPU
+        at --n-gpu-layers 0 (review of a44883fe2).
         """
         from core.llama_geometry import ctx_for_role, derive_ctx_size
         from integrations.service_tools.llamacpp_manager import get_llamacpp_manager
         from integrations.service_tools.vram_manager import vram_manager
+        sample = {}
         try:
-            free_gib = vram_manager.refresh_gpu_info(force=True).get('free_gb', 0)
-            ctx_size = derive_ctx_size(free_gib, os.path.getsize(model) / (1024 ** 3))
+            sample = vram_manager.refresh_gpu_info(force=True) or {}
+            ctx_size = derive_ctx_size(sample.get('free_gb', 0),
+                                       os.path.getsize(model) / (1024 ** 3))
         except Exception as e:
             ctx_size = ctx_for_role('main')
             logger.info(f"Qwen3.5-0.8B: the box could not be measured ({e}); "
                         f"context {ctx_size}")
+        if not sample.get('cuda_available'):
+            return ctx_size, None
         return ctx_size, get_llamacpp_manager().get_optimal_params(model)['n_gpu_layers']
 
     def ensure_running(self, on_wait: Optional[Callable[[], None]] = None) -> bool:
@@ -1185,9 +1202,10 @@ class Qwen08BBackend(VisionBackend):
                 ctx_size, gpu_layers = self._launch_geometry(model)
                 cmd = [server, '--model', model, '--mmproj', mmproj,
                        '--port', str(self._port),
-                       '--ctx-size', str(ctx_size),
-                       '--n-gpu-layers', str(gpu_layers),
-                       '--threads', '4', '--flash-attn', 'on']
+                       '--ctx-size', str(ctx_size)]
+                if gpu_layers is not None:          # else llama-server's own
+                    cmd += ['--n-gpu-layers', str(gpu_layers)]
+                cmd += ['--threads', '4', '--flash-attn', 'on']
                 log_path = os.path.join(os.environ.get('TEMP', '/tmp'), f'llama_{self._port}.log')
                 # APPEND mode — same root-cause class as the caption-server
                 # launch above.  Preserves prior run's log across restarts.
@@ -1211,7 +1229,8 @@ class Qwen08BBackend(VisionBackend):
                 # a camera frame was described long ago.
                 self._last_describe_time = time.time()
                 logger.info(f"Qwen3.5-0.8B launching PID={self._server_proc.pid} "
-                            f"port={self._port} ctx={ctx_size} gpu_layers={gpu_layers}")
+                            f"port={self._port} ctx={ctx_size} gpu_layers="
+                            f"{'llama-server default' if gpu_layers is None else gpu_layers}")
             except Exception as e:
                 logger.error(f"Qwen3.5-0.8B standalone start failed: {e}")
                 return False

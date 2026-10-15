@@ -37,10 +37,15 @@ it does (A13 proof D2, 2026-10-14: it ran at --ctx-size 512, and a reel's
 550-token keyframe rating got HTTP 400 on every frame; it always passed
 --n-gpu-layers 99).  Its context is the one Nunba's start_caption_server gives
 the 0.8B (llama_config._derive_ctx_size: core.llama_geometry.derive_ctx_size
-over a forced VRAM sample and the weights measured from the file), and its GPU
-layers are llamacpp_manager.get_optimal_params', HARTOS's one placement of a
-GGUF on the box: all of them when it fits, part of them on a card short of
-room, none without a usable GPU.
+over a forced VRAM sample and the weights measured from the file).  On a CUDA
+card its GPU layers are llamacpp_manager.get_optimal_params', HARTOS's one
+placement of a GGUF on the box: all of them when it fits, part of them on a
+card short of room.  On any other reading -- Apple Metal, AMD ROCm, a card
+whose driver cannot run CUDA 12, no GPU, a reading that failed -- the launch
+passes no --n-gpu-layers and llama-server places the layers itself (its
+default, 'auto', fitted to the device's memory), as Nunba's start of the same
+server does on a GPU that is not CUDA (review of a44883fe2: get_optimal_params
+reads only cuda_available, and sent a Metal box's 0.8B to the CPU).
 
 Real code throughout: the real backend, the real platform EventBus and
 registry, the real model catalog and completeness rule, the real context
@@ -87,6 +92,17 @@ RATING_TOKENS = 550 + moments.MAX_TOKENS
 ROOMY_GPU = {'name': 'NVIDIA GeForce RTX 3070', 'total_gb': 8.0, 'free_gb': 7.5,
              'cuda_available': True}
 NO_GPU = {'name': None, 'total_gb': 0.0, 'free_gb': 0.0, 'cuda_available': False}
+#: An Apple Silicon Mac: unified memory, its free RAM read as the GPU's
+#: (vram_manager.detect_gpu's Metal branch).
+METAL_GPU = {'name': 'Apple Metal (Apple Silicon)', 'total_gb': 16.0, 'free_gb': 9.0,
+             'cuda_available': False, 'metal_available': True}
+#: An AMD card read by rocm-smi (vram_manager.detect_gpu's ROCm branch).
+ROCM_GPU = {'name': 'AMD GPU (ROCm)', 'total_gb': 16.0, 'free_gb': 12.0,
+            'cuda_available': False, 'rocm_available': True}
+#: An NVIDIA card whose driver is too old for the CUDA 12 runtime.
+OLD_DRIVER_GPU = {'name': 'NVIDIA GeForce 940MX', 'total_gb': 2.0, 'free_gb': 1.9,
+                  'cuda_available': False, 'driver_version': '391.35',
+                  'driver_cuda_ok': False}
 STANDALONE_BINARY = ('integrations.service_tools.model_lifecycle.'
                      'ModelLifecycleManager._find_llama_server_binary')
 #: The bound the start had before: the 5 x 1 s event wait, then 30 x 1 s.
@@ -555,30 +571,67 @@ def test_the_standalone_launch_sizes_its_context_as_nunbas_caption_start_does(bo
 
 def test_a_gpu_probe_that_fails_launches_at_the_unmeasured_default(box):
     """The box cannot be measured (the probe raises): the context is the one
-    Nunba's _derive_ctx_size falls back to, ctx_for_role('main') -- and the
-    0.8B goes on the CPU, which is what the placement rule makes of a GPU it
-    could not read.  The launch still happens."""
+    Nunba's _derive_ctx_size falls back to, ctx_for_role('main'), and the
+    layers are llama-server's own placement (no --n-gpu-layers), not 0.
+    a44883fe2 pinned 0 here: an nvidia-smi that timed out once under load
+    put the 0.8B on the CPU for the life of the server, where the parent's 99
+    had run it on the card (review of a44883fe2).  The launch still happens."""
     _files_in(box.models)
     box.gpu = RuntimeError('nvidia-smi did not answer')
     ok, _ = _ensure(box)
     assert ok is True and len(box.port.spawned) == 1
     cmd = box.port.spawned[0]
     assert _arg(cmd, '--ctx-size') == str(ctx_for_role('main'))
-    assert _arg(cmd, '--n-gpu-layers') == '0'
+    assert '--n-gpu-layers' not in cmd and '-ngl' not in cmd, cmd
+
+
+@pytest.mark.parametrize('gpu', [METAL_GPU, ROCM_GPU, OLD_DRIVER_GPU, NO_GPU],
+                         ids=['apple_metal', 'amd_rocm', 'nvidia_driver_too_old', 'no_gpu'])
+def test_a_gpu_that_is_not_cuda_leaves_the_layers_to_llama_server(box, gpu):
+    """Review of a44883fe2, measured on the real 0.8B weights: a Metal reading
+    launched the 0.8B with --n-gpu-layers 0 although
+    vram_manager.suggest_offload_mode calls that box 'gpu', and so did a
+    ROCm reading.  get_optimal_params decides "GPU or not" from
+    cuda_available alone, so a Mac's captions and a reel's keyframe ratings
+    moved from the GPU (the parent's 99) to the CPU, 9-10 s a frame (A13
+    proof) against a 90 s budget.
+
+    Nunba's start of this server passes -ngl only on CUDA
+    (llama_config._do_start_caption_server) and leaves every other box to
+    llama-server, whose --n-gpu-layers defaults to 'auto', fitted to the
+    device's memory (--fit on; llama-server --help).  So does this launch:
+    no --n-gpu-layers, and HARTOS's CUDA placement is not asked.  The context
+    is still the one derived from the reading, as Nunba's."""
+    from integrations.service_tools import llamacpp_manager as lcm
+    _files_in(box.models)
+    _measured_as(box, REAL_WEIGHTS)
+    box.gpu = dict(gpu)
+    asked = []
+    real = lcm.LlamaCppManager.get_optimal_params
+
+    def optimal(self, model_path):
+        asked.append(model_path)
+        return real(self, model_path)
+    box.mp.setattr(lcm.LlamaCppManager, 'get_optimal_params', optimal)
+    ok, _ = _ensure(box)
+    assert ok is True and len(box.port.spawned) == 1
+    cmd = box.port.spawned[0]
+    assert '--n-gpu-layers' not in cmd and '-ngl' not in cmd, cmd
+    assert asked == [], 'the CUDA-only placement was asked to place a box it cannot read'
+    assert _arg(cmd, '--ctx-size') == str(derive_ctx_size(gpu['free_gb'], REAL_WEIGHTS / GIB))
 
 
 @pytest.mark.parametrize('gpu, layers', [
     (dict(ROOMY_GPU), '-1'),
     (dict(ROOMY_GPU, free_gb=0.2),
      str(mc.gguf_partial_offload_layers(0.2, REAL_WEIGHTS / GIB, None))),
-    (dict(NO_GPU), '0'),
-], ids=['fits_all_layers', 'low_vram_partial', 'no_gpu_cpu'])
+], ids=['fits_all_layers', 'low_vram_partial'])
 def test_the_standalone_launch_places_the_0_8b_by_the_one_placement_rule(box, gpu, layers):
-    """It passed --n-gpu-layers 99 whatever the card held.  Now the layers
-    are llamacpp_manager.get_optimal_params' (model_catalog.gguf_fits_gpu,
-    then a partial offload sized from the file): every layer (-1) on a card
-    with room, part of them on a card short of room (0.2 GiB free for a
-    0.52 GiB file), none on a box without a usable GPU."""
+    """It passed --n-gpu-layers 99 whatever the card held.  On a CUDA card
+    the layers are llamacpp_manager.get_optimal_params' now
+    (model_catalog.gguf_fits_gpu, then a partial offload sized from the
+    file): every layer (-1) on a card with room, part of them on a card short
+    of room (0.2 GiB free for a 0.52 GiB file)."""
     _files_in(box.models)
     _measured_as(box, REAL_WEIGHTS)
     box.gpu = gpu
