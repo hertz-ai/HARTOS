@@ -392,19 +392,17 @@ def test_a_long_plain_card_is_sized_to_its_box(lines):
 
 
 @requires_ffmpeg
-@pytest.mark.parametrize('lines, within_zone_width', [(LONG_CARD, True), (TAMIL_CARD, False)],
-                         ids=['latin', 'tamil'])
-def test_the_plain_end_card_is_drawn_inside_its_box(tmp_path, lines, within_zone_width):
+@pytest.mark.parametrize('lines', [LONG_CARD, TAMIL_CARD], ids=['latin', 'tamil'])
+def test_the_plain_end_card_is_drawn_inside_its_box(tmp_path, lines):
     """The user-visible check: the card rendered by pass 2 (real drawtext, the
     font fonts.resolve_font picks) over a white picture, its dark box measured
-    in the frame: never above or below the card's box (her face is beside it).
+    in the frame: never above or below the card's box (her face is beside it),
+    and never past the safe zone's right edge.
 
-    Its width is checked for the Latin card only: render.text_width, which
-    wraps every reel text, estimates Tamil narrower than Nirmala draws it
-    (measured 2026-10-15: 1.04 em per Tamil letter against its 0.9), so a
-    long Tamil card can run past the safe zone's right edge.  That estimate is
-    render's (it also wraps the hook text) and is left to its owner; the lines
-    drawn are the lines estimated, so the height holds either way."""
+    The width holds for the Tamil card too since render.text_width, which
+    wraps every reel text, measures each character with the drawn font's own
+    advance width (hartos-87 #162: the old 0.9 em guess per Tamil letter was
+    under Nirmala's 1.04, so a long Tamil card ran past the right edge)."""
     import numpy as np
     from core import media_bin
     from integrations.reel_studio.contracts import ClipCapture
@@ -445,5 +443,4 @@ def test_the_plain_end_card_is_drawn_inside_its_box(tmp_path, lines, within_zone
     slack = 3       # encoder edge blur
     assert box[1] - slack <= rows.min() and rows.max() <= box[3] + slack, \
         (rows.min(), rows.max(), card['size_px'])
-    if within_zone_width:
-        assert cols.max() <= C.SAFE_ZONE['x_max'] + slack, (cols.min(), cols.max())
+    assert cols.max() <= C.SAFE_ZONE['x_max'] + slack, (cols.min(), cols.max())

@@ -46,7 +46,6 @@ import math
 import os
 import re
 import time
-import unicodedata
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 from core import media_bin
@@ -86,12 +85,16 @@ TEXT_MAX_LINES = 4
 #: Tamil: 1.18-1.26 em per line, sizes 28-56 px, 2-4 lines, the boxed block
 #: drawn through _drawtext on a white frame.  Rounded up, so an over-estimate.
 TEXT_LINE_EM = 1.3
-#: Estimated advance widths in ems (see text_width): a Latin letter or digit
-#: of a bold sans, an Indic letter, a spacing vowel sign, a space.
-TEXT_EM_LATIN = 0.62
-TEXT_EM_INDIC = 0.9
-TEXT_EM_MARK = 0.45
-TEXT_EM_SPACE = 0.3
+#: A line's width is its characters' advance widths in the drawn font
+#: (fonts.advance_em), plus this many ems once per line: the last glyph's ink
+#: past its advance and the box's whole-pixel edges.  Measured 2026-10-15 at
+#: most 0.065 em (sizes 24-72 px; Segoe UI Bold, Arial Bold, DejaVu Sans
+#: Bold, Nirmala UI with Tamil), rounded up.
+TEXT_OVERHANG_EM = 0.1
+#: A character's width, in ems, when no font file can be read for the text
+#: (no font here draws it, so pass 2 leaves it out, or its file is not one
+#: fonts.advance_em reads): a guess, kept so callers can still size the text.
+TEXT_EM_NO_FONT = 1.0
 
 NOTE_TEXT_NO_FONT = 'text_skipped_no_font'
 NOTE_EMOJI_DROPPED = 'emoji_dropped'
@@ -284,41 +287,42 @@ def plan_final_args(edl: Mapping, concat_list: str, out_path: str, *, encoder: s
 
 # ── text layout ───────────────────────────────────────────────────────────
 
-def _em_width(ch: str) -> float:
-    """A generous advance width of ``ch`` in ems (bold sans; Indic letters wider)."""
-    category = unicodedata.category(ch)
-    if category == 'Mn' or ch in '‌‍':
+def _line_width(line: str, size_px: float, fontfile: Optional[str]) -> float:
+    """The one width rule (see text_width); ``fontfile`` None: no font."""
+    if not line:
         return 0.0
-    if category == 'Mc':
-        return TEXT_EM_MARK
-    if ch.isspace():
-        return TEXT_EM_SPACE
-    if fonts.needs_indic_font(ch):
-        return TEXT_EM_INDIC
-    return TEXT_EM_LATIN
+    ems = fonts.advance_em(line, fontfile)
+    if ems is None:
+        ems = TEXT_EM_NO_FONT * len(line)
+    return size_px * (ems + TEXT_OVERHANG_EM)
 
 
-def text_width(text: str, size_px: float) -> float:
-    """Estimated width of one line of ``text`` at ``size_px`` (an over-estimate).
+def text_width(text: str, size_px: float, fontfile: Optional[str] = None) -> float:
+    """Width of one line of ``text`` drawn at ``size_px`` with ``fontfile``
+    (default: the font fonts.resolve_font picks for it, as pass 2 does), a
+    little over what drawtext draws: the font's own advance widths
+    (fonts.advance_em) plus TEXT_OVERHANG_EM.  Without a readable font each
+    character counts TEXT_EM_NO_FONT."""
+    return _line_width(text, size_px, fonts.resolve_font(text) if fontfile is None else fontfile)
 
-    Widths are estimated, not measured: Pillow's FreeType text path (the
-    pinned 9.5.0) crashed the interpreter with a segmentation fault on
-    Nirmala.ttc under Python 3.12, so no font is opened in-process.
-    """
-    return size_px * sum(_em_width(ch) for ch in text)
 
-
-def wrap_text(text: str, size_px: int, max_width_px: float) -> List[str]:
-    """``text`` broken at spaces into lines no wider than ``max_width_px`` (estimated).
+def wrap_text(text: str, size_px: int, max_width_px: float,
+              fontfile: Optional[str] = None) -> List[str]:
+    """``text`` broken at spaces into lines no wider than ``max_width_px``,
+    each measured (text_width) with ``fontfile``: by default the font
+    fonts.resolve_font picks for the whole text, which pass 2 draws every
+    line of it with.
 
     A word wider than the line stays whole; past TEXT_MAX_LINES the rest
     runs on in the last line rather than being cut.
     """
+    if fontfile is None:
+        fontfile = fonts.resolve_font(text)
     lines: List[str] = []
     current = ''
     for word in text.split():
         candidate = word if not current else current + ' ' + word
-        if current and text_width(candidate, size_px) > max_width_px:
+        if current and _line_width(candidate, size_px, fontfile) > max_width_px:
             lines.append(current)
             current = word
         else:
@@ -330,21 +334,25 @@ def wrap_text(text: str, size_px: int, max_width_px: float) -> List[str]:
     return lines
 
 
-def text_block_size(text: str, size_px: int, max_width_px: float) -> Tuple[List[str], float, float]:
+def text_block_size(text: str, size_px: int, max_width_px: float,
+                    fontfile: Optional[str] = None) -> Tuple[List[str], float, float]:
     """``text`` as pass 2 draws it boxed at ``size_px`` in a column
-    ``max_width_px`` wide (the safe zone's width, for a reel): its lines
-    (wrap_text inside the box's padding, as _write_texts wraps), and the
-    estimated width and height of the drawn block, padding included.
+    ``max_width_px`` wide (the safe zone's width, for a reel) with
+    ``fontfile`` (default: the font fonts.resolve_font picks for it): its
+    lines (wrap_text inside the box's padding, as _write_texts wraps), and
+    the width and height of the drawn block, padding included.
 
-    Estimates, over rather than under (text_width; TEXT_LINE_EM per line,
+    Over rather than under (text_width; TEXT_LINE_EM per line,
     TEXT_LINE_SPACING between lines).  A width over ``max_width_px`` means a
     word, or the run-on last line past TEXT_MAX_LINES, does not fit."""
+    if fontfile is None:
+        fontfile = fonts.resolve_font(text)
     pad = _text_pad(size_px)
-    lines = wrap_text(text, size_px, max_width_px - 2 * pad)
+    lines = wrap_text(text, size_px, max_width_px - 2 * pad, fontfile)
     if not lines:
         return [], 0.0, 0.0
     n = len(lines)
-    width = max(text_width(line, size_px) for line in lines) + 2 * pad
+    width = max(_line_width(line, size_px, fontfile) for line in lines) + 2 * pad
     height = size_px * (TEXT_LINE_EM * n + TEXT_LINE_SPACING * (n - 1)) + 2 * pad
     return lines, width, height
 
@@ -369,7 +377,7 @@ def _write_texts(edl: Mapping, workdir: str, canvas: Mapping, notes: List[str],
             continue
         size = max(8, int(round(ov['size_px'] * f)))
         pad = _text_pad(ov['size_px'], f)
-        lines = wrap_text(text, size, zone['x_max'] - zone['x_min'] - 2 * pad)
+        lines = wrap_text(text, size, zone['x_max'] - zone['x_min'] - 2 * pad, fontfile)
         path = os.path.join(workdir, 'reel_text_%d.txt' % i)
         made.append(path)
         with open(path, 'w', encoding='utf-8', newline='\n') as fh:
@@ -503,8 +511,8 @@ def render_reel(edl: Mapping, out_path: str, *, workdir: str, encoder: str = 'au
 
 __all__ = ['FPS', 'ENCODERS', 'RENDER_TIMEOUT_S', 'SEGMENT_TIMEOUT_BASE_S',
            'SEGMENT_TIMEOUT_PER_S', 'PASS1_ENCODE', 'X264_FINAL', 'NVENC_FINAL', 'RATE_CAP',
-           'BT709', 'TEXT_MAX_LINES', 'TEXT_LINE_EM', 'TEXT_EM_LATIN', 'TEXT_EM_INDIC',
-           'TEXT_EM_MARK', 'TEXT_EM_SPACE', 'NOTE_TEXT_NO_FONT', 'NOTE_EMOJI_DROPPED',
+           'BT709', 'TEXT_MAX_LINES', 'TEXT_LINE_EM', 'TEXT_OVERHANG_EM', 'TEXT_EM_NO_FONT',
+           'NOTE_TEXT_NO_FONT', 'NOTE_EMOJI_DROPPED',
            'NOTE_NVENC_FAILED', 'NOTE_HDR_UNTONED', 'escape_filter_path', 'segment_frames',
            'geometry_filter', 'plan_segment_args', 'plan_final_args', 'text_width', 'wrap_text',
            'text_block_size', 'render_reel']

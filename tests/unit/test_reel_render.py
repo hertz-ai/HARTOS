@@ -16,6 +16,7 @@ short; the production path always renders contracts.CANVAS.
 """
 import os
 import re
+import struct
 import sys
 
 import numpy as np
@@ -228,6 +229,72 @@ def test_a_word_wider_than_the_line_stays_whole_and_lines_are_capped():
     assert len(lines) == R.TEXT_MAX_LINES and ' '.join(lines).split() == ['word'] * 40
 
 
+# hartos-87 #162: the widths were guesses (0.62 em a Latin letter or digit,
+# 0.9 an Indic letter, 0.45 a spacing vowel sign), while drawtext draws
+# Nirmala's Tamil at about 1.04 em a letter and Segoe UI Bold's capitals at
+# 0.66 (W 1.01), so a long Tamil or all-caps hook ran past the safe zone's
+# right edge.  Each character is now as wide as the drawn font says.
+
+CAPS_HOOK = 'WOW MOMENTS WORTH WATCHING FROM DAWN TO DUSK'
+TAMIL_LONG = 'முழு மாற்றம் இருபது வினாடிகளில் ஆரம்பம் முதல் இறுதி வரை'
+
+
+def test_each_latin_letter_is_as_wide_as_the_font_draws_it():
+    if fonts.resolve_font('W') is None:
+        pytest.skip('no Latin font found on this machine')
+    assert R.text_width('W' * 10, 72) > 2 * R.text_width('I' * 10, 72)
+    assert R.text_width(CAPS_HOOK, 72) > R.text_width(CAPS_HOOK.lower(), 72)
+
+
+@pytest.mark.skipif(sys.platform != 'win32',
+                    reason='Nirmala ships with Windows only; no Indic font is bundled yet')
+def test_each_tamil_letter_is_as_wide_as_nirmala_draws_it():
+    if fonts.resolve_font('ண') is None:
+        pytest.skip('Nirmala is not installed on this Windows machine')
+    assert R.text_width('ணணணண', 72) > 1.5 * R.text_width('ரரரர', 72)
+    # The vowel sign u has no advance of its own in the font: கு is drawn as
+    # wide as க (the guess gave every spacing vowel sign 0.45 em).
+    assert R.text_width('கு', 72) == pytest.approx(R.text_width('க', 72))
+
+
+@pytest.fixture(scope='module')
+def white_canvas_clip(tmp_path_factory):
+    if not media_bin.get_ffmpeg():
+        pytest.skip('no ffmpeg')
+    d = tmp_path_factory.mktemp('white_canvas')
+    return make_clip(d, 'white.mp4', size=(C.CANVAS['w'], C.CANVAS['h']), source='color',
+                     color='white', duration_s=1.0)
+
+
+@requires_ffmpeg
+@pytest.mark.parametrize('text', [CAPS_HOOK, TAMIL_LONG], ids=['latin_caps', 'tamil'])
+def test_a_long_hook_is_drawn_inside_the_safe_zone(white_canvas_clip, tmp_path, text):
+    """The user-visible check: the hook as pass 2 draws it (real drawtext,
+    the font fonts.resolve_font picks, its production size and canvas) over
+    a white picture.  Its box is the only dark thing in the frame (the
+    letters inside it are white), measured: inside contracts.SAFE_ZONE, and
+    the width text_block_size estimated is the drawn width or a little over."""
+    if fonts.resolve_font(text) is None:
+        pytest.skip('no font here draws this text')
+    seg = _seg(XL, 0.0, 1.0, 0.0, 1.0, stage='final_look', role='reveal')
+    edl = _edl({XL: _entry(white_canvas_clip, 0)}, [seg], overlays=[_text(text, 0.0, 1.0)])
+    out = str(tmp_path / 'hook.mp4')
+    R.render_reel(edl, out, workdir=str(tmp_path / 'work'), encoder='libx264', timeout_s=300)
+    frame = _frame_at(out, 0.5, C.CANVAS['w'], C.CANVAS['h']).max(axis=2)
+    rows = np.where((frame < 200).any(axis=1))[0]
+    cols = np.where((frame < 200).any(axis=0))[0]
+    assert len(cols), 'the hook was drawn'
+    zone, slack = C.SAFE_ZONE, 3        # encoder edge blur
+    assert zone['x_min'] - slack <= cols.min() and cols.max() <= zone['x_max'] + slack, \
+        (cols.min(), cols.max())
+    assert zone['y_min'] - slack <= rows.min() and rows.max() <= zone['y_max'] + slack, \
+        (rows.min(), rows.max())
+    lines, estimated, _height = R.text_block_size(text, 72, zone['x_max'] - zone['x_min'])
+    drawn = int(cols.max() - cols.min() + 1)
+    assert len(lines) > 1
+    assert drawn - slack <= estimated <= drawn * 1.08, (drawn, estimated)
+
+
 # ── fonts ─────────────────────────────────────────────────────────────────
 
 def test_latin_text_gets_an_existing_font_file():
@@ -250,6 +317,112 @@ def test_indic_text_on_windows_uses_nirmala(text):
 @pytest.mark.parametrize('platform', ['linux', 'darwin'])
 def test_indic_text_has_no_font_off_windows(platform):
     assert fonts.resolve_font(TAMIL_HOOK, platform=platform) is None
+
+
+# ── fonts: advance widths read from the font file ─────────────────────────
+#
+# A minimal TrueType face built here (head, hhea, hmtx and cmap: the tables
+# fonts.advance_em reads), so the reader is checked on every OS, whatever
+# fonts the machine has.
+
+def _format4(segments):
+    """A cmap format 4 subtable.  ``segments``: (first, last, glyphs), glyphs
+    an int (idDelta) or a list of glyph ids (idRangeOffset)."""
+    segs = list(segments) + [(0xFFFF, 0xFFFF, 1)]
+    n = len(segs)
+    ends, starts, deltas, ranges, glyph_ids = [], [], [], [], []
+    for i, (first, last, glyphs) in enumerate(segs):
+        starts.append(first)
+        ends.append(last)
+        if isinstance(glyphs, int):
+            deltas.append(glyphs)
+            ranges.append(0)
+        else:
+            deltas.append(0)
+            ranges.append(2 * (n - i) + 2 * len(glyph_ids))
+            glyph_ids.extend(glyphs)
+    body = (struct.pack('>%dH' % n, *ends) + b'\0\0' + struct.pack('>%dH' % n, *starts)
+            + struct.pack('>%dh' % n, *deltas) + struct.pack('>%dH' % n, *ranges)
+            + struct.pack('>%dH' % len(glyph_ids), *glyph_ids))
+    return struct.pack('>7H', 4, 14 + len(body), 0, 2 * n, 0, 0, 0) + body
+
+
+def _format12(groups):
+    body = b''.join(struct.pack('>III', *g) for g in groups)
+    return struct.pack('>HHIII', 12, 0, 16 + len(body), 0, len(groups)) + body
+
+
+def _cmap(*subtables):
+    offset = 4 + 8 * len(subtables)
+    records, bodies = b'', b''
+    for platform, encoding, body in subtables:
+        records += struct.pack('>HHI', platform, encoding, offset + len(bodies))
+        bodies += body
+    return struct.pack('>HH', 0, len(subtables)) + records + bodies
+
+
+def _face(upm, advances, cmap, base=0):
+    """One sfnt face; its table offsets count from ``base`` (its place in a collection)."""
+    tables = {b'cmap': cmap,
+              b'head': struct.pack('>HHIIIHH', 1, 0, 0x10000, 0, 0x5F0F3CF5, 0, upm) + bytes(34),
+              b'hhea': bytes(34) + struct.pack('>H', len(advances)),
+              b'hmtx': b''.join(struct.pack('>Hh', a, 0) for a in advances)}
+    offset = base + 12 + 16 * len(tables)
+    directory, data = b'', b''
+    for tag in sorted(tables):
+        directory += struct.pack('>4sIII', tag, 0, offset + len(data), len(tables[tag]))
+        data += tables[tag] + bytes(-len(tables[tag]) % 4)
+    return struct.pack('>IHHHH', 0x00010000, len(tables), 0, 0, 0) + directory + data
+
+
+def _collection(*faces):
+    out, offsets = b'', []
+    for face in faces:
+        offsets.append(12 + 4 * len(faces) + len(out))
+        out += _face(*face, base=offsets[-1])
+    return (b'ttcf' + struct.pack('>HHI', 1, 0, len(faces))
+            + struct.pack('>%dI' % len(faces), *offsets) + out)
+
+
+def test_each_character_is_its_glyphs_advance_in_the_font_file(tmp_path):
+    # 'A'-'B' by idDelta (glyphs 1, 2), 'a'-'b' by idRangeOffset (glyphs 3, 4);
+    # glyph 4 is past the long metrics, so it takes the last advance.
+    path = tmp_path / 'face.ttf'
+    path.write_bytes(_face(1000, [500, 600, 700, 800],
+                           _cmap((3, 1, _format4([(0x41, 0x42, -64), (0x61, 0x62, [3, 4])])))))
+    font = str(path)
+    assert fonts.advance_em('A', font) == pytest.approx(0.6)
+    assert fonts.advance_em('B', font) == pytest.approx(0.7)
+    assert fonts.advance_em('a', font) == pytest.approx(0.8)
+    assert fonts.advance_em('b', font) == pytest.approx(0.8)
+    # A character the font has no glyph for is drawn as .notdef (glyph 0).
+    assert fonts.advance_em('Z', font) == pytest.approx(0.5)
+    assert fonts.advance_em('AB a', font) == pytest.approx(0.6 + 0.7 + 0.5 + 0.8)
+    assert R.text_width('AB', 100, font) == pytest.approx(100 * (1.3 + R.TEXT_OVERHANG_EM))
+
+
+def test_a_collection_is_read_at_its_first_face_and_its_32_bit_cmap_wins(tmp_path):
+    """drawtext draws face 0 of a .ttc (Nirmala.ttc: Nirmala UI Regular);
+    FreeType takes a font's 32-bit Unicode cmap over its 16-bit one."""
+    cmap = _cmap((3, 1, _format4([(0x41, 0x41, -64)])),
+                 (3, 10, _format12([(0x41, 0x41, 2), (0x1F600, 0x1F600, 3)])))
+    path = tmp_path / 'pair.ttc'
+    path.write_bytes(_collection((1000, [500, 600, 700, 900], cmap),
+                                 (2000, [100, 100, 100, 100], cmap)))
+    assert fonts.advance_em('A', str(path)) == pytest.approx(0.7)
+    assert fonts.advance_em('\U0001F600', str(path)) == pytest.approx(0.9)
+
+
+def test_a_font_that_cannot_be_read_has_no_widths_and_the_text_is_guessed(tmp_path, monkeypatch):
+    junk = tmp_path / 'junk.ttf'
+    junk.write_bytes(b'not a font at all')
+    for font in (str(junk), str(tmp_path / 'missing.ttf'), None):
+        assert fonts.advance_em('abc', font) is None
+    assert R.text_width('abc', 100, str(junk)) == pytest.approx(
+        100 * (3 * R.TEXT_EM_NO_FONT + R.TEXT_OVERHANG_EM))
+    monkeypatch.setattr(R.fonts, 'resolve_font', lambda text, **kw: None)
+    assert R.text_width('abc', 100) == pytest.approx(100 * (3 * R.TEXT_EM_NO_FONT
+                                                             + R.TEXT_OVERHANG_EM))
 
 
 def test_emoji_are_dropped_from_overlay_text():
