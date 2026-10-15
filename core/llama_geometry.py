@@ -119,18 +119,6 @@ CTX_FALLBACK = 8192
 #: re-derived, so moving it is a deliberate act.
 CPU_ONLY_CTX = 2048
 
-#: Model classes that are sized by ROLE, not by headroom.
-#:
-#: ``caption`` is the 0.8B vision captioner in
-#: ``integrations/vision/lightweight_backend.py``.  512 is not a cramped main
-#: model — captioning sends one small image plus one sentence of prompt, and
-#: the whole point of that backend is that it costs almost nothing.  It is a
-#: legitimately separate model class, so it keeps a fixed small number; what it
-#: does NOT get is its own copy of that number at two call sites.
-ROLE_CTX: dict[str, int] = {
-    'caption': 512,
-}
-
 #: ``(available system RAM in GiB, ceiling)`` — most restrictive wins.
 #:
 #: This is a SEPARATE constraint from :data:`CTX_TIERS`, not a competing one:
@@ -229,18 +217,17 @@ def ctx_for_role(role, *, free_gib=None, model_gib=None, on_gpu=True,
                  fallback=None) -> int:
     """n_ctx for a named model role — the entry point every spawn site uses.
 
-    ``role`` is one of :data:`ROLE_CTX` (fixed by model class, e.g.
-    ``'caption'``) or anything else, which means "a main model, size it to the
-    box".  Routing even the fixed sizes through here is the point: the 512 the
-    captioner needs is a policy decision that belongs beside the tiers, not a
-    literal repeated at each ``subprocess.Popen``.
+    ``role`` names the server being sized (``'main'``); every role is sized to
+    the box.  There was one fixed role, ``'caption'`` (512, the 0.8B vision
+    captioner's standalone launch in ``integrations/vision/lightweight_backend
+    .py``).  It was retired on 2026-10-15, when that launch began sizing the
+    server as Nunba's start of the same server does: a fixed 512 could not
+    hold one reel keyframe rating (550 prompt tokens, HTTP 400 on every
+    frame, measured 2026-10-14).
 
     ``on_gpu=False`` selects :data:`CPU_ONLY_CTX`; the KV cache is then host
     RAM and there is no VRAM headroom to tier against.
     """
-    fixed = ROLE_CTX.get(role)
-    if fixed is not None:
-        return min(fixed, ctx_cap())
     if not on_gpu:
         return min(CPU_ONLY_CTX, ctx_cap())
     if free_gib is None or model_gib is None:

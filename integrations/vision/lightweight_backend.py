@@ -977,6 +977,42 @@ class Qwen08BBackend(VisionBackend):
         return (first(files.get('model'), usable=lambda p: gguf_complete(p, whole)),
                 first(files.get('mmproj')) or first('qwen08b', files.get('mmproj_source')))
 
+    @staticmethod
+    def _launch_geometry(model: str) -> tuple:
+        """(--ctx-size, --n-gpu-layers) for the standalone launch of the
+        weights at ``model``, decided as the other start of this server
+        decides them.
+
+        The context is the one Nunba's start_caption_server gives the 0.8B
+        (llama_config._derive_ctx_size, the 0.8B preset being a Qwen3.5
+        one): core.llama_geometry.derive_ctx_size over the free VRAM of a
+        FORCED sample (vram_manager.refresh_gpu_info(force=True), not the
+        memo) and the weights measured from the file, or ctx_for_role('main')
+        when the box cannot be measured.  The launch used a fixed 512
+        (ctx_for_role('caption')): one caption fits, but a reel's keyframe
+        rating is 550 prompt tokens and every frame got HTTP 400 (measured
+        2026-10-14, A13 proof D2), and a page read (PAGE_LONG_SIDE,
+        PAGE_MAX_TOKENS) never fitted either.
+
+        The GPU layers are llamacpp_manager.get_optimal_params', HARTOS's one
+        placement of a GGUF on this box: every layer (-1) where
+        model_catalog.gguf_fits_gpu says it fits, a partial offload sized
+        from the file's blocks where it does not, none without a usable GPU.
+        It reads the sample just forced.  The launch passed 99 whatever the
+        card held.
+        """
+        from core.llama_geometry import ctx_for_role, derive_ctx_size
+        from integrations.service_tools.llamacpp_manager import get_llamacpp_manager
+        from integrations.service_tools.vram_manager import vram_manager
+        try:
+            free_gib = vram_manager.refresh_gpu_info(force=True).get('free_gb', 0)
+            ctx_size = derive_ctx_size(free_gib, os.path.getsize(model) / (1024 ** 3))
+        except Exception as e:
+            ctx_size = ctx_for_role('main')
+            logger.info(f"Qwen3.5-0.8B: the box could not be measured ({e}); "
+                        f"context {ctx_size}")
+        return ctx_size, get_llamacpp_manager().get_optimal_params(model)['n_gpu_layers']
+
     def ensure_running(self, on_wait: Optional[Callable[[], None]] = None) -> bool:
         """Lazy-start: launch 0.8B server on first frame, not at boot.
 
@@ -992,7 +1028,8 @@ class Qwen08BBackend(VisionBackend):
         server, 5 s + 30 s at most, the bound its own launch has.  In
         standalone mode (neither; a stale lock is neither), HARTOS uses
         model_lifecycle to launch directly, with the files _model_files
-        finds through the model catalog.
+        finds through the model catalog, at the context size and GPU layers
+        _launch_geometry decides (as Nunba's start of this server does).
 
         ``on_wait`` is called once, after the server was found not serving
         and before the event is sent: not when it is up, not while a failed
@@ -1091,25 +1128,17 @@ class Qwen08BBackend(VisionBackend):
                     return False
 
                 import subprocess
-                # 512 is correct for this backend and is NOT a main-model size:
-                # a caption turn is one 512x288 JPEG plus one sentence of prompt,
-                # and the whole point of the 0.8B captioner is that it costs
-                # almost nothing.  It is a legitimately separate model class, so
-                # it keeps a fixed small window — what it must not keep is its own
-                # copy of that number.  core.llama_geometry.ROLE_CTX['caption'] is
-                # where the value lives, beside the tier table, so "the captioner
-                # runs at 512" is a policy statement one grep can answer rather
-                # than a literal repeated at each subprocess.Popen.
-                #
-                # This spawn also does NOT publish_geometry: it is a caption
-                # server on the vlm_caption port, not the main engine, and
-                # publishing 512 would tell HARTOS's wire trimmer that every
-                # agentic request must fit in 512 tokens.
-                from core.llama_geometry import ctx_for_role
+                # Sized and placed as the other start of this server sizes it
+                # (_launch_geometry).  This spawn does NOT publish_geometry:
+                # it is a caption server on the vlm_caption port, not the main
+                # engine, and publishing its window would tell HARTOS's wire
+                # trimmer what the MAIN server holds.
+                ctx_size, gpu_layers = self._launch_geometry(model)
                 cmd = [server, '--model', model, '--mmproj', mmproj,
                        '--port', str(self._port),
-                       '--ctx-size', str(ctx_for_role('caption')),
-                       '--n-gpu-layers', '99', '--threads', '4', '--flash-attn', 'on']
+                       '--ctx-size', str(ctx_size),
+                       '--n-gpu-layers', str(gpu_layers),
+                       '--threads', '4', '--flash-attn', 'on']
                 log_path = os.path.join(os.environ.get('TEMP', '/tmp'), f'llama_{self._port}.log')
                 # APPEND mode — same root-cause class as the caption-server
                 # launch above.  Preserves prior run's log across restarts.
@@ -1128,7 +1157,8 @@ class Qwen08BBackend(VisionBackend):
                     _kw['creationflags'] = subprocess.CREATE_NO_WINDOW
                 self._server_proc = subprocess.Popen(cmd, **_kw)
                 self._log_fh = log_fh
-                logger.info(f"Qwen3.5-0.8B launching PID={self._server_proc.pid} port={self._port}")
+                logger.info(f"Qwen3.5-0.8B launching PID={self._server_proc.pid} "
+                            f"port={self._port} ctx={ctx_size} gpu_layers={gpu_layers}")
             except Exception as e:
                 logger.error(f"Qwen3.5-0.8B standalone start failed: {e}")
                 return False

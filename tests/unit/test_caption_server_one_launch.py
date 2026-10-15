@@ -32,14 +32,27 @@ gguf_min_bytes of the registered size, Nunba's get_model_path rule): a
 partial download is neither selected nor spawned, and does not hide a whole
 copy in a later folder.
 
+The standalone launch sizes and places that server the way the other start of
+it does (A13 proof D2, 2026-10-14: it ran at --ctx-size 512, and a reel's
+550-token keyframe rating got HTTP 400 on every frame; it always passed
+--n-gpu-layers 99).  Its context is the one Nunba's start_caption_server gives
+the 0.8B (llama_config._derive_ctx_size: core.llama_geometry.derive_ctx_size
+over a forced VRAM sample and the weights measured from the file), and its GPU
+layers are llamacpp_manager.get_optimal_params', HARTOS's one placement of a
+GGUF on the box: all of them when it fits, part of them on a card short of
+room, none without a usable GPU.
+
 Real code throughout: the real backend, the real platform EventBus and
-registry, the real model catalog and completeness rule.  Replaced: the caption
-port's HTTP (pooled_get), the event delivery (synchronous, to the real bus),
-the process spawn (subprocess.Popen and the llama-server lookup), sleep (a
-clock, for the thread the start runs on only: time.sleep is process-wide), the
-home folder (a temp dir), and the 0.8B's registered size and the rule's
-100 MB floor (scaled to WEIGHTS bytes, so whole weights are real files of a
-kilobyte rather than half a gigabyte).
+registry, the real model catalog and completeness rule, the real context
+tiers and placement rule.  Replaced: the caption port's HTTP (pooled_get), the
+event delivery (synchronous, to the real bus), the process spawn
+(subprocess.Popen and the llama-server lookup), the GPU reading (vram_manager's
+refresh_gpu_info and detect_gpu, where nvidia-smi would run), sleep (a clock,
+for the thread the start runs on only: time.sleep is process-wide), the home
+folder (a temp dir), and the 0.8B's registered size and the rule's 100 MB
+floor (scaled to WEIGHTS bytes, so whole weights are real files of a kilobyte
+rather than half a gigabyte; the geometry tests measure the file at the real
+0.8B's size).
 
     python -m pytest tests/unit/test_caption_server_one_launch.py -q -p no:cacheprovider
 """
@@ -55,12 +68,24 @@ import requests
 
 import integrations.service_tools.model_catalog as mc
 import integrations.vision.lightweight_backend as lvb
+from core.llama_geometry import ctx_for_role, derive_ctx_size
+from integrations.reel_studio.media import moments
 from tests.conftest import refuse_all_network
 
 PORT = 18491
 MODEL = 'Qwen3.5-0.8B-UD-Q4_K_XL.gguf'
 #: The 0.8B's registered size in these tests (the real row is 558,772,480).
 WEIGHTS = 1000
+#: The real 0.8B weight file's size, which the geometry tests measure it at.
+REAL_WEIGHTS = 558_772_480
+GIB = 1024 ** 3
+#: One reel keyframe rating, measured 2026-10-14 (A13 proof D2): 550 prompt
+#: tokens (336 image + 206 rubric) plus the answer budget moments asks for.
+RATING_TOKENS = 550 + moments.MAX_TOKENS
+#: GPU readings, as vram_manager.detect_gpu reports them.
+ROOMY_GPU = {'name': 'NVIDIA GeForce RTX 3070', 'total_gb': 8.0, 'free_gb': 7.5,
+             'cuda_available': True}
+NO_GPU = {'name': None, 'total_gb': 0.0, 'free_gb': 0.0, 'cuda_available': False}
 STANDALONE_BINARY = ('integrations.service_tools.model_lifecycle.'
                      'ModelLifecycleManager._find_llama_server_binary')
 #: The bound the start had before: the 5 x 1 s event wait, then 30 x 1 s.
@@ -129,8 +154,37 @@ def box(tmp_path, monkeypatch):
     monkeypatch.setattr(reg, '_registry', fresh)
     clock = _Clock()
     port = _Port(clock)
-    return types.SimpleNamespace(home=home, models=home / '.nunba' / 'models', bus=bus,
-                                 clock=clock, port=port, tmp=tmp_path, mp=monkeypatch)
+    ns = types.SimpleNamespace(home=home, models=home / '.nunba' / 'models', bus=bus,
+                               clock=clock, port=port, tmp=tmp_path, mp=monkeypatch,
+                               gpu=dict(ROOMY_GPU), forced=[])
+    _gpu_reads_from(ns)
+    return ns
+
+
+def _gpu_reads_from(box):
+    """vram_manager reads the GPU as ``box.gpu`` says (an exception: the
+    probe raises).  ``box.forced`` records, for each refresh_gpu_info, whether
+    it was forced past the memo; detect_gpu is the memo's own read."""
+    from integrations.service_tools.vram_manager import vram_manager
+
+    def reading():
+        if isinstance(box.gpu, Exception):
+            raise box.gpu
+        return dict(box.gpu)
+
+    def refresh_gpu_info(force=False):
+        box.forced.append(force)
+        return reading()
+    box.mp.setattr(vram_manager, 'refresh_gpu_info', refresh_gpu_info)
+    box.mp.setattr(vram_manager, 'detect_gpu', reading)
+
+
+def _measured_as(box, nbytes):
+    """The 0.8B weight file measures ``nbytes`` on disk (os.path.getsize), as
+    the real one does; every other file measures what it is."""
+    real = os.path.getsize
+    box.mp.setattr(os.path, 'getsize',
+                   lambda p: nbytes if os.path.basename(str(p)) == MODEL else real(p))
 
 
 def _put(path, data=b'GGUF'):
@@ -451,6 +505,90 @@ def test_no_projector_on_disk_means_no_spawn(box):
     _put(box.models / 'mmproj-F16.gguf')        # a projector of unknown model: not taken
     ok, _ = _ensure(box)
     assert ok is False and box.port.spawned == []
+
+
+# ── the standalone launch's geometry: as the other start of this server ──
+
+@pytest.mark.parametrize('gpu', [
+    dict(ROOMY_GPU),                            # 7.5 GiB free: the richest tier, capped
+    dict(ROOMY_GPU, free_gb=2.6),               # 2.08 GiB left after the weights
+    dict(ROOMY_GPU, free_gb=2.4),               # 1.88 left: the smaller tier
+    dict(NO_GPU),                               # no GPU: the weights do not fit any VRAM
+], ids=['roomy', 'tier_8192', 'tier_4096', 'no_gpu'])
+def test_the_standalone_launch_sizes_its_context_as_nunbas_caption_start_does(box, gpu):
+    """A13 proof D2 (2026-10-14, HARTOS-only node): the standalone launch ran
+    the 0.8B at --ctx-size 512, and all 3 of a reel's keyframe ratings came
+    back HTTP 400 'request (550 tokens) exceeds the available context size
+    (512 tokens)': the start said True and every frame fell back.  Nunba's
+    start_caption_server sizes the same server by _derive_ctx_size --
+    core.llama_geometry.derive_ctx_size over a FORCED VRAM sample and the
+    weights measured from the file -- and so does this launch now: one
+    server, one port, one size whoever starts it."""
+    _files_in(box.models)
+    _measured_as(box, REAL_WEIGHTS)
+    box.gpu = gpu
+    ok, _ = _ensure(box)
+    assert ok is True and len(box.port.spawned) == 1
+    ctx = _arg(box.port.spawned[0], '--ctx-size')
+    assert ctx == str(derive_ctx_size(gpu['free_gb'], REAL_WEIGHTS / GIB))
+    assert box.forced[:1] == [True], 'the size was read off a memoized VRAM sample'
+    assert int(ctx) >= RATING_TOKENS, 'a reel keyframe rating does not fit the window'
+
+
+def test_a_gpu_probe_that_fails_launches_at_the_unmeasured_default(box):
+    """The box cannot be measured (the probe raises): the context is the one
+    Nunba's _derive_ctx_size falls back to, ctx_for_role('main') -- and the
+    0.8B goes on the CPU, which is what the placement rule makes of a GPU it
+    could not read.  The launch still happens."""
+    _files_in(box.models)
+    box.gpu = RuntimeError('nvidia-smi did not answer')
+    ok, _ = _ensure(box)
+    assert ok is True and len(box.port.spawned) == 1
+    cmd = box.port.spawned[0]
+    assert _arg(cmd, '--ctx-size') == str(ctx_for_role('main'))
+    assert _arg(cmd, '--n-gpu-layers') == '0'
+
+
+@pytest.mark.parametrize('gpu, layers', [
+    (dict(ROOMY_GPU), '-1'),
+    (dict(ROOMY_GPU, free_gb=0.2),
+     str(mc.gguf_partial_offload_layers(0.2, REAL_WEIGHTS / GIB, None))),
+    (dict(NO_GPU), '0'),
+], ids=['fits_all_layers', 'low_vram_partial', 'no_gpu_cpu'])
+def test_the_standalone_launch_places_the_0_8b_by_the_one_placement_rule(box, gpu, layers):
+    """It passed --n-gpu-layers 99 whatever the card held.  Now the layers
+    are llamacpp_manager.get_optimal_params' (model_catalog.gguf_fits_gpu,
+    then a partial offload sized from the file): every layer (-1) on a card
+    with room, part of them on a card short of room (0.2 GiB free for a
+    0.52 GiB file), none on a box without a usable GPU."""
+    _files_in(box.models)
+    _measured_as(box, REAL_WEIGHTS)
+    box.gpu = gpu
+    ok, _ = _ensure(box)
+    assert ok is True and len(box.port.spawned) == 1
+    got = _arg(box.port.spawned[0], '--n-gpu-layers')
+    assert got == layers
+    if gpu['free_gb'] == 0.2:
+        assert 0 < int(got) < mc.LAYER_COUNT_FALLBACK, 'not a partial offload'
+
+
+def test_the_layers_are_the_placement_helpers_answer_not_a_copy(box):
+    """Delegation, proven: whatever get_optimal_params answers for the 0.8B's
+    file is what the launch passes, so it cannot drift from the placement of
+    every other llama-server HARTOS starts."""
+    from integrations.service_tools import llamacpp_manager as lcm
+    model, _ = _files_in(box.models)
+    asked = []
+
+    def optimal(self, model_path):
+        asked.append(model_path)
+        return {'n_gpu_layers': 7, 'ctx_size': 1}
+    box.mp.setattr(lcm.LlamaCppManager, 'get_optimal_params', optimal)
+    ok, _ = _ensure(box)
+    assert asked == [str(model)]
+    assert _arg(box.port.spawned[0], '--n-gpu-layers') == '7'
+    assert _arg(box.port.spawned[0], '--ctx-size') != '1', \
+        'the context came from the placement helper, not from the caption start rule'
 
 
 # ── a weight file counts only when whole: the one completeness rule ──────
