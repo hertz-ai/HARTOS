@@ -6,11 +6,11 @@ test_reel_edit_skill.py).
 They are package data parsed with the skill registry's own frontmatter
 parser, they stay under 2,000 characters each (a local model's 12K context
 cannot carry the 3-6.5K upstream texts, plan finding 38), and they are never
-registered in the global skill registry, so other agents and casual chat
-never see them (finding 39); a same-named skill there never becomes or
-removes theirs, and reading theirs never replaces or brings back a user's
-skill (inventory D38, judged clean).  ig_viral is not shipped: its own text
-forbids the collector the trends job is.
+registered in the global skill registry, under any name, so other agents
+and casual chat never see them (finding 39); a same-named skill there never
+becomes or removes theirs, and reading theirs never replaces or brings back
+a user's skill (inventory D38, judged clean).  ig_viral is not shipped: its
+own text forbids the collector the trends job is.
 """
 import hashlib
 import os
@@ -83,14 +83,18 @@ def test_unknown_names_are_refused(bad):
         skills.get_skill_text(bad)
 
 
-def test_the_global_skill_registry_is_never_touched():
-    before = [s['name'] for s in registry.skill_registry.list_skills()]
-    skills.list_skills()
+def test_the_global_skill_registry_is_never_touched(monkeypatch, user_skills):
+    """Her texts are never registered, under any name (finding 39): a fresh
+    copy of her module, imported after the registry it reaches is in place
+    and empty, lists and reads every skill, and the registry is still
+    empty.  Review of d00ebfaa9: this test used to snapshot the registry
+    after her module had been imported, so a module that registered her
+    texts at import as 'reel_studio:<name>' passed it."""
+    loaded = fresh_module(monkeypatch, skills.__name__)
+    loaded.list_skills()
     for name in skills.SKILL_NAMES:
-        skills.get_skill_text(name)
-    after = [s['name'] for s in registry.skill_registry.list_skills()]
-    assert after == before
-    assert not set(skills.SKILL_NAMES) & set(after)
+        loaded.get_skill_text(name)
+    assert user_skills.list_skills() == []
 
 
 @pytest.fixture
@@ -129,15 +133,19 @@ def _shipped_texts():
     return {name: _shipped_text(name) for name in skills.SKILL_NAMES}
 
 
-def _users_skills(user_skills):
-    """The registry's entry under each of her skill names, as
-    (instructions, description), or None where there is none."""
-    entries = {name: user_skills.get_skill(name) for name in skills.SKILL_NAMES}
-    return {name: (s.instructions, s.description) if s else None for name, s in entries.items()}
+def _registry_entries(user_skills):
+    """Every entry of the registry, as {name: (instructions, description)}:
+    what GET /api/skills/list shows and save_config writes to skills.json.
+    The D38 tests expect the user's own entries there and nothing of hers
+    under any name (review of d00ebfaa9: checking only her skill names let
+    'reel_studio:<name>' entries through)."""
+    return {s['name']: (user_skills.get_skill(s['name']).instructions, s['description'])
+            for s in user_skills.list_skills()}
 
 
 #: The two orders production has.  Her module is imported when her reel
 #: tools are built (tools.build_reel_tools), but her texts load on her
+#: agent's first reel_skill read (the loader caches them then, not at
 #: import), so each D38 test loads a fresh copy (fresh_module: its read
 #: cache empty, the real module's restored after the test) and runs both:
 #: - the user's same-named skill is in the registry before her first read:
@@ -168,7 +176,7 @@ def test_a_same_named_upload_never_becomes_her_text(monkeypatch, user_skills, re
     _upload_same_named_skills(user_skills)
     assert _her_texts(loaded) == _shipped_texts()
     assert _USERS_SKILL[1] not in [s['description'] for s in loaded.list_skills()]
-    assert _users_skills(user_skills) == dict.fromkeys(skills.SKILL_NAMES, _USERS_SKILL)
+    assert _registry_entries(user_skills) == dict.fromkeys(skills.SKILL_NAMES, _USERS_SKILL)
 
 
 @_PRODUCTION_ORDERS
@@ -184,7 +192,7 @@ def test_deleting_a_same_named_skill_never_removes_her_text(monkeypatch, user_sk
         assert user_skills.unregister_skill(name)
         user_skills.save_config()
     assert _her_texts(loaded) == _shipped_texts()
-    assert _users_skills(user_skills) == dict.fromkeys(skills.SKILL_NAMES)
+    assert _registry_entries(user_skills) == {}
 
 
 def test_the_mit_license_ships_verbatim_beside_the_code():
