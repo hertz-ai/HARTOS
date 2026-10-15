@@ -119,15 +119,23 @@ _STAGE_HINTS = {
 
 #: The rubric every keyframe is rated with.  Part of the cache key: changing
 #: it re-rates frames.
+#:
+#: appeal asks for ONE bare whole number.  Until 2026-10-15 the template read
+#: '"appeal": <1-10>' and the bands '9-10 finished, sharp, ...'; the 0.8B
+#: (REEL_VLM_DEFAULT) copied the first band, words and all, into appeal on 3
+#: of 3 frames (A13 live proof, CPU) and 8 of 11 (shared GPU server), so
+#: every such frame fell back.  With this wording it answered a bare number
+#: on 11 of 11 of the same frames.  The parser still reads a band it copies
+#: (``_appeal``), so either guard alone keeps the model's answer.
 RUBRIC_PROMPT = (
     'This is one frame from a video of a makeup artist doing a bridal look. '
     'Answer with ONLY this JSON object and nothing else:\n'
-    '{"stage": "<stage>", "appeal": <1-10>, "face_visible": <true or false>}\n'
+    '{"stage": "<stage>", "appeal": <whole number>, "face_visible": <true or false>}\n'
     'stage is the step the frame shows, one of: '
     + '; '.join('%s (%s)' % (s, _STAGE_HINTS[s]) for s in STAGES) + '.\n'
-    'appeal is how good the frame would look in a reel: 9-10 finished, sharp, '
-    'well lit, face clearly visible; 5-6 ordinary; 1-3 blurry, dark or the face '
-    'hidden.\n'
+    'appeal is one whole number from 1 to 10, written as a bare number: how good '
+    'the frame would look in a reel (9 or 10: finished, sharp, well lit, face '
+    'clearly visible; 5 or 6: ordinary; 1 to 3: blurry, dark or the face hidden).\n'
     'face_visible is true when the face can be clearly seen.'
 )
 
@@ -160,7 +168,13 @@ _FIELD_KEYS = {
     'appeal': ('appeal', 'score', 'rating'),
     'face_visible': ('face_visible', 'facevisible', 'face'),
 }
-_APPEAL_TEXT = re.compile(r'\s*([-+]?\d+(?:\.\d+)?)\s*(?:/\s*10)?\s*')
+#: An appeal written as text: a LEADING number ('7', '7.5', '8/10') or range
+#: ('9-10', with an en or em dash, '9 to 10', '9 or 10'), then anything (the
+#: band's own words a model copied out of the rubric).
+_APPEAL_TEXT = re.compile(
+    r'\s*([-+]?\d+(?:\.\d+)?)'
+    r'(?:\s*(?:-|–|—|to|or)\s*(\d+(?:\.\d+)?))?'
+    r'\s*(?:/\s*10)?(?!\d)', re.IGNORECASE)
 
 #: What changing one label costs the smoothing: a label the model gave is
 #: worth four position guesses (fallback frames' capture-order stages).
@@ -192,16 +206,29 @@ def _stage(value) -> Optional[str]:
 
 
 def _appeal(value) -> Optional[float]:
-    """A number in 0..10 (clamped), from 7, 7.5, '7', '8/10'; None otherwise."""
+    """A number in 0..10 (clamped), or None.
+
+    From 7, 7.5, '7', '8/10', or text that STARTS with a number or a range:
+    '7 ordinary' is 7; a range is its midpoint, so the rubric's own band
+    copied into the field, '9-10 finished, sharp, well lit, face clearly
+    visible', is 9.5 ('1 to 3 ...' is 2.0, '9 or 10' 9.5).  The whole scale
+    ('1-10', '1 to 10': the template echoed back) says nothing and is None,
+    and so is text with no leading number ('high', 'about 7').
+    """
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
         number = float(value)
     elif isinstance(value, str):
-        match = _APPEAL_TEXT.fullmatch(value)
+        match = _APPEAL_TEXT.match(value)
         if match is None:
             return None
         number = float(match.group(1))
+        if match.group(2) is not None:
+            low, high = sorted((number, float(match.group(2))))
+            if low <= 1 and high >= 10:
+                return None
+            number = (low + high) / 2.0
     else:
         return None
     if not math.isfinite(number):
@@ -248,9 +275,11 @@ def parse_rating(text: Optional[str]) -> Optional[Dict[str, Any]]:
     The JSON may be fenced or wrapped in prose (extract_json finds it).
     ``stage`` is normalised to contracts.STAGES (synonyms such as 'jewelry',
     'eye makeup', 'finished look'; an unknown word is 'other'); ``appeal`` is
-    a number clamped to 0..10; ``face_visible`` is True, False or None when
-    the model did not say.  No stage or no usable appeal is a miss (None),
-    and the frame falls back.
+    a number clamped to 0..10, also read from text that starts with a number
+    or a range (a range is its midpoint: a copied band '9-10 finished, ...'
+    is 9.5; see _appeal); ``face_visible`` is True, False or None when the
+    model did not say.  No stage or no usable appeal is a miss (None), and
+    the frame falls back.
     """
     if not isinstance(text, str) or not text.strip():
         return None

@@ -14,6 +14,7 @@ The VLM is a fake backend here; only its rate_frame boundary is replaced.
 import json
 import math
 import os
+import re
 import time
 
 import pytest
@@ -150,6 +151,94 @@ def test_stage_names_are_normalised(raw, stage):
 ])
 def test_appeal_is_clamped_to_0_10(raw, appeal):
     assert M.parse_rating(json.dumps({'stage': 'lips', 'appeal': raw}))['appeal'] == appeal
+
+
+# ── the 0.8B's real answers ───────────────────────────────────────────────
+# Measured on the reel's default vision model (Qwen3.5-0.8B-UD-Q4_K_XL,
+# llama.cpp b10330) asked through rate_frame with the rubric as it read
+# before 2026-10-15 ('"appeal": <1-10>' and '9-10 finished, sharp, ...'):
+# 2026-10-14 on a CPU-only instance, 3 of 3 frames (A13 live proof, D1);
+# 2026-10-15 on the shared GPU instance, 8 of 11 frames.  The model copied
+# the rubric's first band into appeal, the parser refused it, and every such
+# frame fell back although the model had answered.  The answers below are
+# the model's text byte for byte.
+
+#: One line (A13 proof, leg 1c, all 3; and 6 of the 8 echoes on 2026-10-15).
+ECHO_ONE_LINE = ('```json\n{"stage": "final_look", "appeal": "9-10 finished, sharp, well lit, '
+                 'face clearly visible", "face_visible": true}\n```')
+#: The same echo with another stage (smptehdbars frame, 2026-10-15).
+ECHO_BASE = ('```json\n{"stage": "base", "appeal": "9-10 finished, sharp, well lit, '
+             'face clearly visible", "face_visible": true}\n```')
+#: The same echo spread over lines (blurred grey frame, 2026-10-15).
+ECHO_MULTILINE = ('```json\n{\n    "stage": "final_look",\n    "appeal": "9-10 finished, sharp, '
+                  'well lit, face clearly visible",\n    "face_visible": true\n}\n```')
+#: A bare range (a trial wording that kept '<1-10>', 2026-10-15).
+BARE_RANGE = '```json\n{"stage": "final_look", "appeal": "9-10", "face_visible": true}\n```'
+
+
+@pytest.mark.parametrize('raw,rating', [
+    (ECHO_ONE_LINE, {'stage': 'final_look', 'appeal': 9.5, 'face_visible': True}),
+    (ECHO_BASE, {'stage': 'base', 'appeal': 9.5, 'face_visible': True}),
+    (ECHO_MULTILINE, {'stage': 'final_look', 'appeal': 9.5, 'face_visible': True}),
+    (BARE_RANGE, {'stage': 'final_look', 'appeal': 9.5, 'face_visible': True}),
+])
+def test_the_models_measured_answers_parse_stage_appeal_and_face(raw, rating):
+    # A band read as its midpoint: '9-10 ...' is 9.5.  Stage and face come
+    # from the same answer.
+    assert M.parse_rating(raw) == rating
+
+
+@pytest.mark.parametrize('raw,appeal', [
+    ('9-10 finished, sharp, well lit, face clearly visible', 9.5),
+    ('5-6 ordinary', 5.5),
+    ('1-3 blurry, dark or the face hidden', 2.0),
+    ('9 or 10: finished, sharp, well lit, face clearly visible', 9.5),
+    ('1 to 3: blurry, dark or the face hidden', 2.0),
+    ('9 – 10', 9.5),                         # an en dash
+    ('9—10 sharp', 9.5),                     # an em dash
+    ('10-9', 9.5),                           # either order, the same midpoint
+    ('9-10/10', 9.5),
+    ('7 ordinary', 7.0),
+    ('8/10, sharp and well lit', 8.0),
+    ('7.5 out of 10', 7.5),
+    ('7.', 7.0),
+    ('12-14 stunning', 10.0),                # still clamped
+])
+def test_a_leading_number_or_range_is_read_from_band_text(raw, appeal):
+    assert M.parse_rating(json.dumps({'stage': 'lips', 'appeal': raw}))['appeal'] == appeal
+
+
+@pytest.mark.parametrize('raw', [
+    '1-10', '1 to 10', '0-10', '10 or 1',    # the scale itself: the template echoed back
+    '<1-10>', '<whole number>',              # the placeholder, brackets and all
+    'finished, sharp, well lit, face clearly visible',   # words with no number
+    'about 7',                               # only a LEADING number is an answer
+    'n/a',
+])
+def test_the_scale_or_words_without_a_leading_number_are_still_a_miss(raw):
+    assert M.parse_rating(json.dumps({'stage': 'lips', 'appeal': raw})) is None
+
+
+def test_every_band_the_rubric_offers_reads_inside_that_band_when_copied():
+    # Whatever band a small model copies out of the rubric, the parser reads
+    # a number inside that band, never a miss and never another band.
+    bands = list(re.finditer(r'(\d+) (?:or|to|-) (\d+): [^;)]+', M.RUBRIC_PROMPT))
+    assert len(bands) == 3, M.RUBRIC_PROMPT
+    for band in bands:
+        low, high = float(band.group(1)), float(band.group(2))
+        rating = M.parse_rating(json.dumps({'stage': 'eyes', 'appeal': band.group(0)}))
+        assert rating is not None, band.group(0)
+        assert low <= rating['appeal'] <= high, band.group(0)
+
+
+@pytest.mark.parametrize('stage', C.STAGES)
+def test_a_stage_copied_with_its_rubric_hint_parses_to_that_stage(stage):
+    # Not measured (every stage the 0.8B gave was a bare label), but the
+    # same kind of copy as the appeal echo: 'final_look (the finished look,
+    # shown off)' is the final look.
+    entry = '%s (%s)' % (stage, M._STAGE_HINTS[stage])
+    assert entry in M.RUBRIC_PROMPT
+    assert M.parse_rating(json.dumps({'stage': entry, 'appeal': 5}))['stage'] == stage
 
 
 @pytest.mark.parametrize('raw,face', [
@@ -311,6 +400,22 @@ def test_the_model_down_means_every_frame_falls_back(tmp_path):
     # cover the six process stages in equal steps.
     assert _stages(doc) == ['bare_face', 'base', 'lips', 'hair', 'final_look']
     assert [m['appeal'] for m in doc['moments']] == pytest.approx([3.0] * 5)
+    assert doc['final_look_found'] is True
+
+
+def test_the_models_band_echo_rates_every_frame_instead_of_falling_back(tmp_path):
+    # The A13 live proof's bar: frames the 0.8B answered are rated by it
+    # (src 'vlm'), not the fallback, and the reply is not told it gave no
+    # usable answer (NOTE_VLM_FALLBACK).
+    keys = [_kf(t=float(i), score=0.5) for i in range(3)]
+    vlm = FakeVLM([ECHO_ONE_LINE, ECHO_MULTILINE, ECHO_ONE_LINE])
+    doc = _score(keys, vlm, tmp_path)
+    assert doc['src'] == 'vlm' and doc['model'] == 'fake-vlm'
+    assert M.NOTE_VLM_FALLBACK not in doc['notes'] and M.NOTE_VLM_PARTIAL not in doc['notes']
+    assert doc['stats']['vlm'] == 3 and doc['stats']['calls'] == 3
+    assert [m['src'] for m in doc['moments']] == ['vlm'] * 3
+    assert [m['appeal'] for m in doc['moments']] == pytest.approx([0.6 * 9.5 + 0.4 * 5] * 3)
+    assert [m['face_visible'] for m in doc['moments']] == [True] * 3
     assert doc['final_look_found'] is True
 
 
