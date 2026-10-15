@@ -203,6 +203,17 @@ MODEL_WEIGHT_BYTES = {
     'Tiel-Coder-35B-A3B-MTP-UD-Q4_K_XL.gguf':
         (22749880160, 'MEASURED: HF Content-Length and on-disk size both '
                       '22749880160 bytes exactly (2026-09-22)'),
+
+    # ── VISION PROJECTORS, by the local name a row's files['mmproj'] gives
+    # them (the file downloaded beside the weights).  Only where a caller
+    # needs the size: Nunba's caption start checks the free disk against
+    # the 0.8B AND its projector before it downloads (owner ruling
+    # 2026-10-15); it measured the weights alone and let a box short of the
+    # pair start a download that filled its disk.
+    'mmproj-Qwen3.5-0.8B-F16.gguf':
+        (204_987_232, 'measured 2026-10-15 (~/.nunba/models; the 2026-10-14 '
+                      'download of the repo\'s mmproj-F16.gguf was the same '
+                      'size, sha256 equal)'),
 }
 
 
