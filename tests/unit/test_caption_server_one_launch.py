@@ -56,6 +56,7 @@ rather than half a gigabyte; the geometry tests measure the file at the real
 
     python -m pytest tests/unit/test_caption_server_one_launch.py -q -p no:cacheprovider
 """
+import contextlib
 import os
 import sys
 import threading
@@ -117,6 +118,10 @@ class _Port:
         self.clock = clock
         self.servers = []
         self.spawned = []
+        #: How long a server HARTOS spawns takes to load (None: it never does).
+        self.load_s = 3.0                   # a 0.8B loads in a few seconds
+        #: Called with the spawned command, as the spawn happens.
+        self.on_spawn = None
 
     def start(self, after_s):
         self.servers.append(None if after_s is None else self.clock.t + after_s)
@@ -129,7 +134,9 @@ class _Port:
 
     def popen(self, cmd, **kw):
         self.spawned.append(list(cmd))
-        self.start(3.0)                     # a 0.8B loads in a few seconds
+        self.start(self.load_s)
+        if self.on_spawn is not None:
+            self.on_spawn(cmd)
         return MagicMock(pid=4242)
 
 
@@ -220,20 +227,21 @@ def _nunba_in_this_process(box, start_s):
     box.bus.on('vlm_caption.requested', on_requested)
 
 
-def _ensure(box, backend=None):
-    """ensure_running on the real backend; returns (ok, backend).
+@contextlib.contextmanager
+def _the_box(box):
+    """Every boundary of a start replaced by ``box`` for the block; the
+    events asked for are in ``box.asked``.
 
     The clock is the start's: it runs on this thread, and only this
     thread's sleeps move the clock.  Another thread's sleep is its own,
     really slept -- finding F1 (2026-10-14): a VisionService that
     hart_intelligence_entry's import-time vision_init thread started keeps a
     description loop sleeping every 4 s."""
-    backend = backend or lvb.Qwen08BBackend(port=PORT)
-    asked = []
+    box.asked = []
     me = threading.get_ident()
 
     def deliver(topic, data=None, *a, **kw):
-        asked.append(topic)
+        box.asked.append(topic)
         box.bus.emit(topic, data)
 
     def sleep(seconds=0):
@@ -246,11 +254,21 @@ def _ensure(box, backend=None):
          patch(STANDALONE_BINARY, return_value=str(box.tmp / 'llama-server.exe')), \
          patch('subprocess.Popen', side_effect=box.port.popen), \
          patch('time.sleep', sleep):
-        ok = backend.ensure_running()
-    box.asked = asked
+        yield
+
+
+def _close_log(backend):
     log = getattr(backend, '_log_fh', None)
     if log:
         log.close()
+
+
+def _ensure(box, backend=None):
+    """ensure_running on the real backend; returns (ok, backend)."""
+    backend = backend or lvb.Qwen08BBackend(port=PORT)
+    with _the_box(box):
+        ok = backend.ensure_running()
+    _close_log(backend)
     return ok, backend
 
 
@@ -589,6 +607,105 @@ def test_the_layers_are_the_placement_helpers_answer_not_a_copy(box):
     assert _arg(box.port.spawned[0], '--n-gpu-layers') == '7'
     assert _arg(box.port.spawned[0], '--ctx-size') != '1', \
         'the context came from the placement helper, not from the caption start rule'
+
+
+# ── one backend per process: every caller shares one start ─────────────
+
+def _callers_on_the_test_port(box):
+    """get_vision_backend hands out the 0.8B on this test's port, with no
+    backend forced by the environment."""
+    box.mp.setenv('HEVOLVE_VLM_CAPTION_PORT', str(PORT))
+    box.mp.delenv('HEVOLVE_VISION_BACKEND', raising=False)
+
+
+def test_the_reel_the_camera_and_the_book_reader_share_one_start(box):
+    """Reviewer F1, a HARTOS-only node: the reel
+    (get_vision_backend(REEL_VLM_DEFAULT)), VisionService's describe and the
+    book reader (both on the auto pick) each built their own Qwen08BBackend,
+    each with its own record of a start under way.  A 0.8B that loads slower
+    than the 5 s + 30 s a start waits left the reel's start False with its
+    server still loading; VisionService's next frame and the book reader's
+    next page each spawned their own -- three servers on one port.  One
+    backend per process now (owner ruling 2026-10-15): the later callers are
+    inside the first start's cooldown and spawn nothing."""
+    _files_in(box.models)
+    _callers_on_the_test_port(box)
+    box.port.load_s = 60.0                  # longer than a start waits
+    with _the_box(box):
+        reel = lvb.get_vision_backend(moments.REEL_VLM_DEFAULT)
+        assert reel.ensure_running() is False         # still loading
+        assert lvb.get_vision_backend().describe(b'a camera frame') is None
+        page_reader = lvb.get_document_readers()[0]
+        assert page_reader(b'a book page', 'read every line') is None
+    _close_log(reel)
+    assert len(box.port.spawned) == 1, 'a second 0.8B server was spawned on the port'
+    assert box.asked == ['vlm_caption.requested']
+
+
+def test_a_caller_that_comes_while_a_start_is_under_way_waits_for_it(box):
+    """VisionService's description loop asks for the 0.8B while the reel's
+    start is waiting for the server it has just spawned.  It spawns nothing
+    and is not turned away: it waits for that start, is told it is waiting
+    (on_wait -- a reel in its place says the vision model is being made
+    ready), and is ready when that start's server is."""
+    _files_in(box.models)
+    _callers_on_the_test_port(box)
+    at_the_door = threading.Event()
+    other = {}
+
+    def vision_service_meanwhile(cmd):
+        box.port.on_spawn = None            # the one spawn starts the one caller
+
+        def description_loop():
+            waited = []
+
+            def on_wait():
+                waited.append(1)
+                at_the_door.set()
+            other['ok'] = lvb.get_vision_backend().ensure_running(on_wait=on_wait)
+            other['waited'] = waited
+        other['thread'] = threading.Thread(target=description_loop,
+                                           name='vision-desc', daemon=True)
+        other['thread'].start()
+        at_the_door.wait(10)                # the spawn returns once it is waiting
+    box.port.on_spawn = vision_service_meanwhile
+    with _the_box(box):
+        reel = lvb.get_vision_backend(moments.REEL_VLM_DEFAULT)
+        ok = reel.ensure_running()
+        other['thread'].join(30)
+    _close_log(reel)
+    assert not other['thread'].is_alive()
+    assert ok is True and other.get('ok') is True, other
+    assert other['waited'] == [1], 'the waiting caller was not told it waited'
+    assert len(box.port.spawned) == 1, 'a second 0.8B server was spawned on the port'
+    assert box.asked == ['vlm_caption.requested']
+
+
+def test_a_server_the_reel_started_is_not_idled_out_from_under_it(box):
+    """VisionService's description loop unloads a 0.8B that HARTOS started
+    once it has gone IDLE_TIMEOUT_S unused (check_idle, on the backend it
+    holds -- now also the reel's).  A start and a keyframe rating are uses:
+    a camera frame described long ago does not unload the server the reel
+    has just started, nor one it is rating frames on.  Unused for
+    IDLE_TIMEOUT_S, it is still unloaded."""
+    _files_in(box.models)
+    _callers_on_the_test_port(box)
+    with _the_box(box):
+        camera = lvb.get_vision_backend()
+        camera._last_describe_time = time.time() - 10 * camera.IDLE_TIMEOUT_S
+        reel = lvb.get_vision_backend(moments.REEL_VLM_DEFAULT)
+        assert reel.ensure_running() is True
+        proc = reel._server_proc
+        camera.check_idle()
+        assert not proc.terminate.called, 'the server was unloaded as it came up'
+        reel._last_describe_time -= camera.IDLE_TIMEOUT_S - 1     # a while later
+        reel.rate_frame(b'a keyframe', 'rate it', timeout_s=1.0)
+        reel._last_describe_time -= camera.IDLE_TIMEOUT_S - 1
+        camera.check_idle()
+        assert not proc.terminate.called, 'the server was unloaded while frames were rated'
+        reel._last_describe_time -= camera.IDLE_TIMEOUT_S + 1     # then nobody uses it
+        camera.check_idle()
+    assert proc.terminate.called, 'an unused server HARTOS started was never unloaded'
 
 
 # ── a weight file counts only when whole: the one completeness rule ──────

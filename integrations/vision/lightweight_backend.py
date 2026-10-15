@@ -16,6 +16,7 @@ Usage:
 import functools
 import logging
 import os
+import threading
 from abc import ABC, abstractmethod
 from typing import Callable, Optional
 
@@ -327,6 +328,18 @@ def _rate_frame_at(completions_url: str, serving, image_bytes: bytes, prompt: st
     except Exception as e:
         logger.warning(f"rate_frame failed at {completions_url}: {e}")
         return None
+
+
+def _tell_waiting(on_wait: Optional[Callable[[], None]]) -> None:
+    """Tell an ensure_running caller it is waiting for a server (its
+    ``on_wait``), once.  A callback that raises is logged, and the start or
+    the wait it announces goes on (review of 42735064e)."""
+    if on_wait is None:
+        return
+    try:
+        on_wait()
+    except Exception as e:
+        logger.warning(f"vision start: on_wait raised ({e}); going on")
 
 
 class MiniCPMBackend(VisionBackend):
@@ -869,8 +882,15 @@ class Qwen08BBackend(VisionBackend):
         self._port = port or get_port('vlm_caption')
         self._launch_attempted = False
         self._launch_attempted_at = 0.0
+        #: The last use: a frame described, a page read, a keyframe rated, a
+        #: launch.  check_idle unloads a server this backend started once it
+        #: is IDLE_TIMEOUT_S old.
         self._last_describe_time = 0.0
         self._server_proc = None  # subprocess.Popen object (not just PID)
+        #: Held by the one caller starting the server (ensure_running); a
+        #: caller that finds it held waits for that start instead of making
+        #: its own.
+        self._start_lock = threading.Lock()
 
     @staticmethod
     def start_lock_path(port, config_dir=None) -> str:
@@ -1031,11 +1051,21 @@ class Qwen08BBackend(VisionBackend):
         finds through the model catalog, at the context size and GPU layers
         _launch_geometry decides (as Nunba's start of this server does).
 
+        One start at a time per backend, and the backend is the one this
+        process hands every caller (get_vision_backend; owner ruling
+        2026-10-15): a caller that comes while another caller's start is
+        under way -- VisionService's description loop during a reel's start
+        -- waits for that start and takes its answer, and spawns nothing.
+        Each caller used to hold its own backend with its own record of a
+        start, and two of them spawned two servers on one port (reviewer
+        F1, a HARTOS-only node).  A caller that comes after a start failed
+        is inside that start's cooldown, whoever it was.
+
         ``on_wait`` is called once, after the server was found not serving
-        and before the event is sent: not when it is up, not while a failed
-        launch's cooldown holds.  In its own try, so a caller's progress
-        line that raises never skips the start it announces (review of
-        42735064e).
+        and before the event is sent, or before waiting for another caller's
+        start: not when it is up, not while a failed launch's cooldown
+        holds.  In its own try, so a caller's progress line that raises
+        never skips the start it announces (review of 42735064e).
 
         Dependency direction: Nunba → HARTOS (never HARTOS → Nunba).  What
         is read of Nunba (its event subscriber, its start lock, its models
@@ -1050,6 +1080,18 @@ class Qwen08BBackend(VisionBackend):
         """
         if self._is_serving():
             return True
+        if not self._start_lock.acquire(blocking=False):
+            # Another caller is starting it; its waits bound this one.
+            _tell_waiting(on_wait)
+            with self._start_lock:
+                return self._is_serving()
+        try:
+            return self._start_serving(on_wait)
+        finally:
+            self._start_lock.release()
+
+    def _start_serving(self, on_wait: Optional[Callable[[], None]]) -> bool:
+        """ensure_running's start, with the start lock held."""
         import time as _t
         if self._launch_attempted:
             # A COOLDOWN, not a latch (#102, found by hartos-94).  This flag
@@ -1066,7 +1108,10 @@ class Qwen08BBackend(VisionBackend):
             # this box, and it competes for VRAM with the resident LLM.  Any
             # of those should cost one cooldown, not the feature.
             if _t.time() - self._launch_attempted_at < self.LAUNCH_RETRY_S:
-                return False
+                # A start that another caller finished between this caller's
+                # probe and its lock is serving now; any other start in its
+                # cooldown is not.
+                return self._is_serving()
             logger.info(
                 f"Qwen3.5-0.8B: retrying launch after "
                 f"{self.LAUNCH_RETRY_S}s cooldown")
@@ -1084,11 +1129,7 @@ class Qwen08BBackend(VisionBackend):
         self._launch_attempted = True
         self._launch_attempted_at = _t.time()
 
-        if on_wait is not None:
-            try:
-                on_wait()
-            except Exception as e:
-                logger.warning(f"Qwen3.5-0.8B: on_wait raised ({e}); starting anyway")
+        _tell_waiting(on_wait)
 
         # Emit event — Nunba subscribes in bundled mode and starts the server
         try:
@@ -1157,6 +1198,10 @@ class Qwen08BBackend(VisionBackend):
                     _kw['creationflags'] = subprocess.CREATE_NO_WINDOW
                 self._server_proc = subprocess.Popen(cmd, **_kw)
                 self._log_fh = log_fh
+                # A launch is a use: VisionService's check_idle (on this same
+                # backend) must not unload the server while it loads because
+                # a camera frame was described long ago.
+                self._last_describe_time = time.time()
                 logger.info(f"Qwen3.5-0.8B launching PID={self._server_proc.pid} "
                             f"port={self._port} ctx={ctx_size} gpu_layers={gpu_layers}")
             except Exception as e:
@@ -1202,7 +1247,9 @@ class Qwen08BBackend(VisionBackend):
         self._launch_attempted = False
 
     def check_idle(self):
-        """Called by VisionService's description_loop. Unloads if no frames for IDLE_TIMEOUT_S."""
+        """Called by VisionService's description_loop.  Unloads a server this
+        backend started once it has gone IDLE_TIMEOUT_S without a use (a
+        frame described, a page read, a keyframe rated, its launch)."""
         import time
         if self._server_proc and self._last_describe_time > 0:
             idle = time.time() - self._last_describe_time
@@ -1272,7 +1319,13 @@ class Qwen08BBackend(VisionBackend):
         rule: the reel (score_moments) asks ensure_running ONCE, before its
         first frame that is not cached; each frame then only asks /health.
         Not serving is a None.
+
+        A rating is a use of the server, as a described frame is: the
+        VisionService holding this same backend does not idle out a server
+        a reel is rating frames on (check_idle).
         """
+        import time
+        self._last_describe_time = time.time()
         return _rate_frame_at(self.completions_url(), self._is_serving, image_bytes, prompt,
                               model='local', long_side=long_side, max_tokens=max_tokens,
                               timeout_s=timeout_s)
@@ -1311,6 +1364,24 @@ _BACKENDS = {
     'none': NoneBackend,
 }
 
+#: This process's one instance of each backend, by its _BACKENDS name, made
+#: on first ask (_shared).  Owner ruling 2026-10-15: the reel, the book reader
+#: and VisionService hold the same backend, so one record of a start under way
+#: (Qwen08BBackend.ensure_running) covers them all.
+_SHARED: dict = {}
+_SHARED_LOCK = threading.Lock()
+
+
+def _shared(name: str) -> VisionBackend:
+    """This process's one instance of the backend ``name``; a name _BACKENDS
+    does not have is 'none', as get_vision_backend always answered it."""
+    key = name if name in _BACKENDS else 'none'
+    with _SHARED_LOCK:
+        backend = _SHARED.get(key)
+        if backend is None:
+            backend = _SHARED[key] = _BACKENDS[key]()
+        return backend
+
 
 def get_vision_backend(name: str = '') -> VisionBackend:
     """Get or auto-select a vision backend.
@@ -1324,21 +1395,31 @@ def get_vision_backend(name: str = '') -> VisionBackend:
            - 2GB+ RAM, no GPU → mobilevlm (if ONNX Runtime available)
            - 1GB+ RAM → clip (if clip/open_clip available)
            - <1GB → none
+
+    Every caller gets this process's one instance of the backend chosen
+    (_shared; owner ruling 2026-10-15), whether it names it -- Reel Studio's
+    moments step names REEL_VLM_DEFAULT -- or takes the auto pick, as
+    VisionService, the book reader (get_document_readers) and the media
+    index do.  The choice is still made on every call; only the instance is
+    kept.  Each call used to build a new instance, so each caller had its own
+    record of a start under way and two of them spawned two 0.8B servers on
+    one port (reviewer F1).  What one caller does to the instance, the others
+    see: a launch's cooldown, the idle unload (VisionService.check_idle) and
+    stop() (VisionService.stop, the eye button) reach every caller of it.
     """
     backend_name = name or os.environ.get('HEVOLVE_VISION_BACKEND', '')
 
     if backend_name:
-        cls = _BACKENDS.get(backend_name, NoneBackend)
-        return cls()
+        return _shared(backend_name)
 
     # Auto-detect — prefer Qwen3.5-0.8B for captioning (1s/frame, dedicated port)
     # This is separate from the 4B model used for computer use / action planning.
-    qwen08b = Qwen08BBackend()
+    qwen08b = _shared('qwen08b')
     if qwen08b.is_available():
         return qwen08b
 
     # Fallback: Qwen3-VL 4B (shares port with computer use agent)
-    qwen3vl = Qwen3VLVisionBackend()
+    qwen3vl = _shared('qwen3vl')
     if qwen3vl.is_available():
         return qwen3vl
 
@@ -1357,8 +1438,7 @@ def get_vision_backend(name: str = '') -> VisionBackend:
             }
             backend_key = _CATALOG_TO_BACKEND.get(entry.id)
             if backend_key:
-                cls = _BACKENDS.get(backend_key, NoneBackend)
-                candidate = cls()
+                candidate = _shared(backend_key)
                 if candidate.is_available():
                     return candidate
     except Exception:
@@ -1371,27 +1451,27 @@ def get_vision_backend(name: str = '') -> VisionBackend:
         if caps:
             hw = caps.hardware
             if hw.gpu_vram_gb >= 4:
-                return MiniCPMBackend()
+                return _shared('minicpm')
             if hw.ram_gb >= 2:
-                backend = MobileVLMBackend()
+                backend = _shared('mobilevlm')
                 if backend.is_available():
                     return backend
-                backend = CLIPBackend()
+                backend = _shared('clip')
                 if backend.is_available():
                     return backend
             if hw.ram_gb >= 1:
-                backend = CLIPBackend()
+                backend = _shared('clip')
                 if backend.is_available():
                     return backend
     except Exception:
         pass
 
     # Last resort: try minicpm (original behavior)
-    minicpm = MiniCPMBackend()
+    minicpm = _shared('minicpm')
     if minicpm.is_available():
         return minicpm
 
-    return NoneBackend()
+    return _shared('none')
 
 
 def get_document_readers() -> list:
@@ -1428,10 +1508,11 @@ def get_document_readers() -> list:
 
 
 def list_available_backends():
-    """Return list of (name, available, ram_mb) for all backends."""
+    """Return list of (name, available, ram_mb) for all backends: the
+    instances get_vision_backend hands its callers (_shared)."""
     results = []
-    for name, cls in _BACKENDS.items():
-        backend = cls()
+    for name in _BACKENDS:
+        backend = _shared(name)
         results.append({
             'name': name,
             'available': backend.is_available(),

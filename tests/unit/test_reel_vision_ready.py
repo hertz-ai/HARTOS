@@ -27,13 +27,16 @@ lightweight_backend's pooled_get / pooled_post), the platform event Nunba
 subscribes to (core.platform.events.emit_event), the standalone launcher's
 binary lookup, and sleep.
 
-What the reel did is counted on the reel's own backend (``_Reel``: its starts
-and its /health probes), and the waits on the thread the reel runs on, never
-as every call of a patched module function: those are process-wide, and any
-other thread may call them meanwhile.  Finding F1 (2026-10-14): in a batch,
-hart_intelligence_entry's import-time vision_init thread ran
-VisionService().start() inside a reel's window, and its two probes of the
-same /health URL were counted as the reel's (5 for 3 keyframes).
+What the reel did is counted on the reel's backend (``_Reel``: its starts
+and its /health probes) as the calls made on the thread the reel runs on, and
+the waits likewise, never as every call of a patched module function: those
+are process-wide, and any other thread may call them meanwhile.  Finding F1
+(2026-10-14): in a batch, hart_intelligence_entry's import-time vision_init
+thread ran VisionService().start() inside a reel's window, and its two probes
+of the same /health URL were counted as the reel's (5 for 3 keyframes).
+Since the owner's ruling of 2026-10-15 that thread holds the very same
+backend (one per process, get_vision_backend), so the backend alone no
+longer tells the reel's calls from VisionService's: the thread does.
 
     python -m pytest tests/unit/test_reel_vision_ready.py -q -p no:cacheprovider
 """
@@ -164,38 +167,53 @@ class _Clock:
 class _Reel:
     """The vision backends the reel's moments step resolved
     (moments._default_backend: get_vision_backend(REEL_VLM_DEFAULT), one per
-    score_moments call with keyframes), and what THEY did: ``starts``, calls
-    of their ensure_running, and ``probes``, calls of their _is_serving (one
-    GET /health each).  Another backend in this process probing the same URL,
-    on any thread, is not counted (finding F1, module docstring)."""
+    score_moments call with keyframes), and what the REEL did with them:
+    ``starts``, calls of their ensure_running, and ``probes``, calls of their
+    _is_serving (one GET /health each), made on the thread the reel resolved
+    them on.  Another thread's calls -- a VisionService holding the same
+    backend, probing the same URL -- are not counted (finding F1, module
+    docstring)."""
 
     def __init__(self):
         self.backends = []
+        self.start_calls = []
+        self.probe_calls = []
 
     @property
     def starts(self):
-        return sum(b.ensure_running.call_count for b in self.backends)
+        return len(self.start_calls)
 
     @property
     def probes(self):
-        return sum(b._is_serving.call_count for b in self.backends)
+        return len(self.probe_calls)
+
+
+def _counted_on(thread, calls, method):
+    """``method``, recording each call made on ``thread`` in ``calls``."""
+    def spy(*a, **kw):
+        if threading.get_ident() == thread:
+            calls.append(a)
+        return method(*a, **kw)
+    return spy
 
 
 @contextlib.contextmanager
 def _the_reels_backend(start=None):
     """Yields a ``_Reel`` for the backends moments resolves inside the
-    block, each with a spy on its own health check (the real one runs) and
-    on its own ensure_running: the real one, or ``start`` as its side effect
-    when given."""
+    block, each with a spy on its health check (the real one runs) and on
+    its ensure_running: the real one, or ``start`` in its place when given.
+    The spies count the calls on the thread that resolved the backend."""
     reel = _Reel()
     resolve = M._default_backend
 
     def resolved():
         backend = resolve()
         if backend is not None:
-            backend._is_serving = MagicMock(wraps=backend._is_serving)
-            backend.ensure_running = (MagicMock(side_effect=start) if start is not None
-                                      else MagicMock(wraps=backend.ensure_running))
+            me = threading.get_ident()
+            backend._is_serving = _counted_on(me, reel.probe_calls, backend._is_serving)
+            backend.ensure_running = _counted_on(
+                me, reel.start_calls,
+                start if start is not None else backend.ensure_running)
             reel.backends.append(backend)
         return backend
     with patch.object(M, '_default_backend', side_effect=resolved):
@@ -403,14 +421,18 @@ def test_another_threads_vision_start_is_not_counted_as_the_reels(clip_files, tm
                                                                    monkeypatch):
     """Finding F1 (2026-10-14), simulated: hart_intelligence_entry's
     import-time vision_init thread runs VisionService().start() while a reel
-    is being made.  Its get_vision_backend() asks a new Qwen08BBackend
-    is_available(), then start(): two GETs of the same /health URL, through
-    the same lightweight_backend.pooled_get, from another thread.  The port
-    answers them; the reel's own counts do not change."""
+    is being made.  Its get_vision_backend() hands it the reel's own backend
+    (one per process, owner ruling 2026-10-15; here the 0.8B by name, as on a
+    node whose vision backend is the 0.8B): it asks is_available(), then
+    start(): two GETs of the same /health URL, through the same
+    lightweight_backend.pooled_get, from another thread.  The port answers
+    them; the reel's own counts do not change."""
     joined = []
+    strays = []
 
     def vision_init():
-        stray = lvb.Qwen08BBackend()        # the env's caption port, as the reel's
+        stray = lvb.get_vision_backend(M.REEL_VLM_DEFAULT)
+        strays.append(stray)
         stray.is_available()
         stray.start()
 
@@ -422,6 +444,8 @@ def test_another_threads_vision_start_is_not_counted_as_the_reels(clip_files, tm
     result, reel, picked, srv, post = _a_reel_whose_start_raises(
         clip_files, tmp_path, monkeypatch, meanwhile=meanwhile)
     assert joined == [True]
+    assert len(strays) == 1 and strays[0] is reel.backends[0], \
+        "VisionService's thread did not get the reel's backend"
     assert result['status'] == 'ok', result
     # The other thread's two probes reached the port, at the reel's own URL:
     # every pooled_get, or every probe of that URL, is the frames plus two.

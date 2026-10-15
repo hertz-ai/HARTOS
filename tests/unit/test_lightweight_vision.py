@@ -308,6 +308,51 @@ class TestGetVisionBackend:
         backend = get_vision_backend('imaginary')
         assert backend.name == 'none'
 
+    # ── one instance of each backend per process (owner ruling 2026-10-15) ──
+    # The reel names its backend (moments.REEL_VLM_DEFAULT), VisionService and
+    # the book reader take the auto pick.  Each used to get a NEW instance, so
+    # each had its own "a start is under way" state, and two of them spawned
+    # two 0.8B servers on one port (reviewer F1, a HARTOS-only node).
+
+    @pytest.mark.parametrize('name', sorted(_BACKENDS))
+    def test_every_caller_naming_a_backend_gets_the_same_instance(self, name):
+        assert get_vision_backend(name) is get_vision_backend(name)
+
+    def test_an_unknown_name_is_the_one_none_backend(self):
+        assert get_vision_backend('imaginary') is get_vision_backend('none')
+
+    def test_the_auto_pick_is_the_instance_the_reel_names(self):
+        """VisionService and the book reader (auto pick) and the reel
+        (get_vision_backend('qwen08b')) hold one backend, so its start state
+        covers all three."""
+        from integrations.vision.lightweight_backend import Qwen08BBackend
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('HEVOLVE_VISION_BACKEND', None)
+            with patch.object(Qwen08BBackend, 'is_available', return_value=True):
+                assert get_vision_backend() is get_vision_backend('qwen08b')
+
+    def test_the_env_override_hands_out_the_shared_instance(self):
+        with patch.dict(os.environ, {'HEVOLVE_VISION_BACKEND': 'clip'}):
+            assert get_vision_backend() is get_vision_backend('clip')
+
+    def test_the_fallback_tiers_hand_out_the_shared_instances(self):
+        mock_caps = MagicMock()
+        mock_caps.hardware.gpu_vram_gb = 8
+        mock_caps.hardware.ram_gb = 16
+        with self._upper_tiers_off(), \
+             patch('security.system_requirements.get_capabilities',
+                   return_value=mock_caps):
+            assert get_vision_backend() is get_vision_backend('minicpm')
+
+    def test_the_backend_listing_asks_the_shared_instances(self):
+        """list_available_backends reports on the instances callers hold,
+        not on throwaway copies."""
+        from integrations.vision.lightweight_backend import Qwen08BBackend
+        with patch.object(Qwen08BBackend, 'is_available', autospec=True,
+                          return_value=False) as asked:
+            list_available_backends()
+        assert asked.call_args.args[0] is get_vision_backend('qwen08b')
+
     @staticmethod
     @contextlib.contextmanager
     def _upper_tiers_off():
