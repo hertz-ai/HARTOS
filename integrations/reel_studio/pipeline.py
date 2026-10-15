@@ -413,7 +413,9 @@ def _ok_message(media: Mapping, notes: Sequence[str], song_note: Optional[str] =
     shows one of the reply and the push (it dedups them by xid), not always
     the push.  With no song suggested it asks for none: a song named here
     would be one the reel does not have.  ``moments`` is the reel's moment
-    list (moments.score_moments): its stats say whether any frame was asked."""
+    list (moments.score_moments): its stats say whether any frame was asked.
+    A vision model that is not on this computer (moments.NOTE_VLM_ABSENT) is
+    said as that, with why, never as a model that gave no answer."""
     text = ('The reel is made, checked and on its way to her phone (it also rides this '
             'reply). Tell her it is ready, ')
     if _suggests_song(media.get('song')):
@@ -430,10 +432,35 @@ def _ok_message(media: Mapping, notes: Sequence[str], song_note: Optional[str] =
     if C.NOTE_NO_FINAL_LOOK in notes:
         text += (' No finished look was found in the clips, so the reel ends on the last shot; '
                  'say so.')
-    from integrations.reel_studio.media.moments import NOTE_VLM_BUDGET, NOTE_VLM_FALLBACK
+    from integrations.reel_studio.media.moments import (
+        ABSENT_DECLINED, ABSENT_NO_OWNER, ABSENT_NOT_DOWNLOADED, NOTE_VLM_ABSENT,
+        NOTE_VLM_BUDGET, NOTE_VLM_FALLBACK)
     stats = moments.get('stats') if isinstance(moments, Mapping) else None
     none_asked = isinstance(stats, Mapping) and stats.get('calls') == 0
-    if NOTE_VLM_FALLBACK in notes and NOTE_VLM_BUDGET in notes and none_asked:
+    absent = next((n[len(NOTE_VLM_ABSENT % ''):] for n in notes
+                   if n.startswith(NOTE_VLM_ABSENT % '')), None)
+    if absent is not None:
+        # The model is not on this computer (moments._absent): nothing was
+        # asked of it, so 'no answer' or 'still starting' would be false
+        # (review of Nunba be748369).
+        why = {
+            ABSENT_DECLINED: (
+                ' The owner of this computer said no to downloading the vision model that '
+                'judges the shots, so the shots were chosen by sharpness and filming order '
+                'instead; say so.'),
+            ABSENT_NO_OWNER: (
+                ' The vision model that judges the shots is not on this computer, and nobody '
+                'is set up on it to approve downloading it, so the shots were chosen by '
+                'sharpness and filming order instead; say so.'),
+            ABSENT_NOT_DOWNLOADED: (
+                ' The vision model that judges the shots is not on this computer yet, so the '
+                'shots were chosen by sharpness and filming order instead; say so. It is '
+                'downloaded once the owner of this computer says yes on its setup card and '
+                'there is room for it on the disk (the setup card there says which is still '
+                'missing), and the reels after that use it.'),
+        }
+        text += why.get(absent, why[ABSENT_NOT_DOWNLOADED])
+    elif NOTE_VLM_FALLBACK in notes and NOTE_VLM_BUDGET in notes and none_asked:
         # No frame rated, the time ran out, and not one frame was asked: the
         # start (asked before the first frame, its time counted against the
         # budget) used it all.  A frame asked that timed out is a model that

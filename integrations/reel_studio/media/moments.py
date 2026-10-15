@@ -40,6 +40,16 @@ time it takes COUNTS AGAINST BUDGET_S and is NOT capped by it, so a slow
 start leaves the frames less time or none, and the step can run past
 BUDGET_S.  A reel whose frames are all cached asks for no start.
 
+A start that answers False with the model's weights not on this computer
+(the backend's is_available(): no server, no weights) is a model that is
+absent, not one that gave no answer: Nunba's caption start downloads the
+0.8B only with room for it and the owner's yes on the consent card
+(amendment A25b).  Its frames are not sent to a server that is not there,
+and the list says why (NOTE_VLM_ABSENT, read with capability_setup: the
+owner said no, nobody is set to approve it, or it is not downloaded yet),
+so the reply can say so.  A start that raises is not taken for that: its
+frames are asked one by one, as before.
+
 Ratings are cached under the data dir (<data>/reel_studio/cache/moments/),
 keyed by the frame's bytes, the backend, the prompt and the request size;
 only parsed ratings are cached, never a fallback, and entries older than
@@ -103,6 +113,12 @@ NOTE_VLM_FALLBACK = 'vlm_fallback'      # no keyframe was rated: all fell back
 NOTE_VLM_PARTIAL = 'vlm_partial'        # some keyframes fell back
 NOTE_VLM_BUDGET = 'vlm_budget'          # the time budget ran out before the end
 NOTE_STAGES_SMOOTHED = 'stages_smoothed'  # a label the model gave was corrected
+#: The vision model is not on this computer, and why ('vlm_absent:<why>',
+#: one of the ABSENT_* below); no frame was sent.
+NOTE_VLM_ABSENT = 'vlm_absent:%s'
+ABSENT_DECLINED = 'declined'            # the owner said no to downloading it
+ABSENT_NO_OWNER = 'no_owner'            # nobody is set to approve the download here
+ABSENT_NOT_DOWNLOADED = 'not_downloaded'  # waiting for the owner's yes, room, or its download
 
 #: What each stage means, for the prompt.  Keyed by contracts.STAGES, so the
 #: prompt names exactly the labels the parser accepts.
@@ -475,6 +491,35 @@ def _backend_name(backend) -> str:
     return name if isinstance(name, str) and name else type(backend).__name__
 
 
+def _absent(backend) -> Optional[str]:
+    """Why the vision model is not on this computer, asked after its start
+    said False; None when it is there, or when that cannot be told.
+
+    The backend's is_available() says whether it could answer at all: a
+    server up, or (the 0.8B) its weights whole on disk.  When it says no,
+    the owner's answer on the consent card (capability_setup, read only:
+    setup_owner, setup_declined on the backend's SETUP_CAPABILITY, the
+    scope Nunba's caption start asks under) tells ABSENT_DECLINED and
+    ABSENT_NO_OWNER from ABSENT_NOT_DOWNLOADED.  A consent store that cannot
+    be read leaves ABSENT_NOT_DOWNLOADED.  Never raises."""
+    try:
+        if backend.is_available():
+            return None
+    except Exception as e:      # cannot tell: the frames are asked, as before
+        logger.warning('moments: could not tell whether the vision model is here (%s)', e)
+        return None
+    try:
+        from integrations.agent_engine.capability_setup import setup_declined, setup_owner
+        if not setup_owner():
+            return ABSENT_NO_OWNER
+        capability = getattr(backend, 'SETUP_CAPABILITY', None)
+        if isinstance(capability, str) and capability and setup_declined(capability):
+            return ABSENT_DECLINED
+    except Exception as e:
+        logger.warning('moments: the owner\'s answer on the vision model is unknown (%s)', e)
+    return ABSENT_NOT_DOWNLOADED
+
+
 def _ask(backend, keyframe: Keyframe, timeout_s: float) -> Optional[str]:
     try:
         return backend.rate_frame(keyframe.jpeg, RUBRIC_PROMPT, long_side=LONG_SIDE,
@@ -506,7 +551,9 @@ def score_moments(keyframes: Sequence[Keyframe], *, backend=None, cache_dir: Opt
     takes COUNTS AGAINST ``budget_s`` and is NOT capped by it, so this call
     can take longer than ``budget_s`` (review of b263da313, 2026-10-14: a
     2.0 s budget took 11.05 s).  Frames the model does not rate fall back
-    one by one, also when the start raises.
+    one by one, also when the start raises.  A start that says False for a
+    model that is not on this computer (_absent) sends no frame at all, and
+    the notes carry NOTE_VLM_ABSENT with why.
 
     Returns ``{'schema': 'hart.reel.moments.v1', 'src': 'vlm'|'fallback'|
     'mixed', 'model': backend name or None, 'final_look_found', 'notes',
@@ -529,6 +576,8 @@ def score_moments(keyframes: Sequence[Keyframe], *, backend=None, cache_dir: Opt
         if root:
             cache = _RatingCache(root, _backend_name(backend))
     start_asked = False
+    #: Why the model is not on this computer (_absent), once its start said so.
+    absent: Optional[str] = None
 
     ratings: List[Optional[Dict[str, Any]]] = []
     calls = cached = 0
@@ -546,12 +595,17 @@ def score_moments(keyframes: Sequence[Keyframe], *, backend=None, cache_dir: Opt
                 # A13).  on_start is said only if that start has to wait.
                 # rate_frame itself never starts a server.
                 start_asked = True
+                ready = None
                 try:
-                    backend.ensure_running(on_wait=on_start)
+                    ready = backend.ensure_running(on_wait=on_start)
                 except Exception as e:      # the frames fall back one by one
                     logger.warning('moments: the vision model could not be started (%s)', e)
+                if ready is False:
+                    absent = _absent(backend)
                 left = budget_s - (monotonic() - started)
-            if left < MIN_CALL_S:
+            if absent is not None:
+                pass                        # nothing to ask: the frame falls back
+            elif left < MIN_CALL_S:
                 out_of_time = True
             else:
                 calls += 1
@@ -573,6 +627,8 @@ def score_moments(keyframes: Sequence[Keyframe], *, backend=None, cache_dir: Opt
         notes.append(NOTE_VLM_PARTIAL)
     if out_of_time:
         notes.append(NOTE_VLM_BUDGET)
+    if absent is not None:
+        notes.append(NOTE_VLM_ABSENT % absent)
     if any(a.src == 'vlm' and a.stage != b.stage for a, b in zip(given, moments)):
         notes.append(NOTE_STAGES_SMOOTHED)
     kinds = {m.src for m in moments}
@@ -593,4 +649,5 @@ def score_moments(keyframes: Sequence[Keyframe], *, backend=None, cache_dir: Opt
 __all__ = ['REEL_VLM_DEFAULT', 'RUBRIC_PROMPT', 'LONG_SIDE', 'MAX_TOKENS', 'BUDGET_S',
            'PER_CALL_CAP_S', 'MIN_CALL_S', 'VLM_WEIGHT', 'CACHE_MAX_AGE_S',
            'NOTE_VLM_FALLBACK', 'NOTE_VLM_PARTIAL', 'NOTE_VLM_BUDGET', 'NOTE_STAGES_SMOOTHED',
+           'NOTE_VLM_ABSENT', 'ABSENT_DECLINED', 'ABSENT_NO_OWNER', 'ABSENT_NOT_DOWNLOADED',
            'parse_rating', 'smooth_stages', 'fallback_moments', 'score_moments']

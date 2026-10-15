@@ -80,6 +80,19 @@ def _caption_port_env(monkeypatch):
     monkeypatch.setenv('HEVOLVE_VLM_CAPTION_PORT', '18081')
 
 
+@pytest.fixture(autouse=True)
+def _the_08b_weights_are_here(monkeypatch):
+    """The 0.8B's files are on this computer unless a test says otherwise
+    (``no_weights``).  A start that says False is then a server that did not
+    come up, and its frames are still asked; without its weights it is a
+    model that is absent (moments._absent asks is_available, which looks
+    for them through _model_files).  Pinned, so no test here depends on
+    whether this box has the 0.8B in its models folder."""
+    monkeypatch.setattr(lvb.Qwen08BBackend, '_model_files',
+                        lambda self: ('/models/Qwen3.5-0.8B-UD-Q4_K_XL.gguf',
+                                      '/models/mmproj-Qwen3.5-0.8B-F16.gguf'))
+
+
 def _jpeg(shade):
     from PIL import Image
     buf = io.BytesIO()
@@ -703,6 +716,104 @@ def test_a_moment_list_that_does_not_say_what_was_asked_claims_no_start(turn):
                                 'notes': [M.NOTE_VLM_FALLBACK, M.NOTE_VLM_BUDGET]})
     assert 'still starting' not in message, message
     assert 'no answer' in message, message
+
+
+# ── a vision model that is not on this computer ──────────────────────────
+
+@pytest.fixture
+def no_weights(monkeypatch):
+    """The 0.8B's weights and projector are not on this computer."""
+    monkeypatch.setattr(lvb.Qwen08BBackend, '_model_files', lambda self: (None, None))
+
+
+@pytest.fixture
+def owner_answer(monkeypatch):
+    """The owner's answer on the consent card, as capability_setup reads
+    it: ``owner`` (setup_owner; None is a node with nobody to ask) and
+    ``declined`` (setup_declined); ``asked`` records the capabilities read."""
+    from integrations.agent_engine import capability_setup
+    answer = SimpleNamespace(owner='owner-1', declined=False, asked=[])
+    monkeypatch.setattr(capability_setup, 'setup_owner', lambda: answer.owner)
+
+    def declined(capability):
+        answer.asked.append(capability)
+        return answer.declined
+    monkeypatch.setattr(capability_setup, 'setup_declined', declined)
+    return answer
+
+
+def _absent_reel(turn, owner_answer, **answer):
+    """The real score_moments with the 0.8B not on this computer and
+    Nunba's start refusing to fetch it (nothing comes up on the port), then
+    what her agent is told.  Returns (moment list, POST mock, message)."""
+    for key, value in answer.items():
+        setattr(owner_answer, key, value)
+    srv = _CaptionServer(up=False, nunba_starts_it=False, clock=_Clock(), start_s=35.0)
+    moments, post = _scored(turn, srv, _keys(3))
+    assert len(srv.asks) == 1, 'the start was not asked: nothing could file the ask'
+    return moments, post, _reply_for(turn, moments)
+
+
+def test_a_model_not_on_this_computer_is_said_and_no_frame_is_sent(turn, no_weights,
+                                                                    owner_answer):
+    """Review of Nunba be748369: Nunba's start refused to download the 0.8B
+    (no yes on the consent card yet, or no room), so nothing came up.  Her
+    agent was told 'the vision model gave no answer' -- false: the model is
+    not on this computer.  Now no frame goes to the port, the list says why
+    (vlm_absent:not_downloaded) and the reply says the model is not here
+    yet, that its download waits for the owner's yes and room on the disk,
+    and never that it gave no answer or was still starting."""
+    moments, post, message = _absent_reel(turn, owner_answer)
+    post.assert_not_called()
+    assert moments['stats']['calls'] == 0
+    assert moments['src'] == 'fallback'
+    assert moments['notes'] == [M.NOTE_VLM_FALLBACK,
+                                M.NOTE_VLM_ABSENT % M.ABSENT_NOT_DOWNLOADED], moments['notes']
+    assert owner_answer.asked == [lvb.Qwen08BBackend.SETUP_CAPABILITY]
+    assert 'not on this computer' in message and 'setup card' in message, message
+    assert 'yes' in message and 'disk' in message, message
+    assert 'no answer' not in message and 'still starting' not in message, message
+
+
+def test_a_model_the_owner_said_no_to_is_said(turn, no_weights, owner_answer):
+    moments, post, message = _absent_reel(turn, owner_answer, declined=True)
+    post.assert_not_called()
+    assert M.NOTE_VLM_ABSENT % M.ABSENT_DECLINED in moments['notes'], moments['notes']
+    assert 'said no' in message and 'vision model' in message, message
+    assert 'no answer' not in message and 'setup card' not in message, message
+
+
+def test_a_model_nobody_can_approve_is_said(turn, no_weights, owner_answer):
+    """A node with no owner (HEVOLVE_OWNER_USER_ID unset): nobody is asked,
+    so the 0.8B is never downloaded here, and the reply says that."""
+    moments, post, message = _absent_reel(turn, owner_answer, owner=None)
+    post.assert_not_called()
+    assert M.NOTE_VLM_ABSENT % M.ABSENT_NO_OWNER in moments['notes'], moments['notes']
+    assert owner_answer.asked == [], 'nobody to ask: no answer to read'
+    assert 'nobody' in message and 'approve' in message, message
+    assert 'no answer' not in message, message
+
+
+def test_the_scope_read_is_the_one_nunbas_start_asks_under():
+    """One spelling: 'model:' + the catalog row the 0.8B backend serves."""
+    assert lvb.Qwen08BBackend.SETUP_CAPABILITY == 'model:' + lvb.Qwen08BBackend.CATALOG_ID
+
+
+def test_a_start_that_raises_without_the_weights_still_asks_each_frame(turn, no_weights,
+                                                                       owner_answer):
+    """Only a start that SAYS False is read for an absent model; a start
+    that raised says nothing about it, so the frames are asked one by one
+    (the existing fallback path) and nothing is claimed about the model."""
+    def broken_start(on_wait=None):
+        raise RuntimeError('the launcher broke')
+    srv = _CaptionServer(up=False, nunba_starts_it=False)
+    with _the_reels_backend(start=broken_start) as reel, \
+         patch.object(lvb, 'pooled_get', side_effect=srv.health), \
+         patch.object(lvb, 'pooled_post', side_effect=srv.complete) as post:
+        doc = M.score_moments(_keys(3), cache_dir=str(turn.tmp / 'cache'))
+    assert reel.probes == 3 and doc['stats']['calls'] == 3
+    post.assert_not_called()
+    assert not any(n.startswith('vlm_absent') for n in doc['notes']), doc['notes']
 
 
 def test_a_reel_the_model_rated_does_not_say_it_fell_back(turn):

@@ -805,8 +805,9 @@ class Qwen08BBackend(VisionBackend):
         weights the launch would start (a custom NUNBA_MODELS_DIR, a saved
         models_dir, the catalog's folder) were never selected (review of
         6067e8806).  Whole weights alone make it selectable, not the
-        projector: Nunba's start fetches a missing projector itself
-        (llama_config._do_start_caption_server, _download_mmproj_only).
+        projector: Nunba's start fetches a missing projector itself, with
+        room for it and the owner's yes on SETUP_CAPABILITY
+        (llama_config.start_caption_server), and starts without it until then.
         Whole by the one completeness rule (see _model_files): a partial
         download, which the launch could only fail to load, is not
         selectable.  A lookup that fails -- the catalog unreadable, so the
@@ -876,6 +877,13 @@ class Qwen08BBackend(VisionBackend):
     #: its projector, as Nunba's start_caption_server runs them):
     #: model_catalog._populate_llm_models.
     CATALOG_ID = 'llm-qwen3.5-0.8b'
+    #: What the owner is asked about before this row's files are downloaded:
+    #: the scope of capability_setup.ask_owner_for_setup's consent card.
+    #: Nunba's caption start (llama_config.start_caption_server) asks under
+    #: it and downloads only on a yes (owner ruling 2026-10-15); Reel Studio
+    #: reads the answer by it (capability_setup.setup_declined) to say why
+    #: no frame was rated.  One spelling for the asker and every reader.
+    SETUP_CAPABILITY = 'model:' + CATALOG_ID
 
     def __init__(self, port: int = None):
         from core.port_registry import get_port
