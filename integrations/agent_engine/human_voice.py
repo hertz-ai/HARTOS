@@ -343,7 +343,7 @@ PHRASES = (
 #: grepped for, to call the docs machine-written.  scripts/check_docs_claims.py
 #: reports them as tells, beside WORDS and PHRASES, each with any ending.
 #: Never rewritten, so machine_text_lexicon() leaves them out: in a reel
-#: caption "an honest review" or "genuine lashes" is plain speech.
+#: caption "an honest review" or "genuine silk" is plain speech.
 DOCS_TELLS = ('load-bearing', 'load bearing', 'honest', 'genuine',
               'earns its keep', 'earned its keep')
 

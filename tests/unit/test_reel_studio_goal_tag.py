@@ -39,15 +39,16 @@ from integrations.agent_engine.marketing_tools import (
 #: Her agent's own words: they name her reels and trip media (songs).
 HER_GOAL = "Edit my reels for my bridal clients, Tamil songs"
 
-#: Goals of a commerce lane whose customers are makeup artists: none of them
-#: is a reel studio, whatever words about makeup or reels they use.
+#: Commerce, marketing and outreach goals that name makeup artists or reels
+#: (generic placeholders): none of them is a reel studio, whatever words
+#: about makeup or reels they use.
 COMMERCE_LANE = [
-    'Find bridal makeup artists in Chennai and pitch our lash extensions',
-    'Source makeup artists in Mumbai as leads for eyelash sales',
-    'Post Instagram reels showcasing our lash extensions to makeup artists',
-    'hire a reel editor for our lash brand',
+    'Find bridal makeup artists and pitch our product',
+    'Source makeup artists as leads for our sales team',
+    'Post Instagram reels showcasing our product to makeup artists',
+    'hire a reel editor for our brand',
     'Run a lead gen campaign for bridal makeup artists and send a cold email '
-    'about our lash extensions',
+    'about our product',
     'Onboard my store on McGroce and post an Instagram reel about the new SKU '
     'to makeup artists',
 ]

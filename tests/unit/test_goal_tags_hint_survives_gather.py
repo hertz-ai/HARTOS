@@ -241,10 +241,10 @@ def test_a_reel_tag_the_gather_llm_wrote_itself_is_dropped(chat):
 
 
 def test_a_commerce_lane_goal_is_saved_and_synced_as_before(chat):
-    answer = _completed('Find bridal makeup artists in Chennai and pitch our lash '
-                        'extensions', ['Post Instagram reels to makeup artists'])
+    answer = _completed('Find bridal makeup artists and pitch our product',
+                        ['Post Instagram reels to makeup artists'])
     chat.answers += [REVIEW, answer]
-    chat.turn('find makeup artists for our lash extensions')
+    chat.turn('find makeup artists and pitch our product')
     chat.turn('yes')
     assert chat.saved() == dict(json.loads(answer), prompt_id=chat.pid,
                                 creator_user_id=chat.user)

@@ -119,7 +119,7 @@ def test_on_central_request_tools_never_attaches_a_reel_tool(seats, roomy, monke
     from security import key_delegation
     monkeypatch.setattr(key_delegation, 'get_node_tier', lambda: 'central')
     built = seats(pipeline, goal_tags=['reel_studio'], goal=HER_GOAL)
-    reply = _request_tools(seats, built, 'instagram reels for our lash extensions')
+    reply = _request_tools(seats, built, 'instagram reels for our product')
     every = _every_reel_name()
     for seat in (built.helper, built.assistant, built.executor):
         assert not every & (schema(seat) | runs(seat)), (pipeline, seat.name)

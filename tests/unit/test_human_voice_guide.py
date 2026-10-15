@@ -179,7 +179,7 @@ def test_the_docs_extension_adds_and_never_reaches_the_humanizer():
     hv = _guide()
     listed = {t.find.casefold() for t in hv.WORDS + hv.PHRASES}
     assert hv.DOCS_TELLS and not listed & {f.casefold() for f in hv.DOCS_TELLS}
-    text = 'An honest review of a genuine lash glue that earns its keep.'
+    text = 'An honest review of a genuine setting spray that earns its keep.'
     assert humanize.humanize_text(text)['text'] == text
 
 

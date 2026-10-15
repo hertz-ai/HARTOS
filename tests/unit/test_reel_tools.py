@@ -230,7 +230,7 @@ def test_every_tool_says_what_it_does_on_its_first_docstring_line(env):
 def test_on_the_central_node_no_reel_tool_is_registered(env, monkeypatch):
     """Amendment A8 d: reel_studio is inert on central, so no reel tool sits
     on any of central's agents, not even execution-only for request_tools to
-    re-attach ("instagram reels for our lash extensions" would match
+    re-attach ("instagram reels for our product" would match
     reel_make's docstring)."""
     from integrations.reel_studio import jobs
     from security import key_delegation
