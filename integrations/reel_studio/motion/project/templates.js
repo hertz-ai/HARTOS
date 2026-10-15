@@ -9,7 +9,8 @@
 // numbers, so the same props always render the same frames.
 //
 //   Title      a kinetic title: its words spring in one after another on a
-//              soft dark plate, then fade together.
+//              soft dark plate, then fade together; its size and rows are
+//              fit.js's (fitTitle), so the plate fits its box.
 //   EndCard    a booking/price card that rises in: the first line large
 //              (her service), her price -- the row priceRow names, none when
 //              it is -1 -- in the accent colour, the rest smaller (how to
@@ -23,6 +24,8 @@ const {
   AbsoluteFill, Composition, Easing, Img, interpolate, spring, useCurrentFrame, useVideoConfig,
 } = require('remotion');
 
+const {TITLE, fitTitle} = require('./fit');
+
 const h = React.createElement;
 // The Windows font with Tamil, Devanagari and Gurmukhi first, then common
 // sans fonts; the browser falls back per character.
@@ -34,34 +37,52 @@ function fadeOut(frame, total, fps) {
   return interpolate(frame, [total - len, total - 1], [1, 0], CLAMP);
 }
 
+// A word's drawn width at a size in the title's font, from the browser's
+// own text machinery (a canvas 2D context): fitTitle's measure.
+function titleMeasure() {
+  const context = document.createElement('canvas').getContext('2d');
+  return (word, size) => {
+    context.font = `${TITLE.weight} ${size}px ${FONT}`;
+    return context.measureText(word).width;
+  };
+}
+
 function Title({text, accent}) {
   const frame = useCurrentFrame();
   const {fps, width, height, durationInFrames} = useVideoConfig();
-  const words = String(text || '').split(/\s+/).filter(Boolean);
-  const longest = words.reduce((n, w) => Math.max(n, w.length), 1);
-  const chars = Math.max(6, Math.min(String(text || '').length, 22));
-  const size = Math.round(Math.min(height * 0.3, (width * 0.86) / (Math.max(chars / 1.6, longest) * 0.58)));
+  const title = React.useMemo(() => fitTitle(String(text || '').split(/\s+/).filter(Boolean),
+                                             titleMeasure(), {width, height}),
+                              [text, width, height]);
+  const g = title.geometry;
   const plate = spring({frame, fps, config: {damping: 18, stiffness: 140}});
+  let index = 0;
   return h(AbsoluteFill, {style: {alignItems: 'center', justifyContent: 'center',
                                   opacity: fadeOut(frame, durationInFrames, fps)}},
+    // The plate clips what it holds, so the letters' soft shadow and a word
+    // still springing in end at the plate's edge, which fits the box: the
+    // first fitted render showed the shadow's tail cut at the box's edge.
     h('div', {style: {
-      display: 'flex', flexWrap: 'wrap', justifyContent: 'center', alignItems: 'center',
-      columnGap: Math.round(size * 0.28), rowGap: Math.round(size * 0.08),
-      maxWidth: Math.round(width * 0.94), padding: `${Math.round(size * 0.22)}px ${Math.round(size * 0.4)}px`,
-      borderRadius: Math.round(size * 0.35), background: 'rgba(0, 0, 0, 0.42)',
+      display: 'flex', flexDirection: 'column', alignItems: 'center', rowGap: g.rowGap,
+      boxSizing: 'border-box', padding: `${g.padY}px ${g.padX}px`, overflow: 'hidden',
+      borderRadius: g.radius, background: 'rgba(0, 0, 0, 0.42)',
       transform: `scale(${0.9 + 0.1 * plate})`, opacity: plate,
-      borderBottom: `${Math.max(3, Math.round(size * 0.06))}px solid ${accent}`,
+      borderBottom: `${g.rule}px solid ${accent}`,
     }},
-      words.map((word, i) => {
-        const s = spring({frame: frame - i * Math.round(fps * 0.12), fps,
-                          config: {damping: 11, stiffness: 190}});
-        return h('span', {key: i, style: {
-          display: 'inline-block', color: '#FFFFFF', fontFamily: FONT, fontWeight: 800,
-          fontSize: size, lineHeight: 1.12, opacity: Math.min(1, s * 1.4),
-          transform: `translateY(${Math.round((1 - s) * size * 0.6)}px) scale(${0.55 + 0.45 * s})`,
-          textShadow: '0 4px 18px rgba(0, 0, 0, 0.55)',
-        }}, word);
-      })));
+      title.rows.map((row, r) => h('div', {key: r, style: {
+        display: 'flex', flexWrap: 'nowrap', justifyContent: 'center', columnGap: g.columnGap,
+      }},
+        row.words.map((word) => {
+          const i = index++;
+          const s = spring({frame: frame - i * Math.round(fps * 0.12), fps,
+                            config: {damping: 11, stiffness: 190}});
+          return h('span', {key: i, style: {
+            display: 'inline-block', color: '#FFFFFF', fontFamily: FONT, fontWeight: TITLE.weight,
+            fontSize: g.size, lineHeight: TITLE.lineHeight, whiteSpace: 'nowrap',
+            opacity: Math.min(1, s * 1.4),
+            transform: `translateY(${Math.round((1 - s) * g.size * 0.6)}px) scale(${0.55 + 0.45 * s})`,
+            textShadow: '0 4px 18px rgba(0, 0, 0, 0.55)',
+          }}, word);
+        })))));
 }
 
 function EndCard({lines, priceRow, accent}) {

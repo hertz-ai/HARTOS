@@ -25,6 +25,14 @@ pytest (no test_ prefix):
    runs QA (media.qa), and checks: the step's note is motion:rendered, every
    hard QA check passes, and the frame inside each overlay's box while it
    plays differs from the same frame of a plain render.
+4. Renders the animated title alone for LONG_HOOKS, in the title box the
+   layout gives this reel and at layout.TITLE_MIN_H, and checks every
+   frame: its letters are drawn, and nothing of it -- plate, letters or
+   their shadow, at any alpha -- touches the box's edges (a cut row does).
+   Review r3 of b0fa8c26e: a four-word Tamil hook lost its first and last
+   rows, a six-word English one was clipped.  A frame after the words have
+   settled is written over grey as title_<n>_<height>.png in the work
+   folder, to look at.
 
 Exit 0 when every check passes, 1 when one fails, 2 when it cannot run here.
 """
@@ -39,6 +47,13 @@ import time
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+
+#: Hooks inside reel_edit's six words that the first real render cut.
+LONG_HOOKS = ('மணப்பெண் அலங்காரம் இப்படித்தான் மாறியது',
+              'Watch her bridal transformation unfold today')
+#: When the title's frame to look at is taken (seconds): its words have
+#: settled, its fade-out has not begun.
+TITLE_SETTLED_S = 1.5
 
 
 def _say(*parts):
@@ -119,6 +134,63 @@ def _frame(path, t_s):
         stream.close()
 
 
+def _alphas(path, w, h):
+    """The alpha of every frame of a clip, as (h, w) arrays."""
+    import numpy as np
+    from core import media_bin
+    stream = media_bin.ffmpeg_stream(
+        ['-loglevel', 'error', '-i', path, '-f', 'rawvideo', '-pix_fmt', 'rgba', 'pipe:1'],
+        frame_bytes=w * h * 4, timeout_s=120)
+    try:
+        for buf in stream:
+            yield np.frombuffer(buf, np.uint8).reshape(h, w, 4)[:, :, 3]
+    finally:
+        stream.close()
+
+
+def _title_checks(work, edl):
+    """Step 4 of the module note; the failures."""
+    from integrations.reel_studio import contracts as C
+    from integrations.reel_studio.motion import layout, runtime
+    from core import media_bin
+    fps = int(C.CANVAS['fps'])
+    jobs = []
+    for n, hook in enumerate(LONG_HOOKS):
+        [item] = layout.plan_motion(edl, ['title'], hook_text=hook).items
+        x0, y0, x1, y1 = item.box
+        for height in sorted({int(y1 - y0), layout.TITLE_MIN_H}, reverse=True):
+            props = dict(item.props, width=int(x1 - x0), height=height, fps=fps,
+                         durationInFrames=int(round((item.to_s - item.from_s) * fps)))
+            jobs.append({'id': layout.TEMPLATE_IDS['title'], 'props': props,
+                         'out': os.path.join(work, 'title_%d_%d.mov' % (n, height))})
+    runtime.render(jobs, os.path.join(work, 'titles'))
+    failures = []
+    for job in jobs:
+        w, h = job['props']['width'], job['props']['height']
+        media_bin.run_ffmpeg(
+            ['-y', '-loglevel', 'error', '-ss', '%.3f' % TITLE_SETTLED_S, '-i', job['out'],
+             '-filter_complex', 'color=c=0x505050:s=%dx%d[bg];[bg][0:v]overlay=format=auto'
+             % (w, h), '-frames:v', '1', job['out'][:-4] + '.png'], timeout_s=60)
+        name = '%r at %dx%d' % (job['props']['text'], w, h)
+        letters, cut, margins = False, [], [h, h, w, w]
+        for k, alpha in enumerate(_alphas(job['out'], w, h)):
+            letters = letters or bool((alpha >= 250).any())     # opaque: the letters
+            rows, cols = alpha.any(axis=1).nonzero()[0], alpha.any(axis=0).nonzero()[0]
+            if not len(rows):
+                continue
+            seen = [rows.min(), h - 1 - rows.max(), cols.min(), w - 1 - cols.max()]
+            margins = [min(m, s) for m, s in zip(margins, seen)]
+            if 0 in seen:
+                cut.append(k)
+        _say('title %s: fewest clear px above, below, left, right in any frame: %s'
+             % (name, ', '.join(str(int(m)) for m in margins)))
+        if not letters:
+            failures.append('the title %s drew no letters' % name)
+        if cut:
+            failures.append('the title %s touches its box edge (cut) in frames %s' % (name, cut))
+    return failures
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     parser.add_argument('--out', default=None, help='work folder (default: a temp folder)')
@@ -183,6 +255,7 @@ def main(argv=None) -> int:
         _say('%s at %.2f s: mean difference %.1f inside its box' % (ov['template'], t, diff))
         if diff < 4.0:
             failures.append('%s left no visible mark in its box' % ov['template'])
+    failures.extend(_title_checks(work, edl))
     _say('reel:', reel)
     for f in failures:
         _say('FAIL:', f)
