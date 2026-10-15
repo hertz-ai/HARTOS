@@ -555,7 +555,10 @@ class RuntimeToolManager:
     # ── State persistence ────────────────────────────────────────
 
     def save_state(self) -> None:
-        """Persist tool state to JSON."""
+        """Persist tool state to JSON.  Never raises: the file is a hint for
+        the next start (load_state), and setup_tool ends with this, so a
+        state folder that cannot be made fails no setup (amendment A24b ii;
+        it used to be made outside the try)."""
         state = {
             'tools': {},
             'ports': dict(self._ports),
@@ -567,8 +570,8 @@ class RuntimeToolManager:
                 'port': self._ports.get(name),
             }
 
-        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         try:
+            STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
             STATE_FILE.write_text(json.dumps(state, indent=2))
         except Exception as e:
             logger.warning(f"Failed to save tool state: {e}")
