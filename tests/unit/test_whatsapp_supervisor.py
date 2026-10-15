@@ -202,11 +202,15 @@ def test_a_timed_out_install_is_false(gateway):
 # so a working gateway was never set up again.  Its folder holds gateway.js
 # and package.json (copied), npm's own package-lock.json and node_modules,
 # and no receipt; the first start after the fold therefore runs one setup
-# there.  With the shipped lock now matching package.json, npm installs that
-# locked tree; measured on a copy of a live gateway (baileys 7.0.0-rc13):
-# online with an empty npm cache 'added 1 package, removed 1 package, and
-# changed 28 packages in 6s'; offline with an empty cache npm failed
-# ENOTCACHED (exit 1) and left node_modules as it was.
+# there, and npm installs the tree the shipped lock pins.  That lock is the
+# tree a gateway proven in a signed-in session runs (baileys 7.0.0-rc13, set
+# up 2026-05-24), so the setup changes nothing in it: measured with the real
+# npm and ensure_baileys_deps on an install made from the lock, 'up to date'
+# and no file changed, online and with an empty npm cache and no registry.
+# The lock before it (baileys 7.0.0-rc14) did 'added 1 package, removed 1
+# package, and changed 28 packages' to the same install online; with an
+# empty cache and no registry npm failed (exit 1) and left node_modules as it
+# was.
 
 def _an_install_from_before_the_fold(gateway):
     gw = gateway.home / 'whatsapp' / 'gateway'

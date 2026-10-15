@@ -715,3 +715,26 @@ def test_every_shipped_npm_project_locks_what_its_package_json_asks(project):
         if path:
             assert entry.get('resolved', '').startswith('https://registry.npmjs.org/'), path
             assert entry.get('integrity', '').startswith('sha512-'), path
+
+
+# Review of 7caefebee (hartos-87): package.json asked "^7.0.0-rc13" and the
+# lock regenerated from it locked 7.0.0-rc14, while the gateway proven in a
+# signed-in session runs rc13.  A caret on a pre-release admits every later
+# pre-release of the same version and every later release of its major, so
+# any regeneration of the lock moves a release candidate the project never
+# chose.  A direct dependency locked at a pre-release is therefore named by
+# its exact version in package.json; it moves only when that line changes.
+
+@pytest.mark.parametrize('project', _shipped_npm_projects(),
+                         ids=lambda p: os.path.basename(os.path.dirname(p)) + '/'
+                         + os.path.basename(p))
+def test_a_prerelease_a_shipped_project_locks_is_named_exactly(project):
+    with open(os.path.join(project, 'package.json'), encoding='utf-8') as fh:
+        pkg = json.load(fh)
+    with open(os.path.join(project, 'package-lock.json'), encoding='utf-8') as fh:
+        lock = json.load(fh)
+    for key in ('dependencies', 'optionalDependencies'):
+        for name, wanted in (pkg.get(key) or {}).items():
+            got = lock['packages']['node_modules/' + name]['version']
+            if '-' in got:
+                assert wanted == got, (name, wanted, got)
