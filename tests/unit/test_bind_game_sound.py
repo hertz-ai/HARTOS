@@ -62,7 +62,8 @@ def _user_1_built_agent_4242(tmp_path, monkeypatch):
 
 
 @contextmanager
-def _agent(agent_data, media_module, user_id='user-1', user_prompt='session-1'):
+def _agent(agent_data, media_module, user_id='user-1', user_prompt='session-1',
+           helper_fun=None):
     """The tool set as an agent gets it.
 
     The capability stays patched while the tools RUN, not only while they
@@ -72,7 +73,7 @@ def _agent(agent_data, media_module, user_id='user-1', user_prompt='session-1'):
         'user_id': user_id,
         'prompt_id': 4242,
         'agent_data': agent_data,
-        'helper_fun': MagicMock(),
+        'helper_fun': helper_fun or MagicMock(),
         'user_prompt': user_prompt,
         'request_id_list': [],
         'recent_file_id': {},
@@ -822,49 +823,151 @@ def test_with_no_recorded_creator_nobody_decides_for_everyone(_user_1_built_agen
         'https://node/creators.mp3'
 
 
-def _answer_card(tmp_path, monkeypatch, approver, decision, seed):
-    """answer_game_sound_card over hartos.helper's real store, in a Flask
-    app context as /api/agent/approval runs it."""
-    from flask import Flask
+@pytest.fixture
+def store_dir(tmp_path, monkeypatch):
+    """The agent stores on disk, where core.cache_loaders reads and writes
+    them (the format hartos.helper uses)."""
     from core import cache_loaders
-    from hartos import helper
     store = tmp_path / 'agent_data'
     store.mkdir()
-    monkeypatch.setattr(helper, 'AGENT_DATA_DIR', str(store))
     monkeypatch.setattr(cache_loaders, 'AGENT_DATA_DIR', str(store))
-    with Flask('test_game_sound_card').app_context():
-        helper.save_agent_data_to_file(4242, {4242: seed})
-        body, code = agent_tools.answer_game_sound_card(
-            '4242', 'game_sound:eng-01:bgm', decision, 'too jangly', approver)
-        agent = {}
-        helper.load_agent_data_from_file(4242, agent)
-        person = {}
-        own_id = agent_tools.person_store_for(approver, 4242) if approver else None
-        if own_id:
-            helper.load_agent_data_from_file(own_id, person)
-    return body, code, agent[4242], (person.get(own_id) or {})
+    return store
 
 
-def test_the_creators_answer_on_the_card_is_the_agents(tmp_path, monkeypatch):
-    seed = {'games': {'eng-01': {'sounds': {'bgm': {'url': 'https://node/a.mp3'}}}}}
-    body, code, agent, _own = _answer_card(tmp_path, monkeypatch, 'user-1', False, seed)
+class _Disk:
+    """The two store calls the tools make, on the real file format."""
+
+    def save_agent_data_to_file(self, store_id, store):
+        from core import cache_loaders
+        return cache_loaders.save_agent_data(store_id, store.get(store_id, {}))
+
+    def load_agent_data_from_file(self, store_id, store):
+        from core import cache_loaders
+        data = cache_loaders.load_agent_data(store_id)
+        store[store_id] = data if data is not None else {}
+        return data is not None
+
+
+def _live_cache():
+    """What reuse_recipe holds for a running session: a TTLCache that
+    restores from disk."""
+    from core import cache_loaders
+    from core.session_cache import TTLCache
+    return TTLCache(ttl_seconds=7200, max_size=500, name='test_reuse_agent_data',
+                    loader=cache_loaders.load_agent_data)
+
+
+def _on_disk(store_id):
+    from core import cache_loaders
+    return cache_loaders.load_agent_data(store_id) or {}
+
+
+def _bgm(store):
+    return (((store.get('games') or {}).get('eng-01') or {}).get('sounds') or {}).get('bgm')
+
+
+def _answer_card(store_dir, approver, decision, seed):
+    """answer_game_sound_card over the real store files, as
+    /api/agent/approval runs it."""
+    from core import cache_loaders
+    cache_loaders.save_agent_data(4242, seed)
+    body, code = agent_tools.answer_game_sound_card(
+        '4242', 'game_sound:eng-01:bgm', decision, 'too jangly', approver)
+    own_id = agent_tools.person_store_for(approver, 4242) if approver else None
+    return body, code, _on_disk(4242), (_on_disk(own_id) if own_id else {})
+
+
+_SEED = {'games': {'eng-01': {'sounds': {'bgm': {'url': 'https://node/a.mp3'}}}}}
+
+
+def test_the_creators_answer_on_the_card_is_the_agents(store_dir):
+    body, code, agent, _own = _answer_card(store_dir, 'user-1', False, _SEED)
     assert (code, body['scope'], body['applied']) == (200, 'agent', True)
-    assert agent['games']['eng-01']['sounds']['bgm']['rejected_url'] == 'https://node/a.mp3'
+    assert _bgm(agent)['rejected_url'] == 'https://node/a.mp3'
 
 
-def test_a_visitors_answer_on_the_card_is_theirs_alone(tmp_path, monkeypatch):
-    seed = {'games': {'eng-01': {'sounds': {'bgm': {'url': 'https://node/a.mp3'}}}}}
-    body, code, agent, own = _answer_card(tmp_path, monkeypatch, VISITOR, False, seed)
+def test_a_visitors_answer_on_the_card_is_theirs_alone(store_dir):
+    body, code, agent, own = _answer_card(store_dir, VISITOR, False, _SEED)
     assert (code, body['scope'], body['applied']) == (200, 'mine', True)
-    assert agent['games']['eng-01']['sounds']['bgm']['url'] == 'https://node/a.mp3'
-    assert own['games']['eng-01']['sounds']['bgm']['rejected_url'] == 'https://node/a.mp3'
+    assert _bgm(agent)['url'] == 'https://node/a.mp3'
+    assert _bgm(own)['rejected_url'] == 'https://node/a.mp3'
 
 
-def test_an_unsigned_answer_on_the_card_changes_nothing(tmp_path, monkeypatch):
-    seed = {'games': {'eng-01': {'sounds': {'bgm': {'url': 'https://node/a.mp3'}}}}}
-    body, code, agent, _own = _answer_card(tmp_path, monkeypatch, None, False, seed)
+def test_an_unsigned_answer_on_the_card_changes_nothing(store_dir):
+    body, code, agent, _own = _answer_card(store_dir, None, False, _SEED)
     assert (code, body['applied']) == (401, False)
-    assert agent['games']['eng-01']['sounds']['bgm']['url'] == 'https://node/a.mp3'
+    assert _bgm(agent)['url'] == 'https://node/a.mp3'
+
+
+def test_a_second_rejection_never_brings_the_first_back():
+    """Review of c48e90601, F1: reject the agent's take U, get a take of
+    your own W, reject W too, and U played again, because only the last
+    rejection was read.  A person never hears a take they turned down."""
+    agent_data = _creators_approved_music()
+    media = _media({'status': 'completed',
+                    'results': [{'url': 'https://node/visitors.mp3'}]})
+
+    with _visitor(agent_data, media) as tools:
+        tools['approve_game_sound']('eng-01', False, 'bgm', 'too jangly')
+        tools['bind_game_sound']('eng-01', 'calm', 'spelling')
+        tools['approve_game_sound']('eng-01', False, 'bgm', 'too slow')
+        heard = json.loads(tools['get_game_sound']('eng-01'))
+        media.generate_media.return_value = json.dumps(
+            {'status': 'completed', 'results': [{'url': 'https://node/third.mp3'}]})
+        again = json.loads(tools['bind_game_sound']('eng-01', 'calm', 'spelling'))
+
+    assert heard['status'] == 'unbound', heard
+    assert again['status'] == 'bound' and again['music']['url'] == 'https://node/third.mp3'
+    assert 'too slow' in media.generate_media.call_args.kwargs['context']
+
+
+def test_a_card_answer_reaches_a_session_already_holding_the_store(store_dir):
+    """Review of c48e90601, F2: the card writes the store file while a
+    running session's cache still holds the old store.  The session kept
+    hearing the take turned down, and its next save wrote the old store
+    back over the answer."""
+    from core import cache_loaders
+    cache_loaders.save_agent_data(4242, _SEED)
+    live = _live_cache()
+    nothing = _media({'status': 'completed', 'results': []})
+    with _visitor(live, nothing) as tools:
+        assert json.loads(tools['get_game_sound']('eng-01'))['status'] == 'bound'
+
+    agent_tools.answer_game_sound_card(
+        '4242', 'game_sound:eng-01:bgm', False, 'too jangly', VISITOR)
+
+    with _agent(live, nothing, user_id=VISITOR, user_prompt=f'{VISITOR}_4242',
+                helper_fun=_Disk()) as tools:
+        heard = json.loads(tools['get_game_sound']('eng-01'))
+        tools['save_data_in_memory']('progress', {'level': 2})
+    assert heard['status'] == 'unbound', heard
+    own = _on_disk(f'{VISITOR}_4242')
+    assert _bgm(own)['rejected_url'] == 'https://node/a.mp3', own
+    assert own['progress'] == {'level': 2}
+
+
+def test_a_creators_card_answer_survives_a_visitors_stale_session(store_dir):
+    """The same race on the agent's memo: the creator turns the take down
+    on the card, then a visitor's session, still holding the old agent
+    store, fills another state and saves the agent file."""
+    from core import cache_loaders
+    cache_loaders.save_agent_data(4242, _SEED)
+    live = _live_cache()
+    filled = _media({'status': 'completed',
+                     'results': [{'url': 'https://node/chime.mp3'}]})
+    with _visitor(live, filled) as tools:
+        tools['get_game_sound']('eng-01')
+
+    agent_tools.answer_game_sound_card(
+        '4242', 'game_sound:eng-01:bgm', False, 'too jangly', 'user-1')
+
+    with _agent(live, filled, user_id=VISITOR, user_prompt=f'{VISITOR}_4242',
+                helper_fun=_Disk()) as tools:
+        tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct')
+    agent = _on_disk(4242)
+    assert _bgm(agent).get('url') is None, agent
+    assert _bgm(agent)['rejected_url'] == 'https://node/a.mp3'
+    assert agent['games']['eng-01']['sounds']['correct']['url'] == 'https://node/chime.mp3'
 
 
 def test_the_lenient_tools_refuse_a_state_no_game_has():

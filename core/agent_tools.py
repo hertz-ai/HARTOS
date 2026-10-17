@@ -406,35 +406,46 @@ def answer_game_sound_card(agent_id, action, approved, reason, approver_id):
     and the agent's take stays as it is for everyone else (owner
     2026-10-17).  The verdict itself is core.game_sound_memo.record_verdict,
     as for the agent's own approve_game_sound.  Returns (body, status).
+
+    The card is answered outside any chat turn, so it reads and writes the
+    store files directly (core.cache_loaders, atomic) and then has every
+    pipeline cache drop its copy: a live session still holding the old
+    store kept serving it and wrote it back over this verdict on its next
+    save (review of c48e90601, F2).
     """
+    from core.cache_loaders import (
+        forget_cached_store, load_agent_data, save_agent_data)
     from core.game_sound_memo import parse_game_sound_action, record_verdict
-    from hartos.helper import load_agent_data_from_file, save_agent_data_to_file
     verdict = 'approved' if approved else 'rejected'
     if not approver_id:
         return {'status': 'error', 'action': action, 'applied': False,
                 'reason': 'sign in to answer this'}, 401
     game_id, state = parse_game_sound_action(action)
     pid = int(agent_id)
-    data = {}
-    load_agent_data_from_file(pid, data)
-    games = data.setdefault(pid, {}).setdefault('games', {})
+    agent_store = load_agent_data(pid) or {}
+    games = agent_store.setdefault('games', {})
     for_everyone = is_agent_creator(approver_id, pid)
     if for_everyone:
-        store_id = pid
+        store_id, store = pid, agent_store
         record, matched, key = record_verdict(
             games, game_id, state, approved, reason)
     else:
         store_id = person_store_for(approver_id, pid)
-        load_agent_data_from_file(store_id, data)
-        own = data.setdefault(store_id, {}).setdefault('games', {})
+        store = load_agent_data(store_id) or {}
         record, matched, key = record_verdict(
-            games, game_id, state, approved, reason, own=own)
-    if record:
-        save_agent_data_to_file(store_id, data)
+            games, game_id, state, approved, reason,
+            own=store.setdefault('games', {}))
+    saved = bool(record) and save_agent_data(store_id, store)
+    if saved:
+        forget_cached_store(store_id)
+    elif record:
+        tool_logger.warning(
+            f'game sound card: agent={agent_id} {verdict} {game_id}/{state} '
+            f'was not saved; nothing changed')
     tool_logger.info(
         f'game sound card: agent={agent_id} {verdict} {game_id}/{state} at '
         f'memo {key} for {"everyone" if for_everyone else "the answerer only"}')
-    return {'status': verdict, 'action': action, 'applied': bool(record),
+    return {'status': verdict, 'action': action, 'applied': saved,
             'key': key, 'matched': matched,
             'scope': 'agent' if for_everyone else 'mine'}, 200
 

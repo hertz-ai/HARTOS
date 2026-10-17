@@ -104,6 +104,22 @@ def game_state_key(state, level=None, variant=None):
     return key
 
 
+def _turned_down(sounds, keys):
+    """Every take turned down at these keys of one memo: the one just
+    rejected, and the earlier ones each next take carries forward in
+    ``previous_takes``.  Reading only the last rejection brought the
+    first back: reject the agent's take U, reject your own W, and U played
+    again (review of c48e90601, F1)."""
+    urls = set()
+    for key in keys:
+        record = sounds.get(key) or {}
+        urls.add(record.get('rejected_url'))
+        urls.update(take.get('url') for take in record.get('previous_takes') or ()
+                    if isinstance(take, dict))
+    urls.discard(None)
+    return urls
+
+
 def game_state_match(games, game_id, state, level=None, *, own=None,
                      own_only=False):
     """The sound memoized for a game's state, and what matched (spec §4).
@@ -128,8 +144,7 @@ def game_state_match(games, game_id, state, level=None, *, own=None,
 
     level_key = game_state_key(state, level)
     game_key = game_state_key(state)
-    turned_down = {(mine.get(key) or {}).get('rejected_url')
-                   for key in (level_key, game_key)} - {None}
+    turned_down = _turned_down(mine, (level_key, game_key))
 
     for source, sounds, keys in (
         ('mine', mine, (level_key, game_key)),

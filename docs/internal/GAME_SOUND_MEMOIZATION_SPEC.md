@@ -17,8 +17,9 @@ goal is:
 - every later time that same state is reached — later in the run, in a
   later run, at another level, or by someone else reusing the agent — the
   **same artifact** is replayed, never composed again;
-- when a sound is wrong, a person can **correct** it, and the correction
-  is what everyone hears afterwards;
+- when a sound is wrong, a person can **correct** it.  The agent's
+  creator's correction is what everyone hears afterwards; anyone else's
+  is what they alone hear (§5, owner 2026-10-17);
 - a hit is a hit and a miss is a miss, with **no fuzzy matching** and no
   silent near-misses.
 
@@ -38,8 +39,11 @@ goal is:
 (owner_user_id, prompt_id, game_id, state, level?, variant?)
 ```
 
-- **owner_user_id** — whose agent this is. Two users reusing the same
-  agent share its approved sounds (§6) but corrections are theirs alone.
+- **owner_user_id** — as built (§5), not a field of the key but the
+  store the memo lives in: the agent's own store for what everyone hears,
+  a person's own `{user_id}_{prompt_id}` store for their choices.  Two
+  users reusing the same agent share its approved sounds (§6) but
+  corrections are theirs alone.
 - **prompt_id** — the agent. Sounds belong to the agent, not to the app,
   so reuse carries them.
 - **game_id** — the game's own id as the app knows it (`config.id`, or a
@@ -89,9 +93,12 @@ should not be conflated with"* it.  So there are two memos with one shape:
 - **The agent's memo** (below): every composed take.  A take is composed
   once and replayed for everyone; an empty slot is filled by whoever's
   turn reaches it first.
-- **A person's own memo**: `agent_data[{user_id}_{prompt_id}]['games']`
-  (`core.agent_tools.person_store_id`), the same shape.  It holds their
-  choices: a take they turned down, a take they kept, a take of their own.
+- **A person's own memo**: `agent_data[person_store_id("{user_id}_{prompt_id}")]['games']`
+  (`core.agent_tools.person_store_id` / `person_store_for`: the session
+  key itself when it is safe as a file name and lower case, else a
+  `p<digest>` of it), the same shape.  It holds their choices: every take
+  they turned down (the last one and, in `previous_takes`, the ones
+  before), a take they kept, a take of their own.
   Their lookup tries it first and skips any agent take they turned down.
 
 Only the agent's creator (`core.agent_tools.is_agent_creator`, from
@@ -100,9 +107,13 @@ mode, because the creator's review ("Evaluation Mode") runs through reuse.
 Anyone else's approval, rejection or replacement is written in their own
 memo only, by the agent's tools and by the review card
 (`/api/agent/approval`, which uses the caller's verified identity and
-answers 401 without one).  The per-person `'mine'` sub-slot that used to
-live INSIDE the agent's memo is gone; measured 2026-10-17, no stored agent
-file on the desktop held one.
+answers 401 without one).  The card is answered outside any chat turn,
+so it writes the store files directly and then every recipe-pipeline
+cache drops its copy (`core.cache_loaders.forget_cached_store`); a live
+session would otherwise keep serving the old store and write it back over
+the answer.  The per-person `'mine'` sub-slot that used to live INSIDE the
+agent's memo is gone; measured 2026-10-17, no stored agent file on the
+desktop held one.
 
 The agent's memo, in the agent's own saved data, beside everything else
 the agent keeps (persisted per `prompt_id`):
@@ -130,10 +141,12 @@ wrong for the age. Three moments, three behaviours:
    composition for that key **includes the reason in the prompt** and
    stores the result as the next `variant`. The rejected artifact is kept
    (not deleted) so a reviewer can go back to it.
-2. **In REUSE, by the person using the agent.** Their correction must not
-   silently change what everyone else hears. It writes a memo at the same
-   key **scoped to that user**, which their lookups match before the
-   agent's. The agent's approved sound is untouched.
+2. **In REUSE, by anyone but the agent's creator.** Their correction must
+   not silently change what everyone else hears. It writes a memo **in
+   their own store** (§5), at the key of the take they were hearing, which
+   their lookups match before the agent's. The agent's approved sound is
+   untouched.  (The creator's own review runs through REUSE too, and their
+   word is the agent's, as in 1.)
 3. **Never automatically.** Nothing rewrites a memo because a model
    thought it could do better.
 

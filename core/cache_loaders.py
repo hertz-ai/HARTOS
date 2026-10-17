@@ -114,6 +114,20 @@ def save_agent_data(prompt_id, data) -> bool:
         return False
 
 
+def forget_cached_store(store_id) -> int:
+    """After a store file is written outside the recipe pipelines' agent_data
+    caches (create_recipe and reuse_recipe each hold one, restoring with
+    load_agent_data above), every such cache drops its copy, so neither
+    serves the old value or writes it back over the new one.  The caches
+    key an agent by its prompt id as given, int or str, so both forms go.
+    Returns how many entries were dropped."""
+    from core.session_cache import TTLCache
+    keys = {str(store_id)}
+    if str(store_id).isdigit():
+        keys.add(int(store_id))
+    return sum(TTLCache.forget_everywhere(key, load_agent_data) for key in keys)
+
+
 def load_user_ledger(user_prompt):
     """Load SmartLedger from Redis/JSON. Key is user_prompt (e.g. '123_456')."""
     parts = str(user_prompt).split('_', 1)
