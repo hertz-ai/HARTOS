@@ -6870,9 +6870,10 @@ def load_existing_metadata(prompt_id, user_prompt, flow_progress, user_id):
         if helper_fun.load_agent_data_from_file(prompt_id, agent_data):
             current_app.logger.info(f" Successfully loaded persistent agent data for prompt_id {prompt_id}")
             return
-        # An action JSON's metadata is the creator's saved-key snapshot (the
-        # creator's memory_view when the recipe was written), so it restores
-        # the creator's own memory for this agent and nobody else's: in the
+        # An action JSON's metadata is a saved-key snapshot (the memory_view
+        # of whoever completed that action, the creator unless a visitor
+        # built on a half-built agent, task #239), so it restores the
+        # creator's own memory for this agent and nobody else's: in the
         # shared store it read back as values (None) for every other user
         # (review of 7121264b1), and in a visitor's store, when a visitor
         # resumed CREATE on a half-built agent, it gave them the creator's
@@ -6880,6 +6881,9 @@ def load_existing_metadata(prompt_id, user_prompt, flow_progress, user_id):
         # c8aea38e7).  Nothing to restore when that memory exists.
         from core.agent_tools import is_agent_creator, person_store_id
         if not is_agent_creator(user_id, prompt_id):
+            current_app.logger.info(
+                f" No saved-key snapshot restored for {user_prompt}: not "
+                f"the creator of agent {prompt_id}")
             return
         own_id = person_store_id(user_prompt)
         if agent_data.get(own_id):

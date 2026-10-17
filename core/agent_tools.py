@@ -443,11 +443,13 @@ def person_store_id(user_prompt):
 
 def is_agent_creator(user_id, prompt_id):
     """This person built the agent: prompts/<id>.json's creator_user_id (the
-    ownership ruling of 2026-10-08).  The one test of who may write the
-    agent's own memory: a template or example saved for everyone, and the
-    saved-key snapshot a resumed CREATE restores.  No recorded creator:
-    nobody.  (The /prompts listing's "no creator means listed for everyone"
-    is a visibility rule, not this one.)"""
+    ownership ruling of 2026-10-08).  The one test of who may save a
+    template or example for everyone (save_data_in_memory for_everyone),
+    and of whose own memory a resumed CREATE restores the saved-key
+    snapshot into.  No recorded creator: nobody.  (The /prompts listing's
+    "no creator means listed for everyone" is a visibility rule, not this
+    one; game-sound verdicts, approve_game_sound scope='agent', write the
+    agent's store without it, task #239.)"""
     from core.cache_loaders import load_agent_config
     creator = (load_agent_config(prompt_id) or {}).get('creator_user_id')
     return creator not in (None, '') and str(creator) == str(user_id)

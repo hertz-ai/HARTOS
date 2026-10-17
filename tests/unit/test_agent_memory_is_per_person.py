@@ -40,16 +40,26 @@ def store_dir(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def creator_config(tmp_path, monkeypatch):
-    """Agent 54's definition with its creator, as prompts/54.json holds it
-    on the desktop (creator_user_id 10202)."""
+def agent_config(tmp_path, monkeypatch):
+    """Writes agent 54's definition, prompts/54.json, where core.cache_loaders
+    reads it; None writes no definition at all."""
     prompts = tmp_path / 'prompts'
     prompts.mkdir()
-    (prompts / f'{AGENT}.json').write_text(
-        json.dumps({'prompt_id': AGENT, 'creator_user_id': CREATOR}))
     monkeypatch.setattr(cache_loaders, 'PROMPTS_DIR', str(prompts))
     monkeypatch.setattr(cache_loaders, '_agent_config_cache', {})
-    return prompts
+
+    def write(config):
+        if config is not None:
+            (prompts / f'{AGENT}.json').write_text(json.dumps(config))
+        return prompts
+    return write
+
+
+@pytest.fixture
+def creator_config(agent_config):
+    """Agent 54's definition with its creator, as prompts/54.json holds it
+    on the desktop (creator_user_id 10202)."""
+    return agent_config({'prompt_id': AGENT, 'creator_user_id': CREATOR})
 
 
 class _DiskHelper:
@@ -210,29 +220,34 @@ def test_the_string_false_shares_nothing(store_dir, creator_config):
 @pytest.mark.parametrize('config', [None, {'prompt_id': AGENT}],
                          ids=['no agent definition', 'no creator recorded'])
 def test_with_no_recorded_creator_nobody_saves_for_everyone(
-        store_dir, tmp_path, monkeypatch, config):
-    prompts = tmp_path / 'prompts'
-    prompts.mkdir()
-    if config is not None:
-        (prompts / f'{AGENT}.json').write_text(json.dumps(config))
-    monkeypatch.setattr(cache_loaders, 'PROMPTS_DIR', str(prompts))
-    monkeypatch.setattr(cache_loaders, '_agent_config_cache', {})
+        store_dir, agent_config, config):
+    agent_config(config)
     out = _tools(_store(), CREATOR, building=True)['save_data_in_memory'](
         'receipt_template', 'Bill {amount}', for_everyone=True)
     assert 'for this person only' in out
     assert cache_loaders.load_agent_data(AGENT) is None
 
 
-def test_a_creator_id_stored_as_a_number_still_matches(store_dir, tmp_path,
-                                                       monkeypatch):
+@pytest.mark.parametrize('creator, user_id', [
+    ('absent', None), (None, None), ('', ''), ('absent', 'None')],
+    ids=['no field, no user id', 'null creator, no user id',
+         'empty creator, empty user id', 'no field, user id "None"'])
+def test_a_missing_creator_matches_no_user_id(agent_config, creator, user_id):
+    """Compared as text, a missing creator and a missing user id are both
+    'None' (and two empties are equal), so the check for an empty creator
+    is what keeps "no recorded creator: nobody" for every user id."""
+    from core.agent_tools import is_agent_creator
+    config = {'prompt_id': AGENT}
+    if creator != 'absent':
+        config['creator_user_id'] = creator
+    agent_config(config)
+    assert not is_agent_creator(user_id, AGENT)
+
+
+def test_a_creator_id_stored_as_a_number_still_matches(store_dir, agent_config):
     """A creator_user_id stored as a JSON number still matches the
     person's id, which reaches the tools as a str."""
-    prompts = tmp_path / 'prompts'
-    prompts.mkdir()
-    (prompts / f'{AGENT}.json').write_text(
-        json.dumps({'prompt_id': AGENT, 'creator_user_id': int(CREATOR)}))
-    monkeypatch.setattr(cache_loaders, 'PROMPTS_DIR', str(prompts))
-    monkeypatch.setattr(cache_loaders, '_agent_config_cache', {})
+    agent_config({'prompt_id': AGENT, 'creator_user_id': int(CREATOR)})
     _tools(_store(), CREATOR, building=True)['save_data_in_memory'](
         'receipt_template', 'Bill {amount}', for_everyone=True)
     assert cache_loaders.load_agent_data(AGENT) == {'receipt_template': 'Bill {amount}'}
@@ -247,10 +262,12 @@ def _function_source(name, end_marker):
 
 
 def _resume(tmp_path, user_id, agent_data):
-    """load_existing_metadata, run from its source (create_recipe cannot be
-    imported in a bare test env), for ``user_id`` resuming CREATE on agent
-    54 with one action JSON holding the creator's saved-key snapshot.
-    Returns (agent_data, the store ids it saved, that user's store id)."""
+    """initialize_with_resume and the load_existing_metadata it calls, run
+    from their source (create_recipe cannot be imported in a bare test
+    env), for ``user_id`` resuming CREATE on agent 54 with action 1 done
+    and its action JSON holding the creator's saved-key snapshot.  The
+    pipeline state around them is stubbed.  Returns (agent_data, the store
+    ids it saved, that user's store id)."""
     import logging
     from core.agent_tools import person_store_id
     action = tmp_path / '54_0_1.json'
@@ -260,12 +277,24 @@ def _resume(tmp_path, user_id, agent_data):
         load_agent_data_from_file=lambda pid, store: (store.__setitem__(pid, {}), False)[1],
         safe_prompt_path=lambda pid, flow, aid: str(action),
         save_agent_data_to_file=lambda pid, store: saved.append(pid) or True)
-    ns = {'helper_fun': helper, 'agent_data': agent_data, 'json': json,
-          'current_app': SimpleNamespace(logger=logging.getLogger('t'))}
+    flows = {'prompt_id': AGENT, 'flows': [{'actions': ['a1', 'a2']}]}
+    ns = {
+        'helper_fun': helper, 'agent_data': agent_data, 'json': json,
+        'current_app': SimpleNamespace(logger=logging.getLogger('t')),
+        'get_prompt_config_json': lambda pid: flows,
+        'detect_and_resume_progress': lambda pid, up: (
+            0, 2, {0: {'completed_actions': [1], 'total_actions': 2}}, []),
+        'recipe_for_persona': {}, 'total_persona_actions': {},
+        'user_tasks': {}, 'scheduler_check': {},
+        'create_action_with_ledger': lambda acts, uid, pid, up: SimpleNamespace(
+            ledger=SimpleNamespace(tasks=[]), current_action=1),
+        'Action': lambda acts: SimpleNamespace(current_action=1),
+        'set_states_from_progress': lambda *a, **k: None,
+    }
     exec(_function_source('load_existing_metadata', '\n\n\n'), ns)
+    exec(_function_source('initialize_with_resume', '\n\n\n'), ns)
     user_prompt = f'{user_id}_{AGENT}'
-    ns['load_existing_metadata'](AGENT, user_prompt,
-                                 {0: {'completed_actions': [1]}}, user_id)
+    ns['initialize_with_resume'](AGENT, user_prompt, user_id)
     return ns['agent_data'], saved, person_store_id(user_prompt)
 
 
