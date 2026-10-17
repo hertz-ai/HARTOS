@@ -33,7 +33,8 @@ echo "=== Ensure .env exists ==="
 # because .env is untracked. The exceptions are the keys the workflow
 # itself owns, ensured further down on every deploy: the OTA host, the
 # configured LLM trio, the McGroce session secret and the owner-set keys
-# (the `for _k in ...` loop below is their one list).
+# (their one list is the loop in the "Owner-set keys" section further
+# down).
 # On a rebuilt or fresh box there was previously nothing to recreate
 # it from, which meant the LLM routing existed solely on one machine
 # and would have been lost.

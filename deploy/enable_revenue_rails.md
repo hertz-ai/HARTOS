@@ -86,7 +86,7 @@ the value of the previous secret:
 gh secret set PHONEPE_MERCHANT_ID --repo hertz-ai/HARTOS
 gh secret set PHONEPE_SALT_KEY --repo hertz-ai/HARTOS
 gh secret set PHONEPE_SALT_INDEX --repo hertz-ai/HARTOS    # optional; default 1
-gh secret set PHONEPE_ENV --repo hertz-ai/HARTOS           # optional; exactly PROD (default) or UAT
+gh secret set PHONEPE_ENV --repo hertz-ai/HARTOS           # optional; PROD (default) or UAT, any case, no spaces
 gh secret set PHONEPE_USD_INR_RATE --repo hertz-ai/HARTOS  # optional; default 84.0
 ```
 
@@ -96,15 +96,26 @@ Two traps, both silent:
   followed the older version of this runbook already has `PHONEPE_*`
   lines written by hand, and those keep their values for every secret
   you leave unset: an old `PHONEPE_ENV=UAT` keeps the gateway in the
-  sandbox, where no real payment is taken. List the names on the box
-  (names only, never values) and set a secret for each one present:
-  `grep -oE '^PHONEPE_[A-Z_]+=' .env`.
-- **`PHONEPE_ENV` must be `PROD` or `UAT`** (case does not matter). Any
-  other value, `PRODUCTION` included, selects the sandbox, and a secret
-  cannot be read back. After the deploy, the boot log says which:
-  `sudo docker logs langchain 2>&1 | grep 'PhonePe gateway auto-registered'`
-  must show `(PROD mode`. That line says "real INR charges enabled" in
-  either mode, so read the mode, not the rest.
+  sandbox, where no real payment is taken. In the checkout from Step 1,
+  list the names on the box (names only, never values) and set a secret
+  for each one present: `grep -oE '^PHONEPE_[A-Z_]+=' .env`.
+- **Only `PROD` is live.** The gateway upper-cases `PHONEPE_ENV` and
+  takes anything but `PROD` as the sandbox: `UAT`, `PRODUCTION`, an
+  empty value, a stray space, or the old sample line's trailing comment
+  (`PROD   # or UAT for sandbox`). Unset means `PROD`.
+
+A secret cannot be read back, and the gateway's "auto-registered" boot
+line is no check: it is logged while the module is imported, before
+logging is set up, and a local replay of the boot never printed it. So
+check the container itself after the deploy. The gateway registers when both credentials are set,
+and the mode is the value of `PHONEPE_ENV`, which is not a secret:
+
+```bash
+# Both must say "set" (names only, never values):
+sudo docker exec langchain sh -c 'for v in PHONEPE_MERCHANT_ID PHONEPE_SALT_KEY; do [ -n "$(printenv $v)" ] && echo "$v set" || echo "$v MISSING"; done'
+# Live only when this prints "unset" or [PROD] (any case); the brackets show stray spaces:
+sudo docker exec langchain sh -c 'if [ -z "${PHONEPE_ENV+x}" ]; then echo unset; else echo "[$PHONEPE_ENV]"; fi'
+```
 
 ## Step 4 — Restart the container with the new mount
 
@@ -129,7 +140,7 @@ Confirm:
 
 ```bash
 sleep 20
-sudo docker inspect -f '{{range .Mounts}}{{println .Destination}}{{end}}' langchain | grep agent_data
+sudo docker inspect -f '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{"\n"}}{{end}}' langchain | grep agent_data
 # names only, never values:
 sudo docker exec langchain env | grep -oE '^(STRIPE_API_KEY|PHONEPE_MERCHANT_ID)='
 curl -s http://localhost:6777/status | head -c 200

@@ -118,11 +118,17 @@ runs with `--env-file .env`. Do not hand-edit `.env` for it.
 # Paste the key at the prompt (it is not echoed, not kept in shell history):
 gh secret set STRIPE_API_KEY --repo hertz-ai/HARTOS
 
-# The next deploy writes it; a push to main deploys. Then, on the box:
-sudo docker logs langchain 2>&1 | grep -i "stripe gateway"
-# Expected: "PaymentLedger: Stripe gateway auto-registered (real charges enabled via STRIPE_API_KEY)"
+# The next deploy writes it; a push to main deploys.
 # The deploy log shows "STRIPE_API_KEY set from the secret (value not shown)".
+# Then, on the box: the gateway registers when the key is set AND the SDK
+# imports, so check those two (the key's kind only, never its value):
+sudo docker exec langchain sh -c 'case "$STRIPE_API_KEY" in sk_live_*) echo "key: live";; rk_live_*) echo "key: restricted live";; sk_test_*|rk_test_*) echo "key: test";; "") echo "key: MISSING";; *) echo "key: not a secret key (pk_?)";; esac'
+sudo docker exec langchain python -c "import stripe; print('stripe', stripe.VERSION)"
 ```
+
+The gateway's "auto-registered" boot line is no check: it is logged while
+the module is imported, before logging is set up, and a local replay of
+the boot never printed it. Check the two conditions above instead.
 
 To stop live charges: delete the repo secret FIRST (`gh secret delete
 STRIPE_API_KEY --repo hertz-ai/HARTOS`), then remove the line from
@@ -130,10 +136,11 @@ central's `.env`, then redeploy. In the other order the next deploy writes
 the key straight back; and deleting the secret alone changes nothing on the
 box (an absent secret leaves `.env` as it is).
 
-"STRIPE_API_KEY present but connect failed" means the `stripe` SDK did not
-import (re-run Step 3). It does NOT mean a bad key: `connect()` never checks
-the key, so a wrong or revoked key registers fine and fails at the first
-charge (402 from the upgrade route; Stripe dashboard → Logs has the reason).
+A set key with a failing `import stripe` leaves the gateway off: the SDK
+is missing (re-run Step 3). A set key is NOT a good key: `connect()` never
+checks the key, so a wrong or revoked key registers fine and fails at the
+first charge (402 from the upgrade route; Stripe dashboard → Logs has the
+reason).
 
 Without a live gateway (no key, or the SDK missing) a paid-tier upgrade
 answers 503 naming STRIPE_API_KEY. The mock gateway settles a paid tier only
@@ -294,8 +301,9 @@ That's the goal threshold.  Then:
 ## Troubleshooting
 
 **`Stripe gateway not connected`**:
-- Check `sudo docker exec langchain env | grep STRIPE_API_KEY`
-- Verify the key starts with `sk_live_` (production) or `sk_test_`
+- Check the key's kind with the `case` line in Step 4 (it prints live,
+  restricted live, test, MISSING or "not a secret key", never the key):
+  it must be `sk_live_` / `rk_live_` (production) or `sk_test_`
   (sandbox), not `pk_`.
 - Verify `stripe` SDK is installed (Step 3).
 
