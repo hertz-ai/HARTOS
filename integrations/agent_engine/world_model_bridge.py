@@ -1237,18 +1237,28 @@ class WorldModelBridge:
 
         # PRIVACY: Redact secrets from corrections before shared learning,
         # the context included: every content leaf, by the same walk the
-        # replay path uses (edge_privacy.map_content), identifiers exempt.
+        # replay path uses (edge_privacy.map_content), identifiers exempt, and
+        # a value under a secret-named key withheld when no pattern knows it
+        # (edge_privacy.scrub_secret). A context the walk cannot finish (a
+        # cycle) is dropped, never the correction.
         try:
             from security.secret_redactor import redact_secrets
             original_response, _ = redact_secrets(original_response)
             corrected_response, _ = redact_secrets(corrected_response)
             if explanation:
                 explanation, _ = redact_secrets(explanation)
-            if context:
-                from security.edge_privacy import map_content
-                context = map_content(context, lambda t: redact_secrets(t)[0])
         except ImportError:
             logger.warning("[WorldModelBridge] secret_redactor unavailable; correction NOT redacted")
+        if context:
+            try:
+                from security.edge_privacy import map_content, scrub_secret
+                from security.secret_redactor import redact_secrets
+                context = map_content(context, lambda t: redact_secrets(t)[0],
+                                      secret_fn=scrub_secret)
+            except Exception as e:
+                logger.debug("[WorldModelBridge] correction context dropped: "
+                             "it could not be redacted (%s)", type(e).__name__)
+                context = None
 
         # In-process direct call
         if self._in_process and self._provider:
@@ -1320,6 +1330,13 @@ class WorldModelBridge:
                 body = resp.json()
                 if not isinstance(body, dict):
                     return {'success': False, 'reason': 'unreadable reply'}
+                # A C323 reply always names the fact's source (in its
+                # statistics); none, while a context was sent, means the server
+                # predates C323 and ignored the context.
+                _stats = body.get('statistics')
+                if context and not body.get('source') and not (
+                        isinstance(_stats, dict) and _stats.get('source')):
+                    _note_provenance_dropped()
                 self._count_if_learned(body)
                 return body
             return {'success': False, 'reason': f'HTTP {resp.status_code}'}
@@ -2784,14 +2801,15 @@ _PROVENANCE_DROP_SAID = False
 
 
 def _note_provenance_dropped() -> None:
-    """Say once per process that the installed HevolveAI (a build before C323)
-    takes no provenance, so corrections reach it without their context."""
+    """Say once per process that HevolveAI is not taking the correction's
+    context: an in-process build without the parameter (or whose signature
+    cannot be read), or a server before C323 that ignores the field."""
     global _PROVENANCE_DROP_SAID
     if not _PROVENANCE_DROP_SAID:
         _PROVENANCE_DROP_SAID = True
-        logger.info("[WorldModelBridge] the installed HevolveAI takes no correction "
-                    "provenance (a build before C323): corrections are sent "
-                    "without their context")
+        logger.info("[WorldModelBridge] HevolveAI is not taking correction "
+                    "provenance (a build before C323, or one whose signature "
+                    "cannot be read): corrections reach it without their context")
 
 
 def _accepts_kwarg(fn, name: str) -> bool:

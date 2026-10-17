@@ -162,8 +162,8 @@ def test_a_secret_in_the_context_is_redacted_on_both_paths(monkeypatch):
 
 
 def test_an_older_build_dropping_the_provenance_is_said_once(monkeypatch, caplog):
-    """Review of 54f203c38, MINOR-4: the installed production build is older
-    than C323, so the drop is said, once per process, not silently."""
+    """Review of 54f203c38, MINOR-4: an in-process build older than C323
+    drops the provenance; that is said, once per process, not silently."""
     import logging
     import integrations.agent_engine.world_model_bridge as wmb
 
@@ -196,3 +196,91 @@ def test_the_learner_gets_its_own_copy_of_the_context(monkeypatch):
     ctx = dict(CONTEXT)
     _in_process_bridge().submit_correction('London', 'Paris', context=ctx)
     assert ctx == CONTEXT
+
+
+def _http_bridge():
+    bridge = WorldModelBridge()
+    bridge._in_process = False
+    bridge._http_disabled = False
+    bridge._api_url = 'http://localhost:8000'
+    return bridge
+
+
+def test_a_value_under_a_secret_named_key_is_withheld(monkeypatch):
+    """Review of ea58905, MINOR-B: a value under a secret-named key that no
+    secret pattern recognises passed raw. It is withheld by the walk's own
+    secret policy (edge_privacy.scrub_secret), on both paths."""
+    seen = {}
+
+    def send_expert_correction(domain, original_response, corrected_response,
+                               expert_id, confidence=1.0, explanation=None,
+                               valid_until=None, signed_reward=None,
+                               provenance=None):
+        seen['provenance'] = provenance
+        return {'success': True, 'learned': True}
+
+    _install(monkeypatch, send_expert_correction)
+    ctx = dict(CONTEXT, api_key='opaque-value-hunter2xyz')
+    _in_process_bridge().submit_correction('London', 'Paris', context=dict(ctx))
+    assert 'hunter2' not in str(seen['provenance'])
+    assert seen['provenance']['memory_id'] == 'm-42'
+    resp = MagicMock(status_code=200)
+    resp.json.return_value = {'success': True, 'learned': True}
+    with patch('integrations.agent_engine.world_model_bridge.pooled_post',
+               return_value=resp) as post:
+        _http_bridge().submit_correction('London', 'Paris', context=dict(ctx))
+    assert 'hunter2' not in str(post.call_args.kwargs['json']['context'])
+
+
+def test_a_context_that_cannot_be_walked_does_not_cost_the_correction(monkeypatch):
+    """Review of ea58905, NIT-C: a cyclic context raised RecursionError out of
+    submit_correction. It is dropped instead, and the correction is sent."""
+    calls = []
+
+    def send_expert_correction(domain, original_response, corrected_response,
+                               expert_id, confidence=1.0, explanation=None,
+                               valid_until=None, signed_reward=None,
+                               provenance='unset'):
+        calls.append(provenance)
+        return {'success': True, 'learned': True}
+
+    _install(monkeypatch, send_expert_correction)
+    cyc = {'memory_id': 'm-42'}
+    cyc['self'] = cyc
+    out = _in_process_bridge().submit_correction('London', 'Paris', context=cyc)
+    assert out['learned'] is True and calls == ['unset']
+    resp = MagicMock(status_code=200)
+    resp.json.return_value = {'success': True, 'learned': True}
+    with patch('integrations.agent_engine.world_model_bridge.pooled_post',
+               return_value=resp) as post:
+        _http_bridge().submit_correction('London', 'Paris', context=cyc)
+    assert 'context' not in post.call_args.kwargs['json']
+
+
+def test_an_older_server_ignoring_the_context_is_said_once(monkeypatch, caplog):
+    """Review of ea58905, MINOR-A: production's bridge talks HTTP, where a
+    HevolveAI before C323 has no context field and ignores it silently. A C323
+    reply always names the fact's source; a reply that names none while a
+    context was sent means the context was dropped, which is said once."""
+    import logging
+    import integrations.agent_engine.world_model_bridge as wmb
+    monkeypatch.setattr(wmb, '_PROVENANCE_DROP_SAID', False, raising=False)
+
+    def reply(body):
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = body
+        return resp
+
+    with caplog.at_level(logging.INFO, logger='hevolve_social'):
+        with patch('integrations.agent_engine.world_model_bridge.pooled_post',
+                   return_value=reply({'status': 'success', 'learned': True,
+                                       'statistics': {'learned': True, 'source': 'expert:u-1'}})):
+            _http_bridge().submit_correction('London', 'Paris', context=dict(CONTEXT))
+        assert not [r for r in caplog.records if 'provenance' in r.getMessage()]
+        for _ in range(2):
+            with patch('integrations.agent_engine.world_model_bridge.pooled_post',
+                       return_value=reply({'status': 'success', 'learned': True,
+                                           'statistics': {'learned': True}})):
+                _http_bridge().submit_correction('London', 'Paris', context=dict(CONTEXT))
+    said = [r for r in caplog.records if 'provenance' in r.getMessage()]
+    assert len(said) == 1, [r.getMessage() for r in caplog.records]
