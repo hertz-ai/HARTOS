@@ -59,8 +59,9 @@ def _store():
                     loader=cache_loaders.load_agent_data)
 
 
-def _tools(store, user_id, prompt_id=AGENT, helper_fun=None):
+def _tools(store, user_id, prompt_id=AGENT, helper_fun=None, building=False):
     ctx = {
+        'building_agent': building,
         'user_id': user_id, 'prompt_id': prompt_id, 'agent_data': store,
         'helper_fun': helper_fun or _DiskHelper(),
         'user_prompt': f'{user_id}_{prompt_id}',
@@ -133,6 +134,142 @@ def test_what_the_agent_already_holds_stays_readable_by_everyone(store_dir):
     # The agent's own store is never written by a person's save.
     assert cache_loaders.load_agent_data(AGENT) == {
         'receipt_template': 'Bill {amount}'}
+
+
+def test_while_building_a_template_can_be_saved_for_everyone(store_dir):
+    """Owner 2026-10-17: what the creator saves while building is theirs,
+    "only the template not the data unless it can serve as example" goes
+    to everyone."""
+    store = _store()
+    builder = _tools(store, CREATOR, building=True)
+    out = builder['save_data_in_memory'](
+        'receipt_template', 'Bill for {service}: {amount}', for_everyone=True)
+    assert 'for everyone' in out
+    builder['save_data_in_memory']('client', {'name': 'Priya'})
+
+    visitor = _tools(_store(), VISITOR)
+    assert visitor['get_data_by_key']('receipt_template') == \
+        'Bill for {service}: {amount}'
+    assert visitor['get_data_by_key']('client') == NOT_FOUND
+    assert cache_loaders.load_agent_data(AGENT) == {
+        'receipt_template': 'Bill for {service}: {amount}'}
+
+
+def test_outside_building_for_everyone_stays_personal(store_dir):
+    """A user of a finished agent cannot write the agent's shared store:
+    that is the 10-14 erase again."""
+    store = _store()
+    out = _tools(store, VISITOR)['save_data_in_memory'](
+        'teach', [{'topic': 'Fractions'}], for_everyone=True)
+    assert 'for this person only' in out
+    assert cache_loaders.load_agent_data(AGENT) is None
+    assert _tools(store, CREATOR)['get_data_by_key']('teach') == NOT_FOUND
+
+
+def _function_source(name, end_marker):
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+    src = open(os.path.join(root, 'hartos', 'create_recipe.py'),
+               encoding='utf-8').read()
+    start = src.index(f'\ndef {name}(')
+    return src[start:src.index(end_marker, start)]
+
+
+def test_create_resume_restores_the_creators_own_memory(tmp_path):
+    """load_existing_metadata, run from its source (create_recipe cannot be
+    imported in a bare test env): an action JSON's metadata is the
+    creator's saved-key snapshot, so a resumed CREATE puts it in the
+    creator's own memory, never in the agent's store, where it read back as
+    values for every other user (review of 7121264b1)."""
+    import logging
+    action = tmp_path / '54_0_1.json'
+    action.write_text(json.dumps({'metadata': {'notes': {'secret': None}}}))
+    saved = []
+    helper = SimpleNamespace(
+        load_agent_data_from_file=lambda pid, store: (store.__setitem__(pid, {}), False)[1],
+        safe_prompt_path=lambda pid, flow, aid: str(action),
+        save_agent_data_to_file=lambda pid, store: saved.append(pid) or True)
+    from core.agent_tools import person_store_id
+    ns = {'helper_fun': helper, 'agent_data': {}, 'json': json,
+          'current_app': SimpleNamespace(logger=logging.getLogger('t'))}
+    exec(_function_source('load_existing_metadata', '\n\n\n'), ns)
+    user_prompt = f'{CREATOR}_{AGENT}'
+    ns['load_existing_metadata'](AGENT, user_prompt,
+                                 {0: {'completed_actions': [1]}})
+    own = person_store_id(user_prompt)
+    assert ns['agent_data'][own] == {'notes': {'secret': None}}
+    assert 'notes' not in ns['agent_data'].get(AGENT, {})
+    assert saved == [own]
+
+
+def test_a_nested_save_keeps_the_agent_entrys_other_fields(store_dir):
+    """Agent 54's shape: the agent's own store holds a record saved before
+    the ruling; the creator then saves one field of it.  The read is the
+    merged view, not the first store that has the key (review of 7121264b1:
+    the book vanished from get_data_by_key while get_saved_metadata still
+    listed it)."""
+    cache_loaders.save_agent_data(
+        AGENT, {'teach': {CREATOR: {'book': 'Quantum Mechanics', 'chapter': 3}}})
+    creator = _tools(_store(), CREATOR)
+    creator['save_data_in_memory'](f'teach.{CREATOR}.chapter', 4)
+    record = creator['get_data_by_key'](f'teach.{CREATOR}')
+    assert 'Quantum Mechanics' in record and '4' in record and '3' not in record
+
+
+def test_each_persons_receipt_logo_is_their_own_file(store_dir, tmp_path,
+                                                     monkeypatch):
+    """The logo's path lives in the person's memory, so its file must too:
+    one folder per agent let the next person's logo overwrite the file
+    under a path still stored as the first person's."""
+    data_dir = tmp_path / 'data'
+    monkeypatch.setattr('core.platform_paths.get_data_dir',
+                        lambda: str(data_dir))
+    store = _store()
+    for user, content in ((CREATOR, b'LOGO-A'), (VISITOR, b'LOGO-B')):
+        src = tmp_path / f'{content.decode()}.png'
+        src.write_bytes(content)
+        _tools(store, user)['set_receipt_logo'](file_path=str(src))
+    for user, content in ((CREATOR, b'LOGO-A'), (VISITOR, b'LOGO-B')):
+        path = _tools(store, user)['get_data_by_key']('receipt_logo_path')
+        with open(path, 'rb') as f:
+            assert f.read() == content
+
+
+def test_no_person_store_id_enters_the_elided_namespace():
+    """The wire trim keeps elided text under `elided_<scope>_<id>` and
+    sweeps those files after a day; a person store id must never be one."""
+    from core.agent_tools import person_store_id
+    from core.llm_outbound_logger import ELIDED_NAMESPACE
+    for user_prompt in (f'{ELIDED_NAMESPACE}_u1234_{AGENT}', f'{CREATOR}_{AGENT}',
+                        '../escape_54', 'a@b.c_54'):
+        store_id = person_store_id(user_prompt)
+        assert not store_id.startswith(ELIDED_NAMESPACE + '_')
+        assert store_id.replace('_', '').replace('-', '').isalnum()
+    assert person_store_id(f'{CREATOR}_{AGENT}') == f'{CREATOR}_{AGENT}'
+
+
+def test_source_guard_create_reads_memory_through_memory_view():
+    """Source guard (DRY across the CREATE sites, beside the behaviour test
+    below): every value CREATE builds from the memory store, the recipe's
+    saved-key snapshot, the "Metadata created till this action" line and
+    the speaker selector's key list, comes from memory_view.  Those sites
+    sit inside closures that cannot run without the pipeline, and the
+    review of 7121264b1 found one still reading agent_data[prompt_id]."""
+    import ast
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+    tree = ast.parse(open(os.path.join(root, 'hartos', 'create_recipe.py'),
+                          encoding='utf-8').read())
+    sites = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id in ('metadata', '_ad')):
+            reads_store = any(isinstance(n, ast.Name) and n.id == 'agent_data'
+                              for n in ast.walk(node.value))
+            if reads_store:
+                sites.append((node.lineno, ast.unparse(node.value)))
+    assert sites, 'no CREATE metadata site found: re-point this guard'
+    stray = [s for s in sites if 'memory_view(' not in s[1]]
+    assert not stray, f'CREATE reads the memory store around memory_view: {stray}'
 
 
 def test_saved_metadata_lists_own_and_shared_keys_never_anothers(store_dir):

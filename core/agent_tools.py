@@ -428,7 +428,12 @@ def person_store_id(user_prompt):
     which joins it unchecked, and a user id can come from a request body, so
     '../x' must never reach a path."""
     key = str(user_prompt)
-    if key and key.replace('_', '').replace('-', '').isalnum():
+    # Never in the wire trim's `elided` namespace either: its eviction sweep
+    # deletes those files after a day, and a made-up id there could name
+    # another user's elided item (review of 7121264b1).
+    from core.llm_outbound_logger import ELIDED_NAMESPACE
+    if (key and key.replace('_', '').replace('-', '').isalnum()
+            and not key.startswith(ELIDED_NAMESPACE + '_')):
         return key
     import hashlib
     return 'p' + hashlib.sha256(key.encode('utf-8')).hexdigest()[:24]
@@ -463,7 +468,9 @@ def build_core_tool_closures(ctx):
             simplemem_store (optional), memory_graph (optional),
             log_tool_execution (decorator), send_message_to_user1 (func),
             retrieve_json (func), strip_json_values (func),
-            save_conversation_db (func)
+            save_conversation_db (func),
+            building_agent (optional, True in CREATE: save_data_in_memory
+            may then save a template or example for everyone)
     """
     # Unpack context -------------------------------------------------------
     user_id = ctx['user_id']
@@ -486,6 +493,9 @@ def build_core_tool_closures(ctx):
     # This person's memory for this agent (memory_view): the memory tools
     # write here, and read here before the agent's own store.
     own_key = person_store_id(user_prompt)
+    # CREATE (hartos/create_recipe.py) sets it: the agent is being built,
+    # so a template or example may be saved for everyone.
+    building_agent = bool(ctx.get('building_agent'))
 
     def _own_store():
         """The person's store, restored from disk when the cache lacks it,
@@ -553,8 +563,17 @@ def build_core_tool_closures(ctx):
     def save_data_in_memory(
         key: Annotated[str, "Key path for storing data now & retrieving data later. Use dot notation for nested keys (e.g., 'user.info.name')."],
         value: Annotated[Optional[Any], "Value you want to store; strictly should be one of int, float, bool, json array or json object."] = None,
+        for_everyone: Annotated[bool, "True only while this agent is being built, and only for a template, or an example every user of the agent can start from (a receipt template, a sample lesson). Never a person's own data. Otherwise the value is this person's alone."] = False,
     ) -> str:
-        """Store data with validation to prevent corruption."""
+        """Store data with validation to prevent corruption.
+
+        The value is this person's memory for the agent (memory_view).
+        Owner ruling 2026-10-17: what is saved while the agent is being
+        built is the creator's data too, except a template, or data that
+        can serve as an example, which ``for_everyone`` puts in the agent's
+        own store for every user.  Outside building ``for_everyone`` keeps
+        the value personal, so no user's save reaches another user.
+        """
         tool_logger.info('INSIDE save_data_in_memory')
         try:
             if isinstance(value, str) and (value.startswith('{') or value.startswith('[')):
@@ -568,17 +587,26 @@ def build_core_tool_closures(ctx):
                 validated_value = None
 
             keys = key.split('.')
-            d = _own_store()
+            shared = bool(for_everyone) and building_agent
+            if shared:
+                # The agent's own store, restored first so this adds a key.
+                if prompt_id not in agent_data or not agent_data[prompt_id]:
+                    helper_fun.load_agent_data_from_file(prompt_id, agent_data)
+                store_key = prompt_id
+                d = agent_data.setdefault(prompt_id, {})
+            else:
+                store_key = own_key
+                d = _own_store()
             for k in keys[:-1]:
                 d = d.setdefault(k, {})
             d[keys[-1]] = validated_value
             tool_logger.info(f"VALUES STORED IN AGENT DATA: {validated_value}")
             tool_logger.info(f"FULL AGENT DATA AT KEY: {d}")
 
-            if helper_fun.save_agent_data_to_file(own_key, agent_data):
-                tool_logger.info(f"[OK] Data persisted to file for {own_key}")
+            if helper_fun.save_agent_data_to_file(store_key, agent_data):
+                tool_logger.info(f"[OK] Data persisted to file for {store_key}")
             else:
-                tool_logger.warning(f"Failed to persist data to file for {own_key}")
+                tool_logger.warning(f"Failed to persist data to file for {store_key}")
 
             # Mirror to MemoryGraph (fire-and-forget).  Carried by
             # reuse_recipe's inline twin before the #743 migration, lost
@@ -609,8 +637,14 @@ def build_core_tool_closures(ctx):
             # the model's context and, through the group chat's write-back,
             # into memory again: on central 2026-09-14 (#104) the large
             # MemoryGraph rows were all this repr, 0.9M to 3.96M chars each.
+            where = ''
+            if shared:
+                where = ' (for everyone who uses this agent)'
+            elif for_everyone:
+                where = (' (for this person only: a value is saved for everyone '
+                         'only while the agent is being built)')
             return _bounded_observation(
-                f'Saved at {key}: {json.dumps(validated_value)}',
+                f'Saved at {key}{where}: {json.dumps(validated_value)}',
                 'the whole value was saved')
         except json.JSONDecodeError as je:
             error_msg = f"Invalid JSON structure in value: {str(je)}"
@@ -1128,30 +1162,25 @@ def build_core_tool_closures(ctx):
         template longer than a page was cut and the page note was printed into
         the customer's receipt (#104 review).
 
-        The person's own memory first, then what the agent itself holds
-        (memory_view): a key this person never saved still finds an entry
-        the agent kept for everyone, never another person's.
+        Read through memory_view, the one person's view: this person's
+        entries over what the agent itself holds, merged key by key, so a
+        key this person never saved still finds an entry the agent kept for
+        everyone (never another person's), and a nested key saved over an
+        agent entry keeps the agent entry's other fields.
         """
-        keys = key.split('.')
-
-        def _at(d):
-            for k in keys:
+        if prompt_id not in agent_data or not agent_data[prompt_id]:
+            tool_logger.info(f"Loading agent data from file for prompt_id {prompt_id}")
+            helper_fun.load_agent_data_from_file(prompt_id, agent_data)
+        _own_store()
+        d = memory_view(agent_data, prompt_id, user_prompt)
+        try:
+            for k in key.split('.'):
                 d = d[k]
             return f'{d}'
-
-        try:
-            return _at(_own_store())
         # TypeError too: a path that runs through a None, a string or a list
         # is as missing as an absent key. It used to escape as a tool
         # exception and skip the fallback below (central 2026-09-13, a hive
         # reuse turn asking for a nested key under a None value).
-        except (KeyError, TypeError):
-            pass
-        if prompt_id not in agent_data or not agent_data[prompt_id]:
-            tool_logger.info(f"Loading agent data from file for prompt_id {prompt_id}")
-            helper_fun.load_agent_data_from_file(prompt_id, agent_data)
-        try:
-            return _at(agent_data.get(prompt_id, {}))
         except (KeyError, TypeError):
             # Fallback: check MemoryGraph for persisted [KV] data — the
             # read half of save_data_in_memory's dual-write, carried by
@@ -1326,7 +1355,11 @@ def build_core_tool_closures(ctx):
             return ("'" + ext + "' is not an image type I can put on a "
                     "receipt - please send PNG or JPG.")
         from core.platform_paths import get_data_dir
-        dest_dir = os.path.join(get_data_dir(), 'receipt_assets', str(prompt_id))
+        # One folder per person on this agent, beside the path the person's
+        # memory stores (memory_view): a shared folder let the next person's
+        # logo overwrite this one's file under a path still stored as theirs.
+        dest_dir = os.path.join(get_data_dir(), 'receipt_assets',
+                                str(prompt_id), own_key)
         os.makedirs(dest_dir, exist_ok=True)
         dest = os.path.join(dest_dir, 'logo' + ext)
         try:

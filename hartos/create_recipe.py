@@ -1259,6 +1259,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         'retrieve_json': retrieve_json,
         'strip_json_values': strip_json_values,
         'save_conversation_db': save_conversation_db,
+        # CREATE: a template or example may be saved for everyone who uses
+        # the agent (save_data_in_memory for_everyone; owner 2026-10-17).
+        'building_agent': True,
     }
     core_tools = build_core_tool_closures(_tool_ctx)
     # Same name filter the reuse pipeline's identical helper/assistant leg
@@ -2578,9 +2581,11 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             current_app.logger.error(f"Error in error detection logic: {e}")
 
         # Get metadata once for potential use later
-        # get_saved_metadata is a tool closure — access agent_data directly here
+        # get_saved_metadata is a tool closure — read the same view it reads
+        # (memory_view: this person's memory for the agent over the agent's).
         try:
-            _ad = agent_data.get(prompt_id, {})
+            from core.agent_tools import memory_view
+            _ad = memory_view(agent_data, prompt_id, user_prompt)
             metadata = json.dumps(list(_ad.keys())) if _ad else "{}"
         except Exception as e:
             current_app.logger.error(f"Error getting metadata: {e}")
@@ -3550,6 +3555,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         'retrieve_json': retrieve_json,
         'strip_json_values': strip_json_values,
         'save_conversation_db': save_conversation_db,
+        'building_agent': True,
     }
     core_tools_time = build_core_tool_closures(_tool_ctx_time)
     _time_tool_menu = registered_tool_menu(core_tools_time)
@@ -6863,6 +6869,15 @@ def load_existing_metadata(prompt_id, user_prompt, flow_progress):
         if helper_fun.load_agent_data_from_file(prompt_id, agent_data):
             current_app.logger.info(f" Successfully loaded persistent agent data for prompt_id {prompt_id}")
             return
+        # An action JSON's metadata is the creator's saved-key snapshot (the
+        # creator's memory_view when the recipe was written), so it restores
+        # the creator's own memory for this agent, never the agent's shared
+        # store: there it read back as values (None) for every other user
+        # (review of 7121264b1).  Nothing to restore when that memory exists.
+        from core.agent_tools import person_store_id
+        own_id = person_store_id(user_prompt)
+        if agent_data.get(own_id):
+            return
         # Look for the most recent action JSON with metadata
         for flow_idx, progress in flow_progress.items():
             for action_id in sorted(progress['completed_actions'], reverse=True):
@@ -6871,13 +6886,12 @@ def load_existing_metadata(prompt_id, user_prompt, flow_progress):
                     with open(action_file, 'r') as f:
                         action_data = json.load(f)
                         if 'metadata' in action_data and action_data['metadata']:
-                            # Merge metadata into agent_data
-                            if prompt_id not in agent_data:
-                                agent_data[prompt_id] = {}
-                            agent_data[prompt_id].update(action_data['metadata'])
+                            # Merge metadata into the creator's own memory
+                            own = agent_data.setdefault(own_id, {})
+                            own.update(action_data['metadata'])
                             current_app.logger.info(f" Loaded metadata from {action_file}")
                             # Save to persistent storage for future use
-                            helper_fun.save_agent_data_to_file(prompt_id,agent_data)
+                            helper_fun.save_agent_data_to_file(own_id, agent_data)
                             return  # Load from most recent only
                 except Exception as e:
                     current_app.logger.warning(f"⚠️ Could not load metadata from {action_file}: {e}")
