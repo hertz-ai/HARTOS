@@ -51,8 +51,9 @@ The new mount line to add to the `docker run` command:
 
 ## Step 3 — Add the payment-rail env vars
 
-`STRIPE_API_KEY`, `STRIPE_WEBHOOK_SECRET`, `HEVOLVE_API_KEY` and
-`HARTOS_PUBLIC_URL` are owned by the deploy: set each as a GitHub repo
+`STRIPE_API_KEY`, `STRIPE_WEBHOOK_SECRET`, `HEVOLVE_API_KEY`,
+`HARTOS_PUBLIC_URL` and the PhonePe settings below are owned by the
+deploy: set each as a GitHub repo
 secret (`gh secret set STRIPE_API_KEY --repo hertz-ai/HARTOS`) and the
 deepbox deploy writes it into central's `.env` on every deploy
 (`deploy/deepbox_deploy.sh`). Do not hand-edit those; while the secret is
@@ -69,19 +70,22 @@ a loopback or LAN request host, which no gateway can reach) a PhonePe
 payment is refused, never sent with a guessed host: the shopper sees a
 plain sentence and the ERROR log names the setting (`core/public_url.py`).
 
-The PhonePe keys below are not forwarded by the workflow, so they still
-go into the host-side `.env` by hand (the deploy never rewrites keys it
-does not own). Docker reads `--env-file .env` only when the container is
-created, so a `docker restart` changes nothing: the keys take effect on
-the next deploy, which recreates the container:
+The PhonePe settings are repo secrets too; the deploy forwards them and
+writes each one it is given into `.env`. Docker reads `--env-file .env`
+only when the container is created, so a `docker restart` changes
+nothing: the keys take effect on the next deploy, which recreates the
+container. The gateway registers only when the merchant id AND the salt
+key are both set; leave the other three unset to keep their defaults.
+`gh secret set NAME` with no `--body` asks for the value at a prompt, so
+it never lands in shell history:
 
 ```bash
 # India (UPI / cards / netbanking via PhonePe)
-PHONEPE_MERCHANT_ID=YOUR_MERCHANT_ID
-PHONEPE_SALT_KEY=YOUR_SALT_KEY
-PHONEPE_SALT_INDEX=1
-PHONEPE_ENV=PROD   # or UAT for sandbox
-PHONEPE_USD_INR_RATE=84.0   # optional override; default is 84.0
+gh secret set PHONEPE_MERCHANT_ID --repo hertz-ai/HARTOS
+gh secret set PHONEPE_SALT_KEY --repo hertz-ai/HARTOS
+gh secret set PHONEPE_SALT_INDEX --repo hertz-ai/HARTOS    # optional; default 1
+gh secret set PHONEPE_ENV --repo hertz-ai/HARTOS           # optional; PROD (default), UAT = sandbox
+gh secret set PHONEPE_USD_INR_RATE --repo hertz-ai/HARTOS  # optional; default 84.0
 ```
 
 ## Step 4 — Restart the container with the new mount

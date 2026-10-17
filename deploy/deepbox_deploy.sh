@@ -15,6 +15,8 @@
 #   HEVOLVE_EXPERT_LLM_API_KEY HEVOLVE_CLAUDE_BUDGET_USD_DAY
 #   HEVOLVE_AUTONOMOUS_MARKETING HEVOLVE_API_KEY STRIPE_API_KEY
 #   HARTOS_PUBLIC_URL STRIPE_WEBHOOK_SECRET
+#   PHONEPE_MERCHANT_ID PHONEPE_SALT_KEY PHONEPE_SALT_INDEX PHONEPE_ENV
+#   PHONEPE_USD_INR_RATE
 #
 # Why this file exists: any `with:` value carrying a ${{ }} expression
 # compiles to ONE GitHub expression, hard-capped at 21,000 chars of the
@@ -251,7 +253,11 @@ fi
 # is refused rather than sent with a guessed host), and the Stripe webhook's
 # signing secret (commercial_api.stripe_webhook trusts no event without it, so
 # a paid Checkout then bumps its tier only through the buyer's success
-# page). Same rule as the McGroce secret: written key by key only
+# page), and PhonePe's settings (integrations/ap2/ap2_protocol.py registers
+# the PhonePe gateway at boot only when the merchant id AND the salt key are
+# set; the salt index defaults to 1, the environment to PROD, UAT being the
+# sandbox, and the USD-to-INR rate, which prices USD tiers in rupees,
+# to 84.0). Same rule as the McGroce secret: written key by key only
 # when its secret is non-empty, the value never logged, and an absent secret
 # leaves .env as it is. So deleting a repo secret changes nothing on the box,
 # and editing .env while the secret is still set is undone by the next
@@ -262,7 +268,9 @@ fi
 for _k in HEVOLVE_EXPERT_LLM_ENDPOINT_URL HEVOLVE_EXPERT_LLM_MODEL_NAME \
           HEVOLVE_EXPERT_LLM_API_KEY HEVOLVE_CLAUDE_BUDGET_USD_DAY \
           HEVOLVE_AUTONOMOUS_MARKETING HEVOLVE_API_KEY STRIPE_API_KEY \
-          HARTOS_PUBLIC_URL STRIPE_WEBHOOK_SECRET; do
+          HARTOS_PUBLIC_URL STRIPE_WEBHOOK_SECRET \
+          PHONEPE_MERCHANT_ID PHONEPE_SALT_KEY PHONEPE_SALT_INDEX \
+          PHONEPE_ENV PHONEPE_USD_INR_RATE; do
   if [ -n "${!_k}" ] && [ -f .env ]; then
     _set_env_key "$_k" "${!_k}"
     echo "  $_k set from the secret (value not shown)"
