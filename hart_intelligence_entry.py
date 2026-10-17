@@ -11902,38 +11902,32 @@ def agent_approval():
         else:
             app.logger.warning('agent_approval: consent not recorded — no '
                                'owner identity (HEVOLVE_OWNER_USER_ID unset)')
-        if not approved and str(action or '').startswith('game_sound:'):
-            # A reviewer turning down a game's music is not a consent
-            # denial.  Falling through to the branch below published
-            # {'type':'consent', 'decision':'denied'} on the VISION topic
-            # for a piece of music -- wrong noun, wrong topic -- while the
-            # memo kept serving the take they had just refused.
-            from core.game_sound_memo import parse_game_sound_action
-            sound_game, sound_state = parse_game_sound_action(action_raw)
+        if str(action or '').startswith('game_sound:'):
+            # A game's sound, kept or turned down on the card an agent raised
+            # (core/agent_tools.offer_sound_for_review).  Not a consent: a
+            # denial falling through to the branch below published
+            # {'type':'consent', 'decision':'denied'} on the VISION topic for
+            # a piece of music while the memo kept serving the take they had
+            # just refused, and an approval fell to the no-mapping branch and
+            # was never recorded.  Whose choice it is -- the agent's creator
+            # for everyone, anyone else for themselves alone (owner
+            # 2026-10-17) -- is answer_game_sound_card; the answerer is the
+            # caller's VERIFIED identity, never a body field, by the same
+            # rule the commerce cards use.
             reason = str(data.get('reason') or data.get('note') or '').strip()
             try:
-                from core.game_sound_memo import record_verdict
-                from hartos.helper import (
-                    load_agent_data_from_file, save_agent_data_to_file)
-                _pid = int(agent_id)
-                _data = {}
-                load_agent_data_from_file(_pid, _data)
-                _games = _data.setdefault(_pid, {}).setdefault('games', {})
-                _record, _matched, _key = record_verdict(
-                    _games, sound_game, sound_state, False, reason)
-                if _record:
-                    save_agent_data_to_file(_pid, _data)
-                app.logger.info(
-                    f'agent_approval: agent={agent_id} rejected game sound '
-                    f'{sound_game}/{sound_state} at memo {_key}')
-                return jsonify({'status': 'rejected', 'action': action,
-                                'applied': bool(_record), 'key': _key,
-                                'matched': _matched}), 200
+                from core.agent_tools import answer_game_sound_card
+                from integrations.commerce.approvals import approver_from_request
+                _gs_body, _gs_code = answer_game_sound_card(
+                    agent_id, action_raw, approved, reason,
+                    approver_from_request(request))
+                return jsonify(_gs_body), _gs_code
             except Exception as _gs_exc:
                 app.logger.warning(
-                    f'agent_approval: game sound rejection failed: {_gs_exc}')
-                return jsonify({'status': 'rejected', 'action': action,
-                                'applied': False, 'error': str(_gs_exc)}), 200
+                    f'agent_approval: game sound answer failed: {_gs_exc}')
+                return jsonify({'status': 'approved' if approved else 'rejected',
+                                'action': action, 'applied': False,
+                                'error': str(_gs_exc)}), 200
 
         if not approved:
             # Stage-C (Symptom #6): publish the deny event on WAMP too
@@ -11956,49 +11950,6 @@ def agent_approval():
                 app.logger.debug(f"agent_approval deny WAMP publish failed: {_pub_exc}")
             app.logger.info(f'agent_approval: agent={agent_id} action={action} DENIED')
             return jsonify({'status': 'denied', 'action': action}), 200
-
-        # A reviewer's word on a game's sound.  The card an agent raises
-        # carries action 'game_sound:{game_id}:{state}' (core/agent_tools
-        # .offer_sound_for_review), and until now it fell through to the
-        # no-mapping branch below and returned applied=False -- so a sound
-        # could be approved on screen and approved_at stayed null forever,
-        # leaving REUSE unable to tell an approved sound from an unreviewed
-        # one.  The verdict itself lives in core.game_sound_memo, called
-        # from here and from the agent's own tool, so there is one
-        # implementation rather than two.
-        if str(action or '').startswith('game_sound:'):
-            from core.game_sound_memo import parse_game_sound_action
-            sound_game, sound_state = parse_game_sound_action(action_raw)
-            try:
-                from core.game_sound_memo import record_verdict
-                from hartos.helper import (
-                    load_agent_data_from_file, save_agent_data_to_file)
-                _pid = int(agent_id)
-                _data = {}
-                load_agent_data_from_file(_pid, _data)
-                _games = _data.setdefault(_pid, {}).setdefault('games', {})
-                _record, _matched, _key = record_verdict(
-                    _games, sound_game, sound_state, True)
-                if not _record:
-                    app.logger.info(
-                        f'agent_approval: game sound {sound_game}/{sound_state} '
-                        f'has nothing bound to approve')
-                    return jsonify({'status': 'approved', 'action': action,
-                                    'applied': False,
-                                    'reason': 'nothing bound'}), 200
-                save_agent_data_to_file(_pid, _data)
-                app.logger.info(
-                    f'agent_approval: agent={agent_id} approved game sound '
-                    f'{sound_game}/{sound_state} at memo {_key}')
-                return jsonify({'status': 'approved', 'action': action,
-                                'applied': True, 'key': _key,
-                                'matched': _matched}), 200
-            except Exception as _gs_exc:
-                app.logger.warning(
-                    f'agent_approval: game sound verdict failed: {_gs_exc}')
-                return jsonify({'status': 'approved', 'action': action,
-                                'applied': False,
-                                'error': str(_gs_exc)}), 200
 
         # Map the approval to a feed toggle and reuse the single
         # _apply_embodied_toggle codepath admin settings use.
