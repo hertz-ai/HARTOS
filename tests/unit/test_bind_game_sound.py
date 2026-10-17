@@ -7,6 +7,7 @@ lives in the agent's own saved data, beside everything else
 save_data_in_memory keeps, and the composing is the media capability the
 agent already holds.
 """
+import itertools
 import json
 import time
 from contextlib import contextmanager
@@ -149,10 +150,15 @@ def test_a_composition_still_running_is_handed_back_to_be_finished():
     media = _media({'status': 'pending', 'task_id': 'acestep_1'},
                    {'status': 'pending'})
 
+    # A clock that moves 100 s per read, for ever: the patch is on the time
+    # module itself, so a log record reads it too, and a fixed list of five
+    # readings ran out (StopIteration) whenever an earlier test had left
+    # logging that timestamps records (review of fafa03c40, R2).  Any
+    # extra reading only brings the 90 s poll deadline sooner.
     with _agent(agent_data, media) as tools, \
             patch.object(agent_tools.time, 'sleep', lambda *_: None), \
             patch.object(agent_tools.time, 'time',
-                         MagicMock(side_effect=[0.0, 0.0, 1000.0, 1000.0, 1000.0])):
+                         MagicMock(side_effect=itertools.count(0.0, 100.0))):
         answer = json.loads(tools['bind_game_sound']('eng-02'))
 
     assert answer['status'] == 'composing'
@@ -944,6 +950,72 @@ def test_a_card_answer_reaches_a_session_already_holding_the_store(store_dir):
     own = _on_disk(f'{VISITOR}_4242')
     assert _bgm(own)['rejected_url'] == 'https://node/a.mp3', own
     assert own['progress'] == {'level': 2}
+
+
+def test_a_card_answered_while_a_take_is_composing_loses_neither(store_dir):
+    """Review of fafa03c40, R1: the card dropped the cached store while a
+    bind was still composing, so the bind wrote its take into a dict nobody
+    held any more.  The take composed in that window was lost from the
+    memo, the answer to its own card could not land, and the next bind
+    queued a second composer job.  This is the CREATE flow the feature is
+    for: the creator answers each card while the agent binds the next state."""
+    from core import cache_loaders
+    cache_loaders.save_agent_data(4242, _SEED)
+    live = _live_cache()
+    media = _media({'status': 'pending', 'task_id': 'acestep_c1'})
+    polls = []
+
+    def the_creator_answers_a_card_mid_composition(task_id):
+        polls.append(task_id)
+        if len(polls) == 1:
+            agent_tools.answer_game_sound_card(
+                '4242', 'game_sound:eng-01:bgm', False, 'too jangly', 'user-1')
+            return json.dumps({'status': 'pending'})
+        return json.dumps({'status': 'completed',
+                           'results': [{'url': 'https://node/c1.mp3'}]})
+    media.check_media_status.side_effect = the_creator_answers_a_card_mid_composition
+
+    with _agent(live, media, helper_fun=_Disk()) as tools, \
+            patch('time.sleep', lambda *_a, **_k: None):
+        bound = json.loads(tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct'))
+        again = json.loads(tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct'))
+    kept = agent_tools.answer_game_sound_card(
+        '4242', 'game_sound:eng-01:correct', True, '', 'user-1')[0]
+
+    agent = _on_disk(4242)
+    sounds = agent['games']['eng-01']['sounds']
+    assert bound['status'] == 'bound' and again['status'] == 'already_bound'
+    assert sounds['correct']['url'] == 'https://node/c1.mp3', sounds
+    assert sounds['bgm'].get('url') is None, 'the card answered mid-composition was lost'
+    assert sounds['bgm']['rejected_url'] == 'https://node/a.mp3'
+    assert media.generate_media.call_count == 1, 'a second composer job was queued'
+    assert kept['applied'] is True, kept
+
+
+def test_a_card_whose_answer_could_not_be_saved_says_so(store_dir, monkeypatch):
+    """'applied' follows the save: a store file that could not be written
+    (another process holding it on Windows, a full disk) answers False and
+    changes nothing anyone hears (review of fafa03c40, M6)."""
+    from core import cache_loaders
+    cache_loaders.save_agent_data(4242, _SEED)
+    monkeypatch.setattr(cache_loaders, 'save_agent_data', lambda *_a, **_k: False)
+    body, code = agent_tools.answer_game_sound_card(
+        '4242', 'game_sound:eng-01:bgm', False, 'too jangly', 'user-1')
+    assert (code, body['applied']) == (200, False)
+    assert _bgm(_on_disk(4242))['url'] == 'https://node/a.mp3'
+
+
+def test_a_store_that_cannot_be_replaced_leaves_no_temp_file(store_dir, monkeypatch):
+    """On Windows the atomic replace fails while another handle holds the
+    store open; the save reports False and leaves nothing behind (review of
+    fafa03c40, R3: a .tmp was left per failed answer)."""
+    from core import cache_loaders
+
+    def held_open(*_a, **_k):
+        raise PermissionError(5, 'Access is denied')
+    monkeypatch.setattr(cache_loaders.os, 'replace', held_open)
+    assert cache_loaders.save_agent_data(4242, _SEED) is False
+    assert not list(store_dir.glob('*.tmp'))
 
 
 def test_a_creators_card_answer_survives_a_visitors_stale_session(store_dir):

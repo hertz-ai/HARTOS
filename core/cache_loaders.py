@@ -105,9 +105,20 @@ def save_agent_data(prompt_id, data) -> bool:
         except ImportError as e:
             logger.debug(f"agent_data saved unencrypted: {e}")
         tmp = f"{file_path}.{os.getpid()}.{threading.get_ident()}.tmp"
-        with open(tmp, 'wb') as f:
-            f.write(payload)
-        os.replace(tmp, file_path)
+        try:
+            with open(tmp, 'wb') as f:
+                f.write(payload)
+            os.replace(tmp, file_path)
+        except OSError:
+            # On Windows os.replace fails while another handle has the
+            # target open (WinError 5; the kids media route reads these
+            # files on every cue), and the temp file was left behind
+            # (review of fafa03c40, R3).
+            try:
+                os.remove(tmp)
+            except OSError as cleanup_error:
+                logger.debug(f"could not remove {tmp}: {cleanup_error}")
+            raise
         return True
     except Exception as e:
         logger.warning(f"Failed to save agent_data for {prompt_id}: {e}")

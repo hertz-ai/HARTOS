@@ -804,8 +804,18 @@ def build_core_tool_closures(ctx):
             if personal:
                 bound, matched = game_state_sound(
                     agent_games, slot, which, level, own=own_games, own_only=True)
-        games = own_games if personal else agent_games
         store_id = own_key if personal else prompt_id
+
+        def _memo():
+            """The memo this call writes, looked up again at each use.  A
+            composition can take minutes, and a card answered meanwhile
+            drops the cached store (forget_cached_store): a dict captured
+            at the start would then be an orphan, so the take composed in
+            that window, and the answer to its card, were lost (review of
+            fafa03c40, R1)."""
+            store = (_own_store() if personal
+                     else agent_data.setdefault(prompt_id, {}))
+            return store.setdefault('games', {})
         if bound.get('url'):
             return json.dumps({
                 'status': 'already_bound',
@@ -827,7 +837,7 @@ def build_core_tool_closures(ctx):
         # task_id means poll it, never start a second composition.
 
         def _remember(record):
-            set_game_state_sound(games, slot, which, record, level)
+            set_game_state_sound(_memo(), slot, which, record, level)
             try:
                 helper_fun.save_agent_data_to_file(store_id, agent_data)
             except Exception as e:
@@ -941,7 +951,7 @@ def build_core_tool_closures(ctx):
             what=description or slot, mood=mood)
         # A take the reviewer rejected is composed again WITH the reason
         # they gave, and kept as the next variant (spec §6.1).
-        rejected = rejected_take(games, slot, which, level)
+        rejected = rejected_take(_memo(), slot, which, level)
         variant = int(rejected.get('variant') or 1) + 1 if rejected else 1
         if rejected.get('rejected_reason'):
             prompt = f"{prompt}. Not like the last one: {rejected['rejected_reason']}"
@@ -967,7 +977,7 @@ def build_core_tool_closures(ctx):
             composed again.  The rejection history and variant stay.
             """
             kept = {k: v for k, v in game_state_record(
-                        games, slot, which, level).items()
+                        _memo(), slot, which, level).items()
                     if k not in ('task_id', 'task_since', 'submitted_at')}
             kept['lost_task'] = {'task_id': task_id, 'reason': reason,
                                  'at': time.time()}
@@ -991,7 +1001,7 @@ def build_core_tool_closures(ctx):
                 # own orphans.  /release_task takes no idempotency key, so
                 # the only dedupe is here: after a timed-out submit, do not
                 # submit again for this state until a cooldown has passed.
-                _pending = _pending_submit(games, slot, which, level)
+                _pending = _pending_submit(_memo(), slot, which, level)
                 if _pending and time.time() - _pending < SUBMIT_COOLDOWN_S:
                     return json.dumps({
                         'status': 'composing',
@@ -1040,7 +1050,7 @@ def build_core_tool_closures(ctx):
                     _remember({'mood': mood, 'prompt': prompt, 'state': which,
                                'level': level or None, 'variant': variant,
                                'composed_at': None, 'approved_at': None,
-                               **game_state_record(games, slot, which, level),
+                               **game_state_record(_memo(), slot, which, level),
                                'submitted_at': time.time()})
                     return json.dumps({
                         'status': 'composing',

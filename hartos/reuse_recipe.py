@@ -7693,8 +7693,14 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
         if user_prompt not in user_agents:
             llm_call_track[user_prompt] = {'count': 0, 'original_prompt': False}
             if user_prompt not in user_journey:
-                if prompt_id not in agent_data.keys():
-                    agent_data[prompt_id] = {}
+                # Load-or-create.  `prompt_id not in agent_data.keys()` asked
+                # only what was CACHED (keys() never runs the loader), so the
+                # first REUSE turn after a restart set the agent's store to {}
+                # without reading its file: its tools then saw no template and
+                # no game sounds, and the next save wrote that empty store over
+                # the creator's (review of fafa03c40, D0).  setdefault restores
+                # the file first, and only an agent with none starts empty.
+                agent_data.setdefault(prompt_id, {})
                 role_agents[user_prompt] = create_agents_for_role(user_id, prompt_id)
                 assistant, user_proxy, group_chat, manager, helper, stop = role_agents[user_prompt]
                 if stop:
