@@ -77,16 +77,34 @@ nothing: the keys take effect on the next deploy, which recreates the
 container. The gateway registers only when the merchant id AND the salt
 key are both set; leave the other three unset to keep their defaults.
 `gh secret set NAME` with no `--body` asks for the value at a prompt, so
-it never lands in shell history:
+it never lands in shell history. Run each line on its own and answer its
+prompt before the next one; pasted as a block, the next line can become
+the value of the previous secret:
 
 ```bash
 # India (UPI / cards / netbanking via PhonePe)
 gh secret set PHONEPE_MERCHANT_ID --repo hertz-ai/HARTOS
 gh secret set PHONEPE_SALT_KEY --repo hertz-ai/HARTOS
 gh secret set PHONEPE_SALT_INDEX --repo hertz-ai/HARTOS    # optional; default 1
-gh secret set PHONEPE_ENV --repo hertz-ai/HARTOS           # optional; PROD (default), UAT = sandbox
+gh secret set PHONEPE_ENV --repo hertz-ai/HARTOS           # optional; exactly PROD (default) or UAT
 gh secret set PHONEPE_USD_INR_RATE --repo hertz-ai/HARTOS  # optional; default 84.0
 ```
+
+Two traps, both silent:
+
+- **An unset secret never removes a line from `.env`.** A box that
+  followed the older version of this runbook already has `PHONEPE_*`
+  lines written by hand, and those keep their values for every secret
+  you leave unset: an old `PHONEPE_ENV=UAT` keeps the gateway in the
+  sandbox, where no real payment is taken. List the names on the box
+  (names only, never values) and set a secret for each one present:
+  `grep -oE '^PHONEPE_[A-Z_]+=' .env`.
+- **`PHONEPE_ENV` must be `PROD` or `UAT`** (case does not matter). Any
+  other value, `PRODUCTION` included, selects the sandbox, and a secret
+  cannot be read back. After the deploy, the boot log says which:
+  `sudo docker logs langchain 2>&1 | grep 'PhonePe gateway auto-registered'`
+  must show `(PROD mode`. That line says "real INR charges enabled" in
+  either mode, so read the mode, not the rest.
 
 ## Step 4 — Restart the container with the new mount
 
@@ -111,7 +129,9 @@ Confirm:
 
 ```bash
 sleep 20
-sudo docker inspect langchain | grep -E '(agent_data|STRIPE_API_KEY|PHONEPE_MERCHANT)' | head
+sudo docker inspect -f '{{range .Mounts}}{{println .Destination}}{{end}}' langchain | grep agent_data
+# names only, never values:
+sudo docker exec langchain env | grep -oE '^(STRIPE_API_KEY|PHONEPE_MERCHANT_ID)='
 curl -s http://localhost:6777/status | head -c 200
 curl -s http://localhost:6777/api/v1/intelligence/pricing | python3 -m json.tool | head -30
 ```
@@ -213,7 +233,8 @@ canonical aggregator on the next nightly settle.
   are present.
 - PhonePe 503 on `/upgrade/phonepe`: gateway not registered —
   check `PHONEPE_MERCHANT_ID` and `PHONEPE_SALT_KEY` made it into the
-  container with `sudo docker exec langchain env | grep PHONEPE`.
+  container with `sudo docker exec langchain env | grep -oE '^PHONEPE_[A-Z_]+='`
+  (names only, never values).
 - Marketing goal stays paused: check `agent_data/goals.json` for the
   `paused_reason` field — likely `auth_failed_repeatedly` if step 3
   missed.
