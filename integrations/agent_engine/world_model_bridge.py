@@ -1236,11 +1236,11 @@ class WorldModelBridge:
         context = dict(context) if isinstance(context, dict) else None
 
         # PRIVACY: Redact secrets from corrections before shared learning,
-        # the context included: every content leaf, by the same walk the
-        # replay path uses (edge_privacy.map_content), identifiers exempt, and
-        # a value under a secret-named key withheld when no pattern knows it
-        # (edge_privacy.scrub_secret). A context the walk cannot finish (a
-        # cycle) is dropped, never the correction.
+        # the context included, by the ONE rule the replay path also asks
+        # (edge_privacy.redact_secret_leaves: every content leaf through the
+        # secret patterns, identifiers exempt, a value under a secret-named key
+        # withheld when no pattern knows it). A context the walk cannot finish
+        # (a cycle) is dropped, and said, never the correction.
         try:
             from security.secret_redactor import redact_secrets
             original_response, _ = redact_secrets(original_response)
@@ -1251,13 +1251,12 @@ class WorldModelBridge:
             logger.warning("[WorldModelBridge] secret_redactor unavailable; correction NOT redacted")
         if context:
             try:
-                from security.edge_privacy import map_content, scrub_secret
-                from security.secret_redactor import redact_secrets
-                context = map_content(context, lambda t: redact_secrets(t)[0],
-                                      secret_fn=scrub_secret)
+                from security.edge_privacy import redact_secret_leaves
+                context, _ = redact_secret_leaves(context)
             except Exception as e:
-                logger.debug("[WorldModelBridge] correction context dropped: "
-                             "it could not be redacted (%s)", type(e).__name__)
+                logger.warning("[WorldModelBridge] correction context dropped: "
+                               "it could not be redacted (%s); the correction "
+                               "is sent without it", type(e).__name__)
                 context = None
 
         # In-process direct call
@@ -1330,12 +1329,10 @@ class WorldModelBridge:
                 body = resp.json()
                 if not isinstance(body, dict):
                     return {'success': False, 'reason': 'unreadable reply'}
-                # A C323 reply always names the fact's source (in its
-                # statistics); none, while a context was sent, means the server
-                # predates C323 and ignored the context.
-                _stats = body.get('statistics')
-                if context and not body.get('source') and not (
-                        isinstance(_stats, dict) and _stats.get('source')):
+                # A C323 server says on every 200 reply whether it read the
+                # context (context_received); a reply without the field, while
+                # a context was sent, is a server that ignored it.
+                if context and 'context_received' not in body:
                     _note_provenance_dropped()
                 self._count_if_learned(body)
                 return body

@@ -22,6 +22,13 @@ import pytest
 
 from integrations.agent_engine.world_model_bridge import WorldModelBridge
 
+
+@pytest.fixture(autouse=True)
+def _fresh_notice(monkeypatch):
+    """The drop notice is said once per process; each test starts unsaid."""
+    import integrations.agent_engine.world_model_bridge as wmb
+    monkeypatch.setattr(wmb, '_PROVENANCE_DROP_SAID', False, raising=False)
+
 CONTEXT = {'user_id': 'u-1', 'source_agent': 'agent-7', 'memory_id': 'm-42'}
 
 
@@ -257,30 +264,74 @@ def test_a_context_that_cannot_be_walked_does_not_cost_the_correction(monkeypatc
     assert 'context' not in post.call_args.kwargs['json']
 
 
-def test_an_older_server_ignoring_the_context_is_said_once(monkeypatch, caplog):
-    """Review of ea58905, MINOR-A: production's bridge talks HTTP, where a
-    HevolveAI before C323 has no context field and ignores it silently. A C323
-    reply always names the fact's source; a reply that names none while a
-    context was sent means the context was dropped, which is said once."""
+def test_an_older_server_ignoring_the_context_is_said_once(caplog):
+    """Review of ea58905, MINOR-A, and of 81a1b36, MINOR-1: production's
+    bridge talks HTTP, where a HevolveAI before C323 has no context field and
+    ignores it silently. A C323 server says so on every 200 reply
+    (context_received), including the replies that name no fact source (a
+    capture that raised, no provider for the domain). A reply without the field,
+    while a context was sent, is said once."""
     import logging
-    import integrations.agent_engine.world_model_bridge as wmb
-    monkeypatch.setattr(wmb, '_PROVENANCE_DROP_SAID', False, raising=False)
 
     def reply(body):
         resp = MagicMock(status_code=200)
         resp.json.return_value = body
         return resp
 
+    c323_replies = [
+        {'status': 'success', 'learned': True, 'context_received': True,
+         'statistics': {'learned': True, 'source': 'expert:u-1'}},
+        {'status': 'failed', 'learned': False, 'context_received': True,
+         'statistics': {'success': False, 'learned': False, 'error': 'boom'}},
+    ]
     with caplog.at_level(logging.INFO, logger='hevolve_social'):
-        with patch('integrations.agent_engine.world_model_bridge.pooled_post',
-                   return_value=reply({'status': 'success', 'learned': True,
-                                       'statistics': {'learned': True, 'source': 'expert:u-1'}})):
-            _http_bridge().submit_correction('London', 'Paris', context=dict(CONTEXT))
+        for body in c323_replies:
+            with patch('integrations.agent_engine.world_model_bridge.pooled_post',
+                       return_value=reply(body)):
+                _http_bridge().submit_correction('London', 'Paris', context=dict(CONTEXT))
         assert not [r for r in caplog.records if 'provenance' in r.getMessage()]
         for _ in range(2):
             with patch('integrations.agent_engine.world_model_bridge.pooled_post',
                        return_value=reply({'status': 'success', 'learned': True,
-                                           'statistics': {'learned': True}})):
+                                           'statistics': {'learned': True,
+                                                          'source': 'expert:u-1'}})):
                 _http_bridge().submit_correction('London', 'Paris', context=dict(CONTEXT))
     said = [r for r in caplog.records if 'provenance' in r.getMessage()]
     assert len(said) == 1, [r.getMessage() for r in caplog.records]
+
+
+def test_one_secret_rule_for_the_replay_and_the_correction():
+    """Review of 81a1b36, MINOR-2: the correction context withheld a value
+    under a secret-named key, the replay path (redact_experience) sent it raw.
+    Both now ask edge_privacy.redact_secret_leaves."""
+    from security.edge_privacy import redact_secret_leaves
+    from security.secret_redactor import redact_experience
+    data = {'attribution_chain': {'api_key': 'opaque-value-hunter2xyz',
+                                  'step': 'search', 'token': 'none'},
+            'prompt': 'hello', 'response': 'world', 'user_id': 'u-1'}
+    out, n = redact_secret_leaves(data)
+    assert 'hunter2' not in str(out) and n >= 1
+    assert out['attribution_chain']['token'] == 'none', "a status word stays readable"
+    assert out['attribution_chain']['step'] == 'search' and data['attribution_chain'][
+        'api_key'] == 'opaque-value-hunter2xyz', "the input is not mutated"
+    replayed = redact_experience(dict(data))
+    assert 'hunter2' not in str(replayed['attribution_chain'])
+
+
+def test_a_dropped_context_is_said(monkeypatch, caplog):
+    """Review of 81a1b36, NIT-3: a context dropped because it could not be
+    redacted is said at WARNING, not only at debug."""
+    import logging
+
+    def send_expert_correction(domain, original_response, corrected_response,
+                               expert_id, confidence=1.0, explanation=None,
+                               valid_until=None, signed_reward=None,
+                               provenance='unset'):
+        return {'success': True, 'learned': True}
+
+    _install(monkeypatch, send_expert_correction)
+    cyc = {'memory_id': 'm-42'}
+    cyc['self'] = cyc
+    with caplog.at_level(logging.WARNING, logger='hevolve_social'):
+        _in_process_bridge().submit_correction('London', 'Paris', context=cyc)
+    assert [r for r in caplog.records if 'context dropped' in r.getMessage()]
