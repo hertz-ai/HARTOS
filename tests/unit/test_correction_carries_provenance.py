@@ -104,3 +104,95 @@ def test_http_correction_body_carries_the_context():
                return_value=resp) as post:
         bridge.submit_correction('London', 'Paris', context=dict(CONTEXT))
     assert post.call_args.kwargs['json']['context'] == CONTEXT
+
+
+def test_a_context_that_is_not_a_dict_does_not_lose_the_correction(monkeypatch):
+    """Review of 54f203c38, MINOR-2: dict() on a string context raised inside
+    the in-process try and the correction fell through to a disabled HTTP
+    path. The receiver keeps only a dict, so a non-dict context is dropped and
+    the correction is sent."""
+    seen = {}
+
+    def send_expert_correction(domain, original_response, corrected_response,
+                               expert_id, confidence=1.0, explanation=None,
+                               valid_until=None, signed_reward=None,
+                               provenance='unset'):
+        seen['provenance'] = provenance
+        return {'success': True, 'learned': True}
+
+    _install(monkeypatch, send_expert_correction)
+    out = _in_process_bridge().submit_correction('London', 'Paris', context='m-42')
+    assert out['learned'] is True and seen['provenance'] == 'unset'
+
+
+SECRET = 'sk-ant-api03-' + 'A' * 40
+
+
+def test_a_secret_in_the_context_is_redacted_on_both_paths(monkeypatch):
+    """Review of 54f203c38, MINOR-3: the correction texts were redacted, the
+    context was not. It is now redacted by the same content walk the replay
+    path uses (edge_privacy.map_content + redact_secrets)."""
+    seen = {}
+
+    def send_expert_correction(domain, original_response, corrected_response,
+                               expert_id, confidence=1.0, explanation=None,
+                               valid_until=None, signed_reward=None,
+                               provenance=None):
+        seen['provenance'] = provenance
+        return {'success': True, 'learned': True}
+
+    _install(monkeypatch, send_expert_correction)
+    ctx = dict(CONTEXT, note=f'key is {SECRET}')
+    _in_process_bridge().submit_correction('London', 'Paris', context=ctx)
+    assert SECRET not in str(seen['provenance'])
+    assert seen['provenance']['memory_id'] == 'm-42'
+    assert ctx['note'].endswith(SECRET), "the caller's dict is not mutated"
+
+    bridge = WorldModelBridge()
+    bridge._in_process = False
+    bridge._http_disabled = False
+    bridge._api_url = 'http://localhost:8000'
+    resp = MagicMock(status_code=200)
+    resp.json.return_value = {'success': True, 'learned': True}
+    with patch('integrations.agent_engine.world_model_bridge.pooled_post',
+               return_value=resp) as post:
+        bridge.submit_correction('London', 'Paris', context=dict(ctx))
+    body = post.call_args.kwargs['json']
+    assert SECRET not in str(body['context']) and body['context']['memory_id'] == 'm-42'
+
+
+def test_an_older_build_dropping_the_provenance_is_said_once(monkeypatch, caplog):
+    """Review of 54f203c38, MINOR-4: the installed production build is older
+    than C323, so the drop is said, once per process, not silently."""
+    import logging
+    import integrations.agent_engine.world_model_bridge as wmb
+
+    def send_expert_correction(domain, original_response, corrected_response,
+                               expert_id, confidence=1.0, explanation=None,
+                               valid_until=None, signed_reward=None):
+        return {'success': True, 'learned': True}
+
+    _install(monkeypatch, send_expert_correction)
+    monkeypatch.setattr(wmb, '_PROVENANCE_DROP_SAID', False, raising=False)
+    bridge = _in_process_bridge()
+    with caplog.at_level(logging.INFO, logger='hevolve_social'):
+        bridge.submit_correction('London', 'Paris', context=dict(CONTEXT))
+        bridge.submit_correction('London', 'Paris', context=dict(CONTEXT))
+    said = [r for r in caplog.records if 'provenance' in r.getMessage()]
+    assert len(said) == 1, [r.getMessage() for r in caplog.records]
+
+
+def test_the_learner_gets_its_own_copy_of_the_context(monkeypatch):
+    """Review of 54f203c38, NIT-7: the provenance handed in-process is a copy;
+    what the learner does to it never reaches the caller's dict."""
+    def send_expert_correction(domain, original_response, corrected_response,
+                               expert_id, confidence=1.0, explanation=None,
+                               valid_until=None, signed_reward=None,
+                               provenance=None):
+        provenance['memory_id'] = 'changed'
+        return {'success': True, 'learned': True}
+
+    _install(monkeypatch, send_expert_correction)
+    ctx = dict(CONTEXT)
+    _in_process_bridge().submit_correction('London', 'Paris', context=ctx)
+    assert ctx == CONTEXT

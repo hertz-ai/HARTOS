@@ -1230,13 +1230,23 @@ class WorldModelBridge:
         except ImportError:
             logger.warning("[WorldModelBridge] ConstitutionalFilter unavailable; correction NOT constitution-checked")
 
-        # PRIVACY: Redact secrets from corrections before shared learning
+        # The context goes to HevolveAI only as a dict (its receiver keeps
+        # only a dict); anything else is dropped here so it cannot cost the
+        # correction (review of 54f203c38, MINOR-2).
+        context = dict(context) if isinstance(context, dict) else None
+
+        # PRIVACY: Redact secrets from corrections before shared learning,
+        # the context included: every content leaf, by the same walk the
+        # replay path uses (edge_privacy.map_content), identifiers exempt.
         try:
             from security.secret_redactor import redact_secrets
             original_response, _ = redact_secrets(original_response)
             corrected_response, _ = redact_secrets(corrected_response)
             if explanation:
                 explanation, _ = redact_secrets(explanation)
+            if context:
+                from security.edge_privacy import map_content
+                context = map_content(context, lambda t: redact_secrets(t)[0])
         except ImportError:
             logger.warning("[WorldModelBridge] secret_redactor unavailable; correction NOT redacted")
 
@@ -1244,15 +1254,18 @@ class WorldModelBridge:
         if self._in_process and self._provider:
             try:
                 from hevolveai.embodied_ai.rl_ef import send_expert_correction
-                # hevolveai C323: the context is the correction's PROVENANCE
-                # (who asked, which agent, which memory). The learner files the
-                # fact under its source and earns that source's trust from what
-                # it later observes. This call used to drop it; the HTTP path
-                # always sent it. A build before C323 has no such parameter and
-                # gets the correction without it (_accepts_kwarg).
-                _prov = ({'provenance': dict(context)}
-                         if context and _accepts_kwarg(send_expert_correction, 'provenance')
-                         else {})
+                # hevolveai C323: the context rides as the correction's
+                # provenance; HevolveAI keeps its memory_id on the stored fact
+                # (the fact's source is expert_id, as before). This call used
+                # to drop it; the HTTP path always sent it. A build before C323
+                # has no such parameter: it gets the correction without it, and
+                # the drop is said once (_note_provenance_dropped).
+                _prov = {}
+                if context:
+                    if _accepts_kwarg(send_expert_correction, 'provenance'):
+                        _prov = {'provenance': dict(context)}
+                    else:
+                        _note_provenance_dropped()
                 result = send_expert_correction(
                     domain='general',
                     original_response=original_response[:5000],
@@ -2765,6 +2778,20 @@ def _peer_words(peer_resp) -> str:
         if isinstance(value, str) and value.strip():
             return value
     return ''
+
+
+_PROVENANCE_DROP_SAID = False
+
+
+def _note_provenance_dropped() -> None:
+    """Say once per process that the installed HevolveAI (a build before C323)
+    takes no provenance, so corrections reach it without their context."""
+    global _PROVENANCE_DROP_SAID
+    if not _PROVENANCE_DROP_SAID:
+        _PROVENANCE_DROP_SAID = True
+        logger.info("[WorldModelBridge] the installed HevolveAI takes no correction "
+                    "provenance (a build before C323): corrections are sent "
+                    "without their context")
 
 
 def _accepts_kwarg(fn, name: str) -> bool:
