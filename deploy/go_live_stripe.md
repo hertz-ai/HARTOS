@@ -122,7 +122,7 @@ gh secret set STRIPE_API_KEY --repo hertz-ai/HARTOS
 # The deploy log shows "STRIPE_API_KEY set from the secret (value not shown)".
 # Then, on the box: the gateway registers when the key is set AND the SDK
 # imports, so check those two (the key's kind only, never its value):
-sudo docker exec langchain sh -c 'case "$STRIPE_API_KEY" in sk_live_*) echo "key: live";; rk_live_*) echo "key: restricted live";; sk_test_*|rk_test_*) echo "key: test";; "") echo "key: MISSING";; *) echo "key: not a secret key (pk_?)";; esac'
+sudo docker exec langchain sh -c 'case "$STRIPE_API_KEY" in *[[:space:]]*|*\"*) echo "key: contains spaces or quotes, not a clean key";; sk_live_*) echo "key: live";; rk_live_*) echo "key: restricted live";; sk_test_*|rk_test_*) echo "key: test";; "") echo "key: MISSING";; *) echo "key: not a secret key (pk_?)";; esac'
 sudo docker exec langchain python -c "import stripe; print('stripe', stripe.VERSION)"
 ```
 
@@ -302,9 +302,9 @@ That's the goal threshold.  Then:
 
 **`Stripe gateway not connected`**:
 - Check the key's kind with the `case` line in Step 4 (it prints live,
-  restricted live, test, MISSING or "not a secret key", never the key):
-  it must be `sk_live_` / `rk_live_` (production) or `sk_test_`
-  (sandbox), not `pk_`.
+  restricted live, test, MISSING, "contains spaces or quotes" or "not a
+  secret key", never the key): it must be `sk_live_` / `rk_live_`
+  (production) or `sk_test_` / `rk_test_` (sandbox), not `pk_`.
 - Verify `stripe` SDK is installed (Step 3).
 
 **`Payment authorization failed`** with the test card token:
