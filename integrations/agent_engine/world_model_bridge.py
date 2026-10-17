@@ -1244,6 +1244,15 @@ class WorldModelBridge:
         if self._in_process and self._provider:
             try:
                 from hevolveai.embodied_ai.rl_ef import send_expert_correction
+                # hevolveai C323: the context is the correction's PROVENANCE
+                # (who asked, which agent, which memory). The learner files the
+                # fact under its source and earns that source's trust from what
+                # it later observes. This call used to drop it; the HTTP path
+                # always sent it. A build before C323 has no such parameter and
+                # gets the correction without it (_accepts_kwarg).
+                _prov = ({'provenance': dict(context)}
+                         if context and _accepts_kwarg(send_expert_correction, 'provenance')
+                         else {})
                 result = send_expert_correction(
                     domain='general',
                     original_response=original_response[:5000],
@@ -1252,6 +1261,7 @@ class WorldModelBridge:
                     confidence=_unit_confidence(confidence),
                     explanation=explanation[:2000] if explanation else None,
                     valid_until=valid_until,
+                    **_prov,
                 )
                 if not isinstance(result, dict):
                     result = {'success': False,
@@ -2755,6 +2765,20 @@ def _peer_words(peer_resp) -> str:
         if isinstance(value, str) and value.strip():
             return value
     return ''
+
+
+def _accepts_kwarg(fn, name: str) -> bool:
+    """True when ``fn`` takes a parameter called ``name`` (or **kwargs).
+    HevolveAI's compiled build keeps signatures (Cython binding=True); a
+    callable whose signature cannot be read is treated as not taking it, so
+    an unknown build gets the call it always got."""
+    import inspect
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 def _unit_confidence(value) -> float:
