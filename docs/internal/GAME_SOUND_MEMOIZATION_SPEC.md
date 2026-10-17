@@ -81,8 +81,31 @@ Rules that make hits and misses exact:
 
 ## 5. Where the memo lives
 
-In the agent's own saved data, beside everything else the agent keeps
-(`save_data_in_memory` / `get_data_by_key`, persisted per `prompt_id`):
+**Owner ruling 2026-10-17** (built, task #240): *"background music
+selection can be altered by anyone for my agent ... the unique key is
+userid_promptid"*, and *"background music created once gets reused ...
+should not be conflated with"* it.  So there are two memos with one shape:
+
+- **The agent's memo** (below): every composed take.  A take is composed
+  once and replayed for everyone; an empty slot is filled by whoever's
+  turn reaches it first.
+- **A person's own memo**: `agent_data[{user_id}_{prompt_id}]['games']`
+  (`core.agent_tools.person_store_id`), the same shape.  It holds their
+  choices: a take they turned down, a take they kept, a take of their own.
+  Their lookup tries it first and skips any agent take they turned down.
+
+Only the agent's creator (`core.agent_tools.is_agent_creator`, from
+`prompts/<id>.json`'s `creator_user_id`) chooses for everyone, in any
+mode, because the creator's review ("Evaluation Mode") runs through reuse.
+Anyone else's approval, rejection or replacement is written in their own
+memo only, by the agent's tools and by the review card
+(`/api/agent/approval`, which uses the caller's verified identity and
+answers 401 without one).  The per-person `'mine'` sub-slot that used to
+live INSIDE the agent's memo is gone; measured 2026-10-17, no stored agent
+file on the desktop held one.
+
+The agent's memo, in the agent's own saved data, beside everything else
+the agent keeps (persisted per `prompt_id`):
 
 ```
 agent_data[prompt_id]['games'][game_id]['sounds'][key] = {
@@ -167,7 +190,8 @@ Uncommitted, written before the spec and **to be reconciled with it**:
 
 ## 10. What is missing against this spec
 
-1. `owner_user_id` in the key, and the user-scoped correction of §6.2.
+1. ~~`owner_user_id` in the key, and the user-scoped correction of §6.2.~~
+   Built 2026-10-17 as the two memos of §5.
 2. `variant`, and composing with the rejection reason (§6.1).
 3. The `template` scope (§4.3) — and whether it is wanted at all.
 4. `matched` in every answer, and the logging and tests that make §4
@@ -185,8 +209,10 @@ Uncommitted, written before the spec and **to be reconciled with it**:
 - **Silence while composing**: a first play is silent for that state. Is
   that acceptable, or should the app fall back to its bundled sound for
   that state until the artifact arrives? (The bundled sounds exist today.)
-- **Correction in reuse (§6.2)**: user-scoped override, or should a
-  reused agent be fixed as approved and corrections go back to the author?
+- ~~**Correction in reuse (§6.2)**: user-scoped override, or should a
+  reused agent be fixed as approved and corrections go back to the author?~~
+  Answered 2026-10-17: user-scoped, under `{user_id}_{prompt_id}`; only
+  the creator changes the agent's (§5).
 - **How many states are worth composing.** All fourteen per game is a lot
   of generation. A shortlist (`bgm`, `correct`, `wrong`, `complete`)
   covers most of what a child hears.
