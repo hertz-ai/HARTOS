@@ -408,6 +408,51 @@ def _coding_workdir(working_dir):
     return working_dir or os.environ.get('HEVOLVE_CODING_WORKDIR', '')
 
 
+def _overlay(shared, own):
+    """``own`` laid over ``shared``, key by key down nested dicts, as a new
+    dict; neither argument is changed.  Where both hold a dict the two
+    merge, otherwise ``own`` wins."""
+    view = dict(shared)
+    for key, value in own.items():
+        if isinstance(value, dict) and isinstance(view.get(key), dict):
+            view[key] = _overlay(view[key], value)
+        else:
+            view[key] = value
+    return view
+
+
+def person_store_id(user_prompt):
+    """The store id of one person's memory for one agent: the session key
+    itself when it is safe as a file name (core.cache_loaders.load_agent_data's
+    rule), else a digest of it.  The id becomes a file name in hartos.helper,
+    which joins it unchecked, and a user id can come from a request body, so
+    '../x' must never reach a path."""
+    key = str(user_prompt)
+    if key and key.replace('_', '').replace('-', '').isalnum():
+        return key
+    import hashlib
+    return 'p' + hashlib.sha256(key.encode('utf-8')).hexdigest()[:24]
+
+
+def memory_view(agent_data, prompt_id, user_prompt):
+    """One person's memory for one agent, as that person's tools read it.
+
+    Owner ruling 2026-10-17: an agent's memory belongs to the person AND the
+    agent, kept under the session key ``user_prompt`` ("{user_id}_{prompt_id}",
+    the key the pipelines, ledgers and memory graphs already use).  The
+    memory tools write only there.  What the agent itself holds under
+    ``prompt_id`` (CREATE's metadata, game sounds, anything saved before the
+    ruling) stays readable to everyone, under each person's own entries.
+    One store per agent let a sweep's save of ``teach`` erase the creator's
+    progress on the owner's desktop on 2026-10-14
+    (docs/internal/verification/USER_JOURNEYS_LIVE_2026-10-13.md 11.1).
+    """
+    shared = agent_data.get(prompt_id) or {}
+    own = agent_data.get(person_store_id(user_prompt)) or {}
+    return _overlay(shared if isinstance(shared, dict) else {},
+                    own if isinstance(own, dict) else {})
+
+
 def build_core_tool_closures(ctx):
     """Build session-scoped tool closures.  Returns list of (name, desc, func).
 
@@ -437,6 +482,17 @@ def build_core_tool_closures(ctx):
     _retrieve_json = ctx['retrieve_json']
     _strip_json_values = ctx['strip_json_values']
     save_conversation_db = ctx['save_conversation_db']
+
+    # This person's memory for this agent (memory_view): the memory tools
+    # write here, and read here before the agent's own store.
+    own_key = person_store_id(user_prompt)
+
+    def _own_store():
+        """The person's store, restored from disk when the cache lacks it,
+        so a first save after a restart adds to it instead of replacing it."""
+        if own_key not in agent_data:
+            helper_fun.load_agent_data_from_file(own_key, agent_data)
+        return agent_data.setdefault(own_key, {})
 
     tools: List[Tuple[str, str, Any]] = []
 
@@ -512,17 +568,17 @@ def build_core_tool_closures(ctx):
                 validated_value = None
 
             keys = key.split('.')
-            d = agent_data.setdefault(prompt_id, {})
+            d = _own_store()
             for k in keys[:-1]:
                 d = d.setdefault(k, {})
             d[keys[-1]] = validated_value
             tool_logger.info(f"VALUES STORED IN AGENT DATA: {validated_value}")
             tool_logger.info(f"FULL AGENT DATA AT KEY: {d}")
 
-            if helper_fun.save_agent_data_to_file(prompt_id, agent_data):
-                tool_logger.info(f"[OK] Data persisted to file for prompt_id {prompt_id}")
+            if helper_fun.save_agent_data_to_file(own_key, agent_data):
+                tool_logger.info(f"[OK] Data persisted to file for {own_key}")
             else:
-                tool_logger.warning(f"Failed to persist data to file for prompt_id {prompt_id}")
+                tool_logger.warning(f"Failed to persist data to file for {own_key}")
 
             # Mirror to MemoryGraph (fire-and-forget).  Carried by
             # reuse_recipe's inline twin before the #743 migration, lost
@@ -1042,11 +1098,14 @@ def build_core_tool_closures(ctx):
     # ------------------------------------------------------------------
     @log_tool_execution
     def get_saved_metadata() -> str:
-        """Get metadata with automatic loading from persistent storage."""
+        """The keys of this person's memory for this agent (memory_view),
+        values stripped, loaded from persistent storage when needed."""
         if prompt_id not in agent_data or not agent_data[prompt_id]:
             tool_logger.info(f"Loading agent data from file for get_saved_metadata, prompt_id {prompt_id}")
             helper_fun.load_agent_data_from_file(prompt_id, agent_data)
-        stripped_json = _strip_json_values(agent_data[prompt_id])
+        _own_store()
+        stripped_json = _strip_json_values(
+            memory_view(agent_data, prompt_id, own_key))
         return f'{stripped_json}'
 
     tools.append((
@@ -1068,20 +1127,31 @@ def build_core_tool_closures(ctx):
         model reads; the receipt read its template through that tool, so a
         template longer than a page was cut and the page note was printed into
         the customer's receipt (#104 review).
+
+        The person's own memory first, then what the agent itself holds
+        (memory_view): a key this person never saved still finds an entry
+        the agent kept for everyone, never another person's.
         """
-        if prompt_id not in agent_data or not agent_data[prompt_id]:
-            tool_logger.info(f"Loading agent data from file for prompt_id {prompt_id}")
-            helper_fun.load_agent_data_from_file(prompt_id, agent_data)
         keys = key.split('.')
-        d = agent_data.get(prompt_id, {})
-        try:
+
+        def _at(d):
             for k in keys:
                 d = d[k]
             return f'{d}'
+
+        try:
+            return _at(_own_store())
         # TypeError too: a path that runs through a None, a string or a list
         # is as missing as an absent key. It used to escape as a tool
         # exception and skip the fallback below (central 2026-09-13, a hive
         # reuse turn asking for a nested key under a None value).
+        except (KeyError, TypeError):
+            pass
+        if prompt_id not in agent_data or not agent_data[prompt_id]:
+            tool_logger.info(f"Loading agent data from file for prompt_id {prompt_id}")
+            helper_fun.load_agent_data_from_file(prompt_id, agent_data)
+        try:
+            return _at(agent_data.get(prompt_id, {}))
         except (KeyError, TypeError):
             # Fallback: check MemoryGraph for persisted [KV] data — the
             # read half of save_data_in_memory's dual-write, carried by
@@ -1177,9 +1247,10 @@ def build_core_tool_closures(ctx):
         and appends a [[MEDIA:<path>]] marker that the channel reply path
         converts into a real image attachment on the same channel.
 
-        Reuses the per-prompt KV store (save_data_in_memory / get_data_by_key)
-        as the "template they accept": the agent proposes a template, the user
-        confirms it, and it is saved under key 'receipt_template'.  Falls back to
+        Reuses the memory tools' store (save_data_in_memory / get_data_by_key,
+        the person's own memory for this agent: memory_view) as the "template
+        they accept": the agent proposes a template, the user confirms it, and
+        it is saved under key 'receipt_template'.  Falls back to
         a neutral default when none is stored.  Renders via the existing
         TemplateEngine and returns the receipt text for the agent to send back
         over the same channel the request arrived on (WhatsApp, etc.).
@@ -1242,8 +1313,8 @@ def build_core_tool_closures(ctx):
 
         Inbound channel media lands in short-lived locations (the upload
         TTLCache lives 2 hours), so the logo is COPIED once to the durable
-        data dir and its path stored in the per-prompt KV under
-        'receipt_logo_path' - the same store the accepted template uses.
+        data dir and its path stored in the person's memory for this agent
+        under 'receipt_logo_path' - the same store the accepted template uses.
         """
         import shutil
         src = str(file_path or "").strip().strip('"')

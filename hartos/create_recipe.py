@@ -2775,7 +2775,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                 name = helper_fun.safe_prompt_path(prompt_id, flow, json_obj["action_id"])
                                 user_tasks[user_prompt].fallback = False
                                 user_tasks[user_prompt].recipe = False
-                                metadata = strip_json_values(agent_data[prompt_id])
+                                from core.agent_tools import memory_view
+                                metadata = strip_json_values(
+                                    memory_view(agent_data, prompt_id, user_prompt))
                                 json_obj['metadata'] = metadata
                                 # 'times' is [] at init (:4211) and appended only
                                 # inside a branch (:2438), so it can legitimately
@@ -2838,7 +2840,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                     flow = get_current_flow(user_prompt)
                                     name = helper_fun.safe_prompt_path(prompt_id, flow, json_obj["action_id"])
                                     if not os.path.exists(name):
-                                        metadata = strip_json_values(agent_data.get(prompt_id, {}))
+                                        from core.agent_tools import memory_view
+                                        metadata = strip_json_values(
+                                            memory_view(agent_data, prompt_id, user_prompt))
                                         json_obj['metadata'] = metadata
                                         if prompt_id in task_time and task_time[prompt_id].get('times'):
                                             json_obj['time_took_to_complete'] = task_time[prompt_id]['times'][-1]
@@ -6085,7 +6089,8 @@ def request_fallback_for_action_last(current_action_id, user_prompt):
 def request_recipe_for_action_last(current_action_id, prompt_id, role, user_prompt):
     user_tasks[user_prompt].recipe = False
     user_tasks[user_prompt].fallback = False
-    metadata = strip_json_values(agent_data[prompt_id])
+    from core.agent_tools import memory_view
+    metadata = strip_json_values(memory_view(agent_data, prompt_id, user_prompt))
     safe_set_state(user_prompt, current_action_id, ActionState.RECIPE_REQUESTED, "recipe start")
     message = RECIPE_CREATE_PROMPT_PREFIX + ''' that includes only the necessary steps for this action from history, along with a suitable name. Provide the output in the following JSON format:
                         { "status": "done", "action": "''' + str(user_tasks[user_prompt].get_action(user_tasks[
@@ -6104,7 +6109,10 @@ def request_recipe_for_action(current_action_id, prompt_id, role, user_prompt, p
     user_tasks[user_prompt].recipe = False
     user_tasks[user_prompt].fallback = False
     safe_set_state(user_prompt, current_action_id, ActionState.RECIPE_REQUESTED, "recipe start")
-    metadata = strip_json_values(agent_data[prompt_id])
+    # The creator's own memory for this agent and what the agent holds for
+    # everyone (memory_view): their saves live under user_prompt now.
+    from core.agent_tools import memory_view
+    metadata = strip_json_values(memory_view(agent_data, prompt_id, user_prompt))
     # Name the action the recipe is FOR, exactly as request_recipe_for_action_last
     # already does.  This builder sent the literal placeholder "Describe the
     # action performed here", so the only strong word in the whole prompt was
