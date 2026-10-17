@@ -441,6 +441,18 @@ def person_store_id(user_prompt):
     return 'p' + hashlib.sha256(key.encode('utf-8')).hexdigest()[:24]
 
 
+def is_agent_creator(user_id, prompt_id):
+    """This person built the agent: prompts/<id>.json's creator_user_id (the
+    ownership ruling of 2026-10-08).  The one test of who may write the
+    agent's own memory: a template or example saved for everyone, and the
+    saved-key snapshot a resumed CREATE restores.  No recorded creator:
+    nobody.  (The /prompts listing's "no creator means listed for everyone"
+    is a visibility rule, not this one.)"""
+    from core.cache_loaders import load_agent_config
+    creator = (load_agent_config(prompt_id) or {}).get('creator_user_id')
+    return creator not in (None, '') and str(creator) == str(user_id)
+
+
 def memory_view(agent_data, prompt_id, user_prompt):
     """One person's memory for one agent, as that person's tools read it.
 
@@ -473,7 +485,7 @@ def build_core_tool_closures(ctx):
             log_tool_execution (decorator), send_message_to_user1 (func),
             retrieve_json (func), strip_json_values (func),
             save_conversation_db (func),
-            building_agent (optional, True in CREATE: save_data_in_memory
+            building_agent (optional, True in CREATE: the agent's creator
             may then save a template or example for everyone)
     """
     # Unpack context -------------------------------------------------------
@@ -502,14 +514,10 @@ def build_core_tool_closures(ctx):
     building_agent = bool(ctx.get('building_agent'))
 
     def _is_creator():
-        """This person built the agent: prompts/<id>.json's creator_user_id
-        (the ownership ruling of 2026-10-08).  Any user can land in CREATE on
-        a half-built agent (hart_intelligence_entry sends a no-recipe turn
-        there), so being in CREATE is not enough to write for everyone.  No
-        recorded creator: nobody can."""
-        from core.cache_loaders import load_agent_config
-        creator = (load_agent_config(prompt_id) or {}).get('creator_user_id')
-        return creator not in (None, '') and str(creator) == str(user_id)
+        """Any user can land in CREATE on a half-built agent
+        (hart_intelligence_entry sends a no-recipe turn there), so being in
+        CREATE is not enough to write for everyone: is_agent_creator."""
+        return is_agent_creator(user_id, prompt_id)
 
     def _own_store():
         """The person's store, restored from disk when the cache lacks it,
@@ -585,8 +593,10 @@ def build_core_tool_closures(ctx):
         Owner ruling 2026-10-17: what is saved while the agent is being
         built is the creator's data too, except a template, or data that
         can serve as an example, which ``for_everyone`` puts in the agent's
-        own store for every user.  Outside building ``for_everyone`` keeps
-        the value personal, so no user's save reaches another user.
+        own store for every user when the agent's creator
+        (is_agent_creator) saves it while building.  Anyone else, and
+        anyone outside building, keeps the value personal, so no user's
+        save reaches another user.
         """
         tool_logger.info('INSIDE save_data_in_memory')
         try:

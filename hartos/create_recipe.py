@@ -1259,8 +1259,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         'retrieve_json': retrieve_json,
         'strip_json_values': strip_json_values,
         'save_conversation_db': save_conversation_db,
-        # CREATE: a template or example may be saved for everyone who uses
-        # the agent (save_data_in_memory for_everyone; owner 2026-10-17).
+        # CREATE: the agent's creator may save a template or example for
+        # everyone who uses it (save_data_in_memory for_everyone; owner
+        # 2026-10-17; core.agent_tools.is_agent_creator).
         'building_agent': True,
     }
     core_tools = build_core_tool_closures(_tool_ctx)
@@ -6850,7 +6851,7 @@ def initialize_with_resume(prompt_id, user_prompt, user_id):
     agent_data[prompt_id] = {'user_id': user_id}
 
     # Load existing metadata
-    load_existing_metadata(prompt_id, user_prompt, flow_progress)
+    load_existing_metadata(prompt_id, user_prompt, flow_progress, user_id)
 
     current_app.logger.info(f"[RESUME] RESUME SUMMARY:")
     current_app.logger.info(f"   - Resumed at Flow {current_flow}, Action {current_action}")
@@ -6860,7 +6861,7 @@ def initialize_with_resume(prompt_id, user_prompt, user_id):
     return current_flow, current_action, completed_flows
 
 
-def load_existing_metadata(prompt_id, user_prompt, flow_progress):
+def load_existing_metadata(prompt_id, user_prompt, flow_progress, user_id):
     """
     Load metadata from existing action JSONs to restore agent_data state
     """
@@ -6871,10 +6872,15 @@ def load_existing_metadata(prompt_id, user_prompt, flow_progress):
             return
         # An action JSON's metadata is the creator's saved-key snapshot (the
         # creator's memory_view when the recipe was written), so it restores
-        # the creator's own memory for this agent, never the agent's shared
-        # store: there it read back as values (None) for every other user
-        # (review of 7121264b1).  Nothing to restore when that memory exists.
-        from core.agent_tools import person_store_id
+        # the creator's own memory for this agent and nobody else's: in the
+        # shared store it read back as values (None) for every other user
+        # (review of 7121264b1), and in a visitor's store, when a visitor
+        # resumed CREATE on a half-built agent, it gave them the creator's
+        # keys and shadowed later shared templates with None (review of
+        # c8aea38e7).  Nothing to restore when that memory exists.
+        from core.agent_tools import is_agent_creator, person_store_id
+        if not is_agent_creator(user_id, prompt_id):
+            return
         own_id = person_store_id(user_prompt)
         if agent_data.get(own_id):
             return

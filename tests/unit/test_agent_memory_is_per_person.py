@@ -207,6 +207,37 @@ def test_the_string_false_shares_nothing(store_dir, creator_config):
     assert _tools(store, VISITOR)['get_data_by_key']('client') == NOT_FOUND
 
 
+@pytest.mark.parametrize('config', [None, {'prompt_id': AGENT}],
+                         ids=['no agent definition', 'no creator recorded'])
+def test_with_no_recorded_creator_nobody_saves_for_everyone(
+        store_dir, tmp_path, monkeypatch, config):
+    prompts = tmp_path / 'prompts'
+    prompts.mkdir()
+    if config is not None:
+        (prompts / f'{AGENT}.json').write_text(json.dumps(config))
+    monkeypatch.setattr(cache_loaders, 'PROMPTS_DIR', str(prompts))
+    monkeypatch.setattr(cache_loaders, '_agent_config_cache', {})
+    out = _tools(_store(), CREATOR, building=True)['save_data_in_memory'](
+        'receipt_template', 'Bill {amount}', for_everyone=True)
+    assert 'for this person only' in out
+    assert cache_loaders.load_agent_data(AGENT) is None
+
+
+def test_a_creator_id_stored_as_a_number_still_matches(store_dir, tmp_path,
+                                                       monkeypatch):
+    """A creator_user_id stored as a JSON number still matches the
+    person's id, which reaches the tools as a str."""
+    prompts = tmp_path / 'prompts'
+    prompts.mkdir()
+    (prompts / f'{AGENT}.json').write_text(
+        json.dumps({'prompt_id': AGENT, 'creator_user_id': int(CREATOR)}))
+    monkeypatch.setattr(cache_loaders, 'PROMPTS_DIR', str(prompts))
+    monkeypatch.setattr(cache_loaders, '_agent_config_cache', {})
+    _tools(_store(), CREATOR, building=True)['save_data_in_memory'](
+        'receipt_template', 'Bill {amount}', for_everyone=True)
+    assert cache_loaders.load_agent_data(AGENT) == {'receipt_template': 'Bill {amount}'}
+
+
 def _function_source(name, end_marker):
     root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
     src = open(os.path.join(root, 'hartos', 'create_recipe.py'),
@@ -215,13 +246,13 @@ def _function_source(name, end_marker):
     return src[start:src.index(end_marker, start)]
 
 
-def test_create_resume_restores_the_creators_own_memory(tmp_path):
+def _resume(tmp_path, user_id, agent_data):
     """load_existing_metadata, run from its source (create_recipe cannot be
-    imported in a bare test env): an action JSON's metadata is the
-    creator's saved-key snapshot, so a resumed CREATE puts it in the
-    creator's own memory, never in the agent's store, where it read back as
-    values for every other user (review of 7121264b1)."""
+    imported in a bare test env), for ``user_id`` resuming CREATE on agent
+    54 with one action JSON holding the creator's saved-key snapshot.
+    Returns (agent_data, the store ids it saved, that user's store id)."""
     import logging
+    from core.agent_tools import person_store_id
     action = tmp_path / '54_0_1.json'
     action.write_text(json.dumps({'metadata': {'notes': {'secret': None}}}))
     saved = []
@@ -229,40 +260,45 @@ def test_create_resume_restores_the_creators_own_memory(tmp_path):
         load_agent_data_from_file=lambda pid, store: (store.__setitem__(pid, {}), False)[1],
         safe_prompt_path=lambda pid, flow, aid: str(action),
         save_agent_data_to_file=lambda pid, store: saved.append(pid) or True)
-    from core.agent_tools import person_store_id
-    ns = {'helper_fun': helper, 'agent_data': {}, 'json': json,
+    ns = {'helper_fun': helper, 'agent_data': agent_data, 'json': json,
           'current_app': SimpleNamespace(logger=logging.getLogger('t'))}
     exec(_function_source('load_existing_metadata', '\n\n\n'), ns)
-    user_prompt = f'{CREATOR}_{AGENT}'
+    user_prompt = f'{user_id}_{AGENT}'
     ns['load_existing_metadata'](AGENT, user_prompt,
-                                 {0: {'completed_actions': [1]}})
-    own = person_store_id(user_prompt)
-    assert ns['agent_data'][own] == {'notes': {'secret': None}}
-    assert 'notes' not in ns['agent_data'].get(AGENT, {})
+                                 {0: {'completed_actions': [1]}}, user_id)
+    return ns['agent_data'], saved, person_store_id(user_prompt)
+
+
+def test_create_resume_restores_the_creators_own_memory(tmp_path, creator_config):
+    """An action JSON's metadata is the creator's saved-key snapshot, so a
+    resumed CREATE puts it in the creator's own memory, never in the agent's
+    store, where it read back as values for every other user (review of
+    7121264b1)."""
+    data, saved, own = _resume(tmp_path, CREATOR, {})
+    assert data[own] == {'notes': {'secret': None}}
+    assert 'notes' not in data.get(AGENT, {})
     assert saved == [own]
 
 
-def test_create_resume_leaves_an_existing_creator_memory_alone(tmp_path):
+def test_create_resume_leaves_an_existing_creator_memory_alone(tmp_path,
+                                                               creator_config):
     """The restore runs only when the creator's memory is empty: a resumed
     CREATE must not lay the stripped snapshot (values None) over the
     creator's real saves."""
-    import logging
-    action = tmp_path / '54_0_1.json'
-    action.write_text(json.dumps({'metadata': {'notes': {'secret': None}}}))
-    saved = []
-    helper = SimpleNamespace(
-        load_agent_data_from_file=lambda pid, store: (store.__setitem__(pid, {}), False)[1],
-        safe_prompt_path=lambda pid, flow, aid: str(action),
-        save_agent_data_to_file=lambda pid, store: saved.append(pid) or True)
     from core.agent_tools import person_store_id
-    user_prompt = f'{CREATOR}_{AGENT}'
-    own = person_store_id(user_prompt)
-    ns = {'helper_fun': helper, 'agent_data': {own: {'notes': {'secret': 'mine'}}},
-          'json': json, 'current_app': SimpleNamespace(logger=logging.getLogger('t'))}
-    exec(_function_source('load_existing_metadata', '\n\n\n'), ns)
-    ns['load_existing_metadata'](AGENT, user_prompt,
-                                 {0: {'completed_actions': [1]}})
-    assert ns['agent_data'][own] == {'notes': {'secret': 'mine'}}
+    own = person_store_id(f'{CREATOR}_{AGENT}')
+    data, saved, _ = _resume(tmp_path, CREATOR, {own: {'notes': {'secret': 'mine'}}})
+    assert data[own] == {'notes': {'secret': 'mine'}}
+    assert saved == []
+
+
+def test_a_visitor_resuming_create_gets_no_snapshot(tmp_path, creator_config):
+    """Any user lands in CREATE on a half-built agent; the snapshot is the
+    creator's, so a visitor's resume restores nothing into the visitor's
+    memory, where its None values shadowed a template the creator later
+    shared (review of c8aea38e7)."""
+    data, saved, visitor_store = _resume(tmp_path, VISITOR, {})
+    assert visitor_store not in data
     assert saved == []
 
 
