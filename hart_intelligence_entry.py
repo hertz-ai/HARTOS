@@ -10906,6 +10906,10 @@ def chat():
                     except Exception as e:
                         import traceback
                         app.logger.error(f'Autonomous recipe creation failed: {e}\n{traceback.format_exc()}')
+                        # The turn failed: answer the failure sentence, so the
+                        # caller deciding whether work was done sees it.
+                        from core.agent_tools import user_facing_error
+                        recipe_response = user_facing_error(e)
                     finally:
                         try:
                             from integrations.agent_engine.dispatch import mark_create_end
@@ -10927,10 +10931,19 @@ def chat():
                 # it took the gather output for the turn's result and
                 # recorded a 0-spark strike).  The flags above send the next
                 # dispatch back into recipe(), which resumes the session.
-                from core.agent_tools import is_user_pause
+                # A recipe() whose turn FAILED answers its failure sentence for
+                # the same reason: the hive worker and dispatch_goal recognise
+                # a failed turn only by that sentence (is_user_facing_error).
+                # Measured on central 2026-10-17: every hosted call answered
+                # 400/429, /chat answered the gather output, the worker took it
+                # for the task's result and 17 earning goals were completed
+                # with nothing done.
+                from core.agent_tools import is_user_facing_error, is_user_pause
                 return _chat_reply(
                     user_id, request_id,
-                    recipe_response if is_user_pause(recipe_response) else auto_response,
+                    recipe_response if (is_user_pause(recipe_response)
+                                        or is_user_facing_error(recipe_response))
+                    else auto_response,
                     intent=['FINAL_ANSWER'],
                     req_token_count=0, res_token_count=0,
                     history_request_id=[],
