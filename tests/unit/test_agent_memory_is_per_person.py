@@ -39,6 +39,19 @@ def store_dir(tmp_path, monkeypatch):
     return tmp_path
 
 
+@pytest.fixture
+def creator_config(tmp_path, monkeypatch):
+    """Agent 54's definition with its creator, as prompts/54.json holds it
+    on the desktop (creator_user_id 10202)."""
+    prompts = tmp_path / 'prompts'
+    prompts.mkdir()
+    (prompts / f'{AGENT}.json').write_text(
+        json.dumps({'prompt_id': AGENT, 'creator_user_id': CREATOR}))
+    monkeypatch.setattr(cache_loaders, 'PROMPTS_DIR', str(prompts))
+    monkeypatch.setattr(cache_loaders, '_agent_config_cache', {})
+    return prompts
+
+
 class _DiskHelper:
     """The two store calls the memory tools make, on core.cache_loaders'
     file format (hartos.helper's twins need a Flask app context)."""
@@ -136,7 +149,8 @@ def test_what_the_agent_already_holds_stays_readable_by_everyone(store_dir):
         'receipt_template': 'Bill {amount}'}
 
 
-def test_while_building_a_template_can_be_saved_for_everyone(store_dir):
+def test_while_building_a_template_can_be_saved_for_everyone(store_dir,
+                                                              creator_config):
     """Owner 2026-10-17: what the creator saves while building is theirs,
     "only the template not the data unless it can serve as example" goes
     to everyone."""
@@ -164,6 +178,33 @@ def test_outside_building_for_everyone_stays_personal(store_dir):
     assert 'for this person only' in out
     assert cache_loaders.load_agent_data(AGENT) is None
     assert _tools(store, CREATOR)['get_data_by_key']('teach') == NOT_FOUND
+
+
+def test_a_non_creator_in_create_cannot_save_for_everyone(store_dir,
+                                                          creator_config):
+    """Any user lands in CREATE on a half-built agent, so building alone is
+    not the creator: the review of 213d10b43 replayed the 10-14 erase with a
+    visitor's for_everyone save of `teach` there."""
+    cache_loaders.save_agent_data(
+        AGENT, {'teach': {CREATOR: {'book': 'Quantum Mechanics'}}})
+    store = _store()
+    out = _tools(store, VISITOR, building=True)['save_data_in_memory'](
+        'teach', [{'topic': 'Fractions'}], for_everyone=True)
+    assert 'for this person only' in out
+    assert cache_loaders.load_agent_data(AGENT) == {
+        'teach': {CREATOR: {'book': 'Quantum Mechanics'}}}
+    assert 'Quantum Mechanics' in _tools(_store(), CREATOR)['get_data_by_key'](
+        f'teach.{CREATOR}')
+
+
+def test_the_string_false_shares_nothing(store_dir, creator_config):
+    """autogen hands the tool the model's arguments as given, so the flag
+    can arrive as the string "false"; bool("false") is True."""
+    store = _store()
+    _tools(store, CREATOR, building=True)['save_data_in_memory'](
+        'client', {'name': 'Priya'}, for_everyone='false')
+    assert cache_loaders.load_agent_data(AGENT) is None
+    assert _tools(store, VISITOR)['get_data_by_key']('client') == NOT_FOUND
 
 
 def _function_source(name, end_marker):
@@ -199,6 +240,30 @@ def test_create_resume_restores_the_creators_own_memory(tmp_path):
     assert ns['agent_data'][own] == {'notes': {'secret': None}}
     assert 'notes' not in ns['agent_data'].get(AGENT, {})
     assert saved == [own]
+
+
+def test_create_resume_leaves_an_existing_creator_memory_alone(tmp_path):
+    """The restore runs only when the creator's memory is empty: a resumed
+    CREATE must not lay the stripped snapshot (values None) over the
+    creator's real saves."""
+    import logging
+    action = tmp_path / '54_0_1.json'
+    action.write_text(json.dumps({'metadata': {'notes': {'secret': None}}}))
+    saved = []
+    helper = SimpleNamespace(
+        load_agent_data_from_file=lambda pid, store: (store.__setitem__(pid, {}), False)[1],
+        safe_prompt_path=lambda pid, flow, aid: str(action),
+        save_agent_data_to_file=lambda pid, store: saved.append(pid) or True)
+    from core.agent_tools import person_store_id
+    user_prompt = f'{CREATOR}_{AGENT}'
+    own = person_store_id(user_prompt)
+    ns = {'helper_fun': helper, 'agent_data': {own: {'notes': {'secret': 'mine'}}},
+          'json': json, 'current_app': SimpleNamespace(logger=logging.getLogger('t'))}
+    exec(_function_source('load_existing_metadata', '\n\n\n'), ns)
+    ns['load_existing_metadata'](AGENT, user_prompt,
+                                 {0: {'completed_actions': [1]}})
+    assert ns['agent_data'][own] == {'notes': {'secret': 'mine'}}
+    assert saved == []
 
 
 def test_a_nested_save_keeps_the_agent_entrys_other_fields(store_dir):
@@ -239,12 +304,17 @@ def test_no_person_store_id_enters_the_elided_namespace():
     sweeps those files after a day; a person store id must never be one."""
     from core.agent_tools import person_store_id
     from core.llm_outbound_logger import ELIDED_NAMESPACE
-    for user_prompt in (f'{ELIDED_NAMESPACE}_u1234_{AGENT}', f'{CREATOR}_{AGENT}',
-                        '../escape_54', 'a@b.c_54'):
+    from core.cache_loaders import is_safe_store_id
+    for user_prompt in (f'{ELIDED_NAMESPACE}_u1234_{AGENT}',
+                        f'{ELIDED_NAMESPACE.upper()}_u1_{AGENT}',
+                        f'{CREATOR}_{AGENT}', '../escape_54', 'a@b.c_54'):
         store_id = person_store_id(user_prompt)
-        assert not store_id.startswith(ELIDED_NAMESPACE + '_')
-        assert store_id.replace('_', '').replace('-', '').isalnum()
+        assert not store_id.lower().startswith(ELIDED_NAMESPACE + '_')
+        assert is_safe_store_id(store_id) and store_id == store_id.lower()
     assert person_store_id(f'{CREATOR}_{AGENT}') == f'{CREATOR}_{AGENT}'
+    # Windows and macOS file names ignore case: two ids that differ only by
+    # case must not share a file.
+    assert person_store_id('Abc_54') != person_store_id('abc_54')
 
 
 def test_source_guard_create_reads_memory_through_memory_view():
@@ -270,6 +340,40 @@ def test_source_guard_create_reads_memory_through_memory_view():
     assert sites, 'no CREATE metadata site found: re-point this guard'
     stray = [s for s in sites if 'memory_view(' not in s[1]]
     assert not stray, f'CREATE reads the memory store around memory_view: {stray}'
+    # ...and every view is the turn's own person, not another session key.
+    wrong = [ast.unparse(n) for n in ast.walk(tree)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+             and n.func.id == 'memory_view'
+             and not (len(n.args) == 3 and isinstance(n.args[2], ast.Name)
+                      and n.args[2].id == 'user_prompt')]
+    assert not wrong, f'memory_view called for another person: {wrong}'
+
+
+def _tool_ctx_dicts(relpath):
+    """The dict literals a pipeline hands build_core_tool_closures (the
+    ones carrying save_conversation_db), as {key: value source}."""
+    import ast
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+    tree = ast.parse(open(os.path.join(root, relpath), encoding='utf-8').read())
+    found = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Dict):
+            keys = {k.value: ast.unparse(v) for k, v in zip(node.keys, node.values)
+                    if isinstance(k, ast.Constant)}
+            if 'save_conversation_db' in keys:
+                found.append(keys)
+    return found
+
+
+def test_source_guard_only_create_tool_contexts_are_building():
+    """Source guard (the flag's wiring, beside the behaviour tests above):
+    both CREATE tool contexts mark the agent as being built, and no REUSE
+    context does, so a finished agent's turn can never save for everyone."""
+    create = _tool_ctx_dicts(os.path.join('hartos', 'create_recipe.py'))
+    reuse = _tool_ctx_dicts(os.path.join('hartos', 'reuse_recipe.py'))
+    assert len(create) == 2 and reuse, 're-point this guard'
+    assert all(c.get('building_agent') == 'True' for c in create), create
+    assert all(c.get('building_agent') in (None, 'False') for c in reuse), reuse
 
 
 def test_saved_metadata_lists_own_and_shared_keys_never_anothers(store_dir):

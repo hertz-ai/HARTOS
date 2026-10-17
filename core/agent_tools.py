@@ -423,17 +423,19 @@ def _overlay(shared, own):
 
 def person_store_id(user_prompt):
     """The store id of one person's memory for one agent: the session key
-    itself when it is safe as a file name (core.cache_loaders.load_agent_data's
-    rule), else a digest of it.  The id becomes a file name in hartos.helper,
-    which joins it unchecked, and a user id can come from a request body, so
-    '../x' must never reach a path."""
+    itself when it is safe as a file name (core.cache_loaders.is_safe_store_id)
+    and lower case, else a digest of it.  The id becomes a file name in
+    hartos.helper, which joins it unchecked, and a user id can come from a
+    request body, so '../x' must never reach a path.  Lower case only, since
+    Windows and macOS file names ignore case and two ids differing by case
+    would share a file.  Never in the wire trim's `elided` namespace either:
+    its sweep deletes those files after a day, and a made-up id there could
+    name another user's elided item (review of 7121264b1)."""
+    from core.cache_loaders import is_safe_store_id
+    from core.llm_outbound_logger import ELIDED_ITEM_PREFIX
     key = str(user_prompt)
-    # Never in the wire trim's `elided` namespace either: its eviction sweep
-    # deletes those files after a day, and a made-up id there could name
-    # another user's elided item (review of 7121264b1).
-    from core.llm_outbound_logger import ELIDED_NAMESPACE
-    if (key and key.replace('_', '').replace('-', '').isalnum()
-            and not key.startswith(ELIDED_NAMESPACE + '_')):
+    if (is_safe_store_id(key) and key == key.lower()
+            and not key.startswith(ELIDED_ITEM_PREFIX)):
         return key
     import hashlib
     return 'p' + hashlib.sha256(key.encode('utf-8')).hexdigest()[:24]
@@ -445,8 +447,10 @@ def memory_view(agent_data, prompt_id, user_prompt):
     Owner ruling 2026-10-17: an agent's memory belongs to the person AND the
     agent, kept under the session key ``user_prompt`` ("{user_id}_{prompt_id}",
     the key the pipelines, ledgers and memory graphs already use).  The
-    memory tools write only there.  What the agent itself holds under
-    ``prompt_id`` (CREATE's metadata, game sounds, anything saved before the
+    memory tools write there, except a template or example the agent's
+    creator saves for everyone while building it (save_data_in_memory
+    for_everyone), which goes to the agent's own store under ``prompt_id``.
+    That store (those templates, game sounds, anything saved before the
     ruling) stays readable to everyone, under each person's own entries.
     One store per agent let a sweep's save of ``teach`` erase the creator's
     progress on the owner's desktop on 2026-10-14
@@ -494,8 +498,18 @@ def build_core_tool_closures(ctx):
     # write here, and read here before the agent's own store.
     own_key = person_store_id(user_prompt)
     # CREATE (hartos/create_recipe.py) sets it: the agent is being built,
-    # so a template or example may be saved for everyone.
+    # so its creator may save a template or example for everyone.
     building_agent = bool(ctx.get('building_agent'))
+
+    def _is_creator():
+        """This person built the agent: prompts/<id>.json's creator_user_id
+        (the ownership ruling of 2026-10-08).  Any user can land in CREATE on
+        a half-built agent (hart_intelligence_entry sends a no-recipe turn
+        there), so being in CREATE is not enough to write for everyone.  No
+        recorded creator: nobody can."""
+        from core.cache_loaders import load_agent_config
+        creator = (load_agent_config(prompt_id) or {}).get('creator_user_id')
+        return creator not in (None, '') and str(creator) == str(user_id)
 
     def _own_store():
         """The person's store, restored from disk when the cache lacks it,
@@ -563,7 +577,7 @@ def build_core_tool_closures(ctx):
     def save_data_in_memory(
         key: Annotated[str, "Key path for storing data now & retrieving data later. Use dot notation for nested keys (e.g., 'user.info.name')."],
         value: Annotated[Optional[Any], "Value you want to store; strictly should be one of int, float, bool, json array or json object."] = None,
-        for_everyone: Annotated[bool, "True only while this agent is being built, and only for a template, or an example every user of the agent can start from (a receipt template, a sample lesson). Never a person's own data. Otherwise the value is this person's alone."] = False,
+        for_everyone: Annotated[bool, "True only when the agent's creator is building it, and only for a template, or an example every user of the agent can start from (a form to fill, a sample lesson). Never a person's own data. Otherwise the value is this person's alone."] = False,
     ) -> str:
         """Store data with validation to prevent corruption.
 
@@ -587,7 +601,11 @@ def build_core_tool_closures(ctx):
                 validated_value = None
 
             keys = key.split('.')
-            shared = bool(for_everyone) and building_agent
+            # One reading of a bool that may arrive as the string "false"
+            # (autogen passes the model's arguments as given).
+            from core.config_cache import flag_value
+            wants_shared = flag_value(for_everyone, False)
+            shared = wants_shared and building_agent and _is_creator()
             if shared:
                 # The agent's own store, restored first so this adds a key.
                 if prompt_id not in agent_data or not agent_data[prompt_id]:
@@ -640,9 +658,9 @@ def build_core_tool_closures(ctx):
             where = ''
             if shared:
                 where = ' (for everyone who uses this agent)'
-            elif for_everyone:
+            elif wants_shared:
                 where = (' (for this person only: a value is saved for everyone '
-                         'only while the agent is being built)')
+                         'only by the agent\'s creator while building it)')
             return _bounded_observation(
                 f'Saved at {key}{where}: {json.dumps(validated_value)}',
                 'the whole value was saved')
@@ -1139,7 +1157,7 @@ def build_core_tool_closures(ctx):
             helper_fun.load_agent_data_from_file(prompt_id, agent_data)
         _own_store()
         stripped_json = _strip_json_values(
-            memory_view(agent_data, prompt_id, own_key))
+            memory_view(agent_data, prompt_id, user_prompt))
         return f'{stripped_json}'
 
     tools.append((

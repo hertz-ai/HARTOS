@@ -38,11 +38,19 @@ def _resolve_prompts_dir():
 PROMPTS_DIR = _resolve_prompts_dir()
 
 
+def is_safe_store_id(store_id) -> bool:
+    """The one rule for an id that becomes a file name in AGENT_DATA_DIR or
+    PROMPTS_DIR: letters, digits, '_' and '-' only, so no path traversal.
+    core.agent_tools.person_store_id applies it to a person's memory id."""
+    safe_id = str(store_id)
+    return bool(safe_id) and safe_id.replace('_', '').replace('-', '').isalnum()
+
+
 def load_agent_data(prompt_id):
     """Load agent_data from disk. Key is prompt_id (int or str)."""
     # Sanitize to prevent path traversal
     safe_id = str(prompt_id)
-    if not safe_id.replace('_', '').replace('-', '').isalnum():
+    if not is_safe_store_id(safe_id):
         return None
     file_path = os.path.join(AGENT_DATA_DIR, f"{safe_id}_agent_data.json")
     if not os.path.exists(file_path):
@@ -81,7 +89,7 @@ def save_agent_data(prompt_id, data) -> bool:
     the app package): the wire trim's ``elided`` namespace is written here and
     only here.  Never raises; False when nothing was written."""
     safe_id = str(prompt_id)
-    if not safe_id.replace('_', '').replace('-', '').isalnum():
+    if not is_safe_store_id(safe_id):
         return False
     try:
         from datetime import datetime
@@ -188,7 +196,7 @@ def load_agent_config(prompt_id):
     if prompt_id is None:
         return None
     safe_id = str(prompt_id)
-    if not safe_id.replace('_', '').replace('-', '').isalnum():
+    if not is_safe_store_id(safe_id):
         return None
     file_path = os.path.join(PROMPTS_DIR, f"{safe_id}.json")
     try:
