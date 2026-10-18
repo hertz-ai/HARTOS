@@ -23,6 +23,8 @@ tests/unit/test_charge_goal_work_completed.py does.
 """
 import os
 import sys
+import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -132,6 +134,53 @@ def test_a_failed_release_keeps_the_hold_for_the_next_one():
     with patch('integrations.social.models.get_db', return_value=_db(goal)):
         assert budget_gate.release_goal_reservations(GOAL) == 4
     assert goal.spark_spent == 100
+
+
+def test_two_releases_at_once_give_the_reservation_back_once():
+    """Both read the hold, both wrote it back, and spent dropped below what
+    the goal had before the reservation (review of e8b6bf675, P5)."""
+    goal = Goal(spent=100)
+    with patch('integrations.social.models.get_db', return_value=_db(goal)):
+        budget_gate.check_goal_budget(GOAL, 4)
+
+    def _slow_row():
+        time.sleep(0.3)
+        return goal
+
+    slow = MagicMock()
+    slow.query.return_value.filter_by.return_value.with_for_update \
+        .return_value.first.side_effect = _slow_row
+    results = []
+    with patch('integrations.social.models.get_db', return_value=slow):
+        threads = [threading.Thread(target=lambda: results.append(
+            budget_gate.release_goal_reservations(GOAL))) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(5)
+    assert sorted(results) == [0, 4]
+    assert goal.spark_spent == 100
+    assert budget_gate.held_reservation(GOAL) == 0
+
+
+def test_a_hold_whose_goal_row_is_gone_gives_nothing_back():
+    goal = Goal(spent=100)
+    with patch('integrations.social.models.get_db', return_value=_db(goal)):
+        budget_gate.check_goal_budget(GOAL, 4)
+    with patch('integrations.social.models.get_db', return_value=_db(None)):
+        assert budget_gate.release_goal_reservations(GOAL) == 0
+    assert budget_gate.held_reservation(GOAL) == 0, \
+        'a hold on a deleted goal is dropped, not retried forever'
+
+
+def test_spark_spent_on_work_leaves_the_held_reservation_out():
+    goal = Goal(spent=100)
+    with patch('integrations.social.models.get_db', return_value=_db(goal)):
+        budget_gate.check_goal_budget(GOAL, 4)
+    assert goal.spark_spent == 104
+    assert budget_gate.spark_spent_on_work(GOAL, goal.spark_spent) == 100
+    assert budget_gate.spark_spent_on_work(GOAL, None) == 0
+    assert budget_gate.spark_spent_on_work('nothing-held', 7) == 7
 
 
 def test_nothing_held_releases_nothing():

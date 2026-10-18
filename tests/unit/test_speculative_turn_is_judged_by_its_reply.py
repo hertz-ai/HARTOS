@@ -325,6 +325,58 @@ def test_a_failed_turn_gives_its_reservation_back():
     assert budget_gate.held_reservation(GOAL) == 0
 
 
+class _ReleaseFailsOnce(_Speculator):
+    """Arms one database failure for the next get_db call after the turn,
+    which is the daemon's release_goal_reservations."""
+
+    def __init__(self, goal, reply, state, **kw):
+        super().__init__(goal, reply, **kw)
+        self.state = state
+
+    def dispatch_speculative(self, *a, **k):
+        out = super().dispatch_speculative(*a, **k)
+        self.state['fail_next'] = True
+        return out
+
+
+def _get_db_failing_when_armed(goal, state):
+    good = MagicMock()
+    good.query.return_value.filter.return_value.all.return_value = [goal]
+    good.query.return_value.filter_by.return_value.with_for_update \
+        .return_value.first.return_value = goal
+    good.query.return_value.filter.return_value.with_for_update \
+        .return_value.first.return_value = goal
+    broken = MagicMock()
+    broken.query.side_effect = RuntimeError('database is locked')
+
+    def _get_db():
+        if state.pop('fail_next', False):
+            return broken
+        return good
+    return patch('integrations.social.models.get_db', side_effect=_get_db)
+
+
+def test_real_work_after_a_failed_release_still_completes_the_goal():
+    """Tick 1's release fails, so its 4 spark stay held.  Tick 2's turn
+    finishes a flow worth 2 spark.  The snapshot tick 2 takes must leave the
+    held spark out too, or this dispatch reads as 2 - 4 spark and real work
+    becomes a noop strike (review of e8b6bf675, P3, measured)."""
+    goal = Goal()
+    state = {}
+    tick(goal, _ReleaseFailsOnce(goal, REAL, state), progress=None,
+         extra=[_get_db_failing_when_armed(goal, state)])
+    assert budget_gate.held_reservation(GOAL) == 4
+    assert goal.config_json['noop_dispatch_count'] == 1
+
+    tick(goal, _Speculator(goal, REAL, work=2), progress=None)
+    assert goal.status == 'completed', (
+        f"real work after a failed release was judged a noop: "
+        f"noop={goal.config_json.get('noop_dispatch_count')} "
+        f"spent={goal.spark_spent}")
+    assert goal.spark_spent == 106
+    assert budget_gate.held_reservation(GOAL) == 0
+
+
 def test_a_dispatch_goal_turn_gives_its_reservation_back_too():
     """The same for the ordinary path: dispatch_goal's pre_dispatch_budget_gate
     reserves before its turn, and a reply with no completed work is a noop."""

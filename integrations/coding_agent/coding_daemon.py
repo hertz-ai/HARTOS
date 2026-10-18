@@ -266,9 +266,12 @@ class CodingAgentDaemon:
 
                 goal.last_dispatched_at = now
                 # The spark snapshot the completion gate reads, staged the way
-                # the agent daemon stages it.
+                # the agent daemon stages it (held reservations left out).
+                from integrations.agent_engine.budget_gate import (
+                    spark_spent_on_work)
                 cfg = dict(goal.config_json or {})
-                cfg['spark_at_dispatch'] = goal.spark_spent or 0
+                cfg['spark_at_dispatch'] = spark_spent_on_work(
+                    goal.id, goal.spark_spent)
                 goal.config_json = cfg
                 result = dispatch_to_chat(prompt, str(agent['user_id']), goal.id,
                                           goal_type=goal.goal_type or 'coding')

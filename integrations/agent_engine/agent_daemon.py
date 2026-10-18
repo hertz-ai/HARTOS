@@ -483,9 +483,10 @@ def _settle_dispatched_goal(db, goal, goal_key, served_escalation=None,
     # it back before settling (budget_gate.release_goal_reservations); any
     # still held here (that release failed) is not counted as spent either,
     # or a reservation would complete a goal whose turn did nothing: 18 on
-    # central 2026-10-17 (review of aeb5d4831, finding 1).
-    from .budget_gate import held_reservation
-    spark_spent = max(0, (goal.spark_spent or 0) - held_reservation(goal_key))
+    # central 2026-10-17 (review of aeb5d4831, finding 1).  The snapshot the
+    # tick took before the dispatch reads spark the same way.
+    from .budget_gate import spark_spent_on_work
+    spark_spent = spark_spent_on_work(goal_key, goal.spark_spent)
     # Per-dispatch, not lifetime.  Absent key (a goal dispatched before this
     # code shipped) degrades to the old `> 0` test rather than blocking.
     spark_at_dispatch = cfg.get('spark_at_dispatch')
@@ -1949,8 +1950,13 @@ class AgentDaemon:
                 # _settle_dispatched_goal below.
                 # dict(...) copies: a new dict is written whatever the
                 # column type (see the note in _settle_dispatched_goal).
+                # Spark still held from an earlier dispatch (its release
+                # failed) is left out, as the gate leaves it out when it
+                # settles.
+                from .budget_gate import spark_spent_on_work
                 _cfg_pre = dict(goal.config_json or {})
-                _cfg_pre['spark_at_dispatch'] = goal.spark_spent or 0
+                _cfg_pre['spark_at_dispatch'] = spark_spent_on_work(
+                    goal_key, goal.spark_spent)
                 goal.config_json = _cfg_pre
 
                 # Speculative dispatch if enabled and budget allows.

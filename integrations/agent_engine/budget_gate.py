@@ -26,7 +26,8 @@ logger = logging.getLogger(__name__)
 # + new SQLite connection cycle is the dominant CPU consumer when many
 # goals × idle_agents fire in tight succession.  A short TTL is enough
 # to break the storm — within 10s the goal's row hasn't materially
-# changed (this function is the only writer in the daemon path).  Burst
+# changed (the other writers of spark_spent, release_goal_reservations and
+# charge_goal_work_completed, clear the goal's entry).  Burst
 # under-counting is bounded: at most one un-deducted hit per goal per
 # TTL window.  Cache stores the FULL return tuple so callers see the
 # exact same shape they'd see from a fresh DB query.
@@ -262,8 +263,10 @@ def charge_goal_work_completed(prompt_id, actions_completed: int = 1) -> bool:
 # The reservation is a pre-check: it stops a goal from dispatching past its
 # budget while the turn runs.  It is not work, and the steward's rule
 # (charge_goal_work_completed) is that spark_spent rises only on work done.
-# Kept in process: the daemons that release it run in the process whose
-# dispatches reserved it.
+# Kept in process: a release gives back only what was reserved in its own
+# process.  A reservation made in another process (the stdio MCP server,
+# mcp_server.py, calls dispatch_goal) stays spent, as every reservation did
+# before releases existed.
 _held_reservations: Dict[str, int] = {}
 _held_lock = threading.Lock()
 
@@ -282,6 +285,18 @@ def held_reservation(goal_id) -> int:
         return _held_reservations.get(str(goal_id), 0)
 
 
+def spark_spent_on_work(goal_id, spark_spent) -> int:
+    """The goal's spark_spent without what is still held as a reservation.
+
+    The one reading of "spark spent" for the completion gate: both the
+    snapshot a daemon takes before a dispatch and the figure it settles on
+    go through here.  A hold left by a failed release otherwise inflated the
+    snapshot, and the next dispatch's real work read as a noop (review of
+    e8b6bf675, P3).
+    """
+    return max(0, (spark_spent or 0) - held_reservation(goal_id))
+
+
 def release_goal_reservations(goal_id) -> int:
     """Give back the spark reserved for ``goal_id`` at dispatch.
 
@@ -295,12 +310,15 @@ def release_goal_reservations(goal_id) -> int:
 
     Its own short transaction, row-locked like the reservation, so a
     concurrent work charge is never overwritten.  Never takes spark_spent
-    below zero.  On a database error the hold is kept for the next release
-    and 0 is returned.  Returns the spark given back.
+    below zero.  The hold is taken out of the ledger before the write, so
+    two releases at once give it back once (review of e8b6bf675, P5).  On a
+    database error it is put back for the next release and 0 is returned.
+    A hold whose goal row is gone is dropped and 0 returned: nothing was
+    given back.  Returns the spark given back.
     """
     key = str(goal_id)
     with _held_lock:
-        amount = _held_reservations.get(key, 0)
+        amount = _held_reservations.pop(key, 0)
     if amount <= 0:
         return 0
     try:
@@ -315,18 +333,17 @@ def release_goal_reservations(goal_id) -> int:
         finally:
             db.close()
     except Exception as e:
+        _hold(key, amount)
         logger.warning("Spark reserved for goal %s not given back yet "
                        "(retried at its next release): %s", goal_id, e)
         return 0
-    with _held_lock:
-        left = _held_reservations.get(key, 0) - amount
-        if left > 0:
-            _held_reservations[key] = left
-        else:
-            _held_reservations.pop(key, None)
     invalidate_goal_budget_cache(goal_id)
     if goal_id != key:
         invalidate_goal_budget_cache(key)
+    if goal is None:
+        logger.info("Spark held for goal %s dropped: the goal no longer "
+                    "exists", goal_id)
+        return 0
     return amount
 
 
@@ -496,7 +513,8 @@ def pre_dispatch_budget_gate(goal_id: Optional[str],
 
     1. Resolve effective model name (local vs cloud)
     2. Estimate LLM cost
-    3. Check goal budget (atomic deduction)
+    3. Check goal budget (atomic reservation, given back by
+       release_goal_reservations when the dispatch ends)
     4. Check platform affordability (cached)
 
     Returns: (allowed, reason)
