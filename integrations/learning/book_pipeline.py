@@ -584,10 +584,17 @@ _LOCK_ERRORS = ('database is locked', 'deadlock', 'lock wait timeout')
 def is_lock_error(exc) -> bool:
     """True when ``exc`` is another writer holding the lock, not a bad book.
 
-    One spelling, two callers: ``_retry_on_lock`` reads it to decide whether to
-    wait, and the upload route reads it to decide what to tell the person. A
-    held lock is transient and the file is fine, so the two answers must not
-    drift apart.
+    One spelling, four callers: ``_retry_on_lock`` reads it to decide whether
+    to wait, and the upload route and the worker's two failure paths read it to
+    decide what to tell the person. A held lock is transient and the file is
+    fine, so those answers must not drift apart.
+
+    Only a database error can be a lock. The worker's handler is given every
+    exception a whole parse can raise, and most carry no ``.orig``, so without
+    this gate the fallback below reads the *message* -- and
+    ``BookParseError('the PDF could not be opened (...\\OS_Deadlocks.pdf)')``
+    was classified as lock contention, telling a person to re-upload a file
+    that can never parse (measured 2026-10-18, the defect this gate closes).
 
     Reads the DBAPI error, not the rendered statement. SQLAlchemy's
     ``StatementError.__str__`` appends ``[SQL: ...]`` and ``[parameters: ...]``,
@@ -607,6 +614,9 @@ def is_lock_error(exc) -> bool:
     raising would cost the person the JSON answer and the operator the log
     line (SQLAlchemy guards the same call in ``DBAPIError.__init__``).
     """
+    from sqlalchemy.exc import SQLAlchemyError
+    if not isinstance(exc, SQLAlchemyError):
+        return False
     try:
         text = str(getattr(exc, 'orig', exc)).lower()
     except Exception as unreadable:
@@ -1074,10 +1084,13 @@ def _run(file_id, pdf_path, user_id, request_id, job_id=None, log=None,
             result.update(stored=False, store_error=reason, progress_log=log)
             return result
     except Exception as e:
-        if is_lock_error(e):
-            reason = _BUSY_NOT_SAVED
-        elif isinstance(e, BookParseError):
+        # A book's own complaint first: this handler sees every exception the
+        # parse can raise, and a BookParseError says something true about the
+        # file that must not be overwritten by a guess about the database.
+        if isinstance(e, BookParseError):
             reason = str(e)
+        elif is_lock_error(e):
+            reason = _BUSY_NOT_SAVED
         else:
             reason = f'unexpected error: {e}'
         if not isinstance(e, BookParseError):

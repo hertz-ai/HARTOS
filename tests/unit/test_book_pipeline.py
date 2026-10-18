@@ -683,6 +683,55 @@ class TestLockContention:
                      'OperationalError', 'sqlalche.me'):
             assert leak not in said, said
 
+    def test_the_background_parse_reports_a_lock_as_busy_on_job_and_row(
+            self, book_node, book_db, tmp_path, monkeypatch):
+        """The measured path: start_parse's worker, where the old answer began
+        "unexpected error:" and carried the statement.  parse_book takes the
+        other branch, so without this the named defect is unpinned.
+
+        The lock is raised at the save rather than held on the file: a real
+        hold also blocks _mark_failed's own write, which is the open
+        row-versus-job gap and not what this pins.  Only the boundary -- the
+        database error _save meets -- is faked; the worker, the classifier,
+        the row and the job are the real ones.
+        """
+        from sqlalchemy.exc import OperationalError
+
+        def locked(*a, **k):
+            raise OperationalError('DELETE FROM page_layouts WHERE file_id = ?',
+                                   {}, sqlite3.OperationalError('database is locked'))
+
+        monkeypatch.setattr(bp, '_save', locked)
+        started = bp.start_parse(make_pdf(tmp_path / 'book.pdf'), '42', 'req-lock')
+        job = _wait_for_job(started['job_id'])
+
+        assert job['status'] == 'failed'
+        assert job['error'] == bp._BUSY_NOT_SAVED
+        assert 'unexpected error' not in job['error']
+        assert _row(started['file_id'])['error'] == bp._BUSY_NOT_SAVED
+
+    def test_a_books_own_complaint_is_never_rewritten_as_busy(
+            self, book_node, book_db, tmp_path, monkeypatch):
+        """The guard for the gate in is_lock_error.
+
+        That handler is handed every exception a parse can raise, and most
+        carry no .orig, so matching the message classified
+        BookParseError('the PDF could not be opened (...OS_Deadlocks.pdf)')
+        as lock contention -- telling the person to re-upload a file that can
+        never parse.  A lock word in a book's own complaint must not move it.
+        """
+        complaint = 'the PDF could not be opened (C:/u/9fa_OS_Deadlocks.pdf)'
+        monkeypatch.setattr(bp, '_open',
+                            lambda *a, **k: (_ for _ in ()).throw(
+                                bp.BookParseError(complaint)))
+        started = bp.start_parse(make_pdf(tmp_path / 'book.pdf'), '42', 'req-perm')
+        job = _wait_for_job(started['job_id'])
+
+        assert job['status'] == 'failed'
+        assert job['error'] == complaint
+        assert job['error'] != bp._BUSY_NOT_SAVED
+        assert _row(started['file_id'])['error'] == complaint
+
     def test_a_read_still_answers_while_a_stall_cannot_be_recorded(self, book_node, book_db,
                                                                    monkeypatch):
         from integrations.social.models import BookFile, db_session
