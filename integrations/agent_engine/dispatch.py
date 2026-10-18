@@ -871,6 +871,16 @@ def _turn_failure(reply) -> Optional[str]:
     return f'turn failed: {reply.strip()[:160]}'
 
 
+def _clear_turn_record(goal_id) -> None:
+    """Forget the last turn's failure reason and route for ``goal_id`` on
+    this thread, so what is recorded next describes the new turn only.
+    Called at the start of every goal turn: dispatch_goal's and the
+    speculative one (speculative_turn_result)."""
+    with _turn_failures_lock:
+        _turn_failures.pop(_failure_key(goal_id), None)
+        _dispatch_routes.pop(_failure_key(goal_id), None)
+
+
 def _record_turn_failure(goal_id, reason) -> None:
     with _turn_failures_lock:
         _turn_failures[_failure_key(goal_id)] = reason
@@ -964,16 +974,19 @@ def speculative_turn_result(goal_id, spec) -> Optional[str]:
     The rule is dispatch_goal's own (_failed_turn): a failed turn's sentence
     is 'turn failed', a turn paused for the person is held ('deferred:').  An
     empty reply is a failed turn too: the fast /chat call itself failed (a
-    401, a timeout).  The turn ran on this node, so the route is 'local'.
+    401, a timeout).  _dispatch_to_model swallows that cause, so the reason
+    names the model, which is what an operator has to look at; 'error' is
+    set only when dispatch_speculative refused or raised.  The turn ran on
+    this node, so the route is 'local'.
     """
-    with _turn_failures_lock:
-        _turn_failures.pop(_failure_key(goal_id), None)
-        _dispatch_routes.pop(_failure_key(goal_id), None)
+    _clear_turn_record(goal_id)
     _record_route(goal_id, 'local', 'the speculative fast model ran it')
     spec = spec if isinstance(spec, dict) else {}
     reply = spec.get('response')
     if not isinstance(reply, str) or not reply.strip():
-        why = spec.get('error') or 'the fast model returned no reply'
+        why = spec.get('error') or (
+            f"the fast model {spec.get('fast_model') or '(unnamed)'} "
+            f"returned no reply")
         _record_turn_failure(goal_id, f'turn failed: {why}')
         logger.warning(f"Goal {goal_id}: speculative turn gave no reply "
                        f"({why}); no response returned")
@@ -1522,9 +1535,7 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
     """
     # A failure reason and a route describe this call only
     # (dispatch_failure_reason, handed_to_hive).
-    with _turn_failures_lock:
-        _turn_failures.pop(_failure_key(goal_id), None)
-        _dispatch_routes.pop(_failure_key(goal_id), None)
+    _clear_turn_record(goal_id)
 
     # The lane this goal's turns run on (owner policy 2026-10-12): a goal that
     # earns is revenue work and may use the expert model; registered by the

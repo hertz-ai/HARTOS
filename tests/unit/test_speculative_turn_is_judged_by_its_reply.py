@@ -159,8 +159,12 @@ def tick(goal, speculator, progress=STALE_DONE):
 @pytest.fixture(autouse=True)
 def _fresh_daemon_state():
     agent_daemon._dispatch_backoff.pop(GOAL, None)
+    # The route line is logged only when a goal's route changes, so each
+    # test starts as if the goal had never been dispatched.
+    dispatch._routes_logged.pop(GOAL, None)
     yield
     agent_daemon._dispatch_backoff.pop(GOAL, None)
+    dispatch._routes_logged.pop(GOAL, None)
     dispatch.dispatch_failure_reason(GOAL)
 
 
@@ -199,6 +203,57 @@ def test_an_empty_fast_reply_is_a_failed_dispatch():
     assert goal.status == 'active'
     assert 'completed_at' not in goal.config_json
     assert agent_daemon._dispatch_backoff[GOAL]['failures'] == 1
+
+
+def test_five_empty_fast_replies_pause_the_goal_naming_the_model():
+    """_dispatch_to_model swallows the cause of an empty reply, so the pause
+    names the model an operator has to look at (review of aeb5d4831)."""
+    goal = Goal()
+    for _ in range(5):
+        tick(goal, _Speculator(goal, ''))
+    assert goal.status == 'paused'
+    reason = goal.config_json['pause_reason']
+    assert 'configured-api' in reason and 'returned no reply' in reason
+
+
+class _RaisingSpeculator(_Speculator):
+    def dispatch_speculative(self, *a, **k):
+        self.calls += 1
+        raise RuntimeError('fast model transport broke')
+
+
+def test_a_raising_speculative_dispatch_is_a_failed_turn_not_a_dead_tick():
+    """A raise used to end the tick, and the tick's handler clears every
+    goal's backoff: the goal never collected a strike and another goal's
+    backoff was wiped (review of aeb5d4831, measured)."""
+    other = {'failures': 3, 'skip_until': 9e18}
+    agent_daemon._dispatch_backoff['goal-other'] = dict(other)
+    try:
+        goal = Goal()
+        spec = _RaisingSpeculator(goal, 'unused')
+        tick(goal, spec)
+        assert spec.calls == 1
+        assert agent_daemon._dispatch_backoff[GOAL]['failures'] == 1
+        assert agent_daemon._dispatch_backoff.get('goal-other') == other, \
+            "another goal's backoff was cleared by this goal's raise"
+        for _ in range(4):
+            tick(goal, spec)
+        assert goal.status == 'paused'
+        assert 'RuntimeError: fast model transport broke' in \
+            goal.config_json['pause_reason']
+    finally:
+        agent_daemon._dispatch_backoff.pop('goal-other', None)
+
+
+def test_the_turn_says_where_it_ran():
+    """The 18 completions left no line saying where their turns went; the
+    route is recorded and logged like a dispatch_goal turn's."""
+    goal = Goal()
+    with patch.object(dispatch.logger, 'info') as info:
+        tick(goal, _Speculator(goal, FAILED))
+    lines = [str(c.args[0]) for c in info.call_args_list if c.args]
+    assert any(f'Goal {GOAL}: dispatched here (the speculative fast model '
+               f'ran it)' in line for line in lines), lines
 
 
 def test_a_fast_turn_paused_for_the_person_is_held_not_failed():

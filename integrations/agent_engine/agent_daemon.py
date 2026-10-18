@@ -1964,9 +1964,9 @@ class AgentDaemon:
 
                 # PARALLEL: the goal's ledger has independently-runnable
                 # subtasks, so fan them out across the idle agents instead of
-                # dispatching the goal prompt once.  Treated as a handoff
-                # exactly like speculation: truthy result, backoff cleared,
-                # and the completion gate below still judges it.
+                # dispatching the goal prompt once.  Treated as a handoff:
+                # truthy result, backoff cleared, and the completion gate below
+                # still judges it.
                 fan_out = ({'completed': 0, 'failed': 0, 'deferred': 0}
                            if _expert_cfg else self._try_parallel_dispatch(
                                goal, idle_agents, dispatched, max_concurrent))
@@ -1991,29 +1991,44 @@ class AgentDaemon:
                     logger.debug(f"Goal {goal_key}: {_held} parallel "
                                  f"subtask(s) held for later")
                 elif speculative_enabled and not _expert_cfg:
+                    _speculate = False
                     try:
                         from .speculative_dispatcher import get_speculative_dispatcher
                         dispatcher = get_speculative_dispatcher()
-                        if dispatcher.should_speculate(
-                                str(agent['user_id']), prompt_id, prompt, goal.to_dict()):
+                        _speculate = dispatcher.should_speculate(
+                            str(agent['user_id']), prompt_id, prompt, goal.to_dict())
+                    except ImportError:
+                        pass
+                    except Exception as e:
+                        # The goal is then dispatched the ordinary way below;
+                        # a raise here used to end the tick, and the tick's
+                        # handler clears every goal's backoff.
+                        logger.warning(f"Goal {goal_key}: should_speculate "
+                                       f"failed, dispatching directly: {e}")
+                    if _speculate:
+                        # A raise is this turn's failure, taken by the failure
+                        # arm below like any other, not the end of the tick
+                        # (which would also clear every goal's backoff, review
+                        # of aeb5d4831).
+                        try:
                             _spec = dispatcher.dispatch_speculative(
                                 prompt, str(agent['user_id']), prompt_id,
                                 goal.id, goal.goal_type)
-                            dispatched += 1
-                            handed_off = True
-                            # The fast model's turn ran before
-                            # dispatch_speculative returned: its reply is this
-                            # turn's result, judged by dispatch_goal's own rule,
-                            # so a failed one takes the failure arm below and a
-                            # real one reaches the completion gate.  It used to
-                            # be discarded for a 'speculative-handoff' sentinel,
-                            # and on central 2026-10-17 18 goals whose every
-                            # fast turn failed were completed on the expert's
-                            # spark reservation (speculative_turn_result).
-                            from .dispatch import speculative_turn_result
-                            result = speculative_turn_result(goal_key, _spec)
-                    except ImportError:
-                        pass
+                        except Exception as e:
+                            _spec = {'error': f'{type(e).__name__}: {e}'}
+                        dispatched += 1
+                        handed_off = True
+                        # The fast model's turn ran before dispatch_speculative
+                        # returned: its reply is this turn's result, judged by
+                        # dispatch_goal's own rule, so a failed one takes the
+                        # failure arm below and a real one reaches the
+                        # completion gate.  It used to be discarded for a
+                        # 'speculative-handoff' sentinel, and on central
+                        # 2026-10-17 18 goals whose every fast turn failed were
+                        # completed on the expert's spark reservation
+                        # (speculative_turn_result).
+                        from .dispatch import speculative_turn_result
+                        result = speculative_turn_result(goal_key, _spec)
 
                 _to_hive = False
                 if not handed_off:
