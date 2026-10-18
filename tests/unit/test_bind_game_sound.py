@@ -955,10 +955,13 @@ def test_a_card_answer_reaches_a_session_already_holding_the_store(store_dir):
 def test_a_card_answered_while_a_take_is_composing_loses_neither(store_dir):
     """Review of fafa03c40, R1: the card dropped the cached store while a
     bind was still composing, so the bind wrote its take into a dict nobody
-    held any more.  The take composed in that window was lost from the
-    memo, the answer to its own card could not land, and the next bind
-    queued a second composer job.  This is the CREATE flow the feature is
-    for: the creator answers each card while the agent binds the next state."""
+    held any more.  The store went on reading 'composing': the take
+    reached the memo only when a later bind polled the composer again, and
+    until then the answer to that take's own card could not land on it.
+    The bgm answer itself survived, because the save re-reads the store
+    (measured on fafa03c40, review of f572fd775, F1).  This is the CREATE
+    flow the feature is for: the creator answers each card while the agent
+    binds the next state."""
     from core import cache_loaders
     cache_loaders.save_agent_data(4242, _SEED)
     live = _live_cache()
@@ -990,6 +993,132 @@ def test_a_card_answered_while_a_take_is_composing_loses_neither(store_dir):
     assert sounds['bgm']['rejected_url'] == 'https://node/a.mp3'
     assert media.generate_media.call_count == 1, 'a second composer job was queued'
     assert kept['applied'] is True, kept
+
+
+def test_a_persons_own_take_survives_their_card_answer_mid_composition(store_dir):
+    """The same race on a person's own store (review of f572fd775, F6).  A
+    visitor who turned the agent's music down gets a take of their own,
+    and while it composes they answer the card for another state.  That
+    answer saves their store and drops it from the cache: the take lands in
+    the store the answer wrote, beside the answer."""
+    from core import cache_loaders
+    cache_loaders.save_agent_data(4242, {'games': {'eng-01': {'sounds': {
+        'bgm': {'url': 'https://node/a.mp3'},
+        'correct': {'url': 'https://node/chime.mp3'}}}}})
+    live = _live_cache()
+    media = _media({'status': 'pending', 'task_id': 'acestep_v1'})
+    polls = []
+
+    def they_answer_another_card_mid_composition(task_id):
+        polls.append(task_id)
+        if len(polls) == 1:
+            agent_tools.answer_game_sound_card(
+                '4242', 'game_sound:eng-01:correct', False, 'too loud', VISITOR)
+            return json.dumps({'status': 'pending'})
+        return json.dumps({'status': 'completed',
+                           'results': [{'url': 'https://node/theirs.mp3'}]})
+    media.check_media_status.side_effect = they_answer_another_card_mid_composition
+
+    with _agent(live, media, user_id=VISITOR, user_prompt=f'{VISITOR}_4242',
+                helper_fun=_Disk()) as tools, \
+            patch('time.sleep', lambda *_a, **_k: None):
+        tools['approve_game_sound']('eng-01', False, 'bgm', 'too jangly')
+        bound = json.loads(tools['bind_game_sound']('eng-01', 'calm', 'spelling'))
+
+    own = _on_disk(agent_tools.person_store_for(VISITOR, 4242))
+    sounds = own['games']['eng-01']['sounds']
+    assert bound['status'] == 'bound', bound
+    assert sounds['bgm'].get('url') == 'https://node/theirs.mp3', sounds['bgm']
+    assert sounds['correct']['rejected_url'] == 'https://node/chime.mp3', sounds
+    assert _bgm(_on_disk(4242))['url'] == 'https://node/a.mp3'
+
+
+def test_a_composer_failing_after_a_card_answer_still_frees_the_state(store_dir):
+    """The same race on the failure path (review of f572fd775, F6): the
+    composer fails just after a card answer dropped the cached store.  The
+    dead task leaves the store the answer wrote, or the state polls a task
+    nobody will finish (hartos-3a F2)."""
+    from core import cache_loaders
+    cache_loaders.save_agent_data(4242, _SEED)
+    live = _live_cache()
+    media = _media({'status': 'pending', 'task_id': 'acestep_dead'})
+
+    def the_card_is_answered_then_the_composer_fails(task_id):
+        agent_tools.answer_game_sound_card(
+            '4242', 'game_sound:eng-01:bgm', False, 'too jangly', 'user-1')
+        return json.dumps({'status': 'error', 'error': 'CUDA out of memory'})
+    media.check_media_status.side_effect = the_card_is_answered_then_the_composer_fails
+
+    with _agent(live, media, helper_fun=_Disk()) as tools, \
+            patch('time.sleep', lambda *_a, **_k: None):
+        out = tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct')
+
+    sounds = _on_disk(4242)['games']['eng-01']['sounds']
+    assert 'CUDA out of memory' in out, out
+    assert 'task_id' not in sounds['correct'], sounds['correct']
+    assert sounds['correct']['lost_task']['task_id'] == 'acestep_dead'
+    assert sounds['bgm']['rejected_url'] == 'https://node/a.mp3', sounds['bgm']
+
+
+def test_a_composer_warming_up_during_a_card_answer_is_not_asked_twice(store_dir):
+    """The same race on a slow submit (review of f572fd775, F6): the submit
+    waits on a composer still warming up, and a card is answered meanwhile.
+    The note that a submit went out lands in the store the answer wrote, or
+    the next call queues a second job inside the cooldown (the duplicate
+    jobs measured on a live AceStep, 2026-09-22)."""
+    from core import cache_loaders
+    cache_loaders.save_agent_data(4242, _SEED)
+    live = _live_cache()
+    cold = _media({'status': 'warming_up'})
+
+    def the_card_is_answered_while_it_warms_up(*_a, **_k):
+        agent_tools.answer_game_sound_card(
+            '4242', 'game_sound:eng-01:bgm', False, 'too jangly', 'user-1')
+        return json.dumps({'status': 'warming_up', 'message': 'starting up'})
+    cold.generate_media.side_effect = the_card_is_answered_while_it_warms_up
+
+    with _agent(live, cold, helper_fun=_Disk()) as tools:
+        first = json.loads(tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct'))
+        second = json.loads(tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct'))
+
+    sounds = _on_disk(4242)['games']['eng-01']['sounds']
+    assert (first['status'], second['status']) == ('composing', 'composing')
+    assert cold.generate_media.call_count == 1, 'a second job was queued inside the cooldown'
+    assert sounds['correct'].get('submitted_at'), sounds['correct']
+    assert sounds['bgm']['rejected_url'] == 'https://node/a.mp3', sounds['bgm']
+
+
+def test_a_slow_submit_never_writes_over_a_take_finished_meanwhile(store_dir):
+    """Composed once, by whoever gets there first (owner 2026-10-17).
+    While a visitor's submit waits on a cold composer, the creator answers
+    a card, which drops the cached store, and fills the same state.  The
+    visitor's note that a submit went out lands on top of the finished
+    take, never over it: the note reads the record from the same store it
+    is written to (review of f572fd775, F6)."""
+    from core import cache_loaders
+    cache_loaders.save_agent_data(4242, _SEED)
+    live = _live_cache()
+    warm = _media({'status': 'completed',
+                   'results': [{'url': 'https://node/creators-chime.mp3'}]})
+    cold = _media({'status': 'warming_up'})
+
+    def meanwhile_the_creator_answers_and_fills_it(*_a, **_k):
+        agent_tools.answer_game_sound_card(
+            '4242', 'game_sound:eng-01:bgm', False, 'too jangly', 'user-1')
+        with _agent(live, warm, helper_fun=_Disk()) as tools:
+            tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct')
+        return json.dumps({'status': 'warming_up', 'message': 'starting up'})
+    cold.generate_media.side_effect = meanwhile_the_creator_answers_and_fills_it
+
+    with _agent(live, cold, user_id=VISITOR, user_prompt=f'{VISITOR}_4242',
+                helper_fun=_Disk()) as tools:
+        tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct')
+        heard = json.loads(tools['get_game_sound']('eng-01', 'correct'))
+
+    sounds = _on_disk(4242)['games']['eng-01']['sounds']
+    assert sounds['correct'].get('url') == 'https://node/creators-chime.mp3', sounds['correct']
+    assert heard['music']['url'] == 'https://node/creators-chime.mp3', heard
+    assert sounds['bgm']['rejected_url'] == 'https://node/a.mp3', sounds['bgm']
 
 
 def test_a_card_whose_answer_could_not_be_saved_says_so(store_dir, monkeypatch):
