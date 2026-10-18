@@ -507,3 +507,18 @@ def test_an_expert_that_cannot_be_scheduled_gives_its_reservation_back():
         _speculate(goal, _speculative_dispatcher(pool=_Pool(fail=True)))
     assert goal.spark_spent == 100
     assert budget_gate.held_reservation(GOAL) == 0
+
+
+def test_with_no_budget_system_the_expert_is_still_scheduled(monkeypatch):
+    """The expert's holder name came from budget_gate outside any guard, so
+    with the budget system not importable the scheduling raised and the
+    fast reply was lost; before the holder the expert was scheduled with
+    nothing reserved (review of 8b32e97b6, F3, measured)."""
+    goal = Goal(spent=100)
+    d = _speculative_dispatcher()
+    monkeypatch.setitem(sys.modules, 'integrations.agent_engine.budget_gate',
+                        None)
+    out, pending, ran = _speculate(goal, d)
+    assert out['expert_pending'] is True
+    ran.assert_called_once()
+    assert pending == (100, 0), 'nothing is reserved with no budget system'

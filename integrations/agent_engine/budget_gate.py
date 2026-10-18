@@ -13,6 +13,8 @@ Functions:
   pre_dispatch_budget_gate(goal_id, prompt, model_name, holder) — combined
                                        gate, reserving under holder
   reservation_holder(kind, ident) — the one naming rule for holders
+  goal_spark_now(goal_id, row_spark_spent) — spark spent as committed now,
+                                       and the part of it spent on work
 
 Pattern extracted from: speculative_dispatcher._check_and_reserve_budget() (lines 314-340)
 """
@@ -275,9 +277,11 @@ def charge_goal_work_completed(prompt_id, actions_completed: int = 1) -> bool:
 # still ran, and any caller's reservation to any other (review of
 # e8b6bf675, Q4 and P6).  Kept in process: the holder releases in the
 # process that reserved.  A reservation made in another process (the stdio
-# MCP server's dispatch_goal) is spent as far as this process can tell until
-# it is given back; a settle here meanwhile reads less work than was done,
-# which judges a noop, never a completion.
+# MCP server's dispatch_goal) is not in this ledger, so this process reads
+# it as spent on work until it is given back.  One made after a daemon's
+# snapshot and still held at its settle completes the goal on spark nobody
+# earned (measured, review of 8b32e97b6, F2); one given back in between
+# reads as less work.  Task #175.
 #
 # Two keys under a goal are not holders.  _RELEASING is spark a holder is
 # giving back whose write has not committed yet: still held, or a settle
@@ -325,6 +329,41 @@ def spark_spent_on_work(goal_id, spark_spent) -> int:
     return max(0, (spark_spent or 0) - held_reservation(goal_id))
 
 
+def goal_spark_now(goal_id, row_spark_spent=None) -> Tuple[int, int]:
+    """(spark_spent as committed now, the part of it spent on work).
+
+    The column is read in a short session of its own, then the ledger.  A
+    row loaded earlier goes stale: the agent daemon loads every goal when
+    its tick starts, and a holder giving spark back meanwhile lowers the
+    column in another session while the ledger already holds nothing, so
+    the stale figure read given-back spark as spent.  The budget pre-check
+    paused a goal on '12 < 16' with 16 left, and the snapshot made 2 spark
+    of real work a noop (review of 8b32e97b6, F1, measured).  A release
+    that lands between the two reads can still move this reading by its
+    amount, either way (task #175).
+
+    ``row_spark_spent`` (the caller's row) stands in when the column cannot
+    be read.
+    """
+    spent = row_spark_spent
+    try:
+        from integrations.social.models import get_db, AgentGoal
+        db = get_db()
+        try:
+            value = (db.query(AgentGoal.spark_spent)
+                     .filter(AgentGoal.id == str(goal_id)).scalar())
+        finally:
+            db.close()
+        # Anything but an integer (no row, a NULL column) is no reading.
+        if isinstance(value, int) and not isinstance(value, bool):
+            spent = value
+    except Exception as e:
+        logger.debug("Spark for goal %s not read fresh, using the loaded "
+                     "row: %s", goal_id, e)
+    spent = spent or 0
+    return spent, spark_spent_on_work(goal_id, spent)
+
+
 def release_goal_reservations(goal_id, holder: Optional[str] = None) -> int:
     """Give back the spark ``holder`` reserved for ``goal_id``.
 
@@ -346,9 +385,10 @@ def release_goal_reservations(goal_id, holder: Optional[str] = None) -> int:
     returned.  A hold whose goal row is gone is dropped and 0 returned:
     nothing was given back.  Returns the spark given back.
 
-    Between the commit and the ledger update a settle can read spark_spent
-    already lowered while the spark still counts as held: less work than
-    was done, judged a noop, never a completion.
+    Between the commit and the ledger update spark_spent is already lowered
+    while the spark still counts as held.  A settle reading then sees less
+    work than was done (a noop); a snapshot reading then is low, and the
+    next settle can count the difference as work (task #175).
     """
     key, who = str(goal_id), holder or ''
     with _held_lock:

@@ -246,8 +246,13 @@ def _capability_summary_safe() -> str:
 
 def expert_reservation_holder(speculation_id: str) -> str:
     """The name the expert's goal-budget reservation is held under: made in
-    _schedule_expert_background, given back when its background task ends."""
-    from .budget_gate import reservation_holder
+    _schedule_expert_background, given back when its background task ends.
+    None when the budget system cannot be imported: nothing is reserved then,
+    and the expert is still scheduled (review of 8b32e97b6, F3)."""
+    try:
+        from .budget_gate import reservation_holder
+    except ImportError:
+        return None
     return reservation_holder('expert', speculation_id)
 
 

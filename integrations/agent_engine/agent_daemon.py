@@ -1860,14 +1860,17 @@ class AgentDaemon:
                     # still held by running work (a speculative expert) comes
                     # back when that work ends, so a shortfall it alone causes
                     # waits a tick instead of pausing the goal, which needs a
-                    # person to lift (review of 4bb3bbae0, finding 4).
-                    from .budget_gate import spark_spent_on_work
+                    # person to lift (review of 4bb3bbae0, finding 4).  Read
+                    # as committed now, not off the row this tick loaded: an
+                    # expert ending since then made that row read its
+                    # given-back spark as spent (review of 8b32e97b6, F1).
+                    from .budget_gate import goal_spark_now
                     budget = goal.spark_budget or 0
-                    spent = spark_spent_on_work(goal_key, goal.spark_spent)
+                    spark_now, spent = goal_spark_now(goal_key, goal.spark_spent)
                     estimated = estimate_llm_cost_spark(prompt, _resolve_model_name('gpt-4o'))
                     bg_allowed = (budget - spent) >= estimated
                     bg_reason = f'insufficient_budget ({budget - spent} < {estimated})' if not bg_allowed else ''
-                    if bg_allowed and (budget - (goal.spark_spent or 0)) < estimated:
+                    if bg_allowed and (budget - spark_now) < estimated:
                         logger.info(
                             f"Goal {goal_key}: waiting for spark held by "
                             f"running work before its next dispatch")
@@ -1973,11 +1976,14 @@ class AgentDaemon:
                 # column type (see the note in _settle_dispatched_goal).
                 # Spark still held from an earlier dispatch (its release
                 # failed) is left out, as the gate leaves it out when it
-                # settles.
-                from .budget_gate import spark_spent_on_work
-                _cfg_pre = dict(goal.config_json or {})
-                _cfg_pre['spark_at_dispatch'] = spark_spent_on_work(
+                # settles.  Read as committed now, like the pre-check: off
+                # the row this tick loaded, an expert that ended since made 2
+                # spark of real work a noop (review of 8b32e97b6, F1).
+                from .budget_gate import goal_spark_now
+                _spark_now, _spark_on_work = goal_spark_now(
                     goal_key, goal.spark_spent)
+                _cfg_pre = dict(goal.config_json or {})
+                _cfg_pre['spark_at_dispatch'] = _spark_on_work
                 goal.config_json = _cfg_pre
 
                 # Speculative dispatch if enabled and budget allows.
@@ -2028,8 +2034,11 @@ class AgentDaemon:
                     try:
                         from .speculative_dispatcher import get_speculative_dispatcher
                         dispatcher = get_speculative_dispatcher()
+                        # Its budget check reads the spark as committed now,
+                        # not as this tick loaded it.
                         _speculate = dispatcher.should_speculate(
-                            str(agent['user_id']), prompt_id, prompt, goal.to_dict())
+                            str(agent['user_id']), prompt_id, prompt,
+                            dict(goal.to_dict(), spark_spent=_spark_now))
                     except ImportError:
                         pass
                     except Exception as e:
