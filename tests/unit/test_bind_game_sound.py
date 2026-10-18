@@ -1084,6 +1084,23 @@ def _the_visitor_turns_down_the_creators_next_take(live):
         '4242', 'game_sound:eng-01:bgm', False, 'not this one either', VISITOR)
 
 
+def _the_visitor_keeps_the_creators_next_take(live):
+    """The creator's next take v lands for everyone, and the visitor keeps
+    it on a card.  A card names no level, so the keep lands at the game's
+    key in the visitor's store."""
+    creators_next = _media({'status': 'completed',
+                            'results': [{'url': 'https://node/v.mp3'}]})
+    with _agent(live, creators_next, helper_fun=_Disk()) as tools:
+        tools['bind_game_sound']('eng-01', 'happy', 'spelling')
+    agent_tools.answer_game_sound_card(
+        '4242', 'game_sound:eng-01:bgm', True, '', VISITOR)
+
+
+def _offered_urls(offered):
+    """The url of every take a patched offer_sound_for_review was handed."""
+    return [call.args[4].get('url') for call in offered.call_args_list]
+
+
 def test_a_take_turned_down_while_theirs_composes_stays_turned_down(store_dir):
     """A card can rewrite the very record a bind is polling (review of
     0f929d043, F-A).  When the composer then fails, the dead task is
@@ -1202,12 +1219,7 @@ def test_keeping_the_agents_take_while_theirs_composes_ends_their_job(store_dir,
 
     def the_creators_take_lands_and_is_kept(task_id):
         if not later['s']:
-            creators_next = _media({'status': 'completed',
-                                    'results': [{'url': 'https://node/v.mp3'}]})
-            with _agent(live, creators_next, helper_fun=_Disk()) as tools:
-                tools['bind_game_sound']('eng-01', 'happy', 'spelling')
-            agent_tools.answer_game_sound_card(
-                '4242', 'game_sound:eng-01:bgm', True, '', VISITOR)
+            _the_visitor_keeps_the_creators_next_take(live)
             later['s'] = 200.0
             return json.dumps({'status': 'pending'})
         return json.dumps({'status': 'completed',
@@ -1229,28 +1241,27 @@ def test_keeping_the_agents_take_while_theirs_composes_ends_their_job(store_dir,
     assert 'ends the composition there (acestep_mine)' in caplog.text, caplog.text
 
 
-def test_a_take_kept_while_theirs_finishes_in_the_same_call_stays_kept(store_dir):
+def test_a_take_kept_while_theirs_finishes_in_the_same_call_stays_kept(store_dir, caplog):
     """Their own take finishing in the very call that is still polling it is
     not written over a take they kept meanwhile (review of 4528e339d, F-1:
     the person pressed "Keep it" on the creator's take and then heard their
-    own instead).  The finished take is not bound; the kept one stays."""
+    own instead).  The finished take is not bound, not offered on a card,
+    and its url is logged (review of 0c542e278, F-D); the kept one stays."""
+    import logging
+    caplog.set_level(logging.INFO, logger='tool_execution')
     own_id = _u_turned_down_by_both()
     live = _live_cache()
     media = _media({'status': 'pending', 'task_id': 'acestep_mine'})
 
     def kept_then_theirs_finishes(task_id):
-        creators_next = _media({'status': 'completed',
-                                'results': [{'url': 'https://node/v.mp3'}]})
-        with _agent(live, creators_next, helper_fun=_Disk()) as tools:
-            tools['bind_game_sound']('eng-01', 'happy', 'spelling')
-        agent_tools.answer_game_sound_card(
-            '4242', 'game_sound:eng-01:bgm', True, '', VISITOR)
+        _the_visitor_keeps_the_creators_next_take(live)
         return json.dumps({'status': 'completed',
                            'results': [{'url': 'https://node/theirs.mp3'}]})
     media.check_media_status.side_effect = kept_then_theirs_finishes
 
     with _visitor(live, media, helper_fun=_Disk()) as tools, \
-            patch('time.sleep', lambda *_a, **_k: None):
+            patch('time.sleep', lambda *_a, **_k: None), \
+            patch.object(agent_tools, 'offer_sound_for_review') as offered:
         answer = json.loads(tools['bind_game_sound']('eng-01', 'calm', 'spelling'))
         heard = json.loads(tools['get_game_sound']('eng-01'))
 
@@ -1259,6 +1270,256 @@ def test_a_take_kept_while_theirs_finishes_in_the_same_call_stays_kept(store_dir
     assert heard['music']['url'] == 'https://node/v.mp3', heard
     assert answer['status'] == 'already_bound', answer
     assert answer['music']['url'] == 'https://node/v.mp3', answer
+    assert 'https://node/theirs.mp3' not in _offered_urls(offered)
+    assert 'https://node/theirs.mp3 is not bound over it' in caplog.text, caplog.text
+
+
+def test_a_take_kept_while_their_submit_waits_is_not_written_over(store_dir, caplog):
+    """The same race one step earlier (review of 0c542e278, F-A).  The
+    submit can wait up to two minutes on the composer, and the visitor
+    keeps the creator's take meanwhile.  The task the submit returned was
+    written over the kept take, and the take it finished was bound in its
+    place.  The kept take stays, nothing polls a task whose take cannot be
+    bound, and the task left to finish is logged."""
+    import logging
+    caplog.set_level(logging.INFO, logger='tool_execution')
+    own_id = _u_turned_down_by_both()
+    live = _live_cache()
+    media = _media({}, {'status': 'completed',
+                        'results': [{'url': 'https://node/theirs.mp3'}]})
+
+    def kept_while_the_submit_waits(*_a, **_k):
+        _the_visitor_keeps_the_creators_next_take(live)
+        return json.dumps({'status': 'pending', 'task_id': 'acestep_mine'})
+    media.generate_media.side_effect = kept_while_the_submit_waits
+
+    with _visitor(live, media, helper_fun=_Disk()) as tools, \
+            patch('time.sleep', lambda *_a, **_k: None), \
+            patch.object(agent_tools, 'offer_sound_for_review') as offered:
+        answer = json.loads(tools['bind_game_sound']('eng-01', 'calm', 'spelling'))
+        heard = json.loads(tools['get_game_sound']('eng-01'))
+
+    own = _bgm(_on_disk(own_id))
+    assert own.get('url') == 'https://node/v.mp3' and own.get('approved_at'), own
+    assert not set(agent_tools.IN_FLIGHT_FIELDS) & set(own), own
+    assert heard['music']['url'] == 'https://node/v.mp3', heard
+    assert (answer['status'], answer['music']['url']) == (
+        'already_bound', 'https://node/v.mp3'), answer
+    assert not media.check_media_status.called, 'polled a task whose take cannot be bound'
+    assert 'https://node/theirs.mp3' not in _offered_urls(offered)
+    assert 'task acestep_mine is not bound over it' in caplog.text, caplog.text
+
+
+def test_a_take_kept_while_their_submit_waits_stays_kept_when_it_comes_back_done(store_dir):
+    """The composer can answer the submit with the finished take itself.
+    A take kept while the submit waited stays, and the finished one is
+    neither bound nor offered (review of 0c542e278, F-D: nothing tested this
+    path; it already held)."""
+    own_id = _u_turned_down_by_both()
+    live = _live_cache()
+    media = _media({})
+
+    def kept_then_finished_at_once(*_a, **_k):
+        _the_visitor_keeps_the_creators_next_take(live)
+        return json.dumps({'status': 'completed',
+                           'results': [{'url': 'https://node/theirs.mp3'}]})
+    media.generate_media.side_effect = kept_then_finished_at_once
+
+    with _visitor(live, media, helper_fun=_Disk()) as tools, \
+            patch.object(agent_tools, 'offer_sound_for_review') as offered:
+        answer = json.loads(tools['bind_game_sound']('eng-01', 'calm', 'spelling'))
+
+    own = _bgm(_on_disk(own_id))
+    assert own.get('url') == 'https://node/v.mp3' and own.get('approved_at'), own
+    assert (answer['status'], answer['music']['url']) == (
+        'already_bound', 'https://node/v.mp3'), answer
+    assert 'https://node/theirs.mp3' not in _offered_urls(offered)
+
+
+def test_a_slot_filled_while_a_submit_waits_keeps_the_take_that_filled_it(store_dir):
+    """Composed once, by whoever gets there first (owner 2026-10-17).  A
+    visitor's submit to an empty slot waits on the composer while the
+    creator's turn fills that slot and offers its take on a card.  The
+    visitor's task was written over that take after its card had gone out
+    (review of 0c542e278, probe p6)."""
+    from core import cache_loaders
+    cache_loaders.save_agent_data(4242, {})
+    live = _live_cache()
+    media = _media({}, {'status': 'completed',
+                        'results': [{'url': 'https://node/visitors.mp3'}]})
+
+    def the_creator_fills_it_meanwhile(*_a, **_k):
+        warm = _media({'status': 'completed',
+                       'results': [{'url': 'https://node/creators.mp3'}]})
+        with _agent(live, warm, helper_fun=_Disk()) as tools:
+            tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct')
+        return json.dumps({'status': 'pending', 'task_id': 'acestep_visitor'})
+    media.generate_media.side_effect = the_creator_fills_it_meanwhile
+
+    with _visitor(live, media, helper_fun=_Disk()) as tools, \
+            patch('time.sleep', lambda *_a, **_k: None):
+        answer = json.loads(tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct'))
+
+    correct = _on_disk(4242)['games']['eng-01']['sounds']['correct']
+    assert correct.get('url') == 'https://node/creators.mp3', correct
+    assert 'task_id' not in correct, correct
+    assert (answer['status'], answer['matched'], answer['music']['url']) == (
+        'already_bound', 'game', 'https://node/creators.mp3'), answer
+
+
+def test_a_take_kept_for_the_game_ends_a_take_composing_for_one_level(store_dir):
+    """A card names no level, so a take kept on it is kept at the game's
+    key while the visitor's own take may be composing for one level (review
+    of 0c542e278, F-B).  Their take was bound at the level's key when it
+    finished: at level 3 they heard it, at level 1 the one they kept.  Had
+    the keep come first the call would have answered with the kept take and
+    composed nothing; it now ends the same way, and the job it ends is not
+    resumed once the kept take is turned down."""
+    own_id = _u_turned_down_by_both()
+    live = _live_cache()
+    media = _media({'status': 'pending', 'task_id': 'acestep_level3'})
+    polls = []
+
+    def kept_then_theirs_finishes(task_id):
+        polls.append(task_id)
+        if len(polls) == 1:
+            _the_visitor_keeps_the_creators_next_take(live)
+            return json.dumps({'status': 'pending'})
+        return json.dumps({'status': 'completed',
+                           'results': [{'url': 'https://node/level3.mp3'}]})
+    media.check_media_status.side_effect = kept_then_theirs_finishes
+
+    with _visitor(live, media, helper_fun=_Disk()) as tools, \
+            patch('time.sleep', lambda *_a, **_k: None), \
+            patch.object(agent_tools, 'offer_sound_for_review') as offered:
+        answer = json.loads(tools['bind_game_sound']('eng-01', 'calm', 'spelling', 'bgm', '3'))
+        at_three = json.loads(tools['get_game_sound']('eng-01', 'bgm', '3'))
+        at_one = json.loads(tools['get_game_sound']('eng-01', 'bgm', '1'))
+        first_offers = _offered_urls(offered)
+        tools['approve_game_sound']('eng-01', False, 'bgm', 'changed my mind', '3')
+        tools['bind_game_sound']('eng-01', 'calm', 'spelling', 'bgm', '3')
+
+    assert (answer['status'], answer['music']['url']) == (
+        'already_bound', 'https://node/v.mp3'), answer
+    assert at_three['music']['url'] == at_one['music']['url'] == 'https://node/v.mp3', (
+        at_three, at_one)
+    assert 'https://node/level3.mp3' not in first_offers
+    assert 'task_id' not in (_on_disk(own_id)['games']['eng-01']['sounds'].get('bgm@3') or {})
+    assert media.generate_media.call_count == 2, 'the ended job was resumed instead'
+
+
+def test_the_creators_next_take_landing_meanwhile_is_the_one_they_hear(store_dir):
+    """Composed once, then reused (owner 2026-10-17).  While the visitor's
+    own take composes, the creator's next take lands for everyone, one the
+    visitor has not turned down.  Had it come first, the visitor's call
+    would have answered with it and composed nothing; it ends the same way
+    when it comes meanwhile, rather than binding a second take for one
+    person (review of 0c542e278, F-B: the call asks again with the lookup it
+    began with)."""
+    own_id = _u_turned_down_by_both()
+    live = _live_cache()
+    media = _media({'status': 'pending', 'task_id': 'acestep_mine'})
+
+    def the_creators_take_lands_then_theirs_finishes(task_id):
+        creators_next = _media({'status': 'completed',
+                                'results': [{'url': 'https://node/v.mp3'}]})
+        with _agent(live, creators_next, helper_fun=_Disk()) as tools:
+            tools['bind_game_sound']('eng-01', 'happy', 'spelling')
+        return json.dumps({'status': 'completed',
+                           'results': [{'url': 'https://node/theirs.mp3'}]})
+    media.check_media_status.side_effect = the_creators_take_lands_then_theirs_finishes
+
+    with _visitor(live, media, helper_fun=_Disk()) as tools, \
+            patch('time.sleep', lambda *_a, **_k: None):
+        answer = json.loads(tools['bind_game_sound']('eng-01', 'calm', 'spelling'))
+        heard = json.loads(tools['get_game_sound']('eng-01'))
+
+    own = _bgm(_on_disk(own_id))
+    assert heard['music']['url'] == 'https://node/v.mp3', heard
+    assert (answer['status'], answer.get('matched'), answer['music']['url']) == (
+        'already_bound', 'game', 'https://node/v.mp3'), answer
+    assert not own.get('url') and 'task_id' not in own, own
+    assert own['lost_task']['task_id'] == 'acestep_mine', own
+
+
+def test_a_take_another_call_bound_first_is_left_as_it_is(store_dir, caplog):
+    """Two calls can poll one task: a second call joins a composition
+    rather than start one.  The first to see it finish binds it and offers
+    it, and the creator keeps it on its card.  The other call then sees the
+    same take finish.  It is the take already bound, so nothing is written
+    (the creator's keep stays), it is not offered again, and the answer says
+    the state has its take rather than that another was chosen meanwhile
+    (review of 0c542e278, F-C)."""
+    import logging
+    caplog.set_level(logging.INFO, logger='tool_execution')
+    from core import cache_loaders
+    cache_loaders.save_agent_data(4242, {})
+    live = _live_cache()
+    media = _media({'status': 'pending', 'task_id': 'acestep_one'})
+    polls = []
+    done = json.dumps({'status': 'completed',
+                       'results': [{'url': 'https://node/one.mp3'}]})
+
+    def the_other_call_binds_it_and_the_creator_keeps_it(task_id):
+        polls.append(task_id)
+        if len(polls) == 1:
+            with _agent(live, media, helper_fun=_Disk()) as tools:
+                tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct')
+            agent_tools.answer_game_sound_card(
+                '4242', 'game_sound:eng-01:correct', True, '', 'user-1')
+        return done
+    media.check_media_status.side_effect = the_other_call_binds_it_and_the_creator_keeps_it
+
+    with _visitor(live, media, helper_fun=_Disk()) as tools, \
+            patch('time.sleep', lambda *_a, **_k: None), \
+            patch.object(agent_tools, 'offer_sound_for_review') as offered:
+        answer = json.loads(tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct'))
+
+    correct = _on_disk(4242)['games']['eng-01']['sounds']['correct']
+    assert correct.get('url') == 'https://node/one.mp3' and correct.get('approved_at'), correct
+    assert _offered_urls(offered) == ['https://node/one.mp3']
+    assert (answer['status'], answer['matched']) == ('already_bound', 'game'), answer
+    assert 'never composed twice' in answer['note'], answer
+    assert 'not bound over it' not in caplog.text, caplog.text
+    assert media.generate_media.call_count == 1
+
+
+def test_a_take_they_turned_down_still_holds_the_agents_slot(store_dir):
+    """Of the same two calls, the visitor's is the one left polling, and
+    the visitor turns the finished take down before their call sees it
+    finish.  Their lookup now skips that take, but it is still the agent's,
+    for everyone else: their call does not bind it again, which erased the
+    creator's keep and offered the visitor the take they had just turned
+    down, and it tells them to ask again for one of their own."""
+    from core import cache_loaders
+    cache_loaders.save_agent_data(4242, {})
+    live = _live_cache()
+    media = _media({'status': 'pending', 'task_id': 'acestep_one'})
+    polls = []
+    done = json.dumps({'status': 'completed',
+                       'results': [{'url': 'https://node/one.mp3'}]})
+
+    def bound_kept_then_turned_down_by_the_visitor(task_id):
+        polls.append(task_id)
+        if len(polls) == 1:
+            with _agent(live, media, helper_fun=_Disk()) as tools:
+                tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct')
+            agent_tools.answer_game_sound_card(
+                '4242', 'game_sound:eng-01:correct', True, '', 'user-1')
+            agent_tools.answer_game_sound_card(
+                '4242', 'game_sound:eng-01:correct', False, 'too loud', VISITOR)
+        return done
+    media.check_media_status.side_effect = bound_kept_then_turned_down_by_the_visitor
+
+    with _visitor(live, media, helper_fun=_Disk()) as tools, \
+            patch('time.sleep', lambda *_a, **_k: None), \
+            patch.object(agent_tools, 'offer_sound_for_review') as offered:
+        answer = json.loads(tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct'))
+
+    correct = _on_disk(4242)['games']['eng-01']['sounds']['correct']
+    assert correct.get('url') == 'https://node/one.mp3' and correct.get('approved_at'), correct
+    assert _offered_urls(offered) == ['https://node/one.mp3']
+    assert answer['matched'] == 'miss' and 'call again' in answer['note'], answer
 
 
 def test_a_verdict_over_a_submit_still_queued_keeps_it_queued(store_dir):
@@ -1374,9 +1635,10 @@ def test_a_slow_submit_never_writes_over_a_take_finished_meanwhile(store_dir):
     """Composed once, by whoever gets there first (owner 2026-10-17).
     While a visitor's submit waits on a cold composer, the creator answers
     a card, which drops the cached store, and fills the same state.  The
-    visitor's note that a submit went out lands on top of the finished
-    take, never over it: the note reads the record from the same store it
-    is written to (review of f572fd775, F6)."""
+    visitor's note that a submit went out is not written over the finished
+    take (review of f572fd775, F6), nor on top of it, where the kept take
+    carried a submit (review of 0c542e278, F-A): the call answers with the
+    take that filled the slot."""
     from core import cache_loaders
     cache_loaders.save_agent_data(4242, _SEED)
     live = _live_cache()
@@ -1393,11 +1655,13 @@ def test_a_slow_submit_never_writes_over_a_take_finished_meanwhile(store_dir):
     cold.generate_media.side_effect = meanwhile_the_creator_answers_and_fills_it
 
     with _visitor(live, cold, helper_fun=_Disk()) as tools:
-        tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct')
+        answer = json.loads(tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct'))
         heard = json.loads(tools['get_game_sound']('eng-01', 'correct'))
 
     sounds = _on_disk(4242)['games']['eng-01']['sounds']
     assert sounds['correct'].get('url') == 'https://node/creators-chime.mp3', sounds['correct']
+    assert 'submitted_at' not in sounds['correct'], sounds['correct']
+    assert answer['status'] == 'already_bound', answer
     assert heard['music']['url'] == 'https://node/creators-chime.mp3', heard
     assert sounds['bgm']['rejected_url'] == 'https://node/a.mp3', sounds['bgm']
 

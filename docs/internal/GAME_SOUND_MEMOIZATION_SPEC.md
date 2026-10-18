@@ -72,8 +72,10 @@ Rules that make hits and misses exact:
 - **Only exact keys match.** No prefix matching, no nearest-mood, no
   "close enough". A level asks for its own key and falls back only
   through the ladder above.
-- **Every answer names what matched**: `matched: "level" | "game" |
-  "template" | "miss"`. The caller logs it; tests assert it.
+- **Every answer names what matched**: `matched: "mine" | "level" |
+  "game" | "composing" | "miss"` ("mine" is the person's own memo, §5;
+  "template" joins them if §4.3 is built). The caller logs it; tests
+  assert it.
 - **A miss composes exactly one artifact** and memoizes it **under the
   key that was requested** (not under the fallback it would have used),
   so the second identical request is a level‑1 hit.
@@ -159,12 +161,17 @@ down.  And a rejection written at a key where the person's own take is
 still composing keeps that composition's task (`IN_FLIGHT_FIELDS`), so
 the next call finds the job instead of queueing a second one (both
 measured 2026-10-18 at f572fd775).  A take they KEEP ends their own
-composition there: the kept record holds a url and no task, and a take
-that finishes afterwards, even inside the call still polling it, is not
-written over the kept one (the composer cannot be asked to stop; its
-take is simply not bound).  The setters
-are the one source of a take's history; the composing tool builds none
-of its own.
+composition there: the kept record holds a url and no task.  Nothing the
+composing call holds is written over a take that landed while it
+composed, whether kept on a card or filled by another turn: not the
+task or the submit note its submit returns (the submit can wait two
+minutes), not the take it finishes.  The call asks this before each of
+those writes with the same lookup it began with, so a take kept at the
+game's key also ends a composition for one level; the job it ends is
+cleared, and the composer, which cannot be asked to stop, simply has
+its take left unbound.  The same take, bound first by another call
+polling the same task, is left as it is.  The setters are the one
+source of a take's history; the composing tool builds none of its own.
 
 `approved_at` is what REUSE prefers; an unapproved memo still plays (a
 game is not held hostage to review) but is reported as unapproved so a
