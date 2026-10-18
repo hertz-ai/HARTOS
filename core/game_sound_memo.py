@@ -111,6 +111,23 @@ def game_state_key(state, level=None, variant=None):
 #: task, when it was taken, and a submit whose reply timed out.
 IN_FLIGHT_FIELDS = ('task_id', 'task_since', 'submitted_at')
 
+#: Corrupt values already warned about.  A lookup reads the same record on
+#: every turn, so each is a WARNING once and DEBUG after; at DEBUG alone it
+#: never reached the desktop log (review of 0c542e278, N-1).
+_corrupt_warned = set()
+
+
+def _log_corrupt(value, msg, *args):
+    """Log a corrupt stored value: WARNING the first time, DEBUG after."""
+    token = repr(value)[:200]
+    if token in _corrupt_warned:
+        logger.debug(msg, *args)
+        return
+    if len(_corrupt_warned) >= 1024:
+        _corrupt_warned.clear()
+    _corrupt_warned.add(token)
+    logger.warning(msg, *args)
+
 
 def take_variant(record):
     """Which take this record is: 1 for the first, counting up with each
@@ -121,7 +138,8 @@ def take_variant(record):
     try:
         return int(value)
     except (TypeError, ValueError):
-        logger.debug("a game sound's variant %r is not a number; read as 1", value)
+        _log_corrupt(('variant', value),
+                     "a game sound's variant %r is not a number; read as 1", value)
         return 1
 
 
@@ -132,8 +150,10 @@ def _named_takes(takes):
     takes = list(takes or ())
     named = [take for take in takes if isinstance(take, dict) and take.get('url')]
     if len(named) < len(takes):
-        logger.debug('%d past take(s) with no url skipped in a game sound record',
-                     len(takes) - len(named))
+        skipped = [take for take in takes if take not in named]
+        _log_corrupt(('takes', skipped),
+                     '%d past take(s) with no url skipped in a game sound record: %r',
+                     len(skipped), skipped[:3])
     return named
 
 
@@ -382,9 +402,11 @@ def record_verdict(games, game_id, state, approved, reason='',
                  if field in composing and not composing.get('url')}
     if not record.get('url'):
         record.update(in_flight)
-    elif in_flight:
+    elif in_flight.get('task_id') or _submit_in_flight(composing):
         # The composer cannot be asked to stop; its take, if it finishes,
-        # is not written over this one (agent_tools bind_game_sound).
+        # is not written over this one (agent_tools bind_game_sound).  A
+        # submit past its cooldown is no composition (review of 0c542e278,
+        # N-3).
         logger.info('a take kept at %s/%s ends the composition there (%s)',
                     game_id, write_key,
                     in_flight.get('task_id') or 'a submit still queued')
@@ -407,10 +429,17 @@ def game_state_record(games, game_id, state, level=None):
 
 
 def rejected_take(games, game_id, state, level=None):
-    """The take a reviewer turned down for this exact key, if any.
+    """The take a reviewer turned down for this key, if any: the level's
+    own, else the game's, which is the take the ladder played at that level.
 
     Kept so the next composition can answer the reason they gave, and so a
-    reviewer can go back to it (spec §6.1).
+    reviewer can go back to it (spec §6.1).  A verdict lands at the key the
+    ladder matched, so a rejection given while a level played is the
+    game's; read at the level's key alone, the level was then composed as
+    take 1 without the reason (review of 0c542e278).
     """
-    record = game_state_record(games, game_id, state, level)
-    return record if record.get('rejected_at') else {}
+    for at in (level, None):
+        record = game_state_record(games, game_id, state, at)
+        if record.get('rejected_at'):
+            return record
+    return {}

@@ -1857,6 +1857,84 @@ def test_the_take_after_a_second_rejection_is_take_three():
     assert bound['music']['variant'] == 3, bound
 
 
+def test_a_corrupt_record_is_warned_about_once_then_quietly(caplog, monkeypatch):
+    """At DEBUG alone the corrupt-shape lines never reached the desktop log,
+    whose root logger is at INFO; at WARNING on every read they would flood
+    it, since a lookup reads the same record on every turn.  Each bad value
+    is warned about once and at DEBUG after (review of 0c542e278, N-1)."""
+    import logging
+    from core import game_sound_memo
+    monkeypatch.setattr(game_sound_memo, '_corrupt_warned', set(), raising=False)
+    caplog.set_level(logging.DEBUG, logger='core.game_sound_memo')
+    record = {'rejected_url': 'https://node/a.mp3', 'variant': 'two',
+              'previous_takes': ['junk']}
+
+    game_sound_memo.turned_down_takes(record)
+    game_sound_memo.turned_down_takes(record)
+
+    def lines(level):
+        return sorted(r.getMessage()[:22] for r in caplog.records
+                      if r.levelno == level and r.name == 'core.game_sound_memo')
+    assert lines(logging.WARNING) == ["1 past take(s) with no", "a game sound's variant"]
+    assert lines(logging.DEBUG) == ["1 past take(s) with no", "a game sound's variant"]
+
+
+def test_a_keep_names_only_a_composition_still_under_way(caplog):
+    """A submit note older than the cooldown is not a submit still queued,
+    and the keep log said a queued one was ended (review of 0c542e278,
+    N-3).  A fresh one still is."""
+    import logging
+    from core.game_sound_memo import SUBMIT_COOLDOWN_S, record_verdict
+    caplog.set_level(logging.INFO, logger='core.game_sound_memo')
+
+    def keep_over(submitted_at):
+        caplog.clear()
+        agent = {'eng-01': {'sounds': {'bgm': {'url': 'https://node/v.mp3'}}}}
+        own = {'eng-01': {'sounds': {'bgm': {
+            'rejected_url': 'https://node/u.mp3', 'rejected_at': 1.0,
+            'submitted_at': submitted_at}}}}
+        record, _matched, _key = record_verdict(agent, 'eng-01', 'bgm', True, own=own)
+        assert record['url'] == 'https://node/v.mp3' and 'submitted_at' not in record
+        return caplog.text
+
+    assert 'ends the composition' not in keep_over(time.time() - SUBMIT_COOLDOWN_S - 60)
+    assert 'ends the composition there (a submit still queued)' in keep_over(time.time())
+
+
+def test_a_level_asked_for_after_the_games_take_was_turned_down_answers_it():
+    """A rejection lands on the take the ladder played, the game's, even
+    while a level was playing.  A level asked for afterwards was composed
+    as take 1 without the reason, because only the level's own key was read
+    for a rejection (review of 0c542e278, an older gap)."""
+    agent_data = {4242: {'games': {'eng-01': {'sounds': {'bgm': {
+        'url': 'https://node/game.mp3', 'variant': 1}}}}}}
+    media = _media({'status': 'completed',
+                    'results': [{'url': 'https://node/level3.mp3'}]})
+
+    with _agent(agent_data, media) as tools:
+        tools['approve_game_sound']('eng-01', False, 'bgm', 'too loud', '3')
+        bound = json.loads(tools['bind_game_sound']('eng-01', 'calm', 'spelling', 'bgm', '3'))
+
+    assert bound['status'] == 'bound', bound
+    assert 'too loud' in media.generate_media.call_args.kwargs['context']
+    assert bound['music']['variant'] == 2, bound
+
+
+def test_a_levels_own_rejection_comes_before_the_games():
+    """rejected_take reads the level's key first, then the game's."""
+    from core.game_sound_memo import rejected_take
+    both = {'eng-01': {'sounds': {
+        'bgm': {'rejected_url': 'https://node/g.mp3', 'rejected_at': 1.0},
+        'bgm@3': {'rejected_url': 'https://node/l.mp3', 'rejected_at': 2.0}}}}
+    game_only = {'eng-01': {'sounds': {
+        'bgm': {'rejected_url': 'https://node/g.mp3', 'rejected_at': 1.0},
+        'bgm@3': {'task_id': 'acestep_x'}}}}
+    assert rejected_take(both, 'eng-01', 'bgm', '3')['rejected_url'] == 'https://node/l.mp3'
+    assert rejected_take(game_only, 'eng-01', 'bgm', '3')['rejected_url'] == 'https://node/g.mp3'
+    assert rejected_take(both, 'eng-01', 'bgm')['rejected_url'] == 'https://node/g.mp3'
+    assert rejected_take({}, 'eng-01', 'bgm', '3') == {}
+
+
 def test_the_shared_verdict_says_when_there_is_nothing_to_judge():
     """The endpoint must answer applied=False rather than invent a memo."""
     from core.game_sound_memo import record_verdict

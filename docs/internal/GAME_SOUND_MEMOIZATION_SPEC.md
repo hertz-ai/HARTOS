@@ -142,7 +142,11 @@ wrong for the age. Three moments, three behaviours:
    reason)` marks the memo rejected with the reason, and the next
    composition for that key **includes the reason in the prompt** and
    stores the result as the next `variant`. The rejected artifact is kept
-   (not deleted) so a reviewer can go back to it.
+   (not deleted) so a reviewer can go back to it.  A verdict lands on the
+   key the ladder matched, so a rejection given while a level played is
+   the game's; a level composed afterwards answers it too
+   (`core.game_sound_memo.rejected_take` reads the level's key, then the
+   game's).
 2. **In REUSE, by anyone but the agent's creator.** Their correction must
    not silently change what everyone else hears. It writes a memo **in
    their own store** (§5), at the key of the take they were hearing, which
