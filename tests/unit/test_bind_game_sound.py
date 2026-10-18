@@ -1186,11 +1186,15 @@ def test_a_take_resumed_on_a_later_call_keeps_what_they_turned_down(store_dir):
     assert heard['status'] == 'unbound', heard
 
 
-def test_keeping_the_agents_take_while_theirs_composes_ends_their_job(store_dir):
+def test_keeping_the_agents_take_while_theirs_composes_ends_their_job(store_dir, caplog):
     """A verdict that KEEPS a take leaves no composition behind it (review
     of ed6576624, F1).  Kept with the job's fields, the record read
     'composing' once that take was turned down, and the next call resumed a
-    job composed to answer an older complaint instead of the new one."""
+    job composed to answer an older complaint instead of the new one.  The
+    job it drops is logged, so an operator can see it (review of 4528e339d,
+    F-2)."""
+    import logging
+    caplog.set_level(logging.INFO, logger='core.game_sound_memo')
     own_id = _u_turned_down_by_both()
     live = _live_cache()
     media = _media({'status': 'pending', 'task_id': 'acestep_mine'})
@@ -1222,6 +1226,39 @@ def test_keeping_the_agents_take_while_theirs_composes_ends_their_job(store_dir)
     assert not set(agent_tools.IN_FLIGHT_FIELDS) & set(kept), kept
     assert media.generate_media.call_count == 2, 'the old job was resumed instead'
     assert 'changed my mind' in media.generate_media.call_args.kwargs['context']
+    assert 'ends the composition there (acestep_mine)' in caplog.text, caplog.text
+
+
+def test_a_take_kept_while_theirs_finishes_in_the_same_call_stays_kept(store_dir):
+    """Their own take finishing in the very call that is still polling it is
+    not written over a take they kept meanwhile (review of 4528e339d, F-1:
+    the person pressed "Keep it" on the creator's take and then heard their
+    own instead).  The finished take is not bound; the kept one stays."""
+    own_id = _u_turned_down_by_both()
+    live = _live_cache()
+    media = _media({'status': 'pending', 'task_id': 'acestep_mine'})
+
+    def kept_then_theirs_finishes(task_id):
+        creators_next = _media({'status': 'completed',
+                                'results': [{'url': 'https://node/v.mp3'}]})
+        with _agent(live, creators_next, helper_fun=_Disk()) as tools:
+            tools['bind_game_sound']('eng-01', 'happy', 'spelling')
+        agent_tools.answer_game_sound_card(
+            '4242', 'game_sound:eng-01:bgm', True, '', VISITOR)
+        return json.dumps({'status': 'completed',
+                           'results': [{'url': 'https://node/theirs.mp3'}]})
+    media.check_media_status.side_effect = kept_then_theirs_finishes
+
+    with _visitor(live, media, helper_fun=_Disk()) as tools, \
+            patch('time.sleep', lambda *_a, **_k: None):
+        answer = json.loads(tools['bind_game_sound']('eng-01', 'calm', 'spelling'))
+        heard = json.loads(tools['get_game_sound']('eng-01'))
+
+    own = _bgm(_on_disk(own_id))
+    assert own.get('url') == 'https://node/v.mp3' and own.get('approved_at'), own
+    assert heard['music']['url'] == 'https://node/v.mp3', heard
+    assert answer['status'] == 'already_bound', answer
+    assert answer['music']['url'] == 'https://node/v.mp3', answer
 
 
 def test_a_verdict_over_a_submit_still_queued_keeps_it_queued(store_dir):
@@ -1504,12 +1541,16 @@ def test_a_write_at_a_level_key_keeps_that_keys_turned_down_takes():
     assert own['eng-01']['sounds']['bgm@3'] == stored
 
 
-def test_a_malformed_record_is_read_not_raised():
-    """Hand-edited or corrupt memo data is skipped where it is unreadable,
-    never raised out of a lookup or a write (review of ed6576624, F2: a
-    word for a variant raised ValueError in the matcher, which Nunba's route
-    read as a miss and composed again; a past take with no url raised
-    KeyError on every write at that key)."""
+def test_a_word_for_a_variant_and_a_take_with_no_url_are_read_not_raised(caplog):
+    """Two hand-edited or corrupt shapes are read where they are unreadable,
+    never raised out of a lookup or a write, and each is logged (review of
+    ed6576624, F2: a word for a variant raised ValueError in the matcher,
+    which Nunba's route read as a miss and composed again; a past take with
+    no url raised KeyError on every write at that key; review of 4528e339d,
+    F-3 and F-4: the reading was silent, and the name claimed every shape).
+    Other shapes, a record that is a string, still raise."""
+    import logging
+    caplog.set_level(logging.DEBUG, logger='core.game_sound_memo')
     from core.game_sound_memo import game_state_match, set_game_state_sound
 
     agent = {'eng-01': {'sounds': {'bgm': {'url': 'https://node/a.mp3', 'variant': 'two'}}}}
@@ -1523,6 +1564,33 @@ def test_a_malformed_record_is_read_not_raised():
     assert (record, matched) == ({}, 'miss')
     assert [t['url'] for t in stored['previous_takes']] == [
         'https://node/w.mp3', 'https://node/a.mp3']
+    logged = caplog.text
+    assert "variant 'two' is not a number" in logged, logged
+    assert 'past take(s) with no url' in logged, logged
+
+
+def test_a_word_for_a_variant_does_not_stop_the_next_take():
+    """bind's next-variant count reads the stored variant through the same
+    rule: a rejected take whose variant is a word is composed again as take 2
+    (review of 4528e339d, F-5)."""
+    agent_data = {4242: {'games': {'eng-01': {'sounds': {'bgm': {
+        'rejected_url': 'https://node/first.mp3', 'rejected_at': 1.0,
+        'rejected_reason': 'too jangly', 'variant': 'two'}}}}}}
+    media = _media({'status': 'completed', 'results': [{'url': 'https://node/next.mp3'}]})
+    with _agent(agent_data, media) as tools:
+        bound = json.loads(tools['bind_game_sound']('eng-01', 'calm', 'spelling'))
+    assert bound['status'] == 'bound' and bound['music']['variant'] == 2, bound
+
+
+def test_the_take_after_a_second_rejection_is_take_three():
+    """The variant counts up from the stored one (review of 4528e339d, F-5)."""
+    agent_data = {4242: {'games': {'eng-01': {'sounds': {'bgm': {
+        'url': 'https://node/second.mp3', 'variant': 2}}}}}}
+    media = _media({'status': 'completed', 'results': [{'url': 'https://node/third.mp3'}]})
+    with _agent(agent_data, media) as tools:
+        tools['approve_game_sound']('eng-01', False, 'bgm', 'still too loud')
+        bound = json.loads(tools['bind_game_sound']('eng-01', 'calm', 'spelling'))
+    assert bound['music']['variant'] == 3, bound
 
 
 def test_the_shared_verdict_says_when_there_is_nothing_to_judge():
@@ -1772,8 +1840,9 @@ def test_a_rejection_survives_a_composer_that_is_still_warming_up():
     04b8bd86e made a timed-out submit remember WHEN it went out, so the next
     call waits rather than queueing a duplicate -- right, and measured.  But
     it writes that note as a whole NEW record at the state's key, and every
-    other _remember in the function carries `previous_takes` forward while
-    this one does not.  So a rejected take plus a cold composer -- a node
+    other _remember in the function then carried `previous_takes` forward
+    while this one did not (since 4528e339d the memo's setters carry it for
+    every write).  So a rejected take plus a cold composer -- a node
     restarted overnight, which is exactly when a composer is warming up --
     silently erased the rejection: the audio the reviewer asked to go back
     to, the reason they gave, and the variant counter with it.

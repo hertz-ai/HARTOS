@@ -159,7 +159,10 @@ down.  And a rejection written at a key where the person's own take is
 still composing keeps that composition's task (`IN_FLIGHT_FIELDS`), so
 the next call finds the job instead of queueing a second one (both
 measured 2026-10-18 at f572fd775).  A take they KEEP ends their own
-composition there: the kept record holds a url and no task.  The setters
+composition there: the kept record holds a url and no task, and a take
+that finishes afterwards, even inside the call still polling it, is not
+written over the kept one (the composer cannot be asked to stop; its
+take is simply not bound).  The setters
 are the one source of a take's history; the composing tool builds none
 of its own.
 

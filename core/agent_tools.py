@@ -965,6 +965,33 @@ def build_core_tool_closures(ctx):
         # ed6576624, F3).
         task_id = bound.get('task_id')
 
+        def _bind_finished(url):
+            """Bind a finished take, unless a take landed at this key while
+            it composed: a person's "Keep it" on a card, or another turn
+            filling the empty slot.  That one stays and this one is not
+            written over it: a visitor pressed "Keep it" and then heard
+            their own take instead (review of 4528e339d, F-1)."""
+            current = game_state_record(_memo(), slot, which, level)
+            if current.get('url'):
+                tool_logger.info(
+                    f'bind_game_sound {slot}/{which}: a take landed while this one '
+                    f'composed; {url} is not bound over it')
+                return json.dumps({
+                    'status': 'already_bound',
+                    'game_id': slot,
+                    'state': which,
+                    'matched': 'meanwhile',
+                    'music': current,
+                    'note': f'A {which} was chosen while this one composed; that one stays.',
+                })
+            record = _offer(_remember({'url': url, 'mood': mood, 'prompt': prompt,
+                                       'state': which, 'level': level or None,
+                                       'variant': variant,
+                                       'composed_at': time.time(),
+                                       'approved_at': None}))
+            return json.dumps({'status': 'bound', 'game_id': slot,
+                               'state': which, 'music': record})
+
         def _forget_task(reason):
             """Drop a task the composer will never finish, keep the rest.
 
@@ -1021,14 +1048,7 @@ def build_core_tool_closures(ctx):
                     results = started.get('results') or []
                     url = results[0].get('url') if results else None
                     if url:
-                        record = _offer(_remember({'url': url, 'mood': mood,
-                                            'prompt': prompt, 'state': which,
-                                            'level': level or None,
-                                            'variant': variant,
-                                            'composed_at': time.time(),
-                                            'approved_at': None}))
-                        return json.dumps({'status': 'bound', 'game_id': slot,
-                                           'state': which, 'music': record})
+                        return _bind_finished(url)
                     return "The composer answered without any music; nothing bound."
                 if started.get('status') == 'warming_up':
                     # Not a refusal: the composer is getting ready, which on
@@ -1085,13 +1105,7 @@ def build_core_tool_closures(ctx):
                            or (results[0].get('url') if results else None))
                     if not url:
                         return "The composer finished without any music; nothing bound."
-                    record = _offer(_remember({'url': url, 'mood': mood, 'prompt': prompt,
-                                        'state': which, 'level': level or None,
-                                        'variant': variant,
-                                        'composed_at': time.time(),
-                                        'approved_at': None}))
-                    return json.dumps({'status': 'bound', 'game_id': slot,
-                                       'state': which, 'music': record})
+                    return _bind_finished(url)
                 if state in MEDIA_FAILED_STATUSES:
                     why = str(progress.get('error', 'unknown reason'))
                     if progress.get('unreachable') and _reads_as_still_waking(why):

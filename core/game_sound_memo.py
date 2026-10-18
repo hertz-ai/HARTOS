@@ -24,7 +24,10 @@ decided by the callers, which pass the person's memo as ``own``.
 # One vocabulary for every game: the app's own game renderer accepts the
 # same names over its bridge (DynamicGameRenderer ALLOWED_SOUND_EVENTS), so
 # an agent-led sound and a game-led sound are the same sound.
+import logging
 import time
+
+logger = logging.getLogger(__name__)
 
 
 GAME_STATES = {
@@ -113,11 +116,25 @@ def take_variant(record):
     """Which take this record is: 1 for the first, counting up with each
     take composed after a rejection.  A stored value that is not a number
     (hand-edited or corrupt) reads as 1 rather than raising out of a lookup
-    (review of ed6576624, F2)."""
+    (review of ed6576624, F2), and says so (review of 4528e339d, F-3)."""
+    value = (record or {}).get('variant') or 1
     try:
-        return int((record or {}).get('variant') or 1)
+        return int(value)
     except (TypeError, ValueError):
+        logger.debug("a game sound's variant %r is not a number; read as 1", value)
         return 1
+
+
+def _named_takes(takes):
+    """The takes in a stored ``previous_takes`` that name a take: a dict with
+    a url.  Anything else names no take and is skipped, with a log line,
+    never raised (review of ed6576624, F2; 4528e339d, F-3)."""
+    takes = list(takes or ())
+    named = [take for take in takes if isinstance(take, dict) and take.get('url')]
+    if len(named) < len(takes):
+        logger.debug('%d past take(s) with no url skipped in a game sound record',
+                     len(takes) - len(named))
+    return named
 
 
 def turned_down_takes(record):
@@ -129,8 +146,7 @@ def turned_down_takes(record):
     every write that replaces a record carries it forward, both setters
     alike (set_game_state_sound_at, set_game_state_sound)."""
     record = record or {}
-    takes = [dict(take) for take in record.get('previous_takes') or ()
-             if isinstance(take, dict) and take.get('url')]
+    takes = [dict(take) for take in _named_takes(record.get('previous_takes'))]
     if record.get('rejected_url'):
         takes.append({'url': record['rejected_url'],
                       'variant': take_variant(record),
@@ -161,8 +177,7 @@ def _keeping_turned_down(replaced, record):
     given while it composed kept only the takes turned down before the
     composition began, so the take turned down meanwhile played to them
     again (measured 2026-10-18 at f572fd775)."""
-    carried = [take for take in record.get('previous_takes') or ()
-               if isinstance(take, dict) and take.get('url')]
+    carried = _named_takes(record.get('previous_takes'))
     known = {take['url'] for take in carried}
     known.update((record.get('url'), record.get('rejected_url')))
     extra = []
@@ -363,9 +378,16 @@ def record_verdict(games, game_id, state, approved, reason='',
     # again once that take was turned down, then resumed a take composed to
     # answer an older complaint (review of ed6576624, F1).
     composing = _record_at(target, game_id, write_key)
-    if not record.get('url') and not composing.get('url'):
-        record.update({field: composing[field] for field in IN_FLIGHT_FIELDS
-                       if field in composing})
+    in_flight = {field: composing[field] for field in IN_FLIGHT_FIELDS
+                 if field in composing and not composing.get('url')}
+    if not record.get('url'):
+        record.update(in_flight)
+    elif in_flight:
+        # The composer cannot be asked to stop; its take, if it finishes,
+        # is not written over this one (agent_tools bind_game_sound).
+        logger.info('a take kept at %s/%s ends the composition there (%s)',
+                    game_id, write_key,
+                    in_flight.get('task_id') or 'a submit still queued')
     record = set_game_state_sound_at(target, game_id, write_key, record)
     return record, matched, write_key
 
