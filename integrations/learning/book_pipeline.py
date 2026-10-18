@@ -581,6 +581,17 @@ _LOCK_RETRY_DELAYS = (0.25, 0.5, 1.0, 2.0)
 _LOCK_ERRORS = ('database is locked', 'deadlock', 'lock wait timeout')
 
 
+def is_lock_error(exc) -> bool:
+    """True when ``exc`` is another writer holding the lock, not a bad book.
+
+    One spelling, two callers: ``_retry_on_lock`` reads it to decide whether to
+    wait, and the upload route reads it to decide what to tell the person. A
+    held lock is transient and the file is fine, so the two answers must not
+    drift apart.
+    """
+    return any(m in str(exc).lower() for m in _LOCK_ERRORS)
+
+
 def _retry_on_lock(fn):
     """Retry a write that met another writer's lock; any other error raises at once.
 
@@ -598,7 +609,7 @@ def _retry_on_lock(fn):
             try:
                 return fn(*args, **kwargs)
             except OperationalError as e:
-                if delay is None or not any(m in str(e).lower() for m in _LOCK_ERRORS):
+                if delay is None or not is_lock_error(e):
                     raise
                 logger.info(f"{fn.__name__}: the book library is busy; retrying in {delay}s")
                 time.sleep(delay)

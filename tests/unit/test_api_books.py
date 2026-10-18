@@ -7,6 +7,7 @@ the rate limiter's backend.
     python -m pytest tests/unit/test_api_books.py -q --noconftest
 """
 import io
+import sqlite3
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -199,3 +200,34 @@ class TestOverTheNetwork:
         assert layouts == []
         assert image.status_code == 404
         assert status.status_code == 404
+
+
+class TestABusyLibrary:
+    """Another writer holding the one SQLite write lock is not a bad book."""
+
+    def test_a_busy_library_asks_for_a_retry_instead_of_blaming_the_pdf(
+            self, client, book_db, pdf_bytes, monkeypatch):
+        """Measured live 2026-10-18 on this desktop: three uploads in a row met
+        a 33 s write-lock burst -- longer than _retry_on_lock's whole ladder --
+        and each answered "could not start parsing this PDF" with a 500.  The
+        same bytes parsed in 23 s minutes later, so the file was never the
+        problem; the person was told to fix something that was not broken.
+        A held lock is transient, so it is reported as transient.
+        """
+        from integrations.learning import book_pipeline as bp
+        # One attempt: the ladder's timing is not what this pins, and waiting
+        # out the real one would cost the suite 21 s.
+        monkeypatch.setattr(bp, '_LOCK_RETRY_DELAYS', ())
+        holder = sqlite3.connect(book_db.url.database, timeout=0)
+        holder.execute('BEGIN IMMEDIATE')   # exactly what a slow writer holds
+        try:
+            r = _upload(client, pdf_bytes)
+        finally:
+            holder.rollback()
+            holder.close()
+
+        assert r.status_code == 503, r.get_json()
+        said = r.get_json()['error'].lower()
+        assert 'busy' in said and 'try again' in said, said
+        # The old answer blamed the file; nothing may say that for a lock.
+        assert 'could not start parsing' not in said

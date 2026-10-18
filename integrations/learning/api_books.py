@@ -96,6 +96,16 @@ def parse_pdf():
     try:
         started = bp.start_parse(path, user_id, request_id)
     except Exception as e:
+        if bp.is_lock_error(e):
+            # Another writer holds the one write lock; _retry_on_lock already
+            # waited out its ladder. Measured live 2026-10-18 on this desktop:
+            # bursts reach 33 s, longer than the whole ladder, and the same
+            # bytes parsed 23 s later. Answering "could not start parsing this
+            # PDF" sent the person to fix a file that was never broken, so the
+            # transient case says it is transient.
+            logger.warning(f"book parse deferred, the library is busy: {path}: {e}")
+            return jsonify({'error': 'the book library is busy right now; '
+                                     'please try again in a moment'}), 503
         logger.error(f"could not start a book parse for {path}: {e}")
         return jsonify({'error': 'could not start parsing this PDF'}), 500
     return jsonify({
