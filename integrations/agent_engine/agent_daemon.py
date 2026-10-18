@@ -1996,20 +1996,22 @@ class AgentDaemon:
                         dispatcher = get_speculative_dispatcher()
                         if dispatcher.should_speculate(
                                 str(agent['user_id']), prompt_id, prompt, goal.to_dict()):
-                            dispatcher.dispatch_speculative(
+                            _spec = dispatcher.dispatch_speculative(
                                 prompt, str(agent['user_id']), prompt_id,
                                 goal.id, goal.goal_type)
                             dispatched += 1
-                            # Success — clear backoff
-                            with _module_lock:
-                                _dispatch_backoff.pop(goal_key, None)
                             handed_off = True
-                            # Handed off — same truth as dispatch_goal's
-                            # non-None. Truthy so the failure/backoff arm
-                            # (synchronous failures only; speculation reports
-                            # none synchronously) is skipped and the
-                            # completion gate below runs.
-                            result = 'speculative-handoff'
+                            # The fast model's turn ran before
+                            # dispatch_speculative returned: its reply is this
+                            # turn's result, judged by dispatch_goal's own rule,
+                            # so a failed one takes the failure arm below and a
+                            # real one reaches the completion gate.  It used to
+                            # be discarded for a 'speculative-handoff' sentinel,
+                            # and on central 2026-10-17 18 goals whose every
+                            # fast turn failed were completed on the expert's
+                            # spark reservation (speculative_turn_result).
+                            from .dispatch import speculative_turn_result
+                            result = speculative_turn_result(goal_key, _spec)
                     except ImportError:
                         pass
 

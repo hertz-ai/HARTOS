@@ -947,6 +947,40 @@ def handed_to_hive(goal_id) -> bool:
         return _dispatch_routes.get(_failure_key(goal_id)) == 'hive'
 
 
+def speculative_turn_result(goal_id, spec) -> Optional[str]:
+    """What dispatch_goal would have returned for a goal whose turn the
+    speculative dispatcher ran: the turn's reply, or None when it is no
+    result, with the reason kept for dispatch_failure_reason and
+    is_transient_deferral as dispatch_goal keeps its own.
+
+    SpeculativeDispatcher.dispatch_speculative runs the fast model's /chat
+    turn before it returns ``{'response': reply, ...}``; only the expert runs
+    after.  The daemon's speculative branch used to discard that reply and
+    settle the goal as a handoff.  Measured on central 2026-10-17
+    18:35-18:49Z: every fast turn answered OpenRouter's 400, and 18 goals were
+    completed anyway, 1.5 s after their dispatch, on the 4 spark the expert
+    reservation adds before any work exists.
+
+    The rule is dispatch_goal's own (_failed_turn): a failed turn's sentence
+    is 'turn failed', a turn paused for the person is held ('deferred:').  An
+    empty reply is a failed turn too: the fast /chat call itself failed (a
+    401, a timeout).  The turn ran on this node, so the route is 'local'.
+    """
+    with _turn_failures_lock:
+        _turn_failures.pop(_failure_key(goal_id), None)
+        _dispatch_routes.pop(_failure_key(goal_id), None)
+    _record_route(goal_id, 'local', 'the speculative fast model ran it')
+    spec = spec if isinstance(spec, dict) else {}
+    reply = spec.get('response')
+    if not isinstance(reply, str) or not reply.strip():
+        why = spec.get('error') or 'the fast model returned no reply'
+        _record_turn_failure(goal_id, f'turn failed: {why}')
+        logger.warning(f"Goal {goal_id}: speculative turn gave no reply "
+                       f"({why}); no response returned")
+        return None
+    return None if _failed_turn(goal_id, reply) else reply
+
+
 def _hive_run_open(coordinator, goal_id) -> Optional[bool]:
     """Does the goal's task set in the coordinator still hold work: a task
     that is not in a terminal state (TaskStatus.is_terminal_state, the
