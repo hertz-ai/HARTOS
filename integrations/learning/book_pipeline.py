@@ -588,8 +588,17 @@ def is_lock_error(exc) -> bool:
     wait, and the upload route reads it to decide what to tell the person. A
     held lock is transient and the file is fine, so the two answers must not
     drift apart.
+
+    Reads the DBAPI error, not the rendered statement. SQLAlchemy's
+    ``StatementError.__str__`` appends ``[SQL: ...]`` and ``[parameters: ...]``,
+    and for ``_register`` those carry the uploaded filename, the uploads
+    directory and the caller-supplied request_id -- so matching the whole
+    string let a book called ``deadlock.pdf`` be read as lock contention and
+    answered "try again" when the real failure (a missing table, say) was
+    permanent. Measured 2026-10-18 on the real route with the library tables
+    dropped: physics.pdf answered 500 and deadlock.pdf answered 503.
     """
-    return any(m in str(exc).lower() for m in _LOCK_ERRORS)
+    return any(m in str(getattr(exc, 'orig', exc)).lower() for m in _LOCK_ERRORS)
 
 
 def _retry_on_lock(fn):

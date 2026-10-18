@@ -231,3 +231,23 @@ class TestABusyLibrary:
         assert 'busy' in said and 'try again' in said, said
         # The old answer blamed the file; nothing may say that for a lock.
         assert 'could not start parsing' not in said
+
+    def test_a_permanent_failure_is_not_read_as_busy_because_of_a_filename(
+            self, client, book_db, pdf_bytes):
+        """The classifier reads the driver's error, never the rendered SQL.
+
+        SQLAlchemy appends [SQL: ...] and [parameters: ...] to str(exc), and
+        for this insert those carry the filename, the uploads directory and
+        the caller's request_id.  Matching that whole string answered "the
+        library is busy, try again" to a book called deadlock.pdf on a node
+        whose tables were gone -- a permanent failure dressed as transient,
+        the very mistake the busy branch exists to stop.
+        """
+        from integrations.social import models
+        models.BookPageLayout.__table__.drop(book_db)
+        models.BookFile.__table__.drop(book_db)       # nothing to retry into
+
+        r = _upload(client, pdf_bytes, name='deadlock.pdf')
+
+        assert r.status_code == 500, r.get_json()
+        assert r.get_json()['error'] == 'could not start parsing this PDF'
