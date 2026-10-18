@@ -1138,10 +1138,139 @@ def test_a_take_turned_down_while_theirs_composes_never_comes_back(store_dir):
         heard = json.loads(tools['get_game_sound']('eng-01'))
 
     assert bound['status'] == 'bound' and bound['music']['url'] == 'https://node/mine.mp3'
+    # the tool's answer is the record as stored, history included
+    assert [t['url'] for t in bound['music']['previous_takes']] == [
+        'https://node/u.mp3', 'https://node/v.mp3'], bound
     own = _bgm(_on_disk(own_id))
     assert [t['url'] for t in own['previous_takes']] == [
         'https://node/u.mp3', 'https://node/v.mp3'], own
     assert heard['status'] == 'unbound', heard
+
+
+def test_a_take_resumed_on_a_later_call_keeps_what_they_turned_down(store_dir):
+    """No card involved: a visitor turns the creator's take down, their own
+    take is handed back as still composing, a later call finishes it, and
+    they turn that down too.  The take they turned down first never plays
+    again (review of ed6576624, F3: the resumed take used to carry only the
+    history bind built at the start, which is empty on a resume)."""
+    from core import cache_loaders
+    own_id = agent_tools.person_store_for(VISITOR, 4242)
+    cache_loaders.save_agent_data(4242, {'games': {'eng-01': {'sounds': {
+        'bgm': {'url': 'https://node/u.mp3', 'approved_at': 1.0, 'variant': 1}}}}})
+    cache_loaders.save_agent_data(own_id, {'games': {'eng-01': {'sounds': {
+        'bgm': {'rejected_url': 'https://node/u.mp3', 'rejected_at': 1.0,
+                'rejected_reason': 'too jangly', 'variant': 1}}}}})
+    live = _live_cache()
+    media = _media({'status': 'pending', 'task_id': 'acestep_mine'})
+    real_time, later = time.time, {'s': 0.0}
+
+    def the_window_closes_then_it_finishes(task_id):
+        if not later['s']:
+            later['s'] = 200.0
+            return json.dumps({'status': 'pending'})
+        return json.dumps({'status': 'completed',
+                           'results': [{'url': 'https://node/mine.mp3'}]})
+    media.check_media_status.side_effect = the_window_closes_then_it_finishes
+
+    with _visitor(live, media, helper_fun=_Disk()) as tools, \
+            patch('time.sleep', lambda *_a, **_k: None), \
+            patch.object(agent_tools.time, 'time', lambda: real_time() + later['s']):
+        first = json.loads(tools['bind_game_sound']('eng-01', 'calm', 'spelling'))
+        resumed = json.loads(tools['bind_game_sound']('eng-01', 'calm', 'spelling'))
+        tools['approve_game_sound']('eng-01', False, 'bgm', 'not mine either')
+        heard = json.loads(tools['get_game_sound']('eng-01'))
+
+    assert first['status'] == 'composing', first
+    assert resumed['status'] == 'bound' and resumed['music']['url'] == 'https://node/mine.mp3'
+    assert media.generate_media.call_count == 1
+    assert heard['status'] == 'unbound', heard
+
+
+def test_keeping_the_agents_take_while_theirs_composes_ends_their_job(store_dir):
+    """A verdict that KEEPS a take leaves no composition behind it (review
+    of ed6576624, F1).  Kept with the job's fields, the record read
+    'composing' once that take was turned down, and the next call resumed a
+    job composed to answer an older complaint instead of the new one."""
+    own_id = _u_turned_down_by_both()
+    live = _live_cache()
+    media = _media({'status': 'pending', 'task_id': 'acestep_mine'})
+    real_time, later = time.time, {'s': 0.0}
+
+    def the_creators_take_lands_and_is_kept(task_id):
+        if not later['s']:
+            creators_next = _media({'status': 'completed',
+                                    'results': [{'url': 'https://node/v.mp3'}]})
+            with _agent(live, creators_next, helper_fun=_Disk()) as tools:
+                tools['bind_game_sound']('eng-01', 'happy', 'spelling')
+            agent_tools.answer_game_sound_card(
+                '4242', 'game_sound:eng-01:bgm', True, '', VISITOR)
+            later['s'] = 200.0
+            return json.dumps({'status': 'pending'})
+        return json.dumps({'status': 'completed',
+                           'results': [{'url': 'https://node/fresh.mp3'}]})
+    media.check_media_status.side_effect = the_creators_take_lands_and_is_kept
+
+    with _visitor(live, media, helper_fun=_Disk()) as tools, \
+            patch('time.sleep', lambda *_a, **_k: None), \
+            patch.object(agent_tools.time, 'time', lambda: real_time() + later['s']):
+        tools['bind_game_sound']('eng-01', 'calm', 'spelling')
+        kept = dict(_bgm(_on_disk(own_id)))
+        tools['approve_game_sound']('eng-01', False, 'bgm', 'changed my mind')
+        tools['bind_game_sound']('eng-01', 'calm', 'spelling')
+
+    assert kept.get('url') == 'https://node/v.mp3' and kept.get('approved_at'), kept
+    assert not set(agent_tools.IN_FLIGHT_FIELDS) & set(kept), kept
+    assert media.generate_media.call_count == 2, 'the old job was resumed instead'
+    assert 'changed my mind' in media.generate_media.call_args.kwargs['context']
+
+
+def test_a_verdict_over_a_submit_still_queued_keeps_it_queued(store_dir):
+    """A submit whose reply timed out may still be queued; a verdict written
+    over it keeps that note, so the next call waits instead of queueing a
+    second job inside the cooldown (review of ed6576624, F4)."""
+    own_id = _u_turned_down_by_both()
+    live = _live_cache()
+    cold = _media({'status': 'warming_up'})
+    with _visitor(live, cold, helper_fun=_Disk()) as tools:
+        first = json.loads(tools['bind_game_sound']('eng-01', 'calm', 'spelling'))
+    _the_visitor_turns_down_the_creators_next_take(live)
+    with _visitor(live, cold, helper_fun=_Disk()) as tools:
+        again = json.loads(tools['bind_game_sound']('eng-01', 'calm', 'spelling'))
+
+    own = _bgm(_on_disk(own_id))
+    assert (first['status'], again['status']) == ('composing', 'composing')
+    assert cold.generate_media.call_count == 1, 'a second job was queued in the cooldown'
+    assert own.get('submitted_at') and own['rejected_url'] == 'https://node/v.mp3', own
+
+
+def test_a_verdict_over_a_composing_take_keeps_its_age(store_dir):
+    """The verdict keeps when the job was taken (task_since), so a job the
+    composer lost is still recognised as lost and composed afresh, rather
+    than polled for good (review of ed6576624, F4)."""
+    own_id = _u_turned_down_by_both()
+    live = _live_cache()
+    media = _media({'status': 'pending', 'task_id': 'acestep_mine'})
+    real_time, later = time.time, {'s': 0.0}
+
+    def turned_down_then_long_forgotten(task_id):
+        if not later['s']:
+            _the_visitor_turns_down_the_creators_next_take(live)
+            later['s'] = 200.0
+            return json.dumps({'status': 'pending'})
+        return json.dumps({'status': 'completed',
+                           'results': [{'url': 'https://node/fresh.mp3'}]})
+    media.check_media_status.side_effect = turned_down_then_long_forgotten
+
+    with _visitor(live, media, helper_fun=_Disk()) as tools, \
+            patch('time.sleep', lambda *_a, **_k: None), \
+            patch.object(agent_tools.time, 'time', lambda: real_time() + later['s']):
+        tools['bind_game_sound']('eng-01', 'calm', 'spelling')
+        aged = dict(_bgm(_on_disk(own_id)))
+        later['s'] = agent_tools.TASK_STALE_S + 400.0
+        tools['bind_game_sound']('eng-01', 'calm', 'spelling')
+
+    assert aged.get('task_since') and aged['rejected_url'] == 'https://node/v.mp3', aged
+    assert media.generate_media.call_count == 2, 'the lost job was polled instead'
 
 
 def test_a_card_answered_while_their_take_composes_keeps_the_composition(store_dir):
@@ -1358,6 +1487,42 @@ def test_a_verdict_keeps_what_the_record_it_replaces_turned_down():
     assert [t['url'] for t in record['previous_takes']] == ['https://node/u.mp3']
     assert own['eng-01']['sounds']['bgm'] == record
     assert 'previous_takes' not in agent['eng-01']['sounds']['bgm']
+
+
+def test_a_write_at_a_level_key_keeps_that_keys_turned_down_takes():
+    """The carry reads the record at the exact key written, a level's own
+    key included (review of ed6576624, F4)."""
+    from core.game_sound_memo import set_game_state_sound
+
+    own = {'eng-01': {'sounds': {
+        'bgm': {'rejected_url': 'https://node/game-wide.mp3', 'rejected_at': 1.0},
+        'bgm@3': {'rejected_url': 'https://node/level3.mp3', 'rejected_at': 2.0}}}}
+    stored = set_game_state_sound(own, 'eng-01', 'bgm', {'url': 'https://node/mine3.mp3'},
+                                  level='3')
+
+    assert [t['url'] for t in stored['previous_takes']] == ['https://node/level3.mp3']
+    assert own['eng-01']['sounds']['bgm@3'] == stored
+
+
+def test_a_malformed_record_is_read_not_raised():
+    """Hand-edited or corrupt memo data is skipped where it is unreadable,
+    never raised out of a lookup or a write (review of ed6576624, F2: a
+    word for a variant raised ValueError in the matcher, which Nunba's route
+    read as a miss and composed again; a past take with no url raised
+    KeyError on every write at that key)."""
+    from core.game_sound_memo import game_state_match, set_game_state_sound
+
+    agent = {'eng-01': {'sounds': {'bgm': {'url': 'https://node/a.mp3', 'variant': 'two'}}}}
+    own = {'eng-01': {'sounds': {'bgm': {
+        'rejected_url': 'https://node/a.mp3', 'variant': 'two',
+        'previous_takes': [{'variant': 1}, 'junk', {'url': 'https://node/w.mp3'}]}}}}
+
+    record, matched, _key = game_state_match(agent, 'eng-01', 'bgm', own=own)
+    stored = set_game_state_sound(own, 'eng-01', 'bgm', {'url': 'https://node/new.mp3'})
+
+    assert (record, matched) == ({}, 'miss')
+    assert [t['url'] for t in stored['previous_takes']] == [
+        'https://node/w.mp3', 'https://node/a.mp3']
 
 
 def test_the_shared_verdict_says_when_there_is_nothing_to_judge():

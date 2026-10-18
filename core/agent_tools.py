@@ -264,7 +264,7 @@ from core.game_sound_memo import (  # noqa: E402
     rejected_take,
     set_game_state_sound,
     set_game_state_sound_at,
-    turned_down_takes,
+    take_variant,
 )
 
 
@@ -954,13 +954,15 @@ def build_core_tool_closures(ctx):
         # A take the reviewer rejected is composed again WITH the reason
         # they gave, and kept as the next variant (spec §6.1).
         rejected = rejected_take(_memo(), slot, which, level)
-        variant = int(rejected.get('variant') or 1) + 1 if rejected else 1
+        variant = take_variant(rejected) + 1 if rejected else 1
         if rejected.get('rejected_reason'):
             prompt = f"{prompt}. Not like the last one: {rejected['rejected_reason']}"
-        # Carried forward, because the new take REPLACES the rejected one at
-        # this key: without this the previous audio would survive exactly
-        # until the next composition and then vanish.
-        previous_takes = turned_down_takes(rejected)
+        # The takes turned down before this one are carried by the memo's
+        # setters (set_game_state_sound), not built here: every record this
+        # call writes REPLACES the one at this key, and the setter carries
+        # that record's history forward, on a resumed take too, where a list
+        # built from `rejected` at the start was empty (review of
+        # ed6576624, F3).
         task_id = bound.get('task_id')
 
         def _forget_task(reason):
@@ -1023,7 +1025,6 @@ def build_core_tool_closures(ctx):
                                             'prompt': prompt, 'state': which,
                                             'level': level or None,
                                             'variant': variant,
-                                            'previous_takes': previous_takes,
                                             'composed_at': time.time(),
                                             'approved_at': None}))
                         return json.dumps({'status': 'bound', 'game_id': slot,
@@ -1070,7 +1071,6 @@ def build_core_tool_closures(ctx):
                            'mood': mood, 'prompt': prompt,
                            'state': which, 'level': level or None,
                            'variant': variant,
-                           'previous_takes': previous_takes,
                            'composed_at': None, 'approved_at': None})
 
             # Give it a while, then hand the task back rather than block.
@@ -1088,7 +1088,6 @@ def build_core_tool_closures(ctx):
                     record = _offer(_remember({'url': url, 'mood': mood, 'prompt': prompt,
                                         'state': which, 'level': level or None,
                                         'variant': variant,
-                                        'previous_takes': previous_takes,
                                         'composed_at': time.time(),
                                         'approved_at': None}))
                     return json.dumps({'status': 'bound', 'game_id': slot,

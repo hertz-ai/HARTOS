@@ -109,19 +109,31 @@ def game_state_key(state, level=None, variant=None):
 IN_FLIGHT_FIELDS = ('task_id', 'task_since', 'submitted_at')
 
 
+def take_variant(record):
+    """Which take this record is: 1 for the first, counting up with each
+    take composed after a rejection.  A stored value that is not a number
+    (hand-edited or corrupt) reads as 1 rather than raising out of a lookup
+    (review of ed6576624, F2)."""
+    try:
+        return int((record or {}).get('variant') or 1)
+    except (TypeError, ValueError):
+        return 1
+
+
 def turned_down_takes(record):
     """Every take this record holds as turned down, oldest first: the ones
-    it carries in ``previous_takes``, then the one just rejected.
+    it carries in ``previous_takes``, then the one just rejected.  An entry
+    with no url names no take and is skipped.
 
-    The one builder of that list.  The next take composed at this key
-    carries it (spec 6.1), and so does every write that replaces this
-    record (set_game_state_sound_at)."""
+    The one builder of that list, and the one source of a take's history:
+    every write that replaces a record carries it forward, both setters
+    alike (set_game_state_sound_at, set_game_state_sound)."""
     record = record or {}
     takes = [dict(take) for take in record.get('previous_takes') or ()
-             if isinstance(take, dict)]
+             if isinstance(take, dict) and take.get('url')]
     if record.get('rejected_url'):
         takes.append({'url': record['rejected_url'],
-                      'variant': int(record.get('variant') or 1),
+                      'variant': take_variant(record),
                       'rejected_reason': record.get('rejected_reason') or '',
                       'rejected_at': record.get('rejected_at')})
     return takes
@@ -150,8 +162,8 @@ def _keeping_turned_down(replaced, record):
     composition began, so the take turned down meanwhile played to them
     again (measured 2026-10-18 at f572fd775)."""
     carried = [take for take in record.get('previous_takes') or ()
-               if isinstance(take, dict)]
-    known = {take.get('url') for take in carried}
+               if isinstance(take, dict) and take.get('url')]
+    known = {take['url'] for take in carried}
     known.update((record.get('url'), record.get('rejected_url')))
     extra = []
     for take in turned_down_takes(replaced):
@@ -346,8 +358,12 @@ def record_verdict(games, game_id, state, approved, reason='',
     # take may still be composing at.  The verdict does not end that
     # composition: without its task the next call could not find the job
     # and queued a second one (measured 2026-10-18 at f572fd775).
+    # Only a rejection keeps it: a take that was KEPT ends the person's own
+    # composition, and carried onto the kept take the job read 'composing'
+    # again once that take was turned down, then resumed a take composed to
+    # answer an older complaint (review of ed6576624, F1).
     composing = _record_at(target, game_id, write_key)
-    if not composing.get('url'):
+    if not record.get('url') and not composing.get('url'):
         record.update({field: composing[field] for field in IN_FLIGHT_FIELDS
                        if field in composing})
     record = set_game_state_sound_at(target, game_id, write_key, record)

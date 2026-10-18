@@ -155,10 +155,13 @@ takes the record it replaces held as turned down
 (`core.game_sound_memo.set_game_state_sound_at` / `set_game_state_sound`,
 built by `turned_down_takes`).  So a person's own take finishing over a
 verdict they gave while it composed still skips the take they turned
-down.  And a verdict written at a key where the person's own take is
+down.  And a rejection written at a key where the person's own take is
 still composing keeps that composition's task (`IN_FLIGHT_FIELDS`), so
 the next call finds the job instead of queueing a second one (both
-measured 2026-10-18 at f572fd775).
+measured 2026-10-18 at f572fd775).  A take they KEEP ends their own
+composition there: the kept record holds a url and no task.  The setters
+are the one source of a take's history; the composing tool builds none
+of its own.
 
 `approved_at` is what REUSE prefers; an unapproved memo still plays (a
 game is not held hostage to review) but is reported as unapproved so a
