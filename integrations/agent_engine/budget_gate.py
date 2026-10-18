@@ -5,9 +5,10 @@ Fail-closed economics: don't spend what you don't have.
 
 Functions:
   estimate_llm_cost_spark(prompt, model_name) — token-based cost estimate
-  check_goal_budget(goal_id, estimated_cost) — atomic row-lock reservation
-  release_goal_reservations(goal_id) — give the reservation back when the
-                                       dispatch ends
+  check_goal_budget(goal_id, estimated_cost, holder) — atomic row-lock
+                                       reservation, held under its holder
+  release_goal_reservations(goal_id, holder) — the holder gives its
+                                       reservation back when its work ends
   check_platform_affordability() — 7-day net revenue check (cached 60s)
   pre_dispatch_budget_gate(goal_id, prompt, model_name) — combined gate
 
@@ -125,7 +126,8 @@ def estimate_llm_cost_spark(prompt: str, model_name: str = '') -> int:
 # ── Goal budget (row-lock atomic deduction) ──────────────────────────
 
 def check_goal_budget(goal_id: Optional[str],
-                      estimated_cost: int) -> Tuple[bool, int, str]:
+                      estimated_cost: int,
+                      holder: Optional[str] = None) -> Tuple[bool, int, str]:
     """Check and reserve Spark budget for a goal (atomic row lock).
 
     Extracted from speculative_dispatcher._check_and_reserve_budget().
@@ -138,9 +140,9 @@ def check_goal_budget(goal_id: Optional[str],
     ``goal.spark_spent`` (release_goal_reservations,
     charge_goal_work_completed) clear the goal's cache entry.
 
-    A deduction is held (held_reservation) until release_goal_reservations
-    gives it back when the dispatch ends; a cached answer deducts nothing
-    and holds nothing.
+    A deduction is held under ``holder`` (held_reservation) until that
+    holder gives it back with release_goal_reservations when its work ends;
+    a cached answer deducts nothing and holds nothing.
     """
     if not goal_id:
         return True, -1, 'no_goal_constraint'
@@ -190,7 +192,7 @@ def check_goal_budget(goal_id: Optional[str],
 
             goal.spark_spent = spent + estimated_cost
             db.commit()
-            _hold(goal_id, estimated_cost)
+            _hold(goal_id, estimated_cost, holder)
             result = (True, remaining - estimated_cost, 'budget_reserved')
             with _budget_cache_lock:
                 _budget_cache[goal_id] = (now, result)
@@ -263,26 +265,30 @@ def charge_goal_work_completed(prompt_id, actions_completed: int = 1) -> bool:
 # The reservation is a pre-check: it stops a goal from dispatching past its
 # budget while the turn runs.  It is not work, and the steward's rule
 # (charge_goal_work_completed) is that spark_spent rises only on work done.
-# Kept in process: a release gives back only what was reserved in its own
-# process.  A reservation made in another process (the stdio MCP server,
-# mcp_server.py, calls dispatch_goal) stays spent, as every reservation did
-# before releases existed.
-_held_reservations: Dict[str, int] = {}
+# Each reservation is held under its HOLDER, the code that made it, and that
+# code gives it back when its own work ends: dispatch_goal when its turn
+# returns, the speculative expert when its background task ends.  A
+# goal-wide release gave back the expert's reservation while the expert
+# still ran, and any caller's reservation to any other (review of
+# e8b6bf675, Q4 and P6).  Kept in process: the holder releases in the
+# process that reserved.
+_held_reservations: Dict[str, Dict[str, int]] = {}
 _held_lock = threading.Lock()
 
 
-def _hold(goal_id, amount: int) -> None:
+def _hold(goal_id, amount: int, holder: Optional[str] = None) -> None:
     if not goal_id or not amount or amount <= 0:
         return
-    key = str(goal_id)
+    key, who = str(goal_id), holder or ''
     with _held_lock:
-        _held_reservations[key] = _held_reservations.get(key, 0) + int(amount)
+        mine = _held_reservations.setdefault(key, {})
+        mine[who] = mine.get(who, 0) + int(amount)
 
 
 def held_reservation(goal_id) -> int:
-    """Spark reserved for ``goal_id`` at dispatch and not yet released."""
+    """Spark reserved for ``goal_id`` and not yet released, by any holder."""
     with _held_lock:
-        return _held_reservations.get(str(goal_id), 0)
+        return sum(_held_reservations.get(str(goal_id), {}).values())
 
 
 def spark_spent_on_work(goal_id, spark_spent) -> int:
@@ -297,16 +303,16 @@ def spark_spent_on_work(goal_id, spark_spent) -> int:
     return max(0, (spark_spent or 0) - held_reservation(goal_id))
 
 
-def release_goal_reservations(goal_id) -> int:
-    """Give back the spark reserved for ``goal_id`` at dispatch.
+def release_goal_reservations(goal_id, holder: Optional[str] = None) -> int:
+    """Give back the spark ``holder`` reserved for ``goal_id``.
 
-    Called when a dispatch ends, whatever its outcome.  Without it the
-    reservation stood in for work: the completion gate read it as "spark spent
-    this dispatch" (18 goals completed on central 2026-10-17 whose every turn
-    had failed), and budgets drained by the estimate on every failed or
-    waiting dispatch until the gate paused the goal ("insufficient_budget
-    (0 < 4)").  Spark charged for completed work during the dispatch
-    (charge_goal_work_completed) stays.
+    Called by the holder when its work ends, whatever the outcome; other
+    holders' reservations on the goal stay.  Without it the reservation stood
+    in for work: the completion gate read it as "spark spent this dispatch"
+    (18 goals completed on central 2026-10-17 whose every turn had failed),
+    and budgets drained by the estimate on every failed or waiting dispatch
+    until the gate paused the goal ("insufficient_budget (0 < 4)").  Spark
+    charged for completed work meanwhile (charge_goal_work_completed) stays.
 
     Its own short transaction, row-locked like the reservation, so a
     concurrent work charge is never overwritten.  Never takes spark_spent
@@ -316,9 +322,12 @@ def release_goal_reservations(goal_id) -> int:
     A hold whose goal row is gone is dropped and 0 returned: nothing was
     given back.  Returns the spark given back.
     """
-    key = str(goal_id)
+    key, who = str(goal_id), holder or ''
     with _held_lock:
-        amount = _held_reservations.pop(key, 0)
+        mine = _held_reservations.get(key, {})
+        amount = mine.pop(who, 0)
+        if not mine:
+            _held_reservations.pop(key, None)
     if amount <= 0:
         return 0
     try:
@@ -333,7 +342,7 @@ def release_goal_reservations(goal_id) -> int:
         finally:
             db.close()
     except Exception as e:
-        _hold(key, amount)
+        _hold(key, amount, holder)
         logger.warning("Spark reserved for goal %s not given back yet "
                        "(retried at its next release): %s", goal_id, e)
         return 0
@@ -508,13 +517,15 @@ def apply_budget_pause(goal, reason: str) -> bool:
 
 def pre_dispatch_budget_gate(goal_id: Optional[str],
                              prompt: str,
-                             model_name: str = '') -> Tuple[bool, str]:
+                             model_name: str = '',
+                             holder: Optional[str] = None) -> Tuple[bool, str]:
     """Combined pre-dispatch budget gate.
 
     1. Resolve effective model name (local vs cloud)
     2. Estimate LLM cost
-    3. Check goal budget (atomic reservation, given back by
-       release_goal_reservations when the dispatch ends)
+    3. Check goal budget (atomic reservation under ``holder``, who gives
+       it back with release_goal_reservations when the dispatch ends, a
+       refusal here included)
     4. Check platform affordability (cached)
 
     Returns: (allowed, reason)
@@ -523,7 +534,8 @@ def pre_dispatch_budget_gate(goal_id: Optional[str],
     estimated_cost = estimate_llm_cost_spark(prompt, model_name)
 
     # Goal-level budget
-    allowed, remaining, reason = check_goal_budget(goal_id, estimated_cost)
+    allowed, remaining, reason = check_goal_budget(goal_id, estimated_cost,
+                                                   holder=holder)
     if not allowed:
         logger.warning(f"Budget gate BLOCKED: goal={goal_id}, {reason}")
         # A goal that cannot afford its next dispatch cannot afford the one

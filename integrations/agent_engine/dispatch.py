@@ -19,6 +19,7 @@ Falls back to local /chat when Redis is unavailable.
 import os
 import logging
 import threading
+import uuid
 import requests
 from typing import Dict, List, Optional
 
@@ -1532,7 +1533,31 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
 
     Returns:
         Response text or None on failure
+
+    The spark the budget gate reserves for the turn is given back when the
+    turn ends, however it ends (answered, failed, deferred, refused after
+    the reservation, raised): the reservation is a pre-check, not work.
+    Every caller is covered, the daemons and the stdio MCP server alike.
     """
+    holder = f'dispatch_goal:{uuid.uuid4().hex[:12]}'
+    try:
+        return _dispatch_goal_turn(prompt, user_id, goal_id, goal_type,
+                                   model_config, holder)
+    finally:
+        try:
+            from integrations.agent_engine.budget_gate import (
+                release_goal_reservations)
+            release_goal_reservations(goal_id, holder=holder)
+        except ImportError:
+            logger.debug('budget_gate not importable; nothing to give back '
+                         'for goal %s', goal_id)
+
+
+def _dispatch_goal_turn(prompt: str, user_id: str, goal_id: str,
+                        goal_type: str, model_config: Optional[list],
+                        holder: str) -> Optional[str]:
+    """dispatch_goal's turn.  ``holder`` names its budget reservation, which
+    dispatch_goal gives back when this returns or raises."""
     # A failure reason and a route describe this call only
     # (dispatch_failure_reason, handed_to_hive).
     _clear_turn_record(goal_id)
@@ -1553,7 +1578,8 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
     # BUDGET GATE: check goal budget + platform affordability before dispatch
     try:
         from integrations.agent_engine.budget_gate import pre_dispatch_budget_gate
-        bg_allowed, bg_reason = pre_dispatch_budget_gate(goal_id, prompt)
+        bg_allowed, bg_reason = pre_dispatch_budget_gate(goal_id, prompt,
+                                                         holder=holder)
         if not bg_allowed:
             logger.warning(f"Dispatch blocked by budget gate for {goal_type} goal {goal_id}: {bg_reason}")
             return None

@@ -244,6 +244,12 @@ def _capability_summary_safe() -> str:
         return ""
 
 
+def expert_reservation_holder(speculation_id: str) -> str:
+    """The name the expert's goal-budget reservation is held under: made in
+    _schedule_expert_background, given back when its background task ends."""
+    return f'expert:{speculation_id}'
+
+
 class SpeculativeDispatcher:
     """Fast-first, expert-takeover speculative execution engine.
 
@@ -1339,7 +1345,12 @@ class SpeculativeDispatcher:
                         "(draft reply is final)", speculation_id,
                         origin_model_id)
             return False
-        if not self._check_and_reserve_budget(user_id, goal_id, expert_model):
+        # Held until the expert's task ends (_expert_background_task), not
+        # until the dispatch that scheduled it returns: while it runs it
+        # still counts against the goal's budget.
+        holder = expert_reservation_holder(speculation_id)
+        if not self._check_and_reserve_budget(user_id, goal_id, expert_model,
+                                              holder=holder):
             logger.info("expert not scheduled for %s: budget denied for %s",
                         speculation_id, expert_model.model_id)
             return False
@@ -1396,12 +1407,17 @@ class SpeculativeDispatcher:
             _req_rid = _tl.get_request_id() or ''
         except Exception:
             _req_rid = ''
-        self._expert_pool.submit(
-            self._expert_background_task,
-            speculation_id, prompt, fast_response,
-            expert_model, user_id, prompt_id, goal_id, goal_type,
-            _req_rid,
-        )
+        try:
+            self._expert_pool.submit(
+                self._expert_background_task,
+                speculation_id, prompt, fast_response,
+                expert_model, user_id, prompt_id, goal_id, goal_type,
+                _req_rid,
+            )
+        except Exception:
+            # No task will run to give the reservation back.
+            self._release_expert_reservation(speculation_id, goal_id)
+            raise
         return True
 
     def _parse_draft_envelope(self, raw: str) -> dict:
@@ -1692,6 +1708,21 @@ class SpeculativeDispatcher:
         finally:
             with self._lock:
                 self._active.pop(speculation_id, None)
+            self._release_expert_reservation(speculation_id, goal_id)
+
+    @staticmethod
+    def _release_expert_reservation(speculation_id: str, goal_id) -> None:
+        """Give back the goal-budget spark this expert reserved.  The work it
+        did is charged when its flow completes (charge_goal_work_completed);
+        the reservation was only the pre-check."""
+        if not goal_id:
+            return
+        try:
+            from .budget_gate import release_goal_reservations
+            release_goal_reservations(
+                goal_id, holder=expert_reservation_holder(speculation_id))
+        except ImportError:
+            pass  # no budget system, so nothing was reserved
 
     def _run_collapsed_expert_path(self, speculation_id: str,
                                    original_prompt: str, fast_response: str,
@@ -2293,10 +2324,12 @@ class SpeculativeDispatcher:
                      f"user={user_id}")
 
     def _check_and_reserve_budget(self, user_id: str, goal_id: str,
-                                   expert_model) -> bool:
+                                   expert_model,
+                                   holder: Optional[str] = None) -> bool:
         """Check Spark budget before expert execution (atomic row lock).
 
         Delegates to shared budget_gate.check_goal_budget() to avoid duplication.
+        The reservation is held under ``holder``, who gives it back.
         """
         if not goal_id:
             return True  # No goal = no budget constraint
@@ -2304,7 +2337,8 @@ class SpeculativeDispatcher:
         try:
             from .budget_gate import check_goal_budget
             cost = expert_model.cost_per_1k_tokens
-            allowed, remaining, reason = check_goal_budget(goal_id, cost)
+            allowed, remaining, reason = check_goal_budget(goal_id, cost,
+                                                           holder=holder)
             return allowed
         except ImportError:
             return True  # Allow if budget system unavailable

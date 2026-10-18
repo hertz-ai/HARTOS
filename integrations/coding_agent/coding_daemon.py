@@ -275,11 +275,6 @@ class CodingAgentDaemon:
                 goal.config_json = cfg
                 result = dispatch_to_chat(prompt, str(agent['user_id']), goal.id,
                                           goal_type=goal.goal_type or 'coding')
-                # The spark the dispatch reserved is a pre-check, not work:
-                # given back whatever the turn did, as the agent daemon does.
-                from integrations.agent_engine.budget_gate import (
-                    release_goal_reservations)
-                release_goal_reservations(str(goal.id))
 
                 if result is None and _held_for_later(goal.id):
                     # Not a failure: the turn stopped between steps for a
