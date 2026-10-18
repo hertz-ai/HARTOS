@@ -251,3 +251,25 @@ class TestABusyLibrary:
 
         assert r.status_code == 500, r.get_json()
         assert r.get_json()['error'] == 'could not start parsing this PDF'
+
+    def test_a_permanent_failure_is_not_read_as_busy_because_of_a_request_id(
+            self, client, book_db, pdf_bytes):
+        """The other caller-supplied vector: request_id, bound by _register.
+
+        Dropping the tables fails at _existing's SELECT, whose parameters are
+        the user and the filename.  request_id reaches the database only
+        through _register's INSERT, so it needs a failure there: a book named
+        physics.pdf whose request_id says deadlock-9 must still answer 500.
+        """
+        with book_db.begin() as con:
+            con.exec_driver_sql(
+                "CREATE TRIGGER no_inserts BEFORE INSERT ON pdf_files "
+                "BEGIN SELECT RAISE(ABORT, 'the library refuses this row'); END")
+
+        form = {'file': (io.BytesIO(pdf_bytes), 'physics.pdf'),
+                'user_id': '42', 'request_id': 'deadlock-9'}
+        r = client.post('/upload/parse_pdf', data=form,
+                        content_type='multipart/form-data', environ_base=LOCAL)
+
+        assert r.status_code == 500, r.get_json()
+        assert r.get_json()['error'] == 'could not start parsing this PDF'

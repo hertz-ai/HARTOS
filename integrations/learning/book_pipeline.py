@@ -597,8 +597,21 @@ def is_lock_error(exc) -> bool:
     answered "try again" when the real failure (a missing table, say) was
     permanent. Measured 2026-10-18 on the real route with the library tables
     dropped: physics.pdf answered 500 and deadlock.pdf answered 503.
+
+    ``.orig`` present but None means no driver error, so no lock: keep
+    ``getattr(exc, 'orig', exc)`` rather than tidying it to
+    ``getattr(exc, 'orig', None) or exc``, which would fall back to the
+    rendered statement for that shape and bring the filename back with it.
+    A driver error whose own ``__str__`` raises is not a lock either, and
+    must not raise from here: this runs inside the route's ``except``, where
+    raising would cost the person the JSON answer and the operator the log
+    line (SQLAlchemy guards the same call in ``DBAPIError.__init__``).
     """
-    return any(m in str(getattr(exc, 'orig', exc)).lower() for m in _LOCK_ERRORS)
+    try:
+        text = str(getattr(exc, 'orig', exc)).lower()
+    except Exception:
+        return False
+    return any(m in text for m in _LOCK_ERRORS)
 
 
 def _retry_on_lock(fn):
