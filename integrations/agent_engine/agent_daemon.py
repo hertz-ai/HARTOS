@@ -479,7 +479,13 @@ def _settle_dispatched_goal(db, goal, goal_key, served_escalation=None,
     # change at all.  A new dict is written under every column type.
     cfg = dict(goal.config_json or {})
     is_continuous = cfg.get('continuous', False)
-    spark_spent = goal.spark_spent or 0
+    # Spark reserved at dispatch is a pre-check, not work.  The daemon gives
+    # it back before settling (budget_gate.release_goal_reservations); any
+    # still held here (that release failed) is not counted as spent either,
+    # or a reservation would complete a goal whose turn did nothing: 18 on
+    # central 2026-10-17 (review of aeb5d4831, finding 1).
+    from .budget_gate import held_reservation
+    spark_spent = max(0, (goal.spark_spent or 0) - held_reservation(goal_key))
     # Per-dispatch, not lifetime.  Absent key (a goal dispatched before this
     # code shipped) degrades to the old `> 0` test rather than blocking.
     spark_at_dispatch = cfg.get('spark_at_dispatch')
@@ -2038,6 +2044,13 @@ class AgentDaemon:
                     _to_hive = handed_to_hive(goal.id)
                     dispatched += 1
                     self._wd_heartbeat()
+
+                # The spark this dispatch reserved (dispatch_goal's budget gate,
+                # the speculative expert) was a pre-check, not work: give it
+                # back now, whatever the turn did, so neither the completion
+                # gate nor the budget reads it as spent.
+                from .budget_gate import release_goal_reservations
+                release_goal_reservations(goal_key)
 
                 # Track failures for exponential backoff.  A reply that SAYS the
                 # action failed — the {"status":"error"} envelope the CREATE
