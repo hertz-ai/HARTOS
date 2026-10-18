@@ -609,9 +609,22 @@ def is_lock_error(exc) -> bool:
     """
     try:
         text = str(getattr(exc, 'orig', exc)).lower()
-    except Exception:
+    except Exception as unreadable:
+        logger.debug("book library: a driver error could not be read, so it "
+                     "is not treated as a lock (%r)", unreadable)
         return False
     return any(m in text for m in _LOCK_ERRORS)
+
+
+#: What a person is told when the write lock outlasted the ladder mid-parse.
+#: Never the driver's text: SQLAlchemy renders ``[SQL: ...]`` and
+#: ``[parameters: ...]`` into it, and for ``_save`` those are the executemany
+#: payload -- the book's own page text -- plus the schema, handed to anyone who
+#: can poll the status route. Measured 2026-10-18, a status answer read in full:
+#: "unexpected error: (sqlite3.OperationalError) database is locked [SQL: DELETE
+#: FROM page_layouts WHERE page_layouts.file_id = ?] [parameters: (1,)]".
+_BUSY_NOT_SAVED = ('the book library was busy, so this book did not finish; '
+                   'upload it again in a moment')
 
 
 def _retry_on_lock(fn):
@@ -1054,14 +1067,22 @@ def _run(file_id, pdf_path, user_id, request_id, job_id=None, log=None,
         except Exception as e:
             if not keep_read:
                 raise
-            reason = f'the book was read but could not be saved: {e}'
+            reason = (_BUSY_NOT_SAVED if is_lock_error(e)
+                      else f'the book was read but could not be saved: {e}')
             _mark_failed(file_id, reason)
             log.append(f'Not saved: {reason}')
             result.update(stored=False, store_error=reason, progress_log=log)
             return result
     except Exception as e:
-        reason = str(e) if isinstance(e, BookParseError) else f'unexpected error: {e}'
+        if is_lock_error(e):
+            reason = _BUSY_NOT_SAVED
+        elif isinstance(e, BookParseError):
+            reason = str(e)
+        else:
+            reason = f'unexpected error: {e}'
         if not isinstance(e, BookParseError):
+            # The operator still gets the driver's text and the traceback; it
+            # is only the person's copy that drops the SQL and the parameters.
             logger.exception(f"book {file_id}: parse crashed")
         _mark_failed(file_id, reason)
         _update_job(job_id, status='failed', error=reason)

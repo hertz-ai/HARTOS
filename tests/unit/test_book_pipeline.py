@@ -656,7 +656,32 @@ class TestLockContention:
         self._lock_before_the_save(monkeypatch, book_db, 0.7, held)
         result = bp.parse_book(make_pdf(tmp_path / 'book.pdf'), '42')
         held[0].join()
-        assert result['stored'] is False and 'database is locked' in result['store_error']
+        assert result['stored'] is False
+        assert result['store_error'] == bp._BUSY_NOT_SAVED
+
+    def test_a_lock_mid_parse_does_not_hand_the_person_the_sql(
+            self, book_node, book_db, tmp_path, monkeypatch):
+        """The person is told the library was busy, not shown the statement.
+
+        The driver's text renders [SQL: ...] and [parameters: ...], and for
+        _save's executemany the parameters are the book's own page text; the
+        status route hands that to anyone who can poll it.  Measured live
+        2026-10-18 before this: "unexpected error: (sqlite3.OperationalError)
+        database is locked [SQL: DELETE FROM page_layouts WHERE
+        page_layouts.file_id = ?] [parameters: (1,)]".
+        """
+        _impatient_sessions(monkeypatch, book_db)
+        monkeypatch.setattr(bp, '_LOCK_RETRY_DELAYS', ())
+        held = []
+        self._lock_before_the_save(monkeypatch, book_db, 0.7, held)
+        result = bp.parse_book(make_pdf(tmp_path / 'book.pdf'), '42')
+        held[0].join()
+
+        said = result['store_error']
+        assert 'busy' in said and 'again' in said, said
+        for leak in ('SQL:', 'parameters:', 'page_layouts', 'sqlite3',
+                     'OperationalError', 'sqlalche.me'):
+            assert leak not in said, said
 
     def test_a_read_still_answers_while_a_stall_cannot_be_recorded(self, book_node, book_db,
                                                                    monkeypatch):
