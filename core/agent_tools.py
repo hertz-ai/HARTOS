@@ -254,6 +254,7 @@ _DEFAULT_RECEIPT_TEMPLATE = (
 from core.game_sound_memo import (  # noqa: E402
     GAME_STATE_DURATIONS,
     GAME_STATES,
+    IN_FLIGHT_FIELDS,
     game_state_key,
     game_sound_action,
     game_state_match,
@@ -263,6 +264,7 @@ from core.game_sound_memo import (  # noqa: E402
     rejected_take,
     set_game_state_sound,
     set_game_state_sound_at,
+    turned_down_takes,
 )
 
 
@@ -837,7 +839,7 @@ def build_core_tool_closures(ctx):
         # task_id means poll it, never start a second composition.
 
         def _remember(record):
-            set_game_state_sound(_memo(), slot, which, record, level)
+            record = set_game_state_sound(_memo(), slot, which, record, level)
             try:
                 helper_fun.save_agent_data_to_file(store_id, agent_data)
             except Exception as e:
@@ -958,14 +960,7 @@ def build_core_tool_closures(ctx):
         # Carried forward, because the new take REPLACES the rejected one at
         # this key: without this the previous audio would survive exactly
         # until the next composition and then vanish.
-        previous_takes = list(rejected.get('previous_takes') or [])
-        if rejected.get('rejected_url'):
-            previous_takes.append({
-                'url': rejected['rejected_url'],
-                'variant': int(rejected.get('variant') or 1),
-                'rejected_reason': rejected.get('rejected_reason') or '',
-                'rejected_at': rejected.get('rejected_at'),
-            })
+        previous_takes = turned_down_takes(rejected)
         task_id = bound.get('task_id')
 
         def _forget_task(reason):
@@ -978,7 +973,7 @@ def build_core_tool_closures(ctx):
             """
             kept = {k: v for k, v in game_state_record(
                         _memo(), slot, which, level).items()
-                    if k not in ('task_id', 'task_since', 'submitted_at')}
+                    if k not in IN_FLIGHT_FIELDS}
             kept['lost_task'] = {'task_id': task_id, 'reason': reason,
                                  'at': time.time()}
             _remember(kept)

@@ -104,6 +104,29 @@ def game_state_key(state, level=None, variant=None):
     return key
 
 
+#: The fields of a composition still under way at a key: the composer's
+#: task, when it was taken, and a submit whose reply timed out.
+IN_FLIGHT_FIELDS = ('task_id', 'task_since', 'submitted_at')
+
+
+def turned_down_takes(record):
+    """Every take this record holds as turned down, oldest first: the ones
+    it carries in ``previous_takes``, then the one just rejected.
+
+    The one builder of that list.  The next take composed at this key
+    carries it (spec 6.1), and so does every write that replaces this
+    record (set_game_state_sound_at)."""
+    record = record or {}
+    takes = [dict(take) for take in record.get('previous_takes') or ()
+             if isinstance(take, dict)]
+    if record.get('rejected_url'):
+        takes.append({'url': record['rejected_url'],
+                      'variant': int(record.get('variant') or 1),
+                      'rejected_reason': record.get('rejected_reason') or '',
+                      'rejected_at': record.get('rejected_at')})
+    return takes
+
+
 def _turned_down(sounds, keys):
     """Every take turned down at these keys of one memo: the one just
     rejected, and the earlier ones each next take carries forward in
@@ -112,12 +135,38 @@ def _turned_down(sounds, keys):
     again (review of c48e90601, F1)."""
     urls = set()
     for key in keys:
-        record = sounds.get(key) or {}
-        urls.add(record.get('rejected_url'))
-        urls.update(take.get('url') for take in record.get('previous_takes') or ()
-                    if isinstance(take, dict))
+        urls.update(take.get('url') for take in turned_down_takes(sounds.get(key)))
     urls.discard(None)
     return urls
+
+
+def _keeping_turned_down(replaced, record):
+    """``record``, with every take ``replaced`` held as turned down carried
+    into its ``previous_takes``.
+
+    A write at a key replaces the record there, and the takes a person
+    turned down live only in that record.  A take finishing over a verdict
+    given while it composed kept only the takes turned down before the
+    composition began, so the take turned down meanwhile played to them
+    again (measured 2026-10-18 at f572fd775)."""
+    carried = [take for take in record.get('previous_takes') or ()
+               if isinstance(take, dict)]
+    known = {take.get('url') for take in carried}
+    known.update((record.get('url'), record.get('rejected_url')))
+    extra = []
+    for take in turned_down_takes(replaced):
+        if take['url'] not in known:
+            known.add(take['url'])
+            extra.append(take)
+    if not extra:
+        return record
+    return {**record, 'previous_takes': carried + extra}
+
+
+def _record_at(games, game_id, key):
+    """The record at exactly this memo key, or {}."""
+    slot = (games or {}).get(str(game_id), {})
+    return (slot.get('sounds') or {}).get(key) or {}
 
 
 def game_state_match(games, game_id, state, level=None, *, own=None,
@@ -198,7 +247,11 @@ def set_game_state_sound_at(games, game_id, key, record):
     'correct@3' while 'correct' -- the take actually sounding -- kept its
     url and went on playing. Composing under the key asked for (spec 4)
     is a different rule for a different path: a miss that composes.
+
+    Every take the replaced record held as turned down is kept
+    (_keeping_turned_down).  Returns the record as stored.
     """
+    record = _keeping_turned_down(_record_at(games, game_id, key), record)
     slot = games.setdefault(str(game_id), {})
     slot.setdefault('sounds', {})[key] = record
     if key == 'bgm' and isinstance(slot.get('music'), dict):
@@ -210,10 +263,14 @@ def set_game_state_sound(games, game_id, state, record, level=None):
     """Memoize a sound under the key that was ASKED for (spec §4).
 
     Not under the key a fallback would have used: the next identical
-    request has to be an exact hit.
+    request has to be an exact hit.  Like set_game_state_sound_at, it keeps
+    every take the replaced record held as turned down, and returns the
+    record as stored.
     """
+    key = game_state_key(state, level)
+    record = _keeping_turned_down(_record_at(games, game_id, key), record)
     slot = games.setdefault(str(game_id), {})
-    slot.setdefault('sounds', {})[game_state_key(state, level)] = record
+    slot.setdefault('sounds', {})[key] = record
     if state == 'bgm' and level in (None, '', 0):
         # the shape the first version wrote, kept so older memos read back
         slot['music'] = record
@@ -284,8 +341,16 @@ def record_verdict(games, game_id, state, approved, reason='',
         record['rejected_at'] = time.time()
         record['rejected_reason'] = (reason or '').strip()
         record['rejected_url'] = record.pop('url', None)
-    set_game_state_sound_at(own if own is not None else games,
-                            game_id, write_key, record)
+    target = own if own is not None else games
+    # A person's verdict on the agent's take lands at the key their own
+    # take may still be composing at.  The verdict does not end that
+    # composition: without its task the next call could not find the job
+    # and queued a second one (measured 2026-10-18 at f572fd775).
+    composing = _record_at(target, game_id, write_key)
+    if not composing.get('url'):
+        record.update({field: composing[field] for field in IN_FLIGHT_FIELDS
+                       if field in composing})
+    record = set_game_state_sound_at(target, game_id, write_key, record)
     return record, matched, write_key
 
 
@@ -300,8 +365,7 @@ def game_state_record(games, game_id, state, level=None):
     carried its own copy of the three lines below, and the copy in
     agent_tools was the fourth reader of a shape this module owns.
     """
-    slot = (games or {}).get(str(game_id), {})
-    return (slot.get('sounds') or {}).get(game_state_key(state, level)) or {}
+    return _record_at(games, game_id, game_state_key(state, level))
 
 
 def rejected_take(games, game_id, state, level=None):

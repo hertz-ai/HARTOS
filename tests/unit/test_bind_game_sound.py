@@ -683,9 +683,9 @@ def test_a_persons_correction_still_writes_in_their_own_space():
 VISITOR = 'visitor-1'
 
 
-def _visitor(agent_data, media_module):
+def _visitor(agent_data, media_module, helper_fun=None):
     return _agent(agent_data, media_module, user_id=VISITOR,
-                  user_prompt=f'{VISITOR}_4242')
+                  user_prompt=f'{VISITOR}_4242', helper_fun=helper_fun)
 
 
 def _creators_approved_music():
@@ -942,8 +942,7 @@ def test_a_card_answer_reaches_a_session_already_holding_the_store(store_dir):
     agent_tools.answer_game_sound_card(
         '4242', 'game_sound:eng-01:bgm', False, 'too jangly', VISITOR)
 
-    with _agent(live, nothing, user_id=VISITOR, user_prompt=f'{VISITOR}_4242',
-                helper_fun=_Disk()) as tools:
+    with _visitor(live, nothing, helper_fun=_Disk()) as tools:
         heard = json.loads(tools['get_game_sound']('eng-01'))
         tools['save_data_in_memory']('progress', {'level': 2})
     assert heard['status'] == 'unbound', heard
@@ -1019,8 +1018,7 @@ def test_a_persons_own_take_survives_their_card_answer_mid_composition(store_dir
                            'results': [{'url': 'https://node/theirs.mp3'}]})
     media.check_media_status.side_effect = they_answer_another_card_mid_composition
 
-    with _agent(live, media, user_id=VISITOR, user_prompt=f'{VISITOR}_4242',
-                helper_fun=_Disk()) as tools, \
+    with _visitor(live, media, helper_fun=_Disk()) as tools, \
             patch('time.sleep', lambda *_a, **_k: None):
         tools['approve_game_sound']('eng-01', False, 'bgm', 'too jangly')
         bound = json.loads(tools['bind_game_sound']('eng-01', 'calm', 'spelling'))
@@ -1058,6 +1056,124 @@ def test_a_composer_failing_after_a_card_answer_still_frees_the_state(store_dir)
     assert 'task_id' not in sounds['correct'], sounds['correct']
     assert sounds['correct']['lost_task']['task_id'] == 'acestep_dead'
     assert sounds['bgm']['rejected_url'] == 'https://node/a.mp3', sounds['bgm']
+
+
+def _u_turned_down_by_both():
+    """Agent 4242 and the visitor's own store, each holding take u turned
+    down: the visitor's next bgm is composed for them alone.  Returns the
+    visitor's store id."""
+    from core import cache_loaders
+    own_id = agent_tools.person_store_for(VISITOR, 4242)
+    for store_id in (4242, own_id):
+        cache_loaders.save_agent_data(store_id, {'games': {'eng-01': {'sounds': {
+            'bgm': {'rejected_url': 'https://node/u.mp3', 'rejected_at': 1.0,
+                    'rejected_reason': 'too jangly', 'variant': 1}}}}})
+    return own_id
+
+
+def _the_visitor_turns_down_the_creators_next_take(live):
+    """The creator's next take v lands for everyone, and the visitor turns
+    it down on a card.  The verdict falls past the visitor's own take, which
+    has no url while it composes, to the creator's, and is written at the
+    same key in the visitor's store: the record their bind is polling."""
+    creators_next = _media({'status': 'completed',
+                            'results': [{'url': 'https://node/v.mp3'}]})
+    with _agent(live, creators_next, helper_fun=_Disk()) as tools:
+        tools['bind_game_sound']('eng-01', 'happy', 'spelling')
+    agent_tools.answer_game_sound_card(
+        '4242', 'game_sound:eng-01:bgm', False, 'not this one either', VISITOR)
+
+
+def test_a_take_turned_down_while_theirs_composes_stays_turned_down(store_dir):
+    """A card can rewrite the very record a bind is polling (review of
+    0f929d043, F-A).  When the composer then fails, the dead task is
+    cleared from that record as it now stands, so the visitor never hears
+    the take they just turned down."""
+    own_id = _u_turned_down_by_both()
+    live = _live_cache()
+    media = _media({'status': 'pending', 'task_id': 'acestep_mine'})
+
+    def turned_down_then_the_composer_fails(task_id):
+        _the_visitor_turns_down_the_creators_next_take(live)
+        return json.dumps({'status': 'error', 'error': 'CUDA out of memory'})
+    media.check_media_status.side_effect = turned_down_then_the_composer_fails
+
+    with _visitor(live, media, helper_fun=_Disk()) as tools, \
+            patch('time.sleep', lambda *_a, **_k: None):
+        out = tools['bind_game_sound']('eng-01', 'calm', 'spelling')
+        heard = json.loads(tools['get_game_sound']('eng-01'))
+
+    own = _bgm(_on_disk(own_id))
+    assert 'CUDA out of memory' in out, out
+    assert _bgm(_on_disk(4242))['url'] == 'https://node/v.mp3'
+    assert own.get('rejected_url') == 'https://node/v.mp3', own
+    assert 'task_id' not in own, own
+    assert heard['status'] == 'unbound', heard
+
+
+def test_a_take_turned_down_while_theirs_composes_never_comes_back(store_dir):
+    """Their own take finishing keeps a verdict given while it composed.
+    The finished take replaced the record the verdict was written to and
+    kept only the takes turned down before the composition began; once the
+    visitor turned their own take down too, the creator's take they had
+    turned down played to them again (measured 2026-10-18 at f572fd775)."""
+    own_id = _u_turned_down_by_both()
+    live = _live_cache()
+    media = _media({'status': 'pending', 'task_id': 'acestep_mine'})
+    polls = []
+
+    def turned_down_then_theirs_finishes(task_id):
+        polls.append(task_id)
+        if len(polls) == 1:
+            _the_visitor_turns_down_the_creators_next_take(live)
+            return json.dumps({'status': 'pending'})
+        return json.dumps({'status': 'completed',
+                           'results': [{'url': 'https://node/mine.mp3'}]})
+    media.check_media_status.side_effect = turned_down_then_theirs_finishes
+
+    with _visitor(live, media, helper_fun=_Disk()) as tools, \
+            patch('time.sleep', lambda *_a, **_k: None):
+        bound = json.loads(tools['bind_game_sound']('eng-01', 'calm', 'spelling'))
+        tools['approve_game_sound']('eng-01', False, 'bgm', 'not mine either')
+        heard = json.loads(tools['get_game_sound']('eng-01'))
+
+    assert bound['status'] == 'bound' and bound['music']['url'] == 'https://node/mine.mp3'
+    own = _bgm(_on_disk(own_id))
+    assert [t['url'] for t in own['previous_takes']] == [
+        'https://node/u.mp3', 'https://node/v.mp3'], own
+    assert heard['status'] == 'unbound', heard
+
+
+def test_a_card_answered_while_their_take_composes_keeps_the_composition(store_dir):
+    """A verdict written over a person's composing record dropped its task
+    id, so a bind handed back as still composing could not find its own job
+    again and queued a second one: the duplicate jobs measured on a live
+    AceStep (2026-09-22), and the first job's take was never kept."""
+    _u_turned_down_by_both()
+    live = _live_cache()
+    media = _media({'status': 'pending', 'task_id': 'acestep_mine'})
+    real_time, later = time.time, {'s': 0.0}
+
+    def turned_down_then_the_poll_window_closes(task_id):
+        if not later['s']:
+            _the_visitor_turns_down_the_creators_next_take(live)
+            # past the 90 s poll window, well inside TASK_STALE_S
+            later['s'] = 200.0
+            return json.dumps({'status': 'pending'})
+        return json.dumps({'status': 'completed',
+                           'results': [{'url': 'https://node/mine.mp3'}]})
+    media.check_media_status.side_effect = turned_down_then_the_poll_window_closes
+
+    with _visitor(live, media, helper_fun=_Disk()) as tools, \
+            patch('time.sleep', lambda *_a, **_k: None), \
+            patch.object(agent_tools.time, 'time', lambda: real_time() + later['s']):
+        first = json.loads(tools['bind_game_sound']('eng-01', 'calm', 'spelling'))
+        again = json.loads(tools['bind_game_sound']('eng-01', 'calm', 'spelling'))
+
+    assert (first['status'], first.get('task_id')) == ('composing', 'acestep_mine'), first
+    assert media.generate_media.call_count == 1, 'a second job was queued for the same take'
+    assert again['status'] == 'bound', again
+    assert again['music']['url'] == 'https://node/mine.mp3', again
 
 
 def test_a_composer_warming_up_during_a_card_answer_is_not_asked_twice(store_dir):
@@ -1110,8 +1226,7 @@ def test_a_slow_submit_never_writes_over_a_take_finished_meanwhile(store_dir):
         return json.dumps({'status': 'warming_up', 'message': 'starting up'})
     cold.generate_media.side_effect = meanwhile_the_creator_answers_and_fills_it
 
-    with _agent(live, cold, user_id=VISITOR, user_prompt=f'{VISITOR}_4242',
-                helper_fun=_Disk()) as tools:
+    with _visitor(live, cold, helper_fun=_Disk()) as tools:
         tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct')
         heard = json.loads(tools['get_game_sound']('eng-01', 'correct'))
 
@@ -1162,8 +1277,7 @@ def test_a_creators_card_answer_survives_a_visitors_stale_session(store_dir):
     agent_tools.answer_game_sound_card(
         '4242', 'game_sound:eng-01:bgm', False, 'too jangly', 'user-1')
 
-    with _agent(live, filled, user_id=VISITOR, user_prompt=f'{VISITOR}_4242',
-                helper_fun=_Disk()) as tools:
+    with _visitor(live, filled, helper_fun=_Disk()) as tools:
         tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct')
     agent = _on_disk(4242)
     assert _bgm(agent).get('url') is None, agent
@@ -1221,6 +1335,29 @@ def test_the_shared_verdict_rejects_with_the_reason_given():
     assert record.get('url') is None
     assert record['rejected_url'] == 'https://node/a.mp3'
     assert record['rejected_reason'] == 'too jangly'
+
+
+def test_a_verdict_keeps_what_the_record_it_replaces_turned_down():
+    """A person's verdict on the agent's take is written over their own
+    record at that key, and keeps every take that record held as turned
+    down.  A take composed since 2026-09-21 carries the agent's earlier
+    rejections itself; one stored before take history existed carries
+    none, and the person's own turned-down takes would go with the record
+    it replaced."""
+    from core.game_sound_memo import record_verdict
+
+    agent = {'eng-01': {'sounds': {'bgm': {'url': 'https://node/v.mp3'}}}}
+    own = {'eng-01': {'sounds': {'bgm': {
+        'rejected_url': 'https://node/u.mp3', 'rejected_at': 1.0,
+        'rejected_reason': 'too jangly', 'variant': 1}}}}
+    record, matched, _key = record_verdict(
+        agent, 'eng-01', 'bgm', False, 'too slow', own=own)
+
+    assert matched == 'game'
+    assert record['rejected_url'] == 'https://node/v.mp3'
+    assert [t['url'] for t in record['previous_takes']] == ['https://node/u.mp3']
+    assert own['eng-01']['sounds']['bgm'] == record
+    assert 'previous_takes' not in agent['eng-01']['sounds']['bgm']
 
 
 def test_the_shared_verdict_says_when_there_is_nothing_to_judge():

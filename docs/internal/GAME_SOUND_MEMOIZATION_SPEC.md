@@ -150,6 +150,16 @@ wrong for the age. Three moments, three behaviours:
 3. **Never automatically.** Nothing rewrites a memo because a model
    thought it could do better.
 
+A turned-down take stays turned down.  Every write at a key keeps the
+takes the record it replaces held as turned down
+(`core.game_sound_memo.set_game_state_sound_at` / `set_game_state_sound`,
+built by `turned_down_takes`).  So a person's own take finishing over a
+verdict they gave while it composed still skips the take they turned
+down.  And a verdict written at a key where the person's own take is
+still composing keeps that composition's task (`IN_FLIGHT_FIELDS`), so
+the next call finds the job instead of queueing a second one (both
+measured 2026-10-18 at f572fd775).
+
 `approved_at` is what REUSE prefers; an unapproved memo still plays (a
 game is not held hostage to review) but is reported as unapproved so a
 surface can mark it.
