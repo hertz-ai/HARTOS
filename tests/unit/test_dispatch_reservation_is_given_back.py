@@ -215,6 +215,115 @@ def test_releasing_one_holder_leaves_another_holders_reservation():
     assert goal.spark_spent == 100
 
 
+def test_a_failed_release_is_retried_by_the_goals_next_release():
+    """Every production holder is unique per call, so a hold put back under
+    it after a database error was never released again (review of
+    4bb3bbae0, finding 1).  Parked for the goal, the next release on the
+    goal, by any holder, gives it back; another holder's live reservation
+    stays put."""
+    goal = Goal(spent=100)
+    with patch('integrations.social.models.get_db', return_value=_db(goal)):
+        budget_gate.check_goal_budget(GOAL, 4, holder='expert:a')
+        budget_gate.invalidate_goal_budget_cache()
+        budget_gate.check_goal_budget(GOAL, 3, holder='dispatch_goal:b')
+    broken = MagicMock()
+    broken.query.side_effect = RuntimeError('database is locked')
+    with patch('integrations.social.models.get_db', return_value=broken):
+        assert budget_gate.release_goal_reservations(
+            GOAL, holder='expert:a') == 0
+    assert budget_gate.held_reservation(GOAL) == 7
+    with patch('integrations.social.models.get_db', return_value=_db(goal)):
+        assert budget_gate.release_goal_reservations(
+            GOAL, holder='dispatch_goal:c') == 4, \
+            "the parked spark was not retried by the goal's next release"
+    assert goal.spark_spent == 103
+    assert budget_gate.held_reservation(GOAL) == 3, \
+        "another holder's live reservation was given back"
+
+
+def test_spark_being_given_back_still_counts_as_held_until_written():
+    """The release took the hold out before its write, so a settle running
+    meanwhile read the reservation as work and completed the goal (review
+    of 4bb3bbae0, finding 2)."""
+    goal = Goal(spent=100)
+    with patch('integrations.social.models.get_db', return_value=_db(goal)):
+        budget_gate.check_goal_budget(GOAL, 4, holder='expert:a')
+    seen = {}
+
+    def _row_while_writing():
+        seen['held'] = budget_gate.held_reservation(GOAL)
+        seen['on_work'] = budget_gate.spark_spent_on_work(
+            GOAL, goal.spark_spent)
+        return goal
+
+    db = MagicMock()
+    db.query.return_value.filter_by.return_value.with_for_update \
+        .return_value.first.side_effect = _row_while_writing
+    with patch('integrations.social.models.get_db', return_value=db):
+        assert budget_gate.release_goal_reservations(
+            GOAL, holder='expert:a') == 4
+    assert seen == {'held': 4, 'on_work': 100}
+    assert goal.spark_spent == 100
+    assert budget_gate.held_reservation(GOAL) == 0
+
+
+class _Interrupted(BaseException):
+    """Stands in for KeyboardInterrupt / SystemExit inside a release."""
+
+
+def test_an_interrupted_release_parks_the_spark_and_re_raises():
+    """The hold moved to 'being given back' and was never put back when an
+    interrupt hit before the ledger update: held for good and never retried
+    (review of 25d31fc1d, item 2)."""
+    goal = Goal(spent=100)
+    with patch('integrations.social.models.get_db', return_value=_db(goal)):
+        budget_gate.check_goal_budget(GOAL, 4, holder='expert:a')
+    boom = MagicMock()
+    boom.query.side_effect = _Interrupted('interrupted mid-release')
+    with patch('integrations.social.models.get_db', return_value=boom), \
+            pytest.raises(_Interrupted):
+        budget_gate.release_goal_reservations(GOAL, holder='expert:a')
+    assert budget_gate.held_reservation(GOAL) == 4
+    with patch('integrations.social.models.get_db', return_value=_db(goal)):
+        assert budget_gate.retry_unreleased_reservations() == 4
+    assert goal.spark_spent == 100
+    assert budget_gate.held_reservation(GOAL) == 0
+
+
+def test_a_close_that_fails_after_the_commit_gives_back_once():
+    """The commit stood, so the spark is back; parking it as well gave it
+    back twice (spent 96; review of 25d31fc1d, item 3)."""
+    goal = Goal(spent=100)
+    with patch('integrations.social.models.get_db', return_value=_db(goal)):
+        budget_gate.check_goal_budget(GOAL, 4, holder='expert:a')
+    bad_close = _db(goal)
+    bad_close.close.side_effect = RuntimeError('connection reset after commit')
+    with patch('integrations.social.models.get_db', return_value=bad_close):
+        assert budget_gate.release_goal_reservations(
+            GOAL, holder='expert:a') == 4
+    with patch('integrations.social.models.get_db', return_value=_db(goal)):
+        assert budget_gate.retry_unreleased_reservations() == 0
+    assert goal.spark_spent == 100
+    assert budget_gate.held_reservation(GOAL) == 0
+
+
+def test_the_tick_retry_gives_back_parked_spark_only():
+    goal = Goal(spent=100)
+    with patch('integrations.social.models.get_db', return_value=_db(goal)):
+        budget_gate.check_goal_budget(GOAL, 4, holder='expert:a')
+        budget_gate.invalidate_goal_budget_cache()
+        budget_gate.check_goal_budget(GOAL, 3, holder='expert:live')
+    broken = MagicMock()
+    broken.query.side_effect = RuntimeError('database is locked')
+    with patch('integrations.social.models.get_db', return_value=broken):
+        budget_gate.release_goal_reservations(GOAL, holder='expert:a')
+    with patch('integrations.social.models.get_db', return_value=_db(goal)):
+        assert budget_gate.retry_unreleased_reservations() == 4
+    assert goal.spark_spent == 103
+    assert budget_gate.held_reservation(GOAL) == 3, \
+        "the retry gave back a live holder's reservation"
+
+
 FAILED = ("I couldn't finish that: Error code: 400 - {'error': {'message': "
           "'Reasoning is mandatory for this endpoint and cannot be disabled.', "
           "'code': 400}}")

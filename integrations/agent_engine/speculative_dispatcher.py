@@ -247,7 +247,8 @@ def _capability_summary_safe() -> str:
 def expert_reservation_holder(speculation_id: str) -> str:
     """The name the expert's goal-budget reservation is held under: made in
     _schedule_expert_background, given back when its background task ends."""
-    return f'expert:{speculation_id}'
+    from .budget_gate import reservation_holder
+    return reservation_holder('expert', speculation_id)
 
 
 class SpeculativeDispatcher:

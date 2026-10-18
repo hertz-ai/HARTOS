@@ -373,14 +373,24 @@ def test_real_work_after_a_failed_release_still_completes_the_goal():
     assert first.finish(db=broken) == 0
     assert budget_gate.held_reservation(GOAL) == 4
 
+    # The retry at the start of the next tick finds the database still
+    # locked, so the 4 spark are still held when that tick takes its snapshot.
+    retry = budget_gate.retry_unreleased_reservations
+
+    def retry_while_locked():
+        with patch('integrations.social.models.get_db', return_value=broken):
+            return retry()
     second = _Speculator(goal, REAL, work=2)
-    tick(goal, second, progress=None)
+    tick(goal, second, progress=None,
+         extra=[patch.object(budget_gate, 'retry_unreleased_reservations',
+                             side_effect=retry_while_locked)])
+    assert broken.query.call_count == 2, 'the tick did not retry the parked spark'
     assert goal.status == 'completed', (
         f"real work after a failed release was judged a noop: "
         f"noop={goal.config_json.get('noop_dispatch_count')} "
         f"spent={goal.spark_spent}")
-    second.finish()
-    first.finish()
+    # The second expert's release also retries the first's parked spark.
+    assert second.finish() == 8
     assert goal.spark_spent == 106
     assert budget_gate.held_reservation(GOAL) == 0
 
@@ -471,3 +481,68 @@ def test_the_daemon_leaves_a_running_experts_reservation_to_the_expert():
         d._expert_pool.run()
     assert goal.spark_spent == 104
     assert budget_gate.held_reservation(GOAL) == 0
+
+
+def test_parked_spark_is_retried_so_a_waiting_goal_dispatches_again():
+    """A failed release parks its spark for the goal's next release, but a
+    goal short only of held spark waits and makes no release of its own:
+    without the retry at the start of the tick it waited for good (review
+    of 25d31fc1d, item 5)."""
+    goal = Goal(spark=100)
+    goal.spark_budget = 116
+    with patch('integrations.social.models.get_db',
+               return_value=_row_db(goal)):
+        budget_gate.check_goal_budget(GOAL, 4, holder='expert:old')
+    broken = MagicMock()
+    broken.query.side_effect = RuntimeError('database is locked')
+    with patch('integrations.social.models.get_db', return_value=broken):
+        budget_gate.release_goal_reservations(GOAL, holder='expert:old')
+    assert (goal.spark_spent, budget_gate.held_reservation(GOAL)) == (104, 4)
+
+    spec = _Speculator(goal, REAL)
+    tick(goal, spec, progress=None,
+         extra=[patch('integrations.agent_engine.budget_gate.'
+                      'estimate_llm_cost_spark', return_value=16)])
+    assert spec.calls == 1, 'the goal waited on spark nobody would give back'
+    assert goal.status == 'active'
+    spec.finish()
+    assert goal.spark_spent == 100
+    assert budget_gate.held_reservation(GOAL) == 0
+
+
+def test_a_running_experts_reservation_does_not_pause_the_goal():
+    """The read-only budget pre-check compared the budget with spark_spent
+    including a running expert's reservation and paused the goal ('12 < 16')
+    though 16 was left once the expert gave its 4 back; a pause needs a
+    person to lift (review of 4bb3bbae0, finding 4, measured).  The goal
+    waits a tick instead and dispatches once the expert ends."""
+    from integrations.agent_engine.speculative_dispatcher import (
+        SpeculativeDispatcher)
+    goal = Goal(spark=100)
+    goal.spark_budget = 116
+    d = SpeculativeDispatcher(model_registry=_Registry())
+    d._expert_pool.shutdown(wait=False)
+    d._expert_pool = _Pool()
+    extra = [patch.object(d, '_dispatch_to_model', return_value=REAL),
+             patch.object(d, '_track_call_telemetry'),
+             patch.object(d, '_run_collapsed_expert_path'),
+             patch('integrations.agent_engine.budget_gate.'
+                   'estimate_llm_cost_spark', return_value=16)]
+    tick(goal, d, progress=None, extra=extra)
+    assert len(d._expert_pool.jobs) == 1
+    assert budget_gate.held_reservation(GOAL) == 4
+
+    tick(goal, d, progress=None, extra=extra)
+    assert goal.status == 'active', \
+        f"paused on a running expert's reservation: " \
+        f"{goal.config_json.get('pause_reason')}"
+    assert 'pause_reason' not in goal.config_json
+    assert len(d._expert_pool.jobs) == 1, 'no second turn while it waits'
+
+    with patch('integrations.social.models.get_db',
+               return_value=_row_db(goal)):
+        d._expert_pool.run()
+    d._expert_pool.jobs.clear()
+    tick(goal, d, progress=None, extra=extra)
+    assert len(d._expert_pool.jobs) == 1, \
+        'the goal dispatches again once the expert gave its spark back'

@@ -10,7 +10,9 @@ Functions:
   release_goal_reservations(goal_id, holder) — the holder gives its
                                        reservation back when its work ends
   check_platform_affordability() — 7-day net revenue check (cached 60s)
-  pre_dispatch_budget_gate(goal_id, prompt, model_name) — combined gate
+  pre_dispatch_budget_gate(goal_id, prompt, model_name, holder) — combined
+                                       gate, reserving under holder
+  reservation_holder(kind, ident) — the one naming rule for holders
 
 Pattern extracted from: speculative_dispatcher._check_and_reserve_budget() (lines 314-340)
 """
@@ -27,8 +29,9 @@ logger = logging.getLogger(__name__)
 # + new SQLite connection cycle is the dominant CPU consumer when many
 # goals × idle_agents fire in tight succession.  A short TTL is enough
 # to break the storm — within 10s the goal's row hasn't materially
-# changed (the other writers of spark_spent, release_goal_reservations and
-# charge_goal_work_completed, clear the goal's entry).  Burst
+# changed (release_goal_reservations and charge_goal_work_completed clear
+# the goal's entry; an admin edit through GoalManager.update_goal does not,
+# so a top-up there shows after the window).  Burst
 # under-counting is bounded: at most one un-deducted hit per goal per
 # TTL window.  Cache stores the FULL return tuple so callers see the
 # exact same shape they'd see from a fresh DB query.
@@ -271,9 +274,28 @@ def charge_goal_work_completed(prompt_id, actions_completed: int = 1) -> bool:
 # goal-wide release gave back the expert's reservation while the expert
 # still ran, and any caller's reservation to any other (review of
 # e8b6bf675, Q4 and P6).  Kept in process: the holder releases in the
-# process that reserved.
+# process that reserved.  A reservation made in another process (the stdio
+# MCP server's dispatch_goal) is spent as far as this process can tell until
+# it is given back; a settle here meanwhile reads less work than was done,
+# which judges a noop, never a completion.
+#
+# Two keys under a goal are not holders.  _RELEASING is spark a holder is
+# giving back whose write has not committed yet: still held, or a settle
+# running meanwhile reads the reservation as work (review of 4bb3bbae0,
+# finding 2).  _UNRELEASED is spark whose write failed: every holder is
+# unique per call, so it would never be released again under its own name;
+# the goal's next release, by any holder, retries it (finding 1).
 _held_reservations: Dict[str, Dict[str, int]] = {}
 _held_lock = threading.Lock()
+_RELEASING = '\x00releasing'
+_UNRELEASED = '\x00unreleased'
+
+
+def reservation_holder(kind: str, ident: str) -> str:
+    """The name a reservation is held under: what reserved it, and which
+    call of it.  dispatch_goal names one per turn, the speculative expert
+    one per speculation."""
+    return f'{kind}:{ident}'
 
 
 def _hold(goal_id, amount: int, holder: Optional[str] = None) -> None:
@@ -316,20 +338,28 @@ def release_goal_reservations(goal_id, holder: Optional[str] = None) -> int:
 
     Its own short transaction, row-locked like the reservation, so a
     concurrent work charge is never overwritten.  Never takes spark_spent
-    below zero.  The hold is taken out of the ledger before the write, so
-    two releases at once give it back once (review of e8b6bf675, P5).  On a
-    database error it is put back for the next release and 0 is returned.
-    A hold whose goal row is gone is dropped and 0 returned: nothing was
-    given back.  Returns the spark given back.
+    below zero.  The holder's hold moves to _RELEASING before the write, so
+    two releases at once give it back once (review of e8b6bf675, P5), and it
+    still counts as held until the write commits.  Spark an earlier release
+    could not write (_UNRELEASED) is retried with this one.  On a database
+    error the whole amount is parked for the goal's next release and 0 is
+    returned.  A hold whose goal row is gone is dropped and 0 returned:
+    nothing was given back.  Returns the spark given back.
+
+    Between the commit and the ledger update a settle can read spark_spent
+    already lowered while the spark still counts as held: less work than
+    was done, judged a noop, never a completion.
     """
     key, who = str(goal_id), holder or ''
     with _held_lock:
-        mine = _held_reservations.get(key, {})
-        amount = mine.pop(who, 0)
+        mine = _held_reservations.get(key)
         if not mine:
-            _held_reservations.pop(key, None)
-    if amount <= 0:
-        return 0
+            return 0
+        amount = mine.pop(who, 0) + mine.pop(_UNRELEASED, 0)
+        if amount <= 0:
+            return 0
+        mine[_RELEASING] = mine.get(_RELEASING, 0) + amount
+    written, goal = False, None
     try:
         from integrations.social.models import get_db, AgentGoal
         db = get_db()
@@ -339,12 +369,35 @@ def release_goal_reservations(goal_id, holder: Optional[str] = None) -> int:
             if goal is not None:
                 goal.spark_spent = max(0, (goal.spark_spent or 0) - amount)
                 db.commit()
+            written = True
         finally:
             db.close()
     except Exception as e:
-        _hold(key, amount, holder)
-        logger.warning("Spark reserved for goal %s not given back yet "
-                       "(retried at its next release): %s", goal_id, e)
+        if written:
+            # The commit stood; only closing the session failed.  The spark
+            # is back, so it is not parked to be given back a second time.
+            logger.debug("Session close failed after giving back spark for "
+                         "goal %s: %s", goal_id, e)
+        else:
+            logger.warning("Spark reserved for goal %s not given back yet "
+                           "(kept for the goal's next release): %s",
+                           goal_id, e)
+    finally:
+        # Also on an interrupt (KeyboardInterrupt, SystemExit): an amount
+        # left under _RELEASING would count as held forever and never be
+        # retried (review of 25d31fc1d, item 2).
+        with _held_lock:
+            mine = _held_reservations.setdefault(key, {})
+            left = mine.get(_RELEASING, 0) - amount
+            if left > 0:
+                mine[_RELEASING] = left
+            else:
+                mine.pop(_RELEASING, None)
+            if not written:
+                mine[_UNRELEASED] = mine.get(_UNRELEASED, 0) + amount
+            if not mine:
+                _held_reservations.pop(key, None)
+    if not written:
         return 0
     invalidate_goal_budget_cache(goal_id)
     if goal_id != key:
@@ -354,6 +407,24 @@ def release_goal_reservations(goal_id, holder: Optional[str] = None) -> int:
                     "exists", goal_id)
         return 0
     return amount
+
+
+def retry_unreleased_reservations() -> int:
+    """Retry giving back spark whose earlier release could not be written,
+    for every goal.
+
+    Any release on the goal retries it, but a goal waiting for held spark
+    makes no new dispatch and so no new release of its own.  The agent
+    daemon calls this at the start of each tick, before it opens the tick's
+    long session, so the write does not wait on that session's lock.
+    Returns the spark given back."""
+    with _held_lock:
+        goals = [k for k, mine in _held_reservations.items()
+                 if mine.get(_UNRELEASED, 0) > 0]
+    # _UNRELEASED is never a real holder, so each release takes only the
+    # parked amount and no holder's live reservation.
+    return sum(release_goal_reservations(k, holder=_UNRELEASED)
+               for k in goals)
 
 
 def invalidate_goal_budget_cache(goal_id: Optional[str] = None) -> None:

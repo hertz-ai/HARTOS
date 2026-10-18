@@ -1539,18 +1539,22 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
     the reservation, raised): the reservation is a pre-check, not work.
     Every caller is covered, the daemons and the stdio MCP server alike.
     """
-    holder = f'dispatch_goal:{uuid.uuid4().hex[:12]}'
+    try:
+        from integrations.agent_engine.budget_gate import (
+            release_goal_reservations, reservation_holder)
+    except ImportError:
+        release_goal_reservations = reservation_holder = None
+    holder = (reservation_holder('dispatch_goal', uuid.uuid4().hex[:12])
+              if reservation_holder is not None else None)
     try:
         return _dispatch_goal_turn(prompt, user_id, goal_id, goal_type,
                                    model_config, holder)
     finally:
-        try:
-            from integrations.agent_engine.budget_gate import (
-                release_goal_reservations)
-            release_goal_reservations(goal_id, holder=holder)
-        except ImportError:
+        if release_goal_reservations is None:
             logger.debug('budget_gate not importable; nothing to give back '
                          'for goal %s', goal_id)
+        else:
+            release_goal_reservations(goal_id, holder=holder)
 
 
 def _dispatch_goal_turn(prompt: str, user_id: str, goal_id: str,

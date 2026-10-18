@@ -1602,6 +1602,15 @@ class AgentDaemon:
         speculative_enabled = os.environ.get(
             'HEVOLVE_SPECULATIVE_ENABLED', 'false').lower() == 'true'
 
+        # Spark an earlier release could not write is retried before this
+        # tick's session opens: a goal waiting for held spark makes no new
+        # release of its own (review of 25d31fc1d, item 5).
+        try:
+            from .budget_gate import retry_unreleased_reservations
+            retry_unreleased_reservations()
+        except ImportError:
+            pass
+
         db = get_db()
         try:
             # Settlement pays operators for compute they served other people
@@ -1846,12 +1855,23 @@ class AgentDaemon:
                             continue
 
                     # Read-only check: compare remaining budget vs estimated cost
-                    # without reserving (no spark_spent increment)
+                    # without reserving (no spark_spent increment).  The pause
+                    # is decided on the spark spent on work: a reservation
+                    # still held by running work (a speculative expert) comes
+                    # back when that work ends, so a shortfall it alone causes
+                    # waits a tick instead of pausing the goal, which needs a
+                    # person to lift (review of 4bb3bbae0, finding 4).
+                    from .budget_gate import spark_spent_on_work
                     budget = goal.spark_budget or 0
-                    spent = goal.spark_spent or 0
+                    spent = spark_spent_on_work(goal_key, goal.spark_spent)
                     estimated = estimate_llm_cost_spark(prompt, _resolve_model_name('gpt-4o'))
                     bg_allowed = (budget - spent) >= estimated
                     bg_reason = f'insufficient_budget ({budget - spent} < {estimated})' if not bg_allowed else ''
+                    if bg_allowed and (budget - (goal.spark_spent or 0)) < estimated:
+                        logger.info(
+                            f"Goal {goal_key}: waiting for spark held by "
+                            f"running work before its next dispatch")
+                        continue
                     if not bg_allowed:
                         # Immediately pause — budget won't change between daemon
                         # ticks, so retrying is wasteful.
