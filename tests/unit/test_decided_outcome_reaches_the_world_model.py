@@ -23,6 +23,7 @@ Each check: {what, check, expected, tolerance 0 (exact invariant)}.
 """
 import logging
 import os
+import threading
 import uuid
 from unittest import mock
 
@@ -148,51 +149,121 @@ def test_an_unreachable_world_model_never_costs_the_decision(db, monkeypatch):
     assert (e.status, e.decision_outcome) == ('decided', 'Rejected')
 
 
-def _offline_bridge(url='http://localhost:8000'):
-    b = WorldModelBridge()
-    b._in_process = False
-    b._api_url = url
-    return b
+@pytest.fixture
+def offline(monkeypatch):
+    """A real WorldModelBridge that can reach nothing.  Built with no
+    HEVOLVEAI_API_URL and no in-process load, so its constructor disables
+    HTTP and starts no inbound poller (with the variable set, that poller
+    GETs the URL every 10 s -- on the owner's desktop, production :8000;
+    review of aa37aa4ab).  The tests below replace ingest_sensor_batch, the
+    only sender, and re-enable HTTP on the instance for the code under test
+    to run; the URL points at a closed port."""
+    monkeypatch.delenv('HEVOLVEAI_API_URL', raising=False)
+    monkeypatch.setattr(WorldModelBridge, '_init_in_process', lambda self: None)
+
+    def make(url='http://127.0.0.1:9'):
+        b = WorldModelBridge()
+        assert b._http_disabled, 'the constructor must not have armed HTTP'
+        b._http_disabled = False
+        b._api_url = url
+        return b
+    return make
 
 
-def test_the_bridge_sends_claim_then_decision_in_a_session_of_their_own():
+def _recording(bridge):
+    """Replace the one sender; record what it got and on which thread."""
+    sent = []
+
+    def _ingest(readings):
+        sent.append({'readings': readings,
+                     'thread': threading.current_thread().name})
+        return len(readings)
+    bridge.ingest_sensor_batch = _ingest
+    return sent
+
+
+def test_the_bridge_sends_claim_then_decision_in_a_session_of_their_own(offline):
     """what: the bridge's half; check: ONE batch, two text readings in
     order, both in a session named for this decision only; expected: the
     claim pairs with the decision and with nothing else."""
-    b = _offline_bridge()
-    sent = []
-    b.ingest_sensor_batch = lambda readings: sent.append(readings) or len(readings)
+    b = offline()
+    sent = _recording(b)
     fut = b.ingest_decided_experiment(
         experiment_id='e1', creator_id='u1', claim='the claim',
         decision='Adopted', decided_at='2026-10-19T09:00:00')
     assert fut.result(timeout=10) == 2
     assert len(sent) == 1
-    texts = [r['data']['text'] for r in sent[0]]
-    assert texts == ['the claim', 'Adopted']
-    sids = {r['sensor_id'] for r in sent[0]}
-    assert sids == {'thought_experiment_e1_2026-10-19T09:00:00'}
-    assert {r['sensor_type'] for r in sent[0]} == {'text'}
-    assert {r['data']['stream_source'] for r in sent[0]} == {
+    readings = sent[0]['readings']
+    assert [r['data']['text'] for r in readings] == ['the claim', 'Adopted']
+    assert {r['sensor_id'] for r in readings} == {
+        'thought_experiment_e1_2026-10-19T09:00:00'}
+    assert {r['sensor_type'] for r in readings} == {'text'}
+    assert {r['data']['stream_source'] for r in readings} == {
         'thought_experiment'}
 
 
-def test_a_cloud_world_model_needs_the_creators_consent(monkeypatch):
+def test_the_feed_never_runs_on_the_deciding_thread(offline):
+    """what: where the send runs; expected: on the bridge's flush executor,
+    so a slow world model (up to 2 x 15 s on timeouts) never delays the
+    admin's /decide response."""
+    b = offline()
+    sent = _recording(b)
+    b.ingest_decided_experiment(
+        experiment_id='e1', creator_id='u1', claim='c', decision='d',
+        decided_at='t').result(timeout=10)
+    assert sent[0]['thread'] != threading.current_thread().name
+    assert sent[0]['thread'].startswith('wm_flush')
+
+
+def test_secrets_in_the_claim_or_decision_never_leave(offline):
+    """what: a key pasted into a hypothesis and a password in the decision
+    (review of aa37aa4ab measured both posted word for word); expected: the
+    redactor masked both before the send."""
+    b = offline()
+    sent = _recording(b)
+    key = 'sk-ant-' + 'A1b2C3d4' * 6
+    b.ingest_decided_experiment(
+        experiment_id='e1', creator_id='u1',
+        claim=f'Rotate the cache key {key} weekly',
+        decision='Adopted; password=hunter2hunter2', decided_at='t',
+    ).result(timeout=10)
+    texts = ' '.join(r['data']['text'] for r in sent[0]['readings'])
+    assert key not in texts
+    assert 'hunter2hunter2' not in texts
+
+
+def test_a_text_the_constitutional_filter_refuses_sends_nothing(offline,
+                                                               monkeypatch):
+    """what: the filter refuses the decision; expected: nothing queued,
+    nothing sent (submit_correction's rule for what it sends)."""
+    from security.hive_guardrails import ConstitutionalFilter
+    monkeypatch.setattr(
+        ConstitutionalFilter, 'check_prompt',
+        staticmethod(lambda text: (text != 'refused text', 'blocked')))
+    b = offline()
+    sent = _recording(b)
+    assert b.ingest_decided_experiment(
+        experiment_id='e1', creator_id='u1', claim='fine claim',
+        decision='refused text', decided_at='t') is None
+    assert sent == []
+
+
+def test_a_cloud_world_model_needs_the_creators_consent(offline, monkeypatch):
     """what: a non-local target, the creator has not consented; expected:
     nothing queued, nothing sent."""
-    b = _offline_bridge('https://world-model.example.invalid')
+    b = offline('https://world-model.example.invalid')
     monkeypatch.setattr(b, '_has_cloud_consent', lambda uid: False)
-    sent = []
-    b.ingest_sensor_batch = lambda readings: sent.append(readings) or 0
+    sent = _recording(b)
     assert b.ingest_decided_experiment(
         experiment_id='e1', creator_id='u1', claim='c', decision='d',
         decided_at='t') is None
     assert sent == []
 
 
-def test_a_feed_that_does_not_arrive_is_said(caplog):
+def test_a_feed_that_does_not_arrive_is_said(offline, caplog):
     """what: the world model accepts fewer readings than were sent (circuit
     open, HTTP refused); expected: a warning naming the experiment."""
-    b = _offline_bridge()
+    b = offline()
     b.ingest_sensor_batch = lambda readings: 0
     with caplog.at_level(logging.WARNING):
         fut = b.ingest_decided_experiment(

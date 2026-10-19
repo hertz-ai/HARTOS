@@ -713,16 +713,40 @@ class WorldModelBridge:
             logger.debug("[WorldModelBridge] chat-learning consent check failed "
                          "(user=%s): %s", user_id, e)
             return
-        reading = {
-            'sensor_id': f'chat_{user_id}',
-            'sensor_type': 'text',
-            'data': {'text': text,
-                     'stream_source': _utterance_source(user_type)},
-        }
+        reading = self._text_reading(f'chat_{user_id}', text,
+                                     _utterance_source(user_type))
         try:
             self._flush_executor.submit(self.ingest_sensor_batch, [reading])
         except Exception as e:
             logger.debug("[WorldModelBridge] chat-learning submit skipped: %s", e)
+
+    @staticmethod
+    def _text_reading(sensor_id: str, text: str, stream_source: str) -> dict:
+        """The one shape of a 'text' sensor reading, as ingest_sensor_batch's
+        text branch reads it."""
+        return {'sensor_id': sensor_id, 'sensor_type': 'text',
+                'data': {'text': text, 'stream_source': stream_source}}
+
+    @staticmethod
+    def _screened_text(text: str) -> Optional[str]:
+        """Text bound for the world model, through the two gates
+        submit_correction applies to what it sends: the constitutional filter
+        (None when it refuses) and the secret redactor."""
+        try:
+            from security.hive_guardrails import ConstitutionalFilter
+            passed, _ = ConstitutionalFilter.check_prompt(text)
+            if not passed:
+                return None
+        except ImportError:
+            logger.warning("[WorldModelBridge] ConstitutionalFilter unavailable; "
+                           "text NOT constitution-checked")
+        try:
+            from security.secret_redactor import redact_secrets
+            text, _ = redact_secrets(text)
+        except ImportError:
+            logger.warning("[WorldModelBridge] secret_redactor unavailable; "
+                           "text NOT redacted")
+        return text
 
     def ingest_decided_experiment(self, experiment_id: str, creator_id: str,
                                   claim: str, decision: str, decided_at: str):
@@ -737,13 +761,20 @@ class WorldModelBridge:
         i.e. whatever chat turn it saw last, so a decision fed there would
         teach an unrelated state -> the decision text.
 
-        A cloud world model gets it only with the creator's cloud data
-        consent (submit_correction's rule); a local one always.  Runs on the
-        flush executor, never on the caller's thread, like the utterance
+        Both texts pass the constitutional filter and the secret redactor
+        (_screened_text) before anything leaves; a refused text sends
+        nothing.  A cloud world model gets it only with the creator's cloud
+        data consent (submit_correction's rule); a local one always.  Runs on
+        the flush executor, never on the caller's thread, like the utterance
         feed above.  Returns the Future (its result is how many readings the
         world model accepted), or None when nothing was queued.
         """
         if not claim or not decision:
+            return None
+        screened = [self._screened_text(t) for t in (claim, decision)]
+        if any(t is None for t in screened):
+            logger.info("[WorldModelBridge] decided experiment %s not sent: "
+                        "the constitutional filter refused it", experiment_id)
             return None
         if self._is_external_target() and not self._has_cloud_consent(
                 str(creator_id)):
@@ -751,9 +782,8 @@ class WorldModelBridge:
                         "the creator has no cloud data consent", experiment_id)
             return None
         sid = f'thought_experiment_{experiment_id}_{decided_at}'
-        readings = [{'sensor_id': sid, 'sensor_type': 'text',
-                     'data': {'text': text, 'stream_source': 'thought_experiment'}}
-                    for text in (claim, decision)]
+        readings = [self._text_reading(sid, t, 'thought_experiment')
+                    for t in screened]
 
         def _feed() -> int:
             accepted = self.ingest_sensor_batch(readings)

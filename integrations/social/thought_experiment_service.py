@@ -35,7 +35,6 @@ VALID_DECISION_TYPES = ['majority', 'weighted', 'consensus', 'expert_panel']
 VOTE_RANGE = (-2, 2)  # Strongly oppose to strongly support
 
 
-
 def _feed_decision_to_world_model(**decision) -> None:
     """After decide() commits: hand the outcome to the world model bridge,
     which queues it off this thread.  A missing or failing bridge never
@@ -50,6 +49,7 @@ def _feed_decision_to_world_model(**decision) -> None:
         logger.warning("decided experiment %s: outcome not fed to the world "
                        "model (%s)", decision.get('experiment_id'),
                        type(e).__name__)
+
 
 class ThoughtExperimentService:
     """Manages constitutional thought experiment lifecycle."""
