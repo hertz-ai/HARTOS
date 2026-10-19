@@ -724,6 +724,53 @@ class WorldModelBridge:
         except Exception as e:
             logger.debug("[WorldModelBridge] chat-learning submit skipped: %s", e)
 
+    def ingest_decided_experiment(self, experiment_id: str, creator_id: str,
+                                  claim: str, decision: str, decided_at: str):
+        """A decided thought experiment, as ONE text transition the world
+        model learns: the experiment's claim, then what was decided.
+
+        Both readings share a session no other reading uses (named for this
+        decision), and the sensor-ingest endpoint pairs consecutive readings
+        of a session, so what is learned is keyed on this experiment's own
+        words.  Not submit_correction: /v1/corrections keys a correction on
+        the server's LAST sensor encoding (hevolveai receive_correction),
+        i.e. whatever chat turn it saw last, so a decision fed there would
+        teach an unrelated state -> the decision text.
+
+        A cloud world model gets it only with the creator's cloud data
+        consent (submit_correction's rule); a local one always.  Runs on the
+        flush executor, never on the caller's thread, like the utterance
+        feed above.  Returns the Future (its result is how many readings the
+        world model accepted), or None when nothing was queued.
+        """
+        if not claim or not decision:
+            return None
+        if self._is_external_target() and not self._has_cloud_consent(
+                str(creator_id)):
+            logger.info("[WorldModelBridge] decided experiment %s not sent: "
+                        "the creator has no cloud data consent", experiment_id)
+            return None
+        sid = f'thought_experiment_{experiment_id}_{decided_at}'
+        readings = [{'sensor_id': sid, 'sensor_type': 'text',
+                     'data': {'text': text, 'stream_source': 'thought_experiment'}}
+                    for text in (claim, decision)]
+
+        def _feed() -> int:
+            accepted = self.ingest_sensor_batch(readings)
+            if accepted < len(readings):
+                logger.warning(
+                    "[WorldModelBridge] decided experiment %s: %d of %d "
+                    "readings reached the world model", experiment_id,
+                    accepted, len(readings))
+            return accepted
+
+        try:
+            return self._flush_executor.submit(_feed)
+        except Exception as e:
+            logger.warning("[WorldModelBridge] decided experiment %s not "
+                           "queued: %s", experiment_id, e)
+            return None
+
     @staticmethod
     def _validated_training_signal(verification: dict) -> bool:
         """Accept only evidence-backed outcomes into response training.

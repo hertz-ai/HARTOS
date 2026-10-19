@@ -18,6 +18,8 @@ from typing import Dict, List, Optional
 from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
+from .models import after_commit
+
 logger = logging.getLogger('hevolve_social')
 
 # ─── Constants ───
@@ -32,6 +34,22 @@ VALID_INTENT_CATEGORIES = [
 VALID_DECISION_TYPES = ['majority', 'weighted', 'consensus', 'expert_panel']
 VOTE_RANGE = (-2, 2)  # Strongly oppose to strongly support
 
+
+
+def _feed_decision_to_world_model(**decision) -> None:
+    """After decide() commits: hand the outcome to the world model bridge,
+    which queues it off this thread.  A missing or failing bridge never
+    costs the decision; it is said."""
+    try:
+        from integrations.agent_engine.world_model_bridge import (
+            get_world_model_bridge)
+        bridge = get_world_model_bridge()
+        if bridge:
+            bridge.ingest_decided_experiment(**decision)
+    except Exception as e:
+        logger.warning("decided experiment %s: outcome not fed to the world "
+                       "model (%s)", decision.get('experiment_id'),
+                       type(e).__name__)
 
 class ThoughtExperimentService:
     """Manages constitutional thought experiment lifecycle."""
@@ -797,41 +815,29 @@ class ThoughtExperimentService:
 
         experiment.status = 'decided'
         experiment.decision_outcome = decision_text
+        decided_at = datetime.utcnow().isoformat()
         experiment.decision_rationale = {
             'tally': tally,
             'agent_evaluations': experiment.agent_evaluations_json or [],
-            'decided_at': datetime.utcnow().isoformat(),
+            'decided_at': decided_at,
         }
         db.flush()
 
-        # Feed to WorldModelBridge (RL-EF): the claim the experiment made
-        # (expected outcome) and what was decided, through the bridge's real
-        # signature.  This used to pass ONE dict, which raised TypeError on
-        # every decision and the bare except hid it: no decided experiment
-        # ever reached the world model (hevolveai Master 11.462 H).  Only the
-        # aggregate tally leaves: `suggestions` carries voter ids and their
-        # free text, which stay in this database.
-        try:
-            from integrations.agent_engine.world_model_bridge import get_world_model_bridge
-            bridge = get_world_model_bridge()
-            if bridge:
-                aggregate = {k: tally.get(k) for k in (
-                    'total_votes', 'human_votes', 'agent_votes', 'total_for',
-                    'total_against', 'weighted_score', 'distinct_voters',
-                    'distinct_supporters', 'quorum_met', 'decision_context',
-                    'decision_recommendation')}
-                bridge.submit_correction(
-                    original_response=(experiment.expected_outcome
-                                       or experiment.hypothesis or ''),
-                    corrected_response=decision_text,
-                    expert_id='thought_experiment_decision',
-                    explanation=experiment.hypothesis,
-                    context={'type': 'thought_experiment_outcome',
-                             'experiment_id': experiment_id,
-                             'tally': aggregate})
-        except Exception as e:
-            logger.warning("decide %s: outcome not fed to the world model "
-                           "(%s)", experiment_id, type(e).__name__)
+        # Feed the outcome to the world model ONCE THE DECISION IS DURABLE
+        # (models.after_commit): never between this flush and the caller's
+        # commit, where the bridge call would hold SQLite's one write lock for
+        # its whole timeout, and never for a decision that rolls back.  It
+        # used to call submit_correction with ONE dict, which raised TypeError
+        # on every decision, so no decided experiment ever reached the world
+        # model (hevolveai Master 11.462 H).  Only the claim and the decision
+        # leave; the tally's voter ids and suggestions stay here.
+        claim = experiment.hypothesis or experiment.title or ''
+        if experiment.expected_outcome:
+            claim = f'{claim}\nExpected outcome: {experiment.expected_outcome}'
+        feed = dict(experiment_id=experiment_id,
+                    creator_id=str(experiment.creator_id), claim=claim,
+                    decision=decision_text, decided_at=decided_at)
+        after_commit(db, lambda: _feed_decision_to_world_model(**feed))
 
         return experiment.to_dict()
 
