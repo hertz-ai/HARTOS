@@ -84,10 +84,12 @@ assert set(GAME_STATE_DURATIONS) == set(GAME_STATES), (
 SUBMIT_COOLDOWN_S = 600
 
 
-def _submit_in_flight(record):
+def submit_in_flight(record):
     """A submit whose reply timed out, recent enough to still be queued.
     A time that is not a number is no submit, and says so: it raised out
-    of a keep (review of c67afc26e, F-2)."""
+    of a keep (review of c67afc26e, F-2).  The one reading of it, for the
+    matcher, a keep and bind_game_sound's cooldown (review of 14c6bbd5f,
+    F-C: bind read the field itself, unguarded)."""
     submitted = record.get('submitted_at')
     if not submitted or record.get('url'):
         return False
@@ -105,7 +107,7 @@ def _composing(record):
     or a submit still inside the cooldown.  The one reading of it, for the
     matcher's 'composing' and for what a keep ends."""
     return not record.get('url') and bool(
-        record.get('task_id') or _submit_in_flight(record))
+        record.get('task_id') or submit_in_flight(record))
 
 
 def game_state_key(state, level=None, variant=None):
@@ -130,6 +132,26 @@ def game_state_key(state, level=None, variant=None):
 #: it is), and a submit whose reply timed out.  A verdict over it carries
 #: them all; an ended job drops them all.
 IN_FLIGHT_FIELDS = ('task_id', 'task_since', 'task_take', 'submitted_at')
+
+#: What ``task_take`` names: the only fields a task picked up again lays
+#: over the call's own.
+TASK_LABELS = ('mood', 'prompt', 'variant')
+
+
+def task_labels(record):
+    """What this record's task was composed with, from ``task_take``: its
+    TASK_LABELS only, else {}.  Any other shape reads as none, with a
+    warning, never raised: read before the call's own guard, a raise
+    wedged the key for good, and extra keys overrode the take's state,
+    level and approval (review of 14c6bbd5f, F-A)."""
+    take = (record or {}).get('task_take')
+    if take is None:
+        return {}
+    if not isinstance(take, dict):
+        _log_corrupt(('task_take', take),
+                     "a game sound's task_take %r is not a record; read as none", take)
+        return {}
+    return {field: take[field] for field in TASK_LABELS if field in take}
 
 
 def ended_composition(record, reason, task_id=None):
@@ -471,8 +493,8 @@ def game_state_record(games, game_id, state, level=None):
 
     The one reader of the storage shape for every caller that needs the
     key's own record rather than what the game would play: a take a reviewer
-    turned down (rejected_take), a submit still in flight (agent_tools'
-    _pending_submit), and the note that submit writes, which must land ON
+    turned down (rejected_take), a submit still in flight (bind_game_sound's
+    cooldown), and the note that submit writes, which must land ON
     TOP of whichever of those is already there.  Before this each of them
     carried its own copy of the three lines below, and the copy in
     agent_tools was the fourth reader of a shape this module owns.
@@ -480,21 +502,46 @@ def game_state_record(games, game_id, state, level=None):
     return _record_at(games, game_id, game_state_key(state, level))
 
 
+def _latest_turned_down(record):
+    """The take this record holds as most lately turned down: its own
+    rejection, else, for a record with no take of its own (a job, or one
+    that ended), the last of the takes it carries as turned down."""
+    if record.get('rejected_at'):
+        return record
+    if record.get('url'):
+        return {}
+    takes = turned_down_takes(record)
+    return takes[-1] if takes else {}
+
+
+def _turned_down_when(take):
+    """When ``take`` was turned down, as a number; 0 when unknown."""
+    try:
+        return float(take.get('rejected_at') or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def rejected_take(games, game_id, state, level=None):
-    """The take a reviewer turned down for this key, if any: the level's
-    own, else the game's, which is the take the ladder played at that level.
+    """The complaint the next take at this key answers, if any: the newer
+    of the level's and the game's (the level's on a tie), each the take
+    its key holds as most lately turned down.
 
     Kept so the next composition can answer the reason they gave, and so a
     reviewer can go back to it (spec §6.1).  A verdict lands at the key the
     ladder matched, so a rejection given while a level played is the
     game's; read at the level's key alone, the level was then composed as
-    take 1 without the reason (review of 0c542e278).
+    take 1 without the reason (review of 0c542e278).  A job written at a
+    key replaces its rejection, carrying it as turned down: read at the top
+    of the record alone, a take composed after that job was lost or failed
+    asked for what was just turned down (review of 14c6bbd5f, F-B).
     """
-    for at in (level, None):
-        record = game_state_record(games, game_id, state, at)
-        if record.get('rejected_at'):
-            return record
-    return {}
+    found = {}
+    for key in dict.fromkeys((game_state_key(state, level), game_state_key(state))):
+        take = _latest_turned_down(_record_at(games, game_id, key))
+        if take and (not found or _turned_down_when(take) > _turned_down_when(found)):
+            found = take
+    return found
 
 
 def kept_since(record, since):

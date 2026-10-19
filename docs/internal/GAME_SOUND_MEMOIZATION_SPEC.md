@@ -150,9 +150,12 @@ wrong for the age. Three moments, three behaviours:
    stores the result as the next `variant`. The rejected artifact is kept
    (not deleted) so a reviewer can go back to it.  A verdict lands on the
    key the ladder matched, so a rejection given while a level played is
-   the game's; a level composed afterwards answers it too
-   (`core.game_sound_memo.rejected_take` reads the level's key, then the
-   game's).
+   the game's; a level composed afterwards answers it too.  The next take
+   answers the newer of the level's complaint and the game's, the level's
+   on a tie (`core.game_sound_memo.rejected_take`); a key whose rejection a
+   job replaced is read through the takes the job carries as turned down,
+   so a take composed after that job was lost or failed still answers the
+   reason (review of 14c6bbd5f, F-B).
 2. **In REUSE, by anyone but the agent's creator.** Their correction must
    not silently change what everyone else hears. It writes a memo **in
    their own store** (§5), at the key of the take they were hearing, which

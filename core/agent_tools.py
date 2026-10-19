@@ -265,7 +265,9 @@ from core.game_sound_memo import (  # noqa: E402
     rejected_take,
     set_game_state_sound,
     set_game_state_sound_at,
+    submit_in_flight,
     take_variant,
+    task_labels,
 )
 
 
@@ -279,18 +281,6 @@ from core.game_sound_memo import SUBMIT_COOLDOWN_S  # noqa: E402,F401
 #: id exactly as it answers a queued one (hartos-3a F2).  The slowest job
 #: MEASURED on a shared GPU averaged 907 s; twice that is past any real job.
 TASK_STALE_S = 1800
-
-
-def _pending_submit(games, game_id, state, level=None):
-    """When this state's last submit went out with no id learned, else None.
-
-    A record with 'submitted_at' and neither 'url' nor 'task_id' is a submit
-    whose reply timed out.  The ladder ignores it (nothing to play, nothing to
-    poll), so it is read at its own key."""
-    record = game_state_record(games, game_id, state, level)
-    if record.get('url') or record.get('task_id'):
-        return None
-    return record.get('submitted_at')
 
 
 def offer_sound_for_review(user_id, prompt_id, game_id, state, record):
@@ -1009,7 +999,7 @@ def build_core_tool_closures(ctx):
         # ed6576624, F3).
         task_id = bound.get('task_id')
         labels = {'mood': mood, 'prompt': prompt, 'variant': variant}
-        resumed = dict(bound.get('task_take') or {}) if task_id else {}
+        resumed = task_labels(bound) if task_id else {}
 
         def _take(**fields):
             """This call's take as a record, ``fields`` on top; a task picked up
@@ -1060,8 +1050,9 @@ def build_core_tool_closures(ctx):
                 # own orphans.  /release_task takes no idempotency key, so
                 # the only dedupe is here: after a timed-out submit, do not
                 # submit again for this state until a cooldown has passed.
-                _pending = _pending_submit(_memo(), slot, which, level)
-                if _pending and time.time() - _pending < SUBMIT_COOLDOWN_S:
+                # One reading of it, the memo's, guarded (review of 14c6bbd5f, F-C).
+                pending = game_state_record(_memo(), slot, which, level)
+                if not pending.get('task_id') and submit_in_flight(pending):
                     return json.dumps({
                         'status': 'composing',
                         'game_id': slot,

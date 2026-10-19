@@ -1847,14 +1847,123 @@ def test_a_level_retake_finished_on_a_later_call_is_bound_as_composed(store_dir)
             patch('time.sleep', lambda *_a, **_k: None), \
             patch.object(agent_tools.time, 'time', lambda: real_time() + later['s']):
         first = json.loads(tools['bind_game_sound']('eng-01', 'calm', 'spelling', 'bgm', '3'))
-        done = json.loads(tools['bind_game_sound']('eng-01', 'calm', 'spelling', 'bgm', '3'))
+        # the call that finishes it asks in another mood (review of 14c6bbd5f, MX5)
+        done = json.loads(tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'bgm', '3'))
 
     assert first['status'] == 'composing', first
     assert (done['status'], done['music']['url']) == ('bound', 'https://node/retake.mp3'), done
     assert done['music']['variant'] == 3, done
+    assert done['music']['mood'] == 'calm', done
     assert 'too slow' in done['music']['prompt'], done
     assert 'too loud' not in done['music']['prompt'], done
     assert media.generate_media.call_count == 1
+
+
+@pytest.mark.parametrize('task_take', [
+    'not a record',
+    ['not', 'pairs'],
+    {'state': 'wrong', 'level': '9', 'approved_at': 5.0, 'prompt': 'composed for this',
+     'variant': 4, 'mood': 'calm'},
+], ids=['text', 'list', 'extra_keys'])
+def test_a_task_take_of_the_wrong_shape_neither_wedges_nor_rewrites_the_take(task_take):
+    """task_take was read with dict() before the call's own guard: a value
+    of another shape raised on every call for that key, for good, and a dict
+    with extra keys overrode the take's state, level and approval (review of
+    14c6bbd5f, F-A).  It is read for its labels only, and anything else is
+    none."""
+    agent_data = {4242: {'games': {'eng-01': {'sounds': {'bgm@3': {
+        'task_id': 'acestep_odd', 'task_since': time.time(), 'task_take': task_take}}}}}}
+    media = _media({}, {'status': 'completed', 'results': [{'url': 'https://node/odd.mp3'}]})
+
+    with _agent(agent_data, media) as tools, patch('time.sleep', lambda *_a, **_k: None):
+        bound = json.loads(tools['bind_game_sound']('eng-01', 'calm', 'spelling', 'bgm', '3'))
+
+    music = bound['music']
+    assert (bound['status'], music['url']) == ('bound', 'https://node/odd.mp3'), bound
+    assert (music['state'], music['level'], music['approved_at']) == ('bgm', '3', None), music
+    assert media.generate_media.call_count == 0, 'the task was not picked up'
+    if isinstance(task_take, dict):
+        assert (music['prompt'], music['variant']) == ('composed for this', 4), music
+
+
+@pytest.mark.parametrize('level, reason, variant', [
+    ('3', 'too slow', 3),
+    ('', 'too jangly', 2),
+], ids=['level_retake', 'game_retake'])
+def test_a_retake_after_its_job_was_lost_still_answers_the_reason(level, reason, variant):
+    """A job written at a key replaces the rejection there and carries it
+    as turned down.  Lost (past TASK_STALE_S) or failed, the job was cleared
+    and the fresh take read the key's top alone: a level's retake answered
+    the game's older "too loud" as take 2, a game's retake asked for take 1
+    with no reason, that is, for what was just turned down (review of
+    14c6bbd5f, F-B)."""
+    key = f'bgm@{level}' if level else 'bgm'
+    turned_down = ({'url': 'https://node/l.mp3', 'variant': 2, 'rejected_reason': 'too slow',
+                    'rejected_at': 2.0} if level else
+                   {'url': 'https://node/g.mp3', 'variant': 1, 'rejected_reason': 'too jangly',
+                    'rejected_at': 2.0})
+    sounds = {key: {'task_id': 'acestep_lost',
+                    'task_since': time.time() - agent_tools.TASK_STALE_S - 100,
+                    'previous_takes': [turned_down]}}
+    if level:
+        sounds['bgm'] = {'rejected_url': 'https://node/g.mp3', 'rejected_at': 1.0,
+                         'rejected_reason': 'too loud', 'variant': 1}
+    agent_data = {4242: {'games': {'eng-01': {'sounds': sounds}}}}
+    media = _media({'status': 'completed', 'results': [{'url': 'https://node/fresh.mp3'}]})
+
+    with _agent(agent_data, media) as tools:
+        bound = json.loads(tools['bind_game_sound']('eng-01', 'calm', 'spelling', 'bgm', level))
+
+    context = media.generate_media.call_args.kwargs['context']
+    assert reason in context, context
+    assert 'too loud' not in context or reason == 'too loud', context
+    assert (bound['status'], bound['music']['variant']) == ('bound', variant), bound
+
+
+def test_the_newer_complaint_is_the_one_answered():
+    """rejected_take answers the newer of the level's complaint and the
+    game's, the level's on a tie.  A level job a keep ended still carried an
+    older level rejection; read first, it answered that instead of the
+    game's newer one (review of 14c6bbd5f, F-B)."""
+    from core.game_sound_memo import rejected_take
+    older_level = {'url': 'https://node/l.mp3', 'variant': 2,
+                   'rejected_reason': 'too slow', 'rejected_at': 1.0}
+
+    def memo(level_record, game_at):
+        return {'eng-01': {'sounds': {
+            'bgm@3': level_record,
+            'bgm': {'rejected_url': 'https://node/v.mp3', 'rejected_at': game_at,
+                    'rejected_reason': 'changed my mind', 'variant': 2}}}}
+
+    ended_job = {'previous_takes': [older_level], 'lost_task': {'task_id': 'acestep_x'}}
+    assert rejected_take(memo(ended_job, 3.0), 'eng-01', 'bgm', '3')[
+        'rejected_reason'] == 'changed my mind'
+    assert rejected_take(memo(ended_job, 0.5), 'eng-01', 'bgm', '3')[
+        'rejected_reason'] == 'too slow'
+    # a tie goes to the level
+    assert rejected_take(memo(ended_job, 1.0), 'eng-01', 'bgm', '3')[
+        'rejected_reason'] == 'too slow'
+    # a level holding a take of its own has answered its history
+    kept = {'url': 'https://node/k.mp3', 'previous_takes': [older_level]}
+    assert rejected_take(memo(kept, 0.5), 'eng-01', 'bgm', '3')[
+        'rejected_reason'] == 'changed my mind'
+
+
+def test_a_submit_time_that_is_not_a_time_does_not_stop_a_bind():
+    """bind_game_sound read submitted_at itself, unguarded, beside the
+    memo's guarded reading: a word there made every call for that state
+    answer "Could not bind this game's sound" while the route read the same
+    record as a miss (review of 14c6bbd5f, F-C).  It asks the memo."""
+    agent_data = {4242: {'games': {'eng-01': {'sounds': {'bgm': {
+        'submitted_at': 'yesterday'}}}}}}
+    media = _media({'status': 'completed', 'results': [{'url': 'https://node/b.mp3'}]})
+
+    with _agent(agent_data, media) as tools:
+        out = tools['bind_game_sound']('eng-01', 'calm', 'spelling')
+
+    assert not out.startswith('Could not bind'), out
+    bound = json.loads(out)
+    assert (bound['status'], bound['music']['url']) == ('bound', 'https://node/b.mp3'), bound
 
 
 def test_a_composer_warming_up_during_a_card_answer_is_not_asked_twice(store_dir):
@@ -2177,6 +2286,10 @@ def test_a_submit_time_that_is_not_a_time_does_not_stop_a_keep(caplog, monkeypat
     assert (record.get('url'), matched, key) == ('https://node/v.mp3', 'game', 'bgm'), record
     assert own['eng-01']['sounds']['bgm'].get('approved_at'), own
     assert "'yesterday' is not a time" in caplog.text, caplog.text
+    # read as no submit, so the route does not answer 'composing' for good
+    # (review of 14c6bbd5f, MX2)
+    unsure = {'eng-01': {'sounds': {'bgm': {'submitted_at': 'yesterday'}}}}
+    assert game_sound_memo.game_state_match(unsure, 'eng-01', 'bgm')[1] == 'miss'
 
 
 def test_a_keep_for_the_game_ends_only_its_own_states_level_jobs():
