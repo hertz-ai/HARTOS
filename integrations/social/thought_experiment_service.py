@@ -804,20 +804,34 @@ class ThoughtExperimentService:
         }
         db.flush()
 
-        # Feed to WorldModelBridge (RL-EF)
+        # Feed to WorldModelBridge (RL-EF): the claim the experiment made
+        # (expected outcome) and what was decided, through the bridge's real
+        # signature.  This used to pass ONE dict, which raised TypeError on
+        # every decision and the bare except hid it: no decided experiment
+        # ever reached the world model (hevolveai Master 11.462 H).  Only the
+        # aggregate tally leaves: `suggestions` carries voter ids and their
+        # free text, which stay in this database.
         try:
             from integrations.agent_engine.world_model_bridge import get_world_model_bridge
             bridge = get_world_model_bridge()
             if bridge:
-                bridge.submit_correction({
-                    'type': 'thought_experiment_outcome',
-                    'experiment_id': experiment_id,
-                    'hypothesis': experiment.hypothesis,
-                    'outcome': decision_text,
-                    'tally': tally,
-                })
-        except Exception:
-            pass
+                aggregate = {k: tally.get(k) for k in (
+                    'total_votes', 'human_votes', 'agent_votes', 'total_for',
+                    'total_against', 'weighted_score', 'distinct_voters',
+                    'distinct_supporters', 'quorum_met', 'decision_context',
+                    'decision_recommendation')}
+                bridge.submit_correction(
+                    original_response=(experiment.expected_outcome
+                                       or experiment.hypothesis or ''),
+                    corrected_response=decision_text,
+                    expert_id='thought_experiment_decision',
+                    explanation=experiment.hypothesis,
+                    context={'type': 'thought_experiment_outcome',
+                             'experiment_id': experiment_id,
+                             'tally': aggregate})
+        except Exception as e:
+            logger.warning("decide %s: outcome not fed to the world model "
+                           "(%s)", experiment_id, type(e).__name__)
 
         return experiment.to_dict()
 
