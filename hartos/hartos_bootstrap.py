@@ -235,6 +235,31 @@ def _install_peer_link_relay() -> None:
         logger.warning(f"PeerLink relay not started: {e}")
 
 
+def _device_services_window(installing: bool) -> None:
+    """Steps 1c to 5d as one window to a phone.  While this node installs
+    what a phone's link rides on (the device verifier, the mobile adapter
+    and its 'mobile_paths', the file channel) a device HELLO is refused
+    'not_ready' and the phone re-dials (core.peer_link.link); after them,
+    however they went, device HELLOs are answered again.
+
+    Why: a phone keeps the hello_ack's capabilities for its whole session.
+    Measured 2026-10-19 13:11:57 on the installed desktop: a HELLO acked
+    24 s before step 5c got capabilities with no mobile_paths, and every
+    Reel Studio turn after it was refused on the phone ("not served
+    (not_answered)") until the link was remade.  Opening the window failing
+    leaves the old behaviour; closing it failing is said, since it would
+    leave every device HELLO refused."""
+    try:
+        from core.peer_link.link_manager import get_link_manager
+        if installing:
+            get_link_manager().device_services_pending()
+        else:
+            get_link_manager().device_services_ready()
+    except Exception as e:
+        logger.warning("PeerLink device-services window not %s: %s",
+                       'opened' if installing else 'closed', e)
+
+
 def _install_mobile_adapter(app) -> None:
     """Step 5c: a person's own phone's cloud API calls, answered by this
     desktop over the device link (integrations.mobile_adapter), one alias
@@ -382,6 +407,9 @@ def _run_bootstrap(app, cfg: dict) -> None:
       5d. the file channel (core.peer_link.file_channel) -- added
           2026-10-13: a phone's clips in and its reels out, over the same
           device link, beside the adapter (the other device door)
+          (1c to 5d are one window to a phone: a device HELLO meanwhile is
+          refused 'not_ready' and re-dialled -- _device_services_window,
+          added 2026-10-19)
       6. init_db + run_migrations
       7. channel adapters (config + env-var + web)
       8. init_agent_engine
@@ -401,6 +429,7 @@ def _run_bootstrap(app, cfg: dict) -> None:
             # The gate first.  It covers every route on the app, including
             # the ones registered below (see _install_api_gate).
             _install_api_gate(app)
+            _device_services_window(True)
             _install_device_verifier()
             _install_peer_admission_ask()
             _install_peer_link_relay()
@@ -414,6 +443,7 @@ def _run_bootstrap(app, cfg: dict) -> None:
             _init_a2a_server(app, cfg)
             _install_mobile_adapter(app)
             _install_file_channel()
+            _device_services_window(False)
             _init_database(cfg)
             _init_channel_adapters(app, cfg)
             # IMPORTANT: spawn hevolveai BEFORE the agent-engine subsystem
@@ -429,6 +459,9 @@ def _run_bootstrap(app, cfg: dict) -> None:
         finally:
             if bypass_active:
                 _disable_setup_lock_bypass(app)
+            # Closed again here: a step that raised past its own guard
+            # must not leave every device HELLO refused 'not_ready'.
+            _device_services_window(False)
 
         _BOOTSTRAP_DONE = True
         logger.info("HARTOS bootstrap complete")
