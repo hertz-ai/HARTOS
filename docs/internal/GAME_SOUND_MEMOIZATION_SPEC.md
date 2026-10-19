@@ -51,7 +51,8 @@ goal is:
 - **state** — from the table above. Anything else is rejected, not guessed.
 - **level** — optional. Absent means the sound serves every level.
 - **variant** — optional, reserved for a deliberate second take
-  (§6 correction). Absent for the first.
+  (§6 correction). Absent for the first.  A level's first take that
+  answers the game's rejected take is numbered after it (§6.1).
 
 The key is built by one function on each side and never by string
 concatenation at a call site.
@@ -124,9 +125,14 @@ the agent keeps (persisted per `prompt_id`):
 agent_data[prompt_id]['games'][game_id]['sounds'][key] = {
     url, prompt, state, level?, variant?,
     composed_at, approved_at?, rejected_at?, rejected_reason?,
-    task_id?            # while composing
-}
+    task_id?, task_since?, task_take?   # while composing: the job, when it
+}                                       # was taken, what it was composed with
 ```
+
+A composition outlives the call that starts it (a job averaged 907 s on
+a shared GPU; a call polls for 90 s), so the call that finishes it binds
+the take with the prompt and variant in `task_take`, not with its own
+newer reading of the rejections (review of c67afc26e, F-1).
 
 Why there and not a cache: a cache may evict; a memo may not. The app's
 media cache and the node's media cache stay caches in front of it, and

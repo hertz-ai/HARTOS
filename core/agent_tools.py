@@ -1008,13 +1008,14 @@ def build_core_tool_closures(ctx):
         # built from `rejected` at the start was empty (review of
         # ed6576624, F3).
         task_id = bound.get('task_id')
+        labels = {'mood': mood, 'prompt': prompt, 'variant': variant}
+        resumed = dict(bound.get('task_take') or {}) if task_id else {}
 
         def _take(**fields):
-            """This call's take as a record, ``fields`` on top: one shape for
-            its three writes."""
-            return {'mood': mood, 'prompt': prompt, 'state': which,
-                    'level': level or None, 'variant': variant,
-                    'composed_at': None, 'approved_at': None, **fields}
+            """This call's take as a record, ``fields`` on top; a task picked up
+            again keeps what it was composed with (task_take; c67afc26e, F-1)."""
+            return {**labels, 'state': which, 'level': level or None,
+                    'composed_at': None, 'approved_at': None, **resumed, **fields}
 
         def _bind_finished(url):
             """Bind a finished take, unless a take landed at this state while
@@ -1046,7 +1047,7 @@ def build_core_tool_closures(ctx):
         if (task_id and bound.get('task_since')
                 and time.time() - float(bound['task_since']) > TASK_STALE_S):
             _forget_task('no answer within TASK_STALE_S')
-            task_id = None
+            task_id, resumed = None, {}
         try:
             if not task_id:
                 # A submit whose RESPONSE timed out may still have been
@@ -1129,7 +1130,7 @@ def build_core_tool_closures(ctx):
                 # is not written over by this task (review of 0c542e278, F-A).
                 landed, matched = _chosen_meanwhile()
                 if not landed or _waits_behind(landed):
-                    _remember(_take(task_id=task_id, task_since=time.time()))
+                    _remember(_take(task_id=task_id, task_since=time.time(), task_take=labels))
                 if landed:
                     return _not_over(landed, matched, f'task {task_id}')
 

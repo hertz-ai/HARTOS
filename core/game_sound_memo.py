@@ -85,10 +85,19 @@ SUBMIT_COOLDOWN_S = 600
 
 
 def _submit_in_flight(record):
-    """A submit whose reply timed out, recent enough to still be queued."""
+    """A submit whose reply timed out, recent enough to still be queued.
+    A time that is not a number is no submit, and says so: it raised out
+    of a keep (review of c67afc26e, F-2)."""
     submitted = record.get('submitted_at')
-    return bool(submitted) and not record.get('url') and (
-        time.time() - float(submitted) < SUBMIT_COOLDOWN_S)
+    if not submitted or record.get('url'):
+        return False
+    try:
+        return time.time() - float(submitted) < SUBMIT_COOLDOWN_S
+    except (TypeError, ValueError):
+        _log_corrupt(('submitted_at', submitted),
+                     "a game sound's submitted_at %r is not a time; read as none",
+                     submitted)
+        return False
 
 
 def _composing(record):
@@ -116,8 +125,11 @@ def game_state_key(state, level=None, variant=None):
 
 
 #: The fields of a composition still under way at a key: the composer's
-#: task, when it was taken, and a submit whose reply timed out.
-IN_FLIGHT_FIELDS = ('task_id', 'task_since', 'submitted_at')
+#: task, when it was taken, what it was composed with (``task_take``: its
+#: prompt, variant and mood, so the call that finishes it binds it as what
+#: it is), and a submit whose reply timed out.  A verdict over it carries
+#: them all; an ended job drops them all.
+IN_FLIGHT_FIELDS = ('task_id', 'task_since', 'task_take', 'submitted_at')
 
 
 def ended_composition(record, reason, task_id=None):

@@ -1772,10 +1772,12 @@ def test_a_verdict_over_a_composing_take_keeps_its_age(store_dir):
         tools['bind_game_sound']('eng-01', 'calm', 'spelling')
         aged = dict(_bgm(_on_disk(own_id)))
         later['s'] = agent_tools.TASK_STALE_S + 400.0
-        tools['bind_game_sound']('eng-01', 'calm', 'spelling')
+        fresh = json.loads(tools['bind_game_sound']('eng-01', 'calm', 'spelling'))
 
     assert aged.get('task_since') and aged['rejected_url'] == 'https://node/v.mp3', aged
     assert media.generate_media.call_count == 2, 'the lost job was polled instead'
+    # the fresh take answers the newest verdict, not the lost job's
+    assert 'not this one either' in fresh['music']['prompt'], fresh
 
 
 def test_a_card_answered_while_their_take_composes_keeps_the_composition(store_dir):
@@ -1808,6 +1810,51 @@ def test_a_card_answered_while_their_take_composes_keeps_the_composition(store_d
     assert media.generate_media.call_count == 1, 'a second job was queued for the same take'
     assert again['status'] == 'bound', again
     assert again['music']['url'] == 'https://node/mine.mp3', again
+    # bound as what it was composed for, their second take answering "too
+    # jangly", not as answering the verdict given while it composed
+    # (review of c67afc26e, F-1)
+    assert again['music']['variant'] == 2, again
+    assert 'too jangly' in again['music']['prompt'], again
+    assert 'not this one either' not in again['music']['prompt'], again
+
+
+def test_a_level_retake_finished_on_a_later_call_is_bound_as_composed(store_dir):
+    """A composition outlives the call that starts it: a job averages 907 s
+    and a call polls for 90.  The call that finished a level's retake read
+    the rejections again, found the job at the level's key, fell back to the
+    game's older rejection, and bound the take composed to answer "too slow"
+    as answering "too loud", numbered like the take it replaced (review of
+    c67afc26e, F-1, probe S1)."""
+    from core import cache_loaders
+    cache_loaders.save_agent_data(4242, {'games': {'eng-01': {'sounds': {
+        'bgm': {'rejected_url': 'https://node/g.mp3', 'rejected_at': 1.0,
+                'rejected_reason': 'too loud', 'variant': 1},
+        'bgm@3': {'rejected_url': 'https://node/l.mp3', 'rejected_at': 2.0,
+                  'rejected_reason': 'too slow', 'variant': 2}}}}})
+    live = _live_cache()
+    media = _media({'status': 'pending', 'task_id': 'acestep_retake'})
+    real_time, later = time.time, {'s': 0.0}
+
+    def the_window_closes_then_it_finishes(task_id):
+        if not later['s']:
+            later['s'] = 200.0
+            return json.dumps({'status': 'pending'})
+        return json.dumps({'status': 'completed',
+                           'results': [{'url': 'https://node/retake.mp3'}]})
+    media.check_media_status.side_effect = the_window_closes_then_it_finishes
+
+    with _agent(live, media, helper_fun=_Disk()) as tools, \
+            patch('time.sleep', lambda *_a, **_k: None), \
+            patch.object(agent_tools.time, 'time', lambda: real_time() + later['s']):
+        first = json.loads(tools['bind_game_sound']('eng-01', 'calm', 'spelling', 'bgm', '3'))
+        done = json.loads(tools['bind_game_sound']('eng-01', 'calm', 'spelling', 'bgm', '3'))
+
+    assert first['status'] == 'composing', first
+    assert (done['status'], done['music']['url']) == ('bound', 'https://node/retake.mp3'), done
+    assert done['music']['variant'] == 3, done
+    assert 'too slow' in done['music']['prompt'], done
+    assert 'too loud' not in done['music']['prompt'], done
+    assert media.generate_media.call_count == 1
 
 
 def test_a_composer_warming_up_during_a_card_answer_is_not_asked_twice(store_dir):
@@ -2078,12 +2125,17 @@ def test_a_corrupt_record_is_warned_about_once_then_quietly(caplog, monkeypatch)
 
     game_sound_memo.turned_down_takes(record)
     game_sound_memo.turned_down_takes(record)
+    # another bad value is another warning (review of c67afc26e, mutant M8)
+    game_sound_memo.take_variant({'variant': 'three'})
 
     def lines(level):
         return sorted(r.getMessage()[:22] for r in caplog.records
                       if r.levelno == level and r.name == 'core.game_sound_memo')
-    assert lines(logging.WARNING) == ["1 past take(s) with no", "a game sound's variant"]
+    assert lines(logging.WARNING) == [
+        "1 past take(s) with no", "a game sound's variant", "a game sound's variant"]
     assert lines(logging.DEBUG) == ["1 past take(s) with no", "a game sound's variant"]
+    # the line names what was skipped (mutant M7)
+    assert "'junk'" in caplog.text, caplog.text
 
 
 def test_a_keep_names_only_a_composition_still_under_way(caplog):
@@ -2106,6 +2158,25 @@ def test_a_keep_names_only_a_composition_still_under_way(caplog):
 
     assert 'ends the composition' not in keep_over(time.time() - SUBMIT_COOLDOWN_S - 60)
     assert 'ends the composition there (a submit still queued)' in keep_over(time.time())
+
+
+def test_a_submit_time_that_is_not_a_time_does_not_stop_a_keep(caplog, monkeypatch):
+    """A stored submitted_at that is not a number (hand-edited or corrupt)
+    reads as no submit, with a warning, instead of raising out of the keep
+    (review of c67afc26e, F-2: the keep raised ValueError)."""
+    import logging
+    from core import game_sound_memo
+    monkeypatch.setattr(game_sound_memo, '_corrupt_warned', set())
+    caplog.set_level(logging.WARNING, logger='core.game_sound_memo')
+    own = {'eng-01': {'sounds': {'bgm': {'submitted_at': 'yesterday'}}}}
+    games = {'eng-01': {'sounds': {'bgm': {'url': 'https://node/v.mp3'}}}}
+
+    record, matched, key = game_sound_memo.record_verdict(
+        games, 'eng-01', 'bgm', True, own=own)
+
+    assert (record.get('url'), matched, key) == ('https://node/v.mp3', 'game', 'bgm'), record
+    assert own['eng-01']['sounds']['bgm'].get('approved_at'), own
+    assert "'yesterday' is not a time" in caplog.text, caplog.text
 
 
 def test_a_keep_for_the_game_ends_only_its_own_states_level_jobs():
