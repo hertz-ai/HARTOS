@@ -164,18 +164,36 @@ verdict they gave while it composed still skips the take they turned
 down.  And a rejection written at a key where the person's own take is
 still composing keeps that composition's task (`IN_FLIGHT_FIELDS`), so
 the next call finds the job instead of queueing a second one (both
-measured 2026-10-18 at f572fd775).  A take they KEEP ends their own
-composition there: the kept record holds a url and no task.  Nothing the
-composing call holds is written over a take that landed while it
-composed, whether kept on a card or filled by another turn: not the
-task or the submit note its submit returns (the submit can wait two
-minutes), not the take it finishes.  The call asks this before each of
-those writes with the same lookup it began with, so a take kept at the
-game's key also ends a composition for one level; the job it ends is
-cleared, and the composer, which cannot be asked to stop, simply has
-its take left unbound.  The same take, bound first by another call
-polling the same task, is left as it is.  The setters are the one
-source of a take's history; the composing tool builds none of its own.
+measured 2026-10-18 at f572fd775).
+
+What happens to a composition when another take lands while it runs is
+decided by what the person did, not by when a call happens to look
+(review of 5feeee2b8, F1):
+
+- A take they KEEP is a choice, and ends their own composition for every
+  key it covers: its own key and, kept at the game's key, every level's
+  key of that state, since the ladder answers the kept take at each level
+  without a take of its own.  The verdict writes this itself
+  (`core.game_sound_memo.record_verdict`), so it holds whether or not a
+  call is waiting on that composition.  The job it ends is cleared, with
+  a `lost_task` note; the composer, which cannot be asked to stop, simply
+  has its take left unbound.  A submit still in its cooldown ends with it,
+  so after the kept take is turned down the composer may hold two jobs.
+- Any other take that lands meanwhile (another turn filling the slot,
+  the creator's next take) is what they hear, as it would have been had
+  it come first, and their composition waits behind it with its task or
+  its submit note: if they turn that take down, their own is bound when
+  it finishes, with no second job, exactly as when they turn it down
+  before any call looks.  A job waiting longer than `TASK_STALE_S` is
+  taken as lost and composed afresh.
+
+Nothing the composing call holds is written over a take that landed
+while it composed: not the task or the submit note its submit returns
+(the submit can wait two minutes), not the take it finishes.  The call
+asks this before each of those writes with the same lookup it began
+with.  The same take, bound first by another call polling the same
+task, is left as it is.  The setters are the one source of a take's
+history; the composing tool builds none of its own.
 
 `approved_at` is what REUSE prefers; an unapproved memo still plays (a
 game is not held hostage to review) but is reported as unapproved so a

@@ -254,12 +254,13 @@ _DEFAULT_RECEIPT_TEMPLATE = (
 from core.game_sound_memo import (  # noqa: E402
     GAME_STATE_DURATIONS,
     GAME_STATES,
-    IN_FLIGHT_FIELDS,
+    ended_composition,
     game_state_key,
     game_sound_action,
     game_state_match,
     game_state_record,
     game_state_sound,
+    kept_since,
     record_verdict,
     rejected_take,
     set_game_state_sound,
@@ -785,6 +786,7 @@ def build_core_tool_closures(ctx):
                     f"{', '.join(sorted(GAME_STATES))}.")
         mine_only = str(scope or 'agent').strip() == 'mine'
         for_agent = not mine_only and _is_creator()
+        began = time.time()  # a take kept after this ended the call's job
 
         def _games(own):
             """The person's own memo, or the agent's, looked up at each use:
@@ -860,6 +862,12 @@ def build_core_tool_closures(ctx):
             else:
                 note = f'A {which} was chosen while this one composed; that one stays.'
             return _already_bound(landed, matched, note)
+
+        def _waits_behind(landed):
+            """Whether a submit's job is kept behind a take landed meanwhile at
+            another key: one not kept since the call began (spec §6)."""
+            return not (game_state_record(_memo(), slot, which, level).get('url')
+                        or kept_since(landed, began))
 
         if bound.get('url'):
             return _already_bound(bound, matched)
@@ -1017,12 +1025,8 @@ def build_core_tool_closures(ctx):
                 # to write, and no second card (review of 0c542e278, F-C).
                 return _already_bound(landed, matched)
             if landed:
-                if task_id and game_state_record(
-                        _memo(), slot, which, level).get('task_id') == task_id:
-                    # Its job is over.  Left at a level's key under a take kept
-                    # at the game's, it read 'composing' once that take was
-                    # turned down, and bound a take for an older complaint.
-                    _forget_task(f'a {which} was chosen meanwhile; {url} is not bound')
+                # Its job stays behind that take, to be bound if it is turned
+                # down, as between calls; a keep ended it (review of 5feeee2b8, F1).
                 return _not_over(landed, matched, url)
             record = _offer(_remember(_take(url=url, composed_at=time.time())))
             return json.dumps({'status': 'bound', 'game_id': slot,
@@ -1033,15 +1037,9 @@ def build_core_tool_closures(ctx):
 
             hartos-3a F2: nothing ever cleared a dead task_id, so after a
             composer restart this state answered "composing" for good, and
-            after a failure it answered "failed" for good; it could never be
-            composed again.  The rejection history and variant stay.
-            """
-            kept = {k: v for k, v in game_state_record(
-                        _memo(), slot, which, level).items()
-                    if k not in IN_FLIGHT_FIELDS}
-            kept['lost_task'] = {'task_id': task_id, 'reason': reason,
-                                 'at': time.time()}
-            _remember(kept)
+            after a failure "failed" for good.  History and variant stay."""
+            _remember(ended_composition(
+                game_state_record(_memo(), slot, which, level), reason, task_id))
 
         # A record from before task_since existed has no age to judge; it is
         # polled as before rather than composed a second time.
@@ -1099,13 +1097,15 @@ def build_core_tool_closures(ctx):
                     # 2026-09-22 (hartos-14): replacing the record here erased
                     # all three -- on a node restarted overnight, which is
                     # exactly when a rejection is waiting.  Never on a take
-                    # that landed while it waited (review of 0c542e278, F-A).
+                    # that landed while it waited (review of 0c542e278, F-A);
+                    # behind one landed elsewhere (_waits_behind).
                     landed, matched = _chosen_meanwhile()
+                    if not landed or _waits_behind(landed):
+                        _remember({**_take(),
+                                   **game_state_record(_memo(), slot, which, level),
+                                   'submitted_at': time.time()})
                     if landed:
                         return _not_over(landed, matched, 'a submit still queued')
-                    _remember({**_take(),
-                               **game_state_record(_memo(), slot, which, level),
-                               'submitted_at': time.time()})
                     return json.dumps({
                         'status': 'composing',
                         'game_id': slot,
@@ -1128,9 +1128,10 @@ def build_core_tool_closures(ctx):
                 # The submit can wait two minutes: a take that landed meanwhile
                 # is not written over by this task (review of 0c542e278, F-A).
                 landed, matched = _chosen_meanwhile()
+                if not landed or _waits_behind(landed):
+                    _remember(_take(task_id=task_id, task_since=time.time()))
                 if landed:
                     return _not_over(landed, matched, f'task {task_id}')
-                _remember(_take(task_id=task_id, task_since=time.time()))
 
             # Give it a while, then hand the task back rather than block.
             deadline = time.time() + 90

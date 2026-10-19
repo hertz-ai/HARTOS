@@ -91,6 +91,14 @@ def _submit_in_flight(record):
         time.time() - float(submitted) < SUBMIT_COOLDOWN_S)
 
 
+def _composing(record):
+    """A composition under way at this record, with no take yet: its task,
+    or a submit still inside the cooldown.  The one reading of it, for the
+    matcher's 'composing' and for what a keep ends."""
+    return not record.get('url') and bool(
+        record.get('task_id') or _submit_in_flight(record))
+
+
 def game_state_key(state, level=None, variant=None):
     """The memo key for a game's state (spec §3).
 
@@ -110,6 +118,19 @@ def game_state_key(state, level=None, variant=None):
 #: The fields of a composition still under way at a key: the composer's
 #: task, when it was taken, and a submit whose reply timed out.
 IN_FLIGHT_FIELDS = ('task_id', 'task_since', 'submitted_at')
+
+
+def ended_composition(record, reason, task_id=None):
+    """``record`` with its composition over and the rest kept: the in-flight
+    fields gone, so no lookup joins or resumes it, and the task noted as
+    lost with why.  The composer cannot be asked to stop; its take, if it
+    finishes, is simply not bound.  The one builder of an ended job, for
+    agent_tools' _forget_task and for a keep (record_verdict)."""
+    record = record or {}
+    ended = {k: v for k, v in record.items() if k not in IN_FLIGHT_FIELDS}
+    ended['lost_task'] = {'task_id': task_id or record.get('task_id'),
+                          'reason': reason, 'at': time.time()}
+    return ended
 
 #: Corrupt values already warned about.  A lookup reads the same record on
 #: every turn, so each is a WARNING once and DEBUG after; at DEBUG alone it
@@ -266,7 +287,7 @@ def game_state_match(games, game_id, state, level=None, *, own=None,
         # A task id, OR a submit whose reply timed out and may be queued:
         # the route used to see the second as a miss and queue a duplicate
         # job for bgm, the very thing the cooldown exists to stop (F8).
-        if record.get('task_id') or _submit_in_flight(record):
+        if _composing(record):
             return record, 'composing', level_key
     return {}, 'miss', level_key
 
@@ -402,7 +423,7 @@ def record_verdict(games, game_id, state, approved, reason='',
                  if field in composing and not composing.get('url')}
     if not record.get('url'):
         record.update(in_flight)
-    elif in_flight.get('task_id') or _submit_in_flight(composing):
+    elif _composing(composing):
         # The composer cannot be asked to stop; its take, if it finishes,
         # is not written over this one (agent_tools bind_game_sound).  A
         # submit past its cooldown is no composition (review of 0c542e278,
@@ -411,7 +432,26 @@ def record_verdict(games, game_id, state, approved, reason='',
                     game_id, write_key,
                     in_flight.get('task_id') or 'a submit still queued')
     record = set_game_state_sound_at(target, game_id, write_key, record)
+    if approved and write_key == game_state_key(state):
+        _end_compositions_under(target, game_id, write_key)
     return record, matched, write_key
+
+
+def _end_compositions_under(games, game_id, game_key):
+    """End each level's composition that a take kept at the game's key
+    covers: the ladder answers that take at every level without one of its
+    own.  Ended only while a call was polling it, a level's job read
+    'composing' again once the kept take was turned down, and the next call
+    bound a take made for the older complaint (review of 5feeee2b8, F1)."""
+    sounds = ((games or {}).get(str(game_id)) or {}).get('sounds') or {}
+    for key in [k for k in sounds if str(k).startswith(f'{game_key}@')]:
+        record = sounds.get(key)
+        if isinstance(record, dict) and _composing(record):
+            logger.info('a take kept at %s/%s ends the composition at %s (%s)',
+                        game_id, game_key, key,
+                        record.get('task_id') or 'a submit still queued')
+            set_game_state_sound_at(games, game_id, key, ended_composition(
+                record, f'a take was kept at {game_key}'))
 
 
 def game_state_record(games, game_id, state, level=None):
@@ -443,3 +483,15 @@ def rejected_take(games, game_id, state, level=None):
         if record.get('rejected_at'):
             return record
     return {}
+
+
+def kept_since(record, since):
+    """Whether this take was kept ("Keep it") at or after ``since``.
+
+    A keep is a choice, and ends the keeper's composition (record_verdict);
+    a take that lands for everyone is not, and a composition waits behind
+    it (agent_tools bind_game_sound, spec §6)."""
+    try:
+        return float((record or {}).get('approved_at') or 0) >= float(since)
+    except (TypeError, ValueError):
+        return False
