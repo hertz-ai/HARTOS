@@ -774,7 +774,10 @@ class WorldModelBridge:
         screened = [self._screened_text(t) for t in (claim, decision)]
         if any(t is None for t in screened):
             logger.info("[WorldModelBridge] decided experiment %s not sent: "
-                        "the constitutional filter refused it", experiment_id)
+                        "the constitutional filter refused its %s",
+                        experiment_id, ' and '.join(
+                            name for name, t in zip(('claim', 'decision'),
+                                                    screened) if t is None))
             return None
         if self._is_external_target() and not self._has_cloud_consent(
                 str(creator_id)):

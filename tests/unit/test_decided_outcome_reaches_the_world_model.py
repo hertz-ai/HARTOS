@@ -25,7 +25,6 @@ import logging
 import os
 import threading
 import uuid
-from unittest import mock
 
 import pytest
 from sqlalchemy import create_engine
@@ -232,19 +231,24 @@ def test_secrets_in_the_claim_or_decision_never_leave(offline):
     assert 'hunter2hunter2' not in texts
 
 
+@pytest.mark.parametrize('refused', ['claim', 'decision'])
 def test_a_text_the_constitutional_filter_refuses_sends_nothing(offline,
-                                                               monkeypatch):
-    """what: the filter refuses the decision; expected: nothing queued,
-    nothing sent (submit_correction's rule for what it sends)."""
+                                                               monkeypatch,
+                                                               refused):
+    """what: the filter refuses the claim, or the decision; expected:
+    nothing queued, nothing sent, not even the other half alone
+    (submit_correction's rule for what it sends; review of 0a444194f: a
+    mutant checking only the decision passed when only it was tested)."""
     from security.hive_guardrails import ConstitutionalFilter
     monkeypatch.setattr(
         ConstitutionalFilter, 'check_prompt',
         staticmethod(lambda text: (text != 'refused text', 'blocked')))
+    texts = {'claim': 'fine claim', 'decision': 'fine decision'}
+    texts[refused] = 'refused text'
     b = offline()
     sent = _recording(b)
     assert b.ingest_decided_experiment(
-        experiment_id='e1', creator_id='u1', claim='fine claim',
-        decision='refused text', decided_at='t') is None
+        experiment_id='e1', creator_id='u1', decided_at='t', **texts) is None
     assert sent == []
 
 
