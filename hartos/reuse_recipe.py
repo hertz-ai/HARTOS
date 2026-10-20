@@ -1905,6 +1905,18 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
     # name = a #511 name collision; until that is resolved canonically,
     # this restores the exact pre-#743 body (owner audit 2026-09-01
     # found the swap had silently stubbed real scheduling).
+    #
+    # A background turn may not start a recurring job; a person's request
+    # may.  Measured 2026-10-20 in Nunba's gui_app.log: a daemon turn of agent
+    # 65708210992 (daemon_85d091d3-...) whose action tool had failed called
+    # this with '* * * * *' at 21:45:39, and the job ran a time-agent group
+    # chat on the local model every minute until the log ended at 01:49 (240
+    # runs).  No code removes such a job.  The refusal reads the turn's id
+    # where chat_agent writes it and applies the condition _chat_reply's TTS
+    # gate applies: a non-empty id that is_genuine_user_request rejects.  An
+    # empty id is not refused, because a person's turn can arrive with none
+    # (standalone /chat mints none; the WhatsApp self-chat path sends none).
+    # Recipe schedules (create_schedule) do not come through this tool.
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="tool",
                              description="Use this to Create scheduled jobs")
@@ -1913,6 +1925,15 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
         str, "Cron expression for scheduling. Example: '0 9 * * 1-5' (Runs at 9:00 AM, Monday to Friday)."],
                               job_description: Annotated[str, "Description of the job to be performed"]) -> str:
         current_app.logger.info('INSIDE create_scheduled_jobs')
+        from integrations.agent_engine.dispatch import is_genuine_user_request
+        _rid = request_id_list.get(user_prompt)
+        if _rid and not is_genuine_user_request(_rid):
+            current_app.logger.warning(
+                f'create_scheduled_jobs refused for background turn {_rid}: '
+                f'cron {cron_expression!r}')
+            return (f'{TOOL_FAILURE_RESULTS[0]}\nNo job was scheduled: this '
+                    'is a background turn, and only a person can start a '
+                    'recurring job.')
         if not scheduler.running:
             scheduler.start()
 
