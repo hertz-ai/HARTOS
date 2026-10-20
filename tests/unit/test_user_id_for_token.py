@@ -82,8 +82,12 @@ class TestAnOpaqueTokenIsNotReadAsAJwt:
 
     @staticmethod
     def _token_warnings(caplog):
-        return [r for r in caplog.records if r.name == 'hevolve_security'
-                and r.getMessage().startswith('Invalid token')]
+        # By level and the function that logged, never by the text: once
+        # hart_intelligence_entry is imported, which another test in the same
+        # process may do first, security.audit_log's filter rewrites messages
+        # on every handler, caplog's included.
+        return [r for r in caplog.records
+                if r.levelno == logging.WARNING and r.funcName == 'decode_token']
 
     def test_an_opaque_token_resolves_without_a_jwt_warning(self, caplog):
         db = _db_returning(_user('10202'))
