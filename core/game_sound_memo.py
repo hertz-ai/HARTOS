@@ -542,15 +542,3 @@ def rejected_take(games, game_id, state, level=None):
         if take and (not found or _turned_down_when(take) > _turned_down_when(found)):
             found = take
     return found
-
-
-def kept_since(record, since):
-    """Whether this take was kept ("Keep it") at or after ``since``.
-
-    A keep is a choice, and ends the keeper's composition (record_verdict);
-    a take that lands for everyone is not, and a composition waits behind
-    it (agent_tools bind_game_sound, spec §6)."""
-    try:
-        return float((record or {}).get('approved_at') or 0) >= float(since)
-    except (TypeError, ValueError):
-        return False

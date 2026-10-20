@@ -188,6 +188,12 @@ decided by what the person did, not by when a call happens to look
   a `lost_task` note; the composer, which cannot be asked to stop, simply
   has its take left unbound.  A submit still in its cooldown ends with it,
   so after the kept take is turned down the composer may hold two jobs.
+  A keep counts in the memo it is written to, never by when it happened:
+  a person's keep ends their own composition, and the creator's keep ends
+  the agent's, a visitor's level job filling the agent's empty slot among
+  them.  The creator keeping their next take for everyone is, for a
+  visitor's own composition, a take landing, not the visitor's choice
+  (review of ec055c9b6, F1, F3).
 - Any other take that lands meanwhile (another turn filling the slot,
   the creator's next take) is what they hear, as it would have been had
   it come first, and their composition waits behind it with its task or

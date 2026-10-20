@@ -260,7 +260,6 @@ from core.game_sound_memo import (  # noqa: E402
     game_state_match,
     game_state_record,
     game_state_sound,
-    kept_since,
     record_verdict,
     rejected_take,
     set_game_state_sound,
@@ -776,7 +775,6 @@ def build_core_tool_closures(ctx):
                     f"{', '.join(sorted(GAME_STATES))}.")
         mine_only = str(scope or 'agent').strip() == 'mine'
         for_agent = not mine_only and _is_creator()
-        began = time.time()  # a take kept after this ended the call's job
 
         def _games(own):
             """The person's own memo, or the agent's, looked up at each use:
@@ -853,11 +851,13 @@ def build_core_tool_closures(ctx):
                 note = f'A {which} was chosen while this one composed; that one stays.'
             return _already_bound(landed, matched, note)
 
-        def _waits_behind(landed):
+        def _waits_behind(landed, matched):
             """Whether a submit's job is kept behind a take landed meanwhile at
-            another key: one not kept since the call began (spec §6)."""
+            another key: one not kept in the memo this call writes (spec §6).
+            Read by time, anyone's keep in any memo counted, and a clock step
+            back counted none (review of ec055c9b6, F1, F3)."""
             return not (game_state_record(_memo(), slot, which, level).get('url')
-                        or kept_since(landed, began))
+                        or (landed.get('approved_at') and (matched == 'mine') == personal))
 
         if bound.get('url'):
             return _already_bound(bound, matched)
@@ -1092,7 +1092,7 @@ def build_core_tool_closures(ctx):
                     # that landed while it waited (review of 0c542e278, F-A);
                     # behind one landed elsewhere (_waits_behind).
                     landed, matched = _chosen_meanwhile()
-                    if not landed or _waits_behind(landed):
+                    if not landed or _waits_behind(landed, matched):
                         _remember({**_take(),
                                    **game_state_record(_memo(), slot, which, level),
                                    'submitted_at': time.time()})
@@ -1120,7 +1120,7 @@ def build_core_tool_closures(ctx):
                 # The submit can wait two minutes: a take that landed meanwhile
                 # is not written over by this task (review of 0c542e278, F-A).
                 landed, matched = _chosen_meanwhile()
-                if not landed or _waits_behind(landed):
+                if not landed or _waits_behind(landed, matched):
                     _remember(_take(task_id=task_id, task_since=time.time(), task_take=labels))
                 if landed:
                     return _not_over(landed, matched, f'task {task_id}')

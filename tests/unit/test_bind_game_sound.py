@@ -1673,26 +1673,38 @@ def test_a_take_landing_while_a_level_submit_warms_up_keeps_the_cooldown(store_d
     assert cold.generate_media.call_count == 1, 'a second job was queued inside the cooldown'
 
 
-def test_a_take_kept_while_a_level_submit_waits_leaves_no_job_behind_it(store_dir):
+@pytest.mark.parametrize('submit, clock_step', [
+    ('pending', 0.0), ('warming_up', 0.0), ('pending', -5.0),
+], ids=['task', 'warming_up', 'clock_steps_back'])
+def test_a_take_kept_while_a_level_submit_waits_leaves_no_job_behind_it(
+        store_dir, submit, clock_step):
     """A keep is a choice, and ends the composition (spec §6): the visitor
-    keeps the creator's take while their submit for level 3 waits.  The task
-    it returns is not kept behind the take they kept, so once they turn that
-    down too, the next call composes for the new complaint."""
+    keeps the creator's take while their submit for level 3 waits.  Neither
+    the task nor the note it returns is kept behind the take they kept, so
+    once they turn that down too, the next call composes for the new
+    complaint.  Told by the clock, a step back made the keep read as older
+    than the call, and the job was kept (review of ec055c9b6, F3); the
+    warming-up path was untested (MX3)."""
     own_id = _u_turned_down_by_both()
     live = _live_cache()
     media = _media({}, {'status': 'completed',
                         'results': [{'url': 'https://node/level3.mp3'}]})
     submits = []
+    real_time, offset = time.time, {'s': 0.0}
 
     def kept_while_the_first_submit_waits(*_a, **_k):
         submits.append(1)
         if len(submits) == 1:
+            offset['s'] = clock_step
             _the_visitor_keeps_the_creators_next_take(live)
+        if submit == 'warming_up':
+            return json.dumps({'status': 'warming_up', 'message': 'starting up'})
         return json.dumps({'status': 'pending', 'task_id': f'acestep_level3_{len(submits)}'})
     media.generate_media.side_effect = kept_while_the_first_submit_waits
 
     with _visitor(live, media, helper_fun=_Disk()) as tools, \
-            patch('time.sleep', lambda *_a, **_k: None):
+            patch('time.sleep', lambda *_a, **_k: None), \
+            patch.object(agent_tools.time, 'time', lambda: real_time() + offset['s']):
         answer = json.loads(tools['bind_game_sound']('eng-01', 'calm', 'spelling', 'bgm', '3'))
         level3 = dict(_on_disk(own_id)['games']['eng-01']['sounds'].get('bgm@3') or {})
         tools['approve_game_sound']('eng-01', False, 'bgm', 'changed my mind', '3')
@@ -1700,9 +1712,150 @@ def test_a_take_kept_while_a_level_submit_waits_leaves_no_job_behind_it(store_di
 
     assert (answer['status'], answer['matched'], answer['music']['url']) == (
         'already_bound', 'mine', 'https://node/v.mp3'), answer
-    assert 'task_id' not in level3, level3
-    assert len(submits) == 2, 'the job a keep ended was resumed instead'
+    assert not set(IN_FLIGHT_FIELDS) & set(level3), level3
+    assert len(submits) == 2, 'the job a keep ended was resumed or waited for instead'
     assert 'changed my mind' in media.generate_media.call_args.kwargs['context']
+
+
+def test_the_creators_keep_meanwhile_leaves_a_visitors_own_job_waiting(store_dir):
+    """A keep counts only in the memo the composition writes (review of
+    ec055c9b6, F1, probe r1).  The creator keeping their next take for
+    everyone while a visitor's own submit waits is, for the visitor, a take
+    landing, not their choice.  Counted as a keep, their task was dropped
+    and, once they turned that take down, a second job was queued; the same
+    keep between their calls left the job waiting."""
+    own_id = _u_turned_down_by_both()
+    live = _live_cache()
+    media = _media({}, {'status': 'completed', 'results': [{'url': 'https://node/mine.mp3'}]})
+
+    def the_creator_binds_and_keeps_meanwhile(*_a, **_k):
+        _the_creators_next_take_lands(live)
+        agent_tools.answer_game_sound_card(
+            '4242', 'game_sound:eng-01:bgm', True, '', 'user-1')
+        return json.dumps({'status': 'pending', 'task_id': 'acestep_mine'})
+    media.generate_media.side_effect = the_creator_binds_and_keeps_meanwhile
+
+    with _visitor(live, media, helper_fun=_Disk()) as tools, \
+            patch('time.sleep', lambda *_a, **_k: None):
+        answer = json.loads(tools['bind_game_sound']('eng-01', 'calm', 'spelling'))
+        waiting = dict(_bgm(_on_disk(own_id)))
+        tools['approve_game_sound']('eng-01', False, 'bgm', 'not this one either')
+        after = json.loads(tools['bind_game_sound']('eng-01', 'calm', 'spelling'))
+
+    assert answer['music']['url'] == 'https://node/v.mp3', answer
+    assert waiting.get('task_id') == 'acestep_mine', waiting
+    assert (after['status'], after['music']['url']) == (
+        'bound', 'https://node/mine.mp3'), after
+    assert media.generate_media.call_count == 1, 'a second job was queued'
+
+
+def test_a_visitors_own_keep_leaves_the_agents_level_job_waiting(store_dir):
+    """The mirror case (review of ec055c9b6, F1, probe r2): a visitor
+    filling the agent's empty slot for level 3 keeps, in their own memo, the
+    creator's take that landed meanwhile.  That is their choice, not the
+    agent's: the agent's level job waits behind it for everyone else."""
+    from core import cache_loaders
+    cache_loaders.save_agent_data(4242, {})
+    live = _live_cache()
+    media = _media({}, {'status': 'completed', 'results': [{'url': 'https://node/l3.mp3'}]})
+
+    def the_visitor_keeps_the_creators_take_meanwhile(*_a, **_k):
+        _the_visitor_keeps_the_creators_next_take(live)
+        return json.dumps({'status': 'pending', 'task_id': 'acestep_agents_level3'})
+    media.generate_media.side_effect = the_visitor_keeps_the_creators_take_meanwhile
+
+    with _visitor(live, media, helper_fun=_Disk()) as tools, \
+            patch('time.sleep', lambda *_a, **_k: None):
+        answer = json.loads(tools['bind_game_sound']('eng-01', 'calm', 'spelling', 'bgm', '3'))
+
+    agents_level3 = _on_disk(4242)['games']['eng-01']['sounds'].get('bgm@3') or {}
+    assert (answer['matched'], answer['music']['url']) == ('mine', 'https://node/v.mp3'), answer
+    assert agents_level3.get('task_id') == 'acestep_agents_level3', agents_level3
+
+
+def _the_creators_level_submit(live, meanwhile):
+    """The creator binds level 3; ``meanwhile`` runs while the submit waits.
+    Returns the agent's bgm@3 record as stored after the call."""
+    media = _media({}, {'status': 'pending'})
+
+    def submit(*_a, **_k):
+        meanwhile()
+        return json.dumps({'status': 'pending', 'task_id': 'acestep_creators_level3'})
+    media.generate_media.side_effect = submit
+    with _agent(live, media, helper_fun=_Disk()) as tools, \
+            patch('time.sleep', lambda *_a, **_k: None):
+        tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'bgm', '3')
+    return _on_disk(4242)['games']['eng-01']['sounds'].get('bgm@3') or {}
+
+
+def test_a_take_another_turn_fills_meanwhile_leaves_the_creators_level_job_waiting(store_dir):
+    """A take landing in the memo the composition writes is still not a
+    keep: another turn filling the agent's game slot while the creator's
+    level submit waits leaves that level's job waiting behind it (spec 6;
+    review of ec055c9b6, F1: only a kept take ends a job)."""
+    from core import cache_loaders
+    cache_loaders.save_agent_data(4242, {})
+    live = _live_cache()
+
+    def a_visitors_turn_fills_the_game_slot():
+        fills = _media({'status': 'completed', 'results': [{'url': 'https://node/x.mp3'}]})
+        with _visitor(live, fills, helper_fun=_Disk()) as tools:
+            tools['bind_game_sound']('eng-01', 'calm', 'spelling')
+
+    level3 = _the_creators_level_submit(live, a_visitors_turn_fills_the_game_slot)
+    assert level3.get('task_id') == 'acestep_creators_level3', level3
+
+
+def test_the_creators_own_keep_meanwhile_ends_their_level_job(store_dir):
+    """The creator keeping, for everyone, a game take that landed while
+    their level submit waited is their own choice in the memo their job is
+    in: the job ends, and no task waits behind the kept take (spec 6;
+    review of ec055c9b6, F1)."""
+    from core import cache_loaders
+    cache_loaders.save_agent_data(4242, {})
+    live = _live_cache()
+
+    def the_creator_binds_and_keeps_the_games_take():
+        _the_creators_next_take_lands(live)
+        agent_tools.answer_game_sound_card(
+            '4242', 'game_sound:eng-01:bgm', True, '', 'user-1')
+
+    level3 = _the_creators_level_submit(live, the_creator_binds_and_keeps_the_games_take)
+    assert not set(IN_FLIGHT_FIELDS) & set(level3), level3
+
+
+def test_a_keep_for_the_game_reads_a_corrupt_level_note_as_none(caplog, monkeypatch):
+    """A game-key keep reads every level's note: one whose submit time is
+    not a number made the keep raise and the card answer applied: False
+    (review of ec055c9b6, F2, probe r4).  It reads as no composition."""
+    import logging
+    from core import game_sound_memo
+    monkeypatch.setattr(game_sound_memo, '_corrupt_warned', set())
+    caplog.set_level(logging.WARNING, logger='core.game_sound_memo')
+    games = {'eng-01': {'sounds': {
+        'bgm': {'url': 'https://node/v.mp3'},
+        'bgm@3': {'submitted_at': 'yesterday'}}}}
+
+    record, _matched, _key = game_sound_memo.record_verdict(games, 'eng-01', 'bgm', True)
+
+    assert record.get('approved_at'), record
+    assert games['eng-01']['sounds']['bgm@3'] == {'submitted_at': 'yesterday'}
+    assert "'yesterday' is not a time" in caplog.text, caplog.text
+
+
+def test_a_keep_for_the_game_leaves_a_level_with_its_own_take():
+    """A level holding a take of its own composes nothing, whatever task it
+    still names: a keep at the game's key ends no job there (review of
+    ec055c9b6, F5, mutant MX1)."""
+    from core import game_sound_memo
+    level3 = {'url': 'https://node/level3.mp3', 'task_id': 'acestep_old',
+              'task_since': time.time()}
+    games = {'eng-01': {'sounds': {
+        'bgm': {'url': 'https://node/v.mp3'}, 'bgm@3': dict(level3)}}}
+
+    game_sound_memo.record_verdict(games, 'eng-01', 'bgm', True)
+
+    assert games['eng-01']['sounds']['bgm@3'] == level3
 
 
 def test_the_creators_own_correction_is_composed_once():
