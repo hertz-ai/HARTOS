@@ -100,6 +100,7 @@ class McGroceClient:
                           else get_secret('MCGROCE_ADMIN_API_KEY', ''))
         self._bindings = bindings
         self.breaker = breaker or mcgroce_breaker
+        self._agent_orders_ok = False
 
     @property
     def bindings(self):
@@ -259,6 +260,24 @@ class McGroceClient:
         from integrations.commerce.signing import MANDATE_HEADER
         return self.site(user_id, 'POST', '/cart/checkout/ap2',
                          extra_headers={MANDATE_HEADER: attestation})
+
+    def agent_orders_ready(self, user_id) -> Optional[str]:
+        """None when this McGroce places agent orders, else why not.
+
+        Asked BEFORE any money is taken: the same endpoint called without an
+        attestation is refused (403 AP2_MANDATE_REJECTED) by a McGroce that
+        has it and touches nothing; one without it answers 404, one without
+        the shared secret 503.  A yes is remembered for this client.
+        """
+        if self._agent_orders_ok:
+            return None
+        res = self.site(user_id, 'POST', '/cart/checkout/ap2')
+        if res.get('status') == 403 and 'AP2_MANDATE_REJECTED' in str(res.get('error')):
+            self._agent_orders_ok = True
+            return None
+        if res.get('status') == 404:
+            return 'this McGroce does not take agent orders yet'
+        return f"McGroce cannot take agent orders right now ({res.get('error') or 'unexpected answer'})"
 
     def orders(self, user_id, order_status='SUBMITTED'):
         return self.site(user_id, 'GET', '/orders',

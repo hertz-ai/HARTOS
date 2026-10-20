@@ -255,8 +255,9 @@ class TestOrderRef:
 class TestSupersede:
     KIND = 'commerce_checkout'
 
-    def _mandate(self, store, user='u1', merchant='mcgroce', cart=CART):
-        return store.create_cart_mandate(user, merchant, cart, kind=self.KIND)
+    def _mandate(self, store, user='u1', merchant='mcgroce', cart=CART, cart_ref='555'):
+        return store.create_cart_mandate(user, merchant, cart, kind=self.KIND,
+                                         cart_ref=cart_ref)
 
     def test_voids_the_owners_earlier_live_checkouts_only(self, store):
         mine = self._mandate(store)
@@ -264,7 +265,7 @@ class TestSupersede:
         store.approve(approved.mandate_id, 'u1')
         theirs = self._mandate(store, user='u2')
         other_shop = self._mandate(store, merchant='elsewhere')
-        ok, _ = store.supersede('u1', 'mcgroce', self.KIND, canonical_cart_hash(CART))
+        ok, _ = store.supersede('u1', 'mcgroce', self.KIND, '555')
         assert ok
         for m in (mine, approved):
             assert store.get(m.mandate_id).status == 'rejected'
@@ -277,21 +278,90 @@ class TestSupersede:
         m = self._mandate(store)
         store.approve(m.mandate_id, 'u1')
         store.ledger.get_payment(m.payment_id).update_status(PaymentStatus.PROCESSING)
-        ok, reason = store.supersede('u1', 'mcgroce', self.KIND, canonical_cart_hash(CART))
+        ok, reason = store.supersede('u1', 'mcgroce', self.KIND, '555')
         assert not ok and 'in progress' in reason
         assert store.get(m.mandate_id).status == 'approved'
 
-    def test_refuses_to_take_payment_twice_for_a_cart_already_paid_for(self, store):
+    def test_a_cart_paid_for_is_never_offered_again_whatever_it_holds_now(self, store):
+        # Keyed on the cart, not its contents: a line repriced or added after
+        # the money was taken must not open a second payment for that cart.
         m = self._mandate(store)
         store.approve(m.mandate_id, 'u1')
         store.consume(m.mandate_id)
-        ok, reason = store.supersede('u1', 'mcgroce', self.KIND, canonical_cart_hash(CART))
+        ok, reason = store.supersede('u1', 'mcgroce', self.KIND, '555')
         assert not ok and m.mandate_id in reason
-        # A different cart, or the same one once its order exists, is fine.
-        other = dict(CART, total=241)
-        assert store.supersede('u1', 'mcgroce', self.KIND, canonical_cart_hash(other))[0]
+        # Another cart, or this one once its order exists, is fine.
+        assert store.supersede('u1', 'mcgroce', self.KIND, '556')[0]
         store.record_order(m.mandate_id, 'ORD-1')
-        assert store.supersede('u1', 'mcgroce', self.KIND, canonical_cart_hash(CART))[0]
+        assert store.supersede('u1', 'mcgroce', self.KIND, '555')[0]
+
+    def test_a_payment_from_before_cart_tracking_blocks_nothing(self, store):
+        legacy = self._mandate(store, cart_ref=None)
+        store.approve(legacy.mandate_id, 'u1')
+        store.consume(legacy.mandate_id)
+        assert store.supersede('u1', 'mcgroce', self.KIND, '555')[0]
+
+    def test_a_checkout_whose_payment_cannot_be_cancelled_is_left_alone(self, store, monkeypatch):
+        # The gateway took it between the check and the cancel: the mandate
+        # must not be marked withdrawn over a payment that may complete.
+        m = self._mandate(store)
+        store.approve(m.mandate_id, 'u1')
+        monkeypatch.setattr(store.ledger, 'cancel_payment', lambda *a, **k: False)
+        ok, reason = store.supersede('u1', 'mcgroce', self.KIND, '555')
+        assert not ok and 'in progress' in reason
+        assert store.get(m.mandate_id).status == 'approved'
+
+    def test_refuses_while_an_earlier_payment_is_being_taken(self, store):
+        m = self._mandate(store)
+        store.approve(m.mandate_id, 'u1')
+        assert store.begin_settle(m.mandate_id)[0]
+        ok, reason = store.supersede('u1', 'mcgroce', self.KIND, '555')
+        assert not ok and 'being taken' in reason
+        assert store.get(m.mandate_id).status == 'approved'
+
+
+class TestBeginSettle:
+    KIND = 'commerce_checkout'
+
+    def _approved(self, store, cart_ref='555', user='u1'):
+        m = store.create_cart_mandate(user, 'mcgroce', CART, kind=self.KIND,
+                                      cart_ref=cart_ref)
+        store.approve(m.mandate_id, user)
+        return m
+
+    def test_one_cart_is_paid_by_one_mandate_at_a_time(self, store):
+        a, b = self._approved(store), self._approved(store)
+        assert store.begin_settle(a.mandate_id) == (True, 'ok')
+        ok, reason = store.begin_settle(b.mandate_id)
+        assert not ok and 'being taken' in reason
+        assert store.begin_settle(a.mandate_id)[0] is False      # nor twice
+        store.end_settle(a.mandate_id)
+        assert store.begin_settle(b.mandate_id)[0]
+
+    def test_no_mandate_pays_for_a_cart_another_already_paid_for(self, store):
+        a, b = self._approved(store), self._approved(store)
+        store.consume(a.mandate_id)
+        ok, reason = store.begin_settle(b.mandate_id)
+        assert not ok and a.mandate_id in reason
+        store.record_order(a.mandate_id, 'ORD-1')
+        assert store.begin_settle(b.mandate_id)[0]
+
+    def test_a_payment_with_the_gateway_blocks_the_others_for_its_cart(self, store):
+        a, b = self._approved(store), self._approved(store)
+        store.ledger.get_payment(a.payment_id).update_status(PaymentStatus.PROCESSING)
+        assert store.begin_settle(b.mandate_id)[0] is False
+
+    def test_other_carts_and_other_shoppers_are_not_held_up(self, store):
+        a = self._approved(store)
+        assert store.begin_settle(a.mandate_id)[0]
+        assert store.begin_settle(self._approved(store, cart_ref='556').mandate_id)[0]
+        assert store.begin_settle(self._approved(store, user='u2').mandate_id)[0]
+
+    def test_the_cart_is_part_of_the_signed_record(self, store):
+        m = self._approved(store)
+        store._mandates[m.mandate_id].cart_ref = '999'      # a hand edit
+        assert store.verify_for_checkout(m.mandate_id, 'u1', CART) == (
+            False, 'mandate signature invalid')
 
 
 class TestDecidePayment:

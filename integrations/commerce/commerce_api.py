@@ -28,6 +28,13 @@ import time
 
 from flask import Blueprint, current_app, jsonify, request
 
+# At import, i.e. when the blueprint registers at boot: the nonce memory's
+# "signed before this process started" line is drawn when signing loads, so
+# loading it on the first request would refuse that request's honest
+# signature whenever McGroce's clock trails by a second.
+from integrations.commerce.signing import (
+    SIGNATURE_HEADER, response_signature, verify_request)
+
 logger = logging.getLogger(__name__)
 
 commerce_bp = Blueprint('commerce', __name__)
@@ -43,7 +50,6 @@ def commerce_session():
     secret = get_secret('COMMERCE_SESSION_SECRET', '')
     if not secret:
         return _json_error('commerce session exchange is not configured', 503)
-    from integrations.commerce.signing import verify_request
     body = request.get_data(cache=True)
     # The declared route, not request.path: a proxy prefix must not break
     # a signature McGroce made over the path it was told to call.
@@ -77,7 +83,6 @@ def commerce_session():
     expires_in = int(claims['exp'] - time.time()) if claims.get('exp') else None
     # Signed back, bound to this request's nonce: McGroce uses the token
     # only when the answer is provably this one, from this node.
-    from integrations.commerce.signing import SIGNATURE_HEADER, response_signature
     answer = json.dumps({'success': True, 'token': token, 'expiresIn': expires_in,
                          'userId': binding['user_id']}).encode('utf-8')
     resp = current_app.response_class(answer, mimetype='application/json')

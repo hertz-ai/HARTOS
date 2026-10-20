@@ -11161,6 +11161,25 @@ def chat():
 
             except Exception as e:
                 app.logger.error(f'gather_info parse error on turn {turn_num}: {e}')
+                if _confirmed_cfg is not None:
+                    # The person confirmed the config shown and its save
+                    # failed (a disk error, a locked file): nothing else is
+                    # saved in its place - the salvage below would save a
+                    # generic config they never saw (#205) - and the mark
+                    # stays, so their next plain yes saves it.
+                    app.logger.warning(
+                        "[GATHER] the config confirmed for %s could not be "
+                        "saved (%s) - asking the person to confirm again (#205)",
+                        prompt_id, e)
+                    _record_lifecycle('Creation Mode', user_id, prompt_id,
+                                      'Confirmed config could not be saved')
+                    return _chat_reply(
+                        user_id, request_id, response,
+                        intent=['FINAL_ANSWER'],
+                        req_token_count=0, res_token_count=0, history_request_id=[],
+                        Agent_status='Creation Mode', prompt_id=prompt_id,
+                        user_prompt=_user_turn_text,
+                    )
                 # After repeated failures, salvage what we can and move forward.
                 # For autonomous dispatches (agent daemon), salvage earlier (turn 3)
                 # to avoid tight retry loops that waste resources.

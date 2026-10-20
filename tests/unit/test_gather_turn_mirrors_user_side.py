@@ -505,6 +505,40 @@ def test_a_config_completed_after_a_question_is_shown_before_it_is_built(
                                                        'post a poll']
 
 
+def test_a_confirmed_save_the_disk_refuses_never_saves_another_config(tmp_path):
+    """Review of 5c6286c1f, probed: a plain yes whose save the disk refuses
+    with a permission error (errno 13, as a Windows file lock does) went the
+    parse-error way's FATAL branch: it saved the generic 'Respond to user'
+    config in place of the one confirmed, or, with that write refused too,
+    the error left chat().  The person confirmed THIS config: they are told
+    it could not be saved, nothing else is saved, the model is not asked,
+    and the next plain yes saves the config shown."""
+    import builtins
+    shown = {}
+    _drive(tmp_path, json.dumps(_NEWS), reviews_shown=shown)
+    record = f'{PROMPT_ID}.json'
+
+    def locked_open(path, *a, **kw):
+        if str(path).endswith(record):
+            raise PermissionError(13, 'Permission denied', str(path))
+        return builtins.open(path, *a, **kw)
+
+    payload, _, _, gather_calls = _drive(
+        tmp_path, '{"status": "pending", "question": "unused"}',
+        turn_before=1, user_text='yes', reviews_shown=shown,
+        extra_ns={'open': locked_open})
+    assert gather_calls == [], gather_calls
+    assert payload['Agent_status'] == 'Creation Mode', payload
+    assert 'could not save' in payload['response'], payload
+    assert _saved(tmp_path) is None, 'another config was saved in place of the one confirmed'
+    payload, _, _, gather_calls = _drive(
+        tmp_path, '{"status": "pending", "question": "unused"}',
+        turn_before=2, user_text='yes', reviews_shown=shown)
+    assert gather_calls == [], gather_calls
+    assert payload['Agent_status'] == 'Review Mode', payload
+    assert _saved(tmp_path)['flows'] == _NEWS['flows']
+
+
 def test_a_save_that_fails_leaves_the_yes_answerable_again(tmp_path):
     """The mark stays until the save takes it: when writing the record
     fails on the plain yes (here PROMPTS_DIR is a file, so the open raises),

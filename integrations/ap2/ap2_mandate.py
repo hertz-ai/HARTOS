@@ -142,14 +142,18 @@ class CartMandate:
     sig: str = ''
     #: What the paid-for thing became (a McGroce order number), once known.
     order_ref: Optional[str] = None
+    #: Which merchant-side cart this pays for (a McGroce cart's order id),
+    #: fixed and signed when the mandate is created.
+    cart_ref: Optional[str] = None
 
     def signed_fields(self) -> Dict[str, Any]:
         d = asdict(self)
         d.pop('sig', None)
-        # Absent until an order exists, so a record written before this
-        # field existed still verifies.
-        if d.get('order_ref') is None:
-            d.pop('order_ref', None)
+        # Absent while unset, so a record written before these fields
+        # existed still verifies.
+        for optional in ('order_ref', 'cart_ref'):
+            if d.get(optional) is None:
+                d.pop(optional, None)
         return d
 
 
@@ -166,6 +170,8 @@ class MandateStore:
         self._key = key
         self._lock = threading.Lock()
         self._mandates: Dict[str, CartMandate] = {}
+        # Mandates whose payment is being taken right now (begin_settle).
+        self._settling: set = set()
         self._load()
 
     # ── collaborators ────────────────────────────────────────────
@@ -262,12 +268,15 @@ class MandateStore:
                             ttl_s: Optional[int] = None,
                             description: str = '',
                             kind: str = KIND_GENERIC,
-                            requester_agent_id: Optional[str] = None
+                            requester_agent_id: Optional[str] = None,
+                            cart_ref: Optional[str] = None
                             ) -> CartMandate:
         """Create a pending CartMandate plus its APPROVAL_REQUIRED payment.
 
         ``requester_agent_id`` is the AGENT asking (the ledger refuses it as
         an approver); it defaults to ``ap2:<merchant>``, never the owner.
+        ``cart_ref`` names the merchant-side cart this pays for; it is signed
+        with the mandate, so a paid mandate can never be spent on another.
 
         Raises MandateError for an empty or malformed cart, a non-positive
         total, or a total over ``cap``.
@@ -325,7 +334,8 @@ class MandateStore:
             cart_hash=cart_hash, amount=str(amount), currency=currency,
             payment_id=payment.payment_id, created_at=now,
             expires_at=now + ttl, intent=intent, kind=kind,
-            description=description or f'{merchant} order')
+            description=description or f'{merchant} order',
+            cart_ref=None if cart_ref in (None, '') else str(cart_ref))
         m.sig = self._sign(m)
         with self._lock:
             self._mandates[mandate_id] = m
@@ -492,16 +502,25 @@ class MandateStore:
             self._save()
             return True
 
-    def supersede(self, user_id: str, merchant: str, kind: str,
-                  cart_hash: str) -> Tuple[bool, str]:
-        """Before a new checkout: void the owner's earlier live mandates of
-        this merchant and kind, so two approval cards for one cart can never
-        both be paid.  (ok, reason).
+    def _paid_unordered(self, m: CartMandate, cart_ref: Optional[str]) -> bool:
+        """``m`` took the money for ``cart_ref`` and its order is not placed.
+        A mandate consumed before cart_ref existed is not counted: its order
+        step ran under the old build, which kept no order_ref."""
+        return (m.status == 'consumed' and not m.order_ref
+                and m.cart_ref is not None and m.cart_ref == cart_ref)
 
-        Refused, voiding nothing, when an earlier payment can no longer be
-        stopped: one is with the gateway (PROCESSING), or this same cart was
-        already paid for and its order is not placed yet -- paying again
-        would charge twice; that order is retried with the earlier mandate.
+    def supersede(self, user_id: str, merchant: str, kind: str,
+                  cart_ref: Optional[str]) -> Tuple[bool, str]:
+        """Before a new checkout: void the owner's earlier live mandates of
+        this merchant and kind, so two approval cards can never both be paid.
+        (ok, reason).
+
+        Refused when an earlier payment can no longer be stopped: one is
+        being taken right now, one is with the gateway (PROCESSING), or this
+        same cart (``cart_ref``, whatever it holds now) was already paid for
+        and its order is not placed -- paying again would charge twice; that
+        order is retried with the earlier mandate, or a person sorts it out.
+        A mandate is voided only when its payment was really cancelled.
         """
         with self._lock:
             now = time.time()
@@ -511,25 +530,72 @@ class MandateStore:
             for m in mine:
                 self._expire_if_due(m, now)
             for m in mine:
-                if m.status == 'consumed' and not m.order_ref \
-                        and hmac.compare_digest(m.cart_hash, cart_hash):
+                if m.mandate_id in self._settling:
+                    return False, ('a payment for an earlier checkout is being '
+                                   'taken right now')
+                if self._paid_unordered(m, cart_ref):
                     return False, (f'this cart is already paid for (mandate '
                                    f'{m.mandate_id}); its order is being placed')
                 if m.status in ('pending', 'approved') \
                         and self._money_in_flight(m.payment_id):
                     return False, ('a payment for an earlier checkout is still '
                                    'in progress')
-            voided = 0
+            voided, stuck = 0, 0
             for m in mine:
-                if m.status in ('pending', 'approved'):
+                if m.status not in ('pending', 'approved'):
+                    continue
+                if self.ledger.cancel_payment(m.payment_id, 'ap2_mandate',
+                                              'replaced by a newer checkout'):
                     m.status = 'rejected'
                     m.sig = self._sign(m)
-                    self.ledger.cancel_payment(m.payment_id, 'ap2_mandate',
-                                               'replaced by a newer checkout')
                     voided += 1
+                else:
+                    stuck += 1   # the gateway has it now: leave it as it is
             if voided:
                 self._save()
+            if stuck:
+                return False, ('a payment for an earlier checkout is still '
+                               'in progress')
             return True, f'{voided} earlier checkout(s) withdrawn'
+
+    def begin_settle(self, mandate_id: str) -> Tuple[bool, str]:
+        """Claim the right to take the money for ``mandate_id``.  (ok, reason).
+
+        At most one mandate per merchant-side cart is settled at a time, and
+        none once another one for that cart took the money without its order
+        being placed or is with the gateway: two approvals for one cart --
+        two prepares that raced, an older card -- never both charge.  Pair
+        with end_settle in a finally.
+        """
+        with self._lock:
+            m = self._mandates.get(mandate_id)
+            if m is None:
+                return False, 'mandate not found'
+            if mandate_id in self._settling:
+                return False, 'this payment is already being taken'
+            if m.cart_ref is not None:
+                for other in self._mandates.values():
+                    if (other is m or other.user_id != m.user_id
+                            or other.merchant != m.merchant
+                            or other.kind != m.kind
+                            or other.cart_ref != m.cart_ref):
+                        continue
+                    if other.mandate_id in self._settling:
+                        return False, ('another payment for this cart is being '
+                                       'taken right now')
+                    if self._paid_unordered(other, m.cart_ref):
+                        return False, (f'this cart is already paid for (mandate '
+                                       f'{other.mandate_id})')
+                    if other.status == 'approved' \
+                            and self._money_in_flight(other.payment_id):
+                        return False, ('another payment for this cart is still '
+                                       'in progress')
+            self._settling.add(mandate_id)
+            return True, 'ok'
+
+    def end_settle(self, mandate_id: str) -> None:
+        with self._lock:
+            self._settling.discard(mandate_id)
 
 
 # ── the approval card and the one decision point ─────────────────

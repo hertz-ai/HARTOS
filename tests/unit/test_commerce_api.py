@@ -157,6 +157,15 @@ class TestMandateRead:
         assert ctx['client'].get('/api/commerce/mandates/x').status_code == 401
 
 
+def test_the_signing_memory_starts_when_the_routes_load():
+    # The "signed before this process started" line is drawn when signing
+    # loads; it must load with the blueprint at boot, not on the first
+    # session request (that request would be refused when McGroce's clock
+    # trails by a second).
+    from integrations.commerce import commerce_api
+    assert commerce_api.verify_request is signing.verify_request
+
+
 def test_health_reports_configuration(ctx):
     r = ctx['client'].get('/api/commerce/health')
     assert r.status_code == 200
