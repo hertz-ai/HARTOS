@@ -126,8 +126,10 @@ class JSONBackend(StorageBackend):
     # files carry no .json suffix and sit one level down, so no glob of
     # storage_dir ('*.json', 'ledger_*.json') ever sees them.
     _MARK_DIR = '.in_progress'
-    # Written once every key's mark has been set (SmartLedger.keys_in_progress).
-    _MARK_INDEX_COMPLETE = '.complete'
+    # Its modification time is when SmartLedger.keys_in_progress last started
+    # a pass over the unmarked files; the names in _MARK_DIR starting with '.'
+    # are the index's own, never keys.
+    _MARK_INDEX_STAMP = '.last_pass'
 
     def _mark_path(self, key: str):
         return self.storage_dir / self._MARK_DIR / self._get_path(key).stem
@@ -154,18 +156,24 @@ class JSONBackend(StorageBackend):
             names = os.listdir(self.storage_dir / self._MARK_DIR)
         except FileNotFoundError:
             return []
-        return [n for n in names if n != self._MARK_INDEX_COMPLETE]
+        return [n for n in names if not n.startswith('.')]
 
-    def mark_index_complete(self) -> bool:
-        """Whether every key has had its mark set since marks existed."""
-        return (self.storage_dir / self._MARK_DIR
-                / self._MARK_INDEX_COMPLETE).exists()
+    def mark_index_time(self) -> Optional[float]:
+        """When the last pass over the unmarked files started, or None
+        before the first one."""
+        try:
+            return os.stat(self.storage_dir / self._MARK_DIR
+                           / self._MARK_INDEX_STAMP).st_mtime
+        except OSError:
+            return None
 
-    def complete_mark_index(self) -> None:
-        """Record that every key has had its mark set.  Raises OSError."""
-        path = self.storage_dir / self._MARK_DIR / self._MARK_INDEX_COMPLETE
+    def stamp_mark_index(self, when: float) -> None:
+        """Record that every file written before ``when`` (epoch seconds)
+        has been read.  Raises OSError."""
+        path = self.storage_dir / self._MARK_DIR / self._MARK_INDEX_STAMP
         path.parent.mkdir(parents=True, exist_ok=True)
         os.close(os.open(path, os.O_CREAT | os.O_WRONLY))
+        os.utime(path, (when, when))
 
     def save(self, key: str, data: Dict[str, Any]) -> bool:
         try:
@@ -212,7 +220,7 @@ class JSONBackend(StorageBackend):
         try:
             self.set_mark(key, False)
         except OSError as e:
-            # The data is gone; a mark left behind is dropped by the next
+            # The data is gone; a mark left behind is cleared by the next
             # SmartLedger.keys_in_progress, which finds no file for it.
             print(f"[JSONBackend] Could not clear the in-progress mark for {key}: {e}")
         return True

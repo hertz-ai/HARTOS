@@ -158,11 +158,16 @@ def reap_once(dry_run: bool = False) -> Dict[str, Any]:
     }
 
     try:
+        import agent_ledger
         from agent_ledger import TaskStatus
         from .api import _iter_ledgers
     except ImportError as e:
         logger.debug("zombie_reaper: dependency unavailable (%s) — skipping tick", e)
         return summary
+    # The state the ledger's in-progress index tracks (one definition, in
+    # agent_ledger.core); an agent_ledger from before the index has none, and
+    # its walk is the whole folder anyway.
+    reapable = getattr(agent_ledger, 'WORK_IN_PROGRESS', TaskStatus.IN_PROGRESS)
 
     audit = None
     try:
@@ -193,7 +198,7 @@ def reap_once(dry_run: bool = False) -> Dict[str, Any]:
         for task in tasks:
             summary['examined'] += 1
             try:
-                if getattr(task, 'status', None) != TaskStatus.IN_PROGRESS:
+                if getattr(task, 'status', None) != reapable:
                     continue
                 age = _task_age(task)
                 if age is None or age < threshold:

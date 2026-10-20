@@ -277,18 +277,27 @@ _LEDGER_FILENAME = _re.compile(
 
 def _in_progress_ledger_names(storage_dir):
     """File names of the ledgers in ``storage_dir`` that hold a task in
-    progress: the ones whose saved state says so (the marks behind
-    ``SmartLedger.keys_in_progress``), plus any ledger this process holds
+    progress: the ones whose saved state says so
+    (``SmartLedger.keys_in_progress``), plus any ledger this process holds
     open whose in-memory state has one.  _iter_ledgers hands an open ledger
     back from the cache, so its unsaved state is what the reaper always
     examined; it still is.
-    """
-    from agent_ledger.core import SmartLedger
-    from agent_ledger.factory import cached_ledgers
 
-    names = {f'{key}.json' for key in SmartLedger.keys_in_progress(str(storage_dir))}
+    None when the agent_ledger on the path predates the index (a partial
+    hot-swap, an older install): the caller then walks every file, as it did
+    before the index existed.
+    """
+    from agent_ledger import factory
+    from agent_ledger.core import SmartLedger
+
+    keys_in_progress = getattr(SmartLedger, 'keys_in_progress', None)
+    cached_ledgers = getattr(factory, 'cached_ledgers', None)
+    if keys_in_progress is None or cached_ledgers is None:
+        logger.warning("agent_ledger has no in-progress index; walking every ledger")
+        return None
+    names = {f'{key}.json' for key in keys_in_progress(str(storage_dir))}
     for ledger in cached_ledgers():
-        name = f'ledger_{ledger.agent_id}_{ledger.session_id}.json'
+        name = ledger.ledger_file.name
         if (name not in names and ledger.has_work_in_progress()
                 and (storage_dir / name).is_file()):
             names.add(name)
@@ -317,9 +326,8 @@ def _iter_ledgers(agent_filter=None, in_progress_only=False):
     storage_dir = Path(get_agent_data_dir())
     if not storage_dir.is_dir():
         return
-    if in_progress_only:
-        names = _in_progress_ledger_names(storage_dir)
-    else:
+    names = _in_progress_ledger_names(storage_dir) if in_progress_only else None
+    if names is None:
         names = (f.name for f in storage_dir.glob('ledger_*.json'))
     for name in names:
         m = _LEDGER_FILENAME.match(name)
