@@ -1461,6 +1461,9 @@ class SmartLedger:
         # EARLIER process recorded.  add_task may replace one of these once
         # it is terminal; a task this process added is never replaced.
         self._loaded_task_ids: set = set()
+        # True once this instance has cleared its in-progress mark, so later
+        # saves with nothing in progress skip the unlink (see _mark_in_progress).
+        self._unmarked = False
         self.load()
 
     def load(self):
@@ -1506,6 +1509,7 @@ class SmartLedger:
                     for task_id, task in self.tasks.items()
                 }
             }
+            in_progress = self.has_work_in_progress()
         # Serialize + write outside self._lock — a slow save no longer blocks
         # add_task / get_task / update_task_status on another thread.
         # REVIEW hartos-7c 2026-09-20 (codex's change): AGREED, and the
@@ -1517,16 +1521,54 @@ class SmartLedger:
         # still produce.  Nothing does `if not ledger.save()`.
         with self._io_lock:
             try:
+                # The mark goes on before the write and comes off after it,
+                # so a crash in between leaves an extra mark (the reaper opens
+                # one ledger for nothing), never a missing one.
+                if in_progress:
+                    self._mark_in_progress(True)
                 saved = self.backend.save(self.ledger_key, data)
                 if saved is False:
                     logger.error(
                         "Backend rejected save for ledger %s", self.ledger_key)
                     return False
+                if not in_progress:
+                    self._mark_in_progress(False)
                 logger.info(f"Saved {len(data['tasks'])} tasks to ledger")
                 return True
             except Exception as e:
                 logger.error(f"Failed to save ledger: {e}")
                 return False
+
+    def has_work_in_progress(self) -> bool:
+        """Whether any task is IN_PROGRESS, the state the zombie reaper reaps."""
+        with self._lock:
+            return any(task.status == TaskStatus.IN_PROGRESS
+                       for task in self.tasks.values())
+
+    def _mark_in_progress(self, on: bool) -> None:
+        """Keep the backend's in-progress mark for this ledger in step with
+        what save() writes.  Backends without marks have nothing to keep.
+
+        Only the cleared state is remembered.  Setting the mark again on every
+        save that has work in progress costs one open of an existing empty
+        file, and keeps the mark right when another process sharing this file
+        cleared it in between; a remembered 'set' would then hide this
+        ledger's running task from the reaper.
+
+        Never raises: a mark that cannot be written must not fail the save,
+        whose callers roll the status change back on failure.
+        """
+        set_mark = getattr(self.backend, 'set_mark', None)
+        if set_mark is None or (not on and self._unmarked):
+            return
+        try:
+            set_mark(self.ledger_key, on)
+        except OSError as e:
+            logger.warning(
+                f"Could not {'set' if on else 'clear'} the in-progress mark "
+                f"for {self.ledger_key}: {e}")
+            return
+        self._unmarked = not on
 
     def enable_pubsub(self, redis_client) -> None:
         """Enable distributed notifications via Redis PUBSUB."""
@@ -2745,6 +2787,65 @@ class SmartLedger:
                     flows[fl] = sorted(flows[fl], key=lambda x: x[0])
 
         return groups
+
+    @staticmethod
+    def keys_in_progress(ledger_dir: str = "agent_data") -> List[str]:
+        """Keys (``ledger_{agent_id}_{session_id}``) of the ledgers in
+        ``ledger_dir`` whose saved state holds an IN_PROGRESS task.
+
+        Read from the marks save() keeps (JSONBackend.set_mark), so the cost
+        follows the ledgers with work in flight, not every ledger file in the
+        folder: measured 2026-10-20 on the desktop, the zombie reaper's first
+        tick after boot built all 2,489 ledgers (14,294 tasks, 86 s) to find
+        no task in progress.
+
+        Ledgers saved before marks existed have none, so the first call on a
+        folder indexes it once from the raw files (no ledger is built, nothing
+        is cached) and records that it did.  The index only ever adds marks,
+        so a save racing it can leave an extra mark, never drop one.  A mark
+        whose ledger file is gone is cleared.
+        """
+        from agent_ledger.backends import JSONBackend
+        ledger_path = Path(ledger_dir)
+        backend = JSONBackend(storage_dir=str(ledger_path))
+        if not backend.mark_index_complete():
+            found, unreadable = [], 0
+            for f in ledger_path.glob('ledger_*.json'):
+                try:
+                    with open(f, 'r', encoding='utf-8') as fh:
+                        tasks = (json.load(fh) or {}).get('tasks') or {}
+                    if any((t or {}).get('status') == TaskStatus.IN_PROGRESS.value
+                           for t in tasks.values()):
+                        found.append(f.stem)
+                except (OSError, ValueError, AttributeError) as e:
+                    # A file SmartLedger cannot load opens as an empty
+                    # ledger, which holds nothing to reap; count, don't mark.
+                    unreadable += 1
+                    logger.debug(f"Not indexing unreadable ledger {f.name}: {e}")
+            try:
+                for key in found:
+                    backend.set_mark(key, True)
+                backend.complete_mark_index()
+            except OSError as e:
+                # The scan's answer stands; only recording it failed, so the
+                # next call scans again rather than trusting a partial index.
+                logger.warning(
+                    f"Could not record the in-progress index in {ledger_path} "
+                    f"({e}); it is rebuilt on the next call")
+                return found
+            logger.info(
+                f"Indexed in-progress ledgers in {ledger_path}: {len(found)} "
+                f"marked, {unreadable} unreadable file(s) skipped")
+        keys = []
+        for key in backend.marked_keys():
+            if backend.exists(key):
+                keys.append(key)
+                continue
+            try:
+                backend.set_mark(key, False)
+            except OSError as e:
+                logger.debug(f"Could not clear the mark of deleted ledger {key}: {e}")
+        return keys
 
     def get_all_descendants(self, task_id: str) -> List[Task]:
         """Get all descendant tasks recursively."""

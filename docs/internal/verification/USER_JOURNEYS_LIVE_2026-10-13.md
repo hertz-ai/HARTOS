@@ -330,6 +330,47 @@ server (the row "what slowed it", below; they ended between 15:41:25 and
 | Rows 27 to 37 | the reel and the evolve loop | Not reached: the setup was two gather turns in (its conversation lives 1 h from 15:46:06 on the desktop, so a later turn starts again at 1/12); the next answer could not be typed over adb (the phone's chat box ignored typed and deleted keys while the screen showed it empty and the view tree held the old answer). The 33 loops ended by 15:47:27 on their own, so no restart is needed; the remaining answers are typed on the phone and watched on both ends | | NOT RUN |
 
 
+### 11.4 Reel Studio, the confirmation loop fixed and proven on the INSTALLED build (hartos-94, 2026-10-20, 12:02 to 12:12 IST)
+
+Node: the installed desktop (Nunba 22b282cf; HARTOS ed6576624 with the
+hart_intelligence_entry.py of 181cb2c87 hot-swapped at 12:02:44 IST into
+python-embed site-packages, lib\hart_intelligence_entry.pyc and the
+library.zip entry, compiled by the bundle's python-embed 3.12.6; the
+installed .py was byte-equal to ed657662 before and no other commit had
+touched the file; Nunba stopped 12:02:43 with the owner idle 1289 s,
+relaunched elevated 12:02:45 as pid 8928, supervisor registered 12:05:20,
+Tier-1 ACTIVE 12:09:56; the two llama-servers of 10:26 and 10:28 reused;
+Qwen3.5 2B). No phone in this section: it was on the LAN but off adb, and
+the owner away, so the turns are a throwaway user's (probe_hartos94_20261020,
+prompt 990019) sent to Nunba /chat exactly as the phone sends them
+(goal_tags [reel_studio], create_agent on the first turn, media_mode text).
+
+Why this section exists: section 11.3's run (and the owner's own turns
+17:39 to 17:45 on 10-19) ended at "Before I build it, here is the agent as I
+have it ... Reply yes to build it" three times over, because rule #205
+(61624c9b8, 10-10: build only the config shown) sent every "yes" to the
+model and saved only if its next answer carried exactly the steps shown;
+the 2B rewrote them every time. The owner's ruling on the fix: a plain yes,
+no fuzzy pattern matching. The owner's question "how do we know user said
+yes after we created full gather requirements": the per-session mark that
+the shortcut reads is written only by the reply that showed the full config
+and cleared by every other reply (a question, a request for the steps, a
+save), so a "yes" to one of the model's questions goes to the model.
+
+| Step | What was sent | What the desktop did (frozen_debug.log / reply) |
+|---|---|---|
+| Turn 1, 12:10:27 | the goal ("an agent that makes a short reel from the clips I send it ...", create_agent true) | served_by local, 13.0 s, request be0716bb: the setup's first question (a name for the companion) |
+| Turns 2 to 4, 12:10:37 to 12:11:00 | name + goal; the three steps; "nothing else, one flow" | local, 10.6 / 13.2 / 10.0 s (7463750c, 5909cf31, 64b74a1c): questions on clip type, persona name, persona name again |
+| Turn 5, 12:11:33 | "The persona is a video editor. No tools beyond editing. That is all, please finish the configuration." | local, 32.9 s, request f59ff054: the model completed; HARTOS "[GATHER] completed before any review was shown for 990019 - showing the config to the person (#205)" and the reply "Before I build it, here is the agent as I have it: Name: Reel Studio Goal: Transform uploaded video clips into a 20-second highlight reel ... Reel Creation (Video Editor): 1. Receive user-uploaded video clips and analyze them to identify the most engaging moments. 2. Trim and concatenate the selected highlights to fit a precise 20-second duration. 3. Generate a caption summarizing the best moments ... Reply yes to build it, or tell me what to change." |
+| Turn 6, 12:11:34 | "yes" | request 673f3757, 0.3 s: "gather_info turn 6/12", "[GATHER] the person confirmed the config shown for 990019 - building it as shown; the model is not asked (#205)", "Agent config saved to C:\Users\sathi\Documents\Nunba\data\prompts\990019.json"; reply "Got Agent details successfully lets move on to review them one at a time"; the record carries goal_tags ["reel_studio"], flow "Reel Creation", persona "Video Editor", exactly the three steps shown. The file was copied to the session scratchpad and removed from the prompts dir (throwaway). |
+| Not reached | the phone's own yes for agent 342; rows 27 to 37 | the phone was off adb; the next phone turn starts agent 342's setup at 1/12 again (each Nunba restart clears the in-memory gather conversation) |
+
+What this proves: on the installed build, the plain yes to the config
+HARTOS showed builds that config in under a second and never asks the
+model; the loop that stopped the owner's 10-19 setup is gone on this path.
+What it does not prove: the same turn from the phone over the device link
+(owed), and the reel itself (rows 27 to 37).
+
 ## 10. What this proves
 
 Measured on the public host: the social feed read and the public agent

@@ -13,7 +13,6 @@ stand-in, so nothing reaches the real one.
 """
 import json
 import os
-import shutil
 import sys
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -99,6 +98,17 @@ def _save_idle_ledgers(data_dir):
                      ['pending', 'completed'] if i % 2 else ['pending'])
 
 
+def _drop_marks(data_dir):
+    """Make the folder look as an older version left it: ledgers, no marks.
+    The mark folder is flat; shutil.rmtree is avoided because it is broken in
+    this venv (os._walk_symlinks_as_files, venv 3.12.3 on a 3.12 stdlib)."""
+    marks = data_dir / '.in_progress'
+    if marks.is_dir():
+        for name in os.listdir(marks):
+            os.remove(marks / name)
+        os.rmdir(marks)
+
+
 def _reap():
     from integrations.agent_engine.zombie_reaper import reap_once
     return reap_once()
@@ -129,7 +139,7 @@ def test_ledgers_saved_before_marks_existed_are_found(agent_data):
     indexes them from the raw files and reaps what the old walk reaped."""
     _save_idle_ledgers(agent_data.dir)
     _save_ledger(agent_data.dir, 'busy', ['in_progress'])
-    shutil.rmtree(agent_data.dir / '.in_progress', ignore_errors=True)
+    _drop_marks(agent_data.dir)
 
     out = _reap()
 
@@ -202,7 +212,7 @@ def test_an_index_that_cannot_be_recorded_still_answers(agent_data, monkeypatch)
     from agent_ledger.core import SmartLedger
     _save_idle_ledgers(agent_data.dir)
     _save_ledger(agent_data.dir, 'busy', ['in_progress'])
-    shutil.rmtree(agent_data.dir / '.in_progress', ignore_errors=True)
+    _drop_marks(agent_data.dir)
 
     def refuse(self):
         raise PermissionError('mark folder is read-only')
