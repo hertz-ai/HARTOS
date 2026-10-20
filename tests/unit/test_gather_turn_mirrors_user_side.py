@@ -505,6 +505,31 @@ def test_a_config_completed_after_a_question_is_shown_before_it_is_built(
                                                        'post a poll']
 
 
+def test_a_save_that_fails_leaves_the_yes_answerable_again(tmp_path):
+    """The mark stays until the save takes it: when writing the record
+    fails on the plain yes (here PROMPTS_DIR is a file, so the open raises),
+    the person is told, no model is asked, nothing is saved, and the next
+    plain yes builds the same config once the disk is back."""
+    shown = {}
+    _drive(tmp_path, json.dumps(_NEWS), reviews_shown=shown)
+    blocked = tmp_path / 'not_a_dir'
+    blocked.write_text('x')
+    payload, _, _, gather_calls = _drive(
+        tmp_path, '{"status": "pending", "question": "unused"}',
+        turn_before=1, user_text='yes', reviews_shown=shown,
+        extra_ns={'PROMPTS_DIR': str(blocked)})
+    assert gather_calls == [], gather_calls
+    assert payload['Agent_status'] == 'Creation Mode', payload
+    assert 'could not save' in payload['response'], payload
+    assert _saved(tmp_path) is None
+    payload, _, _, gather_calls = _drive(
+        tmp_path, '{"status": "pending", "question": "unused"}',
+        turn_before=2, user_text='yes', reviews_shown=shown)
+    assert gather_calls == [], gather_calls
+    assert payload['Agent_status'] == 'Review Mode', payload
+    assert _saved(tmp_path)['flows'] == _NEWS['flows']
+
+
 def test_the_same_steps_numbered_or_spaced_differently_are_the_ones_shown(
         tmp_path):
     """A model that numbers or spaces the confirmed steps differently on the
