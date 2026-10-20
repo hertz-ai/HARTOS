@@ -1778,6 +1778,30 @@ def build_core_tool_closures(ctx):
         file_id = recent_file_id.get(user_id)
         if file_id:
             return f'Got user uploaded file the file_id is {file_id}'
+        # Else the clips she sent this agent that no reel has used yet, by
+        # the rule reel_make reads (core.chat_attachments.latest_inbound).
+        # Measured 2026-10-20 (request 8610dffc): her Reel Studio agent 342
+        # called this three times, read "No file uploaded from user" while
+        # the store held her five clips for it, and asked her where they were.
+        from core.chat_attachments import latest_inbound
+        files = latest_inbound(user_id, prompt_id)
+        if files:
+            def _at(seconds):
+                try:        # captured_at is what her phone sent: any int > 0
+                    return datetime.fromtimestamp(seconds).astimezone().isoformat(
+                        timespec='seconds')
+                except (OverflowError, OSError, ValueError):
+                    return None
+            return json.dumps({
+                'count': len(files),
+                'files': [{'file_id': f['xid'], 'name': f['name'], 'mime': f['mime'],
+                           'size': f['size'], 'sent_at': _at(f['created_at']),
+                           'filmed_at': (_at(f['meta']['captured_at'] / 1000)
+                                         if f['meta'].get('captured_at') else None)}
+                          for f in files],
+                'note': ('The files she sent this agent that no reel has used yet, '
+                         'in the order she sent them.'),
+            })
         return 'No file uploaded from user'
 
     tools.append((
