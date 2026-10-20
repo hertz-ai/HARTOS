@@ -340,7 +340,14 @@ installed .py was byte-equal to ed657662 before and no other commit had
 touched the file; Nunba stopped 12:02:43 with the owner idle 1289 s,
 relaunched elevated 12:02:45 as pid 8928, supervisor registered 12:05:20,
 Tier-1 ACTIVE 12:09:56; the two llama-servers of 10:26 and 10:28 reused;
-Qwen3.5 2B). No phone in this section: it was on the LAN but off adb, and
+the chat model answering this node's turns was Qwen3.5-4B on :8080, pid
+3580, not the 2B of 10-19; the yes path asks no model, so the proof itself
+does not depend on which). Times in the table are the probe's reply times;
+turn 1 reached Nunba at 12:10:15 and HARTOS logged "gather_info turn 1/12"
+at 12:10:17. The probe read the reply key as Agent_status while Nunba passes
+it as agent_status, so the transcript's "Agent_status=None" is the probe's
+misread, not the wire value; the saved record and the log lines are the
+proof. No phone in this section: it was on the LAN but off adb, and
 the owner away, so the turns are a throwaway user's (probe_hartos94_20261020,
 prompt 990019) sent to Nunba /chat exactly as the phone sends them
 (goal_tags [reel_studio], create_agent on the first turn, media_mode text).
@@ -359,10 +366,10 @@ save), so a "yes" to one of the model's questions goes to the model.
 
 | Step | What was sent | What the desktop did (frozen_debug.log / reply) |
 |---|---|---|
-| Turn 1, 12:10:27 | the goal ("an agent that makes a short reel from the clips I send it ...", create_agent true) | served_by local, 13.0 s, request be0716bb: the setup's first question (a name for the companion) |
-| Turns 2 to 4, 12:10:37 to 12:11:00 | name + goal; the three steps; "nothing else, one flow" | local, 10.6 / 13.2 / 10.0 s (7463750c, 5909cf31, 64b74a1c): questions on clip type, persona name, persona name again |
-| Turn 5, 12:11:33 | "The persona is a video editor. No tools beyond editing. That is all, please finish the configuration." | local, 32.9 s, request f59ff054: the model completed; HARTOS "[GATHER] completed before any review was shown for 990019 - showing the config to the person (#205)" and the reply "Before I build it, here is the agent as I have it: Name: Reel Studio Goal: Transform uploaded video clips into a 20-second highlight reel ... Reel Creation (Video Editor): 1. Receive user-uploaded video clips and analyze them to identify the most engaging moments. 2. Trim and concatenate the selected highlights to fit a precise 20-second duration. 3. Generate a caption summarizing the best moments ... Reply yes to build it, or tell me what to change." |
-| Turn 6, 12:11:34 | "yes" | request 673f3757, 0.3 s: "gather_info turn 6/12", "[GATHER] the person confirmed the config shown for 990019 - building it as shown; the model is not asked (#205)", "Agent config saved to C:\Users\sathi\Documents\Nunba\data\prompts\990019.json"; reply "Got Agent details successfully lets move on to review them one at a time"; the record carries goal_tags ["reel_studio"], flow "Reel Creation", persona "Video Editor", exactly the three steps shown. The file was copied to the session scratchpad and removed from the prompts dir (throwaway). |
+| Turn 1, received 12:10:15, reply 12:10:27 | the goal ("an agent that makes a short reel from the clips I send it ...", create_agent true) | served_by local, 13.0 s, request be0716bb: the setup's first question (a name for the companion) |
+| Turns 2 to 4, replies 12:10:37 to 12:11:00 | name + goal; the three steps; "nothing else, one flow" | local, 10.6 / 13.2 / 10.0 s (7463750c, 5909cf31, 64b74a1c): questions on clip type, persona name, persona name again |
+| Turn 5, reply 12:11:33 | "The persona is a video editor. No tools beyond editing. That is all, please finish the configuration." | local, 32.9 s, request f59ff054: the model completed; HARTOS "[GATHER] completed before any review was shown for 990019 - showing the config to the person (#205)" and the reply "Before I build it, here is the agent as I have it: Name: Reel Studio Goal: Transform uploaded video clips into a 20-second highlight reel ... Reel Creation (Video Editor): 1. Receive user-uploaded video clips and analyze them to identify the most engaging moments. 2. Trim and concatenate the selected highlights to fit a precise 20-second duration. 3. Generate a caption summarizing the best moments ... Reply yes to build it, or tell me what to change." |
+| Turn 6, received 12:11:33.792, reply 12:11:34.033 | "yes" | request 673f3757, 0.3 s: "gather_info turn 6/12", "[GATHER] the person confirmed the config shown for 990019 - building it as shown; the model is not asked (#205)", "Agent config saved to C:\Users\sathi\Documents\Nunba\data\prompts\990019.json"; reply "Got Agent details successfully lets move on to review them one at a time"; the record carries goal_tags ["reel_studio"], flow "Reel Creation", persona "Video Editor", exactly the three steps shown. The file was copied to the session scratchpad and removed from the prompts dir (throwaway). |
 | Not reached | the phone's own yes for agent 342; rows 27 to 37 | the phone was off adb; the next phone turn starts agent 342's setup at 1/12 again (each Nunba restart clears the in-memory gather conversation) |
 
 What this proves: on the installed build, the plain yes to the config
