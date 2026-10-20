@@ -380,31 +380,35 @@ What it does not prove: the same turn from the phone over the device link
 
 ### 11.5 Reel Studio row 26 on the real phone path, by the owner (2026-10-20, 19:28 to 19:37 IST)
 
-Node: the installed desktop. Which build served this window is not
-pinned: the only boot line found today is 20:39:20 (Nunba c92c7111 /
-HARTOS 1b6e34f42, files with an 18:50 mtime), and the earlier one was the
-12:02 hot-swap relaunch; in both, the HARTOS entry file is byte-equal to
-181cb2c87's. The model was Qwen3.5-4B on :8080 (started 16:08:58; 27
-completions in the window). Phone: the owner's SM-S918B; its device link was accepted at 19:28:21 (from
-192.168.29.99, kind=device, trust same_user). The owner drove it; no turn
-in this section was sent by a session. Read from server.log.1 and the
-desktop's conversation_entries (read-only).
+Node: the installed desktop booted at 16:08:40 (boot_record "[BUILD]
+nunba=c92c7111 hartos=1b6e34f42 built=2026-10-20T10:14:14Z", "Starting
+Nunba Server" 16:08:42; no other server start until 20:39:32). 1b6e34f42
+carries 181cb2c87's hart_intelligence_entry.py unchanged (same git blob).
+The model was Qwen3.5-4B on :8080 (started 16:08:58). Phone: the owner's
+SM-S918B; its device link was accepted at 19:28:21 (from 192.168.29.99,
+kind=device, trust same_user). The owner drove it; no turn in this section
+was sent by a session. Read from server.log.1, boot_record.jsonl,
+gui_app.log.2 and the desktop's conversation_entries (read-only).
 
 | Step | What the phone sent | What the desktop did |
 |---|---|---|
-| Turn 1, received 19:28:26 | request 0ac71204, 1,291 chars: the agent as the desktop last showed it ("Before I build it here is the agent as I have it: Name: Reel Studio Goal: Automate the creation of high-converting Instagram Reels for a makeup studio ..."), media_mode text | "staying here so HARTOS carries on creating it" (Nunba, goal tags ['reel_studio']); "gather_info turn 1/12 for 10202_342" 19:28:27; PENDING, a question back ("Before I finalize the configuration, I have ...") |
-| Turn 2, received 19:32:17 | request adec0bf4: "Agent name use Reel studio Not broadcast Refine to make them atomic Persona name MUA" | gather 2/12; the model's own review (review_details: "Here is a review of the details gathered so far ... Name: Reel Studio ...") |
-| Turn 3, received 19:33:32 | request da53c796: "Looks good" | gather 3/12; COMPLETED STATUS; "Agent config saved to C:\Users\sathi\Documents\Nunba\data\prompts\342.json" 19:33:39; reply "Got Agent details successfully lets move on to review them one at a time"; chat.new on SSE 19:33:39 |
+| Turn 1, received 19:28:26 | request 0ac71204, 1,291 chars: the agent as the desktop last showed it on 10-19 ("Before I build it here is the agent as I have it: Name: Reel Studio Goal: Automate the creation of high-converting Instagram Reels for a makeup studio ..."), media_mode text | "staying here so HARTOS carries on creating it" (Nunba, goal tags ['reel_studio']); "gather_info turn 1/12 for 10202_342" 19:28:27; PENDING, a question back; device reply 200, 3143 bytes, 19:28:34 |
+| Turn 2, received 19:32:17 | request adec0bf4: "Agent name use Reel studio Not broadcast Refine to make them atomic Persona name MUA" | gather 2/12; the model's own review (review_details: "Here is a review of the details gathered so far ... Name: Reel Studio ..."); device reply 200, 4801 bytes, 19:32:27 |
+| Turn 3, received 19:33:32 | request da53c796: "Looks good" | gather 3/12; COMPLETED STATUS; "Agent config saved to C:\Users\sathi\Documents\Nunba\data\prompts\342.json" 19:33:39; reply "Got Agent details successfully lets move on to review them one at a time"; device reply 200, 439 bytes, 19:33:39 |
 | The record | | goal_tags ["reel_studio"], creator_user_id 10202, one flow "Reel Creation Flow" with 9 steps; 342_personality.json at 19:34:14 |
-| CREATE, 19:37 | | request 8610dffc: "I need your input to finish building this agent. Step 1 ("Verify the 5 clips are accessible in this chat session and confirm their exact order.") isn't coming together ..."; cause measured by another lane: get_user_uploaded_file saw no file for the turn; fix HARTOS 5e1f7a178 (20:30), which the 20:39 install (HARTOS 1b6e34f42) does not carry |
+| Turn 4, received 19:33:49 | request 8610dffc: "Ok" (2 chars) | CREATE resumed; reply at 19:37:25: "I need your input to finish building this agent. Step 1 ("Verify the 5 clips are accessible in this chat session and confirm their exact order.") isn't coming together ..."; device reply 200, 863 bytes. Cause measured by another lane: get_user_uploaded_file saw no file for the turn; fix HARTOS 5e1f7a178 (20:30), a child of 1b6e34f42, so no build booted today carries it |
+| Model calls | | 8 completions on :8080 for the three setup turns (19:28:26 to 19:33:39), 61 for CREATE's first step (19:33:49 to 19:37:26) |
 
 What this proves: the phone's Reel Studio setup reaches the desktop over the
-device link, stays local, and ends in a saved Reel Studio agent with its tag;
-the desktop's replies reached the owner (each answer responds to the reply
-before it). "Looks good" is not the plain yes, so the save went the model's
-own-review way; the plain-yes shortcut (section 11.4) was not exercised on
-the phone. What it does not prove: the reel (row 27 stopped at CREATE's first
-step), and the phone's screen itself (not read).
+device link, stays local, and ends in a saved Reel Studio agent record with
+its tag, and each reply went back to the phone (mobile_adapter 200 with the
+bytes above). "Looks good" is not the plain yes, so the save went the
+model's own-review way; the plain-yes shortcut (section 11.4) was not
+exercised on the phone. What it does not prove: row 26's banked recipe (no
+342_*_recipe.json; CREATE stopped at step 1 on the clips), the reel (row
+27), and the phone screen itself (not read). Also measured: the fourth user
+turn ("Ok") and the user side of the 12:10 probe turn be0716bb are missing
+from conversation_entries; handed to the persistence owner.
 
 ## 10. What this proves
 
