@@ -2,15 +2,18 @@
 /api/commerce/* -- the McGroce <-> HARTOS session exchange and status reads.
 
   POST /api/commerce/session        server-to-server from McGroce's Tomcat
-                                    (SpaAgentTokenEndpoint).  Header
-                                    X-Commerce-Secret must equal
-                                    COMMERCE_SESSION_SECRET (constant-time).
-                                    Body {customerId, username, role,
-                                    storeId}.  Writes the commerce binding and
-                                    returns a HARTOS JWT (tenant 'mcgroce')
-                                    the SPA then sends as Bearer to POST /chat
-                                    and /api/agent/approval.  The McGroce
-                                    service account never reaches a browser.
+                                    (SpaAgentTokenEndpoint).  Signed with a
+                                    key derived from COMMERCE_SESSION_SECRET
+                                    (timestamp, single-use nonce, body hash:
+                                    integrations/commerce/signing.py); the
+                                    secret itself never travels, and the
+                                    answer is signed back.  Body {customerId,
+                                    username, role, storeId}.  Writes the
+                                    commerce binding and returns a HARTOS JWT
+                                    (tenant 'mcgroce') the SPA then sends as
+                                    Bearer to POST /chat and
+                                    /api/agent/approval.  The McGroce service
+                                    account never reaches a browser.
   GET  /api/commerce/mandates/<id>  the caller's own mandate status (JWT).
   GET  /api/commerce/stream         where the caller's live cards arrive
                                     (no new stream: the per-user topic).
@@ -19,11 +22,11 @@
 The agentic chat itself is the existing POST /chat -- no second chat route.
 """
 
-import hmac
+import json
 import logging
 import time
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, current_app, jsonify, request
 
 logger = logging.getLogger(__name__)
 
@@ -37,15 +40,26 @@ def _json_error(message: str, code: int):
 @commerce_bp.route('/api/commerce/session', methods=['POST'])
 def commerce_session():
     from core.config_cache import get_secret
-    expected = get_secret('COMMERCE_SESSION_SECRET', '')
-    if not expected:
+    secret = get_secret('COMMERCE_SESSION_SECRET', '')
+    if not secret:
         return _json_error('commerce session exchange is not configured', 503)
-    given = request.headers.get('X-Commerce-Secret', '')
-    if not hmac.compare_digest(given.encode('utf-8'), expected.encode('utf-8')):
+    from integrations.commerce.signing import verify_request
+    body = request.get_data(cache=True)
+    # The declared route, not request.path: a proxy prefix must not break
+    # a signature McGroce made over the path it was told to call.
+    ok, why, nonce = verify_request(secret, request.method,
+                                    request.url_rule.rule, request.headers,
+                                    body)
+    if not ok:
         from core.auth_local import client_key
-        logger.warning('commerce session: bad secret from %s', client_key())
+        logger.warning('commerce session: refused from %s: %s', client_key(), why)
         return _json_error('forbidden', 403)
-    data = request.get_json(silent=True) or {}
+    try:
+        data = json.loads(body or b'{}')
+    except ValueError:
+        data = None
+    if not isinstance(data, dict):
+        return _json_error('the body must be a JSON object', 400)
     customer_id = data.get('customerId')
     username = str(data.get('username') or '').strip()
     role = str(data.get('role') or 'customer').strip().lower()
@@ -61,8 +75,14 @@ def commerce_session():
     token = generate_jwt(binding['user_id'], username, role, tenant_id=TENANT)
     claims = decode_jwt(token) or {}
     expires_in = int(claims['exp'] - time.time()) if claims.get('exp') else None
-    return jsonify({'success': True, 'token': token, 'expiresIn': expires_in,
-                    'userId': binding['user_id']})
+    # Signed back, bound to this request's nonce: McGroce uses the token
+    # only when the answer is provably this one, from this node.
+    from integrations.commerce.signing import SIGNATURE_HEADER, response_signature
+    answer = json.dumps({'success': True, 'token': token, 'expiresIn': expires_in,
+                         'userId': binding['user_id']}).encode('utf-8')
+    resp = current_app.response_class(answer, mimetype='application/json')
+    resp.headers[SIGNATURE_HEADER] = response_signature(secret, nonce, answer)
+    return resp
 
 
 @commerce_bp.route('/api/commerce/mandates/<mandate_id>', methods=['GET'])

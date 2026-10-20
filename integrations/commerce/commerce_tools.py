@@ -3,9 +3,9 @@ Commerce tools -- McGroce shopping, checkout and merchant onboarding for agents.
 
 Tier-2, goal-gated: create_recipe / reuse_recipe call
 ``register_commerce_tools`` when the goal carries the ``commerce`` tag
-(marketing_tools.detect_goal_tags, or a goal type registered with it).  The
-same pure functions are listed in ``COMMERCE_TOOLS`` for the MCP bridge --
-one implementation, two exposures.
+(marketing_tools.detect_goal_tags, or a goal type registered with it).  They
+are listed in ``COMMERCE_TOOLS``; the MCP bridge does not expose them (see
+there).
 
 Every function takes ``user_id`` first.  The agent registration binds it from
 the registrar (the verified identity of the conversation), so the model never
@@ -33,6 +33,7 @@ import inspect
 import json
 import logging
 import re
+import time
 from typing import Annotated, Any, Dict, List, Optional
 
 from integrations.ap2.ap2_protocol import (
@@ -387,7 +388,16 @@ def commerce_prepare_checkout(
     if mock_would_settle(get_payment_ledger().select_gateway(CURRENCY)):
         refuse_no_live_gateway('commerce', user_id)
         return _fail(_NO_LIVE_GATEWAY)
-    from integrations.ap2.ap2_mandate import MandateError
+    from integrations.ap2.ap2_mandate import MandateError, canonical_cart_hash
+    # One live checkout per shopper: two approval cards for one cart could
+    # otherwise both be paid, and only the first could become an order.
+    try:
+        ok, reason = _mandates().supersede(user_id, MERCHANT, CHECKOUT_KIND,
+                                           canonical_cart_hash(mandate_cart(view)))
+    except MandateError as e:
+        return _fail(str(e))
+    if not ok:
+        return _fail(reason)
     try:
         m = _mandates().create_cart_mandate(
             user_id, MERCHANT, mandate_cart(view), cap=cap,
@@ -422,11 +432,15 @@ def commerce_checkout(
     """Pay for the approved cart and place the McGroce order.
 
     Approving the card already does this; call it only to retry a checkout
-    that did not complete.  Refuses unless the shopper approved.
+    that did not complete.  Refuses unless the shopper approved.  When the
+    payment went through but the order did not, this places the order with
+    that payment; it never charges again.
     """
     m = _mandates().get(mandate_id)
     if m is None or m.user_id != str(user_id):
         return _fail('checkout refused: mandate not found')
+    if m.status == 'consumed':
+        return _out(retry_order(m))
     return _out(settle_checkout(m))
 
 
@@ -494,33 +508,127 @@ def settle_checkout(m) -> Dict[str, Any]:
     return _place_order(client, user_id, m, view, payment)
 
 
+def mandate_attestation_for(client, m, payment, view) -> Optional[str]:
+    """The signed X-Commerce-Mandate for a CONSUMED mandate, or None.
+
+    McGroce places an AP2 order only on this: HARTOS is the one payer, and
+    the attestation is its signed word that it took exactly ``m.amount`` for
+    this McGroce customer's cart ``oid`` holding exactly ``lines``, and used
+    the mandate up.  McGroce compares all of it with the cart it reprices,
+    so neither a swapped item nor another cart of the same total passes.
+    The customer comes from the binding McGroce itself asserted at the
+    session exchange, never from the model.  None when the node has no
+    COMMERCE_SESSION_SECRET, the shopper is no longer linked, the mandate is
+    not consumed, or a cart line has no SKU to name.
+    """
+    from core.config_cache import get_secret
+    from integrations.commerce.bindings import is_merchant
+    from integrations.commerce.signing import ATTESTATION_TTL_S, mandate_attestation
+    secret = get_secret('COMMERCE_SESSION_SECRET', '')
+    binding = client.bindings.get(m.user_id)
+    if not secret or not binding or is_merchant(binding) or m.status != 'consumed':
+        return None
+    if view.get('order_id') is None or any(i['sku_id'] is None for i in view['items']):
+        return None
+    now = int(time.time())
+    return mandate_attestation(secret, {
+        'v': 1, 'mid': m.mandate_id, 'pid': m.payment_id,
+        'cid': str(binding['customer_id']), 'oid': str(view['order_id']),
+        'lines': sorted([str(i['sku_id']), int(i['quantity']), f"{i['price']:.2f}"]
+                        for i in view['items']),
+        'amt': str(m.amount), 'cur': str(m.currency).upper(), 'st': 'consumed',
+        'iat': now, 'exp': now + ATTESTATION_TTL_S,
+        'gw': payment.gateway.value if payment and payment.gateway else None,
+        'txn': payment.gateway_transaction_id if payment else None})
+
+
 def _place_order(client, user_id, m, view, payment) -> Dict[str, Any]:
-    """After the money is taken: consume the mandate, record the payment on
-    the McGroce cart (referenceNumber = mandate_id) and submit the order.
-    Shared by commerce_checkout and the redirect-gateway callback."""
-    _mandates().consume(m.mandate_id)
+    """After the money is taken: consume the mandate, then have McGroce
+    place the order (_submit_order).  Shared by commerce_checkout and the
+    redirect-gateway callback."""
+    if not _mandates().consume(m.mandate_id):
+        # Only the settle that consumes the mandate places its order; a
+        # second one racing it must not place a second order.
+        logger.warning(f'commerce: mandate {m.mandate_id} was no longer '
+                       f'approved at order time; no second order placed')
+        return {'success': False, 'error': 'this checkout was already completed',
+                'payment_id': m.payment_id, 'mandate_id': m.mandate_id}
+    m = _mandates().get(m.mandate_id) or m
     method = payment.gateway.value if payment and payment.gateway else None
     txn = payment.gateway_transaction_id if payment else None
     push_fragment(user_id, {'type': 'payment_status', 'status': 'completed',
                             'amount': float(m.amount), 'currency': CURRENCY,
                             'method': method, 'transaction_id': txn})
-    recorded = client.add_checkout_payment(user_id, {
-        'orderId': view['order_id'], 'type': 'THIRD_PARTY_ACCOUNT',
-        'gatewayType': 'Passthrough', 'amount': m.amount,
-        'currency': m.currency, 'referenceNumber': m.mandate_id})
-    placed = client.submit_checkout(user_id) if recorded['success'] else recorded
+    return _submit_order(client, user_id, m, view, payment)
+
+
+def retry_order(m) -> Dict[str, Any]:
+    """The order step again, for a CONSUMED mandate: its payment went
+    through, its order did not (or the answer was lost).  Never charges.
+
+    McGroce answers a mandate it already turned into an order with that
+    order, so a retry after a lost answer finds it instead of placing a
+    second one.  The live cart must still be the one the shopper approved.
+    """
+    import hmac
+    from integrations.ap2.ap2_mandate import MandateError, canonical_cart_hash
+    from integrations.ap2.ap2_protocol import PaymentStatus, get_payment_ledger
+    if m.order_ref:
+        return {'success': True, 'status': 'ordered', 'order_id': m.order_ref,
+                'payment_id': m.payment_id, 'amount': m.amount,
+                'currency': m.currency}
+    payment = get_payment_ledger().get_payment(m.payment_id)
+    if payment is None or payment.status != PaymentStatus.COMPLETED:
+        return {'success': False, 'error': 'checkout refused: mandate is consumed'}
+    client = _client()
+    res = client.cart_get(m.user_id)
+    if not res['success']:
+        return {'success': False, 'error': res['error'], 'needs_attention': True,
+                'payment_id': m.payment_id, 'mandate_id': m.mandate_id}
+    view = cart_view(res['data'])
+    try:
+        same = hmac.compare_digest(canonical_cart_hash(mandate_cart(view)), m.cart_hash)
+    except MandateError:
+        same = False
+    if not same:
+        return {'success': False, 'needs_attention': True,
+                'payment_id': m.payment_id, 'mandate_id': m.mandate_id,
+                'error': ('the payment went through, but the cart is no longer '
+                          'the one that was paid for; a person has to sort it out')}
+    return _submit_order(client, m.user_id, m, view, payment)
+
+
+def _submit_order(client, user_id, m, view, payment) -> Dict[str, Any]:
+    """Ask McGroce to place the order for consumed ``m`` with the signed
+    attestation (mandate_attestation_for).  McGroce checks it itself and
+    turns each mandate into one order at most.  One immediate retry when
+    the answer never came (transport error or 5xx): McGroce's single-use
+    check makes that safe."""
+    attestation = mandate_attestation_for(client, m, payment, view)
+    if not attestation:
+        placed = {'success': False,
+                  'error': 'the order could not be signed for McGroce (no '
+                           'COMMERCE_SESSION_SECRET, the shopper is no longer '
+                           'linked, or a cart line has no SKU)'}
+    else:
+        placed = client.complete_ap2_checkout(user_id, attestation)
+        if not placed['success'] and (placed.get('status') or 500) >= 500:
+            placed = client.complete_ap2_checkout(user_id, attestation)
     if not placed['success']:
         logger.error(f'commerce: paid {m.payment_id} but McGroce did not '
                      f'place the order: {placed["error"]}')
         return {'success': False,
                 'error': ('the payment went through but McGroce did not place '
-                          f'the order ({placed["error"]}); it needs a person to '
-                          'reconcile'),
+                          f'the order ({placed["error"]}); retry with '
+                          'commerce_checkout and this mandate_id, which never '
+                          'charges again, or a person reconciles it'),
                 'payment_id': m.payment_id, 'mandate_id': m.mandate_id,
                 'needs_attention': True}
     order = placed['data'] or {}
     order_id = order.get('orderNumber') or order.get('id')
     status = order.get('status') or 'SUBMITTED'
+    if order_id:
+        _mandates().record_order(m.mandate_id, order_id)
     push_fragment(user_id, _tracking_fragment(order_id, status))
     return {'success': True, 'status': 'ordered', 'order_id': order_id,
             'order_status': status, 'payment_id': m.payment_id,
@@ -718,9 +826,10 @@ _TOOL_SPECS = (
      'Draft a new McGroce product for the merchant to approve'),
 )
 
-# The MCP bridge (integrations/mcp/mcp_http_bridge.py _load_tools) consumes
-# this list.  Its functions take user_id explicitly: an MCP caller is the
-# node's own token holder, and checkout still needs the shopper's approval.
+# Every commerce tool, by name.  Its functions take user_id explicitly, so it
+# is never handed to a caller who is not that shopper: the MCP bridge
+# (integrations/mcp/mcp_http_bridge.py _load_tools) leaves it out, because
+# an MCP caller is the node's one token and could name any shopper.
 COMMERCE_TOOLS: List[Dict[str, Any]] = [
     {'name': name, 'func': fn, 'description': desc, 'tags': ['commerce']}
     for name, fn, desc in _TOOL_SPECS

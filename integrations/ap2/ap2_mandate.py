@@ -140,10 +140,16 @@ class CartMandate:
     kind: str = KIND_GENERIC
     description: str = ''
     sig: str = ''
+    #: What the paid-for thing became (a McGroce order number), once known.
+    order_ref: Optional[str] = None
 
     def signed_fields(self) -> Dict[str, Any]:
         d = asdict(self)
         d.pop('sig', None)
+        # Absent until an order exists, so a record written before this
+        # field existed still verifies.
+        if d.get('order_ref') is None:
+            d.pop('order_ref', None)
         return d
 
 
@@ -474,6 +480,56 @@ class MandateStore:
             m.sig = self._sign(m)
             self._save()
             return True
+
+    def record_order(self, mandate_id: str, order_ref: str) -> bool:
+        """Note what a consumed mandate's payment became (once)."""
+        with self._lock:
+            m = self._mandates.get(mandate_id)
+            if m is None or m.status != 'consumed' or m.order_ref:
+                return False
+            m.order_ref = str(order_ref)
+            m.sig = self._sign(m)
+            self._save()
+            return True
+
+    def supersede(self, user_id: str, merchant: str, kind: str,
+                  cart_hash: str) -> Tuple[bool, str]:
+        """Before a new checkout: void the owner's earlier live mandates of
+        this merchant and kind, so two approval cards for one cart can never
+        both be paid.  (ok, reason).
+
+        Refused, voiding nothing, when an earlier payment can no longer be
+        stopped: one is with the gateway (PROCESSING), or this same cart was
+        already paid for and its order is not placed yet -- paying again
+        would charge twice; that order is retried with the earlier mandate.
+        """
+        with self._lock:
+            now = time.time()
+            mine = [m for m in self._mandates.values()
+                    if m.user_id == str(user_id) and m.merchant == merchant
+                    and m.kind == kind]
+            for m in mine:
+                self._expire_if_due(m, now)
+            for m in mine:
+                if m.status == 'consumed' and not m.order_ref \
+                        and hmac.compare_digest(m.cart_hash, cart_hash):
+                    return False, (f'this cart is already paid for (mandate '
+                                   f'{m.mandate_id}); its order is being placed')
+                if m.status in ('pending', 'approved') \
+                        and self._money_in_flight(m.payment_id):
+                    return False, ('a payment for an earlier checkout is still '
+                                   'in progress')
+            voided = 0
+            for m in mine:
+                if m.status in ('pending', 'approved'):
+                    m.status = 'rejected'
+                    m.sig = self._sign(m)
+                    self.ledger.cancel_payment(m.payment_id, 'ap2_mandate',
+                                               'replaced by a newer checkout')
+                    voided += 1
+            if voided:
+                self._save()
+            return True, f'{voided} earlier checkout(s) withdrawn'
 
 
 # ── the approval card and the one decision point ─────────────────

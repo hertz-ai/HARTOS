@@ -231,6 +231,69 @@ class TestVerifyForCheckout:
         assert not ok and 'consumed' in reason
 
 
+class TestOrderRef:
+    def test_a_record_written_before_order_ref_existed_still_verifies(self, store, tmp_path):
+        m = store.create_cart_mandate('u1', 'mcgroce', CART)
+        raw = json.loads((tmp_path / 'ap2_mandates.json').read_text())
+        rec = raw['mandates'][m.mandate_id]
+        rec.pop('order_ref')                  # as an older build wrote it
+        (tmp_path / 'ap2_mandates.json').write_text(json.dumps(raw))
+        reloaded = MandateStore(path=str(tmp_path / 'ap2_mandates.json'),
+                                ledger=store.ledger, key=b'k' * 32)
+        assert reloaded.approve(m.mandate_id, 'u1') == (True, 'approved')
+
+    def test_the_order_is_recorded_once_and_only_on_a_consumed_mandate(self, store):
+        m = store.create_cart_mandate('u1', 'mcgroce', CART)
+        store.approve(m.mandate_id, 'u1')
+        assert store.record_order(m.mandate_id, 'ORD-1') is False   # not paid yet
+        store.consume(m.mandate_id)
+        assert store.record_order(m.mandate_id, 'ORD-1') is True
+        assert store.record_order(m.mandate_id, 'ORD-2') is False
+        assert store.get(m.mandate_id).order_ref == 'ORD-1'
+
+
+class TestSupersede:
+    KIND = 'commerce_checkout'
+
+    def _mandate(self, store, user='u1', merchant='mcgroce', cart=CART):
+        return store.create_cart_mandate(user, merchant, cart, kind=self.KIND)
+
+    def test_voids_the_owners_earlier_live_checkouts_only(self, store):
+        mine = self._mandate(store)
+        approved = self._mandate(store)
+        store.approve(approved.mandate_id, 'u1')
+        theirs = self._mandate(store, user='u2')
+        other_shop = self._mandate(store, merchant='elsewhere')
+        ok, _ = store.supersede('u1', 'mcgroce', self.KIND, canonical_cart_hash(CART))
+        assert ok
+        for m in (mine, approved):
+            assert store.get(m.mandate_id).status == 'rejected'
+            assert store.ledger.get_payment(m.payment_id).status == PaymentStatus.CANCELLED
+        # Another shopper's and another merchant's checkouts are untouched.
+        assert store.get(theirs.mandate_id).status == 'pending'
+        assert store.get(other_shop.mandate_id).status == 'pending'
+
+    def test_refuses_while_an_earlier_payment_is_with_the_gateway(self, store):
+        m = self._mandate(store)
+        store.approve(m.mandate_id, 'u1')
+        store.ledger.get_payment(m.payment_id).update_status(PaymentStatus.PROCESSING)
+        ok, reason = store.supersede('u1', 'mcgroce', self.KIND, canonical_cart_hash(CART))
+        assert not ok and 'in progress' in reason
+        assert store.get(m.mandate_id).status == 'approved'
+
+    def test_refuses_to_take_payment_twice_for_a_cart_already_paid_for(self, store):
+        m = self._mandate(store)
+        store.approve(m.mandate_id, 'u1')
+        store.consume(m.mandate_id)
+        ok, reason = store.supersede('u1', 'mcgroce', self.KIND, canonical_cart_hash(CART))
+        assert not ok and m.mandate_id in reason
+        # A different cart, or the same one once its order exists, is fine.
+        other = dict(CART, total=241)
+        assert store.supersede('u1', 'mcgroce', self.KIND, canonical_cart_hash(other))[0]
+        store.record_order(m.mandate_id, 'ORD-1')
+        assert store.supersede('u1', 'mcgroce', self.KIND, canonical_cart_hash(CART))[0]
+
+
 class TestDecidePayment:
     """The ONE place a person's answer is applied (the approval routes call it)."""
 

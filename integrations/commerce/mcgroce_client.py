@@ -154,7 +154,8 @@ class McGroceClient:
         return {'success': True, 'status': resp.status_code, 'data': data}
 
     def site(self, user_id, method: str, path: str, params=None,
-             json_body=None, need_customer: bool = True) -> Dict[str, Any]:
+             json_body=None, need_customer: bool = True,
+             extra_headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         """A site-API call acting as ``user_id``'s bound McGroce customer."""
         binding = self.bindings.get(user_id) if user_id else None
         if need_customer and not binding:
@@ -177,6 +178,8 @@ class McGroceClient:
                    'Accept': 'application/json'}
         if binding:
             headers['customerId'] = str(binding['customer_id'])
+        if extra_headers:
+            headers.update(extra_headers)
         return self._call(method, self.base_url + path, headers,
                           params=params, json_body=json_body)
 
@@ -244,15 +247,18 @@ class McGroceClient:
         return self.site(user_id, 'POST', '/cart/offer',
                          params={'promoCode': code})
 
-    def add_checkout_payment(self, user_id, payment: Dict[str, Any]):
-        """POST /cart/checkout/payment -- OrderPaymentWrapper fields as
-        params (McGroce binds this wrapper as @ModelAttribute, not a JSON
-        body; rest_api.md 'no-@RequestBody gotcha')."""
-        return self.site(user_id, 'POST', '/cart/checkout/payment',
-                         params=payment)
-
-    def submit_checkout(self, user_id):
-        return self.site(user_id, 'POST', '/cart/checkout')
+    def complete_ap2_checkout(self, user_id, attestation: str):
+        """POST /cart/checkout/ap2 -- McGroce places the order for a mandate
+        HARTOS has already been paid for.  ``attestation`` is the signed,
+        consumed mandate (signing.mandate_attestation); McGroce checks it
+        itself -- this customer, the repriced cart total and currency,
+        unexpired, never used before -- and records the payment and submits
+        the order in one step.  The two raw calls this replaced
+        (POST /cart/checkout/payment, then POST /cart/checkout) let any
+        caller mark a cart paid, and McGroce could verify neither."""
+        from integrations.commerce.signing import MANDATE_HEADER
+        return self.site(user_id, 'POST', '/cart/checkout/ap2',
+                         extra_headers={MANDATE_HEADER: attestation})
 
     def orders(self, user_id, order_status='SUBMITTED'):
         return self.site(user_id, 'GET', '/orders',
