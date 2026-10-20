@@ -343,7 +343,7 @@ Tier-1 ACTIVE 12:09:56; the two llama-servers of 10:26 and 10:28 reused;
 the chat model answering this node's turns was Qwen3.5-4B on :8080, pid
 3580, not the 2B of 10-19; the yes path asks no model, so the proof itself
 does not depend on which). Times in the table are the probe's reply times;
-turn 1 reached Nunba at 12:10:15 and HARTOS logged "gather_info turn 1/12"
+turn 1 reached Nunba at 12:10:14.922 and HARTOS logged "gather_info turn 1/12"
 at 12:10:17. The probe read the reply key as Agent_status while Nunba passes
 it as agent_status, so the transcript's "Agent_status=None" is the probe's
 misread, not the wire value; the saved record and the log lines are the
@@ -369,7 +369,7 @@ save), so a "yes" to one of the model's questions goes to the model.
 | Turn 1, received 12:10:15, reply 12:10:27 | the goal ("an agent that makes a short reel from the clips I send it ...", create_agent true) | served_by local, 13.0 s, request be0716bb: the setup's first question (a name for the companion) |
 | Turns 2 to 4, replies 12:10:37 to 12:11:00 | name + goal; the three steps; "nothing else, one flow" | local, 10.6 / 13.2 / 10.0 s (7463750c, 5909cf31, 64b74a1c): questions on clip type, persona name, persona name again |
 | Turn 5, reply 12:11:33 | "The persona is a video editor. No tools beyond editing. That is all, please finish the configuration." | local, 32.9 s, request f59ff054: the model completed; HARTOS "[GATHER] completed before any review was shown for 990019 - showing the config to the person (#205)" and the reply "Before I build it, here is the agent as I have it: Name: Reel Studio Goal: Transform uploaded video clips into a 20-second highlight reel ... Reel Creation (Video Editor): 1. Receive user-uploaded video clips and analyze them to identify the most engaging moments. 2. Trim and concatenate the selected highlights to fit a precise 20-second duration. 3. Generate a caption summarizing the best moments ... Reply yes to build it, or tell me what to change." |
-| Turn 6, received 12:11:33.792, reply 12:11:34.033 | "yes" | request 673f3757, 0.3 s: "gather_info turn 6/12", "[GATHER] the person confirmed the config shown for 990019 - building it as shown; the model is not asked (#205)", "Agent config saved to C:\Users\sathi\Documents\Nunba\data\prompts\990019.json"; reply "Got Agent details successfully lets move on to review them one at a time"; the record carries goal_tags ["reel_studio"], flow "Reel Creation", persona "Video Editor", exactly the three steps shown. The file was copied to the session scratchpad and removed from the prompts dir (throwaway). |
+| Turn 6, received 12:11:33.792, reply 12:11:34.033 | "yes" | request 673f3757, 0.24 s on the desktop (0.3 s at the probe's client): "gather_info turn 6/12", "[GATHER] the person confirmed the config shown for 990019 - building it as shown; the model is not asked (#205)", "Agent config saved to C:\Users\sathi\Documents\Nunba\data\prompts\990019.json"; reply "Got Agent details successfully lets move on to review them one at a time"; the record carries goal_tags ["reel_studio"], flow "Reel Creation", persona "Video Editor", exactly the three steps shown. The file was copied to the session scratchpad and removed from the prompts dir (throwaway). |
 | Not reached | the phone's own yes for agent 342; rows 27 to 37 | the phone was off adb; the next phone turn starts agent 342's setup at 1/12 again (each Nunba restart clears the in-memory gather conversation) |
 
 What this proves: on the installed build, the plain yes to the config
@@ -377,6 +377,34 @@ HARTOS showed builds that config in under a second and never asks the
 model; the loop that stopped the owner's 10-19 setup is gone on this path.
 What it does not prove: the same turn from the phone over the device link
 (owed), and the reel itself (rows 27 to 37).
+
+### 11.5 Reel Studio row 26 on the real phone path, by the owner (2026-10-20, 19:28 to 19:37 IST)
+
+Node: the installed desktop. Which build served this window is not
+pinned: the only boot line found today is 20:39:20 (Nunba c92c7111 /
+HARTOS 1b6e34f42, files with an 18:50 mtime), and the earlier one was the
+12:02 hot-swap relaunch; in both, the HARTOS entry file is byte-equal to
+181cb2c87's. The model was Qwen3.5-4B on :8080 (started 16:08:58; 27
+completions in the window). Phone: the owner's SM-S918B; its device link was accepted at 19:28:21 (from
+192.168.29.99, kind=device, trust same_user). The owner drove it; no turn
+in this section was sent by a session. Read from server.log.1 and the
+desktop's conversation_entries (read-only).
+
+| Step | What the phone sent | What the desktop did |
+|---|---|---|
+| Turn 1, received 19:28:26 | request 0ac71204, 1,291 chars: the agent as the desktop last showed it ("Before I build it here is the agent as I have it: Name: Reel Studio Goal: Automate the creation of high-converting Instagram Reels for a makeup studio ..."), media_mode text | "staying here so HARTOS carries on creating it" (Nunba, goal tags ['reel_studio']); "gather_info turn 1/12 for 10202_342" 19:28:27; PENDING, a question back ("Before I finalize the configuration, I have ...") |
+| Turn 2, received 19:32:17 | request adec0bf4: "Agent name use Reel studio Not broadcast Refine to make them atomic Persona name MUA" | gather 2/12; the model's own review (review_details: "Here is a review of the details gathered so far ... Name: Reel Studio ...") |
+| Turn 3, received 19:33:32 | request da53c796: "Looks good" | gather 3/12; COMPLETED STATUS; "Agent config saved to C:\Users\sathi\Documents\Nunba\data\prompts\342.json" 19:33:39; reply "Got Agent details successfully lets move on to review them one at a time"; chat.new on SSE 19:33:39 |
+| The record | | goal_tags ["reel_studio"], creator_user_id 10202, one flow "Reel Creation Flow" with 9 steps; 342_personality.json at 19:34:14 |
+| CREATE, 19:37 | | request 8610dffc: "I need your input to finish building this agent. Step 1 ("Verify the 5 clips are accessible in this chat session and confirm their exact order.") isn't coming together ..."; cause measured by another lane: get_user_uploaded_file saw no file for the turn; fix HARTOS 5e1f7a178 (20:30), which the 20:39 install (HARTOS 1b6e34f42) does not carry |
+
+What this proves: the phone's Reel Studio setup reaches the desktop over the
+device link, stays local, and ends in a saved Reel Studio agent with its tag;
+the desktop's replies reached the owner (each answer responds to the reply
+before it). "Looks good" is not the plain yes, so the save went the model's
+own-review way; the plain-yes shortcut (section 11.4) was not exercised on
+the phone. What it does not prove: the reel (row 27 stopped at CREATE's first
+step), and the phone's screen itself (not read).
 
 ## 10. What this proves
 
