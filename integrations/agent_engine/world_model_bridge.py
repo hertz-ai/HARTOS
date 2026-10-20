@@ -748,6 +748,54 @@ class WorldModelBridge:
                            "text NOT redacted")
         return text
 
+    def score_claim(self, context: str, outcome: str, timestamp: float,
+                    creator_id: str) -> Optional[dict]:
+        """The world model's vote on a claim (a thought experiment's
+        hypothesis -> expected outcome), measured by hevolveai without
+        learning it: POST /v1/world_model/score. Returns its reply ({vote,
+        confidence, error, typical_error, log_surprise, ...}), or None to
+        retry later: 503 while a learn holds the learner, any other failure,
+        a text the constitutional filter refuses, or a non-local world model
+        without the creator's cloud data consent (the decide feed's rules for
+        the same texts, ingest_decided_experiment). `timestamp` is the
+        experiment's own time in UTC epoch seconds, so the vote does not
+        change with the hour. reality_grounded matches how the decide feed's
+        ingest learns a claim (stream source 'thought_experiment' -> 1.0);
+        whether a thought experiment counts as reality is an open owner
+        question, and the two must change together."""
+        screened = [self._screened_text(t) for t in (context, outcome)]
+        if any(t is None for t in screened):
+            return None
+        if self._is_external_target() and not self._has_cloud_consent(str(creator_id)):
+            return None
+        ctx, out = (t[:2000] for t in screened)
+        if self._in_process and self._provider is not None and hasattr(
+                self._provider, 'score_claim'):
+            try:
+                reply = self._provider.score_claim(ctx, out, float(timestamp), True)
+            except Exception as e:
+                logger.debug("[WorldModelBridge] in-process score failed: %s", e)
+                return None
+            return reply if isinstance(reply, dict) and not reply.get('busy') else None
+        if self._http_disabled or self._cb_is_open():
+            return None
+        try:
+            resp = pooled_post(
+                f'{self._api_url}/v1/world_model/score',
+                json={'context': ctx, 'outcome': out, 'timestamp': float(timestamp),
+                      'reality_grounded': True},
+                timeout=self._timeout_default,
+            )
+        except requests.RequestException as e:
+            self._cb_record_failure()
+            logger.debug("[WorldModelBridge] score failed: %s", e)
+            return None
+        self._cb_record_success()
+        if resp.status_code != 200:
+            return None
+        body = resp.json()
+        return body if isinstance(body, dict) else None
+
     def ingest_decided_experiment(self, experiment_id: str, creator_id: str,
                                   claim: str, decision: str, decided_at: str):
         """A decided thought experiment, as ONE text transition the world

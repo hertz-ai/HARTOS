@@ -802,6 +802,18 @@ class AgentDaemon:
         except Exception as exc:
             logger.debug("Thought-experiment lifecycle tick skipped: %s", exc)
 
+        # The world model votes on open experiments (owner, 2026-10-19:
+        # agents AND the world model vote). Bounded per tick; contacts the
+        # world model only when there is something to score.
+        try:
+            from integrations.social.models import db_session
+            from integrations.social.thought_experiment_service import (
+                ThoughtExperimentService)
+            with db_session() as db:
+                ThoughtExperimentService.cast_world_model_votes(db)
+        except Exception as exc:
+            logger.debug("World-model vote tick skipped: %s", exc)
+
         # Complete the existing GATHER->DISPATCH->AgentGoal loop: first project
         # canonical goal outcomes back onto its active session, then start a new
         # bounded cycle only on cadence and only when no cycle is active.

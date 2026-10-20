@@ -12,7 +12,7 @@ Service Pattern: static methods, db: Session, db.flush() not db.commit().
 import json
 import logging
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
 from sqlalchemy import desc
@@ -33,6 +33,10 @@ VALID_INTENT_CATEGORIES = [
 ]
 VALID_DECISION_TYPES = ['majority', 'weighted', 'consensus', 'expert_panel']
 VOTE_RANGE = (-2, 2)  # Strongly oppose to strongly support
+# The world model's own voter account (owner decision, 2026-10-19: agents AND
+# the world model vote; quorum and the 2/3 rule unchanged). An agent with no
+# owner, so the tally counts it as one identity of its own at agent weight.
+WORLD_MODEL_VOTER = 'hevolveai_world_model'
 
 
 def _feed_decision_to_world_model(**decision) -> None:
@@ -256,6 +260,87 @@ class ThoughtExperimentService:
         return moved
 
     # ─── Voting ───
+
+    @staticmethod
+    def ensure_world_model_voter(db: Session):
+        """The world model's voter account, created once: an agent owned by
+        no one, so it is a distinct identity in the tally (one owner's agents
+        collapse into that owner)."""
+        from .models import User
+        voter = db.query(User).filter_by(username=WORLD_MODEL_VOTER).first()
+        if voter is None:
+            voter = User(username=WORLD_MODEL_VOTER,
+                         display_name='HevolveAI World Model',
+                         user_type='agent', is_admin=False)
+            db.add(voter)
+            db.flush()
+        return voter
+
+    @staticmethod
+    def cast_world_model_votes(db: Session, bridge=None, limit: int = 3) -> int:
+        """The world model votes on open experiments (discussing / voting)
+        it has not voted on yet, oldest first, at most `limit` per call.
+
+        Owner decision, 2026-10-19: agents AND the world model vote. Measured
+        on the owner's node, no real experiment had ever received a vote, so
+        auto-evolve could select only test fixtures (hevolveai Master 11.462
+        G). hevolveai scores each claim (hypothesis -> expected outcome) by
+        how surprised its own predictor is, measured without learning it
+        (POST /v1/world_model/score, C329-C329g): +1 when the claim surprises
+        it more than its typical error, -1 when it does not. That vote is
+        cast through cast_vote like any other, with the confidence measured.
+
+        The claim is scored at the experiment's OWN time, its created_at read
+        as UTC epoch seconds (naive UTC in the column; .timestamp() on it
+        would apply the box's offset), so the vote does not change with the
+        hour. A busy or unreachable world model, or an abstention (vote 0),
+        casts nothing: the next tick asks again. Nothing to score means the
+        world model is never contacted. Returns how many votes were cast.
+        """
+        from .models import ExperimentVote, ThoughtExperiment
+        voter = ThoughtExperimentService.ensure_world_model_voter(db)
+        voted = {row[0] for row in db.query(ExperimentVote.experiment_id)
+                 .filter(ExperimentVote.voter_id == voter.id)}
+        query = (db.query(ThoughtExperiment)
+                 .filter(ThoughtExperiment.status.in_(('discussing', 'voting')))
+                 .filter(ThoughtExperiment.expected_outcome.isnot(None)))
+        if voted:
+            query = query.filter(~ThoughtExperiment.id.in_(voted))
+        rows = [e for e in list(query.order_by(ThoughtExperiment.created_at.asc())
+                                .limit(limit).all())
+                if (e.expected_outcome or '').strip()]
+        if not rows:
+            return 0
+        if bridge is None:
+            from integrations.agent_engine.world_model_bridge import (
+                get_world_model_bridge)
+            bridge = get_world_model_bridge()
+            if bridge is None:
+                return 0
+        cast = 0
+        for exp in rows:
+            created = exp.created_at
+            if created is None:
+                continue
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            score = bridge.score_claim(
+                context=exp.hypothesis, outcome=exp.expected_outcome,
+                timestamp=created.timestamp(), creator_id=str(exp.creator_id))
+            if not isinstance(score, dict) or score.get('vote') not in (1, -1):
+                continue
+            reasoning = ('world model: prediction error %s against its typical %s '
+                         '(log surprise %s); +1 means running this would teach it'
+                         % (score.get('error'), score.get('typical_error'),
+                            score.get('log_surprise')))
+            out = ThoughtExperimentService.cast_vote(
+                db, exp.id, voter.id, int(score['vote']), reasoning=reasoning,
+                voter_type='agent', confidence=float(score.get('confidence') or 0.0))
+            if isinstance(out, dict) and out.get('error'):
+                logger.info("world-model vote on %s refused: %s", exp.id, out.get('error'))
+                continue
+            cast += 1
+        return cast
 
     @staticmethod
     def cast_vote(db: Session, experiment_id: str, voter_id: str,
