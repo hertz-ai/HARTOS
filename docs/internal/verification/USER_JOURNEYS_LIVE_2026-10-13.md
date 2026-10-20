@@ -384,17 +384,17 @@ Node: the installed desktop booted at 16:08:40 (boot_record "[BUILD]
 nunba=c92c7111 hartos=1b6e34f42 built=2026-10-20T10:14:14Z", "Starting
 Nunba Server" 16:08:42; no other server start until 20:39:32). 1b6e34f42
 carries 181cb2c87's hart_intelligence_entry.py unchanged (same git blob).
-The installed HARTOS .py files in python-embed now carry an 18:50:58 mtime
-(library.zip 18:49:22, Nunba.exe 18:52:48): a later rebuild of the same
-commits (built 13:25:36Z), put on disk while the 16:08 process ran; the
-commit pin holds. The model was the local Qwen3.5-4B (the outbound rows say
-model local; the :8080 server started 16:08:58 was the only llama server
-running). Phone: the owner's
+The installed HARTOS .py files in python-embed now carry 18:50:58 to
+18:51:00 mtimes (library.zip 18:49:22, Nunba.exe 18:52:48): a later rebuild
+of the same commits (built 13:25:36Z), put on disk while the 16:08 process
+ran; the commit pin holds. The model calls' rows say model local; which
+local server answered each is not recorded. Phone: the owner's
 SM-S918B; its device link was accepted at 19:28:21 (from 192.168.29.99,
 kind=device, trust same_user). The owner drove it; no turn in this section
 was sent by a session. Read from server.log.1 and server.log.3,
-boot_record.jsonl, gui_app.log.2, llama_server_8080.log,
-llm_outbound.jsonl.old and the desktop's conversation_entries (read-only).
+boot_record.jsonl, gui_app.log.2, llm_outbound.jsonl.old (read before it
+rotated at 2026-10-21 00:04:34; its 19:xx rows are no longer on disk) and
+the desktop's conversation_entries (read-only).
 
 | Step | What the phone sent | What the desktop did |
 |---|---|---|
@@ -403,7 +403,7 @@ llm_outbound.jsonl.old and the desktop's conversation_entries (read-only).
 | Turn 3, received 19:33:32 | request da53c796: "Looks good" | gather 3/12; COMPLETED STATUS; "Agent config saved to C:\Users\sathi\Documents\Nunba\data\prompts\342.json" 19:33:39; reply "Got Agent details successfully lets move on to review them one at a time"; device reply 200, 439 bytes, 19:33:39 |
 | The record | | goal_tags ["reel_studio"], creator_user_id 10202, one flow "Reel Creation Flow" with 9 steps; 342_personality.json at 19:34:14 |
 | Turn 4, received 19:33:49 | request 8610dffc: "Ok" (2 chars) | "chat: resuming in-progress creation for 10202_342" (the record existed, so no "staying here" line; "Chat with LOCAL agent: 342" appears on all four turns); CREATE resumed; reply at 19:37:25: "I need your input to finish building this agent. Step 1 ("Verify the 5 clips are accessible in this chat session and confirm their exact order.") isn't coming together ..."; device reply 200, 863 bytes. Cause measured by another lane: get_user_uploaded_file saw no file for the turn; fix HARTOS 5e1f7a178 (20:30), a child of 1b6e34f42, so no build booted today carries it |
-| Model calls | | by request id in llm_outbound.jsonl.old: one autogen.gather call per setup turn (3), 60 autogen.create calls for 8610dffc (19:34:19 to 19:37:25); in the same windows a scheduled task ("This is the time now ... you must perform this task Collect inference feedback ...", no request id, its "time now" advancing one minute per call and 8 to 9 minutes behind) made 5 calls, then 3 more: 1 answered (19:34:05), 2 failed with ReadError (19:35:02, 19:37:03) while CREATE ran |
+| Model calls | | by request id in llm_outbound.jsonl.old: one autogen.gather call per setup turn (3), 60 autogen.create calls for 8610dffc (19:34:19 to 19:37:25); the other rows in those windows had no request id and came from a scheduled task ("... you must perform this task Collect inference feedback ..."): 5 calls, then 3 more, of which 1 was answered (19:34:05) and 2 failed with ReadError (19:35:02, 19:37:03) while CREATE ran |
 
 What this proves: the phone's Reel Studio setup reaches the desktop over the
 device link, stays local, and ends in a saved Reel Studio agent record with
