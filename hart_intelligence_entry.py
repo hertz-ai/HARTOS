@@ -8403,12 +8403,16 @@ _state_lock = threading.Lock()  # Protects review_agents, conversation_agent, fi
 # After MAX_GATHER_TURNS without completion, force-complete with available data
 MAX_GATHER_TURNS = 12
 _gather_turn_counts = {}  # f'{user_id}_{prompt_id}' -> int
-# The gather sessions a review of the agent has been shown to, and what it
-# showed: the steps of the config shown (_config_steps of what
-# _config_review_text rendered), or None for the model's own review_details,
-# which is text.  A completed config is saved only for these, and only with
-# the steps that were shown (#205).  Same keys and lifetime as the turn counts.
+# What the LAST reply of a gather session showed the person: the config
+# shown (what _config_review_text rendered), or None for the model's own
+# review_details, which is text.  Absent after any other reply (a question,
+# a request for the steps, a save), so a plain yes is read against what the
+# person just saw and nothing else: it builds the config shown, as shown,
+# without asking the model; the model's completed config is built when its
+# steps are the ones shown (#205).  Same keys and lifetime as the turn
+# counts.
 _gather_reviews_shown = {}
+_NO_REVIEW_SHOWN = object()  # the mark's value when the session has none
 
 # --- TTL-based cleanup for review_agents / conversation_agent (M2 fix) ---
 _AGENT_TTL = 3600  # 1 hour
@@ -9822,6 +9826,16 @@ def _config_review_text(cfg):
     return '\n'.join(lines)
 
 
+def _is_plain_yes(text):
+    """Whether the person answered a review with the one word it asks for:
+    "yes" on its own, in any case, with or without a full stop or an
+    exclamation mark after it.  Nothing else counts - not "ok", not "y", not
+    "yes but ..." - so an answer that carries a change, or might, is never
+    read as a confirmation; every other answer goes to the model (#205).
+    No pattern matching, on purpose (owner, 2026-10-20)."""
+    return ' '.join(str(text or '').split()).rstrip('.!').lower() == 'yes'
+
+
 @app.route('/chat', methods=['POST'])
 @_mark_foreground
 def chat():
@@ -10965,8 +10979,33 @@ def chat():
                           'status="completed". Use reasonable defaults for any missing fields. '
                           'Return the full JSON immediately.')
 
-            response = gather_info(user_id, prompt, prompt_id)
-            app.logger.info('AFTER GATHER INFO')
+            # What the person saw last in this session (see the mark).
+            _shown = _gather_reviews_shown.get(turn_key, _NO_REVIEW_SHOWN)
+            _confirmed_cfg = None
+            if isinstance(_shown, dict) and _is_plain_yes(_user_turn_text):
+                # The person answered the review with the plain yes it asks
+                # for: what is built is the config that was shown, as shown.
+                # The model is not asked: a small model rewrites the steps on
+                # every answer, and a rewritten config is shown again, every
+                # time (#205; live 2026-10-19, agent 342, three times over).
+                # Any other answer is the person's own and goes to the model
+                # as before.  The mark stays until the save takes it, so a
+                # save that fails leaves the yes answerable again; `response`
+                # is read only by the error exit below.
+                _confirmed_cfg = _shown
+                response = ('I could not save the agent as shown. Reply yes '
+                            'to try again, or tell me what to change.')
+                app.logger.info(
+                    "[GATHER] the person confirmed the config shown for %s - "
+                    "building it as shown; the model is not asked (#205)",
+                    prompt_id)
+            else:
+                # The model answers, and its reply replaces what the person
+                # saw last: the exits below write the mark for a review,
+                # and leave it clear for anything else.
+                _gather_reviews_shown.pop(turn_key, None)
+                response = gather_info(user_id, prompt, prompt_id)
+                app.logger.info('AFTER GATHER INFO')
 
             # --- Helper: save completed agent config and transition to Review ---
             def _save_and_enter_review(agent_config):
@@ -11020,8 +11059,9 @@ def chat():
                 _record_lifecycle('Review Mode', user_id, prompt_id, 'Agent details gathered, entering review')
 
             try:
-                # Parse gather_info response
-                new_res = _read_gather_config(response, prompt_id)
+                # Parse gather_info response, or build the config confirmed
+                new_res = (_confirmed_cfg if _confirmed_cfg is not None
+                           else _read_gather_config(response, prompt_id))
 
                 if (new_res.get('status') != 'pending'
                         and turn_num < MAX_GATHER_TURNS
@@ -11048,7 +11088,9 @@ def chat():
                 if new_res.get('status') == 'pending' and turn_num < MAX_GATHER_TURNS:
                     app.logger.info('PENDING STATUS')
                     if new_res.get('review_details'):
-                        _gather_reviews_shown[turn_key] = None  # text, no steps
+                        # The model's own review, text: the person answers
+                        # it to the model, whose completed config is built.
+                        _gather_reviews_shown[turn_key] = None
                     ans = new_res.get('question') or new_res.get('review_details', response)
                     _record_lifecycle('Creation Mode', user_id, prompt_id, f'Agent creation turn {turn_num}')
                     return _chat_reply(
@@ -11077,20 +11119,23 @@ def chat():
                             user_prompt=_user_turn_text,
                         )
                     _steps = _config_steps(new_res)
-                    _shown = _gather_reviews_shown.get(turn_key, _steps)
+                    _shown_steps = (_config_steps(_shown)
+                                    if isinstance(_shown, dict) else _shown)
                     if (turn_num < MAX_GATHER_TURNS
-                            and (turn_key not in _gather_reviews_shown
-                                 or _shown not in (None, _steps))):
+                            and _shown_steps not in (None, _steps)):
                         # The person confirms what is built (#205).  The model
-                        # finished without showing a review, or with steps
-                        # other than the ones shown, so this config is shown,
-                        # and nothing is saved until the person answers it.
-                        _gather_reviews_shown[turn_key] = _steps
+                        # finished without a review in the last reply, or
+                        # with steps other than the ones shown, so this
+                        # config is shown and becomes the mark: nothing is
+                        # saved until the person answers it, a plain yes
+                        # builds it as shown, anything else goes to the
+                        # model.
+                        _gather_reviews_shown[turn_key] = new_res
                         app.logger.warning(
                             "[GATHER] completed %s for %s - showing the config "
                             "to the person (#205)",
                             'before any review was shown'
-                            if _shown is _steps else
+                            if _shown is _NO_REVIEW_SHOWN else
                             'with steps other than the ones shown', prompt_id)
                         _record_lifecycle('Creation Mode', user_id, prompt_id,
                                           'Completed before a review was '

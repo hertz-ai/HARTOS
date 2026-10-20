@@ -734,6 +734,48 @@ def test_a_caller_that_comes_while_a_start_is_under_way_waits_for_it(box):
     assert box.asked == ['vlm_caption.requested']
 
 
+def test_a_caller_that_comes_during_a_cooldown_probe_is_not_told_it_waits(box):
+    """Review of 1db4503c3, probed (told == [1]): an earlier start failed and
+    its cooldown holds.  VisionService's description loop asks for the 0.8B
+    and holds the start only to ask /health once, as the cooldown says; a
+    reel that comes in that moment was told it waited -- her chat said the
+    vision model was being made ready -- though nothing was being started.
+    It still waits for that caller and takes the same answer, and it is not
+    told."""
+    _files_in(box.models)
+    _callers_on_the_test_port(box)
+    _nunba_in_this_process(box, start_s=None)       # its server never comes up
+    with _the_box(box):
+        camera = lvb.get_vision_backend()
+        assert camera.ensure_running() is False     # a failed start: the cooldown
+    main = threading.get_ident()
+    on_main, reel_probed, told, reel = [], threading.Event(), [], {}
+
+    def reel_asks():
+        reel['ok'] = lvb.get_vision_backend(moments.REEL_VLM_DEFAULT).ensure_running(
+            on_wait=lambda: told.append(1))
+
+    def health(url, timeout=None, **kw):
+        if threading.get_ident() != main:
+            reel_probed.set()
+        else:
+            on_main.append(url)
+            if len(on_main) == 2:       # the cooldown's probe: the camera holds the start
+                reel['thread'] = threading.Thread(target=reel_asks, name='reel', daemon=True)
+                reel['thread'].start()
+                reel_probed.wait(10)
+                REAL_SLEEP(0.5)         # the reel goes on to the start and finds it held
+        return _Port.health(box.port, url, timeout, **kw)
+    box.port.health = health
+    with _the_box(box):
+        assert camera.ensure_running() is False
+        reel['thread'].join(10)
+    assert not reel['thread'].is_alive()
+    assert reel.get('ok') is False
+    assert told == [], 'the reel was told the vision model was being made ready; nothing was'
+    assert box.asked == [] and box.port.spawned == []
+
+
 def test_a_server_the_reel_started_is_not_idled_out_from_under_it(box):
     """VisionService's description loop unloads a 0.8B that HARTOS started
     once it has gone IDLE_TIMEOUT_S unused (check_idle, on the backend it
