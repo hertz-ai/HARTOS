@@ -475,13 +475,6 @@ def settle_checkout(m) -> Dict[str, Any]:
                 'message': 'Your cart is different from the one you approved, '
                            'so nothing was charged. Review it and approve again.'})
         return {'success': False, 'error': f'checkout refused: {reason}'}
-    if m.cart_ref is not None and str(view.get('order_id')) != m.cart_ref:
-        # Same contents, another McGroce cart: the approval named that cart.
-        store.withdraw(m.mandate_id, 'not the cart that was approved')
-        _nothing_charged(user_id, 'This is not the cart you approved, so nothing '
-                                  'was charged. Review it and approve again.')
-        return {'success': False,
-                'error': 'checkout refused: not the cart that was approved'}
     from integrations.ap2.ap2_protocol import PaymentStatus, get_payment_ledger
     ledger = get_payment_ledger()
     payment = ledger.get_payment(m.payment_id)
@@ -497,6 +490,22 @@ def settle_checkout(m) -> Dict[str, Any]:
             'charged and no order was placed.'))
         return {'success': False, 'error': f'checkout refused: {_NO_LIVE_GATEWAY}',
                 'payment_id': m.payment_id}
+    if m.cart_ref is None:
+        # A card an older version showed, which recorded no cart: no order
+        # could be signed for it, so it must not take the money.
+        store.withdraw(m.mandate_id, 'approved before carts were recorded')
+        _nothing_charged(user_id, 'This approval came from an older version of the '
+                                  'store, so nothing was charged. Approve the cart again.')
+        return {'success': False,
+                'error': 'checkout refused: this approval names no cart; nothing was charged',
+                'payment_id': m.payment_id}
+    if str(view.get('order_id')) != m.cart_ref:
+        # Same contents, another McGroce cart: the approval named that cart.
+        store.withdraw(m.mandate_id, 'not the cart that was approved')
+        _nothing_charged(user_id, 'This is not the cart you approved, so nothing '
+                                  'was charged. Review it and approve again.')
+        return {'success': False,
+                'error': 'checkout refused: not the cart that was approved'}
     # Everything the order step needs is checked BEFORE the money moves: once
     # it is taken, any of these would leave a paid cart with no order.
     blocked = _why_no_order(client, user_id, view)
@@ -507,7 +516,13 @@ def settle_checkout(m) -> Dict[str, Any]:
         return {'success': False,
                 'error': f'checkout refused: {blocked}; nothing was charged',
                 'payment_id': m.payment_id}
+    from integrations.ap2.ap2_mandate import ALREADY_SETTLING
     claimed, why = store.begin_settle(m.mandate_id)
+    if not claimed and why == ALREADY_SETTLING:
+        # This same mandate is being paid right now (a retry racing its own
+        # approval): that settle owns it, so it is left alone.
+        return {'success': False, 'error': f'checkout refused: {why}',
+                'payment_id': m.payment_id}
     if not claimed:
         # Another approval for this cart is paying, or already paid: this one
         # must never charge a second time.
@@ -583,6 +598,12 @@ def mandate_attestation_for(client, m, payment, view) -> Optional[str]:
     binding = client.bindings.get(m.user_id)
     if not secret or not binding or is_merchant(binding) or m.status != 'consumed':
         return None
+    # Only what the ledger shows was taken, for a record nobody edited.
+    if not _mandates().paid_as_signed(m, payment):
+        logger.error(f'MANUAL RECONCILIATION NEEDED: mandate {m.mandate_id} does not '
+                     f'match its signature or what payment {m.payment_id} took; '
+                     f'no order signed')
+        return None
     # The cart named when the mandate was created and signed, and no other.
     if m.cart_ref is None or str(view.get('order_id')) != m.cart_ref:
         return None
@@ -602,8 +623,18 @@ def mandate_attestation_for(client, m, payment, view) -> Optional[str]:
 
 def _place_order(client, user_id, m, view, payment) -> Dict[str, Any]:
     """After the money is taken: consume the mandate, then have McGroce
-    place the order (_submit_order).  Shared by commerce_checkout and the
-    redirect-gateway callback."""
+    place the order (_submit_order)."""
+    failed = _consume_paid(user_id, m, payment)
+    if failed:
+        return failed
+    m = _mandates().get(m.mandate_id) or m
+    return _submit_order(client, user_id, m, view, payment)
+
+
+def _consume_paid(user_id, m, payment) -> Optional[Dict[str, Any]]:
+    """The money for ``m`` is taken: use the mandate up and tell the
+    shopper.  None when done, else the answer to return.  From here on the
+    order step is retry_order's, which never charges again."""
     if not _mandates().consume(m.mandate_id):
         current = _mandates().get(m.mandate_id)
         if current is not None and current.status == 'consumed':
@@ -618,13 +649,12 @@ def _place_order(client, user_id, m, view, payment) -> Dict[str, Any]:
                 'error': ('the payment went through but this checkout was withdrawn '
                           'meanwhile; a person has to reconcile it'),
                 'payment_id': m.payment_id, 'mandate_id': m.mandate_id}
-    m = _mandates().get(m.mandate_id) or m
     method = payment.gateway.value if payment and payment.gateway else None
     txn = payment.gateway_transaction_id if payment else None
     push_fragment(user_id, {'type': 'payment_status', 'status': 'completed',
                             'amount': float(m.amount), 'currency': CURRENCY,
                             'method': method, 'transaction_id': txn})
-    return _submit_order(client, user_id, m, view, payment)
+    return None
 
 
 def retry_order(m) -> Dict[str, Any]:
@@ -681,7 +711,9 @@ def _submit_order(client, user_id, m, view, payment) -> Dict[str, Any]:
         placed = {'success': False,
                   'error': 'the order could not be signed for McGroce (no '
                            'COMMERCE_SESSION_SECRET, the shopper is no longer '
-                           'linked, or a cart line has no SKU)'}
+                           'linked, the cart is not the one paid for, a cart '
+                           'line has no SKU, or the record does not match what '
+                           'was paid)'}
     else:
         placed = client.complete_ap2_checkout(user_id, attestation)
         if not placed['success'] and (placed.get('status') or 500) >= 500:
@@ -711,12 +743,13 @@ def complete_redirect_checkout(payment_id: str) -> Dict[str, Any]:
     """Place the McGroce order for a redirect-gateway (PhonePe) payment the
     gateway callback has just confirmed COMPLETED.
 
-    The person approved one exact cart; if the live cart no longer hashes to
-    it, nothing is placed -- the payment is flagged for a person instead of
-    ordering something they did not approve.
+    The money is taken, so the mandate is used up first, whatever becomes of
+    the order: the order step is then retry_order's, which places it only
+    for the cart the approval named, still holding what was approved.  When
+    it cannot (McGroce down, the cart changed) the order is held, the
+    shopper is told, and commerce_checkout retries it later without a new
+    charge; only that cart stays blocked, never the shopper's next one.
     """
-    import hmac
-    from integrations.ap2.ap2_mandate import MandateError, canonical_cart_hash
     from integrations.ap2.ap2_protocol import PaymentStatus, get_payment_ledger
     m = _mandates().find_by_payment_id(payment_id)
     if m is None or m.status != 'approved':
@@ -724,28 +757,19 @@ def complete_redirect_checkout(payment_id: str) -> Dict[str, Any]:
     payment = get_payment_ledger().get_payment(payment_id)
     if payment is None or payment.status != PaymentStatus.COMPLETED:
         return {'success': False, 'error': 'payment is not completed'}
-    client = _client()
-    res = client.cart_get(m.user_id)
-    if not res['success']:
-        return {'success': False, 'error': res['error'], 'needs_attention': True,
-                'payment_id': payment_id}
-    view = cart_view(res['data'])
-    try:
-        same = hmac.compare_digest(canonical_cart_hash(mandate_cart(view)),
-                                   m.cart_hash)
-    except MandateError:
-        same = False
-    if not same:
+    failed = _consume_paid(m.user_id, m, payment)
+    if failed:
+        return failed
+    placed = retry_order(_mandates().get(m.mandate_id) or m)
+    if not placed['success']:
         logger.error(f'commerce: PhonePe payment {payment_id} completed but the '
-                     f'cart changed since approval; order NOT placed')
+                     f'order is NOT placed: {placed["error"]}')
         push_fragment(m.user_id, {
             'type': 'notification', 'severity': 'warning',
             'title': 'Payment received, order on hold',
-            'message': 'Your cart changed after you approved it, so we have not '
-                       'placed the order. We will sort it out with you.'})
-        return {'success': False, 'error': 'cart changed since approval',
-                'needs_attention': True, 'payment_id': payment_id}
-    return _place_order(client, m.user_id, m, view, payment)
+            'message': 'Your payment arrived, but we have not placed the order '
+                       'yet. We will place it or sort it out with you.'})
+    return placed
 
 
 def commerce_order_status(

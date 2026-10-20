@@ -100,7 +100,6 @@ class McGroceClient:
                           else get_secret('MCGROCE_ADMIN_API_KEY', ''))
         self._bindings = bindings
         self.breaker = breaker or mcgroce_breaker
-        self._agent_orders_ok = False
 
     @property
     def bindings(self):
@@ -267,13 +266,11 @@ class McGroceClient:
         Asked BEFORE any money is taken: the same endpoint called without an
         attestation is refused (403 AP2_MANDATE_REJECTED) by a McGroce that
         has it and touches nothing; one without it answers 404, one without
-        the shared secret 503.  A yes is remembered for this client.
+        the shared secret 503.  Asked every time, never remembered: a McGroce
+        rolled back since the last yes would take the money and no order.
         """
-        if self._agent_orders_ok:
-            return None
         res = self.site(user_id, 'POST', '/cart/checkout/ap2')
         if res.get('status') == 403 and 'AP2_MANDATE_REJECTED' in str(res.get('error')):
-            self._agent_orders_ok = True
             return None
         if res.get('status') == 404:
             return 'this McGroce does not take agent orders yet'

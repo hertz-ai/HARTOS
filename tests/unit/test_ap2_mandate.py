@@ -251,6 +251,17 @@ class TestOrderRef:
         assert store.record_order(m.mandate_id, 'ORD-2') is False
         assert store.get(m.mandate_id).order_ref == 'ORD-1'
 
+    def test_an_edited_record_is_never_re_signed(self, store, tmp_path):
+        m = store.create_cart_mandate('u1', 'mcgroce', CART)
+        store.approve(m.mandate_id, 'u1')
+        raw = json.loads((tmp_path / 'ap2_mandates.json').read_text())
+        raw['mandates'][m.mandate_id]['amount'] = '960.00'
+        (tmp_path / 'ap2_mandates.json').write_text(json.dumps(raw))
+        edited = MandateStore(path=str(tmp_path / 'ap2_mandates.json'),
+                              ledger=store.ledger, key=b'k' * 32)
+        assert edited.consume(m.mandate_id) is False
+        assert edited.get(m.mandate_id).status == 'approved'
+
 
 class TestSupersede:
     KIND = 'commerce_checkout'
@@ -310,6 +321,16 @@ class TestSupersede:
         ok, reason = store.supersede('u1', 'mcgroce', self.KIND, '555')
         assert not ok and 'in progress' in reason
         assert store.get(m.mandate_id).status == 'approved'
+
+    def test_a_declined_payment_does_not_hold_up_the_next_checkout(self, store):
+        # A declined card leaves the payment FAILED, which cannot be
+        # cancelled; nothing can be charged on it, so it is withdrawn.
+        m = self._mandate(store)
+        store.approve(m.mandate_id, 'u1')
+        store.ledger.get_payment(m.payment_id).update_status(PaymentStatus.FAILED)
+        ok, reason = store.supersede('u1', 'mcgroce', self.KIND, '555')
+        assert ok, reason
+        assert store.get(m.mandate_id).status == 'rejected'
 
     def test_refuses_while_an_earlier_payment_is_being_taken(self, store):
         m = self._mandate(store)

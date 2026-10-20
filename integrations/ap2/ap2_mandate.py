@@ -69,6 +69,10 @@ DEFAULT_MANDATE_TTL_S = 15 * 60
 # left as it is, since money may have moved.
 PROCESSING_RECONCILE_AFTER_S = 24 * 3600
 
+# begin_settle's answer when this same mandate is already being paid: the
+# caller is a second settle of it and must leave it alone.
+ALREADY_SETTLING = 'this payment is already being taken'
+
 _MANDATES_FILENAME = 'ap2_mandates.json'
 _MANDATE_KEY_FILENAME = '.ap2_mandate_key'
 
@@ -480,22 +484,33 @@ class MandateStore:
         except Exception:
             return False
 
+    def _intact(self, m: CartMandate) -> bool:
+        return hmac.compare_digest(m.sig, self._sign(m))
+
     def consume(self, mandate_id: str) -> bool:
-        """approved -> consumed.  A consumed mandate never pays again."""
+        """approved -> consumed.  A consumed mandate never pays again.
+        A record edited outside this store is never re-signed."""
         with self._lock:
             m = self._mandates.get(mandate_id)
-            if m is None or m.status != 'approved':
+            if m is None or m.status != 'approved' or not self._intact(m):
                 return False
             m.status = 'consumed'
             m.sig = self._sign(m)
             self._save()
             return True
 
+    def paid_as_signed(self, m: CartMandate, payment) -> bool:
+        """``m`` is untampered and ``payment`` took exactly its amount and
+        currency: all a signed word that it was paid for may claim."""
+        with self._lock:
+            return self._intact(m) and self._payment_matches(m, payment)
+
     def record_order(self, mandate_id: str, order_ref: str) -> bool:
         """Note what a consumed mandate's payment became (once)."""
         with self._lock:
             m = self._mandates.get(mandate_id)
-            if m is None or m.status != 'consumed' or m.order_ref:
+            if m is None or m.status != 'consumed' or m.order_ref \
+                    or not self._intact(m):
                 return False
             m.order_ref = str(order_ref)
             m.sig = self._sign(m)
@@ -520,8 +535,10 @@ class MandateStore:
         same cart (``cart_ref``, whatever it holds now) was already paid for
         and its order is not placed -- paying again would charge twice; that
         order is retried with the earlier mandate, or a person sorts it out.
-        A mandate is voided only when its payment was really cancelled.
+        A mandate is voided only when its payment was really cancelled, or
+        had already ended with no money taken (a declined card).
         """
+        from integrations.ap2.ap2_protocol import PaymentStatus
         with self._lock:
             now = time.time()
             mine = [m for m in self._mandates.values()
@@ -545,7 +562,10 @@ class MandateStore:
                 if m.status not in ('pending', 'approved'):
                     continue
                 if self.ledger.cancel_payment(m.payment_id, 'ap2_mandate',
-                                              'replaced by a newer checkout'):
+                                              'replaced by a newer checkout') \
+                        or self._payment_status(m.payment_id) in (
+                            PaymentStatus.FAILED, PaymentStatus.CANCELLED,
+                            PaymentStatus.REFUNDED):
                     m.status = 'rejected'
                     m.sig = self._sign(m)
                     voided += 1
@@ -572,7 +592,7 @@ class MandateStore:
             if m is None:
                 return False, 'mandate not found'
             if mandate_id in self._settling:
-                return False, 'this payment is already being taken'
+                return False, ALREADY_SETTLING
             if m.cart_ref is not None:
                 for other in self._mandates.values():
                     if (other is m or other.user_id != m.user_id

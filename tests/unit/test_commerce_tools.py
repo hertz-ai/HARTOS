@@ -529,6 +529,89 @@ class TestCheckout:
         assert res['success'] is False and res['needs_attention'] is True
         assert len(env['fake'].called('POST', AP2)) == n
 
+    def test_a_declined_card_does_not_lock_the_shopper_out(self, env):
+        from integrations.ap2.ap2_mandate import decide_payment
+        first = self._prepare(env)
+        with patch.object(env['card'], 'create_payment',
+                          return_value={'success': False, 'error': 'card declined'}):
+            decide_payment(first['payment_id'], UID, True, store=env['mandates'])
+        assert env['ledger'].get_payment(first['payment_id']).status == PaymentStatus.FAILED
+        again = self._prepare(env)
+        assert again.get('status') == 'awaiting_approval', again
+        assert env['mandates'].get(first['mandate_id']).status == 'rejected'
+
+    def test_a_mcgroce_rolled_back_after_the_card_was_shown_is_never_paid(self, env):
+        # Ready when the card was shown, gone when the shopper approves:
+        # McGroce is asked again before the money moves, not remembered.
+        from integrations.ap2.ap2_mandate import decide_payment
+        out = self._prepare(env)
+        env['fake'].probe = (404, None)
+        payload, _ = decide_payment(out['payment_id'], UID, True, store=env['mandates'])
+        assert payload['result']['success'] is False
+        assert 'nothing was charged' in payload['result']['error']
+        assert env['card'].captures == []
+        assert env['ledger'].get_payment(out['payment_id']).status == PaymentStatus.CANCELLED
+
+    def test_a_card_shown_by_the_older_version_is_never_paid(self, env):
+        # No cart was recorded with it, so no order could be signed for it.
+        from integrations.ap2.ap2_mandate import decide_payment
+        env['fake'].on('GET', '/cart', body=ORDER)
+        env['fake'].on('POST', AP2, body={'orderNumber': 'ORD-1'})
+        old = env['mandates'].create_cart_mandate(
+            UID, ct.MERCHANT, ct.mandate_cart(ct.cart_view(ORDER)),
+            kind=ct.CHECKOUT_KIND, requester_agent_id=ct._AGENT_ID)
+        payload, _ = decide_payment(old.payment_id, UID, True, store=env['mandates'])
+        assert payload['result']['success'] is False
+        assert 'nothing was charged' in payload['result']['error']
+        assert env['card'].captures == [] and not env['fake'].called('POST', AP2)
+        assert env['ledger'].get_payment(old.payment_id).status == PaymentStatus.CANCELLED
+        assert pushed(env, 'notification')[-1]['title'] == 'Payment not taken'
+        assert self._prepare(env)['status'] == 'awaiting_approval'
+
+    def test_a_retry_while_the_approval_is_paying_leaves_it_alone(self, env):
+        out = self._prepare(env)
+        store = env['mandates']
+        store.approve(out['mandate_id'], UID)
+        assert store.begin_settle(out['mandate_id'])[0]   # the approval is paying
+        try:
+            res = json.loads(ct.commerce_checkout(UID, out['mandate_id']))
+        finally:
+            store.end_settle(out['mandate_id'])
+        assert res['success'] is False and 'already being taken' in res['error']
+        assert store.get(out['mandate_id']).status == 'approved'
+        assert env['ledger'].get_payment(out['payment_id']).status == PaymentStatus.AUTHORIZED
+        assert pushed(env, 'notification') == []
+
+    def test_an_edited_record_is_never_signed_for_mcgroce(self, env):
+        # Paid 240, order failed; then the mandate file is edited to say 960
+        # for a bigger basket.  The retry must not attest it, and nothing may
+        # re-sign the edited record into a valid one.
+        from integrations.ap2.ap2_mandate import canonical_cart_hash
+        out = self._prepare(env)
+        env['mandates'].approve(out['mandate_id'], UID)
+        env['fake'].on('POST', AP2, status=503, body=None)
+        json.loads(ct.commerce_checkout(UID, out['mandate_id']))
+        store = env['mandates']
+        big = json.loads(json.dumps(ORDER))
+        big['orderItems'][0]['quantity'] = 20
+        big['total'] = {'amount': 960.0, 'currency': 'INR'}
+        raw = json.loads(open(store.path, encoding='utf-8').read())
+        rec = raw['mandates'][out['mandate_id']]
+        rec['amount'] = '960.00'
+        rec['cart_hash'] = canonical_cart_hash(ct.mandate_cart(ct.cart_view(big)))
+        open(store.path, 'w', encoding='utf-8').write(json.dumps(raw))
+        edited = MandateStore(store.path, ledger=store.ledger, key=b'k' * 32)
+        n = len(env['fake'].called('POST', AP2))
+        env['fake'].on('GET', '/cart', body=big)
+        env['fake'].on('POST', AP2, body={'orderNumber': 'ORD-BIG'})
+        with patch.object(ct, '_mandates', return_value=edited):
+            res = json.loads(ct.commerce_checkout(UID, out['mandate_id']))
+        assert res['success'] is False and res['needs_attention'] is True
+        assert len(env['fake'].called('POST', AP2)) == n
+        assert edited.record_order(out['mandate_id'], 'ORD-BIG') is False
+        m = edited.get(out['mandate_id'])
+        assert not edited.paid_as_signed(m, env['ledger'].get_payment(m.payment_id))
+
     def test_only_a_mcgroce_checkout_mandate_is_checked_out(self, env):
         generic = env['mandates'].create_cart_mandate(
             UID, ct.MERCHANT, ct.mandate_cart(ct.cart_view(ORDER)))
@@ -700,6 +783,54 @@ class TestRedirectGatewayCheckout:
         assert res['success'] is False and res['needs_attention'] is True
         assert not env['fake'].called('POST', AP2)
         assert pushed(env, 'notification')[-1]['title'] == 'Payment received, order on hold'
+
+    def test_callback_for_another_cart_holds_the_order_and_says_so(self, env):
+        out = self._approved_on_phonepe(env)
+        ct.commerce_checkout(UID, out['mandate_id'])
+        env['ledger'].get_payment(out['payment_id']).update_status(PaymentStatus.COMPLETED)
+        moved = json.loads(json.dumps(ORDER))
+        moved['id'] = 556                         # same basket, another cart
+        env['fake'].on('GET', '/cart', body=moved)
+        res = ct.complete_redirect_checkout(out['payment_id'])
+        assert res['success'] is False and res['needs_attention'] is True
+        assert 'no longer the one that was paid for' in res['error']
+        assert not env['fake'].called('POST', AP2)
+        assert pushed(env, 'notification')[-1]['title'] == 'Payment received, order on hold'
+
+    def test_mcgroce_down_at_the_callback_is_placed_later_without_a_new_charge(self, env):
+        out = self._approved_on_phonepe(env)
+        ct.commerce_checkout(UID, out['mandate_id'])
+        env['ledger'].get_payment(out['payment_id']).update_status(PaymentStatus.COMPLETED)
+        env['fake'].on('GET', '/cart', status=503, body=None)
+        held = ct.complete_redirect_checkout(out['payment_id'])
+        assert held['success'] is False and held['needs_attention'] is True
+        assert pushed(env, 'notification')[-1]['title'] == 'Payment received, order on hold'
+        # The money is taken: the mandate is used up, so the order step can
+        # be retried, and never charges again.
+        assert env['mandates'].get(out['mandate_id']).status == 'consumed'
+        env['fake'].on('GET', '/cart', body=ORDER)
+        env['fake'].on('POST', AP2, body={'orderNumber': 'ORD-OK'})
+        retry = json.loads(ct.commerce_checkout(UID, out['mandate_id']))
+        assert retry['success'] is True and retry['order_id'] == 'ORD-OK'
+        assert len(env['ledger'].payments) == 1
+        assert attestation_of(env['fake'].called('POST', AP2)[0])['gw'] == 'phonepe'
+
+    def test_a_held_order_blocks_only_its_own_cart(self, env):
+        out = self._approved_on_phonepe(env)
+        ct.commerce_checkout(UID, out['mandate_id'])
+        env['ledger'].get_payment(out['payment_id']).update_status(PaymentStatus.COMPLETED)
+        drifted = json.loads(json.dumps(ORDER))
+        drifted['orderItems'].pop()
+        env['fake'].on('GET', '/cart', body=drifted)
+        ct.complete_redirect_checkout(out['payment_id'])
+        # That cart was paid for: it is not offered for payment again...
+        again = json.loads(ct.commerce_prepare_checkout(UID))
+        assert again['success'] is False and out['mandate_id'] in again['error']
+        # ...but the shopper's next cart is.
+        nxt = json.loads(json.dumps(ORDER))
+        nxt['id'] = 556
+        env['fake'].on('GET', '/cart', body=nxt)
+        assert json.loads(ct.commerce_prepare_checkout(UID))['status'] == 'awaiting_approval'
 
     def test_not_completed_payment_places_nothing(self, env):
         out = self._approved_on_phonepe(env)
