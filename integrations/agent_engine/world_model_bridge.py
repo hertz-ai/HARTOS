@@ -826,15 +826,18 @@ class WorldModelBridge:
             if isinstance(detail, str):
                 return self._refused_claim(f'http_422: {detail[:200]}')
             # A 422 that is not the route refusing a claim (FastAPI's request
-            # validation, or no reason at all): the route's contract changed,
-            # and the world model will not vote until someone looks, so say
-            # it once per process.
+            # validation, a proxy, or no reason at all): something between
+            # here and the route rejects every request, and the world model
+            # will not vote until someone looks, so say it once until a score
+            # succeeds again (then a later break is said again).  The detail
+            # is capped: FastAPI's validation detail echoes the request body.
             global _WARNED_422_CONTRACT
             if not _WARNED_422_CONTRACT:
                 _WARNED_422_CONTRACT = True
                 logger.warning("[WorldModelBridge] /v1/world_model/score answered "
-                               "422 without a reason (detail %r): its contract "
-                               "changed; no claim will be scored", detail)
+                               "422 without a reason (detail %s): the route or "
+                               "something in front of it rejects every request; "
+                               "no claim will be scored", repr(detail)[:200])
             return None
         if resp.status_code != 200:
             return None
@@ -843,7 +846,10 @@ class WorldModelBridge:
         except ValueError:
             logger.info("[WorldModelBridge] score reply was not JSON")
             return None
-        return body if isinstance(body, dict) else None
+        if isinstance(body, dict):
+            _WARNED_422_CONTRACT = False      # the route answers again: re-arm
+            return body
+        return None
 
     def ingest_decided_experiment(self, experiment_id: str, creator_id: str,
                                   claim: str, decision: str, decided_at: str):

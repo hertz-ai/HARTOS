@@ -394,7 +394,8 @@ class ThoughtExperimentService:
                 continue
             _WORLD_MODEL_ATTEMPTS[exp.id] = _WORLD_MODEL_ATTEMPTS.get(exp.id, 0) + 1
             if isinstance(score, dict) and score.get('refused'):
-                reason = str(score.get('reason'))
+                # bounded at the logger, whatever the source of the reason
+                reason = str(score.get('reason'))[:300]
                 if _WORLD_MODEL_REFUSAL_LOGGED.get(exp.id) != reason:
                     _WORLD_MODEL_REFUSAL_LOGGED[exp.id] = reason
                     # %r: a reason can carry a world model's text (a 422

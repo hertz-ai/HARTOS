@@ -769,14 +769,14 @@ def test_a_refusal_is_logged_when_its_reason_changes(db, caplog):
     change), not three; a newline in a reason cannot forge a line."""
     import logging
     _experiment(db)
-    reasons = iter(['A', 'B\nINFO forged', 'B\nINFO forged'])
+    reasons = iter(['A', 'B\nINFO forged\r\u2028\x85', 'B\nINFO forged\r\u2028\x85'])
     bridge = _Bridge(lambda kw: {'vote': 0, 'refused': True, 'reason': next(reasons)})
     with caplog.at_level(logging.INFO):
         for _ in range(3):
             ThoughtExperimentService.cast_world_model_votes(db, bridge=bridge)
     lines = [r.getMessage() for r in caplog.records if 'cannot score' in r.getMessage()]
     assert len(lines) == 2
-    assert all('\n' not in ln for ln in lines)
+    assert all(len(ln.splitlines()) == 1 for ln in lines)
 
 
 def test_a_422_detail_is_bounded_and_a_400_is_not_a_refusal(offline, monkeypatch):
@@ -807,4 +807,52 @@ def test_a_422_without_a_reason_is_warned_once(offline, monkeypatch, caplog):
     with caplog.at_level(logging.WARNING):
         for _ in range(3):
             assert b.score_claim(context='h', outcome='o', timestamp=1.0, creator_id='u1') is None
-    assert len([r for r in caplog.records if 'contract' in r.getMessage()]) == 1
+    warned = [r.getMessage() for r in caplog.records if 'rejects every request' in r.getMessage()]
+    assert len(warned) == 1 and 'field required' in warned[0]
+
+
+# --- review of e6e039539 ------------------------------------------------------
+
+def test_the_routes_own_refusal_never_warns_a_broken_contract(offline, monkeypatch, caplog):
+    """what: the route's own 422 refusing a claim (a string detail);
+    expected: an abstention with its reason, and no "rejects every request"
+    warning (which would also spend the one warning a real break gets)."""
+    import logging
+    from integrations.agent_engine import world_model_bridge
+    monkeypatch.setattr(world_model_bridge, '_WARNED_422_CONTRACT', False)
+    b = offline()
+    _post_recorder(monkeypatch, _Resp(422, {'detail': 'timestamp looks like milliseconds'}))
+    with caplog.at_level(logging.WARNING):
+        out = b.score_claim(context='h', outcome='o', timestamp=1.0, creator_id='u1')
+    assert out['refused'] is True
+    assert not [r for r in caplog.records if 'rejects every request' in r.getMessage()]
+    assert world_model_bridge._WARNED_422_CONTRACT is False
+
+
+def test_a_broken_contract_is_warned_again_after_it_recovers(offline, monkeypatch, caplog):
+    """what: a reason-less 422, then a good reply, then a reason-less 422;
+    expected: two warnings (a success re-arms it), each capped in length."""
+    import logging
+    from integrations.agent_engine import world_model_bridge
+    monkeypatch.setattr(world_model_bridge, '_WARNED_422_CONTRACT', False)
+    b = offline()
+    huge = {'detail': [{'msg': 'x' * 100000}]}
+    with caplog.at_level(logging.WARNING):
+        for reply in (_Resp(422, huge), _Resp(200, {'vote': 1, 'confidence': 0.5}),
+                      _Resp(422, huge)):
+            _post_recorder(monkeypatch, reply)
+            b.score_claim(context='h', outcome='o', timestamp=1.0, creator_id='u1')
+    warned = [r.getMessage() for r in caplog.records if 'rejects every request' in r.getMessage()]
+    assert len(warned) == 2 and all(len(w) < 500 for w in warned)
+
+
+def test_a_logged_refusal_reason_is_bounded(db, caplog):
+    """what: a reply whose refusal reason is a megabyte; expected: the round
+    logs a bounded line."""
+    import logging
+    _experiment(db)
+    bridge = _Bridge({'vote': 0, 'refused': True, 'reason': 'r' * 1000000})
+    with caplog.at_level(logging.INFO):
+        ThoughtExperimentService.cast_world_model_votes(db, bridge=bridge)
+    lines = [r.getMessage() for r in caplog.records if 'cannot score' in r.getMessage()]
+    assert len(lines) == 1 and len(lines[0]) < 1000
