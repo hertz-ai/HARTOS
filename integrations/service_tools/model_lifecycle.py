@@ -477,6 +477,7 @@ class ModelLifecycleManager:
         self._wd_heartbeat()
 
         # Phase 11: Process pending crash restarts (with backoff)
+        self._wait_for_due_llm_restart()
         self._process_restart_queue()
         self._wd_heartbeat()
 
@@ -1541,6 +1542,53 @@ class ModelLifecycleManager:
                 'model': tool_name,
                 'crash_count': state.crash_count if state else 0,
             })
+
+    def _wait_for_due_llm_restart(self):
+        """Phase 11 prelude: run a main-LLM restart in the tick that queued it.
+
+        Phase 10 queues the restart at now + backoff (5 s after a first
+        crash), so phase 11 of the same tick found it not yet due and it
+        waited a whole interval.  Live 2026-10-21: llama-server on :8080
+        crashed 01:02:39, the 120 s tick queued its restart at 01:04:21.895
+        ("in 5s"), and it ran at 01:06:26.500 -- 119.6 s after the backoff.
+
+        Sleeps until the restart is due when that comes before the next tick
+        and the OS lists nobody listening on the LLM port.  The restart path
+        does not stop the old server or wait for its process to exit, and
+        start_server's bind test passes over a SO_REUSEADDR listener, so a
+        server still holding the port (a crashed one while its dump is
+        written, or a hung one) is left to the next tick, as before.  Loops
+        because _wd_sleep counts monotonic time while retry_after is wall
+        time; ends when the manager stops.
+        """
+        while self._running:
+            with self._lock:
+                info = self._restart_pending.get('llm')
+            if not isinstance(info, dict) or info.get('in_progress'):
+                return
+            wait_s = info.get('retry_after', 0) - time.time()
+            if wait_s <= 0 or wait_s >= self._interval:
+                return
+            if not self._llm_port_released():
+                return
+            self._wd_sleep(wait_s)
+
+    @staticmethod
+    def _llm_port_released() -> bool:
+        """True when the OS lists no process LISTENING on the LLM port(s).
+
+        core.resource_governor._find_llm_pids is the one reader of that
+        socket table.  It answers an empty set when psutil is missing, which
+        here means "cannot tell", never "free".
+        """
+        try:
+            from core.resource_governor import _find_llm_pids, _try_import_psutil
+            if _try_import_psutil() is None:
+                return False
+            return not _find_llm_pids()
+        except Exception:
+            logger.exception("_llm_port_released: swallowed Exception")
+            return False
 
     def _process_restart_queue(self):
         """Phase 11: Process pending crash restarts with exponential backoff."""
