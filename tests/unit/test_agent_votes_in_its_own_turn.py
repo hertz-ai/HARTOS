@@ -518,3 +518,122 @@ def test_source_guard_the_matched_agent_route_runs_as_that_agent():
             p = parents.get(p)
         assert inside, (f'line {call.lineno}: chat_agent for {agent_arg} '
                         f'runs without turn_of({agent_arg})')
+
+
+# -- The dispatched persona votes, and the coordinator sees its ballot --------
+# hevolveai Master 11.462 K: the agent daemon hands a goal to a persona with
+# user_id = the persona and prompt_id = the GOAL's number
+# (dispatch.prompt_id_for_goal); that number was the agent_id of two other
+# agents in production, so the coordinator's vote landed on one of them.
+
+def test_a_dispatched_persona_votes_as_itself(db, registry, turn):
+    """what: a daemon-dispatched turn (user = the persona, prompt = the
+    goal's number, which another agent carries as its agent_id); expected:
+    the vote is the persona's, not the other agent's."""
+    autogen = pytest.importorskip('autogen')
+    from core.agent_tools import register_dual
+    from integrations.agent_engine.dispatch import prompt_id_for_goal
+    from integrations.agent_engine.thought_experiment_tools import (
+        ExperimentVoteTool)
+    e = _experiment(db)
+    goal_number = prompt_id_for_goal('coordinator-goal')
+    _user(db, 'agent', owner_id=_user(db).id, agent_id=goal_number)  # trained under it
+    persona = _user(db, 'agent')
+    ExperimentVoteTool.register()
+    fn = _gated_tools(registry, TURN)['cast_experiment_vote']
+    helper = autogen.ConversableAgent('helper', llm_config=_NO_CALL_LLM)
+    executor = autogen.ConversableAgent('executor', llm_config=False,
+                                        human_input_mode='NEVER')
+    register_dual(helper, executor, fn, 'cast_experiment_vote', 'vote')
+    turn.set_user_id(persona.id)          # what dispatch_goal sends
+    turn.set_prompt_id(goal_number)
+    ok, result = executor.execute_function({
+        'name': 'cast_experiment_vote',
+        'arguments': json.dumps({'experiment_id': e.id, 'vote_value': 1}),
+    })
+    assert ok and json.loads(result['content'])['success'] is True, result
+    db.expire_all()
+    rows = [v.voter_id for v in db.query(ExperimentVote).filter_by(experiment_id=e.id)]
+    assert rows == [persona.id]
+
+
+def test_a_persons_turn_still_votes_as_the_agent_it_names(db, turn):
+    """what: a person's /chat turn with their agent (user = the person,
+    prompt = the agent); expected: the agent's vote, as before."""
+    from integrations.agent_engine.thought_experiment_tools import (
+        cast_experiment_vote)
+    e = _experiment(db)
+    owner = _user(db)
+    agent = _user(db, 'agent', owner_id=owner.id, agent_id='55509')
+    turn.set_user_id(owner.id)
+    turn.set_prompt_id('55509')
+    out = json.loads(cast_experiment_vote(e.id, '', vote_value=2))
+    assert out['success'] is True, out
+    db.expire_all()
+    assert [v.voter_id for v in db.query(ExperimentVote).filter_by(
+        experiment_id=e.id)] == [agent.id]
+
+
+def _coordinator_prompt():
+    from integrations.agent_engine.goal_manager import GoalManager
+    return GoalManager.build_prompt({
+        'goal_type': 'thought_experiment',
+        'title': 'Constitutional Thought Experiment Coordination',
+        'description': 'Coordinate the pipeline.',
+        'config': {'mode': 'coordinator', 'continuous': True}})
+
+
+def test_the_coordinator_is_shown_its_ballot(db):
+    """what: the coordinator goal's prompt; expected: every experiment open
+    for an agent's vote, with the id the vote tool needs, fewest votes
+    first; never a closed one, a blank one, or one agents may not vote on
+    (security_guardrail); and the tool it must use is named."""
+    from integrations.agent_engine.goal_manager import COORDINATOR_BALLOT_SIZE
+    voted = _experiment(db)
+    ThoughtExperimentService.cast_vote(db, voted.id, _user(db).id, 1)
+    fresh = _experiment(db)
+    closed = _experiment(db)
+    closed.status = 'evaluating'
+    guard = _experiment(db)
+    guard.title = 'Tighten the security guardrail'
+    guard.hypothesis = 'A stricter guardrail blocks the vulnerability'
+    db.commit()
+    prompt = _coordinator_prompt()
+    assert 'cast_experiment_vote' in prompt
+    assert fresh.id in prompt and voted.id in prompt
+    assert prompt.index(fresh.id) < prompt.index(voted.id)      # fewest votes first
+    assert closed.id not in prompt and guard.id not in prompt
+    assert COORDINATOR_BALLOT_SIZE >= 1
+
+
+def test_the_ballot_is_bounded(db):
+    """what: more open experiments than one turn is shown; expected: at
+    most the ballot size, so the prompt stays bounded."""
+    from integrations.agent_engine.goal_manager import COORDINATOR_BALLOT_SIZE
+    ids = [_experiment(db).id for _ in range(COORDINATOR_BALLOT_SIZE + 3)]
+    prompt = _coordinator_prompt()
+    assert sum(i in prompt for i in ids) == COORDINATOR_BALLOT_SIZE
+
+
+def test_only_the_coordinator_gets_a_ballot(db):
+    """what: another thought-experiment goal (a persona such as Sage, an
+    experiment's own evaluation); expected: no ballot in its prompt."""
+    from integrations.agent_engine.goal_manager import GoalManager
+    e = _experiment(db)
+    prompt = GoalManager.build_prompt({
+        'goal_type': 'thought_experiment', 'title': 'Sage',
+        'description': 'The math friend.', 'config': {}})
+    assert e.id not in prompt and 'OPEN FOR YOUR VOTE' not in prompt
+
+
+def test_the_coordinator_seed_asks_for_the_vote(db):
+    """what: the seeded coordinator goal (goal_seeding rewrites a drifted
+    description, so this reaches existing nodes); expected: it asks for
+    votes with the tool a turn holds, not for MCP-only tools."""
+    from integrations.agent_engine.goal_seeding import SEED_BOOTSTRAP_GOALS
+    (seed,) = [g for g in SEED_BOOTSTRAP_GOALS
+               if g['slug'] == 'bootstrap_thought_experiment_coordinator']
+    assert 'cast_experiment_vote' in seed['description']
+    for mcp_only in ('get_experiment_status', 'evaluate_thought_experiment',
+                     'tally_experiment_votes', 'advance_experiment'):
+        assert mcp_only not in seed['description']

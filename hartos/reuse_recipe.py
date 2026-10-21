@@ -1917,9 +1917,15 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
     # empty id is not refused, because a person's turn can arrive with none
     # (standalone /chat mints none; the WhatsApp self-chat path sends none).
     # Recipe schedules (create_schedule) do not come through this tool.
+    #
+    # ONE description string, as for execute_windows_or_android_command: the
+    # hand-over to the named attach (assistant._hart_core_tools, below) builds
+    # this closure's (name, desc, func) triple from it.
+    _SCHEDULE_JOBS_DESC = "Use this to Create scheduled jobs"
+
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="tool",
-                             description="Use this to Create scheduled jobs")
+                             description=_SCHEDULE_JOBS_DESC)
     @log_tool_execution
     def create_scheduled_jobs(cron_expression: Annotated[
         str, "Cron expression for scheduling. Example: '0 9 * * 1-5' (Runs at 9:00 AM, Monday to Friday)."],
@@ -2838,9 +2844,24 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
         # Still named-attach ONLY: this runs arbitrary OS commands, and
         # attach_for_names' own docstring keeps the blast radius at the action
         # whose recipe asked for it.  Nothing is added to the main leg.
-        assistant._hart_core_tools = core_tools + [
+        #
+        # ...and this leg's own create_scheduled_jobs IN PLACE OF the
+        # factory's same-named one, CREATE's stub that schedules nothing and
+        # answers "...you can go ahead and mark this action as completed" (the
+        # #511 collision at the inline def).  Both readers of this list, the
+        # named attach and request_tools, register what they find under its
+        # name, and _attached_names holds only service tools, so the stub
+        # replaced the gated tool: a daemon turn got a line the fabrication
+        # gate reads as the work done, and a person's request scheduled nothing
+        # (review of fe1100b5e).  Handed over like the command tool, so an
+        # action naming it still reaches the Assistant, with the gated tool.
+        # Guarded by tests/unit/test_reuse_scheduler_stays_gated.py.
+        assistant._hart_core_tools = [
+            t for t in core_tools if t[0] != 'create_scheduled_jobs'] + [
             ('execute_windows_or_android_command', _EXEC_CMD_DESC,
              execute_windows_or_android_command),
+            ('create_scheduled_jobs', _SCHEDULE_JOBS_DESC,
+             create_scheduled_jobs),
         ]
         # The FULL recipe list, so the per-turn hook in get_agent_response can
         # narrow the system prompt to the action actually being dispatched

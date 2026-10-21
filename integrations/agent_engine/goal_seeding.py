@@ -679,13 +679,13 @@ SEED_BOOTSTRAP_GOALS = [
         'title': 'Constitutional Thought Experiment Coordination',
         'description': (
             'Coordinate the constitutional thought experiment pipeline: '
-            '1) Monitor active experiments with get_experiment_status, '
-            '2) Evaluate proposed experiments with evaluate_thought_experiment, '
-            '3) Tally votes and compute weighted scores with tally_experiment_votes, '
-            '4) Advance experiments through lifecycle with advance_experiment, '
-            '5) Ensure core IP experiments receive agent evaluation. '
-            'Both humans and agents vote. All content gated by ConstitutionalFilter. '
-            'Every experiment makes the hive smarter.'
+            'the experiments open for your vote are listed with this goal; '
+            'judge each one and cast your own vote with cast_experiment_vote '
+            '(your vote is your evaluation). '
+            'Both humans and agents vote, and the world model too; a quorum '
+            'of distinct voters decides which experiments run. All content '
+            'gated by ConstitutionalFilter. Every experiment makes the hive '
+            'smarter.'
         ),
         'config': {
             'mode': 'coordinator',

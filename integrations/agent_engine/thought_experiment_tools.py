@@ -56,9 +56,15 @@ def cast_experiment_vote(experiment_id: str, voter_id: str,
     """Cast the CALLING agent's vote on a thought experiment.
 
     ONE rule: the voter is the agent whose turn is running, never the
-    argument.  It comes from the request's thread-local prompt_id
-    (hartos.threadlocal, set by the /chat handler), resolved to that agent's
-    users row (user_type 'agent', by id or prompt id); the vote is recorded
+    argument.  It comes from the request's thread-local state (hartos.
+    threadlocal, set by the /chat handler): when the turn's own user is an
+    agent account, that agent (an agent's own turn: the agent daemon hands
+    a goal to a persona with user_id = the persona and prompt_id = the
+    GOAL's number, dispatch.prompt_id_for_goal, which names no persona and
+    is the agent_id of whichever agent was trained under it, so it voted as
+    the wrong agent: hevolveai Master 11.462 K); otherwise the agent the
+    turn's prompt_id names (a person's turn with their agent; by id or
+    prompt id).  The vote is recorded
     under that row as an agent vote, whatever ``voter_type`` says (kept in
     the signature for existing callers, and ignored).  tally_votes counts it
     as its owner's identity: an agent is its owner, so two agents of one
@@ -76,9 +82,13 @@ def cast_experiment_vote(experiment_id: str, voter_id: str,
         from integrations.social.thought_experiment_service import ThoughtExperimentService
 
         caller = thread_local_data.get_prompt_id()
+        turn_user = thread_local_data.get_user_id()
         with db_session() as db:
             agent = None
-            if caller not in (None, ''):
+            if turn_user not in (None, ''):
+                agent = db.query(User).filter(
+                    User.user_type == 'agent', User.id == str(turn_user)).first()
+            if agent is None and caller not in (None, ''):
                 agent = db.query(User).filter(
                     User.user_type == 'agent',
                     or_(User.id == str(caller),

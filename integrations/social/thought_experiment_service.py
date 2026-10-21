@@ -1027,6 +1027,41 @@ class ThoughtExperimentService:
     # ─── Queries ───
 
     @staticmethod
+    def open_for_agent_votes(db: Session, limit: int) -> List[Dict]:
+        """The experiments an agent may vote on now, fewest votes first.
+
+        Owner rulings 2026-10-19 (agents vote) and 2026-10-21 (an agent no
+        person owns counts as its node): the coordinator turn is shown these,
+        since no tool a turn holds lists experiments (hevolveai Master 11.462
+        K).  Open means 'discussing' or 'voting' (cast_vote refuses the
+        rest), with a hypothesis that is not blank; an agent may vote in the
+        experiment's decision context (voting_rules.check_voter_eligibility,
+        the check cast_vote makes).  Fewest votes first, then oldest, so
+        votes gather toward one experiment's quorum before they spread thin.
+        Read-only.  Each entry is to_dict() plus 'votes', the vote count.
+        """
+        from sqlalchemy import func
+        from .models import ExperimentVote, ThoughtExperiment
+        from .voting_rules import check_voter_eligibility
+        rows = [e for e in db.query(ThoughtExperiment)
+                .filter(ThoughtExperiment.status.in_(('discussing', 'voting'))).all()
+                if (e.hypothesis or '').strip()
+                and check_voter_eligibility(e.to_dict(), 'agent').get('eligible')]
+        if not rows:
+            return []
+        counts = dict(db.query(ExperimentVote.experiment_id,
+                               func.count(ExperimentVote.id))
+                      .filter(ExperimentVote.experiment_id.in_([e.id for e in rows]))
+                      .group_by(ExperimentVote.experiment_id).all())
+        rows.sort(key=lambda e: (counts.get(e.id, 0), e.created_at or datetime.min))
+        out = []
+        for e in rows[:max(0, int(limit))]:
+            d = e.to_dict()
+            d['votes'] = counts.get(e.id, 0)
+            out.append(d)
+        return out
+
+    @staticmethod
     def get_active_experiments(db: Session, status: str = None,
                                 limit: int = 50,
                                 with_votes_only: bool = False) -> List[Dict]:
