@@ -721,6 +721,7 @@ def test_the_ballot_leaves_out_what_the_node_already_voted_on(db):
     ThoughtExperimentService.cast_vote(db, person_voted.id,
                                        _user(db, 'agent', owner_id=_user(db).id).id, 1,
                                        voter_type='agent')
+    db.commit()       # the ballot reads in its own session (review of 81c34a0ae)
     prompt = _coordinator_prompt()
     assert node_voted.id not in prompt and person_voted.id in prompt
 
@@ -764,3 +765,57 @@ def test_among_equal_votes_the_oldest_comes_first(db):
 def test_an_empty_ballot_says_there_is_nothing_to_vote_on(db):
     prompt = _coordinator_prompt()
     assert 'NO EXPERIMENT IS OPEN FOR YOUR VOTE NOW' in prompt
+
+
+# -- Review of 81c34a0ae ------------------------------------------------------
+
+def test_a_system_account_turn_is_autonomous(db, turn):
+    """what: a turn whose user is a system account's row naming a person's
+    agent; expected: refused like any autonomous turn."""
+    e = _experiment(db)
+    _user(db, 'agent', owner_id=_user(db).id, agent_id='95555555555')
+    out = _vote_as(turn, _user(db, 'system').id, '95555555555', e.id)
+    assert out.get('reason') == 'autonomous_turn_votes_only_as_its_node', out
+
+
+def test_an_autonomous_turn_never_votes_as_the_world_model(db, turn):
+    """what: a daemon turn naming the world model's account; expected:
+    refused (the world model is its own identity, not the node's)."""
+    e = _experiment(db)
+    _user(db, 'agent', agent_id='96666666666').settings = {'world_model_voter': True}
+    db.commit()
+    out = _vote_as(turn, 'system_daemon', '96666666666', e.id)
+    assert out.get('reason') == 'autonomous_turn_votes_only_as_its_node', out
+
+
+def test_a_daemon_request_with_no_user_row_is_autonomous(db, turn, monkeypatch):
+    """what: a hive worker turn (request id daemon_<goal>, its user a handle
+    with no row) naming a person's agent; expected: refused, as the
+    canonical discriminator says it is autonomous."""
+    e = _experiment(db)
+    _user(db, 'agent', owner_id=_user(db).id, agent_id='97777777777')
+    turn.set_request_id('daemon_goal-1')
+    out = _vote_as(turn, 'hive-worker-handle', '97777777777', e.id)
+    assert out.get('reason') == 'autonomous_turn_votes_only_as_its_node', out
+
+
+def test_a_changed_vote_earns_no_more_spark(db, turn, monkeypatch):
+    from integrations.social.resonance_engine import ResonanceService
+    awarded = []
+    monkeypatch.setattr(ResonanceService, 'award_action', staticmethod(
+        lambda db_, uid, action, **kw: awarded.append((uid, action))))
+    e = _experiment(db)
+    owner = _user(db)
+    _user(db, 'agent', owner_id=owner.id, agent_id='98888888888')
+    for value in (1, -1, 2, -2):
+        assert _vote_as(turn, owner.id, '98888888888', e.id, vote_value=value)['success']
+    assert len(awarded) == 1
+
+
+def test_the_ballot_bounds_title_and_outcome(db):
+    e = _experiment(db)
+    e.title = 'T' * 1000
+    e.expected_outcome = 'O' * 1000
+    db.commit()
+    prompt = _coordinator_prompt()
+    assert 'T' * 201 not in prompt and 'O' * 301 not in prompt

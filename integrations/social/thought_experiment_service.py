@@ -485,6 +485,7 @@ class ThoughtExperimentService:
             voter_id=voter_id,
         ).first()
 
+        created = existing is None
         if existing:
             existing.vote_value = vote_value
             existing.reasoning = reasoning
@@ -509,8 +510,10 @@ class ThoughtExperimentService:
         db.flush()
 
         # Award spark for voting (not for a machine vote: the world model's
-        # votes pass award=False; review of 9ca2be81a measured 60 spark for 6)
-        if award:
+        # votes pass award=False; review of 9ca2be81a measured 60 spark for 6),
+        # once per voter and experiment: a changed vote earns nothing more
+        # (review of 81c34a0ae: 4 re-votes minted 4 awards).
+        if award and created:
             try:
                 from .resonance_engine import ResonanceService
                 ResonanceService.award_action(
@@ -865,7 +868,7 @@ class ThoughtExperimentService:
         # no identity for the quorum.
         from .models import User
         from .voting_rules import (
-            is_steward, one_vote_per_identity, quorum_met, recommendation)
+            is_person, is_steward, one_vote_per_identity, quorum_met, recommendation)
         voter_ids = {v.voter_id for v in votes}
         users = {u.id: u for u in
                  (db.query(User).filter(User.id.in_(voter_ids)).all()
@@ -887,10 +890,15 @@ class ThoughtExperimentService:
                 steward_vote = (v.vote_value if steward_vote is None
                                 else min(steward_vote, v.vote_value))
             user = users.get(v.voter_id)
-            # Agent or human from the ACCOUNT, never the stored voter_type,
-            # which the vote route used to take from the request body.  Only
-            # an unregistered id (in-process callers) falls back to it.
-            is_agent = ((user.user_type == 'agent') if user is not None
+            # Person or not from the ACCOUNT (voting_rules.is_person, the one
+            # person test), never the stored voter_type, which the vote route
+            # used to take from the request body.  Only an unregistered id
+            # (in-process callers) falls back to it.  A non-person (an agent, a
+            # system account) weighs as an agent and is never a person's OWN
+            # vote: a system account shares the node's identity, which is the
+            # owner's, and counted as "own" its one vote cancelled the owner's
+            # AGAINST (review of 81c34a0ae, measured end to end).
+            is_agent = ((not is_person(user)) if user is not None
                         else v.voter_type != 'human')
             if is_agent:
                 agent_weight = context_rules['agent_weight'] if context_rules else 1.0

@@ -102,7 +102,16 @@ def cast_experiment_vote(experiment_id: str, voter_id: str,
         with db_session() as db:
             user_row = (db.query(User).filter(User.id == str(turn_user)).first()
                         if turn_user not in (None, '') else None)
-            autonomous = (str(turn_user) in SYSTEM_IDENTITIES
+            # Autonomous if EITHER test says so (review of 81c34a0ae): the
+            # request is a daemon dispatch (dispatch.is_current_request_
+            # autonomous, the canonical discriminator: a hive worker turn's
+            # user is a handle with no row), or the turn's user is the node's
+            # service identity or a non-person account.  Misreading a
+            # person's turn as autonomous only narrows who may vote.
+            from integrations.agent_engine.dispatch import (
+                is_current_request_autonomous)
+            autonomous = (is_current_request_autonomous()
+                          or str(turn_user) in SYSTEM_IDENTITIES
                           or (user_row is not None and not is_person(user_row)))
             named = (db.query(User).filter(
                 User.user_type == 'agent',
@@ -133,8 +142,8 @@ def cast_experiment_vote(experiment_id: str, voter_id: str,
                     return json.dumps({
                         'success': False,
                         'reason': 'autonomous_turn_votes_only_as_its_node',
-                        'detail': 'this agent counts as a person, who did not '
-                                  'act on this turn',
+                        'detail': 'on a turn no person is taking, only an '
+                                  'agent that counts as this node may vote',
                     })
             result = ThoughtExperimentService.cast_vote(
                 db, experiment_id, agent.id,
@@ -594,7 +603,8 @@ class ExperimentVoteTool:
             name=cls.NAME,
             description=('Cast your own vote on a thought experiment. The '
                          'vote is yours, the agent running this turn, and '
-                         'counts as your owner\'s.'),
+                         'counts as the person you belong to, or as this '
+                         'node when no person owns you.'),
             base_url='native://in-process',
             endpoints={
                 cls.NAME: {

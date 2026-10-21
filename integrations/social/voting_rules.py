@@ -161,12 +161,13 @@ def voter_identity(user, owner_of, node=NODE_IDENTITY):
 
 
 def one_vote_per_identity(ballots):
-    """Collapse vote rows into ONE vote per identity (owner ruling: an agent
-    counts as its owner, and no one entity monopolises the hive).
+    """Collapse vote rows into ONE vote per identity (owner rulings: an agent
+    counts as the person at the root of its owner chain, or as this node;
+    voter_identity; and no one entity monopolises the hive).
 
     ``ballots``: iterable of dicts {'identity', 'own', 'value', 'weight'},
-    one per vote row; ``own`` is True for the identity's human voting as
-    themself.  Returns {identity: (value, weight)}:
+    one per vote row; ``own`` is True for the identity's PERSON voting as
+    themself (never for an agent or a system account: is_person).  Returns {identity: (value, weight)}:
       - the human's own vote when they cast one (their agents are advisory);
       - otherwise the majority side of that identity's votes (FOR vs
         AGAINST), its value and weight the mean of that side's;

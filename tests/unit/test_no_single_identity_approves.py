@@ -339,3 +339,61 @@ class TestOnePersonRuleAndTheNodesOwner:
         _vote(db, exp_id, _user(db), 2)
         tally = ThoughtExperimentService.tally_votes(db, exp_id)
         assert tally['distinct_voters'] == 3
+
+
+class TestTheTallyWeighsByThePersonTest:
+    """Review of 81c34a0ae: the tally decided own vote and weight by "is not
+    an agent", so a system account (the node's identity, which is the
+    owner's) counted as the owner's OWN vote at human weight."""
+
+    def test_a_system_account_never_overrides_the_owners_own_vote(self, db, monkeypatch):
+        """The owner votes AGAINST; a system account votes FOR: the owner's
+        own vote still decides their identity (AGAINST)."""
+        exp_id = _voting_experiment(db)
+        owner = _user(db)
+        monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', owner.id)
+        _vote(db, exp_id, owner, -2)
+        _vote(db, exp_id, _user(db, 'system'), 2)
+        others = [_user(db) for _ in range(2)]
+        for p in others:
+            _vote(db, exp_id, p, 2)
+        tally = ThoughtExperimentService.tally_votes(db, exp_id)
+        # identities: the owner (AGAINST, own), two people FOR
+        assert (tally['distinct_voters'], tally['distinct_supporters']) == (3, 2)
+        assert tally['total_against'] > 0
+
+    def test_a_system_accounts_vote_weighs_as_an_agent(self, db):
+        exp_id = _voting_experiment(db)
+        _vote(db, exp_id, _user(db, 'system'), 2, confidence=0.5)
+        tally = ThoughtExperimentService.tally_votes(db, exp_id)
+        assert tally['agent_votes'] == 1 and tally['human_votes'] == 0
+
+    def test_owners_load_one_query_per_chain_level(self, db):
+        """300 voters on depth-3 chains: a handful of queries, not one per
+        owner (d1cd8de2f issued 901)."""
+        from sqlalchemy import event
+        exp_id = _voting_experiment(db)
+        for _ in range(30):
+            root = _user(db)
+            mid = _user(db, 'agent', owner_id=_user(db, 'agent', owner_id=root.id).id)
+            _vote(db, exp_id, _user(db, 'agent', owner_id=mid.id), 1)
+        selects = []
+
+        def _count(conn, cursor, statement, *a):
+            if statement.lstrip().upper().startswith('SELECT'):
+                selects.append(1)
+        event.listen(db.get_bind(), 'before_cursor_execute', _count)
+        try:
+            ThoughtExperimentService.tally_votes(db, exp_id)
+        finally:
+            event.remove(db.get_bind(), 'before_cursor_execute', _count)
+        assert len(selects) <= 10, len(selects)
+
+    def test_a_guest_who_owns_an_agent_is_its_person(self, db):
+        """An agent owned by a guest counts as the guest, not as this node."""
+        exp_id = _voting_experiment(db)
+        guest = _user(db, 'guest')
+        _vote(db, exp_id, _user(db, 'agent', owner_id=guest.id), 2)
+        _vote(db, exp_id, _user(db, 'agent'), 2)
+        tally = ThoughtExperimentService.tally_votes(db, exp_id)
+        assert tally['distinct_voters'] == 2
