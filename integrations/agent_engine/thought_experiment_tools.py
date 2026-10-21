@@ -58,20 +58,34 @@ def cast_experiment_vote(experiment_id: str, voter_id: str,
     ONE rule: the voter is the agent whose turn is running, never the
     argument.  It comes from the request's thread-local state (hartos.
     threadlocal, set by the /chat handler): when the turn's own user is an
-    agent account, that agent (an agent's own turn: the agent daemon hands
-    a goal to a persona with user_id = the persona and prompt_id = the
-    GOAL's number, dispatch.prompt_id_for_goal, which names no persona and
-    is the agent_id of whichever agent was trained under it, so it voted as
-    the wrong agent: hevolveai Master 11.462 K); otherwise the agent the
-    turn's prompt_id names (a person's turn with their agent; by id or
-    prompt id).  The vote is recorded
-    under that row as an agent vote, whatever ``voter_type`` says (kept in
-    the signature for existing callers, and ignored).  tally_votes counts it
-    as its owner's identity: an agent is its owner, so two agents of one
-    owner are one identity, and no agent is ever the steward
-    (voting_rules.is_steward).  ``voter_id`` may be empty or name that same
-    agent; naming anyone else -- a person, another agent, 'steward' -- is
-    refused and nothing is written.  No resolved caller, no vote: the MCP
+    agent account, that agent (the agent daemon hands a goal to a persona
+    with user_id = the persona and prompt_id = the GOAL's number,
+    dispatch.prompt_id_for_goal, which names no persona and is the agent_id
+    of whichever agent was trained under it: hevolveai Master 11.462 K);
+    otherwise the agent the turn's prompt_id names (a person's turn with
+    their agent; by id or prompt id).
+
+    AN AUTONOMOUS TURN VOTES ONLY AS ITS NODE (owner ruling 2026-10-21; the
+    review of 5fd160d92 measured the daemon rotating the coordinator across
+    personas owned by different people and approving with no person
+    acting).  A turn whose user is an agent or system account, or the
+    node's own service identity (core.constants.SYSTEM_IDENTITIES: the
+    native and Tier-2 dispatch paths run as 'system_daemon'), is the node
+    acting, so its vote counts only if the voting agent's identity is this node's
+    (voting_rules.voter_identity == node_identity); an agent that counts as
+    some person is refused there, since that person did not act.  Such a
+    vote earns no spark (a machine vote is not a contribution, as the world
+    model's).  On a person's own turn the agent it names votes as before
+    and counts as the person at the root of its owner chain; a turn whose
+    user has no row here (the desktop's guest id, an unregistered caller)
+    stays a person's turn, as it was.
+
+    The vote is recorded under the agent's row as an agent vote, whatever
+    ``voter_type`` says (kept in the signature for existing callers, and
+    ignored); no agent is ever the steward (voting_rules.is_steward).
+    ``voter_id`` may be empty or name the agent the turn resolved to or the
+    agent its prompt_id names; naming anyone else -- a person, another
+    agent, 'steward' -- is refused and nothing is written.  No resolved caller, no vote: the MCP
     bridge runs tools with no caller (an MCP call is no agent's turn), so a
     vote there is refused.  A person votes through the signed-in route
     (POST /api/social/experiments/<id>/vote, voter_id from the JWT)."""
@@ -81,18 +95,25 @@ def cast_experiment_vote(experiment_id: str, voter_id: str,
         from integrations.social.models import User, db_session
         from integrations.social.thought_experiment_service import ThoughtExperimentService
 
+        from core.constants import SYSTEM_IDENTITIES
+        from integrations.social.voting_rules import is_person
         caller = thread_local_data.get_prompt_id()
         turn_user = thread_local_data.get_user_id()
         with db_session() as db:
-            agent = None
-            if turn_user not in (None, ''):
-                agent = db.query(User).filter(
-                    User.user_type == 'agent', User.id == str(turn_user)).first()
-            if agent is None and caller not in (None, ''):
-                agent = db.query(User).filter(
-                    User.user_type == 'agent',
-                    or_(User.id == str(caller),
-                        User.agent_id == str(caller))).first()
+            user_row = (db.query(User).filter(User.id == str(turn_user)).first()
+                        if turn_user not in (None, '') else None)
+            autonomous = (str(turn_user) in SYSTEM_IDENTITIES
+                          or (user_row is not None and not is_person(user_row)))
+            named = (db.query(User).filter(
+                User.user_type == 'agent',
+                or_(User.id == str(caller), User.agent_id == str(caller))).first()
+                if caller not in (None, '') else None)
+            agent = user_row if (user_row is not None
+                                 and user_row.user_type == 'agent') else named
+            name = str(voter_id or '')
+            if (name and named is not None and agent is not named
+                    and name in (str(named.id), str(named.agent_id))):
+                agent = named
             if agent is None:
                 return json.dumps({
                     'success': False,
@@ -101,19 +122,28 @@ def cast_experiment_vote(experiment_id: str, voter_id: str,
                               'vote; a person votes through the signed-in '
                               'route',
                 })
-            name = str(voter_id or '')
             if name and name not in (str(agent.id), str(agent.agent_id)):
                 return json.dumps({
                     'success': False,
                     'reason': 'voter_is_not_the_calling_agent',
                 })
+            if autonomous:
+                identity_of, node = ThoughtExperimentService.voter_identities(db, [agent])
+                if identity_of[agent.id] != node:
+                    return json.dumps({
+                        'success': False,
+                        'reason': 'autonomous_turn_votes_only_as_its_node',
+                        'detail': 'this agent counts as a person, who did not '
+                                  'act on this turn',
+                    })
             result = ThoughtExperimentService.cast_vote(
                 db, experiment_id, agent.id,
                 vote_value=int(vote_value),
                 reasoning=reasoning,
                 suggestion=suggestion,
                 voter_type='agent',
-                confidence=float(confidence))
+                confidence=float(confidence),
+                award=not autonomous)
             if result:
                 return json.dumps({'success': True, 'vote': result})
             else:

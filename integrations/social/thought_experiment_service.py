@@ -19,6 +19,7 @@ from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
 from .models import after_commit
+from .voting_rules import WORLD_MODEL_MARKER
 
 logger = logging.getLogger('hevolve_social')
 
@@ -35,16 +36,17 @@ VALID_DECISION_TYPES = ['majority', 'weighted', 'consensus', 'expert_panel']
 VOTE_RANGE = (-2, 2)  # Strongly oppose to strongly support
 # The world model's own voter account (owner decision, 2026-10-19: agents AND
 # the world model vote; quorum and the 2/3 rule unchanged). An agent with no
-# owner, so the tally counts it as one identity of its own at agent weight;
-# marked in its settings, which is how a same-named account that is NOT this
-# one is told apart, and never dispatched work as a persona.
+# owner, marked in its settings (voting_rules.WORLD_MODEL_MARKER), so the
+# tally counts it as one identity of its own (WORLD_MODEL_IDENTITY) at agent
+# weight; the marker is also how a same-named account that is NOT this one
+# is told apart, and it is never dispatched work as a persona.
 WORLD_MODEL_VOTER = 'hevolveai_world_model'
 # How many open experiments the world model scores per daemon tick: each
 # costs two llama-server encodes on the slot chat shares.
 WORLD_MODEL_VOTES_PER_TICK = 3
 # The marker the voter account is made with; an account under its username
 # without it is not the world model's (UserService.machine_account_conflict).
-WORLD_MODEL_VOTER_SETTINGS = {'world_model_voter': True, 'dispatchable': False}
+WORLD_MODEL_VOTER_SETTINGS = {WORLD_MODEL_MARKER: True, 'dispatchable': False}
 # Per-process count of scores that cast nothing (an abstention, a busy or
 # unreachable world model), so an experiment that keeps abstaining sinks
 # behind fresh ones instead of blocking them for ever.
@@ -281,8 +283,8 @@ class ThoughtExperimentService:
     @staticmethod
     def ensure_world_model_voter(db: Session):
         """The world model's voter account, created once through
-        UserService.ensure_system_user: an agent owned by no one (a distinct
-        identity in the tally; one owner's agents collapse into that owner),
+        UserService.ensure_system_user: an agent owned by no one, marked so
+        the tally counts it as one identity of its own (WORLD_MODEL_IDENTITY),
         marked WORLD_MODEL_VOTER_SETTINGS so it is never handed goals as a
         persona.  A same-named account that is not this one (a human who
         took the handle first, any account without the marker) raises
@@ -338,7 +340,6 @@ class ThoughtExperimentService:
         from sqlalchemy import func
         from .models import ExperimentVote, ThoughtExperiment, User
         from .services import UserService
-        from .voting_rules import check_voter_eligibility
         voter = db.query(User).filter(User.username == WORLD_MODEL_VOTER).first()
         conflict = voter and UserService.machine_account_conflict(
             voter, 'agent', WORLD_MODEL_VOTER_SETTINGS)
@@ -351,22 +352,20 @@ class ThoughtExperimentService:
             row[0] for row in db.query(ExperimentVote.experiment_id)
             .filter(ExperimentVote.voter_id == voter.id)}
         query = (db.query(ThoughtExperiment)
-                 .filter(ThoughtExperiment.status.in_(('discussing', 'voting')))
                  .filter(ThoughtExperiment.expected_outcome.isnot(None))
                  .filter(func.length(func.trim(ThoughtExperiment.expected_outcome)) > 0))
         if voted:
             query = query.filter(~ThoughtExperiment.id.in_(voted))
         # The SQL TRIM strips only ASCII spaces; an outcome of tabs, newlines
         # or U+3000 is just as blank (review of 4c4ba922f).
-        open_rows = [e for e in query.all()
-                     if (e.expected_outcome or '').strip() and (e.hypothesis or '').strip()]
+        open_rows = [e for e in ThoughtExperimentService._open_agent_votable(db, query)
+                     if (e.expected_outcome or '').strip()]
         live = {e.id for e in open_rows}
         for stale in [k for k in _WORLD_MODEL_ATTEMPTS if k not in live]:
             _WORLD_MODEL_ATTEMPTS.pop(stale, None)
         for stale in [k for k in _WORLD_MODEL_REFUSAL_LOGGED if k not in live]:
             _WORLD_MODEL_REFUSAL_LOGGED.pop(stale, None)
-        rows = [e for e in open_rows
-                if check_voter_eligibility(e.to_dict(), 'agent').get('eligible')]
+        rows = list(open_rows)
         rows.sort(key=lambda e: (_WORLD_MODEL_ATTEMPTS.get(e.id, 0),
                                  e.created_at or datetime.min))
         rows = rows[:limit]
@@ -863,18 +862,13 @@ class ThoughtExperimentService:
         # no identity for the quorum.
         from .models import User
         from .voting_rules import (
-            is_steward, one_vote_per_identity, quorum_met, recommendation,
-            voter_identity)
+            is_steward, one_vote_per_identity, quorum_met, recommendation)
         voter_ids = {v.voter_id for v in votes}
         users = {u.id: u for u in
                  (db.query(User).filter(User.id.in_(voter_ids)).all()
                   if voter_ids else [])}
-        owners = dict(users)
-
-        def _owner_of(owner_id):
-            if owner_id not in owners:
-                owners[owner_id] = db.query(User).filter(User.id == owner_id).first()
-            return owners[owner_id]
+        identity_of, _node = ThoughtExperimentService.voter_identities(
+            db, users.values())
         # Whose vote is the steward's: voting_rules.is_steward, never a
         # voter_id string.
         stewards = {uid for uid, u in users.items() if is_steward(u)}
@@ -903,7 +897,7 @@ class ThoughtExperimentService:
                 weight = context_rules['human_weight'] if context_rules else 1.0
                 human_votes += 1
             if user is not None:
-                identity, own = voter_identity(user, _owner_of), not is_agent
+                identity, own = identity_of[user.id], not is_agent
             else:
                 identity, own = ('unregistered', v.voter_id), True
             ballots.append({'identity': identity, 'own': own,
@@ -1037,39 +1031,74 @@ class ThoughtExperimentService:
     # ─── Queries ───
 
     @staticmethod
-    def open_for_agent_votes(db: Session, limit: int) -> List[Dict]:
-        """The experiments an agent may vote on now, fewest votes first.
+    def voter_identities(db: Session, users) -> tuple:
+        """({user.id: identity}, this node's identity) for these users rows,
+        by voting_rules.voter_identity and node_identity: every owner on
+        their chains is loaded one query per chain level (a cycle cannot
+        loop: an id is loaded once)."""
+        from .models import User
+        from .voting_rules import node_identity, voter_identity
+        users = list(users)
+        rows = {u.id: u for u in users}
+        frontier = users
+        while frontier:
+            need = {u.owner_id for u in frontier
+                    if u.owner_id is not None and u.owner_id not in rows}
+            if not need:
+                break
+            found = db.query(User).filter(User.id.in_(need)).all()
+            for oid in need:
+                rows[oid] = None
+            for u in found:
+                rows[u.id] = u
+            frontier = found
 
-        Owner rulings 2026-10-19 (agents vote) and 2026-10-21 (an agent no
-        person owns counts as its node): the coordinator turn is shown these,
-        since no tool a turn holds lists experiments (hevolveai Master 11.462
-        K).  Open means 'discussing' or 'voting' (cast_vote refuses the
-        rest), with a hypothesis that is not blank; an agent may vote in the
-        experiment's decision context (voting_rules.check_voter_eligibility,
-        the check cast_vote makes).  Fewest votes first, then oldest, so
-        votes gather toward one experiment's quorum before they spread thin.
-        Read-only.  Each entry is to_dict() plus 'votes', the vote count.
-        """
-        from sqlalchemy import func
-        from .models import ExperimentVote, ThoughtExperiment
+        def owner_of(owner_id):
+            if owner_id not in rows:
+                rows[owner_id] = db.query(User).filter(User.id == owner_id).first()
+            return rows[owner_id]
+        node = node_identity(owner_of)
+        return {u.id: voter_identity(u, owner_of, node) for u in users}, node
+
+    @staticmethod
+    def _open_agent_votable(db: Session, query=None) -> List:
+        """The ONE selection of experiments an agent may vote on now, shared
+        by the world model's round and the coordinator's ballot: open
+        ('discussing' or 'voting'; cast_vote refuses the rest), a hypothesis
+        that is not blank, and a decision context agents may vote in
+        (voting_rules.check_voter_eligibility, the check cast_vote makes).
+        `query` narrows it further (a ThoughtExperiment query)."""
+        from .models import ThoughtExperiment
         from .voting_rules import check_voter_eligibility
-        rows = [e for e in db.query(ThoughtExperiment)
-                .filter(ThoughtExperiment.status.in_(('discussing', 'voting'))).all()
+        q = query if query is not None else db.query(ThoughtExperiment)
+        q = q.filter(ThoughtExperiment.status.in_(('discussing', 'voting')))
+        return [e for e in q.all()
                 if (e.hypothesis or '').strip()
                 and check_voter_eligibility(e.to_dict(), 'agent').get('eligible')]
+
+    @staticmethod
+    def open_for_agent_votes(db: Session, limit: int) -> List[Dict]:
+        """The experiments this node's agents may vote on now: open and
+        agent-eligible (_open_agent_votable), and not yet voted on by this
+        node (owner ruling 2026-10-21: a node's agents are ONE identity, so
+        once one of them voted, another node vote changes nothing and only
+        repeats a turn).  Fewest votes first (total_votes), then oldest, so
+        every open experiment is reached before any is judged twice.
+        Read-only.  Each entry is to_dict()."""
+        from .models import ExperimentVote, User
+        rows = ThoughtExperimentService._open_agent_votable(db)
         if not rows:
             return []
-        counts = dict(db.query(ExperimentVote.experiment_id,
-                               func.count(ExperimentVote.id))
-                      .filter(ExperimentVote.experiment_id.in_([e.id for e in rows]))
-                      .group_by(ExperimentVote.experiment_id).all())
-        rows.sort(key=lambda e: (counts.get(e.id, 0), e.created_at or datetime.min))
-        out = []
-        for e in rows[:max(0, int(limit))]:
-            d = e.to_dict()
-            d['votes'] = counts.get(e.id, 0)
-            out.append(d)
-        return out
+        votes = (db.query(ExperimentVote.experiment_id, ExperimentVote.voter_id)
+                 .filter(ExperimentVote.experiment_id.in_([e.id for e in rows])).all())
+        voters = {u.id: u for u in (db.query(User).filter(
+            User.id.in_({v for _, v in votes})).all() if votes else [])}
+        identity_of, node = ThoughtExperimentService.voter_identities(db, voters.values())
+        node_voted = {exp_id for exp_id, voter_id in votes
+                      if voter_id in voters and identity_of[voter_id] == node}
+        rows = [e for e in rows if e.id not in node_voted]
+        rows.sort(key=lambda e: (e.total_votes or 0, e.created_at or datetime.min))
+        return [e.to_dict() for e in rows[:max(0, int(limit))]]
 
     @staticmethod
     def get_active_experiments(db: Session, status: str = None,

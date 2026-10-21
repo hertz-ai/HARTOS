@@ -370,6 +370,10 @@ class UserService:
         - an agent or system account with no human owner: None;
         - an id with no local users row: returned unchanged, because a goal
           submitted on another node names a requester this node never saw.
+
+        The vote tally uses the same person test with two deliberate
+        differences (voting_rules.voter_identity): it walks the whole owner
+        chain, and an owner it cannot see counts as this node.
         """
         from core.constants import NON_PERSON_USER_TYPES
         user = UserService.get_by_id(db, user_id)

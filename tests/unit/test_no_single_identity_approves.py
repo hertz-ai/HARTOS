@@ -40,6 +40,13 @@ def engine():
     return eng
 
 
+@pytest.fixture(autouse=True)
+def _no_known_owner(monkeypatch):
+    """The node's owner (HEVOLVE_OWNER_USER_ID) is unknown unless a test
+    sets it, whatever the shell running the suite exports."""
+    monkeypatch.delenv('HEVOLVE_OWNER_USER_ID', raising=False)
+
+
 @pytest.fixture
 def db(engine):
     session = sessionmaker(bind=engine)()
@@ -139,14 +146,20 @@ class TestTheQuorumIsCountedByIdentity:
         assert tally['distinct_voters'] == 1
 
     def test_one_supporter_is_not_enough_even_when_the_ratio_passes(self, db):
-        """The weighted case the 2/3 ratio misses: 1.0 / 1.4 = 0.71."""
+        """The weighted case the 2/3 ratio misses: 1.0 / 1.4 = 0.71.  The
+        low-confidence AGAINST voters are agents of DISTINCT people, so the
+        voters do reach the quorum count and only the supporters rule can
+        refuse it (review of d1cd8de2f: with agents no person owns they
+        merged into one identity and the rule went untested)."""
         exp_id = _voting_experiment(db)
         _vote(db, exp_id, _user(db), 2)
         for _ in range(max(2, MIN_DISTINCT_VOTERS - 1)):
-            _vote(db, exp_id, _user(db, 'agent'), -1, confidence=0.2)
+            _vote(db, exp_id, _user(db, 'agent', owner_id=_user(db).id), -1,
+                  confidence=0.2)
         tally = ThoughtExperimentService.tally_votes(db, exp_id)
         decisive = tally['total_for'] + tally['total_against']
         assert tally['total_for'] / decisive >= 2 / 3
+        assert tally['distinct_voters'] >= MIN_DISTINCT_VOTERS
         assert tally['distinct_supporters'] == 1
         assert tally['quorum_met'] is False
 
@@ -242,9 +255,10 @@ class TestAnAgentCountsAsThePersonAtTheRootOfItsChain:
         assert (tally['distinct_voters'], tally['distinct_supporters']) == (2, 2)
         assert tally['quorum_met'] is False   # a node never approves alone
 
-    def test_a_node_needs_a_person_or_another_node(self, db):
+    def test_a_node_whose_owner_is_unknown_needs_a_person(self, db):
         """Its agents and its world model are two identities; a person
-        voting FOR makes the third, and the quorum is met."""
+        voting FOR makes the third, and the quorum is met (no owner known,
+        so the person is not the node)."""
         exp_id = _voting_experiment(db)
         _vote(db, exp_id, _user(db, 'agent'), 2)
         _vote(db, exp_id, _user(db, 'agent', settings={'world_model_voter': True}), 2)
@@ -252,3 +266,72 @@ class TestAnAgentCountsAsThePersonAtTheRootOfItsChain:
         tally = ThoughtExperimentService.tally_votes(db, exp_id)
         assert (tally['distinct_voters'], tally['distinct_supporters']) == (3, 3)
         assert tally['quorum_met'] is True
+
+
+class TestOnePersonRuleAndTheNodesOwner:
+    """Review of d1cd8de2f: a person is any account whose type is not in
+    core.constants.NON_PERSON_USER_TYPES (the test UserService.
+    person_to_notify uses), so a system account is no person; and the
+    owner's ruling of 2026-10-21 counts an agent no person owns as "this
+    node's owner" (HEVOLVE_OWNER_USER_ID, when it is a person's row)."""
+
+    def test_a_system_account_and_its_agent_are_this_node(self, db):
+        """A system account, an agent it owns and the world model, all FOR:
+        2 identities, no quorum (d1cd8de2f counted the system account as
+        itself and approved with no person)."""
+        exp_id = _voting_experiment(db)
+        system = _user(db, 'system')
+        _vote(db, exp_id, system, 2)
+        _vote(db, exp_id, _user(db, 'agent', owner_id=system.id), 2)
+        _vote(db, exp_id, _user(db, 'agent', settings={'world_model_voter': True}), 2)
+        tally = ThoughtExperimentService.tally_votes(db, exp_id)
+        assert (tally['distinct_voters'], tally['quorum_met']) == (2, False)
+
+    def test_a_guest_is_a_person(self, db):
+        """The desktop's own UI account is a guest: a person, and their
+        agent counts as them."""
+        exp_id = _voting_experiment(db)
+        guest = _user(db, 'guest')
+        _vote(db, exp_id, guest, 2)
+        _vote(db, exp_id, _user(db, 'agent', owner_id=guest.id), 2)
+        tally = ThoughtExperimentService.tally_votes(db, exp_id)
+        assert tally['distinct_voters'] == 1
+
+    def test_the_world_model_marker_on_a_persons_agent_is_that_person(self, db):
+        exp_id = _voting_experiment(db)
+        person = _user(db)
+        _vote(db, exp_id, person, 2)
+        _vote(db, exp_id, _user(db, 'agent', owner_id=person.id,
+                                settings={'world_model_voter': True}), 2)
+        tally = ThoughtExperimentService.tally_votes(db, exp_id)
+        assert tally['distinct_voters'] == 1
+
+    def test_the_nodes_agents_count_as_its_owner(self, db, monkeypatch):
+        """HEVOLVE_OWNER_USER_ID names a person: their node's agents are
+        them, their own vote decides, and with the world model they are
+        still two identities, so the owner and their machine can never
+        approve alone."""
+        exp_id = _voting_experiment(db)
+        owner = _user(db)
+        monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', owner.id)
+        _vote(db, exp_id, owner, -2)
+        for _ in range(3):
+            _vote(db, exp_id, _user(db, 'agent'), 2)
+        _vote(db, exp_id, _user(db, 'agent', settings={'world_model_voter': True}), 2)
+        tally = ThoughtExperimentService.tally_votes(db, exp_id)
+        assert (tally['distinct_voters'], tally['distinct_supporters']) == (2, 1)
+        assert tally['quorum_met'] is False
+
+    @pytest.mark.parametrize('owner', ['g_0123456789abcdef', 'agent', 'system'])
+    def test_an_owner_id_that_is_no_person_here_is_the_bare_node(self, db, monkeypatch, owner):
+        """A guest id with no row here, an agent's or a system account's id:
+        the node is its own identity (and a person here is a third)."""
+        exp_id = _voting_experiment(db)
+        if owner != 'g_0123456789abcdef':
+            owner = _user(db, owner).id
+        monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', owner)
+        _vote(db, exp_id, _user(db, 'agent'), 2)
+        _vote(db, exp_id, _user(db, 'agent', settings={'world_model_voter': True}), 2)
+        _vote(db, exp_id, _user(db), 2)
+        tally = ThoughtExperimentService.tally_votes(db, exp_id)
+        assert tally['distinct_voters'] == 3

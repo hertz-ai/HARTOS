@@ -62,9 +62,10 @@ DEFAULT_RULES = {
 # 0 AGAINST is a ratio of 1.0, and weighting lets one human FOR outweigh two
 # low-confidence agents AGAINST (1.0 / 1.4 = 0.71 >= 2/3).  So approval also
 # needs DISTINCT identities, counted by tally_votes:
-#   - an identity is a registered user; an agent counts as the human who
-#     owns it, so one person with many agents is still one identity, and
-#     an agent no person owns counts as this node (voter_identity);
+#   - an identity is a registered user; an agent counts as the person at
+#     the root of its owner chain, so one person with many agents is still
+#     one identity, and an agent no person owns counts as this node, its
+#     owner when known (voter_identity, node_identity);
 #   - only a decisive vote (non-zero value, weight > 0) counts.
 # MIN_DISTINCT_SUPPORTERS = 2 is the invariant itself: one identity can never
 # approve alone.  MIN_DISTINCT_VOTERS = 3 is the smallest decisive quorum at
@@ -76,42 +77,75 @@ MIN_DISTINCT_SUPPORTERS = 2
 
 # Who a vote counts as.  Owner rulings: an agent counts as the human who owns
 # it (2026-09-24), and an agent no PERSON owns counts as this node, ONE
-# identity per node (2026-10-21).  Measured before (production, Oct 21): 302
-# of 305 agents never traced to a person (285 per-flow agents with no owner,
-# 16 of the 19 owned agents owned by another agent), and counting each as its
-# own identity let three of them approve an experiment with no person voting
-# (hevolveai Master 11.462 K).
-#: The identity of every agent whose owner chain reaches no person.
+# identity per node, "this node's owner" (2026-10-21).  Measured before
+# (production, Oct 21): 302 of 305 agents never traced to a person (285
+# per-flow agents and hevolve_system_agent with no owner, 16 of the 19 owned
+# agents owned by another agent), and counting each as its own identity let
+# three of them approve an experiment with no person voting (hevolveai Master
+# 11.462 K).  A person is any account whose type is not in
+# core.constants.NON_PERSON_USER_TYPES ('agent', 'system'), the same test
+# UserService.person_to_notify uses.
+#: The identity of every non-person voter whose owner chain reaches no person,
+#: when this node's owner is not known as a person here (node_identity).
 NODE_IDENTITY = ('node', 'local')
 #: The world model's voter (ThoughtExperimentService.ensure_world_model_voter)
 #: is one identity of its own (owner ruling 2026-10-19), however many
 #: accounts carry its marker.
 WORLD_MODEL_IDENTITY = ('world_model', 'local')
-_PERSON_TYPES = ('human', 'guest')
+#: The settings key that marks the world model's voter account.
+WORLD_MODEL_MARKER = 'world_model_voter'
 
 
-def voter_identity(user, owner_of):
+def is_person(user) -> bool:
+    """A person: an account whose type is not in core.constants.
+    NON_PERSON_USER_TYPES (the test UserService.person_to_notify uses)."""
+    from core.constants import NON_PERSON_USER_TYPES
+    return getattr(user, 'user_type', None) not in NON_PERSON_USER_TYPES
+
+
+def node_identity(owner_of):
+    """This node's identity in the tally: its owner, the person whose
+    machine this is (HEVOLVE_OWNER_USER_ID, which Nunba exports at boot and
+    integrations/vlm/safety.py reads as "whose machine this is"), when that
+    id is a person's row here; otherwise NODE_IDENTITY.  A guest id
+    (g_<hex>) or an operator pin with no row here, an agent or system id,
+    and an unset variable (a HARTOS node without Nunba) all fall back.  So
+    the owner's own vote and their node's agents are ONE identity: the
+    owner plus their own machine can never approve alone."""
+    import os
+    owner = (os.environ.get('HEVOLVE_OWNER_USER_ID') or '').strip()
+    if owner:
+        row = owner_of(owner)
+        if row is not None and is_person(row):
+            return row.id
+    return NODE_IDENTITY
+
+
+def voter_identity(user, owner_of, node=NODE_IDENTITY):
     """The identity a registered voter's vote counts as, for the quorum and
     for one_vote_per_identity.
 
-      - a voter that is not an agent is itself (``user.id``);
+      - a person is themself (``user.id``);
       - the world model's voter (an agent with no owner, settings
-        ``world_model_voter``) is WORLD_MODEL_IDENTITY;
-      - an agent is the PERSON at the root of its owner chain (an agent may
-        be owned by an agent, which may be owned by a person);
-      - an agent whose chain reaches no person -- no owner, an agent-only
-        chain, a system account at its root, a cycle, a missing row -- is
-        NODE_IDENTITY: all such agents together are one identity, so a node
-        can never approve its own change with its own agents (its agents and
-        its world model are two identities; a third must be a person or
-        another node).
+        WORLD_MODEL_MARKER) is WORLD_MODEL_IDENTITY;
+      - any other account that is not a person (an agent, a system account)
+        is the PERSON at the root of its owner chain (an agent may be owned
+        by an agent, which may be owned by a person);
+      - one whose chain reaches no person -- no owner, an agent-only chain,
+        a system account at its root, a cycle, a missing row -- is ``node``
+        (node_identity: this node's owner, else NODE_IDENTITY).
 
-    ``owner_of(owner_id)`` returns that users row, or None.
+    Deliberate differences from UserService.person_to_notify (same person
+    test): the vote walks the whole chain (a notification stops at one hop),
+    and an owner id with no row here is this node, not that id (a
+    notification may be for a person on another node; a vote may not name
+    an identity this node cannot see, or any made-up owner id would be a
+    free identity).  ``owner_of(owner_id)`` returns that users row, or None.
     """
-    if getattr(user, 'user_type', None) != 'agent':
+    if is_person(user):
         return user.id
-    if user.owner_id is None and (
-            getattr(user, 'settings', None) or {}).get('world_model_voter') is True:
+    if (getattr(user, 'user_type', None) == 'agent' and user.owner_id is None
+            and (getattr(user, 'settings', None) or {}).get(WORLD_MODEL_MARKER) is True):
         return WORLD_MODEL_IDENTITY
     seen = {user.id}
     owner_id = user.owner_id
@@ -120,12 +154,10 @@ def voter_identity(user, owner_of):
         owner = owner_of(owner_id)
         if owner is None:
             break
-        if owner.user_type in _PERSON_TYPES:
+        if is_person(owner):
             return owner.id
-        if owner.user_type != 'agent':
-            break
         owner_id = owner.owner_id
-    return NODE_IDENTITY
+    return node
 
 
 def one_vote_per_identity(ballots):
@@ -187,8 +219,9 @@ def is_steward(user) -> bool:
     The steward is a registered HUMAN account holding the central role,
     the one auth.require_central admits (auth.holds_central_role); no other
     role store.  An agent is never the steward, whoever owns it and
-    whatever its own row says: an agent counts as its owner for the quorum
-    (tally_votes), never as the steward.  A voter id with no users row --
+    whatever its own row says: an agent counts as the person at the root
+    of its owner chain, or as this node, for the quorum (voter_identity),
+    never as the steward.  A voter id with no users row --
     the literal 'steward' included -- is no one.  Only a signed-in human
     may cast this vote: the agent tool casts agent votes only
     (thought_experiment_tools.cast_experiment_vote)."""
@@ -204,7 +237,7 @@ def approval_verdict(tally: dict) -> dict:
     `tally` is ThoughtExperimentService.tally_votes' result.  Approved
     requires all of:
       - quorum_met is True: >= MIN_DISTINCT_VOTERS identities, >=
-        MIN_DISTINCT_SUPPORTERS of them FOR, an agent counting as its owner
+        MIN_DISTINCT_SUPPORTERS of them FOR, each counted by voter_identity
         (a tally that does not answer it fails closed);
       - total_for / (total_for + total_against) >= the threshold, which is
         max(SUPERMAJORITY_RATIO, the context's approval_threshold): the

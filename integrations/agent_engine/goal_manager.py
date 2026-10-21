@@ -1216,11 +1216,13 @@ COORDINATOR_BALLOT_SIZE = 5
 
 
 def _coordinator_ballot() -> str:
-    """The coordinator turn's ballot: the experiments open for an agent's
+    """The coordinator turn's ballot: the experiments open for this node's
     vote (ThoughtExperimentService.open_for_agent_votes), each with the id
     cast_experiment_vote needs, since no tool a turn holds lists them.  Their
-    text is proposers' input, sanitized like the goal's own.  '' when there
-    is nothing to vote on or the database cannot be read."""
+    text is proposers' input: sanitized like the goal's own, bounded, and
+    flattened to one line each (newlines kept would let one experiment's
+    text forge another entry or an instruction; review of 5fd160d92).  Says
+    so when nothing is open; '' only when the database cannot be read."""
     try:
         from integrations.social.models import db_session
         from integrations.social.thought_experiment_service import (
@@ -1229,16 +1231,19 @@ def _coordinator_ballot() -> str:
             ballot = ThoughtExperimentService.open_for_agent_votes(
                 db, limit=COORDINATOR_BALLOT_SIZE)
     except Exception as e:
-        logger.info("Coordinator ballot unavailable: %s", e)
+        logger.warning("Coordinator ballot unavailable: %s", e)
         return ''
     if not ballot:
-        return ''
+        return ("\nNO EXPERIMENT IS OPEN FOR YOUR VOTE NOW: there is nothing "
+                "to vote on this turn.\n")
+
+    def _line(text, n):
+        return ' '.join(_sanitize_goal_input(text or '', max_length=n).split())
     entries = '\n'.join(
-        f"- experiment_id: {e['id']} (votes so far: {e['votes']})\n"
-        f"  title: {_sanitize_goal_input(e.get('title') or '', max_length=200)}\n"
-        f"  hypothesis: {_sanitize_goal_input(e.get('hypothesis') or '', max_length=600)}\n"
-        f"  expected outcome: "
-        f"{_sanitize_goal_input(e.get('expected_outcome') or '', max_length=300)}"
+        f"- experiment_id: {e['id']} (votes so far: {e.get('total_votes', 0)})\n"
+        f"  title: {_line(e.get('title'), 200)}\n"
+        f"  hypothesis: {_line(e.get('hypothesis'), 600)}\n"
+        f"  expected outcome: {_line(e.get('expected_outcome'), 300)}"
         for e in ballot)
     return (
         "\nOPEN FOR YOUR VOTE (agents, the world model and people vote; a "
