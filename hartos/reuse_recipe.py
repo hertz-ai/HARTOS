@@ -380,7 +380,8 @@ from hartos.lifecycle_hooks import (
     ActionState, safe_set_state, force_state_through_valid_path, get_action_state,
     clear_action_states, settled_action_id, commit_verified_action_completion,
     dispatch_action_id, ACTION_STATES_AWAITING_USER, autonomy_needs_user,
-    action_is_autonomous, action_named_tools, is_written_answer, ANSWER_KEYS,
+    action_is_autonomous, action_named_tools, action_own_text,
+    is_written_answer, ANSWER_KEYS,
 )
 from hartos.cultural_wisdom import get_cultural_prompt
 
@@ -4163,7 +4164,8 @@ def _reuse_own_tool_progress(user_prompt, action_id, group_chat, agents):
     """
     try:
         task = user_tasks.get(user_prompt)
-        text = str(task.get_action(int(action_id) - 1) or '').lower() if task else ''
+        text = action_own_text(task.get_action(int(action_id) - 1)).lower() \
+            if task else ''
         if not text:
             return -1
         _all_names, referenced = _reuse_registered_and_referenced_tools(agents, text)
@@ -4717,7 +4719,7 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
         dispatch_index = _dispatch_index(messages)
 
         task = user_tasks.get(user_prompt)
-        action_text = str(task.get_action(int(action_id) - 1) or '').lower() \
+        action_text = action_own_text(task.get_action(int(action_id) - 1)).lower() \
             if task else ''
         agents = list(getattr(group_chat, 'agents', None) or [])
         _all_names, referenced = _reuse_registered_and_referenced_tools(
@@ -5604,7 +5606,11 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
     """
     try:
         task = user_tasks.get(user_prompt)
-        text = str(task.get_action(current_action - 1) or '').lower() if task else ''
+        # The step's own words, never str() of its dict: the dict carries the
+        # creator's banked run, and its tools are not this step's to demand
+        # (lifecycle_hooks.action_own_text, live 2026-10-21 agent 54).
+        text = action_own_text(task.get_action(current_action - 1)).lower() \
+            if task else ''
         if not text:
             return []
         names, referenced = _reuse_registered_and_referenced_tools(agents, text)

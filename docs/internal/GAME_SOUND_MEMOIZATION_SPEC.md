@@ -191,9 +191,15 @@ decided by what the person did, not by when a call happens to look
   A keep counts in the memo it is written to, never by when it happened:
   a person's keep ends their own composition, and the creator's keep ends
   the agent's, a visitor's level job filling the agent's empty slot among
-  them.  The creator keeping their next take for everyone is, for a
-  visitor's own composition, a take landing, not the visitor's choice
-  (review of ec055c9b6, F1, F3).
+  them, whatever that visitor did with the take in their own memo.  The
+  creator keeping their next take for everyone is, for a visitor's own
+  composition, a take landing, not the visitor's choice (review of
+  ec055c9b6, F1, F3).  A submit is in the memo before it goes out: the
+  call writes its note first (`core.game_sound_memo.submit_note`), so a
+  keep given while the submit waits ends it like any job, and the call
+  then writes neither its task, nor its note, nor its finished take
+  (`holds_composition`).  A keep then a turn-down inside one submit still
+  ended it (review of bc7bbf721, F-D1 to F-D3).
 - Any other take that lands meanwhile (another turn filling the slot,
   the creator's next take) is what they hear, as it would have been had
   it come first, and their composition waits behind it with its task or
@@ -206,9 +212,19 @@ Nothing the composing call holds is written over a take that landed
 while it composed: not the task or the submit note its submit returns
 (the submit can wait two minutes), not the take it finishes.  The call
 asks this before each of those writes with the same lookup it began
-with.  The same take, bound first by another call polling the same
-task, is left as it is.  The setters are the one source of a take's
-history; the composing tool builds none of its own.
+with, and whether its own note or task is still at its key.  The same
+take, bound first by another call polling the same task, is left as it
+is.  The setters are the one source of a take's history; the composing
+tool builds none of its own.
+
+While a submit is out, its key reads 'composing'.  A second call for
+that key waits for it and says what is composing (the game, state and
+level, and how long ago the submission went out) rather than queue a
+second job of the same take.  A submit that starts nothing (refused, no
+composer, a composer that is not up, no url, an error) takes its note
+out again on its one way out.  A note whose process died lapses with
+`SUBMIT_COOLDOWN_S` (600 s); until then the key reads 'composing', so
+600 s is the longest a stale 'composing' lasts.
 
 `approved_at` is what REUSE prefers; an unapproved memo still plays (a
 game is not held hostage to review) but is reported as unapproved so a

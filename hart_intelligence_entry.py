@@ -3240,7 +3240,8 @@ def _request_consent(action: str, label: str, input_text: str) -> str:
     # computer_control and credential asks rather than copied (it already
     # handles the '0' and 'None' spellings this codebase passes around).
     from integrations.social.consent_service import (
-        ConsentService, consent_type_for_action, known_agent_id)
+        ConsentService, central_lacks, consent_type_for_action,
+        known_agent_id)
     from integrations.social.models import db_session
 
     log = logging.getLogger(__name__)
@@ -3249,6 +3250,9 @@ def _request_consent(action: str, label: str, input_text: str) -> str:
         log.error('_request_consent: %r maps to no consent type', action)
         return (f"Could not request {label.lower()} access — this computer "
                 f"records no permission for '{action}'.")
+    part = central_lacks(consent_type)
+    if part:
+        return f"Not asked: central has no {part}."
 
     owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
     if not owner:
@@ -11811,6 +11815,9 @@ def visual_agent():
         # (vision_service._consent_ok).  The owner is whose machine this is
         # (HEVOLVE_OWNER_USER_ID), never the caller's user_id; with no owner,
         # or a check that fails, nothing is grabbed (#66).
+        from integrations.social.consent_service import central_lacks
+        if central_lacks('screen_capture'):
+            return jsonify({'response': 'Not run: central has no screen.', 'vlm_status': 'no_screen'}), 200
         _owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
         _allowed = False
         if _owner:

@@ -732,6 +732,102 @@ class TestLockContention:
         assert job['error'] != bp._BUSY_NOT_SAVED
         assert _row(started['file_id'])['error'] == complaint
 
+    def test_a_lock_word_outside_a_database_error_is_not_contention(self):
+        """The gate's other half: the type decides, never the words.
+
+        is_lock_error is handed every exception a whole parse can raise, and
+        a plain RuntimeError carrying the driver's own sentence is the shape
+        any message match reads as contention.  The measured own-goal this
+        mirrors went the other way: a BookParseError naming OS_Deadlocks.pdf
+        was answered "the library was busy", for a file that could never parse.
+        """
+        assert bp.is_lock_error(RuntimeError('database is locked')) is False
+        assert bp.is_lock_error(OSError('deadlock while writing')) is False
+
+    def test_a_save_that_fails_with_a_lock_word_is_still_not_busy(
+            self, book_node, book_db, tmp_path, monkeypatch):
+        """parse_book's save handler, the classifier's fourth caller.
+
+        A RuntimeError is not the library being busy, so the person is told
+        the book was not saved -- never invited to repeat an upload that will
+        fail the same way again.
+        """
+        def not_a_database_error(*a, **k):
+            raise RuntimeError('database is locked')
+
+        monkeypatch.setattr(bp, '_save', not_a_database_error)
+        result = bp.parse_book(make_pdf(tmp_path / 'book.pdf'), '42')
+
+        assert result['stored'] is False
+        assert result['store_error'] != bp._BUSY_NOT_SAVED
+        assert 'could not be saved' in result['store_error']
+
+    def test_a_retry_is_not_blocked_by_a_parse_its_lock_already_killed(
+            self, book_node, book_db, tmp_path, monkeypatch):
+        """The other half of the 503's advice: "try again in a moment" has to
+        be TRUE for the same stored file.
+
+        The lock that kills the parse also blocks _mark_failed, so the row
+        keeps 'processing' with a fresh updated_at -- live, by its stored
+        status, for the whole STALL_SECONDS.  _existing then refused to start
+        another parse, and the retry we had just advised did nothing for 30
+        minutes.  The job knew all along.
+        """
+        from sqlalchemy.exc import OperationalError
+        from integrations.social.models import BookFile, db_session
+
+        original_save = bp._save
+
+        def locked(*a, **k):
+            raise OperationalError('DELETE FROM page_layouts WHERE file_id = ?',
+                                   {}, sqlite3.OperationalError('database is locked'))
+
+        monkeypatch.setattr(bp, '_save', locked)
+        pdf = make_pdf(tmp_path / 'book.pdf')
+        first = bp.start_parse(pdf, '42', 'req-busy')
+        assert _wait_for_job(first['job_id'])['error'] == bp._BUSY_NOT_SAVED
+
+        # The lock blocked _mark_failed too, so the row stayed 'processing'
+        # and freshly touched: the measured state, not an invented one.
+        with db_session() as db:
+            row = db.get(BookFile, first['file_id'])
+            row.status, row.error, row.updated_at = ('processing', None,
+                                                     datetime.utcnow())
+
+        assert bp._existing('42', 'book.pdf') is None, 'a dead parse still reads as live'
+
+        monkeypatch.setattr(bp, '_save', original_save)      # the library is free
+        second = bp.start_parse(pdf, '42', 'req-retry')
+        assert second.get('existing') is not True
+        assert second['file_id'] != first['file_id']
+        assert _wait_for_job(second['job_id'])['status'] == 'completed'
+
+    def test_a_parse_with_no_job_of_its_own_is_still_live(self, book_node, book_db):
+        """The guard for the rule above: no job does NOT mean dead.
+
+        parse_book stores a row and never makes a job, and start_parse
+        registers the row a moment before its job exists.  Reading "no job"
+        as "dead" would break the duplicate-upload guard and every
+        synchronous agent parse -- and would decide H-0423's restart question
+        by accident.  Only the stall timeout may call those dead.
+        """
+        file_id = bp._register('42', 'live.pdf', '/tmp', '')
+        bp._update_row(file_id, status='processing')
+
+        assert bp._job_for_file(file_id, 'live.pdf', '42') is None
+        existing = bp._existing('42', 'live.pdf')
+        assert existing is not None and existing['status'] == 'processing'
+
+        # And a failed job that merely REUSED this id is not this book's.
+        # Ids start over after a database reset, so matching on the id alone
+        # let a stale job condemn a fresh row -- which is how this very test
+        # first failed, on a job left by the one above it.
+        stale = bp._new_job(file_id, '42', '', 'another.pdf')
+        bp._update_job(stale, status='failed', error='something else died')
+
+        still = bp._existing('42', 'live.pdf')
+        assert still is not None and still['status'] == 'processing'
+
     def test_a_read_still_answers_while_a_stall_cannot_be_recorded(self, book_node, book_db,
                                                                    monkeypatch):
         from integrations.social.models import BookFile, db_session

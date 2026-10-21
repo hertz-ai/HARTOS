@@ -10349,17 +10349,20 @@ function renderAgentOverlay(ev) {{
         # fetch is loopback and passes _require_system_auth with no token. Own
         # try/except so a failure can NEVER cascade and drop the sibling shell
         # routes above (the #18 route-drop class).
+        #
+        # The idle captioner is NOT started here: serve_forever starts it,
+        # the one host that serves this app.  Building the app starts nothing
+        # (the connectivity prober and the shell-state sampler keep the same
+        # rule).  It used to start here too, for tests and the dev harness
+        # scripts, and every test that built the app ran it in the test
+        # process: it walked ~/Pictures and ~/Videos, asked the vision backend
+        # for a caption, and the 0.8B backend spawned a llama-server on :8081
+        # beside the desktop app's own (task #936, 2026-10-21: five servers
+        # LISTENING on 127.0.0.1:8081, four of them orphans).
         try:
             from integrations.agent_engine.media_semantic_index import (
-                register_media_routes, register_idle_indexer)
+                register_media_routes)
             register_media_routes(app)
-            # Start the idle captioner here too (idempotent) so a host that
-            # builds the app without running serve_forever (tests, the dev
-            # harness scripts) still populates the local caption catalog the
-            # home cards search for photos.  The Nunba desktop is not such a
-            # host: it never builds this app.  Self-gating (yields to the user)
-            # + local-only, so it never competes with a live session.
-            register_idle_indexer()
         except Exception as e:
             logger.warning("Media index API registration: %s", e)
 

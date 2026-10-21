@@ -166,6 +166,51 @@ def ended_composition(record, reason, task_id=None):
                           'reason': reason, 'at': time.time()}
     return ended
 
+
+def submit_note(record, labels):
+    """``record`` with the note that a submit is going out now, and what it
+    composes (``task_take``), and the note's time, which names it.
+
+    Written at the key BEFORE the submit, so that while the submit waits (up
+    to two minutes) the composition is already in the memo.  The key reads
+    'composing' (_composing): a second call waits for it rather than queue a
+    second job.  A keep ends it the way it ends any job (record_verdict,
+    _end_compositions_under), so what a keep ends is decided in one place,
+    whenever the keep comes (review of bc7bbf721, F-D1, F-D3, F-D6).  A note
+    whose process died lapses with the cooldown (submit_in_flight)."""
+    at = time.time()
+    return {**(record or {}), 'submitted_at': at, 'task_take': dict(labels or {})}, at
+
+
+def holds_composition(record, field, value):
+    """Whether ``record`` still holds the composition named by ``field`` =
+    ``value``: a submit note's ``submitted_at``, or a ``task_id``, with no
+    take yet.  A keep ends it (ended_composition drops both), a take landing
+    at the key replaces it, a rejection carries it (record_verdict)."""
+    record = record or {}
+    return bool(value) and record.get(field) == value and not record.get('url')
+
+
+def without_submit_note(record, at):
+    """``record`` without the submit note ``at`` when it holds that note and
+    nothing came of it, else ``record`` as it is: a submit that left no
+    composition must not leave the key reading 'composing'.  An empty result
+    means the key held nothing before the note (forget_game_state_record)."""
+    record = record or {}
+    if not holds_composition(record, 'submitted_at', at) or record.get('task_id'):
+        return record
+    return {k: v for k, v in record.items() if k not in ('submitted_at', 'task_take')}
+
+
+def forget_game_state_record(games, game_id, state, level=None):
+    """Remove the record at exactly this key, and for the game's music the
+    copy the first version's shape keeps (set_game_state_sound): a submit
+    note that left nothing behind, at a key that held nothing before it."""
+    slot = (games or {}).get(str(game_id)) or {}
+    (slot.get('sounds') or {}).pop(game_state_key(state, level), None)
+    if state == 'bgm' and level in (None, '', 0):
+        slot.pop('music', None)
+
 #: Corrupt values already warned about.  A lookup reads the same record on
 #: every turn, so each is a WARNING once and DEBUG after; at DEBUG alone it
 #: never reached the desktop log (review of 0c542e278, N-1).

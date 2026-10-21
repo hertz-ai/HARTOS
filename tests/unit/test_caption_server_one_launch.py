@@ -63,6 +63,7 @@ rather than half a gigabyte; the geometry tests measure the file at the real
 """
 import contextlib
 import os
+import socket
 import sys
 import threading
 import time
@@ -469,6 +470,66 @@ def test_a_server_already_up_spawns_nothing_and_asks_nothing(box):
     ok, _ = _ensure(box)
     assert ok is True
     assert box.asked == [] and box.port.spawned == [] and box.clock.sleeps == 0
+
+
+# ── a port something already listens on: no second server ──────────────
+
+def _socket_table_readable() -> bool:
+    """Whether this interpreter can read the OS socket table at all: psutil
+    installed, and allowed to list it (macOS needs root)."""
+    try:
+        import psutil
+        psutil.net_connections(kind='inet')
+        return True
+    except Exception:
+        return False
+
+
+def test_a_port_already_listened_on_gets_no_second_server(box):
+    """Task #936, measured 2026-10-21: five llama-servers LISTENING on
+    127.0.0.1:8081 at once -- the desktop app's own, and four 0.8B caption
+    servers this launch spawned from test processes.  The live server did not
+    answer their /health (the tests' network seal refused it), so
+    _is_serving() said no, nobody was starting it, and on Windows a second
+    llama-server binds and listens beside the first (both set SO_REUSEADDR).
+    Here a real socket listens the way llama-server's does and answers no
+    HTTP: the launch spawns nothing and waits for whatever holds the port,
+    the 30 s it waits for a server of its own."""
+    if not _socket_table_readable():
+        pytest.skip('this interpreter cannot read the socket table '
+                    '(no psutil, or macOS without root)')
+    _files_in(box.models)
+    held = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    held.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    held.bind(('127.0.0.1', 0))
+    held.listen(1)
+
+    def no_http(url, timeout=None, **kw):
+        raise requests.ConnectionError('refused')
+    box.port.health = no_http
+    try:
+        ok, _ = _ensure(box, lvb.Qwen08BBackend(port=held.getsockname()[1]))
+    finally:
+        held.close()
+    assert box.port.spawned == [], (
+        'a second llama-server was spawned on a port something already listens on')
+    assert ok is False and box.clock.t <= BOUND_S
+
+
+def test_a_socket_table_that_cannot_be_read_keeps_the_launch(box):
+    """No psutil, or psutil refused the table (AccessDenied on macOS without
+    root): whether the port is held cannot be told, and the launch goes on as
+    it did before it asked -- spawning nothing would end captions, page reads
+    and a reel's keyframe ratings on every such node."""
+    import core.resource_governor as rg
+
+    def unreadable(ports):
+        raise RuntimeError('the socket table cannot be read')
+    box.mp.setattr(rg, '_listen_rows', unreadable, raising=False)
+    _files_in(box.models)
+    ok, _ = _ensure(box)
+    assert len(box.port.spawned) == 1, 'an unreadable socket table stopped the launch'
+    assert ok is True
 
 
 # ── no Nunba: the standalone launch, with the catalog's files ─────────────

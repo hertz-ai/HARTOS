@@ -105,38 +105,53 @@ LOAD_BACKOFF_CPU = 0.85
 LOAD_BACKOFF_MEM = 0.90
 
 
-def _llm_listen_rows() -> list:
-    """The LISTEN sockets on the local LLM-server port(s), as psutil lists
-    them -- the one reader of that socket table.  ``pid`` is None when the
-    OS will not say whose socket it is (another user's, on Linux without
-    root); the port is held all the same.
+def _listen_rows(ports) -> list:
+    """The LISTEN sockets on ``ports``, as psutil lists them -- the one
+    reader of this node's socket table.  ``ports`` is the port numbers, or a
+    function returning them, called only once the table can be read (so
+    ports that cost a lookup are not looked up when it cannot).  ``pid`` is
+    None when the OS will not say whose socket it is (another user's, on
+    Linux without root); the port is held all the same.
 
     RAISES when the table cannot be read: no psutil, or net_connections
     failing (psutil documents AccessDenied on macOS without root).  "Nobody
-    is listening" and "could not look" are different answers, and the
-    lifecycle watchdog's restart gate needs the difference.
+    is listening" and "could not look" are different answers, and both
+    readers need the difference: the lifecycle watchdog's restart gate
+    (_llm_listen_rows) and the caption server's launch
+    (lightweight_backend.Qwen08BBackend._port_listener).
     """
     psutil = _try_import_psutil()
     if psutil is None:
         raise RuntimeError('psutil is not installed; the socket table '
                            'cannot be read')
-    ports = set()
-    try:
-        from core.port_registry import get_port
-        ports.add(int(get_port('llm')))
-    except Exception:
-        pass
-    try:
-        from core.port_registry import get_local_llm_url
-        import re
-        m = re.search(r':(\d+)', get_local_llm_url() or '')
-        if m:
-            ports.add(int(m.group(1)))
-    except Exception:
-        pass
-    ports.update((8082, 8080))  # common llama-server defaults
+    wanted = set(ports() if callable(ports) else ports)
     return [c for c in psutil.net_connections(kind='inet')
-            if c.status == 'LISTEN' and c.laddr and c.laddr.port in ports]
+            if c.status == 'LISTEN' and c.laddr and c.laddr.port in wanted]
+
+
+def _llm_listen_rows() -> list:
+    """The LISTEN sockets on the local LLM-server port(s) -- the llm port,
+    the local LLM URL's port and the common llama-server defaults -- read by
+    _listen_rows, which RAISES when the table cannot be read.  The ports are
+    looked up only once it can be."""
+    def ports():
+        found = set()
+        try:
+            from core.port_registry import get_port
+            found.add(int(get_port('llm')))
+        except Exception:
+            pass
+        try:
+            from core.port_registry import get_local_llm_url
+            import re
+            m = re.search(r':(\d+)', get_local_llm_url() or '')
+            if m:
+                found.add(int(m.group(1)))
+        except Exception:
+            pass
+        found.update((8082, 8080))  # common llama-server defaults
+        return found
+    return _listen_rows(ports)
 
 
 def _find_llm_pids() -> set:

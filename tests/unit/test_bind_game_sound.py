@@ -1824,6 +1824,142 @@ def test_the_creators_own_keep_meanwhile_ends_their_level_job(store_dir):
     assert not set(IN_FLIGHT_FIELDS) & set(level3), level3
 
 
+#: The take a level's first job makes, finished whenever it is polled again.
+FIRST_JOBS_TAKE = 'https://node/job1.mp3'
+
+
+class _FirstSubmitComposer:
+    """The composer for a level whose first submit waits while ``meanwhile``
+    happens.  That submit answers ``first`` (a task, or still warming up).
+    Its first poll is still pending and closes the call's 90 s window, unless
+    ``finish_in_window``, when it finishes there.  Every later poll finishes
+    the take that first job made; every later submit composes at once.
+    (Reviewer D of bc7bbf721: probes D1 and D2.)"""
+
+    def __init__(self, meanwhile, first='pending', finish_in_window=False):
+        self.media = _media({}, {})
+        self.meanwhile, self.first = meanwhile, first
+        self.finish_in_window = finish_in_window
+        self.submits, self.polls, self.offset = 0, 0, 0.0
+        self._real_time = time.time
+        self.media.generate_media.side_effect = self._submit
+        self.media.check_media_status.side_effect = self._poll
+
+    def _submit(self, *_a, **_k):
+        self.submits += 1
+        if self.submits > 1:
+            return json.dumps({'status': 'completed', 'results': [
+                {'url': f'https://node/fresh{self.submits}.mp3'}]})
+        self.meanwhile()
+        if self.first == 'warming_up':
+            return json.dumps({'status': 'warming_up', 'message': 'starting up'})
+        return json.dumps({'status': 'pending', 'task_id': 'acestep_job1'})
+
+    def _poll(self, _task_id):
+        self.polls += 1
+        if self.polls == 1 and not self.finish_in_window:
+            self.offset = 200.0
+            return json.dumps({'status': 'pending'})
+        return json.dumps({'status': 'completed', 'results': [{'url': FIRST_JOBS_TAKE}]})
+
+    def clock(self):
+        return patch.object(agent_tools.time, 'time',
+                            lambda: self._real_time() + self.offset)
+
+
+def _level3(store_id):
+    sounds = ((_on_disk(store_id).get('games') or {}).get('eng-01') or {}).get('sounds') or {}
+    return dict(sounds.get('bgm@3') or {})
+
+
+def _a_visitor_fills_the_agents_level_slot(meanwhile, **composer):
+    """A visitor with no choice of their own asks for level 3, so their job
+    fills the agent's empty slot, and ``meanwhile(live)`` runs while their
+    submit waits.  Then the creator turns the game's take down ("too
+    sleepy") and asks for level 3.  Returns (the agent's bgm@3 after the
+    visitor's call, the creator's answer, the composer)."""
+    from core import cache_loaders
+    cache_loaders.save_agent_data(4242, {})
+    live = _live_cache()
+    c = _FirstSubmitComposer(lambda: meanwhile(live), **composer)
+    with patch('time.sleep', lambda *_a, **_k: None), c.clock():
+        with _visitor(live, c.media, helper_fun=_Disk()) as tools:
+            tools['bind_game_sound']('eng-01', 'calm', 'spelling', 'bgm', '3')
+        level3 = _level3(4242)
+        agent_tools.answer_game_sound_card(
+            '4242', 'game_sound:eng-01:bgm', False, 'too sleepy', 'user-1')
+        with _agent(live, c.media, helper_fun=_Disk()) as tools:
+            creator = json.loads(tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'bgm', '3'))
+    return level3, creator, c
+
+
+@pytest.mark.parametrize('first, the_visitor, finish_in_window', [
+    ('pending', 'keeps', False),
+    ('warming_up', 'keeps', False),
+    ('pending', 'turns_down', False),
+    ('warming_up', 'turns_down', False),
+    ('pending', 'turns_down', True),
+], ids=['task-both_keep', 'warming_up-both_keep', 'task-visitor_turns_down',
+        'warming_up-visitor_turns_down', 'finished_in_the_poll-visitor_turns_down'])
+def test_the_creators_keep_meanwhile_ends_the_agents_level_job_whatever_the_visitor_chose(
+        store_dir, first, the_visitor, finish_in_window):
+    """The creator keeps their next take for everyone while a visitor's
+    submit fills the agent's empty level slot.  The job is the agent's, so
+    the creator's keep ends it, whatever the visitor did with that take in
+    their own memo (spec 6: "the creator's keep ends the agent's, a visitor's
+    level job filling the agent's empty slot among them").
+
+    Review of bc7bbf721: the keep was read off the visitor's lookup, so when
+    the visitor kept the take too (F-D1), or turned it down (F-D2), the job
+    or its submit note (F-D4) was written behind it.  Once the creator
+    turned that take down, their level-3 call bound the take composed for
+    the visitor's older request, not for "too sleepy", and everyone on
+    level 3 heard it.  Found while reworking it: a job that finishes inside
+    the visitor's own poll was bound into the agent's slot over the keep."""
+    def meanwhile(live):
+        _the_creators_next_take_lands(live)
+        agent_tools.answer_game_sound_card(
+            '4242', 'game_sound:eng-01:bgm', True, '', 'user-1')
+        agent_tools.answer_game_sound_card(
+            '4242', 'game_sound:eng-01:bgm', the_visitor == 'keeps', 'not v', VISITOR)
+
+    level3, creator, c = _a_visitor_fills_the_agents_level_slot(
+        meanwhile, first=first, finish_in_window=finish_in_window)
+
+    assert not set(IN_FLIGHT_FIELDS) & set(level3), level3
+    assert level3.get('url') != FIRST_JOBS_TAKE, level3
+    assert (creator.get('music') or {}).get('url') != FIRST_JOBS_TAKE, creator
+    assert c.submits == 2, 'the job the keep ended was resumed or waited for'
+    assert 'too sleepy' in c.media.generate_media.call_args.kwargs['context']
+
+
+def test_a_keep_then_a_turn_down_inside_one_submit_still_ends_the_job(store_dir):
+    """A keep ends the person's own composition when it is given, and
+    turning the take down afterwards does not bring the job back (spec 6:
+    "never by when it happened").  Both inside one submit, the job was kept
+    and their next call bound the take made before "changed my mind"
+    (review of bc7bbf721, F-D3)."""
+    own_id = _u_turned_down_by_both()
+    live = _live_cache()
+
+    def kept_then_turned_down():
+        _the_visitor_keeps_the_creators_next_take(live)
+        agent_tools.answer_game_sound_card(
+            '4242', 'game_sound:eng-01:bgm', False, 'changed my mind', VISITOR)
+
+    c = _FirstSubmitComposer(kept_then_turned_down)
+    with patch('time.sleep', lambda *_a, **_k: None), c.clock():
+        with _visitor(live, c.media, helper_fun=_Disk()) as tools:
+            tools['bind_game_sound']('eng-01', 'calm', 'spelling', 'bgm', '3')
+            level3 = _level3(own_id)
+            again = json.loads(tools['bind_game_sound']('eng-01', 'calm', 'spelling', 'bgm', '3'))
+
+    assert not set(IN_FLIGHT_FIELDS) & set(level3), level3
+    assert (again.get('music') or {}).get('url') != FIRST_JOBS_TAKE, again
+    assert c.submits == 2, 'the job the keep ended was resumed'
+    assert 'changed my mind' in c.media.generate_media.call_args.kwargs['context']
+
+
 def test_a_keep_for_the_game_reads_a_corrupt_level_note_as_none(caplog, monkeypatch):
     """A game-key keep reads every level's note: one whose submit time is
     not a number made the keep raise and the card answer applied: False
@@ -2739,6 +2875,92 @@ def test_after_the_cooldown_one_more_submit_is_allowed():
         tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct')
 
     assert media.generate_media.call_count == 2
+
+
+@pytest.mark.parametrize('answer', [
+    {'status': 'error', 'error': 'prompt rejected by safety filter'},
+    {'status': 'unavailable', 'error': 'audio_music not available on this node right now.'},
+    {'status': 'error', 'error': 'AceStep installed but cannot run right now '
+                                 '(Insufficient VRAM for acestep (free=4.9GB); try cpu_only)'},
+    {'status': 'completed', 'results': []},
+    RuntimeError('the composer call raised'),
+], ids=['refused', 'no_composer', 'composer_not_up', 'no_url', 'exception'])
+def test_a_submit_that_starts_nothing_leaves_no_composition_behind(answer):
+    """The submit note goes in before the submit (review of bc7bbf721), so a
+    submit that started nothing takes it out again, on every way out.  Left
+    in, the key read 'composing' and answered "waiting for it" for
+    SUBMIT_COOLDOWN_S with nothing coming (requirements N-0133, H-0267).
+    Nothing is remembered, and the next call submits at once."""
+    agent_data = {}
+    media = _media({})
+    if isinstance(answer, Exception):
+        media.generate_media.side_effect = answer
+    else:
+        media.generate_media.return_value = json.dumps(answer)
+
+    with _agent(agent_data, media) as tools, patch.dict(
+            'sys.modules', {'integrations.agent_engine.capability_setup': _asked('asked')}):
+        tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct')
+        sounds = dict((((agent_data.get(4242) or {}).get('games') or {})
+                       .get('eng-01') or {}).get('sounds') or {})
+        tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct')
+
+    assert 'correct' not in sounds, sounds
+    assert media.generate_media.call_count == 2, 'the next call waited on a submit that started nothing'
+
+
+@pytest.mark.parametrize('died_ago, submits_again', [
+    (30, False), (agent_tools.SUBMIT_COOLDOWN_S + 1, True),
+], ids=['inside_the_cooldown', 'after_the_cooldown'])
+def test_a_note_left_by_a_process_that_died_lapses_with_the_cooldown(died_ago, submits_again):
+    """A process that dies mid-submit leaves its note with no job behind it,
+    and nothing can be asked whether the submit landed.  The note reads as
+    composing only while it is younger than SUBMIT_COOLDOWN_S, and the
+    answer names what is composing (requirements N-0183), not a generic
+    busy; after that the next call submits."""
+    agent_data = {4242: {'games': {'eng-01': {'sounds': {'bgm@3': {
+        'submitted_at': time.time() - died_ago,
+        'task_take': {'mood': 'calm', 'prompt': 'p', 'variant': 1}}}}}}}
+    media = _media({'status': 'completed', 'results': [{'url': 'https://node/new.mp3'}]})
+
+    with _agent(agent_data, media) as tools:
+        answer = json.loads(tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'bgm', '3'))
+
+    if submits_again:
+        assert (answer['status'], answer['music']['url']) == ('bound', 'https://node/new.mp3'), answer
+        assert media.generate_media.call_count == 1
+    else:
+        assert answer['status'] == 'composing', answer
+        assert 'eng-01' in answer['note'] and 'level 3' in answer['note'], answer['note']
+        assert media.generate_media.call_count == 0, 'a second job was queued inside the cooldown'
+
+
+def test_a_second_call_while_a_submit_waits_queues_no_second_job():
+    """A submit can wait two minutes.  A second call for the same key in that
+    time (another person filling the same empty slot) waits for it and says
+    what is composing, instead of queueing a second job of the same take
+    (requirements H-0350, H-1199).  Before the note went in ahead of the
+    submit, the second call submitted again."""
+    agent_data = {}
+    media = _media({}, {'status': 'completed', 'results': [{'url': 'https://node/c.mp3'}]})
+    second, asked = {}, []
+
+    def a_visitor_asks_meanwhile(*_a, **_k):
+        if not asked:
+            asked.append(1)
+            with _visitor(agent_data, media) as tools:
+                second.update(json.loads(tools['bind_game_sound'](
+                    'eng-01', 'happy', 'spelling', 'correct')))
+        return json.dumps({'status': 'pending', 'task_id': 'acestep_one'})
+    media.generate_media.side_effect = a_visitor_asks_meanwhile
+
+    with _agent(agent_data, media) as tools, patch('time.sleep', lambda *_a, **_k: None):
+        first = json.loads(tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct'))
+
+    assert second['status'] == 'composing', second
+    assert 'correct' in second['note'] and 'eng-01' in second['note'], second['note']
+    assert media.generate_media.call_count == 1, 'a second job was queued for the same take'
+    assert (first['status'], first['music']['url']) == ('bound', 'https://node/c.mp3'), first
 
 
 def test_a_rejection_survives_a_composer_that_is_still_warming_up():

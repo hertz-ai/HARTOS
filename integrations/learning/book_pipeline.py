@@ -753,11 +753,33 @@ def _save(file_id, pages, whole_text, book_name, total_pages) -> None:
 def _stall_reason(row) -> Optional[str]:
     """Why a 'pending'/'processing' row is dead, or None while it is alive.
 
-    A running parse touches its row at least every _TOUCH_EVERY_S, so one
-    untouched for STALL_SECONDS belongs to a parse that hung or died with its
+    Two ways a parse dies, and the row can be wrong about both.
+
+    Its job already said so.  The worker records a failure on the job and on
+    the row, but on a held lock the row's write is refused by the very lock
+    that killed the parse -- so the row keeps 'processing' with a *fresh*
+    updated_at and the timeout below cannot see it for STALL_SECONDS.  For
+    those 30 minutes _existing read that dead parse as live and refused to
+    start another, which made the 503's advice ("try again in a moment")
+    false for the one case it is aimed at: the same stored file, retried.
+    Measured 2026-10-18; the advice shipped 005372509, this is its other half.
+
+    Or it left no word: a running parse touches its row at least every
+    _TOUCH_EVERY_S, so one untouched for STALL_SECONDS hung or died with its
     process -- and would otherwise show 'pending' forever.
+
+    A row with NO job is not read as dead.  parse_book stores a row and never
+    makes a job, and start_parse registers the row a moment before the job
+    exists, so "no job" is the ordinary shape of a live parse as much as of
+    one lost to a restart; only the timeout may call those dead.  Resuming a
+    parse across a restart is H-0423's question, not this one's.
     """
-    if (row.status in _LIVE and row.updated_at is not None
+    if row.status not in _LIVE:
+        return None
+    failed = _failed_job_reason(row)
+    if failed:
+        return failed
+    if (row.updated_at is not None
             and (_utcnow() - row.updated_at).total_seconds() > STALL_SECONDS):
         return f'stalled: no page finished for {STALL_SECONDS // 60} minutes'
     return None
@@ -879,11 +901,35 @@ def _update_job(job_id, **fields) -> None:
             job['updated'] = time.time()
 
 
-def _job_for_file(file_id) -> Optional[str]:
+def _job_for_file(file_id, filename=None, user_id=None) -> Optional[str]:
+    """The most recent job for a book.
+
+    Given a filename and reader as well, only a job for THAT book: file ids
+    start over after a database reset (see _clear_page_images), so a stale
+    job must never be taken for a fresh row's.
+    """
     with _jobs_lock:
         for job in reversed(list(_jobs.values())):
-            if job['file_id'] == file_id:
+            if (job['file_id'] == file_id
+                    and (filename is None or job['filename'] == filename)
+                    and (user_id is None or job['user_id'] == str(user_id))):
                 return job['job_id']
+    return None
+
+
+def _failed_job_reason(row) -> Optional[str]:
+    """Why this book's own parse failed, when the job already knows.
+
+    Read without get_job's resolving, which writes: this runs on the read
+    paths, inside an open session.
+    """
+    job_id = _job_for_file(row.file_id, row.filename, row.user_id)
+    if not job_id:
+        return None
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if job is not None and job['status'] == 'failed':
+            return job['error'] or 'the parse failed'
     return None
 
 
