@@ -49,6 +49,11 @@ WORLD_MODEL_VOTER_SETTINGS = {'world_model_voter': True, 'dispatchable': False}
 # unreachable world model), so an experiment that keeps abstaining sinks
 # behind fresh ones instead of blocking them for ever.
 _WORLD_MODEL_ATTEMPTS: Dict[str, int] = {}
+# Per-process: the refusal reason last logged for each open experiment, so a
+# refusal is logged once per experiment and reason, whatever attempts came
+# before it (review of 7fa1d4aba: logging on the first attempt only never
+# logged a refusal that followed a busy reply).
+_WORLD_MODEL_REFUSAL_LOGGED: Dict[str, str] = {}
 
 
 def _feed_decision_to_world_model(**decision) -> None:
@@ -308,9 +313,9 @@ class ThoughtExperimentService:
         caller commits, so a score (an HTTP call of seconds) after a write
         held every other writer off (the outage class models.after_commit
         documents; measured 'database is locked' after 3.36 s).
-        NO HEAD-OF-LINE BLOCK: a blank expected outcome or hypothesis is
-        filtered (SQL first, then Python's str.strip(), since TRIM strips
-        only ASCII spaces);
+        NO HEAD-OF-LINE BLOCK: a blank expected outcome is filtered in SQL
+        first, then a blank outcome or hypothesis by Python's str.strip()
+        (TRIM strips only ASCII spaces);
         an experiment whose context refuses agent votes is never scored; and
         candidates are taken least-attempted first, so one that keeps
         abstaining sinks behind fresh ones.
@@ -318,8 +323,9 @@ class ThoughtExperimentService:
         busy, unreachable, a 5xx, a reply that is not JSON) ends the round at
         its first such reply, so a down world model costs one call per round,
         not one per experiment.  A claim it cannot score (refused by the
-        screen, no cloud consent, a 422) is an abstention like any other:
-        counted, logged once per experiment, and the round goes on.
+        screen, no cloud consent, blank as sent, the route's 422) is an
+        abstention like any other: counted, logged once per experiment and
+        reason in this process, and the round goes on.
         TIME: the claim is scored at the experiment's created_at read as UTC
         epoch seconds (SQLite's func.now() is UTC and stored naive; on MySQL
         func.now() is the server's local time, so a central node scores at
@@ -357,6 +363,8 @@ class ThoughtExperimentService:
         live = {e.id for e in open_rows}
         for stale in [k for k in _WORLD_MODEL_ATTEMPTS if k not in live]:
             _WORLD_MODEL_ATTEMPTS.pop(stale, None)
+        for stale in [k for k in _WORLD_MODEL_REFUSAL_LOGGED if k not in live]:
+            _WORLD_MODEL_REFUSAL_LOGGED.pop(stale, None)
         rows = [e for e in open_rows
                 if check_voter_eligibility(e.to_dict(), 'agent').get('eligible')]
         rows.sort(key=lambda e: (_WORLD_MODEL_ATTEMPTS.get(e.id, 0),
@@ -386,10 +394,12 @@ class ThoughtExperimentService:
                 scored.append((exp, score, float(conf)))
                 continue
             _WORLD_MODEL_ATTEMPTS[exp.id] = _WORLD_MODEL_ATTEMPTS.get(exp.id, 0) + 1
-            if isinstance(score, dict) and score.get('refused') and (
-                    _WORLD_MODEL_ATTEMPTS[exp.id] == 1):
-                logger.info("world model cannot score experiment %s: %s",
-                            exp.id, score.get('reason'))
+            if isinstance(score, dict) and score.get('refused'):
+                reason = str(score.get('reason'))
+                if _WORLD_MODEL_REFUSAL_LOGGED.get(exp.id) != reason:
+                    _WORLD_MODEL_REFUSAL_LOGGED[exp.id] = reason
+                    logger.info("world model cannot score experiment %s: %s",
+                                exp.id, reason)
             if score is None:
                 break
         if not scored:

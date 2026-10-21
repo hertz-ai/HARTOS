@@ -52,8 +52,10 @@ def db():
 def _fresh_attempts():
     """The per-process abstention count starts empty for every test."""
     tes._WORLD_MODEL_ATTEMPTS.clear()
+    tes._WORLD_MODEL_REFUSAL_LOGGED.clear()
     yield
     tes._WORLD_MODEL_ATTEMPTS.clear()
+    tes._WORLD_MODEL_REFUSAL_LOGGED.clear()
 
 
 def _experiment(db, status='voting', expected='p50 latency falls by a third',
@@ -614,11 +616,14 @@ def test_the_bridge_says_why_a_claim_was_not_scored(offline, monkeypatch):
         'vote': 0, 'refused': True, 'reason': 'screened'}
     assert posts == []
     b = offline()
-    _post_recorder(monkeypatch, _Resp(422))
+    _post_recorder(monkeypatch, _Resp(422, {'detail': 'context and outcome must be non-empty'}))
     assert b.score_claim(context='h', outcome='o', timestamp=1.0, creator_id='u1') == {
-        'vote': 0, 'refused': True, 'reason': 'http_422'}
+        'vote': 0, 'refused': True,
+        'reason': 'http_422: context and outcome must be non-empty'}
+    validation = _Resp(422, {'detail': [{'loc': ['body'], 'msg': 'field required'}]})
     for reply in (_Resp(503), _Resp(500), _Resp(404), _Resp(429), _Resp(401),
-                  _Resp(403), _Resp(400), requests.ConnectionError('down')):
+                  _Resp(403), _Resp(400), validation, _Resp(422),
+                  requests.ConnectionError('down')):
         _post_recorder(monkeypatch, reply)
         assert b.score_claim(context='h', outcome='o', timestamp=1.0, creator_id='u1') is None
 
@@ -637,23 +642,26 @@ def test_a_claim_the_route_refuses_never_holds_up_the_round_end_to_end(db, offli
 
     def _post(url, json=None, timeout=None, **kw):
         if json['context'] == bad.hypothesis:
-            return _Resp(422)
+            return _Resp(422, {'detail': 'timestamp looks like milliseconds'})
         return _Resp(200, {'vote': 1, 'confidence': 0.5})
     monkeypatch.setattr(world_model_bridge, 'pooled_post', _post)
     assert ThoughtExperimentService.cast_world_model_votes(db, bridge=b) == 2
     assert all(len(_votes(db, e)) == 1 for e in good) and _votes(db, bad) == []
 
 
-def test_a_world_model_without_the_route_costs_one_call_per_round(db, offline, monkeypatch):
-    """what: a world model whose build has no score route (404, as the
-    installed Aug-29 build answers) or that rate-limits (429); expected: one
-    call per round, nothing cast, as for any world model that cannot answer."""
+def test_a_world_model_without_the_route_costs_one_call_per_round(db, offline, monkeypatch, caplog):
+    """what: a world model whose build has no score route (404) or that
+    rate-limits (429); expected: one call per round, nothing cast and
+    nothing logged as a refusal, as for any world model that cannot answer."""
+    import logging
+    caplog.set_level(logging.INFO)
     for status in (404, 429):
         for i in range(3):
             _experiment(db, created=CREATED + dt.timedelta(minutes=i))
         posts = _post_recorder(monkeypatch, _Resp(status))
         assert ThoughtExperimentService.cast_world_model_votes(db, bridge=offline()) == 0
         assert len(posts) == 1
+        assert not [r for r in caplog.records if 'cannot score' in r.getMessage()]
 
 
 def test_a_refused_claim_is_logged_once_not_every_round(db, caplog):
@@ -679,3 +687,62 @@ def test_a_blank_hypothesis_is_not_scored(db):
     bridge = _Bridge({'vote': 1, 'confidence': 0.5})
     assert ThoughtExperimentService.cast_world_model_votes(db, bridge=bridge, limit=1) == 1
     assert [c['context'] for c in bridge.calls] == [real.hypothesis]
+
+
+# --- review of 7fa1d4aba ------------------------------------------------------
+
+def test_a_refusal_after_a_busy_reply_is_still_logged_once(db, offline, monkeypatch, caplog):
+    """what: through the REAL bridge, an experiment whose first attempt met a
+    busy world model (503) and whose later attempts are refused (the
+    route's 422), over several rounds; expected: the refusal logged exactly
+    once, with the route's own reason; a new reason is logged again."""
+    import logging
+    from integrations.agent_engine import world_model_bridge
+    e = _experiment(db)
+    replies = [_Resp(503)] + [_Resp(422, {'detail': 'bad timestamp'})] * 3 + [
+        _Resp(422, {'detail': 'context and outcome must be non-empty'})]
+    monkeypatch.setattr(world_model_bridge, 'pooled_post',
+                        lambda url, json=None, timeout=None, **kw: replies.pop(0))
+    b = offline()
+    with caplog.at_level(logging.INFO):
+        for _ in range(5):
+            ThoughtExperimentService.cast_world_model_votes(db, bridge=b)
+    lines = [r.getMessage() for r in caplog.records if 'cannot score' in r.getMessage()]
+    assert len(lines) == 2, lines
+    assert e.id in lines[0] and 'bad timestamp' in lines[0]
+    assert 'non-empty' in lines[1]
+
+
+def test_a_claim_blank_once_cut_to_what_is_sent_is_refused_without_a_call(offline, monkeypatch):
+    """what: a hypothesis of 2001 spaces and then text (the bridge sends the
+    first 2000 characters); expected: refused as blank, nothing sent,
+    in-process as much as over HTTP."""
+    b = offline()
+    posts = _post_recorder(monkeypatch, _Resp(200, {'vote': 1, 'confidence': 0.5}))
+    out = b.score_claim(context=' ' * 2001 + 'cache warmup lowers latency',
+                        outcome='o', timestamp=1.0, creator_id='u1')
+    assert out == {'vote': 0, 'refused': True, 'reason': 'blank'} and posts == []
+
+    class _Provider:
+        calls = []
+
+        def score_claim(self, *a):
+            self.calls.append(a)
+            return {'vote': 1, 'confidence': 0.5}
+    b._in_process, b._provider = True, _Provider()
+    out = b.score_claim(context=' ' * 2001 + 'x', outcome='o', timestamp=1.0, creator_id='u1')
+    assert out['reason'] == 'blank' and _Provider.calls == []
+
+
+def test_the_world_models_own_abstention_is_not_logged_as_a_refusal(db, caplog):
+    """what: hevolveai abstains on a claim it could score ({'vote': 0,
+    'reason': ...}, no 'refused'); expected: counted and retried, never
+    logged as a claim the world model cannot score."""
+    import logging
+    _experiment(db)
+    bridge = _Bridge({'error': None, 'vote': 0, 'reason': 'no typical error yet'})
+    with caplog.at_level(logging.INFO):
+        for _ in range(3):
+            ThoughtExperimentService.cast_world_model_votes(db, bridge=bridge)
+    assert len(bridge.calls) == 3
+    assert not [r for r in caplog.records if 'cannot score' in r.getMessage()]

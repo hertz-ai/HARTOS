@@ -767,8 +767,12 @@ class WorldModelBridge:
         'reason' too): a text the constitutional filter refuses
         ('screened'), a non-local world model without the creator's cloud
         data consent ('no_cloud_consent'; the decide feed's rules for the
-        same texts, ingest_decided_experiment), or a 422 ('http_422', the
-        route's only refusal of a claim itself: blank text, a bad timestamp);
+        same texts, ingest_decided_experiment), a claim blank once cut to
+        the 2000 characters sent ('blank'), or the route's own 422 refusing
+        the claim ('http_422: <its reason>': blank text, a bad timestamp;
+        the route's 422 carries a string `detail`, FastAPI's generic
+        request-validation 422 a list, which is no refusal of the claim and
+        answers None);
         or None when the WORLD MODEL cannot answer now (503 while a learn
         holds the learner, any other 4xx such as 404 from a build without
         the route or 429 from a rate limiter, 5xx, a network failure, a
@@ -785,6 +789,11 @@ class WorldModelBridge:
         if self._is_external_target() and not self._has_cloud_consent(str(creator_id)):
             return self._refused_claim('no_cloud_consent')
         ctx, out = (t[:2000] for t in screened)
+        # Checked after the cut, on what is actually sent: a hypothesis of
+        # 2001 spaces and then text is blank to the world model (review of
+        # 7fa1d4aba), in-process as much as over HTTP.
+        if not ctx.strip() or not out.strip():
+            return self._refused_claim('blank')
         if self._in_process and self._provider is not None and hasattr(
                 self._provider, 'score_claim'):
             try:
@@ -810,7 +819,13 @@ class WorldModelBridge:
             logger.info("[WorldModelBridge] score unavailable: %s", e)
             return None
         if resp.status_code == 422:
-            return self._refused_claim('http_422')
+            try:
+                detail = resp.json().get('detail')
+            except (ValueError, AttributeError):
+                detail = None
+            if isinstance(detail, str):
+                return self._refused_claim(f'http_422: {detail[:200]}')
+            return None
         if resp.status_code != 200:
             return None
         try:
