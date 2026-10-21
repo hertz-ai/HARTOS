@@ -63,7 +63,8 @@ DEFAULT_RULES = {
 # low-confidence agents AGAINST (1.0 / 1.4 = 0.71 >= 2/3).  So approval also
 # needs DISTINCT identities, counted by tally_votes:
 #   - an identity is a registered user; an agent counts as the human who
-#     owns it, so one person with many agents is still one identity;
+#     owns it, so one person with many agents is still one identity, and
+#     an agent no person owns counts as this node (voter_identity);
 #   - only a decisive vote (non-zero value, weight > 0) counts.
 # MIN_DISTINCT_SUPPORTERS = 2 is the invariant itself: one identity can never
 # approve alone.  MIN_DISTINCT_VOTERS = 3 is the smallest decisive quorum at
@@ -71,6 +72,60 @@ DEFAULT_RULES = {
 # beyond the supporters has had a say.
 MIN_DISTINCT_VOTERS = 3
 MIN_DISTINCT_SUPPORTERS = 2
+
+
+# Who a vote counts as.  Owner rulings: an agent counts as the human who owns
+# it (2026-09-24), and an agent no PERSON owns counts as this node, ONE
+# identity per node (2026-10-21).  Measured before (production, Oct 21): 302
+# of 305 agents never traced to a person (285 per-flow agents with no owner,
+# 16 of the 19 owned agents owned by another agent), and counting each as its
+# own identity let three of them approve an experiment with no person voting
+# (hevolveai Master 11.462 K).
+#: The identity of every agent whose owner chain reaches no person.
+NODE_IDENTITY = ('node', 'local')
+#: The world model's voter (ThoughtExperimentService.ensure_world_model_voter)
+#: is one identity of its own (owner ruling 2026-10-19), however many
+#: accounts carry its marker.
+WORLD_MODEL_IDENTITY = ('world_model', 'local')
+_PERSON_TYPES = ('human', 'guest')
+
+
+def voter_identity(user, owner_of):
+    """The identity a registered voter's vote counts as, for the quorum and
+    for one_vote_per_identity.
+
+      - a voter that is not an agent is itself (``user.id``);
+      - the world model's voter (an agent with no owner, settings
+        ``world_model_voter``) is WORLD_MODEL_IDENTITY;
+      - an agent is the PERSON at the root of its owner chain (an agent may
+        be owned by an agent, which may be owned by a person);
+      - an agent whose chain reaches no person -- no owner, an agent-only
+        chain, a system account at its root, a cycle, a missing row -- is
+        NODE_IDENTITY: all such agents together are one identity, so a node
+        can never approve its own change with its own agents (its agents and
+        its world model are two identities; a third must be a person or
+        another node).
+
+    ``owner_of(owner_id)`` returns that users row, or None.
+    """
+    if getattr(user, 'user_type', None) != 'agent':
+        return user.id
+    if user.owner_id is None and (
+            getattr(user, 'settings', None) or {}).get('world_model_voter') is True:
+        return WORLD_MODEL_IDENTITY
+    seen = {user.id}
+    owner_id = user.owner_id
+    while owner_id is not None and owner_id not in seen:
+        seen.add(owner_id)
+        owner = owner_of(owner_id)
+        if owner is None:
+            break
+        if owner.user_type in _PERSON_TYPES:
+            return owner.id
+        if owner.user_type != 'agent':
+            break
+        owner_id = owner.owner_id
+    return NODE_IDENTITY
 
 
 def one_vote_per_identity(ballots):

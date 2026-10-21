@@ -839,16 +839,25 @@ class ThoughtExperimentService:
         votes = db.query(ExperimentVote).filter_by(
             experiment_id=experiment_id).all()
 
-        # Who each vote REALLY belongs to: a registered user, and an agent
-        # is its owner.  An unregistered voter_id is a string anyone can
-        # pass, so it keeps its weight but is no identity for the quorum.
+        # Who each vote REALLY belongs to (voting_rules.voter_identity): a
+        # registered user; an agent is the person at the root of its owner
+        # chain, or this node when no person owns it.  An unregistered
+        # voter_id is a string anyone can pass, so it keeps its weight but is
+        # no identity for the quorum.
         from .models import User
         from .voting_rules import (
-            is_steward, one_vote_per_identity, quorum_met, recommendation)
+            is_steward, one_vote_per_identity, quorum_met, recommendation,
+            voter_identity)
         voter_ids = {v.voter_id for v in votes}
         users = {u.id: u for u in
                  (db.query(User).filter(User.id.in_(voter_ids)).all()
                   if voter_ids else [])}
+        owners = dict(users)
+
+        def _owner_of(owner_id):
+            if owner_id not in owners:
+                owners[owner_id] = db.query(User).filter(User.id == owner_id).first()
+            return owners[owner_id]
         # Whose vote is the steward's: voting_rules.is_steward, never a
         # voter_id string.
         stewards = {uid for uid, u in users.items() if is_steward(u)}
@@ -877,7 +886,7 @@ class ThoughtExperimentService:
                 weight = context_rules['human_weight'] if context_rules else 1.0
                 human_votes += 1
             if user is not None:
-                identity, own = (user.owner_id or user.id), not is_agent
+                identity, own = voter_identity(user, _owner_of), not is_agent
             else:
                 identity, own = ('unregistered', v.voter_id), True
             ballots.append({'identity': identity, 'own': own,

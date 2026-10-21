@@ -48,9 +48,9 @@ def db(engine):
     session.close()
 
 
-def _user(db, user_type='human', owner_id=None):
+def _user(db, user_type='human', owner_id=None, settings=None):
     u = User(username=f'u_{uuid.uuid4().hex[:10]}', user_type=user_type,
-             owner_id=owner_id)
+             owner_id=owner_id, settings=settings)
     db.add(u)
     db.flush()
     return u
@@ -105,15 +105,17 @@ class TestTheQuorumIsCountedByIdentity:
         assert tally['distinct_voters'] == 1
         assert tally['quorum_met'] is False
 
-    def test_an_unowned_agent_is_its_own_identity(self, db):
-        """Agents may vote (owner ruling 2026-09-23); an agent with no owner
-        is a distinct identity like any registered user."""
+    def test_agents_no_person_owns_are_one_identity_this_node(self, db):
+        """Agents may vote (owner ruling 2026-09-23), but agents no person
+        owns are ONE identity, this node (owner ruling 2026-10-21; it
+        replaces 'an agent with no owner is a distinct identity'): measured
+        on production, three such agents approved with no person voting."""
         exp_id = _voting_experiment(db)
         for _ in range(MIN_DISTINCT_VOTERS):
             _vote(db, exp_id, _user(db, 'agent'), 2, confidence=0.9)
         tally = ThoughtExperimentService.tally_votes(db, exp_id)
-        assert tally['distinct_voters'] == MIN_DISTINCT_VOTERS
-        assert tally['quorum_met'] is True
+        assert tally['distinct_voters'] == 1
+        assert tally['quorum_met'] is False
 
     def test_an_unregistered_voter_id_does_not_count(self, db):
         """The live 'toolsweep' vote has no users row: a string anyone can
@@ -176,3 +178,77 @@ class TestAutoEvolveRequiresTheQuorum:
         ranked = self._rank({'weighted_score': 1.0, 'total_for': 3.0,
                              'total_against': 0.0, 'quorum_met': True})
         assert [e['id'] for e in ranked] == ['e']
+
+
+class TestAnAgentCountsAsThePersonAtTheRootOfItsChain:
+    """Owner ruling 2026-10-21 (hevolveai Master 11.462 K): an agent counts as
+    the person at the root of its owner chain; an agent whose chain reaches no
+    person counts as this node.  Production: 16 of the 19 owned agents are
+    owned by another agent."""
+
+    def test_an_agent_owned_by_an_agent_owned_by_a_person_is_that_person(self, db):
+        exp_id = _voting_experiment(db)
+        person = _user(db)
+        middle = _user(db, 'agent', owner_id=person.id)
+        _vote(db, exp_id, person, -2)
+        for _ in range(3):
+            _vote(db, exp_id, _user(db, 'agent', owner_id=middle.id), 2)
+        tally = ThoughtExperimentService.tally_votes(db, exp_id)
+        # one identity, and the person's own vote decides it
+        assert (tally['distinct_voters'], tally['distinct_supporters']) == (1, 0)
+
+    @pytest.mark.parametrize('root', ['none', 'agent_chain', 'system', 'missing'])
+    def test_an_agent_no_person_owns_counts_as_this_node(self, db, root):
+        exp_id = _voting_experiment(db)
+        plain = _user(db, 'agent')                      # no owner at all
+        if root == 'none':
+            other = _user(db, 'agent')
+        elif root == 'agent_chain':
+            other = _user(db, 'agent', owner_id=_user(db, 'agent', owner_id=_user(db, 'agent').id).id)
+        elif root == 'system':
+            other = _user(db, 'agent', owner_id=_user(db, 'system').id)
+        else:
+            other = _user(db, 'agent', owner_id='no-such-user')
+        _vote(db, exp_id, plain, 2)
+        _vote(db, exp_id, other, 2)
+        tally = ThoughtExperimentService.tally_votes(db, exp_id)
+        assert (tally['distinct_voters'], tally['distinct_supporters']) == (1, 1)
+
+    def test_an_owner_cycle_ends_and_counts_as_this_node(self):
+        """Two agents owning each other: the walk ends (under a deadline,
+        so a loop fails here instead of hanging the suite) at this node."""
+        import threading
+        from types import SimpleNamespace
+        from integrations.social.voting_rules import NODE_IDENTITY, voter_identity
+        a = SimpleNamespace(id='a', user_type='agent', owner_id='b', settings=None)
+        b = SimpleNamespace(id='b', user_type='agent', owner_id='a', settings=None)
+        rows = {'a': a, 'b': b}
+        out = []
+        worker = threading.Thread(
+            target=lambda: out.append(voter_identity(a, rows.get)), daemon=True)
+        worker.start()
+        worker.join(10)
+        assert not worker.is_alive(), "the owner chain walk did not end"
+        assert out == [NODE_IDENTITY]
+
+    def test_the_world_model_is_one_identity_of_its_own(self, db):
+        """Owner ruling 2026-10-19: the world model's measured vote is one
+        more identity; two accounts carrying its marker are still one."""
+        exp_id = _voting_experiment(db)
+        for _ in range(2):
+            _vote(db, exp_id, _user(db, 'agent', settings={'world_model_voter': True}), 2)
+        _vote(db, exp_id, _user(db, 'agent'), 2)
+        tally = ThoughtExperimentService.tally_votes(db, exp_id)
+        assert (tally['distinct_voters'], tally['distinct_supporters']) == (2, 2)
+        assert tally['quorum_met'] is False   # a node never approves alone
+
+    def test_a_node_needs_a_person_or_another_node(self, db):
+        """Its agents and its world model are two identities; a person
+        voting FOR makes the third, and the quorum is met."""
+        exp_id = _voting_experiment(db)
+        _vote(db, exp_id, _user(db, 'agent'), 2)
+        _vote(db, exp_id, _user(db, 'agent', settings={'world_model_voter': True}), 2)
+        _vote(db, exp_id, _user(db), 2)
+        tally = ThoughtExperimentService.tally_votes(db, exp_id)
+        assert (tally['distinct_voters'], tally['distinct_supporters']) == (3, 3)
+        assert tally['quorum_met'] is True
