@@ -797,8 +797,9 @@ def test_an_outcome_blank_once_cut_is_refused_without_a_call(offline, monkeypatc
 
 
 def test_a_422_without_a_reason_is_warned_once(offline, monkeypatch, caplog):
-    """what: the route's contract changed (FastAPI's validation 422); expected:
-    None every time, and ONE warning per process saying why nothing votes."""
+    """what: a 422 without a reason (FastAPI's validation 422); expected:
+    None every time, and one warning saying why nothing votes, not one a
+    round."""
     import logging
     from integrations.agent_engine import world_model_bridge
     monkeypatch.setattr(world_model_bridge, '_WARNED_422_CONTRACT', False)
@@ -830,21 +831,57 @@ def test_the_routes_own_refusal_never_warns_a_broken_contract(offline, monkeypat
 
 
 def test_a_broken_contract_is_warned_again_after_it_recovers(offline, monkeypatch, caplog):
-    """what: a reason-less 422, then a good reply, then a reason-less 422;
-    expected: two warnings (a success re-arms it), each capped in length."""
+    """what: a reason-less 422, a real score, a reason-less 422, first within
+    the re-arm floor, then after it; expected: one warning within the floor
+    (a flapping proxy does not warn every round), a second after a real
+    score past the floor, and the recovery said; each warning capped."""
     import logging
     from integrations.agent_engine import world_model_bridge
+    clock = [1000.0]
+    monkeypatch.setattr(world_model_bridge.time, 'monotonic', lambda: clock[0])
     monkeypatch.setattr(world_model_bridge, '_WARNED_422_CONTRACT', False)
+    monkeypatch.setattr(world_model_bridge, '_WARNED_422_AT', 0.0)
     b = offline()
     huge = {'detail': [{'msg': 'x' * 100000}]}
-    with caplog.at_level(logging.WARNING):
+
+    def _post(reply):
+        _post_recorder(monkeypatch, reply)
+        b.score_claim(context='h', outcome='o', timestamp=1.0, creator_id='u1')
+    with caplog.at_level(logging.INFO):
         for reply in (_Resp(422, huge), _Resp(200, {'vote': 1, 'confidence': 0.5}),
                       _Resp(422, huge)):
-            _post_recorder(monkeypatch, reply)
-            b.score_claim(context='h', outcome='o', timestamp=1.0, creator_id='u1')
-    warned = [r.getMessage() for r in caplog.records if 'rejects every request' in r.getMessage()]
+            _post(reply)
+        clock[0] += world_model_bridge._WARN_422_REARM_S
+        _post(_Resp(200, {'vote': 1, 'confidence': 0.5}))
+        _post(_Resp(422, huge))
+    msgs = [r.getMessage() for r in caplog.records]
+    warned = [m for m in msgs if 'rejects every request' in m]
     assert len(warned) == 2 and all(len(w) < 500 for w in warned)
+    assert sum('answers again' in m for m in msgs) == 1
 
+
+def test_only_a_real_score_re_arms_the_warning(offline, monkeypatch):
+    """what: after a warned break and past the floor, replies that are not
+    a score (503, 404, a 200 that is not JSON, a 200 dict without a vote);
+    expected: none re-arms the warning, and a non-score 200 is no score."""
+    from integrations.agent_engine import world_model_bridge
+    clock = [1000.0]
+    monkeypatch.setattr(world_model_bridge.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(world_model_bridge, '_WARNED_422_CONTRACT', False)
+    monkeypatch.setattr(world_model_bridge, '_WARNED_422_AT', 0.0)
+    b = offline()
+    _post_recorder(monkeypatch, _Resp(422))
+    b.score_claim(context='h', outcome='o', timestamp=1.0, creator_id='u1')
+    assert world_model_bridge._WARNED_422_CONTRACT is True
+    clock[0] += 10 * world_model_bridge._WARN_422_REARM_S
+
+    class _NotJson(_Resp):
+        def json(self):
+            raise ValueError('not json')
+    for reply in (_Resp(503), _Resp(404), _NotJson(200), _Resp(200, {'error': 'upstream'})):
+        _post_recorder(monkeypatch, reply)
+        assert b.score_claim(context='h', outcome='o', timestamp=1.0, creator_id='u1') is None
+        assert world_model_bridge._WARNED_422_CONTRACT is True
 
 def test_a_logged_refusal_reason_is_bounded(db, caplog):
     """what: a reply whose refusal reason is a megabyte; expected: the round
@@ -856,3 +893,15 @@ def test_a_logged_refusal_reason_is_bounded(db, caplog):
         ThoughtExperimentService.cast_world_model_votes(db, bridge=bridge)
     lines = [r.getMessage() for r in caplog.records if 'cannot score' in r.getMessage()]
     assert len(lines) == 1 and len(lines[0]) < 1000
+
+
+def test_a_logged_reason_is_bounded_as_printed(db, caplog):
+    """what: a refusal reason of characters repr() expands tenfold;
+    expected: the printed line is still bounded."""
+    import logging
+    _experiment(db)
+    bridge = _Bridge({'vote': 0, 'refused': True, 'reason': '\U000e0001' * 100000})
+    with caplog.at_level(logging.INFO):
+        ThoughtExperimentService.cast_world_model_votes(db, bridge=bridge)
+    lines = [r.getMessage() for r in caplog.records if 'cannot score' in r.getMessage()]
+    assert len(lines) == 1 and len(lines[0]) < 500

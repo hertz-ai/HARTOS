@@ -395,13 +395,15 @@ class ThoughtExperimentService:
             _WORLD_MODEL_ATTEMPTS[exp.id] = _WORLD_MODEL_ATTEMPTS.get(exp.id, 0) + 1
             if isinstance(score, dict) and score.get('refused'):
                 # bounded at the logger, whatever the source of the reason
-                reason = str(score.get('reason'))[:300]
+                reason = str(score.get('reason'))[:2000]
                 if _WORLD_MODEL_REFUSAL_LOGGED.get(exp.id) != reason:
                     _WORLD_MODEL_REFUSAL_LOGGED[exp.id] = reason
-                    # %r: a reason can carry a world model's text (a 422
-                    # detail), and a newline in it must not forge a log line
-                    logger.info("world model cannot score experiment %s: %r",
-                                exp.id, reason)
+                    # repr: a reason can carry a world model's text (a 422
+                    # detail), and a line break in it must not forge a log
+                    # line; the PRINTED form is capped (repr can expand a
+                    # character tenfold; review of 9ef1a8bf4)
+                    logger.info("world model cannot score experiment %s: %s",
+                                exp.id, repr(reason)[:300])
             if score is None:
                 break
         if not scored:

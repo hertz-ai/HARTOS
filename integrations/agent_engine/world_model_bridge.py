@@ -783,6 +783,7 @@ class WorldModelBridge:
         ingest learns a claim (stream source 'thought_experiment' -> 1.0);
         whether a thought experiment counts as reality is an open owner
         question, and the two must change together."""
+        global _WARNED_422_CONTRACT, _WARNED_422_AT
         screened = [self._screened_text(t) for t in (context, outcome)]
         if any(t is None for t in screened):
             return self._refused_claim('screened')
@@ -828,12 +829,14 @@ class WorldModelBridge:
             # A 422 that is not the route refusing a claim (FastAPI's request
             # validation, a proxy, or no reason at all): something between
             # here and the route rejects every request, and the world model
-            # will not vote until someone looks, so say it once until a score
-            # succeeds again (then a later break is said again).  The detail
+            # will not vote until someone looks, so say it once, and again only
+            # after a real score came back at least _WARN_422_REARM_S after
+            # the warning (a proxy that flaps between a score and a 422 would
+            # otherwise warn every round; review of 9ef1a8bf4).  The detail
             # is capped: FastAPI's validation detail echoes the request body.
-            global _WARNED_422_CONTRACT
             if not _WARNED_422_CONTRACT:
                 _WARNED_422_CONTRACT = True
+                _WARNED_422_AT = time.monotonic()
                 logger.warning("[WorldModelBridge] /v1/world_model/score answered "
                                "422 without a reason (detail %s): the route or "
                                "something in front of it rejects every request; "
@@ -846,10 +849,15 @@ class WorldModelBridge:
         except ValueError:
             logger.info("[WorldModelBridge] score reply was not JSON")
             return None
-        if isinstance(body, dict):
-            _WARNED_422_CONTRACT = False      # the route answers again: re-arm
-            return body
-        return None
+        if not (isinstance(body, dict) and 'vote' in body):
+            # a 200 that is not a score (a proxy's {'error': ...}): cannot
+            # answer now, never a score, never a re-arm
+            return None
+        if _WARNED_422_CONTRACT and (
+                time.monotonic() - _WARNED_422_AT >= _WARN_422_REARM_S):
+            _WARNED_422_CONTRACT = False
+            logger.info("[WorldModelBridge] /v1/world_model/score answers again")
+        return body
 
     def ingest_decided_experiment(self, experiment_id: str, creator_id: str,
                                   claim: str, decision: str, decided_at: str):
@@ -3006,8 +3014,11 @@ def _accepts_kwarg(fn, name: str) -> bool:
         p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
-# score_claim's one-per-process warning for a 422 that carries no reason.
+# score_claim's warning for a 422 that carries no reason: said once, re-armed
+# only by a real score at least _WARN_422_REARM_S after it.
 _WARNED_422_CONTRACT = False
+_WARNED_422_AT = 0.0
+_WARN_422_REARM_S = 600.0
 
 
 def _unit_confidence(value) -> float:
