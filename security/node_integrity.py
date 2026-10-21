@@ -652,12 +652,35 @@ def compute_file_manifest(code_root: str = None) -> Dict[str, str]:
     return result
 
 
+def _is_foreign_tree(entry: Path) -> bool:
+    """A directory whose .py files are not this node's code.
+
+    ``_EXCLUDE_DIRS`` names the known ones.  Two kinds are recognised by
+    what they ARE rather than by name, because the name list is an
+    allowlist that a new directory silently falls outside of:
+
+      * a virtualenv, under any name -- it carries ``pyvenv.cfg``
+        (measured 2026-10-21: an untracked ``venv-hart/`` in a dev
+        checkout was walked in full, and two boot threads sat in
+        ``compute_code_hash`` for 12+ minutes while ``init_social``
+        waited behind them);
+      * an installed-package tree -- a ``site-packages`` directory,
+        wherever its parent sits.
+    """
+    if entry.name in _EXCLUDE_DIRS or entry.name == 'site-packages':
+        return True
+    try:
+        return (entry / 'pyvenv.cfg').is_file()
+    except OSError:
+        return False
+
+
 def _collect_py_files(directory: Path, root: Path):
     """Walk directory recursively, yield (relative_path, absolute_path) for .py files."""
     try:
         for entry in sorted(directory.iterdir()):
             if entry.is_dir():
-                if entry.name in _EXCLUDE_DIRS:
+                if _is_foreign_tree(entry):
                     continue
                 yield from _collect_py_files(entry, root)
             elif entry.is_file() and entry.suffix == '.py':
