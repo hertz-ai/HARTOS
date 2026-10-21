@@ -252,6 +252,22 @@ def test_a_captured_amount_that_differs_is_not_finalized(ctx):
     assert ctx['ledger'].get_payment(p.payment_id).status == PaymentStatus.FAILED
 
 
+def test_a_different_amount_is_kept_as_money_taken_and_the_shopper_told(ctx):
+    # FAILED, but money moved: never read as a declined card, which would
+    # offer the same cart for a second payment.
+    from integrations.ap2.ap2_protocol import MONEY_TAKEN
+    p = _processing(ctx['ledger'], {'kind': 'commerce_checkout', 'mandate_id': 'mdt_1'})
+    _set_capture(ctx, lambda *a: {'success': True, 'status': 'captured',
+                                  'gateway_response': {'data': {'amount': 100}}})
+    with patch('integrations.commerce.commerce_tools.hold_paid_order') as hold:
+        r = _callback(ctx['client'])
+    assert r.get_json()['status'] == 'amount_mismatch'
+    assert hold.call_args.args[0] == p.payment_id
+    reloaded = PaymentLedger(ledger_path=ctx['ledger'].ledger_path)
+    saved = reloaded.get_payment(p.payment_id)
+    assert saved.status == PaymentStatus.FAILED and saved.metadata[MONEY_TAKEN] is True
+
+
 def test_the_right_amount_completes(ctx):
     p = _processing(ctx['ledger'], {})
     _set_capture(ctx, lambda *a: {'success': True, 'status': 'captured',

@@ -441,12 +441,42 @@ def commerce_checkout(
         return _fail('checkout refused: mandate not found')
     if m.status == 'consumed':
         return _out(retry_order(m))
+    from integrations.ap2.ap2_protocol import PaymentStatus, get_payment_ledger
+    payment = get_payment_ledger().get_payment(m.payment_id)
+    if m.status == 'approved' and payment is not None \
+            and payment.status == PaymentStatus.COMPLETED:
+        # Paid, and its order step never finished (the gateway callback
+        # failed midway): it runs now, and never charges again.
+        return _out(complete_redirect_checkout(m.payment_id))
     return _out(settle_checkout(m))
 
 
 def _nothing_charged(user_id, message: str) -> None:
     push_fragment(user_id, {'type': 'notification', 'severity': 'warning',
                             'title': 'Payment not taken', 'message': message})
+
+
+_ON_HOLD = ('Your payment arrived, but your order is not confirmed yet. '
+            'We will place it or sort it out with you.')
+
+
+def _order_on_hold(user_id, message: str = _ON_HOLD) -> None:
+    """The money is taken and the order is not placed: the shopper hears it."""
+    push_fragment(user_id, {'type': 'notification', 'severity': 'warning',
+                            'title': 'Payment received, order on hold',
+                            'message': message})
+
+
+def hold_paid_order(payment_id: str, why: str) -> None:
+    """A gateway took money for a checkout that cannot become an order as it
+    stands (PhonePe captured a different amount).  The mandate is kept, so
+    its cart is not offered for payment again; the shopper is told and a
+    person settles it."""
+    m = _mandates().find_by_payment_id(payment_id)
+    logger.error(f'MANUAL RECONCILIATION NEEDED: payment {payment_id} ({why}); '
+                 f'mandate {m.mandate_id if m else "not found"} kept, no order placed')
+    if m is not None:
+        _order_on_hold(m.user_id)
 
 
 def settle_checkout(m) -> Dict[str, Any]:
@@ -642,12 +672,22 @@ def _consume_paid(user_id, m, payment) -> Optional[Dict[str, Any]]:
             # this one must not place a second.
             return {'success': False, 'error': 'this checkout is already being completed',
                     'payment_id': m.payment_id, 'mandate_id': m.mandate_id}
+        if current is not None and current.status == 'approved':
+            # consume refuses an approved mandate only when its record fails
+            # its signature: edited outside the store, or signed with a key
+            # this node no longer has.  No order can be signed for it.
+            cause = "this checkout's record does not match its signature"
+        elif current is None:
+            cause = "this checkout's record is gone"
+        else:
+            cause = f'this checkout was {current.status} meanwhile'
         logger.error(f'MANUAL RECONCILIATION NEEDED: payment {m.payment_id} went '
-                     f'through but mandate {m.mandate_id} is '
-                     f'{current.status if current else "gone"}; no order placed')
+                     f'through but mandate {m.mandate_id} cannot be used ({cause}); '
+                     f'no order placed')
+        _order_on_hold(user_id)
         return {'success': False, 'needs_attention': True,
-                'error': ('the payment went through but this checkout was withdrawn '
-                          'meanwhile; a person has to reconcile it'),
+                'error': (f'the payment went through, but {cause}, so no order can '
+                          f'be placed for it; a person has to place it or refund it'),
                 'payment_id': m.payment_id, 'mandate_id': m.mandate_id}
     method = payment.gateway.value if payment and payment.gateway else None
     txn = payment.gateway_transaction_id if payment else None
@@ -657,47 +697,71 @@ def _consume_paid(user_id, m, payment) -> Optional[Dict[str, Any]]:
     return None
 
 
-def retry_order(m) -> Dict[str, Any]:
+def retry_order(m, claimed: bool = False) -> Dict[str, Any]:
     """The order step again, for a CONSUMED mandate: its payment went
     through, its order did not (or the answer was lost).  Never charges.
 
     McGroce answers a mandate it already turned into an order with that
     order, so a retry after a lost answer finds it instead of placing a
     second one.  The live cart must still be the one the shopper approved.
+    One order step per mandate at a time (MandateStore.begin_settle): a
+    retry racing the gateway callback is told it is in progress.
+    ``claimed``: the caller already holds that claim.
     """
     import hmac
     from integrations.ap2.ap2_mandate import MandateError, canonical_cart_hash
     from integrations.ap2.ap2_protocol import PaymentStatus, get_payment_ledger
     if m.order_ref:
-        return {'success': True, 'status': 'ordered', 'order_id': m.order_ref,
-                'payment_id': m.payment_id, 'amount': m.amount,
-                'currency': m.currency}
+        return _ordered(m)
     if m.cart_ref is None:
         # Consumed by an older build, which kept no order_ref and no cart:
         # its order may well exist, and nothing says which cart it paid for.
-        return {'success': False, 'payment_id': m.payment_id, 'mandate_id': m.mandate_id,
+        return {'success': False, 'needs_attention': True,
+                'payment_id': m.payment_id, 'mandate_id': m.mandate_id,
                 'error': ('this payment was handled by an older version; check the '
                           "shopper's orders, or a person reconciles it")}
     payment = get_payment_ledger().get_payment(m.payment_id)
     if payment is None or payment.status != PaymentStatus.COMPLETED:
         return {'success': False, 'error': 'checkout refused: mandate is consumed'}
-    client = _client()
-    res = client.cart_get(m.user_id)
-    if not res['success']:
-        return {'success': False, 'error': res['error'], 'needs_attention': True,
-                'payment_id': m.payment_id, 'mandate_id': m.mandate_id}
-    view = cart_view(res['data'])
+    store = _mandates()
+    if not claimed:
+        ok, why = store.begin_settle(m.mandate_id)
+        if not ok:
+            return {'success': False, 'in_progress': True,
+                    'error': f'this checkout is already being completed ({why})',
+                    'payment_id': m.payment_id, 'mandate_id': m.mandate_id}
     try:
-        same = (str(view.get('order_id')) == m.cart_ref and hmac.compare_digest(
-            canonical_cart_hash(mandate_cart(view)), m.cart_hash))
-    except MandateError:
-        same = False
-    if not same:
-        return {'success': False, 'needs_attention': True,
-                'payment_id': m.payment_id, 'mandate_id': m.mandate_id,
-                'error': ('the payment went through, but the cart is no longer '
-                          'the one that was paid for; a person has to sort it out')}
-    return _submit_order(client, m.user_id, m, view, payment)
+        m = store.get(m.mandate_id) or m
+        if m.order_ref:                 # placed while this one waited
+            return _ordered(m)
+        client = _client()
+        res = client.cart_get(m.user_id)
+        if not res['success']:
+            return {'success': False, 'error': res['error'], 'needs_attention': True,
+                    'payment_id': m.payment_id, 'mandate_id': m.mandate_id}
+        view = cart_view(res['data'])
+        try:
+            same = (str(view.get('order_id')) == m.cart_ref and hmac.compare_digest(
+                canonical_cart_hash(mandate_cart(view)), m.cart_hash))
+        except MandateError:
+            same = False
+        if not same:
+            return {'success': False, 'needs_attention': True, 'cart_changed': True,
+                    'payment_id': m.payment_id, 'mandate_id': m.mandate_id,
+                    'error': ('the payment went through, but the cart no longer holds '
+                              'what was paid for; put it back as it was approved and '
+                              'call commerce_checkout with this mandate_id, which '
+                              'places the order with that payment and never charges '
+                              'again, or a person sorts it out')}
+        return _submit_order(client, m.user_id, m, view, payment)
+    finally:
+        if not claimed:
+            store.end_settle(m.mandate_id)
+
+
+def _ordered(m) -> Dict[str, Any]:
+    return {'success': True, 'status': 'ordered', 'order_id': m.order_ref,
+            'payment_id': m.payment_id, 'amount': m.amount, 'currency': m.currency}
 
 
 def _submit_order(client, user_id, m, view, payment) -> Dict[str, Any]:
@@ -748,7 +812,10 @@ def complete_redirect_checkout(payment_id: str) -> Dict[str, Any]:
     for the cart the approval named, still holding what was approved.  When
     it cannot (McGroce down, the cart changed) the order is held, the
     shopper is told, and commerce_checkout retries it later without a new
-    charge; only that cart stays blocked, never the shopper's next one.
+    charge.  That cart is not offered for payment again meanwhile, and since
+    McGroce keeps one open cart per shopper until an order is placed, that
+    is the shopper's live cart.  commerce_checkout also runs this for an
+    approved mandate whose payment completed but whose order step never ran.
     """
     from integrations.ap2.ap2_protocol import PaymentStatus, get_payment_ledger
     m = _mandates().find_by_payment_id(payment_id)
@@ -757,18 +824,51 @@ def complete_redirect_checkout(payment_id: str) -> Dict[str, Any]:
     payment = get_payment_ledger().get_payment(payment_id)
     if payment is None or payment.status != PaymentStatus.COMPLETED:
         return {'success': False, 'error': 'payment is not completed'}
-    failed = _consume_paid(m.user_id, m, payment)
-    if failed:
-        return failed
-    placed = retry_order(_mandates().get(m.mandate_id) or m)
+    from integrations.ap2.ap2_mandate import ALREADY_SETTLING
+    store = _mandates()
+    # Claimed before the mandate is used up: the callback and a retry of it
+    # never both consume it and then both leave the order to the other.
+    claimed, why = store.begin_settle(m.mandate_id)
+    if not claimed and why == ALREADY_SETTLING:
+        return {'success': False, 'in_progress': True,
+                'error': 'this checkout is already being completed',
+                'payment_id': m.payment_id, 'mandate_id': m.mandate_id}
+    if not claimed:
+        logger.error(f'MANUAL RECONCILIATION NEEDED: payment {payment_id} completed '
+                     f'but mandate {m.mandate_id} cannot be ordered ({why})')
+        _order_on_hold(m.user_id)
+        return {'success': False, 'needs_attention': True,
+                'error': f'the payment went through, but {why}; a person has to sort it out',
+                'payment_id': m.payment_id, 'mandate_id': m.mandate_id}
+    try:
+        failed = _consume_paid(m.user_id, m, payment)
+        if failed:
+            return failed
+        if m.cart_ref is None:
+            # Approved under an older version, which recorded no cart: no
+            # order can be signed for it, and none was placed (this is its
+            # order step).
+            logger.error(f'MANUAL RECONCILIATION NEEDED: payment {payment_id} '
+                         f'completed for mandate {m.mandate_id}, approved before '
+                         f'carts were recorded; no order placed')
+            _order_on_hold(m.user_id)
+            return {'success': False, 'needs_attention': True,
+                    'payment_id': m.payment_id, 'mandate_id': m.mandate_id,
+                    'error': ('the payment went through for a checkout approved under '
+                              'an older version, which named no cart; a person has to '
+                              'place the order or refund it')}
+        placed = retry_order(store.get(m.mandate_id) or m, claimed=True)
+    finally:
+        store.end_settle(m.mandate_id)
     if not placed['success']:
-        logger.error(f'commerce: PhonePe payment {payment_id} completed but the '
+        logger.error(f'commerce: payment {payment_id} completed but the '
                      f'order is NOT placed: {placed["error"]}')
-        push_fragment(m.user_id, {
-            'type': 'notification', 'severity': 'warning',
-            'title': 'Payment received, order on hold',
-            'message': 'Your payment arrived, but we have not placed the order '
-                       'yet. We will place it or sort it out with you.'})
+        _order_on_hold(m.user_id, (
+            'Your payment arrived, but your cart changed while you were paying, so '
+            'the order is on hold. Put the cart back the way you approved it and '
+            'ask your agent to check out: it is placed with this payment, with no '
+            'new charge. Or we sort it out with you.')
+            if placed.get('cart_changed') else _ON_HOLD)
     return placed
 
 

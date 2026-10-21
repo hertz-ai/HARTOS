@@ -81,6 +81,11 @@ class MandateError(ValueError):
     """A mandate could not be created (bad cart, over the cap)."""
 
 
+class MandateKeyError(MandateError):
+    """The node's mandate key cannot be read or saved right now: nothing is
+    signed until it can (see _load_or_create_key)."""
+
+
 def _money(value) -> Decimal:
     """Parse a price: a number, a numeric string, or a Money bean
     ``{amount, currency}`` (how Broadleaf serialises Money)."""
@@ -223,6 +228,9 @@ class MandateStore:
     def _expire_if_due(self, m: CartMandate, now: float) -> None:
         if m.status in ('pending', 'approved') and now >= m.expires_at:
             from integrations.ap2.ap2_protocol import PaymentStatus
+            # A record edited outside this store keeps its broken signature
+            # whatever it becomes: re-signing it would make the edit genuine.
+            intact = self._intact(m)
             status = self._payment_status(m.payment_id)
             if status == PaymentStatus.COMPLETED:
                 # The money was taken.  A generic mandate has no step that
@@ -231,7 +239,13 @@ class MandateStore:
                 # after the TTL and must still find it approved.
                 if m.status == 'approved' and m.kind == KIND_GENERIC:
                     m.status = 'consumed'
-                    m.sig = self._sign(m)
+                    if intact:
+                        m.sig = self._sign(m)
+                return
+            if self._money_taken(m.payment_id):
+                # FAILED, but the gateway took a different amount: kept as it
+                # is, so its cart is never offered for payment again; a person
+                # settles it.
                 return
             if status == PaymentStatus.PROCESSING:
                 # A redirect gateway (PhonePe) is holding the money; its
@@ -244,10 +258,12 @@ class MandateStore:
                              f'PROCESSING a day after the mandate expired; the '
                              f'mandate is released, the payment is left as is')
                 m.status = 'expired'
-                m.sig = self._sign(m)
+                if intact:
+                    m.sig = self._sign(m)
                 return
             m.status = 'expired'
-            m.sig = self._sign(m)
+            if intact:
+                m.sig = self._sign(m)
             try:
                 self.ledger.cancel_payment(m.payment_id, 'ap2_mandate',
                                            'mandate expired')
@@ -261,10 +277,24 @@ class MandateStore:
             return None
         return p.status if p is not None else None
 
+    def _money_taken(self, payment_id: str) -> bool:
+        """The gateway took money for this payment: it COMPLETED, or it is
+        FAILED only because the amount taken was not the one asked."""
+        from integrations.ap2.ap2_protocol import MONEY_TAKEN, PaymentStatus
+        try:
+            p = self.ledger.get_payment(payment_id)
+        except Exception:
+            return False
+        if p is None:
+            return False
+        return p.status == PaymentStatus.COMPLETED or (
+            p.status == PaymentStatus.FAILED
+            and bool((p.metadata or {}).get(MONEY_TAKEN)))
+
     def _money_in_flight(self, payment_id: str) -> bool:
         from integrations.ap2.ap2_protocol import PaymentStatus
-        return self._payment_status(payment_id) in (PaymentStatus.PROCESSING,
-                                                    PaymentStatus.COMPLETED)
+        return (self._payment_status(payment_id) == PaymentStatus.PROCESSING
+                or self._money_taken(payment_id))
 
     # ── public API ───────────────────────────────────────────────
     def create_cart_mandate(self, user_id: str, merchant: str,
@@ -368,7 +398,7 @@ class MandateStore:
             if m is None:
                 return False, 'mandate not found'
             self._expire_if_due(m, time.time())
-            if not hmac.compare_digest(m.sig, self._sign(m)):
+            if not self._intact(m):
                 return False, 'mandate signature invalid'
             if str(approver_id) != m.user_id:
                 return False, 'only the owner can approve this payment'
@@ -453,7 +483,7 @@ class MandateStore:
             if m is None:
                 return False, 'mandate not found'
             self._expire_if_due(m, time.time())
-            if not hmac.compare_digest(m.sig, self._sign(m)):
+            if not self._intact(m):
                 return False, 'mandate signature invalid'
             if m.user_id != str(user_id):
                 return False, 'mandate belongs to another user'
@@ -518,11 +548,17 @@ class MandateStore:
             return True
 
     def _paid_unordered(self, m: CartMandate, cart_ref: Optional[str]) -> bool:
-        """``m`` took the money for ``cart_ref`` and its order is not placed.
-        A mandate consumed before cart_ref existed is not counted: its order
-        step ran under the old build, which kept no order_ref."""
-        return (m.status == 'consumed' and not m.order_ref
-                and m.cart_ref is not None and m.cart_ref == cart_ref)
+        """``m`` took the money for ``cart_ref`` and its order is not placed:
+        consumed with no order yet, or still approved because its order step
+        never used it up (it failed midway, the record fails its signature,
+        the gateway took another amount).  A mandate consumed before cart_ref
+        existed is not counted: its order step ran under the old build, which
+        kept no order_ref."""
+        if m.cart_ref is None or m.cart_ref != cart_ref:
+            return False
+        if m.status == 'consumed':
+            return not m.order_ref
+        return m.status == 'approved' and self._money_taken(m.payment_id)
 
     def supersede(self, user_id: str, merchant: str, kind: str,
                   cart_ref: Optional[str]) -> Tuple[bool, str]:
@@ -535,8 +571,10 @@ class MandateStore:
         same cart (``cart_ref``, whatever it holds now) was already paid for
         and its order is not placed -- paying again would charge twice; that
         order is retried with the earlier mandate, or a person sorts it out.
-        A mandate is voided only when its payment was really cancelled, or
-        had already ended with no money taken (a declined card).
+        Money taken for ANOTHER cart holds up nothing: that mandate is left
+        as it is, never voided.  A mandate is voided only when its payment
+        was really cancelled, or had already ended with no money taken (a
+        declined card).
         """
         from integrations.ap2.ap2_protocol import PaymentStatus
         with self._lock:
@@ -552,14 +590,19 @@ class MandateStore:
                                    'taken right now')
                 if self._paid_unordered(m, cart_ref):
                     return False, (f'this cart is already paid for (mandate '
-                                   f'{m.mandate_id}); its order is being placed')
-                if m.status in ('pending', 'approved') \
-                        and self._money_in_flight(m.payment_id):
+                                   f'{m.mandate_id}) and its order is not placed '
+                                   f'yet; commerce_checkout with that mandate_id '
+                                   f'places it with that payment and never '
+                                   f'charges again (the cart must hold what was '
+                                   f'paid for), or a person sorts it out')
+                if m.status in ('pending', 'approved') and self._payment_status(
+                        m.payment_id) == PaymentStatus.PROCESSING:
                     return False, ('a payment for an earlier checkout is still '
                                    'in progress')
             voided, stuck = 0, 0
             for m in mine:
-                if m.status not in ('pending', 'approved'):
+                if m.status not in ('pending', 'approved') \
+                        or self._money_taken(m.payment_id):
                     continue
                 if self.ledger.cancel_payment(m.payment_id, 'ap2_mandate',
                                               'replaced by a newer checkout') \
@@ -579,13 +622,16 @@ class MandateStore:
             return True, f'{voided} earlier checkout(s) withdrawn'
 
     def begin_settle(self, mandate_id: str) -> Tuple[bool, str]:
-        """Claim the right to take the money for ``mandate_id``.  (ok, reason).
+        """Claim the right to take the money for ``mandate_id``, or to place
+        its order.  (ok, reason).
 
         At most one mandate per merchant-side cart is settled at a time, and
         none once another one for that cart took the money without its order
         being placed or is with the gateway: two approvals for one cart --
-        two prepares that raced, an older card -- never both charge.  Pair
-        with end_settle in a finally.
+        two prepares that raced, an older card -- never both charge.  A paid
+        mandate's order step claims it the same way, so a callback and a
+        retry never send its order at once.  Pair with end_settle in a
+        finally.
         """
         with self._lock:
             m = self._mandates.get(mandate_id)
@@ -782,28 +828,51 @@ def decide_payment(payment_id: str, approver_id: Optional[str], approved: bool,
 
 
 def _load_or_create_key(path: str) -> bytes:
-    """Node-local HMAC key for mandate records (0600 where supported)."""
+    """Node-local HMAC key for mandate records (0600 where supported).
+
+    Created only when there is none (or an empty file a crash left before a
+    key was written).  Every mandate is signed with it, so a key that cannot
+    be read right now is never replaced: a new one would turn every record
+    unverifiable, and a paid one could then never be ordered.  That raises
+    MandateKeyError instead, and so does a new key that could not be saved,
+    which a restart would lose; nothing is signed until the key reads again.
+    """
     try:
         with open(path, 'r', encoding='utf-8') as f:
-            key = f.read().strip()
-        if len(key) >= 64:
-            return bytes.fromhex(key)
+            existing = f.read().strip()
+        mode = 'w'                      # only ever over an empty file
     except FileNotFoundError:
-        pass
-    except Exception as e:
-        logger.warning(f'ap2 mandates: key unreadable ({e}); regenerating')
+        existing, mode = '', 'x'        # never over one written meanwhile
+    except OSError as e:
+        logger.error(f'ap2 mandates: key {path} unreadable ({e}); not replaced, '
+                     f'nothing is signed until it reads again')
+        raise MandateKeyError('payment records cannot be signed on this node '
+                              'right now')
+    if existing:
+        try:
+            if len(existing) >= 64:
+                return bytes.fromhex(existing)
+        except ValueError:
+            pass
+        logger.error(f'ap2 mandates: {path} does not hold a key; not replaced: '
+                     f'restore it, or move it away to start with a new key '
+                     f'(records signed with the old one will not verify)')
+        raise MandateKeyError('payment records cannot be signed on this node '
+                              'right now')
     key = secrets.token_hex(32)
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, 'w', encoding='utf-8') as f:
+        with open(path, mode, encoding='utf-8') as f:
             f.write(key)
-        try:
-            os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
-        except (OSError, NotImplementedError):
-            pass
     except OSError as e:
-        logger.warning(f'ap2 mandates: key not persisted ({e}); '
-                       f'mandates will not survive a restart')
+        logger.error(f'ap2 mandates: key not saved to {path} ({e}); nothing is '
+                     f'signed with a key a restart would lose')
+        raise MandateKeyError('payment records cannot be signed on this node '
+                              'right now')
+    try:
+        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+    except (OSError, NotImplementedError):
+        pass
     return bytes.fromhex(key)
 
 

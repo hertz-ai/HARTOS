@@ -102,6 +102,12 @@ class PaymentGateway(str, Enum):
 # moves later, when the person pays, and a server callback confirms it.
 REDIRECT_GATEWAYS = frozenset({PaymentGateway.PHONEPE})
 
+#: Payment metadata flag: the gateway took money for this payment although it
+#: is FAILED (PhonePe captured an amount other than the one asked).  Such a
+#: payment is never read as a declined one: its cart is not offered for
+#: payment again, and a person settles it.
+MONEY_TAKEN = 'money_taken'
+
 
 def mock_settlement_allowed(user=None) -> bool:
     """May a payment the ledger routed to the MockPaymentGateway settle for

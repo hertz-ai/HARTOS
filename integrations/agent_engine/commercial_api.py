@@ -1524,7 +1524,19 @@ def phonepe_callback():
                 PaymentStatus.FAILED,
                 f"amount mismatch: captured {_gw_data.get('amount')} paise, "
                 f"expected {_expected}")
+            # FAILED, but the money moved: never read as a declined card,
+            # which would offer the same cart for a second payment.
+            from integrations.ap2.ap2_protocol import MONEY_TAKEN
+            payment_req.metadata = {**(payment_req.metadata or {}), MONEY_TAKEN: True}
             payment_ledger.save_ledger()
+            if (payment_req.metadata or {}).get('kind') == 'commerce_checkout':
+                try:
+                    from integrations.commerce.commerce_tools import hold_paid_order
+                    hold_paid_order(payment_req.payment_id,
+                                    'PhonePe took a different amount than was asked')
+                except Exception:
+                    logger.exception(f"PhonePe callback: could not tell the shopper "
+                                     f"about {payment_req.payment_id}")
             return jsonify({'success': False, 'status': 'amount_mismatch',
                             'payment_request_id': payment_req.payment_id}), 200
 

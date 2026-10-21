@@ -12,9 +12,12 @@ from unittest.mock import patch
 import pytest
 
 from integrations.ap2.ap2_mandate import (
-    MandateError, MandateStore, canonical_cart_hash,
+    MandateError, MandateKeyError, MandateStore, _load_or_create_key,
+    canonical_cart_hash,
 )
-from integrations.ap2.ap2_protocol import PaymentGateway, PaymentLedger, PaymentStatus
+from integrations.ap2.ap2_protocol import (
+    MONEY_TAKEN, PaymentGateway, PaymentLedger, PaymentStatus,
+)
 from tests.unit.ap2_doubles import CardRailDouble
 
 CART = {
@@ -262,6 +265,77 @@ class TestOrderRef:
         assert edited.consume(m.mandate_id) is False
         assert edited.get(m.mandate_id).status == 'approved'
 
+    def test_an_edited_record_is_not_re_signed_when_it_expires(self, store, tmp_path):
+        m = store.create_cart_mandate('u1', 'mcgroce', CART)
+        raw = json.loads((tmp_path / 'ap2_mandates.json').read_text())
+        raw['mandates'][m.mandate_id]['description'] = 'something else'
+        (tmp_path / 'ap2_mandates.json').write_text(json.dumps(raw))
+        edited = MandateStore(path=str(tmp_path / 'ap2_mandates.json'),
+                              ledger=store.ledger, key=b'k' * 32)
+        with patch('integrations.ap2.ap2_mandate.time.time',
+                   return_value=m.expires_at + 1):
+            assert edited.get(m.mandate_id).status == 'expired'
+            assert edited.approve(m.mandate_id, 'u1') == (
+                False, 'mandate signature invalid')
+
+    def test_paid_as_signed_needs_an_intact_record_and_the_exact_payment(self, store):
+        from decimal import Decimal
+        m = store.create_cart_mandate('u1', 'mcgroce', CART)
+        store.approve(m.mandate_id, 'u1')
+        payment = store.ledger.get_payment(m.payment_id)
+        assert store.paid_as_signed(m, payment)
+        payment.amount = Decimal('241.00')
+        assert not store.paid_as_signed(m, payment)
+        payment.amount, payment.currency = Decimal('240.00'), 'USD'
+        assert not store.paid_as_signed(m, payment)
+        payment.currency = 'INR'
+        m.description = 'edited'           # the signature no longer holds
+        assert not store.paid_as_signed(m, payment)
+
+
+class TestMandateKey:
+    """Every record is signed with the node's mandate key, so it is created
+    once and never replaced: a new key would orphan every paid record."""
+
+    def test_a_missing_key_is_created_once_and_kept(self, tmp_path):
+        path = str(tmp_path / 'data' / '.ap2_mandate_key')
+        first = _load_or_create_key(path)
+        assert len(first) == 32 and _load_or_create_key(path) == first
+
+    def test_an_unreadable_key_is_never_replaced(self, tmp_path):
+        path = tmp_path / '.ap2_mandate_key'
+        path.write_text('ab' * 32, encoding='utf-8')
+        real_open = open
+
+        def locked(p, mode='r', *a, **k):
+            if str(p) == str(path) and 'r' in mode:
+                raise PermissionError('in use by another process')
+            return real_open(p, mode, *a, **k)
+
+        with patch('builtins.open', locked):
+            with pytest.raises(MandateKeyError):
+                _load_or_create_key(str(path))
+        assert path.read_text(encoding='utf-8') == 'ab' * 32
+
+    def test_a_file_that_is_not_a_key_is_never_replaced(self, tmp_path):
+        path = tmp_path / '.ap2_mandate_key'
+        path.write_text('﻿' + 'ab' * 32, encoding='utf-8')   # an editor's BOM
+        with pytest.raises(MandateKeyError):
+            _load_or_create_key(str(path))
+        assert path.read_text(encoding='utf-8') == '﻿' + 'ab' * 32
+
+    def test_a_key_that_cannot_be_saved_signs_nothing(self, tmp_path):
+        blocker = tmp_path / 'not_a_dir'
+        blocker.write_text('x', encoding='utf-8')
+        with pytest.raises(MandateKeyError):
+            _load_or_create_key(str(blocker / '.ap2_mandate_key'))
+
+    def test_an_empty_file_left_by_a_crash_gets_a_key(self, tmp_path):
+        path = tmp_path / '.ap2_mandate_key'
+        path.write_text('', encoding='utf-8')
+        key = _load_or_create_key(str(path))
+        assert path.read_text(encoding='utf-8') == key.hex()
+
 
 class TestSupersede:
     KIND = 'commerce_checkout'
@@ -339,6 +413,34 @@ class TestSupersede:
         ok, reason = store.supersede('u1', 'mcgroce', self.KIND, '555')
         assert not ok and 'being taken' in reason
         assert store.get(m.mandate_id).status == 'approved'
+
+    def test_a_payment_that_took_another_amount_never_opens_a_second_one(self, store):
+        # PhonePe captured a different amount: FAILED, but money moved.  It is
+        # no declined card: the cart stays paid for, past the TTL too.
+        m = self._mandate(store)
+        store.approve(m.mandate_id, 'u1')
+        p = store.ledger.get_payment(m.payment_id)
+        p.update_status(PaymentStatus.FAILED, 'amount mismatch')
+        p.metadata = {**p.metadata, MONEY_TAKEN: True}
+        ok, reason = store.supersede('u1', 'mcgroce', self.KIND, '555')
+        assert not ok and m.mandate_id in reason
+        with patch('integrations.ap2.ap2_mandate.time.time',
+                   return_value=m.expires_at + 3600):
+            assert store.supersede('u1', 'mcgroce', self.KIND, '555')[0] is False
+        assert store.get(m.mandate_id).status == 'approved'
+        assert store.withdraw(m.mandate_id, 'cart changed') is False
+
+    def test_money_taken_for_another_cart_holds_up_nothing(self, store):
+        # Paid, but its order step never used it up (it failed midway, or the
+        # record fails its signature): that cart waits, the next one does not.
+        m = self._mandate(store)
+        store.approve(m.mandate_id, 'u1')
+        store.ledger.get_payment(m.payment_id).update_status(PaymentStatus.COMPLETED)
+        ok, reason = store.supersede('u1', 'mcgroce', self.KIND, '555')
+        assert not ok and m.mandate_id in reason
+        ok, reason = store.supersede('u1', 'mcgroce', self.KIND, '556')
+        assert ok, reason
+        assert store.get(m.mandate_id).status == 'approved'     # paid: never voided
 
 
 class TestBeginSettle:
