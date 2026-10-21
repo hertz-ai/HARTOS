@@ -2817,16 +2817,25 @@ class SmartLedger:
         cleared the mark after this one's write, when its mark could not be
         written, or when a writer from before marks existed saved it; each of
         those writes the file, so the next pass reads it.  The first call on a
-        folder reads every file once.  The pass's start time is recorded only
-        after every mark it found is written, so a mark that cannot be written
-        leaves the file to be read again next time; its key is returned
-        either way.  A mark whose ledger file is gone is cleared.
+        folder in each process reads every file once, whatever the last pass
+        recorded: a file can read as written before that pass and still hold
+        an unmarked task in progress (another instance cleared its mark more
+        than the slack after the pass; a ledger copied back over a name
+        deleted seconds earlier, where NTFS hands it the old file's creation
+        time and copy2 keeps the modification time), and the restart is what
+        finds it (review of 1b6e34f42, R1 and R2).  The pass's start time is
+        recorded only after every mark it found is written, so a mark that
+        cannot be written leaves the file to be read again next time; its key
+        is returned either way.  A mark whose ledger file is gone is cleared.
         """
         from agent_ledger.backends import JSONBackend
         ledger_path = Path(ledger_dir)
         backend = JSONBackend(storage_dir=str(ledger_path))
         marked = set(backend.marked_keys())
-        since = backend.mark_index_time()
+        folder = os.path.normcase(os.path.abspath(str(ledger_path)))
+        with _FOLDERS_READ_IN_FULL_LOCK:
+            read_in_full = folder in _FOLDERS_READ_IN_FULL
+        since = backend.mark_index_time() if read_in_full else None
         pass_started = time.time()
         found = (_unmarked_work_in_progress(ledger_path, marked, since)
                  if ledger_path.is_dir() else [])
@@ -2834,6 +2843,8 @@ class SmartLedger:
             for key in found:
                 backend.set_mark(key, True)
             backend.stamp_mark_index(pass_started)
+            with _FOLDERS_READ_IN_FULL_LOCK:
+                _FOLDERS_READ_IN_FULL.add(folder)
         except OSError as e:
             logger.warning(
                 f"Could not record the in-progress index in {ledger_path} "
@@ -4153,6 +4164,13 @@ def get_production_backend():
 #: Slack when comparing a ledger file's times with the in-progress index's
 #: last pass: covers coarse filesystem timestamps (FAT keeps 2 s) and rounding.
 _INDEX_TIME_SLACK_S = 2.0
+
+#: The ledger folders SmartLedger.keys_in_progress has read in full in this
+#: process, and recorded.  A folder joins only after its pass's marks and
+#: start time are written, so a pass that could not record them is followed
+#: by another full read.
+_FOLDERS_READ_IN_FULL: set = set()
+_FOLDERS_READ_IN_FULL_LOCK = threading.Lock()
 
 
 def _file_written_at(st) -> float:

@@ -189,9 +189,12 @@ def test_a_mark_whose_ledger_file_is_gone_is_dropped(agent_data):
 
 
 def _fresh_process_view():
-    """Forget the ledgers this process holds open, as a restarted node would."""
+    """Forget what this process knows, as a restarted node would: the
+    ledgers it holds open, and the folders it has read in full."""
+    from agent_ledger import core
     from agent_ledger.factory import clear_ledger_cache
     clear_ledger_cache()
+    getattr(core, '_FOLDERS_READ_IN_FULL', set()).clear()
 
 
 def _build_index(data_dir):
@@ -382,3 +385,108 @@ def test_an_index_that_cannot_be_recorded_still_answers(agent_data, monkeypatch)
 
     assert SmartLedger.keys_in_progress(str(agent_data.dir)) == [f'ledger_{AGENT}_busy']
     assert not (agent_data.dir / '.in_progress' / '.last_pass').exists()
+
+
+def _pass_recorded_after(data_dir, seconds):
+    """Record the index's last pass as ``seconds`` from now: a pass that ran
+    after every file's last write."""
+    import time
+    from agent_ledger.backends import JSONBackend
+    JSONBackend(storage_dir=str(data_dir)).stamp_mark_index(time.time() + seconds)
+
+
+def _count_reads(monkeypatch):
+    from agent_ledger import core
+    read = []
+    real_read = core._saved_work_in_progress
+    monkeypatch.setattr(core, '_saved_work_in_progress',
+                        lambda path: (read.append(os.path.basename(path)), real_read(path))[1])
+    return read
+
+
+def test_a_mark_cleared_after_a_later_pass_is_found_after_a_restart(agent_data):
+    """Review of 1b6e34f42, R1: an instance saves its running task and marks
+    it, a pass runs, another instance of the same key clears the mark more
+    than the slack later, and the node restarts.  The file holds the running
+    task and no mark, and was written before the last pass.  The new
+    process's first tick still finds it."""
+    from agent_ledger.backends import JSONBackend
+    _save_idle_ledgers(agent_data.dir)
+    _save_ledger(agent_data.dir, 'busy', ['in_progress'])
+    _build_index(agent_data.dir)
+    _pass_recorded_after(agent_data.dir, 10)
+    JSONBackend(storage_dir=str(agent_data.dir)).set_mark(f'ledger_{AGENT}_busy', False)
+    _fresh_process_view()
+
+    out = _reap()
+
+    assert out['reaped'] == 1 and agent_data.opened == ['busy'], (out, agent_data.opened)
+    assert _saved_status(agent_data.dir, 'busy', 'action_1') == 'failed'
+
+
+def test_a_ledger_restored_with_older_times_is_found_after_a_restart(agent_data):
+    """Review of 1b6e34f42, R2: a ledger copied back over a name deleted
+    seconds earlier keeps old times (NTFS hands the new file the deleted
+    one's creation time, copy2 keeps the modification time), so it reads as
+    written before the last pass.  A test cannot make NTFS do that; the pass
+    is recorded after the file's times instead, the comparison the index
+    makes.  The new process's first tick still finds the running task."""
+    import time
+    from agent_ledger.backends import JSONBackend
+    _save_idle_ledgers(agent_data.dir)
+    _build_index(agent_data.dir)
+    JSONBackend(storage_dir=str(agent_data.dir)).save(
+        f'ledger_{AGENT}_restored', _raw_ledger_data('restored', ['in_progress']))
+    old = time.time() - 3600
+    os.utime(agent_data.dir / f'ledger_{AGENT}_restored.json', (old, old))
+    _pass_recorded_after(agent_data.dir, 10)
+    _fresh_process_view()
+
+    out = _reap()
+
+    assert out['reaped'] == 1 and agent_data.opened == ['restored'], (out, agent_data.opened)
+
+
+def test_each_process_reads_every_file_once(agent_data, monkeypatch):
+    """The first pass in a process reads every ledger file whatever the
+    index recorded; later passes in the same process read only the files
+    written since."""
+    import time
+    from agent_ledger import core
+    monkeypatch.setattr(core, '_INDEX_TIME_SLACK_S', 0.0)
+    _save_idle_ledgers(agent_data.dir)
+    time.sleep(0.05)
+    _build_index(agent_data.dir)
+    read = _count_reads(monkeypatch)
+
+    _build_index(agent_data.dir)
+    assert read == []
+
+    _fresh_process_view()
+    _build_index(agent_data.dir)
+    assert len(read) == IDLE_LEDGERS
+
+    _build_index(agent_data.dir)
+    assert len(read) == IDLE_LEDGERS
+
+
+def test_a_first_pass_that_cannot_be_recorded_reads_every_file_again(agent_data, monkeypatch):
+    """A process whose first pass could not record the index has not read
+    the folder in full as far as the next pass knows: it reads every file
+    again."""
+    from agent_ledger.backends import JSONBackend
+    _save_idle_ledgers(agent_data.dir)
+    read = _count_reads(monkeypatch)
+    real_stamp = JSONBackend.stamp_mark_index
+
+    def refuse(self, when):
+        raise PermissionError('mark folder is read-only')
+
+    monkeypatch.setattr(JSONBackend, 'stamp_mark_index', refuse)
+    _build_index(agent_data.dir)
+    assert len(read) == IDLE_LEDGERS
+    monkeypatch.setattr(JSONBackend, 'stamp_mark_index', real_stamp)
+    read.clear()
+
+    _build_index(agent_data.dir)
+    assert len(read) == IDLE_LEDGERS
