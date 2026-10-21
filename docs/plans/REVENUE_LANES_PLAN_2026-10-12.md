@@ -28,6 +28,16 @@ by Qwen through the autogen fallback ladder that already exists
 (`core.autogen_config.with_local_fallback`), and payment steps (AP2 mandates,
 Stripe, PhonePe) never touch an LLM gate.
 
+**Where the table is not yet true (read 2026-10-14, task #156):** a paid API
+tier's turn is registered on the revenue lane but does not reach the expert
+today. The expert is offered through the speculative dispatcher, which /chat
+enters only for an agent-bound turn (`prompt_id` set) whose body asks for
+`speculative`; the metered self-POST is an agent-less conversation turn
+(`prompt_id` None, the conversation fix) and sends no `speculative`, so it
+runs `get_ans` on the node's configured model. The McGroce shopper's turn is
+agent-bound and does reach it. Until #156 lands, "Claude first" holds for the
+commerce lane and the earning goals, not for the paid API.
+
 ## Topology: central only, by configuration, never by tier branch
 
 The owner wants this routing on central only, and HARTOS stays topology
@@ -50,7 +60,7 @@ agnostic. Both hold because nothing in the code reads the node tier for it:
 | Lane decided for a /chat turn | `core/request_lane.py` (pure rule; `register_chat_lane` is /chat's one registration decision: the node's own daemon turn is left to the id's prefix rule and to `dispatch_goal`'s registration, everyone else is registered by what the request proves, replacing what the id held) | landed |
 | Lane decided for a daemon goal | `dispatch.is_revenue_goal_type`, registered in `dispatch_goal` | landed |
 | Lane crosses the worker thread, reaches the wire | `core.llm_outbound_logger` (`register_request_lane`, `current_lane`, `X-HARTOS-Lane`, `X-HARTOS-Model`, `X-HARTOS-Model-Family`), stamped on the local target AND on every hosted chat/completions call (Kong's `/llm/v1` path is a hosted call) | landed |
-| Paid tier marks its turn | `commercial_api._metered_backend_chat` body `lane` + a `request_id` of its own; trusted only from the node itself (its key, or the JWT it mints for its system identity when no key is set); /chat accepts the `X-API-Key` header the middleware accepts | landed |
+| Paid tier marks its turn | `commercial_api._metered_backend_chat` builds the self-POST with `chat_contract.chat_turn_request` for the key's OWNER (the customer's identity in the body and in the minted credential), with a `request_id` of its own and the node's lane word: in the body beside the node's key, and as the `lane` claim of the JWT minted for the customer on a keyless node (only the node's secret mints one; the claim is bound to the turn by the token's `rid` claim and the token lives five minutes, #157; `core.request_lane.lane_for_chat` believes the body word beside the key and the claim in the JWT, nothing else). /chat accepts the `X-API-Key` header the middleware accepts. Before task #153 the self-POST carried the system identity, so every paying customer on a keyless node ran as `system_daemon` in one shared session | landed (#153 local, unpushed) |
 | Kong fuse per lane; a fuse on user/daemon Claude calls | `integrations/gateway/kong_onboard.py --llm` (Kong 2.8.5 community: request caps only; the Claude route matches `X-HARTOS-Model-Family: claude`, one rule with the meter). Revenue-lane Claude has NO Kong fuse by design: its cap is the HARTOS day budget below | landed, apply on deepbox |
 | Provider fan-out, verbatim relay, real statuses | gpt3 `llm_gateway.py` (hertz-ai/GPT3 main 36ebae1) | landed, redeploy with start.sh |
 | Claude as the expert tier, offered to the revenue lane only, selectable only by the expert selectors | `model_registry` from `HEVOLVE_EXPERT_LLM_*` | landed |
@@ -85,16 +95,20 @@ or a mix with merchant and driver subscriptions.
    two keys the deploy check names, `OPENAI_BASE_URL` and
    `HEVOLVE_LOCAL_LLM_URL`, set to the SAME Kong URL. They are not repo
    secrets; left on gpt3 (`:5459`) the check passes while printing "SPLIT
-   across 2 endpoints" and those callers go around Kong's caps. Then set `HEVOLVE_API_KEY` (also a repo secret), AFTER the build carrying the /chat
-   `X-API-Key` fix is deployed (before it, a keyed central answered every
-   paid metered call with 401 inside /chat and the customer saw 503,
-   measured by the review of 7086adff8).  The key is not optional in
-   practice: without it the metered self-POST carries the node's system
-   JWT, /chat trusts the JWT over the body (correctly), and every paying
-   API customer's turn runs as `system_daemon`, one shared identity, session
-   and ledger (measured 2026-10-12; the same collapse the channel relays had
-   on 2026-08-06).  With the key, the body's customer id is kept and the lane
-   claim is trusted.
+   across 2 endpoints" and those callers go around Kong's caps. `HEVOLVE_API_KEY`
+   (also a repo secret) is optional for the paid API since task #153: the
+   metered self-POST is built for the key's owner (`chat_turn_request`), so
+   with or without the key the customer's own id is kept and the paid lane
+   is trusted (as the body's word beside the key, or as the claim of the
+   JWT the node mints for the customer). Before #153 the key was not
+   optional in practice: without it the self-POST carried the node's system
+   JWT, /chat trusted the JWT over the body (correctly), and every paying
+   API customer's turn ran as `system_daemon`, one shared identity, session
+   and ledger (measured 2026-10-12 and 2026-10-14; the same collapse the
+   channel relays had on 2026-08-06). If the key is set, set it AFTER the
+   build carrying the /chat `X-API-Key` fix is deployed (before it, a keyed
+   central answered every paid metered call with 401 inside /chat and the
+   customer saw 503, measured by the review of 7086adff8).
 
    Deferred, recorded here so they are not lost: (a) request ids minted per
    second collide (`core.chat_client.mint_request_id`); the metered endpoint

@@ -23,12 +23,11 @@ Delete an entry when the change that closes it lands.
 
 ### Needs another repository (cannot be done from HARTOS)
 
-1. **Nunba freeze list (CLAUDE.md Gate 6).**  Add the new modules to
-   `Nunba-HART-Companion/scripts/setup_freeze_nunba.py` `packages[]`:
-   `integrations.commerce` (`__init__`, `approvals`, `bindings`,
-   `commerce_api`, `commerce_tools`, `drafts`, `mcgroce_client`) and
-   `integrations.ap2.ap2_mandate`.  Without it the installed Nunba build hits
-   `ModuleNotFoundError` the first time a commerce or AP2-mandate import runs.
+1. **Nunba freeze list (CLAUDE.md Gate 6): closed, nothing to add.**
+   `integrations.commerce` and `integrations.ap2.ap2_mandate` ship with the
+   whole `integrations/` tree, and HARTOS modules never go in Nunba's
+   `packages[]` (see CLAUDE.md Gate 6).  Nunba's `setup_freeze_nunba.py`
+   records the same beside `packages[]`.
 2. **Possible duplicate card in bundled Nunba.**  `push_agent_ui` sends a
    card on the shell leg (`agent.ui.update`, which also reaches SSE) AND on
    the per-user leg (`chat.social`, SSE event `chat.social`).  Whether
@@ -62,11 +61,14 @@ Delete an entry when the change that closes it lands.
 8. **Merchant drafts are open to any signed-in user.**
    `commerce_onboard_merchant` has no merchant-role check (only the drafter
    can approve).  Decide: require a McGroce merchant binding, or rate-limit.
-9. **PhonePe return URLs for commerce.**  Commerce payments carry no
-   `redirect_url` / `callback_url` in metadata, so `PhonePePaymentGateway`
-   falls back to the hevolve.ai intelligence routes.  Add config pointing the
-   redirect back at the McGroce SPA.  The S2S callback already completes
-   commerce payments.
+9. **PhonePe return URLs for commerce.**  A commerce payment on PhonePe
+   carries this node's `redirect_url` / `callback_url` (stamped at mandate
+   creation from `HARTOS_PUBLIC_URL`, `ap2_protocol.own_gateway_urls`), and
+   the gateway refuses to start a payment when the node has no public
+   address, so nothing falls back to another host any more.  Still open: the
+   buyer's return page is the API root with `redirectMode: POST`, which
+   serves no POST `/` route; point the redirect at the McGroce SPA (task
+   #145).  The S2S callback already completes commerce payments.
 10. **Single-process state.**  Bindings, mandates and drafts are JSON files
     under `agent_data/` with an in-memory copy per process.  With more than
     one server worker the copies diverge.  Old records are never pruned.

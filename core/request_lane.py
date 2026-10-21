@@ -8,12 +8,24 @@ Two facts make a turn revenue-bearing, and /chat can verify both itself:
 
   1. The caller's JWT carries the commerce tenant claim (``tid``): a McGroce
      shopper or store owner whose token POST /api/commerce/session minted.
-  2. The body says ``lane: revenue`` AND the caller is the node itself: the
-     metered API endpoints' self-POST for a paying tier
-     (commercial_api._metered_backend_chat) arrives either with the node's
-     own key (``auth_source == 'api_key'``) or with the JWT the node mints
-     for its own system identity (dispatch._internal_auth_headers).  Nobody
-     else holds either.  The same word in any other body is just a word.
+  2. The node itself says ``lane: revenue`` for a paying tier's turn: the
+     metered API endpoints' self-POST (commercial_api._metered_backend_chat,
+     built for the key's owner by chat_contract.chat_turn_request).  The
+     node's word travels with the credential it sends, one carrier per
+     credential.  Beside its own key (``auth_source == 'api_key'``) it is
+     the body's ``lane`` field: a key is a header, no claim rides in it, so
+     the body is the only place for the word there.  In the JWT the node
+     mints for the CUSTOMER it is the token's ``lane`` claim, since only
+     the node's secret mints one (task #153: the relay used to carry the
+     system identity, so every paying customer ran as system_daemon), read
+     only when the token's ``rid`` claim names this request's id, and the
+     token lives minutes (security.jwt_manager.TURN_TOKEN_EXPIRY), so a
+     captured token buys nothing for a turn with another request id and
+     nothing at all for long (task #157).  The same word in any other body
+     is just a word, under anyone's JWT: the node's own system identity
+     included, since nothing mints a system JWT with a body lane (the rule
+     that believed one was a carrier with no producer, review of af5c75099,
+     and went with task #157).
 
 Everything else is a user turn.  The daemon lane is not decided here: the
 request id's ``daemon_`` prefix decides it on the wire
@@ -36,6 +48,16 @@ request id's ``daemon_`` prefix decides it on the wire
     what the id held.  That is what stops a stranger from inheriting a
     goal's revenue lane by naming its request id.
 
+A turn that keeps to this node (``local_only``) is the third input.  /chat
+decides it from ONE rule (the person's own local_only toggle, or the goal
+tags of the turn's agent, e.g. a Reel Studio agent, decision U4) and passes
+it here; it is never a second decision beside this module (amendment A9 e,
+ruled with the lanes lane 2026-10-13).  Such a turn never runs on, and is
+never left on, the revenue lane, the one lane the configured expert is
+offered to.  ``chat_turn_models`` is the other half of the same decision:
+the model tier and speculation the turn's body asks for, refused for a turn
+that keeps to this node.  /chat sets neither itself.
+
 Pure: the JWT decoder, the tenant name, the system identities and the
 genuine-user rule are passed in by the caller (hart_intelligence_entry's
 /chat), so core imports nothing from integrations and the rule is testable
@@ -43,7 +65,7 @@ without the app.  The lane names are the ones core.llm_outbound_logger stamps
 on the wire.
 """
 from core.llm_outbound_logger import (
-    LANE_REVENUE, LANE_USER, lane_for_request, register_request_lane,
+    LANE_DAEMON, LANE_REVENUE, LANE_USER, lane_for_request, register_request_lane,
 )
 
 #: auth_source values that mean "no credential was presented": the desktop's
@@ -74,24 +96,46 @@ def is_internal_caller(auth_source, jwt_payload, system_identities=()):
 
 
 def lane_for_chat(bearer_token, body, auth_source, decode_jwt=None, tenant=None,
-                  system_identities=(), jwt_payload=None):
+                  jwt_payload=None, request_id=None):
     # type: (...) -> str
-    """'revenue' or 'user' for one /chat request; never raises."""
+    """'revenue' or 'user' for one /chat request; never raises.
+    ``request_id`` is the request's own id: the node's lane claim in a JWT
+    is believed only when the token's ``rid`` claim names it, so a request
+    with no id is never bought the lane by a claim."""
     payload = jwt_payload if isinstance(jwt_payload, dict) else _payload(bearer_token, decode_jwt)
     if tenant and payload.get('tid') == tenant:
         return LANE_REVENUE
-    if (isinstance(body, dict) and body.get('lane') == LANE_REVENUE
-            and is_internal_caller(auth_source, payload, system_identities)):
+    # The node's word as the claim of a JWT it minted for ONE person's turn
+    # (chat_turn_request -> _internal_auth_headers(lane=..., rid=...)):
+    # nobody else can sign one, it holds for the request id it names only,
+    # and the token itself lives minutes (security.jwt_manager
+    # .TURN_TOKEN_EXPIRY).
+    if (payload.get('lane') == LANE_REVENUE and request_id
+            and str(payload.get('rid') or '') == str(request_id)):
+        return LANE_REVENUE
+    # The node's word in the body beside its own key: a header carries no
+    # claim, so the body is the word's only carrier there, and the key is
+    # the only credential it is believed beside.  A JWT carries the word as
+    # its claim or not at all, the node's own system identity included.
+    if auth_source == 'api_key' and isinstance(body, dict) and body.get('lane') == LANE_REVENUE:
         return LANE_REVENUE
     return LANE_USER
 
 
 def register_chat_lane(request_id, bearer_token, body, auth_source, decode_jwt=None,
-                       tenant=None, system_identities=(), is_genuine=None):
+                       tenant=None, system_identities=(), is_genuine=None,
+                       local_only=False):
     # type: (...) -> object
     """/chat's one registration decision.  Returns the lane the turn runs on
     when this call decided or confirmed it, or None when the turn is left to
-    the prefix rule and to earlier registrations."""
+    the prefix rule and to earlier registrations.
+
+    ``local_only``: the turn keeps to this node.  Wherever the answer would
+    be revenue (what the request proves, or what the id already holds), the
+    turn is registered on its own lane instead, replacing the revenue
+    registration: 'daemon' for the node's own daemon turn, 'user' for anyone
+    else's.  Every other answer is unchanged, and False (the default) changes
+    nothing."""
     payload = _payload(bearer_token, decode_jwt)
     internal = is_internal_caller(auth_source, payload, system_identities)
     credentialless = auth_source in CREDENTIALLESS_AUTH
@@ -102,12 +146,36 @@ def register_chat_lane(request_id, bearer_token, body, auth_source, decode_jwt=N
         except Exception:
             genuine = True
     if not genuine and (internal or credentialless):
-        return None                                   # the node's own daemon turn
+        # The node's own daemon turn.
+        if local_only and lane_for_request(request_id) == LANE_REVENUE:
+            register_request_lane(request_id, LANE_DAEMON)
+            return LANE_DAEMON
+        return None
     claim = body.get('lane') if isinstance(body, dict) else None
     if internal and not claim:
-        return lane_for_request(request_id) or None   # the node's own inner call
+        # The node's own inner call.
+        lane = lane_for_request(request_id) or None
+        if local_only and lane == LANE_REVENUE:
+            register_request_lane(request_id, LANE_USER)
+            return LANE_USER
+        return lane
     lane = lane_for_chat(bearer_token, body, auth_source, decode_jwt=decode_jwt,
-                         tenant=tenant, system_identities=system_identities,
-                         jwt_payload=payload)
+                         tenant=tenant, jwt_payload=payload, request_id=request_id)
+    if local_only and lane == LANE_REVENUE:
+        lane = LANE_USER
     register_request_lane(request_id, lane)
     return lane
+
+
+def chat_turn_models(body, local_only=False):
+    # type: (object, bool) -> tuple
+    """``(model_config, speculative)`` for one /chat turn: the model tier its
+    body names for the turn's autogen agents (the speculative dispatcher's
+    expert reroute and dispatch.py send one) and whether to hand the turn to
+    the speculative dispatcher's background expert.  A turn that keeps to
+    this node (``local_only``) gets neither: ``(None, False)``.  Otherwise
+    the body's own values, as /chat read them before (absent: None, False).
+    Never raises."""
+    if local_only or not isinstance(body, dict):
+        return None, False
+    return body.get('model_config', None), body.get('speculative', False)

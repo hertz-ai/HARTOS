@@ -162,6 +162,10 @@ HART_IDENTITY_DESIGN.md
 
 # npm deps inside vendored channel adapters
 integrations/channels/*/node_modules/
+# Reel Studio's Remotion project is set up at runtime in the models dir
+# (amendment A16); a developer's install or bundle in place is never tracked.
+integrations/reel_studio/motion/project/node_modules/
+integrations/reel_studio/motion/project/bundle/
 
 # Runtime trading + capture logs
 integrations/trading/paper_trades.jsonl

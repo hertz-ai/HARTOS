@@ -99,6 +99,93 @@ def test_tier_upgrade_path_is_unchanged(ctx):
     assert ctx['ledger'].get_payment(p.payment_id).status == PaymentStatus.FAILED
 
 
+from tests.unit.commercial_db import key_db, tier_tuple as _tier  # noqa: E402,F401  (key_db is a fixture)
+
+
+def test_a_tier_upgrade_callback_bumps_the_key(ctx, key_db):
+    p = _processing(ctx['ledger'], {'kind': 'tier_upgrade', 'api_key_id': 'k1',
+                                    'target_tier': 'starter'})
+    r = _callback(ctx['client'])
+    assert r.status_code == 200, r.get_json()
+    assert r.get_json()['status'] == 'completed' and r.get_json()['new_tier'] == 'starter'
+    assert key_db.key() == _tier('starter')
+    assert ctx['ledger'].get_payment(p.payment_id).status == PaymentStatus.COMPLETED
+
+
+def test_a_tier_bump_that_fails_is_retried_by_phonepe(ctx, key_db):
+    """Money confirmed and the tier write failed: the payment stays
+    PROCESSING and PhonePe is answered a 500, so its retry runs the status
+    check and the bump again and finishes it; the ERROR line names the
+    payment.  It used to answer 200 completed and mark the payment
+    COMPLETED, so the retry was told already_completed and no success page
+    ever re-applied the tier (the review of ec0dbe7be, finding 6)."""
+    import logging
+    p = _processing(ctx['ledger'], {'kind': 'tier_upgrade', 'api_key_id': 'k1',
+                                    'target_tier': 'starter'})
+    key_db.fail_next_commit()
+    log = logging.getLogger('hevolve_social')
+    with patch.object(log, 'error') as said:
+        r = _callback(ctx['client'])
+    assert r.status_code == 500, r.get_json()
+    assert r.get_json()['success'] is False and r.get_json()['status'] == 'bump_failed'
+    assert said.call_count == 1 and p.payment_id in said.call_args.args[0]
+    # This rail's own retry sentence: PhonePe delivers the callback again,
+    # the buyer's return page does not bump (the review of 7c8431c2e).
+    line = said.call_args.args[0]
+    assert 'if this repeats' in line and 'PhonePe delivers this callback again' in line
+    assert 'return page bumps nothing' in line
+    assert ctx['ledger'].get_payment(p.payment_id).status == PaymentStatus.PROCESSING
+    assert key_db.key() == _tier('free')
+    r2 = _callback(ctx['client'])                  # PhonePe's retry
+    assert r2.status_code == 200 and r2.get_json()['status'] == 'completed'
+    assert ctx['ledger'].get_payment(p.payment_id).status == PaymentStatus.COMPLETED
+    assert key_db.key() == _tier('starter')
+
+
+def test_a_tier_bump_that_raises_is_one_record_and_the_payment_waits(ctx, key_db):
+    """The database itself fails inside the bump (get_db raises: a lost
+    connection, a locked file): the payment stays PROCESSING, PhonePe is
+    answered 500 with status bump_failed, and the failure is ONE ERROR
+    record carrying the traceback and naming the payment; it used to be
+    logger.exception plus the reconciliation line, two records for one
+    failure (the review of 7c8431c2e)."""
+    import logging
+    p = _processing(ctx['ledger'], {'kind': 'tier_upgrade', 'api_key_id': 'k1',
+                                    'target_tier': 'starter'})
+    log = logging.getLogger('hevolve_social')
+    boom = RuntimeError('database is locked')
+    with patch('integrations.social.models.get_db', side_effect=boom), \
+            patch.object(log, 'error') as said, patch.object(log, 'exception') as traced:
+        r = _callback(ctx['client'])
+    assert r.status_code == 500, r.get_json()
+    body = r.get_json()
+    assert body['success'] is False and body['status'] == 'bump_failed'
+    assert body['payment_request_id'] == p.payment_id
+    traced.assert_not_called()
+    assert said.call_count == 1
+    line = said.call_args.args[0]
+    assert p.payment_id in line and 'database is locked' in line
+    assert said.call_args.kwargs.get('exc_info') is boom
+    assert ctx['ledger'].get_payment(p.payment_id).status == PaymentStatus.PROCESSING
+    assert key_db.key() == _tier('free')
+
+
+def test_a_tier_upgrade_callback_never_lowers_the_key(ctx, key_db):
+    """The PhonePe rail writes the tier through the same rule as the card
+    rails: a confirmed payment for a cheaper tier completes (the money is
+    taken) and leaves the key where it is.  This callback bumped with no
+    guard, where the Stripe finalizer refused the downgrade (the review of
+    fd2b4773c: the policy differed per rail)."""
+    key_db.put_key_on('pro')
+    p = _processing(ctx['ledger'], {'kind': 'tier_upgrade', 'api_key_id': 'k1',
+                                    'target_tier': 'starter'})
+    r = _callback(ctx['client'])
+    assert r.status_code == 200, r.get_json()
+    assert r.get_json()['status'] == 'completed'
+    assert key_db.key() == _tier('pro')
+    assert ctx['ledger'].get_payment(p.payment_id).status == PaymentStatus.COMPLETED
+
+
 def test_bad_signature_changes_nothing(ctx):
     p = _processing(ctx['ledger'], {'kind': 'commerce_checkout'})
     assert _callback(ctx['client'], sig='bad').status_code == 401
@@ -170,6 +257,28 @@ def test_the_right_amount_completes(ctx):
     _set_capture(ctx, lambda *a: {'success': True, 'status': 'captured',
                                   'gateway_response': {'data': {'amount': 24000}}})
     assert _callback(ctx['client']).get_json()['status'] == 'completed'
+    assert ctx['ledger'].get_payment(p.payment_id).status == PaymentStatus.COMPLETED
+
+
+def test_the_captured_amount_is_checked_against_what_was_sent(ctx):
+    """A USD payment minted at 84 INR/USD and confirmed after the operator
+    moved the rate to 90: PhonePe captured the 75600 paise it was asked
+    for, and the callback compares with that recorded amount, not with a
+    recomputation (81000) that marked the capture 'amount mismatch' and
+    FAILED after the money was taken (the review of f08ff3e4c)."""
+    gw = ctx['ledger'].gateways[PaymentGateway.PHONEPE]
+    gw.usd_inr_rate = 84.0
+    p = ctx['ledger'].create_payment_request(
+        amount=Decimal('9.00'), currency='USD', description='starter',
+        requester_agent_id='user:u', gateway=PaymentGateway.PHONEPE,
+        metadata={'phonepe_amount_paise': 75600})     # as create_payment records it
+    p.status = PaymentStatus.PROCESSING
+    p.gateway_transaction_id = 'hartos_txn_1'
+    gw.usd_inr_rate = 90.0
+    _set_capture(ctx, lambda *a: {'success': True, 'status': 'captured',
+                                  'gateway_response': {'data': {'amount': 75600}}})
+    r = _callback(ctx['client'])
+    assert r.get_json()['status'] == 'completed', r.get_json()
     assert ctx['ledger'].get_payment(p.payment_id).status == PaymentStatus.COMPLETED
 
 

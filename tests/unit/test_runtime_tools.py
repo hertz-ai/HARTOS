@@ -388,6 +388,27 @@ class TestRuntimeToolManager:
             state = json.loads(test_state_file.read_text())
             assert 'tools' in state
 
+    def test_a_state_file_that_cannot_be_saved_never_fails_a_setup(self, rtm, tmp_path,
+                                                                     monkeypatch):
+        """Amendment A24b ii: setup_tool never raises for an npm row.  Its
+        last step is save_state, a hint for the next start; when the state
+        file's folder cannot be made (a file stands where it goes), the
+        finished setup is still answered, not an exception."""
+        import importlib
+        runtime_manager = importlib.import_module('integrations.service_tools.runtime_manager')
+        blocker = tmp_path / 'not_a_folder'
+        blocker.write_text('a file where the state folder goes')
+        monkeypatch.setattr(runtime_manager, 'STATE_FILE', blocker / 'tool_state.json')
+        monkeypatch.setitem(runtime_manager.TOOL_CONFIGS, 'demo_on_demand', {
+            'download_type': 'npm', 'npm_project': str(tmp_path / 'project'),
+            'on_demand': True, 'catalog_id': None})
+        monkeypatch.setattr(rtm.storage, 'install_npm_project',
+                            lambda tool, project, **kw: rtm.storage.get_tool_dir(tool))
+        result = rtm.setup_tool('demo_on_demand')
+        assert result.get('ready') is True and 'error' not in result, result
+        rtm.save_state()        # stop_tool, start_tool and stop_all at exit call it too
+        assert blocker.read_text() == 'a file where the state folder goes'
+
     def test_stop_all(self, rtm):
         """stop_all runs without error even with no running tools."""
         rtm.stop_all()

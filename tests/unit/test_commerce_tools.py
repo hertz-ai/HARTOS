@@ -2,10 +2,15 @@
 
 Real McGroceClient, bindings, PaymentLedger, MandateStore and DraftStore on
 tmp paths.  Mocked boundaries only: core.http_pool.pooled_request (McGroce)
-and the LiquidUIService from core.platform.registry (the UI push).
+and the LiquidUIService from core.platform.registry (the UI push).  The
+ledger carries a live synchronous card rail (tests/unit/ap2_doubles.py
+CardRailDouble, Stripe's shape), so the checkout tests run as a node with
+gateway keys; the node WITHOUT one, where select_gateway answers MOCK, is
+TestNoLiveGateway.
 """
 import inspect
 import json
+import logging
 import time
 from unittest.mock import MagicMock, patch
 
@@ -13,6 +18,7 @@ import pytest
 
 from core.circuit_breaker import CircuitBreaker
 from integrations.ap2 import ap2_protocol
+from tests.unit.ap2_doubles import CardRailDouble
 from integrations.ap2.ap2_mandate import MandateStore
 from integrations.ap2.ap2_protocol import PaymentLedger, PaymentStatus
 from integrations.commerce import commerce_tools as ct
@@ -78,6 +84,8 @@ def env(tmp_path):
                            admin_key='k', bindings=bindings,
                            breaker=CircuitBreaker('t'))
     ledger = PaymentLedger(ledger_path=str(tmp_path / 'ledger.json'))
+    card = CardRailDouble()
+    ledger.add_gateway(card)
     mandates = MandateStore(str(tmp_path / 'mandates.json'), ledger=ledger,
                             key=b'k' * 32)
     drafts = DraftStore(str(tmp_path / 'drafts.json'))
@@ -91,7 +99,7 @@ def env(tmp_path):
             patch('core.http_pool.pooled_request', side_effect=fake), \
             patch('integrations.agent_engine.liquid_ui_service.push_agent_ui', ui):
         yield {'fake': fake, 'ui': ui, 'ledger': ledger, 'mandates': mandates,
-               'drafts': drafts, 'bindings': bindings}
+               'drafts': drafts, 'bindings': bindings, 'card': card}
 
 
 def pushed(env, type_=None):
@@ -471,3 +479,93 @@ class TestRedirectGatewayCheckout:
         ct.commerce_checkout(UID, out['mandate_id'])
         res = ct.complete_redirect_checkout(out['payment_id'])
         assert res == {'success': False, 'error': 'payment is not completed'}
+
+
+class TestNoLiveGateway:
+    """A node with no gateway keys cannot take money.  select_gateway then
+    answers MOCK, and before this the mock captured anything: the cart was
+    marked paid and the McGroce order placed with nothing taken (read at
+    903cd58c0 by claude-autostart-93, 2026-10-14).  Dev mode is the one
+    exemption (security.master_key.is_dev_mode), the same rule the paid-tier
+    upgrade route reads (ap2_protocol.mock_settlement_allowed)."""
+
+    def _mock_only(self, env):
+        env['ledger'].gateways.pop(ap2_protocol.PaymentGateway.STRIPE)
+        env['fake'].on('GET', '/cart', body=ORDER)
+        env['fake'].on('POST', '/cart/checkout/payment', body={'id': 1})
+        env['fake'].on('POST', '/cart/checkout',
+                       body={'orderNumber': 'ORD-X', 'status': 'SUBMITTED'})
+
+    def _mandate_on_the_mock(self, env):
+        # Created around the prepare-time refusal (an older build, keys
+        # removed after the approval): the settler must be the gate itself.
+        m = env['mandates'].create_cart_mandate(
+            UID, ct.MERCHANT, ct.mandate_cart(ct.cart_view(ORDER)),
+            kind=ct.CHECKOUT_KIND, requester_agent_id=ct._AGENT_ID)
+        assert env['ledger'].get_payment(m.payment_id).gateway == ap2_protocol.PaymentGateway.MOCK
+        return m
+
+    @staticmethod
+    def _warnings(caplog):
+        """The operator's WARNINGs on the one refusal logger."""
+        return [r.getMessage() for r in caplog.records
+                if r.name == 'integrations.ap2.ap2_protocol' and r.levelno == logging.WARNING]
+
+    def test_prepare_refuses_before_any_approval_is_asked(self, env, caplog):
+        self._mock_only(env)
+        with caplog.at_level(logging.WARNING, logger='integrations.ap2.ap2_protocol'):
+            out = json.loads(ct.commerce_prepare_checkout(UID))
+        assert out['success'] is False and 'cannot take payments' in out['error']
+        assert pushed(env, 'approval') == [] and pushed(env, 'checkout') == []
+        assert env['ledger'].payments == {}
+        warned = self._warnings(caplog)
+        assert len(warned) == 1 and 'STRIPE_API_KEY' in warned[0] and '=' not in warned[0]
+        assert 'STRIPE_API_KEY' not in out['error']       # the shopper reads no setting
+
+    def test_settle_refuses_a_mock_payment_and_cancels_it(self, env, caplog):
+        self._mock_only(env)
+        m = self._mandate_on_the_mock(env)
+        env['mandates'].approve(m.mandate_id, UID)
+        with caplog.at_level(logging.WARNING, logger='integrations.ap2.ap2_protocol'):
+            res = json.loads(ct.commerce_checkout(UID, m.mandate_id))
+        assert res['success'] is False and 'cannot take payments' in res['error']
+        assert not env['fake'].called('POST', '/cart/checkout/payment')
+        assert not env['fake'].called('POST', '/cart/checkout')
+        assert env['mandates'].get(m.mandate_id).status == 'rejected'
+        assert env['ledger'].get_payment(m.payment_id).status == PaymentStatus.CANCELLED
+        assert pushed(env, 'notification')[-1]['title'] == 'Payment not available'
+        assert pushed(env, 'payment_status') == []
+        warned = self._warnings(caplog)
+        assert len(warned) == 1 and 'STRIPE_API_KEY' in warned[0] and m.payment_id in warned[0]
+
+    def test_the_shoppers_approval_is_refused_the_same_way(self, env):
+        from integrations.ap2.ap2_mandate import decide_payment
+        self._mock_only(env)
+        m = self._mandate_on_the_mock(env)
+        payload, code = decide_payment(m.payment_id, UID, True, store=env['mandates'])
+        assert code == 200 and payload['result']['success'] is False
+        assert 'cannot take payments' in payload['result']['error']
+        assert env['ledger'].get_payment(m.payment_id).status == PaymentStatus.CANCELLED
+        assert not env['fake'].called('POST', '/cart/checkout')
+
+    def test_dev_mode_node_still_settles_through_the_mock(self, env, monkeypatch):
+        from security import master_key
+        self._mock_only(env)
+        monkeypatch.setattr(master_key, 'is_dev_mode', lambda: True)
+        out = json.loads(ct.commerce_prepare_checkout(UID))
+        assert out['status'] == 'awaiting_approval'
+        env['mandates'].approve(out['mandate_id'], UID)
+        res = json.loads(ct.commerce_checkout(UID, out['mandate_id']))
+        assert res['success'] is True and res['order_id'] == 'ORD-X'
+        assert env['ledger'].get_payment(out['payment_id']).gateway == ap2_protocol.PaymentGateway.MOCK
+
+    def test_a_live_rail_is_untouched_by_the_rule(self, env):
+        env['fake'].on('GET', '/cart', body=ORDER)
+        env['fake'].on('POST', '/cart/checkout/payment', body={'id': 1})
+        env['fake'].on('POST', '/cart/checkout',
+                       body={'orderNumber': 'ORD-Y', 'status': 'SUBMITTED'})
+        out = json.loads(ct.commerce_prepare_checkout(UID))
+        env['mandates'].approve(out['mandate_id'], UID)
+        res = json.loads(ct.commerce_checkout(UID, out['mandate_id']))
+        assert res['success'] is True and res['order_id'] == 'ORD-Y'
+        assert env['card'].captures == [(out['payment_id'], f"card_{out['payment_id']}")]

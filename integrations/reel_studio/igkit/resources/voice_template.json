@@ -1,0 +1,39 @@
+{
+  "version": "1.0",
+  "source": "Derived from instagram-agent-skill @d03c56b templates/voice.md (MIT License, Copyright (c) 2026 Jake Schincariol; see ../LICENSE.txt).",
+  "modified": [
+    "The free-text voice.md became typed fields with limits, read and written only by integrations.reel_studio.voice_profile.",
+    "Added what a bridal makeup artist in India needs: city, price band, caption language and code-mix, hashtag bank, emoji she uses, booking contact, brands, logo and logo corner.",
+    "choices_from names a tuple in integrations.reel_studio.contracts, so the allowed values have one source.",
+    "A label or help that states the reel hashtag cap writes {reel_hashtag_limit}; voice_profile fills it with the human-voice guide's REEL_HASHTAG_LIMIT, so the number has one source.",
+    "Field order is the order voice_brief() lists them; brief=false keeps a field out of the brief.",
+    "An emoji item is one emoji as igkit.EMOJI_RE reads it; item_max_len 16 code points fits a kiss or a couple with two skin tones (10)."
+  ],
+  "fields": {
+    "name": {"type": "text", "max_len": 60, "label": "Name", "help": "Her name or studio name, as clients know it."},
+    "city": {"type": "text", "max_len": 60, "label": "City", "help": "Where she works, e.g. Madurai."},
+    "services": {"type": "text", "max_len": 200, "label": "What she does", "help": "One sentence, e.g. bridal and reception makeup, saree draping."},
+    "audience": {"type": "text", "max_len": 200, "label": "Who she talks to", "help": "Be specific, e.g. brides in Madurai planning a December muhurtham."},
+    "caption_language": {"type": "choice", "choices_from": "STYLE_LANGUAGES", "label": "Caption language", "help": "ta, hi, pa or en."},
+    "code_mix": {"type": "bool", "label": "Mixes English words into captions", "help": "yes or no."},
+    "tone": {"type": "text", "max_len": 120, "label": "Tone", "help": "How she sounds, e.g. warm and chatty, calm, funny."},
+    "words_used": {"type": "list", "max_items": 20, "item_max_len": 40, "label": "Words she uses", "help": "Words and phrases she really says; the humanizer keeps them."},
+    "words_never": {"type": "list", "max_items": 20, "item_max_len": 40, "label": "Never write", "help": "Words she would never say."},
+    "emoji": {"type": "emoji", "max_items": 12, "item_max_len": 16, "label": "Emoji she uses", "help": "Each emoji she uses, side by side or separated by spaces or commas; the humanizer does not flag these."},
+    "hashtag_bank": {"type": "hashtags", "max_items": 15, "item_max_len": 40, "label": "Hashtag bank (up to {reel_hashtag_limit} per reel)", "help": "About 15 specific tags, separated by commas or spaces; each reel caption uses up to {reel_hashtag_limit} of them."},
+    "search_terms": {"type": "list", "max_items": 5, "item_max_len": 60, "label": "Search terms", "help": "What brides type into search, e.g. bridal makeup artist Madurai."},
+    "cta": {"type": "text", "max_len": 120, "label": "Her ask", "help": "The one ask at the end, e.g. DM for bookings."},
+    "contact": {"type": "choice", "choices": ["dm", "whatsapp", "dm_and_whatsapp"], "label": "Bookings by", "help": "dm, whatsapp or dm_and_whatsapp."},
+    "price_band": {"type": "text", "max_len": 80, "label": "Price band", "help": "Only if she shares it publicly, e.g. bridal from Rs 15k."},
+    "brands": {"type": "list", "max_items": 15, "item_max_len": 40, "label": "Brands she uses", "help": "e.g. Kryolan, MAC, Huda."},
+    "proof": {"type": "list", "split": "lines", "max_items": 10, "item_max_len": 160, "label": "Proof she can use (never invent more)", "help": "Real numbers and outcomes she is happy to post, one per line."},
+    "off_limits": {"type": "list", "split": "lines", "max_items": 10, "item_max_len": 160, "label": "Off limits", "help": "Topics, clients or claims she does not post, one per line."},
+    "style_notes": {"type": "text", "max_len": 400, "label": "Style notes", "help": "Anything else about her look and edits, e.g. soft glam, no heavy contour."},
+    "wpm": {"type": "int", "min": 80, "max": 260, "label": "Speaking rate (words per minute)", "help": "For voice-over timing; most people speak 150-200."},
+    "handle": {"type": "text", "max_len": 31, "label": "Instagram handle", "help": "e.g. @meena.mua"},
+    "logo_corner": {"type": "choice", "choices_from": "LOGO_CORNERS", "label": "Logo corner", "help": "top_left, top_right or bottom_left."},
+    "logo_xid": {"type": "xid", "brief": false, "label": "Logo file", "help": "Store id of her logo image; set by the reel tools."},
+    "motion_overlays": {"type": "list", "choices_from": "MOTION_TEMPLATES", "max_items": 4, "item_max_len": 20, "brief": false, "label": "Animated overlays", "help": "Any of title, logo_sting, end_card, wipe, comma-separated; every reel gets them. reel_motion sets it."},
+    "sample_captions": {"type": "list", "split": "none", "multiline": true, "max_items": 3, "item_max_len": 600, "brief": false, "label": "Sample captions", "help": "Up to three of her own past captions, to match her voice."}
+  }
+}

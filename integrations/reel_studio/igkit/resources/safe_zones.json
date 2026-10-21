@@ -1,0 +1,19 @@
+{
+  "version": "1.0",
+  "source": "Derived from instagram-agent-skill @d03c56b skills/ig-reel/SKILL.md (On-screen text is a separate script) and skills/ig-story/SKILL.md (Rules) (MIT License, Copyright (c) 2026 Jake Schincariol; see ../LICENSE.txt).",
+  "modified": [
+    "The reel safe zone is not repeated here: integrations.reel_studio.contracts.SAFE_ZONE is the one copy, used by the planner, the renderer and QA.",
+    "text_card.max_words is read by igkit.hooks (score_hooks reports card_ok)."
+  ],
+  "text_card": {
+    "max_words": 6,
+    "why": "An on-screen card is read at arm's length by someone who is not listening yet: six words or fewer, up at the first frame."
+  },
+  "story": {
+    "x_min": 0,
+    "x_max": 1080,
+    "y_min": 250,
+    "y_max": 1600,
+    "why": "On a 1080x1920 story nothing above y=250 or below y=1600: the profile row sits on top and the reply bar underneath. Stories are not made in V1."
+  }
+}

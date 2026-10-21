@@ -927,6 +927,9 @@ def detect_language(text: str) -> str:
     arabic = sum(1 for c in sample if '\u0600' <= c <= '\u06FF')
     cyrillic = sum(1 for c in sample if '\u0400' <= c <= '\u04FF')
     bengali = sum(1 for c in sample if '\u0980' <= c <= '\u09FF')
+    # Gurmukhi (Punjabi): without it Punjabi text read as 'en' and was
+    # spoken by an English voice, though 'pa' has its own engine ladder.
+    gurmukhi = sum(1 for c in sample if '\u0A00' <= c <= '\u0A7F')
     gujarati = sum(1 for c in sample if '\u0A80' <= c <= '\u0AFF')
     kannada = sum(1 for c in sample if '\u0C80' <= c <= '\u0CFF')
     malayalam = sum(1 for c in sample if '\u0D00' <= c <= '\u0D7F')
@@ -940,6 +943,8 @@ def detect_language(text: str) -> str:
         return 'te'
     if bengali > threshold:
         return 'bn'
+    if gurmukhi > threshold:
+        return 'pa'
     if gujarati > threshold:
         return 'gu'
     if kannada > threshold:

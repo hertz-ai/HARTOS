@@ -1,9 +1,12 @@
 """Behavioural tests for integrations/ap2/ap2_mandate.py.
 
-A real PaymentLedger (isolated tmp path, Mock gateway) sits behind a real
-MandateStore; nothing is mocked except time where expiry is under test.
+A real PaymentLedger (isolated tmp path) with a live card-rail double
+(tests/unit/ap2_doubles.py) sits behind a real MandateStore; nothing is
+mocked except time where expiry is under test, and the UI push in
+TestDecidePayment.  The Mock gateway alone is the no-payment-keys case.
 """
 import json
+import logging
 from unittest.mock import patch
 
 import pytest
@@ -11,7 +14,8 @@ import pytest
 from integrations.ap2.ap2_mandate import (
     MandateError, MandateStore, canonical_cart_hash,
 )
-from integrations.ap2.ap2_protocol import PaymentLedger, PaymentStatus
+from integrations.ap2.ap2_protocol import PaymentGateway, PaymentLedger, PaymentStatus
+from tests.unit.ap2_doubles import CardRailDouble
 
 CART = {
     'lines': [{'sku_id': 11, 'qty': 2, 'unit_price': 40},
@@ -23,7 +27,12 @@ CART = {
 
 @pytest.fixture
 def store(tmp_path):
+    # A keyed node: the card rail is registered, so a mandate settles for
+    # real money.  The node WITHOUT one (select_gateway answers MOCK, and a
+    # Mock payment settles nothing for a person since abb2dcfaf) is the
+    # TestDecidePayment mock-only tests, which pop it again.
     ledger = PaymentLedger(ledger_path=str(tmp_path / 'ledger.json'))
+    ledger.add_gateway(CardRailDouble())
     return MandateStore(path=str(tmp_path / 'ap2_mandates.json'),
                         ledger=ledger, key=b'k' * 32)
 
@@ -67,20 +76,53 @@ class TestCreate:
         raw = json.load(open(store.path))
         assert raw['mandates'][m.mandate_id]['cart_hash'] == m.cart_hash
 
+    def _with_phonepe(self, store):
+        """An INR mandate settles on PhonePe when the gateway is registered
+        (PaymentLedger.select_gateway); the redirect URLs are stamped for it."""
+        from integrations.ap2.ap2_protocol import PaymentGateway, PhonePePaymentGateway
+        gw = PhonePePaymentGateway(merchant_id='M', salt_key='S', salt_index='1', env='UAT')
+        gw.connect()
+        store.ledger.gateways[PaymentGateway.PHONEPE] = gw
+
     def test_payment_metadata_carries_this_nodes_gateway_urls(
             self, store, monkeypatch):
         monkeypatch.setenv('HARTOS_PUBLIC_URL', 'https://node7.example/')
+        self._with_phonepe(store)
         m = store.create_cart_mandate('u1', 'mcgroce', CART)
         meta = store.ledger.get_payment(m.payment_id).metadata
         assert meta['callback_url'] == (
             'https://node7.example/api/v1/intelligence/phonepe/callback')
+        assert meta['refund_callback_url'] == (
+            'https://node7.example/api/v1/intelligence/phonepe/refund-callback')
         assert meta['redirect_url'].startswith('https://node7.example')
 
-    def test_no_public_base_leaves_the_gateway_default(self, store, monkeypatch):
+    def test_no_public_base_stamps_no_urls(self, store, monkeypatch):
+        """Nothing guessed into the payment: the gateway resolves this node's
+        URLs again when it mints the checkout, and refuses without them."""
         monkeypatch.delenv('HARTOS_PUBLIC_URL', raising=False)
+        self._with_phonepe(store)
         m = store.create_cart_mandate('u1', 'mcgroce', CART)
         meta = store.ledger.get_payment(m.payment_id).metadata
-        assert 'callback_url' not in meta
+        assert 'callback_url' not in meta and 'redirect_url' not in meta
+
+    def test_a_synchronous_gateway_mandate_looks_up_no_urls_and_warns_nothing(
+            self, store, monkeypatch, caplog):
+        """Only a redirect gateway needs the return and callback URLs; a
+        mandate on the dev mock (or Stripe) stamps none and logs no
+        'no public address' warning (the review of af987a962: every mandate
+        and refund used to warn)."""
+        import logging
+        monkeypatch.delenv('HARTOS_PUBLIC_URL', raising=False)
+        with caplog.at_level(logging.WARNING, logger='integrations.ap2.ap2_protocol'):
+            m = store.create_cart_mandate('u1', 'mcgroce', CART)
+        meta = store.ledger.get_payment(m.payment_id).metadata
+        assert 'callback_url' not in meta and 'redirect_url' not in meta
+        # Any warning from the gateway module, whatever its wording (the
+        # review of f08ff3e4c: a check on the words passed on the parent).
+        gateway_warnings = [r for r in caplog.records
+                            if r.name == 'integrations.ap2.ap2_protocol'
+                            and r.levelno >= logging.WARNING]
+        assert gateway_warnings == [], gateway_warnings
 
     def test_over_cap_is_refused(self, store):
         with pytest.raises(MandateError, match='over the cap'):
@@ -208,6 +250,95 @@ class TestDecidePayment:
         assert store.get(m.mandate_id).status == 'consumed'
         assert self.push.call_args.args[1]['type'] == 'payment_status'
         assert self.push.call_args.kwargs['user_id'] == 'u1'
+
+    def test_a_node_with_no_payment_keys_refuses_and_cancels_a_generic_mandate(self, store, caplog):
+        # Any agent's request_payment creates such a mandate; with no gateway
+        # keys select_gateway answers MOCK, and before this the mock "paid" it
+        # (review of abb2dcfaf, measured): completed, consumed, card shown,
+        # nothing taken.  The generic settler now reads the one rule.
+        from integrations.ap2.ap2_mandate import decide_payment
+        store.ledger.gateways.pop(PaymentGateway.STRIPE)
+        m = store.create_cart_mandate('u1', 'shop', CART)
+        assert store.ledger.get_payment(m.payment_id).gateway == PaymentGateway.MOCK
+        with caplog.at_level(logging.WARNING, logger='integrations.ap2.ap2_protocol'):
+            payload, code = decide_payment(m.payment_id, 'u1', True, store=store)
+        assert code == 200 and payload['result']['success'] is False
+        assert 'no live payment gateway' in payload['result']['error']
+        assert store.ledger.get_payment(m.payment_id).status == PaymentStatus.CANCELLED
+        assert store.get(m.mandate_id).status == 'rejected'
+        card = self.push.call_args.args[1]
+        assert card['type'] == 'notification' and card['title'] == 'Payment not available'
+        assert self.push.call_args.kwargs['user_id'] == 'u1'
+        # The operator's side: one WARNING naming the setting, never a value.
+        warned = [r.getMessage() for r in caplog.records
+                  if r.name == 'integrations.ap2.ap2_protocol' and r.levelno == logging.WARNING]
+        assert len(warned) == 1 and 'STRIPE_API_KEY' in warned[0] and m.payment_id in warned[0]
+        assert '=' not in warned[0]
+
+
+class TestRequestPaymentTool:
+    """The agent's request_payment on a keyless node refuses BEFORE the person
+    is asked (review of 3a07d3989, F1: the mandate was minted on the mock and
+    the Approve card shown, and only the approval was refused)."""
+
+    def _tool(self, store):
+        from integrations.ap2.ap2_protocol import create_payment_request_function
+        return create_payment_request_function('agent', user_id='u1')
+
+    def test_a_keyless_node_refuses_before_asking_the_person(self, store, caplog):
+        store.ledger.gateways.pop(PaymentGateway.STRIPE)
+        with patch('integrations.ap2.ap2_mandate.get_mandate_store', return_value=store), \
+                patch('integrations.agent_engine.liquid_ui_service.push_agent_ui',
+                      return_value=True) as push, \
+                caplog.at_level(logging.WARNING, logger='integrations.ap2.ap2_protocol'):
+            out = json.loads(self._tool(store)(10.0, 'INR', 'a thing'))
+        assert out['success'] is False and 'no live payment gateway' in out['error']
+        assert push.call_count == 0                    # no Approve card
+        assert store.ledger.payments == {}             # no mandate, no payment
+        warned = [r.getMessage() for r in caplog.records
+                  if r.name == 'integrations.ap2.ap2_protocol' and r.levelno == logging.WARNING]
+        assert len(warned) == 1 and 'STRIPE_API_KEY' in warned[0]
+
+    def test_a_keyed_node_still_asks_the_person(self, store):
+        with patch('integrations.ap2.ap2_mandate.get_mandate_store', return_value=store), \
+                patch('integrations.agent_engine.liquid_ui_service.push_agent_ui',
+                      return_value=True) as push:
+            out = json.loads(self._tool(store)(10.0, 'INR', 'a thing'))
+        assert out['status'] == 'approval_required'
+        assert push.call_count == 1 and push.call_args.args[1]['type'] == 'approval'
+        p = store.ledger.get_payment(out['payment_id'])
+        assert p.status == PaymentStatus.APPROVAL_REQUIRED and p.gateway == PaymentGateway.STRIPE
+
+    @pytest.mark.parametrize('currency', ['', 'inr'])
+    def test_the_gate_reads_the_currency_the_way_the_mandate_does(self, store, currency):
+        """The review of 3ec90cc58 measured: the before-asking gate read
+        select_gateway with the raw tool argument while the mandate reads
+        INR for none and upper-cases, so on a PhonePe-only node
+        request_payment(10, '', ...) was refused "no live payment gateway"
+        (and an operator WARNING asked for keys the node has) where 'inr'
+        minted on PhonePe.  One reading now, before both."""
+        store.ledger.gateways.pop(PaymentGateway.STRIPE)
+        store.ledger.add_gateway(CardRailDouble(PaymentGateway.PHONEPE))
+        with patch('integrations.ap2.ap2_mandate.get_mandate_store', return_value=store), \
+                patch('integrations.agent_engine.liquid_ui_service.push_agent_ui',
+                      return_value=True) as push:
+            out = json.loads(self._tool(store)(10.0, currency, 'a thing'))
+        assert out.get('status') == 'approval_required', out
+        assert out['currency'] == 'INR'
+        assert push.call_count == 1
+        p = store.ledger.get_payment(out['payment_id'])
+        assert p.gateway == PaymentGateway.PHONEPE and p.currency == 'INR'
+
+    def test_dev_mode_still_settles_a_generic_mandate_on_the_mock(self, store, monkeypatch):
+        from security import master_key
+        from integrations.ap2.ap2_mandate import decide_payment
+        store.ledger.gateways.pop(PaymentGateway.STRIPE)
+        monkeypatch.setattr(master_key, 'is_dev_mode', lambda: True)
+        m = store.create_cart_mandate('u1', 'shop', CART)
+        payload, code = decide_payment(m.payment_id, 'u1', True, store=store)
+        assert code == 200 and payload['result']['success'] is True
+        assert store.ledger.get_payment(m.payment_id).status == PaymentStatus.COMPLETED
+        assert store.ledger.get_payment(m.payment_id).gateway == PaymentGateway.MOCK
 
     @pytest.mark.parametrize('who,code', [(None, 401), ('', 401), ('u2', 403)])
     def test_only_the_owner_may_answer(self, store, who, code):

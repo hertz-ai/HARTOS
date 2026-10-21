@@ -1491,6 +1491,19 @@ class AgentDaemon:
             db.rollback()
             logger.warning("Metered settlement failed (retried next cycle): %s", e)
 
+    @staticmethod
+    def _trends_tick() -> None:
+        """Her desktop's daily trending-songs run (integrations.trends.
+        daily_job, owner rulings U6 and A10d): a child process it starts and
+        then only polls, so a tick costs one poll() at most -- no thread, no
+        LLM.  On a central node it returns at once.  Its own failures never
+        reach the tick."""
+        try:
+            from integrations.trends.daily_job import maybe_tick
+            maybe_tick()
+        except Exception as e:
+            logger.warning("Trending-songs tick failed (retried next tick): %s", e)
+
     def _tick(self):
         """Find active goals, find idle agents, dispatch via /chat.
 
@@ -1591,6 +1604,12 @@ class AgentDaemon:
             # owes the operators who served it.
             if self._tick_count % self._remediate_every == 0:
                 self._settle_metered_usage(db)
+
+            # Her trending-song list is made on her desktop whether or not
+            # it has goals: before the no-goals stop on purpose, like
+            # settlement.  Past the yield gate above, so it runs while she
+            # is away from the computer.
+            self._trends_tick()
 
             # DETERMINISTIC STOP: no goals = no action = system is inert
             # Skip CODING_GOAL_TYPES — coding_daemon handles those with

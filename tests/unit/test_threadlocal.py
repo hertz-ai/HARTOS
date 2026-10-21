@@ -205,6 +205,43 @@ class TestAgenticRouting:
 
 
 # ============================================================
+# Agent-work tools — the turn's answer, read by get_tools (task #120)
+# ============================================================
+
+class TestAgentToolsFlag:
+    """/chat sets it once per turn; get_tools reads it when a caller passes
+    no flag, so the model wrapper's prompt rebuild agrees with get_ans."""
+
+    def test_default_is_every_tool(self):
+        assert ThreadLocalData().get_agent_tools() is True
+
+    def test_a_declined_turn_reads_false(self):
+        tld = ThreadLocalData()
+        tld.set_agent_tools(False)
+        assert tld.get_agent_tools() is False
+        tld.set_agent_tools(True)
+        assert tld.get_agent_tools() is True
+
+    def test_the_value_is_a_bool_whatever_was_given(self):
+        tld = ThreadLocalData()
+        tld.set_agent_tools(0)
+        assert tld.get_agent_tools() is False
+
+    def test_each_thread_has_its_own_answer(self):
+        tld = ThreadLocalData()
+        tld.set_agent_tools(False)
+        seen = {}
+
+        def other():
+            seen['other'] = tld.get_agent_tools()
+        t = threading.Thread(target=other)
+        t.start()
+        t.join()
+        assert seen['other'] is True
+        assert tld.get_agent_tools() is False
+
+
+# ============================================================
 # Model config override — speculative execution
 # ============================================================
 

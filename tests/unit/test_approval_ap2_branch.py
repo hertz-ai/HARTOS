@@ -17,6 +17,7 @@ from integrations.ap2.ap2_mandate import MandateStore
 from integrations.ap2.ap2_protocol import PaymentLedger, PaymentStatus
 from integrations.commerce.drafts import DraftStore
 from integrations.social.auth import generate_jwt
+from tests.unit.ap2_doubles import CardRailDouble
 
 CART = {'lines': [{'sku_id': 11, 'qty': 2, 'unit_price': 40}],
         'total': 80, 'currency': 'INR'}
@@ -47,7 +48,11 @@ def app():
 
 @pytest.fixture
 def ctx(app, tmp_path):
+    # A keyed node: with only the mock registered a person's approval is
+    # refused and the payment cancelled (ap2_protocol.mock_would_settle),
+    # which is not what these route tests are about.
     ledger = PaymentLedger(ledger_path=str(tmp_path / 'l.json'))
+    ledger.add_gateway(CardRailDouble())
     mandates = MandateStore(str(tmp_path / 'm.json'), ledger=ledger, key=b'k' * 32)
     drafts = DraftStore(str(tmp_path / 'd.json'))
     mcg = MagicMock()

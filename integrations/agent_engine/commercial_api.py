@@ -11,7 +11,6 @@ Blueprint Pattern: Blueprint('commercial_api', __name__).
 import hashlib
 import hmac
 import logging
-import os
 import secrets
 import time
 from datetime import datetime, timedelta
@@ -54,21 +53,6 @@ def _invalid_tier_error(tier) -> str:
     """The ONE wording for a tier that is not in the table (service and route)."""
     return f'Invalid tier: {tier}. Valid: {list(TIER_CONFIG.keys())}'
 
-
-def _mock_payments_allowed(user) -> bool:
-    """May this caller's tier upgrade be settled by the MockPaymentGateway?
-
-    The mock authorizes any payment_method string, so for a paying customer
-    it is a free tier (review of 0cf610371: a plain user named
-    ``gateway: mock``, or hit a node without Stripe, and got enterprise for
-    nothing, with the $499 recorded in the ledger as paid).  Only an operator
-    (integrations.social.auth.holds_central_role) or a node in the existing
-    dev mode (HEVOLVE_DEV_MODE=true, which central forces to false at boot)
-    may settle through the mock.
-    """
-    from integrations.social.auth import holds_central_role
-    from security.master_key import is_dev_mode     # the ONE dev-mode switch
-    return holds_central_role(user) or is_dev_mode()
 
 COST_PER_1K_TOKENS = {
     'free': 0.0,
@@ -302,10 +286,15 @@ class CommercialAPIService:
         return [k.to_dict() for k in keys]
 
     @staticmethod
-    def revoke_api_key(db: Session, api_key_id: str) -> Optional[Dict]:
-        """Revoke (deactivate) an API key."""
+    def revoke_api_key(db: Session, api_key_id: str, user_id: str) -> Optional[Dict]:
+        """Revoke (deactivate) ``user_id``'s API key ``api_key_id``; None when
+        that person has no such key.  The owner is part of the lookup, as on
+        every other key route: by id alone, any signed-in person who knew
+        another's key id could switch it off (the review of fd2b4773c read
+        it; task #146)."""
         from integrations.social.models import CommercialAPIKey
-        key = db.query(CommercialAPIKey).filter_by(id=api_key_id).first()
+        key = db.query(CommercialAPIKey).filter_by(
+            id=api_key_id, user_id=str(user_id)).first()
         if not key:
             return None
         key.is_active = False
@@ -481,10 +470,36 @@ def require_api_key(f):
 commercial_api_bp = Blueprint('commercial_api', __name__)
 
 
-def _metered_backend_chat(prompt: str, prompt_id: str):
+def _metered_backend_chat(prompt: str, label: str):
     """The ONE self-POST the metered endpoints make to this node's own /chat.
 
-    Returns ``(ok, text, status_code)``.
+    Returns ``(ok, text, status_code)``.  ``label`` names the endpoint in
+    this function's log lines; it is NOT an agent.
+
+    The customer's call is an agent-less conversation turn (``prompt_id``
+    None): the self-POST itself never asks for an agent to be created, and
+    ``agent_tools`` False keeps ``Create_Agent`` and ``Agentic_Router`` out
+    of the turn's tool set (task #120: with them offered, the model could
+    hand the customer the creation interview, a Review Mode agent under
+    their id, or a Plan Mode consent question as the billed answer; the
+    review of 7e7ce19bc drove it).  Two more flags are deliberate: ``draft_first``
+    False, so the 0.8B draft and its classifier never answer a paid call
+    (a confident ``is_create_agent`` verdict would mint an agent and hand the
+    customer the creation text again; a confident ``delegate=none`` would ship
+    the draft as the paid answer), and ``casual_conv`` left False, so the
+    turn runs the default tool set, not the casual one that carries
+    ``Shell_Command`` and ``Computer_Action`` (a self-issued free key must
+    never reach a shell on the serving node).  It
+    used to send ``prompt_id`` 'api_intelligence' / 'api_analyze': no
+    such prompt file exists on any node, so /chat's ladder logged 'GATHER
+    JSON doesnot EXISTS', set create_agent and ran gather_info turn 1/12;
+    the model's non-JSON reply to the agent-building prompt went back to
+    the customer raw.  Measured live on central 2026-10-13 (e829b072):
+    "What is the capital of France?" was answered "I have the name and
+    goal, but not every step came through as a step I can build...",
+    success true, billed; the same question through /chat with prompt_id
+    None answered "Paris is the capital of France."  Guarded by
+    tests/unit/test_metered_chat_is_a_conversation.py.
 
     These two call sites were the 4th and 5th instances of the cdd379ad
     defect: ``cdd379ad`` fixed the speculative-dispatcher legs, ``272c4315``
@@ -503,65 +518,132 @@ def _metered_backend_chat(prompt: str, prompt_id: str):
     ``'deferred'``) which exists to stop *background* work stealing the LLM
     from a human.  A paying customer's synchronous request is not background
     work, so inheriting that gate would trade this bug for a worse one.  What
-    is shared with the other callers is the credential helper itself.
+    is shared with the other callers is the one builder of a person's turn
+    sent for them (``chat_contract.chat_turn_request``: the body and the
+    credential) and the canonical /chat client (``core.chat_client.post_chat``:
+    the same pooled path, with the request id this function mints passed
+    through).
+
+    The turn is the CUSTOMER's.  The self-POST used to carry the credential
+    helper's default identity, so on a keyless node (no HEVOLVE_API_KEY) the
+    JWT named system_daemon and /chat, trusting the token over the body
+    (correctly), ran every paying customer as the node's own system identity
+    in ONE shared agent session with history and memory tools (task #153;
+    measured 2026-10-14; the channel relays had the same collapse on
+    2026-08-06).  chat_turn_request mints the token for the key's owner, as
+    a user, and carries the lane below as that token's claim, so the paid
+    lane no longer depends on the node holding a key.
     """
     import uuid as _uuid
-    from core.http_pool import pooled_post
+    from core.chat_client import post_chat
     from core.llm_outbound_logger import LANE_REVENUE, LANE_USER
-    from integrations.agent_engine.dispatch import _internal_auth_headers
+    from integrations.channels.chat_contract import chat_turn_request
 
+    # The customer's turn: their identity in the body and in the minted
+    # credential, no agent (the key is present, the route 400s without it,
+    # and None is an agent-less conversation turn: see the docstring for what
+    # a made-up agent id did to customers), and the flags the docstring
+    # explains.  casual_conv is deliberately NOT sent (False): the casual
+    # tool set carries Shell_Command / Computer_Action.
+    payload, headers = chat_turn_request(
+        g.api_key['user_id'], None, prompt,
+        create_agent=False,
+        # Never the draft: see the docstring.  HEVOLVE_DRAFT_FIRST=1 in the
+        # node's env still overrides this body flag.
+        draft_first=False,
+        # Never agent work: /chat withholds Create_Agent and Agentic_Router
+        # from this turn (task #120), so the model cannot hand the customer
+        # an interview or a consent question as the billed answer.
+        agent_tools=False,
+        # A paying customer's call is a genuine turn, never background: a
+        # request id of its own (unique per call, so two calls in the same
+        # second cannot share a lane entry) makes /chat and the wire treat it
+        # so (core.chat_client: a missing id reads as background), and keys
+        # the lane below.
+        request_id='api_%d_%s' % (int(time.time()), _uuid.uuid4().hex[:8]),
+        # Owner policy 2026-10-12: a paying tier's turn is revenue-bearing
+        # (may use the expert model, never throttled); the free tier runs on
+        # the free model like any person's turn.  The node's word: in the
+        # body beside the node's key, and as the claim of the JWT minted for
+        # the customer (core.request_lane.lane_for_chat believes either from
+        # the node alone).
+        lane=LANE_REVENUE if (g.api_key.get('tier') or 'free') != 'free' else LANE_USER)
     try:
-        result = pooled_post(
-            f'http://localhost:{get_port("backend")}/chat',
-            json={
-                'user_id': g.api_key['user_id'],
-                'prompt_id': prompt_id,
-                'prompt': prompt,
-                'create_agent': False,
-                # A paying customer's call is a genuine turn, never background:
-                # a request id of its own (unique per call, so two calls in the
-                # same second cannot share a lane entry) makes /chat and the
-                # wire treat it so (core.chat_client: a missing id reads as
-                # background), and keys the lane below.
-                'request_id': 'api_%d_%s' % (int(time.time()), _uuid.uuid4().hex[:8]),
-                # Owner policy 2026-10-12: a paying tier's turn is revenue-
-                # bearing (may use the expert model, never throttled); the
-                # free tier runs on the free model like any person's turn.
-                # /chat believes this field only from the node itself: the
-                # key or the system JWT _internal_auth_headers sends
-                # (core.request_lane.is_internal_caller).
-                'lane': LANE_REVENUE if (g.api_key.get('tier') or 'free') != 'free' else LANE_USER,
-            },
-            headers=_internal_auth_headers(),
-            timeout=120)
+        # The canonical /chat client (core.chat_client): the same pooled path,
+        # with the body normalised.  The id minted above passes through
+        # untouched, so this is the wire this function always sent.
+        result = post_chat(
+            f'http://localhost:{get_port("backend")}/chat', payload,
+            headers=headers, timeout=120)
     except Exception as e:
         # 502: we could not reach our own backend at all.
-        logger.warning(f"Metered {prompt_id} /chat transport error: {e}")
+        logger.warning(f"Metered {label} /chat transport error: {e}")
         return False, '', 502
 
-    status = getattr(result, 'status_code', 200)
+    # A /chat answer is read the way the call path reads it
+    # (integrations.agentic_router._call_turn_reply, reached through
+    # dispatch_to_agent; the one production caller of this pair):
+    # chat_turn_result parses the body, and a 200
+    # whose body is not /chat's JSON object (a proxy's or server's error
+    # page) becomes an 'error' body instead of raising out of this function;
+    # chat_turn_answer is the reply when the turn produced one, else None.
+    # A turn that fails does not raise: the pipeline answers HTTP 200 with a
+    # polite sentence (core.agent_tools.user_facing_error, the LLM_*_REPLY
+    # constants, BUILD_INCOMPLETE_REPLY), right for a person and wrong for a
+    # billed call.  Measured on central 2026-10-12 18:14Z: the "internal
+    # snag" sentence went to a paying customer as success:true and was billed
+    # (task #110).  The same reader also refuses an empty reply, 'success'
+    # False, an 'error', a 'loading' notice and a route speaking for itself
+    # (the review of 2efb73519: this used to be a narrower inline copy of
+    # that rule; the review of ca3e314de corrected whose rule it is).
+    from integrations.channels.chat_contract import chat_turn_answer, chat_turn_result
+    try:
+        status, data = chat_turn_result(result)
+    except Exception as e:
+        # chat_turn_result catches ValueError only (the call path's choice);
+        # whatever else a response raises while its body is read is still
+        # "no answer" here, with its audit row, instead of a 500 and no row
+        # (the review of c8a9e0c28 measured that on a non-200).
+        # The row keeps the backend's own status when it is not 200 (a 401
+        # stays a 401); an unreadable 200 is "answered, not with an answer",
+        # 502, like the other 200s below (the review of fbeb16284).
+        logger.warning(f"Metered {label} /chat answer could not be read: {e}")
+        status = getattr(result, 'status_code', None)
+        return False, '', status if isinstance(status, int) and status != 200 else 502
     if status != 200:
         # WARNING, not DEBUG: central emits nothing below WARNING after boot,
         # which is why this leg was dead silently.  Same reasoning as the
         # sibling fixes in speculative_dispatcher.py and worker_loop.py.
         logger.warning(
-            f"Metered {prompt_id} /chat returned HTTP {status}")
+            f"Metered {label} /chat returned HTTP {status}")
         return False, '', status
 
-    data = result.json() if hasattr(result, 'json') else {}
-    return True, (data.get('response') or ''), 200
+    text = chat_turn_answer(status, data)
+    if text is None:
+        shown = data.get('response') or data.get('error')
+        logger.warning(
+            f"Metered {label} /chat answered 200 without an answer: {str(shown)[:120]!r}")
+        return False, '', 502
+    return True, text, 200
 
 
 def _metered_backend_failure(endpoint: str, tokens_in: int, elapsed_ms: int,
                              status: int):
-    """Record a metered call whose backend produced nothing, and tell the
+    """Record a metered call whose backend produced no answer, and tell the
     customer the truth.
 
-    Billing 0 tokens is not a new policy -- ``require_api_key`` already
-    states it for the 429 path: "No log_usage() is called ... the backend was
-    never invoked, so no inference tokens are recorded."  The row is still
-    written (audit that the call happened, and its real status) but
-    ``cost_credits`` computes to 0 because both token counts are 0.
+    "No answer" is any of: the self-POST to /chat could not be made or was
+    refused (``status`` is the transport's: 502, 401, ...), /chat answered
+    200 with a failed-turn sentence or nothing (502: the backend answered,
+    not with an answer), the hive bridge had no thought, or the media agent
+    generated nothing.  Billing 0 tokens is not a new policy --
+    ``require_api_key`` already states it for the 429 path: "No log_usage()
+    is called ... the backend was never invoked, so no inference tokens are
+    recorded."  The row is still written (audit that the call happened, and
+    its real status) but ``cost_credits`` computes to 0 because both token
+    counts are 0.  The row does count toward the key's daily rate limit
+    (``check_rate_limit`` counts rows, not successes); task #111 (degraded
+    mode) is where a dead backend stops consuming the customer's day.
 
     ``reserve_quota`` has already consumed one unit of monthly quota by this
     point; that is the documented pre-execution reservation and is
@@ -654,9 +736,10 @@ def intelligence_generate():
         return jsonify({'success': False, 'error': 'prompt required'}), 400
 
     t0 = time.time()
+    tokens_in = len(prompt_text.split())
 
     try:
-        from integrations.service_tools.media_agent import generate_media
+        from integrations.service_tools.media_agent import generate_media, generated_nothing
         result_json = generate_media(
             context=prompt_text,
             output_modality=modality,
@@ -664,15 +747,23 @@ def intelligence_generate():
         )
         import json
         result = json.loads(result_json) if isinstance(result_json, str) else result_json
+        nothing = generated_nothing(result)
     except Exception as e:
         logger.warning(f"Generate endpoint error: {e}")
-        result = {'error': 'Generation service temporarily unavailable'}
+        result, nothing = None, True
 
     elapsed_ms = int((time.time() - t0) * 1000)
-    tokens_in = len(prompt_text.split())
+    if nothing:
+        # status error / unavailable / warming_up, or the agent raised: no
+        # file and no task to poll.  Counted as a call and reported
+        # success:true until task #110; the media agent's own reader
+        # (classify_error) names the same statuses.
+        return _metered_backend_failure(
+            '/v1/intelligence/generate', tokens_in, elapsed_ms, 502)
+
     CommercialAPIService.log_usage(
         g.api_db, g.api_key['id'], '/v1/intelligence/generate',
-        tokens_in=tokens_in, compute_ms=elapsed_ms)
+        tokens_in=tokens_in, compute_ms=elapsed_ms, status_code=200)
 
     return jsonify({'success': True, 'result': result,
                     'usage': {'tokens_in': tokens_in, 'compute_ms': elapsed_ms}})
@@ -687,20 +778,31 @@ def intelligence_hivemind():
         return jsonify({'success': False, 'error': 'query parameter required'}), 400
 
     t0 = time.time()
-    result = {}
+    tokens_in = len(query.split())
+    result, has_thought = None, False
 
     try:
         from integrations.agent_engine.world_model_bridge import get_world_model_bridge
         bridge = get_world_model_bridge()
         result = bridge.query_hivemind(query)
+        has_thought = bool(result and result.get('thought'))
     except Exception as e:
         logger.warning(f"HiveMind endpoint error: {e}")
-        result = {'error': 'HiveMind service temporarily unavailable'}
+        result, has_thought = None, False
 
     elapsed_ms = int((time.time() - t0) * 1000)
+    if not has_thought:
+        # No thought: None (no hive core installed, no CCT for the
+        # capability, the filter refused, every leg failed) or a reply whose
+        # words are '' (every peer silent, the core's answer None).  Measured
+        # on central 2026-10-13: {"result": null, "success": true} was
+        # counted as a call (task #110).
+        return _metered_backend_failure(
+            '/v1/intelligence/hivemind', tokens_in, elapsed_ms, 502)
+
     CommercialAPIService.log_usage(
         g.api_db, g.api_key['id'], '/v1/intelligence/hivemind',
-        tokens_in=len(query.split()), compute_ms=elapsed_ms)
+        tokens_in=tokens_in, compute_ms=elapsed_ms, status_code=200)
 
     return jsonify({'success': True, 'result': result,
                     'usage': {'compute_ms': elapsed_ms}})
@@ -805,7 +907,7 @@ def revoke_key(key_id):
         return jsonify({'success': False, 'error': 'Invalid token'}), 401
 
     try:
-        result = CommercialAPIService.revoke_api_key(db, key_id)
+        result = CommercialAPIService.revoke_api_key(db, key_id, str(user.id))
         if not result:
             return jsonify({'success': False, 'error': 'Key not found'}), 404
         db.commit()
@@ -936,6 +1038,9 @@ def upgrade_key(key_id):
             id=key_id, user_id=str(user.id)).first()
         if not api_key:
             return jsonify({'success': False, 'error': 'API key not found'}), 404
+        refusal = _not_an_upgrade(api_key, target_tier)
+        if refusal is not None:
+            return refusal
 
         target_cfg = TIER_CONFIG[target_tier]
         amount_usd = float(target_cfg['monthly_price_usd'])
@@ -959,7 +1064,8 @@ def upgrade_key(key_id):
         # MockPaymentGateway, which authorizes any payment_method string
         # (review of 0cf610371, measured on the real route).  A Mock result
         # is a paid tier for nothing, so it is refused unless the caller is an
-        # operator or the node is in dev mode (_mock_payments_allowed).
+        # operator or the node is in dev mode: ap2_protocol.mock_settlement_allowed,
+        # the one rule, which the McGroce cart settler reads too.
         #
         # PhonePe is intentionally NOT selected here even when registered —
         # it is a redirect-then-webhook flow.  Selecting it synchronously
@@ -978,19 +1084,21 @@ def upgrade_key(key_id):
                          'Stripe (set STRIPE_API_KEY).',
             }), 501
         try:
-            from integrations.ap2 import PaymentGateway as _PG
+            from integrations.ap2 import (
+                NO_LIVE_GATEWAY, mock_would_settle, refuse_no_live_gateway)
             _gateway_choice = payment_ledger.select_gateway('USD')
         except Exception as _sel_err:
             return jsonify({
                 'success': False,
                 'error': f'No payment gateway could be selected: {_sel_err}',
             }), 503
-        if _gateway_choice == _PG.MOCK and not _mock_payments_allowed(user):
+        if mock_would_settle(_gateway_choice, user):
+            # The one refusal wording and the one operator WARNING (which
+            # names the setting; the body, read by the customer, does not).
+            refuse_no_live_gateway('upgrade', user.id)
             return jsonify({
                 'success': False,
-                'error': 'No live USD payment gateway (Stripe) is configured on '
-                         'this node (set STRIPE_API_KEY); the dev mock settles '
-                         'nothing.',
+                'error': f'{NO_LIVE_GATEWAY}; the dev mock settles nothing',
             }), 503
 
         # Three-step AP2 flow.  We do all synchronously here for the simple
@@ -1032,11 +1140,17 @@ def upgrade_key(key_id):
                 'error': f'Payment error: {pay_err}',
             }), 502
 
-        # Payment succeeded — bump the key's tier and limits.
-        api_key.tier = target_tier
-        api_key.rate_limit_per_day = target_cfg['rate_limit_per_day']
-        api_key.monthly_quota = target_cfg['monthly_quota']
-        db.commit()
+        # Payment succeeded — the bought tier, through the one writer.
+        _changed, failure = _apply_bought_tier(db, api_key, target_tier)
+        if failure is not None:
+            # No retry follows on this rail: a re-POST of /upgrade would
+            # charge the card again, so the line asks for a person now.
+            payload, status = _bump_failed(
+                f'payment {payment_req.payment_id}', api_key.id, failure,
+                retry='no retry follows: a re-POST of /upgrade would charge the card '
+                      'again; apply the bought tier by hand',
+                retries=False, payment_request_id=payment_req.payment_id)
+            return jsonify(payload), status
 
         return jsonify({
             'success': True,
@@ -1082,6 +1196,19 @@ def upgrade_key(key_id):
 def initiate_phonepe_upgrade(key_id: str):
     """Initiate a PhonePe-rail upgrade for a paid tier.
 
+    Body: ``target_tier``; optional ``redirect_url`` (the page the buyer
+    returns to after paying, this node's public URL when absent) and
+    ``mobile_number``.  A ``callback_url`` in the body is ignored: the
+    server callback is always this node's own
+    (integrations.ap2.ap2_protocol.own_gateway_urls), since a caller-named
+    one would send PhonePe's signed confirmation elsewhere and the tier
+    would never be bumped.  The price is the tier's, converted to INR at
+    the operator's rate by the gateway; an ``inr_amount`` in the body is
+    ignored too (it used to be stored as the gateway's override, and the
+    callback's amount check compared against the same override, so a buyer
+    could name their own price: the review of af987a962 measured the
+    enterprise tier for one rupee).
+
     Returns:
         202 Accepted with `{redirect_url, payment_request_id,
         gateway_transaction_id}` — the caller should redirect the user
@@ -1123,6 +1250,9 @@ def initiate_phonepe_upgrade(key_id: str):
             id=key_id, user_id=str(user.id)).first()
         if not api_key:
             return jsonify({'success': False, 'error': 'API key not found'}), 404
+        refusal = _not_an_upgrade(api_key, target_tier)
+        if refusal is not None:
+            return refusal
 
         target_cfg = TIER_CONFIG[target_tier]
         amount_usd = float(target_cfg['monthly_price_usd'])
@@ -1147,7 +1277,24 @@ def initiate_phonepe_upgrade(key_id: str):
 
         # Build the payment request.  Metadata carries the bookkeeping
         # the webhook needs to finalize the tier change without trusting
-        # any caller-supplied data.
+        # any caller-supplied data.  The buyer's return page may be the
+        # caller's own (the app that started the upgrade); the server
+        # callback is never the caller's, and neither is written here
+        # when absent: the gateway resolves this node's URLs when it
+        # mints the checkout and refuses without them.  Both used to
+        # default to the web app's host here, which answers these paths
+        # with the web app's 404 (task #122).
+        metadata = {
+            'api_key_id': str(key_id),
+            'current_tier': api_key.tier,
+            'target_tier': target_tier,
+            'kind': 'tier_upgrade',
+            'user_id': str(user.id),
+            'mobile_number': data.get('mobile_number'),
+            # No 'inr_amount': the gateway prices the tier itself.
+        }
+        if data.get('redirect_url'):
+            metadata['redirect_url'] = str(data['redirect_url'])
         try:
             payment_req = payment_ledger.create_payment_request(
                 amount=_Decimal(str(amount_usd)),
@@ -1156,23 +1303,7 @@ def initiate_phonepe_upgrade(key_id: str):
                 requester_agent_id=f'user:{user.id}',
                 payment_method=PaymentMethod.INTERNAL_CREDITS,
                 gateway=PaymentGateway.PHONEPE,
-                metadata={
-                    'api_key_id': str(key_id),
-                    'current_tier': api_key.tier,
-                    'target_tier': target_tier,
-                    'kind': 'tier_upgrade',
-                    'user_id': str(user.id),
-                    'redirect_url': data.get(
-                        'redirect_url',
-                        'https://hevolve.ai/api/v1/intelligence/keys',
-                    ),
-                    'callback_url': data.get(
-                        'callback_url',
-                        'https://hevolve.ai/api/v1/intelligence/phonepe/callback',
-                    ),
-                    'mobile_number': data.get('mobile_number'),
-                    'inr_amount': data.get('inr_amount'),  # optional override
-                },
+                metadata=metadata,
             )
 
             authorized = payment_ledger.authorize_payment(
@@ -1212,7 +1343,10 @@ def initiate_phonepe_upgrade(key_id: str):
                 'payment_request_id': payment_req.payment_id,
                 'gateway_transaction_id': payment_req.gateway_transaction_id,
                 'amount_usd': amount_usd,
-                'inr_amount_estimated_paise': gateway._to_paise(payment_req),
+                # The paise PhonePe was asked for (recorded on the payment
+                # by create_payment; the callback checks the capture
+                # against the same number).
+                'inr_amount_estimated_paise': gateway.expected_paise(payment_req),
                 'message': 'Redirect the user to redirect_url to complete payment. '
                            'The tier will be bumped once PhonePe confirms payment '
                            'via the callback webhook.',
@@ -1230,6 +1364,56 @@ def initiate_phonepe_upgrade(key_id: str):
             pass
 
 
+def _verified_phonepe_envelope(what: str):
+    """The decoded envelope of a PhonePe server-to-server POST whose X-VERIFY
+    signature checks out against the registered gateway's salt, as
+    ``(gateway, envelope, None)``; else ``(None, None, (response, status))``
+    for the route to return.  Shared by the payment and the refund callback:
+    PhonePe signs both the same way (``sha256(base64 + salt_key) + "###" +
+    salt_index``), and the AP2 import, the gateway lookup, the missing-payload
+    400, the bad-signature 401 and the undecodable 400 are one rule."""
+    import base64 as _b64
+    import json as _json
+
+    try:
+        from integrations.ap2 import payment_ledger, PaymentGateway
+    except Exception as imp_err:
+        logger.error(f"PhonePe {what}: AP2 import failed: {imp_err}")
+        return None, None, (jsonify({'success': False, 'error': 'AP2 unavailable'}), 503)
+
+    gateway = payment_ledger.gateways.get(PaymentGateway.PHONEPE)
+    if gateway is None:
+        # If PhonePe isn't registered we shouldn't be receiving callbacks.
+        # Log loudly so the operator notices.
+        logger.error(f"PhonePe {what} received but gateway is not registered")
+        return None, None, (jsonify({'success': False,
+                                     'error': 'PhonePe gateway unavailable'}), 503)
+
+    x_verify = request.headers.get('X-VERIFY', '')
+    body = request.get_json(silent=True) or {}
+    b64_response = body.get('response', '')
+    if not b64_response or not x_verify:
+        logger.warning(f"PhonePe {what}: missing response body or X-VERIFY header")
+        return None, None, (jsonify({'success': False,
+                                     'error': 'Missing signature payload'}), 400)
+
+    # Reject any callback that fails signature verification.  Constant-time
+    # compare inside verify_callback prevents timing oracles.
+    if not gateway.verify_callback(b64_response, x_verify):
+        logger.warning(f"PhonePe {what}: X-VERIFY signature mismatch — rejecting")
+        return None, None, (jsonify({'success': False, 'error': 'Invalid signature'}), 401)
+
+    try:
+        envelope = _json.loads(_b64.b64decode(b64_response).decode('utf-8'))
+        if not isinstance(envelope, dict):
+            raise ValueError('envelope is not an object')
+    except Exception as e:
+        logger.warning(f"PhonePe {what}: failed to decode response payload: {e}")
+        return None, None, (jsonify({'success': False,
+                                     'error': 'Invalid payload encoding'}), 400)
+    return gateway, envelope, None
+
+
 @commercial_api_bp.route('/api/v1/intelligence/phonepe/callback',
                          methods=['POST'])
 def phonepe_callback():
@@ -1238,53 +1422,27 @@ def phonepe_callback():
     PhonePe POSTs `{"response": "<base64>"}` with header
     `X-VERIFY: sha256(base64 + salt_key) + "###" + salt_index`.
     We:
-      1. Verify the signature with the registered PhonePe gateway.
+      1. Verify the signature with the registered PhonePe gateway
+         (_verified_phonepe_envelope).
       2. Decode the payload, recover our merchantTransactionId.
       3. Look up the payment in the ledger.
       4. Idempotency: if already COMPLETED, 200 immediately.
       5. Defense in depth: re-query PhonePe status API via
          gateway.capture_payment — never trust the webhook body alone.
-      6. On confirmed PAYMENT_SUCCESS, mark COMPLETED and bump the
-         API key's tier limits.  Returns 200 to PhonePe regardless of
-         tier-bump success so retries stop.
+      6. On confirmed PAYMENT_SUCCESS, bump the API key's tier through the
+         one writer and mark COMPLETED; a failed bump leaves the payment
+         PROCESSING and answers 500 so PhonePe delivers the callback again
+         and that retry runs the bump again.  PhonePe retries a non-200
+         answer a bounded number of times (its pages give no count for the
+         PG callback; three for the in-store one), and the buyer's return
+         page bumps nothing; past the retries the payment stays PROCESSING
+         and a person finishes it from the ERROR line (the reviews of
+         38a881c35 and 7c8431c2e).
     """
-    import base64 as _b64
-    import json as _json
-
-    try:
-        from integrations.ap2 import payment_ledger, PaymentStatus, PaymentGateway
-    except Exception as imp_err:
-        logger.error(f"PhonePe callback: AP2 import failed: {imp_err}")
-        return jsonify({'success': False, 'error': 'AP2 unavailable'}), 503
-
-    if PaymentGateway.PHONEPE not in payment_ledger.gateways:
-        # If PhonePe isn't registered we shouldn't be receiving callbacks.
-        # Log loudly so the operator notices.
-        logger.error("PhonePe callback received but gateway is not registered")
-        return jsonify({'success': False, 'error': 'PhonePe gateway unavailable'}), 503
-
-    gateway = payment_ledger.gateways[PaymentGateway.PHONEPE]
-    x_verify = request.headers.get('X-VERIFY', '')
-    body = request.get_json(silent=True) or {}
-    b64_response = body.get('response', '')
-
-    if not b64_response or not x_verify:
-        logger.warning("PhonePe callback: missing response body or X-VERIFY header")
-        return jsonify({'success': False, 'error': 'Missing signature payload'}), 400
-
-    # Reject any callback that fails signature verification.  Constant-time
-    # compare inside verify_callback prevents timing oracles.
-    if not gateway.verify_callback(b64_response, x_verify):
-        logger.warning("PhonePe callback: X-VERIFY signature mismatch — rejecting")
-        return jsonify({'success': False, 'error': 'Invalid signature'}), 401
-
-    # Decode the verified payload.
-    try:
-        decoded = _b64.b64decode(b64_response).decode('utf-8')
-        envelope = _json.loads(decoded)
-    except Exception as e:
-        logger.warning(f"PhonePe callback: failed to decode response payload: {e}")
-        return jsonify({'success': False, 'error': 'Invalid payload encoding'}), 400
+    gateway, envelope, refusal = _verified_phonepe_envelope('callback')
+    if refusal is not None:
+        return refusal
+    from integrations.ap2 import payment_ledger, PaymentStatus
 
     code = envelope.get('code', '')
     callback_data = envelope.get('data') or {}
@@ -1301,8 +1459,8 @@ def phonepe_callback():
         return jsonify({'success': False, 'error': 'Payment not found'}), 200
 
     # Idempotency: if we've already completed (or failed) this payment,
-    # do nothing.  PhonePe retries the callback if it doesn't get 2xx
-    # within ~30s, so duplicates are normal.
+    # do nothing.  PhonePe delivers the callback again when it does not get
+    # a 200 OK, so duplicates are normal.
     if payment_req.status == PaymentStatus.COMPLETED:
         return jsonify({
             'success': True,
@@ -1347,12 +1505,14 @@ def phonepe_callback():
         }), 200
 
     # Status check confirmed PAYMENT_SUCCESS.  The amount PhonePe took must be
-    # the amount this payment asked for (when the status API reports one).
+    # the amount this payment SENT (recorded when the request was minted;
+    # a recomputation at today's rate marked a correct capture a mismatch
+    # after the operator moved the rate), when the status API reports one.
     _gw_data = (status_result.get('gateway_response') or {}).get('data') or {}
     if _gw_data.get('amount') is not None:
         try:
             _paid = int(_gw_data['amount'])
-            _expected = gateway._to_paise(payment_req)
+            _expected = gateway.expected_paise(payment_req)
         except (TypeError, ValueError):
             _paid, _expected = None, None
         if _paid is None or _paid != _expected:
@@ -1431,7 +1591,16 @@ def phonepe_callback():
             'payment_request_id': payment_req.payment_id,
         }), 200
 
-    # Bump the API key tier.
+    # The bought tier, through the one writer (_apply_bought_tier: never a
+    # downgrade, whatever order confirmations land in; this rail used to
+    # bump with no rule, the review of fd2b4773c).  Money confirmed and the
+    # write failed: the payment stays PROCESSING and PhonePe is answered a
+    # 500, so its redelivery (a bounded number of them; the buyer's return
+    # page bumps nothing) runs the status check and the bump again; it used
+    # to answer 200 completed and mark the payment COMPLETED, so the retry
+    # was told already_completed and nothing ever re-applied the tier (the
+    # review of ec0dbe7be).
+    failure, raised = None, None
     try:
         from integrations.social.models import get_db, CommercialAPIKey
         db = get_db()
@@ -1447,21 +1616,22 @@ def phonepe_callback():
                     'error': 'API key not found',
                     'payment_request_id': payment_req.payment_id,
                 }), 200
-            target_cfg = TIER_CONFIG[target_tier]
-            api_key.tier = target_tier
-            api_key.rate_limit_per_day = target_cfg['rate_limit_per_day']
-            api_key.monthly_quota = target_cfg['monthly_quota']
-            db.commit()
+            _changed, failure = _apply_bought_tier(db, api_key, target_tier)
         finally:
             db.close()
     except Exception as db_err:
-        logger.exception("PhonePe callback: tier bump failed")
-        # Don't fail the payment — money has changed hands.  Mark
-        # COMPLETED and emit a loud error so operator can manually
-        # reconcile.
-        logger.error(f"MANUAL RECONCILIATION NEEDED: payment "
-                     f"{payment_req.payment_id} succeeded but tier bump "
-                     f"failed for api_key {api_key_id}: {db_err}")
+        # The traceback (a locked database is diagnosed from it) rides on
+        # the one reconciliation line below; logger.exception here made a
+        # second ERROR record for the same failure (the review of 7c8431c2e).
+        failure, raised = f'{type(db_err).__name__}: {db_err}', db_err
+    if failure is not None:
+        payload, status = _bump_failed(
+            f'PhonePe payment {payment_req.payment_id}', api_key_id, failure,
+            retry='PhonePe delivers this callback again on the 500, a bounded number '
+                  "of times, and that retry runs the bump again; the buyer's return "
+                  'page bumps nothing',
+            retries=True, exc_info=raised, payment_request_id=payment_req.payment_id)
+        return jsonify(payload), status
 
     payment_req.update_status(PaymentStatus.COMPLETED,
                               'PhonePe payment captured via callback')
@@ -1476,6 +1646,37 @@ def phonepe_callback():
         'new_tier': target_tier,
         'revenue_split': _revenue_split_usd(amount_usd),
     }), 200
+
+
+@commercial_api_bp.route('/api/v1/intelligence/phonepe/refund-callback',
+                         methods=['POST'])
+def phonepe_refund_callback():
+    """PhonePe's server-to-server refund status: acknowledge it and name it
+    for a person.
+
+    The refund request (PhonePePaymentGateway.refund_payment) names this
+    route as its callback.  It used to name a route that existed nowhere,
+    on the web app's host.  The signature is checked like the payment
+    callback's; the refund's merchantTransactionId, the original
+    transaction, the code and the amount are logged at WARNING for the
+    operator to reconcile by hand.  No ledger state changes here: nothing
+    in the tree calls refund_payment today, so there is no refund record to
+    finish; what this route guarantees is that a refund's confirmation is
+    received, verified and acknowledged (200, so PhonePe stops retrying)
+    instead of lost to a 404.
+    """
+    _gateway, envelope, refusal = _verified_phonepe_envelope('refund callback')
+    if refusal is not None:
+        return refusal
+    data = envelope.get('data') or {}
+    code = envelope.get('code', '')
+    logger.warning("PhonePe refund %s for transaction %s: %s (amount %s paise); "
+                   "reconcile by hand, the ledger is not changed by this callback",
+                   data.get('merchantTransactionId'), data.get('transactionId'),
+                   code, data.get('amount'))
+    return jsonify({'success': True, 'status': 'acknowledged',
+                    'refund_id': data.get('merchantTransactionId'),
+                    'code': code}), 200
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1497,7 +1698,40 @@ def phonepe_callback():
 # COMPLETED PaymentRequest into payment_ledger so the existing
 # get_api_revenue_stats reads the $9 / $49 / $499 entry.  The Stripe
 # PaymentIntent ID is preserved in metadata for audit.
+#
+#   POST /stripe/webhook                       → Stripe's signed event
+#
+# The completion route needs the buyer's browser to reach the success page
+# and POST the session id; the deployed landing page has no such page, so
+# a buyer was charged and never upgraded (task #122).  Stripe's
+# checkout.session.completed event finalizes the same session through the
+# same code (_finalize_paid_checkout_session), whichever arrives first.
 # ═══════════════════════════════════════════════════════════════
+
+def _stripe_gateway():
+    """``(gateway, None)`` when the Stripe gateway is registered and connected
+    with its SDK, else ``(None, (response, status))`` for the route to
+    return: the ONE lookup for the checkout, the completion and the webhook
+    routes, with the STRIPE_API_KEY hint operators need instead of a 500."""
+    try:
+        from integrations.ap2 import payment_ledger
+        from integrations.ap2.ap2_protocol import PaymentGateway
+    except Exception as e:
+        return None, (jsonify({
+            'success': False,
+            'error': f'AP2 payment surface unavailable: {e}',
+        }), 503)
+    gw = payment_ledger.gateways.get(PaymentGateway.STRIPE)
+    if gw is None or not getattr(gw, 'connected', False) \
+            or getattr(gw, '_stripe', None) is None:
+        return None, (jsonify({
+            'success': False,
+            'error': 'Card checkout (Stripe) is not configured on this node '
+                     '(set STRIPE_API_KEY; on central it is a repo secret, '
+                     'see deploy/go_live_stripe.md Step 4).',
+        }), 503)
+    return gw, None
+
 
 @commercial_api_bp.route('/api/v1/intelligence/keys/<key_id>/upgrade/checkout',
                          methods=['POST'])
@@ -1548,6 +1782,9 @@ def create_upgrade_checkout(key_id):
             id=key_id, user_id=str(user.id)).first()
         if not api_key:
             return jsonify({'success': False, 'error': 'API key not found'}), 404
+        refusal = _not_an_upgrade(api_key, target_tier)
+        if refusal is not None:
+            return refusal
 
         target_cfg = TIER_CONFIG[target_tier]
         amount_usd = float(target_cfg['monthly_price_usd'])
@@ -1561,26 +1798,11 @@ def create_upgrade_checkout(key_id):
             sep = '&' if '?' in success_url else '?'
             success_url = f"{success_url}{sep}session_id={{CHECKOUT_SESSION_ID}}"
 
-        # Locate the Stripe gateway.  Falls back to 503 if not registered
-        # — operators see a clear "STRIPE_API_KEY missing" hint rather
-        # than a generic 500.
-        try:
-            from integrations.ap2 import payment_ledger
-            from integrations.ap2.ap2_protocol import PaymentGateway
-            stripe_gw = payment_ledger.gateways.get(PaymentGateway.STRIPE)
-        except Exception as e:
-            return jsonify({
-                'success': False,
-                'error': f'AP2 payment surface unavailable: {e}',
-            }), 503
-        if stripe_gw is None or not getattr(stripe_gw, 'connected', False) \
-                or stripe_gw._stripe is None:
-            return jsonify({
-                'success': False,
-                'error': 'Card checkout (Stripe) is not configured on this node '
-                         '(set STRIPE_API_KEY; on central it is a repo secret, '
-                         'see deploy/go_live_stripe.md Step 4).',
-            }), 503
+        # Locate the Stripe gateway (the ONE lookup, _stripe_gateway): 503
+        # with the STRIPE_API_KEY hint when it is not registered.
+        stripe_gw, refusal = _stripe_gateway()
+        if refusal is not None:
+            return refusal
 
         try:
             session = stripe_gw._stripe.checkout.Session.create(
@@ -1631,6 +1853,318 @@ def create_upgrade_checkout(key_id):
             pass
 
 
+def _session_metadata(session):
+    """A Stripe Checkout Session's metadata as a plain dict; ``None`` when
+    this node cannot read it.
+
+    From stripe 15.0.0 (2026-03) StripeObject no longer subclasses dict:
+    ``.get`` raises AttributeError, where 7.0.0 through 14.4.1 still answer
+    it.  The review of 3153761b3 measured a 500 on every paid event with
+    15.0.0 and 16.0.0, which is what central's next image installs
+    (requirements.txt pins stripe>=7.0.0).  ``to_dict`` exists on every
+    version (a StripeObject on all of them, a plain dict in a test) and a
+    plain dict is copied.  No metadata is ``{}``, readable and not ours.
+    A ``to_dict`` that raises, or a shape that is neither, is ``None``:
+    unreadable is not "not ours", and a caller that treated it so answered
+    Stripe 200 ignored for a paid tier upgrade, stopping the retries on an
+    event no person had seen (the review of fd2b4773c measured it)."""
+    meta = getattr(session, 'metadata', None)
+    if meta is None:
+        return {}
+    if isinstance(meta, dict):
+        return dict(meta)
+    if hasattr(meta, 'to_dict'):
+        try:
+            return dict(meta.to_dict() or {})
+        except Exception as e:
+            logger.error("Stripe session %s: metadata could not be read (%s: %s)",
+                         getattr(session, 'id', None), type(e).__name__, e)
+            return None
+    logger.error("Stripe session %s: metadata of type %s cannot be read",
+                 getattr(session, 'id', None), type(meta).__name__)
+    return None
+
+
+def _is_tier_upgrade_checkout(meta) -> bool:
+    """Is this (readable) Checkout metadata one of this node's tier
+    upgrades, as create_upgrade_checkout stamps it?"""
+    return isinstance(meta, dict) and meta.get('kind') == 'tier_upgrade_checkout'
+
+
+def _tier_rank(tier: str) -> float:
+    """What a tier costs a month: the order a bought tier is compared in."""
+    return float(TIER_CONFIG.get(tier, {}).get('monthly_price_usd', 0.0) or 0.0)
+
+
+def _tiers_at_least(target_tier: str) -> list:
+    """The tiers a key may already hold that make ``target_tier`` no
+    upgrade: those costing the same or more.  The ONE expression of the
+    rule, read by _is_tier_upgrade (before a charge) and by the bought-tier
+    UPDATE's WHERE (at the write), so the two cannot drift."""
+    return [t for t in TIER_CONFIG if _tier_rank(t) >= _tier_rank(target_tier)]
+
+
+def _is_tier_upgrade(current_tier, target_tier) -> bool:
+    """The ONE rule for selling a tier, on every rail (the card checkout,
+    the synchronous card charge, the PhonePe redirect) and for every writer
+    of a key's tier: ``target_tier`` is a paid tier that costs more than the
+    one the key is on.  There is no downgrade route (no writer lowers a
+    tier; revoke only deactivates), and the pricing page offers every paid
+    tier whatever the key holds, so a Pro user choosing starter was charged
+    $9 for nothing, and before fd2b4773c the same purchase lowered the key
+    (the review of fd2b4773c measured both).  A key on no known tier (None,
+    a legacy name) counts as free."""
+    if target_tier not in TIER_CONFIG or target_tier == 'free':
+        return False
+    return str(current_tier or '') not in _tiers_at_least(target_tier)
+
+
+def _not_an_upgrade(api_key, target_tier):
+    """The 400 a rail answers before charging when ``target_tier`` is not an
+    upgrade for ``api_key`` (_is_tier_upgrade), else None.  Nothing here is
+    a subscription (Checkout is a one-off payment and no tier expires), so
+    the sentence names no renewal."""
+    current = str(getattr(api_key, 'tier', '') or 'free')
+    if _is_tier_upgrade(current, target_tier):
+        return None
+    return jsonify({
+        'success': False,
+        'error': f'This key is on the {current} tier; {target_tier} is not an '
+                 f'upgrade from it (a tier is never lowered).',
+        'current_tier': current,
+        'target_tier': target_tier,
+    }), 400
+
+
+def _bump_failed(what_paid: str, api_key_id, failure: str, *, retry: str,
+                 retries: bool, exc_info=None, **payload_extra):
+    """The answer when money was taken and the tier write failed: ONE ERROR
+    line a person reconciles by, and a 500 with ``status`` 'bump_failed',
+    never a success over a key still on the old tier.
+
+    Whether a retry follows differs per rail, so each caller says so in
+    ``retry``, its own sentence in the line: Stripe redelivers its event on
+    a non-2xx and the buyer's reload re-POSTs the session, either of which
+    runs the bump again; PhonePe delivers its callback again a bounded
+    number of times, and the buyer's return page bumps nothing; the
+    synchronous card charge has no retry at all, since a re-POST of
+    /upgrade charges the card again.  ``retries`` True means the line asks
+    for a person only if it repeats; False means it asks now.  One wording
+    used to claim "the gateway's redelivery or the buyer's reload retries
+    it" on every rail (the review of 7c8431c2e, which measured the sync
+    route and PhonePe's return page against it).  ``exc_info`` is the
+    exception the caller caught, when it caught one, so the traceback rides
+    on this line and not on a second ERROR record."""
+    logger.error(f"MANUAL RECONCILIATION NEEDED{' if this repeats' if retries else ''}: "
+                 f"{what_paid} paid but the tier bump failed for api_key {api_key_id}: "
+                 f"{failure}; {retry}", exc_info=exc_info)
+    return dict({
+        'success': False,
+        'status': 'bump_failed',
+        'error': f'Payment succeeded but tier bump failed: {failure}',
+    }, **payload_extra), 500
+
+
+def _recorded_checkout_unlocked(session_id: str):
+    """The ledger payment that already finalized this Checkout Session, or
+    None.  The caller holds payment_ledger.lock (the dict is iterated)."""
+    from integrations.ap2 import payment_ledger
+    for existing in payment_ledger.payments.values():
+        if (existing.metadata or {}).get('stripe_session_id') == session_id:
+            return existing
+    return None
+
+
+def _recorded_checkout(session_id: str):
+    """_recorded_checkout_unlocked under the ledger's lock: the browser
+    route's fast path, answering a replay without asking Stripe.  (An
+    unlocked iteration while another thread inserts can raise 'dictionary
+    changed size'; find_by_gateway_transaction locks for the same reason.)"""
+    from integrations.ap2 import payment_ledger
+    with payment_ledger.lock:
+        return _recorded_checkout_unlocked(session_id)
+
+
+def _checkout_payload(payment, api_key, already_completed: bool = False) -> dict:
+    """The one answer a finalized Checkout gets, whichever caller asks and
+    however many times: the tier and its limits, the amount, the split and
+    the receipt ids the landing page's success screen renders
+    (UpgradeSuccess.js reads api_key.tier, api_key.rate_limit_per_day,
+    api_key.monthly_quota, payment.amount_usd, payment.stripe_payment_intent,
+    revenue_split.* and payment_request_id).  A replay used to answer a bare
+    already_completed envelope, on which that page threw (the review of
+    3153761b3 ran it)."""
+    meta = payment.metadata or {}
+    amount_usd = float(payment.amount)
+    body = {
+        'success': True,
+        'payment_request_id': payment.payment_id,
+        'api_key': {
+            'id': str(api_key.id),
+            'tier': api_key.tier,
+            'rate_limit_per_day': api_key.rate_limit_per_day,
+            'monthly_quota': api_key.monthly_quota,
+        },
+        'payment': {
+            'amount_usd': amount_usd,
+            'stripe_session_id': meta.get('stripe_session_id'),
+            'stripe_payment_intent': meta.get('stripe_payment_intent'),
+            'status': payment.status.value if hasattr(payment.status, 'value') else str(payment.status),
+        },
+        'revenue_split': _revenue_split_usd(amount_usd),
+    }
+    if already_completed:
+        body['already_completed'] = True
+    return body
+
+
+def _apply_bought_tier(db, api_key, target_tier: str):
+    """Put ``api_key`` on the tier it bought; ``(changed, error)``.  The ONE
+    writer of a key's tier for every rail.
+
+    One conditional UPDATE: the row moves only while its tier costs less
+    than ``target_tier`` (an unknown or NULL tier counts as free), so a key
+    already there, or on a tier that costs more, is left alone WHATEVER
+    this process read a moment ago.  Stripe does not order deliveries and
+    events queue while the webhook secret is missing, so a starter session
+    can be finalized after the pro one; a read-then-write guard here lost
+    that race when the two landed together (the starter delivery read
+    'free', waited on the ledger lock while the pro bump committed, then
+    wrote starter: 16 to 23 of 40 rounds, the review of fd2b4773c).  On a
+    failure the session is rolled back, so a later call (Stripe's retry
+    after the 500, the buyer's reload) finds the key still below the
+    bought tier and finishes the bump.  ``api_key`` is refreshed from the
+    row afterwards, so the caller's payload shows what the table holds."""
+    from sqlalchemy import or_
+    from integrations.social.models import CommercialAPIKey
+    if target_tier not in TIER_CONFIG:
+        # Only a hand-edited ledger record lacks its target_tier (every
+        # writer stamps it); it is a reconciliation case for the caller, not
+        # a KeyError outside this try (the review of ec0dbe7be).
+        return False, f'bought tier {target_tier!r} is not a tier'
+    cfg = TIER_CONFIG[target_tier]
+    try:
+        rows = db.query(CommercialAPIKey).filter(
+            CommercialAPIKey.id == api_key.id,
+            or_(CommercialAPIKey.tier.is_(None),
+                CommercialAPIKey.tier.notin_(_tiers_at_least(target_tier))),
+        ).update({
+            CommercialAPIKey.tier: target_tier,
+            CommercialAPIKey.rate_limit_per_day: cfg['rate_limit_per_day'],
+            CommercialAPIKey.monthly_quota: cfg['monthly_quota'],
+        }, synchronize_session=False)
+        db.commit()
+        db.refresh(api_key)
+    except Exception as e:
+        try:
+            db.rollback()
+        except Exception as rb:
+            logger.debug("tier bump: rollback after %s also failed: %s", e, rb)
+        return False, str(e)
+    current = getattr(api_key, 'tier', None)
+    if not rows and current != target_tier:
+        # Money was taken for a tier the key is already above: a refund
+        # case the operator must see.  A replay of an applied session (the
+        # key is already there) is routine and says nothing; one INFO line
+        # covered both, and central logs nothing below WARNING (the review
+        # of ec0dbe7be).
+        logger.warning("api_key %s stays on %s: it paid for %s, which costs less; "
+                       "the payment is recorded and may need a refund",
+                       getattr(api_key, 'id', None), current, target_tier)
+    return bool(rows), None
+
+
+def _finalize_paid_checkout_session(session, db):
+    """Record a PAID Stripe Checkout Session in the ledger and bump the tier
+    it bought; ``(payload, http_status)``.
+
+    The ONE finalizer, shared by complete_upgrade_checkout (the buyer's
+    browser, with their JWT) and stripe_webhook (Stripe's signed event):
+    until the webhook, the tier moved only if the success page POSTed the
+    session id (task #122).  Both may finish the same session, so the
+    ledger record is made under the ledger's lock: the first to insert it
+    records the payment, every caller then applies the bought tier
+    (_apply_bought_tier: a no-op once the key is there, so a replay after a
+    failed bump finishes it, and never a downgrade), and every caller
+    answers the same payload (_checkout_payload), with
+    ``already_completed`` when the record was there before it.  ``session``
+    is Stripe's object (attribute access, as the SDK returns it from
+    retrieve() and in an event; its metadata through _session_metadata,
+    since the SDK's metadata object is not a dict from 15.0.0 on); the
+    metadata was written by create_upgrade_checkout and comes back signed
+    by Stripe, so the user_id and api_key_id it carries are trusted here.
+    The browser route checks the user_id against the JWT before calling.
+    """
+    from decimal import Decimal as _Decimal
+    from integrations.ap2 import payment_ledger
+    from integrations.ap2.ap2_protocol import (
+        PaymentGateway, PaymentMethod, PaymentRequest, PaymentStatus,
+    )
+    from integrations.social.models import CommercialAPIKey
+
+    session_id = getattr(session, 'id', None) or ''
+    meta = _session_metadata(session)
+    if meta is None:
+        return {'success': False, 'error': 'Session metadata could not be read.'}, 500
+    if not _is_tier_upgrade_checkout(meta):
+        return {'success': False, 'error': 'Session is not a tier upgrade.'}, 400
+    api_key_id = meta.get('api_key_id', '')
+    user_id = str(meta.get('user_id') or '')
+    target_tier = (meta.get('target_tier') or '').lower()
+    if target_tier not in TIER_CONFIG or target_tier == 'free':
+        return {'success': False, 'error': 'Session has invalid target_tier metadata.'}, 400
+
+    api_key = db.query(CommercialAPIKey).filter_by(
+        id=api_key_id, user_id=user_id).first()
+    if not api_key:
+        return {'success': False, 'error': 'API key not found'}, 404
+
+    amount_usd = float(session.amount_total) / 100.0
+
+    with payment_ledger.lock:
+        payment = _recorded_checkout_unlocked(session_id)
+        already = payment is not None
+        if not already:
+            # Record the revenue: a COMPLETED PaymentRequest in the ledger
+            # so settle_metered_api_costs + get_api_revenue_stats see it.
+            payment = PaymentRequest(
+                amount=_Decimal(str(amount_usd)),
+                currency=(getattr(session, 'currency', None) or 'usd').upper(),
+                description=f'API tier upgrade via Checkout: {api_key.tier} → {target_tier}',
+                requester_agent_id=f'user:{user_id}',
+                payment_method=PaymentMethod.STRIPE,
+                metadata={
+                    'kind': 'tier_upgrade',
+                    'api_key_id': api_key_id,
+                    'current_tier': api_key.tier,
+                    'target_tier': target_tier,
+                    'stripe_session_id': session_id,
+                    'stripe_payment_intent': getattr(session, 'payment_intent', None),
+                    'stripe_customer': getattr(session, 'customer', None),
+                },
+            )
+            payment.gateway = PaymentGateway.STRIPE
+            payment.update_status(PaymentStatus.AUTHORIZED, 'Stripe Checkout paid')
+            payment.gateway_transaction_id = getattr(session, 'payment_intent', None) or session_id
+            payment.update_status(PaymentStatus.COMPLETED, 'Stripe Checkout finalized')
+            payment_ledger.payments[payment.payment_id] = payment
+            payment_ledger.save_ledger()
+
+    # The bought tier: applied on the first finalize, and again by a replay
+    # when a bump failed after the record was made (a 500 asks Stripe to
+    # retry; the retry used to be answered already_completed over a key
+    # still on the old tier, the review of 3153761b3).  Never a downgrade.
+    _changed, failure = _apply_bought_tier(db, api_key, target_tier)
+    if failure is not None:
+        return _bump_failed(f'Stripe session {session_id}', api_key_id, failure,
+                            retry="Stripe redelivers the event on the 500 and the buyer's "
+                                  'reload re-POSTs the session; either runs the bump again',
+                            retries=True, payment_request_id=payment.payment_id,
+                            session_id=session_id)
+
+    return _checkout_payload(payment, api_key, already_completed=already), 200
+
+
 @commercial_api_bp.route('/api/v1/intelligence/upgrade/checkout/complete',
                          methods=['POST'])
 def complete_upgrade_checkout():
@@ -1640,7 +2174,9 @@ def complete_upgrade_checkout():
 
     Idempotent: replays with the same session_id are detected via the
     payment_ledger metadata index and return 200 with the already-applied
-    state rather than double-charging or double-upgrading.
+    state rather than double-charging or double-upgrading.  The webhook
+    (stripe_webhook) usually finalizes the session first; this route then
+    answers ``already_completed`` without asking Stripe.
 
     Auth: Bearer JWT.  The session metadata must contain `user_id`
     matching the JWT user — prevents Alice from completing Bob's
@@ -1666,34 +2202,36 @@ def complete_upgrade_checkout():
                 'error': 'session_id required (starts with cs_)',
             }), 400
 
-        try:
-            from integrations.ap2 import payment_ledger
-            from integrations.ap2.ap2_protocol import (
-                PaymentGateway, PaymentMethod, PaymentRequest, PaymentStatus,
-            )
-        except Exception as e:
-            return jsonify({
-                'success': False,
-                'error': f'AP2 payment surface unavailable: {e}',
-            }), 503
-        stripe_gw = payment_ledger.gateways.get(PaymentGateway.STRIPE)
-        if stripe_gw is None or not getattr(stripe_gw, 'connected', False) \
-                or stripe_gw._stripe is None:
-            return jsonify({
-                'success': False,
-                'error': 'Stripe gateway not registered.',
-            }), 503
+        stripe_gw, refusal = _stripe_gateway()
+        if refusal is not None:
+            return refusal
 
-        # Idempotency check: if we've already recorded this session,
-        # skip re-charging the buyer.
-        for existing in payment_ledger.payments.values():
-            if (existing.metadata or {}).get('stripe_session_id') == session_id:
+        # A replay (or the webhook got there first): answer the same page
+        # without asking Stripe, to the key's owner only, and finish the
+        # bump if the record outlived a failed one (the buyer's first visit
+        # recorded the payment and the bump failed; every reload then said
+        # success over a key still on free, the review of fd2b4773c).
+        existing = _recorded_checkout(session_id)
+        if existing is not None:
+            from integrations.social.models import CommercialAPIKey
+            recorded = existing.metadata or {}
+            api_key = db.query(CommercialAPIKey).filter_by(
+                id=recorded.get('api_key_id'), user_id=str(user.id)).first()
+            if not api_key:
                 return jsonify({
-                    'success': True,
-                    'already_completed': True,
-                    'payment_request_id': existing.payment_id,
-                    'status': existing.status.value if hasattr(existing.status, 'value') else str(existing.status),
-                }), 200
+                    'success': False,
+                    'error': 'Session belongs to a different user.',
+                }), 403
+            _changed, failure = _apply_bought_tier(db, api_key, recorded.get('target_tier'))
+            if failure is not None:
+                payload, status = _bump_failed(
+                    f'Stripe session {session_id}', api_key.id, failure,
+                    retry="the buyer's reload re-POSTs the session, and Stripe's event, "
+                          'when it is still due, finalizes it; either runs the bump again',
+                    retries=True, payment_request_id=existing.payment_id,
+                    session_id=session_id)
+                return jsonify(payload), status
+            return jsonify(_checkout_payload(existing, api_key, already_completed=True)), 200
 
         try:
             session = stripe_gw._stripe.checkout.Session.retrieve(session_id)
@@ -1710,8 +2248,15 @@ def complete_upgrade_checkout():
                 'session_id': session_id,
             }), 402
 
-        meta = session.metadata or {}
-        if meta.get('kind') != 'tier_upgrade_checkout':
+        # The kind before the user, as before the finalizer was lifted out:
+        # a session that is no tier upgrade is a 400 whoever asks.
+        meta = _session_metadata(session)
+        if meta is None:
+            return jsonify({
+                'success': False,
+                'error': 'Session metadata could not be read.',
+            }), 500
+        if not _is_tier_upgrade_checkout(meta):
             return jsonify({
                 'success': False,
                 'error': 'Session is not a tier upgrade.',
@@ -1721,87 +2266,90 @@ def complete_upgrade_checkout():
                 'success': False,
                 'error': 'Session belongs to a different user.',
             }), 403
-        api_key_id = meta.get('api_key_id', '')
-        target_tier = (meta.get('target_tier') or '').lower()
-        if target_tier not in TIER_CONFIG or target_tier == 'free':
-            return jsonify({
-                'success': False,
-                'error': 'Session has invalid target_tier metadata.',
-            }), 400
 
-        from integrations.social.models import CommercialAPIKey
-        api_key = db.query(CommercialAPIKey).filter_by(
-            id=api_key_id, user_id=str(user.id)).first()
-        if not api_key:
-            return jsonify({'success': False, 'error': 'API key not found'}), 404
-
-        target_cfg = TIER_CONFIG[target_tier]
-        amount_usd = float(session.amount_total) / 100.0
-
-        # Record the revenue: insert a COMPLETED PaymentRequest into the
-        # ledger so settle_metered_api_costs + get_api_revenue_stats see it.
-        from decimal import Decimal as _Decimal
-        payment = PaymentRequest(
-            amount=_Decimal(str(amount_usd)),
-            currency=(session.currency or 'usd').upper(),
-            description=f'API tier upgrade via Checkout: {api_key.tier} → {target_tier}',
-            requester_agent_id=f'user:{user.id}',
-            payment_method=PaymentMethod.STRIPE,
-            metadata={
-                'kind': 'tier_upgrade',
-                'api_key_id': api_key_id,
-                'current_tier': api_key.tier,
-                'target_tier': target_tier,
-                'stripe_session_id': session_id,
-                'stripe_payment_intent': getattr(session, 'payment_intent', None),
-                'stripe_customer': getattr(session, 'customer', None),
-            },
-        )
-        payment.gateway = PaymentGateway.STRIPE
-        payment.update_status(PaymentStatus.AUTHORIZED, 'Stripe Checkout paid')
-        payment.gateway_transaction_id = getattr(session, 'payment_intent', None) or session_id
-        payment.update_status(PaymentStatus.COMPLETED, 'Stripe Checkout finalized')
-
-        with payment_ledger.lock:
-            payment_ledger.payments[payment.payment_id] = payment
-            payment_ledger.save_ledger()
-
-        # Apply the tier bump.
-        try:
-            api_key.tier = target_tier
-            api_key.rate_limit_per_day = target_cfg['rate_limit_per_day']
-            api_key.monthly_quota = target_cfg['monthly_quota']
-            db.commit()
-        except Exception as e:
-            logger.error(f"MANUAL RECONCILIATION NEEDED: Stripe session "
-                         f"{session_id} paid but tier bump failed for "
-                         f"api_key {api_key_id}: {e}")
-            return jsonify({
-                'success': False,
-                'error': f'Payment succeeded but tier bump failed: {e}',
-                'payment_request_id': payment.payment_id,
-                'session_id': session_id,
-            }), 500
-
-        return jsonify({
-            'success': True,
-            'payment_request_id': payment.payment_id,
-            'api_key': {
-                'id': str(api_key.id),
-                'tier': api_key.tier,
-                'rate_limit_per_day': api_key.rate_limit_per_day,
-                'monthly_quota': api_key.monthly_quota,
-            },
-            'payment': {
-                'amount_usd': amount_usd,
-                'stripe_session_id': session_id,
-                'stripe_payment_intent': getattr(session, 'payment_intent', None),
-                'status': 'completed',
-            },
-            'revenue_split': _revenue_split_usd(amount_usd),
-        }), 200
+        payload, status = _finalize_paid_checkout_session(session, db)
+        return jsonify(payload), status
     finally:
         try:
             db.close()
         except Exception:
             pass
+
+
+@commercial_api_bp.route('/api/v1/intelligence/stripe/webhook', methods=['POST'])
+def stripe_webhook():
+    """Stripe's signed event: a paid Checkout Session bumps its tier here,
+    whether or not the buyer's browser ever reaches the success page.
+
+    Register the endpoint in the Stripe dashboard for the event
+    ``checkout.session.completed`` and set its signing secret as
+    STRIPE_WEBHOOK_SECRET (deploy/go_live_stripe.md).  The raw body and the
+    Stripe-Signature header go to StripePaymentGateway.verify_webhook;
+    nothing in the body is read before that.  Answers: 503 when the Stripe
+    gateway is not registered or the secret is not set (nothing unsigned is
+    ever trusted; Stripe retries non-2xx for days, so the operator can fix
+    the configuration without losing the event), 400 when the signature or
+    the payload is refused, 200 for an event of another type or an unpaid
+    session, and 200 ``ignored`` for a paid session that is not one of
+    this node's tier upgrades (another product on the same Stripe account,
+    the dashboard's test event); the finalizer's status otherwise: a 500
+    (the tier bump failed) asks Stripe to retry, and the retry finds the
+    record and finishes the bump; a 4xx from it (malformed tier, no such
+    key) is answered 200 with the error named and an ERROR line for a
+    person, since a retry cannot fix it.
+    """
+    stripe_gw, refusal = _stripe_gateway()
+    if refusal is not None:
+        return refusal
+    if not getattr(stripe_gw, 'webhook_secret', ''):
+        logger.error("Stripe webhook received but STRIPE_WEBHOOK_SECRET is not "
+                     "set; the event is not trusted")
+        return jsonify({'success': False,
+                        'error': 'STRIPE_WEBHOOK_SECRET is not set on this node'}), 503
+    try:
+        event = stripe_gw.verify_webhook(request.get_data(),
+                                         request.headers.get('Stripe-Signature', ''))
+    except ValueError as e:
+        logger.warning(f"Stripe webhook refused: {e}")
+        return jsonify({'success': False, 'error': 'Invalid signature'}), 400
+
+    event_type = getattr(event, 'type', None)
+    if event_type != 'checkout.session.completed':
+        return jsonify({'success': True, 'status': 'ignored', 'type': event_type}), 200
+    session = event.data.object
+    session_id = getattr(session, 'id', None)
+    if getattr(session, 'payment_status', None) != 'paid':
+        return jsonify({'success': True, 'status': 'unpaid', 'session_id': session_id}), 200
+    meta = _session_metadata(session)
+    if meta is None:
+        # Unreadable is not "not ours": a 500 keeps Stripe delivering (for
+        # days) until a person has read the ERROR line _session_metadata
+        # wrote; a 200 here lost a paid tier upgrade with the retries
+        # stopped (the review of fd2b4773c).
+        logger.error("MANUAL RECONCILIATION NEEDED: Stripe session %s paid but its "
+                     "metadata could not be read; not finalized, Stripe will retry",
+                     session_id)
+        return jsonify({'success': False, 'status': 'metadata_unreadable',
+                        'session_id': session_id}), 500
+    if not _is_tier_upgrade_checkout(meta):
+        # Not one of this node's tier upgrades: another product's checkout
+        # on the same account, or the dashboard's test event.  Acknowledged
+        # and ignored; it is not a reconciliation case.
+        logger.info("Stripe webhook: paid session %s is not a tier upgrade; ignored",
+                    session_id)
+        return jsonify({'success': True, 'status': 'ignored', 'session_id': session_id}), 200
+
+    from integrations.social.models import get_db
+    db = get_db()
+    try:
+        payload, status = _finalize_paid_checkout_session(session, db)
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+    if 400 <= status < 500:
+        logger.error(f"MANUAL RECONCILIATION NEEDED: Stripe session {session_id} "
+                     f"paid but not finalized: {payload.get('error')}")
+        return jsonify(dict(payload, status='not_finalized', session_id=session_id)), 200
+    return jsonify(payload), status

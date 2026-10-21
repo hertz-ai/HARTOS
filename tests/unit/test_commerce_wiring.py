@@ -164,7 +164,12 @@ def shell_world(monkeypatch, tmp_path):
     monkeypatch.setattr(LiquidUIService, '_register_self', lambda self: None)
     monkeypatch.setattr('integrations.agent_engine.liquid_ui_service.push_agent_ui',
                         lambda *a, **k: True)
+    from tests.unit.ap2_doubles import CardRailDouble
     ledger = PaymentLedger(ledger_path=str(tmp_path / 'l.json'))
+    # A keyed node: a mock-only ledger refuses the approval and cancels the
+    # payment (ap2_protocol.mock_would_settle); this test is about who may
+    # decide, not about the rail.
+    ledger.add_gateway(CardRailDouble())
     store = MandateStore(str(tmp_path / 'm.json'), ledger=ledger, key=b'k' * 32)
     monkeypatch.setattr('integrations.ap2.ap2_mandate.get_mandate_store', lambda: store)
     client = LiquidUIService()._create_flask_app().test_client()

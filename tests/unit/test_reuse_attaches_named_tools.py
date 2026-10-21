@@ -176,12 +176,15 @@ class TestReuseConsultsTheActionsNamedTools:
         # The tag scan moved into core.agent_tool_menu.attach_for_turn, the
         # one per-turn attach CREATE's turn now shares (review of d99b1aa88);
         # follow that indirection as the named attach's is followed above.
+        # It scans through resolve_goal_tags, the one rule that also holds the
+        # record's stored tags (critic report 2.6; its behaviour is pinned in
+        # test_turn_attach_reads_stored_tags.py).
         assert 'attach_for_turn(' in block, (
             'the tag scan stays — it is the fallback for families nothing '
             'names; this fix is ADDITIVE, not a replacement')
         from core.agent_tool_menu import attach_for_turn
         import inspect
-        assert 'detect_goal_tags(' in inspect.getsource(attach_for_turn)
+        assert 'resolve_goal_tags(' in inspect.getsource(attach_for_turn)
 
 
 class TestNamedToolExtraction:

@@ -1,0 +1,20 @@
+Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'VID_20261012_110500.mp4':
+  Metadata:
+    major_brand     : isom
+    minor_version   : 512
+    compatible_brands: isomiso2avc1mp41
+    creation_time   : 2026-10-12T05:35:00.000000Z
+    encoder         : Lavf61.7.100
+  Duration: 00:00:01.00, start: 0.000000, bitrate: 27947 kb/s
+  Stream #0:0[0x1](und): Video: h264 (Constrained Baseline) (avc1 / 0x31637661), yuv420p(progressive), 1920x1080 [SAR 1:1 DAR 16:9], 27855 kb/s, 60 fps, 60 tbr, 15360 tbn (default)
+      Metadata:
+        creation_time   : 2026-10-12T05:35:00.000000Z
+        handler_name    : VideoHandler
+        vendor_id       : [0][0][0][0]
+        encoder         : Lavc61.19.100 libx264
+  Stream #0:1[0x2](und): Audio: aac (LC) (mp4a / 0x6134706D), 48000 Hz, mono, fltp, 70 kb/s (default)
+      Metadata:
+        creation_time   : 2026-10-12T05:35:00.000000Z
+        handler_name    : SoundHandler
+        vendor_id       : [0][0][0][0]
+At least one output file must be specified

@@ -176,6 +176,27 @@ def reopen_owner_feed_answers():
         ai_sensing._answered.clear()
 
 
+@pytest.fixture(autouse=True)
+def fresh_shared_vision_backends():
+    """get_vision_backend keeps ONE instance of each vision backend per
+    process (owner ruling 2026-10-15: the reel, the book reader and
+    VisionService hold the same one).  Every test starts and ends with none,
+    as a fresh process does, so one test's start state -- a launch cooldown,
+    a spy left on a method -- never reaches the next."""
+    _forget_shared_vision_backends()
+    yield
+    _forget_shared_vision_backends()
+
+
+def _forget_shared_vision_backends():
+    # Only if a test loaded the real module -- never import it here (see
+    # reopen_owner_feed_answers).
+    module = sys.modules.get('integrations.vision.lightweight_backend')
+    shared = getattr(module, '_SHARED', None)
+    if isinstance(shared, dict):
+        shared.clear()
+
+
 @pytest.fixture
 def idle_desktop(monkeypatch):
     """Nobody is at this computer and nothing presses on it.
