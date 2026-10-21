@@ -96,8 +96,11 @@ def commerce_mandate(mandate_id):
     user_id = approver_from_request(request)
     if not user_id:
         return _json_error('sign in first', 401)
-    from integrations.ap2.ap2_mandate import get_mandate_store
-    m = get_mandate_store().get(mandate_id)
+    from integrations.ap2.ap2_mandate import MandateKeyError, get_mandate_store
+    try:
+        m = get_mandate_store().get(mandate_id)
+    except MandateKeyError as e:
+        return _json_error(str(e), 503)
     # Someone else's mandate answers exactly like a missing one.
     if m is None or m.user_id != user_id:
         return _json_error('mandate not found', 404)

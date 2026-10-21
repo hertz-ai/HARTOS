@@ -156,6 +156,16 @@ class TestMandateRead:
     def test_no_token(self, ctx):
         assert ctx['client'].get('/api/commerce/mandates/x').status_code == 401
 
+    def test_a_node_whose_key_cannot_be_read_answers_the_pause(self, ctx):
+        from integrations.ap2.ap2_mandate import MandateKeyError, PAYMENTS_PAUSED
+        m = ctx['mandates'].create_cart_mandate('mcg-4242', 'mcgroce', CART)
+        tok = generate_jwt('mcg-4242', 'asha', tenant_id='mcgroce')
+        with patch.object(ctx['mandates'], 'get', side_effect=MandateKeyError()):
+            r = ctx['client'].get(f'/api/commerce/mandates/{m.mandate_id}',
+                                  headers={'Authorization': f'Bearer {tok}'})
+        assert r.status_code == 503
+        assert r.get_json() == {'success': False, 'error': PAYMENTS_PAUSED}
+
 
 def test_the_signing_memory_starts_when_the_routes_load():
     # The "signed before this process started" line is drawn when signing

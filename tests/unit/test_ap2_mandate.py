@@ -7,6 +7,7 @@ TestDecidePayment.  The Mock gateway alone is the no-payment-keys case.
 """
 import json
 import logging
+import time
 from unittest.mock import patch
 
 import pytest
@@ -293,36 +294,65 @@ class TestOrderRef:
         assert not store.paid_as_signed(m, payment)
 
 
+def _key_files(folder):
+    return {p.name for p in folder.iterdir() if p.name.startswith('.ap2_mandate_key')}
+
+
+def _unreadable(path):
+    """builtins.open that refuses to READ ``path`` (locked by another
+    process, denied); every other file, and the lock file, opens as usual."""
+    real_open = open
+
+    def locked(p, mode='r', *a, **k):
+        if str(p) == str(path) and 'r' in mode:
+            raise PermissionError('in use by another process')
+        return real_open(p, mode, *a, **k)
+    return patch('builtins.open', locked)
+
+
 class TestMandateKey:
     """Every record is signed with the node's mandate key, so it is created
-    once and never replaced: a new key would orphan every paid record."""
+    once, read as it is on disk, and never replaced: a new key would orphan
+    every paid record.  One writer at a time, across threads and processes."""
 
     def test_a_missing_key_is_created_once_and_kept(self, tmp_path):
-        path = str(tmp_path / 'data' / '.ap2_mandate_key')
-        first = _load_or_create_key(path)
-        assert len(first) == 32 and _load_or_create_key(path) == first
+        folder = tmp_path / 'data'
+        first = _load_or_create_key(str(folder / '.ap2_mandate_key'))
+        assert len(first) == 32
+        assert _load_or_create_key(str(folder / '.ap2_mandate_key')) == first
+        assert (folder / '.ap2_mandate_key').read_text() == first.hex()
+        # The lock file stays (deleting it would reopen the race); no temp.
+        assert _key_files(folder) == {'.ap2_mandate_key', '.ap2_mandate_key.lock'}
 
     def test_an_unreadable_key_is_never_replaced(self, tmp_path):
+        from integrations.ap2.ap2_mandate import PAYMENTS_PAUSED
         path = tmp_path / '.ap2_mandate_key'
         path.write_text('ab' * 32, encoding='utf-8')
-        real_open = open
-
-        def locked(p, mode='r', *a, **k):
-            if str(p) == str(path) and 'r' in mode:
-                raise PermissionError('in use by another process')
-            return real_open(p, mode, *a, **k)
-
-        with patch('builtins.open', locked):
-            with pytest.raises(MandateKeyError):
+        with _unreadable(path):
+            with pytest.raises(MandateKeyError) as e:
                 _load_or_create_key(str(path))
+        assert str(e.value) == PAYMENTS_PAUSED
         assert path.read_text(encoding='utf-8') == 'ab' * 32
+        assert _key_files(tmp_path) == {'.ap2_mandate_key', '.ap2_mandate_key.lock'}
 
-    def test_a_file_that_is_not_a_key_is_never_replaced(self, tmp_path):
+    def test_a_key_re_saved_by_an_editor_is_read_not_replaced(self, tmp_path):
+        # Notepad adds a BOM and CRLF: the key is the same key, and replacing
+        # it would orphan every record it signed.
         path = tmp_path / '.ap2_mandate_key'
-        path.write_text('﻿' + 'ab' * 32, encoding='utf-8')   # an editor's BOM
+        saved = b'\xef\xbb\xbf' + b'ab' * 32 + b'\r\n'
+        path.write_bytes(saved)
+        assert _load_or_create_key(str(path)) == bytes.fromhex('ab' * 32)
+        assert path.read_bytes() == saved
+
+    def test_a_file_that_holds_no_key_pauses_payments_and_is_kept(self, tmp_path):
+        # Whether this should mint a fresh key instead is the owner's open
+        # call; until then the fail-closed answer is to pause for a person.
+        path = tmp_path / '.ap2_mandate_key'
+        path.write_text('not a key at all', encoding='utf-8')
         with pytest.raises(MandateKeyError):
             _load_or_create_key(str(path))
-        assert path.read_text(encoding='utf-8') == '﻿' + 'ab' * 32
+        assert path.read_text(encoding='utf-8') == 'not a key at all'
+        assert _key_files(tmp_path) == {'.ap2_mandate_key', '.ap2_mandate_key.lock'}
 
     def test_a_key_that_cannot_be_saved_signs_nothing(self, tmp_path):
         blocker = tmp_path / 'not_a_dir'
@@ -335,6 +365,84 @@ class TestMandateKey:
         path.write_text('', encoding='utf-8')
         key = _load_or_create_key(str(path))
         assert path.read_text(encoding='utf-8') == key.hex()
+
+    def test_a_paused_store_changes_nothing(self, tmp_path):
+        # Every change is signed, so a store that cannot sign refuses BEFORE
+        # it touches the ledger or a record: no payment is cancelled,
+        # created or authorized, in memory or on disk.
+        ledger = PaymentLedger(ledger_path=str(tmp_path / 'ledger.json'))
+        ledger.add_gateway(CardRailDouble())
+        path, key_path = str(tmp_path / 'ap2_mandates.json'), tmp_path / '.ap2_mandate_key'
+        live = MandateStore(path=path, ledger=ledger)
+        pending = live.create_cart_mandate('u1', 'mcgroce', CART,
+                                           kind='commerce_checkout', cart_ref='555')
+        approved = live.create_cart_mandate('u1', 'mcgroce', CART,
+                                            kind='commerce_checkout', cart_ref='556')
+        assert live.approve(approved.mandate_id, 'u1')[0]
+        file_before = (tmp_path / 'ap2_mandates.json').read_bytes()
+        statuses = {p.payment_id: p.status for p in ledger.payments.values()}
+        worker = MandateStore(path=path, ledger=ledger)      # key not cached
+        with _unreadable(key_path):
+            for change in (lambda: worker.approve(pending.mandate_id, 'u1'),
+                           lambda: worker.reject(pending.mandate_id, 'u1'),
+                           lambda: worker.withdraw(approved.mandate_id, 'cart changed'),
+                           lambda: worker.consume(approved.mandate_id),
+                           lambda: worker.record_order(approved.mandate_id, 'ORD-1'),
+                           lambda: worker.supersede('u1', 'mcgroce', 'commerce_checkout', '557'),
+                           lambda: worker.create_cart_mandate('u1', 'mcgroce', CART)):
+                with pytest.raises(MandateKeyError):
+                    change()
+        assert {p.payment_id: p.status for p in ledger.payments.values()} == statuses
+        assert len(ledger.payments) == 2
+        assert (tmp_path / 'ap2_mandates.json').read_bytes() == file_before
+        assert worker.get(pending.mandate_id).status == 'pending'
+        assert worker.get(approved.mandate_id).status == 'approved'
+
+    def test_two_threads_creating_the_first_key_hold_the_same_key(self, tmp_path):
+        import threading
+        path = str(tmp_path / '.ap2_mandate_key')
+        gate, keys = threading.Barrier(2), []
+
+        def one():
+            gate.wait()
+            keys.append(_load_or_create_key(path))
+
+        threads = [threading.Thread(target=one) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(30)
+        assert len(keys) == 2 and keys[0] == keys[1]
+        assert (tmp_path / '.ap2_mandate_key').read_text() == keys[0].hex()
+        assert _key_files(tmp_path) == {'.ap2_mandate_key', '.ap2_mandate_key.lock'}
+
+    def test_two_processes_creating_the_first_key_hold_the_same_key(self, tmp_path):
+        # The real first-boot hazard: two workers, one data dir.  Each child
+        # imports, says it is ready, then waits for one 'go' so both race.
+        import subprocess
+        import sys
+        from pathlib import Path
+        root = str(Path(__file__).resolve().parents[2])
+        path = str(tmp_path / '.ap2_mandate_key')
+        go = tmp_path / 'go'
+        prog = ('import os, sys, time\n'
+                'sys.path.insert(0, sys.argv[3])\n'
+                'from integrations.ap2.ap2_mandate import _load_or_create_key\n'
+                'open(sys.argv[2] + ".ready" + sys.argv[4], "w").close()\n'
+                'while not os.path.exists(sys.argv[2]):\n'
+                '    time.sleep(0.002)\n'
+                'print(_load_or_create_key(sys.argv[1]).hex())\n')
+        procs = [subprocess.Popen([sys.executable, '-c', prog, path, str(go), root, str(i)],
+                                  stdout=subprocess.PIPE, text=True, cwd=root)
+                 for i in range(2)]
+        deadline = time.time() + 120
+        while not all((tmp_path / f'go.ready{i}').exists() for i in range(2)):
+            assert time.time() < deadline, 'children never got past their imports'
+            time.sleep(0.05)
+        go.write_text('go')
+        outs = [p.communicate(timeout=60)[0].strip() for p in procs]
+        assert outs[0] == outs[1] and len(outs[0]) == 64, outs
+        assert (tmp_path / '.ap2_mandate_key').read_text() == outs[0]
 
 
 class TestSupersede:
@@ -496,6 +604,31 @@ class TestDecidePayment:
                    return_value=True) as push:
             self.push = push
             yield
+
+    def test_a_key_that_cannot_be_read_pauses_the_answer_and_keeps_the_card_open(self, tmp_path):
+        # The approval answers 503 with the pause, nothing is signed, no key
+        # file is written and the card stays open; once the key reads again
+        # the same answer approves, and the earlier record still verifies.
+        from integrations.ap2.ap2_mandate import PAYMENTS_PAUSED, decide_payment
+        ledger = PaymentLedger(ledger_path=str(tmp_path / 'ledger.json'))
+        ledger.add_gateway(CardRailDouble())
+        path, key_path = str(tmp_path / 'ap2_mandates.json'), tmp_path / '.ap2_mandate_key'
+        m = MandateStore(path=path, ledger=ledger).create_cart_mandate('u1', 'mcgroce', CART)
+        key_bytes = key_path.read_bytes()
+        worker = MandateStore(path=path, ledger=ledger)      # another worker: key not cached
+        with _unreadable(key_path):
+            payload, code = decide_payment(m.payment_id, 'u1', True, store=worker)
+        assert code == 503, payload
+        assert payload['status'] == 'error' and payload['reason'] == PAYMENTS_PAUSED
+        assert payload['retry_later'] is True
+        assert key_path.read_bytes() == key_bytes
+        assert _key_files(tmp_path) == {'.ap2_mandate_key', '.ap2_mandate_key.lock'}
+        assert ledger.get_payment(m.payment_id).status == PaymentStatus.APPROVAL_REQUIRED
+        later = MandateStore(path=path, ledger=ledger)
+        assert later.get(m.mandate_id).status == 'pending'       # the card is still open
+        payload, code = decide_payment(m.payment_id, 'u1', True, store=later)
+        assert code == 200 and payload['status'] == 'approved', payload
+        assert later.get(m.mandate_id).status == 'consumed'
 
     def test_owner_approval_settles_a_generic_mandate(self, store):
         from integrations.ap2.ap2_mandate import decide_payment

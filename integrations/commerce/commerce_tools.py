@@ -395,15 +395,15 @@ def commerce_prepare_checkout(
     # One live checkout per shopper and cart: two approval cards for one cart
     # could otherwise both be paid, and only the first could become an order.
     cart_ref = str(view['order_id'])
-    ok, reason = _mandates().supersede(user_id, MERCHANT, CHECKOUT_KIND, cart_ref)
-    if not ok:
-        return _fail(reason)
     try:
+        ok, reason = _mandates().supersede(user_id, MERCHANT, CHECKOUT_KIND, cart_ref)
+        if not ok:
+            return _fail(reason)
         m = _mandates().create_cart_mandate(
             user_id, MERCHANT, mandate_cart(view), cap=cap,
             description=f"McGroce order, {len(view['items'])} item(s)",
             kind=CHECKOUT_KIND, requester_agent_id=_AGENT_ID, cart_ref=cart_ref)
-    except MandateError as e:
+    except MandateError as e:       # a bad cart, or the node's payment pause
         return _fail(str(e))
     count = sum(i['quantity'] for i in view['items'])
     push_fragment(user_id, {'type': 'checkout',
@@ -436,19 +436,26 @@ def commerce_checkout(
     payment went through but the order did not, this places the order with
     that payment; it never charges again.
     """
-    m = _mandates().get(mandate_id)
-    if m is None or m.user_id != str(user_id) or m.kind != CHECKOUT_KIND:
-        return _fail('checkout refused: mandate not found')
-    if m.status == 'consumed':
-        return _out(retry_order(m))
+    from integrations.ap2.ap2_mandate import MandateKeyError
     from integrations.ap2.ap2_protocol import PaymentStatus, get_payment_ledger
-    payment = get_payment_ledger().get_payment(m.payment_id)
-    if m.status == 'approved' and payment is not None \
-            and payment.status == PaymentStatus.COMPLETED:
-        # Paid, and its order step never finished (the gateway callback
-        # failed midway): it runs now, and never charges again.
-        return _out(complete_redirect_checkout(m.payment_id))
-    return _out(settle_checkout(m))
+    try:
+        m = _mandates().get(mandate_id)
+        if m is None or m.user_id != str(user_id) or m.kind != CHECKOUT_KIND:
+            return _fail('checkout refused: mandate not found')
+        if m.status == 'consumed':
+            return _out(retry_order(m))
+        payment = get_payment_ledger().get_payment(m.payment_id)
+        if m.status == 'approved' and payment is not None \
+                and payment.status == PaymentStatus.COMPLETED:
+            # Paid, and its order step never finished (the gateway callback
+            # failed midway): it runs now, and never charges again.
+            return _out(complete_redirect_checkout(m.payment_id))
+        return _out(settle_checkout(m))
+    except MandateKeyError as e:
+        # The node's payment pause: nothing was read or changed, the
+        # approval stays as it is, and the shopper hears why.
+        logger.error(f'commerce: checkout {mandate_id} not run: {e}')
+        return _fail(str(e))
 
 
 def _nothing_charged(user_id, message: str) -> None:

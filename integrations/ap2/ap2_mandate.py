@@ -28,6 +28,7 @@ core.platform_paths.get_agent_data_dir().  Each record carries an HMAC so a
 hand-edited file (flipping a mandate to approved) fails verification.
 """
 
+import contextlib
 import hashlib
 import hmac
 import json
@@ -35,6 +36,7 @@ import logging
 import os
 import secrets
 import stat
+import tempfile
 import threading
 import time
 import uuid
@@ -81,9 +83,20 @@ class MandateError(ValueError):
     """A mandate could not be created (bad cart, over the cap)."""
 
 
+#: Why payments stop on a node whose mandate key cannot be used: the one
+#: spelling the approval answer (503), the mandate route and the commerce
+#: tools give the person.  The approval card stays open, so they can answer
+#: again once the key reads.
+PAYMENTS_PAUSED = ('payments are paused on this node because its payment key '
+                   'cannot be read or saved; nothing was charged')
+
+
 class MandateKeyError(MandateError):
     """The node's mandate key cannot be read or saved right now: nothing is
     signed until it can (see _load_or_create_key)."""
+
+    def __init__(self, message: str = PAYMENTS_PAUSED):
+        super().__init__(message)
 
 
 def _money(value) -> Decimal:
@@ -202,6 +215,14 @@ class MandateStore:
         return hmac.new(self._signing_key(), body.encode('utf-8'),
                         hashlib.sha256).hexdigest()
 
+    def _ready_to_sign(self) -> None:
+        """Every change to a record is signed, so a node that cannot sign
+        (MandateKeyError from the key file) must refuse BEFORE it cancels,
+        creates or authorizes a payment or edits a record, in memory or on
+        disk.  Called first by every state-changing method: the key is in
+        hand, or the pause is answered with everything as it was."""
+        self._signing_key()
+
     # ── persistence (caller holds the lock for _save) ────────────
     def _load(self) -> None:
         try:
@@ -315,6 +336,7 @@ class MandateStore:
         Raises MandateError for an empty or malformed cart, a non-positive
         total, or a total over ``cap``.
         """
+        self._ready_to_sign()
         # Expiry is lazy; each new checkout also expires the old ones, so a
         # mandate nobody reads again does not keep its payment AUTHORIZED.
         self.sweep_expired()
@@ -394,6 +416,7 @@ class MandateStore:
     def approve(self, mandate_id: str, approver_id: str) -> Tuple[bool, str]:
         """The owner approves: authorize the payment, mark approved."""
         with self._lock:
+            self._ready_to_sign()
             m = self._mandates.get(mandate_id)
             if m is None:
                 return False, 'mandate not found'
@@ -418,6 +441,7 @@ class MandateStore:
 
     def reject(self, mandate_id: str, approver_id: str) -> Tuple[bool, str]:
         with self._lock:
+            self._ready_to_sign()
             m = self._mandates.get(mandate_id)
             if m is None:
                 return False, 'mandate not found'
@@ -442,6 +466,7 @@ class MandateStore:
         approves a fresh mandate instead.
         """
         with self._lock:
+            self._ready_to_sign()
             m = self._mandates.get(mandate_id)
             if m is None or m.status != 'approved':
                 return False
@@ -521,6 +546,7 @@ class MandateStore:
         """approved -> consumed.  A consumed mandate never pays again.
         A record edited outside this store is never re-signed."""
         with self._lock:
+            self._ready_to_sign()
             m = self._mandates.get(mandate_id)
             if m is None or m.status != 'approved' or not self._intact(m):
                 return False
@@ -538,6 +564,7 @@ class MandateStore:
     def record_order(self, mandate_id: str, order_ref: str) -> bool:
         """Note what a consumed mandate's payment became (once)."""
         with self._lock:
+            self._ready_to_sign()
             m = self._mandates.get(mandate_id)
             if m is None or m.status != 'consumed' or m.order_ref \
                     or not self._intact(m):
@@ -578,6 +605,7 @@ class MandateStore:
         """
         from integrations.ap2.ap2_protocol import PaymentStatus
         with self._lock:
+            self._ready_to_sign()
             now = time.time()
             mine = [m for m in self._mandates.values()
                     if m.user_id == str(user_id) and m.merchant == merchant
@@ -714,7 +742,10 @@ def request_human_approval(payment_id: str, store: Optional[MandateStore] = None
     """Put a payment's approval card in front of its owner.  What the
     agent-side ``authorize_payment`` tool does: it can ask, never approve."""
     store = store or get_mandate_store()
-    m = store.find_by_payment_id(payment_id)
+    try:
+        m = store.find_by_payment_id(payment_id)
+    except MandateKeyError as e:
+        return {'success': False, 'payment_id': payment_id, 'error': str(e)}
     if m is None:
         return {'success': False, 'payment_id': payment_id,
                 'error': 'this payment has no owner to ask; it cannot be '
@@ -797,23 +828,31 @@ def decide_payment(payment_id: str, approver_id: Optional[str], approved: bool,
         return {'status': 'error', 'action': action,
                 'reason': 'sign in to answer this request'}, 401
     store = store or get_mandate_store()
-    m = store.find_by_payment_id(payment_id)
-    if m is None:
-        return {'status': 'error', 'action': action,
-                'reason': 'payment not found'}, 404
-    if m.user_id != str(approver_id):
-        logger.warning(f'ap2_pay: {approver_id} tried to answer '
-                       f'{m.user_id}\'s payment {payment_id}')
-        return {'status': 'error', 'action': action,
-                'reason': 'this payment belongs to someone else'}, 403
-    if not approved:
-        ok, reason = store.reject(m.mandate_id, approver_id)
-        if ok:
-            push_card(m.user_id, {'type': 'payment_status', 'status': 'cancelled',
-                                  'amount': m.amount, 'currency': m.currency})
-        return {'status': 'denied', 'action': action, 'applied': ok,
-                'reason': reason, 'mandate_id': m.mandate_id}, 200
-    ok, reason = store.approve(m.mandate_id, approver_id)
+    try:
+        m = store.find_by_payment_id(payment_id)
+        if m is None:
+            return {'status': 'error', 'action': action,
+                    'reason': 'payment not found'}, 404
+        if m.user_id != str(approver_id):
+            logger.warning(f'ap2_pay: {approver_id} tried to answer '
+                           f'{m.user_id}\'s payment {payment_id}')
+            return {'status': 'error', 'action': action,
+                    'reason': 'this payment belongs to someone else'}, 403
+        if not approved:
+            ok, reason = store.reject(m.mandate_id, approver_id)
+            if ok:
+                push_card(m.user_id, {'type': 'payment_status', 'status': 'cancelled',
+                                      'amount': m.amount, 'currency': m.currency})
+            return {'status': 'denied', 'action': action, 'applied': ok,
+                    'reason': reason, 'mandate_id': m.mandate_id}, 200
+        ok, reason = store.approve(m.mandate_id, approver_id)
+    except MandateKeyError as e:
+        # Nothing was read or written: the card stays open and the person
+        # can answer again once the key reads.  503, not 500: the node is
+        # pausing payments, not crashing, and the reason is stated.
+        logger.error(f'ap2_pay: {payment_id} not answered: {e}')
+        return {'status': 'error', 'action': action, 'reason': str(e),
+                'retry_later': True}, 503
     if not ok:
         return {'status': 'error', 'action': action, 'reason': reason,
                 'mandate_id': m.mandate_id}, 409
@@ -827,53 +866,139 @@ def decide_payment(payment_id: str, approver_id: Optional[str], approved: bool,
             'result': result}, 200
 
 
+@contextlib.contextmanager
+def _key_file_lock(lock_path: str):
+    """One writer at a time for the mandate key, across threads AND
+    processes: an OS lock on the sidecar ``lock_path``.  fcntl.flock on
+    POSIX and msvcrt.locking on Windows both bind to the handle opened here,
+    so every caller opens its own (a lockf/fcntl lock would belong to the
+    process and let two threads through).  The lock file is never deleted:
+    unlinking it while another caller waits would hand that caller a
+    different file and reopen the race.  Windows gives up after its ten
+    one-second retries with an OSError, which the caller reports as the
+    payment pause."""
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    f = open(lock_path, 'a+')
+    try:
+        if os.name == 'nt':
+            import msvcrt
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            # Unlocked before the close, as the Windows runtime asks.
+            if os.name == 'nt':
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    finally:
+        f.close()
+
+
+def _parse_key(raw: bytes) -> Optional[bytes]:
+    """The ONE reading of the key file, cold boot and re-read alike: utf-8
+    with or without a BOM (a key re-saved in Notepad is still the key, and
+    replacing it would orphan every record it signed), surrounding
+    whitespace and line ends ignored, 64 or more hex digits.  None when the
+    bytes hold no key."""
+    try:
+        text = raw.decode('utf-8-sig').strip()
+    except UnicodeDecodeError:
+        return None
+    if len(text) < 64:
+        return None
+    try:
+        return bytes.fromhex(text)
+    except ValueError:
+        return None
+
+
 def _load_or_create_key(path: str) -> bytes:
     """Node-local HMAC key for mandate records (0600 where supported).
 
-    Created only when there is none (or an empty file a crash left before a
-    key was written).  Every mandate is signed with it, so a key that cannot
-    be read right now is never replaced: a new one would turn every record
-    unverifiable, and a paid one could then never be ordered.  That raises
-    MandateKeyError instead, and so does a new key that could not be saved,
-    which a restart would lose; nothing is signed until the key reads again.
+    Every mandate is signed with it, so the rule is: one key per node, read
+    as it is on disk, created once, never replaced.  Every step here is a
+    check-then-act, so it runs under _key_file_lock: two processes at first
+    boot end with ONE key that both hold.  Under the lock:
+      - a readable key (_parse_key) is returned exactly as it is on disk;
+      - absent, or an empty file (the old create path's crash window), gets
+        a key: written to a temp file in the same directory, fsynced, moved
+        into place with os.replace (atomic on every volume; no hard links,
+        which a FAT or exFAT data dir lacks), the directory fsynced on POSIX
+        so a power loss cannot lose the rename, then read back with the same
+        parser, so what is cached is what is on disk;
+      - unreadable (locked, denied) raises MandateKeyError and writes
+        nothing: a new key would turn every record unverifiable, and a paid
+        one could then never be ordered;
+      - non-empty but not a key also raises and writes nothing.  Whether
+        that should instead mint a fresh key (and lose whatever the file
+        once signed) is the owner's open call; pausing for a person is the
+        fail-closed default.
+    A failure to lock, write, replace or read back is the same
+    MandateKeyError.  On Windows os.replace raises PermissionError while
+    another handle holds the key open; every reader takes the lock, so that
+    is an antivirus scan, brief and rare, and it is reported as the pause
+    rather than retried here: a retry loop would hide a real denial behind
+    delay.
     """
+    directory = os.path.dirname(path)
     try:
-        with open(path, 'r', encoding='utf-8') as f:
-            existing = f.read().strip()
-        mode = 'w'                      # only ever over an empty file
-    except FileNotFoundError:
-        existing, mode = '', 'x'        # never over one written meanwhile
+        with _key_file_lock(path + '.lock'):
+            try:
+                with open(path, 'rb') as f:
+                    raw = f.read()
+            except FileNotFoundError:
+                raw = b''
+            if raw:
+                key = _parse_key(raw)
+                if key is None:
+                    logger.error(f'ap2 mandates: {path} does not hold a key; not '
+                                 f'replaced: restore it, or move it away to start '
+                                 f'with a new key (records signed with the old '
+                                 f'one will not verify)')
+                    raise MandateKeyError()
+                return key
+            fd, tmp = tempfile.mkstemp(prefix=_MANDATE_KEY_FILENAME + '.',
+                                       dir=directory)
+            try:
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                    f.write(secrets.token_hex(32))
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, path)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
+                raise
+            if os.name != 'nt':
+                try:
+                    dfd = os.open(directory, os.O_RDONLY)
+                    try:
+                        os.fsync(dfd)
+                    finally:
+                        os.close(dfd)
+                except OSError as e:
+                    logger.warning(f'ap2 mandates: directory of {path} not '
+                                   f'fsynced ({e}); the key is written, a '
+                                   f'power loss now could lose its name')
+            with contextlib.suppress(OSError, NotImplementedError):
+                os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+            with open(path, 'rb') as f:
+                key = _parse_key(f.read())
+            if key is None:
+                raise MandateKeyError()
+            return key
+    except MandateKeyError:
+        raise
     except OSError as e:
-        logger.error(f'ap2 mandates: key {path} unreadable ({e}); not replaced, '
-                     f'nothing is signed until it reads again')
-        raise MandateKeyError('payment records cannot be signed on this node '
-                              'right now')
-    if existing:
-        try:
-            if len(existing) >= 64:
-                return bytes.fromhex(existing)
-        except ValueError:
-            pass
-        logger.error(f'ap2 mandates: {path} does not hold a key; not replaced: '
-                     f'restore it, or move it away to start with a new key '
-                     f'(records signed with the old one will not verify)')
-        raise MandateKeyError('payment records cannot be signed on this node '
-                              'right now')
-    key = secrets.token_hex(32)
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, mode, encoding='utf-8') as f:
-            f.write(key)
-    except OSError as e:
-        logger.error(f'ap2 mandates: key not saved to {path} ({e}); nothing is '
-                     f'signed with a key a restart would lose')
-        raise MandateKeyError('payment records cannot be signed on this node '
-                              'right now')
-    try:
-        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
-    except (OSError, NotImplementedError):
-        pass
-    return bytes.fromhex(key)
+        logger.error(f'ap2 mandates: key {path} cannot be used ({e}); not '
+                     f'replaced, nothing is signed until it can')
+        raise MandateKeyError()
 
 
 _store: Optional[MandateStore] = None
@@ -891,7 +1016,8 @@ def get_mandate_store() -> MandateStore:
 
 
 __all__ = [
-    'MandateError', 'IntentMandate', 'CartMandate', 'MandateStore',
+    'MandateError', 'MandateKeyError', 'PAYMENTS_PAUSED',
+    'IntentMandate', 'CartMandate', 'MandateStore',
     'canonical_cart_hash', 'get_mandate_store', 'DEFAULT_MANDATE_TTL_S',
     'NON_HUMAN_APPROVERS', 'PERSON_ID_PREFIX', 'approval_action', 'parse_approval_action',
     'request_human_approval', 'register_settler', 'settle', 'decide_payment',
