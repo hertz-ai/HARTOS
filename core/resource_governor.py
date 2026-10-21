@@ -105,16 +105,21 @@ LOAD_BACKOFF_CPU = 0.85
 LOAD_BACKOFF_MEM = 0.90
 
 
-def _find_llm_pids() -> set:
-    """PIDs listening on the local LLM-server port(s) (llama-server).  SINGLE
-    source used by BOTH the governor's own-CPU attribution
-    (``_resolve_llm_server_pid``) and the enforcer's affinity exemption
-    (``_unrestrict_llm_affinity``), so they never drift on which process is
-    'the model'.  Empty set when psutil is unavailable or nothing is listening.
+def _llm_listen_rows() -> list:
+    """The LISTEN sockets on the local LLM-server port(s), as psutil lists
+    them -- the one reader of that socket table.  ``pid`` is None when the
+    OS will not say whose socket it is (another user's, on Linux without
+    root); the port is held all the same.
+
+    RAISES when the table cannot be read: no psutil, or net_connections
+    failing (psutil documents AccessDenied on macOS without root).  "Nobody
+    is listening" and "could not look" are different answers, and the
+    lifecycle watchdog's restart gate needs the difference.
     """
     psutil = _try_import_psutil()
     if psutil is None:
-        return set()
+        raise RuntimeError('psutil is not installed; the socket table '
+                           'cannot be read')
     ports = set()
     try:
         from core.port_registry import get_port
@@ -130,15 +135,23 @@ def _find_llm_pids() -> set:
     except Exception:
         pass
     ports.update((8082, 8080))  # common llama-server defaults
-    pids = set()
+    return [c for c in psutil.net_connections(kind='inet')
+            if c.status == 'LISTEN' and c.laddr and c.laddr.port in ports]
+
+
+def _find_llm_pids() -> set:
+    """PIDs listening on the local LLM-server port(s) (llama-server).  SINGLE
+    source used by BOTH the governor's own-CPU attribution
+    (``_resolve_llm_server_pid``) and the enforcer's affinity exemption
+    (``_unrestrict_llm_affinity``), so they never drift on which process is
+    'the model'.  Empty set when psutil is unavailable, the socket table
+    cannot be read, or nothing is listening.
+    """
     try:
-        for c in psutil.net_connections(kind='inet'):
-            if (c.status == 'LISTEN' and c.laddr
-                    and c.laddr.port in ports and c.pid):
-                pids.add(c.pid)
+        rows = _llm_listen_rows()
     except Exception:
-        pass
-    return pids
+        return set()
+    return {c.pid for c in rows if c.pid}
 
 
 # ═══════════════════════════════════════════════════════════════════════

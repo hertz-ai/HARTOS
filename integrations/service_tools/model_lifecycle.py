@@ -476,9 +476,12 @@ class ModelLifecycleManager:
         self._check_process_health()
         self._wd_heartbeat()
 
-        # Phase 11: Process pending crash restarts (with backoff)
+        # Phase 11: Process pending crash restarts (with backoff).  Not once
+        # stop() has run: the wait above sleeps whole chunks, so it can end
+        # after stop() with a restart due.
         self._wait_for_due_llm_restart()
-        self._process_restart_queue()
+        if self._running:
+            self._process_restart_queue()
         self._wd_heartbeat()
 
         # Phase 12: Swap queue — restore evicted models when space frees up
@@ -1553,13 +1556,13 @@ class ModelLifecycleManager:
         ("in 5s"), and it ran at 01:06:26.500 -- 119.6 s after the backoff.
 
         Sleeps until the restart is due when that comes before the next tick
-        and the OS lists nobody listening on the LLM port.  The restart path
-        does not stop the old server or wait for its process to exit, and
-        start_server's bind test passes over a SO_REUSEADDR listener, so a
-        server still holding the port (a crashed one while its dump is
-        written, or a hung one) is left to the next tick, as before.  Loops
-        because _wd_sleep counts monotonic time while retry_after is wall
-        time; ends when the manager stops.
+        and the OS socket table, read, lists nobody listening on the LLM
+        port.  The restart path does not stop the old server or wait for its
+        process to exit, and start_server's bind test passes over a
+        SO_REUSEADDR listener, so a server that may still hold the port (a
+        crashed one while its dump is written, or a hung one) is left to the
+        next tick, as before.  Loops because _wd_sleep counts monotonic time
+        while retry_after is wall time; ends when the manager stops.
         """
         while self._running:
             with self._lock:
@@ -1575,17 +1578,17 @@ class ModelLifecycleManager:
 
     @staticmethod
     def _llm_port_released() -> bool:
-        """True when the OS lists no process LISTENING on the LLM port(s).
+        """True only when the socket table, read, lists nobody LISTENING on
+        the LLM port(s).
 
-        core.resource_governor._find_llm_pids is the one reader of that
-        socket table.  It answers an empty set when psutil is missing, which
-        here means "cannot tell", never "free".
+        core.resource_governor._llm_listen_rows is the one reader of that
+        table.  A row with no PID still holds the port, and a table that
+        cannot be read (no psutil, net_connections raising) is "cannot
+        tell", never "free".
         """
         try:
-            from core.resource_governor import _find_llm_pids, _try_import_psutil
-            if _try_import_psutil() is None:
-                return False
-            return not _find_llm_pids()
+            from core.resource_governor import _llm_listen_rows
+            return not _llm_listen_rows()
         except Exception:
             logger.exception("_llm_port_released: swallowed Exception")
             return False
