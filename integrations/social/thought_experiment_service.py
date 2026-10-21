@@ -35,8 +35,20 @@ VALID_DECISION_TYPES = ['majority', 'weighted', 'consensus', 'expert_panel']
 VOTE_RANGE = (-2, 2)  # Strongly oppose to strongly support
 # The world model's own voter account (owner decision, 2026-10-19: agents AND
 # the world model vote; quorum and the 2/3 rule unchanged). An agent with no
-# owner, so the tally counts it as one identity of its own at agent weight.
+# owner, so the tally counts it as one identity of its own at agent weight;
+# marked in its settings, which is how a same-named account that is NOT this
+# one is told apart, and never dispatched work as a persona.
 WORLD_MODEL_VOTER = 'hevolveai_world_model'
+# How many open experiments the world model scores per daemon tick: each
+# costs two llama-server encodes on the slot chat shares.
+WORLD_MODEL_VOTES_PER_TICK = 3
+# The marker the voter account is made with; an account under its username
+# without it is not the world model's (UserService.machine_account_conflict).
+WORLD_MODEL_VOTER_SETTINGS = {'world_model_voter': True, 'dispatchable': False}
+# Per-process count of scores that cast nothing (an abstention, a busy or
+# unreachable world model), so an experiment that keeps abstaining sinks
+# behind fresh ones instead of blocking them for ever.
+_WORLD_MODEL_ATTEMPTS: Dict[str, int] = {}
 
 
 def _feed_decision_to_world_model(**decision) -> None:
@@ -263,23 +275,23 @@ class ThoughtExperimentService:
 
     @staticmethod
     def ensure_world_model_voter(db: Session):
-        """The world model's voter account, created once: an agent owned by
-        no one, so it is a distinct identity in the tally (one owner's agents
-        collapse into that owner)."""
-        from .models import User
-        voter = db.query(User).filter_by(username=WORLD_MODEL_VOTER).first()
-        if voter is None:
-            voter = User(username=WORLD_MODEL_VOTER,
-                         display_name='HevolveAI World Model',
-                         user_type='agent', is_admin=False)
-            db.add(voter)
-            db.flush()
-        return voter
+        """The world model's voter account, created once through
+        UserService.ensure_system_user: an agent owned by no one (a distinct
+        identity in the tally; one owner's agents collapse into that owner),
+        marked WORLD_MODEL_VOTER_SETTINGS so it is never handed goals as a
+        persona.  A same-named account that is not this one (a human who
+        took the handle first, any account without the marker) raises
+        ValueError rather than lend the world model's votes to it."""
+        from .services import UserService
+        return UserService.ensure_system_user(
+            db, WORLD_MODEL_VOTER, display_name='HevolveAI World Model',
+            user_type='agent', settings=WORLD_MODEL_VOTER_SETTINGS)
 
     @staticmethod
-    def cast_world_model_votes(db: Session, bridge=None, limit: int = 3) -> int:
+    def cast_world_model_votes(db: Session, bridge=None,
+                               limit: int = WORLD_MODEL_VOTES_PER_TICK) -> int:
         """The world model votes on open experiments (discussing / voting)
-        it has not voted on yet, oldest first, at most `limit` per call.
+        it may vote on and has not voted on yet, at most `limit` per call.
 
         Owner decision, 2026-10-19: agents AND the world model vote. Measured
         on the owner's node, no real experiment had ever received a vote, so
@@ -288,27 +300,60 @@ class ThoughtExperimentService:
         how surprised its own predictor is, measured without learning it
         (POST /v1/world_model/score, C329-C329g): +1 when the claim surprises
         it more than its typical error, -1 when it does not. That vote is
-        cast through cast_vote like any other, with the confidence measured.
+        cast through cast_vote like any other, with the measured confidence,
+        and earns no spark (a machine vote is not a contribution).
 
-        The claim is scored at the experiment's OWN time, its created_at read
-        as UTC epoch seconds (naive UTC in the column; .timestamp() on it
-        would apply the box's offset), so the vote does not change with the
-        hour. A busy or unreachable world model, or an abstention (vote 0),
-        casts nothing: the next tick asks again. Nothing to score means the
-        world model is never contacted. Returns how many votes were cast.
+        ORDER (review of 9ca2be81a): every read and every score first, every
+        write after. A flushed row holds SQLite's one write lock until the
+        caller commits, so a score (an HTTP call of seconds) after a write
+        held every other writer off (the outage class models.after_commit
+        documents; measured 'database is locked' after 3.36 s).
+        NO HEAD-OF-LINE BLOCK: blank expected outcomes are filtered in SQL;
+        an experiment whose context refuses agent votes is never scored; and
+        candidates are taken least-attempted first, so one that keeps
+        abstaining sinks behind fresh ones.
+        A busy or unreachable world model ends the round at the first such
+        reply, so a down world model costs one call per round, not one per
+        experiment.
+        TIME: the claim is scored at the experiment's created_at read as UTC
+        epoch seconds (SQLite's func.now() is UTC and stored naive; on MySQL
+        func.now() is the server's local time, so a central node scores at
+        an offset until the column is stored as UTC). A busy or unreachable
+        world model, or an abstention (vote 0), casts nothing; a later tick
+        asks again. Nothing to score never contacts the world model.
+        Returns how many votes were cast.
         """
-        from .models import ExperimentVote, ThoughtExperiment
-        voter = ThoughtExperimentService.ensure_world_model_voter(db)
-        voted = {row[0] for row in db.query(ExperimentVote.experiment_id)
-                 .filter(ExperimentVote.voter_id == voter.id)}
+        import math
+        from sqlalchemy import func
+        from .models import ExperimentVote, ThoughtExperiment, User
+        from .services import UserService
+        from .voting_rules import check_voter_eligibility
+        voter = db.query(User).filter(User.username == WORLD_MODEL_VOTER).first()
+        conflict = voter and UserService.machine_account_conflict(
+            voter, 'agent', WORLD_MODEL_VOTER_SETTINGS)
+        if conflict:
+            logger.warning("world-model voter username %r belongs to another "
+                           "account (%s); the world model does not vote",
+                           WORLD_MODEL_VOTER, conflict)
+            return 0
+        voted = set() if voter is None else {
+            row[0] for row in db.query(ExperimentVote.experiment_id)
+            .filter(ExperimentVote.voter_id == voter.id)}
         query = (db.query(ThoughtExperiment)
                  .filter(ThoughtExperiment.status.in_(('discussing', 'voting')))
-                 .filter(ThoughtExperiment.expected_outcome.isnot(None)))
+                 .filter(ThoughtExperiment.expected_outcome.isnot(None))
+                 .filter(func.length(func.trim(ThoughtExperiment.expected_outcome)) > 0))
         if voted:
             query = query.filter(~ThoughtExperiment.id.in_(voted))
-        rows = [e for e in list(query.order_by(ThoughtExperiment.created_at.asc())
-                                .limit(limit).all())
-                if (e.expected_outcome or '').strip()]
+        open_rows = list(query.all())
+        live = {e.id for e in open_rows}
+        for stale in [k for k in _WORLD_MODEL_ATTEMPTS if k not in live]:
+            _WORLD_MODEL_ATTEMPTS.pop(stale, None)
+        rows = [e for e in open_rows
+                if check_voter_eligibility(e.to_dict(), 'agent').get('eligible')]
+        rows.sort(key=lambda e: (_WORLD_MODEL_ATTEMPTS.get(e.id, 0),
+                                 e.created_at or datetime.min))
+        rows = rows[:limit]
         if not rows:
             return 0
         if bridge is None:
@@ -317,7 +362,7 @@ class ThoughtExperimentService:
             bridge = get_world_model_bridge()
             if bridge is None:
                 return 0
-        cast = 0
+        scored = []
         for exp in rows:
             created = exp.created_at
             if created is None:
@@ -327,18 +372,31 @@ class ThoughtExperimentService:
             score = bridge.score_claim(
                 context=exp.hypothesis, outcome=exp.expected_outcome,
                 timestamp=created.timestamp(), creator_id=str(exp.creator_id))
-            if not isinstance(score, dict) or score.get('vote') not in (1, -1):
+            conf = score.get('confidence') if isinstance(score, dict) else None
+            if (isinstance(score, dict) and score.get('vote') in (1, -1)
+                    and isinstance(conf, (int, float)) and math.isfinite(conf)):
+                scored.append((exp, score, float(conf)))
                 continue
+            _WORLD_MODEL_ATTEMPTS[exp.id] = _WORLD_MODEL_ATTEMPTS.get(exp.id, 0) + 1
+            if score is None:
+                break
+        if not scored:
+            return 0
+        voter = voter or ThoughtExperimentService.ensure_world_model_voter(db)
+        cast = 0
+        for exp, score, conf in scored:
             reasoning = ('world model: prediction error %s against its typical %s '
                          '(log surprise %s); +1 means running this would teach it'
                          % (score.get('error'), score.get('typical_error'),
                             score.get('log_surprise')))
             out = ThoughtExperimentService.cast_vote(
                 db, exp.id, voter.id, int(score['vote']), reasoning=reasoning,
-                voter_type='agent', confidence=float(score.get('confidence') or 0.0))
+                voter_type='agent', confidence=conf, award=False)
             if isinstance(out, dict) and out.get('error'):
                 logger.info("world-model vote on %s refused: %s", exp.id, out.get('error'))
+                _WORLD_MODEL_ATTEMPTS[exp.id] = _WORLD_MODEL_ATTEMPTS.get(exp.id, 0) + 1
                 continue
+            _WORLD_MODEL_ATTEMPTS.pop(exp.id, None)
             cast += 1
         return cast
 
@@ -347,7 +405,8 @@ class ThoughtExperimentService:
                   vote_value: int, reasoning: str = '',
                   suggestion: str = '',
                   voter_type: str = 'human',
-                  confidence: float = 1.0) -> Optional[Dict]:
+                  confidence: float = 1.0,
+                  award: bool = True) -> Optional[Dict]:
         """Cast a vote on a thought experiment.
 
         Both humans and agents can vote. Agent votes include confidence.
@@ -379,8 +438,10 @@ class ThoughtExperimentService:
         # Clamp vote value
         vote_value = max(VOTE_RANGE[0], min(VOTE_RANGE[1], vote_value))
 
-        # Clamp confidence
-        confidence = max(0.0, min(1.0, confidence))
+        # Clamp confidence: the ONE clamp (a nan or a non-number is no
+        # confidence; max(0, min(1, nan)) was 1.0)
+        from integrations.agent_engine.world_model_bridge import _unit_confidence
+        confidence = _unit_confidence(confidence)
         if voter_type == 'human':
             confidence = 1.0
 
@@ -423,18 +484,20 @@ class ThoughtExperimentService:
 
         db.flush()
 
-        # Award spark for voting
-        try:
-            from .resonance_engine import ResonanceService
-            ResonanceService.award_action(
-                db, voter_id, 'experiment_voted',
-                source_id=experiment_id)
-            if suggestion:
+        # Award spark for voting (not for a machine vote: the world model's
+        # votes pass award=False; review of 9ca2be81a measured 60 spark for 6)
+        if award:
+            try:
+                from .resonance_engine import ResonanceService
                 ResonanceService.award_action(
-                    db, voter_id, 'experiment_suggestion',
+                    db, voter_id, 'experiment_voted',
                     source_id=experiment_id)
-        except Exception:
-            pass
+                if suggestion:
+                    ResonanceService.award_action(
+                        db, voter_id, 'experiment_suggestion',
+                        source_id=experiment_id)
+            except Exception:
+                pass
 
         return vote.to_dict()
 

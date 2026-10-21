@@ -803,16 +803,8 @@ class AgentDaemon:
             logger.debug("Thought-experiment lifecycle tick skipped: %s", exc)
 
         # The world model votes on open experiments (owner, 2026-10-19:
-        # agents AND the world model vote). Bounded per tick; contacts the
-        # world model only when there is something to score.
-        try:
-            from integrations.social.models import db_session
-            from integrations.social.thought_experiment_service import (
-                ThoughtExperimentService)
-            with db_session() as db:
-                ThoughtExperimentService.cast_world_model_votes(db)
-        except Exception as exc:
-            logger.debug("World-model vote tick skipped: %s", exc)
+        # agents AND the world model vote), off this loop.
+        self._spawn_world_model_votes_async()
 
         # Complete the existing GATHER->DISPATCH->AgentGoal loop: first project
         # canonical goal outcomes back onto its active session, then start a new
@@ -1401,6 +1393,44 @@ class AgentDaemon:
             target=_runner, daemon=True, name='proactive_hive_tick')
         t.start()
         self._proactive_thread = t
+
+    def _spawn_world_model_votes_async(self) -> None:
+        """Let the world model vote on open thought experiments
+        (ThoughtExperimentService.cast_world_model_votes) in a daemon thread,
+        never blocking the goal-dispatch loop: each score is an HTTP call of
+        seconds (two llama-server encodes on the slot chat shares; review of
+        9ca2be81a).  Two of _spawn_home_compose_async's gates:
+          1. yield - skip while should_yield_to_user(), and skip when the
+             gate cannot answer (the slot is the user's until we know);
+          2. single-flight - skip while the prior round is still running.
+        The round itself is bounded (WORLD_MODEL_VOTES_PER_TICK) and
+        contacts the world model only when there is something to score.
+        Fully guarded: a voting fault never touches the daemon loop."""
+        prior = getattr(self, '_world_model_vote_thread', None)
+        if prior is not None and prior.is_alive():
+            return
+        try:
+            from .dispatch import should_yield_to_user
+            if should_yield_to_user():
+                return
+        except Exception as exc:
+            logger.info("World-model votes skipped: yield gate unreadable: %s", exc)
+            return
+
+        def _runner():
+            try:
+                from integrations.social.models import db_session
+                from integrations.social.thought_experiment_service import (
+                    ThoughtExperimentService)
+                with db_session() as db:
+                    ThoughtExperimentService.cast_world_model_votes(db)
+            except Exception as exc:
+                logger.info("World-model vote round failed: %s", exc)
+
+        t = threading.Thread(
+            target=_runner, daemon=True, name='world_model_votes')
+        t.start()
+        self._world_model_vote_thread = t
 
     def _spawn_home_compose_async(self) -> None:
         """Compose + push the agentic home in a daemon thread when the box is

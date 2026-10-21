@@ -32,6 +32,7 @@ from integrations.agent_engine.world_model_bridge import (  # noqa: E402
     WorldModelBridge)
 from integrations.social.models import (  # noqa: E402
     Base, ExperimentVote, ThoughtExperiment, User)
+from integrations.social import thought_experiment_service as tes  # noqa: E402
 from integrations.social.thought_experiment_service import (  # noqa: E402
     WORLD_MODEL_VOTER, ThoughtExperimentService)
 
@@ -47,13 +48,21 @@ def db():
     s.close()
 
 
+@pytest.fixture(autouse=True)
+def _fresh_attempts():
+    """The per-process abstention count starts empty for every test."""
+    tes._WORLD_MODEL_ATTEMPTS.clear()
+    yield
+    tes._WORLD_MODEL_ATTEMPTS.clear()
+
+
 def _experiment(db, status='voting', expected='p50 latency falls by a third',
-                created=CREATED, hypothesis=None):
+                created=CREATED, hypothesis=None, title='Cache warmup'):
     creator = User(username=f'wmv_{uuid.uuid4().hex[:8]}', user_type='human')
     db.add(creator)
     db.flush()
     e = ThoughtExperiment(
-        id=str(uuid.uuid4()), creator_id=creator.id, title='Cache warmup',
+        id=str(uuid.uuid4()), creator_id=creator.id, title=title,
         hypothesis=hypothesis or f'Faster cache warmup lowers latency {uuid.uuid4().hex[:4]}',
         expected_outcome=expected, status=status, created_at=created)
     db.add(e)
@@ -85,6 +94,7 @@ def test_the_world_model_votes_as_one_identity_of_its_own(db):
     b = ThoughtExperimentService.ensure_world_model_voter(db)
     assert a.id == b.id and a.username == WORLD_MODEL_VOTER
     assert a.user_type == 'agent' and a.owner_id is None
+    assert a.settings == {'world_model_voter': True, 'dispatchable': False}
 
 
 @pytest.mark.parametrize('vote', [1, -1])
@@ -277,7 +287,9 @@ def test_the_daemon_tick_lets_the_world_model_vote(monkeypatch):
     db_context = MagicMock()
     db_context.__enter__.return_value = MagicMock()
     db_context.__exit__.return_value = False
-    with patch('integrations.social.models.db_session', return_value=db_context), patch(
+    with patch('integrations.agent_engine.dispatch.should_yield_to_user',
+               return_value=False), patch(
+            'integrations.social.models.db_session', return_value=db_context), patch(
             'integrations.social.thought_experiment_service.ThoughtExperimentService.'
             'advance_due_experiments'), patch(
             'integrations.social.thought_experiment_service.ThoughtExperimentService.'
@@ -285,5 +297,268 @@ def test_the_daemon_tick_lets_the_world_model_vote(monkeypatch):
             'integrations.agent_engine.auto_evolve.get_auto_evolve_orchestrator') as orch:
         orch.return_value.reconcile.return_value = {'status': 'idle'}
         daemon._advance_thought_experiments()
+        daemon._world_model_vote_thread.join(10)
     assert voter.call_count == 1
     assert orch.return_value.reconcile.call_count == 1, "a voting failure stopped the tick"
+
+
+def test_a_tick_never_scores_after_a_write(db):
+    """what: the order of database writes and score calls in one tick;
+    expected: no INSERT or UPDATE before the last score. A flushed row holds
+    SQLite's one write lock until the caller commits, so a score (an HTTP
+    call of seconds) made after the first cast vote, or after creating the
+    voter account, would hold every other writer off for the whole call."""
+    from sqlalchemy import event
+    exps = [_experiment(db, created=CREATED + dt.timedelta(minutes=i)) for i in range(3)]
+    writes = []
+
+    def _seen(conn, cursor, statement, params, context, executemany):
+        if statement.lstrip().upper().startswith(('INSERT', 'UPDATE', 'DELETE')):
+            writes.append(statement.split()[0])
+    event.listen(db.get_bind(), 'before_cursor_execute', _seen)
+    try:
+        def _reply(kw):
+            assert writes == [], ("a score ran after a write", writes)
+            return {'vote': 1, 'confidence': 0.5}
+        bridge = _Bridge(_reply)
+        assert ThoughtExperimentService.cast_world_model_votes(db, bridge=bridge) == 3
+    finally:
+        event.remove(db.get_bind(), 'before_cursor_execute', _seen)
+    assert len(bridge.calls) == 3 and writes, "the votes were written, after the scores"
+
+
+# --- review of 9ca2be81a ------------------------------------------------------
+
+def test_blank_outcomes_never_block_newer_experiments(db):
+    """what: more blank-outcome experiments than one tick scores, all older
+    than a real one; expected: the real one is scored in the first tick (a
+    blank outcome is filtered before the batch is cut, not after)."""
+    for i in range(3):
+        _experiment(db, expected='   ', created=CREATED + dt.timedelta(minutes=i))
+    real = _experiment(db, created=CREATED + dt.timedelta(hours=1))
+    bridge = _Bridge({'vote': 1, 'confidence': 0.5})
+    assert ThoughtExperimentService.cast_world_model_votes(db, bridge=bridge, limit=3) == 1
+    assert [c['context'] for c in bridge.calls] == [real.hypothesis]
+
+
+def test_an_experiment_that_keeps_abstaining_sinks_behind_fresh_ones(db):
+    """what: a full batch of older experiments the world model abstains on,
+    and a newer one; expected: the next tick scores the newer one first, so
+    abstainers never hold the batch for ever (they are still asked again)."""
+    old = [_experiment(db, created=CREATED + dt.timedelta(minutes=i)) for i in range(3)]
+    new = _experiment(db, created=CREATED + dt.timedelta(hours=1))
+    abstain = {e.hypothesis for e in old}
+
+    def _reply(kw):
+        return ({'error': None, 'vote': 0} if kw['context'] in abstain
+                else {'vote': 1, 'confidence': 0.5})
+    first = _Bridge(_reply)
+    assert ThoughtExperimentService.cast_world_model_votes(db, bridge=first, limit=3) == 0
+    assert {c['context'] for c in first.calls} == abstain
+    second = _Bridge(_reply)
+    assert ThoughtExperimentService.cast_world_model_votes(db, bridge=second, limit=3) == 1
+    assert second.calls[0]['context'] == new.hypothesis
+    assert len(_votes(db, new)) == 1
+
+
+def test_an_experiment_agents_may_not_vote_on_is_never_scored(db):
+    """what: a security-guardrail experiment (voting_rules: agents cannot
+    vote; cast_vote would refuse) older than an ordinary one; expected: it
+    is not scored at all, and does not take a place in the batch."""
+    _experiment(db, title='Tighten the security guardrail',
+                hypothesis='A stricter guardrail blocks the vulnerability')
+    ok = _experiment(db, created=CREATED + dt.timedelta(minutes=5))
+    bridge = _Bridge({'vote': 1, 'confidence': 0.5})
+    assert ThoughtExperimentService.cast_world_model_votes(db, bridge=bridge, limit=1) == 1
+    assert [c['context'] for c in bridge.calls] == [ok.hypothesis]
+
+
+def test_the_voter_is_never_dispatched_as_a_persona(db, monkeypatch):
+    """what: the agents the daemon hands goals to; expected: an ordinary
+    agent persona is there, the world model's voter is not."""
+    import sys
+    from integrations.coding_agent.idle_detection import IdleDetectionService
+    monkeypatch.delitem(sys.modules, 'hartos.create_recipe', raising=False)
+    persona = User(username=f'persona_{uuid.uuid4().hex[:6]}', user_type='agent')
+    db.add(persona)
+    ThoughtExperimentService.ensure_world_model_voter(db)
+    db.commit()
+    names = {p['username'] for p in IdleDetectionService.get_idle_agent_personas(db)}
+    assert persona.username in names
+    assert WORLD_MODEL_VOTER not in names
+
+
+@pytest.mark.parametrize('taken', ['human', 'unmarked_agent', 'owned_agent'])
+def test_a_same_named_account_never_receives_the_world_models_votes(db, taken):
+    """what: the voter's username already belongs to another account (a
+    human, an agent without the marker, someone's own agent carrying it);
+    expected: no vote is cast as it and the world model is not contacted;
+    creating the voter refuses (ensure_system_user's collision rule)."""
+    if taken == 'human':
+        db.add(User(username=WORLD_MODEL_VOTER, user_type='human'))
+    elif taken == 'unmarked_agent':
+        db.add(User(username=WORLD_MODEL_VOTER, user_type='agent'))
+    else:
+        owner = User(username=f'o_{uuid.uuid4().hex[:6]}', user_type='human')
+        db.add(owner)
+        db.flush()
+        db.add(User(username=WORLD_MODEL_VOTER, user_type='agent', owner_id=owner.id,
+                    settings=dict(tes.WORLD_MODEL_VOTER_SETTINGS)))
+    db.commit()
+    e = _experiment(db)
+    bridge = _Bridge({'vote': 1, 'confidence': 0.5})
+    assert ThoughtExperimentService.cast_world_model_votes(db, bridge=bridge) == 0
+    assert _votes(db, e) == [] and bridge.calls == []
+    with pytest.raises(ValueError):
+        ThoughtExperimentService.ensure_world_model_voter(db)
+
+
+def test_a_machine_vote_earns_no_spark(db, monkeypatch):
+    """what: spark awards; expected: the world model's votes award nothing,
+    while a person's vote still earns its spark (the default is unchanged)."""
+    from integrations.social.resonance_engine import ResonanceService
+    awarded = []
+    monkeypatch.setattr(ResonanceService, 'award_action',
+                        staticmethod(lambda db_, uid, action, **kw: awarded.append((uid, action))))
+    e = _experiment(db)
+    bridge = _Bridge({'vote': 1, 'confidence': 0.5})
+    assert ThoughtExperimentService.cast_world_model_votes(db, bridge=bridge) == 1
+    assert awarded == []
+    person = User(username=f'p_{uuid.uuid4().hex[:6]}', user_type='human')
+    db.add(person)
+    db.flush()
+    ThoughtExperimentService.cast_vote(db, e.id, person.id, 1)
+    assert awarded == [(person.id, 'experiment_voted')]
+
+
+@pytest.mark.parametrize('conf', [float('nan'), float('inf'), None, 'high'])
+def test_a_vote_without_a_finite_confidence_is_not_cast(db, conf):
+    """what: a reply whose confidence is not a finite number; expected: no
+    vote (the tally weights by confidence), retried like an abstention."""
+    e = _experiment(db)
+    bridge = _Bridge({'vote': 1, 'confidence': conf})
+    assert ThoughtExperimentService.cast_world_model_votes(db, bridge=bridge) == 0
+    assert _votes(db, e) == []
+    assert tes._WORLD_MODEL_ATTEMPTS == {e.id: 1}
+
+
+def test_score_failures_never_trip_the_shared_breaker(offline, monkeypatch):
+    """what: many failed scores in a row; expected: the bridge's breaker,
+    shared with corrections, flushes and ingest, stays closed."""
+    import requests
+    b = offline()
+    _post_recorder(monkeypatch, requests.ConnectionError('down'))
+    for _ in range(20):
+        assert b.score_claim(context='h', outcome='o', timestamp=1.0, creator_id='u1') is None
+    assert not b._cb_is_open()
+
+
+def test_a_reply_that_is_not_json_is_none(offline, monkeypatch):
+    """what: a 200 whose body is not JSON (a proxy page); expected: None
+    (retry later), not an exception out of the daemon tick."""
+    class _Html(_Resp):
+        def json(self):
+            raise ValueError('Expecting value: line 1 column 1 (char 0)')
+    b = offline()
+    _post_recorder(monkeypatch, _Html(200))
+    assert b.score_claim(context='h', outcome='o', timestamp=1.0, creator_id='u1') is None
+
+
+def test_the_world_model_does_not_vote_while_the_user_is_yielded_to(monkeypatch):
+    """what: the daemon tick while the user-yield gate is closed (a person
+    at the desk or chatting; each score costs encodes on the slot chat
+    shares); expected: no voting, and the rest of the tick still runs."""
+    from unittest.mock import MagicMock, patch
+    from integrations.agent_engine.agent_daemon import AgentDaemon
+    daemon = AgentDaemon.__new__(AgentDaemon)
+    daemon._auto_evolve_interval_s = 0
+    daemon._next_auto_evolve_at = 0.0
+    db_context = MagicMock()
+    db_context.__enter__.return_value = MagicMock()
+    db_context.__exit__.return_value = False
+    with patch('integrations.agent_engine.dispatch.should_yield_to_user',
+               return_value=True), patch(
+            'integrations.social.models.db_session', return_value=db_context), patch(
+            'integrations.social.thought_experiment_service.ThoughtExperimentService.'
+            'advance_due_experiments'), patch(
+            'integrations.social.thought_experiment_service.ThoughtExperimentService.'
+            'cast_world_model_votes') as voter, patch(
+            'integrations.agent_engine.auto_evolve.get_auto_evolve_orchestrator') as orch:
+        orch.return_value.reconcile.return_value = {'status': 'idle'}
+        daemon._advance_thought_experiments()
+    assert getattr(daemon, '_world_model_vote_thread', None) is None
+    assert voter.call_count == 0
+    assert orch.return_value.reconcile.call_count == 1
+
+
+def test_a_down_world_model_costs_one_call_per_round(db):
+    """what: a round with several experiments and an unreachable (or busy)
+    world model; expected: one call, then the round ends (a down world
+    model must not cost a timeout per experiment); an abstention does not
+    end the round (the world model answered)."""
+    for i in range(3):
+        _experiment(db, created=CREATED + dt.timedelta(minutes=i))
+    down = _Bridge(None)
+    assert ThoughtExperimentService.cast_world_model_votes(db, bridge=down) == 0
+    assert len(down.calls) == 1
+    abstains = _Bridge({'error': None, 'vote': 0})
+    assert ThoughtExperimentService.cast_world_model_votes(db, bridge=abstains) == 0
+    assert len(abstains.calls) == 3
+
+
+def test_a_slow_round_never_blocks_the_daemon_loop(monkeypatch):
+    """what: a vote round that takes long (each score is an HTTP call of
+    seconds); expected: the daemon tick returns and runs the rest of its
+    work while the round is still scoring, and a second tick does not
+    start a second round beside it."""
+    import threading
+    from unittest.mock import MagicMock, patch
+    from integrations.agent_engine.agent_daemon import AgentDaemon
+    daemon = AgentDaemon.__new__(AgentDaemon)
+    daemon._auto_evolve_interval_s = 0
+    daemon._next_auto_evolve_at = 0.0
+    db_context = MagicMock()
+    db_context.__enter__.return_value = MagicMock()
+    db_context.__exit__.return_value = False
+    release = threading.Event()
+    rounds = []
+
+    def _slow(db):
+        rounds.append(1)
+        release.wait(10)
+        return 0
+    with patch('integrations.agent_engine.dispatch.should_yield_to_user',
+               return_value=False), patch(
+            'integrations.social.models.db_session', return_value=db_context), patch(
+            'integrations.social.thought_experiment_service.ThoughtExperimentService.'
+            'advance_due_experiments'), patch(
+            'integrations.social.thought_experiment_service.ThoughtExperimentService.'
+            'cast_world_model_votes', side_effect=_slow), patch(
+            'integrations.agent_engine.auto_evolve.get_auto_evolve_orchestrator') as orch:
+        orch.return_value.reconcile.return_value = {'status': 'idle'}
+        try:
+            daemon._advance_thought_experiments()
+            first = daemon._world_model_vote_thread
+            assert orch.return_value.reconcile.call_count == 1
+            assert first.is_alive(), "the round finished inside the tick"
+            daemon._advance_thought_experiments()
+            assert daemon._world_model_vote_thread is first
+            assert orch.return_value.reconcile.call_count == 2
+        finally:
+            release.set()
+            daemon._world_model_vote_thread.join(10)
+    assert rounds == [1]
+
+
+def test_a_vote_confidence_that_is_no_number_counts_for_nothing(db):
+    """what: cast_vote with a nan confidence (an agent tool's reply);
+    expected: stored as 0.0, no confidence (max(0, min(1, nan)) was 1.0,
+    a full-weight vote), through the ONE clamp the bridge uses."""
+    e = _experiment(db)
+    agent = User(username=f'a_{uuid.uuid4().hex[:6]}', user_type='agent')
+    db.add(agent)
+    db.flush()
+    ThoughtExperimentService.cast_vote(db, e.id, agent.id, 1, voter_type='agent',
+                                       confidence=float('nan'))
+    (v,) = _votes(db, e)
+    assert v.confidence == 0.0

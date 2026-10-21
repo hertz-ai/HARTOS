@@ -779,6 +779,10 @@ class WorldModelBridge:
             return reply if isinstance(reply, dict) and not reply.get('busy') else None
         if self._http_disabled or self._cb_is_open():
             return None
+        # The circuit breaker is SHARED with corrections, flushes and ingest:
+        # a slow score (the route waits for nothing, but scores a large graph
+        # for seconds) must not trip it and block them for its cooldown
+        # (review of 9ca2be81a), so a score reads the breaker, never feeds it.
         try:
             resp = pooled_post(
                 f'{self._api_url}/v1/world_model/score',
@@ -787,13 +791,15 @@ class WorldModelBridge:
                 timeout=self._timeout_default,
             )
         except requests.RequestException as e:
-            self._cb_record_failure()
-            logger.debug("[WorldModelBridge] score failed: %s", e)
+            logger.info("[WorldModelBridge] score unavailable: %s", e)
             return None
-        self._cb_record_success()
         if resp.status_code != 200:
             return None
-        body = resp.json()
+        try:
+            body = resp.json()
+        except ValueError:
+            logger.info("[WorldModelBridge] score reply was not JSON")
+            return None
         return body if isinstance(body, dict) else None
 
     def ingest_decided_experiment(self, experiment_id: str, creator_id: str,
