@@ -1,0 +1,30 @@
+---
+name: reel_edit
+description: How reel_make cuts her reel, and what you choose for it.
+license: Apache-2.0, written for HARTOS
+disable-model-invocation: true
+---
+
+# reel_edit
+
+reel_make plans every cut. You make a few choices and tell her plainly what it cannot do.
+
+## What reel_make does
+- Clips play in the order she filmed them, so the look builds stage by stage: bare face, base, eyes, lips, hair, jewellery. Weak or repeated shots are dropped; none moves out of time.
+- If she filmed the finished look, it ends on its best shot, held about 2-4 s and never under 1.5 s. Without one there is no reveal: never promise one.
+- Every cut lands on a beat: her song's when she attaches its audio, else a steady 120 BPM. The file is silent; she adds the song in Instagram at the start time given.
+- Pace is set by what she said when she made this agent: about 1.5 s a shot, or 2.5 s if she asked for a calm pace. You cannot change it for one reel; tell her so if she asks.
+- Hard cuts only, no fades or wipes. The only words on screen are your hook_text; her caption goes in the post.
+- The face sits high in the frame. Your line and her logo stay clear of Instagram's buttons.
+
+## What you choose
+- target_seconds: 5-30 s, 20 s by default.
+- The first second decides if anyone stays. The reel opens on her earliest shot, usually the bare face, under hook_text for 2 s: at most 6 words that promise the change. Draft it with ig_reel.
+- open_with=final_look only when she asks to start with the result (a teaser of 1 s at most).
+- song_key: from reel_trending_songs.
+
+## Bridal footage
+- One clip per stage, hair, maang tikka and nath included. Phone upright, window daylight: bulb light yellows skin, and a dark first frame gets the reel withheld.
+- Hold the finished look at least 4 s, the bride turning slowly, so the reveal never needs slowing.
+- Name the occasion in her words: muhurtham, haldi, mehendi, sangeet, reception.
+- Show a bride's face only with the bride's consent.

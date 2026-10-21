@@ -24,6 +24,16 @@ owns no path of its own:
     error_advice throttles per failure shape in memory and skips a
     fingerprint that already has an active goal, so offering on every turn
     still provisions exactly once.
+  * a second WORK route, deterministic, for a job that must run no LLM goal
+    (owner ruling U6): integrations.trends.daily_job asks here
+    (``ask_owner_for_setup('trends:ig_trends', ...)``) and, on yes, hands
+    its worker's venv to Nunba's ``tts.backend_venv.install_in_background``
+    (install_into_venv, the one venv filler the TTS venvs use, on its own
+    thread), which later daemon ticks only poll.  repair_backend_venv knows
+    TTS backends only, so it could not serve there.  Owner ruling A16
+    (2026-10-14) names integrations.service_tools.runtime_manager.
+    RuntimeToolManager the one place a pip-in-isolated-env setup belongs;
+    this route predates that ruling and has not moved there yet.
   * the SCOPE -- one capability per grant (``tts:f5_tts``), because a yes to
     a 2.5 GB voice is not a yes to a 12 GB one.
 

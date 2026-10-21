@@ -8,6 +8,7 @@ import pytest
 from flask import Flask
 
 from integrations.ap2.ap2_protocol import PaymentLedger
+from tests.unit.commercial_db import KEY, OWNER, key_db  # noqa: F401  (a fixture)
 
 
 def _ledger(tmp_path):
@@ -31,28 +32,28 @@ def test_agent_still_cannot_authorize_itself(tmp_path, agent_id):
     assert ledger.authorize_payment(p.payment_id, agent_id) is False
 
 
-def test_tier_upgrade_route_authorizes_through_the_real_guard(tmp_path):
+def test_tier_upgrade_route_authorizes_through_the_real_guard(tmp_path, key_db):
     from integrations.agent_engine.commercial_api import commercial_api_bp
     ledger = _ledger(tmp_path)
     # An operator: since 0cf610371's rework only an operator (or a node in
     # dev mode) may settle a tier through the MockPaymentGateway; a plain
     # user is refused with 503 (tests/unit/test_api_keys_paid_tier_needs_payment.py).
-    user = MagicMock(id=7, is_admin=True)
-    db = MagicMock()
-    api_key = MagicMock(tier='free')
-    db.query.return_value.filter_by.return_value.first.return_value = api_key
+    # The key's owner, on the real table (the route writes the tier through
+    # one conditional UPDATE, which a MagicMock session would swallow).
+    user = MagicMock(id=OWNER, is_admin=True)
     app = Flask(__name__)
     app.register_blueprint(commercial_api_bp)
     with patch('integrations.social.auth._get_user_from_token',
-               return_value=(user, db)), \
+               side_effect=lambda tok: (user, key_db.session())), \
             patch('integrations.ap2.payment_ledger', ledger):
         res = app.test_client().post(
-            '/api/v1/intelligence/keys/k1/upgrade',
+            f'/api/v1/intelligence/keys/{KEY}/upgrade',
             json={'target_tier': 'starter', 'payment_method': 'tok_mock',
                   'gateway': 'mock'},
             headers={'Authorization': 'Bearer t'})
     assert res.status_code != 402, res.get_json()
     assert res.get_json()['success'] is True
+    assert key_db.key()[0] == 'starter'
 
 
 def test_hart_pay_authorize_lets_the_cli_person_authorize(tmp_path):

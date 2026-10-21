@@ -600,9 +600,9 @@ existing DB, sync, and ceiling machinery. The ceiling enforcement reuses the
 `cmd_type="seed_assets"` is added to `VALID_COMMAND_TYPES` so it flows through the
 existing signed fleet bus, drain, and verify path with no new transport.
 
-Gate 6 (cx_Freeze): every new `core/asset_cache/*.py` must be added to
-`Nunba-HART-Companion/scripts/setup_freeze_nunba.py` `packages[]` with an
-`__init__.py`, or the installed Nunba.exe will `ModuleNotFoundError` on first use.
+Gate 6 (cx_Freeze): `core/asset_cache/` needs an `__init__.py` and no
+`packages[]` entry; it ships with the whole `core/` tree (see CLAUDE.md
+Gate 6).
 
 ## 10. Phased build plan (Layer 1 first; Layer 2 strictly after)
 

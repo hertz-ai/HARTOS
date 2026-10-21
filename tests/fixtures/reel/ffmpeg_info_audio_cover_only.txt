@@ -1,0 +1,14 @@
+[mov,mp4,m4a,3gp,3g2,mj2 @ 0000017828c4f380] stream 0, timescale not set
+Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'song.m4a':
+  Metadata:
+    major_brand     : isom
+    minor_version   : 512
+    compatible_brands: isomiso2mp41
+    encoder         : Lavf61.7.100
+  Duration: 00:00:01.00, start: 0.000000, bitrate: 81 kb/s
+  Stream #0:0[0x1](und): Audio: aac (LC) (mp4a / 0x6134706D), 48000 Hz, mono, fltp, 70 kb/s (default)
+      Metadata:
+        handler_name    : SoundHandler
+        vendor_id       : [0][0][0][0]
+  Stream #0:1[0x0]: Video: png, rgb24(pc, gbr/unknown/unknown), 64x64 [SAR 1:1 DAR 1:1], 90k tbr, 90k tbn (attached pic)
+At least one output file must be specified

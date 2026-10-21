@@ -313,11 +313,14 @@ class TestCommercialAPIService:
         assert CommercialAPIService.check_rate_limit(db, key.id) is False
 
     def test_revoke_api_key(self, db, test_user):
-        """Revoking a key deactivates it."""
+        """Revoking a key deactivates it, for its owner; for anyone else the
+        key is not found and stays active (task #146)."""
         from integrations.agent_engine.commercial_api import CommercialAPIService
 
         created = CommercialAPIService.create_api_key(db, str(test_user.id))
-        revoked = CommercialAPIService.revoke_api_key(db, created['id'])
+        assert CommercialAPIService.revoke_api_key(db, created['id'], 'someone-else') is None
+        assert db.get(CommercialAPIKey, created['id']).is_active is True
+        revoked = CommercialAPIService.revoke_api_key(db, created['id'], str(test_user.id))
         assert revoked['is_active'] is False
 
 

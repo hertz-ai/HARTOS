@@ -500,6 +500,26 @@ def ensure_data_dirs():
         pass
 
 
+def free_bytes(path) -> int:
+    """Free disk where ``path`` is or will be, in bytes.  THE free-disk
+    reading at a path (duplicates inventory D27).
+
+    shutil.disk_usage needs a path that exists, so it is asked of ``path``'s
+    nearest existing folder (``path`` itself, or for a file or a folder not
+    made yet, the first existing parent); nothing is created to measure it
+    (amendment A11b: measuring must not make dirs).  A drive or root that is
+    not there is asked anyway, so its OSError says so.  Used by the reel
+    pipeline's disk check and model_storage's npm setup."""
+    import shutil
+    probe = os.path.abspath(os.fspath(path))
+    while not os.path.isdir(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    return shutil.disk_usage(probe).free
+
+
 def reset_cache():
     """Reset the cached data dir (useful for testing)."""
     global _cached_data_dir

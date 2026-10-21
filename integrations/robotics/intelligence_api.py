@@ -712,11 +712,18 @@ class RobotIntelligenceAPI:
             result = bridge.query_hivemind(
                 query, timeout_ms=int(INTELLIGENCE_TIMEOUT_S * 800))
             if result:
+                # query_hivemind's one shape: the words under 'thought'.
+                words = result.get('thought') or ''
                 return {
                     'similar_tasks': result.get('match_count', 0),
-                    'best_strategy': result.get('thought',
-                                                result.get('strategy', '')),
-                    'confidence': result.get('confidence', 0.0),
+                    'best_strategy': words,
+                    # A reply with no words vouches for nothing: the
+                    # in-process core's CollectiveThought carries a
+                    # confidence and no text (task #135), and _fuse_results
+                    # averages this number into the plan's confidence, so a
+                    # wordless thought raised a plan from 0.5 to 1.0 (the
+                    # review of d954f18ab).
+                    'confidence': result.get('confidence', 0.0) if words else 0.0,
                     'contributing_agents': result.get('agents', []),
                     'source': result.get('source', 'hivemind'),
                 }

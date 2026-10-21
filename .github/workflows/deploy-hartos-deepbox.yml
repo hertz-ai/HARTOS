@@ -48,7 +48,7 @@ jobs:
           # This bootstrap stays tiny; config flows via `envs:` below.
           # oauth.env is written HERE because the secret is multiline and
           # heredoc interpolation is the safe transport for it.
-          envs: DEPLOY_LOGS_PATH,DEPLOY_IMAGES_PATH,DEPLOY_MASTER_KEY_PATH,DEPLOY_ADVERTISE_URL,DEPLOY_AGENT_DATA_PATH,LLM_GATEWAY_URL,HEVOLVE_LLM_ENDPOINT_URL,HEVOLVE_LLM_MODEL_NAME,HEVOLVE_LLM_API_KEY,GROQ_API_KEY,LANGCHAIN_API_KEY,ALLOWED_HOSTS,CORS_ORIGINS,HART_OTA_HOST,HEVOLVE_ENFORCEMENT_MODE,HEVOLVE_NODE_TIER,LANGCHAIN_PROJECT,COMMERCE_SESSION_SECRET,HEVOLVE_EXPERT_LLM_ENDPOINT_URL,HEVOLVE_EXPERT_LLM_MODEL_NAME,HEVOLVE_EXPERT_LLM_API_KEY,HEVOLVE_CLAUDE_BUDGET_USD_DAY,HEVOLVE_AUTONOMOUS_MARKETING,HEVOLVE_API_KEY,STRIPE_API_KEY
+          envs: DEPLOY_LOGS_PATH,DEPLOY_IMAGES_PATH,DEPLOY_MASTER_KEY_PATH,DEPLOY_ADVERTISE_URL,DEPLOY_AGENT_DATA_PATH,LLM_GATEWAY_URL,HEVOLVE_LLM_ENDPOINT_URL,HEVOLVE_LLM_MODEL_NAME,HEVOLVE_LLM_API_KEY,GROQ_API_KEY,LANGCHAIN_API_KEY,ALLOWED_HOSTS,CORS_ORIGINS,HART_OTA_HOST,HEVOLVE_ENFORCEMENT_MODE,HEVOLVE_NODE_TIER,LANGCHAIN_PROJECT,COMMERCE_SESSION_SECRET,HEVOLVE_EXPERT_LLM_ENDPOINT_URL,HEVOLVE_EXPERT_LLM_MODEL_NAME,HEVOLVE_EXPERT_LLM_API_KEY,HEVOLVE_CLAUDE_BUDGET_USD_DAY,HEVOLVE_AUTONOMOUS_MARKETING,HEVOLVE_API_KEY,STRIPE_API_KEY,HARTOS_PUBLIC_URL,STRIPE_WEBHOOK_SECRET,PHONEPE_MERCHANT_ID,PHONEPE_SALT_KEY,PHONEPE_SALT_INDEX,PHONEPE_ENV,PHONEPE_USD_INR_RATE
           script: |
             set -e
             cd ${{ secrets.DEPLOY_REPO_PATH }}
@@ -144,3 +144,18 @@ jobs:
           HEVOLVE_AUTONOMOUS_MARKETING: ${{ secrets.HEVOLVE_AUTONOMOUS_MARKETING }}
           HEVOLVE_API_KEY: ${{ secrets.HEVOLVE_API_KEY }}
           STRIPE_API_KEY: ${{ secrets.STRIPE_API_KEY }}
+          # The node's public URL (core/public_url.py): the base of the URLs
+          # PhonePe returns the buyer to and posts its confirmation to.
+          HARTOS_PUBLIC_URL: ${{ secrets.HARTOS_PUBLIC_URL }}
+          # The Checkout webhook's signing secret (whsec_...): without it
+          # commercial_api.stripe_webhook trusts no event.
+          STRIPE_WEBHOOK_SECRET: ${{ secrets.STRIPE_WEBHOOK_SECRET }}
+          # PhonePe (integrations/ap2/ap2_protocol.py): the gateway registers
+          # at boot only when the merchant id AND the salt key are set; the
+          # salt index defaults to 1, the environment to PROD (UAT is the
+          # sandbox), and the rate prices USD tiers in INR (default 84.0).
+          PHONEPE_MERCHANT_ID: ${{ secrets.PHONEPE_MERCHANT_ID }}
+          PHONEPE_SALT_KEY: ${{ secrets.PHONEPE_SALT_KEY }}
+          PHONEPE_SALT_INDEX: ${{ secrets.PHONEPE_SALT_INDEX }}
+          PHONEPE_ENV: ${{ secrets.PHONEPE_ENV }}
+          PHONEPE_USD_INR_RATE: ${{ secrets.PHONEPE_USD_INR_RATE }}

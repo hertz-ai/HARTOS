@@ -1913,7 +1913,10 @@ class TestWorldModelBridge:
 
     @patch('integrations.agent_engine.world_model_bridge.pooled_post')
     def test_query_hivemind(self, mock_post):
-        """query_hivemind forwards to POST /v1/hivemind/think."""
+        """query_hivemind forwards to POST /v1/hivemind/think and answers its
+        one shape: the core's words under 'answer' (none in this body), its
+        confidence and the source.  The core's agents and weights do not
+        leave the bridge (task #136)."""
         from integrations.agent_engine.world_model_bridge import WorldModelBridge
         mock_post.return_value = Mock(
             status_code=200,
@@ -1928,8 +1931,8 @@ class TestWorldModelBridge:
         bridge._api_url = 'http://localhost:8000'
         with patch.object(bridge, '_check_cct_access', return_value=True):
             result = bridge.query_hivemind('What is in this image?', timeout_ms=2000)
-        assert result is not None
-        assert 'contributing_agents' in result
+        assert result == {'thought': '', 'source': 'http', 'peer_count': 0,
+                          'confidence': 0.85}
         call_args = mock_post.call_args
         assert 'http://localhost:8000/v1/hivemind/think' == call_args[0][0]
         body = call_args[1]['json']

@@ -63,6 +63,17 @@ TUNNEL_CLOSE = 'tunnel_close'
 #: tunnel: requests, answered with the call and its room token.
 CALL_OPEN = 'call_open'
 CALL_END = 'call_end'
+#: A person's own phone moving files to and from this desktop (core.peer_link.
+#: file_channel, in front of core.user_file_store; owner ruling U3, 2026-10-13):
+#: an upload offered, its chunks put, then committed or aborted; the outbox
+#: listed, its chunks got, and a fetched file acknowledged.  All requests.
+FILE_OFFER = 'file_offer'
+FILE_PUT = 'file_put'
+FILE_COMMIT = 'file_commit'
+FILE_ABORT = 'file_abort'
+FILE_GET = 'file_get'
+FILE_LIST = 'file_list'
+FILE_FETCHED = 'file_fetched'
 
 CHANNEL_REGISTRY = {
     'control': {
@@ -173,6 +184,22 @@ CHANNEL_REGISTRY = {
         'reliable': True,
         'description': "A phone's LiveKit signal socket, tunnelled to this "
                        "node's own LiveKit signal port",
+    },
+    'file': {
+        'id': 0x0C,
+        # A person's own phone's files (core.peer_link.file_channel): its
+        # clips, logo and song audio uploaded in chunks, and the reels this
+        # node made pulled back.  Every frame is a request the door answers,
+        # so a lost frame on the relay is a timeout the phone retries; nothing
+        # goes to a phone here unasked, so the channel is 'in' only.
+        DEVICE_POLICY_KEY: 'in',
+        DEVICE_TYPES_KEY: (FILE_OFFER, FILE_PUT, FILE_COMMIT, FILE_ABORT,
+                           FILE_GET, FILE_LIST, FILE_FETCHED),
+        'data_class': DataClass.PRIVATE,  # her clients' faces
+        'priority': 2,      # bulk, below chat and calls
+        'reliable': True,
+        'description': "A phone's files to and from its desktop: chunked "
+                       "uploads into its store, the reel outbox back",
     },
 }
 

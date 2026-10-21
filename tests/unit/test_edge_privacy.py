@@ -120,6 +120,26 @@ class TestScopeGuard:
         ok, _ = guard.check_egress(data, PrivacyScope.EDGE_ONLY)
         assert ok  # Stays on device, no DLP needed
 
+    def test_her_own_devices_are_not_dlp_scanned(self, guard):
+        """USER_DEVICES (her own devices, PeerLink SAME_USER) is not egress:
+        egress is what goes to OTHER people's nodes (owner ruling
+        2026-09-26), so PII bound for her own devices passes, while the same
+        payload bound for the hive is blocked by DLP.  The PeerLink file
+        channel (her phone <-> her desktop) relies on this and scans nothing
+        (inventory D35, judged clean)."""
+        name = 'Bride Priya 415-555-0199 priya.k@example.com.mp4'
+        mine = {'name': name, '_privacy_scope': PrivacyScope.USER_DEVICES}
+        ok, reason = guard.check_egress(mine, PrivacyScope.USER_DEVICES)
+        assert ok, reason
+        # Same payload and scope, only the destination differs: DLP is the
+        # one check between them.
+        shared = {'name': name, '_privacy_scope': PrivacyScope.FEDERATED}
+        ok, reason = guard.check_egress(shared, PrivacyScope.USER_DEVICES)
+        assert ok, reason
+        ok, reason = guard.check_egress(shared, PrivacyScope.FEDERATED)
+        assert not ok
+        assert 'PII' in reason and 'email' in reason and 'phone' in reason
+
 
 # ═══════════════════════════════════════════════════════════════
 # 3. Scope Redaction

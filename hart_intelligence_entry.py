@@ -971,7 +971,10 @@ app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY') or secrets.token_h
 # One payload policy for app AND transport: core.serve passes the same
 # constant to Hypercorn's WSGI middleware (whose 64 KB library default
 # otherwise transport-rejects bodies Flask's own cap here would accept).
-from core.constants import MAX_PAYLOAD_BYTES, SHELL_COMMAND_TIMEOUT_S
+from core.constants import (
+    AGENT_WORK_TOOL_NAMES, AGENTIC_ROUTER_TOOL_NAME, CREATE_AGENT_TOOL_NAME,
+    MAX_PAYLOAD_BYTES, SHELL_COMMAND_TIMEOUT_S,
+)
 app.config['MAX_CONTENT_LENGTH'] = MAX_PAYLOAD_BYTES  # 2MB default, HEVOLVE_MAX_PAYLOAD_BYTES to override
 # ...for a remote caller.  A local caller's body has no cap (owner
 # 2026-10-10); the per-request rule is core.serve.max_body_size.
@@ -1895,7 +1898,7 @@ RAG_API = config.get('RAG_API', '')
 from core.config_cache import (
     get_db_url, get_action_api, get_student_api,
     get_vision_api, is_bundled as _config_is_bundled,
-    get_central_db_url,
+    get_central_db_url, flag_value,
 )
 DB_URL = get_db_url()
 # Distinct from DB_URL: always points at the central cloud (kong-routed)
@@ -2513,7 +2516,7 @@ _inject_http_transport()
 # (single source of truth — no duplicate mapping table here)
 
 
-def publish_async(topic, message, timeout=2.0):
+def publish_async(topic, message, timeout=2.0, skip_crossbar=False):
     """
     Publish to all available transports: LOCAL EventBus + PeerLink + Crossbar.
 
@@ -2546,6 +2549,13 @@ def publish_async(topic, message, timeout=2.0):
             f-strings.
         message: Message payload (JSON string or dict)
         timeout: Maximum time for HTTP Crossbar publish (default: 2.0 seconds)
+        skip_crossbar: True keeps the message on this node's own legs -- the
+            MessageBus (LOCAL + the user's own devices over PeerLink) and the
+            desktop's SSE -- and off the HTTP Crossbar leg, which reaches
+            central (Reel Studio decision U4(d): a reel push names her
+            clients).  Every stamp above still applies.  Nunba's wrapper must
+            forward it; callers pass it only when True, so a wrapper that
+            takes (topic, message, timeout) keeps working for everyone else.
 
     Where a chat reply came from: every chat.* envelope but the voice (a
     'TTS' payload) leaves here stamped ``served_by`` = local | hive | cloud
@@ -2678,8 +2688,9 @@ def publish_async(topic, message, timeout=2.0):
         except Exception as _sse_err:
             app.logger.debug(f"SSE fan-out skipped: {_sse_err}")
 
-    # 3. HTTP Crossbar for cloud telemetry + legacy mobile (when internet available)
-    if client is None:
+    # 3. HTTP Crossbar for cloud telemetry + legacy mobile (when internet
+    # available) -- unless the caller keeps this message on the node.
+    if client is None or skip_crossbar:
         return
 
     raw_message = message if isinstance(message, str) else json.dumps(message, default=str)
@@ -3027,6 +3038,17 @@ _CREATE_AGENT_TOOL_DESCRIPTION = (
     "'do it for me', 'handle it', 'just create it', include them in your "
     "input so the downstream pipeline runs in autonomous mode."
 )
+
+def _without_agent_work_tools(tools):
+    """``tools`` minus the agent-work pair (core.constants.AGENT_WORK_TOOL_NAMES:
+    Create_Agent, an interview or an autonomous build saved under the
+    caller's id, and Agentic_Router, a Plan Mode consent question); every
+    other tool keeps its place.  Objects without a ``name`` are kept.  Both
+    get_tools branches offer the pair to a person; a metered Hive API call
+    must not get it, since its caller is a program that can answer none of
+    those and the tool's output would be the billed reply (task #120; the
+    review of 7e7ce19bc drove it).  The ONE filter both branches apply."""
+    return [t for t in tools if getattr(t, 'name', None) not in AGENT_WORK_TOOL_NAMES]
 
 
 def _handle_create_agent_tool(input_text):
@@ -5363,7 +5385,23 @@ def _warmup_tool_registries_in_background():
             "tool-registry-warmup spawn skipped: %s", _w_err)
 
 
-def get_tools(req_tool, is_first: bool = False):
+def get_tools(req_tool, is_first: bool = False, agent_tools=None):
+    """The tool set for a turn.
+
+    ``agent_tools`` False withholds the agent-work pair
+    (core.constants.AGENT_WORK_TOOL_NAMES) on either branch; the metered Hive
+    API asks for that (task #120).  None, the default, reads the turn's own
+    answer from the request thread-local (thread_local_data.get_agent_tools,
+    set once by /chat from the body), so every caller of this turn agrees:
+    get_ans's two calls and CustomGPT._call's prompt rebuild on later steps,
+    which passes no flag and, while the flag travelled as a keyword,
+    re-listed both tools in the prompt after the first step (the review of
+    5a66a3308 measured it).  Nothing is added by asking: an explicit False
+    withholds the pair on any turn, and an explicit True cannot bring it
+    back on a turn that declined (the review of df2474851 measured that it
+    did; no caller passes a value today)."""
+    turn_allows = thread_local_data.get_agent_tools()
+    agent_tools = turn_allows if agent_tools is None else (bool(agent_tools) and turn_allows)
 
     if is_first:
         # ── Timing instrumentation (#185) ─────────────────────────────
@@ -5387,7 +5425,9 @@ def get_tools(req_tool, is_first: bool = False):
         try:
             _uid = thread_local_data.get_user_id()
             _pid = thread_local_data.get_prompt_id()
-            _cache_key = f"{_uid}:{_pid}"
+            # The flag is part of the key: a set built without the agent-work
+            # pair must never be served to a turn that may use it, or back.
+            _cache_key = f"{_uid}:{_pid}:{'all' if agent_tools else 'no-agent-work'}"
         except Exception:
             _cache_key = None
         if _cache_key and _cache_key in _FIRST_TOOLS_CACHE:
@@ -5517,7 +5557,7 @@ def get_tools(req_tool, is_first: bool = False):
                 ui_label='Setting up a visual watcher…',
             ),
             labeled_tool(
-                name="Create_Agent",
+                name=CREATE_AGENT_TOOL_NAME,
                 func=_handle_create_agent_tool,
                 description=_CREATE_AGENT_TOOL_DESCRIPTION,
                 ui_label='Starting agent creation…',
@@ -5571,7 +5611,7 @@ def get_tools(req_tool, is_first: bool = False):
                 ui_label='Reflecting on past suggestions…',
             ),
             labeled_tool(
-                name="Agentic_Router",
+                name=AGENTIC_ROUTER_TOOL_NAME,
                 func=_handle_agentic_router_tool,
                 description=(
                     "Use when the user's request requires multi-step execution such as building "
@@ -5809,6 +5849,8 @@ def get_tools(req_tool, is_first: bool = False):
             pass  # Non-blocking — memory tools are optional
 
         tools += tool
+        if not agent_tools:
+            tools = _without_agent_work_tools(tools)
 
         # Provider gateway tools (Cloud_LLM, Generate_Image, etc.).
         # Moved into the heavy-tools group (loaded eagerly at boot, non-
@@ -5988,7 +6030,7 @@ def get_tools(req_tool, is_first: bool = False):
                 description="This tool captures the user's visual context during a video call, providing real-time captions. Use it for visual question answering, scene understanding, recognizing objects, activities, & monitoring the user. Input will be the user's input/query. If the last 16 seconds of visual context are available and sufficient, it crafts a creative, cohesive response. If not, inform the user of the glitch accessing the current camera feed and guess using the Last_5_Minutes_Visual_Context. Ensure responses are natural, avoiding lists of captions, and format them as if you are seeing the user scene via video call. Analyze the current tool response and previous visual context captions to recognize user activities and infer actions from multiple frames. If the user requests continuous narration without active input, adapt the response to include past, present, and future tenses for dynamic and contextually aware commentary."
             ),
             Tool(
-                name="Create_Agent",
+                name=CREATE_AGENT_TOOL_NAME,
                 func=_handle_create_agent_tool,
                 description=_CREATE_AGENT_TOOL_DESCRIPTION,
             ),
@@ -6037,7 +6079,7 @@ def get_tools(req_tool, is_first: bool = False):
                 ),
             ),
             Tool(
-                name="Agentic_Router",
+                name=AGENTIC_ROUTER_TOOL_NAME,
                 func=_handle_agentic_router_tool,
                 description=(
                     "Use when the user's request requires multi-step execution such as building "
@@ -6056,6 +6098,8 @@ def get_tools(req_tool, is_first: bool = False):
                 final_tool.append(new_tool)
 
         tools += final_tool
+        if not agent_tools:
+            tools = _without_agent_work_tools(tools)
 
         # Wrap all tool functions with logging
         for t in tools:
@@ -8955,6 +8999,25 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
     # isolated namespace by tests.
     from core.constants import canonical_served_by
     _served_by = canonical_served_by(payload.get('served_by'))
+    # A reel this turn made rides its reply as `media` (Reel Studio, plan
+    # 4.2(f)): taken once from the user file store's outbox, which marks it
+    # replied.  Local imports, like the rest of this function's, and never
+    # the reason a reply fails.
+    _media = payload.get('media')
+    if not _media:
+        try:
+            from flask import has_request_context as _media_hrc
+            from flask import request as _media_req
+            _media_pid = payload.get('prompt_id') or (
+                (_media_req.get_json(silent=True) or {}).get('prompt_id')
+                if _media_hrc() else None)
+            if _media_pid:
+                from core.chat_attachments import take_outbound
+                _media = take_outbound(user_id, _media_pid, request_id)
+        except Exception as _media_err:
+            app.logger.warning(f"_chat_reply: reply media skipped: {_media_err}")
+    if _media:
+        payload['media'] = _media
     if response_text:
         # media_mode honor: the Nunba adapter has forwarded the user's
         # chosen mode ('audio'|'video'|'text') in the /chat body all
@@ -9125,11 +9188,17 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
                     lang=_lang_hint, attachments=_atts,
                     channel_type=_chan_type,
                 )
+            # The reply's media (a reel) in the mirror's documented
+            # attachments shape; none for any other reply, as before.
+            _reply_atts = None
+            if _media:
+                from core.chat_attachments import media_to_mirror
+                _reply_atts = media_to_mirror(_media) or None
             _cm.persist_and_publish_async(
                 str(user_id), 'assistant', response_text,
                 agent_id=_agent, prompt_id=_prompt_id,
                 request_id=_rid, device_id=_dev,
-                lang=_lang_hint, attachments=None,
+                lang=_lang_hint, attachments=_reply_atts,
                 channel_type=_chan_type,
             )
         except Exception as _chat_sync_err:
@@ -9973,6 +10042,16 @@ def chat():
     # downstream foreground/yield + log correlation) is never silently empty.
     request_id = data.get('request_id') or request.values.get('request_id') or None
     req_tool = data.get('tools', None)
+    # agent_tools False withholds Create_Agent and Agentic_Router from this
+    # turn (get_tools, core.constants.AGENT_WORK_TOOL_NAMES).  The metered
+    # Hive API's self-POST sends it (task #120): its caller is a program that
+    # cannot answer an agent interview or a Plan Mode consent question, and
+    # the tool's output was the billed reply.  Anyone may ask for fewer tools
+    # and nobody gets more, so the field needs no credential; absent, every
+    # person's turn keeps both.  Read by the one boolean reader the env flags
+    # use (core.config_cache.flag_value), so 'FALSE', 'no' and 'off' decline
+    # too; junk keeps the default.
+    agent_tools = flag_value(data.get('agent_tools'), True)
     file_id = data.get('file_id', None)
     prompt_id = data.get('prompt_id', None)
 
@@ -9998,13 +10077,26 @@ def chat():
     # which pins both the ordering and the survival of the later stamp.
     thread_local_data.set_user_id(user_id=user_id)
     thread_local_data.set_prompt_id(prompt_id)
+    # The turn's own answer to "may the model be offered agent work?", read
+    # by get_tools wherever it runs for this turn (get_ans's two calls and
+    # CustomGPT._call's prompt rebuild on later steps), so no caller of the
+    # turn can disagree with another.
+    thread_local_data.set_agent_tools(agent_tools)
+    # A Create_Agent or Agentic_Router flag left by an EARLIER turn on this
+    # reused worker thread (its turn ended before the handlers below get_ans
+    # read and cleared it) would route THIS turn into Creation Mode or Plan
+    # Mode: the handlers read the flags, never who set them (the review of
+    # 5a66a3308 read it; not measured live).  Nothing sets either flag before
+    # get_ans within a turn (their only writers are the two tool handlers),
+    # so the turn starts clean.
+    thread_local_data.clear_creation_flags()
+    thread_local_data.clear_agentic_flags()
 
     create_agent = data.get('create_agent', None)
     casual_conv = data.get('casual_conv', False)
     autonomous = data.get('autonomous', False)
     probe = data.get('probe', None)
     intermediate = data.get('intermediate', None)
-    speculative = data.get('speculative', False)
     # Tier ladder preference forwarded from Nunba Demopage toggle (see
     # routes/hartos_backend_adapter.py + routes/chatbot_routes.py).
     # Values: 'local_only' | 'auto' | 'hive_preferred'.  Default 'auto'
@@ -10051,7 +10143,6 @@ def chat():
     # that branch, every /chat without a prompt_id raised UnboundLocalError
     # there (live 2026-09-13 13:38).
     _system_agent_pid = None
-    model_config = data.get('model_config', None)
     task_source = data.get('task_source', 'own')
     thread_local_data.set_task_source(task_source)
     channel_context = data.get('channel_context', None)
@@ -10103,6 +10194,82 @@ def chat():
         prompt_id = str(prompt_id)
         if not re.fullmatch(r'[a-zA-Z0-9_-]+', prompt_id):
             return jsonify({'error': 'Invalid prompt_id format', 'response': None}), 400
+
+    # Reel Studio (plan WS-8a, amendment A19): the turn's creation hint, the
+    # user-assignable tags of the body's goal_tags.  Read here, before the
+    # REUSE ladder below replaces `data` with the agent's own record.  Held
+    # nowhere between turns: her client puts her agent's tags on every turn
+    # of it (the phone's ReelInbox.markTurn), so the turn whose gather saves
+    # the record carries them, after a restart or a long gather alike, and
+    # _save_and_enter_review stamps them.
+    from core.intelligence_preference import IntelligencePreference
+    from integrations.agent_engine.marketing_tools import (
+        agent_is_local_only, user_assignable_goal_tags)
+    _creation_hint = user_assignable_goal_tags(data.get('goal_tags'))
+    # Does this turn keep to this node?  ONE rule over every source
+    # (amendment A9 e, ruled with the lanes lane 2026-10-13): the person's
+    # own toggle (Nunba's Demopage switch), or the goal tags of the turn's
+    # agent (Reel Studio, decision U4) -- this prompt_id's, with the hint
+    # this turn carries for it, and the agent an agentic_execute plan names,
+    # which the turn is routed to only below.  Strictness only goes up.  An
+    # input to the lane and model decision below, never a decision of its
+    # own; in memory only, nothing persisted.
+    _plan = data.get('agentic_plan') if data.get('agentic_execute') else None
+    local_only = (intelligence_preference == IntelligencePreference.LOCAL_ONLY
+                  or agent_is_local_only(prompt_id, _creation_hint)
+                  or (isinstance(_plan, dict)
+                      and agent_is_local_only(_plan.get('matched_agent_id'))))
+    if local_only:
+        from core.autogen_config import llm_stays_on_premises
+        # The one answer every reader of the turn's preference sees
+        # (dispatch_draft_first's user_pref below).
+        intelligence_preference = IntelligencePreference.LOCAL_ONLY
+        # The known limit (agreed with the lanes lane): local-only refuses
+        # the body's tier, speculation and the revenue lane, and the turn
+        # runs on this node's own backend (core.autogen_config
+        # .get_autogen_config_list).  When that backend is a public API, the
+        # turn's text still leaves this machine.  Said once per process.
+        if not llm_stays_on_premises() and not getattr(chat, '_local_only_offsite_warned', False):
+            app.logger.warning(
+                'chat: local-only turns run on this node\'s own LLM, and it is a '
+                'public API endpoint (core.autogen_config.llm_stays_on_premises '
+                'is False): their text leaves this machine')
+            chat._local_only_offsite_warned = True
+    # The turn's file references (plan 4.2(e)), bound to this user, agent and
+    # request before anything runs, so the agent's reel tool finds them.
+    if data.get('attachments'):
+        from core.chat_attachments import bind_inbound, parse_inbound
+        bind_inbound(user_id, prompt_id, request_id, parse_inbound(data['attachments']))
+
+    # The lane this turn runs on (revenue or user; daemon is the id's own
+    # prefix), decided here where the request's auth is in hand and
+    # registered by request id so the autogen worker thread and the wire
+    # header read the same answer (core.request_lane, owner policy 2026-10-12).
+    # The node's own daemon turn is left to the id's prefix rule and to the
+    # lane dispatch_goal registered for a goal that earns; every other caller
+    # is registered by what its request proves, replacing whatever the id
+    # held, so nobody inherits a goal's lane by naming its request id.  A
+    # turn that keeps to this node is never left on the revenue lane.
+    try:
+        from core.constants import SYSTEM_IDENTITIES as _SYSTEM_IDENTITIES
+        from core.request_lane import register_chat_lane
+        from integrations.agent_engine.dispatch import (
+            is_genuine_user_request as _lane_is_genuine)
+        from integrations.commerce.bindings import TENANT as _COMMERCE_TENANT
+        from integrations.social.auth import decode_jwt as _lane_decode_jwt
+        register_chat_lane(request_id, _bearer_token, data, getattr(g, 'auth_source', None),
+                           decode_jwt=_lane_decode_jwt, tenant=_COMMERCE_TENANT,
+                           system_identities=_SYSTEM_IDENTITIES, is_genuine=_lane_is_genuine,
+                           local_only=local_only)
+    except Exception as _lane_err:
+        app.logger.warning('lane not registered for %s (the id rule decides it): %s',
+                           request_id, _lane_err)
+
+    # The turn's model tier and speculation: the body's, unless the turn
+    # keeps to this node.  core.request_lane decides both (amendment A9 e:
+    # one owner of the turn's model decision); chat() decides neither.
+    from core.request_lane import chat_turn_models
+    model_config, speculative = chat_turn_models(data, local_only=local_only)
 
     # Per-request model config override (speculative execution).
     #
@@ -10186,27 +10353,6 @@ def chat():
     # `_req_rid` is '' and the worker's re-bind at :1580 (`if request_id:`)
     # cannot fire.  Attributing that caller is the open work, not this line.
     thread_local_data.set_request_id(request_id=request_id)
-    # The lane this turn runs on (revenue or user; daemon is the id's own
-    # prefix), decided here where the request's auth is in hand and
-    # registered by request id so the autogen worker thread and the wire
-    # header read the same answer (core.request_lane, owner policy 2026-10-12).
-    # The node's own daemon turn is left to the id's prefix rule and to the
-    # lane dispatch_goal registered for a goal that earns; every other caller
-    # is registered by what its request proves, replacing whatever the id
-    # held, so nobody inherits a goal's lane by naming its request id.
-    try:
-        from core.constants import SYSTEM_IDENTITIES as _SYSTEM_IDENTITIES
-        from core.request_lane import register_chat_lane
-        from integrations.agent_engine.dispatch import (
-            is_genuine_user_request as _lane_is_genuine)
-        from integrations.commerce.bindings import TENANT as _COMMERCE_TENANT
-        from integrations.social.auth import decode_jwt as _lane_decode_jwt
-        register_chat_lane(request_id, _bearer_token, data, getattr(g, 'auth_source', None),
-                           decode_jwt=_lane_decode_jwt, tenant=_COMMERCE_TENANT,
-                           system_identities=_SYSTEM_IDENTITIES, is_genuine=_lane_is_genuine)
-    except Exception as _lane_err:
-        app.logger.warning('lane not registered for %s (the id rule decides it): %s',
-                           request_id, _lane_err)
 
     # Speculative dispatch: fast response + background expert
     if speculative and prompt and user_id and prompt_id:
@@ -10488,7 +10634,13 @@ def chat():
                 # fix.  Untrusted intent is treated as absent, everywhere.
                 _create_intent_actionable = (
                     bool(result.get('is_create_agent'))
-                    and _draft_conf >= _DRAFT_INTENT_CONFIDENCE)
+                    and _draft_conf >= _DRAFT_INTENT_CONFIDENCE
+                    # A turn that declined agent work (the metered Hive
+                    # API's self-POST, task #120) is not routed into CREATE
+                    # by the draft either: HEVOLVE_DRAFT_FIRST=1 in the
+                    # node's env overrides the body's draft_first False and
+                    # could bring a paid call here (read, not measured).
+                    and agent_tools)
 
                 if _create_intent_actionable:
                     app.logger.info(
@@ -10754,6 +10906,10 @@ def chat():
                     except Exception as e:
                         import traceback
                         app.logger.error(f'Autonomous recipe creation failed: {e}\n{traceback.format_exc()}')
+                        # The turn failed: answer the failure sentence, so the
+                        # caller deciding whether work was done sees it.
+                        from core.agent_tools import user_facing_error
+                        recipe_response = user_facing_error(e)
                     finally:
                         try:
                             from integrations.agent_engine.dispatch import mark_create_end
@@ -10775,10 +10931,19 @@ def chat():
                 # it took the gather output for the turn's result and
                 # recorded a 0-spark strike).  The flags above send the next
                 # dispatch back into recipe(), which resumes the session.
-                from core.agent_tools import is_user_pause
+                # A recipe() whose turn FAILED answers its failure sentence for
+                # the same reason: the hive worker and dispatch_goal recognise
+                # a failed turn only by that sentence (is_user_facing_error).
+                # Measured on central 2026-10-17: every hosted call answered
+                # 400/429, /chat answered the gather output, the worker took it
+                # for the task's result and 17 earning goals were completed
+                # with nothing done.
+                from core.agent_tools import is_user_facing_error, is_user_pause
                 return _chat_reply(
                     user_id, request_id,
-                    recipe_response if is_user_pause(recipe_response) else auto_response,
+                    recipe_response if (is_user_pause(recipe_response)
+                                        or is_user_facing_error(recipe_response))
+                    else auto_response,
                     intent=['FINAL_ANSWER'],
                     req_token_count=0, res_token_count=0,
                     history_request_id=[],
@@ -10807,6 +10972,17 @@ def chat():
             def _save_and_enter_review(agent_config):
                 agent_config['prompt_id'] = prompt_id
                 agent_config['creator_user_id'] = user_id
+                # Reel Studio (plan WS-8a, amendments A8 c and A19): the record
+                # carries the user-assignable goal tags of the creation hint
+                # this saving turn carries, and only those, so CREATE and
+                # REUSE build her agent with its tools.  Any other record is
+                # written exactly as before.
+                from integrations.agent_engine.marketing_tools import (
+                    is_local_only, stamp_goal_tags)
+                _stamped = stamp_goal_tags(_creation_hint,
+                                           agent_config.get('goal_tags'))
+                if _stamped is not None:
+                    agent_config['goal_tags'] = _stamped
                 with _user_lock:
                     conversation_agent[_ak] = False
                     _touch_agent_timestamp(_ak)
@@ -10814,21 +10990,28 @@ def chat():
                 with open(name, "w") as json_file:
                     json.dump(agent_config, json_file)
                 app.logger.info(f"Agent config saved to {name}")
-                # Sync to cloud DB (non-fatal)
-                try:
-                    pooled_post(
-                        f'{DB_URL}/createpromptlist',
-                        json={'listprompts': [{
-                            'prompt_id': prompt_id,
-                            'prompt': agent_config.get('goal', ''),
-                            'user_id': user_id,
-                            'name': agent_config.get('name', ''),
-                            'is_active': True,
-                            'image_url': agent_config.get('image_url', ''),
-                        }]},
-                        timeout=5)
-                except Exception:
-                    logging.getLogger(__name__).exception("_save_and_enter_review: swallowed Exception")
+                # Sync to cloud DB (non-fatal) -- except a local-only agent's
+                # gathered goal (decision U4(c)): neither this prompt-list row
+                # nor, when CREATE completes, its prompts bundle
+                # (create_recipe.update_agent_creation_to_db) goes to the cloud.
+                if is_local_only(agent_config.get('goal_tags')):
+                    app.logger.info(f'Agent {prompt_id} is local-only: its gathered '
+                                    f'goal is not synced to the cloud prompt list')
+                else:
+                    try:
+                        pooled_post(
+                            f'{DB_URL}/createpromptlist',
+                            json={'listprompts': [{
+                                'prompt_id': prompt_id,
+                                'prompt': agent_config.get('goal', ''),
+                                'user_id': user_id,
+                                'name': agent_config.get('name', ''),
+                                'is_active': True,
+                                'image_url': agent_config.get('image_url', ''),
+                            }]},
+                            timeout=5)
+                    except Exception:
+                        logging.getLogger(__name__).exception("_save_and_enter_review: swallowed Exception")
                 with _user_lock:
                     review_agents[_ak] = True
                     _touch_agent_timestamp(_ak)
@@ -11719,38 +11902,32 @@ def agent_approval():
         else:
             app.logger.warning('agent_approval: consent not recorded — no '
                                'owner identity (HEVOLVE_OWNER_USER_ID unset)')
-        if not approved and str(action or '').startswith('game_sound:'):
-            # A reviewer turning down a game's music is not a consent
-            # denial.  Falling through to the branch below published
-            # {'type':'consent', 'decision':'denied'} on the VISION topic
-            # for a piece of music -- wrong noun, wrong topic -- while the
-            # memo kept serving the take they had just refused.
-            from core.game_sound_memo import parse_game_sound_action
-            sound_game, sound_state = parse_game_sound_action(action_raw)
+        if str(action or '').startswith('game_sound:'):
+            # A game's sound, kept or turned down on the card an agent raised
+            # (core/agent_tools.offer_sound_for_review).  Not a consent: a
+            # denial falling through to the branch below published
+            # {'type':'consent', 'decision':'denied'} on the VISION topic for
+            # a piece of music while the memo kept serving the take they had
+            # just refused, and an approval fell to the no-mapping branch and
+            # was never recorded.  Whose choice it is -- the agent's creator
+            # for everyone, anyone else for themselves alone (owner
+            # 2026-10-17) -- is answer_game_sound_card; the answerer is the
+            # caller's VERIFIED identity, never a body field, by the same
+            # rule the commerce cards use.
             reason = str(data.get('reason') or data.get('note') or '').strip()
             try:
-                from core.game_sound_memo import record_verdict
-                from hartos.helper import (
-                    load_agent_data_from_file, save_agent_data_to_file)
-                _pid = int(agent_id)
-                _data = {}
-                load_agent_data_from_file(_pid, _data)
-                _games = _data.setdefault(_pid, {}).setdefault('games', {})
-                _record, _matched, _key = record_verdict(
-                    _games, sound_game, sound_state, False, reason)
-                if _record:
-                    save_agent_data_to_file(_pid, _data)
-                app.logger.info(
-                    f'agent_approval: agent={agent_id} rejected game sound '
-                    f'{sound_game}/{sound_state} at memo {_key}')
-                return jsonify({'status': 'rejected', 'action': action,
-                                'applied': bool(_record), 'key': _key,
-                                'matched': _matched}), 200
+                from core.agent_tools import answer_game_sound_card
+                from integrations.commerce.approvals import approver_from_request
+                _gs_body, _gs_code = answer_game_sound_card(
+                    agent_id, action_raw, approved, reason,
+                    approver_from_request(request))
+                return jsonify(_gs_body), _gs_code
             except Exception as _gs_exc:
                 app.logger.warning(
-                    f'agent_approval: game sound rejection failed: {_gs_exc}')
-                return jsonify({'status': 'rejected', 'action': action,
-                                'applied': False, 'error': str(_gs_exc)}), 200
+                    f'agent_approval: game sound answer failed: {_gs_exc}')
+                return jsonify({'status': 'approved' if approved else 'rejected',
+                                'action': action, 'applied': False,
+                                'error': str(_gs_exc)}), 200
 
         if not approved:
             # Stage-C (Symptom #6): publish the deny event on WAMP too
@@ -11773,49 +11950,6 @@ def agent_approval():
                 app.logger.debug(f"agent_approval deny WAMP publish failed: {_pub_exc}")
             app.logger.info(f'agent_approval: agent={agent_id} action={action} DENIED')
             return jsonify({'status': 'denied', 'action': action}), 200
-
-        # A reviewer's word on a game's sound.  The card an agent raises
-        # carries action 'game_sound:{game_id}:{state}' (core/agent_tools
-        # .offer_sound_for_review), and until now it fell through to the
-        # no-mapping branch below and returned applied=False -- so a sound
-        # could be approved on screen and approved_at stayed null forever,
-        # leaving REUSE unable to tell an approved sound from an unreviewed
-        # one.  The verdict itself lives in core.game_sound_memo, called
-        # from here and from the agent's own tool, so there is one
-        # implementation rather than two.
-        if str(action or '').startswith('game_sound:'):
-            from core.game_sound_memo import parse_game_sound_action
-            sound_game, sound_state = parse_game_sound_action(action_raw)
-            try:
-                from core.game_sound_memo import record_verdict
-                from hartos.helper import (
-                    load_agent_data_from_file, save_agent_data_to_file)
-                _pid = int(agent_id)
-                _data = {}
-                load_agent_data_from_file(_pid, _data)
-                _games = _data.setdefault(_pid, {}).setdefault('games', {})
-                _record, _matched, _key = record_verdict(
-                    _games, sound_game, sound_state, True)
-                if not _record:
-                    app.logger.info(
-                        f'agent_approval: game sound {sound_game}/{sound_state} '
-                        f'has nothing bound to approve')
-                    return jsonify({'status': 'approved', 'action': action,
-                                    'applied': False,
-                                    'reason': 'nothing bound'}), 200
-                save_agent_data_to_file(_pid, _data)
-                app.logger.info(
-                    f'agent_approval: agent={agent_id} approved game sound '
-                    f'{sound_game}/{sound_state} at memo {_key}')
-                return jsonify({'status': 'approved', 'action': action,
-                                'applied': True, 'key': _key,
-                                'matched': _matched}), 200
-            except Exception as _gs_exc:
-                app.logger.warning(
-                    f'agent_approval: game sound verdict failed: {_gs_exc}')
-                return jsonify({'status': 'approved', 'action': action,
-                                'applied': False,
-                                'error': str(_gs_exc)}), 200
 
         # Map the approval to a feed toggle and reuse the single
         # _apply_embodied_toggle codepath admin settings use.

@@ -44,6 +44,87 @@ class HiveMindHandlerTest(unittest.TestCase):
         self.assertIsInstance(result, dict)
         self.assertIn('thought', result)
 
+    def test_query_relays_the_words_of_the_local_result(self):
+        """The reply's thought is this node's own words (query_hivemind's one
+        shape): the core's answer over HTTP, the in-process thought, '' when
+        the core had none; what this node's own peers told it (source
+        'peerlink') is not relayed a second hop."""
+        from core.peer_link.hivemind_handler import handle_hivemind_message
+        for local_result, relayed in (
+                ({'thought': 'The hive is a network of agents.', 'source': 'http',
+                  'peer_count': 0, 'confidence': 0.9}, 'The hive is a network of agents.'),
+                ({'thought': '', 'source': 'http', 'peer_count': 0, 'confidence': 0.0}, ''),
+                ({'thought': 'plain', 'source': 'in_process', 'peer_count': 0,
+                  'confidence': 0.0}, 'plain'),
+                ({'thought': 'a further peer', 'source': 'peerlink', 'peer_count': 1,
+                  'confidence': 0.0}, '')):
+            bridge = MagicMock()
+            bridge.query_hivemind.return_value = local_result
+            with patch('integrations.agent_engine.world_model_bridge.'
+                       'get_world_model_bridge', return_value=bridge):
+                reply = handle_hivemind_message(
+                    {'type': 'query', 'query': 'q'}, 'peer_x')
+            self.assertEqual(reply.get('type'), 'reply', reply)
+            self.assertEqual(reply.get('thought'), relayed, local_result)
+
+    def test_a_tree_missing_the_bridge_is_said_out_loud(self):
+        """A copy of the tree whose bridge module cannot be imported (the
+        bundle carries more than one copy of HARTOS) used to answer every
+        peer's query with the empty reply and log nothing.  It still answers
+        the empty reply (the asking peer's collect() must not hang) and says
+        why at WARNING, naming the import (the review of fbeb16284), once per
+        process: the next query logs it at DEBUG (a peer's robot loop can ask
+        many times a second; the review of c10535351)."""
+        import logging
+        import integrations.agent_engine.world_model_bridge as wmb
+        from core.peer_link import hivemind_handler
+        from core.peer_link.hivemind_handler import (
+            handle_hivemind_message, _EMPTY_REPLY,
+        )
+        real = wmb.get_world_model_bridge
+        del wmb.get_world_model_bridge
+        hivemind_handler._handle_query.__dict__.pop('import_failure_said', None)
+        try:
+            with self.assertLogs('hevolve.peer_link.hivemind', level='DEBUG') as logs:
+                first = handle_hivemind_message(
+                    {'type': 'query', 'query': 'q'}, 'peer_x')
+                second = handle_hivemind_message(
+                    {'type': 'query', 'query': 'q'}, 'peer_x')
+        finally:
+            wmb.get_world_model_bridge = real
+            hivemind_handler._handle_query.__dict__.pop('import_failure_said', None)
+        self.assertEqual((first, second), (_EMPTY_REPLY, _EMPTY_REPLY))
+        said = [r for r in logs.records if 'get_world_model_bridge' in r.getMessage()]
+        self.assertEqual([r.levelno for r in said], [logging.WARNING, logging.DEBUG],
+                         logs.output)
+
+    def test_an_older_bridge_without_the_source_name_is_said_out_loud(self):
+        """A bridge that imports but lacks HIVE_SOURCE_PEERLINK (a partial
+        hot-swap left core/ newer than integrations/) answers the empty reply
+        too, and the WARNING names the missing name, so the operator reads a
+        version skew and not a missing module (the review of d954f18ab: the
+        test above pins only the missing-module message).  The bridge is not
+        asked for a thought it could not relay by the one rule."""
+        import logging
+        from core.peer_link import hivemind_handler
+        from core.peer_link.hivemind_handler import (
+            handle_hivemind_message, _EMPTY_REPLY,
+        )
+        from tests.unit.module_swap import swap_modules
+        older = MagicMock(spec=['get_world_model_bridge'])
+        hivemind_handler._handle_query.__dict__.pop('import_failure_said', None)
+        try:
+            with swap_modules({'integrations.agent_engine.world_model_bridge': older}), \
+                 self.assertLogs('hevolve.peer_link.hivemind', level='DEBUG') as logs:
+                reply = handle_hivemind_message(
+                    {'type': 'query', 'query': 'q'}, 'peer_x')
+        finally:
+            hivemind_handler._handle_query.__dict__.pop('import_failure_said', None)
+        self.assertEqual(reply, _EMPTY_REPLY)
+        said = [r for r in logs.records if 'HIVE_SOURCE_PEERLINK' in r.getMessage()]
+        self.assertEqual([r.levelno for r in said], [logging.WARNING], logs.output)
+        older.get_world_model_bridge.assert_not_called()
+
     def test_deliver_missing_target_returns_ack_invalid(self):
         from core.peer_link.hivemind_handler import handle_hivemind_message
         result = handle_hivemind_message(

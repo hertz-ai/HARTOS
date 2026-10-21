@@ -409,6 +409,36 @@ def scrub_secret(text: str) -> str:
     return '[SECRET_REDACTED]'
 
 
+def redact_secret_leaves(data: Any) -> Tuple[Any, int]:
+    """``(copy, n)``: ``data`` with its SECRETS out, nothing else changed --
+    every content and contact leaf through the secret patterns
+    (secret_redactor.redact_secrets), and a value under a secret-named key
+    withheld whole when no pattern recognises it (scrub_secret; a status word
+    stays).  ``n`` counts what was redacted or withheld.  The secret layer of
+    the world-model path: the replay (secret_redactor.redact_experience) and a
+    correction's context (WorldModelBridge.submit_correction) both ask here,
+    so they answer one rule.  PII is NOT scrubbed here; scrub_for_egress does
+    that for another person's node.  ``data`` is never mutated.
+    """
+    _, redact_secrets = _redactors()
+    total = 0
+
+    def _content(text):
+        nonlocal total
+        text, n = redact_secrets(text)
+        total += n
+        return text
+
+    def _secret(text):
+        nonlocal total
+        out = scrub_secret(text)
+        if out != text:
+            total += 1
+        return out
+
+    return map_content(data, _content, secret_fn=_secret), total
+
+
 def scrub_for_egress(data: Any) -> Any:
     """The copy of ``data`` that may go to a node its user does not own:
     person records without their private fields, every content leaf

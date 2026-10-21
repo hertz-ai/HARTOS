@@ -3245,7 +3245,8 @@ def admin_wamp_authorize_subscribe():
 
 # Phase 7e — AI moderation quarantine queue.  Lists ContentClassifier
 # decisions awaiting human review.  GLOBAL platform admin only —
-# `require_admin` enforces is_admin OR role IN ('regional', 'central').
+# `require_admin` enforces holds_central_role: role 'central' or the is_admin
+# flag; role 'regional' is NOT admitted (that is require_moderator's set).
 #
 # Pass-4 P4-11 fix: previously gated by `require_moderator` which
 # accepts both global is_moderator AND community-level membership

@@ -1,0 +1,14 @@
+{
+  "name": "hart-reel-motion",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Reel Studio's animated overlay templates (HARTOS, Apache-2.0). Its packages are installed at runtime into the data dir by RuntimeToolManager; nothing here is packaged into a build.",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@remotion/bundler": "4.0.530",
+    "@remotion/renderer": "4.0.530",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "remotion": "4.0.530"
+  }
+}

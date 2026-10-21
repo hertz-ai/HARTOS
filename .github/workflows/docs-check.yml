@@ -10,6 +10,9 @@ name: Docs Claims Check
 # and has never passed (see issue #93). A check nobody runs is not a check, so
 # this one triggers on push and on pull_request, needs no runner beyond
 # ubuntu + python, and finishes in seconds.
+#
+# The words it reports come from the human-voice guide's one list
+# (integrations/agent_engine/human_voice.py), so a change there re-runs it.
 
 on:
   push:
@@ -17,12 +20,14 @@ on:
     paths:
       - '**.md'
       - 'scripts/check_docs_claims.py'
+      - 'integrations/agent_engine/human_voice.py'
       - '.github/workflows/docs-check.yml'
   pull_request:
     branches: [main]
     paths:
       - '**.md'
       - 'scripts/check_docs_claims.py'
+      - 'integrations/agent_engine/human_voice.py'
   workflow_dispatch:
 
 permissions:

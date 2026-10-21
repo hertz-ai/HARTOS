@@ -1,13 +1,9 @@
 """Tests for self-build AutoGen tools — sandbox-first OS modification."""
 import json
 import os
-import sys
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
-
-# Prevent heavy imports
-sys.modules.setdefault('hart_intelligence_entry', MagicMock())
 
 from integrations.agent_engine.self_build_tools import (
     _PKG_RE,

@@ -73,48 +73,6 @@ _MANDATES_FILENAME = 'ap2_mandates.json'
 _MANDATE_KEY_FILENAME = '.ap2_mandate_key'
 
 
-def _trusted_request_base() -> str:
-    """The live request's root, but only when its Host is one this node was
-    told to answer for: an explicit ALLOWED_HOSTS entry (never the '*'
-    wildcard) or a loopback address.  '' otherwise, and outside a request.
-
-    The Host header is the caller's to write.  With ALLOWED_HOSTS=* (the
-    deploy default) a forged Host would otherwise become the URL PhonePe
-    returns the buyer to and posts the signed confirmation to.
-    """
-    try:
-        from flask import has_request_context, request
-        if not has_request_context():
-            return ''
-        host = (request.host or '').rsplit(':', 1)[0].strip('[]').lower()
-        root = request.url_root.rstrip('/')
-    except Exception:
-        return ''
-    if not host:
-        return ''
-    allowed = {h.strip().lower() for h in
-               os.environ.get('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
-               if h.strip() and h.strip() != '*'}
-    if host in allowed or host in ('localhost', '127.0.0.1', '::1'):
-        return root
-    return ''
-
-
-def _own_gateway_urls() -> Dict[str, str]:
-    """This node's redirect/callback URLs: HARTOS_PUBLIC_URL, else the live
-    request's root when its Host is trusted (_trusted_request_base).  Empty
-    when neither exists -- the gateway default then applies, and a warning
-    says so, because the order is then placed only if that default can reach
-    this node."""
-    base = (os.environ.get('HARTOS_PUBLIC_URL') or '').rstrip('/')         or _trusted_request_base()
-    if not base:
-        logger.warning('ap2: no trusted public base for gateway urls (set '
-                       'HARTOS_PUBLIC_URL); the gateway default applies')
-        return {}
-    return {'redirect_url': base + '/',
-            'callback_url': base + '/api/v1/intelligence/phonepe/callback'}
-
-
 class MandateError(ValueError):
     """A mandate could not be created (bad cart, over the cap)."""
 
@@ -337,15 +295,22 @@ class MandateStore:
         meta = {'kind': kind, 'mandate_id': mandate_id,
                 'merchant': merchant, 'user_id': str(user_id),
                 'cart_hash': cart_hash}
+        gateway = ledger.select_gateway(currency)
         # A redirect gateway (PhonePe) returns the buyer and posts its
-        # confirmation to THIS node, which owns the checkout; without these
-        # the gateway defaults to hevolve.ai and the order is never placed.
-        meta.update(_own_gateway_urls())
+        # confirmation to THIS node, which owns the checkout: its URLs are
+        # stamped now, while the shopper's own request is in hand.  The
+        # gateway resolves them again when it mints the checkout and refuses
+        # without them (ap2_protocol.own_gateway_urls); nothing defaults to a
+        # host that is not this node.  A synchronous gateway (Stripe, the dev
+        # mock) needs none, so none is looked up and nothing is logged for it.
+        from integrations.ap2.ap2_protocol import REDIRECT_GATEWAYS, own_gateway_urls
+        if gateway in REDIRECT_GATEWAYS:
+            meta.update(own_gateway_urls())
         payment = ledger.create_payment_request(
             amount=amount, currency=currency,
             description=description or f'{merchant} order',
             requester_agent_id=requester_agent_id or f'ap2:{merchant}',
-            gateway=ledger.select_gateway(currency),
+            gateway=gateway,
             require_approval=True,
             metadata=meta,
         )
@@ -536,6 +501,17 @@ def push_card(user_id, component: Dict[str, Any]) -> bool:
         return False
 
 
+def no_live_gateway_card(message: Optional[str] = None) -> Dict[str, Any]:
+    """The card a person sees when a payment they approved cannot be taken
+    because this node has no live gateway (ap2_protocol.mock_would_settle).
+    One title for every settler; the body may say what else did not happen
+    (the cart settler adds "and no order was placed")."""
+    return {'type': 'notification', 'severity': 'warning',
+            'title': 'Payment not available',
+            'message': message or ('This node cannot take payments right now, '
+                                   'so nothing was charged.')}
+
+
 def approval_card(m: CartMandate, description: Optional[str] = None) -> Dict[str, Any]:
     return {'type': 'approval', 'agent_id': AP2_AGENT_ID,
             'action': approval_action(m.payment_id),
@@ -571,7 +547,10 @@ _settlers_lock = threading.Lock()
 
 def register_settler(kind: str, fn) -> None:
     """``fn(mandate) -> dict`` settles an APPROVED mandate of ``kind``.
-    Without one, settling is ledger.process_payment."""
+    Without one, settling is the no-live-gateway gate
+    (ap2_protocol.mock_would_settle) and then ledger.process_payment.  A
+    registered settler owns that gate itself (commerce_tools.settle_checkout
+    does): a kind registered without it would settle on the mock."""
     with _settlers_lock:
         _settlers[kind] = fn
 
@@ -583,6 +562,23 @@ def settle(m: CartMandate, store: Optional[MandateStore] = None) -> Dict[str, An
     if fn is not None:
         return fn(m)
     store = store or get_mandate_store()
+    from integrations.ap2.ap2_protocol import (
+        NO_LIVE_GATEWAY, NO_LIVE_GATEWAY_REASON, mock_would_settle,
+        refuse_no_live_gateway)
+    payment = store.ledger.get_payment(m.payment_id)
+    if payment is not None and mock_would_settle(payment.gateway):
+        # The same gate the cart settler has (commerce_tools.settle_checkout):
+        # the mock captures anything, so an approved "pay 10 USD for X" from
+        # any agent's request_payment was marked paid, consumed and shown as
+        # completed with nothing taken (review of abb2dcfaf, measured).
+        # Refused BEFORE process_payment so no PROCESSING reservation is
+        # left; the approval is void, so the payment is cancelled, not left
+        # AUTHORIZED for anything else to take.
+        store.withdraw(m.mandate_id, NO_LIVE_GATEWAY_REASON)
+        refuse_no_live_gateway('ap2', m.user_id, m.payment_id)
+        push_card(m.user_id, no_live_gateway_card())
+        return {'success': False, 'payment_id': m.payment_id,
+                'error': f'payment refused: {NO_LIVE_GATEWAY}; nothing was charged'}
     result = store.ledger.process_payment(m.payment_id, settler=True)
     if result.get('success'):
         store.consume(m.mandate_id)
@@ -688,4 +684,5 @@ __all__ = [
     'canonical_cart_hash', 'get_mandate_store', 'DEFAULT_MANDATE_TTL_S',
     'NON_HUMAN_APPROVERS', 'PERSON_ID_PREFIX', 'approval_action', 'parse_approval_action',
     'request_human_approval', 'register_settler', 'settle', 'decide_payment',
+    'no_live_gateway_card',
 ]

@@ -104,6 +104,33 @@ class TestAuthEndpoints:
         resp = client.get('/api/social/auth/me')
         assert resp.status_code == 401
 
+    def test_no_login_token_names_a_lane(self, client):
+        """The node's 'lane' and 'rid' JWT claims are its own word about ONE
+        turn it relays (the metered API's self-POST, task #153/#157), minted
+        only by dispatch._internal_auth_headers.  A token a person gets by
+        logging in, registering as a guest or refreshing carries neither:
+        otherwise a login would buy the revenue lane (the expert model)."""
+        from integrations.social.auth import decode_jwt
+        register_user(client, 'laneless', 'mypass123!')
+        login = client.post('/api/social/auth/login',
+                            json={'username': 'laneless', 'password': 'mypass123!'})
+        assert login.status_code == 200
+        guest = client.post('/api/social/auth/guest-register',
+                            json={'guest_name': 'Visitor', 'device_id': 'dev-laneless'})
+        assert guest.status_code == 201, guest.get_json()
+        tokens = {'login': login.get_json()['data']['token'],
+                  'guest': guest.get_json()['data']['token']}
+        from security.jwt_manager import JWTManager
+        pair = JWTManager().generate_token_pair('laneless', 'laneless')
+        refreshed = client.post('/api/social/auth/refresh',
+                                json={'refresh_token': pair['refresh_token']})
+        assert refreshed.status_code == 200, refreshed.get_json()
+        tokens['refreshed'] = refreshed.get_json()['data']['access_token']
+        for path, token in tokens.items():
+            claims = decode_jwt(token)
+            assert claims.get('user_id'), path
+            assert 'lane' not in claims and 'rid' not in claims, (path, sorted(claims))
+
 
 class TestPostEndpoints:
     def test_create_post(self, client):

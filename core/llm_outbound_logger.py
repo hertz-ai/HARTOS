@@ -1115,6 +1115,9 @@ def _truncate_msg_content(msg: dict, target_chars: int, marker: str,
 # instruction, no summary.  What it is and how to expand it is said once, in
 # the system message of a body that carries one (ELIDED_POINTER_EXPLANATION).
 ELIDED_NAMESPACE = 'elided'
+# The store-id prefix every elided item carries (_elided_item), the one the
+# eviction sweep matches and core.agent_tools.person_store_id keeps clear of.
+ELIDED_ITEM_PREFIX = ELIDED_NAMESPACE + '_'
 ELIDED_KEY_PREFIX = 'elided:'
 _ELIDED_POINTER_RE = None  # compiled on first use
 _ELIDED_MAX_ITEMS = 5000        # items kept on disk; the oldest go first
@@ -1217,7 +1220,7 @@ def elision_scope(user_id=None, request_id=None) -> str:
 
 def _elided_item(scope: str, pointer_id: str) -> str:
     """The agent-data namespace of ONE elided item: ``elided_<scope>_<id>``."""
-    return f'{ELIDED_NAMESPACE}_{scope}_{pointer_id}'
+    return f'{ELIDED_ITEM_PREFIX}{scope}_{pointer_id}'
 
 
 def _evict_elided() -> None:
@@ -1228,7 +1231,7 @@ def _evict_elided() -> None:
         return
     try:
         from core.cache_loaders import AGENT_DATA_DIR
-        prefix, suffix = ELIDED_NAMESPACE + '_', '_agent_data.json'
+        prefix, suffix = ELIDED_ITEM_PREFIX, '_agent_data.json'
         items = []
         for entry in os.scandir(AGENT_DATA_DIR):
             if entry.name.startswith(prefix) and entry.name.endswith(suffix):

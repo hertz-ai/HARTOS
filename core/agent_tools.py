@@ -278,13 +278,13 @@ from core.game_sound_memo import SUBMIT_COOLDOWN_S  # noqa: E402,F401
 TASK_STALE_S = 1800
 
 
-def _pending_submit(games, game_id, state, level=None, user_id=None):
+def _pending_submit(games, game_id, state, level=None):
     """When this state's last submit went out with no id learned, else None.
 
     A record with 'submitted_at' and neither 'url' nor 'task_id' is a submit
     whose reply timed out.  The ladder ignores it (nothing to play, nothing to
     poll), so it is read at its own key."""
-    record = game_state_record(games, game_id, state, level, user_id)
+    record = game_state_record(games, game_id, state, level)
     if record.get('url') or record.get('task_id'):
         return None
     return record.get('submitted_at')
@@ -397,6 +397,48 @@ def _tell_the_person_elsewhere(user_id, prompt_id, game_id, state, record):
         tool_logger.debug(f'game sound: no push to the phone ({e})')
 
 
+def answer_game_sound_card(agent_id, action, approved, reason, approver_id):
+    """A person's answer to the card offer_sound_for_review raised.
+
+    /api/agent/approval hands it here with the caller's VERIFIED identity
+    (never a body field).  The agent's creator answers for the agent;
+    anyone else's answer is their own choice, written in their own store,
+    and the agent's take stays as it is for everyone else (owner
+    2026-10-17).  The verdict itself is core.game_sound_memo.record_verdict,
+    as for the agent's own approve_game_sound.  Returns (body, status).
+    """
+    from core.game_sound_memo import parse_game_sound_action, record_verdict
+    from hartos.helper import load_agent_data_from_file, save_agent_data_to_file
+    verdict = 'approved' if approved else 'rejected'
+    if not approver_id:
+        return {'status': 'error', 'action': action, 'applied': False,
+                'reason': 'sign in to answer this'}, 401
+    game_id, state = parse_game_sound_action(action)
+    pid = int(agent_id)
+    data = {}
+    load_agent_data_from_file(pid, data)
+    games = data.setdefault(pid, {}).setdefault('games', {})
+    for_everyone = is_agent_creator(approver_id, pid)
+    if for_everyone:
+        store_id = pid
+        record, matched, key = record_verdict(
+            games, game_id, state, approved, reason)
+    else:
+        store_id = person_store_for(approver_id, pid)
+        load_agent_data_from_file(store_id, data)
+        own = data.setdefault(store_id, {}).setdefault('games', {})
+        record, matched, key = record_verdict(
+            games, game_id, state, approved, reason, own=own)
+    if record:
+        save_agent_data_to_file(store_id, data)
+    tool_logger.info(
+        f'game sound card: agent={agent_id} {verdict} {game_id}/{state} at '
+        f'memo {key} for {"everyone" if for_everyone else "the answerer only"}')
+    return {'status': verdict, 'action': action, 'applied': bool(record),
+            'key': key, 'matched': matched,
+            'scope': 'agent' if for_everyone else 'mine'}, 200
+
+
 def _coding_workdir(working_dir):
     """The directory a coding tool was handed, else HEVOLVE_CODING_WORKDIR.
 
@@ -406,6 +448,81 @@ def _coding_workdir(working_dir):
     every coding tool an agent is given.
     """
     return working_dir or os.environ.get('HEVOLVE_CODING_WORKDIR', '')
+
+
+def _overlay(shared, own):
+    """``own`` laid over ``shared``, key by key down nested dicts, as a new
+    dict; neither argument is changed.  Where both hold a dict the two
+    merge, otherwise ``own`` wins."""
+    view = dict(shared)
+    for key, value in own.items():
+        if isinstance(value, dict) and isinstance(view.get(key), dict):
+            view[key] = _overlay(view[key], value)
+        else:
+            view[key] = value
+    return view
+
+
+def person_store_id(user_prompt):
+    """The store id of one person's memory for one agent: the session key
+    itself when it is safe as a file name (core.cache_loaders.is_safe_store_id)
+    and lower case, else a digest of it.  The id becomes a file name in
+    hartos.helper, which joins it unchecked, and a user id can come from a
+    request body, so '../x' must never reach a path.  Lower case only, since
+    Windows and macOS file names ignore case and two ids differing by case
+    would share a file.  Never in the wire trim's `elided` namespace either:
+    its sweep deletes those files after a day, and a made-up id there could
+    name another user's elided item (review of 7121264b1)."""
+    from core.cache_loaders import is_safe_store_id
+    from core.llm_outbound_logger import ELIDED_ITEM_PREFIX
+    key = str(user_prompt)
+    if (is_safe_store_id(key) and key == key.lower()
+            and not key.startswith(ELIDED_ITEM_PREFIX)):
+        return key
+    import hashlib
+    return 'p' + hashlib.sha256(key.encode('utf-8')).hexdigest()[:24]
+
+
+def person_store_for(user_id, prompt_id):
+    """person_store_id for a caller that holds the two ids rather than the
+    session key, such as an HTTP route: the same "{user_id}_{prompt_id}"
+    key the recipe pipelines build, so both reach one file."""
+    return person_store_id(f'{user_id}_{prompt_id}')
+
+
+def is_agent_creator(user_id, prompt_id):
+    """This person built the agent: prompts/<id>.json's creator_user_id (the
+    ownership ruling of 2026-10-08).  The one test of who may save a
+    template or example for everyone (save_data_in_memory for_everyone),
+    of whose choice of a game's sounds is the agent's (owner 2026-10-17:
+    anyone else's choice is their own), and of whose own memory a resumed
+    CREATE restores the saved-key snapshot into.  No recorded creator:
+    nobody.  (The /prompts listing's "no creator means listed for everyone"
+    is a visibility rule, not this one.)"""
+    from core.cache_loaders import load_agent_config
+    creator = (load_agent_config(prompt_id) or {}).get('creator_user_id')
+    return creator not in (None, '') and str(creator) == str(user_id)
+
+
+def memory_view(agent_data, prompt_id, user_prompt):
+    """One person's memory for one agent, as that person's tools read it.
+
+    Owner ruling 2026-10-17: an agent's memory belongs to the person AND the
+    agent, kept under the session key ``user_prompt`` ("{user_id}_{prompt_id}",
+    the key the pipelines, ledgers and memory graphs already use).  The
+    memory tools write there, except a template or example the agent's
+    creator saves for everyone while building it (save_data_in_memory
+    for_everyone), which goes to the agent's own store under ``prompt_id``.
+    That store (those templates, game sounds, anything saved before the
+    ruling) stays readable to everyone, under each person's own entries.
+    One store per agent let a sweep's save of ``teach`` erase the creator's
+    progress on the owner's desktop on 2026-10-14
+    (docs/internal/verification/USER_JOURNEYS_LIVE_2026-10-13.md 11.1).
+    """
+    shared = agent_data.get(prompt_id) or {}
+    own = agent_data.get(person_store_id(user_prompt)) or {}
+    return _overlay(shared if isinstance(shared, dict) else {},
+                    own if isinstance(own, dict) else {})
 
 
 def build_core_tool_closures(ctx):
@@ -418,7 +535,9 @@ def build_core_tool_closures(ctx):
             simplemem_store (optional), memory_graph (optional),
             log_tool_execution (decorator), send_message_to_user1 (func),
             retrieve_json (func), strip_json_values (func),
-            save_conversation_db (func)
+            save_conversation_db (func),
+            building_agent (optional, True in CREATE: the agent's creator
+            may then save a template or example for everyone)
     """
     # Unpack context -------------------------------------------------------
     user_id = ctx['user_id']
@@ -437,6 +556,26 @@ def build_core_tool_closures(ctx):
     _retrieve_json = ctx['retrieve_json']
     _strip_json_values = ctx['strip_json_values']
     save_conversation_db = ctx['save_conversation_db']
+
+    # This person's memory for this agent (memory_view): the memory tools
+    # write here, and read here before the agent's own store.
+    own_key = person_store_id(user_prompt)
+    # CREATE (hartos/create_recipe.py) sets it: the agent is being built,
+    # so its creator may save a template or example for everyone.
+    building_agent = bool(ctx.get('building_agent'))
+
+    def _is_creator():
+        """Any user can land in CREATE on a half-built agent
+        (hart_intelligence_entry sends a no-recipe turn there), so being in
+        CREATE is not enough to write for everyone: is_agent_creator."""
+        return is_agent_creator(user_id, prompt_id)
+
+    def _own_store():
+        """The person's store, restored from disk when the cache lacks it,
+        so a first save after a restart adds to it instead of replacing it."""
+        if own_key not in agent_data:
+            helper_fun.load_agent_data_from_file(own_key, agent_data)
+        return agent_data.setdefault(own_key, {})
 
     tools: List[Tuple[str, str, Any]] = []
 
@@ -497,8 +636,19 @@ def build_core_tool_closures(ctx):
     def save_data_in_memory(
         key: Annotated[str, "Key path for storing data now & retrieving data later. Use dot notation for nested keys (e.g., 'user.info.name')."],
         value: Annotated[Optional[Any], "Value you want to store; strictly should be one of int, float, bool, json array or json object."] = None,
+        for_everyone: Annotated[bool, "True only when the agent's creator is building it, and only for a template, or an example every user of the agent can start from (a form to fill, a sample lesson). Never a person's own data. Otherwise the value is this person's alone."] = False,
     ) -> str:
-        """Store data with validation to prevent corruption."""
+        """Store data with validation to prevent corruption.
+
+        The value is this person's memory for the agent (memory_view).
+        Owner ruling 2026-10-17: what is saved while the agent is being
+        built is the creator's data too, except a template, or data that
+        can serve as an example, which ``for_everyone`` puts in the agent's
+        own store for every user when the agent's creator
+        (is_agent_creator) saves it while building.  Anyone else, and
+        anyone outside building, keeps the value personal, so no user's
+        save reaches another user.
+        """
         tool_logger.info('INSIDE save_data_in_memory')
         try:
             if isinstance(value, str) and (value.startswith('{') or value.startswith('[')):
@@ -512,17 +662,30 @@ def build_core_tool_closures(ctx):
                 validated_value = None
 
             keys = key.split('.')
-            d = agent_data.setdefault(prompt_id, {})
+            # One reading of a bool that may arrive as the string "false"
+            # (autogen passes the model's arguments as given).
+            from core.config_cache import flag_value
+            wants_shared = flag_value(for_everyone, False)
+            shared = wants_shared and building_agent and _is_creator()
+            if shared:
+                # The agent's own store, restored first so this adds a key.
+                if prompt_id not in agent_data or not agent_data[prompt_id]:
+                    helper_fun.load_agent_data_from_file(prompt_id, agent_data)
+                store_key = prompt_id
+                d = agent_data.setdefault(prompt_id, {})
+            else:
+                store_key = own_key
+                d = _own_store()
             for k in keys[:-1]:
                 d = d.setdefault(k, {})
             d[keys[-1]] = validated_value
             tool_logger.info(f"VALUES STORED IN AGENT DATA: {validated_value}")
             tool_logger.info(f"FULL AGENT DATA AT KEY: {d}")
 
-            if helper_fun.save_agent_data_to_file(prompt_id, agent_data):
-                tool_logger.info(f"[OK] Data persisted to file for prompt_id {prompt_id}")
+            if helper_fun.save_agent_data_to_file(store_key, agent_data):
+                tool_logger.info(f"[OK] Data persisted to file for {store_key}")
             else:
-                tool_logger.warning(f"Failed to persist data to file for prompt_id {prompt_id}")
+                tool_logger.warning(f"Failed to persist data to file for {store_key}")
 
             # Mirror to MemoryGraph (fire-and-forget).  Carried by
             # reuse_recipe's inline twin before the #743 migration, lost
@@ -553,8 +716,14 @@ def build_core_tool_closures(ctx):
             # the model's context and, through the group chat's write-back,
             # into memory again: on central 2026-09-14 (#104) the large
             # MemoryGraph rows were all this repr, 0.9M to 3.96M chars each.
+            where = ''
+            if shared:
+                where = ' (for everyone who uses this agent)'
+            elif wants_shared:
+                where = (' (for this person only: a value is saved for everyone '
+                         'only by the agent\'s creator while building it)')
             return _bounded_observation(
-                f'Saved at {key}: {json.dumps(validated_value)}',
+                f'Saved at {key}{where}: {json.dumps(validated_value)}',
                 'the whole value was saved')
         except json.JSONDecodeError as je:
             error_msg = f"Invalid JSON structure in value: {str(je)}"
@@ -579,7 +748,7 @@ def build_core_tool_closures(ctx):
         description: Annotated[str, "What happens in the game, for the composer"] = "",
         state: Annotated[str, "Which state of the game: bgm for the music under the game, or correct, wrong, streak, complete, starEarned, intro, countdownTick, countdownEnd, cardFlip, matchFound, dragStart, dragDrop, tap"] = "bgm",
         level: Annotated[str, "Only when THIS level needs its own sound; leave empty so every level of the game shares one"] = "",
-        scope: Annotated[str, "'agent' binds it for everyone who reuses this agent; 'mine' is a correction for this person alone"] = "agent",
+        scope: Annotated[str, "'agent' is the agent's own sound, composed once and played for everyone who reuses it; 'mine' is a correction for this person alone"] = "agent",
     ) -> str:
         """Compose this game's background music and bind it to the game.
 
@@ -601,10 +770,31 @@ def build_core_tool_closures(ctx):
         if which not in GAME_STATES:
             return (f"{which} is not one of a game's states. Use one of: "
                     f"{', '.join(sorted(GAME_STATES))}.")
-        mine = user_id if str(scope or 'agent').strip() == 'mine' else None
-        games = agent_data.setdefault(prompt_id, {}).setdefault('games', {})
-        bound, matched = game_state_sound(games, slot, which, level, mine,
-                                          own_only=bool(mine))
+        agent_games = agent_data.setdefault(prompt_id, {}).setdefault('games', {})
+        own_games = _own_store().setdefault('games', {})
+        if str(scope or 'agent').strip() == 'mine':
+            personal = True
+            bound, matched = game_state_sound(
+                agent_games, slot, which, level, own=own_games, own_only=True)
+        elif _is_creator():
+            personal = False
+            bound, matched = game_state_sound(agent_games, slot, which, level)
+        else:
+            # Composed once, replayed for everyone: an empty slot is filled
+            # in the agent's memo by whoever reaches it first.  A choice is
+            # the person's own: once they have turned the agent's take down,
+            # their next take is composed for them alone, and the agent's
+            # stays for everyone else (owner 2026-10-17).
+            bound, matched = game_state_sound(
+                agent_games, slot, which, level, own=own_games)
+            personal = not bound.get('url') and bool(
+                game_state_record(own_games, slot, which, level)
+                or game_state_record(own_games, slot, which))
+            if personal:
+                bound, matched = game_state_sound(
+                    agent_games, slot, which, level, own=own_games, own_only=True)
+        games = own_games if personal else agent_games
+        store_id = own_key if personal else prompt_id
         if bound.get('url'):
             return json.dumps({
                 'status': 'already_bound',
@@ -626,9 +816,9 @@ def build_core_tool_closures(ctx):
         # task_id means poll it, never start a second composition.
 
         def _remember(record):
-            set_game_state_sound(games, slot, which, record, level, mine)
+            set_game_state_sound(games, slot, which, record, level)
             try:
-                helper_fun.save_agent_data_to_file(prompt_id, agent_data)
+                helper_fun.save_agent_data_to_file(store_id, agent_data)
             except Exception as e:
                 tool_logger.warning(f'bind_game_sound could not persist: {e}')
             return record
@@ -740,7 +930,7 @@ def build_core_tool_closures(ctx):
             what=description or slot, mood=mood)
         # A take the reviewer rejected is composed again WITH the reason
         # they gave, and kept as the next variant (spec §6.1).
-        rejected = rejected_take(games, slot, which, level, mine)
+        rejected = rejected_take(games, slot, which, level)
         variant = int(rejected.get('variant') or 1) + 1 if rejected else 1
         if rejected.get('rejected_reason'):
             prompt = f"{prompt}. Not like the last one: {rejected['rejected_reason']}"
@@ -766,7 +956,7 @@ def build_core_tool_closures(ctx):
             composed again.  The rejection history and variant stay.
             """
             kept = {k: v for k, v in game_state_record(
-                        games, slot, which, level, mine).items()
+                        games, slot, which, level).items()
                     if k not in ('task_id', 'task_since', 'submitted_at')}
             kept['lost_task'] = {'task_id': task_id, 'reason': reason,
                                  'at': time.time()}
@@ -790,7 +980,7 @@ def build_core_tool_closures(ctx):
                 # own orphans.  /release_task takes no idempotency key, so
                 # the only dedupe is here: after a timed-out submit, do not
                 # submit again for this state until a cooldown has passed.
-                _pending = _pending_submit(games, slot, which, level, mine)
+                _pending = _pending_submit(games, slot, which, level)
                 if _pending and time.time() - _pending < SUBMIT_COOLDOWN_S:
                     return json.dumps({
                         'status': 'composing',
@@ -839,7 +1029,7 @@ def build_core_tool_closures(ctx):
                     _remember({'mood': mood, 'prompt': prompt, 'state': which,
                                'level': level or None, 'variant': variant,
                                'composed_at': None, 'approved_at': None,
-                               **game_state_record(games, slot, which, level, mine),
+                               **game_state_record(games, slot, which, level),
                                'submitted_at': time.time()})
                     return json.dumps({
                         'status': 'composing',
@@ -941,7 +1131,8 @@ def build_core_tool_closures(ctx):
                     f"{', '.join(sorted(GAME_STATES))}.")
         level = str(level or '').strip()
         bound, matched = game_state_sound(
-            agent_data.get(prompt_id, {}).get('games', {}), slot, which, level, user_id)
+            agent_data.get(prompt_id, {}).get('games', {}), slot, which, level,
+            own=_own_store().get('games', {}))
         if bound.get('url'):
             return json.dumps({
                 'status': 'bound',
@@ -967,15 +1158,16 @@ def build_core_tool_closures(ctx):
         state: Annotated[str, "Which state of the game: bgm, correct, wrong, complete, intro…"] = "bgm",
         reason: Annotated[str, "Why it was rejected, in the reviewer's words — the next take is composed to answer it"] = "",
         level: Annotated[str, "The level, when this sound belongs to one level"] = "",
-        scope: Annotated[str, "'agent' is the reviewer deciding for everyone; 'mine' is this person correcting their own copy"] = "agent",
+        scope: Annotated[str, "'agent' is the agent's creator deciding for everyone (anyone else's decision is theirs alone); 'mine' is this person correcting their own copy"] = "agent",
     ) -> str:
         """Record that the reviewer approved (or rejected) a game's music.
 
-        The reviewer meets this agent in Evaluation Mode after creation and
-        hears the game's music there.  Their word is recorded on the
-        binding, so the person who reuses this agent gets the music that
-        was approved.  A rejection clears the binding, and the next
-        bind_game_sound composes a fresh one.
+        The agent's creator meets this agent in Evaluation Mode after
+        creation and hears the game's music there.  Their word is recorded
+        on the binding, so the person who reuses this agent gets the music
+        that was approved.  A rejection clears the binding, and the next
+        bind_game_sound composes a fresh one.  Anyone else's word changes
+        only what they hear themselves.
         """
         slot = str(game_id or '').strip()
         which = str(state or 'bgm').strip() or 'bgm'
@@ -983,40 +1175,50 @@ def build_core_tool_closures(ctx):
             return (f"{which} is not one of a game's states. Use one of: "
                     f"{', '.join(sorted(GAME_STATES))}.")
         level = str(level or '').strip()
-        mine = user_id if str(scope or 'agent').strip() == 'mine' else None
+        wants_everyone = str(scope or 'agent').strip() != 'mine'
+        # Only the agent's creator decides for everyone (owner 2026-10-17).
+        # Anyone else's word is their own choice, kept in their own store,
+        # and the agent's take stays as it is for everyone else.
+        for_everyone = wants_everyone and _is_creator()
+        own = None if for_everyone else _own_store().setdefault('games', {})
         games = agent_data.setdefault(prompt_id, {}).setdefault('games', {})
         # A verdict belongs to the memo it was GIVEN, and the ladder may have
         # found that under a different key than the one asked for: rejecting
         # while playing level 3 wrote at 'correct@3' and left 'correct' --
-        # the take actually sounding -- playing on, url intact.  A person
-        # correcting their own copy still writes in their own space.
+        # the take actually sounding -- playing on, url intact.  A person's
+        # own word still lands in their own memo.
         music, matched, write_key = record_verdict(
-            games, slot, which, approved, reason, level, mine)
+            games, slot, which, approved, reason, level, own=own)
         if not music:
             return (f"No {which} is bound to {slot or 'that game'} yet, so "
                     f"there is nothing to approve.")
         try:
-            helper_fun.save_agent_data_to_file(prompt_id, agent_data)
+            helper_fun.save_agent_data_to_file(
+                prompt_id if for_everyone else own_key, agent_data)
         except Exception as e:
             tool_logger.warning(f'approve_game_sound could not persist: {e}')
-        return json.dumps({
+        answer = {
             'status': 'approved' if approved else 'rejected',
             'game_id': slot,
             'state': which,
-            'music': game_state_sound(games, slot, which, level, mine,
-                                      own_only=bool(mine))[0] or None,
-            'scope': 'mine' if mine else 'agent',
+            # what this person hears now
+            'music': game_state_sound(games, slot, which, level, own=own)[0] or None,
+            'scope': 'agent' if for_everyone else 'mine',
             # which memo the verdict landed on, so a caller can see that a
             # level-3 rejection marked the game-wide take that was playing
             'matched': matched,
             'key': write_key,
-        })
+        }
+        if wants_everyone and not for_everyone:
+            answer['note'] = ("Recorded for this person only: only the agent's "
+                              "creator changes a game's sound for everyone.")
+        return json.dumps(answer)
 
     tools.append((
         "approve_game_sound",
-        "Record the reviewer's decision on a kids game's music during review: "
-        "approved keeps it for everyone who reuses this agent, rejected drops "
-        "it so it can be composed again.",
+        "Record a decision on a kids game's music: approved keeps it, rejected "
+        "drops it so it can be composed again. The agent's creator decides for "
+        "everyone who reuses this agent; anyone else's decision is theirs alone.",
         approve_game_sound,
     ))
 
@@ -1042,11 +1244,14 @@ def build_core_tool_closures(ctx):
     # ------------------------------------------------------------------
     @log_tool_execution
     def get_saved_metadata() -> str:
-        """Get metadata with automatic loading from persistent storage."""
+        """The keys of this person's memory for this agent (memory_view),
+        values stripped, loaded from persistent storage when needed."""
         if prompt_id not in agent_data or not agent_data[prompt_id]:
             tool_logger.info(f"Loading agent data from file for get_saved_metadata, prompt_id {prompt_id}")
             helper_fun.load_agent_data_from_file(prompt_id, agent_data)
-        stripped_json = _strip_json_values(agent_data[prompt_id])
+        _own_store()
+        stripped_json = _strip_json_values(
+            memory_view(agent_data, prompt_id, user_prompt))
         return f'{stripped_json}'
 
     tools.append((
@@ -1068,14 +1273,20 @@ def build_core_tool_closures(ctx):
         model reads; the receipt read its template through that tool, so a
         template longer than a page was cut and the page note was printed into
         the customer's receipt (#104 review).
+
+        Read through memory_view, the one person's view: this person's
+        entries over what the agent itself holds, merged key by key, so a
+        key this person never saved still finds an entry the agent kept for
+        everyone (never another person's), and a nested key saved over an
+        agent entry keeps the agent entry's other fields.
         """
         if prompt_id not in agent_data or not agent_data[prompt_id]:
             tool_logger.info(f"Loading agent data from file for prompt_id {prompt_id}")
             helper_fun.load_agent_data_from_file(prompt_id, agent_data)
-        keys = key.split('.')
-        d = agent_data.get(prompt_id, {})
+        _own_store()
+        d = memory_view(agent_data, prompt_id, user_prompt)
         try:
-            for k in keys:
+            for k in key.split('.'):
                 d = d[k]
             return f'{d}'
         # TypeError too: a path that runs through a None, a string or a list
@@ -1177,9 +1388,10 @@ def build_core_tool_closures(ctx):
         and appends a [[MEDIA:<path>]] marker that the channel reply path
         converts into a real image attachment on the same channel.
 
-        Reuses the per-prompt KV store (save_data_in_memory / get_data_by_key)
-        as the "template they accept": the agent proposes a template, the user
-        confirms it, and it is saved under key 'receipt_template'.  Falls back to
+        Reuses the memory tools' store (save_data_in_memory / get_data_by_key,
+        the person's own memory for this agent: memory_view) as the "template
+        they accept": the agent proposes a template, the user confirms it, and
+        it is saved under key 'receipt_template'.  Falls back to
         a neutral default when none is stored.  Renders via the existing
         TemplateEngine and returns the receipt text for the agent to send back
         over the same channel the request arrived on (WhatsApp, etc.).
@@ -1242,8 +1454,8 @@ def build_core_tool_closures(ctx):
 
         Inbound channel media lands in short-lived locations (the upload
         TTLCache lives 2 hours), so the logo is COPIED once to the durable
-        data dir and its path stored in the per-prompt KV under
-        'receipt_logo_path' - the same store the accepted template uses.
+        data dir and its path stored in the person's memory for this agent
+        under 'receipt_logo_path' - the same store the accepted template uses.
         """
         import shutil
         src = str(file_path or "").strip().strip('"')
@@ -1255,7 +1467,11 @@ def build_core_tool_closures(ctx):
             return ("'" + ext + "' is not an image type I can put on a "
                     "receipt - please send PNG or JPG.")
         from core.platform_paths import get_data_dir
-        dest_dir = os.path.join(get_data_dir(), 'receipt_assets', str(prompt_id))
+        # One folder per person on this agent, beside the path the person's
+        # memory stores (memory_view): a shared folder let the next person's
+        # logo overwrite this one's file under a path still stored as theirs.
+        dest_dir = os.path.join(get_data_dir(), 'receipt_assets',
+                                str(prompt_id), own_key)
         os.makedirs(dest_dir, exist_ok=True)
         dest = os.path.join(dest_dir, 'logo' + ext)
         try:

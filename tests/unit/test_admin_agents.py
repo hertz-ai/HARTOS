@@ -83,7 +83,7 @@ def _mk_admin(db):
 
 
 @pytest.fixture
-def app_with_admin(db):
+def app_with_admin(db, monkeypatch):
     """Flask app with admin_bp registered and g.user mocked to the admin row."""
     from integrations.channels.admin.api import admin_bp
     app = Flask(__name__)
@@ -103,11 +103,16 @@ def app_with_admin(db):
         g.db = db
 
     # The production gate is registered at import time via
-    # @admin_bp.before_request; replace the function list entry directly.
-    admin_bp.before_request_funcs.setdefault(None, [])
-    admin_bp.before_request_funcs[None] = [_stub_auth]
-    admin_bp.teardown_request_funcs.setdefault(None, [])
-    admin_bp.teardown_request_funcs[None] = []  # don't close our session
+    # @admin_bp.before_request.  admin_bp is a module-level object shared by
+    # every test in the process, and Flask copies these lists into an app at
+    # register_blueprint time, so the swap must be undone after each test:
+    # assigning the lists outright left this stub in place for every later
+    # app, and the real gate's own tests
+    # (test_channels_admin_gate_operator_only_on_public_tiers.py) ran without
+    # the gate, 12 red whenever the two files shared a process (task #126).
+    # monkeypatch.setitem restores both entries at teardown.
+    monkeypatch.setitem(admin_bp.before_request_funcs, None, [_stub_auth])
+    monkeypatch.setitem(admin_bp.teardown_request_funcs, None, [])  # don't close our session
 
     app.register_blueprint(admin_bp)
     app.config['_test_admin'] = admin
