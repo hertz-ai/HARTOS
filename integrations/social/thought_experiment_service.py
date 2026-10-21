@@ -312,9 +312,12 @@ class ThoughtExperimentService:
         an experiment whose context refuses agent votes is never scored; and
         candidates are taken least-attempted first, so one that keeps
         abstaining sinks behind fresh ones.
-        A busy or unreachable world model ends the round at the first such
-        reply, so a down world model costs one call per round, not one per
-        experiment.
+        A world model that cannot answer now (score_claim returns None:
+        busy, unreachable, a 5xx, a reply that is not JSON) ends the round at
+        its first such reply, so a down world model costs one call per round,
+        not one per experiment.  A claim it cannot score (refused by the
+        screen, no cloud consent, a 4xx) is an abstention like any other:
+        counted, and the round goes on.
         TIME: the claim is scored at the experiment's created_at read as UTC
         epoch seconds (SQLite's func.now() is UTC and stored naive; on MySQL
         func.now() is the server's local time, so a central node scores at
@@ -345,7 +348,9 @@ class ThoughtExperimentService:
                  .filter(func.length(func.trim(ThoughtExperiment.expected_outcome)) > 0))
         if voted:
             query = query.filter(~ThoughtExperiment.id.in_(voted))
-        open_rows = list(query.all())
+        # The SQL TRIM strips only ASCII spaces; an outcome of tabs, newlines
+        # or U+3000 is just as blank (review of 4c4ba922f).
+        open_rows = [e for e in query.all() if (e.expected_outcome or '').strip()]
         live = {e.id for e in open_rows}
         for stale in [k for k in _WORLD_MODEL_ATTEMPTS if k not in live]:
             _WORLD_MODEL_ATTEMPTS.pop(stale, None)

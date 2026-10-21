@@ -256,11 +256,13 @@ def test_the_bridge_reads_a_score_and_treats_503_as_retry(offline, monkeypatch):
 
 def test_a_cloud_world_model_scores_only_with_the_creators_consent(offline, monkeypatch):
     """what: a non-local world model, the creator has not consented;
-    expected: nothing sent (the decide feed's rule for the same texts)."""
+    expected: nothing sent (the decide feed's rule for the same texts), and
+    the claim abstains with its reason."""
     b = offline('https://world-model.example.invalid')
     monkeypatch.setattr(b, '_has_cloud_consent', lambda uid: False)
     posts = _post_recorder(monkeypatch, _Resp(200, {'vote': 1}))
-    assert b.score_claim(context='h', outcome='o', timestamp=1.0, creator_id='u1') is None
+    out = b.score_claim(context='h', outcome='o', timestamp=1.0, creator_id='u1')
+    assert out == {'vote': 0, 'refused': 'no_cloud_consent'}
     assert posts == []
 
 
@@ -562,3 +564,57 @@ def test_a_vote_confidence_that_is_no_number_counts_for_nothing(db):
                                        confidence=float('nan'))
     (v,) = _votes(db, e)
     assert v.confidence == 0.0
+
+
+# --- review of 4c4ba922f ------------------------------------------------------
+
+@pytest.mark.parametrize('blank', ['\t\n', '\u3000', ' \u00a0 '])
+def test_an_outcome_blank_in_any_script_is_not_scored(db, blank):
+    """what: an expected outcome of tabs, newlines, an ideographic or a
+    non-breaking space (SQL TRIM strips only ASCII spaces); expected: never
+    scored, and it takes no place in the batch."""
+    _experiment(db, expected=blank)
+    real = _experiment(db, created=CREATED + dt.timedelta(minutes=5))
+    bridge = _Bridge({'vote': 1, 'confidence': 0.5})
+    assert ThoughtExperimentService.cast_world_model_votes(db, bridge=bridge, limit=1) == 1
+    assert [c['context'] for c in bridge.calls] == [real.hypothesis]
+
+
+def test_a_claim_that_cannot_be_scored_never_holds_up_the_round(db):
+    """what: older claims the world model refuses (screened, no consent, a
+    4xx) ahead of a scorable one; expected: each abstains and the round goes
+    on, so the scorable one is voted in the same round; only None (the
+    world model cannot answer now) ends a round."""
+    refused = [_experiment(db, created=CREATED + dt.timedelta(minutes=i)) for i in range(3)]
+    ok = _experiment(db, created=CREATED + dt.timedelta(hours=1))
+    no = {e.hypothesis: r for e, r in zip(refused, ('screened', 'no_cloud_consent', 'http_422'))}
+
+    def _reply(kw):
+        if kw['context'] in no:
+            return {'vote': 0, 'refused': no[kw['context']]}
+        return {'vote': 1, 'confidence': 0.5}
+    bridge = _Bridge(_reply)
+    assert ThoughtExperimentService.cast_world_model_votes(db, bridge=bridge, limit=4) == 1
+    assert len(bridge.calls) == 4 and len(_votes(db, ok)) == 1
+    assert all(tes._WORLD_MODEL_ATTEMPTS[e.id] == 1 for e in refused)
+
+
+def test_the_bridge_says_why_a_claim_was_not_scored(offline, monkeypatch):
+    """what: the bridge's two kinds of no-answer; expected: a claim it
+    cannot score (screened text, a 4xx) abstains with its reason; a world
+    model that cannot answer now (503, 5xx, network) is None."""
+    import requests
+    b = offline()
+    monkeypatch.setattr(b, '_screened_text', lambda text: None)
+    posts = _post_recorder(monkeypatch, _Resp(200, {'vote': 1}))
+    assert b.score_claim(context='h', outcome='o', timestamp=1.0,
+                         creator_id='u1') == {'vote': 0, 'refused': 'screened'}
+    assert posts == []
+    b = offline()
+    for status in (400, 422):
+        _post_recorder(monkeypatch, _Resp(status))
+        assert b.score_claim(context='h', outcome='o', timestamp=1.0,
+                             creator_id='u1') == {'vote': 0, 'refused': f'http_{status}'}
+    for reply in (_Resp(503), _Resp(500), requests.ConnectionError('down')):
+        _post_recorder(monkeypatch, reply)
+        assert b.score_claim(context='h', outcome='o', timestamp=1.0, creator_id='u1') is None
