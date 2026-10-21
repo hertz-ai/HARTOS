@@ -276,13 +276,16 @@ class TestOnePersonRuleAndTheNodesOwner:
     node's owner" (HEVOLVE_OWNER_USER_ID, when it is a person's row)."""
 
     def test_a_system_account_and_its_agent_are_this_node(self, db):
-        """A system account, an agent it owns and the world model, all FOR:
-        2 identities, no quorum (d1cd8de2f counted the system account as
-        itself and approved with no person)."""
+        """A system account, an agent it owns, an agent no one owns and the
+        world model, all FOR: the system account is no person, so it and its
+        agent are this node like the unowned agent: 2 identities, no quorum
+        (d1cd8de2f counted the system account as itself and approved with
+        no person; counting it as a person would too)."""
         exp_id = _voting_experiment(db)
         system = _user(db, 'system')
         _vote(db, exp_id, system, 2)
         _vote(db, exp_id, _user(db, 'agent', owner_id=system.id), 2)
+        _vote(db, exp_id, _user(db, 'agent'), 2)
         _vote(db, exp_id, _user(db, 'agent', settings={'world_model_voter': True}), 2)
         tally = ThoughtExperimentService.tally_votes(db, exp_id)
         assert (tally['distinct_voters'], tally['quorum_met']) == (2, False)
@@ -294,8 +297,9 @@ class TestOnePersonRuleAndTheNodesOwner:
         guest = _user(db, 'guest')
         _vote(db, exp_id, guest, 2)
         _vote(db, exp_id, _user(db, 'agent', owner_id=guest.id), 2)
+        _vote(db, exp_id, _user(db, 'agent'), 2)      # this node
         tally = ThoughtExperimentService.tally_votes(db, exp_id)
-        assert tally['distinct_voters'] == 1
+        assert tally['distinct_voters'] == 2          # the guest, and the node
 
     def test_the_world_model_marker_on_a_persons_agent_is_that_person(self, db):
         exp_id = _voting_experiment(db)
