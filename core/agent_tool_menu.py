@@ -829,14 +829,19 @@ def attach_for_tags(cap_tags, helper, executor, registry, attached_names):
     return n
 
 
-def arm_turn_attach(executor, attached_names, goal_tags):
+def arm_turn_attach(executor, attached_names, goal_tags, stored_tags=None):
     """Give a freshly built agent pair the ledger attach_for_turn reads:
-    the tool names already on the pair and the goal tags already unlocked.
-    ONE writer, called by both builders (create_recipe.create_agents and
-    reuse_recipe's constructor) on the agent their register_dual executes
-    service tools on."""
+    the tool names already on the pair, the goal tags already unlocked, and
+    ``stored_tags`` -- the agent record's own ``goal_tags``, exactly as the
+    builder handed them to marketing_tools.resolve_goal_tags (which also
+    validates them), so each turn is resolved against what the record
+    stores.  ONE writer, called by both builders (create_recipe.create_agents
+    and reuse_recipe's constructor) on the agent their register_dual
+    executes service tools on.  A builder that passes no stored tags gets a
+    turn resolved from its words alone."""
     executor._hart_attached_tools = attached_names
     executor._hart_unlocked_tags = set(goal_tags or ())
+    executor._hart_stored_tags = stored_tags
 
 
 def attach_for_turn(message, helper, executor, registry):
@@ -860,14 +865,26 @@ def attach_for_turn(message, helper, executor, registry):
     the 400 (review of a4dc8cf3b).  The tools just attached are protected,
     since this turn asked for them; anything deferred stays executable and
     re-attachable through request_tools.
+
+    The turn's words are resolved by marketing_tools.resolve_goal_tags with
+    the record's stored tags from the ledger -- the one rule both builders
+    resolve with, so a turn obeys what the build obeyed.  Reading
+    detect_goal_tags directly skipped that rule's exceptions (critic report
+    2.6, amendment A8): her Reel Studio agent, whose stored reel_studio
+    quiets media, marketing and outreach unless her words really ask for
+    them, had media unlocked mid-chat by "find a trending Tamil song for
+    this reel", and on the central node, where reel_studio is inert, a turn
+    saying "edit my clips" unlocked it.
     """
     unlocked = getattr(executor, '_hart_unlocked_tags', None)
     attached = getattr(executor, '_hart_attached_tools', None)
     if unlocked is None or attached is None:
         return [], 0
-    from integrations.agent_engine.marketing_tools import detect_goal_tags
+    from integrations.agent_engine.marketing_tools import resolve_goal_tags
     from integrations.agent_engine.goal_manager import get_tool_tags
-    new = [t for t in detect_goal_tags(message or '') if t not in unlocked]
+    new = [t for t in resolve_goal_tags(getattr(executor, '_hart_stored_tags', None),
+                                        message or '')
+           if t not in unlocked]
     if not new:
         return [], 0
     cap = set()

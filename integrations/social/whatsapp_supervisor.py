@@ -31,13 +31,14 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shutil
 import socket
 import subprocess
 import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+from core.node_bin import find_node
 
 logger = logging.getLogger(__name__)
 
@@ -60,52 +61,44 @@ def _bundled_gateway_dir() -> Path:
     return Path(__file__).resolve().parent.parent / 'channels' / 'whatsapp'
 
 
+#: The gateway's npm project in its storage root (_gateway_storage).
+GATEWAY_TOOL = 'gateway'
+#: Bound on the gateway's ``npm install``.  It runs in the HARTOS bootstrap
+#: thread (hartos_bootstrap._init_whatsapp_supervisor), ahead of the
+#: consumer's on_bootstrap_complete, so it keeps the 180 s it always had
+#: rather than the npm installer's longer default.
+GATEWAY_NPM_TIMEOUT_S = 180.0
+
+
+def _gateway_storage():
+    """The storage root the gateway is set up in: ~/.hevolve/whatsapp
+    (HEVOLVE_HOME honoured), through the one npm installer's own class.
+
+    Not the models root (model_storage's HEVOLVE_MODEL_DIR): that may be an
+    external drive, and WhatsApp must not stop working when it is unplugged;
+    and the gateway has always lived here, beside its paired auth state
+    (gateway.js keeps that in $HEVOLVE_HOME/whatsapp/auth, outside this
+    folder), so no install moves or downloads again."""
+    from integrations.service_tools.model_storage import ModelStorageManager
+    return ModelStorageManager(base_dir=_whatsapp_home())
+
+
 def _gateway_dir() -> Path:
     """User-writable directory holding the runtime gateway.js +
-    package.json + node_modules/ + per-account auth state.
+    package.json + node_modules/: ~/.hevolve/whatsapp/gateway/, the
+    gateway tool's folder in _gateway_storage.
 
-    Previously this returned the bundled path under Program Files
-    directly, which broke every non-admin Windows install — npm
-    install hit EPERM creating node_modules/ inside the read-only
-    install dir.  Logs at ~/Documents/Nunba/logs/frozen_debug.log
-    showed "npm install returned 4294963248" identically on every
-    boot for 6+ days (the unsigned wraparound of an EACCES exit).
-
-    New behaviour mirrors tts/backend_venv.py:venv_root() — all
-    mutable state lives under ~/.hevolve/whatsapp/gateway/.  On
-    first call we lazily copy gateway.js + package.json from the
-    bundled location.  Idempotent: a second call finds both files
-    already present and returns immediately.  Survives Nunba
-    uninstall/reinstall — the venv-shaped node_modules and the
-    paired Baileys auth state at ~/.hevolve/whatsapp/auth/ stay
-    intact across upgrades.
+    It once returned the bundled path under Program Files directly, which
+    broke every non-admin Windows install — npm install hit EPERM creating
+    node_modules/ inside the read-only install dir.  Logs at
+    ~/Documents/Nunba/logs/frozen_debug.log showed "npm install returned
+    4294963248" identically on every boot for 6+ days (the unsigned
+    wraparound of an EACCES exit).  All mutable state lives here instead;
+    the files are staged into it by ensure_baileys_deps' setup.  Survives
+    Nunba uninstall/reinstall, as does the paired Baileys auth state at
+    ~/.hevolve/whatsapp/auth/.
     """
-    target = _whatsapp_home() / 'gateway'
-    target.mkdir(parents=True, exist_ok=True)
-    src = _bundled_gateway_dir()
-    for name in ('gateway.js', 'package.json'):
-        src_path = src / name
-        dst_path = target / name
-        if not src_path.exists():
-            # source-mode HARTOS with the bundle stripped: surface
-            # a clear error rather than silently shipping a half-
-            # populated user-writable dir.
-            continue
-        try:
-            needs_copy = (
-                not dst_path.exists()
-                or dst_path.stat().st_size != src_path.stat().st_size
-                or dst_path.stat().st_mtime < src_path.stat().st_mtime
-            )
-            if needs_copy:
-                shutil.copy2(str(src_path), str(dst_path))
-        except OSError as e:
-            logger.warning(
-                "whatsapp_supervisor: failed to stage %s into %s: %s "
-                "(falling back to bundled dir — install will likely "
-                "fail on non-admin Windows)", name, target, e)
-            return src  # last-ditch fallback
-    return target
+    return _gateway_storage().get_tool_dir(GATEWAY_TOOL)
 
 
 # ── Deploy-mode gating (mirrors livekit_supervisor pattern) ──────────
@@ -165,75 +158,54 @@ def _gateway_port() -> int:
 
 
 # ── Node + dep ensures (one-time on first start) ─────────────────────
-def ensure_node() -> Optional[str]:
-    """Return path to ``node`` executable, or None if Node isn't on
-    PATH.  Caller surfaces a "please install Node" message to the user
-    when this returns None."""
-    return shutil.which('node')
-
-
-def ensure_npm() -> Optional[str]:
-    """Return path to ``npm``, or None.  Same docs as ensure_node."""
-    return shutil.which('npm')
-
-
+# Node and npm are found by core.node_bin, the one locator (find_node
+# returns None when absent; start() then says Node.js is missing).
 def ensure_baileys_deps() -> bool:
-    """Idempotent: install gateway.js's npm deps under the gateway dir
-    if its ``node_modules/`` doesn't yet exist.  Returns True iff the
-    deps are now ready (cached or freshly installed).  False on
-    install failure — caller logs and falls back."""
-    gateway_dir = _gateway_dir()
-    if not gateway_dir.exists():
-        logger.error(
-            "whatsapp_supervisor: gateway dir missing at %s", gateway_dir)
-        return False
+    """Set the gateway's npm project (gateway.js + package.json +
+    package-lock.json, shipped in _bundled_gateway_dir) up in
+    _gateway_dir through the one npm installer,
+    integrations.service_tools.model_storage.install_npm_project (A18/A20:
+    this was a second copy of it).  Idempotent: a complete setup of the
+    shipped project returns at once; a HARTOS update that changes any of
+    its files sets it up again (its receipt names their fingerprint), and
+    npm installs the tree package-lock.json pins.
 
-    node_modules = gateway_dir / 'node_modules'
-    if node_modules.exists() and node_modules.is_dir():
-        return True
-
-    npm = ensure_npm()
-    if npm is None:
-        logger.warning(
-            "whatsapp_supervisor: npm not on PATH; cannot install Baileys "
-            "deps.  Set WHATSAPP_API_URL to a managed WAHA endpoint, or "
-            "install Node.js (which provides npm).")
-        return False
-
-    # First-run install — pulls @whiskeysockets/baileys + express.
-    # Hidden cmd window on Windows.
-    from core.subprocess_safe import hidden_popen_kwargs
-    logger.info(
-        "whatsapp_supervisor: installing Baileys deps in %s "
-        "(one-time, ~80 MB)…", gateway_dir)
+    Returns True iff the gateway can start: the setup finished, or it
+    failed (offline, say) where an earlier install left node_modules and
+    gateway.js -- the gateway then starts on the packages it has, as it
+    always did before the fold, and the next start tries the setup again
+    (no receipt was written).  False when it failed with nothing to start
+    on.  Never raises: it runs in the HARTOS bootstrap thread, so anything
+    the setup raises is a failed setup (logged)."""
+    from integrations.service_tools.model_storage import NpmSetupFailed
     try:
-        result = subprocess.run(
-            [npm, 'install', '--no-audit', '--no-fund',
-             '--loglevel=error', '--prefer-offline'],
-            cwd=str(gateway_dir),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=180,
-            **hidden_popen_kwargs(),
-        )
-    except (subprocess.TimeoutExpired, OSError) as e:
-        logger.warning("whatsapp_supervisor: npm install failed (%s)", e)
-        return False
-    if result.returncode != 0:
-        # Expanded from 500 → 2000 chars + explicit cwd echo.  The
-        # 6-day production failure (2026-05-17→23) showed only the
-        # truncated rc with no stdout body because npm crashed
-        # before emitting output (EPERM creating node_modules under
-        # Program Files).  Surfacing cwd + a longer tail makes the
-        # next failure mode self-diagnosing.
+        _gateway_storage().install_npm_project(
+            GATEWAY_TOOL, str(_bundled_gateway_dir()), timeout_s=GATEWAY_NPM_TIMEOUT_S)
+        return True
+    except NpmSetupFailed as e:
+        why = str(e)
+    except Exception as e:      # a bug in the setup: logged, never into start()
+        logger.error("whatsapp_supervisor: the gateway's npm setup raised %s: %s",
+                     type(e).__name__, e, exc_info=True)
+        why = '%s: %s' % (type(e).__name__, e)
+    gateway_dir = _gateway_dir()
+    try:
+        installed = (gateway_dir / 'node_modules').is_dir() \
+            and (gateway_dir / 'gateway.js').is_file()
+    except OSError as e:
+        logger.warning("whatsapp_supervisor: %s could not be read: %s", gateway_dir, e)
+        installed = False
+    if installed:
         logger.warning(
-            "whatsapp_supervisor: npm install returned %d in cwd=%s:\n%s",
-            result.returncode, gateway_dir,
-            (result.stdout or '<no stdout>')[:2000])
-        return False
-    logger.info("whatsapp_supervisor: Baileys deps installed")
-    return True
+            "whatsapp_supervisor: the gateway's npm setup failed (%s); starting it on "
+            "the node_modules already in %s, and setting it up again next start.",
+            why, gateway_dir)
+        return True
+    logger.warning(
+        "whatsapp_supervisor: the gateway's npm setup failed: %s.  Set "
+        "WHATSAPP_API_URL to a managed WAHA endpoint, or install Node.js "
+        "(which provides npm).", why)
+    return False
 
 
 from core.process_supervisor import ProcessSupervisor
@@ -266,7 +238,7 @@ class _Supervisor(ProcessSupervisor):
         if self.thread is not None and self.thread.is_alive():
             return self.info()
 
-        node = ensure_node()
+        node = find_node()
         if node is None:
             self.last_error = (
                 'Node.js not on PATH; install Node ≥18 or set '
@@ -292,7 +264,7 @@ class _Supervisor(ProcessSupervisor):
 
     def _build_popen(self):
         from core.subprocess_safe import hidden_popen_kwargs
-        node = ensure_node() or 'node'
+        node = find_node() or 'node'
         gateway_js = _gateway_dir() / 'gateway.js'
         env = os.environ.copy()
         env['WHATSAPP_GATEWAY_PORT'] = str(_gateway_port())

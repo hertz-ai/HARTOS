@@ -229,6 +229,10 @@ class TestToolsAndCli:
         monkeypatch.delenv('AP2_ALLOW_LLM_AUTHORIZE', raising=False)
         from integrations.ap2.ap2_mandate import MandateStore
         ledger = _ledger(tmp_path)
+        # A keyed node: on a mock-only ledger request_payment now refuses
+        # before asking (ap2_protocol.mock_would_settle), which is not what
+        # this test is about.
+        ledger.gateways[PaymentGateway.STRIPE] = _Gateway(PaymentGateway.STRIPE)
         store = MandateStore(str(tmp_path / 'm.json'), ledger=ledger, key=b'k' * 32)
         tools = {t['name']: t['function']
                  for t in ap2.get_ap2_tools_for_autogen('agent', user_id='u1')}

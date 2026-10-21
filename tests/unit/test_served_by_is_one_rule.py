@@ -312,11 +312,15 @@ class TestPublishAsyncStampsServedBy:
 
     def test_publish_async_keeps_the_three_argument_contract_nunba_wraps(
             self, hie):
-        """Nunba's wrapper is ``_patched(topic, message, timeout=2.0)``: a
-        fourth parameter on the real function invites a caller to pass it
-        through that wrapper, which raises TypeError on the desktop."""
-        params = list(inspect.signature(hie.publish_async).parameters)
-        assert params == ['topic', 'message', 'timeout']
+        """Nunba's wrapper is ``_patched(topic, message, timeout=2.0)``: the
+        three come first, in that order.  The one flag after them,
+        ``skip_crossbar`` (Reel Studio amendment A9 e: the one publisher owns
+        it), defaults off and its callers pass it only when set, so every
+        other call still fits the three the wrapper takes.  The origin is
+        still NOT a parameter: it travels as the reply_from() context."""
+        sig = inspect.signature(hie.publish_async)
+        assert list(sig.parameters) == ['topic', 'message', 'timeout', 'skip_crossbar']
+        assert sig.parameters['skip_crossbar'].default is False
 
     def test_a_reply_with_no_origin_is_local_on_a_flat_node(
             self, hie, monkeypatch, flat_node):

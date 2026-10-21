@@ -13,6 +13,10 @@ from typing import Dict, List, Optional, Callable
 from sqlalchemy.orm import Session
 
 from core.error_advice import FAILED_STEP_SETUP_OFFER
+# HUMAN_VOICE_GUIDE: the SINGLE source of published-text style, put in every
+# prompt below that writes PUBLISHED text.  It lives in human_voice (standard
+# library only) so Reel Studio reads the same guide without importing this.
+from integrations.agent_engine.human_voice import HUMAN_VOICE_GUIDE
 
 logger = logging.getLogger('hevolve_social')
 
@@ -682,51 +686,6 @@ def _get_platform_identity() -> str:
         "way around.  A world where technology makes Earth better and safely enables "
         "exploration of the cosmos without disturbing other civilizations.\n"
     )
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# Human voice — the SINGLE source of "don't sound like AI" guidance, shared by
-# every builder that produces PUBLISHED text (marketing, content, news).  The
-# rule the user set: AI-sounding content is exactly what people scroll past and
-# discard, so HOW it reads matters more than what it says.  Kept deliberately
-# tight — the local ~4B model executes these prompts and a wall of rules hurts
-# its completion rate.  Import this; never re-state it inline (no parallel copy).
-HUMAN_VOICE_GUIDE = (
-    "HOW TO WRITE (this decides whether anyone reads it):\n"
-    "Write as ONE real person typing to another, not a brand, not an AI. "
-    "Text that reads like AI gets scrolled past and discarded; that is the "
-    "single biggest reason good work goes unseen. Earn the read:\n"
-    "- HARD RULE, no exceptions: never use an em dash (the '—' character). "
-    "Use a period, a comma, a colon, parentheses, or the word 'and' instead. "
-    "A stray em dash is the loudest AI tell there is.\n"
-    "- Ground every claim in the source in front of you: the paper's abstract, "
-    "or the feature that actually shipped. Invent nothing. No made-up numbers, "
-    "benchmarks, or results. When the source is thin, stay honest and general "
-    "instead of filling the gap with something that merely sounds impressive.\n"
-    "- Write like a specific person who knows the subject explaining it to a "
-    "smart friend. Reach for a concrete analogy or bit of intuition when one "
-    "genuinely fits, and skip it when it doesn't. Vary sentence length and how "
-    "each sentence and paragraph opens. No templated cadence, and don't start "
-    "every item the same way (for example, not always 'This paper...').\n"
-    "- Open on one concrete, specific thing: a real moment, a number, a thing "
-    "that actually happened. Never a mission statement or a rhetorical question.\n"
-    "- Short sentences. Plain words. One idea per line. Cut every word that "
-    "isn't load-bearing.\n"
-    "- Ban these tells and their close cousins: 'in the rapidly evolving "
-    "landscape', 'in today's world', 'delve', 'dive in', 'dive into', 'it's "
-    "worth noting', 'in conclusion', 'moreover', 'furthermore', 'leverage', "
-    "'seamless', 'game-changer', 'revolutionary', 'cutting-edge', 'unlock', "
-    "'elevate', 'harness the power', 'the power of', 'robust', 'transformative', "
-    "'unleash'. No 'it's not just X, it's Y'. No '\U0001F680 Exciting news!'.\n"
-    "- No hype and no marketing voice: explain, don't sell. Say so plainly when "
-    "something is narrow, preliminary, or incremental. A real, slightly "
-    "imperfect opinion beats a polished, balanced summary. Specific beats "
-    "grand: let people feel the point through ONE useful, true detail (a "
-    "result, a tip they can use today), not a restated vision.\n"
-    "- At most one emoji, only if it's natural. Zero to two hashtags, or none.\n"
-    "- Last check before posting: would a real person say this out loud to a "
-    "friend? If not, rewrite it until they would.\n\n"
-)
 
 
 def _build_marketing_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:

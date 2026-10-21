@@ -48,9 +48,10 @@ def handle_hivemind_message(data: Any, sender_peer_id: str) -> Optional[dict]:
     Failure modes:
     - malformed payload (non-dict)            → log at debug, return None
     - unknown ``type``                         → log at debug, return None
-    - HiveMind bridge missing (HTTP-only tier) → log at debug, return
-      ``_EMPTY_REPLY`` so the requesting peer's ``collect()`` still sees a
-      structured response rather than hanging on the timeout.
+    - the bridge module missing from this copy of the tree → say so at
+      WARNING once per process (debug after), return ``_EMPTY_REPLY`` so
+      the requesting peer's ``collect()`` still sees a structured response
+      rather than hanging on the timeout.
     """
     if not isinstance(data, dict):
         logger.debug(
@@ -85,10 +86,23 @@ def _handle_query(data: dict, sender_peer_id: str) -> Optional[dict]:
     """
     try:
         from integrations.agent_engine.world_model_bridge import (
-            get_world_model_bridge,
+            HIVE_SOURCE_PEERLINK, get_world_model_bridge,
         )
-    except ImportError:
-        # HTTP-only central tier — hevolveai not loaded, nothing to think.
+    except ImportError as e:
+        # The bridge module is HARTOS's own and imports without the hive
+        # core (central, with no core installed, runs it), so this is a copy
+        # of the tree that lacks it, or an older bridge without
+        # HIVE_SOURCE_PEERLINK after a partial hot-swap (the bundle carries
+        # more than one copy of HARTOS); the exception names which.  Said at
+        # WARNING once per process, debug after (a peer's robot loop can ask
+        # many times a second; the review of c10535351): every peer's query
+        # is otherwise answered with the empty reply and nothing logged (the
+        # review of fbeb16284).
+        said = _handle_query.__dict__.setdefault('import_failure_said', False)
+        _handle_query.import_failure_said = True
+        logger.log(logging.DEBUG if said else logging.WARNING,
+                   f"hivemind query: bridge import failed (module or name "
+                   f"missing), answering empty: {e}")
         return _EMPTY_REPLY
 
     try:
@@ -117,17 +131,13 @@ def _handle_query(data: dict, sender_peer_id: str) -> Optional[dict]:
     if not result:
         return _EMPTY_REPLY
 
-    # Shape matches what world_model_bridge.query_hivemind reads back
-    # (line 954–958 of world_model_bridge.py):
-    #   peer_resp.get('thought') or peer_resp.get('response')
-    thought = (
-        (result.get('thought') if isinstance(result, dict) else None)
-        or (result.get('response') if isinstance(result, dict) else None)
-        or ''
-    )
+    # This node's own words (query_hivemind's one shape).  What its peers
+    # told it (source HIVE_SOURCE_PEERLINK) is not relayed a second hop: the
+    # asker fans out to those peers itself.
+    own = '' if result.get('source') == HIVE_SOURCE_PEERLINK else (result.get('thought') or '')
     return {
         'type': 'reply',
-        'thought': thought,
+        'thought': own,
         'peer_id': sender_peer_id,
     }
 

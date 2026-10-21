@@ -55,6 +55,29 @@ class TestLocalTokenScope:
         payload = mgr.decode_token(token, expected_type='access')
         assert payload['iss'].startswith('node:')
 
+    def test_access_token_carries_the_nodes_lane_claim_only_when_asked(self, mgr):
+        """The node's own word that a turn it relays is revenue-bearing travels
+        as a signed claim (core.request_lane reads it); a token minted without
+        it carries none, so a person's own login token never says a lane."""
+        from security.jwt_manager import ACCESS_TOKEN_EXPIRY
+        token = mgr.generate_access_token('cust-42', 'Customer', lane='revenue',
+                                          rid='api_1760300000_abcd1234')
+        payload = mgr.decode_token(token, expected_type='access')
+        assert payload['user_id'] == 'cust-42'
+        assert payload['lane'] == 'revenue'
+        # Bound to the one turn it was minted for (task #157) ...
+        assert payload['rid'] == 'api_1760300000_abcd1234'
+        # ... and alive for minutes, not the session's hour (30 days bundled):
+        # a captured one replayed with the same request id is worth nothing
+        # for long (reviews of af5c75099 and f431b73d7).
+        assert payload['exp'] - payload['iat'] <= 300
+        from security.jwt_manager import TURN_TOKEN_EXPIRY
+        assert payload['exp'] - payload['iat'] == min(ACCESS_TOKEN_EXPIRY, TURN_TOKEN_EXPIRY)
+        plain = mgr.decode_token(mgr.generate_access_token('cust-42', 'Customer'),
+                                 expected_type='access')
+        assert 'lane' not in plain and 'rid' not in plain
+        assert plain['exp'] - plain['iat'] == ACCESS_TOKEN_EXPIRY
+
     def test_refresh_token_has_local_scope(self, mgr):
         token = mgr.generate_refresh_token('u1', 'alice')
         payload = mgr.decode_token(token, expected_type='refresh')
@@ -311,6 +334,41 @@ class TestAuthModuleHiveFunctions:
         token = generate_jwt('u1', 'alice', 'flat')
         payload = decode_jwt(token)
         assert payload.get('scope') == 'local'
+
+    @pytest.mark.parametrize('signer', ['manager', 'legacy'])
+    def test_generate_jwt_carries_the_nodes_lane_claim_through_either_signer(
+            self, monkeypatch, signer):
+        """generate_jwt(lane=...) reaches the claim through BOTH signers, each
+        forced in turn (the review of af5c75099, F6: run as the process found
+        it, this test proved only the hardened manager): the claims come from
+        the one builder (security.jwt_manager.turn_claims), a token minted
+        without a lane has none, and the one minted with it lives
+        TURN_TOKEN_EXPIRY seconds under either (token_lifetime) where the
+        session token keeps its own lifetime."""
+        from integrations.social import auth
+        from security.jwt_manager import ACCESS_TOKEN_EXPIRY, JWTManager
+        if signer == 'manager':
+            monkeypatch.setattr(auth, '_jwt_manager', JWTManager(secret_key=SECRET))
+            session_life = ACCESS_TOKEN_EXPIRY
+        else:
+            monkeypatch.setattr(auth, '_jwt_manager', False)   # the legacy encoder
+            session_life = auth.TOKEN_EXPIRY
+        claims = auth.decode_jwt(auth.generate_jwt('cust-42', 'Customer', 'user', lane='revenue',
+                                                   rid='api_1760300000_abcd1234'))
+        assert claims['user_id'] == 'cust-42'
+        assert claims['lane'] == 'revenue' and claims['rid'] == 'api_1760300000_abcd1234'
+        assert claims['exp'] - claims['iat'] <= 300
+        from security.jwt_manager import TURN_TOKEN_EXPIRY
+        assert claims['exp'] - claims['iat'] == min(session_life, TURN_TOKEN_EXPIRY)
+        plain = auth.decode_jwt(auth.generate_jwt('cust-42', 'Customer', 'user'))
+        assert 'lane' not in plain and 'rid' not in plain
+        assert plain['exp'] - plain['iat'] == session_life
+        # The role asked of the mint reaches only the legacy token; the
+        # hardened one names no role, and nothing reads a JWT's role
+        # (review of af5c75099, F3; recorded in chat_contract.chat_turn_request).
+        assert ('role' in claims) == (signer == 'legacy')
+        if signer == 'legacy':
+            assert claims['role'] == 'user'
 
 
 # ═══════════════════════════════════════════════════════════════════════

@@ -1,0 +1,5 @@
+[mov,mp4,m4a,3gp,3g2,mj2 @ 0000017c2b92f380] Format mov,mp4,m4a,3gp,3g2,mj2 detected only with low score of 1, misdetection possible!
+[mov,mp4,m4a,3gp,3g2,mj2 @ 0000017c2b92f380] moov atom not found
+[in#0 @ 0000017c2b92ef80] Error opening input: Invalid data found when processing input
+Error opening input file VID_20261012_112000.mp4.
+Error opening input files: Invalid data found when processing input

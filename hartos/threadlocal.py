@@ -335,6 +335,25 @@ class ThreadLocalData:
         self._local.agentic_plan_steps = []
         self._local.agentic_matched_agent_id = None
 
+    # --- May this turn be offered the agent-work tools? (set by /chat) ---
+    # Create_Agent and Agentic_Router (core.constants.AGENT_WORK_TOOL_NAMES)
+    # turn a conversation into agent work: an interview, a build saved under
+    # the caller's id, a Plan Mode consent question.  /chat records the
+    # body's answer here once per turn, and hart_intelligence_entry.get_tools
+    # reads it on every call (an explicit False still withholds the pair; an
+    # explicit True cannot bring it back on a declined turn; no caller passes
+    # a value today), so get_ans's two calls and CustomGPT._call's prompt
+    # rebuild on later steps agree (the review of 5a66a3308 measured the
+    # rebuild re-listing both tools after the first step when the flag
+    # travelled as a keyword).  Default True: a person's turn keeps both;
+    # the metered Hive API declines (task #120).
+
+    def set_agent_tools(self, allowed):
+        self._local.agent_tools = bool(allowed)
+
+    def get_agent_tools(self) -> bool:
+        return getattr(self._local, 'agent_tools', True)
+
     # --- Per-request task source (own | hive | idle) ---
 
     def set_task_source(self, source: str):

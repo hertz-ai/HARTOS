@@ -16,10 +16,11 @@ Usage:
 import functools
 import logging
 import os
+import threading
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Callable, Optional
 
-from core.http_pool import pooled_get, pooled_post
+from core.http_pool import LLM_COMPLETION_TIMEOUT, pooled_get, pooled_post
 
 logger = logging.getLogger('hevolve_vision')
 
@@ -59,6 +60,12 @@ class VisionBackend(AutoReportSubsystemFailures, ABC):
     # silent.  Adding new methods to a concrete backend (e.g. `embed`)
     # just needs the method name in this tuple — no per-backend
     # except-block edits.
+    #
+    # `rate_frame` is deliberately NOT here.  A frame the model cannot rate
+    # (server down, a prose answer, the caller's time budget spent) falls
+    # back to a deterministic score in the caller; that is the designed
+    # path, not a subsystem failure, and 25 of them per reel would only
+    # flood the self-heal pipeline.
     AUTO_REPORTED_METHODS = ('start', 'describe', 'read_document', 'stop')
 
     @property
@@ -115,6 +122,53 @@ class VisionBackend(AutoReportSubsystemFailures, ABC):
         """
         return None
 
+    def rate_frame(self, image_bytes: bytes, prompt: str, *, long_side: int = 768,
+                   max_tokens: int = 80, timeout_s: float = 20.0) -> Optional[str]:
+        """Judge one video frame against a rubric prompt.
+
+        Reel Studio rates up to 25 keyframes of a reel this way (which makeup
+        stage the frame shows, how appealing it is), asking for a short JSON
+        answer that the caller parses.  The frame goes with its aspect kept,
+        no longer than ``long_side`` on its long side, at temperature 0 with
+        thinking off, and ``max_tokens`` of answer.
+
+        Unlike describe() and read_document(), it never starts a model
+        server: a server that does not answer /health is a None, and the
+        caller falls back.  A caller that rates many frames asks
+        ensure_running() itself, once, before its first frame (Reel Studio's
+        score_moments does).  ``timeout_s`` bounds the request itself, so a
+        caller with a time budget passes what is left of it.  It never
+        raises, and it is not an auto-reported method (see
+        AUTO_REPORTED_METHODS).
+
+        Returns:
+            The model's answer ('' when it answered with nothing), or None
+            when this backend cannot rate a frame, its server is not up, or
+            the request failed.  The default is None.
+        """
+        return None
+
+    def ensure_running(self, on_wait: Optional[Callable[[], None]] = None) -> bool:
+        """Make this backend able to answer now, starting its model server
+        when it has one to start.  True when it can answer.
+
+        describe() and read_document() ask it before they send anything;
+        rate_frame() never does, its caller asks it once (Reel Studio's
+        score_moments, before the first frame it needs the model for).
+
+        ``on_wait`` is called once, just before this method waits for a
+        server or starts one -- never when the backend is ready as it is --
+        so a caller can say the model is being made ready only when it is
+        (a reel's chat line).  A callback that raises is logged; the start
+        goes on.
+
+        The default is True and calls nothing: this backend has no server to
+        start (it loads its model in start(), talks to a server something
+        else runs, or has no model).  Qwen08BBackend's is the caption
+        server's lazy launch.
+        """
+        return True
+
     def start(self) -> bool:
         """Initialize the backend model. Returns True if ready."""
         return True
@@ -135,13 +189,14 @@ PAGE_LONG_SIDE = 1280
 PAGE_MAX_TOKENS = 4096
 
 
-def _page_jpeg(image_bytes: bytes) -> bytes:
-    """The page as JPEG bytes, no longer than PAGE_LONG_SIDE on its long side."""
+def _fit_jpeg(image_bytes: bytes, long_side: int) -> bytes:
+    """The image as JPEG bytes (quality 85), its aspect kept, no longer than
+    ``long_side`` on its long side.  A smaller image is not enlarged."""
     import io
     from PIL import Image
     img = Image.open(io.BytesIO(image_bytes))
-    if max(img.size) > PAGE_LONG_SIDE:
-        scale = PAGE_LONG_SIDE / max(img.size)
+    if max(img.size) > long_side:
+        scale = long_side / max(img.size)
         img = img.resize((round(img.width * scale), round(img.height * scale)),
                          Image.LANCZOS)
     buf = io.BytesIO()
@@ -149,24 +204,33 @@ def _page_jpeg(image_bytes: bytes) -> bytes:
     return buf.getvalue()
 
 
-def _read_page_with(completions_url: str, image_bytes: bytes, prompt: str, *,
-                    model: str, headers: Optional[dict] = None) -> Optional[str]:
-    """The one page-reading request to an OpenAI-compatible vision server.
+def _vision_complete(completions_url: str, image_bytes: bytes, prompt: str, *,
+                     model: str, long_side: int, max_tokens: int, temperature: float,
+                     headers: Optional[dict] = None,
+                     timeout=LLM_COMPLETION_TIMEOUT) -> Optional[str]:
+    """The one image + prompt request to an OpenAI-compatible vision server.
+
+    Page reads (_read_page_with) and frame ratings (rate_frame) both go
+    through here; they differ only in the image size, the answer budget,
+    the temperature and the timeout they pass.  The image goes first, then
+    the prompt.
 
     Thinking is off (core.constants.LLM_THINKING_OFF_KWARGS): a hybrid
     reasoning model otherwise spends its budget in reasoning_content and
-    answers with nothing. pooled_post admits the call through the priority
-    scheduler, so a page read by a background parse waits behind the user's
-    own turn. Never raises: a page the model does not read, the caller reads
-    from somewhere else.
+    answers with nothing. pooled_post admits a main-model call through the
+    priority scheduler, so a background request waits behind the user's own
+    turn. Never raises.
+
+    Returns the stripped answer ('' when the model answered with nothing), or
+    None when the image could not be prepared, the server could not be
+    reached, or it answered with a non-200 or with no usable JSON.
     """
     import base64
     from core.constants import LLM_THINKING_OFF_KWARGS
-    from core.http_pool import LLM_COMPLETION_TIMEOUT
     try:
-        b64 = base64.b64encode(_page_jpeg(image_bytes)).decode('ascii')
+        b64 = base64.b64encode(_fit_jpeg(image_bytes, long_side)).decode('ascii')
     except Exception as e:
-        logger.warning(f"page image could not be prepared for the VLM: {e}")
+        logger.warning(f"image could not be prepared for the VLM: {e}")
         return None
     body = {
         'model': model,
@@ -175,35 +239,107 @@ def _read_page_with(completions_url: str, image_bytes: bytes, prompt: str, *,
             {'type': 'text', 'text': prompt},
         ]}],
         'chat_template_kwargs': dict(LLM_THINKING_OFF_KWARGS),
-        'max_tokens': PAGE_MAX_TOKENS,
-        'temperature': 0.3,
+        'max_tokens': max_tokens,
+        'temperature': temperature,
     }
     extra = {'headers': headers} if headers else {}
     try:
-        resp = pooled_post(completions_url, json=body,
-                           timeout=LLM_COMPLETION_TIMEOUT, **extra)
+        resp = pooled_post(completions_url, json=body, timeout=timeout, **extra)
     except Exception as e:
-        logger.warning(f"page read failed at {completions_url}: {e}")
+        logger.warning(f"VLM request failed at {completions_url}: {e}")
         return None
     if resp.status_code != 200:
-        logger.warning(f"page read at {completions_url} returned HTTP "
+        logger.warning(f"VLM request at {completions_url} returned HTTP "
                        f"{resp.status_code}: {resp.text[:200]}")
         return None
     try:
         choice = (resp.json().get('choices') or [{}])[0]
     except (ValueError, AttributeError) as e:
-        logger.warning(f"page read at {completions_url} answered with no usable JSON: {e}")
+        logger.warning(f"VLM at {completions_url} answered with no usable JSON: {e}")
         return None
     message = choice.get('message') or {}
     content = (message.get('content') or '').strip()
     if choice.get('finish_reason') == 'length':
-        logger.warning("page read stopped at its %d-token budget: the answer is cut off",
-                       PAGE_MAX_TOKENS)
+        logger.warning("VLM answer stopped at its %d-token budget: it is cut off",
+                       max_tokens)
     if not content:
-        logger.warning("page read produced EMPTY content (finish_reason=%s, "
+        logger.warning("VLM produced EMPTY content (finish_reason=%s, "
                        "reasoning_content=%d chars)", choice.get('finish_reason'),
                        len(message.get('reasoning_content') or ''))
     return content
+
+
+def _read_page_with(completions_url: str, image_bytes: bytes, prompt: str, *,
+                    model: str, headers: Optional[dict] = None) -> Optional[str]:
+    """The one page-reading request to an OpenAI-compatible vision server:
+    the page at PAGE_LONG_SIDE, PAGE_MAX_TOKENS of answer, temperature 0.3,
+    the LLM completion timeout.  Never raises: a page the model does not
+    read, the caller reads from somewhere else."""
+    return _vision_complete(completions_url, image_bytes, prompt, model=model,
+                            long_side=PAGE_LONG_SIDE, max_tokens=PAGE_MAX_TOKENS,
+                            temperature=0.3, headers=headers)
+
+
+#: A health probe of a local vision server: 1 s to connect, 2 s to answer.
+#: llama-server answers /health 200 when its model is loaded and 503 while
+#: it loads; anything else, or no answer in time, is "not serving".
+HEALTH_TIMEOUT = (1, 2)
+
+
+def _health_ok(server_root: str) -> bool:
+    """True only when the server at ``server_root`` answers GET /health 200."""
+    try:
+        resp = pooled_get(f'{server_root.rstrip("/")}/health', timeout=HEALTH_TIMEOUT)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def _server_root(base_url: str) -> str:
+    """An OpenAI-compatible base URL without its trailing /v1:
+    'http://127.0.0.1:8080/v1/' -> 'http://127.0.0.1:8080'."""
+    root = base_url.rstrip('/')
+    return root[:-len('/v1')] if root.endswith('/v1') else root
+
+
+def _rate_frame_at(completions_url: str, serving, image_bytes: bytes, prompt: str, *,
+                   model: str, long_side: int, max_tokens: int, timeout_s,
+                   headers: Optional[dict] = None) -> Optional[str]:
+    """VisionBackend.rate_frame for a backend with an OpenAI-compatible server.
+
+    ``serving()`` is the backend's own health check, asked first; nothing is
+    started when it says no.  Then one _vision_complete at temperature 0
+    with ``timeout_s`` as the request timeout.  A timeout that is not a
+    positive number is no time at all: no probe and no request.  Never
+    raises.
+    """
+    import math
+    try:
+        if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)) \
+                or not math.isfinite(timeout_s) or timeout_s <= 0:
+            logger.warning(f"rate_frame: no time to rate a frame (timeout_s={timeout_s!r})")
+            return None
+        if not serving():
+            logger.info(f"rate_frame: no vision server answering at {completions_url}")
+            return None
+        return _vision_complete(completions_url, image_bytes, prompt, model=model,
+                                long_side=long_side, max_tokens=max_tokens,
+                                temperature=0.0, headers=headers, timeout=timeout_s)
+    except Exception as e:
+        logger.warning(f"rate_frame failed at {completions_url}: {e}")
+        return None
+
+
+def _tell_waiting(on_wait: Optional[Callable[[], None]]) -> None:
+    """Tell an ensure_running caller it is waiting for a server (its
+    ``on_wait``), once.  A callback that raises is logged, and the start or
+    the wait it announces goes on (review of 42735064e)."""
+    if on_wait is None:
+        return
+    try:
+        on_wait()
+    except Exception as e:
+        logger.warning(f"vision start: on_wait raised ({e}); going on")
 
 
 class MiniCPMBackend(VisionBackend):
@@ -596,6 +732,23 @@ class Qwen3VLVisionBackend(VisionBackend):
         return _read_page_with(url, image_bytes, prompt, model=endpoint.model_name,
                                headers={'Authorization': f'Bearer {endpoint.api_key}'})
 
+    def rate_frame(self, image_bytes: bytes, prompt: str, *, long_side: int = 768,
+                   max_tokens: int = 80, timeout_s: float = 20.0) -> Optional[str]:
+        """A keyframe rating through the same endpoint, after its /health
+        answers (see VisionBackend.rate_frame).  This backend has no
+        launcher; it sends nothing when the endpoint is not serving."""
+        try:
+            endpoint = self._endpoint()
+            url = self.completions_url()
+            root = _server_root(endpoint.base_url)
+        except Exception as e:
+            logger.warning(f"Qwen3-VL unavailable to rate a frame: {e}")
+            return None
+        return _rate_frame_at(url, lambda: _health_ok(root), image_bytes, prompt,
+                              model=endpoint.model_name, long_side=long_side,
+                              max_tokens=max_tokens, timeout_s=timeout_s,
+                              headers={'Authorization': f'Bearer {endpoint.api_key}'})
+
 
 class Qwen08BBackend(VisionBackend):
     """Qwen3.5-0.8B — fast continuous captioning (1s/frame).
@@ -604,9 +757,15 @@ class Qwen08BBackend(VisionBackend):
     core.port_registry, 'vlm_caption'), separate from the 4B model used for
     computer use / action planning.
 
-    Purpose: always-on frame captioning → FrameStore activity table, and
-    reading document pages (read_document) for the book pipeline.
+    Purpose: always-on frame captioning → FrameStore activity table,
+    reading document pages (read_document) for the book pipeline, and
+    rating Reel Studio keyframes (rate_frame).
     NOT for computer use (use 4B Qwen3VLVisionBackend for that).
+
+    The server starts lazily, in ensure_running: describe() and
+    read_document() ask it per call; a reel asks it ONCE, before its first
+    keyframe that is not cached (score_moments), and rate_frame never asks
+    it, so 25 frames cost at most one start.
 
     Model: Qwen3.5-0.8B-UD-Q4_K_XL.gguf (~558MB) + mmproj-F16.gguf (~195MB)
     Download: unsloth/Qwen3.5-0.8B-GGUF (model + mmproj)
@@ -638,23 +797,38 @@ class Qwen08BBackend(VisionBackend):
         actually arrives.
 
         "Selectable", not "serving": the launch path asks _is_serving().
+
+        The weights are looked for by the launch's own lookup, _model_files
+        (the catalog row's file name; the folder it recorded, Nunba's
+        models-folder rule, ~/.trueflow/models).  It was a second lookup, a
+        literal name in ~/.nunba/models and ~/.trueflow/models only, so
+        weights the launch would start (a custom NUNBA_MODELS_DIR, a saved
+        models_dir, the catalog's folder) were never selected (review of
+        6067e8806).  Whole weights alone make it selectable, not the
+        projector: Nunba's start fetches a missing projector itself, with
+        room for it and the owner's yes on SETUP_CAPABILITY
+        (llama_config.start_caption_server), and starts without it until then.
+        Whole by the one completeness rule (see _model_files): a partial
+        download, which the launch could only fail to load, is not
+        selectable.  A lookup that fails -- the catalog unreadable, so the
+        launch could not find the files either -- is not selectable.
         """
         if self._is_serving():
             return True
-        home = os.path.expanduser('~')
-        for d in [os.path.join(home, '.nunba', 'models'),
-                  os.path.join(home, '.trueflow', 'models')]:
-            if os.path.isfile(os.path.join(d, 'Qwen3.5-0.8B-UD-Q4_K_XL.gguf')):
-                return True
-        return False
+        try:
+            model, _mmproj = self._model_files()
+        except Exception as e:
+            logger.warning(f"Qwen3.5-0.8B: model lookup failed ({e}); not selectable")
+            return False
+        return model is not None
 
     def _is_serving(self) -> bool:
         """True only when the caption server answers /health on its port."""
-        try:
-            resp = pooled_get(f'http://127.0.0.1:{self._port}/health', timeout=2)
-            return resp.status_code == 200
-        except Exception:
-            return False
+        return _health_ok(f'http://127.0.0.1:{self._port}')
+
+    def completions_url(self) -> str:
+        """The caption server's chat completions URL (this node, its port)."""
+        return f'http://127.0.0.1:{self._port}/v1/chat/completions'
 
     def start(self) -> bool:
         """Lazy: don't boot at VisionService.start(). describe() does the
@@ -670,36 +844,258 @@ class Qwen08BBackend(VisionBackend):
         # DELETED 2026-09-22: ~60 lines of a SECOND caption-server launcher
         # used to sit here, after that unconditional `return True`.  It was
         # unreachable — dead since the lazy-start contract moved the launch
-        # into _ensure_running — but it was a byte-for-byte duplicate of the
-        # launcher below, including its own hardcoded 512-token window.  A dead
-        # parallel path still costs: it is the copy a reader greps up first,
-        # and it is the copy a future edit lands in.  The live launcher is
-        # _ensure_running; there is now exactly one.
+        # into ensure_running (then private: _ensure_running) — but it was a
+        # byte-for-byte duplicate of the launcher below, including its own
+        # hardcoded 512-token window.  A dead parallel path still costs: it is
+        # the copy a reader greps up first, and it is the copy a future edit
+        # lands in.  The live launcher is ensure_running; there is now exactly
+        # one.
 
     # 0.8B optimal: 512x288 (11KB JPEG) — only needs scene understanding, not coords
     CAPTION_WIDTH = 512
     CAPTION_HEIGHT = 288
     IDLE_TIMEOUT_S = 300  # Unload after 5 min with no frames
     #: How long a FAILED launch suppresses the next attempt.  Not forever:
-    #: see _ensure_running for why permanence was a defect (#102).
+    #: see ensure_running for why permanence was a defect (#102).
     LAUNCH_RETRY_S = 120
+    #: The event ensure_running sends; Nunba's subscriber (main.py ~:669)
+    #: answers it with llama_config.start_caption_server.
+    START_EVENT = 'vlm_caption.requested'
+    #: Nunba's per-port caption start lock (start_lock_path) means "a start
+    #: is in progress" only while it is younger than this; an older one was
+    #: left by a start that died (Nunba killed mid-start), and Nunba's next
+    #: start removes it.  ONE number for the writer and the reader: Nunba's
+    #: start_caption_server (llama/llama_config.py) waits on and removes the
+    #: lock by this attribute, and _launch_owner reads it by the same one.
+    #: It lives here, not in Nunba, because HARTOS cannot import Nunba (a
+    #: HARTOS-only process is the one a stale lock stopped).  Nunba's MAIN
+    #: server lock (.server_starting.lock, llama_config.start_server) keeps
+    #: its own 120 s: another file, guarding another server's start, which
+    #: nothing in HARTOS reads -- its bound is its own question.
+    START_LOCK_STALE_S = 120
+    #: The model catalog row whose files this backend serves (the 0.8B and
+    #: its projector, as Nunba's start_caption_server runs them):
+    #: model_catalog._populate_llm_models.
+    CATALOG_ID = 'llm-qwen3.5-0.8b'
+    #: What the owner is asked about before this row's files are downloaded:
+    #: the scope of capability_setup.ask_owner_for_setup's consent card.
+    #: Nunba's caption start (llama_config.start_caption_server) asks under
+    #: it and downloads only on a yes (owner ruling 2026-10-15); Reel Studio
+    #: reads the answer by it (capability_setup.setup_declined) to say why
+    #: no frame was rated.  One spelling for the asker and every reader.
+    SETUP_CAPABILITY = 'model:' + CATALOG_ID
 
     def __init__(self, port: int = None):
         from core.port_registry import get_port
         self._port = port or get_port('vlm_caption')
         self._launch_attempted = False
         self._launch_attempted_at = 0.0
+        #: The last use: a frame described, a page read, a keyframe rated, a
+        #: launch.  check_idle unloads a server this backend started once it
+        #: is IDLE_TIMEOUT_S old.
         self._last_describe_time = 0.0
         self._server_proc = None  # subprocess.Popen object (not just PID)
+        #: Held by the one caller starting the server (ensure_running); a
+        #: caller that finds it held waits for that start instead of making
+        #: its own.
+        self._start_lock = threading.Lock()
 
-    def _ensure_running(self) -> bool:
+    @staticmethod
+    def start_lock_path(port, config_dir=None) -> str:
+        """Nunba's per-port caption start lock, named once for both sides:
+        <config_dir>/.caption_server_starting.<port>.lock.
+
+        ``config_dir`` is Nunba's config folder (LlamaConfig.config_dir);
+        left out, its default ~/.nunba, where Nunba keeps it (no LlamaConfig
+        outside tests is built with another folder).  Nunba's
+        start_caption_server writes the lock here, holds it while it starts
+        the server and removes it; HARTOS only reads it (_launch_owner).
+        """
+        folder = (config_dir if config_dir is not None
+                  else os.path.join(os.path.expanduser('~'), '.nunba'))
+        return os.path.join(str(folder), f'.caption_server_starting.{port}.lock')
+
+    def _launch_owner(self) -> str:
+        """Why this backend must not spawn the caption server itself --
+        Nunba is starting it -- or '' when nobody is.
+
+        Both are Nunba's existing records, read here, never written:
+
+        * its START_EVENT subscriber on this process's platform event bus
+          (Nunba main.py ~:669): it answers the event ensure_running has
+          just sent with llama_config.start_caption_server;
+        * its per-port start lock, start_lock_path(port), which serializes
+          that start across Nunba's own callers and processes -- held only
+          while it is younger than START_LOCK_STALE_S, the number Nunba's
+          start_caption_server ages it by too.  One older than that was left
+          by a start that died (a Nunba killed mid-start): Nunba's next
+          start removes it, and it stops nobody here either.  HARTOS reads
+          the lock and never writes or removes it.
+
+        Spawning while either holds is how two 0.8B servers landed on one
+        port (2026-09-26).  A stale lock taken as held stopped a HARTOS-only
+        process for good (review of 6067e8806): every start waited 35 s,
+        spawned nothing and failed, until Nunba ran again.
+        """
+        import time
+        try:
+            from core.platform.registry import get_registry
+            bus = get_registry().get_or_none('events')
+            if bus is not None and bus.has_listeners(self.START_EVENT):
+                return f"Nunba's {self.START_EVENT} subscriber is starting it"
+        except Exception as e:
+            logger.debug(f"Qwen3.5-0.8B: event bus not readable ({e})")
+        lock = self.start_lock_path(self._port)
+        try:
+            age = time.time() - os.path.getmtime(lock)
+        except OSError:             # no lock, or it went as we looked: no start
+            return ''
+        if age < self.START_LOCK_STALE_S:
+            return f"Nunba's start lock {lock} is held ({age:.0f} s old)"
+        logger.info(f"Qwen3.5-0.8B: Nunba's start lock {lock} is stale ({age:.0f} s "
+                    f"old): no start in progress")
+        return ''
+
+    def _model_files(self) -> tuple:
+        """(model, mmproj) on disk for the standalone launch; None for a
+        file that is not there.  is_available() asks it too, for the model,
+        so selection and the launch find the 0.8B in the same places.
+
+        Names from the catalog row CATALOG_ID: files['model'], and the
+        projector under the name Nunba's installer stores it by,
+        files['mmproj'] (mmproj-Qwen3.5-0.8B-F16.gguf), or where
+        scripts/setup_vlm.py puts it, files['mmproj_source'] in a 'qwen08b'
+        folder.  Folders, first hit wins: the one the row's local_path names
+        (where the loader that fetched the weights put them); the LLM models
+        folder by Nunba's one storage rule, LlamaInstaller.resolve_models_dir
+        (llama_installer.py ~:446), where Nunba is importable, else that
+        rule's default ~/.nunba/models; then ~/.trueflow/models.
+
+        The weights count only when whole, by the one completeness rule
+        Nunba's get_model_path asks too: model_catalog.gguf_complete at
+        gguf_min_bytes of the registered size (90% of it, the GGUF magic).
+        A partial download is not found, so it is neither selected nor
+        spawned, and a whole copy in a later folder is found past it.  The
+        projector has no registered size and is taken as any file of its
+        name, as before.
+        """
+        from integrations.service_tools.model_catalog import (
+            get_catalog, gguf_complete, gguf_min_bytes, model_weight_bytes)
+        entry = get_catalog().get(self.CATALOG_ID)
+        if entry is None:
+            logger.warning(f"Qwen3.5-0.8B: catalog row {self.CATALOG_ID} is missing")
+            return None, None
+        files = entry.files or {}
+        home = os.path.expanduser('~')
+        try:
+            from llama.llama_installer import LlamaInstaller   # Nunba, when present
+            models_dir = str(LlamaInstaller.resolve_models_dir())
+        except Exception as e:
+            logger.debug(f"Qwen3.5-0.8B: Nunba's models folder rule not here ({e})")
+            models_dir = os.path.join(home, '.nunba', 'models')
+        dirs = [os.path.dirname(entry.local_path)] if entry.local_path else []
+        dirs += [models_dir, os.path.join(home, '.trueflow', 'models')]
+
+        def first(*parts, usable=os.path.isfile):
+            if not all(parts):
+                return None
+            return next((p for p in (os.path.join(d, *parts) for d in dirs)
+                         if usable(p)), None)
+        whole = gguf_min_bytes(model_weight_bytes(files.get('model') or ''))
+        return (first(files.get('model'), usable=lambda p: gguf_complete(p, whole)),
+                first(files.get('mmproj')) or first('qwen08b', files.get('mmproj_source')))
+
+    @staticmethod
+    def _launch_geometry(model: str) -> tuple:
+        """(--ctx-size, --n-gpu-layers or None) for the standalone launch of
+        the weights at ``model``, decided as the other start of this server
+        decides them.  None: pass no --n-gpu-layers.
+
+        The context is the one Nunba's start_caption_server gives the 0.8B
+        (llama_config._derive_ctx_size, the 0.8B preset being a Qwen3.5
+        one): core.llama_geometry.derive_ctx_size over the free VRAM of a
+        FORCED sample (vram_manager.refresh_gpu_info(force=True), not the
+        memo) and the weights measured from the file, or ctx_for_role('main')
+        when the box cannot be measured.  The launch used a fixed 512
+        (ctx_for_role('caption')): one caption fits, but a reel's keyframe
+        rating is 550 prompt tokens and every frame got HTTP 400 (measured
+        2026-10-14, A13 proof D2), and a page read (PAGE_LONG_SIDE,
+        PAGE_MAX_TOKENS) never fitted either.
+
+        On a CUDA card (the sample's cuda_available) the GPU layers are
+        llamacpp_manager.get_optimal_params', HARTOS's one placement of a
+        GGUF on a CUDA card: every layer (-1) where model_catalog.gguf_fits_gpu
+        says it fits, a partial offload sized from the file's blocks where it
+        does not.  It reads the sample just forced.  The launch passed 99
+        whatever the card held.
+
+        On any other sample -- Apple Metal, AMD ROCm, an NVIDIA card whose
+        driver cannot run CUDA 12, no GPU, a probe that failed -- None:
+        llama-server places the layers itself (--n-gpu-layers defaults to
+        'auto', fitted to the device's memory by --fit, on by default;
+        llama-server --help, build 7909 on this box), as Nunba's start of this
+        server leaves them on a GPU that is not CUDA
+        (llama_config._do_start_caption_server passes -ngl only when
+        installer.gpu_available is 'cuda').  get_optimal_params is not asked
+        there: it reads only cuda_available (llamacpp_manager._gguf_footprint)
+        and calls every other box CPU-only, so a Mac's 0.8B, which
+        vram_manager.suggest_offload_mode places on its GPU, went to the CPU
+        at --n-gpu-layers 0 (review of a44883fe2).
+        """
+        from core.llama_geometry import ctx_for_role, derive_ctx_size
+        from integrations.service_tools.llamacpp_manager import get_llamacpp_manager
+        from integrations.service_tools.vram_manager import vram_manager
+        sample = {}
+        try:
+            sample = vram_manager.refresh_gpu_info(force=True) or {}
+            ctx_size = derive_ctx_size(sample.get('free_gb', 0),
+                                       os.path.getsize(model) / (1024 ** 3))
+        except Exception as e:
+            ctx_size = ctx_for_role('main')
+            logger.info(f"Qwen3.5-0.8B: the box could not be measured ({e}); "
+                        f"context {ctx_size}")
+        if not sample.get('cuda_available'):
+            return ctx_size, None
+        return ctx_size, get_llamacpp_manager().get_optimal_params(model)['n_gpu_layers']
+
+    def ensure_running(self, on_wait: Optional[Callable[[], None]] = None) -> bool:
         """Lazy-start: launch 0.8B server on first frame, not at boot.
+
+        VisionBackend.ensure_running for the caption server (it was the
+        private _ensure_running until 2026-10-14; describe(),
+        read_document() and Reel Studio's score_moments call it).
 
         HARTOS emits 'vlm_caption.requested' event. In bundled mode, Nunba
         subscribes to this event and calls its own start_caption_server().
-        In standalone mode, HARTOS uses model_lifecycle to launch directly.
+        While Nunba is starting it (_launch_owner: its subscriber took the
+        event, or its per-port start lock is held, i.e. younger than
+        START_LOCK_STALE_S) HARTOS spawns nothing and waits for Nunba's
+        server, 5 s + 30 s at most, the bound its own launch has.  In
+        standalone mode (neither; a stale lock is neither), HARTOS uses
+        model_lifecycle to launch directly, with the files _model_files
+        finds through the model catalog, at the context size and GPU layers
+        _launch_geometry decides (as Nunba's start of this server does).
 
-        Dependency direction: Nunba → HARTOS (never HARTOS → Nunba).
+        One start at a time per backend, and the backend is the one this
+        process hands every caller (get_vision_backend; owner ruling
+        2026-10-15): a caller that comes while another caller's start is
+        under way -- VisionService's description loop during a reel's start
+        -- waits for that start and takes its answer, and spawns nothing.
+        Each caller used to hold its own backend with its own record of a
+        start, and two of them spawned two servers on one port (reviewer
+        F1, a HARTOS-only node).  A caller that comes after a start failed
+        is inside that start's cooldown, whoever it was.
+
+        ``on_wait`` is called once, after the server was found not serving
+        and before the event is sent, or before waiting for another caller's
+        start: not when it is up, not while a failed launch's cooldown
+        holds.  In its own try, so a caller's progress line that raises
+        never skips the start it announces (review of 42735064e).
+
+        Dependency direction: Nunba → HARTOS (never HARTOS → Nunba).  What
+        is read of Nunba (its event subscriber, its start lock, its models
+        folder rule when importable) is optional: a HARTOS-only node has none
+        of it and launches standalone.
 
         Every "is it up" check here is _is_serving(), never is_available():
         is_available() is also True when only the weights are on disk, and
@@ -709,6 +1105,18 @@ class Qwen08BBackend(VisionBackend):
         """
         if self._is_serving():
             return True
+        if not self._start_lock.acquire(blocking=False):
+            # Another caller is starting it; its waits bound this one.
+            _tell_waiting(on_wait)
+            with self._start_lock:
+                return self._is_serving()
+        try:
+            return self._start_serving(on_wait)
+        finally:
+            self._start_lock.release()
+
+    def _start_serving(self, on_wait: Optional[Callable[[], None]]) -> bool:
+        """ensure_running's start, with the start lock held."""
         import time as _t
         if self._launch_attempted:
             # A COOLDOWN, not a latch (#102, found by hartos-94).  This flag
@@ -720,13 +1128,15 @@ class Qwen08BBackend(VisionBackend):
             # per frame.
             #
             # Transient failure is the normal case here, not the exception:
-            # the event wait below is only 5x1s so a still-booting Nunba
-            # loses the race, the standalone path needs a llama-server
-            # binary that aborts on this box, and it competes for VRAM with
-            # the resident LLM.  Any of those should cost one cooldown, not
-            # the feature.
+            # a still-booting Nunba can take longer than the wait below, the
+            # standalone path needs a llama-server binary that aborts on
+            # this box, and it competes for VRAM with the resident LLM.  Any
+            # of those should cost one cooldown, not the feature.
             if _t.time() - self._launch_attempted_at < self.LAUNCH_RETRY_S:
-                return False
+                # A start that another caller finished between this caller's
+                # probe and its lock is serving now; any other start in its
+                # cooldown is not.
+                return self._is_serving()
             logger.info(
                 f"Qwen3.5-0.8B: retrying launch after "
                 f"{self.LAUNCH_RETRY_S}s cooldown")
@@ -744,10 +1154,12 @@ class Qwen08BBackend(VisionBackend):
         self._launch_attempted = True
         self._launch_attempted_at = _t.time()
 
+        _tell_waiting(on_wait)
+
         # Emit event — Nunba subscribes in bundled mode and starts the server
         try:
             from core.platform.events import emit_event
-            emit_event('vlm_caption.requested', {'port': self._port})
+            emit_event(self.START_EVENT, {'port': self._port})
         except Exception:
             pass
 
@@ -759,74 +1171,74 @@ class Qwen08BBackend(VisionBackend):
                 logger.info(f"Qwen3.5-0.8B started (event-driven) on port {self._port}")
                 return True
 
-        # Nobody started it — standalone mode, use model_lifecycle
-        try:
-            from integrations.service_tools.model_lifecycle import ModelLifecycleManager
-            server = ModelLifecycleManager._find_llama_server_binary()
-            if not server:
-                logger.info("Qwen3.5-0.8B: llama-server not found")
-                return False
-
-            home = os.path.expanduser('~')
-            model = mmproj = None
-            for d in [os.path.join(home, '.nunba', 'models'),
-                      os.path.join(home, '.trueflow', 'models')]:
-                p = os.path.join(d, 'Qwen3.5-0.8B-UD-Q4_K_XL.gguf')
-                if os.path.isfile(p) and not model:
-                    model = p
-                p = os.path.join(d, 'qwen08b', 'mmproj-F16.gguf')
-                if os.path.isfile(p) and not mmproj:
-                    mmproj = p
-            if not model or not mmproj:
-                logger.info("Qwen3.5-0.8B: model files not found")
-                return False
-
-            import subprocess
-            # 512 is correct for this backend and is NOT a main-model size:
-            # a caption turn is one 512x288 JPEG plus one sentence of prompt,
-            # and the whole point of the 0.8B captioner is that it costs
-            # almost nothing.  It is a legitimately separate model class, so
-            # it keeps a fixed small window — what it must not keep is its own
-            # copy of that number.  core.llama_geometry.ROLE_CTX['caption'] is
-            # where the value lives, beside the tier table, so "the captioner
-            # runs at 512" is a policy statement one grep can answer rather
-            # than a literal repeated at each subprocess.Popen.
-            #
-            # This spawn also does NOT publish_geometry: it is a caption
-            # server on the vlm_caption port, not the main engine, and
-            # publishing 512 would tell HARTOS's wire trimmer that every
-            # agentic request must fit in 512 tokens.
-            from core.llama_geometry import ctx_for_role
-            cmd = [server, '--model', model, '--mmproj', mmproj,
-                   '--port', str(self._port),
-                   '--ctx-size', str(ctx_for_role('caption')),
-                   '--n-gpu-layers', '99', '--threads', '4', '--flash-attn', 'on']
-            log_path = os.path.join(os.environ.get('TEMP', '/tmp'), f'llama_{self._port}.log')
-            # APPEND mode — same root-cause class as the caption-server
-            # launch above.  Preserves prior run's log across restarts.
-            log_fh = open(log_path, 'a')
+        # Not up yet.  If Nunba is starting it (its subscriber took the event,
+        # or its per-port lock is held), a spawn here is a second 0.8B server
+        # on the port -- the 2026-09-26 incident class.  Spawn nothing; wait
+        # for its server the 30 s this backend waits for its own.  Nobody
+        # starting it — standalone mode, use model_lifecycle.
+        owner = self._launch_owner()
+        if owner:
+            logger.info(f"Qwen3.5-0.8B: not spawning on port {self._port}: {owner}; "
+                        f"waiting for it")
+        else:
             try:
-                import datetime as _lb_dt
-                log_fh.write(
-                    f"\n===== llama-caption (standalone) session "
-                    f"{_lb_dt.datetime.now().isoformat()} port={self._port} =====\n"
-                )
-                log_fh.flush()
-            except Exception:
-                pass
-            _kw = dict(stdout=log_fh, stderr=subprocess.STDOUT)
-            if os.name == 'nt':
-                _kw['creationflags'] = subprocess.CREATE_NO_WINDOW
-            self._server_proc = subprocess.Popen(cmd, **_kw)
-            self._log_fh = log_fh
-            logger.info(f"Qwen3.5-0.8B launching PID={self._server_proc.pid} port={self._port}")
-            for _ in range(30):
-                time.sleep(1)
-                if self._is_serving():
-                    logger.info(f"Qwen3.5-0.8B ready on port {self._port}")
-                    return True
-        except Exception as e:
-            logger.error(f"Qwen3.5-0.8B standalone start failed: {e}")
+                from integrations.service_tools.model_lifecycle import ModelLifecycleManager
+                server = ModelLifecycleManager._find_llama_server_binary()
+                if not server:
+                    logger.info("Qwen3.5-0.8B: llama-server not found")
+                    return False
+
+                model, mmproj = self._model_files()
+                if not model or not mmproj:
+                    logger.info("Qwen3.5-0.8B: model files not found")
+                    return False
+
+                import subprocess
+                # Sized and placed as the other start of this server sizes it
+                # (_launch_geometry).  This spawn does NOT publish_geometry:
+                # it is a caption server on the vlm_caption port, not the main
+                # engine, and publishing its window would tell HARTOS's wire
+                # trimmer what the MAIN server holds.
+                ctx_size, gpu_layers = self._launch_geometry(model)
+                cmd = [server, '--model', model, '--mmproj', mmproj,
+                       '--port', str(self._port),
+                       '--ctx-size', str(ctx_size)]
+                if gpu_layers is not None:          # else llama-server's own
+                    cmd += ['--n-gpu-layers', str(gpu_layers)]
+                cmd += ['--threads', '4', '--flash-attn', 'on']
+                log_path = os.path.join(os.environ.get('TEMP', '/tmp'), f'llama_{self._port}.log')
+                # APPEND mode — same root-cause class as the caption-server
+                # launch above.  Preserves prior run's log across restarts.
+                log_fh = open(log_path, 'a')
+                try:
+                    import datetime as _lb_dt
+                    log_fh.write(
+                        f"\n===== llama-caption (standalone) session "
+                        f"{_lb_dt.datetime.now().isoformat()} port={self._port} =====\n"
+                    )
+                    log_fh.flush()
+                except Exception:
+                    pass
+                _kw = dict(stdout=log_fh, stderr=subprocess.STDOUT)
+                if os.name == 'nt':
+                    _kw['creationflags'] = subprocess.CREATE_NO_WINDOW
+                self._server_proc = subprocess.Popen(cmd, **_kw)
+                self._log_fh = log_fh
+                # A launch is a use: VisionService's check_idle (on this same
+                # backend) must not unload the server while it loads because
+                # a camera frame was described long ago.
+                self._last_describe_time = time.time()
+                logger.info(f"Qwen3.5-0.8B launching PID={self._server_proc.pid} "
+                            f"port={self._port} ctx={ctx_size} gpu_layers="
+                            f"{'llama-server default' if gpu_layers is None else gpu_layers}")
+            except Exception as e:
+                logger.error(f"Qwen3.5-0.8B standalone start failed: {e}")
+                return False
+        for _ in range(30):
+            time.sleep(1)
+            if self._is_serving():
+                logger.info(f"Qwen3.5-0.8B ready on port {self._port}")
+                return True
         return False
 
     def stop(self):
@@ -862,7 +1274,9 @@ class Qwen08BBackend(VisionBackend):
         self._launch_attempted = False
 
     def check_idle(self):
-        """Called by VisionService's description_loop. Unloads if no frames for IDLE_TIMEOUT_S."""
+        """Called by VisionService's description_loop.  Unloads a server this
+        backend started once it has gone IDLE_TIMEOUT_S without a use (a
+        frame described, a page read, a keyframe rated, its launch)."""
         import time
         if self._server_proc and self._last_describe_time > 0:
             idle = time.time() - self._last_describe_time
@@ -873,7 +1287,7 @@ class Qwen08BBackend(VisionBackend):
     def describe(self, frame_bytes: bytes, prompt: str = '') -> Optional[str]:
         import base64, time
         # Lazy-start on first frame
-        if not self._ensure_running():
+        if not self.ensure_running():
             return None
         self._last_describe_time = time.time()
         try:
@@ -888,7 +1302,7 @@ class Qwen08BBackend(VisionBackend):
             b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
 
             resp = pooled_post(
-                f'http://127.0.0.1:{self._port}/v1/chat/completions',
+                self.completions_url(),
                 json={
                     'model': 'local',
                     'max_tokens': 100,
@@ -916,12 +1330,32 @@ class Qwen08BBackend(VisionBackend):
         as describe(), none of its caption shrink (512x288 at 100 tokens is
         far too little to read a page)."""
         import time
-        if not self._ensure_running():
+        if not self.ensure_running():
             return None
         self._last_describe_time = time.time()
-        return _read_page_with(
-            f'http://127.0.0.1:{self._port}/v1/chat/completions', image_bytes, prompt,
-            model='local')
+        return _read_page_with(self.completions_url(), image_bytes, prompt, model='local')
+
+    def rate_frame(self, image_bytes: bytes, prompt: str, *, long_side: int = 768,
+                   max_tokens: int = 80, timeout_s: float = 20.0) -> Optional[str]:
+        """A keyframe rating on the caption server, ONLY if it is already
+        serving (see VisionBackend.rate_frame).
+
+        Never ensure_running per frame: that start emits
+        vlm_caption.requested and waits for the server, and a reel rates up
+        to 25 frames on a time budget with a deterministic fallback.  The
+        rule: the reel (score_moments) asks ensure_running ONCE, before its
+        first frame that is not cached; each frame then only asks /health.
+        Not serving is a None.
+
+        A rating is a use of the server, as a described frame is: the
+        VisionService holding this same backend does not idle out a server
+        a reel is rating frames on (check_idle).
+        """
+        import time
+        self._last_describe_time = time.time()
+        return _rate_frame_at(self.completions_url(), self._is_serving, image_bytes, prompt,
+                              model='local', long_side=long_side, max_tokens=max_tokens,
+                              timeout_s=timeout_s)
 
 
 class NoneBackend(VisionBackend):
@@ -957,6 +1391,24 @@ _BACKENDS = {
     'none': NoneBackend,
 }
 
+#: This process's one instance of each backend, by its _BACKENDS name, made
+#: on first ask (_shared).  Owner ruling 2026-10-15: the reel, the book reader
+#: and VisionService hold the same backend, so one record of a start under way
+#: (Qwen08BBackend.ensure_running) covers them all.
+_SHARED: dict = {}
+_SHARED_LOCK = threading.Lock()
+
+
+def _shared(name: str) -> VisionBackend:
+    """This process's one instance of the backend ``name``; a name _BACKENDS
+    does not have is 'none', as get_vision_backend always answered it."""
+    key = name if name in _BACKENDS else 'none'
+    with _SHARED_LOCK:
+        backend = _SHARED.get(key)
+        if backend is None:
+            backend = _SHARED[key] = _BACKENDS[key]()
+        return backend
+
 
 def get_vision_backend(name: str = '') -> VisionBackend:
     """Get or auto-select a vision backend.
@@ -970,21 +1422,31 @@ def get_vision_backend(name: str = '') -> VisionBackend:
            - 2GB+ RAM, no GPU → mobilevlm (if ONNX Runtime available)
            - 1GB+ RAM → clip (if clip/open_clip available)
            - <1GB → none
+
+    Every caller gets this process's one instance of the backend chosen
+    (_shared; owner ruling 2026-10-15), whether it names it -- Reel Studio's
+    moments step names REEL_VLM_DEFAULT -- or takes the auto pick, as
+    VisionService, the book reader (get_document_readers) and the media
+    index do.  The choice is still made on every call; only the instance is
+    kept.  Each call used to build a new instance, so each caller had its own
+    record of a start under way and two of them spawned two 0.8B servers on
+    one port (reviewer F1).  What one caller does to the instance, the others
+    see: a launch's cooldown, the idle unload (VisionService.check_idle) and
+    stop() (VisionService.stop, the eye button) reach every caller of it.
     """
     backend_name = name or os.environ.get('HEVOLVE_VISION_BACKEND', '')
 
     if backend_name:
-        cls = _BACKENDS.get(backend_name, NoneBackend)
-        return cls()
+        return _shared(backend_name)
 
     # Auto-detect — prefer Qwen3.5-0.8B for captioning (1s/frame, dedicated port)
     # This is separate from the 4B model used for computer use / action planning.
-    qwen08b = Qwen08BBackend()
+    qwen08b = _shared('qwen08b')
     if qwen08b.is_available():
         return qwen08b
 
     # Fallback: Qwen3-VL 4B (shares port with computer use agent)
-    qwen3vl = Qwen3VLVisionBackend()
+    qwen3vl = _shared('qwen3vl')
     if qwen3vl.is_available():
         return qwen3vl
 
@@ -1003,8 +1465,7 @@ def get_vision_backend(name: str = '') -> VisionBackend:
             }
             backend_key = _CATALOG_TO_BACKEND.get(entry.id)
             if backend_key:
-                cls = _BACKENDS.get(backend_key, NoneBackend)
-                candidate = cls()
+                candidate = _shared(backend_key)
                 if candidate.is_available():
                     return candidate
     except Exception:
@@ -1017,27 +1478,27 @@ def get_vision_backend(name: str = '') -> VisionBackend:
         if caps:
             hw = caps.hardware
             if hw.gpu_vram_gb >= 4:
-                return MiniCPMBackend()
+                return _shared('minicpm')
             if hw.ram_gb >= 2:
-                backend = MobileVLMBackend()
+                backend = _shared('mobilevlm')
                 if backend.is_available():
                     return backend
-                backend = CLIPBackend()
+                backend = _shared('clip')
                 if backend.is_available():
                     return backend
             if hw.ram_gb >= 1:
-                backend = CLIPBackend()
+                backend = _shared('clip')
                 if backend.is_available():
                     return backend
     except Exception:
         pass
 
     # Last resort: try minicpm (original behavior)
-    minicpm = MiniCPMBackend()
+    minicpm = _shared('minicpm')
     if minicpm.is_available():
         return minicpm
 
-    return NoneBackend()
+    return _shared('none')
 
 
 def get_document_readers() -> list:
@@ -1074,10 +1535,11 @@ def get_document_readers() -> list:
 
 
 def list_available_backends():
-    """Return list of (name, available, ram_mb) for all backends."""
+    """Return list of (name, available, ram_mb) for all backends: the
+    instances get_vision_backend hands its callers (_shared)."""
     results = []
-    for name, cls in _BACKENDS.items():
-        backend = cls()
+    for name in _BACKENDS:
+        backend = _shared(name)
         results.append({
             'name': name,
             'available': backend.is_available(),

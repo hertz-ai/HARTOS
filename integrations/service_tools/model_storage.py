@@ -1,24 +1,51 @@
 """
 Model Storage Manager — centralized model storage at ~/.hevolve/models/
 
-Tracks all downloaded models (git repos, HuggingFace weights) in a single
-manifest.json so the user can see where their disk space is going and
-the RuntimeToolManager can skip re-downloads.
+Tracks all downloaded models (git repos, HuggingFace weights, npm projects
+set up at runtime) in a single manifest.json so the user can see where their
+disk space is going and the RuntimeToolManager can skip re-downloads.
 
 Pattern from: integrations/vision/minicpm_installer.py
 """
 
+import hashlib
 import json
 import logging
 import os
 import shutil
 import subprocess
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
+
+from core.node_bin import find_node, find_npm
+from core.platform_paths import free_bytes
+from core.subprocess_safe import run_bounded
 
 logger = logging.getLogger(__name__)
+
+#: Bounds on the two steps of an npm project's setup (install_npm_project):
+#: ``npm install`` and the project's prepare script (which may download a
+#: browser).  A step past its bound is killed and the setup fails.
+NPM_INSTALL_TIMEOUT_S = 900.0
+NPM_PREPARE_TIMEOUT_S = 900.0
+#: Directories of an npm project that are never copied or fingerprinted.
+_NPM_SKIP_DIRS = frozenset({'node_modules', '__pycache__'})
+#: In a tool dir: the project files the last setup copied there (sorted
+#: '/'-separated relative paths), so the next setup removes the ones the
+#: project no longer has (_mirror_npm_project).
+NPM_COPIED_LIST = '.hart_project_files.json'
+#: One npm setup per tool directory at a time (two npm installs in one
+#: folder corrupt it); the second caller waits, then finds the receipt.
+_NPM_LOCKS: Dict[str, threading.Lock] = {}
+_NPM_LOCKS_GUARD = threading.Lock()
+
+
+class NpmSetupFailed(RuntimeError):
+    """An npm project could not be set up; the message says why in words a
+    person can be told (Node.js missing, npm install failed, timed out)."""
 
 DEFAULT_BASE_DIR = Path.home() / '.hevolve' / 'models'
 
@@ -340,6 +367,278 @@ class ModelStorageManager:
                 return tool_dir
             logger.error(f"HF download failed for {tool_name}: {e}")
             return None
+
+    # ── npm project (Node packages set up at runtime) ────────────
+    #
+    # Owner ruling A16 (2026-10-14): an optional capability is set up on
+    # demand at runtime, into this storage, never packaged into a build.  An
+    # npm project is HARTOS's own source (package.json naming exact versions,
+    # plus its scripts); the packages it names arrive here through npm, and
+    # its prepare script (run with Node afterwards) fetches anything else it
+    # needs, such as a headless browser, into the same folder.  The receipt
+    # (mark_downloaded) names the project's fingerprint, so a HARTOS update
+    # that changes the project sets it up again.
+
+    @staticmethod
+    def _npm_project_files(project_dir: str) -> List[str]:
+        """The project's files to copy, as sorted relative paths: everything
+        but Python files (the project folder is also a Python package, so
+        package-data ships it) and the _NPM_SKIP_DIRS."""
+        out = []
+        for root, dirs, files in os.walk(project_dir):
+            dirs[:] = sorted(d for d in dirs if d not in _NPM_SKIP_DIRS)
+            for name in files:
+                if name.endswith(('.py', '.pyc')):
+                    continue
+                out.append(os.path.relpath(os.path.join(root, name), project_dir))
+        return sorted(out)
+
+    def npm_project_fingerprint(self, project_dir: str) -> str:
+        """sha256 over the project's files (each relative path, then its bytes)."""
+        digest = hashlib.sha256()
+        for rel in self._npm_project_files(project_dir):
+            digest.update(rel.replace(os.sep, '/').encode('utf-8') + b'\0')
+            with open(os.path.join(project_dir, rel), 'rb') as fh:
+                digest.update(fh.read())
+            digest.update(b'\0')
+        return digest.hexdigest()
+
+    @staticmethod
+    def _npm_declares_dependencies(project_dir: str) -> bool:
+        """Does the project's package.json name any dependency?  npm makes no
+        node_modules for a project that names none.  An unreadable
+        package.json counts as naming some (its install then has to show
+        them)."""
+        try:
+            with open(os.path.join(project_dir, 'package.json'), encoding='utf-8') as fh:
+                doc = json.load(fh)
+        except (OSError, ValueError):
+            return True
+        if not isinstance(doc, dict):
+            return True
+        return any(doc.get(key) for key in ('dependencies', 'optionalDependencies'))
+
+    def npm_install_is_complete(self, tool_name: str, project_dir: str) -> bool:
+        """True when this exact project was set up here and its packages are
+        still on disk: the receipt names the project's current fingerprint
+        and ``node_modules`` exists (or the project names no dependency, for
+        which npm makes none).  A partly finished setup leaves no receipt
+        (mark_downloaded is its last step)."""
+        row = self._read_manifest().get("tools", {}).get(tool_name)
+        if not row or not os.path.isdir(project_dir):
+            return False
+        if row.get("source_url") != 'npm:' + self.npm_project_fingerprint(project_dir):
+            return False
+        return ((self.get_tool_dir(tool_name) / 'node_modules').is_dir()
+                or not self._npm_declares_dependencies(project_dir))
+
+    def _mirror_npm_project(self, project_dir: str, tool_dir: Path) -> None:
+        """Make the project's files in ``tool_dir`` the source's own.
+
+        Removes each file an earlier setup copied (NPM_COPIED_LIST) that the
+        project no longer has, and the folders that leaves empty; writes the
+        new list; then copies every project file.  A HARTOS update that
+        deletes or renames a file therefore leaves no stale copy behind
+        (peer validation of 38a220495).  Only listed files are touched:
+        node_modules, the browser a prepare script downloaded there, npm's
+        lock file and anything else not copied by a setup stay
+        (_remove_listed_files says how a listed path is checked).  The list
+        is written before the copy, so a copy that fails half way still
+        names every file it may have placed.  Raises OSError.
+        """
+        files = [rel.replace(os.sep, '/') for rel in self._npm_project_files(project_dir)]
+        listing = tool_dir / NPM_COPIED_LIST
+        try:
+            before = json.loads(listing.read_text(encoding='utf-8'))
+        except FileNotFoundError:
+            before = []
+        except (OSError, ValueError) as e:
+            logger.warning("%s is unreadable (%s); no earlier project file is removed",
+                           listing, e)
+            before = []
+        keep = set(files)
+        self._remove_listed_files(tool_dir, [rel for rel in (before if isinstance(before, list) else ())
+                                             if isinstance(rel, str) and rel not in keep])
+        tool_dir.mkdir(parents=True, exist_ok=True)
+        listing.write_text(json.dumps(files), encoding='utf-8')
+        for rel in files:
+            dest = tool_dir / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(os.path.join(project_dir, rel), dest)
+
+    @staticmethod
+    def _remove_listed_files(tool_dir: Path, entries: List[str]) -> None:
+        """Remove each file an earlier setup listed (NPM_COPIED_LIST) and the
+        folders that leaves empty.  Never raises.
+
+        The list is data on disk, not trusted (amendment A24a).  An entry is
+        removed only when it resolves -- os.path.realpath, so through links,
+        junctions and 8.3 short names; compared after os.path.normcase, so in
+        any letter case -- to a FILE strictly inside the tool dir, not inside
+        what npm or a prepare script own (_NPM_SKIP_DIRS, resolved the same
+        way) and not the list itself.  '.', '', a folder, an absolute path, a
+        path on another drive or through a link that leads out is skipped.
+        An entry that cannot be checked or removed (OSError, or ValueError
+        for a name such as one with a NUL) is logged and skipped, so one bad
+        entry never fails the setup -- nor every later one, since the list
+        is rewritten only after this runs.  Review of a47b8c883: the lexical,
+        case-sensitive guard before this removed node_modules/x/keep.js for
+        'Node_Modules/x/keep.js', a file outside the tool dir for an entry
+        through a junction, and raised PermissionError for '.'.
+        """
+        def resolved(path) -> str:
+            return os.path.realpath(str(path))
+
+        def inside(path: str, top: str) -> bool:
+            """``path`` is ``top`` or below it (both resolved)."""
+            path, top = os.path.normcase(path), os.path.normcase(top)
+            try:
+                return os.path.commonpath([path, top]) == top
+            except ValueError:          # another drive, or not comparable
+                return False
+
+        root = resolved(tool_dir)
+        fenced = [resolved(os.path.join(root, d)) for d in sorted(_NPM_SKIP_DIRS)]
+        listing = resolved(os.path.join(root, NPM_COPIED_LIST))
+        for rel in entries:
+            try:
+                path = resolved(os.path.join(root, rel))
+                if (not inside(path, root) or os.path.normcase(path) == os.path.normcase(root)
+                        or os.path.normcase(path) == os.path.normcase(listing)
+                        or any(inside(path, top) for top in fenced)
+                        or not os.path.isfile(path)):
+                    continue
+                os.remove(path)
+            except (OSError, ValueError) as e:
+                logger.warning("an earlier project file listed as %r in %s was left in place: %s",
+                               rel, tool_dir, e)
+                continue
+            parent = os.path.dirname(path)
+            while inside(parent, root) and os.path.normcase(parent) != os.path.normcase(root):
+                try:
+                    os.rmdir(parent)            # only when empty
+                except OSError:
+                    break
+                parent = os.path.dirname(parent)
+
+    @staticmethod
+    def _check_free_disk(tool_dir: Path, need: int) -> None:
+        """NpmSetupFailed unless ``need`` bytes are free where ``tool_dir``
+        goes (core.platform_paths.free_bytes: its nearest existing folder,
+        nothing created to measure it)."""
+        try:
+            free = free_bytes(tool_dir)
+        except OSError as e:
+            raise NpmSetupFailed('the free disk where it goes (%s) could not be read: %s'
+                                 % (tool_dir, e)) from e
+        if free < need:
+            raise NpmSetupFailed('setting it up needs about %.1f GB of free disk where it goes '
+                                 '(%s) and there is %.1f GB' % (need / 1e9, tool_dir, free / 1e9))
+
+    @staticmethod
+    def _npm_lock(tool_dir: Path) -> threading.Lock:
+        key = os.path.normcase(os.path.abspath(str(tool_dir)))
+        with _NPM_LOCKS_GUARD:
+            return _NPM_LOCKS.setdefault(key, threading.Lock())
+
+    @staticmethod
+    def _npm_step(cmd: List[str], what: str, cwd: Path, timeout_s: float) -> None:
+        """Run one setup step in ``cwd``, bounded; NpmSetupFailed unless it exits 0."""
+        env = dict(os.environ, npm_config_update_notifier='false', npm_config_fund='false',
+                   npm_config_audit='false')
+        try:
+            result = run_bounded(cmd, timeout=timeout_s, cwd=str(cwd), env=env,
+                                 encoding='utf-8', errors='replace')
+        except (OSError, ValueError) as e:
+            raise NpmSetupFailed(f'{what} could not be started: {e}') from e
+        if result.timed_out:
+            logger.warning("%s timed out after %d s in cwd=%s", what, int(timeout_s), cwd)
+            raise NpmSetupFailed(f'{what} timed out after {int(timeout_s)} s')
+        if result.returncode != 0:
+            # The log keeps the step's own words and where it ran (a failure
+            # such as EPERM under a read-only install folder diagnoses itself
+            # from them); the person is told a short tail.
+            logger.warning("%s returned %d in cwd=%s:\n%s", what, result.returncode, cwd,
+                           ((result.stdout or '') + (result.stderr or '')).strip()[-2000:]
+                           or '<no output>')
+            tail = ' '.join((result.stderr or result.stdout or '').split())[-400:]
+            raise NpmSetupFailed(f'{what} failed (exit {result.returncode}): {tail}')
+        logger.info("%s finished in %s: %s", what, cwd,
+                    ' '.join((result.stdout or '').split())[-300:])
+
+    def install_npm_project(self, tool_name: str, project_dir: str, *,
+                            prepare: Optional[str] = None,
+                            timeout_s: float = NPM_INSTALL_TIMEOUT_S,
+                            min_free_bytes: int = 0) -> Path:
+        """Set the npm project at ``project_dir`` up in this tool's directory.
+
+        THE npm installer: RuntimeToolManager's npm rows and the WhatsApp
+        gateway (integrations/social/whatsapp_supervisor.ensure_baileys_deps,
+        with its own storage root) both set up through it.
+
+        Mirrors the project's files there (_mirror_npm_project: copied, and
+        files an earlier setup copied that the project no longer has
+        removed), runs ``npm install --prefer-offline`` there (bounded by
+        ``timeout_s``), then ``node <prepare>`` when the project names a
+        prepare script, and records the receipt.  Idempotent: a complete setup of
+        this exact project returns at once; one setup per tool directory
+        runs at a time.  ``min_free_bytes``: the free disk the setup needs
+        where the tool dir goes (core.platform_paths.free_bytes), checked
+        before anything is copied (A13/A14: a download checks the disk
+        first).  Returns the tool directory; raises NpmSetupFailed
+        (not enough free disk, or it cannot be read; no package.json in the
+        project; Node.js or npm missing; a step failed or ran past its
+        bound; npm made no node_modules for a project that names
+        dependencies; the copy failed; any other OSError, such as a
+        project file that cannot be read or a receipt that cannot be
+        written), leaving no receipt.  NpmSetupFailed is the only error it
+        raises for a setup that did not finish (amendment A24b ii).
+        """
+        tool_dir = self.get_tool_dir(tool_name)
+        with self._npm_lock(tool_dir):
+            try:
+                return self._install_npm_project_locked(tool_name, project_dir, tool_dir,
+                                                        prepare, timeout_s, min_free_bytes)
+            except OSError as e:
+                raise NpmSetupFailed(f'the setup in {tool_dir} could not finish: {e}') from e
+
+    def _install_npm_project_locked(self, tool_name: str, project_dir: str, tool_dir: Path,
+                                    prepare: Optional[str], timeout_s: float,
+                                    min_free_bytes: int) -> Path:
+        """install_npm_project's steps, under its per-folder lock."""
+        if self.npm_install_is_complete(tool_name, project_dir):
+            return tool_dir
+        if not os.path.isfile(os.path.join(project_dir, 'package.json')):
+            # npm install in a folder with no package.json walks up to the
+            # nearest ancestor that has one and installs there.
+            raise NpmSetupFailed('the project at %s has no package.json' % project_dir)
+        if min_free_bytes > 0:
+            self._check_free_disk(tool_dir, min_free_bytes)
+        node, npm = find_node(), find_npm()
+        if not node or not npm:
+            raise NpmSetupFailed(
+                'Node.js is not installed on this computer (%s not found)'
+                % ' and '.join(n for n, p in (('node', node), ('npm', npm)) if not p))
+        fingerprint = self.npm_project_fingerprint(project_dir)
+        try:
+            self._mirror_npm_project(project_dir, tool_dir)
+        except OSError as e:
+            raise NpmSetupFailed(f'the project could not be copied into {tool_dir}: {e}') from e
+        # npm on Windows is a .cmd shim; launch_argv is how a shim is run.
+        from integrations.coding_agent.installer import launch_argv
+        # --prefer-offline: what npm's cache already holds is not fetched
+        # again (a re-setup after an update changes little).
+        self._npm_step(launch_argv([npm, 'install', '--no-audit', '--no-fund',
+                                    '--loglevel=error', '--prefer-offline']),
+                       'npm install', tool_dir, timeout_s)
+        if not (tool_dir / 'node_modules').is_dir() \
+                and self._npm_declares_dependencies(project_dir):
+            raise NpmSetupFailed('npm install finished but made no node_modules in %s'
+                                 % tool_dir)
+        if prepare:
+            self._npm_step([node, prepare], prepare, tool_dir, NPM_PREPARE_TIMEOUT_S)
+        self.mark_downloaded(tool_name, 'npm:' + fingerprint, self.get_tool_size(tool_name))
+        return tool_dir
 
     # ── Cleanup ──────────────────────────────────────────────────
 

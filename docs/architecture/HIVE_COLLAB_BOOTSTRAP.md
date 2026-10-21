@@ -207,10 +207,29 @@ transports.
   reputation-ranked specialization (5%-cap-guarded) are the next
   increments. Verified by `tests/unit/test_recipe_capability_mesh.py`.
 
+**PeerLink links (code-verified 2026-10-13; whether a given fleet holds any
+right now is a live measurement, not a code fact):**
+- Both directions. After three successful gossip exchanges a node dials its
+  peer (`link_manager.record_http_exchange` -> `_try_auto_upgrade`), and every
+  Hypercorn entry point answers: `hart_intelligence_entry._serve_app`,
+  `asgi.py` and Nunba's `app.py`/`main.py` all wrap their app in
+  `core/serve.py::build_asgi_app`, which mounts
+  `core/peer_link/server.py::peer_link_asgi` on `/peer_link` and hands each
+  HELLO to `link_manager.accept_inbound` (`HEVOLVE_PEER_LINK_SERVER=0` closes
+  it; the Waitress fallback has no listener). Off the LAN both ends dial out
+  to central's router and meet there (`core/peer_link/relay.py`; every frame
+  after the HELLO pair is end-to-end encrypted).
+- A person's phone links as a DEVICE, admitted by the owner's `device_access`
+  grant, and may send only on the channels `core/peer_link/channels.py` opens
+  to devices: `dispatch` (`api_request`, its API calls), `tunnel` (calls) and
+  `file` (0x0C: its clips in and its reels out, `core/peer_link/file_channel.py`
+  over `core/user_file_store.py`).
+
 **Does NOT work today (do not assume it):**
-- PeerLink is DIAL-ONLY: no `/peer_link` listener and no
-  `/api/peer-link/message` route exists anywhere, so the encrypted-link layer
-  never connects (budgets 10/50/200 are therefore moot).
+- PeerLink's HTTP fallback: no route serves `/api/peer-link/message`, so
+  `link_manager._http_fallback` never delivers. That is deliberate (see its
+  docstring): a plain POST into the channel handlers would be an
+  unauthenticated door beside the signed handshake.
 - Cross-node WAMP: the router lives in Nunba (`nunba.enable=false` shipped).
 - Cross-node goal execution: NOT safe with a shared `REDIS_HOST` either.
   `coordinator_backends._try_redis_backend` could not build at all from
@@ -243,9 +262,11 @@ transports.
    `GET /a2a/<agent_id>/recipe` + `peer_reuse.pull_recipe`, banking into
    `prompts/{prompt_id}_{flow_id}_recipe.json` where the loader already
    looks (`agent_baseline_service.py`).
-5. Add the inbound PeerLink listener on `:6777` feeding the existing
-   `ChannelDispatcher` (`core/peer_link/channels.py`) per the fallback
-   contract in `link_manager.py`.
+5. SHIPPED: the inbound PeerLink listener (`/peer_link` on the served port;
+   see "PeerLink links" above), whose links reach the handlers bound with
+   `link_manager.register_channel_handler`. Still open: the HTTP fallback
+   contract in `link_manager.py` has no authenticated route (see "Does NOT
+   work today").
 The feed buffer is PER-NODE (50-batch, no timer): 20 nodes fill 20 separate
 buffers into 20 HevolveAI instances — fleet size does not shorten
 time-to-first-fed-outcome until the hooks above land.

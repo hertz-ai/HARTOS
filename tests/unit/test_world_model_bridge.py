@@ -406,6 +406,21 @@ class TestSubmitCorrection(unittest.TestCase):
         self.assertEqual(self.bridge._stats['total_corrections'], 1)
 
     @patch('integrations.agent_engine.world_model_bridge.pooled_post')
+    def test_a_nan_confidence_is_sent_as_no_confidence(self, mock_post):
+        """The HTTP body's confidence for nan is 0.0, not 1.0: the inline
+        clamp max(0, min(1, nan)) answered 1.0 (min(1.0, nan) is 1.0).  The
+        in-process case is in test_confidence_clamped, which skips where
+        hevolveai is not installed; this one runs everywhere."""
+        self.bridge._http_disabled = False
+        self.bridge._api_url = 'http://localhost:9999'
+        mock_post.return_value = MagicMock(
+            status_code=200, json=lambda: {'success': True, 'learned': False})
+        self.bridge.submit_correction('orig', 'fixed', confidence=float('nan'))
+        self.assertEqual(mock_post.call_args.kwargs['json']['confidence'], 0.0)
+        self.bridge.submit_correction('orig', 'fixed', confidence=3.5)
+        self.assertEqual(mock_post.call_args.kwargs['json']['confidence'], 1.0)
+
+    @patch('integrations.agent_engine.world_model_bridge.pooled_post')
     def test_http_correction_non_200(self, mock_post):
         """ERR: Non-200 response returns failure with status code."""
         self.bridge._http_disabled = False
@@ -428,6 +443,11 @@ class TestSubmitCorrection(unittest.TestCase):
             self.bridge.submit_correction('o', 'c', confidence=5.0)
             args = mock_send.call_args
             self.assertLessEqual(args[1]['confidence'], 1.0)
+            # A nan is no confidence, not full confidence: max(0, min(1, nan))
+            # answered 1.0 (the one clamp now serves this and the hive reply).
+            mock_send.reset_mock()
+            self.bridge.submit_correction('o', 'c', confidence=float('nan'))
+            self.assertEqual(mock_send.call_args[1]['confidence'], 0.0)
 
     def test_consent_gate_blocks_external_correction(self):
         """SEC: External HTTP correction blocked without cloud consent."""
@@ -512,13 +532,14 @@ class TestQueryHivemind(unittest.TestCase):
         self.bridge._http_disabled = False
         self.bridge._api_url = 'http://localhost:9999'
         mock_resp = MagicMock(status_code=200)
-        mock_resp.json.return_value = {'thought': 'collective answer'}
+        mock_resp.json.return_value = {'answer': 'collective answer', 'confidence': 0.7}
         mock_post.return_value = mock_resp
 
         with patch.object(self.bridge, '_check_cct_access', return_value=True), \
              patch('core.peer_link.link_manager.get_link_manager', side_effect=ImportError):
             result = self.bridge.query_hivemind('test query')
-        self.assertIsNotNone(result)
+        self.assertEqual(result, {'thought': 'collective answer', 'source': 'http',
+                                  'peer_count': 0, 'confidence': 0.7})
         self.assertEqual(self.bridge._stats['total_hivemind_queries'], 1)
 
     def test_consent_gate_blocks_external_query(self):
@@ -999,6 +1020,32 @@ class TestSubmitOutputFeedback(unittest.TestCase):
         self.assertFalse(accepted)
         mock_rec.assert_not_called()
 
+    def test_the_hive_hint_is_the_words_of_the_hives_reply(self):
+        """The hint attached to the correction is the reply's words
+        (query_hivemind's one shape, 'thought'); a reply with nothing to say
+        and no reply at all attach none."""
+        core = {'thought': 'Lower the batch size.', 'source': 'http',
+                'peer_count': 0, 'confidence': 0.9}
+        peers = {'thought': 'Use fp16.\nFree the VRAM first.', 'source': 'peerlink',
+                 'peer_count': 3, 'confidence': 0.0}
+        silent = {'thought': '', 'source': 'peerlink', 'peer_count': 1, 'confidence': 0.0}
+        for hive_result, hint in (
+                (core, 'hive_hint: Lower the batch size.'),
+                (peers, 'hive_hint: Use fp16.\nFree the VRAM first.'),
+                (silent, None),
+                (None, None)):
+            bridge = _make_bridge()
+            with patch.object(bridge, 'query_hivemind', return_value=hive_result), \
+                 patch.object(bridge, 'submit_correction') as corr:
+                bridge.submit_output_feedback(
+                    output_modality='image', status='error',
+                    context='generate cat', error_message='OOM')
+            kwargs = corr.call_args.kwargs
+            self.assertEqual(kwargs['explanation'], hint, hive_result)
+            self.assertEqual(kwargs['context']['hive_hint_used'], hint is not None)
+            self.assertEqual(bridge._stats.get('hive_hints_on_output_error', 0),
+                             1 if hint else 0, hive_result)
+
 
 class TestPeerLinkLearningBoundary(unittest.TestCase):
     """Peer fanout is observed now; final verified work learns later."""
@@ -1023,6 +1070,7 @@ class TestPeerLinkLearningBoundary(unittest.TestCase):
 
         self.assertEqual(result['source'], 'peerlink')
         self.assertEqual(result['peer_count'], 3)
+        self.assertEqual(result['thought'], 'candidate one\ncandidate two')
         manager.collect.assert_called_once_with(
             'hivemind', timeout_ms=1000,
             payload={
@@ -1033,6 +1081,106 @@ class TestPeerLinkLearningBoundary(unittest.TestCase):
         record.assert_not_called()
         self.assertEqual(bridge._stats['peerlink_responses_observed'], 2)
         self.assertNotIn('peerlink_responses_trained', bridge._stats)
+
+    def test_every_leg_answers_the_one_shape(self):
+        """query_hivemind returns one shape whichever leg answered, and a
+        peer "said something" by the same rule billing reads: non-blank
+        words.  A blank, a list, the handler's empty reply and a key no peer
+        writes ('answer' is the HTTP core's) are silence; the peer count is
+        the replies, the observed count the ones with words."""
+        from core.peer_link.hivemind_handler import _EMPTY_REPLY
+        peers = [{'thought': ' '}, {'thought': ['a', 'list']},
+                 {'answer': 'the core key, not a peer key'}, dict(_EMPTY_REPLY),
+                 {'response': 'a real reply'}]
+        bridge = _make_bridge()
+        manager = MagicMock()
+        manager.collect.return_value = list(peers)
+        with patch('core.peer_link.link_manager.get_link_manager',
+                   return_value=manager), \
+             patch.object(bridge, '_check_cct_access', return_value=True):
+            result = bridge.query_hivemind('what is the hive?')
+        self.assertEqual(result, {'thought': 'a real reply', 'source': 'peerlink',
+                                  'peer_count': 5, 'confidence': 0.0})
+        self.assertEqual(bridge._stats['peerlink_responses_observed'], 1)
+        # The HTTP core: words under 'answer', None when it had none.
+        core = {'status': 'ok', 'answer': 'The hive is a network of agents.',
+                'reasoning_chain': [], 'contributing_agents': ['inst-1'],
+                'weights': {'inst-1': 1.0}, 'confidence': 0.9, 'topology': {}}
+        for body, thought in ((core, 'The hive is a network of agents.'),
+                              (dict(core, answer=None), '')):
+            bridge = _make_bridge()
+            bridge._http_disabled = False
+            bridge._api_url = 'http://localhost:9999'
+            with patch.object(bridge, '_check_cct_access', return_value=True), \
+                 patch('core.peer_link.link_manager.get_link_manager',
+                       side_effect=ImportError), \
+                 patch('integrations.agent_engine.world_model_bridge.pooled_post',
+                       return_value=MagicMock(status_code=200, json=lambda: dict(body))):
+                result = bridge.query_hivemind('what is the hive?')
+            self.assertEqual(result, {'thought': thought, 'source': 'http',
+                                      'peer_count': 0, 'confidence': 0.9}, body)
+
+    def test_the_in_process_leg_answers_the_one_shape(self):
+        """The core's CollectiveThought: its text and its confidence, '' and
+        0.0 when it carries neither.  The repr used to be billed as a thought
+        (task #135) and the confidence used to be dropped on this leg alone
+        (the review of 474f77a72).  torch is stood in for by a MagicMock so
+        the leg's query encoding runs no tensor op: the test drives the leg's
+        reading of the core's reply, not the encoder.  (This venv does have
+        torch, 2.3.0+cpu; d954f18ab's docstring said it had none.)"""
+        from types import SimpleNamespace
+        from tests.unit.module_swap import swap_modules
+        cases = [
+            (SimpleNamespace(text='Lower the batch size.', confidence=0.8),
+             {'thought': 'Lower the batch size.', 'source': 'in_process',
+              'peer_count': 0, 'confidence': 0.8}),
+            (SimpleNamespace(confidence=0.4),
+             {'thought': '', 'source': 'in_process', 'peer_count': 0, 'confidence': 0.4}),
+            (object(),
+             {'thought': '', 'source': 'in_process', 'peer_count': 0, 'confidence': 0.0}),
+        ]
+        for thought, expected in cases:
+            bridge = _make_bridge()
+            bridge._in_process = True
+            bridge._hive_mind = MagicMock()
+            bridge._hive_mind.think_together_distributed.return_value = thought
+            with swap_modules({'torch': MagicMock()}), \
+                 patch.object(bridge, '_check_cct_access', return_value=True):
+                result = bridge.query_hivemind('what is the hive?')
+            self.assertEqual(result, expected, thought)
+            self.assertEqual(bridge._stats['total_hivemind_queries'], 1)
+            kwargs = bridge._hive_mind.think_together_distributed.call_args.kwargs
+            self.assertEqual(kwargs['timeout_ms'], 1000)
+            self.assertNotIn('owner_id', kwargs)      # no user_id was given
+
+    def test_the_one_shape_keeps_confidence_in_the_unit_interval(self):
+        """A leg's confidence is a float in [0, 1]: a non-finite value (the
+        core's fuse_thoughts guards NaN, its other constructors were not
+        checked; the review of d954f18ab) or a string that is no number is
+        0.0, an out-of-range number is clamped.  _hive_reply passed nan, inf
+        and 7.0 through, and the robotics fusion averages the number into a
+        plan's confidence."""
+        from integrations.agent_engine.world_model_bridge import _hive_reply
+        for given, kept in ((float('nan'), 0.0), (float('inf'), 0.0),
+                            (float('-inf'), 0.0), (-0.2, 0.0), (7.0, 1.0),
+                            ('0.7', 0.7), ('seven', 0.0), (None, 0.0),
+                            (0.42, 0.42), (1, 1.0)):
+            reply = _hive_reply('words', 'http', confidence=given)
+            self.assertEqual(reply['confidence'], kept, given)
+            self.assertIsInstance(reply['confidence'], float, given)
+        # And through a leg: the HTTP core's body (json accepts Infinity).
+        bridge = _make_bridge()
+        bridge._http_disabled = False
+        bridge._api_url = 'http://localhost:9999'
+        body = {'status': 'ok', 'answer': 'w', 'confidence': float('inf')}
+        with patch.object(bridge, '_check_cct_access', return_value=True), \
+             patch('core.peer_link.link_manager.get_link_manager',
+                   side_effect=ImportError), \
+             patch('integrations.agent_engine.world_model_bridge.pooled_post',
+                   return_value=MagicMock(status_code=200, json=lambda: dict(body))):
+            result = bridge.query_hivemind('what is the hive?')
+        self.assertEqual(result, {'thought': 'w', 'source': 'http',
+                                  'peer_count': 0, 'confidence': 0.0})
 
 
 class TestGetLearningFeedback(unittest.TestCase):

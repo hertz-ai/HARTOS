@@ -8,7 +8,7 @@ import os
 import unittest
 from unittest.mock import patch
 
-from core.config_cache import env_flag, env_int
+from core.config_cache import env_flag, env_int, flag_value
 
 
 class EnvFlagSemantics(unittest.TestCase):
@@ -76,6 +76,47 @@ class EnvIntSemantics(unittest.TestCase):
         env['X_TEST_INT'] = '1'
         with patch.dict(os.environ, env, clear=True):
             self.assertEqual(env_int('X_TEST_INT', 4, minimum=1), 1)
+
+
+class FlagValueSemantics(unittest.TestCase):
+    """flag_value is the ONE reading behind env_flag and a request body's
+    boolean field (/chat's agent_tools, task #120)."""
+
+    def test_a_bool_is_itself(self):
+        self.assertTrue(flag_value(True, False))
+        self.assertFalse(flag_value(False, True))
+
+    def test_a_number_is_its_truth(self):
+        self.assertFalse(flag_value(0, True))
+        self.assertTrue(flag_value(1, False))
+        self.assertTrue(flag_value(2, False))
+
+    def test_strings_are_read_stripped_and_case_folded(self):
+        for v in ('1', 'true', 'YES', 'On ', ' TRUE'):
+            self.assertTrue(flag_value(v, False), v)
+        for v in ('0', 'false', 'No', ' off', 'FALSE', 'False'):
+            self.assertFalse(flag_value(v, True), v)
+
+    def test_none_empty_and_junk_keep_the_default(self):
+        for v in (None, '', '  ', 'nah', 'enable', 'tru', [], {}):
+            self.assertTrue(flag_value(v, True), repr(v))
+            self.assertFalse(flag_value(v, False), repr(v))
+
+    def test_env_flag_is_flag_value_on_the_env_string(self):
+        """env_flag delegates to flag_value: for every spelling the table
+        knows, and junk, both answer the same.  The table's own semantics
+        are pinned by EnvFlagSemantics above (the old env_flag body is gone,
+        so this compares the two readers that exist, not old against new;
+        the review of df2474851 measured the old env_flag against the new
+        over 66 cases and found 0 differences)."""
+        for v in ('1', 'true', 'YES', 'On ', '0', 'false', 'No', ' off',
+                  'nah', 'enable', '2', 'tru', ''):
+            for default in (True, False):
+                env = {k: val for k, val in os.environ.items() if k != 'X_TEST_FLAG'}
+                env['X_TEST_FLAG'] = v
+                with patch.dict(os.environ, env, clear=True):
+                    self.assertEqual(env_flag('X_TEST_FLAG', default),
+                                     flag_value(v, default), (v, default))
 
 
 if __name__ == '__main__':

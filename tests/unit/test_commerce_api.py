@@ -45,6 +45,10 @@ class TestSession:
         claims = decode_jwt(body['token'])
         assert claims['user_id'] == 'mcg-4242'
         assert claims['tid'] == 'mcgroce'
+        # The tenant claim is this session's revenue proof; the node's
+        # per-turn 'lane'/'rid' claims (the metered relay's) are never
+        # minted here (task #157).
+        assert 'lane' not in claims and 'rid' not in claims
         assert body['expiresIn'] > 0
         row = ctx['bindings'].get('mcg-4242')
         assert row['customer_id'] == '4242' and row['store_id'] == '7'

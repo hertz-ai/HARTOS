@@ -194,19 +194,18 @@ def _is_private_address(host: str) -> bool:
 def _apply_host_validation(app: Flask):
     """Prevent Host header injection."""
 
-    allowed_hosts = set(
-        h.strip() for h in
-        os.environ.get('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
-        if h.strip()
-    )
+    # The ONE parse of ALLOWED_HOSTS (core.public_url.allowed_hosts): the
+    # payment gateways' trusted-root rule reads the same entries.
+    from core.public_url import allowed_hosts as _allowed_hosts_setting
+    configured_hosts = set(_allowed_hosts_setting())
     # '*' is the Django-style wildcard: the operator opted into allow-all. The
     # deploy default is exactly this (deploy-hartos-deepbox.yml sets
     # ALLOWED_HOSTS=`secrets.ALLOWED_HOSTS || '*'`), and it is load-bearing:
     # /api/ota/latest is a PUBLIC pointer fleet nodes poll with
     # Host: <central-host>. Without wildcard support a '*' config is treated as a
     # literal host, so every real Host is rejected 400 and OTA delivery silently
-    # breaks fleet-wide. Precompute once — allowed_hosts is fixed at app init.
-    allow_all_hosts = '*' in allowed_hosts
+    # breaks fleet-wide. Precompute once — the configured set is fixed at app init.
+    allow_all_hosts = '*' in configured_hosts
 
     # The node's own name. gethostname() is a local syscall — no DNS, no
     # network — so this is safe to compute at init on an offline box, unlike
@@ -229,7 +228,7 @@ def _apply_host_validation(app: Flask):
             return
 
         host = request.host.split(':')[0]
-        if host in allowed_hosts:
+        if host in configured_hosts:
             return
         if _own_hostname and host.lower() == _own_hostname:
             return

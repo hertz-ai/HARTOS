@@ -22,6 +22,7 @@ GUARDRAILS applied at every layer:
 import atexit
 import json
 import logging
+import math
 import os
 import sys
 import time
@@ -1229,7 +1230,17 @@ class WorldModelBridge:
         except ImportError:
             logger.warning("[WorldModelBridge] ConstitutionalFilter unavailable; correction NOT constitution-checked")
 
-        # PRIVACY: Redact secrets from corrections before shared learning
+        # The context goes to HevolveAI only as a dict (its receiver keeps
+        # only a dict); anything else is dropped here so it cannot cost the
+        # correction (review of 54f203c38, MINOR-2).
+        context = dict(context) if isinstance(context, dict) else None
+
+        # PRIVACY: Redact secrets from corrections before shared learning,
+        # the context included, by the ONE rule the replay path also asks
+        # (edge_privacy.redact_secret_leaves: every content leaf through the
+        # secret patterns, identifiers exempt, a value under a secret-named key
+        # withheld when no pattern knows it). A context the walk cannot finish
+        # (a cycle) is dropped, and said, never the correction.
         try:
             from security.secret_redactor import redact_secrets
             original_response, _ = redact_secrets(original_response)
@@ -1238,19 +1249,41 @@ class WorldModelBridge:
                 explanation, _ = redact_secrets(explanation)
         except ImportError:
             logger.warning("[WorldModelBridge] secret_redactor unavailable; correction NOT redacted")
+        if context:
+            try:
+                from security.edge_privacy import redact_secret_leaves
+                context, _ = redact_secret_leaves(context)
+            except Exception as e:
+                logger.warning("[WorldModelBridge] correction context dropped: "
+                               "it could not be redacted (%s); the correction "
+                               "is sent without it", type(e).__name__)
+                context = None
 
         # In-process direct call
         if self._in_process and self._provider:
             try:
                 from hevolveai.embodied_ai.rl_ef import send_expert_correction
+                # hevolveai C323: the context rides as the correction's
+                # provenance; HevolveAI keeps its memory_id on the stored fact
+                # (the fact's source is expert_id, as before). This call used
+                # to drop it; the HTTP path always sent it. A build before C323
+                # has no such parameter: it gets the correction without it, and
+                # the drop is said once (_note_provenance_dropped).
+                _prov = {}
+                if context:
+                    if _accepts_kwarg(send_expert_correction, 'provenance'):
+                        _prov = {'provenance': dict(context)}
+                    else:
+                        _note_provenance_dropped()
                 result = send_expert_correction(
                     domain='general',
                     original_response=original_response[:5000],
                     corrected_response=corrected_response[:5000],
                     expert_id=expert_id,
-                    confidence=max(0.0, min(1.0, confidence)),
+                    confidence=_unit_confidence(confidence),
                     explanation=explanation[:2000] if explanation else None,
                     valid_until=valid_until,
+                    **_prov,
                 )
                 if not isinstance(result, dict):
                     result = {'success': False,
@@ -1273,7 +1306,7 @@ class WorldModelBridge:
             'original_response': original_response[:5000],
             'corrected_response': corrected_response[:5000],
             'expert_id': expert_id,
-            'confidence': max(0.0, min(1.0, confidence)),
+            'confidence': _unit_confidence(confidence),
         }
         if explanation:
             body['explanation'] = explanation[:2000]
@@ -1296,6 +1329,11 @@ class WorldModelBridge:
                 body = resp.json()
                 if not isinstance(body, dict):
                     return {'success': False, 'reason': 'unreadable reply'}
+                # A C323 server says on every 200 reply whether it read the
+                # context (context_received); a reply without the field, while
+                # a context was sent, is a server that ignored it.
+                if context and 'context_received' not in body:
+                    _note_provenance_dropped()
                 self._count_if_learned(body)
                 return body
             return {'success': False, 'reason': f'HTTP {resp.status_code}'}
@@ -1491,14 +1529,23 @@ class WorldModelBridge:
         """Query HevolveAI's HiveMind for distributed collective thinking.
 
         In-process: calls hive_mind.think_together_distributed() directly.
+        PeerLink: collects the connected peers' replies.
         HTTP: POST /v1/hivemind/think.
+
+        Every leg answers the ONE shape, ``_hive_reply``: ``{'thought':
+        <words or ''>, 'source': 'in_process' | 'peerlink' | 'http' |
+        'cached', 'peer_count', 'confidence'}``; None when no leg answered.
+        The core's contributing agents, weights, topology and timings stay
+        in the core (task #136: a metered caller used to be handed them).
 
         HevolveAI:
         1. Encodes query via frozen Qwen alignment layer (2048-D)
         2. Publishes local thought to WAMP
         3. Waits for remote agent responses (timeout_ms)
         4. Fuses with attention-weighted method
-        5. Returns collective thought with contributing agents + weights
+        5. Returns the collective thought: its confidence here, and its
+           text when the thought carries one (the core's CollectiveThought
+           carries none, task #135, so this leg's 'thought' is '')
 
         Use this for real-time multi-modal reasoning (tensor-level fusion).
         For coarse-grained task delegation, use agent-level dispatch instead.
@@ -1516,7 +1563,7 @@ class WorldModelBridge:
             logger.debug("HiveMind query: no CCT with hivemind_query capability")
             cached = self._federation_aggregated.get('last_thought')
             if cached:
-                return {'thought': cached, 'source': 'cached', 'cct_gated': True}
+                return _hive_reply(cached, 'cached', cct_gated=True)
             return None
 
         try:
@@ -1583,10 +1630,13 @@ class WorldModelBridge:
                 )
                 with self._lock:
                     self._stats['total_hivemind_queries'] += 1
-                return {
-                    'thought': result.text if hasattr(result, 'text')
-                    else str(result)
-                }
+                # The one shape (_hive_reply): the core's words, or '' when
+                # its CollectiveThought carries no text (its repr used to be
+                # returned and billed as a thought, task #135), and its
+                # confidence, 0.0 when it carries none (this leg alone used
+                # to drop it; the review of 474f77a72).
+                return _hive_reply(getattr(result, 'text', None), 'in_process',
+                                   confidence=getattr(result, 'confidence', None))
             except Exception as e:
                 logger.debug(f"In-process hivemind failed: {e}")
 
@@ -1618,21 +1668,12 @@ class WorldModelBridge:
                 # raw thought here duplicated the query into chat history,
                 # ingested it as a user sensor once per peer, and (after the
                 # verification gate was added) still claimed it was trained.
-                observed = sum(
-                    1 for peer_resp in responses
-                    if isinstance(peer_resp, dict) and (
-                        peer_resp.get('thought')
-                        or peer_resp.get('response')
-                        or peer_resp.get('text'))
-                )
+                said = [w for w in (_peer_words(r) for r in responses) if w]
                 with self._lock:
                     self._stats.setdefault('peerlink_responses_observed', 0)
-                    self._stats['peerlink_responses_observed'] += observed
-                return {
-                    'thoughts': responses,
-                    'source': 'peerlink',
-                    'peer_count': len(responses),
-                }
+                    self._stats['peerlink_responses_observed'] += len(said)
+                return _hive_reply('\n'.join(said), HIVE_SOURCE_PEERLINK,
+                                   peer_count=len(responses))
         except Exception:
             logger.debug("[WorldModelBridge] peerlink thought query failed; falling through", exc_info=True)
 
@@ -1657,7 +1698,13 @@ class WorldModelBridge:
             if resp.status_code == 200:
                 with self._lock:
                     self._stats['total_hivemind_queries'] += 1
-                return resp.json()
+                body = resp.json()
+                body = body if isinstance(body, dict) else {}
+                # HevolveAI's api_server keeps the words under 'answer' (text
+                # or None) beside its reasoning chain, agents, weights and
+                # timings; only the words and the confidence leave here.
+                return _hive_reply(body.get('answer'), 'http',
+                                   confidence=body.get('confidence'))
         except requests.RequestException as e:
             self._cb_record_failure()
             logger.debug(f"HiveMind query failed: {e}")
@@ -2615,20 +2662,14 @@ class WorldModelBridge:
                 hive_result = self.query_hivemind(
                     query_text, user_id=user_id, timeout_ms=200
                 )
-                if hive_result:
-                    if isinstance(hive_result, dict):
-                        hive_hint = (
-                            hive_result.get('thought')
-                            or hive_result.get('thoughts')
-                            or hive_result.get('source')
-                        )
-                    else:
-                        hive_hint = str(hive_result)[:400]
-                    if hive_hint:
-                        with self._lock:
-                            self._stats.setdefault(
-                                'hive_hints_on_output_error', 0)
-                            self._stats['hive_hints_on_output_error'] += 1
+                # What the hive said: query_hivemind's one shape carries the
+                # words under 'thought' ('' when nothing was said).
+                hive_hint = (hive_result or {}).get('thought') or ''
+                if hive_hint:
+                    with self._lock:
+                        self._stats.setdefault(
+                            'hive_hints_on_output_error', 0)
+                        self._stats['hive_hints_on_output_error'] += 1
             except Exception as hive_err:
                 logger.debug(
                     f"[Bridge] hive hint query failed for output error: {hive_err}"
@@ -2637,7 +2678,7 @@ class WorldModelBridge:
 
             explanation = None
             if hive_hint:
-                explanation = f'hive_hint: {str(hive_hint)[:400]}'
+                explanation = f'hive_hint: {hive_hint[:400]}'
 
             self.submit_correction(
                 original_response=f'[{output_modality}] {context[:500]}',
@@ -2729,6 +2770,94 @@ class WorldModelBridge:
 
 
 # ─── Module-level singleton ───
+#: A PeerLink peer's reply keeps its words under 'thought'
+#: (core.peer_link.hivemind_handler); 'response' and 'text' are older
+#: spellings still accepted.
+_PEER_WORD_KEYS = ('thought', 'response', 'text')
+
+#: The 'source' of a reply made of this node's peers' words.  The peer
+#: reply handler (core.peer_link.hivemind_handler) reads it to relay this
+#: node's own words only, never its peers' a second hop.
+HIVE_SOURCE_PEERLINK = 'peerlink'
+
+
+def _peer_words(peer_resp) -> str:
+    """One peer reply's words: the first non-blank string under
+    _PEER_WORD_KEYS, else '' (a connected peer with no core answers the
+    handler's empty reply, which collect() keeps as a non-empty dict)."""
+    if not isinstance(peer_resp, dict):
+        return ''
+    for key in _PEER_WORD_KEYS:
+        value = peer_resp.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return ''
+
+
+_PROVENANCE_DROP_SAID = False
+
+
+def _note_provenance_dropped() -> None:
+    """Say once per process that HevolveAI is not taking the correction's
+    context: an in-process build without the parameter (or whose signature
+    cannot be read), or a server before C323 that ignores the field."""
+    global _PROVENANCE_DROP_SAID
+    if not _PROVENANCE_DROP_SAID:
+        _PROVENANCE_DROP_SAID = True
+        logger.info("[WorldModelBridge] HevolveAI is not taking correction "
+                    "provenance (a build before C323, or one whose signature "
+                    "cannot be read): corrections reach it without their context")
+
+
+def _accepts_kwarg(fn, name: str) -> bool:
+    """True when ``fn`` takes a parameter called ``name`` (or **kwargs).
+    HevolveAI's compiled build keeps signatures (Cython binding=True); a
+    callable whose signature cannot be read is treated as not taking it, so
+    an unknown build gets the call it always got."""
+    import inspect
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def _unit_confidence(value) -> float:
+    """``value`` as a confidence in [0.0, 1.0]: a number out of range is
+    clamped; None, a non-finite number (nan, inf) or a string that is no
+    number is 0.0, no confidence.  The ONE clamp: ``max(0, min(1, x))`` at
+    the two correction sites answered 1.0 for nan (min(1.0, nan) is 1.0), and
+    the hive reply passed nan, inf and 7.0 through to readers that average
+    it (the review of d954f18ab)."""
+    try:
+        conf = float(value) if value is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(conf):
+        return 0.0
+    return max(0.0, min(1.0, conf))
+
+
+def _hive_reply(words, source, peer_count=0, confidence=None, **extra) -> dict:
+    """The ONE shape query_hivemind returns, whichever leg answered:
+    ``{'thought': <words or ''>, 'source': 'in_process' | 'peerlink' |
+    'http' | 'cached', 'peer_count': <peers that replied>, 'confidence':
+    <float in [0, 1], 0.0 when the leg reports none or no number>}``.  Every
+    reader asks ``result['thought']``: '' is a leg that answered with nothing
+    to say, None (no result at all) a leg that did not answer.  Before this
+    the three legs returned three shapes (the core's whole body, a list of
+    peer dicts, the in-process text or its repr) and six reader functions
+    grew around them in task #110's rounds two to six; the metered endpoint
+    also handed a customer the core's whole body (task #136)."""
+    text = words if isinstance(words, str) and words.strip() else ''
+    reply = {'thought': text, 'source': source,
+             'peer_count': int(peer_count or 0),
+             'confidence': _unit_confidence(confidence)}
+    reply.update(extra)
+    return reply
+
+
 _bridge = None
 _bridge_lock = threading.Lock()
 

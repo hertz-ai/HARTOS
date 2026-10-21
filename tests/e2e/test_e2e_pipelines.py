@@ -159,7 +159,7 @@ class TestCommercialAPILifecycle:
         assert stats['total_cost_credits'] > 0
 
         # Step 7: Revoke
-        revoked = CommercialAPIService.revoke_api_key(db, key_id)
+        revoked = CommercialAPIService.revoke_api_key(db, key_id, str(test_user.id))
         assert revoked['is_active'] is False
 
         # Step 8: Validate after revoke - should fail

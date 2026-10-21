@@ -51,26 +51,74 @@ The new mount line to add to the `docker run` command:
 
 ## Step 3 — Add the payment-rail env vars
 
-`STRIPE_API_KEY` and `HEVOLVE_API_KEY` are owned by the deploy: set each
-as a GitHub repo secret (`gh secret set STRIPE_API_KEY --repo
-hertz-ai/HARTOS`) and the deepbox deploy writes it into central's `.env`
-on every deploy (`deploy/deepbox_deploy.sh`). Do not hand-edit those two;
-while the secret is set, the next deploy writes the secret's value back.
-To remove one: delete the repo secret FIRST, then the line from `.env`.
+`STRIPE_API_KEY`, `STRIPE_WEBHOOK_SECRET`, `HEVOLVE_API_KEY`,
+`HARTOS_PUBLIC_URL` and the PhonePe settings below are owned by the
+deploy: set each as a GitHub repo
+secret (`gh secret set STRIPE_API_KEY --repo hertz-ai/HARTOS`) and the
+deepbox deploy writes it into central's `.env` on every deploy
+(`deploy/deepbox_deploy.sh`). Do not hand-edit those; while the secret is
+set, the next deploy writes the secret's value back. To remove one: delete
+the repo secret FIRST, then the line from `.env`. The webhook secret and
+its Stripe-side registration are `deploy/go_live_stripe.md` Step 4b.
 
-The PhonePe keys below are not forwarded by the workflow, so they still
-go into the host-side `.env` by hand (the deploy never rewrites keys it
-does not own). Docker reads `--env-file .env` only when the container is
-created, so a `docker restart` changes nothing: the keys take effect on
-the next deploy, which recreates the container:
+`HARTOS_PUBLIC_URL` is the public base of this node's API (the host Kong
+fronts it on). PhonePe is sent `HARTOS_PUBLIC_URL` +
+`/api/v1/intelligence/phonepe/callback` as its server-to-server callback
+and the same base as the buyer's return page, and refund requests name
+`/api/v1/intelligence/phonepe/refund-callback`; without it (or with only
+a loopback or LAN request host, which no gateway can reach) a PhonePe
+payment is refused, never sent with a guessed host: the shopper sees a
+plain sentence and the ERROR log names the setting (`core/public_url.py`).
+
+The PhonePe settings are repo secrets too; the deploy forwards them and
+writes each one it is given into `.env`. Docker reads `--env-file .env`
+only when the container is created, so a `docker restart` changes
+nothing: the keys take effect on the next deploy, which recreates the
+container. The gateway registers only when the merchant id AND the salt
+key are both set; leave the other three unset to keep their defaults.
+`gh secret set NAME` with no `--body` asks for the value at a prompt, so
+it never lands in shell history. Run each line on its own and answer its
+prompt before the next one; pasted as a block, the next line can become
+the value of the previous secret:
 
 ```bash
 # India (UPI / cards / netbanking via PhonePe)
-PHONEPE_MERCHANT_ID=YOUR_MERCHANT_ID
-PHONEPE_SALT_KEY=YOUR_SALT_KEY
-PHONEPE_SALT_INDEX=1
-PHONEPE_ENV=PROD   # or UAT for sandbox
-PHONEPE_USD_INR_RATE=84.0   # optional override; default is 84.0
+gh secret set PHONEPE_MERCHANT_ID --repo hertz-ai/HARTOS
+gh secret set PHONEPE_SALT_KEY --repo hertz-ai/HARTOS
+gh secret set PHONEPE_SALT_INDEX --repo hertz-ai/HARTOS    # optional; default 1
+gh secret set PHONEPE_ENV --repo hertz-ai/HARTOS           # optional; PROD (default) or UAT, any case, no spaces
+gh secret set PHONEPE_USD_INR_RATE --repo hertz-ai/HARTOS  # optional; default 84.0
+```
+
+Two traps, both silent:
+
+- **An unset secret never removes a line from `.env`.** A box that
+  followed the older version of this runbook already has `PHONEPE_*`
+  lines written by hand, and those keep their values for every secret
+  you leave unset: an old `PHONEPE_ENV=UAT` keeps the gateway in the
+  sandbox, where no real payment is taken. In the checkout from Step 1,
+  list the names on the box (names only, never values) and set a secret
+  for each one present: `grep -oE '^[[:space:]]*PHONEPE_[A-Z_]+=' .env`.
+- **Only `PROD` is live.** The gateway upper-cases `PHONEPE_ENV` and
+  takes anything but `PROD` as the sandbox: `UAT`, `PRODUCTION`, an
+  empty value, a stray space, or the old sample line's trailing comment
+  (`PROD   # or UAT for sandbox`). Unset means `PROD`.
+
+A secret cannot be read back, and the gateway's "auto-registered" boot
+line is no check: it is logged while the module is imported, before
+logging is set up, and a local replay of the boot never printed it. So
+check the running node after the deploy: the callback route says whether
+the gateway registered, the container says why not, and the mode is the
+value of `PHONEPE_ENV`, which is not a secret:
+
+```bash
+# Registered: an empty POST to the callback answers 400 (registered, the
+# empty body refused) or 503 "PhonePe gateway unavailable" (not registered):
+curl -s -o /dev/null -w '%{http_code}\n' -X POST -H 'Content-Type: application/json' -d '{}' http://localhost:6777/api/v1/intelligence/phonepe/callback
+# On a 503, both must say "set" (names only, never values):
+sudo docker exec langchain sh -c 'for v in PHONEPE_MERCHANT_ID PHONEPE_SALT_KEY; do [ -n "$(printenv $v)" ] && echo "$v set" || echo "$v MISSING"; done'
+# Live only when this prints "unset" or [PROD] (any case); the brackets show stray spaces:
+sudo docker exec langchain sh -c 'if [ -z "${PHONEPE_ENV+x}" ]; then echo unset; else echo "[$PHONEPE_ENV]"; fi'
 ```
 
 ## Step 4 — Restart the container with the new mount
@@ -96,7 +144,9 @@ Confirm:
 
 ```bash
 sleep 20
-sudo docker inspect langchain | grep -E '(agent_data|STRIPE_API_KEY|PHONEPE_MERCHANT)' | head
+sudo docker inspect -f '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{"\n"}}{{end}}' langchain | grep agent_data
+# each must say "set" (names only, never values; an empty value says MISSING):
+sudo docker exec langchain sh -c 'for v in STRIPE_API_KEY PHONEPE_MERCHANT_ID PHONEPE_SALT_KEY; do [ -n "$(printenv $v)" ] && echo "$v set" || echo "$v MISSING"; done'
 curl -s http://localhost:6777/status | head -c 200
 curl -s http://localhost:6777/api/v1/intelligence/pricing | python3 -m json.tool | head -30
 ```
@@ -104,14 +154,14 @@ curl -s http://localhost:6777/api/v1/intelligence/pricing | python3 -m json.tool
 ## Step 5 — Register PhonePe S2S callback on the merchant dashboard
 
 Log into the PhonePe merchant portal and set the **server-to-server
-callback URL** to:
+callback URL** to the one HARTOS sends with every pay request:
 
 ```
-https://etime.hertzai.com/api/v1/intelligence/phonepe/callback
+<HARTOS_PUBLIC_URL>/api/v1/intelligence/phonepe/callback
 ```
 
-(or whatever public URL fronts your central instance — Cloudflare
-Tunnel, ALB DNS, Kong upstream, etc.  The URL must reach the
+(`HARTOS_PUBLIC_URL` is whatever public URL fronts your central instance
+— Cloudflare Tunnel, ALB DNS, Kong upstream, etc.  The URL must reach the
 container's port 6777.)
 
 PhonePe rejects mixed-case URLs in some configs — keep it all
@@ -196,9 +246,9 @@ canonical aggregator on the next nightly settle.
 - Auth 401 from daemon: confirm `HEVOLVE_API_KEY` is in `.env` OR
   the JWT secret env vars used by `integrations.social.auth.generate_jwt`
   are present.
-- PhonePe 503 on `/upgrade/phonepe`: gateway not registered —
-  check `PHONEPE_MERCHANT_ID` and `PHONEPE_SALT_KEY` made it into the
-  container with `sudo docker exec langchain env | grep PHONEPE`.
+- PhonePe 503 on `/upgrade/phonepe`: gateway not registered. Run the
+  three checks at the end of Step 3 (the callback's code, both
+  credentials set, the mode); an empty value counts as missing.
 - Marketing goal stays paused: check `agent_data/goals.json` for the
   `paused_reason` field — likely `auth_failed_repeatedly` if step 3
   missed.

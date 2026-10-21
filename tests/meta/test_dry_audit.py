@@ -205,9 +205,66 @@ CANONICAL_OWNERS = {
     'set_preferred_lang': 'core/user_lang.py',
     'user_facing_error': 'core/agent_tools.py',
     'is_user_facing_error': 'core/agent_tools.py',
+    'NOTHING_GENERATED_STATUSES': 'integrations/service_tools/media_agent.py',
+    'generated_nothing': 'integrations/service_tools/media_agent.py',
+    'AGENT_WORK_TOOL_NAMES': 'core/constants.py',
+    'flag_value': 'core/config_cache.py',
     'dump_all_thread_stacks': 'core/diag.py',
     'get_watchdog': 'security/node_watchdog.py',
     'sleep_with_heartbeat': 'security/node_watchdog.py',
+    'configured_public_url': 'core/public_url.py',
+    'trusted_request_base': 'core/public_url.py',
+    'internet_base_url': 'core/public_url.py',
+    'is_public_host': 'core/public_url.py',
+    'allowed_hosts': 'core/public_url.py',
+    'own_gateway_urls': 'integrations/ap2/ap2_protocol.py',
+    # The one upload store's facts (owner ruling A10a, amendment A9 d):
+    # integrations.reel_studio.contracts and voice_profile import them.
+    'UploadPurpose': 'core/user_file_store.py',
+    'INBOUND_PURPOSES': 'core/user_file_store.py',
+    'INBOUND_MIMES': 'core/user_file_store.py',
+    'INBOUND_META_KEYS': 'core/user_file_store.py',
+    'OUTBOUND_PURPOSE': 'core/user_file_store.py',
+    'is_xid': 'core/user_file_store.py',
+    'is_file_name': 'core/user_file_store.py',
+    'is_capture_ms': 'core/user_file_store.py',
+    'user_dir_name': 'core/user_file_store.py',
+    # The ONE /chat attachments rule (amendment A9 a): integrations.
+    # reel_studio.contracts re-exports it; Nunba's turn_attachments reads it.
+    'validate_attachment': 'core/chat_attachments.py',
+    # The human-voice guide, the one source of published-text style (owner
+    # ruling A10c): goal_manager imports the guide; Reel Studio's contracts
+    # (as HASHTAG_LIMIT), caption linter and skills import the reel cap;
+    # igkit.humanize reads the word list.
+    'HUMAN_VOICE_GUIDE': 'integrations/agent_engine/human_voice.py',
+    'REEL_HASHTAG_LIMIT': 'integrations/agent_engine/human_voice.py',
+    'POST_HASHTAG_LIMIT': 'integrations/agent_engine/human_voice.py',
+    'machine_text_lexicon': 'integrations/agent_engine/human_voice.py',
+    # The reel cap's token in texts an agent reads (skills, her profile's
+    # labels) and the one filler: igkit.skills imports both, voice_profile
+    # the filler.
+    'REEL_HASHTAG_LIMIT_TOKEN': 'integrations/agent_engine/human_voice.py',
+    'with_reel_hashtag_limit': 'integrations/agent_engine/human_voice.py',
+    # The one way a tell matches text (igkit.humanize rewrites and scores
+    # with it; scripts/check_docs_claims.py reports with it) and the docs'
+    # own tells, which that checker reads beside the guide's list.
+    'tell_pattern': 'integrations/agent_engine/human_voice.py',
+    'DOCS_TELLS': 'integrations/agent_engine/human_voice.py',
+    # Her trending-song watchlist's one reader and one writer (owner ruling
+    # A17b): daily_job reads through it, the reel_watchlist tool writes
+    # through it.  And the one short-tag rule its niche and the published
+    # list's region/niche/source are kept with.
+    'read_watchlist': 'integrations/trends/watchlist.py',
+    'update_watchlist': 'integrations/trends/watchlist.py',
+    'clean_tag': 'integrations/trends/trending_songs.py',
+    # The one Node.js locator (amendment A14): the coding-tool launcher, the
+    # WhatsApp gateway supervisor and the runtime's npm setup import it.
+    'find_node': 'core/node_bin.py',
+    'find_npm': 'core/node_bin.py',
+    # The one npm installer (A16/A18/A20): RuntimeToolManager's npm rows and
+    # the WhatsApp gateway (whatsapp_supervisor.ensure_baileys_deps) set up
+    # through it.
+    'install_npm_project': 'integrations/service_tools/model_storage.py',
 }
 
 #: module -> why it may walk sys._current_frames() itself.

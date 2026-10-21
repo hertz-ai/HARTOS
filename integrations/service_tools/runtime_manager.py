@@ -6,6 +6,26 @@ Persists state to ~/.hevolve/tool_state.json so restarts skip completed setup.
 
 All sidecar servers use dynamic port allocation (no fixed ports).
 Whisper runs in-process (no sidecar).
+
+On-demand tools (``on_demand: True``, owner ruling A16) have no server: a
+Node project whose packages are set up at runtime (``download_type: 'npm'``,
+model_storage.install_npm_project) when a task asks for it, after the
+owner's consent, and then run by that task.  setup_tool installs and
+prepares them and stops there (no VRAM, no sidecar); setup_available_tools
+never sets them up; tool_ready says whether one is usable.
+
+A row may also carry (amendment A14, for Remotion's row), each checked IN
+setup_tool so no caller -- an agent tool, POST /api/tools/<name>/setup --
+gets past it:
+  ``enabled_by``   an env flag; the row is off unless it is set
+                   (core.config_cache.env_flag, default off: tool_enabled);
+  ``consent``      a capability id ('<family>:<id>') set up only after the
+                   owner's yes on the one consent card
+                   (capability_setup.ask_owner_for_setup with
+                   ``consent_reason``, the card's words: ask_tool_consent);
+  ``npm_min_free_bytes``  the free disk an npm setup checks first.
+setup_tool_async runs a setup on a thread of its own, one per tool, so a
+caller can wait as long as it can afford and leave it running.
 """
 
 import atexit
@@ -15,11 +35,12 @@ import os
 import subprocess
 import sys
 import time
+from concurrent.futures import Future
 from pathlib import Path
 from threading import Lock, Thread
 from typing import Dict, Optional
 
-from .model_storage import ModelStorageManager, model_storage
+from .model_storage import ModelStorageManager, NpmSetupFailed, model_storage
 from .vram_manager import VRAMManager, vram_manager
 from .registry import service_tool_registry
 
@@ -35,10 +56,16 @@ PORT_LISTEN_TIMEOUT_S = 600
 # servers/ and is the only working video server in the tree.
 VISION_DIR = os.path.join(
     os.path.dirname(os.path.dirname(__file__)), 'vision')
+# Reel Studio's Remotion project (our templates and scripts, HARTOS source).
+REEL_MOTION_PROJECT = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)), 'reel_studio', 'motion', 'project')
 
 # Tool configuration: name → {repo_url, server_script, hf_repo_id, is_inprocess, catalog_id}
 # catalog_id links RTM tools to ModelCatalog entries so the orchestrator stays in sync.
 # None = no catalog entry (tool is a wrapper or resolved dynamically).
+# An npm row (download_type 'npm') names npm_project (the project folder HARTOS
+# ships as source), optionally npm_prepare (a script in it run with Node after
+# npm install) and on_demand: True (no server; see the module note).
 TOOL_CONFIGS = {
     # Video generation
     'wan2gp': {
@@ -130,6 +157,34 @@ TOOL_CONFIGS = {
         'server_script': os.path.join(VISION_DIR, 'minicpm_server.py'),
         'catalog_id': 'vlm-minicpm-v2',
     },
+    # Reel Studio's animated overlays (amendment A14): Remotion renders our
+    # templates (integrations/reel_studio/motion).  Its npm packages (the
+    # versions package.json and package-lock.json pin) and the headless
+    # browser its prepare.js downloads are set up here at runtime, never
+    # packaged (A16).  OFF until the owner confirms which Remotion license
+    # applies (NOTICE); then each node's owner is asked on the consent card.
+    'reel_motion': {
+        'download_type': 'npm',
+        'npm_project': REEL_MOTION_PROJECT,
+        'npm_prepare': 'prepare.js',
+        # The npm packages are 184 MB unpacked for win32-x64 (measured
+        # 2026-10-15 from the registry sizes of the 186 of the lock's 226
+        # packages that install on win32-x64 -- the other 40 are builds for
+        # other platforms -- six with no size recorded); the browser's size
+        # is not measured here.  1 GiB leaves room for both.
+        'npm_min_free_bytes': 1 << 30,
+        'on_demand': True,
+        'enabled_by': 'HEVOLVE_REEL_MOTION',
+        'consent': 'reel:motion',
+        # The card is read by this computer's owner, who is usually the
+        # person making the reels: the words do not talk about "her".
+        'consent_reason': (
+            "Animated overlays for reels made on this computer (a moving title, a logo "
+            "sting, a booking card at the end, a before-and-after wipe) need Remotion: "
+            "its packages and a headless browser, a few hundred MB, downloaded once into "
+            "the models folder. Set it up?"),
+        'catalog_id': None,
+    },
 }
 
 
@@ -143,6 +198,8 @@ class RuntimeToolManager:
         self._processes: Dict[str, subprocess.Popen] = {}
         self._ports: Dict[str, int] = {}
         self._lock = Lock()
+        # setup_tool_async: the one setup in flight per tool.
+        self._setups: Dict[str, Future] = {}
         # Lifecycle hooks — ModelLifecycleManager subscribes to these
         self._lifecycle_hooks = {
             'on_tool_started': [],
@@ -175,6 +232,18 @@ class RuntimeToolManager:
 
         result = {'tool': tool_name}
 
+        # Step 0: a row that is switched off, or needs the owner's yes, sets
+        # nothing up without it -- whoever asks (see the module note).
+        if not self.tool_enabled(tool_name):
+            return dict(result, disabled=True,
+                        error=f"{tool_name} is switched off on this node "
+                              f"({config['enabled_by']} is not set)")
+        answer = self.ask_tool_consent(tool_name)
+        if answer != 'granted':
+            return dict(result, consent=answer,
+                        error=f"setting {tool_name} up needs the owner's yes on the consent "
+                              f"card ({answer})")
+
         # Step 1: Download if needed.
         #
         # The hf branch deliberately does NOT pre-check is_downloaded():
@@ -198,6 +267,26 @@ class RuntimeToolManager:
             path = (self.storage.get_tool_dir(tool_name)
                     if self.storage.is_downloaded(tool_name)
                     else self.storage.clone_repo(tool_name, config['repo_url']))
+        elif dl_type == 'npm':
+            # Idempotent and one-at-a-time (install_npm_project): a set-up
+            # project returns at once; the reason a setup failed is kept
+            # for the caller, who tells the person.  Nothing raises out of
+            # here (amendment A24b ii): the installer turns an OSError into
+            # NpmSetupFailed, and anything else (a bug) is logged with its
+            # traceback and answered like a failed setup, so neither POST
+            # /api/tools/<name>/setup nor a background setup's waiter gets an
+            # exception in place of the reason.
+            try:
+                path = self.storage.install_npm_project(
+                    tool_name, config['npm_project'], prepare=config.get('npm_prepare'),
+                    min_free_bytes=int(config.get('npm_min_free_bytes') or 0))
+            except NpmSetupFailed as e:
+                logger.warning(f"Setup of {tool_name} failed: {e}")
+                return dict(result, error=str(e))
+            except Exception as e:
+                logger.error(f"Setup of {tool_name} raised {type(e).__name__}: {e}",
+                             exc_info=True)
+                return dict(result, error=f'setting {tool_name} up failed: {e}')
         else:
             return {'error': f'Unknown download_type: {dl_type}'}
 
@@ -205,6 +294,12 @@ class RuntimeToolManager:
             return {'error': f'Download failed for {tool_name}'}
 
         result['downloaded'] = True
+
+        if config.get('on_demand'):
+            # No server and no GPU: set up is ready, the task runs it.
+            result['ready'] = True
+            self.save_state()
+            return result
 
         # Step 2: Check VRAM and decide offload mode
         offload = self.vram.suggest_offload_mode(tool_name)
@@ -223,12 +318,70 @@ class RuntimeToolManager:
 
         return result
 
+    def setup_tool_async(self, tool_name: str) -> Future:
+        """setup_tool(tool_name) on a thread of its own; the Future gets its
+        result dict (or the exception a bug raised).  While one is running
+        for this tool, asking again returns that same Future, so a caller
+        waits for it as long as it can afford (``result(timeout=...)``) and
+        leaves it running; the next ask after it finished starts a new one
+        (setup_tool is idempotent, so a set-up tool answers at once)."""
+        with self._lock:
+            running = self._setups.get(tool_name)
+            if running is not None and not running.done():
+                return running
+            future: Future = Future()
+            self._setups[tool_name] = future
+
+        def run():
+            try:
+                future.set_result(self.setup_tool(tool_name))
+            except BaseException as e:      # handed to whoever waits
+                logger.error(f"Setup of {tool_name} raised: {e}", exc_info=True)
+                future.set_exception(e)
+        Thread(target=run, name=f"{tool_name}-setup", daemon=True).start()
+        return future
+
+    def tool_enabled(self, tool_name: str) -> bool:
+        """Is the row switched on?  A row naming an ``enabled_by`` env flag
+        is on only when that flag is set (core.config_cache.env_flag,
+        default off); any other known row is on."""
+        config = TOOL_CONFIGS.get(tool_name)
+        if not config:
+            return False
+        flag = config.get('enabled_by')
+        if not flag:
+            return True
+        from core.config_cache import env_flag
+        return env_flag(flag, False)
+
+    def ask_tool_consent(self, tool_name: str) -> str:
+        """The owner's answer to setting this row up: 'granted' for a row
+        that names no ``consent``; else capability_setup.ask_owner_for_setup
+        (the one consent card, filed once with the row's consent_reason):
+        'granted', 'asked', 'declined' or 'unavailable'."""
+        config = TOOL_CONFIGS.get(tool_name) or {}
+        capability = config.get('consent')
+        if not capability:
+            return 'granted'
+        from integrations.agent_engine.capability_setup import ask_owner_for_setup
+        return ask_owner_for_setup(
+            capability, reason=config.get('consent_reason') or f'Set {tool_name} up here?')
+
     def start_tool(self, tool_name: str) -> Dict:
         """Start a tool that's already downloaded."""
+        config = TOOL_CONFIGS.get(tool_name)
+        if config and config.get('on_demand'):
+            # Nothing to start: set up means ready.
+            if self.tool_ready(tool_name):
+                return {'tool': tool_name, 'ready': True}
+            if not self.tool_enabled(tool_name):
+                return {'tool': tool_name, 'disabled': True,
+                        'error': f'{tool_name} is switched off on this node'}
+            return {'error': f'{tool_name} is not set up. Use setup_tool() first.'}
+
         if not self.storage.is_downloaded(tool_name):
             return {'error': f'{tool_name} not downloaded. Use setup_tool() first.'}
 
-        config = TOOL_CONFIGS.get(tool_name)
         if not config:
             return {'error': f'Unknown tool: {tool_name}'}
 
@@ -287,22 +440,49 @@ class RuntimeToolManager:
             return {'error': f'Unknown tool: {tool_name}'}
 
         is_running = self._is_server_alive(tool_name)
-        return {
+        status = {
             'tool': tool_name,
             'downloaded': self.storage.is_downloaded(tool_name),
             'running': is_running,
             'port': self._ports.get(tool_name),
             'is_inprocess': config.get('is_inprocess', False),
-            'vram_allocated_gb': self.vram.get_allocations().get(tool_name, 0),
-            'offload_mode': self.vram.suggest_offload_mode(tool_name),
         }
+        if config.get('on_demand'):
+            # No server and no GPU to report: whether it is on and set up is
+            # the answer.
+            status.update(on_demand=True, enabled=self.tool_enabled(tool_name),
+                          ready=self.tool_ready(tool_name))
+            return status
+        status.update(vram_allocated_gb=self.vram.get_allocations().get(tool_name, 0),
+                      offload_mode=self.vram.suggest_offload_mode(tool_name))
+        return status
+
+    def tool_ready(self, tool_name: str) -> bool:
+        """Is ``tool_name`` usable now: switched on (tool_enabled) and, for an
+        on-demand tool, completely set up (its npm project:
+        model_storage.npm_install_is_complete), for any other tool serving
+        (_is_server_alive).  ``on_demand`` is the one flag that says which,
+        here as in setup_tool, start_tool, get_tool_status and
+        setup_available_tools (amendment A24b iii); an on-demand row is an
+        npm project (download_type 'npm', npm_project), the one kind of
+        on-demand setup."""
+        config = TOOL_CONFIGS.get(tool_name)
+        if not config or not self.tool_enabled(tool_name):
+            return False
+        if config.get('on_demand'):
+            return self.storage.npm_install_is_complete(tool_name, config['npm_project'])
+        return self._is_server_alive(tool_name)
 
     # ── Bulk operations ──────────────────────────────────────────
 
     def setup_available_tools(self) -> Dict:
         """Setup all tools that can fit in available VRAM."""
         results = {}
-        for name in TOOL_CONFIGS:
+        for name, config in TOOL_CONFIGS.items():
+            if config.get('on_demand'):
+                # Set up only when a task asks, after the owner's consent.
+                results[name] = {'skipped': 'set up on demand only'}
+                continue
             if self.vram.can_fit(name):
                 results[name] = self.setup_tool(name)
             else:
@@ -375,7 +555,10 @@ class RuntimeToolManager:
     # ── State persistence ────────────────────────────────────────
 
     def save_state(self) -> None:
-        """Persist tool state to JSON."""
+        """Persist tool state to JSON.  Never raises: the file is a hint for
+        the next start (load_state), and setup_tool ends with this, so a
+        state folder that cannot be made fails no setup (amendment A24b ii;
+        it used to be made outside the try)."""
         state = {
             'tools': {},
             'ports': dict(self._ports),
@@ -387,8 +570,8 @@ class RuntimeToolManager:
                 'port': self._ports.get(name),
             }
 
-        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         try:
+            STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
             STATE_FILE.write_text(json.dumps(state, indent=2))
         except Exception as e:
             logger.warning(f"Failed to save tool state: {e}")

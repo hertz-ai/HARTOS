@@ -142,7 +142,10 @@ class SetReceiptLogoTool(unittest.TestCase):
                     return_value=tmp_data):
             out = set_logo(file_path=src)
         self.assertIn('Logo saved', out)
-        stored = agent_data['testp']['receipt_logo_path']
+        # The person's own memory for this agent (core.agent_tools
+        # .memory_view), under the ctx's session key, not the agent's store.
+        self.assertNotIn('receipt_logo_path', agent_data.get('testp', {}))
+        stored = agent_data['up']['receipt_logo_path']
         self.assertTrue(os.path.isfile(stored))
         self.assertTrue(os.path.realpath(stored).startswith(
             os.path.realpath(tmp_data)))

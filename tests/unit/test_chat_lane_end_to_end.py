@@ -59,12 +59,23 @@ def lanes():
 
 def _chat(hie, monkeypatch, body, headers):
     """POST ``body`` to the real /chat.  Returns 'registered' when the turn
-    got past the lane registration, else the HTTP status it was refused with."""
+    got past the lane registration, else the HTTP status it was refused with.
+
+    Two stop points, both after the registration: an agent-bound turn asks
+    for the speculative dispatcher; an agent-less turn with the draft off
+    (the metered self-POST since the review of e0abe7c34 sends prompt_id
+    None and draft_first False) reaches get_ans instead.  Without the second
+    stop that turn ran to the end of /chat and published to the desktop's
+    bus from a unit test."""
     def stop(*_a, **_k):
         raise _Stop()
     monkeypatch.setitem(hie.app.config, 'PROPAGATE_EXCEPTIONS', True)
     monkeypatch.setattr(hie, '_persist_language', lambda *a, **k: None)
     monkeypatch.setattr(hie, '_cleanup_stale_agents', lambda: None)
+    monkeypatch.setattr(hie, 'get_ans', stop)
+    # The INITIALIZED publish sits just before get_ans; a unit test must not
+    # hand it to the desktop's bus (review of 7e7ce19bc: 2 publishes here).
+    monkeypatch.setattr(hie, 'publish_async', lambda *a, **k: None)
     body = dict(body, speculative=True)
     body.setdefault('prompt_id', '7')
     with patch('integrations.agent_engine.speculative_dispatcher.get_speculative_dispatcher',
@@ -75,10 +86,11 @@ def _chat(hie, monkeypatch, body, headers):
             return 'registered'
 
 
-def _metered_call(hie, monkeypatch):
-    """Drive the real metered endpoint (its auth stubbed); its self-POST is
-    forwarded to the real /chat with the body and headers it really sends.
-    Returns (the endpoint's response, what was sent, /chat's outcome)."""
+def _metered_call(hie, monkeypatch, user_id='cust-42'):
+    """Drive the real metered endpoint (its auth stubbed; the key belongs to
+    ``user_id``); its self-POST is forwarded to the real /chat with the body
+    and headers it really sends.  Returns (the endpoint's response, what was
+    sent, /chat's outcome)."""
     from integrations.agent_engine.commercial_api import (
         CommercialAPIService, commercial_api_bp)
     app = Flask(__name__)
@@ -93,7 +105,7 @@ def _metered_call(hie, monkeypatch):
         r.json.return_value = {'response': 'ok'}
         return r
 
-    key_data = {'id': 'key-1', 'user_id': 'cust-42', 'tier': 'pro'}
+    key_data = {'id': 'key-1', 'user_id': user_id, 'tier': 'pro'}
     with patch('integrations.social.models.get_db', return_value=MagicMock()), \
             patch.object(CommercialAPIService, 'validate_api_key', return_value=key_data), \
             patch.object(CommercialAPIService, 'check_rate_limit', return_value=True), \
@@ -116,15 +128,60 @@ def test_a_paid_call_on_a_keyed_node_is_admitted_by_chat_and_runs_revenue(
     assert r.status_code == 200
 
 
-def test_a_paid_call_on_a_keyless_node_runs_revenue_through_the_system_jwt(
+def _bearer_user(headers):
+    """Who the self-POST's JWT says is calling, as /chat reads it."""
+    from integrations.social.auth import decode_jwt
+    token = headers.get('Authorization', '')
+    assert token.startswith('Bearer '), headers
+    return decode_jwt(token[7:]).get('user_id')
+
+
+def test_a_paid_call_on_a_keyless_node_runs_as_the_customer_on_the_revenue_lane(
         hie, lanes, monkeypatch):
+    """Without HEVOLVE_API_KEY the self-POST carries a JWT, and /chat trusts a
+    JWT over the body (correctly).  Minted for the node's own system identity
+    it put every paying customer in ONE shared session with history and
+    memory tools (task #153; the same collapse the channel relays had on
+    2026-08-06).  The relay now mints it for the key's owner through
+    chat_turn_request, and the node's lane word rides as the token's claim,
+    so the turn is still revenue."""
     monkeypatch.delenv('HEVOLVE_API_KEY', raising=False)
     monkeypatch.setenv('HEVOLVE_NODE_TIER', 'central')
     r, sent = _metered_call(hie, monkeypatch)
-    assert sent['headers'].get('Authorization', '').startswith('Bearer ')
+    assert _bearer_user(sent['headers']) == 'cust-42', (
+        'the self-POST ran as %r, not the customer' % _bearer_user(sent['headers']))
     assert sent['chat'] == 'registered'
     assert lanes.lane_for_request(sent['json']['request_id']) == 'revenue'
     assert r.status_code == 200
+
+
+def test_a_captured_customer_token_does_not_buy_the_revenue_lane_for_another_turn(
+        hie, lanes, monkeypatch):
+    """Task #157: the self-POST's token carries the node's lane word for ONE
+    turn (its rid claim).  Replayed at the real /chat by the same user with a
+    fresh request id and the same body word, the turn is admitted (the
+    identity is good) but registered on the user lane."""
+    monkeypatch.delenv('HEVOLVE_API_KEY', raising=False)
+    monkeypatch.setenv('HEVOLVE_NODE_TIER', 'central')
+    _r, sent = _metered_call(hie, monkeypatch)
+    assert lanes.lane_for_request(sent['json']['request_id']) == 'revenue'
+    replay = dict(sent['json'], request_id='api_replay_' + sent['json']['request_id'][-8:])
+    assert _chat(hie, monkeypatch, replay, sent['headers']) == 'registered'
+    assert lanes.lane_for_request(replay['request_id']) == 'user'
+    # The original turn's registration is untouched.
+    assert lanes.lane_for_request(sent['json']['request_id']) == 'revenue'
+
+
+def test_two_customers_on_a_keyless_node_never_share_an_identity(hie, lanes, monkeypatch):
+    monkeypatch.delenv('HEVOLVE_API_KEY', raising=False)
+    monkeypatch.setenv('HEVOLVE_NODE_TIER', 'central')
+    _r1, first = _metered_call(hie, monkeypatch, user_id='cust-1')
+    _r2, second = _metered_call(hie, monkeypatch, user_id='cust-2')
+    assert first['chat'] == second['chat'] == 'registered'
+    assert _bearer_user(first['headers']) == 'cust-1'
+    assert _bearer_user(second['headers']) == 'cust-2'
+    for sent in (first, second):
+        assert lanes.lane_for_request(sent['json']['request_id']) == 'revenue'
 
 
 def _node_credential(hie, monkeypatch, mode):

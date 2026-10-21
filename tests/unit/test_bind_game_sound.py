@@ -46,19 +46,34 @@ def _media(started, progress=None):
     return module
 
 
+@pytest.fixture(autouse=True)
+def _user_1_built_agent_4242(tmp_path, monkeypatch):
+    """Agent 4242's definition names user-1, the reviewer in these tests, as
+    its creator: only the creator's word on a sound is the agent's (owner
+    2026-10-17), so without it every verdict below would be user-1's own."""
+    from core import cache_loaders
+    prompts = tmp_path / 'prompts'
+    prompts.mkdir()
+    (prompts / '4242.json').write_text(
+        json.dumps({'prompt_id': 4242, 'creator_user_id': 'user-1'}))
+    monkeypatch.setattr(cache_loaders, 'PROMPTS_DIR', str(prompts))
+    monkeypatch.setattr(cache_loaders, '_agent_config_cache', {})
+    return prompts
+
+
 @contextmanager
-def _agent(agent_data, media_module):
+def _agent(agent_data, media_module, user_id='user-1', user_prompt='session-1'):
     """The tool set as an agent gets it.
 
     The capability stays patched while the tools RUN, not only while they
     are built: bind_game_sound imports it at call time.
     """
     ctx = {
-        'user_id': 'user-1',
+        'user_id': user_id,
         'prompt_id': 4242,
         'agent_data': agent_data,
         'helper_fun': MagicMock(),
-        'user_prompt': 'session-1',
+        'user_prompt': user_prompt,
         'request_id_list': [],
         'recent_file_id': {},
         'scheduler': MagicMock(),
@@ -253,9 +268,10 @@ def test_a_persons_correction_is_theirs_and_leaves_the_agents_alone():
     # the agent's approved sound is untouched
     assert agent_data[4242]['games']['eng-01']['sounds']['correct']['url'] == \
         'https://node/approved.mp3'
-    # and the correction sits under that person
-    assert agent_data[4242]['games']['eng-01']['mine']['user-1']['correct']['url'] == \
+    # and the correction sits in that person's own store, not the agent's
+    assert agent_data['session-1']['games']['eng-01']['sounds']['correct']['url'] == \
         'https://node/mine.mp3'
+    assert 'mine' not in agent_data[4242]['games']['eng-01']
 
 
 # ── a rejected take (spec §6.1) ───────────────────────────────────────
@@ -631,17 +647,224 @@ def test_approving_while_a_level_plays_approves_the_take_that_is_playing():
 
 def test_a_persons_correction_still_writes_in_their_own_space():
     """The fix must not send a personal rejection into the agent's memo."""
-    agent_data = {4242: {'games': {'eng-01': {'mine': {'user-1': {
-        'correct': {'url': 'https://node/mine.mp3'}}},
-        'sounds': {'correct': {'url': 'https://node/agent.mp3',
-                               'approved_at': 1}}}}}}
+    agent_data = {
+        4242: {'games': {'eng-01': {'sounds': {'correct': {
+            'url': 'https://node/agent.mp3', 'approved_at': 1}}}}},
+        'session-1': {'games': {'eng-01': {'sounds': {'correct': {
+            'url': 'https://node/mine.mp3'}}}}},
+    }
 
     with _agent(agent_data, _media({'status': 'completed', 'results': []})) as tools:
         tools['approve_game_sound']('eng-01', False, 'correct', 'not for me', '', 'mine')
 
-    game = agent_data[4242]['games']['eng-01']
-    assert game['mine']['user-1']['correct'].get('url') is None
-    assert game['sounds']['correct']['url'] == 'https://node/agent.mp3'
+    own = agent_data['session-1']['games']['eng-01']['sounds']['correct']
+    assert own.get('url') is None
+    assert own['rejected_url'] == 'https://node/mine.mp3'
+    assert agent_data[4242]['games']['eng-01']['sounds']['correct']['url'] == \
+        'https://node/agent.mp3'
+
+
+# ── whose choice it is (owner 2026-10-17) ─────────────────────────────
+#
+# "background music selection can be altered by anyone for my agent ...
+# the unique key is userid_promptid" and "background music created once
+# gets reused ... should not be conflated with" the choice.  A composed
+# take is the agent's, made once and replayed for everyone; keeping or
+# turning one down is a choice, the creator's for everyone and anyone
+# else's for themselves alone.
+
+VISITOR = 'visitor-1'
+
+
+def _visitor(agent_data, media_module):
+    return _agent(agent_data, media_module, user_id=VISITOR,
+                  user_prompt=f'{VISITOR}_4242')
+
+
+def _creators_approved_music():
+    return {4242: {'games': {'eng-01': {'sounds': {'bgm': {
+        'url': 'https://node/creators.mp3', 'approved_at': 1.0,
+        'variant': 1}}}}}}
+
+
+def test_a_visitor_turning_the_creators_music_down_changes_only_their_own():
+    """The probe of 2026-10-17, replayed: a visitor's default-scope
+    rejection wiped the creator's approved music for everyone, and the
+    creator's own agent then answered that no bgm was bound."""
+    agent_data = _creators_approved_music()
+    nothing = _media({'status': 'completed', 'results': []})
+
+    with _visitor(agent_data, nothing) as tools:
+        answer = json.loads(tools['approve_game_sound']('eng-01', False, 'bgm', 'too jangly'))
+        theirs = json.loads(tools['get_game_sound']('eng-01'))
+    with _agent(agent_data, nothing) as tools:
+        creators = json.loads(tools['get_game_sound']('eng-01'))
+
+    assert answer['scope'] == 'mine' and 'creator' in answer['note']
+    agent_take = agent_data[4242]['games']['eng-01']['sounds']['bgm']
+    assert agent_take['url'] == 'https://node/creators.mp3'
+    assert 'rejected_at' not in agent_take
+    assert (creators['status'], creators['music']['url']) == (
+        'bound', 'https://node/creators.mp3')
+    # the visitor no longer hears the take they turned down
+    assert theirs['status'] == 'unbound'
+    own = agent_data[f'{VISITOR}_4242']['games']['eng-01']['sounds']['bgm']
+    assert own['rejected_reason'] == 'too jangly'
+
+
+def test_a_visitors_next_take_is_theirs_alone():
+    agent_data = _creators_approved_music()
+    media = _media({'status': 'completed',
+                    'results': [{'url': 'https://node/visitors.mp3'}]})
+
+    with _visitor(agent_data, media) as tools:
+        tools['approve_game_sound']('eng-01', False, 'bgm', 'too jangly')
+        bound = json.loads(tools['bind_game_sound']('eng-01', 'calm', 'spelling'))
+        theirs = json.loads(tools['get_game_sound']('eng-01'))
+    with _agent(agent_data, media) as tools:
+        creators = json.loads(tools['get_game_sound']('eng-01'))
+
+    assert bound['status'] == 'bound'
+    assert 'too jangly' in media.generate_media.call_args.kwargs['context']
+    assert (theirs['matched'], theirs['music']['url']) == ('mine', 'https://node/visitors.mp3')
+    assert creators['music']['url'] == 'https://node/creators.mp3'
+    assert agent_data[4242]['games']['eng-01']['sounds']['bgm']['url'] == \
+        'https://node/creators.mp3'
+
+
+def test_a_sound_composed_once_is_replayed_for_everyone():
+    """The owner's second word: what is composed once is reused.  A
+    visitor reaching a state nobody has sounded yet fills the agent's
+    memo, and the creator then hears that take, never a second one."""
+    agent_data = {}
+    media = _media({'status': 'completed',
+                    'results': [{'url': 'https://node/first.mp3'}]})
+
+    with _visitor(agent_data, media) as tools:
+        first = json.loads(tools['bind_game_sound']('eng-01', 'happy', 'spelling'))
+    with _agent(agent_data, media) as tools:
+        again = json.loads(tools['bind_game_sound']('eng-01', 'happy', 'spelling'))
+
+    assert first['status'] == 'bound'
+    assert agent_data[4242]['games']['eng-01']['sounds']['bgm']['url'] == \
+        'https://node/first.mp3'
+    assert again['status'] == 'already_bound'
+    assert media.generate_media.call_count == 1
+
+
+def test_a_visitor_waits_for_the_agents_composition_instead_of_starting_one():
+    agent_data = {4242: {'games': {'eng-01': {'sounds': {'correct': {
+        'task_id': 'acestep_abc', 'task_since': time.time(), 'state': 'correct'}}}}}}
+    media = _media({'status': 'pending', 'task_id': 'acestep_new'},
+                   {'status': 'completed',
+                    'results': [{'url': 'https://node/finished.mp3'}]})
+
+    with _visitor(agent_data, media) as tools, \
+            patch('time.sleep', lambda *_a, **_k: None):
+        answer = json.loads(tools['bind_game_sound']('eng-01', 'happy', 'spelling', 'correct'))
+
+    assert answer['status'] == 'bound'
+    assert not media.generate_media.called, 'composed a second take'
+    assert agent_data[4242]['games']['eng-01']['sounds']['correct']['url'] == \
+        'https://node/finished.mp3'
+    assert not ((agent_data.get(f'{VISITOR}_4242') or {}).get('games') or {}), (
+        "the agent's take landed in the visitor's own store")
+
+
+def test_a_visitor_who_turned_a_take_down_never_takes_over_the_creators_next():
+    """The creator is composing the agent's next take while a visitor, who
+    turned the last one down, asks for theirs: the visitor's take is
+    composed for them, and the creator's composition stays the agent's."""
+    agent_data = {
+        4242: {'games': {'eng-01': {'sounds': {'bgm': {
+            'task_id': 'acestep_agent', 'task_since': time.time(),
+            'rejected_url': 'https://node/creators.mp3', 'variant': 1}}}}},
+        f'{VISITOR}_4242': {'games': {'eng-01': {'sounds': {'bgm': {
+            'rejected_url': 'https://node/creators.mp3', 'rejected_at': 1.0,
+            'rejected_reason': 'too jangly', 'variant': 1}}}}},
+    }
+    media = _media({'status': 'pending', 'task_id': 'acestep_mine'},
+                   {'status': 'completed',
+                    'results': [{'url': 'https://node/visitors.mp3'}]})
+
+    with _visitor(agent_data, media) as tools, \
+            patch('time.sleep', lambda *_a, **_k: None):
+        answer = json.loads(tools['bind_game_sound']('eng-01', 'calm', 'spelling'))
+
+    assert media.generate_media.called, "polled the creator's composition instead"
+    assert answer['music']['url'] == 'https://node/visitors.mp3'
+    assert agent_data[4242]['games']['eng-01']['sounds']['bgm']['task_id'] == 'acestep_agent'
+    assert agent_data[f'{VISITOR}_4242']['games']['eng-01']['sounds']['bgm']['url'] == \
+        'https://node/visitors.mp3'
+
+
+def test_a_visitor_keeping_a_take_approves_it_for_nobody_else():
+    agent_data = {4242: {'games': {'eng-01': {'sounds': {'bgm': {
+        'url': 'https://node/unreviewed.mp3'}}}}}}
+
+    with _visitor(agent_data, _media({'status': 'completed', 'results': []})) as tools:
+        tools['approve_game_sound']('eng-01', True)
+
+    assert 'approved_at' not in agent_data[4242]['games']['eng-01']['sounds']['bgm']
+    own = agent_data[f'{VISITOR}_4242']['games']['eng-01']['sounds']['bgm']
+    assert own['approved_at'] > 0 and own['url'] == 'https://node/unreviewed.mp3'
+
+
+def test_with_no_recorded_creator_nobody_decides_for_everyone(_user_1_built_agent_4242):
+    (_user_1_built_agent_4242 / '4242.json').write_text(json.dumps({'prompt_id': 4242}))
+    agent_data = _creators_approved_music()
+
+    with _agent(agent_data, _media({'status': 'completed', 'results': []})) as tools:
+        answer = json.loads(tools['approve_game_sound']('eng-01', False, 'bgm', 'meh'))
+
+    assert answer['scope'] == 'mine'
+    assert agent_data[4242]['games']['eng-01']['sounds']['bgm']['url'] == \
+        'https://node/creators.mp3'
+
+
+def _answer_card(tmp_path, monkeypatch, approver, decision, seed):
+    """answer_game_sound_card over hartos.helper's real store, in a Flask
+    app context as /api/agent/approval runs it."""
+    from flask import Flask
+    from core import cache_loaders
+    from hartos import helper
+    store = tmp_path / 'agent_data'
+    store.mkdir()
+    monkeypatch.setattr(helper, 'AGENT_DATA_DIR', str(store))
+    monkeypatch.setattr(cache_loaders, 'AGENT_DATA_DIR', str(store))
+    with Flask('test_game_sound_card').app_context():
+        helper.save_agent_data_to_file(4242, {4242: seed})
+        body, code = agent_tools.answer_game_sound_card(
+            '4242', 'game_sound:eng-01:bgm', decision, 'too jangly', approver)
+        agent = {}
+        helper.load_agent_data_from_file(4242, agent)
+        person = {}
+        own_id = agent_tools.person_store_for(approver, 4242) if approver else None
+        if own_id:
+            helper.load_agent_data_from_file(own_id, person)
+    return body, code, agent[4242], (person.get(own_id) or {})
+
+
+def test_the_creators_answer_on_the_card_is_the_agents(tmp_path, monkeypatch):
+    seed = {'games': {'eng-01': {'sounds': {'bgm': {'url': 'https://node/a.mp3'}}}}}
+    body, code, agent, _own = _answer_card(tmp_path, monkeypatch, 'user-1', False, seed)
+    assert (code, body['scope'], body['applied']) == (200, 'agent', True)
+    assert agent['games']['eng-01']['sounds']['bgm']['rejected_url'] == 'https://node/a.mp3'
+
+
+def test_a_visitors_answer_on_the_card_is_theirs_alone(tmp_path, monkeypatch):
+    seed = {'games': {'eng-01': {'sounds': {'bgm': {'url': 'https://node/a.mp3'}}}}}
+    body, code, agent, own = _answer_card(tmp_path, monkeypatch, VISITOR, False, seed)
+    assert (code, body['scope'], body['applied']) == (200, 'mine', True)
+    assert agent['games']['eng-01']['sounds']['bgm']['url'] == 'https://node/a.mp3'
+    assert own['games']['eng-01']['sounds']['bgm']['rejected_url'] == 'https://node/a.mp3'
+
+
+def test_an_unsigned_answer_on_the_card_changes_nothing(tmp_path, monkeypatch):
+    seed = {'games': {'eng-01': {'sounds': {'bgm': {'url': 'https://node/a.mp3'}}}}}
+    body, code, agent, _own = _answer_card(tmp_path, monkeypatch, None, False, seed)
+    assert (code, body['applied']) == (401, False)
+    assert agent['games']['eng-01']['sounds']['bgm']['url'] == 'https://node/a.mp3'
 
 
 def test_the_lenient_tools_refuse_a_state_no_game_has():
