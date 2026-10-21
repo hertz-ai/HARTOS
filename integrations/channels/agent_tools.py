@@ -190,23 +190,17 @@ def build_channel_tool_closures(ctx):
                 )
                 return f"Message broadcast to all connected channels for user {uid}."
 
-            from integrations.channels.registry import get_registry
-            import asyncio
-            registry = get_registry()
-            loop = getattr(registry, '_loop', None)
-
-            if loop and loop.is_running():
-                future = asyncio.run_coroutine_threadsafe(
-                    registry.send_to_channel(channel_type, chat_id, message),
-                    loop,
-                )
-                result = future.result(timeout=30)
-                if result.success:
-                    return f"Message sent to {channel_type}:{chat_id} successfully."
-                else:
-                    return f"Failed to send to {channel_type}: {result.error}"
-            else:
-                return f"Channel adapters not running. Message queued for delivery."
+            # The channel integration owns the adapters' loop; ChannelRegistry
+            # has none (tests/unit/test_channel_loop_owner.py).
+            from integrations.channels.flask_integration import get_channel_integration
+            result = get_channel_integration().send_threadsafe(
+                channel_type, chat_id, message, wait=30)
+            if result is None:
+                return ("Channel adapters are not running, so the message "
+                        "was not sent.")
+            if result.success:
+                return f"Message sent to {channel_type}:{chat_id} successfully."
+            return f"Failed to send to {channel_type}: {result.error}"
 
         except Exception as e:
             logger.error("send_to_channel error: %s", e)
@@ -823,21 +817,13 @@ def build_channel_tool_closures(ctx):
                 f"Reply here if you hit any issue during setup."
             )
 
-            # Dispatch via the registry (re-uses the same plumbing as
-            # send_to_channel) so all channel adapters share one path.
-            from integrations.channels.registry import get_registry
-            import asyncio
-            registry = get_registry()
-            loop = getattr(registry, '_loop', None)
+            # Dispatch through the channel integration, which owns the
+            # adapters' loop (the same plumbing as send_to_channel).
+            from integrations.channels.flask_integration import get_channel_integration
+            result = get_channel_integration().send_threadsafe(
+                channel_type_n, resolved_chat_id, message, wait=30)
 
-            if loop and loop.is_running():
-                future = asyncio.run_coroutine_threadsafe(
-                    registry.send_to_channel(
-                        channel_type_n, resolved_chat_id, message,
-                    ),
-                    loop,
-                )
-                result = future.result(timeout=30)
+            if result is not None:
                 if getattr(result, 'success', False):
                     msg_id = (
                         getattr(result, 'message_id', None)
