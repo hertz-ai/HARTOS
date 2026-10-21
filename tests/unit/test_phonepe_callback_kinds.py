@@ -83,12 +83,20 @@ def test_agent_payment_without_kind_completes(ctx):
     assert ctx['ledger'].get_payment(p.payment_id).status == PaymentStatus.COMPLETED
 
 
-def test_order_step_failure_still_completes_the_payment(ctx):
+def test_order_step_failure_still_completes_the_payment_and_tells_the_shopper(ctx):
+    # The money is taken: the shopper and the owner are told through the one
+    # hold rule (commerce_tools.hold_paid_order), and PhonePe is answered 200
+    # so it does not redeliver into the same failure.
     p = _processing(ctx['ledger'], {'kind': 'commerce_checkout'})
     with patch('integrations.commerce.commerce_tools.complete_redirect_checkout',
-               side_effect=RuntimeError('mcgroce down')):
+               side_effect=RuntimeError('mcgroce down')), \
+            patch('integrations.commerce.commerce_tools.hold_paid_order',
+                  return_value={'held': True, 'owner_told': True}) as hold:
         r = _callback(ctx['client'])
-    assert r.status_code == 200 and r.get_json()['order'] is None
+    assert r.status_code == 200 and r.get_json()['status'] == 'completed'
+    assert r.get_json()['order'] == {'held': True, 'owner_told': True}
+    hold.assert_called_once()
+    assert hold.call_args.args[0] == p.payment_id
     assert ctx['ledger'].get_payment(p.payment_id).status == PaymentStatus.COMPLETED
 
 
@@ -263,6 +271,8 @@ def test_a_different_amount_is_kept_as_money_taken_and_the_shopper_told(ctx):
         r = _callback(ctx['client'])
     assert r.get_json()['status'] == 'amount_mismatch'
     assert hold.call_args.args[0] == p.payment_id
+    # The figure PhonePe took reaches the shopper's sentence, in rupees.
+    assert hold.call_args.kwargs['received'] == Decimal('1')      # 100 paise
     reloaded = PaymentLedger(ledger_path=ctx['ledger'].ledger_path)
     saved = reloaded.get_payment(p.payment_id)
     assert saved.status == PaymentStatus.FAILED and saved.metadata[MONEY_TAKEN] is True

@@ -1531,9 +1531,15 @@ def phonepe_callback():
             payment_ledger.save_ledger()
             if (payment_req.metadata or {}).get('kind') == 'commerce_checkout':
                 try:
+                    from decimal import Decimal as _Decimal
                     from integrations.commerce.commerce_tools import hold_paid_order
+                    # What PhonePe took, in rupees, so the shopper reads the
+                    # real figures (commerce_tools.order_on_hold); None when
+                    # its figure could not be read.
                     hold_paid_order(payment_req.payment_id,
-                                    'PhonePe took a different amount than was asked')
+                                    'PhonePe took a different amount than was asked',
+                                    received=(_Decimal(_paid) / 100
+                                              if _paid is not None else None))
                 except Exception:
                     logger.exception(f"PhonePe callback: could not tell the shopper "
                                      f"about {payment_req.payment_id}")
@@ -1580,6 +1586,18 @@ def phonepe_callback():
                     "MANUAL RECONCILIATION NEEDED: PhonePe payment "
                     f"{payment_req.payment_id} captured but the commerce "
                     "order step raised")
+                # The money is taken: the shopper and this node's owner are
+                # told through the one hold rule, from the payment's own
+                # record, and PhonePe is still answered 200 (a 5xx would only
+                # redeliver into the same failure); commerce_checkout places
+                # the order later with no new charge.
+                try:
+                    from integrations.commerce.commerce_tools import hold_paid_order
+                    order = hold_paid_order(payment_req.payment_id,
+                                            'the commerce order step raised')
+                except Exception:
+                    logger.exception(f"PhonePe callback: could not tell the shopper "
+                                     f"about {payment_req.payment_id}")
         return jsonify({
             'success': True,
             'status': 'completed',

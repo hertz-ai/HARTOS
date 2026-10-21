@@ -299,18 +299,14 @@ class MandateStore:
         return p.status if p is not None else None
 
     def _money_taken(self, payment_id: str) -> bool:
-        """The gateway took money for this payment: it COMPLETED, or it is
-        FAILED only because the amount taken was not the one asked."""
-        from integrations.ap2.ap2_protocol import MONEY_TAKEN, PaymentStatus
+        """The gateway took money for this payment (ap2_protocol.money_taken,
+        the one reading)."""
+        from integrations.ap2.ap2_protocol import money_taken
         try:
             p = self.ledger.get_payment(payment_id)
         except Exception:
             return False
-        if p is None:
-            return False
-        return p.status == PaymentStatus.COMPLETED or (
-            p.status == PaymentStatus.FAILED
-            and bool((p.metadata or {}).get(MONEY_TAKEN)))
+        return money_taken(p)
 
     def _money_in_flight(self, payment_id: str) -> bool:
         from integrations.ap2.ap2_protocol import PaymentStatus

@@ -109,6 +109,19 @@ REDIRECT_GATEWAYS = frozenset({PaymentGateway.PHONEPE})
 MONEY_TAKEN = 'money_taken'
 
 
+def money_taken(payment) -> bool:
+    """The gateway took money for ``payment``: it COMPLETED, or it is FAILED
+    only because the amount taken was not the one asked (MONEY_TAKEN).  The
+    ONE reading of "was this paid": the mandate store's predicates read it,
+    and so does the commerce order step when it must decide, without the
+    store, whether a shopper's money moved."""
+    if payment is None:
+        return False
+    return payment.status == PaymentStatus.COMPLETED or (
+        payment.status == PaymentStatus.FAILED
+        and bool((payment.metadata or {}).get(MONEY_TAKEN)))
+
+
 def mock_settlement_allowed(user=None) -> bool:
     """May a payment the ledger routed to the MockPaymentGateway settle for
     this caller?  The ONE rule for every settlement path.

@@ -9,12 +9,14 @@ gateway keys; the node WITHOUT one, where select_gateway answers MOCK, is
 TestNoLiveGateway.
 """
 import base64
+import contextlib
 import hashlib
 import hmac
 import inspect
 import json
 import logging
 import time
+from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -107,9 +109,13 @@ def attestation_of(call):
     return json.loads(base64.urlsafe_b64decode(b64 + '=' * (-len(b64) % 4)))
 
 
+OWNER = '10202'          # this computer's owner, who hears about held payments
+
+
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     monkeypatch.setenv('COMMERCE_SESSION_SECRET', SECRET)
+    monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', OWNER)
     bindings = CommerceBindings(str(tmp_path / 'bindings.json'))
     bindings.upsert(4242, 'asha@example.com', 'customer', store_id=7)
     bindings.upsert(77, 'owner@shop.in', 'merchant', store_id=9)
@@ -136,9 +142,17 @@ def env(tmp_path, monkeypatch):
                'drafts': drafts, 'bindings': bindings, 'card': card}
 
 
-def pushed(env, type_=None):
-    comps = [c.args[1] for c in env['ui'].call_args_list]
+def pushed(env, type_=None, to=None):
+    """Cards pushed so far, by type and by recipient (``to``; the shopper's
+    when None, so the owner's cards never pass as the shopper's notice)."""
+    want = OWNER if to == OWNER else None
+    comps = [c.args[1] for c in env['ui'].call_args_list
+             if (c.kwargs.get('user_id') == OWNER) == (want == OWNER)]
     return [c for c in comps if type_ is None or c['type'] == type_]
+
+
+def owner_cards(env):
+    return pushed(env, to=OWNER)
 
 
 class TestRegistration:
@@ -1034,6 +1048,140 @@ class TestRedirectGatewayCheckout:
         ct.commerce_checkout(UID, out['mandate_id'])
         res = ct.complete_redirect_checkout(out['payment_id'])
         assert res == {'success': False, 'error': 'payment is not completed'}
+
+
+class TestHeldPayments:
+    """ONE hold rule for every payment whose money is taken and whose order is
+    not placed: the shopper reads the real amounts and never "nothing was
+    charged", this computer's owner gets a card naming what a person must do,
+    and the sentence promises follow-up only when that card was published."""
+
+    PAID = ('Your payment of ₹240.00 arrived, but your order is not placed yet, '
+            'so it is on hold. Nothing more will be charged; we will sort it out '
+            'with you.')
+
+    def _paid_on_phonepe(self, env):
+        env['ledger'].gateways[ap2_protocol.PaymentGateway.PHONEPE] = _PhonePeDouble()
+        env['fake'].on('GET', '/cart', body=ORDER)
+        out = json.loads(ct.commerce_prepare_checkout(UID))
+        env['mandates'].approve(out['mandate_id'], UID)
+        ct.commerce_checkout(UID, out['mandate_id'])           # redirect: PROCESSING
+        env['ledger'].get_payment(out['payment_id']).update_status(PaymentStatus.COMPLETED)
+        return out
+
+    @contextlib.contextmanager
+    def _pause(self, env):
+        """A worker whose mandate key cannot be read (no cached key)."""
+        from integrations.ap2.ap2_mandate import MandateKeyError
+        worker = MandateStore(env['mandates'].path, ledger=env['ledger'])
+        with patch.object(ct, '_mandates', return_value=worker), \
+                patch('integrations.ap2.ap2_mandate._load_or_create_key',
+                      side_effect=MandateKeyError()):
+            yield worker
+
+    def test_a_paid_shopper_under_the_key_pause_is_told_on_hold_not_nothing_charged(self, env):
+        out = self._paid_on_phonepe(env)
+        with self._pause(env):
+            res = json.loads(ct.commerce_checkout(UID, out['mandate_id']))
+        assert res['success'] is False and res['needs_attention'] is True
+        assert 'on hold' in res['error'] and 'nothing was charged' not in res['error']
+        assert env['ledger'].get_payment(out['payment_id']).status == PaymentStatus.COMPLETED
+        note = pushed(env, 'notification')[-1]
+        assert note['title'] == ct.HOLD_TITLE and note['message'] == self.PAID
+        (card,) = owner_cards(env)
+        assert out['payment_id'] in card['message'] and UID in card['message']
+        assert 'refund it from your PhonePe merchant account' in card['message']
+
+    def test_the_callback_under_the_key_pause_holds_and_tells_instead_of_raising(self, env):
+        out = self._paid_on_phonepe(env)
+        with self._pause(env):
+            res = ct.complete_redirect_checkout(out['payment_id'])
+        assert res['held'] is True and res['needs_attention'] is True
+        assert 'on hold' in res['error'] and 'nothing was charged' not in res['error']
+        assert pushed(env, 'notification')[-1]['message'] == self.PAID
+        assert len(owner_cards(env)) == 1
+        assert env['mandates'].get(out['mandate_id']).status == 'approved'  # not used up yet
+        # Once the key reads again, the retry places the order, no new charge.
+        env['fake'].on('POST', AP2, body={'orderNumber': 'ORD-LATER'})
+        later = json.loads(ct.commerce_checkout(UID, out['mandate_id']))
+        assert later['success'] is True and later['order_id'] == 'ORD-LATER'
+        assert len(env['ledger'].payments) == 1
+
+    def test_a_consumed_unordered_retry_under_the_key_pause_is_told_on_hold(self, env):
+        out = self._paid_on_phonepe(env)
+        env['fake'].on('GET', '/cart', status=503, body=None)
+        ct.complete_redirect_checkout(out['payment_id'])         # used up, held
+        env['fake'].on('GET', '/cart', body=ORDER)
+        env['fake'].on('POST', AP2, body={'orderNumber': 'ORD-1'})
+        with self._pause(env):
+            res = json.loads(ct.commerce_checkout(UID, out['mandate_id']))
+        assert res['success'] is False and 'on hold' in res['error']
+        assert 'nothing was charged' not in res['error']
+        assert not env['fake'].called('POST', AP2)
+        assert pushed(env, 'notification')[-1]['message'] == self.PAID
+
+    def test_an_unpaid_shopper_under_the_key_pause_still_hears_nothing_was_charged(self, env):
+        from integrations.ap2.ap2_mandate import PAYMENTS_PAUSED
+        env['fake'].on('GET', '/cart', body=ORDER)
+        out = json.loads(ct.commerce_prepare_checkout(UID))
+        env['mandates'].approve(out['mandate_id'], UID)          # AUTHORIZED, nothing taken
+        with self._pause(env):
+            res = json.loads(ct.commerce_checkout(UID, out['mandate_id']))
+        assert res == {'success': False, 'error': PAYMENTS_PAUSED}
+        assert pushed(env, 'notification') == [] and owner_cards(env) == []
+
+    def test_a_different_amount_names_both_figures(self, env):
+        from integrations.ap2.ap2_protocol import MONEY_TAKEN
+        out = self._paid_on_phonepe(env)
+        p = env['ledger'].get_payment(out['payment_id'])
+        p.update_status(PaymentStatus.FAILED, 'amount mismatch')
+        p.metadata = {**p.metadata, MONEY_TAKEN: True}
+        held = ct.hold_paid_order(out['payment_id'], 'PhonePe took a different amount',
+                                  received=Decimal('100'))
+        assert held['held'] is True and held['owner_told'] is True
+        assert pushed(env, 'notification')[-1]['message'] == (
+            'We received ₹100.00 but your order comes to ₹240.00, so your order is '
+            'on hold. Nothing more will be charged; we will sort it out with you.')
+        (card,) = owner_cards(env)
+        assert '₹100.00' in card['message'] and '₹240.00' in card['message']
+        assert 'nothing is refunded automatically' in card['message']
+        # With no figure from the gateway, the ledger still says another
+        # amount was taken: the shopper is not told their full payment arrived.
+        ct.hold_paid_order(out['payment_id'], 'PhonePe took a different amount')
+        assert pushed(env, 'notification')[-1]['message'].startswith(
+            "We received a different amount from your order's ₹240.00, so your "
+            'order is on hold.')
+
+    def test_without_an_owner_told_the_sentence_names_the_next_step(self, env, monkeypatch):
+        out = self._paid_on_phonepe(env)
+        env['fake'].on('GET', '/cart', status=503, body=None)
+        monkeypatch.delenv('HEVOLVE_OWNER_USER_ID')
+        ct.complete_redirect_checkout(out['payment_id'])
+        assert pushed(env, 'notification')[-1]['message'].endswith(
+            'Nothing more will be charged; reply here or contact the shop.')
+        assert owner_cards(env) == []
+        # An owner is set but the card was not published: the same honest ending.
+        monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', OWNER)
+        env['ui'].side_effect = lambda agent_id, component, user_id=None: user_id != OWNER
+        held = ct.hold_paid_order(out['payment_id'], 'McGroce is down')
+        assert held['owner_told'] is False
+        assert pushed(env, 'notification')[-1]['message'].endswith(
+            'reply here or contact the shop.')
+
+    def test_a_changed_cart_keeps_its_recovery_in_the_sentence(self, env):
+        out = self._paid_on_phonepe(env)
+        drifted = json.loads(json.dumps(ORDER))
+        drifted['orderItems'].pop()
+        env['fake'].on('GET', '/cart', body=drifted)
+        ct.complete_redirect_checkout(out['payment_id'])
+        note = pushed(env, 'notification')[-1]
+        assert note['message'] == (
+            'Your payment of ₹240.00 arrived, but your order is not placed yet, so '
+            'it is on hold. Your cart changed while you were paying: put the cart '
+            'back the way you approved it and ask your agent to check out, and it '
+            'is placed with this payment, with no new charge. Nothing more will be '
+            'charged; we will sort it out with you.')
+        assert len(owner_cards(env)) == 1
 
 
 class TestNoLiveGateway:
