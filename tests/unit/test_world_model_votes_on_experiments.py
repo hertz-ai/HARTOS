@@ -746,3 +746,65 @@ def test_the_world_models_own_abstention_is_not_logged_as_a_refusal(db, caplog):
             ThoughtExperimentService.cast_world_model_votes(db, bridge=bridge)
     assert len(bridge.calls) == 3
     assert not [r for r in caplog.records if 'cannot score' in r.getMessage()]
+
+
+# --- review of fe854f009 ------------------------------------------------------
+
+def test_a_closed_experiment_leaves_no_per_experiment_state(db):
+    """what: an experiment refused, then closed; expected: its attempt count
+    and its last logged reason are dropped on the next round."""
+    e = _experiment(db)
+    ThoughtExperimentService.cast_world_model_votes(
+        db, bridge=_Bridge({'vote': 0, 'refused': True, 'reason': 'screened'}))
+    assert e.id in tes._WORLD_MODEL_ATTEMPTS and e.id in tes._WORLD_MODEL_REFUSAL_LOGGED
+    e.status = 'evaluating'
+    db.commit()
+    ThoughtExperimentService.cast_world_model_votes(db, bridge=_Bridge(None))
+    assert e.id not in tes._WORLD_MODEL_ATTEMPTS
+    assert e.id not in tes._WORLD_MODEL_REFUSAL_LOGGED
+
+
+def test_a_refusal_is_logged_when_its_reason_changes(db, caplog):
+    """what: reasons A, B, B over three rounds; expected: two lines (each
+    change), not three; a newline in a reason cannot forge a line."""
+    import logging
+    _experiment(db)
+    reasons = iter(['A', 'B\nINFO forged', 'B\nINFO forged'])
+    bridge = _Bridge(lambda kw: {'vote': 0, 'refused': True, 'reason': next(reasons)})
+    with caplog.at_level(logging.INFO):
+        for _ in range(3):
+            ThoughtExperimentService.cast_world_model_votes(db, bridge=bridge)
+    lines = [r.getMessage() for r in caplog.records if 'cannot score' in r.getMessage()]
+    assert len(lines) == 2
+    assert all('\n' not in ln for ln in lines)
+
+
+def test_a_422_detail_is_bounded_and_a_400_is_not_a_refusal(offline, monkeypatch):
+    b = offline()
+    _post_recorder(monkeypatch, _Resp(422, {'detail': 'y' * 500}))
+    out = b.score_claim(context='h', outcome='o', timestamp=1.0, creator_id='u1')
+    assert out['reason'] == 'http_422: ' + 'y' * 200
+    _post_recorder(monkeypatch, _Resp(400, {'detail': 'not this route'}))
+    assert b.score_claim(context='h', outcome='o', timestamp=1.0, creator_id='u1') is None
+
+
+def test_an_outcome_blank_once_cut_is_refused_without_a_call(offline, monkeypatch):
+    b = offline()
+    posts = _post_recorder(monkeypatch, _Resp(200, {'vote': 1, 'confidence': 0.5}))
+    out = b.score_claim(context='h', outcome=' ' * 2001 + 'latency falls',
+                        timestamp=1.0, creator_id='u1')
+    assert out['reason'] == 'blank' and posts == []
+
+
+def test_a_422_without_a_reason_is_warned_once(offline, monkeypatch, caplog):
+    """what: the route's contract changed (FastAPI's validation 422); expected:
+    None every time, and ONE warning per process saying why nothing votes."""
+    import logging
+    from integrations.agent_engine import world_model_bridge
+    monkeypatch.setattr(world_model_bridge, '_WARNED_422_CONTRACT', False)
+    b = offline()
+    _post_recorder(monkeypatch, _Resp(422, {'detail': [{'msg': 'field required'}]}))
+    with caplog.at_level(logging.WARNING):
+        for _ in range(3):
+            assert b.score_claim(context='h', outcome='o', timestamp=1.0, creator_id='u1') is None
+    assert len([r for r in caplog.records if 'contract' in r.getMessage()]) == 1

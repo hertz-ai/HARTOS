@@ -52,9 +52,10 @@ WORLD_MODEL_VOTER_SETTINGS = {WORLD_MODEL_MARKER: True, 'dispatchable': False}
 # behind fresh ones instead of blocking them for ever.
 _WORLD_MODEL_ATTEMPTS: Dict[str, int] = {}
 # Per-process: the refusal reason last logged for each open experiment, so a
-# refusal is logged once per experiment and reason, whatever attempts came
-# before it (review of 7fa1d4aba: logging on the first attempt only never
-# logged a refusal that followed a busy reply).
+# refusal is logged when an experiment's reason CHANGES (an alternating
+# reason logs each change), whatever attempts came before it (review of
+# 7fa1d4aba: logging on the first attempt only never logged a refusal that
+# followed a busy reply).
 _WORLD_MODEL_REFUSAL_LOGGED: Dict[str, str] = {}
 
 
@@ -326,8 +327,8 @@ class ThoughtExperimentService:
         its first such reply, so a down world model costs one call per round,
         not one per experiment.  A claim it cannot score (refused by the
         screen, no cloud consent, blank as sent, the route's 422) is an
-        abstention like any other: counted, logged once per experiment and
-        reason in this process, and the round goes on.
+        abstention like any other: counted, logged when the experiment's
+        reason changes (in this process), and the round goes on.
         TIME: the claim is scored at the experiment's created_at read as UTC
         epoch seconds (SQLite's func.now() is UTC and stored naive; on MySQL
         func.now() is the server's local time, so a central node scores at
@@ -361,10 +362,9 @@ class ThoughtExperimentService:
         open_rows = [e for e in ThoughtExperimentService._open_agent_votable(db, query)
                      if (e.expected_outcome or '').strip()]
         live = {e.id for e in open_rows}
-        for stale in [k for k in _WORLD_MODEL_ATTEMPTS if k not in live]:
-            _WORLD_MODEL_ATTEMPTS.pop(stale, None)
-        for stale in [k for k in _WORLD_MODEL_REFUSAL_LOGGED if k not in live]:
-            _WORLD_MODEL_REFUSAL_LOGGED.pop(stale, None)
+        for per_experiment in (_WORLD_MODEL_ATTEMPTS, _WORLD_MODEL_REFUSAL_LOGGED):
+            for stale in [k for k in per_experiment if k not in live]:
+                per_experiment.pop(stale, None)
         rows = list(open_rows)
         rows.sort(key=lambda e: (_WORLD_MODEL_ATTEMPTS.get(e.id, 0),
                                  e.created_at or datetime.min))
@@ -397,7 +397,9 @@ class ThoughtExperimentService:
                 reason = str(score.get('reason'))
                 if _WORLD_MODEL_REFUSAL_LOGGED.get(exp.id) != reason:
                     _WORLD_MODEL_REFUSAL_LOGGED[exp.id] = reason
-                    logger.info("world model cannot score experiment %s: %s",
+                    # %r: a reason can carry a world model's text (a 422
+                    # detail), and a newline in it must not forge a log line
+                    logger.info("world model cannot score experiment %s: %r",
                                 exp.id, reason)
             if score is None:
                 break

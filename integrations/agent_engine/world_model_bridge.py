@@ -753,7 +753,7 @@ class WorldModelBridge:
         """score_claim's answer for a claim that cannot be scored: an
         abstention (vote 0) naming why, so the caller moves on to the next
         claim instead of waiting on a world model that is up.  The caller
-        logs it (once per experiment)."""
+        logs it when an experiment's reason changes."""
         return {'vote': 0, 'refused': True, 'reason': reason}
 
     def score_claim(self, context: str, outcome: str, timestamp: float,
@@ -825,6 +825,16 @@ class WorldModelBridge:
                 detail = None
             if isinstance(detail, str):
                 return self._refused_claim(f'http_422: {detail[:200]}')
+            # A 422 that is not the route refusing a claim (FastAPI's request
+            # validation, or no reason at all): the route's contract changed,
+            # and the world model will not vote until someone looks, so say
+            # it once per process.
+            global _WARNED_422_CONTRACT
+            if not _WARNED_422_CONTRACT:
+                _WARNED_422_CONTRACT = True
+                logger.warning("[WorldModelBridge] /v1/world_model/score answered "
+                               "422 without a reason (detail %r): its contract "
+                               "changed; no claim will be scored", detail)
             return None
         if resp.status_code != 200:
             return None
@@ -2988,6 +2998,10 @@ def _accepts_kwarg(fn, name: str) -> bool:
         return False
     return name in params or any(
         p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+# score_claim's one-per-process warning for a 422 that carries no reason.
+_WARNED_422_CONTRACT = False
 
 
 def _unit_confidence(value) -> float:
