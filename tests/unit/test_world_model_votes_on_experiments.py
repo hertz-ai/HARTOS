@@ -262,7 +262,7 @@ def test_a_cloud_world_model_scores_only_with_the_creators_consent(offline, monk
     monkeypatch.setattr(b, '_has_cloud_consent', lambda uid: False)
     posts = _post_recorder(monkeypatch, _Resp(200, {'vote': 1}))
     out = b.score_claim(context='h', outcome='o', timestamp=1.0, creator_id='u1')
-    assert out == {'vote': 0, 'refused': 'no_cloud_consent'}
+    assert out == {'vote': 0, 'refused': True, 'reason': 'no_cloud_consent'}
     assert posts == []
 
 
@@ -591,7 +591,7 @@ def test_a_claim_that_cannot_be_scored_never_holds_up_the_round(db):
 
     def _reply(kw):
         if kw['context'] in no:
-            return {'vote': 0, 'refused': no[kw['context']]}
+            return {'vote': 0, 'refused': True, 'reason': no[kw['context']]}
         return {'vote': 1, 'confidence': 0.5}
     bridge = _Bridge(_reply)
     assert ThoughtExperimentService.cast_world_model_votes(db, bridge=bridge, limit=4) == 1
@@ -601,20 +601,81 @@ def test_a_claim_that_cannot_be_scored_never_holds_up_the_round(db):
 
 def test_the_bridge_says_why_a_claim_was_not_scored(offline, monkeypatch):
     """what: the bridge's two kinds of no-answer; expected: a claim it
-    cannot score (screened text, a 4xx) abstains with its reason; a world
-    model that cannot answer now (503, 5xx, network) is None."""
+    cannot score (screened text, a 422, the route's only refusal of a
+    claim) abstains with its reason; a world model that cannot answer now
+    is None: 503, 5xx, network, and every other 4xx (404 from a build
+    without the route, 429 from a rate limiter, 401/403 from an auth
+    layer), so a misconfigured world model costs one call per round."""
     import requests
     b = offline()
     monkeypatch.setattr(b, '_screened_text', lambda text: None)
     posts = _post_recorder(monkeypatch, _Resp(200, {'vote': 1}))
-    assert b.score_claim(context='h', outcome='o', timestamp=1.0,
-                         creator_id='u1') == {'vote': 0, 'refused': 'screened'}
+    assert b.score_claim(context='h', outcome='o', timestamp=1.0, creator_id='u1') == {
+        'vote': 0, 'refused': True, 'reason': 'screened'}
     assert posts == []
     b = offline()
-    for status in (400, 422):
-        _post_recorder(monkeypatch, _Resp(status))
-        assert b.score_claim(context='h', outcome='o', timestamp=1.0,
-                             creator_id='u1') == {'vote': 0, 'refused': f'http_{status}'}
-    for reply in (_Resp(503), _Resp(500), requests.ConnectionError('down')):
+    _post_recorder(monkeypatch, _Resp(422))
+    assert b.score_claim(context='h', outcome='o', timestamp=1.0, creator_id='u1') == {
+        'vote': 0, 'refused': True, 'reason': 'http_422'}
+    for reply in (_Resp(503), _Resp(500), _Resp(404), _Resp(429), _Resp(401),
+                  _Resp(403), _Resp(400), requests.ConnectionError('down')):
         _post_recorder(monkeypatch, reply)
         assert b.score_claim(context='h', outcome='o', timestamp=1.0, creator_id='u1') is None
+
+
+# --- review of 8014c0e4e ------------------------------------------------------
+
+def test_a_claim_the_route_refuses_never_holds_up_the_round_end_to_end(db, offline, monkeypatch):
+    """what: the REAL bridge in a round; the oldest claim answers 422 (the
+    route refuses it), two newer ones are scored; expected: the round goes
+    on past the refusal and both newer claims are voted (4c4ba922f ended
+    the round at the 422 and voted none)."""
+    from integrations.agent_engine import world_model_bridge
+    bad = _experiment(db)
+    good = [_experiment(db, created=CREATED + dt.timedelta(minutes=i + 1)) for i in range(2)]
+    b = offline()
+
+    def _post(url, json=None, timeout=None, **kw):
+        if json['context'] == bad.hypothesis:
+            return _Resp(422)
+        return _Resp(200, {'vote': 1, 'confidence': 0.5})
+    monkeypatch.setattr(world_model_bridge, 'pooled_post', _post)
+    assert ThoughtExperimentService.cast_world_model_votes(db, bridge=b) == 2
+    assert all(len(_votes(db, e)) == 1 for e in good) and _votes(db, bad) == []
+
+
+def test_a_world_model_without_the_route_costs_one_call_per_round(db, offline, monkeypatch):
+    """what: a world model whose build has no score route (404, as the
+    installed Aug-29 build answers) or that rate-limits (429); expected: one
+    call per round, nothing cast, as for any world model that cannot answer."""
+    for status in (404, 429):
+        for i in range(3):
+            _experiment(db, created=CREATED + dt.timedelta(minutes=i))
+        posts = _post_recorder(monkeypatch, _Resp(status))
+        assert ThoughtExperimentService.cast_world_model_votes(db, bridge=offline()) == 0
+        assert len(posts) == 1
+
+
+def test_a_refused_claim_is_logged_once_not_every_round(db, caplog):
+    """what: a claim the world model keeps refusing, over several rounds;
+    expected: one log line naming the experiment and why, not one a round."""
+    import logging
+    e = _experiment(db)
+    bridge = _Bridge({'vote': 0, 'refused': True, 'reason': 'no_cloud_consent'})
+    with caplog.at_level(logging.INFO, logger=tes.logger.name):
+        for _ in range(4):
+            ThoughtExperimentService.cast_world_model_votes(db, bridge=bridge)
+    lines = [r for r in caplog.records if 'cannot score' in r.getMessage()]
+    assert len(bridge.calls) == 4
+    assert len(lines) == 1 and e.id in lines[0].getMessage()
+    assert 'no_cloud_consent' in lines[0].getMessage()
+
+
+def test_a_blank_hypothesis_is_not_scored(db):
+    """what: a hypothesis of only whitespace (the API accepts it); expected:
+    not scored (in-process the provider would score an empty claim)."""
+    _experiment(db, hypothesis=' \t\n\u3000 ')
+    real = _experiment(db, created=CREATED + dt.timedelta(minutes=5))
+    bridge = _Bridge({'vote': 1, 'confidence': 0.5})
+    assert ThoughtExperimentService.cast_world_model_votes(db, bridge=bridge, limit=1) == 1
+    assert [c['context'] for c in bridge.calls] == [real.hypothesis]

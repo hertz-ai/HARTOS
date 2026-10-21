@@ -751,10 +751,10 @@ class WorldModelBridge:
     @staticmethod
     def _refused_claim(reason: str) -> dict:
         """score_claim's answer for a claim that cannot be scored: an
-        abstention (vote 0) naming why, logged, so the caller moves on to
-        the next claim instead of waiting on a world model that is up."""
-        logger.info("[WorldModelBridge] claim not scored: %s", reason)
-        return {'vote': 0, 'refused': reason}
+        abstention (vote 0) naming why, so the caller moves on to the next
+        claim instead of waiting on a world model that is up.  The caller
+        logs it (once per experiment)."""
+        return {'vote': 0, 'refused': True, 'reason': reason}
 
     def score_claim(self, context: str, outcome: str, timestamp: float,
                     creator_id: str) -> Optional[dict]:
@@ -763,14 +763,17 @@ class WorldModelBridge:
         learning it: POST /v1/world_model/score. Returns its reply ({vote,
         confidence, error, typical_error, log_surprise, ...}); or, for a
         claim that cannot be scored, an abstention naming why, {'vote': 0,
-        'refused': reason}: a text the constitutional filter refuses
+        'refused': True, 'reason': why} (hevolveai's own abstentions carry
+        'reason' too): a text the constitutional filter refuses
         ('screened'), a non-local world model without the creator's cloud
         data consent ('no_cloud_consent'; the decide feed's rules for the
-        same texts, ingest_decided_experiment), or a 4xx reply ('http_<code>',
-        the route refusing the claim itself); or None when the WORLD MODEL
-        cannot answer now (503 while a learn holds the learner, 5xx, a
-        network failure, a reply that is not JSON, the breaker open), so the
-        caller stops asking until later.  `timestamp` is the
+        same texts, ingest_decided_experiment), or a 422 ('http_422', the
+        route's only refusal of a claim itself: blank text, a bad timestamp);
+        or None when the WORLD MODEL cannot answer now (503 while a learn
+        holds the learner, any other 4xx such as 404 from a build without
+        the route or 429 from a rate limiter, 5xx, a network failure, a
+        reply that is not JSON, the breaker open), so the caller stops
+        asking until later.  `timestamp` is the
         experiment's own time in UTC epoch seconds, so the vote does not
         change with the hour. reality_grounded matches how the decide feed's
         ingest learns a claim (stream source 'thought_experiment' -> 1.0);
@@ -806,8 +809,8 @@ class WorldModelBridge:
         except requests.RequestException as e:
             logger.info("[WorldModelBridge] score unavailable: %s", e)
             return None
-        if 400 <= resp.status_code < 500:
-            return self._refused_claim(f'http_{resp.status_code}')
+        if resp.status_code == 422:
+            return self._refused_claim('http_422')
         if resp.status_code != 200:
             return None
         try:

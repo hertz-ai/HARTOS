@@ -308,7 +308,9 @@ class ThoughtExperimentService:
         caller commits, so a score (an HTTP call of seconds) after a write
         held every other writer off (the outage class models.after_commit
         documents; measured 'database is locked' after 3.36 s).
-        NO HEAD-OF-LINE BLOCK: blank expected outcomes are filtered in SQL;
+        NO HEAD-OF-LINE BLOCK: a blank expected outcome or hypothesis is
+        filtered (SQL first, then Python's str.strip(), since TRIM strips
+        only ASCII spaces);
         an experiment whose context refuses agent votes is never scored; and
         candidates are taken least-attempted first, so one that keeps
         abstaining sinks behind fresh ones.
@@ -316,8 +318,8 @@ class ThoughtExperimentService:
         busy, unreachable, a 5xx, a reply that is not JSON) ends the round at
         its first such reply, so a down world model costs one call per round,
         not one per experiment.  A claim it cannot score (refused by the
-        screen, no cloud consent, a 4xx) is an abstention like any other:
-        counted, and the round goes on.
+        screen, no cloud consent, a 422) is an abstention like any other:
+        counted, logged once per experiment, and the round goes on.
         TIME: the claim is scored at the experiment's created_at read as UTC
         epoch seconds (SQLite's func.now() is UTC and stored naive; on MySQL
         func.now() is the server's local time, so a central node scores at
@@ -350,7 +352,8 @@ class ThoughtExperimentService:
             query = query.filter(~ThoughtExperiment.id.in_(voted))
         # The SQL TRIM strips only ASCII spaces; an outcome of tabs, newlines
         # or U+3000 is just as blank (review of 4c4ba922f).
-        open_rows = [e for e in query.all() if (e.expected_outcome or '').strip()]
+        open_rows = [e for e in query.all()
+                     if (e.expected_outcome or '').strip() and (e.hypothesis or '').strip()]
         live = {e.id for e in open_rows}
         for stale in [k for k in _WORLD_MODEL_ATTEMPTS if k not in live]:
             _WORLD_MODEL_ATTEMPTS.pop(stale, None)
@@ -383,6 +386,10 @@ class ThoughtExperimentService:
                 scored.append((exp, score, float(conf)))
                 continue
             _WORLD_MODEL_ATTEMPTS[exp.id] = _WORLD_MODEL_ATTEMPTS.get(exp.id, 0) + 1
+            if isinstance(score, dict) and score.get('refused') and (
+                    _WORLD_MODEL_ATTEMPTS[exp.id] == 1):
+                logger.info("world model cannot score experiment %s: %s",
+                            exp.id, score.get('reason'))
             if score is None:
                 break
         if not scored:
