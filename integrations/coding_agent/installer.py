@@ -19,6 +19,7 @@ import shutil
 import sys
 from typing import Dict, List, Optional
 
+from core.node_bin import find_node, find_npm
 from core.subprocess_safe import run_bounded
 
 logger = logging.getLogger('hevolve.coding_agent')
@@ -87,8 +88,8 @@ def launch_argv(cmd: List[str]) -> List[str]:
         target = os.path.join(shim_dir, match.group(1))
         if target.lower().endswith('.exe'):
             return [target] + args
-        local_node = os.path.join(shim_dir, 'node.exe')
-        node = local_node if os.path.isfile(local_node) else shutil.which('node')
+        # The node.exe npm put beside the shim, else PATH's (core.node_bin).
+        node = find_node(beside=shim_dir)
         if node:
             return [node, target] + args
     if any(_CMD_UNSAFE & set(a) for a in args):
@@ -155,7 +156,7 @@ def install(tool_name: str) -> Dict:
         }
 
     # Check npm availability
-    if not shutil.which('npm'):
+    if not find_npm():
         return {
             'success': False,
             'error': 'npm not found. Install Node.js first: https://nodejs.org/',

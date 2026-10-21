@@ -46,6 +46,7 @@ import pytest
 
 flask = pytest.importorskip('flask')
 
+from core.config_cache import flag_value as _flag_value  # noqa: E402
 from core.constants import canonical_served_by as _canonical_served_by  # noqa: E402
 
 _SRC = os.environ.get('HARTOS_ENTRY_SOURCE') or str(
@@ -138,6 +139,11 @@ def _drive(tmp_path, gather_reply, *, turn_before=0, first_turn_cloud=None,
         'request': flask.request, 'g': flask.g, 'jsonify': flask.jsonify,
         'app': app,
         'thread_local_data': MagicMock(),
+        # chat() reads the body's agent_tools through the ONE boolean reader
+        # (core.config_cache.flag_value, task #120): the real function, as
+        # with canonical_served_by below, so this isolation never
+        # re-implements it.
+        'flag_value': _flag_value,
         '_cleanup_stale_agents': lambda: None,
         '_persist_language': lambda lang: None,
         'with_local_fallback': lambda cfg: cfg,

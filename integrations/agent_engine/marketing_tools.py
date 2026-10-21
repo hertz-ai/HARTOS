@@ -11,7 +11,10 @@ Tier 3 (Runtime): delegate_to_specialist finds agents with needed skills via A2A
 import json
 import logging
 import re
+from types import MappingProxyType
 from typing import Annotated, Optional
+
+from core.intelligence_preference import IntelligencePreference
 
 logger = logging.getLogger('hevolve_social')
 
@@ -512,6 +515,54 @@ def register_marketing_tools(helper, assistant, user_id: str):
         logger.debug(f"Marketing skill registration skipped: {e}")
 
 
+#: The goal tag of a Reel Studio agent: her own Instagram-reel editor
+#: (integrations/reel_studio).
+REEL_STUDIO_TAG = 'reel_studio'
+
+#: Goal tags a client may ASK for when it creates an agent (the /chat body's
+#: ``goal_tags``: the phone puts her agent's on every turn of it,
+#: ReelInbox.markTurn, and stamp_goal_tags stamps the ones the turn that
+#: saves the record carries; nothing holds them between turns).  Every other
+#: tag is only ever detected from the goal text, never taken from a request.
+#: Read through the one filter, user_assignable_goal_tags: Nunba's
+#: turn_goal_tags forwards what that filter keeps of a turn's tags and keeps
+#: no list or filter of its own.
+USER_ASSIGNABLE_GOAL_TAGS = frozenset({REEL_STUDIO_TAG})
+
+#: The inference preference a goal tag sets for its agent (decision U4), in
+#: the node's one vocabulary (core.intelligence_preference).  A reel agent
+#: handles her clients' faces: its turns keep to this node and its record is
+#: not synced to the cloud prompt list.  Read through goal_tags_preference.
+GOAL_TAG_PREFERENCES = MappingProxyType({REEL_STUDIO_TAG: IntelligencePreference.LOCAL_ONLY})
+
+#: What her Reel Studio agent's own words trip by accident, and the phrases
+#: that mean she really asked for that family (plan C8 / WS-8a step 6).  Her
+#: goal names songs (media: music generation), her brand and engagement
+#: (marketing: campaigns, ads) and following up with brides (outreach: an
+#: email CRM); none of those families edits a reel, and each costs schema
+#: room the reel family needs.  Applied only to an agent whose STORED tags
+#: carry reel_studio (amendment A8 b).
+_REEL_STUDIO_KEEPS = {
+    'media': ('compose', 'melody', 'jingle', 'vocals', 'tts', 'voiceover',
+              'voice over'),
+    'marketing': ('campaign', 'advertis', 'lead gen', 'email marketing'),
+    'outreach': ('email sequence', 'cold email', 'crm'),
+}
+
+
+def _reel_studio_inert() -> bool:
+    """Is reel_studio meaningless on this node?  True on the CENTRAL node
+    (amendment A8 d): central runs the network's own commerce, marketing and
+    outreach goals, which must keep every tool family and their cloud sync,
+    and no one edits her reels there.  There the tag grants no tools, quiets
+    no family, keeps no agent local-only and is never stamped.  The node's
+    topology is security.key_delegation.get_node_tier (central only with the
+    master key), asked at call time.  The one test resolve_goal_tags,
+    is_local_only and stamp_goal_tags ask."""
+    from security.key_delegation import get_node_tier
+    return get_node_tier() == 'central'
+
+
 _WORD_START_CACHE = {}
 
 
@@ -723,6 +774,26 @@ def detect_goal_tags(prompt) -> list:
     if _mentions(lower, commerce_keywords):
         tags.append('commerce')
 
+    # Reel Studio: her own reel editor (integrations/reel_studio).  ONLY
+    # phrases that mean editing HER OWN videos (amendment A8): the tag grants
+    # the reel tools.  Words about an audience or about marketing content --
+    # 'makeup artist', 'bridal makeup', 'instagram reel', 'reel editor',
+    # 'make a reel' -- are deliberately absent: a commerce, marketing or
+    # outreach goal that sources makeup artists as leads, or posts reels to
+    # sell them a product, is not a reel studio and keeps its own tools.
+    # Measured against the in-repo goal corpus plus such goals: 0 hits
+    # (tests/unit/test_reel_studio_goal_tag.py).  Detection alone makes no
+    # agent hers: it never stamps the tag on a record, never quiets a family,
+    # never keeps an agent on this node and never gets an agent the reel
+    # tools -- only the stored tag, which only her explicit creation hint
+    # stamps, does that (integrations.reel_studio.tools.
+    # register_reel_studio_tools registers the family on her agent alone).
+    reel_studio_keywords = [
+        'reel studio', 'edit my reel', 'edit my videos', 'edit my clips',
+    ]
+    if _mentions(lower, reel_studio_keywords):
+        tags.append(REEL_STUDIO_TAG)
+
     media_keywords = [
         'song', 'music', 'compose', 'melody', 'sing', 'vocals',
         'voice clone', 'clone my voice', 'text to speech', 'tts',
@@ -765,10 +836,108 @@ def resolve_goal_tags(stored_tags, text) -> list:
     without stored tags resolves to exactly ``detect_goal_tags(text)``
     — the pre-existing behavior — and a tagged record can only GAIN
     tags, never lose one.  Non-string entries in stored_tags are
-    dropped, not raised on (the record is user-writable JSON).
+    dropped, not raised on, and so is a stored value that is not a list
+    of tags at all (the record is user-writable JSON: a bare string
+    would otherwise unlock one tag per character).
+
+    The exceptions to "only gain" are Reel Studio's (amendment A8):
+    an agent whose STORED tags carry reel_studio -- her explicitly created
+    reel agent -- loses the look-alike families its words trip by accident
+    (_REEL_STUDIO_KEEPS), stored or detected alike, unless ``text`` really
+    asks for them; a reel_studio that is only detected quiets nothing.  On
+    the central node reel_studio is dropped and quiets nothing
+    (_reel_studio_inert).
     """
     detected = detect_goal_tags(text)
+    if not isinstance(stored_tags, (list, tuple, set, frozenset)):
+        stored_tags = None
     stored = {t for t in (stored_tags or []) if isinstance(t, str) and t}
-    if not stored:
-        return detected
-    return sorted(stored | set(detected))
+    tags = detected if not stored else sorted(stored | set(detected))
+    if REEL_STUDIO_TAG not in tags:
+        return tags
+    if _reel_studio_inert():
+        return [t for t in tags if t != REEL_STUDIO_TAG]
+    if REEL_STUDIO_TAG not in stored:
+        return tags
+    lower = str(text).lower()
+    return [t for t in tags
+            if t not in _REEL_STUDIO_KEEPS or _mentions(lower, _REEL_STUDIO_KEEPS[t])]
+
+
+def user_assignable_goal_tags(raw) -> list:
+    """The tags of a client's creation hint that a client may assign.
+
+    ``raw`` is the /chat body's ``goal_tags``: a list of names.  Returns the
+    ones in USER_ASSIGNABLE_GOAL_TAGS, sorted, each once; anything that is
+    not a list of names reads as no hint.
+    """
+    if not isinstance(raw, list):
+        return []
+    return sorted({t for t in raw if isinstance(t, str) and t in USER_ASSIGNABLE_GOAL_TAGS})
+
+
+def goal_tags_preference(tags) -> Optional[IntelligencePreference]:
+    """The inference preference these goal tags set for their agent
+    (GOAL_TAG_PREFERENCES), or None when they set none.
+
+    ``tags`` is a record's stored ``goal_tags`` or a turn's creation hint --
+    never detected tags.  When several tags set one, the strictest wins
+    (IntelligencePreference's own order: local_only, auto, hive_preferred).
+    reel_studio sets none on the central node (_reel_studio_inert).  None
+    for anything that is not a collection of tags.
+    """
+    if not isinstance(tags, (list, tuple, set, frozenset)):
+        return None
+    named = {t for t in tags if isinstance(t, str) and t in GOAL_TAG_PREFERENCES}
+    if REEL_STUDIO_TAG in named and _reel_studio_inert():
+        named.discard(REEL_STUDIO_TAG)
+    asked = {GOAL_TAG_PREFERENCES[t] for t in named}
+    return next((p for p in IntelligencePreference if p in asked), None)
+
+
+def is_local_only(tags) -> bool:
+    """Do these goal tags keep the agent on this node -- is their
+    goal_tags_preference LOCAL_ONLY?  Its turns then run local-only and its
+    record is not synced to the cloud prompt list."""
+    return goal_tags_preference(tags) is IntelligencePreference.LOCAL_ONLY
+
+
+def agent_is_local_only(prompt_id, hint=None) -> bool:
+    """Do the goal tags of the agent ``prompt_id`` keep its turns on this
+    node (is_local_only)?  Its saved record's ``goal_tags``, and ``hint``:
+    the creation hint the turn itself carries for it (the /chat body's
+    ``goal_tags``, read by user_assignable_goal_tags), which is all there is
+    before that record exists.  Nothing is held between turns (amendment
+    A19): the phone puts her agent's tags on every turn of it.  The
+    per-agent half of /chat's one local-only rule.  False for no id, an
+    unsafe id or no readable record and no hint."""
+    if prompt_id is None or prompt_id == '':
+        return False
+    from core.cache_loaders import load_agent_config
+    stored = (load_agent_config(prompt_id) or {}).get('goal_tags')
+    return is_local_only(user_assignable_goal_tags(hint)
+                         + (stored if isinstance(stored, list) else []))
+
+
+def stamp_goal_tags(hint, stored=None) -> Optional[list]:
+    """The ``goal_tags`` an agent record is saved with, or None when the
+    record's own value stays exactly as it is.
+
+    A user-assignable tag reaches a record ONLY from the explicit creation
+    hint (user_assignable_goal_tags) -- never from what the record's words
+    detect, nor from the gathered record itself (amendment A8 c): a stored
+    reel_studio quiets families and keeps the agent on this node, so it must
+    mean she asked for a Reel Studio agent.  ``stored`` is the gathered
+    record's ``goal_tags``: its other tags are kept, its user-assignable ones
+    dropped.  reel_studio is never stamped on the central node
+    (_reel_studio_inert).  Sorted when it returns a list; None for a record
+    with neither a hint nor an assignable tag of its own.
+    """
+    tags = set(user_assignable_goal_tags(hint))
+    if REEL_STUDIO_TAG in tags and _reel_studio_inert():
+        tags.discard(REEL_STUDIO_TAG)
+    own = [t for t in stored if isinstance(t, str) and t] \
+        if isinstance(stored, list) else []
+    if not tags and not any(t in USER_ASSIGNABLE_GOAL_TAGS for t in own):
+        return None
+    return sorted(tags | {t for t in own if t not in USER_ASSIGNABLE_GOAL_TAGS})

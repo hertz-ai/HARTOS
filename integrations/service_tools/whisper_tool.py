@@ -1777,9 +1777,9 @@ def _audio_is_silent(audio_path: str) -> bool:
     FAILS OPEN.  Only WAV is decoded here (stdlib ``wave``); whisper_transcribe
     also accepts WebM/MP3, and calling an undecodable container "silent" would
     swallow real speech.  Anything unreadable returns False so the transcript
-    survives.  The realtime path already converts to WAV via ffmpeg
-    (_pcm_from_blob), and the file path writes WAV temp files, so the common
-    cases are covered.
+    survives.  The realtime path already converts container chunks to PCM16
+    via ffmpeg (_container_to_pcm) and wraps them in WAV, and the file path
+    writes WAV temp files, so the common cases are covered.
     """
     try:
         with wave.open(audio_path, 'rb') as w:
@@ -2171,7 +2171,8 @@ async def _stt_stream_handler(websocket):
             )
 
             if is_container:
-                # Save to temp file, let faster-whisper handle decoding
+                # Decoded to PCM16 16 kHz mono by ffmpeg; a chunk it cannot
+                # decode adds nothing (container bytes are not samples)
                 chunk_pcm = _container_to_pcm(message) or b''
             else:
                 # Raw PCM16 mono 16kHz
@@ -2243,16 +2244,31 @@ async def _stt_stream_handler(websocket):
         logger.debug(f"STT stream connection ended: {e}")
 
 
-def _container_to_pcm(data: bytes) -> Optional[bytes]:
-    """Convert WebM/Opus/WAV container to raw PCM16 16kHz mono via temp file.
+#: Bound on converting one container chunk from the streaming socket.
+CONTAINER_DECODE_TIMEOUT_S = 10.0
+#: Set when a container chunk first finds no ffmpeg at all.  The socket
+#: carries several chunks a second, so that is said once, not per chunk.
+_container_ffmpeg_missing_warned = False
 
-    faster-whisper can read any ffmpeg-supported format, so we save to a
-    temp file, transcribe, and extract the raw audio. But for streaming we
-    need raw PCM — use ffmpeg subprocess if available, else return raw bytes
-    and let faster-whisper handle it at transcribe time.
+
+def _container_to_pcm(data: bytes) -> Optional[bytes]:
+    """A WebM/Opus, Ogg/Opus or WAV chunk -> raw PCM16 16 kHz mono, or None.
+
+    Runs ffmpeg through core.media_bin, the one runner, which also finds
+    the bundled imageio-ffmpeg binary where PATH has none; the chunk goes in
+    and the PCM comes out through temp files.  None when there is no ffmpeg
+    at all, or it fails or passes CONTAINER_DECODE_TIMEOUT_S.  Container
+    bytes are never samples, so such a chunk is dropped rather than written
+    into the PCM buffer (raw PCM16 frames on the socket still transcribe).
+
+    Until 2026-10-14 this shelled a bare 'ffmpeg'.  With none on PATH (the
+    development desktop) it returned the container bytes themselves, and
+    the stream buffered them as audio.
     """
-    import subprocess as _sp
+    global _container_ffmpeg_missing_warned
     import tempfile
+
+    from core import media_bin
 
     tmp_in = None
     tmp_out = None
@@ -2264,23 +2280,24 @@ def _container_to_pcm(data: bytes) -> Optional[bytes]:
         tmp_out = tempfile.NamedTemporaryFile(suffix='.pcm', delete=False)
         tmp_out.close()
 
-        _kw = dict(capture_output=True, timeout=10)
-        if hasattr(_sp, 'CREATE_NO_WINDOW'):
-            _kw['creationflags'] = _sp.CREATE_NO_WINDOW
-
-        result = _sp.run([
-            'ffmpeg', '-y', '-i', tmp_in.name,
+        result = media_bin.run_ffmpeg([
+            '-y', '-loglevel', 'error', '-i', tmp_in.name,
             '-ar', str(STREAM_SAMPLE_RATE), '-ac', '1', '-f', 's16le',
             tmp_out.name,
-        ], **_kw)
+        ], timeout_s=CONTAINER_DECODE_TIMEOUT_S)
 
-        if result.returncode == 0:
+        if result.returncode == 0 and not result.timed_out:
             with open(tmp_out.name, 'rb') as f:
                 return f.read()
-    except FileNotFoundError:
-        # ffmpeg not available — save raw container bytes,
-        # _transcribe_buffer will write to temp file for faster-whisper
-        return data
+        logger.debug("PCM conversion failed (rc=%s, timed_out=%s): %s",
+                     result.returncode, result.timed_out, result.stderr.strip()[-300:])
+    except media_bin.MediaToolMissing as e:
+        if _container_ffmpeg_missing_warned:
+            logger.debug("PCM conversion skipped: %s", e)
+        else:
+            _container_ffmpeg_missing_warned = True
+            logger.warning("streaming STT: %s; WebM/Ogg/WAV chunks are dropped until "
+                           "ffmpeg is available (raw PCM16 frames still transcribe)", e)
     except Exception as e:
         logger.debug(f"PCM conversion failed: {e}")
     finally:

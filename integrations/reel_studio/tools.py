@@ -1,0 +1,807 @@
+"""integrations.reel_studio.tools -- her seven reel_* agent tools, and
+reel_watchlist, the one asked for on demand.
+
+``register_reel_studio_tools(helper, assistant, user_id, prompt_id=,
+stored_tags=, request_id_getter=, executor=)`` builds the closures with her
+user id, her agent's prompt id and a getter for the current turn's request
+id bound in, so none of them is a tool argument, and registers them in the
+canonical Tier-2 shape (integrations.agent_engine.news_tools.
+register_news_tools; commerce, finance and revenue follow it): the LLM
+schema on the helper AND the assistant, execution on the assistant and, when
+given, on the group chat's executor.  The assistant needs the schema: when
+speaker selection lets it propose a tool it has no schema for, the model
+free-forms the call as plain text that autogen never runs (measured live on
+the news family, 2026-09-03), and reel_make is her agent's whole action.
+The executor runs the assistant's own structured call, which autogen's
+repeat-speaker rule would otherwise strand.
+
+Only her Reel Studio agent gets them: an agent whose record STORES
+reel_studio (``stored_tags``; only her explicit creation hint stamps it,
+amendment A8 c), on a node where the tag is live.  Any other agent gets
+none, so core.agent_tool_menu.discover_and_attach -- which finds a tool on
+an agent's function map by the first line of its docstring -- can never
+offer one to it for an unrelated need (critic report 2.6: "trending news
+today" attached reel_trending_songs to a non-reel agent).  On her agent it
+gives a deferred one back when she asks request_tools ("make a reel from my
+videos").  On the central node nothing is registered: reel_studio is inert
+there (amendment A8 d).
+
+The seven (REEL_TOOL_NAMES):
+
+* ``reel_make``: a reel from the clips she attached, delivered to her phone
+  (pipeline.make_reel).  It reads this turn's clips (else her newest unused
+  batch, or the clip ids named), her style (the arguments, over her agent
+  record's words through style.parse_style_hints, over her voice profile),
+  her newest uploaded logo (else her profile's logo_xid; her profile is
+  read, never written, by making a reel), her song (a key from
+  reel_trending_songs, her attached song audio, else the top trending song
+  in her language; with none, why -- the trending list's own note, such as
+  no research account on this computer -- rides the reply, and the reply
+  names no song), a caption (else one from her profile) and at most
+  contracts.HASHTAG_LIMIT hashtags, the human-voice guide's reel cap (else
+  from her hashtag bank); its hashtags parameter tells the model that
+  number, read from the same constant.  The animated overlays she chose
+  with reel_motion (her profile's motion_overlays) ride every reel.
+* ``reel_trending_songs``: trending songs in her language
+  (integrations.trends.trending_songs_client; with none, its reason and
+  note, after asking the owner for the research account when that is why).
+* ``reel_check_caption``: igkit's caption lint, how machine-written it
+  reads, and a cleaned-up version, with her own emoji and words kept.
+* ``reel_score_hooks``: weak-hook flags (verdict and weakest check only; no
+  score: it does not predict performance).
+* ``reel_beat_sheet``: a voice-over script timed at her speaking rate.
+* ``reel_skill``: a skill text with her voice brief in front: one of the
+  three adapted writing skills, or reel_edit, HARTOS's own on how reel_make
+  cuts (igkit.skills.SKILL_NAMES, which its name parameter lists).
+* ``reel_voice``: read or change her voice profile.
+
+On demand (REEL_ON_DEMAND_TOOL_NAMES): registered with the seven, on the
+same seats of her Reel Studio agent, but with no schema up front --
+request_tools attaches it when she asks
+(core.agent_tool_menu.discover_and_attach matches the first line of its
+docstring).  It is used once in a while, and the seven's schema is held to
+900 tokens per seat (plan WS-8b; 895 measured with the seven once reel_skill
+named reel_edit):
+
+* ``reel_watchlist``: track, stop tracking or list the Instagram accounts
+  her trending songs come from, and their niche (owner ruling A17b;
+  integrations.trends.watchlist, the one writer of the list the daily job
+  watches).  It takes handles only: the research Instagram account's
+  username and password are asked for on the credential consent card
+  (integrations.trends.daily_job.ask_for_account), and its reply says
+  where that ask stands and never to take them in chat.
+* ``reel_motion``: the animated overlays her reels get -- a kinetic title,
+  a logo sting, a booking/price end card, a before->after wipe (amendment
+  A14, integrations.reel_studio.motion).  It keeps her choice in her voice
+  profile (motion_overlays; voice_profile.update_field, the one writer) and
+  says where Remotion stands on this computer: switched off until the
+  owner confirms its license (one flag, off by default), asked on the
+  consent card, being set up (a bounded wait, shown on her chat), ready.
+  Choosing overlays asks for that one-time setup (motion.runtime.
+  ensure_ready, through RuntimeToolManager).  reel_make hands every reel
+  her choice; a reel made while Remotion is not ready gets the plain
+  versions and says so.
+
+Replies are JSON, except reel_skill's text.  A call that did not do its work
+answers in the executor's failure form, starting "Error:"
+(core.constants.TOOL_ERROR_REPLY_PREFIXES): for reel_make that is every
+status but 'ok' -- needs_clips, busy, no_space, quota, not_enough_footage,
+clip_unsupported, render_failed, qa_failed -- with the result's JSON on the
+next line.  core.constants.tool_reply_failed is the one rule the CREATE
+recipe banker, the REUSE fabrication gate and the completion gate read, so
+a reel that was not made is never banked or verified as made.
+
+Importing this module is cheap: no cv2, numpy, ffmpeg or autogen.  The first
+registration in a process sweeps jobs a restart interrupted
+(jobs.sweep_once).
+"""
+import json
+import logging
+import os
+import re
+from typing import Annotated, Any, Callable, Dict, List, Mapping, Optional, Tuple
+
+from core.constants import TOOL_ERROR_REPLY_PREFIXES
+
+logger = logging.getLogger(__name__)
+
+REEL_TOOL_NAMES = ('reel_make', 'reel_trending_songs', 'reel_check_caption', 'reel_score_hooks',
+                   'reel_beat_sheet', 'reel_skill', 'reel_voice')
+#: Registered with REEL_TOOL_NAMES on the same seats, shown to no agent:
+#: request_tools attaches them when asked (see the module note).
+REEL_ON_DEMAND_TOOL_NAMES = ('reel_watchlist', 'reel_motion')
+
+#: The executor's failure form (core.constants.tool_reply_failed reads it).
+_FAILED = TOOL_ERROR_REPLY_PREFIXES[0]
+#: Longest on-screen hook text taken from the agent (the renderer wraps it).
+HOOK_TEXT_MAX_CHARS = 120
+#: Trending songs looked through for a song key the agent names.
+SONG_LOOKUP_LIMIT = 100
+DEFAULT_SONG_LIMIT = 5
+#: Why a reel suggests no song, when the trending list gave no note of its
+#: own (its note -- no research account here, no list yet -- comes first).
+UNLISTED_SONG_NOTE = ("The song named for this reel is not on this computer's trending-song "
+                      "list, so its title and start time are not known.")
+NO_SONG_NOTE = ("Today's trending-song list on this computer has no song in the reel's "
+                "language.")
+UNREAD_LIST_NOTE = "The trending-song list on this computer could not be read."
+#: What every reel_watchlist reply tells her agent to do with it.
+WATCHLIST_MESSAGE = ("Tell her which Instagram accounts are tracked for her trending songs now, "
+                     "any handle not taken and why, and the trending note when there is one. "
+                     "The research Instagram account's username and password are entered on "
+                     "this computer's consent card only, never in chat: do not ask her for them "
+                     "or accept them here.")
+
+#: How long reel_motion waits for a Remotion setup it asks for (seconds);
+#: the setup goes on after that (motion.runtime.ensure_ready).
+MOTION_SETUP_WAIT_S = 90.0
+#: Words that stop her overlays.
+_MOTION_NONE = frozenset({'none', 'no', 'off', 'stop', 'clear', 'remove'})
+#: What each template needs to appear, for her agent to pass on.
+MOTION_NEEDS = {
+    'title': "the reel's hook text (reel_make's hook_text), animated",
+    'logo_sting': 'her logo (upload one, or reel_voice logo_xid), popping in before it stays',
+    'end_card': "her profile's services, price_band and cta, as a card at the end",
+    'wipe': 'a filmed finished look: her before shot wiped away to the reveal',
+}
+#: What reel_motion tells her agent, by where Remotion stands.
+MOTION_MESSAGES = {
+    # Off is the build's state (the HEVOLVE_REEL_MOTION flag, kept off until
+    # Remotion's license is confirmed: NOTICE), not a setting she can reach.
+    'off': ("Her choice is saved. Animated overlays are not available in this version of the "
+            "app yet (the license of Remotion, the tool that draws them, is still being "
+            "confirmed); until then her reels get the plain versions (the end card as a text "
+            "box, the title as the hook text, the still logo, a cut for the wipe). Tell her "
+            "that, and that there is nothing she needs to do."),
+    'not_set_up': ("Animated overlays are not set up on this computer yet; choosing overlays "
+                   "asks its owner to set them up."),
+    'ready': "Animated overlays are set up; her next reel gets them. Tell her.",
+    'asked': ("Her choice is saved. The owner of this computer has been asked on the consent "
+              "card to set animated overlays up (a one-time download of a few hundred MB); "
+              "until then her reels get the plain versions. Tell her that."),
+    'declined': ("Her choice is saved, but the owner of this computer said no to setting "
+                 "animated overlays up, so her reels get the plain versions. Tell her that."),
+    'unavailable': ("Her choice is saved, but animated overlays cannot be set up on this "
+                    "computer: there is nobody to ask. Her reels get the plain versions; tell "
+                    "her that."),
+    'setting_up': ("Her choice is saved. Animated overlays are being set up on this computer "
+                   "now; the next reel after it finishes gets them, until then the plain "
+                   "versions. Tell her that."),
+    'failed': ("Her choice is saved, but animated overlays could not be set up on this "
+               "computer (%s); her reels get the plain versions. Tell her that."),
+}
+
+#: open_with values that ask for the final-look teaser (A1), and those that
+#: ask for the plain story; anything else is read as her words.
+_OPEN_TEASER = frozenset({'final_look', 'final', 'finished_look', 'result', 'end_result',
+                          'reveal', 'teaser', 'after', 'hook'})
+_OPEN_STORY = frozenset({'story', 'bare_face', 'before', 'start', 'beginning', 'process',
+                         'chronological', 'no', 'none', 'off'})
+
+# ── replies ───────────────────────────────────────────────────────────────
+
+def _ok_reply(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, default=str)
+
+
+def _error(tool: str, message: str) -> str:
+    return '%s %s: %s' % (_FAILED, tool, ' '.join(str(message).split()))
+
+
+def _failure_reply(result: Mapping[str, Any]) -> str:
+    """A reel_make result that made no reel, in the executor's failure form:
+    one line naming the status and what to do, then the result's JSON."""
+    head = '%s %s: %s' % (_FAILED, result.get('status'),
+                          ' '.join(str(result.get('message') or '').split()))
+    return head + '\n' + _ok_reply(result)
+
+
+def _describe(func: Callable) -> str:
+    """The first line of the docstring: the one description of a tool, read
+    by the LLM schema and by discover_and_attach alike."""
+    return (func.__doc__ or '').strip().split('\n')[0].strip() or func.__name__
+
+
+# ── reading values the model sends ────────────────────────────────────────
+
+def _text(value) -> str:
+    return value.strip() if isinstance(value, str) else ('' if value is None else str(value).strip())
+
+
+def _int(value) -> Optional[int]:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(round(value))
+    match = re.search(r'\d+', str(value))
+    return int(match.group()) if match else None
+
+
+def _flag(value) -> Optional[bool]:
+    """core.config_cache.flag_value's reading, with anything it does not
+    recognise ('', None, 'nah') as None: not given, so an unclear argument
+    never overrides what she said."""
+    from core.config_cache import flag_value
+    return flag_value(value, None)
+
+
+def _opening(value) -> Optional[bool]:
+    """open_with -> hook_first: True (teaser), False (the story), None (her words)."""
+    text = _text(value)
+    if not text or text.lower() == 'auto':
+        return None
+    key = re.sub(r'[\s-]+', '_', text.lower())
+    if key in _OPEN_TEASER:
+        return True
+    if key in _OPEN_STORY:
+        return False
+    from integrations.reel_studio.style import parse_style_hints
+    return parse_style_hints(text).get('hook_first')
+
+
+# ── her things ────────────────────────────────────────────────────────────
+
+class _Turn:
+    """What every closure of one agent knows: whose, which agent, which turn."""
+
+    def __init__(self, user_id, prompt_id, request_id_getter):
+        self.user_id = str(user_id).strip()
+        self.prompt_id = None if prompt_id is None else (str(prompt_id).strip() or None)
+        self._getter = request_id_getter
+
+    def request_id(self) -> Optional[str]:
+        if self._getter is None:
+            return None
+        try:
+            rid = self._getter()
+        except Exception as e:
+            logger.warning('reel tools: request id getter failed: %s', e)
+            return None
+        return None if rid is None else (str(rid).strip() or None)
+
+
+def _profile(user_id) -> Tuple[Dict[str, Any], Optional[str]]:
+    """(her voice profile, a note when it could not be read)."""
+    from integrations.reel_studio import voice_profile
+    try:
+        return voice_profile.load_voice(user_id), None
+    except voice_profile.VoiceProfileUnreadable:
+        return {}, 'voice_profile_unreadable'
+    except (ValueError, PermissionError) as e:
+        logger.warning('reel tools: voice profile of %s not read: %s', user_id, e)
+        return {}, 'voice_profile_unreadable'
+
+
+def _style(turn: _Turn, profile: Mapping, args: Optional[Mapping] = None) -> Dict[str, Any]:
+    from integrations.reel_studio.style import agent_record_text, build_style, parse_style_hints
+    hints = parse_style_hints(agent_record_text(turn.prompt_id))
+    return build_style(args=args, hints=hints, profile=profile)
+
+
+def _store():
+    from core.user_file_store import get_user_file_store
+    return get_user_file_store()
+
+
+def _clips(turn: _Turn, rid: Optional[str], named: str) -> List[Dict[str, Any]]:
+    """The clips to use: the ids named (hers, held as reel clips: the same
+    bytes may also be her chat attachment), else this turn's, else her
+    newest unused batch for this agent."""
+    from core import chat_attachments
+    from core.user_file_store import REEL_SOURCE, is_xid
+    from integrations.reel_studio.pipeline import MAX_CLIPS
+    if named:
+        store, out, seen = _store(), [], set()
+        for ref in re.split(r'[\s,;]+', named.lower()):
+            if not is_xid(ref) or ref in seen:
+                continue
+            seen.add(ref)
+            try:
+                held = store.resolve(turn.user_id, ref, purpose=REEL_SOURCE)
+            except Exception as e:
+                logger.warning('reel tools: clip %s not resolved: %s', ref[:12], e)
+                held = None
+            if held is not None:
+                out.append(held.to_dict())
+        return out[:MAX_CLIPS]
+    files = chat_attachments.latest_inbound(turn.user_id, turn.prompt_id, request_id=rid) \
+        if rid else []
+    if not files:
+        files = chat_attachments.latest_inbound(turn.user_id, turn.prompt_id)
+    return files[:MAX_CLIPS]
+
+
+def _song_audio(turn: _Turn, rid: Optional[str]) -> Optional[Dict[str, Any]]:
+    from core import chat_attachments
+    from core.user_file_store import SONG_AUDIO
+    files = chat_attachments.latest_inbound(turn.user_id, turn.prompt_id, request_id=rid,
+                                            purpose=SONG_AUDIO) if rid else []
+    if not files:
+        files = chat_attachments.latest_inbound(turn.user_id, turn.prompt_id,
+                                                purpose=SONG_AUDIO)
+    return files[-1] if files else None
+
+
+def _logo_path(turn: _Turn, profile: Mapping) -> Optional[str]:
+    """Her newest uploaded logo, else the one her profile names (logo_xid),
+    else None.  Her profile is read, never written: making a reel changes
+    nothing she keeps (amendment A11b); reel_voice is where logo_xid is set.
+
+    The newest upload wins over the profile's logo_xid (plan WS-9 put the
+    profile first): uploading a logo is how she changes it, and the store's
+    retention keeps only her newest logo (user_file_store GC), so an older
+    one the profile still names is about to go anyway."""
+    from core.user_file_store import LOGO
+    store = _store()
+    try:
+        logos = store.query_inbox(turn.user_id, purpose=LOGO, unconsumed_only=False)
+    except Exception as e:
+        logger.warning('reel tools: logos of %s not read: %s', turn.user_id, e)
+        logos = []
+    if logos:
+        return logos[-1].path
+    saved = profile.get('logo_xid')
+    if saved:
+        try:
+            held = store.resolve(turn.user_id, saved, box='in')
+        except Exception as e:          # the reel is made without it
+            logger.warning('reel tools: saved logo %s of %s not read: %s', str(saved)[:12],
+                           turn.user_id, e)
+            held = None
+        return held.path if held is not None else None
+    return None
+
+
+def _trending(langs=None, limit: int = DEFAULT_SONG_LIMIT) -> Dict[str, Any]:
+    from integrations.trends import trending_songs_client
+    try:
+        doc = trending_songs_client.get_trending_songs(langs=langs, limit=limit)
+    except Exception as e:      # documented never to raise; held to it here too
+        logger.warning('reel tools: trending songs unavailable: %s', e)
+        doc = None
+    return doc if isinstance(doc, dict) else {'songs': [], 'stale': True, 'reason': 'error',
+                                              'note': UNREAD_LIST_NOTE}
+
+
+def _song_from(entry: Mapping) -> Dict[str, Any]:
+    start = entry.get('suggested_start_ms')
+    return {'song_key': entry.get('song_key'), 'title': entry.get('title') or '',
+            'artist': entry.get('artist') or '', 'lang': entry.get('lang'),
+            'start_ms': start if isinstance(start, int) and not isinstance(start, bool) else 0}
+
+
+def _song(song_key: str, language: Optional[str],
+          audio: Optional[Mapping]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """``(song, why_none)``: the song the reel suggests -- the key named
+    (from the trending list), her attached audio, else the top trending song
+    in her language -- and, when it suggests none (no song, or a key the
+    list does not hold, so no title), why: the trending list's own note (no
+    research account on this computer, no list yet, ...), else
+    UNLISTED_SONG_NOTE or NO_SONG_NOTE.  ``why_none`` is None when a song
+    is suggested."""
+    song, why = None, None
+    if song_key:
+        doc = _trending(None, SONG_LOOKUP_LIMIT)
+        hit = next((s for s in doc.get('songs') or []
+                    if isinstance(s, Mapping) and s.get('song_key') == song_key), None)
+        if hit:
+            song = _song_from(hit)
+        else:
+            song = {'song_key': song_key, 'title': '', 'artist': '', 'lang': None, 'start_ms': 0}
+            why = doc.get('note') or UNLISTED_SONG_NOTE
+    if audio is not None:
+        song = song or {'song_key': None, 'artist': '', 'lang': language, 'start_ms': 0,
+                        'title': ''}
+        # Her own audio is the song; a key the list does not hold leaves it
+        # its file's name.
+        song['title'] = song['title'] or os.path.splitext(str(audio.get('name') or ''))[0]
+        song.update(audio_path=audio.get('path'), audio_xid=audio.get('xid'))
+        return song, None
+    if song is None:
+        doc = _trending(language, 1)
+        top = [s for s in doc.get('songs') or [] if isinstance(s, Mapping)]
+        if top:
+            song = _song_from(top[0])
+        else:
+            why = doc.get('note') or NO_SONG_NOTE
+    return song, why
+
+
+def _caption_from_profile(profile: Mapping) -> str:
+    """A plain caption from her own profile, never invented: what she does
+    (and where, when she says what she does), then her ask.  '' when her
+    profile names neither her services nor her ask."""
+    services = _text(profile.get('services')).rstrip('.')
+    city, cta = _text(profile.get('city')), _text(profile.get('cta'))
+    line = (services + (' in %s' % city if city else '') + '.') if services else ''
+    return ' '.join(p for p in (line, cta) if p)
+
+
+def _hashtags(text: str, profile: Mapping) -> List[str]:
+    """At most contracts.HASHTAG_LIMIT '#tags' (the human-voice guide's
+    reel cap) from what the agent wrote (commas, spaces, with or without
+    '#'), else from her hashtag bank; repeats dropped."""
+    from integrations.reel_studio.contracts import HASHTAG_LIMIT
+    from integrations.reel_studio.igkit import hashtags as find_tags, is_tag_char
+    tags: List[str] = []
+    seen = set()
+    for piece in re.split(r'[\s,;]+', text or ''):
+        found = [t for t, _, _ in find_tags(piece)]
+        if not found and piece and all(is_tag_char(c) for c in piece):
+            found = ['#' + piece]
+        for tag in found:
+            if tag.lower() not in seen:
+                seen.add(tag.lower())
+                tags.append(tag)
+    if not tags:
+        tags = [t for t in profile.get('hashtag_bank') or () if isinstance(t, str)]
+    return tags[:HASHTAG_LIMIT]
+
+
+# ── the tools ─────────────────────────────────────────────────────────────
+
+def _reel_make(turn: _Turn, target_seconds, open_with, hook_text, caption, hashtags, song_key,
+               use_logo, clips) -> str:
+    from integrations.reel_studio import jobs, pipeline
+    rid = turn.request_id()
+    files = _clips(turn, rid, _text(clips))
+    if not files:
+        return _failure_reply({'status': 'needs_clips', 'message': pipeline.NEEDS_CLIPS_MESSAGE})
+    # Busy is said before anything is done for this reel (her logo looked
+    # up, the trending list asked).  make_reel still takes the job itself,
+    # so a reel started in between is still refused there.
+    if jobs.active_job() is not None:
+        return _failure_reply({'status': 'busy', 'message': pipeline.BUSY_MESSAGE})
+    profile, note = _profile(turn.user_id)
+    target = _int(target_seconds)
+    try:
+        style = _style(turn, profile, {
+            'target_s': target if target and target > 0 else None,
+            'hook_first': _opening(open_with),
+            'use_logo': _flag(use_logo),
+            'hook_text': _text(hook_text)[:HOOK_TEXT_MAX_CHARS] or None,
+            'song_key': _text(song_key) or None,
+        })
+    except ValueError as e:
+        return _error('reel_make', 'bad style: %s' % e)
+    song, song_note = _song(_text(song_key), style['language'], _song_audio(turn, rid))
+    result = pipeline.make_reel(
+        user_id=turn.user_id, prompt_id=turn.prompt_id, request_id=rid, clips=files,
+        style=style, song=song, song_note=song_note,
+        logo_path=_logo_path(turn, profile) if style['use_logo'] else None,
+        caption=_text(caption) or _caption_from_profile(profile),
+        hashtags=_hashtags(_text(hashtags), profile), motion=_motion_request(profile, style))
+    if result.get('status') != 'ok':
+        return _failure_reply(result)
+    if note:
+        result['notes'] = list(result.get('notes') or []) + [note]
+    return _ok_reply(result)
+
+
+def _motion_request(profile: Mapping, style: Mapping) -> Optional[Dict[str, Any]]:
+    """Her animated overlays for one reel (motion.compose.add_motion's
+    request), from her voice profile's motion_overlays, or None when she
+    chose none: the reel's hook text for the title, and her services, price
+    band and ask for the end card."""
+    overlays = [t for t in (profile.get('motion_overlays') or ()) if isinstance(t, str)]
+    if not overlays:
+        return None
+    return {'overlays': overlays, 'hook_text': style.get('hook_text') or '',
+            'card_text': [profile.get('services'), profile.get('price_band'), profile.get('cta')]}
+
+
+def _reel_motion(turn: _Turn, overlays) -> str:
+    """Set (or stop, or list) her animated overlays and say where Remotion
+    stands; choosing some asks for its setup with a bounded wait whose
+    progress shows on her chat."""
+    from integrations.reel_studio import pipeline, voice_profile
+    from integrations.reel_studio.motion import runtime
+    text = _text(overlays)
+    try:
+        if text.lower() in _MOTION_NONE:
+            chosen = list(voice_profile.update_field(turn.user_id, 'motion_overlays', None)
+                          .get('motion_overlays') or [])
+        elif text:
+            chosen = list(voice_profile.update_field(turn.user_id, 'motion_overlays', text)
+                          .get('motion_overlays') or [])
+        else:
+            chosen = list(voice_profile.load_voice(turn.user_id).get('motion_overlays') or [])
+    except voice_profile.VoiceProfileUnreadable as e:
+        return _error('reel_motion', str(e))
+    except (ValueError, PermissionError) as e:
+        return _error('reel_motion', e)
+    detail = ''
+    if text and chosen:
+        rid = turn.request_id()
+        readiness = runtime.ensure_ready(
+            wait_s=MOTION_SETUP_WAIT_S,
+            progress=lambda said: pipeline.chat_stage(turn.user_id, rid, 'reel_motion', said))
+        state, detail = readiness.state, readiness.detail
+    else:
+        state = runtime.status()
+    message = MOTION_MESSAGES.get(state, MOTION_MESSAGES['not_set_up'])
+    if '%s' in message:
+        message = message % (detail or 'no reason given')
+    if not chosen:
+        message = 'Her reels get no animated overlays. ' + (message if not text else '')
+    return _ok_reply({'overlays': chosen, 'animated': state, 'templates': dict(MOTION_NEEDS),
+                      'message': message.strip()})
+
+
+def _reel_voice(turn: _Turn, action, field, value) -> str:
+    from integrations.reel_studio import voice_profile
+    act = _text(action).lower() or 'get'
+    name = _text(field)
+    try:
+        if act == 'get':
+            return _ok_reply({'profile': voice_profile.load_voice(turn.user_id)})
+        if act == 'fields':
+            return _ok_reply({'fields': {
+                f: {k: (list(v) if isinstance(v, tuple) else v) for k, v in spec.items()}
+                for f, spec in voice_profile.FIELD_SPECS.items()}})
+        if act == 'set':
+            return _ok_reply({'profile': voice_profile.update_field(turn.user_id, name, value)})
+        if act == 'clear':
+            return _ok_reply({'profile': voice_profile.update_field(turn.user_id, name, None)})
+        if act == 'reset':
+            return _ok_reply({'reset': voice_profile.reset_voice(turn.user_id) is not None})
+    except voice_profile.VoiceProfileUnreadable as e:
+        return _error('reel_voice', str(e))
+    except (ValueError, PermissionError) as e:
+        return _error('reel_voice', '%s: %s' % (name or act, e))
+    return _error('reel_voice', 'action must be get, set, clear, fields or reset, not %r' % act)
+
+
+def _reel_watchlist(track, untrack, niche) -> str:
+    """Change and list the accounts watched (integrations.trends.watchlist),
+    then say where her trending-song list stands (trending_songs_client.
+    list_status: with accounts tracked and no research account here, the
+    owner is asked on the consent card).  A call that asked for a change and
+    got none, every value it named refused, answers in the failure form."""
+    from integrations.trends import trending_songs_client, watchlist
+    track, untrack, niche = _text(track), _text(untrack), _text(niche)
+    try:
+        result = watchlist.update_watchlist(track=track, untrack=untrack, niche=niche or None)
+    except watchlist.WatchlistUnavailable as e:
+        return _error('reel_watchlist', 'the list of tracked accounts on this computer could '
+                      'not be changed (%s)' % e)
+    answered = (result['changed'] or result['already_tracked'] or result['not_tracked']
+                or result['over_limit'])
+    if (track or untrack or niche) and result['refused'] and not answered:
+        return _error('reel_watchlist', '; '.join('%r is %s' % (r['value'], r['why'])
+                                                  for r in result['refused']))
+    result['trending'] = trending_songs_client.list_status()
+    result['message'] = WATCHLIST_MESSAGE
+    return _ok_reply(result)
+
+
+def build_reel_tools(user_id, *, prompt_id,
+                     request_id_getter: Optional[Callable[[], Any]] = None
+                     ) -> List[Tuple[str, Callable[..., str]]]:
+    """The (name, closure) pairs for one user's agent: REEL_TOOL_NAMES, then
+    REEL_ON_DEMAND_TOOL_NAMES, in that order."""
+    # The cap reel_make's hashtags parameter states is the one _hashtags
+    # keeps (contracts.HASHTAG_LIMIT, the human-voice guide's reel cap).
+    from integrations.reel_studio.contracts import HASHTAG_LIMIT
+    # reel_skill's name parameter names every skill there is, from the one list.
+    from integrations.reel_studio.igkit.skills import SKILL_NAMES
+    skill_choice = '%s or %s' % (', '.join(SKILL_NAMES[:-1]), SKILL_NAMES[-1])
+    turn = _Turn(user_id, prompt_id, request_id_getter)
+
+    def reel_make(
+        target_seconds: Annotated[int, 'Seconds, 5-30; 0 = her instructions'] = 0,
+        open_with: Annotated[str, "final_look (1 s teaser first), story, or '' = her instructions"] = '',
+        hook_text: Annotated[str, 'On-screen text for 2 s, max 6 words'] = '',
+        caption: Annotated[str, "Caption; '' = from her profile"] = '',
+        hashtags: Annotated[str, "Up to %d #tags; '' = her bank" % HASHTAG_LIMIT] = '',
+        song_key: Annotated[str, "From reel_trending_songs; '' = auto"] = '',
+        use_logo: Annotated[str, "yes, no, or '' = her instructions"] = '',
+        clips: Annotated[str, "Clip ids; '' = attached clips"] = '',
+    ) -> str:
+        """Make an Instagram reel video from her attached makeup clips and send it to her phone.
+
+        Plays her clips in the order she filmed them and ends on the
+        finished look.  Takes minutes; the reel also arrives on her phone
+        by itself.
+        """
+        return _reel_make(turn, target_seconds, open_with, hook_text, caption, hashtags,
+                          song_key, use_logo, clips)
+
+    def reel_trending_songs(
+        language: Annotated[str, "ta, hi, pa, en; '' = hers"] = '',
+        limit: Annotated[int, 'Max songs'] = DEFAULT_SONG_LIMIT,
+    ) -> str:
+        """Trending Instagram reel songs in her language, with start times."""
+        profile, _note = _profile(turn.user_id)
+        language = _text(language).lower() or _style(turn, profile)['language']
+        return _ok_reply(_trending(language or None, _int(limit) or DEFAULT_SONG_LIMIT))
+
+    def reel_check_caption(
+        caption: Annotated[str, 'Caption'],
+        keywords: Annotated[str, "Search terms, comma-separated; '' = hers"] = '',
+    ) -> str:
+        """Check an Instagram caption: lint, machine-text score and a cleaned-up version.
+
+        Her own emoji and words (voice profile) are never flagged or replaced.
+        """
+        from integrations.reel_studio.igkit.caption import lint_caption
+        from integrations.reel_studio.igkit.humanize import detect_machine_text, humanize_text
+        profile, _note = _profile(turn.user_id)
+        text = caption if isinstance(caption, str) else _text(caption)
+        terms = [k.strip() for k in re.split(r'[\n,]', _text(keywords)) if k.strip()] \
+            or list(profile.get('search_terms') or ()) or None
+        keep = {'keep_emoji': tuple(profile.get('emoji') or ()),
+                'keep_words': tuple(profile.get('words_used') or ())}
+        return _ok_reply({'lint': lint_caption(text, keywords=terms),
+                          'detection': detect_machine_text(text, **keep),
+                          'humanized': humanize_text(text, **keep)})
+
+    def reel_score_hooks(
+        hooks: Annotated[str, 'One hook per line'],
+    ) -> str:
+        """Flag weak reel hooks and each one's weakest check; it does not predict performance."""
+        from integrations.reel_studio.igkit.hooks import score_hooks
+        return _ok_reply(score_hooks(hooks if isinstance(hooks, str) else _text(hooks)))
+
+    def reel_beat_sheet(
+        script: Annotated[str, 'One beat per line'],
+        target_seconds: Annotated[int, 'Reel seconds; 0 = none'] = 0,
+    ) -> str:
+        """Time a reel voice-over script into beats at her speaking rate."""
+        from integrations.reel_studio.igkit.hooks import DEFAULT_WPM, beat_sheet
+        profile, _note = _profile(turn.user_id)
+        target = _int(target_seconds)
+        try:
+            return _ok_reply(beat_sheet(script if isinstance(script, str) else _text(script),
+                                        wpm=profile.get('wpm') or DEFAULT_WPM,
+                                        target=target if target and target > 0 else None))
+        except ValueError as e:
+            return _error('reel_beat_sheet', e)
+
+    def reel_skill(
+        name: Annotated[str, skill_choice],
+    ) -> str:
+        """Read a Reel Studio skill with her voice profile in front."""
+        from integrations.reel_studio import voice_profile
+        from integrations.reel_studio.igkit.skills import get_skill_text
+        try:
+            text = get_skill_text(_text(name))
+        except KeyError:
+            return _error('reel_skill', 'no skill %r; the skills are %s'
+                          % (_text(name), ', '.join(SKILL_NAMES)))
+        try:
+            brief = voice_profile.voice_brief(turn.user_id)
+        except (ValueError, PermissionError) as e:
+            logger.warning('reel tools: voice brief of %s not read: %s', turn.user_id, e)
+            brief = ''
+        return (brief + '\n\n' + text) if brief else text
+
+    def reel_voice(
+        action: Annotated[str, 'get|set|clear|fields|reset'] = 'get',
+        field: Annotated[str, 'Field to set or clear'] = '',
+        value: Annotated[str, 'New value'] = '',
+    ) -> str:
+        """Read or change her Instagram voice profile: language, tone, emoji, hashtags, logo corner.
+
+        reset only after she confirms she wants to start her profile over.
+        """
+        return _reel_voice(turn, action, field, value)
+
+    def reel_watchlist(
+        track: Annotated[str, 'Instagram handles to start tracking, comma-separated'] = '',
+        untrack: Annotated[str, 'Handles to stop tracking, comma-separated'] = '',
+        niche: Annotated[str, "What they post, e.g. bridal makeup; '' = unchanged"] = '',
+    ) -> str:
+        """Track or stop tracking the Instagram accounts her trending songs come from, or list them.
+
+        With nothing to change it lists them.  Handles only: the research
+        Instagram account's username and password are entered on this
+        computer's consent card, never here or in chat.
+        """
+        return _reel_watchlist(track, untrack, niche)
+
+    def reel_motion(
+        overlays: Annotated[str, "title, logo_sting, end_card, wipe (comma-separated); "
+                                 "'none' stops them; '' lists"] = '',
+    ) -> str:
+        """Add animated overlays to her reels: a kinetic title, a logo sting, a booking/price end card, a before-after wipe.
+
+        Her choice is kept for every reel she makes.  Deterministic: the
+        reel places them; no model draws them.  Says whether they can be
+        animated on this computer yet (the owner may first have to confirm
+        the Remotion license or allow its one-time setup); until then her
+        reels get plain versions.
+        """
+        return _reel_motion(turn, overlays)
+
+    return [('reel_make', reel_make), ('reel_trending_songs', reel_trending_songs),
+            ('reel_check_caption', reel_check_caption), ('reel_score_hooks', reel_score_hooks),
+            ('reel_beat_sheet', reel_beat_sheet), ('reel_skill', reel_skill),
+            ('reel_voice', reel_voice), ('reel_watchlist', reel_watchlist),
+            ('reel_motion', reel_motion)]
+
+
+def _first_registration() -> None:
+    """Once per process: sweep jobs a restart interrupted (jobs.sweep_once).
+    The store's own once-per-process retention pass is the device door's
+    (core.peer_link.file_channel.install); make_reel runs one after each reel."""
+    from integrations.reel_studio import jobs
+    jobs.sweep_once()
+
+
+def _inert_here() -> bool:
+    """Is reel_studio inert on this node (amendment A8 d: the central node)?
+
+    Asked of marketing_tools.resolve_goal_tags, the one rule for the goal
+    tags an agent carries: an agent whose stored tags are [reel_studio] keeps
+    that tag on every node but central (its node test is
+    security.key_delegation.get_node_tier, asked there), so this module holds
+    no second node-tier test."""
+    from integrations.agent_engine.marketing_tools import REEL_STUDIO_TAG, resolve_goal_tags
+    return REEL_STUDIO_TAG not in resolve_goal_tags([REEL_STUDIO_TAG], '')
+
+
+def _her_agent(stored_tags) -> bool:
+    """Is this her Reel Studio agent: does its record STORE reel_studio?
+
+    Asked of marketing_tools.resolve_goal_tags with no text, so only the
+    stored tags speak (her words never make an agent hers, amendment A8 b/c)
+    and a junk stored value reads as no tags -- this module holds no second
+    rule for what a record's goal_tags mean."""
+    from integrations.agent_engine.marketing_tools import REEL_STUDIO_TAG, resolve_goal_tags
+    return REEL_STUDIO_TAG in resolve_goal_tags(stored_tags, '')
+
+
+def register_reel_studio_tools(helper, assistant, user_id: str, *, prompt_id, stored_tags,
+                               request_id_getter: Optional[Callable[[], Any]] = None,
+                               executor=None) -> List[str]:
+    """Register the reel tools for ``user_id``'s agent ``prompt_id`` when it
+    is her Reel Studio agent, in the canonical Tier-2 shape (see the module
+    note; the same as news_tools.register_news_tools).
+
+    ``stored_tags`` is the agent record's own ``goal_tags``, as stored (not
+    the tags resolved from its words): only an agent whose record stores
+    reel_studio is hers (_her_agent).  For any other agent nothing is
+    registered and [] is returned.  On the central node nothing is
+    registered for any agent (amendment A8 d); elsewhere the first call in
+    a process sweeps the reel jobs a restart interrupted, whichever agent it
+    is building (_first_registration).
+
+    ``request_id_getter()`` returns the current turn's request id, read each
+    time reel_make runs.  ``register_for_llm`` on ``helper`` and on
+    ``assistant`` for the seven REEL_TOOL_NAMES, so whichever of them
+    proposes reel_make makes a structured call; REEL_ON_DEMAND_TOOL_NAMES
+    get no schema up front (request_tools attaches them when she asks).
+    ``assistant`` runs them all (``register_for_execution``), and so does
+    ``executor`` when given: a group-chat agent distinct from the proposer,
+    which runs the assistant's own calls (REUSE passes its executor to every
+    Tier-2 family).  Returns the names registered, REEL_TOOL_NAMES then
+    REEL_ON_DEMAND_TOOL_NAMES.
+    """
+    if _inert_here():
+        logger.info('Reel tools not registered for user %s: reel_studio is inert on the '
+                    'central node', user_id)
+        return []
+    _first_registration()
+    if not _her_agent(stored_tags):
+        logger.info('Reel tools not registered for agent %s of user %s: its record stores '
+                    'no reel_studio, so it is not her Reel Studio agent', prompt_id, user_id)
+        return []
+    tools = build_reel_tools(user_id, prompt_id=prompt_id, request_id_getter=request_id_getter)
+    for name, func in tools:
+        if name not in REEL_ON_DEMAND_TOOL_NAMES:
+            description = _describe(func)
+            helper.register_for_llm(name=name, description=description)(func)
+            assistant.register_for_llm(name=name, description=description)(func)
+        assistant.register_for_execution(name=name)(func)
+        if executor is not None:
+            executor.register_for_execution(name=name)(func)
+    names = [name for name, _func in tools]
+    logger.info('Registered %d reel tools for agent %s of user %s (schema on helper + '
+                'assistant, execution%s)', len(names), prompt_id, user_id,
+                ' + executor' if executor is not None else '')
+    return names
+
+
+__all__ = ['REEL_TOOL_NAMES', 'REEL_ON_DEMAND_TOOL_NAMES', 'HOOK_TEXT_MAX_CHARS',
+           'build_reel_tools', 'register_reel_studio_tools']

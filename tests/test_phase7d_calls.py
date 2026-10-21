@@ -1554,8 +1554,14 @@ def _call_turn_rig(db, monkeypatch, chat_status=200, chat_body=None,
             plain.append(prompt)
             return type('R', (), {'content': 'a plain answer'})()
 
-    def fake_mint(user_id='system_daemon', username=None, role='admin'):
-        minted.append({'user_id': user_id, 'role': role})
+    def fake_mint(user_id='system_daemon', username=None, role='admin',
+                  lane=None, rid=None):
+        # The signature dispatch._internal_auth_headers has: chat_turn_request
+        # passes lane= and rid= on every call (None for a turn that names no
+        # lane), and a double without them raised TypeError, swallowed into
+        # "internal auth header unavailable", so the turn went out bare and
+        # this rig recorded no mint (review of f431b73d7, F1).
+        minted.append({'user_id': user_id, 'role': role, 'lane': lane, 'rid': rid})
         return {'Authorization': 'Bearer t'}
 
     import core.http_pool
@@ -1623,7 +1629,11 @@ def test_a_call_turn_runs_the_agents_own_prompt_through_chat(
     # daemons, and they yield to it (the one discriminator /chat applies).
     from integrations.agent_engine.dispatch import is_genuine_user_request
     assert is_genuine_user_request(body['request_id'])
-    assert minted == [{'user_id': speaker.id, 'role': 'user'}]
+    # Minted for the speaker, as a user, for no lane: a word spoken in a call
+    # is a person's turn, so the mint is asked for no lane claim and no
+    # request binding (chat_turn_request passes both only when a caller
+    # names a lane; the metered API does, task #157).
+    assert minted == [{'user_id': speaker.id, 'role': 'user', 'lane': None, 'rid': None}]
     assert sent['headers'] == {'Authorization': 'Bearer t'}
     assert plain == [], 'the plain model never answered for the agent'
     from integrations.social.agent_voice_bridge import dequeue_tts_text

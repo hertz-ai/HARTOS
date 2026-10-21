@@ -8,6 +8,14 @@ whoever made it.
 This lives on its own so the one matcher serves everyone who needs it --
 the agent's tools here, and the node's kids media route -- rather than
 each growing a ladder of its own.  Importing it costs nothing.
+
+Two memos, one shape (owner ruling 2026-10-17).  A sound composed once is
+replayed for everyone who uses the agent: that is the AGENT's memo, in the
+agent's own store.  Which take a person keeps or turns down is a choice,
+and a choice belongs to the person: that is their OWN memo, in their own
+{user_id}_{prompt_id} store, never inside the agent's.  Only the agent's
+creator chooses for everyone (core.agent_tools.is_agent_creator); that is
+decided by the callers, which pass the person's memo as ``own``.
 """
 
 # The states a game passes through, and how each is described to the
@@ -96,14 +104,18 @@ def game_state_key(state, level=None, variant=None):
     return key
 
 
-def game_state_match(games, game_id, state, level=None, user_id=None,
+def game_state_match(games, game_id, state, level=None, *, own=None,
                      own_only=False):
     """The sound memoized for a game's state, and what matched (spec §4).
 
-    Tries, in order and only exactly: this user's own correction, this
-    level's sound, the game's sound.  Returns (record, matched) where
-    matched is 'mine', 'level', 'game', 'composing' or 'miss' — a caller
-    reports it, so a hit is never confused with a near miss.
+    ``games`` is the agent's memo; ``own`` is one person's memo (same
+    shape, from their own store), or None for nobody's.  Tries, in order
+    and only exactly: this person's own take, this level's sound, the
+    game's sound.  An agent take this person turned down is skipped for
+    them alone, so they stop hearing it while everyone else still does.
+    Returns (record, matched, key) where matched is 'mine', 'level',
+    'game', 'composing' or 'miss' -- a caller reports it, so a hit is
+    never confused with a near miss.
 
     ``own_only`` looks at this person's own memo alone.  Correcting a
     sound has to: with the ladder, a person asking to replace what they
@@ -112,10 +124,12 @@ def game_state_match(games, game_id, state, level=None, user_id=None,
     """
     slot = (games or {}).get(str(game_id), {})
     agent_sounds = {} if own_only else (slot.get('sounds') or {})
-    mine = (slot.get('mine') or {}).get(str(user_id), {}) if user_id else {}
+    mine = ((own or {}).get(str(game_id), {}).get('sounds') or {})
 
     level_key = game_state_key(state, level)
     game_key = game_state_key(state)
+    turned_down = {(mine.get(key) or {}).get('rejected_url')
+                   for key in (level_key, game_key)} - {None}
 
     for source, sounds, keys in (
         ('mine', mine, (level_key, game_key)),
@@ -124,12 +138,14 @@ def game_state_match(games, game_id, state, level=None, user_id=None,
     ):
         for key in keys:
             record = sounds.get(key) or {}
-            if record.get('url'):
+            if record.get('url') and (source == 'mine'
+                                      or record['url'] not in turned_down):
                 return record, source, key
 
     # the shape written before states existed: a game's music
     if (not own_only and state == 'bgm'
-            and isinstance(slot.get('music'), dict) and slot['music'].get('url')):
+            and isinstance(slot.get('music'), dict) and slot['music'].get('url')
+            and slot['music']['url'] not in turned_down):
         return slot['music'], 'game', game_key
 
     # a composition already under way for the exact key is itself the memo,
@@ -144,7 +160,7 @@ def game_state_match(games, game_id, state, level=None, user_id=None,
     return {}, 'miss', level_key
 
 
-def game_state_sound(games, game_id, state, level=None, user_id=None,
+def game_state_sound(games, game_id, state, level=None, *, own=None,
                      own_only=False):
     """What a game plays for this state, and what matched -- the common ask.
 
@@ -152,46 +168,40 @@ def game_state_sound(games, game_id, state, level=None, user_id=None,
     matched, which a verdict needs and a lookup does not.
     """
     record, source, _key = game_state_match(
-        games, game_id, state, level, user_id, own_only)
+        games, game_id, state, level, own=own, own_only=own_only)
     return record, source
 
 
-def set_game_state_sound_at(games, game_id, key, record, user_id=None):
+def set_game_state_sound_at(games, game_id, key, record):
     """Write a record at an EXACT key -- the key a lookup MATCHED.
 
-    A verdict belongs to the memo it was given (spec 6.1), which is not
-    always the key that was asked for: the ladder falls back from
-    'correct@3' to 'correct', so a reviewer rejecting while playing level 3
-    was writing a rejection at 'correct@3' while 'correct' -- the take
-    actually sounding -- kept its url and went on playing. Composing under
-    the key asked for (spec 4) is a different rule for a different path: a
-    miss that composes.
+    ``games`` is whichever memo the write belongs to, the agent's or one
+    person's own; the caller chooses.  A verdict belongs to the memo it
+    was given (spec 6.1), which is not always the key that was asked for:
+    the ladder falls back from 'correct@3' to 'correct', so a reviewer
+    rejecting while playing level 3 was writing a rejection at
+    'correct@3' while 'correct' -- the take actually sounding -- kept its
+    url and went on playing. Composing under the key asked for (spec 4)
+    is a different rule for a different path: a miss that composes.
     """
     slot = games.setdefault(str(game_id), {})
-    if user_id in (None, ''):
-        slot.setdefault('sounds', {})[key] = record
-        if key == 'bgm' and isinstance(slot.get('music'), dict):
-            slot['music'] = record
-    else:
-        slot.setdefault('mine', {}).setdefault(str(user_id), {})[key] = record
+    slot.setdefault('sounds', {})[key] = record
+    if key == 'bgm' and isinstance(slot.get('music'), dict):
+        slot['music'] = record
     return record
 
 
-def set_game_state_sound(games, game_id, state, record, level=None, user_id=None):
+def set_game_state_sound(games, game_id, state, record, level=None):
     """Memoize a sound under the key that was ASKED for (spec §4).
 
     Not under the key a fallback would have used: the next identical
     request has to be an exact hit.
     """
     slot = games.setdefault(str(game_id), {})
-    if user_id in (None, ''):
-        slot.setdefault('sounds', {})[game_state_key(state, level)] = record
-        if state == 'bgm' and level in (None, '', 0):
-            # the shape the first version wrote, kept so older memos read back
-            slot['music'] = record
-    else:
-        slot.setdefault('mine', {}).setdefault(str(user_id), {})[
-            game_state_key(state, level)] = record
+    slot.setdefault('sounds', {})[game_state_key(state, level)] = record
+    if state == 'bgm' and level in (None, '', 0):
+        # the shape the first version wrote, kept so older memos read back
+        slot['music'] = record
     return record
 
 
@@ -224,7 +234,7 @@ def parse_game_sound_action(action):
 
 
 def record_verdict(games, game_id, state, approved, reason='',
-                   level=None, user_id=None):
+                   level=None, *, own=None):
     """Mark the memo a reviewer just judged, and say which one it was.
 
     ONE implementation, deliberately: the agent's approve_game_sound tool
@@ -235,19 +245,21 @@ def record_verdict(games, game_id, state, approved, reason='',
     copy of this logic over there would have been the parallel path the
     owner's rule exists to stop.
 
-    The verdict lands on the memo the ladder MATCHED, not the key asked for
-    (spec 6.1), except for a person correcting their own copy, who always
-    writes in their own space (spec 6.2).
+    The verdict lands on the take the ladder MATCHED, at the key it
+    matched, not the key asked for (spec 6.1).  With ``own`` (a person's
+    memo) it is that person's verdict on the take THEY hear, their own or
+    the agent's, and it is written in their memo alone (spec 6.2): the
+    agent's take stays as it is for everyone else.
 
     Returns (record, matched, key). An empty record means there was nothing
     bound to judge.
     """
     found, matched, matched_key = game_state_match(
-        games, game_id, state, level, user_id, own_only=bool(user_id))
+        games, game_id, state, level, own=own)
     record = dict(found)
     if not record.get('url'):
         return {}, matched, matched_key
-    write_key = game_state_key(state, level) if user_id else matched_key
+    write_key = matched_key
     if approved:
         record['approved_at'] = time.time()
     else:
@@ -257,12 +269,13 @@ def record_verdict(games, game_id, state, approved, reason='',
         record['rejected_at'] = time.time()
         record['rejected_reason'] = (reason or '').strip()
         record['rejected_url'] = record.pop('url', None)
-    set_game_state_sound_at(games, game_id, write_key, record, user_id)
+    set_game_state_sound_at(own if own is not None else games,
+                            game_id, write_key, record)
     return record, matched, write_key
 
 
-def game_state_record(games, game_id, state, level=None, user_id=None):
-    """The record at EXACTLY this key, or {} -- no ladder.
+def game_state_record(games, game_id, state, level=None):
+    """The record at EXACTLY this key in this memo, or {} -- no ladder.
 
     The one reader of the storage shape for every caller that needs the
     key's own record rather than what the game would play: a take a reviewer
@@ -273,16 +286,14 @@ def game_state_record(games, game_id, state, level=None, user_id=None):
     agent_tools was the fourth reader of a shape this module owns.
     """
     slot = (games or {}).get(str(game_id), {})
-    sounds = ((slot.get('mine') or {}).get(str(user_id), {}) if user_id
-              else (slot.get('sounds') or {}))
-    return sounds.get(game_state_key(state, level)) or {}
+    return (slot.get('sounds') or {}).get(game_state_key(state, level)) or {}
 
 
-def rejected_take(games, game_id, state, level=None, user_id=None):
+def rejected_take(games, game_id, state, level=None):
     """The take a reviewer turned down for this exact key, if any.
 
     Kept so the next composition can answer the reason they gave, and so a
     reviewer can go back to it (spec §6.1).
     """
-    record = game_state_record(games, game_id, state, level, user_id)
+    record = game_state_record(games, game_id, state, level)
     return record if record.get('rejected_at') else {}

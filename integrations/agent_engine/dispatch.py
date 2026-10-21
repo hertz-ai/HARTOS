@@ -84,7 +84,9 @@ def _local_dispatch_base_url() -> str:
 
 def _internal_auth_headers(user_id: str = SYSTEM_DAEMON_IDENTITY,
                             username: str = None,
-                            role: str = 'admin') -> Optional[Dict[str, str]]:
+                            role: str = 'admin',
+                            lane: str = None,
+                            rid: str = None) -> Optional[Dict[str, str]]:
     """Build auth headers for internal /chat dispatch.
 
     Why: on central/regional tiers, security/middleware.py Gate 2 rejects
@@ -96,6 +98,21 @@ def _internal_auth_headers(user_id: str = SYSTEM_DAEMON_IDENTITY,
     short-lived JWT via integrations.social.auth. Returns None on
     flat-tier deployments where auth is unneeded (caller passes None to
     pooled_post → no header attached).
+
+    ``lane``: the node's own word about the turn these headers are for
+    (core.request_lane: 'revenue' for a paying API tier's turn), carried
+    as the minted JWT's 'lane' claim, which /chat believes because only
+    the node's secret mints one; ``rid`` is that turn's request id, carried
+    as the 'rid' claim so the word holds for the request id it names, and
+    such a token lives minutes (security.jwt_manager.TURN_TOKEN_EXPIRY):
+    a captured one buys nothing for a turn with another id (task #157).
+    When the key is sent instead, the claim has nowhere to ride and the
+    caller's body carries the word, which /chat believes beside the node's
+    key only (core.request_lane.lane_for_chat).  Only
+    chat_contract.chat_turn_request passes them, for a person's turn
+    relayed with that person's own identity (task #153: the metered API's
+    self-POST, which used to carry this helper's default identity and so
+    ran every paying customer as system_daemon in one shared session).
 
     Args:
         user_id: identity the minted JWT represents. Defaults to the
@@ -136,6 +153,8 @@ def _internal_auth_headers(user_id: str = SYSTEM_DAEMON_IDENTITY,
                 user_id=user_id,
                 username=username or user_id,
                 role=role,
+                lane=lane,
+                rid=rid,
             )
             if jwt:
                 headers['Authorization'] = f'Bearer {jwt}'

@@ -1259,6 +1259,10 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         'retrieve_json': retrieve_json,
         'strip_json_values': strip_json_values,
         'save_conversation_db': save_conversation_db,
+        # CREATE: the agent's creator may save a template or example for
+        # everyone who uses it (save_data_in_memory for_everyone; owner
+        # 2026-10-17; core.agent_tools.is_agent_creator).
+        'building_agent': True,
     }
     core_tools = build_core_tool_closures(_tool_ctx)
     # Same name filter the reuse pipeline's identical helper/assistant leg
@@ -1858,6 +1862,12 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     # gather LLM has no real tool to map "fetch a webpage" onto and invents
     # fake tool names (2026-05-12 IPL refusal forensic).
     goal_tags = []  # bound before the gated blocks; detected inside the try
+    # The goal_tags the record loaded above (`config`) STORES, as the gather
+    # save stamped them (hart_intelligence_entry._save_and_enter_review).
+    # Bound here, outside the try, for the same reason as goal_tags: the
+    # resolution below, the per-turn attach ledger and her reel family's own
+    # try all read it, and that try runs even when this one raises.
+    stored_goal_tags = config.get('goal_tags') if config else None
     # Same reason as goal_tags: the deferral keep-set below reads this, and if
     # the try raises before the assignment an unbound name would take down
     # agent construction over a tool-budget optimisation.
@@ -1884,10 +1894,12 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         # Ungated, 50 rendered defs cost 5,820 of the 6,144-token slot.
         from integrations.agent_engine.marketing_tools import resolve_goal_tags
         from core.agent_tools import filter_service_tools
-        # No stored record exists yet at creation — resolve_goal_tags(None, x)
-        # is exactly detect_goal_tags(x); the stored leg activates when the
-        # create flow starts stamping goal_tags on the agent record (Lever 2).
-        goal_tags = resolve_goal_tags(None, task)
+        # The record's stored goal_tags (stored_goal_tags, above) are what
+        # decides here: `task` is the session's helper.Action, whose str() is
+        # a repr, so detection on it finds nothing (plan C7).  The keyword leg
+        # is unchanged; a record without stored tags resolves exactly as
+        # before.
+        goal_tags = resolve_goal_tags(stored_goal_tags, task)
         _n_all_svc = len(svc_tools)
         svc_tools = filter_service_tools(goal_tags, svc_tools, svc_defs,
                                          service_tool_registry)
@@ -1901,9 +1913,11 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         # The ledger the per-turn attach reads (core.agent_tool_menu.
         # attach_for_turn, from _attach_for_create_turn), on the agent the
         # register_dual above executes service tools on, as REUSE does.
-        # CREATE used to attach only at build time, from the task.
+        # CREATE used to attach only at build time, from the task.  It carries
+        # the record's stored tags, so each turn is resolved by the same rule
+        # as this build (her stored reel_studio keeps media quiet mid-chat).
         from core.agent_tool_menu import arm_turn_attach
-        arm_turn_attach(assistant, _attached_names, goal_tags)
+        arm_turn_attach(assistant, _attached_names, goal_tags, stored_goal_tags)
         from core.agent_tools import register_request_tools
         register_request_tools(helper, assistant, service_tool_registry,
                                _attached_names)
@@ -2151,6 +2165,32 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         # goal "completes" with zero side-effects).  Silent for ~6 weeks
         # before being caught.  Loud now so any future regression surfaces.
         tool_logger.warning(f"Goal-aware tool loading FAILED: {e}")
+
+    # Reel Studio (integrations/reel_studio): her Instagram-reel tools, a
+    # Tier-2 family in its own try after the shared one, so a failure on
+    # either side costs the other nothing (plan WS-8b).  Only her Reel Studio
+    # agent -- its record STORES reel_studio, which only her explicit
+    # creation hint stamps -- gets them; every other agent gets none, so
+    # request_tools (core.agent_tool_menu.discover_and_attach, which reads the
+    # assistant's function map) can never offer one to it for an unrelated
+    # need (critic report 2.6).  Hence the stored tags, not goal_tags, whose
+    # detected reel_studio would make an agent hers from its words alone
+    # (amendment A8 b).  The same call as REUSE's, including the executor:
+    # the canonical Tier-2 shape register_reel_studio_tools documents.  The
+    # tools read the turn's request id from this module's request_id_list
+    # when they run.  On the central node it registers nothing (amendment
+    # A8 d).  Registered after _pre_tier2_tools, so create_helper_keep below
+    # keeps her family on the Helper as it does every Tier-2 family.
+    try:
+        from integrations.reel_studio.tools import register_reel_studio_tools
+        register_reel_studio_tools(
+            helper, assistant, user_id, prompt_id=prompt_id,
+            request_id_getter=lambda: request_id_list.get(user_prompt),
+            stored_tags=stored_goal_tags, executor=executor)
+    except Exception as e:
+        # Loud for the reason the shared block above is: an agent built
+        # without its reel tools talks about reels without making one.
+        tool_logger.warning(f"Reel Studio tool loading FAILED: {e}")
 
     # ── Bound the HELPER's schema to what CREATE actually uses ─────────────
     # register_dual puts the schema on the helper and execution on the
@@ -2542,9 +2582,11 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             current_app.logger.error(f"Error in error detection logic: {e}")
 
         # Get metadata once for potential use later
-        # get_saved_metadata is a tool closure — access agent_data directly here
+        # get_saved_metadata is a tool closure — read the same view it reads
+        # (memory_view: this person's memory for the agent over the agent's).
         try:
-            _ad = agent_data.get(prompt_id, {})
+            from core.agent_tools import memory_view
+            _ad = memory_view(agent_data, prompt_id, user_prompt)
             metadata = json.dumps(list(_ad.keys())) if _ad else "{}"
         except Exception as e:
             current_app.logger.error(f"Error getting metadata: {e}")
@@ -2739,7 +2781,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                 name = helper_fun.safe_prompt_path(prompt_id, flow, json_obj["action_id"])
                                 user_tasks[user_prompt].fallback = False
                                 user_tasks[user_prompt].recipe = False
-                                metadata = strip_json_values(agent_data[prompt_id])
+                                from core.agent_tools import memory_view
+                                metadata = strip_json_values(
+                                    memory_view(agent_data, prompt_id, user_prompt))
                                 json_obj['metadata'] = metadata
                                 # 'times' is [] at init (:4211) and appended only
                                 # inside a branch (:2438), so it can legitimately
@@ -2802,7 +2846,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                     flow = get_current_flow(user_prompt)
                                     name = helper_fun.safe_prompt_path(prompt_id, flow, json_obj["action_id"])
                                     if not os.path.exists(name):
-                                        metadata = strip_json_values(agent_data.get(prompt_id, {}))
+                                        from core.agent_tools import memory_view
+                                        metadata = strip_json_values(
+                                            memory_view(agent_data, prompt_id, user_prompt))
                                         json_obj['metadata'] = metadata
                                         if prompt_id in task_time and task_time[prompt_id].get('times'):
                                             json_obj['time_took_to_complete'] = task_time[prompt_id]['times'][-1]
@@ -3510,6 +3556,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         'retrieve_json': retrieve_json,
         'strip_json_values': strip_json_values,
         'save_conversation_db': save_conversation_db,
+        'building_agent': True,
     }
     core_tools_time = build_core_tool_closures(_tool_ctx_time)
     _time_tool_menu = registered_tool_menu(core_tools_time)
@@ -6049,7 +6096,8 @@ def request_fallback_for_action_last(current_action_id, user_prompt):
 def request_recipe_for_action_last(current_action_id, prompt_id, role, user_prompt):
     user_tasks[user_prompt].recipe = False
     user_tasks[user_prompt].fallback = False
-    metadata = strip_json_values(agent_data[prompt_id])
+    from core.agent_tools import memory_view
+    metadata = strip_json_values(memory_view(agent_data, prompt_id, user_prompt))
     safe_set_state(user_prompt, current_action_id, ActionState.RECIPE_REQUESTED, "recipe start")
     message = RECIPE_CREATE_PROMPT_PREFIX + ''' that includes only the necessary steps for this action from history, along with a suitable name. Provide the output in the following JSON format:
                         { "status": "done", "action": "''' + str(user_tasks[user_prompt].get_action(user_tasks[
@@ -6068,7 +6116,10 @@ def request_recipe_for_action(current_action_id, prompt_id, role, user_prompt, p
     user_tasks[user_prompt].recipe = False
     user_tasks[user_prompt].fallback = False
     safe_set_state(user_prompt, current_action_id, ActionState.RECIPE_REQUESTED, "recipe start")
-    metadata = strip_json_values(agent_data[prompt_id])
+    # The creator's own memory for this agent and what the agent holds for
+    # everyone (memory_view): their saves live under user_prompt now.
+    from core.agent_tools import memory_view
+    metadata = strip_json_values(memory_view(agent_data, prompt_id, user_prompt))
     # Name the action the recipe is FOR, exactly as request_recipe_for_action_last
     # already does.  This builder sent the literal placeholder "Describe the
     # action performed here", so the only strong word in the whole prompt was
@@ -6800,7 +6851,7 @@ def initialize_with_resume(prompt_id, user_prompt, user_id):
     agent_data[prompt_id] = {'user_id': user_id}
 
     # Load existing metadata
-    load_existing_metadata(prompt_id, user_prompt, flow_progress)
+    load_existing_metadata(prompt_id, user_prompt, flow_progress, user_id)
 
     current_app.logger.info(f"[RESUME] RESUME SUMMARY:")
     current_app.logger.info(f"   - Resumed at Flow {current_flow}, Action {current_action}")
@@ -6810,7 +6861,7 @@ def initialize_with_resume(prompt_id, user_prompt, user_id):
     return current_flow, current_action, completed_flows
 
 
-def load_existing_metadata(prompt_id, user_prompt, flow_progress):
+def load_existing_metadata(prompt_id, user_prompt, flow_progress, user_id):
     """
     Load metadata from existing action JSONs to restore agent_data state
     """
@@ -6818,6 +6869,24 @@ def load_existing_metadata(prompt_id, user_prompt, flow_progress):
         # First, try to load from persistent storage
         if helper_fun.load_agent_data_from_file(prompt_id, agent_data):
             current_app.logger.info(f" Successfully loaded persistent agent data for prompt_id {prompt_id}")
+            return
+        # An action JSON's metadata is a saved-key snapshot (the memory_view
+        # of whoever completed that action, the creator unless a visitor
+        # built on a half-built agent, task #239), so it restores the
+        # creator's own memory for this agent and nobody else's: in the
+        # shared store it read back as values (None) for every other user
+        # (review of 7121264b1), and in a visitor's store, when a visitor
+        # resumed CREATE on a half-built agent, it gave them the creator's
+        # keys and shadowed later shared templates with None (review of
+        # c8aea38e7).  Nothing to restore when that memory exists.
+        from core.agent_tools import is_agent_creator, person_store_id
+        if not is_agent_creator(user_id, prompt_id):
+            current_app.logger.info(
+                f" No saved-key snapshot restored for {user_prompt}: not "
+                f"the creator of agent {prompt_id}")
+            return
+        own_id = person_store_id(user_prompt)
+        if agent_data.get(own_id):
             return
         # Look for the most recent action JSON with metadata
         for flow_idx, progress in flow_progress.items():
@@ -6827,13 +6896,12 @@ def load_existing_metadata(prompt_id, user_prompt, flow_progress):
                     with open(action_file, 'r') as f:
                         action_data = json.load(f)
                         if 'metadata' in action_data and action_data['metadata']:
-                            # Merge metadata into agent_data
-                            if prompt_id not in agent_data:
-                                agent_data[prompt_id] = {}
-                            agent_data[prompt_id].update(action_data['metadata'])
+                            # Merge metadata into the creator's own memory
+                            own = agent_data.setdefault(own_id, {})
+                            own.update(action_data['metadata'])
                             current_app.logger.info(f" Loaded metadata from {action_file}")
                             # Save to persistent storage for future use
-                            helper_fun.save_agent_data_to_file(prompt_id,agent_data)
+                            helper_fun.save_agent_data_to_file(own_id, agent_data)
                             return  # Load from most recent only
                 except Exception as e:
                     current_app.logger.warning(f"⚠️ Could not load metadata from {action_file}: {e}")
@@ -6971,12 +7039,24 @@ def update_agent_creation_to_db(prompt_id):
     # core/recipe_sync.py - without it the agent is local-only and
     # the user hits the silent-fallback bug when switching devices.
     # Best-effort: never raises, never blocks the user.
+    # Except a local-only agent's bundle (decision U4(c); marketing_tools
+    # .is_local_only over the record's goal_tags, e.g. her Reel Studio agent):
+    # its goal, goal_tags, flows, extra_information and recipes are not
+    # pushed, like its prompt-list row (hart_intelligence_entry
+    # ._save_and_enter_review).  Asked inside the try: a record that cannot
+    # be read is not pushed.
     try:
         from core.recipe_sync import push_recipe
-        # user_id not in scope here; recipe_sync accepts '' as
-        # creator-unknown.  The {prompt_id}.json file itself carries
-        # creator_user_id so the cloud side can still attribute.
-        push_recipe(PROMPTS_DIR, prompt_id, user_id='')
+        from integrations.agent_engine.marketing_tools import is_local_only
+        if is_local_only(get_prompt_config_json(prompt_id).get('goal_tags')):
+            current_app.logger.info(
+                f'recipe_sync: prompt_id={prompt_id} is local-only; its '
+                f'bundle is not pushed to the cloud')
+        else:
+            # user_id not in scope here; recipe_sync accepts '' as
+            # creator-unknown.  The {prompt_id}.json file itself carries
+            # creator_user_id so the cloud side can still attribute.
+            push_recipe(PROMPTS_DIR, prompt_id, user_id='')
     except Exception as _push_err:
         current_app.logger.debug(
             f'recipe_sync push for prompt_id={prompt_id} failed: {_push_err}')

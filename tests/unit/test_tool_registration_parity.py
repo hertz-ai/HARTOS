@@ -377,13 +377,48 @@ def test_send_message_to_roles_registered_in_both_flows():
     assert callable(_send_message_to_roles_impl)
 
 
+#: Each pipeline's agent constructor: the function whose Tier-2 block reads
+#: ``goal_tags``.
+_TIER2_CONSTRUCTORS = {
+    os.path.join('hartos', 'create_recipe.py'): 'create_agents',
+    os.path.join('hartos', 'reuse_recipe.py'): 'create_agents_for_user',
+}
+
+
+def _goal_tags_sources(src: str, constructor: str) -> set:
+    """The functions ``goal_tags`` is bound from by a call inside
+    ``constructor`` (``goal_tags = <name>(...)``).  Read from the AST, so a
+    comment or a docstring that names a function never counts."""
+    fn = next((n for n in ast.walk(ast.parse(src))
+               if isinstance(n, ast.FunctionDef) and n.name == constructor), None)
+    assert fn is not None, f'{constructor} not found; re-point this guard'
+    found = set()
+    for node in ast.walk(fn):
+        if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
+                and any(isinstance(t, ast.Name) and t.id == 'goal_tags'
+                        for t in node.targets)):
+            f = node.value.func
+            found.add(f.id if isinstance(f, ast.Name) else getattr(f, 'attr', '?'))
+    return found
+
+
 def test_tier2_goal_detection_parity():
-    """Both create_recipe.py and reuse_recipe.py must use
-    detect_goal_tags() for Tier-2 progressive tool injection, with the
-    same 5 categories (marketing / ip_protection / self_build / outreach
-    / sales).  Earlier reuse used `prompt_id.startswith()` and only
-    handled 2 of 5 — recipes authored under semantic tags failed to
-    replay because the matching Tier-2 modules never loaded."""
+    """Both create_recipe.py and reuse_recipe.py must decide Tier-2
+    progressive tool injection through the ONE resolver,
+    marketing_tools.resolve_goal_tags (the record's stored tags plus
+    detect_goal_tags on the goal's words), with the same categories
+    (marketing / ip_protection / self_build / outreach / sales / news).
+    Earlier reuse used `prompt_id.startswith()` and only handled 2 of 5 —
+    recipes authored under semantic tags failed to replay because the
+    matching Tier-2 modules never loaded.  What the resolver decides is
+    pinned behaviourally in test_tier2_tags_come_from_the_goal_words."""
+    # The resolver reader is not vacuous: a constructor that only NAMES the
+    # resolver in a comment -- how the old text check passed -- binds
+    # goal_tags from nothing.
+    assert _goal_tags_sources(
+        'def create_agents():\n'
+        '    # goal_tags = resolve_goal_tags(None, task)\n'
+        '    goal_tags = []\n', 'create_agents') == set()
     EXPECTED_CATEGORIES = {
         'marketing', 'ip_protection', 'self_build', 'outreach', 'sales',
         'news',
@@ -398,13 +433,18 @@ def test_tier2_goal_detection_parity():
         # these wired in BOTH flows or a news recipe replays toolless.
         'news': 'register_news_tools',
     }
-    for filename in (os.path.join('hartos', 'create_recipe.py'), os.path.join('hartos', 'reuse_recipe.py')):
+    for filename, constructor in _TIER2_CONSTRUCTORS.items():
         src = _read(os.path.join(REPO_ROOT, filename))
 
-        # Must use detect_goal_tags() — semantic method, not prefix string
-        assert 'detect_goal_tags(' in src, (
-            f"{filename} must use detect_goal_tags(...) for Tier-2 "
-            f"detection.  Mirrors progressive-injection design and "
+        # Must bind goal_tags from ONE call to the canonical resolver —
+        # semantic method, not prefix string.  The AST, not the text: this
+        # used to look for 'detect_goal_tags(' anywhere in the file, which a
+        # comment satisfied and a reworded comment broke.
+        sources = _goal_tags_sources(src, constructor)
+        assert sources == {'resolve_goal_tags'}, (
+            f"{filename}: {constructor} must bind goal_tags from "
+            f"resolve_goal_tags(...) alone for Tier-2 detection, found "
+            f"{sorted(sources)}.  Mirrors progressive-injection design and "
             f"makes both flows route the same tags to the same modules.")
 
         # Old prefix-string method must be GONE from the Tier-2 block.
@@ -427,6 +467,27 @@ def test_tier2_goal_detection_parity():
             assert reg_fn in src, (
                 f"{filename}: missing call to {reg_fn} for the "
                 f"`{cat}` Tier-2 branch")
+
+
+@pytest.mark.parametrize('tag, goal', [
+    ('marketing', 'Run a launch campaign for our new app'),
+    ('ip_protection', 'File a provisional patent for our sensor design'),
+    ('self_build', 'Install package htop with nixos-rebuild on this machine'),
+    ('outreach', 'Send a cold email sequence to new prospects'),
+    ('sales', 'Map the user journey of our sales pipeline'),
+    ('news', 'Curate news from my rss feed every morning'),
+])
+def test_tier2_tags_come_from_the_goal_words(tag, goal):
+    """What both constructors' one resolver decides (the parity guard above
+    holds them to it): each Tier-2 family's tag comes from the goal's words,
+    a record without stored tags gets exactly what detect_goal_tags finds,
+    and words that ask for no family get none."""
+    from integrations.agent_engine.marketing_tools import (
+        detect_goal_tags, resolve_goal_tags)
+    tags = resolve_goal_tags(None, goal)
+    assert tag in tags, f'{goal!r} resolved to {tags}, without {tag!r}'
+    assert tags == detect_goal_tags(goal)
+    assert resolve_goal_tags(None, 'Say good morning to me') == []
 
 
 # ─── T7: Cross-user-join fallback + per-persona-owner topic ─────────

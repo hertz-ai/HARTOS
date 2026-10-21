@@ -308,6 +308,51 @@ class TestGetVisionBackend:
         backend = get_vision_backend('imaginary')
         assert backend.name == 'none'
 
+    # ── one instance of each backend per process (owner ruling 2026-10-15) ──
+    # The reel names its backend (moments.REEL_VLM_DEFAULT), VisionService and
+    # the book reader take the auto pick.  Each used to get a NEW instance, so
+    # each had its own "a start is under way" state, and two of them spawned
+    # two 0.8B servers on one port (reviewer F1, a HARTOS-only node).
+
+    @pytest.mark.parametrize('name', sorted(_BACKENDS))
+    def test_every_caller_naming_a_backend_gets_the_same_instance(self, name):
+        assert get_vision_backend(name) is get_vision_backend(name)
+
+    def test_an_unknown_name_is_the_one_none_backend(self):
+        assert get_vision_backend('imaginary') is get_vision_backend('none')
+
+    def test_the_auto_pick_is_the_instance_the_reel_names(self):
+        """VisionService and the book reader (auto pick) and the reel
+        (get_vision_backend('qwen08b')) hold one backend, so its start state
+        covers all three."""
+        from integrations.vision.lightweight_backend import Qwen08BBackend
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('HEVOLVE_VISION_BACKEND', None)
+            with patch.object(Qwen08BBackend, 'is_available', return_value=True):
+                assert get_vision_backend() is get_vision_backend('qwen08b')
+
+    def test_the_env_override_hands_out_the_shared_instance(self):
+        with patch.dict(os.environ, {'HEVOLVE_VISION_BACKEND': 'clip'}):
+            assert get_vision_backend() is get_vision_backend('clip')
+
+    def test_the_fallback_tiers_hand_out_the_shared_instances(self):
+        mock_caps = MagicMock()
+        mock_caps.hardware.gpu_vram_gb = 8
+        mock_caps.hardware.ram_gb = 16
+        with self._upper_tiers_off(), \
+             patch('security.system_requirements.get_capabilities',
+                   return_value=mock_caps):
+            assert get_vision_backend() is get_vision_backend('minicpm')
+
+    def test_the_backend_listing_asks_the_shared_instances(self):
+        """list_available_backends reports on the instances callers hold,
+        not on throwaway copies."""
+        from integrations.vision.lightweight_backend import Qwen08BBackend
+        with patch.object(Qwen08BBackend, 'is_available', autospec=True,
+                          return_value=False) as asked:
+            list_available_backends()
+        assert asked.call_args.args[0] is get_vision_backend('qwen08b')
+
     @staticmethod
     @contextlib.contextmanager
     def _upper_tiers_off():
@@ -414,7 +459,7 @@ class TestReadDocument:
         import integrations.vision.lightweight_backend as lvb
         from core.http_pool import LLM_COMPLETION_TIMEOUT
         backend = lvb.Qwen08BBackend(port=9555)
-        with patch.object(backend, '_ensure_running', return_value=True), \
+        with patch.object(backend, 'ensure_running', return_value=True), \
              patch.object(lvb, 'pooled_post', return_value=self._answer()) as post:
             assert backend.read_document(self._page(), 'read every line') == 'page text'
         # The caption server's own port, the one describe() uses.
@@ -430,7 +475,7 @@ class TestReadDocument:
     def test_a_small_page_is_not_enlarged(self):
         import integrations.vision.lightweight_backend as lvb
         backend = lvb.Qwen08BBackend(port=9555)
-        with patch.object(backend, '_ensure_running', return_value=True), \
+        with patch.object(backend, 'ensure_running', return_value=True), \
              patch.object(lvb, 'pooled_post', return_value=self._answer()) as post:
             backend.read_document(self._page((600, 800)), 'x')
         assert self._sent_size(post) == (600, 800)
@@ -438,7 +483,7 @@ class TestReadDocument:
     def test_no_caption_server_means_no_request(self):
         import integrations.vision.lightweight_backend as lvb
         backend = lvb.Qwen08BBackend(port=9555)
-        with patch.object(backend, '_ensure_running', return_value=False), \
+        with patch.object(backend, 'ensure_running', return_value=False), \
              patch.object(lvb, 'pooled_post') as post:
             assert backend.read_document(self._page(), 'x') is None
         post.assert_not_called()
@@ -451,7 +496,7 @@ class TestReadDocument:
     def test_what_the_server_answered_is_what_comes_back(self, answer, expected):
         import integrations.vision.lightweight_backend as lvb
         backend = lvb.Qwen08BBackend(port=9555)
-        with patch.object(backend, '_ensure_running', return_value=True), \
+        with patch.object(backend, 'ensure_running', return_value=True), \
              patch.object(lvb, 'pooled_post', return_value=self._answer(**answer)):
             assert backend.read_document(self._page(), 'x') == expected
 
@@ -459,7 +504,7 @@ class TestReadDocument:
         import requests
         import integrations.vision.lightweight_backend as lvb
         backend = lvb.Qwen08BBackend(port=9555)
-        with patch.object(backend, '_ensure_running', return_value=True), \
+        with patch.object(backend, 'ensure_running', return_value=True), \
              patch.object(lvb, 'pooled_post', side_effect=requests.ConnectionError('refused')):
             assert backend.read_document(self._page(), 'x') is None
 
@@ -740,7 +785,17 @@ class TestModelRegistryVisionLite:
 
 # ── #102: a failed launch must not kill captioning for good ───────────
 
-def test_a_failed_launch_is_retried_after_the_cooldown():
+#: The standalone launcher's llama-server lookup.  The cooldown tests pin it
+#: to "none on this machine": they are about WHEN a launch is tried, and with
+#: a real binary and the 0.8B files on the box they would spawn a real
+#: llama-server.
+LLAMA_SERVER_LOOKUP = ('integrations.service_tools.model_lifecycle.'
+                       'ModelLifecycleManager._find_llama_server_binary')
+
+
+@patch(LLAMA_SERVER_LOOKUP, return_value=None)
+@patch('time.sleep')
+def test_a_failed_launch_is_retried_after_the_cooldown(_sleep, _binary):
     """Found by hartos-94, read from the path and fixed here.
 
     _launch_attempted was cleared in exactly ONE place -- the tail of
@@ -761,24 +816,26 @@ def test_a_failed_launch_is_retried_after_the_cooldown():
     # on every call before the cooldown -- correctly, it is the cheap "is
     # it already up" check -- so counting it proves nothing about whether
     # a launch was tried.
-    assert backend._ensure_running() is False
+    assert backend.ensure_running() is False
     first_attempt = backend._launch_attempted_at
     assert first_attempt > 0, 'never even tried'
 
     # immediately after: suppressed by the cooldown, as intended
-    assert backend._ensure_running() is False
+    assert backend.ensure_running() is False
     assert backend._launch_attempted_at == first_attempt, (
         'hammered the launch instead of waiting out the cooldown')
 
     # once the cooldown has passed, it tries AGAIN rather than latching off
     backend._launch_attempted_at -= (backend.LAUNCH_RETRY_S + 1)
     stale = backend._launch_attempted_at
-    assert backend._ensure_running() is False
+    assert backend.ensure_running() is False
     assert backend._launch_attempted_at > stale, (
         'captioning stayed dead after one failed launch (#102)')
 
 
-def test_a_wedged_server_is_stopped_before_another_is_launched():
+@patch(LLAMA_SERVER_LOOKUP, return_value=None)
+@patch('time.sleep')
+def test_a_wedged_server_is_stopped_before_another_is_launched(_sleep, _binary):
     """hartos-3a F7: after the cooldown a retry launched a second
     llama-server while the first -- alive but never serving -- kept running,
     and its log handle leaked.  One process at a time."""
@@ -794,7 +851,7 @@ def test_a_wedged_server_is_stopped_before_another_is_launched():
     backend._launch_attempted = True
     backend._launch_attempted_at -= (backend.LAUNCH_RETRY_S + 1)
 
-    backend._ensure_running()
+    backend.ensure_running()
 
     assert wedged.terminate.called or wedged.kill.called, (
         'relaunched over a process that was still running')
@@ -817,15 +874,21 @@ def test_weights_on_disk_do_not_stand_in_for_a_running_server(
     """Measured live 2026-09-27: the 0.8B GGUF is in ~/.nunba/models, :8081
     refuses connections, and VisionService logged described=0 over 697
     frames.  is_available() answers True from the file alone -- right for
-    SELECTING this backend -- and _ensure_running used that same answer to
+    SELECTING this backend -- and ensure_running used that same answer to
     mean "serving", so it returned True without ever asking Nunba to start
     the server, and every describe() failed at debug level."""
     from unittest.mock import patch
+    from integrations.service_tools import model_catalog as mc
     from integrations.vision import lightweight_backend as lvb
 
+    # Whole weights by the one completeness rule (gguf_complete at
+    # gguf_min_bytes of the registered size), scaled to a kilobyte.
+    model = 'Qwen3.5-0.8B-UD-Q4_K_XL.gguf'
+    monkeypatch.setitem(mc.MODEL_WEIGHT_BYTES, model, (1000, 'test: scaled down'))
+    monkeypatch.setattr(mc, 'GGUF_MIN_BYTES', 0)
     models = tmp_path / '.nunba' / 'models'
     models.mkdir(parents=True)
-    (models / 'Qwen3.5-0.8B-UD-Q4_K_XL.gguf').write_bytes(b'gguf')
+    (models / model).write_bytes(b'GGUF' + b'\0' * 996)
     monkeypatch.setenv('HOME', str(tmp_path))
     monkeypatch.setenv('USERPROFILE', str(tmp_path))
 
@@ -840,6 +903,6 @@ def test_weights_on_disk_do_not_stand_in_for_a_running_server(
          patch('integrations.service_tools.model_lifecycle.'
                'ModelLifecycleManager._find_llama_server_binary',
                return_value=None):
-        assert backend._ensure_running() is False
+        assert backend.ensure_running() is False
     assert 'vlm_caption.requested' in emitted, (
         'a server that is not running was never asked for')

@@ -256,6 +256,27 @@ def _install_mobile_adapter(app) -> None:
         logger.warning(f"Mobile adapter not installed: {e}")
 
 
+def _install_file_channel() -> None:
+    """Step 5d: a person's own phone's files to and from this desktop, over
+    the device link (core.peer_link.file_channel; owner ruling U3, option A):
+    clips, logo and song audio into core.user_file_store, the reels it makes
+    back out.  It also applies the store's retention once per boot.  Central
+    is no person's desktop and keeps no one's files."""
+    try:
+        from security.key_delegation import get_node_tier
+        if get_node_tier() == 'central':
+            return
+    except Exception as e:
+        logger.debug(f"File channel: node tier unreadable ({e}); installing")
+    try:
+        from core.peer_link.file_channel import install
+        if not install():
+            logger.warning("File channel not installed: a phone cannot send this "
+                           "desktop its clips")
+    except Exception as e:
+        logger.warning(f"File channel not installed: {e}")
+
+
 def bootstrap(
     app,
     config: Optional[Mapping[str, Any]] = None,
@@ -358,6 +379,9 @@ def _run_bootstrap(app, cfg: dict) -> None:
       5c. the mobile adapter (integrations.mobile_adapter) -- added
           2026-10-06: a phone's cloud calls answered by the routes above,
           over the device link
+      5d. the file channel (core.peer_link.file_channel) -- added
+          2026-10-13: a phone's clips in and its reels out, over the same
+          device link, beside the adapter (the other device door)
       6. init_db + run_migrations
       7. channel adapters (config + env-var + web)
       8. init_agent_engine
@@ -389,6 +413,7 @@ def _run_bootstrap(app, cfg: dict) -> None:
             # why the bundle needs this (peers got the SPA shell for /a2a/*).
             _init_a2a_server(app, cfg)
             _install_mobile_adapter(app)
+            _install_file_channel()
             _init_database(cfg)
             _init_channel_adapters(app, cfg)
             # IMPORTANT: spawn hevolveai BEFORE the agent-engine subsystem

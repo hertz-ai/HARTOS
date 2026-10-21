@@ -1,0 +1,182 @@
+{
+  "_about": "Reels shaped like Instagram's private clips/user/ items[].media, as instagrapi 3.0.24 receives them (field names read from its types.py, extractors.py and mixins). Every id, handle, title and number is invented for the tests; URLs point at example.invalid.",
+  "licensed": {
+    "pk": 3412000000000000101,
+    "id": "3412000000000000101_9100000001",
+    "code": "Cfix0001",
+    "taken_at": 1760300000,
+    "media_type": 2,
+    "product_type": "clips",
+    "play_count": 41200,
+    "view_count": 0,
+    "like_count": 1800,
+    "video_duration": 18.4,
+    "caption": {"text": "Reception look in 40 minutes"},
+    "video_versions": [{"url": "https://example.invalid/v.mp4", "width": 720, "height": 1280}],
+    "image_versions2": {"candidates": [{"url": "https://example.invalid/t.jpg", "width": 720, "height": 1280}]},
+    "user": {"pk": 9100000001, "username": "mua_fixture_one", "full_name": "Fixture One", "profile_pic_url": "https://example.invalid/p.jpg"},
+    "clips_music_attribution_info": {
+      "artist_name": "Fixture Artist",
+      "song_name": "Saree Song",
+      "uses_original_audio": false,
+      "should_mute_audio": false,
+      "should_mute_audio_reason": "",
+      "audio_id": "770000000000000001"
+    },
+    "clips_metadata": {
+      "audio_type": "licensed_music",
+      "music_canonical_id": "18200000000000001",
+      "music_info": {
+        "music_asset_info": {
+          "id": "770000000000000001",
+          "audio_cluster_id": 660000000000001,
+          "audio_asset_id": 770000000000000001,
+          "music_canonical_id": "18200000000000001",
+          "title": "Saree Song",
+          "subtitle": "",
+          "display_artist": "Fixture Artist",
+          "highlight_start_times_in_ms": [38500, 61000],
+          "duration_in_ms": 180000,
+          "is_explicit": false,
+          "progressive_download_url": "https://example.invalid/song.m4a",
+          "dash_manifest": "<MPD>fixture</MPD>",
+          "cover_artwork_uri": "https://example.invalid/cover.jpg"
+        },
+        "music_consumption_info": {"should_mute_audio": false}
+      },
+      "original_sound_info": null
+    }
+  },
+  "original_audio": {
+    "pk": 3412000000000000202,
+    "id": "3412000000000000202_9100000002",
+    "code": "Cfix0002",
+    "taken_at": 1760290000,
+    "media_type": 2,
+    "product_type": "clips",
+    "play_count": 9800,
+    "user": {"pk": 9100000002, "username": "mua_fixture_two"},
+    "clips_music_attribution_info": {
+      "artist_name": "mua_fixture_two",
+      "song_name": "Original audio",
+      "uses_original_audio": true,
+      "should_mute_audio": false,
+      "audio_id": "880000000000000002"
+    },
+    "clips_metadata": {
+      "audio_type": "original_sounds",
+      "music_canonical_id": "",
+      "music_info": null,
+      "original_sound_info": {
+        "audio_asset_id": 880000000000000002,
+        "original_audio_title": "Original audio",
+        "duration_in_ms": 21000,
+        "is_explicit": false,
+        "should_mute_audio": false,
+        "progressive_download_url": "https://example.invalid/orig.m4a",
+        "dash_manifest": "<MPD>orig</MPD>",
+        "ig_artist": {"pk": 9100000002, "username": "mua_fixture_two", "profile_pic_url": "https://example.invalid/p2.jpg"},
+        "consumption_info": {"should_mute_audio_reason": "", "is_trending_in_clips": false}
+      }
+    }
+  },
+  "attribution_only": {
+    "pk": 3412000000000000303,
+    "id": "3412000000000000303_9100000003",
+    "code": "Cfix0003",
+    "taken_at": 1760280000,
+    "media_type": 2,
+    "product_type": "clips",
+    "play_count": null,
+    "view_count": 15500,
+    "user": {"pk": 9100000003, "username": "mua_fixture_three"},
+    "clips_music_attribution_info": {
+      "artist_name": "Fixture Band",
+      "song_name": "Mehendi Beat",
+      "uses_original_audio": false,
+      "should_mute_audio": false,
+      "audio_id": "990000000000000003"
+    },
+    "clips_metadata": {
+      "audio_type": "licensed_music",
+      "music_canonical_id": ""
+    }
+  },
+  "canonical_only": {
+    "pk": 3412000000000000404,
+    "id": "3412000000000000404_9100000004",
+    "code": "Cfix0004",
+    "taken_at": 1760270000,
+    "media_type": 2,
+    "product_type": "clips",
+    "play_count": 7300,
+    "user": {"pk": 9100000004, "username": "mua_fixture_four"},
+    "clips_metadata": {
+      "audio_type": "licensed_music",
+      "music_canonical_id": "18200000000000044",
+      "music_info": {}
+    }
+  },
+  "muted": {
+    "pk": 3412000000000000505,
+    "id": "3412000000000000505_9100000005",
+    "code": "Cfix0005",
+    "taken_at": 1760260000,
+    "media_type": 2,
+    "product_type": "clips",
+    "play_count": 52000,
+    "user": {"pk": 9100000005, "username": "mua_fixture_five"},
+    "clips_music_attribution_info": {
+      "artist_name": "Fixture Label",
+      "song_name": "Muted Song",
+      "uses_original_audio": false,
+      "should_mute_audio": true,
+      "should_mute_audio_reason": "copyright",
+      "audio_id": "550000000000000005"
+    },
+    "clips_metadata": {
+      "audio_type": "licensed_music",
+      "music_canonical_id": "18200000000000055",
+      "music_info": {
+        "music_asset_info": {
+          "audio_cluster_id": 550000000000005,
+          "audio_asset_id": 550000000000000005,
+          "title": "Muted Song",
+          "display_artist": "Fixture Label",
+          "highlight_start_times_in_ms": [12000],
+          "duration_in_ms": 150000,
+          "is_explicit": false
+        }
+      }
+    }
+  },
+  "no_music": {
+    "pk": 3412000000000000606,
+    "id": "3412000000000000606_9100000001",
+    "code": "Cfix0006",
+    "taken_at": 1760250000,
+    "media_type": 2,
+    "product_type": "clips",
+    "play_count": 3900,
+    "user": {"pk": 9100000001, "username": "mua_fixture_one"},
+    "clips_metadata": {"audio_type": "original_sounds", "music_canonical_id": ""}
+  },
+  "track": {
+    "id": "770000000000000044",
+    "title": "Mallige Song",
+    "subtitle": "",
+    "display_artist": "Fixture Singer",
+    "audio_cluster_id": 660000000000044,
+    "music_canonical_id": "18200000000000044",
+    "highlight_start_times_in_ms": [45000],
+    "is_explicit": false,
+    "dash_manifest": "<MPD>track</MPD>",
+    "has_lyrics": true,
+    "audio_asset_id": 770000000000000044,
+    "duration_in_ms": 200000,
+    "allows_saving": true,
+    "territory_validity_periods": {},
+    "progressive_download_url": "https://example.invalid/track.m4a",
+    "cover_artwork_uri": "https://example.invalid/track.jpg"
+  }
+}

@@ -65,16 +65,36 @@ _SAVE_CONFIG_LOCK = threading.Lock()
 admin_bp = Blueprint("admin", __name__, url_prefix="/api/admin")
 
 
+#: Node tiers on which the channel configuration is the operator's, not every
+#: registered user's.  Central only: it serves strangers over the public API
+#: host.  Regional is NOT listed: a regional node's own operator holds
+#: neither role 'central' nor is_admin (no code path grants either locally;
+#: the most such an account can carry is role 'regional' with is_moderator,
+#: what UserService.set_user_role writes), so holds_central_role refuses them
+#: and listing regional here locked every regional operator out of their own
+#: channels (review of 91a211c9e); who operates a regional node is the
+#: owner's ruling, task #124.  The same env read the network gate uses
+#: (security/middleware.py, HEVOLVE_NODE_TIER).
+_OPERATOR_ONLY_TIERS = ('central',)
+
+
 @admin_bp.before_request
 def _admin_auth_gate():
-    """Require authenticated user for channel/device config endpoints.
+    """Require an authenticated user; on central, the operator.
 
-    Channel config (settings, identity, channels, workflows) is local device
-    configuration — any registered (flat+) user can manage their own device.
-    Network-wide admin operations (user management, moderation) are protected
-    by separate @require_central decorators on the social admin blueprint.
+    Channel config (settings, identity, channels, workflows) is node
+    configuration.  On a flat desktop any registered user is the one person
+    using the device, so a valid token is enough; a regional node keeps that
+    rule until task #124 says who its operator is.  On central the node
+    serves strangers and Kong routes /api/admin on the public API host, so
+    the gate requires the operator: ``holds_central_role``, the check the
+    social layer's central-only decorator applies.  Measured 2026-10-13 on
+    central: a self-registered user's JWT reached /api/admin/channels (task
+    #121).  Network-wide admin operations (user management, moderation) stay
+    behind the social admin blueprint's own @require_admin and
+    @require_moderator decorators.
     """
-    from integrations.social.auth import _get_user_from_token
+    from integrations.social.auth import _get_user_from_token, holds_central_role
     from flask import g
 
     auth_header = request.headers.get('Authorization', '')
@@ -87,6 +107,13 @@ def _admin_auth_gate():
         if db:
             db.close()
         return jsonify({'success': False, 'error': 'Invalid or expired token'}), 401
+
+    node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat').lower()
+    if node_tier in _OPERATOR_ONLY_TIERS and not holds_central_role(user):
+        if db:
+            db.close()
+        return jsonify({'success': False,
+                        'error': 'Operator access required on this node'}), 403
 
     g.user = user
     g.user_id = str(user.id)
@@ -2630,9 +2657,12 @@ def reset_config():
 def _require_admin_user():
     """Raise PermissionError unless the authenticated caller is an admin.
 
-    The blueprint's ``before_request`` gate only verifies the bearer token is
-    valid; admin-level operations on every-user resources still need an
-    explicit is_admin check.  ``api_response`` maps PermissionError to 403.
+    The blueprint's ``before_request`` gate verifies the bearer token and, on
+    central only, that the caller ``holds_central_role``; on a flat or
+    regional node any registered user passes it, so admin-level operations on
+    every-user resources still need an explicit is_admin check here (one
+    definition of admin for both is task #124's follow-up).  ``api_response``
+    maps PermissionError to 403.
     """
     user = getattr(g, 'user', None)
     if user is None or not getattr(user, 'is_admin', False):

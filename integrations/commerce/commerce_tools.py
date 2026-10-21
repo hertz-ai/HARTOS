@@ -35,6 +35,10 @@ import logging
 import re
 from typing import Annotated, Any, Dict, List, Optional
 
+from integrations.ap2.ap2_protocol import (
+    NO_LIVE_GATEWAY, NO_LIVE_GATEWAY_REASON, mock_would_settle,
+    refuse_no_live_gateway)
+
 logger = logging.getLogger('tool_execution')
 
 MERCHANT = 'mcgroce'
@@ -351,6 +355,16 @@ def commerce_apply_promo(
     return _cart_result(user_id, _client().apply_promo(user_id, code))
 
 
+# The shopper's wording for ap2_protocol.NO_LIVE_GATEWAY.  select_gateway
+# answers MOCK whenever neither PhonePe nor Stripe is registered, and the mock
+# captures anything, so a cart on a node with no gateway keys was marked paid
+# and the McGroce order placed with no money taken (read at 903cd58c0,
+# 2026-10-14).  The gate is ap2_protocol.mock_would_settle, the one spelling
+# every settler reads; the cart path acts for the shopper by id and has no
+# operator object, so dev mode is its only exemption.
+_NO_LIVE_GATEWAY = f'this store cannot take payments right now: {NO_LIVE_GATEWAY}'
+
+
 def commerce_prepare_checkout(
     user_id: str,
     cap: Annotated[Optional[float], "The most the shopper said they want to spend, in INR"] = None,
@@ -359,7 +373,9 @@ def commerce_prepare_checkout(
 
     Shows the checkout summary and an Approve / Decline card.  Nothing is
     charged: the shopper approves on their own device, then call
-    commerce_checkout with the returned mandate_id.
+    commerce_checkout with the returned mandate_id.  Refused outright on a
+    node that cannot take money (ap2_protocol.mock_would_settle): a shopper
+    is never asked to approve a payment nothing can capture.
     """
     res = _client().cart_get(user_id)
     if not res['success']:
@@ -367,6 +383,10 @@ def commerce_prepare_checkout(
     view = cart_view(res['data'])
     if not view['items']:
         return _fail('the cart is empty')
+    from integrations.ap2.ap2_protocol import get_payment_ledger
+    if mock_would_settle(get_payment_ledger().select_gateway(CURRENCY)):
+        refuse_no_live_gateway('commerce', user_id)
+        return _fail(_NO_LIVE_GATEWAY)
     from integrations.ap2.ap2_mandate import MandateError
     try:
         m = _mandates().create_cart_mandate(
@@ -438,6 +458,19 @@ def settle_checkout(m) -> Dict[str, Any]:
         return {'success': False, 'error': f'checkout refused: {reason}'}
     from integrations.ap2.ap2_protocol import PaymentStatus, get_payment_ledger
     ledger = get_payment_ledger()
+    payment = ledger.get_payment(m.payment_id)
+    if payment is not None and mock_would_settle(payment.gateway):
+        # The money gate itself, whatever created the mandate (an older
+        # build, keys removed after the approval): nothing can be charged, so
+        # the approval is void and the payment must not stay AUTHORIZED.
+        store.withdraw(m.mandate_id, NO_LIVE_GATEWAY_REASON)
+        refuse_no_live_gateway('commerce', user_id, m.payment_id)
+        from integrations.ap2.ap2_mandate import no_live_gateway_card
+        push_fragment(user_id, no_live_gateway_card(
+            'This store cannot take payments right now, so nothing was '
+            'charged and no order was placed.'))
+        return {'success': False, 'error': f'checkout refused: {_NO_LIVE_GATEWAY}',
+                'payment_id': m.payment_id}
     paid = ledger.process_payment(m.payment_id, settler=True)
     payment = ledger.get_payment(m.payment_id)
     method = payment.gateway.value if payment and payment.gateway else None

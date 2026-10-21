@@ -29,7 +29,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from typing import Any
+from typing import Any, Mapping
 
 from core.constants import (
     CHAT_ACTION_STATUS,
@@ -189,6 +189,8 @@ def publish_agent_message(
     request_id: str,
     prompt_id: Any,
     inp: Any = '',
+    media: Any = None,
+    skip_crossbar: bool = False,
 ) -> bool:
     """Deliver an agent's message to the user on the local chat topic.
 
@@ -200,7 +202,23 @@ def publish_agent_message(
     2026-06-09 and chat-stream subscribers parse (text, request_id,
     prompt_id, bot_type, options, page_image_url).
 
-    Returns True only when publish_async was resolved and returned without
+    ``media``: reply media items (Reel Studio's reel, plan 4.2(f)) the
+    message carries under ``media``; non-object entries are dropped.  A
+    message still needs text: media alone is not sent.  Without media the
+    envelope is exactly the one above.
+
+    ``skip_crossbar``: keep the message on this node's own legs -- LOCAL,
+    SSE and the user's own devices over PeerLink, which is how the phone
+    receives agent messages (EVENTS) -- and off central's crossbar (decision
+    U4(d): a reel push names her clients).  It is publish_async's own flag
+    (the one publisher, amendment A9 e), passed only when set: every other
+    message reaches publish_async, and any wrapper around it, exactly as
+    before.  Nunba's thinking-trace wrapper (routes/hartos_backend_adapter
+    ._capturing_thinking) forwards it when set.  A wrapper that does not
+    (an older Nunba's, which takes (topic, message, timeout)) raises, and
+    the push is reported undelivered rather than sent to the crossbar.
+
+    Returns True only when the publisher was resolved and returned without
     raising; False for empty text or user, an unresolvable publisher, or a
     raising one.  Callers report that result instead of claiming delivery.
     """
@@ -223,6 +241,10 @@ def publish_agent_message(
         'probe': False,
         'inp': inp,
     }
+    items = [dict(m) for m in media if isinstance(m, Mapping)] \
+        if isinstance(media, (list, tuple)) else []
+    if items:
+        payload['media'] = items
     try:
         from core.peer_link.message_bus import chat_topic_for
         from core.safe_hartos_attr import safe_hartos_attr
@@ -232,7 +254,8 @@ def publish_agent_message(
                 "publish_agent_message: HARTOS publish_async unresolvable; "
                 "message for user %s not delivered", user_id)
             return False
-        publish_async(chat_topic_for(user_id), payload)
+        flags = {'skip_crossbar': True} if skip_crossbar else {}
+        publish_async(chat_topic_for(user_id), payload, **flags)
         return True
     except Exception as e:
         logger.warning(

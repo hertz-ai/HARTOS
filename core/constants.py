@@ -813,6 +813,18 @@ LLM_THINKING_OFF_KWARGS: dict = {'enable_thinking': False}
 LLM_THINKING_OFF_REASONING: dict = {'effort': 'none'}
 
 
+# The two LangChain tools that turn a conversation into agent WORK:
+# Create_Agent (an interview, or an autonomous build saved under the
+# caller's id) and Agentic_Router (a Plan Mode consent question).  Named
+# here once, so the Tool() literals in hart_intelligence_entry.get_tools,
+# the filter that withholds them from a turn that declined agent work
+# (task #120; the metered Hive API's self-POST) and the labels below cannot
+# drift apart: a renamed tool the filter no longer matched would be offered
+# to a paid turn again.
+CREATE_AGENT_TOOL_NAME: str = 'Create_Agent'
+AGENTIC_ROUTER_TOOL_NAME: str = 'Agentic_Router'
+AGENT_WORK_TOOL_NAMES: frozenset = frozenset({CREATE_AGENT_TOOL_NAME, AGENTIC_ROUTER_TOOL_NAME})
+
 TOOL_LABELS: dict = {
     # Memory + history
     'FULL_HISTORY':                'Searching your message history…',
@@ -835,8 +847,8 @@ TOOL_LABELS: dict = {
     'Invite_Friend':               'Generating an invite link…',
     'Join_External_Room':          'Joining the room…',
     # Agent + planning
-    'Agentic_Router':              'Planning the next steps…',
-    'Create_Agent':                'Starting agent creation…',
+    AGENTIC_ROUTER_TOOL_NAME:      'Planning the next steps…',
+    CREATE_AGENT_TOOL_NAME:        'Starting agent creation…',
     # System / OS
     'Shell_Command':               'Running a command…',
     'Computer_Action':              'Acting on your screen…',
@@ -1133,8 +1145,11 @@ DEFAULT_SINGLE_ROLE = 'assistant'
 #: so this set cannot silently fall behind the producers.
 #: The identity the node mints its OWN JWT for when it calls itself with no
 #: person behind the call (dispatch._internal_auth_headers).  A request whose
-#: JWT names it is the node talking to itself: /chat trusts its body's lane
-#: claim on that basis (core.request_lane.is_internal_caller).
+#: JWT names it is the node talking to itself (core.request_lane
+#: .is_internal_caller): /chat leaves such a daemon turn to the lane its goal
+#: registered and lets its claim-less inner call keep a turn's lane.  The
+#: body's lane word /chat believes beside the node's KEY only; a JWT carries
+#: the word as its own claim or not at all (task #157).
 SYSTEM_DAEMON_IDENTITY = 'system_daemon'
 SYSTEM_IDENTITIES = frozenset({SYSTEM_DAEMON_IDENTITY})
 

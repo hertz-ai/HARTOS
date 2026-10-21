@@ -327,16 +327,6 @@ class HFModelResolver:
         # Fallback (should not reach here since 0.0 is in the map)
         return 'Q4_0'
 
-    @staticmethod
-    def _validate_gguf(path: Path) -> bool:
-        """Check GGUF magic bytes (0x47475546 = 'GGUF') at file start."""
-        try:
-            with open(path, 'rb') as f:
-                magic = f.read(4)
-                return magic == b'GGUF'
-        except Exception:
-            return False
-
     # ── Download ─────────────────────────────────────────────────
 
     def download(self, repo_id: str, filename: str) -> Path:
@@ -344,7 +334,8 @@ class HFModelResolver:
 
         Downloads to ~/.hevolve/models/gguf/{repo_safe_name}/{filename}.
         Thread-safe: only one download runs at a time.
-        Skips download if file already exists with non-zero size.
+        Skips download if a GGUF is already there (model_catalog.gguf_complete,
+        the magic only); any other file there is removed and fetched again.
         Updates the ModelStorageManager manifest on success.
 
         Args:
@@ -358,24 +349,30 @@ class HFModelResolver:
             RuntimeError: If the download fails.
             ImportError: If huggingface_hub is not installed.
         """
+        # The one GGUF check, model_catalog.gguf_complete, with no size floor:
+        # the magic only.  A file here can be any quant of any repo, and most
+        # have no registered size; the floor's 100 MB would refuse a small
+        # GGUF that is whole and re-download it on every call.
+        from .model_catalog import gguf_complete
+
         # Build local path
         repo_safe = repo_id.replace('/', '--')
         gguf_dir = Path.home() / '.hevolve' / 'models' / 'gguf' / repo_safe
         local_path = gguf_dir / filename
 
-        # Skip if already downloaded AND valid GGUF (magic bytes check)
+        # Skip if already downloaded AND a GGUF (the magic)
         if local_path.exists() and local_path.stat().st_size > 0:
-            if self._validate_gguf(local_path):
+            if gguf_complete(local_path):
                 logger.info(f"Already downloaded: {local_path}")
                 return local_path
             else:
-                logger.warning(f"Corrupt/partial GGUF detected, re-downloading: {local_path}")
+                logger.warning(f"Not a GGUF (wrong first bytes), re-downloading: {local_path}")
                 local_path.unlink(missing_ok=True)
 
         with self._download_lock:
             # Double-check after acquiring lock
             if local_path.exists() and local_path.stat().st_size > 0:
-                if self._validate_gguf(local_path):
+                if gguf_complete(local_path):
                     logger.info(f"Already downloaded (post-lock): {local_path}")
                     return local_path
                 else:

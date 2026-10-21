@@ -25,7 +25,38 @@ from enum import Enum
 from decimal import Decimal
 import hashlib
 
+from core.public_url import PUBLIC_URL_VAR, internet_base_url
+
 logger = logging.getLogger(__name__)
+
+# Where a redirect gateway's server-to-server confirmations land on this
+# node (integrations.agent_engine.commercial_api serves both paths).  The
+# gateway composes its callback URLs from these; a test pins the blueprint's
+# rules to them.
+PHONEPE_CALLBACK_PATH = '/api/v1/intelligence/phonepe/callback'
+PHONEPE_REFUND_CALLBACK_PATH = '/api/v1/intelligence/phonepe/refund-callback'
+
+
+def own_gateway_urls() -> Dict[str, str]:
+    """The URLs a redirect gateway (PhonePe) returns the buyer to and posts
+    its confirmations to, on this node's internet-reachable base
+    (core.public_url.internet_base_url: HARTOS_PUBLIC_URL, else the live
+    request's root when its Host is trusted AND the internet can reach it;
+    a loopback or LAN root is this node, but no gateway can post to it).
+    {} when there is none, and a warning says so: the payment is then
+    refused rather than sent with a host that is not this node or that
+    nothing can reach.  Called only for a redirect gateway: a cart mandate
+    on Stripe or the dev mock needs no such URLs."""
+    base = internet_base_url()
+    if not base:
+        logger.warning('ap2: this node has no public address for a redirect '
+                       'gateway\'s return and callback urls (set %s); a payment '
+                       'through one cannot be started until it has one',
+                       PUBLIC_URL_VAR)
+        return {}
+    return {'redirect_url': base + '/',
+            'callback_url': base + PHONEPE_CALLBACK_PATH,
+            'refund_callback_url': base + PHONEPE_REFUND_CALLBACK_PATH}
 
 
 class PaymentStatus(str, Enum):
@@ -70,6 +101,72 @@ class PaymentGateway(str, Enum):
 # Gateways whose create_payment returns a hosted-checkout redirect: the money
 # moves later, when the person pays, and a server callback confirms it.
 REDIRECT_GATEWAYS = frozenset({PaymentGateway.PHONEPE})
+
+
+def mock_settlement_allowed(user=None) -> bool:
+    """May a payment the ledger routed to the MockPaymentGateway settle for
+    this caller?  The ONE rule for every settlement path.
+
+    The mock authorizes any payment_method and captures anything, so for a
+    customer it is a paid tier, or a placed order, for nothing: a plain user
+    named ``gateway: mock`` or hit a node without Stripe and got enterprise
+    with the $499 recorded as paid (review of 0cf610371, measured on the real
+    route); a McGroce cart on a node with no gateway keys settled through the
+    mock and the order was placed (claude-autostart-93, 2026-10-14, read at
+    903cd58c0).  select_gateway answers MOCK whenever no live gateway is
+    registered, so a missing key must read as "cannot take payments", never
+    as "paid".
+
+    Allowed only when the node is in the existing dev mode
+    (security.master_key.is_dev_mode, HEVOLVE_DEV_MODE=true, which central
+    forces to false at boot), or when the caller is a known operator
+    (integrations.social.auth.holds_central_role).  A settler that acts for
+    a person by id and holds no user object (the cart settler) passes none
+    and gets the dev-mode answer alone.
+    """
+    from security.master_key import is_dev_mode     # the ONE dev-mode switch
+    if is_dev_mode():
+        return True
+    if user is None:
+        return False
+    from integrations.social.auth import holds_central_role
+    return holds_central_role(user)
+
+
+#: The refusal every settlement path answers with when the mock is the only
+#: gateway (the person hears that nothing was charged; the operator reads
+#: which setting is missing in the WARNING each refusal logs).
+NO_LIVE_GATEWAY = 'no live payment gateway is configured on this node'
+LIVE_GATEWAY_SETTINGS = ('STRIPE_API_KEY, or PHONEPE_MERCHANT_ID with '
+                         'PHONEPE_SALT_KEY for INR')
+
+
+def mock_would_settle(gateway, user=None) -> bool:
+    """Would a payment on ``gateway`` be "paid" with no money moving for this
+    caller?  True when it is the Mock and mock_settlement_allowed says no.
+    The ONE spelling of that question: the tier upgrade route
+    (commercial_api.upgrade_key), the McGroce cart settler
+    (commerce_tools.settle_checkout and its prepare step) and the generic
+    mandate settler (ap2_mandate.settle) all read it (review of abb2dcfaf:
+    two spellings, and the generic settler read neither)."""
+    return gateway == PaymentGateway.MOCK and not mock_settlement_allowed(user)
+
+
+#: The reason a withdrawn mandate's payment is cancelled with, the one
+#: spelling for every settler (review of 3a07d3989, F5).
+NO_LIVE_GATEWAY_REASON = 'no live payment gateway'
+
+
+def refuse_no_live_gateway(where: str, user_id, payment_id=None) -> None:
+    """The operator's side of every no-live-gateway refusal: ONE WARNING
+    shape, on this module's logger, naming the settings to set
+    (LIVE_GATEWAY_SETTINGS) and never a value.  The person's reply or card
+    names no setting.  ``where`` is the path that refused ('ap2' for the
+    generic settler and the agent's request, 'commerce' for the cart,
+    'upgrade' for the paid tier)."""
+    logger.warning('%s: payment%s for %s refused: %s (set %s)', where,
+                   f' {payment_id}' if payment_id else '', user_id,
+                   NO_LIVE_GATEWAY, LIVE_GATEWAY_SETTINGS)
 
 
 #: Metadata keys that are credentials: kept in memory for the gateway call,
@@ -282,6 +379,31 @@ class StripePaymentGateway(PaymentGatewayConnector):
             **kwargs,
         )
         self._stripe = None  # lazy-imported in connect()
+        # The signing secret of the Checkout webhook (Stripe dashboard ->
+        # Developers -> Webhooks -> the endpoint's signing secret, whsec_...).
+        # Without it no webhook event is trusted (commercial_api.stripe_webhook
+        # answers 503), so a paid Checkout bumps its tier only through the
+        # buyer's success page.
+        self.webhook_secret = _os.environ.get('STRIPE_WEBHOOK_SECRET', '')
+
+    def verify_webhook(self, payload: bytes, sig_header: str):
+        """The event Stripe signed, or ValueError.
+
+        ``payload`` is the request body exactly as received (the signature
+        covers its bytes), ``sig_header`` the Stripe-Signature header.  The
+        SDK's Webhook.construct_event checks the HMAC against
+        STRIPE_WEBHOOK_SECRET and its timestamp tolerance; whatever it
+        raises, and a missing secret or connection, is one ValueError here,
+        so the route's only branches are "verified" and "refused".
+        """
+        if not self.connected or not self._stripe:
+            raise ValueError('Stripe gateway not connected')
+        if not self.webhook_secret:
+            raise ValueError('STRIPE_WEBHOOK_SECRET not set')
+        try:
+            return self._stripe.Webhook.construct_event(payload, sig_header, self.webhook_secret)
+        except Exception as e:
+            raise ValueError(f'Stripe webhook rejected: {e}') from e
 
     def connect(self) -> bool:
         """Lazy-import the stripe SDK and configure with the API key.
@@ -383,6 +505,12 @@ class StripePaymentGateway(PaymentGatewayConnector):
             return {'success': False, 'error': f'Stripe refund failed: {e}'}
 
 
+#: The payment-metadata key under which PhonePePaymentGateway.create_payment
+#: records the paise it asked PhonePe for; the one spelling the callback's
+#: amount check (expected_paise) reads.
+PHONEPE_SENT_AMOUNT_KEY = 'phonepe_amount_paise'
+
+
 class PhonePePaymentGateway(PaymentGatewayConnector):
     """PhonePe Payment Gateway (Standard Checkout / Hermes API).
 
@@ -407,9 +535,14 @@ class PhonePePaymentGateway(PaymentGatewayConnector):
     Currency note: PhonePe is INR-only.  When a payment_request has
     currency='USD' we convert via PHONEPE_USD_INR_RATE (default 84.0)
     so the integration works for USD-priced API tiers without forcing
-    a schema change to upgrade flows.  Override the rate via env var
-    on the operator side, or pass `inr_amount` in metadata to bypass
-    conversion entirely.
+    a schema change to upgrade flows.  The rate is the operator's (the
+    env var); nothing in a payment's metadata prices it (a metadata
+    inr_amount once did, and a buyer reached it through the upgrade
+    route's body: the review of af987a962 bought the enterprise tier for
+    one rupee).  The paise actually sent are recorded on the payment
+    (PHONEPE_SENT_AMOUNT_KEY) when the request is minted, and the callback
+    compares the captured amount with THAT, not with a recomputation at
+    today's rate (sent_paise / expected_paise).
     """
 
     PROD_BASE = "https://api.phonepe.com/apis/hermes"
@@ -448,18 +581,42 @@ class PhonePePaymentGateway(PaymentGatewayConnector):
         return f"{digest}###{self.salt_index}"
 
     def _to_paise(self, payment_request: 'PaymentRequest') -> int:
-        """Convert payment amount to paise (INR's smallest unit).
-
-        Honors `metadata.inr_amount` override.  Otherwise converts USD via
-        usd_inr_rate; INR amounts pass through unchanged.
-        """
-        meta = payment_request.metadata or {}
-        if 'inr_amount' in meta:
-            return int(round(float(meta['inr_amount']) * 100))
+        """The payment's amount in paise (INR's smallest unit) at the
+        operator's rate: INR passes through, USD converts via usd_inr_rate.
+        Metadata prices nothing (a metadata inr_amount was the override a
+        buyer reached through the upgrade route's body, the review of
+        af987a962; then an internal override nothing set, whose None value
+        raised on float(None) and answered 502: a stale key is ignored)."""
         amt = float(payment_request.amount)
         if payment_request.currency.upper() == 'INR':
             return int(round(amt * 100))
         return int(round(amt * self.usd_inr_rate * 100))
+
+    def sent_paise(self, payment_request: 'PaymentRequest') -> Optional[int]:
+        """The paise this gateway asked PhonePe for when it minted the
+        request (recorded by create_payment), or None when no request has
+        been minted for the payment."""
+        value = (payment_request.metadata or {}).get(PHONEPE_SENT_AMOUNT_KEY)
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def expected_paise(self, payment_request: 'PaymentRequest') -> int:
+        """What PhonePe should have captured: the amount SENT when known.
+        A capture is checked against that, never against a recomputation,
+        because the operator's rate can move between the checkout and the
+        confirmation and a correct capture then read 'amount mismatch',
+        FAILED, after the money was taken (the review of f08ff3e4c).  A
+        payment minted before the amount was recorded falls back to today's
+        rate, said at WARNING."""
+        sent = self.sent_paise(payment_request)
+        if sent is not None:
+            return sent
+        logger.warning("ap2: PhonePe payment %s has no recorded sent amount; "
+                       "checking its capture against today's rate",
+                       payment_request.payment_id)
+        return self._to_paise(payment_request)
 
     def connect(self) -> bool:
         """Validate that credentials are present; PhonePe has no per-session handshake."""
@@ -487,16 +644,49 @@ class PhonePePaymentGateway(PaymentGatewayConnector):
             import requests as _requests
 
             amount_paise = self._to_paise(payment_request)
-            meta = payment_request.metadata or {}
+            # Recorded before the wire: the callback checks the capture
+            # against what was sent (expected_paise), and a request that
+            # was posted but whose reply was lost still has its amount.
+            if payment_request.metadata is None:
+                payment_request.metadata = {}
+            payment_request.metadata[PHONEPE_SENT_AMOUNT_KEY] = amount_paise
+            meta = payment_request.metadata
+            # Where the buyer returns and where the signed confirmation is
+            # posted: what the payment's metadata names (a cart mandate
+            # stamps this node's URLs at creation; the upgrade route may
+            # name the buyer's return page), else this node's public URLs
+            # now.  Never a guessed host: these defaulted to the web app's
+            # host, which answers the API paths with the web app's 404, so
+            # the callback never arrived and the money was taken with no
+            # tier bumped and no order placed (task #122).
+            redirect_url = meta.get('redirect_url')
+            callback_url = meta.get('callback_url')
+            if not redirect_url or not callback_url:
+                own = own_gateway_urls()
+                redirect_url = redirect_url or own.get('redirect_url')
+                callback_url = callback_url or own.get('callback_url')
+            if not redirect_url or not callback_url:
+                # The operator's detail goes to the log; the sentence below
+                # reaches the shopper through the agent (settle_checkout
+                # repeats a gateway error), and a tenant-facing message
+                # names no environment variable.
+                logger.error("ap2: PhonePe payment %s refused: this node has no "
+                             "public address for the buyer's return and the "
+                             "payment callback (set %s)",
+                             payment_request.payment_id, PUBLIC_URL_VAR)
+                return {'success': False,
+                        'error': 'This node is not set up to take PhonePe payments '
+                                 'yet (it has no public address for the payment '
+                                 'callback)'}
             merchant_txn_id = f"hartos_{payment_request.payment_id.replace('-', '')[:24]}"
             payload = {
                 "merchantId": self.merchant_id,
                 "merchantTransactionId": merchant_txn_id,
                 "merchantUserId": str(meta.get('user_id', payment_request.requester_agent_id))[:36],
                 "amount": amount_paise,
-                "redirectUrl": meta.get('redirect_url', 'https://hevolve.ai/api/v1/intelligence/keys'),
+                "redirectUrl": redirect_url,
                 "redirectMode": "POST",
-                "callbackUrl": meta.get('callback_url', 'https://hevolve.ai/api/v1/intelligence/phonepe/callback'),
+                "callbackUrl": callback_url,
                 "paymentInstrument": {"type": "PAY_PAGE"},
             }
             mobile = meta.get('mobile_number')
@@ -607,8 +797,15 @@ class PhonePePaymentGateway(PaymentGatewayConnector):
                 "merchantUserId": payment_id,
                 "originalTransactionId": gateway_transaction_id,
                 "merchantTransactionId": refund_txn_id,
-                "callbackUrl": "https://hevolve.ai/api/v1/intelligence/phonepe/refund-callback",
             }
+            # The refund's status lands on this node's acknowledger
+            # (commercial_api.phonepe_refund_callback) when the node knows
+            # its public URL; the key is left out otherwise, rather than
+            # naming a host that is not this node (it named the web app's
+            # host, and a route that existed nowhere).
+            refund_callback = own_gateway_urls().get('refund_callback_url')
+            if refund_callback:
+                payload["callbackUrl"] = refund_callback
             if amount_paise is not None:
                 payload["amount"] = amount_paise
 
@@ -1231,11 +1428,29 @@ def create_payment_request_function(agent_name: str,
             method = PaymentMethod(payment_method.lower())
         except ValueError:
             method = PaymentMethod.INTERNAL_CREDITS
+        # The currency as the mandate reads it (ap2_mandate.create_cart_mandate:
+        # INR when the tool names none, upper-cased), decided ONCE so the gate
+        # below and the mandate pick the same gateway: the gate read the raw
+        # argument, so on a PhonePe-only node request_payment(10, '', ...)
+        # was refused "no live payment gateway" where 'inr' minted on PhonePe
+        # (the review of 3ec90cc58 measured it).
+        currency = str(currency or 'INR').upper()
 
         if user_id:
             from integrations.ap2.ap2_mandate import (
                 MandateError, get_mandate_store, request_human_approval)
             store = get_mandate_store()
+            # Refused before the person is asked (the cart's prepare step
+            # does the same): on a node with no gateway keys the mandate
+            # would be minted on the mock and the Approve card shown, and
+            # only the approval would be refused (review of 3a07d3989, F1).
+            # settle()'s own gate stays for mandates minted earlier.
+            if mock_would_settle(store.ledger.select_gateway(currency)):
+                refuse_no_live_gateway('ap2', user_id)
+                return json.dumps({
+                    'success': False,
+                    'error': f'{NO_LIVE_GATEWAY}; nothing was charged and the '
+                             'person was not asked'}, indent=2)
             try:
                 m = store.create_cart_mandate(
                     str(user_id), agent_name,
@@ -1431,7 +1646,11 @@ __all__ = [
     'MockPaymentGateway', 'StripePaymentGateway', 'PhonePePaymentGateway',
     'payment_ledger', 'get_payment_ledger',
     'create_payment_request_function', 'create_payment_authorization_function',
-    'create_payment_processing_function', 'get_ap2_tools_for_autogen'
+    'create_payment_processing_function', 'get_ap2_tools_for_autogen',
+    'own_gateway_urls', 'PHONEPE_CALLBACK_PATH', 'PHONEPE_REFUND_CALLBACK_PATH',
+    'PHONEPE_SENT_AMOUNT_KEY',
+    'mock_settlement_allowed', 'mock_would_settle', 'NO_LIVE_GATEWAY',
+    'LIVE_GATEWAY_SETTINGS', 'NO_LIVE_GATEWAY_REASON', 'refuse_no_live_gateway',
 ]
 
 
@@ -1442,4 +1661,5 @@ __all__ = [
 ENV_SECRETS = (
     'PHONEPE_SALT_KEY',
     'STRIPE_API_KEY',
+    'STRIPE_WEBHOOK_SECRET',
 )

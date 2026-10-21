@@ -1,0 +1,180 @@
+"""integrations.reel_studio.igkit.caption: the caption linter, ported from
+instagram-agent-skill (MIT).
+
+Upstream's hashtag pattern was ASCII-only, so a Tamil hashtag was cut at its
+first vowel sign or not counted (skill-port report (c)3).  The port counts
+hashtags in any script against the ONE hashtag cap (contracts.HASHTAG_LIMIT)
+and knows the booking asks Indian makeup artists use.
+"""
+import pytest
+
+from integrations.reel_studio import contracts
+from integrations.reel_studio.igkit import caption
+
+CLEAN = ('Reception look in 40 minutes, Chennai humidity and all.\n\n'
+         'Kryolan base that held for 9 hours of dancing, MAC lips, her own temple jewellery.\n\n'
+         'DM for bookings.\n\n'
+         '#chennaimua #bridalmakeup')
+
+
+def _check(result, name):
+    return next(c for c in result['checks'] if c['check'] == name)
+
+
+def test_tamil_hashtags_are_whole_and_counted():
+    text = ('Bridal look for a December muhurtham in Madurai. DM for bookings.\n\n'
+            '#சென்னைமேக்கப் #bridalmakeup #மணப்பெண்')
+    r = caption.lint_caption(text)
+    assert r['hashtags'] == ['#சென்னைமேக்கப்', '#bridalmakeup', '#மணப்பெண்']
+
+
+def test_the_hashtag_cap_is_the_contract_limit():
+    body = 'Reception look, 12-hour wear in Chennai humidity. DM for bookings.\n\n'
+    at_cap = body + ' '.join('#look%d' % i for i in range(contracts.HASHTAG_LIMIT))
+    over = body + ' '.join('#look%d' % i for i in range(contracts.HASHTAG_LIMIT + 1))
+    assert _check(caption.lint_caption(at_cap), 'HASHTAGS')['status'] == 'PASS'
+    assert _check(caption.lint_caption(over), 'HASHTAGS')['status'] == 'FAIL'
+
+
+def test_a_tighter_hashtag_limit_can_be_passed():
+    r = caption.lint_caption('Look one in 40 minutes.\n\n#a1 #b2 #c3 #d4', hashtag_limit=3)
+    assert _check(r, 'HASHTAGS')['status'] == 'FAIL'
+
+
+def test_generic_tags_are_named():
+    r = caption.lint_caption('Look one in 40 minutes.\n\n#bridal #viral #reelitfeelit')
+    check = _check(r, 'HASHTAGS')
+    assert check['status'] == 'WARN' and '#viral' in check['detail']
+
+
+@pytest.mark.parametrize('ask_line,ask', [
+    ('DM for bookings.', 'DM for bookings'),
+    ('Bookings open for December.', 'bookings open'),
+    ('WhatsApp 98765 43210 for dates.', 'WhatsApp number'),
+    ('WhatsApp me for bookings.', 'DM for bookings'),
+])
+def test_indian_booking_asks_are_one_ask(ask_line, ask):
+    r = caption.lint_caption('Sangeet look in 40 minutes.\n' + ask_line)
+    assert r['asks'] == [ask]
+    assert _check(r, 'ONE ASK')['status'] == 'PASS'
+
+
+def test_two_asks_warn():
+    r = caption.lint_caption('Sangeet look in 40 minutes.\nSave this and DM for bookings.')
+    assert _check(r, 'ONE ASK')['status'] == 'WARN'
+
+
+def test_a_phone_number_is_not_a_link():
+    r = caption.lint_caption('Sangeet look in 40 minutes.\nWhatsApp 98765 43210 for dates.')
+    assert r['links'] == []
+    assert _check(r, 'LINKS')['status'] == 'PASS'
+
+
+def test_a_link_warns():
+    r = caption.lint_caption('Sangeet look in 40 minutes.\nBook at www.example.com/book now.')
+    assert _check(r, 'LINKS')['status'] == 'WARN'
+
+
+def test_search_terms_in_any_script():
+    r = caption.lint_caption('மதுரை bridal makeup artist, முகூர்த்தம் லுக்.\nDM for bookings.',
+                             keywords=['மதுரை', 'Bridal Makeup Artist'])
+    assert _check(r, 'SEARCH TERMS')['status'] == 'PASS'
+    r = caption.lint_caption('Bridal look.\nDM for bookings.', keywords=['மதுரை'])
+    assert _check(r, 'SEARCH TERMS')['status'] == 'FAIL'
+
+
+def test_a_first_line_hashtag_fails():
+    r = caption.lint_caption('#bridal look for Priya\nDM for bookings.')
+    assert _check(r, 'FIRST LINE')['status'] == 'FAIL'
+    assert r['verdict'] == 'FIX'
+
+
+def test_the_visible_window_is_what_the_feed_shows():
+    r = caption.lint_caption('x' * 130)
+    assert r['visible'] == 'x' * 125 and r['truncated'] is True
+    assert caption.lint_caption('x' * 130, truncate=200)['truncated'] is False
+
+
+def test_a_clean_caption_is_ready():
+    r = caption.lint_caption(CLEAN)
+    assert r['verdict'] == 'READY', r['checks']
+    assert r['hashtags'] == ['#chennaimua', '#bridalmakeup']
+    assert _check(r, 'TAG PLACEMENT')['status'] == 'PASS'
+
+
+def test_over_the_caption_limit_fails():
+    r = caption.lint_caption('Look in 40 minutes. ' + 'a' * caption.LIMIT)
+    assert _check(r, 'LENGTH')['status'] == 'FAIL'
+
+
+def test_glued_hashtags_count_each():
+    # Only a tag at the start or after whitespace was counted, so six tags
+    # written without spaces were one and slipped past the cap.
+    r = caption.lint_caption('Reception look in 40 minutes. DM for bookings.\n\n'
+                             '#a1#b2#c3#d4#e5#f6')
+    assert r['hashtags'] == ['#a1', '#b2', '#c3', '#d4', '#e5', '#f6']
+    assert _check(r, 'HASHTAGS')['status'] == 'FAIL'
+
+
+def test_a_hashtag_right_after_an_emoji_or_a_bracket_counts():
+    tamil = '#மணப்பெண்'
+    r = caption.lint_caption('Reception look in 40 minutes \u2728#bridalmakeup (' + tamil + ')')
+    assert r['hashtags'] == ['#bridalmakeup', tamil]
+
+
+@pytest.mark.parametrize('text', ['Rates at example.com/page#rates', 'Look#2 in 40 minutes',
+                                  'C# and F# are not tags', '## heading'])
+def test_a_hash_inside_a_word_or_alone_is_not_a_tag(text):
+    assert caption.lint_caption(text)['hashtags'] == []
+
+
+def test_a_long_run_is_linted_in_linear_time():
+    # LINK_RE's "\b[a-z0-9-]+\." restarted at every "-": 3.8 s on 20,000
+    # characters of "a-a-a-".
+    import time
+    started = time.perf_counter()
+    caption.lint_caption('Reception look. ' + 'a-' * 20000)
+    assert time.perf_counter() - started < 2.0
+
+
+@pytest.mark.parametrize('emoji', [
+    '❤\ufe0f',                         # red heart with its selector
+    '\U0001F470\u200d♀\ufe0f',         # bride: woman, joined
+    '\U0001F44D\U0001F3FD',            # thumbs up with a skin tone
+    '✨',
+    '1\ufe0f\u20e3',                   # keycap one
+    '\U0001F1EE\U0001F1F3',            # a flag: two regional indicators
+    '\u27a1\ufe0f',                    # right arrow, emoji style
+])
+def test_one_emoji_counts_once(emoji):
+    # Upstream counted the variation selector as an emoji of its own, so a
+    # red heart was 2 and the emoji-density warning fired early.
+    assert caption.lint_caption('Reception look for Priya ' + emoji)['emoji'] == 1
+
+
+def test_emoji_side_by_side_count_each():
+    assert caption.lint_caption('Reception look ✨✨ ❤\ufe0f❤\ufe0f')['emoji'] == 4
+
+
+@pytest.mark.parametrize('text', ['Bare face → bride', 'Rs 15k - 20k', '!! done', '#1 look'])
+def test_text_symbols_are_not_emoji(text):
+    # A plain arrow is typography; upstream counted the whole arrows block.
+    assert caption.lint_caption(text)['emoji'] == 0
+
+
+@pytest.mark.parametrize('piece', ['✨', '1\ufe0f\u20e3', '\U0001F1EE\U0001F1F3',
+                                   '❤\ufe0f', '→', '!!', '#1', 'plain'])
+def test_the_hook_check_and_the_caption_linter_share_one_emoji_definition(piece):
+    from integrations.reel_studio import igkit
+    from integrations.reel_studio.igkit import hooks
+    line = 'Bare face to bride in 20 minutes ' + piece
+    in_caption = caption.lint_caption(line)['emoji'] > 0
+    in_hook = any(f.startswith('Emoji') for f in hooks.rate_hook(line)['flags'])
+    assert in_caption == in_hook == bool(igkit.EMOJI_RE.search(piece))
+
+
+def test_two_hearts_in_a_seventy_character_caption_are_not_decoration():
+    text = 'Reception look for Priya in Madurai, 40 minutes start to finish ❤\ufe0f❤\ufe0f'
+    r = caption.lint_caption(text)
+    assert (r['characters'], r['emoji']) == (68, 2)
+    assert _check(r, 'EMOJI')['status'] == 'PASS'

@@ -883,7 +883,8 @@ def _autonomous_create_block():
 
 def _first_dispatch(tmp_path, recipe_reply):
     """Run the block for a daemon's autonomous CREATE turn whose recipe()
-    answers recipe_reply.  Returns (reply text, reply payload)."""
+    answers recipe_reply (or IS recipe_reply, when that is a callable, e.g.
+    one that raises).  Returns (reply text, reply payload)."""
     (tmp_path / '777.json').write_text('{}', encoding='utf-8')
     ns = {
         'autonomous': True, 'prompt': 'Draft the weekly digest',
@@ -891,7 +892,7 @@ def _first_dispatch(tmp_path, recipe_reply):
         'app': MagicMock(), 'thread_local_data': tld, 'chat_agent': MagicMock(),
         'user_id': 'u1', 'file_id': None, 'request_id': DAEMON_RID, 'prompt_id': '777',
         '_autonomous_gather_info': lambda *a: 'GATHER OUTPUT',
-        'recipe': lambda *a: recipe_reply,
+        'recipe': recipe_reply if callable(recipe_reply) else (lambda *a: recipe_reply),
         '_user_lock': threading.Lock(), 'review_agents': {}, '_ak': 'u1_777',
         'conversation_agent': {}, '_touch_agent_timestamp': lambda *a: None,
         '_create_social_agent_from_prompt': lambda *a: None,
@@ -921,6 +922,37 @@ class TestTheChatFirstDispatchAnswersThePause:
         assert payload['Agent_status'] == 'completed'
         text, payload = _first_dispatch(tmp_path, 'Could not finish action 2.')
         assert text == 'GATHER OUTPUT'
+        assert payload['Agent_status'] == 'Review Mode'
+
+
+class TestTheChatFirstDispatchAnswersAFailedTurn:
+    """Measured on central 2026-10-17: every hosted call of an autonomous
+    CREATE turn answered 400 "Reasoning is mandatory" or 429, recipe() returned
+    "I couldn't finish that: Error code: 400 ..." (or the snag sentence), and
+    /chat answered the gather output instead.  The hive worker recognises a
+    failed turn by its sentence (core.agent_tools.is_user_facing_error), never
+    saw one, submitted the gather output as the task's result (four tasks, one
+    result hash), and 17 earning goals were marked completed with no post, no
+    listing and no payment behind them."""
+
+    def test_a_create_whose_calls_failed_answers_the_failure(self, tmp_path):
+        failed = agent_tools.user_facing_error(
+            "Error code: 400 - {'error': {'message': 'Reasoning is mandatory "
+            "for this endpoint and cannot be disabled.', 'code': 400}}")
+        text, payload = _first_dispatch(tmp_path, failed)
+        assert agent_tools.is_user_facing_error(text), text
+        assert text == failed
+
+    def test_the_snag_sentence_is_answered_too(self, tmp_path):
+        snag = agent_tools.user_facing_error(RuntimeError('x' * 300))
+        text, _ = _first_dispatch(tmp_path, snag)
+        assert agent_tools.is_user_facing_error(text), text
+
+    def test_a_recipe_that_raises_answers_a_failure(self, tmp_path):
+        def _boom(*a):
+            raise RuntimeError('Error code: 429 - rate limit')
+        text, payload = _first_dispatch(tmp_path, _boom)
+        assert agent_tools.is_user_facing_error(text), text
         assert payload['Agent_status'] == 'Review Mode'
 
 
