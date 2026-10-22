@@ -118,9 +118,19 @@ del _md_safe
 # before any consumer's deferred bootstrap touches transformers.
 try:
     import transformers as _tf_safe
-    from transformers.models.gpt2.tokenization_gpt2_fast import (
-        GPT2TokenizerFast as _GPT2TokenizerFast_direct,
-    )
+    try:
+        # transformers 4.x: the fast tokenizer has its own module.
+        from transformers.models.gpt2.tokenization_gpt2_fast import (
+            GPT2TokenizerFast as _GPT2TokenizerFast_direct,
+        )
+    except ImportError:
+        # transformers 5.x dropped the *_fast modules, and its lazy lookup
+        # answers GPT2TokenizerFast with GPT2Tokenizer (measured on 5.1.0),
+        # so bind that same class.  Without this the installed Nunba logged
+        # "defang skipped" with a ModuleNotFoundError on every boot.
+        from transformers.models.gpt2.tokenization_gpt2 import (
+            GPT2Tokenizer as _GPT2TokenizerFast_direct,
+        )
     if not hasattr(_tf_safe, '__dict__') or \
             'GPT2TokenizerFast' not in _tf_safe.__dict__:
         _tf_safe.__dict__['GPT2TokenizerFast'] = _GPT2TokenizerFast_direct
