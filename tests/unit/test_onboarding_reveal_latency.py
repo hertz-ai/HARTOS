@@ -183,3 +183,75 @@ def test_try_another_is_also_bounded(monkeypatch):
 
     assert elapsed < s.REVEAL_WAIT_S + 2.0, \
         "'try another' blocked %.2fs" % elapsed
+
+
+# ── a one-shot caller is bounded the same way ────────────────────────────────
+#
+# Nunba's ceremony does not drive the session: it POSTs /api/hart/generate once,
+# and that route called generate_hart_name(use_llm=True) with nothing bounding
+# it.  Measured 2026-10-22 on a CPU-only desktop: 270s on "Your secret name
+# is..." while an agent plan held the one llama-server slot, and 46s with the
+# slot idle (30s generate timeout + 15s validate) -- both ending in a curated
+# name anyway.
+
+def _named(name):
+    return {'name': name, 'candidates': [name], 'dimensions': {},
+            'emoji_combo': '', 'element': '', 'spirit': ''}
+
+
+def test_within_does_not_wait_for_a_slow_model(monkeypatch):
+    def _slow(*a, **k):
+        if k.get('use_llm', True):
+            time.sleep(8)
+            return _named('modelname')
+        return _named('curated')
+
+    monkeypatch.setattr(ho, 'generate_hart_name', _slow)
+
+    t0 = time.monotonic()
+    out = ho.generate_hart_name_within(
+        wait_s=0.5, language='en', passion_key='building_coding',
+        escape_key='nature_open')
+    elapsed = time.monotonic() - t0
+
+    assert elapsed < 0.5 + 2.0, "blocked %.2fs on a slow model" % elapsed
+    assert out['name'] == 'curated'
+
+
+def test_within_uses_the_model_name_when_it_lands(monkeypatch):
+    def _quick(*a, **k):
+        if k.get('use_llm', True):
+            time.sleep(0.1)
+            return _named('modelname')
+        return _named('curated')
+
+    monkeypatch.setattr(ho, 'generate_hart_name', _quick)
+
+    out = ho.generate_hart_name_within(
+        wait_s=3.0, language='en', passion_key='building_coding',
+        escape_key='nature_open')
+    assert out['name'] == 'modelname'
+
+
+def test_within_survives_a_model_path_that_raises(monkeypatch):
+    def _boom_then_curated(*a, **k):
+        if k.get('use_llm', True):
+            raise RuntimeError('llama-server went away')
+        return _named('curated')
+
+    monkeypatch.setattr(ho, 'generate_hart_name', _boom_then_curated)
+
+    out = ho.generate_hart_name_within(
+        wait_s=3.0, language='en', passion_key='building_coding',
+        escape_key='nature_open')
+    assert out['name'] == 'curated'
+
+
+def test_within_default_wait_is_the_script_cover_plus_the_reveal_tail():
+    """One budget, derived -- not a second literal that drifts from the
+    session's REVEAL_WAIT_S."""
+    import inspect
+    assert ho.NAME_WAIT_S == \
+        ho.NAME_COVER_S + ho.HARTOnboardingSession.REVEAL_WAIT_S
+    assert inspect.signature(ho.generate_hart_name_within) \
+        .parameters['wait_s'].default == ho.NAME_WAIT_S
