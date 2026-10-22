@@ -217,10 +217,11 @@ take, bound first by another call polling the same task, is left as it
 is.  The setters are the one source of a take's history; the composing
 tool builds none of its own.
 
-While a submit is out, its key reads 'composing'.  A second call for
-that key waits for it and says what is composing (the game, state and
-level, and how long ago the submission went out) rather than queue a
-second job of the same take.  A submit that starts nothing (refused, no
+While a submit is out, its key reads 'composing', to `bind_game_sound`
+and to REUSE's reader `get_game_sound` alike.  A second call for that key
+waits for it and says what is composing (the game, state and level, and
+how long ago the submission went out) rather than queue a second job of
+the same take: composed once, by whoever submitted first.  A submit that starts nothing (refused, no
 composer, a composer that is not up, no url, an error) takes its note
 out again on its one way out.  A note whose process died lapses with
 `SUBMIT_COOLDOWN_S` (600 s); until then the key reads 'composing', so

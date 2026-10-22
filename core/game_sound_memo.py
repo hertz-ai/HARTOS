@@ -188,7 +188,10 @@ def holds_composition(record, field, value):
     take yet.  A keep ends it (ended_composition drops both), a take landing
     at the key replaces it, a rejection carries it (record_verdict)."""
     record = record or {}
-    return bool(value) and record.get(field) == value and not record.get('url')
+    # ``is not None``, not truth: a clock that starts at 0.0 (a test's, or a
+    # box whose clock reset) notes a submit at 0.0, and that note is still
+    # this call's.
+    return value is not None and record.get(field) == value and not record.get('url')
 
 
 def without_submit_note(record, at):
@@ -203,12 +206,15 @@ def without_submit_note(record, at):
 
 
 def forget_game_state_record(games, game_id, state, level=None):
-    """Remove the record at exactly this key, and for the game's music the
-    copy the first version's shape keeps (set_game_state_sound): a submit
-    note that left nothing behind, at a key that held nothing before it."""
+    """Remove the record at exactly this key: a submit note that left nothing
+    behind, at a key that held nothing before it.  For the game's music, the
+    copy the first version's shape keeps (set_game_state_sound writes both)
+    goes with it only when it is that same record; a take an older memo
+    still holds there stays."""
     slot = (games or {}).get(str(game_id)) or {}
-    (slot.get('sounds') or {}).pop(game_state_key(state, level), None)
-    if state == 'bgm' and level in (None, '', 0):
+    removed = (slot.get('sounds') or {}).pop(game_state_key(state, level), None)
+    if (state == 'bgm' and level in (None, '', 0) and removed is not None
+            and slot.get('music') == removed):
         slot.pop('music', None)
 
 #: Corrupt values already warned about.  A lookup reads the same record on

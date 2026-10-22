@@ -1275,9 +1275,12 @@ def build_core_tool_closures(ctx):
                 'approved': bool(bound.get('approved_at')),
                 'music': bound,
             })
-        if bound.get('task_id'):
+        # A task, or a submit still out (its note is in the memo before the
+        # submit goes, bind_game_sound): both are a composition under way,
+        # which REUSE reads as composing, never as nothing bound.
+        if bound.get('task_id') or submit_in_flight(bound):
             return json.dumps({'status': 'composing', 'game_id': slot,
-                               'state': which, 'task_id': bound['task_id']})
+                               'state': which, 'task_id': bound.get('task_id')})
         return json.dumps({'status': 'unbound', 'game_id': slot, 'state': which,
                            'note': f'No {which} is bound to this game yet.'})
 
