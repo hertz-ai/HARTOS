@@ -3944,7 +3944,7 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict,
         _log.warning("gateway_qr: %s: %s", channel_type, text)
         _emit({'type': 'toast', 'severity': 'error',
                'channel': channel_type, 'channel_type': channel_type,
-               'text': text})
+               'message': text})
 
     # The number, in order: given, the operator's, the user's profile.
     # WhatsApp's pair-code endpoint REQUIRES E.164 digits-only.

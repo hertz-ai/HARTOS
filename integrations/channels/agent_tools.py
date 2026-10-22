@@ -122,7 +122,7 @@ def _report_when_live(channel_type: str, meta: dict, owner,
         _emit_to_user(owner, {
             'type': 'toast', 'severity': 'error',
             'channel': channel_type, 'channel_type': channel_type,
-            'text': f"{name} couldn't connect: {reason}. Check the token.",
+            'message': f"{name} couldn't connect: {reason}. Check the token.",
         })
     except Exception as e:
         logger.warning("%s: connect-failure toast not delivered: %s", channel_type, e)
@@ -914,7 +914,7 @@ def build_channel_tool_closures(ctx):
                     _lui.agent_ui_update(uid, {
                         'type': 'toast', 'severity': 'info',
                         'channel': channel_type, 'channel_type': channel_type,
-                        'text': f"{meta['display_name']} disconnected.",
+                        'message': f"{meta['display_name']} disconnected.",
                     }, user_id=uid)
             except Exception as e:
                 logger.debug("disconnect toast emit skipped: %s", e)

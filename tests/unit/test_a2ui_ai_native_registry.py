@@ -237,9 +237,10 @@ def test_what_the_emit_sites_really_send_has_no_schema_errors(name):
     assert _errors(issues) == [], issues
 
 
-def test_the_channel_failure_toast_is_flagged_not_hidden():
-    # integrations/channels/agent_tools: the toast sends `text`; AgentOverlay's
-    # NotificationCard reads message/content, so the reason never shows.
+def test_a_toast_sent_with_text_is_flagged_not_hidden():
+    # The channel emitters sent the body as `text` until 2026-10-22, and
+    # AgentOverlay's NotificationCard reads message/content, so the reason
+    # never showed.  A toast with that shape is flagged, both halves named.
     issues = _issues('toast', {'severity': 'error', 'channel': 'discord',
                                'channel_type': 'discord',
                                'text': "Discord couldn't connect."})

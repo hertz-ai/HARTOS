@@ -1209,8 +1209,7 @@ COMPONENT_TYPES = {
                        'channel': 'str', 'channel_type': 'str'},
         'required': ['message'],
         'aliases': {'text': 'message'},
-        'doc': ('Short notice. The body is `message`; AgentOverlay does not read '
-                '`text`, which two channel emitters send.'),
+        'doc': 'Short notice. The body is `message`; AgentOverlay does not read `text`.',
         'example': {'message': 'Discord disconnected.', 'severity': 'info'},
     },
     # ── Channel pair-code consent card (gateway_qr auth_method) ──
