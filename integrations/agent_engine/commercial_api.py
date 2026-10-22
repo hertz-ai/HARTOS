@@ -1590,11 +1590,14 @@ def phonepe_callback():
                 # told through the one hold rule, from the payment's own
                 # record, and PhonePe is still answered 200 (a 5xx would only
                 # redeliver into the same failure); commerce_checkout places
-                # the order later with no new charge.
+                # the order later with no new charge.  The step raised
+                # midway, so an order call may have left (sent): the shopper
+                # hears "could not confirm", the owner checks McGroce first.
                 try:
                     from integrations.commerce.commerce_tools import hold_paid_order
                     order = hold_paid_order(payment_req.payment_id,
-                                            'the commerce order step raised')
+                                            'the commerce order step raised',
+                                            sent=True)
                 except Exception:
                     logger.exception(f"PhonePe callback: could not tell the shopper "
                                      f"about {payment_req.payment_id}")

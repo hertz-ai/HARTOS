@@ -31,6 +31,8 @@ from integrations.commerce import signing
 from integrations.commerce.bindings import CommerceBindings, hartos_user_id
 from integrations.commerce.drafts import DraftStore
 from integrations.commerce.mcgroce_client import McGroceClient
+from integrations.social.models import Notification, User, db_session, init_db
+from integrations.social.services import NotificationService
 
 BASE = 'https://mcgroce.example/api/v1'
 SECRET = 'shared-with-tomcat-test-only'
@@ -110,12 +112,48 @@ def attestation_of(call):
 
 
 OWNER = '10202'          # this computer's owner, who hears about held payments
+STRANGER = '20909'       # an id with no user row on this node
+
+
+def node_user(uid):
+    """``uid`` is a user of this node: a row in its users table, as the
+    owner's and a signed-in shopper's are.  A McGroce-only shopper
+    (``mcg-<id>``, bound but never signed in here) has none."""
+    with db_session(commit=True) as db:
+        if db.query(User.id).filter(User.id == uid).first() is None:
+            db.add(User(id=uid, username=f'u-{uid}', user_type='human'))
+
+
+def not_a_node_user(uid):
+    with db_session(commit=True) as db:
+        db.query(User).filter(User.id == uid).delete(synchronize_session=False)
+
+
+def forget_bells(*uids):
+    with db_session(commit=True) as db:
+        db.query(Notification).filter(Notification.user_id.in_(uids)).delete(
+            synchronize_session=False)
+
+
+def bell(uid, payment_id=None):
+    """What ``uid`` finds in their bell (the notification rows, which outlive
+    a restart): (type, message) of each, for ``payment_id`` when given."""
+    with db_session(commit=False) as db:
+        rows, _ = NotificationService.get_for_user(db, uid)
+        return [(r.type, r.message) for r in rows
+                if payment_id is None or r.target_id == payment_id]
 
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     monkeypatch.setenv('COMMERCE_SESSION_SECRET', SECRET)
     monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', OWNER)
+    # This node's users: the owner has an account here, the shopper does not
+    # (the test database is this process's own, hermetic under pytest).
+    init_db()
+    node_user(OWNER)
+    not_a_node_user(UID)
+    forget_bells(OWNER, UID, STRANGER)
     bindings = CommerceBindings(str(tmp_path / 'bindings.json'))
     bindings.upsert(4242, 'asha@example.com', 'customer', store_id=7)
     bindings.upsert(77, 'owner@shop.in', 'merchant', store_id=9)
@@ -1059,6 +1097,10 @@ class TestHeldPayments:
     PAID = ('Your payment of ₹240.00 arrived, but your order is not placed yet, '
             'so it is on hold. Nothing more will be charged; we will sort it out '
             'with you.')
+    #: An order call left this node and no answer confirmed or refused it.
+    UNCONFIRMED = ('Your payment of ₹240.00 arrived, but we could not confirm your '
+                   'order, so it is on hold. Nothing more will be charged; we will '
+                   'sort it out with you.')
 
     def _paid_on_phonepe(self, env):
         env['ledger'].gateways[ap2_protocol.PaymentGateway.PHONEPE] = _PhonePeDouble()
@@ -1160,13 +1202,157 @@ class TestHeldPayments:
         assert pushed(env, 'notification')[-1]['message'].endswith(
             'Nothing more will be charged; reply here or contact the shop.')
         assert owner_cards(env) == []
-        # An owner is set but the card was not published: the same honest ending.
-        monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', OWNER)
-        env['ui'].side_effect = lambda agent_id, component, user_id=None: user_id != OWNER
+        # An owner is configured who is not a user of this node (central on
+        # 2026-10-19: HEVOLVE_OWNER_USER_ID named an id with no user row):
+        # the live card goes into the void, so the same honest ending.
+        monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', STRANGER)
         held = ct.hold_paid_order(out['payment_id'], 'McGroce is down')
         assert held['owner_told'] is False
         assert pushed(env, 'notification')[-1]['message'].endswith(
             'reply here or contact the shop.')
+        assert bell(STRANGER) == []
+        # Told is the row in the owner's bell, not the live push: an owner
+        # with no client open right now still finds it there.
+        monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', OWNER)
+        env['ui'].side_effect = lambda agent_id, component, user_id=None: user_id != OWNER
+        held = ct.hold_paid_order(out['payment_id'], 'McGroce is down')
+        assert held['owner_told'] is True
+        assert pushed(env, 'notification')[-1]['message'].endswith(
+            'we will sort it out with you.')
+        ((kind, note),) = bell(OWNER, out['payment_id'])
+        assert kind == ct.HOLD_NOTICE_TYPE and 'McGroce is down' in note
+
+    def test_a_hold_lands_in_the_bell_of_everyone_who_is_a_user_of_this_node(self, env):
+        # The notification row outlives a restart and reaches every client of
+        # this node; the live card is pushed on top of it.  A McGroce-only
+        # shopper (mcg-<id>, no user row here) gets the live card alone.
+        out = self._paid_on_phonepe(env)
+        env['fake'].on('GET', '/cart', status=503, body=None)
+        held = ct.complete_redirect_checkout(out['payment_id'])
+        assert held['needs_attention'] is True
+        ((kind, note),) = bell(OWNER, out['payment_id'])
+        assert kind == ct.HOLD_NOTICE_TYPE
+        assert note == f"{ct.OWNER_HOLD_TITLE}. {owner_cards(env)[-1]['message']}"
+        assert out['payment_id'] in note and UID in note and 'Place the order' in note
+        assert bell(UID) == []
+        assert pushed(env, 'notification')[-1]['title'] == ct.HOLD_TITLE
+        # A shopper who is a user of this node reads it in their bell too.
+        node_user(UID)
+        env['fake'].on('GET', '/cart', body=ORDER)
+        env['fake'].on('POST', AP2, status=503, body=None)
+        json.loads(ct.commerce_checkout(UID, out['mandate_id']))
+        ((kind, note),) = bell(UID, out['payment_id'])
+        assert kind == ct.HOLD_NOTICE_TYPE
+        assert note == f"{ct.HOLD_TITLE}. {pushed(env, 'notification')[-1]['message']}"
+
+    def test_an_order_call_without_an_answer_is_could_not_confirm(self, env):
+        # Sent, and McGroce neither did nor refused it (5xx, twice): the order
+        # may exist, so the shopper is never told "not placed yet" and the
+        # owner looks at McGroce before refunding.
+        out = self._paid_on_phonepe(env)
+        env['fake'].on('POST', AP2, status=503, body=None)
+        res = ct.complete_redirect_checkout(out['payment_id'])
+        assert res['success'] is False and res['needs_attention'] is True
+        assert len(env['fake'].called('POST', AP2)) == 2
+        assert pushed(env, 'notification')[-1]['message'] == self.UNCONFIRMED
+        (card,) = owner_cards(env)
+        assert 'Check McGroce for the order before refunding' in card['message']
+        assert 'PhonePe merchant account' in card['message']
+
+    def test_an_order_call_that_got_no_answer_at_all_is_could_not_confirm(self, env):
+        import requests
+        out = self._paid_on_phonepe(env)
+        fake = env['fake']
+
+        def dropped(method, url, **kw):
+            if method == 'POST' and url.endswith(AP2) and \
+                    signing.MANDATE_HEADER in (kw.get('headers') or {}):
+                raise requests.Timeout('no answer')
+            return fake(method, url, **kw)
+        with patch('core.http_pool.pooled_request', side_effect=dropped):
+            ct.complete_redirect_checkout(out['payment_id'])
+        assert pushed(env, 'notification')[-1]['message'] == self.UNCONFIRMED
+        assert 'Check McGroce' in owner_cards(env)[-1]['message']
+
+    def test_a_refused_order_call_is_not_placed_yet(self, env):
+        # McGroce answered and refused: nothing was placed, and the owner is
+        # not sent to look for an order that cannot exist.
+        out = self._paid_on_phonepe(env)
+        env['fake'].on('POST', AP2, status=409,
+                       body={'messages': [{'messageKey': 'AMOUNT_MISMATCH'}]})
+        ct.complete_redirect_checkout(out['payment_id'])
+        assert len(env['fake'].called('POST', AP2)) == 1
+        assert pushed(env, 'notification')[-1]['message'] == self.PAID
+        (card,) = owner_cards(env)
+        assert 'Place the order, or refund it' in card['message']
+        assert 'Check McGroce' not in card['message']
+
+    def test_the_card_path_holds_when_mcgroce_does_not_place_the_order(self, env):
+        # The shopper's approval on a card rail (no gateway callback): the
+        # settle takes the money and the order step fails right there.  The
+        # same hold, from the same site, with the same sentence.
+        env['fake'].on('GET', '/cart', body=ORDER)
+        out = json.loads(ct.commerce_prepare_checkout(UID))
+        env['mandates'].approve(out['mandate_id'], UID)
+        env['fake'].on('POST', AP2, status=503, body=None)
+        res = json.loads(ct.commerce_checkout(UID, out['mandate_id']))
+        assert res['success'] is False and res['needs_attention'] is True
+        assert len(env['card'].captures) == 1
+        note = pushed(env, 'notification')[-1]
+        assert note['title'] == ct.HOLD_TITLE and note['message'] == self.UNCONFIRMED
+        (card,) = owner_cards(env)
+        assert out['payment_id'] in card['message']
+        assert 'Stripe merchant account' in card['message']
+        ((kind, _),) = bell(OWNER, out['payment_id'])
+        assert kind == ct.HOLD_NOTICE_TYPE
+
+    def test_a_retry_that_cannot_read_the_cart_holds_and_tells(self, env):
+        out = self._paid_on_phonepe(env)
+        env['fake'].on('POST', AP2, status=503, body=None)
+        ct.complete_redirect_checkout(out['payment_id'])          # used up, held
+        cards = len(pushed(env, 'notification'))
+        env['fake'].on('GET', '/cart', status=503, body=None)
+        res = json.loads(ct.commerce_checkout(UID, out['mandate_id']))
+        assert res['success'] is False and res['needs_attention'] is True
+        assert len(pushed(env, 'notification')) == cards + 1
+        # This time no call left the node.
+        assert pushed(env, 'notification')[-1]['message'] == self.PAID
+        assert len(owner_cards(env)) == 2
+
+    def test_an_order_step_that_raises_is_held_as_could_not_confirm(self, env):
+        # Anything raised mid-step after the money is taken: the step may
+        # have sent the call, so nobody hears "not placed yet", nothing
+        # propagates to the callback, and a person checks McGroce.
+        out = self._paid_on_phonepe(env)
+        with patch.object(ct, 'retry_order', side_effect=RuntimeError('boom')):
+            res = ct.complete_redirect_checkout(out['payment_id'])
+        assert res['held'] is True and res['needs_attention'] is True
+        assert pushed(env, 'notification')[-1]['message'] == self.UNCONFIRMED
+        assert 'Check McGroce' in owner_cards(env)[-1]['message']
+        assert env['mandates'].get(out['mandate_id']).status == 'consumed'
+        # The claim is released: the retry places it once McGroce answers.
+        env['fake'].on('POST', AP2, body={'orderNumber': 'ORD-AFTER'})
+        later = json.loads(ct.commerce_checkout(UID, out['mandate_id']))
+        assert later['success'] is True and later['order_id'] == 'ORD-AFTER'
+        assert len(env['ledger'].payments) == 1
+
+    def test_an_order_placed_but_not_recorded_is_still_an_order(self, env):
+        # The key stops reading between the order call and its record: the
+        # order IS placed, the shopper gets its tracking, nobody is told it
+        # is on hold, and the retry finds the same order at McGroce.
+        from integrations.ap2.ap2_mandate import MandateKeyError
+        out = self._paid_on_phonepe(env)
+        env['fake'].on('POST', AP2, body={'orderNumber': 'ORD-UNREC'})
+        with patch.object(env['mandates'], 'record_order', side_effect=MandateKeyError()):
+            res = ct.complete_redirect_checkout(out['payment_id'])
+        assert res['success'] is True and res['order_id'] == 'ORD-UNREC'
+        assert pushed(env, 'order_tracking')[-1]['order_id'] == 'ORD-UNREC'
+        assert pushed(env, 'notification') == [] and owner_cards(env) == []
+        assert env['mandates'].get(out['mandate_id']).order_ref is None
+        later = json.loads(ct.commerce_checkout(UID, out['mandate_id']))
+        assert later['success'] is True and later['order_id'] == 'ORD-UNREC'
+        assert len(env['fake'].called('POST', AP2)) == 2
+        assert env['mandates'].get(out['mandate_id']).order_ref == 'ORD-UNREC'
 
     def test_a_changed_cart_keeps_its_recovery_in_the_sentence(self, env):
         out = self._paid_on_phonepe(env)
@@ -1177,10 +1363,10 @@ class TestHeldPayments:
         note = pushed(env, 'notification')[-1]
         assert note['message'] == (
             'Your payment of ₹240.00 arrived, but your order is not placed yet, so '
-            'it is on hold. Your cart changed while you were paying: put the cart '
-            'back the way you approved it and ask your agent to check out, and it '
-            'is placed with this payment, with no new charge. Nothing more will be '
-            'charged; we will sort it out with you.')
+            'it is on hold. Your cart changed after you paid: put the cart back the '
+            'way you approved it and ask your agent to check out, and it is placed '
+            'with this payment, with no new charge. Nothing more will be charged; '
+            'we will sort it out with you.')
         assert len(owner_cards(env)) == 1
 
 

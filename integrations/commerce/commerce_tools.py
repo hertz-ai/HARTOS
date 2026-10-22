@@ -476,10 +476,16 @@ def _nothing_charged(user_id, message: str) -> None:
 
 
 HOLD_TITLE = 'Payment received, order on hold'
-#: The shopper's sentence ends with a promise only when the owner card was
-#: published (order_on_hold); otherwise it names the next step.
+OWNER_HOLD_TITLE = 'A held payment needs a person'
+#: The notification row every held payment writes (NotificationService):
+#: the bell on every client of this node, kept across a restart.
+HOLD_NOTICE_TYPE = 'held_payment'
+#: The shopper's sentence ends with a promise only when the owner was told
+#: (order_on_hold); otherwise it names the next step.
 _HOLD_FOLLOW_UP = 'we will sort it out with you.'
 _HOLD_CONTACT = 'reply here or contact the shop.'
+_RAIL_NAMES = {'phonepe': 'PhonePe', 'stripe': 'Stripe', 'paypal': 'PayPal',
+               'square': 'Square', 'braintree': 'Braintree'}
 #: What a paid shopper hears when this node cannot sign its records: not the
 #: pause's "nothing was charged", which is false once the money moved.
 _PAUSED_AFTER_PAID = ('the payment went through, but this node cannot place the '
@@ -491,36 +497,80 @@ def _rupees(amount) -> str:
     return f'₹{_amount(amount):.2f}'
 
 
-def _tell_owner(payment, user_id, what: str, why: str) -> bool:
-    """The owner card half of order_on_hold: this computer's owner (the same
+def _durable_notice(user_id, message: str, payment_id: str) -> bool:
+    """One notification row for ``user_id`` (NotificationService.create: the
+    bell on every client of this node, kept across a restart; the live push
+    rides on its commit).  Written only for a user this node has, since the
+    row names its user: a McGroce-only shopper (``mcg-<id>``, no user row
+    here) gets none, and only the live card.  True when the row committed."""
+    if not user_id:
+        return False
+    try:
+        from integrations.social.models import User, db_session
+        from integrations.social.services import NotificationService
+        with db_session(commit=True) as db:
+            if db.query(User.id).filter(User.id == str(user_id)).first() is None:
+                return False
+            NotificationService.create(
+                db, user_id=str(user_id), type=HOLD_NOTICE_TYPE,
+                target_type='payment', target_id=str(payment_id)[:64],
+                message=message)
+        return True
+    except Exception as e:
+        logger.error(f'held payment {payment_id}: no notification row for '
+                     f'{user_id}: {e}')
+        return False
+
+
+def _tell_owner(payment, user_id, what: str, why: str, sent: bool) -> bool:
+    """The owner half of order_on_hold: this computer's owner (the same
     identity every other ask of this machine goes to: ai_key_vault,
-    vlm.safety) hears what a person must do.  True only when the card was
-    published; the shopper's sentence promises follow-up only then."""
+    vlm.safety) hears what a person must do.  Told means the notification
+    row was written for an owner who is a user of this node (it lands in
+    their bell and outlives a restart); the live card is pushed on top of
+    it.  The shopper's sentence promises follow-up only when told.
+    ``sent``: an order call left this node and no answer confirmed or
+    refused it, so the order may exist and a refund must wait for a look."""
     owner = (os.environ.get('HEVOLVE_OWNER_USER_ID') or '').strip()
     if not owner:
         logger.error(f'held payment {payment.payment_id}: nobody was told, '
                      f'HEVOLVE_OWNER_USER_ID is not set')
         return False
-    told = push_fragment(owner, {
-        'type': 'notification', 'severity': 'warning',
-        'title': 'A held payment needs a person',
-        'message': (f'{what} Payment {payment.payment_id} from shopper {user_id}: '
-                    f'{why}. Place the order, or refund it from your PhonePe '
-                    f'merchant account; nothing is refunded automatically.')})
+    gw = payment.gateway.value if payment.gateway else ''
+    rail = _RAIL_NAMES.get(gw, gw or 'payment')
+    if sent:
+        step = (f'Check McGroce for the order before refunding: this node sent '
+                f'the order call and no answer confirmed it. Place the order if '
+                f'it is not there, or refund the payment from your {rail} '
+                f'merchant account; nothing is refunded automatically.')
+    else:
+        step = (f'Place the order, or refund it from your {rail} merchant '
+                f'account; nothing is refunded automatically.')
+    message = f'{what} Payment {payment.payment_id} from shopper {user_id}: {why}. {step}'
+    told = _durable_notice(owner, f'{OWNER_HOLD_TITLE}. {message}', payment.payment_id)
+    push_fragment(owner, {'type': 'notification', 'severity': 'warning',
+                          'title': OWNER_HOLD_TITLE, 'message': message})
     if not told:
         logger.error(f'held payment {payment.payment_id}: nobody was told, the '
-                     f'owner card was not published')
+                     f'owner {owner} is not a user of this node')
     return told
 
 
-def order_on_hold(payment, why: str, detail: str = '', received=None) -> Dict[str, Any]:
+def order_on_hold(payment, why: str, detail: str = '', received=None,
+                  sent: bool = False) -> Dict[str, Any]:
     """The ONE rule for every held payment (money taken, order not placed),
     whatever the cause: the shopper's notice is built from the payment's own
     record (no mandate store, so a node that cannot sign still tells them)
     with the real amounts (``received``, in INR, when the gateway said what it
-    took), and this computer's owner gets a card naming the payment and what
-    a person must do.  The sentence promises follow-up only when that card
-    was published; otherwise it names the next step.  Nothing is refunded
+    took), and this computer's owner is told what a person must do.  Both
+    notices are notification rows (the bell, kept across a restart) for
+    whoever is a user of this node, with the live card pushed on top.  The
+    sentence promises follow-up only when the owner was told; otherwise it
+    names the next step.  ``sent``: an order call left this node and no
+    answer confirmed or refused it, so the shopper hears "we could not
+    confirm your order", never "not placed yet", which is said only when
+    this node never sent the call.  The caller says which from its own code
+    path; nothing is read off an error text.  Nothing is refunded
     automatically, and the sentence never says so."""
     from integrations.ap2.ap2_protocol import PaymentStatus
     user_id = (payment.metadata or {}).get('user_id')
@@ -533,37 +583,44 @@ def order_on_hold(payment, why: str, detail: str = '', received=None) -> Dict[st
         # (ap2_protocol.money_taken); this caller did not learn which.
         what = (f"We received a different amount from your order's "
                 f'{order_amount}, so your order is on hold.')
+    elif sent:
+        what = (f'Your payment of {order_amount} arrived, but we could not '
+                f'confirm your order, so it is on hold.')
     else:
         what = (f'Your payment of {order_amount} arrived, but your order is '
                 f'not placed yet, so it is on hold.')
     logger.error(f'MANUAL RECONCILIATION NEEDED: payment {payment.payment_id} '
                  f'held ({why}); {what}')
-    owner_told = _tell_owner(payment, user_id, what, why)
+    owner_told = _tell_owner(payment, user_id, what, why, sent)
     message = ' '.join(filter(None, [
         what, detail, 'Nothing more will be charged;',
         _HOLD_FOLLOW_UP if owner_told else _HOLD_CONTACT]))
     if user_id:
+        _durable_notice(user_id, f'{HOLD_TITLE}. {message}', payment.payment_id)
         push_fragment(user_id, {'type': 'notification', 'severity': 'warning',
                                 'title': HOLD_TITLE, 'message': message})
     else:
         logger.error(f'held payment {payment.payment_id}: the shopper could not '
                      f'be told, its record names no user')
-    return {'held': True, 'owner_told': owner_told, 'message': message}
+    return {'held': True, 'owner_told': owner_told, 'message': message,
+            'order_call_sent': sent}
 
 
-def hold_paid_order(payment_id: str, why: str, received=None) -> Dict[str, Any]:
+def hold_paid_order(payment_id: str, why: str, received=None,
+                    sent: bool = False) -> Dict[str, Any]:
     """A gateway took money for a checkout that cannot become an order as it
     stands (PhonePe captured a different amount: ``received`` in INR when the
-    callback has it).  The mandate is kept as it is, so its cart is not
-    offered for payment again; the shopper and the owner are told through
-    order_on_hold, which needs no store."""
+    callback has it; the order step raised: ``sent``, an order call may have
+    left).  The mandate is kept as it is, so its cart is not offered for
+    payment again; the shopper and the owner are told through order_on_hold,
+    which needs no store."""
     from integrations.ap2.ap2_protocol import get_payment_ledger
     payment = get_payment_ledger().get_payment(payment_id)
     if payment is None:
         logger.error(f'MANUAL RECONCILIATION NEEDED: payment {payment_id} ({why}) '
                      f'is not in the ledger; nobody was told')
         return {'held': False, 'owner_told': False}
-    return order_on_hold(payment, why, received=received)
+    return order_on_hold(payment, why, received=received, sent=sent)
 
 
 def _payment_for_mandate(mandate_id: str):
@@ -808,14 +865,19 @@ def retry_order(m, claimed: bool = False) -> Dict[str, Any]:
     from integrations.ap2.ap2_protocol import PaymentStatus, get_payment_ledger
     if m.order_ref:
         return _ordered(m)
+    payment = get_payment_ledger().get_payment(m.payment_id)
     if m.cart_ref is None:
         # Consumed by an older build, which kept no order_ref and no cart:
-        # its order may well exist, and nothing says which cart it paid for.
+        # its order may well exist (that build sent the call), and nothing
+        # says which cart it paid for.
+        from integrations.ap2.ap2_protocol import money_taken
+        if money_taken(payment):
+            order_on_hold(payment, f'mandate {m.mandate_id} was consumed under an '
+                                   f'older version, which recorded no cart', sent=True)
         return {'success': False, 'needs_attention': True,
                 'payment_id': m.payment_id, 'mandate_id': m.mandate_id,
                 'error': ('this payment was handled by an older version; check the '
                           "shopper's orders, or a person reconciles it")}
-    payment = get_payment_ledger().get_payment(m.payment_id)
     if payment is None or payment.status != PaymentStatus.COMPLETED:
         return {'success': False, 'error': 'checkout refused: mandate is consumed'}
     store = _mandates()
@@ -832,6 +894,8 @@ def retry_order(m, claimed: bool = False) -> Dict[str, Any]:
         client = _client()
         res = client.cart_get(m.user_id)
         if not res['success']:
+            # No order call left: the cart could not even be read.
+            order_on_hold(payment, f"the cart could not be read: {res['error']}")
             return {'success': False, 'error': res['error'], 'needs_attention': True,
                     'payment_id': m.payment_id, 'mandate_id': m.mandate_id}
         view = cart_view(res['data'])
@@ -841,6 +905,13 @@ def retry_order(m, claimed: bool = False) -> Dict[str, Any]:
         except MandateError:
             same = False
         if not same:
+            # McGroce keeps one open cart per shopper until an order is
+            # placed, so the changed cart is this cart: the notice says how
+            # to get the order placed with the payment already made.
+            order_on_hold(payment, 'the cart no longer holds what was paid for', detail=(
+                'Your cart changed after you paid: put the cart back the way you '
+                'approved it and ask your agent to check out, and it is placed '
+                'with this payment, with no new charge.'))
             return {'success': False, 'needs_attention': True, 'cart_changed': True,
                     'payment_id': m.payment_id, 'mandate_id': m.mandate_id,
                     'error': ('the payment went through, but the cart no longer holds '
@@ -864,7 +935,11 @@ def _submit_order(client, user_id, m, view, payment) -> Dict[str, Any]:
     attestation (mandate_attestation_for).  McGroce checks it itself and
     turns each mandate into one order at most.  One immediate retry when
     the answer never came (transport error or 5xx): McGroce's single-use
-    check makes that safe."""
+    check makes that safe.  When no order comes of it the payment is held
+    (order_on_hold); the client's own answer says whether the call left
+    and went unconfirmed (``unconfirmed``: it may have been placed) or was
+    refused or never sent."""
+    from integrations.ap2.ap2_mandate import MandateKeyError
     attestation = mandate_attestation_for(client, m, payment, view)
     if not attestation:
         placed = {'success': False,
@@ -880,6 +955,8 @@ def _submit_order(client, user_id, m, view, payment) -> Dict[str, Any]:
     if not placed['success']:
         logger.error(f'commerce: paid {m.payment_id} but McGroce did not '
                      f'place the order: {placed["error"]}')
+        order_on_hold(payment, f"McGroce did not place the order: {placed['error']}",
+                      sent=bool(placed.get('unconfirmed')))
         return {'success': False,
                 'error': ('the payment went through but McGroce did not place '
                           f'the order ({placed["error"]}); retry with '
@@ -891,7 +968,14 @@ def _submit_order(client, user_id, m, view, payment) -> Dict[str, Any]:
     order_id = order.get('orderNumber') or order.get('id')
     status = order.get('status') or 'SUBMITTED'
     if order_id:
-        _mandates().record_order(m.mandate_id, order_id)
+        try:
+            _mandates().record_order(m.mandate_id, order_id)
+        except MandateKeyError as e:
+            # The order IS placed; only this node's record of it is not
+            # written.  Never answered as a hold: the next retry asks
+            # McGroce, which answers a used mandate with this same order.
+            logger.error(f'MANUAL RECONCILIATION NEEDED: order {order_id} placed '
+                         f'for payment {m.payment_id} but not recorded: {e}')
     push_fragment(user_id, _tracking_fragment(order_id, status))
     return {'success': True, 'status': 'ordered', 'order_id': order_id,
             'order_status': status, 'payment_id': m.payment_id,
@@ -899,11 +983,14 @@ def _submit_order(client, user_id, m, view, payment) -> Dict[str, Any]:
 
 
 def complete_redirect_checkout(payment_id: str) -> Dict[str, Any]:
-    """_complete_redirect_checkout, with the node's payment pause answered
-    as a HOLD: the money is taken, so a MandateKeyError here never leaves
+    """_complete_redirect_checkout, with every failure of the order step
+    answered as a HOLD: the money is taken, so nothing raised here leaves
     the shopper untold or the callback raising.  The shopper and the owner
-    are told from the payment's own record, and commerce_checkout places the
-    order once the key reads."""
+    are told from the payment's own record.  Under the node's payment
+    pause (MandateKeyError) no order call left, and commerce_checkout
+    places the order once the key reads; anything else raised mid-step may
+    have left one, so the shopper hears "we could not confirm" and the
+    owner checks McGroce before refunding."""
     from integrations.ap2.ap2_mandate import MandateKeyError
     from integrations.ap2.ap2_protocol import get_payment_ledger
     try:
@@ -915,6 +1002,18 @@ def complete_redirect_checkout(payment_id: str) -> Dict[str, Any]:
         order_on_hold(payment, f'this node cannot sign its records right now ({e})')
         return {'success': False, 'needs_attention': True, 'held': True,
                 'payment_id': payment_id, 'error': _PAUSED_AFTER_PAID}
+    except Exception as e:
+        payment = get_payment_ledger().get_payment(payment_id)
+        if payment is None:
+            raise
+        logger.exception(f'MANUAL RECONCILIATION NEEDED: the order step for '
+                         f'payment {payment_id} raised')
+        order_on_hold(payment, f'the order step raised ({type(e).__name__})', sent=True)
+        return {'success': False, 'needs_attention': True, 'held': True,
+                'payment_id': payment_id,
+                'error': ('the payment went through, but the order step failed '
+                          'before it could confirm the order; it is on hold and '
+                          'a person checks McGroce for it')}
 
 
 def _complete_redirect_checkout(payment_id: str) -> Dict[str, Any]:
@@ -967,16 +1066,12 @@ def _complete_redirect_checkout(payment_id: str) -> Dict[str, Any]:
                     'error': ('the payment went through for a checkout approved under '
                               'an older version, which named no cart; a person has to '
                               'place the order or refund it')}
-        placed = retry_order(store.get(m.mandate_id) or m, claimed=True)
+        # Every way this fails holds the payment and tells both parties at
+        # the failure site (retry_order, _submit_order), which alone knows
+        # whether an order call left this node.
+        return retry_order(store.get(m.mandate_id) or m, claimed=True)
     finally:
         store.end_settle(m.mandate_id)
-    if not placed['success']:
-        order_on_hold(payment, placed['error'], detail=(
-            'Your cart changed while you were paying: put the cart back the way '
-            'you approved it and ask your agent to check out, and it is placed '
-            'with this payment, with no new charge.')
-            if placed.get('cart_changed') else '')
-    return placed
 
 
 def commerce_order_status(

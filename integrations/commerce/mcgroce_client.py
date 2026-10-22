@@ -23,7 +23,11 @@ Every call:
   failures or 5xx in a row stop further calls for a minute.
 
 Results are ``{'success': True, 'status': int, 'data': ...}`` or
-``{'success': False, 'error': str, 'status'?: int}`` -- never an exception.
+``{'success': False, 'error': str, 'status'?: int, 'unconfirmed'?: True}``
+-- never an exception.  ``unconfirmed`` marks a request that was sent and
+that McGroce neither did nor refused (timeout, transport error, 5xx): the
+caller cannot know whether it happened.  A refusal (4xx) and a request
+never sent (bad URL, breaker open) carry no such mark.
 """
 
 import base64
@@ -45,10 +49,13 @@ MCGROCE_TIMEOUT = (3, 15)
 mcgroce_breaker = CircuitBreaker(name='mcgroce', threshold=5, cooldown=60)
 
 
-def _err(error: str, status: Optional[int] = None) -> Dict[str, Any]:
+def _err(error: str, status: Optional[int] = None,
+         unconfirmed: bool = False) -> Dict[str, Any]:
     out = {'success': False, 'error': error}
     if status is not None:
         out['status'] = status
+    if unconfirmed:
+        out['unconfirmed'] = True
     return out
 
 
@@ -135,13 +142,13 @@ class McGroceClient:
                                   json=json_body, timeout=MCGROCE_TIMEOUT)
         except requests.Timeout:
             self.breaker.record_failure()
-            return _err('McGroce timed out')
+            return _err('McGroce timed out', unconfirmed=True)
         except requests.RequestException as e:
             self.breaker.record_failure()
-            return _err(f'McGroce unreachable: {type(e).__name__}')
+            return _err(f'McGroce unreachable: {type(e).__name__}', unconfirmed=True)
         if resp.status_code >= 500:
             self.breaker.record_failure()
-            return _err(_error_text(resp), resp.status_code)
+            return _err(_error_text(resp), resp.status_code, unconfirmed=True)
         self.breaker.record_success()
         if resp.status_code >= 400:
             return _err(_error_text(resp), resp.status_code)

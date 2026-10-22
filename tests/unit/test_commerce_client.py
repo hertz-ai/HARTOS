@@ -140,7 +140,28 @@ class TestFailures:
         with patch('core.http_pool.pooled_request',
                    side_effect=requests.Timeout('slow')):
             out = client.cart_get(hartos_user_id(4242))
-        assert out == {'success': False, 'error': 'McGroce timed out'}
+        assert out == {'success': False, 'error': 'McGroce timed out', 'unconfirmed': True}
+
+    def test_only_a_sent_and_unanswered_request_is_unconfirmed(self, client):
+        # commerce_tools._submit_order reads this mark to tell a paid shopper
+        # "we could not confirm your order" (the call left, McGroce neither
+        # did nor refused it: it may be placed) from "not placed yet" (refused,
+        # or never sent).  It comes from the transport's own path, never from
+        # an error text.
+        uid = hartos_user_id(4242)
+        with patch('core.http_pool.pooled_request',
+                   side_effect=requests.ConnectionError('reset')):
+            assert client.cart_get(uid)['unconfirmed'] is True
+        with patch('core.http_pool.pooled_request', return_value=_Resp(503, {})):
+            assert client.cart_get(uid)['unconfirmed'] is True
+        with patch('core.http_pool.pooled_request', return_value=_Resp(409, {})):
+            assert 'unconfirmed' not in client.cart_get(uid)
+        for _ in range(5):
+            client.breaker.record_failure()
+        with patch('core.http_pool.pooled_request') as m:
+            out = client.cart_get(uid)
+        m.assert_not_called()
+        assert out['success'] is False and 'unconfirmed' not in out
 
     def test_error_wrapper_message_is_surfaced(self, client):
         body = {'httpStatusCode': 404, 'messages': [

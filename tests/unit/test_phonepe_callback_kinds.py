@@ -97,6 +97,9 @@ def test_order_step_failure_still_completes_the_payment_and_tells_the_shopper(ct
     assert r.get_json()['order'] == {'held': True, 'owner_told': True}
     hold.assert_called_once()
     assert hold.call_args.args[0] == p.payment_id
+    # The step raised midway, so an order call may have left: the shopper
+    # hears "could not confirm", never "not placed yet".
+    assert hold.call_args.kwargs['sent'] is True
     assert ctx['ledger'].get_payment(p.payment_id).status == PaymentStatus.COMPLETED
 
 
