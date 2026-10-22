@@ -7,6 +7,7 @@ import json
 import hashlib
 import logging
 import shutil
+import threading
 from pathlib import Path
 from typing import Optional, Tuple, Dict
 
@@ -537,6 +538,13 @@ def verify_json_signature(public_key_hex: str, payload: dict,
         return False
 
 
+# One cached-path walk at a time.  Measured 2026-10-21 on a dev boot: two boot
+# threads (hartos-bootstrap via start_relay_hub, platform-init via telemetry)
+# both missed the cache and walked the tree side by side.  The second caller
+# now waits and reads the cache the first one wrote.
+_CODE_HASH_WALK_LOCK = threading.Lock()
+
+
 def compute_code_hash(code_root: str = None, force_walk: bool = False) -> str:
     """Compute SHA-256 manifest hash of all .py files in the project.
 
@@ -573,17 +581,25 @@ def compute_code_hash(code_root: str = None, force_walk: bool = False) -> str:
         if cached:
             return cached
 
-    # Tier 3: Full computation
+        # Tier 3, single-flight: re-read the cache under the lock, since the
+        # walk we may have waited on has just written it.
+        with _CODE_HASH_WALK_LOCK:
+            cached = _load_code_hash_cache(root)
+            if cached:
+                return cached
+            result = _walk_code_hash(root)
+            _save_code_hash_cache(root, result)  # for the next caller / boot
+            return result
+
+    return _walk_code_hash(root)
+
+
+def _walk_code_hash(root: Path) -> str:
+    """Tier 3: hash every collected .py file's bytes and fold the manifest."""
     py_files = sorted(_collect_py_files(root, root))
     file_manifest = {rel_path: _hash_file(file_path)
                      for rel_path, file_path in py_files}
-    result = manifest_to_code_hash(file_manifest)
-
-    if not force_walk:
-        # Save to cache for next boot
-        _save_code_hash_cache(root, result)
-
-    return result
+    return manifest_to_code_hash(file_manifest)
 
 
 def manifest_to_code_hash(file_manifest: Dict[str, str]) -> str:
