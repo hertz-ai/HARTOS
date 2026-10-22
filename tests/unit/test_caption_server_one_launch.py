@@ -837,6 +837,49 @@ def test_a_caller_that_comes_during_a_cooldown_probe_is_not_told_it_waits(box):
     assert box.asked == [] and box.port.spawned == []
 
 
+def test_a_caller_that_comes_before_the_start_begins_is_told_when_it_does(box):
+    """The start is held but not begun: its holder is first stopping the
+    server it spawned last time, still not serving after a whole cooldown.
+    A reel that comes in that moment waits for that start, is told once that
+    the vision model is being made ready, and takes the start's answer.  A
+    reel told only when it finds a start already begun would wait here with
+    nothing said."""
+    _files_in(box.models)
+    _callers_on_the_test_port(box)
+    _nunba_in_this_process(box, start_s=1.0)
+    main = threading.get_ident()
+    reel_probed, told, reel = threading.Event(), [], {}
+
+    def reel_asks():
+        reel['ok'] = lvb.get_vision_backend(moments.REEL_VLM_DEFAULT).ensure_running(
+            on_wait=lambda: told.append(1))
+
+    def health(url, timeout=None, **kw):
+        if threading.get_ident() != main:
+            reel_probed.set()
+        return _Port.health(box.port, url, timeout, **kw)
+    box.port.health = health
+
+    def stopping(timeout=None):
+        """The wedged server's wait inside stop(): the start is held, not begun."""
+        reel['thread'] = threading.Thread(target=reel_asks, name='reel', daemon=True)
+        reel['thread'].start()
+        reel_probed.wait(10)
+        REAL_SLEEP(0.5)             # the reel finds the start held and waits
+        return 0
+    camera = lvb.get_vision_backend(moments.REEL_VLM_DEFAULT)
+    camera._launch_attempted = True
+    camera._launch_attempted_at = time.time() - camera.LAUNCH_RETRY_S - 1
+    camera._server_proc = MagicMock(pid=4141, wait=MagicMock(side_effect=stopping))
+    with _the_box(box):
+        assert camera.ensure_running() is True
+        reel['thread'].join(10)
+    assert not reel['thread'].is_alive()
+    assert reel.get('ok') is True
+    assert told == [1], 'the reel waited for the start without being told'
+    assert box.port.spawned == []
+
+
 def test_a_server_the_reel_started_is_not_idled_out_from_under_it(box):
     """VisionService's description loop unloads a 0.8B that HARTOS started
     once it has gone IDLE_TIMEOUT_S unused (check_idle, on the backend it

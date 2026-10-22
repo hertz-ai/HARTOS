@@ -899,6 +899,12 @@ class Qwen08BBackend(VisionBackend):
         #: caller that finds it held waits for that start instead of making
         #: its own.
         self._start_lock = threading.Lock()
+        #: Whether the caller holding _start_lock is starting a server, not
+        #: only asking /health in a failed start's cooldown.  _start_state is
+        #: notified when it turns True and whenever _start_lock is let go
+        #: (_end_hold), so a caller waiting on the start learns both.
+        self._starting = False
+        self._start_state = threading.Condition()
 
     @staticmethod
     def start_lock_path(port, config_dir=None) -> str:
@@ -1119,10 +1125,12 @@ class Qwen08BBackend(VisionBackend):
         is inside that start's cooldown, whoever it was.
 
         ``on_wait`` is called once, after the server was found not serving
-        and before the event is sent, or before waiting for another caller's
-        start: not when it is up, not while a failed launch's cooldown
-        holds.  In its own try, so a caller's progress line that raises
-        never skips the start it announces (review of 42735064e).
+        and before the event is sent, or, for a caller waiting on another
+        caller's start, when that start begins (_wait_for_start): not when
+        it is up, not while a failed launch's cooldown holds -- this
+        caller's, or the one another caller is asking /health in.  In its
+        own try, so a caller's progress line that raises never skips the
+        start it announces (review of 42735064e).
 
         Dependency direction: Nunba → HARTOS (never HARTOS → Nunba).  What
         is read of Nunba (its event subscriber, its start lock, its models
@@ -1138,14 +1146,41 @@ class Qwen08BBackend(VisionBackend):
         if self._is_serving():
             return True
         if not self._start_lock.acquire(blocking=False):
-            # Another caller is starting it; its waits bound this one.
-            _tell_waiting(on_wait)
-            with self._start_lock:
-                return self._is_serving()
+            return self._wait_for_start(on_wait)
         try:
             return self._start_serving(on_wait)
         finally:
+            self._end_hold()
+
+    def _wait_for_start(self, on_wait: Optional[Callable[[], None]]) -> bool:
+        """ensure_running for a caller that found the start held: it waits
+        for that start, whose waits bound this one, and takes its answer.
+
+        It is told it waits (``on_wait``, once, on its own thread) when that
+        caller is starting a server, now or when the start begins; never
+        while that caller only asks /health in a failed start's cooldown.
+        Told on arrival, a reel's chat said the vision model was being made
+        ready while nothing was being started (review of 1db4503c3)."""
+        told = False
+        while not self._start_lock.acquire(blocking=False):
+            with self._start_state:
+                self._start_state.wait_for(
+                    lambda: (self._starting and not told) or not self._start_lock.locked())
+                tell = self._starting and not told
+            if tell:
+                told = True
+                _tell_waiting(on_wait)
+        try:
+            return self._is_serving()
+        finally:
+            self._end_hold()
+
+    def _end_hold(self) -> None:
+        """Let go of the start, and wake every caller waiting on it."""
+        with self._start_state:
+            self._starting = False
             self._start_lock.release()
+            self._start_state.notify_all()
 
     def _start_serving(self, on_wait: Optional[Callable[[], None]]) -> bool:
         """ensure_running's start, with the start lock held."""
@@ -1186,6 +1221,11 @@ class Qwen08BBackend(VisionBackend):
         self._launch_attempted = True
         self._launch_attempted_at = _t.time()
 
+        # A start, not a cooldown's probe: a caller waiting on this one is
+        # told it waits now (_wait_for_start).
+        with self._start_state:
+            self._starting = True
+            self._start_state.notify_all()
         _tell_waiting(on_wait)
 
         # Emit event — Nunba subscribes in bundled mode and starts the server
