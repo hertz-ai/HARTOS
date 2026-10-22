@@ -414,6 +414,8 @@ def answer_game_sound_card(agent_id, action, approved, reason, approver_id):
     from core.game_sound_memo import parse_game_sound_action, record_verdict
     verdict = 'approved' if approved else 'rejected'
     if not approver_id:
+        from integrations.social.auth import log_refused_credential
+        log_refused_credential()
         return {'status': 'error', 'action': action, 'applied': False,
                 'reason': 'sign in to answer this'}, 401
     game_id, state = parse_game_sound_action(action)

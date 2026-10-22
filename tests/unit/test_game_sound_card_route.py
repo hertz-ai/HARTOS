@@ -69,6 +69,40 @@ def test_a_body_naming_the_creator_decides_nothing(hie, stores):
     assert _bgm(stores, AGENT)['url'] == TAKE
 
 
+def test_a_bearer_that_names_nobody_is_refused_with_one_line(hie, stores):
+    """#935: the 401 for a bearer that names no one is said once in the log
+    (integrations.social.auth.log_refused_credential): the route and the
+    reason, never the bearer itself."""
+    import logging
+    from unittest.mock import MagicMock, patch
+    unknown = 'opaque-credential-no-account-has-it'
+    lines = []
+
+    class _Refusals(logging.Handler):
+        def emit(self, record):
+            if record.funcName == 'log_refused_credential':
+                lines.append(record.getMessage())
+    log, handler = logging.getLogger('hevolve_social'), _Refusals(logging.WARNING)
+    level = log.level
+    log.addHandler(handler)
+    log.setLevel(logging.WARNING)
+    db = MagicMock()        # no account holds the bearer
+    db.query.return_value.filter.return_value.first.return_value = None
+    try:
+        with patch('integrations.social.models.get_db', return_value=db):
+            response = hie.app.test_client().post(
+                '/api/agent/approval', json=CARD,
+                headers={'Authorization': f'Bearer {unknown}'})
+    finally:
+        log.removeHandler(handler)
+        log.setLevel(level)
+    assert (response.status_code, response.get_json()['applied']) == (401, False)
+    (line,) = lines
+    assert 'POST /api/agent/approval' in line and 'unknown_token' in line
+    assert unknown not in line
+    assert _bgm(stores, AGENT)['url'] == TAKE
+
+
 def test_the_creators_signed_answer_is_the_agents(hie, stores):
     code, body = _post(hie, CARD, CREATOR)
     assert (code, body['scope'], body['applied']) == (200, 'agent', True)
