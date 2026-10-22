@@ -802,6 +802,47 @@ class TestLockContention:
         assert second['file_id'] != first['file_id']
         assert _wait_for_job(second['job_id'])['status'] == 'completed'
 
+    def test_an_existing_book_never_hands_back_another_books_job(
+            self, book_node, book_db, tmp_path):
+        """start_parse's 'existing' branch: the rule's second call site.
+
+        It asked for a job by bare id, so after a database reset -- where
+        ids start over -- "Already in your library" could answer with a job
+        belonging to a different book, and the person polled a stranger's
+        failure.  Measured by the 1faa4b6a0 review.
+        """
+        # _jobs outlives a test database, so an earlier test's job for this
+        # same book would answer here and hide what is being pinned.
+        with bp._jobs_lock:
+            bp._jobs.clear()
+
+        file_id = bp._register('42', 'book.pdf', '/tmp', '')
+        bp._update_row(file_id, status='completed')
+        stale = bp._new_job(file_id, '42', '', 'other.pdf')   # the reset shape
+        bp._update_job(stale, status='failed', error='another book died')
+
+        answer = bp.start_parse(make_pdf(tmp_path / 'book.pdf'), '42', 'req-again')
+
+        assert answer['existing'] is True and answer['status'] == 'completed'
+        assert answer['job_id'] != stale
+        assert answer['job_id'] is None
+
+    def test_a_long_name_does_not_hide_a_dead_parse(self, book_node, book_db):
+        """The job's key has to be the row's key.
+
+        The row clips a filename to its column and the job kept the whole
+        300 characters, so the two never matched: for a long name the fix
+        above silently did not apply and the 30-minute wait was back.
+        Measured by the 1faa4b6a0 review.
+        """
+        long_name = 'a' * 300 + '.pdf'
+        file_id = bp._register('42', long_name, '/tmp', '')
+        bp._update_row(file_id, status='processing')
+        job = bp._new_job(file_id, '42', '', long_name)
+        bp._update_job(job, status='failed', error=bp._BUSY_NOT_SAVED)
+
+        assert bp._existing('42', long_name) is None
+
     def test_a_parse_with_no_job_of_its_own_is_still_live(self, book_node, book_db):
         """The guard for the rule above: no job does NOT mean dead.
 

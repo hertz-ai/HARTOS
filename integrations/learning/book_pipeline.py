@@ -662,11 +662,23 @@ def _retry_on_lock(fn):
 
 
 @_retry_on_lock
+def _book_key(user_id, filename):
+    """How a book's reader and name are stored, in one spelling.
+
+    The ROW is canonical: it clips both to its columns. A job keyed any
+    other way cannot be matched to its book, and a 300-character filename
+    then slips past the match in _job_for_file -- which is a dead parse
+    reading as live again, the whole defect, for that one shape.
+    """
+    return str(user_id)[:64], str(filename)[:255]
+
+
 def _register(user_id, filename, directory, request_id) -> int:
     from integrations.social.models import BookFile, db_session
     with db_session() as db:
         now = _utcnow()
-        row = BookFile(user_id=str(user_id)[:64], filename=str(filename)[:255],
+        key_user, key_name = _book_key(user_id, filename)
+        row = BookFile(user_id=key_user, filename=key_name,
                        directory=str(directory)[:1024],
                        request_id=str(request_id or '')[:128],
                        status='pending', created_date=now, updated_at=now)
@@ -879,10 +891,12 @@ _jobs_lock = threading.Lock()
 
 def _new_job(file_id, user_id, request_id, filename) -> str:
     job_id = uuid.uuid4().hex[:12]
+    # Keyed as the row keys them, or this job cannot be matched to its book.
+    key_user, key_name = _book_key(user_id, filename)
     with _jobs_lock:
         _jobs[job_id] = {
-            'job_id': job_id, 'file_id': file_id, 'user_id': str(user_id),
-            'request_id': request_id, 'filename': filename,
+            'job_id': job_id, 'file_id': file_id, 'user_id': key_user,
+            'request_id': request_id, 'filename': key_name,
             'status': 'queued', 'total_pages': 0, 'progress': 0,
             'error': None, 'result': None, 'updated': time.time(),
         }
@@ -1216,7 +1230,12 @@ def start_parse(pdf_path, user_id, request_id='') -> dict:
         if existing['status'] == 'completed':
             _publish(user_id, _progress(request_id, pdf_path.name, existing['file_id'],
                                         'Already in your library', 100))
-        return {'job_id': _job_for_file(existing['file_id']),
+        # This book's own job, never one that merely reused its id: after a
+        # database reset the stale job belongs to another book, and handing
+        # back its id sends the person to poll a stranger's failure under
+        # "Already in your library".
+        return {'job_id': _job_for_file(existing['file_id'], existing['filename'],
+                                        existing['user_id']),
                 'file_id': existing['file_id'], 'status': existing['status'],
                 'existing': True}
     file_id = _register(user_id, pdf_path.name, pdf_path.parent, request_id)
