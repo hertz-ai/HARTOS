@@ -887,6 +887,39 @@ class TestLockContention:
         with db_session(commit=False) as db:
             assert db.get(BookFile, file_id).status == 'failed'
 
+    def test_the_row_that_starts_a_parse_waits_out_a_lock(
+            self, book_node, book_db, monkeypatch):
+        """_register's own ladder, which nothing pinned until now.
+
+        Every parse begins with this insert.  When a pure helper was put
+        between @_retry_on_lock and def _register, the insert lost the
+        ladder -- one busy moment raised straight to the upload route, and
+        the person got a 503 where they used to get their book -- while the
+        whole suite stayed green (cc66abd80, found on review).
+        """
+        from sqlalchemy.exc import OperationalError
+        import integrations.social.models as models
+
+        real_session, calls = models.db_session, []
+
+        def busy_once(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                raise OperationalError('INSERT INTO pdf_files', {},
+                                       sqlite3.OperationalError('database is locked'))
+            return real_session(*args, **kwargs)
+
+        monkeypatch.setattr(models, 'db_session', busy_once)
+        monkeypatch.setattr(bp, '_LOCK_RETRY_DELAYS', (0, 0, 0))
+
+        file_id = bp._register('42', 'waited.pdf', '/tmp', '')
+
+        assert isinstance(file_id, int) and file_id > 0
+        assert len(calls) == 2, 'the insert that starts a parse did not retry'
+        # and the ladder is on the write, not on the helper beside it
+        assert hasattr(bp._register, '__wrapped__')
+        assert not hasattr(bp._book_key, '__wrapped__')
+
     def test_only_lock_contention_is_retried(self, monkeypatch):
         from sqlalchemy.exc import OperationalError
         calls = []

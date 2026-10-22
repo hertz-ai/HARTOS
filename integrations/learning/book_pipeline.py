@@ -661,7 +661,6 @@ def _retry_on_lock(fn):
     return retrying
 
 
-@_retry_on_lock
 def _book_key(user_id, filename):
     """How a book's reader and name are stored, in one spelling.
 
@@ -669,10 +668,16 @@ def _book_key(user_id, filename):
     other way cannot be matched to its book, and a 300-character filename
     then slips past the match in _job_for_file -- which is a dead parse
     reading as live again, the whole defect, for that one shape.
+
+    Pure, and deliberately above the decorator: _retry_on_lock belongs to
+    _register, the write. Inserting this helper between the two gave the
+    ladder to a function that does no I/O and took it from the insert that
+    starts every parse, with every test still green (cc66abd80).
     """
     return str(user_id)[:64], str(filename)[:255]
 
 
+@_retry_on_lock
 def _register(user_id, filename, directory, request_id) -> int:
     from integrations.social.models import BookFile, db_session
     with db_session() as db:
