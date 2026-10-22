@@ -830,12 +830,13 @@ def create_key():
     if not auth_header.startswith('Bearer '):
         return jsonify({'success': False, 'error': 'Authorization required'}), 401
 
-    from integrations.social.auth import _get_user_from_token
+    from integrations.social.auth import _get_user_from_token, log_refused_credential
     token = auth_header[7:]
     user, db = _get_user_from_token(token)
     if not user:
         if db:
             db.close()
+        log_refused_credential(token)
         return jsonify({'success': False, 'error': 'Invalid token'}), 401
 
     try:
@@ -876,12 +877,13 @@ def list_keys():
     if not auth_header.startswith('Bearer '):
         return jsonify({'success': False, 'error': 'Authorization required'}), 401
 
-    from integrations.social.auth import _get_user_from_token
+    from integrations.social.auth import _get_user_from_token, log_refused_credential
     token = auth_header[7:]
     user, db = _get_user_from_token(token)
     if not user:
         if db:
             db.close()
+        log_refused_credential(token)
         return jsonify({'success': False, 'error': 'Invalid token'}), 401
 
     try:
@@ -898,12 +900,13 @@ def revoke_key(key_id):
     if not auth_header.startswith('Bearer '):
         return jsonify({'success': False, 'error': 'Authorization required'}), 401
 
-    from integrations.social.auth import _get_user_from_token
+    from integrations.social.auth import _get_user_from_token, log_refused_credential
     token = auth_header[7:]
     user, db = _get_user_from_token(token)
     if not user:
         if db:
             db.close()
+        log_refused_credential(token)
         return jsonify({'success': False, 'error': 'Invalid token'}), 401
 
     try:
@@ -1003,12 +1006,13 @@ def upgrade_key(key_id):
     if not auth_header.startswith('Bearer '):
         return jsonify({'success': False, 'error': 'Authorization required'}), 401
 
-    from integrations.social.auth import _get_user_from_token
+    from integrations.social.auth import _get_user_from_token, log_refused_credential
     token = auth_header[7:]
     user, db = _get_user_from_token(token)
     if not user:
         if db:
             db.close()
+        log_refused_credential(token)
         return jsonify({'success': False, 'error': 'Invalid token'}), 401
 
     try:
@@ -1222,12 +1226,13 @@ def initiate_phonepe_upgrade(key_id: str):
     if not auth_header.startswith('Bearer '):
         return jsonify({'success': False, 'error': 'Authorization required'}), 401
 
-    from integrations.social.auth import _get_user_from_token
+    from integrations.social.auth import _get_user_from_token, log_refused_credential
     token = auth_header[7:]
     user, db = _get_user_from_token(token)
     if not user:
         if db:
             db.close()
+        log_refused_credential(token)
         return jsonify({'success': False, 'error': 'Invalid token'}), 401
 
     try:
@@ -1789,11 +1794,12 @@ def create_upgrade_checkout(key_id):
     if not auth_header.startswith('Bearer '):
         return jsonify({'success': False, 'error': 'Authorization required'}), 401
 
-    from integrations.social.auth import _get_user_from_token
+    from integrations.social.auth import _get_user_from_token, log_refused_credential
     user, db = _get_user_from_token(auth_header[7:])
     if not user:
         if db:
             db.close()
+        log_refused_credential(auth_header[7:])
         return jsonify({'success': False, 'error': 'Invalid token'}), 401
 
     try:
@@ -2219,11 +2225,12 @@ def complete_upgrade_checkout():
     if not auth_header.startswith('Bearer '):
         return jsonify({'success': False, 'error': 'Authorization required'}), 401
 
-    from integrations.social.auth import _get_user_from_token
+    from integrations.social.auth import _get_user_from_token, log_refused_credential
     user, db = _get_user_from_token(auth_header[7:])
     if not user:
         if db:
             db.close()
+        log_refused_credential(auth_header[7:])
         return jsonify({'success': False, 'error': 'Invalid token'}), 401
 
     try:

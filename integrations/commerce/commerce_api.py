@@ -95,6 +95,8 @@ def commerce_mandate(mandate_id):
     from integrations.commerce.approvals import approver_from_request
     user_id = approver_from_request(request)
     if not user_id:
+        from integrations.social.auth import log_refused_credential
+        log_refused_credential()
         return _json_error('sign in first', 401)
     from integrations.ap2.ap2_mandate import MandateKeyError, get_mandate_store
     try:
@@ -120,6 +122,8 @@ def commerce_stream():
     from integrations.commerce.approvals import approver_from_request
     user_id = approver_from_request(request)
     if not user_id:
+        from integrations.social.auth import log_refused_credential
+        log_refused_credential()
         return _json_error('sign in first', 401)
     return jsonify({'user_id': user_id,
                     'wamp_topic': f'com.hertzai.hevolve.social.{user_id}',

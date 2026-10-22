@@ -468,7 +468,7 @@ def user_id_for_token(token):
             db.close()
 
 
-def log_refused_credential(token, reason=None) -> None:
+def log_refused_credential(token=None, reason=None) -> None:
     """Say, once, that a request is refused because no way in accepted the
     credential it sent: where, why, and the credential's shape, never the
     credential itself (owner rule H-0711: an error is seen in the log).
@@ -479,7 +479,13 @@ def log_refused_credential(token, reason=None) -> None:
     not call it, so a request that goes on to succeed logs nothing.
     ``reason`` defaults to the one _get_user_from_token left on g.  A
     request that sent no credential was not refused one, and logs nothing.
+    ``token`` defaults to the Bearer the request sent, for a refusal decided
+    where the token is not at hand (approver_from_request's callers, the API
+    gate's final answer).
     """
+    if token is None and has_request_context():
+        header = request.headers.get('Authorization', '')
+        token = header[7:].strip() if header.startswith('Bearer ') else ''
     if not token:
         return
     where = 'a call outside a request'
