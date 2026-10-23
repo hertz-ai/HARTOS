@@ -1876,6 +1876,10 @@ class ModelLifecycleManager:
             if os.name == 'nt':
                 _popen_kwargs['creationflags'] = _sp.CREATE_NO_WINDOW
             proc = _sp.Popen(cmd, **_popen_kwargs)
+            # Die with this process: an orphaned llama-server keeps its RAM
+            # and CPU, and the next launch reuses it as "external".
+            from core.child_lifecycle import bind_to_parent
+            bind_to_parent(proc)
             # Store handle so it stays open for the child process
             self._direct_log_fh = log_fh
             log_fh = None  # Prevent close in finally
@@ -1989,7 +1993,11 @@ class ModelLifecycleManager:
                      and s.active_inference_count == 0
                      and s.name != needed_model
                      and not s.name.startswith('llm-')
-                     and s.model_type != 'llm'],
+                     # ModelState carries no type; ask the module's own
+                     # name->type map (the crash path uses it too).  A bare
+                     # `s.model_type` raised AttributeError here, so no swap
+                     # could ever happen while a non-LLM model was on GPU.
+                     and self._guess_model_type(s.name) != 'llm'],
                     key=lambda s: (
                         _PRIORITY_RANK.get(s.priority, 99),
                         s.last_access_time,
