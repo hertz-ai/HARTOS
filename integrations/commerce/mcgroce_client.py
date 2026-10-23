@@ -24,10 +24,12 @@ Every call:
 
 Results are ``{'success': True, 'status': int, 'data': ...}`` or
 ``{'success': False, 'error': str, 'status'?: int, 'unconfirmed'?: True}``
--- never an exception.  ``unconfirmed`` marks a request that was sent and
-that McGroce neither did nor refused (timeout, transport error, 5xx): the
-caller cannot know whether it happened.  A refusal (4xx) and a request
-never sent (bad URL, breaker open) carry no such mark.
+-- never an exception.  ``unconfirmed`` marks a request McGroce neither did
+nor refused: a timeout, a transport error (a refused connection included,
+since the client cannot tell one refused before the request left from one
+dropped after it did), or a 5xx.  The caller cannot know whether it
+happened.  A refusal (4xx) and a request never attempted (bad URL, breaker
+open) carry no such mark.
 """
 
 import base64

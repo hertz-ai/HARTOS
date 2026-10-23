@@ -167,13 +167,18 @@ class CartMandate:
     #: Which merchant-side cart this pays for (a McGroce cart's order id),
     #: fixed and signed when the mandate is created.
     cart_ref: Optional[str] = None
+    #: When an order call for this consumed mandate left the node and was
+    #: never answered (timeout, transport error, 5xx): the order may exist,
+    #: so every hold for it since says "could not confirm" and a person
+    #: checks the merchant before refunding, until order_ref is known.
+    order_sent: Optional[float] = None
 
     def signed_fields(self) -> Dict[str, Any]:
         d = asdict(self)
         d.pop('sig', None)
         # Absent while unset, so a record written before these fields
         # existed still verifies.
-        for optional in ('order_ref', 'cart_ref'):
+        for optional in ('order_ref', 'cart_ref', 'order_sent'):
             if d.get(optional) is None:
                 d.pop(optional, None)
         return d
@@ -566,6 +571,21 @@ class MandateStore:
                     or not self._intact(m):
                 return False
             m.order_ref = str(order_ref)
+            m.sig = self._sign(m)
+            self._save()
+            return True
+
+    def record_order_sent(self, mandate_id: str) -> bool:
+        """Note that an order call for a consumed mandate left and was never
+        answered (once: the first such time stands).  Signed with the
+        record, like order_ref."""
+        with self._lock:
+            self._ready_to_sign()
+            m = self._mandates.get(mandate_id)
+            if m is None or m.status != 'consumed' or m.order_sent \
+                    or not self._intact(m):
+                return False
+            m.order_sent = time.time()
             m.sig = self._sign(m)
             self._save()
             return True

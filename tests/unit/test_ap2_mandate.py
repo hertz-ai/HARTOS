@@ -255,6 +255,48 @@ class TestOrderRef:
         assert store.record_order(m.mandate_id, 'ORD-2') is False
         assert store.get(m.mandate_id).order_ref == 'ORD-1'
 
+    def test_an_unanswered_order_call_is_marked_once_on_a_consumed_mandate(self, store):
+        # The mark outlives the attempt: a later hold for this mandate says
+        # "could not confirm" until McGroce answers with the order.
+        m = store.create_cart_mandate('u1', 'mcgroce', CART)
+        store.approve(m.mandate_id, 'u1')
+        assert store.record_order_sent(m.mandate_id) is False      # not paid yet
+        store.consume(m.mandate_id)
+        assert store.get(m.mandate_id).order_sent is None
+        before = time.time()
+        assert store.record_order_sent(m.mandate_id) is True
+        first = store.get(m.mandate_id).order_sent
+        assert first is not None and first >= before
+        assert store.record_order_sent(m.mandate_id) is False      # the first time stands
+        assert store.get(m.mandate_id).order_sent == first
+        # Signed with the record: it survives a reload, and the order is
+        # still recorded on top of it.
+        reloaded = MandateStore(path=store.path, ledger=store.ledger, key=b'k' * 32)
+        assert reloaded.get(m.mandate_id).order_sent == first
+        assert reloaded.record_order(m.mandate_id, 'ORD-1') is True
+
+    def test_a_record_written_before_order_sent_existed_still_verifies(self, store, tmp_path):
+        m = store.create_cart_mandate('u1', 'mcgroce', CART)
+        raw = json.loads((tmp_path / 'ap2_mandates.json').read_text())
+        rec = raw['mandates'][m.mandate_id]
+        rec.pop('order_sent')                 # as the build before the mark wrote it
+        (tmp_path / 'ap2_mandates.json').write_text(json.dumps(raw))
+        reloaded = MandateStore(path=str(tmp_path / 'ap2_mandates.json'),
+                                ledger=store.ledger, key=b'k' * 32)
+        assert reloaded.approve(m.mandate_id, 'u1') == (True, 'approved')
+
+    def test_a_mark_erased_outside_the_store_fails_the_signature(self, store, tmp_path):
+        m = store.create_cart_mandate('u1', 'mcgroce', CART)
+        store.approve(m.mandate_id, 'u1')
+        store.consume(m.mandate_id)
+        store.record_order_sent(m.mandate_id)
+        raw = json.loads((tmp_path / 'ap2_mandates.json').read_text())
+        raw['mandates'][m.mandate_id]['order_sent'] = None
+        (tmp_path / 'ap2_mandates.json').write_text(json.dumps(raw))
+        reloaded = MandateStore(path=str(tmp_path / 'ap2_mandates.json'),
+                                ledger=store.ledger, key=b'k' * 32)
+        assert reloaded.record_order(m.mandate_id, 'ORD-1') is False   # not intact
+
     def test_an_edited_record_is_never_re_signed(self, store, tmp_path):
         m = store.create_cart_mandate('u1', 'mcgroce', CART)
         store.approve(m.mandate_id, 'u1')
