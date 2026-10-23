@@ -13,7 +13,7 @@ import logging
 import time
 from functools import wraps
 
-from flask import request, g, jsonify
+from flask import request, g, jsonify, has_request_context
 
 try:
     import jwt as pyjwt
@@ -375,6 +375,36 @@ def _get_user_from_token(token: str):
             pass
         return user, db
 
+    # A desktop's Social API uses the existing owner-approved phone proof.
+    # Discovery and the phone's claimed user alone confer no identity: only
+    # the owner's exact device-key grant admits their own synced account.
+    owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
+    if (token and owner and os.environ.get('NUNBA_BUNDLED')
+            and has_request_context()):
+        verdict = verify_device_jwt(db, token, owner)
+        claims = verdict.get('payload') or verdict.get('claims') or {}
+        if verdict['status'] == 'denied':
+            g.device_auth_error = 'consent_denied'
+        if str(claims.get('user_id', '')) == str(owner):
+            if verdict['status'] == 'pending':
+                from .discovery import check_client_rate
+                if check_client_rate():
+                    file_device_access_ask(db, owner, verdict['public_key'], claims)
+                    db.commit()
+                g.device_auth_error = 'consent_pending'
+            elif verdict['status'] == 'denied':
+                g.device_auth_error = 'consent_denied'
+            elif verdict['status'] == 'ok':
+                body = request.get_json(silent=True) if request.is_json else None
+                if isinstance(body, dict) and 'user_id' in body and str(body['user_id']) != str(owner):
+                    return None, db
+                user = db.query(User).filter(User.id == str(owner)).first()
+                if user and not user.is_banned:
+                    g.token_scope = 'device'
+                    g.token_node_id = claims.get('node_id', '')
+                    g.token_tenant_id = None
+                    return user, db
+
     # ── Kong gateway fallback (2026-06-20) ────────────────────────────
     # If both JWT decode + api_token lookup failed AND the request was
     # pre-authenticated by Kong, trust Kong's identity headers as a
@@ -499,6 +529,10 @@ def require_auth(f):
         if user is None:
             if db:
                 db.close()
+            device_error = getattr(g, 'device_auth_error', None)
+            if device_error:
+                return jsonify({'success': False, 'error': device_error,
+                                'message': 'Allow this phone in the desktop privacy settings.'}), 403
             return _sign_in_required('Invalid or expired token')
 
         g.user = user
