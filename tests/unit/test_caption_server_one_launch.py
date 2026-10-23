@@ -898,9 +898,10 @@ def test_a_server_the_reel_started_is_not_idled_out_from_under_it(box):
         camera.check_idle()
         assert not proc.terminate.called, 'the server was unloaded as it came up'
         # A while later: three quarters of IDLE_TIMEOUT_S, so real time spent
-        # in rate_frame never pushes a used server past it (with IDLE - 1 a
-        # one-second stall failed this, measured 10-22), while a rating that
-        # was not a use leaves it 1.5 x IDLE_TIMEOUT_S idle.
+        # in rate_frame never pushes a used server past it (with IDLE - 1 the
+        # assertion failed once in a cold full-file run, 10-22: any second of
+        # real time here fails it), while a rating that was not a use leaves
+        # it 1.5 x IDLE_TIMEOUT_S idle.
         while_later = camera.IDLE_TIMEOUT_S * 3 // 4
         reel._last_describe_time -= while_later
         reel.rate_frame(b'a keyframe', 'rate it', timeout_s=1.0)
