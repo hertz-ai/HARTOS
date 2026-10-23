@@ -1024,11 +1024,9 @@ COMPONENT_TYPES = {
     'media': {
         'props': ['type', 'src', 'alt', 'controls'],
         'attributes': {'media_type': 'image|video|audio', 'src': 'str',
-                       'url': 'str', 'alt': 'str', 'title': 'str',
-                       'controls': 'bool'},
-        'doc': ("Image, video or audio. Nunba's AgentOverlay plays `url`; `src` "
-                'is the declared prop and AgentOverlay does not read it.'),
-        'example': {'media_type': 'audio', 'url': 'https://example.com/a.mp3',
+                       'alt': 'str', 'title': 'str', 'controls': 'bool'},
+        'doc': 'Image, video or audio; the source to play is `src`.',
+        'example': {'media_type': 'audio', 'src': 'https://example.com/a.mp3',
                     'alt': 'Sample', 'controls': True},
     },
     # ``metric`` is the worked example of the ENRICHED interface shape (§6b): the
