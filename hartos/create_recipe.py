@@ -65,8 +65,6 @@ except Exception:
     PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'prompts'))
 os.makedirs(PROMPTS_DIR, exist_ok=True)
 from hartos import helper as helper_fun
-import contextlib
-import threading
 from concurrent.futures import ThreadPoolExecutor
 # transform_messages is an autogen.agentchat.contrib.capabilities submodule —
 # importing it eagerly pulls the SAME heavy chain as autogen (llmlingua ->
@@ -819,52 +817,14 @@ class SubscriptionHandler:
 from hartos.helper import has_pending_tool_calls  # noqa: E402
 
 
-# Every thread running a session's turn, by user_prompt (recipe() marks
-# them), each with how deep it has re-entered.  get_response_group re-enters
-# itself (safe_action_boundary_check, the flow-increment sites), so the SAME
-# thread entering again is still its one turn; any OTHER thread in the set is
-# "another turn in flight".  A set, not one owner: with one owner, three
-# overlapping requests for one session emptied the table when the first
-# returned, and the third settled the second's live tool call (review of
-# ff160f057, 2026-10-05).
-_TURNS_IN_FLIGHT = {}
-_TURNS_IN_FLIGHT_LOCK = threading.Lock()
-
-
-@contextlib.contextmanager
-def _turn_in_flight(user_prompt):
-    """Mark this thread as running ``user_prompt``'s turn for the duration
-    of the block.  Re-entrant: an inner block on the same thread deepens the
-    mark and leaving it only undoes its own level; every thread is counted
-    on its own, so one leaving never clears another's."""
-    me = threading.get_ident()
-    with _TURNS_IN_FLIGHT_LOCK:
-        running = _TURNS_IN_FLIGHT.setdefault(user_prompt, {})
-        running[me] = running.get(me, 0) + 1
-    try:
-        yield
-    finally:
-        with _TURNS_IN_FLIGHT_LOCK:
-            running = _TURNS_IN_FLIGHT.get(user_prompt)
-            if running is not None:
-                depth = running.get(me, 0) - 1
-                if depth > 0:
-                    running[me] = depth
-                else:
-                    running.pop(me, None)
-                    if not running:
-                        del _TURNS_IN_FLIGHT[user_prompt]
-
-
-def _another_turn_in_flight(user_prompt):
-    """True when a thread other than this one is running ``user_prompt``'s
-    turn right now.  The per-user lock is not held across LLM calls
-    (hart_intelligence_entry chat()), so /chat requests for one session can
-    overlap, and that is the only case in which a pending tool call at the
-    end of the group chat is really being processed."""
-    me = threading.get_ident()
-    with _TURNS_IN_FLIGHT_LOCK:
-        return any(t != me for t in _TURNS_IN_FLIGHT.get(user_prompt, ()))
+# Every thread running a session's turn: the one registry in helper
+# (turn_in_flight / another_turn_in_flight), which REUSE's turns mark too, so
+# a REUSE turn of a session counts here as well (#172).  recipe() marks this
+# module's turns; a pending tool call at the end of the group chat is really
+# being processed only while another turn of the session is in flight.
+_TURNS_IN_FLIGHT = helper_fun.TURNS_IN_FLIGHT
+_turn_in_flight = helper_fun.turn_in_flight
+_another_turn_in_flight = helper_fun.another_turn_in_flight
 
 
 def _settle_orphaned_tool_calls(group_chat, manager=None):
@@ -4627,6 +4587,9 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
     else:
         current_app.logger.info(f"Using existing agents for user_prompt={user_prompt}")
         author, assistant_agent, executor, group_chat, manager, chat_instructor,agents_object = user_agents[user_prompt]
+        # Built on an earlier turn's model: this turn runs on its own (#172).
+        helper_fun.bind_agents_to_turn_model(
+            user_agents[user_prompt], config_list, user_prompt)
     clear_history = False
 
     # TOOL CALL AND RESPONSE CHECK.  A turn that ends while a tool call is the

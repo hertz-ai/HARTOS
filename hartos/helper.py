@@ -62,6 +62,8 @@ import aiohttp
 import asyncio
 import os
 import threading
+import contextlib
+import functools
 from core.file_cache import atomic_json_write
 from bs4 import BeautifulSoup
 from json_repair import repair_json
@@ -3943,6 +3945,122 @@ def get_llm_config(fallback_config_list=None):
     from hartos.threadlocal import thread_local_data
     override = thread_local_data.get_model_config_override()
     return {"cache_seed": None, "config_list": override or (fallback_config_list if fallback_config_list is not None else config_list), "max_tokens": 1500}
+
+
+# Every thread running a session's turn, by user_prompt, each with how deep it
+# has re-entered.  CREATE's recipe() and REUSE's chat_agent mark their turn
+# (turn_in_flight); get_response_group re-enters itself (safe_action_boundary_
+# check, the flow-increment sites), so the SAME thread entering again is still
+# its one turn, and any OTHER thread in the set is "another turn in flight".
+# A set, not one owner: with one owner, three overlapping requests for one
+# session emptied the table when the first returned, and the third settled the
+# second's live tool call (review of ff160f057, 2026-10-05).
+TURNS_IN_FLIGHT = {}
+_TURNS_IN_FLIGHT_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def turn_in_flight(user_prompt):
+    """Mark this thread as running ``user_prompt``'s turn for the duration
+    of the block.  Re-entrant: an inner block on the same thread deepens the
+    mark and leaving it only undoes its own level; every thread is counted
+    on its own, so one leaving never clears another's."""
+    me = threading.get_ident()
+    with _TURNS_IN_FLIGHT_LOCK:
+        running = TURNS_IN_FLIGHT.setdefault(user_prompt, {})
+        running[me] = running.get(me, 0) + 1
+    try:
+        yield
+    finally:
+        with _TURNS_IN_FLIGHT_LOCK:
+            running = TURNS_IN_FLIGHT.get(user_prompt)
+            if running is not None:
+                depth = running.get(me, 0) - 1
+                if depth > 0:
+                    running[me] = depth
+                else:
+                    running.pop(me, None)
+                    if not running:
+                        del TURNS_IN_FLIGHT[user_prompt]
+
+
+def marks_session_turn(turn):
+    """``turn(user_id, text, prompt_id, ...)`` runs as its session's turn
+    (turn_in_flight), so another_turn_in_flight sees it.  REUSE's chat_agent
+    wears it; CREATE's recipe() marks its turn around get_response_group."""
+    @functools.wraps(turn)
+    def marked(user_id, text, prompt_id, *args, **kwargs):
+        with turn_in_flight(f'{user_id}_{prompt_id}'):
+            return turn(user_id, text, prompt_id, *args, **kwargs)
+    return marked
+
+
+def another_turn_in_flight(user_prompt):
+    """True when a thread other than this one is running ``user_prompt``'s
+    turn right now.  The per-user lock is not held across LLM calls
+    (hart_intelligence_entry chat()), so /chat requests for one session can
+    overlap."""
+    me = threading.get_ident()
+    with _TURNS_IN_FLIGHT_LOCK:
+        return any(t != me for t in TURNS_IN_FLIGHT.get(user_prompt, ()))
+
+
+def _session_llm_agents(cached):
+    """The autogen agents with a model in a cached session entry (the tuple
+    create_agents / create_agents_for_user return, its agents dict, a
+    GroupChat's agents), each once."""
+    seen, found = set(), []
+
+    def walk(item):
+        if isinstance(item, (tuple, list)):
+            for x in item:
+                walk(x)
+        elif isinstance(item, dict):
+            for x in item.values():
+                walk(x)
+        elif isinstance(item, autogen.GroupChat):
+            walk(item.agents)
+        elif isinstance(item, autogen.ConversableAgent) and id(item) not in seen:
+            seen.add(id(item))
+            if isinstance(item.llm_config, dict):
+                found.append(item)
+
+    walk(cached)
+    return found
+
+
+def bind_agents_to_turn_model(cached, fallback_config_list, user_prompt):
+    """Run a cached session's agents on THIS turn's model (#172).
+
+    autogen builds an agent's client once, from the llm_config it was made
+    with, and CREATE / REUSE keep a session's agents between turns, so a turn
+    whose dispatcher chose another model (the expert of a revenue goal, set by
+    /chat as the thread's model_config override) still called the model the
+    agents were built on: central, 2026-10-23, 0 api.anthropic.com calls after
+    "Handed to the expert model".  Built on an expert turn, they kept the
+    expert for every ordinary turn after it, outside the day-cap check.
+
+    The turn's model is get_llm_config's, the one every agent builder reads.
+    Each agent gets it through autogen's own builder (_validate_llm_config),
+    with the rest of its llm_config kept, registered tools included.  A
+    session whose other turn is still running is left as it is: switching
+    the model under that turn would change the model it is mid-way through.
+    Returns whether any agent was switched."""
+    turn_list = get_llm_config(fallback_config_list)['config_list']
+    stale = [a for a in _session_llm_agents(cached)
+             if a.llm_config.get('config_list') != turn_list]
+    if not stale:
+        return False
+    models = sorted({str((c or {}).get('model')) for c in turn_list or []})
+    if another_turn_in_flight(user_prompt):
+        _safe_log('warning', f'[TURN-MODEL] {user_prompt}: another turn of this '
+                             f'session is running, so its agents keep their model; '
+                             f'this turn asked for {models}')
+        return False
+    for agent in stale:
+        agent._validate_llm_config({**agent.llm_config, 'config_list': turn_list})
+    _safe_log('info', f'[TURN-MODEL] {user_prompt}: {len(stale)} agent(s) now on {models}')
+    return True
 
 
 def format_action_text(text):

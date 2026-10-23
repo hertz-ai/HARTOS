@@ -905,6 +905,9 @@ def time_based_execution(task_description: str, user_id: int, prompt_id: int, ac
     else:
         # TODO use action_entry_point to give actions via chatinstructor by changing currnt action
         assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor, visual_agent_group = user_agents[user_prompt]
+        # An expert turn may have left the session on its model (#172).
+        helper_fun.bind_agents_to_turn_model(
+            user_agents[user_prompt], config_list, user_prompt)
         # author, assistant_agent, executor, group_chat, manager, chat_instructor,agents_object = user_agents[user_id]
         current_time = datetime.now()
         text = f'This is the time now {current_time}\n you must perform this task {task_description}'
@@ -976,6 +979,9 @@ def visual_based_execution(task_description: str, user_id: int, prompt_id: int):
     else:
         assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor, visual_agent_group = \
         user_agents[user_prompt]
+        # An expert turn may have left the session on its model (#172).
+        helper_fun.bind_agents_to_turn_model(
+            user_agents[user_prompt], config_list, user_prompt)
 
         # Log the current time
         current_time = datetime.now()
@@ -7699,6 +7705,7 @@ from core.llm_outbound_logger import with_llm_context as _with_llm_context
 
 
 @_with_llm_context('autogen.reuse')
+@helper_fun.marks_session_turn
 def chat_agent(user_id, text, prompt_id, file_id, request_id):
     current_app.logger.info('--' * 100)
     user_message = text
@@ -7763,6 +7770,9 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                 user_journey[user_prompt] = 'UseBot'
         if user_journey[user_prompt] == 'Roles':
             assistant, user_proxy, group_chat, manager, helper, stop = role_agents[user_prompt]
+            # Built on an earlier turn's model: this turn runs on its own (#172).
+            helper_fun.bind_agents_to_turn_model(
+                role_agents[user_prompt], config_list, user_prompt)
             result = user_proxy.initiate_chat(manager, message=user_message, speaker_selection={"speaker": "assistant"},
                                               clear_history=False)
             # The persona-selection chat's selector yields too (#129): a
@@ -7796,6 +7806,9 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
         # The former role-selection loop only recognized ChatInstructor's
         # TERMINATE token, so a terminal verifier verdict stranded action 1.
         assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor, visual_agent_group = user_agents[user_prompt]
+        # Built on an earlier turn's model: this turn runs on its own (#172).
+        helper_fun.bind_agents_to_turn_model(
+            user_agents[user_prompt], config_list, user_prompt)
         role = get_role(user_id, prompt_id)
         response = get_agent_response(assistant, chat_instructor, helper, user_proxy, manager, group_chat,
                                       user_message, role, user_id, prompt_id, request_id)
@@ -7813,6 +7826,8 @@ def crossbar_multiagent(msg):
 
     user_prompt = f"{msg['user_id']}_{msg['caller_prompt_id']}"
     assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor, visual_agent_group = user_agents[user_prompt]
+    # An expert turn may have left the session on its model (#172).
+    helper_fun.bind_agents_to_turn_model(user_agents[user_prompt], config_list, user_prompt)
     message = f"Role: {msg['caller_role']}\n Message: {msg['message']}"
     response = multi_role_agent.initiate_chat(manager, message=message, speaker_selection={"speaker": "assistant"},
                                               clear_history=False)
@@ -7825,6 +7840,8 @@ def crossbar_multiagent(msg):
 
     user_prompt = f"{msg['caller_user_id']}_{msg['caller_prompt_id']}"
     assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor, visual_agent_group = user_agents[user_prompt]
+    # An expert turn may have left the session on its model (#172).
+    helper_fun.bind_agents_to_turn_model(user_agents[user_prompt], config_list, user_prompt)
     message = f"Role: {msg['role']}\n Message: {last_message}"
     response = multi_role_agent.initiate_chat(manager, message=message, speaker_selection={"speaker": "assistant"},
                                               clear_history=False)
