@@ -1993,7 +1993,11 @@ class ModelLifecycleManager:
                      and s.active_inference_count == 0
                      and s.name != needed_model
                      and not s.name.startswith('llm-')
-                     and s.model_type != 'llm'],
+                     # ModelState carries no type; ask the module's own
+                     # name->type map (the crash path uses it too).  A bare
+                     # `s.model_type` raised AttributeError here, so no swap
+                     # could ever happen while a non-LLM model was on GPU.
+                     and self._guess_model_type(s.name) != 'llm'],
                     key=lambda s: (
                         _PRIORITY_RANK.get(s.priority, 99),
                         s.last_access_time,
