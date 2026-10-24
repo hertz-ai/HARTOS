@@ -121,6 +121,28 @@ class TestTextLayer:
 
 class TestPageImages:
 
+    def test_a_page_image_is_never_served_half_written(self, tmp_path):
+        """_write_jpeg's claim: it writes under a temporary name and moves it
+        into place, "so the page-image route never serves a half-written
+        file".  Nothing held that -- saving straight to the destination passed
+        every test (cc12's docstring sweep of 74b39d1a4).
+        """
+        out = tmp_path / 'page_1.jpg'
+        seen = {}
+
+        class OnePage:
+            def save(self, target, *args, **kwargs):
+                seen['target'] = str(target)
+                seen['destination_existed'] = out.exists()
+                Path(target).write_bytes(b'jpeg-bytes')
+
+        bp._write_jpeg(OnePage(), out)
+
+        assert seen['target'].endswith('.part')      # not the served name
+        assert seen['destination_existed'] is False  # nothing to serve half-written
+        assert out.read_bytes() == b'jpeg-bytes'
+        assert not out.with_name(out.name + '.part').exists()
+
     def test_every_page_gets_an_image(self, book_node, tmp_path):
         from PIL import Image
         result = bp.parse_book(make_pdf(tmp_path / 'book.pdf'), '42')
@@ -531,6 +553,83 @@ class TestFailures:
 # ── Never on a request thread; never twice; never pending forever ─────
 
 class TestLifecycle:
+
+    def test_a_background_failure_is_recorded_before_the_worker_logs_it(
+            self, book_node, book_db, tmp_path, monkeypatch):
+        """_worker's BookParseError branch logs only debug, on the stated
+        ground that the failure is "already recorded on the row and the job,
+        and published".  Nothing held any of those three.
+        """
+        pdf = make_pdf(tmp_path / 'book.pdf')
+        file_id = bp._register('42', pdf.name, pdf.parent, 'req-bg')
+        job = bp._new_job(file_id, '42', 'req-bg', pdf.name)
+        monkeypatch.setattr(bp, '_open', lambda *a, **k: (_ for _ in ()).throw(
+            bp.BookParseError('this PDF is password-protected')))
+
+        bp._worker(job, file_id, str(pdf), '42', 'req-bg')
+
+        assert _stored_status(file_id) == 'failed'                      # the row
+        assert bp.get_job(job)['status'] == 'failed'                    # the job
+        assert any('password-protected' in str(payload)                 # and published
+                   for _, payload in book_node.published)
+
+    def test_a_background_crash_leaves_the_operator_a_traceback(
+            self, book_node, monkeypatch, caplog):
+        """_worker's other branch logs with logger.exception.
+
+        _run converts everything it catches into a BookParseError, so this
+        branch is only reached by a failure that escapes _run itself -- which
+        is why nothing exercised it, and why driver_text's "every caller logs"
+        was untested on this path (cc12's sweep).
+        """
+        def lost(*args, **kwargs):
+            raise RuntimeError('the worker thread lost its database')
+        monkeypatch.setattr(bp, '_run', lost)
+
+        with caplog.at_level('ERROR'):
+            bp._worker('job-x', 7, 'C:/tmp/x.pdf', '42', 'req-crash')
+
+        crashed = [r for r in caplog.records
+                   if 'background parse crashed' in r.getMessage()]
+        assert crashed and crashed[0].exc_info is not None
+
+    def test_a_parse_that_finished_first_is_not_overwritten_as_failed(
+            self, book_node, book_db):
+        """_record_stalled re-reads each row and writes "only if it is STILL
+        dead, so a parse that finished a moment ago is never overwritten".
+        The re-check exists for this and nothing held it: recording whatever
+        the READ decided passed every test.
+        """
+        file_id = _a_parse_its_lock_killed('42', 'raced.pdf')
+        assert bp.list_books('42')[0]['status'] == 'failed'   # the read condemns it
+        bp._update_row(file_id, status='completed', error=None)   # it finishes first
+
+        bp._resolve_stalled([file_id])
+
+        assert _stored_status(file_id) == 'completed'
+
+    def test_a_long_parse_keeps_its_record_fresh(self, book_node, tmp_path, monkeypatch):
+        """_stall_reason condemns a row untouched for STALL_SECONDS, and the
+        only thing keeping a long parse's row fresh is _run's periodic touch.
+        Without it a parse running over 30 minutes is recorded FAILED mid-run.
+
+        Measured before this was written: _run already sets status='processing'
+        ONCE before the pages, so a test that merely sees one such write passes
+        with the touch removed.  Hence the count rather than a flag.
+        """
+        monkeypatch.setattr(bp, '_TOUCH_EVERY_S', 0)      # every step touches
+        touches = []
+        real_update = bp._update_row
+
+        def counting(file_id, **fields):
+            if fields.get('status') == 'processing':
+                touches.append(file_id)
+            return real_update(file_id, **fields)
+
+        monkeypatch.setattr(bp, '_update_row', counting)
+        bp.parse_book(make_pdf(tmp_path / 'book.pdf'), '42')
+
+        assert len(touches) >= 2, touches
 
     def test_start_parse_returns_before_the_parse_runs(self, book_node, tmp_path, monkeypatch):
         release = threading.Event()
