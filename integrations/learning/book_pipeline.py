@@ -294,9 +294,11 @@ def _open(pdf_path):
         # can be a cloud one, and api_books hands the job's error to a client
         # that may be a phone. H-0715 scrubs what LEAVES, and the uploads path
         # carries the OS user's name (hartos-70, consult 2026-10-25).
-        raise BookParseError(
-            f'the PDF could not be opened '
-            f'({e.strerror or "the file could not be read"})') from e
+        # A missing file is the only case measured here, so say so plainly
+        # rather than "could not be read", which repeats the sentence it is
+        # inside (that review's F5).
+        reason = e.strerror or 'it is no longer on this node, so please upload it again'
+        raise BookParseError(f'the PDF could not be opened ({reason})') from e
 
 
 #: PDFium is not thread-safe -- pypdfium2's README says so ("Incompatibility
@@ -613,6 +615,9 @@ def is_lock_error(exc) -> bool:
     ``BookParseError('the PDF could not be opened (...\\OS_Deadlocks.pdf)')``
     was classified as lock contention, telling a person to re-upload a file
     that can never parse (measured 2026-10-18, the defect this gate closes).
+    That exact text is historical: _open no longer repeats the path (74b39d1a4).
+    The gate still earns its place, because a book's own complaint can carry a
+    lock word by other routes -- PDFium's wording, or the book's own name.
 
     Reads the DBAPI error, not the rendered statement. SQLAlchemy's
     ``StatementError.__str__`` appends ``[SQL: ...]`` and ``[parameters: ...]``,
@@ -725,28 +730,54 @@ def _retry_on_lock(fn):
     return retrying
 
 
+#: Both pdf_files.user_id and users.id are String(64), and users.id defaults
+#: to a uuid4 -- so an id longer than this is not a reader this node can have.
+READER_ID_MAX = 64
+
+
 def _book_key(user_id, filename):
     """How a book's reader and name are stored, in one spelling.
 
-    The ROW is canonical: it clips both to its columns. A job keyed any
-    other way cannot be matched to its book, and a 300-character filename
-    then slips past the match in _job_for_file -- which is a dead parse
-    reading as live again, the whole defect, for that one shape.
+    Asymmetric on purpose, and the asymmetry IS the rule:
+
+    The READER is identity, so it is never shortened. _register refuses an id
+    the column cannot hold rather than truncating it, so no stored row carries
+    a lossy reader id and every filter can compare the id exactly. Clipping
+    identity on the READ side is what made 74b39d1a4 a leak: two readers whose
+    ids share the column's first 64 characters collapsed onto one key, so
+    list_books merged their libraries -- and get_layouts keys on file_id with
+    no owner check, so one reader's pages would have reached the other's agent
+    prompt. Measured on review: bob's library showed alice's book. Matching a
+    read to a lossy write is never the fix; the write stops losing.
+
+    The NAME is data, so it still is: a 300-character filename is clipped to
+    its column exactly as the row has always done, because losing the tail of
+    a title harms nobody and refusing the upload would. A job keyed any other
+    way cannot be matched to its book, and a long name then slips past the
+    match in _job_for_file -- a dead parse reading as live again.
 
     Pure, and deliberately above the decorator: _retry_on_lock belongs to
     _register, the write. Inserting this helper between the two gave the
     ladder to a function that does no I/O and took it from the insert that
     starts every parse, with every test still green (cc66abd80).
     """
-    return str(user_id)[:64], str(filename)[:255]
+    return str(user_id), str(filename)[:255]
 
 
 @_retry_on_lock
 def _register(user_id, filename, directory, request_id) -> int:
     from integrations.social.models import BookFile, db_session
+    key_user, key_name = _book_key(user_id, filename)
+    # Refused, not truncated, and before a write transaction is opened. Storing
+    # a shortened id is what let two readers share one stored key (the leak in
+    # 74b39d1a4, found on review); users.id is String(64), so an id longer than
+    # the column is not a reader this node could have in the first place.
+    if len(key_user) > READER_ID_MAX:
+        raise BookParseError(
+            f'that reader id is longer than this node stores '
+            f'({READER_ID_MAX} characters)')
     with db_session() as db:
         now = _utcnow()
-        key_user, key_name = _book_key(user_id, filename)
         row = BookFile(user_id=key_user, filename=key_name,
                        directory=str(directory)[:1024],
                        request_id=str(request_id or '')[:128],
@@ -938,11 +969,11 @@ def list_books(user_id=None, limit=100) -> List[dict]:
     with db_session(commit=False) as db:
         q = db.query(BookFile)
         if user_id not in (None, ''):
-            # The ROW's key, in the one spelling _book_key already owns: the
-            # column stores str(user_id)[:64], so filtering on the unclipped id
-            # handed an empty library to any reader whose id is longer than
-            # that, while _existing below had always clipped. Drift between two
-            # filters on one column, not a new rule (hartos-70, 2026-10-25).
+            # Identity, compared exactly, in the one spelling _book_key owns.
+            # An id too long for the column matches nothing here, which is
+            # correct rather than unhelpful: _register refuses such an id, so
+            # no row can exist for it. The previous spelling of this line
+            # compared the CLIPPED id and merged two readers' libraries.
             q = q.filter(BookFile.user_id == _book_key(user_id, '')[0])
         books, stalled = _book_dicts(
             q.order_by(BookFile.file_id.desc()).limit(int(limit)).all())
@@ -973,11 +1004,12 @@ def get_layouts(file_id, page_number=None) -> List[dict]:
 def _existing(user_id, filename) -> Optional[dict]:
     """A live or completed book already made from this stored file, if any."""
     from integrations.social.models import BookFile, db_session
+    key_user, key_name = _book_key(user_id, filename)
     with db_session(commit=False) as db:
         books, stalled = _book_dicts(
             db.query(BookFile)
-            .filter(BookFile.user_id == str(user_id)[:64],
-                    BookFile.filename == str(filename)[:255])
+            .filter(BookFile.user_id == key_user,
+                    BookFile.filename == key_name)
             .order_by(BookFile.file_id.desc()).all())
     _resolve_stalled(stalled)
     return next((b for b in books

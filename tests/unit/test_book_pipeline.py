@@ -228,16 +228,20 @@ class TestFailures:
         path carries the OS user's name (H-0715: scrubbing is for what leaves,
         not for the operator's own log). The operator still gets both, below.
         """
-        missing = tmp_path / 'MySecretDiary_2026.pdf'
+        missing = tmp_path / 'a_book.pdf'
         with caplog.at_level('WARNING'):
             with pytest.raises(bp.BookParseError) as raised:
                 bp._open(missing)
 
         said = str(raised.value)
-        assert 'MySecretDiary' not in said and str(tmp_path) not in said
-        # and the operator loses nothing: the path AND a traceback
+        # The DIRECTORY is the sensitive half: it carries the OS user's name.
+        # The filename is not secret -- the row publishes it in `filename` and
+        # in `book_name` -- so a fixture called MySecretDiary.pdf implied a
+        # confidentiality this code does not offer (that review's F6).
+        assert str(tmp_path) not in said
+        # and the operator loses nothing: the full path AND a traceback
         opened = [r for r in caplog.records if 'could not be opened' in r.getMessage()]
-        assert opened and 'MySecretDiary' in opened[0].getMessage()
+        assert opened and str(tmp_path) in opened[0].getMessage()
         assert opened[0].exc_info is not None
 
     def test_a_file_that_is_gone_does_not_say_none(self, book_node, tmp_path):
@@ -253,7 +257,7 @@ class TestFailures:
             bp._open(tmp_path / 'gone.pdf')
         said = str(raised.value)
         assert 'None' not in said
-        assert 'the file could not be read' in said
+        assert 'no longer on this node' in said
 
     def test_a_file_that_is_not_a_pdf_still_says_what_pdfium_said(
             self, book_node, tmp_path):
@@ -1097,19 +1101,73 @@ class TestLockContention:
 
         assert bp._existing('42', long_name) is None
 
-    def test_a_long_reader_id_still_sees_their_own_library(self, book_node, book_db):
-        """list_books filtered on the UNCLIPPED id, and the column clips.
+    def test_two_readers_the_column_cannot_tell_apart_are_both_refused(
+            self, book_node, book_db):
+        """The leak 74b39d1a4 introduced, pinned as unreachable.
 
-        The row stores str(user_id)[:64], so a reader whose id is longer than
-        that matched nothing and was shown an empty library, while _existing
-        two functions below had always clipped -- drift between two filters on
-        one column. _book_key is the one spelling of that key.
+        These two ids share the column's first 64 characters. 74b39d1a4 made
+        list_books match the CLIPPED id, so they collapsed onto one key and
+        bob's library showed alice's book -- and get_layouts keys on file_id
+        with no owner check, so read_book_page would have put alice's page text
+        into bob's agent prompt (measured on review).
+
+        Clipping identity on the read was the wrong half to change. The write
+        refuses an id it cannot store, so neither of these readers can own a
+        row at all and the collision has nowhere to happen.
         """
-        long_id = 'u' * 70
-        file_id = bp._register(long_id, 'mine.pdf', '/tmp', '')
-        bp._update_row(file_id, status='completed')
+        alice, bob = 'P' * 64 + 'alice', 'P' * 64 + 'bob'
+        assert alice[:bp.READER_ID_MAX] == bob[:bp.READER_ID_MAX]
 
-        assert [b['file_id'] for b in bp.list_books(long_id)] == [file_id]
+        for reader in (alice, bob):
+            with pytest.raises(bp.BookParseError, match='longer than this node stores'):
+                bp._register(reader, 'book.pdf', '/tmp', '')
+            assert bp.list_books(reader) == []
+        assert bp.list_books() == []          # and nothing was stored for either
+
+    def test_a_reader_id_longer_than_the_column_is_refused_not_truncated(
+            self, book_node, book_db):
+        """users.id is String(64), so a longer id is not a reader at all.
+
+        Truncating it silently was the root cause: the row then held a key that
+        was not the id it was given, and anything comparing the two had to
+        choose between missing the row and matching someone else's.
+        """
+        with pytest.raises(bp.BookParseError, match='longer than this node stores'):
+            bp._register('u' * (bp.READER_ID_MAX + 1), 'mine.pdf', '/tmp', '')
+        assert bp.list_books() == []
+
+    def test_two_readers_the_column_can_hold_stay_apart(self, book_node, book_db):
+        """The ordinary case the exact comparison has to keep right."""
+        a, b = 'r' * 63 + 'a', 'r' * 63 + 'b'
+        hers = bp._register(a, 'hers.pdf', '/tmp', '')
+        his = bp._register(b, 'his.pdf', '/tmp', '')
+        bp._update_row(hers, status='completed')
+        bp._update_row(his, status='completed')
+
+        assert [x['file_id'] for x in bp.list_books(a)] == [hers]
+        assert [x['file_id'] for x in bp.list_books(b)] == [his]
+
+    def test_an_over_long_id_is_never_handed_another_readers_book(
+            self, book_node, book_db):
+        """The same leak reached from the read side, which the refusal alone
+        does not close.
+
+        Here a real reader owns a book, and their id is exactly the first 64
+        characters of a longer one. Refusing the over-long id at the write
+        stops it OWNING a row, but a READ that clips would still match this
+        row -- handing back another reader's file_id and status through
+        start_parse's 'existing' branch, before any refusal runs, and their
+        book through list_books. Found by asking what the reverted _existing
+        clip would do, not by the failure.
+        """
+        owner = 'P' * bp.READER_ID_MAX
+        file_id = bp._register(owner, 'book.pdf', '/tmp', '')
+        bp._update_row(file_id, status='completed')
+        intruder = owner + 'bob'
+
+        assert bp._existing(intruder, 'book.pdf') is None
+        assert bp.list_books(intruder) == []
+        assert [b['file_id'] for b in bp.list_books(owner)] == [file_id]
 
     def test_another_readers_job_does_not_condemn_this_readers_book(
             self, book_node, book_db):
@@ -1350,16 +1408,23 @@ class TestLockContention:
         assert waited >= 0.6, f'it never waited for the lock ({waited:.2f}s)'
         assert bp._existing('42', 'held.pdf') is not None
 
-    def test_a_long_reader_does_not_hide_a_dead_parse(self, book_node, book_db):
+    def test_a_reader_at_the_columns_limit_does_not_hide_a_dead_parse(
+            self, book_node, book_db):
         """The reader half of the key, which the name half leaves unpinned.
 
-        _book_key clips BOTH columns and the job has to store both clipped,
-        or a dead parse cannot be matched to its book.  Reverting only the
+        _book_key has to spell the reader the same way for the job as for the
+        row, or a dead parse cannot be matched to its book.  Reverting only the
         user_id half of that fix passed all 138 tests (hartos-94's review of
-        cc66abd80): the long-name test above cannot see it, because its
-        reader is '42' either way.
+        cc66abd80): the long-name test above cannot see it, because its reader
+        is '42' either way.
+
+        This reader used to be 70 characters, and the claim rested on BOTH
+        sides clipping to 64.  Clipping identity is what let two readers share
+        one stored key (the leak reworked out of 74b39d1a4), so an over-long id
+        is refused at the write now and the boundary worth pinning is the
+        longest id the column can actually hold.
         """
-        reader = 'r' * 70                                # the column holds 64
+        reader = 'r' * bp.READER_ID_MAX
         file_id = bp._register(reader, 'book.pdf', '/tmp', '')
         bp._update_row(file_id, status='processing')
         job = bp._new_job(file_id, reader, '', 'book.pdf')

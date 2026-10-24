@@ -130,6 +130,20 @@ class TestBadInput:
         r = _upload(client, pdf_bytes, name='book.png')
         assert r.status_code == 400 and 'Only PDF' in r.get_json()['error']
 
+    def test_a_reader_id_the_column_cannot_hold_is_refused_not_a_broken_pdf(
+            self, client, pdf_bytes):
+        """The request is wrong; the PDF is fine. So not a 500.
+
+        _register refuses an id longer than its column rather than truncating
+        it (the leak reworked out of 74b39d1a4). With no branch for it the
+        refusal fell through to 500 "could not start parsing this PDF", which
+        sends a person to fix a file that was never broken -- the same mistake
+        this lane had already fixed once for a held lock.
+        """
+        r = _upload(client, pdf_bytes, user_id='u' * 70)
+        assert r.status_code == 400
+        assert 'longer than this node stores' in r.get_json()['error']
+
     def test_not_a_pdf_by_content(self, client):
         r = _upload(client, b'<html>not a pdf</html>')
         assert r.status_code == 400 and 'not a PDF' in r.get_json()['error']
