@@ -2055,8 +2055,19 @@ class TestSchema:
         monkeypatch.setattr(m, '_engine', None)
 
         with m.get_engine().connect() as connection:
-            patience = connection.exec_driver_sql('PRAGMA busy_timeout')
-            assert patience.scalar() == 3000
+            def pragma(name):
+                return connection.exec_driver_sql('PRAGMA ' + name).scalar()
+
+            # All three the hook issues, not just the one this lane needed.
+            # Asking only about busy_timeout left a hook that dropped
+            # journal_mode=WAL passing all 190 tests, because the constant
+            # test only finds WAL in the SCRIPT (mutant MH4 of the e28a1b19c
+            # review). Losing WAL changes locking on every node: readers stop
+            # running beside the writer, which is the whole reason this
+            # lane's lock contention is survivable at all.
+            assert pragma('busy_timeout') == 3000
+            assert pragma('journal_mode') == 'wal'
+            assert pragma('synchronous') == 1          # NORMAL
 
     def test_the_reader_id_limit_matches_its_column(self):
         """READER_ID_MAX copies pdf_files.user_id's width and could drift from
