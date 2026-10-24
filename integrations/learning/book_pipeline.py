@@ -255,7 +255,28 @@ def fetch_pdf(url, timeout=60) -> Path:
     finally:
         response.close()
     name = str(url).split('?', 1)[0].rstrip('/').rsplit('/', 1)[-1]
-    return save_pdf(bytes(data), name or 'book.pdf')
+    try:
+        return save_pdf(bytes(data), name or 'book.pdf')
+    except OSError as e:
+        # The operator's copy: the path and the traceback, on this machine.
+        logger.warning("book: a downloaded PDF could not be stored", exc_info=True)
+        # save_pdf re-raises the OS error as it came, and OSError.__str__
+        # appends e.filename -- which for this write is the uploads directory,
+        # carrying the OS user's name. That is the egress 74b39d1a4 closed for
+        # _open, one function along (hevolve-cc12's note on it).
+        #
+        # Rebuilt rather than blanked: setting e.filename = None leaves
+        # "[Errno 28] No space left on device: None" (measured 2026-10-25),
+        # the same "(None)" a person should never be shown. Rebuilding keeps
+        # the specific subclass -- FileNotFoundError, PermissionError -- so a
+        # caller that branches on the class still can; api_books does exactly
+        # that for its own save_pdf call, answering 507 rather than 400, which
+        # is why this is NOT wrapped in a BookParseError.
+        if e.errno is None:
+            # A hand-raised OSError keeps its message in args[0], where a path
+            # could also sit, so that one is dropped rather than repeated.
+            raise OSError(e.strerror or 'this node could not store the download') from e
+        raise OSError(e.errno, e.strerror) from e
 
 
 # ── The PDF engine (pypdfium2) ────────────────────────────────────────

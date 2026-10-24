@@ -1667,6 +1667,52 @@ class TestFetch:
         response.iter_content.return_value = chunks
         return response
 
+    def _store_fails_with(self, boom, tmp_path):
+        """A download that arrives whole and then cannot be stored."""
+        data = make_pdf(tmp_path / 'src.pdf').read_bytes()
+        response = self._response([data])
+        with patch('core.http_pool.pooled_get', return_value=response):
+            with patch.object(bp, 'save_pdf', side_effect=boom):
+                with pytest.raises(OSError) as raised:
+                    bp.fetch_pdf('https://example.org/books/physics.pdf')
+        return raised.value
+
+    def test_a_download_that_cannot_be_stored_keeps_the_path_on_this_node(
+            self, book_uploads, tmp_path, caplog):
+        """The same egress _open had, one function along.
+
+        save_pdf re-raises the OS error untouched and OSError.__str__ appends
+        e.filename, so the uploads directory -- with the OS user's name in it
+        -- rode out of this lane inside the exception. The class is kept, not
+        swapped for a BookParseError: a caller that branches on OSError means
+        "this node could not store it", and api_books answers 507 for exactly
+        that rather than 400.
+        """
+        secret = str(book_uploads / 'files' / 'de1f_physics.pdf')
+        with caplog.at_level('WARNING'):
+            failure = self._store_fails_with(
+                OSError(28, 'No space left on device', secret), tmp_path)
+
+        said = str(failure)
+        assert secret not in said and 'de1f_physics' not in said
+        assert 'No space left on device' in said      # the reason survives
+        assert failure.errno == 28                    # and so does the class's detail
+        stored = [r for r in caplog.records if 'could not be stored' in r.getMessage()]
+        assert stored and stored[0].exc_info is not None   # the operator keeps both
+
+    def test_a_store_failure_with_no_errno_does_not_read_errno_none(
+            self, book_uploads, tmp_path):
+        """Passing e.errno through when it is None renders "[Errno None] ...".
+
+        The same shape as _open's strerror: the scrub must not replace a path
+        with the word None (hartos-70's catch on 74b39d1a4).
+        """
+        failure = self._store_fails_with(OSError('the volume went away'), tmp_path)
+
+        said = str(failure)
+        assert 'Errno None' not in said and 'None' not in said
+        assert 'this node could not store the download' in said
+
     def test_a_pdf_link_is_saved_into_the_uploads(self, book_uploads, tmp_path):
         data = make_pdf(tmp_path / 'src.pdf').read_bytes()
         response = self._response([data[:500], data[500:]])
