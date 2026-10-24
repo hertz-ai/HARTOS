@@ -1260,9 +1260,12 @@ def commerce_order_status(
         if res.get('status') == 404:
             return _out({'success': True, 'orders': []})
         return _fail(res['error'])
+    from integrations.commerce.mcgroce_client import order_number_of
     rows = [o for o in (res['data'] or []) if isinstance(o, dict)]
     rows.sort(key=lambda o: o.get('id') or 0, reverse=True)
-    orders = [{'order_id': o.get('orderNumber') or o.get('id'),
+    # The one reader of what names a McGroce order (the AP2 answer's and
+    # the listing's rows alike), so no second place decides it.
+    orders = [{'order_id': order_number_of(o),
                'status': o.get('status'), 'total': _amount(o.get('total'))}
               for o in rows[:10]]
     if orders:

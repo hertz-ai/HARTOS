@@ -401,6 +401,21 @@ class TestShopping:
         assert tr['order_id'] == 'ORD-8'
         assert [s['done'] for s in tr['steps']] == [True, True, True, False]
 
+    def test_the_listing_reads_order_numbers_through_the_one_reader(self, env):
+        # What names a McGroce order is decided in one place
+        # (mcgroce_client.order_number_of, the reader the AP2 success check
+        # and _order_placed use); the listing goes through it too, so no
+        # second reader can drift (6aec34570's rule, closed here).
+        from integrations.commerce import mcgroce_client
+        env['fake'].on('GET', '/orders', body=[
+            {'id': 3, 'orderNumber': 'ORD-3', 'status': 'SUBMITTED', 'total': 10},
+            {'id': 8, 'orderNumber': '', 'status': 'SUBMITTED', 'total': 20}])
+        with patch.object(mcgroce_client, 'order_number_of',
+                          wraps=mcgroce_client.order_number_of) as reader:
+            out = json.loads(ct.commerce_order_status(UID))
+        assert reader.call_count == 2
+        assert [o['order_id'] for o in out['orders']] == [8, 'ORD-3']   # '' is no number
+
     def test_no_orders_is_not_an_error(self, env):
         env['fake'].on('GET', '/orders', status=404,
                        body={'messages': [{'messageKey': 'CART_NOT_FOUND'}]})
