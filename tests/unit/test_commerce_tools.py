@@ -129,6 +129,22 @@ class FakeMcGroce:
         return [c for c in self.calls if c[0] == method and c[1] == path]
 
 
+@contextlib.contextmanager
+def disk_full_once(store, field):
+    """The mandate file cannot be written once any record carries ``field``:
+    ENOSPC from the write, as atomic_json_write raises it.  The disk is the
+    boundary; no store method is faked."""
+    import errno
+    real = store._save
+
+    def save():
+        if any(getattr(m, field) for m in store._mandates.values()):
+            raise OSError(errno.ENOSPC, 'No space left on device')
+        return real()
+    with patch.object(store, '_save', side_effect=save):
+        yield
+
+
 def claims_of(token: str):
     """The claims an X-Commerce-Mandate carries (the fake's routing; the MAC
     is checked by attestation_of)."""
@@ -1532,6 +1548,90 @@ class TestHeldPayments:
         ct.commerce_checkout(UID, out['mandate_id'])
         assert len(bell(OWNER, out['payment_id'])) == 2
         assert len(bell(UID, out['payment_id'])) == 1          # the same sentence
+
+    def test_the_card_path_tells_the_hold_when_the_mark_cannot_be_written(self, env):
+        # hartos-70's R1 on 05025ce37: the mark's write (a full disk) raised
+        # out of the order step BEFORE the hold, with the money taken and
+        # nobody told.  The hold comes first; the mark's writer never raises.
+        env['fake'].on('GET', '/cart', body=ORDER)
+        out = json.loads(ct.commerce_prepare_checkout(UID))
+        env['mandates'].approve(out['mandate_id'], UID)
+        env['fake'].on('POST', AP2, status=503, body=None)
+        with disk_full_once(env['mandates'], 'order_sent'):
+            res = json.loads(ct.commerce_checkout(UID, out['mandate_id']))
+        assert res['success'] is False and res['needs_attention'] is True
+        assert len(env['card'].captures) == 1                      # the money was taken
+        assert pushed(env, 'notification')[-1]['message'] == self.UNCONFIRMED
+        assert 'Check McGroce' in owner_cards(env)[-1]['message']
+
+    def test_the_approval_tap_tells_the_hold_when_the_mark_cannot_be_written(self, env):
+        from integrations.ap2.ap2_mandate import decide_payment
+        env['fake'].on('GET', '/cart', body=ORDER)
+        out = json.loads(ct.commerce_prepare_checkout(UID))
+        env['fake'].on('POST', AP2, status=503, body=None)
+        with disk_full_once(env['mandates'], 'order_sent'):
+            payload, status = decide_payment(out['payment_id'], UID, True,
+                                             store=env['mandates'])
+        assert 'Errno' not in json.dumps(payload)
+        assert len(env['card'].captures) == 1
+        assert pushed(env, 'notification')[-1]['message'] == self.UNCONFIRMED
+        assert 'Check McGroce' in owner_cards(env)[-1]['message']
+
+    def test_the_retry_tells_the_hold_when_the_mark_cannot_be_written(self, env):
+        out = self._paid_on_phonepe(env)
+        env['fake'].on('GET', '/cart', status=503, body=None)
+        ct.complete_redirect_checkout(out['payment_id'])         # used up, held, nothing sent
+        n, c = len(pushed(env, 'notification')), len(owner_cards(env))
+        env['fake'].on('GET', '/cart', body=ORDER)
+        env['fake'].on('POST', AP2, status=503, body=None)
+        with disk_full_once(env['mandates'], 'order_sent'):
+            res = json.loads(ct.commerce_checkout(UID, out['mandate_id']))
+        assert res['success'] is False and res['needs_attention'] is True
+        assert len(env['fake'].called('POST', AP2)) == 2         # the call left, twice
+        assert [x['message'] for x in pushed(env, 'notification')[n:]] == [self.UNCONFIRMED]
+        assert len(owner_cards(env)) == c + 1
+        assert 'Check McGroce' in owner_cards(env)[-1]['message']
+
+    def test_the_hold_is_told_before_the_mark_is_written(self, env):
+        # Defence in depth behind the never-raising writer: were the mark's
+        # writer ever to raise, the hold has already gone out.
+        env['fake'].on('GET', '/cart', body=ORDER)
+        out = json.loads(ct.commerce_prepare_checkout(UID))
+        env['mandates'].approve(out['mandate_id'], UID)
+        env['fake'].on('POST', AP2, status=503, body=None)
+        with patch.object(ct, '_mark_order_sent', side_effect=RuntimeError('writer broke')):
+            with pytest.raises(RuntimeError):
+                ct.commerce_checkout(UID, out['mandate_id'])
+        assert pushed(env, 'notification')[-1]['message'] == self.UNCONFIRMED
+        assert 'Check McGroce' in owner_cards(env)[-1]['message']
+
+    def test_a_step_that_raised_after_its_call_left_keeps_the_mark(self, env):
+        # hartos-70's R2: the catch-all hold (sent=True) kept no mark, so a
+        # restart forgot that a call had left.  McGroce placed ORD-X, the
+        # step raised after the answer came back: held as could-not-confirm,
+        # the mark written; after a restart the next hold still says so, and
+        # the probe finds the order.
+        out = self._paid_on_phonepe(env)
+        env['fake'].on('POST', AP2, body={'orderNumber': 'ORD-X'})
+        with patch.object(ct, '_order_placed', side_effect=RuntimeError('boom')):
+            first = ct.complete_redirect_checkout(out['payment_id'])
+        assert first['held'] is True
+        assert pushed(env, 'notification')[-1]['message'] == self.UNCONFIRMED
+        assert env['fake'].placed.get(out['mandate_id']) == 'ORD-X'
+        after = MandateStore(env['mandates'].path, ledger=env['ledger'], key=b'k' * 32)
+        rec = after.get(out['mandate_id'])
+        assert rec.status == 'consumed' and rec.order_ref is None
+        assert rec.order_sent is not None                        # on disk, signed
+        n = len(pushed(env, 'notification'))
+        env['fake'].on('GET', '/cart', status=503, body=None)    # McGroce not answering
+        with patch.object(ct, '_mandates', return_value=after):
+            res = json.loads(ct.commerce_checkout(UID, out['mandate_id']))
+            assert res['needs_attention'] is True
+            assert pushed(env, 'notification')[n]['message'] == self.UNCONFIRMED
+            assert 'Check McGroce' in owner_cards(env)[-1]['message']
+            env['fake'].on('GET', '/cart', *CART_GONE)           # McGroce back: the probe finds it
+            later = json.loads(ct.commerce_checkout(UID, out['mandate_id']))
+        assert later['success'] is True and later['order_id'] == 'ORD-X'
 
     def test_a_changed_cart_keeps_its_recovery_in_the_sentence(self, env):
         out = self._paid_on_phonepe(env)

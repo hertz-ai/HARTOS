@@ -978,15 +978,18 @@ def _mark_order_sent(m) -> None:
     """An order call for consumed ``m`` left this node and was never
     answered: kept on the mandate, signed (MandateStore.record_order_sent),
     so every later hold for it says "could not confirm" and sends a person
-    to McGroce first, until McGroce answers with the order.  Under the
-    node's payment pause the mark cannot be written; the hold raised now
-    still says so, from the attempt itself."""
-    from integrations.ap2.ap2_mandate import MandateKeyError
+    to McGroce first, until McGroce answers with the order.  Never raises:
+    the money is taken and the hold is what tells people, so a mark that
+    cannot be written (the payment pause, a full disk, a refused replace)
+    is logged for a person and the hold already raised stands on its own.
+    Callers hold FIRST, then mark."""
     try:
         _mandates().record_order_sent(m.mandate_id)
-    except MandateKeyError as e:
-        logger.error(f'mandate {m.mandate_id}: an order call went unanswered and '
-                     f'the mark could not be written: {e}')
+    except Exception as e:
+        logger.error(f'MANUAL RECONCILIATION NEEDED: mandate {m.mandate_id}: an '
+                     f'order call went unanswered and the mark could not be '
+                     f'written ({type(e).__name__}: {e}); the next hold for it '
+                     f'may say "not placed yet"')
 
 
 def _order_for_mandate(client, m, payment) -> Optional[Dict[str, Any]]:
@@ -1044,12 +1047,15 @@ def _submit_order(client, user_id, m, view, payment) -> Dict[str, Any]:
             placed = client.complete_ap2_checkout(user_id, attestation)
             sent = sent or bool(placed.get('unconfirmed'))
     if not placed['success']:
-        if sent:
-            _mark_order_sent(m)
         logger.error(f'commerce: paid {m.payment_id} but McGroce did not '
                      f'place the order: {placed["error"]}')
+        # The hold first: it is what tells the shopper and the owner.  The
+        # mark after, since its write can fail (a full disk) and must never
+        # stand between a taken payment and the people who must hear of it.
         order_on_hold(payment, f"McGroce did not place the order: {placed['error']}",
                       sent=sent or bool(m.order_sent))
+        if sent:
+            _mark_order_sent(m)
         return {'success': False,
                 'error': ('the payment went through but McGroce did not place '
                           f'the order ({placed["error"]}); retry with '
@@ -1108,6 +1114,15 @@ def complete_redirect_checkout(payment_id: str) -> Dict[str, Any]:
         logger.exception(f'MANUAL RECONCILIATION NEEDED: the order step for '
                          f'payment {payment_id} raised')
         order_on_hold(payment, f'the order step raised ({type(e).__name__})', sent=True)
+        # The same mark the order step keeps for an unanswered call: a step
+        # that raised may have sent one, so every later hold for this
+        # mandate says could-not-confirm too (after the hold; never raises).
+        try:
+            m = _mandates().find_by_payment_id(payment_id)
+        except Exception:
+            m = None
+        if m is not None and m.status == 'consumed':
+            _mark_order_sent(m)
         return {'success': False, 'needs_attention': True, 'held': True,
                 'payment_id': payment_id,
                 'error': ('the payment went through, but the order step failed '
