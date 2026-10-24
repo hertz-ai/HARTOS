@@ -41,6 +41,22 @@ def _row(file_id):
     return bp.get_book(file_id)
 
 
+def _stored_status(file_id):
+    """The status ON THE ROW, not the one a read computes.
+
+    _row goes through get_book, which runs _stall_reason and shows a dead
+    parse as 'failed' whether or not the record was ever written -- so an
+    assertion on _row cannot tell "recorded" from "merely shown".  That is
+    how a recorder ignoring the job survived every test (A4/M8 of the
+    1faa4b6a0 review), including the two whose own comments claimed to check
+    exactly this.
+    """
+    from integrations.social.models import BookFile, db_session
+    with db_session(commit=False) as db:
+        row = db.get(BookFile, int(file_id))
+        return row.status if row is not None else None
+
+
 def _only_book():
     books = bp.list_books()
     assert len(books) == 1, books
@@ -511,7 +527,22 @@ class TestLifecycle:
             row.updated_at = datetime.utcnow() - timedelta(seconds=bp.STALL_SECONDS + 60)
         book = bp.list_books('42')[0]
         assert book['status'] == 'failed' and 'stalled' in book['error']
-        assert _row(file_id)['status'] == 'failed'          # recorded, not just shown
+        assert _stored_status(file_id) == 'failed'          # recorded, not just shown
+
+    def test_a_parse_only_its_job_calls_dead_is_recorded_too(self, book_node):
+        """The same claim for the hot window, which nothing claimed.
+
+        The row above is old enough for the stall timeout to condemn on its
+        own, so a recorder that consulted only the timeout -- ignoring the
+        job -- kept every test green (A4/M8 of the 1faa4b6a0 review).  Here
+        the row was touched a moment ago and only the failed job knows, and
+        it still has to be written, not merely displayed as failed.
+        """
+        file_id = _a_parse_its_lock_killed('42', 'hot-record.pdf')
+
+        book = bp.list_books('42')[0]
+        assert book['status'] == 'failed'
+        assert _stored_status(file_id) == 'failed'      # recorded, not just shown
 
     def test_a_stalled_job_resolves_to_failed(self, book_node):
         file_id = bp._register('42', 'y.pdf', '/tmp', '')
@@ -520,7 +551,7 @@ class TestLifecycle:
         with bp._jobs_lock:
             bp._jobs[job_id]['updated'] = time.time() - bp.STALL_SECONDS - 1
         assert bp.get_job(job_id)['status'] == 'failed'
-        assert _row(file_id)['status'] == 'failed'
+        assert _stored_status(file_id) == 'failed'
 
 
 # ── Progress reaches the clients that already render it ───────────────
@@ -785,6 +816,24 @@ def _hold_write_lock(book_db, seconds):
     return release
 
 
+def _a_parse_its_lock_killed(user_id, filename):
+    """A row still saying 'processing' with a FRESH updated_at, and a failed job.
+
+    The hot window 1faa4b6a0 opened: the lock that killed the parse also
+    refused _mark_failed's write, so the row looks freshly touched and the
+    stall timeout cannot condemn it for 30 minutes.  Only the job knows.
+    """
+    from integrations.social.models import BookFile, db_session
+    file_id = bp._register(user_id, filename, '/tmp', '')
+    with db_session() as db:
+        row = db.get(BookFile, file_id)
+        row.status = 'processing'
+        row.updated_at = bp._utcnow()         # fresh: only the job can call it dead
+    job_id = bp._new_job(file_id, user_id, '', filename)
+    bp._update_job(job_id, status='failed', error=bp._BUSY_NOT_SAVED)
+    return file_id
+
+
 class TestLockContention:
 
     def _lock_before_the_save(self, monkeypatch, book_db, seconds, holder):
@@ -996,6 +1045,29 @@ class TestLockContention:
 
         assert bp._existing('42', long_name) is None
 
+    def test_another_readers_job_does_not_condemn_this_readers_book(
+            self, book_node, book_db):
+        """The other half of the same key, which nothing claimed.
+
+        A job is matched by id AND filename AND reader, and the filename
+        half is pinned by the test above -- but with the READER condition
+        dropped from _job_for_file the whole suite stayed green (A4/M5 of
+        the 1faa4b6a0 review).  Two readers can hold the same file id and
+        the same name, because ids start over after a database reset, so
+        without the reader one person's failed parse calls another person's
+        live book dead and refuses the retry for 30 minutes.
+        """
+        file_id = bp._register('42', 'shared.pdf', '/tmp', '')
+        bp._update_row(file_id, status='processing')
+        mine = bp._new_job(file_id, '42', '', 'shared.pdf')    # still running
+        bp._update_job(mine, status='processing')
+        theirs = bp._new_job(file_id, '99', '', 'shared.pdf')  # newest, and not mine
+        bp._update_job(theirs, status='failed', error='their parse died')
+
+        # Newest first, so a match that ignores the reader returns theirs.
+        assert bp._job_for_file(file_id, 'shared.pdf', '42') == mine
+        assert bp._existing('42', 'shared.pdf') is not None
+
     def test_a_parse_with_no_job_of_its_own_is_still_live(self, book_node, book_db):
         """The guard for the rule above: no job does NOT mean dead.
 
@@ -1031,7 +1103,9 @@ class TestLockContention:
             row.status = 'processing'
             row.updated_at = datetime.utcnow() - timedelta(seconds=bp.STALL_SECONDS + 60)
         _impatient_sessions(monkeypatch, book_db)
-        monkeypatch.setattr(bp, '_LOCK_RETRY_DELAYS', ())
+        # The real ladder, not an emptied one: with @_retry_on_lock still on
+        # _record_stalled this test passed only because it had removed the
+        # cost it should have been measuring (that review's A1).
         release = _hold_write_lock(book_db, 0.5)
         book = bp.list_books('42')[0]                 # the write is blocked; the read is not
         assert book['status'] == 'failed' and 'stalled' in book['error']
@@ -1039,6 +1113,52 @@ class TestLockContention:
         bp.list_books('42')                           # the lock is gone: now it is recorded
         with db_session(commit=False) as db:
             assert db.get(BookFile, file_id).status == 'failed'
+
+    def test_a_library_read_under_a_lock_does_not_pay_the_write_ladder(
+            self, book_node, book_db, monkeypatch):
+        """Reading the library while the holder is still there.
+
+        The answer below was always right -- a dead parse shows as failed
+        whether or not the record can be written.  It is the WAITING that was
+        the defect: _record_stalled was patient, so the read was too, and a
+        person opening their books waited out a lock they had no stake in
+        (measured 20.48 s vs 0.00 s at the parent; that review's A1).
+        """
+        _a_parse_its_lock_killed('42', 'hot.pdf')
+        _impatient_sessions(monkeypatch, book_db)
+        monkeypatch.setattr(bp, '_LOCK_RETRY_DELAYS', (0.4, 0.4, 0.4, 0.4))
+        release = _hold_write_lock(book_db, 2.0)
+        try:
+            started = time.monotonic()
+            books = bp.list_books('42')
+            waited = time.monotonic() - started
+        finally:
+            release.join()
+        assert books[0]['status'] == 'failed'
+        assert waited < 1.0, f"the library read waited out the holder: {waited:.2f}s"
+
+    def test_a_retry_checking_the_library_does_not_pay_the_write_ladder(
+            self, book_node, book_db, monkeypatch):
+        """start_parse's first act is _existing, a read, and it met the ladder too.
+
+        Retrying a stored file whose parse the lock killed is precisely what
+        the 503's "try again in a moment" sends a person back to do, so this
+        read put the ladder in front of the one case that advice is aimed at
+        -- and then _register's own, legitimate ladder followed it (measured
+        40.97 s through start_parse).
+        """
+        _a_parse_its_lock_killed('42', 'retry.pdf')
+        _impatient_sessions(monkeypatch, book_db)
+        monkeypatch.setattr(bp, '_LOCK_RETRY_DELAYS', (0.4, 0.4, 0.4, 0.4))
+        release = _hold_write_lock(book_db, 2.0)
+        try:
+            started = time.monotonic()
+            # The dead parse is not live, so a retry may start: 1faa4b6a0's claim.
+            assert bp._existing('42', 'retry.pdf') is None
+            waited = time.monotonic() - started
+        finally:
+            release.join()
+        assert waited < 1.0, f"the retry's library check waited out the holder: {waited:.2f}s"
 
     def test_the_row_that_starts_a_parse_waits_out_a_lock(
             self, book_node, book_db, monkeypatch):

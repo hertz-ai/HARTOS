@@ -861,10 +861,24 @@ def _book_dicts(rows):
     return books, stalled
 
 
-@_retry_on_lock
 def _record_stalled(file_ids) -> None:
     """Record dead parses as failed -- each only if it is STILL dead, so a
-    parse that finished a moment ago is never overwritten."""
+    parse that finished a moment ago is never overwritten.
+
+    No retry ladder, deliberately: this is the one write on a READ path, and
+    _resolve_stalled below already promises the library answers without it
+    ("the next read tries again").  The ladder came off because it made that
+    promise false.  _stall_reason calls a row dead as soon as its job has
+    failed -- no longer only after STALL_SECONDS -- so the hot window of a
+    lock-killed parse now reaches this write, and while it was patient every
+    library read sat out the holder with it: 20.48 s for list_books where
+    1faa4b6a0's parent answered in 0.00 s, and 40.97 s for a retry through
+    start_parse, which meets this ladder in _existing and then _register's
+    own (hevolve-cc12's review of 1faa4b6a0, finding A1).
+
+    The patient ladder stays where a write must land: _register, _update_row
+    (so _mark_failed keeps it) and _save.
+    """
     from integrations.social.models import BookFile, db_session
     with db_session() as db:
         for file_id in file_ids:
