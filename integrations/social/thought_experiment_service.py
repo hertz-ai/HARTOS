@@ -877,7 +877,8 @@ class ThoughtExperimentService:
         # no identity for the quorum.
         from .models import User
         from .voting_rules import (
-            is_person, is_steward, one_vote_per_identity, quorum_met, recommendation)
+            is_steward, one_vote_per_identity, quorum_met, recommendation,
+            vote_is_persons)
         voter_ids = {v.voter_id for v in votes}
         users = {u.id: u for u in
                  (db.query(User).filter(User.id.in_(voter_ids)).all()
@@ -907,8 +908,7 @@ class ThoughtExperimentService:
             # vote: a system account shares the node's identity, which is the
             # owner's, and counted as "own" its one vote cancelled the owner's
             # AGAINST (review of 81c34a0ae, measured end to end).
-            is_agent = ((not is_person(user)) if user is not None
-                        else v.voter_type != 'human')
+            is_agent = not vote_is_persons(user, v.voter_type)
             if is_agent:
                 agent_weight = context_rules['agent_weight'] if context_rules else 1.0
                 weight = v.confidence * agent_weight

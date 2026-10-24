@@ -103,6 +103,17 @@ def is_person(user) -> bool:
     return getattr(user, 'user_type', None) not in NON_PERSON_USER_TYPES
 
 
+def vote_is_persons(user, stored_voter_type) -> bool:
+    """Whether a vote row is a person's: from its account (is_person) when
+    the voter has one, else from the voter_type stored on the row (an
+    unregistered voter id: in-process callers).  The ONE reading the tally,
+    the vote route's stored label and the discovery metrics share (review of
+    40aaed434, finding 1: the route and the metrics read user_type == 'agent'
+    and the stored label, so a 'system' account was stored, paid and counted
+    as a human while the tally weighed it as an agent)."""
+    return is_person(user) if user is not None else stored_voter_type == 'human'
+
+
 def node_identity(owner_of):
     """This node's identity in the tally: its owner, the person whose
     machine this is (HEVOLVE_OWNER_USER_ID, which Nunba exports at boot and
