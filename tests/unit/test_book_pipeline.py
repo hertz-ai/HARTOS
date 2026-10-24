@@ -637,10 +637,10 @@ class TestLifecycle:
         and published".
 
         Only the PUBLISHED third was unheld. Removing _mark_failed fails five
-        tests and removing the _update_job fails six, nearly all pre-existing,
-        through TestFailures' _fails helper -- measured by splitting the claim
-        rather than trusting the sentence. So this test closes one gap, not
-        three, and the docstring used to say otherwise.
+        tests, four of them pre-existing through TestFailures' _fails helper;
+        removing the _update_job fails six, none of them through that helper.
+        Measured by splitting the claim rather than trusting the sentence, so
+        this test closes one gap and not three.
         """
         pdf = make_pdf(tmp_path / 'book.pdf')
         file_id = bp._register('42', pdf.name, pdf.parent, 'req-bg')
@@ -700,25 +700,35 @@ class TestLifecycle:
         with the touch removed.  Hence the count rather than a flag.
         """
         monkeypatch.setattr(bp, '_TOUCH_EVERY_S', 0)      # every step touches
-        touches = []
-        real_update = bp._update_row
+        touches, steps = [], []
+        real_update, real_make_step = bp._update_row, bp._make_step
 
-        def counting(file_id, **fields):
-            if fields.get('status') == 'processing':
+        def counting_update(file_id, **fields):
+            if 'status' not in fields:                    # a touch, not a write
                 touches.append(file_id)
             return real_update(file_id, **fields)
 
-        monkeypatch.setattr(bp, '_update_row', counting)
-        bp.parse_book(make_pdf(tmp_path / 'book.pdf'), '42')
+        def counting_make_step(*args, **kwargs):
+            step = real_make_step(*args, **kwargs)
 
-        # Tied to the number of STEPS, not a floor of 2: with the interval at
-        # zero every step must touch, so one touch per step plus _run's own
-        # write before the pages. "At least 2" was met by that write plus a
-        # SINGLE touch, so a parse that touched once and then never again
-        # passed all 174 -- and would still go stale thirty minutes in
-        # (mutant MC5b of the 5928418f3 review).
-        steps = len(book_node.published)
-        assert len(touches) == steps + 1, (len(touches), steps)
+            def counted(*step_args, **step_kwargs):
+                steps.append(1)
+                return step(*step_args, **step_kwargs)
+            return counted
+
+        monkeypatch.setattr(bp, '_update_row', counting_update)
+        monkeypatch.setattr(bp, '_make_step', counting_make_step)
+        result = bp.parse_book(make_pdf(tmp_path / 'book.pdf'), '42')
+
+        # The OUTCOME first, because the bound alone pinned the bug as a
+        # requirement: the row must still say what _save wrote.
+        assert result['stored'] is True
+        file_id = bp.list_books('42')[0]['file_id']
+        assert _stored_status(file_id) == 'completed'
+
+        # And one touch per step() call -- counted on the step itself, not on
+        # publishes, which a single extra publish would throw off.
+        assert len(touches) == len(steps), (len(touches), len(steps))
 
     def test_start_parse_returns_before_the_parse_runs(self, book_node, tmp_path, monkeypatch):
         release = threading.Event()

@@ -1245,7 +1245,14 @@ def _make_step(job_id, file_id, user_id, request_id, filename, log) -> Callable:
         if file_id is not None and now - last_touch[0] >= _TOUCH_EVERY_S:
             last_touch[0] = now
             try:
-                _update_row(file_id, status='processing')
+                # No fields: _update_row bumps updated_at and nothing else,
+                # which is all a touch ever needed. Writing status='processing'
+                # as well meant the "Done" step -- which runs AFTER _save has
+                # written 'completed' -- set a stored book back to processing.
+                # _stall_reason then showed it as processing for STALL_SECONDS
+                # and finally as "failed: stalled", with its pages on disk the
+                # whole time.
+                _update_row(file_id)
             except Exception as e:
                 logger.warning(f"book {file_id}: could not refresh its record: {e}")
 
