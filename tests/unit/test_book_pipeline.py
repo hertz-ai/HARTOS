@@ -1331,6 +1331,60 @@ class TestLockContention:
         assert _stored_status(file_id) == 'failed'
         assert waited >= 0.5, f"it never waited for the lock at all: {waited:.2f}s"
 
+    def test_the_failure_record_waits_for_the_lock_not_only_for_its_turn(
+            self, book_node, book_db, monkeypatch):
+        """_mark_failed must land because it WAITS, not only because it retries.
+
+        The test above holds the lock for less time than the ladder's own
+        sleeps, so the record lands there even with no patience at all -- which
+        is why putting the read path's busy_timeout=0 into _update_row, a write
+        that must land, survived all 157 tests (mutant MF6 of the c53ad80f9
+        review).  Here the lock outlasts the whole ladder, so the write can only
+        land by waiting on the busy timeout.
+        """
+        file_id = bp._register('42', 'patient.pdf', '/tmp', '')
+        bp._update_row(file_id, status='processing')
+        _impatient_sessions(monkeypatch, book_db, timeout=1.5)
+        monkeypatch.setattr(bp, '_LOCK_RETRY_DELAYS', (0.1, 0.1))   # 0.2 s of sleeps
+        release = _hold_write_lock(book_db, 0.8)                    # outlasts them
+        bp._mark_failed(file_id, 'the parse died on a held lock')
+        release.join()
+
+        assert _stored_status(file_id) == 'failed'
+
+    def test_the_no_wait_is_put_back_on_a_shared_connection(
+            self, book_node, book_db, monkeypatch):
+        """The read path's no-wait must not outlive the record it was taken for.
+
+        On the file engine every session gets its own NullPool connection, so a
+        leak cannot be observed there -- but the in-memory engine uses
+        StaticPool, where the pragma persisted into every later session
+        (measured on review of c53ad80f9, where my comment claimed it "dies
+        with" the connection).  A leak hands the no-wait to _register, _save
+        and _update_row, the three writes that must land.  StaticPool here, so
+        one connection is shared and the restore is visible.
+        """
+        from sqlalchemy import create_engine
+        from sqlalchemy import text as sql
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import StaticPool
+
+        from integrations.social import models
+        shared = create_engine(book_db.url, poolclass=StaticPool,
+                               connect_args={'check_same_thread': False, 'timeout': 5})
+        monkeypatch.setattr(models, '_SessionLocal',
+                            sessionmaker(bind=shared, expire_on_commit=False))
+
+        def patience():
+            with models.db_session(commit=False) as db:
+                return db.execute(sql('PRAGMA busy_timeout')).scalar()
+
+        before = patience()
+        assert before == 5000                      # the patience the engine was given
+        _a_parse_its_lock_killed('42', 'shared.pdf')
+        assert bp.list_books('42')[0]['status'] == 'failed'     # the record really ran
+        assert patience() == before
+
     def test_the_row_that_starts_a_parse_waits_out_a_lock(
             self, book_node, book_db, monkeypatch):
         """_register's own ladder, which nothing pinned until now.

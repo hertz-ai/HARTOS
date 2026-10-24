@@ -936,19 +936,45 @@ def _record_stalled(file_ids) -> None:
         # attempt, but one attempt still sat out the engine's
         # busy_timeout=3000, so a library read inside a lock window paid about
         # 3.4 s -- measured on 179a11815: list_books 3.38 s, down from 20.48 s
-        # but not free (hevolve-cc12's review of it, finding 2).  File-based
-        # SQLite runs on NullPool, so this session owns a short-lived
-        # connection of its own and the pragma dies with it; no pooled
-        # connection is left impatient for another writer.  Guarded by dialect
-        # because HEVOLVE_DB_URL can point at MySQL, where it is not valid SQL.
-        if db.get_bind().dialect.name == 'sqlite':
+        # but not free (hevolve-cc12's review of it, finding 2).  Guarded by
+        # dialect because HEVOLVE_DB_URL can point at MySQL, where this is not
+        # valid SQL.
+        #
+        # Put back in the `finally`, and NOT left to the connection's lifetime.
+        # c53ad80f9's comment claimed "the pragma dies with it" because file
+        # SQLite runs on NullPool; that is true of the file engine and false of
+        # the in-memory one, which uses StaticPool and kept the zero for every
+        # later session (measured on review).  Either way the containment would
+        # have rested on a pool chosen in another module and pinned by no test,
+        # and if it ever leaked it would hand the no-wait to _register, _save
+        # and _update_row -- the three writes that MUST land.  A pooled probe
+        # showed _update_row then giving up after 3.75 s instead of waiting out
+        # its ~20.5 s ladder.
+        sqlite = db.get_bind().dialect.name == 'sqlite'
+        patience = db.execute(text('PRAGMA busy_timeout')).scalar() if sqlite else None
+        if sqlite:
             db.execute(text('PRAGMA busy_timeout=0'))
-        for file_id in file_ids:
-            row = db.get(BookFile, int(file_id))
-            reason = _stall_reason(row) if row is not None else None
-            if reason:
-                row.status, row.error, row.updated_at = 'failed', reason, _utcnow()
-                logger.warning(f"book {file_id}: {reason}")
+        try:
+            for file_id in file_ids:
+                row = db.get(BookFile, int(file_id))
+                reason = _stall_reason(row) if row is not None else None
+                if reason:
+                    row.status, row.error, row.updated_at = 'failed', reason, _utcnow()
+                    logger.warning(f"book {file_id}: {reason}")
+            # Flushed HERE, while the no-wait still applies: SQLite takes the
+            # write lock on the first write, so a flush after the pragma was
+            # put back would be the 3 s wait all over again.  The commit that
+            # follows holds that lock already and waits for nobody.
+            db.flush()
+        finally:
+            if sqlite:
+                try:
+                    db.execute(text('PRAGMA busy_timeout=%d' % int(patience or 0)))
+                except Exception as unrestored:
+                    # A refused flush leaves the session needing a rollback,
+                    # which db_session does on the way out; on NullPool the
+                    # connection is then discarded anyway.
+                    logger.debug("book library: patience not restored (%r)", unrestored)
 
 
 def _resolve_stalled(file_ids) -> None:
