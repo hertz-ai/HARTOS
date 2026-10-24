@@ -181,6 +181,26 @@ def unreadable_order_answers(fake):
     return signed_order_answers(fake, _NotJson)
 
 
+@contextlib.contextmanager
+def disk_refuses_once(store, field=None):
+    """The mandate file's next write (the next one carrying ``field`` on any
+    record, when given) fails with ENOSPC and every later one succeeds: a
+    disk that filled for one write and recovered.  _save is the one store
+    method stood in for."""
+    import errno
+    real = store._save
+    state = {'refused': False}
+
+    def save():
+        due = field is None or any(getattr(m, field) for m in store._mandates.values())
+        if due and not state['refused']:
+            state['refused'] = True
+            raise OSError(errno.ENOSPC, 'No space left on device')
+        return real()
+    with patch.object(store, '_save', side_effect=save):
+        yield
+
+
 def claims_of(token: str):
     """The claims an X-Commerce-Mandate carries (the fake's routing; the MAC
     is checked by attestation_of)."""
@@ -1713,6 +1733,34 @@ class TestHeldPayments:
             later = json.loads(ct.commerce_checkout(UID, out['mandate_id']))
         assert later['success'] is True and later['order_id'] == 'ORD-REC'
         assert after.get(out['mandate_id']).order_ref == 'ORD-REC'
+
+    def test_a_placed_order_whose_record_failed_once_is_known_after_a_restart(self, env):
+        # hartos-f3's second reviewer's F-F on 555b4a65b..0a6870d1a (hartos-70's
+        # recovers scenario): McGroce placed the order, the record's write
+        # failed once and the disk recovered, the node restarted, McGroce is
+        # down at the retry.  874ff371b's catch-all had marked the mandate;
+        # _order_placed's catch swallowed the failure and left NO mark, so
+        # the retry's hold said "not placed yet" and the owner was told to
+        # place or refund an order McGroce holds.  The placer marks through
+        # the never-raising writer, whose save carries the in-memory record
+        # too, so after the restart the order is known.
+        out = self._paid_on_phonepe(env)
+        env['fake'].on('POST', AP2, body={'orderNumber': 'ORD-ONCE'})
+        with disk_refuses_once(env['mandates'], 'order_ref'):
+            res = ct.complete_redirect_checkout(out['payment_id'])
+        assert res['success'] is True and res['order_id'] == 'ORD-ONCE'
+        after = MandateStore(env['mandates'].path, ledger=env['ledger'], key=b'k' * 32)
+        rec = after.get(out['mandate_id'])
+        assert rec.order_ref == 'ORD-ONCE' or rec.order_sent is not None
+        n = len(pushed(env, 'notification'))
+        env['fake'].on('GET', '/cart', status=503, body=None)    # McGroce down at the retry
+        with patch.object(ct, '_mandates', return_value=after):
+            later = json.loads(ct.commerce_checkout(UID, out['mandate_id']))
+        assert later.get('order_id') == 'ORD-ONCE' or \
+            pushed(env, 'notification')[n]['message'] == self.UNCONFIRMED
+        assert self.PAID not in [c['message'] for c in pushed(env, 'notification')[n:]]
+        assert 'Place the order, or refund it' not in ' '.join(
+            c['message'] for c in owner_cards(env))
 
     def test_the_card_path_answers_a_placed_order_whose_record_cannot_be_written(self, env):
         env['fake'].on('GET', '/cart', body=ORDER)

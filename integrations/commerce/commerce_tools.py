@@ -997,7 +997,8 @@ def _ordered(m) -> Dict[str, Any]:
 
 def _mark_order_sent(m) -> None:
     """An order call for consumed ``m`` left this node and was never
-    answered: kept on the mandate, signed (MandateStore.record_order_sent),
+    answered, or was answered with an order this node could not record:
+    kept on the mandate, signed (MandateStore.record_order_sent),
     so every later hold for it says "could not confirm" and sends a person
     to McGroce first, until McGroce answers with the order.  Never raises:
     the money is taken and the hold is what tells people, so a mark that
@@ -1131,6 +1132,13 @@ def _order_placed(user_id, m, placed) -> Dict[str, Any]:
             logger.error(f'MANUAL RECONCILIATION NEEDED: order {order_id} placed '
                          f'for payment {m.payment_id} but not recorded '
                          f'({type(e).__name__}: {e})')
+            # The record failed, so the mark says what the record would have:
+            # an order exists for this mandate.  Through the never-raising
+            # writer; its save also carries the in-memory order_ref, so a
+            # disk that refused once and recovered keeps the record after
+            # all, and a later hold after a restart says "could not
+            # confirm", never "not placed yet", for an order McGroce holds.
+            _mark_order_sent(m)
     push_fragment(user_id, _tracking_fragment(order_id, status))
     return {'success': True, 'status': 'ordered', 'order_id': order_id,
             'order_status': status, 'payment_id': m.payment_id,
