@@ -643,8 +643,15 @@ def driver_text(exc) -> str:
     not hypothetical here -- this node raised it from 16:26 to 17:37 on
     2026-10-22, with the disk at zero bytes free.
 
-    The operator loses nothing: the ``logger.exception`` beside each caller
-    still records the rendered statement and the traceback.
+    The operator loses nothing -- but ONLY because every caller logs the
+    exception itself beside this call, with ``logger.exception`` or
+    ``exc_info=True``. Sanitising a person's reason without that leaves the
+    operator the sanitised sentence and nothing else: no statement, no
+    parameters, no traceback. That is precisely what acd5f5a42 did on the
+    agent's synchronous path -- a disk I/O error became four words -- and
+    what its review caught. If a new caller is added, log the exception
+    there too; this function deliberately cannot do it for you, because it
+    does not know whether its answer is headed for a person or a log.
 
     Public, and deliberately here rather than in a shared module: every
     caller today is inside ``integrations/learning`` (the three boundaries
@@ -1184,6 +1191,12 @@ def _run(file_id, pdf_path, user_id, request_id, job_id=None, log=None,
             reason = (_BUSY_NOT_SAVED if is_lock_error(e)
                       else f'the book was read but could not be saved: '
                            f'{driver_text(e)}')
+            # The operator's only copy on this path. Once the reason is
+            # sanitised, nothing else here carries the rendered statement or
+            # the traceback -- acd5f5a42 sanitised and did not log, which
+            # left a disk I/O error as four words and no stack (its review).
+            logger.warning("book %s: read but not saved (%s)", file_id, reason,
+                           exc_info=True)
             _mark_failed(file_id, reason)
             log.append(f'Not saved: {reason}')
             result.update(stored=False, store_error=reason, progress_log=log)
@@ -1231,7 +1244,10 @@ def parse_book(pdf_path, user_id, request_id='', log=None) -> dict:
         file_id = _register(user_id, pdf_path.name, pdf_path.parent, request_id)
     except Exception as e:
         reason = f'the book library is unavailable ({driver_text(e)})'
-        logger.warning(f"reading {pdf_path.name} without storing it: {reason}")
+        # exc_info because `reason` no longer carries the driver's statement:
+        # without it the operator is left the sanitised sentence alone.
+        logger.warning(f"reading {pdf_path.name} without storing it: {reason}",
+                       exc_info=True)
         return _read_unstored(pdf_path, user_id, request_id, log, reason)
     return _run(file_id, pdf_path, user_id, request_id, log=log, keep_read=True)
 

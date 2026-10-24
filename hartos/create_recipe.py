@@ -595,7 +595,20 @@ def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_
     user_prompt = f'{user_id}_{prompt_id}'
     if user_prompt not in time_agents:
         time_agents[user_prompt] = create_time_agents(user_id,prompt_id,'creator','',actions)
+    # The time group's run is a turn of that group, on its own model, not the
+    # one the turn that built the group ran on (#172).
+    with helper_fun.group_turn(time_agents[user_prompt], config_list, user_prompt,
+                               _CREATE_TIME_GROUP) as runs:
+        if not runs:
+            from core.agent_tools import held_for_another_turn_reply
+            return held_for_another_turn_reply()
+        return _run_time_group(task_description, user_id, prompt_id,
+                               action_entry_point, user_prompt)
 
+
+def _run_time_group(task_description, user_id, prompt_id, action_entry_point, user_prompt):
+    """time_based_execution's run of the session's time group, which it has
+    marked and bound to the turn's model."""
     # author, assistant_agent, executor, group_chat, manager, chat_instructor,agents_object = user_agents[user_id]
     current_time = datetime.now()
     group_chat = time_agents[user_prompt]['time_group_chat']
@@ -741,8 +754,14 @@ def visual_execution(task_description: str, user_id: int, prompt_id: int):
             Only send this if you have something meaningful to say.
             Do not interrupt the user unless they have asked for a response or the task cannot proceed without their input.
             You must now perform this task: {task_description}'''
-        # Use the existing agent structure
-        result = author.initiate_chat(manager, message=text, clear_history=False)
+        # The session's own group chat, so this run is a turn of it, on its
+        # own model, not the one an earlier turn left (#172).
+        with helper_fun.group_turn(user_agents[user_prompt], config_list, user_prompt,
+                                   _CREATE_GROUP) as runs:
+            if not runs:
+                from core.agent_tools import held_for_another_turn_reply
+                return held_for_another_turn_reply()
+            result = author.initiate_chat(manager, message=text, clear_history=False)
         last_message = group_chat.messages[-1]
         if _is_terminate(last_message['content']):
             if len(group_chat.messages) > 1:
@@ -817,14 +836,23 @@ class SubscriptionHandler:
 from hartos.helper import has_pending_tool_calls  # noqa: E402
 
 
-# Every thread running a session's turn: the one registry in helper
-# (turn_in_flight / another_turn_in_flight), which REUSE's turns mark too, so
-# a REUSE turn of a session counts here as well (#172).  recipe() marks this
-# module's turns; a pending tool call at the end of the group chat is really
-# being processed only while another turn of the session is in flight.
+# Every thread driving this module's group chat of a session (user_agents),
+# in the one registry in helper, under group 'create'.  recipe() and
+# visual_execution mark their turns; a pending tool call at the end of the
+# group chat is really being processed only while another turn of THIS group
+# is in flight.  REUSE's turns drive REUSE's own agents and are marked under
+# their own groups, so they never hold this one back (review of 75dc20add, P5).
 _TURNS_IN_FLIGHT = helper_fun.TURNS_IN_FLIGHT
-_turn_in_flight = helper_fun.turn_in_flight
-_another_turn_in_flight = helper_fun.another_turn_in_flight
+_CREATE_GROUP = 'create'
+_CREATE_TIME_GROUP = 'create-time'
+
+
+def _turn_in_flight(user_prompt):
+    return helper_fun.turn_in_flight(user_prompt, _CREATE_GROUP)
+
+
+def _another_turn_in_flight(user_prompt):
+    return helper_fun.another_turn_in_flight(user_prompt, _CREATE_GROUP)
 
 
 def _settle_orphaned_tool_calls(group_chat, manager=None):
@@ -4588,8 +4616,10 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
         current_app.logger.info(f"Using existing agents for user_prompt={user_prompt}")
         author, assistant_agent, executor, group_chat, manager, chat_instructor,agents_object = user_agents[user_prompt]
         # Built on an earlier turn's model: this turn runs on its own (#172).
-        helper_fun.bind_agents_to_turn_model(
-            user_agents[user_prompt], config_list, user_prompt)
+        if not helper_fun.bind_agents_to_turn_model(
+                user_agents[user_prompt], config_list, user_prompt, _CREATE_GROUP):
+            from core.agent_tools import held_for_another_turn_reply
+            return held_for_another_turn_reply()
     clear_history = False
 
     # TOOL CALL AND RESPONSE CHECK.  A turn that ends while a tool call is the

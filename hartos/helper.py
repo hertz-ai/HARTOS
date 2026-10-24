@@ -63,7 +63,6 @@ import asyncio
 import os
 import threading
 import contextlib
-import functools
 from core.file_cache import atomic_json_write
 from bs4 import BeautifulSoup
 from json_repair import repair_json
@@ -3947,68 +3946,88 @@ def get_llm_config(fallback_config_list=None):
     return {"cache_seed": None, "config_list": override or (fallback_config_list if fallback_config_list is not None else config_list), "max_tokens": 1500}
 
 
-# Every thread running a session's turn, by user_prompt, each with how deep it
-# has re-entered.  CREATE's recipe() and REUSE's chat_agent mark their turn
-# (turn_in_flight); get_response_group re-enters itself (safe_action_boundary_
-# check, the flow-increment sites), so the SAME thread entering again is still
-# its one turn, and any OTHER thread in the set is "another turn in flight".
-# A set, not one owner: with one owner, three overlapping requests for one
-# session emptied the table when the first returned, and the third settled the
-# second's live tool call (review of ff160f057, 2026-10-05).
+# Every thread driving one group chat of a session, by (user_prompt, group),
+# each with how deep it has re-entered.  get_response_group re-enters itself
+# (safe_action_boundary_check, the flow-increment sites), so the SAME thread
+# entering again is still its one turn, and any OTHER thread in the set is
+# "another turn in flight".  A set, not one owner: with one owner, three
+# overlapping requests for one session emptied the table when the first
+# returned, and the third settled the second's live tool call (review of
+# ff160f057, 2026-10-05).
+#
+# One key per GROUP CHAT, not per session (review of 75dc20add, P1 and P5):
+# the groups hold separate agents.  'create' is create_recipe's user_agents
+# group and 'create-time' its time_agents group; 'reuse', 'reuse-time' and
+# 'reuse-visual' are the three groups of reuse_recipe's user_agents entry and
+# 'reuse-role' its role_agents group.  Keyed by session, a REUSE turn held
+# back the CREATE group's orphan settle, and a REUSE chat turn switched the
+# model of a scheduled run still going in the time group.
+#
+# TURN_MODELS keeps, per key, the model each running thread's turn asked for:
+# the thread's model_config override when the turn started, None for the
+# node's default (bind_agents_to_turn_model compares them).
 TURNS_IN_FLIGHT = {}
+TURN_MODELS = {}
 _TURNS_IN_FLIGHT_LOCK = threading.Lock()
+# A running thread whose asked model is not recorded (marked by hand, as a
+# test does) counts as asking for another model.
+_MODEL_NOT_RECORDED = object()
+
+
+def _turn_asks_for():
+    """The model this thread's turn asked for: /chat's override, or None."""
+    from hartos.threadlocal import thread_local_data
+    return thread_local_data.get_model_config_override()
 
 
 @contextlib.contextmanager
-def turn_in_flight(user_prompt):
-    """Mark this thread as running ``user_prompt``'s turn for the duration
-    of the block.  Re-entrant: an inner block on the same thread deepens the
-    mark and leaving it only undoes its own level; every thread is counted
-    on its own, so one leaving never clears another's."""
+def turn_in_flight(user_prompt, group):
+    """Mark this thread as driving ``user_prompt``'s ``group`` chat for the
+    duration of the block.  Re-entrant: an inner block on the same thread
+    deepens the mark and leaving it only undoes its own level; every thread
+    is counted on its own, so one leaving never clears another's."""
+    key = (user_prompt, group)
     me = threading.get_ident()
+    asked = _turn_asks_for()
     with _TURNS_IN_FLIGHT_LOCK:
-        running = TURNS_IN_FLIGHT.setdefault(user_prompt, {})
+        running = TURNS_IN_FLIGHT.setdefault(key, {})
+        if me not in running:
+            TURN_MODELS.setdefault(key, {})[me] = asked
         running[me] = running.get(me, 0) + 1
     try:
         yield
     finally:
         with _TURNS_IN_FLIGHT_LOCK:
-            running = TURNS_IN_FLIGHT.get(user_prompt)
+            running = TURNS_IN_FLIGHT.get(key)
             if running is not None:
                 depth = running.get(me, 0) - 1
                 if depth > 0:
                     running[me] = depth
                 else:
                     running.pop(me, None)
+                    models = TURN_MODELS.get(key)
+                    if models is not None:
+                        models.pop(me, None)
+                        if not models:
+                            del TURN_MODELS[key]
                     if not running:
-                        del TURNS_IN_FLIGHT[user_prompt]
+                        del TURNS_IN_FLIGHT[key]
 
 
-def marks_session_turn(turn):
-    """``turn(user_id, text, prompt_id, ...)`` runs as its session's turn
-    (turn_in_flight), so another_turn_in_flight sees it.  REUSE's chat_agent
-    wears it; CREATE's recipe() marks its turn around get_response_group."""
-    @functools.wraps(turn)
-    def marked(user_id, text, prompt_id, *args, **kwargs):
-        with turn_in_flight(f'{user_id}_{prompt_id}'):
-            return turn(user_id, text, prompt_id, *args, **kwargs)
-    return marked
-
-
-def another_turn_in_flight(user_prompt):
-    """True when a thread other than this one is running ``user_prompt``'s
-    turn right now.  The per-user lock is not held across LLM calls
+def another_turn_in_flight(user_prompt, group):
+    """True when a thread other than this one is driving ``user_prompt``'s
+    ``group`` chat right now.  The per-user lock is not held across LLM calls
     (hart_intelligence_entry chat()), so /chat requests for one session can
     overlap."""
     me = threading.get_ident()
     with _TURNS_IN_FLIGHT_LOCK:
-        return any(t != me for t in TURNS_IN_FLIGHT.get(user_prompt, ()))
+        return any(t != me for t in TURNS_IN_FLIGHT.get((user_prompt, group), ()))
 
 
 def _session_llm_agents(cached):
     """The autogen agents with a model in a cached session entry (the tuple
-    create_agents / create_agents_for_user return, its agents dict, a
-    GroupChat's agents), each once."""
+    create_agents returns, its agents dict, a GroupChat's agents, a
+    GroupChatManager), each once."""
     seen, found = set(), []
 
     def walk(item):
@@ -4029,8 +4048,8 @@ def _session_llm_agents(cached):
     return found
 
 
-def bind_agents_to_turn_model(cached, fallback_config_list, user_prompt):
-    """Run a cached session's agents on THIS turn's model (#172).
+def bind_agents_to_turn_model(agents, fallback_config_list, user_prompt, group):
+    """Run one group chat's cached agents on THIS turn's model (#172).
 
     autogen builds an agent's client once, from the llm_config it was made
     with, and CREATE / REUSE keep a session's agents between turns, so a turn
@@ -4040,27 +4059,59 @@ def bind_agents_to_turn_model(cached, fallback_config_list, user_prompt):
     "Handed to the expert model".  Built on an expert turn, they kept the
     expert for every ordinary turn after it, outside the day-cap check.
 
-    The turn's model is get_llm_config's, the one every agent builder reads.
-    Each agent gets it through autogen's own builder (_validate_llm_config),
-    with the rest of its llm_config kept, registered tools included.  A
-    session whose other turn is still running is left as it is: switching
-    the model under that turn would change the model it is mid-way through.
-    Returns whether any agent was switched."""
+    ``agents`` is the group the turn drives (its GroupChat and manager, or
+    create_recipe's entry for that group), never another group's: the groups
+    hold separate agents.  The turn's model is get_llm_config's, the one
+    every agent builder reads.  Each agent gets it through autogen's own
+    builder (_validate_llm_config), with the rest of its llm_config kept,
+    registered tools included.
+
+    Returns True when the group's agents run on this turn's model (they did
+    already, or now do).  Returns False, switching nothing, when another
+    running turn of the group asked for another model: switching would change
+    the model that turn is mid-way through, and running this turn on that
+    model would spend it on a model this turn did not ask for (an ordinary
+    turn on the expert, outside the day-cap check).  The caller then does not
+    run its turn and answers held_for_another_turn_reply(), which every
+    dispatcher holds for a retry.  The check and the switch are one step
+    under the registry's lock, so a turn that starts meanwhile is seen."""
     turn_list = get_llm_config(fallback_config_list)['config_list']
-    stale = [a for a in _session_llm_agents(cached)
-             if a.llm_config.get('config_list') != turn_list]
-    if not stale:
-        return False
+    asked = _turn_asks_for()
+    me = threading.get_ident()
+    key = (user_prompt, group)
     models = sorted({str((c or {}).get('model')) for c in turn_list or []})
-    if another_turn_in_flight(user_prompt):
-        _safe_log('warning', f'[TURN-MODEL] {user_prompt}: another turn of this '
-                             f'session is running, so its agents keep their model; '
-                             f'this turn asked for {models}')
+    with _TURNS_IN_FLIGHT_LOCK:
+        stale = [a for a in _session_llm_agents(agents)
+                 if a.llm_config.get('config_list') != turn_list]
+        if not stale:
+            return True
+        asked_by = TURN_MODELS.get(key, {})
+        held = any(asked_by.get(t, _MODEL_NOT_RECORDED) != asked
+                   for t in TURNS_IN_FLIGHT.get(key, ()) if t != me)
+        if not held:
+            for agent in stale:
+                agent._validate_llm_config({**agent.llm_config, 'config_list': turn_list})
+    if held:
+        _safe_log('warning', f'[TURN-MODEL] {user_prompt} {group}: another turn of '
+                             f'this group is running on another model, so this '
+                             f'turn does not run; it asked for {models}')
         return False
-    for agent in stale:
-        agent._validate_llm_config({**agent.llm_config, 'config_list': turn_list})
-    _safe_log('info', f'[TURN-MODEL] {user_prompt}: {len(stale)} agent(s) now on {models}')
+    _safe_log('info', f'[TURN-MODEL] {user_prompt} {group}: {len(stale)} agent(s) '
+                      f'now on {models}')
     return True
+
+
+@contextlib.contextmanager
+def group_turn(agents, fallback_config_list, user_prompt, group):
+    """A turn of one group chat, for the block: this thread is marked as
+    driving it (turn_in_flight) and its agents run on the turn's model
+    (bind_agents_to_turn_model).  Yields whether the turn may run; on False
+    the caller does not drive the group and answers
+    core.agent_tools.held_for_another_turn_reply().  The one way a turn picks
+    up a cached group, so none binds without being seen by the next turn
+    (review of 75dc20add, P1)."""
+    with turn_in_flight(user_prompt, group):
+        yield bind_agents_to_turn_model(agents, fallback_config_list, user_prompt, group)
 
 
 def format_action_text(text):

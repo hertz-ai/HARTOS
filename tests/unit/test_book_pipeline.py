@@ -313,6 +313,94 @@ class TestFailures:
         assert '[SQL:' not in job['error'] and '[parameters:' not in job['error']
         assert _row(started['file_id'])['error'] == job['error']
 
+    def _logged_exceptions(self, caplog):
+        return [r for r in caplog.records if r.exc_info]
+
+    def test_the_operator_still_gets_the_statement_when_a_save_fails(
+            self, book_node, tmp_path, monkeypatch, caplog):
+        """Sanitising the person's copy must not blind the operator.
+
+        acd5f5a42 replaced the driver's text in `reason` and logged only
+        `reason`, so on the agent's synchronous path a disk I/O error left
+        the operator four words and no stack -- the parent had the statement,
+        inside the reason it printed. Found on review, not by a test, because
+        no test had ever read the log on this path.
+        """
+        import logging
+        boom = self._db_error('DELETE FROM page_layouts WHERE file_id = ?',
+                              {'passage': "a page of the book's own text"})
+        monkeypatch.setattr(bp, '_save', MagicMock(side_effect=boom))
+
+        with caplog.at_level(logging.WARNING, logger=bp.logger.name):
+            result = bp.parse_book(make_pdf(tmp_path / 'book.pdf'), '42')
+
+        assert '[SQL:' not in result['store_error']        # the person's copy
+        logged = self._logged_exceptions(caplog)
+        assert logged, 'the operator was left the sanitised sentence alone'
+        full = '\n'.join(str(r.exc_info[1]) for r in logged)
+        assert '[SQL:' in full and 'page_layouts' in full  # the operator's copy
+
+    def test_the_operator_still_gets_the_statement_when_registration_fails(
+            self, book_node, tmp_path, monkeypatch, caplog):
+        """parse_book's registration boundary, the same omission."""
+        import logging
+        boom = self._db_error('INSERT INTO pdf_files (directory) VALUES (?)',
+                              {'directory': '/srv/nunba/uploads/pdf_parse'})
+        monkeypatch.setattr(bp, '_register', MagicMock(side_effect=boom))
+
+        with caplog.at_level(logging.WARNING, logger=bp.logger.name):
+            result = bp.parse_book(make_pdf(tmp_path / 'book.pdf'), '42')
+
+        assert '[SQL:' not in result['store_error']
+        logged = self._logged_exceptions(caplog)
+        assert logged, 'the operator was left the sanitised sentence alone'
+        full = '\n'.join(str(r.exc_info[1]) for r in logged)
+        assert '[SQL:' in full and 'pdf_files' in full
+
+    def test_driver_text_drops_the_statement_and_keeps_the_drivers_words(self):
+        boom = self._db_error('INSERT INTO pdf_files (directory) VALUES (?)',
+                              {'directory': '/srv/nunba/uploads'})
+        assert '[SQL:' in str(boom), 'the hazard this guards is gone'
+        assert bp.driver_text(boom) == 'disk I/O error'
+
+    def test_driver_text_with_no_driver_error_does_not_fall_back_to_the_statement(self):
+        """orig None: str(exc) IS the statement, so it must not be the answer.
+
+        This branch survived as a mutant on the acd5f5a42 review -- 122 tests
+        passed with it reverted.
+        """
+        from sqlalchemy.exc import StatementError
+        exc = StatementError('boom', 'SELECT secret FROM pdf_files', {}, None)
+        assert '[SQL:' in str(exc)
+        said = bp.driver_text(exc)
+        assert said == 'StatementError'
+        assert '[SQL:' not in said and 'pdf_files' not in said
+
+    def test_driver_text_leaves_an_exception_that_renders_no_statement_alone(self):
+        """The isinstance(StatementError) gate, the other surviving mutant.
+
+        Only that class appends [SQL:]/[parameters:]; everything else already
+        says exactly what it was given, and a book's own complaint must reach
+        the person whole.
+        """
+        from sqlalchemy.exc import InvalidRequestError
+        assert bp.driver_text(RuntimeError('the PDF could not be opened')) == (
+            'the PDF could not be opened')
+        assert bp.driver_text(InvalidRequestError('no such table')) == 'no such table'
+
+    def test_driver_text_does_not_raise_when_the_driver_error_cannot_be_read(self):
+        """It runs inside except blocks; raising here costs the person the answer."""
+        from sqlalchemy.exc import StatementError
+
+        class Unreadable(Exception):
+            def __str__(self):
+                raise ValueError('cannot be rendered')
+
+        exc = StatementError('boom', 'SELECT 1 FROM pdf_files', {}, Unreadable())
+        said = bp.driver_text(exc)
+        assert said == 'StatementError'
+        assert 'pdf_files' not in said
+
     def test_a_row_that_cannot_be_marked_processing_does_not_fail_the_book(
             self, book_node, tmp_path, monkeypatch):
         real_update, calls = bp._update_row, []

@@ -9840,6 +9840,18 @@ def _is_plain_yes(text):
     return ' '.join(str(text or '').split()).rstrip('.!').lower() == 'yes'
 
 
+@app.teardown_request
+def _a_turns_model_ends_with_its_request(_exc=None):
+    """A turn's model lasts as long as its request (#172).  /chat sets the
+    thread's model_config override when a turn starts and nothing cleared it
+    when the turn ended, by any return, an exception, or the daemon's
+    in-process test client (dispatch._native_chat, on the daemon's own
+    thread).  /time_agent and /visual_agent never set it, so a scheduled run
+    on a reused worker thread inherited an earlier expert turn's model and
+    spent it outside the day-cap check (review of 75dc20add, P2)."""
+    thread_local_data.clear_model_config_override()
+
+
 @app.route('/chat', methods=['POST'])
 @_mark_foreground
 def chat():
@@ -10956,10 +10968,16 @@ def chat():
                 # 400/429, /chat answered the gather output, the worker took it
                 # for the task's result and 17 earning goals were completed
                 # with nothing done.
-                from core.agent_tools import is_user_facing_error, is_user_pause
+                # A recipe() that did not start (another turn of the
+                # conversation runs on a different model, #172) answers that
+                # too, so the dispatcher holds it instead of judging the
+                # gather output.
+                from core.agent_tools import (is_held_for_another_turn,
+                                              is_user_facing_error, is_user_pause)
                 return _chat_reply(
                     user_id, request_id,
                     recipe_response if (is_user_pause(recipe_response)
+                                        or is_held_for_another_turn(recipe_response)
                                         or is_user_facing_error(recipe_response))
                     else auto_response,
                     intent=['FINAL_ANSWER'],

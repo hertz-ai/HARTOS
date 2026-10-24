@@ -846,6 +846,12 @@ _DEFERRED_PREFIX = 'deferred:'
 #: Why a turn that stopped between steps for a person (#129) returned nothing.
 _PAUSED_FOR_THE_PERSON = (f'{_DEFERRED_PREFIX} paused between steps; a person '
                           f'is using this computer')
+#: Why a turn that did not start returned nothing: another turn of the same
+#: conversation is running on a different model (#172).  A goal handed to the
+#: expert keeps its escalation for the next tick instead of being parked as
+#: "the expert model did not finish it" by a turn the expert never ran.
+_HELD_FOR_ANOTHER_TURN = (f'{_DEFERRED_PREFIX} another turn of this '
+                          f'conversation is running on a different model')
 
 
 def _failure_key(goal_id) -> tuple:
@@ -858,15 +864,20 @@ def _turn_failure(reply) -> Optional[str]:
 
     Two kinds, told apart by the reason's prefix.  A turn that stopped
     between steps because a person is using this computer
-    (core.agent_tools.is_user_pause, #129) is held: retry later, never
-    counted as done or failed ('deferred: ...').  A turn whose LLM call
-    failed is a failure: the pipeline does not raise, user_facing_error()
-    turns the exception into a polite sentence and the turn returns it as
-    the reply ('turn failed: ...').  core.agent_tools holds the one
-    recogniser of each; worker_loop._after_response uses them the same way."""
-    from core.agent_tools import is_user_facing_error, is_user_pause
+    (core.agent_tools.is_user_pause, #129), or that did not start because
+    another turn of its conversation is running on a different model
+    (is_held_for_another_turn, #172), is held: retry later, never counted as
+    done or failed ('deferred: ...').  A turn whose LLM call failed is a
+    failure: the pipeline does not raise, user_facing_error() turns the
+    exception into a polite sentence and the turn returns it as the reply
+    ('turn failed: ...').  core.agent_tools holds the one recogniser of
+    each; worker_loop._after_response uses them the same way."""
+    from core.agent_tools import (is_held_for_another_turn,
+                                  is_user_facing_error, is_user_pause)
     if is_user_pause(reply):
         return _PAUSED_FOR_THE_PERSON
+    if is_held_for_another_turn(reply):
+        return _HELD_FOR_ANOTHER_TURN
     if not is_user_facing_error(reply):
         return None
     return f'turn failed: {reply.strip()[:160]}'

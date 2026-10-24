@@ -186,6 +186,28 @@ def is_user_pause(reply) -> bool:
     return reply.strip().startswith(PAUSED_FOR_USER_REPLY_PREFIX)
 
 
+def held_for_another_turn_reply() -> str:
+    """The sentence a turn answers when it did not start because another turn
+    of the same conversation is running on a different model
+    (hartos.helper.bind_agents_to_turn_model, #172).  Written here, beside
+    the predicate that recognises it."""
+    from core.constants import HELD_FOR_ANOTHER_TURN_REPLY_PREFIX
+    return (f"{HELD_FOR_ANOTHER_TURN_REPLY_PREFIX} another turn of this "
+            f"conversation is still running on a different model, so this one "
+            f"did not start; send it again once that turn has answered.")
+
+
+def is_held_for_another_turn(reply) -> bool:
+    """True when ``reply`` is held_for_another_turn_reply: the turn did not
+    run.  Neither a result nor a failure: the daemon keeps the goal (and an
+    escalation to the expert) for its next tick with no strike, and the hive
+    worker defers the task.  Recognised by the prefix in core.constants."""
+    if not isinstance(reply, str):
+        return False
+    from core.constants import HELD_FOR_ANOTHER_TURN_REPLY_PREFIX
+    return reply.strip().startswith(HELD_FOR_ANOTHER_TURN_REPLY_PREFIX)
+
+
 def is_action_error_reply(reply) -> bool:
     """True when ``reply`` is the CREATE pipeline's structured error envelope,
     {"status": "error", "action": ..., "action_id": ..., "message": ...} — the
