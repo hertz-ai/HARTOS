@@ -255,11 +255,20 @@ class ResonanceService:
         a second call for this user waits on the write lock (SQLite; a row
         or gap lock on MySQL, which also guards the wallet insert) until the
         first commits, and the ledger read is a locking read, so it sees
-        that commit rather than an older snapshot."""
+        that commit rather than an older snapshot.  Measured on file SQLite
+        (one award, no failed request, wallet or not).  On MySQL, by InnoDB's
+        rules and not measured here, two first awards for a user with no
+        wallet yet can end one request with a deadlock abort instead of a
+        wait; never a double pay."""
         from .models import ResonanceTransaction
         db.query(ResonanceWallet).filter(
             ResonanceWallet.user_id == user_id,
-        ).update({ResonanceWallet.spark: ResonanceWallet.spark},
+        ).update({ResonanceWallet.spark: ResonanceWallet.spark,
+                  # set to itself, so the onupdate does not fire: wallet sync
+                  # is last-write-wins on updated_at, and taking a lock must
+                  # not make an unchanged balance look newer (review of
+                  # 375df0ef0, finding 1)
+                  ResonanceWallet.updated_at: ResonanceWallet.updated_at},
                  synchronize_session=False)
         paid = db.query(ResonanceTransaction.id).filter(
             ResonanceTransaction.user_id == user_id,

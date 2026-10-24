@@ -530,8 +530,14 @@ class ThoughtExperimentService:
                 if suggestion:
                     ResonanceService.award_action_once(
                         db, voter_id, 'experiment_suggestion', experiment_id)
-            except Exception:
-                pass
+            except Exception as exc:
+                # the vote stands; a later vote by this voter pays what is
+                # still due (the ledger decides).  Said, not swallowed (review
+                # of 375df0ef0, finding 2: under a lock held past the busy
+                # timeout the award was skipped silently).
+                logger.info("spark for %s's vote on %s not paid now (%s); a "
+                            "later vote pays it", voter_id, experiment_id,
+                            type(exc).__name__)
 
         return vote.to_dict()
 

@@ -889,8 +889,18 @@ def test_two_identical_re_votes_at_once_pay_once(tmp_path):
     from sqlalchemy.pool import NullPool
     from integrations.social.models import ResonanceTransaction
     from integrations.social.resonance_engine import ResonanceService
+    from sqlalchemy import event
+    # as models.get_engine builds a file SQLite: NullPool, WAL, a 3 s busy
+    # timeout (review of 375df0ef0, finding 3)
     eng = create_engine(f"sqlite:///{tmp_path / 'race.db'}", poolclass=NullPool,
-                        connect_args={'check_same_thread': False, 'timeout': 10})
+                        connect_args={'check_same_thread': False})
+
+    @event.listens_for(eng, 'connect')
+    def _pragmas(dbapi_conn, _record):
+        cur = dbapi_conn.cursor()
+        cur.execute('PRAGMA journal_mode=WAL')
+        cur.execute('PRAGMA busy_timeout=3000')
+        cur.close()
     Base.metadata.create_all(eng)
     make = sessionmaker(bind=eng, expire_on_commit=False)
     outcomes, errors = [], []
@@ -938,3 +948,24 @@ def test_two_identical_re_votes_at_once_pay_once(tmp_path):
             s.close()
     eng.dispose()
     assert outcomes == [1] * 20 and errors == [], (outcomes, errors)
+
+
+def test_taking_the_award_lock_does_not_touch_the_wallets_time(db):
+    """Review of 375df0ef0, finding 1: an identical re-vote of a paid vote
+    takes the wallet lock but changes nothing, so the wallet's updated_at
+    (last-write-wins for sync) must not move."""
+    from datetime import datetime
+    from integrations.social.models import ResonanceWallet
+    e = _experiment(db)
+    person = _user(db)
+    ThoughtExperimentService.cast_vote(db, e.id, person.id, 1, voter_type='human')
+    db.commit()
+    wallet = db.query(ResonanceWallet).filter_by(user_id=person.id).one()
+    wallet.updated_at = datetime(2000, 1, 1)
+    db.commit()
+    ThoughtExperimentService.cast_vote(db, e.id, person.id, 1, voter_type='human')
+    db.commit()
+    db.expire_all()
+    wallet = db.query(ResonanceWallet).filter_by(user_id=person.id).one()
+    assert wallet.updated_at == datetime(2000, 1, 1)
+    assert _spark_awards(db, person.id) == ['experiment_voted']
