@@ -242,16 +242,30 @@ class ResonanceService:
                           source_id: str) -> Dict:
         """award_action at most once per (user, action, source): the ledger
         entry IS the record (as hive_contest registers a participant), so no
-        sequence of calls pays the same action for the same source twice.
-        Returns {} when it was already paid.  (Review of 5637595de: a flag
-        read from the vote row was reset by clearing the suggestion, and 50
-        clear-and-re-add cycles minted 51 suggestion awards.)"""
+        sequence of calls, sequential or concurrent, pays the same action for
+        the same source twice.  Returns {} when it was already paid, or when
+        `action` is not in AWARD_TABLE.  (Review of 5637595de: a flag read
+        from the vote row was reset by clearing the suggestion, and 50
+        clear-and-re-add cycles minted 51 suggestion awards.)
+
+        CONCURRENT CALLS (review of f5089e1ef: two identical re-votes at once
+        paid twice in 51 of 60 trials, and with no wallet yet the loser's
+        session failed in 56 of 60): the user's wallet row is written first,
+        a self-assigning UPDATE (spend_spark's conditional-UPDATE idiom), so
+        a second call for this user waits on the write lock (SQLite; a row
+        or gap lock on MySQL, which also guards the wallet insert) until the
+        first commits, and the ledger read is a locking read, so it sees
+        that commit rather than an older snapshot."""
         from .models import ResonanceTransaction
+        db.query(ResonanceWallet).filter(
+            ResonanceWallet.user_id == user_id,
+        ).update({ResonanceWallet.spark: ResonanceWallet.spark},
+                 synchronize_session=False)
         paid = db.query(ResonanceTransaction.id).filter(
             ResonanceTransaction.user_id == user_id,
             ResonanceTransaction.source_type == action,
             ResonanceTransaction.source_id == source_id,
-        ).first()
+        ).with_for_update().first()
         if paid is not None:
             return {}
         return ResonanceService.award_action(db, user_id, action,

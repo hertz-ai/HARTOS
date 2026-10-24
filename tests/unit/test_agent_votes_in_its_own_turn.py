@@ -864,3 +864,77 @@ def test_an_action_is_paid_once_per_user_and_source(db):
     assert ResonanceService.award_action_once(db, person.id, 'experiment_voted', 'exp-2')
     db.commit()
     assert _spark_awards(db, person.id) == ['experiment_voted', 'experiment_voted']
+
+
+def test_one_voters_award_does_not_block_anothers(db):
+    """Review of f5089e1ef, finding 3: the once-check is per user; two
+    voters on one experiment each earn their own vote award."""
+    e = _experiment(db)
+    first, second = _user(db), _user(db)
+    for person in (first, second):
+        ThoughtExperimentService.cast_vote(db, e.id, person.id, 1, voter_type='human')
+    assert _spark_awards(db, first.id) == ['experiment_voted']
+    assert _spark_awards(db, second.id) == ['experiment_voted']
+
+
+def test_two_identical_re_votes_at_once_pay_once(tmp_path):
+    """Review of f5089e1ef, finding 1: two re-votes of the same unpaid vote,
+    at once, on a NullPool file SQLite as production builds it, with and
+    without a wallet; expected: one award each time and no failed request
+    (before the fix: 51 of 60 paid twice with a wallet; 56 of 60 failed one
+    request without)."""
+    import threading
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import NullPool
+    from integrations.social.models import ResonanceTransaction
+    from integrations.social.resonance_engine import ResonanceService
+    eng = create_engine(f"sqlite:///{tmp_path / 'race.db'}", poolclass=NullPool,
+                        connect_args={'check_same_thread': False, 'timeout': 10})
+    Base.metadata.create_all(eng)
+    make = sessionmaker(bind=eng, expire_on_commit=False)
+    outcomes, errors = [], []
+    for with_wallet in (True, False):
+        for _ in range(10):
+            s = make()
+            creator = User(username='c' + uuid.uuid4().hex[:8], user_type='human')
+            voter = User(username='v' + uuid.uuid4().hex[:8], user_type='human')
+            s.add_all([creator, voter])
+            s.flush()
+            e = ThoughtExperiment(id=str(uuid.uuid4()), creator_id=creator.id, title='t',
+                                  hypothesis='h', expected_outcome='o', status='voting')
+            s.add(e)
+            s.flush()
+            ThoughtExperimentService.cast_vote(s, e.id, voter.id, 1, voter_type='human',
+                                               award=False)
+            if with_wallet:
+                ResonanceService.get_or_create_wallet(s, voter.id)
+            s.commit()
+            s.close()
+            barrier = threading.Barrier(2)
+
+            def go(exp_id=e.id, voter_id=voter.id):
+                t = make()
+                try:
+                    barrier.wait()
+                    ThoughtExperimentService.cast_vote(t, exp_id, voter_id, 1,
+                                                       voter_type='human')
+                    t.commit()
+                except Exception as ex:  # noqa: BLE001
+                    errors.append(type(ex).__name__)
+                    t.rollback()
+                finally:
+                    t.close()
+            threads = [threading.Thread(target=go) for _ in range(2)]
+            for th in threads:
+                th.start()
+            for th in threads:
+                th.join()
+            s = make()
+            outcomes.append(s.query(ResonanceTransaction).filter(
+                ResonanceTransaction.user_id == voter.id,
+                ResonanceTransaction.source_type == 'experiment_voted',
+                ResonanceTransaction.currency == 'spark').count())
+            s.close()
+    eng.dispose()
+    assert outcomes == [1] * 20 and errors == [], (outcomes, errors)

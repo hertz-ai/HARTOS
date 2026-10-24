@@ -519,6 +519,9 @@ class ThoughtExperimentService:
         # row, which every re-vote rewrites (reviews of 81c34a0ae: 4 re-votes
         # minted 4 awards; of 40aaed434: a suggestion added on a re-vote went
         # unpaid; of 5637595de: clearing and re-adding one paid it again).
+        # A vote first cast unpaid (award=False: an autonomous turn, a machine
+        # vote) earns its award on a later award=True re-vote, when a person
+        # acted (review of f5089e1ef, finding 2).
         if award:
             try:
                 from .resonance_engine import ResonanceService
