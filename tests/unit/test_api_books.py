@@ -142,7 +142,7 @@ class TestBadInput:
         """
         r = _upload(client, pdf_bytes, user_id='u' * 70)
         assert r.status_code == 400
-        assert 'longer than this node stores' in r.get_json()['error']
+        assert 'cannot file a book for that account' in r.get_json()['error']
 
     def test_not_a_pdf_by_content(self, client):
         r = _upload(client, b'<html>not a pdf</html>')

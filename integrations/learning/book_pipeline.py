@@ -297,7 +297,10 @@ def _open(pdf_path):
         # A missing file is the only case measured here, so say so plainly
         # rather than "could not be read", which repeats the sentence it is
         # inside (that review's F5).
-        reason = e.strerror or 'it is no longer on this node, so please upload it again'
+        # No advice about re-uploading: the same branch serves a link the
+        # caller named by URL, which was never uploaded by them (that
+        # review's F5). The fact is the useful part.
+        reason = e.strerror or 'the file is no longer on this node'
         raise BookParseError(f'the PDF could not be opened ({reason})') from e
 
 
@@ -774,8 +777,8 @@ def _register(user_id, filename, directory, request_id) -> int:
     # the column is not a reader this node could have in the first place.
     if len(key_user) > READER_ID_MAX:
         raise BookParseError(
-            f'that reader id is longer than this node stores '
-            f'({READER_ID_MAX} characters)')
+            f'this node cannot file a book for that account '
+            f'(its id is longer than {READER_ID_MAX} characters)')
     with db_session() as db:
         now = _utcnow()
         row = BookFile(user_id=key_user, filename=key_name,
@@ -1351,7 +1354,14 @@ def parse_book(pdf_path, user_id, request_id='', log=None) -> dict:
     try:
         file_id = _register(user_id, pdf_path.name, pdf_path.parent, request_id)
     except Exception as e:
-        reason = f'the book library is unavailable ({driver_text(e)})'
+        # A book's own complaint first, the same order _run's handler uses: a
+        # BookParseError says something TRUE about this request -- a refused
+        # account id, say -- and the library is not unavailable merely because
+        # it would not file this book (that review's F1).
+        if isinstance(e, BookParseError):
+            reason = str(e)
+        else:
+            reason = f'the book library is unavailable ({driver_text(e)})'
         # exc_info because `reason` no longer carries the driver's statement:
         # without it the operator is left the sanitised sentence alone.
         logger.warning(f"reading {pdf_path.name} without storing it: {reason}",

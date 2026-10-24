@@ -37,6 +37,14 @@ def _by_page(file_id, field='passage'):
     return out
 
 
+#: What pdf_files.user_id holds. Spelled out here rather than read from
+#: bp.READER_ID_MAX so the tests below fail on a PARENT by the behaviour they
+#: claim, instead of by AttributeError on a constant the parent does not have
+#: (that review's F8). test_the_reader_id_limit_matches_its_column ties the two
+#: together, so this literal cannot drift from the column either.
+READER_ID_CHARS = 64
+
+
 def _row(file_id):
     return bp.get_book(file_id)
 
@@ -1116,10 +1124,10 @@ class TestLockContention:
         row at all and the collision has nowhere to happen.
         """
         alice, bob = 'P' * 64 + 'alice', 'P' * 64 + 'bob'
-        assert alice[:bp.READER_ID_MAX] == bob[:bp.READER_ID_MAX]
+        assert alice[:READER_ID_CHARS] == bob[:READER_ID_CHARS]
 
         for reader in (alice, bob):
-            with pytest.raises(bp.BookParseError, match='longer than this node stores'):
+            with pytest.raises(bp.BookParseError, match='cannot file a book'):
                 bp._register(reader, 'book.pdf', '/tmp', '')
             assert bp.list_books(reader) == []
         assert bp.list_books() == []          # and nothing was stored for either
@@ -1132,8 +1140,8 @@ class TestLockContention:
         was not the id it was given, and anything comparing the two had to
         choose between missing the row and matching someone else's.
         """
-        with pytest.raises(bp.BookParseError, match='longer than this node stores'):
-            bp._register('u' * (bp.READER_ID_MAX + 1), 'mine.pdf', '/tmp', '')
+        with pytest.raises(bp.BookParseError, match='cannot file a book'):
+            bp._register('u' * (READER_ID_CHARS + 1), 'mine.pdf', '/tmp', '')
         assert bp.list_books() == []
 
     def test_two_readers_the_column_can_hold_stay_apart(self, book_node, book_db):
@@ -1160,7 +1168,7 @@ class TestLockContention:
         book through list_books. Found by asking what the reverted _existing
         clip would do, not by the failure.
         """
-        owner = 'P' * bp.READER_ID_MAX
+        owner = 'P' * READER_ID_CHARS
         file_id = bp._register(owner, 'book.pdf', '/tmp', '')
         bp._update_row(file_id, status='completed')
         intruder = owner + 'bob'
@@ -1478,7 +1486,7 @@ class TestLockContention:
         is refused at the write now and the boundary worth pinning is the
         longest id the column can actually hold.
         """
-        reader = 'r' * bp.READER_ID_MAX
+        reader = 'r' * READER_ID_CHARS
         file_id = bp._register(reader, 'book.pdf', '/tmp', '')
         bp._update_row(file_id, status='processing')
         job = bp._new_job(file_id, reader, '', 'book.pdf')
@@ -1636,6 +1644,16 @@ class TestFetch:
 # ── The schema the library gets on each database ──────────────────────
 
 class TestSchema:
+
+    def test_the_reader_id_limit_matches_its_column(self):
+        """READER_ID_MAX copies pdf_files.user_id's width and could drift from
+        it (that review's F2), and the tests above spell 64 out for their own
+        reasons -- so something has to hold all three together."""
+        from integrations.social.models import BookFile
+
+        assert (bp.READER_ID_MAX
+                == BookFile.__table__.c.user_id.type.length
+                == READER_ID_CHARS)
 
     def _ddl(self, dialect):
         from sqlalchemy.schema import CreateTable
