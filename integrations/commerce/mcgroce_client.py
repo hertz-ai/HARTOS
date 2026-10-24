@@ -31,7 +31,10 @@ tell one refused before the request left from one dropped after it did), a
 5xx, or a 2xx whose body is not JSON (``status`` 2xx tells that one apart:
 McGroce answered with a success it could not explain).  The caller cannot
 know what happened.  A refusal (4xx) and a request never attempted (bad
-URL, breaker open) carry no such mark.
+URL, breaker open) carry no such mark.  ``key`` is McGroce's own messageKey
+when its answer carried one (AP2_REFUSAL_KEYS names the ones its AP2
+verifier refuses with); a 4xx without one came from something in front of
+McGroce, not from McGroce refusing.
 """
 
 import base64
@@ -54,13 +57,26 @@ mcgroce_breaker = CircuitBreaker(name='mcgroce', threshold=5, cooldown=60)
 
 
 def _err(error: str, status: Optional[int] = None,
-         unconfirmed: bool = False) -> Dict[str, Any]:
+         unconfirmed: bool = False, key: Optional[str] = None) -> Dict[str, Any]:
     out = {'success': False, 'error': error}
     if status is not None:
         out['status'] = status
     if unconfirmed:
         out['unconfirmed'] = True
+    if key:
+        # McGroce's own messageKey, as its own field: callers decide on the
+        # key, never by parsing the error text, which is rendered for people.
+        out['key'] = key
     return out
+
+
+#: McGroce's AP2 verifier refusing a mandate: the messageKeys its answers
+#: carry (Ap2CheckoutServiceImpl / Ap2MandateVerifierImpl on
+#: mcgroce-agentic-commerce).  A 4xx with none of them (Kong's "no Route
+#: matched" 404, a 401 wall) is not McGroce refusing the mandate.  The ONE
+#: set, for agent_orders_ready and the order probe alike.
+AP2_MANDATE_REJECTED = 'AP2_MANDATE_REJECTED'
+AP2_REFUSAL_KEYS = frozenset({AP2_MANDATE_REJECTED, 'CART_NOT_FOUND', 'AMOUNT_MISMATCH'})
 
 
 def order_number_of(data) -> Optional[Any]:
@@ -73,7 +89,16 @@ def order_number_of(data) -> Optional[Any]:
         return None
     for key in ('orderNumber', 'id'):
         value = data.get(key)
-        if value not in (None, ''):
+        # McGroce's orderNumber is yyyyMMddHHmmssS plus the order id
+        # (CompleteOrderActivity.determineOrderNumber), a digit string that
+        # can never be blank or all zeros; an older McGroce's id is a
+        # positive int.  Anything else names no order: 0, '', '   ', '0',
+        # a bool, a dict, a negative number.
+        if isinstance(value, str):
+            value = value.strip()
+            if value and value.strip('0'):
+                return value
+        elif isinstance(value, int) and not isinstance(value, bool) and value > 0:
             return value
     return None
 
@@ -92,19 +117,21 @@ def _is_loopback(host: str) -> bool:
         return False
 
 
-def _error_text(resp) -> str:
-    """Broadleaf ErrorWrapper -> 'KEY: message; ...', else the status."""
+def _error_parts(resp):
+    """Broadleaf ErrorWrapper -> ('KEY: message; ...', first messageKey);
+    anything else -> ('McGroce answered HTTP <status>', None)."""
     try:
         body = resp.json()
-        msgs = body.get('messages') or []
+        msgs = [m for m in (body.get('messages') or []) if isinstance(m, dict)]
         text = '; '.join(
             ': '.join(x for x in (m.get('messageKey'), m.get('message')) if x)
-            for m in msgs if isinstance(m, dict))
+            for m in msgs)
+        key = next((m.get('messageKey') for m in msgs if m.get('messageKey')), None)
         if text:
-            return text
+            return text, key
     except Exception:
         pass
-    return f'McGroce answered HTTP {resp.status_code}'
+    return f'McGroce answered HTTP {resp.status_code}', None
 
 
 class McGroceClient:
@@ -167,10 +194,12 @@ class McGroceClient:
             return _err(f'McGroce unreachable: {type(e).__name__}', unconfirmed=True)
         if resp.status_code >= 500:
             self.breaker.record_failure()
-            return _err(_error_text(resp), resp.status_code, unconfirmed=True)
+            text, key = _error_parts(resp)
+            return _err(text, resp.status_code, unconfirmed=True, key=key)
         self.breaker.record_success()
         if resp.status_code >= 400:
-            return _err(_error_text(resp), resp.status_code)
+            text, key = _error_parts(resp)
+            return _err(text, resp.status_code, key=key)
         data = None
         if resp.content:
             try:
@@ -260,7 +289,15 @@ class McGroceClient:
                          need_customer=False)
 
     def cart_get(self, user_id):
-        return self.site(user_id, 'GET', '/cart')
+        """The shopper's open cart.  McGroce answers a customer with no cart
+        404 CART_NOT_FOUND (CartEndpoint.findCartForCustomer), so a 2xx that
+        names no cart id is not "no cart yet": it is an answer this node
+        cannot read as a cart, and a failure, never an empty cart."""
+        res = self.site(user_id, 'GET', '/cart')
+        if res['success'] and not (isinstance(res.get('data'), dict)
+                                   and res['data'].get('id') not in (None, '')):
+            return _err('McGroce sent an empty answer where a cart was due', res['status'])
+        return res
 
     def cart_add(self, user_id, product_id, category_id, quantity=1):
         return self.site(user_id, 'POST', f'/cart/{_seg(product_id)}',
@@ -310,7 +347,7 @@ class McGroceClient:
         rolled back since the last yes would take the money and no order.
         """
         res = self.site(user_id, 'POST', '/cart/checkout/ap2')
-        if res.get('status') == 403 and 'AP2_MANDATE_REJECTED' in str(res.get('error')):
+        if res.get('status') == 403 and res.get('key') in AP2_REFUSAL_KEYS:
             return None
         if res.get('status') == 404:
             return 'this McGroce does not take agent orders yet'

@@ -169,7 +169,7 @@ class TestFailures:
         with patch('core.http_pool.pooled_request', return_value=_Resp(404, body)):
             out = client.cart_get(hartos_user_id(4242))
         assert out == {'success': False, 'error': 'CART_NOT_FOUND: No cart',
-                       'status': 404}
+                       'status': 404, 'key': 'CART_NOT_FOUND'}
 
     def test_breaker_opens_after_five_failures(self, client):
         uid = hartos_user_id(4242)
@@ -227,6 +227,70 @@ class TestFailures:
         assert order_number_of(out['data']) == 'ORD-ID'
         assert order_number_of({'orderNumber': 'N1', 'id': 7}) == 'N1'
         assert order_number_of(['N1']) is None and order_number_of(None) is None
+
+    def test_the_reader_names_an_order_only_for_a_real_number(self, client):
+        # hartos-94's order-zero probe: 0, {} and '   ' passed as order
+        # numbers, and for the falsy ones the placer skipped the record
+        # while answering "ordered".  McGroce's orderNumber is
+        # yyyyMMddHHmmssS plus the order id (CompleteOrderActivity), never
+        # blank or all zeros; an older McGroce's id is a positive int.
+        from integrations.commerce.mcgroce_client import order_number_of
+        for body in ({'id': 0}, {'orderNumber': '   '}, {'orderNumber': {}},
+                     {'id': -1}, {'id': True}, {'orderNumber': '0'},
+                     {'orderNumber': '00'}, {'orderNumber': ['N1']}):
+            assert order_number_of(body) is None, body
+            with patch('core.http_pool.pooled_request', return_value=_Resp(200, body)):
+                out = client.complete_ap2_checkout(hartos_user_id(4242), 'tok')
+            assert out['success'] is False and out['unconfirmed'] is True, body
+        assert order_number_of({'orderNumber': ' ORD-S '}) == 'ORD-S'       # stripped
+        assert order_number_of({'id': 7}) == 7
+        assert order_number_of({'orderNumber': '2026102500000011'}) == '2026102500000011'
+
+    def test_a_refusal_carries_mcgroce_key_as_its_own_field(self, client):
+        # The caller decides on McGroce's messageKey, never by parsing the
+        # error text, which is rendered for people.  A 4xx without one came
+        # from something in front of McGroce (Kong's 404, a 401 wall).
+        from integrations.commerce.mcgroce_client import AP2_REFUSAL_KEYS
+        refused = _Resp(403, {'messages': [{'messageKey': 'AP2_MANDATE_REJECTED',
+                                            'message': 'The payment does not match (items)'}]})
+        with patch('core.http_pool.pooled_request', return_value=refused):
+            out = client.complete_ap2_checkout(hartos_user_id(4242), 'tok')
+        assert out['key'] == 'AP2_MANDATE_REJECTED' and out['key'] in AP2_REFUSAL_KEYS
+        assert out['status'] == 403 and 'unconfirmed' not in out
+        kong = _Resp(404, {'message': 'no Route matched with those values',
+                           'request_id': 'abc'})
+        with patch('core.http_pool.pooled_request', return_value=kong):
+            out = client.complete_ap2_checkout(hartos_user_id(4242), 'tok')
+        assert out['success'] is False and out['status'] == 404 and 'key' not in out
+        wall = _Resp(401, None)
+        wall.content = b'<html>sign in</html>'
+        with patch('core.http_pool.pooled_request', return_value=wall):
+            out = client.complete_ap2_checkout(hartos_user_id(4242), 'tok')
+        assert out['success'] is False and out['status'] == 401 and 'key' not in out
+
+    def test_readiness_reads_the_refusal_from_the_key(self, client):
+        refused = _Resp(403, {'messages': [{'messageKey': 'AP2_MANDATE_REJECTED',
+                                            'message': 'no payment attestation'}]})
+        with patch('core.http_pool.pooled_request', return_value=refused):
+            assert client.agent_orders_ready(hartos_user_id(4242)) is None
+        wall = _Resp(403, {'message': 'forbidden by the gateway'})
+        with patch('core.http_pool.pooled_request', return_value=wall):
+            assert client.agent_orders_ready(hartos_user_id(4242)) is not None
+
+    def test_a_cart_answer_naming_no_cart_is_a_failure_not_an_empty_cart(self, client):
+        # McGroce answers a customer with no cart 404 CART_NOT_FOUND
+        # (CartEndpoint.findCartForCustomer), so a 2xx without a cart id is
+        # an answer this node cannot read as a cart: a failure, read as
+        # such by the caller (not unconfirmed: nothing was placed).
+        for body in (None, {}, {'orderItems': []}, {'id': ''}):
+            with patch('core.http_pool.pooled_request', return_value=_Resp(200, body)):
+                out = client.cart_get(hartos_user_id(4242))
+            assert out['success'] is False and 'empty answer' in out['error'], body
+            assert out['status'] == 200 and 'unconfirmed' not in out
+        with patch('core.http_pool.pooled_request',
+                   return_value=_Resp(200, {'id': 555, 'orderItems': []})):
+            out = client.cart_get(hartos_user_id(4242))
+        assert out['success'] is True and out['data']['id'] == 555
 
 
 class TestBindings:

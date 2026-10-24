@@ -1830,6 +1830,8 @@ class TestHeldPayments:
             ct.complete_redirect_checkout(out['payment_id'])
         assert 'MANUAL RECONCILIATION NEEDED' in caplog.text
         assert out['mandate_id'] in caplog.text and 'could not be written' in caplog.text
+        assert any(r.levelno == logging.ERROR and 'could not be written' in r.getMessage()
+                   for r in caplog.records)                      # X1: an ERROR, not a warning
 
     # ── a marked mandate under the key pause (F-B) ───────────────────────
 
@@ -2019,6 +2021,116 @@ class TestHeldPayments:
         assert pushed(env, 'order_tracking')[-1]['order_id'] == 'ORD-ID'
         assert env['mandates'].get(out['mandate_id']).order_ref == 'ORD-ID'
         assert owner_cards(env) == []
+
+    def test_a_probe_answered_by_the_gateway_not_mcgroce_is_could_not_be_made(self, env):
+        # hartos-f3's second reviewer's F-E': any 4xx read as McGroce's
+        # refusal, so a Kong 404 ("no Route matched") or a 401 wall gave the
+        # cart-changed hold, "put the cart back" and the refund step.  Only
+        # McGroce's own refusal keys refuse; the rest is "could not be made".
+        for status, body in ((404, {'message': 'no Route matched with those values'}),
+                             (401, None)):
+            out = self._paid_on_phonepe(env)
+            drifted = json.loads(json.dumps(ORDER))
+            drifted['orderItems'].pop()
+            env['fake'].on('GET', '/cart', body=drifted)
+            fake = env['fake']
+            resp = _Resp(status, body)
+            if body is None:
+                resp.content = b'<html>sign in</html>'
+            with patch('core.http_pool.pooled_request',
+                       side_effect=signed_order_answers(fake, lambda r=resp: r)):
+                res = ct.complete_redirect_checkout(out['payment_id'])
+            assert res['success'] is False and 'cart_changed' not in res, status
+            note = pushed(env, 'notification')[-1]['message']
+            assert note == self.PAID and 'put the cart back' not in note
+            card = owner_cards(env)[-1]['message']
+            assert 'the order check could not be made' in card, status
+            # The next shopper gets a fresh cart (555 is held): a new cart id.
+            fresh = json.loads(json.dumps(ORDER))
+            fresh['id'] = 555 + status
+            env['fake'].on('GET', '/cart', body=fresh)
+            env['fake'].on('POST', AP2, body={'orderNumber': f'ORD-{status}'})
+            env['mandates'].get(out['mandate_id'])   # keep the store's view current
+            env['fake'].placed[out['mandate_id']] = f'ORD-{status}'
+            later = json.loads(ct.commerce_checkout(UID, out['mandate_id']))
+            assert later['success'] is True and later['order_id'] == f'ORD-{status}'
+
+    def test_a_probe_mcgroce_refused_by_its_own_key_is_still_the_changed_cart(self, env):
+        out = self._paid_on_phonepe(env)
+        drifted = json.loads(json.dumps(ORDER))
+        drifted['orderItems'].pop()
+        env['fake'].on('GET', '/cart', body=drifted)
+        res = ct.complete_redirect_checkout(out['payment_id'])   # the fake refuses AP2_MANDATE_REJECTED
+        assert res['cart_changed'] is True
+        assert 'put the cart back' in pushed(env, 'notification')[-1]['message']
+
+    def test_an_order_call_answered_with_a_garbage_order_number_is_could_not_confirm(self, env):
+        # hartos-94's order-zero probe on 6aec34570: {'id': 0} and
+        # {'orderNumber': {}} answered "ordered" with order_id 0 / {} and
+        # recorded nothing; '   ' was recorded as the order.  The reader
+        # names an order only for a real number, so these are unconfirmed:
+        # could-not-confirm, marked, one call, nothing recorded.
+        for body in ({'id': 0}, {'orderNumber': '   '}, {'orderNumber': {}}):
+            out = self._paid_on_phonepe(env)
+            fake = env['fake']
+            with patch('core.http_pool.pooled_request',
+                       side_effect=signed_order_answers(fake, lambda b=body: _Resp(200, b))):
+                res = ct.complete_redirect_checkout(out['payment_id'])
+            assert res['success'] is False and res.get('status') != 'ordered', body
+            assert pushed(env, 'notification')[-1]['message'] == self.UNCONFIRMED
+            rec = env['mandates'].get(out['mandate_id'])
+            assert rec.order_ref is None and rec.order_sent is not None, body
+            fake.placed[out['mandate_id']] = 'ORD-REAL'
+            env['fake'].on('GET', '/cart', *CART_GONE)
+            later = json.loads(ct.commerce_checkout(UID, out['mandate_id']))
+            assert later['success'] is True and later['order_id'] == 'ORD-REAL'
+            env['fake'].on('GET', '/cart', body=ORDER)
+
+    def test_an_order_number_is_recorded_stripped(self, env):
+        out = self._paid_on_phonepe(env)
+        env['fake'].on('POST', AP2, body={'orderNumber': ' ORD-S '})
+        res = ct.complete_redirect_checkout(out['payment_id'])
+        assert res['success'] is True and res['order_id'] == 'ORD-S'
+        assert env['mandates'].get(out['mandate_id']).order_ref == 'ORD-S'
+
+    def test_a_cart_read_naming_no_cart_holds_as_unreadable_not_as_changed(self, env):
+        # cart_get's 2xx without a cart id used to pass as an empty cart, so
+        # a retry whose cart read was an empty 200 and whose probe was
+        # refused said "put the cart back".  It is a failed read.
+        out = self._paid_on_phonepe(env)
+        env['fake'].on('GET', '/cart', status=503, body=None)
+        ct.complete_redirect_checkout(out['payment_id'])         # used up, held
+        env['fake'].on('GET', '/cart', body={})
+        res = json.loads(ct.commerce_checkout(UID, out['mandate_id']))
+        assert res['success'] is False and 'cart_changed' not in res
+        assert 'put the cart back' not in pushed(env, 'notification')[-1]['message']
+        assert 'could not be read' in owner_cards(env)[-1]['message']
+        assert 'empty answer' in owner_cards(env)[-1]['message']
+
+    def test_the_hold_goes_out_before_the_mark_inside_the_raise_catcher(self, env):
+        # Y3: _order_step_raised holds first, then marks, even when the
+        # writer raises (defence in depth behind the never-raising writer).
+        out = self._paid_on_phonepe(env)
+        env['fake'].on('POST', AP2, body={'orderNumber': 'ORD-X'})
+        with patch.object(ct, '_order_placed', side_effect=RuntimeError('boom')), \
+                patch.object(ct, '_mark_order_sent', side_effect=RuntimeError('writer broke')):
+            with pytest.raises(RuntimeError):
+                ct.complete_redirect_checkout(out['payment_id'])
+        assert pushed(env, 'notification')[-1]['message'] == self.UNCONFIRMED
+        assert 'Check McGroce' in owner_cards(env)[-1]['message']
+
+    def test_a_cart_gone_after_a_refused_probe_keeps_the_mark(self, env):
+        # X2/Y1: the second cart-unreadable hold (cart gone, probe refused)
+        # after an unanswered call still says could-not-confirm.
+        out = self._paid_on_phonepe(env)
+        env['fake'].on('POST', AP2, status=503, body=None)
+        ct.complete_redirect_checkout(out['payment_id'])         # marked
+        env['fake'].on('GET', '/cart', *CART_GONE)
+        for _ in range(2):
+            res = json.loads(ct.commerce_checkout(UID, out['mandate_id']))
+            assert res['needs_attention'] is True
+            assert pushed(env, 'notification')[-1]['message'] == self.UNCONFIRMED
+            assert 'Check McGroce' in owner_cards(env)[-1]['message']
 
     # ── the mark, on every later hold ────────────────────────────────────
 

@@ -1004,12 +1004,13 @@ def _mark_order_sent(m) -> None:
     the money is taken and the hold is what tells people, so a mark that
     cannot be written (the payment pause, a full disk, a refused replace)
     is logged for a person and the hold already raised stands on its own.
-    Callers hold FIRST, then mark."""
+    A caller that holds does so FIRST, then marks; the placer marks after a
+    record it could not write."""
     try:
         _mandates().record_order_sent(m.mandate_id)
     except Exception as e:
         logger.error(f'MANUAL RECONCILIATION NEEDED: mandate {m.mandate_id}: an '
-                     f'order call went unanswered and the mark could not be '
+                     f'order may exist at McGroce for it and the mark could not be '
                      f'written ({type(e).__name__}: {e}); the next hold for it '
                      f'may say "not placed yet"')
 
@@ -1026,6 +1027,7 @@ def _order_for_mandate(client, m, payment) -> Optional[Dict[str, Any]]:
     probe could be signed; the call never left, the breaker open or the
     URL bad), and a shopper whose cart may hold the placed order must not
     be told to rebuild it."""
+    from integrations.commerce.mcgroce_client import AP2_REFUSAL_KEYS
     attestation = mandate_attestation_for(client, m, payment, None)
     if attestation:
         found = client.complete_ap2_checkout(m.user_id, attestation)
@@ -1055,7 +1057,10 @@ def _order_for_mandate(client, m, payment) -> Optional[Dict[str, Any]]:
                  f"whether its order exists ({found['error']}); retry with "
                  'commerce_checkout and this mandate_id, which never charges '
                  'again, or a person checks McGroce')
-    elif 400 <= status < 500:
+    elif found.get('key') in AP2_REFUSAL_KEYS:
+        # McGroce itself refused the mandate, by one of its own keys: no
+        # placed order carries it.  A 4xx without one (Kong's "no Route
+        # matched" 404, a 401 wall) is not McGroce answering.
         return None
     else:
         why = f"the order check could not be made: {found['error']}"
@@ -1125,7 +1130,9 @@ def _order_placed(user_id, m, placed) -> Dict[str, Any]:
     # names none as unconfirmed).
     order_id = order_number_of(order)
     status = order.get('status') or 'SUBMITTED'
-    if order_id:
+    # The reader is the one authority on what counts as an order number;
+    # no truthiness test here can skip the record for a value it passed.
+    if order_id is not None:
         try:
             _mandates().record_order(m.mandate_id, order_id)
         except Exception as e:
