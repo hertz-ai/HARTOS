@@ -592,7 +592,13 @@ class TestLifecycle:
             self, book_node, book_db, tmp_path, monkeypatch):
         """_worker's BookParseError branch logs only debug, on the stated
         ground that the failure is "already recorded on the row and the job,
-        and published".  Nothing held any of those three.
+        and published".
+
+        Only the PUBLISHED third was unheld. Removing _mark_failed fails five
+        tests and removing the _update_job fails six, nearly all pre-existing,
+        through TestFailures' _fails helper -- measured by splitting the claim
+        rather than trusting the sentence. So this test closes one gap, not
+        three, and the docstring used to say otherwise.
         """
         pdf = make_pdf(tmp_path / 'book.pdf')
         file_id = bp._register('42', pdf.name, pdf.parent, 'req-bg')
@@ -663,7 +669,14 @@ class TestLifecycle:
         monkeypatch.setattr(bp, '_update_row', counting)
         bp.parse_book(make_pdf(tmp_path / 'book.pdf'), '42')
 
-        assert len(touches) >= 2, touches
+        # Tied to the number of STEPS, not a floor of 2: with the interval at
+        # zero every step must touch, so one touch per step plus _run's own
+        # write before the pages. "At least 2" was met by that write plus a
+        # SINGLE touch, so a parse that touched once and then never again
+        # passed all 174 -- and would still go stale thirty minutes in
+        # (mutant MC5b of the 5928418f3 review).
+        steps = len(book_node.published)
+        assert len(touches) == steps + 1, (len(touches), steps)
 
     def test_start_parse_returns_before_the_parse_runs(self, book_node, tmp_path, monkeypatch):
         release = threading.Event()
