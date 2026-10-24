@@ -879,8 +879,21 @@ def _record_stalled(file_ids) -> None:
     The patient ladder stays where a write must land: _register, _update_row
     (so _mark_failed keeps it) and _save.
     """
+    from sqlalchemy import text
+
     from integrations.social.models import BookFile, db_session
     with db_session() as db:
+        # Best-effort means not waiting, either.  Dropping the ladder left one
+        # attempt, but one attempt still sat out the engine's
+        # busy_timeout=3000, so a library read inside a lock window paid about
+        # 3.4 s -- measured on 179a11815: list_books 3.38 s, down from 20.48 s
+        # but not free (hevolve-cc12's review of it, finding 2).  File-based
+        # SQLite runs on NullPool, so this session owns a short-lived
+        # connection of its own and the pragma dies with it; no pooled
+        # connection is left impatient for another writer.  Guarded by dialect
+        # because HEVOLVE_DB_URL can point at MySQL, where it is not valid SQL.
+        if db.get_bind().dialect.name == 'sqlite':
+            db.execute(text('PRAGMA busy_timeout=0'))
         for file_id in file_ids:
             row = db.get(BookFile, int(file_id))
             reason = _stall_reason(row) if row is not None else None

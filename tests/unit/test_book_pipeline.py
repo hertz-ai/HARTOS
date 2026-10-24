@@ -792,16 +792,18 @@ class TestUploads:
 
 # ── A busy library: another writer holds SQLite's lock ────────────────
 
-def _impatient_sessions(monkeypatch, book_db):
-    """Sessions on the same library file that give up on a lock after 0.1 s.
-    Production gives up after 3 s (busy_timeout=3000); only the scale differs."""
+def _impatient_sessions(monkeypatch, book_db, timeout=0.1):
+    """Sessions on the same library file that give up on a lock after `timeout`.
+    Production gives up after 3 s (busy_timeout=3000); only the scale differs.
+    A test that is about the busy timeout itself passes a larger one."""
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
     from sqlalchemy.pool import NullPool
 
     from integrations.social import models
     engine = create_engine(book_db.url, poolclass=NullPool,
-                           connect_args={'check_same_thread': False, 'timeout': 0.1})
+                           connect_args={'check_same_thread': False,
+                                         'timeout': timeout})
     monkeypatch.setattr(models, '_SessionLocal',
                         sessionmaker(bind=engine, expire_on_commit=False))
 
@@ -1159,6 +1161,53 @@ class TestLockContention:
         finally:
             release.join()
         assert waited < 1.0, f"the retry's library check waited out the holder: {waited:.2f}s"
+
+    def test_a_library_read_does_not_wait_out_the_busy_timeout(
+            self, book_node, book_db, monkeypatch):
+        """Finding 2 of the 179a11815 review: one attempt is still a wait.
+
+        Taking the ladder off _record_stalled cut a read under a lock from
+        20.48 s to 3.38 s, not to nothing -- the single attempt still sat out
+        the engine's busy_timeout.  A best-effort write on a read path should
+        not wait at all, so it asks for no patience and lets the next read
+        record the stall instead.  The sessions here are given a full second
+        of patience, which the read must NOT spend.
+        """
+        _a_parse_its_lock_killed('42', 'nowait.pdf')
+        _impatient_sessions(monkeypatch, book_db, timeout=1.0)
+        release = _hold_write_lock(book_db, 2.0)
+        try:
+            started = time.monotonic()
+            books = bp.list_books('42')
+            waited = time.monotonic() - started
+        finally:
+            release.join()
+        assert books[0]['status'] == 'failed'
+        assert waited < 0.4, f"the read sat out the busy timeout: {waited:.2f}s"
+
+    def test_the_failure_record_waits_out_a_lock(
+            self, book_node, book_db, monkeypatch):
+        """_update_row's ladder, which nothing pinned until now.
+
+        _mark_failed swallows a write it cannot make ("could not record the
+        failure"), so with the ladder off _update_row a parse killed by a lock
+        loses its reason entirely and the row goes on saying 'processing' --
+        and every one of the 155 tests still passed (mutant MW1 of the
+        179a11815 review).  _record_stalled's docstring names _update_row as
+        one of the three writes that must land; this is that claim, held.
+        """
+        file_id = bp._register('42', 'record.pdf', '/tmp', '')
+        bp._update_row(file_id, status='processing')
+        _impatient_sessions(monkeypatch, book_db)
+        monkeypatch.setattr(bp, '_LOCK_RETRY_DELAYS', (0.3, 0.3, 0.3, 0.3))
+        release = _hold_write_lock(book_db, 0.7)
+        started = time.monotonic()
+        bp._mark_failed(file_id, 'the parse died on a held lock')
+        waited = time.monotonic() - started
+        release.join()
+
+        assert _stored_status(file_id) == 'failed'
+        assert waited >= 0.5, f"it never waited for the lock at all: {waited:.2f}s"
 
     def test_the_row_that_starts_a_parse_waits_out_a_lock(
             self, book_node, book_db, monkeypatch):
