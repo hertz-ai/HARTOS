@@ -692,14 +692,70 @@ class TestLifecycle:
 
         assert _stored_status(file_id) == 'completed'
 
+    def test_a_touch_really_moves_the_row_forward(self, book_node, book_db,
+                                                  monkeypatch):
+        """The touch is _update_row(file_id) with NO fields, so it rests
+        entirely on that path doing something.
+
+        `if not fields: return True` at the top of _update_row, or dropping
+        `row.updated_at = _utcnow()`, passes all 129 tests in this file
+        (MT4 and MT5 of the c5811c468 review) -- and brings the mid-parse
+        stalls back with the suite green. Counting touch CALLS cannot see
+        that, because the call is still made; only the effect is gone. This
+        back-dates the row and asserts a step moved it forward.
+        """
+        from integrations.social.models import BookFile, db_session
+
+        monkeypatch.setattr(bp, '_TOUCH_EVERY_S', 0)
+        file_id = bp._register('42', 'fresh.pdf', '/tmp', '')
+        bp._update_row(file_id, status='processing')
+        stale = bp._utcnow() - timedelta(hours=2)
+        with db_session() as db:
+            db.get(BookFile, int(file_id)).updated_at = stale
+
+        step = bp._make_step(None, file_id, '42', 'req-fresh', 'fresh.pdf', [])
+        step('page 1 of 3', 33, page_number=1)
+
+        with db_session(commit=False) as db:
+            row = db.get(BookFile, int(file_id))
+            assert row.updated_at > stale          # the touch had an effect
+            assert row.status == 'processing'      # and changed nothing else
+
+    def test_a_disk_error_filing_a_book_does_not_hand_back_the_path(
+            self, book_node, tmp_path, monkeypatch, caplog):
+        """One more route the uploads path could leave by.
+
+        driver_text falls back to str(e) for anything that is not a
+        SQLAlchemy StatementError, and OSError renders e.filename into
+        str() -- so a disk error from _register put the uploads path into
+        the agent's answer (a minor of the c5811c468 review, pre-existing;
+        measured as a composition rather than from a real run).
+        """
+        secret = str(tmp_path / 'uploads' / 'files' / 'de1f_book.pdf')
+        monkeypatch.setattr(bp, '_register', lambda *a, **k: (_ for _ in ()).throw(
+            OSError(28, 'No space left on device', secret)))
+
+        with caplog.at_level('WARNING'):
+            result = bp.parse_book(make_pdf(tmp_path / 'book.pdf'), '42')
+
+        assert result['stored'] is False
+        # Exact text: a substring check for the path is blind to the repr
+        # form OSError renders filename in.
+        assert result['store_error'] == ('this node could not file the book '
+                                         '(No space left on device)')
+        logged = [r for r in caplog.records if 'without storing it' in r.getMessage()]
+        assert logged and logged[0].exc_info is not None   # the operator keeps it
+
     def test_a_long_parse_keeps_its_record_fresh(self, book_node, tmp_path, monkeypatch):
         """_stall_reason condemns a row untouched for STALL_SECONDS, and the
         only thing keeping a long parse's row fresh is _run's periodic touch.
         Without it a parse running over 30 minutes is recorded FAILED mid-run.
 
-        Measured before this was written: _run already sets status='processing'
-        ONCE before the pages, so a test that merely sees one such write passes
-        with the touch removed.  Hence the count rather than a flag.
+        The bound is one touch per step() call, counted on the step itself
+        and recognised by a write with NO fields -- the touch does not write a
+        status any more. Two earlier versions were wrong in opposite
+        directions: "at least 2", which a single touch satisfied, and then
+        steps + 1, which REQUIRED the defect the parent commit fixed.
         """
         monkeypatch.setattr(bp, '_TOUCH_EVERY_S', 0)      # every step touches
         touches, steps = [], []

@@ -1434,6 +1434,14 @@ def parse_book(pdf_path, user_id, request_id='', log=None) -> dict:
         # it would not file this book (that review's F1).
         if isinstance(e, BookParseError):
             reason = str(e)
+        elif isinstance(e, OSError):
+            # driver_text falls back to str(e) for anything that is not a
+            # SQLAlchemy StatementError, and OSError renders e.filename into
+            # str() -- so a disk error here put the uploads path into the
+            # agent's answer. The library is not "unavailable" for one either:
+            # it is this node that could not keep the file.
+            reason = ('this node could not file the book '
+                      f'({os_error_reason(e, "no reason reported")})')
         else:
             reason = f'the book library is unavailable ({driver_text(e)})'
         # A traceback for a FAILURE, not for a refusal. Where `reason` is
