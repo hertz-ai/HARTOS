@@ -296,10 +296,11 @@ def _open(pdf_path):
         # carries the OS user's name (hartos-70, consult 2026-10-25).
         # A missing file is the only case measured here, so say so plainly
         # rather than "could not be read", which repeats the sentence it is
-        # inside (that review's F5).
-        # No advice about re-uploading: the same branch serves a link the
-        # caller named by URL, which was never uploaded by them (that
-        # review's F5). The fact is the useful part.
+        # inside (F5 of the 74b39d1a4 review).
+        # And no advice about re-uploading: the same branch serves a link the
+        # caller named by URL and never uploaded (F5 of the 30c304dac review --
+        # a different review's F5 from the one just above, which is why both
+        # are spelled out). The fact is the useful part.
         reason = e.strerror or 'the file is no longer on this node'
         raise BookParseError(f'the PDF could not be opened ({reason})') from e
 

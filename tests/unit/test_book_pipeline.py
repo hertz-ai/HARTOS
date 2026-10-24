@@ -302,6 +302,40 @@ class TestFailures:
             bp._open(bad)
         assert 'format error' in str(raised.value).lower()
 
+    def test_a_refused_account_is_not_called_an_unavailable_library(
+            self, book_node, tmp_path):
+        """parse_book reported "the book library is unavailable" for ANY
+        registration failure, so a refused account id told a person the library
+        was down while it was answering perfectly well (F1 of the 30c304dac
+        review).
+
+        01639d757 fixed that and its message claimed the change was "pinned by
+        a test that reads the message".  It was not: reverting it left 169
+        passing, which is what got that commit rejected.  This is the test the
+        claim needed.
+        """
+        result = bp.parse_book(make_pdf(tmp_path / 'book.pdf'), 'u' * 65)
+
+        assert result['stored'] is False
+        assert 'unavailable' not in result['store_error']
+        assert 'account' in result['store_error']
+
+    def test_a_missing_file_is_not_told_to_upload_it_again(
+            self, book_node, tmp_path):
+        """The same branch serves a link the caller named by URL and never
+        uploaded, so "please upload it again" is wrong advice there (F5 of the
+        30c304dac review).
+
+        Unpinned for a reason worth remembering: the test beside this one
+        asserts "no longer on this node", which was true of the OLD text too,
+        so it matched the part that did not change.  An assertion has to name
+        the thing the change removed.
+        """
+        with pytest.raises(bp.BookParseError) as raised:
+            bp._open(tmp_path / 'gone.pdf')
+
+        assert 'upload' not in str(raised.value).lower()
+
     def test_a_password_protected_pdf_says_so(self, book_node, tmp_path):
         book = self._fails(make_encrypted_pdf(tmp_path / 'locked.pdf'), 'password-protected')
         assert 'password-protected' in book['error']
