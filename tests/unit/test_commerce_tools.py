@@ -161,19 +161,24 @@ class _NotJson:
         raise ValueError('not json')
 
 
-def unreadable_order_answers(fake):
+def signed_order_answers(fake, make_resp):
     """The transport with every signed order call (POST /cart/checkout/ap2
     carrying an attestation: the order call and the probe alike) answered
-    200 and unreadable, everything else by ``fake``.  The call is still
+    by ``make_resp()``, everything else by ``fake``.  The call is still
     recorded on the fake."""
     def transport(method, url, **kw):
         path = url[len(BASE):] if url.startswith(BASE) else url
         if (method, path) == ('POST', AP2) and \
                 signing.MANDATE_HEADER in (kw.get('headers') or {}):
             fake.calls.append((method, path, kw))
-            return _NotJson()
+            return make_resp()
         return fake(method, url, **kw)
     return transport
+
+
+def unreadable_order_answers(fake):
+    """signed_order_answers with a 200 this node cannot read."""
+    return signed_order_answers(fake, _NotJson)
 
 
 def claims_of(token: str):
@@ -1890,6 +1895,67 @@ class TestHeldPayments:
         env['fake'].on('GET', '/cart', *CART_GONE)
         later = json.loads(ct.commerce_checkout(UID, out['mandate_id']))
         assert later['success'] is True and later['order_id'] == 'ORD-UNREAD'
+
+    def test_an_order_call_answered_with_an_empty_body_is_could_not_confirm(self, env):
+        # F2 (the 2xx shapes hartos-f3's reviewer set out to probe, agreed
+        # with hartos-70): a 200 with an empty body came out of the client
+        # as success with data None, and _order_placed answered "ordered"
+        # with order_id None, recording nothing and pushing a tracking card
+        # with no number.  The order contract is 200 {"orderNumber"}: a
+        # success naming no order is unconfirmed, so could-not-confirm,
+        # the owner checks McGroce first, the mandate is marked, one call.
+        out = self._paid_on_phonepe(env)
+        env['fake'].on('POST', AP2, status=200, body=None)
+        res = ct.complete_redirect_checkout(out['payment_id'])
+        assert res['success'] is False and res['needs_attention'] is True
+        assert len(env['fake'].called('POST', AP2)) == 1
+        assert pushed(env, 'order_tracking') == []                 # never "ordered"
+        assert pushed(env, 'notification')[-1]['message'] == self.UNCONFIRMED
+        assert 'Check McGroce' in owner_cards(env)[-1]['message']
+        rec = env['mandates'].get(out['mandate_id'])
+        assert rec.order_ref is None and rec.order_sent is not None
+
+    def test_an_order_call_answered_with_json_naming_no_order_is_could_not_confirm(self, env):
+        out = self._paid_on_phonepe(env)
+        env['fake'].on('POST', AP2, body={'status': 'SUBMITTED'})
+        res = ct.complete_redirect_checkout(out['payment_id'])
+        assert res['success'] is False and res['needs_attention'] is True
+        assert len(env['fake'].called('POST', AP2)) == 1
+        assert pushed(env, 'order_tracking') == []
+        assert pushed(env, 'notification')[-1]['message'] == self.UNCONFIRMED
+        assert 'Check McGroce' in owner_cards(env)[-1]['message']
+        rec = env['mandates'].get(out['mandate_id'])
+        assert rec.order_ref is None and rec.order_sent is not None
+
+    def test_a_probe_answered_with_json_naming_no_order_means_the_order_exists(self, env):
+        out = self._paid_on_phonepe(env)
+        drifted = json.loads(json.dumps(ORDER))
+        drifted['orderItems'].pop()
+        env['fake'].on('GET', '/cart', body=drifted)
+        fake = env['fake']
+        with patch('core.http_pool.pooled_request',
+                   side_effect=signed_order_answers(fake, lambda: _Resp(200, {}))):
+            res = ct.complete_redirect_checkout(out['payment_id'])
+        assert res['success'] is False and 'cart_changed' not in res
+        assert len(fake.called('POST', AP2)) == 1                  # the probe, once
+        assert pushed(env, 'order_tracking') == []
+        assert pushed(env, 'notification')[-1]['message'] == self.UNCONFIRMED
+        assert 'Check McGroce' in owner_cards(env)[-1]['message']
+        assert env['mandates'].get(out['mandate_id']).order_sent is not None
+        fake.placed[out['mandate_id']] = 'ORD-LATER'
+        later = json.loads(ct.commerce_checkout(UID, out['mandate_id']))
+        assert later['success'] is True and later['order_id'] == 'ORD-LATER'
+
+    def test_an_order_call_answered_with_only_an_id_is_placed(self, env):
+        # hartos-70's point: the check must not be stricter than the reader;
+        # an older McGroce names the order by id alone.
+        out = self._paid_on_phonepe(env)
+        env['fake'].on('POST', AP2, body={'id': 'ORD-ID'})
+        res = ct.complete_redirect_checkout(out['payment_id'])
+        assert res['success'] is True and res['order_id'] == 'ORD-ID'
+        assert pushed(env, 'order_tracking')[-1]['order_id'] == 'ORD-ID'
+        assert env['mandates'].get(out['mandate_id']).order_ref == 'ORD-ID'
+        assert owner_cards(env) == []
 
     # ── the mark, on every later hold ────────────────────────────────────
 

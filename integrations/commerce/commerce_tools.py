@@ -1117,8 +1117,12 @@ def _order_placed(user_id, m, placed) -> Dict[str, Any]:
     and never a raise, which turned a placed order into a failure answer
     with no tracking and nobody told.  The record's failure is logged for
     a person; the next retry's probe finds the same order at McGroce."""
+    from integrations.commerce.mcgroce_client import order_number_of
     order = placed['data'] or {}
-    order_id = order.get('orderNumber') or order.get('id')
+    # The one reader the client's success check uses: an answer that
+    # reaches here names an order (complete_ap2_checkout answers one that
+    # names none as unconfirmed).
+    order_id = order_number_of(order)
     status = order.get('status') or 'SUBMITTED'
     if order_id:
         try:

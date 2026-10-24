@@ -63,6 +63,21 @@ def _err(error: str, status: Optional[int] = None,
     return out
 
 
+def order_number_of(data) -> Optional[Any]:
+    """The order an AP2 checkout answer names (COMMERCE_MCGROCE.md's order
+    contract: 200 {"orderNumber": ...}; an older McGroce's {"id": ...}
+    too), or None when it names none: no body, not an object, neither key,
+    or an empty one.  The ONE reader for the client's success check and
+    commerce_tools._order_placed, so the two can never disagree."""
+    if not isinstance(data, dict):
+        return None
+    for key in ('orderNumber', 'id'):
+        value = data.get(key)
+        if value not in (None, ''):
+            return value
+    return None
+
+
 def _seg(value) -> str:
     """One URL path segment -- quoted so an argument can never add a path."""
     return quote(str(value).strip(), safe='')
@@ -271,10 +286,19 @@ class McGroceClient:
         unexpired, never used before -- and records the payment and submits
         the order in one step.  The two raw calls this replaced
         (POST /cart/checkout/payment, then POST /cart/checkout) let any
-        caller mark a cart paid, and McGroce could verify neither."""
+        caller mark a cart paid, and McGroce could verify neither.
+        The answer names the order (order_number_of): a success that
+        names none (an empty body, a wrapper without the keys) breaks the
+        order contract and is never a legitimate success, so it is
+        answered as ``unconfirmed`` with its 2xx status, like a body this
+        node cannot read at all."""
         from integrations.commerce.signing import MANDATE_HEADER
-        return self.site(user_id, 'POST', '/cart/checkout/ap2',
-                         extra_headers={MANDATE_HEADER: attestation})
+        res = self.site(user_id, 'POST', '/cart/checkout/ap2',
+                        extra_headers={MANDATE_HEADER: attestation})
+        if res['success'] and order_number_of(res.get('data')) is None:
+            return _err('McGroce answered without an order number', res['status'],
+                        unconfirmed=True)
+        return res
 
     def agent_orders_ready(self, user_id) -> Optional[str]:
         """None when this McGroce places agent orders, else why not.

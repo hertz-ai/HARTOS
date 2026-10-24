@@ -205,6 +205,29 @@ class TestFailures:
         # nor refused, with the 2xx status telling it apart from a 5xx.
         assert out['unconfirmed'] is True and out['status'] == 200
 
+    def test_an_ap2_success_that_names_no_order_is_unconfirmed(self, client):
+        # COMMERCE_MCGROCE.md's order contract is 200 {"orderNumber": ...}:
+        # a success without it (an empty body, a wrapper without the keys,
+        # an empty number) is never a legitimate success.  McGroce did
+        # something this node cannot read, so the caller takes it as
+        # unconfirmed, with the 2xx status telling it apart from a 5xx.
+        for body in (None, {}, {'orderNumber': ''}, {'status': 'SUBMITTED'}):
+            with patch('core.http_pool.pooled_request', return_value=_Resp(200, body)):
+                out = client.complete_ap2_checkout(hartos_user_id(4242), 'tok')
+            assert out['success'] is False and out['unconfirmed'] is True, body
+            assert out['status'] == 200 and 'without an order number' in out['error']
+
+    def test_an_ap2_success_with_only_an_id_is_placed(self, client):
+        # The check must not be stricter than the reader _order_placed
+        # uses: an older McGroce names the order by id alone.
+        from integrations.commerce.mcgroce_client import order_number_of
+        with patch('core.http_pool.pooled_request', return_value=_Resp(200, {'id': 'ORD-ID'})):
+            out = client.complete_ap2_checkout(hartos_user_id(4242), 'tok')
+        assert out['success'] is True and out['data'] == {'id': 'ORD-ID'}
+        assert order_number_of(out['data']) == 'ORD-ID'
+        assert order_number_of({'orderNumber': 'N1', 'id': 7}) == 'N1'
+        assert order_number_of(['N1']) is None and order_number_of(None) is None
+
 
 class TestBindings:
     def test_ids_are_namespaced_file_safe_and_stable(self):
