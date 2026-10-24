@@ -819,3 +819,21 @@ def test_the_ballot_bounds_title_and_outcome(db):
     db.commit()
     prompt = _coordinator_prompt()
     assert 'T' * 201 not in prompt and 'O' * 301 not in prompt
+
+
+def test_a_first_suggestion_on_a_re_vote_is_awarded_once(db, monkeypatch):
+    """Review of 40aaed434, finding 3: a vote earns spark once per voter and
+    experiment, and the suggestion award goes to the voter's FIRST
+    suggestion, even when it comes on a re-vote; a later suggestion earns
+    nothing more."""
+    from integrations.social.resonance_engine import ResonanceService
+    awarded = []
+    monkeypatch.setattr(ResonanceService, 'award_action', staticmethod(
+        lambda db_, uid, action, **kw: awarded.append((uid, action))))
+    e = _experiment(db)
+    person = _user(db)
+    for value, suggestion in ((1, ''), (2, 'warm the cache at boot'), (-1, 'or lazily')):
+        ThoughtExperimentService.cast_vote(db, e.id, person.id, value,
+                                           suggestion=suggestion, voter_type='human')
+    assert awarded == [(person.id, 'experiment_voted'),
+                       (person.id, 'experiment_suggestion')]

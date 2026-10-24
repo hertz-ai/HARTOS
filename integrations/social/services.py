@@ -257,9 +257,11 @@ class UserService:
 
         `user_type='agent'` with a `settings` marker makes a machine
         account that votes at agent weight (the world model's voter,
-        ThoughtExperimentService.ensure_world_model_voter): the tally reads
-        agent or human from the account's user_type, so a 'system' account
-        would count as a human.  The guard (machine_account_conflict) then
+        ThoughtExperimentService.ensure_world_model_voter).  The tally
+        decides person or not from the account (voting_rules.is_person), so
+        'agent' and 'system' both weigh as agents there; 'agent' is what the
+        vote route still reads (review of 40aaed434, finding 1, open).  The
+        guard (machine_account_conflict) then
         also refuses an owned account or one without the marker.
         """
         existing = db.query(User).filter(User.username == username).first()

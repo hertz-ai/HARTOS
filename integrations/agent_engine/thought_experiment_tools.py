@@ -68,17 +68,19 @@ def cast_experiment_vote(experiment_id: str, voter_id: str,
     AN AUTONOMOUS TURN VOTES ONLY AS ITS NODE (owner ruling 2026-10-21; the
     review of 5fd160d92 measured the daemon rotating the coordinator across
     personas owned by different people and approving with no person
-    acting).  A turn whose user is an agent or system account, or the
-    node's own service identity (core.constants.SYSTEM_IDENTITIES: the
-    native and Tier-2 dispatch paths run as 'system_daemon'), is the node
-    acting, so its vote counts only if the voting agent's identity is this node's
+    acting).  A turn whose request is a daemon dispatch (dispatch.
+    is_current_request_autonomous: a 'daemon_<goal>' request id, also when
+    the daemon runs it as a person), or whose user is an agent or system
+    account, or the node's own service identity (core.constants.
+    SYSTEM_IDENTITIES: the native and Tier-2 dispatch paths run as
+    'system_daemon'), is the node acting, so its vote counts only if the voting agent's identity is this node's
     (voting_rules.voter_identity == node_identity); an agent that counts as
     some person is refused there, since that person did not act.  Such a
     vote earns no spark (a machine vote is not a contribution, as the world
     model's).  On a person's own turn the agent it names votes as before
     and counts as the person at the root of its owner chain; a turn whose
     user has no row here (the desktop's guest id, an unregistered caller)
-    stays a person's turn, as it was.
+    stays a person's turn unless its request is a daemon dispatch.
 
     The vote is recorded under the agent's row as an agent vote, whatever
     ``voter_type`` says (kept in the signature for existing callers, and

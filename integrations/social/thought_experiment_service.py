@@ -488,6 +488,9 @@ class ThoughtExperimentService:
         ).first()
 
         created = existing is None
+        # read before the overwrite below: is this the voter's first suggestion?
+        first_suggestion = bool(suggestion) and not (existing is not None
+                                                     and existing.suggestion)
         if existing:
             existing.vote_value = vote_value
             existing.reasoning = reasoning
@@ -514,14 +517,18 @@ class ThoughtExperimentService:
         # Award spark for voting (not for a machine vote: the world model's
         # votes pass award=False; review of 9ca2be81a measured 60 spark for 6),
         # once per voter and experiment: a changed vote earns nothing more
-        # (review of 81c34a0ae: 4 re-votes minted 4 awards).
-        if award and created:
+        # (review of 81c34a0ae: 4 re-votes minted 4 awards).  The suggestion
+        # award goes to the voter's FIRST suggestion, on whichever vote it
+        # comes (review of 40aaed434: tying it to the first vote left a
+        # suggestion added on a re-vote unpaid).
+        if award and (created or first_suggestion):
             try:
                 from .resonance_engine import ResonanceService
-                ResonanceService.award_action(
-                    db, voter_id, 'experiment_voted',
-                    source_id=experiment_id)
-                if suggestion:
+                if created:
+                    ResonanceService.award_action(
+                        db, voter_id, 'experiment_voted',
+                        source_id=experiment_id)
+                if first_suggestion:
                     ResonanceService.award_action(
                         db, voter_id, 'experiment_suggestion',
                         source_id=experiment_id)

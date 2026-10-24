@@ -167,7 +167,8 @@ def one_vote_per_identity(ballots):
 
     ``ballots``: iterable of dicts {'identity', 'own', 'value', 'weight'},
     one per vote row; ``own`` is True for the identity's PERSON voting as
-    themself (never for an agent or a system account: is_person).  Returns {identity: (value, weight)}:
+    themself (never for an agent or a system account: is_person).
+    Returns {identity: (value, weight)}:
       - the human's own vote when they cast one (their agents are advisory);
       - otherwise the majority side of that identity's votes (FOR vs
         AGAINST), its value and weight the mean of that side's;
