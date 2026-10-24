@@ -187,8 +187,10 @@ def get_engine():
 
             # Enable WAL mode for file-based SQLite
             # WAL allows concurrent reads + one writer without blocking readers.
-            # busy_timeout=3000 (3s) — fail fast rather than blocking daemon threads
-            # for 15-30s which triggers watchdog restarts.
+            # The patience is SQLITE_BUSY_TIMEOUT_MS, which this hook and
+            # book_pipeline._restore_patience both read: fail fast rather than
+            # blocking daemon threads for 15-30s, which trips watchdog
+            # restarts. Not repeated as a number here -- the constant owns it.
             #
             # NullPool means every checkout creates a fresh connection, so
             # this hook fires per-checkout, not per-engine.  Combining the

@@ -965,8 +965,6 @@ def _record_stalled(file_ids) -> None:
     The patient ladder stays where a write must land: _register, _update_row
     (so _mark_failed keeps it) and _save.
     """
-    from sqlalchemy import text
-
     from integrations.social.models import BookFile, db_session
     with db_session() as db:
         # Best-effort means not waiting, either.  Dropping the ladder left one
