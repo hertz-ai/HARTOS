@@ -883,6 +883,7 @@ def test_only_a_real_score_re_arms_the_warning(offline, monkeypatch):
         assert b.score_claim(context='h', outcome='o', timestamp=1.0, creator_id='u1') is None
         assert world_model_bridge._WARNED_422_CONTRACT is True
 
+
 def test_a_logged_refusal_reason_is_bounded(db, caplog):
     """what: a reply whose refusal reason is a megabyte; expected: the round
     logs a bounded line."""

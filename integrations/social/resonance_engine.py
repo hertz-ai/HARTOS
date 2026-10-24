@@ -238,6 +238,26 @@ class ResonanceService:
         return result
 
     @staticmethod
+    def award_action_once(db: Session, user_id: str, action: str,
+                          source_id: str) -> Dict:
+        """award_action at most once per (user, action, source): the ledger
+        entry IS the record (as hive_contest registers a participant), so no
+        sequence of calls pays the same action for the same source twice.
+        Returns {} when it was already paid.  (Review of 5637595de: a flag
+        read from the vote row was reset by clearing the suggestion, and 50
+        clear-and-re-add cycles minted 51 suggestion awards.)"""
+        from .models import ResonanceTransaction
+        paid = db.query(ResonanceTransaction.id).filter(
+            ResonanceTransaction.user_id == user_id,
+            ResonanceTransaction.source_type == action,
+            ResonanceTransaction.source_id == source_id,
+        ).first()
+        if paid is not None:
+            return {}
+        return ResonanceService.award_action(db, user_id, action,
+                                             source_id=source_id)
+
+    @staticmethod
     def award(db: Session, user_id: str, action: str, amount: int,
               reason: str = '') -> Dict:
         """Generic award entry point for action-based rewards.

@@ -776,7 +776,8 @@ class WorldModelBridge:
         or None when the WORLD MODEL cannot answer now (503 while a learn
         holds the learner, any other 4xx such as 404 from a build without
         the route or 429 from a rate limiter, 5xx, a network failure, a
-        reply that is not JSON, the breaker open), so the caller stops
+        reply that is not JSON, a 200 that is not a score, the breaker
+        open), so the caller stops
         asking until later.  `timestamp` is the
         experiment's own time in UTC epoch seconds, so the vote does not
         change with the hour. reality_grounded matches how the decide feed's

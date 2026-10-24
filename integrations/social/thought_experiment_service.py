@@ -323,7 +323,8 @@ class ThoughtExperimentService:
         candidates are taken least-attempted first, so one that keeps
         abstaining sinks behind fresh ones.
         A world model that cannot answer now (score_claim returns None:
-        busy, unreachable, a 5xx, a reply that is not JSON) ends the round at
+        busy, unreachable, a 5xx, a reply that is not JSON, a 200 that is not
+        a score) ends the round at
         its first such reply, so a down world model costs one call per round,
         not one per experiment.  A claim it cannot score (refused by the
         screen, no cloud consent, blank as sent, the route's 422) is an
@@ -487,10 +488,6 @@ class ThoughtExperimentService:
             voter_id=voter_id,
         ).first()
 
-        created = existing is None
-        # read before the overwrite below: is this the voter's first suggestion?
-        first_suggestion = bool(suggestion) and not (existing is not None
-                                                     and existing.suggestion)
         if existing:
             existing.vote_value = vote_value
             existing.reasoning = reasoning
@@ -516,22 +513,20 @@ class ThoughtExperimentService:
 
         # Award spark for voting (not for a machine vote: the world model's
         # votes pass award=False; review of 9ca2be81a measured 60 spark for 6),
-        # once per voter and experiment: a changed vote earns nothing more
-        # (review of 81c34a0ae: 4 re-votes minted 4 awards).  The suggestion
-        # award goes to the voter's FIRST suggestion, on whichever vote it
-        # comes (review of 40aaed434: tying it to the first vote left a
-        # suggestion added on a re-vote unpaid).
-        if award and (created or first_suggestion):
+        # once per voter and experiment, and the suggestion award once too,
+        # on whichever vote the first suggestion comes: both read from the
+        # ledger (ResonanceService.award_action_once), never from the vote
+        # row, which every re-vote rewrites (reviews of 81c34a0ae: 4 re-votes
+        # minted 4 awards; of 40aaed434: a suggestion added on a re-vote went
+        # unpaid; of 5637595de: clearing and re-adding one paid it again).
+        if award:
             try:
                 from .resonance_engine import ResonanceService
-                if created:
-                    ResonanceService.award_action(
-                        db, voter_id, 'experiment_voted',
-                        source_id=experiment_id)
-                if first_suggestion:
-                    ResonanceService.award_action(
-                        db, voter_id, 'experiment_suggestion',
-                        source_id=experiment_id)
+                ResonanceService.award_action_once(
+                    db, voter_id, 'experiment_voted', experiment_id)
+                if suggestion:
+                    ResonanceService.award_action_once(
+                        db, voter_id, 'experiment_suggestion', experiment_id)
             except Exception:
                 pass
 

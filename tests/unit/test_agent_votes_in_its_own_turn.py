@@ -799,17 +799,22 @@ def test_a_daemon_request_with_no_user_row_is_autonomous(db, turn, monkeypatch):
     assert out.get('reason') == 'autonomous_turn_votes_only_as_its_node', out
 
 
-def test_a_changed_vote_earns_no_more_spark(db, turn, monkeypatch):
-    from integrations.social.resonance_engine import ResonanceService
-    awarded = []
-    monkeypatch.setattr(ResonanceService, 'award_action', staticmethod(
-        lambda db_, uid, action, **kw: awarded.append((uid, action))))
+def _spark_awards(db, user_id):
+    """The real ledger: the spark rows paid to this user, by action."""
+    from integrations.social.models import ResonanceTransaction
+    db.expire_all()
+    return sorted(r.source_type for r in db.query(ResonanceTransaction).filter(
+        ResonanceTransaction.user_id == user_id,
+        ResonanceTransaction.currency == 'spark').all())
+
+
+def test_a_changed_vote_earns_no_more_spark(db, turn):
     e = _experiment(db)
     owner = _user(db)
-    _user(db, 'agent', owner_id=owner.id, agent_id='98888888888')
+    agent = _user(db, 'agent', owner_id=owner.id, agent_id='98888888888')
     for value in (1, -1, 2, -2):
         assert _vote_as(turn, owner.id, '98888888888', e.id, vote_value=value)['success']
-    assert len(awarded) == 1
+    assert _spark_awards(db, agent.id) == ['experiment_voted']
 
 
 def test_the_ballot_bounds_title_and_outcome(db):
@@ -821,19 +826,41 @@ def test_the_ballot_bounds_title_and_outcome(db):
     assert 'T' * 201 not in prompt and 'O' * 301 not in prompt
 
 
-def test_a_first_suggestion_on_a_re_vote_is_awarded_once(db, monkeypatch):
+def test_a_first_suggestion_on_a_re_vote_is_awarded_once(db):
     """Review of 40aaed434, finding 3: a vote earns spark once per voter and
-    experiment, and the suggestion award goes to the voter's FIRST
+    experiment, and the suggestion award goes to the voter's first
     suggestion, even when it comes on a re-vote; a later suggestion earns
     nothing more."""
-    from integrations.social.resonance_engine import ResonanceService
-    awarded = []
-    monkeypatch.setattr(ResonanceService, 'award_action', staticmethod(
-        lambda db_, uid, action, **kw: awarded.append((uid, action))))
     e = _experiment(db)
     person = _user(db)
     for value, suggestion in ((1, ''), (2, 'warm the cache at boot'), (-1, 'or lazily')):
         ThoughtExperimentService.cast_vote(db, e.id, person.id, value,
                                            suggestion=suggestion, voter_type='human')
-    assert awarded == [(person.id, 'experiment_voted'),
-                       (person.id, 'experiment_suggestion')]
+    assert _spark_awards(db, person.id) == ['experiment_suggestion', 'experiment_voted']
+
+
+def test_clearing_and_re_adding_a_suggestion_mints_nothing(db):
+    """Review of 5637595de (critical): a suggestion, then none, then a new
+    one, fifty times over, through cast_vote: still one vote award and one
+    suggestion award, read from the ledger."""
+    e = _experiment(db)
+    person = _user(db)
+    ThoughtExperimentService.cast_vote(db, e.id, person.id, 1, suggestion='A',
+                                       voter_type='human')
+    for i in range(50):
+        for suggestion in ('', 'B%d' % i):
+            ThoughtExperimentService.cast_vote(db, e.id, person.id, 1,
+                                               suggestion=suggestion, voter_type='human')
+    assert _spark_awards(db, person.id) == ['experiment_suggestion', 'experiment_voted']
+
+
+def test_an_action_is_paid_once_per_user_and_source(db):
+    """ResonanceService.award_action_once, directly: a second call for the
+    same (user, action, source) pays nothing; another source still pays."""
+    from integrations.social.resonance_engine import ResonanceService
+    person = _user(db)
+    assert ResonanceService.award_action_once(db, person.id, 'experiment_voted', 'exp-1')
+    assert ResonanceService.award_action_once(db, person.id, 'experiment_voted', 'exp-1') == {}
+    assert ResonanceService.award_action_once(db, person.id, 'experiment_voted', 'exp-2')
+    db.commit()
+    assert _spark_awards(db, person.id) == ['experiment_voted', 'experiment_voted']

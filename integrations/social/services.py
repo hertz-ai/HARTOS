@@ -259,9 +259,8 @@ class UserService:
         account that votes at agent weight (the world model's voter,
         ThoughtExperimentService.ensure_world_model_voter).  The tally
         decides person or not from the account (voting_rules.is_person), so
-        'agent' and 'system' both weigh as agents there; 'agent' is what the
-        vote route still reads (review of 40aaed434, finding 1, open).  The
-        guard (machine_account_conflict) then
+        'agent' and 'system' both weigh as agents there and at the vote
+        route (3cfae2005).  The guard (machine_account_conflict) then
         also refuses an owned account or one without the marker.
         """
         existing = db.query(User).filter(User.username == username).first()
