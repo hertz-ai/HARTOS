@@ -243,6 +243,76 @@ class TestFailures:
         assert 'Acceleration is the rate of change of velocity.' in result['whole_text']
         assert bp.list_books('42') == []
 
+    def _db_error(self, statement, params, message='disk I/O error'):
+        """A real SQLAlchemy failure: str() renders the statement and the
+        parameters into it, which is the whole of this defect."""
+        from sqlalchemy.exc import OperationalError
+        return OperationalError(statement, params, sqlite3.OperationalError(message))
+
+    def test_a_save_that_fails_does_not_hand_back_the_statement(
+            self, book_node, tmp_path, monkeypatch):
+        """The person's copy of a non-lock database failure.
+
+        A held lock has been answered safely since 2026-10-18, but that fix
+        sorted failures by transience and left the rendering alone: anything
+        NOT a lock still took the else branch and printed the statement. For
+        _save the parameters are the executemany payload -- the book's own
+        page text -- and this node really did raise 'disk I/O error' all
+        afternoon on 2026-10-22, with the disk at zero bytes free.
+        """
+        boom = self._db_error('DELETE FROM page_layouts WHERE file_id = ?',
+                              {'passage': "a page of the book's own text"})
+        monkeypatch.setattr(bp, '_save', MagicMock(side_effect=boom))
+
+        result = bp.parse_book(make_pdf(tmp_path / 'book.pdf'), '42')
+
+        said = result['store_error']
+        assert result['stored'] is False
+        assert said != bp._BUSY_NOT_SAVED, 'a disk error is not the library being busy'
+        assert 'disk I/O error' in said, 'the person is still told what went wrong'
+        assert '[SQL:' not in said and '[parameters:' not in said, said
+        assert 'page_layouts' not in said and 'own text' not in said, said
+
+    def test_a_library_that_cannot_be_reached_does_not_hand_back_the_path(
+            self, book_node, tmp_path, monkeypatch):
+        """parse_book's registration boundary (hartos-94's M1).
+
+        _register's parameters carry the uploads directory, so the rendered
+        statement hands a server path to whoever reads the agent's progress.
+        """
+        boom = self._db_error(
+            'INSERT INTO pdf_files (user_id, filename, directory) VALUES (?, ?, ?)',
+            {'directory': r'C:\Users\sathi\Documents\Nunba\uploads\pdf_parse'})
+        monkeypatch.setattr(bp, '_register', MagicMock(side_effect=boom))
+
+        result = bp.parse_book(make_pdf(tmp_path / 'book.pdf'), '42')
+
+        said = result['store_error']
+        assert result['stored'] is False and 'unavailable' in said
+        assert 'disk I/O error' in said
+        assert '[SQL:' not in said and '[parameters:' not in said, said
+        assert 'Documents' not in said and 'pdf_files' not in said, said
+        assert 'Acceleration is the rate of change of velocity.' in result['whole_text']
+
+    def test_a_background_parse_does_not_put_the_statement_in_its_job(
+            self, book_node, tmp_path, monkeypatch):
+        """The same leak on the route a person can poll.
+
+        The text measured on 2026-10-18 and quoted beside _BUSY_NOT_SAVED
+        was built here, by 'unexpected error: {e}'. The lock half of that
+        line was closed; this is the half that was left.
+        """
+        boom = self._db_error('SELECT pdf_files.file_id FROM pdf_files', {'file_id': 1})
+        monkeypatch.setattr(bp, '_parse', MagicMock(side_effect=boom))
+
+        started = bp.start_parse(make_pdf(tmp_path / 'book.pdf'), '42')
+        job = _wait_for_job(started['job_id'])
+
+        assert job['status'] == 'failed'
+        assert 'disk I/O error' in job['error']
+        assert '[SQL:' not in job['error'] and '[parameters:' not in job['error']
+        assert _row(started['file_id'])['error'] == job['error']
+
     def test_a_row_that_cannot_be_marked_processing_does_not_fail_the_book(
             self, book_node, tmp_path, monkeypatch):
         real_update, calls = bp._update_row, []
@@ -811,11 +881,6 @@ class TestLockContention:
         belonging to a different book, and the person polled a stranger's
         failure.  Measured by the 1faa4b6a0 review.
         """
-        # _jobs outlives a test database, so an earlier test's job for this
-        # same book would answer here and hide what is being pinned.
-        with bp._jobs_lock:
-            bp._jobs.clear()
-
         file_id = bp._register('42', 'book.pdf', '/tmp', '')
         bp._update_row(file_id, status='completed')
         stale = bp._new_job(file_id, '42', '', 'other.pdf')   # the reset shape
@@ -937,6 +1002,50 @@ class TestLockContention:
 
 
 # ── Two parses at once: PDFium is not thread-safe ─────────────────────
+
+    def test_the_insert_waits_out_a_lock_another_writer_really_holds(
+            self, book_node, book_db, monkeypatch):
+        """The same ladder, measured against SQLite rather than a stub.
+
+        The test above counts calls to a db_session that raises, so it
+        proves _register retries -- not that the ladder outlasts a lock a
+        second writer is really holding.  Here one does: BEGIN IMMEDIATE
+        for 0.7s while sessions give up after 0.1s, so only a working
+        ladder can come back with an id.  The shape hartos-94's reviewer
+        asked for, after cc66abd80 passed 138 tests with the insert
+        undecorated and only a __wrapped__ assertion to catch it.
+        """
+        _impatient_sessions(monkeypatch, book_db)
+        monkeypatch.setattr(bp, '_LOCK_RETRY_DELAYS', (0.3, 0.3, 0.3, 0.3))
+        release = _hold_write_lock(book_db, 0.7)
+        started = time.time()
+        try:
+            file_id = bp._register('42', 'held.pdf', '/tmp', '')
+        finally:
+            release.join()
+        waited = time.time() - started
+
+        assert isinstance(file_id, int) and file_id > 0
+        assert waited >= 0.6, f'it never waited for the lock ({waited:.2f}s)'
+        assert bp._existing('42', 'held.pdf') is not None
+
+    def test_a_long_reader_does_not_hide_a_dead_parse(self, book_node, book_db):
+        """The reader half of the key, which the name half leaves unpinned.
+
+        _book_key clips BOTH columns and the job has to store both clipped,
+        or a dead parse cannot be matched to its book.  Reverting only the
+        user_id half of that fix passed all 138 tests (hartos-94's review of
+        cc66abd80): the long-name test above cannot see it, because its
+        reader is '42' either way.
+        """
+        reader = 'r' * 70                                # the column holds 64
+        file_id = bp._register(reader, 'book.pdf', '/tmp', '')
+        bp._update_row(file_id, status='processing')
+        job = bp._new_job(file_id, reader, '', 'book.pdf')
+        bp._update_job(job, status='failed', error=bp._BUSY_NOT_SAVED)
+
+        assert bp._existing(reader, 'book.pdf') is None
+
 
 class TestConcurrency:
 

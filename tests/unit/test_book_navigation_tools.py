@@ -316,6 +316,32 @@ class ParseBookPdf(unittest.TestCase):
         out, _ = self._parse('/uploads/files/abc_book.pdf', error=RuntimeError('db locked'))
         self.assertIn('Could not start PDF parsing', out)
 
+    def test_a_failure_to_start_does_not_hand_the_agent_the_statement(self):
+        """What this tool returns becomes part of a model's prompt.
+
+        SQLAlchemy renders [SQL: ...] and [parameters: ...] into a
+        StatementError, and _register's parameters carry the uploads
+        directory. The prefix assertion above passes either way, which is
+        why this went unnoticed; hartos-70's register reads an agent's tool
+        output as data leaving the device (H-0715, H-1015), because the
+        model answering the turn can be a cloud one.
+        """
+        import sqlite3
+        from sqlalchemy.exc import OperationalError
+        boom = OperationalError(
+            'INSERT INTO pdf_files (user_id, filename, directory) VALUES (?, ?, ?)',
+            {'directory': r'C:\Users\sathi\Documents\Nunba\uploads\pdf_parse'},
+            sqlite3.OperationalError('disk I/O error'))
+
+        out, _ = self._parse('/uploads/files/abc_book.pdf', error=boom)
+
+        self.assertIn('Could not start PDF parsing', out)
+        self.assertIn('disk I/O error', out)      # the person still learns what broke
+        self.assertNotIn('[SQL:', out)
+        self.assertNotIn('[parameters:', out)
+        self.assertNotIn('Documents', out)
+        self.assertNotIn('pdf_files', out)
+
 
 class PublisherCarriesTheImage(unittest.TestCase):
     """The shared publisher change: page_image_url was an unconditional ''."""

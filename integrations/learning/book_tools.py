@@ -349,7 +349,11 @@ def build_book_tools(ctx) -> List[Tuple[str, str, Any]]:
             started = bp.start_parse(path, user_id)
         except Exception as e:
             logger.warning("parse_book_pdf could not start for %s: %s", file_url, e)
-            return f'Could not start PDF parsing: {e}'
+            # The agent's answer goes into a model's prompt, and that model can
+            # be a cloud one, so this copy drops the driver's rendered [SQL:]
+            # and [parameters:] -- for a registration those carry the uploads
+            # directory. The warning above still has them (H-0715).
+            return f'Could not start PDF parsing: {bp.driver_text(e)}'
         if started.get('status') == 'completed':
             return json.dumps({
                 'status': 'completed',

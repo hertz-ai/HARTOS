@@ -626,6 +626,45 @@ def is_lock_error(exc) -> bool:
     return any(m in text for m in _LOCK_ERRORS)
 
 
+def driver_text(exc) -> str:
+    """The driver's own words for ``exc``, safe to repeat to a person.
+
+    is_lock_error's companion: that one reads ``.orig`` to decide whether a
+    failure is transient, this one reads it to decide what may be said out
+    loud. It is ``StatementError.__str__`` that appends ``[SQL: ...]`` and
+    ``[parameters: ...]``, so only that class is unwrapped -- every other
+    exception already says only what it was given.
+
+    The lock half of this was closed on 2026-10-18 by routing locks to
+    _BUSY_NOT_SAVED (see the comment below for the leak measured then). The
+    rest stayed open: classifying by transience left the RENDERING of
+    everything else untouched, and a ``disk I/O error`` is not a lock, so it
+    took the ``else`` branch and printed the statement in full. That error is
+    not hypothetical here -- this node raised it from 16:26 to 17:37 on
+    2026-10-22, with the disk at zero bytes free.
+
+    The operator loses nothing: the ``logger.exception`` beside each caller
+    still records the rendered statement and the traceback.
+
+    Public, and deliberately here rather than in a shared module: every
+    caller today is inside ``integrations/learning`` (the three boundaries
+    below and ``book_tools.parse_book_pdf``), so a shared home would have one
+    family of users. If a caller outside books ever needs it, is_lock_error
+    and this move together to sit beside ``db_session`` -- in one step, never
+    as a second copy (hartos-70, register consult 2026-10-24, H-0715).
+    """
+    from sqlalchemy.exc import StatementError
+    if not isinstance(exc, StatementError):
+        return str(exc)
+    # .orig is None for a StatementError raised with no driver error under it;
+    # falling back to str(exc) there would bring the statement straight back.
+    try:
+        return str(exc.orig) if exc.orig is not None else exc.__class__.__name__
+    except Exception as unreadable:
+        logger.debug("book library: a driver error could not be read (%r)", unreadable)
+        return exc.__class__.__name__
+
+
 #: What a person is told when the write lock outlasted the ladder mid-parse.
 #: Never the driver's text: SQLAlchemy renders ``[SQL: ...]`` and
 #: ``[parameters: ...]`` into it, and for ``_save`` those are the executemany
@@ -1143,7 +1182,8 @@ def _run(file_id, pdf_path, user_id, request_id, job_id=None, log=None,
             if not keep_read:
                 raise
             reason = (_BUSY_NOT_SAVED if is_lock_error(e)
-                      else f'the book was read but could not be saved: {e}')
+                      else f'the book was read but could not be saved: '
+                           f'{driver_text(e)}')
             _mark_failed(file_id, reason)
             log.append(f'Not saved: {reason}')
             result.update(stored=False, store_error=reason, progress_log=log)
@@ -1157,7 +1197,7 @@ def _run(file_id, pdf_path, user_id, request_id, job_id=None, log=None,
         elif is_lock_error(e):
             reason = _BUSY_NOT_SAVED
         else:
-            reason = f'unexpected error: {e}'
+            reason = f'unexpected error: {driver_text(e)}'
         if not isinstance(e, BookParseError):
             # The operator still gets the driver's text and the traceback; it
             # is only the person's copy that drops the SQL and the parameters.
@@ -1190,7 +1230,7 @@ def parse_book(pdf_path, user_id, request_id='', log=None) -> dict:
     try:
         file_id = _register(user_id, pdf_path.name, pdf_path.parent, request_id)
     except Exception as e:
-        reason = f'the book library is unavailable ({e})'
+        reason = f'the book library is unavailable ({driver_text(e)})'
         logger.warning(f"reading {pdf_path.name} without storing it: {reason}")
         return _read_unstored(pdf_path, user_id, request_id, log, reason)
     return _run(file_id, pdf_path, user_id, request_id, log=log, keep_read=True)
