@@ -383,6 +383,48 @@ class TestFailures:
         from sqlalchemy.exc import OperationalError
         return OperationalError(statement, params, sqlite3.OperationalError(message))
 
+    def test_a_busy_library_does_not_tell_a_link_reader_to_upload(self):
+        """_run serves links as well as uploads -- hart_intelligence_entry
+        calls parse_book after fetch_pdf -- so "upload it again" is advice the
+        link reader cannot take. The same wrong advice F5 removed from _open,
+        in a string that commit did not touch.
+        """
+        assert 'upload' not in bp._BUSY_NOT_SAVED
+        assert 'try again' in bp._BUSY_NOT_SAVED
+
+    def test_a_refusal_is_logged_without_a_traceback(
+            self, book_node, tmp_path, caplog):
+        """A refusal is expected and states its own reason, so the stack is
+        noise."""
+        with caplog.at_level('WARNING'):
+            result = bp.parse_book(make_pdf(tmp_path / 'book.pdf'), 'u' * 65)
+
+        assert result['stored'] is False
+        unstored = [r for r in caplog.records
+                    if 'without storing it' in r.getMessage()]
+        # Falsy, not None: logging stores exc_info=False AS False, and
+        # only an omitted argument leaves it None.
+        assert unstored and not unstored[0].exc_info
+
+    def test_a_library_failure_is_still_logged_with_one(
+            self, book_node, book_db, tmp_path, monkeypatch, caplog):
+        """The other half, which must not be lost with it: when `reason` is
+        sanitised the log is the operator's ONLY copy of what broke.
+        """
+        boom = self._db_error('INSERT INTO pdf_files (directory) VALUES (?)',
+                              {'directory': r'C:\Users\someone\uploads'})
+        monkeypatch.setattr(bp, '_register',
+                            lambda *a, **k: (_ for _ in ()).throw(boom))
+
+        with caplog.at_level('WARNING'):
+            result = bp.parse_book(make_pdf(tmp_path / 'book.pdf'), '42')
+
+        assert result['stored'] is False
+        assert 'INSERT INTO' not in result['store_error']      # not the person's
+        unstored = [r for r in caplog.records
+                    if 'without storing it' in r.getMessage()]
+        assert unstored and unstored[0].exc_info               # but the operator's
+
     def test_a_save_that_fails_does_not_hand_back_the_statement(
             self, book_node, tmp_path, monkeypatch):
         """The person's copy of a non-lock database failure.

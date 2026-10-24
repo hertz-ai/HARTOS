@@ -736,8 +736,10 @@ def driver_text(exc) -> str:
 #: can poll the status route. Measured 2026-10-18, a status answer read in full:
 #: "unexpected error: (sqlite3.OperationalError) database is locked [SQL: DELETE
 #: FROM page_layouts WHERE page_layouts.file_id = ?] [parameters: (1,)]".
+#: "try again", not "upload again": _run serves a link the agent followed as
+#: well as a file a person uploaded, and a link reader has nothing to upload.
 _BUSY_NOT_SAVED = ('the book library was busy, so this book did not finish; '
-                   'upload it again in a moment')
+                   'try again in a moment')
 
 
 def _retry_on_lock(fn):
@@ -1428,10 +1430,12 @@ def parse_book(pdf_path, user_id, request_id='', log=None) -> dict:
             reason = str(e)
         else:
             reason = f'the book library is unavailable ({driver_text(e)})'
-        # exc_info because `reason` no longer carries the driver's statement:
-        # without it the operator is left the sanitised sentence alone.
+        # A traceback for a FAILURE, not for a refusal. Where `reason` is
+        # sanitised -- a database error, whose statement the person must not
+        # see -- this log is the operator's only copy and needs the stack. A
+        # refusal states its own whole reason, so a stack is noise.
         logger.warning(f"reading {pdf_path.name} without storing it: {reason}",
-                       exc_info=True)
+                       exc_info=not isinstance(e, BookParseError))
         return _read_unstored(pdf_path, user_id, request_id, log, reason)
     return _run(file_id, pdf_path, user_id, request_id, log=log, keep_read=True)
 
