@@ -263,12 +263,14 @@ class TestFailures:
             with pytest.raises(bp.BookParseError) as raised:
                 bp._open(missing)
 
-        said = str(raised.value)
-        # The DIRECTORY is the sensitive half: it carries the OS user's name.
-        # The filename is not secret -- the row publishes it in `filename` and
-        # in `book_name` -- so a fixture called MySecretDiary.pdf implied a
-        # confidentiality this code does not offer (that review's F6).
-        assert str(tmp_path) not in said
+        # The EXACT text, as fetch_pdf's test already does. `str(tmp_path)
+        # not in said` is blind to the repr form: OSError renders filename
+        # through repr, so a leak arrives with its backslashes doubled and the
+        # substring never matches. A mutant appending the repr-form path
+        # passed all 126 tests (MO2 of the eba6265c4 review). The code did not
+        # leak; the guard could not have told.
+        assert str(raised.value) == ('the PDF could not be opened '
+                                     '(the file is no longer on this node)')
         # and the operator loses nothing: the full path AND a traceback
         opened = [r for r in caplog.records if 'could not be opened' in r.getMessage()]
         assert opened and str(tmp_path) in opened[0].getMessage()
@@ -2030,6 +2032,31 @@ class TestSchema:
                 in m.SQLITE_BOOT_PRAGMAS)
         assert 'PRAGMA journal_mode=WAL;' in m.SQLITE_BOOT_PRAGMAS
         assert 'PRAGMA synchronous=NORMAL;' in m.SQLITE_BOOT_PRAGMAS
+
+    def test_a_real_connection_gets_the_patience_that_number_names(
+            self, tmp_path, monkeypatch):
+        """What a CONNECTION actually gets, which the test above cannot see.
+
+        That one reads the constant and the script built from it. A hook
+        issuing a different number while the constant still said 3000
+        passed all 182 tests (mutant MH2 of the e278103a9 review) --
+        nothing asked a connection. This builds a real engine through
+        get_engine() on a scratch file and reads the pragma back.
+
+        A guard, not a regression test: the parent's hook sets 3000 too,
+        so it passes there. It asserts the literal rather than the
+        constant, so it needs no new symbol in order to run at all.
+        """
+        from integrations.social import models as m
+
+        scratch = tmp_path / 'patience.db'
+        monkeypatch.setattr(m, 'DB_PATH', str(scratch))
+        monkeypatch.setattr(m, 'DB_URL', 'sqlite:///%s' % scratch)
+        monkeypatch.setattr(m, '_engine', None)
+
+        with m.get_engine().connect() as connection:
+            patience = connection.exec_driver_sql('PRAGMA busy_timeout')
+            assert patience.scalar() == 3000
 
     def test_the_reader_id_limit_matches_its_column(self):
         """READER_ID_MAX copies pdf_files.user_id's width and could drift from

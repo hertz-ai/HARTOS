@@ -262,7 +262,8 @@ def fetch_pdf(url, timeout=60) -> Path:
         logger.warning("book: a downloaded PDF could not be stored", exc_info=True)
         # Rebuilt rather than blanked: clearing e.filename leaves a trailing
         # ": None" where the path was. Only strerror is replaced, so the errno
-        # and the subclass survive for any caller that branches on them, and
+        # and the subclass survive -- when errno is set; an errno-less
+        # FileNotFoundError(path) comes back as a plain OSError -- and
         # this stays an OSError rather than becoming a BookParseError -- a
         # storage failure is not a bad request.
         #
@@ -1041,11 +1042,9 @@ def _restore_patience(raw) -> None:
     try:
         _set_patience(raw, SQLITE_BUSY_TIMEOUT_MS)
     except Exception as unrestored:
-                    # Said out loud, not at debug: a reset that fails quietly
-                    # is exactly how the leak cc12 measured on a pooled engine
-                    # stayed hidden. 609692530's message claimed this line was
-                    # already a warning; it was not, and this is the change.
-                    logger.warning("book library: patience not restored (%r)", unrestored)
+        # Said out loud rather than at debug: a reset that fails quietly is how
+        # this leak stayed hidden for a whole commit.
+        logger.warning("book library: patience not restored (%r)", unrestored)
 
 
 def _resolve_stalled(file_ids) -> None:
