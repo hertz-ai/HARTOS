@@ -276,9 +276,27 @@ def _open(pdf_path):
     except pdfium.PdfiumError as e:
         if 'password' in str(e).lower():
             raise BookParseError('this PDF is password-protected') from e
+        # PDFium's own words carry no path -- measured 2026-10-25 on a non-PDF
+        # and on an empty file, both "Failed to load document (PDFium: Data
+        # format error)." -- so this one is repeated as it stands.
         raise BookParseError(f'this file could not be read as a PDF ({e})') from e
     except OSError as e:
-        raise BookParseError(f'the PDF could not be opened ({e})') from e
+        # The operator's copy: the path and the traceback, on this machine.
+        logger.warning("book: %s could not be opened", pdf_path, exc_info=True)
+        # The person's and the agent's copy must not carry it. pypdfium2 raises
+        # FileNotFoundError(path), so str(e) is the path and NOTHING else, and
+        # strerror, filename and errno are all None (measured 2026-10-25) --
+        # there is no driver text here worth repeating, and e.strerror on its
+        # own would have told a person "None".
+        #
+        # It does leave this node: book_tools puts a failed book's error into
+        # an agent's tool output, which becomes a model's prompt and that model
+        # can be a cloud one, and api_books hands the job's error to a client
+        # that may be a phone. H-0715 scrubs what LEAVES, and the uploads path
+        # carries the OS user's name (hartos-70, consult 2026-10-25).
+        raise BookParseError(
+            f'the PDF could not be opened '
+            f'({e.strerror or "the file could not be read"})') from e
 
 
 #: PDFium is not thread-safe -- pypdfium2's README says so ("Incompatibility
@@ -920,7 +938,12 @@ def list_books(user_id=None, limit=100) -> List[dict]:
     with db_session(commit=False) as db:
         q = db.query(BookFile)
         if user_id not in (None, ''):
-            q = q.filter(BookFile.user_id == str(user_id))
+            # The ROW's key, in the one spelling _book_key already owns: the
+            # column stores str(user_id)[:64], so filtering on the unclipped id
+            # handed an empty library to any reader whose id is longer than
+            # that, while _existing below had always clipped. Drift between two
+            # filters on one column, not a new rule (hartos-70, 2026-10-25).
+            q = q.filter(BookFile.user_id == _book_key(user_id, '')[0])
         books, stalled = _book_dicts(
             q.order_by(BookFile.file_id.desc()).limit(int(limit)).all())
     _resolve_stalled(stalled)

@@ -316,6 +316,21 @@ class ParseBookPdf(unittest.TestCase):
         out, _ = self._parse('/uploads/files/abc_book.pdf', error=RuntimeError('db locked'))
         self.assertIn('Could not start PDF parsing', out)
 
+    def test_the_operator_gets_a_traceback_when_a_parse_cannot_start(self):
+        """driver_text's docstring promises this, and this caller broke it.
+
+        That docstring says the operator loses nothing because every caller
+        logs the exception beside the sanitised answer -- and this one, the
+        fourth caller it names, logged the text with no traceback at all
+        (hartos-f3's review of df055008a, Minor 2).
+        """
+        boom = RuntimeError('the library went away')
+        with self.assertLogs('integrations.learning.book_tools', level='WARNING') as got:
+            answer, _ = self._parse('/uploads/files/abc_book.pdf', error=boom)
+        assert 'Could not start PDF parsing' in answer
+        assert any(r.exc_info is not None for r in got.records), [
+            r.getMessage() for r in got.records]
+
     def test_a_failure_to_start_does_not_hand_the_agent_the_statement(self):
         """What this tool returns becomes part of a model's prompt.
 

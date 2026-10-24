@@ -218,6 +218,56 @@ class TestFailures:
         bad.write_bytes(b'this is not a pdf')
         self._fails(bad, 'could not be read')
 
+    def test_a_file_that_is_gone_does_not_hand_back_its_path(
+            self, book_node, tmp_path, caplog):
+        """The uploads path leaves this node, so it must not be in the answer.
+
+        book_tools puts a failed book's error into an agent's tool output,
+        which becomes a model's prompt and that model can be a cloud one, and
+        api_books hands the job's error to a client that may be a phone. The
+        path carries the OS user's name (H-0715: scrubbing is for what leaves,
+        not for the operator's own log). The operator still gets both, below.
+        """
+        missing = tmp_path / 'MySecretDiary_2026.pdf'
+        with caplog.at_level('WARNING'):
+            with pytest.raises(bp.BookParseError) as raised:
+                bp._open(missing)
+
+        said = str(raised.value)
+        assert 'MySecretDiary' not in said and str(tmp_path) not in said
+        # and the operator loses nothing: the path AND a traceback
+        opened = [r for r in caplog.records if 'could not be opened' in r.getMessage()]
+        assert opened and 'MySecretDiary' in opened[0].getMessage()
+        assert opened[0].exc_info is not None
+
+    def test_a_file_that_is_gone_does_not_say_none(self, book_node, tmp_path):
+        """The case a naive scrub gets wrong, which is in fact the only case.
+
+        pypdfium2 raises FileNotFoundError(path): str(e) is the path and
+        nothing else, and strerror, filename and errno are all None (measured
+        2026-10-25). So reporting e.strerror by itself would tell a person
+        "the PDF could not be opened (None)" -- flagged by hartos-70 before
+        this was written, and true of every OSError this branch sees.
+        """
+        with pytest.raises(bp.BookParseError) as raised:
+            bp._open(tmp_path / 'gone.pdf')
+        said = str(raised.value)
+        assert 'None' not in said
+        assert 'the file could not be read' in said
+
+    def test_a_file_that_is_not_a_pdf_still_says_what_pdfium_said(
+            self, book_node, tmp_path):
+        """The guard against over-scrubbing the branch beside it.
+
+        PDFium's text names no path, so it is still repeated in full; losing
+        it would leave a person "this file could not be read as a PDF ()".
+        """
+        bad = tmp_path / 'not_a.pdf'
+        bad.write_bytes(b'this is plainly not a pdf')
+        with pytest.raises(bp.BookParseError) as raised:
+            bp._open(bad)
+        assert 'format error' in str(raised.value).lower()
+
     def test_a_password_protected_pdf_says_so(self, book_node, tmp_path):
         book = self._fails(make_encrypted_pdf(tmp_path / 'locked.pdf'), 'password-protected')
         assert 'password-protected' in book['error']
@@ -1046,6 +1096,20 @@ class TestLockContention:
         bp._update_job(job, status='failed', error=bp._BUSY_NOT_SAVED)
 
         assert bp._existing('42', long_name) is None
+
+    def test_a_long_reader_id_still_sees_their_own_library(self, book_node, book_db):
+        """list_books filtered on the UNCLIPPED id, and the column clips.
+
+        The row stores str(user_id)[:64], so a reader whose id is longer than
+        that matched nothing and was shown an empty library, while _existing
+        two functions below had always clipped -- drift between two filters on
+        one column. _book_key is the one spelling of that key.
+        """
+        long_id = 'u' * 70
+        file_id = bp._register(long_id, 'mine.pdf', '/tmp', '')
+        bp._update_row(file_id, status='completed')
+
+        assert [b['file_id'] for b in bp.list_books(long_id)] == [file_id]
 
     def test_another_readers_job_does_not_condemn_this_readers_book(
             self, book_node, book_db):
