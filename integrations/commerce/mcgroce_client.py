@@ -25,11 +25,13 @@ Every call:
 Results are ``{'success': True, 'status': int, 'data': ...}`` or
 ``{'success': False, 'error': str, 'status'?: int, 'unconfirmed'?: True}``
 -- never an exception.  ``unconfirmed`` marks a request McGroce neither did
-nor refused: a timeout, a transport error (a refused connection included,
-since the client cannot tell one refused before the request left from one
-dropped after it did), or a 5xx.  The caller cannot know whether it
-happened.  A refusal (4xx) and a request never attempted (bad URL, breaker
-open) carry no such mark.
+nor refused, or did without this node reading what it did: a timeout, a
+transport error (a refused connection included, since the client cannot
+tell one refused before the request left from one dropped after it did), a
+5xx, or a 2xx whose body is not JSON (``status`` 2xx tells that one apart:
+McGroce answered with a success it could not explain).  The caller cannot
+know what happened.  A refusal (4xx) and a request never attempted (bad
+URL, breaker open) carry no such mark.
 """
 
 import base64
@@ -159,7 +161,12 @@ class McGroceClient:
             try:
                 data = resp.json()
             except ValueError:
-                return _err('McGroce sent a non-JSON answer', resp.status_code)
+                # McGroce did it (a 2xx) and this node could not read what
+                # it did: for the caller that is neither confirmed nor
+                # refused, the same as an answer that never came, with the
+                # 2xx status telling it apart from a 5xx.
+                return _err('McGroce sent a non-JSON answer', resp.status_code,
+                            unconfirmed=True)
         return {'success': True, 'status': resp.status_code, 'data': data}
 
     def site(self, user_id, method: str, path: str, params=None,

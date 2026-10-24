@@ -151,6 +151,31 @@ def disk_full_once(store, field, value=None):
         yield
 
 
+class _NotJson:
+    """A 2xx McGroce answer this node cannot read: a proxy's HTML page where
+    JSON was due."""
+    status_code = 200
+    content = b'<html>a proxy page</html>'
+
+    def json(self):
+        raise ValueError('not json')
+
+
+def unreadable_order_answers(fake):
+    """The transport with every signed order call (POST /cart/checkout/ap2
+    carrying an attestation: the order call and the probe alike) answered
+    200 and unreadable, everything else by ``fake``.  The call is still
+    recorded on the fake."""
+    def transport(method, url, **kw):
+        path = url[len(BASE):] if url.startswith(BASE) else url
+        if (method, path) == ('POST', AP2) and \
+                signing.MANDATE_HEADER in (kw.get('headers') or {}):
+            fake.calls.append((method, path, kw))
+            return _NotJson()
+        return fake(method, url, **kw)
+    return transport
+
+
 def claims_of(token: str):
     """The claims an X-Commerce-Mandate carries (the fake's routing; the MAC
     is checked by attestation_of)."""
@@ -1816,6 +1841,55 @@ class TestHeldPayments:
         assert 'put the cart back' not in pushed(env, 'notification')[-1]['message']
         card = owner_cards(env)[-1]['message']
         assert 'the order check could not be made' in card and 'could not be signed' in card
+
+    def test_a_probe_answered_with_a_body_this_node_cannot_read_means_the_order_exists(self, env):
+        # hartos-70's F1 on 82f934df5: McGroce answers a probe 200 only for a
+        # mandate one of the customer's orders carries.  A 200 whose body
+        # this node cannot read (a proxy page) came back as success False
+        # WITH a status and was read as a refusal: the cart-changed hold,
+        # "put the cart back", "Place the order, or refund it", a second
+        # order in reach.  The client marks it unconfirmed; the probe holds
+        # it as answered-but-unread, says check McGroce, marks the mandate.
+        out = self._paid_on_phonepe(env)
+        drifted = json.loads(json.dumps(ORDER))
+        drifted['orderItems'].pop()
+        env['fake'].on('GET', '/cart', body=drifted)
+        fake = env['fake']
+        with patch('core.http_pool.pooled_request', side_effect=unreadable_order_answers(fake)):
+            res = ct.complete_redirect_checkout(out['payment_id'])
+        assert res['success'] is False and res['needs_attention'] is True
+        assert 'cart_changed' not in res
+        assert len(fake.called('POST', AP2)) == 1                  # the probe, once
+        note = pushed(env, 'notification')[-1]['message']
+        assert note == self.UNCONFIRMED and 'put the cart back' not in note
+        card = owner_cards(env)[-1]['message']
+        assert 'Check McGroce' in card and 'could not be read' in card
+        assert 'Place the order, or refund it' not in card
+        assert env['mandates'].get(out['mandate_id']).order_sent is not None
+        # McGroce readable again: the next probe finds the order it holds.
+        fake.placed[out['mandate_id']] = 'ORD-UNREAD'
+        later = json.loads(ct.commerce_checkout(UID, out['mandate_id']))
+        assert later['success'] is True and later['order_id'] == 'ORD-UNREAD'
+
+    def test_an_order_call_answered_with_a_body_this_node_cannot_read_is_could_not_confirm(self, env):
+        # The same answer on the ORDER call, pre-existing: McGroce placed it
+        # (2xx) and this node could not read the order number, which set
+        # no mark: "not placed yet", "Place the order, or refund it".  Now
+        # could-not-confirm, the owner checks McGroce first, the mandate is
+        # marked, and no second call is made for a placed order.
+        out = self._paid_on_phonepe(env)
+        fake = env['fake']
+        with patch('core.http_pool.pooled_request', side_effect=unreadable_order_answers(fake)):
+            res = ct.complete_redirect_checkout(out['payment_id'])
+        assert res['success'] is False and res['needs_attention'] is True
+        assert len(fake.called('POST', AP2)) == 1                  # no second call
+        assert pushed(env, 'notification')[-1]['message'] == self.UNCONFIRMED
+        assert 'Check McGroce' in owner_cards(env)[-1]['message']
+        assert env['mandates'].get(out['mandate_id']).order_sent is not None
+        fake.placed[out['mandate_id']] = 'ORD-UNREAD'
+        env['fake'].on('GET', '/cart', *CART_GONE)
+        later = json.loads(ct.commerce_checkout(UID, out['mandate_id']))
+        assert later['success'] is True and later['order_id'] == 'ORD-UNREAD'
 
     # ── the mark, on every later hold ────────────────────────────────────
 

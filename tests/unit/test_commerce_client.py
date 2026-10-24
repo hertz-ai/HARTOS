@@ -201,6 +201,9 @@ class TestFailures:
         with patch('core.http_pool.pooled_request', return_value=r):
             out = client.cart_get(hartos_user_id(4242))
         assert out['success'] is False and 'non-JSON' in out['error']
+        # McGroce did it and this node could not read what: neither confirmed
+        # nor refused, with the 2xx status telling it apart from a 5xx.
+        assert out['unconfirmed'] is True and out['status'] == 200
 
 
 class TestBindings:

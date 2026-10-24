@@ -1032,13 +1032,29 @@ def _order_for_mandate(client, m, payment) -> Optional[Dict[str, Any]]:
         found = {'success': False, 'error': _UNSIGNABLE}
     if found['success']:
         return _order_placed(m.user_id, m, found)
+    status = found.get('status') or 0
+    if found.get('unconfirmed') and 200 <= status < 300:
+        # McGroce answered the probe with the success it gives only a
+        # mandate one of the customer's orders carries, and this node could
+        # not read which order: the order exists.  The owner checks McGroce
+        # first, and the mandate is marked (after the hold) so every later
+        # hold says so too, until a readable answer records the order.
+        order_on_hold(payment, f"McGroce answered the order check and the answer "
+                               f"could not be read: {found['error']}", sent=True)
+        _mark_order_sent(m)
+        return {'success': False, 'needs_attention': True,
+                'error': ('the payment went through, and McGroce answered that its '
+                          f"order exists but the answer could not be read ({found['error']}); "
+                          'retry with commerce_checkout and this mandate_id, which never '
+                          'charges again, or a person checks McGroce'),
+                'payment_id': m.payment_id, 'mandate_id': m.mandate_id}
     if found.get('unconfirmed'):
         why = f"McGroce did not answer the order check: {found['error']}"
         error = ('the payment went through, and McGroce did not answer '
                  f"whether its order exists ({found['error']}); retry with "
                  'commerce_checkout and this mandate_id, which never charges '
                  'again, or a person checks McGroce')
-    elif found.get('status') is not None:
+    elif 400 <= status < 500:
         return None
     else:
         why = f"the order check could not be made: {found['error']}"
