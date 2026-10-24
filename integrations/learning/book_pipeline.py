@@ -272,11 +272,19 @@ def fetch_pdf(url, timeout=60) -> Path:
         # caller that branches on the class still can; api_books does exactly
         # that for its own save_pdf call, answering 507 rather than 400, which
         # is why this is NOT wrapped in a BookParseError.
+        # The sentence has to blame the right machine. Dropping the filename
+        # left the agent reading "Failed to extract content from <url>:
+        # [Errno 2] No such file or directory", which says the LINK's PDF is
+        # missing when it is THIS node's uploads folder that is (F3 of the
+        # 609692530 review). The errno and the subclass still survive, because
+        # only strerror is replaced, not the first argument.
+        reason = ('this node could not store the download '
+                  f'({e.strerror or "no reason reported"})')
         if e.errno is None:
             # A hand-raised OSError keeps its message in args[0], where a path
-            # could also sit, so that one is dropped rather than repeated.
-            raise OSError(e.strerror or 'this node could not store the download') from e
-        raise OSError(e.errno, e.strerror) from e
+            # could sit, so that one is dropped rather than repeated.
+            raise OSError(reason) from e
+        raise OSError(e.errno, reason) from e
 
 
 # ── The PDF engine (pypdfium2) ────────────────────────────────────────
@@ -996,10 +1004,11 @@ def _record_stalled(file_ids) -> None:
                 try:
                     db.execute(text('PRAGMA busy_timeout=%d' % int(patience or 0)))
                 except Exception as unrestored:
-                    # A refused flush leaves the session needing a rollback,
-                    # which db_session does on the way out; on NullPool the
-                    # connection is then discarded anyway.
-                    logger.debug("book library: patience not restored (%r)", unrestored)
+                    # Said out loud, not at debug: a reset that fails quietly
+                    # is exactly how the leak cc12 measured on a pooled engine
+                    # stayed hidden. 609692530's message claimed this line was
+                    # already a warning; it was not, and this is the change.
+                    logger.warning("book library: patience not restored (%r)", unrestored)
 
 
 def _resolve_stalled(file_ids) -> None:

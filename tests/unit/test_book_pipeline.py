@@ -1526,6 +1526,37 @@ class TestLockContention:
         assert bp.list_books('42')[0]['status'] == 'failed'     # the record really ran
         assert patience() == before
 
+    def test_a_patience_reset_that_fails_is_said_out_loud(
+            self, book_node, book_db, monkeypatch, caplog):
+        """A reset that fails quietly is how the pooled leak stayed hidden.
+
+        The reset runs through the ORM session, and a lock that refused the
+        flush leaves that session needing a rollback -- so the reset raises and
+        the connection keeps busy_timeout 0. At debug nobody hears it.
+        609692530's message claimed this line was already a warning; it was
+        not, and this test is what makes the claim true.
+        """
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import StaticPool
+
+        from integrations.social import models
+        shared = create_engine(book_db.url, poolclass=StaticPool,
+                               connect_args={'check_same_thread': False, 'timeout': 5})
+        monkeypatch.setattr(models, '_SessionLocal',
+                            sessionmaker(bind=shared, expire_on_commit=False))
+
+        _a_parse_its_lock_killed('42', 'noisy.pdf')
+        release = _hold_write_lock(book_db, 1.0)
+        try:
+            with caplog.at_level('WARNING'):
+                assert bp.list_books('42')[0]['status'] == 'failed'   # the read answers
+        finally:
+            release.join()
+
+        assert any('patience not restored' in r.getMessage() for r in caplog.records), [
+            r.getMessage() for r in caplog.records]
+
     def test_the_row_that_starts_a_parse_waits_out_a_lock(
             self, book_node, book_db, monkeypatch):
         """_register's own ladder, which nothing pinned until now.
@@ -1693,10 +1724,15 @@ class TestFetch:
             failure = self._store_fails_with(
                 OSError(28, 'No space left on device', secret), tmp_path)
 
-        said = str(failure)
-        assert secret not in said and 'de1f_physics' not in said
-        assert 'No space left on device' in said      # the reason survives
-        assert failure.errno == 28                    # and so does the class's detail
+        # The EXACT text, because a substring check cannot pin this. On Windows
+        # OSError.__str__ renders filename through repr, which DOUBLES the
+        # backslashes, so `secret not in str(failure)` was true whether or not
+        # the path leaked -- and a mutant that kept the directory and dropped
+        # only the file name passed 10 of 10 (M9 of the 609692530 review).
+        assert str(failure) == ('[Errno 28] this node could not store the '
+                                'download (No space left on device)')
+        assert ': None' not in str(failure)      # the blank-filename shape
+        assert failure.errno == 28
         stored = [r for r in caplog.records if 'could not be stored' in r.getMessage()]
         assert stored and stored[0].exc_info is not None   # the operator keeps both
 
@@ -1709,9 +1745,31 @@ class TestFetch:
         """
         failure = self._store_fails_with(OSError('the volume went away'), tmp_path)
 
-        said = str(failure)
-        assert 'Errno None' not in said and 'None' not in said
-        assert 'this node could not store the download' in said
+        assert str(failure) == ('this node could not store the download '
+                                '(no reason reported)')
+        assert 'Errno None' not in str(failure)
+
+    def test_the_class_of_a_store_failure_survives_the_scrub(
+            self, book_uploads, tmp_path):
+        """A caller branching on the class still can.
+
+        api_books answers 507 for an OSError out of save_pdf rather than 400,
+        so the scrub must keep the subclass as well as the errno. The reviewer
+        made ENOENT, EACCES and EEXIST happen for real; these are the shapes
+        they came back as, and nothing pinned them (F6 of that review).
+        """
+        for number, strerror, expected in (
+                (2, 'No such file or directory', FileNotFoundError),
+                (13, 'Permission denied', PermissionError),
+                (17, 'File exists', FileExistsError)):
+            failure = self._store_fails_with(
+                OSError(number, strerror,
+                        str(book_uploads / 'files' / 'de1f_physics.pdf')), tmp_path)
+
+            assert isinstance(failure, expected)
+            assert failure.errno == number
+            assert str(failure) == ('[Errno %d] this node could not store the '
+                                    'download (%s)' % (number, strerror))
 
     def test_a_pdf_link_is_saved_into_the_uploads(self, book_uploads, tmp_path):
         data = make_pdf(tmp_path / 'src.pdf').read_bytes()
