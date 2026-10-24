@@ -1933,6 +1933,34 @@ class TestFetch:
 
 # ── The schema the library gets on each database ──────────────────────
 
+class TestOsErrorReason:
+    """The one rule both scrub sites follow."""
+
+    def test_the_drivers_own_words_are_kept(self):
+        assert bp.os_error_reason(
+            OSError(28, 'No space left on device'), 'fallback') == 'No space left on device'
+
+    def test_a_missing_strerror_falls_back(self):
+        """pypdfium2's FileNotFoundError(path) and a hand-raised OSError both
+        leave strerror unset, which is every case _open's branch sees."""
+        assert bp.os_error_reason(FileNotFoundError('C:/u/book.pdf'), 'fallback') == 'fallback'
+        assert bp.os_error_reason(OSError('the volume went away'), 'fallback') == 'fallback'
+
+    def test_a_path_in_the_first_argument_is_not_repeated(self):
+        """args[0] is where a hand-raised OSError puts its message, and a path
+        rides there as easily as anywhere."""
+        assert 'book.pdf' not in bp.os_error_reason(
+            OSError(r'C:\Users\someone\uploads\book.pdf'), 'fallback')
+
+    def test_the_filename_is_not_repeated(self):
+        """str(exc) would append it -- through repr, so on Windows the
+        backslashes double and a substring check for the path cannot fail."""
+        said = bp.os_error_reason(
+            OSError(2, 'No such file or directory',
+                    r'C:\Users\someone\uploads\book.pdf'), 'fallback')
+        assert said == 'No such file or directory'
+
+
 class TestSchema:
 
     def test_the_sqlite_patience_is_unchanged_and_has_one_spelling(self):

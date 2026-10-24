@@ -260,29 +260,18 @@ def fetch_pdf(url, timeout=60) -> Path:
     except OSError as e:
         # The operator's copy: the path and the traceback, on this machine.
         logger.warning("book: a downloaded PDF could not be stored", exc_info=True)
-        # save_pdf re-raises the OS error as it came, and OSError.__str__
-        # appends e.filename -- which for this write is the uploads directory,
-        # carrying the OS user's name. That is the egress 74b39d1a4 closed for
-        # _open, one function along (hevolve-cc12's note on it).
+        # Rebuilt rather than blanked: clearing e.filename leaves a trailing
+        # ": None" where the path was. Only strerror is replaced, so the errno
+        # and the subclass survive for any caller that branches on them, and
+        # this stays an OSError rather than becoming a BookParseError -- a
+        # storage failure is not a bad request.
         #
-        # Rebuilt rather than blanked: setting e.filename = None leaves
-        # "[Errno 28] No space left on device: None" (measured 2026-10-25),
-        # the same "(None)" a person should never be shown. Rebuilding keeps
-        # the specific subclass -- FileNotFoundError, PermissionError -- so a
-        # caller that branches on the class still can; api_books does exactly
-        # that for its own save_pdf call, answering 507 rather than 400, which
-        # is why this is NOT wrapped in a BookParseError.
-        # The sentence has to blame the right machine. Dropping the filename
-        # left the agent reading "Failed to extract content from <url>:
-        # [Errno 2] No such file or directory", which says the LINK's PDF is
-        # missing when it is THIS node's uploads folder that is (F3 of the
-        # 609692530 review). The errno and the subclass still survive, because
-        # only strerror is replaced, not the first argument.
+        # The sentence names THIS node on purpose. Without that, a failure to
+        # write here reaches the agent as "[Errno 2] No such file or
+        # directory" about the LINK, whose PDF arrived perfectly well.
         reason = ('this node could not store the download '
-                  f'({e.strerror or "no reason reported"})')
+                  f'({os_error_reason(e, "no reason reported")})')
         if e.errno is None:
-            # A hand-raised OSError keeps its message in args[0], where a path
-            # could sit, so that one is dropped rather than repeated.
             raise OSError(reason) from e
         raise OSError(e.errno, reason) from e
 
@@ -312,26 +301,13 @@ def _open(pdf_path):
     except OSError as e:
         # The operator's copy: the path and the traceback, on this machine.
         logger.warning("book: %s could not be opened", pdf_path, exc_info=True)
-        # The person's and the agent's copy must not carry it. pypdfium2 raises
-        # FileNotFoundError(path), so str(e) is the path and NOTHING else, and
-        # strerror, filename and errno are all None (measured 2026-10-25) --
-        # there is no driver text here worth repeating, and e.strerror on its
-        # own would have told a person "None".
-        #
-        # It does leave this node: book_tools puts a failed book's error into
-        # an agent's tool output, which becomes a model's prompt and that model
-        # can be a cloud one, and api_books hands the job's error to a client
-        # that may be a phone. H-0715 scrubs what LEAVES, and the uploads path
-        # carries the OS user's name (hartos-70, consult 2026-10-25).
-        # A missing file is the only case measured here, so say so plainly
-        # rather than "could not be read", which repeats the sentence it is
-        # inside (F5 of the 74b39d1a4 review).
-        # And no advice about re-uploading: the same branch serves a link the
-        # caller named by URL and never uploaded (F5 of the 30c304dac review --
-        # a different review's F5 from the one just above, which is why both
-        # are spelled out). The fact is the useful part.
-        reason = e.strerror or 'the file is no longer on this node'
-        raise BookParseError(f'the PDF could not be opened ({reason})') from e
+        # pypdfium2 raises FileNotFoundError(path) with strerror unset, so the
+        # default below is what a person actually reads on this branch. It
+        # states the fact and gives no advice to upload again, because the same
+        # branch serves a link the caller named by URL and never uploaded.
+        raise BookParseError(
+            'the PDF could not be opened '
+            f'({os_error_reason(e, "the file is no longer on this node")})') from e
 
 
 #: PDFium is not thread-safe -- pypdfium2's README says so ("Incompatibility
@@ -680,6 +656,31 @@ def is_lock_error(exc) -> bool:
                      "is not treated as a lock (%r)", unreadable)
         return False
     return any(m in text for m in _LOCK_ERRORS)
+
+
+def os_error_reason(exc, default) -> str:
+    """An OS error's own words, with no path among them.
+
+    Reads ``strerror`` and nothing else. ``str(exc)`` is never safe here:
+    OSError renders ``filename`` into it through repr, so on Windows the
+    backslashes double and a substring check for the real path quietly cannot
+    fail; and a hand-raised OSError carries its whole message in ``args[0]``,
+    where a path sits just as easily. ``strerror`` is unset for both of those
+    shapes, which is what ``default`` is for -- reporting it unguarded tells a
+    person "None".
+
+    ``default`` is the caller's sentence because the two callers describe
+    different failures: a book that is no longer on this node, and a download
+    this node could not store. One rule, two sentences, each chosen at its own
+    call site rather than drifting apart.
+
+    driver_text is the companion for a database error. Both exist because
+    these messages LEAVE the node: book_tools puts a failed book's error into
+    an agent's tool output, which becomes a model's prompt and that model can
+    be a cloud one, and api_books hands a job's error to a client that may be
+    a phone (H-0715 scrubs what leaves, never the operator's own log).
+    """
+    return exc.strerror or default
 
 
 def driver_text(exc) -> str:
