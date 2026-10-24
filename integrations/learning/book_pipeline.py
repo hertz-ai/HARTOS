@@ -984,9 +984,11 @@ def _record_stalled(file_ids) -> None:
         # showed _update_row then giving up after 3.75 s instead of waiting out
         # its ~20.5 s ladder.
         sqlite = db.get_bind().dialect.name == 'sqlite'
-        patience = db.execute(text('PRAGMA busy_timeout')).scalar() if sqlite else None
+        # The DBAPI connection, not the session: the reset below has to work
+        # after a refused flush, and by then the session needs a rollback.
+        raw = db.connection().connection if sqlite else None
         if sqlite:
-            db.execute(text('PRAGMA busy_timeout=0'))
+            _set_patience(raw, 0)
         try:
             for file_id in file_ids:
                 row = db.get(BookFile, int(file_id))
@@ -1001,9 +1003,41 @@ def _record_stalled(file_ids) -> None:
             db.flush()
         finally:
             if sqlite:
-                try:
-                    db.execute(text('PRAGMA busy_timeout=%d' % int(patience or 0)))
-                except Exception as unrestored:
+                _restore_patience(raw)
+
+
+def _set_patience(raw, milliseconds) -> None:
+    """Set busy_timeout on the DBAPI connection itself."""
+    cursor = raw.cursor()
+    try:
+        cursor.execute('PRAGMA busy_timeout=%d' % int(milliseconds))
+    finally:
+        cursor.close()
+
+
+def _restore_patience(raw) -> None:
+    """Give the connection back the patience the engine configured for it.
+
+    Two faults in abe6cd886, and the second is why the first was permanent
+    (hevolve-cc12's review of it).
+
+    It ran through the ORM session, so when the lock refused the flush the
+    session needed a rollback first and the reset raised -- swallowed, leaving
+    busy_timeout at 0 on a connection the pool hands to the next writer.
+    Measured on QueuePool and on StaticPool-on-file: _update_row then gave up
+    after 3.77 s instead of waiting out its ~20.5 s ladder, which for a
+    lock-killed parse loses the reason entirely. A DBAPI cursor works in a
+    failed transaction, so the reset lands.
+
+    And it restored the value it had READ, which on an already-leaked
+    connection is 0 -- so every later record faithfully restored 0. The
+    engine's configured number is the only correct answer, and models owns it,
+    so there is nothing here to drift from it.
+    """
+    from integrations.social.models import SQLITE_BUSY_TIMEOUT_MS
+    try:
+        _set_patience(raw, SQLITE_BUSY_TIMEOUT_MS)
+    except Exception as unrestored:
                     # Said out loud, not at debug: a reset that fails quietly
                     # is exactly how the leak cc12 measured on a pooled engine
                     # stayed hidden. 609692530's message claimed this line was

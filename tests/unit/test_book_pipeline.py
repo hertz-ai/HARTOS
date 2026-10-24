@@ -1520,21 +1520,29 @@ class TestLockContention:
             with models.db_session(commit=False) as db:
                 return db.execute(sql('PRAGMA busy_timeout')).scalar()
 
-        before = patience()
-        assert before == 5000                      # the patience the engine was given
+        from integrations.social.models import SQLITE_BUSY_TIMEOUT_MS
+
+        assert patience() == 5000              # what THIS test's engine was given
         _a_parse_its_lock_killed('42', 'shared.pdf')
         assert bp.list_books('42')[0]['status'] == 'failed'     # the record really ran
-        assert patience() == before
+        # The ENGINE's configured number, never the one read back: restoring
+        # what it read meant that once a leak had left a connection at 0, every
+        # later record restored 0 for ever. On a real node the hook configures
+        # exactly this; here it moves this engine's 5000 to models' 3000, which
+        # is the intended behaviour and not a test artefact.
+        assert patience() == SQLITE_BUSY_TIMEOUT_MS
 
-    def test_a_patience_reset_that_fails_is_said_out_loud(
+    def test_the_patience_comes_back_when_the_lock_refused_the_write(
             self, book_node, book_db, monkeypatch, caplog):
-        """A reset that fails quietly is how the pooled leak stayed hidden.
+        """The leak itself, and the case the old reset could not survive.
 
-        The reset runs through the ORM session, and a lock that refused the
-        flush leaves that session needing a rollback -- so the reset raises and
-        the connection keeps busy_timeout 0. At debug nobody hears it.
-        609692530's message claimed this line was already a warning; it was
-        not, and this test is what makes the claim true.
+        It ran through the ORM session, which needs a rollback once the lock
+        has refused the flush -- so it raised, was swallowed, and the pool
+        handed an impatient connection to the next writer. Measured by
+        hevolve-cc12 on QueuePool and StaticPool-on-file: _update_row then gave
+        up after 3.77 s instead of waiting out its ~20.5 s ladder, which for a
+        lock-killed parse loses the reason altogether. A DBAPI cursor works in
+        a failed transaction, so the reset lands.
         """
         from sqlalchemy import create_engine
         from sqlalchemy.orm import sessionmaker
@@ -1546,6 +1554,13 @@ class TestLockContention:
         monkeypatch.setattr(models, '_SessionLocal',
                             sessionmaker(bind=shared, expire_on_commit=False))
 
+        from sqlalchemy import text as sql
+        from integrations.social.models import SQLITE_BUSY_TIMEOUT_MS
+
+        def patience():
+            with models.db_session(commit=False) as db:
+                return db.execute(sql('PRAGMA busy_timeout')).scalar()
+
         _a_parse_its_lock_killed('42', 'noisy.pdf')
         release = _hold_write_lock(book_db, 1.0)
         try:
@@ -1554,8 +1569,33 @@ class TestLockContention:
         finally:
             release.join()
 
-        assert any('patience not restored' in r.getMessage() for r in caplog.records), [
-            r.getMessage() for r in caplog.records]
+        assert patience() == SQLITE_BUSY_TIMEOUT_MS
+        assert not [r for r in caplog.records
+                    if 'patience not restored' in r.getMessage()]
+
+    def test_a_patience_reset_that_cannot_be_made_is_said_out_loud(
+            self, book_node, book_db, monkeypatch, caplog):
+        """The one failure path left says so at warning, not debug.
+
+        A reset that fails quietly is how the pooled leak stayed hidden for a
+        whole commit, so the remaining case -- a connection that will not take
+        the pragma at all -- is audible.
+        """
+        real = bp._set_patience
+
+        def refuse(raw, milliseconds):
+            if milliseconds:                  # the restore, not the borrow
+                raise RuntimeError('the connection went away')
+            return real(raw, milliseconds)
+
+        monkeypatch.setattr(bp, '_set_patience', refuse)
+        _a_parse_its_lock_killed('42', 'unreachable.pdf')
+
+        with caplog.at_level('WARNING'):
+            assert bp.list_books('42')[0]['status'] == 'failed'
+
+        assert any('patience not restored' in r.getMessage()
+                   for r in caplog.records), [r.getMessage() for r in caplog.records]
 
     def test_the_row_that_starts_a_parse_waits_out_a_lock(
             self, book_node, book_db, monkeypatch):
@@ -1881,6 +1921,22 @@ class TestFetch:
 # ── The schema the library gets on each database ──────────────────────
 
 class TestSchema:
+
+    def test_the_sqlite_patience_is_unchanged_and_has_one_spelling(self):
+        """Naming the literal must not have changed what the hook issues.
+
+        That connect hook runs for EVERY SQLite connection on every node
+        (hartos-70's caution). These read module constants, not source text:
+        hevolveai's C240 exists because 48 source-text pins went silently
+        untested the moment their module was compiled.
+        """
+        from integrations.social import models as m
+
+        assert m.SQLITE_BUSY_TIMEOUT_MS == 3000          # the value it replaced
+        assert (f'PRAGMA busy_timeout={m.SQLITE_BUSY_TIMEOUT_MS};'
+                in m.SQLITE_BOOT_PRAGMAS)
+        assert 'PRAGMA journal_mode=WAL;' in m.SQLITE_BOOT_PRAGMAS
+        assert 'PRAGMA synchronous=NORMAL;' in m.SQLITE_BOOT_PRAGMAS
 
     def test_the_reader_id_limit_matches_its_column(self):
         """READER_ID_MAX copies pdf_files.user_id's width and could drift from
