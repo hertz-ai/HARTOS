@@ -122,26 +122,36 @@ class TestTextLayer:
 class TestPageImages:
 
     def test_a_page_image_is_never_served_half_written(self, tmp_path):
-        """_write_jpeg's claim: it writes under a temporary name and moves it
-        into place, "so the page-image route never serves a half-written
-        file".  Nothing held that -- saving straight to the destination passed
-        every test (cc12's docstring sweep of 74b39d1a4).
+        """_write_jpeg's claim: the page-image route never serves a
+        half-written file.
+
+        The property is that the SERVED name never holds a partial file, so
+        the fake writes half its bytes and the assertion looks at the
+        destination AT THAT MOMENT.
+
+        Two ways the earlier version was wrong, both measured (A1 of the
+        5928418f3 review). It read out.exists() before the fake had written
+        anything, which is true whatever name is used -- so it passed with the
+        save going straight to the served name -- and it leaned on the
+        '.part' suffix instead, which would have REJECTED a correct change to
+        tempfile. It missed the defect and blocked the fix at once.
         """
         out = tmp_path / 'page_1.jpg'
         seen = {}
 
-        class OnePage:
+        class HalfWritten:
             def save(self, target, *args, **kwargs):
-                seen['target'] = str(target)
-                seen['destination_existed'] = out.exists()
-                Path(target).write_bytes(b'jpeg-bytes')
+                written = Path(target)
+                written.write_bytes(b'jpeg')              # half of it
+                seen['served'] = out.exists() and out.read_bytes()
+                written.write_bytes(b'jpeg-bytes')        # and the rest
 
-        bp._write_jpeg(OnePage(), out)
+        bp._write_jpeg(HalfWritten(), out)
 
-        assert seen['target'].endswith('.part')      # not the served name
-        assert seen['destination_existed'] is False  # nothing to serve half-written
+        assert seen['served'] is False               # nothing partial, ever
         assert out.read_bytes() == b'jpeg-bytes'
-        assert not out.with_name(out.name + '.part').exists()
+        # No leftover beside it, whatever the implementation called it.
+        assert list(tmp_path.iterdir()) == [out]
 
     def test_every_page_gets_an_image(self, book_node, tmp_path):
         from PIL import Image
@@ -316,7 +326,7 @@ class TestFailures:
         passing, which is what got that commit rejected.  This is the test the
         claim needed.
         """
-        result = bp.parse_book(make_pdf(tmp_path / 'book.pdf'), 'u' * 65)
+        result = bp.parse_book(make_pdf(tmp_path / 'book.pdf'), 'u' * (READER_ID_CHARS + 1))
 
         assert result['stored'] is False
         assert 'unavailable' not in result['store_error']
@@ -415,7 +425,7 @@ class TestFailures:
         """A refusal is expected and states its own reason, so the stack is
         noise."""
         with caplog.at_level('WARNING'):
-            result = bp.parse_book(make_pdf(tmp_path / 'book.pdf'), 'u' * 65)
+            result = bp.parse_book(make_pdf(tmp_path / 'book.pdf'), 'u' * (READER_ID_CHARS + 1))
 
         assert result['stored'] is False
         unstored = [r for r in caplog.records

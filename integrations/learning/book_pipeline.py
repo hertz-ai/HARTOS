@@ -1438,7 +1438,7 @@ def parse_book(pdf_path, user_id, request_id='', log=None) -> dict:
         # A book's own complaint first, the same order _run's handler uses: a
         # BookParseError says something TRUE about this request -- a refused
         # account id, say -- and the library is not unavailable merely because
-        # it would not file this book (that review's F1).
+        # it would not file this book (F1 of the 30c304dac review).
         if isinstance(e, BookParseError):
             reason = str(e)
         elif isinstance(e, OSError):
