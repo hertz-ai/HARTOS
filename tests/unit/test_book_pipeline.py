@@ -755,14 +755,25 @@ class TestLifecycle:
                       for c in BookFile.__table__.c if c.name != 'updated_at'}
 
         step = bp._make_step(None, file_id, '42', 'req-fresh', 'fresh.pdf', [])
+        # Bracketed by two readings, so the stamp must land BETWEEN them. The
+        # earlier version asserted only that the row was no longer condemnable,
+        # which a touch writing LOCAL time satisfies by stamping it 5.5 h ahead
+        # -- never stale, and never right either (mutant MC_local_touch).
+        opened = bp._utcnow()
         step('page 1 of 3', 33, page_number=1)
+        closed = bp._utcnow()
 
         with db_session(commit=False) as db:
             row = db.get(BookFile, int(file_id))
-            # Not "moved forward", which a one-second nudge satisfies while the
-            # row stays two hours stale: the row must no longer be condemnable
-            # at all, which is the whole purpose of the touch (mutant MT8).
+            # Not "moved forward", which a one-second nudge satisfies while
+            # the row stays two hours stale: the row must no longer be
+            # condemnable at all, which is the whole purpose of the touch
+            # (mutant MT8). A clock that is local END TO END still passes
+            # both of these, self-consistently; catching that needs a UTC
+            # source independent of the one under test, which is a
+            # system-level question rather than this test's.
             assert bp._stall_reason(row) is None
+            assert opened <= row.updated_at <= closed
             # And nothing BUT updated_at: checking status alone let a touch
             # that also wrote error= pass all 192 (mutant MT6).
             after = {c.name: getattr(row, c.name)
