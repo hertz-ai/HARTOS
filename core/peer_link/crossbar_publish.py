@@ -255,14 +255,11 @@ def publish_agent_message(
         # write one agent specific contract".
         #
         # I removed this in 0b632c59f and both reasons I gave have fallen.
-        # The desktop's left panel switching to the page view is the
-        # behaviour he wants, not the defect I called it; the double render
-        # existed only beside a second renderer that is being taken back;
-        # and the Android claim ("Glide has no base url, the card comes up
-        # empty") was a code reading nobody had measured, now withdrawn by
-        # the lane that made it.  Recording that here because the next
-        # person to read 0b632c59f will find a confident argument for the
-        # opposite.
+        # WARNING TO THE NEXT READER: 0b632c59f removed this and argues the
+        # case well -- a book-page MODE, a double render, an unloadable
+        # phone card. It was OVERRULED, and its Android premise was a code
+        # reading nobody had measured, since withdrawn. Do not re-derive it
+        # from that commit alone.
         #
         # This is also why no per-agent contract branch exists: the reel
         # contract describes a reel, and filtering every agent's reply
@@ -272,24 +269,16 @@ def publish_agent_message(
              if it.get('kind') == 'image' and isinstance(it.get('url'), str)), '')
         # Which items the slot could NOT take, so a kind is never dropped
         # from the record in silence.  It says only what THIS function
-        # knows -- the slot holds one image, everything else rides `media`
-        # -- and nothing about what a client renders, because the publisher
-        # cannot know that.
-        #
-        # f92d0846f claimed it could: it logged a WARNING that "no client
-        # renders them today", which fires on EVERY Reel Studio delivery
-        # (pipeline.py:569 publishes each reel here with kind 'video') and
-        # is false -- the phone renders exactly that item.  A warning is
-        # also the wrong level for a fact about the envelope.
-        # str() on every kind, because this sort MUST NOT RAISE.  It sits
-        # outside the try below, so sorted() over a set mixing 'video' with
-        # a non-string kind threw TypeError and killed the delivery of the
-        # whole message -- for a log line.
-        #
-        # fc47e967a said "a malformed item costs itself"; that was not true
-        # either.  The item still rides `media` and reaches the client
-        # exactly as sent.  It costs NOTHING here: all this does is stop a
-        # log line from breaking the publish.
+        # knows -- the slot took one image, the rest ride `media` -- and
+        # NOTHING about what a client renders, which the publisher cannot
+        # know: Reel Studio publishes every reel through here
+        # (reel_studio/pipeline.py:569) and the phone does render those.
+        # info, not warning: it is a fact about the envelope.
+        # str() on every kind, because this sort MUST NOT RAISE: it sits
+        # outside the try below, so a set mixing 'video' with a non-string
+        # kind threw TypeError and lost the whole message for a log line.
+        # The item itself is unaffected either way -- it still rides
+        # `media` as sent -- so this protects the publish and nothing else.
         rides_media_only = sorted(
             {str(it.get('kind')) for it in items
              if it.get('kind') is not None and it.get('kind') != 'image'})

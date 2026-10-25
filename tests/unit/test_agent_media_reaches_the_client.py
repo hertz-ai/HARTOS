@@ -620,15 +620,17 @@ class TestAnAgentsPictureRidesTheSlotABookPageUses:
             publish_agent_message(text='your reel is ready', user_id='u1',
                                   request_id='r1', prompt_id='54', media=[reel])
 
-        said = ' '.join(r.getMessage() for r in caplog.records).lower()
-        for claim in ('no client', 'renders them', 'reaches the person'):
-            assert claim not in said, claim
+        # The WHOLE line, not a list of banned phrases. Banning phrases is
+        # what let the earlier false claims through: a rewording walks past
+        # a blocklist, and this test is the one standing between a reel and
+        # being described as unrendered again. Pinning the rendered message
+        # means any added claim fails, however it is worded.
+        assert [r.getMessage() for r in caplog.records
+                if r.name == 'core.peer_link.crossbar_publish'] == [
+            'publish_agent_message: page_image_url is empty; video item(s) '
+            'ride `media` (user u1)']
         assert not [r for r in caplog.records if r.levelname == 'WARNING']
         assert published[0][1]['media'] == [reel]      # delivered untouched
-        # and it must not claim the slot took an image, because a reel has
-        # none and the slot is empty -- the same over-claim, one size down
-        assert 'carries the first image' not in said
-        assert 'is empty' in said
 
     def test_the_line_says_the_slot_took_an_image_when_it_did(self, published, caplog):
         """The other half of the branch, and nothing pinned it: a mutant
