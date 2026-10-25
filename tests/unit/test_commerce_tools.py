@@ -2055,6 +2055,24 @@ class TestHeldPayments:
             later = json.loads(ct.commerce_checkout(UID, out['mandate_id']))
             assert later['success'] is True and later['order_id'] == f'ORD-{status}'
 
+    def test_a_probe_answered_with_a_key_that_is_not_a_refusal_is_could_not_be_made(self, env):
+        # A 4xx with a McGroce key outside AP2_REFUSAL_KEYS is not McGroce
+        # refusing the mandate: the hold is "could not be made", not the
+        # changed cart.  No live producer at f199899; pinned so the set,
+        # not the presence of a key, decides.
+        out = self._paid_on_phonepe(env)
+        drifted = json.loads(json.dumps(ORDER))
+        drifted['orderItems'].pop()
+        env['fake'].on('GET', '/cart', body=drifted)
+        fake = env['fake']
+        keyed = _Resp(400, {'messages': [{'messageKey': 'VALIDATION_ERROR', 'message': 'x'}]})
+        with patch('core.http_pool.pooled_request',
+                   side_effect=signed_order_answers(fake, lambda: keyed)):
+            res = ct.complete_redirect_checkout(out['payment_id'])
+        assert res['success'] is False and 'cart_changed' not in res
+        assert 'put the cart back' not in pushed(env, 'notification')[-1]['message']
+        assert 'the order check could not be made' in owner_cards(env)[-1]['message']
+
     def test_a_probe_mcgroce_refused_by_its_own_key_is_still_the_changed_cart(self, env):
         out = self._paid_on_phonepe(env)
         drifted = json.loads(json.dumps(ORDER))
@@ -2126,11 +2144,17 @@ class TestHeldPayments:
         env['fake'].on('POST', AP2, status=503, body=None)
         ct.complete_redirect_checkout(out['payment_id'])         # marked
         env['fake'].on('GET', '/cart', *CART_GONE)
+        # McGroce is up again: the fake REFUSES a probe for a mandate no
+        # order carries (the route must be a 2xx for that logic to apply).
+        env['fake'].on('POST', AP2, body={'orderNumber': 'ORD-NEVER'})
+        n = len(env['fake'].called('POST', AP2))
         for _ in range(2):
             res = json.loads(ct.commerce_checkout(UID, out['mandate_id']))
-            assert res['needs_attention'] is True
+            assert res['needs_attention'] is True and 'cart_changed' not in res
             assert pushed(env, 'notification')[-1]['message'] == self.UNCONFIRMED
             assert 'Check McGroce' in owner_cards(env)[-1]['message']
+            assert 'could not be read' in owner_cards(env)[-1]['message']
+        assert len(env['fake'].called('POST', AP2)) == n + 2    # a refused probe each time
 
     # ── the mark, on every later hold ────────────────────────────────────
 

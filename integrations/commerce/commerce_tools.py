@@ -1021,8 +1021,9 @@ def _order_for_mandate(client, m, payment) -> Optional[Dict[str, Any]]:
     no lines), which McGroce answers with the order a placed one carries
     and refuses otherwise, so it can place nothing.  The order's answer
     when there is one (recorded, the tracking pushed).  None ONLY when
-    McGroce answered and refused (a 4xx: no placed order carries this
-    mandate), so the caller's cart-changed hold follows.  Otherwise the
+    McGroce answered and refused by one of its own keys (AP2_REFUSAL_KEYS:
+    no placed order carries this mandate), so the caller's cart-changed
+    hold follows.  Otherwise the
     hold itself: McGroce did not answer the probe, or was never asked (no
     probe could be signed; the call never left, the breaker open or the
     URL bad), and a shopper whose cart may hold the placed order must not

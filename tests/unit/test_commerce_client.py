@@ -267,6 +267,18 @@ class TestFailures:
         with patch('core.http_pool.pooled_request', return_value=wall):
             out = client.complete_ap2_checkout(hartos_user_id(4242), 'tok')
         assert out['success'] is False and out['status'] == 401 and 'key' not in out
+        # A keyed 4xx that is not a refusal keeps its key and is not in the set.
+        other = _Resp(400, {'messages': [{'messageKey': 'VALIDATION_ERROR',
+                                          'message': 'bad request'}]})
+        with patch('core.http_pool.pooled_request', return_value=other):
+            out = client.complete_ap2_checkout(hartos_user_id(4242), 'tok')
+        assert out['key'] == 'VALIDATION_ERROR' and out['key'] not in AP2_REFUSAL_KEYS
+        # Several messages: the FIRST key is the answer's key, the text has all.
+        many = _Resp(409, {'messages': [{'messageKey': 'AMOUNT_MISMATCH', 'message': 'a'},
+                                        {'messageKey': 'OTHER', 'message': 'b'}]})
+        with patch('core.http_pool.pooled_request', return_value=many):
+            out = client.complete_ap2_checkout(hartos_user_id(4242), 'tok')
+        assert out['key'] == 'AMOUNT_MISMATCH' and out['error'] == 'AMOUNT_MISMATCH: a; OTHER: b'
 
     def test_readiness_reads_the_refusal_from_the_key(self, client):
         refused = _Resp(403, {'messages': [{'messageKey': 'AP2_MANDATE_REJECTED',
