@@ -121,7 +121,7 @@ class TestTextLayer:
 
 class TestPageImages:
 
-    def test_a_page_image_is_never_served_half_written(self, tmp_path):
+    def test_a_page_image_is_never_served_half_written(self, tmp_path, monkeypatch):
         """_write_jpeg's claim: the page-image route never serves a
         half-written file.
 
@@ -136,8 +136,22 @@ class TestPageImages:
         '.part' suffix instead, which would have REJECTED a correct change to
         tempfile. It missed the defect and blocked the fix at once.
         """
+        import os
+
         out = tmp_path / 'page_1.jpg'
         seen = {}
+        published = []
+        real_replace, real_rename = os.replace, os.rename
+
+        def watch(src, dst, *args, **kwargs):
+            published.append((Path(src), Path(dst)))
+            return real_replace(src, dst, *args, **kwargs)
+
+        # Both spellings, so any atomic-rename primitive counts and none is
+        # required by name: Path.replace calls os.replace, shutil.move inside
+        # one directory calls os.rename.
+        monkeypatch.setattr(os, 'replace', watch)
+        monkeypatch.setattr(os, 'rename', watch)
 
         class HalfWritten:
             def save(self, target, *args, **kwargs):
@@ -148,9 +162,21 @@ class TestPageImages:
 
         bp._write_jpeg(HalfWritten(), out)
 
-        assert seen['served'] is False               # nothing partial, ever
+        assert seen['served'] is False               # nothing partial during the save
         assert out.read_bytes() == b'jpeg-bytes'
-        # No leftover beside it, whatever the implementation called it.
+
+        # And nothing partial during the PUBLISH either, which the fake above
+        # cannot see: it only looks while image.save runs. A publish that
+        # copies into the served name leaves it half-written for the length of
+        # the copy -- exactly what this test's name forbids -- and survived all
+        # 195 (MC_copy_publish). An atomic rename has no such window.
+        assert len(published) == 1, published
+        source, target = published[0]
+        assert target == out
+        # From the SAME directory, or the rename is not atomic -- and a temp
+        # left anywhere else escapes the leftover check below
+        # (MC_outside_leftover).
+        assert source.parent == out.parent
         assert list(tmp_path.iterdir()) == [out]
 
     def test_every_page_gets_an_image(self, book_node, tmp_path):
@@ -772,7 +798,10 @@ class TestLifecycle:
         # earlier -- at the start of the parse, say, which would leave the row
         # looking stale half an hour in -- compared EQUAL and passed 20 of 20
         # runs. With a fixed step the edges are exact and strict.
-        ticking = [datetime(2026, 10, 25, 12, 0, 0)]
+        # A day ahead of the real clock, not a fixed date: ME2 and
+        # MC_local_touch die by DISTANCE from this base, and a literal
+        # date could in principle be the real time.
+        ticking = [datetime.utcnow() + timedelta(days=1)]
 
         def one_second_each_call():
             ticking[0] += timedelta(seconds=1)
