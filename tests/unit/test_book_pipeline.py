@@ -149,17 +149,19 @@ class TestPageImages:
                 # Recorded only if it SUCCEEDED. shutil.move tries os.rename
                 # first and falls back to copy+delete on EXDEV, so counting
                 # the attempt let a cross-volume copy pass as a publish.
-                published.append((Path(dst), existed))
+                published.append((Path(dst), existed, Path(dst).stat().st_mtime_ns))
                 return result
             return spy
 
-        # Both spellings, so any atomic-rename primitive counts and none is
+        # Every primitive that makes a file appear atomically, so none is
         # required by name: Path.replace calls os.replace, shutil.move inside
-        # one directory calls os.rename. Each keeps its OWN primitive -- routing
-        # rename through replace would hide a rename that fails on Windows
-        # because the target exists.
+        # one directory calls os.rename, and os.link is atomic too -- rejecting
+        # a link publish was this test dictating an implementation again.
+        # Each keeps its OWN primitive: routing rename through replace would
+        # hide a rename that fails on Windows because the target exists.
         monkeypatch.setattr(os, 'replace', watching(os.replace))
         monkeypatch.setattr(os, 'rename', watching(os.rename))
+        monkeypatch.setattr(os, 'link', watching(os.link))
 
         class HalfWritten:
             def save(self, target, *args, **kwargs):
@@ -179,7 +181,7 @@ class TestPageImages:
         # the copy -- exactly what this test's name forbids -- and survived all
         # 195 (MC_copy_publish). An atomic rename has no such window.
         assert len(published) == 1, published
-        target, served_existed = published[0]
+        target, served_existed, at_publish = published[0]
         assert target == out
         # Nothing had reached the served name before that atomic publish. A
         # copy into place FOLLOWED by a same-folder rename counts one rename
@@ -193,6 +195,10 @@ class TestPageImages:
         # volumes raises EXDEV rather than copying silently (measured), so a
         # folder or st_dev rule would reject correct code and catch nothing
         # the two assertions above miss.
+        # And nothing touched the served name AFTER the publish. An atomic
+        # publish followed by an in-place rewrite serves a half-written file
+        # just as surely, and passed because nothing looked past the rename.
+        assert out.stat().st_mtime_ns == at_publish
         assert list(tmp_path.iterdir()) == [out]
 
     def test_every_page_gets_an_image(self, book_node, tmp_path):
