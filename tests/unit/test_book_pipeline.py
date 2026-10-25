@@ -755,10 +755,20 @@ class TestLifecycle:
                       for c in BookFile.__table__.c if c.name != 'updated_at'}
 
         step = bp._make_step(None, file_id, '42', 'req-fresh', 'fresh.pdf', [])
-        # Bracketed by two readings, so the stamp must land BETWEEN them. The
-        # earlier version asserted only that the row was no longer condemnable,
-        # which a touch writing LOCAL time satisfies by stamping it 5.5 h ahead
-        # -- never stale, and never right either (mutant MC_local_touch).
+
+        # A clock that steps one second per call, installed only for the
+        # measured window. Two real readings bracket the stamp only to the
+        # clock's TICK, so a touch reusing a stamp captured microseconds
+        # earlier -- at the start of the parse, say, which would leave the row
+        # looking stale half an hour in -- compared EQUAL and passed 20 of 20
+        # runs. With a fixed step the edges are exact and strict.
+        ticking = [datetime(2026, 10, 25, 12, 0, 0)]
+
+        def one_second_each_call():
+            ticking[0] += timedelta(seconds=1)
+            return ticking[0]
+
+        monkeypatch.setattr(bp, '_utcnow', one_second_each_call)
         opened = bp._utcnow()
         step('page 1 of 3', 33, page_number=1)
         closed = bp._utcnow()
@@ -773,7 +783,11 @@ class TestLifecycle:
             # source independent of the one under test, which is a
             # system-level question rather than this test's.
             assert bp._stall_reason(row) is None
-            assert opened <= row.updated_at <= closed
+            # STRICT: the stamp came from the touch's own call, not from a
+            # reading taken before the window or after it. A stamp reused from
+            # earlier in the parse now equals `opened` and fails here, where
+            # the inclusive real-clock version accepted it.
+            assert opened < row.updated_at < closed
             # And nothing BUT updated_at: checking status alone let a touch
             # that also wrote error= pass all 192 (mutant MT6).
             after = {c.name: getattr(row, c.name)
