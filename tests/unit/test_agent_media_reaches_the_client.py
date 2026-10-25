@@ -21,6 +21,7 @@ import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -237,6 +238,172 @@ class TestTheStoreVouchesForEveryItem:
         assert 'No space left on device' in said
         # the operator's log may name the path; nothing here returns it
         assert json.dumps(items) == '[]'
+
+
+@pytest.fixture()
+def rr():
+    pytest.importorskip('autogen', reason='autogen not installed')
+    from hartos import reuse_recipe
+    return reuse_recipe
+
+
+@pytest.fixture()
+def publisher(monkeypatch):
+    """hart_intelligence.publish_async, as safe_hartos_attr resolves it."""
+    pub = MagicMock(name='publish_async')
+    monkeypatch.setitem(sys.modules, 'hart_intelligence',
+                        SimpleNamespace(publish_async=pub))
+    return pub
+
+
+@pytest.fixture()
+def real_store(tmp_path, monkeypatch):
+    """A REAL UserFileStore on a throwaway root, with a real uploads tree.
+
+    M1 needs the real store, not the fake one above: the reply calls
+    chat_attachments.take_outbound, and only the real store records the
+    prompt_id and request_id it is then asked for. A fake cannot fail a
+    wrong binding, which is one of the three mutants the review measured
+    surviving. Patching the _STORE singleton makes media_items_for and
+    take_outbound share one instance, as they do in production.
+    """
+    import core.platform_paths as pp
+    import core.user_file_store as ufs
+    page_dir = tmp_path / 'uploads' / 'pdf_parse' / '10'
+    page_dir.mkdir(parents=True)
+    (page_dir / 'page_2.jpg').write_bytes(JPEG)
+    monkeypatch.setattr(pp, 'get_uploads_dir', lambda: str(tmp_path / 'uploads'))
+    monkeypatch.setattr(ufs, '_STORE', ufs.UserFileStore(root=str(tmp_path / 'store')))
+    return ufs._STORE
+
+
+def _drive_reuse_turn(rr, monkeypatch, answer_obj, user, prompt, request_id,
+                      then=None):
+    """Run the REAL get_agent_response for one turn ending on the agent's
+    answer, and return its reply.
+
+    Modelled on the house harness, tests/unit/
+    test_reuse_final_answer_is_the_reply.py::_drive_turn, rather than
+    invented: fakes only at the boundaries (the autogen agents, the HTTP
+    pool, the scheduler), so the function's own path to its answer branch
+    is the real one.
+    """
+    from flask import Flask
+    user_prompt = f'{user}_{prompt}'
+    action = {'action_id': 1, 'action': 'Show her the page',
+              'can_perform_without_user_input': 'no', 'recipe': []}
+    monkeypatch.setattr(rr, 'recipes', {user_prompt: {'actions': [action]}})
+    monkeypatch.setattr(rr, 'user_tasks', {user_prompt: rr.Action([action])})
+    monkeypatch.setattr(rr, 'user_ledgers', {})
+    monkeypatch.setattr(rr, 'request_id_list', {user_prompt: request_id})
+    monkeypatch.setattr(rr, 'request_id_list_sent_intermediate', {})
+
+    group_chat = SimpleNamespace(messages=[], agents=[])
+    manager = SimpleNamespace(_oai_messages={})
+
+    rounds = []
+
+    def initiate_chat(recipient, message=None, **_kw):
+        group_chat.messages.append(
+            {'role': 'user', 'name': 'ChatInstructor', 'content': message})
+        group_chat.messages.append(
+            {'role': 'assistant', 'name': 'Assistant',
+             'content': json.dumps(answer_obj)})
+        # `then` ends the round on the verifier's verdict, so the turn is
+        # finalised by the POST-LOOP extractor (site 2) instead of the
+        # in-loop branch (site 1). First round only, as the house harness
+        # does it.
+        if then is not None and not rounds:
+            group_chat.messages.append(then)
+        rounds.append(message)
+
+    agent = SimpleNamespace(initiate_chat=initiate_chat, name='Assistant')
+    with patch.object(rr, 'pooled_post'), \
+            patch.object(rr, 'scheduler') as sched, \
+            Flask('m1-media').app_context():
+        sched.get_job.return_value = None
+        return rr.get_agent_response(
+            agent, agent, SimpleNamespace(name='helper'), agent, manager,
+            group_chat, 'show me page 2', 'user', user, prompt, request_id)
+
+
+class TestTheMainAnswerDeliversMediaThroughTheReply:
+    """M1 of the e0661827a review: nothing drove get_agent_response through
+    to the reply, so deleting either call site -- or binding the wrong
+    request_id -- left every test green.
+
+    This drives the REAL function and then asks the REAL taker, which is
+    what _chat_reply calls (hart_intelligence_entry.py:9024). A wrong
+    request_id fails it, because take_replied filters on the turn's own id.
+    """
+
+    def test_the_turn_puts_its_media_where_the_reply_takes_it(
+            self, real_store, rr, publisher, monkeypatch):
+        from core.chat_attachments import take_outbound
+        url = '/uploads/pdf_parse/10/page_2.jpg'
+
+        reply = _drive_reuse_turn(
+            rr, monkeypatch,
+            {'message2userfinal': 'here is page 2',
+             MEDIA_REPLY_KEY: [{'type': 'image', 'url': url}]},
+            'm1-user', 4242, 'req-m1')
+
+        assert reply == 'here is page 2'
+        media = take_outbound('m1-user', 4242, 'req-m1')
+        assert [m['url'] for m in media] == [url]
+        assert media[0]['xid'] == hashlib.sha256(JPEG).hexdigest()
+        assert media[0]['kind'] == 'image'
+
+    def test_a_turn_with_no_media_leaves_the_reply_with_none(
+            self, real_store, rr, publisher, monkeypatch):
+        from core.chat_attachments import take_outbound
+
+        reply = _drive_reuse_turn(
+            rr, monkeypatch, {'message2userfinal': 'just words'},
+            'm1-user', 4242, 'req-m1')
+
+        assert reply == 'just words'
+        assert take_outbound('m1-user', 4242, 'req-m1') == []
+
+    def test_the_post_loop_answer_delivers_its_media_too(
+            self, real_store, rr, publisher, monkeypatch):
+        """Site 2, and it was NOT covered until this test existed.
+
+        When the round ends on the verifier's verdict the turn is finalised
+        by the post-loop extractor, not the in-loop branch. The mutant that
+        deletes THAT call survived all 34 tests while the site-1 mutant
+        died -- so "both sites are carried" was a claim one site held up.
+        """
+        from core.chat_attachments import take_outbound
+        url = '/uploads/pdf_parse/10/page_2.jpg'
+        verdict = {'role': 'assistant', 'name': 'StatusVerifier',
+                   'content': json.dumps({'status': 'completed',
+                                          'action_id': 1})}
+
+        reply = _drive_reuse_turn(
+            rr, monkeypatch,
+            {'message2userfinal': 'here is page 2',
+             MEDIA_REPLY_KEY: [{'type': 'image', 'url': url}]},
+            'm1-user', 4242, 'req-m1', then=verdict)
+
+        assert reply == 'here is page 2'
+        media = take_outbound('m1-user', 4242, 'req-m1')
+        assert [m['url'] for m in media] == [url]
+        assert media[0]['xid'] == hashlib.sha256(JPEG).hexdigest()
+
+    def test_an_invented_url_reaches_no_reply(
+            self, real_store, rr, publisher, monkeypatch):
+        """The guard holds on the real path, not only in isolation."""
+        from core.chat_attachments import take_outbound
+
+        _drive_reuse_turn(
+            rr, monkeypatch,
+            {'message2userfinal': 'here',
+             MEDIA_REPLY_KEY: [{'type': 'image',
+                                'url': '/uploads/pdf_parse/10/ghost.jpg'}]},
+            'm1-user', 4242, 'req-m1')
+
+        assert take_outbound('m1-user', 4242, 'req-m1') == []
 
 
 class TestTheTwoSynthesisSteersDiffer:
