@@ -588,12 +588,10 @@ class TestAnAgentsPictureRidesTheSlotABookPageUses:
 
         assert published[0][1]['page_image_url'] == '/uploads/a/first.jpg'
 
-    def test_a_kind_no_client_shows_is_logged_not_dropped_silently(
-            self, published, caplog):
-        """hevolve-cc12's M2: the slot holds one IMAGE, so a video or an
-        html page the template still offers reaches nobody. Being silent
-        about that is how this lane got here twice already."""
-        with caplog.at_level('WARNING'):
+    def test_the_kinds_the_slot_could_not_take_are_named(self, published, caplog):
+        """A kind must not vanish from the record in silence -- but the line
+        says only what THIS function knows."""
+        with caplog.at_level('INFO'):
             publish_agent_message(
                 text='t', user_id='u1', request_id='r1', prompt_id='54',
                 media=[{'kind': 'video', 'url': '/uploads/a/clip.mp4'},
@@ -604,14 +602,29 @@ class TestAnAgentsPictureRidesTheSlotABookPageUses:
         assert published[0][1]['page_image_url'] == ''
         assert len(published[0][1]['media']) == 2      # still carried
 
-    def test_an_image_alone_is_not_called_unshown(self, published, caplog):
-        with caplog.at_level('WARNING'):
-            publish_agent_message(
-                text='t', user_id='u1', request_id='r1', prompt_id='54',
-                media=[{'kind': 'image', 'url': '/uploads/a/p.jpg'}])
+    def test_a_reel_is_never_described_as_unrendered(self, published, caplog):
+        """f92d0846f's F1, measured by hevolve-cc12 and correct.
 
-        assert 'no client renders' not in \
-            ' '.join(r.getMessage() for r in caplog.records)
+        Reel Studio publishes EVERY reel through this function
+        (reel_studio/pipeline.py:569, kind 'video'), and the phone renders
+        exactly that item -- ReelInbox.onPush via ReelMedia.isDeliverable.
+        The warning I had written fired on all of them and said no client
+        renders them, which is false, and the test I wrote pinned the
+        falsehood. The publisher cannot know what a client draws, so it may
+        not say.
+        """
+        reel = {'kind': 'video', 'xid': 'a' * 64, 'sha256': 'a' * 64,
+                'mime': 'video/mp4', 'url': '/uploads/a/reel.mp4'}
+
+        with caplog.at_level('DEBUG'):
+            publish_agent_message(text='your reel is ready', user_id='u1',
+                                  request_id='r1', prompt_id='54', media=[reel])
+
+        said = ' '.join(r.getMessage() for r in caplog.records).lower()
+        for claim in ('no client', 'renders them', 'reaches the person'):
+            assert claim not in said, claim
+        assert not [r for r in caplog.records if r.levelname == 'WARNING']
+        assert published[0][1]['media'] == [reel]      # delivered untouched
 
     def test_a_message_with_no_image_leaves_the_slot_empty(self, published):
         for media in (None, [], [{'kind': 'video', 'url': '/uploads/a/clip.mp4'}],

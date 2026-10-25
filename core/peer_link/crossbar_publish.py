@@ -270,19 +270,24 @@ def publish_agent_message(
         payload['page_image_url'] = next(
             (it['url'] for it in items
              if it.get('kind') == 'image' and isinstance(it.get('url'), str)), '')
-        # The slot holds ONE IMAGE, so a video or an html page an agent
-        # attached has no client that shows it today -- the reply template
-        # still offers those kinds.  Say so in the log rather than drop them
-        # in silence, which is the defect this lane keeps repeating: a
-        # capability advertised to the model that nothing downstream
-        # honours.  They still ride `media` for whatever reads it.
-        unshown = sorted({it.get('kind') for it in items
-                          if it.get('kind') != 'image'} - {None})
-        if unshown:
-            logger.warning(
-                "publish_agent_message: %s item(s) ride `media` but no client "
-                "renders them today; only an image reaches the person, through "
-                "page_image_url (user %s)", ', '.join(unshown), user_id)
+        # Which items the slot could NOT take, so a kind is never dropped
+        # from the record in silence.  It says only what THIS function
+        # knows -- the slot holds one image, everything else rides `media`
+        # -- and nothing about what a client renders, because the publisher
+        # cannot know that.
+        #
+        # f92d0846f claimed it could: it logged a WARNING that "no client
+        # renders them today", which fires on EVERY Reel Studio delivery
+        # (pipeline.py:569 publishes each reel here with kind 'video') and
+        # is false -- the phone renders exactly that item.  A warning is
+        # also the wrong level for a fact about the envelope.
+        rides_media_only = sorted({it.get('kind') for it in items
+                                   if it.get('kind') != 'image'} - {None})
+        if rides_media_only:
+            logger.info(
+                "publish_agent_message: page_image_url carries the first image "
+                "only; %s item(s) ride `media` (user %s)",
+                ', '.join(rides_media_only), user_id)
     try:
         from core.peer_link.message_bus import chat_topic_for
         from core.safe_hartos_attr import safe_hartos_attr
