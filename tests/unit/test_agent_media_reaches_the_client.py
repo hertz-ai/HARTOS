@@ -630,11 +630,33 @@ class TestAnAgentsPictureRidesTheSlotABookPageUses:
         assert 'carries the first image' not in said
         assert 'is empty' in said
 
-    def test_a_malformed_kind_costs_only_itself(self, published):
+    def test_the_line_says_the_slot_took_an_image_when_it_did(self, published, caplog):
+        """The other half of the branch, and nothing pinned it: a mutant
+        that ALWAYS logged "is empty" survived, because every existing test
+        exercised only the no-image side."""
+        with caplog.at_level('INFO'):
+            publish_agent_message(
+                text='t', user_id='u1', request_id='r1', prompt_id='54',
+                media=[{'kind': 'image', 'url': '/uploads/a/p.jpg'},
+                       {'kind': 'video', 'url': '/uploads/a/clip.mp4'}])
+
+        said = ' '.join(r.getMessage() for r in caplog.records)
+        assert 'carries the first image' in said
+        assert 'is empty' not in said
+        assert published[0][1]['page_image_url'] == '/uploads/a/p.jpg'
+
+    def test_a_malformed_kind_cannot_break_the_publish(self, published):
         """The kind collection sits OUTSIDE the try that guards publishing,
         so a sort over mixed types raised TypeError and lost the whole
         message -- the person's answer destroyed for the sake of a log
-        line. A bad item may cost itself and nothing else."""
+        line.
+
+        Named for what it actually holds. fc47e967a called this "a bad kind
+        costs itself", which the reviewer correctly refused: the malformed
+        item still rides `media` and reaches the client untouched, as the
+        last assertion here shows. It costs nothing; it simply cannot break
+        the publish any more.
+        """
         assert publish_agent_message(
             text='here is your answer', user_id='u1', request_id='r1',
             prompt_id='54',

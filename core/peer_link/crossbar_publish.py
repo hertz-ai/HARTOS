@@ -284,8 +284,12 @@ def publish_agent_message(
         # str() on every kind, because this sort MUST NOT RAISE.  It sits
         # outside the try below, so sorted() over a set mixing 'video' with
         # a non-string kind threw TypeError and killed the delivery of the
-        # whole message -- for a log line.  A malformed item costs itself,
-        # never the person's answer.
+        # whole message -- for a log line.
+        #
+        # fc47e967a said "a malformed item costs itself"; that was not true
+        # either.  The item still rides `media` and reaches the client
+        # exactly as sent.  It costs NOTHING here: all this does is stop a
+        # log line from breaking the publish.
         rides_media_only = sorted(
             {str(it.get('kind')) for it in items
              if it.get('kind') is not None and it.get('kind') != 'image'})
