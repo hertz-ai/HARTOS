@@ -508,8 +508,16 @@ def save_conversation_db(text, user_id, prompt_id, database_url, request_id):
     return helper_fun.save_conversation_db(text, user_id, prompt_id, database_url, request_id)
 
 
-def send_message_to_user1(user_id, response, inp, prompt_id):
+def send_message_to_user1(user_id, response, inp, prompt_id, media_refs=None):
     """Publish an intermediate agent response to the user.
+
+    ``media_refs``: what the agent wrote beside its message2user --
+    ``[{'type': 'image'|'video'|'html', 'url': '/uploads/...'}]`` -- for the
+    owner's 2026-10-25 order that an agent be able to SHOW the person an
+    image, a video or a page.  helper.media_items_for turns each reference
+    into an item the file store has vouched for, dropping any url with no
+    real file behind it.  None or [] publishes exactly what this did before.
+    REUSE's send_message_to_user1 takes the same argument.
 
     Deployment-mode-aware (2026-06-09):
 
@@ -558,9 +566,12 @@ def send_message_to_user1(user_id, response, inp, prompt_id):
     if is_bundled():
         # Bundled (Nunba install) — local chat topic, on-device.
         from core.peer_link.crossbar_publish import publish_agent_message
+        from hartos.helper import media_items_for
+        media = media_items_for(user_id, media_refs, prompt_id=prompt_id,
+                                request_id=request_id)
         if publish_agent_message(text=response, user_id=user_id,
                                  request_id=request_id, prompt_id=prompt_id,
-                                 inp=inp):
+                                 inp=inp, media=media):
             return sent
         return failed
 
@@ -770,7 +781,8 @@ def visual_execution(task_description: str, user_id: int, prompt_id: int):
                 try:
                     json_obj = retrieve_json(last_message['content'])
                     if json_obj and 'message2user' in json_obj:
-                        send_message_to_user1(user_id, json_obj['message2user'], task_description, prompt_id)
+                        send_message_to_user1(user_id, json_obj['message2user'], task_description, prompt_id,
+                                              media_refs=json_obj.get('media'))
                 except Exception as e:
                     current_app.logger.error(f"Error processing visual agent response: {e}")
     except Exception as e:
@@ -3773,7 +3785,8 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
             if json_obj:
                 try:
                     current_app.logger.info('Sending user the message')
-                    send_message_to_user1(user_id,json_obj['message2user'],'',prompt_id)
+                    send_message_to_user1(user_id, json_obj['message2user'], '', prompt_id,
+                                          media_refs=json_obj.get('media'))
                 except Exception:
                     pass
                 return "auto"

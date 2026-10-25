@@ -5676,3 +5676,95 @@ async def subscribe_and_return(message, topic, time=1800000):
                 await component.stop()
             except Exception as e:
                 current_app.logger.error(f"Error stopping component in finally: {e}")
+
+
+# ── media an agent wants the person to SEE ───────────────────────────────
+#
+# The owner, 2026-10-25: "if there is an image url to display in frointeend
+# and agent want to set it in response to show to user , it could be text to
+# image response, it could also be video url when video is generated, all
+# modalities we have a way to set in response and render play or show it".
+#
+# No new channel. The agent names media beside its message2userfinal,
+# send_message_to_user1 hands the references here, and publish_agent_message
+# already carries a `media` list -- the reel pipeline has sent one since
+# reel_studio. Same shape, so one renderer on each client serves both.
+#
+# Every item carries BOTH addresses, because the two clients fetch
+# differently (traced in both clients on 2026-10-25 by
+# fix-all-log-observed-issues): the desktop renders `url`, served
+# same-origin by this same Flask, and the phone fetches `xid` over the
+# device link, which keeps working through the relay where a LAN URL does
+# not.
+
+#: The kinds an agent may ask for, and the MIME each file must really be.
+#: The FILE decides: a reference whose own file contradicts its kind is
+#: dropped, never relabelled. A model sure enough to name the wrong kind is
+#: guessing, and the next thing it guesses is the path.
+MEDIA_KIND_MIMES = {
+    'image': {'.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
+              '.gif': 'image/gif', '.webp': 'image/webp'},
+    'video': {'.mp4': 'video/mp4', '.webm': 'video/webm'},
+    'html': {'.html': 'text/html', '.htm': 'text/html'},
+}
+
+
+def media_items_for(user_id, refs, *, prompt_id, request_id):
+    """Reply ``media`` items for the files an agent asked to show.
+
+    ``refs`` is what the agent put beside its ``message2userfinal``:
+    ``[{'type': 'image'|'video'|'html', 'url': '/uploads/...', 'caption'?}]``
+    -- already the shape media_agent._generate_image returns. Anything else
+    in the list is ignored.
+
+    A reference becomes an item only when a real file is behind it. THE
+    MODEL INVENTS: on 2026-10-25 (request_id t1-retrieval-102136) an agent
+    answered out of "The Art of Computer Programming", a book in no row of
+    pdf_files and in no agent-data file. One that invents a book will invent
+    a path, and an invented path reaching a client is a broken frame in her
+    chat. So every url goes through resolve_upload_url -- which already
+    refuses traversal and UNC -- and a url with no file behind it is dropped
+    and logged.
+
+    Each surviving file is copied into her outbox by the store, which writes
+    its own facts into the item (xid, sha256, size, mime, prompt_id,
+    request_id), so the item and the file cannot disagree. One bad reference
+    costs only itself: the answer still goes, carrying the items that are
+    real.
+    """
+    from core.user_file_store import OUTBOUND_PURPOSE, get_user_file_store
+    from integrations.learning.book_pipeline import resolve_upload_url, upload_url_for
+
+    if not isinstance(refs, (list, tuple)):
+        return []
+    store, items = None, []
+    for ref in refs:
+        if not isinstance(ref, dict):
+            continue
+        kind, url = ref.get('type'), ref.get('url')
+        wanted = MEDIA_KIND_MIMES.get(kind) if isinstance(kind, str) else None
+        if wanted is None or not isinstance(url, str):
+            _safe_log('warning', f"media: ignoring the reference {ref!r}")
+            continue
+        path = resolve_upload_url(url)
+        if path is None:
+            _safe_log('warning', f"media: nothing is behind {url!r}, dropped")
+            continue
+        mime = wanted.get(path.suffix.lower())
+        if mime is None:
+            _safe_log('warning', f"media: {url!r} is not a {kind}, dropped")
+            continue
+        item = {'kind': kind, 'url': upload_url_for(path)}
+        caption = ref.get('caption')
+        if isinstance(caption, str) and caption.strip():
+            item['caption'] = caption.strip()
+        try:
+            store = store or get_user_file_store()
+            stored = store.offer_to_device(
+                user_id, str(path), mime=mime, purpose=OUTBOUND_PURPOSE,
+                prompt_id=prompt_id, request_id=request_id,
+                meta={'media': item}, name=path.name)
+            items.append(stored.meta['media'])
+        except (OSError, ValueError) as e:
+            _safe_log('warning', f"media: the store refused {url!r}: {e}")
+    return items

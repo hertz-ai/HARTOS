@@ -586,9 +586,19 @@ def clear_message_tracking(user_prompt, unique_message_key):
         pass
 
 
-def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_delay=50):
+def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_delay=50,
+                          media_refs=None):
     """
     Send message to user with improved tracking of sent messages
+
+    ``media_refs``: what the agent wrote beside its message2userfinal --
+    ``[{'type': 'image'|'video'|'html', 'url': '/uploads/...'}]`` -- for the
+    owner's 2026-10-25 order that an agent be able to show the person an
+    image, a video or a page, not only tell them about it.  helper
+    .media_items_for turns each reference into an item the file store has
+    vouched for, DROPPING any url with no real file behind it, and
+    publish_agent_message already carries them.  None or [] publishes
+    exactly the message this sent before.
     """
     user_prompt = f'{user_id}_{prompt_id}'
     random_num = random.randint(1000, 9999)
@@ -652,9 +662,12 @@ def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_dela
     # REUSE: core.peer_link.crossbar_publish.publish_agent_message.
     if is_bundled():
         from core.peer_link.crossbar_publish import publish_agent_message
+        from hartos.helper import media_items_for
+        media = media_items_for(user_id, media_refs, prompt_id=prompt_id,
+                                request_id=intermediate_request_id)
         if publish_agent_message(text=response, user_id=user_id,
                                  request_id=intermediate_request_id,
-                                 prompt_id=prompt_id, inp=inp):
+                                 prompt_id=prompt_id, inp=inp, media=media):
             _ctx_safe_log(
                 'info',
                 f'Message published locally with request_id: {intermediate_request_id}')
@@ -709,7 +722,8 @@ def _reuse_speaker_says_to_user(user_id, message, prompt_id, inp=''):
     json_obj = retrieve_json((message or {}).get('content') or '')
     if not isinstance(json_obj, dict) or 'message2userfinal' not in json_obj:
         return False
-    send_message_to_user1(user_id, json_obj['message2userfinal'], inp, prompt_id)
+    send_message_to_user1(user_id, json_obj['message2userfinal'], inp, prompt_id,
+                          media_refs=json_obj.get('media'))
     return True
 
 

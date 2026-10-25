@@ -205,7 +205,9 @@ def publish_agent_message(
     ``media``: reply media items (Reel Studio's reel, plan 4.2(f)) the
     message carries under ``media``; non-object entries are dropped.  A
     message still needs text: media alone is not sent.  Without media the
-    envelope is exactly the one above.
+    envelope is exactly the one above.  With media, the first ``image``
+    item's url also fills the legacy ``page_image_url``, which is the only
+    image slot the desktop reads today.
 
     ``skip_crossbar``: keep the message on this node's own legs -- LOCAL,
     SSE and the user's own devices over PeerLink, which is how the phone
@@ -245,6 +247,15 @@ def publish_agent_message(
         if isinstance(media, (list, tuple)) else []
     if items:
         payload['media'] = items
+        # The desktop's own image slot (Demopage.js:2466 sets uploadedImage
+        # from page_image_url) predates `media` and is the only one it reads
+        # today, so the first image item fills it as well.  DERIVED, never a
+        # parameter: publish_thinking_trace already takes a page_image_url
+        # and not one of its five production callers passes it -- a
+        # parameter nobody passes is how this slot went dead the first time.
+        payload['page_image_url'] = next(
+            (it['url'] for it in items
+             if it.get('kind') == 'image' and isinstance(it.get('url'), str)), '')
     try:
         from core.peer_link.message_bus import chat_topic_for
         from core.safe_hartos_attr import safe_hartos_attr
