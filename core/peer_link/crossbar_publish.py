@@ -281,12 +281,25 @@ def publish_agent_message(
         # (pipeline.py:569 publishes each reel here with kind 'video') and
         # is false -- the phone renders exactly that item.  A warning is
         # also the wrong level for a fact about the envelope.
-        rides_media_only = sorted({it.get('kind') for it in items
-                                   if it.get('kind') != 'image'} - {None})
+        # str() on every kind, because this sort MUST NOT RAISE.  It sits
+        # outside the try below, so sorted() over a set mixing 'video' with
+        # a non-string kind threw TypeError and killed the delivery of the
+        # whole message -- for a log line.  A malformed item costs itself,
+        # never the person's answer.
+        rides_media_only = sorted(
+            {str(it.get('kind')) for it in items
+             if it.get('kind') is not None and it.get('kind') != 'image'})
         if rides_media_only:
+            # Says what the slot ACTUALLY did. Saying "carries the first
+            # image" when there is no image was the same over-claim as the
+            # warning this replaced, one size smaller -- and it was wrong in
+            # exactly the Reel Studio case, where the items are videos and
+            # the slot stays empty.
             logger.info(
-                "publish_agent_message: page_image_url carries the first image "
-                "only; %s item(s) ride `media` (user %s)",
+                "publish_agent_message: page_image_url %s; %s item(s) ride "
+                "`media` (user %s)",
+                'carries the first image' if payload['page_image_url']
+                else 'is empty',
                 ', '.join(rides_media_only), user_id)
     try:
         from core.peer_link.message_bus import chat_topic_for

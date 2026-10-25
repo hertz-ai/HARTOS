@@ -625,6 +625,27 @@ class TestAnAgentsPictureRidesTheSlotABookPageUses:
             assert claim not in said, claim
         assert not [r for r in caplog.records if r.levelname == 'WARNING']
         assert published[0][1]['media'] == [reel]      # delivered untouched
+        # and it must not claim the slot took an image, because a reel has
+        # none and the slot is empty -- the same over-claim, one size down
+        assert 'carries the first image' not in said
+        assert 'is empty' in said
+
+    def test_a_malformed_kind_costs_only_itself(self, published):
+        """The kind collection sits OUTSIDE the try that guards publishing,
+        so a sort over mixed types raised TypeError and lost the whole
+        message -- the person's answer destroyed for the sake of a log
+        line. A bad item may cost itself and nothing else."""
+        assert publish_agent_message(
+            text='here is your answer', user_id='u1', request_id='r1',
+            prompt_id='54',
+            media=[{'kind': 7, 'url': '/uploads/a/x.bin'},
+                   {'kind': ['nested'], 'url': '/uploads/a/y.bin'},
+                   {'kind': 'image', 'url': '/uploads/a/p.jpg'}])
+
+        payload = published[0][1]
+        assert payload['text'] == ['here is your answer']
+        assert payload['page_image_url'] == '/uploads/a/p.jpg'
+        assert len(payload['media']) == 3
 
     def test_a_message_with_no_image_leaves_the_slot_empty(self, published):
         for media in (None, [], [{'kind': 'video', 'url': '/uploads/a/clip.mp4'}],
