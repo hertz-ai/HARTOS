@@ -231,20 +231,31 @@ def published(monkeypatch):
     return sent
 
 
-class TestTheLegacyImageSlotIsFilledFromTheItem:
-    """Demopage.js:2466 shows an image from ``page_image_url`` and reads no
-    ``media`` at all (both clients traced 2026-10-25). publish_agent_message
-    hard-coded that slot to '', so an agent's page image reached the desktop
-    by no route whatever.
+class TestTheLegacyImageSlotIsLeftAlone:
+    """``media`` is the ONE path; the legacy slot is not a spare image field.
 
-    It is filled FROM the item rather than from a new parameter, because
-    publish_thinking_trace already takes a page_image_url and not one of its
-    five production callers passes it -- a parameter nobody passes is how
-    this slot went dead the first time. Derived, it cannot disagree with the
-    item beside it, and every caller gets it without remembering to.
+    ad729fcc9 derived page_image_url from the first image item, reasoning
+    that it was the only slot the desktop read. That was wrong, and this is
+    the guard against reinstating it.
+
+    ``page_image_url`` is not "an image": on the desktop
+    ``setUploadedImage(parsed.page_image_url)`` (Demopage.js:2477, :2558)
+    switches the left panel to the PdfViewer book-page view, and the gate at
+    :5179 forces that panel w-full whenever uploadedImage is set -- in text
+    mode too. Beside a client that renders ``media`` (Nunba 523b8b71), a
+    derived slot draws the same picture twice AND rearranges the screen. On
+    the phone the slot is loaded by Glide with no base URL, so a
+    desktop-relative '/uploads/...' resolves to nothing and the card comes
+    up empty.
+
+    Each client fetches the way it can -- the desktop by ``url``, the phone
+    by ``xid`` -- and every item carries both, which is what makes the
+    second path unnecessary rather than merely redundant.
     """
 
-    def test_the_first_image_fills_the_legacy_slot(self, published):
+    def test_media_never_fills_the_legacy_slot(self, published):
+        """The regression guard. A reply's media must not reach the slot
+        that drives the book-page panel and the phone's Glide card."""
         media = [{'kind': 'image', 'url': '/uploads/pdf_parse/10/page_2.jpg',
                   'xid': 'a' * 64}]
 
@@ -252,27 +263,22 @@ class TestTheLegacyImageSlotIsFilledFromTheItem:
                                      request_id='r1', prompt_id='54', media=media)
 
         payload = published[0][1]
-        assert payload['page_image_url'] == '/uploads/pdf_parse/10/page_2.jpg'
-        assert payload['media'] == media        # the new path carries it too
+        assert payload['page_image_url'] == ''
+        assert payload['media'] == media        # and the one real path is intact
 
-    def test_the_slot_holds_the_first_image_whatever_else_rode_along(self, published):
-        """The slot holds exactly one url, so which one is a real choice:
-        the FIRST image, past any non-image before it, and not the last."""
-        publish_agent_message(
-            text='t', user_id='u1', request_id='r1', prompt_id='54',
-            media=[{'kind': 'video', 'url': '/uploads/a/clip.mp4'},
-                   {'kind': 'image', 'url': '/uploads/a/first.jpg'},
-                   {'kind': 'image', 'url': '/uploads/a/second.jpg'}])
+    def test_the_items_ride_in_order_and_unaltered(self, published):
+        """Several kinds at once reach the client as sent: the publisher
+        chooses no favourite among them and rewrites none of them."""
+        media = [{'kind': 'video', 'url': '/uploads/a/clip.mp4', 'xid': 'b' * 64},
+                 {'kind': 'image', 'url': '/uploads/a/first.jpg', 'xid': 'c' * 64},
+                 {'kind': 'html', 'url': '/uploads/a/note.html', 'xid': 'd' * 64}]
 
-        assert published[0][1]['page_image_url'] == '/uploads/a/first.jpg'
+        publish_agent_message(text='t', user_id='u1', request_id='r1',
+                              prompt_id='54', media=media)
 
-    def test_a_message_with_no_image_leaves_the_slot_empty(self, published):
-        for media in (None, [], [{'kind': 'video', 'url': '/uploads/a/clip.mp4'}],
-                      [{'kind': 'image', 'xid': 'a' * 64}]):   # an item with no url
-            published.clear()
-            publish_agent_message(text='t', user_id='u1', request_id='r1',
-                                  prompt_id='54', media=media)
-            assert published[0][1]['page_image_url'] == '', media
+        payload = published[0][1]
+        assert payload['media'] == media
+        assert payload['page_image_url'] == ''
 
     def test_a_text_only_message_is_the_envelope_it_always_was(self, published):
         """Without media the envelope is exactly the one subscribers have
