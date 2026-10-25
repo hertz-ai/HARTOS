@@ -4920,16 +4920,19 @@ _REUSE_SYNTHESIS_ANSWER_SHAPE = (
     "Address your reply to @user, and send one JSON object whose answer key is "
     "message2userfinal and whose value is the answer itself, written out as "
     "sentences the user will read. Substitute the real text — a placeholder, "
-    "an empty value, or anything in angle brackets is not an answer. "
-    "Attach no media here: nothing ran that could ground a file."
+    "an empty value, or anything in angle brackets is not an answer."
 )
 # "only key" until 19836e605's review: it contradicted the reply schema,
-# which now also offers `media`.  It says "answer key" and then forbids
-# media OUTRIGHT, which is not a hedge -- this steer fires exactly when the
-# action's tools did not run or returned nothing, so there is no grounded
-# file to show, and an image beside an ungrounded answer is read as evidence
-# for it.  The same branch is where "4000" was fabricated (measured 12:07
-# 2026-10-25, where the page said 47.3).
+# which now also offers `media`.  "answer key" leaves room for it.
+#
+# SAYS NOTHING ABOUT MEDIA, deliberately, and e0661827a got this wrong: it
+# appended "Attach no media here: nothing ran that could ground a file" to
+# THIS shared text, which both steers end with -- including
+# _REUSE_SYNTHESIS_STEER, which fires when the tools DID all run.  So it
+# forbade media on the one path where media is grounded, and the comment
+# justifying it ("fires exactly when the action's tools did not run") was
+# contradicted by its own use at :4962.  The rule belongs to the INCOMPLETE
+# steer alone, and lives there now.
 
 # "using the real tool results from this conversation" WAS A FALSE PREMISE
 # whenever the tools ran and returned NOTHING, and this file already records
@@ -4994,8 +4997,14 @@ _REUSE_SYNTHESIS_STEER_INCOMPLETE = (
     "for the user now, in your own words: report what WAS actually done, "
     "using only the real tool results present in this conversation, and say "
     "plainly which part could not be completed. Do not describe unexecuted "
-    "work as done. " + _REUSE_SYNTHESIS_ANSWER_SHAPE
+    "work as done. Attach no media: nothing ran here that could ground a "
+    "file. " + _REUSE_SYNTHESIS_ANSWER_SHAPE
 )
+# The media rule is HERE and not in the shared shape, because only this
+# branch knows the tools did not run.  It is why the rule exists: an image
+# beside an answer nothing grounded is read as evidence FOR it, and this is
+# the branch that produced "4000" where the page said 47.3 (measured 12:07
+# 2026-10-25).  No braces, so .format(unrun=...) stays safe.
 
 
 # THE HONEST ANSWER WHEN THE LOOKUP FOUND NOTHING.  Authored here, not asked

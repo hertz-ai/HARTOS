@@ -239,6 +239,41 @@ class TestTheStoreVouchesForEveryItem:
         assert json.dumps(items) == '[]'
 
 
+class TestTheTwoSynthesisSteersDiffer:
+    """Only the branch that knows the tools did not run may forbid media.
+
+    e0661827a put "Attach no media here" in _REUSE_SYNTHESIS_ANSWER_SHAPE,
+    the text BOTH steers end with -- so it also forbade media on
+    _REUSE_SYNTHESIS_STEER, which fires when the tools DID all run. That is
+    the one path where an agent's file is grounded, and it was the only
+    path the feature exists for.
+    """
+
+    def test_the_grounded_steer_does_not_forbid_media(self):
+        import hartos.reuse_recipe as reuse
+
+        assert 'no media' not in reuse._REUSE_SYNTHESIS_STEER.lower()
+
+    def test_the_incomplete_steer_does_forbid_media(self):
+        """Nothing ran, so nothing grounds a file, and a picture beside an
+        ungrounded answer is read as evidence for it."""
+        import hartos.reuse_recipe as reuse
+
+        assert 'no media' in reuse._REUSE_SYNTHESIS_STEER_INCOMPLETE.lower()
+
+    def test_the_incomplete_steer_still_formats_its_one_slot(self):
+        """It carries {unrun} and is .format()ed at the call site, so a
+        stray brace in the media rule would raise exactly when a turn had
+        already gone wrong. The original comment warned of this."""
+        import hartos.reuse_recipe as reuse
+
+        out = reuse._REUSE_SYNTHESIS_STEER_INCOMPLETE.format(
+            unrun='read_book_page did not run for action 1')
+
+        assert 'read_book_page did not run for action 1' in out
+        assert '{' not in out and '}' not in out
+
+
 @pytest.fixture
 def published(monkeypatch):
     """What reached publish_async: (topic, payload, flags)."""
