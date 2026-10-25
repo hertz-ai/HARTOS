@@ -394,6 +394,22 @@ class TestFailures:
         assert 'upload' not in bp._BUSY_NOT_SAVED
         assert 'try again' in bp._BUSY_NOT_SAVED
 
+    def test_a_disk_error_saving_a_book_does_not_hand_back_the_path(
+            self, book_node, book_db, tmp_path, monkeypatch):
+        """_run's keep_read handler, one of the three routes driver_text
+        was carrying the path out through.
+        """
+        secret = r'C:\Users\someone\uploads\files\de1f.pdf'
+        monkeypatch.setattr(bp, '_save', lambda *a, **k: (_ for _ in ()).throw(
+            OSError(28, 'No space left on device', secret)))
+
+        result = bp.parse_book(make_pdf(tmp_path / 'book.pdf'), '42')
+
+        assert result['stored'] is False
+        said = result['store_error']
+        assert 'someone' not in said and 'de1f' not in said
+        assert 'No space left on device' in said
+
     def test_a_refusal_is_logged_without_a_traceback(
             self, book_node, tmp_path, caplog):
         """A refusal is expected and states its own reason, so the stack is
@@ -534,6 +550,25 @@ class TestFailures:
         assert logged, 'the operator was left the sanitised sentence alone'
         full = '\n'.join(str(r.exc_info[1]) for r in logged)
         assert '[SQL:' in full and 'pdf_files' in full
+
+    def test_driver_text_does_not_hand_back_an_os_errors_path(self):
+        """The mechanism behind three leaking routes, fixed in one place.
+
+        driver_text fell back to str(exc) for anything that is not a
+        StatementError, and str(an OSError) appends e.filename -- so the
+        uploads path, OS user name included, left through every handler
+        that routes here: book_tools.parse_book_pdf into the agent's
+        answer, _run's unexpected-error handler onto the row list_books
+        returns, and _run's keep_read handler into store_error. Patching
+        the call sites one at a time is how three of them stayed open
+        while _open, fetch_pdf and parse_book were each closed
+        separately (the Medium of the 3a0c982ba review).
+        """
+        secret = r'C:\Users\someone\uploads\files\de1f.pdf'
+        said = bp.driver_text(OSError(13, 'Permission denied', secret))
+
+        assert said == 'Permission denied'          # exact: repr-safe
+        assert bp.driver_text(OSError('bare message')) == 'no reason reported'
 
     def test_driver_text_drops_the_statement_and_keeps_the_drivers_words(self):
         boom = self._db_error('INSERT INTO pdf_files (directory) VALUES (?)',
@@ -713,13 +748,26 @@ class TestLifecycle:
         with db_session() as db:
             db.get(BookFile, int(file_id)).updated_at = stale
 
+        with db_session(commit=False) as db:
+            row = db.get(BookFile, int(file_id))
+            assert bp._stall_reason(row) is not None      # condemnable first
+            before = {c.name: getattr(row, c.name)
+                      for c in BookFile.__table__.c if c.name != 'updated_at'}
+
         step = bp._make_step(None, file_id, '42', 'req-fresh', 'fresh.pdf', [])
         step('page 1 of 3', 33, page_number=1)
 
         with db_session(commit=False) as db:
             row = db.get(BookFile, int(file_id))
-            assert row.updated_at > stale          # the touch had an effect
-            assert row.status == 'processing'      # and changed nothing else
+            # Not "moved forward", which a one-second nudge satisfies while the
+            # row stays two hours stale: the row must no longer be condemnable
+            # at all, which is the whole purpose of the touch (mutant MT8).
+            assert bp._stall_reason(row) is None
+            # And nothing BUT updated_at: checking status alone let a touch
+            # that also wrote error= pass all 192 (mutant MT6).
+            after = {c.name: getattr(row, c.name)
+                     for c in BookFile.__table__.c if c.name != 'updated_at'}
+        assert after == before
 
     def test_a_disk_error_filing_a_book_does_not_hand_back_the_path(
             self, book_node, tmp_path, monkeypatch, caplog):
@@ -752,8 +800,9 @@ class TestLifecycle:
         Without it a parse running over 30 minutes is recorded FAILED mid-run.
 
         The bound is one touch per step() call, counted on the step itself
-        and recognised by a write with NO fields -- the touch does not write a
-        status any more. Two earlier versions were wrong in opposite
+        and recognised by a write carrying no 'status' key -- which is what
+        the counter below actually tests, the touch passing no fields at all
+        being the shape that satisfies it. Two earlier versions were wrong in opposite
         directions: "at least 2", which a single touch satisfied, and then
         steps + 1, which REQUIRED the defect the parent commit fixed.
         """
@@ -2110,7 +2159,7 @@ class TestSchema:
         monkeypatch.setattr(m, 'DB_URL', 'sqlite:///%s' % scratch)
         monkeypatch.setattr(m, '_engine', None)
 
-        with m.get_engine().connect() as connection:
+        def pragmas_of(connection):
             def pragma(name):
                 return connection.exec_driver_sql('PRAGMA ' + name).scalar()
 
@@ -2121,9 +2170,19 @@ class TestSchema:
             # review). Losing WAL changes locking on every node: readers stop
             # running beside the writer, which is the whole reason this
             # lane's lock contention is survivable at all.
-            assert pragma('busy_timeout') == 3000
-            assert pragma('journal_mode') == 'wal'
-            assert pragma('synchronous') == 1          # NORMAL
+            return (pragma('busy_timeout'), pragma('journal_mode'),
+                    pragma('synchronous'))
+
+        engine = m.get_engine()
+        # TWO connections, because busy_timeout and synchronous are
+        # per-connection: a hook that configured only an engine's FIRST
+        # connection passed all 190 tests, since the test opened one
+        # (mutant MH6 of the ea42bd723 review). journal_mode is per-database
+        # and sticks, which is why MH4 died on one connection.
+        with engine.connect() as first:
+            assert pragmas_of(first) == (3000, 'wal', 1)     # 1 == NORMAL
+        with engine.connect() as second:
+            assert pragmas_of(second) == (3000, 'wal', 1)
 
     def test_the_reader_id_limit_matches_its_column(self):
         """READER_ID_MAX copies pdf_files.user_id's width and could drift from

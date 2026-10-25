@@ -331,6 +331,20 @@ class ParseBookPdf(unittest.TestCase):
         assert any(r.exc_info is not None for r in got.records), [
             r.getMessage() for r in got.records]
 
+    def test_a_disk_error_does_not_hand_the_agent_the_uploads_path(self):
+        """The agent-facing one of the three routes driver_text was
+        carrying an OSError's path out through. What this tool returns
+        becomes part of a model's prompt, and that model can be a cloud
+        one (H-0715).
+        """
+        secret = r'C:\Users\someone\uploads\files\de1f.pdf'
+        out, _ = self._parse('/uploads/files/abc_book.pdf',
+                             error=OSError(13, 'Permission denied', secret))
+
+        assert 'Could not start PDF parsing' in out
+        assert 'someone' not in out and 'de1f' not in out
+        assert 'Permission denied' in out
+
     def test_a_failure_to_start_does_not_hand_the_agent_the_statement(self):
         """What this tool returns becomes part of a model's prompt.
 

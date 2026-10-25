@@ -719,6 +719,15 @@ def driver_text(exc) -> str:
     as a second copy (hartos-70, register consult 2026-10-24, H-0715).
     """
     from sqlalchemy.exc import StatementError
+    if isinstance(exc, OSError):
+        # str(an OSError) appends e.filename, so the fallback below carried the
+        # uploads path -- with the OS user's name in it -- out through every
+        # handler that routes here: book_tools.parse_book_pdf into the agent's
+        # answer, _run's unexpected-error handler onto the row list_books
+        # returns, and _run's keep_read handler into store_error. One branch
+        # here covers all of them; patching the call sites one at a time was
+        # how three of them stayed open (cc12's review of 3a0c982ba).
+        return os_error_reason(exc, 'no reason reported')
     if not isinstance(exc, StatementError):
         return str(exc)
     # .orig is None for a StatementError raised with no driver error under it;
