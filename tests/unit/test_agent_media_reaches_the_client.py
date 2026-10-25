@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from core.peer_link.crossbar_publish import publish_agent_message  # noqa: E402
 from core.user_file_store import OUTBOUND_PURPOSE  # noqa: E402
-from hartos.helper import media_items_for  # noqa: E402
+from hartos.helper import MEDIA_REPLY_KEY, media_items_for  # noqa: E402
 
 JPEG = b'\xff\xd8jpegbytes'
 
@@ -306,7 +306,7 @@ class TestTheAgentsRefsReachThePublisher:
         monkeypatch.setattr(reuse, 'send_message_to_user1',
                             lambda *a, **kw: seen.update(args=a, kwargs=kw))
         message = {'name': 'Answerer', 'content': json.dumps(
-            {'message2userfinal': 'here is page 2', 'media': refs})}
+            {'message2userfinal': 'here is page 2', MEDIA_REPLY_KEY: refs})}
 
         assert reuse._reuse_speaker_says_to_user('u1', message, '54', inp='q') is True
         assert seen['kwargs']['media_refs'] == refs
@@ -355,6 +355,45 @@ class TestTheAgentsRefsReachThePublisher:
         reuse.send_message_to_user1('u1', 'just words', '', '54')
 
         assert seen['media'] == [] and offered == []
+
+    def test_the_schema_offers_the_key_the_door_honours(self):
+        """An agent can only send what the reply schema offers it.
+
+        Pins the COUPLING, not the wording: response_format_template is the
+        ONE source interpolated into six prompt sites as
+        `@user {response_format}`, and the door test above builds its JSON
+        with this same constant. Rename the key in either place and one of
+        the two fails -- where a prompt string-match would stay green while
+        the agent's media silently stopped arriving. That is exactly how
+        page_image_url went dead.
+        """
+        import hartos.reuse_recipe as reuse
+
+        assert MEDIA_REPLY_KEY in reuse.response_format_template()
+
+    def test_the_schema_advertises_exactly_the_kinds_the_producer_accepts(self):
+        """A kind the prompt names but the producer drops is an agent told
+        to do something that silently fails; a kind the producer accepts but
+        the prompt hides is dead capability. They must be the same set."""
+        from hartos.helper import MEDIA_KIND_MIMES
+        import hartos.reuse_recipe as reuse
+        advertised = reuse.response_format_template()
+
+        for kind in MEDIA_KIND_MIMES:
+            assert kind in advertised, f'{kind} is accepted but never offered'
+        for word in ('audio', 'pdf', 'document'):      # not accepted today
+            assert word not in advertised, f'{word} is offered but would be dropped'
+
+    def test_the_schema_tells_the_agent_not_to_invent_a_url(self):
+        """The one instruction that matters, given 'The Art of Computer
+        Programming' at t1-retrieval-102136: a url the model did not get
+        from a tool is dropped by media_items_for, so the agent is told
+        that rather than left to discover it as a silent failure."""
+        advertised = __import__('hartos.reuse_recipe', fromlist=['x']) \
+            .response_format_template().lower()
+
+        assert 'tool' in advertised
+        assert '/uploads/' in advertised
 
     def test_create_carries_media_the_same_way(self, uploads, offered, monkeypatch):
         """publish_agent_message calls itself "the one on-device path for

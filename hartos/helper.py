@@ -5697,6 +5697,12 @@ async def subscribe_and_return(message, topic, time=1800000):
 # device link, which keeps working through the relay where a LAN URL does
 # not.
 
+#: The key an agent puts its media under, beside message2userfinal.  ONE
+#: name, shared by the reply schema the prompt shows the agent
+#: (reuse_recipe.response_format_template) and the doors that read it, so a
+#: rename cannot leave the prompt advertising a key nothing consumes.
+MEDIA_REPLY_KEY = 'media'
+
 #: The kinds an agent may ask for, and the MIME each file must really be.
 #: The FILE decides: a reference whose own file contradicts its kind is
 #: dropped, never relabelled. A model sure enough to name the wrong kind is

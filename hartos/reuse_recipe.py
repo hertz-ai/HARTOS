@@ -61,7 +61,7 @@ from PIL import Image
 
 
 from flask import current_app
-from hartos.helper import ToolMessageHandler, strip_json_values, get_time_based_history, retrieve_json, load_vlm_agent_files, _is_terminate_msg, answered_call_ids, history_limiter, token_limiter, give_judge_view
+from hartos.helper import ToolMessageHandler, strip_json_values, get_time_based_history, retrieve_json, load_vlm_agent_files, _is_terminate_msg, answered_call_ids, history_limiter, token_limiter, give_judge_view, MEDIA_REPLY_KEY
 
 
 def _normalize_flow_recipe(config):
@@ -586,6 +586,31 @@ def clear_message_tracking(user_prompt, unique_message_key):
         pass
 
 
+def response_format_template() -> str:
+    """The reply shape every prompt shows the agent -- ONE source.
+
+    Interpolated as ``@user {response_format}`` at six sites in this module,
+    so the agent is told the same shape wherever it is told it.
+
+    ``media`` is the owner's 2026-10-25 order that an agent be able to SHOW
+    the person a file, not only describe it.  It is OPTIONAL, and the
+    instruction beside it is the one that matters: only a url a TOOL handed
+    back.  A url the model writes itself is dropped by helper
+    .media_items_for before anyone sees it (measured need: at request_id
+    t1-retrieval-102136 an agent answered out of a book that exists in no
+    row of pdf_files), so the agent is told that rather than left to
+    discover it as a silent failure.
+    """
+    return (
+        '{"message2userfinal": "Your message here", '
+        '"%s": [{"type": "image|video|html", "url": "/uploads/..."}]}'
+        ' -- "%s" is OPTIONAL. Include it ONLY to show the person a file, and'
+        ' ONLY with a url a tool gave you. Omit it entirely if you have none.'
+        ' A url you write yourself is dropped and the person never sees it.'
+        % (MEDIA_REPLY_KEY, MEDIA_REPLY_KEY)
+    )
+
+
 def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_delay=50,
                           media_refs=None):
     """
@@ -723,7 +748,7 @@ def _reuse_speaker_says_to_user(user_id, message, prompt_id, inp=''):
     if not isinstance(json_obj, dict) or 'message2userfinal' not in json_obj:
         return False
     send_message_to_user1(user_id, json_obj['message2userfinal'], inp, prompt_id,
-                          media_refs=json_obj.get('media'))
+                          media_refs=json_obj.get(MEDIA_REPLY_KEY))
     return True
 
 
@@ -1634,7 +1659,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
     except Exception:
         pass
 
-    response_format = {"message2userfinal": "Your message here"}
+    response_format = response_format_template()
     # DATE-CONTEXT: the local model's training cutoff makes it assume an earlier
     # year — it refused "2026" research as "the future" and injected "2024" into
     # its own search queries (measured live 2026-09-05, agent 18088688973).

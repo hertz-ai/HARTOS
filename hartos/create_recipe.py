@@ -782,7 +782,7 @@ def visual_execution(task_description: str, user_id: int, prompt_id: int):
                     json_obj = retrieve_json(last_message['content'])
                     if json_obj and 'message2user' in json_obj:
                         send_message_to_user1(user_id, json_obj['message2user'], task_description, prompt_id,
-                                              media_refs=json_obj.get('media'))
+                                              media_refs=json_obj.get(MEDIA_REPLY_KEY))
                 except Exception as e:
                     current_app.logger.error(f"Error processing visual agent response: {e}")
     except Exception as e:
@@ -845,7 +845,7 @@ class SubscriptionHandler:
 # The one "is the last message an unanswered tool call" rule lives in
 # hartos.helper, where the yield-to-user check also asks it; re-exported here
 # for this module's two readers.
-from hartos.helper import has_pending_tool_calls  # noqa: E402
+from hartos.helper import MEDIA_REPLY_KEY, has_pending_tool_calls  # noqa: E402
 
 
 # Every thread driving this module's group chat of a session (user_agents),
@@ -3786,7 +3786,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
                 try:
                     current_app.logger.info('Sending user the message')
                     send_message_to_user1(user_id, json_obj['message2user'], '', prompt_id,
-                                          media_refs=json_obj.get('media'))
+                                          media_refs=json_obj.get(MEDIA_REPLY_KEY))
                 except Exception:
                     pass
                 return "auto"
