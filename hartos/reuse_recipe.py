@@ -4997,14 +4997,22 @@ _REUSE_SYNTHESIS_STEER_INCOMPLETE = (
     "for the user now, in your own words: report what WAS actually done, "
     "using only the real tool results present in this conversation, and say "
     "plainly which part could not be completed. Do not describe unexecuted "
-    "work as done. Attach no media: nothing ran here that could ground a "
-    "file. " + _REUSE_SYNTHESIS_ANSWER_SHAPE
+    "work as done. Attach no media: this turn did not finish, so no file in "
+    "it is vouched for. " + _REUSE_SYNTHESIS_ANSWER_SHAPE
 )
 # The media rule is HERE and not in the shared shape, because only this
-# branch knows the tools did not run.  It is why the rule exists: an image
-# beside an answer nothing grounded is read as evidence FOR it, and this is
-# the branch that produced "4000" where the page said 47.3 (measured 12:07
-# 2026-10-25).  No braces, so .format(unrun=...) stays safe.
+# branch knows the turn is incomplete.  Why it exists: an image beside an
+# answer nothing grounded is read as evidence FOR it, and this is the
+# branch behind "4000" where the page said 47.3 (measured 12:07 2026-10-25).
+#
+# WORDED FOR WHEN IT ACTUALLY FIRES.  bc93648fa said "nothing ran here that
+# could ground a file", and that was still false: the gate is `_unrun OR
+# _unfinished` (:5221), so this steer also reaches a turn whose EARLIER
+# actions ran their tools -- the same message would then say "report what
+# WAS actually done using the real tool results" and "nothing ran". It
+# claims only what the gate knows: the turn did not finish.
+#
+# No braces, so .format(unrun=...) stays safe.
 
 
 # THE HONEST ANSWER WHEN THE LOOKUP FOUND NOTHING.  Authored here, not asked

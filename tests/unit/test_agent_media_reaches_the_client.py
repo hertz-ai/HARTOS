@@ -107,6 +107,58 @@ def _page(uploads, name='page_2.jpg', data=JPEG):
     return '/uploads/pdf_parse/10/' + name
 
 
+def test_the_two_mime_tables_agree_where_they_overlap():
+    """MEDIA_KIND_MIMES is not the tree's only extension-to-MIME table.
+
+    The [[MEDIA:]] marker has _MEDIA_MIME (integrations/channels/registry
+    .py:89) for SENDING a file out through a channel. Two tables is a
+    decision, not drift: a channel can post a .pdf, .mp3 or .ogg that no
+    chat bubble renders, and a reply can show .html and .webm that the
+    channel senders do not take. What must never differ is MEANING -- an
+    extension both know has to be the same type in both, or one file is
+    audio when sent and nothing when shown.
+    """
+    from integrations.channels.registry import _MEDIA_MIME
+    from hartos.helper import MEDIA_KIND_MIMES
+    mine = {ext: mime for kind in MEDIA_KIND_MIMES.values()
+            for ext, mime in kind.items()}
+
+    shared = set(mine) & set(_MEDIA_MIME)
+    assert shared, 'the tables no longer overlap; this guard has gone blind'
+    assert {e: mine[e] for e in shared} == {e: _MEDIA_MIME[e] for e in shared}
+
+
+def test_create_hands_media_wherever_it_hands_the_agents_own_answer():
+    """A8/A9: mutants dropping media_refs at create_recipe's two call sites
+    passed every test, because nothing here drives create's loop.
+
+    Structural, and weaker than driving the path -- it checks the calls,
+    not the delivery. Saying so plainly is better than leaving the sites
+    unpinned or implying more than it proves. The invariant it does hold
+    exactly: wherever CREATE hands the agent's OWN parsed answer to the
+    user, it hands the media that agent named along with it. Calls that
+    pass raw message content, not json_obj, are correctly untouched.
+    """
+    import ast
+    import inspect
+    import hartos.create_recipe as create
+
+    sites = [
+        node for node in ast.walk(ast.parse(inspect.getsource(create)))
+        if isinstance(node, ast.Call)
+        and getattr(node.func, 'id', None) == 'send_message_to_user1'
+        and any(isinstance(a, ast.Subscript)
+                and getattr(a.value, 'id', None) == 'json_obj'
+                for a in node.args)
+    ]
+
+    assert len(sites) >= 2, f'expected 2+ json_obj answer sites, found {len(sites)}'
+    for call in sites:
+        assert 'media_refs' in {k.arg for k in call.keywords}, (
+            f'create_recipe.py:{call.lineno} answers from the agent JSON but '
+            f'does not pass the media the agent named')
+
+
 class TestAnInventedUrlNeverShips:
     """The model invents; the store only ever sees real files."""
 
@@ -130,6 +182,26 @@ class TestAnInventedUrlNeverShips:
                     'file:///C:/Windows/win.ini', 'https://example.org/x.jpg'):
             assert media_items_for('u1', [{'type': 'image', 'url': url}],
                                    prompt_id='54', request_id='r1') == []
+        assert offered == []
+
+    def test_a_real_file_outside_the_uploads_is_still_refused(self, uploads, offered):
+        """A11 of hevolve-cc12's review, and the case that actually matters.
+
+        Every traversal url in the test above names a file that does not
+        exist, so a mutant replacing resolve_upload_url with a bare
+        "does this path exist?" check passed all of them. The property is
+        CONTAINMENT, not existence, and only a real file outside the root
+        can tell the two apart.
+        """
+        outside = uploads.parent / 'secret.jpg'
+        outside.write_bytes(JPEG)
+        assert outside.is_file(), 'the escape target must really exist'
+
+        for url in ('/uploads/../secret.jpg',
+                    '/uploads/pdf_parse/../../secret.jpg',
+                    '/uploads/pdf_parse/10/../../../secret.jpg'):
+            assert media_items_for('u1', [{'type': 'image', 'url': url}],
+                                   prompt_id='54', request_id='r1') == [], url
         assert offered == []
 
     def test_a_kind_the_file_contradicts_is_dropped(self, uploads, offered, caplog):
@@ -416,17 +488,38 @@ class TestTheTwoSynthesisSteersDiffer:
     path the feature exists for.
     """
 
-    def test_the_grounded_steer_does_not_forbid_media(self):
+    def test_the_grounded_steer_says_nothing_about_media_at_all(self):
+        """Pinned on the WORD, not on a phrase.
+
+        The first version asserted 'no media' was absent, which a reworded
+        prohibition walks straight past -- hevolve-cc12 measured exactly
+        that mutant surviving 31/31. Any mention of media in the grounded
+        steer is the defect, however it is phrased, because that branch is
+        where an agent's file is real.
+        """
         import hartos.reuse_recipe as reuse
 
-        assert 'no media' not in reuse._REUSE_SYNTHESIS_STEER.lower()
+        assert 'media' not in reuse._REUSE_SYNTHESIS_STEER.lower()
 
     def test_the_incomplete_steer_does_forbid_media(self):
-        """Nothing ran, so nothing grounds a file, and a picture beside an
-        ungrounded answer is read as evidence for it."""
+        """The turn did not finish, so no file in it is vouched for, and a
+        picture beside an ungrounded answer is read as evidence for it.
+
+        Also pinned on the word: a correct REWORDING of the prohibition
+        must not be failed by this test, which the phrase version did.
+        """
         import hartos.reuse_recipe as reuse
 
-        assert 'no media' in reuse._REUSE_SYNTHESIS_STEER_INCOMPLETE.lower()
+        assert 'media' in reuse._REUSE_SYNTHESIS_STEER_INCOMPLETE.lower()
+
+    def test_the_incomplete_steer_claims_only_what_its_gate_knows(self):
+        """It fires on `_unrun OR _unfinished`, so it also reaches a turn
+        whose EARLIER actions ran their tools. Saying "nothing ran" there
+        contradicts the same message's "report what WAS actually done"."""
+        import hartos.reuse_recipe as reuse
+        text = reuse._REUSE_SYNTHESIS_STEER_INCOMPLETE.lower()
+
+        assert 'nothing ran' not in text
 
     def test_the_incomplete_steer_still_formats_its_one_slot(self):
         """It carries {unrun} and is .format()ed at the call site, so a
@@ -494,6 +587,31 @@ class TestAnAgentsPictureRidesTheSlotABookPageUses:
                    {'kind': 'image', 'url': '/uploads/a/second.jpg'}])
 
         assert published[0][1]['page_image_url'] == '/uploads/a/first.jpg'
+
+    def test_a_kind_no_client_shows_is_logged_not_dropped_silently(
+            self, published, caplog):
+        """hevolve-cc12's M2: the slot holds one IMAGE, so a video or an
+        html page the template still offers reaches nobody. Being silent
+        about that is how this lane got here twice already."""
+        with caplog.at_level('WARNING'):
+            publish_agent_message(
+                text='t', user_id='u1', request_id='r1', prompt_id='54',
+                media=[{'kind': 'video', 'url': '/uploads/a/clip.mp4'},
+                       {'kind': 'html', 'url': '/uploads/a/note.html'}])
+
+        said = ' '.join(r.getMessage() for r in caplog.records)
+        assert 'video' in said and 'html' in said
+        assert published[0][1]['page_image_url'] == ''
+        assert len(published[0][1]['media']) == 2      # still carried
+
+    def test_an_image_alone_is_not_called_unshown(self, published, caplog):
+        with caplog.at_level('WARNING'):
+            publish_agent_message(
+                text='t', user_id='u1', request_id='r1', prompt_id='54',
+                media=[{'kind': 'image', 'url': '/uploads/a/p.jpg'}])
+
+        assert 'no client renders' not in \
+            ' '.join(r.getMessage() for r in caplog.records)
 
     def test_a_message_with_no_image_leaves_the_slot_empty(self, published):
         for media in (None, [], [{'kind': 'video', 'url': '/uploads/a/clip.mp4'}],

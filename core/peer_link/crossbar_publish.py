@@ -270,6 +270,19 @@ def publish_agent_message(
         payload['page_image_url'] = next(
             (it['url'] for it in items
              if it.get('kind') == 'image' and isinstance(it.get('url'), str)), '')
+        # The slot holds ONE IMAGE, so a video or an html page an agent
+        # attached has no client that shows it today -- the reply template
+        # still offers those kinds.  Say so in the log rather than drop them
+        # in silence, which is the defect this lane keeps repeating: a
+        # capability advertised to the model that nothing downstream
+        # honours.  They still ride `media` for whatever reads it.
+        unshown = sorted({it.get('kind') for it in items
+                          if it.get('kind') != 'image'} - {None})
+        if unshown:
+            logger.warning(
+                "publish_agent_message: %s item(s) ride `media` but no client "
+                "renders them today; only an image reaches the person, through "
+                "page_image_url (user %s)", ', '.join(unshown), user_id)
     try:
         from core.peer_link.message_bus import chat_topic_for
         from core.safe_hartos_attr import safe_hartos_attr
