@@ -455,31 +455,25 @@ def published(monkeypatch):
     return sent
 
 
-class TestTheLegacyImageSlotIsLeftAlone:
-    """``media`` is the ONE path; the legacy slot is not a spare image field.
+class TestAnAgentsPictureRidesTheSlotABookPageUses:
+    """An agent's image goes on ``page_image_url``, the way a book page
+    always has.
 
-    ad729fcc9 derived page_image_url from the first image item, reasoning
-    that it was the only slot the desktop read. That was wrong, and this is
-    the guard against reinstating it.
+    Owner ruling 2026-10-25, relayed verbatim through two sessions: "we
+    show page image url and analogy images", "it shd be the same exact way
+    we used t show earlier", "what filter per agent when did we write one
+    agent specific contract".
 
-    ``page_image_url`` is not "an image": on the desktop
-    ``setUploadedImage(parsed.page_image_url)`` (Demopage.js:2477, :2558)
-    switches the left panel to the PdfViewer book-page view, and the gate at
-    :5179 forces that panel w-full whenever uploadedImage is set -- in text
-    mode too. Beside a client that renders ``media`` (Nunba 523b8b71), a
-    derived slot draws the same picture twice AND rearranges the screen. On
-    the phone the slot is loaded by Glide with no base URL, so a
-    desktop-relative '/uploads/...' resolves to nothing and the card comes
-    up empty.
-
-    Each client fetches the way it can -- the desktop by ``url``, the phone
-    by ``xid`` -- and every item carries both, which is what makes the
-    second path unnecessary rather than merely redundant.
+    This class previously asserted the OPPOSITE, with a confident rationale:
+    that the slot is a book-page MODE, that filling it draws the picture
+    twice, and that the phone cannot resolve a relative url. The first is
+    the behaviour he wants; the second was true only beside a second
+    renderer now being withdrawn; the third was a code reading nobody had
+    measured, since withdrawn by the lane that made it. Kept in the record
+    because the reasoning read just as well when it was wrong.
     """
 
-    def test_media_never_fills_the_legacy_slot(self, published):
-        """The regression guard. A reply's media must not reach the slot
-        that drives the book-page panel and the phone's Glide card."""
+    def test_the_first_image_fills_the_slot_a_book_page_uses(self, published):
         media = [{'kind': 'image', 'url': '/uploads/pdf_parse/10/page_2.jpg',
                   'xid': 'a' * 64}]
 
@@ -487,8 +481,27 @@ class TestTheLegacyImageSlotIsLeftAlone:
                                      request_id='r1', prompt_id='54', media=media)
 
         payload = published[0][1]
-        assert payload['page_image_url'] == ''
-        assert payload['media'] == media        # and the one real path is intact
+        assert payload['page_image_url'] == '/uploads/pdf_parse/10/page_2.jpg'
+        assert payload['media'] == media        # and the items still ride
+
+    def test_the_slot_takes_the_first_image_past_anything_else(self, published):
+        """It holds one url, so which one is a real choice: the first image,
+        past a non-image before it, and not the last."""
+        publish_agent_message(
+            text='t', user_id='u1', request_id='r1', prompt_id='54',
+            media=[{'kind': 'video', 'url': '/uploads/a/clip.mp4'},
+                   {'kind': 'image', 'url': '/uploads/a/first.jpg'},
+                   {'kind': 'image', 'url': '/uploads/a/second.jpg'}])
+
+        assert published[0][1]['page_image_url'] == '/uploads/a/first.jpg'
+
+    def test_a_message_with_no_image_leaves_the_slot_empty(self, published):
+        for media in (None, [], [{'kind': 'video', 'url': '/uploads/a/clip.mp4'}],
+                      [{'kind': 'image', 'xid': 'a' * 64}]):   # an item with no url
+            published.clear()
+            publish_agent_message(text='t', user_id='u1', request_id='r1',
+                                  prompt_id='54', media=media)
+            assert published[0][1]['page_image_url'] == '', media
 
     def test_the_items_ride_in_order_and_unaltered(self, published):
         """Several kinds at once reach the client as sent: the publisher
@@ -502,7 +515,9 @@ class TestTheLegacyImageSlotIsLeftAlone:
 
         payload = published[0][1]
         assert payload['media'] == media
-        assert payload['page_image_url'] == ''
+        # the slot is filled from the items, never at their expense: the
+        # list the client receives is still every item, in order, unaltered
+        assert payload['page_image_url'] == '/uploads/a/first.jpg'
 
     def test_a_text_only_message_is_the_envelope_it_always_was(self, published):
         """Without media the envelope is exactly the one subscribers have
