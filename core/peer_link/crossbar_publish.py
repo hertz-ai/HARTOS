@@ -254,12 +254,15 @@ def publish_agent_message(
         # way we used t show earlier", "what filter per agent when did we
         # write one agent specific contract".
         #
-        # I removed this in 0b632c59f and both reasons I gave have fallen.
         # WARNING TO THE NEXT READER: 0b632c59f removed this and argues the
         # case well -- a book-page MODE, a double render, an unloadable
-        # phone card. It was OVERRULED, and its Android premise was a code
-        # reading nobody had measured, since withdrawn. Do not re-derive it
-        # from that commit alone.
+        # phone card. It was OVERRULED, so do not re-derive it from that
+        # commit alone.
+        #
+        # Its Android premise is NOT refuted, only unmeasured: two
+        # independent readings say Glide treats a leading "/" as a local
+        # file, so a relative url may genuinely fail on the phone. Measure
+        # it on the Pad before relying either way.
         #
         # This is also why no per-agent contract branch exists: the reel
         # contract describes a reel, and filtering every agent's reply
@@ -283,11 +286,9 @@ def publish_agent_message(
             {str(it.get('kind')) for it in items
              if it.get('kind') is not None and it.get('kind') != 'image'})
         if rides_media_only:
-            # Says what the slot ACTUALLY did. Saying "carries the first
-            # image" when there is no image was the same over-claim as the
-            # warning this replaced, one size smaller -- and it was wrong in
-            # exactly the Reel Studio case, where the items are videos and
-            # the slot stays empty.
+            # Says what the slot ACTUALLY did, in both branches. A reel's
+            # items are videos and the slot stays empty, so a fixed
+            # "carries the first image" would be false on every reel.
             logger.info(
                 "publish_agent_message: page_image_url %s; %s item(s) ride "
                 "`media` (user %s)",

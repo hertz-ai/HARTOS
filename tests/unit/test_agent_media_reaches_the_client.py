@@ -642,9 +642,13 @@ class TestAnAgentsPictureRidesTheSlotABookPageUses:
                 media=[{'kind': 'image', 'url': '/uploads/a/p.jpg'},
                        {'kind': 'video', 'url': '/uploads/a/clip.mp4'}])
 
-        said = ' '.join(r.getMessage() for r in caplog.records)
-        assert 'carries the first image' in said
-        assert 'is empty' not in said
+        # Whole line, like its reel twin: a substring check here would let
+        # an added claim ride along on the image side exactly as the
+        # blocklist did on the reel side.
+        assert [r.getMessage() for r in caplog.records
+                if r.name == 'core.peer_link.crossbar_publish'] == [
+            'publish_agent_message: page_image_url carries the first image; '
+            'video item(s) ride `media` (user u1)']
         assert published[0][1]['page_image_url'] == '/uploads/a/p.jpg'
 
     def test_a_malformed_kind_cannot_break_the_publish(self, published):
