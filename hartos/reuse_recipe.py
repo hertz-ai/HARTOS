@@ -604,11 +604,38 @@ def response_format_template() -> str:
     return (
         '{"message2userfinal": "Your message here", '
         '"%s": [{"type": "image|video|html", "url": "/uploads/..."}]}'
-        ' -- "%s" is OPTIONAL. Include it ONLY to show the person a file, and'
-        ' ONLY with a url a tool gave you. Omit it entirely if you have none.'
-        ' A url you write yourself is dropped and the person never sees it.'
+        ' %s is optional; use only a /uploads path from a tool result,'
+        ' others are dropped.'
         % (MEDIA_REPLY_KEY, MEDIA_REPLY_KEY)
     )
+
+
+def _carry_reply_media(user_id, json_obj, prompt_id, request_id):
+    """Put the media an agent named on its answer into her outbox.
+
+    The reply needs no new field: _chat_reply already takes this turn's
+    outbox with chat_attachments.take_outbound and puts it on the reply as
+    ``media`` (hart_intelligence_entry.py:9024).  So landing the files here
+    IS delivering them, on the path a reel has used since reel_studio.
+
+    Added because 19836e605 offered ``media`` at six prompt sites and only
+    ONE reader honoured it.  get_agent_response returned message2userfinal
+    alone, so the MAIN /chat answer -- a book page being exactly the case --
+    dropped every item, with media_items_for called zero times.
+
+    Never the reason an answer fails: a raise here would cost the person
+    their words for the sake of a picture.
+    """
+    try:
+        refs = (json_obj or {}).get(MEDIA_REPLY_KEY)
+        if not refs:
+            return []
+        from hartos.helper import media_items_for
+        return media_items_for(user_id, refs, prompt_id=prompt_id,
+                               request_id=request_id)
+    except Exception as e:
+        _ctx_safe_log('warning', f"reply media skipped: {e}")
+        return []
 
 
 def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_delay=50,
@@ -1033,7 +1060,7 @@ def visual_based_execution(task_description: str, user_id: int, prompt_id: int):
             Note: Visual input is available because the user's camera is ON.
             <Last_{minutes}_Minutes_Visual_Context_End>: {actions}
             If the user needs to be informed (e.g., task completed, input needed, error), respond in this exact JSON format:
-            {{"message2userfinal": "Your clear and useful message here"}}
+            {response_format_template()}
             Only send this if you have something meaningful to say.
             Do not interrupt the user unless they have asked for a response or the task cannot proceed without their input.
             You must now perform this task: {task_description}'''
@@ -4890,11 +4917,19 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
 # Keeps the message2userfinal name (get_agent_response unwraps it, #797/D31)
 # and carries no braces, so .format(unrun=...) below stays safe.
 _REUSE_SYNTHESIS_ANSWER_SHAPE = (
-    "Address your reply to @user, and send one JSON object whose only key is "
+    "Address your reply to @user, and send one JSON object whose answer key is "
     "message2userfinal and whose value is the answer itself, written out as "
     "sentences the user will read. Substitute the real text — a placeholder, "
-    "an empty value, or anything in angle brackets is not an answer."
+    "an empty value, or anything in angle brackets is not an answer. "
+    "Attach no media here: nothing ran that could ground a file."
 )
+# "only key" until 19836e605's review: it contradicted the reply schema,
+# which now also offers `media`.  It says "answer key" and then forbids
+# media OUTRIGHT, which is not a hedge -- this steer fires exactly when the
+# action's tools did not run or returned nothing, so there is no grounded
+# file to show, and an image beside an ungrounded answer is read as evidence
+# for it.  The same branch is where "4000" was fabricated (measured 12:07
+# 2026-10-25, where the page said 47.3).
 
 # "using the real tool results from this conversation" WAS A FALSE PREMISE
 # whenever the tools ran and returned NOTHING, and this file already records
@@ -6498,6 +6533,7 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                         # had just done and saved (#797/D31, #803/D37).  What
                         # else the answer is sent through, and why the desktop
                         # gets nothing else: _reuse_answer_off_box.
+                        _carry_reply_media(user_id, json_obj, prompt_id, request_id)
                         _reuse_answer_off_box(
                             user_id, json_obj['message2userfinal'], prompt_id)
                         return json_obj['message2userfinal']
@@ -6638,6 +6674,7 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
             try:
                 json_obj = retrieve_json(last_message['content'])
                 if json_obj and 'message2userfinal' in json_obj:
+                    _carry_reply_media(user_id, json_obj, prompt_id, request_id)
                     last_message['content'] = json_obj['message2userfinal']
                     return last_message['content']
 

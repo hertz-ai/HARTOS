@@ -78,6 +78,28 @@ def offered(monkeypatch):
     return calls
 
 
+def _template_example():
+    """The JSON object the reply schema SHOWS the agent, parsed.
+
+    Reading the example as data is what binds the prompt to the code. The
+    review of 19836e605 measured three mutants surviving the substring
+    version with 24/24 green: a literal 'media_items' key, gif|svg kinds,
+    and a "make one up" instruction.
+    """
+    import hartos.reuse_recipe as reuse
+    text = reuse.response_format_template()
+    start = text.index('{')
+    depth = 0
+    for i, ch in enumerate(text[start:], start):
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                return json.loads(text[start:i + 1])
+    raise AssertionError('no complete JSON object in the template: %r' % text)
+
+
 def _page(uploads, name='page_2.jpg', data=JPEG):
     path = uploads / 'pdf_parse' / '10' / name
     path.write_bytes(data)
@@ -356,44 +378,101 @@ class TestTheAgentsRefsReachThePublisher:
 
         assert seen['media'] == [] and offered == []
 
-    def test_the_schema_offers_the_key_the_door_honours(self):
-        """An agent can only send what the reply schema offers it.
+    def test_the_example_is_real_json_carrying_exactly_the_reply_key(self):
+        """The schema must OFFER the key the readers honour, by that exact
+        name.
 
-        Pins the COUPLING, not the wording: response_format_template is the
-        ONE source interpolated into six prompt sites as
-        `@user {response_format}`, and the door test above builds its JSON
-        with this same constant. Rename the key in either place and one of
-        the two fails -- where a prompt string-match would stay green while
-        the agent's media silently stopped arriving. That is exactly how
-        page_image_url went dead.
+        Parsed, not matched. The review of 19836e605 killed the substring
+        version: a literal 'media_items' satisfies `MEDIA_REPLY_KEY in
+        template` while no reader consumes it, and 24/24 stayed green.
+        """
+        example = _template_example()
+
+        assert 'message2userfinal' in example
+        assert MEDIA_REPLY_KEY in example
+
+    def test_the_example_offers_exactly_the_kinds_the_producer_accepts(self):
+        """Equality, not membership. A kind named but dropped is an agent
+        told to do something that silently fails; a kind accepted but hidden
+        is dead capability. The gif|svg mutant passed the old version."""
+        from hartos.helper import MEDIA_KIND_MIMES
+        example = _template_example()
+
+        offered = set(example[MEDIA_REPLY_KEY][0]['type'].split('|'))
+        assert offered == set(MEDIA_KIND_MIMES)
+
+    def test_the_example_url_is_the_shape_the_producer_will_resolve(self):
+        """An example the producer would itself drop teaches the agent to
+        fail."""
+        example = _template_example()
+
+        assert example[MEDIA_REPLY_KEY][0]['url'].startswith('/uploads/')
+
+    def test_the_rule_names_uploads_not_merely_a_tool(self):
+        """19836e605 said "ONLY with a url a tool gave you". That was NOT
+        the rule the code enforces, and the difference matters: txt2img
+        returns a remote aws_rasa url and Generate_video returns a conv_id,
+        so under the old wording the owner's own first example -- text to
+        image -- would be dropped by media_items_for in silence. The
+        enforced rule is a /uploads path on THIS node.
+
+        Prose can only be pinned weakly; this says so rather than pretending
+        otherwise. The enforcement itself is pinned by the drop tests above.
         """
         import hartos.reuse_recipe as reuse
+        text = reuse.response_format_template().lower()
 
-        assert MEDIA_REPLY_KEY in reuse.response_format_template()
+        assert 'uploads' in text
+        for invitation in ('make one up', 'invent', 'guess'):
+            assert invitation not in text, invitation
 
-    def test_the_schema_advertises_exactly_the_kinds_the_producer_accepts(self):
-        """A kind the prompt names but the producer drops is an agent told
-        to do something that silently fails; a kind the producer accepts but
-        the prompt hides is dead capability. They must be the same set."""
-        from hartos.helper import MEDIA_KIND_MIMES
+    def test_the_main_chat_answer_offers_its_media_to_the_store(self, uploads, offered):
+        """F1 of the 19836e605 review, and the defect that mattered most.
+
+        Six prompt sites invited media and ONE reader honoured it: the
+        speaker door. get_agent_response, which produces the MAIN /chat
+        answer -- the book-page case -- returned message2userfinal alone and
+        dropped every item, with media_items_for called 0 times.
+
+        Putting the files in her outbox here is all that is needed: the
+        reply already takes them, because _chat_reply calls
+        chat_attachments.take_outbound for any turn with a prompt_id
+        (hart_intelligence_entry.py:9024) and puts them on the reply as
+        `media`. One existing path, no new field on the reply.
+        """
         import hartos.reuse_recipe as reuse
-        advertised = reuse.response_format_template()
+        url = _page(uploads)
 
-        for kind in MEDIA_KIND_MIMES:
-            assert kind in advertised, f'{kind} is accepted but never offered'
-        for word in ('audio', 'pdf', 'document'):      # not accepted today
-            assert word not in advertised, f'{word} is offered but would be dropped'
+        reuse._carry_reply_media('u1', {'message2userfinal': 'here is page 2',
+                                        MEDIA_REPLY_KEY: [{'type': 'image',
+                                                           'url': url}]},
+                                 '54', 'r1')
 
-    def test_the_schema_tells_the_agent_not_to_invent_a_url(self):
-        """The one instruction that matters, given 'The Art of Computer
-        Programming' at t1-retrieval-102136: a url the model did not get
-        from a tool is dropped by media_items_for, so the agent is told
-        that rather than left to discover it as a silent failure."""
-        advertised = __import__('hartos.reuse_recipe', fromlist=['x']) \
-            .response_format_template().lower()
+        assert [c['path'] for c in offered] == \
+            [str(uploads / 'pdf_parse' / '10' / 'page_2.jpg')]
 
-        assert 'tool' in advertised
-        assert '/uploads/' in advertised
+    def test_an_answer_with_no_media_never_touches_the_store(self, uploads, offered):
+        import hartos.reuse_recipe as reuse
+
+        for obj in ({'message2userfinal': 'just words'},
+                    {'message2userfinal': 'x', MEDIA_REPLY_KEY: []},
+                    {'message2userfinal': 'x', MEDIA_REPLY_KEY: None},
+                    {}):
+            reuse._carry_reply_media('u1', obj, '54', 'r1')
+
+        assert offered == []
+
+    def test_a_main_answer_with_an_invented_url_offers_nothing(self, uploads, offered):
+        """The guard holds on this path too, not only the speaker door."""
+        import hartos.reuse_recipe as reuse
+
+        reuse._carry_reply_media(
+            'u1', {'message2userfinal': 'here',
+                   MEDIA_REPLY_KEY: [{'type': 'image',
+                                      'url': '/uploads/pdf_parse/10/ghost.jpg'}]},
+            '54', 'r1')
+
+        assert offered == []
 
     def test_create_carries_media_the_same_way(self, uploads, offered, monkeypatch):
         """publish_agent_message calls itself "the one on-device path for
