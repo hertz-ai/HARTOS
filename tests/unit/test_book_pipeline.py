@@ -141,17 +141,25 @@ class TestPageImages:
         out = tmp_path / 'page_1.jpg'
         seen = {}
         published = []
-        real_replace, real_rename = os.replace, os.rename
-
-        def watch(src, dst, *args, **kwargs):
-            published.append((Path(src), Path(dst)))
-            return real_replace(src, dst, *args, **kwargs)
+        def watching(primitive):
+            def spy(src, dst, *args, **kwargs):
+                # What the SERVED name looked like at the moment of the publish.
+                existed = Path(dst).exists()
+                result = primitive(src, dst, *args, **kwargs)
+                # Recorded only if it SUCCEEDED. shutil.move tries os.rename
+                # first and falls back to copy+delete on EXDEV, so counting
+                # the attempt let a cross-volume copy pass as a publish.
+                published.append((Path(dst), existed))
+                return result
+            return spy
 
         # Both spellings, so any atomic-rename primitive counts and none is
         # required by name: Path.replace calls os.replace, shutil.move inside
-        # one directory calls os.rename.
-        monkeypatch.setattr(os, 'replace', watch)
-        monkeypatch.setattr(os, 'rename', watch)
+        # one directory calls os.rename. Each keeps its OWN primitive -- routing
+        # rename through replace would hide a rename that fails on Windows
+        # because the target exists.
+        monkeypatch.setattr(os, 'replace', watching(os.replace))
+        monkeypatch.setattr(os, 'rename', watching(os.rename))
 
         class HalfWritten:
             def save(self, target, *args, **kwargs):
@@ -171,12 +179,20 @@ class TestPageImages:
         # the copy -- exactly what this test's name forbids -- and survived all
         # 195 (MC_copy_publish). An atomic rename has no such window.
         assert len(published) == 1, published
-        source, target = published[0]
+        target, served_existed = published[0]
         assert target == out
-        # From the SAME directory, or the rename is not atomic -- and a temp
-        # left anywhere else escapes the leftover check below
-        # (MC_outside_leftover).
-        assert source.parent == out.parent
+        # Nothing had reached the served name before that atomic publish. A
+        # copy into place FOLLOWED by a same-folder rename counts one rename
+        # and still serves a half-written file, which passed all 195
+        # (MX_copy_then_replace). True of this test because the destination
+        # does not exist beforehand; overwriting an existing page image is
+        # legitimate elsewhere.
+        assert served_existed is False
+        # No rule about WHICH folder the temp came from. A temp elsewhere on
+        # the same volume is a correct implementation, and os.replace across
+        # volumes raises EXDEV rather than copying silently (measured), so a
+        # folder or st_dev rule would reject correct code and catch nothing
+        # the two assertions above miss.
         assert list(tmp_path.iterdir()) == [out]
 
     def test_every_page_gets_an_image(self, book_node, tmp_path):
