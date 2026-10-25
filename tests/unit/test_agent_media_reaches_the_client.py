@@ -561,9 +561,14 @@ class TestAnAgentsPictureRidesTheSlotABookPageUses:
     that the slot is a book-page MODE, that filling it draws the picture
     twice, and that the phone cannot resolve a relative url. The first is
     the behaviour he wants; the second was true only beside a second
-    renderer now being withdrawn; the third was a code reading nobody had
-    measured, since withdrawn by the lane that made it. Kept in the record
-    because the reasoning read just as well when it was wrong.
+    renderer now being withdrawn.
+
+    The third is NOT refuted, only unmeasured: two independent readings say
+    Glide treats a leading "/" as a local file, so a relative url may well
+    fail on the phone. It was withdrawn for want of a measurement, not
+    disproved -- measure it on the Pad before relying either way. (This
+    docstring said "since withdrawn", which reads as refuted; that is the
+    same collapse the warning in crossbar_publish was corrected for.)
     """
 
     def test_the_first_image_fills_the_slot_a_book_page_uses(self, published):
