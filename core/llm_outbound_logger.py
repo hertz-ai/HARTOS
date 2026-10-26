@@ -609,6 +609,54 @@ def _meter_response(body, response, status) -> None:
         logger.debug("[outbound] metering skipped: %s", e)
 
 
+def _day_cap_refusal(httpx_module, request, body):
+    """HARTOS's own answer in place of a call the Claude day cap no longer
+    allows, or None when the call may go out.
+
+    The cap was read only where the expert is OFFERED (ModelRegistry._offered),
+    so a turn that already held the expert kept calling it: live on central
+    2026-10-25, request daemon_fbcaabe0-2910-4e3c-a7ef-06d244992ebb went on
+    calling api.anthropic.com after the selector had logged "claude day budget
+    spent: $3.62 of $3.30", and the day closed at $4.39.  Every call that holds
+    the configured expert (_holds_the_expert) now asks the same gate
+    (budget_gate.expert_budget_allows) before it leaves; only the capped family
+    is ever refused.  A call to the node's own model is never refused, even
+    when that model is a Claude model: the cap governs the expert, and
+    refusing the node's own model would block the turn instead of
+    withholding anything.
+
+    The refusal is a 429 with ``x-should-retry: false`` (Kong's Claude fuse
+    answers 429 too): the openai SDK raises it without retrying, autogen moves
+    to the next entry of the turn's config_list, and with_local_fallback ends
+    every expert override with the node's own model.  So the turn goes on, on
+    the node's own model, as when the expert is not offered.  The refusal
+    never reaches the provider, the meter or the breaker.  Calls already past
+    this check when the ledger crosses still complete: the day can close above
+    the cap by what was in flight, never by more.
+
+    A gate that cannot run lets the call go, logged: _offered withholds the
+    expert from every new turn when the gate fails, so this only decides the
+    turns already holding it.
+    """
+    if not _holds_the_expert(request, body):
+        return None
+    model = body.get('model')
+    try:
+        from integrations.agent_engine.budget_gate import expert_budget_allows
+        allowed, why = expert_budget_allows(model)
+    except Exception as e:
+        logger.warning("[outbound] day cap not checked for %s: %s", model, e)
+        return None
+    if allowed:
+        return None
+    logger.warning("[outbound] %s call refused before it left: %s", model, why)
+    return httpx_module.Response(
+        429, request=request,
+        headers={'x-should-retry': 'false'},
+        json={'error': {'type': 'rate_limit_error', 'code': 'hartos_day_budget',
+                        'message': why}})
+
+
 def _hosted_body(request):
     """The JSON body of a hosted chat/completions request, read without
     mutation, or None.  Only for header stamping and metering: the hosted
@@ -676,6 +724,19 @@ def _configured_endpoints() -> frozenset:
     return _configured_endpoints_cache[1]
 
 
+def _url_host_port(url):
+    """(host, port) of a request's URL object, the port defaulted by scheme;
+    None when there is no host.  The URL-object twin of _host_port."""
+    host = str(getattr(url, 'host', '') or '').lower()
+    if not host:
+        return None
+    port = getattr(url, 'port', None)
+    if port is None:
+        scheme = str(getattr(url, 'scheme', '') or '')
+        port = 443 if scheme == 'https' else 80 if scheme == 'http' else None
+    return (host, port)
+
+
 def _is_configured_endpoint(url) -> bool:
     """Is this hosted URL one of the node's configured LLM endpoints (the
     gateway, or a provider the owner pointed a trio at)?  Only those calls
@@ -685,17 +746,39 @@ def _is_configured_endpoint(url) -> bool:
     2026-10-06: the cloud request stays unchanged where the routing does not
     apply; review of 8947e2753, M3)."""
     try:
-        host = str(getattr(url, 'host', '') or '').lower()
-        port = getattr(url, 'port', None)
-        if port is None:
-            scheme = str(getattr(url, 'scheme', '') or '')
-            port = 443 if scheme == 'https' else 80 if scheme == 'http' else None
-        return bool(host) and (host, port) in _configured_endpoints()
+        hp = _url_host_port(url)
+        return hp is not None and hp in _configured_endpoints()
     except Exception:
         return False
 
 
-def _send_and_feed(orig_send, client, request, kwargs):
+def _holds_the_expert(request, body) -> bool:
+    """Is this hosted call the configured expert's: the expert trio's model
+    (core.autogen_config.resolve_expert_backend) at its endpoint's host, port
+    and base path?  The Claude day cap governs the expert alone (budget_gate:
+    the cap only has anything to cap where an expert trio is configured), so
+    the node's own model, even a Claude model on the same gateway, is never
+    refused by it."""
+    try:
+        from core.autogen_config import resolve_expert_backend
+        expert = resolve_expert_backend()
+        if not expert or not isinstance(body, dict):
+            return False
+        if str(body.get('model') or '').strip() != str(expert.get('model') or '').strip():
+            return False
+        base = str(expert.get('base_url') or '')
+        if _host_port(base) != _url_host_port(request.url):
+            return False
+        from urllib.parse import urlsplit
+        prefix = urlsplit(base).path.rstrip('/')
+        path = str(getattr(request.url, 'path', '') or '')
+        return path == prefix or path.startswith(prefix + '/')
+    except Exception as e:
+        logger.warning("[outbound] could not tell whether a call holds the expert: %s", e)
+        return False
+
+
+def _send_and_feed(httpx_module, orig_send, client, request, kwargs):
     """Run a HOSTED (non-target) chat/completions send and feed the provider
     breaker with its real status.  Body bytes are never touched; the response
     object is returned as-is and an exception is re-raised bare (exceptions do
@@ -706,12 +789,17 @@ def _send_and_feed(orig_send, client, request, kwargs):
     (review of 065cef8bb, C1): the configured endpoint on central is Kong at
     /llm/v1/..., whose path is not the local target's, so every Claude call
     took this branch unlabelled and unmetered, the day cap never saw a dollar
-    and Kong routed the calls to its default lane.  Any other host is left
-    exactly as it was (_is_configured_endpoint)."""
+    and Kong routed the calls to its default lane.  Of the calls it meters,
+    those that hold the configured expert are the ones the day cap can refuse
+    (_day_cap_refusal).  Any other host is left exactly as it was
+    (_is_configured_endpoint)."""
     gateway = _is_configured_endpoint(request.url)
     body = _hosted_body(request) if gateway else None
     if gateway:
         _annotate_request(request, body)
+        refusal = _day_cap_refusal(httpx_module, request, body)
+        if refusal is not None:
+            return refusal
     response = orig_send(client, request, **kwargs)
     _status = getattr(response, 'status_code', None)
     _feed_provider_breaker(request.url, _status)
@@ -2419,7 +2507,7 @@ def _install_sync_patch(httpx_module) -> None:
             # provider breaker (#106b b); every other request is an unchanged
             # passthrough.
             if _is_chat_completions_post(request):
-                return _send_and_feed(_orig_send, self, request, kwargs)
+                return _send_and_feed(httpx_module, _orig_send, self, request, kwargs)
             return _orig_send(self, request, **kwargs)
         try:
             body_bytes = bytes(request.content or b'')
@@ -2485,13 +2573,17 @@ def _install_async_patch(httpx_module) -> None:
 
     async def _patched(self, request, **kwargs):
         if not _is_target_request(request.url, request.method):
-            # Hosted chat/completions: lane and model headers, the provider
-            # breaker (#106b b) and the dollar meter, as in _send_and_feed.
+            # Hosted chat/completions: lane and model headers, the day cap,
+            # the provider breaker (#106b b) and the dollar meter, as in
+            # _send_and_feed.
             if _is_chat_completions_post(request):
                 _gateway = _is_configured_endpoint(request.url)
                 _hbody = _hosted_body(request) if _gateway else None
                 if _gateway:
                     _annotate_request(request, _hbody)
+                    _refusal = _day_cap_refusal(httpx_module, request, _hbody)
+                    if _refusal is not None:
+                        return _refusal
                 _resp = await _orig(self, request, **kwargs)
                 _hstatus = getattr(_resp, 'status_code', None)
                 _feed_provider_breaker(request.url, _hstatus)

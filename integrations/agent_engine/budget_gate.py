@@ -841,7 +841,13 @@ def meter_llm_call(model: str, tokens_in: int, tokens_out: int,
 # "No more than $6 a day on Claude in central", and "Claude can never become
 # its own blocker": the cap is enforced where the expert is OFFERED
 # (ModelRegistry._offered asks expert_budget_allows), so a turn past the cap
-# is served by the node's own model instead of failing.  The ledger it reads
+# is served by the node's own model instead of failing; and again before
+# every call to the configured expert leaves the node (core.
+# llm_outbound_logger._day_cap_refusal asks the same function; the node's own
+# model is never refused), so a turn that already holds the
+# expert falls back to the node's own model the moment the ledger crosses
+# (live 2026-10-25: a running turn took central to $4.39 of $3.30 when only
+# the offer was checked).  The ledger it reads
 # is MeteredAPIUsage, fed by the wire hook from every response's usage block
 # (core.llm_outbound_logger._meter_response) at a real dollar price.
 # Topology agnostic: no node-tier branch.  The cap only has anything to cap
@@ -934,12 +940,13 @@ def claude_usd_spent_today() -> Optional[float]:
 
 
 def expert_budget_allows(model_name) -> Tuple[bool, str]:
-    """May the expert model ``model_name`` be offered right now?
+    """May the expert model ``model_name`` be offered, or called, right now?
 
     Only the capped family is ever refused: once today's metered dollars
     reach the day budget, or while the ledger cannot be read.  A refusal is
-    not an error anywhere: the selector simply does not offer the expert and
-    the turn runs on the node's own model.
+    not an error anywhere: the selector simply does not offer the expert, the
+    wire hook answers a call the turn already holds with a no-retry 429, and
+    either way the turn runs on the node's own model.
     """
     if model_family(model_name) != CAPPED_FAMILY:
         return True, 'not a capped family'
