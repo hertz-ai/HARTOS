@@ -1214,14 +1214,21 @@ class NotificationService:
     @staticmethod
     def create(db: Session, user_id: str, type: str, source_user_id: str = None,
                target_type: str = None, target_id: str = None, message: str = '',
-               push: dict = None):
+               push: dict = None, notification_id: str = None):
         """Write a notification for ``user_id`` and send it to their live
         clients once the row commits.  ``push`` (realtime.on_notification's
         ``{'title', 'body', 'data'}``) also sends it to their phone as a
         Firebase message: for a notification that asks the person for
-        something, which they must see with every app closed."""
+        something, which they must see with every app closed.
+
+        ``notification_id``: a caller that has to name the row before it
+        exists (an ask, whose push and card carry its id:
+        integrations.agent_engine.person_ask) gives it here, and the row's
+        messages then go out under that id as their msg_id, so every copy of
+        the ask on every surface, and its Firebase push, is one message
+        (realtime.on_notification pushes once per msg_id)."""
         notif = Notification(
-            id=_uuid(), user_id=user_id, type=type,
+            id=notification_id or _uuid(), user_id=user_id, type=type,
             source_user_id=source_user_id, target_type=target_type,
             target_id=target_id, message=message,
         )
@@ -1230,6 +1237,8 @@ class NotificationService:
         # Push to SSE + WAMP once the row has committed, never for a row
         # that rolls back (models.after_commit; a failed push is logged there).
         notif_dict = notif.to_dict()
+        if notification_id:
+            notif_dict['msg_id'] = notif.id
 
         def _push():
             from .realtime import on_notification

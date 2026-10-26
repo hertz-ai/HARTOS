@@ -1007,6 +1007,21 @@ COMPONENT_TYPES = {
         'example': {'agent_id': 'agent_1', 'action': 'delete_old_logs',
                     'description': 'Delete logs older than 30 days?'},
     },
+    'file_request': {
+        'props': ['title', 'purpose', 'accept', 'max_files', 'prompt_id'],
+        'attributes': {'title': 'str', 'description': 'str', 'purpose': 'str',
+                       'accept': 'str', 'max_files': 'number', 'prompt_id': 'any',
+                       'ask_id': 'str'},
+        'required': ['purpose'],
+        'doc': ('Asks the person for files, on whichever of their devices they '
+                'answer. The surface sends the picked files to the user file store '
+                'under `purpose` (core.user_file_store decides which purposes and '
+                'types exist) for `prompt_id`, then answers the ask with their '
+                'ids. Sent by integrations.agent_engine.person_ask.'),
+        'example': {'title': 'Send me the clips for your reel',
+                    'purpose': 'reel_source', 'accept': 'video', 'max_files': 5,
+                    'prompt_id': '342'},
+    },
     'code': {
         'props': ['language', 'content', 'filename'],
         'attributes': {'language': 'str', 'content': 'str', 'code': 'str',

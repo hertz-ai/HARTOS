@@ -11932,6 +11932,19 @@ def agent_approval():
     """
     try:
         data = request.get_json(silent=True) or {}
+        # The person's answer to an ask an agent put to them, from whichever
+        # surface they answered on, for any component (a file_request's
+        # picked files, a form's values, a choice):
+        # integrations.agent_engine.person_ask.  First, because it carries
+        # no decision word; the answerer is the caller's VERIFIED identity,
+        # never a body field, by the rule the commerce and game-sound cards
+        # use.  Every branch below keeps its own shape.
+        if data.get('ask_id'):
+            from integrations.agent_engine.person_ask import answer_ask
+            from integrations.commerce.approvals import approver_from_request
+            _ask_body, _ask_code = answer_ask(
+                data.get('ask_id'), data.get('answer'), approver_from_request(request))
+            return jsonify(_ask_body), _ask_code
         agent_id = data.get('agent_id', '')
         # kept as sent as well: a game sound's state is camelCase and its
         # memo key exact (hartos-3a F5)
