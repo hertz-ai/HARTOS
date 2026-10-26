@@ -12,6 +12,8 @@ Topic routing (MessageBus TOPIC_MAP):
 import logging
 import json
 import os
+import threading
+from collections import OrderedDict
 
 logger = logging.getLogger('hevolve_social')
 
@@ -368,7 +370,67 @@ def on_vote_update(target_type: str, target_id: str, score: int):
     publish_event(f'social.{target_type}.{target_id}.vote', {'score': score})
 
 
-def on_notification(user_id: str, notification_dict: dict):
+# A notification that must reach a person who is not looking at any app also
+# goes out as one Firebase message (core.fcm_sync.send_fcm_push: this node's
+# own credential, else central's relay).  Once per msg_id per process: an ask
+# is re-sent on every poll with a stable msg_id so the card stays one card,
+# and that must not ring the phone every poll.  Bounded; oldest forgotten.
+_PUSHED: 'OrderedDict[str, bool]' = OrderedDict()
+_PUSHED_MAX = 4096
+_pushed_lock = threading.Lock()
+
+
+_push_skip_said = False
+
+
+def _pushes_allowed() -> bool:
+    """A Firebase push leaves this machine (Google, or central's relay over
+    the bus), so it goes out only from a process that runs the node's
+    background services -- never from a test or a tool that only imports the
+    code (core.config_cache.should_start_background_services; off under
+    pytest unless a test sets it).  The first skip is logged, once."""
+    global _push_skip_said
+    from core.config_cache import should_start_background_services
+    if should_start_background_services():
+        return True
+    if not _push_skip_said:
+        _push_skip_said = True
+        logger.info("notification pushes are off in this process: background "
+                    "services are off (HEVOLVE_START_BACKGROUND_SERVICES)")
+    return False
+
+
+def _first_push_of(msg_id: str) -> bool:
+    with _pushed_lock:
+        if msg_id in _PUSHED:
+            return False
+        _PUSHED[msg_id] = True
+        while len(_PUSHED) > _PUSHED_MAX:
+            _PUSHED.popitem(last=False)
+        return True
+
+
+def _send_push(user_id: str, push: dict) -> None:
+    kind = (push.get('data') or {}).get('type', '')
+    try:
+        from core.fcm_sync import send_fcm_push
+        if not send_fcm_push(user_id, push.get('title') or 'HART',
+                             push.get('body') or '', data=push.get('data')):
+            logger.warning("push %s to %s did not go out: no Firebase credential "
+                           "or token here, and no relay accepted it", kind, user_id)
+    except Exception:
+        logger.warning("push %s to %s failed", kind, user_id, exc_info=True)
+
+
+def on_notification(user_id: str, notification_dict: dict, push: dict = None):
+    """Fan a notification out to ``user_id``'s live clients (WAMP + SSE).
+
+    ``push`` -- ``{'title', 'body', 'data'}`` -- also sends it to the person's
+    phone as a Firebase message, for a notification that asks them for
+    something: the WAMP and SSE legs reach only an app that is open and
+    connected to this node's router.  Sent once per msg_id, off the caller's
+    thread (a token fetch can take seconds).
+    """
     # Stamp idempotency key once so the same payload lands on WAMP
     # and SSE with the same msg_id — clients dedupe transport races.
     from .chat_messages import make_msg_id
@@ -387,6 +449,9 @@ def on_notification(user_id: str, notification_dict: dict):
         'msg_id': msg_id,
         **notification_dict,
     }, user_id=user_id)
+    if push and user_id and _pushes_allowed() and _first_push_of(str(msg_id)):
+        threading.Thread(target=_send_push, args=(str(user_id), push),
+                         daemon=True, name='notify-push').start()
 
 
 def on_notification_read(user_id: str, ids):

@@ -1213,7 +1213,13 @@ class NotificationService:
 
     @staticmethod
     def create(db: Session, user_id: str, type: str, source_user_id: str = None,
-               target_type: str = None, target_id: str = None, message: str = ''):
+               target_type: str = None, target_id: str = None, message: str = '',
+               push: dict = None):
+        """Write a notification for ``user_id`` and send it to their live
+        clients once the row commits.  ``push`` (realtime.on_notification's
+        ``{'title', 'body', 'data'}``) also sends it to their phone as a
+        Firebase message: for a notification that asks the person for
+        something, which they must see with every app closed."""
         notif = Notification(
             id=_uuid(), user_id=user_id, type=type,
             source_user_id=source_user_id, target_type=target_type,
@@ -1227,7 +1233,10 @@ class NotificationService:
 
         def _push():
             from .realtime import on_notification
-            on_notification(user_id, notif_dict)
+            if push:
+                on_notification(user_id, notif_dict, push=push)
+            else:
+                on_notification(user_id, notif_dict)
         after_commit(db, _push)
         return notif
 

@@ -172,6 +172,9 @@ class DeviceRoutingService:
         consent_prompt FCM (the native Truecaller-style ConsentOverlayService
         that draws over other apps so the user can act without opening the
         app), and a FleetCommand (real-time push to the RN app when open).
+        An action with a consent type is filed through ConsentService, which
+        sends that FCM itself, once per ask, carrying the ask's row id; this
+        method sends one only for an action no consent type governs.
 
         Args:
             db: SQLAlchemy session.
@@ -201,13 +204,16 @@ class DeviceRoutingService:
         # consent_type_for_action maps the action; an action that governs no
         # consent type records nothing and still pushes, exactly as before, so
         # no caller loses its notification.
+        handed = False
+        recorded = None
         try:
             from .consent_service import ConsentService, consent_type_for_action
             _ct = consent_type_for_action(action)
             if _ct:
-                ConsentService.request_consent(
+                recorded = ConsentService.request_consent(
                     db, str(user_id), _ct, scope='*', agent_id=agent_id,
                     reason=description or action)
+                handed = True
         except Exception as _e:  # never cost the user the ask itself
             logger.warning(
                 'device consent ask not recorded for %s/%s: %s',
@@ -227,29 +233,32 @@ class DeviceRoutingService:
         # the RN app only when it is OPEN, so without this FCM the over-other-
         # apps overlay never pops while the user is away from the agent's
         # device — which is the whole point (agents run on the laptop; the user
-        # acts on the phone).  Payload mirrors chatbot_pipeline/confirmation.py.
-        # No-ops cleanly on a node with no edge FCM credential (send_fcm_push
-        # gates on HART_FCM_SA_FILE/HART_FCM_ACCESS_TOKEN + HART_FCM_PROJECT).
-        request_id = uuid.uuid4().hex
-        try:
-            from core.fcm_sync import send_fcm_push
-            send_fcm_push(
-                str(user_id),
-                'HARTOS consent',
-                f"[{action}] {description}" if description
-                else f"An agent needs your consent: {action}",
-                data={
-                    'type': 'consent_prompt',
-                    'request_id': request_id,
+        # acts on the phone).  Payload: consent_service.consent_prompt_push,
+        # the one builder.  With no edge FCM credential, send_fcm_push hands
+        # it to central's relay.
+        if handed:
+            # ConsentService decided: an undecided ask rang the phone when it
+            # was filed (realtime.on_notification's Firebase leg), carrying
+            # the row's id, the id a yes or no answers; a decided one, or one
+            # central cannot use, rings nothing.  A second push here popped a
+            # second overlay with an id no ask on file has.
+            request_id = str(recorded.id) if recorded is not None else uuid.uuid4().hex
+        else:
+            request_id = uuid.uuid4().hex
+            try:
+                from core.fcm_sync import send_fcm_push
+                from .consent_service import consent_prompt_push
+                push = consent_prompt_push({
                     'user_id': str(user_id),
-                    'topic_reply': f'com.hertzai.pupit.{user_id}',
-                    'action': str(action),
-                    'agent_id': str(agent_id),
-                },
-            )
-        except Exception as exc:  # a push failure must never break the record
-            logger.warning('consent_prompt FCM push failed (%s) — notification + '
-                           'fleet command remain', exc)
+                    'reason': (f"[{action}] {description}" if description
+                               else f"An agent needs your consent: {action}"),
+                }, request_id)
+                push['data'].update(action=str(action), agent_id=str(agent_id))
+                send_fcm_push(str(user_id), push['title'], push['body'],
+                              data=push['data'])
+            except Exception as exc:  # a push failure must never break the record
+                logger.warning('consent_prompt FCM push failed (%s) — notification + '
+                               'fleet command remain', exc)
 
         # Find primary device (phone > desktop > tablet > any)
         devices = db.query(DeviceBinding).filter_by(

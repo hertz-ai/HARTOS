@@ -450,6 +450,11 @@ class GoalManager:
             cfg['escalation'] = record
             result = GoalManager.update_goal(db, goal_id, config_json=cfg)
             return dict(result, stage='expert') if result.get('success') else result
+        # Already waiting on a person for this same action: the pause is
+        # renewed and nobody is told again.  A hive worker re-running a paused
+        # goal's task asks for help each time its claim expires (#194).
+        already_told = (goal.status == 'paused' and same_action
+                        and prior.get('next') == 'human')
         record['next'] = 'human'
         cfg['escalation'] = record
         cfg['pause_reason'] = (
@@ -461,7 +466,55 @@ class GoalManager:
         if not result.get('success'):
             return result
         result = GoalManager.update_goal_status(db, goal_id, 'paused')
+        if result.get('success') and not already_told:
+            GoalManager._tell_its_person(db, goal, cfg['pause_reason'])
         return dict(result, stage='human') if result.get('success') else result
+
+    @staticmethod
+    def _tell_its_person(db: Session, goal, reason: str) -> None:
+        """Tell the person a goal belongs to that it has stopped for them.
+
+        The goal's own person (core.event_attribution.goal_owner_user_id) or,
+        for a goal the node seeded itself, the node's owner
+        (capability_setup.setup_owner): one notification, sent to their phone
+        too (NotificationService.create's push).  Until 2026-10-26 the human
+        stage only wrote "Needs help" into the goal, and on central five
+        earning goals waited on it with nobody told.  Nobody to tell, or a
+        person with no account on this node, is logged; nothing here can
+        undo or fail the pause.
+        """
+        try:
+            from core.event_attribution import goal_owner_user_id
+            from integrations.agent_engine.capability_setup import setup_owner
+            from integrations.social.models import User
+            from integrations.social.services import NotificationService
+            person = goal_owner_user_id(goal) or setup_owner()
+            if not person:
+                logger.warning(
+                    "goal %s needs a person and nobody can be told: the goal "
+                    "names no owner and HEVOLVE_OWNER_USER_ID is not set", goal.id)
+                return
+            if not db.query(User).filter_by(id=str(person)).first():
+                logger.warning(
+                    "goal %s needs a person, but %s has no account on this "
+                    "node to tell", goal.id, person)
+                return
+            title = str(goal.title or 'A goal')[:100]
+            try:
+                from security.dlp_engine import get_dlp_engine
+                title = get_dlp_engine().redact(title)
+            except Exception:
+                title = 'A goal'
+            NotificationService.create(
+                db, str(person), 'goal_needs_help', target_type='goal',
+                target_id=str(goal.id), message=str(reason or '')[:500],
+                push={'title': 'A goal needs your help',
+                      'body': f'{title} is waiting for you.',
+                      'data': {'type': 'goal_needs_help',
+                               'goal_id': str(goal.id)}})
+        except Exception:
+            logger.warning("goal %s: could not tell its person that it needs "
+                           "help", getattr(goal, 'id', '?'), exc_info=True)
 
     @staticmethod
     def _escalation_expert(goal_type=None):

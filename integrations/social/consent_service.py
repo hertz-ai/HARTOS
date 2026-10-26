@@ -279,6 +279,42 @@ def _audit(event_type: str, actor_id: str, action: str, detail: dict):
             event_type, actor_id, e)
 
 
+def consent_prompt_push(data: dict, request_id) -> dict:
+    """The Firebase message that pops the phone's consent overlay for an ask,
+    in the shape its handler reads (MyFirebaseMessagingService
+    .handleConsentPrompt: type 'consent_prompt', request_id, user_id,
+    topic_reply, title, body).  The one builder: an ask filed here (_emit)
+    and DeviceRoutingService's push for an action no consent type governs.
+
+    ``request_id`` is what a yes or no answers: the consent row's id for an
+    ask on file.  ``topic_reply`` is where the overlay publishes that answer
+    (the overlay's own default, carried as the steward's spec has it).  The
+    text leaves this node for Google (or central's relay), so it passes the
+    DLP scrub; if the scrub cannot run, the reason is left out.
+    """
+    user_id = str(data.get('user_id', ''))
+    who = str(data.get('agent_name') or data.get('requester_name') or 'An agent')
+    what = str(data.get('consent_type') or 'your permission').replace('_', ' ')
+    title = f"{who} needs your OK"
+    body = str(data.get('reason') or '').strip() or f"{who} asks for {what}."
+    try:
+        from security.dlp_engine import get_dlp_engine
+        dlp = get_dlp_engine()
+        title, body = dlp.redact(title), dlp.redact(body)
+    except Exception:
+        _logger.warning("consent ask push: DLP scrub unavailable; the reason "
+                        "stays on this node", exc_info=True)
+        body = f"{who} asks for {what}."
+    title, body = title[:80], body[:240]
+    return {'title': title, 'body': body,
+            'data': {'type': 'consent_prompt',
+                     'request_id': str(request_id),
+                     'user_id': user_id,
+                     'topic_reply': f'com.hertzai.pupit.{user_id}',
+                     'consent_type': str(data.get('consent_type') or ''),
+                     'title': title, 'body': body}}
+
+
 def _emit(topic: str, data: dict, msg_id: str = None):
     """Best-effort EventBus broadcast + push to frontend via WAMP/SSE.
 
@@ -316,7 +352,17 @@ def _emit(topic: str, data: dict, msg_id: str = None):
                     note[name_key] = data[name_key]
             if msg_id:
                 note['msg_id'] = msg_id
-            on_notification(user_id, note)
+            # An ask also rings the person's phone (Firebase), once per ask:
+            # the live legs reach only an app that is open on this router.
+            # Only an ask with a stable id (the row's): the push goes out once
+            # per id, and an ask without one could not be told from its own
+            # re-sends.
+            push = (consent_prompt_push(data, msg_id.split(':', 1)[-1])
+                    if topic == 'consent.request' and msg_id else None)
+            if push:
+                on_notification(user_id, note, push=push)
+            else:
+                on_notification(user_id, note)
             note_sent = True
         except Exception:
             _logger.warning("consent %s: notification leg failed for user %s",
