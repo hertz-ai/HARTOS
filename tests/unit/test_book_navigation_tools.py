@@ -316,6 +316,61 @@ class ParseBookPdf(unittest.TestCase):
         out, _ = self._parse('/uploads/files/abc_book.pdf', error=RuntimeError('db locked'))
         self.assertIn('Could not start PDF parsing', out)
 
+    def test_the_operator_gets_a_traceback_when_a_parse_cannot_start(self):
+        """driver_text's docstring promises this, and this caller broke it.
+
+        That docstring says the operator loses nothing because every caller
+        logs the exception beside the sanitised answer -- and this one, the
+        fourth caller it names, logged the text with no traceback at all
+        (hartos-f3's review of df055008a, Minor 2).
+        """
+        boom = RuntimeError('the library went away')
+        with self.assertLogs('integrations.learning.book_tools', level='WARNING') as got:
+            answer, _ = self._parse('/uploads/files/abc_book.pdf', error=boom)
+        assert 'Could not start PDF parsing' in answer
+        assert any(r.exc_info is not None for r in got.records), [
+            r.getMessage() for r in got.records]
+
+    def test_a_disk_error_does_not_hand_the_agent_the_uploads_path(self):
+        """The agent-facing one of the three routes driver_text was
+        carrying an OSError's path out through. What this tool returns
+        becomes part of a model's prompt, and that model can be a cloud
+        one (H-0715).
+        """
+        secret = r'C:\Users\someone\uploads\files\de1f.pdf'
+        out, _ = self._parse('/uploads/files/abc_book.pdf',
+                             error=OSError(13, 'Permission denied', secret))
+
+        assert 'Could not start PDF parsing' in out
+        assert 'someone' not in out and 'de1f' not in out
+        assert 'Permission denied' in out
+
+    def test_a_failure_to_start_does_not_hand_the_agent_the_statement(self):
+        """What this tool returns becomes part of a model's prompt.
+
+        SQLAlchemy renders [SQL: ...] and [parameters: ...] into a
+        StatementError, and _register's parameters carry the uploads
+        directory. The prefix assertion above passes either way, which is
+        why this went unnoticed; hartos-70's register reads an agent's tool
+        output as data leaving the device (H-0715, H-1015), because the
+        model answering the turn can be a cloud one.
+        """
+        import sqlite3
+        from sqlalchemy.exc import OperationalError
+        boom = OperationalError(
+            'INSERT INTO pdf_files (user_id, filename, directory) VALUES (?, ?, ?)',
+            {'directory': r'C:\Users\sathi\Documents\Nunba\uploads\pdf_parse'},
+            sqlite3.OperationalError('disk I/O error'))
+
+        out, _ = self._parse('/uploads/files/abc_book.pdf', error=boom)
+
+        self.assertIn('Could not start PDF parsing', out)
+        self.assertIn('disk I/O error', out)      # the person still learns what broke
+        self.assertNotIn('[SQL:', out)
+        self.assertNotIn('[parameters:', out)
+        self.assertNotIn('Documents', out)
+        self.assertNotIn('pdf_files', out)
+
 
 class PublisherCarriesTheImage(unittest.TestCase):
     """The shared publisher change: page_image_url was an unconditional ''."""

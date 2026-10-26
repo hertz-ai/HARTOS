@@ -5,9 +5,16 @@ Fail-closed economics: don't spend what you don't have.
 
 Functions:
   estimate_llm_cost_spark(prompt, model_name) — token-based cost estimate
-  check_goal_budget(goal_id, estimated_cost) — atomic row-lock deduction
+  check_goal_budget(goal_id, estimated_cost, holder) — atomic row-lock
+                                       reservation, held under its holder
+  release_goal_reservations(goal_id, holder) — the holder gives its
+                                       reservation back when its work ends
   check_platform_affordability() — 7-day net revenue check (cached 60s)
-  pre_dispatch_budget_gate(goal_id, prompt, model_name) — combined gate
+  pre_dispatch_budget_gate(goal_id, prompt, model_name, holder) — combined
+                                       gate, reserving under holder
+  reservation_holder(kind, ident) — the one naming rule for holders
+  goal_spark_now(goal_id, row_spark_spent) — spark spent as committed now,
+                                       and the part of it spent on work
 
 Pattern extracted from: speculative_dispatcher._check_and_reserve_budget() (lines 314-340)
 """
@@ -24,7 +31,9 @@ logger = logging.getLogger(__name__)
 # + new SQLite connection cycle is the dominant CPU consumer when many
 # goals × idle_agents fire in tight succession.  A short TTL is enough
 # to break the storm — within 10s the goal's row hasn't materially
-# changed (this function is the only writer in the daemon path).  Burst
+# changed (release_goal_reservations and charge_goal_work_completed clear
+# the goal's entry; an admin edit through GoalManager.update_goal does not,
+# so a top-up there shows after the window).  Burst
 # under-counting is bounded: at most one un-deducted hit per goal per
 # TTL window.  Cache stores the FULL return tuple so callers see the
 # exact same shape they'd see from a fresh DB query.
@@ -122,7 +131,8 @@ def estimate_llm_cost_spark(prompt: str, model_name: str = '') -> int:
 # ── Goal budget (row-lock atomic deduction) ──────────────────────────
 
 def check_goal_budget(goal_id: Optional[str],
-                      estimated_cost: int) -> Tuple[bool, int, str]:
+                      estimated_cost: int,
+                      holder: Optional[str] = None) -> Tuple[bool, int, str]:
     """Check and reserve Spark budget for a goal (atomic row lock).
 
     Extracted from speculative_dispatcher._check_and_reserve_budget().
@@ -131,9 +141,13 @@ def check_goal_budget(goal_id: Optional[str],
     TTL cache (``_BUDGET_CACHE_TTL_S``) breaks the daemon-tick storm —
     repeated calls for the same goal within the window return the cached
     tuple without hitting the DB.  Bounds under-counting at one
-    un-deducted hit per goal per window; the only writer to
-    ``goal.spark_spent`` is this function, so cache freshness is
-    self-consistent.
+    un-deducted hit per goal per window.  The other writers of
+    ``goal.spark_spent`` (release_goal_reservations,
+    charge_goal_work_completed) clear the goal's cache entry.
+
+    A deduction is held under ``holder`` (held_reservation) until that
+    holder gives it back with release_goal_reservations when its work ends;
+    a cached answer deducts nothing and holds nothing.
     """
     if not goal_id:
         return True, -1, 'no_goal_constraint'
@@ -183,6 +197,7 @@ def check_goal_budget(goal_id: Optional[str],
 
             goal.spark_spent = spent + estimated_cost
             db.commit()
+            _hold(goal_id, estimated_cost, holder)
             result = (True, remaining - estimated_cost, 'budget_reserved')
             with _budget_cache_lock:
                 _budget_cache[goal_id] = (now, result)
@@ -249,6 +264,207 @@ def charge_goal_work_completed(prompt_id, actions_completed: int = 1) -> bool:
     except Exception as e:
         logger.debug(f"completed-work spark charge unavailable: {e}")
         return False
+
+
+# Spark check_goal_budget reserved and nobody has given back yet, per goal.
+# The reservation is a pre-check: it stops a goal from dispatching past its
+# budget while the turn runs.  It is not work, and the steward's rule
+# (charge_goal_work_completed) is that spark_spent rises only on work done.
+# Each reservation is held under its HOLDER, the code that made it, and that
+# code gives it back when its own work ends: dispatch_goal when its turn
+# returns, the speculative expert when its background task ends.  A
+# goal-wide release gave back the expert's reservation while the expert
+# still ran, and any caller's reservation to any other (review of
+# e8b6bf675, Q4 and P6).  Kept in process: the holder releases in the
+# process that reserved.  A reservation made in another process (the stdio
+# MCP server's dispatch_goal) is not in this ledger, so this process reads
+# it as spent on work until it is given back.  One made after a daemon's
+# snapshot and still held at its settle completes the goal on spark nobody
+# earned (measured, review of 8b32e97b6, F2); one given back in between
+# reads as less work.  Task #175.
+#
+# Two keys under a goal are not holders.  _RELEASING is spark a holder is
+# giving back whose write has not committed yet: still held, or a settle
+# running meanwhile reads the reservation as work (review of 4bb3bbae0,
+# finding 2).  _UNRELEASED is spark whose write failed: every holder is
+# unique per call, so it would never be released again under its own name;
+# the goal's next release, by any holder, retries it (finding 1).
+_held_reservations: Dict[str, Dict[str, int]] = {}
+_held_lock = threading.Lock()
+_RELEASING = '\x00releasing'
+_UNRELEASED = '\x00unreleased'
+
+
+def reservation_holder(kind: str, ident: str) -> str:
+    """The name a reservation is held under: what reserved it, and which
+    call of it.  dispatch_goal names one per turn, the speculative expert
+    one per speculation."""
+    return f'{kind}:{ident}'
+
+
+def _hold(goal_id, amount: int, holder: Optional[str] = None) -> None:
+    if not goal_id or not amount or amount <= 0:
+        return
+    key, who = str(goal_id), holder or ''
+    with _held_lock:
+        mine = _held_reservations.setdefault(key, {})
+        mine[who] = mine.get(who, 0) + int(amount)
+
+
+def held_reservation(goal_id) -> int:
+    """Spark reserved for ``goal_id`` and not yet released, by any holder."""
+    with _held_lock:
+        return sum(_held_reservations.get(str(goal_id), {}).values())
+
+
+def spark_spent_on_work(goal_id, spark_spent) -> int:
+    """The goal's spark_spent without what is still held as a reservation.
+
+    The one reading of "spark spent" for the completion gate: both the
+    snapshot a daemon takes before a dispatch and the figure it settles on
+    go through here.  A hold left by a failed release otherwise inflated the
+    snapshot, and the next dispatch's real work read as a noop (review of
+    e8b6bf675, P3).
+    """
+    return max(0, (spark_spent or 0) - held_reservation(goal_id))
+
+
+def goal_spark_now(goal_id, row_spark_spent=None) -> Tuple[int, int]:
+    """(spark_spent as committed now, the part of it spent on work).
+
+    The column is read in a short session of its own, then the ledger.  A
+    row loaded earlier goes stale: the agent daemon loads every goal when
+    its tick starts, and a holder giving spark back meanwhile lowers the
+    column in another session while the ledger already holds nothing, so
+    the stale figure read given-back spark as spent.  The budget pre-check
+    paused a goal on '12 < 16' with 16 left, and the snapshot made 2 spark
+    of real work a noop (review of 8b32e97b6, F1, measured).  A release
+    that lands between the two reads can still move this reading by its
+    amount, either way (task #175).
+
+    ``row_spark_spent`` (the caller's row) stands in when the column cannot
+    be read.
+    """
+    spent = row_spark_spent
+    try:
+        from integrations.social.models import get_db, AgentGoal
+        db = get_db()
+        try:
+            value = (db.query(AgentGoal.spark_spent)
+                     .filter(AgentGoal.id == str(goal_id)).scalar())
+        finally:
+            db.close()
+        # Anything but an integer (no row, a NULL column) is no reading.
+        if isinstance(value, int) and not isinstance(value, bool):
+            spent = value
+    except Exception as e:
+        logger.debug("Spark for goal %s not read fresh, using the loaded "
+                     "row: %s", goal_id, e)
+    spent = spent or 0
+    return spent, spark_spent_on_work(goal_id, spent)
+
+
+def release_goal_reservations(goal_id, holder: Optional[str] = None) -> int:
+    """Give back the spark ``holder`` reserved for ``goal_id``.
+
+    Called by the holder when its work ends, whatever the outcome; other
+    holders' reservations on the goal stay.  Without it the reservation stood
+    in for work: the completion gate read it as "spark spent this dispatch"
+    (18 goals completed on central 2026-10-17 whose every turn had failed),
+    and budgets drained by the estimate on every failed or waiting dispatch
+    until the gate paused the goal ("insufficient_budget (0 < 4)").  Spark
+    charged for completed work meanwhile (charge_goal_work_completed) stays.
+
+    Its own short transaction, row-locked like the reservation, so a
+    concurrent work charge is never overwritten.  Never takes spark_spent
+    below zero.  The holder's hold moves to _RELEASING before the write, so
+    two releases at once give it back once (review of e8b6bf675, P5), and it
+    still counts as held until the write commits.  Spark an earlier release
+    could not write (_UNRELEASED) is retried with this one.  On a database
+    error the whole amount is parked for the goal's next release and 0 is
+    returned.  A hold whose goal row is gone is dropped and 0 returned:
+    nothing was given back.  Returns the spark given back.
+
+    Between the commit and the ledger update spark_spent is already lowered
+    while the spark still counts as held.  A settle reading then sees less
+    work than was done (a noop); a snapshot reading then is low, and the
+    next settle can count the difference as work (task #175).
+    """
+    key, who = str(goal_id), holder or ''
+    with _held_lock:
+        mine = _held_reservations.get(key)
+        if not mine:
+            return 0
+        amount = mine.pop(who, 0) + mine.pop(_UNRELEASED, 0)
+        if amount <= 0:
+            return 0
+        mine[_RELEASING] = mine.get(_RELEASING, 0) + amount
+    written, goal = False, None
+    try:
+        from integrations.social.models import get_db, AgentGoal
+        db = get_db()
+        try:
+            goal = db.query(AgentGoal).filter_by(
+                id=goal_id).with_for_update().first()
+            if goal is not None:
+                goal.spark_spent = max(0, (goal.spark_spent or 0) - amount)
+                db.commit()
+            written = True
+        finally:
+            db.close()
+    except Exception as e:
+        if written:
+            # The commit stood; only closing the session failed.  The spark
+            # is back, so it is not parked to be given back a second time.
+            logger.debug("Session close failed after giving back spark for "
+                         "goal %s: %s", goal_id, e)
+        else:
+            logger.warning("Spark reserved for goal %s not given back yet "
+                           "(kept for the goal's next release): %s",
+                           goal_id, e)
+    finally:
+        # Also on an interrupt (KeyboardInterrupt, SystemExit): an amount
+        # left under _RELEASING would count as held forever and never be
+        # retried (review of 25d31fc1d, item 2).
+        with _held_lock:
+            mine = _held_reservations.setdefault(key, {})
+            left = mine.get(_RELEASING, 0) - amount
+            if left > 0:
+                mine[_RELEASING] = left
+            else:
+                mine.pop(_RELEASING, None)
+            if not written:
+                mine[_UNRELEASED] = mine.get(_UNRELEASED, 0) + amount
+            if not mine:
+                _held_reservations.pop(key, None)
+    if not written:
+        return 0
+    invalidate_goal_budget_cache(goal_id)
+    if goal_id != key:
+        invalidate_goal_budget_cache(key)
+    if goal is None:
+        logger.info("Spark held for goal %s dropped: the goal no longer "
+                    "exists", goal_id)
+        return 0
+    return amount
+
+
+def retry_unreleased_reservations() -> int:
+    """Retry giving back spark whose earlier release could not be written,
+    for every goal.
+
+    Any release on the goal retries it, but a goal waiting for held spark
+    makes no new dispatch and so no new release of its own.  The agent
+    daemon calls this at the start of each tick, before it opens the tick's
+    long session, so the write does not wait on that session's lock.
+    Returns the spark given back."""
+    with _held_lock:
+        goals = [k for k, mine in _held_reservations.items()
+                 if mine.get(_UNRELEASED, 0) > 0]
+    # _UNRELEASED is never a real holder, so each release takes only the
+    # parked amount and no holder's live reservation.
+    return sum(release_goal_reservations(k, holder=_UNRELEASED)
+               for k in goals)
 
 
 def invalidate_goal_budget_cache(goal_id: Optional[str] = None) -> None:
@@ -412,12 +628,15 @@ def apply_budget_pause(goal, reason: str) -> bool:
 
 def pre_dispatch_budget_gate(goal_id: Optional[str],
                              prompt: str,
-                             model_name: str = '') -> Tuple[bool, str]:
+                             model_name: str = '',
+                             holder: Optional[str] = None) -> Tuple[bool, str]:
     """Combined pre-dispatch budget gate.
 
     1. Resolve effective model name (local vs cloud)
     2. Estimate LLM cost
-    3. Check goal budget (atomic deduction)
+    3. Check goal budget (atomic reservation under ``holder``, who gives
+       it back with release_goal_reservations when the dispatch ends, a
+       refusal here included)
     4. Check platform affordability (cached)
 
     Returns: (allowed, reason)
@@ -426,7 +645,8 @@ def pre_dispatch_budget_gate(goal_id: Optional[str],
     estimated_cost = estimate_llm_cost_spark(prompt, model_name)
 
     # Goal-level budget
-    allowed, remaining, reason = check_goal_budget(goal_id, estimated_cost)
+    allowed, remaining, reason = check_goal_budget(goal_id, estimated_cost,
+                                                   holder=holder)
     if not allowed:
         logger.warning(f"Budget gate BLOCKED: goal={goal_id}, {reason}")
         # A goal that cannot afford its next dispatch cannot afford the one

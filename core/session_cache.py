@@ -11,6 +11,7 @@ After:  Entries auto-expire after configurable TTL (default 2 hours).
 import time
 import threading
 import logging
+import weakref
 from collections import OrderedDict
 
 logger = logging.getLogger('hevolve_core')
@@ -41,6 +42,11 @@ class TTLCache:
     abandoned for 2h still gets cleaned up.
     """
 
+    #: Every live cache, so a value written past them can be dropped from
+    #: all (forget_everywhere).  Weak: a cache that goes away leaves it.
+    _instances = weakref.WeakSet()
+    _instances_lock = threading.Lock()
+
     def __init__(self, ttl_seconds: int = 7200, max_size: int = 1000, name: str = 'cache', loader=None):
         self._data = OrderedDict()
         self._timestamps = {}
@@ -50,6 +56,28 @@ class TTLCache:
         self._lock = threading.Lock()
         self._cleanup_counter = 0
         self._loader = loader  # callable(key) → value or None
+        with TTLCache._instances_lock:
+            TTLCache._instances.add(self)
+
+    @classmethod
+    def forget_everywhere(cls, key, loader) -> int:
+        """Drop ``key`` from every live cache that restores entries with
+        ``loader``, so each one's next read loads it again.  For a value
+        written straight to the store those caches load from: a cache that
+        already held the key kept serving its older copy and, on its next
+        save, wrote that copy back over the new one (review of c48e90601,
+        F2).  Returns how many caches dropped it."""
+        with cls._instances_lock:
+            caches = list(cls._instances)
+        dropped = 0
+        for cache in caches:
+            if cache._loader is not loader:
+                continue
+            with cache._lock:
+                if key in cache._data:
+                    cache._remove(key)
+                    dropped += 1
+        return dropped
 
     def __setitem__(self, key, value):
         with self._lock:

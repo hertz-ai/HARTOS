@@ -118,7 +118,10 @@ def test_source_guard_tier2_dispatches_commerce(leg):
 
 # ── Delivery: push_agent_ui (ported from the parallel WP-H branch) ──
 
-def test_push_reaches_the_shell_and_the_users_own_stream(monkeypatch):
+def test_push_with_a_shell_hands_the_card_to_the_shell_only(monkeypatch):
+    """The shell's agent_ui_update shows the card AND publishes it on the
+    user's own stream (test_liquid_ui_owner_topic.py).  push_agent_ui
+    publishing it there as well sent the phone two copies."""
     from unittest.mock import MagicMock
     from integrations.agent_engine import liquid_ui_service as lui
     shell = MagicMock()
@@ -131,10 +134,9 @@ def test_push_reaches_the_shell_and_the_users_own_stream(monkeypatch):
                         lambda t, d, user_id='': published.append((t, d, user_id)))
     card = {'type': 'cart', 'items': [], 'total': 0, 'currency': 'INR'}
     assert lui.push_agent_ui('mcgroce', card, user_id='mcg-1')
+    assert shell.agent_ui_update.call_count == 1
     assert shell.agent_ui_update.call_args.kwargs['user_id'] == 'mcg-1'
-    topic, data, uid = published[0]
-    assert (topic, uid) == ('chat.social', 'mcg-1')
-    assert data['type'] == 'agent_ui_update' and data['component']['type'] == 'cart'
+    assert published == []
 
 
 def test_push_without_a_shell_still_gates_the_card(monkeypatch):

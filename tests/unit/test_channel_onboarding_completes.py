@@ -58,6 +58,15 @@ def _cards(svc, kind):
             if c.args[1].get('type') == kind]
 
 
+def _toast_errors(card):
+    """The toast contract's errors for ``card`` (COMPONENT_TYPES['toast']).
+    Its body is `message`, the field AgentOverlay and the phone draw."""
+    from integrations.agent_engine.liquid_ui_service import (
+        COMPONENT_TYPES, validate_component)
+    return [i for i in validate_component('toast', card, COMPONENT_TYPES['toast'])
+            if i['level'] == 'error']
+
+
 def _register_fn(user_id='u-1'):
     from integrations.channels.agent_tools import build_channel_tool_closures
     tools = build_channel_tool_closures({'user_id': user_id, 'prompt_id': None})
@@ -249,7 +258,7 @@ class TestReportWhenLive:
             ok = _report_when_live('telegram', {'display_name': 'Telegram'},
                                    'u-1', wait_seconds=30, poll_seconds=0.01)
         assert ok is False and time.monotonic() - t0 < 5
-        assert 'start failed' in _cards(lui, 'toast')[0]['text']
+        assert 'start failed' in _cards(lui, 'toast')[0]['message']
 
     def test_never_connecting_is_a_toast_and_a_fleet_banner(self, lui):
         from integrations.channels.agent_tools import _report_when_live
@@ -263,7 +272,8 @@ class TestReportWhenLive:
                                    'u-1', wait_seconds=0.05, poll_seconds=0.01)
         assert ok is False
         (toast,) = _cards(lui, 'toast')
-        assert toast['severity'] == 'error' and 'disconnected' in toast['text']
+        assert toast['severity'] == 'error' and 'disconnected' in toast['message']
+        assert _toast_errors(toast) == []
         assert _cards(lui, 'channel_connected') == []
         assert fanout.call_args.kwargs['channel_type'] == 'telegram'
 
@@ -475,7 +485,8 @@ class TestWhatsAppLinksByQR(_DrivesTheLinkHelper):
         with patch('time.time', side_effect=lambda: next(clock)):
             self._run([_status(qr='QR-A')] * 5)
         toast = _cards(lui, 'toast')[-1]
-        assert toast['severity'] == 'error' and 'expired' in toast['text']
+        assert toast['severity'] == 'error' and 'expired' in toast['message']
+        assert _toast_errors(toast) == []
         assert 'whatsapp' not in str(self.link.__dict__.get('attempts'))
         assert self.link.__dict__['attempts'] == {}
 
@@ -551,7 +562,7 @@ class TestWhatsAppLinksTheWayThisDeviceCan(_DrivesTheLinkHelper):
         self._run([_status(qr='QR-A')], phone='919003054371',
                  pair_body={'error': 'rate limited'})
         assert self.how is None
-        assert 'rate limited' in _cards(lui, 'toast')[0]['text']
+        assert 'rate limited' in _cards(lui, 'toast')[0]['message']
         assert self.link.__dict__['attempts'] == {}
 
 

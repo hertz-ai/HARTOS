@@ -21,6 +21,7 @@ Phase 2 (pairing tokens, agentic policy) is out of scope — see
 from __future__ import annotations
 
 import asyncio
+import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -118,9 +119,12 @@ def test_send_install_link_is_registered_in_channel_tool_closures():
 
 # ─── Behavioural tests ─────────────────────────────────────────────
 #
-# We mock the channel registry's running asyncio loop and verify the
-# tool plumbs args through correctly.  The DB binding lookup is
-# mocked via `integrations.social.models.get_db`.
+# The channel integration that owns the adapters' loop runs a real event
+# loop over a mock registry, and we verify the tool plumbs args through
+# correctly.  (These tests used to give the registry a fake `_loop`, a shape
+# production never has, so they passed while the tool always answered
+# "adapters are not running".)  The DB binding lookup is mocked via
+# `integrations.social.models.get_db`.
 
 def _build_tool(user_id=42):
     from integrations.channels.agent_tools import build_channel_tool_closures
@@ -149,15 +153,30 @@ def _mock_db_with_binding(binding=None):
     return db
 
 
-class _FakeLoop:
-    def is_running(self):
-        return True
+@pytest.fixture
+def live_loop():
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    yield loop
+    loop.call_soon_threadsafe(loop.stop)
+    thread.join(timeout=5)
+    loop.close()
+
+
+def _integration_over(registry, loop):
+    """The channel integration, running ``loop``, over ``registry``."""
+    from integrations.channels.flask_integration import FlaskChannelIntegration
+    integration = FlaskChannelIntegration.__new__(FlaskChannelIntegration)
+    integration.registry = registry
+    integration._loop = loop
+    integration._thread = None
+    return integration
 
 
 def _mock_registry_send(success=True, error=None, message_id='msg_1'):
     """Mock registry whose .send_to_channel returns SendResult-like."""
     registry = MagicMock()
-    registry._loop = _FakeLoop()
 
     async def _send(channel, chat_id, message, **kw):
         sr = MagicMock()
@@ -171,7 +190,7 @@ def _mock_registry_send(success=True, error=None, message_id='msg_1'):
     return registry
 
 
-def test_send_install_link_dispatches_to_registry_with_canonical_url():
+def test_send_install_link_dispatches_to_registry_with_canonical_url(live_loop):
     """FT: tool resolves user's preferred binding + canonical URL +
     plumbs them through to registry.send_to_channel."""
     tool = _build_tool(user_id=42)
@@ -192,19 +211,9 @@ def test_send_install_link_dispatches_to_registry_with_canonical_url():
 
     registry.send_to_channel.side_effect = _capture
 
-    # asyncio.run_coroutine_threadsafe needs a real loop; we monkeypatch
-    # to invoke the coroutine synchronously via asyncio.run.
-    def _fake_run_threadsafe(coro, loop):
-        result = asyncio.new_event_loop().run_until_complete(coro)
-        fut = MagicMock()
-        fut.result.return_value = result
-        return fut
-
     with patch('integrations.social.models.get_db', return_value=db), \
-         patch('integrations.channels.registry.get_registry',
-               return_value=registry), \
-         patch('asyncio.run_coroutine_threadsafe',
-               side_effect=_fake_run_threadsafe):
+         patch('integrations.channels.flask_integration._integration',
+               _integration_over(registry, live_loop)):
         out = tool('telegram', 'windows')
 
     assert 'sent' in out.lower(), out
@@ -214,15 +223,15 @@ def test_send_install_link_dispatches_to_registry_with_canonical_url():
     assert 'github.com/hertz-ai/Nunba' in captured['message']
 
 
-def test_send_install_link_returns_friendly_message_when_no_binding():
+def test_send_install_link_returns_friendly_message_when_no_binding(live_loop):
     """FT: tool falls back gracefully when user has no paired channel."""
     tool = _build_tool(user_id=42)
     db = _mock_db_with_binding(binding=None)
     registry = _mock_registry_send()
 
     with patch('integrations.social.models.get_db', return_value=db), \
-         patch('integrations.channels.registry.get_registry',
-               return_value=registry):
+         patch('integrations.channels.flask_integration._integration',
+               _integration_over(registry, live_loop)):
         out = tool('telegram', 'android')
 
     assert 'paired' in out.lower() or "don't have" in out.lower(), out
@@ -268,7 +277,7 @@ def test_send_install_link_rejects_phishing_url_override():
     assert 'allowlist' in out.lower() or 'allowed' in out.lower()
 
 
-def test_send_install_link_rejects_chat_id_not_owned_by_caller():
+def test_send_install_link_rejects_chat_id_not_owned_by_caller(live_loop):
     """NFT/security (no-spam): Alice cannot target Bob's chat_id."""
     tool = _build_tool(user_id=42)  # Alice
     # DB query returns None — Alice has no binding for this chat_id
@@ -276,8 +285,8 @@ def test_send_install_link_rejects_chat_id_not_owned_by_caller():
     registry = _mock_registry_send()
 
     with patch('integrations.social.models.get_db', return_value=db), \
-         patch('integrations.channels.registry.get_registry',
-               return_value=registry):
+         patch('integrations.channels.flask_integration._integration',
+               _integration_over(registry, live_loop)):
         out = tool(
             'telegram', 'windows',
             chat_id='bobs_chat_id_999',  # Bob's chat — Alice doesn't own it
@@ -287,7 +296,7 @@ def test_send_install_link_rejects_chat_id_not_owned_by_caller():
     registry.send_to_channel.assert_not_called()
 
 
-def test_send_install_link_accepts_owned_chat_id():
+def test_send_install_link_accepts_owned_chat_id(live_loop):
     """FT/security: explicit chat_id is accepted when ownership verifies."""
     tool = _build_tool(user_id=42)
     binding = _mock_binding(chat_id='tg_alice_chat', sender_id='@alice')
@@ -307,17 +316,9 @@ def test_send_install_link_accepts_owned_chat_id():
 
     registry.send_to_channel.side_effect = _capture
 
-    def _fake_run_threadsafe(coro, loop):
-        result = asyncio.new_event_loop().run_until_complete(coro)
-        fut = MagicMock()
-        fut.result.return_value = result
-        return fut
-
     with patch('integrations.social.models.get_db', return_value=db), \
-         patch('integrations.channels.registry.get_registry',
-               return_value=registry), \
-         patch('asyncio.run_coroutine_threadsafe',
-               side_effect=_fake_run_threadsafe):
+         patch('integrations.channels.flask_integration._integration',
+               _integration_over(registry, live_loop)):
         out = tool('telegram', 'android', chat_id='tg_alice_chat')
 
     assert 'sent' in out.lower()

@@ -775,3 +775,179 @@ class TestVramPressureWarningUsesTheRealAPI:
 
         fake_vm.get_total_vram.assert_called(), (
             "start() never asked for total VRAM — the pressure check is dead")
+
+
+# ─── A queued main-LLM restart runs in the tick that queued it ───
+#
+# LIVE INCIDENT 2026-10-21 (gui_app.log.3): the main llama-server on :8080
+# crashed at 01:02:39 (Application Error, 0xc0000409).  The 120 s lifecycle
+# tick found it unreachable at 01:04:21.889 and logged "Queued restart for
+# llm in 5s", but phase 11 of that tick had nothing due yet, so the restart
+# waited for the NEXT tick: "Restarting llm in gpu mode" at 01:06:26.500,
+# 119.6 s after its backoff ran out.  Chat was down until 01:06:51.
+#
+# The restart path (_restart_llm -> LlamaConfig.start_server) neither stops
+# an adopted server nor waits for its process to exit, and its bind test
+# passes while a SO_REUSEADDR socket still listens (measured 2026-10-21), so
+# the tick may restart early only once the OS lists nobody listening on the
+# LLM port.  Time is a fake clock that only _wd_sleep moves; psutil is faked
+# where it is imported and port_registry's URL resolver is stubbed, so
+# nothing is spawned or dialed.
+class TestQueuedLlmRestartRunsInItsTick:
+
+    T0 = 1_000_000.0          # fake wall clock when phase 10 finds it dead
+
+    def _run_tick(self, *, rows=(), psutil_present=True, table_error=None,
+                  crash_count=0, on_sleep=None):
+        """One real _tick() whose phase 10 finds the adopted :8080 server
+        unreachable.  ``rows`` are the (port, pid) LISTEN sockets the fake
+        psutil lists; ``table_error`` makes net_connections raise instead.
+        Returns (manager, slept, restarts)."""
+        import types
+        from integrations.service_tools import model_lifecycle as ml
+        from tests.unit.module_swap import swap_modules
+
+        clock = [self.T0]
+        slept, restarts = [], []
+
+        mgr = ml.ModelLifecycleManager()
+        mgr._interval = 120                 # the bundled (Nunba) tick
+        mgr._running = True                 # ticks only run from the live loop
+        mgr._models['llm'] = ml.ModelState(
+            name='llm', device=ml.ModelDevice.GPU,
+            priority=ml.ModelPriority.ACTIVE, crash_count=crash_count,
+            pinned=True, pressure_evict_only=True)
+        for name in ('_refresh_memory_state', '_evict_idle_models',
+                     '_apply_hive_hints', '_report_to_federation',
+                     '_process_swap_queue', '_emit_pressure_alerts',
+                     '_persist_state_to_disk', '_wd_heartbeat', '_emit_event'):
+            setattr(mgr, name, lambda *a, **k: None)
+        for name in ('_detect_vram_pressure', '_detect_ram_pressure',
+                     '_detect_cpu_pressure', '_detect_disk_pressure'):
+            setattr(mgr, name, lambda: False)
+        mgr._guess_model_type = lambda name: 'llm'
+
+        def fake_sleep(seconds):
+            slept.append(seconds)
+            clock[0] += on_sleep(mgr, seconds) if on_sleep else seconds
+        mgr._wd_sleep = fake_sleep
+
+        def fake_restart(mode):
+            restarts.append((mode, clock[0]))
+            return True
+        mgr._restart_llm = fake_restart
+
+        # The adopted server: no Popen handle here, and the HTTP probe fails.
+        cfg = types.SimpleNamespace(
+            server_process=None, config={'server_port': 8080},
+            check_server_running=lambda *a, **k: False)
+        llama_config = types.ModuleType('llama.llama_config')
+        llama_config.LlamaConfig = lambda: cfg
+        rtm = types.ModuleType('integrations.service_tools.runtime_manager')
+        rtm.TOOL_CONFIGS = {}
+        rtm.runtime_tool_manager = types.SimpleNamespace(
+            _processes={}, _ports={}, _is_server_alive=lambda name: False)
+        vram = types.ModuleType('integrations.service_tools.vram_manager')
+        vram.vram_manager = types.SimpleNamespace(release=lambda name: None)
+        orch = types.ModuleType('integrations.service_tools.model_orchestrator')
+        orch.get_orchestrator = lambda: types.SimpleNamespace(
+            notify_unloaded=lambda *a, **k: None)
+
+        def net_connections(kind='inet'):
+            if table_error is not None:
+                raise table_error
+            return [types.SimpleNamespace(
+                        status='LISTEN', pid=pid,
+                        laddr=types.SimpleNamespace(ip='127.0.0.1', port=port))
+                    for port, pid in rows]
+        fake_psutil = types.ModuleType('psutil')
+        fake_psutil.net_connections = net_connections
+
+        with swap_modules({
+                'psutil': fake_psutil if psutil_present else None,
+                'llama.llama_config': llama_config,
+                'integrations.service_tools.runtime_manager': rtm,
+                'integrations.service_tools.vram_manager': vram,
+                'integrations.service_tools.model_orchestrator': orch}), \
+             patch.object(ml, 'time',
+                          types.SimpleNamespace(time=lambda: clock[0])), \
+             patch('security.hive_guardrails.HiveCircuitBreaker.is_halted',
+                   return_value=False), \
+             patch('core.port_registry.get_local_llm_url',
+                   return_value='http://127.0.0.1:8080/v1'):
+            mgr._tick()
+        return mgr, slept, restarts
+
+    @pytest.mark.parametrize('wall_lag', [0.0, 0.015625],
+                             ids=['clocks-agree', 'wall-clock-a-tick-behind'])
+    def test_restart_runs_in_the_tick_that_queued_it(self, wall_lag):
+        """Port released, 5 s backoff: the restart runs in this tick at T0+5.
+
+        _wd_sleep counts on the monotonic clock while retry_after is wall
+        time (15.625 ms resolution on this box), so the wait re-reads the
+        wall clock until the restart is really due."""
+        lag = [wall_lag]
+
+        def sleep_with_lag(mgr, seconds):
+            moved, lag[0] = seconds - lag[0], 0.0
+            return moved
+
+        # The caption server and another service still listen, on ports that
+        # are not the main LLM's -- as on the owner's box (8081, 8088).
+        mgr, slept, restarts = self._run_tick(
+            rows=[(8081, 1001), (8088, 1002)], on_sleep=sleep_with_lag)
+
+        assert restarts == [('gpu', self.T0 + 5.0)], (
+            f"the restart this tick queued did not run in it once its 5 s "
+            f"backoff passed (restarts={restarts}, slept={slept}); it waits "
+            f"for the next tick, {mgr._interval} s later -- the 2026-10-21 "
+            f"01:04:21 -> 01:06:26 gap")
+        assert slept[0] == 5.0
+        assert 'llm' not in mgr._restart_pending
+
+    @pytest.mark.parametrize('rows,psutil_present,table_error', [
+        # the crashed server still listens (its dump is being written)
+        ([(8080, 31332)], True, None),
+        # a listener the OS will not name (another user's, Linux non-root)
+        ([(8080, None)], True, None),
+        # the table cannot be read (psutil raises AccessDenied on macOS
+        # without root)
+        ((), True, PermissionError('psutil.AccessDenied')),
+        # no psutil at all
+        ((), False, None),
+    ], ids=['old-server-still-listening', 'listener-without-pid',
+            'net-connections-raises', 'no-psutil'])
+    def test_never_spawns_over_a_server_that_may_hold_the_port(
+            self, rows, psutil_present, table_error):
+        """No early restart unless the socket table, read, shows the LLM port
+        released; the restart stays queued for the next tick, as before."""
+        mgr, slept, restarts = self._run_tick(
+            rows=rows, psutil_present=psutil_present, table_error=table_error)
+
+        assert restarts == [] and slept == [], (
+            f"restarted early while the old server may still hold :8080 "
+            f"(restarts={restarts}, slept={slept}); start_server's bind test "
+            f"passes over a SO_REUSEADDR listener, so that spawns a second "
+            f"server on the same port")
+        assert mgr._restart_pending['llm']['retry_after'] == self.T0 + 5.0
+
+    def test_backoff_that_ends_after_the_next_tick_is_left_to_it(self):
+        """A 6th crash backs off 160 s, past the 120 s tick: no wait here."""
+        mgr, slept, restarts = self._run_tick(crash_count=5)
+
+        assert slept == [] and restarts == []
+        assert mgr._restart_pending['llm']['retry_after'] == self.T0 + 160.0
+
+    def test_stop_during_the_wait_ends_it_without_a_restart(self):
+        """stop() during the wait: sleep_with_heartbeat checks stop only
+        between chunks of up to 10 s, so the 5 s sleep still runs to its end.
+        The restart, due by then, must not run after the manager stopped."""
+        def stop_while_asleep(mgr, seconds):
+            mgr._running = False
+            return seconds
+
+        mgr, slept, restarts = self._run_tick(on_sleep=stop_while_asleep)
+
+        assert len(slept) <= 1 and restarts == [], (
+            f"restart ran after stop() (restarts={restarts}, slept={slept})")
+        assert 'llm' in mgr._restart_pending

@@ -9,6 +9,15 @@ from unittest.mock import patch, MagicMock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 
+@pytest.fixture(autouse=True)
+def _no_held_reservations():
+    """check_goal_budget holds what it reserves until a release; a hold left
+    here would be read by a later test's settle of the same goal id."""
+    yield
+    from integrations.agent_engine import budget_gate
+    budget_gate._held_reservations.clear()
+
+
 # ── WS1: estimate_llm_cost_spark ─────────────────────────────────────
 
 class TestEstimateLLMCostSpark:

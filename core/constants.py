@@ -784,6 +784,14 @@ HELP_EXPERT_REPLY_PREFIX: str = "Handed to the expert model:"
 #: -- resumes the same session where it stopped.  core.agent_tools.is_user_pause
 #: recognises it by this prefix; user_pause_reply writes it.
 PAUSED_FOR_USER_REPLY_PREFIX: str = "Paused for the user:"
+#: The reply of a turn that did not start because another turn of the same
+#: conversation is running on a different model (hartos.helper.
+#: bind_agents_to_turn_model, #172): switching would change that turn's model
+#: mid-way, and running on it would spend a model this turn did not ask for.
+#: Not a result, not a failure: dispatchers hold it for a retry.
+#: core.agent_tools.is_held_for_another_turn recognises it by this prefix;
+#: held_for_another_turn_reply writes it.
+HELD_FOR_ANOTHER_TURN_REPLY_PREFIX: str = "Held for another turn:"
 
 
 # ── The per-request switch that turns a hybrid-reasoning model's thinking OFF ──

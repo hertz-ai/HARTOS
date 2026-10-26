@@ -38,10 +38,13 @@ from integrations.agent_engine.budget_gate import (
 
 @pytest.fixture(autouse=True)
 def _isolate_cache():
-    """Each test gets a clean cache so prior tests don't leak."""
+    """Each test gets a clean cache, and no held reservation, so prior tests
+    don't leak (a hold left on 'g1' is read by any later settle of 'g1')."""
     invalidate_goal_budget_cache()
+    budget_gate._held_reservations.clear()
     yield
     invalidate_goal_budget_cache()
+    budget_gate._held_reservations.clear()
 
 
 def _mock_get_db_returning_goal(spark_budget=1000, spark_spent=0):
