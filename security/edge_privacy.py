@@ -180,7 +180,9 @@ _PERSON_PLACEHOLDER = re.compile(r'\[(?!IP_)[A-Z_]+_REDACTED\]')
 _CONTENT, _EXEMPT, _CONTACT, _SECRET = 'content', 'exempt', 'contact', 'secret'
 
 
-def _is_secret_key(key: str) -> bool:
+def is_secret_key(key: str) -> bool:
+    """Is a lowercase, underscore-separated name a secret's?  The one rule:
+    what a scrub withholds here, and what person_ask refuses to ask for."""
     if {'password', 'passwd', 'pwd'}.intersection(key.split('_')):
         return True                              # password_hash, pwd_salt
     return any(key == w or key.endswith('_' + w) for w in _SECRET_KEY_WORDS)
@@ -250,7 +252,7 @@ def _leaf_policy(key: Any, value: str, gossip: bool) -> str:
     lk = key.lower()
     if _is_contact_key(lk):
         return _CONTACT
-    if _is_secret_key(lk):
+    if is_secret_key(lk):
         if gossip and lk in _GOSSIP_SECRET_KEYS:
             return _EXEMPT
         return _SECRET

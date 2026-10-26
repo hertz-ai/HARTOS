@@ -758,11 +758,16 @@ def _holds_the_expert(request, body) -> bool:
     and base path?  The Claude day cap governs the expert alone (budget_gate:
     the cap only has anything to cap where an expert trio is configured), so
     the node's own model, even a Claude model on the same gateway, is never
-    refused by it."""
+    refused by it.  An expert trio that names the node's own model at its own
+    endpoint is no expert: the model registry never offers it
+    (ensure_configured_expert_registered, the same llm_target rule), so a
+    call to it is the node's own call."""
     try:
-        from core.autogen_config import resolve_expert_backend
+        from core.autogen_config import llm_target, own_llm_target, resolve_expert_backend
         expert = resolve_expert_backend()
         if not expert or not isinstance(body, dict):
+            return False
+        if llm_target(expert) == own_llm_target():
             return False
         if str(body.get('model') or '').strip() != str(expert.get('model') or '').strip():
             return False

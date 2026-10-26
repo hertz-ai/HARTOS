@@ -453,9 +453,9 @@ class DistributedTaskCoordinator:
 
         Runs when the goal is submitted AGAIN.  The daemon dispatches only
         active goals, so a re-dispatch of a goal whose task was held means
-        the owner or the co-pilot resumed it (a parked goal) or the expert
-        leg is running (an active one): the answer is in, the work goes back
-        to the queue.  Nothing else releases a held task: orphan recovery
+        the owner or the co-pilot resumed it (a parked goal, or one the
+        worker found not running) or the expert leg is running (an active
+        one): the answer is in, the work goes back to the queue.  Nothing else releases a held task: orphan recovery
         skips BLOCKED, and claim_next_task takes only PENDING.
 
         Only tasks blocked for INPUT_REQUIRED, the mark hold_task makes.  A
@@ -804,10 +804,13 @@ class DistributedTaskCoordinator:
         self._lock.release_task(task_id, agent_id)
         return bool(moved)
 
-    def hold_task(self, task_id: str, agent_id: str, reason: str) -> bool:
+    def hold_task(self, task_id: str, agent_id: str, reason: str,
+                  history: str = 'held for help: the action was handed to a '
+                                 'person or an expert') -> bool:
         """A worker holds a task whose action was handed to a person or an
         expert (create_recipe._ask_for_help; the goal is parked or the expert
-        has its next turn).
+        has its next turn), or whose goal is not running (worker_loop,
+        #194): the same wait, with ``history`` saying which.
 
         IN_PROGRESS -> BLOCKED with blocked_reason input_required, the same
         mark the create loop puts on its own ledger's action, and the reason
@@ -828,8 +831,7 @@ class DistributedTaskCoordinator:
         try:
             ok = self._ledger.update_task_status(
                 task_id, TaskStatus.BLOCKED, error_message=reason,
-                reason='held for help: the action was handed to a person or an '
-                       'expert', defer_save=True)
+                reason=history, defer_save=True)
             if not ok:
                 self._restore_tasks(snapshots)
                 return False

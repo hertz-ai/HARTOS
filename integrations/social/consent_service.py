@@ -290,7 +290,8 @@ def consent_prompt_push(data: dict, request_id) -> dict:
     ask on file.  ``topic_reply`` is where the overlay publishes that answer
     (the overlay's own default, carried as the steward's spec has it).  The
     text leaves this node for Google (or central's relay), so it passes the
-    DLP scrub; if the scrub cannot run, the reason is left out.
+    one egress scrub (security.edge_privacy.scrub_text: secrets, then PII);
+    if the scrub cannot run, the reason is left out.
     """
     user_id = str(data.get('user_id', ''))
     who = str(data.get('agent_name') or data.get('requester_name') or 'An agent')
@@ -298,11 +299,10 @@ def consent_prompt_push(data: dict, request_id) -> dict:
     title = f"{who} needs your OK"
     body = str(data.get('reason') or '').strip() or f"{who} asks for {what}."
     try:
-        from security.dlp_engine import get_dlp_engine
-        dlp = get_dlp_engine()
-        title, body = dlp.redact(title), dlp.redact(body)
+        from security.edge_privacy import scrub_text
+        title, body = scrub_text(title), scrub_text(body)
     except Exception:
-        _logger.warning("consent ask push: DLP scrub unavailable; the reason "
+        _logger.warning("consent ask push: egress scrub unavailable; the reason "
                         "stays on this node", exc_info=True)
         body = f"{who} asks for {what}."
     title, body = title[:80], body[:240]

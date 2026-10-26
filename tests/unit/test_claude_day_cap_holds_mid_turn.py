@@ -224,6 +224,47 @@ def test_the_nodes_own_claude_model_is_never_refused_either(central):
     assert central['hits'].get('own') == 1
 
 
+def test_an_expert_trio_naming_the_nodes_own_model_refuses_nothing(central, monkeypatch):
+    """Review of 9caee5961 (REJECTED): an expert trio that names the node's
+    own model at its own endpoint is no expert (the registry never offers it,
+    by the same llm_target rule), so past the cap the node's own turn is still
+    answered instead of refused with no fallback left."""
+    import openai
+    monkeypatch.setenv('HEVOLVE_LLM_MODEL_NAME', CLAUDE)
+    monkeypatch.setenv('HEVOLVE_EXPERT_LLM_ENDPOINT_URL', central['base'] + '/own/v1')
+    monkeypatch.setenv('HEVOLVE_EXPERT_LLM_MODEL_NAME', CLAUDE)
+    central['state']['start'] = 4.39
+    client = openai.OpenAI(base_url=central['base'] + '/own/v1',
+                           api_key='dummy', max_retries=0)
+    reply = client.chat.completions.create(
+        model=CLAUDE, messages=[{'role': 'user', 'content': 'hi'}])
+    assert reply.choices[0].message.content == 'answered by own'
+    assert central['hits'].get('own') == 1
+
+
+def test_on_a_shared_gateway_only_the_experts_model_is_refused(central, monkeypatch):
+    """Central's real shape (core.autogen_config: the expert rides the same
+    gateway as the node's own LLM): past the cap the expert's model is
+    refused and the node's own Claude model on the same gateway is not.
+    Pins the model-name half of _holds_the_expert (review of 9caee5961: with
+    that check removed every other test still passed)."""
+    import openai
+    gateway = central['base'] + '/gw/v1'
+    monkeypatch.setenv('HEVOLVE_LLM_ENDPOINT_URL', gateway)
+    monkeypatch.setenv('HEVOLVE_LLM_MODEL_NAME', 'claude-haiku-4-5')
+    monkeypatch.setenv('HEVOLVE_EXPERT_LLM_ENDPOINT_URL', gateway)
+    central['state']['start'] = 4.39
+    client = openai.OpenAI(base_url=gateway, api_key='dummy', max_retries=0)
+    own = client.chat.completions.create(
+        model='claude-haiku-4-5', messages=[{'role': 'user', 'content': 'hi'}])
+    assert own.choices[0].message.content == 'answered by own'
+    with central['hook'].lane_context(central['hook'].LANE_REVENUE):
+        with pytest.raises(openai.RateLimitError):
+            client.chat.completions.create(
+                model=CLAUDE, messages=[{'role': 'user', 'content': 'hi'}])
+    assert central['hits'].get('own') == 1
+
+
 def test_a_call_to_an_endpoint_the_node_did_not_configure_is_left_alone(central):
     """Scope guard, not a fail-first test: the cap covers the dollars HARTOS
     meters (its configured endpoints).  A call to any other host is left as

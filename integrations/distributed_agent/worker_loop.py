@@ -351,6 +351,18 @@ class DistributedWorkerLoop:
                 f">= HIVE_DEPTH={HIVE_DEPTH}")
             return
 
+        # A goal that is not running has no work to do (#194).  Its task
+        # waits, like one held for help, and the goal's next dispatch brings
+        # it back.  When it ran anyway, a failed turn released the claim and
+        # orphan recovery handed the task out again every _ORPHAN_AFTER_S:
+        # on central 2026-10-26, 176 runs in 6 h of paused goals' tasks.
+        stopped = self._goal_not_running(task)
+        if stopped:
+            self._hold(coordinator, task, stopped,
+                       history="held: its goal is not running; back on the "
+                               "goal's next dispatch")
+            return
+
         # Execute via local /chat
         result = self._execute_task(task)
 
@@ -358,16 +370,7 @@ class DistributedWorkerLoop:
             # The action was handed to a person or an expert.  Neither a
             # result to submit nor a failure to retry: the task waits with
             # the goal and comes back on the goal's next dispatch.
-            try:
-                if coordinator.hold_task(task.task_id, self._node_id,
-                                         result.reason):
-                    logger.info(f"Worker holding task {task.task_id}: "
-                                f"{result.reason[:120]!r}")
-                else:
-                    logger.warning(f"Worker could not hold {task.task_id}: "
-                                   f"the ledger refused the transition")
-            except Exception as e:
-                logger.warning(f"Worker could not hold {task.task_id}: {e}")
+            self._hold(coordinator, task, result.reason)
         elif isinstance(result, DeferredForRetry):
             try:
                 if coordinator.defer_task(task.task_id, self._node_id,
@@ -398,6 +401,53 @@ class DistributedWorkerLoop:
             except Exception as e:
                 logger.warning(
                     f"Worker could not release {task.task_id}: {e}")
+
+    def _hold(self, coordinator, task, reason, history=None) -> None:
+        """Hold a claimed task until its goal's next dispatch
+        (coordinator.hold_task), saying so either way."""
+        extra = {'history': history} if history else {}
+        try:
+            if coordinator.hold_task(task.task_id, self._node_id, reason,
+                                     **extra):
+                logger.info(f"Worker holding task {task.task_id}: "
+                            f"{reason[:120]!r}")
+            else:
+                logger.warning(f"Worker could not hold {task.task_id}: "
+                               f"the ledger refused the transition")
+        except Exception as e:
+            logger.warning(f"Worker could not hold {task.task_id}: {e}")
+
+    @staticmethod
+    def _goal_not_running(task):
+        """Why this task's goal is not running, or None.
+
+        The goal is the task's parent: dispatch_goal_distributed submits the
+        AgentGoal's own id as the coordinator root, and a task with no parent
+        is its own goal, as _execute_task reads it.  A goal this node holds
+        that is not active (paused for a person or for budget, completed,
+        archived) has no work to do; the daemon dispatches only active goals,
+        and a hive run in flight keeps its goal active.  The status column
+        decides: AgentGoal.to_dict() lays config_json over the columns.
+
+        None when the goal is active, when this node holds no such goal (a
+        peer's work), or when it cannot be read: none of those says the goal
+        stopped, so the task runs as it always did.
+        """
+        goal_id = str(task.parent_task_id or task.task_id)
+        try:
+            from integrations.social.models import AgentGoal, db_session
+            with db_session(commit=False) as db:
+                row = db.query(AgentGoal.status, AgentGoal.config_json).filter(
+                    AgentGoal.id == goal_id).first()
+        except Exception as e:
+            logger.warning("Worker could not read goal %s (%s); its task "
+                           "runs", goal_id, e)
+            return None
+        if row is None or row[0] == 'active':
+            return None
+        cfg = row[1] if isinstance(row[1], dict) else {}
+        why = str(cfg.get('pause_reason') or '').strip()
+        return f"the goal is {row[0]}" + (f": {why}" if why else '')
 
     @staticmethod
     def _dispatch_would_defer():

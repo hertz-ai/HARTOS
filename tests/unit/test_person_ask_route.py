@@ -49,11 +49,21 @@ def asked(app, monkeypatch):
                 db.add(User(id=uid, username=f'p{uid}', display_name=f'P {uid}',
                             user_type='human', api_token=f'tok-{uid}'))
     from integrations.agent_engine import person_ask
+    monkeypatch.setattr(lui, 'withdraw_agent_ui', lambda *a, **k: 0)
+    with person_ask._lock:
+        person_ask._asks.clear()
     out = person_ask.ask('10202', '342', {
+        'type': 'approval', 'action': 'post_the_reel',
+        'description': 'Post the reel today?'}, prompt_id='342')
+    assert out['ok'], out
+    clips = person_ask.ask('10202', '342', {
         'type': 'file_request', 'title': 'Send me the clips', 'purpose': 'reel_source',
         'accept': 'video', 'max_files': 5}, prompt_id='342')
-    assert out['ok'], out
-    return {'client': app.test_client(), 'ask_id': out['ask_id']}
+    assert clips['ok'], clips
+    yield {'client': app.test_client(), 'ask_id': out['ask_id'],
+           'clips_id': clips['ask_id']}
+    with person_ask._lock:
+        person_ask._asks.clear()
 
 
 def _post(ctx, body, user='10202'):
@@ -70,29 +80,32 @@ def _is_read(ask_id):
 
 def test_the_person_answers_an_ask_through_the_one_door(asked):
     from integrations.agent_engine import person_ask
-    xid = '1f' * 32
-    r = _post(asked, {'ask_id': asked['ask_id'], 'answer': {'xids': [xid]}})
+    r = _post(asked, {'ask_id': asked['ask_id'], 'answer': {'decision': 'approve'}})
     assert r.status_code == 200, r.get_json()
     assert r.get_json() == {'status': 'ok', 'ask_id': asked['ask_id']}
-    assert person_ask.answer_of(asked['ask_id']) == {'xids': [xid]}
+    assert person_ask.ask_state(asked['ask_id'], '10202') == {
+        'status': 'answered', 'answer': {'decision': 'approve'}}
     assert _is_read(asked['ask_id']) is True
 
 
 def test_a_body_user_id_never_answers_for_the_person(asked):
     from integrations.agent_engine import person_ask
-    r = _post(asked, {'ask_id': asked['ask_id'], 'answer': {'xids': []},
+    r = _post(asked, {'ask_id': asked['ask_id'], 'answer': {'decision': 'approve'},
                       'user_id': '10202'}, user='777')
     assert r.status_code == 403 and r.get_json()['reason'] == 'not_yours'
-    r = _post(asked, {'ask_id': asked['ask_id'], 'answer': {'xids': []},
+    r = _post(asked, {'ask_id': asked['ask_id'], 'answer': {'decision': 'approve'},
                       'user_id': '10202'}, user=None)
     assert r.status_code == 403
-    assert person_ask.answer_of(asked['ask_id']) is None
+    assert person_ask.ask_state(asked['ask_id'], '10202')['status'] == 'open'
     assert _is_read(asked['ask_id']) is False
 
 
 def test_a_malformed_answer_is_refused(asked):
-    r = _post(asked, {'ask_id': asked['ask_id'], 'answer': {'xids': ['not-an-xid']}})
+    r = _post(asked, {'ask_id': asked['clips_id'], 'answer': {'xids': ['not-an-xid']}})
     assert r.status_code == 400 and r.get_json()['reason'] == 'bad_answer'
+    # picks the store does not hold for her are not an answer
+    r = _post(asked, {'ask_id': asked['clips_id'], 'answer': {'xids': ['1f' * 32]}})
+    assert r.status_code == 400 and r.get_json()['reason'] == 'files_not_received'
 
 
 def test_a_game_sound_answer_still_reaches_its_own_branch_as_the_verified_caller(
@@ -120,3 +133,26 @@ def test_an_approval_without_an_ask_id_keeps_its_old_answers(asked):
     r = _post(asked, {'agent_id': '342', 'action': 'something'})
     assert r.status_code == 400
     assert r.get_json()['reason'] == 'invalid decision'
+
+
+def test_the_shells_own_door_answers_an_ask_the_same_way(asked):
+    """The :6800 shell serves its own /api/agent/approval (the shell's
+    _postApproval posts there).  It takes the ask branch first, with the
+    caller's Bearer as the answerer; before, it answered 400 'Invalid decision'
+    and the ask stayed open."""
+    from core.platform.registry import reset_registry
+    from integrations.agent_engine import person_ask
+    from integrations.agent_engine.liquid_ui_service import LiquidUIService
+    try:
+        shell = LiquidUIService()._create_flask_app().test_client()
+        body = {'ask_id': asked['ask_id'], 'answer': {'decision': 'deny'}}
+        r = shell.post('/api/agent/approval', json=body)
+        assert r.status_code == 403
+        assert person_ask.ask_state(asked['ask_id'], '10202')['status'] == 'open'
+        r = shell.post('/api/agent/approval', json=body, headers={
+            'Authorization': 'Bearer ' + generate_jwt('10202', 'p10202')})
+        assert r.status_code == 200, r.get_json()
+        assert person_ask.ask_state(asked['ask_id'], '10202')['answer'] == {
+            'decision': 'deny'}
+    finally:
+        reset_registry()

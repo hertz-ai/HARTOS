@@ -227,6 +227,28 @@ def test_what_leaves_for_the_phone_is_scrubbed(pushes):
         assert 'alice.person@example.com' not in text
 
 
+#: A key in security.secret_redactor's anthropic shape.  The DLP engine alone
+#: lets it through (review of claude_code_backend's DLP-only scrub, pinned by
+#: tests/unit/test_egress_one_rule.py), so a push scrubbed by DLP alone
+#: carried it to Google or central's relay.
+_KEY = 'sk-ant-' + 'A1b2C3d4E5' * 5
+
+
+def test_a_key_in_an_asks_reason_never_leaves_for_the_phone(pushes):
+    from integrations.social.consent_service import ConsentService
+    _person('10205')
+    with db_session() as db:
+        ConsentService.request_consent(
+            db, '10205', 'data_access', agent_id=None,
+            reason=f'Post to LinkedIn with the key {_KEY}')
+    _settle()
+    assert len(pushes) == 1
+    _u, title, body, data = pushes[0]
+    for text in (title, body, data.get('body', ''), data.get('title', '')):
+        assert _KEY not in text
+    assert 'LinkedIn' in body        # the scrub takes the key, not the ask
+
+
 # ── a goal that needs a person tells that person ────────────────────────────
 
 def test_a_machine_goal_that_needs_help_tells_the_nodes_owner(pushes, monkeypatch):
@@ -248,6 +270,19 @@ def test_a_machine_goal_that_needs_help_tells_the_nodes_owner(pushes, monkeypatc
     assert user == '10202'
     assert data == {'type': 'goal_needs_help', 'goal_id': gid}
     assert 'Grow the network' in body
+
+
+def test_a_key_in_a_goal_title_never_leaves_for_the_phone(pushes, monkeypatch):
+    monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', '10202')
+    _person('10202')
+    gid = _goal(created_by='system_bootstrap', title=f'Post with {_KEY}')
+    _escalate(gid, monkeypatch)
+    _settle()
+    told = [p for p in pushes if p[3].get('goal_id') == gid]
+    assert len(told) == 1
+    _u, title, body, _data = told[0]
+    assert _KEY not in title and _KEY not in body
+    assert body.startswith('Post with ')   # the scrub takes the key, not the title
 
 
 def test_a_persons_own_goal_tells_that_person_not_the_node_owner(pushes, monkeypatch):

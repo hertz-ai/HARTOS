@@ -3080,7 +3080,8 @@ def build_core_tool_closures(ctx):
     # asked as a tool by server").
     try:
         from integrations.agent_engine.person_ask import ask_person_tool
-        tools.append(ask_person_tool(user_id, prompt_id))
+        _name, _desc, _ask_fn = ask_person_tool(user_id, prompt_id)
+        tools.append((_name, _desc, log_tool_execution(_ask_fn)))
     except Exception as e:
         tool_logger.warning("ask_person tool not registered: %s", e)
 

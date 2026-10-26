@@ -11940,10 +11940,8 @@ def agent_approval():
         # never a body field, by the rule the commerce and game-sound cards
         # use.  Every branch below keeps its own shape.
         if data.get('ask_id'):
-            from integrations.agent_engine.person_ask import answer_ask
-            from integrations.commerce.approvals import approver_from_request
-            _ask_body, _ask_code = answer_ask(
-                data.get('ask_id'), data.get('answer'), approver_from_request(request))
+            from integrations.agent_engine.person_ask import answer_from_request
+            _ask_body, _ask_code = answer_from_request(request, data)
             return jsonify(_ask_body), _ask_code
         agent_id = data.get('agent_id', '')
         # kept as sent as well: a game sound's state is camelCase and its

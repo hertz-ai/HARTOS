@@ -507,11 +507,15 @@ class GoalManager:
                     "goal %s needs a person, but %s has no account on this "
                     "node to tell", goal.id, person)
                 return False
+            # The push leaves for Google or central's relay: the one egress
+            # scrub (secrets, then PII), or no title at all.
             title = str(goal.title or 'A goal')[:100]
             try:
-                from security.dlp_engine import get_dlp_engine
-                title = get_dlp_engine().redact(title)
+                from security.edge_privacy import scrub_text
+                title = scrub_text(title)
             except Exception:
+                logger.warning("goal %s: egress scrub unavailable; the push "
+                               "names no goal", goal.id, exc_info=True)
                 title = 'A goal'
             NotificationService.create(
                 db, str(person), 'goal_needs_help', target_type='goal',

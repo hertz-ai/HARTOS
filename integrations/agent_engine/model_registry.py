@@ -119,27 +119,20 @@ class ModelBackend:
 
 
 def _llm_target(entry) -> tuple:
-    """(base_url, model) of a config_list entry, to tell two backends apart.
-    A trailing /v1 is dropped: the same endpoint is written both ways."""
-    entry = entry or {}
-    url = str(entry.get('base_url') or '').rstrip('/')
-    if url.endswith('/v1'):
-        url = url[:-3]
-    return (url, str(entry.get('model') or ''))
+    """(base_url, model) of a config_list entry: the one rule,
+    core.autogen_config.llm_target, which the wire hook's day cap reads too."""
+    from core.autogen_config import llm_target
+    return llm_target(entry)
 
 
 def _own_llm_target() -> tuple:
-    """(base_url, model) of the LLM this node's own turns run on.
-
-    Read from resolve_llm_backend(), whose entry also carries the API key, so
-    only these two fields leave this function and nothing here is logged.
-    """
+    """(base_url, model) of the LLM this node's own turns run on
+    (core.autogen_config.own_llm_target); ('', '') when it cannot be read."""
     try:
-        from core.autogen_config import resolve_llm_backend
-        _kind, entry = resolve_llm_backend()
+        from core.autogen_config import own_llm_target
     except Exception:
         return ('', '')
-    return _llm_target(entry)
+    return own_llm_target()
 
 
 # ─── Model Registry (Singleton) ───

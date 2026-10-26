@@ -19,7 +19,8 @@ question is a Liquid UI component (`COMPONENT_TYPES`). It reaches every
 surface the person has: the desktop page, the shell, the phone in the app,
 and the phone with the app closed. The person answers on any one surface.
 The answer comes back to the agent that asked, and every other surface
-drops the card.
+drops the card. Reading the ask in the bell is not an answer and drops
+nothing (review of Nunba 8d2b0c54, F1).
 
 It is the same mechanism whichever HARTOS consumer renders it: Nunba's
 React tree (desktop and web), the HART OS shell, Android, and later iOS.
@@ -31,7 +32,7 @@ React tree (desktop and web), the HART OS shell, Android, and later iOS.
 | Push one card to every surface, one msg_id | `agent_ui_compose` / `push_agent_ui` | `integrations/agent_engine/liquid_ui_service.py` :2162, :11337 |
 | A durable ask with an id, plus Firebase for a closed app | `NotificationService.create(..., push=)`, once per msg_id | `integrations/social/services.py`, `realtime.on_notification` (570b6c43a) |
 | The phone-push shape and its reply topic | `consent_prompt_push` (request_id = the row id, `topic_reply` = `com.hertzai.pupit.{user}`) | `integrations/social/consent_service.py` |
-| Drop the card everywhere once answered | `NotificationService.mark_read`, which calls `realtime.on_notification_read` (`notification.read` on chat.social and SSE) | `realtime.py` :457 |
+| Drop the card everywhere once answered | `realtime.on_notification` with `{type: 'ask.answered', ask_id}`, the fan-out consent answers use (consent.granted / consent.revoked). NOT `notification.read`: the bell's "Mark all read" and a click on a row send that too | `realtime.py` :425 |
 | One answer door, with the identity taken from the verified caller | `/api/agent/approval` + `approver_from_request` | `hart_intelligence_entry.py` :11907 |
 | The phone's files reaching the store | device-link file channel (offer/put/commit, phone-initiated) | `core/peer_link/file_channel.py` |
 | The desktop's files reaching the same store | Nunba `/api/chat-sync/files/push` | Nunba `desktop/file_sync.py` |
@@ -56,63 +57,131 @@ React tree (desktop and web), the HART OS shell, Android, and later iOS.
 no owner today):
 
 - `ask(user_id, agent_id, component, *, prompt_id=None, title, body)`:
-  1. Refuses a component whose type is not in `COMPONENT_TYPES`.
-  2. Refuses a component carrying a `secret` field. Secrets go to the vault
-     (`ai_key_vault.request_credential`, H-0986) and never into a tool
-     result, a log or the ledger.
-  3. Files the ask as ONE `Notification` row (type `agent_ask`) through
+  1. Refuses a component that asks for a secret: a field marked `secret`,
+     typed `password` in any spelling (`type`, `input_type`, ...), or named
+     the way a secret is named (`security.edge_privacy.is_secret_key`, the
+     scrub's own rule: `password`, `api_key`, `auth_token`, ...). Secrets go
+     to the vault (`ai_key_vault.request_credential`, H-0986) and never into
+     a tool result, a log or the ledger.
+  2. A `file_request` names a purpose the store has (`INBOUND_PURPOSES`)
+     and an agent to give the files to (`prompt_id`). It asks for one file
+     of a purpose the store keeps one of (a logo), else at most a turn's
+     attachments.
+  3. The same question already open is the same ask (no second push). A
+     person has at most `MAX_OPEN_PER_PERSON` (3) open asks.
+  4. Pushes the card FIRST, through `push_agent_ui`, with `ask_id` on it;
+     `agent_ui_compose` keeps a card's `ask_id` as its `msg_id`, so every
+     copy on every surface is the ask. The card's gates are the human's and
+     come before everything: the Liquid UI kill switch, the hive halt,
+     unsafe content, the allowlist (a type an agent registered at runtime
+     counts) and the rate cap. A refused card means no row and no push
+     (`not_shown`).
+  5. Files the ask as ONE `Notification` row (type `agent_ask`, bell title
+     "Your agent asks you something") through
      `NotificationService.create(..., push=)`. The row id is the ask_id
      (H-1022), so the Firebase push goes out once (570b6c43a's leg, not a
-     second one). The push is in `consent_prompt_push`'s shape:
-     `request_id` = ask_id, `topic_reply` = `com.hertzai.pupit.{user}`.
-  4. Pushes the component through `push_agent_ui` with `msg_id` =
-     `ask:<ask_id>` and `ask_id` on the card.
+     second one). The push carries the ask's id as `ask_id` (central's
+     relay replaces `request_id`) and no `topic_reply`, because no reply
+     topic is an answer door (see the doors section). A row that cannot be
+     written takes the card back down (`not_filed`).
 
-  Gates that already exist stay ahead of all of this: the hive halt, the
-  Liquid UI kill switch and allowlist, and, for consent, `central_lacks`
-  (#244).
+  For consent (slice S4), `central_lacks` (#244) stays ahead of all of it.
 
-- `answer(ask_id, answer, answerer_id)`:
+- `answer_ask(ask_id, answer, answerer_id)`:
   - Only the person asked may answer: the verified caller, never a body
     field.
+  - An answer is a small, shallow object (16 KB, 4 levels). One that
+    carries a secret (`edge_privacy.redact_secret_leaves` finds one) is
+    refused. A `file_request` answer is `{xids: [...]}`: each pick must be
+    in the person's own inbox, held for the ask's purpose, and is then
+    bound to the asking agent with the ask as its turn
+    (`core.chat_attachments.bind_inbound`, the one binding rule); else 400
+    `files_not_received` and the ask stays open.
   - The first answer wins; a later one gets 409 and the answer already
     given.
-  - The answer is stored, the row is marked read (that is the dismiss
-    fan-out, H-1024), and anyone waiting is woken.
-- `wait(ask_id, timeout_s)`: blocks for at most `timeout_s`.
-- `answer_of(ask_id)`: the answer once given, so a later turn can read it.
+  - The answer is stored and anyone waiting is woken. Then `ask.answered`
+    goes to every surface (they drop the card, H-1024), the card leaves the
+    shell's store (`withdraw_agent_ui`) and the row is marked read (the
+    bell stops listing it).
+- `wait_for_answer(ask_id, timeout_s)`: blocks for at most `timeout_s`.
+- `ask_state(ask_id, user_id)`: `open`, `answered` (with the answer),
+  `expired` (her ask, no longer held here: a restart, or an hour after its
+  answer; ask again) or `not_found` (not hers). Never "waiting" for an ask
+  that is gone.
+- `open_file_request(ask_id, user_id)`: the purpose of her OPEN file ask,
+  for the door that takes the files (Nunba's `/api/chat-sync/files/push`
+  takes a file for an ask only while it is open, for her, under its
+  purpose).
 
-### One resolver, two transport doors (the mobile adapter's own shape)
+### One resolver, one authenticated door
 
-- HTTP: `/api/agent/approval` with `{ask_id, answer}`. This is the desktop
-  page and the shell. When the body carries `ask_id`, the route calls
-  `person_ask.answer`. Every existing branch keeps its shape and its
-  identity rule: commerce, `game_sound:` (#240) and capability consent.
-- WAMP: the reader of `com.hertzai.pupit.{user}` replies `{reply,
-  request_id, answer}` (G4). It is the phone's door, for an app that is
-  open or one woken by Firebase, on the LAN or off it, and for whichever
-  node asked: each node resolves only the ask_ids it holds.
+Every surface answers through `/api/agent/approval` with `{ask_id,
+answer}` and its own Bearer, and the route calls `person_ask.answer_ask`
+with the VERIFIED caller (`approver_from_request`), through
+`person_ask.answer_from_request`: the backend's route and the shell's own
+route (:6800, whose `_postApproval` sends the ask's id) take that branch
+first. Every existing branch
+keeps its shape and its identity rule: commerce, `game_sound:` (#240) and
+capability consent.
 
-Both doors call `person_ask.answer`. There is no second resolver.
+- The desktop page and the shell answer over HTTP on the node itself.
+- The phone answers through its one client. Off the LAN, the call rides
+  the device link: a mobile-adapter alias row (`aliases.py`) maps it to the
+  desktop's route, and the adapter carries the phone's bearer, checked
+  against the link's user. An ask the desktop does not hold answers 404,
+  and the phone's DesktopRouteInterceptor retries on the cloud, so central's
+  own asks reach central.
+
+NOT a door, by decision (2026-10-27, security): the reply topic
+`com.hertzai.pupit.{user}`. Central's router is anonymous (realm1, measured
+2026-10-06), so anyone can publish `{reply, request_id}` there. And the
+ask's id is not a secret: it travels on the person's social topic on the
+same router. A reader that turned those replies into answers or consent
+grants would accept forged ones. The phone overlay's existing pupit reply
+(G4) moves to the door above, and is not read.
+
+This supersedes the June steward spec's "a HARTOS subscriber maps the reply
+to a ConsentService grant or decline by the row id"
+(docs/STEWARD_INSTRUCTION_LOG.md:20327-20328), for that reason. Do not
+build that subscriber. An anonymous-realm topic may carry an ask OUT but
+never an answer or a grant IN. The answerer is always the caller's verified
+identity, never a body field or a topic payload, which is the rule the
+game_sound branch already follows. The id in an answer only names WHICH ask
+is answered, never WHO answers (hartos-f3, consent lane, agreed
+2026-10-27). Pinned by tests: a reply published on the topic answers
+nothing, and an answer whose Bearer is not the asked person is refused and
+leaves the ask open.
+
+Not checked (outside this lane, noted by hartos-70): whether central's
+chatbot_pipeline (confirmation.py, on central's host) acts on pupit
+replies. If it does, it carries the same anonymous-router exposure.
+consent_prompt_push still names `topic_reply` (consent_service.py:313).
+That field goes in S4, in the same change that moves the phone's
+ConsentOverlayService to the door, so the overlay never publishes replies
+that nobody reads.
 
 ### The tool
 
-`ask_person(component, wait_s)` is available to every agent, with no
-per-agent code. It files the ask and waits up to `wait_s`. If the answer
-comes in time, it is the tool's result. If not, the tool returns a held
-reply. Like a help pause, a held reply is neither work done nor a failure,
-and the agent reads the answer with `answer_of` on its next turn.
+`ask_person(component, wait_seconds, ask_id)` is available to every agent,
+with no per-agent code. It files the ask and waits up to `wait_seconds`
+(20 by default, 60 at most). If the answer comes in time, it is the tool's
+result. If not, the tool returns a held reply. Like a help pause, a held
+reply is neither work done nor a failure, and the agent reads the answer
+with `ask_person(ask_id=...)` on its next turn (`ask_state`).
+
+Not done yet: an answer that comes after the turn ended does not start a
+new turn by itself; the agent reads it when it next runs.
 
 ### `file_request` (new `COMPONENT_TYPES` entry)
 
-`{title, purpose (reel_source|logo|song|chat_attachment), accept
+`{title, purpose (reel_source|logo|song_audio|chat_attachment), accept
 (video|image|audio), max_files, prompt_id}`.
 
-Each surface uploads the person's picks to `core.user_file_store` with that
-purpose and prompt_id: the phone over its file channel, the desktop page
-through file_sync. It then answers `{xids: [...]}`. The agent's existing
-`get_user_uploaded_file` reads those files, because they are bound to the
-agent like any upload.
+Each surface uploads the person's picks to `core.user_file_store` for the
+ask: the desktop page through file_sync, naming the ask's id (the door
+takes the purpose from the open ask, not from the client), the phone over
+its file channel. It then answers `{xids: [...]}`, and answer_ask binds
+them to the agent that asked (above).
 
 ### Consent (slice S4, with hartos-f3)
 
@@ -137,11 +206,14 @@ ONE writer, and `central_lacks` stays ahead of everything.
   desktop page and on the phone (Firebase or WAMP), and an answer from one
   of them resolves the tool and drops the card on the other.
 - S2 Nunba AgentOverlay: renders `file_request` (a file input, the
-  file_sync push, then the answer), answers any card that carries
-  `ask_id`, and drops the card on `notification.read`.
+  file_sync push with the ask's id, then the answer), answers any card that
+  carries `ask_id`, and drops the card on `ask.answered` (never on
+  `notification.read`). An open ask's card is not pushed out by newer
+  cards.
 - S3 Android: renders the ask in the app (approval and `file_request`): the
-  system picker, then DesktopFiles upload, then the reply on
-  `com.hertzai.pupit.{user}`. A Firebase ask opens the app on the ask.
+  system picker, then DesktopFiles upload, then the answer through
+  `/api/agent/approval` with its Bearer (the device-link alias row, else
+  direct). A Firebase ask opens the app on the ask.
 - S4 consent folded onto the ask (with hartos-f3).
 - S5 the journey: agent 342's step 2 asks for clips, the person picks them
   on the Pad or the desktop, and step 2 moves on.

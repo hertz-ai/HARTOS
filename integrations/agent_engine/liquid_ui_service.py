@@ -1014,10 +1014,11 @@ COMPONENT_TYPES = {
                        'ask_id': 'str'},
         'required': ['purpose'],
         'doc': ('Asks the person for files, on whichever of their devices they '
-                'answer. The surface sends the picked files to the user file store '
-                'under `purpose` (core.user_file_store decides which purposes and '
-                'types exist) for `prompt_id`, then answers the ask with their '
-                'ids. Sent by integrations.agent_engine.person_ask.'),
+                'answer. `purpose` is one of core.user_file_store INBOUND_PURPOSES '
+                '(reel_source, logo, song_audio, chat_attachment). The surface '
+                'sends the picked files to the user file store for the ask '
+                '(`ask_id`), then answers it with their ids, and the files become '
+                'the asking agent\'s. Sent by integrations.agent_engine.person_ask.'),
         'example': {'title': 'Send me the clips for your reel',
                     'purpose': 'reel_source', 'accept': 'video', 'max_files': 5,
                     'prompt_id': '342'},
@@ -2312,8 +2313,12 @@ class LiquidUIService:
         # Nunba's realtimeService.unwrapAgentUiEnvelope names the first by its
         # envelope's msg_id and the second by its card's, and drops a copy it
         # has already shown.  The form EventBus.emit gives an event that has
-        # none; new per push, so a dict pushed twice is two cards.
-        component['msg_id'] = _uuid.uuid4().hex
+        # none; new per push, so a dict pushed twice is two cards.  A card
+        # that asks its person something (person_ask) is that ask, on every
+        # surface and every push: its msg_id is the ask's id.
+        _ask_id = component.get('ask_id')
+        component['msg_id'] = (_ask_id if isinstance(_ask_id, str) and _ask_id
+                               else _uuid.uuid4().hex)
 
         # G2: a push of an agent-REGISTERED custom type carries its render spec so the
         # client can render it (props to iterate, or a template to fill) instead of the
@@ -2412,6 +2417,20 @@ class LiquidUIService:
 
         logger.info("A2UI: agent %s pushed %s component", agent_id, comp_type)
         return verdict(True, issues=issues)
+
+    def withdraw_agent_ui(self, msg_id: str) -> int:
+        """Take every stored card with ``msg_id`` out of the store the shell's
+        stream and static dashboard re-serve (an ask that was answered).
+        Returns how many went."""
+        if not msg_id:
+            return 0
+        gone = 0
+        with self._lock:
+            for aid, comps in self._agent_components.items():
+                kept = [c for c in comps if c.get('msg_id') != msg_id]
+                gone += len(comps) - len(kept)
+                self._agent_components[aid] = kept
+        return gone
 
     def _a2ui_rate_ok(self, agent_id: str) -> bool:
         """Per-agent token bucket (20 burst, +2/s) — a runaway agent cannot
@@ -8316,16 +8335,19 @@ if(!PERF.potato && HartShellState.isHost()) {{
 }}
 
 // ═══ Approval Helper ═══
-function _postApproval(agentId, action, decision) {{
+function _postApproval(agentId, action, decision, askId) {{
   try {{
     // The node names the approver from the caller's Bearer, never the body.
     var _tok = ''; try {{ _tok = localStorage.getItem('access_token') || ''; }} catch(e) {{}}
     var _hdr = {{'Content-Type':'application/json'}};
     if(_tok) _hdr['Authorization'] = 'Bearer ' + _tok;
+    // An agent's ask (person_ask) is answered by its id, with the decision.
+    var _body = askId ? {{ask_id:askId, answer:{{decision:decision}}}}
+                      : {{agent_id:agentId, action:action, decision:decision}};
     fetch(SHELL+'/api/agent/approval', {{
       method:'POST',
       headers:_hdr,
-      body:JSON.stringify({{agent_id:agentId, action:action, decision:decision}})
+      body:JSON.stringify(_body)
     }}).catch(function(){{}});
   }} catch(e) {{}}
 }}
@@ -8364,7 +8386,7 @@ function shellA2UIEmit(el) {{
 }}
 function _doApproval(btn, verdict) {{
   var div = btn.closest('[data-agent-id]');
-  if(div) {{ _postApproval(div.dataset.agentId||'', div.dataset.action||'', verdict); }}
+  if(div) {{ _postApproval(div.dataset.agentId||'', div.dataset.action||'', verdict, div.dataset.askId||''); }}
   var ov = btn.closest('.agent-overlay');
   if(ov) ov.remove();
 }}
@@ -8593,7 +8615,7 @@ function renderAgentOverlay(ev) {{
     html += '<div class="ds-body-md" style="font-weight:600;margin-bottom:4px">Approval Required</div>';
     html += '<div class="ds-body-sm ds-text-muted" style="margin-bottom:8px">'+(ev.description||ev.action||'An agent requests your approval.')+'</div>';
     if(ev.agent_id) html += '<div class="ds-label-sm ds-text-muted" style="margin-bottom:6px">Agent: '+(ev.agent_id)+'</div>';
-    html += '<div style="display:flex;gap:6px;justify-content:flex-end" data-agent-id="'+(ev.agent_id||'')+'" data-action="'+(ev.action||'')+'">';
+    html += '<div style="display:flex;gap:6px;justify-content:flex-end" data-agent-id="'+(ev.agent_id||'')+'" data-action="'+(ev.action||'')+'" data-ask-id="'+(ev.ask_id||'')+'">';
     html += '<button class="ds-btn ds-btn-primary ds-btn-sm" onclick="dsRipple(event);_doApproval(this,&quot;approve&quot;)"><span>'+_lbl(0,'Approve')+'</span></button>';
     html += '<button class="ds-btn ds-btn-outline ds-btn-sm" onclick="dsRipple(event);_doApproval(this,&quot;deny&quot;)"><span>'+_lbl(1,'Deny')+'</span></button>';
     html += '<button class="ds-btn ds-btn-ghost ds-btn-sm" onclick="dsRipple(event);this.closest(&quot;.agent-overlay&quot;).remove()"><span>'+_lbl(2,'Later')+'</span></button>';
@@ -9039,6 +9061,12 @@ function renderAgentOverlay(ev) {{
         def handle_agent_approval():
             """Handle approval decisions from Nunba JS or Android clients."""
             data = request.get_json(force=True)
+            # An agent's ask (person_ask): answered by the caller's Bearer
+            # identity, the same branch the backend's route takes first.
+            if data.get('ask_id'):
+                from integrations.agent_engine.person_ask import answer_from_request
+                _ask_body, _ask_code = answer_from_request(request, data)
+                return jsonify(_ask_body), _ask_code
             agent_id = data.get('agent_id', '')
             action = data.get('action', '')
             decision = data.get('decision', '')  # approve / deny / later
@@ -11411,3 +11439,17 @@ def push_agent_ui(agent_id: str, component: dict,
     except Exception:
         logger.exception("push_agent_ui: per-user publish failed")
         return False
+
+
+def withdraw_agent_ui(msg_id: str) -> int:
+    """The in-process form of LiquidUIService.withdraw_agent_ui: take a card
+    out of this process's shell store.  0 where no shell is served (the
+    surfaces drop their own copies on the event that ended it)."""
+    try:
+        from core.platform.registry import get_registry
+        svc = get_registry().get_or_none('LiquidUIService')
+    except Exception:
+        svc = None
+    if svc is None or not hasattr(svc, 'withdraw_agent_ui'):
+        return 0
+    return svc.withdraw_agent_ui(msg_id)
