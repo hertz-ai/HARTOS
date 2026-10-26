@@ -570,6 +570,10 @@ def require_auth(f):
         if user is None:
             if db:
                 db.close()
+            device_error = getattr(g, 'device_auth_error', None)
+            if device_error:
+                return jsonify({'success': False, 'error': device_error,
+                                'message': 'Allow this phone in the desktop privacy settings.'}), 403
             log_refused_credential(token)
             return _sign_in_required('Invalid or expired token')
 
