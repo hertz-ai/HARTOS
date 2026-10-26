@@ -450,12 +450,16 @@ class GoalManager:
             cfg['escalation'] = record
             result = GoalManager.update_goal(db, goal_id, config_json=cfg)
             return dict(result, stage='expert') if result.get('success') else result
-        # Already waiting on a person for this same action: the pause is
+        # Its person was already told about this same action: the pause is
         # renewed and nobody is told again.  A hive worker re-running a paused
         # goal's task asks for help each time its claim expires (#194).
-        already_told = (goal.status == 'paused' and same_action
-                        and prior.get('next') == 'human')
+        # 'told_at' is written only when a notification was made, so a goal
+        # that paused before anyone was told (every pause until 2026-10-26)
+        # is told on its next ask; a paused state alone proves nothing.
+        already_told = same_action and bool(prior.get('told_at'))
         record['next'] = 'human'
+        if already_told:
+            record['told_at'] = prior['told_at']
         cfg['escalation'] = record
         cfg['pause_reason'] = (
             f"Needs help: action {record.get('action_id')} "
@@ -466,13 +470,17 @@ class GoalManager:
         if not result.get('success'):
             return result
         result = GoalManager.update_goal_status(db, goal_id, 'paused')
-        if result.get('success') and not already_told:
-            GoalManager._tell_its_person(db, goal, cfg['pause_reason'])
+        if (result.get('success') and not already_told
+                and GoalManager._tell_its_person(db, goal, cfg['pause_reason'])):
+            # New dicts, so the JSON column sees a change.
+            cfg = dict(cfg, escalation=dict(record, told_at=now))
+            GoalManager.update_goal(db, goal_id, config_json=cfg)
         return dict(result, stage='human') if result.get('success') else result
 
     @staticmethod
-    def _tell_its_person(db: Session, goal, reason: str) -> None:
+    def _tell_its_person(db: Session, goal, reason: str) -> bool:
         """Tell the person a goal belongs to that it has stopped for them.
+        True when the notification was made.
 
         The goal's own person (core.event_attribution.goal_owner_user_id) or,
         for a goal the node seeded itself, the node's owner
@@ -493,12 +501,12 @@ class GoalManager:
                 logger.warning(
                     "goal %s needs a person and nobody can be told: the goal "
                     "names no owner and HEVOLVE_OWNER_USER_ID is not set", goal.id)
-                return
+                return False
             if not db.query(User).filter_by(id=str(person)).first():
                 logger.warning(
                     "goal %s needs a person, but %s has no account on this "
                     "node to tell", goal.id, person)
-                return
+                return False
             title = str(goal.title or 'A goal')[:100]
             try:
                 from security.dlp_engine import get_dlp_engine
@@ -512,9 +520,11 @@ class GoalManager:
                       'body': f'{title} is waiting for you.',
                       'data': {'type': 'goal_needs_help',
                                'goal_id': str(goal.id)}})
+            return True
         except Exception:
             logger.warning("goal %s: could not tell its person that it needs "
                            "help", getattr(goal, 'id', '?'), exc_info=True)
+            return False
 
     @staticmethod
     def _escalation_expert(goal_type=None):

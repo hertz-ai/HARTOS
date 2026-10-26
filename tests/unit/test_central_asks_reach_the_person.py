@@ -277,6 +277,28 @@ def test_the_same_stuck_action_asked_again_while_it_waits_tells_nobody_again(
     assert [p[3].get('goal_id') for p in pushes] == [gid]
 
 
+def test_a_goal_that_paused_before_anyone_was_told_is_told_on_its_next_ask(
+        pushes, monkeypatch):
+    """Every pause until 2026-10-26 told nobody: on central 18 goals sit
+    paused waiting on a person who never heard.  Their next ask (the hive
+    worker re-runs them) must tell the person, once; a paused state alone is
+    not a record that anyone was told."""
+    monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', '10202')
+    _person('10202')
+    gid = _goal(created_by='system_bootstrap', title='Grow the marketplace')
+    with db_session() as db:
+        goal = db.query(AgentGoal).filter_by(id=gid).first()
+        goal.status = 'paused'
+        goal.config_json = {'escalation': {'action_id': 2, 'next': 'human',
+                                           'tried': ['local']},
+                            'pause_reason': 'Needs help: action 2'}
+    for _ in range(2):
+        _escalate(gid, monkeypatch)
+    _settle()
+    assert [t for t, _g, _m in _notifications('10202', gid)] == ['goal_needs_help']
+    assert [p[3].get('goal_id') for p in pushes] == [gid]
+
+
 def test_with_nobody_to_ask_the_goal_still_pauses_and_says_so(pushes, monkeypatch, caplog):
     monkeypatch.delenv('HEVOLVE_OWNER_USER_ID', raising=False)
     gid = _goal(created_by='system_bootstrap')
