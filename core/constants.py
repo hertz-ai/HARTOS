@@ -608,7 +608,8 @@ ENCOUNTER_PERSONA_TAG_MAX_CHARS: int = 40
 #
 # Consumers build their own URL from this plus the port that belongs to their
 # service — WAMP takes core.port_registry.get_port('crossbar'); the central DB
-# keeps its own 8443. Do NOT inline the hostname; import it from here.
+# is on the standard HTTPS port at /db (its old :8443 default answered 404,
+# measured 2026-10-26). Do NOT inline the hostname; import it from here.
 #
 # THIS IS A DEFAULT, NOT A MANDATE. Unifying the literal must never cost a system
 # the ability to run its OWN server (steward, 2026-08-18). Every consumer keeps

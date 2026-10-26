@@ -257,11 +257,15 @@ def get_db_url() -> str:
 # running against a private Hevolve installation.  Resolves to '' if
 # the env override is set to empty, which callers must treat as
 # "no central available — skip cross-device merge".
-# Host comes from the ONE literal (core.constants.CENTRAL_HOST); the 8443/db
-# path is this service's own and stays here. Composing keeps the hostname from
+# Host comes from the ONE literal (core.constants.CENTRAL_HOST); the /db path
+# is this service's own and stays here. Composing keeps the hostname from
 # being written out a second time — it was in four places before.
-_CENTRAL_DB_PORT = 8443
-_DEFAULT_CENTRAL_DB_URL = 'https://%s:%d/db' % (_CENTRAL_HOST, _CENTRAL_DB_PORT)
+# The account store answers on the standard HTTPS port behind Kong.  Measured
+# from central 2026-10-26: https://azurekong.hertzai.com/db/get_user/10202
+# -> 200 with the account; the old default :8443/db -> 404 (port 8443 is an
+# Apache-Coyote that is not the DB service, first seen 2026-10-04), so every
+# reader of this default had been failing quietly.
+_DEFAULT_CENTRAL_DB_URL = 'https://%s/db' % _CENTRAL_HOST
 
 
 def get_central_db_url() -> str:

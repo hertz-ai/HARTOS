@@ -170,24 +170,23 @@ class TestSyncProfile:
 
 # ── _central_url: the ONE parent resolver (SyncEngine), env fallback ─────────
 class TestCentralUrl:
-    def test_resolves_via_sync_engine_and_strips_trailing_slash(self, monkeypatch):
-        import integrations.social.sync_engine as se
-        monkeypatch.setattr(se.SyncEngine, "parent_tier_url",
-                            staticmethod(lambda: "http://central:6777/"))
-        assert profile_sync._central_url() == "http://central:6777"
+    """The profile lives in the account store (Hevolve_Database), reached by
+    core.config_cache.get_central_db_url.  It used to be the hive parent
+    (SyncEngine.parent_tier_url, a HARTOS node), which answered 404 for every
+    account (measured on central 2026-10-26)."""
 
-    def test_empty_parent_tier_url_yields_empty(self, monkeypatch):
-        import integrations.social.sync_engine as se
-        monkeypatch.setattr(se.SyncEngine, "parent_tier_url",
-                            staticmethod(lambda: None))
+    def test_resolves_via_the_account_store_and_strips_trailing_slash(self, monkeypatch):
+        monkeypatch.setenv("HEVOLVE_CENTRAL_DB_URL", "http://store:9000/db/")
+        assert profile_sync._central_url() == "http://store:9000/db"
+
+    def test_an_empty_account_store_url_disables_the_pull(self, monkeypatch):
+        monkeypatch.setenv("HEVOLVE_CENTRAL_DB_URL", "")
         assert profile_sync._central_url() == ""
 
-    def test_falls_back_to_env_when_sync_engine_unimportable(self, monkeypatch):
-        import sys
-        # Force the inline SyncEngine import in _central_url to raise, so the
-        # except branch reads the SAME env keys the up-sync drain resolves its
-        # parent with (HEVOLVE_CENTRAL_URL > HEVOLVE_REGIONAL_URL).
-        monkeypatch.setitem(sys.modules, "integrations.social.sync_engine", None)
-        monkeypatch.delenv("HEVOLVE_REGIONAL_URL", raising=False)
-        monkeypatch.setenv("HEVOLVE_CENTRAL_URL", "http://envcentral/")
-        assert profile_sync._central_url() == "http://envcentral"
+    def test_the_hive_parent_does_not_decide_where_profiles_come_from(self, monkeypatch):
+        import integrations.social.sync_engine as se
+        monkeypatch.setattr(se.SyncEngine, "parent_tier_url",
+                            staticmethod(lambda: "http://hive-parent:6777"))
+        monkeypatch.setenv("HEVOLVE_CENTRAL_URL", "http://hive-parent:6777")
+        monkeypatch.setenv("HEVOLVE_CENTRAL_DB_URL", "http://store:9000/db")
+        assert profile_sync._central_url() == "http://store:9000/db"

@@ -90,7 +90,7 @@ cloud" and "runs entirely on its own".
 | `HART_CROSSBAR_PORT` | Router port, resolved via `core/port_registry.py`. | `8088` |
 | `CBURL` | PeerLink's own router override (`core/peer_link/telemetry.py`, `nat.py`). **A second naming scheme** — see the note below. | `ws://aws_rasa.hertzai.com:8088/ws` |
 | `CBREALM` | WAMP realm for the PeerLink leg. | `realm1` |
-| `HEVOLVE_CENTRAL_DB_URL` | Central DB base URL for cross-device reads. **`''` (empty) disables** cross-device merge rather than falling back. | `https://azurekong.hertzai.com:8443/db` |
+| `HEVOLVE_CENTRAL_DB_URL` | The account store (Hevolve_Database): cross-device agent reads, and the account a node copies into its social DB under the same id. **`''` (empty) disables** both rather than falling back. | `https://azurekong.hertzai.com/db` |
 
 **Run your own server.** Every one of these is independent, and the override always
 wins over the default:

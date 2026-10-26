@@ -618,6 +618,20 @@ def init_social(app):
         except Exception as e:
             logger.debug(f"HevolveSocial sync engine start skipped: {e}")
 
+    # Copy this node's owner account from the account store into the social
+    # DB under the same id (core.profile_sync.sync_owner_account).  Every ask
+    # the node files is addressed to its owner; on central (2026-10-26) owner
+    # 10202 had no social row, so its asks reached nobody.  It is a network
+    # call, so it runs off the boot path and logs its own failure.
+    if _start_services:
+        try:
+            import threading as _th_owner
+            from core.profile_sync import sync_owner_account
+            _th_owner.Thread(target=sync_owner_account, daemon=True,
+                             name='owner-account-sync').start()
+        except Exception as e:
+            logger.warning(f"HevolveSocial owner account sync not started: {e}")
+
     # Start distributed coding agent if enabled.  Default flipped to
     # 'true' on 2026-05-07 — the daemon consumes self_heal goals
     # produced by error_advice (#102) and SelfHealingDispatcher; with
