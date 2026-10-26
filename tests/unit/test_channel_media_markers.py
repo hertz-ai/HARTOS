@@ -59,6 +59,21 @@ class ExtractMediaMarkers(unittest.TestCase):
         self.assertEqual(media, [])
         self.assertNotIn('[[MEDIA:', clean)
 
+    def test_a_sibling_folder_sharing_the_prefix_is_outside(self):
+        # The data dir is <x>\media_root_abc; <x>\media_root_abc_x\leak.png
+        # begins with the same characters and is NOT inside it.  The
+        # containment check used to be a bare startswith(root), so a prompted
+        # model could post a file from the sibling folder outward (found by
+        # hevolve-cc12, reviewing 78e38420d, 2026-10-25).
+        sibling = self.root + '_x'
+        os.makedirs(sibling, exist_ok=True)
+        leak = os.path.join(sibling, 'leak.png')
+        with open(leak, 'wb') as f:
+            f.write(b'\x89PNG secret')
+        clean, media = extract_media_markers(f'reply [[MEDIA:{leak}]]')
+        self.assertEqual(media, [])
+        self.assertNotIn('[[MEDIA:', clean)
+
     def test_missing_file_is_dropped(self):
         text = f'reply [[MEDIA:{os.path.join(self.root, "gone.png")}]]'
         clean, media = extract_media_markers(text)

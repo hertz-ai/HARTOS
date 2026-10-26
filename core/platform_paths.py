@@ -101,18 +101,31 @@ def get_install_dir():
     return os.path.dirname(os.path.abspath(sys.executable))
 
 
+def is_within(path, root) -> bool:
+    """Whether ``path`` is ``root`` or inside it, as normalised absolute paths.
+
+    A sibling that only shares the prefix (``data_x`` beside ``data``) is not
+    inside: a bare ``startswith(root)`` let one through on the channel media
+    path (review of 78e38420d, 2026-10-25).  False when either is empty and
+    for a path on another drive.  Resolve symlinks first (realpath) when the
+    path comes from untrusted text."""
+    if not path or not root:
+        return False
+    try:
+        p = os.path.normcase(os.path.abspath(str(path)))
+        r = os.path.normcase(os.path.abspath(str(root)))
+        return os.path.commonpath([p, r]) == r
+    except ValueError:      # different drives on Windows
+        return False
+
+
 def is_inside_install_dir(path) -> bool:
     """Whether ``path`` is the installed app's own folder or inside it.
     False when running from source, and for a path on another drive."""
     install = get_install_dir()
-    if not install or not path:
+    if not install:
         return False
-    try:
-        p = os.path.normcase(os.path.abspath(str(path)))
-        root = os.path.normcase(os.path.abspath(install))
-        return os.path.commonpath([p, root]) == root
-    except ValueError:      # different drives on Windows
-        return False
+    return is_within(path, install)
 
 
 def _off_the_real_root_under_test(path: str, real: str, label: str = '') -> str:
