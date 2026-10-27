@@ -479,7 +479,15 @@ def _settle_dispatched_goal(db, goal, goal_key, served_escalation=None,
     # change at all.  A new dict is written under every column type.
     cfg = dict(goal.config_json or {})
     is_continuous = cfg.get('continuous', False)
-    spark_spent = goal.spark_spent or 0
+    # Spark reserved at dispatch is a pre-check, not work.  Its holder gives
+    # it back (dispatch_goal when its turn ends, the speculative expert when
+    # its task ends); any still held here (an expert still running, a release
+    # that failed) is not counted as spent either, or a reservation would
+    # complete a goal whose turn did nothing: 18 on central 2026-10-17
+    # (review of aeb5d4831, finding 1).  The snapshot the tick took before
+    # the dispatch reads spark the same way.
+    from .budget_gate import spark_spent_on_work
+    spark_spent = spark_spent_on_work(goal_key, goal.spark_spent)
     # Per-dispatch, not lifetime.  Absent key (a goal dispatched before this
     # code shipped) degrades to the old `> 0` test rather than blocking.
     spark_at_dispatch = cfg.get('spark_at_dispatch')
@@ -793,6 +801,10 @@ class AgentDaemon:
                 ThoughtExperimentService.advance_due_experiments(db)
         except Exception as exc:
             logger.debug("Thought-experiment lifecycle tick skipped: %s", exc)
+
+        # The world model votes on open experiments (owner, 2026-10-19:
+        # agents AND the world model vote), off this loop.
+        self._spawn_world_model_votes_async()
 
         # Complete the existing GATHER->DISPATCH->AgentGoal loop: first project
         # canonical goal outcomes back onto its active session, then start a new
@@ -1382,6 +1394,44 @@ class AgentDaemon:
         t.start()
         self._proactive_thread = t
 
+    def _spawn_world_model_votes_async(self) -> None:
+        """Let the world model vote on open thought experiments
+        (ThoughtExperimentService.cast_world_model_votes) in a daemon thread,
+        never blocking the goal-dispatch loop: each score is an HTTP call of
+        seconds (two llama-server encodes on the slot chat shares; review of
+        9ca2be81a).  Two of _spawn_home_compose_async's gates:
+          1. yield - skip while should_yield_to_user(), and skip when the
+             gate cannot answer (the slot is the user's until we know);
+          2. single-flight - skip while the prior round is still running.
+        The round itself is bounded (WORLD_MODEL_VOTES_PER_TICK) and
+        contacts the world model only when there is something to score.
+        Fully guarded: a voting fault never touches the daemon loop."""
+        prior = getattr(self, '_world_model_vote_thread', None)
+        if prior is not None and prior.is_alive():
+            return
+        try:
+            from .dispatch import should_yield_to_user
+            if should_yield_to_user():
+                return
+        except Exception as exc:
+            logger.info("World-model votes skipped: yield gate unreadable: %s", exc)
+            return
+
+        def _runner():
+            try:
+                from integrations.social.models import db_session
+                from integrations.social.thought_experiment_service import (
+                    ThoughtExperimentService)
+                with db_session() as db:
+                    ThoughtExperimentService.cast_world_model_votes(db)
+            except Exception as exc:
+                logger.info("World-model vote round failed: %s", exc)
+
+        t = threading.Thread(
+            target=_runner, daemon=True, name='world_model_votes')
+        t.start()
+        self._world_model_vote_thread = t
+
     def _spawn_home_compose_async(self) -> None:
         """Compose + push the agentic home in a daemon thread when the box is
         idle, never blocking the goal-dispatch loop.
@@ -1593,6 +1643,15 @@ class AgentDaemon:
 
         speculative_enabled = os.environ.get(
             'HEVOLVE_SPECULATIVE_ENABLED', 'false').lower() == 'true'
+
+        # Spark an earlier release could not write is retried before this
+        # tick's session opens: a goal waiting for held spark makes no new
+        # release of its own (review of 25d31fc1d, item 5).
+        try:
+            from .budget_gate import retry_unreleased_reservations
+            retry_unreleased_reservations()
+        except ImportError:
+            pass
 
         db = get_db()
         try:
@@ -1838,12 +1897,26 @@ class AgentDaemon:
                             continue
 
                     # Read-only check: compare remaining budget vs estimated cost
-                    # without reserving (no spark_spent increment)
+                    # without reserving (no spark_spent increment).  The pause
+                    # is decided on the spark spent on work: a reservation
+                    # still held by running work (a speculative expert) comes
+                    # back when that work ends, so a shortfall it alone causes
+                    # waits a tick instead of pausing the goal, which needs a
+                    # person to lift (review of 4bb3bbae0, finding 4).  Read
+                    # as committed now, not off the row this tick loaded: an
+                    # expert ending since then made that row read its
+                    # given-back spark as spent (review of 8b32e97b6, F1).
+                    from .budget_gate import goal_spark_now
                     budget = goal.spark_budget or 0
-                    spent = goal.spark_spent or 0
+                    spark_now, spent = goal_spark_now(goal_key, goal.spark_spent)
                     estimated = estimate_llm_cost_spark(prompt, _resolve_model_name('gpt-4o'))
                     bg_allowed = (budget - spent) >= estimated
                     bg_reason = f'insufficient_budget ({budget - spent} < {estimated})' if not bg_allowed else ''
+                    if bg_allowed and (budget - spark_now) < estimated:
+                        logger.info(
+                            f"Goal {goal_key}: waiting for spark held by "
+                            f"running work before its next dispatch")
+                        continue
                     if not bg_allowed:
                         # Immediately pause — budget won't change between daemon
                         # ticks, so retrying is wasteful.
@@ -1943,8 +2016,16 @@ class AgentDaemon:
                 # _settle_dispatched_goal below.
                 # dict(...) copies: a new dict is written whatever the
                 # column type (see the note in _settle_dispatched_goal).
+                # Spark still held from an earlier dispatch (its release
+                # failed) is left out, as the gate leaves it out when it
+                # settles.  Read as committed now, like the pre-check: off
+                # the row this tick loaded, an expert that ended since made 2
+                # spark of real work a noop (review of 8b32e97b6, F1).
+                from .budget_gate import goal_spark_now
+                _spark_now, _spark_on_work = goal_spark_now(
+                    goal_key, goal.spark_spent)
                 _cfg_pre = dict(goal.config_json or {})
-                _cfg_pre['spark_at_dispatch'] = goal.spark_spent or 0
+                _cfg_pre['spark_at_dispatch'] = _spark_on_work
                 goal.config_json = _cfg_pre
 
                 # Speculative dispatch if enabled and budget allows.
@@ -1964,9 +2045,9 @@ class AgentDaemon:
 
                 # PARALLEL: the goal's ledger has independently-runnable
                 # subtasks, so fan them out across the idle agents instead of
-                # dispatching the goal prompt once.  Treated as a handoff
-                # exactly like speculation: truthy result, backoff cleared,
-                # and the completion gate below still judges it.
+                # dispatching the goal prompt once.  Treated as a handoff:
+                # truthy result, backoff cleared, and the completion gate below
+                # still judges it.
                 fan_out = ({'completed': 0, 'failed': 0, 'deferred': 0}
                            if _expert_cfg else self._try_parallel_dispatch(
                                goal, idle_agents, dispatched, max_concurrent))
@@ -1991,27 +2072,47 @@ class AgentDaemon:
                     logger.debug(f"Goal {goal_key}: {_held} parallel "
                                  f"subtask(s) held for later")
                 elif speculative_enabled and not _expert_cfg:
+                    _speculate = False
                     try:
                         from .speculative_dispatcher import get_speculative_dispatcher
                         dispatcher = get_speculative_dispatcher()
-                        if dispatcher.should_speculate(
-                                str(agent['user_id']), prompt_id, prompt, goal.to_dict()):
-                            dispatcher.dispatch_speculative(
-                                prompt, str(agent['user_id']), prompt_id,
-                                goal.id, goal.goal_type)
-                            dispatched += 1
-                            # Success — clear backoff
-                            with _module_lock:
-                                _dispatch_backoff.pop(goal_key, None)
-                            handed_off = True
-                            # Handed off — same truth as dispatch_goal's
-                            # non-None. Truthy so the failure/backoff arm
-                            # (synchronous failures only; speculation reports
-                            # none synchronously) is skipped and the
-                            # completion gate below runs.
-                            result = 'speculative-handoff'
+                        # Its budget check reads the spark as committed now,
+                        # not as this tick loaded it.
+                        _speculate = dispatcher.should_speculate(
+                            str(agent['user_id']), prompt_id, prompt,
+                            dict(goal.to_dict(), spark_spent=_spark_now))
                     except ImportError:
                         pass
+                    except Exception as e:
+                        # The goal is then dispatched the ordinary way below;
+                        # a raise here used to end the tick, and the tick's
+                        # handler clears every goal's backoff.
+                        logger.warning(f"Goal {goal_key}: should_speculate "
+                                       f"failed, dispatching directly: {e}")
+                    if _speculate:
+                        # A raise is this turn's failure, taken by the failure
+                        # arm below like any other, not the end of the tick
+                        # (which would also clear every goal's backoff, review
+                        # of aeb5d4831).
+                        try:
+                            _spec = dispatcher.dispatch_speculative(
+                                prompt, str(agent['user_id']), prompt_id,
+                                goal.id, goal.goal_type)
+                        except Exception as e:
+                            _spec = {'error': f'{type(e).__name__}: {e}'}
+                        dispatched += 1
+                        handed_off = True
+                        # The fast model's turn ran before dispatch_speculative
+                        # returned: its reply is this turn's result, judged by
+                        # dispatch_goal's own rule, so a failed one takes the
+                        # failure arm below and a real one reaches the
+                        # completion gate.  It used to be discarded for a
+                        # 'speculative-handoff' sentinel, and on central
+                        # 2026-10-17 18 goals whose every fast turn failed were
+                        # completed on the expert's spark reservation
+                        # (speculative_turn_result).
+                        from .dispatch import speculative_turn_result
+                        result = speculative_turn_result(goal_key, _spec)
 
                 _to_hive = False
                 if not handed_off:

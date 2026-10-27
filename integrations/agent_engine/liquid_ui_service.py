@@ -1024,11 +1024,9 @@ COMPONENT_TYPES = {
     'media': {
         'props': ['type', 'src', 'alt', 'controls'],
         'attributes': {'media_type': 'image|video|audio', 'src': 'str',
-                       'url': 'str', 'alt': 'str', 'title': 'str',
-                       'controls': 'bool'},
-        'doc': ("Image, video or audio. Nunba's AgentOverlay plays `url`; `src` "
-                'is the declared prop and AgentOverlay does not read it.'),
-        'example': {'media_type': 'audio', 'url': 'https://example.com/a.mp3',
+                       'alt': 'str', 'title': 'str', 'controls': 'bool'},
+        'doc': 'Image, video or audio; the source to play is `src`.',
+        'example': {'media_type': 'audio', 'src': 'https://example.com/a.mp3',
                     'alt': 'Sample', 'controls': True},
     },
     # ``metric`` is the worked example of the ENRICHED interface shape (§6b): the
@@ -1209,8 +1207,7 @@ COMPONENT_TYPES = {
                        'channel': 'str', 'channel_type': 'str'},
         'required': ['message'],
         'aliases': {'text': 'message'},
-        'doc': ('Short notice. The body is `message`; AgentOverlay does not read '
-                '`text`, which two channel emitters send.'),
+        'doc': 'Short notice. The body is `message`; AgentOverlay does not read `text`.',
         'example': {'message': 'Discord disconnected.', 'severity': 'info'},
     },
     # ── Channel pair-code consent card (gateway_qr auth_method) ──
@@ -2190,7 +2187,13 @@ class LiquidUIService:
           2. EventBus → SSE for the owning user → the Nunba Demopage's agent
              component (AgentOverlay), which IS Liquid UI on the desktop
              (owner ruling 2026-09-26)
-          3. EventBus → WAMP bridge → Android/iOS React Native via Crossbar
+          3. The owner's own topic, chat.social → WAMP
+             com.hertzai.hevolve.social.<owner> → the phone
+             (AutobahnConnectionManager.onEventSocial), and the owner's SSE
+             event chat.social.  The EventBus WAMP bridge never carries a
+             card: one person's event, on a URI that names no user.
+        Every copy carries the card's one msg_id, so a client that gets two
+        copies shows one.
 
         ``user_id`` names the person the push is FOR. Pass it whenever the
         emitter knows it: it is what the P3a SSE guard routes on. Without it
@@ -2286,8 +2289,16 @@ class LiquidUIService:
                            'fix the listed issues and push again', issues)
 
         import time as _time
+        import uuid as _uuid
         component['_ts'] = _time.time()
         component['_agent_id'] = agent_id
+        # One id per accepted push, carried by every copy of it: the
+        # agent.ui.update envelope and the card on its owner's own topic.
+        # Nunba's realtimeService.unwrapAgentUiEnvelope names the first by its
+        # envelope's msg_id and the second by its card's, and drops a copy it
+        # has already shown.  The form EventBus.emit gives an event that has
+        # none; new per push, so a dict pushed twice is two cards.
+        component['msg_id'] = _uuid.uuid4().hex
 
         # G2: a push of an agent-REGISTERED custom type carries its render spec so the
         # client can render it (props to iterate, or a template to fill) instead of the
@@ -2344,36 +2355,45 @@ class LiquidUIService:
         except Exception:
             logger.exception("agent_ui_update: swallowed Exception")
 
-        # 2. Push to EventBus → WAMP → Android/iOS/Desktop
-        # The WAMP bridge (core/platform/events.py) auto-publishes to
-        # com.hartos.event.agent.ui.update which Android subscribes to
-        # via AutobahnConnectionManager. Android renders as floating
-        # overlay on top of AbstractChatActivity.
+        # Stamp the owning user so the P3a SSE guard ROUTES this push rather
+        # than refusing it.  Measured 2026-08-12: 38 refusals in two hours,
+        # which is every A2UI overlay push silently dropped.  Unlike
+        # agent.action.completed this emit stamped NOTHING at all.  None ->
+        # still refused, exactly as before: no leak, no regression.
+        # Import is local + guarded so an import problem degrades the
+        # user_id to None instead of killing the push entirely.
+        # An emitter-supplied user_id wins: the emitter knows whose turn
+        # this is, the fallback can only guess the sole tenant.
+        _owner = str(user_id) if user_id else None
+        if _owner is None:
+            try:
+                from core.event_attribution import owner_user_id
+                _owner = owner_user_id()
+            except Exception:
+                _owner = None
+
+        # 2. EventBus agent.ui.update → the owner's SSE stream (the Nunba
+        # Demopage) and in-process listeners.  Never the phone: the WAMP
+        # bridge withholds a one-person event whose URI names no user
+        # (core/platform/events.py _bridge_payload).
         try:
             from core.platform.events import emit_event
-            # Stamp the owning user so the P3a SSE guard ROUTES this push rather
-            # than refusing it.  Measured 2026-08-12: 38 refusals in two hours,
-            # which is every A2UI overlay push silently dropped.  Unlike
-            # agent.action.completed this emit stamped NOTHING at all.  None ->
-            # still refused, exactly as before: no leak, no regression.
-            # Import is local + guarded so an import problem degrades the
-            # user_id to None instead of killing the push entirely.
-            # An emitter-supplied user_id wins: the emitter knows whose turn
-            # this is, the fallback can only guess the sole tenant.
-            _owner = str(user_id) if user_id else None
-            if _owner is None:
-                try:
-                    from core.event_attribution import owner_user_id
-                    _owner = owner_user_id()
-                except Exception:
-                    _owner = None
             emit_event('agent.ui.update', {
                 'agent_id': agent_id,
                 'component': component,
                 'user_id': _owner,
+                'msg_id': component['msg_id'],
             })
         except Exception:
             logger.exception("agent_ui_update: swallowed Exception")  # EventBus emission is best-effort
+
+        # 3. The owner's own topic → the phone.  No owner, no leg: the same
+        # card the SSE guard refuses above has no one to go to.
+        if _owner:
+            try:
+                _publish_to_owner(agent_id, component, _owner)
+            except Exception:
+                logger.exception("agent_ui_update: owner topic publish failed")
 
         logger.info("A2UI: agent %s pushed %s component", agent_id, comp_type)
         return verdict(True, issues=issues)
@@ -10349,17 +10369,20 @@ function renderAgentOverlay(ev) {{
         # fetch is loopback and passes _require_system_auth with no token. Own
         # try/except so a failure can NEVER cascade and drop the sibling shell
         # routes above (the #18 route-drop class).
+        #
+        # The idle captioner is NOT started here: serve_forever starts it,
+        # the one host that serves this app.  Building the app starts nothing
+        # (the connectivity prober and the shell-state sampler keep the same
+        # rule).  It used to start here too, for tests and the dev harness
+        # scripts, and every test that built the app ran it in the test
+        # process: it walked ~/Pictures and ~/Videos, asked the vision backend
+        # for a caption, and the 0.8B backend spawned a llama-server on :8081
+        # beside the desktop app's own (task #936, 2026-10-21: five servers
+        # LISTENING on 127.0.0.1:8081, four of them orphans).
         try:
             from integrations.agent_engine.media_semantic_index import (
-                register_media_routes, register_idle_indexer)
+                register_media_routes)
             register_media_routes(app)
-            # Start the idle captioner here too (idempotent) so a host that
-            # builds the app without running serve_forever (tests, the dev
-            # harness scripts) still populates the local caption catalog the
-            # home cards search for photos.  The Nunba desktop is not such a
-            # host: it never builds this app.  Self-gating (yields to the user)
-            # + local-only, so it never competes with a live session.
-            register_idle_indexer()
         except Exception as e:
             logger.warning("Media index API registration: %s", e)
 
@@ -11293,27 +11316,41 @@ def _to_client_vocabulary(component: dict):
     return component, None
 
 
+def _publish_to_owner(agent_id: str, card: dict, user_id: str) -> None:
+    """One accepted card on its owner's own topic.
+
+    ``publish_event('chat.social', ..., user_id)``: MessageBus carries it to
+    WAMP ``com.hertzai.hevolve.social.{user_id}``, where the phone listens
+    (AutobahnConnectionManager.onEventSocial -> AgentUiEnvelope), and to the
+    owner's SSE event ``chat.social``.  Both clients know the envelope by its
+    type and the card by its own msg_id, when it has one (agent_ui_compose
+    stamps it).  Raises what publish_event raises.
+    """
+    from integrations.social.realtime import publish_event
+    publish_event('chat.social', {
+        'type': 'agent_ui_update',
+        'agent_id': agent_id,
+        'component': card,
+    }, user_id=str(user_id))
+
+
 def push_agent_ui(agent_id: str, component: dict,
                   user_id: Optional[str] = None) -> bool:
     """Push one agent UI component to its user, from code that holds no
     reference to the shell.  The in-process form of agent_ui_update.
 
-    Two legs, each for a surface the other does not reach:
+    When this process serves a LiquidUIService (the registry entry
+    _register_self writes), the card is its to deliver: agent_ui_update
+    applies the allowlist, kill switch, rate cap and XSS gate, shows the card
+    and publishes it on the user's own topic, under one msg_id.  Publishing
+    it here as well sent the phone two copies, and the desktop two cards.
 
-      1. The live LiquidUIService, when this process serves one (the
-         registry entry _register_self writes).  agent_ui_update applies the
-         allowlist, kill switch, rate cap and XSS gate, stores the card for the
-         shell's SSE stream and emits ``agent.ui.update`` (the WAMP topic the
-         Android AgentOverlayBridge subscribes to).
-      2. When ``user_id`` is given, the user's own stream:
-         ``publish_event('chat.social', ..., user_id)``, which MessageBus maps
-         to WAMP ``com.hertzai.hevolve.social.{user_id}`` and to the per-user
-         SSE event ``chat.social``.  A node without a shell (the cloud gateway
-         the McGroce embed talks to) has only this leg, so the same gates run
-         here first: an unknown type, a halted hive or unsafe content is not
-         published.
+    A node without a shell (the cloud gateway the McGroce embed talks to), or
+    one whose shell push failed, has only the user's own topic
+    (_publish_to_owner), so the same gates run here first: an unknown type,
+    a halted hive or unsafe content is not published.
 
-    Returns True if either leg accepted the push.  Never raises.
+    Returns True if the card was accepted.  Never raises.
     """
     if not isinstance(component, dict):
         return False
@@ -11332,36 +11369,30 @@ def push_agent_ui(agent_id: str, component: dict,
         svc = get_registry().get_or_none('LiquidUIService')
     except Exception:
         svc = None
-    delivered = False
     if svc is not None:
         try:
-            delivered = bool(svc.agent_ui_update(
+            return bool(svc.agent_ui_update(
                 agent_id, dict(component), user_id=user_id))
         except Exception:
             logger.exception("push_agent_ui: shell push failed")
     if not user_id:
-        return delivered
+        return False
     if comp_type not in COMPONENT_TYPES or _a2ui_has_xss(component):
         logger.warning("push_agent_ui: %s from %s not published", comp_type,
                        agent_id)
-        return delivered
+        return False
     try:
         from security.hive_guardrails import HiveCircuitBreaker
         if HiveCircuitBreaker.is_halted():
-            return delivered
+            return False
     except Exception:
         logger.exception("push_agent_ui: swallowed Exception")
     try:
-        from integrations.social.realtime import publish_event
         card = dict(component)
         card.setdefault('_ts', time.time())
         card.setdefault('_agent_id', agent_id)
-        publish_event('chat.social', {
-            'type': 'agent_ui_update',
-            'agent_id': agent_id,
-            'component': card,
-        }, user_id=str(user_id))
+        _publish_to_owner(agent_id, card, user_id)
         return True
     except Exception:
         logger.exception("push_agent_ui: per-user publish failed")
-        return delivered
+        return False

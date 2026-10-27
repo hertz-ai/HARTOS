@@ -309,6 +309,12 @@ class VisionService:
         existing = getattr(self, '_screen_capture_thread', None)
         if existing is not None and existing.is_alive():
             return
+        # Central with no screen has nothing to capture or to ask for
+        # (2026-10-21: its loop asked the owner every 10 seconds).
+        from integrations.social.consent_service import central_lacks
+        if central_lacks('screen_capture'):
+            logger.info("Screen capture idle: central has no screen")
+            return
         if not os.environ.get('HEVOLVE_OWNER_USER_ID'):
             logger.info("Screen capture idle: no HEVOLVE_OWNER_USER_ID "
                         "identity to consent-ask or file frames under")

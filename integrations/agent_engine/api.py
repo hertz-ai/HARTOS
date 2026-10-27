@@ -275,7 +275,36 @@ _LEDGER_FILENAME = _re.compile(
 )
 
 
-def _iter_ledgers(agent_filter=None):
+def _in_progress_ledger_names(storage_dir):
+    """File names of the ledgers in ``storage_dir`` that hold a task in
+    progress: the ones whose saved state says so
+    (``SmartLedger.keys_in_progress``), plus any ledger this process holds
+    open whose in-memory state has one.  _iter_ledgers hands an open ledger
+    back from the cache, so its unsaved state is what the reaper always
+    examined; it still is.
+
+    None when the agent_ledger on the path predates the index (a partial
+    hot-swap, an older install): the caller then walks every file, as it did
+    before the index existed.
+    """
+    from agent_ledger import factory
+    from agent_ledger.core import SmartLedger
+
+    keys_in_progress = getattr(SmartLedger, 'keys_in_progress', None)
+    cached_ledgers = getattr(factory, 'cached_ledgers', None)
+    if keys_in_progress is None or cached_ledgers is None:
+        logger.warning("agent_ledger has no in-progress index; walking every ledger")
+        return None
+    names = {f'{key}.json' for key in keys_in_progress(str(storage_dir))}
+    for ledger in cached_ledgers():
+        name = ledger.ledger_file.name
+        if (name not in names and ledger.has_work_in_progress()
+                and (storage_dir / name).is_file()):
+            names.add(name)
+    return sorted(names)
+
+
+def _iter_ledgers(agent_filter=None, in_progress_only=False):
     """Yield ``(agent_id, session_id, SmartLedger)`` for every JSON
     ledger file in ``get_agent_data_dir()``.
 
@@ -284,6 +313,11 @@ def _iter_ledgers(agent_filter=None):
     don't re-parse JSON each time.  ``prefer_redis=False`` because
     we are explicitly walking on-disk JSON files; a RedisBackend
     instance would not surface them via ``Path.glob``.
+
+    ``in_progress_only`` yields only the ledgers holding a task in
+    progress (``_in_progress_ledger_names``), without opening the rest:
+    the zombie reaper's walk, whose cost then follows the work in flight
+    rather than every session on disk.
     """
     from agent_ledger.factory import get_or_create_ledger
     from core.platform_paths import get_agent_data_dir
@@ -292,8 +326,11 @@ def _iter_ledgers(agent_filter=None):
     storage_dir = Path(get_agent_data_dir())
     if not storage_dir.is_dir():
         return
-    for ledger_file in storage_dir.glob('ledger_*.json'):
-        m = _LEDGER_FILENAME.match(ledger_file.name)
+    names = _in_progress_ledger_names(storage_dir) if in_progress_only else None
+    if names is None:
+        names = (f.name for f in storage_dir.glob('ledger_*.json'))
+    for name in names:
+        m = _LEDGER_FILENAME.match(name)
         if not m:
             # benchmark_ledger.json, malformed names, traversal attempts.
             continue
@@ -310,7 +347,7 @@ def _iter_ledgers(agent_filter=None):
             )
             yield agent_id, session_id, ledger
         except Exception as e:
-            logger.warning(f"Skipped ledger {ledger_file.name}: {e}")
+            logger.warning(f"Skipped ledger {name}: {e}")
             continue
 
 

@@ -231,3 +231,40 @@ def test_a_person_is_a_human_whatever_the_body_says(db, client):
     db.expire_all()
     row = db.query(ExperimentVote).filter_by(voter_id=person.id).one()
     assert row.voter_type == 'human' and row.confidence == 1.0
+
+
+# -- review of 40aaed434, finding 1: one person test at the route and in the metrics --
+
+def test_a_system_account_votes_as_an_agent_at_the_route(db, client):
+    """A 'system' account's token passes require_auth; its vote is stored
+    as the agent the tally weighs it as."""
+    e = _experiment(db)
+    system = _user(db, 'system', api_token='tok-system-' + uuid.uuid4().hex)
+    resp = _post(client, e, system.api_token, voter_type='human')
+    assert resp.status_code == 200, resp.get_json()
+    db.expire_all()
+    row = db.query(ExperimentVote).filter_by(voter_id=system.id).one()
+    assert row.voter_type == 'agent'
+
+
+def test_a_system_account_cannot_vote_on_security(db, client):
+    """security_guardrail refuses agents; a system account is no person."""
+    e = _experiment(db, SECURITY)
+    system = _user(db, 'system', api_token='tok-system-' + uuid.uuid4().hex)
+    resp = _post(client, e, system.api_token)
+    assert resp.status_code == 400
+    db.expire_all()
+    assert db.query(ExperimentVote).filter_by(voter_id=system.id).count() == 0
+
+
+def test_the_metrics_count_voters_by_account(db):
+    """A person, a system account whose row an older route stored as
+    'human', and an agent: one human voter, two agent voters."""
+    from integrations.social.experiment_discovery_service import (
+        ExperimentDiscoveryService)
+    e = _experiment(db)
+    _vote(db, e.id, _user(db), 2)
+    _vote(db, e.id, _user(db, 'system'), 2, voter_type='human')
+    _vote(db, e.id, _user(db, 'agent', owner_id=_user(db).id), 2)
+    m = ExperimentDiscoveryService.get_experiment_metrics(db, e.id)
+    assert (m['human_voters'], m['agent_voters']) == (1, 2)
