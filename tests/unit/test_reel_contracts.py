@@ -669,6 +669,25 @@ def test_trending_lists_carry_no_urls_and_no_session_data():
     assert C.validate_trending_songs(doc)
 
 
+@pytest.mark.parametrize('key', [
+    # a secret by the one rule (security.edge_privacy.is_secret_key), which
+    # the list's own words missed (parallel-path audit 10-27, R1)
+    'api_key', 'secret', 'credentials', 'private_key', 'accessToken', 'auth_token',
+    # instagrapi's own login names, glued
+    'sessionid', 'csrftoken', 'cookies', 'authorization_data', 'preview_url',
+])
+def test_a_song_list_carries_no_secret_under_any_name(key):
+    doc = _client()
+    doc['songs'][0][key] = 'x'
+    assert any(key in p for p in C.validate_trending_songs(doc)), key
+
+
+def test_a_count_of_tokens_is_not_session_data():
+    doc = _published()
+    doc['songs'][0]['max_tokens'] = 3
+    assert C.validate_trending_songs(doc) == []
+
+
 def test_malformed_trending_lists_are_refused():
     doc = _published()
     doc['date'] = '13/10/2026'

@@ -234,9 +234,12 @@ class PlanError(Exception):
 
 _DATE = re.compile(r'\d{4}-\d{2}-\d{2}')
 _URL = re.compile(r'(?i)^\s*https?://')
-#: Keys a published or cached song list must never carry.
-_FORBIDDEN_KEY_PARTS = ('url', 'session', 'cookie', 'token', 'password', 'csrf',
-                        'authorization')
+#: Beyond a secret's name (security.edge_privacy.is_secret_key), what a
+#: published or cached song list never carries under a key: an address, or the
+#: login its source (instagrapi) keeps, whose names are glued ('sessionid',
+#: 'csrftoken', 'cookies', 'authorization_data'), so these match anywhere in
+#: the key.
+_SONG_LIST_KEY_PARTS = ('url', 'session', 'cookie', 'csrf', 'authorization')
 
 
 def _is_num(v) -> bool:
@@ -1283,12 +1286,19 @@ def validate_file_offer(frame) -> List[str]:
 
 # ── trending songs ────────────────────────────────────────────────────────
 
+def _leaky_key(key) -> bool:
+    from security.edge_privacy import is_secret_key, secret_key_form
+    return isinstance(key, str) and (
+        is_secret_key(secret_key_form(key))
+        or any(p in key.lower() for p in _SONG_LIST_KEY_PARTS))
+
+
 def _leaks(value, where: str) -> List[str]:
-    """URLs or session data anywhere inside a song list."""
+    """URLs, secrets or session data anywhere inside a song list."""
     out = []
     if isinstance(value, Mapping):
         for key, sub in value.items():
-            if isinstance(key, str) and any(p in key.lower() for p in _FORBIDDEN_KEY_PARTS):
+            if _leaky_key(key):
                 out.append('%s.%s: song lists carry no URLs or session data' % (where, key))
             out += _leaks(sub, '%s.%s' % (where, key))
     elif isinstance(value, (list, tuple)):
