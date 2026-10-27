@@ -173,7 +173,8 @@ def _drive(tmp_path, gather_reply, *, turn_before=0, first_turn_cloud=None,
                                  '_CONFIG_LIST_FIELDS', '_read_gather_config',
                                  '_BUILDABLE_REASK', '_config_review_text',
                                  '_STEP_NUMBER', '_step_text',
-                                 '_config_steps'}),
+                                 '_config_steps', '_is_plain_yes',
+                                 '_NO_REVIEW_SHOWN'}),
                  _SRC, 'exec'), ns)
 
     social = MagicMock(chat_messages=chat_messages)
@@ -345,25 +346,222 @@ def test_a_config_completed_before_any_review_is_shown_not_built(tmp_path):
     assert not shown, 'a saved agent leaves no review mark for the next one'
 
 
-def test_a_config_that_changed_after_its_review_is_shown_again(tmp_path):
-    """The yes builds the steps that were shown.  A model that adds a step
-    between the review and its completed config (the attempt 6 shape: steps
-    the person never saw) gets the new config shown, not built; the next
-    completed config with those same steps is built."""
+def test_a_plain_yes_builds_the_shown_config_without_asking_the_model(tmp_path):
+    """LIVE 2026-10-19 (agent 342, the 2B, requests 86c2f666 / 9cf4793c /
+    cba6e916): the config was shown at 17:39, and each "yes" ran the model
+    again, which rewrote the steps every time, so the person read "Before I
+    build it" three times and nothing was ever saved.  The plain yes the
+    review asks for confirms the config that was shown: that config is saved,
+    and the model, whose next answer would differ, is not asked at all."""
+    shown = {}
+    _drive(tmp_path, json.dumps(_NEWS), reviews_shown=shown)
+    rewritten = json.loads(json.dumps(_NEWS))
+    rewritten['flows'][0]['actions'] = ['verify the feeds', 'fetch news',
+                                        'summarise it', 'email it to everyone']
+    payload, _, _, gather_calls = _drive(
+        tmp_path, json.dumps(rewritten), turn_before=1, user_text='Yes.',
+        reviews_shown=shown)
+    assert payload['Agent_status'] == 'Review Mode', payload
+    assert _saved(tmp_path)['flows'] == _NEWS['flows'], _saved(tmp_path)
+    assert gather_calls == [], gather_calls
+    assert not shown, 'a saved agent leaves no review mark for the next one'
+
+
+def test_a_change_after_the_review_asks_the_model_and_shows_the_new_steps(
+        tmp_path):
+    """Anything but a plain yes is the person's change: the model is asked,
+    and a config whose steps differ from the ones shown is shown again (the
+    attempt 6 shape: steps the person never saw are never built unseen).
+    The yes after that builds the steps shown then."""
     shown = {}
     _drive(tmp_path, json.dumps(_NEWS), reviews_shown=shown)
     changed = json.loads(json.dumps(_NEWS))
     changed['flows'][0]['actions'].append('email it to everyone')
-    payload, _, _, _ = _drive(tmp_path, json.dumps(changed), turn_before=1,
-                              user_text='yes', reviews_shown=shown)
+    payload, _, _, gather_calls = _drive(
+        tmp_path, json.dumps(changed), turn_before=1,
+        user_text='also email it to everyone', reviews_shown=shown)
+    assert gather_calls == ['also email it to everyone'], gather_calls
     assert payload['Agent_status'] == 'Creation Mode', payload
     assert '3. email it to everyone' in payload['response'], payload
     assert _saved(tmp_path) is None
 
-    payload, _, _, _ = _drive(tmp_path, json.dumps(changed), turn_before=2,
-                              user_text='yes', reviews_shown=shown)
+    payload, _, _, gather_calls = _drive(
+        tmp_path, json.dumps(_NEWS), turn_before=2, user_text='yes',
+        reviews_shown=shown)
     assert payload['Agent_status'] == 'Review Mode', payload
     assert len(_saved(tmp_path)['flows'][0]['actions']) == 3
+    assert gather_calls == [], gather_calls
+
+
+@pytest.mark.parametrize('answer', [
+    'yes', 'Yes', 'YES', 'Yes.', 'yes!', ' yes ',
+])
+def test_only_a_plain_yes_confirms_the_shown_config(tmp_path, answer):
+    """The one word the review asks for ("Reply yes to build it"), on its
+    own, in any case, with or without the full stop: no pattern matching
+    (owner, 2026-10-20)."""
+    shown = {}
+    _drive(tmp_path, json.dumps(_NEWS), reviews_shown=shown)
+    payload, _, _, gather_calls = _drive(
+        tmp_path, '{"status": "pending", "question": "unused"}',
+        turn_before=1, user_text=answer, reviews_shown=shown)
+    assert payload['Agent_status'] == 'Review Mode', (answer, payload)
+    assert gather_calls == [], (answer, gather_calls)
+
+
+@pytest.mark.parametrize('answer', [
+    'no', 'y', 'ok', 'sure', 'build it', 'confirmed', 'yes please',
+    'Yes, build it', 'yes but make it 15 seconds', 'yes, and add my logo',
+    'change the song', 'not yet', 'yes instead of the second step use a poll',
+    'ok remove step 2', 'build it without the email',
+])
+def test_every_other_answer_goes_to_the_model(tmp_path, answer):
+    """Anything that is not the plain yes is the person's answer to the
+    model, as before: a change, a question, or a yes with more in it that
+    no pattern is trusted to read."""
+    shown = {}
+    _drive(tmp_path, json.dumps(_NEWS), reviews_shown=shown)
+    payload, _, _, gather_calls = _drive(
+        tmp_path, '{"status": "pending", "question": "Which step?"}',
+        turn_before=1, user_text=answer, reviews_shown=shown)
+    assert gather_calls == [answer], (answer, gather_calls)
+    assert payload['Agent_status'] == 'Creation Mode', (answer, payload)
+    assert _saved(tmp_path) is None
+
+
+# How the handler knows a plain yes answers the FULL config (owner's question,
+# 2026-10-20): the mark under the session's key holds what the person saw in
+# the LAST reply - the config HARTOS showed, None for the model's own review
+# text, nothing after a question, a request for the steps, or a save.  Only a
+# config under the mark is built on a plain yes; the three tests below pin
+# the replies that must clear it.
+
+def test_a_yes_to_the_models_question_after_the_review_answers_the_model(
+        tmp_path):
+    """After the review the person asks for a change, the model asks a
+    question back, and the plain yes answering THAT question is an answer
+    to the model: it must not build the config shown two replies earlier,
+    which the change left behind."""
+    shown = {}
+    _drive(tmp_path, json.dumps(_NEWS), reviews_shown=shown)
+    payload, _, _, gather_calls = _drive(
+        tmp_path, '{"status": "pending", "question": "Daily or weekly?"}',
+        turn_before=1, user_text='make the summary a poll',
+        reviews_shown=shown)
+    assert gather_calls == ['make the summary a poll'], gather_calls
+    assert payload['response'] == 'Daily or weekly?', payload
+    payload, _, _, gather_calls = _drive(
+        tmp_path, '{"status": "pending", "question": "Which poll service?"}',
+        turn_before=2, user_text='yes', reviews_shown=shown)
+    assert gather_calls == ['yes'], gather_calls
+    assert payload['Agent_status'] == 'Creation Mode', payload
+    assert _saved(tmp_path) is None
+
+
+def test_a_yes_after_the_steps_were_asked_for_answers_the_model(tmp_path):
+    """The same when the reply after the review asked the person for the
+    steps (the model's change could not be built): that reply showed no
+    config, so a plain yes to it goes to the model."""
+    shown = {}
+    _drive(tmp_path, json.dumps(_NEWS), reviews_shown=shown)
+    payload, _, _, gather_calls = _drive(
+        tmp_path, json.dumps(_REFUSED), turn_before=1,
+        user_text='teach from the book instead', reviews_shown=shown)
+    assert payload['Agent_status'] == 'Creation Mode', payload
+    assert 'Before I build it' not in payload['response'], payload
+    assert _saved(tmp_path) is None
+    payload, _, _, gather_calls = _drive(
+        tmp_path, '{"status": "pending", "question": "Which book?"}',
+        turn_before=2, user_text='yes', reviews_shown=shown)
+    assert gather_calls == ['yes'], gather_calls
+    assert payload['Agent_status'] == 'Creation Mode', payload
+    assert _saved(tmp_path) is None
+
+
+def test_a_config_completed_after_a_question_is_shown_before_it_is_built(
+        tmp_path):
+    """After the review and a question the person has not seen the config
+    that answers them: it is shown, and the plain yes to THAT builds it."""
+    shown = {}
+    _drive(tmp_path, json.dumps(_NEWS), reviews_shown=shown)
+    _drive(tmp_path, '{"status": "pending", "question": "Daily or weekly?"}',
+           turn_before=1, user_text='make the summary a poll',
+           reviews_shown=shown)
+    changed = json.loads(json.dumps(_NEWS))
+    changed['flows'][0]['actions'][1] = 'post a poll'
+    payload, _, _, gather_calls = _drive(
+        tmp_path, json.dumps(changed), turn_before=2, user_text='weekly',
+        reviews_shown=shown)
+    assert gather_calls == ['weekly'], gather_calls
+    assert payload['Agent_status'] == 'Creation Mode', payload
+    assert '2. post a poll' in payload['response'], payload
+    assert _saved(tmp_path) is None
+    payload, _, _, gather_calls = _drive(
+        tmp_path, json.dumps(_NEWS), turn_before=3, user_text='yes',
+        reviews_shown=shown)
+    assert gather_calls == [], gather_calls
+    assert payload['Agent_status'] == 'Review Mode', payload
+    assert _saved(tmp_path)['flows'][0]['actions'] == ['fetch news',
+                                                       'post a poll']
+
+
+def test_a_confirmed_save_the_disk_refuses_never_saves_another_config(tmp_path):
+    """Review of 5c6286c1f, probed: a plain yes whose save the disk refuses
+    with a permission error (errno 13, as a Windows file lock does) went the
+    parse-error way's FATAL branch: it saved the generic 'Respond to user'
+    config in place of the one confirmed, or, with that write refused too,
+    the error left chat().  The person confirmed THIS config: they are told
+    it could not be saved, nothing else is saved, the model is not asked,
+    and the next plain yes saves the config shown."""
+    import builtins
+    shown = {}
+    _drive(tmp_path, json.dumps(_NEWS), reviews_shown=shown)
+    record = f'{PROMPT_ID}.json'
+
+    def locked_open(path, *a, **kw):
+        if str(path).endswith(record):
+            raise PermissionError(13, 'Permission denied', str(path))
+        return builtins.open(path, *a, **kw)
+
+    payload, _, _, gather_calls = _drive(
+        tmp_path, '{"status": "pending", "question": "unused"}',
+        turn_before=1, user_text='yes', reviews_shown=shown,
+        extra_ns={'open': locked_open})
+    assert gather_calls == [], gather_calls
+    assert payload['Agent_status'] == 'Creation Mode', payload
+    assert 'could not save' in payload['response'], payload
+    assert _saved(tmp_path) is None, 'another config was saved in place of the one confirmed'
+    payload, _, _, gather_calls = _drive(
+        tmp_path, '{"status": "pending", "question": "unused"}',
+        turn_before=2, user_text='yes', reviews_shown=shown)
+    assert gather_calls == [], gather_calls
+    assert payload['Agent_status'] == 'Review Mode', payload
+    assert _saved(tmp_path)['flows'] == _NEWS['flows']
+
+
+def test_a_save_that_fails_leaves_the_yes_answerable_again(tmp_path):
+    """The mark stays until the save takes it: when writing the record
+    fails on the plain yes (here PROMPTS_DIR is a file, so the open raises),
+    the person is told, no model is asked, nothing is saved, and the next
+    plain yes builds the same config once the disk is back."""
+    shown = {}
+    _drive(tmp_path, json.dumps(_NEWS), reviews_shown=shown)
+    blocked = tmp_path / 'not_a_dir'
+    blocked.write_text('x')
+    payload, _, _, gather_calls = _drive(
+        tmp_path, '{"status": "pending", "question": "unused"}',
+        turn_before=1, user_text='yes', reviews_shown=shown,
+        extra_ns={'PROMPTS_DIR': str(blocked)})
+    assert gather_calls == [], gather_calls
+    assert payload['Agent_status'] == 'Creation Mode', payload
+    assert 'could not save' in payload['response'], payload
+    assert _saved(tmp_path) is None
+    payload, _, _, gather_calls = _drive(
+        tmp_path, '{"status": "pending", "question": "unused"}',
+        turn_before=2, user_text='yes', reviews_shown=shown)
+    assert gather_calls == [], gather_calls
+    assert payload['Agent_status'] == 'Review Mode', payload
+    assert _saved(tmp_path)['flows'] == _NEWS['flows']
 
 
 def test_the_same_steps_numbered_or_spaced_differently_are_the_ones_shown(

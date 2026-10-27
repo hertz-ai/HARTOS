@@ -1,0 +1,679 @@
+"""A goal the speculative dispatcher ran is judged by the reply its turn gave.
+
+Measured on central 2026-10-17 18:35-18:49Z (container c48e9060):
+- Once the Claude key made a second dispatchable model exist,
+  should_speculate turned true and every daemon goal took the speculative
+  branch (HEVOLVE_SPECULATIVE_ENABLED is set true by the node-tier feature
+  gate).  dispatch_speculative runs the fast model's /chat turn
+  synchronously and returns its reply; the branch threw the reply away and
+  set result to the 'speculative-handoff' sentinel.
+- Every fast turn failed (OpenRouter 400 "Reasoning is mandatory"), and
+  18 goals were still completed, one every ~42 s, 1.5 s after their
+  dispatch: the expert reservation inside dispatch_speculative added 4 spark
+  (spark_this_dispatch=4), and the coordinator still held the task the
+  morning's false result had completed (grounding ledger_tasks_complete),
+  or no task at all (local_dispatch_spend).
+
+The reply is the turn's result.  A failed or empty one is a failed dispatch
+(backoff, the 5-strike pause with its reason); a paused one is held; a real
+one is settled like any other turn that ran here.
+
+Behavioural: the real AgentDaemon._tick, dispatch's failure rule and
+_settle_dispatched_goal.  Replaced at the boundaries only: the DB session and
+goal row, the idle personas, the yield and person checks, the budget and
+guardrail gates, the prompt builder, the coordinator's accounting and the
+speculative dispatcher (its fast turn and its reservation).
+
+    python -m pytest tests/unit/test_speculative_turn_is_judged_by_its_reply.py -q
+"""
+import contextlib
+import itertools
+import os
+import sys
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+os.environ.setdefault('HEVOLVE_DB_PATH', ':memory:')
+
+from integrations.agent_engine import agent_daemon, budget_gate, dispatch  # noqa: E402
+from integrations.agent_engine.agent_daemon import AgentDaemon  # noqa: E402
+
+
+def expert_reservation_holder(speculation_id):
+    from integrations.agent_engine.speculative_dispatcher import (
+        expert_reservation_holder as _holder)
+    return _holder(speculation_id)
+
+GOAL = 'goal-spec-1'
+FAILED = ("I couldn't finish that: Error code: 400 - {'error': {'message': "
+          "'Reasoning is mandatory for this endpoint and cannot be disabled.', "
+          "'code': 400}}")
+
+
+class Goal:
+    """Stands in for an AgentGoal row (the attributes _tick reads)."""
+
+    def __init__(self, gid=GOAL, spark=104):
+        self.id = gid
+        self.goal_type = 'marketing'
+        self.title = 'Growth Analytics and Optimization'
+        self.description = ''
+        self.status = 'active'
+        self.config_json = {'bootstrap_slug': 'bootstrap_growth_analytics'}
+        self.spark_spent = spark
+        self.spark_budget = 300
+        self.last_dispatched_at = None
+        self.product_id = None
+        self.owner_id = None
+        self.prompt_id = None
+        self.flow_id = None
+
+    def to_dict(self):
+        d = {'id': self.id, 'goal_type': self.goal_type, 'title': self.title,
+             'description': self.description, 'status': self.status,
+             'spark_budget': self.spark_budget, 'spark_spent': self.spark_spent}
+        d.update(self.config_json)
+        return d
+
+
+class _Coordinator:
+    """The coordinator's own accounting for the goal: the task an earlier
+    run left behind (completed), or none at all."""
+
+    def __init__(self, progress):
+        self._progress = progress
+
+    def get_goal_progress(self, goal_id):
+        return self._progress
+
+
+STALE_DONE = {'total_tasks': 1, 'completed': 1}
+
+
+def _row_db(goal):
+    """A session whose goal queries, and budget_gate's row lookups (by id;
+    by prompt id + status), find ``goal``; its spark_spent column reads the
+    row as it is now (goal_spark_now)."""
+    db = MagicMock()
+    db.query.return_value.filter.return_value.all.return_value = [goal]
+    db.query.return_value.filter.return_value.scalar.side_effect = \
+        lambda: goal.spark_spent
+    db.query.return_value.filter_by.return_value.with_for_update \
+        .return_value.first.return_value = goal
+    db.query.return_value.filter.return_value.with_for_update \
+        .return_value.first.return_value = goal
+    return db
+
+
+_speculation_ids = itertools.count(1)
+
+
+class _Speculator:
+    """The speculative dispatcher at its boundary: the fast turn's reply, and
+    the expert reservation that adds spark before any work exists, held under
+    the expert's own holder until the expert task ends (finish()), as
+    _schedule_expert_background and _expert_background_task do."""
+
+    def __init__(self, goal, reply, reserve=4, work=0):
+        self.goal = goal
+        self.reply = reply
+        self.reserve = reserve
+        self.work = work
+        self.calls = 0
+        self.speculation_id = f'spec-{next(_speculation_ids)}'
+
+    def should_speculate(self, *a, **k):
+        return True
+
+    def dispatch_speculative(self, prompt, user_id, prompt_id=None,
+                             goal_id=None, goal_type='general', node_id=None):
+        self.calls += 1
+        budget_gate.check_goal_budget(
+            str(goal_id), self.reserve,
+            holder=expert_reservation_holder(self.speculation_id))
+        if self.work:
+            # A flow that finished during the fast turn charges its work
+            # (create_recipe._save_flow_recipe / reuse_recipe all-done).
+            budget_gate.charge_goal_work_completed(prompt_id, self.work)
+        return {'response': self.reply, 'speculation_id': self.speculation_id,
+                'fast_model': 'configured-api', 'expert_pending': True}
+
+    def finish(self, db=None):
+        """The expert task ending: it gives its own reservation back."""
+        with patch('integrations.social.models.get_db',
+                   return_value=db or _row_db(self.goal)):
+            return budget_gate.release_goal_reservations(
+                str(self.goal.id),
+                holder=expert_reservation_holder(self.speculation_id))
+
+
+def _boundaries(goal, speculator, progress, speculative=True):
+    db = _row_db(goal)
+    return [
+        patch.dict(os.environ, {'HEVOLVE_SPECULATIVE_ENABLED':
+                                'true' if speculative else 'false'}),
+        patch('integrations.social.models.get_db', return_value=db),
+        patch('integrations.coding_agent.idle_detection.IdleDetectionService.'
+              'get_idle_agent_personas',
+              return_value=[{'user_id': 'agent-1', 'username': 'a1'}]),
+        patch.object(dispatch, 'should_yield_to_user', return_value=False),
+        patch.object(dispatch, 'is_user_recently_active', return_value=False),
+        patch.object(dispatch, '_cb_is_open', return_value=False),
+        patch('core.foreground.preempted_recently', return_value=False),
+        patch('integrations.agent_engine.model_registry._own_llm_target',
+              return_value=('', '')),
+        patch.object(agent_daemon, '_flow_recipe_exists', return_value=True),
+        patch('integrations.agent_engine.goal_manager.GoalManager.build_prompt',
+              return_value='Analyze platform growth metrics and optimize'),
+        patch('integrations.agent_engine.budget_gate.estimate_llm_cost_spark',
+              return_value=0),
+        patch('security.hive_guardrails.GuardrailEnforcer.before_dispatch',
+              side_effect=lambda prompt, *a, **k: (True, '', prompt)),
+        patch.object(AgentDaemon, '_try_parallel_dispatch',
+                     return_value={'completed': 0, 'failed': 0, 'deferred': 0}),
+        patch.object(dispatch, '_get_distributed_coordinator',
+                     return_value=(_Coordinator(progress)
+                                   if progress is not None else None)),
+        patch('integrations.agent_engine.speculative_dispatcher.'
+              'get_speculative_dispatcher', return_value=speculator),
+    ]
+
+
+def tick(goal, speculator, progress=STALE_DONE, speculative=True, extra=()):
+    """One real agent-daemon tick over ``goal``; a backoff left by the last
+    tick is due now, the count of failures it holds is kept.  Ticks run 30 s
+    apart, past the budget cache's 10 s window, so each starts uncached."""
+    info = agent_daemon._dispatch_backoff.get(str(goal.id))
+    if info:
+        info['skip_until'] = 0
+    agent_daemon._budget_blocked_goals.discard(str(goal.id))
+    budget_gate.invalidate_goal_budget_cache()
+    goal.last_dispatched_at = None
+    with contextlib.ExitStack() as stack:
+        for p in list(_boundaries(goal, speculator, progress,
+                                  speculative)) + list(extra):
+            stack.enter_context(p)
+        AgentDaemon()._tick()
+
+
+def _forget_held():
+    getattr(budget_gate, '_held_reservations', {}).pop(GOAL, None)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_daemon_state():
+    agent_daemon._dispatch_backoff.pop(GOAL, None)
+    # The route line is logged only when a goal's route changes, so each
+    # test starts as if the goal had never been dispatched.
+    dispatch._routes_logged.pop(GOAL, None)
+    budget_gate.invalidate_goal_budget_cache()
+    _forget_held()
+    yield
+    agent_daemon._dispatch_backoff.pop(GOAL, None)
+    dispatch._routes_logged.pop(GOAL, None)
+    dispatch.dispatch_failure_reason(GOAL)
+    budget_gate.invalidate_goal_budget_cache()
+    _forget_held()
+
+
+def test_a_failed_fast_turn_does_not_complete_the_goal():
+    """The 18 completions themselves: a reserved 4 spark and a task an
+    earlier run completed, and a turn that answered with its 400."""
+    goal = Goal()
+    spec = _Speculator(goal, FAILED)
+    tick(goal, spec)
+    assert spec.calls == 1
+    assert goal.status == 'active', \
+        'a failed turn completed the goal on a reservation and a stale task'
+    assert 'completed_at' not in goal.config_json
+    assert agent_daemon._dispatch_backoff[GOAL]['failures'] == 1, \
+        'the failed turn must count as a failed dispatch'
+
+
+def test_five_failed_fast_turns_pause_the_goal_and_say_why():
+    goal = Goal()
+    spec = _Speculator(goal, FAILED)
+    for _ in range(5):
+        tick(goal, spec)
+    assert spec.calls == 5
+    assert goal.status == 'paused'
+    reason = goal.config_json['pause_reason']
+    assert '5 consecutive dispatch failures' in reason
+    assert 'Reasoning is mandatory' in reason, \
+        'the pause must name what failed, as a dispatch_goal turn does'
+
+
+def test_an_empty_fast_reply_is_a_failed_dispatch():
+    """dispatch_speculative answers '' when its /chat call fails (a 401, a
+    timeout): no turn result, so no settlement."""
+    goal = Goal()
+    tick(goal, _Speculator(goal, ''))
+    assert goal.status == 'active'
+    assert 'completed_at' not in goal.config_json
+    assert agent_daemon._dispatch_backoff[GOAL]['failures'] == 1
+
+
+def test_five_empty_fast_replies_pause_the_goal_naming_the_model():
+    """_dispatch_to_model swallows the cause of an empty reply, so the pause
+    names the model an operator has to look at (review of aeb5d4831)."""
+    goal = Goal()
+    for _ in range(5):
+        tick(goal, _Speculator(goal, ''))
+    assert goal.status == 'paused'
+    reason = goal.config_json['pause_reason']
+    assert 'configured-api' in reason and 'returned no reply' in reason
+
+
+class _RaisingSpeculator(_Speculator):
+    def dispatch_speculative(self, *a, **k):
+        self.calls += 1
+        raise RuntimeError('fast model transport broke')
+
+
+def test_a_raising_speculative_dispatch_is_a_failed_turn_not_a_dead_tick():
+    """A raise used to end the tick, and the tick's handler clears every
+    goal's backoff: the goal never collected a strike and another goal's
+    backoff was wiped (review of aeb5d4831, measured)."""
+    other = {'failures': 3, 'skip_until': 9e18}
+    agent_daemon._dispatch_backoff['goal-other'] = dict(other)
+    try:
+        goal = Goal()
+        spec = _RaisingSpeculator(goal, 'unused')
+        tick(goal, spec)
+        assert spec.calls == 1
+        assert agent_daemon._dispatch_backoff[GOAL]['failures'] == 1
+        assert agent_daemon._dispatch_backoff.get('goal-other') == other, \
+            "another goal's backoff was cleared by this goal's raise"
+        for _ in range(4):
+            tick(goal, spec)
+        assert goal.status == 'paused'
+        assert 'RuntimeError: fast model transport broke' in \
+            goal.config_json['pause_reason']
+    finally:
+        agent_daemon._dispatch_backoff.pop('goal-other', None)
+
+
+def test_the_turn_says_where_it_ran():
+    """The 18 completions left no line saying where their turns went; the
+    route is recorded and logged like a dispatch_goal turn's."""
+    goal = Goal()
+    with patch.object(dispatch.logger, 'info') as info:
+        tick(goal, _Speculator(goal, FAILED))
+    lines = [str(c.args[0]) for c in info.call_args_list if c.args]
+    assert any(f'Goal {GOAL}: dispatched here (the speculative fast model '
+               f'ran it)' in line for line in lines), lines
+
+
+def test_a_fast_turn_paused_for_the_person_is_held_not_failed():
+    from core.agent_tools import user_pause_reply
+    goal = Goal()
+    tick(goal, _Speculator(goal, user_pause_reply(1)))
+    assert goal.status == 'active'
+    assert 'completed_at' not in goal.config_json
+    assert GOAL not in agent_daemon._dispatch_backoff, \
+        'a turn paused for the person is no strike against the goal'
+
+
+REAL = ('Funnel drop-off is at sign-up; three posts drafted for the '
+        'student segment.')
+
+
+def test_a_real_fast_reply_with_no_work_charged_is_a_noop_not_a_completion():
+    """The reply reaches the one completion gate (defect (b), 2026-09-02),
+    and the gate judges it on work, not on the expert's reservation (review
+    of aeb5d4831, finding 1): no flow finished, so nothing was earned."""
+    goal = Goal()
+    spec = _Speculator(goal, REAL)
+    tick(goal, spec, progress=None)
+    assert goal.status == 'active'
+    assert 'completed_at' not in goal.config_json
+    assert goal.config_json['noop_dispatch_count'] == 1, \
+        'the reply reached the gate and was judged a noop'
+    assert (goal.spark_spent, budget_gate.held_reservation(GOAL)) == (108, 4), \
+        'the expert still runs and holds its reservation'
+    assert GOAL not in agent_daemon._dispatch_backoff
+    spec.finish()
+    assert goal.spark_spent == 104, 'the expert gave its reservation back'
+
+
+def test_a_real_fast_reply_whose_flow_finished_completes_the_goal():
+    goal = Goal()
+    spec = _Speculator(goal, REAL, work=2)
+    tick(goal, spec, progress=None)
+    assert goal.status == 'completed'
+    assert goal.config_json['completion_grounding'] == 'local_dispatch_spend'
+    spec.finish()
+    assert goal.spark_spent == 106, 'only the completed-work charge stays'
+
+
+def test_a_failed_turn_leaves_nothing_spent_once_the_expert_ends():
+    """Budgets drained 4 spark per failed dispatch until the budget gate
+    paused the goal ('insufficient_budget (0 < 4)', central 10-17)."""
+    goal = Goal()
+    spec = _Speculator(goal, FAILED)
+    tick(goal, spec)
+    spec.finish()
+    assert goal.spark_spent == 104
+    assert budget_gate.held_reservation(GOAL) == 0
+
+
+def test_real_work_after_a_failed_release_still_completes_the_goal():
+    """An expert's release fails, so its 4 spark stay held.  The next tick's
+    turn finishes a flow worth 2 spark.  The snapshot that tick takes must
+    leave the held spark out too, or this dispatch reads as 2 - 4 spark and
+    real work becomes a noop strike (review of e8b6bf675, P3, measured)."""
+    goal = Goal()
+    first = _Speculator(goal, REAL)
+    tick(goal, first, progress=None)
+    assert goal.config_json['noop_dispatch_count'] == 1
+    broken = MagicMock()
+    broken.query.side_effect = RuntimeError('database is locked')
+    assert first.finish(db=broken) == 0
+    assert budget_gate.held_reservation(GOAL) == 4
+
+    # The retry at the start of the next tick finds the database still
+    # locked, so the 4 spark are still held when that tick takes its snapshot.
+    retry = budget_gate.retry_unreleased_reservations
+
+    def retry_while_locked():
+        with patch('integrations.social.models.get_db', return_value=broken):
+            return retry()
+    second = _Speculator(goal, REAL, work=2)
+    tick(goal, second, progress=None,
+         extra=[patch.object(budget_gate, 'retry_unreleased_reservations',
+                             side_effect=retry_while_locked)])
+    assert broken.query.call_count == 2, 'the tick did not retry the parked spark'
+    assert goal.status == 'completed', (
+        f"real work after a failed release was judged a noop: "
+        f"noop={goal.config_json.get('noop_dispatch_count')} "
+        f"spent={goal.spark_spent}")
+    # The second expert's release also retries the first's parked spark.
+    assert second.finish() == 8
+    assert goal.spark_spent == 106
+    assert budget_gate.held_reservation(GOAL) == 0
+
+
+def test_a_dispatch_goal_turn_gives_its_reservation_back_too():
+    """The ordinary path, through the real dispatch_goal: its budget gate
+    reserves before the turn and dispatch_goal gives it back when the turn
+    ends; a reply with no completed work is a noop."""
+    goal = Goal()
+    tick(goal, _Speculator(goal, 'unused'), progress=None, speculative=False,
+         extra=[patch.object(budget_gate, 'estimate_llm_cost_spark',
+                             return_value=4),
+                patch.object(budget_gate, 'check_platform_affordability',
+                             return_value=(True, {})),
+                patch.object(dispatch, 'local_chat_dispatch',
+                             return_value=('ok', REAL)),
+                patch('security.immutable_audit_log.get_audit_log')])
+    assert goal.status == 'active'
+    assert goal.config_json['noop_dispatch_count'] == 1
+    assert goal.spark_spent == 104
+    assert budget_gate.held_reservation(GOAL) == 0
+
+
+class _Model:
+    def __init__(self, model_id, cost):
+        self.model_id = model_id
+        self.cost_per_1k_tokens = cost
+
+
+class _Registry:
+    fast = _Model('fast-local', 0)
+    expert = _Model('claude-expert', 4)
+
+    def get_fast_model(self):
+        return self.fast
+
+    def get_expert_model(self):
+        return self.expert
+
+    def speculation_pair(self):
+        return self.fast, self.expert
+
+    def record_energy(self, *a, **k):
+        pass
+
+    def record_latency(self, *a, **k):
+        pass
+
+    def get_total_energy_kwh(self, hours=0):
+        return 0.0
+
+
+class _Pool:
+    """The expert pool, holding each submitted task until the test runs it."""
+
+    def __init__(self):
+        self.jobs = []
+
+    def submit(self, fn, *a, **k):
+        self.jobs.append((fn, a, k))
+
+    def run(self):
+        for fn, a, k in self.jobs:
+            fn(*a, **k)
+
+
+def test_the_daemon_leaves_a_running_experts_reservation_to_the_expert():
+    """The real SpeculativeDispatcher in the tick.  The daemon gave back every
+    reservation on the goal after the fast turn, the expert's too, so a goal
+    queued experts with nothing on its budget (review of e8b6bf675, Q4)."""
+    from integrations.agent_engine.speculative_dispatcher import (
+        SpeculativeDispatcher)
+    goal = Goal()
+    d = SpeculativeDispatcher(model_registry=_Registry())
+    d._expert_pool.shutdown(wait=False)
+    d._expert_pool = _Pool()
+    tick(goal, d, progress=None,
+         extra=[patch.object(d, '_dispatch_to_model', return_value=REAL),
+                patch.object(d, '_track_call_telemetry'),
+                patch.object(d, '_run_collapsed_expert_path')])
+    assert len(d._expert_pool.jobs) == 1, 'the expert was scheduled'
+    assert (goal.spark_spent, budget_gate.held_reservation(GOAL)) == (108, 4), \
+        "the daemon gave back a reservation the expert still holds"
+    assert goal.config_json['noop_dispatch_count'] == 1, \
+        "the expert's reservation was read as work"
+    with patch('integrations.social.models.get_db',
+               return_value=_row_db(goal)):
+        d._expert_pool.run()
+    assert goal.spark_spent == 104
+    assert budget_gate.held_reservation(GOAL) == 0
+
+
+def test_parked_spark_is_retried_so_a_waiting_goal_dispatches_again():
+    """A failed release parks its spark for the goal's next release, but a
+    goal short only of held spark waits and makes no release of its own:
+    without the retry at the start of the tick it waited for good (review
+    of 25d31fc1d, item 5)."""
+    goal = Goal(spark=100)
+    goal.spark_budget = 116
+    with patch('integrations.social.models.get_db',
+               return_value=_row_db(goal)):
+        budget_gate.check_goal_budget(GOAL, 4, holder='expert:old')
+    broken = MagicMock()
+    broken.query.side_effect = RuntimeError('database is locked')
+    with patch('integrations.social.models.get_db', return_value=broken):
+        budget_gate.release_goal_reservations(GOAL, holder='expert:old')
+    assert (goal.spark_spent, budget_gate.held_reservation(GOAL)) == (104, 4)
+
+    spec = _Speculator(goal, REAL)
+    tick(goal, spec, progress=None,
+         extra=[patch('integrations.agent_engine.budget_gate.'
+                      'estimate_llm_cost_spark', return_value=16)])
+    assert spec.calls == 1, 'the goal waited on spark nobody would give back'
+    assert goal.status == 'active'
+    spec.finish()
+    assert goal.spark_spent == 100
+    assert budget_gate.held_reservation(GOAL) == 0
+
+
+def test_a_running_experts_reservation_does_not_pause_the_goal():
+    """The read-only budget pre-check compared the budget with spark_spent
+    including a running expert's reservation and paused the goal ('12 < 16')
+    though 16 was left once the expert gave its 4 back; a pause needs a
+    person to lift (review of 4bb3bbae0, finding 4, measured).  The goal
+    waits a tick instead and dispatches once the expert ends."""
+    from integrations.agent_engine.speculative_dispatcher import (
+        SpeculativeDispatcher)
+    goal = Goal(spark=100)
+    goal.spark_budget = 116
+    d = SpeculativeDispatcher(model_registry=_Registry())
+    d._expert_pool.shutdown(wait=False)
+    d._expert_pool = _Pool()
+    extra = [patch.object(d, '_dispatch_to_model', return_value=REAL),
+             patch.object(d, '_track_call_telemetry'),
+             patch.object(d, '_run_collapsed_expert_path'),
+             patch('integrations.agent_engine.budget_gate.'
+                   'estimate_llm_cost_spark', return_value=16)]
+    tick(goal, d, progress=None, extra=extra)
+    assert len(d._expert_pool.jobs) == 1
+    assert budget_gate.held_reservation(GOAL) == 4
+
+    tick(goal, d, progress=None, extra=extra)
+    assert goal.status == 'active', \
+        f"paused on a running expert's reservation: " \
+        f"{goal.config_json.get('pause_reason')}"
+    assert 'pause_reason' not in goal.config_json
+    assert len(d._expert_pool.jobs) == 1, 'no second turn while it waits'
+    assert GOAL not in agent_daemon._dispatch_backoff, \
+        'a goal waiting on its expert took a dispatch-failure strike'
+
+    with patch('integrations.social.models.get_db',
+               return_value=_row_db(goal)):
+        d._expert_pool.run()
+    d._expert_pool.jobs.clear()
+    tick(goal, d, progress=None, extra=extra)
+    assert len(d._expert_pool.jobs) == 1, \
+        'the goal dispatches again once the expert gave its spark back'
+
+
+# ── Separate sessions over one database ────────────────────────────────────
+
+
+@pytest.fixture
+def sessions(tmp_path):
+    """Separate sessions over one SQLite file, as get_db gives them in
+    production.  The row the tick loads and the row the expert's release
+    writes are different objects here, so the tick's row stays as it was
+    when the expert's own session writes, which the shared stand-in row
+    above cannot show."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from integrations.social.models import Base
+    engine = create_engine(f"sqlite:///{tmp_path / 'goals.db'}",
+                           connect_args={'check_same_thread': False})
+    Base.metadata.create_all(engine)
+    yield sessionmaker(bind=engine, expire_on_commit=False)
+    engine.dispose()
+
+
+def _seed_goal(sessions, spent, budget):
+    from integrations.social.models import AgentGoal
+    s = sessions()
+    s.add(AgentGoal(id=GOAL, goal_type='marketing', title='Growth Analytics',
+                    description='', status='active', spark_budget=budget,
+                    spark_spent=spent,
+                    config_json={'bootstrap_slug': 'bootstrap_growth_analytics'}))
+    s.commit()
+    s.close()
+
+
+def _goal_row(sessions):
+    """The goal as committed now, read in a session of its own."""
+    from integrations.social.models import AgentGoal
+    s = sessions()
+    try:
+        return s.query(AgentGoal).filter_by(id=GOAL).one()
+    finally:
+        s.close()
+
+
+def _real_dispatcher():
+    from integrations.agent_engine.speculative_dispatcher import (
+        SpeculativeDispatcher)
+    d = SpeculativeDispatcher(model_registry=_Registry())
+    d._expert_pool.shutdown(wait=False)
+    d._expert_pool = _Pool()
+    return d
+
+
+def _expert_ends(d):
+    d._expert_pool.run()
+    d._expert_pool.jobs.clear()
+
+
+def _tick_on_the_database(sessions, d, fast, during=None):
+    """One real tick, every get_db a new session.  ``during`` runs once the
+    tick has loaded its goals and before their budget pre-check: the tick
+    reads its idle personas in between."""
+    def idle(db):
+        if during:
+            during()
+        return [{'user_id': 'agent-1', 'username': 'a1'}]
+    tick(Goal(), d, progress=None, extra=[
+        patch('integrations.social.models.get_db', side_effect=sessions),
+        patch('integrations.coding_agent.idle_detection.IdleDetectionService.'
+              'get_idle_agent_personas', side_effect=idle),
+        patch.object(AgentDaemon, '_trends_tick'),
+        patch.object(d, '_dispatch_to_model', side_effect=fast),
+        patch.object(d, '_track_call_telemetry'),
+        patch.object(d, '_run_collapsed_expert_path'),
+        patch('integrations.agent_engine.budget_gate.estimate_llm_cost_spark',
+              return_value=16)])
+
+
+def test_an_expert_that_ends_inside_the_tick_does_not_pause_the_goal(sessions):
+    """The tick loads every goal when it starts.  An expert that gave its 4
+    spark back after that, before the goal's budget pre-check, left the
+    loaded row at 104 against an empty ledger: '12 < 16', and the goal was
+    paused with 16 left, which needs a person to lift (review of 8b32e97b6,
+    F1, measured)."""
+    _seed_goal(sessions, spent=100, budget=116)
+    d = _real_dispatcher()
+    turns = []
+
+    def fast(model, prompt, user_id, prompt_id, *a, **k):
+        turns.append(prompt_id)
+        return REAL
+    _tick_on_the_database(sessions, d, fast)
+    assert (_goal_row(sessions).spark_spent,
+            budget_gate.held_reservation(GOAL)) == (104, 4)
+
+    _tick_on_the_database(sessions, d, fast, during=lambda: _expert_ends(d))
+    row = _goal_row(sessions)
+    assert row.status == 'active', (row.config_json or {}).get('pause_reason')
+    assert len(turns) == 2, \
+        'the goal dispatched again once its expert gave its spark back'
+    assert GOAL not in agent_daemon._dispatch_backoff
+
+
+def test_real_work_after_an_expert_ended_inside_the_tick_completes_the_goal(
+        sessions):
+    """The snapshot side of the same stale row: read off it, the snapshot
+    counted the expert's given-back 4 as spent, and the turn's 2 spark of
+    real work settled as a noop (review of 8b32e97b6, F1, measured)."""
+    _seed_goal(sessions, spent=100, budget=300)
+    d = _real_dispatcher()
+    work = {'spark': 0}
+
+    def fast(model, prompt, user_id, prompt_id, *a, **k):
+        if work['spark']:
+            # The flow that finished during the fast turn charges its work.
+            budget_gate.charge_goal_work_completed(prompt_id, work['spark'])
+        return REAL
+    _tick_on_the_database(sessions, d, fast)
+    assert (_goal_row(sessions).config_json or {})['noop_dispatch_count'] == 1
+
+    work['spark'] = 2
+    _tick_on_the_database(sessions, d, fast, during=lambda: _expert_ends(d))
+    row = _goal_row(sessions)
+    cfg = row.config_json or {}
+    assert row.status == 'completed', (
+        f"real work read as a noop: noop={cfg.get('noop_dispatch_count')} "
+        f"snapshot={cfg.get('spark_at_dispatch')} spent={row.spark_spent}")

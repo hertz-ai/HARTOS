@@ -1565,8 +1565,35 @@ def tool_call_names(msg_lists) -> Dict[str, str]:
     return out
 
 
+def action_own_text(action) -> str:
+    """The words one action says: an action dict's own 'action' text, a string
+    as it is, '' for None.  The text action_named_tools reads.
+
+    Never str() of the dict.  A REUSE action is the recipe's whole action
+    dict, whose 'recipe' holds the steps the creator's CREATE run took; read as
+    the action's words, every tool that one run happened to call became a tool
+    the action names, and the gate demanded it of every later run.  Live
+    2026-10-21, agent 54, two new learners: step 1 names get_user_id and
+    get_data_by_key, and the gate also demanded list_books (the creator has
+    books); step 2 says "never through a messaging tool", and the gate
+    demanded send_message_to_user.  Both turns re-steered until they gave up
+    and never reached step 3, the save of the learner's progress.  Of the
+    desktop's 1,098 recipe actions, 600 carry a banked tool their words do not
+    name.  What a step is OFFERED still includes its banked tools
+    (reuse_recipe._reuse_action_tool_names); what it REQUIRES is its words'.
+    """
+    if action is None:
+        return ''
+    if isinstance(action, dict):
+        return str(action.get('action') or '')
+    return str(action)
+
+
 def action_named_tools(agents, action_text):
     """(every tool these agents can SERVE, the ones the action's TEXT names).
+
+    ``action_text`` is the action's words, or the action itself, which
+    action_own_text reads its words from.
 
     The ONE rule for "this action names that tool".  Read by the REUSE
     fabrication gate (reuse_recipe._reuse_fabricated_tools, through
@@ -1627,7 +1654,7 @@ def action_named_tools(agents, action_text):
                 continue
             if _cn:
                 names.add(_cn)
-    text = str(action_text or '').lower()
+    text = action_own_text(action_text).lower()
     referenced = [n for n in names if _text_names_tool(text, n)]
     return names, referenced
 

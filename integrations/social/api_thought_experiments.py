@@ -210,13 +210,16 @@ def vote_experiment(experiment_id):
     if not voter_id:
         return jsonify({'success': False, 'error': 'voter_id required'}), 400
 
-    # Agent or human from the signed-in ACCOUNT, never the body: every agent
+    # Person or not from the signed-in ACCOUNT, never the body: every agent
     # account holds an api_token (UserService.register_agent), passes
     # require_auth, and used to claim 'human' here for full weight and past
-    # "agents cannot vote on security_guardrail".
+    # "agents cannot vote on security_guardrail".  The one person test
+    # (voting_rules.is_person, as the tally): a 'system' account is no person
+    # either (review of 40aaed434, finding 1: it was stored and paid as a
+    # human on security_guardrail, then weighed 0 by the tally).
+    from .voting_rules import is_person
     user = getattr(g, 'user', None)
-    voter_type = ('agent' if getattr(user, 'user_type', None) == 'agent'
-                  else 'human')
+    voter_type = 'human' if is_person(user) else 'agent'
 
     db = get_db()
     try:

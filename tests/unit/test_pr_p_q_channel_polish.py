@@ -218,6 +218,30 @@ class TestDisconnectReconnectChannelTools:
             assert 'reconnected' in out2.lower() or 'reactivated' in out2.lower()
             assert fake_row.is_active is True
 
+    def test_disconnect_toast_body_is_message(self):
+        """The toast's body is `message` (COMPONENT_TYPES['toast']), the field
+        AgentOverlay and the phone draw.  Sent as `text`, the user saw a card
+        titled "Notification" with nothing under it."""
+        from core.platform.registry import get_registry, reset_registry
+        from integrations.agent_engine.liquid_ui_service import (
+            COMPONENT_TYPES, validate_component)
+        fake_row = MagicMock(user_id='42', channel_type='discord', is_active=True)
+        fake_db = MagicMock()
+        fake_db.query.return_value.filter_by.return_value.first.return_value = fake_row
+        lui = MagicMock()
+        reset_registry()
+        get_registry().register('LiquidUIService', lambda: lui)
+        try:
+            with patch('integrations.social.models.get_db', return_value=fake_db):
+                self._get(self._build_tools(), 'disconnect_channel')('discord')
+        finally:
+            reset_registry()
+        toast = lui.agent_ui_update.call_args.args[1]
+        assert toast['type'] == 'toast'
+        assert 'disconnected' in toast['message']
+        assert [i for i in validate_component('toast', toast, COMPONENT_TYPES['toast'])
+                if i['level'] == 'error'] == []
+
     def test_reconnect_when_no_binding_exists_returns_connect_instruction(
         self, monkeypatch,
     ):

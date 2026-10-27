@@ -186,6 +186,28 @@ def is_user_pause(reply) -> bool:
     return reply.strip().startswith(PAUSED_FOR_USER_REPLY_PREFIX)
 
 
+def held_for_another_turn_reply() -> str:
+    """The sentence a turn answers when it did not start because another turn
+    of the same conversation is running on a different model
+    (hartos.helper.bind_agents_to_turn_model, #172).  Written here, beside
+    the predicate that recognises it."""
+    from core.constants import HELD_FOR_ANOTHER_TURN_REPLY_PREFIX
+    return (f"{HELD_FOR_ANOTHER_TURN_REPLY_PREFIX} another turn of this "
+            f"conversation is still running on a different model, so this one "
+            f"did not start; send it again once that turn has answered.")
+
+
+def is_held_for_another_turn(reply) -> bool:
+    """True when ``reply`` is held_for_another_turn_reply: the turn did not
+    run.  Neither a result nor a failure: the daemon keeps the goal (and an
+    escalation to the expert) for its next tick with no strike, and the hive
+    worker defers the task.  Recognised by the prefix in core.constants."""
+    if not isinstance(reply, str):
+        return False
+    from core.constants import HELD_FOR_ANOTHER_TURN_REPLY_PREFIX
+    return reply.strip().startswith(HELD_FOR_ANOTHER_TURN_REPLY_PREFIX)
+
+
 def is_action_error_reply(reply) -> bool:
     """True when ``reply`` is the CREATE pipeline's structured error envelope,
     {"status": "error", "action": ..., "action_id": ..., "message": ...} — the
@@ -254,15 +276,23 @@ _DEFAULT_RECEIPT_TEMPLATE = (
 from core.game_sound_memo import (  # noqa: E402
     GAME_STATE_DURATIONS,
     GAME_STATES,
+    ended_composition,
+    forget_game_state_record,
     game_state_key,
     game_sound_action,
     game_state_match,
     game_state_record,
     game_state_sound,
+    holds_composition,
     record_verdict,
     rejected_take,
     set_game_state_sound,
     set_game_state_sound_at,
+    submit_in_flight,
+    submit_note,
+    take_variant,
+    task_labels,
+    without_submit_note,
 )
 
 
@@ -276,18 +306,6 @@ from core.game_sound_memo import SUBMIT_COOLDOWN_S  # noqa: E402,F401
 #: id exactly as it answers a queued one (hartos-3a F2).  The slowest job
 #: MEASURED on a shared GPU averaged 907 s; twice that is past any real job.
 TASK_STALE_S = 1800
-
-
-def _pending_submit(games, game_id, state, level=None):
-    """When this state's last submit went out with no id learned, else None.
-
-    A record with 'submitted_at' and neither 'url' nor 'task_id' is a submit
-    whose reply timed out.  The ladder ignores it (nothing to play, nothing to
-    poll), so it is read at its own key."""
-    record = game_state_record(games, game_id, state, level)
-    if record.get('url') or record.get('task_id'):
-        return None
-    return record.get('submitted_at')
 
 
 def offer_sound_for_review(user_id, prompt_id, game_id, state, record):
@@ -406,35 +424,48 @@ def answer_game_sound_card(agent_id, action, approved, reason, approver_id):
     and the agent's take stays as it is for everyone else (owner
     2026-10-17).  The verdict itself is core.game_sound_memo.record_verdict,
     as for the agent's own approve_game_sound.  Returns (body, status).
+
+    The card is answered outside any chat turn, so it reads and writes the
+    store files directly (core.cache_loaders, atomic) and then has every
+    pipeline cache drop its copy: a live session still holding the old
+    store kept serving it and wrote it back over this verdict on its next
+    save (review of c48e90601, F2).
     """
+    from core.cache_loaders import (
+        forget_cached_store, load_agent_data, save_agent_data)
     from core.game_sound_memo import parse_game_sound_action, record_verdict
-    from hartos.helper import load_agent_data_from_file, save_agent_data_to_file
     verdict = 'approved' if approved else 'rejected'
     if not approver_id:
+        from integrations.social.auth import log_refused_credential
+        log_refused_credential()
         return {'status': 'error', 'action': action, 'applied': False,
                 'reason': 'sign in to answer this'}, 401
     game_id, state = parse_game_sound_action(action)
     pid = int(agent_id)
-    data = {}
-    load_agent_data_from_file(pid, data)
-    games = data.setdefault(pid, {}).setdefault('games', {})
+    agent_store = load_agent_data(pid) or {}
+    games = agent_store.setdefault('games', {})
     for_everyone = is_agent_creator(approver_id, pid)
     if for_everyone:
-        store_id = pid
+        store_id, store = pid, agent_store
         record, matched, key = record_verdict(
             games, game_id, state, approved, reason)
     else:
         store_id = person_store_for(approver_id, pid)
-        load_agent_data_from_file(store_id, data)
-        own = data.setdefault(store_id, {}).setdefault('games', {})
+        store = load_agent_data(store_id) or {}
         record, matched, key = record_verdict(
-            games, game_id, state, approved, reason, own=own)
-    if record:
-        save_agent_data_to_file(store_id, data)
+            games, game_id, state, approved, reason,
+            own=store.setdefault('games', {}))
+    saved = bool(record) and save_agent_data(store_id, store)
+    if saved:
+        forget_cached_store(store_id)
+    elif record:
+        tool_logger.warning(
+            f'game sound card: agent={agent_id} {verdict} {game_id}/{state} '
+            f'was not saved; nothing changed')
     tool_logger.info(
         f'game sound card: agent={agent_id} {verdict} {game_id}/{state} at '
         f'memo {key} for {"everyone" if for_everyone else "the answerer only"}')
-    return {'status': verdict, 'action': action, 'applied': bool(record),
+    return {'status': verdict, 'action': action, 'applied': saved,
             'key': key, 'matched': matched,
             'scope': 'agent' if for_everyone else 'mine'}, 200
 
@@ -770,40 +801,124 @@ def build_core_tool_closures(ctx):
         if which not in GAME_STATES:
             return (f"{which} is not one of a game's states. Use one of: "
                     f"{', '.join(sorted(GAME_STATES))}.")
-        agent_games = agent_data.setdefault(prompt_id, {}).setdefault('games', {})
-        own_games = _own_store().setdefault('games', {})
-        if str(scope or 'agent').strip() == 'mine':
+        mine_only = str(scope or 'agent').strip() == 'mine'
+        for_agent = not mine_only and _is_creator()
+
+        def _games(own):
+            """The person's own memo, or the agent's, looked up at each use:
+            a card answered meanwhile drops the cached store, and a dict held
+            from the start was an orphan (review of fafa03c40, R1)."""
+            store = _own_store() if own else agent_data.setdefault(prompt_id, {})
+            return store.setdefault('games', {})
+
+        def _lookup(own_only=mine_only):
+            """What this person's call finds: the creator reads the agent's
+            memo alone, anyone else their own first.  Made again before any
+            write (_chosen_meanwhile)."""
+            return game_state_sound(
+                _games(False), slot, which, level,
+                own=None if for_agent else _games(True), own_only=own_only)
+
+        bound, matched = _lookup()
+        if mine_only:
             personal = True
-            bound, matched = game_state_sound(
-                agent_games, slot, which, level, own=own_games, own_only=True)
-        elif _is_creator():
+        elif for_agent:
             personal = False
-            bound, matched = game_state_sound(agent_games, slot, which, level)
         else:
             # Composed once, replayed for everyone: an empty slot is filled
             # in the agent's memo by whoever reaches it first.  A choice is
             # the person's own: once they have turned the agent's take down,
             # their next take is composed for them alone, and the agent's
             # stays for everyone else (owner 2026-10-17).
-            bound, matched = game_state_sound(
-                agent_games, slot, which, level, own=own_games)
             personal = not bound.get('url') and bool(
-                game_state_record(own_games, slot, which, level)
-                or game_state_record(own_games, slot, which))
+                game_state_record(_games(True), slot, which, level)
+                or game_state_record(_games(True), slot, which))
             if personal:
-                bound, matched = game_state_sound(
-                    agent_games, slot, which, level, own=own_games, own_only=True)
-        games = own_games if personal else agent_games
+                bound, matched = _lookup(own_only=True)
         store_id = own_key if personal else prompt_id
-        if bound.get('url'):
+
+        def _memo():
+            """The memo this call writes."""
+            return _games(personal)
+
+        def _already_bound(record, matched, note=None):
+            """The answer for a state that has its take."""
             return json.dumps({
                 'status': 'already_bound',
                 'game_id': slot,
                 'state': which,
                 'matched': matched,
-                'music': bound,
-                'note': f'This game already has its {which}; it is never composed twice.',
+                'music': record,
+                'note': note or f'This game already has its {which}; it is never composed twice.',
             })
+
+        def _chosen_meanwhile():
+            """A take that landed here while this call composed ("Keep it" on
+            a card, another turn filling the slot), and what matched, else
+            ({}, None).  Nothing this call holds is written over it: not its
+            finished take (review of 4528e339d, F-1), task or submit (review
+            of 0c542e278, F-A).  Asked of the call's own lookup (F-B), then of
+            the key it writes, where a take this person turned down still
+            holds the agent's slot for everyone else ('miss' for them)."""
+            found, matched = _lookup()
+            if found.get('url'):
+                return found, matched
+            here = game_state_record(_memo(), slot, which, level)
+            return (here, 'miss') if here.get('url') else ({}, None)
+
+        def _not_over(landed, matched, what):
+            """The answer when ``what`` of this call's is not written over
+            the take that landed meanwhile, and the log line that says so."""
+            tool_logger.info(
+                f'bind_game_sound {slot}/{which}: a take landed while this one '
+                f'composed; {what} is not bound over it')
+            if matched == 'miss':
+                note = (f"The {which} chosen meanwhile is one this person turned "
+                        f"down; call again to compose one of their own.")
+            else:
+                note = f'A {which} was chosen while this one composed; that one stays.'
+            return _already_bound(landed, matched, note)
+
+        def _still_ours(field, value):
+            """Whether this call's composition is still the one at its key:
+            its submit note (``submitted_at``) or its task (``task_id``).  A
+            keep made meanwhile ended it there (record_verdict, the one rule
+            for what a keep ends) and a take landing at the key replaced it,
+            so nothing more of it is written (review of bc7bbf721, F-D1)."""
+            return holds_composition(
+                game_state_record(_memo(), slot, which, level), field, value)
+
+        def _drop_note(note):
+            """Clear this call's submit note when the submit left no
+            composition behind it, so the key does not read 'composing' for
+            SUBMIT_COOLDOWN_S after a refusal (without_submit_note)."""
+            here = game_state_record(_memo(), slot, which, level)
+            cleared = without_submit_note(here, note)
+            if cleared == here:
+                return
+            if cleared:
+                _remember(cleared)
+            else:
+                forget_game_state_record(_memo(), slot, which, level)
+                _persist()
+
+        def _ended(what):
+            """The answer when a choice made while this call composed ended its
+            composition, and none of the takes it covers is one this person
+            hears: ``what`` of this call's is not bound."""
+            tool_logger.info(
+                f'bind_game_sound {slot}/{which}: a choice made while this one '
+                f'composed ended it; {what} is not bound')
+            return json.dumps({
+                'status': 'not_bound',
+                'game_id': slot,
+                'state': which,
+                'note': (f'A {which} was chosen while this one composed, so this '
+                         f'one is not bound; call again to compose one.'),
+            })
+
+        if bound.get('url'):
+            return _already_bound(bound, matched)
         # NO early return for a composition already under way.  It used to
         # return here saying "call again with the same arguments to finish
         # it" -- and calling again hit this same branch and said it again,
@@ -815,12 +930,15 @@ def build_core_tool_closures(ctx):
         # could not keep.  Falling through IS the dedupe: an existing
         # task_id means poll it, never start a second composition.
 
-        def _remember(record):
-            set_game_state_sound(games, slot, which, record, level)
+        def _persist():
             try:
                 helper_fun.save_agent_data_to_file(store_id, agent_data)
             except Exception as e:
                 tool_logger.warning(f'bind_game_sound could not persist: {e}')
+
+        def _remember(record):
+            record = set_game_state_sound(_memo(), slot, which, record, level)
+            _persist()
             return record
 
         def _offer(record):
@@ -930,44 +1048,64 @@ def build_core_tool_closures(ctx):
             what=description or slot, mood=mood)
         # A take the reviewer rejected is composed again WITH the reason
         # they gave, and kept as the next variant (spec §6.1).
-        rejected = rejected_take(games, slot, which, level)
-        variant = int(rejected.get('variant') or 1) + 1 if rejected else 1
+        rejected = rejected_take(_memo(), slot, which, level)
+        variant = take_variant(rejected) + 1 if rejected else 1
         if rejected.get('rejected_reason'):
             prompt = f"{prompt}. Not like the last one: {rejected['rejected_reason']}"
-        # Carried forward, because the new take REPLACES the rejected one at
-        # this key: without this the previous audio would survive exactly
-        # until the next composition and then vanish.
-        previous_takes = list(rejected.get('previous_takes') or [])
-        if rejected.get('rejected_url'):
-            previous_takes.append({
-                'url': rejected['rejected_url'],
-                'variant': int(rejected.get('variant') or 1),
-                'rejected_reason': rejected.get('rejected_reason') or '',
-                'rejected_at': rejected.get('rejected_at'),
-            })
+        # The takes turned down before this one are carried by the memo's
+        # setters (set_game_state_sound), not built here: every record this
+        # call writes REPLACES the one at this key, and the setter carries
+        # that record's history forward, on a resumed take too, where a list
+        # built from `rejected` at the start was empty (review of
+        # ed6576624, F3).
         task_id = bound.get('task_id')
+        labels = {'mood': mood, 'prompt': prompt, 'variant': variant}
+        resumed = task_labels(bound) if task_id else {}
+
+        def _take(**fields):
+            """This call's take as a record, ``fields`` on top; a task picked up
+            again keeps what it was composed with (task_take; c67afc26e, F-1)."""
+            return {**labels, 'state': which, 'level': level or None,
+                    'composed_at': None, 'approved_at': None, **resumed, **fields}
+
+        def _bind_finished(url, ours):
+            """Bind a finished take, unless a take landed at this state while
+            it composed (_chosen_meanwhile) or a choice ended its composition
+            (``ours()`` is False, _still_ours)."""
+            landed, matched = _chosen_meanwhile()
+            if landed.get('url') == url and matched != 'miss':
+                # Another call polling the same task bound it first: nothing
+                # to write, and no second card (review of 0c542e278, F-C).
+                return _already_bound(landed, matched)
+            if landed:
+                # Its job stays behind that take, to be bound if it is turned
+                # down, as between calls; a keep ended it (review of 5feeee2b8, F1).
+                return _not_over(landed, matched, url)
+            if not ours():
+                # A keep this person does not hear ended it: the visitor
+                # turned the creator's kept take down while their job filled
+                # the agent's slot, and it was bound there over the keep
+                # (found reworking bc7bbf721).
+                return _ended(url)
+            record = _offer(_remember(_take(url=url, composed_at=time.time())))
+            return json.dumps({'status': 'bound', 'game_id': slot,
+                               'state': which, 'music': record})
 
         def _forget_task(reason):
             """Drop a task the composer will never finish, keep the rest.
 
             hartos-3a F2: nothing ever cleared a dead task_id, so after a
             composer restart this state answered "composing" for good, and
-            after a failure it answered "failed" for good; it could never be
-            composed again.  The rejection history and variant stay.
-            """
-            kept = {k: v for k, v in game_state_record(
-                        games, slot, which, level).items()
-                    if k not in ('task_id', 'task_since', 'submitted_at')}
-            kept['lost_task'] = {'task_id': task_id, 'reason': reason,
-                                 'at': time.time()}
-            _remember(kept)
+            after a failure "failed" for good.  History and variant stay."""
+            _remember(ended_composition(
+                game_state_record(_memo(), slot, which, level), reason, task_id))
 
         # A record from before task_since existed has no age to judge; it is
         # polled as before rather than composed a second time.
         if (task_id and bound.get('task_since')
                 and time.time() - float(bound['task_since']) > TASK_STALE_S):
             _forget_task('no answer within TASK_STALE_S')
-            task_id = None
+            task_id, resumed = None, {}
         try:
             if not task_id:
                 # A submit whose RESPONSE timed out may still have been
@@ -980,82 +1118,108 @@ def build_core_tool_closures(ctx):
                 # own orphans.  /release_task takes no idempotency key, so
                 # the only dedupe is here: after a timed-out submit, do not
                 # submit again for this state until a cooldown has passed.
-                _pending = _pending_submit(games, slot, which, level)
-                if _pending and time.time() - _pending < SUBMIT_COOLDOWN_S:
+                # One reading of it, the memo's, guarded (review of 14c6bbd5f, F-C).
+                pending = game_state_record(_memo(), slot, which, level)
+                if not pending.get('task_id') and submit_in_flight(pending):
+                    # Another call's submit for this key is out, or one whose
+                    # reply timed out may be queued: wait for it, and say what.
+                    waited = int(max(0.0, time.time() - float(pending['submitted_at'])))
                     return json.dumps({
                         'status': 'composing',
                         'game_id': slot,
                         'state': which,
-                        'note': ("A submission for this state may already be "
-                                 "in the composer's queue (the last one was "
-                                 "accepted but its reply timed out); waiting "
-                                 "for it rather than queueing a second."),
+                        'level': level or None,
+                        'note': (f"The {which} for {slot}"
+                                 f"{f' level {level}' if level else ''} is being "
+                                 f"composed: a submission went out {waited} s ago "
+                                 f"and may be in the composer's queue. Waiting "
+                                 f"for it rather than queueing a second."),
                     })
-                started = json.loads(generate_media(
-                    context=prompt,
-                    output_modality='audio_music',
-                    input_text=prompt,
-                    # per state: a chime is two seconds, a loop is thirty (spec 3).
-                    duration=GAME_STATE_DURATIONS.get(which, 30),
-                    style=mood,
-                ))
-                if started.get('status') == 'completed':
-                    results = started.get('results') or []
-                    url = results[0].get('url') if results else None
-                    if url:
-                        record = _offer(_remember({'url': url, 'mood': mood,
-                                            'prompt': prompt, 'state': which,
-                                            'level': level or None,
-                                            'variant': variant,
-                                            'previous_takes': previous_takes,
-                                            'composed_at': time.time(),
-                                            'approved_at': None}))
-                        return json.dumps({'status': 'bound', 'game_id': slot,
-                                           'state': which, 'music': record})
-                    return "The composer answered without any music; nothing bound."
-                if started.get('status') == 'warming_up':
-                    # Not a refusal: the composer is getting ready, which on
-                    # a first run means downloading its model.  Saying it
-                    # refused would be wrong AND would leave the game with
-                    # nothing pending to come back to.  And the POST may have
-                    # been accepted: remember WHEN it went out, so the next
-                    # call waits instead of queueing a duplicate.  Written ON
-                    # TOP of what this key already holds: a take the reviewer
-                    # turned down keeps its rejected_url, its reason and its
-                    # variant, so the next call still answers them.  MEASURED
-                    # 2026-09-22 (hartos-14): replacing the record here erased
-                    # all three -- on a node restarted overnight, which is
-                    # exactly when a rejection is waiting.
-                    _remember({'mood': mood, 'prompt': prompt, 'state': which,
-                               'level': level or None, 'variant': variant,
-                               'composed_at': None, 'approved_at': None,
-                               **game_state_record(games, slot, which, level),
-                               'submitted_at': time.time()})
-                    return json.dumps({
-                        'status': 'composing',
-                        'game_id': slot,
-                        'state': which,
-                        'note': started.get(
-                            'message',
-                            'The composer is starting up; ask again shortly.'),
-                    })
-                if started.get('status') != 'pending':
-                    why = str(started.get('error', 'unknown reason'))
-                    if _no_composer_here(started):
-                        return _ask_for_a_composer(why)
-                    if _composer_not_up(started):
-                        return (f"The composer is installed but not running "
-                                f"right now ({why}). Nothing was started; ask "
-                                f"again in a while by calling bind_game_sound "
-                                f"with the same game_id and state.")
-                    return f"The composer refused this game's music: {why}"
-                task_id = started.get('task_id')
-                _remember({'task_id': task_id, 'task_since': time.time(),
-                           'mood': mood, 'prompt': prompt,
-                           'state': which, 'level': level or None,
-                           'variant': variant,
-                           'previous_takes': previous_takes,
-                           'composed_at': None, 'approved_at': None})
+                # The note goes in BEFORE the submit (submit_note): a keep made
+                # while it waits ends it in record_verdict, as it ends any job,
+                # and every write below asks _still_ours first (review of
+                # bc7bbf721).  A note the submit left no composition behind is
+                # cleared on the one way out (finally).
+                noted, note = submit_note(pending, labels)
+                _remember(noted)
+                started = {}
+                try:
+                    started = json.loads(generate_media(
+                        context=prompt,
+                        output_modality='audio_music',
+                        input_text=prompt,
+                        # per state: a chime is two seconds, a loop is thirty (spec 3).
+                        duration=GAME_STATE_DURATIONS.get(which, 30),
+                        style=mood,
+                    ))
+                    if started.get('status') == 'completed':
+                        results = started.get('results') or []
+                        url = results[0].get('url') if results else None
+                        if url:
+                            return _bind_finished(
+                                url, lambda: _still_ours('submitted_at', note))
+                        return "The composer answered without any music; nothing bound."
+                    if started.get('status') == 'warming_up':
+                        # Not a refusal: the composer is getting ready, which on
+                        # a first run means downloading its model.  Saying it
+                        # refused would be wrong AND would leave the game with
+                        # nothing pending to come back to.  And the POST may have
+                        # been accepted: the note stays, timed from now, so the
+                        # next call waits instead of queueing a duplicate.  Written
+                        # ON TOP of what this key already holds: a take the
+                        # reviewer turned down keeps its rejected_url, its reason
+                        # and its variant, so the next call still answers them.
+                        # MEASURED 2026-09-22 (hartos-14): replacing the record
+                        # here erased all three -- on a node restarted overnight,
+                        # which is exactly when a rejection is waiting.  Only
+                        # while the composition is still this call's (review of
+                        # 0c542e278, F-A; bc7bbf721, F-D4).
+                        landed, matched = _chosen_meanwhile()
+                        ours = _still_ours('submitted_at', note)
+                        if ours:
+                            _remember({**_take(),
+                                       **game_state_record(_memo(), slot, which, level),
+                                       'submitted_at': time.time()})
+                        if landed:
+                            return _not_over(landed, matched, 'a submit still queued')
+                        if not ours:
+                            return _ended('a submit still queued')
+                        return json.dumps({
+                            'status': 'composing',
+                            'game_id': slot,
+                            'state': which,
+                            'note': started.get(
+                                'message',
+                                'The composer is starting up; ask again shortly.'),
+                        })
+                    if started.get('status') != 'pending':
+                        why = str(started.get('error', 'unknown reason'))
+                        if _no_composer_here(started):
+                            return _ask_for_a_composer(why)
+                        if _composer_not_up(started):
+                            return (f"The composer is installed but not running "
+                                    f"right now ({why}). Nothing was started; ask "
+                                    f"again in a while by calling bind_game_sound "
+                                    f"with the same game_id and state.")
+                        return f"The composer refused this game's music: {why}"
+                    task_id = started.get('task_id')
+                    # The submit can wait two minutes: the task is written only
+                    # while the composition is still this call's, never over a
+                    # take that landed at its key (review of 0c542e278, F-A)
+                    # nor behind a keep that ended it (bc7bbf721, F-D1, F-D2).
+                    landed, matched = _chosen_meanwhile()
+                    ours = _still_ours('submitted_at', note)
+                    if ours:
+                        _remember(_take(task_id=task_id, task_since=time.time(),
+                                        task_take=labels))
+                    if landed:
+                        return _not_over(landed, matched, f'task {task_id}')
+                    if not ours:
+                        return _ended(f'task {task_id}')
+                finally:
+                    if not (isinstance(started, dict)
+                            and started.get('status') == 'warming_up'):
+                        _drop_note(note)
 
             # Give it a while, then hand the task back rather than block.
             deadline = time.time() + 90
@@ -1069,14 +1233,7 @@ def build_core_tool_closures(ctx):
                            or (results[0].get('url') if results else None))
                     if not url:
                         return "The composer finished without any music; nothing bound."
-                    record = _offer(_remember({'url': url, 'mood': mood, 'prompt': prompt,
-                                        'state': which, 'level': level or None,
-                                        'variant': variant,
-                                        'previous_takes': previous_takes,
-                                        'composed_at': time.time(),
-                                        'approved_at': None}))
-                    return json.dumps({'status': 'bound', 'game_id': slot,
-                                       'state': which, 'music': record})
+                    return _bind_finished(url, lambda: _still_ours('task_id', task_id))
                 if state in MEDIA_FAILED_STATUSES:
                     why = str(progress.get('error', 'unknown reason'))
                     if progress.get('unreachable') and _reads_as_still_waking(why):
@@ -1142,9 +1299,12 @@ def build_core_tool_closures(ctx):
                 'approved': bool(bound.get('approved_at')),
                 'music': bound,
             })
-        if bound.get('task_id'):
+        # A task, or a submit still out (its note is in the memo before the
+        # submit goes, bind_game_sound): both are a composition under way,
+        # which REUSE reads as composing, never as nothing bound.
+        if bound.get('task_id') or submit_in_flight(bound):
             return json.dumps({'status': 'composing', 'game_id': slot,
-                               'state': which, 'task_id': bound['task_id']})
+                               'state': which, 'task_id': bound.get('task_id')})
         return json.dumps({'status': 'unbound', 'game_id': slot, 'state': which,
                            'note': f'No {which} is bound to this game yet.'})
 
@@ -1717,6 +1877,30 @@ def build_core_tool_closures(ctx):
         file_id = recent_file_id.get(user_id)
         if file_id:
             return f'Got user uploaded file the file_id is {file_id}'
+        # Else the clips she sent this agent that no reel has used yet, by
+        # the rule reel_make reads (core.chat_attachments.latest_inbound).
+        # Measured 2026-10-20 (request 8610dffc): her Reel Studio agent 342
+        # called this three times, read "No file uploaded from user" while
+        # the store held her five clips for it, and asked her where they were.
+        from core.chat_attachments import latest_inbound
+        files = latest_inbound(user_id, prompt_id)
+        if files:
+            def _at(seconds):
+                try:        # captured_at is what her phone sent: any int > 0
+                    return datetime.fromtimestamp(seconds).astimezone().isoformat(
+                        timespec='seconds')
+                except (OverflowError, OSError, ValueError):
+                    return None
+            return json.dumps({
+                'count': len(files),
+                'files': [{'file_id': f['xid'], 'name': f['name'], 'mime': f['mime'],
+                           'size': f['size'], 'sent_at': _at(f['created_at']),
+                           'filmed_at': (_at(f['meta']['captured_at'] / 1000)
+                                         if f['meta'].get('captured_at') else None)}
+                          for f in files],
+                'note': ('The files she sent this agent that no reel has used yet, '
+                         'in the order she sent them.'),
+            })
         return 'No file uploaded from user'
 
     tools.append((

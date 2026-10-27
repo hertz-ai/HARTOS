@@ -24,7 +24,10 @@ decided by the callers, which pass the person's memo as ``own``.
 # One vocabulary for every game: the app's own game renderer accepts the
 # same names over its bridge (DynamicGameRenderer ALLOWED_SOUND_EVENTS), so
 # an agent-led sound and a game-led sound are the same sound.
+import logging
 import time
+
+logger = logging.getLogger(__name__)
 
 
 GAME_STATES = {
@@ -81,11 +84,30 @@ assert set(GAME_STATE_DURATIONS) == set(GAME_STATES), (
 SUBMIT_COOLDOWN_S = 600
 
 
-def _submit_in_flight(record):
-    """A submit whose reply timed out, recent enough to still be queued."""
+def submit_in_flight(record):
+    """A submit whose reply timed out, recent enough to still be queued.
+    A time that is not a number is no submit, and says so: it raised out
+    of a keep (review of c67afc26e, F-2).  The one reading of it, for the
+    matcher, a keep and bind_game_sound's cooldown (review of 14c6bbd5f,
+    F-C: bind read the field itself, unguarded)."""
     submitted = record.get('submitted_at')
-    return bool(submitted) and not record.get('url') and (
-        time.time() - float(submitted) < SUBMIT_COOLDOWN_S)
+    if not submitted or record.get('url'):
+        return False
+    try:
+        return time.time() - float(submitted) < SUBMIT_COOLDOWN_S
+    except (TypeError, ValueError):
+        _log_corrupt(('submitted_at', submitted),
+                     "a game sound's submitted_at %r is not a time; read as none",
+                     submitted)
+        return False
+
+
+def _composing(record):
+    """A composition under way at this record, with no take yet: its task,
+    or a submit still inside the cooldown.  The one reading of it, for the
+    matcher's 'composing' and for what a keep ends."""
+    return not record.get('url') and bool(
+        record.get('task_id') or submit_in_flight(record))
 
 
 def game_state_key(state, level=None, variant=None):
@@ -102,6 +124,202 @@ def game_state_key(state, level=None, variant=None):
     if variant not in (None, '', 0, 1):
         key = f'{key}#{variant}'
     return key
+
+
+#: The fields of a composition still under way at a key: the composer's
+#: task, when it was taken, what it was composed with (``task_take``: its
+#: prompt, variant and mood, so the call that finishes it binds it as what
+#: it is), and a submit whose reply timed out.  A verdict over it carries
+#: them all; an ended job drops them all.
+IN_FLIGHT_FIELDS = ('task_id', 'task_since', 'task_take', 'submitted_at')
+
+#: What ``task_take`` names: the only fields a task picked up again lays
+#: over the call's own.
+TASK_LABELS = ('mood', 'prompt', 'variant')
+
+
+def task_labels(record):
+    """What this record's task was composed with, from ``task_take``: its
+    TASK_LABELS only, else {}.  Any other shape reads as none, with a
+    warning, never raised: read before the call's own guard, a raise
+    wedged the key for good, and extra keys overrode the take's state,
+    level and approval (review of 14c6bbd5f, F-A)."""
+    take = (record or {}).get('task_take')
+    if take is None:
+        return {}
+    if not isinstance(take, dict):
+        _log_corrupt(('task_take', take),
+                     "a game sound's task_take %r is not a record; read as none", take)
+        return {}
+    return {field: take[field] for field in TASK_LABELS if field in take}
+
+
+def ended_composition(record, reason, task_id=None):
+    """``record`` with its composition over and the rest kept: the in-flight
+    fields gone, so no lookup joins or resumes it, and the task noted as
+    lost with why.  The composer cannot be asked to stop; its take, if it
+    finishes, is simply not bound.  The one builder of an ended job, for
+    agent_tools' _forget_task and for a keep (record_verdict)."""
+    record = record or {}
+    ended = {k: v for k, v in record.items() if k not in IN_FLIGHT_FIELDS}
+    ended['lost_task'] = {'task_id': task_id or record.get('task_id'),
+                          'reason': reason, 'at': time.time()}
+    return ended
+
+
+def submit_note(record, labels):
+    """``record`` with the note that a submit is going out now, and what it
+    composes (``task_take``), and the note's time, which names it.
+
+    Written at the key BEFORE the submit, so that while the submit waits (up
+    to two minutes) the composition is already in the memo.  The key reads
+    'composing' (_composing): a second call waits for it rather than queue a
+    second job.  A keep ends it the way it ends any job (record_verdict,
+    _end_compositions_under), so what a keep ends is decided in one place,
+    whenever the keep comes (review of bc7bbf721, F-D1, F-D3, F-D6).  A note
+    whose process died lapses with the cooldown (submit_in_flight)."""
+    at = time.time()
+    return {**(record or {}), 'submitted_at': at, 'task_take': dict(labels or {})}, at
+
+
+def holds_composition(record, field, value):
+    """Whether ``record`` still holds the composition named by ``field`` =
+    ``value``: a submit note's ``submitted_at``, or a ``task_id``, with no
+    take yet.  A keep ends it (ended_composition drops both), a take landing
+    at the key replaces it, a rejection carries it (record_verdict)."""
+    record = record or {}
+    # ``is not None``, not truth: a clock that starts at 0.0 (a test's, or a
+    # box whose clock reset) notes a submit at 0.0, and that note is still
+    # this call's.
+    return value is not None and record.get(field) == value and not record.get('url')
+
+
+def without_submit_note(record, at):
+    """``record`` without the submit note ``at`` when it holds that note and
+    nothing came of it, else ``record`` as it is: a submit that left no
+    composition must not leave the key reading 'composing'.  An empty result
+    means the key held nothing before the note (forget_game_state_record)."""
+    record = record or {}
+    if not holds_composition(record, 'submitted_at', at) or record.get('task_id'):
+        return record
+    return {k: v for k, v in record.items() if k not in ('submitted_at', 'task_take')}
+
+
+def forget_game_state_record(games, game_id, state, level=None):
+    """Remove the record at exactly this key: a submit note that left nothing
+    behind, at a key that held nothing before it.  For the game's music, the
+    copy the first version's shape keeps (set_game_state_sound writes both)
+    goes with it only when it is that same record; a take an older memo
+    still holds there stays."""
+    slot = (games or {}).get(str(game_id)) or {}
+    removed = (slot.get('sounds') or {}).pop(game_state_key(state, level), None)
+    if (state == 'bgm' and level in (None, '', 0) and removed is not None
+            and slot.get('music') == removed):
+        slot.pop('music', None)
+
+#: Corrupt values already warned about.  A lookup reads the same record on
+#: every turn, so each is a WARNING once and DEBUG after; at DEBUG alone it
+#: never reached the desktop log (review of 0c542e278, N-1).
+_corrupt_warned = set()
+
+
+def _log_corrupt(value, msg, *args):
+    """Log a corrupt stored value: WARNING the first time, DEBUG after."""
+    token = repr(value)[:200]
+    if token in _corrupt_warned:
+        logger.debug(msg, *args)
+        return
+    if len(_corrupt_warned) >= 1024:
+        _corrupt_warned.clear()
+    _corrupt_warned.add(token)
+    logger.warning(msg, *args)
+
+
+def take_variant(record):
+    """Which take this record is: 1 for the first, counting up with each
+    take composed after a rejection.  A stored value that is not a number
+    (hand-edited or corrupt) reads as 1 rather than raising out of a lookup
+    (review of ed6576624, F2), and says so (review of 4528e339d, F-3)."""
+    value = (record or {}).get('variant') or 1
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        _log_corrupt(('variant', value),
+                     "a game sound's variant %r is not a number; read as 1", value)
+        return 1
+
+
+def _named_takes(takes):
+    """The takes in a stored ``previous_takes`` that name a take: a dict with
+    a url.  Anything else names no take and is skipped, with a log line,
+    never raised (review of ed6576624, F2; 4528e339d, F-3)."""
+    takes = list(takes or ())
+    named = [take for take in takes if isinstance(take, dict) and take.get('url')]
+    if len(named) < len(takes):
+        skipped = [take for take in takes if take not in named]
+        _log_corrupt(('takes', skipped),
+                     '%d past take(s) with no url skipped in a game sound record: %r',
+                     len(skipped), skipped[:3])
+    return named
+
+
+def turned_down_takes(record):
+    """Every take this record holds as turned down, oldest first: the ones
+    it carries in ``previous_takes``, then the one just rejected.  An entry
+    with no url names no take and is skipped.
+
+    The one builder of that list, and the one source of a take's history:
+    every write that replaces a record carries it forward, both setters
+    alike (set_game_state_sound_at, set_game_state_sound)."""
+    record = record or {}
+    takes = [dict(take) for take in _named_takes(record.get('previous_takes'))]
+    if record.get('rejected_url'):
+        takes.append({'url': record['rejected_url'],
+                      'variant': take_variant(record),
+                      'rejected_reason': record.get('rejected_reason') or '',
+                      'rejected_at': record.get('rejected_at')})
+    return takes
+
+
+def _turned_down(sounds, keys):
+    """Every take turned down at these keys of one memo: the one just
+    rejected, and the earlier ones each next take carries forward in
+    ``previous_takes``.  Reading only the last rejection brought the
+    first back: reject the agent's take U, reject your own W, and U played
+    again (review of c48e90601, F1)."""
+    urls = set()
+    for key in keys:
+        urls.update(take.get('url') for take in turned_down_takes(sounds.get(key)))
+    urls.discard(None)
+    return urls
+
+
+def _keeping_turned_down(replaced, record):
+    """``record``, with every take ``replaced`` held as turned down carried
+    into its ``previous_takes``.
+
+    A write at a key replaces the record there, and the takes a person
+    turned down live only in that record.  A take finishing over a verdict
+    given while it composed kept only the takes turned down before the
+    composition began, so the take turned down meanwhile played to them
+    again (measured 2026-10-18 at f572fd775)."""
+    carried = _named_takes(record.get('previous_takes'))
+    known = {take['url'] for take in carried}
+    known.update((record.get('url'), record.get('rejected_url')))
+    extra = []
+    for take in turned_down_takes(replaced):
+        if take['url'] not in known:
+            known.add(take['url'])
+            extra.append(take)
+    if not extra:
+        return record
+    return {**record, 'previous_takes': carried + extra}
+
+
+def _record_at(games, game_id, key):
+    """The record at exactly this memo key, or {}."""
+    slot = (games or {}).get(str(game_id), {})
+    return (slot.get('sounds') or {}).get(key) or {}
 
 
 def game_state_match(games, game_id, state, level=None, *, own=None,
@@ -128,8 +346,7 @@ def game_state_match(games, game_id, state, level=None, *, own=None,
 
     level_key = game_state_key(state, level)
     game_key = game_state_key(state)
-    turned_down = {(mine.get(key) or {}).get('rejected_url')
-                   for key in (level_key, game_key)} - {None}
+    turned_down = _turned_down(mine, (level_key, game_key))
 
     for source, sounds, keys in (
         ('mine', mine, (level_key, game_key)),
@@ -155,7 +372,7 @@ def game_state_match(games, game_id, state, level=None, *, own=None,
         # A task id, OR a submit whose reply timed out and may be queued:
         # the route used to see the second as a miss and queue a duplicate
         # job for bgm, the very thing the cooldown exists to stop (F8).
-        if record.get('task_id') or _submit_in_flight(record):
+        if _composing(record):
             return record, 'composing', level_key
     return {}, 'miss', level_key
 
@@ -183,7 +400,11 @@ def set_game_state_sound_at(games, game_id, key, record):
     'correct@3' while 'correct' -- the take actually sounding -- kept its
     url and went on playing. Composing under the key asked for (spec 4)
     is a different rule for a different path: a miss that composes.
+
+    Every take the replaced record held as turned down is kept
+    (_keeping_turned_down).  Returns the record as stored.
     """
+    record = _keeping_turned_down(_record_at(games, game_id, key), record)
     slot = games.setdefault(str(game_id), {})
     slot.setdefault('sounds', {})[key] = record
     if key == 'bgm' and isinstance(slot.get('music'), dict):
@@ -195,10 +416,14 @@ def set_game_state_sound(games, game_id, state, record, level=None):
     """Memoize a sound under the key that was ASKED for (spec §4).
 
     Not under the key a fallback would have used: the next identical
-    request has to be an exact hit.
+    request has to be an exact hit.  Like set_game_state_sound_at, it keeps
+    every take the replaced record held as turned down, and returns the
+    record as stored.
     """
+    key = game_state_key(state, level)
+    record = _keeping_turned_down(_record_at(games, game_id, key), record)
     slot = games.setdefault(str(game_id), {})
-    slot.setdefault('sounds', {})[game_state_key(state, level)] = record
+    slot.setdefault('sounds', {})[key] = record
     if state == 'bgm' and level in (None, '', 0):
         # the shape the first version wrote, kept so older memos read back
         slot['music'] = record
@@ -269,9 +494,49 @@ def record_verdict(games, game_id, state, approved, reason='',
         record['rejected_at'] = time.time()
         record['rejected_reason'] = (reason or '').strip()
         record['rejected_url'] = record.pop('url', None)
-    set_game_state_sound_at(own if own is not None else games,
-                            game_id, write_key, record)
+    target = own if own is not None else games
+    # A person's verdict on the agent's take lands at the key their own
+    # take may still be composing at.  The verdict does not end that
+    # composition: without its task the next call could not find the job
+    # and queued a second one (measured 2026-10-18 at f572fd775).
+    # Only a rejection keeps it: a take that was KEPT ends the person's own
+    # composition, and carried onto the kept take the job read 'composing'
+    # again once that take was turned down, then resumed a take composed to
+    # answer an older complaint (review of ed6576624, F1).
+    composing = _record_at(target, game_id, write_key)
+    in_flight = {field: composing[field] for field in IN_FLIGHT_FIELDS
+                 if field in composing and not composing.get('url')}
+    if not record.get('url'):
+        record.update(in_flight)
+    elif _composing(composing):
+        # The composer cannot be asked to stop; its take, if it finishes,
+        # is not written over this one (agent_tools bind_game_sound).  A
+        # submit past its cooldown is no composition (review of 0c542e278,
+        # N-3).
+        logger.info('a take kept at %s/%s ends the composition there (%s)',
+                    game_id, write_key,
+                    in_flight.get('task_id') or 'a submit still queued')
+    record = set_game_state_sound_at(target, game_id, write_key, record)
+    if approved and write_key == game_state_key(state):
+        _end_compositions_under(target, game_id, write_key)
     return record, matched, write_key
+
+
+def _end_compositions_under(games, game_id, game_key):
+    """End each level's composition that a take kept at the game's key
+    covers: the ladder answers that take at every level without one of its
+    own.  Ended only while a call was polling it, a level's job read
+    'composing' again once the kept take was turned down, and the next call
+    bound a take made for the older complaint (review of 5feeee2b8, F1)."""
+    sounds = ((games or {}).get(str(game_id)) or {}).get('sounds') or {}
+    for key in [k for k in sounds if str(k).startswith(f'{game_key}@')]:
+        record = sounds.get(key)
+        if isinstance(record, dict) and _composing(record):
+            logger.info('a take kept at %s/%s ends the composition at %s (%s)',
+                        game_id, game_key, key,
+                        record.get('task_id') or 'a submit still queued')
+            set_game_state_sound_at(games, game_id, key, ended_composition(
+                record, f'a take was kept at {game_key}'))
 
 
 def game_state_record(games, game_id, state, level=None):
@@ -279,21 +544,52 @@ def game_state_record(games, game_id, state, level=None):
 
     The one reader of the storage shape for every caller that needs the
     key's own record rather than what the game would play: a take a reviewer
-    turned down (rejected_take), a submit still in flight (agent_tools'
-    _pending_submit), and the note that submit writes, which must land ON
+    turned down (rejected_take), a submit still in flight (bind_game_sound's
+    cooldown), and the note that submit writes, which must land ON
     TOP of whichever of those is already there.  Before this each of them
     carried its own copy of the three lines below, and the copy in
     agent_tools was the fourth reader of a shape this module owns.
     """
-    slot = (games or {}).get(str(game_id), {})
-    return (slot.get('sounds') or {}).get(game_state_key(state, level)) or {}
+    return _record_at(games, game_id, game_state_key(state, level))
+
+
+def _latest_turned_down(record):
+    """The take this record holds as most lately turned down: its own
+    rejection, else, for a record with no take of its own (a job, or one
+    that ended), the last of the takes it carries as turned down."""
+    if record.get('rejected_at'):
+        return record
+    if record.get('url'):
+        return {}
+    takes = turned_down_takes(record)
+    return takes[-1] if takes else {}
+
+
+def _turned_down_when(take):
+    """When ``take`` was turned down, as a number; 0 when unknown."""
+    try:
+        return float(take.get('rejected_at') or 0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def rejected_take(games, game_id, state, level=None):
-    """The take a reviewer turned down for this exact key, if any.
+    """The complaint the next take at this key answers, if any: the newer
+    of the level's and the game's (the level's on a tie), each the take
+    its key holds as most lately turned down.
 
     Kept so the next composition can answer the reason they gave, and so a
-    reviewer can go back to it (spec §6.1).
+    reviewer can go back to it (spec §6.1).  A verdict lands at the key the
+    ladder matched, so a rejection given while a level played is the
+    game's; read at the level's key alone, the level was then composed as
+    take 1 without the reason (review of 0c542e278).  A job written at a
+    key replaces its rejection, carrying it as turned down: read at the top
+    of the record alone, a take composed after that job was lost or failed
+    asked for what was just turned down (review of 14c6bbd5f, F-B).
     """
-    record = game_state_record(games, game_id, state, level)
-    return record if record.get('rejected_at') else {}
+    found = {}
+    for key in dict.fromkeys((game_state_key(state, level), game_state_key(state))):
+        take = _latest_turned_down(_record_at(games, game_id, key))
+        if take and (not found or _turned_down_when(take) > _turned_down_when(found)):
+            found = take
+    return found

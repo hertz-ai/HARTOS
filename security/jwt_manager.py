@@ -319,6 +319,17 @@ class JWTManager:
         if not HAS_JWT:
             return None
 
+        # A token with fewer than three segments is not a JWT; an opaque
+        # cloud token has one, and the caller looks it up as an api_token
+        # next.  PyJWT refuses every such token with "Not enough segments"
+        # before it reads anything else, which reached the except below: the
+        # same None, plus a warning.  On a desktop signed in with one that was
+        # 829-840 warnings an hour (Nunba gui_app.log, 2026-10-20/21).  The
+        # test is PyJWT's own: the token's utf-8 bytes hold fewer than two
+        # dots.
+        if isinstance(token, str) and token.encode('utf-8').count(b'.') < 2:
+            return None
+
         try:
             payload = pyjwt.decode(
                 token, self._secret_key, algorithms=['HS256']

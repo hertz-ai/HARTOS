@@ -7,14 +7,18 @@ TestDecidePayment.  The Mock gateway alone is the no-payment-keys case.
 """
 import json
 import logging
+import time
 from unittest.mock import patch
 
 import pytest
 
 from integrations.ap2.ap2_mandate import (
-    MandateError, MandateStore, canonical_cart_hash,
+    MandateError, MandateKeyError, MandateStore, _load_or_create_key,
+    canonical_cart_hash,
 )
-from integrations.ap2.ap2_protocol import PaymentGateway, PaymentLedger, PaymentStatus
+from integrations.ap2.ap2_protocol import (
+    MONEY_TAKEN, PaymentGateway, PaymentLedger, PaymentStatus,
+)
 from tests.unit.ap2_doubles import CardRailDouble
 
 CART = {
@@ -231,6 +235,408 @@ class TestVerifyForCheckout:
         assert not ok and 'consumed' in reason
 
 
+class TestOrderRef:
+    def test_a_record_written_before_order_ref_existed_still_verifies(self, store, tmp_path):
+        m = store.create_cart_mandate('u1', 'mcgroce', CART)
+        raw = json.loads((tmp_path / 'ap2_mandates.json').read_text())
+        rec = raw['mandates'][m.mandate_id]
+        rec.pop('order_ref')                  # as an older build wrote it
+        (tmp_path / 'ap2_mandates.json').write_text(json.dumps(raw))
+        reloaded = MandateStore(path=str(tmp_path / 'ap2_mandates.json'),
+                                ledger=store.ledger, key=b'k' * 32)
+        assert reloaded.approve(m.mandate_id, 'u1') == (True, 'approved')
+
+    def test_the_order_is_recorded_once_and_only_on_a_consumed_mandate(self, store):
+        m = store.create_cart_mandate('u1', 'mcgroce', CART)
+        store.approve(m.mandate_id, 'u1')
+        assert store.record_order(m.mandate_id, 'ORD-1') is False   # not paid yet
+        store.consume(m.mandate_id)
+        assert store.record_order(m.mandate_id, 'ORD-1') is True
+        assert store.record_order(m.mandate_id, 'ORD-2') is False
+        assert store.get(m.mandate_id).order_ref == 'ORD-1'
+
+    def test_an_unanswered_order_call_is_marked_once_on_a_consumed_mandate(self, store):
+        # The mark outlives the attempt: a later hold for this mandate says
+        # "could not confirm" until McGroce answers with the order.
+        m = store.create_cart_mandate('u1', 'mcgroce', CART)
+        store.approve(m.mandate_id, 'u1')
+        assert store.record_order_sent(m.mandate_id) is False      # not paid yet
+        store.consume(m.mandate_id)
+        assert store.get(m.mandate_id).order_sent is None
+        before = time.time()
+        assert store.record_order_sent(m.mandate_id) is True
+        first = store.get(m.mandate_id).order_sent
+        assert first is not None and first >= before
+        assert store.record_order_sent(m.mandate_id) is False      # the first time stands
+        assert store.get(m.mandate_id).order_sent == first
+        # Signed with the record: it survives a reload, and the order is
+        # still recorded on top of it.
+        reloaded = MandateStore(path=store.path, ledger=store.ledger, key=b'k' * 32)
+        assert reloaded.get(m.mandate_id).order_sent == first
+        assert reloaded.record_order(m.mandate_id, 'ORD-1') is True
+
+    def test_a_record_written_before_order_sent_existed_still_verifies(self, store, tmp_path):
+        m = store.create_cart_mandate('u1', 'mcgroce', CART)
+        raw = json.loads((tmp_path / 'ap2_mandates.json').read_text())
+        rec = raw['mandates'][m.mandate_id]
+        rec.pop('order_sent')                 # as the build before the mark wrote it
+        (tmp_path / 'ap2_mandates.json').write_text(json.dumps(raw))
+        reloaded = MandateStore(path=str(tmp_path / 'ap2_mandates.json'),
+                                ledger=store.ledger, key=b'k' * 32)
+        assert reloaded.approve(m.mandate_id, 'u1') == (True, 'approved')
+
+    def test_a_mark_erased_outside_the_store_fails_the_signature(self, store, tmp_path):
+        m = store.create_cart_mandate('u1', 'mcgroce', CART)
+        store.approve(m.mandate_id, 'u1')
+        store.consume(m.mandate_id)
+        store.record_order_sent(m.mandate_id)
+        raw = json.loads((tmp_path / 'ap2_mandates.json').read_text())
+        raw['mandates'][m.mandate_id]['order_sent'] = None
+        (tmp_path / 'ap2_mandates.json').write_text(json.dumps(raw))
+        reloaded = MandateStore(path=str(tmp_path / 'ap2_mandates.json'),
+                                ledger=store.ledger, key=b'k' * 32)
+        assert reloaded.record_order(m.mandate_id, 'ORD-1') is False   # not intact
+
+    def test_an_edited_record_is_never_re_signed(self, store, tmp_path):
+        m = store.create_cart_mandate('u1', 'mcgroce', CART)
+        store.approve(m.mandate_id, 'u1')
+        raw = json.loads((tmp_path / 'ap2_mandates.json').read_text())
+        raw['mandates'][m.mandate_id]['amount'] = '960.00'
+        (tmp_path / 'ap2_mandates.json').write_text(json.dumps(raw))
+        edited = MandateStore(path=str(tmp_path / 'ap2_mandates.json'),
+                              ledger=store.ledger, key=b'k' * 32)
+        assert edited.consume(m.mandate_id) is False
+        assert edited.get(m.mandate_id).status == 'approved'
+
+    def test_an_edited_record_is_not_re_signed_when_it_expires(self, store, tmp_path):
+        m = store.create_cart_mandate('u1', 'mcgroce', CART)
+        raw = json.loads((tmp_path / 'ap2_mandates.json').read_text())
+        raw['mandates'][m.mandate_id]['description'] = 'something else'
+        (tmp_path / 'ap2_mandates.json').write_text(json.dumps(raw))
+        edited = MandateStore(path=str(tmp_path / 'ap2_mandates.json'),
+                              ledger=store.ledger, key=b'k' * 32)
+        with patch('integrations.ap2.ap2_mandate.time.time',
+                   return_value=m.expires_at + 1):
+            assert edited.get(m.mandate_id).status == 'expired'
+            assert edited.approve(m.mandate_id, 'u1') == (
+                False, 'mandate signature invalid')
+
+    def test_paid_as_signed_needs_an_intact_record_and_the_exact_payment(self, store):
+        from decimal import Decimal
+        m = store.create_cart_mandate('u1', 'mcgroce', CART)
+        store.approve(m.mandate_id, 'u1')
+        payment = store.ledger.get_payment(m.payment_id)
+        assert store.paid_as_signed(m, payment)
+        payment.amount = Decimal('241.00')
+        assert not store.paid_as_signed(m, payment)
+        payment.amount, payment.currency = Decimal('240.00'), 'USD'
+        assert not store.paid_as_signed(m, payment)
+        payment.currency = 'INR'
+        m.description = 'edited'           # the signature no longer holds
+        assert not store.paid_as_signed(m, payment)
+
+
+def _key_files(folder):
+    return {p.name for p in folder.iterdir() if p.name.startswith('.ap2_mandate_key')}
+
+
+def _unreadable(path):
+    """builtins.open that refuses to READ ``path`` (locked by another
+    process, denied); every other file, and the lock file, opens as usual."""
+    real_open = open
+
+    def locked(p, mode='r', *a, **k):
+        if str(p) == str(path) and 'r' in mode:
+            raise PermissionError('in use by another process')
+        return real_open(p, mode, *a, **k)
+    return patch('builtins.open', locked)
+
+
+class TestMandateKey:
+    """Every record is signed with the node's mandate key, so it is created
+    once, read as it is on disk, and never replaced: a new key would orphan
+    every paid record.  One writer at a time, across threads and processes."""
+
+    def test_a_missing_key_is_created_once_and_kept(self, tmp_path):
+        folder = tmp_path / 'data'
+        first = _load_or_create_key(str(folder / '.ap2_mandate_key'))
+        assert len(first) == 32
+        assert _load_or_create_key(str(folder / '.ap2_mandate_key')) == first
+        assert (folder / '.ap2_mandate_key').read_text() == first.hex()
+        # The lock file stays (deleting it would reopen the race); no temp.
+        assert _key_files(folder) == {'.ap2_mandate_key', '.ap2_mandate_key.lock'}
+
+    def test_an_unreadable_key_is_never_replaced(self, tmp_path):
+        from integrations.ap2.ap2_mandate import PAYMENTS_PAUSED
+        path = tmp_path / '.ap2_mandate_key'
+        path.write_text('ab' * 32, encoding='utf-8')
+        with _unreadable(path):
+            with pytest.raises(MandateKeyError) as e:
+                _load_or_create_key(str(path))
+        assert str(e.value) == PAYMENTS_PAUSED
+        assert path.read_text(encoding='utf-8') == 'ab' * 32
+        assert _key_files(tmp_path) == {'.ap2_mandate_key', '.ap2_mandate_key.lock'}
+
+    def test_a_key_re_saved_by_an_editor_is_read_not_replaced(self, tmp_path):
+        # Notepad adds a BOM and CRLF: the key is the same key, and replacing
+        # it would orphan every record it signed.
+        path = tmp_path / '.ap2_mandate_key'
+        saved = b'\xef\xbb\xbf' + b'ab' * 32 + b'\r\n'
+        path.write_bytes(saved)
+        assert _load_or_create_key(str(path)) == bytes.fromhex('ab' * 32)
+        assert path.read_bytes() == saved
+
+    def test_a_file_that_holds_no_key_pauses_payments_and_is_kept(self, tmp_path):
+        # Whether this should mint a fresh key instead is the owner's open
+        # call; until then the fail-closed answer is to pause for a person.
+        path = tmp_path / '.ap2_mandate_key'
+        path.write_text('not a key at all', encoding='utf-8')
+        with pytest.raises(MandateKeyError):
+            _load_or_create_key(str(path))
+        assert path.read_text(encoding='utf-8') == 'not a key at all'
+        assert _key_files(tmp_path) == {'.ap2_mandate_key', '.ap2_mandate_key.lock'}
+
+    def test_a_key_that_cannot_be_saved_signs_nothing(self, tmp_path):
+        blocker = tmp_path / 'not_a_dir'
+        blocker.write_text('x', encoding='utf-8')
+        with pytest.raises(MandateKeyError):
+            _load_or_create_key(str(blocker / '.ap2_mandate_key'))
+
+    def test_an_empty_file_left_by_a_crash_gets_a_key(self, tmp_path):
+        path = tmp_path / '.ap2_mandate_key'
+        path.write_text('', encoding='utf-8')
+        key = _load_or_create_key(str(path))
+        assert path.read_text(encoding='utf-8') == key.hex()
+
+    def test_a_paused_store_changes_nothing(self, tmp_path):
+        # Every change is signed, so a store that cannot sign refuses BEFORE
+        # it touches the ledger or a record: no payment is cancelled,
+        # created or authorized, in memory or on disk.
+        ledger = PaymentLedger(ledger_path=str(tmp_path / 'ledger.json'))
+        ledger.add_gateway(CardRailDouble())
+        path, key_path = str(tmp_path / 'ap2_mandates.json'), tmp_path / '.ap2_mandate_key'
+        live = MandateStore(path=path, ledger=ledger)
+        pending = live.create_cart_mandate('u1', 'mcgroce', CART,
+                                           kind='commerce_checkout', cart_ref='555')
+        approved = live.create_cart_mandate('u1', 'mcgroce', CART,
+                                            kind='commerce_checkout', cart_ref='556')
+        assert live.approve(approved.mandate_id, 'u1')[0]
+        file_before = (tmp_path / 'ap2_mandates.json').read_bytes()
+        statuses = {p.payment_id: p.status for p in ledger.payments.values()}
+        worker = MandateStore(path=path, ledger=ledger)      # key not cached
+        with _unreadable(key_path):
+            for change in (lambda: worker.approve(pending.mandate_id, 'u1'),
+                           lambda: worker.reject(pending.mandate_id, 'u1'),
+                           lambda: worker.withdraw(approved.mandate_id, 'cart changed'),
+                           lambda: worker.consume(approved.mandate_id),
+                           lambda: worker.record_order(approved.mandate_id, 'ORD-1'),
+                           lambda: worker.supersede('u1', 'mcgroce', 'commerce_checkout', '557'),
+                           lambda: worker.create_cart_mandate('u1', 'mcgroce', CART)):
+                with pytest.raises(MandateKeyError):
+                    change()
+        assert {p.payment_id: p.status for p in ledger.payments.values()} == statuses
+        assert len(ledger.payments) == 2
+        assert (tmp_path / 'ap2_mandates.json').read_bytes() == file_before
+        assert worker.get(pending.mandate_id).status == 'pending'
+        assert worker.get(approved.mandate_id).status == 'approved'
+
+    def test_two_threads_creating_the_first_key_hold_the_same_key(self, tmp_path):
+        import threading
+        path = str(tmp_path / '.ap2_mandate_key')
+        gate, keys = threading.Barrier(2), []
+
+        def one():
+            gate.wait()
+            keys.append(_load_or_create_key(path))
+
+        threads = [threading.Thread(target=one) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(30)
+        assert len(keys) == 2 and keys[0] == keys[1]
+        assert (tmp_path / '.ap2_mandate_key').read_text() == keys[0].hex()
+        assert _key_files(tmp_path) == {'.ap2_mandate_key', '.ap2_mandate_key.lock'}
+
+    def test_two_processes_creating_the_first_key_hold_the_same_key(self, tmp_path):
+        # The real first-boot hazard: two workers, one data dir.  Each child
+        # imports, says it is ready, then waits for one 'go' so both race.
+        import subprocess
+        import sys
+        from pathlib import Path
+        root = str(Path(__file__).resolve().parents[2])
+        path = str(tmp_path / '.ap2_mandate_key')
+        go = tmp_path / 'go'
+        prog = ('import os, sys, time\n'
+                'sys.path.insert(0, sys.argv[3])\n'
+                'from integrations.ap2.ap2_mandate import _load_or_create_key\n'
+                'open(sys.argv[2] + ".ready" + sys.argv[4], "w").close()\n'
+                'while not os.path.exists(sys.argv[2]):\n'
+                '    time.sleep(0.002)\n'
+                'print(_load_or_create_key(sys.argv[1]).hex())\n')
+        procs = [subprocess.Popen([sys.executable, '-c', prog, path, str(go), root, str(i)],
+                                  stdout=subprocess.PIPE, text=True, cwd=root)
+                 for i in range(2)]
+        deadline = time.time() + 120
+        while not all((tmp_path / f'go.ready{i}').exists() for i in range(2)):
+            assert time.time() < deadline, 'children never got past their imports'
+            time.sleep(0.05)
+        go.write_text('go')
+        outs = [p.communicate(timeout=60)[0].strip() for p in procs]
+        assert outs[0] == outs[1] and len(outs[0]) == 64, outs
+        assert (tmp_path / '.ap2_mandate_key').read_text() == outs[0]
+
+
+class TestSupersede:
+    KIND = 'commerce_checkout'
+
+    def _mandate(self, store, user='u1', merchant='mcgroce', cart=CART, cart_ref='555'):
+        return store.create_cart_mandate(user, merchant, cart, kind=self.KIND,
+                                         cart_ref=cart_ref)
+
+    def test_voids_the_owners_earlier_live_checkouts_only(self, store):
+        mine = self._mandate(store)
+        approved = self._mandate(store)
+        store.approve(approved.mandate_id, 'u1')
+        theirs = self._mandate(store, user='u2')
+        other_shop = self._mandate(store, merchant='elsewhere')
+        ok, _ = store.supersede('u1', 'mcgroce', self.KIND, '555')
+        assert ok
+        for m in (mine, approved):
+            assert store.get(m.mandate_id).status == 'rejected'
+            assert store.ledger.get_payment(m.payment_id).status == PaymentStatus.CANCELLED
+        # Another shopper's and another merchant's checkouts are untouched.
+        assert store.get(theirs.mandate_id).status == 'pending'
+        assert store.get(other_shop.mandate_id).status == 'pending'
+
+    def test_refuses_while_an_earlier_payment_is_with_the_gateway(self, store):
+        m = self._mandate(store)
+        store.approve(m.mandate_id, 'u1')
+        store.ledger.get_payment(m.payment_id).update_status(PaymentStatus.PROCESSING)
+        ok, reason = store.supersede('u1', 'mcgroce', self.KIND, '555')
+        assert not ok and 'in progress' in reason
+        assert store.get(m.mandate_id).status == 'approved'
+
+    def test_a_cart_paid_for_is_never_offered_again_whatever_it_holds_now(self, store):
+        # Keyed on the cart, not its contents: a line repriced or added after
+        # the money was taken must not open a second payment for that cart.
+        m = self._mandate(store)
+        store.approve(m.mandate_id, 'u1')
+        store.consume(m.mandate_id)
+        ok, reason = store.supersede('u1', 'mcgroce', self.KIND, '555')
+        assert not ok and m.mandate_id in reason
+        # Another cart, or this one once its order exists, is fine.
+        assert store.supersede('u1', 'mcgroce', self.KIND, '556')[0]
+        store.record_order(m.mandate_id, 'ORD-1')
+        assert store.supersede('u1', 'mcgroce', self.KIND, '555')[0]
+
+    def test_a_payment_from_before_cart_tracking_blocks_nothing(self, store):
+        legacy = self._mandate(store, cart_ref=None)
+        store.approve(legacy.mandate_id, 'u1')
+        store.consume(legacy.mandate_id)
+        assert store.supersede('u1', 'mcgroce', self.KIND, '555')[0]
+
+    def test_a_checkout_whose_payment_cannot_be_cancelled_is_left_alone(self, store, monkeypatch):
+        # The gateway took it between the check and the cancel: the mandate
+        # must not be marked withdrawn over a payment that may complete.
+        m = self._mandate(store)
+        store.approve(m.mandate_id, 'u1')
+        monkeypatch.setattr(store.ledger, 'cancel_payment', lambda *a, **k: False)
+        ok, reason = store.supersede('u1', 'mcgroce', self.KIND, '555')
+        assert not ok and 'in progress' in reason
+        assert store.get(m.mandate_id).status == 'approved'
+
+    def test_a_declined_payment_does_not_hold_up_the_next_checkout(self, store):
+        # A declined card leaves the payment FAILED, which cannot be
+        # cancelled; nothing can be charged on it, so it is withdrawn.
+        m = self._mandate(store)
+        store.approve(m.mandate_id, 'u1')
+        store.ledger.get_payment(m.payment_id).update_status(PaymentStatus.FAILED)
+        ok, reason = store.supersede('u1', 'mcgroce', self.KIND, '555')
+        assert ok, reason
+        assert store.get(m.mandate_id).status == 'rejected'
+
+    def test_refuses_while_an_earlier_payment_is_being_taken(self, store):
+        m = self._mandate(store)
+        store.approve(m.mandate_id, 'u1')
+        assert store.begin_settle(m.mandate_id)[0]
+        ok, reason = store.supersede('u1', 'mcgroce', self.KIND, '555')
+        assert not ok and 'being taken' in reason
+        assert store.get(m.mandate_id).status == 'approved'
+
+    def test_a_payment_that_took_another_amount_never_opens_a_second_one(self, store):
+        # PhonePe captured a different amount: FAILED, but money moved.  It is
+        # no declined card: the cart stays paid for, past the TTL too.
+        m = self._mandate(store)
+        store.approve(m.mandate_id, 'u1')
+        p = store.ledger.get_payment(m.payment_id)
+        p.update_status(PaymentStatus.FAILED, 'amount mismatch')
+        p.metadata = {**p.metadata, MONEY_TAKEN: True}
+        ok, reason = store.supersede('u1', 'mcgroce', self.KIND, '555')
+        assert not ok and m.mandate_id in reason
+        with patch('integrations.ap2.ap2_mandate.time.time',
+                   return_value=m.expires_at + 3600):
+            assert store.supersede('u1', 'mcgroce', self.KIND, '555')[0] is False
+        assert store.get(m.mandate_id).status == 'approved'
+        assert store.withdraw(m.mandate_id, 'cart changed') is False
+
+    def test_money_taken_for_another_cart_holds_up_nothing(self, store):
+        # Paid, but its order step never used it up (it failed midway, or the
+        # record fails its signature): that cart waits, the next one does not.
+        m = self._mandate(store)
+        store.approve(m.mandate_id, 'u1')
+        store.ledger.get_payment(m.payment_id).update_status(PaymentStatus.COMPLETED)
+        ok, reason = store.supersede('u1', 'mcgroce', self.KIND, '555')
+        assert not ok and m.mandate_id in reason
+        ok, reason = store.supersede('u1', 'mcgroce', self.KIND, '556')
+        assert ok, reason
+        assert store.get(m.mandate_id).status == 'approved'     # paid: never voided
+
+
+class TestBeginSettle:
+    KIND = 'commerce_checkout'
+
+    def _approved(self, store, cart_ref='555', user='u1'):
+        m = store.create_cart_mandate(user, 'mcgroce', CART, kind=self.KIND,
+                                      cart_ref=cart_ref)
+        store.approve(m.mandate_id, user)
+        return m
+
+    def test_one_cart_is_paid_by_one_mandate_at_a_time(self, store):
+        a, b = self._approved(store), self._approved(store)
+        assert store.begin_settle(a.mandate_id) == (True, 'ok')
+        ok, reason = store.begin_settle(b.mandate_id)
+        assert not ok and 'being taken' in reason
+        assert store.begin_settle(a.mandate_id)[0] is False      # nor twice
+        store.end_settle(a.mandate_id)
+        assert store.begin_settle(b.mandate_id)[0]
+
+    def test_no_mandate_pays_for_a_cart_another_already_paid_for(self, store):
+        a, b = self._approved(store), self._approved(store)
+        store.consume(a.mandate_id)
+        ok, reason = store.begin_settle(b.mandate_id)
+        assert not ok and a.mandate_id in reason
+        store.record_order(a.mandate_id, 'ORD-1')
+        assert store.begin_settle(b.mandate_id)[0]
+
+    def test_a_payment_with_the_gateway_blocks_the_others_for_its_cart(self, store):
+        a, b = self._approved(store), self._approved(store)
+        store.ledger.get_payment(a.payment_id).update_status(PaymentStatus.PROCESSING)
+        assert store.begin_settle(b.mandate_id)[0] is False
+
+    def test_other_carts_and_other_shoppers_are_not_held_up(self, store):
+        a = self._approved(store)
+        assert store.begin_settle(a.mandate_id)[0]
+        assert store.begin_settle(self._approved(store, cart_ref='556').mandate_id)[0]
+        assert store.begin_settle(self._approved(store, user='u2').mandate_id)[0]
+
+    def test_the_cart_is_part_of_the_signed_record(self, store):
+        m = self._approved(store)
+        store._mandates[m.mandate_id].cart_ref = '999'      # a hand edit
+        assert store.verify_for_checkout(m.mandate_id, 'u1', CART) == (
+            False, 'mandate signature invalid')
+
+
 class TestDecidePayment:
     """The ONE place a person's answer is applied (the approval routes call it)."""
 
@@ -240,6 +646,31 @@ class TestDecidePayment:
                    return_value=True) as push:
             self.push = push
             yield
+
+    def test_a_key_that_cannot_be_read_pauses_the_answer_and_keeps_the_card_open(self, tmp_path):
+        # The approval answers 503 with the pause, nothing is signed, no key
+        # file is written and the card stays open; once the key reads again
+        # the same answer approves, and the earlier record still verifies.
+        from integrations.ap2.ap2_mandate import PAYMENTS_PAUSED, decide_payment
+        ledger = PaymentLedger(ledger_path=str(tmp_path / 'ledger.json'))
+        ledger.add_gateway(CardRailDouble())
+        path, key_path = str(tmp_path / 'ap2_mandates.json'), tmp_path / '.ap2_mandate_key'
+        m = MandateStore(path=path, ledger=ledger).create_cart_mandate('u1', 'mcgroce', CART)
+        key_bytes = key_path.read_bytes()
+        worker = MandateStore(path=path, ledger=ledger)      # another worker: key not cached
+        with _unreadable(key_path):
+            payload, code = decide_payment(m.payment_id, 'u1', True, store=worker)
+        assert code == 503, payload
+        assert payload['status'] == 'error' and payload['reason'] == PAYMENTS_PAUSED
+        assert payload['retry_later'] is True
+        assert key_path.read_bytes() == key_bytes
+        assert _key_files(tmp_path) == {'.ap2_mandate_key', '.ap2_mandate_key.lock'}
+        assert ledger.get_payment(m.payment_id).status == PaymentStatus.APPROVAL_REQUIRED
+        later = MandateStore(path=path, ledger=ledger)
+        assert later.get(m.mandate_id).status == 'pending'       # the card is still open
+        payload, code = decide_payment(m.payment_id, 'u1', True, store=later)
+        assert code == 200 and payload['status'] == 'approved', payload
+        assert later.get(m.mandate_id).status == 'consumed'
 
     def test_owner_approval_settles_a_generic_mandate(self, store):
         from integrations.ap2.ap2_mandate import decide_payment

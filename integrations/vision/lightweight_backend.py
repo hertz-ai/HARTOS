@@ -899,6 +899,12 @@ class Qwen08BBackend(VisionBackend):
         #: caller that finds it held waits for that start instead of making
         #: its own.
         self._start_lock = threading.Lock()
+        #: Whether the caller holding _start_lock is starting a server, not
+        #: only asking /health in a failed start's cooldown.  _start_state is
+        #: notified when it turns True and whenever _start_lock is let go
+        #: (_end_hold), so a caller waiting on the start learns both.
+        self._starting = False
+        self._start_state = threading.Condition()
 
     @staticmethod
     def start_lock_path(port, config_dir=None) -> str:
@@ -955,6 +961,36 @@ class Qwen08BBackend(VisionBackend):
         logger.info(f"Qwen3.5-0.8B: Nunba's start lock {lock} is stale ({age:.0f} s "
                     f"old): no start in progress")
         return ''
+
+    def _port_listener(self) -> str:
+        """Who already listens on this backend's port -- why it must not
+        spawn a server there -- or '' when the OS shows nobody listening.
+
+        Read from the OS socket table (core.resource_governor._listen_rows,
+        the one reader of it), not from /health: _is_serving() calls a server
+        down when it answers 503 while it loads, takes longer than 2 s, or
+        cannot be reached by the caller (a test's network seal), and on
+        Windows a second llama-server binds and listens on a port the first
+        still holds (both set SO_REUSEADDR).  Measured 2026-10-21 (task #936):
+        five llama-servers LISTENING on 127.0.0.1:8081, four of them 0.8B
+        caption servers this launch spawned from test processes beside the
+        desktop app's own.
+
+        A table that cannot be read (no psutil; AccessDenied on macOS without
+        root) is '': the launch goes on as it did before it asked.
+        """
+        try:
+            from core.resource_governor import _listen_rows
+            rows = _listen_rows((self._port,))
+        except Exception as e:
+            logger.info(f"Qwen3.5-0.8B: the socket table could not be read ({e}); "
+                        f"not known whether port {self._port} is held")
+            return ''
+        if not rows:
+            return ''
+        pids = sorted({c.pid for c in rows if c.pid})
+        who = ('PID ' + ', '.join(str(p) for p in pids)) if pids else 'another process'
+        return f"{who} already listens on it"
 
     def _model_files(self) -> tuple:
         """(model, mmproj) on disk for the standalone launch; None for a
@@ -1070,11 +1106,13 @@ class Qwen08BBackend(VisionBackend):
         While Nunba is starting it (_launch_owner: its subscriber took the
         event, or its per-port start lock is held, i.e. younger than
         START_LOCK_STALE_S) HARTOS spawns nothing and waits for Nunba's
-        server, 5 s + 30 s at most, the bound its own launch has.  In
-        standalone mode (neither; a stale lock is neither), HARTOS uses
-        model_lifecycle to launch directly, with the files _model_files
-        finds through the model catalog, at the context size and GPU layers
-        _launch_geometry decides (as Nunba's start of this server does).
+        server, 5 s + 30 s at most, the bound its own launch has; so it does
+        while something already LISTENs on the port (_port_listener, the OS
+        socket table).  In standalone mode (none of these; a stale lock is
+        none), HARTOS uses model_lifecycle to launch directly, with the
+        files _model_files finds through the model catalog, at the context
+        size and GPU layers _launch_geometry decides (as Nunba's start of
+        this server does).
 
         One start at a time per backend, and the backend is the one this
         process hands every caller (get_vision_backend; owner ruling
@@ -1087,10 +1125,12 @@ class Qwen08BBackend(VisionBackend):
         is inside that start's cooldown, whoever it was.
 
         ``on_wait`` is called once, after the server was found not serving
-        and before the event is sent, or before waiting for another caller's
-        start: not when it is up, not while a failed launch's cooldown
-        holds.  In its own try, so a caller's progress line that raises
-        never skips the start it announces (review of 42735064e).
+        and before the event is sent, or, for a caller waiting on another
+        caller's start, when that start begins (_wait_for_start): not when
+        it is up, not while a failed launch's cooldown holds -- this
+        caller's, or the one another caller is asking /health in.  In its
+        own try, so a caller's progress line that raises never skips the
+        start it announces (review of 42735064e).
 
         Dependency direction: Nunba → HARTOS (never HARTOS → Nunba).  What
         is read of Nunba (its event subscriber, its start lock, its models
@@ -1106,14 +1146,41 @@ class Qwen08BBackend(VisionBackend):
         if self._is_serving():
             return True
         if not self._start_lock.acquire(blocking=False):
-            # Another caller is starting it; its waits bound this one.
-            _tell_waiting(on_wait)
-            with self._start_lock:
-                return self._is_serving()
+            return self._wait_for_start(on_wait)
         try:
             return self._start_serving(on_wait)
         finally:
+            self._end_hold()
+
+    def _wait_for_start(self, on_wait: Optional[Callable[[], None]]) -> bool:
+        """ensure_running for a caller that found the start held: it waits
+        for that start, whose waits bound this one, and takes its answer.
+
+        It is told it waits (``on_wait``, once, on its own thread) when that
+        caller is starting a server, now or when the start begins; never
+        while that caller only asks /health in a failed start's cooldown.
+        Told on arrival, a reel's chat said the vision model was being made
+        ready while nothing was being started (review of 1db4503c3)."""
+        told = False
+        while not self._start_lock.acquire(blocking=False):
+            with self._start_state:
+                self._start_state.wait_for(
+                    lambda: (self._starting and not told) or not self._start_lock.locked())
+                tell = self._starting and not told
+            if tell:
+                told = True
+                _tell_waiting(on_wait)
+        try:
+            return self._is_serving()
+        finally:
+            self._end_hold()
+
+    def _end_hold(self) -> None:
+        """Let go of the start, and wake every caller waiting on it."""
+        with self._start_state:
+            self._starting = False
             self._start_lock.release()
+            self._start_state.notify_all()
 
     def _start_serving(self, on_wait: Optional[Callable[[], None]]) -> bool:
         """ensure_running's start, with the start lock held."""
@@ -1154,6 +1221,11 @@ class Qwen08BBackend(VisionBackend):
         self._launch_attempted = True
         self._launch_attempted_at = _t.time()
 
+        # A start, not a cooldown's probe: a caller waiting on this one is
+        # told it waits now (_wait_for_start).
+        with self._start_state:
+            self._starting = True
+            self._start_state.notify_all()
         _tell_waiting(on_wait)
 
         # Emit event — Nunba subscribes in bundled mode and starts the server
@@ -1172,11 +1244,12 @@ class Qwen08BBackend(VisionBackend):
                 return True
 
         # Not up yet.  If Nunba is starting it (its subscriber took the event,
-        # or its per-port lock is held), a spawn here is a second 0.8B server
-        # on the port -- the 2026-09-26 incident class.  Spawn nothing; wait
-        # for its server the 30 s this backend waits for its own.  Nobody
-        # starting it — standalone mode, use model_lifecycle.
-        owner = self._launch_owner()
+        # or its per-port lock is held), or something already listens on the
+        # port (_port_listener), a spawn here is a second server on the port
+        # -- the 2026-09-26 and 2026-10-21 incidents.  Spawn nothing; wait for
+        # that server the 30 s this backend waits for its own.  Nobody there
+        # — standalone mode, use model_lifecycle.
+        owner = self._launch_owner() or self._port_listener()
         if owner:
             logger.info(f"Qwen3.5-0.8B: not spawning on port {self._port}: {owner}; "
                         f"waiting for it")

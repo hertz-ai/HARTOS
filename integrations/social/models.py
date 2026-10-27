@@ -120,6 +120,23 @@ def _uuid():
     return str(uuid.uuid4())
 
 
+#: How long every SQLite connection on this node waits for another writer's
+#: lock. ONE spelling: the connect hook below builds its PRAGMA from it, and
+#: book_pipeline._restore_patience reads it to give a connection back the
+#: patience it borrowed. Changing this changes every connection on every node.
+SQLITE_BUSY_TIMEOUT_MS = 3000
+
+#: Exactly what that hook issues. A module constant rather than a string
+#: rebuilt at call time, so a test can read what will really be run without
+#: reading source text -- hevolveai's C240 exists because 48 source-text pins
+#: went silently untested the moment their module was compiled.
+SQLITE_BOOT_PRAGMAS = (
+    "PRAGMA journal_mode=WAL;"
+    f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS};"
+    "PRAGMA synchronous=NORMAL;"
+)
+
+
 def get_engine():
     global _engine
     if _engine is None:
@@ -170,8 +187,10 @@ def get_engine():
 
             # Enable WAL mode for file-based SQLite
             # WAL allows concurrent reads + one writer without blocking readers.
-            # busy_timeout=3000 (3s) — fail fast rather than blocking daemon threads
-            # for 15-30s which triggers watchdog restarts.
+            # The patience is SQLITE_BUSY_TIMEOUT_MS, which this hook and
+            # book_pipeline._restore_patience both read: fail fast rather than
+            # blocking daemon threads for 15-30s, which trips watchdog
+            # restarts. Not repeated as a number here -- the constant owns it.
             #
             # NullPool means every checkout creates a fresh connection, so
             # this hook fires per-checkout, not per-engine.  Combining the
@@ -184,11 +203,7 @@ def get_engine():
                 @event.listens_for(_engine, "connect")
                 def _set_sqlite_wal(dbapi_connection, connection_record):
                     cursor = dbapi_connection.cursor()
-                    cursor.executescript(
-                        "PRAGMA journal_mode=WAL;"
-                        "PRAGMA busy_timeout=3000;"
-                        "PRAGMA synchronous=NORMAL;"
-                    )
+                    cursor.executescript(SQLITE_BOOT_PRAGMAS)
                     cursor.close()
     return _engine
 

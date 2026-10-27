@@ -237,13 +237,25 @@ def test_what_the_emit_sites_really_send_has_no_schema_errors(name):
     assert _errors(issues) == [], issues
 
 
-def test_the_channel_failure_toast_is_flagged_not_hidden():
-    # integrations/channels/agent_tools: the toast sends `text`; AgentOverlay's
-    # NotificationCard reads message/content, so the reason never shows.
+def test_a_toast_sent_with_text_is_flagged_not_hidden():
+    # The channel emitters sent the body as `text` until 2026-10-22, and
+    # AgentOverlay's NotificationCard reads message/content, so the reason
+    # never showed.  A toast with that shape is flagged, both halves named.
     issues = _issues('toast', {'severity': 'error', 'channel': 'discord',
                                'channel_type': 'discord',
                                'text': "Discord couldn't connect."})
     assert {i['code'] for i in issues} == {'unknown_prop', 'required'}
+
+
+def test_the_media_catalogue_teaches_src_the_source_the_overlay_plays(svc):
+    # AgentOverlay plays `src`, the prop the game-sound card sends.  The
+    # catalogue line and the example taught `url`, so a card a model built
+    # from them came up with nothing to play.
+    line = svc.component_prompt(['media'])
+    assert 'src: str' in line and 'url' not in line
+    assert 'src' in COMPONENT_TYPES['media']['example']
+    issues = _issues('media', {'media_type': 'audio', 'url': '/a.wav'})
+    assert [i['path'] for i in issues if i['code'] == 'unknown_prop'] == ['url']
 
 
 # ── agent_ui_compose: a verdict the model can read ─────────────────────────

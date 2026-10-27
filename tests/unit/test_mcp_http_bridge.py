@@ -441,27 +441,23 @@ class TestRestSurfaceUnchangedByJsonRpc:
 
 # ── McGroce commerce tools (COMMERCE_TOOLS) ────────────────────
 
-class TestCommerceToolsExposed:
-    def test_commerce_tools_are_listed_with_user_id_required(self, client):
-        from integrations.commerce.commerce_tools import COMMERCE_TOOLS
-        tools = {t['name']: t for t in
-                 client.get('/api/mcp/local/tools/list').get_json()['tools']}
-        for entry in COMMERCE_TOOLS:
-            assert entry['name'] in tools, entry['name']
-        schema = tools['commerce_cart_add']['parameters']
-        assert schema['required'][0] == 'user_id'
-        assert {'product_id', 'category_id'} <= set(schema['required'])
+class TestCommerceToolsNotExposed:
+    """The MCP caller is the node's one token, not a shopper.  Exposed, the
+    commerce tools let it read and edit any linked shopper's cart and order
+    history by naming their user_id."""
 
-    def test_executing_acts_only_through_the_binding(self, client, tmp_path):
-        from integrations.commerce.bindings import CommerceBindings
-        empty = CommerceBindings(str(tmp_path / 'b.json'))
-        with patch('integrations.commerce.bindings.get_bindings', return_value=empty), \
-                patch('core.http_pool.pooled_request') as http:
+    def test_no_commerce_tool_is_listed(self, client):
+        from integrations.commerce.commerce_tools import COMMERCE_TOOLS
+        listed = {t['name'] for t in
+                  client.get('/api/mcp/local/tools/list').get_json()['tools']}
+        assert listed.isdisjoint(t['name'] for t in COMMERCE_TOOLS)
+
+    def test_a_shoppers_cart_cannot_be_read_by_naming_them(self, client):
+        with patch('core.http_pool.pooled_request') as http:
             resp = client.post('/api/mcp/local/tools/execute',
                                data=json.dumps({'tool': 'commerce_cart_view',
-                                                'arguments': {'user_id': 'mcgroce_1'}}),
+                                                'arguments': {'user_id': 'mcg-4242'}}),
                                content_type='application/json')
-        assert resp.status_code == 200
-        result = resp.get_json()['result']
-        assert result['success'] is False and 'not linked' in result['error']
+        assert resp.status_code == 404
+        assert 'Unknown tool' in resp.get_json()['error']
         http.assert_not_called()

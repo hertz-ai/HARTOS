@@ -159,6 +159,9 @@ class HardwareProfile:
     has_imu: bool = False
     has_gps: bool = False
     has_lidar: bool = False
+    # A screen this process can reach (_detect_display), or None when the
+    # probe cannot tell.  Read it through has_display().
+    has_display: Optional[bool] = None
     detected_at: float = field(default_factory=time.time)
 
     def to_dict(self) -> Dict:
@@ -181,6 +184,7 @@ class HardwareProfile:
             'has_imu': self.has_imu,
             'has_gps': self.has_gps,
             'has_lidar': self.has_lidar,
+            'has_display': self.has_display,
         }
 
 
@@ -361,6 +365,7 @@ def detect_hardware() -> HardwareProfile:
     hw.has_imu = _detect_imu()
     hw.has_gps = _detect_gps()
     hw.has_lidar = _detect_lidar()
+    hw.has_display = _detect_display()
 
     hw.detected_at = time.time()
     return hw
@@ -509,6 +514,45 @@ def _detect_camera_hw() -> bool:
     except (FileNotFoundError, OSError):
         pass
     return False
+
+
+#: GetSystemMetrics index: the number of display monitors on the desktop.
+_SM_CMONITORS = 80
+#: A display session a Linux process can capture: X11, Wayland, or the
+#: sway IPC socket, the one signal the HART OS backend unit gets (its
+#: WAYLAND_DISPLAY is unset; shell_desktop_apis._is_wayland, measured
+#: 2026-08-26).
+_DISPLAY_ENV = ('DISPLAY', 'WAYLAND_DISPLAY', 'SWAYSOCK')
+_CORE_GRAPHICS = '/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics'
+
+
+def _detect_display() -> Optional[bool]:
+    """Whether this process can reach a screen: True, False, or None when
+    the probe cannot tell.
+
+    A screen this process cannot reach is no screen to capture: central's
+    container has no display session (measured 2026-10-21) and asked its
+    owner for screen capture every 10 seconds for two days.
+    """
+    system = platform.system()
+    try:
+        if system == 'Windows':
+            import ctypes
+            return ctypes.windll.user32.GetSystemMetrics(_SM_CMONITORS) > 0
+        if system == 'Linux':
+            return any(os.environ.get(name) for name in _DISPLAY_ENV)
+        if system == 'Darwin':
+            import ctypes
+            import ctypes.util
+            graphics = ctypes.cdll.LoadLibrary(
+                ctypes.util.find_library('CoreGraphics') or _CORE_GRAPHICS)
+            count = ctypes.c_uint32(0)
+            if graphics.CGGetActiveDisplayList(0, None, ctypes.byref(count)) != 0:
+                return None
+            return count.value > 0
+    except Exception as e:
+        logger.debug('display probe failed on %s: %s', system, e)
+    return None
 
 
 def _detect_imu() -> bool:
@@ -742,6 +786,15 @@ def get_tier() -> NodeTierLevel:
 def get_tier_name() -> str:
     """Get current tier as string. Convenience for gossip/API."""
     return get_tier().value
+
+
+def has_display() -> Optional[bool]:
+    """Whether this computer has a screen this process can reach, as the
+    boot check (run_system_check) found it: None before that check has run
+    or when its probe could not tell."""
+    if _capabilities is None:
+        return None
+    return _capabilities.hardware.has_display
 
 
 def reset_for_testing():
