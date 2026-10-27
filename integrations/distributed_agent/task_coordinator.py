@@ -455,8 +455,9 @@ class DistributedTaskCoordinator:
         active goals, so a re-dispatch of a goal whose task was held means
         the owner or the co-pilot resumed it (a parked goal, or one the
         worker found not running) or the expert leg is running (an active
-        one): the answer is in, the work goes back to the queue.  Nothing else releases a held task: orphan recovery
-        skips BLOCKED, and claim_next_task takes only PENDING.
+        one): the answer is in, the work goes back to the queue.  Nothing
+        else releases a held task: orphan recovery skips BLOCKED, and
+        claim_next_task takes only PENDING.
 
         Only tasks blocked for INPUT_REQUIRED, the mark hold_task makes.  A
         task blocked on a prerequisite (parallel_dispatch's dependency

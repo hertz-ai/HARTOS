@@ -433,8 +433,10 @@ class DistributedWorkerLoop:
         peer's work), or when it cannot be read: none of those says the goal
         stopped, so the task runs as it always did.
         """
-        goal_id = str(task.parent_task_id or task.task_id)
+        goal_id = '?'
         try:
+            goal_id = str(getattr(task, 'parent_task_id', None)
+                          or getattr(task, 'task_id', ''))
             from integrations.social.models import AgentGoal, db_session
             with db_session(commit=False) as db:
                 row = db.query(AgentGoal.status, AgentGoal.config_json).filter(

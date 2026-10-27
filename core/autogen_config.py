@@ -253,7 +253,12 @@ def own_llm_target() -> tuple:
 
 
 def _same_endpoint(a: dict, b: dict) -> bool:
-    """Two config entries that would dial the same model at the same place."""
+    """Two config entries that would dial the same model at the same URL.
+
+    Exact on purpose, unlike llm_target's "same LLM?" rule, which drops a
+    trailing /v1: here an entry written without /v1 may be a broken path
+    beside a working one, and folding them would drop the working fallback
+    that with_local_fallback exists to add."""
     def _norm(e):
         return ((e or {}).get('base_url') or '').rstrip('/'), (e or {}).get('model')
     return _norm(a) == _norm(b)

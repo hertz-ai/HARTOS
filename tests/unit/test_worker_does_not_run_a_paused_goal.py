@@ -131,6 +131,9 @@ def test_a_goal_that_is_not_running_has_its_task_held_not_run(db, status):
     assert task.blocked_reason == 'input_required'
     assert f'the goal is {status}' in task.error_message
     assert not co._lock.is_task_locked(task.task_id), 'the claim was not released'
+    # The ledger's history says why it waits; not "held for help".
+    assert task.state_history[-1]['reason'] == (
+        "held: its goal is not running; back on the goal's next dispatch")
 
 
 def test_a_paused_goals_task_is_not_run_again_an_orphan_window_later(db):
@@ -183,6 +186,29 @@ def test_a_config_key_named_status_does_not_hide_the_pause(db):
         gid = str(g.id)
     _led, co = _coordinator(gid)
     assert _tick(co) == []
+
+
+def test_a_task_that_names_no_parent_is_still_run(db):
+    """A task object without the attribute at all (the shape the worker's
+    own failed-turn tests hand it) is no evidence its goal stopped: the
+    tick goes on to the turn instead of failing on the read."""
+    from integrations.distributed_agent.worker_loop import DistributedWorkerLoop
+
+    class _Bare:
+        task_id = 'bare_task_0'
+        description = 'post the weekly digest'
+        context = {'hop': 0}
+
+    co = MagicMock()
+    co.claim_next_task.return_value = _Bare()
+    loop = DistributedWorkerLoop()
+    loop._node_id = 'node-a'
+    with patch.object(loop, '_get_coordinator', return_value=co), \
+         patch.object(loop, '_execute_task', return_value=None) as turn:
+        loop._tick()
+    turn.assert_called_once()
+    co.abandon_task.assert_called_once_with('bare_task_0', 'node-a')
+    co.hold_task.assert_not_called()
 
 
 def test_a_goal_that_cannot_be_read_does_not_stop_the_work(db):
