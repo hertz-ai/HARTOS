@@ -180,12 +180,24 @@ _PERSON_PLACEHOLDER = re.compile(r'\[(?!IP_)[A-Z_]+_REDACTED\]')
 _CONTENT, _EXEMPT, _CONTACT, _SECRET = 'content', 'exempt', 'contact', 'secret'
 
 
-def is_secret_key(key: str) -> bool:
-    """Is a lowercase, underscore-separated name a secret's?  The one rule:
-    what a scrub withholds here, and what person_ask refuses to ask for."""
+def secret_key_form(name: str) -> str:
+    """``name`` as is_secret_key reads it: lowercase, camelCase split, and
+    every run of other characters one underscore ('userPassword' ->
+    'user_password', 'API-Key' -> 'api_key', 'Your UPI PIN' -> 'your_upi_pin')."""
+    name = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', str(name or ''))
+    return re.sub(r'[^a-z0-9]+', '_', name.lower()).strip('_')
+
+
+def is_secret_key(key: str, extra: Tuple[str, ...] = ()) -> bool:
+    """Is a lowercase, underscore-separated name (secret_key_form) a
+    secret's?  The one rule: what a scrub withholds here, and what person_ask
+    refuses to ask for.  ``extra`` are a caller's own words, matched like the
+    secret key words (the whole name or its last word), so a caller extends
+    this rule instead of keeping a second list."""
     if {'password', 'passwd', 'pwd'}.intersection(key.split('_')):
         return True                              # password_hash, pwd_salt
-    return any(key == w or key.endswith('_' + w) for w in _SECRET_KEY_WORDS)
+    return any(key == w or key.endswith('_' + w)
+               for w in (_SECRET_KEY_WORDS + tuple(extra)))
 
 
 def _is_contact_key(key: str) -> bool:

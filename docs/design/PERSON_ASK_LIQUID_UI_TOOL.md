@@ -59,8 +59,14 @@ no owner today):
 - `ask(user_id, agent_id, component, *, prompt_id=None, title, body)`:
   1. Refuses a component that asks for a secret: a field marked `secret`,
      typed `password` in any spelling (`type`, `input_type`, ...), or named
-     the way a secret is named (`security.edge_privacy.is_secret_key`, the
-     scrub's own rule: `password`, `api_key`, `auth_token`, ...). Secrets go
+     the way a secret is named in any spelling (`userPassword`, `API-Key`:
+     `security.edge_privacy.secret_key_form`, then `is_secret_key`, the
+     scrub's own rule, extended by the words only the vault asks for: `otp`,
+     `pin`, `cvv`, `card_number`, `passcode`, `seed_phrase`, ...). A field
+     whose label, placeholder or hint asks for one ('Password', 'Enter the
+     OTP', 'Your UPI PIN') is refused too, as is an ask whose title or body
+     does ('Enter your bank password'); an everyday word alone ('pass the
+     clips', 'a token of thanks', 'PIN code') is not a secret. Secrets go
      to the vault (`ai_key_vault.request_credential`, H-0986) and never into
      a tool result, a log or the ledger.
   2. A `file_request` names a purpose the store has (`INBOUND_PURPOSES`)
@@ -83,7 +89,9 @@ no owner today):
      second one). The push carries the ask's id as `ask_id` (central's
      relay replaces `request_id`) and no `topic_reply`, because no reply
      topic is an answer door (see the doors section). A row that cannot be
-     written takes the card back down (`not_filed`).
+     written takes the card back down from every surface it reached: the
+     shell's store, and `ask.answered` for the phone's topic and the page
+     (`not_filed`).
 
   For consent (slice S4), `central_lacks` (#244) stays ahead of all of it.
 
@@ -91,8 +99,11 @@ no owner today):
   - Only the person asked may answer: the verified caller, never a body
     field.
   - An answer is a small, shallow object (16 KB, 4 levels). One that
-    carries a secret (`edge_privacy.redact_secret_leaves` finds one) is
-    refused. A `file_request` answer is `{xids: [...]}`: each pick must be
+    carries a secret (`edge_privacy.redact_secret_leaves` finds one, or a
+    key in it names a secret or a credential, in any spelling, with a value)
+    is refused. A plain value under an everyday name (a one-time code typed
+    into a field called `code`) cannot be told from any other answer; the
+    ask-time refusal of the field's name and words is what keeps it out. A `file_request` answer is `{xids: [...]}`: each pick must be
     in the person's own inbox, held for the ask's purpose, and is then
     bound to the asking agent with the ask as its turn
     (`core.chat_attachments.bind_inbound`, the one binding rule); else 400

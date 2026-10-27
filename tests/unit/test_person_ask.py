@@ -296,6 +296,12 @@ def test_a_row_that_cannot_be_written_takes_the_card_back(shell, monkeypatch):
     assert person_ask._asks == {}
     assert shell['svc']._agent_components['342'] == []
     assert shell['pushes'] == []
+    # the card already reached her phone's topic and the page: they drop it too
+    # (review of a802e22de, probe P3), or her answer to it would get 404
+    sent = [d['component']['msg_id'] for t, d, _u in shell['events']
+            if t == 'chat.social' and d.get('type') == 'agent_ui_update']
+    assert len(sent) == 1
+    assert len(_answered_events(shell, sent[0])) == 1
 
 
 def test_an_agents_registered_component_type_can_be_asked(shell):
@@ -465,6 +471,23 @@ def test_a_person_has_at_most_a_few_open_asks(legs):
     {'name': 'pw', 'secret': 'true'},
     {'name': 'password', 'type': 'text', 'label': 'Your Instagram password'},
     {'name': 'api_key', 'type': 'text', 'label': 'Paste your OpenAI key'},
+    # a name in any spelling (review of a802e22de, probe S1)
+    *({'name': n, 'type': 'text'} for n in (
+        'userPassword', 'confirmPassword', 'newPassword', 'instagramPassword',
+        'accessToken', 'refreshToken', 'authToken', 'apiToken', 'clientSecret',
+        'secretKey', 'privateKey', 'sessionCookie', 'API-Key')),
+    # what a person is only asked through the vault
+    *({'name': n, 'type': 'text'} for n in (
+        'otp', 'pin', 'cvv', 'card_number', 'passcode', 'seed_phrase', 'upiPin',
+        'otp_code')),
+    # a field whose words ask for it, whatever its name
+    {'name': 'f1', 'type': 'text', 'label': 'Password'},
+    {'name': 'f1', 'type': 'text', 'placeholder': 'your password'},
+    {'name': 'f1', 'type': 'text', 'label': 'Enter the OTP'},
+    {'name': 'f1', 'type': 'text', 'label': 'Your UPI PIN'},
+    {'name': 'f1', 'type': 'text', 'label': 'Card number'},
+    {'name': 'f1', 'type': 'text', 'hint': 'Paste your API key here'},
+    {'name': 'f1', 'type': 'text', 'label': 'Your wallet seed phrase'},
 ])
 def test_a_component_that_asks_for_a_secret_is_refused(legs, field):
     form = {'type': 'form', 'title': 'Your login',
@@ -475,10 +498,44 @@ def test_a_component_that_asks_for_a_secret_is_refused(legs, field):
     assert legs['pushes'] == [] and legs['cards'] == []
 
 
+@pytest.mark.parametrize('where', ['component', 'ask'])
+def test_an_ask_whose_title_asks_for_a_secret_is_refused(legs, where):
+    title = 'Enter your bank password'
+    form = {'type': 'form', 'fields': [{'name': 'f1', 'type': 'text'}], 'action': '/x'}
+    if where == 'component':
+        out = _ask(component=dict(form, title=title), title='')
+    else:
+        out = _ask(component=form, title=title)
+    _settle()
+    assert out['ok'] is False and out['refused'] == 'secrets_go_to_the_vault'
+    assert legs['pushes'] == [] and legs['cards'] == []
+
+
+@pytest.mark.parametrize('field', [
+    {'name': 'pin_code', 'type': 'text', 'label': 'PIN code'},     # a postal code
+    {'name': 'max_tokens', 'type': 'number'},
+    {'name': 'token_type', 'type': 'text'},
+    {'name': 'tokenizer', 'type': 'text'},
+    {'name': 'secret_name', 'type': 'text'},
+    {'name': 'note', 'type': 'text', 'label': 'Send me a token of appreciation'},
+    {'name': 'note', 'type': 'text', 'label': 'Pass the clips to me'},
+    {'name': 'note', 'type': 'text', 'label': 'Pin it to your profile?'},
+    {'name': 'note', 'type': 'text', 'label': "What's the secret to your best reel?"},
+])
+def test_everyday_words_are_not_a_secret(legs, field):
+    form = {'type': 'form', 'title': 'Tell me',
+            'fields': [{'name': 'user', 'type': 'text'}, field], 'action': '/x'}
+    out = _ask(component=form)
+    assert out['ok'] is True, out
+
+
 @pytest.mark.parametrize('answer', [
     {'password': 'hunter2-hunter2'},
     {'api_key': 'sk-proj-abcdefghijklmnopqrstuvwxyz0123456789'},
     {'note': 'my key is sk-proj-abcdefghijklmnopqrstuvwxyz0123456789'},
+    {'values': {'userPassword': 'hunter2-hunter2'}},
+    {'values': {'accessToken': 'opaque-value'}},
+    {'values': {'otp': '482913'}},
 ])
 def test_an_answer_that_carries_a_secret_is_refused(legs, answer):
     from integrations.agent_engine import person_ask
@@ -488,6 +545,15 @@ def test_an_answer_that_carries_a_secret_is_refused(legs, answer):
     body, code = person_ask.answer_ask(ask_id, answer, '10202')
     assert code == 400 and body['reason'] == 'secrets_go_to_the_vault'
     assert person_ask.ask_state(ask_id, '10202')['status'] == 'open'
+
+
+def test_an_answer_with_an_everyday_field_is_taken(legs):
+    from integrations.agent_engine import person_ask
+    ask_id = _ask(component={'type': 'form', 'title': 'Where to?',
+                             'fields': [{'name': 'pin_code', 'type': 'text'}],
+                             'action': '/x'})['ask_id']
+    body, code = person_ask.answer_ask(ask_id, {'values': {'pin_code': '560001'}}, '10202')
+    assert code == 200, body
 
 
 def test_an_ask_with_no_person_is_refused(legs):

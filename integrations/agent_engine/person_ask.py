@@ -46,7 +46,6 @@ and to the agent, never ``waiting``.
 """
 import json
 import logging
-import re
 import threading
 import time
 import uuid
@@ -76,9 +75,28 @@ MAX_ANSWER_DEPTH = 4
 #: phone without end).  The same question asked again is the same ask.
 MAX_OPEN_PER_PERSON = 3
 
-#: Keys that type a field, and the keys that name one.
+#: Keys that type a field, the keys that name one, and the keys whose value is
+#: words the person reads (a field's label, a card's title).
 _TYPE_KEYS = ('type', 'input_type', 'inputType', 'format', 'kind')
 _NAME_KEYS = ('name', 'key', 'field')
+_TEXT_KEYS = ('label', 'placeholder', 'title', 'description', 'hint', 'help',
+              'prompt', 'question')
+#: Beyond the secret key words (security.edge_privacy.is_secret_key), what a
+#: person is only ever asked through the vault: a one-time code, a PIN, a
+#: card's number or code, a wallet's phrase.  Ask-only: on the wire 'pin' is a
+#: GPIO pin, so the egress scrub does not withhold these.
+_CREDENTIAL_WORDS = ('otp', 'otp_code', 'one_time_code', 'pin', 'pin_number',
+                     'passcode', 'cvv', 'cvc', 'card_number', 'secret_key',
+                     'seed_phrase', 'recovery_phrase')
+#: In a sentence these are everyday words ('pass the clips', 'a token of
+#: thanks', 'pin it'), so alone they ask for nothing; 'UPI PIN' or 'access
+#: token' still does.
+_EVERYDAY_WORDS = frozenset({'pass', 'token', 'secret', 'cookie', 'credential',
+                             'credentials', 'pin'})
+#: Little words a phrase that names a secret does not carry ('a token').
+_FUNCTION_WORDS = frozenset({'a', 'an', 'the', 'your', 'my', 'our', 'their',
+                             'his', 'her', 'its', 'this', 'that', 'of', 'to',
+                             'for', 'and', 'or', 'any', 'some', 'no', 's'})
 
 _lock = threading.Lock()
 _asks: Dict[str, '_Ask'] = {}
@@ -120,33 +138,61 @@ def _walk(value):
             stack.extend(v)
 
 
-def _asks_for_a_secret(component) -> bool:
-    """True if any field of ``component`` asks for a secret: marked
-    ``secret``, typed ``password`` in any spelling, or named the way a
-    secret is named (security.edge_privacy.is_secret_key: 'password',
-    'api_key', 'auth_token', ...)."""
-    from security.edge_privacy import is_secret_key
+def _names_a_secret(name) -> bool:
+    """Is ``name`` (a field's or an answer's key, in any spelling) a secret's
+    or a credential's?  security.edge_privacy.is_secret_key, extended by the
+    words only the vault asks for."""
+    from security.edge_privacy import is_secret_key, secret_key_form
+    return isinstance(name, str) and is_secret_key(secret_key_form(name),
+                                                   _CREDENTIAL_WORDS)
+
+
+def _words_ask_for_a_secret(text) -> bool:
+    """Do the words of a label or a title ask for a secret?  One word that
+    names one ('Password', 'Enter the OTP'), or two or three that do the way a
+    field name does ('API key', 'access token', 'UPI PIN', 'card number').
+    An everyday word alone ('pass', 'token', 'pin') is not enough, nor a
+    phrase with a little word in it ('a token')."""
+    if not isinstance(text, str):
+        return False
+    from security.edge_privacy import secret_key_form
+    words = secret_key_form(text).split('_')
+    for i, word in enumerate(words):
+        if word not in _EVERYDAY_WORDS and _names_a_secret(word):
+            return True
+        for n in (2, 3):
+            phrase = words[i:i + n]
+            if len(phrase) == n and not _FUNCTION_WORDS.intersection(phrase) \
+                    and _names_a_secret('_'.join(phrase)):
+                return True
+    return False
+
+
+def _asks_for_a_secret(component, words=()) -> bool:
+    """True if ``component`` asks for a secret: a field marked ``secret``,
+    typed ``password`` in any spelling, named the way a secret is named, or
+    whose label, placeholder or title asks for one; or the ask's own
+    ``words`` (its title and body) do."""
     for d in _walk(component):
         if d.get('secret') is True or str(d.get('secret', '')).strip().lower() in (
                 'true', '1', 'yes'):
             return True
         if any(str(d.get(k, '')).strip().lower() == 'password' for k in _TYPE_KEYS):
             return True
-        for k in _NAME_KEYS:
-            name = d.get(k)
-            if isinstance(name, str) and is_secret_key(
-                    re.sub(r'[^a-z0-9]+', '_', name.lower()).strip('_')):
-                return True
-    return False
+        if any(_names_a_secret(d.get(k)) for k in _NAME_KEYS):
+            return True
+        if any(_words_ask_for_a_secret(d.get(k)) for k in _TEXT_KEYS):
+            return True
+    return any(_words_ask_for_a_secret(w) for w in words)
 
 
-def _refusal(component, prompt_id) -> Optional[str]:
+def _refusal(component, prompt_id, words=()) -> Optional[str]:
     """Why ``component`` cannot be asked, before anything is sent.  Which
     component types exist is the card gate's to say (agent_ui_compose), so a
     type an agent registered at runtime is asked like a builtin."""
     if not isinstance(component, dict) or not component.get('type'):
         return 'not_an_object'
-    if _asks_for_a_secret(component):
+    if _asks_for_a_secret(component, words):
         return 'secrets_go_to_the_vault'
     if component.get('type') == 'file_request':
         from core.user_file_store import INBOUND_PURPOSES
@@ -233,7 +279,7 @@ def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
     user_id = str(user_id or '').strip()
     if not user_id:
         return _refused('no_person')
-    refused = _refusal(component, prompt_id)
+    refused = _refusal(component, prompt_id, (title, body))
     if refused:
         logger.info("person ask refused (%s) for user %s by agent %s",
                     refused, user_id, agent_id)
@@ -286,11 +332,13 @@ def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
                 push=ask_push(ask_id, user_id, ctype, title, body),
                 notification_id=ask_id)
     except Exception:
-        # No row, no ask: the card comes back down and the agent is told,
-        # rather than waiting on a question with no record.
+        # No row, no ask: the card comes back down from every surface it
+        # reached (the phone's topic and the page too, not only the shell),
+        # and the agent is told, rather than waiting on a question with no
+        # record that her answer would find gone.
         with _lock:
             _asks.pop(ask_id, None)
-        _withdraw_card(ask_id)
+        _drop_everywhere(ask_id, user_id)
         logger.warning("person ask for user %s by agent %s NOT filed: its row "
                        "could not be written", user_id, agent_id, exc_info=True)
         return _refused('not_filed')
@@ -336,7 +384,16 @@ def _answer_problem(a: '_Ask', answer) -> Optional[str]:
         logger.warning("person ask %s: the answer could not be checked for "
                        "secrets, so it is refused", a.ask_id, exc_info=True)
         return 'bad_answer'
-    return 'secrets_go_to_the_vault' if found else None
+    if found or any(_names_a_secret(k) and _has_a_value(v)
+                    for d in _walk(answer) for k, v in d.items()):
+        return 'secrets_go_to_the_vault'
+    return None
+
+
+def _has_a_value(v) -> bool:
+    if isinstance(v, str):
+        return bool(v.strip())
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
 def _bind_picks(a: '_Ask', xids) -> Optional[str]:
@@ -365,17 +422,23 @@ def _mark_read(ask_id: str, user_id: str) -> None:
                        "still lists it", ask_id, exc_info=True)
 
 
-def _close(ask_id: str, user_id: str) -> None:
-    """The ask is over: every surface is told to drop its card, the shell's
-    store lets it go and the bell stops listing it."""
+def _drop_everywhere(ask_id: str, user_id: str) -> None:
+    """Every surface is told to drop the ask's card (ANSWERED_TYPE, which is
+    the one drop event they listen for) and the shell's store lets it go."""
     try:
         from integrations.social.realtime import on_notification
         on_notification(str(user_id), {'type': ANSWERED_TYPE, 'ask_id': ask_id,
                                        'msg_id': f'{ask_id}.answered'})
     except Exception:
-        logger.warning("person ask %s: the answered fan-out failed, so other "
+        logger.warning("person ask %s: the drop fan-out failed, so other "
                        "surfaces keep the card", ask_id, exc_info=True)
     _withdraw_card(ask_id)
+
+
+def _close(ask_id: str, user_id: str) -> None:
+    """The ask is over: its card drops everywhere and the bell stops
+    listing it."""
+    _drop_everywhere(ask_id, user_id)
     _mark_read(ask_id, user_id)
 
 
