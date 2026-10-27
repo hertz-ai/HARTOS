@@ -174,6 +174,33 @@ def test_no_transformers_is_not_a_fault(monkeypatch, caplog):
     assert 'defang skipped' not in caplog.text
 
 
+@pytest.mark.parametrize('error', [
+    KeyError('Name'),                  # corrupt dist-info (observed 2026-04-26)
+    RuntimeError('transformers blew up while importing'),
+    ImportError('cannot import name x from y'),
+])
+def test_a_transformers_that_raises_on_import_never_escapes_import_core(
+        monkeypatch, caplog, error):
+    """The guard runs at import of `core` and `integrations`, before
+    hart_intelligence_entry's packages_distributions workaround.  A corrupt
+    dist-info makes `import transformers` raise KeyError('Name'); the original
+    code swallowed everything, and narrowing the import's catch to ImportError
+    let it escape `import core` and fail the backend's start (review of
+    #142).  It must be logged, never raised, at import and on a direct call."""
+    monkeypatch.delitem(sys.modules, 'transformers', raising=False)
+
+    class _Boom:
+        def find_spec(self, name, path=None, target=None):
+            if name == 'transformers':
+                raise error
+
+    monkeypatch.setattr(sys, 'meta_path', [_Boom()] + list(sys.meta_path))
+    with caplog.at_level(logging.WARNING):
+        guard = _load_guard()            # the import-time call
+        guard.bind_gpt2_tokenizer_fast()  # and a direct one
+    assert 'defang skipped' in caplog.text
+
+
 def test_the_entry_module_has_no_second_copy():
     """One implementation: hart_intelligence_entry calls the guard's."""
     with open(_ENTRY, encoding='utf-8') as fh:

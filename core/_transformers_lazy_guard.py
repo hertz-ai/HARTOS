@@ -86,12 +86,18 @@ def bind_gpt2_tokenizer_fast() -> None:
     HARTOS import, and ``hart_intelligence_entry`` calls the same function.
     Idempotent, and an existing binding is left alone.  transformers not being
     installed is not a fault (nothing to bind); any other failure is logged
-    with its traceback, never swallowed.
+    with its traceback and never raised.
+
+    Never raised, because this runs at import of ``core`` and
+    ``integrations``, before hart_intelligence_entry's packages_distributions
+    workaround: a corrupt dist-info makes ``import transformers`` raise
+    ``KeyError('Name')`` (observed 2026-04-26), and an exception here would
+    escape ``import core`` and stop the backend from starting.
     """
     try:
         import transformers as _tf
-    except ImportError as exc:
-        if exc.name == 'transformers':
+    except Exception as exc:
+        if isinstance(exc, ImportError) and exc.name == 'transformers':
             return
         logging.getLogger(__name__).warning(
             "transformers GPT2 tokenizer defang skipped (transformers failed "
