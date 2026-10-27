@@ -105,13 +105,38 @@ def save_agent_data(prompt_id, data) -> bool:
         except ImportError as e:
             logger.debug(f"agent_data saved unencrypted: {e}")
         tmp = f"{file_path}.{os.getpid()}.{threading.get_ident()}.tmp"
-        with open(tmp, 'wb') as f:
-            f.write(payload)
-        os.replace(tmp, file_path)
+        try:
+            with open(tmp, 'wb') as f:
+                f.write(payload)
+            os.replace(tmp, file_path)
+        except OSError:
+            # On Windows os.replace fails while another handle has the
+            # target open (WinError 5; the kids media route reads these
+            # files on every cue), and the temp file was left behind
+            # (review of fafa03c40, R3).
+            try:
+                os.remove(tmp)
+            except OSError as cleanup_error:
+                logger.debug(f"could not remove {tmp}: {cleanup_error}")
+            raise
         return True
     except Exception as e:
         logger.warning(f"Failed to save agent_data for {prompt_id}: {e}")
         return False
+
+
+def forget_cached_store(store_id) -> int:
+    """After a store file is written outside the recipe pipelines' agent_data
+    caches (create_recipe and reuse_recipe each hold one, restoring with
+    load_agent_data above), every such cache drops its copy, so neither
+    serves the old value or writes it back over the new one.  The caches
+    key an agent by its prompt id as given, int or str, so both forms go.
+    Returns how many entries were dropped."""
+    from core.session_cache import TTLCache
+    keys = {str(store_id)}
+    if str(store_id).isdigit():
+        keys.add(int(store_id))
+    return sum(TTLCache.forget_everywhere(key, load_agent_data) for key in keys)
 
 
 def load_user_ledger(user_prompt):

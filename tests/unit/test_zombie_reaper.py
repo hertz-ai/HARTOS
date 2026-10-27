@@ -165,12 +165,13 @@ def _patch_imports(monkeypatch, ledgers, audit_calls):
     try:
         monkeypatch.setattr(
             'integrations.agent_engine.api._iter_ledgers',
-            lambda agent_filter=None: iter(ledgers),
+            lambda agent_filter=None, in_progress_only=False: iter(ledgers),
             raising=False,
         )
     except (ImportError, ModuleNotFoundError):
         # Inject a fake api module too if even that import fails.
-        fake_api = SimpleNamespace(_iter_ledgers=lambda agent_filter=None: iter(ledgers))
+        fake_api = SimpleNamespace(
+            _iter_ledgers=lambda agent_filter=None, in_progress_only=False: iter(ledgers))
         monkeypatch.setitem(sys.modules, 'integrations.agent_engine.api', fake_api)
     return fake_audit
 

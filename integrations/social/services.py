@@ -211,9 +211,28 @@ class UserService:
         ).all()
 
     @staticmethod
+    def machine_account_conflict(existing: User, user_type: str = 'system',
+                                 settings: Optional[dict] = None) -> Optional[str]:
+        """Why `existing` is NOT the machine account ensure_system_user makes
+        under its username, or None when it is: a different user_type, an
+        owner (a machine account is owned by no one), or a settings value
+        that differs from the marker it was made with.  The collision guard,
+        readable without writing, so a caller can refuse before doing work."""
+        if existing.user_type != user_type:
+            return f"user_type={existing.user_type!r}"
+        if existing.owner_id is not None:
+            return "it has an owner"
+        have = existing.settings or {}
+        for key, value in (settings or {}).items():
+            if have.get(key) != value:
+                return f"settings[{key!r}]={have.get(key)!r}"
+        return None
+
+    @staticmethod
     def ensure_system_user(db: Session, username: str,
                            display_name: str = None,
-                           bio: str = '') -> User:
+                           bio: str = '', user_type: str = 'system',
+                           settings: Optional[dict] = None) -> User:
         """Idempotent system-user bootstrap.
 
         Returns the existing User row if `username` is taken AND that
@@ -235,23 +254,34 @@ class UserService:
         Skips the 3-word agent_naming validation: system users are
         not user-facing accounts and don't participate in handle
         uniqueness via that validator.
+
+        `user_type='agent'` with a `settings` marker makes a machine
+        account that votes at agent weight (the world model's voter,
+        ThoughtExperimentService.ensure_world_model_voter).  The tally
+        decides person or not from the account (voting_rules.is_person), so
+        'agent' and 'system' both weigh as agents there and at the vote
+        route (3cfae2005).  The guard (machine_account_conflict) then
+        also refuses an owned account or one without the marker.
         """
         existing = db.query(User).filter(User.username == username).first()
         if existing:
-            if existing.user_type != 'system':
+            conflict = UserService.machine_account_conflict(
+                existing, user_type, settings)
+            if conflict:
                 raise ValueError(
                     f"system username {username!r} is already taken by a "
-                    f"non-system account (user_type={existing.user_type!r}); "
-                    "refusing to hijack — rename the human account or pick "
-                    "a different system identity"
+                    f"non-system account ({conflict}); refusing to hijack: "
+                    "rename that account or pick a different system identity"
                 )
             return existing
         user = User(
             id=_uuid(), username=username,
             display_name=display_name or username,
-            bio=bio, user_type='system',
+            bio=bio, user_type=user_type,
             api_token=generate_api_token(), is_verified=True,
         )
+        if settings:
+            user.settings = dict(settings)
         db.add(user)
         db.flush()
         return user
@@ -341,6 +371,10 @@ class UserService:
         - an agent or system account with no human owner: None;
         - an id with no local users row: returned unchanged, because a goal
           submitted on another node names a requester this node never saw.
+
+        The vote tally uses the same person test with two deliberate
+        differences (voting_rules.voter_identity): it walks the whole owner
+        chain, and an owner it cannot see counts as this node.
         """
         from core.constants import NON_PERSON_USER_TYPES
         user = UserService.get_by_id(db, user_id)

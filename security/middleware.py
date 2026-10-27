@@ -369,6 +369,15 @@ def _apply_api_auth(app: Flask, register: bool = True):
             {'error': 'Authentication required (Bearer token)'},
         ), 401
 
+    def _say_refused():
+        """Say once that the gate refuses the request's bearer
+        (integrations.social.auth.log_refused_credential).  Called where the
+        gate gives its final answer, not inside _require_api_key_or_bearer:
+        on a desktop that 401 is only the first check, and a phone the
+        owner allowed is admitted right after it."""
+        from integrations.social.auth import log_refused_credential
+        log_refused_credential(reason='jwt_invalid')
+
     def _admit_owner_allowed_device(refused):
         """A desktop's second network credential: a token the phone signed
         with its own PeerLink key, admitted when the owner has allowed that
@@ -478,7 +487,10 @@ def _apply_api_auth(app: Flask, register: bool = True):
             # A person's phone, signed with the key the owner allowed (#111):
             # only after the key and the local JWT have not admitted it, so
             # every caller admitted today is admitted exactly as before.
-            return _admit_owner_allowed_device(refused)
+            answer = _admit_owner_allowed_device(refused)
+            if answer is refused:
+                _say_refused()
+            return answer
 
         if _is_exempt(path):
             return
@@ -492,6 +504,7 @@ def _apply_api_auth(app: Flask, register: bool = True):
         if _is_admin_path(path):
             resp = _require_api_key_or_bearer(expected_key)
             if resp is not None:
+                _say_refused()
                 return resp
             return  # Admin path authenticated, skip gate 2
 
@@ -505,11 +518,13 @@ def _apply_api_auth(app: Flask, register: bool = True):
         if expected_key:
             resp = _require_api_key_or_bearer(expected_key)
             if resp is not None:
+                _say_refused()
                 return resp
             return
         if node_tier == 'central':
             resp = _require_api_key_or_bearer(expected_key='')
             if resp is not None:
+                _say_refused()
                 return resp
             return
         # Non-central without API key → LAN-trusted or gateway-auth'd

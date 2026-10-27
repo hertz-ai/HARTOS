@@ -94,7 +94,8 @@ def _admin_auth_gate():
     behind the social admin blueprint's own @require_admin and
     @require_moderator decorators.
     """
-    from integrations.social.auth import _get_user_from_token, holds_central_role
+    from integrations.social.auth import (
+        _get_user_from_token, holds_central_role, log_refused_credential)
     from flask import g
 
     auth_header = request.headers.get('Authorization', '')
@@ -106,6 +107,7 @@ def _admin_auth_gate():
     if user is None:
         if db:
             db.close()
+        log_refused_credential(token)
         return jsonify({'success': False, 'error': 'Invalid or expired token'}), 401
 
     node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat').lower()

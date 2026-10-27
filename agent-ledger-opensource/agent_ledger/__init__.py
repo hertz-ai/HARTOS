@@ -40,6 +40,7 @@ from .core import (
     Task,
     TaskType,
     TaskStatus,
+    WORK_IN_PROGRESS,
     ExecutionMode,
     TaskLocality,
     TaskSensitivity,
@@ -77,6 +78,7 @@ from .factory import (
     get_or_create_ledger,
     migrate_ledger_to_redis,
     clear_ledger_cache,
+    cached_ledgers,
 )
 
 # Distributed features (optional — require Redis at runtime, not import time)
@@ -95,6 +97,7 @@ __all__ = [
     "Task",
     "TaskType",
     "TaskStatus",
+    "WORK_IN_PROGRESS",
     "ExecutionMode",
     "TaskLocality",
     "TaskSensitivity",
@@ -131,6 +134,7 @@ __all__ = [
     "get_or_create_ledger",
     "migrate_ledger_to_redis",
     "clear_ledger_cache",
+    "cached_ledgers",
 
     # Distributed features (optional — require Redis)
     "TaskVerification",

@@ -233,7 +233,8 @@ class TestDaemonAutoEvolveTick(unittest.TestCase):
         with patch('integrations.social.models.db_session',
                    return_value=db_context), patch(
                 'integrations.social.thought_experiment_service.'
-                'ThoughtExperimentService.advance_due_experiments'), patch(
+                'ThoughtExperimentService.advance_due_experiments'), patch.object(
+                AgentDaemon, '_spawn_world_model_votes_async'), patch(
                 'integrations.agent_engine.auto_evolve.'
                 'get_auto_evolve_orchestrator',
                 return_value=orchestrator), patch(

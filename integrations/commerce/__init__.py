@@ -4,8 +4,10 @@
                     commerce_bindings.json)
     mcgroce_client  REST I/O only (Basic service account + customerId from
                     the binding, https, circuit breaker)
-    commerce_tools  the agent tools (Tier-2, goal tag 'commerce') and the
-                    COMMERCE_TOOLS list the MCP bridge exposes
+    commerce_tools  the agent tools (Tier-2, goal tag 'commerce'); never on
+                    the MCP bridge, whose caller is not a shopper
+    signing         the MACs on every McGroce <-> HARTOS message (session
+                    exchange, consumed-mandate attestation)
     commerce_api    Flask blueprint /api/commerce/* (session exchange,
                     mandate status, health)
 

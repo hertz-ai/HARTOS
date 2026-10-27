@@ -2,15 +2,18 @@
 /api/commerce/* -- the McGroce <-> HARTOS session exchange and status reads.
 
   POST /api/commerce/session        server-to-server from McGroce's Tomcat
-                                    (SpaAgentTokenEndpoint).  Header
-                                    X-Commerce-Secret must equal
-                                    COMMERCE_SESSION_SECRET (constant-time).
-                                    Body {customerId, username, role,
-                                    storeId}.  Writes the commerce binding and
-                                    returns a HARTOS JWT (tenant 'mcgroce')
-                                    the SPA then sends as Bearer to POST /chat
-                                    and /api/agent/approval.  The McGroce
-                                    service account never reaches a browser.
+                                    (SpaAgentTokenEndpoint).  Signed with a
+                                    key derived from COMMERCE_SESSION_SECRET
+                                    (timestamp, single-use nonce, body hash:
+                                    integrations/commerce/signing.py); the
+                                    secret itself never travels, and the
+                                    answer is signed back.  Body {customerId,
+                                    username, role, storeId}.  Writes the
+                                    commerce binding and returns a HARTOS JWT
+                                    (tenant 'mcgroce') the SPA then sends as
+                                    Bearer to POST /chat and
+                                    /api/agent/approval.  The McGroce service
+                                    account never reaches a browser.
   GET  /api/commerce/mandates/<id>  the caller's own mandate status (JWT).
   GET  /api/commerce/stream         where the caller's live cards arrive
                                     (no new stream: the per-user topic).
@@ -19,11 +22,18 @@
 The agentic chat itself is the existing POST /chat -- no second chat route.
 """
 
-import hmac
+import json
 import logging
 import time
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, current_app, jsonify, request
+
+# At import, i.e. when the blueprint registers at boot: the nonce memory's
+# "signed before this process started" line is drawn when signing loads, so
+# loading it on the first request would refuse that request's honest
+# signature whenever McGroce's clock trails by a second.
+from integrations.commerce.signing import (
+    SIGNATURE_HEADER, response_signature, verify_request)
 
 logger = logging.getLogger(__name__)
 
@@ -37,15 +47,25 @@ def _json_error(message: str, code: int):
 @commerce_bp.route('/api/commerce/session', methods=['POST'])
 def commerce_session():
     from core.config_cache import get_secret
-    expected = get_secret('COMMERCE_SESSION_SECRET', '')
-    if not expected:
+    secret = get_secret('COMMERCE_SESSION_SECRET', '')
+    if not secret:
         return _json_error('commerce session exchange is not configured', 503)
-    given = request.headers.get('X-Commerce-Secret', '')
-    if not hmac.compare_digest(given.encode('utf-8'), expected.encode('utf-8')):
+    body = request.get_data(cache=True)
+    # The declared route, not request.path: a proxy prefix must not break
+    # a signature McGroce made over the path it was told to call.
+    ok, why, nonce = verify_request(secret, request.method,
+                                    request.url_rule.rule, request.headers,
+                                    body)
+    if not ok:
         from core.auth_local import client_key
-        logger.warning('commerce session: bad secret from %s', client_key())
+        logger.warning('commerce session: refused from %s: %s', client_key(), why)
         return _json_error('forbidden', 403)
-    data = request.get_json(silent=True) or {}
+    try:
+        data = json.loads(body or b'{}')
+    except ValueError:
+        data = None
+    if not isinstance(data, dict):
+        return _json_error('the body must be a JSON object', 400)
     customer_id = data.get('customerId')
     username = str(data.get('username') or '').strip()
     role = str(data.get('role') or 'customer').strip().lower()
@@ -61,8 +81,13 @@ def commerce_session():
     token = generate_jwt(binding['user_id'], username, role, tenant_id=TENANT)
     claims = decode_jwt(token) or {}
     expires_in = int(claims['exp'] - time.time()) if claims.get('exp') else None
-    return jsonify({'success': True, 'token': token, 'expiresIn': expires_in,
-                    'userId': binding['user_id']})
+    # Signed back, bound to this request's nonce: McGroce uses the token
+    # only when the answer is provably this one, from this node.
+    answer = json.dumps({'success': True, 'token': token, 'expiresIn': expires_in,
+                         'userId': binding['user_id']}).encode('utf-8')
+    resp = current_app.response_class(answer, mimetype='application/json')
+    resp.headers[SIGNATURE_HEADER] = response_signature(secret, nonce, answer)
+    return resp
 
 
 @commerce_bp.route('/api/commerce/mandates/<mandate_id>', methods=['GET'])
@@ -70,9 +95,14 @@ def commerce_mandate(mandate_id):
     from integrations.commerce.approvals import approver_from_request
     user_id = approver_from_request(request)
     if not user_id:
+        from integrations.social.auth import log_refused_credential
+        log_refused_credential()
         return _json_error('sign in first', 401)
-    from integrations.ap2.ap2_mandate import get_mandate_store
-    m = get_mandate_store().get(mandate_id)
+    from integrations.ap2.ap2_mandate import MandateKeyError, get_mandate_store
+    try:
+        m = get_mandate_store().get(mandate_id)
+    except MandateKeyError as e:
+        return _json_error(str(e), 503)
     # Someone else's mandate answers exactly like a missing one.
     if m is None or m.user_id != user_id:
         return _json_error('mandate not found', 404)
@@ -92,6 +122,8 @@ def commerce_stream():
     from integrations.commerce.approvals import approver_from_request
     user_id = approver_from_request(request)
     if not user_id:
+        from integrations.social.auth import log_refused_credential
+        log_refused_credential()
         return _json_error('sign in first', 401)
     return jsonify({'user_id': user_id,
                     'wamp_topic': f'com.hertzai.hevolve.social.{user_id}',

@@ -133,27 +133,27 @@ def _send_email(to_email: str, subject: str, html_body: str) -> Dict:
     # Strip HTML for plain-text fallback
     plain_text = re.sub(r'<[^>]+>', '', sanitized_body).strip()
 
-    # Tier 1: Email channel adapter (user's SMTP)
+    # Tier 1: Email channel adapter (user's SMTP), run on the channel
+    # integration's loop, which owns the adapters (ChannelRegistry has none).
     try:
-        from integrations.channels.registry import get_registry
+        from integrations.channels.flask_integration import get_channel_integration
         import asyncio
-        registry = get_registry()
-        adapter = registry.get_adapter('email')
-        if adapter and hasattr(adapter, 'send_email'):
-            loop = getattr(registry, '_loop', None)
-            if loop and loop.is_running():
-                future = asyncio.run_coroutine_threadsafe(
-                    adapter.send_email(
-                        to=to_email, subject=subject,
-                        body=plain_text, html_body=sanitized_body,
-                    ),
-                    loop,
-                )
-                result = future.result(timeout=30)
-                return {'success': result.success, 'via': 'email_channel',
-                        'error': result.error if not result.success else None}
+        integration = get_channel_integration()
+        adapter = integration.registry.get('email')
+        loop = integration.running_loop()
+        if adapter is not None and hasattr(adapter, 'send_email') and loop is not None:
+            future = asyncio.run_coroutine_threadsafe(
+                adapter.send_email(
+                    to=to_email, subject=subject,
+                    body=plain_text, html_body=sanitized_body,
+                ),
+                loop,
+            )
+            result = future.result(timeout=30)
+            return {'success': result.success, 'via': 'email_channel',
+                    'error': result.error if not result.success else None}
     except Exception as e:
-        logger.debug(f"Email channel not available: {e}")
+        logger.warning(f"Email channel send failed, trying the mailer service: {e}")
 
     # Tier 2: HertzAI mailer service (fallback)
     try:
@@ -740,8 +740,10 @@ def check_pending_followups_daemon() -> dict:
     """Module-level follow-up checker called by agent_daemon on each tick.
 
     Delegates to the tool-level check_pending_followups logic (DRY).
-    Returns dict with 'sent' count.
+    Returns dict with 'sent' count.  Also attaches the reply hook once the
+    email channel exists: boot wires it before channels are restored.
     """
+    register_reply_handler()
     result_json = _check_pending_followups_impl()
     result = json.loads(result_json)
     sent = len([a for a in result.get('actions', []) if a.get('action') == 'followup_sent'])
@@ -904,26 +906,34 @@ def _dispatch_response_draft(prospect: Dict, context: Dict):
 
 
 def register_reply_handler():
-    """Register the inbound email handler with the email channel adapter.
+    """Register the inbound email handler with the email channel adapter,
+    once per adapter.
 
-    Called during boot (from register_outreach_goal_type) to wire
-    reply detection into the channel system.
+    Called at boot (from register_outreach_goal_type), before channels are
+    restored, and again on every outreach tick
+    (check_pending_followups_daemon), which is what attaches it once the
+    email channel is up.  The hook reads the Message the email adapter
+    builds: the subject in ``raw``, the message id in ``id``.
     """
     try:
         from integrations.channels.registry import get_registry
-        registry = get_registry()
-        adapter = registry.get_adapter('email')
-        if adapter and hasattr(adapter, 'on_message'):
-            async def _outreach_reply_hook(message):
-                """Post-process inbound emails for prospect matching."""
-                sender = getattr(message, 'sender_id', '') or ''
-                subject = getattr(message, 'metadata', {}).get('subject', '')
-                body = getattr(message, 'text', '')
-                msg_id = getattr(message, 'message_id', '')
-                if '@' in sender:
-                    handle_inbound_email(sender, subject, body, msg_id)
+        adapter = get_registry().get('email')
+        if adapter is None or not hasattr(adapter, 'on_message'):
+            return
+        if getattr(adapter, '_outreach_reply_hooked', False):
+            return
 
-            adapter.on_message(_outreach_reply_hook)
-            logger.info("Outreach reply handler registered with email adapter")
+        async def _outreach_reply_hook(message):
+            """Post-process inbound emails for prospect matching."""
+            sender = getattr(message, 'sender_id', '') or ''
+            subject = (getattr(message, 'raw', None) or {}).get('subject', '')
+            body = getattr(message, 'text', '') or ''
+            msg_id = getattr(message, 'id', '') or ''
+            if '@' in sender:
+                handle_inbound_email(sender, subject, body, msg_id)
+
+        adapter.on_message(_outreach_reply_hook)
+        adapter._outreach_reply_hooked = True
+        logger.info("Outreach reply handler registered with email adapter")
     except Exception as e:
-        logger.debug(f"Could not register reply handler: {e}")
+        logger.warning(f"Could not register the outreach reply handler: {e}")

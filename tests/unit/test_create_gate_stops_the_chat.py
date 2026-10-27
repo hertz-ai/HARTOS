@@ -56,6 +56,12 @@ from hartos.threadlocal import thread_local_data  # noqa: E402
 
 STUB = {'action': 'Respond to user', 'action_id': 1, 'status': 'pending'}
 CANNED = 'Processing a tool now please try later'
+
+
+def _create_key(user_prompt):
+    """The running-turn registry's key for a CREATE session's turn: one
+    registry in helper keyed by (session, group), CREATE's group 'create'."""
+    return (user_prompt, cr._CREATE_GROUP)
 POSTED = {'role': 'user', 'name': 'ChatInstructor',
           'content': 'Execute Action 1: Respond to user ,Latest User message: '
                      'Run a thought experiment'}
@@ -209,11 +215,11 @@ class TestAnOrphanedToolCallIsSettled:
         t = threading.Thread(target=lambda: other.append(threading.get_ident()))
         t.start()
         t.join()
-        cr._TURNS_IN_FLIGHT[s.up] = {other[0]: 1}
+        cr._TURNS_IN_FLIGHT[_create_key(s.up)] = {other[0]: 1}
         try:
             reply = cr.get_response_group(s.user_id, 'and again', s.prompt_id)
         finally:
-            cr._TURNS_IN_FLIGHT.pop(s.up, None)
+            cr._TURNS_IN_FLIGHT.pop(_create_key(s.up), None)
         assert reply == CANNED
         s.agents_object['user'].initiate_chat.assert_not_called()
         assert cr.has_pending_tool_calls(s.group_chat.messages), \
@@ -231,15 +237,15 @@ def test_the_turn_marker_is_per_session_and_re_entrant():
     with cr._turn_in_flight(up):
         assert not cr._another_turn_in_flight(up)
         with cr._turn_in_flight(up):
-            assert cr._TURNS_IN_FLIGHT[up] == {me: 2}
-        assert cr._TURNS_IN_FLIGHT[up] == {me: 1}, \
+            assert cr._TURNS_IN_FLIGHT[_create_key(up)] == {me: 2}
+        assert cr._TURNS_IN_FLIGHT[_create_key(up)] == {me: 1}, \
             'the inner exit must not clear the outer turn'
         seen = []
         t = threading.Thread(target=lambda: seen.append(cr._another_turn_in_flight(up)))
         t.start()
         t.join()
         assert seen == [True]
-    assert up not in cr._TURNS_IN_FLIGHT
+    assert _create_key(up) not in cr._TURNS_IN_FLIGHT
 
 
 def test_a_turn_that_ends_does_not_unmark_a_turn_still_running():
@@ -279,7 +285,7 @@ def test_a_turn_that_ends_does_not_unmark_a_turn_still_running():
         t1.join(10)
         t2.join(10)
     assert not cr._another_turn_in_flight(up)
-    assert up not in cr._TURNS_IN_FLIGHT
+    assert _create_key(up) not in cr._TURNS_IN_FLIGHT
 
 
 def test_the_settle_reaches_every_agents_own_history(session):

@@ -348,8 +348,17 @@ def build_book_tools(ctx) -> List[Tuple[str, str, Any]]:
         try:
             started = bp.start_parse(path, user_id)
         except Exception as e:
-            logger.warning("parse_book_pdf could not start for %s: %s", file_url, e)
-            return f'Could not start PDF parsing: {e}'
+            # exc_info because driver_text's docstring promises the operator
+            # keeps what this answer drops -- and this caller, the fourth that
+            # docstring names, logged the text with no traceback at all
+            # (hartos-f3's review of df055008a, Minor 2).
+            logger.warning("parse_book_pdf could not start for %s: %s", file_url, e,
+                           exc_info=True)
+            # The agent's answer goes into a model's prompt, and that model can
+            # be a cloud one, so this copy drops the driver's rendered [SQL:]
+            # and [parameters:] -- for a registration those carry the uploads
+            # directory. The warning above still has them (H-0715).
+            return f'Could not start PDF parsing: {bp.driver_text(e)}'
         if started.get('status') == 'completed':
             return json.dumps({
                 'status': 'completed',

@@ -27,7 +27,8 @@ from core.foreground import should_yield_to_user
 
 from .channels import device_may_receive
 from .link import (PeerLink, TrustLevel, LinkState, hello_names_device,
-                   provable_user_id, set_device_verifier, set_peer_admission_ask)
+                   provable_user_id, set_device_verifier, set_peer_admission_ask,
+                   device_services_pending, device_services_ready)
 
 logger = logging.getLogger('hevolve.peer_link')
 
@@ -111,6 +112,20 @@ class PeerLinkManager:
         under hard enforcement is refused without the owner being asked
         (link.py) -- fail closed, but say so in the log."""
         set_peer_admission_ask(fn)
+
+    def device_services_pending(self) -> None:
+        """This node is installing what a phone's link rides on
+        (hartos_bootstrap steps 1c to 5d: the device verifier, the mobile
+        adapter and its 'mobile_paths', the file channel).  A device HELLO
+        meanwhile is refused 'not_ready' and re-dialled (link.py), so no
+        phone keeps a hello_ack that names no paths.  Same seam as
+        set_device_verifier: core never imports the subsystems."""
+        device_services_pending()
+
+    def device_services_ready(self) -> None:
+        """The device steps are over, however they went: device HELLOs are
+        answered again, with whatever the steps advertised."""
+        device_services_ready()
 
     def start(self):
         """Start the link manager background maintenance."""
