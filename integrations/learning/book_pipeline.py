@@ -255,7 +255,26 @@ def fetch_pdf(url, timeout=60) -> Path:
     finally:
         response.close()
     name = str(url).split('?', 1)[0].rstrip('/').rsplit('/', 1)[-1]
-    return save_pdf(bytes(data), name or 'book.pdf')
+    try:
+        return save_pdf(bytes(data), name or 'book.pdf')
+    except OSError as e:
+        # The operator's copy: the path and the traceback, on this machine.
+        logger.warning("book: a downloaded PDF could not be stored", exc_info=True)
+        # Rebuilt rather than blanked: clearing e.filename leaves a trailing
+        # ": None" where the path was. Only strerror is replaced, so the errno
+        # and the subclass survive -- when errno is set; an errno-less
+        # FileNotFoundError(path) comes back as a plain OSError -- and
+        # this stays an OSError rather than becoming a BookParseError -- a
+        # storage failure is not a bad request.
+        #
+        # The sentence names THIS node on purpose. Without that, a failure to
+        # write here reaches the agent as "[Errno 2] No such file or
+        # directory" about the LINK, whose PDF arrived perfectly well.
+        reason = ('this node could not store the download '
+                  f'({os_error_reason(e, "no reason reported")})')
+        if e.errno is None:
+            raise OSError(reason) from e
+        raise OSError(e.errno, reason) from e
 
 
 # ── The PDF engine (pypdfium2) ────────────────────────────────────────
@@ -276,9 +295,20 @@ def _open(pdf_path):
     except pdfium.PdfiumError as e:
         if 'password' in str(e).lower():
             raise BookParseError('this PDF is password-protected') from e
+        # PDFium's own words carry no path -- measured 2026-10-25 on a non-PDF
+        # and on an empty file, both "Failed to load document (PDFium: Data
+        # format error)." -- so this one is repeated as it stands.
         raise BookParseError(f'this file could not be read as a PDF ({e})') from e
     except OSError as e:
-        raise BookParseError(f'the PDF could not be opened ({e})') from e
+        # The operator's copy: the path and the traceback, on this machine.
+        logger.warning("book: %s could not be opened", pdf_path, exc_info=True)
+        # pypdfium2 raises FileNotFoundError(path) with strerror unset, so the
+        # default below is what a person actually reads on this branch. It
+        # states the fact and gives no advice to upload again, because the same
+        # branch serves a link the caller named by URL and never uploaded.
+        raise BookParseError(
+            'the PDF could not be opened '
+            f'({os_error_reason(e, "the file is no longer on this node")})') from e
 
 
 #: PDFium is not thread-safe -- pypdfium2's README says so ("Incompatibility
@@ -581,6 +611,147 @@ _LOCK_RETRY_DELAYS = (0.25, 0.5, 1.0, 2.0)
 _LOCK_ERRORS = ('database is locked', 'deadlock', 'lock wait timeout')
 
 
+def is_lock_error(exc) -> bool:
+    """True when ``exc`` is another writer holding the lock, not a bad book.
+
+    One spelling, four callers: ``_retry_on_lock`` reads it to decide whether
+    to wait, and the upload route and the worker's two failure paths read it to
+    decide what to tell the person. A held lock is transient and the file is
+    fine, so those answers must not drift apart.
+
+    Only a database error can be a lock. The worker's handler is given every
+    exception a whole parse can raise, and most carry no ``.orig``, so without
+    this gate the fallback below reads the *message* -- and
+    ``BookParseError('the PDF could not be opened (...\\OS_Deadlocks.pdf)')``
+    was classified as lock contention, telling a person to re-upload a file
+    that can never parse (measured 2026-10-18, the defect this gate closes).
+    That exact text is historical: _open no longer repeats the path (74b39d1a4).
+    The gate still earns its place, because a book's own complaint can carry a
+    lock word by other routes -- PDFium's wording, or the book's own name.
+
+    Reads the DBAPI error, not the rendered statement. SQLAlchemy's
+    ``StatementError.__str__`` appends ``[SQL: ...]`` and ``[parameters: ...]``,
+    and for ``_register`` those carry the uploaded filename, the uploads
+    directory and the caller-supplied request_id -- so matching the whole
+    string let a book called ``deadlock.pdf`` be read as lock contention and
+    answered "try again" when the real failure (a missing table, say) was
+    permanent. Measured 2026-10-18 on the real route with the library tables
+    dropped: physics.pdf answered 500 and deadlock.pdf answered 503.
+
+    ``.orig`` present but None means no driver error, so no lock: keep
+    ``getattr(exc, 'orig', exc)`` rather than tidying it to
+    ``getattr(exc, 'orig', None) or exc``, which would fall back to the
+    rendered statement for that shape and bring the filename back with it.
+    A driver error whose own ``__str__`` raises is not a lock either, and
+    must not raise from here: this runs inside the route's ``except``, where
+    raising would cost the person the JSON answer and the operator the log
+    line (SQLAlchemy guards the same call in ``DBAPIError.__init__``).
+    """
+    from sqlalchemy.exc import SQLAlchemyError
+    if not isinstance(exc, SQLAlchemyError):
+        return False
+    try:
+        text = str(getattr(exc, 'orig', exc)).lower()
+    except Exception as unreadable:
+        logger.debug("book library: a driver error could not be read, so it "
+                     "is not treated as a lock (%r)", unreadable)
+        return False
+    return any(m in text for m in _LOCK_ERRORS)
+
+
+def os_error_reason(exc, default) -> str:
+    """An OS error's own words, with no path among them.
+
+    Reads ``strerror`` and nothing else. ``str(exc)`` is never safe here:
+    OSError renders ``filename`` into it through repr, so on Windows the
+    backslashes double and a substring check for the real path quietly cannot
+    fail; and a hand-raised OSError carries its whole message in ``args[0]``,
+    where a path sits just as easily. ``strerror`` is unset for both of those
+    shapes, which is what ``default`` is for -- reporting it unguarded tells a
+    person "None".
+
+    ``default`` is the caller's sentence because the two callers describe
+    different failures: a book that is no longer on this node, and a download
+    this node could not store. One rule, two sentences, each chosen at its own
+    call site rather than drifting apart.
+
+    driver_text is the companion for a database error. Both exist because
+    these messages LEAVE the node: book_tools puts a failed book's error into
+    an agent's tool output, which becomes a model's prompt and that model can
+    be a cloud one, and api_books hands a job's error to a client that may be
+    a phone (H-0715 scrubs what leaves, never the operator's own log).
+    """
+    return exc.strerror or default
+
+
+def driver_text(exc) -> str:
+    """The driver's own words for ``exc``, safe to repeat to a person.
+
+    is_lock_error's companion: that one reads ``.orig`` to decide whether a
+    failure is transient, this one reads it to decide what may be said out
+    loud. It is ``StatementError.__str__`` that appends ``[SQL: ...]`` and
+    ``[parameters: ...]``, so only that class is unwrapped -- every other
+    exception already says only what it was given.
+
+    The lock half of this was closed on 2026-10-18 by routing locks to
+    _BUSY_NOT_SAVED (see the comment below for the leak measured then). The
+    rest stayed open: classifying by transience left the RENDERING of
+    everything else untouched, and a ``disk I/O error`` is not a lock, so it
+    took the ``else`` branch and printed the statement in full. That error is
+    not hypothetical here -- this node raised it from 16:26 to 17:37 on
+    2026-10-22, with the disk at zero bytes free.
+
+    The operator loses nothing -- but ONLY because every caller logs the
+    exception itself beside this call, with ``logger.exception`` or
+    ``exc_info=True``. Sanitising a person's reason without that leaves the
+    operator the sanitised sentence and nothing else: no statement, no
+    parameters, no traceback. That is precisely what acd5f5a42 did on the
+    agent's synchronous path -- a disk I/O error became four words -- and
+    what its review caught. If a new caller is added, log the exception
+    there too; this function deliberately cannot do it for you, because it
+    does not know whether its answer is headed for a person or a log.
+
+    Public, and deliberately here rather than in a shared module: every
+    caller today is inside ``integrations/learning`` (the three boundaries
+    below and ``book_tools.parse_book_pdf``), so a shared home would have one
+    family of users. If a caller outside books ever needs it, is_lock_error
+    and this move together to sit beside ``db_session`` -- in one step, never
+    as a second copy (hartos-70, register consult 2026-10-24, H-0715).
+    """
+    from sqlalchemy.exc import StatementError
+    if isinstance(exc, OSError):
+        # str(an OSError) appends e.filename, so the fallback below carried the
+        # uploads path -- with the OS user's name in it -- out through every
+        # handler that routes here: book_tools.parse_book_pdf into the agent's
+        # answer, _run's unexpected-error handler onto the row list_books
+        # returns, and _run's keep_read handler into store_error. One branch
+        # here covers all of them; patching the call sites one at a time was
+        # how three of them stayed open (cc12's review of 3a0c982ba).
+        return os_error_reason(exc, 'no reason reported')
+    if not isinstance(exc, StatementError):
+        return str(exc)
+    # .orig is None for a StatementError raised with no driver error under it;
+    # falling back to str(exc) there would bring the statement straight back.
+    try:
+        return str(exc.orig) if exc.orig is not None else exc.__class__.__name__
+    except Exception as unreadable:
+        logger.debug("book library: a driver error could not be read (%r)", unreadable)
+        return exc.__class__.__name__
+
+
+#: What a person is told when the write lock outlasted the ladder mid-parse.
+#: Never the driver's text: SQLAlchemy renders ``[SQL: ...]`` and
+#: ``[parameters: ...]`` into it, and for ``_save`` those are the executemany
+#: payload -- the book's own page text -- plus the schema, handed to anyone who
+#: can poll the status route. Measured 2026-10-18, a status answer read in full:
+#: "unexpected error: (sqlite3.OperationalError) database is locked [SQL: DELETE
+#: FROM page_layouts WHERE page_layouts.file_id = ?] [parameters: (1,)]".
+#: "try again", not "upload again": _run serves a link the agent followed as
+#: well as a file a person uploaded, and a link reader has nothing to upload.
+_BUSY_NOT_SAVED = ('the book library was busy, so this book did not finish; '
+                   'try again in a moment')
+
+
 def _retry_on_lock(fn):
     """Retry a write that met another writer's lock; any other error raises at once.
 
@@ -598,19 +769,62 @@ def _retry_on_lock(fn):
             try:
                 return fn(*args, **kwargs)
             except OperationalError as e:
-                if delay is None or not any(m in str(e).lower() for m in _LOCK_ERRORS):
+                if delay is None or not is_lock_error(e):
                     raise
                 logger.info(f"{fn.__name__}: the book library is busy; retrying in {delay}s")
                 time.sleep(delay)
     return retrying
 
 
+#: Both pdf_files.user_id and users.id are String(64), and users.id defaults
+#: to a uuid4 -- so an id longer than this is not a reader this node can have.
+READER_ID_MAX = 64
+
+
+def _book_key(user_id, filename):
+    """How a book's reader and name are stored, in one spelling.
+
+    Asymmetric on purpose, and the asymmetry IS the rule:
+
+    The READER is identity, so it is never shortened. _register refuses an id
+    the column cannot hold rather than truncating it, so no stored row carries
+    a lossy reader id and every filter can compare the id exactly. Clipping
+    identity on the READ side is what made 74b39d1a4 a leak: two readers whose
+    ids share the column's first 64 characters collapsed onto one key, so
+    list_books merged their libraries -- and get_layouts keys on file_id with
+    no owner check, so one reader's pages would have reached the other's agent
+    prompt. Measured on review: bob's library showed alice's book. Matching a
+    read to a lossy write is never the fix; the write stops losing.
+
+    The NAME is data, so it still is: a 300-character filename is clipped to
+    its column exactly as the row has always done, because losing the tail of
+    a title harms nobody and refusing the upload would. A job keyed any other
+    way cannot be matched to its book, and a long name then slips past the
+    match in _job_for_file -- a dead parse reading as live again.
+
+    Pure, and deliberately above the decorator: _retry_on_lock belongs to
+    _register, the write. Inserting this helper between the two gave the
+    ladder to a function that does no I/O and took it from the insert that
+    starts every parse, with every test still green (cc66abd80).
+    """
+    return str(user_id), str(filename)[:255]
+
+
 @_retry_on_lock
 def _register(user_id, filename, directory, request_id) -> int:
     from integrations.social.models import BookFile, db_session
+    key_user, key_name = _book_key(user_id, filename)
+    # Refused, not truncated, and before a write transaction is opened. Storing
+    # a shortened id is what let two readers share one stored key (the leak in
+    # 74b39d1a4, found on review); users.id is String(64), so an id longer than
+    # the column is not a reader this node could have in the first place.
+    if len(key_user) > READER_ID_MAX:
+        raise BookParseError(
+            f'this node cannot file a book for that account '
+            f'(its id is longer than {READER_ID_MAX} characters)')
     with db_session() as db:
         now = _utcnow()
-        row = BookFile(user_id=str(user_id)[:64], filename=str(filename)[:255],
+        row = BookFile(user_id=key_user, filename=key_name,
                        directory=str(directory)[:1024],
                        request_id=str(request_id or '')[:128],
                        status='pending', created_date=now, updated_at=now)
@@ -697,11 +911,33 @@ def _save(file_id, pages, whole_text, book_name, total_pages) -> None:
 def _stall_reason(row) -> Optional[str]:
     """Why a 'pending'/'processing' row is dead, or None while it is alive.
 
-    A running parse touches its row at least every _TOUCH_EVERY_S, so one
-    untouched for STALL_SECONDS belongs to a parse that hung or died with its
+    Two ways a parse dies, and the row can be wrong about both.
+
+    Its job already said so.  The worker records a failure on the job and on
+    the row, but on a held lock the row's write is refused by the very lock
+    that killed the parse -- so the row keeps 'processing' with a *fresh*
+    updated_at and the timeout below cannot see it for STALL_SECONDS.  For
+    those 30 minutes _existing read that dead parse as live and refused to
+    start another, which made the 503's advice ("try again in a moment")
+    false for the one case it is aimed at: the same stored file, retried.
+    Measured 2026-10-18; the advice shipped 005372509, this is its other half.
+
+    Or it left no word: a running parse touches its row at least every
+    _TOUCH_EVERY_S, so one untouched for STALL_SECONDS hung or died with its
     process -- and would otherwise show 'pending' forever.
+
+    A row with NO job is not read as dead.  parse_book stores a row and never
+    makes a job, and start_parse registers the row a moment before the job
+    exists, so "no job" is the ordinary shape of a live parse as much as of
+    one lost to a restart; only the timeout may call those dead.  Resuming a
+    parse across a restart is H-0423's question, not this one's.
     """
-    if (row.status in _LIVE and row.updated_at is not None
+    if row.status not in _LIVE:
+        return None
+    failed = _failed_job_reason(row)
+    if failed:
+        return failed
+    if (row.updated_at is not None
             and (_utcnow() - row.updated_at).total_seconds() > STALL_SECONDS):
         return f'stalled: no page finished for {STALL_SECONDS // 60} minutes'
     return None
@@ -720,18 +956,102 @@ def _book_dicts(rows):
     return books, stalled
 
 
-@_retry_on_lock
 def _record_stalled(file_ids) -> None:
     """Record dead parses as failed -- each only if it is STILL dead, so a
-    parse that finished a moment ago is never overwritten."""
+    parse that finished a moment ago is never overwritten.
+
+    No retry ladder, deliberately: this is the one write on a READ path, and
+    _resolve_stalled below already promises the library answers without it
+    ("the next read tries again").  The ladder came off because it made that
+    promise false.  _stall_reason calls a row dead as soon as its job has
+    failed -- no longer only after STALL_SECONDS -- so the hot window of a
+    lock-killed parse now reaches this write, and while it was patient every
+    library read sat out the holder with it: 20.48 s for list_books where
+    1faa4b6a0's parent answered in 0.00 s, and 40.97 s for a retry through
+    start_parse, which meets this ladder in _existing and then _register's
+    own (hevolve-cc12's review of 1faa4b6a0, finding A1).
+
+    The patient ladder stays where a write must land: _register, _update_row
+    (so _mark_failed keeps it) and _save.
+    """
     from integrations.social.models import BookFile, db_session
     with db_session() as db:
-        for file_id in file_ids:
-            row = db.get(BookFile, int(file_id))
-            reason = _stall_reason(row) if row is not None else None
-            if reason:
-                row.status, row.error, row.updated_at = 'failed', reason, _utcnow()
-                logger.warning(f"book {file_id}: {reason}")
+        # Best-effort means not waiting, either.  Dropping the ladder left one
+        # attempt, but one attempt still sat out the engine's
+        # busy_timeout=3000, so a library read inside a lock window paid about
+        # 3.4 s -- measured on 179a11815: list_books 3.38 s, down from 20.48 s
+        # but not free (hevolve-cc12's review of it, finding 2).  Guarded by
+        # dialect because HEVOLVE_DB_URL can point at MySQL, where this is not
+        # valid SQL.
+        #
+        # Put back in the `finally`, and NOT left to the connection's lifetime.
+        # c53ad80f9's comment claimed "the pragma dies with it" because file
+        # SQLite runs on NullPool; that is true of the file engine and false of
+        # the in-memory one, which uses StaticPool and kept the zero for every
+        # later session (measured on review).  Either way the containment would
+        # have rested on a pool chosen in another module and pinned by no test,
+        # and if it ever leaked it would hand the no-wait to _register, _save
+        # and _update_row -- the three writes that MUST land.  A pooled probe
+        # showed _update_row then giving up after 3.75 s instead of waiting out
+        # its ~20.5 s ladder.
+        sqlite = db.get_bind().dialect.name == 'sqlite'
+        # The DBAPI connection, not the session: the reset below has to work
+        # after a refused flush, and by then the session needs a rollback.
+        raw = db.connection().connection if sqlite else None
+        if sqlite:
+            _set_patience(raw, 0)
+        try:
+            for file_id in file_ids:
+                row = db.get(BookFile, int(file_id))
+                reason = _stall_reason(row) if row is not None else None
+                if reason:
+                    row.status, row.error, row.updated_at = 'failed', reason, _utcnow()
+                    logger.warning(f"book {file_id}: {reason}")
+            # Flushed HERE, while the no-wait still applies: SQLite takes the
+            # write lock on the first write, so a flush after the pragma was
+            # put back would be the 3 s wait all over again.  The commit that
+            # follows holds that lock already and waits for nobody.
+            db.flush()
+        finally:
+            if sqlite:
+                _restore_patience(raw)
+
+
+def _set_patience(raw, milliseconds) -> None:
+    """Set busy_timeout on the DBAPI connection itself."""
+    cursor = raw.cursor()
+    try:
+        cursor.execute('PRAGMA busy_timeout=%d' % int(milliseconds))
+    finally:
+        cursor.close()
+
+
+def _restore_patience(raw) -> None:
+    """Give the connection back the patience the engine configured for it.
+
+    Two faults in abe6cd886, and the second is why the first was permanent
+    (hevolve-cc12's review of it).
+
+    It ran through the ORM session, so when the lock refused the flush the
+    session needed a rollback first and the reset raised -- swallowed, leaving
+    busy_timeout at 0 on a connection the pool hands to the next writer.
+    Measured on QueuePool and on StaticPool-on-file: _update_row then gave up
+    after 3.77 s instead of waiting out its ~20.5 s ladder, which for a
+    lock-killed parse loses the reason entirely. A DBAPI cursor works in a
+    failed transaction, so the reset lands.
+
+    And it restored the value it had READ, which on an already-leaked
+    connection is 0 -- so every later record faithfully restored 0. The
+    engine's configured number is the only correct answer, and models owns it,
+    so there is nothing here to drift from it.
+    """
+    from integrations.social.models import SQLITE_BUSY_TIMEOUT_MS
+    try:
+        _set_patience(raw, SQLITE_BUSY_TIMEOUT_MS)
+    except Exception as unrestored:
+        # Said out loud rather than at debug: a reset that fails quietly is how
+        # this leak stayed hidden for a whole commit.
+        logger.warning("book library: patience not restored (%r)", unrestored)
 
 
 def _resolve_stalled(file_ids) -> None:
@@ -752,7 +1072,12 @@ def list_books(user_id=None, limit=100) -> List[dict]:
     with db_session(commit=False) as db:
         q = db.query(BookFile)
         if user_id not in (None, ''):
-            q = q.filter(BookFile.user_id == str(user_id))
+            # Identity, compared exactly, in the one spelling _book_key owns.
+            # An id too long for the column matches nothing here, which is
+            # correct rather than unhelpful: _register refuses such an id, so
+            # no row can exist for it. The previous spelling of this line
+            # compared the CLIPPED id and merged two readers' libraries.
+            q = q.filter(BookFile.user_id == _book_key(user_id, '')[0])
         books, stalled = _book_dicts(
             q.order_by(BookFile.file_id.desc()).limit(int(limit)).all())
     _resolve_stalled(stalled)
@@ -782,11 +1107,12 @@ def get_layouts(file_id, page_number=None) -> List[dict]:
 def _existing(user_id, filename) -> Optional[dict]:
     """A live or completed book already made from this stored file, if any."""
     from integrations.social.models import BookFile, db_session
+    key_user, key_name = _book_key(user_id, filename)
     with db_session(commit=False) as db:
         books, stalled = _book_dicts(
             db.query(BookFile)
-            .filter(BookFile.user_id == str(user_id)[:64],
-                    BookFile.filename == str(filename)[:255])
+            .filter(BookFile.user_id == key_user,
+                    BookFile.filename == key_name)
             .order_by(BookFile.file_id.desc()).all())
     _resolve_stalled(stalled)
     return next((b for b in books
@@ -801,10 +1127,12 @@ _jobs_lock = threading.Lock()
 
 def _new_job(file_id, user_id, request_id, filename) -> str:
     job_id = uuid.uuid4().hex[:12]
+    # Keyed as the row keys them, or this job cannot be matched to its book.
+    key_user, key_name = _book_key(user_id, filename)
     with _jobs_lock:
         _jobs[job_id] = {
-            'job_id': job_id, 'file_id': file_id, 'user_id': str(user_id),
-            'request_id': request_id, 'filename': filename,
+            'job_id': job_id, 'file_id': file_id, 'user_id': key_user,
+            'request_id': request_id, 'filename': key_name,
             'status': 'queued', 'total_pages': 0, 'progress': 0,
             'error': None, 'result': None, 'updated': time.time(),
         }
@@ -823,11 +1151,35 @@ def _update_job(job_id, **fields) -> None:
             job['updated'] = time.time()
 
 
-def _job_for_file(file_id) -> Optional[str]:
+def _job_for_file(file_id, filename=None, user_id=None) -> Optional[str]:
+    """The most recent job for a book.
+
+    Given a filename and reader as well, only a job for THAT book: file ids
+    start over after a database reset (see _clear_page_images), so a stale
+    job must never be taken for a fresh row's.
+    """
     with _jobs_lock:
         for job in reversed(list(_jobs.values())):
-            if job['file_id'] == file_id:
+            if (job['file_id'] == file_id
+                    and (filename is None or job['filename'] == filename)
+                    and (user_id is None or job['user_id'] == str(user_id))):
                 return job['job_id']
+    return None
+
+
+def _failed_job_reason(row) -> Optional[str]:
+    """Why this book's own parse failed, when the job already knows.
+
+    Read without get_job's resolving, which writes: this runs on the read
+    paths, inside an open session.
+    """
+    job_id = _job_for_file(row.file_id, row.filename, row.user_id)
+    if not job_id:
+        return None
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if job is not None and job['status'] == 'failed':
+            return job['error'] or 'the parse failed'
     return None
 
 
@@ -899,7 +1251,14 @@ def _make_step(job_id, file_id, user_id, request_id, filename, log) -> Callable:
         if file_id is not None and now - last_touch[0] >= _TOUCH_EVERY_S:
             last_touch[0] = now
             try:
-                _update_row(file_id, status='processing')
+                # No fields: _update_row bumps updated_at and nothing else,
+                # which is all a touch ever needed. Writing status='processing'
+                # as well meant the "Done" step -- which runs AFTER _save has
+                # written 'completed' -- set a stored book back to processing.
+                # _stall_reason then showed it as processing for STALL_SECONDS
+                # and finally as "failed: stalled", with its pages on disk the
+                # whole time.
+                _update_row(file_id)
             except Exception as e:
                 logger.warning(f"book {file_id}: could not refresh its record: {e}")
 
@@ -1021,14 +1380,32 @@ def _run(file_id, pdf_path, user_id, request_id, job_id=None, log=None,
         except Exception as e:
             if not keep_read:
                 raise
-            reason = f'the book was read but could not be saved: {e}'
+            reason = (_BUSY_NOT_SAVED if is_lock_error(e)
+                      else f'the book was read but could not be saved: '
+                           f'{driver_text(e)}')
+            # The operator's only copy on this path. Once the reason is
+            # sanitised, nothing else here carries the rendered statement or
+            # the traceback -- acd5f5a42 sanitised and did not log, which
+            # left a disk I/O error as four words and no stack (its review).
+            logger.warning("book %s: read but not saved (%s)", file_id, reason,
+                           exc_info=True)
             _mark_failed(file_id, reason)
             log.append(f'Not saved: {reason}')
             result.update(stored=False, store_error=reason, progress_log=log)
             return result
     except Exception as e:
-        reason = str(e) if isinstance(e, BookParseError) else f'unexpected error: {e}'
+        # A book's own complaint first: this handler sees every exception the
+        # parse can raise, and a BookParseError says something true about the
+        # file that must not be overwritten by a guess about the database.
+        if isinstance(e, BookParseError):
+            reason = str(e)
+        elif is_lock_error(e):
+            reason = _BUSY_NOT_SAVED
+        else:
+            reason = f'unexpected error: {driver_text(e)}'
         if not isinstance(e, BookParseError):
+            # The operator still gets the driver's text and the traceback; it
+            # is only the person's copy that drops the SQL and the parameters.
             logger.exception(f"book {file_id}: parse crashed")
         _mark_failed(file_id, reason)
         _update_job(job_id, status='failed', error=reason)
@@ -1058,8 +1435,28 @@ def parse_book(pdf_path, user_id, request_id='', log=None) -> dict:
     try:
         file_id = _register(user_id, pdf_path.name, pdf_path.parent, request_id)
     except Exception as e:
-        reason = f'the book library is unavailable ({e})'
-        logger.warning(f"reading {pdf_path.name} without storing it: {reason}")
+        # A book's own complaint first, the same order _run's handler uses: a
+        # BookParseError says something TRUE about this request -- a refused
+        # account id, say -- and the library is not unavailable merely because
+        # it would not file this book (F1 of the 30c304dac review).
+        if isinstance(e, BookParseError):
+            reason = str(e)
+        elif isinstance(e, OSError):
+            # driver_text falls back to str(e) for anything that is not a
+            # SQLAlchemy StatementError, and OSError renders e.filename into
+            # str() -- so a disk error here put the uploads path into the
+            # agent's answer. The library is not "unavailable" for one either:
+            # it is this node that could not keep the file.
+            reason = ('this node could not file the book '
+                      f'({os_error_reason(e, "no reason reported")})')
+        else:
+            reason = f'the book library is unavailable ({driver_text(e)})'
+        # A traceback for a FAILURE, not for a refusal. Where `reason` is
+        # sanitised -- a database error, whose statement the person must not
+        # see -- this log is the operator's only copy and needs the stack. A
+        # refusal states its own whole reason, so a stack is noise.
+        logger.warning(f"reading {pdf_path.name} without storing it: {reason}",
+                       exc_info=not isinstance(e, BookParseError))
         return _read_unstored(pdf_path, user_id, request_id, log, reason)
     return _run(file_id, pdf_path, user_id, request_id, log=log, keep_read=True)
 
@@ -1103,7 +1500,12 @@ def start_parse(pdf_path, user_id, request_id='') -> dict:
         if existing['status'] == 'completed':
             _publish(user_id, _progress(request_id, pdf_path.name, existing['file_id'],
                                         'Already in your library', 100))
-        return {'job_id': _job_for_file(existing['file_id']),
+        # This book's own job, never one that merely reused its id: after a
+        # database reset the stale job belongs to another book, and handing
+        # back its id sends the person to poll a stranger's failure under
+        # "Already in your library".
+        return {'job_id': _job_for_file(existing['file_id'], existing['filename'],
+                                        existing['user_id']),
                 'file_id': existing['file_id'], 'status': existing['status'],
                 'existing': True}
     file_id = _register(user_id, pdf_path.name, pdf_path.parent, request_id)

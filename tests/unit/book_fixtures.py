@@ -143,6 +143,13 @@ def book_db(tmp_path, monkeypatch):
     monkeypatch.setattr(models, '_engine', engine)
     monkeypatch.setattr(models, '_SessionLocal',
                         sessionmaker(bind=engine, expire_on_commit=False))
+    # The pipeline's job store is a module global, so it outlives this
+    # database -- and file ids start over with the database, so a job left by
+    # an earlier test can be matched to a brand-new row and condemn it. One
+    # clean store per library; tests that need a stale job plant their own.
+    from integrations.learning import book_pipeline
+    with book_pipeline._jobs_lock:
+        book_pipeline._jobs.clear()
     yield engine
     engine.dispose()
 

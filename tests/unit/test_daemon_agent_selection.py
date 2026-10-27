@@ -19,7 +19,7 @@ Consequence: central's goals showed last_dispatched_at frozen at 2026-09-01
 21:05 for over two days while the daemon ticked every 30s.
 
 These are structural assertions, the same style as
-test_the_speculative_branch_reaches_the_gate in test_goal_settlement_gate.py:
+test_the_parallel_branch_reaches_the_gate in test_goal_settlement_gate.py:
 _tick is a 500-line method over live DB, guardrail, ledger and peer surfaces,
 and the defect lives entirely in its control flow.
 

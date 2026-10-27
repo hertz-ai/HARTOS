@@ -65,8 +65,6 @@ except Exception:
     PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'prompts'))
 os.makedirs(PROMPTS_DIR, exist_ok=True)
 from hartos import helper as helper_fun
-import contextlib
-import threading
 from concurrent.futures import ThreadPoolExecutor
 # transform_messages is an autogen.agentchat.contrib.capabilities submodule —
 # importing it eagerly pulls the SAME heavy chain as autogen (llmlingua ->
@@ -510,8 +508,16 @@ def save_conversation_db(text, user_id, prompt_id, database_url, request_id):
     return helper_fun.save_conversation_db(text, user_id, prompt_id, database_url, request_id)
 
 
-def send_message_to_user1(user_id, response, inp, prompt_id):
+def send_message_to_user1(user_id, response, inp, prompt_id, media_refs=None):
     """Publish an intermediate agent response to the user.
+
+    ``media_refs``: what the agent wrote beside its message2user --
+    ``[{'type': 'image'|'video'|'html', 'url': '/uploads/...'}]`` -- for the
+    owner's 2026-10-25 order that an agent be able to SHOW the person an
+    image, a video or a page.  helper.media_items_for turns each reference
+    into an item the file store has vouched for, dropping any url with no
+    real file behind it.  None or [] publishes exactly what this did before.
+    REUSE's send_message_to_user1 takes the same argument.
 
     Deployment-mode-aware (2026-06-09):
 
@@ -560,9 +566,12 @@ def send_message_to_user1(user_id, response, inp, prompt_id):
     if is_bundled():
         # Bundled (Nunba install) — local chat topic, on-device.
         from core.peer_link.crossbar_publish import publish_agent_message
+        from hartos.helper import media_items_for
+        media = media_items_for(user_id, media_refs, prompt_id=prompt_id,
+                                request_id=request_id)
         if publish_agent_message(text=response, user_id=user_id,
                                  request_id=request_id, prompt_id=prompt_id,
-                                 inp=inp):
+                                 inp=inp, media=media):
             return sent
         return failed
 
@@ -597,7 +606,20 @@ def time_based_execution(task_description:str,user_id: int,prompt_id:int,action_
     user_prompt = f'{user_id}_{prompt_id}'
     if user_prompt not in time_agents:
         time_agents[user_prompt] = create_time_agents(user_id,prompt_id,'creator','',actions)
+    # The time group's run is a turn of that group, on its own model, not the
+    # one the turn that built the group ran on (#172).
+    with helper_fun.group_turn(time_agents[user_prompt], config_list, user_prompt,
+                               _CREATE_TIME_GROUP) as runs:
+        if not runs:
+            from core.agent_tools import held_for_another_turn_reply
+            return held_for_another_turn_reply()
+        return _run_time_group(task_description, user_id, prompt_id,
+                               action_entry_point, user_prompt)
 
+
+def _run_time_group(task_description, user_id, prompt_id, action_entry_point, user_prompt):
+    """time_based_execution's run of the session's time group, which it has
+    marked and bound to the turn's model."""
     # author, assistant_agent, executor, group_chat, manager, chat_instructor,agents_object = user_agents[user_id]
     current_time = datetime.now()
     group_chat = time_agents[user_prompt]['time_group_chat']
@@ -743,8 +765,14 @@ def visual_execution(task_description: str, user_id: int, prompt_id: int):
             Only send this if you have something meaningful to say.
             Do not interrupt the user unless they have asked for a response or the task cannot proceed without their input.
             You must now perform this task: {task_description}'''
-        # Use the existing agent structure
-        result = author.initiate_chat(manager, message=text, clear_history=False)
+        # The session's own group chat, so this run is a turn of it, on its
+        # own model, not the one an earlier turn left (#172).
+        with helper_fun.group_turn(user_agents[user_prompt], config_list, user_prompt,
+                                   _CREATE_GROUP) as runs:
+            if not runs:
+                from core.agent_tools import held_for_another_turn_reply
+                return held_for_another_turn_reply()
+            result = author.initiate_chat(manager, message=text, clear_history=False)
         last_message = group_chat.messages[-1]
         if _is_terminate(last_message['content']):
             if len(group_chat.messages) > 1:
@@ -753,7 +781,8 @@ def visual_execution(task_description: str, user_id: int, prompt_id: int):
                 try:
                     json_obj = retrieve_json(last_message['content'])
                     if json_obj and 'message2user' in json_obj:
-                        send_message_to_user1(user_id, json_obj['message2user'], task_description, prompt_id)
+                        send_message_to_user1(user_id, json_obj['message2user'], task_description, prompt_id,
+                                              media_refs=json_obj.get(MEDIA_REPLY_KEY))
                 except Exception as e:
                     current_app.logger.error(f"Error processing visual agent response: {e}")
     except Exception as e:
@@ -816,55 +845,26 @@ class SubscriptionHandler:
 # The one "is the last message an unanswered tool call" rule lives in
 # hartos.helper, where the yield-to-user check also asks it; re-exported here
 # for this module's two readers.
-from hartos.helper import has_pending_tool_calls  # noqa: E402
+from hartos.helper import MEDIA_REPLY_KEY, has_pending_tool_calls  # noqa: E402
 
 
-# Every thread running a session's turn, by user_prompt (recipe() marks
-# them), each with how deep it has re-entered.  get_response_group re-enters
-# itself (safe_action_boundary_check, the flow-increment sites), so the SAME
-# thread entering again is still its one turn; any OTHER thread in the set is
-# "another turn in flight".  A set, not one owner: with one owner, three
-# overlapping requests for one session emptied the table when the first
-# returned, and the third settled the second's live tool call (review of
-# ff160f057, 2026-10-05).
-_TURNS_IN_FLIGHT = {}
-_TURNS_IN_FLIGHT_LOCK = threading.Lock()
+# Every thread driving this module's group chat of a session (user_agents),
+# in the one registry in helper, under group 'create'.  recipe() and
+# visual_execution mark their turns; a pending tool call at the end of the
+# group chat is really being processed only while another turn of THIS group
+# is in flight.  REUSE's turns drive REUSE's own agents and are marked under
+# their own groups, so they never hold this one back (review of 75dc20add, P5).
+_TURNS_IN_FLIGHT = helper_fun.TURNS_IN_FLIGHT
+_CREATE_GROUP = 'create'
+_CREATE_TIME_GROUP = 'create-time'
 
 
-@contextlib.contextmanager
 def _turn_in_flight(user_prompt):
-    """Mark this thread as running ``user_prompt``'s turn for the duration
-    of the block.  Re-entrant: an inner block on the same thread deepens the
-    mark and leaving it only undoes its own level; every thread is counted
-    on its own, so one leaving never clears another's."""
-    me = threading.get_ident()
-    with _TURNS_IN_FLIGHT_LOCK:
-        running = _TURNS_IN_FLIGHT.setdefault(user_prompt, {})
-        running[me] = running.get(me, 0) + 1
-    try:
-        yield
-    finally:
-        with _TURNS_IN_FLIGHT_LOCK:
-            running = _TURNS_IN_FLIGHT.get(user_prompt)
-            if running is not None:
-                depth = running.get(me, 0) - 1
-                if depth > 0:
-                    running[me] = depth
-                else:
-                    running.pop(me, None)
-                    if not running:
-                        del _TURNS_IN_FLIGHT[user_prompt]
+    return helper_fun.turn_in_flight(user_prompt, _CREATE_GROUP)
 
 
 def _another_turn_in_flight(user_prompt):
-    """True when a thread other than this one is running ``user_prompt``'s
-    turn right now.  The per-user lock is not held across LLM calls
-    (hart_intelligence_entry chat()), so /chat requests for one session can
-    overlap, and that is the only case in which a pending tool call at the
-    end of the group chat is really being processed."""
-    me = threading.get_ident()
-    with _TURNS_IN_FLIGHT_LOCK:
-        return any(t != me for t in _TURNS_IN_FLIGHT.get(user_prompt, ()))
+    return helper_fun.another_turn_in_flight(user_prompt, _CREATE_GROUP)
 
 
 def _settle_orphaned_tool_calls(group_chat, manager=None):
@@ -3785,7 +3785,8 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
             if json_obj:
                 try:
                     current_app.logger.info('Sending user the message')
-                    send_message_to_user1(user_id,json_obj['message2user'],'',prompt_id)
+                    send_message_to_user1(user_id, json_obj['message2user'], '', prompt_id,
+                                          media_refs=json_obj.get(MEDIA_REPLY_KEY))
                 except Exception:
                     pass
                 return "auto"
@@ -4627,6 +4628,11 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
     else:
         current_app.logger.info(f"Using existing agents for user_prompt={user_prompt}")
         author, assistant_agent, executor, group_chat, manager, chat_instructor,agents_object = user_agents[user_prompt]
+        # Built on an earlier turn's model: this turn runs on its own (#172).
+        if not helper_fun.bind_agents_to_turn_model(
+                user_agents[user_prompt], config_list, user_prompt, _CREATE_GROUP):
+            from core.agent_tools import held_for_another_turn_reply
+            return held_for_another_turn_reply()
     clear_history = False
 
     # TOOL CALL AND RESPONSE CHECK.  A turn that ends while a tool call is the

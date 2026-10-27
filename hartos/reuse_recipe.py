@@ -61,7 +61,7 @@ from PIL import Image
 
 
 from flask import current_app
-from hartos.helper import ToolMessageHandler, strip_json_values, get_time_based_history, retrieve_json, load_vlm_agent_files, _is_terminate_msg, answered_call_ids, history_limiter, token_limiter, give_judge_view
+from hartos.helper import ToolMessageHandler, strip_json_values, get_time_based_history, retrieve_json, load_vlm_agent_files, _is_terminate_msg, answered_call_ids, history_limiter, token_limiter, give_judge_view, MEDIA_REPLY_KEY
 
 
 def _normalize_flow_recipe(config):
@@ -380,7 +380,8 @@ from hartos.lifecycle_hooks import (
     ActionState, safe_set_state, force_state_through_valid_path, get_action_state,
     clear_action_states, settled_action_id, commit_verified_action_completion,
     dispatch_action_id, ACTION_STATES_AWAITING_USER, autonomy_needs_user,
-    action_is_autonomous, action_named_tools, is_written_answer, ANSWER_KEYS,
+    action_is_autonomous, action_named_tools, action_own_text,
+    is_written_answer, ANSWER_KEYS,
 )
 from hartos.cultural_wisdom import get_cultural_prompt
 
@@ -585,9 +586,44 @@ def clear_message_tracking(user_prompt, unique_message_key):
         pass
 
 
-def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_delay=50):
+def response_format_template() -> str:
+    """The reply shape every prompt shows the agent -- ONE source.
+
+    Interpolated as ``@user {response_format}`` at six sites in this module,
+    so the agent is told the same shape wherever it is told it.
+
+    ``media`` is the owner's 2026-10-25 order that an agent be able to SHOW
+    the person a file, not only describe it.  It is OPTIONAL, and the
+    instruction beside it is the one that matters: only a url a TOOL handed
+    back.  A url the model writes itself is dropped by helper
+    .media_items_for before anyone sees it (measured need: at request_id
+    t1-retrieval-102136 an agent answered out of a book that exists in no
+    row of pdf_files), so the agent is told that rather than left to
+    discover it as a silent failure.
+    """
+    return (
+        '{"message2userfinal": "Your message here", '
+        '"%s": [{"type": "image|video|html", "url": "/uploads/..."}]}'
+        ' -- "%s" is OPTIONAL. Include it ONLY to show the person a file, and'
+        ' ONLY with a url a tool gave you. Omit it entirely if you have none.'
+        ' A url you write yourself is dropped and the person never sees it.'
+        % (MEDIA_REPLY_KEY, MEDIA_REPLY_KEY)
+    )
+
+
+def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_delay=50,
+                          media_refs=None):
     """
     Send message to user with improved tracking of sent messages
+
+    ``media_refs``: what the agent wrote beside its message2userfinal --
+    ``[{'type': 'image'|'video'|'html', 'url': '/uploads/...'}]`` -- for the
+    owner's 2026-10-25 order that an agent be able to show the person an
+    image, a video or a page, not only tell them about it.  helper
+    .media_items_for turns each reference into an item the file store has
+    vouched for, DROPPING any url with no real file behind it, and
+    publish_agent_message already carries them.  None or [] publishes
+    exactly the message this sent before.
     """
     user_prompt = f'{user_id}_{prompt_id}'
     random_num = random.randint(1000, 9999)
@@ -651,9 +687,12 @@ def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_dela
     # REUSE: core.peer_link.crossbar_publish.publish_agent_message.
     if is_bundled():
         from core.peer_link.crossbar_publish import publish_agent_message
+        from hartos.helper import media_items_for
+        media = media_items_for(user_id, media_refs, prompt_id=prompt_id,
+                                request_id=intermediate_request_id)
         if publish_agent_message(text=response, user_id=user_id,
                                  request_id=intermediate_request_id,
-                                 prompt_id=prompt_id, inp=inp):
+                                 prompt_id=prompt_id, inp=inp, media=media):
             _ctx_safe_log(
                 'info',
                 f'Message published locally with request_id: {intermediate_request_id}')
@@ -708,7 +747,8 @@ def _reuse_speaker_says_to_user(user_id, message, prompt_id, inp=''):
     json_obj = retrieve_json((message or {}).get('content') or '')
     if not isinstance(json_obj, dict) or 'message2userfinal' not in json_obj:
         return False
-    send_message_to_user1(user_id, json_obj['message2userfinal'], inp, prompt_id)
+    send_message_to_user1(user_id, json_obj['message2userfinal'], inp, prompt_id,
+                          media_refs=json_obj.get(MEDIA_REPLY_KEY))
     return True
 
 
@@ -907,8 +947,16 @@ def time_based_execution(task_description: str, user_id: int, prompt_id: int, ac
         # author, assistant_agent, executor, group_chat, manager, chat_instructor,agents_object = user_agents[user_id]
         current_time = datetime.now()
         text = f'This is the time now {current_time}\n you must perform this task {task_description}'
-        result = time_user.initiate_chat(manager_1, message=text, speaker_selection={"speaker": "assistant"},
-                                         clear_history=False)
+        # The time group's run is a turn of that group: seen by a chat turn,
+        # which then never switches its model mid-run, and on its own model,
+        # not the one an expert turn built the session on (#172).
+        with helper_fun.group_turn((group_chat_1, manager_1), config_list,
+                                   user_prompt, 'reuse-time') as runs:
+            if not runs:
+                from core.agent_tools import held_for_another_turn_reply
+                return held_for_another_turn_reply()
+            result = time_user.initiate_chat(manager_1, message=text, speaker_selection={"speaker": "assistant"},
+                                             clear_history=False)
         # The tail of the group this run happened in: manager_1's
         # group_chat_1.  It read group_chat, the MAIN conversation, so a
         # scheduled task could deliver the main chat's last message as its
@@ -995,8 +1043,15 @@ def visual_based_execution(task_description: str, user_id: int, prompt_id: int):
         user = visual_agent_group['visual_user']
         chat = visual_agent_group['group_chat_2']
 
-        result = user.initiate_chat(manager, message=text, speaker_selection={"speaker": "assistant"},
-                                    clear_history=False)
+        # The visual group's run is a turn of that group, on its own model,
+        # not the one an expert turn built the session on (#172).
+        with helper_fun.group_turn(visual_agent_group, config_list,
+                                   user_prompt, 'reuse-visual') as runs:
+            if not runs:
+                from core.agent_tools import held_for_another_turn_reply
+                return held_for_another_turn_reply()
+            result = user.initiate_chat(manager, message=text, speaker_selection={"speaker": "assistant"},
+                                        clear_history=False)
 
         last_message = chat.messages[-1]
         if last_message['content'] == 'TERMINATE':
@@ -1604,7 +1659,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
     except Exception:
         pass
 
-    response_format = {"message2userfinal": "Your message here"}
+    response_format = response_format_template()
     # DATE-CONTEXT: the local model's training cutoff makes it assume an earlier
     # year — it refused "2026" research as "the future" and injected "2024" into
     # its own search queries (measured live 2026-09-05, agent 18088688973).
@@ -1905,14 +1960,41 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
     # name = a #511 name collision; until that is resolved canonically,
     # this restores the exact pre-#743 body (owner audit 2026-09-01
     # found the swap had silently stubbed real scheduling).
+    #
+    # A background turn may not start a recurring job; a person's request
+    # may.  Measured 2026-10-20 in Nunba's gui_app.log: a daemon turn of agent
+    # 65708210992 (daemon_85d091d3-...) whose action tool had failed called
+    # this with '* * * * *' at 21:45:39, and the job ran a time-agent group
+    # chat on the local model every minute until the log ended at 01:49 (240
+    # runs).  No code removes such a job.  The refusal reads the turn's id
+    # where chat_agent writes it and applies the condition _chat_reply's TTS
+    # gate applies: a non-empty id that is_genuine_user_request rejects.  An
+    # empty id is not refused, because a person's turn can arrive with none
+    # (standalone /chat mints none; the WhatsApp self-chat path sends none).
+    # Recipe schedules (create_schedule) do not come through this tool.
+    #
+    # ONE description string, as for execute_windows_or_android_command: the
+    # hand-over to the named attach (assistant._hart_core_tools, below) builds
+    # this closure's (name, desc, func) triple from it.
+    _SCHEDULE_JOBS_DESC = "Use this to Create scheduled jobs"
+
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="tool",
-                             description="Use this to Create scheduled jobs")
+                             description=_SCHEDULE_JOBS_DESC)
     @log_tool_execution
     def create_scheduled_jobs(cron_expression: Annotated[
         str, "Cron expression for scheduling. Example: '0 9 * * 1-5' (Runs at 9:00 AM, Monday to Friday)."],
                               job_description: Annotated[str, "Description of the job to be performed"]) -> str:
         current_app.logger.info('INSIDE create_scheduled_jobs')
+        from integrations.agent_engine.dispatch import is_genuine_user_request
+        _rid = request_id_list.get(user_prompt)
+        if _rid and not is_genuine_user_request(_rid):
+            current_app.logger.warning(
+                f'create_scheduled_jobs refused for background turn {_rid}: '
+                f'cron {cron_expression!r}')
+            return (f'{TOOL_FAILURE_RESULTS[0]}\nNo job was scheduled: this '
+                    'is a background turn, and only a person can start a '
+                    'recurring job.')
         if not scheduler.running:
             scheduler.start()
 
@@ -2686,8 +2768,11 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
         print(f'user_id {user_id}')
         user_prompt = f'{user_id}_{prompt_id}'
         assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor, visual_agent_group = user_agents[user_prompt]
-        response = multi_role_agent.initiate_chat(manager, message=message, speaker_selection={"speaker": "assistant"},
-                                                  clear_history=False)
+        # The time run reaching into the main group is a turn of the main
+        # group, on the time run's model (#172).
+        if _main_group_turn(user_prompt, message) is None:
+            from core.agent_tools import held_for_another_turn_reply
+            return held_for_another_turn_reply()
         last_message = group_chat.messages[-1]
         if last_message['content'] == 'TERMINATE':
             last_message = group_chat.messages[-2]
@@ -2817,9 +2902,24 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
         # Still named-attach ONLY: this runs arbitrary OS commands, and
         # attach_for_names' own docstring keeps the blast radius at the action
         # whose recipe asked for it.  Nothing is added to the main leg.
-        assistant._hart_core_tools = core_tools + [
+        #
+        # ...and this leg's own create_scheduled_jobs IN PLACE OF the
+        # factory's same-named one, CREATE's stub that schedules nothing and
+        # answers "...you can go ahead and mark this action as completed" (the
+        # #511 collision at the inline def).  Both readers of this list, the
+        # named attach and request_tools, register what they find under its
+        # name, and _attached_names holds only service tools, so the stub
+        # replaced the gated tool: a daemon turn got a line the fabrication
+        # gate reads as the work done, and a person's request scheduled nothing
+        # (review of fe1100b5e).  Handed over like the command tool, so an
+        # action naming it still reaches the Assistant, with the gated tool.
+        # Guarded by tests/unit/test_reuse_scheduler_stays_gated.py.
+        assistant._hart_core_tools = [
+            t for t in core_tools if t[0] != 'create_scheduled_jobs'] + [
             ('execute_windows_or_android_command', _EXEC_CMD_DESC,
              execute_windows_or_android_command),
+            ('create_scheduled_jobs', _SCHEDULE_JOBS_DESC,
+             create_scheduled_jobs),
         ]
         # The FULL recipe list, so the per-turn hook in get_agent_response can
         # narrow the system prompt to the action actually being dispatched
@@ -4121,7 +4221,8 @@ def _reuse_own_tool_progress(user_prompt, action_id, group_chat, agents):
     """
     try:
         task = user_tasks.get(user_prompt)
-        text = str(task.get_action(int(action_id) - 1) or '').lower() if task else ''
+        text = action_own_text(task.get_action(int(action_id) - 1)).lower() \
+            if task else ''
         if not text:
             return -1
         _all_names, referenced = _reuse_registered_and_referenced_tools(agents, text)
@@ -4675,7 +4776,7 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
         dispatch_index = _dispatch_index(messages)
 
         task = user_tasks.get(user_prompt)
-        action_text = str(task.get_action(int(action_id) - 1) or '').lower() \
+        action_text = action_own_text(task.get_action(int(action_id) - 1)).lower() \
             if task else ''
         agents = list(getattr(group_chat, 'agents', None) or [])
         _all_names, referenced = _reuse_registered_and_referenced_tools(
@@ -5562,7 +5663,11 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
     """
     try:
         task = user_tasks.get(user_prompt)
-        text = str(task.get_action(current_action - 1) or '').lower() if task else ''
+        # The step's own words, never str() of its dict: the dict carries the
+        # creator's banked run, and its tools are not this step's to demand
+        # (lifecycle_hooks.action_own_text, live 2026-10-21 agent 54).
+        text = action_own_text(task.get_action(current_action - 1)).lower() \
+            if task else ''
         if not text:
             return []
         names, referenced = _reuse_registered_and_referenced_tools(agents, text)
@@ -7693,8 +7798,14 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
         if user_prompt not in user_agents:
             llm_call_track[user_prompt] = {'count': 0, 'original_prompt': False}
             if user_prompt not in user_journey:
-                if prompt_id not in agent_data.keys():
-                    agent_data[prompt_id] = {}
+                # Load-or-create.  `prompt_id not in agent_data.keys()` asked
+                # only what was CACHED (keys() never runs the loader), so the
+                # first REUSE turn after a restart set the agent's store to {}
+                # without reading its file: its tools then saw no template and
+                # no game sounds, and the next save wrote that empty store over
+                # the creator's (review of fafa03c40, D0).  setdefault restores
+                # the file first, and only an agent with none starts empty.
+                agent_data.setdefault(prompt_id, {})
                 role_agents[user_prompt] = create_agents_for_role(user_id, prompt_id)
                 assistant, user_proxy, group_chat, manager, helper, stop = role_agents[user_prompt]
                 if stop:
@@ -7709,8 +7820,15 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                 user_journey[user_prompt] = 'UseBot'
         if user_journey[user_prompt] == 'Roles':
             assistant, user_proxy, group_chat, manager, helper, stop = role_agents[user_prompt]
-            result = user_proxy.initiate_chat(manager, message=user_message, speaker_selection={"speaker": "assistant"},
-                                              clear_history=False)
+            # A turn of the role group, on its own model, not the one an
+            # earlier turn built the group on (#172).
+            with helper_fun.group_turn(role_agents[user_prompt], config_list,
+                                       user_prompt, 'reuse-role') as runs:
+                if not runs:
+                    from core.agent_tools import held_for_another_turn_reply
+                    return held_for_another_turn_reply()
+                result = user_proxy.initiate_chat(manager, message=user_message, speaker_selection={"speaker": "assistant"},
+                                                  clear_history=False)
             # The persona-selection chat's selector yields too (#129): a
             # round it ended for the person is the turn's pause, not the
             # role chat's last line.
@@ -7743,8 +7861,17 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
         # TERMINATE token, so a terminal verifier verdict stranded action 1.
         assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor, visual_agent_group = user_agents[user_prompt]
         role = get_role(user_id, prompt_id)
-        response = get_agent_response(assistant, chat_instructor, helper, user_proxy, manager, group_chat,
-                                      user_message, role, user_id, prompt_id, request_id)
+        # A turn of the session's main group: seen by a turn on another model,
+        # which then never switches it mid-turn, and on its own model, not the
+        # one an earlier turn built the group on (#172).  The time and visual
+        # groups hold their own agents and are left to their own runs.
+        with helper_fun.group_turn((group_chat, manager), config_list,
+                                   user_prompt, 'reuse') as runs:
+            if not runs:
+                from core.agent_tools import held_for_another_turn_reply
+                return held_for_another_turn_reply()
+            response = get_agent_response(assistant, chat_instructor, helper, user_proxy, manager, group_chat,
+                                          user_message, role, user_id, prompt_id, request_id)
         llm_call_track[user_prompt]['count'] = 0
         llm_call_track[user_prompt]['original_prompt'] = True
         return response
@@ -7753,15 +7880,33 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
         raise
 
 
+def _main_group_turn(user_prompt, message):
+    """The session's multi_role_agent says ``message`` into its main group,
+    as a turn of that group on this thread's model (#172).  Returns the group
+    chat, or None when the turn did not run because another turn of the
+    group is running on a different model.  crossbar_multiagent's two legs
+    and the time agent's connect_time_main tool drive the main group this
+    one way."""
+    (_assistant, _user_proxy, group_chat, manager, _helper, multi_role_agent,
+     *_rest) = user_agents[user_prompt]
+    with helper_fun.group_turn((group_chat, manager), config_list,
+                               user_prompt, 'reuse') as runs:
+        if not runs:
+            return None
+        multi_role_agent.initiate_chat(manager, message=message, speaker_selection={"speaker": "assistant"},
+                                       clear_history=False)
+    return group_chat
+
+
 def crossbar_multiagent(msg):
     current_app.logger.info("insde crossbar_multiagent")
     current_app.logger.info('--' * 100)
 
     user_prompt = f"{msg['user_id']}_{msg['caller_prompt_id']}"
-    assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor, visual_agent_group = user_agents[user_prompt]
     message = f"Role: {msg['caller_role']}\n Message: {msg['message']}"
-    response = multi_role_agent.initiate_chat(manager, message=message, speaker_selection={"speaker": "assistant"},
-                                              clear_history=False)
+    group_chat = _main_group_turn(user_prompt, message)
+    if group_chat is None:
+        return
     last_message = group_chat.messages[-1]
     if last_message['content'] == 'TERMINATE':
         last_message = group_chat.messages[-2]
@@ -7770,10 +7915,10 @@ def crossbar_multiagent(msg):
     send_message_to_user1(msg['user_id'], last_message, msg['message'], msg['caller_prompt_id'])
 
     user_prompt = f"{msg['caller_user_id']}_{msg['caller_prompt_id']}"
-    assistant, user_proxy, group_chat, manager, helper, multi_role_agent, time_agent, time_user, group_chat_1, manager_1, chat_instructor, visual_agent_group = user_agents[user_prompt]
     message = f"Role: {msg['role']}\n Message: {last_message}"
-    response = multi_role_agent.initiate_chat(manager, message=message, speaker_selection={"speaker": "assistant"},
-                                              clear_history=False)
+    group_chat = _main_group_turn(user_prompt, message)
+    if group_chat is None:
+        return
     last_message = group_chat.messages[-1]
     if last_message['content'] == 'TERMINATE':
         last_message = group_chat.messages[-2]

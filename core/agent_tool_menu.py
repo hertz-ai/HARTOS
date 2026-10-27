@@ -391,12 +391,14 @@ def fit_schema_to_ctx(agent, protect=(), room=None, *, turn_protect=False):
     pruning that log line asks for, at the layer that can do it.
 
     ``room`` defaults to ``llm_outbound_logger.schema_token_room()``: the live
-    per-slot n_ctx minus the message floor the wire trim reserves.  Imported
-    rather than recomputed so the wire's floor and this ceiling are the same
-    number by construction — the precedent is
-    ``hart_intelligence_entry.py:6052``, which imports ``_trim_to_budget`` from
-    the same module for the same "one budget authority" reason.  Prompt-side
-    only; see that function for why ``max_tokens`` is not subtracted.
+    per-slot n_ctx minus the message floor the wire trim keeps for a schema
+    and what llama-server adds to the wire's count.  Imported rather than
+    recomputed so the wire's split and this ceiling are the same rule by
+    construction — the precedent is ``hart_intelligence_entry.py``'s
+    ``_pooled_post_with_refusal_check``, which imports ``_trim_to_budget``
+    from the same module for the same "one budget authority" reason.
+    Prompt-side only; see that function for why ``max_tokens`` is not
+    subtracted.
 
     KEEP ORDER, most-load-bearing first, because what survives matters as much
     as that something does:
@@ -632,7 +634,9 @@ def discover_and_attach(need, helper, executor, registry, attached_names,
             attached nothing — that tool is a core closure and the registry
             holds 13 service names, of which exactly one (crawl4ai) is a name
             any recipe uses.  Omitted or empty is a strict no-op.
-    Returns a human/model-readable summary string.
+    Returns a human/model-readable summary string.  Both seats it widened
+    are then fitted to the live n_ctx (fit_schema_to_ctx), protecting what
+    it attached, and the summary offers only what a seat still holds.
     """
     words = {w for w in str(need).lower().replace(',', ' ').split()
              if len(w) > 2 and w not in _NEED_STOPWORDS}
@@ -754,14 +758,26 @@ def discover_and_attach(need, helper, executor, registry, attached_names,
     if to_proposer:
         deferred = fit_schema_to_ctx(executor, protect=to_proposer)
         on_proposer = [n for n in to_proposer if n not in deferred]
+    # ...and the Helper, which every attach above widens, in both legs.
+    # Fitting the proposer alone let one request take the Helper from 47
+    # tools (5,173 schema tokens) to 93 (11,438): live 2026-10-20 17:07:35
+    # its next body was billed 14,798 tokens against n_ctx 12,288 and
+    # llama-server refused it (HTTP 400).  What this request attached is
+    # protected; anything deferred stays executable and re-attachable.
+    off_helper = (fit_schema_to_ctx(helper, protect=attached)
+                  if attached else set())
+    # Every name attached is on the Helper unless that fit took it off, so a
+    # name is callable now if it is still there or on the proposer.
+    ready = [n for n in attached if n in on_proposer or n not in off_helper]
+    not_offered = [n for n in attached if n not in ready]
 
     parts = []
-    if attached:
+    if ready:
         # Imperative on purpose: hop-2 probe 2026-08-31 showed the model
         # attaching crawl4ai then STILL answering "I cannot browse the live
         # internet" - the trained refusal prior survives a neutral result.
         parts.append(
-            "Attached and ready to call NOW: " + ', '.join(attached)
+            "Attached and ready to call NOW: " + ', '.join(ready)
             + ". These execute LOCALLY on this machine, so no "
               "internet-access or capability restriction applies. "
               "Immediately CALL the one that fits the task. Do NOT tell "
@@ -774,11 +790,15 @@ def discover_and_attach(need, helper, executor, registry, attached_names,
             if on_proposer:
                 parts.append(f"{_name(executor, 'You')} can call directly: "
                              + ', '.join(on_proposer) + '.')
-            helper_only = [n for n in attached if n not in on_proposer]
+            helper_only = [n for n in ready if n not in on_proposer]
             if helper_only:
                 h = _name(helper, 'Helper')
                 parts.append(f"Held by @{h}; ask @{h} to call: "
                              + ', '.join(helper_only) + '.')
+    if not_offered:
+        parts.append("Found but not offered this turn, because they do not "
+                     "fit the context window beside the tools above: "
+                     + ', '.join(not_offered) + '.')
     if startable:
         parts.append("Exists locally but the backing service is down — it "
                      "can be self-hosted/started via the install flow: "

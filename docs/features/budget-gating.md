@@ -15,11 +15,25 @@ Estimates the Spark cost of an LLM call before it happens.
 
 ### check_goal_budget()
 
-Checks and atomically deducts from a goal's Spark budget.
+Checks a goal's Spark budget and reserves the estimate while the turn runs.
 
 - Uses a row-level lock on `AgentGoal.spark_budget`.
 - If the estimated cost exceeds the remaining budget, the call is rejected.
-- Deduction is atomic to prevent race conditions under concurrent dispatch.
+- The reservation is atomic, so concurrent dispatches cannot overspend.
+- It is a pre-check, not work: it is held under its holder (the
+  `dispatch_goal` turn, or the speculative expert) and that holder gives it
+  back with `release_goal_reservations()` when its work ends. Spark rises
+  only on completed work (`charge_goal_work_completed()`), and the
+  completion gate reads spark through `spark_spent_on_work()`, which leaves
+  anything still held out. Before a dispatch the daemons read it with
+  `goal_spark_now()`, as committed at that moment rather than off the row
+  their tick loaded, so a reservation given back in the meantime is not
+  counted twice. A release that cannot be written is parked and retried by
+  the goal's next release, and by the agent daemon at the start of each
+  tick.
+- A reservation made by another process (the stdio MCP server's
+  `dispatch_goal`) is not in this process's ledger, so it reads as work
+  until it is given back (task #175).
 
 ### check_platform_affordability()
 

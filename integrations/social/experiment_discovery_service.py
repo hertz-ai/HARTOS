@@ -180,10 +180,17 @@ class ExperimentDiscoveryService:
             'status': exp.status,
         }
 
-        # Voter breakdown
+        # Voter breakdown, by account (voting_rules.vote_is_persons, the
+        # tally's reading), not by the stored label alone
+        from .models import User
+        from .voting_rules import vote_is_persons
         votes = db.query(ExperimentVote).filter_by(experiment_id=experiment_id).all()
-        metrics['human_voters'] = sum(1 for v in votes if v.voter_type == 'human')
-        metrics['agent_voters'] = sum(1 for v in votes if v.voter_type == 'agent')
+        users = {u.id: u for u in (db.query(User).filter(
+            User.id.in_({v.voter_id for v in votes})).all() if votes else [])}
+        persons = sum(1 for v in votes
+                      if vote_is_persons(users.get(v.voter_id), v.voter_type))
+        metrics['human_voters'] = persons
+        metrics['agent_voters'] = len(votes) - persons
 
         # Vote distribution
         support = sum(1 for v in votes if v.vote_value > 0)

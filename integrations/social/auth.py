@@ -13,7 +13,7 @@ import logging
 import time
 from functools import wraps
 
-from flask import request, g, jsonify
+from flask import request, g, jsonify, has_app_context, has_request_context
 
 try:
     import jwt as pyjwt
@@ -325,6 +325,14 @@ def revoke_token(token: str):
         mgr.revoke_token(token)
 
 
+def _note_refusal(reason: str) -> None:
+    """Why _get_user_from_token is answering None for a credential it was
+    given, left on g for the caller that turns that None into the request's
+    refusal (log_refused_credential reads it)."""
+    if has_app_context():
+        g.token_refusal = reason
+
+
 def _get_user_from_token(token: str):
     """Look up user by API token or JWT (local or hive scope).
 
@@ -354,6 +362,7 @@ def _get_user_from_token(token: str):
                 return user, db
         finally:
             pass  # keep session open for request lifecycle
+        _note_refusal('jwt_user_banned' if user else 'jwt_user_missing')
         return None, db
 
     # Fall back to raw API token lookup
@@ -430,6 +439,8 @@ def _get_user_from_token(token: str):
         except Exception as e:
             # Kong fallback must never raise — auth still 401s the same way.
             logger.warning(f"Kong fallback auth failed: {e}")
+    if token:
+        _note_refusal('api_token_user_banned' if user else 'unknown_token')
     return None, db
 
 
@@ -455,6 +466,36 @@ def user_id_for_token(token):
     finally:
         if db is not None:
             db.close()
+
+
+def log_refused_credential(token=None, reason=None) -> None:
+    """Say, once, that a request is refused because no way in accepted the
+    credential it sent: where, why, and the credential's shape, never the
+    credential itself (owner rule H-0711: an error is seen in the log).
+
+    Called where a caller turns _get_user_from_token's None into the
+    request's refusal.  A caller for which None is not a refusal (a loopback
+    caller that falls back to the desktop's owner, an optional login) does
+    not call it, so a request that goes on to succeed logs nothing.
+    ``reason`` defaults to the one _get_user_from_token left on g.  A
+    request that sent no credential was not refused one, and logs nothing.
+    ``token`` defaults to the Bearer the request sent, for a refusal decided
+    where the token is not at hand (approver_from_request's callers, the API
+    gate's final answer).
+    """
+    if token is None and has_request_context():
+        header = request.headers.get('Authorization', '')
+        token = header[7:].strip() if header.startswith('Bearer ') else ''
+    if not token:
+        return
+    where = 'a call outside a request'
+    if has_request_context():
+        from core.auth_local import client_key
+        where = f'{request.method} {request.path} from {client_key()}'
+        reason = reason or g.get('token_refusal')
+    logger.warning(
+        "Refused the credential sent to %s (%s; %d segment(s), %d chars)",
+        where, reason or 'unknown', token.count('.') + 1, len(token))
 
 
 def _sign_in_required(error: str):
@@ -499,6 +540,7 @@ def require_auth(f):
         if user is None:
             if db:
                 db.close()
+            log_refused_credential(token)
             return _sign_in_required('Invalid or expired token')
 
         g.user = user

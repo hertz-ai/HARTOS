@@ -421,28 +421,27 @@ class JourneyEngine:
             except Exception as e:
                 return {'success': False, 'error': str(e)}
 
-        # Other channels via registry
+        # Other channels: the prospect's chat there, sent on the channel
+        # integration's loop, which owns the adapters (ChannelRegistry has no
+        # loop of its own; tests/unit/test_channel_loop_owner.py).
+        chat_id = (prospect.get('channel_ids') or {}).get(channel)
+        if not chat_id:
+            return {'success': False, 'channel': channel,
+                    'error': f'no {channel} chat for this prospect'}
         try:
-            from integrations.channels.registry import get_registry
-            registry = get_registry()
-            adapter = registry.get_adapter(channel)
-            if adapter:
-                import asyncio
-                loop = getattr(registry, '_loop', None)
-                if loop and loop.is_running():
-                    future = asyncio.run_coroutine_threadsafe(
-                        adapter.send_message(
-                            chat_id=prospect.get('channel_ids', {}).get(channel, ''),
-                            text=message,
-                        ),
-                        loop,
-                    )
-                    result = future.result(timeout=15)
-                    return {'success': result.success, 'channel': channel}
+            from integrations.channels.flask_integration import get_channel_integration
+            result = get_channel_integration().send_threadsafe(
+                channel, chat_id, message, wait=15)
         except Exception as e:
-            logger.debug('Channel %s send failed: %s', channel, e)
-
-        return {'success': False, 'channel': channel, 'error': 'adapter unavailable'}
+            logger.warning('Journey message on %s not sent: %s', channel, e)
+            return {'success': False, 'channel': channel, 'error': str(e)}
+        if result is None:
+            return {'success': False, 'channel': channel,
+                    'error': 'channels are not running'}
+        sent = {'success': bool(result.success), 'channel': channel}
+        if not result.success:
+            sent['error'] = result.error
+        return sent
 
     def _try_alternate_channel(self, prospect: Dict):
         """Try reaching a prospect via a different channel than email."""

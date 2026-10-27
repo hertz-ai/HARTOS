@@ -17,8 +17,9 @@ goal is:
 - every later time that same state is reached — later in the run, in a
   later run, at another level, or by someone else reusing the agent — the
   **same artifact** is replayed, never composed again;
-- when a sound is wrong, a person can **correct** it, and the correction
-  is what everyone hears afterwards;
+- when a sound is wrong, a person can **correct** it.  The agent's
+  creator's correction is what everyone hears afterwards; anyone else's
+  is what they alone hear (§5, owner 2026-10-17);
 - a hit is a hit and a miss is a miss, with **no fuzzy matching** and no
   silent near-misses.
 
@@ -38,8 +39,11 @@ goal is:
 (owner_user_id, prompt_id, game_id, state, level?, variant?)
 ```
 
-- **owner_user_id** — whose agent this is. Two users reusing the same
-  agent share its approved sounds (§6) but corrections are theirs alone.
+- **owner_user_id** — as built (§5), not a field of the key but the
+  store the memo lives in: the agent's own store for what everyone hears,
+  a person's own `{user_id}_{prompt_id}` store for their choices.  Two
+  users reusing the same agent share its approved sounds (§6) but
+  corrections are theirs alone.
 - **prompt_id** — the agent. Sounds belong to the agent, not to the app,
   so reuse carries them.
 - **game_id** — the game's own id as the app knows it (`config.id`, or a
@@ -47,7 +51,8 @@ goal is:
 - **state** — from the table above. Anything else is rejected, not guessed.
 - **level** — optional. Absent means the sound serves every level.
 - **variant** — optional, reserved for a deliberate second take
-  (§6 correction). Absent for the first.
+  (§6 correction). Absent for the first.  A level's first take that
+  answers the game's rejected take is numbered after it (§6.1).
 
 The key is built by one function on each side and never by string
 concatenation at a call site.
@@ -68,8 +73,10 @@ Rules that make hits and misses exact:
 - **Only exact keys match.** No prefix matching, no nearest-mood, no
   "close enough". A level asks for its own key and falls back only
   through the ladder above.
-- **Every answer names what matched**: `matched: "level" | "game" |
-  "template" | "miss"`. The caller logs it; tests assert it.
+- **Every answer names what matched**: `matched: "mine" | "level" |
+  "game" | "composing" | "miss"` ("mine" is the person's own memo, §5;
+  "template" joins them if §4.3 is built). The caller logs it; tests
+  assert it.
 - **A miss composes exactly one artifact** and memoizes it **under the
   key that was requested** (not under the fallback it would have used),
   so the second identical request is a level‑1 hit.
@@ -81,16 +88,51 @@ Rules that make hits and misses exact:
 
 ## 5. Where the memo lives
 
-In the agent's own saved data, beside everything else the agent keeps
-(`save_data_in_memory` / `get_data_by_key`, persisted per `prompt_id`):
+**Owner ruling 2026-10-17** (built, task #240): *"background music
+selection can be altered by anyone for my agent ... the unique key is
+userid_promptid"*, and *"background music created once gets reused ...
+should not be conflated with"* it.  So there are two memos with one shape:
+
+- **The agent's memo** (below): every composed take.  A take is composed
+  once and replayed for everyone; an empty slot is filled by whoever's
+  turn reaches it first.
+- **A person's own memo**: `agent_data[person_store_id("{user_id}_{prompt_id}")]['games']`
+  (`core.agent_tools.person_store_id` / `person_store_for`: the session
+  key itself when it is safe as a file name and lower case, else a
+  `p<digest>` of it), the same shape.  It holds their choices: every take
+  they turned down (the last one and, in `previous_takes`, the ones
+  before), a take they kept, a take of their own.
+  Their lookup tries it first and skips any agent take they turned down.
+
+Only the agent's creator (`core.agent_tools.is_agent_creator`, from
+`prompts/<id>.json`'s `creator_user_id`) chooses for everyone, in any
+mode, because the creator's review ("Evaluation Mode") runs through reuse.
+Anyone else's approval, rejection or replacement is written in their own
+memo only, by the agent's tools and by the review card
+(`/api/agent/approval`, which uses the caller's verified identity and
+answers 401 without one).  The card is answered outside any chat turn,
+so it writes the store files directly and then every recipe-pipeline
+cache drops its copy (`core.cache_loaders.forget_cached_store`); a live
+session would otherwise keep serving the old store and write it back over
+the answer.  The per-person `'mine'` sub-slot that used to live INSIDE the
+agent's memo is gone; measured 2026-10-17, no stored agent file on the
+desktop held one.
+
+The agent's memo, in the agent's own saved data, beside everything else
+the agent keeps (persisted per `prompt_id`):
 
 ```
 agent_data[prompt_id]['games'][game_id]['sounds'][key] = {
     url, prompt, state, level?, variant?,
     composed_at, approved_at?, rejected_at?, rejected_reason?,
-    task_id?            # while composing
-}
+    task_id?, task_since?, task_take?   # while composing: the job, when it
+}                                       # was taken, what it was composed with
 ```
+
+A composition outlives the call that starts it (a job averaged 907 s on
+a shared GPU; a call polls for 90 s), so the call that finishes it binds
+the take with the prompt and variant in `task_take`, not with its own
+newer reading of the rejections (review of c67afc26e, F-1).
 
 Why there and not a cache: a cache may evict; a memo may not. The app's
 media cache and the node's media cache stay caches in front of it, and
@@ -106,13 +148,84 @@ wrong for the age. Three moments, three behaviours:
    reason)` marks the memo rejected with the reason, and the next
    composition for that key **includes the reason in the prompt** and
    stores the result as the next `variant`. The rejected artifact is kept
-   (not deleted) so a reviewer can go back to it.
-2. **In REUSE, by the person using the agent.** Their correction must not
-   silently change what everyone else hears. It writes a memo at the same
-   key **scoped to that user**, which their lookups match before the
-   agent's. The agent's approved sound is untouched.
+   (not deleted) so a reviewer can go back to it.  A verdict lands on the
+   key the ladder matched, so a rejection given while a level played is
+   the game's; a level composed afterwards answers it too.  The next take
+   answers the newer of the level's complaint and the game's, the level's
+   on a tie (`core.game_sound_memo.rejected_take`); a key whose rejection a
+   job replaced is read through the takes the job carries as turned down,
+   so a take composed after that job was lost or failed still answers the
+   reason (review of 14c6bbd5f, F-B).
+2. **In REUSE, by anyone but the agent's creator.** Their correction must
+   not silently change what everyone else hears. It writes a memo **in
+   their own store** (§5), at the key of the take they were hearing, which
+   their lookups match before the agent's. The agent's approved sound is
+   untouched.  (The creator's own review runs through REUSE too, and their
+   word is the agent's, as in 1.)
 3. **Never automatically.** Nothing rewrites a memo because a model
    thought it could do better.
+
+A turned-down take stays turned down.  Every write at a key keeps the
+takes the record it replaces held as turned down
+(`core.game_sound_memo.set_game_state_sound_at` / `set_game_state_sound`,
+built by `turned_down_takes`).  So a person's own take finishing over a
+verdict they gave while it composed still skips the take they turned
+down.  And a rejection written at a key where the person's own take is
+still composing keeps that composition's task (`IN_FLIGHT_FIELDS`), so
+the next call finds the job instead of queueing a second one (both
+measured 2026-10-18 at f572fd775).
+
+What happens to a composition when another take lands while it runs is
+decided by what the person did, not by when a call happens to look
+(review of 5feeee2b8, F1):
+
+- A take they KEEP is a choice, and ends their own composition for every
+  key it covers: its own key and, kept at the game's key, every level's
+  key of that state, since the ladder answers the kept take at each level
+  without a take of its own.  The verdict writes this itself
+  (`core.game_sound_memo.record_verdict`), so it holds whether or not a
+  call is waiting on that composition.  The job it ends is cleared, with
+  a `lost_task` note; the composer, which cannot be asked to stop, simply
+  has its take left unbound.  A submit still in its cooldown ends with it,
+  so after the kept take is turned down the composer may hold two jobs.
+  A keep counts in the memo it is written to, never by when it happened:
+  a person's keep ends their own composition, and the creator's keep ends
+  the agent's, a visitor's level job filling the agent's empty slot among
+  them, whatever that visitor did with the take in their own memo.  The
+  creator keeping their next take for everyone is, for a visitor's own
+  composition, a take landing, not the visitor's choice (review of
+  ec055c9b6, F1, F3).  A submit is in the memo before it goes out: the
+  call writes its note first (`core.game_sound_memo.submit_note`), so a
+  keep given while the submit waits ends it like any job, and the call
+  then writes neither its task, nor its note, nor its finished take
+  (`holds_composition`).  A keep then a turn-down inside one submit still
+  ended it (review of bc7bbf721, F-D1 to F-D3).
+- Any other take that lands meanwhile (another turn filling the slot,
+  the creator's next take) is what they hear, as it would have been had
+  it come first, and their composition waits behind it with its task or
+  its submit note: if they turn that take down, their own is bound when
+  it finishes, with no second job, exactly as when they turn it down
+  before any call looks.  A job waiting longer than `TASK_STALE_S` is
+  taken as lost and composed afresh.
+
+Nothing the composing call holds is written over a take that landed
+while it composed: not the task or the submit note its submit returns
+(the submit can wait two minutes), not the take it finishes.  The call
+asks this before each of those writes with the same lookup it began
+with, and whether its own note or task is still at its key.  The same
+take, bound first by another call polling the same task, is left as it
+is.  The setters are the one source of a take's history; the composing
+tool builds none of its own.
+
+While a submit is out, its key reads 'composing', to `bind_game_sound`
+and to REUSE's reader `get_game_sound` alike.  A second call for that key
+waits for it and says what is composing (the game, state and level, and
+how long ago the submission went out) rather than queue a second job of
+the same take: composed once, by whoever submitted first.  A submit that starts nothing (refused, no
+composer, a composer that is not up, no url, an error) takes its note
+out again on its one way out.  A note whose process died lapses with
+`SUBMIT_COOLDOWN_S` (600 s); until then the key reads 'composing', so
+600 s is the longest a stale 'composing' lasts.
 
 `approved_at` is what REUSE prefers; an unapproved memo still plays (a
 game is not held hostage to review) but is reported as unapproved so a
@@ -167,7 +280,8 @@ Uncommitted, written before the spec and **to be reconciled with it**:
 
 ## 10. What is missing against this spec
 
-1. `owner_user_id` in the key, and the user-scoped correction of §6.2.
+1. ~~`owner_user_id` in the key, and the user-scoped correction of §6.2.~~
+   Built 2026-10-17 as the two memos of §5.
 2. `variant`, and composing with the rejection reason (§6.1).
 3. The `template` scope (§4.3) — and whether it is wanted at all.
 4. `matched` in every answer, and the logging and tests that make §4
@@ -185,8 +299,10 @@ Uncommitted, written before the spec and **to be reconciled with it**:
 - **Silence while composing**: a first play is silent for that state. Is
   that acceptable, or should the app fall back to its bundled sound for
   that state until the artifact arrives? (The bundled sounds exist today.)
-- **Correction in reuse (§6.2)**: user-scoped override, or should a
-  reused agent be fixed as approved and corrections go back to the author?
+- ~~**Correction in reuse (§6.2)**: user-scoped override, or should a
+  reused agent be fixed as approved and corrections go back to the author?~~
+  Answered 2026-10-17: user-scoped, under `{user_id}_{prompt_id}`; only
+  the creator changes the agent's (§5).
 - **How many states are worth composing.** All fourteen per game is a lot
   of generation. A shortlist (`bgm`, `correct`, `wrong`, `complete`)
   covers most of what a child hears.
