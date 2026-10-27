@@ -170,6 +170,97 @@ def _find_llm_pids() -> set:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Windows Job Object plumbing — the ONE job this process has
+# ═══════════════════════════════════════════════════════════════════════
+#
+# The process is in a single Job Object, owned by ResourceEnforcer: it carries
+# the memory ceiling AND kill-on-close, so every process assigned to it dies
+# when this one exits (tray quit is os._exit(0): no atexit, no cleanup).
+# core.child_lifecycle.bind_to_parent assigns children to it; it never makes a
+# job of its own.  A second job made the outcome depend on start order (Nunba
+# starts the llama-server thread before the governor), review of HARTOS #141.
+
+_JOB_OBJECT_LIMIT_JOB_MEMORY = 0x200
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+_JOB_EXTENDED_LIMIT_INFO_CLASS = 9   # JobObjectExtendedLimitInformation
+
+
+class _IoCounters(ctypes.Structure):
+    _fields_ = [('_' + str(i), ctypes.c_ulonglong) for i in range(6)]
+
+
+class _JobBasicLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ('PerProcessUserTimeLimit', ctypes.c_longlong),
+        ('PerJobUserTimeLimit', ctypes.c_longlong),
+        ('LimitFlags', ctypes.c_ulong),
+        ('MinimumWorkingSetSize', ctypes.c_size_t),
+        ('MaximumWorkingSetSize', ctypes.c_size_t),
+        ('ActiveProcessLimit', ctypes.c_ulong),
+        ('Affinity', ctypes.c_size_t),
+        ('PriorityClass', ctypes.c_ulong),
+        ('SchedulingClass', ctypes.c_ulong),
+    ]
+
+
+class _JobExtendedLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ('BasicLimitInformation', _JobBasicLimitInformation),
+        ('IoInfo', _IoCounters),
+        ('ProcessMemoryLimit', ctypes.c_size_t),
+        ('JobMemoryLimit', ctypes.c_size_t),
+        ('PeakProcessMemoryUsed', ctypes.c_size_t),
+        ('PeakJobMemoryUsed', ctypes.c_size_t),
+    ]
+
+
+_job_kernel32_cache = None
+
+
+def _job_kernel32():
+    """kernel32 with the Job Object prototypes declared.
+
+    A private WinDLL, not ctypes.windll.kernel32: setting argtypes/restype on
+    the shared one would change every other caller's prototypes.  Without them
+    ctypes treats a HANDLE as a 32-bit int and a 64-bit handle is truncated,
+    which silently breaks the binding.  use_last_error=True so the logged
+    Win32 error code is the failing call's, not a stale one.
+    """
+    global _job_kernel32_cache
+    if _job_kernel32_cache is None:
+        k = ctypes.WinDLL('kernel32', use_last_error=True)  # type: ignore[attr-defined]
+        k.CreateJobObjectW.restype = ctypes.c_void_p
+        k.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+        k.SetInformationJobObject.restype = ctypes.c_bool
+        k.SetInformationJobObject.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong]
+        k.AssignProcessToJobObject.restype = ctypes.c_bool
+        k.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        k.GetCurrentProcess.restype = ctypes.c_void_p
+        _job_kernel32_cache = k
+    return _job_kernel32_cache
+
+
+def _set_job_limits(job, job_memory_bytes: int = 0) -> bool:
+    """Set the job's limit flags: kill-on-close ALWAYS, plus the job-wide
+    memory ceiling when ``job_memory_bytes`` is given.
+
+    SetInformationJobObject replaces the flags rather than merging them, so
+    every call must restate kill-on-close: a memory-only call (what this used
+    to be) silently undoes it on the first update_caps().
+    """
+    info = _JobExtendedLimitInformation()
+    flags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    if job_memory_bytes:
+        flags |= _JOB_OBJECT_LIMIT_JOB_MEMORY
+        info.JobMemoryLimit = job_memory_bytes
+    info.BasicLimitInformation.LimitFlags = flags
+    return bool(_job_kernel32().SetInformationJobObject(
+        job, _JOB_EXTENDED_LIMIT_INFO_CLASS, ctypes.byref(info),
+        ctypes.sizeof(info)))
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # ResourceEnforcer — hard OS-level process caps
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -191,6 +282,7 @@ class ResourceEnforcer:
     def __init__(self):
         self._enforced = False
         self._job_handle = None   # Windows Job Object handle
+        self._job_lock = threading.Lock()   # one creator, whichever thread is first
         self._cgroup_path = None  # Linux cgroup path
         self._original_nice = None
 
@@ -318,21 +410,71 @@ class ResourceEnforcer:
         handle.  Creating a fresh Job Object per mode flip (the old behaviour)
         accumulated nested jobs on Windows, pinning the process at the
         most-restrictive cap so 'relax to idle' silently never took effect.
+
+        This is the process's ONLY job, and it is created by whoever needs it
+        first: the governor when it enforces, or ``bind_child`` when a child
+        is spawned before the governor starts (Nunba starts the llama-server
+        thread first).  Either way later callers reuse it.  It carries
+        kill-on-close from the moment it exists.
         """
-        if self._job_handle:
-            return
-        try:
-            kernel32 = ctypes.windll.kernel32
-            job = kernel32.CreateJobObjectW(None, None)
-            if not job:
-                logger.debug("ResourceEnforcer: CreateJobObject failed")
+        with self._job_lock:
+            if self._job_handle:
                 return
-            kernel32.AssignProcessToJobObject(job, kernel32.GetCurrentProcess())
-            self._job_handle = job
-            logger.info("ResourceEnforcer: Job Object ready "
-                        "(memory ceiling; CPU governed by affinity, not a rate cap)")
+            try:
+                kernel32 = _job_kernel32()
+                job = kernel32.CreateJobObjectW(None, None)
+                if not job:
+                    logger.debug("ResourceEnforcer: CreateJobObject failed")
+                    return
+                if not _set_job_limits(job):
+                    logger.warning(
+                        "ResourceEnforcer: SetInformationJobObject failed; "
+                        "Job Object created without KILL_ON_JOB_CLOSE")
+                if not kernel32.AssignProcessToJobObject(
+                        job, kernel32.GetCurrentProcess()):
+                    # The job still works for children assigned one by one.
+                    logger.warning(
+                        "ResourceEnforcer: this process could not join its "
+                        "Job Object (err=%d)", ctypes.get_last_error())
+                self._job_handle = job
+                logger.info("ResourceEnforcer: Job Object ready "
+                            "(kill-on-close + memory ceiling; CPU governed by "
+                            "affinity, not a rate cap)")
+            except Exception as e:
+                logger.debug("ResourceEnforcer: Job Object create failed: %s", e)
+
+    def bind_child(self, proc) -> bool:
+        """Make ``proc`` (a subprocess.Popen) die when this process exits, by
+        assigning it to the process's one Job Object (created here if the
+        governor has not started yet).  Call right after Popen returns.
+
+        Measured on Windows 11: a child spawned BEFORE the job existed can be
+        assigned to it afterwards, and a child that inherited the job can be
+        assigned to it again, so both start orders bind.  Returns False off
+        Windows or when the assignment failed (logged: the child will outlive
+        this process).  Never raises: a failed binding must not fail a spawn.
+        """
+        if sys.platform != 'win32':
+            return False
+        handle = getattr(proc, '_handle', None)
+        if not handle:
+            return False
+        try:
+            self._ensure_job_windows()
+            if not self._job_handle:
+                return False
+            ok = _job_kernel32().AssignProcessToJobObject(
+                self._job_handle, int(handle))
+            if not ok:
+                logger.warning(
+                    "ResourceEnforcer: AssignProcessToJobObject failed "
+                    "(err=%d); child WILL outlive parent",
+                    ctypes.get_last_error())
+            return bool(ok)
         except Exception as e:
-            logger.debug("ResourceEnforcer: Job Object create failed: %s", e)
+            logger.warning(
+                "ResourceEnforcer: AssignProcessToJobObject exception: %s", e)
+            return False
 
     def _unrestrict_llm_affinity(self, total_cores: int):
         """Pin llama-server to EVERY core.  The model is a child of this process
@@ -386,48 +528,12 @@ class ResourceEnforcer:
             self._enforce_ram_rlimit(max_bytes)
 
     def _enforce_ram_windows(self, max_bytes: int):
-        """Windows: Job Object memory limit."""
+        """Windows: Job Object memory limit (kill-on-close restated: see
+        ``_set_job_limits``)."""
         if not self._job_handle:
             return
         try:
-            kernel32 = ctypes.windll.kernel32
-
-            # JOBOBJECT_EXTENDED_LIMIT_INFORMATION
-            class IO_COUNTERS(ctypes.Structure):
-                _fields_ = [('_' + str(i), ctypes.c_ulonglong) for i in range(6)]
-
-            class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
-                _fields_ = [
-                    ('PerProcessUserTimeLimit', ctypes.c_longlong),
-                    ('PerJobUserTimeLimit', ctypes.c_longlong),
-                    ('LimitFlags', ctypes.c_ulong),
-                    ('MinimumWorkingSetSize', ctypes.c_size_t),
-                    ('MaximumWorkingSetSize', ctypes.c_size_t),
-                    ('ActiveProcessLimit', ctypes.c_ulong),
-                    ('Affinity', ctypes.c_size_t),
-                    ('PriorityClass', ctypes.c_ulong),
-                    ('SchedulingClass', ctypes.c_ulong),
-                ]
-
-            class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
-                _fields_ = [
-                    ('BasicLimitInformation', JOBOBJECT_BASIC_LIMIT_INFORMATION),
-                    ('IoInfo', IO_COUNTERS),
-                    ('ProcessMemoryLimit', ctypes.c_size_t),
-                    ('JobMemoryLimit', ctypes.c_size_t),
-                    ('PeakProcessMemoryUsed', ctypes.c_size_t),
-                    ('PeakJobMemoryUsed', ctypes.c_size_t),
-                ]
-
-            info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-            # JOB_OBJECT_LIMIT_JOB_MEMORY = 0x200
-            info.BasicLimitInformation.LimitFlags = 0x200
-            info.JobMemoryLimit = max_bytes
-
-            # SetInformationJobObject with JobObjectExtendedLimitInformation (9)
-            kernel32.SetInformationJobObject(
-                self._job_handle, 9, ctypes.byref(info), ctypes.sizeof(info))
-
+            _set_job_limits(self._job_handle, max_bytes)
             logger.info("ResourceEnforcer: Windows Job memory limit = %.1f GB",
                          max_bytes / (1024**3))
         except Exception as e:

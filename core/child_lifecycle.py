@@ -13,16 +13,21 @@ A Windows Job Object with ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` fixes that
 exactly: when this process exits -- tray quit, Task Manager, crash -- the
 kernel closes the job handle and kills every process assigned to it.
 
-NESTING
+ONE JOB
 -------
-``bind_to_parent`` assigns the child as it was spawned; it does NOT ask for
-``CREATE_BREAKAWAY_FROM_JOB``.  If this process sits in the resource
-governor's job (core/resource_governor.py), the child is in it too, and the
-governor's memory ceiling keeps counting it -- on purpose: llama-server is
-the biggest consumer it governs.  Windows 8+ nests the lifecycle job under
-that one.  A process that needs a job of its own (hevolveai_supervisor: it
-also caps the child's CPU rate job-wide) creates its own ``JobHandle`` and
-spawns with ``CREATE_BREAKAWAY_FROM_JOB``.
+The process has a single Job Object, the resource governor's
+(``core.resource_governor.ResourceEnforcer``): it carries the memory ceiling
+and kill-on-close.  ``bind_to_parent`` assigns the child to it -- creating it
+first if the governor has not started yet, which is Nunba's order: the
+llama-server thread starts before the governor.  There is no second job
+beside it (a second job made the outcome depend on that start order, review
+of HARTOS #141).  The governor's memory ceiling keeps counting the child, on
+purpose: llama-server is the biggest consumer it governs.
+
+``bind_to_parent`` does NOT ask for ``CREATE_BREAKAWAY_FROM_JOB``.  A process
+that needs a job of its own (hevolveai_supervisor: it also caps the child's
+CPU rate job-wide) creates its own ``JobHandle`` and spawns with
+``CREATE_BREAKAWAY_FROM_JOB``; ``JobHandle`` stays here for that one use.
 
 Windows only.  Elsewhere ``bind_to_parent`` returns False and does nothing.
 """
@@ -31,7 +36,6 @@ from __future__ import annotations
 import ctypes
 import logging
 import sys
-import threading
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -168,8 +172,8 @@ class JobHandle:
         ``cpu_fraction`` is a fraction of ONE logical core (0.05 = 5%).
         Windows clamps the rate field at 1 (0.01%); we floor at 100 (1%)
         so a near-zero cap doesn't starve a child out of even emitting its
-        shutdown logs.  Never call this on the shared lifecycle job: the
-        cap would apply to every child bound to it.
+        shutdown logs.  Never call this on the process's shared job
+        (core.resource_governor): the cap would apply to every child in it.
         """
         if self.handle is None or self._kernel32 is None:
             return False
@@ -198,27 +202,21 @@ class JobHandle:
             return False
 
 
-_LIFECYCLE_JOB: Optional[JobHandle] = None
-_LIFECYCLE_LOCK = threading.Lock()
-
-
 def bind_to_parent(proc) -> bool:
     """Make ``proc`` (a subprocess.Popen) die when this process exits.
 
     Call right after Popen returns.  Returns True when the child is bound;
     False off Windows or if the Job Object could not be set up (logged).
     Never raises: a failed binding must not fail the spawn.
+
+    Delegates to the process's one job (``ResourceEnforcer.bind_child``);
+    this module keeps no job of its own for it.
     """
-    if sys.platform != 'win32':
+    if sys.platform != 'win32' or not getattr(proc, '_handle', None):
         return False
-    handle = getattr(proc, '_handle', None)
-    if not handle:
+    try:
+        from core.resource_governor import get_enforcer
+        return get_enforcer().bind_child(proc)
+    except Exception as e:  # pragma: no cover -- defensive
+        logger.warning("child_lifecycle: could not bind child: %s", e)
         return False
-    global _LIFECYCLE_JOB
-    with _LIFECYCLE_LOCK:
-        if _LIFECYCLE_JOB is None:
-            job = JobHandle(owner='child_lifecycle')
-            if job.create() is None:
-                return False
-            _LIFECYCLE_JOB = job
-        return _LIFECYCLE_JOB.assign(handle)
