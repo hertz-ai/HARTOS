@@ -262,3 +262,35 @@ def test_one_model_call_per_session_however_often_it_is_asked(monkeypatch):
     release.set()
     s._prewarm_thread.join(2)
     assert len(calls) == 1
+
+
+def test_try_another_never_offers_the_declined_name_as_a_backup(monkeypatch):
+    monkeypatch.setattr(ho, 'generate_hart_name',
+                        lambda *a, **k: _named('first', 'second', 'third'))
+    s = _session()
+    s._start_prewarm()
+    s._prewarm_thread.join(2)
+    first = s._do_reveal()
+    assert first['hart_name'] == 'first'
+
+    again = s._do_reveal(alternative=True)
+    assert again['hart_name'] == 'second'
+    assert 'first' not in again['candidates'], \
+        "the name the person turned down must not come back as a seal backup"
+    assert again['candidates'] == ['third']
+
+
+def test_a_model_failure_is_logged_where_it_can_be_seen(monkeypatch, caplog):
+    def _boom(*a, **k):
+        if k.get('use_llm'):
+            raise RuntimeError('llama-server went away')
+        return _named('curated')
+
+    monkeypatch.setattr(ho, 'generate_hart_name', _boom)
+    s = _session()
+    with caplog.at_level('WARNING', logger=ho.logger.name):
+        s._start_prewarm()
+        s._prewarm_thread.join(2)
+    failures = [r for r in caplog.records if 'prewarm failed' in r.getMessage()]
+    assert failures and failures[0].levelname == 'WARNING'
+    assert s._do_reveal()['hart_name'] == 'curated'
