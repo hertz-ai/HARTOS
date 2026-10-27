@@ -172,12 +172,13 @@ def purchase_build():
     if not auth_header.startswith('Bearer '):
         return jsonify({'success': False, 'error': 'Authorization required'}), 401
 
-    from integrations.social.auth import _get_user_from_token
+    from integrations.social.auth import _get_user_from_token, log_refused_credential
     token = auth_header[7:]
     user, db = _get_user_from_token(token)
     if not user:
         if db:
             db.close()
+        log_refused_credential(token)
         return jsonify({'success': False, 'error': 'Invalid token'}), 401
 
     try:
@@ -203,12 +204,13 @@ def download_build(license_id):
     if not auth_header.startswith('Bearer '):
         return jsonify({'success': False, 'error': 'Authorization required'}), 401
 
-    from integrations.social.auth import _get_user_from_token
+    from integrations.social.auth import _get_user_from_token, log_refused_credential
     token = auth_header[7:]
     user, db = _get_user_from_token(token)
     if not user:
         if db:
             db.close()
+        log_refused_credential(token)
         return jsonify({'success': False, 'error': 'Invalid token'}), 401
 
     try:
@@ -228,12 +230,13 @@ def list_build_licenses():
     if not auth_header.startswith('Bearer '):
         return jsonify({'success': False, 'error': 'Authorization required'}), 401
 
-    from integrations.social.auth import _get_user_from_token
+    from integrations.social.auth import _get_user_from_token, log_refused_credential
     token = auth_header[7:]
     user, db = _get_user_from_token(token)
     if not user:
         if db:
             db.close()
+        log_refused_credential(token)
         return jsonify({'success': False, 'error': 'Invalid token'}), 401
 
     try:

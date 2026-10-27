@@ -11,6 +11,7 @@ These import the REAL module and mock only the boundaries:
 We call the real functions and assert observable behavior, never grep source.
 """
 import os
+import threading
 
 import pytest
 
@@ -330,6 +331,35 @@ def test_register_idle_indexer_is_idempotent(tmp_path, monkeypatch):
     started_again = msi.register_idle_indexer(dirs=[str(tmp_path)])
     assert started_first is True
     assert started_again is False
+
+
+def test_building_the_shell_app_starts_no_idle_indexer(monkeypatch):
+    """The idle indexer starts where the shell is SERVED (serve_forever),
+    never where its Flask app is only BUILT.
+
+    Task #936, measured 2026-10-21: LiquidUIService()._create_flask_app()
+    started this thread, so every test that built the app started it in the
+    test process (27 files; test_commerce_wiring.py's shell_world fixture is
+    one).  It walked ~/Pictures and ~/Videos, asked the vision backend for a
+    caption, and the 0.8B backend spawned a llama-server on :8081 beside the
+    desktop app's own: five servers LISTENING there, four of them orphans
+    holding 8.8 GiB of commit.
+    """
+    from integrations.agent_engine.liquid_ui_service import LiquidUIService
+    monkeypatch.setattr(LiquidUIService, '_register_self', lambda self: None)
+    monkeypatch.setattr(msi, '_idle_started', False)
+    monkeypatch.setattr(msi, '_idle_thread', None)
+    before = {t.ident for t in threading.enumerate()
+              if t.name == 'media-idle-indexer'}
+
+    app = LiquidUIService()._create_flask_app()
+
+    started = [t for t in threading.enumerate()
+               if t.name == 'media-idle-indexer' and t.ident not in before]
+    assert started == [], 'building the shell app started the media idle indexer'
+    assert msi._idle_started is False
+    # The media routes registered beside it are still mounted.
+    assert '/api/media/search' in {r.rule for r in app.url_map.iter_rules()}
 
 
 # ─── 6. dynamic image cache: fetch-once, serve-from-cache, offline-graceful ─

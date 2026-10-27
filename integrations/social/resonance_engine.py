@@ -238,6 +238,49 @@ class ResonanceService:
         return result
 
     @staticmethod
+    def award_action_once(db: Session, user_id: str, action: str,
+                          source_id: str) -> Dict:
+        """award_action at most once per (user, action, source): the ledger
+        entry IS the record (as hive_contest registers a participant), so no
+        sequence of calls, sequential or concurrent, pays the same action for
+        the same source twice.  Returns {} when it was already paid, or when
+        `action` is not in AWARD_TABLE.  (Review of 5637595de: a flag read
+        from the vote row was reset by clearing the suggestion, and 50
+        clear-and-re-add cycles minted 51 suggestion awards.)
+
+        CONCURRENT CALLS (review of f5089e1ef: two identical re-votes at once
+        paid twice in 51 of 60 trials, and with no wallet yet the loser's
+        session failed in 56 of 60): the user's wallet row is written first,
+        a self-assigning UPDATE (spend_spark's conditional-UPDATE idiom), so
+        a second call for this user waits on the write lock (SQLite; a row
+        or gap lock on MySQL, which also guards the wallet insert) until the
+        first commits, and the ledger read is a locking read, so it sees
+        that commit rather than an older snapshot.  Measured on file SQLite
+        (one award, no failed request, wallet or not).  On MySQL, by InnoDB's
+        rules and not measured here, two first awards for a user with no
+        wallet yet can end one request with a deadlock abort instead of a
+        wait; never a double pay."""
+        from .models import ResonanceTransaction
+        db.query(ResonanceWallet).filter(
+            ResonanceWallet.user_id == user_id,
+        ).update({ResonanceWallet.spark: ResonanceWallet.spark,
+                  # set to itself, so the onupdate does not fire: wallet sync
+                  # is last-write-wins on updated_at, and taking a lock must
+                  # not make an unchanged balance look newer (review of
+                  # 375df0ef0, finding 1)
+                  ResonanceWallet.updated_at: ResonanceWallet.updated_at},
+                 synchronize_session=False)
+        paid = db.query(ResonanceTransaction.id).filter(
+            ResonanceTransaction.user_id == user_id,
+            ResonanceTransaction.source_type == action,
+            ResonanceTransaction.source_id == source_id,
+        ).with_for_update().first()
+        if paid is not None:
+            return {}
+        return ResonanceService.award_action(db, user_id, action,
+                                             source_id=source_id)
+
+    @staticmethod
     def award(db: Session, user_id: str, action: str, amount: int,
               reason: str = '') -> Dict:
         """Generic award entry point for action-based rewards.

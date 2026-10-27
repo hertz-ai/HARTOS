@@ -394,11 +394,29 @@ class TestLatestInbound:
         assert [g['xid'] for g in latest_inbound('u1', '9', request_id='r',
                                                  purpose='logo')] == [logo]
         clock.now += 7 * 3600
+        # An unused clip stays usable for as long as the store keeps it (its
+        # purpose's unused_s), not for a shorter window of the reader's own.
+        assert [g['xid'] for g in latest_inbound('u1', '9', request_id='r')] == [clip]
+        assert latest_inbound('u1', '9', request_id='r', max_age_s=3600) == []
+        clock.now += ufs.PURPOSES['reel_source'].unused_s - 7 * 3600 + 1
         assert latest_inbound('u1', '9', request_id='r') == []
         assert [g['xid'] for g in latest_inbound('u1', '9', request_id='r',
-                                                 max_age_s=8 * 3600)] == [clip]
+                                                 max_age_s=80 * 3600)] == [clip]
         store.mark_consumed('u1', [clip])
-        assert latest_inbound('u1', '9', request_id='r', max_age_s=8 * 3600) == []
+        assert latest_inbound('u1', '9', request_id='r', max_age_s=80 * 3600) == []
+
+    def test_her_unused_batch_stays_usable_while_the_store_keeps_it(self, store, clock):
+        """Measured 2026-10-20 on her desktop: five clips her phone sent on
+        10-18 21:30, bound to agent 342 and that turn, never used.  46 hours
+        later the store still held all five (an unused clip is kept 72 h),
+        but a 6-hour window of this reader's own hid them: reel_make would
+        have answered needs_clips.  What the store keeps for her agent, a
+        later turn of that agent can use."""
+        clips = [_upload(store, 'u1', ('clip-%d' % i).encode() * 60) for i in range(5)]
+        bind_inbound('u1', '342', 'req-1018', parse_inbound([_att(c) for c in clips]))
+        clock.now += 46 * 3600
+        assert [g['xid'] for g in latest_inbound('u1', '342')] == clips
+        assert latest_inbound('u1', '342', request_id='req-1020') == []
 
     def test_another_agents_clips_are_not_this_agents(self, store):
         c = _upload(store, 'u1', b'agent-a' * 40)

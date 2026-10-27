@@ -219,17 +219,30 @@ def bind_inbound(user_id, prompt_id, request_id, items) -> List[Dict[str, Any]]:
 
 
 def latest_inbound(user_id, prompt_id, *, request_id=None, purpose=REEL_SOURCE,
-                   max_age_s: Optional[float] = 21600) -> List[Dict[str, Any]]:
+                   max_age_s: Optional[float] = None) -> List[Dict[str, Any]]:
     """The inbound files a reel turn may use, in upload order.
 
     Unconsumed files of ``purpose`` bound to this user's ``prompt_id``,
-    uploaded within ``max_age_s``.  With ``request_id``: the ones bound to
-    that turn.  Without: the newest batch -- the files bound to the same turn
-    as the newest of them.  Returns StoredFile dicts
-    (contracts.ClipSource.from_stored reads them).  Never raises.
+    uploaded within ``max_age_s``.  None (the default) is the store's own
+    rule: as long as it keeps an unused file of that purpose (its
+    ``unused_s``; a purpose with none is kept until she deletes it), so what
+    the store holds for her agent a later turn of that agent can use.  With
+    ``request_id``: the ones bound to that turn.  Without: the newest batch
+    -- the files bound to the same turn as the newest of them.  Returns
+    StoredFile dicts (contracts.ClipSource.from_stored reads them).  Never
+    raises.
+
+    The default was 6 h (4ec01b499) while the store keeps an unused clip
+    72 h.  Measured 2026-10-20: five clips her phone sent agent 342 on 10-18
+    21:30, never used, were held by the store and hidden from every turn of
+    that agent after 03:30 the next morning.
     """
     try:
-        files = get_user_file_store().query_inbox(
+        store = get_user_file_store()
+        if max_age_s is None:
+            kind = store.purposes.get(purpose)
+            max_age_s = kind.unused_s if kind is not None else None
+        files = store.query_inbox(
             user_id, prompt_id=prompt_id, request_id=request_id, purpose=purpose,
             max_age_s=max_age_s, unconsumed_only=True)
     except Exception as e:

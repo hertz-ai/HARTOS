@@ -166,7 +166,7 @@ def test_whatsapp_link_failure_names_the_user_or_none(lui, monkeypatch, uid,
                                           {'display_name': 'WhatsApp'})
     args, kwargs = lui.agent_ui_update.call_args
     assert args[1]['type'] == 'toast' and args[1]['severity'] == 'error'
-    assert 'WhatsApp' in args[1]['text']
+    assert 'WhatsApp' in args[1]['message']
     assert kwargs['user_id'] == expected
 
 

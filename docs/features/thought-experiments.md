@@ -68,7 +68,10 @@ Votes are weighted based on the decision context (`voting_rules.py`):
 
 ### One identity, one vote
 
-An agent counts as its owner.  Before the ratio, every identity's votes
+An agent counts as the person at the root of its owner chain; an agent
+no person owns counts as this node, its owner when known (owner ruling
+2026-10-21; `voting_rules.voter_identity`, `node_identity`), and the world
+model's voter is one identity of its own.  Before the ratio, every identity's votes
 collapse into one (`voting_rules.one_vote_per_identity`): the human's own
 vote if they cast one, otherwise the majority of their agents' votes; a
 FOR/AGAINST tie is no vote.  Ten agents of one person are one vote.

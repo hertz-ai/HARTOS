@@ -846,39 +846,102 @@ def _get_budget_per_slot() -> int:
 def _min_message_budget(per_slot: int) -> int:
     """Tokens the MESSAGES must always be left, whatever the schema costs.
 
-    The floor the degrade branch of :func:`_trim_to_budget` already fell back
-    to; named here so the two callers cannot drift.  The second caller is
-    ``core.agent_tools.fit_schema_to_ctx``, which subtracts this from the live
-    n_ctx to learn how much a tool schema may spend — so the wire's floor and
-    the selection path's ceiling are the same number by construction.
+    The floor of both halves of the slot's one split: :func:`_schema_room`
+    leaves it beside every schema the selection path keeps
+    (``core.agent_tools.fit_schema_to_ctx``), and :func:`_message_budget`
+    never trims a request that carries a schema below it -- so the wire's
+    floor and the selection path's ceiling are the same number by
+    construction.
     """
     return max(512, int(per_slot) // 4)
+
+
+#: What llama-server bills beyond the wire's own count of a request.  The wire
+#: counts with tiktoken (core.token_utils); the server tokenizes with the
+#: model's own vocabulary and renders the chat template around every message
+#: and the tool block.  MEASURED 2026-10-20 on the owner's desktop (Qwen3.5-4B,
+#: n_ctx_slot 12288, one slot), the 377 autogen bodies of 16:08-17:38 that
+#: pair with their llama-server task: the server counted at most 407 tokens
+#: more than count_tokens_for_messages + _schema_tokens (5.7% of a 7,065-token
+#: body, 3.4% or less above 8,192), and the HTTP 400 of 17:07:35 was billed
+#: 14,798 against the wire's 14,476 (+322).  Mostly template, so it does not
+#: shrink with the slot: one flat reserve, with headroom over the most
+#: measured.  WIRE_TRIM_SAFETY_MARGIN_TOKENS covers it whenever the slot also
+#: holds max_tokens; this is the part that holds when it does not.
+_PROMPT_OVERHEAD_TOKENS = 512
+
+
+def _schema_room(per_slot: int) -> int:
+    """Tokens a tool schema may cost in a slot of ``per_slot`` tokens: the
+    slot less the messages' floor and what the server adds to the wire's
+    count.
+
+    The schema half of the slot's one split; :func:`_message_budget` is the
+    message half.  A schema this size or smaller, with the messages trimmed
+    to their floor, is a request llama-server takes.  Past it the trim can
+    only report the schema: it never cuts one.
+    """
+    per_slot = int(per_slot)
+    return per_slot - _min_message_budget(per_slot) - _PROMPT_OVERHEAD_TOKENS
+
+
+def _message_budget(per_slot: int, max_tokens: int, tools_tokens: int) -> int:
+    """Tokens the MESSAGES of one request may spend: the wire trim's budget,
+    the message half of the slot's one split (:func:`_schema_room` is the
+    schema half).
+
+    The slot less ``max_tokens``, ``WIRE_TRIM_SAFETY_MARGIN_TOKENS`` and the
+    tool schema -- but a schema never takes the messages below
+    :func:`_min_message_budget`, the floor :func:`_schema_room` leaves beside
+    every schema the selection path keeps; the generation reserve and the
+    margin give way first.  Without a schema the reserves alone decide, and
+    the floor holds only when they leave nothing, as before.
+
+    WHY THE FLOOR FOR A SCHEMA.  The fit admits a schema on the floor's
+    promise, and the trim broke it: 7424 - schema at n_ctx 12288, under the
+    floor for every schema from 4353 to 7423.  Measured 2026-10-20
+    (16:08-17:38): 31 Helper bodies were trimmed to message budgets of 316
+    to 2,730 tokens beside schemas the fit had kept.
+    """
+    from core.constants import WIRE_TRIM_SAFETY_MARGIN_TOKENS
+    budget = (int(per_slot) - int(max_tokens)
+              - WIRE_TRIM_SAFETY_MARGIN_TOKENS - int(tools_tokens))
+    if tools_tokens or budget <= 0:
+        budget = max(budget, _min_message_budget(per_slot))
+    return budget
 
 
 def schema_token_room() -> int:
     """Tokens a request's tool schema may spend against the LIVE n_ctx.
 
-    ``_get_budget_per_slot()`` minus :func:`_min_message_budget`.  Public
-    because the SELECTION path (core.agent_tools) has to ask it before it
-    offers a tool set; everything about the answer — the live ``/props`` probe,
-    the ``HEVOLVE_LLAMA_CTX_SIZE`` override, the constant backstop — stays here,
-    where the wire already computes it.
+    :func:`_schema_room` of ``_get_budget_per_slot()``.  Public because the
+    SELECTION path (core.agent_tools) has to ask it before it offers a tool
+    set; everything about the answer — the live ``/props`` probe, the
+    ``HEVOLVE_LLAMA_CTX_SIZE`` override, the constant backstop, and the split
+    the trim spends the same slot by — stays here.
 
     PROMPT-SIDE ONLY, and deliberately so.  ``max_tokens`` and
     ``WIRE_TRIM_SAFETY_MARGIN_TOKENS`` are NOT subtracted: llama-server's 400
     is ``n_prompt_tokens >= n_ctx``, and reserving the 2,048-token generation
     budget as well would put the room at 4096-2048-2816-1024 = -1792 and prune
     the 23-tool set that measurably works.  Measured 2026-09-22 against both
-    populations at n_ctx 4096 (room 3072):
+    populations at n_ctx 4096 (room then 3072, now 2560):
 
         23 tools = 2489 tok -> fits    (516 such bodies returned 200)
         50 tools = 5782 tok -> prune   ( 20 such bodies returned 400)
         60 tools = 7712 tok -> prune   ( 16 such bodies returned 400)
 
-    Generation overrun is the OTHER failure and the trim still reserves for it.
+    What llama-server adds to the wire's count (_PROMPT_OVERHEAD_TOKENS) IS
+    subtracted, because it is prompt-side too.  Without it a schema at the
+    room, its messages at the floor, was n_ctx by the wire's count and over
+    it by the server's.  Measured 2026-10-20 17:07:35: a Helper body of 3,038
+    message + 11,438 schema tokens was billed 14,798 against n_ctx 12,288 and
+    refused; the room was 9,216 and is 8,704.
+
+    Generation overrun is the OTHER failure; the trim reserves for it
+    whenever the slot holds it beside the floor.
     """
-    per_slot = _get_budget_per_slot()
-    return per_slot - _min_message_budget(per_slot)
+    return _schema_room(_get_budget_per_slot())
 
 
 def _schema_tokens(body: dict, model=None) -> int:
@@ -1572,7 +1635,9 @@ def _trim_to_budget(body: dict, _reserve: int = 0) -> tuple:
     est_after, budget)``.
 
     Trim policy (best-effort, idempotent):
-      1. budget = per_slot - max_tokens - safety - the tool schema's tokens
+      1. budget = :func:`_message_budget`: per_slot - max_tokens - safety -
+         the tool schema's tokens, never below the messages' floor when a
+         schema is what takes it there (the floor the fit leaves beside it)
       2. If under budget → return unchanged.
       3. Left-drop non-system messages (preserve index 0 if role=system)
          until the remaining set fits.  Never dropped: the system message,
@@ -1600,7 +1665,7 @@ def _trim_to_budget(body: dict, _reserve: int = 0) -> tuple:
     Reuses ``core.token_utils`` for token counting (single source) and
     ``core.constants`` for the safety margin + marker (single source).
     """
-    from core.constants import WIRE_TRIM_SAFETY_MARGIN_TOKENS, WIRE_TRIM_MARKER
+    from core.constants import WIRE_TRIM_MARKER
     from core.token_utils import (
         count_tokens_for_messages, count_tokens_for_text, _content_to_text,
     )
@@ -1678,25 +1743,26 @@ def _trim_to_budget(body: dict, _reserve: int = 0) -> tuple:
 
     tools_tokens = _schema_tokens(body, model)
 
-    budget = (_get_budget_per_slot() - max_tokens
-              - WIRE_TRIM_SAFETY_MARGIN_TOKENS - tools_tokens)
-    if budget <= 0:
-        # max_tokens (and/or the tool schema) alone exceeds n_ctx — degrade
-        # gracefully so we still send SOMETHING instead of 500-failing.
-        #
-        # Say so LOUDLY when the tools block is the cause: trimming messages cannot
-        # recover a schema that does not fit, so a quiet degrade here means the
-        # request goes out over-length and llama-server rejects it anyway. The fix
-        # is to prune the tool list for the persona, and an operator can only know
-        # that if this line names the cost.
-        if tools_tokens and tools_tokens >= _get_budget_per_slot() // 2:
-            logger.error(
-                "wire-trim: the TOOL SCHEMA alone is %d tokens against an n_ctx of "
-                "%d (%d tool(s)) — no amount of message trimming can make this fit. "
-                "Prune the tool list for this agent; the request will be rejected "
-                "as over-length.",
-                tools_tokens, _get_budget_per_slot(), len(body.get('tools') or []))
-        budget = _min_message_budget(_get_budget_per_slot())
+    # The slot's ONE split, the one the selection path fits schemas by
+    # (schema_token_room -> core.agent_tools.fit_schema_to_ctx): the messages
+    # get _message_budget, and a schema past _schema_room cannot fit beside
+    # their floor.
+    per_slot = _get_budget_per_slot()
+    budget = _message_budget(per_slot, max_tokens, tools_tokens)
+    if tools_tokens > _schema_room(per_slot):
+        # Say so LOUDLY: trimming messages cannot recover a schema that does
+        # not fit, so a quiet send here goes out over-length and llama-server
+        # rejects it anyway.  The fix is to prune the tool list for the
+        # persona, and an operator can only know that if this line names the
+        # cost.  It is never a schema the fit kept.
+        logger.error(
+            "wire-trim: the TOOL SCHEMA alone is %d tokens against an n_ctx of "
+            "%d (%d tool(s)), over the %d a schema may take beside the "
+            "messages' floor and the server's own overhead. Prune the tool "
+            "list for this agent; the request will very likely be rejected as "
+            "over-length.",
+            tools_tokens, per_slot, len(body.get('tools') or []),
+            _schema_room(per_slot))
 
     est_before = count_tokens_for_messages(messages, model)
     if est_before <= budget:
