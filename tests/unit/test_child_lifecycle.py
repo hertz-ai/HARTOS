@@ -90,8 +90,8 @@ def test_bound_child_dies_when_the_parent_os_exits_governor_not_started():
 
 @windows_only
 def test_bound_child_dies_when_the_governor_job_exists_first():
-    """The governor-first order: the parent is already in the job and the
-    child inherited it."""
+    """The governor-first order: the parent is already in the job; the child
+    starts outside it (silent breakaway) and is then bound."""
     pid, bound = _run(f"""
         enforcer._ensure_job_windows()
         child = {_CHILD}

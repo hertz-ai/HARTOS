@@ -191,11 +191,21 @@ def _find_llm_pids() -> set:
 # bound children (llama-server, the one that matters) and no longer counts
 # other children.
 
+# The Job Object constants JobHandle also uses live in core.child_lifecycle
+# (one home; child_lifecycle imports this module only inside a function, so
+# there is no import cycle).  Only the governor's own flags are defined here.
+from core.child_lifecycle import (
+    JOB_OBJECT_LIMIT_BREAKAWAY_OK as _JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+)
+from core.child_lifecycle import (
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE as _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+)
+from core.child_lifecycle import (
+    JOBOBJECT_EXTENDED_LIMIT_INFO_CLS as _JOB_EXTENDED_LIMIT_INFO_CLASS,
+)
+
 _JOB_OBJECT_LIMIT_JOB_MEMORY = 0x200
-_JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x800
 _JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK = 0x1000
-_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
-_JOB_EXTENDED_LIMIT_INFO_CLASS = 9   # JobObjectExtendedLimitInformation
 
 
 class _IoCounters(ctypes.Structure):
@@ -388,8 +398,8 @@ class ResourceEnforcer:
         """Limit HARTOS's OWN orchestration to ``usable_cores`` via CPU affinity
         + BELOW_NORMAL priority — deliberately NOT a job-wide hard rate cap.
 
-        A Job Object CPU-rate cap throttles the WHOLE job, and llama-server is a
-        CHILD of this process (it inherits our Job Object), so a rate cap would
+        A Job Object CPU-rate cap throttles the WHOLE job, and llama-server is
+        bound into our Job Object (``bind_child``), so a rate cap would
         strangle the model — the foreground work the user is waiting on.
         Per-process affinity bounds only our threads; the model is then pinned
         back to EVERY core (_unrestrict_llm_affinity).  The Windows Job Object is
@@ -421,7 +431,7 @@ class ResourceEnforcer:
         """Create the process Job Object ONCE (idempotent) and assign this
         process to it.  Used for the MEMORY ceiling only — there is deliberately
         NO CPU-rate control, because the rate cap is job-wide and llama-server is
-        a child that would inherit it (see _enforce_cpu).  Reused across mode
+        bound into this job (see _enforce_cpu).  Reused across mode
         changes; _enforce_ram_windows updates the memory limit on this same
         handle.  Creating a fresh Job Object per mode flip (the old behaviour)
         accumulated nested jobs on Windows, pinning the process at the
@@ -468,8 +478,9 @@ class ResourceEnforcer:
         governor has not started yet).  Call right after Popen returns.
 
         Measured on Windows 11: a child spawned BEFORE the job existed can be
-        assigned to it afterwards, and a child that inherited the job can be
-        assigned to it again, so both start orders bind.  Returns False off
+        assigned to it afterwards, and a child spawned after it starts outside
+        the job (the job allows silent breakaway) and is assigned here, so both
+        start orders bind.  Returns False off
         Windows or when the assignment failed (logged: the child will outlive
         this process).  Never raises: a failed binding must not fail a spawn.
         """
