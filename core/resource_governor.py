@@ -179,8 +179,21 @@ def _find_llm_pids() -> set:
 # core.child_lifecycle.bind_to_parent assigns children to it; it never makes a
 # job of its own.  A second job made the outcome depend on start order (Nunba
 # starts the llama-server thread before the governor), review of HARTOS #141.
+#
+# This process joins the job itself, so with kill-on-close alone EVERY child it
+# starts would die when it quits (an editor the agent opened, the setup wizard,
+# a browser).  The job therefore allows breakaway, silently: a child is in the
+# job only when ``bind_child`` assigns it explicitly, so only bound children
+# die with this process.  Measured on Windows 11 (kill-on-close only: a
+# CREATE_BREAKAWAY_FROM_JOB spawn fails with WinError 5 and un-assigned
+# children die at quit; with SILENT_BREAKAWAY_OK un-assigned children survive
+# and the breakaway spawn works).  Consequence: the memory ceiling counts the
+# bound children (llama-server, the one that matters) and no longer counts
+# other children.
 
 _JOB_OBJECT_LIMIT_JOB_MEMORY = 0x200
+_JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x800
+_JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK = 0x1000
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
 _JOB_EXTENDED_LIMIT_INFO_CLASS = 9   # JobObjectExtendedLimitInformation
 
@@ -242,15 +255,18 @@ def _job_kernel32():
 
 
 def _set_job_limits(job, job_memory_bytes: int = 0) -> bool:
-    """Set the job's limit flags: kill-on-close ALWAYS, plus the job-wide
-    memory ceiling when ``job_memory_bytes`` is given.
+    """Set the job's limit flags: kill-on-close and breakaway ALWAYS, plus the
+    job-wide memory ceiling when ``job_memory_bytes`` is given.
 
     SetInformationJobObject replaces the flags rather than merging them, so
-    every call must restate kill-on-close: a memory-only call (what this used
-    to be) silently undoes it on the first update_caps().
+    every call must restate them: a memory-only call (what this used to be)
+    silently undoes kill-on-close on the first update_caps().  Breakaway (see
+    the note above) keeps only explicitly bound children in the job.
     """
     info = _JobExtendedLimitInformation()
-    flags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    flags = (_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+             | _JOB_OBJECT_LIMIT_BREAKAWAY_OK
+             | _JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK)
     if job_memory_bytes:
         flags |= _JOB_OBJECT_LIMIT_JOB_MEMORY
         info.JobMemoryLimit = job_memory_bytes
@@ -424,7 +440,10 @@ class ResourceEnforcer:
                 kernel32 = _job_kernel32()
                 job = kernel32.CreateJobObjectW(None, None)
                 if not job:
-                    logger.debug("ResourceEnforcer: CreateJobObject failed")
+                    logger.warning(
+                        "ResourceEnforcer: CreateJobObject failed (err=%d); "
+                        "children will NOT be killed on parent exit",
+                        ctypes.get_last_error())
                     return
                 if not _set_job_limits(job):
                     logger.warning(
@@ -441,7 +460,7 @@ class ResourceEnforcer:
                             "(kill-on-close + memory ceiling; CPU governed by "
                             "affinity, not a rate cap)")
             except Exception as e:
-                logger.debug("ResourceEnforcer: Job Object create failed: %s", e)
+                logger.warning("ResourceEnforcer: Job Object create failed: %s", e)
 
     def bind_child(self, proc) -> bool:
         """Make ``proc`` (a subprocess.Popen) die when this process exits, by

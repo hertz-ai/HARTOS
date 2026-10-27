@@ -157,7 +157,49 @@ def test_the_governors_memory_cap_keeps_kill_on_close_on_the_one_job():
     limit_flags, job_memory = int(flags[0]), int(flags[1])
     assert limit_flags & 0x2000, 'KILL_ON_JOB_CLOSE was dropped by the memory cap'
     assert limit_flags & 0x200, 'the memory limit flag is gone'
+    assert limit_flags & 0x1000, 'SILENT_BREAKAWAY_OK was dropped by the memory cap'
+    assert limit_flags & 0x0800, 'BREAKAWAY_OK was dropped by the memory cap'
     assert job_memory == 4 << 30
+
+
+@windows_only
+def test_only_the_bound_child_dies_other_children_of_the_parent_survive_quit():
+    """Review of #141: the job Nunba itself joins has kill-on-close, so with no
+    breakaway flag EVERY child (an editor the agent opened, the setup wizard, a
+    browser) was killed on quit, not only the workers.  Measured on Windows 11:
+    SILENT_BREAKAWAY_OK keeps un-assigned children out of the job, so only the
+    child bind_to_parent assigns dies."""
+    other, bound = _run(f"""
+        enforcer._ensure_job_windows()       # the parent is in the job
+        other = {_CHILD}                     # an ordinary child, never bound
+        child = {_CHILD}
+        assert bind_to_parent(child)
+        print(other.pid, child.pid, flush=True)
+    """)
+    try:
+        assert _gone_within(int(bound), 10), 'the bound child outlived its parent'
+        assert not _gone_within(int(other), 2), \
+            'an ordinary child was killed with the parent (no breakaway on the job)'
+    finally:
+        _kill(int(other))
+
+
+@windows_only
+def test_a_child_can_ask_to_break_away_from_the_job():
+    """hevolveai_supervisor spawns with CREATE_BREAKAWAY_FROM_JOB.  In a job
+    without BREAKAWAY_OK that CreateProcess fails with WinError 5 (measured),
+    and the supervisor retries forever."""
+    out = _run("""
+        enforcer._ensure_job_windows()
+        try:
+            c = subprocess.Popen([sys.executable, '-c', 'pass'],
+                                 creationflags=0x01000000)   # CREATE_BREAKAWAY_FROM_JOB
+            c.wait()
+            print('ok', flush=True)
+        except OSError as exc:
+            print('failed', exc.winerror, flush=True)
+    """)
+    assert out == ['ok'], out
 
 
 @windows_only
@@ -197,7 +239,7 @@ def test_there_is_one_job_bind_to_parent_does_not_create_its_own():
 
 @pytest.mark.parametrize('relpath, enclosing', [
     ('integrations/service_tools/gpu_worker.py', '_spawn'),
-    ('integrations/service_tools/model_lifecycle.py', None),
+    ('integrations/service_tools/model_lifecycle.py', '_launch_llama_server_direct'),
 ])
 def test_every_spawn_site_still_binds_its_child(relpath, enclosing):
     """Deleting the bind_to_parent call leaves the spawn working and the child
