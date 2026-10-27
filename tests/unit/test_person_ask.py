@@ -223,6 +223,19 @@ def test_the_ask_rings_the_phone_once_however_often_it_is_fanned(legs):
     assert len(legs['pushes']) == 1
 
 
+def test_the_push_carries_no_secret_from_the_asks_words(legs):
+    """The push leaves for Google or central's relay: its words pass the one
+    egress scrub (secrets, then PII), not DLP alone, which lets a structured
+    key through."""
+    key = 'sk-ant-' + 'A1b2C3d4E5' * 5
+    _ask(component=dict(POST), title=f'Use {key} to post?', body=f'key {key}')
+    _settle()
+    assert len(legs['pushes']) == 1
+    _uid, title, body, data = legs['pushes'][0]
+    assert key not in title and key not in body
+    assert key not in json.dumps(data)
+
+
 def test_the_bell_names_an_ask_in_words():
     from integrations.social.models import Notification
     assert Notification(type='agent_ask').title_for_humans() == \

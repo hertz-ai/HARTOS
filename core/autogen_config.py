@@ -135,13 +135,16 @@ def resolve_llm_backend():
         # spawn); LLM_THINKING_OFF_KWARGS travels with the request, and autogen
         # hands extra_body to the openai client's create().  OpenAI and Azure
         # OpenAI reject an unknown request field, so they are left alone.
-        # OpenRouter takes the switch in its own `reasoning` field.
+        # OpenRouter takes its own `reasoning` field, where thinking cannot
+        # always be turned off: a model that must reason answers 400 to
+        # effort 'none', so it gets the shortest effort every routed model
+        # accepted (core.constants.LLM_SHORT_REASONING, #115).
         from urllib.parse import urlparse
         host = (urlparse(endpoint).hostname or '').lower()
         if host == 'openrouter.ai':
-            from core.constants import LLM_THINKING_OFF_REASONING
+            from core.constants import LLM_SHORT_REASONING
             entry["extra_body"] = {
-                "reasoning": dict(LLM_THINKING_OFF_REASONING)}
+                "reasoning": dict(LLM_SHORT_REASONING)}
         elif host != 'api.openai.com' and not host.endswith('.openai.azure.com'):
             from core.constants import LLM_THINKING_OFF_KWARGS
             entry["extra_body"] = {

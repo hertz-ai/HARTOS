@@ -814,12 +814,16 @@ HELD_FOR_ANOTHER_TURN_REPLY_PREFIX: str = "Held for another turn:"
 # or cloud endpoint.
 LLM_THINKING_OFF_KWARGS: dict = {'enable_thinking': False}
 
-# The same switch in OpenRouter's own request field.  OpenRouter normalises
-# requests across providers and documents `reasoning.effort: "none"` as
-# "disables reasoning entirely"; a llama.cpp/vLLM chat_template_kwargs is not
-# one of its parameters, so sent there it would not reach the model and every
-# agent turn would think at length.
-LLM_THINKING_OFF_REASONING: dict = {'effort': 'none'}
+# The same intent in OpenRouter's own request field: think as little as the
+# model allows.  A llama.cpp/vLLM chat_template_kwargs is not one of its
+# parameters (sent there it would not reach the model and every agent turn
+# would think at length), and its `reasoning.effort: "none"` cannot be the
+# value: a reasoning-mandatory model answers 400 "Reasoning is mandatory for
+# this endpoint and cannot be disabled.".  Measured on central's
+# openrouter/free, which routes each call to a model of its choosing:
+# 'none' failed 4 of 7 calls (2026-10-26/27), 'low' was answered 3 of 3 with
+# 41-65 reasoning tokens.
+LLM_SHORT_REASONING: dict = {'effort': 'low'}
 
 
 # The two LangChain tools that turn a conversation into agent WORK:
