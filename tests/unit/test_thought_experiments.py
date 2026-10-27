@@ -37,6 +37,16 @@ from integrations.social.thought_experiment_service import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _no_live_world_model(monkeypatch):
+    """decide() feeds the world model once its commit lands, and the bridge
+    defaults to http://localhost:8000, which on the owner's desktop is the
+    production world model.  No test here may reach it."""
+    from integrations.agent_engine import world_model_bridge
+    monkeypatch.setattr(world_model_bridge, 'get_world_model_bridge',
+                        lambda: None)
+
+
 @pytest.fixture(scope='session')
 def engine():
     eng = create_engine('sqlite:///:memory:')

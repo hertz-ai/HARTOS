@@ -525,7 +525,11 @@ class TestAgentDaemon:
         mock_idle.return_value = [
             {'user_id': test_user.id, 'username': 'test', 'user_type': 'agent'}]
         agent_daemon._dispatch_backoff.pop(str(goal.id), None)
-        with patch('integrations.social.models.get_db', return_value=db), \
+        # The plain dispatch_goal path.  The flag is otherwise whatever the
+        # process's first system check wrote: 'true' when the code root's disk
+        # has 10 GB free, and the tick then takes the speculative branch.
+        with patch.dict(os.environ, {'HEVOLVE_SPECULATIVE_ENABLED': 'false'}), \
+             patch('integrations.social.models.get_db', return_value=db), \
              patch('integrations.agent_engine.dispatch.local_chat_dispatch',
                    return_value=('ok', user_pause_reply(2))) as dispatched, \
              patch('integrations.agent_engine.dispatch._get_distributed_coordinator',

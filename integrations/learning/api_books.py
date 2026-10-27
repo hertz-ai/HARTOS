@@ -95,7 +95,31 @@ def parse_pdf():
 
     try:
         started = bp.start_parse(path, user_id, request_id)
+    except bp.BookParseError as e:
+        # The same answer the multipart branch above already gives for this
+        # error: the request is wrong, not the node, and the PDF itself may be
+        # perfectly fine -- so it must not come back as 500 "could not start
+        # parsing this PDF". Telling a person to fix a file that was never
+        # broken is the mistake this lane already fixed once for a held lock.
+        logger.warning(f"book parse refused for {path}: {e}")
+        return jsonify({'error': str(e)}), 400
     except Exception as e:
+        if bp.is_lock_error(e):
+            # Another writer holds the one write lock; _retry_on_lock already
+            # waited out its ladder. Measured live 2026-10-18 on this desktop:
+            # the write lock was busy on 20 of 20 samples at 200 ms patience
+            # and still refused 4 of 5 at 3 s, free two minutes later, while 3
+            # of 4 uploads died in _register -- so a holder outlasts the whole
+            # ladder, in bursts. (An earlier version of this comment said
+            # "bursts reach 33 s". That figure was never measured: 36.3 s was a
+            # lock I held myself during a probe and ~33 s was the parse
+            # duration of the lock-free control. Corrected 2026-10-25; the
+            # holder's identity is still unmeasured.) Answering "could not
+            # start parsing this PDF" sent the person to fix a file that was
+            # never broken, so the transient case says it is transient.
+            logger.warning(f"book parse deferred, the library is busy: {path}: {e}")
+            return jsonify({'error': 'the book library is busy right now; '
+                                     'please try again in a moment'}), 503
         logger.error(f"could not start a book parse for {path}: {e}")
         return jsonify({'error': 'could not start parsing this PDF'}), 500
     return jsonify({

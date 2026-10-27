@@ -69,6 +69,8 @@ def answer_commerce_approval(action: str, approved: bool,
     prefix = prefix.lower()
     ref = ref.strip()
     if not approver_id:
+        from integrations.social.auth import log_refused_credential
+        log_refused_credential()
         return {'status': 'error', 'action': action,
                 'reason': 'sign in to answer this request'}, 401
     if not ref:

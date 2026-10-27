@@ -7,6 +7,7 @@ the rate limiter's backend.
     python -m pytest tests/unit/test_api_books.py -q --noconftest
 """
 import io
+import sqlite3
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -129,6 +130,20 @@ class TestBadInput:
         r = _upload(client, pdf_bytes, name='book.png')
         assert r.status_code == 400 and 'Only PDF' in r.get_json()['error']
 
+    def test_a_reader_id_the_column_cannot_hold_is_refused_not_a_broken_pdf(
+            self, client, pdf_bytes):
+        """The request is wrong; the PDF is fine. So not a 500.
+
+        _register refuses an id longer than its column rather than truncating
+        it (the leak reworked out of 74b39d1a4). With no branch for it the
+        refusal fell through to 500 "could not start parsing this PDF", which
+        sends a person to fix a file that was never broken -- the same mistake
+        this lane had already fixed once for a held lock.
+        """
+        r = _upload(client, pdf_bytes, user_id='u' * 70)
+        assert r.status_code == 400
+        assert 'cannot file a book for that account' in r.get_json()['error']
+
     def test_not_a_pdf_by_content(self, client):
         r = _upload(client, b'<html>not a pdf</html>')
         assert r.status_code == 400 and 'not a PDF' in r.get_json()['error']
@@ -199,3 +214,76 @@ class TestOverTheNetwork:
         assert layouts == []
         assert image.status_code == 404
         assert status.status_code == 404
+
+
+class TestABusyLibrary:
+    """Another writer holding the one SQLite write lock is not a bad book."""
+
+    def test_a_busy_library_asks_for_a_retry_instead_of_blaming_the_pdf(
+            self, client, book_db, pdf_bytes, monkeypatch):
+        """Measured live 2026-10-18 on this desktop: three uploads in a row met
+        a 33 s write-lock burst -- longer than _retry_on_lock's whole ladder --
+        and each answered "could not start parsing this PDF" with a 500.  The
+        same bytes parsed in 23 s minutes later, so the file was never the
+        problem; the person was told to fix something that was not broken.
+        A held lock is transient, so it is reported as transient.
+        """
+        from integrations.learning import book_pipeline as bp
+        # One attempt: the ladder's timing is not what this pins, and waiting
+        # out the real one would cost the suite 21 s.
+        monkeypatch.setattr(bp, '_LOCK_RETRY_DELAYS', ())
+        holder = sqlite3.connect(book_db.url.database, timeout=0)
+        holder.execute('BEGIN IMMEDIATE')   # exactly what a slow writer holds
+        try:
+            r = _upload(client, pdf_bytes)
+        finally:
+            holder.rollback()
+            holder.close()
+
+        assert r.status_code == 503, r.get_json()
+        said = r.get_json()['error'].lower()
+        assert 'busy' in said and 'try again' in said, said
+        # The old answer blamed the file; nothing may say that for a lock.
+        assert 'could not start parsing' not in said
+
+    def test_a_permanent_failure_is_not_read_as_busy_because_of_a_filename(
+            self, client, book_db, pdf_bytes):
+        """The classifier reads the driver's error, never the rendered SQL.
+
+        SQLAlchemy appends [SQL: ...] and [parameters: ...] to str(exc), and
+        for this insert those carry the filename, the uploads directory and
+        the caller's request_id.  Matching that whole string answered "the
+        library is busy, try again" to a book called deadlock.pdf on a node
+        whose tables were gone -- a permanent failure dressed as transient,
+        the very mistake the busy branch exists to stop.
+        """
+        from integrations.social import models
+        models.BookPageLayout.__table__.drop(book_db)
+        models.BookFile.__table__.drop(book_db)       # nothing to retry into
+
+        r = _upload(client, pdf_bytes, name='deadlock.pdf')
+
+        assert r.status_code == 500, r.get_json()
+        assert r.get_json()['error'] == 'could not start parsing this PDF'
+
+    def test_a_permanent_failure_is_not_read_as_busy_because_of_a_request_id(
+            self, client, book_db, pdf_bytes):
+        """The other caller-supplied vector: request_id, bound by _register.
+
+        Dropping the tables fails at _existing's SELECT, whose parameters are
+        the user and the filename.  request_id reaches the database only
+        through _register's INSERT, so it needs a failure there: a book named
+        physics.pdf whose request_id says deadlock-9 must still answer 500.
+        """
+        with book_db.begin() as con:
+            con.exec_driver_sql(
+                "CREATE TRIGGER no_inserts BEFORE INSERT ON pdf_files "
+                "BEGIN SELECT RAISE(ABORT, 'the library refuses this row'); END")
+
+        form = {'file': (io.BytesIO(pdf_bytes), 'physics.pdf'),
+                'user_id': '42', 'request_id': 'deadlock-9'}
+        r = client.post('/upload/parse_pdf', data=form,
+                        content_type='multipart/form-data', environ_base=LOCAL)
+
+        assert r.status_code == 500, r.get_json()
+        assert r.get_json()['error'] == 'could not start parsing this PDF'

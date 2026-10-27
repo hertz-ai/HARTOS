@@ -21,6 +21,7 @@ with the JWT HTTP surface so the audit trail of grant events is
 immutable regardless of which entry point a caller chose.
 """
 import logging
+import os
 import re
 import uuid
 from datetime import datetime
@@ -71,7 +72,8 @@ CONSENT_TYPES = frozenset({
                          # for the visual agent (VisionService screen channel,
                          # #701).  The capture loop's first denied tick files
                          # the pending ask; granting in the UserConsent UI
-                         # starts capture on the next tick.
+                         # starts capture on the next tick.  Never asked on
+                         # central when it has no screen (central_lacks).
     'computer_control',  # An agent acts on this computer: shell commands,
                          # file writes, mouse and keyboard, opening apps
                          # (integrations.vlm.safety.computer_control_block).
@@ -176,6 +178,43 @@ def consent_type_for_action(action) -> str:
     if not isinstance(action, str):
         return None
     return CAPABILITY_CONSENT_TYPES.get(action.strip().lower())
+
+
+#: The part of the computer a consent type uses, as a person would name it,
+#: and the boot hardware check's reader for it (security.system_requirements).
+#: Central has no screen and asked its owner for screen capture every 10
+#: seconds from 2026-10-19 to 10-21.  camera_capture is not here: its frames
+#: also arrive over the vision socket from a client's browser, and the camera
+#: probe sees only Linux devices.
+_OWN_HARDWARE = {'screen_capture': ('screen', 'has_display')}
+_said_missing = set()
+
+
+def central_lacks(consent_type) -> str:
+    """The part ``consent_type`` uses ('screen') when this node is central
+    and its boot hardware check found that part missing; '' otherwise.
+
+    Central only (owner, 2026-10-21): central is in no one's local hive.  Any
+    other node asks as it always did, with or without the part: in a
+    person's hive a node without a screen or a GPU still reaches what the
+    other nodes have.  On central only a definite no counts; before the
+    check has run, or when it could not tell, the ask goes out."""
+    entry = _OWN_HARDWARE.get(consent_type)
+    if entry is None:
+        return ''
+    # The topology env var, not key_delegation.get_node_tier: that one
+    # loads the master key, and on central it has already set this var.
+    if os.environ.get('HEVOLVE_NODE_TIER', 'flat').strip().lower() != 'central':
+        return ''
+    part, reader = entry
+    try:
+        from security import system_requirements
+        found = getattr(system_requirements, reader)()
+    except Exception:
+        _logger.debug("hardware check for %s unavailable", consent_type,
+                      exc_info=True)
+        return ''
+    return part if found is False else ''
 
 #: A device is identified by its Ed25519 public key (the PeerLink identity
 #: every phone already has); the consent scope carries the whole key so no
@@ -505,8 +544,18 @@ class ConsentService:
         phone signed into its first ask stands, a later ask cannot rename
         the row (the label is a hint beside the fingerprint, never
         identity).
+
+        An ask central cannot use (central_lacks: central with no screen)
+        is not filed: nothing is written or sent, and None is returned.
         """
         _validate_consent_type(consent_type)
+        part = central_lacks(consent_type)
+        if part:
+            if consent_type not in _said_missing:
+                _said_missing.add(consent_type)
+                _logger.info("consent %s not asked: central has no %s",
+                             consent_type, part)
+            return None
 
         ask = {
             'user_id': user_id,

@@ -98,8 +98,10 @@ def _desktop(monkeypatch):
     mgr._links = {}
     mgr._max_links = 10
     link_mod.set_device_verifier(None)
+    link_mod.device_services_ready()
     yield
     link_mod.set_device_verifier(None)
+    link_mod.device_services_ready()
     reset_link_manager()
     Base.metadata.drop_all(engine)
 
@@ -186,6 +188,34 @@ def test_no_verifier_installed_refuses_every_device_hello(phone):
     ws = FakeWs()
     assert _accept(_hello(phone, phone.token()), ws=ws) is None
     assert _refusal(ws)['reason'] == 'unavailable'
+
+
+def test_a_device_hello_while_the_device_services_install_is_refused_not_ready(phone):
+    """The window hartos_bootstrap opens around its device steps: an
+    allowed phone dialling into it is refused with a signed 'not_ready'
+    (it re-dials), and the same phone's next dial, after the window
+    closes, opens its link.  Measured 2026-10-19: a link acked inside the
+    window carried no mobile_paths for its whole session."""
+    _allow(phone)
+    _install_real_verifier()
+    link_mod.device_services_pending()
+    ws = FakeWs()
+    assert _accept(_hello(phone, phone.token()), ws=ws) is None
+    assert _refusal(ws)['reason'] == 'not_ready'
+    assert get_link_manager().get_device_link(phone.public_hex[:16]) is None
+    link_mod.device_services_ready()
+    link = _accept(_hello(phone, phone.token()))
+    assert link is not None and link.kind == 'device'
+    assert link.trust == TrustLevel.SAME_USER and link.user_id == '40021'
+
+
+def test_a_node_hello_is_not_held_by_the_device_services_window(phone):
+    """No device_token: the peer path does not wait for a phone's services."""
+    _install_real_verifier()
+    link_mod.device_services_pending()
+    link = _accept(_hello(phone, trust='peer'))
+    assert link is not None and link.kind == 'node'
+    assert link.trust == TrustLevel.PEER
 
 
 def test_a_token_for_another_key_than_the_sockets_is_closed(phone):

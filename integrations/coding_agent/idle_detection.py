@@ -95,6 +95,10 @@ class IdleDetectionService:
         user_settings = user.settings or {}
         if user_settings.get('paused') is True:
             return False
+        # An agent account that exists to do something else (the world
+        # model's voter) is never handed goals as a persona.
+        if user_settings.get('dispatchable') is False:
+            return False
         # Worker-thread guard (same rationale as ``is_agent_idle``):
         # consult sys.modules instead of ``from create_recipe import …``.
         # If create_recipe isn't loaded yet, treat sessions as idle —

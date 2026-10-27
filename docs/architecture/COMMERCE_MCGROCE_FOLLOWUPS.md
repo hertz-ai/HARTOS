@@ -48,11 +48,12 @@ Delete an entry when the change that closes it lands.
 4. **`/api/commerce/session` from another machine on a bundled node.**  With
    `NUNBA_BUNDLED` set, `security/middleware.check_api_auth` admits only local
    callers and exempt prefixes without a credential, and `/api/commerce/` is
-   not exempt.  The McGroce site's server-to-server call carries
-   `X-Commerce-Secret`, not a Bearer, so it gets 401 on a bundled desktop.
-   The cloud gateway (not bundled) is unaffected.  Decide: exempt
-   `/api/commerce/session` (it authenticates itself with the shared secret)
-   or document that McGroce only ever talks to a gateway node.
+   not exempt.  The McGroce site's server-to-server call carries a commerce
+   signature (`X-Commerce-Signature`), not a Bearer, so it gets 401 on a
+   bundled desktop.  The cloud gateway (not bundled) is unaffected.  Decide:
+   exempt `/api/commerce/session` (it authenticates itself with the signed,
+   single-use request) or document that McGroce only ever talks to a gateway
+   node.
 5. **Tier-2 registration not driven end to end.**  `register_commerce_tools`
    is tested directly and `detect_goal_tags` is tested for the `commerce`
    tag, but no test runs `create_agents` / `create_agents_for_user` and asserts
@@ -82,13 +83,18 @@ Delete an entry when the change that closes it lands.
 
 ### Planned but not implemented
 
-13. **McGroce `POST /api/v1/spa/checkout/ap2` is not used.**  HARTOS records
-    the payment server-to-server on the Basic API (`POST
-    /cart/checkout/payment`, `referenceNumber` = mandate id, then `POST
-    /cart/checkout`), because the `/spa/**` chain is session-authenticated
-    only.  The spa endpoint's `amount == cart.total` 409 guard therefore does
-    not protect this path, and McGroce must accept a `THIRD_PARTY_ACCOUNT` /
-    `Passthrough` payment there.  Unverified.
+13. **HARTOS half done (2026-10-21); McGroce half pending in PR #1.**  HARTOS
+    no longer records a payment through the raw `POST /cart/checkout/payment`
+    + `POST /cart/checkout` pair, which McGroce could not verify (and which,
+    read in McGroce's code, lets any signed-in customer attach a "captured"
+    transaction to their own cart and check out without paying; hosted
+    today, not tried live).  It calls one `POST /cart/checkout/ap2` with a
+    signed attestation of the consumed mandate (COMMERCE_MCGROCE.md, order
+    contract).  McGroce must still: add that endpoint in its own controller,
+    verify the attestation and single use there, disable the raw classic
+    payment writes, and drop the browser `POST /api/v1/spa/checkout/ap2`.
+    Until it does, a HARTOS order call answers 404 and is flagged
+    `needs_attention`; no McGroce is configured on central today.
 14. **`commerce_voice_order`** (audio to `/audioorder/upload`,
     hartos_commerce.md §7.2) was not built.  It is not in PLAN §5.2's tool
     list; voice uses the existing whisper path.

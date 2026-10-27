@@ -304,6 +304,18 @@ class ReuseMainCoreFactory(unittest.TestCase):
         self.assertIn('scheduler.add_job', body)
         self.assertIn('CronTrigger.from_crontab', body)
 
+    def test_factory_scheduler_twin_schedules_nothing(self):
+        """The factory's create_scheduled_jobs, registered on the time and
+        visual legs, returns its deferral and adds no job for any turn, so a
+        daemon turn cannot start a recurring job through it either (see
+        DaemonTurnStartsNoRecurringJob below for the inline one)."""
+        from unittest import mock
+        tools = self._factory_tools()
+        with mock.patch('apscheduler.schedulers.base.BaseScheduler.add_job') as add_job:
+            out = tools['create_scheduled_jobs'](60, 'collect logs', '* * * * *')
+        add_job.assert_not_called()
+        self.assertIn('creation process will do it at the end', out)
+
 
 if __name__ == '__main__':
     unittest.main()
@@ -336,3 +348,89 @@ class InstructionCoercion(unittest.TestCase):
         for v in ({'foo': 1}, 42, None, {'instructions': 'x'}):
             coerced = _coerce_instruction_text(v)
             ' '.join(coerced.lower().strip().split())
+
+
+class DaemonTurnStartsNoRecurringJob(unittest.TestCase):
+    """A background turn cannot start a recurring job.
+
+    Measured in Nunba's gui_app.log on 2026-10-20: a daemon turn of agent
+    65708210992 (request id daemon_85d091d3-dc4e-4a08-b0ca-403c487bf53f) had
+    its action tool fail, and the Helper then called this tool with
+    '* * * * *':
+
+        21:45:39,599 hart_intelligence_entry INFO INSIDE create_scheduled_jobs
+        21:45:39,600 apscheduler.scheduler INFO Added job "execute_python_file"
+        21:45:42,844 _chat_reply: TTS suppressed (background turn) for
+                     request_id=daemon_85d091d3-dc4e-4a08-b0ca-403c487bf53f
+
+    The job ran a time-agent group chat on the local model every minute from
+    21:46 until the log ended at 01:49 (240 runs); no code removes it, only
+    a restart does.  The same goal did it once before, at 18:26:03; that job
+    ran every minute until the 20:39 restart.
+
+    The closure is lifted out of create_agents_for_user the way
+    test_reuse_inline_scheduler_is_real_not_stub finds it (building the
+    agents needs live autogen agents), its decorators dropped, and run on a
+    mock scheduler.  The turn's id sits where chat_agent writes it,
+    request_id_list.
+    """
+
+    USER_ID = 'cf125371-5b6a-4e00-beae-f42513cf47ab'
+    PROMPT_ID = 65708210992
+    TASK = 'Collect inference feedback logs from all distributed training nodes'
+
+    def _call(self, request_id):
+        """Run the inline create_scheduled_jobs for a turn whose id is
+        ``request_id``; return (its reply, the mock scheduler)."""
+        from unittest import mock
+        import flask
+        from apscheduler.schedulers.background import BackgroundScheduler
+        import hartos.reuse_recipe as rr
+        tree = ast.parse(_REUSE.read_text(encoding='utf-8'))
+        outer = next(n for n in ast.walk(tree)
+                     if isinstance(n, ast.FunctionDef)
+                     and n.name == 'create_agents_for_user')
+        fn = next(n for n in ast.walk(outer)
+                  if isinstance(n, ast.FunctionDef)
+                  and n.name == 'create_scheduled_jobs')
+        fn.decorator_list = []
+        scheduler = mock.Mock(spec=BackgroundScheduler)
+        scheduler.running = True
+        user_prompt = f'{self.USER_ID}_{self.PROMPT_ID}'
+        ns = dict(vars(rr))
+        ns.update(scheduler=scheduler, user_id=self.USER_ID,
+                  prompt_id=self.PROMPT_ID, user_prompt=user_prompt,
+                  request_id_list={user_prompt: request_id})
+        exec(compile(ast.Module(body=[fn], type_ignores=[]), str(_REUSE),
+                     'exec'), ns)
+        with flask.Flask(__name__).app_context():
+            out = ns['create_scheduled_jobs'](cron_expression='* * * * *',
+                                              job_description=self.TASK)
+        return out, scheduler
+
+    def test_a_daemon_turn_adds_no_job(self):
+        from core.constants import tool_reply_failed
+        out, scheduler = self._call(
+            'daemon_85d091d3-dc4e-4a08-b0ca-403c487bf53f')
+        scheduler.add_job.assert_not_called()
+        # Read as a refusal, never as the work done (the fabrication gate).
+        self.assertTrue(tool_reply_failed(out), out)
+
+    def test_a_persons_turn_still_adds_its_job(self):
+        import hartos.reuse_recipe as rr
+        out, scheduler = self._call('msg_1792513278')
+        self.assertEqual(out, 'Successfully created scheduler job')
+        scheduler.add_job.assert_called_once()
+        args, kwargs = scheduler.add_job.call_args
+        self.assertIs(args[0], rr.execute_python_file)
+        self.assertEqual(kwargs['args'],
+                         [self.TASK, self.USER_ID, self.PROMPT_ID, 0])
+
+    def test_a_turn_with_no_id_is_not_refused(self):
+        """A person's turn can arrive with no id: standalone HARTOS /chat
+        mints none, and the WhatsApp self-chat path
+        (integrations/channels/self_chat.py) sends none.  Only a declared
+        background id is refused."""
+        out, scheduler = self._call(None)
+        self.assertEqual(out, 'Successfully created scheduler job')
+        scheduler.add_job.assert_called_once()

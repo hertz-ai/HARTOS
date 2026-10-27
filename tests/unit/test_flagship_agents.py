@@ -225,7 +225,8 @@ class TestTutorEndToEnd:
         # Boundary mock: budget gate (stateful platform affordability) -> allow.
         monkeypatch.setattr(
             budget_mod, 'pre_dispatch_budget_gate',
-            lambda gid, p, model_name='gpt-4o': (True, 'test-allow'))
+            lambda gid, p, model_name='gpt-4o', holder=None:
+            (True, 'test-allow'))
 
         # Boundary mock: no distributed coordinator -> force LOCAL dispatch.
         monkeypatch.setattr(dispatch_mod, '_get_distributed_coordinator',

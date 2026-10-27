@@ -93,24 +93,12 @@ def test_refresh_failure_still_settles_from_attributes():
         'a refresh failure must degrade to the attribute read, not skip the gate'
 
 
-def test_the_speculative_branch_reaches_the_gate():
-    """The defect itself, pinned structurally: the dispatch loop must contain
-    NO `continue` between a speculative handoff and the settlement call. We
-    assert on the compiled control flow: within _tick's source, the
-    speculative-handoff sentinel exists and the old bare `continue` after
-    dispatch_speculative is gone."""
-    import inspect
-    import integrations.agent_engine.agent_daemon as ad
-    src = inspect.getsource(ad.AgentDaemon._tick) if hasattr(ad, 'AgentDaemon') \
-        else open(ad.__file__, encoding='utf-8').read()
-    i = src.index('dispatch_speculative(')
-    window = src[i:i + 1200]
-    assert 'speculative-handoff' in window, \
-        'the handoff sentinel is gone — the fall-through fix was reverted'
-    before_settle = window.split('_settle_dispatched_goal')[0] \
-        if '_settle_dispatched_goal' in window else window
-    assert '\n                            continue' not in before_settle, \
-        'a continue crept back between speculation and settlement (defect (b))'
+# The speculative branch reaching this gate (defect (b)) is pinned by
+# behaviour in tests/unit/test_speculative_turn_is_judged_by_its_reply.py:
+# the real _tick settles a speculative turn whose reply is real, and takes
+# the failure arm for one whose reply is a failure.  The structural check that
+# stood here read a 'speculative-handoff' sentinel, the very value that let a
+# failed fast turn complete its goal on central 2026-10-17.
 
 
 def test_the_parallel_branch_reaches_the_gate():

@@ -204,8 +204,10 @@ def publish_agent_message(
 
     ``media``: reply media items (Reel Studio's reel, plan 4.2(f)) the
     message carries under ``media``; non-object entries are dropped.  A
-    message still needs text: media alone is not sent.  Without media the
-    envelope is exactly the one above.
+    message still needs text: media alone is not sent.  The envelope is
+    exactly the one above either way: ``page_image_url`` stays empty, since
+    that slot drives the desktop's book-page panel and the phone's Glide
+    card, neither of which is where a reply's media belongs.
 
     ``skip_crossbar``: keep the message on this node's own legs -- LOCAL,
     SSE and the user's own devices over PeerLink, which is how the phone
@@ -245,6 +247,19 @@ def publish_agent_message(
         if isinstance(media, (list, tuple)) else []
     if items:
         payload['media'] = items
+        # page_image_url is deliberately NOT derived from these items, and
+        # ad729fcc9 was wrong to derive it.  That slot is not a spare image
+        # field: on the desktop `setUploadedImage(parsed.page_image_url)`
+        # (Demopage.js:2477, :2558) flips the left panel to the PdfViewer
+        # book-page view, and the gate at :5179 forces it w-full whenever
+        # uploadedImage is set -- in text mode too.  So beside a client that
+        # renders `media`, filling it draws the same picture twice AND
+        # rearranges the screen.  On the phone it is worse: the slot is
+        # loaded by Glide with no base URL, so a desktop-relative
+        # '/uploads/...' cannot resolve and the card comes up empty
+        # (fix-all-log-observed-issues, from the Android source; not
+        # verified here).  `media` carries both a url and an xid precisely
+        # so each client fetches the way it can -- one path, not two.
     try:
         from core.peer_link.message_bus import chat_topic_for
         from core.safe_hartos_attr import safe_hartos_attr

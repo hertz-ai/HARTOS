@@ -131,7 +131,9 @@ def _dispatch(model_config=None, goal_id='g-refused'):
                          return_value=None), \
             patch.dict('sys.modules', {
                 'integrations.agent_engine.budget_gate': SimpleNamespace(
-                    pre_dispatch_budget_gate=lambda *a: (True, 'ok')),
+                    pre_dispatch_budget_gate=lambda *a, **k: (True, 'ok'),
+                    release_goal_reservations=lambda *a, **k: 0,
+                    reservation_holder=lambda kind, ident: f'{kind}:{ident}'),
                 'security.hive_guardrails': SimpleNamespace(
                     GuardrailEnforcer=SimpleNamespace(
                         before_dispatch=lambda p, **k: (True, 'ok', p),
