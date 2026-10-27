@@ -21,9 +21,9 @@ Fix: extract the guard to a tiny standalone module imported by both
 entry path now triggers the guard before any transformers attribute
 access.  Patch is idempotent (``_hartos_reentry_guarded`` sentinel) so
 re-import during a single interpreter session is a no-op.  HIE calls this
-module's ``bind_gpt2_tokenizer_fast`` rather than carrying its own copy of the
-GPT2 pre-bind (three copies of one workaround drifted: the one that ran first
-had no transformers-5 branch).
+module's ``bind_gpt2_tokenizer_fast`` and ``install_lazy_module_reentry_guard``
+rather than carrying its own copies (three copies of the GPT2 pre-bind drifted:
+the one that ran first had no transformers-5 branch).
 
 Two patches:
 
@@ -115,11 +115,17 @@ def bind_gpt2_tokenizer_fast() -> None:
             exc_info=True)
 
 
-def _install_lazy_module_reentry_guard() -> None:
+def install_lazy_module_reentry_guard() -> None:
     """Wrap `_LazyModule.__getattr__` with a threading.local re-entry guard.
 
+    THE one implementation: this module runs it on import, and
+    ``hart_intelligence_entry`` calls it again after its
+    packages_distributions workaround (a first attempt that a corrupt
+    dist-info stopped is retried there).  It used to carry its own copy.
+
     Idempotent — the sentinel `_hartos_reentry_guarded` ensures repeated
-    calls in the same interpreter are no-ops.
+    calls in the same interpreter are no-ops.  transformers not being
+    installed is not a fault; any other failure is logged and never raised.
     """
     try:
         import threading
@@ -161,16 +167,17 @@ def _install_lazy_module_reentry_guard() -> None:
 
         _LazyModule.__getattr__ = _hartos_guarded_getattr
         _LazyModule._hartos_reentry_guarded = True
-    except Exception:
-        # transformers absent, version moved _LazyModule, or guard
-        # already-installed elsewhere — fall through.  Worker threads
-        # will hit the lazy path and may pay the recursion once, but the
-        # GPT2TokenizerFast direct-bind above still covers the common
-        # entry symbol.
-        pass
+    except Exception as exc:
+        if isinstance(exc, ImportError) and (exc.name or '').startswith('transformers'):
+            return  # transformers not installed: nothing to guard
+        # Worker threads will hit the lazy path and may pay the recursion
+        # once, but the GPT2TokenizerFast direct-bind above still covers the
+        # common entry symbol.  Say so, with the cause.
+        logging.getLogger(__name__).warning(
+            "transformers _LazyModule re-entry defang skipped", exc_info=True)
 
 
 # Run on import — every entry path that triggers this module gets both
 # guards before any transformers attribute access can fire.
 bind_gpt2_tokenizer_fast()
-_install_lazy_module_reentry_guard()
+install_lazy_module_reentry_guard()

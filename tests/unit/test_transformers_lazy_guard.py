@@ -69,7 +69,7 @@ class TestReentryGuard:
         Lazy = _make_fake_lazy_module_class()
         _inject_fake_transformers(monkeypatch, lazy_cls=Lazy)
 
-        guard._install_lazy_module_reentry_guard()
+        guard.install_lazy_module_reentry_guard()
         inst = Lazy()
         # Without the guard this is infinite recursion (RecursionError). With it,
         # the inner hasattr re-entry raises AttributeError -> hasattr False ->
@@ -80,21 +80,21 @@ class TestReentryGuard:
     def test_patch_marks_the_class_guarded(self, monkeypatch):
         Lazy = _make_fake_lazy_module_class()
         _inject_fake_transformers(monkeypatch, lazy_cls=Lazy)
-        guard._install_lazy_module_reentry_guard()
+        guard.install_lazy_module_reentry_guard()
         assert getattr(Lazy, "_hartos_reentry_guarded", False) is True
 
     def test_install_is_idempotent(self, monkeypatch):
         Lazy = _make_fake_lazy_module_class()
         _inject_fake_transformers(monkeypatch, lazy_cls=Lazy)
-        guard._install_lazy_module_reentry_guard()
+        guard.install_lazy_module_reentry_guard()
         wrapped_once = Lazy.__getattr__
-        guard._install_lazy_module_reentry_guard()  # second call must no-op
+        guard.install_lazy_module_reentry_guard()  # second call must no-op
         assert Lazy.__getattr__ is wrapped_once, "guard double-wrapped the method"
 
     def test_distinct_names_are_independent(self, monkeypatch):
         Lazy = _make_fake_lazy_module_class()
         _inject_fake_transformers(monkeypatch, lazy_cls=Lazy)
-        guard._install_lazy_module_reentry_guard()
+        guard.install_lazy_module_reentry_guard()
         inst = Lazy()
         # Two different names both resolve — the guard keys on (id(self), name),
         # so it never blocks a DIFFERENT attribute.
@@ -111,13 +111,13 @@ class TestReentryGuard:
         monkeypatch.setitem(sys.modules, "transformers", tf)
         monkeypatch.setitem(sys.modules, "transformers.utils", utils)
         monkeypatch.setitem(sys.modules, "transformers.utils.import_utils", iu)
-        guard._install_lazy_module_reentry_guard()  # must not raise
+        guard.install_lazy_module_reentry_guard()  # must not raise
 
     def test_transformers_absent_is_a_noop(self, monkeypatch):
         monkeypatch.setitem(sys.modules, "transformers", None)
         # None in sys.modules makes `import transformers` raise ImportError,
         # which the guard swallows. Must not propagate.
-        guard._install_lazy_module_reentry_guard()
+        guard.install_lazy_module_reentry_guard()
 
 
 # ── GPT2 direct-bind ────────────────────────────────────────────────────────
@@ -147,3 +147,50 @@ class TestGpt2DirectBind:
         # transformers present, but the gpt2 tokenizer submodule is gone.
         _inject_fake_transformers(monkeypatch)  # no gpt2 module injected
         guard.bind_gpt2_tokenizer_fast()  # must not raise (logs a warning)
+
+
+# ── one implementation of the re-entry guard ────────────────────────────────
+def test_a_guard_failure_other_than_absent_transformers_is_logged(monkeypatch, caplog):
+    """The entry module's copy logged this; the one copy must too."""
+    import logging
+
+    class _Exploding(types.ModuleType):
+        def __getattr__(self, name):
+            raise RuntimeError("transformers half-installed")
+
+    iu = _Exploding("transformers.utils.import_utils")
+    utils = types.ModuleType("transformers.utils")
+    utils.import_utils = iu
+    tf = types.ModuleType("transformers")
+    tf.utils = utils
+    monkeypatch.setitem(sys.modules, "transformers", tf)
+    monkeypatch.setitem(sys.modules, "transformers.utils", utils)
+    monkeypatch.setitem(sys.modules, "transformers.utils.import_utils", iu)
+    with caplog.at_level(logging.WARNING):
+        guard.install_lazy_module_reentry_guard()  # must not raise
+    assert "re-entry defang skipped" in caplog.text
+
+
+def test_absent_transformers_is_silent(monkeypatch, caplog):
+    import logging
+    monkeypatch.setitem(sys.modules, "transformers", None)
+    with caplog.at_level(logging.WARNING):
+        guard.install_lazy_module_reentry_guard()
+    assert "defang skipped" not in caplog.text
+
+
+def test_the_entry_module_has_no_second_reentry_guard():
+    """hart_intelligence_entry calls the guard's function instead of carrying
+    its own patch of _LazyModule.__getattr__ (review of HARTOS #142)."""
+    import ast
+    import os
+    entry = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "hart_intelligence_entry.py")
+    with open(entry, encoding="utf-8") as fh:
+        src = fh.read()
+    patched = [n.lineno for n in ast.walk(ast.parse(src))
+               if isinstance(n, ast.Assign) and any(
+                   isinstance(t, ast.Attribute) and t.attr == "__getattr__"
+                   for t in n.targets)]
+    assert patched == [], f"the entry module patches __getattr__ itself at {patched}"
+    assert "install_lazy_module_reentry_guard()" in src
