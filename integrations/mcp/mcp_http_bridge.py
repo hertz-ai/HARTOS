@@ -846,12 +846,11 @@ def _load_tools():
          'AUTOEVOLVE_CODE_TOOLS', 'autoevolve_code'),
         ('integrations.coding_agent.backend_repair_tools',
          'BACKEND_REPAIR_TOOLS', 'backend_repair'),
-        # McGroce commerce: the SAME functions the Tier-2 registrar binds
-        # for agents; here user_id is an explicit argument (the caller holds
-        # this node's MCP token), and checkout still needs the shopper's own
-        # approval through /api/agent/approval.
-        ('integrations.commerce.commerce_tools',
-         'COMMERCE_TOOLS', 'commerce'),
+        # McGroce commerce is NOT here.  Its tools take the shopper as
+        # user_id, and an MCP caller is this node's one token, not a
+        # shopper: exposed, it read and edited any linked shopper's cart and
+        # orders by naming them.  Shoppers reach those tools only through
+        # their own agent, where the registrar binds user_id.
     ):
         try:
             import importlib

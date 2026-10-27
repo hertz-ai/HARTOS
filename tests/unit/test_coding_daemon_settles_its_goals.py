@@ -326,3 +326,47 @@ def test_a_dispatch_that_ran_clears_the_count_and_is_settled_on_the_row(db_path)
     assert cfg.get('noop_dispatch_count') == 1, cfg
     assert back.status == 'active'
     db2.close()
+
+
+# ── held spark is not work (review of 25d31fc1d, item 1) ─────────────────
+
+def test_real_work_after_a_failed_release_completes_a_coding_goal():
+    """An earlier release failed, so 4 spark stay held.  This turn reserves 4
+    (the real check_goal_budget) and its flow charges 2 of work.  The
+    snapshot the coding daemon takes before the dispatch must leave the held
+    spark out, or the 2 spark of work read as 2 - 4 and the goal gets a noop
+    strike.  Mutant M2 (the snapshot back to raw spark_spent) passed all the
+    other tests (hartos-a8's probe, adapted)."""
+    from integrations.agent_engine import budget_gate
+    goal = _Goal(gid='fix-held', spark=104)       # 100 of work + 4 held
+    goal.spark_budget = 300
+    goal.prompt_id = '12345'
+    budget_gate._held_reservations.pop('fix-held', None)
+    budget_gate._hold('fix-held', 4, 'expert:earlier')
+    db = MagicMock()
+    db.query.return_value.filter.return_value.order_by.return_value \
+        .all.return_value = [goal]
+    db.query.return_value.filter_by.return_value.with_for_update \
+        .return_value.first.return_value = goal
+    db.query.return_value.filter.return_value.with_for_update \
+        .return_value.first.return_value = goal
+
+    def _turn(prompt, user_id, goal_id, goal_type=None):
+        budget_gate.invalidate_goal_budget_cache()
+        assert budget_gate.check_goal_budget(
+            str(goal_id), 4, holder='dispatch_goal:t')[0]
+        assert budget_gate.charge_goal_work_completed('12345', 2)
+        budget_gate.release_goal_reservations(
+            str(goal_id), holder='dispatch_goal:t')
+        return 'Patched the probe; it passes.'
+
+    try:
+        _tick(goal, MagicMock(side_effect=_turn), db=db)
+        assert goal.config_json.get('spark_at_dispatch') == 100, \
+            'the held spark was counted in the snapshot'
+        assert goal.status == 'completed', (
+            f"real work after a failed release was judged a noop: "
+            f"noop={goal.config_json.get('noop_dispatch_count')}")
+    finally:
+        budget_gate._held_reservations.pop('fix-held', None)
+        budget_gate.invalidate_goal_budget_cache()

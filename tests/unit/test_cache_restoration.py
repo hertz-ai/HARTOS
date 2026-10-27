@@ -159,6 +159,25 @@ class TestTTLCacheLoader:
         assert cache.get('nonexistent') is None
         assert 'nonexistent' not in cache
 
+    def test_forget_everywhere_reloads_in_every_cache_of_that_loader(self):
+        """A value written past the caches (the game-sound card writes the
+        store file) is reloaded by every cache that restores from the same
+        loader; a cache with another loader keeps its entries."""
+        store = {'k': 'old'}
+        load = store.get
+        create_like = TTLCache(ttl_seconds=60, max_size=10, name='a', loader=load)
+        reuse_like = TTLCache(ttl_seconds=60, max_size=10, name='b', loader=load)
+        other = TTLCache(ttl_seconds=60, max_size=10, name='c',
+                         loader=lambda key: 'unrelated')
+        assert create_like['k'] == reuse_like['k'] == 'old'
+        other['k'] = 'kept'
+
+        store['k'] = 'new'
+        assert TTLCache.forget_everywhere('k', load) == 2
+
+        assert create_like['k'] == reuse_like['k'] == 'new'
+        assert other['k'] == 'kept'
+
 
 # =============================================================================
 # Cache loader function tests

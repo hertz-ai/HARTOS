@@ -119,6 +119,62 @@ class JSONBackend(StorageBackend):
         safe_key = key.replace('..', '_').replace('/', '_').replace('\\', '_')
         return self.storage_dir / f"{safe_key}.json"
 
+    # Keys whose saved data holds a task in progress: one empty file per key
+    # in <storage_dir>/.in_progress/.  A reader that wants only those (the
+    # zombie reaper) lists this folder instead of opening every file, so its
+    # cost follows the work in flight, not every session ever recorded.  The
+    # files carry no .json suffix and sit one level down, so no glob of
+    # storage_dir ('*.json', 'ledger_*.json') ever sees them.
+    _MARK_DIR = '.in_progress'
+    # Its modification time is when SmartLedger.keys_in_progress last started
+    # a pass over the unmarked files; the names in _MARK_DIR starting with '.'
+    # are the index's own, never keys.
+    _MARK_INDEX_STAMP = '.last_pass'
+
+    def _mark_path(self, key: str):
+        return self.storage_dir / self._MARK_DIR / self._get_path(key).stem
+
+    def set_mark(self, key: str, on: bool) -> None:
+        """Mark ``key`` as holding a task in progress, or clear the mark.
+        Idempotent; raises OSError when the mark cannot be written."""
+        path = self._mark_path(key)
+        if not on:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            return
+        try:
+            os.close(os.open(path, os.O_CREAT | os.O_WRONLY))
+        except FileNotFoundError:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            os.close(os.open(path, os.O_CREAT | os.O_WRONLY))
+
+    def marked_keys(self) -> List[str]:
+        """The keys currently marked as holding a task in progress."""
+        try:
+            names = os.listdir(self.storage_dir / self._MARK_DIR)
+        except FileNotFoundError:
+            return []
+        return [n for n in names if not n.startswith('.')]
+
+    def mark_index_time(self) -> Optional[float]:
+        """When the last pass over the unmarked files started, or None
+        before the first one."""
+        try:
+            return os.stat(self.storage_dir / self._MARK_DIR
+                           / self._MARK_INDEX_STAMP).st_mtime
+        except OSError:
+            return None
+
+    def stamp_mark_index(self, when: float) -> None:
+        """Record that every file written before ``when`` (epoch seconds)
+        has been read.  Raises OSError."""
+        path = self.storage_dir / self._MARK_DIR / self._MARK_INDEX_STAMP
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.close(os.open(path, os.O_CREAT | os.O_WRONLY))
+        os.utime(path, (when, when))
+
     def save(self, key: str, data: Dict[str, Any]) -> bool:
         try:
             path = self._get_path(key)
@@ -158,10 +214,16 @@ class JSONBackend(StorageBackend):
             path = self._get_path(key)
             if path.exists():
                 path.unlink()
-            return True
         except Exception as e:
             print(f"[JSONBackend] Delete error for {path}: {e}")
             return False
+        try:
+            self.set_mark(key, False)
+        except OSError as e:
+            # The data is gone; a mark left behind is cleared by the next
+            # SmartLedger.keys_in_progress, which finds no file for it.
+            print(f"[JSONBackend] Could not clear the in-progress mark for {key}: {e}")
+        return True
 
     def list_keys(self, pattern: str = "*") -> List[str]:
         import fnmatch

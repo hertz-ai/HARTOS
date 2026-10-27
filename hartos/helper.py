@@ -62,6 +62,7 @@ import aiohttp
 import asyncio
 import os
 import threading
+import contextlib
 from core.file_cache import atomic_json_write
 from bs4 import BeautifulSoup
 from json_repair import repair_json
@@ -3945,6 +3946,174 @@ def get_llm_config(fallback_config_list=None):
     return {"cache_seed": None, "config_list": override or (fallback_config_list if fallback_config_list is not None else config_list), "max_tokens": 1500}
 
 
+# Every thread driving one group chat of a session, by (user_prompt, group),
+# each with how deep it has re-entered.  get_response_group re-enters itself
+# (safe_action_boundary_check, the flow-increment sites), so the SAME thread
+# entering again is still its one turn, and any OTHER thread in the set is
+# "another turn in flight".  A set, not one owner: with one owner, three
+# overlapping requests for one session emptied the table when the first
+# returned, and the third settled the second's live tool call (review of
+# ff160f057, 2026-10-05).
+#
+# One key per GROUP CHAT, not per session (review of 75dc20add, P1 and P5):
+# the groups hold separate agents.  'create' is create_recipe's user_agents
+# group and 'create-time' its time_agents group; 'reuse', 'reuse-time' and
+# 'reuse-visual' are the three groups of reuse_recipe's user_agents entry and
+# 'reuse-role' its role_agents group.  Keyed by session, a REUSE turn held
+# back the CREATE group's orphan settle, and a REUSE chat turn switched the
+# model of a scheduled run still going in the time group.
+#
+# TURN_MODELS keeps, per key, the model each running thread's turn asked for:
+# the thread's model_config override when the turn started, None for the
+# node's default (bind_agents_to_turn_model compares them).
+TURNS_IN_FLIGHT = {}
+TURN_MODELS = {}
+_TURNS_IN_FLIGHT_LOCK = threading.Lock()
+# A running thread whose asked model is not recorded (marked by hand, as a
+# test does) counts as asking for another model.
+_MODEL_NOT_RECORDED = object()
+
+
+def _turn_asks_for():
+    """The model this thread's turn asked for: /chat's override, or None."""
+    from hartos.threadlocal import thread_local_data
+    return thread_local_data.get_model_config_override()
+
+
+@contextlib.contextmanager
+def turn_in_flight(user_prompt, group):
+    """Mark this thread as driving ``user_prompt``'s ``group`` chat for the
+    duration of the block.  Re-entrant: an inner block on the same thread
+    deepens the mark and leaving it only undoes its own level; every thread
+    is counted on its own, so one leaving never clears another's."""
+    key = (user_prompt, group)
+    me = threading.get_ident()
+    asked = _turn_asks_for()
+    with _TURNS_IN_FLIGHT_LOCK:
+        running = TURNS_IN_FLIGHT.setdefault(key, {})
+        if me not in running:
+            TURN_MODELS.setdefault(key, {})[me] = asked
+        running[me] = running.get(me, 0) + 1
+    try:
+        yield
+    finally:
+        with _TURNS_IN_FLIGHT_LOCK:
+            running = TURNS_IN_FLIGHT.get(key)
+            if running is not None:
+                depth = running.get(me, 0) - 1
+                if depth > 0:
+                    running[me] = depth
+                else:
+                    running.pop(me, None)
+                    models = TURN_MODELS.get(key)
+                    if models is not None:
+                        models.pop(me, None)
+                        if not models:
+                            del TURN_MODELS[key]
+                    if not running:
+                        del TURNS_IN_FLIGHT[key]
+
+
+def another_turn_in_flight(user_prompt, group):
+    """True when a thread other than this one is driving ``user_prompt``'s
+    ``group`` chat right now.  The per-user lock is not held across LLM calls
+    (hart_intelligence_entry chat()), so /chat requests for one session can
+    overlap."""
+    me = threading.get_ident()
+    with _TURNS_IN_FLIGHT_LOCK:
+        return any(t != me for t in TURNS_IN_FLIGHT.get((user_prompt, group), ()))
+
+
+def _session_llm_agents(cached):
+    """The autogen agents with a model in a cached session entry (the tuple
+    create_agents returns, its agents dict, a GroupChat's agents, a
+    GroupChatManager), each once."""
+    seen, found = set(), []
+
+    def walk(item):
+        if isinstance(item, (tuple, list)):
+            for x in item:
+                walk(x)
+        elif isinstance(item, dict):
+            for x in item.values():
+                walk(x)
+        elif isinstance(item, autogen.GroupChat):
+            walk(item.agents)
+        elif isinstance(item, autogen.ConversableAgent) and id(item) not in seen:
+            seen.add(id(item))
+            if isinstance(item.llm_config, dict):
+                found.append(item)
+
+    walk(cached)
+    return found
+
+
+def bind_agents_to_turn_model(agents, fallback_config_list, user_prompt, group):
+    """Run one group chat's cached agents on THIS turn's model (#172).
+
+    autogen builds an agent's client once, from the llm_config it was made
+    with, and CREATE / REUSE keep a session's agents between turns, so a turn
+    whose dispatcher chose another model (the expert of a revenue goal, set by
+    /chat as the thread's model_config override) still called the model the
+    agents were built on: central, 2026-10-23, 0 api.anthropic.com calls after
+    "Handed to the expert model".  Built on an expert turn, they kept the
+    expert for every ordinary turn after it, outside the day-cap check.
+
+    ``agents`` is the group the turn drives (its GroupChat and manager, or
+    create_recipe's entry for that group), never another group's: the groups
+    hold separate agents.  The turn's model is get_llm_config's, the one
+    every agent builder reads.  Each agent gets it through autogen's own
+    builder (_validate_llm_config), with the rest of its llm_config kept,
+    registered tools included.
+
+    Returns True when the group's agents run on this turn's model (they did
+    already, or now do).  Returns False, switching nothing, when another
+    running turn of the group asked for another model: switching would change
+    the model that turn is mid-way through, and running this turn on that
+    model would spend it on a model this turn did not ask for (an ordinary
+    turn on the expert, outside the day-cap check).  The caller then does not
+    run its turn and answers held_for_another_turn_reply(), which every
+    dispatcher holds for a retry.  The check and the switch are one step
+    under the registry's lock, so a turn that starts meanwhile is seen."""
+    turn_list = get_llm_config(fallback_config_list)['config_list']
+    asked = _turn_asks_for()
+    me = threading.get_ident()
+    key = (user_prompt, group)
+    models = sorted({str((c or {}).get('model')) for c in turn_list or []})
+    with _TURNS_IN_FLIGHT_LOCK:
+        stale = [a for a in _session_llm_agents(agents)
+                 if a.llm_config.get('config_list') != turn_list]
+        if not stale:
+            return True
+        asked_by = TURN_MODELS.get(key, {})
+        held = any(asked_by.get(t, _MODEL_NOT_RECORDED) != asked
+                   for t in TURNS_IN_FLIGHT.get(key, ()) if t != me)
+        if not held:
+            for agent in stale:
+                agent._validate_llm_config({**agent.llm_config, 'config_list': turn_list})
+    if held:
+        _safe_log('warning', f'[TURN-MODEL] {user_prompt} {group}: another turn of '
+                             f'this group is running on another model, so this '
+                             f'turn does not run; it asked for {models}')
+        return False
+    _safe_log('info', f'[TURN-MODEL] {user_prompt} {group}: {len(stale)} agent(s) '
+                      f'now on {models}')
+    return True
+
+
+@contextlib.contextmanager
+def group_turn(agents, fallback_config_list, user_prompt, group):
+    """A turn of one group chat, for the block: this thread is marked as
+    driving it (turn_in_flight) and its agents run on the turn's model
+    (bind_agents_to_turn_model).  Yields whether the turn may run; on False
+    the caller does not drive the group and answers
+    core.agent_tools.held_for_another_turn_reply().  The one way a turn picks
+    up a cached group, so none binds without being seen by the next turn
+    (review of 75dc20add, P1)."""
+    with turn_in_flight(user_prompt, group):
+        yield bind_agents_to_turn_model(agents, fallback_config_list, user_prompt, group)
+
+
 def format_action_text(text):
     """Format VLM action JSON into human-readable step description.
 
@@ -5507,3 +5676,101 @@ async def subscribe_and_return(message, topic, time=1800000):
                 await component.stop()
             except Exception as e:
                 current_app.logger.error(f"Error stopping component in finally: {e}")
+
+
+# ── media an agent wants the person to SEE ───────────────────────────────
+#
+# The owner, 2026-10-25: "if there is an image url to display in frointeend
+# and agent want to set it in response to show to user , it could be text to
+# image response, it could also be video url when video is generated, all
+# modalities we have a way to set in response and render play or show it".
+#
+# No new channel. The agent names media beside its message2userfinal,
+# send_message_to_user1 hands the references here, and publish_agent_message
+# already carries a `media` list -- the reel pipeline has sent one since
+# reel_studio. Same shape, so one renderer on each client serves both.
+#
+# Every item carries BOTH addresses, because the two clients fetch
+# differently (traced in both clients on 2026-10-25 by
+# fix-all-log-observed-issues): the desktop renders `url`, served
+# same-origin by this same Flask, and the phone fetches `xid` over the
+# device link, which keeps working through the relay where a LAN URL does
+# not.
+
+#: The key an agent puts its media under, beside message2userfinal.  ONE
+#: name, shared by the reply schema the prompt shows the agent
+#: (reuse_recipe.response_format_template) and the doors that read it, so a
+#: rename cannot leave the prompt advertising a key nothing consumes.
+MEDIA_REPLY_KEY = 'media'
+
+#: The kinds an agent may ask for, and the MIME each file must really be.
+#: The FILE decides: a reference whose own file contradicts its kind is
+#: dropped, never relabelled. A model sure enough to name the wrong kind is
+#: guessing, and the next thing it guesses is the path.
+MEDIA_KIND_MIMES = {
+    'image': {'.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
+              '.gif': 'image/gif', '.webp': 'image/webp'},
+    'video': {'.mp4': 'video/mp4', '.webm': 'video/webm'},
+    'html': {'.html': 'text/html', '.htm': 'text/html'},
+}
+
+
+def media_items_for(user_id, refs, *, prompt_id, request_id):
+    """Reply ``media`` items for the files an agent asked to show.
+
+    ``refs`` is what the agent put beside its ``message2userfinal``:
+    ``[{'type': 'image'|'video'|'html', 'url': '/uploads/...', 'caption'?}]``
+    -- already the shape media_agent._generate_image returns. Anything else
+    in the list is ignored.
+
+    A reference becomes an item only when a real file is behind it. THE
+    MODEL INVENTS: on 2026-10-25 (request_id t1-retrieval-102136) an agent
+    answered out of "The Art of Computer Programming", a book in no row of
+    pdf_files and in no agent-data file. One that invents a book will invent
+    a path, and an invented path reaching a client is a broken frame in her
+    chat. So every url goes through resolve_upload_url -- which already
+    refuses traversal and UNC -- and a url with no file behind it is dropped
+    and logged.
+
+    Each surviving file is copied into her outbox by the store, which writes
+    its own facts into the item (xid, sha256, size, mime, prompt_id,
+    request_id), so the item and the file cannot disagree. One bad reference
+    costs only itself: the answer still goes, carrying the items that are
+    real.
+    """
+    from core.user_file_store import OUTBOUND_PURPOSE, get_user_file_store
+    from integrations.learning.book_pipeline import resolve_upload_url, upload_url_for
+
+    if not isinstance(refs, (list, tuple)):
+        return []
+    store, items = None, []
+    for ref in refs:
+        if not isinstance(ref, dict):
+            continue
+        kind, url = ref.get('type'), ref.get('url')
+        wanted = MEDIA_KIND_MIMES.get(kind) if isinstance(kind, str) else None
+        if wanted is None or not isinstance(url, str):
+            _safe_log('warning', f"media: ignoring the reference {ref!r}")
+            continue
+        path = resolve_upload_url(url)
+        if path is None:
+            _safe_log('warning', f"media: nothing is behind {url!r}, dropped")
+            continue
+        mime = wanted.get(path.suffix.lower())
+        if mime is None:
+            _safe_log('warning', f"media: {url!r} is not a {kind}, dropped")
+            continue
+        item = {'kind': kind, 'url': upload_url_for(path)}
+        caption = ref.get('caption')
+        if isinstance(caption, str) and caption.strip():
+            item['caption'] = caption.strip()
+        try:
+            store = store or get_user_file_store()
+            stored = store.offer_to_device(
+                user_id, str(path), mime=mime, purpose=OUTBOUND_PURPOSE,
+                prompt_id=prompt_id, request_id=request_id,
+                meta={'media': item}, name=path.name)
+            items.append(stored.meta['media'])
+        except (OSError, ValueError) as e:
+            _safe_log('warning', f"media: the store refused {url!r}: {e}")
+    return items

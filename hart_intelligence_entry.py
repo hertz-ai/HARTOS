@@ -3240,7 +3240,8 @@ def _request_consent(action: str, label: str, input_text: str) -> str:
     # computer_control and credential asks rather than copied (it already
     # handles the '0' and 'None' spellings this codebase passes around).
     from integrations.social.consent_service import (
-        ConsentService, consent_type_for_action, known_agent_id)
+        ConsentService, central_lacks, consent_type_for_action,
+        known_agent_id)
     from integrations.social.models import db_session
 
     log = logging.getLogger(__name__)
@@ -3249,6 +3250,9 @@ def _request_consent(action: str, label: str, input_text: str) -> str:
         log.error('_request_consent: %r maps to no consent type', action)
         return (f"Could not request {label.lower()} access — this computer "
                 f"records no permission for '{action}'.")
+    part = central_lacks(consent_type)
+    if part:
+        return f"Not asked: central has no {part}."
 
     owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
     if not owner:
@@ -3940,7 +3944,7 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict,
         _log.warning("gateway_qr: %s: %s", channel_type, text)
         _emit({'type': 'toast', 'severity': 'error',
                'channel': channel_type, 'channel_type': channel_type,
-               'text': text})
+               'message': text})
 
     # The number, in order: given, the operator's, the user's profile.
     # WhatsApp's pair-code endpoint REQUIRES E.164 digits-only.
@@ -8403,12 +8407,16 @@ _state_lock = threading.Lock()  # Protects review_agents, conversation_agent, fi
 # After MAX_GATHER_TURNS without completion, force-complete with available data
 MAX_GATHER_TURNS = 12
 _gather_turn_counts = {}  # f'{user_id}_{prompt_id}' -> int
-# The gather sessions a review of the agent has been shown to, and what it
-# showed: the steps of the config shown (_config_steps of what
-# _config_review_text rendered), or None for the model's own review_details,
-# which is text.  A completed config is saved only for these, and only with
-# the steps that were shown (#205).  Same keys and lifetime as the turn counts.
+# What the LAST reply of a gather session showed the person: the config
+# shown (what _config_review_text rendered), or None for the model's own
+# review_details, which is text.  Absent after any other reply (a question,
+# a request for the steps, a save), so a plain yes is read against what the
+# person just saw and nothing else: it builds the config shown, as shown,
+# without asking the model; the model's completed config is built when its
+# steps are the ones shown (#205).  Same keys and lifetime as the turn
+# counts.
 _gather_reviews_shown = {}
+_NO_REVIEW_SHOWN = object()  # the mark's value when the session has none
 
 # --- TTL-based cleanup for review_agents / conversation_agent (M2 fix) ---
 _AGENT_TTL = 3600  # 1 hour
@@ -9822,6 +9830,28 @@ def _config_review_text(cfg):
     return '\n'.join(lines)
 
 
+def _is_plain_yes(text):
+    """Whether the person answered a review with the one word it asks for:
+    "yes" on its own, in any case, with or without a full stop or an
+    exclamation mark after it.  Nothing else counts - not "ok", not "y", not
+    "yes but ..." - so an answer that carries a change, or might, is never
+    read as a confirmation; every other answer goes to the model (#205).
+    No pattern matching, on purpose (owner, 2026-10-20)."""
+    return ' '.join(str(text or '').split()).rstrip('.!').lower() == 'yes'
+
+
+@app.teardown_request
+def _a_turns_model_ends_with_its_request(_exc=None):
+    """A turn's model lasts as long as its request (#172).  /chat sets the
+    thread's model_config override when a turn starts and nothing cleared it
+    when the turn ended, by any return, an exception, or the daemon's
+    in-process test client (dispatch._native_chat, on the daemon's own
+    thread).  /time_agent and /visual_agent never set it, so a scheduled run
+    on a reused worker thread inherited an earlier expert turn's model and
+    spent it outside the day-cap check (review of 75dc20add, P2)."""
+    thread_local_data.clear_model_config_override()
+
+
 @app.route('/chat', methods=['POST'])
 @_mark_foreground
 def chat():
@@ -10938,10 +10968,16 @@ def chat():
                 # 400/429, /chat answered the gather output, the worker took it
                 # for the task's result and 17 earning goals were completed
                 # with nothing done.
-                from core.agent_tools import is_user_facing_error, is_user_pause
+                # A recipe() that did not start (another turn of the
+                # conversation runs on a different model, #172) answers that
+                # too, so the dispatcher holds it instead of judging the
+                # gather output.
+                from core.agent_tools import (is_held_for_another_turn,
+                                              is_user_facing_error, is_user_pause)
                 return _chat_reply(
                     user_id, request_id,
                     recipe_response if (is_user_pause(recipe_response)
+                                        or is_held_for_another_turn(recipe_response)
                                         or is_user_facing_error(recipe_response))
                     else auto_response,
                     intent=['FINAL_ANSWER'],
@@ -10965,8 +11001,33 @@ def chat():
                           'status="completed". Use reasonable defaults for any missing fields. '
                           'Return the full JSON immediately.')
 
-            response = gather_info(user_id, prompt, prompt_id)
-            app.logger.info('AFTER GATHER INFO')
+            # What the person saw last in this session (see the mark).
+            _shown = _gather_reviews_shown.get(turn_key, _NO_REVIEW_SHOWN)
+            _confirmed_cfg = None
+            if isinstance(_shown, dict) and _is_plain_yes(_user_turn_text):
+                # The person answered the review with the plain yes it asks
+                # for: what is built is the config that was shown, as shown.
+                # The model is not asked: a small model rewrites the steps on
+                # every answer, and a rewritten config is shown again, every
+                # time (#205; live 2026-10-19, agent 342, three times over).
+                # Any other answer is the person's own and goes to the model
+                # as before.  The mark stays until the save takes it, so a
+                # save that fails leaves the yes answerable again; `response`
+                # is read only by the error exit below.
+                _confirmed_cfg = _shown
+                response = ('I could not save the agent as shown. Reply yes '
+                            'to try again, or tell me what to change.')
+                app.logger.info(
+                    "[GATHER] the person confirmed the config shown for %s - "
+                    "building it as shown; the model is not asked (#205)",
+                    prompt_id)
+            else:
+                # The model answers, and its reply replaces what the person
+                # saw last: the exits below write the mark for a review,
+                # and leave it clear for anything else.
+                _gather_reviews_shown.pop(turn_key, None)
+                response = gather_info(user_id, prompt, prompt_id)
+                app.logger.info('AFTER GATHER INFO')
 
             # --- Helper: save completed agent config and transition to Review ---
             def _save_and_enter_review(agent_config):
@@ -11020,8 +11081,9 @@ def chat():
                 _record_lifecycle('Review Mode', user_id, prompt_id, 'Agent details gathered, entering review')
 
             try:
-                # Parse gather_info response
-                new_res = _read_gather_config(response, prompt_id)
+                # Parse gather_info response, or build the config confirmed
+                new_res = (_confirmed_cfg if _confirmed_cfg is not None
+                           else _read_gather_config(response, prompt_id))
 
                 if (new_res.get('status') != 'pending'
                         and turn_num < MAX_GATHER_TURNS
@@ -11048,7 +11110,9 @@ def chat():
                 if new_res.get('status') == 'pending' and turn_num < MAX_GATHER_TURNS:
                     app.logger.info('PENDING STATUS')
                     if new_res.get('review_details'):
-                        _gather_reviews_shown[turn_key] = None  # text, no steps
+                        # The model's own review, text: the person answers
+                        # it to the model, whose completed config is built.
+                        _gather_reviews_shown[turn_key] = None
                     ans = new_res.get('question') or new_res.get('review_details', response)
                     _record_lifecycle('Creation Mode', user_id, prompt_id, f'Agent creation turn {turn_num}')
                     return _chat_reply(
@@ -11077,20 +11141,23 @@ def chat():
                             user_prompt=_user_turn_text,
                         )
                     _steps = _config_steps(new_res)
-                    _shown = _gather_reviews_shown.get(turn_key, _steps)
+                    _shown_steps = (_config_steps(_shown)
+                                    if isinstance(_shown, dict) else _shown)
                     if (turn_num < MAX_GATHER_TURNS
-                            and (turn_key not in _gather_reviews_shown
-                                 or _shown not in (None, _steps))):
+                            and _shown_steps not in (None, _steps)):
                         # The person confirms what is built (#205).  The model
-                        # finished without showing a review, or with steps
-                        # other than the ones shown, so this config is shown,
-                        # and nothing is saved until the person answers it.
-                        _gather_reviews_shown[turn_key] = _steps
+                        # finished without a review in the last reply, or
+                        # with steps other than the ones shown, so this
+                        # config is shown and becomes the mark: nothing is
+                        # saved until the person answers it, a plain yes
+                        # builds it as shown, anything else goes to the
+                        # model.
+                        _gather_reviews_shown[turn_key] = new_res
                         app.logger.warning(
                             "[GATHER] completed %s for %s - showing the config "
                             "to the person (#205)",
                             'before any review was shown'
-                            if _shown is _steps else
+                            if _shown is _NO_REVIEW_SHOWN else
                             'with steps other than the ones shown', prompt_id)
                         _record_lifecycle('Creation Mode', user_id, prompt_id,
                                           'Completed before a review was '
@@ -11116,6 +11183,25 @@ def chat():
 
             except Exception as e:
                 app.logger.error(f'gather_info parse error on turn {turn_num}: {e}')
+                if _confirmed_cfg is not None:
+                    # The person confirmed the config shown and its save
+                    # failed (a disk error, a locked file): nothing else is
+                    # saved in its place - the salvage below would save a
+                    # generic config they never saw (#205) - and the mark
+                    # stays, so their next plain yes saves it.
+                    app.logger.warning(
+                        "[GATHER] the config confirmed for %s could not be "
+                        "saved (%s) - asking the person to confirm again (#205)",
+                        prompt_id, e)
+                    _record_lifecycle('Creation Mode', user_id, prompt_id,
+                                      'Confirmed config could not be saved')
+                    return _chat_reply(
+                        user_id, request_id, response,
+                        intent=['FINAL_ANSWER'],
+                        req_token_count=0, res_token_count=0, history_request_id=[],
+                        Agent_status='Creation Mode', prompt_id=prompt_id,
+                        user_prompt=_user_turn_text,
+                    )
                 # After repeated failures, salvage what we can and move forward.
                 # For autonomous dispatches (agent daemon), salvage earlier (turn 3)
                 # to avoid tight retry loops that waste resources.
@@ -11747,6 +11833,9 @@ def visual_agent():
         # (vision_service._consent_ok).  The owner is whose machine this is
         # (HEVOLVE_OWNER_USER_ID), never the caller's user_id; with no owner,
         # or a check that fails, nothing is grabbed (#66).
+        from integrations.social.consent_service import central_lacks
+        if central_lacks('screen_capture'):
+            return jsonify({'response': 'Not run: central has no screen.', 'vlm_status': 'no_screen'}), 200
         _owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
         _allowed = False
         if _owner:

@@ -19,21 +19,53 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 class TestToolAllowlistGateDispatch(unittest.TestCase):
     """Verify dispatch_goal has model tier resolution wired in."""
 
-    def test_dispatch_goal_source_has_tool_filter_reference(self):
-        """dispatch_goal should reference tool filtering for model tier."""
-        import inspect
-        from integrations.agent_engine.dispatch import dispatch_goal
-        src = inspect.getsource(dispatch_goal)
-        # Tier resolution comment references filter_tools_for_model
-        self.assertIn('filter_tools_for_model', src)
-        self.assertIn('model_tier', src)
+    def test_dispatch_goal_sends_the_overrides_model_tier_to_chat(self):
+        """A turn on a named model carries that model's tier to /chat as
+        body['model_tier'], which create_recipe feeds to
+        filter_tools_for_model.  Behavioural: the real dispatch_goal, its
+        Tier-2 /chat POST captured; the boundaries are the budget gate,
+        the guardrail, the audit log, the model registry and the
+        in-process Tier-1 call."""
+        from types import SimpleNamespace
+        from integrations.agent_engine import budget_gate, dispatch
+        from integrations.agent_engine.model_registry import model_registry
 
-    def test_dispatch_goal_attaches_model_tier_to_body(self):
-        """dispatch_goal source should set body['model_tier']."""
-        import inspect
-        from integrations.agent_engine.dispatch import dispatch_goal
-        src = inspect.getsource(dispatch_goal)
-        self.assertIn("body['model_tier']", src)
+        class _Reply:
+            status_code = 200
+
+            def json(self):
+                return {'response': 'Done.'}
+
+        sent = {}
+
+        def _post(url, json=None, **kw):
+            sent['body'] = json
+            return _Reply()
+
+        with patch.object(budget_gate, 'pre_dispatch_budget_gate',
+                          return_value=(True, 'ok')), \
+                patch.object(model_registry, 'get_model',
+                             return_value=SimpleNamespace(
+                                 tier=SimpleNamespace(value='fast'))), \
+                patch('integrations.agent_engine.model_registry.'
+                      '_own_llm_target', return_value=('', '')), \
+                patch('security.hive_guardrails.GuardrailEnforcer.'
+                      'before_dispatch',
+                      side_effect=lambda p, *a, **k: (True, '', p)), \
+                patch('security.hive_guardrails.GuardrailEnforcer.'
+                      'after_response', return_value=(True, '')), \
+                patch('security.immutable_audit_log.get_audit_log'), \
+                patch.object(dispatch, 'local_chat_dispatch',
+                             return_value=('unavailable', None)), \
+                patch.object(dispatch, '_cb_is_open', return_value=False), \
+                patch.object(dispatch, '_local_dispatch_base_url',
+                             return_value='http://127.0.0.1:1'), \
+                patch.object(dispatch, 'pooled_post', side_effect=_post):
+            result = dispatch.dispatch_goal(
+                'Draft three posts', 'agent-1', 'goal-ws13-tier', 'marketing',
+                model_config=[{'model': 'fast-local'}])
+        self.assertEqual(result, 'Done.')
+        self.assertEqual(sent['body']['model_tier'], 'fast')
 
     def test_dispatch_without_model_config_has_no_tier(self):
         """Without model_config, _dispatch_model_tier stays None."""

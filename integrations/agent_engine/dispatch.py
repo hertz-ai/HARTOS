@@ -19,6 +19,7 @@ Falls back to local /chat when Redis is unavailable.
 import os
 import logging
 import threading
+import uuid
 import requests
 from typing import Dict, List, Optional
 
@@ -845,6 +846,12 @@ _DEFERRED_PREFIX = 'deferred:'
 #: Why a turn that stopped between steps for a person (#129) returned nothing.
 _PAUSED_FOR_THE_PERSON = (f'{_DEFERRED_PREFIX} paused between steps; a person '
                           f'is using this computer')
+#: Why a turn that did not start returned nothing: another turn of the same
+#: conversation is running on a different model (#172).  A goal handed to the
+#: expert keeps its escalation for the next tick instead of being parked as
+#: "the expert model did not finish it" by a turn the expert never ran.
+_HELD_FOR_ANOTHER_TURN = (f'{_DEFERRED_PREFIX} another turn of this '
+                          f'conversation is running on a different model')
 
 
 def _failure_key(goal_id) -> tuple:
@@ -857,18 +864,33 @@ def _turn_failure(reply) -> Optional[str]:
 
     Two kinds, told apart by the reason's prefix.  A turn that stopped
     between steps because a person is using this computer
-    (core.agent_tools.is_user_pause, #129) is held: retry later, never
-    counted as done or failed ('deferred: ...').  A turn whose LLM call
-    failed is a failure: the pipeline does not raise, user_facing_error()
-    turns the exception into a polite sentence and the turn returns it as
-    the reply ('turn failed: ...').  core.agent_tools holds the one
-    recogniser of each; worker_loop._after_response uses them the same way."""
-    from core.agent_tools import is_user_facing_error, is_user_pause
+    (core.agent_tools.is_user_pause, #129), or that did not start because
+    another turn of its conversation is running on a different model
+    (is_held_for_another_turn, #172), is held: retry later, never counted as
+    done or failed ('deferred: ...').  A turn whose LLM call failed is a
+    failure: the pipeline does not raise, user_facing_error() turns the
+    exception into a polite sentence and the turn returns it as the reply
+    ('turn failed: ...').  core.agent_tools holds the one recogniser of
+    each; worker_loop._after_response uses them the same way."""
+    from core.agent_tools import (is_held_for_another_turn,
+                                  is_user_facing_error, is_user_pause)
     if is_user_pause(reply):
         return _PAUSED_FOR_THE_PERSON
+    if is_held_for_another_turn(reply):
+        return _HELD_FOR_ANOTHER_TURN
     if not is_user_facing_error(reply):
         return None
     return f'turn failed: {reply.strip()[:160]}'
+
+
+def _clear_turn_record(goal_id) -> None:
+    """Forget the last turn's failure reason and route for ``goal_id`` on
+    this thread, so what is recorded next describes the new turn only.
+    Called at the start of every goal turn: dispatch_goal's and the
+    speculative one (speculative_turn_result)."""
+    with _turn_failures_lock:
+        _turn_failures.pop(_failure_key(goal_id), None)
+        _dispatch_routes.pop(_failure_key(goal_id), None)
 
 
 def _record_turn_failure(goal_id, reason) -> None:
@@ -945,6 +967,43 @@ def handed_to_hive(goal_id) -> bool:
     handed the goal to the hive rather than running its turn here."""
     with _turn_failures_lock:
         return _dispatch_routes.get(_failure_key(goal_id)) == 'hive'
+
+
+def speculative_turn_result(goal_id, spec) -> Optional[str]:
+    """What dispatch_goal would have returned for a goal whose turn the
+    speculative dispatcher ran: the turn's reply, or None when it is no
+    result, with the reason kept for dispatch_failure_reason and
+    is_transient_deferral as dispatch_goal keeps its own.
+
+    SpeculativeDispatcher.dispatch_speculative runs the fast model's /chat
+    turn before it returns ``{'response': reply, ...}``; only the expert runs
+    after.  The daemon's speculative branch used to discard that reply and
+    settle the goal as a handoff.  Measured on central 2026-10-17
+    18:35-18:49Z: every fast turn answered OpenRouter's 400, and 18 goals were
+    completed anyway, 1.5 s after their dispatch, on the 4 spark the expert
+    reservation adds before any work exists.
+
+    The rule is dispatch_goal's own (_failed_turn): a failed turn's sentence
+    is 'turn failed', a turn paused for the person is held ('deferred:').  An
+    empty reply is a failed turn too: the fast /chat call itself failed (a
+    401, a timeout).  _dispatch_to_model swallows that cause, so the reason
+    names the model, which is what an operator has to look at; 'error' is
+    set only when dispatch_speculative refused or raised.  The turn ran on
+    this node, so the route is 'local'.
+    """
+    _clear_turn_record(goal_id)
+    _record_route(goal_id, 'local', 'the speculative fast model ran it')
+    spec = spec if isinstance(spec, dict) else {}
+    reply = spec.get('response')
+    if not isinstance(reply, str) or not reply.strip():
+        why = spec.get('error') or (
+            f"the fast model {spec.get('fast_model') or '(unnamed)'} "
+            f"returned no reply")
+        _record_turn_failure(goal_id, f'turn failed: {why}')
+        logger.warning(f"Goal {goal_id}: speculative turn gave no reply "
+                       f"({why}); no response returned")
+        return None
+    return None if _failed_turn(goal_id, reply) else reply
 
 
 def _hive_run_open(coordinator, goal_id) -> Optional[bool]:
@@ -1485,12 +1544,38 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
 
     Returns:
         Response text or None on failure
+
+    The spark the budget gate reserves for the turn is given back when the
+    turn ends, however it ends (answered, failed, deferred, refused after
+    the reservation, raised): the reservation is a pre-check, not work.
+    Every caller is covered, the daemons and the stdio MCP server alike.
     """
+    try:
+        from integrations.agent_engine.budget_gate import (
+            release_goal_reservations, reservation_holder)
+    except ImportError:
+        release_goal_reservations = reservation_holder = None
+    holder = (reservation_holder('dispatch_goal', uuid.uuid4().hex[:12])
+              if reservation_holder is not None else None)
+    try:
+        return _dispatch_goal_turn(prompt, user_id, goal_id, goal_type,
+                                   model_config, holder)
+    finally:
+        if release_goal_reservations is None:
+            logger.debug('budget_gate not importable; nothing to give back '
+                         'for goal %s', goal_id)
+        else:
+            release_goal_reservations(goal_id, holder=holder)
+
+
+def _dispatch_goal_turn(prompt: str, user_id: str, goal_id: str,
+                        goal_type: str, model_config: Optional[list],
+                        holder: str) -> Optional[str]:
+    """dispatch_goal's turn.  ``holder`` names its budget reservation, which
+    dispatch_goal gives back when this returns or raises."""
     # A failure reason and a route describe this call only
     # (dispatch_failure_reason, handed_to_hive).
-    with _turn_failures_lock:
-        _turn_failures.pop(_failure_key(goal_id), None)
-        _dispatch_routes.pop(_failure_key(goal_id), None)
+    _clear_turn_record(goal_id)
 
     # The lane this goal's turns run on (owner policy 2026-10-12): a goal that
     # earns is revenue work and may use the expert model; registered by the
@@ -1508,7 +1593,8 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
     # BUDGET GATE: check goal budget + platform affordability before dispatch
     try:
         from integrations.agent_engine.budget_gate import pre_dispatch_budget_gate
-        bg_allowed, bg_reason = pre_dispatch_budget_gate(goal_id, prompt)
+        bg_allowed, bg_reason = pre_dispatch_budget_gate(goal_id, prompt,
+                                                         holder=holder)
         if not bg_allowed:
             logger.warning(f"Dispatch blocked by budget gate for {goal_type} goal {goal_id}: {bg_reason}")
             return None

@@ -220,8 +220,8 @@ fi
 # ── The McGroce session secret, guaranteed on EVERY deploy ──
 # Same reason as the blocks above: the create-block never runs on a box that
 # already has a .env, so a secret added to the repo later would reach this
-# script and stop. McGroce's Tomcat presents the same value as
-# X-Commerce-Secret (integrations/commerce/commerce_api.py); while the
+# script and stop. McGroce's Tomcat holds the same value and signs its calls
+# with keys derived from it (integrations/commerce/signing.py); while the
 # container has none (environment first, then config.json: core/config_cache)
 # POST /api/commerce/session answers 503. An absent secret leaves .env alone,
 # and the log says which of the two states that leaves the box in.

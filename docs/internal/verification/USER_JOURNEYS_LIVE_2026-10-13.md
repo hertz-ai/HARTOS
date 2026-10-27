@@ -283,6 +283,139 @@ seven on hevolve.ai through the cloud chat route) is not run: the route
 answers 401 without a signed-in token, and central's free model tier is
 capped (section 8).
 
+### 11.2 Reel Studio, first live run on the INSTALLED build (hartos-94, 2026-10-18, 21:18 to 22:37 IST)
+
+Node: the installed desktop (Nunba 22b282cf, HARTOS ed6576624,
+Hevolve_Database c5be877, built from a clean export and installed 18:42 IST,
+relaunched elevated). Phone: the owner's SM-S918B, Hevolve_React_Native
+09167f4e1 (`app-prod-debug.apk`), signed in as user 10202, driven over adb
+by hierarchy. Every row is **measured** on both sides unless it says
+otherwise. Phone times are the phone's clock, about 1.2 s ahead of the
+desktop's (its send at 21:46:48.5 was received at 21:46:47.4 desktop time).
+
+| Step | Probe | Result | Label | Verdict |
+|---|---|---|---|---|
+| The phone is admitted as a device of the same user (row 36's precondition) | the phone's HELLO after the reinstall (new Ed25519 key); the owner answers the desktop card | 21:18:21 consent.request filed and the first "Device HELLO refused: pending" (repeated until the card was answered); 21:22:30 consent.granted (user 10202, scope `device:<the phone's key>`, hex redacted in the log); 21:22:30.989 "PeerLink inbound ACCEPTED from ba28 5b2e 80b8 dafa (192.168.29.99:60280) kind=device trust=same_user". The previous build refused every HELLO with `UserConsent has no attribute reopened_at` (fixed in Hevolve_Database c5be877, inside this build) | measured | WORKS |
+| Row 25: her clips reach her own desktop over the device link | Reel Studio setup screen: 5 camera clips picked (the picker allowed 1 to 10); Create tapped at 21:30:35 before the consent tick and refused with the consent toast (`ReelStudioSetupActivity.create:191`, a correct refusal); consent ticked between 21:30:36 and 21:30:52 (the 21:30:40 tap is the likely one; the 21:30:41 tap reopened the picker, closed 21:30:47); Create at 21:30:52 queued the uploads | Phone (`DesktopFiles`): 5 uploads queued 21:30:52 as `reel_source`, each `Done(xid=<sha256>)` 21:30:56 to 21:31:22, 5 WorkManager SUCCESS rows under one setup tag. Desktop (`hevolve.peer_link`): 5 `file_offer ... -> file_accept` and 5 `file_commit -> file_done` 21:30:51 to 21:31:21 from device ba28 5b2e 80b8 dafa, no cloud, no LAN HTTP. On disk: `user_files/42bfe80fd85434fc/in/<sha256>.mp4` x5 (30,269,005 / 19,155,847 / 58,647,121 / 42,899,145 / 57,608,381 bytes), sha256 recomputed on the desktop = the names = `sha256sum` on the phone of `DCIM/Camera/20260902_132352/132255/132230/132244/132336.mp4` (shot 2026-09-02; the picker names them by MediaStore id). Store index: 5 `reel_source` claims bound to prompt 342 and request 7d7bfe9f, capture times carried | measured | PROVEN (with 5 clips, not 3) |
+| Row 26, first half: the create turn reaches the desktop with the tag and the files | the setup screen's first turn, the instructions "Open with the final look, 20 seconds, Tamil songs, add my logo." | Phone `DesktopRoute` 21:33:10 "Desktop-only POST /chat/custom_gpt: served by the desktop". Desktop 21:33:04 `[CHAT] turn received: user_id=10202 ... text_len=63 request_id=7d7bfe9f`, Nunba "prompt_id=342 has no recipe on this node yet - creating it here", HARTOS "GATHER JSON doesnot EXISTS", "gather_info turn 1/12 for 10202_342", local reply via 127.0.0.1:8080 in 5 s: "I love that you're thinking about your final look and the Tamil songs! ... Is this for a video intro, a social media post ...?" No `342.json` yet (the record is written only when gather completes; `reel_studio` is stamped from the hint of that turn) | measured | WORKS as designed, the agent is not yet made |
+| Row 26, second half: the setup conversation continues to the saved record | the answer injected into the phone's chat box over adb at 21:46:40 and sent at 21:46:48: "An Instagram reel for my makeup studio made from the 5 clips I attached. ..." | Desktop 21:46:47 `[CHAT] turn received ... text_len=157 request_id=dbd9c656`; Nunba "prompt_id=342 has no recipe on this node - cloud-only agent, forwarding the turn to the cloud"; "Cloud agent 342 not answered by the cloud (HTTP 401) - answering here as local_assistant"; casual chat with prompt_id 0; the generic agent tried Animate_Character (TIMEOUT 21:47:22), Text to image, Agentic_Router ("plan not ready after 15s"), and 67 s after receipt replied "No worries, those technical hiccups happen! Since we can't generate the reel directly right now, let's get you the exact API keys needed to power the video tools (like Runway or Pika)... Just say 'give me the keys'". That is what the phone shows. Cause (code, both sides): the phone's `ReelInbox.delivered()` marks the agent created on the first reply, so every later turn carries `create_agent: false` (its javadoc assumes the desktop keeps a creation in progress "whatever a later turn says"; HARTOS does, by `review_agents` and by treating a turn for an unmade id as a creation); Nunba's `_resolve_agent` step 4 sent such a turn to the cloud. HARTOS task #136 | measured | FAILED (deadlock after one exchange) |
+| The fix, on the node | Nunba cb7bc7cb: `_resolve_agent` step 4 keeps a turn here when its goal_tags hint is local-only by HARTOS's one rule (`marketing_tools.agent_is_local_only`), type local, nothing forced | Test-first: `tests/test_chatbot_routes.py::TestAgentRouting` +2; on the old code the new test got "cloud says hi" (the measured failure); 10/10 after, 61/61 for the file. Hot-swapped 22:31:18 IST into `lib/routes/chatbot_routes.pyc` (compiled by the bundle's python-embed 3.12.6 from `git show cb7bc7cb`, two compiles byte-identical, the nested rule present and absent in the old module), Nunba relaunched elevated (pid 30284), harthash 22:32:36, `hevolveai_supervisor: registered pid=31564` 22:33:37 | measured | SWAPPED; the phone re-run is owed |
+| The swapped resolver, probed from the desktop | 22:36:49 `POST /chat` on 127.0.0.1:5000 with the phone's second-turn body shape (prompt_id 342, `create_agent` false, `goal_tags` [reel_studio], user 10202, the same answer text), request c13068df | 22:36:50 "prompt_id=342 has no recipe on this node yet and its turn keeps to this node (goal tags ['reel_studio']) - staying here so HARTOS carries on creating it", "Chat with LOCAL agent: 342", HARTOS "GATHER JSON doesnot EXISTS", "gather_info turn 1/12 for 10202_342" (the restart had dropped the earlier gather state), 200 in 5.5 s, served_by local, agent_id 342, the reply asks for the agent's name. Side effect: this probe consumed gather turn 1/12 of her live agent with a replayed answer she did not type on the phone; her next phone turn enters at 2/12 only if it comes within an hour of 22:36:50 (the 1-hour TTL `_AGENT_TTL` in `_cleanup_stale_agents`, run at the top of every /chat, drops the turn counter) and Nunba has not restarted; after that the counter restarts at 1/12, while the gather conversation itself (`gather_agentdetails.user_agents`, a plain dict with no eviction) keeps the probe's replayed answer and the name question until Nunba restarts | measured, desktop side only | WORKS (the resolver); the phone path is still owed |
+| Rows 26 (end) to 37 | the phone's next turn through to the reel | Not run: the phone's battery died at ~22:00 IST (4% and not charging through the run). Her next phone turn continues the gather the desktop probe above started: the counter reads 2/12 only within an hour of 22:36:50 (1-hour TTL, `_cleanup_stale_agents`), else 1/12 again, while the gather conversation holding the probe's answer survives until Nunba restarts | not run | OWED |
+
+### 11.3 Reel Studio, second live run on the INSTALLED build (hartos-94, 2026-10-19, 15:00 to 15:50 IST)
+
+Node: the installed desktop (Nunba 22b282cf with the 59bd38ae
+`routes/chatbot_routes` module hot-swapped on 10-18, replacing the cb7bc7cb
+module that section 11.2's 22:36 probe tested; HARTOS ed6576624; elevated;
+relaunched 13:10 IST after a 13:07 crash, pid 30280, which loaded the
+swapped module from disk). Phone: the owner's SM-S918B, Hevolve_React_Native app 4.1.15,
+user 10202, app restarted 14:57 so its link re-handshook WITH `mobile_paths`
+(the 13:11 handshake had come 24 s before the mobile adapter installed and
+carried none; fix: HARTOS commit 03e61f16c, the device-services window).
+Every row names its side; the phone's log buffer did not keep 15:00 to
+15:02 or 15:41:17, and those cells say so. During turn 1 and most of turn 2
+the desktop ran 33 REUSE loops of agent 54 on its single-slot Qwen3.5-2B
+server (the row "what slowed it", below; they ended between 15:41:25 and
+15:47:27), so the model calls of both turns queued behind them.
+
+| Step | Probe | Result | Label | Verdict |
+|---|---|---|---|---|
+| Row 26, turn 1 on the REAL phone path: the fixed resolver keeps the create turn here | the phone's Reel Studio create turn, request 28db3433, sent 15:00:08 (phone side not kept; `create_agent` true, goal_tags [reel_studio]; desktop receipt 15:00:28) | Desktop 15:00:28 Nunba "prompt_id=342 has no recipe on this node yet and its turn keeps to this node (goal tags ['reel_studio']) - staying here so HARTOS carries on creating it"; 15:00:30 HARTOS "GATHER JSON doesnot EXISTS"; 15:00:32 "gather_info turn 1/12 for 10202_342"; the question produced 15:02:20 (111 s from receipt): "I understand you want to create an Instagram reel for your makeup studio using 5 pre-existing clips, ..." | the 10-18 deadlock is gone on the real path | PROVEN |
+| Turn 1's reply on the phone | the phone's desktop route (150 s wait) and the fan-out | The device link closed at 15:01:39 (phone `SocketException: Software caused connection abort`, desktop "PeerLink inbound CLOSED"; not the 3-heartbeat rule, screen on) and re-handshook 15:01:44; the route reported `not served (link_down)` and put the text back into the chat box. The desktop sent the answer as the api_response at 15:02:20.433 (200, 1465 bytes) over the re-made link; nothing awaited it. The fan-out copy at 15:02:20 reached the phone and was drawn as a "thinking" bubble ("Working on Agent blueprint ready. Starting execution..."); the question text itself never reached the phone (phone side for 15:00 to 15:02 not kept beyond those lines) | a late reply that nothing awaited, the same class as turn 2 | FAILED (link drop; cause not pinned) |
+| Row 26, turn 2: the setup answer is a gather turn, not a cloud turn | the answer typed into the phone's box over adb and sent 15:41:17 (phone side not kept; its route's dispatch 15:41:30.0 and 150 000 ms give-up 15:44:00.044 are; the link had closed again 15:19:40 and was re-accepted 15:40:57 before this turn): "Call it Reel Studio. Purpose: make Instagram reels for my makeup studio from the clips I attach. Open with the final look, 20 seconds total, portrait 1080x1920, a trending Tamil song, my logo on the last frame, smooth cuts. Use sensible defaults for everything else." (request 7dd07da9) | Desktop 15:41:29 `[CHAT] turn received: user_id=10202 ... text_len=266 request_id=7dd07da9`, "staying here so HARTOS carries on creating it", 15:41:30 "gather_info turn 2/12 for 10202_342" | the second turn continues the same gather | PROVEN |
+| Turn 2's reply on the phone | the phone's wait (`mobile_paths` row for POST /chat/custom_gpt: 150 s) against the desktop's answer | Phone 15:44:00 `DesktopRoute: Desktop-only POST /chat/custom_gpt: not served (timeout)`, text put back into the box. Desktop 15:46:06 (277 s from receipt) "LangChain local response: Are the 5 clips attached or linked to this request? Also, what is your studio's name so I can includ..."; the mobile adapter sent it as the api_response (200, 723 bytes) that nobody awaited any more. The fan-out legs at 15:46:06 (chat.response, message, both user 10202) carried a priority-49 Thinking trace, not the answer: the phone logged 0 occurrences of the answer text, drew one more thinking container and showed "HevolveAI is thinking..." with an empty box | a /chat reply slower than the phone's wait is lost on the phone. The desktop also publishes the persisted row as `chat.new` (15:46:07.027 and .029, user 10202: SSE, the PeerLink `events` channel, central's Crossbar HTTP bridge at azurekong:8088/publish, live) and the phone is subscribed to `com.hertzai.hevolve.chat.new.10202` on central (router meta-API, 16:52). The phone discards it: `PeerLinkManager.wampDrawnPush` passes only chat.pupit, chat.response and chat.analogy; `onEventRevision` parses the row as a chat response that needs `text` and `priority` (a row has `content` and `role`, no priority) and `addNewMessage` returns on a null priority; the catch-up `HartChatSyncManager` sync sends no Bearer and gets 401 from `require_auth` (16:04:58, 16:36:58, cursor never advanced) and no screen listens for HART_CHAT_DELTA. `chat.response` on this node carries thinking traces only (`publish_thinking_trace`) | FAILED |
+| What slowed it: 33 stray REUSE loops | Nunba server.log.2 `[CHAT] turn received ... agent_id=54 ... media_mode=audio` | Three whisper transcriptions of audio at the desktop mic (who spoke is not established) were sent by the desktop web chat's voice input into the open agent-54 chat at 13:22:04, 13:23:37, 13:25:45 (Urdu-script noise, "It's like my heart.", "and it looks so good."); the page's retry loop (`Demopage.js` handleSend, MAX_RETRIES 10, same request_id) re-posted each after every timeout: 11 arrivals per turn, one post and ten re-posts (13:22:04 to 14:07:54); HARTOS ran every arrival as its own reuse turn on session 10202_54 (11 `[nunba_N]` worker threads per id, each with its own `inside reuse while1`), all held on action 1 of 3 by `[SUBTASK-HOLD] action 1 keeps N unrun subtask(s)`, N from 2 to 71 between 13:26 and 15:06 (the breakdown path persisting 2-3 per verdict); in 15:41 to 15:48 the Nunba server log has 34 "timed out" lines and llm_outbound.jsonl has 75 calls, 15 of them ReadTimeout and 60 answered 200 (the 684 first written here counted every line of the repeated tracebacks); all 33 loops ended on their own between 15:41:25 and 15:47:27, each with "Some ERROR IN REUSE RECIPE '10202_54'" and KeyError '10202_54', 26 to 32 of them live during turn 2 (my earlier "29 still running at 16:04" counted later requests on the same worker threads logging the stale request id) | nothing in the product ended them sooner (the yield gate pauses background turns only; the Stop button stops VLM loops only); HARTOS task #137 | measured, hand-over |
+| How the phone groups thoughts | the phone's chat while the loops ran | The desktop sends every thought of a turn with that turn's request_id. The phone (`AbstractChatActivity.addNewMessage`, priority 49 Thinking) keys its container on a `THINKING_MESSAGE_` prefix or on the id of the last priority-99 reply; over the device link it had neither and logged "No user request ID for thinking message, using random UUID" per thought: 24 thoughts, 24 containers between 15:16:24.9 and 15:18:10.7, and 28 more between 15:46:01 and 15:47:17 in my two phone dumps (the peer review counted 115 containers from 15:00 to 15:47), nearly all agent 54's, drawn inside the Reel Studio chat (the phone drops only `daemon_` ids, not other turns'). The agent-54 status event also throws `onEventRevision ... Bbox.getTop_left() on a null object reference` | RN lane | measured, hand-over |
+| Rows 27 to 37 | the reel and the evolve loop | Not reached: the setup was two gather turns in (its conversation lives 1 h from 15:46:06 on the desktop, so a later turn starts again at 1/12); the next answer could not be typed over adb (the phone's chat box ignored typed and deleted keys while the screen showed it empty and the view tree held the old answer). The 33 loops ended by 15:47:27 on their own, so no restart is needed; the remaining answers are typed on the phone and watched on both ends | | NOT RUN |
+
+
+### 11.4 Reel Studio, the confirmation loop fixed and proven on the INSTALLED build (hartos-94, 2026-10-20, 12:02 to 12:12 IST)
+
+Node: the installed desktop (Nunba 22b282cf; HARTOS ed6576624 with the
+hart_intelligence_entry.py of 181cb2c87 hot-swapped at 12:02:44 IST into
+python-embed site-packages, lib\hart_intelligence_entry.pyc and the
+library.zip entry, compiled by the bundle's python-embed 3.12.6; the
+installed .py was byte-equal to ed657662 before and no other commit had
+touched the file; Nunba stopped 12:02:43 with the owner idle 1289 s,
+relaunched elevated 12:02:45 as pid 8928, supervisor registered 12:05:20,
+Tier-1 ACTIVE 12:09:56; the two llama-servers of 10:26 and 10:28 reused;
+the chat model answering this node's turns was Qwen3.5-4B on :8080, pid
+3580, not the 2B of 10-19; the yes path asks no model, so the proof itself
+does not depend on which). Times in the table are the probe's reply times;
+turn 1 reached Nunba at 12:10:14.922 and HARTOS logged "gather_info turn 1/12"
+at 12:10:17. The probe read the reply key as Agent_status while Nunba passes
+it as agent_status, so the transcript's "Agent_status=None" is the probe's
+misread, not the wire value; the saved record and the log lines are the
+proof. No phone in this section: it was on the LAN but off adb, and
+the owner away, so the turns are a throwaway user's (probe_hartos94_20261020,
+prompt 990019) sent to Nunba /chat exactly as the phone sends them
+(goal_tags [reel_studio], create_agent on the first turn, media_mode text).
+
+Why this section exists: section 11.3's run (and the owner's own turns
+17:39 to 17:45 on 10-19) ended at "Before I build it, here is the agent as I
+have it ... Reply yes to build it" three times over, because rule #205
+(61624c9b8, 10-10: build only the config shown) sent every "yes" to the
+model and saved only if its next answer carried exactly the steps shown;
+the 2B rewrote them every time. The owner's ruling on the fix: a plain yes,
+no fuzzy pattern matching. The owner's question "how do we know user said
+yes after we created full gather requirements": the per-session mark that
+the shortcut reads is written only by the reply that showed the full config
+and cleared by every other reply (a question, a request for the steps, a
+save), so a "yes" to one of the model's questions goes to the model.
+
+| Step | What was sent | What the desktop did (frozen_debug.log / reply) |
+|---|---|---|
+| Turn 1, received 12:10:15, reply 12:10:27 | the goal ("an agent that makes a short reel from the clips I send it ...", create_agent true) | served_by local, 13.0 s, request be0716bb: the setup's first question (a name for the companion) |
+| Turns 2 to 4, replies 12:10:37 to 12:11:00 | name + goal; the three steps; "nothing else, one flow" | local, 10.6 / 13.2 / 10.0 s (7463750c, 5909cf31, 64b74a1c): questions on clip type, persona name, persona name again |
+| Turn 5, reply 12:11:33 | "The persona is a video editor. No tools beyond editing. That is all, please finish the configuration." | local, 32.9 s, request f59ff054: the model completed; HARTOS "[GATHER] completed before any review was shown for 990019 - showing the config to the person (#205)" and the reply "Before I build it, here is the agent as I have it: Name: Reel Studio Goal: Transform uploaded video clips into a 20-second highlight reel ... Reel Creation (Video Editor): 1. Receive user-uploaded video clips and analyze them to identify the most engaging moments. 2. Trim and concatenate the selected highlights to fit a precise 20-second duration. 3. Generate a caption summarizing the best moments ... Reply yes to build it, or tell me what to change." |
+| Turn 6, received 12:11:33.792, reply 12:11:34.033 | "yes" | request 673f3757, 0.24 s on the desktop (0.3 s at the probe's client): "gather_info turn 6/12", "[GATHER] the person confirmed the config shown for 990019 - building it as shown; the model is not asked (#205)", "Agent config saved to C:\Users\sathi\Documents\Nunba\data\prompts\990019.json"; reply "Got Agent details successfully lets move on to review them one at a time"; the record carries goal_tags ["reel_studio"], flow "Reel Creation", persona "Video Editor", exactly the three steps shown. The file was copied to the session scratchpad and removed from the prompts dir (throwaway). |
+| Not reached | the phone's own yes for agent 342; rows 27 to 37 | the phone was off adb; the next phone turn starts agent 342's setup at 1/12 again (each Nunba restart clears the in-memory gather conversation) |
+
+What this proves: on the installed build, the plain yes to the config
+HARTOS showed builds that config in under a second and never asks the
+model; the loop that stopped the owner's 10-19 setup is gone on this path.
+What it does not prove: the same turn from the phone over the device link
+(owed), and the reel itself (rows 27 to 37).
+
+### 11.5 Reel Studio row 26 on the real phone path, by the owner (2026-10-20, 19:28 to 19:37 IST)
+
+Node: the installed desktop booted at 16:08:40 (boot_record "[BUILD]
+nunba=c92c7111 hartos=1b6e34f42 built=2026-10-20T10:14:14Z", "Starting
+Nunba Server" 16:08:42; no other server start until 20:39:32). 1b6e34f42
+carries 181cb2c87's hart_intelligence_entry.py unchanged (same git blob).
+The files installed now are a later rebuild of the same commits
+(BUILD_INFO: BUILD_SHA c92c7111, HARTOS_SHA 1b6e34f42, BUILD_TIME
+2026-10-20T13:25:36Z); the commit pin holds. Phone: the owner's
+SM-S918B; its device link was accepted at 19:28:21 (from 192.168.29.99,
+kind=device, trust same_user). The owner drove it; no turn in this section
+was sent by a session. Read from boot_record.jsonl, the server.log and
+gui_app.log rotations covering 2026-10-20 16:08 to 20:39, llm_outbound.jsonl.old
+(read on 10-20 before it rotated; its 10-20 rows are no longer on disk) and
+the desktop's conversation_entries (read-only).
+
+| Step | What the phone sent | What the desktop did |
+|---|---|---|
+| Turn 1, received 19:28:26 | request 0ac71204, 1,291 chars: the agent as the desktop last showed it on 10-19 ("Before I build it here is the agent as I have it: Name: Reel Studio Goal: Automate the creation of high-converting Instagram Reels for a makeup studio ..."), media_mode text | "staying here so HARTOS carries on creating it" (Nunba, goal tags ['reel_studio']); "gather_info turn 1/12 for 10202_342" 19:28:27; PENDING, a question back; device reply 200, 3143 bytes, 19:28:34 |
+| Turn 2, received 19:32:17 | request adec0bf4: "Agent name use Reel studio Not broadcast Refine to make them atomic Persona name MUA" | gather 2/12; the model's own review (review_details: "Here is a review of the details gathered so far ... Name: Reel Studio ..."); device reply 200, 4801 bytes, 19:32:27 |
+| Turn 3, received 19:33:32 | request da53c796: "Looks good" | gather 3/12; COMPLETED STATUS; "Agent config saved to C:\Users\sathi\Documents\Nunba\data\prompts\342.json" 19:33:39; reply "Got Agent details successfully lets move on to review them one at a time"; device reply 200, 439 bytes, 19:33:39 |
+| The record | | goal_tags ["reel_studio"], creator_user_id 10202, one flow "Reel Creation Flow" with 9 steps; 342_personality.json at 19:34:14 |
+| Turn 4, received 19:33:49 | request 8610dffc: "Ok" (2 chars) | "chat: resuming in-progress creation for 10202_342" (the record existed, so no "staying here" line; "Chat with LOCAL agent: 342" appears on all four turns); CREATE resumed; reply at 19:37:25: "I need your input to finish building this agent. Step 1 ("Verify the 5 clips are accessible in this chat session and confirm their exact order.") isn't coming together ..."; device reply 200, 863 bytes. Cause measured by another lane: get_user_uploaded_file saw no file for the turn; fix HARTOS 5e1f7a178 (20:30), a child of 1b6e34f42, so no build booted today carries it |
+| Model calls | | by request id in llm_outbound.jsonl.old: one autogen.gather call per setup turn (3), 60 autogen.create calls for 8610dffc (19:34:19 to 19:37:25); the other rows in the setup turns' span (19:28:26 to 19:33:39) and in turn 4's (19:33:49 to 19:37:25) had no request id and came from a scheduled task ("... you must perform this task Collect inference feedback ..."): 5 calls, then 3 more, of which 1 was answered (19:34:05) and 2 failed with ReadError (19:35:02, 19:37:03) while CREATE ran |
+
+What this proves: the phone's Reel Studio setup reaches the desktop over the
+device link, stays local, and ends in a saved Reel Studio agent record with
+its tag, and each reply went back to the phone (mobile_adapter 200 with the
+bytes above). "Looks good" is not the plain yes, so the save went the
+model's own-review way; the plain-yes shortcut (section 11.4) was not
+exercised on the phone. What it does not prove: row 26's banked recipe (no
+342_*_recipe.json; CREATE stopped at step 1 on the clips), the reel (row
+27), and the phone screen itself (not read). Also measured, and handed to
+the persistence owner: in conversation_entries the fourth turn ("Ok",
+8610dffc) has only its assistant row, and the 12:10 probe's first turn
+(be0716bb) has no row of either role (the probe's first row is 06:40:37
+UTC).
+
 ## 10. What this proves
 
 Measured on the public host: the social feed read and the public agent

@@ -3,9 +3,9 @@ Commerce tools -- McGroce shopping, checkout and merchant onboarding for agents.
 
 Tier-2, goal-gated: create_recipe / reuse_recipe call
 ``register_commerce_tools`` when the goal carries the ``commerce`` tag
-(marketing_tools.detect_goal_tags, or a goal type registered with it).  The
-same pure functions are listed in ``COMMERCE_TOOLS`` for the MCP bridge --
-one implementation, two exposures.
+(marketing_tools.detect_goal_tags, or a goal type registered with it).  They
+are listed in ``COMMERCE_TOOLS``; the MCP bridge does not expose them (see
+there).
 
 Every function takes ``user_id`` first.  The agent registration binds it from
 the registrar (the verified identity of the conversation), so the model never
@@ -32,7 +32,9 @@ import functools
 import inspect
 import json
 import logging
+import os
 import re
+import time
 from typing import Annotated, Any, Dict, List, Optional
 
 from integrations.ap2.ap2_protocol import (
@@ -387,13 +389,22 @@ def commerce_prepare_checkout(
     if mock_would_settle(get_payment_ledger().select_gateway(CURRENCY)):
         refuse_no_live_gateway('commerce', user_id)
         return _fail(_NO_LIVE_GATEWAY)
+    blocked = _why_no_order(_client(), user_id, view)
+    if blocked:
+        return _fail(f'this cart cannot be paid for by your agent right now: {blocked}')
     from integrations.ap2.ap2_mandate import MandateError
+    # One live checkout per shopper and cart: two approval cards for one cart
+    # could otherwise both be paid, and only the first could become an order.
+    cart_ref = str(view['order_id'])
     try:
+        ok, reason = _mandates().supersede(user_id, MERCHANT, CHECKOUT_KIND, cart_ref)
+        if not ok:
+            return _fail(reason)
         m = _mandates().create_cart_mandate(
             user_id, MERCHANT, mandate_cart(view), cap=cap,
             description=f"McGroce order, {len(view['items'])} item(s)",
-            kind=CHECKOUT_KIND, requester_agent_id=_AGENT_ID)
-    except MandateError as e:
+            kind=CHECKOUT_KIND, requester_agent_id=_AGENT_ID, cart_ref=cart_ref)
+    except MandateError as e:       # a bad cart, or the node's payment pause
         return _fail(str(e))
     count = sum(i['quantity'] for i in view['items'])
     push_fragment(user_id, {'type': 'checkout',
@@ -422,12 +433,226 @@ def commerce_checkout(
     """Pay for the approved cart and place the McGroce order.
 
     Approving the card already does this; call it only to retry a checkout
-    that did not complete.  Refuses unless the shopper approved.
+    that did not complete.  Refuses unless the shopper approved.  When the
+    payment went through but the order did not, this places the order with
+    that payment; it never charges again.
     """
-    m = _mandates().get(mandate_id)
-    if m is None or m.user_id != str(user_id):
-        return _fail('checkout refused: mandate not found')
-    return _out(settle_checkout(m))
+    from integrations.ap2.ap2_mandate import MandateKeyError
+    from integrations.ap2.ap2_protocol import PaymentStatus, get_payment_ledger
+    m = None
+    try:
+        m = _mandates().get(mandate_id)
+        if m is None or m.user_id != str(user_id) or m.kind != CHECKOUT_KIND:
+            return _fail('checkout refused: mandate not found')
+        if m.status == 'consumed':
+            return _out(retry_order(m))
+        payment = get_payment_ledger().get_payment(m.payment_id)
+        if m.status == 'approved' and payment is not None \
+                and payment.status == PaymentStatus.COMPLETED:
+            # Paid, and its order step never finished (the gateway callback
+            # failed midway): it runs now, and never charges again.
+            return _out(complete_redirect_checkout(m.payment_id))
+        return _out(settle_checkout(m))
+    except MandateKeyError as e:
+        # The node's payment pause.  The raise site cannot know whether the
+        # money moved; this catcher can, from the payment's own record: a
+        # paid shopper is told the order is on hold (never "nothing was
+        # charged"), an unpaid one hears the pause.  Either way nothing was
+        # changed and the approval stays as it is.  The mark an earlier
+        # order call left is read, never written, under the pause (get()
+        # needs no key for a consumed record), so the hold still says
+        # "could not confirm" and sends a person to McGroce first.
+        from integrations.ap2.ap2_protocol import money_taken
+        payment = _payment_for_mandate(mandate_id)
+        if payment is not None and (payment.metadata or {}).get('user_id') != str(user_id):
+            return _fail('checkout refused: mandate not found')
+        if money_taken(payment):
+            order_on_hold(payment, f'this node cannot sign its records right now ({e})',
+                          sent=bool(getattr(m, 'order_sent', None)))
+            return _fail(_PAUSED_AFTER_PAID, needs_attention=True,
+                         payment_id=payment.payment_id, mandate_id=mandate_id)
+        logger.error(f'commerce: checkout {mandate_id} not run: {e}')
+        return _fail(str(e))
+
+
+def _nothing_charged(user_id, message: str) -> None:
+    push_fragment(user_id, {'type': 'notification', 'severity': 'warning',
+                            'title': 'Payment not taken', 'message': message})
+
+
+HOLD_TITLE = 'Payment received, order on hold'
+OWNER_HOLD_TITLE = 'A held payment needs a person'
+#: The notification row every held payment writes (NotificationService):
+#: the bell on every client of this node, kept across a restart.
+HOLD_NOTICE_TYPE = 'held_payment'
+#: The shopper's sentence ends with a promise only when the owner was told
+#: (order_on_hold); otherwise it names the next step.
+_HOLD_FOLLOW_UP = 'we will sort it out with you.'
+_HOLD_CONTACT = 'reply here or contact the shop.'
+_RAIL_NAMES = {'phonepe': 'PhonePe', 'stripe': 'Stripe', 'paypal': 'PayPal',
+               'square': 'Square', 'braintree': 'Braintree'}
+#: What a paid shopper hears when this node cannot sign its records: not the
+#: pause's "nothing was charged", which is false once the money moved.
+_PAUSED_AFTER_PAID = ('the payment went through, but this node cannot place the '
+                      'order right now (its payment key cannot be read); the order '
+                      'is on hold and commerce_checkout places it once the key reads')
+#: Why no order call, and no probe, could be signed for McGroce
+#: (mandate_attestation_for answered None): McGroce was not asked.
+_UNSIGNABLE = ('the order could not be signed for McGroce (no COMMERCE_SESSION_SECRET, '
+               'the shopper is no longer linked, the cart is not the one paid for, a '
+               'cart line has no SKU, or the record does not match what was paid)')
+
+
+def _rupees(amount) -> str:
+    return f'₹{_amount(amount):.2f}'
+
+
+def _durable_notice(user_id, message: str, payment_id: str) -> bool:
+    """One notification row for ``user_id`` (NotificationService.create: the
+    bell on every client of this node, kept across a restart; the live push
+    rides on its commit).  Written only for a user this node has, since the
+    row names its user: a McGroce-only shopper (``mcg-<id>``, no user row
+    here) gets none, and only the live card.  One row per person, payment
+    and sentence: a retry that holds again for the same reason adds nothing
+    to the bell (the live card may repeat), a new reason is a new row.
+    True when the row is there, written now or before."""
+    if not user_id:
+        return False
+    try:
+        from integrations.social.models import Notification, User, db_session
+        from integrations.social.services import NotificationService
+        with db_session(commit=True) as db:
+            if db.query(User.id).filter(User.id == str(user_id)).first() is None:
+                return False
+            target = str(payment_id)[:64]
+            already = db.query(Notification.id).filter(
+                Notification.user_id == str(user_id),
+                Notification.type == HOLD_NOTICE_TYPE,
+                Notification.target_id == target,
+                Notification.message == message).first()
+            if already is None:
+                NotificationService.create(
+                    db, user_id=str(user_id), type=HOLD_NOTICE_TYPE,
+                    target_type='payment', target_id=target, message=message)
+        return True
+    except Exception as e:
+        logger.error(f'held payment {payment_id}: no notification row for '
+                     f'{user_id}: {e}')
+        return False
+
+
+def _tell_owner(payment, user_id, what: str, why: str, sent: bool) -> bool:
+    """The owner half of order_on_hold: this computer's owner (the same
+    identity every other ask of this machine goes to: ai_key_vault,
+    vlm.safety) hears what a person must do.  Told means the notification
+    row was written for an owner who is a user of this node (it lands in
+    their bell and outlives a restart); the live card is pushed on top of
+    it.  The shopper's sentence promises follow-up only when told.
+    ``sent``: an order call left this node and no answer confirmed or
+    refused it, so the order may exist and a refund must wait for a look."""
+    owner = (os.environ.get('HEVOLVE_OWNER_USER_ID') or '').strip()
+    if not owner:
+        logger.error(f'held payment {payment.payment_id}: nobody was told, '
+                     f'HEVOLVE_OWNER_USER_ID is not set')
+        return False
+    gw = payment.gateway.value if payment.gateway else ''
+    rail = _RAIL_NAMES.get(gw, gw or 'payment')
+    if sent:
+        # "May have left": true of a call McGroce never answered and of an
+        # order step that raised, which may have raised before its call.
+        step = (f'Check McGroce for the order before refunding: an order call may '
+                f'have left this node and no answer confirmed it. Place the order '
+                f'if it is not there, or refund the payment from your {rail} '
+                f'merchant account; nothing is refunded automatically.')
+    else:
+        step = (f'Place the order, or refund it from your {rail} merchant '
+                f'account; nothing is refunded automatically.')
+    message = f'{what} Payment {payment.payment_id} from shopper {user_id}: {why}. {step}'
+    told = _durable_notice(owner, f'{OWNER_HOLD_TITLE}. {message}', payment.payment_id)
+    push_fragment(owner, {'type': 'notification', 'severity': 'warning',
+                          'title': OWNER_HOLD_TITLE, 'message': message})
+    if not told:
+        logger.error(f'held payment {payment.payment_id}: nobody was told, the '
+                     f'owner {owner} is not a user of this node')
+    return told
+
+
+def order_on_hold(payment, why: str, detail: str = '', received=None,
+                  sent: bool = False) -> Dict[str, Any]:
+    """The ONE rule for every held payment (money taken, order not placed),
+    whatever the cause: the shopper's notice is built from the payment's own
+    record (no mandate store, so a node that cannot sign still tells them)
+    with the real amounts (``received``, in INR, when the gateway said what it
+    took), and this computer's owner is told what a person must do.  Both
+    notices are notification rows (the bell, kept across a restart) for
+    whoever is a user of this node, with the live card pushed on top.  The
+    sentence promises follow-up only when the owner was told; otherwise it
+    names the next step.  ``sent``: an order call left this node and no
+    answer confirmed or refused it, so the shopper hears "we could not
+    confirm your order", never "not placed yet", which is said only when
+    this node never sent the call.  The caller says which from its own code
+    path; nothing is read off an error text.  Nothing is refunded
+    automatically, and the sentence never says so."""
+    from integrations.ap2.ap2_protocol import PaymentStatus
+    user_id = (payment.metadata or {}).get('user_id')
+    order_amount = _rupees(payment.amount)
+    if received is not None:
+        what = (f'We received {_rupees(received)} but your order comes to '
+                f'{order_amount}, so your order is on hold.')
+    elif payment.status == PaymentStatus.FAILED:
+        # Money taken on a FAILED payment is a capture of another amount
+        # (ap2_protocol.money_taken); this caller did not learn which.
+        what = (f"We received a different amount from your order's "
+                f'{order_amount}, so your order is on hold.')
+    elif sent:
+        what = (f'Your payment of {order_amount} arrived, but we could not '
+                f'confirm your order, so it is on hold.')
+    else:
+        what = (f'Your payment of {order_amount} arrived, but your order is '
+                f'not placed yet, so it is on hold.')
+    logger.error(f'MANUAL RECONCILIATION NEEDED: payment {payment.payment_id} '
+                 f'held ({why}); {what}')
+    owner_told = _tell_owner(payment, user_id, what, why, sent)
+    message = ' '.join(filter(None, [
+        what, detail, 'Nothing more will be charged;',
+        _HOLD_FOLLOW_UP if owner_told else _HOLD_CONTACT]))
+    if user_id:
+        _durable_notice(user_id, f'{HOLD_TITLE}. {message}', payment.payment_id)
+        push_fragment(user_id, {'type': 'notification', 'severity': 'warning',
+                                'title': HOLD_TITLE, 'message': message})
+    else:
+        logger.error(f'held payment {payment.payment_id}: the shopper could not '
+                     f'be told, its record names no user')
+    return {'held': True, 'owner_told': owner_told, 'message': message,
+            'order_call_sent': sent}
+
+
+def hold_paid_order(payment_id: str, why: str, received=None,
+                    sent: bool = False) -> Dict[str, Any]:
+    """A gateway took money for a checkout that cannot become an order as it
+    stands (PhonePe captured a different amount: ``received`` in INR when the
+    callback has it; the order step raised: ``sent``, an order call may have
+    left).  The mandate is kept as it is, so its cart is not offered for
+    payment again; the shopper and the owner are told through order_on_hold,
+    which needs no store."""
+    from integrations.ap2.ap2_protocol import get_payment_ledger
+    payment = get_payment_ledger().get_payment(payment_id)
+    if payment is None:
+        logger.error(f'MANUAL RECONCILIATION NEEDED: payment {payment_id} ({why}) '
+                     f'is not in the ledger; nobody was told')
+        return {'held': False, 'owner_told': False}
+    return order_on_hold(payment, why, received=received, sent=sent)
+
+
+def _payment_for_mandate(mandate_id: str):
+    """The ledger payment minted for ``mandate_id``, found by the payment's
+    own record (its metadata names the mandate), so a node that cannot read
+    its mandate store can still see whether a shopper's money moved."""
+    from integrations.ap2.ap2_protocol import get_payment_ledger
+    for p in list(get_payment_ledger().payments.values()):
+        if (p.metadata or {}).get('mandate_id') == mandate_id:
+            return p
+    return None
 
 
 def settle_checkout(m) -> Dict[str, Any]:
@@ -471,72 +696,532 @@ def settle_checkout(m) -> Dict[str, Any]:
             'charged and no order was placed.'))
         return {'success': False, 'error': f'checkout refused: {_NO_LIVE_GATEWAY}',
                 'payment_id': m.payment_id}
-    paid = ledger.process_payment(m.payment_id, settler=True)
-    payment = ledger.get_payment(m.payment_id)
-    method = payment.gateway.value if payment and payment.gateway else None
-    if paid.get('status') == 'redirect_required':
-        push_fragment(user_id, {'type': 'payment_status', 'status': 'processing',
-                                'amount': float(m.amount), 'currency': CURRENCY,
-                                'method': method,
-                                'transaction_id': paid.get('transaction_id'),
-                                'redirect_url': paid.get('redirect_url')})
-        return {'success': True, 'status': 'awaiting_payment',
-                'redirect_url': paid.get('redirect_url'),
-                'payment_id': m.payment_id}
-    if not paid.get('success'):
-        if payment is not None and payment.status == PaymentStatus.FAILED:
-            push_fragment(user_id, {'type': 'payment_status', 'status': 'failed',
-                                    'amount': float(m.amount), 'currency': CURRENCY,
-                                    'method': method})
+    if m.cart_ref is None:
+        # A card an older version showed, which recorded no cart: no order
+        # could be signed for it, so it must not take the money.
+        store.withdraw(m.mandate_id, 'approved before carts were recorded')
+        _nothing_charged(user_id, 'This approval came from an older version of the '
+                                  'store, so nothing was charged. Approve the cart again.')
         return {'success': False,
-                'error': f"payment failed: {paid.get('error', 'declined')}",
+                'error': 'checkout refused: this approval names no cart; nothing was charged',
                 'payment_id': m.payment_id}
-    return _place_order(client, user_id, m, view, payment)
+    if str(view.get('order_id')) != m.cart_ref:
+        # Same contents, another McGroce cart: the approval named that cart.
+        store.withdraw(m.mandate_id, 'not the cart that was approved')
+        _nothing_charged(user_id, 'This is not the cart you approved, so nothing '
+                                  'was charged. Review it and approve again.')
+        return {'success': False,
+                'error': 'checkout refused: not the cart that was approved'}
+    # Everything the order step needs is checked BEFORE the money moves: once
+    # it is taken, any of these would leave a paid cart with no order.
+    blocked = _why_no_order(client, user_id, view)
+    if blocked:
+        store.withdraw(m.mandate_id, blocked)
+        _nothing_charged(user_id, 'Your agent cannot place this order right now, '
+                                  'so nothing was charged.')
+        return {'success': False,
+                'error': f'checkout refused: {blocked}; nothing was charged',
+                'payment_id': m.payment_id}
+    from integrations.ap2.ap2_mandate import ALREADY_SETTLING
+    claimed, why = store.begin_settle(m.mandate_id)
+    if not claimed and why == ALREADY_SETTLING:
+        # This same mandate is being paid right now (a retry racing its own
+        # approval): that settle owns it, so it is left alone.
+        return {'success': False, 'error': f'checkout refused: {why}',
+                'payment_id': m.payment_id}
+    if not claimed:
+        # Another approval for this cart is paying, or already paid: this one
+        # must never charge a second time.
+        store.withdraw(m.mandate_id, why)
+        _nothing_charged(user_id, 'This cart already has a payment, so nothing '
+                                  'more was charged.')
+        return {'success': False,
+                'error': f'checkout refused: {why}; nothing was charged',
+                'payment_id': m.payment_id}
+    try:
+        paid = ledger.process_payment(m.payment_id, settler=True)
+        payment = ledger.get_payment(m.payment_id)
+        method = payment.gateway.value if payment and payment.gateway else None
+        if paid.get('status') == 'redirect_required':
+            push_fragment(user_id, {'type': 'payment_status', 'status': 'processing',
+                                    'amount': float(m.amount), 'currency': CURRENCY,
+                                    'method': method,
+                                    'transaction_id': paid.get('transaction_id'),
+                                    'redirect_url': paid.get('redirect_url')})
+            return {'success': True, 'status': 'awaiting_payment',
+                    'redirect_url': paid.get('redirect_url'),
+                    'payment_id': m.payment_id}
+        if not paid.get('success'):
+            if payment is not None and payment.status == PaymentStatus.FAILED:
+                push_fragment(user_id, {'type': 'payment_status', 'status': 'failed',
+                                        'amount': float(m.amount), 'currency': CURRENCY,
+                                        'method': method})
+            return {'success': False,
+                    'error': f"payment failed: {paid.get('error', 'declined')}",
+                    'payment_id': m.payment_id}
+        # The money is taken from here on: whatever the order step raises is
+        # answered as a hold, the same way as the PhonePe callback, never
+        # re-raised into decide_payment's bare catch (which would answer
+        # with the errno and tell nobody) or out of commerce_checkout.
+        try:
+            return _place_order(client, user_id, m, view, payment)
+        except Exception as e:
+            if payment is None:
+                raise
+            return _order_step_raised(payment, e)
+    finally:
+        store.end_settle(m.mandate_id)
+
+
+def _why_no_order(client, user_id, view) -> Optional[str]:
+    """Why an agent payment for this cart could not become a McGroce order
+    (None when it can).  Asked before the shopper is asked to approve and
+    again right before the money is taken."""
+    from core.config_cache import get_secret
+    from integrations.commerce.bindings import is_merchant
+    if not get_secret('COMMERCE_SESSION_SECRET', ''):
+        logger.warning('commerce: agent checkout refused, COMMERCE_SESSION_SECRET '
+                       'is not set, so no order could be signed for McGroce')
+        return 'this store is not set up to take agent payments yet'
+    binding = client.bindings.get(user_id)
+    if not binding or is_merchant(binding):
+        return 'this account is not linked to a McGroce shopper'
+    if view.get('order_id') is None:
+        return 'McGroce did not name the cart'
+    if any(i['sku_id'] is None for i in view['items']):
+        return 'a cart line has no product variant McGroce can check'
+    return client.agent_orders_ready(user_id)
+
+
+def mandate_attestation_for(client, m, payment, view) -> Optional[str]:
+    """The signed X-Commerce-Mandate for a CONSUMED mandate, or None.
+
+    McGroce places an AP2 order only on this: HARTOS is the one payer, and
+    the attestation is its signed word that it took exactly ``m.amount`` for
+    this McGroce customer's cart ``oid`` holding exactly ``lines``, and used
+    the mandate up.  McGroce compares all of it with the cart it reprices,
+    so neither a swapped item nor another cart of the same total passes.
+    The customer comes from the binding McGroce itself asserted at the
+    session exchange, never from the model.  None when the node has no
+    COMMERCE_SESSION_SECRET, the shopper is no longer linked, the mandate is
+    not consumed, or a cart line has no SKU to name.
+
+    ``view`` None is the PROBE: the paid cart (``cart_ref``) and no lines.
+    McGroce answers a mandate that one of this customer's placed orders
+    already carries with that order before it looks at any cart
+    (Ap2CheckoutServiceImpl.completeAp2), and refuses an attestation naming
+    no lines for any other mandate (Ap2MandateVerifierImpl: 'items'), so a
+    probe finds the order a lost answer or an unwritten record hid, and can
+    never place one.
+    """
+    from core.config_cache import get_secret
+    from integrations.commerce.bindings import is_merchant
+    from integrations.commerce.signing import ATTESTATION_TTL_S, mandate_attestation
+    secret = get_secret('COMMERCE_SESSION_SECRET', '')
+    binding = client.bindings.get(m.user_id)
+    if not secret or not binding or is_merchant(binding) or m.status != 'consumed':
+        return None
+    # Only what the ledger shows was taken, for a record nobody edited.
+    if not _mandates().paid_as_signed(m, payment):
+        logger.error(f'MANUAL RECONCILIATION NEEDED: mandate {m.mandate_id} does not '
+                     f'match its signature or what payment {m.payment_id} took; '
+                     f'no order signed')
+        return None
+    if m.cart_ref is None:
+        return None
+    if view is None:
+        lines = []
+    else:
+        # The cart named when the mandate was created and signed, and no other.
+        if str(view.get('order_id')) != m.cart_ref:
+            return None
+        if any(i['sku_id'] is None for i in view['items']):
+            return None
+        lines = sorted([str(i['sku_id']), int(i['quantity']), f"{i['price']:.2f}"]
+                       for i in view['items'])
+    now = int(time.time())
+    return mandate_attestation(secret, {
+        'v': 1, 'mid': m.mandate_id, 'pid': m.payment_id,
+        'cid': str(binding['customer_id']), 'oid': m.cart_ref, 'lines': lines,
+        'amt': str(m.amount), 'cur': str(m.currency).upper(), 'st': 'consumed',
+        'iat': now, 'exp': now + ATTESTATION_TTL_S,
+        'gw': payment.gateway.value if payment and payment.gateway else None,
+        'txn': payment.gateway_transaction_id if payment else None})
 
 
 def _place_order(client, user_id, m, view, payment) -> Dict[str, Any]:
-    """After the money is taken: consume the mandate, record the payment on
-    the McGroce cart (referenceNumber = mandate_id) and submit the order.
-    Shared by commerce_checkout and the redirect-gateway callback."""
-    _mandates().consume(m.mandate_id)
+    """After the money is taken: consume the mandate, then have McGroce
+    place the order (_submit_order)."""
+    failed = _consume_paid(user_id, m, payment)
+    if failed:
+        return failed
+    m = _mandates().get(m.mandate_id) or m
+    return _submit_order(client, user_id, m, view, payment)
+
+
+def _consume_paid(user_id, m, payment) -> Optional[Dict[str, Any]]:
+    """The money for ``m`` is taken: use the mandate up and tell the
+    shopper.  None when done, else the answer to return.  From here on the
+    order step is retry_order's, which never charges again."""
+    if not _mandates().consume(m.mandate_id):
+        current = _mandates().get(m.mandate_id)
+        if current is not None and current.status == 'consumed':
+            # Another settle of this mandate consumed it and places its order;
+            # this one must not place a second.
+            return {'success': False, 'error': 'this checkout is already being completed',
+                    'payment_id': m.payment_id, 'mandate_id': m.mandate_id}
+        if current is not None and current.status == 'approved':
+            # consume refuses an approved mandate only when its record fails
+            # its signature: edited outside the store, or signed with a key
+            # this node no longer has.  No order can be signed for it.
+            cause = "this checkout's record does not match its signature"
+        elif current is None:
+            cause = "this checkout's record is gone"
+        else:
+            cause = f'this checkout was {current.status} meanwhile'
+        order_on_hold(payment, f'mandate {m.mandate_id} cannot be used: {cause}')
+        return {'success': False, 'needs_attention': True,
+                'error': (f'the payment went through, but {cause}, so no order can '
+                          f'be placed for it; a person has to place it or refund it'),
+                'payment_id': m.payment_id, 'mandate_id': m.mandate_id}
     method = payment.gateway.value if payment and payment.gateway else None
     txn = payment.gateway_transaction_id if payment else None
     push_fragment(user_id, {'type': 'payment_status', 'status': 'completed',
                             'amount': float(m.amount), 'currency': CURRENCY,
                             'method': method, 'transaction_id': txn})
-    recorded = client.add_checkout_payment(user_id, {
-        'orderId': view['order_id'], 'type': 'THIRD_PARTY_ACCOUNT',
-        'gatewayType': 'Passthrough', 'amount': m.amount,
-        'currency': m.currency, 'referenceNumber': m.mandate_id})
-    placed = client.submit_checkout(user_id) if recorded['success'] else recorded
+    return None
+
+
+def retry_order(m, claimed: bool = False) -> Dict[str, Any]:
+    """The order step again, for a CONSUMED mandate: its payment went
+    through, its order did not (or the answer was lost).  Never charges.
+
+    The order goes in only while the live cart is the one the shopper
+    approved, holding what was approved.  When it is not (changed, another
+    cart, or gone: McGroce checks a cart out when it places the order, so
+    this is what an order whose answer was lost, or whose record was not
+    written, looks like), McGroce is asked first whether the mandate
+    already became an order (_order_for_mandate), and only a refusal holds
+    the payment.  One order step per mandate at a time
+    (MandateStore.begin_settle): a retry racing the gateway callback is
+    told it is in progress.  ``claimed``: the caller already holds that
+    claim.
+    """
+    import hmac
+    from integrations.ap2.ap2_mandate import MandateError, canonical_cart_hash
+    from integrations.ap2.ap2_protocol import PaymentStatus, get_payment_ledger
+    if m.order_ref:
+        return _ordered(m)
+    payment = get_payment_ledger().get_payment(m.payment_id)
+    if m.cart_ref is None:
+        # Consumed by an older build, which kept no order_ref and no cart:
+        # its order may well exist (that build sent the call), and nothing
+        # says which cart it paid for.
+        from integrations.ap2.ap2_protocol import money_taken
+        if money_taken(payment):
+            order_on_hold(payment, f'mandate {m.mandate_id} was consumed under an '
+                                   f'older version, which recorded no cart', sent=True)
+        return {'success': False, 'needs_attention': True,
+                'payment_id': m.payment_id, 'mandate_id': m.mandate_id,
+                'error': ('this payment was handled by an older version; check the '
+                          "shopper's orders, or a person reconciles it")}
+    if payment is None or payment.status != PaymentStatus.COMPLETED:
+        return {'success': False, 'error': 'checkout refused: mandate is consumed'}
+    store = _mandates()
+    if not claimed:
+        ok, why = store.begin_settle(m.mandate_id)
+        if not ok:
+            return {'success': False, 'in_progress': True,
+                    'error': f'this checkout is already being completed ({why})',
+                    'payment_id': m.payment_id, 'mandate_id': m.mandate_id}
+    try:
+        m = store.get(m.mandate_id) or m
+        if m.order_ref:                 # placed while this one waited
+            return _ordered(m)
+        client = _client()
+        res = client.cart_get(m.user_id)
+        if not res['success'] and res.get('unconfirmed'):
+            # McGroce is not answering: no call leaves now.  An earlier call
+            # that left and was never answered keeps its mark.
+            order_on_hold(payment, f"the cart could not be read: {res['error']}",
+                          sent=bool(m.order_sent))
+            return {'success': False, 'error': res['error'], 'needs_attention': True,
+                    'payment_id': m.payment_id, 'mandate_id': m.mandate_id}
+        view = cart_view(res['data']) if res['success'] else None
+        same = False
+        if view is not None:
+            try:
+                same = (str(view.get('order_id')) == m.cart_ref and hmac.compare_digest(
+                    canonical_cart_hash(mandate_cart(view)), m.cart_hash))
+            except MandateError:
+                same = False
+        if same:
+            return _submit_order(client, m.user_id, m, view, payment)
+        # The live cart is not the one paid for: changed, another cart, or
+        # gone (McGroce answered that there is none).  McGroce checks a cart
+        # out when it places an order, so this is also what an order whose
+        # answer was lost, or whose record was not written, looks like:
+        # McGroce is asked by the mandate first, with a probe that can
+        # place nothing, and only its refusal holds the payment.
+        found = _order_for_mandate(client, m, payment)
+        if found is not None:
+            return found
+        if view is None:
+            order_on_hold(payment, f"the cart could not be read: {res['error']}",
+                          sent=bool(m.order_sent))
+            return {'success': False, 'error': res['error'], 'needs_attention': True,
+                    'payment_id': m.payment_id, 'mandate_id': m.mandate_id}
+        # McGroce keeps one open cart per shopper until an order is placed,
+        # so the changed cart is this cart: the notice says how to get the
+        # order placed with the payment already made.
+        order_on_hold(payment, 'the cart no longer holds what was paid for', detail=(
+            'Your cart changed after you paid: put the cart back the way you '
+            'approved it and ask your agent to check out, and it is placed '
+            'with this payment, with no new charge.'), sent=bool(m.order_sent))
+        return {'success': False, 'needs_attention': True, 'cart_changed': True,
+                'payment_id': m.payment_id, 'mandate_id': m.mandate_id,
+                'error': ('the payment went through, but the cart no longer holds '
+                          'what was paid for; put it back as it was approved and '
+                          'call commerce_checkout with this mandate_id, which '
+                          'places the order with that payment and never charges '
+                          'again, or a person sorts it out')}
+    finally:
+        if not claimed:
+            store.end_settle(m.mandate_id)
+
+
+def _ordered(m) -> Dict[str, Any]:
+    return {'success': True, 'status': 'ordered', 'order_id': m.order_ref,
+            'payment_id': m.payment_id, 'amount': m.amount, 'currency': m.currency}
+
+
+def _mark_order_sent(m) -> None:
+    """An order call for consumed ``m`` left this node and was never
+    answered, or was answered with an order this node could not record:
+    kept on the mandate, signed (MandateStore.record_order_sent),
+    so every later hold for it says "could not confirm" and sends a person
+    to McGroce first, until McGroce answers with the order.  Never raises:
+    the money is taken and the hold is what tells people, so a mark that
+    cannot be written (the payment pause, a full disk, a refused replace)
+    is logged for a person and the hold already raised stands on its own.
+    A caller that holds does so FIRST, then marks; the placer marks after a
+    record it could not write."""
+    try:
+        _mandates().record_order_sent(m.mandate_id)
+    except Exception as e:
+        logger.error(f'MANUAL RECONCILIATION NEEDED: mandate {m.mandate_id}: an '
+                     f'order may exist at McGroce for it and the mark could not be '
+                     f'written ({type(e).__name__}: {e}); the next hold for it '
+                     f'may say "not placed yet"')
+
+
+def _order_for_mandate(client, m, payment) -> Optional[Dict[str, Any]]:
+    """Ask McGroce whether consumed ``m`` already became an order, with the
+    probe attestation (mandate_attestation_for with no view: the paid cart,
+    no lines), which McGroce answers with the order a placed one carries
+    and refuses otherwise, so it can place nothing.  The order's answer
+    when there is one (recorded, the tracking pushed).  None ONLY when
+    McGroce answered and refused by one of its own keys (AP2_REFUSAL_KEYS:
+    no placed order carries this mandate), so the caller's cart-changed
+    hold follows.  Otherwise the
+    hold itself: McGroce did not answer the probe, or was never asked (no
+    probe could be signed; the call never left, the breaker open or the
+    URL bad), and a shopper whose cart may hold the placed order must not
+    be told to rebuild it."""
+    from integrations.commerce.mcgroce_client import AP2_REFUSAL_KEYS
+    attestation = mandate_attestation_for(client, m, payment, None)
+    if attestation:
+        found = client.complete_ap2_checkout(m.user_id, attestation)
+    else:
+        found = {'success': False, 'error': _UNSIGNABLE}
+    if found['success']:
+        return _order_placed(m.user_id, m, found)
+    status = found.get('status') or 0
+    if found.get('unconfirmed') and 200 <= status < 300:
+        # McGroce answered the probe with the success it gives only a
+        # mandate one of the customer's orders carries, and this node could
+        # not read which order: the order exists.  The owner checks McGroce
+        # first, and the mandate is marked (after the hold) so every later
+        # hold says so too, until a readable answer records the order.
+        order_on_hold(payment, f"McGroce answered the order check and the answer "
+                               f"could not be read: {found['error']}", sent=True)
+        _mark_order_sent(m)
+        return {'success': False, 'needs_attention': True,
+                'error': ('the payment went through, and McGroce answered that its '
+                          f"order exists but the answer could not be read ({found['error']}); "
+                          'retry with commerce_checkout and this mandate_id, which never '
+                          'charges again, or a person checks McGroce'),
+                'payment_id': m.payment_id, 'mandate_id': m.mandate_id}
+    if found.get('unconfirmed'):
+        why = f"McGroce did not answer the order check: {found['error']}"
+        error = ('the payment went through, and McGroce did not answer '
+                 f"whether its order exists ({found['error']}); retry with "
+                 'commerce_checkout and this mandate_id, which never charges '
+                 'again, or a person checks McGroce')
+    elif found.get('key') in AP2_REFUSAL_KEYS:
+        # McGroce itself refused the mandate, by one of its own keys: no
+        # placed order carries it.  A 4xx without one (Kong's "no Route
+        # matched" 404, a 401 wall) is not McGroce answering.
+        return None
+    else:
+        why = f"the order check could not be made: {found['error']}"
+        error = ('the payment went through, and whether its order exists could '
+                 f"not be checked ({found['error']}); retry with commerce_checkout "
+                 'and this mandate_id, which never charges again, or a person '
+                 'checks McGroce')
+    # A probe places nothing, so one unanswered or never sent leaves no mark
+    # of its own; an earlier order call that did keeps its mark.
+    order_on_hold(payment, why, sent=bool(m.order_sent))
+    return {'success': False, 'needs_attention': True, 'error': error,
+            'payment_id': m.payment_id, 'mandate_id': m.mandate_id}
+
+
+def _submit_order(client, user_id, m, view, payment) -> Dict[str, Any]:
+    """Ask McGroce to place the order for consumed ``m`` with the signed
+    attestation (mandate_attestation_for).  McGroce checks it itself and
+    turns each mandate into one order at most.  One immediate retry when
+    the answer never came (transport error or 5xx): McGroce's single-use
+    check makes that safe.  When no order comes of it the payment is held
+    (order_on_hold); whether a call left and went unconfirmed (the client's
+    ``unconfirmed`` mark on EITHER attempt: it may have been placed) is
+    said now and kept on the mandate (_mark_order_sent), so every later
+    hold for it says so too.  A refused or never-sent call leaves no mark."""
+    attestation = mandate_attestation_for(client, m, payment, view)
+    sent = False
+    if not attestation:
+        placed = {'success': False, 'error': _UNSIGNABLE}
+    else:
+        placed = client.complete_ap2_checkout(user_id, attestation)
+        sent = bool(placed.get('unconfirmed'))
+        if not placed['success'] and (placed.get('status') or 500) >= 500:
+            placed = client.complete_ap2_checkout(user_id, attestation)
+            sent = sent or bool(placed.get('unconfirmed'))
     if not placed['success']:
         logger.error(f'commerce: paid {m.payment_id} but McGroce did not '
                      f'place the order: {placed["error"]}')
+        # The hold first: it is what tells the shopper and the owner.  The
+        # mark after, since its write can fail (a full disk) and must never
+        # stand between a taken payment and the people who must hear of it.
+        order_on_hold(payment, f"McGroce did not place the order: {placed['error']}",
+                      sent=sent or bool(m.order_sent))
+        if sent:
+            _mark_order_sent(m)
         return {'success': False,
                 'error': ('the payment went through but McGroce did not place '
-                          f'the order ({placed["error"]}); it needs a person to '
-                          'reconcile'),
+                          f'the order ({placed["error"]}); retry with '
+                          'commerce_checkout and this mandate_id, which never '
+                          'charges again, or a person reconciles it'),
                 'payment_id': m.payment_id, 'mandate_id': m.mandate_id,
                 'needs_attention': True}
+    return _order_placed(user_id, m, placed)
+
+
+def _order_placed(user_id, m, placed) -> Dict[str, Any]:
+    """McGroce answered with an order for consumed ``m``, placed now or the
+    one it already carried: recorded on the mandate, the tracking pushed.
+    The order IS placed even when this node cannot record it (the key
+    stopped reading, a full disk, a refused file replace): never a hold,
+    and never a raise, which turned a placed order into a failure answer
+    with no tracking and nobody told.  The record's failure is logged for
+    a person; the next retry's probe finds the same order at McGroce."""
+    from integrations.commerce.mcgroce_client import order_number_of
     order = placed['data'] or {}
-    order_id = order.get('orderNumber') or order.get('id')
+    # The one reader the client's success check uses: an answer that
+    # reaches here names an order (complete_ap2_checkout answers one that
+    # names none as unconfirmed).
+    order_id = order_number_of(order)
     status = order.get('status') or 'SUBMITTED'
+    # The reader is the one authority on what counts as an order number;
+    # no truthiness test here can skip the record for a value it passed.
+    if order_id is not None:
+        try:
+            _mandates().record_order(m.mandate_id, order_id)
+        except Exception as e:
+            logger.error(f'MANUAL RECONCILIATION NEEDED: order {order_id} placed '
+                         f'for payment {m.payment_id} but not recorded '
+                         f'({type(e).__name__}: {e})')
+            # The record failed, so the mark says what the record would have:
+            # an order exists for this mandate.  Through the never-raising
+            # writer; its save also carries the in-memory order_ref, so a
+            # disk that refused once and recovered keeps the record after
+            # all, and a later hold after a restart says "could not
+            # confirm", never "not placed yet", for an order McGroce holds.
+            _mark_order_sent(m)
     push_fragment(user_id, _tracking_fragment(order_id, status))
     return {'success': True, 'status': 'ordered', 'order_id': order_id,
             'order_status': status, 'payment_id': m.payment_id,
             'amount': m.amount, 'currency': m.currency}
 
 
+def _order_step_raised(payment, e: BaseException) -> Dict[str, Any]:
+    """The order step for PAID ``payment`` raised: answered as a HOLD, so
+    nothing raised after the money moved leaves the shopper untold, the
+    callback raising, commerce_checkout raising, or decide_payment's bare
+    catch answering with the errno.  One catcher for the three paths (the
+    PhonePe callback, a card approval settled at once, the approval tap).
+    Under the node's payment pause (MandateKeyError) no order call left
+    and commerce_checkout places the order once the key reads; anything
+    else raised mid-step may have left one, so the shopper hears "we
+    could not confirm" and the owner checks McGroce before refunding.
+    The mark an earlier call left is read either way (never written under
+    the pause: a consumed record reads without the key), and a step that
+    raised outside the pause marks its consumed mandate, after the hold,
+    through the never-raising writer."""
+    from integrations.ap2.ap2_mandate import MandateKeyError
+    try:
+        m = _mandates().find_by_payment_id(payment.payment_id)
+    except Exception as err:
+        # The pause on an expired approved record, which cannot be signed:
+        # no mark can exist for it, and the hold goes out without it.
+        logger.warning(f'held payment {payment.payment_id}: its mandate could '
+                       f'not be read for the hold ({type(err).__name__}: {err})')
+        m = None
+    marked = bool(getattr(m, 'order_sent', None))
+    if isinstance(e, MandateKeyError):
+        order_on_hold(payment, f'this node cannot sign its records right now ({e})',
+                      sent=marked)
+        return {'success': False, 'needs_attention': True, 'held': True,
+                'payment_id': payment.payment_id, 'error': _PAUSED_AFTER_PAID}
+    logger.error(f'MANUAL RECONCILIATION NEEDED: the order step for payment '
+                 f'{payment.payment_id} raised', exc_info=e)
+    order_on_hold(payment, f'the order step raised ({type(e).__name__})', sent=True)
+    if m is not None and m.status == 'consumed':
+        _mark_order_sent(m)
+    return {'success': False, 'needs_attention': True, 'held': True,
+            'payment_id': payment.payment_id,
+            'error': ('the payment went through, but the order step failed '
+                      'before it could confirm the order; it is on hold and '
+                      'a person checks McGroce for it')}
+
+
 def complete_redirect_checkout(payment_id: str) -> Dict[str, Any]:
+    """_complete_redirect_checkout, with every failure of the order step
+    answered as a HOLD (_order_step_raised): the money is taken, so nothing
+    raised here leaves the shopper untold or the callback raising."""
+    from integrations.ap2.ap2_protocol import get_payment_ledger
+    try:
+        return _complete_redirect_checkout(payment_id)
+    except Exception as e:
+        payment = get_payment_ledger().get_payment(payment_id)
+        if payment is None:
+            raise
+        return _order_step_raised(payment, e)
+
+
+def _complete_redirect_checkout(payment_id: str) -> Dict[str, Any]:
     """Place the McGroce order for a redirect-gateway (PhonePe) payment the
     gateway callback has just confirmed COMPLETED.
 
-    The person approved one exact cart; if the live cart no longer hashes to
-    it, nothing is placed -- the payment is flagged for a person instead of
-    ordering something they did not approve.
+    The money is taken, so the mandate is used up first, whatever becomes of
+    the order: the order step is then retry_order's, which places it only
+    for the cart the approval named, still holding what was approved.  When
+    it cannot (McGroce down, the cart changed) the order is held, the
+    shopper is told, and commerce_checkout retries it later without a new
+    charge.  That cart is not offered for payment again meanwhile, and since
+    McGroce keeps one open cart per shopper until an order is placed, that
+    is the shopper's live cart.  commerce_checkout also runs this for an
+    approved mandate whose payment completed but whose order step never ran.
     """
-    import hmac
-    from integrations.ap2.ap2_mandate import MandateError, canonical_cart_hash
     from integrations.ap2.ap2_protocol import PaymentStatus, get_payment_ledger
     m = _mandates().find_by_payment_id(payment_id)
     if m is None or m.status != 'approved':
@@ -544,28 +1229,41 @@ def complete_redirect_checkout(payment_id: str) -> Dict[str, Any]:
     payment = get_payment_ledger().get_payment(payment_id)
     if payment is None or payment.status != PaymentStatus.COMPLETED:
         return {'success': False, 'error': 'payment is not completed'}
-    client = _client()
-    res = client.cart_get(m.user_id)
-    if not res['success']:
-        return {'success': False, 'error': res['error'], 'needs_attention': True,
-                'payment_id': payment_id}
-    view = cart_view(res['data'])
+    from integrations.ap2.ap2_mandate import ALREADY_SETTLING
+    store = _mandates()
+    # Claimed before the mandate is used up: the callback and a retry of it
+    # never both consume it and then both leave the order to the other.
+    claimed, why = store.begin_settle(m.mandate_id)
+    if not claimed and why == ALREADY_SETTLING:
+        return {'success': False, 'in_progress': True,
+                'error': 'this checkout is already being completed',
+                'payment_id': m.payment_id, 'mandate_id': m.mandate_id}
+    if not claimed:
+        order_on_hold(payment, f'mandate {m.mandate_id} cannot be ordered: {why}')
+        return {'success': False, 'needs_attention': True,
+                'error': f'the payment went through, but {why}; a person has to sort it out',
+                'payment_id': m.payment_id, 'mandate_id': m.mandate_id}
     try:
-        same = hmac.compare_digest(canonical_cart_hash(mandate_cart(view)),
-                                   m.cart_hash)
-    except MandateError:
-        same = False
-    if not same:
-        logger.error(f'commerce: PhonePe payment {payment_id} completed but the '
-                     f'cart changed since approval; order NOT placed')
-        push_fragment(m.user_id, {
-            'type': 'notification', 'severity': 'warning',
-            'title': 'Payment received, order on hold',
-            'message': 'Your cart changed after you approved it, so we have not '
-                       'placed the order. We will sort it out with you.'})
-        return {'success': False, 'error': 'cart changed since approval',
-                'needs_attention': True, 'payment_id': payment_id}
-    return _place_order(client, m.user_id, m, view, payment)
+        failed = _consume_paid(m.user_id, m, payment)
+        if failed:
+            return failed
+        if m.cart_ref is None:
+            # Approved under an older version, which recorded no cart: no
+            # order can be signed for it, and none was placed (this is its
+            # order step).
+            order_on_hold(payment, f'mandate {m.mandate_id} was approved under an '
+                                   f'older version, which named no cart')
+            return {'success': False, 'needs_attention': True,
+                    'payment_id': m.payment_id, 'mandate_id': m.mandate_id,
+                    'error': ('the payment went through for a checkout approved under '
+                              'an older version, which named no cart; a person has to '
+                              'place the order or refund it')}
+        # Every way this fails holds the payment and tells both parties at
+        # the failure site (retry_order, _submit_order), which alone knows
+        # whether an order call left this node.
+        return retry_order(store.get(m.mandate_id) or m, claimed=True)
+    finally:
+        store.end_settle(m.mandate_id)
 
 
 def commerce_order_status(
@@ -578,9 +1276,12 @@ def commerce_order_status(
         if res.get('status') == 404:
             return _out({'success': True, 'orders': []})
         return _fail(res['error'])
+    from integrations.commerce.mcgroce_client import order_number_of
     rows = [o for o in (res['data'] or []) if isinstance(o, dict)]
     rows.sort(key=lambda o: o.get('id') or 0, reverse=True)
-    orders = [{'order_id': o.get('orderNumber') or o.get('id'),
+    # The one reader of what names a McGroce order (the AP2 answer's and
+    # the listing's rows alike), so no second place decides it.
+    orders = [{'order_id': order_number_of(o),
                'status': o.get('status'), 'total': _amount(o.get('total'))}
               for o in rows[:10]]
     if orders:
@@ -718,9 +1419,10 @@ _TOOL_SPECS = (
      'Draft a new McGroce product for the merchant to approve'),
 )
 
-# The MCP bridge (integrations/mcp/mcp_http_bridge.py _load_tools) consumes
-# this list.  Its functions take user_id explicitly: an MCP caller is the
-# node's own token holder, and checkout still needs the shopper's approval.
+# Every commerce tool, by name.  Its functions take user_id explicitly, so it
+# is never handed to a caller who is not that shopper: the MCP bridge
+# (integrations/mcp/mcp_http_bridge.py _load_tools) leaves it out, because
+# an MCP caller is the node's one token and could name any shopper.
 COMMERCE_TOOLS: List[Dict[str, Any]] = [
     {'name': name, 'func': fn, 'description': desc, 'tags': ['commerce']}
     for name, fn, desc in _TOOL_SPECS
