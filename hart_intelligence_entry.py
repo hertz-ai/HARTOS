@@ -116,32 +116,14 @@ del _md_safe
 # not Nunba: it must run before HARTOS's own
 # `from langchain_classic.llms import OpenAI` (next stmt below) AND
 # before any consumer's deferred bootstrap touches transformers.
-try:
-    import transformers as _tf_safe
-    try:
-        # transformers 4.x: the fast tokenizer has its own module.
-        from transformers.models.gpt2.tokenization_gpt2_fast import (
-            GPT2TokenizerFast as _GPT2TokenizerFast_direct,
-        )
-    except ImportError:
-        # transformers 5.x dropped the *_fast modules, and its lazy lookup
-        # answers GPT2TokenizerFast with GPT2Tokenizer (measured on 5.1.0),
-        # so bind that same class.  Without this the installed Nunba logged
-        # "defang skipped" with a ModuleNotFoundError on every boot.
-        from transformers.models.gpt2.tokenization_gpt2 import (
-            GPT2Tokenizer as _GPT2TokenizerFast_direct,
-        )
-    if not hasattr(_tf_safe, '__dict__') or \
-            'GPT2TokenizerFast' not in _tf_safe.__dict__:
-        _tf_safe.__dict__['GPT2TokenizerFast'] = _GPT2TokenizerFast_direct
-    del _tf_safe, _GPT2TokenizerFast_direct
-except Exception:
-    # If transformers isn't installed or moved the symbol, fall through.
-    # Worker threads will hit the lazy path and pay the recursion once;
-    # bad but not fatal (and surfaced via the hartos_init_error.log).
-    import logging as _early_logging
-    _early_logging.getLogger(__name__).warning(
-        "transformers GPT2 tokenizer defang skipped (symbol absent/moved)", exc_info=True)
+#
+# The bind itself lives in ONE place, core/_transformers_lazy_guard.py, which
+# also runs first on every HARTOS import (core/__init__.py); this call is
+# idempotent.  It used to be a second inline copy here, and the copy that ran
+# first had no transformers-5 branch while this one fell back on any
+# ImportError.
+from core._transformers_lazy_guard import bind_gpt2_tokenizer_fast
+bind_gpt2_tokenizer_fast()
 
 # ── Defang transformers `_LazyModule.__getattr__` re-entry recursion ──
 #

@@ -20,8 +20,10 @@ Fix: extract the guard to a tiny standalone module imported by both
 ``core/__init__.py`` and ``integrations/__init__.py``.  Every HARTOS
 entry path now triggers the guard before any transformers attribute
 access.  Patch is idempotent (``_hartos_reentry_guarded`` sentinel) so
-re-import during a single interpreter session is a no-op; HIE's
-original install block still runs unchanged as a third defense.
+re-import during a single interpreter session is a no-op.  HIE calls this
+module's ``bind_gpt2_tokenizer_fast`` rather than carrying its own copy of the
+GPT2 pre-bind (three copies of one workaround drifted: the one that ran first
+had no transformers-5 branch).
 
 Two patches:
 
@@ -44,22 +46,67 @@ follow-up tracking the upstream HuggingFace fix.
 """
 from __future__ import annotations
 
+import logging
 
-def _install_gpt2_direct_bind() -> None:
+_GPT2_FAST_MODULE = 'transformers.models.gpt2.tokenization_gpt2_fast'
+
+
+def _gpt2_tokenizer_fast_class():
+    """The class `from transformers import GPT2TokenizerFast` answers with.
+
+    transformers 4.x: the fast tokenizer has its own module.  transformers 5.x
+    dropped the ``*_fast`` modules, and its lazy lookup answers
+    ``GPT2TokenizerFast`` with ``GPT2Tokenizer`` (measured on 5.1.0), so that
+    is the class to bind there.
+
+    The slow class is the answer ONLY when the ``_fast`` module itself does
+    not exist.  On 4.x that module imports ``tokenizers`` at its top, so a
+    missing or wrong-ABI ``tokenizers`` fails the same ``import`` statement
+    with a different ``ModuleNotFoundError.name`` (or a plain ImportError):
+    that is a broken install, and papering over it with the slow tokenizer
+    bound under the fast name would hide it.  It propagates to the caller.
+    """
+    try:
+        from transformers.models.gpt2.tokenization_gpt2_fast import (
+            GPT2TokenizerFast,
+        )
+        return GPT2TokenizerFast
+    except ModuleNotFoundError as exc:
+        if exc.name != _GPT2_FAST_MODULE:
+            raise
+    from transformers.models.gpt2.tokenization_gpt2 import GPT2Tokenizer
+    return GPT2Tokenizer
+
+
+def bind_gpt2_tokenizer_fast() -> None:
     """Resolve `transformers.GPT2TokenizerFast` eagerly so the very first
-    consumer lookup hits a populated `__dict__` instead of the lazy graph."""
+    consumer lookup hits a populated `__dict__` instead of the lazy graph.
+
+    THE one implementation of this pre-bind: this module runs first on every
+    HARTOS import, and ``hart_intelligence_entry`` calls the same function.
+    Idempotent, and an existing binding is left alone.  transformers not being
+    installed is not a fault (nothing to bind); any other failure is logged
+    with its traceback, never swallowed.
+    """
     try:
         import transformers as _tf
-        from transformers.models.gpt2.tokenization_gpt2_fast import (
-            GPT2TokenizerFast as _gpt2_fast,
-        )
+    except ImportError as exc:
+        if exc.name == 'transformers':
+            return
+        logging.getLogger(__name__).warning(
+            "transformers GPT2 tokenizer defang skipped (transformers failed "
+            "to import)", exc_info=True)
+        return
+    try:
         if 'GPT2TokenizerFast' not in _tf.__dict__:
-            _tf.__dict__['GPT2TokenizerFast'] = _gpt2_fast
+            _tf.__dict__['GPT2TokenizerFast'] = _gpt2_tokenizer_fast_class()
     except Exception:
-        # transformers not installed, version moved the submodule, or the
-        # bundled hevolvearmor strip removed it.  Recursion guard below
-        # still applies; this direct-bind is a one-symbol fast-path.
-        pass
+        # The recursion guard below still applies, and worker threads pay the
+        # lazy path once; but say so, with the cause (a broken `tokenizers`
+        # install looks exactly like this).
+        logging.getLogger(__name__).warning(
+            "transformers GPT2 tokenizer defang skipped (symbol absent/moved)",
+            exc_info=True)
 
 
 def _install_lazy_module_reentry_guard() -> None:
@@ -119,5 +166,5 @@ def _install_lazy_module_reentry_guard() -> None:
 
 # Run on import — every entry path that triggers this module gets both
 # guards before any transformers attribute access can fire.
-_install_gpt2_direct_bind()
+bind_gpt2_tokenizer_fast()
 _install_lazy_module_reentry_guard()

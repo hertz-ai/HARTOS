@@ -128,7 +128,7 @@ class TestGpt2DirectBind:
 
         tf = _inject_fake_transformers(monkeypatch, gpt2_cls=FakeGPT2TokenizerFast)
         assert "GPT2TokenizerFast" not in tf.__dict__
-        guard._install_gpt2_direct_bind()
+        guard.bind_gpt2_tokenizer_fast()
         assert tf.__dict__.get("GPT2TokenizerFast") is FakeGPT2TokenizerFast
 
     def test_does_not_clobber_existing_binding(self, monkeypatch):
@@ -140,10 +140,10 @@ class TestGpt2DirectBind:
 
         tf = _inject_fake_transformers(monkeypatch, gpt2_cls=Other)
         tf.__dict__["GPT2TokenizerFast"] = Real  # already resolved
-        guard._install_gpt2_direct_bind()
+        guard.bind_gpt2_tokenizer_fast()
         assert tf.__dict__["GPT2TokenizerFast"] is Real, "must not overwrite"
 
     def test_absent_gpt2_submodule_is_a_noop(self, monkeypatch):
         # transformers present, but the gpt2 tokenizer submodule is gone.
         _inject_fake_transformers(monkeypatch)  # no gpt2 module injected
-        guard._install_gpt2_direct_bind()  # must not raise
+        guard.bind_gpt2_tokenizer_fast()  # must not raise (logs a warning)
