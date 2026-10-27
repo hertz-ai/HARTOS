@@ -185,73 +185,80 @@ def test_try_another_is_also_bounded(monkeypatch):
         "'try another' blocked %.2fs" % elapsed
 
 
-# ── a one-shot caller is bounded the same way ────────────────────────────────
+# ── the steps Nunba's ceremony sends reach the prewarm ───────────────────────
 #
-# Nunba's ceremony does not drive the session: it POSTs /api/hart/generate once,
-# and that route called generate_hart_name(use_llm=True) with nothing bounding
-# it.  Measured 2026-10-22 on a CPU-only desktop: 270s on "Your secret name
-# is..." while an agent plan held the one llama-server slot, and 46s with the
-# slot idle (30s generate timeout + 15s validate) -- both ending in a curated
-# name anyway.
+# Nunba's ceremony drives this session through /api/hart/advance.  It used to
+# send only select_language and the two answers, never the bare steps for the
+# greeting and the two acknowledgements, so the greeting branch swallowed the
+# passion answer, the escape answer landed in 'passion', and _start_prewarm
+# never ran.  These tests drive a REAL session with the ceremony's steps.
 
-def _named(name):
-    return {'name': name, 'candidates': [name], 'dimensions': {},
-            'emoji_combo': '', 'element': '', 'spirit': ''}
+CEREMONY_STEPS_TO_ESCAPE = [
+    ('select_language', {'language': 'en', 'locale': 'en_US'}),
+    (None, None),                                     # greeting -> passion
+    ('answer', {'key': 'building_coding'}),           # passion -> ack_passion
+    (None, None),                                     # ack_passion -> escape
+    ('answer', {'key': 'nature_open'}),               # escape -> ack_escape
+]
 
 
-def test_within_does_not_wait_for_a_slow_model(monkeypatch):
+def _named(name, *others):
+    return {'name': name, 'candidates': [name, *others], 'dimensions': {},
+            'emoji_combo': 'x', 'element': '', 'spirit': '',
+            'hart_tag': '@' + name}
+
+
+def test_the_ceremony_steps_start_the_prewarm_with_both_answers(monkeypatch):
+    seen = []
+
+    def _gen(*a, **k):
+        seen.append(dict(k))
+        return _named('modelname', 'backup')
+
+    monkeypatch.setattr(ho, 'generate_hart_name', _gen)
+    s = ho.HARTOnboardingSession('ceremony-key')
+    for action, data in CEREMONY_STEPS_TO_ESCAPE:
+        s.advance(action=action, data=data)
+
+    assert s.phase == 'ack_escape'
+    assert s._prewarm_thread is not None, "the escape answer must start it"
+    s._prewarm_thread.join(2)
+    model_calls = [k for k in seen if k.get('use_llm')]
+    assert model_calls and model_calls[0]['passion_key'] == 'building_coding'
+    assert model_calls[0]['escape_key'] == 'nature_open'
+
+
+def test_the_reveal_answers_with_the_name_and_its_backups(monkeypatch):
+    monkeypatch.setattr(ho, 'generate_hart_name',
+                        lambda *a, **k: _named('modelname', 'backup1', 'backup2'))
+    s = ho.HARTOnboardingSession('ceremony-key')
+    for action, data in CEREMONY_STEPS_TO_ESCAPE:
+        s.advance(action=action, data=data)
+    s.advance()                                       # ack_escape -> pre_reveal
+    out = s.advance()                                 # pre_reveal -> reveal
+
+    assert out['phase'] == 'reveal'
+    assert out['hart_name'] == 'modelname'
+    assert out['hart_tag'] == '@modelname'
+    assert out['candidates'] == ['backup1', 'backup2'],         "the client seals through /api/hart/seal and needs the backups for a 409"
+
+
+def test_one_model_call_per_session_however_often_it_is_asked(monkeypatch):
+    """A second prewarm while one is cooking starts no second model thread,
+    so a slow model holds one llama-server slot per ceremony, not one per call."""
+    release = threading.Event()
+    calls = []
+
     def _slow(*a, **k):
-        if k.get('use_llm', True):
-            time.sleep(8)
-            return _named('modelname')
-        return _named('curated')
+        calls.append(1)
+        release.wait(5)
+        return _named('modelname')
 
     monkeypatch.setattr(ho, 'generate_hart_name', _slow)
-
-    t0 = time.monotonic()
-    out = ho.generate_hart_name_within(
-        wait_s=0.5, language='en', passion_key='building_coding',
-        escape_key='nature_open')
-    elapsed = time.monotonic() - t0
-
-    assert elapsed < 0.5 + 2.0, "blocked %.2fs on a slow model" % elapsed
-    assert out['name'] == 'curated'
-
-
-def test_within_uses_the_model_name_when_it_lands(monkeypatch):
-    def _quick(*a, **k):
-        if k.get('use_llm', True):
-            time.sleep(0.1)
-            return _named('modelname')
-        return _named('curated')
-
-    monkeypatch.setattr(ho, 'generate_hart_name', _quick)
-
-    out = ho.generate_hart_name_within(
-        wait_s=3.0, language='en', passion_key='building_coding',
-        escape_key='nature_open')
-    assert out['name'] == 'modelname'
-
-
-def test_within_survives_a_model_path_that_raises(monkeypatch):
-    def _boom_then_curated(*a, **k):
-        if k.get('use_llm', True):
-            raise RuntimeError('llama-server went away')
-        return _named('curated')
-
-    monkeypatch.setattr(ho, 'generate_hart_name', _boom_then_curated)
-
-    out = ho.generate_hart_name_within(
-        wait_s=3.0, language='en', passion_key='building_coding',
-        escape_key='nature_open')
-    assert out['name'] == 'curated'
-
-
-def test_within_default_wait_is_the_script_cover_plus_the_reveal_tail():
-    """One budget, derived -- not a second literal that drifts from the
-    session's REVEAL_WAIT_S."""
-    import inspect
-    assert ho.NAME_WAIT_S == \
-        ho.NAME_COVER_S + ho.HARTOnboardingSession.REVEAL_WAIT_S
-    assert inspect.signature(ho.generate_hart_name_within) \
-        .parameters['wait_s'].default == ho.NAME_WAIT_S
+    s = _session()
+    s._start_prewarm()
+    s._start_prewarm()
+    time.sleep(0.2)
+    release.set()
+    s._prewarm_thread.join(2)
+    assert len(calls) == 1

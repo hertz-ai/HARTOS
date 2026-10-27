@@ -1901,6 +1901,8 @@ class HARTOnboardingSession:
 
         if result is None:
             # Nothing landed in time. Hand over a curated name NOW.
+            logger.info("HART reveal: no model name within the %.1fs grace "
+                        "period, revealing a curated name", self.REVEAL_WAIT_S)
             result = generate_hart_name(
                 language=self.language,
                 passion_key=self.passion_key or 'reading_learning',
@@ -1931,6 +1933,10 @@ class HARTOnboardingSession:
             element=result.get('element', ''),
             spirit=result.get('spirit', ''),
             emoji_combo=result['emoji_combo'],
+            # The other candidates, so a client that seals through
+            # /api/hart/seal can try the next one when a name is taken (409).
+            candidates=[c for c in result.get('candidates', [])
+                        if c != result['name']],
             animation_hint='name_reveal',
             can_try_another=not alternative,  # only one retry allowed
         )
@@ -1975,49 +1981,6 @@ class HARTOnboardingSession:
         }
         resp.update(kwargs)
         return resp
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# ONE-SHOT NAME — bounded the way the session reveal is
-# ═══════════════════════════════════════════════════════════════════════
-
-# A one-shot caller (Nunba's ceremony POSTs /api/hart/generate once instead of
-# driving the session) starts its request when the escape answer lands, then
-# plays the same ~8.5s of acknowledgement and pre-reveal the session prewarm
-# hides behind.  The model gets that cover plus the session's reveal tail.
-NAME_COVER_S = 8.5
-NAME_WAIT_S = NAME_COVER_S + HARTOnboardingSession.REVEAL_WAIT_S
-
-
-def generate_hart_name_within(wait_s: float = NAME_WAIT_S, **kwargs) -> Dict:
-    """generate_hart_name, giving the model at most `wait_s` seconds.
-
-    The model path runs on a daemon thread; if it has not answered in time the
-    instant curated path (use_llm=False) answers instead, exactly as
-    HARTOnboardingSession._do_reveal does.  Measured 2026-10-22 on a CPU-only
-    desktop through /api/hart/generate, which called the unbounded model path:
-    270s on "Your secret name is..." while an agent plan held the one
-    llama-server slot, and 46s with the slot idle (30s generate timeout + 15s
-    validate) -- both ending in a curated name anyway.
-
-    `kwargs` are generate_hart_name's arguments other than use_llm.
-    """
-    import threading
-    landed = {}
-
-    def _work():
-        try:
-            landed['result'] = generate_hart_name(use_llm=True, **kwargs)
-        except Exception:
-            logger.debug("HART model name generation failed", exc_info=True)
-
-    t = threading.Thread(target=_work, daemon=True, name='hart-name-model')
-    t.start()
-    t.join(wait_s)
-    result = landed.get('result')
-    if result is not None:
-        return result
-    return generate_hart_name(use_llm=False, **kwargs)
 
 
 # ═══════════════════════════════════════════════════════════════════════
