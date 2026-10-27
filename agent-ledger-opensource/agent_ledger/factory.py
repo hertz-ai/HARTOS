@@ -260,6 +260,12 @@ def get_or_create_ledger(
     return ledger
 
 
+def cached_ledgers() -> list:
+    """The ledgers this process holds open through get_or_create_ledger."""
+    with _ledger_cache_lock:
+        return list(_ledger_cache.values())
+
+
 def clear_ledger_cache():
     """Clear the global ledger cache."""
     global _ledger_cache

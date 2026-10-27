@@ -713,16 +713,208 @@ class WorldModelBridge:
             logger.debug("[WorldModelBridge] chat-learning consent check failed "
                          "(user=%s): %s", user_id, e)
             return
-        reading = {
-            'sensor_id': f'chat_{user_id}',
-            'sensor_type': 'text',
-            'data': {'text': text,
-                     'stream_source': _utterance_source(user_type)},
-        }
+        reading = self._text_reading(f'chat_{user_id}', text,
+                                     _utterance_source(user_type))
         try:
             self._flush_executor.submit(self.ingest_sensor_batch, [reading])
         except Exception as e:
             logger.debug("[WorldModelBridge] chat-learning submit skipped: %s", e)
+
+    @staticmethod
+    def _text_reading(sensor_id: str, text: str, stream_source: str) -> dict:
+        """The one shape of a 'text' sensor reading, as ingest_sensor_batch's
+        text branch reads it."""
+        return {'sensor_id': sensor_id, 'sensor_type': 'text',
+                'data': {'text': text, 'stream_source': stream_source}}
+
+    @staticmethod
+    def _screened_text(text: str) -> Optional[str]:
+        """Text bound for the world model, through the two gates
+        submit_correction applies to what it sends: the constitutional filter
+        (None when it refuses) and the secret redactor."""
+        try:
+            from security.hive_guardrails import ConstitutionalFilter
+            passed, _ = ConstitutionalFilter.check_prompt(text)
+            if not passed:
+                return None
+        except ImportError:
+            logger.warning("[WorldModelBridge] ConstitutionalFilter unavailable; "
+                           "text NOT constitution-checked")
+        try:
+            from security.secret_redactor import redact_secrets
+            text, _ = redact_secrets(text)
+        except ImportError:
+            logger.warning("[WorldModelBridge] secret_redactor unavailable; "
+                           "text NOT redacted")
+        return text
+
+    @staticmethod
+    def _refused_claim(reason: str) -> dict:
+        """score_claim's answer for a claim that cannot be scored: an
+        abstention (vote 0) naming why, so the caller moves on to the next
+        claim instead of waiting on a world model that is up.  The caller
+        logs it when an experiment's reason changes."""
+        return {'vote': 0, 'refused': True, 'reason': reason}
+
+    def score_claim(self, context: str, outcome: str, timestamp: float,
+                    creator_id: str) -> Optional[dict]:
+        """The world model's vote on a claim (a thought experiment's
+        hypothesis -> expected outcome), measured by hevolveai without
+        learning it: POST /v1/world_model/score. Returns its reply ({vote,
+        confidence, error, typical_error, log_surprise, ...}); or, for a
+        claim that cannot be scored, an abstention naming why, {'vote': 0,
+        'refused': True, 'reason': why} (hevolveai's own abstentions carry
+        'reason' too): a text the constitutional filter refuses
+        ('screened'), a non-local world model without the creator's cloud
+        data consent ('no_cloud_consent'; the decide feed's rules for the
+        same texts, ingest_decided_experiment), a claim blank once cut to
+        the 2000 characters sent ('blank'), or the route's own 422 refusing
+        the claim ('http_422: <its reason>': blank text, a bad timestamp;
+        the route's 422 carries a string `detail`, FastAPI's generic
+        request-validation 422 a list, which is no refusal of the claim and
+        answers None);
+        or None when the WORLD MODEL cannot answer now (503 while a learn
+        holds the learner, any other 4xx such as 404 from a build without
+        the route or 429 from a rate limiter, 5xx, a network failure, a
+        reply that is not JSON, a 200 that is not a score, the breaker
+        open), so the caller stops
+        asking until later.  `timestamp` is the
+        experiment's own time in UTC epoch seconds, so the vote does not
+        change with the hour. reality_grounded matches how the decide feed's
+        ingest learns a claim (stream source 'thought_experiment' -> 1.0);
+        whether a thought experiment counts as reality is an open owner
+        question, and the two must change together."""
+        global _WARNED_422_CONTRACT, _WARNED_422_AT
+        screened = [self._screened_text(t) for t in (context, outcome)]
+        if any(t is None for t in screened):
+            return self._refused_claim('screened')
+        if self._is_external_target() and not self._has_cloud_consent(str(creator_id)):
+            return self._refused_claim('no_cloud_consent')
+        ctx, out = (t[:2000] for t in screened)
+        # Checked after the cut, on what is actually sent: a hypothesis of
+        # 2001 spaces and then text is blank to the world model (review of
+        # 7fa1d4aba), in-process as much as over HTTP.
+        if not ctx.strip() or not out.strip():
+            return self._refused_claim('blank')
+        if self._in_process and self._provider is not None and hasattr(
+                self._provider, 'score_claim'):
+            try:
+                reply = self._provider.score_claim(ctx, out, float(timestamp), True)
+            except Exception as e:
+                logger.debug("[WorldModelBridge] in-process score failed: %s", e)
+                return None
+            return reply if isinstance(reply, dict) and not reply.get('busy') else None
+        if self._http_disabled or self._cb_is_open():
+            return None
+        # The circuit breaker is SHARED with corrections, flushes and ingest:
+        # a slow score (the route waits for nothing, but scores a large graph
+        # for seconds) must not trip it and block them for its cooldown
+        # (review of 9ca2be81a), so a score reads the breaker, never feeds it.
+        try:
+            resp = pooled_post(
+                f'{self._api_url}/v1/world_model/score',
+                json={'context': ctx, 'outcome': out, 'timestamp': float(timestamp),
+                      'reality_grounded': True},
+                timeout=self._timeout_default,
+            )
+        except requests.RequestException as e:
+            logger.info("[WorldModelBridge] score unavailable: %s", e)
+            return None
+        if resp.status_code == 422:
+            try:
+                detail = resp.json().get('detail')
+            except (ValueError, AttributeError):
+                detail = None
+            if isinstance(detail, str):
+                return self._refused_claim(f'http_422: {detail[:200]}')
+            # A 422 that is not the route refusing a claim (FastAPI's request
+            # validation, a proxy, or no reason at all): something between
+            # here and the route rejects every request, and the world model
+            # will not vote until someone looks, so say it once, and again only
+            # after a real score came back at least _WARN_422_REARM_S after
+            # the warning (a proxy that flaps between a score and a 422 would
+            # otherwise warn every round; review of 9ef1a8bf4).  The detail
+            # is capped: FastAPI's validation detail echoes the request body.
+            if not _WARNED_422_CONTRACT:
+                _WARNED_422_CONTRACT = True
+                _WARNED_422_AT = time.monotonic()
+                logger.warning("[WorldModelBridge] /v1/world_model/score answered "
+                               "422 without a reason (detail %s): the route or "
+                               "something in front of it rejects every request; "
+                               "no claim will be scored", repr(detail)[:200])
+            return None
+        if resp.status_code != 200:
+            return None
+        try:
+            body = resp.json()
+        except ValueError:
+            logger.info("[WorldModelBridge] score reply was not JSON")
+            return None
+        if not (isinstance(body, dict) and 'vote' in body):
+            # a 200 that is not a score (a proxy's {'error': ...}): cannot
+            # answer now, never a score, never a re-arm
+            return None
+        if _WARNED_422_CONTRACT and (
+                time.monotonic() - _WARNED_422_AT >= _WARN_422_REARM_S):
+            _WARNED_422_CONTRACT = False
+            logger.info("[WorldModelBridge] /v1/world_model/score answers again")
+        return body
+
+    def ingest_decided_experiment(self, experiment_id: str, creator_id: str,
+                                  claim: str, decision: str, decided_at: str):
+        """A decided thought experiment, as ONE text transition the world
+        model learns: the experiment's claim, then what was decided.
+
+        Both readings share a session no other reading uses (named for this
+        decision), and the sensor-ingest endpoint pairs consecutive readings
+        of a session, so what is learned is keyed on this experiment's own
+        words.  Not submit_correction: /v1/corrections keys a correction on
+        the server's LAST sensor encoding (hevolveai receive_correction),
+        i.e. whatever chat turn it saw last, so a decision fed there would
+        teach an unrelated state -> the decision text.
+
+        Both texts pass the constitutional filter and the secret redactor
+        (_screened_text) before anything leaves; a refused text sends
+        nothing.  A cloud world model gets it only with the creator's cloud
+        data consent (submit_correction's rule); a local one always.  Runs on
+        the flush executor, never on the caller's thread, like the utterance
+        feed above.  Returns the Future (its result is how many readings the
+        world model accepted), or None when nothing was queued.
+        """
+        if not claim or not decision:
+            return None
+        screened = [self._screened_text(t) for t in (claim, decision)]
+        if any(t is None for t in screened):
+            logger.info("[WorldModelBridge] decided experiment %s not sent: "
+                        "the constitutional filter refused its %s",
+                        experiment_id, ' and '.join(
+                            name for name, t in zip(('claim', 'decision'),
+                                                    screened) if t is None))
+            return None
+        if self._is_external_target() and not self._has_cloud_consent(
+                str(creator_id)):
+            logger.info("[WorldModelBridge] decided experiment %s not sent: "
+                        "the creator has no cloud data consent", experiment_id)
+            return None
+        sid = f'thought_experiment_{experiment_id}_{decided_at}'
+        readings = [self._text_reading(sid, t, 'thought_experiment')
+                    for t in screened]
+
+        def _feed() -> int:
+            accepted = self.ingest_sensor_batch(readings)
+            if accepted < len(readings):
+                logger.warning(
+                    "[WorldModelBridge] decided experiment %s: %d of %d "
+                    "readings reached the world model", experiment_id,
+                    accepted, len(readings))
+            return accepted
+
+        try:
+            return self._flush_executor.submit(_feed)
+        except Exception as e:
+            logger.warning("[WorldModelBridge] decided experiment %s not "
+                           "queued: %s", experiment_id, e)
+            return None
 
     @staticmethod
     def _validated_training_signal(verification: dict) -> bool:
@@ -2821,6 +3013,13 @@ def _accepts_kwarg(fn, name: str) -> bool:
         return False
     return name in params or any(
         p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+# score_claim's warning for a 422 that carries no reason: said once, re-armed
+# only by a real score at least _WARN_422_REARM_S after it.
+_WARNED_422_CONTRACT = False
+_WARNED_422_AT = 0.0
+_WARN_422_REARM_S = 600.0
 
 
 def _unit_confidence(value) -> float:

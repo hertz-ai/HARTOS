@@ -16,9 +16,15 @@ was never marked terminal.  They poison three things:
 
 REUSES (no parallel paths)
 ==========================
-- ``_iter_ledgers(...)`` from ``integrations/agent_engine/api.py:265``
-  (the canonical "walk every SmartLedger on disk" generator the
-  /api/agent-engine/ledger/tasks endpoint already uses).
+- ``_iter_ledgers(in_progress_only=True)`` from
+  ``integrations/agent_engine/api.py`` (the canonical SmartLedger walker
+  the /api/agent-engine/ledger/tasks endpoint already uses), limited to
+  the ledgers holding a task in progress: only those can hold a zombie.
+  Measured 2026-10-20 on the desktop, the whole-folder walk built all
+  2,489 ledgers (14,294 tasks) in 86 s on the first tick after boot and
+  found none in progress; the limited walk opens only the ledgers that
+  ``SmartLedger.keys_in_progress`` names, or that this process holds
+  open with one in memory.
 - ``get_audit_log().log_event(...)`` from
   ``security/immutable_audit_log.py:95`` (the canonical hash-chained
   audit log; reuses existing event-type vocabulary plus one new value
@@ -130,11 +136,14 @@ def _task_age(task: Any) -> Optional[timedelta]:
 
 
 def reap_once(dry_run: bool = False) -> Dict[str, Any]:
-    """Walk every SmartLedger, fail old IN_PROGRESS tasks.
+    """Walk the SmartLedgers holding a task in progress, fail old
+    IN_PROGRESS tasks.
 
     Returns a summary dict — safe to call from a scheduler tick or a
     CLI probe.  Never raises; all per-task errors are caught and
-    counted in ``errors``.
+    counted in ``errors``.  ``examined`` counts the tasks of the ledgers
+    walked, so it is the tasks of ledgers with work in progress, not every
+    task on disk.
 
     ``dry_run=True`` leaves task state untouched but still produces the
     summary, for safe "what would be reaped" inspection from a probe.
@@ -149,11 +158,16 @@ def reap_once(dry_run: bool = False) -> Dict[str, Any]:
     }
 
     try:
+        import agent_ledger
         from agent_ledger import TaskStatus
         from .api import _iter_ledgers
     except ImportError as e:
         logger.debug("zombie_reaper: dependency unavailable (%s) — skipping tick", e)
         return summary
+    # The state the ledger's in-progress index tracks (one definition, in
+    # agent_ledger.core); an agent_ledger from before the index has none, and
+    # its walk is the whole folder anyway.
+    reapable = getattr(agent_ledger, 'WORK_IN_PROGRESS', TaskStatus.IN_PROGRESS)
 
     audit = None
     try:
@@ -165,7 +179,7 @@ def reap_once(dry_run: bool = False) -> Dict[str, Any]:
     threshold = _max_age()
 
     try:
-        ledgers = list(_iter_ledgers())
+        ledgers = list(_iter_ledgers(in_progress_only=True))
     except Exception:
         logger.exception("zombie_reaper: _iter_ledgers failed — aborting tick")
         summary['errors'] += 1
@@ -184,7 +198,7 @@ def reap_once(dry_run: bool = False) -> Dict[str, Any]:
         for task in tasks:
             summary['examined'] += 1
             try:
-                if getattr(task, 'status', None) != TaskStatus.IN_PROGRESS:
+                if getattr(task, 'status', None) != reapable:
                     continue
                 age = _task_age(task)
                 if age is None or age < threshold:

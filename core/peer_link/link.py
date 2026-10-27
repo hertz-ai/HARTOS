@@ -200,6 +200,42 @@ def set_peer_admission_ask(fn: Optional[Callable[[str, str], bool]]) -> None:
     global _PEER_ADMISSION_ASK
     _PEER_ADMISSION_ASK = fn
 
+
+#: Whether this node's device services are installed: the verifier above,
+#: the mobile adapter (its 'mobile_paths') and the file channel -- what a
+#: phone's calls and clips ride on.  A phone keeps the hello_ack's
+#: capabilities for its whole session (PeerLinkManager.desktopApiLink reads
+#: mobile_paths from them and never asks again), so a HELLO answered before
+#: those services exist opens a link that can serve nothing.  Measured
+#: 2026-10-19 13:11:57 on the installed desktop: the ack went out 24 s before
+#: hartos_bootstrap step 5c advertised mobile_paths, and every Reel Studio
+#: turn after it was refused on the phone ("not served (not_answered)")
+#: until the link was remade.  Set (ready) unless a boot says otherwise:
+#: hartos_bootstrap clears it before its device steps and sets it after
+#: them, failing or not, and a device HELLO in between is answered
+#: HELLO_REFUSED 'not_ready', which the phone re-dials on
+#: (PeerLinkClient.refused -> scheduleReconnect).  A node HELLO is untouched.
+_DEVICE_SERVICES_READY = threading.Event()
+_DEVICE_SERVICES_READY.set()
+#: The refusal a phone hears while the device services are installing.
+NOT_READY = 'not_ready'
+
+
+def device_services_pending() -> None:
+    """The device services are being installed: a device HELLO is refused
+    NOT_READY until device_services_ready()."""
+    _DEVICE_SERVICES_READY.clear()
+
+
+def device_services_ready() -> None:
+    """The device services are installed (or their install is over): device
+    HELLOs are answered again."""
+    _DEVICE_SERVICES_READY.set()
+
+
+def device_services_are_ready() -> bool:
+    return _DEVICE_SERVICES_READY.is_set()
+
 # Key rotation interval (seconds)
 KEY_ROTATION_INTERVAL = 3600
 
@@ -896,6 +932,14 @@ class PeerLink:
             if not device_token:
                 logger.warning("Device HELLO refused: its sealed token does not open here")
                 return self._refuse_device(SEAL_NOT_OPENED, peer_sig)
+        if device_token and not _DEVICE_SERVICES_READY.is_set():
+            # Answered now, this HELLO would get capabilities that name no
+            # mobile_paths, and the phone keeps them for the session
+            # (_DEVICE_SERVICES_READY above).  Refused with a reason, the
+            # phone re-dials in seconds and meets the installed services.
+            logger.info("Device HELLO refused: this node's device services are "
+                        "still installing (not_ready); the phone re-dials")
+            return self._refuse_device(NOT_READY, peer_sig)
         if device_token:
             refusal = self._device_refusal(peer_ed25519, peer_sig, str(device_token))
             if refusal:

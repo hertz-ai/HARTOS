@@ -63,6 +63,7 @@ rather than half a gigabyte; the geometry tests measure the file at the real
 """
 import contextlib
 import os
+import socket
 import sys
 import threading
 import time
@@ -471,6 +472,66 @@ def test_a_server_already_up_spawns_nothing_and_asks_nothing(box):
     assert box.asked == [] and box.port.spawned == [] and box.clock.sleeps == 0
 
 
+# ── a port something already listens on: no second server ──────────────
+
+def _socket_table_readable() -> bool:
+    """Whether this interpreter can read the OS socket table at all: psutil
+    installed, and allowed to list it (macOS needs root)."""
+    try:
+        import psutil
+        psutil.net_connections(kind='inet')
+        return True
+    except Exception:
+        return False
+
+
+def test_a_port_already_listened_on_gets_no_second_server(box):
+    """Task #936, measured 2026-10-21: five llama-servers LISTENING on
+    127.0.0.1:8081 at once -- the desktop app's own, and four 0.8B caption
+    servers this launch spawned from test processes.  The live server did not
+    answer their /health (the tests' network seal refused it), so
+    _is_serving() said no, nobody was starting it, and on Windows a second
+    llama-server binds and listens beside the first (both set SO_REUSEADDR).
+    Here a real socket listens the way llama-server's does and answers no
+    HTTP: the launch spawns nothing and waits for whatever holds the port,
+    the 30 s it waits for a server of its own."""
+    if not _socket_table_readable():
+        pytest.skip('this interpreter cannot read the socket table '
+                    '(no psutil, or macOS without root)')
+    _files_in(box.models)
+    held = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    held.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    held.bind(('127.0.0.1', 0))
+    held.listen(1)
+
+    def no_http(url, timeout=None, **kw):
+        raise requests.ConnectionError('refused')
+    box.port.health = no_http
+    try:
+        ok, _ = _ensure(box, lvb.Qwen08BBackend(port=held.getsockname()[1]))
+    finally:
+        held.close()
+    assert box.port.spawned == [], (
+        'a second llama-server was spawned on a port something already listens on')
+    assert ok is False and box.clock.t <= BOUND_S
+
+
+def test_a_socket_table_that_cannot_be_read_keeps_the_launch(box):
+    """No psutil, or psutil refused the table (AccessDenied on macOS without
+    root): whether the port is held cannot be told, and the launch goes on as
+    it did before it asked -- spawning nothing would end captions, page reads
+    and a reel's keyframe ratings on every such node."""
+    import core.resource_governor as rg
+
+    def unreadable(ports):
+        raise RuntimeError('the socket table cannot be read')
+    box.mp.setattr(rg, '_listen_rows', unreadable, raising=False)
+    _files_in(box.models)
+    ok, _ = _ensure(box)
+    assert len(box.port.spawned) == 1, 'an unreadable socket table stopped the launch'
+    assert ok is True
+
+
 # ── no Nunba: the standalone launch, with the catalog's files ─────────────
 
 @pytest.mark.parametrize('mmproj', [
@@ -734,6 +795,91 @@ def test_a_caller_that_comes_while_a_start_is_under_way_waits_for_it(box):
     assert box.asked == ['vlm_caption.requested']
 
 
+def test_a_caller_that_comes_during_a_cooldown_probe_is_not_told_it_waits(box):
+    """Review of 1db4503c3, probed (told == [1]): an earlier start failed and
+    its cooldown holds.  VisionService's description loop asks for the 0.8B
+    and holds the start only to ask /health once, as the cooldown says; a
+    reel that comes in that moment was told it waited -- her chat said the
+    vision model was being made ready -- though nothing was being started.
+    It still waits for that caller and takes the same answer, and it is not
+    told."""
+    _files_in(box.models)
+    _callers_on_the_test_port(box)
+    _nunba_in_this_process(box, start_s=None)       # its server never comes up
+    with _the_box(box):
+        camera = lvb.get_vision_backend()
+        assert camera.ensure_running() is False     # a failed start: the cooldown
+    main = threading.get_ident()
+    on_main, reel_probed, told, reel = [], threading.Event(), [], {}
+
+    def reel_asks():
+        reel['ok'] = lvb.get_vision_backend(moments.REEL_VLM_DEFAULT).ensure_running(
+            on_wait=lambda: told.append(1))
+
+    def health(url, timeout=None, **kw):
+        if threading.get_ident() != main:
+            reel_probed.set()
+        else:
+            on_main.append(url)
+            if len(on_main) == 2:       # the cooldown's probe: the camera holds the start
+                reel['thread'] = threading.Thread(target=reel_asks, name='reel', daemon=True)
+                reel['thread'].start()
+                reel_probed.wait(10)
+                REAL_SLEEP(0.5)         # the reel goes on to the start and finds it held
+        return _Port.health(box.port, url, timeout, **kw)
+    box.port.health = health
+    with _the_box(box):
+        assert camera.ensure_running() is False
+        reel['thread'].join(10)
+    assert not reel['thread'].is_alive()
+    assert reel.get('ok') is False
+    assert told == [], 'the reel was told the vision model was being made ready; nothing was'
+    assert box.asked == [] and box.port.spawned == []
+
+
+def test_a_caller_that_comes_before_the_start_begins_is_told_when_it_does(box):
+    """The start is held but not begun: its holder is first stopping the
+    server it spawned last time, still not serving after a whole cooldown.
+    A reel that comes in that moment waits for that start, is told once that
+    the vision model is being made ready, and takes the start's answer.  A
+    reel told only when it finds a start already begun would wait here with
+    nothing said."""
+    _files_in(box.models)
+    _callers_on_the_test_port(box)
+    _nunba_in_this_process(box, start_s=1.0)
+    main = threading.get_ident()
+    reel_probed, told, reel = threading.Event(), [], {}
+
+    def reel_asks():
+        reel['ok'] = lvb.get_vision_backend(moments.REEL_VLM_DEFAULT).ensure_running(
+            on_wait=lambda: told.append(1))
+
+    def health(url, timeout=None, **kw):
+        if threading.get_ident() != main:
+            reel_probed.set()
+        return _Port.health(box.port, url, timeout, **kw)
+    box.port.health = health
+
+    def stopping(timeout=None):
+        """The wedged server's wait inside stop(): the start is held, not begun."""
+        reel['thread'] = threading.Thread(target=reel_asks, name='reel', daemon=True)
+        reel['thread'].start()
+        reel_probed.wait(10)
+        REAL_SLEEP(0.5)             # the reel finds the start held and waits
+        return 0
+    camera = lvb.get_vision_backend(moments.REEL_VLM_DEFAULT)
+    camera._launch_attempted = True
+    camera._launch_attempted_at = time.time() - camera.LAUNCH_RETRY_S - 1
+    camera._server_proc = MagicMock(pid=4141, wait=MagicMock(side_effect=stopping))
+    with _the_box(box):
+        assert camera.ensure_running() is True
+        reel['thread'].join(10)
+    assert not reel['thread'].is_alive()
+    assert reel.get('ok') is True
+    assert told == [1], 'the reel waited for the start without being told'
+    assert box.port.spawned == []
+
+
 def test_a_server_the_reel_started_is_not_idled_out_from_under_it(box):
     """VisionService's description loop unloads a 0.8B that HARTOS started
     once it has gone IDLE_TIMEOUT_S unused (check_idle, on the backend it
@@ -751,9 +897,15 @@ def test_a_server_the_reel_started_is_not_idled_out_from_under_it(box):
         proc = reel._server_proc
         camera.check_idle()
         assert not proc.terminate.called, 'the server was unloaded as it came up'
-        reel._last_describe_time -= camera.IDLE_TIMEOUT_S - 1     # a while later
+        # A while later: three quarters of IDLE_TIMEOUT_S, so real time spent
+        # in rate_frame never pushes a used server past it (with IDLE - 1 the
+        # assertion failed once in a cold full-file run, 10-22: any second of
+        # real time here fails it), while a rating that was not a use leaves
+        # it 1.5 x IDLE_TIMEOUT_S idle.
+        while_later = camera.IDLE_TIMEOUT_S * 3 // 4
+        reel._last_describe_time -= while_later
         reel.rate_frame(b'a keyframe', 'rate it', timeout_s=1.0)
-        reel._last_describe_time -= camera.IDLE_TIMEOUT_S - 1
+        reel._last_describe_time -= while_later
         camera.check_idle()
         assert not proc.terminate.called, 'the server was unloaded while frames were rated'
         reel._last_describe_time -= camera.IDLE_TIMEOUT_S + 1     # then nobody uses it

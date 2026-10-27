@@ -102,7 +102,7 @@ def _require_user() -> Optional[Tuple[Response, int]]:
     """Mini auth gate for /start.  Mirrors admin_bp.before_request but
     scoped to this blueprint so /callback can stay public.
     """
-    from integrations.social.auth import _get_user_from_token
+    from integrations.social.auth import _get_user_from_token, log_refused_credential
     auth_header = request.headers.get('Authorization', '')
     if not auth_header.startswith('Bearer '):
         return jsonify({'success': False, 'error': 'Authentication required'}), 401
@@ -111,6 +111,7 @@ def _require_user() -> Optional[Tuple[Response, int]]:
     if user is None:
         if db:
             db.close()
+        log_refused_credential(token)
         return jsonify({'success': False, 'error': 'Invalid token'}), 401
     g.user = user
     # user.id is a UUID string, not an int. int(user.id) raised
