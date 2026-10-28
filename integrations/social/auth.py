@@ -280,6 +280,116 @@ def file_device_access_ask(db, owner_id: str, public_key: str, claims: dict) -> 
                "Allow it only if the phone is yours.",
         requester_name=name)
 
+
+def check_owner_allowed_device(token: str) -> dict:
+    """The one device gate (#111), shared by the network gate
+    (security.middleware) and the desktop's Social routes (require_auth).
+
+    Returns verify_device_jwt's verdict, with the owner's ask filed for a
+    pending phone (paced per client by discovery.check_client_rate: filing
+    is what an unauthenticated peer can trigger), ``{'status': 'invalid'}``
+    when there is no token or no owner, and ``{'status': 'error'}`` when the
+    check itself failed -- which every caller refuses like a bad token.
+    """
+    owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
+    if not token or not owner:
+        return {'status': 'invalid'}
+    try:
+        from .models import db_session
+        with db_session(commit=True) as db:
+            verdict = verify_device_jwt(db, token, owner)
+            if verdict['status'] == 'pending':
+                from .discovery import check_client_rate
+                if check_client_rate():
+                    file_device_access_ask(db, owner, verdict['public_key'],
+                                           verdict.get('claims') or {})
+                else:
+                    from core.auth_local import client_key
+                    logger.warning("device ask from %s not filed: rate limit",
+                                   client_key())
+        return verdict
+    except Exception:
+        logger.warning("device credential check failed; refusing",
+                       exc_info=True)
+        return {'status': 'error'}
+
+
+def device_refusal(status: str):
+    """The answer to a phone the owner has not allowed, or None for any
+    other verdict (the caller's own 401 stands for those)."""
+    if status == 'pending':
+        return jsonify({'error': 'consent_pending',
+                        'message': "Waiting for this desktop's owner to "
+                                   "allow this phone"}), 403
+    if status == 'denied':
+        return jsonify({'error': 'consent_denied',
+                        'message': "This desktop's owner has not allowed "
+                                   "this phone"}), 403
+    return None
+
+
+def device_body_refusal(user_id, required: bool):
+    """A phone acts only as the token's user (#51): a JSON body that names
+    any other user_id is refused.  ``required`` also refuses a body with no
+    user_id, for routes whose default user would otherwise stand in for the
+    phone (the network gate's /chat family); Social routes take the user
+    from g.user, so their bodies need not name it.  None when fine."""
+    body = request.get_json(silent=True) if request.is_json else None
+    if isinstance(body, dict):
+        asked_as = body.get('user_id')
+        if asked_as is None and not required:
+            return None
+        if asked_as is None or str(asked_as) != str(user_id):
+            logger.warning("device acting as user %s, token says %s; refused",
+                           asked_as, user_id)
+            return jsonify({'error': 'user_id must be the token\'s user'}), 403
+    return None
+
+
+# Where an owner-approved phone counts as the owner on a desktop: the Social
+# API the phone apps use, never the consent answers (a phone must not allow
+# another phone or a feed; only the desktop owner answers those), and no
+# other blueprint (commerce approvals, admin, agents...) -- review of #147.
+DEVICE_SOCIAL_PREFIX = '/api/social/'
+DEVICE_SOCIAL_EXCLUDED = ('/api/social/consent',)
+
+
+def _device_may_act_as_owner() -> bool:
+    if not (os.environ.get('NUNBA_BUNDLED') and has_request_context()):
+        return False
+    path = request.path or ''
+    return (path.startswith(DEVICE_SOCIAL_PREFIX)
+            and not path.startswith(DEVICE_SOCIAL_EXCLUDED))
+
+
+def _owner_from_device(db, token: str):
+    """require_auth's device branch: ``(user, None)`` for the owner's own
+    approved phone on a Social route, ``(None, response)`` for a phone that
+    is pending, denied or naming another user, ``(None, None)`` otherwise."""
+    if not token or not _device_may_act_as_owner():
+        return None, None
+    verdict = check_owner_allowed_device(token)
+    refusal = device_refusal(verdict['status'])
+    if refusal is not None:
+        return None, refusal
+    if verdict['status'] != 'ok':
+        return None, None
+    owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
+    if str((verdict.get('payload') or {}).get('user_id', '')) != str(owner):
+        return None, None
+    refusal = device_body_refusal(owner, required=False)
+    if refusal is not None:
+        return None, refusal
+    from .models import User
+    user = db.query(User).filter(User.id == str(owner)).first()
+    if user is None or user.is_banned:
+        return None, None
+    g.token_scope = 'device'
+    g.token_node_id = verdict['payload'].get('node_id', '')
+    g.token_tenant_id = None
+    return user, None
+
+
 def generate_token_pair(user_id: str, username: str, role: str = 'flat') -> dict:
     """Generate access + refresh token pair."""
     mgr = _get_jwt_manager()
@@ -383,36 +493,6 @@ def _get_user_from_token(token: str):
         except RuntimeError:
             pass
         return user, db
-
-    # A desktop's Social API uses the existing owner-approved phone proof.
-    # Discovery and the phone's claimed user alone confer no identity: only
-    # the owner's exact device-key grant admits their own synced account.
-    owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
-    if (token and owner and os.environ.get('NUNBA_BUNDLED')
-            and has_request_context()):
-        verdict = verify_device_jwt(db, token, owner)
-        claims = verdict.get('payload') or verdict.get('claims') or {}
-        if verdict['status'] == 'denied':
-            g.device_auth_error = 'consent_denied'
-        if str(claims.get('user_id', '')) == str(owner):
-            if verdict['status'] == 'pending':
-                from .discovery import check_client_rate
-                if check_client_rate():
-                    file_device_access_ask(db, owner, verdict['public_key'], claims)
-                    db.commit()
-                g.device_auth_error = 'consent_pending'
-            elif verdict['status'] == 'denied':
-                g.device_auth_error = 'consent_denied'
-            elif verdict['status'] == 'ok':
-                body = request.get_json(silent=True) if request.is_json else None
-                if isinstance(body, dict) and 'user_id' in body and str(body['user_id']) != str(owner):
-                    return None, db
-                user = db.query(User).filter(User.id == str(owner)).first()
-                if user and not user.is_banned:
-                    g.token_scope = 'device'
-                    g.token_node_id = claims.get('node_id', '')
-                    g.token_tenant_id = None
-                    return user, db
 
     # ── Kong gateway fallback (2026-06-20) ────────────────────────────
     # If both JWT decode + api_token lookup failed AND the request was
@@ -567,13 +647,15 @@ def require_auth(f):
             return _sign_in_required('Missing or invalid Authorization header')
 
         user, db = _get_user_from_token(token)
+        if user is None and db is not None:
+            # A desktop's Social routes only: the owner's approved phone.
+            user, refusal = _owner_from_device(db, token)
+            if refusal is not None:
+                db.close()
+                return refusal
         if user is None:
             if db:
                 db.close()
-            device_error = getattr(g, 'device_auth_error', None)
-            if device_error:
-                return jsonify({'success': False, 'error': device_error,
-                                'message': 'Allow this phone in the desktop privacy settings.'}), 403
             log_refused_credential(token)
             return _sign_in_required('Invalid or expired token')
 

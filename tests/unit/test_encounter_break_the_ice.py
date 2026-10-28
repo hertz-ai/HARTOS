@@ -26,7 +26,7 @@ def env(monkeypatch, tmp_path):
     """encounter_bp on a migrated DB of its own, auth faked to string
     user ids, `conversations` flag on (flip with env.flags)."""
     from integrations.social import auth as auth_mod
-    auth_mod._jwt_manager = False
+    monkeypatch.setattr(auth_mod, "_jwt_manager", False)
     from integrations.social import models as models_mod
     # models resolves its DB once at import; give this test a fresh one.
     db_file = tmp_path / 'social.db'

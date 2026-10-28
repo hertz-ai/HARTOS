@@ -11,10 +11,12 @@ from integrations.social.models import User, db_session
 def client():
     app = Flask(__name__)
     app.testing = True
-    @app.route('/api/social/test', methods=['GET', 'POST'])
-    @require_auth
-    def who():
-        return jsonify({'id': g.user_id})
+    # A Social route, the consent answers, and a route outside Social.
+    for path in ('/api/social/test', '/api/social/consent/test', '/api/agent/test'):
+        @app.route(path, methods=['GET', 'POST'], endpoint=path)
+        @require_auth
+        def who():
+            return jsonify({'id': g.user_id})
     return app.test_client()
 
 
@@ -71,6 +73,60 @@ def test_phone_cannot_override_user_in_body():
     _allow(phone)
     response = client().post('/api/social/test', headers=_bearer(phone.token()),
                              json={'user_id': 'someone-else'}, environ_base=LAN)
+    assert response.status_code == 403
+    assert response.json['error'] == "user_id must be the token's user"
+
+
+def test_social_post_need_not_name_the_user():
+    # The phone's Social bodies (a location ping) carry no user_id.
+    phone = owner_phone()
+    _allow(phone)
+    with patch('integrations.social.feature_flags.get_flags_for_tenant', return_value={}):
+        response = client().post('/api/social/test', headers=_bearer(phone.token()),
+                                 json={'lat': 1.0, 'lon': 2.0}, environ_base=LAN)
+    assert response.status_code == 200
+    assert response.json['id'] == OWNER
+
+
+def test_approved_phone_is_not_the_owner_outside_social():
+    phone = owner_phone()
+    _allow(phone)
+    response = client().get('/api/agent/test', headers=_bearer(phone.token()), environ_base=LAN)
+    assert response.status_code == 401
+
+
+def test_approved_phone_cannot_answer_consent_asks():
+    # Otherwise one allowed phone could allow another phone, or a feed.
+    phone = owner_phone()
+    _allow(phone)
+    response = client().post('/api/social/consent/test', headers=_bearer(phone.token()),
+                             json={}, environ_base=LAN)
+    assert response.status_code == 401
+
+
+def test_approved_phone_cannot_approve_a_payment():
+    # Review of #147: an approved phone posting /api/agent/approval
+    # {action: 'ap2_pay:<id>'} resolved to the owner and the payment went
+    # through.  The approver lookup must not know the phone.
+    from integrations.commerce.approvals import approver_from_request
+    from integrations.social.auth import user_id_for_token
+    phone = owner_phone()
+    _allow(phone)
+    app = Flask(__name__)
+    with app.test_request_context('/api/agent/approval', method='POST',
+                                  headers=_bearer(phone.token()), environ_base=LAN,
+                                  json={'action': 'ap2_pay:x', 'decision': 'approve',
+                                        'user_id': OWNER}):
+        from flask import request
+        assert user_id_for_token(phone.token()) is None
+        assert approver_from_request(request) is None
+
+
+def test_a_failing_device_check_is_401_not_500():
+    phone = owner_phone()
+    _allow(phone)
+    with patch('integrations.social.auth.verify_device_jwt', side_effect=RuntimeError('db down')):
+        response = client().get('/api/social/test', headers=_bearer(phone.token()), environ_base=LAN)
     assert response.status_code == 401
 
 
