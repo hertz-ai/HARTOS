@@ -413,6 +413,27 @@ class TestWhatIsRefused:
         assert reply == {'type': 'call_refused', 'id': 'c1', 'reason': 'not_allowed',
                          'detail': 'banned'}
 
+    def test_a_refusal_the_one_rule_adds_reaches_the_phone_door(self, db, monkeypatch):
+        """The phone door asks the ONE "may this person act here" rule the
+        Bearer doors ask (auth.user_refusal): a refusal added there reaches
+        the phone without the door changing.  Before, the door ran its own
+        SQL for is_banned, so a new refusal in require_auth never reached it
+        (parallel-path audit 2026-10-27, item 4)."""
+        from integrations.social import auth
+        person = _user(db)
+        agent = _user(db, 'agent', owner_id=person)
+        real = getattr(auth, 'user_refusal', lambda user: None)
+
+        def on_leave(user):
+            if user is not None and str(user.id) == person:
+                return 'on_leave'
+            return real(user)
+        monkeypatch.setattr(auth, 'user_refusal', on_leave, raising=False)
+        reply = _open(_phone(person), agent)
+        assert reply == {'type': 'call_refused', 'id': 'c1', 'reason': 'not_allowed',
+                         'detail': 'on_leave'}
+        assert _open_calls(db, person) == []
+
     def test_hanging_up_when_calls_are_switched_off(self, db, monkeypatch):
         person = _user(db)
         agent = _user(db, 'agent', owner_id=person)

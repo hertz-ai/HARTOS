@@ -1217,7 +1217,7 @@ def steering_caller() -> SteeringCaller:
     """
     from flask import g, request
     from core.auth_local import _is_local_request
-    from .auth import _get_user_from_token, holds_central_role
+    from .auth import _get_user_from_token, holds_central_role, user_refusal
     local = _is_local_request()
     user = getattr(g, 'user', None)
     if user is not None:
@@ -1226,11 +1226,12 @@ def steering_caller() -> SteeringCaller:
                               is_local=local)
     auth = request.headers.get('Authorization', '')
     if auth.startswith('Bearer ') and auth[7:]:
-        # The same token lookup require_auth uses; an invalid or banned
-        # token is no token, and the local owner below answers.
+        # The same token lookup require_auth uses, and the same one rule
+        # (auth.user_refusal): a token whose person may not act here is no
+        # token, and the local owner below answers.
         token_user, token_db = _get_user_from_token(auth[7:])
         try:
-            if token_user is not None and not getattr(token_user, 'is_banned', False):
+            if user_refusal(token_user) is None:
                 return SteeringCaller(user_id=str(token_user.id),
                                       is_admin=holds_central_role(token_user),
                                       is_local=local)
