@@ -527,11 +527,15 @@ LLM_ROUTE_DAEMON = "llm-daemon"
 LLM_ROUTE_DEFAULT = "llm-default"
 
 
-def _env_int(name: str, default: int) -> int:
-    try:
-        return max(1, int(_os.environ.get(name, "") or default))
-    except ValueError:
-        return default
+def _cap(name: str, default: int) -> int:
+    """One lane cap from the environment, through the ONE integer-env reader
+    (core.config_cache.env_int): a Kong rate limit is at least 1 request, so
+    a value below that is clamped to 1 and SAID, and junk takes the default
+    and is said too.  Whether 0 should instead mean "no Claude at all" is a
+    separate switch for the owner to rule on: a rate-limiting plugin cannot
+    carry it."""
+    from core.config_cache import env_int
+    return env_int(name, default, minimum=1, clamp=True)
 
 
 def llm_lane_routes() -> list:
@@ -540,14 +544,14 @@ def llm_lane_routes() -> list:
     without a code change; the Claude day cap is the $6/day policy in requests
     (60 at about ten cents a call, the owner's number to tune from measured
     tokens per turn)."""
-    user = {"minute": _env_int("LLM_USER_PER_MINUTE", 60),
-            "hour": _env_int("LLM_USER_PER_HOUR", 600),
-            "day": _env_int("LLM_USER_PER_DAY", 5000)}
-    daemon = {"minute": _env_int("LLM_DAEMON_PER_MINUTE", 20),
-              "hour": _env_int("LLM_DAEMON_PER_HOUR", 200),
-              "day": _env_int("LLM_DAEMON_PER_DAY", 2000)}
-    claude = {"hour": _env_int("LLM_CLAUDE_REQUESTS_PER_HOUR", 20),
-              "day": _env_int("LLM_CLAUDE_REQUESTS_PER_DAY", 60)}
+    user = {"minute": _cap("LLM_USER_PER_MINUTE", 60),
+            "hour": _cap("LLM_USER_PER_HOUR", 600),
+            "day": _cap("LLM_USER_PER_DAY", 5000)}
+    daemon = {"minute": _cap("LLM_DAEMON_PER_MINUTE", 20),
+              "hour": _cap("LLM_DAEMON_PER_HOUR", 200),
+              "day": _cap("LLM_DAEMON_PER_DAY", 2000)}
+    claude = {"hour": _cap("LLM_CLAUDE_REQUESTS_PER_HOUR", 20),
+              "day": _cap("LLM_CLAUDE_REQUESTS_PER_DAY", 60)}
     return [
         {"name": LLM_ROUTE_REVENUE, "headers": {LLM_LANE_HEADER: ["revenue"]}, "limits": None},
         {"name": LLM_ROUTE_CLAUDE,

@@ -133,6 +133,43 @@ def test_caps_follow_the_environment(monkeypatch):
     assert posts["/routes/llm-daemon/plugins"][0]["config"]["day"] == 100
 
 
+def test_a_cap_set_to_zero_or_junk_is_applied_as_one_or_the_default_and_said(monkeypatch):
+    """The caps are read by the ONE env-int reader (core.config_cache.env_int),
+    so an operator's value that could not be applied is SAID, as every other
+    integer flag's is: a Kong rate limit is at least 1 request, so 0 becomes 1
+    (clamped, not defaulted to 60 calls a day), and junk takes the default.
+    Before, kong_onboard kept its own silent max(1, int(...)) reader
+    (parallel-path audit 2026-10-27, item 2): LLM_CLAUDE_REQUESTS_PER_DAY=0
+    became one Claude call a day and nobody was told."""
+    import logging
+
+    class _Seen(logging.Handler):
+        def __init__(self):
+            super().__init__(level=logging.WARNING)
+            self.lines = []
+
+        def emit(self, record):
+            self.lines.append(record.getMessage())
+
+    seen = _Seen()
+    reader_log = logging.getLogger("hevolve_core")       # env_int's logger
+    reader_log.addHandler(seen)
+    try:
+        monkeypatch.setenv("LLM_CLAUDE_REQUESTS_PER_DAY", "0")
+        monkeypatch.setenv("LLM_DAEMON_PER_DAY", "two thousand")
+        s = _session()
+        ko.onboard_llm_gateway(s, KONG)
+    finally:
+        reader_log.removeHandler(seen)
+    posts = _posts(s)
+    assert posts["/routes/llm-claude/plugins"][0]["config"]["day"] == 1
+    assert posts["/routes/llm-daemon/plugins"][0]["config"]["day"] == 2000
+    said = "\n".join(seen.lines)
+    assert "LLM_CLAUDE_REQUESTS_PER_DAY" in said and "minimum" in said
+    assert "LLM_DAEMON_PER_DAY" in said and "not an integer" in said
+    assert not hasattr(ko, "_env_int")                    # the copy is gone
+
+
 def test_a_cap_that_could_not_be_looked_up_or_updated_is_not_reported_applied():
     """A failed lookup used to fall through to a POST that 409'd as "already
     exists (no change)" while the cap on the box stayed the OLD one (review
