@@ -103,16 +103,19 @@ def registry(monkeypatch):
 def test_registered_as_expert_priced_like_claude(registry, monkeypatch):
     for k, v in EXPERT_ENV.items():
         monkeypatch.setenv(k, v)
-    for v in ('HEVOLVE_CLAUDE_USD_PER_1K_IN', 'HEVOLVE_CLAUDE_USD_PER_1K_OUT',
-              'HEVOLVE_SPARK_PER_USD'):
+    for v in ('HEVOLVE_CLAUDE_USD_PER_1K_IN', 'HEVOLVE_SPARK_PER_USD'):
         monkeypatch.delenv(v, raising=False)
+    # The claude family price, derived from the one dollar table
+    # (core.autogen_config.EXPERT_USD_PER_1K) with the owner's pin: 0.05 * 100
+    # = 5 Spark per 1k.  Pinned away from both the list price (2) and the
+    # unknown-model default (2), so this proves the derivation, not a
+    # coincidence (reviewer of c483a7b32, finding 5).
+    monkeypatch.setenv('HEVOLVE_CLAUDE_USD_PER_1K_OUT', '0.05')
     assert mr.ensure_configured_expert_registered() is True
     m = registry.get_model('configured-expert')
     assert m.tier is mr.ModelTier.EXPERT
     assert m.is_dispatchable() and m.is_local
-    # the claude family price, derived from the one dollar table
-    # (core.autogen_config.EXPERT_USD_PER_1K): ceil(0.015 * 100) Spark per 1k
-    assert m.cost_per_1k_tokens == 2
+    assert m.cost_per_1k_tokens == 5
     assert m.config_list_entry['model'] == 'claude-sonnet-4-5'
     assert m.config_list_entry['base_url'] == 'http://172.17.0.1:8100/llm/v1'
 

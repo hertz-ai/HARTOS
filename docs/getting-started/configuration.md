@@ -41,7 +41,7 @@ These settings control how the node allocates compute resources, gates API costs
 | `HEVOLVE_ALLOW_METERED_HIVE` | Allow metered (paid) API calls for hive tasks from other users | `false` |
 | `HEVOLVE_MAX_HIVE_GPU_PCT` | Maximum GPU percentage allocatable to hive tasks | `50` |
 | `HEVOLVE_METERED_DAILY_LIMIT` | Daily spending limit (USD) for metered API calls on hive tasks | `0.00` |
-| `HEVOLVE_SPARK_PER_USD` | Spark-to-USD conversion rate for budget gating | `1000` |
+| `HEVOLVE_SPARK_PER_USD` | Spark per dollar, read by the budget gate's reservation and meter (`budget_gate.spark_per_usd`) and by revenue settlement | `100` |
 
 ### Budget Gate
 

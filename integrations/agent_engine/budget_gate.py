@@ -81,24 +81,29 @@ def spark_per_1k(model_name: str) -> int:
     A family with a dollar price (core.autogen_config.EXPERT_USD_PER_1K, the
     ONE price table, read with the owner's pin by family_usd_per_1k) is
     priced from it: the larger of its input and output price per 1k, times
-    spark_per_usd(), rounded up, so a reservation stays an upper bound on
-    what the meter then records for the same call; the owner's pin on
-    HEVOLVE_<FAMILY>_USD_PER_1K_IN / _OUT and the Spark rate move the
-    reservation and the meter alike.  Every other family is the Spark map
-    above: 0 for the local and free-tier families, 2 for a cloud model the
-    map does not know.
+    spark_per_usd(), rounded up, so the reservation's rate per 1k is never
+    below the meter's (per CALL the meter can still record more: it prices
+    output tokens at the output price, while the reservation counts the
+    prompt); the owner's pin on HEVOLVE_<FAMILY>_USD_PER_1K_IN / _OUT and
+    the Spark rate move the reservation and the meter alike.  Every other
+    family is the Spark map above: 0 for the local and free-tier families,
+    2 for a cloud model the map does not know.
 
     ONE lookup for estimate_llm_cost_spark and for the registry's
     'configured-api' and configured-expert backends, so the pre-dispatch
-    estimate, the expert path's reservation and the max_cost filter
-    (ModelBackend.cost_per_1k_tokens) price the same model the same way.
+    estimate, the expert path's reservation, the max_cost filter and the
+    speculative dispatcher's affordability check (all readers of
+    ModelBackend.cost_per_1k_tokens) price the same model the same way.
     Before, Claude was written here a second time as 'claude': 4, and a pin
     moved the meter but not the reservation (parallel-path audit
     2026-10-27, item 1).
     """
     price = usd_price_per_1k(model_name)
     if price is not None:
-        return int(math.ceil(max(price) * spark_per_usd()))
+        # round(.., 6) before the ceil: 0.07 * 100 is 7.000000000000001 in
+        # floating point, and a bare ceil reserved 8 Spark for a pin of
+        # exactly 7 (reviewer of c483a7b32, finding 1).
+        return int(math.ceil(round(max(price) * spark_per_usd(), 6)))
     model_lower = (model_name or '').lower()
     for prefix, cost in _MODEL_COST_MAP.items():
         if prefix in model_lower:

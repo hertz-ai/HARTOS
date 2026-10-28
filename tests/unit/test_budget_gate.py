@@ -384,6 +384,14 @@ def test_a_priced_family_reserves_from_the_one_dollar_table(monkeypatch):
     assert bg.blended_usd_per_1k('claude-sonnet-4-5', 0, 1000) == 0.03   # and the meter
     monkeypatch.setenv('HEVOLVE_SPARK_PER_USD', '1000')
     assert bg.spark_per_1k('claude-sonnet-4-5') == 30              # the rate moves it too
+    # A pin whose product is a whole number is that number, not one more:
+    # 0.07 * 100 is 7.000000000000001 in floating point, and a bare ceil
+    # reserved 8 (reviewer of c483a7b32, finding 1).
+    monkeypatch.setenv('HEVOLVE_SPARK_PER_USD', '100')
+    monkeypatch.setenv('HEVOLVE_CLAUDE_USD_PER_1K_OUT', '0.07')
+    assert bg.spark_per_1k('claude-sonnet-4-5') == 7
+    monkeypatch.setenv('HEVOLVE_CLAUDE_USD_PER_1K_OUT', '0.0701')
+    assert bg.spark_per_1k('claude-sonnet-4-5') == 8               # a real fraction still rounds up
     assert bg.spark_per_1k('gpt-4o') == 4                          # the map still prices the rest
     assert bg.spark_per_1k('some-unknown-model') == 2
     assert bg.spark_per_1k('qwen3-27b') == 0
