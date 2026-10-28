@@ -4016,8 +4016,10 @@ def _reuse_is_pipeline_text(content):
             # untouched (it carries no braces, by its own design note).  So
             # one marker covers both producers and survives the formatting.
             # It is defined further down, beside the steers that emit it —
-            # resolved at call time like every other global here.
-            or _REUSE_SYNTHESIS_ANSWER_SHAPE in _c)
+            # resolved at call time like every other global here.  Keyed on
+            # the shape's value clause, the part every wording has carried
+            # (see _REUSE_SYNTHESIS_ANSWER_VALUE).
+            or _REUSE_SYNTHESIS_ANSWER_VALUE in _c)
 
 # Recorded in _reuse_fab_pending when the thing that did not happen is not a
 # tool run but the ACTION'S OWN TEXT.  Angle brackets, so _TOOL_IDENT_RE can
@@ -4916,11 +4918,23 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
 #
 # Keeps the message2userfinal name (get_agent_response unwraps it, #797/D31)
 # and carries no braces, so .format(unrun=...) below stays safe.
+#
+# _REUSE_SYNTHESIS_ANSWER_VALUE: the clause every wording of the shape has
+# carried, and what _reuse_is_pipeline_text keys on.  e0661827a reworded the
+# part before it
+# ("only key" -> "answer key"), and the recogniser, keyed on the whole shape,
+# then let the 2026-09-10 steer the user received pass as an answer again
+# (tests/unit/test_reuse_never_delivers_its_own_steer.py, red from 10-25).  A
+# steer written before a rewording still sits in stored conversations, so the
+# marker is the part a rewording of the key leaves alone.
+_REUSE_SYNTHESIS_ANSWER_VALUE = (
+    "and whose value is the answer itself, written out as sentences the user "
+    "will read. Substitute the real text — a placeholder, an empty value, or "
+    "anything in angle brackets is not an answer."
+)
 _REUSE_SYNTHESIS_ANSWER_SHAPE = (
     "Address your reply to @user, and send one JSON object whose answer key is "
-    "message2userfinal and whose value is the answer itself, written out as "
-    "sentences the user will read. Substitute the real text — a placeholder, "
-    "an empty value, or anything in angle brackets is not an answer."
+    "message2userfinal " + _REUSE_SYNTHESIS_ANSWER_VALUE
 )
 # "only key" until 19836e605's review: it contradicted the reply schema,
 # which now also offers `media`.  "answer key" leaves room for it.
