@@ -333,8 +333,13 @@ class UserService:
             raise ValueError("Invalid username or password")
         if not user:
             raise ValueError("Invalid username or password")
-        if user.is_banned:
-            raise ValueError("Account is banned")
+        # This door mints a JWT, so it asks the ONE "may this person act
+        # here" rule the Bearer doors ask (auth.user_refusal), in this
+        # door's own reply shape ("Account is banned").
+        from .auth import user_refusal
+        why = user_refusal(user)
+        if why:
+            raise ValueError("Account is " + why)
         # Clear lockout on successful login
         with UserService._login_lock:
             UserService._login_attempts.pop(username, None)

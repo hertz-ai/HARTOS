@@ -101,6 +101,43 @@ def test_user_id_for_token_refuses_a_banned_user_through_the_rule(jwt_door):
     assert auth.user_id_for_token('t') is None
 
 
+@pytest.fixture
+def login_door(monkeypatch):
+    """UserService.login with the password check passed and the JWT signer
+    stood in: the path the password door walks after the credential."""
+    from integrations.social import services
+
+    def _install(user):
+        user.username = 'u'
+        user.password_hash = 'x:y'
+        db = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = user
+        monkeypatch.setattr(services, 'verify_password', lambda pw, stored: True)
+        monkeypatch.setattr(services, 'generate_jwt', lambda *a, **k: 'jwt')
+        services.UserService._login_attempts.clear()
+        return db
+    return _install
+
+
+def test_login_mints_and_refuses_by_the_one_rule(login_door, monkeypatch):
+    """The password door mints a JWT, so it asks the one rule too: a refusal
+    added there stops the token at login with the door's own reply shape
+    (ValueError 'Account is <why>')."""
+    from integrations.social import services
+    db = login_door(_user())
+    assert services.UserService.login(db, 'u', 'pw')[1] == 'jwt'
+    monkeypatch.setattr(auth, 'user_refusal', lambda user: 'on_leave', raising=False)
+    with pytest.raises(ValueError, match='Account is on_leave'):
+        services.UserService.login(db, 'u', 'pw')
+
+
+def test_login_refuses_a_banned_user_through_the_rule(login_door):
+    from integrations.social import services
+    db = login_door(_user(banned=True))
+    with pytest.raises(ValueError, match='Account is banned'):
+        services.UserService.login(db, 'u', 'pw')
+
+
 def test_the_steering_caller_falls_back_to_the_owner_by_the_one_rule(app, jwt_door, monkeypatch):
     """dashboard_service's caller resolution: a token whose user the rule
     refuses is no token, and the loopback owner answers instead."""

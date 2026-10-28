@@ -184,7 +184,7 @@ def link_hevolve():
     """
     import re
     import secrets
-    from .auth import generate_jwt, generate_api_token
+    from .auth import generate_jwt, generate_api_token, user_refusal
     from .kong_identity import email_for_token
 
     data = _get_json()
@@ -209,8 +209,12 @@ def link_hevolve():
     try:
         user = db.query(User).filter(User.email == email).first()
         if user:
-            if user.is_banned:
-                return _err("Account banned", 403)
+            # This door mints a JWT, so it asks the ONE "may this person act
+            # here" rule the Bearer doors ask (auth.user_refusal), in this
+            # door's own reply shape ("Account banned", 403).
+            why = user_refusal(user)
+            if why:
+                return _err("Account " + why, 403)
             token = generate_jwt(user.id, user.username, user.role or 'flat')
             return _ok({'user': user.to_dict(), 'token': token})
 

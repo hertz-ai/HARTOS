@@ -110,6 +110,37 @@ def test_a_proven_new_email_gets_an_account(client):
     assert _has_account('new@example.com')
 
 
+def test_a_banned_account_is_refused_with_the_doors_own_reply(client):
+    db = get_db()
+    try:
+        db.query(User).filter(User.email == OWNER).first().is_banned = True
+        db.commit()
+    finally:
+        db.close()
+    with patch.object(kong_identity, 'email_for_token', return_value=OWNER):
+        resp = _link(client, OWNER, token='kong-token')
+    assert resp.status_code == 403
+    assert resp.get_json()['error'] == 'Account banned'
+    assert 'data' not in resp.get_json()
+
+
+def test_an_account_the_one_rule_refuses_gets_no_token(client, monkeypatch):
+    """This door mints a JWT, so it asks the ONE "may this person act here"
+    rule the Bearer doors ask (auth.user_refusal): a refusal added there
+    stops the token here too, with this door's own reply shape.  Before, the
+    door read is_banned for itself and a person the rule refused was still
+    given a JWT (parallel-path audit 2026-10-27, item 4 rework)."""
+    from integrations.social import auth
+    monkeypatch.setattr(auth, 'user_refusal',
+                        lambda user: 'no_user' if user is None else 'on_leave',
+                        raising=False)
+    with patch.object(kong_identity, 'email_for_token', return_value=OWNER):
+        resp = _link(client, OWNER, token='kong-token')
+    assert resp.status_code == 403
+    assert resp.get_json()['error'] == 'Account on_leave'
+    assert 'data' not in resp.get_json()
+
+
 # ── Asking Kong ──
 
 _LIVE_ROW = {'access_token': 'live-token', 'expires_in': 0,

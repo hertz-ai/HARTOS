@@ -338,15 +338,19 @@ def user_refusal(user):
     node, or None when they may: 'no_user', 'banned'.
 
     The ONE "may this person act here" rule.  Every door that admits a
-    person asks it: the Bearer doors through _get_user_from_token (JWT,
-    api_token and the Kong fallback), user_id_for_token, the steering
-    caller (dashboard_service.steering_caller) and the phone's device-link
-    door (phone_call._person_refusal).  A refusal added here reaches them
-    all; each door keeps its own reply shape.  Before, each door re-read
-    is_banned for itself and the phone door ran its own SQL, so a refusal
-    added to one never reached the others (parallel-path audit 2026-10-27,
-    item 4).  Tenancy (require_auth's cloud-mode check) is a door's own
-    concern and stays there.
+    person, or mints them a token, asks it: the Bearer doors through
+    _get_user_from_token (JWT, api_token and the Kong fallback),
+    user_id_for_token, the steering caller (dashboard_service
+    .steering_caller), the phone's device-link door
+    (phone_call._person_refusal), and the two JWT-minting doors, the
+    password login (services.UserService.login) and the Hevolve link
+    (api.link_hevolve).  A refusal added here reaches them all; each door
+    keeps its own reply shape.  Before, each door re-read is_banned for
+    itself and the phone door ran its own SQL, so a refusal added to one
+    never reached the others (parallel-path audit 2026-10-27, item 4).
+    Tenancy (require_auth's cloud-mode check) is a door's own concern and
+    stays there; a listing that filters banned users out of search results
+    is a different question (who is shown), not this one (who may act).
     """
     if user is None:
         return 'no_user'
