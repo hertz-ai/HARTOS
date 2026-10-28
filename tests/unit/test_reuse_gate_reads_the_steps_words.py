@@ -113,6 +113,26 @@ def test_the_named_tools_of_a_step_are_the_ones_its_words_name():
     assert sorted(named) == ['get_data_by_key', 'get_user_id']
 
 
+def test_a_tool_written_as_words_is_named():
+    """A step that spells an identifier tool out as words names it: "Read
+    item 3" names read_item (tests/unit/test_reuse_role_handoff.py's fixture,
+    6 of 8 red on main once the gate read only the step's words: the step
+    read as naming no tool, wanted a written answer, and the real read_item
+    result was no receipt).  Whole words only: "read items" is not read_item,
+    and "never through a messaging tool" still names no messaging tool.
+    Measured 2026-10-29 on the desktop's 1,104 recipe actions (1,586
+    action/banked-tool pairs): 17 pairs change, every one a step whose words
+    spell its tool out ("execute windows or android command: ...",
+    "google search for ...", "consult expert on ...")."""
+    agents = [_agent(['read_item', 'send_message_to_user', 'google_search'])]
+    assert lh.action_named_tools(agents, 'Read item 3')[1] == ['read_item']
+    assert lh.action_named_tools(
+        agents, "Google search for 'crypto market sentiment'")[1] == ['google_search']
+    assert lh.action_named_tools(agents, 'Read items 1 and 2')[1] == []
+    assert lh.action_named_tools(agents, STEP_2)[1] == []
+    assert lh.action_named_tools(agents, 'call read_item(3)')[1] == ['read_item']
+
+
 # ── the fabrication gate ──────────────────────────────────────────────────
 
 def test_a_new_learners_read_completes_step_one(session):
