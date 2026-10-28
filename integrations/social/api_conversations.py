@@ -42,7 +42,9 @@ conversations_bp = Blueprint(
 from .api_common import _ok, _err, _get_json  # single-sourced (#97)
 
 
-def _flag_on() -> bool:
+def conversations_on() -> bool:
+    """DMs exist only with the `conversations` feature flag on; other
+    blueprints that open DMs (encounter_api's icebreaker) ask here."""
     flags = getattr(g, 'feature_flags', {}) or {}
     return bool(flags.get('conversations', False))
 
@@ -52,7 +54,7 @@ def _flag_on() -> bool:
 @conversations_bp.route('', methods=['GET'])
 @require_auth
 def list_conversations():
-    if not _flag_on():
+    if not conversations_on():
         return _ok([])
     include_archived = (request.args.get('include_archived',
                                          'false').lower() == 'true')
@@ -65,7 +67,7 @@ def list_conversations():
 @conversations_bp.route('', methods=['POST'])
 @require_auth
 def create_conversation():
-    if not _flag_on():
+    if not conversations_on():
         return _err("conversations feature flag is off", 503)
     data = _get_json()
     kind = data.get('kind')
@@ -90,7 +92,7 @@ def create_conversation():
 @conversations_bp.route('/<conv_id>', methods=['GET'])
 @require_auth
 def get_conversation(conv_id):
-    if not _flag_on():
+    if not conversations_on():
         return _err("conversations feature flag is off", 503)
     from .conversation_service import ConversationService, _is_member
     if not _is_member(g.db, conv_id, g.user.id):
@@ -106,7 +108,7 @@ def get_conversation(conv_id):
 @conversations_bp.route('/<conv_id>/messages', methods=['GET'])
 @require_auth
 def list_messages(conv_id):
-    if not _flag_on():
+    if not conversations_on():
         return _ok([])
     before = request.args.get('before')
     limit = max(1, min(int(request.args.get('limit', 50)), 200))
@@ -163,7 +165,7 @@ def _classify_message_if_enabled(message_id: str, content: str) -> None:
 @conversations_bp.route('/<conv_id>/messages', methods=['POST'])
 @require_auth
 def send_message(conv_id):
-    if not _flag_on():
+    if not conversations_on():
         return _err("conversations feature flag is off", 503)
     data = _get_json()
     content = data.get('content')
@@ -193,7 +195,7 @@ def send_message(conv_id):
                         methods=['PATCH'])
 @require_auth
 def edit_message(conv_id, message_id):
-    if not _flag_on():
+    if not conversations_on():
         return _err("conversations feature flag is off", 503)
     data = _get_json()
     content = data.get('content')
@@ -217,7 +219,7 @@ def edit_message(conv_id, message_id):
                         methods=['DELETE'])
 @require_auth
 def delete_message(conv_id, message_id):
-    if not _flag_on():
+    if not conversations_on():
         return _err("conversations feature flag is off", 503)
     try:
         from .conversation_service import (
@@ -233,7 +235,7 @@ def delete_message(conv_id, message_id):
 @conversations_bp.route('/<conv_id>/members', methods=['POST'])
 @require_auth
 def add_member(conv_id):
-    if not _flag_on():
+    if not conversations_on():
         return _err("conversations feature flag is off", 503)
     data = _get_json()
     new_member_id = data.get('user_id') or data.get('member_id')
@@ -253,7 +255,7 @@ def add_member(conv_id):
 @conversations_bp.route('/<conv_id>/members/<user_id>', methods=['DELETE'])
 @require_auth
 def remove_member(conv_id, user_id):
-    if not _flag_on():
+    if not conversations_on():
         return _err("conversations feature flag is off", 503)
     try:
         from .conversation_service import (
@@ -276,7 +278,7 @@ def emit_typing(conv_id):
     Receivers see it through tenant.{tid}.conv.{id}.typing WAMP
     subscription.  Pure broadcast — never persisted.
     """
-    if not _flag_on():
+    if not conversations_on():
         return _err("conversations feature flag is off", 503)
     try:
         from .conversation_service import (
@@ -298,7 +300,7 @@ def mark_read(conv_id):
     last_read_at on the user's memberships row AND broadcasts a
     receipt to other members via tenant.{tid}.conv.{id}.read.
     """
-    if not _flag_on():
+    if not conversations_on():
         return _err("conversations feature flag is off", 503)
     data = _get_json()
     try:
