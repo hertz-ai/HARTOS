@@ -150,3 +150,13 @@ def test_banned_owner_is_not_admitted_from_an_approved_phone():
         db.query(User).filter_by(id=OWNER).one().is_banned = True
     response = client().get('/api/social/test', headers=_bearer(phone.token()), environ_base=LAN)
     assert response.status_code == 401
+
+
+def test_a_token_claiming_a_long_life_is_refused():
+    # The apps mint 15-minute tokens; one that says it lives an hour is
+    # refused, so a sniffed token stays useful for minutes only.
+    phone = owner_phone()
+    _allow(phone)
+    response = client().get('/api/social/test', headers=_bearer(phone.token(exp_in=3600)),
+                            environ_base=LAN)
+    assert response.status_code == 401

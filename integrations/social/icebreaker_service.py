@@ -170,18 +170,27 @@ def _peer_id_for(match, viewer_uid: str) -> Optional[str]:
 ICEBREAKER_KINDS = ('ble', 'proximity')
 
 
-def find_icebreaker_match(db_session, match_id: str, kind: str = 'ble'):
+def find_icebreaker_match(db_session, match_id: str, kind: str = 'ble',
+                          for_update: bool = False):
     """The row an icebreaker is about: a BLE Encounter, or a GPS
     ProximityMatch once both people revealed themselves.  A GPS match
-    that is still pending names nobody, so it can't be broken into yet.
-    Returns None when there is no such row."""
+    that is still pending names nobody, so it can't be broken into yet,
+    and an expired one is gone (the same rule ProximityService.get_matches
+    lists by).  Returns None when there is no such row.  ``for_update``
+    locks the row until the caller's commit (PostgreSQL; a no-op on
+    SQLite), for a send that must happen once."""
     if kind == 'proximity':
-        return db_session.query(ProximityMatch).filter_by(
-            id=match_id, status='matched',
-        ).first()
-    return db_session.query(Encounter).filter_by(
-        id=match_id, context_type='ble',
-    ).first()
+        from datetime import datetime
+        q = db_session.query(ProximityMatch).filter(
+            ProximityMatch.id == match_id,
+            ProximityMatch.status == 'matched',
+            ProximityMatch.expires_at > datetime.utcnow(),
+        )
+    else:
+        q = db_session.query(Encounter).filter_by(
+            id=match_id, context_type='ble',
+        )
+    return (q.with_for_update() if for_update else q).first()
 
 
 # ──────────────────────────────────────────────────────────────────────

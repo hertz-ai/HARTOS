@@ -202,6 +202,14 @@ def verify_hive_jwt(token: str, issuer_public_key_hex: str) -> dict:
     return {}
 
 
+# The phone apps mint 15-minute device tokens (Android
+# PeerLinkDeviceToken.TTL_SECONDS, iOS PeerLinkCrypto); 5 more minutes allow
+# for a phone clock ahead of this desktop's.  A token that claims to live
+# longer is refused, so a token sniffed off the plain-HTTP LAN port is good
+# for minutes, not for whatever exp its sender chose (review of #147).
+DEVICE_TOKEN_MAX_SECONDS = 15 * 60 + 5 * 60
+
+
 def verify_device_jwt(db, token: str, owner_id: str) -> dict:
     """Verify a hive-shaped token from a person's phone against the key the
     desktop owner allowed for it (#111).
@@ -240,6 +248,10 @@ def verify_device_jwt(db, token: str, owner_id: str) -> dict:
         return {'status': 'invalid'}
     scope = device_scope(claims.get('node_public_key'))
     if scope is None or claims.get('scope') != 'hive':
+        return {'status': 'invalid'}
+    exp = claims.get('exp')
+    if (not isinstance(exp, (int, float))
+            or exp - time.time() > DEVICE_TOKEN_MAX_SECONDS):
         return {'status': 'invalid'}
     row = ConsentService.active_grant(db, owner_id, 'device_access',
                                       scope=scope, agent_id=None)

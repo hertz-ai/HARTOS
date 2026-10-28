@@ -87,19 +87,17 @@ def _gps_match(env, status='matched'):
 
 def _dm_messages(env):
     from sqlalchemy import text
-    from integrations.social.conversation_service import _member_hash
+    from integrations.social.conversation_service import ConversationService
     db = env.db()
     try:
-        conv = db.execute(text(
-            "SELECT id FROM conversations WHERE kind='dm' AND member_hash=:h"),
-            {'h': _member_hash([A, B])}).fetchone()
+        conv = ConversationService.find_dm(db, A, B)
         if conv is None:
             return None, []
         rows = db.execute(text(
             "SELECT author_id, content FROM messages "
             "WHERE parent_kind='conversation' AND parent_id=:c "
-            "ORDER BY created_at"), {'c': conv[0]}).fetchall()
-        return conv[0], [tuple(r) for r in rows]
+            "ORDER BY created_at"), {'c': conv}).fetchall()
+        return conv, [tuple(r) for r in rows]
     finally:
         db.close()
 
@@ -214,3 +212,125 @@ def test_ble_icebreaker_also_lands_in_dm(env):
     conv_id, msgs = _dm_messages(env)
     assert r.get_json()['data']['conversation_id'] == conv_id
     assert msgs == [(A, 'Hello from BLE')]
+
+
+# ── Review of #147 ─────────────────────────────────────────────────────
+
+def _ble_match(env):
+    from integrations.social.models import Encounter
+    db = env.db()
+    enc = Encounter(user_a_id=A, user_b_id=B, context_type='ble',
+                    context_id='ctx-ble-2')
+    db.add(enc)
+    db.commit()
+    mid = enc.id
+    db.close()
+    return mid
+
+
+def _say(env, uid, text, source=None):
+    """A message in the A-B DM, posted the way the chat screen posts it."""
+    from integrations.social.conversation_service import ConversationService
+    db = env.db()
+    try:
+        conv = ConversationService.create(db, kind='dm', member_ids=[A, B],
+                                          created_by=uid)
+        ConversationService.send_message(
+            db, conv['id'], uid, text,
+            metadata={'source': source} if source else None)
+    finally:
+        db.close()
+
+
+def test_an_earlier_chat_message_does_not_block_the_icebreaker(env):
+    # Only an earlier OPENER counts as "already sent", not small talk.
+    mid = _gps_match(env)
+    _say(env, A, 'hey, we met at the cafe')
+    r = _post(env, 'approve', {'match_id': mid, 'kind': 'proximity',
+                               'text': 'Breaking the ice properly'})
+    assert r.status_code == 200, r.get_json()
+    _, msgs = _dm_messages(env)
+    assert msgs == [(A, 'hey, we met at the cafe'),
+                    (A, 'Breaking the ice properly')]
+
+
+def test_an_expired_gps_match_takes_no_opener(env):
+    from integrations.social.models import ProximityMatch
+    mid = _gps_match(env)
+    db = env.db()
+    db.query(ProximityMatch).filter_by(id=mid).one().expires_at = (
+        datetime.utcnow() - timedelta(minutes=1))
+    db.commit()
+    db.close()
+    for path, body in (('draft', {}), ('approve', {'text': 'hi'})):
+        r = _post(env, path, dict(body, match_id=mid, kind='proximity'))
+        assert r.status_code == 404, (path, r.get_json())
+    assert _dm_messages(env) == (None, [])
+
+
+def test_a_failing_sent_check_sends_nothing(env, monkeypatch):
+    # The old lookup answered "not sent" on any error, so a broken DB
+    # read could post the opener a second time.
+    from integrations.social.conversation_service import ConversationService
+    mid = _gps_match(env)
+    _post(env, 'approve', {'match_id': mid, 'kind': 'proximity',
+                           'text': 'first'})
+
+    def broken(*a, **k):
+        raise RuntimeError('db read failed')
+    monkeypatch.setattr(ConversationService, 'has_message_from', broken)
+    with pytest.raises(RuntimeError):
+        _post(env, 'approve', {'match_id': mid, 'kind': 'proximity',
+                               'text': 'second'})
+    _, msgs = _dm_messages(env)
+    assert msgs == [(A, 'first')]
+
+
+def test_two_quick_taps_send_one_opener(env, monkeypatch):
+    # The second tap arrives while the first is still sending: it waits
+    # for the first to finish, then finds the opener and gets 409.
+    import threading
+    import time as _time
+    from integrations.social import encounter_api
+    mid = _gps_match(env)
+    real_send = encounter_api._send_icebreaker_as_dm
+    second = {}
+
+    def tap_again():
+        second['r'] = _post(env, 'approve', {'match_id': mid,
+                                             'kind': 'proximity',
+                                             'text': 'Hi (tap 2)'})
+
+    def slow_send(*a, **k):
+        if 'thread' not in second:
+            second['thread'] = threading.Thread(target=tap_again)
+            second['thread'].start()
+            _time.sleep(0.3)
+            second['waiting'] = second['thread'].is_alive()
+        return real_send(*a, **k)
+    monkeypatch.setattr(encounter_api, '_send_icebreaker_as_dm', slow_send)
+
+    first = _post(env, 'approve', {'match_id': mid, 'kind': 'proximity',
+                                   'text': 'Hi (tap 1)'})
+    second['thread'].join(10)
+    assert first.status_code == 200, first.get_json()
+    assert second['waiting'], 'the second tap did not wait for the first'
+    assert second['r'].status_code == 409
+    _, msgs = _dm_messages(env)
+    assert msgs == [(A, 'Hi (tap 1)')]
+
+
+def test_ble_opener_already_in_the_dm_is_recorded_not_resent(env):
+    # The DM commits before the match's 'sent' state; if that state write
+    # was lost, the retry must not post the opener again.
+    from integrations.social.models import Encounter
+    mid = _ble_match(env)
+    _say(env, A, 'Hello from BLE', source='encounter_icebreaker')
+    r = _post(env, 'approve', {'match_id': mid, 'text': 'Hello from BLE'})
+    assert r.status_code == 409
+    _, msgs = _dm_messages(env)
+    assert msgs == [(A, 'Hello from BLE')]
+    db = env.db()
+    payload = db.query(Encounter).filter_by(id=mid).one().payload
+    db.close()
+    assert payload['icebreaker_a']['status'] == 'sent'  # A is user_a
