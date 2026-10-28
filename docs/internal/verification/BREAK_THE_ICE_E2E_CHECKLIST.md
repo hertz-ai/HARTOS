@@ -32,10 +32,10 @@ record names no private addresses, hosts or accounts.
 
 | Part | Branch | SHA at writing | SHA at run |
 |---|---|---|---|
-| HARTOS (in Nunba desktop) | `encounters-chat` (PR #147) | 17d86d490 | |
-| Nunba desktop | `fix/freeze-validate-diagnostics` (PR #50) | f4c32fb | |
-| Android app | `feat/break-the-ice` | fbe362bb | |
-| iOS app | `v1_macos` (PR #2) | ed709a7 | |
+| HARTOS (in Nunba desktop) | `encounters-chat` (PR #147) | 17d86d490 | 016074c39 (2026-10-28) |
+| Nunba desktop | `fix/freeze-validate-diagnostics` (PR #50) | f4c32fb | 7f5dd97 (2026-10-28) |
+| Android app | `feat/break-the-ice` | fbe362bb | native fbe362bb, JS e788dc7c via Metro (2026-10-28) |
+| iOS app | `v1_macos` (PR #2) | ed709a7 | ed709a7 (installed build) |
 
 Devices: one physical Android phone, one physical iPhone, same network as the
 desktop. Accounts: two real accounts, one per phone. Server flag
@@ -56,9 +56,9 @@ step 6 as BLOCKED with this reason.
 
 | # | Step | Setup | Expected | Code and existing test | Evidence level reached | Device / SHA | Label | Verdict |
 |---|---|---|---|---|---|---|---|---|
-| 1a | Phone admitted by the desktop | Phone: Privacy, Connect to the desktop address | First call answers 403 `consent_pending` with "Allow this phone in the desktop privacy settings."; owner approves on desktop Privacy; next call 200 | `auth.py` require_auth device branch; `test_social_device_auth.py`, `test_device_access_gate.py` | unit | | read | not run |
-| 1b | Discoverable consent | Encounters: tick 18+, turn Discoverable and Location on | `POST /api/social/encounter/discoverable` 200, then `GET` returns `enabled=true`, remaining TTL > 0; without the 18+ tick 403 | `encounter_api.py:389` set_discoverable; J200, `test_encounter_api.py`, `test_encounter_privacy.py` | unit | | read | not run |
-| 2a | Match by GPS (Nearby) | Both phones discoverable, near each other, both reveal | `/api/social/encounters/proximity-matches` lists the pair; after both reveal, status `matched`; card shows "Break the ice" | `api_gamification.py:1489` location-ping, `:1530` proximity-matches, `:1543` reveal | read only | | read | not run |
+| 1a | Phone admitted by the desktop | Phone: Privacy, Connect to the desktop address | First call answers 403 `consent_pending` with "Allow this phone in the desktop privacy settings."; owner approves on desktop Privacy; next call 200 | `auth.py` require_auth device branch; `test_social_device_auth.py`, `test_device_access_gate.py` | physical device (Android); iPhone user-reported | Android + iPhone; desktop 7f5dd97 + HARTOS 016074c39 | measured | WORKS (partial). Each phone filed one `device_access` ask (DB rows read 10-26); the owner clicked Allow on desktop Privacy, granted rows read back 10-28; the Android phone then held open connections to the desktop's port and Encounters loaded with no pending notice (screen seen). The 403 `consent_pending` body itself was not captured. iPhone: owner reports Encounters open and scanning; its connection was not tied to the device by measurement |
+| 1b | Discoverable consent | Encounters: tick 18+, turn Discoverable and Location on | `POST /api/social/encounter/discoverable` 200, then `GET` returns `enabled=true`, remaining TTL > 0; without the 18+ tick 403 | `encounter_api.py:389` set_discoverable; J200, `test_encounter_api.py`, `test_encounter_privacy.py` | physical device | Android + iPhone, same builds as 1a | measured | WORKS (partial). `discoverable_prefs` row read back: `enabled=1`, `age_claim_18=1`, expires 4 h after enabling; `location_pings` arrive every 30 s; both phones show Scanning. Not measured: the 403 without the 18+ tick |
+| 2a | Match by GPS (Nearby) | Both phones discoverable, near each other, both reveal | `/api/social/encounters/proximity-matches` lists the pair; after both reveal, status `matched`; card shows "Break the ice" | `api_gamification.py:1489` location-ping, `:1530` proximity-matches, `:1543` reveal | read only | | measured | BLOCKED 2026-10-28: both phones are signed in as the desktop owner, so one `discoverable_prefs` row and one user's pings; 0 sightings, 0 matches. Needs the second-account route (see Known constraint) |
 | 2b | Match by BLE | Both phones discoverable with BLE on, mutual like | `POST /encounter/swipe` returns `match_id` to both; one-sided like returns `match_id:null` | `encounter_api.py:554` sighting, `:631` swipe; J203, J204, J205 | unit | | read | not run |
 | 2c | The old "BLE match not found" on a GPS match | Tap Break the ice on a GPS match | Draft opens; no `BLE match ... not found` (main looked up BLE only; this branch looks up the `kind` the card sends) | `icebreaker_service.py:173`, `encounter_api.py:817` `_icebreaker_kind`; `test_gps_match_gets_a_draft`, `test_pending_gps_match_has_no_icebreaker` | unit | | read | not run |
 | 3 | Draft generated and shown | Tap Break the ice | `POST /encounter/icebreaker/draft {match_id, kind}` 200 with `draft` and `alt_drafts`; sheet shows the draft in an editable field; a server error shows as an error, never as a draft | `encounter_api.py:901`; J207; app sheet `IcebreakerDraftSheet.js` (Android `components/CommunityView/components/Encounters/`, iOS `js/shared/components/CommunityView/components/Encounters/`) | unit | | read | not run |
