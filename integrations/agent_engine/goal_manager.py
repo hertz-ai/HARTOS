@@ -293,6 +293,43 @@ class GoalManager:
     # are operational parameters — they tune the agent's runtime
     # behavior but do not change WHO the agent is, so they bypass
     # consensus to keep the hot path cheap.
+    @staticmethod
+    def resume_goal(db: Session, goal_id: str, resumed_by: str) -> Dict:
+        """The ONE way a paused goal becomes active again.  The dashboard's
+        resume verb and the agent daemon's resume both call it (review of
+        26b5f8177, finding 7: two resume paths with different semantics,
+        one leaving the old pause reason and strike count on the goal).
+
+        Moves the pause record (pause_reason, paused_at, pause_cause,
+        paused_by) to its last_* history keys, counts the resume and stamps
+        who resumed it, then writes the status through update_goal_status.
+        A goal that is not paused is refused; a refused status write leaves
+        the config exactly as it was.  The config is replaced by a NEW dict
+        so the JSON column sees the change.
+        """
+        from datetime import datetime
+        from integrations.social.models import AgentGoal
+
+        goal = db.query(AgentGoal).filter_by(id=goal_id).first()
+        if not goal:
+            return {'success': False, 'error': 'Goal not found'}
+        if goal.status != 'paused':
+            return {'success': False,
+                    'error': f'not paused (status {goal.status})'}
+        prior = goal.config_json
+        cfg = dict(prior or {})
+        for key in ('pause_reason', 'paused_at', 'pause_cause', 'paused_by'):
+            if key in cfg:
+                cfg['last_' + key] = cfg.pop(key)
+        cfg['resume_count'] = int(cfg.get('resume_count', 0) or 0) + 1
+        cfg['resumed_at'] = datetime.utcnow().isoformat()
+        cfg['resumed_by'] = str(resumed_by or 'unknown')
+        goal.config_json = cfg
+        result = GoalManager.update_goal_status(db, goal_id, 'active')
+        if not result.get('success'):
+            goal.config_json = prior
+        return result
+
     _PERSONA_FIELDS = frozenset({'description', 'title'})
 
     @staticmethod

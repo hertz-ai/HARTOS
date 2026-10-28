@@ -385,13 +385,65 @@ _RESUME_RETRY_INTERVAL_S = 1800
 _last_probe_resume_at = 0.0
 
 
+#: The structured record of why this daemon paused a goal.  The prose in
+#: pause_reason is for people; this is what code reads.
+PAUSE_CAUSE_DISPATCH_FAILURES = 'dispatch_failures'
+
+
 def _paused_for_dispatch_failures(goal) -> bool:
-    """True for a goal this daemon auto-paused after consecutive dispatch
-    failures (the record it writes below).  A pause for ledger grounding,
-    budget, consent or a person's help has a different cause and keeps."""
-    reason = str((goal.config_json or {}).get('pause_reason') or '')
+    """True for a goal THIS daemon auto-paused after consecutive dispatch
+    failures.  A pause for ledger grounding, budget, consent, a person's
+    help, or a person's own dashboard pause has a different cause and
+    keeps.
+
+    The record is cfg['pause_cause'] (written by
+    _auto_pause_for_dispatch_failures; 'person' by the dashboard's pause).
+    A row paused before that key existed carries only the prose, and is
+    accepted on it only while nothing has resumed it since (a resume moves
+    the record to history, so a later pause of any kind is never read as
+    this daemon's).  Measured on central 2026-10-29: 0 dashboard steers in
+    the audit log, so every such legacy row there is the daemon's own.
+    """
+    cfg = goal.config_json or {}
+    cause = cfg.get('pause_cause')
+    if cause is not None:
+        return cause == PAUSE_CAUSE_DISPATCH_FAILURES
+    reason = str(cfg.get('pause_reason') or '')
     return (reason.startswith('Auto-paused:')
-            and 'consecutive dispatch failures' in reason)
+            and 'consecutive dispatch failures' in reason
+            and 'resume_count' not in cfg)
+
+
+def _auto_pause_for_dispatch_failures(db, goal, goal_key, failure_count, why):
+    """Pause a goal after consecutive dispatch failures: the prose for a
+    person, the structured cause for code, the strike count ended (the
+    pause IS the record now; a lingering count blocked the probe below for
+    the whole process lifetime: review of 26b5f8177, finding 1), and, once
+    the daemon's retries are spent, the ASK the owner's gate rule requires
+    (BLOCK + ASK + RECOVERY) through the existing _tell_its_person, once."""
+    goal.status = 'paused'
+    cfg = dict(goal.config_json or {})  # new dict: JSON column
+    cfg['pause_reason'] = (
+        f'Auto-paused: {failure_count} consecutive dispatch failures'
+        + (f' (last: {why})' if why else ''))
+    cfg['paused_at'] = datetime.utcnow().isoformat()
+    cfg['pause_cause'] = PAUSE_CAUSE_DISPATCH_FAILURES
+    cfg['paused_by'] = 'daemon'
+    goal.config_json = cfg
+    with _module_lock:
+        _dispatch_backoff.pop(goal_key, None)
+    logger.warning(
+        f"Goal {goal_key} AUTO-PAUSED after {failure_count} dispatch failures")
+    if int(cfg.get('daemon_resume_count', 0) or 0) >= _RESUME_CAP:
+        try:
+            from .goal_manager import GoalManager
+            if GoalManager._tell_its_person(
+                    db, goal,
+                    f"{cfg['pause_reason']}. The daemon retried it "
+                    f"{_RESUME_CAP} times; it stays paused until you resume it."):
+                goal.config_json = dict(cfg, told_at=datetime.utcnow().isoformat())
+        except Exception as exc:
+            logger.debug(f"Goal {goal_key}: could not tell its person: {exc}")
 
 
 def _resume_goals_paused_for_a_cleared_cause(db, cause_cleared, now=None):
@@ -407,69 +459,77 @@ def _resume_goals_paused_for_a_cleared_cause(db, cause_cleared, now=None):
 
     ``cause_cleared`` True is a dispatch that just succeeded on this node:
     the evidence the failures' cause has gone, so up to _RESUME_BATCH goals
-    are released.  False is the per-tick probe: with no active goal still
-    failing (the backoff table, the existing record of that, is empty of
-    failures) ONE goal is re-tried per _RESUME_RETRY_INTERVAL_S, so an
-    all-paused node re-tests its cause without an outside hand.  Each goal
-    gets _RESUME_CAP resumes, then stays paused for a person.
+    are released.  False is the per-tick probe: with no ACTIVE goal still
+    failing (its backoff entry, the existing record of that) ONE goal is
+    re-tried per _RESUME_RETRY_INTERVAL_S, so an all-paused node re-tests
+    its cause without an outside hand.  Each goal gets _RESUME_CAP daemon
+    resumes per pause episode (the count is reset when it runs again), then
+    stays paused and its person is told at the pause.
 
-    The status moves only through GoalManager.update_goal_status (the
-    writer /api/goals and the dashboard steer use); the goal's backoff entry
-    is cleared so the retry starts at zero failures; the config keeps the
-    history (last_pause_reason, last_paused_at, resume_count, resumed_at,
-    resumed_by) as a NEW dict so the JSON column sees the change.  Never
-    raises: a refused write leaves the goal exactly as it was.
+    Only this daemon's goals: coding goal types belong to coding_daemon,
+    which writes the same prose into the same table (review of 26b5f8177,
+    finding 3).  The resume itself is GoalManager.resume_goal, the one
+    routine the dashboard uses too; the goal's backoff entry is cleared so
+    the retry starts at zero; the write is committed here, because the
+    tick's own commit sits behind two early returns that discarded a
+    flushed resume (finding 4).  Never raises: a refused write leaves the
+    goal exactly as it was.
     """
     global _last_probe_resume_at
     try:
+        from integrations.social.models import AgentGoal
+        from .goal_manager import GoalManager, CODING_GOAL_TYPES
         if cause_cleared:
             budget = _RESUME_BATCH
         else:
+            if time.monotonic() - _last_probe_resume_at < _RESUME_RETRY_INTERVAL_S:
+                return []
+            active_ids = {str(row[0]) for row in db.query(AgentGoal.id).filter(
+                AgentGoal.status == 'active').all()}
             with _module_lock:
                 still_failing = any(
                     int((info or {}).get('failures', 0) or 0) > 0
-                    for info in _dispatch_backoff.values())
+                    for key, info in _dispatch_backoff.items()
+                    if str(key) in active_ids)
             if still_failing:
                 return []
-            if time.monotonic() - _last_probe_resume_at < _RESUME_RETRY_INTERVAL_S:
-                return []
             budget = 1
-        from integrations.social.models import AgentGoal
-        from .goal_manager import GoalManager
-        paused = db.query(AgentGoal).filter(AgentGoal.status == 'paused').all()
+        paused = db.query(AgentGoal).filter(
+            AgentGoal.status == 'paused',
+            ~AgentGoal.goal_type.in_(CODING_GOAL_TYPES),
+        ).all()
         eligible = [
             g for g in paused
             if _paused_for_dispatch_failures(g)
-            and int((g.config_json or {}).get('resume_count', 0) or 0) < _RESUME_CAP]
+            and int((g.config_json or {}).get('daemon_resume_count', 0) or 0)
+            < _RESUME_CAP]
         eligible.sort(key=lambda g: str((g.config_json or {}).get('paused_at') or ''))
-        stamp = (now or datetime.utcnow()).isoformat()
         resumed = []
         for goal in eligible[:budget]:
-            cfg = dict(goal.config_json or {})
-            prior = dict(cfg)
-            cfg['last_pause_reason'] = cfg.pop('pause_reason', None)
-            cfg['last_paused_at'] = cfg.pop('paused_at', None)
-            cfg['resume_count'] = int(cfg.get('resume_count', 0) or 0) + 1
-            cfg['resumed_at'] = stamp
-            cfg['resumed_by'] = ('daemon:cause_cleared' if cause_cleared
-                                 else 'daemon:retry_probe')
-            goal.config_json = cfg
-            result = GoalManager.update_goal_status(db, goal.id, 'active')
+            by = 'daemon:cause_cleared' if cause_cleared else 'daemon:retry_probe'
+            result = GoalManager.resume_goal(db, goal.id, resumed_by=by)
             if not result.get('success'):
-                goal.config_json = prior
                 logger.warning(
-                    f"Goal {goal.id}: resume refused by the status writer "
-                    f"({result.get('error')}); left paused")
+                    f"Goal {goal.id}: resume refused ({result.get('error')}); "
+                    f"left paused")
                 continue
+            cfg = dict(goal.config_json or {})
+            cfg['daemon_resume_count'] = int(
+                cfg.get('daemon_resume_count', 0) or 0) + 1
+            goal.config_json = cfg
             with _module_lock:
                 _dispatch_backoff.pop(str(goal.id), None)
             resumed.append(goal.id)
             logger.info(
-                f"Goal {goal.id} RESUMED by the daemon ({cfg['resumed_by']}, "
-                f"resume {cfg['resume_count']} of {_RESUME_CAP}) after: "
-                f"{str(cfg['last_pause_reason'])[:120]}")
-        if resumed and not cause_cleared:
-            _last_probe_resume_at = time.monotonic()
+                f"Goal {goal.id} RESUMED by the daemon ({by}, retry "
+                f"{cfg['daemon_resume_count']} of {_RESUME_CAP}) after: "
+                f"{str(cfg.get('last_pause_reason'))[:120]}")
+        if resumed:
+            if not cause_cleared:
+                _last_probe_resume_at = time.monotonic()
+            commit = getattr(db, 'commit', None)
+            if callable(commit):
+                commit()
         return resumed
     except Exception as exc:
         logger.warning(f"Resume of paused goals skipped: {exc}")
@@ -2086,6 +2146,16 @@ class AgentDaemon:
                 goal_key = str(goal.id)
                 with _module_lock:
                     backoff_info = _dispatch_backoff.get(goal_key)
+                    if backoff_info and int(
+                            backoff_info.get('failures', 0) or 0) >= 5:
+                        # An ACTIVE goal carrying a completed strike count
+                        # was resumed by someone other than this daemon (the
+                        # dashboard, which cannot reach this table).  Those
+                        # strikes belong to the pause that ended; without
+                        # this it re-paused after ONE failure (review of
+                        # 26b5f8177, finding 7).
+                        _dispatch_backoff.pop(goal_key, None)
+                        backoff_info = None
                 if backoff_info and time.time() < backoff_info.get('skip_until', 0):
                     logger.debug(
                         f"Skipping goal {goal_key}: backoff "
@@ -2165,6 +2235,10 @@ class AgentDaemon:
                     dispatched += _ran + _held
                     with _module_lock:
                         _dispatch_backoff.pop(goal_key, None)
+                    # A fan-out that ran is a success on this node too, and
+                    # the same evidence that a dispatch-failure pause's cause
+                    # has gone (review of 26b5f8177, finding 8).
+                    _resume_goals_paused_for_a_cleared_cause(db, cause_cleared=True)
                     handed_off = True
                     result = 'parallel-handoff'
                 elif _held > 0:
@@ -2288,22 +2362,22 @@ class AgentDaemon:
                         _dispatch_backoff[goal_key] = info
                         failure_count = info['failures']
                     if failure_count >= 5:
-                        # Auto-pause after 5 consecutive failures
-                        goal.status = 'paused'
-                        cfg = dict(goal.config_json or {})  # copy: see above
-                        cfg['pause_reason'] = (
-                            f'Auto-paused: {failure_count} consecutive '
-                            f'dispatch failures'
-                            + (f' (last: {_why})' if _why else ''))
-                        cfg['paused_at'] = datetime.utcnow().isoformat()
-                        goal.config_json = cfg
-                        logger.warning(
-                            f"Goal {goal_key} AUTO-PAUSED after "
-                            f"{failure_count} dispatch failures")
+                        # Auto-pause after 5 consecutive failures: the record,
+                        # the strike count's end and the ask at the cap live
+                        # in _auto_pause_for_dispatch_failures.
+                        _auto_pause_for_dispatch_failures(
+                            db, goal, goal_key, failure_count, _why)
                 else:
                     # Success — clear backoff
                     with _module_lock:
                         _dispatch_backoff.pop(goal_key, None)
+                    if (goal.config_json or {}).get('daemon_resume_count'):
+                        # This goal ran again: the daemon's retries are spent
+                        # per pause episode, not for life (review of
+                        # 26b5f8177, finding 6).  New dict: JSON column.
+                        _cfg = dict(goal.config_json)
+                        _cfg.pop('daemon_resume_count', None)
+                        goal.config_json = _cfg
                     # ...and this success is the evidence that whatever paused
                     # other goals for dispatch failures has gone: release a
                     # few of them (bounded; each gets _RESUME_CAP tries).
