@@ -360,16 +360,49 @@ if __name__ == '__main__':
     pytest.main([__file__, '-v'])
 
 
-def test_claude_is_priced_with_the_gpt4o_class_not_as_unknown():
-    """Owner policy 2026-10-12: Claude is the expert tier on central.  Priced
-    by family like every other cloud model, so the Spark estimate and the
-    expert selector's cost gate see the same number.  Before this row the
-    name fell to the unknown-model default."""
-    from integrations.agent_engine.budget_gate import spark_per_1k
-    assert spark_per_1k('claude-sonnet-4-5') == spark_per_1k('gpt-4o') == 4
-    assert spark_per_1k('claude-haiku-4-5') == 4
-    assert spark_per_1k('some-unknown-model') == 2
-    assert spark_per_1k('qwen3-27b') == 0
+def test_a_priced_family_reserves_from_the_one_dollar_table(monkeypatch):
+    """Owner policy 2026-10-12 priced Claude in dollars (core.autogen_config
+    .EXPERT_USD_PER_1K, the ONE price table, read with the owner's pin by
+    family_usd_per_1k).  The Spark reservation used to carry its own
+    'claude': 4 beside it, so a pin on HEVOLVE_CLAUDE_USD_PER_1K_OUT moved
+    the meter and the day cap but not the reservation or the registry's
+    max_cost filter (parallel-path audit 2026-10-27, item 1).  The
+    reservation is now derived from that table: the larger of the family's
+    input and output price per 1k, times HEVOLVE_SPARK_PER_USD, rounded up,
+    an upper bound on what the meter then records; the pin and the rate move
+    reservation and meter alike.  Every other family keeps the Spark map."""
+    from integrations.agent_engine import budget_gate as bg
+    for v in ('HEVOLVE_CLAUDE_USD_PER_1K_IN', 'HEVOLVE_CLAUDE_USD_PER_1K_OUT',
+              'HEVOLVE_SPARK_PER_USD'):
+        monkeypatch.delenv(v, raising=False)
+    # list price (0.003, 0.015) at 100 Spark per dollar: ceil(1.5) = 2
+    assert bg.spark_per_1k('claude-sonnet-4-5') == 2
+    assert bg.spark_per_1k('anthropic/claude-haiku-4-5') == 2
+    assert bg.blended_usd_per_1k('claude-sonnet-4-5', 0, 1000) == 0.015
+    monkeypatch.setenv('HEVOLVE_CLAUDE_USD_PER_1K_OUT', '0.03')
+    assert bg.spark_per_1k('claude-sonnet-4-5') == 3               # the pin moves the reservation
+    assert bg.blended_usd_per_1k('claude-sonnet-4-5', 0, 1000) == 0.03   # and the meter
+    monkeypatch.setenv('HEVOLVE_SPARK_PER_USD', '1000')
+    assert bg.spark_per_1k('claude-sonnet-4-5') == 30              # the rate moves it too
+    assert bg.spark_per_1k('gpt-4o') == 4                          # the map still prices the rest
+    assert bg.spark_per_1k('some-unknown-model') == 2
+    assert bg.spark_per_1k('qwen3-27b') == 0
+    assert 'claude' not in bg._MODEL_COST_MAP                      # one price, not two
+
+
+def test_one_spark_per_dollar_reading_in_the_budget_gate(monkeypatch):
+    """HEVOLVE_SPARK_PER_USD was read at three sites in this module, two
+    spellings (int at the usage record, float at the meter); one reader now,
+    and junk falls to the default rather than raising inside a meter."""
+    from integrations.agent_engine import budget_gate as bg
+    monkeypatch.delenv('HEVOLVE_SPARK_PER_USD', raising=False)
+    assert bg.spark_per_usd() == 100.0
+    monkeypatch.setenv('HEVOLVE_SPARK_PER_USD', '250')
+    assert bg.spark_per_usd() == 250.0
+    monkeypatch.setenv('HEVOLVE_SPARK_PER_USD', 'lots')
+    assert bg.spark_per_usd() == 100.0
+    monkeypatch.setenv('HEVOLVE_SPARK_PER_USD', '0')
+    assert bg.spark_per_usd() > 0                                  # never a division by zero
 
 
 # ── Dollar meter + the Claude day cap (owner policy 2026-10-12) ─────────────

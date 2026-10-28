@@ -103,11 +103,16 @@ def registry(monkeypatch):
 def test_registered_as_expert_priced_like_claude(registry, monkeypatch):
     for k, v in EXPERT_ENV.items():
         monkeypatch.setenv(k, v)
+    for v in ('HEVOLVE_CLAUDE_USD_PER_1K_IN', 'HEVOLVE_CLAUDE_USD_PER_1K_OUT',
+              'HEVOLVE_SPARK_PER_USD'):
+        monkeypatch.delenv(v, raising=False)
     assert mr.ensure_configured_expert_registered() is True
     m = registry.get_model('configured-expert')
     assert m.tier is mr.ModelTier.EXPERT
     assert m.is_dispatchable() and m.is_local
-    assert m.cost_per_1k_tokens == 4                    # the claude family price
+    # the claude family price, derived from the one dollar table
+    # (core.autogen_config.EXPERT_USD_PER_1K): ceil(0.015 * 100) Spark per 1k
+    assert m.cost_per_1k_tokens == 2
     assert m.config_list_entry['model'] == 'claude-sonnet-4-5'
     assert m.config_list_entry['base_url'] == 'http://172.17.0.1:8100/llm/v1'
 
