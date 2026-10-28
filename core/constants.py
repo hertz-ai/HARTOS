@@ -128,6 +128,13 @@ WIRE_TRIM_MARKER: str = '\n...[truncated middle]...\n'
 # 2026-09-27, liveprobe_reuse_1: a fixed half/half cut lost the middle of
 # the user's words).
 ACTION_STEPS_SEPARATOR: str = '\n follow these steps: '
+# How every REUSE dispatch turn begins ("Perform this action -> Action #N:").
+# Written by reuse_recipe._build_reuse_action_message, whose module keeps the
+# same literal as _REUSE_ACTION_MESSAGE_PREFIX (its extract-and-exec tests need
+# its constants literal; tests/unit/test_wire_trim_keeps_the_newest_order.py
+# pins the two equal).  Read by the wire trim to find the NEWEST order in a
+# user turn the ROLE-ORDER-GUARD merged from several (keep_head_cut).
+ACTION_DISPATCH_PREFIX: str = 'Perform this action -> Action #'
 # Seed injected at the wire when an outbound body carries no role='user'
 # turn.  llama-server's Qwen3 chat template raises a hard 500 "No user
 # query found in messages." whenever the messages array reaches it without

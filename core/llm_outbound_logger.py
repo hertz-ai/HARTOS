@@ -1238,7 +1238,10 @@ def _truncate_msg_content(msg: dict, target_chars: int, marker: str,
         return msg, 0  # nothing left to elide without cutting the head
     if callable(marker):
         marker = marker(text)  # a pointer to this text (see elided_pointer)
-    new_text = _middle_cut(text, head_chars, tail_chars, marker)
+    # A dispatch turn is cut by the limiter's cut too, which also keeps the
+    # newest order a merged turn carries (keep_head_cut).
+    new_text = (keep_head_cut(text, head_chars, tail_chars, marker) if keep
+                else _middle_cut(text, head_chars, tail_chars, marker))
     if isinstance(new_msg.get('content'), list):
         new_parts = []
         replaced = False
@@ -1539,7 +1542,8 @@ def must_keep_head(text: str, role='user') -> int:
     are conversation turns only: autogen adds the system prompt after the
     transforms).  Only a user turn is a dispatch turn: a system prompt that
     happens to contain the separator is cut like any other (review of
-    f97b6bed8)."""
+    f97b6bed8).  The cut both places make, keep_head_cut, also keeps the
+    newest order of a turn merged from several (newest_order_head)."""
     if role != 'user' or not isinstance(text, str):
         return 0
     from core.constants import ACTION_STEPS_SEPARATOR
@@ -1547,11 +1551,58 @@ def must_keep_head(text: str, role='user') -> int:
     return at + len(ACTION_STEPS_SEPARATOR) if at >= 0 else 0
 
 
+def newest_order_head(text: str):
+    """``(start, end)`` of the NEWEST order a dispatch turn carries -- its
+    ``ACTION_DISPATCH_PREFIX`` marker through its ``ACTION_STEPS_SEPARATOR``
+    -- or None when the text holds no complete order.
+
+    A user turn can carry several orders: the ROLE-ORDER-GUARD (hartos.helper
+    ToolMessageHandler) joins consecutive user turns, so action 3's order can
+    sit after action 1's in one message.  Ask it only of a dispatch turn
+    (must_keep_head > 0): a system prompt can hold both strings."""
+    from core.constants import ACTION_DISPATCH_PREFIX, ACTION_STEPS_SEPARATOR
+    if not isinstance(text, str):
+        return None
+    at = text.rfind(ACTION_STEPS_SEPARATOR)
+    if at < 0:
+        return None
+    start = text.rfind(ACTION_DISPATCH_PREFIX, 0, at)
+    if start < 0:
+        return None
+    return start, at + len(ACTION_STEPS_SEPARATOR)
+
+
 def keep_head_cut(text: str, keep: int, tail_chars: int, marker: str) -> str:
     """``text``'s first ``keep`` characters whole, then ``marker``, then its
     last ``tail_chars``: the cut both the trim and the limiter make of a
-    dispatch turn (must_keep_head)."""
-    return _middle_cut(text, keep, max(0, tail_chars), marker)
+    dispatch turn (must_keep_head).
+
+    When the turn carries a newer order than the one its head keeps
+    (newest_order_head), that order's marker is kept whole as well, out of
+    the tail's share, and the older text between the two is what goes: the
+    oldest text is cut first, never the latest order appended (owner,
+    2026-10-28).  Live 2026-10-28 21:32, agent 54 (llm_outbound rows 85-106):
+    seven of the nine requests the tool seats made during action 3 carried
+    its order only in a turn merged after action 1's; the cut kept action
+    1's head and elided action 3's, and the model repeated action 1's calls
+    until the fabrication gate gave the action up."""
+    from core.constants import WIRE_TRIM_MARKER
+    tail_chars = max(0, tail_chars)
+    span = newest_order_head(text)
+    if span is None or span[1] <= keep or span[0] >= len(text) - tail_chars:
+        # The newest order is the one the head keeps, or the tail holds it.
+        return _middle_cut(text, keep, tail_chars, marker)
+    start, end = span
+    if start <= keep:
+        # It runs on from the head: one cut, after it.
+        return _middle_cut(text, end, max(0, tail_chars - (end - keep)), marker)
+    room = tail_chars - (end - start)
+    if room >= len(text) - end:
+        # Everything after it fits: one cut, before it.
+        return _middle_cut(text, keep, len(text) - start, marker)
+    room -= len(WIRE_TRIM_MARKER)
+    return (_middle_cut(text[:end], keep, end - start, marker)
+            + _middle_cut(text[end:], 0, max(0, room), WIRE_TRIM_MARKER))
 
 
 def ensure_user_turn(messages: list) -> bool:
