@@ -20,6 +20,9 @@ from .models import (
     _uuid, after_commit,
 )
 from .auth import hash_password, verify_password, generate_api_token, generate_jwt
+# The module, not the names: the one refusal rule is read at call time, so a
+# refusal added to auth.user_refusal (or a test standing one in) reaches login.
+from . import auth as _auth
 
 
 def _community_name_for(db: Session, post: Post) -> Optional[str]:
@@ -336,10 +339,9 @@ class UserService:
         # This door mints a JWT, so it asks the ONE "may this person act
         # here" rule the Bearer doors ask (auth.user_refusal), in this
         # door's own reply shape ("Account is banned").
-        from .auth import user_refusal
-        why = user_refusal(user)
+        why = _auth.user_refusal(user)
         if why:
-            raise ValueError("Account is " + why)
+            raise ValueError("Account is " + _auth.user_refusal_words(why))
         # Clear lockout on successful login
         with UserService._login_lock:
             UserService._login_attempts.pop(username, None)

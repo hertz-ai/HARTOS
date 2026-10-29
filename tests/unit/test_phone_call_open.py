@@ -420,18 +420,22 @@ class TestWhatIsRefused:
         SQL for is_banned, so a new refusal in require_auth never reached it
         (parallel-path audit 2026-10-27, item 4)."""
         from integrations.social import auth
+        from tests.unit.test_user_refusal_one_rule import ADDED_REFUSAL
         person = _user(db)
         agent = _user(db, 'agent', owner_id=person)
         real = getattr(auth, 'user_refusal', lambda user: None)
 
         def on_leave(user):
             if user is not None and str(user.id) == person:
-                return 'on_leave'
+                return ADDED_REFUSAL
             return real(user)
         monkeypatch.setattr(auth, 'user_refusal', on_leave, raising=False)
         reply = _open(_phone(person), agent)
+        # The frame's detail is the rule's word itself: a wire field the
+        # phone app keys on, not prose for the person (phone_call
+        # ._person_refusal: "reaches this door unchanged").
         assert reply == {'type': 'call_refused', 'id': 'c1', 'reason': 'not_allowed',
-                         'detail': 'on_leave'}
+                         'detail': ADDED_REFUSAL}
         assert _open_calls(db, person) == []
 
     def test_hanging_up_when_calls_are_switched_off(self, db, monkeypatch):

@@ -338,16 +338,31 @@ def user_refusal(user):
     node, or None when they may: 'no_user', 'banned'.
 
     The ONE "may this person act here" rule.  Every door that admits a
-    person, or mints them a token, asks it: the Bearer doors through
-    _get_user_from_token (JWT, api_token and the Kong fallback),
-    user_id_for_token, the steering caller (dashboard_service
+    person by their account, or mints them a token for one, asks it: the
+    Bearer doors through _get_user_from_token (JWT, api_token and the Kong
+    fallback), user_id_for_token, the steering caller (dashboard_service
     .steering_caller), the phone's device-link door
-    (phone_call._person_refusal), and the two JWT-minting doors, the
-    password login (services.UserService.login) and the Hevolve link
-    (api.link_hevolve).  A refusal added here reaches them all; each door
-    keeps its own reply shape.  Before, each door re-read is_banned for
-    itself and the phone door ran its own SQL, so a refusal added to one
-    never reached the others (parallel-path audit 2026-10-27, item 4).
+    (phone_call._person_refusal), and the five token-minting doors, the
+    password login (services.UserService.login), the Hevolve link
+    (api.link_hevolve), a guest's device re-registration
+    (api.guest_register, existing device_id), a guest's recovery code
+    (api.guest_recover) and an external bot's re-registration
+    (external_bot_bridge.ExternalBotRegistry.register_bot).  A refusal
+    added here reaches them all; each door keeps its own reply shape, and
+    one that shows the person why words it through user_refusal_words.
+    Before, each door re-read is_banned for itself and the phone door ran
+    its own SQL, so a refusal added to one never reached the others
+    (parallel-path audit 2026-10-27, item 4).
+
+    Doors that do NOT ask, by design, because they never read the account:
+    the API gate (security.middleware._require_api_key_or_bearer) and POST
+    /chat admit a JWT by its decoded payload until it expires, and
+    /auth/refresh (api.refresh_token) re-mints from a refresh token through
+    JWTManager alone.  A ban reaches those holders when their token expires
+    or is revoked (revoke_token), not before; whether they should read the
+    row on every turn is the owner's call (a users-row read per turn).  The
+    create paths of guest_register and link_hevolve make a new account, so
+    there is nothing to ask about yet.
     Tenancy (require_auth's cloud-mode check) is a door's own concern and
     stays there; a listing that filters banned users out of search results
     is a different question (who is shown), not this one (who may act).
@@ -357,6 +372,14 @@ def user_refusal(user):
     if getattr(user, 'is_banned', False):
         return 'banned'
     return None
+
+
+def user_refusal_words(why) -> str:
+    """The rule's answer as said to a person: its word with the underscores
+    read as spaces ('no_user' -> 'no user'), so a door that shows why ("Account
+    banned", "Account is on leave") composes its reply through one reading and
+    a mechanism token never reaches them."""
+    return str(why or '').replace('_', ' ')
 
 
 def _get_user_from_token(token: str):

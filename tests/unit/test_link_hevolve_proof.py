@@ -131,13 +131,14 @@ def test_an_account_the_one_rule_refuses_gets_no_token(client, monkeypatch):
     door read is_banned for itself and a person the rule refused was still
     given a JWT (parallel-path audit 2026-10-27, item 4 rework)."""
     from integrations.social import auth
+    from tests.unit.test_user_refusal_one_rule import ADDED_REFUSAL
     monkeypatch.setattr(auth, 'user_refusal',
-                        lambda user: 'no_user' if user is None else 'on_leave',
+                        lambda user: 'no_user' if user is None else ADDED_REFUSAL,
                         raising=False)
     with patch.object(kong_identity, 'email_for_token', return_value=OWNER):
         resp = _link(client, OWNER, token='kong-token')
     assert resp.status_code == 403
-    assert resp.get_json()['error'] == 'Account on_leave'
+    assert resp.get_json()['error'] == 'Account on leave'
     assert 'data' not in resp.get_json()
 
 

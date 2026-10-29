@@ -170,6 +170,27 @@ class TestRegisterBotHappyPath:
         assert second.id == first_id
         assert second.api_token == first_token
 
+    def test_a_banned_bot_re_registering_gets_no_token(self, db, monkeypatch):
+        """The idempotent branch hands an existing bot its api_token back; it
+        asks the one "may this account act here" rule first
+        (integrations.social.auth.user_refusal), with this door's own reply
+        (ValueError "Account is <why>"), so a banned bot, or one the rule
+        refuses later, gets nothing (reviewer of 10f6fa50b, F1)."""
+        from integrations.social import auth
+        first = ExternalBotRegistry.register_bot(
+            db, bot_id='same2', bot_name='calm.jade.oracle', platform='openclaw')
+        first.is_banned = True
+        db.flush()
+        with pytest.raises(ValueError, match='Account is banned'):
+            ExternalBotRegistry.register_bot(
+                db, bot_id='same2', bot_name='calm.jade.oracle', platform='openclaw')
+        first.is_banned = False
+        db.flush()
+        monkeypatch.setattr(auth, 'user_refusal', lambda user: 'on_leave', raising=False)
+        with pytest.raises(ValueError, match='Account is on leave'):
+            ExternalBotRegistry.register_bot(
+                db, bot_id='same2', bot_name='calm.jade.oracle', platform='openclaw')
+
 
 # ═════════════════════════════════════════════════════════════════════
 # register_bot — ACCOUNT-TAKEOVER guard (the security bug)

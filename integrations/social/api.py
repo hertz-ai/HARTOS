@@ -184,7 +184,7 @@ def link_hevolve():
     """
     import re
     import secrets
-    from .auth import generate_jwt, generate_api_token, user_refusal
+    from .auth import generate_jwt, generate_api_token, user_refusal, user_refusal_words
     from .kong_identity import email_for_token
 
     data = _get_json()
@@ -214,7 +214,7 @@ def link_hevolve():
             # door's own reply shape ("Account banned", 403).
             why = user_refusal(user)
             if why:
-                return _err("Account " + why, 403)
+                return _err("Account " + user_refusal_words(why), 403)
             token = generate_jwt(user.id, user.username, user.role or 'flat')
             return _ok({'user': user.to_dict(), 'token': token})
 
@@ -278,7 +278,8 @@ def guest_register():
     create new user).
     """
     import secrets
-    from .auth import hash_password, generate_api_token, generate_jwt
+    from .auth import (hash_password, generate_api_token, generate_jwt,
+                       user_refusal, user_refusal_words)
     from .models import GuestRecovery
 
     data = _get_json()
@@ -302,6 +303,13 @@ def guest_register():
                     db.query(User).filter_by(id=existing.user_id).first()
                 )
                 if existing_user and existing_user.user_type == 'guest':
+                    # This path mints a JWT for an existing account, so it
+                    # asks the ONE "may this person act here" rule the
+                    # Bearer doors ask (auth.user_refusal), in this door's
+                    # own reply shape ("Account banned", 403).
+                    why = user_refusal(existing_user)
+                    if why:
+                        return _err("Account " + user_refusal_words(why), 403)
                     # Fresh JWT — client likely re-registered because
                     # the old one expired.  No new recovery code (would
                     # invalidate their saved one).
@@ -382,7 +390,7 @@ def guest_register():
 @rate_limit('auth')
 def guest_recover():
     """Recover guest identity using the 6-word recovery code."""
-    from .auth import verify_password, generate_jwt
+    from .auth import verify_password, generate_jwt, user_refusal, user_refusal_words
     from .models import GuestRecovery
     from datetime import datetime
 
@@ -400,6 +408,12 @@ def guest_recover():
                     user = db.query(User).filter_by(id=gr.user_id).first()
                     if not user:
                         continue
+                    # The code names this account: it mints a JWT for it,
+                    # so it asks the ONE "may this person act here" rule
+                    # (auth.user_refusal), in this door's own reply shape.
+                    why = user_refusal(user)
+                    if why:
+                        return _err("Account " + user_refusal_words(why), 403)
                     gr.last_used_at = datetime.utcnow()
                     gr.device_id = device_id or gr.device_id
                     token = generate_jwt(user.id, user.username, user.role or 'guest')
