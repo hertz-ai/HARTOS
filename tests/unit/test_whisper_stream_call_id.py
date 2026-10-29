@@ -18,7 +18,12 @@ to spin up the actual whisper subprocess + websockets server.
 from __future__ import annotations
 
 import ast
+import asyncio
+import io
+import json
+import threading
 import unittest
+import wave
 
 
 class WsPathParserTest(unittest.TestCase):
@@ -345,6 +350,75 @@ class MicLearningConsentGateTest(unittest.TestCase):
                          and n.id == '_maybe_ingest_audio_sensor']
                 self.assertEqual(inner, [],
                                  'the producer is gated on call_id again')
+
+
+class FinalizeFeedsTheLearnerTheUtteranceTest(unittest.TestCase):
+    """The learner is handed the SAME audio the transcriber decoded.
+
+    _emit_final is the one finalization path ({control:final}, the 30 s
+    overflow, the VAD pause).  It transcribes the accumulated buffer and
+    hands the utterance's PCM to _maybe_ingest_audio_sensor on the executor.
+    _transcribe_buffer EMPTIES the caller's buffer on that final path
+    (keep_buffer=False), so the order of the two reads decides whether the
+    learner ever hears anything.  With the PCM read after the transcribe,
+    every final hands the ingest b'' and it returns at its first line; the
+    MicLearningConsentGateTest cases above call the ingest directly with
+    audio, so they cannot see that.  This test drives the real _emit_final
+    with the real _transcribe_buffer; only the STT worker call is stood in,
+    and it reads back the WAV it was asked to decode.
+    """
+
+    def test_the_learner_gets_the_utterance_the_transcriber_decoded(self):
+        from unittest import mock
+        from integrations.service_tools import whisper_tool as wt
+
+        pcm = b'\x01\x02' * (wt.STREAM_SAMPLE_RATE * 2)   # 2 s: above the 1 s floor
+        decoded = []
+
+        def _worker(req):
+            with wave.open(req['audio_path'], 'rb') as w:
+                decoded.append(w.readframes(w.getnframes()))
+            return {'raw_json': json.dumps({'text': 'red ball', 'language': 'en'})}
+
+        handed = {}
+        ran = threading.Event()
+
+        def _ingest(call_id, user_id, pcm_bytes, transcript, lang):
+            handed.update(call_id=call_id, user_id=user_id, pcm=pcm_bytes,
+                          transcript=transcript, lang=lang)
+            ran.set()
+
+        class _WS:
+            def __init__(self):
+                self.sent = []
+
+            async def send(self, payload):
+                self.sent.append(json.loads(payload))
+
+        ws = _WS()
+        loop = asyncio.new_event_loop()
+        try:
+            with mock.patch.object(wt, '_stt_call', _worker), \
+                    mock.patch.object(wt, '_maybe_ingest_audio_sensor', _ingest):
+                sent = loop.run_until_complete(
+                    wt._emit_final(ws, io.BytesIO(pcm), None, None, 'alice'))
+                self.assertTrue(ran.wait(10),
+                                'the producer never ran on the executor')
+        finally:
+            loop.close()
+
+        self.assertTrue(sent)
+        self.assertEqual([m['text'] for m in ws.sent], ['red ball'])
+        self.assertEqual(decoded, [pcm],
+                         'the transcriber must decode the whole utterance')
+        self.assertEqual(handed['transcript'], 'red ball')
+        self.assertEqual(handed['lang'], 'en')
+        self.assertEqual(handed['user_id'], 'alice')
+        self.assertEqual(
+            len(handed['pcm']), len(pcm),
+            'the learner was handed %d of the utterance\'s %d bytes'
+            % (len(handed['pcm']), len(pcm)))
+        self.assertEqual(handed['pcm'], pcm)
 
 
 if __name__ == '__main__':
