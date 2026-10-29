@@ -414,6 +414,76 @@ def _paused_for_dispatch_failures(goal) -> bool:
             and 'resume_count' not in cfg)
 
 
+#: One dispatch-failure signature on this many of the daemon's goals is the
+#: harness failing, not the goals: the daemon proposes the shared cause once.
+_HARNESS_EXPERIMENT_MIN_GOALS = 3
+
+
+def _propose_harness_experiment_for_signature(db, signature):
+    """The harness proposes its own improvement: when ONE dispatch-failure
+    signature has paused _HARNESS_EXPERIMENT_MIN_GOALS of this daemon's goals,
+    file ONE thought experiment about the shared cause, so the auto-evolve
+    loop has a candidate that came from the harness itself.
+
+    Measured on central 2026-10-28: every auto-evolve cycle for weeks
+    gathered 0 candidates (834 experiments, all the prover's August
+    duplicates, 0 votes, none created since 08-12) while 17 goals paused on
+    the SAME 400 in one day; the one systemic defect was written 17 times
+    into pause_reason prose and proposed to nobody.
+
+    Reuses the existing proposer path, not a second one:
+    ThoughtExperimentService.create_experiment (the ConstitutionalFilter and
+    the lifecycle stamps live there) as the 'nunba' system user the prover
+    files under, and hive_benchmark_prover._open_experiment_exists so an
+    unresolved question is never asked twice.  Coding goals are
+    coding_daemon's and do not count.  Never raises: a refused or failing
+    create leaves the pause exactly as written.  Returns the experiment dict
+    or None.
+    """
+    try:
+        signature = str(signature or '').strip()
+        if not signature:
+            return None
+        from integrations.social.models import AgentGoal
+        from .goal_manager import CODING_GOAL_TYPES
+        paused = db.query(AgentGoal).filter(
+            AgentGoal.status == 'paused',
+            ~AgentGoal.goal_type.in_(CODING_GOAL_TYPES),
+        ).all()
+        hit = [g for g in paused
+               if _paused_for_dispatch_failures(g)
+               and (g.config_json or {}).get('pause_signature') == signature]
+        if len(hit) < _HARNESS_EXPERIMENT_MIN_GOALS:
+            return None
+        title = f'Harness: {signature}'
+        from integrations.agent_engine.hive_benchmark_prover import (
+            _open_experiment_exists)
+        if _open_experiment_exists(db, title):
+            return None
+        from integrations.social.services import UserService
+        from integrations.social.thought_experiment_service import (
+            ThoughtExperimentService)
+        proposer = UserService.ensure_system_user(db, 'nunba', display_name='Nunba')
+        kinds = ', '.join(sorted({str(g.goal_type) for g in hit}))
+        result = ThoughtExperimentService.create_experiment(
+            db, proposer.id, title,
+            hypothesis=(
+                f"{len(hit)} goals on this node paused on the same dispatch "
+                f"failure: {signature}. The harness, not the goals, is failing "
+                f"({kinds}); the shared cause (endpoint settings, provider, "
+                f"model) is one fix that resumes them all."),
+            expected_outcome=(
+                "The shared cause is fixed once; the daemon resumes these goals "
+                "and they complete without a person."),
+            intent_category='technology')
+        if result:
+            logger.info(f"Harness experiment proposed for {len(hit)} goals: {title}")
+        return result
+    except Exception as exc:
+        logger.warning(f"Harness experiment not proposed: {exc}")
+        return None
+
+
 def _auto_pause_for_dispatch_failures(db, goal, goal_key, failure_count, why):
     """Pause a goal after consecutive dispatch failures: the prose for a
     person, the structured cause for code, the strike count ended (the
@@ -429,11 +499,16 @@ def _auto_pause_for_dispatch_failures(db, goal, goal_key, failure_count, why):
     cfg['paused_at'] = datetime.utcnow().isoformat()
     cfg['pause_cause'] = PAUSE_CAUSE_DISPATCH_FAILURES
     cfg['paused_by'] = 'daemon'
+    # The failure's signature, structured, so a shared cause can be counted
+    # across goals (the prose above is for people).
+    cfg['pause_signature'] = str(why or '')[:80]
     goal.config_json = cfg
     with _module_lock:
         _dispatch_backoff.pop(goal_key, None)
     logger.warning(
         f"Goal {goal_key} AUTO-PAUSED after {failure_count} dispatch failures")
+    if cfg['pause_signature']:
+        _propose_harness_experiment_for_signature(db, cfg['pause_signature'])
     if int(cfg.get('daemon_resume_count', 0) or 0) >= _RESUME_CAP:
         try:
             from .goal_manager import GoalManager
