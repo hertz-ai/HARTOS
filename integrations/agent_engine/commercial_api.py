@@ -16,7 +16,6 @@ import time
 from datetime import datetime, timedelta
 from functools import wraps
 from typing import Dict, List, Optional
-from core.port_registry import get_port
 
 from flask import Blueprint, g, jsonify, request
 from sqlalchemy.orm import Session
@@ -571,9 +570,14 @@ def _metered_backend_chat(prompt: str, label: str):
     try:
         # The canonical /chat client (core.chat_client): the same pooled path,
         # with the body normalised.  The id minted above passes through
-        # untouched, so this is the wire this function always sent.
+        # untouched, so this is the wire this function always sent.  The port
+        # is the one this node is serving on (the bundled desktop serves on
+        # the Flask port and never binds the backend one: every metered call
+        # there was a 503, task #160), on loopback even where HEVOLVE_BASE_URL
+        # names the LAN, so the customer's call keeps its own rate-limit key.
+        from core.port_registry import get_local_backend_url
         result = post_chat(
-            f'http://localhost:{get_port("backend")}/chat', payload,
+            get_local_backend_url(honor_base_url=False) + '/chat', payload,
             headers=headers, timeout=120)
     except Exception as e:
         # 502: we could not reach our own backend at all.
