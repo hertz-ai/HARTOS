@@ -313,3 +313,20 @@ def test_the_ticks_staged_config_does_not_erase_the_ask():
     assert g.config_json['pause_reason'] == 'Needs help: action 9'
     assert g.config_json['spark_at_dispatch'] == 101
     assert 'completed_at' not in g.config_json
+
+
+def test_a_refused_pause_is_not_logged_as_a_pause(caplog):
+    """Minor from the review of fbc54ddd6: the gate logged AUTO-PAUSED even
+    when the one pause routine refused the write; the goal was still
+    active."""
+    import logging
+    from unittest.mock import patch
+    from integrations.agent_engine.goal_manager import GoalManager
+    g = Goal(spark=0, cfg={'noop_dispatch_count': 4})
+    with patch.object(GoalManager, 'pause_goal',
+                      return_value={'success': False, 'error': 'refused'}), \
+            caplog.at_level(logging.INFO):
+        _settle_dispatched_goal(Db(), g, 'g1')
+    assert g.status == 'active'
+    assert g.config_json['noop_dispatch_count'] == 5
+    assert 'AUTO-PAUSED' not in caplog.text

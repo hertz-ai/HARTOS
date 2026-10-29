@@ -196,3 +196,46 @@ def test_update_goal_status_paused_to_active_goes_through_resume_goal(db):
     # The ordinary writes are untouched.
     assert GoalManager.update_goal_status(db, 'u1', 'completed')['success']
     assert goal.status == 'completed'
+
+
+def test_an_escalation_renewal_keeps_a_persons_pause(db):
+    """Review of fbc54ddd6, minor: a hive worker re-asking for help on a goal
+    its person paused from the dashboard (#194) restamped the pause as the
+    daemon's.  The ask is recorded; the person's cause, name and words
+    stand."""
+    goal = _goal(db, 'pp1', {'pause_cause': gm.PAUSE_CAUSE_PERSON, 'paused_by': 'person:owner',
+                             'pause_reason': 'Paused by its person from the dashboard',
+                             'paused_at': 'x'}, status='paused')
+    with patch.object(GoalManager, '_escalation_expert', return_value=None), \
+            patch.object(GoalManager, '_tell_its_person', return_value=True):
+        result = GoalManager.escalate_goal(db, 'pp1', {
+            'action_id': 4, 'action': 'post', 'reason': 'needs a login', 'tried': ['local']})
+    assert result.get('stage') == 'human'
+    cfg = goal.config_json
+    assert goal.status == 'paused'
+    assert (cfg['pause_cause'], cfg['paused_by']) == (gm.PAUSE_CAUSE_PERSON, 'person:owner')
+    assert cfg['pause_reason'] == 'Paused by its person from the dashboard'
+    assert cfg['escalation']['next'] == 'human' and cfg['escalation']['action_id'] == 4
+    assert cfg['escalation']['told_at']
+
+
+def test_the_consent_gates_park_stamps_its_cause(db, monkeypatch):
+    """The seventh writer (review of fbc54ddd6): hive_guardrails parks a
+    consent-flagged goal on a node with nobody to ask through the one
+    routine, with its own cause, and leaves an already-paused goal alone."""
+    import contextlib
+    from security import hive_guardrails as hg
+    from integrations.social import models as social_models
+    goal = _goal(db, 'c1', {'require_consent': True})
+
+    @contextlib.contextmanager
+    def db_session(commit=False):
+        yield db
+    monkeypatch.setattr(social_models, 'db_session', db_session)
+    assert hg._park_goal_for_no_owner({'id': 'c1'}) is True
+    assert goal.status == 'paused'
+    assert _record(goal)[:2] == (gm.PAUSE_CAUSE_NO_OWNER, 'consent_gate')
+    assert 'no owner to ask' in goal.config_json['pause_reason']
+    assert goal.config_json['require_consent'] is True
+    assert hg._park_goal_for_no_owner({'id': 'c1'}) is False
+    assert _record(goal)[:2] == (gm.PAUSE_CAUSE_NO_OWNER, 'consent_gate')

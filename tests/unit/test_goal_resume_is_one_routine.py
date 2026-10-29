@@ -124,3 +124,25 @@ def test_a_coding_goal_is_still_set_directly():
     goal = CodingGoal()
     _write_goal_status(None, goal, 'active', actor_id='owner')
     assert goal.status == 'active'
+
+
+def test_resume_goal_moves_a_human_escalation_and_the_signature_to_history(db):
+    """Review of fbc54ddd6: a person's hand (escalation.next == 'human') is
+    history once the goal runs again, or the daemon's guard on it excludes
+    the goal from its resume for life; the expert's pending turn (next ==
+    'expert') is not a person's hand and stays; the failure signature goes
+    with the rest of the record."""
+    goal = _goal(db, 'h1', {'pause_cause': 'needs_help', 'paused_by': 'daemon',
+                            'pause_reason': 'Needs help: action 2', 'paused_at': 'x',
+                            'pause_signature': 'sig',
+                            'escalation': {'action_id': 2, 'next': 'human'}})
+    assert GoalManager.resume_goal(db, 'h1', resumed_by='person:owner')['success']
+    cfg = goal.config_json
+    assert 'escalation' not in cfg
+    assert cfg['last_escalation'] == {'action_id': 2, 'next': 'human'}
+    assert 'pause_signature' not in cfg and cfg['last_pause_signature'] == 'sig'
+    expert = _goal(db, 'h2', {'pause_cause': 'budget', 'paused_by': 'daemon',
+                              'pause_reason': 'r', 'paused_at': 'x',
+                              'escalation': {'action_id': 5, 'next': 'expert'}})
+    assert GoalManager.resume_goal(db, 'h2', resumed_by='daemon:cause_cleared')['success']
+    assert expert.config_json['escalation'] == {'action_id': 5, 'next': 'expert'}

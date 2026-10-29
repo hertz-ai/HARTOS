@@ -574,15 +574,24 @@ class TestGoalManagerEscalate(unittest.TestCase):
         self.assertFalse(result['success'])
 
     def test_it_writes_only_through_the_existing_writers(self):
+        """The pause goes through the ONE pause routine (pause_goal), which
+        writes the status through update_goal_status once, with the row it
+        holds; the config write after the person was told goes through
+        update_goal once.  Nothing is set on the row directly."""
         fake = FakeGoal(id='71', goal_type='marketing', status='active',
                         config_json={})
         gm = self.gm.GoalManager
         with patch.object(gm, 'update_goal', wraps=gm.update_goal) as fields, \
                 patch.object(gm, 'update_goal_status',
-                             wraps=gm.update_goal_status) as status:
+                             wraps=gm.update_goal_status) as status, \
+                patch.object(gm, 'pause_goal', wraps=gm.pause_goal) as pause, \
+                patch.object(gm, '_tell_its_person', return_value=True):
             self._escalate(fake, {'action_id': 2, 'reason': 'needs input'})
+        pause.assert_called_once()
+        status.assert_called_once_with(self.db, '71', 'paused', goal=fake)
         fields.assert_called_once()
-        status.assert_called_once_with(self.db, '71', 'paused')
+        self.assertEqual(fake.status, 'paused')
+        self.assertTrue(fake.config_json['escalation']['told_at'])
 
     # -- #106d: the node's expert model gets the action before a person --
 

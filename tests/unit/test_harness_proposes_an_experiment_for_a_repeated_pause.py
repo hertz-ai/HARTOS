@@ -14,8 +14,12 @@ Pinned, against a real SQLite AgentGoal + ThoughtExperiment through the real
 ThoughtExperimentService.create_experiment and the prover's
 _open_experiment_exists (the existing proposer path, reused, not a second
 one):
-  * the pause site records the failure's signature (why[:80]) as a
-    structured key beside pause_cause;
+  * the pause site records the failure's signature (_failure_signature:
+    stripped, cut to 80, stripped again) as a structured key beside
+    pause_cause, and none for a failure with no reason; the proposer matches
+    the stored key as written, so a cut on whitespace still matches;
+  * the title and hypothesis pass the one egress scrub
+    (security.edge_privacy.scrub_text) before they leave the goal's row;
   * the third goal paused on one signature files one experiment titled
     'Harness: <signature>' as the 'nunba' system user; the first two file
     nothing; a fourth files no duplicate while the first is unresolved;
@@ -130,3 +134,40 @@ def test_a_refused_or_failing_create_leaves_the_pause_as_written(db):
     assert g4.status == 'paused'
     # Called directly with no goals at all: nothing, no raise.
     assert _propose_harness_experiment_for_signature(db, 'never seen') is None
+
+
+def test_a_signature_cut_on_whitespace_or_led_by_it_still_matches(db):
+    """Review of 3d4c5b3a3: the proposer stripped the signature but the
+    stored one was why[:80] as written, so a cut landing on a space, or a
+    reason led by whitespace, matched nothing and three identical pauses
+    filed NO experiment, silently.  One normaliser for the pause that stores
+    it and the proposer that matches it."""
+    cut_on_space = 'x' * 79 + ' tail of the error text'
+    for gid in ('w1', 'w2'):
+        _pause(db, _active(db, gid), why=cut_on_space)
+    _pause(db, _active(db, 'w3'), why='   ' + cut_on_space)
+    assert [e.title for e in _harness_experiments(db)] == ['Harness: ' + 'x' * 79]
+    assert db.get(AgentGoal, 'w3').config_json['pause_signature'] == 'x' * 79
+
+
+def test_a_secret_in_the_failure_text_never_reaches_the_experiment(db):
+    """Review of 3d4c5b3a3: the turn's raw error text became a public Post
+    title and hypothesis with no egress scrub, so a 401 body echoing a key
+    fragment would be published.  The one egress scrub
+    (security.edge_privacy.scrub_text) runs before the text leaves the
+    goal's own row; the stored signature is matched as written."""
+    key = 'sk-proj-' + 'A' * 50
+    for gid in ('k1', 'k2', 'k3'):
+        _pause(db, _active(db, gid), why=f'turn failed: 401 for key {key}')
+    [exp] = _harness_experiments(db)
+    assert exp.title.startswith('Harness: turn failed: 401 for key ')
+    assert 'sk-proj-' not in exp.title and 'AAAA' not in exp.title
+    assert 'sk-proj-' not in (exp.hypothesis or '') and 'AAAA' not in (exp.hypothesis or '')
+
+
+def test_no_signature_is_stored_for_a_failure_with_no_reason(db):
+    """Minor from the review: an empty signature is no key at all."""
+    _pause(db, _active(db, 'n1'), why=None)
+    cfg = db.get(AgentGoal, 'n1').config_json
+    assert 'pause_signature' not in cfg
+    assert cfg['pause_cause'] == 'dispatch_failures'

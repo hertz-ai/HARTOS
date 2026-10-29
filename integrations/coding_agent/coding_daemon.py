@@ -142,7 +142,8 @@ class CodingAgentDaemon:
         """
         from integrations.social.models import get_db, AgentGoal
         from .idle_detection import IdleDetectionService
-        from integrations.agent_engine.goal_manager import GoalManager, CODING_GOAL_TYPES
+        from integrations.agent_engine.goal_manager import (
+            GoalManager, CODING_GOAL_TYPES, PAUSE_CAUSE_DISPATCH_FAILURES)
         from .task_distributor import dispatch_to_chat
 
         self._tick_count += 1
@@ -287,14 +288,22 @@ class CodingAgentDaemon:
                 elif result is None:
                     # Dispatch failed — track for backoff
                     fails = (goal.config_json or {}).get('_dispatch_failures', 0) + 1
-                    cfg = goal.config_json or {}
+                    cfg = dict(goal.config_json or {})
                     cfg['_dispatch_failures'] = fails
                     goal.config_json = cfg
                     if fails >= 5:
-                        goal.status = 'paused'
-                        cfg['pause_reason'] = f'Auto-paused: {fails} consecutive dispatch failures'
-                        goal.config_json = cfg
-                        logger.warning(f"Coding goal {goal.id} AUTO-PAUSED after {fails} failures")
+                        # The ONE pause routine (GoalManager.pause_goal), with
+                        # this daemon's cause and name; setting the status and
+                        # the prose on the row here left no cause (review of
+                        # fbc54ddd6).  The agent daemon's resume excludes
+                        # coding goals by type, so nothing resumes these yet.
+                        _res = GoalManager.pause_goal(
+                            db, goal, cause=PAUSE_CAUSE_DISPATCH_FAILURES,
+                            by='coding_daemon',
+                            reason=f'Auto-paused: {fails} consecutive dispatch failures',
+                            config=cfg)
+                        if _res.get('success'):
+                            logger.warning(f"Coding goal {goal.id} AUTO-PAUSED after {fails} failures")
                 else:
                     # The ONE completion gate (agent_daemon's docstring: "every
                     # dispatched goal must pass through").  This daemon never

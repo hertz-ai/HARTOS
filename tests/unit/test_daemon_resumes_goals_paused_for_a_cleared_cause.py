@@ -341,3 +341,120 @@ def test_a_legacy_prose_row_counts_only_when_the_pause_followed_its_own_dispatch
     assert resumed == ['g-daemon-like']
     assert _status(session_factory, 'g-person-like') == 'paused'
     assert _status(session_factory, 'g-never-ran') == 'paused'
+
+
+def _file_db(tmp_path):
+    """Two sessions need two transactions: a file database, not StaticPool.
+    Returns the session factory and the engine (disposed by the test, so the
+    file is closed before pytest removes the directory)."""
+    engine = create_engine('sqlite:///' + str(tmp_path / 'two.db').replace('\\', '/'))
+    Base.metadata.create_all(engine)
+    return sessionmaker(bind=engine), engine
+
+
+def _row(factory, gid):
+    """The row as committed, read in a session of its own and closed."""
+    reader = factory()
+    try:
+        row = reader.get(AgentGoal, gid)
+        return row.status, dict(row.config_json or {}), row.last_dispatched_at
+    finally:
+        reader.close()
+
+
+def _tick_stages(db, gid, cfg):
+    """The tick's own writes before the turn, as agent_daemon._tick makes
+    them: the dispatch stamp and a copy of the pre-turn config carrying this
+    tick's spark snapshot."""
+    _goal(db, gid, cfg, status='active')
+    goal = db.get(AgentGoal, gid)
+    goal.last_dispatched_at = T0
+    goal.config_json = dict(goal.config_json or {}, spark_at_dispatch=7)
+    return goal
+
+
+def test_s7_two_sessions_the_turns_record_survives_the_failure_arm(tmp_path):
+    """Review of fbc54ddd6, critical: the failure arm FLUSHED before it
+    refreshed, so the config the tick staged before the turn (its copy of the
+    pre-turn row plus spark_at_dispatch) overwrote the record the turn's
+    escalate_goal had committed in ITS OWN session: the row read
+    status=paused with pause_reason, pause_cause, paused_by, escalation and
+    told_at all gone, and the daemon later resumed it as its own.  The
+    same-session S7 above never saw it: one session, one object.
+
+    Two sessions on one file database, the tick's real staging and the real
+    escalate_goal: the person's record stands, and the tick's own stamp
+    (last_dispatched_at) still reaches the row."""
+    from integrations.agent_engine.goal_manager import GoalManager, PAUSE_CAUSE_NEEDS_HELP
+    factory, engine = _file_db(tmp_path)
+    tick = factory()
+    goal = _tick_stages(tick, 'g-s7b', {'daemon_resume_count': 0, 'bootstrap_slug': 'guardian'})
+    turn = factory()
+    with patch.object(GoalManager, '_escalation_expert', return_value=None), \
+            patch.object(GoalManager, '_tell_its_person', return_value=True):
+        assert GoalManager.escalate_goal(turn, 'g-s7b', {
+            'action_id': 3, 'action': 'google_search', 'reason': 'blocked',
+            'tried': ['local']}).get('stage') == 'human'
+    turn.commit()
+    turn.close()
+    ad._dispatch_backoff['g-s7b'] = {'failures': 5, 'skip_until': 0}
+    _auto_pause_for_dispatch_failures(tick, goal, 'g-s7b', 5, 'turn failed: help reply')
+    tick.commit()
+    tick.close()
+    status, cfg, dispatched_at = _row(factory, 'g-s7b')
+    engine.dispose()
+    assert status == 'paused'
+    assert cfg['pause_cause'] == PAUSE_CAUSE_NEEDS_HELP
+    assert cfg['pause_reason'].startswith('Needs help: action 3')
+    assert cfg['escalation']['next'] == 'human' and cfg['escalation']['told_at']
+    assert cfg['bootstrap_slug'] == 'guardian'
+    assert dispatched_at == T0
+    assert 'g-s7b' not in ad._dispatch_backoff
+
+
+def test_the_failure_arm_pauses_the_row_as_committed_plus_the_ticks_own_key(tmp_path):
+    """Still active after the failed turn: the daemon's pause is built on the
+    row as committed (a key the turn wrote in its own session stands) plus
+    the one key this tick owns, spark_at_dispatch, the way the settlement
+    gate merges it."""
+    factory, engine = _file_db(tmp_path)
+    tick = factory()
+    goal = _tick_stages(tick, 'g-merge', {'daemon_resume_count': 0})
+    turn = factory()
+    other = turn.get(AgentGoal, 'g-merge')
+    other.config_json = dict(other.config_json or {}, steps_done=2)
+    turn.commit()
+    turn.close()
+    ad._dispatch_backoff['g-merge'] = {'failures': 5, 'skip_until': 0}
+    _auto_pause_for_dispatch_failures(tick, goal, 'g-merge', 5, 'turn failed: 400')
+    tick.commit()
+    tick.close()
+    status, cfg, dispatched_at = _row(factory, 'g-merge')
+    engine.dispose()
+    assert status == 'paused'
+    assert cfg['pause_cause'] == PAUSE_CAUSE_DISPATCH_FAILURES
+    assert cfg['steps_done'] == 2
+    assert cfg['spark_at_dispatch'] == 7
+    assert dispatched_at == T0
+
+
+def test_a_persons_resume_ages_out_the_human_escalation(session_factory):
+    """Review of fbc54ddd6: the escalation.next == 'human' guard never aged
+    out (only the expert's settle pops the record), so a goal once parked
+    for a person was excluded from the daemon's resume for life.  A resume
+    moves the human escalation to history; the next pause the daemon makes
+    is the daemon's again."""
+    from integrations.agent_engine.goal_manager import GoalManager
+    db = session_factory()
+    _goal(db, 'g-aged', {'pause_cause': 'needs_help', 'paused_by': 'daemon',
+                         'pause_reason': 'Needs help: action 2', 'paused_at': T0.isoformat(),
+                         'escalation': {'action_id': 2, 'next': 'human', 'told_at': 'x'}})
+    goal = db.get(AgentGoal, 'g-aged')
+    assert GoalManager.resume_goal(db, 'g-aged', resumed_by='person:owner')['success']
+    db.commit()
+    cfg = goal.config_json
+    assert 'escalation' not in cfg and cfg['last_escalation']['next'] == 'human'
+    ad._dispatch_backoff['g-aged'] = {'failures': 5, 'skip_until': 0}
+    _auto_pause_for_dispatch_failures(db, goal, 'g-aged', 5, 'turn failed: 400')
+    db.commit()
+    assert _resume_goals_paused_for_a_cleared_cause(db, cause_cleared=True) == ['g-aged']

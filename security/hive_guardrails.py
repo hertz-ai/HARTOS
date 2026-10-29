@@ -492,12 +492,15 @@ def _park_goal_for_no_owner(goal_dict: Dict) -> bool:
     filter all already read ``status='paused'`` + ``config.pause_reason``, and
     the daemon stops re-attempting it.
 
-    Writes through ``GoalManager.update_goal`` / ``update_goal_status`` — the
-    same two writers every other pause path uses, so there is no second writer
-    of either field.  ``dict(...)`` deliberately: ``config_json`` is a
-    MutableDict, and mutating the instance's own dict in place leaves the
-    attribute identical to itself, so SQLAlchemy sees no change and drops the
-    write (the defect recorded at ``_models_local.py:2128``).
+    Pauses through ``GoalManager.pause_goal``, the one pause routine every
+    pause path uses, with this gate's own cause (``PAUSE_CAUSE_NO_OWNER``), so
+    the agent daemon, which resumes only its own dispatch-failure pauses,
+    never takes a consent park for its own (review of fbc54ddd6: this was one
+    of two writers still setting the row directly, with no cause).  The
+    routine writes a NEW config dict: ``config_json`` is a MutableDict, and
+    mutating the instance's own dict in place leaves the attribute identical
+    to itself, so SQLAlchemy sees no change and drops the write (the defect
+    recorded at ``_models_local.py:2128``).
 
     Idempotent and best-effort: an already-paused goal is left alone (so a
     different pause_reason is never overwritten and the row is not rewritten
@@ -510,23 +513,19 @@ def _park_goal_for_no_owner(goal_dict: Dict) -> bool:
     if not goal_id:
         return False
     try:
-        from integrations.agent_engine.goal_manager import GoalManager
+        from integrations.agent_engine.goal_manager import (
+            GoalManager, PAUSE_CAUSE_NO_OWNER)
         from integrations.social.models import AgentGoal, db_session
         with db_session(commit=True) as db:
             goal = db.query(AgentGoal).filter_by(id=str(goal_id)).first()
             if goal is None or goal.status == 'paused':
                 return False
-            cfg = dict(goal.config_json or {})
-            cfg['pause_reason'] = (
-                'Needs consent, but this node has no owner to ask: set '
-                'HEVOLVE_OWNER_USER_ID, or run this goal on a desktop where '
-                'the signed-in user is the owner.')
-            cfg['paused_at'] = datetime.utcnow().isoformat()
-            if not GoalManager.update_goal(
-                    db, str(goal_id), config_json=cfg).get('success'):
-                return False
-            if not GoalManager.update_goal_status(
-                    db, str(goal_id), 'paused').get('success'):
+            if not GoalManager.pause_goal(
+                    db, goal, cause=PAUSE_CAUSE_NO_OWNER, by='consent_gate',
+                    reason=(
+                        'Needs consent, but this node has no owner to ask: set '
+                        'HEVOLVE_OWNER_USER_ID, or run this goal on a desktop '
+                        'where the signed-in user is the owner.')).get('success'):
                 return False
         logger.warning(
             "Goal %s needs consent and this node has no owner to ask — "

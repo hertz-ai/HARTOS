@@ -370,3 +370,51 @@ def test_real_work_after_a_failed_release_completes_a_coding_goal():
     finally:
         budget_gate._held_reservations.pop('fix-held', None)
         budget_gate.invalidate_goal_budget_cache()
+
+
+def test_the_fifth_failed_dispatch_pauses_through_the_one_routine(db_path):
+    """Review of fbc54ddd6: this daemon wrote status='paused' and the prose
+    straight onto the row, with no cause, outside GoalManager.pause_goal.
+    The fifth failure pauses through the one routine with this daemon's
+    cause and name (the agent daemon's resume excludes coding goals by
+    type, so the shared cause resumes nothing here)."""
+    from integrations.agent_engine.goal_manager import PAUSE_CAUSE_DISPATCH_FAILURES
+    from integrations.social.migrations import run_migrations
+    from integrations.social.models import AgentGoal, get_db
+
+    run_migrations()
+    db = get_db()
+    row = AgentGoal(id='fix-fifth', goal_type='self_heal', title='Self-heal',
+                    status='active')
+    row.config_json = dict(_FIX_CONFIG, _dispatch_failures=4)
+    row.spark_budget = 200
+    row.spark_spent = 0
+    db.add(row)
+    db.commit()
+    db.close()
+
+    with patch('integrations.coding_agent.idle_detection.'
+               'IdleDetectionService.get_idle_agent_personas',
+               return_value=[{'user_id': 'agent-1', 'username': 'a1'}]), \
+            patch('integrations.agent_engine.dispatch.should_yield_to_user',
+                  return_value=False), \
+            patch('integrations.agent_engine.budget_gate.'
+                  'check_platform_affordability', return_value=(True, {})), \
+            patch('integrations.agent_engine.dispatch.'
+                  'max_autonomous_concurrency', side_effect=lambda cap: cap), \
+            patch('integrations.agent_engine.dispatch.is_transient_deferral',
+                  return_value=False), \
+            patch('integrations.coding_agent.task_distributor.'
+                  'dispatch_to_chat', MagicMock(return_value=None)):
+        CodingAgentDaemon()._tick()
+
+    db2 = get_db()
+    back = db2.query(AgentGoal).filter_by(id='fix-fifth').first()
+    cfg = back.config_json or {}
+    assert back.status == 'paused'
+    assert cfg['_dispatch_failures'] == 5
+    assert cfg['pause_reason'] == 'Auto-paused: 5 consecutive dispatch failures'
+    assert (cfg.get('pause_cause'), cfg.get('paused_by')) == (
+        PAUSE_CAUSE_DISPATCH_FAILURES, 'coding_daemon')
+    assert cfg.get('paused_at')
+    db2.close()

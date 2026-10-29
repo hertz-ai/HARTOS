@@ -451,6 +451,16 @@ def _paused_for_dispatch_failures(goal) -> bool:
 _HARNESS_EXPERIMENT_MIN_GOALS = 3
 
 
+def _failure_signature(why):
+    """The failure's key: ONE normaliser for the pause that stores it and the
+    proposer that matches it (review of 3d4c5b3a3: the stored why[:80] was
+    compared with a stripped copy, so a cut landing on a space, or a reason
+    led by whitespace, matched nothing and three identical pauses filed no
+    experiment, silently).  Stripped, cut to 80, stripped again where the cut
+    left whitespace; '' for no reason at all."""
+    return str(why or '').strip()[:80].rstrip()
+
+
 def _propose_harness_experiment_for_signature(db, signature):
     """The harness proposes its own improvement: when ONE dispatch-failure
     signature has paused _HARNESS_EXPERIMENT_MIN_GOALS of this daemon's goals,
@@ -468,12 +478,18 @@ def _propose_harness_experiment_for_signature(db, signature):
     the lifecycle stamps live there) as the 'nunba' system user the prover
     files under, and hive_benchmark_prover._open_experiment_exists so an
     unresolved question is never asked twice.  Coding goals are
-    coding_daemon's and do not count.  Never raises: a refused or failing
-    create leaves the pause exactly as written.  Returns the experiment dict
-    or None.
+    coding_daemon's and do not count.  ``signature`` is matched against the
+    goals' stored pause_signature as written (both from _failure_signature);
+    the text that leaves the goal's own row for a public Post, the title and
+    the hypothesis, first passes the one egress scrub,
+    security.edge_privacy.scrub_text (review of 3d4c5b3a3: a 401 body echoing
+    a key fragment, or a peer URL with a token, would have been published
+    verbatim), and no scrubber means no proposal.  Never raises: a refused or
+    failing create leaves the pause exactly as written.  Returns the
+    experiment dict or None.
     """
     try:
-        signature = str(signature or '').strip()
+        signature = str(signature or '')
         if not signature:
             return None
         from integrations.social.models import AgentGoal
@@ -487,7 +503,9 @@ def _propose_harness_experiment_for_signature(db, signature):
                and (g.config_json or {}).get('pause_signature') == signature]
         if len(hit) < _HARNESS_EXPERIMENT_MIN_GOALS:
             return None
-        title = f'Harness: {signature}'
+        from security.edge_privacy import scrub_text
+        public = scrub_text(signature)
+        title = f'Harness: {public}'
         from integrations.agent_engine.hive_benchmark_prover import (
             _open_experiment_exists)
         if _open_experiment_exists(db, title):
@@ -501,7 +519,7 @@ def _propose_harness_experiment_for_signature(db, signature):
             db, proposer.id, title,
             hypothesis=(
                 f"{len(hit)} goals on this node paused on the same dispatch "
-                f"failure: {signature}. The harness, not the goals, is failing "
+                f"failure: {public}. The harness, not the goals, is failing "
                 f"({kinds}); the shared cause (endpoint settings, provider, "
                 f"model) is one fix that resumes them all."),
             expected_outcome=(
@@ -526,22 +544,28 @@ def _auto_pause_for_dispatch_failures(db, goal, goal_key, failure_count, why):
     requires (BLOCK + ASK + RECOVERY) through the existing _tell_its_person,
     once per pause episode.
 
-    The goal is RE-READ first, as _settle_dispatched_goal does: the turn
-    that failed may itself have parked the goal (its help reply ran
+    The goal's status and config are RE-READ first, never flushed, as
+    _settle_dispatched_goal re-reads them: the turn that failed may itself
+    have written the row in its own session (its help reply ran
     escalate_goal, which hands the goal to a person and counts as a failure
-    here), and that record stands.  Pausing the object loaded before the
-    turn overwrote it and the daemon later resumed a goal a person held
-    (hartos-73's S7).
+    here), and that record stands.  The tick staged a copy of the pre-turn
+    config (plus spark_at_dispatch) and the dispatch stamp before the turn;
+    pausing that object overwrote the person's record (hartos-73's S7), and
+    flushing it before the re-read did the same (review of fbc54ddd6: the
+    row read paused with pause_reason, pause_cause, paused_by, escalation
+    and told_at all gone, then resumed as the daemon's).  refresh() on the
+    two attributes drops the staged copy and reloads them; the stamp this
+    tick owns is flushed by the reload and kept; the one config key the tick
+    owns, spark_at_dispatch, is carried over onto the row as committed when
+    the goal is still active, and dropped with the rest of the copy when the
+    turn parked it.
     """
     from .goal_manager import GoalManager
+    pending = dict(goal.config_json or {})
     try:
-        db.flush()
+        db.refresh(goal, ['config_json', 'status'])
     except Exception:
-        pass
-    try:
-        db.refresh(goal)
-    except Exception:
-        pass
+        pass  # no second read: the tick's copy stays, as the settle gate keeps it
     with _module_lock:
         _dispatch_backoff.pop(goal_key, None)
     if goal.status != 'active':
@@ -549,12 +573,16 @@ def _auto_pause_for_dispatch_failures(db, goal, goal_key, failure_count, why):
             f"Goal {goal_key}: not paused for dispatch failures, it is already "
             f"{goal.status} (parked during the turn; that record stands)")
         return
-    signature = str(why or '')[:80]
+    cfg = dict(goal.config_json or {})
+    if 'spark_at_dispatch' in pending:
+        cfg['spark_at_dispatch'] = pending['spark_at_dispatch']
+    signature = _failure_signature(why)
     reason = (f'Auto-paused: {failure_count} consecutive dispatch failures'
               + (f' (last: {why})' if why else ''))
     result = GoalManager.pause_goal(
         db, goal, cause=PAUSE_CAUSE_DISPATCH_FAILURES, by='daemon',
-        reason=reason, extra={'pause_signature': signature})
+        reason=reason, config=cfg,
+        extra={'pause_signature': signature} if signature else None)
     if not result.get('success'):
         logger.warning(f"Goal {goal_key}: pause refused ({result.get('error')})")
         return
@@ -867,9 +895,10 @@ def _settle_dispatched_goal(db, goal, goal_key, served_escalation=None,
                     f'node before resuming.'),
                 config=cfg)
             cfg = _res.get('config', cfg)
-            logger.warning(
-                f"Goal {goal_key} AUTO-PAUSED after {int(waited)}s "
-                f"awaiting ledger grounding")
+            if _res.get('success'):
+                logger.warning(
+                    f"Goal {goal_key} AUTO-PAUSED after {int(waited)}s "
+                    f"awaiting ledger grounding")
         else:
             logger.info(
                 f"Goal {goal_key} awaiting verification "
@@ -909,9 +938,10 @@ def _settle_dispatched_goal(db, goal, goal_key, served_escalation=None,
                     f'agent prompt or tool registration.'),
                 config=cfg)
             cfg = _res.get('config', cfg)
-            logger.warning(
-                f"Goal {goal_key} AUTO-PAUSED after "
-                f"{noop_count} noop dispatches")
+            if _res.get('success'):
+                logger.warning(
+                    f"Goal {goal_key} AUTO-PAUSED after "
+                    f"{noop_count} noop dispatches")
         else:
             logger.info(
                 f"Goal {goal_key} dispatched but "
