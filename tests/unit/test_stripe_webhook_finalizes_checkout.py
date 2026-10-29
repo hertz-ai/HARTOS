@@ -16,6 +16,7 @@ Real blueprint, real PaymentLedger and StripePaymentGateway, a real
 api_keys table (tests/unit/commercial_db); the Stripe SDK handle (the wire
 to Stripe) is stubbed.
 """
+import contextlib
 import logging
 import sys
 import threading
@@ -24,6 +25,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from flask import Flask
+from sqlalchemy import event
 
 import integrations.ap2 as ap2_pkg
 from integrations.ap2.ap2_protocol import (
@@ -469,6 +471,84 @@ class TestTheBrowserRouteSharesTheFinalizer:
         r = _complete(ctx)
         assert r.status_code == 403
         assert ctx['ledger'].payments == {} and ctx['db'].key() == FREE
+
+
+@contextlib.contextmanager
+def _database_gone_after_the_failed_bump(db):
+    """The bump's commit fails and the database stays unreachable from then
+    on (a lost connection, not a locked file): every statement after the
+    failed commit raises.  The rollback the bump runs is not a statement."""
+    gone = {'now': False}
+
+    def fail_the_commit(session):
+        gone['now'] = True
+        raise RuntimeError('database connection lost')
+
+    def refuse_every_statement(conn, cursor, statement, params, context, executemany):
+        if gone['now']:
+            raise RuntimeError('database unreachable')
+
+    event.listen(db.Session, 'before_commit', fail_the_commit)
+    event.listen(db.engine, 'before_cursor_execute', refuse_every_statement)
+    try:
+        yield
+    finally:
+        event.remove(db.Session, 'before_commit', fail_the_commit)
+        event.remove(db.engine, 'before_cursor_execute', refuse_every_statement)
+
+
+class TestAFailedBumpIsNamedWithTheDatabaseGone:
+    """A failed bump rolls the session back, which expires the key row; the
+    finish read api_key.id after that, so with the database gone the read
+    raised inside the failure report: Flask's HTML 500, no reconciliation
+    line naming the session and the key, and "HTTP 500" on the buyer's
+    success page (the review of 2971c00db measured it on all three paths;
+    its parent's reload did the same).  Stripe's retry and the buyer's
+    reload still finish the bump once the database is back."""
+
+    def _assert_named(self, r, said):
+        assert r.status_code == 500
+        body = r.get_json(silent=True)
+        assert body is not None, r.data[:200]
+        assert body['status'] == 'bump_failed' and body['success'] is False
+        assert said.call_count == 1
+        line = said.call_args.args[0]
+        assert 'MANUAL RECONCILIATION NEEDED' in line
+        assert 'cs_test_1' in line and f'api_key {KEY}' in line
+
+    def test_the_webhook_names_it(self, ctx):
+        log = logging.getLogger('hevolve_social')
+        with _database_gone_after_the_failed_bump(ctx['db']), \
+                patch.object(log, 'error') as said:
+            r = _deliver(ctx, _event(_session()))
+        self._assert_named(r, said)
+        assert ctx['db'].key() == FREE and len(ctx['ledger'].payments) == 1
+        again = _deliver(ctx, _event(_session()))        # Stripe's retry
+        assert again.status_code == 200 and ctx['db'].key() == PRO
+
+    def test_the_buyers_first_visit_names_it(self, ctx):
+        ctx['stripe'].checkout.Session.retrieve.return_value = _session()
+        log = logging.getLogger('hevolve_social')
+        with _database_gone_after_the_failed_bump(ctx['db']), \
+                patch.object(log, 'error') as said:
+            r = _complete(ctx)
+        self._assert_named(r, said)
+        assert ctx['db'].key() == FREE and len(ctx['ledger'].payments) == 1
+        reload = _complete(ctx)
+        assert reload.status_code == 200 and ctx['db'].key() == PRO
+
+    def test_the_buyers_reload_names_it(self, ctx):
+        ctx['db'].fail_next_commit()
+        assert _deliver(ctx, _event(_session())).status_code == 500   # recorded, unbumped
+        log = logging.getLogger('hevolve_social')
+        with _database_gone_after_the_failed_bump(ctx['db']), \
+                patch.object(log, 'error') as said:
+            r = _complete(ctx)
+        self._assert_named(r, said)
+        assert ctx['db'].key() == FREE and len(ctx['ledger'].payments) == 1
+        reload = _complete(ctx)
+        assert reload.status_code == 200 and ctx['db'].key() == PRO
+        ctx['stripe'].checkout.Session.retrieve.assert_not_called()
 
 
 class TestOnlyAnUpgradeIsSold:

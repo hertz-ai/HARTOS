@@ -2241,10 +2241,14 @@ def _finish_recorded_checkout(db, payment, api_key, target_tier, *,
     answered already_completed over a key still on the old tier, the review
     of 3153761b3).  Never a downgrade.  ``target_tier`` is the caller's:
     Stripe's signed metadata for the finalizer, the ledger record for the
-    fast path."""
+    fast path.  The key's id is read before the bump: a failed bump rolls
+    the session back, which expires the row, and with the database gone a
+    read after it raised inside the report, so the 500 carried no
+    reconciliation line (the review of 2971c00db)."""
+    api_key_id = api_key.id
     _changed, failure = _apply_bought_tier(db, api_key, target_tier)
     if failure is not None:
-        return _bump_failed(f'Stripe session {session_id}', api_key.id, failure,
+        return _bump_failed(f'Stripe session {session_id}', api_key_id, failure,
                             retry="the buyer's reload re-POSTs the session, and Stripe "
                                   'redelivers the event to a registered webhook until '
                                   'it is answered 200; either runs the bump again',
