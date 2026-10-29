@@ -58,14 +58,21 @@ no owner today):
 
 - `ask(user_id, agent_id, component, *, prompt_id=None, title, body)`:
   1. Refuses a component that asks for a secret by its structure: a field
-     marked `secret`, typed `password` in any spelling (`type`,
+     whose `secret` is truthy the way the desktop page reads it (JavaScript:
+     the string 'false' and an empty list too, since AgentOverlay draws a
+     password box for them), typed `password` in any spelling (`type`,
      `input_type`, ...), or named the way a secret is named in any spelling
-     (`userPassword`, `DBPassword`, `APIToken`, `API-Key`, `password2`:
-     `security.edge_privacy.secret_key_form`, then `is_secret_key`, the
-     scrub's own rule, extended by the words only the vault asks for: `otp`,
-     `pin`, `cvv`, `card_number`, `passcode`, `seed_phrase`, ...). Secrets go
-     to the vault (`ai_key_vault.request_credential`, H-0986) and never into
-     a tool result, a log or the ledger.
+     (`userPassword`, `DBPassword`, `APIToken`, `API-Key`, `password2`, and
+     glued into one lowercase word: `newpassword`, `accesstoken`,
+     `secretkey`, `otpcode`: `security.edge_privacy.secret_key_form`, then
+     `is_secret_key`, the scrub's own rule, extended by the words only the
+     vault asks for: `otp`, `pin`, `cvv`, `card_number`, `passcode`,
+     `seed_phrase`, ...). A short word glued into a name is not read
+     (`upipin`; `upi_pin`, `upiPin` and `UPIPin` are): glued, `pin`, `pass`
+     and `otp` end too many everyday names (`spin`, `compass`,
+     `boardingpass`). Secrets go to the vault
+     (`ai_key_vault.request_credential`, H-0986) and never into a tool
+     result, a log or the ledger.
 
      An ask's words (a label, a placeholder, a title, a body) are not read
      for secrets. A word list over them refused 36 of 52 honest asks ('the
@@ -108,7 +115,8 @@ no owner today):
   - An answer is a small, shallow object (16 KB, 4 levels). One that
     carries a secret (`edge_privacy.redact_secret_leaves` finds one, or a
     key in it names a secret or a credential, in any spelling, with a value)
-    is refused; the same name with nothing under it is taken. A plain value
+    is refused (a value one level down too: `{'password': {'value': ...}}`);
+    the same name with nothing under it is taken. A plain value
     under an everyday name (a one-time code typed into a field called
     `code`) cannot be told from any other answer, and nothing at ask time
     keeps it out either (above). A `file_request` answer is `{xids: [...]}`: each pick must be

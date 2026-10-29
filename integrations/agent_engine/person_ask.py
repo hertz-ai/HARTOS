@@ -83,8 +83,8 @@ _NAME_KEYS = ('name', 'key', 'field')
 #: card's number or code, a wallet's phrase.  Ask-only: on the wire 'pin' is a
 #: GPIO pin, so the egress scrub does not withhold these.
 _CREDENTIAL_WORDS = ('otp', 'otp_code', 'one_time_code', 'pin', 'pin_number',
-                     'passcode', 'cvv', 'cvc', 'card_number', 'secret_key',
-                     'seed_phrase', 'recovery_phrase')
+                     'passcode', 'cvv', 'cvc', 'card_number', 'seed_phrase',
+                     'recovery_phrase')
 
 _lock = threading.Lock()
 _asks: Dict[str, '_Ask'] = {}
@@ -127,9 +127,11 @@ def _walk(value):
 
 
 def _names_a_secret(name) -> bool:
-    """Is ``name`` (a field's or an answer's key, in any spelling) a secret's
-    or a credential's?  security.edge_privacy.is_secret_key, extended by the
-    words only the vault asks for."""
+    """Is ``name`` (a field's or an answer's key, in any spelling, glued
+    into one word too) a secret's or a credential's?
+    security.edge_privacy.is_secret_key, extended by the words only the vault
+    asks for.  A short credential word glued into a name ('upipin') is not
+    read: written 'upi_pin', 'upiPin' or 'UPIPin' it is."""
     from security.edge_privacy import is_secret_key, secret_key_form
     return isinstance(name, str) and is_secret_key(secret_key_form(name),
                                                    _CREDENTIAL_WORDS)
@@ -146,14 +148,24 @@ def _asks_for_a_secret(component) -> bool:
     through (review of e6eed01ae), and the owner's ruling of 2026-10-20 for
     reading words without the model is the exact word or the model."""
     for d in _walk(component):
-        if d.get('secret') is True or str(d.get('secret', '')).strip().lower() in (
-                'true', '1', 'yes'):
+        if _marked_secret(d.get('secret')):
             return True
         if any(str(d.get(k, '')).strip().lower() == 'password' for k in _TYPE_KEYS):
             return True
         if any(_names_a_secret(d.get(k)) for k in _NAME_KEYS):
             return True
     return False
+
+
+def _marked_secret(marker) -> bool:
+    """Whether a field's ``secret`` marks it: truthy the way the desktop page
+    reads it (AgentOverlay.jsx draws a password box for a JavaScript-truthy
+    ``secret``), so the string 'false' and an empty list mark it too."""
+    if marker is None or marker is False or marker == '':
+        return False
+    if isinstance(marker, (int, float)) and not isinstance(marker, bool):
+        return marker == marker and marker != 0          # NaN and 0 are falsy
+    return True
 
 
 def _refusal(component, prompt_id) -> Optional[str]:
@@ -361,8 +373,15 @@ def _answer_problem(a: '_Ask', answer) -> Optional[str]:
 
 
 def _has_a_value(v) -> bool:
+    """A value under a secret's name: text that is not blank, a number, or a
+    dict or list that holds one (an answer is at most MAX_ANSWER_DEPTH deep,
+    checked before this)."""
     if isinstance(v, str):
         return bool(v.strip())
+    if isinstance(v, dict):
+        return any(_has_a_value(x) for x in v.values())
+    if isinstance(v, (list, tuple)):
+        return any(_has_a_value(x) for x in v)
     return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 

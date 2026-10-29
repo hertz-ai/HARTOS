@@ -485,6 +485,12 @@ def test_a_person_has_at_most_a_few_open_asks(legs):
     *({'name': n, 'type': 'text'} for n in (
         'otp', 'pin', 'cvv', 'card_number', 'passcode', 'seed_phrase', 'upiPin',
         'otp_code', 'OTPCode', 'PINNumber', 'otp1', 'CVV2')),
+    # ... and glued into one lowercase word (review of 83f44ebb1, M1)
+    *({'name': n, 'type': 'text'} for n in (
+        'newpassword', 'confirmpassword', 'userpassword', 'NEWPASSWORD',
+        'accesstoken', 'apitoken', 'authtoken', 'refreshtoken', 'clientsecret',
+        'secretkey', 'privatekey', 'otpcode', 'cardnumber', 'seedphrase',
+        'pinnumber', 'onetimecode')),
 ])
 def test_a_component_that_asks_for_a_secret_is_refused(legs, field):
     form = {'type': 'form', 'title': 'Your login',
@@ -512,6 +518,12 @@ def test_a_component_that_asks_for_a_secret_is_refused(legs, field):
     {'name': 'doc', 'type': 'text', 'label': 'Upload your boarding pass'},
     {'name': 'doc', 'type': 'text', 'hint': 'Upload the PWD approval letter'},
     {'name': 'note', 'type': 'text', 'label': 'Add chocolate cookie to the cart?'},
+    # a short secret word is not read inside a glued name
+    {'name': 'boardingpass', 'type': 'text'},
+    {'name': 'compass', 'type': 'text'},
+    {'name': 'spin', 'type': 'number'},
+    # a field not marked secret, however the marker is spelled
+    *({'name': 'note', 'type': 'text', 'secret': v} for v in (False, None, 0, '')),
 ])
 def test_everyday_words_are_not_a_secret(legs, field):
     form = {'type': 'form', 'title': 'Tell me',
@@ -539,6 +551,14 @@ def test_an_asks_title_and_body_are_not_read_for_secrets(legs, where):
     {'values': {'userPassword': 'hunter2-hunter2'}},
     {'values': {'accessToken': 'opaque-value'}},
     {'values': {'otp': '482913'}},
+    # a glued name (review of 83f44ebb1, M1), and a secret under a secret's
+    # name one level down
+    {'values': {'newpassword': 'hunter2'}},
+    {'values': {'userpassword': 'hunter2'}},
+    {'values': {'accesstoken': 'opaque-value'}},
+    {'values': {'otpcode': '482913'}},
+    {'password': {'value': 'hunter2'}},
+    {'values': {'password': ['hunter2']}},
 ])
 def test_an_answer_that_carries_a_secret_is_refused(legs, answer):
     from integrations.agent_engine import person_ask
@@ -548,6 +568,17 @@ def test_an_answer_that_carries_a_secret_is_refused(legs, answer):
     body, code = person_ask.answer_ask(ask_id, answer, '10202')
     assert code == 400 and body['reason'] == 'secrets_go_to_the_vault'
     assert person_ask.ask_state(ask_id, '10202')['status'] == 'open'
+
+
+@pytest.mark.parametrize('marker', ['on', 'y', 2, [1], {'yes': 1}, 'false'])
+def test_a_field_the_page_would_mask_is_refused(legs, marker):
+    """The desktop page draws a password box for a field whose ``secret`` is
+    truthy the way JavaScript reads it (AgentOverlay.jsx), 'false' and [1]
+    included; such a field is never asked here (review of 83f44ebb1, S1)."""
+    form = {'type': 'form', 'title': 'Tell me', 'action': '/x',
+            'fields': [{'name': 'note', 'type': 'text', 'secret': marker}]}
+    out = _ask(component=form)
+    assert out['ok'] is False and out['refused'] == 'secrets_go_to_the_vault'
 
 
 def test_an_answer_with_an_everyday_field_is_taken(legs):
@@ -615,6 +646,7 @@ def test_a_file_request_the_store_could_not_take_is_refused(legs, comp, prompt, 
 def test_a_logo_is_asked_for_one_file(legs):
     _ask(component=dict(CLIPS, purpose='logo', accept='image', max_files=4))
     assert legs['cards'][-1][1]['max_files'] == 1
+
 
 
 @pytest.fixture
