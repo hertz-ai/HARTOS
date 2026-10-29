@@ -16,7 +16,15 @@
 #
 # Regenerate from a report: python -c "import json;d=json.load(open('pip-audit-report.json'));[print(v['id'],'#',x['name']+'=='+x['version']) for x in d['dependencies'] for v in x.get('vulns',[])]"
 
-# aiohttp==3.9.5: 34 ids; inherited pin, not in KNOWN_ISSUES.md
+# aiohttp==3.9.5: 42 ids; inherited pin, not in KNOWN_ISSUES.md
+CVE-2026-111063  # aiohttp==3.9.5 fixed in 3.14.4
+CVE-2026-111064  # aiohttp==3.9.5 fixed in 3.14.4
+CVE-2026-111065  # aiohttp==3.9.5 fixed in 3.14.4
+CVE-2026-111066  # aiohttp==3.9.5 fixed in 3.14.4
+CVE-2026-111748  # aiohttp==3.9.5 fixed in 3.14.4
+CVE-2026-111749  # aiohttp==3.9.5 fixed in 3.14.4
+CVE-2026-111750  # aiohttp==3.9.5 fixed in 3.14.4
+GHSA-2g87-pp6c-29x5  # aiohttp==3.9.5 fixed in 3.14.4
 PYSEC-2026-1097  # aiohttp==3.9.5 fixed in 3.13.3
 PYSEC-2026-1099  # aiohttp==3.9.5 fixed in 3.13.3
 PYSEC-2026-1100  # aiohttp==3.9.5 fixed in 3.13.3
@@ -59,9 +67,10 @@ CVE-2026-64847  # anyio==4.8.0 fixed in 4.14.2
 # autobahn==23.1.2: 1 ids; inherited pin, not in KNOWN_ISSUES.md
 CVE-2026-77528  # autobahn==23.1.2 fixed in 26.7.1
 
-# certifi==2023.5.7: 2 ids; KNOWN_ISSUES.md #1 (CVSS 9.8)
+# certifi==2023.5.7: 3 ids; KNOWN_ISSUES.md #1 (CVSS 9.8)
 PYSEC-2023-135  # certifi==2023.5.7 fixed in 2023.7.22
 PYSEC-2024-230  # certifi==2023.5.7 fixed in 2024.7.4
+PYSEC-2026-4320  # certifi==2023.5.7 fixed in 2026.10.19
 
 # click==8.1.8: 1 ids; inherited pin, not in KNOWN_ISSUES.md
 PYSEC-2026-2132  # click==8.1.8 fixed in 8.3.3
@@ -82,14 +91,25 @@ PYSEC-2026-2447  # diskcache==5.6.3
 PYSEC-2024-203  # duckdb==0.8.1 fixed in 1.1.0
 PYSEC-2024-25  # duckdb==0.8.1 fixed in 0.9.3.dev6
 
-# filelock==3.12.2: 2 ids; inherited pin, not in KNOWN_ISSUES.md
+# filelock==3.12.2: 4 ids; inherited pin, not in KNOWN_ISSUES.md
+CVE-2026-112909  # filelock==3.12.2 fixed in 4.2.1
+CVE-2026-112910  # filelock==3.12.2 fixed in 4.2.1
 PYSEC-2026-1374  # filelock==3.12.2 fixed in 3.20.3
 PYSEC-2026-1375  # filelock==3.12.2 fixed in 3.20.1
 
 # flask==2.3.2: 1 ids; inherited pin, not in KNOWN_ISSUES.md
 PYSEC-2026-2151  # flask==2.3.2 fixed in 3.1.3
 
-# gitpython==3.1.44: 28 ids; inherited pin, not in KNOWN_ISSUES.md
+# fsspec==2023.6.0: 1 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2026-4217  # fsspec==2023.6.0 fixed in 2026.6.0
+
+# gitpython==3.1.44: 34 ids; inherited pin, not in KNOWN_ISSUES.md
+CVE-2026-110855  # gitpython==3.1.44 fixed in 3.2.0
+CVE-2026-110856  # gitpython==3.1.44 fixed in 3.2.0
+CVE-2026-110857  # gitpython==3.1.44 fixed in 3.2.0
+CVE-2026-110858  # gitpython==3.1.44 fixed in 3.2.0
+CVE-2026-110859  # gitpython==3.1.44 fixed in 3.2.0
+CVE-2026-114145  # gitpython==3.1.44 fixed in 3.2.1
 CVE-2026-73624  # gitpython==3.1.44 fixed in 3.1.54
 PYSEC-2026-2160  # gitpython==3.1.44 fixed in 3.1.47
 PYSEC-2026-2161  # gitpython==3.1.44 fixed in 3.1.47
@@ -167,7 +187,7 @@ PYSEC-2026-2583  # langsmith==0.3.45 fixed in 0.7.31
 # marshmallow==3.19.0: 1 ids; inherited pin, not in KNOWN_ISSUES.md
 PYSEC-2026-1605  # marshmallow==3.19.0 fixed in 3.26.2, 4.1.2
 
-# nltk==3.8.1: 42 ids; inherited pin, not in KNOWN_ISSUES.md
+# nltk==3.8.1: 43 ids; inherited pin, not in KNOWN_ISSUES.md
 PYSEC-2024-167  # nltk==3.8.1 fixed in 3.9
 PYSEC-2026-2085  # nltk==3.8.1 fixed in 3.9.4
 PYSEC-2026-2235  # nltk==3.8.1 fixed in 3.9.4
@@ -205,6 +225,7 @@ PYSEC-2026-3870  # nltk==3.8.1 fixed in 3.10.1
 PYSEC-2026-3871  # nltk==3.8.1 fixed in 3.10.3
 PYSEC-2026-3954  # nltk==3.8.1 fixed in 3.10.0
 PYSEC-2026-3955  # nltk==3.8.1
+PYSEC-2026-4318  # nltk==3.8.1 fixed in no fix released
 PYSEC-2026-597  # nltk==3.8.1 fixed in 3.10.0
 PYSEC-2026-96  # nltk==3.8.1 fixed in 3.9.3
 PYSEC-2026-97  # nltk==3.8.1 fixed in 3.9.3
@@ -224,7 +245,26 @@ PYSEC-2026-107  # orjson==3.10.1 fixed in 3.11.5, 3.11.6
 # paramiko==3.5.1: 1 ids; inherited pin, not in KNOWN_ISSUES.md
 PYSEC-2026-2858  # paramiko==3.5.1
 
-# pillow==9.5.0: 19 ids; KNOWN_ISSUES.md #1 (3 CVEs then; 36 ids now)
+# pillow==9.5.0: 51 ids; KNOWN_ISSUES.md #1 (3 CVEs then; 36 ids now)
+CVE-2026-112390  # pillow==9.5.0 fixed in 13.0.0
+CVE-2026-112391  # pillow==9.5.0 fixed in 13.0.0
+CVE-2026-112393  # pillow==9.5.0 fixed in 13.0.0
+CVE-2026-112395  # pillow==9.5.0 fixed in 13.0.0
+CVE-2026-112399  # pillow==9.5.0 fixed in 13.0.0
+CVE-2026-112400  # pillow==9.5.0 fixed in 13.0.0
+CVE-2026-112401  # pillow==9.5.0 fixed in 13.0.0
+CVE-2026-112404  # pillow==9.5.0 fixed in 13.0.0
+CVE-2026-112406  # pillow==9.5.0 fixed in 13.0.0
+CVE-2026-112891  # pillow==9.5.0 fixed in 13.0.0
+CVE-2026-112892  # pillow==9.5.0 fixed in 13.0.0
+CVE-2026-112894  # pillow==9.5.0 fixed in 13.0.0
+CVE-2026-112895  # pillow==9.5.0 fixed in 13.0.0
+CVE-2026-112897  # pillow==9.5.0 fixed in 13.0.0
+CVE-2026-112899  # pillow==9.5.0 fixed in 13.0.0
+CVE-2026-112900  # pillow==9.5.0 fixed in 13.0.0
+CVE-2026-96638  # pillow==9.5.0 fixed in 13.0.0
+CVE-2026-96640  # pillow==9.5.0 fixed in 13.0.0
+CVE-2026-96778  # pillow==9.5.0 fixed in 13.0.0
 PYSEC-2023-175  # pillow==9.5.0 fixed in 10.0.1
 PYSEC-2023-227  # pillow==9.5.0 fixed in 10.0.0
 PYSEC-2026-165  # pillow==9.5.0 fixed in 12.2.0
@@ -243,6 +283,19 @@ PYSEC-2026-3493  # pillow==9.5.0 fixed in 12.3.0
 PYSEC-2026-3494  # pillow==9.5.0 fixed in 12.3.0
 PYSEC-2026-3495  # pillow==9.5.0 fixed in 12.3.0
 PYSEC-2026-3496  # pillow==9.5.0 fixed in 12.3.0
+PYSEC-2026-4326  # pillow==9.5.0 fixed in 13.0.0
+PYSEC-2026-4327  # pillow==9.5.0 fixed in 13.0.0
+PYSEC-2026-4329  # pillow==9.5.0 fixed in 13.0.0
+PYSEC-2026-4330  # pillow==9.5.0 fixed in 13.0.0
+PYSEC-2026-4331  # pillow==9.5.0 fixed in 13.0.0
+PYSEC-2026-4332  # pillow==9.5.0 fixed in 13.0.0
+PYSEC-2026-4334  # pillow==9.5.0 fixed in 13.0.0
+PYSEC-2026-4335  # pillow==9.5.0 fixed in 13.0.0
+PYSEC-2026-4337  # pillow==9.5.0 fixed in 13.0.0
+PYSEC-2026-4338  # pillow==9.5.0 fixed in 13.0.0
+PYSEC-2026-4340  # pillow==9.5.0 fixed in 13.0.0
+PYSEC-2026-4341  # pillow==9.5.0 fixed in 13.0.0
+PYSEC-2026-4343  # pillow==9.5.0 fixed in 13.0.0
 PYSEC-2026-457  # pillow==9.5.0 fixed in 10.2.0
 
 # protobuf==4.23.3: 2 ids; inherited pin, not in KNOWN_ISSUES.md
@@ -258,7 +311,22 @@ PYSEC-2026-3455  # pyasn1==0.5.0 fixed in 0.6.4
 PYSEC-2026-3456  # pyasn1==0.5.0 fixed in 0.6.4
 PYSEC-2026-3457  # pyasn1==0.5.0 fixed in 0.6.4
 
-# pypdf==3.17.1: 41 ids; inherited pin, not in KNOWN_ISSUES.md
+# pyjwt==2.14.0: 2 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2026-4141  # pyjwt==2.14.0 fixed in 2.15.0
+PYSEC-2026-4183  # pyjwt==2.14.0 fixed in 2.15.0
+
+# pypdf==3.17.1: 60 ids; inherited pin, not in KNOWN_ISSUES.md
+CVE-2026-113786  # pypdf==3.17.1 fixed in 6.21.1
+CVE-2026-113789  # pypdf==3.17.1 fixed in 6.21.0
+CVE-2026-113790  # pypdf==3.17.1 fixed in 6.21.0
+CVE-2026-113791  # pypdf==3.17.1 fixed in 6.21.0
+CVE-2026-113792  # pypdf==3.17.1 fixed in 6.20.1
+CVE-2026-113793  # pypdf==3.17.1 fixed in 6.20.1
+CVE-2026-113794  # pypdf==3.17.1 fixed in 6.20.0
+CVE-2026-113795  # pypdf==3.17.1 fixed in 6.20.0
+CVE-2026-115572  # pypdf==3.17.1 fixed in 6.21.2
+CVE-2026-115580  # pypdf==3.17.1 fixed in 6.21.2
+CVE-2026-115585  # pypdf==3.17.1 fixed in 6.21.2
 CVE-2026-57204  # pypdf==3.17.1 fixed in 6.13.3
 PYSEC-2026-1827  # pypdf==3.17.1 fixed in 6.6.2
 PYSEC-2026-1828  # pypdf==3.17.1 fixed in 6.6.0
@@ -300,6 +368,14 @@ PYSEC-2026-3910  # pypdf==3.17.1 fixed in 6.16.1
 PYSEC-2026-3911  # pypdf==3.17.1 fixed in 6.16.1
 PYSEC-2026-3912  # pypdf==3.17.1 fixed in 6.15.0
 PYSEC-2026-3913  # pypdf==3.17.1 fixed in 6.16.0
+PYSEC-2026-4153  # pypdf==3.17.1 fixed in 6.18.0
+PYSEC-2026-4154  # pypdf==3.17.1 fixed in 6.18.1
+PYSEC-2026-4155  # pypdf==3.17.1 fixed in 6.18.1
+PYSEC-2026-4156  # pypdf==3.17.1 fixed in 6.18.1
+PYSEC-2026-4157  # pypdf==3.17.1 fixed in 6.19.0
+PYSEC-2026-4158  # pypdf==3.17.1 fixed in 6.17.0
+PYSEC-2026-4159  # pypdf==3.17.1 fixed in 6.19.0
+PYSEC-2026-4160  # pypdf==3.17.1 fixed in 6.19.0
 
 # python-dotenv==1.0.0: 1 ids; inherited pin, not in KNOWN_ISSUES.md
 PYSEC-2026-2270  # python-dotenv==1.0.0 fixed in 1.2.2
@@ -320,6 +396,9 @@ PYSEC-2026-2275  # requests==2.32.5 fixed in 2.33.0
 
 # scikit-learn==1.3.2: 1 ids; inherited pin, not in KNOWN_ISSUES.md
 PYSEC-2024-110  # scikit-learn==1.3.2 fixed in 1.5.0
+
+# sentence-transformers==2.2.2: 1 ids; inherited pin, not in KNOWN_ISSUES.md
+PYSEC-2026-4164  # sentence-transformers==2.2.2 fixed in 5.6.0
 
 # sentencepiece==0.1.99: 1 ids; inherited pin, not in KNOWN_ISSUES.md
 PYSEC-2026-1909  # sentencepiece==0.1.99 fixed in 0.2.1
@@ -395,7 +474,7 @@ PYSEC-2026-2289  # transformers==4.33.3 fixed in 5.3.0
 PYSEC-2026-2290  # transformers==4.33.3 fixed in 5.5.0
 PYSEC-2026-3929  # transformers==4.33.3 fixed in 5.10.0
 
-# urllib3==1.26.16: 8 ids; KNOWN_ISSUES.md #1
+# urllib3==1.26.16: 10 ids; KNOWN_ISSUES.md #1
 PYSEC-2023-192  # urllib3==1.26.16 fixed in 1.26.17, 2.0.6
 PYSEC-2023-212  # urllib3==1.26.16 fixed in 1.26.18, 2.0.7
 PYSEC-2026-141  # urllib3==1.26.16 fixed in 2.7.0
@@ -404,12 +483,14 @@ PYSEC-2026-1995  # urllib3==1.26.16 fixed in 1.26.19, 2.2.2
 PYSEC-2026-1996  # urllib3==1.26.16 fixed in 2.6.3
 PYSEC-2026-1998  # urllib3==1.26.16 fixed in 2.6.0
 PYSEC-2026-1999  # urllib3==1.26.16 fixed in 2.5.0
+PYSEC-2026-4175  # urllib3==1.26.16 fixed in 2.8.0
+PYSEC-2026-4177  # urllib3==1.26.16 fixed in 2.8.0
 
 # waitress==2.1.2: 2 ids; inherited pin, not in KNOWN_ISSUES.md
 PYSEC-2024-210  # waitress==2.1.2 fixed in 3.0.1
 PYSEC-2024-211  # waitress==2.1.2 fixed in 3.0.1
 
-# werkzeug==2.3.6: 8 ids; KNOWN_ISSUES.md #1 (RCE 7.5)
+# werkzeug==2.3.6: 9 ids; KNOWN_ISSUES.md #1 (RCE 7.5)
 PYSEC-2023-221  # werkzeug==2.3.6 fixed in 2.3.8, 3.0.1
 PYSEC-2026-1860  # werkzeug==2.3.6 fixed in 3.0.6
 PYSEC-2026-2043  # werkzeug==2.3.6 fixed in 3.0.3
@@ -418,6 +499,7 @@ PYSEC-2026-2045  # werkzeug==2.3.6 fixed in 3.0.6
 PYSEC-2026-2046  # werkzeug==2.3.6 fixed in 3.1.4
 PYSEC-2026-2320  # werkzeug==2.3.6 fixed in 3.1.6
 PYSEC-2026-3417  # werkzeug==2.3.6 fixed in 3.0.6
+PYSEC-2026-4312  # werkzeug==2.3.6 fixed in 3.1.9
 
 # zipp==3.15.0: 1 ids; inherited pin, not in KNOWN_ISSUES.md
 PYSEC-2026-2074  # zipp==3.15.0 fixed in 3.19.1
