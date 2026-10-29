@@ -569,6 +569,18 @@ def get_local_draft_url() -> str:
     return url
 
 
+def has_dedicated_draft_server() -> bool:
+    """True when a draft server of its own is configured and listening.
+
+    ``get_local_draft_url()`` answers with the main model's URL both when no
+    draft is configured and when the configured one is not listening, so the
+    two URLs being equal is exactly "no draft server": the main model is the
+    draft.  A caller that wants a separate, faster first responder (the
+    draft-first dispatcher) must not take the main model for one.
+    """
+    return get_local_draft_url().rstrip('/') != get_local_llm_url().rstrip('/')
+
+
 def get_local_llm_url() -> str:
     """Single source of truth for the local LLM endpoint URL.
 

@@ -978,7 +978,14 @@ class SpeculativeDispatcher:
     def _draft_server_alive(self) -> bool:
         """Cheap TCP probe against the draft server endpoint. Cached
         for 30s so the dispatcher stays responsive under chat load.
-        Returns True if a connect() to the draft host:port succeeds."""
+        Returns True if a connect() to the draft host:port succeeds.
+
+        A local node with no draft server of its own is NOT alive: the draft
+        URL then IS the main llama-server, which always accepts the connect,
+        so the probe would wave draft-first through to post its classifier
+        prompt to the 4B with a 15 s read timeout (30 s after the pooled_post
+        re-send) and an empty reply on any box that cannot answer that fast.
+        An api-kind node keeps the main model as its draft by design."""
         import socket
         import time as _t
         now = _t.time()
@@ -986,19 +993,27 @@ class SpeculativeDispatcher:
             return self._draft_probe_ok
         ok = False
         try:
-            from core.port_registry import get_local_draft_url
-            url = get_local_draft_url()
-            # http://host:port/v1 → (host, port)
-            _body = url.split('://', 1)[-1].split('/', 1)[0]
-            host, _, port_s = _body.partition(':')
-            port = int(port_s) if port_s else 80
-            with socket.create_connection((host, port), timeout=0.5):
-                ok = True
+            if not self._main_model_is_the_only_draft():
+                from core.port_registry import get_local_draft_url
+                url = get_local_draft_url()
+                # http://host:port/v1 → (host, port)
+                _body = url.split('://', 1)[-1].split('/', 1)[0]
+                host, _, port_s = _body.partition(':')
+                port = int(port_s) if port_s else 80
+                with socket.create_connection((host, port), timeout=0.5):
+                    ok = True
         except Exception:
             ok = False
         self.__class__._draft_probe_ts = now
         self.__class__._draft_probe_ok = ok
         return ok
+
+    @staticmethod
+    def _main_model_is_the_only_draft() -> bool:
+        """A local node whose draft URL is its own main llama-server."""
+        from core.autogen_config import resolve_llm_backend
+        from core.port_registry import has_dedicated_draft_server
+        return resolve_llm_backend()[0] == 'local' and not has_dedicated_draft_server()
 
     def _build_draft_classifier_prompt(
         self, user_prompt: str, agent_persona: Optional[str] = None,
