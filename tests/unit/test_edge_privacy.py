@@ -273,3 +273,36 @@ class TestSingletonAndDRY:
         assert 'PII_PATTERNS' not in source
         assert r'\b\d{3}-\d{2}-\d{4}' not in source  # No SSN regex
         assert r'@[A-Za-z0-9' not in source  # No email regex
+
+
+# ═══════════════════════════════════════════════════════════════
+# 6. A secret's name, in any spelling
+# ═══════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize('name, form', [
+    ('userPassword', 'user_password'), ('API-Key', 'api_key'),
+    ('Your UPI PIN', 'your_upi_pin'),
+    # where an acronym ends, and a number on a name (review of e6eed01ae)
+    ('DBPassword', 'db_password'), ('APIToken', 'api_token'),
+    ('JWTToken', 'jwt_token'), ('AWSSecretKey', 'aws_secret_key'),
+    ('OTPCode', 'otp_code'), ('password2', 'password'), ('pwd2', 'pwd'),
+    ('otp1', 'otp'), ('oauth2Token', 'oauth_token'), ('', ''), (None, ''),
+])
+def test_secret_key_form_reads_a_name_in_any_spelling(name, form):
+    from security.edge_privacy import secret_key_form
+    assert secret_key_form(name) == form
+
+
+@pytest.mark.parametrize('name', ['DBPassword', 'SSHPassword', 'APIToken',
+                                  'JWTToken', 'password1', 'password2', 'pwd2',
+                                  'clientSecret'])
+def test_a_secrets_name_in_any_spelling_is_a_secret(name):
+    from security.edge_privacy import is_secret_key, secret_key_form
+    assert is_secret_key(secret_key_form(name))
+
+
+@pytest.mark.parametrize('name', ['max_tokens', 'tokenizer', 'token_type',
+                                  'secret_name', 'mp3_url', 'top50'])
+def test_a_name_that_only_holds_a_secrets_word_is_not_a_secret(name):
+    from security.edge_privacy import is_secret_key, secret_key_form
+    assert not is_secret_key(secret_key_form(name))

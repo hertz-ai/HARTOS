@@ -476,36 +476,20 @@ def test_a_person_has_at_most_a_few_open_asks(legs):
         'userPassword', 'confirmPassword', 'newPassword', 'instagramPassword',
         'accessToken', 'refreshToken', 'authToken', 'apiToken', 'clientSecret',
         'secretKey', 'privateKey', 'sessionCookie', 'API-Key')),
+    # ... where an acronym ends, and with a number on it (review of
+    # e6eed01ae, probes P4 and P5)
+    *({'name': n, 'type': 'text'} for n in (
+        'DBPassword', 'SSHPassword', 'APIToken', 'JWTToken', 'AWSSecretKey',
+        'password1', 'password2', 'pwd2')),
     # what a person is only asked through the vault
     *({'name': n, 'type': 'text'} for n in (
         'otp', 'pin', 'cvv', 'card_number', 'passcode', 'seed_phrase', 'upiPin',
-        'otp_code')),
-    # a field whose words ask for it, whatever its name
-    {'name': 'f1', 'type': 'text', 'label': 'Password'},
-    {'name': 'f1', 'type': 'text', 'placeholder': 'your password'},
-    {'name': 'f1', 'type': 'text', 'label': 'Enter the OTP'},
-    {'name': 'f1', 'type': 'text', 'label': 'Your UPI PIN'},
-    {'name': 'f1', 'type': 'text', 'label': 'Card number'},
-    {'name': 'f1', 'type': 'text', 'hint': 'Paste your API key here'},
-    {'name': 'f1', 'type': 'text', 'label': 'Your wallet seed phrase'},
+        'otp_code', 'OTPCode', 'PINNumber', 'otp1', 'CVV2')),
 ])
 def test_a_component_that_asks_for_a_secret_is_refused(legs, field):
     form = {'type': 'form', 'title': 'Your login',
             'fields': [{'name': 'user', 'type': 'text'}, field], 'action': '/x'}
     out = _ask(component=form)
-    _settle()
-    assert out['ok'] is False and out['refused'] == 'secrets_go_to_the_vault'
-    assert legs['pushes'] == [] and legs['cards'] == []
-
-
-@pytest.mark.parametrize('where', ['component', 'ask'])
-def test_an_ask_whose_title_asks_for_a_secret_is_refused(legs, where):
-    title = 'Enter your bank password'
-    form = {'type': 'form', 'fields': [{'name': 'f1', 'type': 'text'}], 'action': '/x'}
-    if where == 'component':
-        out = _ask(component=dict(form, title=title), title='')
-    else:
-        out = _ask(component=form, title=title)
     _settle()
     assert out['ok'] is False and out['refused'] == 'secrets_go_to_the_vault'
     assert legs['pushes'] == [] and legs['cards'] == []
@@ -519,14 +503,33 @@ def test_an_ask_whose_title_asks_for_a_secret_is_refused(legs, where):
     {'name': 'secret_name', 'type': 'text'},
     {'name': 'note', 'type': 'text', 'label': 'Send me a token of appreciation'},
     {'name': 'note', 'type': 'text', 'label': 'Pass the clips to me'},
-    {'name': 'note', 'type': 'text', 'label': 'Pin it to your profile?'},
     {'name': 'note', 'type': 'text', 'label': "What's the secret to your best reel?"},
+    # an ask's words are not read for secrets: what a word list refused
+    # (review of e6eed01ae, probes P1-P3)
+    {'name': 'zip', 'type': 'text', 'label': 'Delivery address PIN code'},
+    {'name': 'zip', 'type': 'text', 'placeholder': 'Enter your 6-digit PIN code'},
+    {'name': 'note', 'type': 'text', 'label': 'Loved the edit! Pin it to your profile?'},
+    {'name': 'doc', 'type': 'text', 'label': 'Upload your boarding pass'},
+    {'name': 'doc', 'type': 'text', 'hint': 'Upload the PWD approval letter'},
+    {'name': 'note', 'type': 'text', 'label': 'Add chocolate cookie to the cart?'},
 ])
 def test_everyday_words_are_not_a_secret(legs, field):
     form = {'type': 'form', 'title': 'Tell me',
             'fields': [{'name': 'user', 'type': 'text'}, field], 'action': '/x'}
     out = _ask(component=form)
     assert out['ok'] is True, out
+
+
+@pytest.mark.parametrize('where', ['component', 'ask'])
+def test_an_asks_title_and_body_are_not_read_for_secrets(legs, where):
+    words = 'Here is the first pass of your reel. Approve?'
+    if where == 'component':
+        out = _ask(component=dict(POST, description=words), title='', body='')
+    else:
+        out = _ask(component=dict(POST), title='The first pass', body=words)
+    _settle()
+    assert out['ok'] is True, out
+    assert len(legs['cards']) == 1 and len(legs['pushes']) == 1
 
 
 @pytest.mark.parametrize('answer', [
@@ -553,6 +556,19 @@ def test_an_answer_with_an_everyday_field_is_taken(legs):
                              'fields': [{'name': 'pin_code', 'type': 'text'}],
                              'action': '/x'})['ask_id']
     body, code = person_ask.answer_ask(ask_id, {'values': {'pin_code': '560001'}}, '10202')
+    assert code == 200, body
+
+
+@pytest.mark.parametrize('empty', ['', '   ', True, None])
+def test_an_answer_whose_secret_field_is_empty_is_taken(legs, empty):
+    """A secret's name with nothing under it carries no secret: only a value
+    under it is refused."""
+    from integrations.agent_engine import person_ask
+    ask_id = _ask(component={'type': 'form', 'title': 'Tell me',
+                             'fields': [{'name': 'note', 'type': 'text'}],
+                             'action': '/x'})['ask_id']
+    answer = {'values': {'note': 'hi', 'password': empty}}
+    body, code = person_ask.answer_ask(ask_id, answer, '10202')
     assert code == 200, body
 
 

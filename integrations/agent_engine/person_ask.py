@@ -75,12 +75,9 @@ MAX_ANSWER_DEPTH = 4
 #: phone without end).  The same question asked again is the same ask.
 MAX_OPEN_PER_PERSON = 3
 
-#: Keys that type a field, the keys that name one, and the keys whose value is
-#: words the person reads (a field's label, a card's title).
+#: Keys that type a field, and the keys that name one.
 _TYPE_KEYS = ('type', 'input_type', 'inputType', 'format', 'kind')
 _NAME_KEYS = ('name', 'key', 'field')
-_TEXT_KEYS = ('label', 'placeholder', 'title', 'description', 'hint', 'help',
-              'prompt', 'question')
 #: Beyond the secret key words (security.edge_privacy.is_secret_key), what a
 #: person is only ever asked through the vault: a one-time code, a PIN, a
 #: card's number or code, a wallet's phrase.  Ask-only: on the wire 'pin' is a
@@ -88,15 +85,6 @@ _TEXT_KEYS = ('label', 'placeholder', 'title', 'description', 'hint', 'help',
 _CREDENTIAL_WORDS = ('otp', 'otp_code', 'one_time_code', 'pin', 'pin_number',
                      'passcode', 'cvv', 'cvc', 'card_number', 'secret_key',
                      'seed_phrase', 'recovery_phrase')
-#: In a sentence these are everyday words ('pass the clips', 'a token of
-#: thanks', 'pin it'), so alone they ask for nothing; 'UPI PIN' or 'access
-#: token' still does.
-_EVERYDAY_WORDS = frozenset({'pass', 'token', 'secret', 'cookie', 'credential',
-                             'credentials', 'pin'})
-#: Little words a phrase that names a secret does not carry ('a token').
-_FUNCTION_WORDS = frozenset({'a', 'an', 'the', 'your', 'my', 'our', 'their',
-                             'his', 'her', 'its', 'this', 'that', 'of', 'to',
-                             'for', 'and', 'or', 'any', 'some', 'no', 's'})
 
 _lock = threading.Lock()
 _asks: Dict[str, '_Ask'] = {}
@@ -147,32 +135,16 @@ def _names_a_secret(name) -> bool:
                                                    _CREDENTIAL_WORDS)
 
 
-def _words_ask_for_a_secret(text) -> bool:
-    """Do the words of a label or a title ask for a secret?  One word that
-    names one ('Password', 'Enter the OTP'), or two or three that do the way a
-    field name does ('API key', 'access token', 'UPI PIN', 'card number').
-    An everyday word alone ('pass', 'token', 'pin') is not enough, nor a
-    phrase with a little word in it ('a token')."""
-    if not isinstance(text, str):
-        return False
-    from security.edge_privacy import secret_key_form
-    words = secret_key_form(text).split('_')
-    for i, word in enumerate(words):
-        if word not in _EVERYDAY_WORDS and _names_a_secret(word):
-            return True
-        for n in (2, 3):
-            phrase = words[i:i + n]
-            if len(phrase) == n and not _FUNCTION_WORDS.intersection(phrase) \
-                    and _names_a_secret('_'.join(phrase)):
-                return True
-    return False
+def _asks_for_a_secret(component) -> bool:
+    """True if ``component`` asks for a secret by its structure: a field
+    marked ``secret``, typed ``password`` in any spelling, or named the way a
+    secret is named.
 
-
-def _asks_for_a_secret(component, words=()) -> bool:
-    """True if ``component`` asks for a secret: a field marked ``secret``,
-    typed ``password`` in any spelling, named the way a secret is named, or
-    whose label, placeholder or title asks for one; or the ask's own
-    ``words`` (its title and body) do."""
+    Its words (a label, a placeholder, a title) are not read: a word list over
+    free text refused 36 of 52 honest asks ('the first pass of your reel',
+    'Delivery address PIN code') and still let 32 of 47 secret phrasings
+    through (review of e6eed01ae), and the owner's ruling of 2026-10-20 for
+    reading words without the model is the exact word or the model."""
     for d in _walk(component):
         if d.get('secret') is True or str(d.get('secret', '')).strip().lower() in (
                 'true', '1', 'yes'):
@@ -181,18 +153,16 @@ def _asks_for_a_secret(component, words=()) -> bool:
             return True
         if any(_names_a_secret(d.get(k)) for k in _NAME_KEYS):
             return True
-        if any(_words_ask_for_a_secret(d.get(k)) for k in _TEXT_KEYS):
-            return True
-    return any(_words_ask_for_a_secret(w) for w in words)
+    return False
 
 
-def _refusal(component, prompt_id, words=()) -> Optional[str]:
+def _refusal(component, prompt_id) -> Optional[str]:
     """Why ``component`` cannot be asked, before anything is sent.  Which
     component types exist is the card gate's to say (agent_ui_compose), so a
     type an agent registered at runtime is asked like a builtin."""
     if not isinstance(component, dict) or not component.get('type'):
         return 'not_an_object'
-    if _asks_for_a_secret(component, words):
+    if _asks_for_a_secret(component):
         return 'secrets_go_to_the_vault'
     if component.get('type') == 'file_request':
         from core.user_file_store import INBOUND_PURPOSES
@@ -279,7 +249,7 @@ def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
     user_id = str(user_id or '').strip()
     if not user_id:
         return _refused('no_person')
-    refused = _refusal(component, prompt_id, (title, body))
+    refused = _refusal(component, prompt_id)
     if refused:
         logger.info("person ask refused (%s) for user %s by agent %s",
                     refused, user_id, agent_id)

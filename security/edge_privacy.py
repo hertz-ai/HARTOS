@@ -181,11 +181,15 @@ _CONTENT, _EXEMPT, _CONTACT, _SECRET = 'content', 'exempt', 'contact', 'secret'
 
 
 def secret_key_form(name: str) -> str:
-    """``name`` as is_secret_key reads it: lowercase, camelCase split, and
-    every run of other characters one underscore ('userPassword' ->
-    'user_password', 'API-Key' -> 'api_key', 'Your UPI PIN' -> 'your_upi_pin')."""
-    name = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', str(name or ''))
-    return re.sub(r'[^a-z0-9]+', '_', name.lower()).strip('_')
+    """``name`` as is_secret_key reads it: lowercase, split into words where
+    camelCase or an acronym ends, and every run of other characters, digits
+    too, one underscore ('userPassword' -> 'user_password', 'DBPassword' ->
+    'db_password', 'APIToken' -> 'api_token', 'API-Key' -> 'api_key',
+    'password2' -> 'password', 'otp1' -> 'otp').  A number in a name counts
+    fields; it is not a word of the name."""
+    name = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1_\2', str(name or ''))
+    name = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', name)
+    return re.sub(r'[^a-z]+', '_', name.lower()).strip('_')
 
 
 def is_secret_key(key: str, extra: Tuple[str, ...] = ()) -> bool:
