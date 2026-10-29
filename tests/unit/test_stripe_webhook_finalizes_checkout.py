@@ -407,6 +407,30 @@ class TestTheBrowserRouteSharesTheFinalizer:
         assert len(ctx['ledger'].payments) == 1
         ctx['stripe'].checkout.Session.retrieve.assert_called_once()
 
+    def test_a_step_added_to_the_finish_runs_on_every_path(self, ctx, monkeypatch):
+        """One finish for a recorded session (parallel-path audit 2026-10-27,
+        item 6): the webhook, its redelivery and the buyer's reload of a
+        session the webhook already recorded all end in
+        _finish_recorded_checkout, so a step added there later runs on each.
+        The reload's fast path ran its own copy of the tier, bump and
+        payload sequence, where a step added to the finalizer was skipped."""
+        from integrations.agent_engine import commercial_api
+        real = getattr(commercial_api, '_finish_recorded_checkout', None)
+
+        def with_a_later_step(*args, **kwargs):
+            payload, status = real(*args, **kwargs)
+            return dict(payload, a_later_step=True), status
+
+        monkeypatch.setattr(commercial_api, '_finish_recorded_checkout',
+                            with_a_later_step, raising=False)
+        first = _deliver(ctx, _event(_session()))        # the webhook records it
+        again = _deliver(ctx, _event(_session()))        # Stripe's redelivery
+        reload = _complete(ctx)                          # the buyer's reload
+        for r in (first, again, reload):
+            assert r.status_code == 200, r.get_json()
+            assert r.get_json().get('a_later_step') is True, r.get_json()
+        ctx['stripe'].checkout.Session.retrieve.assert_not_called()
+
     def test_a_record_without_a_bought_tier_is_a_reconciliation_case(self, ctx):
         """A ledger record missing target_tier (only a hand-edited ledger can
         lack it: every writer stamps it) used to raise KeyError outside the

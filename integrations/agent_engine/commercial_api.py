@@ -2223,18 +2223,33 @@ def _finalize_paid_checkout_session(session, db):
             payment_ledger.payments[payment.payment_id] = payment
             payment_ledger.save_ledger()
 
-    # The bought tier: applied on the first finalize, and again by a replay
-    # when a bump failed after the record was made (a 500 asks Stripe to
-    # retry; the retry used to be answered already_completed over a key
-    # still on the old tier, the review of 3153761b3).  Never a downgrade.
+    return _finish_recorded_checkout(db, payment, api_key, target_tier,
+                                     already=already, session_id=session_id)
+
+
+def _finish_recorded_checkout(db, payment, api_key, target_tier, *,
+                              already: bool, session_id: str):
+    """The end of every path that answers for a recorded Checkout payment;
+    ``(payload, http_status)``.
+
+    The finalizer (the webhook and the browser's first visit) and the
+    browser's fast path for a session already recorded both end here, so a
+    step added to the finish runs on each (the reload ran its own copy of
+    this sequence: parallel-path audit 2026-10-27, item 6).  The bought tier
+    is applied on the first finish and again by a replay when a bump failed
+    after the record was made (a 500 asks for a retry; the retry used to be
+    answered already_completed over a key still on the old tier, the review
+    of 3153761b3).  Never a downgrade.  ``target_tier`` is the caller's:
+    Stripe's signed metadata for the finalizer, the ledger record for the
+    fast path."""
     _changed, failure = _apply_bought_tier(db, api_key, target_tier)
     if failure is not None:
-        return _bump_failed(f'Stripe session {session_id}', api_key_id, failure,
-                            retry="Stripe redelivers the event on the 500 and the buyer's "
-                                  'reload re-POSTs the session; either runs the bump again',
+        return _bump_failed(f'Stripe session {session_id}', api_key.id, failure,
+                            retry="the buyer's reload re-POSTs the session, and Stripe "
+                                  'redelivers the event to a registered webhook until '
+                                  'it is answered 200; either runs the bump again',
                             retries=True, payment_request_id=payment.payment_id,
                             session_id=session_id)
-
     return _checkout_payload(payment, api_key, already_completed=already), 200
 
 
@@ -2296,16 +2311,10 @@ def complete_upgrade_checkout():
                     'success': False,
                     'error': 'Session belongs to a different user.',
                 }), 403
-            _changed, failure = _apply_bought_tier(db, api_key, recorded.get('target_tier'))
-            if failure is not None:
-                payload, status = _bump_failed(
-                    f'Stripe session {session_id}', api_key.id, failure,
-                    retry="the buyer's reload re-POSTs the session, and Stripe's event, "
-                          'when it is still due, finalizes it; either runs the bump again',
-                    retries=True, payment_request_id=existing.payment_id,
-                    session_id=session_id)
-                return jsonify(payload), status
-            return jsonify(_checkout_payload(existing, api_key, already_completed=True)), 200
+            payload, status = _finish_recorded_checkout(
+                db, existing, api_key, recorded.get('target_tier'),
+                already=True, session_id=session_id)
+            return jsonify(payload), status
 
         try:
             session = stripe_gw._stripe.checkout.Session.retrieve(session_id)
