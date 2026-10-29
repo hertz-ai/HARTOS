@@ -565,7 +565,13 @@ def _auto_pause_for_dispatch_failures(db, goal, goal_key, failure_count, why):
     try:
         db.refresh(goal, ['config_json', 'status'])
     except Exception:
-        pass  # no second read: the tick's copy stays, as the settle gate keeps it
+        # refresh() expired both attributes before it failed, so the staged
+        # copy is already gone from the instance: the next read of either
+        # attribute re-selects the row (or raises, for a row deleted during
+        # the turn, as the parent's arm did).  The carry-over below re-applies
+        # the tick's own key from ``pending``; nothing else of the staged copy
+        # is wanted (review of d73463359, finding 1).
+        pass
     with _module_lock:
         _dispatch_backoff.pop(goal_key, None)
     if goal.status != 'active':
