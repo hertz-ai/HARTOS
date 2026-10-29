@@ -235,11 +235,13 @@ class PlanError(Exception):
 _DATE = re.compile(r'\d{4}-\d{2}-\d{2}')
 _URL = re.compile(r'(?i)^\s*https?://')
 #: Beyond a secret's name (security.edge_privacy.is_secret_key), what a
-#: published or cached song list never carries under a key: an address, or the
-#: login its source (instagrapi) keeps, whose names are glued ('sessionid',
-#: 'csrftoken', 'cookies', 'authorization_data'), so these match anywhere in
-#: the key.
-_SONG_LIST_KEY_PARTS = ('url', 'session', 'cookie', 'csrf', 'authorization')
+#: published or cached song list never carries under a key: an address, or a
+#: login, whose names are often glued (instagrapi's 'sessionid', 'csrftoken',
+#: 'authorization_data'; 'accesstoken', 'userpassword'), so these match
+#: anywhere in the key.  A song list has no count of tokens either, so
+#: 'max_tokens' is refused with them.
+_SONG_LIST_KEY_PARTS = ('url', 'session', 'cookie', 'csrf', 'authorization',
+                        'token', 'password')
 
 
 def _is_num(v) -> bool:
@@ -1299,7 +1301,8 @@ def _leaks(value, where: str) -> List[str]:
     if isinstance(value, Mapping):
         for key, sub in value.items():
             if _leaky_key(key):
-                out.append('%s.%s: song lists carry no URLs or session data' % (where, key))
+                out.append('%s.%s: song lists carry no URLs, secrets or session data'
+                           % (where, key))
             out += _leaks(sub, '%s.%s' % (where, key))
     elif isinstance(value, (list, tuple)):
         for i, sub in enumerate(value):

@@ -673,19 +673,18 @@ def test_trending_lists_carry_no_urls_and_no_session_data():
     # a secret by the one rule (security.edge_privacy.is_secret_key), which
     # the list's own words missed (parallel-path audit 10-27, R1)
     'api_key', 'secret', 'credentials', 'private_key', 'accessToken', 'auth_token',
-    # instagrapi's own login names, glued
+    'APIToken', 'DBPassword',
+    # a login's names, glued: instagrapi's own, and the ones b72e74dd7 let
+    # through (its review)
     'sessionid', 'csrftoken', 'cookies', 'authorization_data', 'preview_url',
+    'accesstoken', 'authtoken', 'apitoken', 'refreshtoken', 'bearertoken',
+    'userpassword', 'igpassword',
 ])
 def test_a_song_list_carries_no_secret_under_any_name(key):
     doc = _client()
     doc['songs'][0][key] = 'x'
-    assert any(key in p for p in C.validate_trending_songs(doc)), key
-
-
-def test_a_count_of_tokens_is_not_session_data():
-    doc = _published()
-    doc['songs'][0]['max_tokens'] = 3
-    assert C.validate_trending_songs(doc) == []
+    found = [p for p in C.validate_trending_songs(doc) if key in p]
+    assert found and all('secrets' in p for p in found), key
 
 
 def test_malformed_trending_lists_are_refused():
