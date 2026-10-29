@@ -86,7 +86,10 @@ no owner today):
   2. A `file_request` names a purpose the store has (`INBOUND_PURPOSES`)
      and an agent to give the files to (`prompt_id`). It asks for one file
      of a purpose the store keeps one of (a logo), else at most a turn's
-     attachments.
+     attachments. When the agent names no `accept`, the card carries the
+     kind of file the store takes for the purpose (video for `reel_source`,
+     image for `logo`, audio for `song_audio`; none for a chat attachment,
+     which takes several kinds), so every surface opens the right picker.
   3. The same question already open is the same ask (no second push). A
      person has at most `MAX_OPEN_PER_PERSON` (3) open asks.
   4. Pushes the card FIRST, through `push_agent_ui`, with `ask_id` on it;
@@ -152,12 +155,15 @@ keeps its shape and its identity rule: commerce, `game_sound:` (#240) and
 capability consent.
 
 - The desktop page and the shell answer over HTTP on the node itself.
-- The phone answers through its one client. Off the LAN, the call rides
-  the device link: a mobile-adapter alias row (`aliases.py`) maps it to the
-  desktop's route, and the adapter carries the phone's bearer, checked
-  against the link's user. An ask the desktop does not hold answers 404,
-  and the phone's DesktopRouteInterceptor retries on the cloud, so central's
-  own asks reach central.
+- The phone answers its desktop's asks over the device link (LAN, else the
+  relay), desktop-only: a mobile-adapter alias row (`aliases.py`, `POST
+  azurekong.hertzai.com/api/agent/approval`) maps the call to this door, and
+  the adapter runs it through the API gate as the device the owner allowed
+  (its token; the body names the token's user, #51). The door takes the
+  gate's verdict as the answerer (`approver_from_request`: `g.auth_source
+  == 'device'`, the token's user); a verdict without a user answers for
+  nobody. Not done: central's own asks are not answered from the phone (a
+  desktop-only answer never goes to the cloud).
 
 NOT a door, by decision (2026-10-27, security): the reply topic
 `com.hertzai.pupit.{user}`. Central's router is anonymous (realm1, measured

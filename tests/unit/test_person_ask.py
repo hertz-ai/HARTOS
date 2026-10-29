@@ -648,6 +648,18 @@ def test_a_logo_is_asked_for_one_file(legs):
     assert legs['cards'][-1][1]['max_files'] == 1
 
 
+@pytest.mark.parametrize('purpose, accept', [
+    ('reel_source', 'video'), ('logo', 'image'), ('song_audio', 'audio'),
+    ('chat_attachment', None)])
+def test_a_file_request_names_the_kind_of_file_its_store_takes(legs, purpose, accept):
+    """An agent that names no ``accept`` gets the kind its store takes for the
+    purpose, so a surface opens the right picker (review of RN 8bf1da4a5: a
+    logo ask opened the video picker); several kinds name none."""
+    comp = {k: v for k, v in CLIPS.items() if k != 'accept'}
+    out = _ask(component=dict(comp, purpose=purpose))
+    assert out['ok'], out
+    assert legs['cards'][-1][1].get('accept') == accept
+
 
 @pytest.fixture
 def store(monkeypatch):

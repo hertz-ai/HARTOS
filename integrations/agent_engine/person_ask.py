@@ -187,9 +187,15 @@ def _refusal(component, prompt_id) -> Optional[str]:
 
 def _file_card(card: dict, prompt_id) -> None:
     """A file_request asks for as many files as the store keeps of its
-    purpose (one logo), at most a turn's attachments, for the agent asking."""
+    purpose (one logo), at most a turn's attachments, for the agent asking.
+    An agent that names no ``accept`` gets the one kind of file the store
+    takes for the purpose (video, image or audio), so every surface opens
+    the right picker; a purpose that takes several kinds names none."""
     from core.chat_attachments import MAX_ATTACHMENTS
     from core.user_file_store import PURPOSES
+    kinds = {mime.split('/', 1)[0] for mime in PURPOSES[card['purpose']].types}
+    if not card.get('accept') and len(kinds) == 1:
+        card['accept'] = kinds.pop()
     if PURPOSES[card['purpose']].newest_only:
         card['max_files'] = 1
     else:
