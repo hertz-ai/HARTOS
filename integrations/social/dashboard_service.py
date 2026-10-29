@@ -982,13 +982,13 @@ def _write_goal_status(db, goal, status: str, actor_id=None) -> None:
         if status == 'active' and goal.status == 'paused':
             result = GoalManager.resume_goal(
                 db, goal.id, resumed_by=f'person:{actor_id or "unknown"}')
+        elif status == 'paused':
+            from integrations.agent_engine.goal_manager import PAUSE_CAUSE_PERSON
+            result = GoalManager.pause_goal(
+                db, goal, cause=PAUSE_CAUSE_PERSON,
+                by=f'person:{actor_id or "unknown"}',
+                reason='Paused by its person from the dashboard')
         else:
-            if status == 'paused':
-                cfg = dict(goal.config_json or {})  # new dict: JSON column
-                cfg['pause_cause'] = 'person'
-                cfg['paused_by'] = f'person:{actor_id or "unknown"}'
-                cfg['paused_at'] = datetime.utcnow().isoformat()
-                goal.config_json = cfg
             result = GoalManager.update_goal_status(db, goal.id, status)
         if not result.get('success'):
             raise RuntimeError(result.get('error') or 'status write failed')

@@ -615,15 +615,22 @@ def pause_goal_for_budget(goal_id: Optional[str], reason: str) -> bool:
         from integrations.social.models import db_session, AgentGoal
         with db_session() as db:
             goal = db.query(AgentGoal).filter_by(id=goal_id).first()
-            return apply_budget_pause(goal, reason)
+            return apply_budget_pause(goal, reason, db=db)
     except Exception as e:
         logger.warning("Could not auto-pause goal %s after budget block: %s",
                        goal_id, e)
         return False
 
 
-def apply_budget_pause(goal, reason: str) -> bool:
+def apply_budget_pause(goal, reason: str, db=None) -> bool:
     """Mutate an already-loaded goal row. THE CALLER OWNS THE COMMIT.
+
+    The pause itself is GoalManager.pause_goal, the ONE pause routine, with
+    this gate's own cause (PAUSE_CAUSE_BUDGET), so the agent daemon, which
+    resumes only its own dispatch-failure pauses, never resumes a goal that
+    is out of budget (review of 20dc8c996 by hartos-73).  ``db`` is the
+    caller's session when it has one (the daemon's loop; the wrapper above);
+    with none the status is set on the row and the caller's commit carries it.
 
     Split from pause_goal_for_budget on purpose. agent_daemon holds one session
     open across its whole dispatch loop and commits once at the end, so it must
@@ -648,11 +655,13 @@ def apply_budget_pause(goal, reason: str) -> bool:
             "or clear never_pause.", goal.id, reason)
         return False
 
-    goal.status = 'paused'
-    cfg['pause_reason'] = (
-        f'Auto-paused: budget gate blocked. Reason: {reason}')
-    cfg['paused_at'] = datetime.utcnow().isoformat()
-    goal.config_json = cfg
+    from integrations.agent_engine.goal_manager import GoalManager, PAUSE_CAUSE_BUDGET
+    result = GoalManager.pause_goal(
+        db, goal, cause=PAUSE_CAUSE_BUDGET, by='daemon',
+        reason=f'Auto-paused: budget gate blocked. Reason: {reason}')
+    if not result.get('success'):
+        logger.warning("Goal %s: budget pause refused: %s", goal.id, result.get('error'))
+        return False
     # WARNING, not info: this is the state transition that explains why a goal
     # stopped making progress, and the hevolve loggers run at WARNING in
     # production, where INFO is invisible. A retention sweep that logged its

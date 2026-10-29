@@ -36,15 +36,24 @@ from integrations.agent_engine.agent_daemon import _settle_dispatched_goal  # no
 
 class Goal:
     def __init__(self, spark=0, cfg=None, status='active'):
+        self.id = 'g1'                 # the one pause routine writes by the row it holds
+        self.goal_type = 'marketing'
         self.spark_spent = spark
         self.config_json = cfg or {}
         self.status = status
 
+    def to_dict(self):
+        return {'id': self.id, 'status': self.status, 'config': self.config_json}
+
 
 class Db:
-    """refresh is a no-op seam — the gate must still judge attribute state."""
+    """refresh and flush are no-op seams — the gate must still judge
+    attribute state, and the pause routine's status write flushes."""
 
     def refresh(self, goal):
+        pass
+
+    def flush(self):
         pass
 
 

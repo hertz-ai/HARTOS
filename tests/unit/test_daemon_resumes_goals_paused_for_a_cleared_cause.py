@@ -126,6 +126,9 @@ def test_a_legacy_prose_row_is_taken_only_while_nothing_resumed_it(session_facto
     _goal(db, 'g-legacy', {'pause_reason': PROSE, 'paused_at': T0.isoformat()})
     _goal(db, 'g-resumed-once', {'pause_reason': PROSE, 'paused_at': T0.isoformat(),
                                  'resume_count': 1})
+    for gid in ('g-legacy', 'g-resumed-once'):
+        db.get(AgentGoal, gid).last_dispatched_at = T0 - timedelta(minutes=1)
+    db.commit()
     resumed = _resume_goals_paused_for_a_cleared_cause(db, cause_cleared=True)
     assert resumed == ['g-legacy']
     assert _status(session_factory, 'g-resumed-once') == 'paused'
@@ -229,22 +232,112 @@ def test_the_pause_site_does_not_ask_before_the_cap(session_factory):
     assert not tell.called and 'told_at' not in goal.config_json
 
 
-def test_the_tick_wires_the_probe_both_successes_and_the_episode_reset():
+def test_the_tick_wires_the_probe_and_both_successes():
     """Wiring in _tick, anchored on the code it sits next to: the probe runs
     before the active-goal query; both success sites (the plain dispatch and
-    the parallel fan-out) release right after they pop their own backoff;
-    the plain success resets the episode counter."""
+    the parallel fan-out) release right after they pop their own backoff and
+    name the goal that succeeded, so its episode counter is reset by the one
+    helper."""
     src = inspect.getsource(ad.AgentDaemon._tick)
     probe = src.index('_resume_goals_paused_for_a_cleared_cause(db, cause_cleared=False)')
     assert probe < src.index("AgentGoal.status == 'active'")
-    assert src.count('_resume_goals_paused_for_a_cleared_cause(db, cause_cleared=True)') == 2
+    call = '_resume_goals_paused_for_a_cleared_cause(db, cause_cleared=True, succeeded=goal)'
+    assert src.count(call) == 2
     pops = [i for i in range(len(src))
             if src.startswith('_dispatch_backoff.pop(goal_key, None)', i)]
-    releases = [i for i in range(len(src))
-                if src.startswith('_resume_goals_paused_for_a_cleared_cause(db, cause_cleared=True)', i)]
+    releases = [i for i in range(len(src)) if src.startswith(call, i)]
     for rel in releases:
-        # right after its own pop, before the handoff that follows it
         assert any(0 < rel - p < 1500 for p in pops)
         assert rel < src.index('_settle_dispatched_goal(db, goal, goal_key', rel)
-    assert src.index("_cfg.pop('daemon_resume_count', None)") < releases[-1]
+    assert "daemon_resume_count" not in src        # the reset lives in the helper, once
     assert '_auto_pause_for_dispatch_failures(' in src
+
+
+def test_a_success_resets_the_episode_counter_of_the_goal_that_ran(session_factory):
+    """Finding 6: the retries are spent per pause episode; whichever success
+    site ran the goal (plain or fan-out) names it and the helper resets it."""
+    db = session_factory()
+    _goal(db, 'g-ran', {'daemon_resume_count': 2}, status='active')
+    _goal(db, 'g-paused', _daemon_paused(T0))
+    ran = db.get(AgentGoal, 'g-ran')
+    resumed = _resume_goals_paused_for_a_cleared_cause(db, cause_cleared=True, succeeded=ran)
+    assert resumed == ['g-paused']
+    assert 'daemon_resume_count' not in session_factory().get(AgentGoal, 'g-ran').config_json
+
+
+def test_s7_a_goal_the_turn_parked_for_a_person_is_not_paused_as_a_failure(session_factory):
+    """hartos-73's S7: the 5th turn asked for help, escalate_goal parked the
+    goal for a person; the failure branch then pauses the object it loaded
+    before the turn.  The pause site re-reads the goal and leaves a goal that
+    is no longer active alone, so the person's hand is not overwritten and
+    the daemon never resumes it."""
+    from integrations.agent_engine.goal_manager import GoalManager, PAUSE_CAUSE_NEEDS_HELP
+    db = session_factory()
+    _goal(db, 'g-s7', {'daemon_resume_count': 0}, status='active')
+    goal = db.get(AgentGoal, 'g-s7')
+    # The turn's help reply, through the one pause routine, as escalate_goal does.
+    GoalManager.pause_goal(db, goal, cause=PAUSE_CAUSE_NEEDS_HELP, by='daemon',
+                           reason='Needs help: action 3 (google_search) could not be done',
+                           extra={'escalation': {'action_id': 3, 'next': 'human'}})
+    db.commit()
+    ad._dispatch_backoff['g-s7'] = {'failures': 5, 'skip_until': 0}
+    _auto_pause_for_dispatch_failures(db, goal, 'g-s7', 5, 'turn failed: help reply')
+    db.commit()
+    cfg = session_factory().get(AgentGoal, 'g-s7').config_json
+    assert cfg['pause_cause'] == PAUSE_CAUSE_NEEDS_HELP
+    assert cfg['pause_reason'].startswith('Needs help')
+    assert cfg['escalation']['next'] == 'human'
+    assert 'g-s7' not in ad._dispatch_backoff               # the strikes still end
+    ad._last_probe_resume_at = 0.0
+    assert _resume_goals_paused_for_a_cleared_cause(db, cause_cleared=True) == []
+    assert _resume_goals_paused_for_a_cleared_cause(db, cause_cleared=False) == []
+
+
+def test_s1_a_daemon_pause_later_parked_for_a_person_is_never_resumed(session_factory):
+    """hartos-73's S1: the daemon pauses a goal, then escalate_goal parks it
+    for a person (it runs on paused goals, #194).  The person's hand wins:
+    neither the success path nor the probe resumes it."""
+    from integrations.agent_engine.goal_manager import GoalManager
+    db = session_factory()
+    _goal(db, 'g-s1', _daemon_paused(T0))
+    goal = db.get(AgentGoal, 'g-s1')
+    with patch.object(GoalManager, '_escalation_expert', return_value=None), \
+            patch.object(GoalManager, '_tell_its_person', return_value=True):
+        result = GoalManager.escalate_goal(db, 'g-s1', {
+            'action_id': 2, 'action': 'post', 'reason': 'needs a login', 'tried': ['local']})
+    assert result.get('stage') == 'human'
+    db.commit()
+    ad._last_probe_resume_at = 0.0
+    assert _resume_goals_paused_for_a_cleared_cause(db, cause_cleared=True) == []
+    assert _resume_goals_paused_for_a_cleared_cause(db, cause_cleared=False) == []
+    assert _status(session_factory, 'g-s1') == 'paused'
+
+
+def test_a_human_escalation_on_the_record_beats_the_cause(session_factory):
+    """Belt and braces for S1/S7: whatever the cause says, a goal carrying a
+    human escalation (escalation.next == 'human') is a person's and is never
+    resumed by the daemon."""
+    db = session_factory()
+    _goal(db, 'g-esc', _daemon_paused(T0, escalation={'action_id': 2, 'next': 'human'}))
+    _goal(db, 'g-plain', _daemon_paused(T0 + timedelta(hours=1)))
+    resumed = _resume_goals_paused_for_a_cleared_cause(db, cause_cleared=True)
+    assert resumed == ['g-plain']
+    assert _status(session_factory, 'g-esc') == 'paused'
+
+
+def test_a_legacy_prose_row_counts_only_when_the_pause_followed_its_own_dispatch(session_factory):
+    """Finding 2, the sounder test for rows paused before the structured
+    record existed: the daemon pauses in the tick that dispatched, so its
+    pause sits within an hour of the goal's last dispatch; a person's pause
+    long after the last dispatch is not taken."""
+    db = session_factory()
+    _goal(db, 'g-daemon-like', {'pause_reason': PROSE, 'paused_at': (T0 + timedelta(minutes=2)).isoformat()})
+    _goal(db, 'g-person-like', {'pause_reason': PROSE, 'paused_at': (T0 + timedelta(days=3)).isoformat()})
+    _goal(db, 'g-never-ran', {'pause_reason': PROSE, 'paused_at': T0.isoformat()})
+    for gid in ('g-daemon-like', 'g-person-like'):
+        db.get(AgentGoal, gid).last_dispatched_at = T0
+    db.commit()
+    resumed = _resume_goals_paused_for_a_cleared_cause(db, cause_cleared=True)
+    assert resumed == ['g-daemon-like']
+    assert _status(session_factory, 'g-person-like') == 'paused'
+    assert _status(session_factory, 'g-never-ran') == 'paused'
