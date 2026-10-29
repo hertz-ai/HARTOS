@@ -243,7 +243,7 @@ def _is_port_listening(port: int, host: str = '127.0.0.1',
         s.close()
 
 
-def get_local_backend_url(honor_base_url: bool = True) -> str:
+def get_local_backend_url() -> str:
     """Single source for the live local HARTOS backend base URL (no trailing
     slash).
 
@@ -253,17 +253,10 @@ def get_local_backend_url(honor_base_url: bool = True) -> str:
     backend (6777); the bundled desktop serves HARTOS in-process on the Flask
     port (5000).  Falls back to backend on cold boot.
 
-    ``honor_base_url`` False skips that variable: this machine's own loopback
-    serve port, for a self-POST that must not leave the machine.  Central sets
-    HEVOLVE_BASE_URL to its LAN address, so the paid API's relay
-    (commercial_api._metered_backend_chat) would otherwise reach /chat from
-    the docker address every public caller shares, not from loopback (task
-    #160 is the bundled half: the relay dialled a dead :6777).
-
     Used by BOTH the channel inbound bridge (flask_integration) and the
     dispatch Tier-2 fallback — ONE resolver, so neither hardcodes a dead
     :6777 in bundled mode (#71 + omni-channel bridge inbound)."""
-    env = os.environ.get('HEVOLVE_BASE_URL') if honor_base_url else None
+    env = os.environ.get('HEVOLVE_BASE_URL')
     if env:
         return env.rstrip('/')
     for svc in ('backend', 'flask'):
