@@ -64,7 +64,9 @@ its Stripe-side registration are `deploy/go_live_stripe.md` Step 4b.
 `HARTOS_PUBLIC_URL` is the public base of this node's API (the host Kong
 fronts it on). PhonePe is sent `HARTOS_PUBLIC_URL` +
 `/api/v1/intelligence/phonepe/callback` as its server-to-server callback
-and the same base as the buyer's return page, and refund requests name
+and `/api/v1/intelligence/phonepe/return` on the same base as the buyer's
+return page (all three under `/api/v1/intelligence`, so one Kong route
+carries them), and refund requests name
 `/api/v1/intelligence/phonepe/refund-callback`; without it (or with only
 a loopback or LAN request host, which no gateway can reach) a PhonePe
 payment is refused, never sent with a guessed host: the shopper sees a

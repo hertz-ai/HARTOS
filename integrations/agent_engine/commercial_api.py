@@ -1183,6 +1183,7 @@ def upgrade_key(key_id):
 #
 #   POST /keys/<id>/upgrade/phonepe   → 202 + redirect_url (caller redirects user)
 #   POST /phonepe/callback            → PhonePe S2S webhook, finalizes tier change
+#   GET|POST /phonepe/return          → the page the buyer comes back to; changes nothing
 #
 # The synchronous /upgrade endpoint cannot service PhonePe because PhonePe
 # is a redirect-then-webhook flow — at create_payment time the user has not
@@ -1201,7 +1202,8 @@ def initiate_phonepe_upgrade(key_id: str):
     """Initiate a PhonePe-rail upgrade for a paid tier.
 
     Body: ``target_tier``; optional ``redirect_url`` (the page the buyer
-    returns to after paying, this node's public URL when absent) and
+    returns to after paying, this node's return page, phonepe_return, when
+    absent) and
     ``mobile_number``.  A ``callback_url`` in the body is ignored: the
     server callback is always this node's own
     (integrations.ap2.ap2_protocol.own_gateway_urls), since a caller-named
@@ -1715,6 +1717,38 @@ def phonepe_refund_callback():
     return jsonify({'success': True, 'status': 'acknowledged',
                     'refund_id': data.get('merchantTransactionId'),
                     'code': code}), 200
+
+
+#: The page a buyer's browser lands on when PhonePe's checkout sends it back.
+#: Plain HTML with no style or script (the node's CSP allows neither inline)
+#: and nothing from the request in it.
+_PHONEPE_RETURN_PAGE = (
+    '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+    '<meta name="viewport" content="width=device-width, initial-scale=1">'
+    '<title>Back from PhonePe</title></head><body><main>'
+    '<h1>Thank you</h1>'
+    '<p>If your payment went through, PhonePe confirms it to us directly, '
+    'and your purchase completes when it does.</p>'
+    '<p>You do not need to pay again. You can close this page.</p>'
+    '</main></body></html>')
+
+
+@commercial_api_bp.route('/api/v1/intelligence/phonepe/return',
+                         methods=['GET', 'POST'])
+def phonepe_return():
+    """The page PhonePe sends the buyer back to: the default return of every
+    PhonePe payment, a tier upgrade or a cart (ap2_protocol.PHONEPE_RETURN_PATH).
+
+    It reads nothing from the request and changes nothing.  The signed
+    callback (phonepe_callback) is the only thing that completes a payment,
+    and nothing in the return is believed.  GET and POST alike: the gateway
+    comes back with a form POST (redirectMode POST) and a reload is a GET;
+    the CSRF guard lets this one path through (security.middleware), since a
+    request that changes nothing gives a forger nothing to make.  The return
+    used to be the bare root, which no node serves (task #145).
+    """
+    from flask import Response
+    return Response(_PHONEPE_RETURN_PAGE, status=200, mimetype='text/html')
 
 
 # ═══════════════════════════════════════════════════════════════

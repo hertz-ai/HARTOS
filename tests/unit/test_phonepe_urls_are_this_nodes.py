@@ -31,6 +31,7 @@ from integrations.ap2.ap2_protocol import (
 BASE = 'https://node.example'
 CALLBACK = '/api/v1/intelligence/phonepe/callback'
 REFUND_CALLBACK = '/api/v1/intelligence/phonepe/refund-callback'
+RETURN = '/api/v1/intelligence/phonepe/return'
 
 
 def _gateway():
@@ -83,11 +84,16 @@ class TestThePayRequestsUrls:
         assert sent['callbackUrl'] == BASE + CALLBACK
 
     def test_a_payment_naming_nothing_gets_both_of_this_nodes_urls(self, monkeypatch):
+        """The buyer comes back to this node's return page, beside the
+        callback, never to the bare root: no node serves a page there, and
+        on api.hevolve.ai the root answers Kong's 404 'no Route matched' to
+        GET and POST alike (measured 2026-10-27), so a buyer who had just
+        paid landed on an error page (task #145)."""
         monkeypatch.setenv('HARTOS_PUBLIC_URL', BASE + '/')
         with patch('requests.post', return_value=_phonepe_says(_CHECKOUT_MINTED)) as post:
             _gateway().create_payment(_request())
         sent = _sent(post)
-        assert (sent['redirectUrl'], sent['callbackUrl']) == (BASE + '/', BASE + CALLBACK)
+        assert (sent['redirectUrl'], sent['callbackUrl']) == (BASE + RETURN, BASE + CALLBACK)
 
     def test_without_a_public_url_nothing_is_sent_and_the_shopper_sees_no_setting(
             self, monkeypatch, caplog):
@@ -325,12 +331,86 @@ class TestTheRefundCallbackLandsSomewhere:
         assert _refund_callback(ctx['client']).status_code == 503
 
     def test_the_routes_are_where_the_gateway_sends_phonepe(self, ctx):
-        """The gateway composes its callback URLs from these constants; the
-        blueprint must serve exactly those paths."""
+        """The gateway composes its callback and return URLs from these
+        constants; the blueprint must serve exactly those paths."""
         from integrations.ap2.ap2_protocol import (
-            PHONEPE_CALLBACK_PATH, PHONEPE_REFUND_CALLBACK_PATH,
+            PHONEPE_CALLBACK_PATH, PHONEPE_REFUND_CALLBACK_PATH, PHONEPE_RETURN_PATH,
         )
-        assert (PHONEPE_CALLBACK_PATH, PHONEPE_REFUND_CALLBACK_PATH) == (CALLBACK, REFUND_CALLBACK)
+        assert (PHONEPE_CALLBACK_PATH, PHONEPE_REFUND_CALLBACK_PATH, PHONEPE_RETURN_PATH) == (
+            CALLBACK, REFUND_CALLBACK, RETURN)
         rules = {r.rule for r in ctx['app'].url_map.iter_rules()}
         assert PHONEPE_CALLBACK_PATH in rules
         assert PHONEPE_REFUND_CALLBACK_PATH in rules
+        assert PHONEPE_RETURN_PATH in rules
+
+
+# ── the buyer's return page, behind the node's real security middleware ──
+
+@pytest.fixture
+def buyer(tmp_path, monkeypatch):
+    """The blueprint behind security.middleware as hart_intelligence_entry
+    applies it, on a central node with no API key: the gates a browser
+    coming back from PhonePe meets."""
+    for name, value in (('ALLOWED_HOSTS', 'localhost'), ('HEVOLVE_ENV', 'production'),
+                        ('HEVOLVE_NODE_TIER', 'central'), ('HEVOLVE_API_KEY', ''),
+                        ('CORS_ORIGINS', '')):
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv('NUNBA_BUNDLED', raising=False)
+    ledger = PaymentLedger(ledger_path=str(tmp_path / 'l.json'))
+    ledger.gateways[PaymentGateway.PHONEPE] = _Minting()
+    from integrations.agent_engine.commercial_api import commercial_api_bp
+    from security.middleware import apply_security_middleware
+    app = Flask(__name__)
+    apply_security_middleware(app)
+    app.register_blueprint(commercial_api_bp)
+    with patch.object(ap2_pkg, 'payment_ledger', ledger):
+        yield {'client': app.test_client(), 'ledger': ledger}
+
+
+#: What PhonePe's redirectMode POST sends the buyer's browser back with:
+#: a plain form, no credential, no CSRF token.
+_RETURN_FORM = {'code': 'PAYMENT_SUCCESS', 'merchantId': 'M',
+                'transactionId': 'hartos_t1', 'amount': '75600'}
+
+
+class TestTheBuyersReturnPage:
+    def test_a_buyer_sent_back_by_phonepes_form_post_gets_the_page(self, buyer):
+        """PhonePe returns the buyer with a form POST (redirectMode POST).
+        The CSRF guard answers an unauthenticated form POST 403, so the
+        return page is the one path it lets through; it changes nothing."""
+        r = buyer['client'].post(RETURN, data=_RETURN_FORM)
+        assert r.status_code == 200, r.get_data(as_text=True)[:200]
+        assert r.mimetype == 'text/html'
+        assert 'You do not need to pay again' in r.get_data(as_text=True)
+
+    def test_a_plain_visit_gets_the_same_page(self, buyer):
+        r = buyer['client'].get(RETURN)
+        assert r.status_code == 200
+        assert 'You do not need to pay again' in r.get_data(as_text=True)
+
+    def test_the_page_repeats_nothing_the_request_carried(self, buyer):
+        r = buyer['client'].post(RETURN, data=dict(
+            _RETURN_FORM, transactionId='<script>alert(1)</script>'))
+        assert r.status_code == 200
+        assert '<script>' not in r.get_data(as_text=True)
+
+    def test_coming_back_settles_nothing(self, buyer):
+        """Only the signed callback finalizes a payment: a return that says
+        PAYMENT_SUCCESS leaves a payment waiting for PhonePe as it was."""
+        ledger = buyer['ledger']
+        p = ledger.create_payment_request(
+            amount=Decimal('9.00'), currency='USD', description='x',
+            requester_agent_id='user:u-1', gateway=PaymentGateway.PHONEPE,
+            metadata={'kind': 'tier_upgrade', 'api_key_id': 'k1',
+                      'target_tier': 'starter', 'user_id': 'u-1'})
+        p.gateway_transaction_id = 'hartos_t1'
+        p.update_status(PaymentStatus.PROCESSING, 'awaiting user payment on PhonePe checkout')
+        buyer['client'].post(RETURN, data=_RETURN_FORM)
+        assert ledger.get_payment(p.payment_id).status == PaymentStatus.PROCESSING
+
+    def test_the_callbacks_beside_it_keep_the_csrf_guard(self, buyer):
+        """The exemption is the return page alone: an unauthenticated form
+        POST to its sibling, the payment callback, is still refused."""
+        r = buyer['client'].post(CALLBACK, data=_RETURN_FORM)
+        assert r.status_code == 403
+        assert 'CSRF' in r.get_json().get('error', '')

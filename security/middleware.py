@@ -133,6 +133,11 @@ def _apply_csrf_protection(app: Flask):
     CSRF_EXEMPT_PREFIXES = (
         '/a2a/', '/api/social/bots/', '/status',
         '/.well-known/',
+        # The page PhonePe's checkout returns the buyer's browser to with a
+        # plain form POST (integrations.ap2.ap2_protocol.PHONEPE_RETURN_PATH).
+        # It reads nothing and changes nothing, so there is no request for a
+        # forger to make on anyone's behalf (task #145).
+        '/api/v1/intelligence/phonepe/return',
     )
 
     @app.before_request
