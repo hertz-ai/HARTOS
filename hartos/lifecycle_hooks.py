@@ -490,12 +490,25 @@ def resume_blocked_action(user_prompt: str, action_id: int,
     before = copy.deepcopy(task.__dict__)
     if not task.resume(reason):
         return False
-    evidence_items = None
     if evidence is not None:
         context = getattr(task, 'context', None)
         if isinstance(context, dict):
-            evidence_items = context.setdefault(evidence_key, [])
-            evidence_items.append(evidence)
+            # #159: `context` is part of Task.compute_data_hash, and the
+            # ledger seals that hash only in add_actions_to_ledger and
+            # update_task_context; ledger.save() does not.  Appending the
+            # person's answer straight into task.context and saving left the
+            # stored hash describing the task from BEFORE the answer, and the
+            # completion claim's verify_integrity then read the reply itself
+            # as corruption: live 2026-10-30 "[CLAIM REJECTED] ... data_hash
+            # mismatch" 21 times between 20:13 and 20:36 on four agents, each
+            # followed by the same question to the person again.  The ledger's
+            # own context setter carries the seal, so the evidence goes
+            # through it (in memory here; the one save below persists it).
+            new_context = dict(context)
+            items = list(new_context.get(evidence_key) or [])
+            items.append(evidence)
+            new_context[evidence_key] = items
+            ledger.update_task_context(task_id, new_context, defer_save=True)
     task.blocked_reason = None
     if ledger.save() is False:
         task.__dict__.clear()

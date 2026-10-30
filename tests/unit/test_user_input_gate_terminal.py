@@ -296,5 +296,82 @@ class AGateTheLedgerNeverHeld(unittest.TestCase):
         self.assertEqual(self.task._needs_user_input_action_id, 2)
 
 
+class AResumedTaskStillPassesItsIntegrityCheck(unittest.TestCase):
+    """#159, MEASURED 2026-10-30 on the installed desktop (hartos-f9's reading):
+    the gate asked, the person answered, resume_from_user_input released the
+    block, the verifier passed the step, and the completion claim was refused:
+
+        [CLAIM REJECTED] Task action_3 integrity check failed — data_hash
+        mismatch, possible corruption
+
+    four times on the flow 1 duplicate (20:13:07 to 20:13:48), four on the
+    flow 3 text-only agent, six on the Spoken English Coach, six on flow 7:
+    21 refusals in 23 minutes, each followed by the same question again.
+
+    WHY: Task.compute_data_hash covers `context`, and the ledger seals the
+    hash only in add_task and update_task_context.  resume_blocked_action
+    appended the person's answer straight into task.context and called
+    ledger.save(), which does not seal, so the stored hash described the
+    task from BEFORE the answer.  The claim handler's verify_integrity then
+    read the person's own reply as corruption.
+    """
+
+    def setUp(self):
+        import tempfile
+        from agent_ledger.core import SmartLedger, add_actions_to_ledger
+        from hartos import lifecycle_hooks as L
+        self.L = L
+        clear_action_states(_UP)
+        self.ledger = SmartLedger(agent_id='54', session_id=f'{_UP}_2',
+                                  ledger_dir=tempfile.mkdtemp())
+        # The create loop's own path (create_action_with_ledger ->
+        # add_actions_to_ledger) seals every task it adds; a bare add_task
+        # leaves data_hash None and verify_integrity then passes vacuously.
+        add_actions_to_ledger(self.ledger, [
+            {'action': 'say Hello Arjun and wait', 'action_id': 1},
+            {'action': 'ask the child to say ball', 'action_id': 3},
+        ], flow_id=0)
+        L.register_ledger_for_session(_UP, self.ledger)
+
+    def tearDown(self):
+        clear_action_states(_UP)
+        with self.L._state_lock:
+            self.L._ledger_registry.pop(_UP, None)
+
+    def _block(self):
+        from agent_ledger.core import TaskStatus
+        task = self.ledger.tasks['action_3']
+        self.assertIsNotNone(task.data_hash, 'precondition: the create path seals its tasks')
+        task.status = TaskStatus.IN_PROGRESS
+        self.assertTrue(self.L.block_for_user_input(_UP, 3, 'waiting for Arjun'))
+        self.assertTrue(task.verify_integrity(), 'precondition: the block alone keeps the seal')
+        return task
+
+    def test_the_persons_answer_is_kept_and_the_seal_still_holds(self):
+        task = self._block()
+        self.assertTrue(self.L.resume_from_user_input(_UP, 3, 'User responded', 'Hi!'))
+        self.assertEqual(task.context['user_input_evidence'][0]['answer'], 'Hi!',
+                         'the answer must land in the task, that is the point of resuming')
+        self.assertTrue(
+            task.verify_integrity(),
+            'the stored hash describes the task from before the answer: the '
+            'completion claim will be refused as "data_hash mismatch" (21 times '
+            'live on 2026-10-30)')
+
+    def test_an_experts_evidence_is_sealed_the_same_way(self):
+        task = self._block()
+        self.assertTrue(self.L.resume_blocked_action(
+            _UP, 3, 'Assigned expert is retrying',
+            evidence={'source': 'escalation_expert', 'action_id': 3}))
+        self.assertEqual(task.context['unblock_evidence'][0]['source'], 'escalation_expert')
+        self.assertTrue(task.verify_integrity())
+
+    def test_a_resume_without_evidence_is_unchanged(self):
+        task = self._block()
+        self.assertTrue(self.L.resume_blocked_action(_UP, 3, 'Block resolved'))
+        self.assertTrue(task.verify_integrity())
+        self.assertNotIn('unblock_evidence', task.context)
+
+
 if __name__ == '__main__':
     unittest.main()
