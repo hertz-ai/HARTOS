@@ -569,8 +569,11 @@ def record_user_answer(user_prompt: str, action_id: int, answer: str,
     task_id = f"action_{action_id}"
     task = ledger.tasks.get(task_id) if ledger else None
     if task is None:
+        logger.warning("Cannot record the person's answer: %s holds no task "
+                       "%s", user_prompt, task_id)
         return False
-    context = dict(getattr(task, 'context', None) or {})
+    before = dict(getattr(task, 'context', None) or {})
+    context = dict(before)
     items = list(context.get(USER_INPUT_EVIDENCE_KEY) or [])
     items.append({
         'action_id': int(action_id),
@@ -582,8 +585,13 @@ def record_user_answer(user_prompt: str, action_id: int, answer: str,
     if not ledger.update_task_context(task_id, context, defer_save=True):
         return False
     if ledger.save() is False:
+        # The write is not durable, so it is not a record: put the sealed
+        # context back the way resume_blocked_action restores its task, and
+        # let the caller keep the gate so the same answer can be retried
+        # (G3: an answer that lives only in memory must not clear the ask).
+        ledger.update_task_context(task_id, before, defer_save=True)
         logger.error("Could not persist the person's answer for %s: ledger "
-                     "persistence failed", task_id)
+                     "persistence failed; the gate stays", task_id)
         return False
     logger.info(f"Recorded the person's answer for {task_id} (flow {flow})")
     return True
@@ -591,10 +599,10 @@ def record_user_answer(user_prompt: str, action_id: int, answer: str,
 
 def ledger_user_answered(user_prompt: str, action_id: int, flow) -> bool:
     """Whether the person has answered this action in this flow
-    (record_user_answer).  The one reader for the two questions that hang on
-    it: CREATE's state_transition asks whether a `completed` + `no` verdict
-    still has the person to hear from, and the trace bank stamps the banked
-    action's can_perform_without_user_input from it (#160).  An expert's
+    (record_user_answer).  One reader: CREATE's state_transition, through
+    create_recipe._completed_verdict_still_waits, asks whether a `completed`
+    + `no` verdict still has the person to hear from.  The trace bank does
+    not read it while the #160 stamp is held (a3820a8fe).  An expert's
     resume (unblock_evidence) is not a person's answer; an entry without a
     flow matches nothing."""
     ledger = _ledger_registry.get(user_prompt)
@@ -607,20 +615,42 @@ def ledger_user_answered(user_prompt: str, action_id: int, flow) -> bool:
                for entry in (context.get(USER_INPUT_EVIDENCE_KEY) or []))
 
 
+def blocked_action_awaiting_user(user_prompt: str) -> Optional[int]:
+    """The lowest action whose ledger task is BLOCKED for the person
+    (blocked_reason 'input_required'), or None.
+
+    The create loop's gate is a sticky flag on the in-memory task
+    (_needs_user_input_action_id); a restart between the ask and the reply
+    loses it, so the first reply after a restart was ignored and the person
+    was asked again (G5).  The ledger is the durable half of that same wait
+    (mark_action_waiting_for_user writes both), so the reply derives the
+    waiting action from it when the flag is gone.  Only the person's wait
+    counts: a task BLOCKED on a dependency is not asking anyone."""
+    ledger = _ledger_registry.get(user_prompt)
+    if ledger is None:
+        return None
+    blocked = _get_ledger_task_status().BLOCKED
+    waiting = []
+    for task_id, task in (getattr(ledger, 'tasks', None) or {}).items():
+        if (getattr(task, 'status', None) == blocked
+                and getattr(task, 'blocked_reason', None) == 'input_required'
+                and str(task_id).startswith('action_')):
+            try:
+                waiting.append(int(str(task_id)[len('action_'):]))
+            except ValueError:
+                continue
+    return min(waiting) if waiting else None
+
+
 def resume_from_user_input(user_prompt: str, action_id: int,
-                           reason: str = "User responded",
-                           answer: Optional[str] = None) -> bool:
-    """Resume a blocked task with evidence from a genuine user turn."""
-    evidence = None
-    if answer is not None:
-        evidence = {
-            'action_id': action_id,
-            'answer': str(answer),
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-        }
-    return resume_blocked_action(
-        user_prompt, action_id, reason, evidence=evidence,
-        evidence_key=USER_INPUT_EVIDENCE_KEY)
+                           reason: str = "User responded") -> bool:
+    """Resume a task the gate blocked for the person, through the one
+    validated BLOCKED -> IN_PROGRESS edge.  The answer itself is recorded by
+    record_user_answer, the create loop's one writer, tagged with the flow it
+    answers; an `answer` argument here used to be a second writer whose
+    entries carried no flow, so ledger_user_answered ignored them
+    (hartos-f9's review of 94354c536, G7)."""
+    return resume_blocked_action(user_prompt, action_id, reason)
 
 # Add new states to ActionState enum:
 class FlowState(Enum):

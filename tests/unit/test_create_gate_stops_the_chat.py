@@ -189,6 +189,16 @@ class TestACompletedVerdictThatNeedsThePersonStillAsks:
             'completed + no closed the step instead of asking the person '
             '(live 18:44:09, 18:44:40, 20:23:18 on 2026-10-30)')
         assert chosen is None, 'the gate must end the round so the OUTER loop asks'
+        # G8: the step has asked already; the loop's own line says it waits.
+        assert s.task._needs_user_input_kind == 'awaiting_reply'
+        line = cr._needs_input_reply(1, 'Respond to user', waiting=True)
+        assert 'waiting for your reply' in line and "isn't coming together" not in line
+
+    def test_a_pending_plus_no_still_reads_as_human_required(self, selector):
+        s = selector
+        group = SimpleNamespace(messages=[POSTED, _verdict('no', status='pending')], agents=[])
+        assert s.select(s.verify, group) is None
+        assert s.task._needs_user_input_kind == 'human_required'
 
     def test_the_reasoned_no_is_read_the_same_way(self, selector):
         """The CREATE prompt asks for 'no' WITH a reason; autonomy_needs_user

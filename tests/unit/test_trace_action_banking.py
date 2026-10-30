@@ -61,10 +61,10 @@ def _load_bank_fn(tmp_path):
 def banked(tmp_path):
     fn, ns = _load_bank_fn(tmp_path)
 
-    def run(messages, action_id=2, user_prompt='u_test', agents=None, flow=0):
+    def run(messages, action_id=2, user_prompt='u_test', agents=None):
         gc = SimpleNamespace(messages=messages, agents=agents or [])
-        ok = fn(user_prompt, '999', flow, action_id, gc)
-        path = tmp_path / f'999_{flow}_{action_id}.json'
+        ok = fn(user_prompt, '999', 0, action_id, gc)
+        path = tmp_path / f'999_0_{action_id}.json'
         data = json.load(open(path)) if path.exists() else None
         return ok, data, ns
 
@@ -432,7 +432,7 @@ class TestABankedActionStillReadsYesWhileTheStampIsHeld:
         try:
             assert L.record_user_answer('u_test', 2, 'the Kumar week', 0)
             assert L.ledger_user_answered('u_test', 2, 0) is True
-            ok, data, _ = banked(list(self.STEP), flow=0)
+            ok, data, _ = banked(list(self.STEP))
         finally:
             with L._state_lock:
                 L._ledger_registry.pop('u_test', None)

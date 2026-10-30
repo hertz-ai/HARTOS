@@ -287,6 +287,8 @@ class TheReplyMovesTheActionOutOfPending(unittest.TestCase):
         self.assertEqual(task.status, TaskStatus.IN_PROGRESS)
         self.assertEqual(get_action_state(_UP, 3), ActionState.IN_PROGRESS,
                          'the reply moved the ledger but left the action PENDING')
+        self.assertTrue(task.verify_integrity(),
+                        'G2: the seal must survive the production resume path')
 
     def test_a_release_the_ledger_never_held_moves_it_too(self):
         """The other resume: the verifier's 'pending' set PENDING, the ledger
@@ -307,6 +309,7 @@ class TheReplyMovesTheActionOutOfPending(unittest.TestCase):
             self.ledger.tasks['action_3'].context.get(self.L.USER_INPUT_EVIDENCE_KEY),
             'the released answer must still be recorded, or the next '
             'completed + no asks again')
+        self.assertTrue(self.ledger.tasks['action_3'].verify_integrity())
 
     def test_the_assigned_experts_turn_moves_it_too_and_is_no_persons_answer(self):
         """The projection runs for the expert path as well (same resume
@@ -327,6 +330,62 @@ class TheReplyMovesTheActionOutOfPending(unittest.TestCase):
         self.assertTrue(task.context.get('unblock_evidence'))
         self.assertFalse(task.context.get(self.L.USER_INPUT_EVIDENCE_KEY),
                          "an expert's turn is not the person's answer")
+
+    def _wait_on_action_3(self):
+        from agent_ledger.core import TaskStatus
+        task = self.ledger.tasks['action_3']
+        task.status = TaskStatus.IN_PROGRESS
+        safe_set_state(_UP, 3, ActionState.IN_PROGRESS, 'working')
+        self.assertTrue(self.L.mark_action_waiting_for_user(_UP, 3, 'say ball'))
+        return task
+
+    def test_the_answer_is_tagged_with_the_flow_it_answers(self):
+        """G6: flow 1's action_3 is flow 0's ledger task, so the record says
+        which flow the answer belongs to; a record stamped flow 0 for every
+        answer would close flow 1's question with flow 0's reply."""
+        task = self._wait_on_action_3()
+        create_recipe.recipe_for_persona[_UP] = 1
+        try:
+            self.assertTrue(_resume_prior_user_input_block(_UP, 'ball'))
+        finally:
+            create_recipe.initialise_current_flow_to_zero(_UP)
+        self.assertTrue(self.L.ledger_user_answered(_UP, 3, 1))
+        self.assertFalse(self.L.ledger_user_answered(_UP, 3, 0))
+        self.assertTrue(task.verify_integrity())
+
+    def test_an_answer_the_ledger_cannot_save_keeps_the_gate(self):
+        """G3: the resume saved but the answer's save failed.  The answer then
+        exists only in memory, so the gate stays (the same answer is retried
+        next turn) and the sealed context is put back as it was."""
+        task = self._wait_on_action_3()
+        before = dict(task.context)
+        real_save = self.ledger.save
+        calls = {'n': 0}
+
+        def save_once_then_fail(*args, **kwargs):
+            calls['n'] += 1
+            return real_save(*args, **kwargs) if calls['n'] == 1 else False
+
+        with patch.object(self.ledger, 'save', side_effect=save_once_then_fail):
+            self.assertFalse(_resume_prior_user_input_block(_UP, 'ball'))
+        self.assertEqual(create_recipe.user_tasks[_UP]._needs_user_input_action_id, 3,
+                         'an unrecorded answer must not clear the gate')
+        self.assertEqual(task.context, before)
+        self.assertTrue(task.verify_integrity())
+
+    def test_after_a_restart_the_ledger_alone_names_the_waiting_action(self):
+        """G5: the sticky flag lives on the in-memory task and a restart
+        between the ask and the reply loses it; the ledger still holds the
+        task BLOCKED for the person, so the reply resumes that action."""
+        from agent_ledger.core import TaskStatus
+        task = self._wait_on_action_3()
+        create_recipe.user_tasks[_UP] = SimpleNamespace()   # a fresh process
+        self.assertTrue(_resume_prior_user_input_block(_UP, 'ball'))
+        self.assertEqual(task.status, TaskStatus.IN_PROGRESS)
+        self.assertTrue(self.L.ledger_user_answered(_UP, 3, 0))
+        self.assertIsNone(getattr(create_recipe.user_tasks[_UP],
+                                  '_needs_user_input_action_id', None))
+        self.assertTrue(task.verify_integrity())
 
 
 class AGateTheLedgerNeverHeld(unittest.TestCase):
@@ -437,6 +496,19 @@ class AResumedTaskStillPassesItsIntegrityCheck(unittest.TestCase):
         clear_action_states(_UP)
         with self.L._state_lock:
             self.L._ledger_registry.pop(_UP, None)
+        for store in (create_recipe.user_tasks, create_recipe.request_id_list):
+            try:
+                del store[_UP]
+            except Exception:
+                pass
+
+    def _reply(self, text='Hi!', request_id='user-request-7'):
+        """The production path: the create loop's own resume takes the reply."""
+        create_recipe.user_tasks[_UP] = SimpleNamespace(
+            _needs_user_input_action_id=3, _needs_help_reason='waiting for Arjun',
+            _needs_user_input_kind='human_required')
+        create_recipe.request_id_list[_UP] = request_id
+        return _resume_prior_user_input_block(_UP, text)
 
     def _block(self):
         from agent_ledger.core import TaskStatus
@@ -448,15 +520,29 @@ class AResumedTaskStillPassesItsIntegrityCheck(unittest.TestCase):
         return task
 
     def test_the_persons_answer_is_kept_and_the_seal_still_holds(self):
+        """Through the production path (G2): the create loop's resume takes
+        the reply, resumes the ledger and records the answer in one record."""
         task = self._block()
-        self.assertTrue(self.L.resume_from_user_input(_UP, 3, 'User responded', 'Hi!'))
-        self.assertEqual(task.context['user_input_evidence'][0]['answer'], 'Hi!',
+        self.assertTrue(self._reply('Hi!'))
+        self.assertEqual(task.context[self.L.USER_INPUT_EVIDENCE_KEY][0]['answer'], 'Hi!',
                          'the answer must land in the task, that is the point of resuming')
         self.assertTrue(
             task.verify_integrity(),
             'the stored hash describes the task from before the answer: the '
             'completion claim will be refused as "data_hash mismatch" (21 times '
             'live on 2026-10-30)')
+
+    def test_the_seal_holds_on_the_released_path_too(self):
+        """The ledger refused the block (its task was not in progress, live
+        2026-10-10 agent 54): the reply releases the gate through
+        ledger_holds_no_block, and the answer is still recorded and sealed."""
+        from agent_ledger.core import TaskStatus
+        task = self.ledger.tasks['action_3']
+        self.assertIsNotNone(task.data_hash)
+        self.assertNotEqual(task.status, TaskStatus.BLOCKED)
+        self.assertTrue(self._reply('Hi!'))
+        self.assertEqual(task.context[self.L.USER_INPUT_EVIDENCE_KEY][0]['answer'], 'Hi!')
+        self.assertTrue(task.verify_integrity())
 
     def test_an_experts_evidence_is_sealed_the_same_way(self):
         task = self._block()

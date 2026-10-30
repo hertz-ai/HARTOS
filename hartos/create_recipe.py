@@ -255,6 +255,7 @@ from hartos.lifecycle_hooks import (
     lifecycle_hook_check_all_actions_terminated, StateTransitionError, lifecycle_hook_validate_final_agent_creation,
     mark_action_waiting_for_user, resume_blocked_action, resume_from_user_input,
     ledger_holds_no_block, ledger_user_answered, record_user_answer,
+    blocked_action_awaiting_user,
     sync_action_state_to_ledger,  # Sync ActionState to SmartLedger
     register_ledger_for_session,  # Register ledger for auto-sync
     stall_guard_step,             # No-progress stall tracker (reachable guard)
@@ -2704,7 +2705,15 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                 if _should_block_on_user_input(user_prompt, current_action_id, _gate_value):
                                     _needs_user_input = True
                                     user_tasks[user_prompt]._needs_user_input_action_id = current_action_id
-                                    user_tasks[user_prompt]._needs_user_input_kind = 'human_required'
+                                    # A `completed` + `no` step has already asked
+                                    # (its send went out); the loop's own line
+                                    # must say it waits, not that the step "isn't
+                                    # coming together" (G8).  Resume treats both
+                                    # kinds as the person's gate.
+                                    user_tasks[user_prompt]._needs_user_input_kind = (
+                                        'awaiting_reply'
+                                        if json_obj['status'].lower() != 'pending'
+                                        else 'human_required')
                                     current_app.logger.info(
                                         f"[USER-INPUT-GATE] Action {current_action_id} flagged "
                                         f"as blocked on user input "
@@ -4444,8 +4453,13 @@ def _completed_verdict_still_waits(user_prompt, action_id, gate_value):
                                     get_current_flow(user_prompt))
 
 
-def _needs_input_reply(action_id, action_text):
+def _needs_input_reply(action_id, action_text, waiting=False):
     step = f' ("{action_text}")' if action_text else ''
+    if waiting:
+        # The step has asked its question and only waits for the reply (the
+        # `completed` + `no` gate); the person has the question above.
+        return (f"Step {action_id}{step} is waiting for your reply before I "
+                f"continue.")
     return (f"I need your input to finish building this agent. Step {action_id}"
             f"{step} isn't coming together from what I have so far — tell me "
             f"more about how this step should work, and I'll continue building "
@@ -4468,7 +4482,9 @@ def _ask_for_help(user_prompt, prompt_id, action_id, action_text, reason):
     """
     from integrations.agent_engine.dispatch import is_current_request_autonomous
     if not is_current_request_autonomous():
-        return _needs_input_reply(action_id, action_text)
+        _kind = getattr(user_tasks.get(user_prompt), '_needs_user_input_kind', None)
+        return _needs_input_reply(action_id, action_text,
+                                  waiting=(_kind == 'awaiting_reply'))
     _ledger = user_ledgers.get(user_prompt)
     _task = _ledger.tasks.get(f"action_{action_id}") if _ledger else None
     if _task is not None:
@@ -4563,10 +4579,26 @@ def _resume_prior_user_input_block(user_prompt, text, failure=False):
     if failure:
         return False
     task = user_tasks.get(user_prompt)
+    if task is None:
+        return False
     action_id = getattr(task, '_needs_user_input_action_id', None)
     if not isinstance(action_id, int):
-        return False
-    gate_kind = getattr(task, '_needs_user_input_kind', 'human_required')
+        # The flag lives on the in-memory task and a restart between the ask
+        # and the reply loses it, so the first reply after a restart was
+        # ignored and the person asked again (G5).  The ledger holds the
+        # durable half of the same wait (mark_action_waiting_for_user wrote
+        # both), so the reply derives the waiting action from it.
+        action_id = blocked_action_awaiting_user(user_prompt)
+        if action_id is None:
+            return False
+        logging.getLogger(__name__).info(
+            '[USER-INPUT-GATE] action %s waits in the ledger with no gate '
+            'flag (restart between the ask and the reply); taking the reply '
+            'for it', action_id)
+        task._needs_user_input_action_id = action_id
+        task._needs_user_input_kind = getattr(
+            task, '_needs_user_input_kind', None) or 'human_required'
+    gate_kind = getattr(task, '_needs_user_input_kind', None) or 'human_required'
     try:
         from integrations.agent_engine.dispatch import is_genuine_user_request
         request_id = request_id_list.get(user_prompt)
@@ -4632,13 +4664,18 @@ def _resume_prior_user_input_block(user_prompt, text, failure=False):
         # per flow and the flow boundary keeps the ledger (create_action_with_
         # ledger's reuse branch; add_actions_to_ledger skips a task id it
         # already holds), so flow 1's action_1 is flow 0's task.
-        # _completed_verdict_still_waits and the trace bank read it through
-        # lifecycle_hooks.ledger_user_answered.
+        # _completed_verdict_still_waits reads it through lifecycle_hooks.
+        # ledger_user_answered (the one reader while the #160 stamp is held).
+        # An answer that could not be recorded durably clears nothing: the
+        # gate stays and the same answer is retried next turn, the way a
+        # failed resume above keeps it (G3).  record_user_answer logs the
+        # cause (no task, or the save failed and was reverted).
         if not record_user_answer(user_prompt, action_id, text,
                                   get_current_flow(user_prompt)):
             logging.getLogger(__name__).warning(
-                '[USER-INPUT-GATE] action %s: the ledger holds no task to '
-                'record the answer on', action_id)
+                '[USER-INPUT-GATE] Keeping action %s flagged: the person\'s '
+                'answer could not be recorded on the ledger', action_id)
+            return False
     # The wait was projected into both authorities (mark_action_waiting_for_
     # user: ledger BLOCKED + ActionState PENDING) and the resume moved only
     # the ledger.  Left PENDING, the loop re-reads the verdict still at the
