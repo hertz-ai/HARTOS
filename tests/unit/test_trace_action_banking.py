@@ -400,18 +400,15 @@ class TestTraceBankingIsNotBoundedByLastNMessages:
         assert 'print(42)' in data['recipe'][0]['generalized_functions'], data
 
 
-class TestABankedActionCarriesItsPause:
-    """#160: every banked action was stamped can_perform_without_user_input
-    'yes', so a step that stopped for the person at creation (the gate asked,
-    the person answered) replayed on its own in REUSE, which reads this field
-    (_reuse_action_is_autonomous).  The ledger task is the record of that
-    pause: the create loop's resume records the person's answer on it, tagged
-    with the flow (lifecycle_hooks.record_user_answer), and one reader
-    (lifecycle_hooks.ledger_user_answered) serves the create gate and the
-    bank.  The stamp is ONE constant: the verifier's message is free model
-    text and a recipe bundle leaves the node (push_recipe, peer_reuse), and
-    the owner's rule of 2026-10-17 is that CREATE shares templates, never a
-    person's data; every reader needs only the leading 'no'."""
+class TestABankedActionStillReadsYesWhileTheStampIsHeld:
+    """#160 is OPEN.  94354c536 stamped a banked step the person answered
+    with a 'no' constant read from the ledger's answer record; it is held out
+    again because a 'no' step must first be shown to advance on the person's
+    reply in REUSE, and the live walk of 2026-10-30 22:24-22:28 IST on the
+    installed build (HARTOS 19836e605, agent 45620673143) re-asked the person
+    and recorded GAVE_UP instead.  Until that walk is fixed the bank writes
+    'yes' whatever the ledger holds, so new recipes behave as origin's do;
+    this pins the hold so re-landing the stamp is a deliberate act."""
 
     STEP = [
         {'content': 'Execute Action 2: synthesize weekly recap'},
@@ -420,10 +417,9 @@ class TestABankedActionCarriesItsPause:
             'arguments': '{"instructions": "query revenue"}'}}]},
         {'content': 'numbers retrieved'},
     ]
-    QUESTION = 'which week do you mean, the one with the Kumar invoice?'
 
-    @staticmethod
-    def _ledger_with_action_2(tmp_path):
+    def test_an_answered_step_still_banks_yes_while_the_stamp_is_held(
+            self, banked, tmp_path):
         import hartos.lifecycle_hooks as L
         from agent_ledger.core import SmartLedger, Task, TaskStatus, TaskType
         led = SmartLedger(agent_id='999', session_id='u_test_0',
@@ -433,39 +429,16 @@ class TestABankedActionCarriesItsPause:
                                      task_type=TaskType.PRE_ASSIGNED)
         led.tasks['action_2'].status = TaskStatus.IN_PROGRESS
         L.register_ledger_for_session('u_test', led)
-        return L, led
-
-    def test_a_step_the_person_answered_banks_the_no_constant(self, banked, tmp_path):
-        from core.constants import USER_ANSWERS_THIS_STEP
-        L, _ = self._ledger_with_action_2(tmp_path)
         try:
-            assert L.block_for_user_input('u_test', 2, self.QUESTION)
-            assert L.resume_from_user_input(
-                'u_test', 2, 'User supplied input for the blocked action')
             assert L.record_user_answer('u_test', 2, 'the Kumar week', 0)
+            assert L.ledger_user_answered('u_test', 2, 0) is True
             ok, data, _ = banked(list(self.STEP), flow=0)
         finally:
             with L._state_lock:
                 L._ledger_registry.pop('u_test', None)
         assert ok is True
-        assert data['can_perform_without_user_input'] == USER_ANSWERS_THIS_STEP
-        assert USER_ANSWERS_THIS_STEP.lower().startswith('no')
-        assert 'Kumar' not in json.dumps(data), (
-            'neither the question nor the answer may enter the recipe bundle')
-
-    def test_an_answer_from_another_flow_does_not_mark_this_flows_step(
-            self, banked, tmp_path):
-        """action_id restarts per flow and a later flow's action_2 is the
-        same ledger task, so the answer is matched by flow."""
-        L, _ = self._ledger_with_action_2(tmp_path)
-        try:
-            assert L.record_user_answer('u_test', 2, 'the Kumar week', 0)
-            ok, data, _ = banked(list(self.STEP), flow=1)
-        finally:
-            with L._state_lock:
-                L._ledger_registry.pop('u_test', None)
-        assert ok is True
         assert data['can_perform_without_user_input'] == 'yes'
+        assert 'Kumar' not in json.dumps(data)
 
     def test_a_step_that_never_stopped_banks_yes(self, banked):
         ok, data, _ = banked(list(self.STEP))

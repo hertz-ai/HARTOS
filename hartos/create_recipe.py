@@ -6526,18 +6526,19 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
                 'generalized_functions': '',
                 'agent_to_perform_this_action': 'Assistant',
             }]
-        # #160: 'yes' was stamped on every banked action, so a step that
-        # stopped for the person at creation replayed on its own in REUSE
+        # #160 (open): 'yes' is stamped on every banked action, so a step that
+        # stopped for the person at creation replays on its own in REUSE
         # (_reuse_action_is_autonomous reads this field).  The ledger task
         # records whether the person answered this action in THIS flow
-        # (lifecycle_hooks.record_user_answer / ledger_user_answered, the
-        # create gate's own reader).  The stamp is one constant: a recipe
-        # bundle leaves the node (push_recipe, peer_reuse's export) and the
-        # verifier's message is free model text (owner, 2026-10-17: CREATE
-        # shares templates, never a person's data).
-        from core.constants import USER_ANSWERS_THIS_STEP
-        from hartos.lifecycle_hooks import ledger_user_answered
-        _answered = ledger_user_answered(user_prompt, action_id, flow)
+        # (lifecycle_hooks.record_user_answer / ledger_user_answered); a stamp
+        # read from it was written in 94354c536 and HELD OUT again, because a
+        # 'no' step must first be shown to advance on the person's reply in
+        # REUSE, and the live walk measured 2026-10-30 22:24-22:28 IST on the
+        # installed build (HARTOS 19836e605, agent 45620673143 flow 0) did the
+        # opposite: the reply turn restarted at action 1, closed it on a
+        # send_message_to_user receipt with its named tool never run, then
+        # recorded GAVE_UP for the 'no' ask step and re-asked the person.
+        # Until that walk is fixed, 'yes' here keeps new recipes as they are.
         json_obj = {
             'status': 'done',
             'action': action_obj.get('action', ''),
@@ -6550,8 +6551,7 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
             'persona': '',
             'action_id': int(action_id),
             'recipe': steps,
-            'can_perform_without_user_input': (
-                USER_ANSWERS_THIS_STEP if _answered else 'yes'),
+            'can_perform_without_user_input': 'yes',
             'scheduled_tasks': [],
             'metadata': {},
             'recipe_source': 'execution_trace',
