@@ -67,10 +67,10 @@ POSTED = {'role': 'user', 'name': 'ChatInstructor',
                      'Run a thought experiment'}
 
 
-def _verdict(gate):
+def _verdict(gate, status='pending'):
     """The StatusVerifier's live verdict shape, with the gate value under test."""
     return {'role': 'user', 'name': 'StatusVerifier', 'content': json.dumps({
-        'status': 'pending', 'action': 'Respond to user', 'action_id': 1,
+        'status': status, 'action': 'Respond to user', 'action_id': 1,
         'message': 'the person has to say what the experiment is about',
         'can_perform_without_user_input': gate})}
 
@@ -110,7 +110,8 @@ def selector(test_user_id, test_prompt_id, mock_flask_app, sample_config_json):
         agents_object = out[6]
         yield SimpleNamespace(up=up, task=task, select=select,
                               assistant=agents_object['assistant'],
-                              verify=agents_object['verify'])
+                              verify=agents_object['verify'],
+                              chat_instructor=out[5])
     finally:
         for p in reversed(patches):
             p.stop()
@@ -137,6 +138,54 @@ class TestTheGateEndsTheInnerChat:
         chosen = s.select(s.verify, group)
         assert getattr(s.task, '_needs_user_input_action_id', None) is None
         assert chosen is s.assistant
+
+
+class TestACompletedVerdictThatNeedsThePersonStillAsks:
+    """#158, MEASURED 2026-10-30 on the installed desktop (hartos-f9's reading
+    of the logs): the StatusVerifier answered {"status": "completed",
+    "can_perform_without_user_input": "no"} for send_message_to_user steps
+    whose text asked the child to reply (flow 1 agent 1793365817449 actions 3
+    and 4 at 18:44:09 and 18:44:40, with the note "assumption of response";
+    flow 7 agent 1793371954882 action 1 at 20:23:18).  The handler returned on
+    `completed` before reading the flag, so a step the verifier itself said
+    needed the person was closed, the model wrote the child's reply, and four
+    agents banked flows whose recipes hold invented exchanges.  A verdict that
+    says the action cannot be performed without the person is the gate's case
+    whatever its status word says.
+    """
+
+    def test_completed_plus_no_flags_and_ends_the_chat(self, selector):
+        s = selector
+        assert get_action_state(s.up, 1) != ActionState.TERMINATED
+        group = SimpleNamespace(
+            messages=[POSTED, _verdict('no', status='completed')], agents=[])
+        chosen = s.select(s.verify, group)
+        assert s.task._needs_user_input_action_id == 1, (
+            'completed + no closed the step instead of asking the person '
+            '(live 18:44:09, 18:44:40, 20:23:18 on 2026-10-30)')
+        assert chosen is None, 'the gate must end the round so the OUTER loop asks'
+
+    def test_the_reasoned_no_is_read_the_same_way(self, selector):
+        """The CREATE prompt asks for 'no' WITH a reason; autonomy_needs_user
+        is the one reader of that value."""
+        s = selector
+        group = SimpleNamespace(
+            messages=[POSTED, _verdict('no - the child has to answer first',
+                                       status='completed')], agents=[])
+        chosen = s.select(s.verify, group)
+        assert s.task._needs_user_input_action_id == 1
+        assert chosen is None
+
+    def test_a_completed_verdict_without_no_still_goes_to_the_completion_owner(self, selector):
+        """Preservation: the main-loop lifecycle hook stays the only completion
+        owner; a plain completed verdict hands the turn to the ChatInstructor
+        as before."""
+        s = selector
+        group = SimpleNamespace(
+            messages=[POSTED, _verdict('yes', status='completed')], agents=[])
+        chosen = s.select(s.verify, group)
+        assert getattr(s.task, '_needs_user_input_action_id', None) is None
+        assert chosen is s.chat_instructor
 
 
 @pytest.fixture

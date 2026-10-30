@@ -2647,13 +2647,30 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                         if json_obj['status'].lower() == 'error' and 'message' in json_obj:
                             safe_set_state(user_prompt, current_action_id, ActionState.ERROR, "verifier error")
                             return author
-                        elif json_obj['status'].lower() in ('completed', 'success'):
+                        elif (json_obj['status'].lower() in ('completed', 'success')
+                              and not autonomy_needs_user(json_obj.get('can_perform_without_user_input'))):
                             # The main-loop lifecycle hook below is the only
                             # completion owner.  It validates the cited receipt,
                             # persists it, and advances the ledger; doing that
                             # here used the verifier JSON itself as proof.
                             return chat_instructor
-                        elif json_obj['status'].lower() == 'pending':
+                        elif json_obj['status'].lower() in ('pending', 'completed', 'success'):
+                            # #158: a verdict that says `completed` AND
+                            # `can_perform_without_user_input: no` contradicts
+                            # itself, and the `no` is the half that protects the
+                            # person.  Live 2026-10-30 on the installed desktop
+                            # the StatusVerifier answered exactly that for
+                            # send_message_to_user steps whose text asked the
+                            # child to reply (agent 1793365817449 actions 3 and
+                            # 4 at 18:44:09 and 18:44:40, "assumption of
+                            # response"; agent 1793371954882 action 1 at
+                            # 20:23:18); the branch above returned before this
+                            # gate read the flag, the step closed with no reply,
+                            # the model wrote the child's answer itself and four
+                            # agents banked flows holding invented exchanges.
+                            # So `completed` + `no` takes the gate below like
+                            # `pending` + `no` does; only a `completed` with no
+                            # such flag reaches the completion owner.
                             # USER-INPUT GATE (code-level enforcement of the
                             # prompt-level rule above):  if the verifier
                             # explicitly returned `can_perform_without_user_input:
@@ -2726,6 +2743,13 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                     f"[USER-INPUT-GATE] ending the chat round: action "
                                     f"{current_action_id} is waiting for the user")
                                 return None
+                            if json_obj['status'].lower() != 'pending':
+                                # #158: `completed` + `no` on an action the gate
+                                # refused to block (already terminal, see
+                                # _should_block_on_user_input): nothing is left
+                                # to ask about, so the completion owner takes it
+                                # exactly as before.
+                                return chat_instructor
                             safe_set_state(user_prompt, current_action_id, ActionState.PENDING, "verifier pending")
                             return assistant
                         elif json_obj['status'].lower() == 'requires_breakdown':
