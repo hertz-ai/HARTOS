@@ -158,8 +158,20 @@ _VLM_PRESERVED_CONTRACT_FIELDS = (
 )
 
 
-def _action_persona(action, role):
+def _action_persona(action, role, declared_personas=None):
     """Owner of a recipe action, defaulting to the role this turn runs as.
+
+    `declared_personas` is the agent record's `personas` list (names).  The
+    `persona` field has three producers with three vocabularies: the trace
+    bank wrote the create group's AGENT name ('Executor'), the VLM path writes
+    'user<id>', the model-written recipe writes the flow persona.  MEASURED
+    live 2026-10-30 17:09:43 (agent 1793359802508, flow persona 'Speech
+    Companion', 9 actions): 8 x 'Executor' failed the role filter below and
+    the ledger ran ONE action; the len(role_actions)==0 fallback only fires
+    when nothing matches.  A persona is a name the agent DECLARES; any other
+    value in the field is a producer's bookkeeping and the action belongs to
+    the flow's role, exactly like a missing persona.  Without a declared list
+    (legacy records, other call sites) the explicit value still wins.
 
     `persona` is OPTIONAL in a saved action.  MEASURED live 2026-09-10 on the
     installed build: create wrote actions 4 and 5 of agent 28160128202 with no
@@ -181,7 +193,9 @@ def _action_persona(action, role):
     if isinstance(action, dict):
         _p = action.get('persona')
         if _p:
-            return str(_p)
+            _names = {str(n).strip().lower() for n in (declared_personas or []) if n}
+            if not _names or str(_p).strip().lower() in _names:
+                return str(_p)
     return str(role or '')
 
 
@@ -1481,6 +1495,12 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
         # (Lever 2, owner 2026-09-01).  Absent on legacy records — the
         # gate below then resolves to pure detection, exactly as before.
         stored_goal_tags = config.get('goal_tags')
+        # The names this agent declares as personas: the only values of an
+        # action's `persona` field that mean "another role's action".  See
+        # _action_persona.
+        declared_personas = [
+            p.get('name') for p in (config.get('personas') or [])
+            if isinstance(p, dict) and p.get('name')]
 
     current_app.logger.info(f'Got goal as {goal}')
     role_actions = []
@@ -1502,11 +1522,11 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
             f"[VLM-MERGE] {len(vlm_actions)} override(s); actions "
             f"{_before} -> {len(recipes[user_prompt]['actions'])}, "
             f"persona-matching role {role!r}: "
-            f"{sum(1 for a in recipes[user_prompt]['actions'] if _action_persona(a, role).lower() == str(role or '').lower())}")
+            f"{sum(1 for a in recipes[user_prompt]['actions'] if _action_persona(a, role, declared_personas).lower() == str(role or '').lower())}")
 
     current_app.logger.info(f'Getting role actions')
     for i in recipes[user_prompt]['actions']:
-        _persona = _action_persona(i, role)
+        _persona = _action_persona(i, role, declared_personas)
         current_app.logger.info(f'this is action persona:{_persona} ')
         if _persona.lower() == str(role or '').lower():
             role_actions.append(i)

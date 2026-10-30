@@ -6429,7 +6429,12 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
             'status': 'done',
             'action': action_obj.get('action', ''),
             'fallback_action': action_obj.get('fallback_action', ''),
-            'persona': 'Executor',
+            # Empty = owned by the flow (reuse_recipe._action_persona resolves
+            # it to the flow's role).  This stamped 'Executor', the create
+            # group's AGENT name, and reuse filters actions by persona == the
+            # flow persona: 8 of 9 Syllable Coach actions dropped out of the
+            # ledger live 2026-10-30 17:09:43 ("[REUSE-LEDGER] actions=1").
+            'persona': '',
             'action_id': int(action_id),
             'recipe': steps,
             'can_perform_without_user_input': 'yes',
