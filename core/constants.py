@@ -1451,6 +1451,14 @@ def action_is_autonomous(value) -> bool:
     return str(value or '').strip().lower() == 'yes'
 
 
+#: The one value the trace bank stamps on a banked action the person answered
+#: at creation (#160).  Reads as a pause to both rules above (a leading 'no').
+#: A constant, never the verifier's or the person's words: a recipe bundle
+#: leaves the node (CREATE's push_recipe, peer_reuse's export) and the owner's
+#: rule of 2026-10-17 is that CREATE shares templates, never a person's data.
+USER_ANSWERS_THIS_STEP = 'no - the person answers this step'
+
+
 # ── Where a chat reply came from: the THREE values a client badge reads ──
 # Owner, 2026-10-04: 'local' is a reply this node's own LLM wrote, 'hive' is a
 # reply that was escalated to a hive peer, 'cloud' is a reply from a cloud

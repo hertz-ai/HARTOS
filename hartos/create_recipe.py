@@ -254,7 +254,7 @@ from hartos.lifecycle_hooks import (
     lifecycle_hook_track_recipe_completion,
     lifecycle_hook_check_all_actions_terminated, StateTransitionError, lifecycle_hook_validate_final_agent_creation,
     mark_action_waiting_for_user, resume_blocked_action, resume_from_user_input,
-    ledger_holds_no_block,
+    ledger_holds_no_block, ledger_user_answered, record_user_answer,
     sync_action_state_to_ledger,  # Sync ActionState to SmartLedger
     register_ledger_for_session,  # Register ledger for auto-sync
     stall_guard_step,             # No-progress stall tracker (reachable guard)
@@ -2648,29 +2648,35 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                             safe_set_state(user_prompt, current_action_id, ActionState.ERROR, "verifier error")
                             return author
                         elif (json_obj['status'].lower() in ('completed', 'success')
-                              and not autonomy_needs_user(json_obj.get('can_perform_without_user_input'))):
+                              and not _completed_verdict_still_waits(
+                                  user_prompt, current_action_id,
+                                  json_obj.get('can_perform_without_user_input'))):
                             # The main-loop lifecycle hook below is the only
                             # completion owner.  It validates the cited receipt,
                             # persists it, and advances the ledger; doing that
-                            # here used the verifier JSON itself as proof.
+                            # here used the verifier JSON itself as proof.  A
+                            # `completed` whose `no` still has the person to
+                            # hear from takes the gate below instead (#158,
+                            # _completed_verdict_still_waits).
                             return chat_instructor
                         elif json_obj['status'].lower() in ('pending', 'completed', 'success'):
-                            # #158: a verdict that says `completed` AND
-                            # `can_perform_without_user_input: no` contradicts
-                            # itself, and the `no` is the half that protects the
-                            # person.  Live 2026-10-30 on the installed desktop
-                            # the StatusVerifier answered exactly that for
-                            # send_message_to_user steps whose text asked the
-                            # child to reply (agent 1793365817449 actions 3 and
-                            # 4 at 18:44:09 and 18:44:40, "assumption of
-                            # response"; agent 1793371954882 action 1 at
-                            # 20:23:18); the branch above returned before this
-                            # gate read the flag, the step closed with no reply,
-                            # the model wrote the child's answer itself and four
-                            # agents banked flows holding invented exchanges.
-                            # So `completed` + `no` takes the gate below like
-                            # `pending` + `no` does; only a `completed` with no
-                            # such flag reaches the completion owner.
+                            # #158: `completed` + `can_perform_without_user_input:
+                            # no` on a step the person has not answered yet
+                            # takes this gate like `pending` + `no` does.  By
+                            # the verifier's prompt the `no` describes the
+                            # action (it asks the person to choose, confirm or
+                            # approve); _completed_verdict_still_waits decides
+                            # whether the person has answered.  Live 2026-10-30
+                            # on the installed desktop the StatusVerifier
+                            # answered exactly that for send_message_to_user
+                            # steps whose text asked the child to reply (agent
+                            # 1793365817449 actions 3 and 4 at 18:44:09 and
+                            # 18:44:40, "assumption of response"; agent
+                            # 1793371954882 action 1 at 20:23:18); the branch
+                            # above returned before this gate read the flag,
+                            # the step closed with no reply, the model wrote the
+                            # child's answer itself and four agents banked
+                            # flows holding invented exchanges.
                             # USER-INPUT GATE (code-level enforcement of the
                             # prompt-level rule above):  if the verifier
                             # explicitly returned `can_perform_without_user_input:
@@ -4398,6 +4404,46 @@ def _should_block_on_user_input(user_prompt, action_id, gate_value) -> bool:
     return True
 
 
+def _completed_verdict_still_waits(user_prompt, action_id, gate_value):
+    """Does a `completed` verdict that says `no` still have the person to hear from?
+
+    The StatusVerifier's prompt (create_agents, Response formats) lets
+    `completed` carry `can_perform_without_user_input: no` when the action
+    verbatim asks the user to choose, confirm or approve: on a completed
+    verdict `no` describes the ACTION, not "still waiting".  Live 2026-10-30
+    on the installed desktop (hartos-f9's count), 16 of 54 completed verdicts
+    on send_message_to_user steps carried `no`: 8 had the reply already, 4
+    were plain sends, 4 were really waiting (agent 1793365817449 actions 3 and
+    4 at 18:44:09 and 18:44:40, "assumption of response"; agent 1793371954882
+    action 1 at 20:23:18).  Before 51c6f6c2d the handler returned on
+    `completed` before reading the flag, so those 4 closed with the child's
+    reply written by the model; 51c6f6c2d gated every `completed` + `no` and
+    asked without bound instead (the flag stays `no` after the reply: a replay
+    asked 7 times in 7 turns and the step never closed).
+
+    So the question is whether the person has answered THIS action in THIS
+    flow, and the ledger task records that (the create loop's resume writes
+    it, lifecycle_hooks.ledger_user_answered reads it): a `no` with no answer
+    yet asks once; a `no` whose task holds the answer closes.  A daemon turn
+    has nobody to ask, so its `completed` closes as it did before 51c6f6c2d (a
+    mislabelled `no` would otherwise park the goal: the parent flow finished 3
+    of 3, the same flow under the gate paused at action 2 with 1 banked);
+    holding such a step for the expert instead is PENDING the owner's ruling,
+    asked 2026-10-30, not decided here.  The terminal case is
+    _should_block_on_user_input's, downstream."""
+    if not autonomy_needs_user(gate_value):
+        return False
+    try:
+        from integrations.agent_engine.dispatch import is_current_request_autonomous
+        if is_current_request_autonomous():
+            return False
+    except Exception:
+        # An unreadable request kind degrades to asking, the interactive side.
+        pass
+    return not ledger_user_answered(user_prompt, action_id,
+                                    get_current_flow(user_prompt))
+
+
 def _needs_input_reply(action_id, action_text):
     step = f' ("{action_text}")' if action_text else ''
     return (f"I need your input to finish building this agent. Step {action_id}"
@@ -4543,9 +4589,11 @@ def _resume_prior_user_input_block(user_prompt, text, failure=False):
         return False
 
     if is_user:
+        # The answer itself is recorded once below (record_user_answer),
+        # tagged with the flow it answers; the resume carries no evidence.
         resumed = resume_from_user_input(
             user_prompt, action_id,
-            'User supplied input for the blocked action', text)
+            'User supplied input for the blocked action')
     else:
         resumed = resume_blocked_action(
             user_prompt, action_id,
@@ -4576,6 +4624,35 @@ def _resume_prior_user_input_block(user_prompt, text, failure=False):
             '%s failed', action_id,
             'a genuine user reply' if is_user else 'its assigned expert turn')
         return False
+    if is_user:
+        # ONE writer of the person's answer, for the durable resume and for
+        # the release above alike (the ledger refused the block, so the resume
+        # wrote nothing; without this record the next `completed` + `no` asked
+        # the same question again).  Tagged with the flow: action_id restarts
+        # per flow and the flow boundary keeps the ledger (create_action_with_
+        # ledger's reuse branch; add_actions_to_ledger skips a task id it
+        # already holds), so flow 1's action_1 is flow 0's task.
+        # _completed_verdict_still_waits and the trace bank read it through
+        # lifecycle_hooks.ledger_user_answered.
+        if not record_user_answer(user_prompt, action_id, text,
+                                  get_current_flow(user_prompt)):
+            logging.getLogger(__name__).warning(
+                '[USER-INPUT-GATE] action %s: the ledger holds no task to '
+                'record the answer on', action_id)
+    # The wait was projected into both authorities (mark_action_waiting_for_
+    # user: ledger BLOCKED + ActionState PENDING) and the resume moved only
+    # the ledger.  Left PENDING, the loop re-reads the verdict still at the
+    # tail: the verifier hook answers 'allow' without moving a PENDING action,
+    # the claim handler's [COMPLETION-GATE] leaves it open, and the lap
+    # repeats to the stall guard, the person receiving the verifier's message
+    # as the reply (hartos-f9's replay of 49afbeba4: action 2 pending for
+    # every turn run, 120 laps).  Before 49afbeba4 the false [CLAIM REJECTED]
+    # re-posted the action and moved the state by accident.  Runs for the
+    # expert path too, and covers the release above.
+    if get_action_state(user_prompt, action_id) == ActionState.PENDING:
+        safe_set_state(user_prompt, action_id, ActionState.IN_PROGRESS,
+                       'the person answered' if is_user
+                       else 'the assigned expert took the action')
     task._needs_user_input_action_id = None
     task._needs_user_input_kind = None
     task._needs_help_reason = None
@@ -6449,6 +6526,18 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
                 'generalized_functions': '',
                 'agent_to_perform_this_action': 'Assistant',
             }]
+        # #160: 'yes' was stamped on every banked action, so a step that
+        # stopped for the person at creation replayed on its own in REUSE
+        # (_reuse_action_is_autonomous reads this field).  The ledger task
+        # records whether the person answered this action in THIS flow
+        # (lifecycle_hooks.record_user_answer / ledger_user_answered, the
+        # create gate's own reader).  The stamp is one constant: a recipe
+        # bundle leaves the node (push_recipe, peer_reuse's export) and the
+        # verifier's message is free model text (owner, 2026-10-17: CREATE
+        # shares templates, never a person's data).
+        from core.constants import USER_ANSWERS_THIS_STEP
+        from hartos.lifecycle_hooks import ledger_user_answered
+        _answered = ledger_user_answered(user_prompt, action_id, flow)
         json_obj = {
             'status': 'done',
             'action': action_obj.get('action', ''),
@@ -6461,7 +6550,8 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
             'persona': '',
             'action_id': int(action_id),
             'recipe': steps,
-            'can_perform_without_user_input': 'yes',
+            'can_perform_without_user_input': (
+                USER_ANSWERS_THIS_STEP if _answered else 'yes'),
             'scheduled_tasks': [],
             'metadata': {},
             'recipe_source': 'execution_trace',

@@ -204,12 +204,17 @@ class UserInputGateTerminal(unittest.TestCase):
         create_recipe.user_tasks[_UP] = task
         create_recipe.request_id_list[_UP] = 'user-request-2'
         with patch('hartos.create_recipe.resume_from_user_input',
-                   return_value=True) as resume:
+                   return_value=True) as resume, \
+                patch('hartos.create_recipe.record_user_answer',
+                      return_value=True) as record:
             self.assertTrue(
                 _resume_prior_user_input_block(_UP, 'Use account A'))
         resume.assert_called_once_with(
-            _UP, 3, 'User supplied input for the blocked action',
-            'Use account A')
+            _UP, 3, 'User supplied input for the blocked action')
+        # The one writer of the person's answer, tagged with the flow it
+        # answers (a later flow's action_1 is the same ledger task).
+        record.assert_called_once_with(
+            _UP, 3, 'Use account A', create_recipe.get_current_flow(_UP))
         self.assertIsNone(task._needs_user_input_action_id)
 
     def test_failed_durable_resume_keeps_the_sticky_gate(self):
@@ -227,6 +232,101 @@ class UserInputGateTerminal(unittest.TestCase):
         self.assertEqual(task._needs_user_input_action_id, 3)
         self.assertEqual(task._needs_user_input_kind, 'human_required')
         self.assertEqual(task._needs_help_reason, 'need choice')
+
+
+class TheReplyMovesTheActionOutOfPending(unittest.TestCase):
+    """hartos-f9's replay of 49afbeba4: mark_action_waiting_for_user projects
+    the wait into BOTH authorities (ledger BLOCKED, ActionState PENDING); the
+    reply resumed only the ledger.  Left PENDING, the loop re-read the verdict
+    still at the tail, the verifier hook answered 'allow' without moving a
+    PENDING action, [COMPLETION-GATE] left it open, and the lap repeated to
+    the stall guard (120 laps; action 2 pending for every turn run), the
+    person receiving the verifier's message as the reply.  Before 49afbeba4
+    the false [CLAIM REJECTED] re-posted the action and moved the state by
+    accident.  Driven through the real hooks and a real ledger."""
+
+    def setUp(self):
+        import tempfile
+        from agent_ledger.core import SmartLedger, add_actions_to_ledger
+        from hartos import lifecycle_hooks as L
+        self.L = L
+        clear_action_states(_UP)
+        self.ledger = SmartLedger(agent_id='54', session_id=f'{_UP}_3',
+                                  ledger_dir=tempfile.mkdtemp())
+        add_actions_to_ledger(self.ledger, [
+            {'action': 'say Hello Arjun and wait', 'action_id': 1},
+            {'action': 'ask the child to say ball', 'action_id': 3},
+        ], flow_id=0)
+        L.register_ledger_for_session(_UP, self.ledger)
+        create_recipe.user_tasks[_UP] = SimpleNamespace(
+            _needs_user_input_action_id=3, _needs_help_reason='say ball',
+            _needs_user_input_kind='human_required')
+        create_recipe.request_id_list[_UP] = 'user-request-9'
+
+    def tearDown(self):
+        clear_action_states(_UP)
+        with self.L._state_lock:
+            self.L._ledger_registry.pop(_UP, None)
+        for store in (create_recipe.user_tasks, create_recipe.request_id_list):
+            try:
+                del store[_UP]
+            except Exception:
+                pass
+
+    def test_a_genuine_reply_puts_the_action_back_in_progress(self):
+        from agent_ledger.core import TaskStatus
+        task = self.ledger.tasks['action_3']
+        task.status = TaskStatus.IN_PROGRESS
+        safe_set_state(_UP, 3, ActionState.IN_PROGRESS, 'working')
+        self.assertTrue(self.L.mark_action_waiting_for_user(_UP, 3, 'say ball'))
+        self.assertEqual(get_action_state(_UP, 3), ActionState.PENDING)
+        self.assertEqual(task.status, TaskStatus.BLOCKED)
+
+        self.assertTrue(_resume_prior_user_input_block(_UP, 'ball'))
+
+        self.assertEqual(task.status, TaskStatus.IN_PROGRESS)
+        self.assertEqual(get_action_state(_UP, 3), ActionState.IN_PROGRESS,
+                         'the reply moved the ledger but left the action PENDING')
+
+    def test_a_release_the_ledger_never_held_moves_it_too(self):
+        """The other resume: the verifier's 'pending' set PENDING, the ledger
+        refused the block (task not in progress), and the reply releases the
+        gate through ledger_holds_no_block.  Same projection."""
+        from agent_ledger.core import TaskStatus
+        task = self.ledger.tasks['action_3']
+        self.assertNotEqual(task.status, TaskStatus.IN_PROGRESS)
+        safe_set_state(_UP, 3, ActionState.IN_PROGRESS, 'working')
+        safe_set_state(_UP, 3, ActionState.STATUS_VERIFICATION_REQUESTED, 'verify')
+        safe_set_state(_UP, 3, ActionState.PENDING, 'verifier pending')
+        self.assertFalse(self.L.block_for_user_input(_UP, 3, 'say ball'))
+
+        self.assertTrue(_resume_prior_user_input_block(_UP, 'ball'))
+
+        self.assertEqual(get_action_state(_UP, 3), ActionState.IN_PROGRESS)
+        self.assertTrue(
+            self.ledger.tasks['action_3'].context.get(self.L.USER_INPUT_EVIDENCE_KEY),
+            'the released answer must still be recorded, or the next '
+            'completed + no asks again')
+
+    def test_the_assigned_experts_turn_moves_it_too_and_is_no_persons_answer(self):
+        """The projection runs for the expert path as well (same resume
+        site); an expert's evidence stays unblock_evidence, never a person's
+        answer."""
+        from agent_ledger.core import TaskStatus
+        task = self.ledger.tasks['action_3']
+        task.status = TaskStatus.IN_PROGRESS
+        safe_set_state(_UP, 3, ActionState.IN_PROGRESS, 'working')
+        self.assertTrue(self.L.mark_action_waiting_for_user(_UP, 3, 'needs an expert'))
+        create_recipe.user_tasks[_UP]._needs_user_input_kind = 'recoverable_stall'
+        create_recipe.request_id_list[_UP] = 'daemon_expert_turn'
+        with patch('hartos.create_recipe._is_serving_escalation_expert',
+                   return_value=True):
+            self.assertTrue(_resume_prior_user_input_block(_UP, 'expert text'))
+        self.assertEqual(get_action_state(_UP, 3), ActionState.IN_PROGRESS)
+        self.assertEqual(task.status, TaskStatus.IN_PROGRESS)
+        self.assertTrue(task.context.get('unblock_evidence'))
+        self.assertFalse(task.context.get(self.L.USER_INPUT_EVIDENCE_KEY),
+                         "an expert's turn is not the person's answer")
 
 
 class AGateTheLedgerNeverHeld(unittest.TestCase):
