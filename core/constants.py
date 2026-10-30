@@ -800,6 +800,15 @@ PAUSED_FOR_USER_REPLY_PREFIX: str = "Paused for the user:"
 #: core.agent_tools.is_held_for_another_turn recognises it by this prefix;
 #: held_for_another_turn_reply writes it.
 HELD_FOR_ANOTHER_TURN_REPLY_PREFIX: str = "Held for another turn:"
+#: The reply of a background turn (daemon, hive, timer) that found the
+#: session's current REUSE step held for the person's reply (#161): the step
+#: asked them a question in their own turn and waits for the answer, so this
+#: turn neither ran the step nor asked again.  Not a result, not a failure,
+#: not a parked goal: the person's next turn resumes the step; a dispatcher
+#: holds it and counts nothing (the daemon a transient defer, no strike; the
+#: hive worker HeldForHelp).  core.agent_tools.is_waiting_for_person
+#: recognises it by this prefix; waiting_for_person_reply writes it.
+WAITING_FOR_PERSON_REPLY_PREFIX: str = "Waiting for the person:"
 
 
 # ── The per-request switch that turns a hybrid-reasoning model's thinking OFF ──

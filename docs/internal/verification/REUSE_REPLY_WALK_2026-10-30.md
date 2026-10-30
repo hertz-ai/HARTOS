@@ -50,11 +50,23 @@ That is action 2's question, delivered while the pipeline was still on action 1:
 send_message_to_user x5, get_user_uploaded_file x1, get_saved_metadata x1). The verifier
 said action 1 pending ("Awaiting user input for learner key"), then action 2 pending seven
 times ("Awaiting user response to their preferred topic and desired level of detail"). At
-22:26:08 `[UNDER-REPORTED]` advanced action 1 "on the tool evidence" (the send receipts),
-then `[REUSE-VERIFY]` found no canonical receipt in action 1's dispatch window (the steers
-had moved the window past the sends, and a prose-read step wants a written answer there)
-and recorded GAVE_UP; the ledger task went FAILED. The turn ended through `[SYNTHESIS]`,
-delivering the ask. Three `while1` passes, no `[REUSE-NODRIVER]`.
+22:26:08 `[UNDER-REPORTED]` advanced action 1 with the fabrication gate checking nothing:
+at 19836e605 `_reuse_fabricated_tools` returns `[]` for an action whose words name no tool,
+and the session log has 0 `[FAB-GUARD] action 1` lines. `[REUSE-VERIFY]` then found no
+canonical receipt in action 1's dispatch window and recorded GAVE_UP; the ledger task went
+FAILED. The turn ended through `[SYNTHESIS]`, delivering the ask. Three `while1` passes, no
+`[REUSE-NODRIVER]`.
+
+Why the finder found nothing is not established. Measured: 0 "receipt search" lines in
+either turn's log, so the named-tool branch did not run; the step read as a prose step and
+`_reuse_written_answer` returned None. Inferred (strong): that function's `except
+Exception: return None` is a silent exit nobody has ruled out. Not the steers: a steer
+carries no leading dispatch marker, so it cannot move the window, and a send ran at
+22:25:57 after the last steer at 22:25:45; the backward walk stops at the first message
+the predicate accepts, and messages 22, 23 and 26 sit after the last steer. hartos-f9's
+guess, inferred and not run: the walk stops at Helper's message 26 and `is_written_answer`
+refuses it as not the Assistant's, which fits the json_repair failure pair at 22:26:08. No
+log line records which exit returned None; the walk on a HEAD build may settle it.
 
 ## Turn 2, 22:28:01 to 22:28:43 (42 s), "I'd like to focus on basic algebra, at a beginner level."
 
@@ -88,20 +100,25 @@ a3820a8fe).
 
 - R1. The reply turn did not carry the answer into the ask step: the seed re-posted the
   current action's instruction, the model asked again, the verifier reported the ask step
-  pending although the answer was the latest user message. Fixed locally in HARTOS
-  b9edfd90a: the seed says the question was already delivered, the reply is captured
-  with its request id, and it stands as the completion evidence (`user_reply`) for the
-  verifier's `completed`, only from a genuine request other than the one that asked.
+  pending although the answer was the latest user message. A fix landed locally in HARTOS
+  b9edfd90a and its rework (the commit that carries this text), under review, not live
+  proven: the seed says the question was already delivered, the reply is captured with
+  its request id, and it stands as the completion evidence (`user_reply`) for the
+  verifier's `completed`, only from a genuine request other than the one that asked, and
+  only on a person's turn.
 - R2. The receipt finder accepted a written answer as action 1's receipt while its banked
   tool get_data_by_key never ran, because the action's words name no tool (the 2026-10-21
   requires-versus-offered rule). Open; a measurement of an any-of banked-tool rule over the
   desktop's recipe actions comes before any change.
 - R3. A `no` step with a completed verdict and no receipt was recorded GAVE_UP and the
-  person re-asked. Fixed locally in b9edfd90a: an ask-only step whose question is out waits
-  through the canonical path (ledger BLOCKED with blocked_reason input_required,
-  ActionState PENDING) and a genuine next turn resumes it.
+  person re-asked. A fix landed locally in b9edfd90a and its rework, under review, not
+  live proven: an ask-only step whose question is out waits through the canonical path
+  (ledger BLOCKED with blocked_reason input_required, ActionState PENDING) on a person's
+  turn, and a genuine next turn resumes it first; a background turn neither runs nor
+  re-asks it. A reply after a restart or the 7200 s cache lapse still re-steers and gives
+  up (hartos-f9's review, item 5), so "never GAVE_UP" does not hold yet.
 
-## Control: the same walk on a `yes` send step (2026-10-30, 23:28 IST)
+## Control: a different agent's `yes` send step, with no question in it (2026-10-30, 23:28 IST)
 
 Agent 7700000611 "AgentToAgentVerificationAndDelegation", flow 0, declared persona
 Executor, two actions: 1. `yes` send_message_to_user "livetest_agent_to_agent_verify step
@@ -113,9 +130,9 @@ tool (`[FABRICATED-COMPLETE]` refused and re-steered at 23:28:32), then ran
 delegate_to_specialist and completed at 23:28:50; the person received the delegation
 summary. Tools in the turn: send_message_to_user x3, delegate_to_specialist x1,
 save_to_long_term_memory x1, get_user_id x1. So a `yes` send step completes on its own
-send and the flow runs to the end in the asking turn: it does not wedge, and it never
-waits for a reply either. That is the "ask and ignore" shape the seven speech agents'
-recipes would replay today, every step of theirs being stamped `yes`.
+send and the flow runs to the end in its one turn (nothing was asked): it does not wedge,
+and it does not wait for a reply either. Inferred, not run: that is the shape the seven
+speech agents' recipes would replay today, every step of theirs being stamped `yes`.
 
 Not yet measured, carried on the task: R1 to R3 on a HEAD build; the live gate for
 b9edfd90a on a demo agent (a refusal and an off-topic reply, and the exact texts the

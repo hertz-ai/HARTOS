@@ -2643,9 +2643,19 @@ def commit_verified_action_completion(user_prompt: str, action_id: int,
         # review, change 4; the raw chat path already owns history and
         # consented writes).  The answer is recorded the way CREATE records
         # it and the ask it answers is closed, in the same step.
-        record_user_answer(user_prompt, action_id, evidence.get('reply'),
-                           evidence.get('flow'))
-        close_open_ask(user_prompt, action_id, evidence.get('flow'))
+        # Both writes land after the COMPLETED write and cannot undo it, so a
+        # refusal is said at error: the first leaves ledger_user_answered
+        # reading False for a step that did take its answer, the second
+        # leaves the ask open so the next reply would be read against it.
+        if not record_user_answer(user_prompt, action_id, evidence.get('reply'),
+                                  evidence.get('flow')):
+            logger.error("[REUSE-WAIT] action %s in %s completed on the person's "
+                         "reply but the answer record was refused",
+                         action_id, user_prompt)
+        if not close_open_ask(user_prompt, action_id, evidence.get('flow')):
+            logger.error("[REUSE-WAIT] action %s in %s completed on the person's "
+                         "reply but its ask could not be closed",
+                         action_id, user_prompt)
     else:
         # Learning follows both durable evidence and the successful canonical
         # state write. Never credit a receipt which failed either boundary.

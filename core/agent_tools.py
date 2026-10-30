@@ -208,6 +208,31 @@ def is_held_for_another_turn(reply) -> bool:
     return reply.strip().startswith(HELD_FOR_ANOTHER_TURN_REPLY_PREFIX)
 
 
+def waiting_for_person_reply(action_id) -> str:
+    """The sentence a background turn answers when the session's current
+    REUSE step is held for the person's reply (#161): the step asked them in
+    their own turn, and this turn neither ran it nor asked again.  Written
+    here, beside the predicate that recognises it, so a reworded sentence
+    cannot stop being recognised."""
+    from core.constants import WAITING_FOR_PERSON_REPLY_PREFIX
+    return (f"{WAITING_FOR_PERSON_REPLY_PREFIX} step {action_id} asked them a "
+            f"question and waits for their reply; this turn did not run it or "
+            f"ask again.")
+
+
+def is_waiting_for_person(reply) -> bool:
+    """True when ``reply`` is waiting_for_person_reply: the turn did not run
+    its step because the step waits for the person.  Neither a result nor a
+    failure nor a parked goal: the daemon counts no strike and keeps the goal
+    active (dispatch treats it as a transient defer), the hive worker holds
+    the task (HeldForHelp), nobody records it as work.  Recognised by the
+    prefix in core.constants."""
+    if not isinstance(reply, str):
+        return False
+    from core.constants import WAITING_FOR_PERSON_REPLY_PREFIX
+    return reply.strip().startswith(WAITING_FOR_PERSON_REPLY_PREFIX)
+
+
 def is_action_error_reply(reply) -> bool:
     """True when ``reply`` is the CREATE pipeline's structured error envelope,
     {"status": "error", "action": ..., "action_id": ..., "message": ...} — the

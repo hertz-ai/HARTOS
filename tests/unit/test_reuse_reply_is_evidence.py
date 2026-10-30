@@ -73,13 +73,17 @@ def speech(monkeypatch, tmp_path):
     monkeypatch.setattr(budget_gate, 'charge_goal_work_completed', Mock())
     monkeypatch.setattr(rr, 'get_role', Mock(return_value='Executor'))
 
-    def build(ask_action=None, ask_verdict='pending'):
+    def build(ask_action=None, ask_verdict='pending', actions=None,
+              assistant_script=None, verdict_script=None):
         """`ask_verdict` is what the verifier says on the ASK turn, before any
         reply exists: 'pending' (the honest verdict) or 'completed' (the live
-        4B's, which must no longer close the step)."""
+        4B's, which must no longer close the step).  `actions` replaces the
+        speech flow; `assistant_script(state, aid, content)` and
+        `verdict_script(state, aid, content)` script the two model seats for
+        other shapes and fall back to the speech script on None."""
         key = 'reply_evidence_test_61'
         user_id, prompt_id = 'reply_evidence_test', 61
-        actions = [
+        actions = actions or [
             ask_action or {'action': ASK_TEXT, 'action_id': 1,
                            'can_perform_without_user_input': 'no',
                            'recipe': [{'steps': 'ask the child', 'tool_name': 'send_message_to_user'}]},
@@ -118,6 +122,10 @@ def speech(monkeypatch, tmp_path):
             if rr._REUSE_SYNTHESIS_ANSWER_SHAPE in content:
                 return True, json.dumps({'message2userfinal': FINAL})
             aid = rr.user_tasks[key].current_action
+            if assistant_script is not None:
+                scripted = assistant_script(state, aid, content)
+                if scripted is not None:
+                    return True, scripted
             if aid == 1:
                 if state['turn'] == 'ask' and not state['sends']:
                     return True, {'content': '', 'tool_calls': [{
@@ -132,6 +140,10 @@ def speech(monkeypatch, tmp_path):
 
         def verdict_reply(recipient, messages=None, sender=None, config=None):
             aid = rr.user_tasks[key].current_action
+            if verdict_script is not None:
+                scripted = verdict_script(state, aid, messages[-1].get('content') or '')
+                if scripted is not None:
+                    return True, scripted
             if aid == 1 and state['turn'] == 'ask':
                 if ask_verdict == 'pending':
                     return True, json.dumps({'status': 'pending', 'action_id': 1,
@@ -254,6 +266,8 @@ class TestTheReplyTurnCompletesTheStep:
         assert any(c.args[1] in (2, 3) for c in promote.call_args_list)
         answers = _task(run, 1).context.get(run.L.USER_INPUT_EVIDENCE_KEY) or []
         assert answers and answers[-1]['answer'] == 'ba'
+        # The step's result is the person's words, never the seed they rode in.
+        assert _task(run, 1).result == 'ba', _task(run, 1).result
 
     def test_the_reply_seed_says_the_question_was_delivered(self, speech):
         run = self._asked(speech)
@@ -298,7 +312,305 @@ class TestANoStepNamingAnotherToolStillNeedsItsReceipt:
                                  'action_id': 1, 'can_perform_without_user_input': 'no',
                                  'recipe': [{'steps': 'read', 'tool_name': 'read_item'}]})
         run.turn('go', 'request-1')
+        # Its send is not an ask either: the step is never held for a reply
+        # (REUSE's branch choice, hartos-f9's mutant M1a).
+        assert run.L.ledger_open_ask(run.key, 1, 0) is None
+        assert _task(run, 1).status != TaskStatus.BLOCKED
         run.turn('yes, confirmed', 'request-2', kind='reply')
         assert run.state['read'] == [], 'precondition: the tool never ran in this script'
         assert _task(run, 1).status not in (TaskStatus.COMPLETED, TaskStatus.TERMINATED)
         assert run.rr.user_tasks[run.key].current_action == 1
+
+    def test_the_lifecycle_gate_itself_refuses_a_reply_for_a_tool_step(self, speech):
+        """The gate's own scope rule, fed directly (hartos-f9's mutant M1b):
+        a user_reply receipt for a step naming read_item is refused by
+        _verifier_completion_has_conversation_evidence whatever REUSE's branch
+        choice was; the same receipt for the ask-only step is accepted."""
+        def cite(run, reply):
+            messages = run.gc.messages
+            ask_idx = max(i for i, m in enumerate(messages) if m.get('role') == 'tool')
+            assert run.L.record_ask_delivered(run.key, 1, 'request-1', ask_idx, 0)
+            messages.append({'role': 'user', 'name': 'User',
+                             'content': run.rr._build_reuse_action_message(
+                                 run.key, 1, user_words=reply)})
+            evidence = {'message_index': len(messages) - 1, 'kind': 'user_reply',
+                        'request_id': 'request-2', 'reply': reply, 'flow': 0}
+            return run.L._verifier_completion_has_conversation_evidence(
+                run.key, 1, {'evidence': evidence})
+
+        tool_step = speech(ask_action={'action': 'read_item 1, then confirm the value with the person',
+                                       'action_id': 1, 'can_perform_without_user_input': 'no',
+                                       'recipe': [{'steps': 'read', 'tool_name': 'read_item'}]})
+        tool_step.turn('go', 'request-1')
+        assert cite(tool_step, 'yes, confirmed') is False
+        ask_step = speech()
+        ask_step.turn('hi, I am ready', 'request-1')
+        assert cite(ask_step, 'ba') is True
+
+
+# ─── hartos-f9's review of b9edfd90a: the four shapes it must not change ──────
+
+PROSE_NO = {'action': 'Respond to the user with a short greeting', 'action_id': 1,
+            'can_perform_without_user_input': 'no', 'recipe': []}
+GREETING = 'Hello! Lovely to see you today.'
+PLAN_FLOW = [
+    {'action': "Tell the person today's plan", 'action_id': 1,
+     'can_perform_without_user_input': 'no', 'recipe': []},
+    {'action': 'note the plan in your own words', 'action_id': 2,
+     'can_perform_without_user_input': 'yes', 'recipe': []},
+    {'action': 'close with an encouraging line', 'action_id': 3,
+     'can_perform_without_user_input': 'yes', 'recipe': []},
+]
+PROSE_OUT = {1: GREETING, 2: 'Noted: warm-up, then two sounds.', 3: 'You will do great today.'}
+
+
+def _prose_assistant(state, aid, content):
+    return PROSE_OUT.get(aid)
+
+
+def _completed(state, aid, content):
+    return json.dumps({'status': 'completed', 'action_id': aid})
+
+
+class TestAProseNoStepThatOnlyWritesOutputCompletesAsBefore:
+    """Critical 1: a 'no' step whose words name no tool and whose answer is
+    its output ("Respond to user") must not hold on `completed`, and the next
+    message must not become its answer.  Measured by hartos-f9 on b9edfd90a:
+    2 of 5 turns complete, 0 promoted, the step's result was the person's
+    next question."""
+
+    def test_respond_to_user_completes_and_is_promoted_on_every_genuine_turn(self, speech):
+        from agent_ledger.core import TaskStatus
+        run = speech(actions=[PROSE_NO], assistant_script=_prose_assistant,
+                     verdict_script=_completed)
+        with patch.object(run.L, '_promote_verified_outcome') as promote:
+            for n, words in enumerate(('hello', 'how are you', 'what can you do'), start=1):
+                run.turn(words, f'request-{n}')
+                assert _task(run, 1).status in (TaskStatus.COMPLETED, TaskStatus.TERMINATED), (
+                    f'turn {n}: {_task(run, 1).status} / {_task(run, 1).blocked_reason}')
+                assert _task(run, 1).result == GREETING
+        assert [c.args[1] for c in promote.call_args_list] == [1, 1, 1]
+        assert run.L.ledger_user_answered(run.key, 1, 0) is False
+        assert not _task(run, 1).context.get(run.L.USER_INPUT_EVIDENCE_KEY)
+        assert run.L.ledger_open_ask(run.key, 1, 0) is None
+
+    def test_a_prose_no_first_step_does_not_hold_and_the_next_message_is_not_its_answer(self, speech):
+        from agent_ledger.core import TaskStatus
+        run = speech(actions=PLAN_FLOW, assistant_script=_prose_assistant,
+                     verdict_script=_completed)
+        run.turn('ready', 'request-1')
+        assert run.rr.user_tasks[run.key].current_action == 4
+        assert all(_task(run, a).status != TaskStatus.BLOCKED for a in (1, 2, 3))
+        run.turn('what is the weather like', 'request-2')
+        assert not _task(run, 1).context.get(run.L.USER_INPUT_EVIDENCE_KEY)
+        assert run.L.ledger_user_answered(run.key, 1, 0) is False
+        assert run.L.ledger_open_ask(run.key, 1, 0) is None
+
+    def test_a_written_question_on_a_pending_verdict_still_holds_and_the_reply_closes_it(self, speech):
+        """The one shape where a written answer IS the ask: the verifier says
+        the step waits (pending), the model wrote the question instead of
+        sending it."""
+        from agent_ledger.core import TaskStatus
+        question = 'Which topic would you like today?'
+        ask_prose = {'action': 'Ask the person which topic they want today', 'action_id': 1,
+                     'can_perform_without_user_input': 'no', 'recipe': []}
+
+        def assistant(state, aid, content):
+            return question if state['turn'] == 'ask' else 'Algebra it is; a good choice.'
+
+        def verifier(state, aid, content):
+            status = 'pending' if state['turn'] == 'ask' else 'completed'
+            return json.dumps({'status': status, 'action_id': aid})
+
+        run = speech(actions=[ask_prose], assistant_script=assistant, verdict_script=verifier)
+        reply = run.turn('hi', 'request-1')
+        assert question in reply
+        assert _task(run, 1).status == TaskStatus.BLOCKED
+        assert _task(run, 1).blocked_reason == 'input_required'
+        run.turn('algebra', 'request-2', kind='reply')
+        assert _task(run, 1).status in (TaskStatus.COMPLETED, TaskStatus.TERMINATED)
+        answers = _task(run, 1).context.get(run.L.USER_INPUT_EVIDENCE_KEY) or []
+        assert answers and answers[-1]['answer'] == 'algebra'
+
+
+class TestADaemonTurnWalksTheParentsPaths:
+    """Critical 2: until the owner rules on daemon replay of 'no' steps, a
+    daemon turn takes exactly the parent's paths: the send receipt completes
+    the step, it is promoted, no ask is recorded, nothing is held."""
+
+    def test_a_daemon_tick_on_the_ask_step_finishes_the_flow_as_before(self, speech):
+        from agent_ledger.core import TaskStatus
+        run = speech(ask_verdict='completed')
+        with patch.object(run.L, '_promote_verified_outcome') as promote:
+            run.turn('tick', 'daemon_goal_turn')
+        assert run.state['sends'] == [ASK_LINE]
+        assert run.rr.user_tasks[run.key].current_action == 4
+        assert 1 in [c.args[1] for c in promote.call_args_list]
+        assert all(_task(run, a).status != TaskStatus.BLOCKED for a in (1, 2, 3))
+        assert run.L.ledger_open_ask(run.key, 1, 0) is None
+
+    def test_a_daemon_tick_with_a_pending_verdict_records_no_ask_and_holds_nothing(self, speech):
+        from agent_ledger.core import TaskStatus
+        run = speech(ask_verdict='pending')
+        run.turn('tick', 'daemon_goal_turn')
+        assert _task(run, 1).status != TaskStatus.BLOCKED
+        assert run.L.ledger_open_ask(run.key, 1, 0) is None
+
+
+class TestAQuestionWrittenInThePromptedFormatIsRecorded:
+    """High 3: `@user {"message2userfinal": ...}` ends the round and the loop
+    returns before any hold.  For a step whose words name send_message_to_user
+    that written question is the ask; for a prose 'no' step naming no tool it
+    is the step's output (hartos-f9's fix to the design)."""
+
+    def test_an_ask_step_that_writes_its_question_holds_and_the_reply_closes_it(self, speech):
+        from agent_ledger.core import TaskStatus
+
+        def assistant(state, aid, content):
+            if aid == 1 and state['turn'] == 'ask':
+                return '@user ' + json.dumps({'message2userfinal': ASK_LINE})
+            return None
+
+        run = speech(assistant_script=assistant)
+        reply = run.turn('hi, I am ready', 'request-1')
+        assert ASK_LINE in reply
+        assert run.state['sends'] == []
+        assert _task(run, 1).status == TaskStatus.BLOCKED
+        assert _task(run, 1).blocked_reason == 'input_required'
+        assert run.L.ledger_open_ask(run.key, 1, 0) is not None
+        ask_turn_steers = list(run.state['steers'])
+        run.turn('ba', 'request-2', kind='reply')
+        assert run.rr.user_tasks[run.key].current_action == 4
+        assert run.L.ledger_user_answered(run.key, 1, 0) is True
+        seed = next(s for s in run.state['steers'][len(ask_turn_steers):]
+                    if s.startswith(f'{run.rr._REUSE_ACTION_MESSAGE_PREFIX}1:'))
+        assert run.rr._REUSE_REPLY_PREFACE in seed
+
+    def test_a_prose_no_step_ending_on_message2userfinal_is_not_an_ask(self, speech):
+        from agent_ledger.core import TaskStatus
+
+        def assistant(state, aid, content):
+            return '@user ' + json.dumps({'message2userfinal': GREETING})
+
+        run = speech(actions=[PROSE_NO], assistant_script=assistant)
+        reply = run.turn('hello', 'request-1')
+        assert GREETING in reply
+        assert _task(run, 1).status != TaskStatus.BLOCKED
+        assert run.L.ledger_open_ask(run.key, 1, 0) is None
+        run.turn('what is the weather like', 'request-2')
+        assert not _task(run, 1).context.get(run.L.USER_INPUT_EVIDENCE_KEY)
+        assert run.L.ledger_user_answered(run.key, 1, 0) is False
+
+
+class TestAHeldStepResumesFirstAndIsNeverRedispatchedInTheBackground:
+    """High 4: the warm start used to start the step before looking at the
+    hold, so the resume never ran and every tick asked again."""
+
+    def test_the_reply_turn_resumes_the_held_step_through_the_one_edge(self, speech):
+        run = speech(ask_verdict='pending')
+        run.turn('hi, I am ready', 'request-1')
+        with patch.object(run.rr, 'resume_from_user_input',
+                          wraps=run.rr.resume_from_user_input) as resume:
+            run.turn('ba', 'request-2', kind='reply')
+        assert resume.call_count == 1, resume.call_args_list
+        assert resume.call_args.args[:2] == (run.key, 1)
+        assert run.rr.user_tasks[run.key].current_action == 4
+
+    @pytest.mark.parametrize('request_id', ['daemon_goal_turn', ''])
+    def test_a_background_turn_on_a_held_step_neither_dispatches_nor_asks_again(self, speech, request_id):
+        from agent_ledger.core import TaskStatus
+        from core.agent_tools import is_waiting_for_person
+        run = speech(ask_verdict='pending')
+        run.turn('hi, I am ready', 'request-1')
+        dispatched, sends = list(run.state['dispatched']), list(run.state['sends'])
+        reply = run.turn('tick', request_id, kind='reply')
+        assert is_waiting_for_person(reply), reply
+        assert run.state['dispatched'] == dispatched, 'the step was dispatched again'
+        assert run.state['sends'] == sends, 'the person heard the question again'
+        assert _task(run, 1).status == TaskStatus.BLOCKED
+        assert run.rr.user_tasks[run.key].current_action == 1
+
+    def test_the_waiting_reply_is_neither_work_nor_a_strike_for_a_dispatcher(self, monkeypatch):
+        """The daemon: a transient deferral, no backoff, no auto-pause.  The
+        hive worker: held, not recorded, not released."""
+        from core import agent_tools
+        from integrations.agent_engine import agent_daemon, dispatch
+        from integrations.distributed_agent.worker_loop import (
+            DistributedWorkerLoop, HeldForHelp)
+        reply = agent_tools.waiting_for_person_reply(2)
+        assert agent_tools.is_waiting_for_person(reply)
+        assert not agent_tools.is_help_pause(reply) and not agent_tools.is_user_pause(reply)
+        assert dispatch._failed_turn('g-wait', reply) is True
+        assert dispatch.is_transient_deferral('g-wait') is True
+        assert agent_daemon._reply_failure(reply) is None
+
+        class _Task:
+            task_id, parent_task_id, description = 'g_task_0', 'g', 'say ball'
+            context = {'hop': 0, 'user_id': '42', 'prompt': 'say ball'}
+
+        monkeypatch.setattr(DistributedWorkerLoop, '_dispatch_would_defer',
+                            staticmethod(lambda: None))
+        loop = DistributedWorkerLoop()
+        with patch('security.hive_guardrails.GuardrailEnforcer.before_dispatch',
+                   return_value=(True, '', 'say ball')), \
+             patch('integrations.agent_engine.dispatch.local_chat_dispatch',
+                   return_value=('ok', reply)), \
+             patch('integrations.agent_engine.dispatch.prompt_id_for_goal', return_value='p'):
+            got = loop._execute_task(_Task())
+        assert isinstance(got, HeldForHelp), got
+
+
+class TestTheOpenAskReaderReturnsTheOldest:
+    def test_two_open_entries_read_oldest_first(self, speech):
+        """ledger_open_ask's contract (hartos-f9's change 2): the OLDEST open
+        ask is the one a reply answers.  record_ask_delivered opens no second
+        ask while one is open, so the reader is fed two entries directly."""
+        run = speech()
+        run.turn('hi, I am ready', 'request-1')
+        task = _task(run, 1)
+        entries = list(task.context.get(run.L.ASK_DELIVERED_KEY) or [])
+        assert len(entries) == 1 and entries[0]['request_id'] == 'request-1'
+        newer = dict(entries[0], request_id='request-9', message_index=entries[0]['message_index'] + 1)
+        assert run.ledger.update_task_context(task.task_id, {run.L.ASK_DELIVERED_KEY: entries + [newer]})
+        assert run.L.ledger_open_ask(run.key, 1, 0)['request_id'] == 'request-1'
+
+
+class TestAReplyJudgedInsufficientKeepsTheOneAsk:
+    def test_the_second_ask_is_not_a_new_entry_and_the_next_reply_closes_it(self, speech):
+        """hartos-f9's surviving mutant: oldest-vs-latest open ask.  Turn 2's
+        reply is judged insufficient and the model asks again (a tool send);
+        the ask entry stays the one from turn 1, and turn 3's reply closes it."""
+        from agent_ledger.core import TaskStatus
+        again = 'Say it once more, Arjun?'
+
+        def assistant(state, aid, content):
+            if aid != 1:
+                return None
+            if state['turn'] == 'ask' and not state['sends']:
+                return None                      # the speech script sends ASK_LINE
+            if state['turn'] == 'again':
+                return {'content': '', 'tool_calls': [{
+                    'id': 'ask_again', 'type': 'function',
+                    'function': {'name': 'send_message_to_user',
+                                 'arguments': json.dumps({'message': again})}}]}
+            return None
+
+        def verifier(state, aid, content):
+            if aid == 1 and state['turn'] in ('ask', 'again'):
+                return json.dumps({'status': 'pending', 'action_id': 1,
+                                   'can_perform_without_user_input': 'no'})
+            return None
+
+        run = speech(assistant_script=assistant, verdict_script=verifier)
+        run.turn('hi, I am ready', 'request-1')
+        run.turn('ba', 'request-2', kind='again')
+        assert _task(run, 1).status == TaskStatus.BLOCKED
+        asks = _task(run, 1).context.get(run.L.ASK_DELIVERED_KEY) or []
+        assert len(asks) == 1 and asks[0]['request_id'] == 'request-1'
+        run.turn('ball', 'request-3', kind='reply')
+        assert run.rr.user_tasks[run.key].current_action == 4
+        assert run.state['sends'] == [ASK_LINE, again]
+        asks = _task(run, 1).context.get(run.L.ASK_DELIVERED_KEY) or []
+        assert len(asks) == 1 and asks[0]['answered'] is True
+        answers = _task(run, 1).context.get(run.L.USER_INPUT_EVIDENCE_KEY) or []
+        assert answers[-1]['answer'] == 'ball'

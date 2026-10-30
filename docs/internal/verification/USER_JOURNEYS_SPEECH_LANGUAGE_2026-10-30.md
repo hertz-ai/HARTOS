@@ -149,10 +149,10 @@ per owner flow; flow 5's agent is build 2.
   camera tool `get_user_camera_inp`, forbidden by every description, was called once each
   by build 6 (18:50:20), the flow 1 duplicate (20:12:48) and the flow 3 text-only agent
   (20:38:17) (review).
-- Replies that WERE taken were refused (section 0, row 2, which holds the counts): the
-  ledger's integrity check rejected completion claims 29 times by 20:41:43 on five agents
-  after the verifier had passed the step; the loop then asked the same question again.
-  Cause found: #159, section 0.
+- Replies that WERE taken were refused: the ledger's integrity check rejected completion
+  claims after the verifier had passed the step, and the loop then asked the same question
+  again. Section 0 row 2 holds the counts and the one exception (the Singing Agent's
+  rejection refused the driver's proceed line, not a reply). Cause found: #159, section 0.
 - Known limit, hartos-f9's decision pending the owner (G4 of its review of 94354c536): a
   second distinct question inside ONE action closes unanswered on a `completed` + `no`.
   Re-read against the seven created agents' recipes: no ask step asks two distinct
@@ -204,8 +204,10 @@ about your preferred topic and detail level. I'm waiting for your response", aft
 person had been told at 22:28:13 "I've successfully retrieved your learner profile data
 (Action #1 completed)" with that tool never run. The installed reuse module is HARTOS
 19836e605 (hot-swapped into the install on 27 Oct 01:03), and its three walk regions
-match main. Filed as #161; the fix landed locally as HARTOS b9edfd90a the next morning
-(an ask step waits for the person and closes on their reply), with the order agreed with
+match main. Filed as #161; a fix landed locally as HARTOS b9edfd90a later that night
+(23:22 IST, 54 minutes after turn 2: an ask step waits for the person and closes on their
+reply), reworked after review in the commit that carries this text and not live proven,
+with the order agreed with
 hartos-f9: that fix, then the stamp, then the seven agents rebuilt, then one live walk
 gates all of it.
 

@@ -852,6 +852,8 @@ _PAUSED_FOR_THE_PERSON = (f'{_DEFERRED_PREFIX} paused between steps; a person '
 #: "the expert model did not finish it" by a turn the expert never ran.
 _HELD_FOR_ANOTHER_TURN = (f'{_DEFERRED_PREFIX} another turn of this '
                           f'conversation is running on a different model')
+_WAITING_FOR_THE_PERSON = (f'{_DEFERRED_PREFIX} the current step waits for the '
+                           f"person's reply to its question")
 
 
 def _failure_key(goal_id) -> tuple:
@@ -873,11 +875,16 @@ def _turn_failure(reply) -> Optional[str]:
     ('turn failed: ...').  core.agent_tools holds the one recogniser of
     each; worker_loop._after_response uses them the same way."""
     from core.agent_tools import (is_held_for_another_turn,
-                                  is_user_facing_error, is_user_pause)
+                                  is_user_facing_error, is_user_pause,
+                                  is_waiting_for_person)
     if is_user_pause(reply):
         return _PAUSED_FOR_THE_PERSON
     if is_held_for_another_turn(reply):
         return _HELD_FOR_ANOTHER_TURN
+    # The session's REUSE step waits for the person's reply (#161): the turn
+    # did not run it.  Held like the two above: no strike, no completion.
+    if is_waiting_for_person(reply):
+        return _WAITING_FOR_THE_PERSON
     if not is_user_facing_error(reply):
         return None
     return f'turn failed: {reply.strip()[:160]}'
