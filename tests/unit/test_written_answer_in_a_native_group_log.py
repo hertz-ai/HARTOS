@@ -584,6 +584,49 @@ class TestReuseCompletesWhenTheVerdictMisnumbersTheAction(
                          S.STATUS_VERIFICATION_REQUESTED)
         self.assertEqual(rr.user_tasks[self.UP].current_action, 1)
 
+    def test_the_walk_asks_the_verifier_again_instead_of_ending(self):
+        """LIVE 2026-10-31 14:00:59, installed desktop, agent 54 (three
+        actions) for 10202 (fix-all's R11 proof, msg_1793435428262_r11prf):
+        "Refusing completion of action 1 in 10202_54: the verdict names
+        action 2", then "[REUSE] Cannot advance action 1 ... aborting
+        advance", and the person got a recap of stored progress instead of
+        the next step.  The refusal stands (a verdict about another action
+        completes nothing); what must not happen is the walk ending on it.
+        The verifier is asked to judge the posted action under its own
+        number, through the same pending-refusal record and budget as every
+        other refusal re-steer."""
+        self.ledger = _Ledger(_ACTION, actions=2)
+        self.assertEqual(self._advance(2), (None, False))
+        steer = rr._reuse_fab_steer_message(self.UP, 1)
+        self.assertIsNotNone(steer, 'the walk ended on a misnumbered verdict')
+        self.assertIn('@StatusVerifier', steer)
+        self.assertIn('Action 1' + rr._REUSE_NOT_COMPLETE_MARKER, steer)
+        self.assertIn('action 2', steer)
+        self.assertTrue(rr._reuse_is_pipeline_text(steer),
+                        'the re-ask must never be shown as an answer')
+        self.assertEqual(lh.get_action_state(self.UP, 1),
+                         S.STATUS_VERIFICATION_REQUESTED)
+
+    def test_the_re_ask_is_bounded(self):
+        self.ledger = _Ledger(_ACTION, actions=2)
+        for _ in range(rr._REUSE_FAB_STEER_MAX):
+            self._advance(2)
+            self.assertIsNotNone(rr._reuse_fab_steer_message(self.UP, 1))
+        self._advance(2)
+        self.assertIsNone(rr._reuse_fab_steer_message(self.UP, 1),
+                          'a verifier that keeps naming another action '
+                          'must not be re-asked forever')
+        self.assertEqual(lh.get_action_state(self.UP, 1),
+                         S.STATUS_VERIFICATION_REQUESTED)
+
+    def test_a_verdict_naming_the_posted_action_after_the_re_ask_completes_it(
+            self):
+        self.ledger = _Ledger(_ACTION, actions=2)
+        self._advance(2)
+        rr._reuse_fab_steer_message(self.UP, 1)
+        self._advance(1)
+        self.assertEqual(lh.get_action_state(self.UP, 1), S.TERMINATED)
+
 
 class TestTheMentionListIsOneList(unittest.TestCase):
     """"Is this message addressed to an agent" has one answer.  REUSE's loop

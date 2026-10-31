@@ -393,7 +393,7 @@ from hartos.lifecycle_hooks import (
     sync_action_state_to_ledger, register_ledger_for_session,
     ActionState, safe_set_state, force_state_through_valid_path, get_action_state,
     clear_action_states, settled_action_id, commit_verified_action_completion,
-    dispatch_action_id, ACTION_STATES_AWAITING_USER, autonomy_needs_user,
+    verdict_names_another_action, dispatch_action_id, ACTION_STATES_AWAITING_USER, autonomy_needs_user,
     action_is_autonomous, action_named_tools, action_own_text,
     is_written_answer, ANSWER_KEYS,
     mark_action_waiting_for_user, resume_from_user_input,
@@ -4076,6 +4076,13 @@ def _reuse_is_pipeline_text(content):
 # that record.  Internal only — _reuse_fab_steer_message never shows it.
 _REUSE_NO_OUTPUT_SENTINEL = '<no output produced>'
 
+# Recorded in _reuse_fab_pending, followed by the id the verdict named, when
+# the verdict for the posted action named ANOTHER action of the flow.  The
+# completion gate refuses that verdict (a verdict completes only the action
+# it names); this record lets the walk ask the verifier again instead of
+# ending the turn on the refusal.  Internal only, like the sentinel above.
+_REUSE_OTHER_ACTION_SENTINEL = '<verdict names another action>'
+
 
 def _reuse_action_at(user_prompt, action_id):
     """The banked action this id names, or ``{}``.
@@ -4432,6 +4439,20 @@ def _reuse_fab_steer_message(user_prompt, current_action_id):
     tools = _reuse_fab_pending.pop((user_prompt, current_action_id), None)
     if not tools:
         return None
+    if list(tools)[:1] == [_REUSE_OTHER_ACTION_SENTINEL]:
+        # The verdict named another action of the flow, so the gate refused
+        # it.  Nothing is wrong with the action's work as far as anyone
+        # knows; the verifier must judge THIS action under its own number.
+        named = list(tools)[1] if len(tools) > 1 else '?'
+        return (
+            f"Action {current_action_id}{_REUSE_NOT_COMPLETE_MARKER}the "
+            f"verdict named action {named}, but the action being verified is "
+            f"action {current_action_id}. @StatusVerifier judge action "
+            f"{current_action_id} only: if its result is in this "
+            f"conversation, give its verdict with \"action_id\": "
+            f"{current_action_id}; if it is not done, say what is missing. "
+            f"Do not report on action {named} now."
+        )
     if list(tools) == [_REUSE_NO_OUTPUT_SENTINEL]:
         # The refusal was recorded by the text half of the gate: this action
         # names no tool, so "@Helper call <names>" would name nothing and
@@ -7219,6 +7240,28 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
                 user_prompt, current_action_id,
                 ActionState.STATUS_VERIFICATION_REQUESTED,
                 f"{reason}: verifier returned terminal verdict"):
+            return None, False
+    # A verdict naming ANOTHER action of the flow completes nothing (the gate
+    # below refuses it).  The refusal used to end the walk: LIVE 2026-10-31
+    # 14:00:59, agent 54 (three actions) for 10202, "Refusing completion of
+    # action 1 ... the verdict names action 2", "Cannot advance action 1 ...
+    # aborting advance", and the person got a recap instead of the next step.
+    # Ask the verifier again, on the same budget and pending record as every
+    # other refusal re-steer; once the budget is spent the gate refuses as
+    # before and the turn ends.
+    _named = verdict_names_another_action(
+        user_prompt, current_action_id, claimed_action_id)
+    if _named is not None:
+        _rk = (user_prompt, current_action_id)
+        _n = _reuse_resteer_counts.get(_rk, 0)
+        if _n < _REUSE_FAB_STEER_MAX:
+            _reuse_resteer_counts[_rk] = _n + 1
+            _reuse_fab_pending[_rk] = [_REUSE_OTHER_ACTION_SENTINEL, _named]
+            current_app.logger.warning(
+                f"[REUSE-VERIFY] the verdict for action {current_action_id} "
+                f"names action {_named}; asking the verifier to judge action "
+                f"{current_action_id} again (attempt {_n + 1}/"
+                f"{_REUSE_FAB_STEER_MAX})")
             return None, False
     ok1 = commit_verified_action_completion(
         user_prompt, current_action_id, evidence,

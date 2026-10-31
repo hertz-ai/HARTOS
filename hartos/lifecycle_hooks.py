@@ -2659,6 +2659,31 @@ def _flow_has_action(user_prompt: str, action_id: int) -> bool:
         getattr(get_registered_ledger(user_prompt), 'tasks', None) or {})
 
 
+def verdict_names_another_action(user_prompt: str, action_id,
+                                 claimed_action_id):
+    """The other action of this flow a verdict names, or None.
+
+    A verdict completes only the action it names (the rule and its live
+    cases are on commit_verified_action_completion, which asks this).  None
+    when the verdict names no id, names the posted action, names an id the
+    flow does not have, or names something no int can hold ('inf',
+    '1e999', 'nan': a number the verifier cannot have meant as an action).
+    One answer for both readers: the gate that refuses the completion and
+    reuse's walk, which asks the verifier again instead of ending the turn
+    on the refusal.
+    """
+    if claimed_action_id is None:
+        return None
+    try:
+        claimed = int(float(claimed_action_id))
+        posted = int(action_id)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if claimed != posted and _flow_has_action(user_prompt, claimed):
+        return claimed
+    return None
+
+
 def commit_verified_action_completion(user_prompt: str, action_id: int,
                                       evidence: dict,
                                       reason: str = 'verified complete',
@@ -2686,17 +2711,13 @@ def commit_verified_action_completion(user_prompt: str, action_id: int,
     verdict that names no action_id, or one the flow does not have, is not
     contradicting anything.
     """
-    if claimed_action_id is not None:
-        try:
-            _claimed = int(float(claimed_action_id))
-        except (TypeError, ValueError):
-            _claimed = None
-        if (_claimed is not None and _claimed != int(action_id)
-                and _flow_has_action(user_prompt, _claimed)):
-            logger.warning(
-                "Refusing completion of action %s in %s: the verdict names "
-                "action %s", action_id, user_prompt, _claimed)
-            return False
+    _other = verdict_names_another_action(user_prompt, action_id,
+                                          claimed_action_id)
+    if _other is not None:
+        logger.warning(
+            "Refusing completion of action %s in %s: the verdict names "
+            "action %s", action_id, user_prompt, _other)
+        return False
     if get_action_state(user_prompt, action_id) != \
             ActionState.STATUS_VERIFICATION_REQUESTED:
         logger.warning(

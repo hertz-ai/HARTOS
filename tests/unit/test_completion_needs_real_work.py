@@ -243,6 +243,15 @@ class TestAVerdictNamingNoActionOfTheFlowIsNotContradicting(_Harness):
                 self._flow(1)
                 self.assertTrue(self._commit(claimed))
 
+    def test_a_number_no_int_can_hold_is_no_id(self):
+        """'inf' and '1e999' parse as floats that int() cannot take: they
+        raised OverflowError out of the completion gate instead of being
+        read as no id at all (task #168)."""
+        for claimed in ('inf', '1e999', float('inf'), 'nan'):
+            with self.subTest(claimed=claimed):
+                self._flow(2)
+                self.assertTrue(self._commit(claimed))
+
     def test_a_flow_that_has_the_named_action_still_refuses_it(self):
         self._flow(2)
         self.assertFalse(self._commit(2))
