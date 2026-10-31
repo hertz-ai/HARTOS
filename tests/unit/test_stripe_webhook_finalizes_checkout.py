@@ -16,7 +16,6 @@ Real blueprint, real PaymentLedger and StripePaymentGateway, a real
 api_keys table (tests/unit/commercial_db); the Stripe SDK handle (the wire
 to Stripe) is stubbed.
 """
-import contextlib
 import logging
 import sys
 import threading
@@ -25,7 +24,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from flask import Flask
-from sqlalchemy import event
 
 import integrations.ap2 as ap2_pkg
 from integrations.ap2.ap2_protocol import (
@@ -473,30 +471,6 @@ class TestTheBrowserRouteSharesTheFinalizer:
         assert ctx['ledger'].payments == {} and ctx['db'].key() == FREE
 
 
-@contextlib.contextmanager
-def _database_gone_after_the_failed_bump(db):
-    """The bump's commit fails and the database stays unreachable from then
-    on (a lost connection, not a locked file): every statement after the
-    failed commit raises.  The rollback the bump runs is not a statement."""
-    gone = {'now': False}
-
-    def fail_the_commit(session):
-        gone['now'] = True
-        raise RuntimeError('database connection lost')
-
-    def refuse_every_statement(conn, cursor, statement, params, context, executemany):
-        if gone['now']:
-            raise RuntimeError('database unreachable')
-
-    event.listen(db.Session, 'before_commit', fail_the_commit)
-    event.listen(db.engine, 'before_cursor_execute', refuse_every_statement)
-    try:
-        yield
-    finally:
-        event.remove(db.Session, 'before_commit', fail_the_commit)
-        event.remove(db.engine, 'before_cursor_execute', refuse_every_statement)
-
-
 class TestAFailedBumpIsNamedWithTheDatabaseGone:
     """A failed bump rolls the session back, which expires the key row; the
     finish read api_key.id after that, so with the database gone the read
@@ -518,7 +492,7 @@ class TestAFailedBumpIsNamedWithTheDatabaseGone:
 
     def test_the_webhook_names_it(self, ctx):
         log = logging.getLogger('hevolve_social')
-        with _database_gone_after_the_failed_bump(ctx['db']), \
+        with ctx['db'].gone_after_next_commit(), \
                 patch.object(log, 'error') as said:
             r = _deliver(ctx, _event(_session()))
         self._assert_named(r, said)
@@ -529,7 +503,7 @@ class TestAFailedBumpIsNamedWithTheDatabaseGone:
     def test_the_buyers_first_visit_names_it(self, ctx):
         ctx['stripe'].checkout.Session.retrieve.return_value = _session()
         log = logging.getLogger('hevolve_social')
-        with _database_gone_after_the_failed_bump(ctx['db']), \
+        with ctx['db'].gone_after_next_commit(), \
                 patch.object(log, 'error') as said:
             r = _complete(ctx)
         self._assert_named(r, said)
@@ -541,7 +515,7 @@ class TestAFailedBumpIsNamedWithTheDatabaseGone:
         ctx['db'].fail_next_commit()
         assert _deliver(ctx, _event(_session())).status_code == 500   # recorded, unbumped
         log = logging.getLogger('hevolve_social')
-        with _database_gone_after_the_failed_bump(ctx['db']), \
+        with ctx['db'].gone_after_next_commit(), \
                 patch.object(log, 'error') as said:
             r = _complete(ctx)
         self._assert_named(r, said)

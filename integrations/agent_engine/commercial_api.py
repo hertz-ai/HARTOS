@@ -1151,13 +1151,19 @@ def upgrade_key(key_id):
                 'error': f'Payment error: {pay_err}',
             }), 502
 
-        # Payment succeeded — the bought tier, through the one writer.
+        # Payment succeeded — the bought tier, through the one writer.  The
+        # key's id is read before the bump, as _finish_recorded_checkout
+        # does: a failed bump rolls the session back, which expires the row,
+        # and with the database gone a read of api_key.id after it raised
+        # inside the report, so a charged card got Flask's HTML 500 and no
+        # reconciliation line (task #211).
+        api_key_id = api_key.id
         _changed, failure = _apply_bought_tier(db, api_key, target_tier)
         if failure is not None:
             # No retry follows on this rail: a re-POST of /upgrade would
             # charge the card again, so the line asks for a person now.
             payload, status = _bump_failed(
-                f'payment {payment_req.payment_id}', api_key.id, failure,
+                f'payment {payment_req.payment_id}', api_key_id, failure,
                 retry='no retry follows: a re-POST of /upgrade would charge the card '
                       'again; apply the bought tier by hand',
                 retries=False, payment_request_id=payment_req.payment_id)
@@ -2034,7 +2040,10 @@ def _bump_failed(what_paid: str, api_key_id, failure: str, *, retry: str,
     it" on every rail (the review of 7c8431c2e, which measured the sync
     route and PhonePe's return page against it).  ``exc_info`` is the
     exception the caller caught, when it caught one, so the traceback rides
-    on this line and not on a second ERROR record."""
+    on this line and not on a second ERROR record.  ``api_key_id`` is a plain
+    value the caller read BEFORE the bump: the failed bump's rollback expires
+    the key row, so an ORM attribute read here can raise with the database
+    gone (task #211)."""
     logger.error(f"MANUAL RECONCILIATION NEEDED{' if this repeats' if retries else ''}: "
                  f"{what_paid} paid but the tier bump failed for api_key {api_key_id}: "
                  f"{failure}; {retry}", exc_info=exc_info)
