@@ -2229,7 +2229,8 @@ def tool_result_is_action_work(user_prompt: str, action_id: int,
     Assistant, as every action did before.
 
     False for an action that names no tool: it is done by its written
-    answer, and a tool reply in its window is not its receipt
+    answer, or by the send that delivered it (user_output_receipt), which the
+    verdict path finds; no tool reply in its window is its receipt here
     (derive_completion_evidence splits the same way).  Never raises: it sits
     on the speaker-selection path."""
     try:
@@ -2421,8 +2422,100 @@ def _derive_written_answer(user_prompt: str, action_id: int,
     return best
 
 
-def derive_completion_evidence(user_prompt: str,
-                               action_id: int) -> Optional[dict]:
+def user_output_receipt(user_prompt: str, action_id: int, group_chat,
+                        seen=(), waits_on_person=False) -> Optional[dict]:
+    """The send that delivered a no-tool action's output to the person, as
+    evidence, or None.  The one rule both projectors read after their
+    written-answer miss (derive_completion_evidence for CREATE,
+    reuse_recipe._reuse_completion_evidence for REUSE).
+
+    None for an action that waits on the person (``waits_on_person``: the
+    verdict's can_perform_without_user_input in CREATE, the recipe's flag in
+    REUSE, both read by autonomy_needs_user): its send is its question, and a
+    question is not the step done.  Each path supplies the fact from where it
+    holds it, so a banked step is not "done by its send" in CREATE and an ask
+    in REUSE.
+
+    A no-tool action is done by its written answer, or by the
+    send_message_to_user call that put that answer in front of the person,
+    and by no other tool's result.  Live 2026-10-31 17:13 IST, desktop
+    4B, agent 45620673143 action 3 ("Confirm user's topic focus and preferred
+    detail level before proceeding with guided discovery."): the Assistant's
+    output was one send, answered "Message sent successfully ...", inside
+    the action's window; no written answer existed, so the action GAVE_UP and
+    action 4 was never reached.  A search or a note saved to memory still
+    does not complete "write X" (owner ruling 2026-09-14: never record a
+    completion that did not happen).
+
+    Newest first, in the group log and then each participant's buffer
+    (evidence_sources): a result of send_message_to_user (resolved on its
+    proposal, tool_call_names) that is not failed, not the placeholder, and
+    whose call id is not in ``seen`` (REUSE's watermark of the calls present
+    at the dispatch).  Those are read per result, because an aggregate
+    message the gate accepts for any one result may carry a failed send
+    beside another tool's reply.  The candidate then faces the completion
+    gate, which holds it to the action's own dispatch window in its own list,
+    as every derived receipt does; a list's search ends at its first result
+    outside that window (the gate's latest_dispatch_before).  The gate also
+    refuses a send for an action that names a tool (_receipt_is_real_work),
+    whose receipt is that tool's work; both callers reach this only for an
+    action that names none.  Never raises: it sits on the verdict path.
+    """
+    try:
+        if waits_on_person:
+            return None
+        seen = set(seen or ())
+        for source, msgs in evidence_sources(
+                group_chat, getattr(group_chat, 'agents', None)):
+            if not isinstance(msgs, list):
+                continue
+            names = tool_call_names([msgs])
+            for index in range(len(msgs) - 1, -1, -1):
+                msg = msgs[index]
+                if not isinstance(msg, dict) or msg.get('role') != 'tool':
+                    continue
+                # Newest first, the action's window is the list's tail: the
+                # first result outside it ends this list's search, so a long
+                # session is not one gate call per older send (hartos-00).
+                if latest_dispatch_before(msgs, index + 1) != action_id:
+                    break
+                responses = msg.get('tool_responses')
+                for result in (responses if isinstance(responses, list)
+                               and responses else [msg]):
+                    if not isinstance(result, dict):
+                        continue
+                    call_id = result.get('tool_call_id') or msg.get('tool_call_id')
+                    body = str(result.get('content') or msg.get('content') or '')
+                    if (names.get(call_id) != 'send_message_to_user'
+                            or call_id in seen or not body.strip()
+                            or tool_reply_failed(body)
+                            or HISTORICAL_TOOL_PLACEHOLDER in body):
+                        continue
+                    candidate = {**(source or {}), 'message_index': index,
+                                 'kind': 'tool_receipt'}
+                    if _verifier_completion_has_conversation_evidence(
+                            user_prompt, action_id, {'evidence': candidate}):
+                        logger.info(
+                            "[COMPLETION-RECEIPT] action %s in %s: no written "
+                            "answer; the send that delivered its output (call "
+                            "%s, %s message %s) stands in", action_id,
+                            user_prompt, call_id,
+                            'group log' if source is None else
+                            f"{source['agent']}->{source['peer']} buffer",
+                            index)
+                        return candidate
+        logger.warning(
+            "[COMPLETION-RECEIPT] action %s in %s: no written answer and no "
+            "send of its output in its window", action_id, user_prompt)
+    except Exception:
+        logger.warning(
+            "[COMPLETION-RECEIPT] action %s in %s: the send search failed",
+            action_id, user_prompt, exc_info=True)
+    return None
+
+
+def derive_completion_evidence(user_prompt: str, action_id: int,
+                               waits_on_person=False) -> Optional[dict]:
     """The action's own tool receipt, found by the pipeline.
 
     A completion has to cite a result from this action's dispatch window
@@ -2442,11 +2535,15 @@ def derive_completion_evidence(user_prompt: str,
     no receipt here either.  Returns the evidence in the shape resolve_receipt
     reads, or None.
 
-    An action that names no tool is done by its WRITTEN ANSWER, not by a tool
-    reply (_derive_written_answer): measured live on the same 4B 2026-10-06
-    01:11, agent 54 as one prose action ("Teach exactly one next step ...
-    Write the lesson as your reply to the learner") -- the Assistant wrote a
-    good lesson and the verdict that cited the dispatch instead was refused.
+    An action that names no tool is done by its WRITTEN ANSWER
+    (_derive_written_answer), or else by the send that delivered its output
+    to the person (user_output_receipt; not when the verdict says the action
+    waits on the person, ``waits_on_person``, since that send is its
+    question), and by no other tool reply: measured
+    live on the same 4B 2026-10-06 01:11, agent 54 as one prose action
+    ("Teach exactly one next step ... Write the lesson as your reply to the
+    learner") -- the Assistant wrote a good lesson and the verdict that cited
+    the dispatch instead was refused.
 
     It never raises -- it sits on the verdict path -- and a miss says what
     was looked at.
@@ -2456,10 +2553,13 @@ def derive_completion_evidence(user_prompt: str,
         if group_chat is None:
             return None
         # REUSE splits the same way: a tool receipt for an action that names a
-        # tool, the written answer for one that does not.  A tool reply in a
-        # prose action's window is not its receipt.
+        # tool, the written answer (or the send that delivered it) for one
+        # that does not.  No other tool reply in a prose action's window is
+        # its receipt.
         if not _tools_this_action_names(user_prompt, action_id)[1]:
-            return _derive_written_answer(user_prompt, action_id, group_chat)
+            return (_derive_written_answer(user_prompt, action_id, group_chat)
+                    or user_output_receipt(user_prompt, action_id, group_chat,
+                                           waits_on_person=waits_on_person))
         looked = []
         for source, msgs in evidence_sources(
                 group_chat, getattr(group_chat, 'agents', None)):
@@ -2847,7 +2947,9 @@ def lifecycle_hook_process_verifier_response(user_prompt: str, json_obj: dict, u
         if not _verifier_completion_has_conversation_evidence(
                 user_prompt, current_action_id, json_obj):
             evidence = derive_completion_evidence(
-                user_prompt, current_action_id) or evidence
+                user_prompt, current_action_id,
+                waits_on_person=autonomy_needs_user(
+                    json_obj.get('can_perform_without_user_input'))) or evidence
         if not commit_verified_action_completion(
                 user_prompt, current_action_id, evidence,
                 "hook tracking lifecycle_hook_process_verifier_response",

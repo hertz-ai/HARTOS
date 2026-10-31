@@ -395,7 +395,7 @@ from hartos.lifecycle_hooks import (
     clear_action_states, settled_action_id, commit_verified_action_completion,
     verdict_names_another_action, dispatch_action_id, ACTION_STATES_AWAITING_USER, autonomy_needs_user,
     action_is_autonomous, action_named_tools, action_own_text,
-    is_written_answer, ANSWER_KEYS,
+    is_written_answer, ANSWER_KEYS, user_output_receipt,
     mark_action_waiting_for_user, resume_from_user_input,
     record_ask_delivered, ledger_open_ask, person_waits_on, is_terminal_state,
 )
@@ -4897,6 +4897,12 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
     reads it back from that list.  Measured 2026-09-24 on nightly 8a11925: this
     helper read the group log only, the gate credited results that lived only
     in a buffer, and 362 actions ended GAVE_UP with 0 committed.
+
+    A step whose words name no tool is done by its written answer, or else by
+    the send that delivered its output to the person
+    (lifecycle_hooks.user_output_receipt, the rule CREATE's
+    derive_completion_evidence reads too), and by no other tool's result.  A
+    step flagged 'no' is not done by its send: that send is its ask.
     """
     try:
         messages = getattr(group_chat, 'messages', None)
@@ -4987,29 +4993,46 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
                 + f" for session: {user_prompt}"))
             return None
 
-        if dispatch_index is None:
-            return None
-        answer = _reuse_written_answer(group_chat)
-        if not isinstance(answer, dict):
-            return None
-        for idx in range(len(messages) - 1, dispatch_index, -1):
-            if messages[idx] is answer or messages[idx] == answer:
-                # The Assistant's, in whichever role this log holds it: a
-                # native autogen log reads a plain reply as role 'user', a
-                # resynced one as 'assistant'.  Measured live 2026-10-06 01:26
-                # (agent 54): the role was tested here as 'assistant' only, so
-                # a lesson the Assistant had just written was "no canonical
-                # receipt" and the action GAVE_UP.  The same predicate the
-                # shared gate applies to this message afterwards.
-                if is_written_answer(answer):
-                    return {
-                        'message_index': idx,
-                        'kind': 'user_visible_result',
-                    }
-                return None
-        return None
+        answer = (_reuse_written_answer(group_chat)
+                  if dispatch_index is not None else None)
+        if isinstance(answer, dict):
+            for idx in range(len(messages) - 1, dispatch_index, -1):
+                if messages[idx] is answer or messages[idx] == answer:
+                    # The Assistant's, in whichever role this log holds it: a
+                    # native autogen log reads a plain reply as role 'user', a
+                    # resynced one as 'assistant'.  Measured live 2026-10-06
+                    # 01:26 (agent 54): the role was tested here as
+                    # 'assistant' only, so a lesson the Assistant had just
+                    # written was "no canonical receipt" and the action
+                    # GAVE_UP.  The same predicate the shared gate applies to
+                    # this message afterwards.
+                    if is_written_answer(answer):
+                        return {
+                            'message_index': idx,
+                            'kind': 'user_visible_result',
+                        }
+                    break
+        # No written answer: the send that delivered the step's output, for a
+        # step that does not wait on the person.  Live 2026-10-31 17:13 IST
+        # (agent 45620673143 action 3): the output went out as a send and the
+        # step GAVE_UP with "no canonical receipt in its dispatch window".
+        return _reuse_output_send(user_prompt, action_id, group_chat)
     except Exception:
         return None
+
+
+def _reuse_output_send(user_prompt, action_id, group_chat):
+    """The send that delivered a no-tool step's output, as evidence, or None:
+    lifecycle_hooks.user_output_receipt with this session's watermark and the
+    step's own 'no' flag.  One call for the receipt finder above and the
+    no-output gate in _advance_reuse_action, so the gate never refuses as
+    "no output" a step the finder would commit on its send."""
+    task = user_tasks.get(user_prompt)
+    seen = getattr(task, 'evidence_seen_call_ids', None)
+    seen = seen if isinstance(seen, (set, frozenset)) else set()
+    return user_output_receipt(
+        user_prompt, action_id, group_chat, seen,
+        waits_on_person=_reuse_action_declares_user_pause(user_prompt, action_id))
 
 
 # Asks for the ONE thing the round never produced.  Deliberately names the
@@ -7161,7 +7184,12 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
                     f"{reason}: missing evidence for {', '.join(_fab)}")
                 return None, False
             elif not _reuse_action_declares_tool(user_prompt, current_action_id) \
-                    and _reuse_written_answer(_gc) is None:
+                    and _reuse_written_answer(_gc) is None \
+                    and _reuse_output_send(user_prompt, current_action_id, _gc) is None:
+                # The send that delivered the step's output is its output too
+                # (_reuse_output_send, the receipt finder's own rule): live
+                # 2026-10-31 17:13 IST, agent 45620673143 action 3 sent its
+                # confirmation and wrote nothing else.
                 # SAME GATE, THE OTHER HALF OF THE EVIDENCE.  The tool check
                 # above answers "did the NAMED tools execute" and says in its
                 # own docstring that it never touches "prose actions that name
