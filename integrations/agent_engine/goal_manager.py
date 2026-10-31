@@ -198,6 +198,14 @@ PAUSE_CAUSE_NEEDS_HELP = 'needs_help'                 # escalate_goal: a person'
 PAUSE_CAUSE_PERSON = 'person'                         # the dashboard's pause verb
 PAUSE_CAUSE_NO_OWNER = 'no_owner_to_ask'              # the consent gate: nobody to ask
 
+#: The pause record: what GoalManager.pause_goal and its writers set on a
+#: paused goal, and what resume_goal moves to its last_* history keys.  One
+#: tuple, so a key added to the record is also retired by the resume (review
+#: of d73463359 by claude-autostart-71: pause_signature was missing from the
+#: hand-kept list until that commit).
+PAUSE_RECORD_KEYS = ('pause_reason', 'paused_at', 'pause_cause', 'paused_by',
+                     'told_at', 'pause_signature')
+
 
 class GoalManager:
     """Unified CRUD for agent goals. All execution goes through /chat."""
@@ -332,8 +340,10 @@ class GoalManager:
         semantics, one leaving the old pause reason and strike count on the
         goal).
 
-        Moves the pause record (pause_reason, paused_at, pause_cause,
-        paused_by, told_at, pause_signature) to its last_* history keys, and
+        Moves the pause record (PAUSE_RECORD_KEYS) to its last_* history keys,
+        ends the coding daemon's strike count (_dispatch_failures, which only
+        a turn that ran cleared, so the first failure after a resume paused
+        the goal again: review of d73463359 by claude-autostart-71), and
         with it a person's hand on the goal (escalate_goal's human stage,
         escalation.next == 'human': the daemon's guard on it would otherwise
         exclude the goal from its resume for life, review of fbc54ddd6; the
@@ -356,10 +366,10 @@ class GoalManager:
                     'error': f'not paused (status {goal.status})'}
         prior = goal.config_json
         cfg = dict(prior or {})
-        for key in ('pause_reason', 'paused_at', 'pause_cause', 'paused_by', 'told_at',
-                    'pause_signature'):
+        for key in PAUSE_RECORD_KEYS:
             if key in cfg:
                 cfg['last_' + key] = cfg.pop(key)
+        cfg.pop('_dispatch_failures', None)
         escalation = cfg.get('escalation')
         if isinstance(escalation, dict) and escalation.get('next') == 'human':
             cfg['last_escalation'] = cfg.pop('escalation')

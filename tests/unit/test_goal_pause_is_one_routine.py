@@ -183,6 +183,30 @@ def test_the_dashboards_pause_verb_stamps_the_person(db):
     assert _record(goal)[:2] == (gm.PAUSE_CAUSE_PERSON, 'person:owner')
 
 
+def test_a_resume_retires_every_key_the_pause_wrote(db):
+    """Review of d73463359 by claude-autostart-71: the resume's key list was
+    kept by hand, and pause_signature was missing from it until that commit,
+    so a resumed goal carried the old pause's detail into its next pause.
+    Whatever pause_goal and its writers put on the record (the escalation's
+    told_at, the daemon's pause_signature) leaves the config on resume and is
+    kept under last_*."""
+    goal = _goal(db, 'k1', {'goal_note': 'kept'})
+    before = set(goal.config_json)
+    GoalManager.pause_goal(db, goal, cause=gm.PAUSE_CAUSE_DISPATCH_FAILURES,
+                           by='agent_daemon', reason='five turns failed',
+                           extra={'pause_signature': 'turn failed: 400',
+                                  'told_at': '2026-10-31T00:00:00'})
+    written = set(goal.config_json) - before
+    assert written == {'pause_reason', 'paused_at', 'pause_cause', 'paused_by',
+                       'told_at', 'pause_signature'}
+    assert GoalManager.resume_goal(db, 'k1', 'person:a')['success']
+    cfg = goal.config_json
+    assert not written & set(cfg), sorted(written & set(cfg))
+    assert {('last_' + k) for k in written} <= set(cfg)
+    assert cfg['last_pause_signature'] == 'turn failed: 400'
+    assert cfg['goal_note'] == 'kept'
+
+
 def test_update_goal_status_paused_to_active_goes_through_resume_goal(db):
     goal = _goal(db, 'u1', {'pause_cause': 'person', 'paused_by': 'person:a',
                             'pause_reason': 'r', 'paused_at': 'x'}, status='paused')
