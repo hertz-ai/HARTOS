@@ -525,6 +525,53 @@ class TestAFailedBumpIsNamedWithTheDatabaseGone:
         ctx['stripe'].checkout.Session.retrieve.assert_not_called()
 
 
+class TestABumpWrittenBeforeTheDatabaseWentIsAnUpgrade:
+    """The tier write COMMITTED, then the database went away before the key
+    row was read back (task #214).  The table holds the bought tier, so the
+    buyer's success page gets the upgrade, Stripe gets its 200, and no line
+    asks a person to finish a bump that is finished.  The read back shared
+    the write's try, so all three paths answered 500 bump_failed and logged
+    MANUAL RECONCILIATION over a key already on pro."""
+
+    def _assert_upgraded(self, r, said):
+        assert r.status_code == 200, r.data[:300]
+        body = r.get_json()
+        assert body['success'] is True
+        assert body['api_key'] == {'id': KEY, 'tier': PRO[0],
+                                   'rate_limit_per_day': PRO[1], 'monthly_quota': PRO[2]}
+        said.assert_not_called()
+        return body
+
+    def test_the_webhook(self, ctx):
+        log = logging.getLogger('hevolve_social')
+        with ctx['db'].lost_after_next_commit(), \
+                patch.object(log, 'error') as said:
+            r = _deliver(ctx, _event(_session()))
+        self._assert_upgraded(r, said)
+        assert ctx['db'].key() == PRO and len(ctx['ledger'].payments) == 1
+
+    def test_the_buyers_first_visit(self, ctx):
+        ctx['stripe'].checkout.Session.retrieve.return_value = _session()
+        log = logging.getLogger('hevolve_social')
+        with ctx['db'].lost_after_next_commit(), \
+                patch.object(log, 'error') as said:
+            r = _complete(ctx)
+        self._assert_upgraded(r, said)
+        assert ctx['db'].key() == PRO and len(ctx['ledger'].payments) == 1
+
+    def test_the_buyers_reload(self, ctx):
+        ctx['db'].fail_next_commit()
+        assert _deliver(ctx, _event(_session())).status_code == 500   # recorded, unbumped
+        log = logging.getLogger('hevolve_social')
+        with ctx['db'].lost_after_next_commit(), \
+                patch.object(log, 'error') as said:
+            r = _complete(ctx)
+        body = self._assert_upgraded(r, said)
+        assert body['already_completed'] is True
+        assert ctx['db'].key() == PRO and len(ctx['ledger'].payments) == 1
+        ctx['stripe'].checkout.Session.retrieve.assert_not_called()
+
+
 class TestOnlyAnUpgradeIsSold:
     """One rule for the three rails: the tier bought must cost more than
     the one the key is on.  There is no downgrade route (no writer lowers

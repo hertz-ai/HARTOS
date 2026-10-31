@@ -146,6 +146,30 @@ class ApiKeyDb:
             event.remove(self.Session, 'before_commit', fail_the_commit)
             event.remove(self.engine, 'before_cursor_execute', refuse_every_statement)
 
+    @contextlib.contextmanager
+    def lost_after_next_commit(self):
+        """The next commit SUCCEEDS and the database is unreachable from then
+        on: every statement after it raises.  The bump happened (the table
+        holds the bought tier); what fails is the read back of the key row,
+        which the commit expired.  The case lost_at_next_commit is not
+        (task #214)."""
+        gone = {'now': False}
+
+        def lose_it(session):
+            gone['now'] = True
+
+        def refuse_every_statement(conn, cursor, statement, params, context, executemany):
+            if gone['now']:
+                raise RuntimeError('database unreachable')
+
+        event.listen(self.Session, 'after_commit', lose_it)
+        event.listen(self.engine, 'before_cursor_execute', refuse_every_statement)
+        try:
+            yield
+        finally:
+            event.remove(self.Session, 'after_commit', lose_it)
+            event.remove(self.engine, 'before_cursor_execute', refuse_every_statement)
+
     def dispose(self):
         event.remove(self.Session, 'before_commit', self._maybe_fail)
         self.engine.dispose()

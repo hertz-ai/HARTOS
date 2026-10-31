@@ -304,6 +304,34 @@ def test_with_the_database_gone_the_charged_card_is_still_named(client, key_db, 
     assert _tier_of(key_db) == 'free'
 
 
+def test_a_bump_written_before_the_database_went_is_an_upgrade(client, key_db, tmp_path,
+                                                                monkeypatch):
+    """The card was charged and the tier write COMMITTED; then the database
+    went away before the key row could be read back.  The table holds the
+    bought tier, so the buyer is told the upgrade happened, with the tier's
+    limits, and no line asks a person to apply by hand what is already
+    applied.  The read back shared the write's try, so its failure was
+    reported as a failed bump: a 500 bump_failed to the buyer and "apply the
+    bought tier by hand" to the operator (task #214)."""
+    ledger = PaymentLedger(ledger_path=str(tmp_path / 'ledger.json'))
+    ledger.add_gateway(_AuthorizingStripe())
+    monkeypatch.delenv('HEVOLVE_DEV_MODE', raising=False)
+    log = logging.getLogger('hevolve_social')
+    with _as_owner(key_db), patch('integrations.ap2.payment_ledger', ledger), \
+            key_db.lost_after_next_commit(), patch.object(log, 'error') as said:
+        r = client.post(f'/api/v1/intelligence/keys/{KEY}/upgrade',
+                        json={'target_tier': 'pro', 'payment_method': 'pm_card_visa'},
+                        headers={'Authorization': 'Bearer tok'})
+    assert r.status_code == 200, r.data[:300]
+    body = r.get_json()
+    assert body['success'] is True and body['payment']['status'] == 'completed'
+    held = key_db.key()
+    assert held[0] == 'pro'
+    assert body['api_key'] == {'id': KEY, 'tier': held[0],
+                               'rate_limit_per_day': held[1], 'monthly_quota': held[2]}
+    said.assert_not_called()
+
+
 def test_the_mock_gate_reads_the_one_dev_mode_switch(client, key_db, tmp_path, monkeypatch):
     """security.master_key.is_dev_mode is the switch the security layer reads;
     the money gate must read the same one, not its own copy of the env rule."""
