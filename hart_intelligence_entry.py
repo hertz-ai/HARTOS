@@ -10972,13 +10972,21 @@ def chat():
                 # conversation runs on a different model, #172) answers that
                 # too, so the dispatcher holds it instead of judging the
                 # gather output.
-                from core.agent_tools import (is_held_for_another_turn,
+                # So does a recipe() that handed its step to a person or the
+                # expert (_ask_for_help) or ended in the CREATE error envelope
+                # (#170): the daemon counted the gather output as work done,
+                # and the hive worker recorded it as the task's result while
+                # the goal waited for help.
+                from core.agent_tools import (is_action_error_reply, is_help_pause,
+                                              is_held_for_another_turn,
                                               is_user_facing_error, is_user_pause)
                 return _chat_reply(
                     user_id, request_id,
                     recipe_response if (is_user_pause(recipe_response)
                                         or is_held_for_another_turn(recipe_response)
-                                        or is_user_facing_error(recipe_response))
+                                        or is_user_facing_error(recipe_response)
+                                        or is_help_pause(recipe_response)
+                                        or is_action_error_reply(recipe_response))
                     else auto_response,
                     intent=['FINAL_ANSWER'],
                     req_token_count=0, res_token_count=0,
