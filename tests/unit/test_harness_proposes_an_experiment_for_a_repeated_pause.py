@@ -165,6 +165,24 @@ def test_a_secret_in_the_failure_text_never_reaches_the_experiment(db):
     assert 'sk-proj-' not in (exp.hypothesis or '') and 'AAAA' not in (exp.hypothesis or '')
 
 
+def test_a_secret_cut_in_half_by_the_signature_never_reaches_the_experiment(db):
+    """Review of 3d4c5b3a3's fix by claude-autostart-71: the signature was cut
+    to 80 characters BEFORE the egress scrub, so a key straddling the cut
+    left a fragment too short for the secret patterns (sk-proj- plus 27
+    characters, where the pattern wants 40), and the proposer's scrub of the
+    cut text published it.  The scrub runs on the whole failure text, then
+    the cut."""
+    why = 'turn failed: 401 Incorrect API key provided: sk-proj-' + 'B' * 60
+    for gid in ('s1', 's2', 's3'):
+        _pause(db, _active(db, gid), why=why)
+    [exp] = _harness_experiments(db)
+    assert exp.title.startswith('Harness: turn failed: 401 Incorrect API key provided: ')
+    for text in (exp.title, exp.hypothesis or ''):
+        assert 'sk-proj-' not in text and 'BBBB' not in text, text
+    stored = db.get(AgentGoal, 's1').config_json['pause_signature']
+    assert 'sk-proj-' not in stored and 'BBBB' not in stored, stored
+
+
 def test_no_signature_is_stored_for_a_failure_with_no_reason(db):
     """Minor from the review: an empty signature is no key at all."""
     _pause(db, _active(db, 'n1'), why=None)

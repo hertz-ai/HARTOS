@@ -457,8 +457,20 @@ def _failure_signature(why):
     compared with a stripped copy, so a cut landing on a space, or a reason
     led by whitespace, matched nothing and three identical pauses filed no
     experiment, silently).  Stripped, cut to 80, stripped again where the cut
-    left whitespace; '' for no reason at all."""
-    return str(why or '').strip()[:80].rstrip()
+    left whitespace; '' for no reason at all.  The egress scrub
+    (security.edge_privacy.scrub_text) runs on the whole text BEFORE the cut
+    (review by claude-autostart-71: a key straddling the cut left a fragment
+    too short for the secret patterns, which the proposer's scrub of the cut
+    text then let into a public Post title).  With no scrubber the text is
+    cut as written: it stays on the goal's own row, and the proposer, which
+    scrubs again, publishes nothing without one."""
+    text = str(why or '').strip()
+    try:
+        from security.edge_privacy import scrub_text
+        text = scrub_text(text).strip()
+    except ImportError:
+        pass
+    return text[:80].rstrip()
 
 
 def _propose_harness_experiment_for_signature(db, signature):
