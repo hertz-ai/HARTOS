@@ -107,7 +107,8 @@ def speech(monkeypatch, tmp_path):
         # 'message' hid that the ask recorder read the wrong argument.
         def send_message_to_user(text: str, expects_reply: bool) -> str:
             state['sends'].append(text)
-            return 'Message sent'
+            # The real send's success reply (lifecycle_hooks.send_delivered).
+            return 'Message sent successfully to user with request_id: r'
 
         def read_item(item: int) -> str:
             state['read'].append(item)

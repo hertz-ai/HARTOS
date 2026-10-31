@@ -1927,13 +1927,11 @@ def tool_call_names(msg_lists) -> Dict[str, str]:
 SEND_TOOL = 'send_message_to_user'
 
 
-def send_expects_reply(messages, call_id) -> Optional[bool]:
-    """What a send_message_to_user call declared: True (it asks the person
-    something), False (it only tells them), None when it declared nothing (a
-    call made before the argument existed).  Read off the PROPOSING message's
-    tool_calls, joined by call id as tool_call_names joins the function: the
-    act decides, never the words.  A JSON string 'true'/'false' is read as
-    its value."""
+def _send_call_args(messages, call_id) -> Optional[dict]:
+    """The arguments of the send_message_to_user call ``call_id``, read off
+    the PROPOSING message's tool_calls (joined by call id as tool_call_names
+    joins the function), or None when the call is not a send or cannot be
+    read."""
     import json
     for m in (messages or []):
         if not isinstance(m, dict):
@@ -1950,13 +1948,58 @@ def send_expects_reply(messages, call_id) -> Optional[bool]:
                     args = json.loads(args)
                 except Exception:
                     return None
-            value = args.get('expects_reply') if isinstance(args, dict) else None
-            if isinstance(value, bool):
-                return value
-            if isinstance(value, str) and value.strip().lower() in ('true', 'false'):
-                return value.strip().lower() == 'true'
-            return None
+            return args if isinstance(args, dict) else None
     return None
+
+
+def send_expects_reply(messages, call_id) -> Optional[bool]:
+    """What a send_message_to_user call declared: True (it asks the person
+    something), False (it only tells them), None when it declared nothing (a
+    call made before the argument existed).  The act decides, never the
+    words.  A JSON string 'true'/'false' is read as its value."""
+    value = (_send_call_args(messages, call_id) or {}).get('expects_reply')
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in ('true', 'false'):
+        return value.strip().lower() == 'true'
+    return None
+
+
+def sent_text(messages, call_id) -> Optional[str]:
+    """The ``text`` a send_message_to_user call carried to the person, or
+    None."""
+    text = (_send_call_args(messages, call_id) or {}).get('text')
+    return text if isinstance(text, str) else None
+
+
+#: The send tool's own success reply, from both send_message_to_user1
+#: copies (create_recipe.py, reuse_recipe.py): "Message sent successfully to
+#: user with request_id: ...".  Every other reply reached nobody: "Failed to
+#: send message to user ...", "Message directed to @x agent, not sending to
+#: user", "... its delivery was not confirmed".
+SEND_DELIVERED_PREFIX = 'Message sent successfully to user'
+
+
+def send_delivered(body) -> bool:
+    """The send's result says the person got it: the tool's own success
+    reply and nothing else.  hartos-00's review of 476bbd5d8 (critical):
+    failure was judged by tool_reply_failed, which misses the tool's own
+    non-delivery replies, so a send that reached nobody completed the step
+    and "Failed to send message ..." was promoted as a verified success."""
+    return str(body or '').strip().startswith(SEND_DELIVERED_PREFIX)
+
+
+def delivered_text(messages, call_id, body) -> Optional[str]:
+    """The text a send delivered as the step's output, or None: its result
+    is the tool's own success reply (send_delivered) and its text is written
+    work by the rule a written answer is held to (written_text_is_answer),
+    so an empty send or a send of ``{"status": "completed"}`` is no output
+    (hartos-00's review of 476bbd5d8, Medium).  Whether it asked is
+    send_is_ask's question, asked separately."""
+    if not send_delivered(body):
+        return None
+    text = sent_text(messages, call_id)
+    return text if written_text_is_answer(text) else None
 
 
 def verdict_waits_on_person(verdict) -> bool:
@@ -2233,7 +2276,10 @@ def _work_results(message: dict, names: Dict[str, str], action_text: str,
             continue
         call_id = result.get('tool_call_id') or message.get('tool_call_id')
         name = names.get(call_id)
-        if name == SEND_TOOL and send_is_ask(messages, call_id):
+        if name == SEND_TOOL and (send_is_ask(messages, call_id)
+                                  or delivered_text(messages, call_id, body) is None):
+            # An ask is not the action done; a send that reached nobody, or
+            # carried no written work, is no work at all (delivered_text).
             continue
         if name in BOOKKEEPING_TOOLS and name.lower() not in action_text:
             continue
@@ -2455,7 +2501,44 @@ def is_written_answer(message) -> bool:
     if not (isinstance(message, dict) and message.get('name') == 'Assistant'
             and message.get('role') in _ASSISTANT_WRITTEN_ROLES):
         return False
-    text = str(message.get('content') or '').strip()
+    return written_text_is_answer(message.get('content'))
+
+
+def receipt_result_text(resolved) -> str:
+    """What a receipt (resolve_receipt's tuple) says the step produced: for
+    the send that delivered the step's output, the words the person got;
+    for any other receipt its content.  hartos-00's review of 476bbd5d8
+    (Medium): the tool's "Message sent successfully ..." became the step's
+    result and the world model's record, and with a send that reached nobody
+    "Failed to send message ..." was promoted as a verified success."""
+    if not resolved:
+        return ''
+    messages, _index, message, _agent = resolved
+    if isinstance(message, dict) and message.get('role') == 'tool':
+        names = tool_call_names([messages])
+        responses = message.get('tool_responses')
+        for result in (responses if isinstance(responses, list) and responses
+                       else [message]):
+            if not isinstance(result, dict):
+                continue
+            call_id = result.get('tool_call_id') or message.get('tool_call_id')
+            if names.get(call_id) != SEND_TOOL:
+                continue
+            body = result.get('content')
+            if body is None:
+                body = message.get('content')
+            text = delivered_text(messages, call_id, body)
+            if text is not None:
+                return text
+    return str((message or {}).get('content') or '')
+
+
+def written_text_is_answer(text) -> bool:
+    """The words alone, by is_written_answer's rule: not empty, not
+    TERMINATE, not a dispatch, not routing to another agent, not unexecuted
+    tool-call markup, not a control JSON.  The one judgment for words the
+    Assistant wrote and for words it sent the person (delivered_text)."""
+    text = str(text or '').strip()
     low = text.lower()
     if (not text or text == 'TERMINATE' or _DISPATCH_MARKER.match(text)
             or any(mention in low for mention in _ROUTING_MENTIONS)
@@ -2564,12 +2647,18 @@ def user_output_receipt(user_prompt: str, action_id: int, group_chat,
                     if not isinstance(result, dict):
                         continue
                     call_id = result.get('tool_call_id') or msg.get('tool_call_id')
-                    body = str(result.get('content') or msg.get('content') or '')
+                    # The aggregate's content only for a result that carries
+                    # none at all, as _work_results reads it: an empty result
+                    # never borrows its neighbour's "sent" (hartos-00's review
+                    # of 476bbd5d8).
+                    body = result.get('content')
+                    if body is None:
+                        body = msg.get('content')
+                    body = str(body or '')
                     if (names.get(call_id) != SEND_TOOL
                             or send_is_ask(msgs, call_id)
-                            or call_id in seen or not body.strip()
-                            or tool_reply_failed(body)
-                            or HISTORICAL_TOOL_PLACEHOLDER in body):
+                            or call_id in seen
+                            or delivered_text(msgs, call_id, body) is None):
                         continue
                     candidate = {**(source or {}), 'message_index': index,
                                  'kind': 'tool_receipt'}
@@ -2808,7 +2897,7 @@ def _promote_verified_outcome(user_prompt: str, action_id: int,
             prompt_id=prompt_id or user_prompt,
             prompt=str(getattr(task, 'description', '') or
                        f'Complete action {action_id}'),
-            response=str(receipt.get('content') or ''),
+            response=receipt_result_text(resolved),
             model_id=str(receipt.get('name') or 'verified-agent'),
             goal_id=(context.get('goal_id') or context.get('parent_task_id')),
             verification={
@@ -2933,16 +3022,18 @@ def commit_verified_action_completion(user_prompt: str, action_id: int,
     if not validate_state_transition(
             user_prompt, action_id, ActionState.COMPLETED):
         return False
-    receipt = resolve_receipt(user_prompt, evidence)[2]
+    _resolved = resolve_receipt(user_prompt, evidence)
     _is_reply = evidence.get('kind') == 'user_reply'
     # The proof must be durable before a completion can release dependents or
     # feed any learning system. A retry deduplicates the same receipt hash.
     if not _record_verifier_evidence(user_prompt, action_id, verdict):
         return False
     # A reply's receipt is the seed (pipeline text plus the person's words
-    # plus the steps); the step's RESULT is the person's words alone.
+    # plus the steps); the step's RESULT is the person's words alone.  A
+    # send's receipt is the tool's "Message sent ..."; the RESULT is the
+    # words it delivered (receipt_result_text).
     _result = (str(evidence.get('reply') or '') if _is_reply
-               else str(receipt.get('content') or ''))
+               else receipt_result_text(_resolved))
     if not safe_set_state(
             user_prompt, action_id, ActionState.COMPLETED, reason,
             result=_result):

@@ -396,7 +396,8 @@ from hartos.lifecycle_hooks import (
     verdict_names_another_action, dispatch_action_id, ACTION_STATES_AWAITING_USER, autonomy_needs_user,
     action_is_autonomous, action_named_tools, action_own_text,
     is_written_answer, ANSWER_KEYS, user_output_receipt,
-    SEND_TOOL, send_is_ask, verdict_waits_on_person,
+    SEND_TOOL, send_is_ask, verdict_waits_on_person, send_delivered,
+    delivered_text, sent_text,
     mark_action_waiting_for_user, resume_from_user_input,
     record_ask_delivered, ledger_open_ask, person_waits_on, is_terminal_state,
 )
@@ -4982,13 +4983,24 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
                     if not isinstance(result, dict):
                         continue
                     call_id = result.get('tool_call_id') or msg.get('tool_call_id')
-                    body = str(result.get('content') or msg.get('content') or '')
+                    # The aggregate's content only for a result that carries
+                    # none at all, as the gate's _work_results reads it: an
+                    # empty send result never borrows its neighbour's "sent"
+                    # (hartos-00's review of 476bbd5d8).
+                    body = result.get('content')
+                    if body is None:
+                        body = msg.get('content')
+                    body = str(body or '')
                     if call_id in seen or HISTORICAL_TOOL_PLACEHOLDER in body:
                         continue
                     if tool_reply_failed(body):
                         continue
                     _fn = call_fn.get(call_id) or result.get('name')
-                    if _fn == SEND_TOOL and send_is_ask(_every_msg, call_id):
+                    if _fn == SEND_TOOL and (
+                            send_is_ask(_every_msg, call_id)
+                            or delivered_text(_every_msg, call_id, body) is None):
+                        # An ask, a send that reached nobody, or a send that
+                        # carried no written work: the gate's own rule.
                         continue
                     if _fn in wanted:
                         return True
@@ -7551,16 +7563,9 @@ def _reuse_send_text(messages, call_id):
     (the question the person was sent), or None.  The real tool's argument
     is ``text`` (core/agent_tools.py); this read ``message``, the name the
     #161 test fixture's stand-in used, so a live ask was recorded with no
-    question and a turn with no request id got the generic line back."""
-    for m in messages:
-        for call in ((m or {}).get('tool_calls') or []):
-            if isinstance(call, dict) and call.get('id') == call_id:
-                try:
-                    args = json.loads((call.get('function') or {}).get('arguments') or '{}')
-                except Exception:
-                    return None
-                return args.get('text') if isinstance(args, dict) else None
-    return None
+    question and a turn with no request id got the generic line back.  One
+    reader: lifecycle_hooks.sent_text."""
+    return sent_text(messages, call_id)
 
 
 def _reuse_ask_index(group_chat, messages, dispatch_index, written_counts,
@@ -7593,7 +7598,7 @@ def _reuse_ask_index(group_chat, messages, dispatch_index, written_counts,
             call_id = result.get('tool_call_id') or m.get('tool_call_id')
             body = str(result.get('content') or m.get('content') or '')
             if (call_fn.get(call_id) == SEND_TOOL
-                    and not tool_reply_failed(body)
+                    and send_delivered(body)
                     and (step_waits or send_is_ask(messages, call_id, verdict))):
                 return idx, 'send', _reuse_send_text(messages, call_id)
     if not written_counts:
