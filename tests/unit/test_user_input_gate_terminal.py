@@ -59,8 +59,9 @@ fourth copy of that tuple is exactly the drift this codebase keeps paying for.
     python -m pytest tests/unit/test_user_input_gate_terminal.py -q
 """
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from hartos import create_recipe
 from hartos.create_recipe import (
@@ -813,11 +814,69 @@ class AnAnswerTheLedgerCannotSaveIsKeptAndRetried(unittest.TestCase):
         clear_action_states(_UP)
         with self.L._state_lock:
             self.L._ledger_registry.pop(_UP, None)
-        for store in (create_recipe.user_tasks, create_recipe.request_id_list):
+        for store in (create_recipe.user_tasks, create_recipe.request_id_list,
+                      create_recipe.user_agents, create_recipe.messages,
+                      create_recipe.recipe_for_persona):
             try:
                 del store[_UP]
             except Exception:
                 pass
+
+    def _round(self, request, text, saves=True):
+        """The WHOLE turn through get_response_group (hartos-00's review of
+        ca2e52c91: tests that called the helpers directly skipped the early
+        return where the person's words leaked).  Returns ('round', the text
+        its model round is given) or ('reply', what it answered without
+        one); the round itself is stopped where its text is attached."""
+        from flask import Flask
+        user_id, prompt_id = _UP.rsplit('_', 1)
+        create_recipe.request_id_list[_UP] = request
+        create_recipe.user_agents.pop(_UP, None)
+
+        class RoundStarted(Exception):
+            pass
+
+        given = []
+
+        def attach(agents_object, round_text, user_prompt):
+            given.append(round_text)
+            raise RoundStarted()
+
+        agents = tuple(MagicMock() for _ in range(7))
+        agents[3].messages = []
+        with ExitStack() as stack:
+            stack.enter_context(Flask(__name__).app_context())
+            stack.enter_context(patch.object(create_recipe, 'create_agents',
+                                             return_value=agents))
+            stack.enter_context(patch.object(create_recipe, '_attach_for_create_turn',
+                                             side_effect=attach))
+            if not saves:
+                stack.enter_context(patch.object(self.ledger, 'save', return_value=False))
+            try:
+                reply = create_recipe.get_response_group(user_id, text, prompt_id)
+            except RoundStarted:
+                return 'round', given[0]
+            finally:
+                create_recipe.user_agents.pop(_UP, None)
+        return 'reply', reply
+
+    def _ask_on_action_4(self, request='user-request-5'):
+        """The flow moved on to a NEW ask step (action 4) waiting on this
+        person, asked in ``request``."""
+        from agent_ledger.core import TaskStatus, add_actions_to_ledger
+        add_actions_to_ledger(self.ledger, [
+            {'action': 'ask which topic comes next', 'action_id': 4}], flow_id=0)
+        self.ledger.tasks['action_4'].status = TaskStatus.IN_PROGRESS
+        safe_set_state(_UP, 4, ActionState.IN_PROGRESS, 'working')
+        self.assertTrue(self.L.mark_action_waiting_for_user(
+            _UP, 4, 'which topic', flow=0, asked_in=request))
+        task = create_recipe.user_tasks[_UP]
+        task.current_action, task._needs_user_input_action_id = 4, 4
+        task._needs_user_input_kind = 'human_required'
+
+    def _answers_4(self):
+        return [e['answer'] for e in self.ledger.tasks['action_4'].context.get(
+            self.L.USER_INPUT_EVIDENCE_KEY) or []]
 
     def _turn(self, request, text, saves=True):
         create_recipe.request_id_list[_UP] = request
@@ -949,21 +1008,10 @@ class AnAnswerTheLedgerCannotSaveIsKeptAndRetried(unittest.TestCase):
         this person.  The old 'ba' (the answer to "say ball") and 'hello' are
         context for the model only; the new ask's answer is this turn's own
         message, never the old answer to a different question."""
-        from agent_ledger.core import TaskStatus, add_actions_to_ledger
-        add_actions_to_ledger(self.ledger, [
-            {'action': 'ask which topic comes next', 'action_id': 4}], flow_id=0)
         self._expert_resumes()
-        self.ledger.tasks['action_4'].status = TaskStatus.IN_PROGRESS
-        safe_set_state(_UP, 4, ActionState.IN_PROGRESS, 'working')
-        self.assertTrue(self.L.mark_action_waiting_for_user(
-            _UP, 4, 'which topic', flow=0, asked_in='user-request-5'))
-        task = create_recipe.user_tasks[_UP]
-        task.current_action, task._needs_user_input_action_id = 4, 4
-        task._needs_user_input_kind = 'human_required'
+        self._ask_on_action_4()
         self.assertTrue(self._turn('user-request-6', 'algebra'))
-        answers_4 = [e['answer'] for e in self.ledger.tasks['action_4'].context.get(
-            self.L.USER_INPUT_EVIDENCE_KEY) or []]
-        self.assertEqual(answers_4, ['algebra'])
+        self.assertEqual(self._answers_4(), ['algebra'])
         self.assertEqual(self._answers(), [], "'ba' was never recorded for action 3")
         self.assertEqual(create_recipe._answer_for_this_turn(_UP, 'algebra'),
                          'ba\nhello\nalgebra')
@@ -1031,6 +1079,81 @@ class AnAnswerTheLedgerCannotSaveIsKeptAndRetried(unittest.TestCase):
             reply = create_recipe.get_response_group(user_id, 'ba', prompt_id)
         made.assert_not_called()
         self.assertIn("couldn't save your answer to step 3", reply)
+
+    def test_a_daemon_tick_never_gets_the_persons_words_in_a_whole_turn(self):
+        """hartos-00's review of ca2e52c91, finding 1 (critical): the person's
+        turn handed 'ba' and 'hello' over, then its save of the NEW ask's
+        answer failed and it returned before its round; the next daemon
+        tick's round got 'ba\\nhello\\ntick'."""
+        self._expert_resumes()
+        self._ask_on_action_4()
+        kind, said = self._round('user-request-6', 'algebra', saves=False)
+        self.assertEqual(kind, 'reply')
+        self.assertIn("couldn't save your answer to step 4", said)
+        self.assertEqual(self._round('daemon_goal-7', 'tick'), ('round', 'tick'))
+
+    def test_the_persons_next_round_gets_every_word_in_the_order_sent(self):
+        """Finding 2: the retry that saved ASSIGNED the owed words, so 'ba'
+        and 'hello' were overwritten and the model got 'algebra\\ndid you get
+        that' after the person had been told not to resend.  Every word, in
+        order; only 'algebra' is recorded, and for action 4."""
+        self._expert_resumes()
+        self._ask_on_action_4()
+        self._round('user-request-6', 'algebra', saves=False)
+        self._round('daemon_goal-7', 'tick')
+        self.assertEqual(self._round('user-request-7', 'did you get that'),
+                         ('round', 'ba\nhello\nalgebra\ndid you get that'))
+        self.assertEqual(self._answers_4(), ['algebra'])
+        self.assertEqual(self._answers(), [])
+
+    def test_a_kept_answer_from_another_flow_never_answers_this_one(self):
+        """Finding 3: the drop compared only the action id.  'ba' was kept
+        for flow 0's action 3, the expert resumed it, the flow moved to 1 and
+        action 3 was flagged again there; the person's 'cat' is flow 1's
+        answer, and 'ba' is never recorded against flow 0."""
+        from agent_ledger.core import TaskStatus
+        self._expert_resumes()
+        create_recipe.recipe_for_persona[_UP] = 1
+        self.task.status = TaskStatus.IN_PROGRESS
+        self.assertTrue(self.L.mark_action_waiting_for_user(
+            _UP, 3, 'say cat', flow=1, asked_in='user-request-5'))
+        task = create_recipe.user_tasks[_UP]
+        task._needs_user_input_action_id = 3
+        task._needs_user_input_kind = 'human_required'
+        self.assertEqual(self._round('user-request-6', 'cat'),
+                         ('round', 'ba\nhello\ncat'))
+        self.assertTrue(self.L.ledger_user_answered(_UP, 3, 1))
+        self.assertFalse(self.L.ledger_user_answered(_UP, 3, 0))
+        self.assertEqual(self._answers(), ['cat'])
+
+    def test_owed_words_are_only_ever_the_persons(self):
+        """The guard behind finding 1, on its own: whatever is owed, a daemon
+        turn's round gets its own text and leaves the words; the person's
+        next round gets them."""
+        create_recipe.user_tasks[_UP]._answer_owed_to_turn = ['ba']
+        create_recipe.request_id_list[_UP] = 'daemon_goal-7'
+        self.assertEqual(create_recipe._answer_for_this_turn(_UP, 'tick'), 'tick')
+        create_recipe.request_id_list[_UP] = 'user-request-9'
+        self.assertEqual(create_recipe._answer_for_this_turn(_UP, 'hi'), 'ba\nhi')
+
+    def test_a_hand_over_adds_to_what_is_owed(self):
+        """Finding 2's rule at the drop too: words already owed are kept and
+        the dropped answer's words follow them, never written over them."""
+        self._expert_resumes()
+        create_recipe.user_tasks[_UP]._answer_owed_to_turn = ['earlier']
+        self._turn('user-request-4', 'how is it going')
+        self.assertEqual(
+            create_recipe._answer_for_this_turn(_UP, 'how is it going'),
+            'earlier\nba\nhello\nhow is it going')
+
+    def test_the_line_promises_only_what_happens(self):
+        """Finding 4: the line promised the answer would be saved, and after
+        a hand-over it never is; it is passed on.  True both ways now."""
+        self.assertFalse(self._turn('user-request-2', 'ba', saves=False))
+        line = create_recipe._unsaved_answer_reply(_UP)
+        self.assertNotIn('save it before anything else', line)
+        self.assertIn('pass it on with your next message', line)
+        self.assertIn('no need to send it again', line)
 
 
 if __name__ == '__main__':

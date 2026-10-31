@@ -4591,6 +4591,21 @@ def _same_message(a, b):
     return str(a or '').strip() == str(b or '').strip()
 
 
+def _newest_kept(words, action_id):
+    """The newest _UNSAVED_ANSWER_LATER_MAX of ``words`` kept beside the
+    answer to ``action_id``; how many older ones went is logged, never their
+    text."""
+    words = list(words)
+    if len(words) > _UNSAVED_ANSWER_LATER_MAX:
+        logging.getLogger(__name__).warning(
+            "[USER-INPUT-GATE] %d older message(s) kept beside the answer to "
+            "action %s are no longer kept (the newest %d are)",
+            len(words) - _UNSAVED_ANSWER_LATER_MAX, action_id,
+            _UNSAVED_ANSWER_LATER_MAX)
+        words = words[-_UNSAVED_ANSWER_LATER_MAX:]
+    return words
+
+
 def _keep_unsaved_answer(task, action_id, answer, flow, later=(), failed_in=None):
     """Keep a person's answer the ledger could not save, to be retried at
     their next turn before anything else (_resume_prior_user_input_block).
@@ -4598,24 +4613,25 @@ def _keep_unsaved_answer(task, action_id, answer, flow, later=(), failed_in=None
     ``later`` is what they sent while it waited (hartos-00's review of
     077e779b7, item 4: a message whose retry also failed was dropped without
     a word); the model gets it after the answer once the answer saves, and
-    it is never recorded as the answer.  The newest _UNSAVED_ANSWER_LATER_MAX
-    are kept.  ``failed_in`` is the request whose save just failed: the
-    turn's "couldn't save" line is for that turn only (item 3)."""
+    it is never recorded as the answer.  ``before`` is what an earlier,
+    dropped answer owed this turn's round (_answer_owed_to_turn): the turn
+    keeping this answer runs no round, so those words wait here and reach
+    the person's round with it, never a daemon tick's (hartos-00's review of
+    ca2e52c91, finding 1).  The newest _UNSAVED_ANSWER_LATER_MAX of each are
+    kept.  ``failed_in`` is the request whose save just failed: the turn's
+    "couldn't save" line is for that turn only (item 3)."""
     kept = getattr(task, '_unsaved_answer', None)
-    failures = (kept.get('failures', 0)
-                if isinstance(kept, dict) and kept.get('action_id') == action_id
-                else 0) + 1
-    later = list(later)
-    if len(later) > _UNSAVED_ANSWER_LATER_MAX:
-        logging.getLogger(__name__).warning(
-            "[USER-INPUT-GATE] %d older message(s) sent while the answer to "
-            "action %s waited are no longer kept (the newest %d are)",
-            len(later) - _UNSAVED_ANSWER_LATER_MAX, action_id,
-            _UNSAVED_ANSWER_LATER_MAX)
-        later = later[-_UNSAVED_ANSWER_LATER_MAX:]
+    same = isinstance(kept, dict) and kept.get('action_id') == action_id
+    failures = (kept.get('failures', 0) if same else 0) + 1
+    before = _newest_kept(
+        (list(kept.get('before') or []) if same else [])
+        + list(getattr(task, '_answer_owed_to_turn', None) or []), action_id)
+    task._answer_owed_to_turn = None
     task._unsaved_answer = {'action_id': action_id, 'text': answer,
                             'flow': flow, 'failures': failures,
-                            'later': later, 'failed_in': failed_in}
+                            'before': before,
+                            'later': _newest_kept(later, action_id),
+                            'failed_in': failed_in}
     (logging.getLogger(__name__).error
      if failures >= _UNSAVED_ANSWER_ERROR_AFTER
      else logging.getLogger(__name__).warning)(
@@ -4632,8 +4648,10 @@ def _unsaved_answer_reply(user_prompt):
     or because it is a daemon's, gets no line and runs as usual (hartos-00's
     review of 077e779b7, item 3: once the expert resumed the action, every
     later turn got this line and no model round until a restart).  Worded so
-    the person does not resend: the kept answer is saved before anything
-    else on their next message."""
+    the person does not resend, and true either way: on their next message
+    the kept answer is saved and passed on, or, once its step no longer
+    waits for them, passed on as context (hartos-00's review of ca2e52c91,
+    finding 4)."""
     task = user_tasks.get(user_prompt)
     kept = getattr(task, '_unsaved_answer', None) if task is not None else None
     if not isinstance(kept, dict):
@@ -4648,19 +4666,28 @@ def _unsaved_answer_reply(user_prompt):
     if kept.get('failed_in') is None or str(kept.get('failed_in')) != str(request_id):
         return None
     return (f"I couldn't save your answer to step {kept.get('action_id')} yet. "
-            f"I've kept it and will save it before anything else on your next "
-            f"message, so there's no need to send it again.")
+            f"I've kept it and will pass it on with your next message, so "
+            f"there's no need to send it again.")
 
 
 def _answer_for_this_turn(user_prompt, text):
-    """This turn's message once a kept answer was saved at its start: the
-    answer the model has not seen, what the person sent while it waited,
-    then this turn's words, one per line; a new message that repeats one of
-    them is a resend and is dropped.  Owed to one turn only.  Any other
-    turn: ``text`` unchanged."""
+    """This turn's message once a kept answer was saved or dropped at its
+    start (_answer_owed_to_turn): the words the model has not seen, in the
+    order the person sent them, then this turn's words, one per line; a new
+    message that repeats one of them is a resend and is dropped.  Owed to
+    the PERSON's round only: a daemon or expert turn gets ``text`` unchanged
+    and leaves the words for the person (hartos-00's review of ca2e52c91,
+    finding 1: a daemon tick's round got 'ba\\nhello\\ntick').  Owed to one
+    round only."""
     task = user_tasks.get(user_prompt)
     owed = getattr(task, '_answer_owed_to_turn', None) if task is not None else None
     if owed is None:
+        return text
+    try:
+        from integrations.agent_engine.dispatch import is_genuine_user_request
+        if not is_genuine_user_request(request_id_list.get(user_prompt)):
+            return text
+    except Exception:
         return text
     task._answer_owed_to_turn = None
     parts = list(owed)
@@ -4709,19 +4736,26 @@ def _resume_prior_user_input_block(user_prompt, text, failure=False):
     # only for the turn whose retry failed, so it locks nobody out.  The
     # gate below records only this turn's own message as an open ask's
     # answer, so the old answer to a different question never fills a new
-    # step.
+    # step.  A kept answer waits only in its own flow: action ids restart per
+    # flow, and flow 1's action 3 flagged again is not flow 0's (hartos-00's
+    # review of ca2e52c91, finding 3: 'ba' was recorded against flow 0 and
+    # flow 1's gate cleared with no answer).  The words are added to what is
+    # owed, never written over it (finding 2).
     _kept = getattr(task, '_unsaved_answer', None)
+    _kept_flow = _kept.get('flow', flow) if isinstance(_kept, dict) else flow
     if is_user and isinstance(_kept, dict) and not (
-            getattr(task, '_needs_user_input_action_id', None) == _kept.get('action_id')
-            or person_waits_on(user_prompt, _kept.get('action_id'),
-                               _kept.get('flow', flow))):
-        _words = [w for w in [_kept.get('text')] + list(_kept.get('later') or [])
-                  if str(w or '').strip()]
+            _kept_flow == flow and (
+                getattr(task, '_needs_user_input_action_id', None) == _kept.get('action_id')
+                or person_waits_on(user_prompt, _kept.get('action_id'), _kept_flow))):
+        _later_words = [w for w in list(_kept.get('later') or []) if str(w or '').strip()]
+        _words = [w for w in list(_kept.get('before') or []) + [_kept.get('text')]
+                  + list(_kept.get('later') or []) if str(w or '').strip()]
         logging.getLogger(__name__).info(
             '[USER-INPUT-GATE] Action %s no longer waits for the person: its '
             'kept answer and %d later message(s) go to this turn as context, '
-            'not as an answer', _kept.get('action_id'), max(len(_words) - 1, 0))
-        task._answer_owed_to_turn = _words or None
+            'not as an answer', _kept.get('action_id'), len(_later_words))
+        task._answer_owed_to_turn = (
+            list(getattr(task, '_answer_owed_to_turn', None) or []) + _words) or None
         task._unsaved_answer = None
     action_id = getattr(task, '_needs_user_input_action_id', None)
     if not isinstance(action_id, int):
@@ -4863,9 +4897,13 @@ def _resume_prior_user_input_block(user_prompt, text, failure=False):
             return False
         if _retrying:
             # The failed turns returned before any model round, so the model
-            # has seen neither the answer nor what came while it waited: this
-            # turn's round carries them.
-            task._answer_owed_to_turn = [answer] + _later
+            # has seen neither the answer nor what came before or while it
+            # waited: this turn's round carries them, in the order sent, added
+            # to anything already owed (hartos-00's review of ca2e52c91,
+            # finding 2: an assignment here overwrote 'ba' and 'hello').
+            task._answer_owed_to_turn = (
+                list(getattr(task, '_answer_owed_to_turn', None) or [])
+                + list(_kept.get('before') or []) + [answer] + _later)
         task._unsaved_answer = None
     # The wait was projected into both authorities (mark_action_waiting_for_
     # user: ledger BLOCKED + ActionState PENDING) and the resume moved only
