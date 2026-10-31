@@ -756,6 +756,25 @@ class TestEveryRunGetsItsOwnReAsks(_ReuseOnARealLog, _Harness):
         self.assertFalse(rr._reuse_resteer_counts.get((self.UP, 1)),
                          'a re-ask spent the fabrication re-steer budget')
 
+    def test_another_sessions_run_leaves_these_re_asks_spent(self):
+        """Review of f14b50637 (its mutant M4 survived): a run boundary gives
+        back only its own session's re-asks.  Clearing every session's there
+        would let any other session's run refill a run still going."""
+        other = 'p78'
+        other_up = f'{self.USER}_{other}'
+        self._install_session(other_up)
+        self.patch(rr, 'user_agents', {self.UP: None, other_up: None})
+        self.addCleanup(rr.request_id_list.pop, other_up, None)
+        self.addCleanup(lh.action_states.pop, other_up, None)
+        self._run('rid-a')
+        self._spend_the_re_asks()
+        rr.thread_local_data.set_request_id('rid-b')
+        self.assertEqual(
+            rr.chat_agent(self.USER, 'next', other, None, 'rid-b'), 'held')
+        self.assertIsNone(self._misnumbered(),
+                          "another session's run gave this run its re-asks "
+                          'back')
+
 
 class TestTheMentionListIsOneList(unittest.TestCase):
     """"Is this message addressed to an agent" has one answer.  REUSE's loop
