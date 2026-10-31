@@ -909,6 +909,86 @@ class AnAnswerTheLedgerCannotSaveIsKeptAndRetried(unittest.TestCase):
         self.assertIsNone(getattr(create_recipe.user_tasks[_UP], '_unsaved_answer', None))
         self.assertEqual(self._answers(), [])
 
+    def _expert_resumes(self):
+        """'ba' and then 'hello' fail to save; the assigned expert's turn
+        then resumes the action, so it no longer waits for the person."""
+        create_recipe.user_tasks[_UP]._needs_user_input_kind = 'recoverable_stall'
+        self.assertFalse(self._turn('user-request-2', 'ba', saves=False))
+        self.assertFalse(self._turn('user-request-3', 'hello', saves=False))
+        with patch('hartos.create_recipe._is_serving_escalation_expert',
+                   return_value=True):
+            self.assertTrue(self._turn('daemon_expert_turn', 'expert'))
+
+    def test_the_person_keeps_their_words_when_the_step_moves_on_without_them(self):
+        """hartos-00's review of b599e7f98, Medium 2: the kept answer was
+        dropped once the expert resumed the step, so the model got only 'how
+        is it going', nothing was recorded, and the person had been told
+        there was no need to send it again.  Their words go to their next
+        round as context; nothing is recorded as an answer."""
+        self._expert_resumes()
+        self._turn('user-request-4', 'how is it going')
+        self.assertEqual(
+            create_recipe._answer_for_this_turn(_UP, 'how is it going'),
+            'ba\nhello\nhow is it going')
+        self.assertEqual(self._answers(), [])
+        self.assertIsNone(getattr(create_recipe.user_tasks[_UP], '_unsaved_answer', None))
+
+    def test_a_daemon_turn_between_never_gets_the_persons_words(self):
+        """The hand-over is on the person's own turn only: a daemon tick that
+        comes first runs with its own text and leaves the words kept."""
+        self._expert_resumes()
+        self._turn('daemon_goal-7', 'tick')
+        self.assertEqual(create_recipe._answer_for_this_turn(_UP, 'tick'), 'tick')
+        self._turn('user-request-4', 'how is it going')
+        self.assertEqual(
+            create_recipe._answer_for_this_turn(_UP, 'how is it going'),
+            'ba\nhello\nhow is it going')
+
+    def test_the_kept_words_are_never_the_answer_to_a_new_ask(self):
+        """hartos-00's case: the flow moved on to a NEW ask step waiting on
+        this person.  The old 'ba' (the answer to "say ball") and 'hello' are
+        context for the model only; the new ask's answer is this turn's own
+        message, never the old answer to a different question."""
+        from agent_ledger.core import TaskStatus, add_actions_to_ledger
+        add_actions_to_ledger(self.ledger, [
+            {'action': 'ask which topic comes next', 'action_id': 4}], flow_id=0)
+        self._expert_resumes()
+        self.ledger.tasks['action_4'].status = TaskStatus.IN_PROGRESS
+        safe_set_state(_UP, 4, ActionState.IN_PROGRESS, 'working')
+        self.assertTrue(self.L.mark_action_waiting_for_user(
+            _UP, 4, 'which topic', flow=0, asked_in='user-request-5'))
+        task = create_recipe.user_tasks[_UP]
+        task.current_action, task._needs_user_input_action_id = 4, 4
+        task._needs_user_input_kind = 'human_required'
+        self.assertTrue(self._turn('user-request-6', 'algebra'))
+        answers_4 = [e['answer'] for e in self.ledger.tasks['action_4'].context.get(
+            self.L.USER_INPUT_EVIDENCE_KEY) or []]
+        self.assertEqual(answers_4, ['algebra'])
+        self.assertEqual(self._answers(), [], "'ba' was never recorded for action 3")
+        self.assertEqual(create_recipe._answer_for_this_turn(_UP, 'algebra'),
+                         'ba\nhello\nalgebra')
+
+    def test_what_waits_beside_a_kept_answer_is_capped_newest_kept(self):
+        """Minor 3: `later` grew without bound (61 failed turns, one 62-line
+        message, a 12k context at risk).  It keeps the newest ten."""
+        self.assertFalse(self._turn('user-request-2', 'ba', saves=False))
+        for n in range(3, 64):
+            self._turn(f'user-request-{n}', f'm{n}', saves=False)
+        kept = create_recipe.user_tasks[_UP]._unsaved_answer
+        self.assertEqual(kept['text'], 'ba')
+        self.assertEqual(kept['later'], [f'm{n}' for n in range(54, 64)])
+
+    def test_a_resend_differing_only_in_spaces_is_a_resend(self):
+        """Minor 4: 'ba ' after 'ba' was kept beside it.  Repeats compare
+        stripped; case is kept ('Ba' is the person's own word)."""
+        self.assertFalse(self._turn('user-request-2', 'ba', saves=False))
+        self.assertFalse(self._turn('user-request-3', 'ba ', saves=False))
+        self.assertEqual(create_recipe.user_tasks[_UP]._unsaved_answer['later'], [])
+        self.assertFalse(self._turn('user-request-4', 'Ba', saves=False))
+        self.assertEqual(create_recipe.user_tasks[_UP]._unsaved_answer['later'], ['Ba'])
+        self.assertTrue(self._turn('user-request-5', ' Ba'))
+        self.assertEqual(create_recipe._answer_for_this_turn(_UP, ' Ba'), 'ba\nBa')
+
     def test_the_line_is_only_for_the_turn_whose_retry_failed(self):
         """Item 3's second half: a person's turn that tried nothing gets no
         "couldn't save" line.  The asking request re-posted (the 10-19 retry
