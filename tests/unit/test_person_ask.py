@@ -661,6 +661,19 @@ def test_a_file_request_names_the_kind_of_file_its_store_takes(legs, purpose, ac
     assert legs['cards'][-1][1].get('accept') == accept
 
 
+@pytest.mark.parametrize('purpose, written, shown', [
+    ('logo', 'video', 'image'), ('reel_source', 'image', 'video'),
+    ('song_audio', 'video/mp4', 'audio'),
+    ('chat_attachment', 'image', 'image'), ('chat_attachment', 'font', None)])
+def test_an_agents_accept_never_contradicts_its_store(legs, purpose, written, shown):
+    """An agent's ``accept`` that names a kind the store refuses for the
+    purpose opened a picker whose every pick the store then turned away
+    (review of ec468c821): the kind shown is the store's."""
+    out = _ask(component=dict(CLIPS, purpose=purpose, accept=written))
+    assert out['ok'], out
+    assert legs['cards'][-1][1].get('accept') == shown
+
+
 @pytest.fixture
 def store(monkeypatch):
     """A real user file store in a temp dir (no disk margin: the test files

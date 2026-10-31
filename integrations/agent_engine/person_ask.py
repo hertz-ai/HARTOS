@@ -188,14 +188,19 @@ def _refusal(component, prompt_id) -> Optional[str]:
 def _file_card(card: dict, prompt_id) -> None:
     """A file_request asks for as many files as the store keeps of its
     purpose (one logo), at most a turn's attachments, for the agent asking.
-    An agent that names no ``accept`` gets the one kind of file the store
-    takes for the purpose (video, image or audio), so every surface opens
-    the right picker; a purpose that takes several kinds names none."""
+    Its ``accept`` is the one kind of file the store takes for the purpose
+    (video, image or audio), whatever the agent wrote, so every surface
+    opens the picker for files the store will keep; for a purpose that
+    takes several kinds, an agent's ``accept`` stands only when it names one
+    of them (the store refused every pick of a contradicting one: review of
+    ec468c821)."""
     from core.chat_attachments import MAX_ATTACHMENTS
     from core.user_file_store import PURPOSES
     kinds = {mime.split('/', 1)[0] for mime in PURPOSES[card['purpose']].types}
-    if not card.get('accept') and len(kinds) == 1:
-        card['accept'] = kinds.pop()
+    if len(kinds) == 1:
+        card['accept'] = next(iter(kinds))
+    elif str(card.get('accept') or '').split('/', 1)[0].strip().lower() not in kinds:
+        card.pop('accept', None)
     if PURPOSES[card['purpose']].newest_only:
         card['max_files'] = 1
     else:
@@ -503,10 +508,15 @@ def answer_ask(ask_id, answer, answerer_id) -> Tuple[dict, int]:
 
 def answer_from_request(req, data) -> Tuple[dict, int]:
     """/api/agent/approval's ask branch, for both of its routes (this node's
-    and the shell's): the answerer is the caller's Bearer identity."""
-    from integrations.commerce.approvals import approver_from_request
-    return answer_ask((data or {}).get('ask_id'), (data or {}).get('answer'),
-                      approver_from_request(req))
+    and the shell's): the answerer is the caller's Bearer identity.  A
+    signed-in person is who their token names (approver_from_request).  A
+    phone is this desktop's owner when the owner allowed it and it signed as
+    them, else nobody (integrations.social.auth.allowed_device_owner): the
+    owner's phone answers the owner's asks, and only asks."""
+    from integrations.commerce.approvals import approver_from_request, bearer_token
+    from integrations.social.auth import allowed_device_owner
+    answerer = approver_from_request(req) or allowed_device_owner(bearer_token(req))
+    return answer_ask((data or {}).get('ask_id'), (data or {}).get('answer'), answerer)
 
 
 def wait_for_answer(ask_id, timeout_s) -> Optional[dict]:
