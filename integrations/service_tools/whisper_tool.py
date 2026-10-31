@@ -1887,7 +1887,8 @@ async def _emit_final(websocket, audio_buffer, stt_lang, call_id, user_id) -> bo
         # chat mic now feeds learning too, behind the SAME consent the voice
         # agents already require. The gate moved into
         # _maybe_ingest_audio_sensor, where it can read ConsentService off the
-        # event loop. Voice-room streams (call_id set) are unchanged. The
+        # event loop. A call stream's speaker needs the same consent (see
+        # _maybe_ingest_audio_sensor). The
         # call-segment enqueue above stays keyed by call_id: a chat-mic segment
         # belongs to no call, so there is nothing to file it under.
         import asyncio
@@ -1978,7 +1979,7 @@ def _maybe_enqueue_call_segment(
             "(call=%s): %s", call_id, e)
 
 
-def _mic_learning_consented(user: str) -> bool:
+def _mic_learning_consented(user: str, ask: bool = True) -> bool:
     """True when ``user`` holds the consent the voice agents already require.
 
     Mirrors security/hive_guardrails.py for require_consent goals: the SAME
@@ -1988,6 +1989,10 @@ def _mic_learning_consented(user: str) -> bool:
     channel does (vision_service._start_screen_capture): request_consent
     dedupes and re-emits ONE card, so the UserConsent UI shows a single ask and
     granting it takes effect on the next utterance.
+
+    ``ask=False`` checks without filing the ask: a call speaker's id (a
+    Discord user, a LiveKit participant) may name no local person, so an ask
+    filed for it would be a pending row nobody can answer.
 
     FAIL-CLOSED: any error in the consent machinery means no ingest. A child's
     voice is not fed to learning on a guess.
@@ -1999,8 +2004,9 @@ def _mic_learning_consented(user: str) -> bool:
             if ConsentService.check_consent(db, str(user), 'data_access',
                                             scope='*'):
                 return True
-            ConsentService.request_consent(db, str(user), 'data_access',
-                                           scope='*')
+            if ask:
+                ConsentService.request_consent(db, str(user), 'data_access',
+                                               scope='*')
             return False
     except Exception as e:
         logger.debug("whisper_tool mic-learning consent check failed "
@@ -2028,7 +2034,13 @@ def _maybe_ingest_audio_sensor(
     learner ground the spoken WORD and not only the sound.
 
     Who is heard, and on whose consent:
-      * Voice-room stream (``call_id`` set): unchanged, ingested as before.
+      * Call stream (``call_id`` set): the speaker is the WS ``user_id``,
+        and a call carries OTHER people's voices (the Discord receiver and
+        the LiveKit subscriber forward every remote speaker).  Ingested only
+        when that speaker holds the same consent, checked without filing an
+        ask; a call stream with no speaker is skipped.  Until 2026-10-31 a
+        call was ingested with no consent lookup, which cost nothing only
+        because every final reached here as b'' until 5aa2c905f.
       * Chat mic (``call_id`` None): ingested only when the speaker's user
         holds the consent checked by _mic_learning_consented. The user is the
         WS ``user_id`` param when the client sends one, else the boot-declared
@@ -2039,7 +2051,7 @@ def _maybe_ingest_audio_sensor(
         it skips rather than guesses. The reading records where the identity
         came from (``identity_source``, also folded into ``sensor_id``) so an
         owner-attributed segment stays identifiable later.
-      * HEVOLVE_MIC_LEARNING=0 switches the chat-mic path off; voice rooms
+      * HEVOLVE_MIC_LEARNING=0 switches the chat-mic path off; call streams
         are unaffected by it.
 
     Runs on a thread-pool executor (the bridge call does a blocking HTTP POST
@@ -2049,7 +2061,11 @@ def _maybe_ingest_audio_sensor(
     if not pcm_bytes:
         return
     if call_id:
-        subject, identity_source = str(call_id), 'call'
+        if not user_id:
+            return
+        subject, identity_source = str(user_id), 'call'
+        if not _mic_learning_consented(subject, ask=False):
+            return
         sensor_id = f'mic_{call_id}'
     else:
         if os.environ.get('HEVOLVE_MIC_LEARNING', '1') == '0':
