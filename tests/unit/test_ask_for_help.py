@@ -110,10 +110,11 @@ def test_a_live_user_whose_step_already_asked_is_told_it_waits():
     so the loop's own line says the step waits for the reply, not that it
     "isn't coming together" (hartos-00's mutant M8 survived without this)."""
     from core.constants import USER_INPUT_GATE_AWAITING_REPLY
+    from tests.unit.module_swap import swap_modules
     states, names = _names(tasks={'7_1': types.SimpleNamespace(
         _needs_user_input_kind=USER_INPUT_GATE_AWAITING_REPLY)})
     ns = _functions(names)
-    with mock.patch.dict(sys.modules, _modules(autonomous=False)):
+    with swap_modules(_modules(autonomous=False)):
         reply = ns['_ask_for_help']('7_1', 1, 2, 'Collect the sources', 'it looped')
     assert reply == ns['_needs_input_reply'](2, 'Collect the sources', waiting=True)
     assert 'is waiting for your reply before I continue' in reply, reply

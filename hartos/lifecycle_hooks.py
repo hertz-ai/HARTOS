@@ -637,8 +637,7 @@ def record_user_answer(user_prompt: str, action_id: int, answer: str,
     asks = [dict(e) if isinstance(e, dict) else e
             for e in (context.get(ASK_DELIVERED_KEY) or [])]
     for entry in asks:
-        if (isinstance(entry, dict) and entry.get('flow') == _flow_index(flow)
-                and not entry.get('answered')):
+        if _is_open_ask(entry, flow):
             entry['answered'] = True
             context[ASK_DELIVERED_KEY] = asks
             break
@@ -711,6 +710,18 @@ _PIPELINE_SEATS = frozenset({'ChatInstructor', 'StatusVerifier', 'Assistant',
                              'Helper', 'Executor'})
 
 
+def _is_open_ask(entry, flow=None) -> bool:
+    """THE open-ask rule: an ask record that is neither answered nor
+    abandoned, in ``flow`` (any flow when None).  ledger_open_ask,
+    record_user_answer and _abandon_open_asks all read an ask through it
+    (hartos-00's review of 077e779b7, item 1: written out three times with
+    three rules, the answer closed an abandoned ask and left the fresh one
+    open)."""
+    return (isinstance(entry, dict)
+            and not entry.get('answered') and not entry.get('abandoned')
+            and (flow is None or entry.get('flow') == _flow_index(flow)))
+
+
 def ledger_open_ask(user_prompt: str, action_id: int, flow) -> Optional[dict]:
     """The OLDEST open ask recorded for this action in this flow, or None.
 
@@ -724,19 +735,23 @@ def ledger_open_ask(user_prompt: str, action_id: int, flow) -> Optional[dict]:
     context = getattr(task, 'context', None) if task is not None else None
     if not isinstance(context, dict):
         return None
-    wanted = _flow_index(flow)
     for entry in (context.get(ASK_DELIVERED_KEY) or []):
-        if (isinstance(entry, dict) and entry.get('flow') == wanted
-                and not entry.get('answered') and not entry.get('abandoned')):
+        if _is_open_ask(entry, flow):
             return entry
     return None
 
 
 def _abandon_open_asks(user_prompt: str, action_id: int) -> bool:
-    """Mark every open ask of this action abandoned, through the ledger's own
-    context setter (the seal holds), when the step gives up.  Best effort:
-    a failed save is reverted and logged, never raised into the state
-    write that called it."""
+    """Mark every open ask of this action abandoned, in any flow (_is_open_ask
+    with no flow: a give-up ends the step's question whatever flow raised
+    it), through the ledger's own context setter (the seal holds), when the
+    step gives up.  Best effort: a failed save is reverted and logged, never
+    raised into the state write that called it.  The ask then stays open
+    (review of 077e779b7, item 8): after a re-open it is the step's open ask
+    again, record_ask_delivered opens no second one beside it, and the
+    person's next answer closes it (the oldest open ask), so it never
+    outlives an answer, but the step is held on its old request id, via and
+    question until then."""
     try:
         ledger = _ledger_registry.get(user_prompt)
         task_id = f"action_{action_id}"
@@ -748,8 +763,7 @@ def _abandon_open_asks(user_prompt: str, action_id: int) -> bool:
                 for e in (before.get(ASK_DELIVERED_KEY) or [])]
         changed = False
         for entry in asks:
-            if (isinstance(entry, dict) and not entry.get('answered')
-                    and not entry.get('abandoned')):
+            if _is_open_ask(entry):
                 entry['abandoned'] = True
                 changed = True
         if not changed:

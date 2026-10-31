@@ -733,6 +733,30 @@ class ThePersonsWaitIsTheAskRecord(unittest.TestCase):
         self.assertEqual([a['answered'] for a in asks], [True])
         self.assertTrue(self._task(3).verify_integrity())
 
+    def test_an_answer_after_a_give_up_and_a_new_ask_closes_the_new_ask(self):
+        """hartos-00's review of 077e779b7, item 1: record_user_answer closed
+        the first unanswered entry of the flow, abandoned or not.  After a
+        give-up (the ask abandoned), a re-open (GAVE_UP -> ASSIGNED, #139) and
+        a fresh ask, the answer marked the OLD entry and left the new one
+        open, so a later daemon park plus a person's unrelated chat resumed
+        the action with that chat as the answer.  One open-ask rule now."""
+        from agent_ledger.core import TaskStatus
+        self._person_asked(3, 'user-request-1')
+        safe_set_state(_UP, 3, ActionState.GAVE_UP, 'gave up')
+        safe_set_state(_UP, 3, ActionState.ASSIGNED, 're-opened')
+        self.assertEqual(get_action_state(_UP, 3), ActionState.ASSIGNED)
+        self.assertIsNone(self.L.ledger_open_ask(_UP, 3, 0), 'the give-up abandoned it')
+        self._person_asked(3, 'user-request-5')
+        self.assertEqual(self.L.ledger_open_ask(_UP, 3, 0)['request_id'], 'user-request-5')
+        self.assertTrue(self._turn('user-request-6', 'ball'))
+        self.assertEqual(self._task(3).status, TaskStatus.IN_PROGRESS)
+        self.assertIsNone(self.L.ledger_open_ask(_UP, 3, 0), 'no ask is left open')
+        asks = [(a['request_id'], a.get('answered'), bool(a.get('abandoned')))
+                for a in self._task(3).context[self.L.ASK_DELIVERED_KEY]]
+        self.assertEqual(asks, [('user-request-1', False, True),
+                                ('user-request-5', True, False)])
+        self.assertTrue(self._task(3).verify_integrity())
+
     def test_close_open_ask_is_gone_from_hartos_and_nunba(self):
         """The ask closes only inside record_user_answer now; a caller left
         anywhere would import a name that no longer exists.  Tracked files
@@ -847,9 +871,57 @@ class AnAnswerTheLedgerCannotSaveIsKeptAndRetried(unittest.TestCase):
         self.assertFalse(self._turn('daemon_goal-7', 'tick'))
         self.assertEqual(self._answers(), [])
         self.assertIsNone(create_recipe._unsaved_answer_reply(_UP))
-        create_recipe.request_id_list[_UP] = 'user-request-3'
+        self.assertFalse(self._turn('user-request-3', 'ba?', saves=False))
         self.assertIsNotNone(create_recipe._unsaved_answer_reply(_UP),
-                             'the kept answer is still waiting for a person\'s turn')
+                             'the next person\'s turn retried it and failed')
+
+    def test_a_kept_answer_is_dropped_once_its_action_no_longer_waits_for_the_person(self):
+        """hartos-00's review of 077e779b7, item 3: on a recoverable_stall
+        gate the person's answer failed to save and was kept; the assigned
+        expert's turn then resumed the action, clearing the gate but not the
+        kept answer, and every later person's turn got "I couldn't save your
+        answer to step 3 yet..." with no retry and no model round until a
+        restart.  The kept answer goes once its action no longer waits for
+        the person, and the line is only for a turn whose retry ran and
+        failed."""
+        create_recipe.user_tasks[_UP]._needs_user_input_kind = 'recoverable_stall'
+        self.assertFalse(self._turn('user-request-2', 'ba', saves=False))
+        self.assertIsNotNone(create_recipe._unsaved_answer_reply(_UP))
+        with patch('hartos.create_recipe._is_serving_escalation_expert',
+                   return_value=True):
+            self.assertTrue(self._turn('daemon_expert_turn', 'expert'))
+        self.assertIsNone(getattr(create_recipe.user_tasks[_UP],
+                                  '_needs_user_input_action_id', None))
+        for n in (3, 4, 5):
+            self._turn(f'user-request-{n}', 'how is it going')
+            self.assertIsNone(create_recipe._unsaved_answer_reply(_UP),
+                              f'turn {n} was locked out by a stale kept answer')
+        self.assertIsNone(getattr(create_recipe.user_tasks[_UP], '_unsaved_answer', None))
+        self.assertEqual(self._answers(), [])
+
+    def test_the_line_is_only_for_the_turn_whose_retry_failed(self):
+        """Item 3's second half: a person's turn that tried nothing gets no
+        "couldn't save" line.  The asking request re-posted (the 10-19 retry
+        storm) is not the answer, retries nothing, and runs as usual; the
+        answer stays kept for the next real turn."""
+        self.assertFalse(self._turn('user-request-2', 'ba', saves=False))
+        self.assertIsNotNone(create_recipe._unsaved_answer_reply(_UP))
+        self.assertFalse(self._turn('user-request-1', 'say ball'))
+        self.assertIsNone(create_recipe._unsaved_answer_reply(_UP))
+        self.assertIsNotNone(getattr(create_recipe.user_tasks[_UP], '_unsaved_answer', None))
+        self.assertTrue(self._turn('user-request-3', 'ok'))
+        self.assertEqual(self._answers(), ['ba'])
+
+    def test_words_sent_while_the_retry_fails_are_kept_with_the_answer(self):
+        """Item 4: "ba" failed, the next message's retry failed too, and the
+        kept text stayed "ba", so once the save worked the model saw
+        'ba\\nok' and the middle message was gone without a word."""
+        self.assertFalse(self._turn('user-request-2', 'ba', saves=False))
+        self.assertFalse(self._turn('user-request-3', 'can you hear me', saves=False))
+        self.assertTrue(self._turn('user-request-4', 'ok'))
+        self.assertEqual(self._answers(), ['ba'], 'only the answer is recorded as the answer')
+        self.assertEqual(create_recipe._answer_for_this_turn(_UP, 'ok'),
+                         'ba\ncan you hear me\nok')
 
     def test_the_third_failure_is_an_error(self):
         with self.assertLogs('hartos.create_recipe', level='ERROR') as logs:

@@ -7502,8 +7502,7 @@ def _reuse_note_ask_and_wait(user_prompt, action_id, group_chat, returned_text=N
     try:
         if not _reuse_person_turn(user_prompt):
             return False
-        _state = get_action_state(user_prompt, action_id)
-        if _state == ActionState.GAVE_UP or is_terminal_state(_state):
+        if is_terminal_state(get_action_state(user_prompt, action_id)):
             return False
         if not _reuse_ask_only_step(user_prompt, action_id, group_chat):
             return False
