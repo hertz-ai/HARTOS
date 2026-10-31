@@ -454,32 +454,44 @@ def _paused_for_dispatch_failures(goal) -> bool:
 _HARNESS_EXPERIMENT_MIN_GOALS = 3
 
 
-def _failure_signature(why):
-    """The failure's key: ONE normaliser for the pause that stores it and the
-    proposer that matches it (review of 3d4c5b3a3: the stored why[:80] was
-    compared with a stripped copy, so a cut landing on a space, or a reason
-    led by whitespace, matched nothing and three identical pauses filed no
-    experiment, silently).  Stripped, cut to 80, stripped again where the cut
-    left whitespace; '' for no reason at all.  The egress scrub
-    (security.edge_privacy.scrub_text) runs on the whole text BEFORE the cut
-    (review by claude-autostart-71: a key straddling the cut left a fragment
-    too short for the secret patterns, which the proposer's scrub of the cut
-    text then let into a public Post title).  With no scrubber, or one that
-    fails, the text is cut as written and the failure logged: it stays on
-    the goal's own row, the pause that calls this still happens, and the
-    proposer, which scrubs again, publishes nothing without a working one
-    (review of 6d557b153 by claude-autostart-71: anything but an
-    ImportError escaped into the pause arm before pause_goal).  A goal
-    paused before 6d557b153 holds a signature cut before the scrub; for a
-    key-free failure it is the same text, and otherwise it does not count
-    with the new ones toward the three-goal proposal, which is transitional."""
+def _failure_signature(why, goal_key=None):
+    """The failure's key, as (signature, scrubbed): ONE normaliser for the
+    pause that stores it and the proposer that matches it (review of
+    3d4c5b3a3: the stored why[:80] was compared with a stripped copy, so a
+    cut landing on a space, or a reason led by whitespace, matched nothing
+    and three identical pauses filed no experiment, silently).  Stripped, cut
+    to 80, stripped again where the cut left whitespace; '' for no reason at
+    all.  The egress scrub (security.edge_privacy.scrub_text) runs on the
+    whole text BEFORE the cut (review by claude-autostart-71: a key
+    straddling the cut left a fragment too short for the secret patterns,
+    which the proposer's scrub of the cut text then let into a public Post
+    title).
+
+    With no scrubber, or one that fails, the text is cut as written and
+    ``scrubbed`` is False: it stays on the goal's own row, the pause that
+    calls this still happens (review of 6d557b153 by claude-autostart-71:
+    anything but an ImportError escaped into the pause arm before
+    pause_goal), and the caller proposes nothing from it.  Raw stays local,
+    what leaves is refused: hartos-00's review of cd49395bc reproduced a
+    scrubber that failed on the whole text but not on the 80-char cut, and
+    the proposer's own scrub of the cut passed a key fragment into a public
+    ThoughtExperiment.  A goal paused before 6d557b153 holds a signature cut
+    before the scrub; for a key-free failure it is the same text, and
+    otherwise it does not count with the new ones toward the three-goal
+    proposal, which is transitional."""
     text = str(why or '').strip()
+    scrubbed = False
     try:
         from security.edge_privacy import scrub_text
         text = scrub_text(text).strip()
+        scrubbed = True
+    except ImportError:
+        logger.debug(f"Goal {goal_key}: no egress scrubber; its failure "
+                     f"signature stays on its own row and is not proposed")
     except Exception as exc:
-        logger.warning(f"Failure signature kept unscrubbed on the goal's row: {exc}")
-    return text[:80].rstrip()
+        logger.warning(f"Goal {goal_key}: failure signature kept unscrubbed on "
+                       f"its own row and not proposed: {exc}")
+    return text[:80].rstrip(), scrubbed
 
 
 def _propose_harness_experiment_for_signature(db, signature):
@@ -603,7 +615,7 @@ def _auto_pause_for_dispatch_failures(db, goal, goal_key, failure_count, why):
     cfg = dict(goal.config_json or {})
     if 'spark_at_dispatch' in pending:
         cfg['spark_at_dispatch'] = pending['spark_at_dispatch']
-    signature = _failure_signature(why)
+    signature, scrubbed = _failure_signature(why, goal_key)
     reason = dispatch_failure_pause_reason(failure_count, why)
     result = GoalManager.pause_goal(
         db, goal, cause=PAUSE_CAUSE_DISPATCH_FAILURES, by='daemon',
@@ -615,7 +627,7 @@ def _auto_pause_for_dispatch_failures(db, goal, goal_key, failure_count, why):
     cfg = result['config']
     logger.warning(
         f"Goal {goal_key} AUTO-PAUSED after {failure_count} dispatch failures")
-    if signature:
+    if signature and scrubbed:
         _propose_harness_experiment_for_signature(db, signature)
     if (int(cfg.get('daemon_resume_count', 0) or 0) >= _RESUME_CAP
             and not cfg.get('told_at')):

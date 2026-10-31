@@ -208,10 +208,10 @@ PAUSE_RECORD_KEYS = ('pause_reason', 'paused_at', 'pause_cause', 'paused_by',
 
 #: The words a dispatch-failure pause says to people (pause_reason).  The
 #: agent daemon and the coding daemon write them through
-#: dispatch_failure_pause_reason; the agent daemon reads them
-#: (is_dispatch_failure_pause_reason) only for a row paused before
-#: pause_cause existed.  The literal was written in two places and read in a
-#: third (review of 3d4c5b3a3's set by claude-autostart-71).
+#: dispatch_failure_pause_reason (the literal was written in two places,
+#: review of 3d4c5b3a3's set by claude-autostart-71).  Rewording them is
+#: safe: a new row is read by its pause_cause, and an old row by the frozen
+#: copy below.
 DISPATCH_FAILURE_PAUSE_PREFIX = 'Auto-paused: '
 DISPATCH_FAILURE_PAUSE_WORDS = 'consecutive dispatch failures'
 
@@ -222,11 +222,20 @@ def dispatch_failure_pause_reason(failures, why=None) -> str:
             + (f' (last: {why})' if why else ''))
 
 
+#: The sentence as rows paused before pause_cause existed hold it, frozen
+#: from the reader those rows were written for (agent_daemon before
+#: cd49395bc): an old row keeps the words it was written with, so its reader
+#: must not follow a later rewording of the writer's constants above
+#: (hartos-00's review of cd49395bc, F3).
+_PRE_CAUSE_DISPATCH_FAILURE_PAUSE = ('Auto-paused:', 'consecutive dispatch failures')
+
+
 def is_dispatch_failure_pause_reason(reason) -> bool:
-    """Whether ``reason`` is that sentence."""
+    """Whether ``reason`` is the dispatch-failure sentence of a row paused
+    before pause_cause existed, the only rows whose words are read."""
     text = str(reason or '')
-    return (text.startswith(DISPATCH_FAILURE_PAUSE_PREFIX)
-            and DISPATCH_FAILURE_PAUSE_WORDS in text)
+    prefix, words = _PRE_CAUSE_DISPATCH_FAILURE_PAUSE
+    return text.startswith(prefix) and words in text
 
 
 class GoalManager:

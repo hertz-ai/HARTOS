@@ -213,7 +213,10 @@ def test_every_key_a_pause_writes_is_retired_by_the_resume(db):
     would be retired by nobody (the pause_signature miss).  The daemon's own
     pause at its retry cap writes every optional key (its signature, and
     told_at once its person is told); every top-level key it adds is in the
-    tuple the resume retires."""
+    tuple the resume retires.  It covers the daemon's pause path only:
+    escalate_goal and the budget gate write keys of their own (their pause
+    records are read and retired by their own tests), so a key added there
+    is not caught here (claude-autostart-71's nit on cd49395bc)."""
     goal = _goal(db, 'w1', {'goal_note': 'kept', 'daemon_resume_count': ad._RESUME_CAP})
     before = set(goal.config_json)
     with patch.object(GoalManager, '_tell_its_person', return_value=True):
@@ -241,6 +244,41 @@ def test_the_daemons_pause_is_read_by_its_cause_not_its_words(db):
                              'pause_reason': 'Auto-paused: 5 consecutive dispatch failures'},
                   status='paused')
     assert not ad._paused_for_dispatch_failures(other)
+
+
+def _old_row(db, gid, reason):
+    """A row paused before pause_cause existed, right after its own last
+    dispatch, never resumed: the only shape whose words are read."""
+    goal = _goal(db, gid, status='paused')
+    goal.last_dispatched_at = datetime(2026, 10, 20, 10, 0, 0)
+    goal.config_json = {'pause_reason': reason,
+                        'paused_at': (goal.last_dispatched_at
+                                      + timedelta(minutes=5)).isoformat()}
+    db.commit()
+    return goal
+
+
+def test_an_old_row_with_other_words_is_not_the_daemons(db):
+    """hartos-00's review of cd49395bc, F2: no test read an old row whose
+    words are another pause's, paused within the hour of its dispatch (the
+    one fixture with other words had no dispatch time, so it failed the
+    timing check anyway).  Its words are not the daemon's sentence: it is
+    not the daemon's to resume."""
+    assert ad._paused_for_dispatch_failures(
+        _old_row(db, 'o1', 'Auto-paused: 5 consecutive dispatch failures'))
+    assert not ad._paused_for_dispatch_failures(
+        _old_row(db, 'o2', 'Auto-paused: 3 consecutive no-op dispatches'))
+
+
+def test_an_old_row_is_read_by_the_sentence_it_was_written_with(db, monkeypatch):
+    """hartos-00's review of cd49395bc, F3: old rows hold the sentence as it
+    was written, but the reader matched today's writer constants, so
+    rewording the writer would have changed which old rows the daemon
+    resumes.  The reader keeps a frozen copy of the historical sentence."""
+    goal = _old_row(db, 'h1', 'Auto-paused: 5 consecutive dispatch failures')
+    monkeypatch.setattr(gm, 'DISPATCH_FAILURE_PAUSE_PREFIX', 'Paused: ')
+    monkeypatch.setattr(gm, 'DISPATCH_FAILURE_PAUSE_WORDS', 'failed turns in a row')
+    assert ad._paused_for_dispatch_failures(goal)
 
 
 def test_update_goal_status_paused_to_active_goes_through_resume_goal(db):

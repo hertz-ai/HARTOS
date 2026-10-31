@@ -202,6 +202,32 @@ def test_a_scrubber_failure_still_pauses_and_publishes_nothing(db):
     assert _harness_experiments(db) == []
 
 
+def test_an_unscrubbed_signature_is_never_proposed(db):
+    """hartos-00's review of cd49395bc, F1 (blocking, privacy): with a
+    scrubber that fails on the whole failure text but not on the 80-char cut,
+    the pause kept the raw cut and handed it to the proposer, whose own scrub
+    of those 80 chars passed: 'sk-proj-' plus 27 key characters reached a
+    public ThoughtExperiment title and hypothesis.  Raw stays local, on the
+    goal's own row; a signature the scrub did not clean is never proposed."""
+    keyed = ('turn failed: upstream refused the call, key in the url: '
+             'sk-proj-' + 'B' * 40)
+
+    def fails_on_the_whole_text(text):
+        if len(text) > 80:
+            raise RuntimeError('scrubber failed on the long text')
+        return text
+
+    with patch('security.edge_privacy.scrub_text',
+               side_effect=fails_on_the_whole_text):
+        for gid in ('k1', 'k2', 'k3'):
+            _pause(db, _active(db, gid), why=keyed)
+    for gid in ('k1', 'k2', 'k3'):
+        goal = db.get(AgentGoal, gid)
+        assert goal.status == 'paused'
+        assert goal.config_json['pause_signature'] == keyed[:80].rstrip()
+    assert _harness_experiments(db) == []
+
+
 def test_no_signature_is_stored_for_a_failure_with_no_reason(db):
     """Minor from the review: an empty signature is no key at all."""
     _pause(db, _active(db, 'n1'), why=None)
