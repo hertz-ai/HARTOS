@@ -103,8 +103,10 @@ def speech(monkeypatch, tmp_path):
             agent, ('Assistant', 'Helper', 'Executor', 'StatusVerifier'))
         user, instructor = agent('User'), agent('ChatInstructor')
 
-        def send_message_to_user(message: str) -> str:
-            state['sends'].append(message)
+        # The real tool's signature (core/agent_tools.py): a stand-in taking
+        # 'message' hid that the ask recorder read the wrong argument.
+        def send_message_to_user(text: str, expects_reply: bool) -> str:
+            state['sends'].append(text)
             return 'Message sent'
 
         def read_item(item: int) -> str:
@@ -131,7 +133,8 @@ def speech(monkeypatch, tmp_path):
                     return True, {'content': '', 'tool_calls': [{
                         'id': f'ask_{len(state["sends"])}', 'type': 'function',
                         'function': {'name': 'send_message_to_user',
-                                     'arguments': json.dumps({'message': ASK_LINE})}}]}
+                                     'arguments': json.dumps({'text': ASK_LINE,
+                                                              'expects_reply': True})}}]}
                 # The reply turn: the model judges, it does not ask again.
                 return True, 'Arjun said "ba": a good attempt at ball.'
             if aid == 2:
@@ -471,18 +474,22 @@ class TestAProseNoStepThatOnlyWritesOutputCompletesAsBefore:
 
 
 class TestADaemonTurnWalksTheParentsPaths:
-    """Critical 2: until the owner rules on daemon replay of 'no' steps, a
-    daemon turn takes exactly the parent's paths: the send receipt completes
-    the step, it is promoted, no ask is recorded, nothing is held."""
+    """Critical 2 left a daemon turn on the parent's paths until the owner
+    ruled on daemon replay of 'no' steps.  The owner ruled on 31 Oct: a
+    background step whose output is a question goes to the owner, never
+    "done".  476bbd5d8's rework part A: the question is never the step's
+    receipt on any turn; part B parks the goal and asks the owner (not yet
+    landed, so no ask is recorded and nothing is held on a daemon turn)."""
 
-    def test_a_daemon_tick_on_the_ask_step_finishes_the_flow_as_before(self, speech):
+    def test_a_daemon_tick_never_closes_the_ask_step_on_its_question(self, speech):
         from agent_ledger.core import TaskStatus
         run = speech(ask_verdict='completed')
         with patch.object(run.L, '_promote_verified_outcome') as promote:
             run.turn('tick', 'daemon_goal_turn')
         assert run.state['sends'] == [ASK_LINE]
-        assert run.rr.user_tasks[run.key].current_action == 4
-        assert 1 in [c.args[1] for c in promote.call_args_list]
+        assert 1 not in [c.args[1] for c in promote.call_args_list]
+        assert _task(run, 1).status not in (TaskStatus.COMPLETED, TaskStatus.TERMINATED)
+        assert run.rr.user_tasks[run.key].current_action == 1
         assert all(_task(run, a).status != TaskStatus.BLOCKED for a in (1, 2, 3))
         assert run.L.ledger_open_ask(run.key, 1, 0) is None
 
@@ -750,7 +757,8 @@ class TestAReplyJudgedInsufficientKeepsTheOneAsk:
                 return {'content': '', 'tool_calls': [{
                     'id': 'ask_again', 'type': 'function',
                     'function': {'name': 'send_message_to_user',
-                                 'arguments': json.dumps({'message': again})}}]}
+                                 'arguments': json.dumps({'text': again,
+                                                          'expects_reply': True})}}]}
             return None
 
         def verifier(state, aid, content):

@@ -396,6 +396,7 @@ from hartos.lifecycle_hooks import (
     verdict_names_another_action, dispatch_action_id, ACTION_STATES_AWAITING_USER, autonomy_needs_user,
     action_is_autonomous, action_named_tools, action_own_text,
     is_written_answer, ANSWER_KEYS, user_output_receipt,
+    SEND_TOOL, send_is_ask, verdict_waits_on_person,
     mark_action_waiting_for_user, resume_from_user_input,
     record_ask_delivered, ledger_open_ask, person_waits_on, is_terminal_state,
 )
@@ -4946,10 +4947,11 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
         # question found in the window is recorded as the ask and the caller
         # holds the step; else nothing reached the person as an ask (an
         # output step whose written answer is its output, Critical 1) and the
-        # parent's paths below decide.
+        # parent's paths below decide.  A step not flagged 'no' is one when
+        # this run asked the person (_reuse_ask_only_step): a send that asks
+        # is never its receipt, the answer is.
         if (_reuse_person_turn(user_prompt)
-                and _reuse_action_declares_user_pause(user_prompt, action_id)
-                and _reuse_names_only_the_ask_tool(referenced)):
+                and _reuse_ask_only_step(user_prompt, action_id, group_chat)):
             reply = _reuse_reply_evidence(user_prompt, action_id, messages)
             if reply:
                 return reply
@@ -4966,9 +4968,12 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
             call_fn = _reuse_call_id_to_tool_name([msgs for _s, msgs in sources])
             seen = getattr(task, 'evidence_seen_call_ids', set()) if task else set()
             seen = seen if isinstance(seen, (set, frozenset)) else set()
+            _every_msg = [m for _s, msgs in sources for m in msgs]
             def _is_named_result(msg):
                 """This tool message carries an unseen, non-failed result of a
-                tool the action names -- the gate's own rule, one copy."""
+                tool the action names -- the gate's own rule, one copy.  A send
+                that asked the person something is never one
+                (lifecycle_hooks.send_is_ask): its answer is the receipt."""
                 if not isinstance(msg, dict) or msg.get('role') != 'tool':
                     return False
                 responses = msg.get('tool_responses')
@@ -4982,7 +4987,10 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
                         continue
                     if tool_reply_failed(body):
                         continue
-                    if (call_fn.get(call_id) or result.get('name')) in wanted:
+                    _fn = call_fn.get(call_id) or result.get('name')
+                    if _fn == SEND_TOOL and send_is_ask(_every_msg, call_id):
+                        continue
+                    if _fn in wanted:
                         return True
                 return False
 
@@ -5043,16 +5051,22 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
 
 def _reuse_output_send(user_prompt, action_id, group_chat):
     """The send that delivered a no-tool step's output, as evidence, or None:
-    lifecycle_hooks.user_output_receipt with this session's watermark and the
-    step's own 'no' flag.  One call for the receipt finder above and the
-    no-output gate in _advance_reuse_action, so the gate never refuses as
-    "no output" a step the finder would commit on its send."""
+    lifecycle_hooks.user_output_receipt with this session's watermark, and
+    the step waiting on the person when its banked flag says 'no' OR this
+    run's verdict says so (status pending, or can_perform_without_user_input
+    'no'): the banked flag is CREATE's guess, the verdict is this run's
+    judgment (the owner, on 476bbd5d8: the output is the completed-state
+    JSON, and an ask's verdict is pending).  One call for the receipt finder
+    above and the no-output gate in _advance_reuse_action, so the gate never
+    refuses as "no output" a step the finder would commit on its send."""
     task = user_tasks.get(user_prompt)
     seen = getattr(task, 'evidence_seen_call_ids', None)
     seen = seen if isinstance(seen, (set, frozenset)) else set()
     return user_output_receipt(
         user_prompt, action_id, group_chat, seen,
-        waits_on_person=_reuse_action_declares_user_pause(user_prompt, action_id))
+        waits_on_person=(
+            _reuse_action_declares_user_pause(user_prompt, action_id)
+            or verdict_waits_on_person(_reuse_latest_verdict(group_chat))))
 
 
 # Asks for the ONE thing the round never produced.  Deliberately names the
@@ -6471,7 +6485,11 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
             # and 89555447799 ('requires_breakdown') measurements.
             # Steer first (bounded), then let the normal advance path decide;
             # that path re-runs the fabrication gate, so nothing advances whose
-            # tool did not actually execute.
+            # tool did not actually execute.  A step whose window holds a send
+            # that asked the person is not under-reporting: 'pending' is the
+            # truth, and its run waits for the answer (hartos-00's review of
+            # 476bbd5d8: this escape completed a question send under
+            # every-'pending' verdicts).
             try:
                 # Was `group_chat.messages[-1]`, which is the ChatInstructor
                 # nudge 120 times in 128 (see _reuse_latest_verdict) -- that one
@@ -6483,7 +6501,9 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                         and _reuse_current_action not in _reuse_advanced_actions
                         and _reuse_action_is_autonomous(user_prompt, _reuse_current_action)
                         and not _reuse_outstanding_tools(user_prompt, _reuse_current_action,
-                                                        group_chat)):
+                                                        group_chat)
+                        and not _reuse_window_holds_an_ask(user_prompt, _reuse_current_action,
+                                                           group_chat)):
                     _pk = (user_prompt, _reuse_current_action)
                     _pn = _reuse_pending_counts.get(_pk, 0)
                     if _pn < _REUSE_PENDING_STEER_MAX:
@@ -7205,7 +7225,13 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
                 return None, False
             elif not _reuse_action_declares_tool(user_prompt, current_action_id) \
                     and _reuse_written_answer(_gc) is None \
-                    and _reuse_output_send(user_prompt, current_action_id, _gc) is None:
+                    and _reuse_output_send(user_prompt, current_action_id, _gc) is None \
+                    and not (_reuse_person_turn(user_prompt)
+                             and _reuse_window_holds_an_ask(user_prompt, current_action_id, _gc)
+                             and _reuse_ask_only_step(user_prompt, current_action_id, _gc)):
+                # A question that reached the person is not "no output": the
+                # receipt finder records it as the step's ask and the step
+                # holds for the answer (the owner on 476bbd5d8).
                 # The send that delivered the step's output is its output too
                 # (_reuse_output_send, the receipt finder's own rule): live
                 # 2026-10-31 17:13 IST, agent 45620673143 action 3 sent its
@@ -7467,10 +7493,33 @@ def _reuse_ask_only_step(user_prompt, action_id, group_chat):
     """A step that waits for the person and whose words name no tool other
     than send_message_to_user: the one shape whose ask is its own delivery
     and whose completion a reply may supply (#161).  A 'no' step naming any
-    other tool keeps needing that tool's receipt."""
+    other tool keeps needing that tool's receipt.
+
+    It waits when its banked flag says 'no', or when THIS run asked the
+    person: an ask recorded for it is still open, or its window holds a send
+    that asks (lifecycle_hooks.send_is_ask, which also reads this run's
+    verdict).  The owner on 476bbd5d8: a question is never the step done.
+    A 'pending' verdict with no send is not an ask: that is the
+    under-report the escape in get_agent_response exists for.  The banked flag
+    stays as it is; the next run decides again."""
+    if not _reuse_names_only_the_ask_tool(
+            _reuse_step_referenced_tools(user_prompt, action_id, group_chat)):
+        return False
     return bool(_reuse_action_declares_user_pause(user_prompt, action_id)
-                and _reuse_names_only_the_ask_tool(
-                    _reuse_step_referenced_tools(user_prompt, action_id, group_chat)))
+                or ledger_open_ask(user_prompt, action_id,
+                                   _reuse_action_flow(user_prompt, action_id))
+                or _reuse_window_holds_an_ask(user_prompt, action_id, group_chat))
+
+
+def _reuse_window_holds_an_ask(user_prompt, action_id, group_chat):
+    """This step's dispatch window holds a send that reached the person as
+    its ask (_reuse_ask_index: any send for a step flagged 'no', a send that
+    asks for any other)."""
+    messages = list(getattr(group_chat, 'messages', None) or [])
+    dispatch_index = _reuse_latest_dispatch_index(messages, action_id)
+    return dispatch_index is not None and _reuse_ask_index(
+        group_chat, messages, dispatch_index, written_counts=False,
+        step_waits=_reuse_action_declares_user_pause(user_prompt, action_id)) is not None
 
 
 def _reuse_step_names_the_ask_tool(user_prompt, action_id, group_chat):
@@ -7498,8 +7547,11 @@ def _reuse_verdict_is_pending(group_chat):
 
 
 def _reuse_send_text(messages, call_id):
-    """The ``message`` argument of the send_message_to_user call ``call_id``
-    (the question the person was sent), or None."""
+    """The ``text`` argument of the send_message_to_user call ``call_id``
+    (the question the person was sent), or None.  The real tool's argument
+    is ``text`` (core/agent_tools.py); this read ``message``, the name the
+    #161 test fixture's stand-in used, so a live ask was recorded with no
+    question and a turn with no request id got the generic line back."""
     for m in messages:
         for call in ((m or {}).get('tool_calls') or []):
             if isinstance(call, dict) and call.get('id') == call_id:
@@ -7507,17 +7559,19 @@ def _reuse_send_text(messages, call_id):
                     args = json.loads((call.get('function') or {}).get('arguments') or '{}')
                 except Exception:
                     return None
-                return args.get('message') if isinstance(args, dict) else None
+                return args.get('text') if isinstance(args, dict) else None
     return None
 
 
 def _reuse_ask_index(group_chat, messages, dispatch_index, written_counts,
-                     returned_text=None):
+                     returned_text=None, step_waits=True):
     """The question the person got after this step's dispatch, as
     (index, via, question), or None.
 
     'send': the latest non-failed send_message_to_user receipt (the question
-    is the call's message).  Else, only when ``written_counts`` (a pending
+    is the call's message); for a step not flagged 'no' (``step_waits``
+    False) only a send that asks (lifecycle_hooks.send_is_ask), since its
+    declared deliveries are its output.  Else, only when ``written_counts`` (a pending
     verdict, or a step whose words name the send tool): 'reply' when this
     exit returns text to the person (``returned_text``, the last message),
     else 'written', the step's written answer.  None when nothing reached the
@@ -7527,6 +7581,7 @@ def _reuse_ask_index(group_chat, messages, dispatch_index, written_counts,
     (_REUSE_ASK_REACHED_THE_PERSON)."""
     from core.constants import tool_reply_failed
     call_fn = _reuse_call_id_to_tool_name([messages])
+    verdict = None if step_waits else _reuse_latest_verdict(group_chat)
     for idx in range(len(messages) - 1, dispatch_index, -1):
         m = messages[idx] or {}
         if m.get('role') != 'tool':
@@ -7537,8 +7592,9 @@ def _reuse_ask_index(group_chat, messages, dispatch_index, written_counts,
                 continue
             call_id = result.get('tool_call_id') or m.get('tool_call_id')
             body = str(result.get('content') or m.get('content') or '')
-            if (call_fn.get(call_id) == 'send_message_to_user'
-                    and not tool_reply_failed(body)):
+            if (call_fn.get(call_id) == SEND_TOOL
+                    and not tool_reply_failed(body)
+                    and (step_waits or send_is_ask(messages, call_id, verdict))):
                 return idx, 'send', _reuse_send_text(messages, call_id)
     if not written_counts:
         return None
@@ -7592,7 +7648,8 @@ def _reuse_record_ask_in_window(user_prompt, action_id, group_chat, messages,
     if dispatch_index is None:
         return False
     found = _reuse_ask_index(group_chat, messages, dispatch_index, written_counts,
-                             returned_text=returned_text)
+                             returned_text=returned_text,
+                             step_waits=_reuse_action_declares_user_pause(user_prompt, action_id))
     if found is None:
         return False
     ask_idx, via, question = found
@@ -7784,18 +7841,18 @@ def _reuse_seed_message(user_prompt, message):
         current_action_id = user_tasks[user_prompt].current_action
         words = message
         _reuse_pending_reply.pop(user_prompt, None)
-        # An ask step with an open ask from an EARLIER turn: this genuine turn
+        # A step with an open ask from an EARLIER turn: this genuine turn
         # carries the person's reply (#161).  Say so in the seed, so the model
         # judges the words instead of asking again, and capture the reply
         # with its request id for the receipt finder.  Any other turn seeds
-        # byte-for-byte as before.
-        if _reuse_action_declares_user_pause(user_prompt, current_action_id):
-            _rid = str(request_id_list.get(user_prompt) or '')
-            _flow = _reuse_action_flow(user_prompt, current_action_id)
-            _ask = ledger_open_ask(user_prompt, current_action_id, _flow)
-            if (_ask and str(_ask.get('request_id') or '') != _rid
-                    and _reuse_request_is_a_person(_rid)):
-                words = f"{_REUSE_REPLY_PREFACE}{message}"
+        # byte-for-byte as before.  The open ask is the record, whether the
+        # step is flagged 'no' or its run asked (_reuse_ask_only_step).
+        _rid = str(request_id_list.get(user_prompt) or '')
+        _flow = _reuse_action_flow(user_prompt, current_action_id)
+        _ask = ledger_open_ask(user_prompt, current_action_id, _flow)
+        if (_ask and str(_ask.get('request_id') or '') != _rid
+                and _reuse_request_is_a_person(_rid)):
+            words = f"{_REUSE_REPLY_PREFACE}{message}"
         seeded = _build_reuse_action_message(
             user_prompt, current_action_id, user_words=words)
         if words is not message:

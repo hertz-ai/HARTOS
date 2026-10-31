@@ -56,12 +56,15 @@ S = lh.ActionState
 
 _ACTION = ("Confirm user's topic focus and preferred detail level before "
            "proceeding with guided discovery.")
-# The live call's text, from the 17:13:03 input dump.
+# The live call's text without its closing question.  The live send ended
+# "Ready to begin?": a question, which the owner ruled is never the step
+# done (tests/unit/test_a_send_that_asks_never_completes.py holds it as
+# written).  Every send here is a delivery, declared expects_reply=false.
 _SEND_TEXT = ("Thanks for sharing your topic preference on basic algebra and "
               "your beginner level. I'll now prepare some guiding questions to "
               "help you discover the concepts yourself before revealing the "
               "solutions. This approach will make learning more engaging and "
-              "memorable. Ready to begin?")
+              "memorable.")
 _SENT = 'Message sent successfully to user with request_id: msg_1793446973018_ex'
 _CALL_ID = 'DPuAdrjjOQ6vI4Yo95I0jZRlrgFamxFf'
 _SERVED = ('get_data_by_key', 'send_message_to_user', 'google_search',
@@ -72,8 +75,9 @@ _NAMED = 'get_data_by_key: read key tutor.progress for the topic being learned'
 
 
 def _send(call_id=_CALL_ID, reply=_SENT, text=_SEND_TEXT):
-    """A send_message_to_user call and its result, as the live log held them."""
-    return [_call(call_id, 'send_message_to_user', json.dumps({'text': text})),
+    """A send_message_to_user call declared as delivery, and its result."""
+    return [_call(call_id, 'send_message_to_user',
+                  json.dumps({'text': text, 'expects_reply': False})),
             _result(call_id, reply)]
 
 
@@ -223,7 +227,8 @@ class TestNoOtherResultCompletesAProseStep(_BothProjectors):
                          'tool_calls': [
                              {'id': 's1', 'type': 'function', 'function': {
                                  'name': 'send_message_to_user',
-                                 'arguments': json.dumps({'text': _SEND_TEXT})}},
+                                 'arguments': json.dumps({'text': _SEND_TEXT,
+                                                          'expects_reply': False})}},
                              {'id': 'g1', 'type': 'function', 'function': {
                                  'name': 'google_search', 'arguments': '{}'}}]}
                 both = {'role': 'tool', 'name': 'Assistant', 'content': bad,
@@ -296,13 +301,14 @@ _LIVE_FLOW = [
 
 
 def _sends_its_output(state, aid, content):
-    """The live 4B: step 1's output goes out as a send, every time it is
-    asked; step 2 writes its line."""
+    """Step 1's output goes out as a send declared as delivery, every time
+    it is asked; step 2 writes its line."""
     if aid == 1:
         return {'content': '', 'tool_calls': [{
             'id': f'send_{len(state["sends"])}', 'type': 'function',
             'function': {'name': 'send_message_to_user',
-                         'arguments': json.dumps({'message': _SEND_TEXT})}}]}
+                         'arguments': json.dumps({'text': _SEND_TEXT,
+                                                  'expects_reply': False})}}]}
     return 'Basic algebra is a great place to start; you will do well.'
 
 
@@ -313,6 +319,13 @@ def test_the_step_completes_on_its_send_and_the_walk_goes_on(speech):
     from agent_ledger.core import TaskStatus
     run = speech(actions=_LIVE_FLOW, assistant_script=_sends_its_output,
                  verdict_script=_completed)
+    executor = next(a for a in run.gc.agents if a.name == 'Executor')
+
+    def send_message_to_user(text: str, expects_reply: bool) -> str:
+        run.state['sends'].append(text)
+        return 'Message sent successfully to user with request_id: r'
+
+    executor.register_for_execution(name='send_message_to_user')(send_message_to_user)
     run.turn('basic algebra, beginner level', 'request-1')
     assert _task(run, 1).status in (TaskStatus.COMPLETED, TaskStatus.TERMINATED), (
         f'{_task(run, 1).status} / {_task(run, 1).blocked_reason}')

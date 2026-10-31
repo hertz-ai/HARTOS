@@ -1922,6 +1922,79 @@ def tool_call_names(msg_lists) -> Dict[str, str]:
     return out
 
 
+#: The send the person reads; its expects_reply argument says whether it asked
+#: them something (core/agent_tools.py send_message_to_user).
+SEND_TOOL = 'send_message_to_user'
+
+
+def send_expects_reply(messages, call_id) -> Optional[bool]:
+    """What a send_message_to_user call declared: True (it asks the person
+    something), False (it only tells them), None when it declared nothing (a
+    call made before the argument existed).  Read off the PROPOSING message's
+    tool_calls, joined by call id as tool_call_names joins the function: the
+    act decides, never the words.  A JSON string 'true'/'false' is read as
+    its value."""
+    import json
+    for m in (messages or []):
+        if not isinstance(m, dict):
+            continue
+        for tc in (m.get('tool_calls') or []):
+            if (tc or {}).get('id') != call_id:
+                continue
+            fn = (tc or {}).get('function') or {}
+            if fn.get('name') != SEND_TOOL:
+                return None
+            args = fn.get('arguments')
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    return None
+            value = args.get('expects_reply') if isinstance(args, dict) else None
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str) and value.strip().lower() in ('true', 'false'):
+                return value.strip().lower() == 'true'
+            return None
+    return None
+
+
+def verdict_waits_on_person(verdict) -> bool:
+    """This run's verdict says the step waits on the person: status 'pending',
+    or a can_perform_without_user_input autonomy_needs_user reads as 'no'."""
+    if not isinstance(verdict, dict):
+        return False
+    return (str(verdict.get('status') or '').strip().lower() == 'pending'
+            or autonomy_needs_user(verdict.get('can_perform_without_user_input')))
+
+
+def send_is_ask(messages, call_id, verdict=None) -> bool:
+    """THE ONE RULE for whether a send asked the person something, read by
+    every reader of a send (the gate's _work_results, user_output_receipt,
+    REUSE's ask finder and named-tool receipt).  The owner on 476bbd5d8:
+    "when the output is a question to get the job done, how can that be
+    counted as that step is done?"  Live 2026-10-31 17:13 IST, agent
+    45620673143 action 3: its only output was a send ending "Ready to
+    begin?".  An ask is never a step's receipt; the person's answer is
+    (kind user_reply).
+
+    A send is an ask unless it declared expects_reply=false, and a declared
+    delivery is an ask too when this run's verdict says the step waits on the
+    person.  Undeclared counts as an ask: the fail-safe is a person
+    answering "ok", never a step closed on its own question."""
+    return (send_expects_reply(messages, call_id) is not False
+            or verdict_waits_on_person(verdict))
+
+
+def action_in_progress(user_prompt) -> Optional[int]:
+    """The action this session is working on (IN_PROGRESS or awaiting its
+    verdict), or None; for the per-send log line."""
+    for aid, st in (action_states.get(user_prompt) or {}).items():
+        if st in (ActionState.IN_PROGRESS, ActionState.STATUS_VERIFICATION_REQUESTED):
+            return aid
+    return None
+
+
 def action_own_text(action) -> str:
     """The words one action says: an action dict's own 'action' text, a string
     as it is, '' for None.  The text action_named_tools reads.
@@ -2133,17 +2206,20 @@ def _receipt_is_real_work(user_prompt: str, action_id: int, messages,
     """
     action_text, named = _tools_this_action_names(user_prompt, action_id)
     return any(True for _ in _work_results(
-        message, tool_call_names([messages]), action_text, named))
+        message, tool_call_names([messages]), action_text, named, messages))
 
 
 def _work_results(message: dict, names: Dict[str, str], action_text: str,
-                  named):
+                  named, messages=None):
     """The tool name of each result in a role='tool' ``message`` that is the
     action's work, by _receipt_is_real_work's rule (its docstring gives the
-    four exclusions); None for a result whose function cannot be resolved,
-    which only an action naming no tool accepts.  ``names`` is
-    tool_call_names of the message's list; ``action_text`` and ``named`` are
-    _tools_this_action_names of the action."""
+    four exclusions), and never a send that asked the person something
+    (send_is_ask, read in ``messages``, the message's list): a question is
+    not the action done, whatever the verifier wrote.  None for a result
+    whose function cannot be resolved, which only an action naming no tool
+    accepts.  ``names`` is tool_call_names of the message's list;
+    ``action_text`` and ``named`` are _tools_this_action_names of the
+    action."""
     responses = message.get('tool_responses')
     results = responses if isinstance(responses, list) and responses else [message]
     for result in results:
@@ -2155,7 +2231,10 @@ def _work_results(message: dict, names: Dict[str, str], action_text: str,
         if (not str(body or '').strip() or tool_reply_failed(body)
                 or HISTORICAL_TOOL_PLACEHOLDER in str(body)):
             continue
-        name = names.get(result.get('tool_call_id') or message.get('tool_call_id'))
+        call_id = result.get('tool_call_id') or message.get('tool_call_id')
+        name = names.get(call_id)
+        if name == SEND_TOOL and send_is_ask(messages, call_id):
+            continue
         if name in BOOKKEEPING_TOOLS and name.lower() not in action_text:
             continue
         if named and name not in named:
@@ -2247,7 +2326,7 @@ def tool_result_is_action_work(user_prompt: str, action_id: int,
         for i, msg in enumerate(messages[:index + 1]):
             if (isinstance(msg, dict) and msg.get('role') == 'tool'
                     and latest_dispatch_before(messages, i + 1) == action_id):
-                done.update(_work_results(msg, names, action_text, named))
+                done.update(_work_results(msg, names, action_text, named, messages))
         return set(named) <= done
     except Exception:
         logger.warning(
@@ -2486,7 +2565,8 @@ def user_output_receipt(user_prompt: str, action_id: int, group_chat,
                         continue
                     call_id = result.get('tool_call_id') or msg.get('tool_call_id')
                     body = str(result.get('content') or msg.get('content') or '')
-                    if (names.get(call_id) != 'send_message_to_user'
+                    if (names.get(call_id) != SEND_TOOL
+                            or send_is_ask(msgs, call_id)
                             or call_id in seen or not body.strip()
                             or tool_reply_failed(body)
                             or HISTORICAL_TOOL_PLACEHOLDER in body):
@@ -2976,7 +3056,10 @@ def lifecycle_hook_process_verifier_response(user_prompt: str, json_obj: dict, u
                     f"StatusVerifier must report action_id {current_action_id} "
                     "and cite an earlier tool receipt that did this action's "
                     "work (not a note saved to memory, not a failed call) or a "
-                    "user-visible result from this conversation.")
+                    "user-visible result from this conversation.  If this "
+                    "action asked the person something and waits for their "
+                    "answer, report status pending: a question is not the "
+                    "action done.")
             }
         # Automatically request fallback after completion
         return {

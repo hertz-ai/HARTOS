@@ -2010,9 +2010,20 @@ def build_core_tool_closures(ctx):
     _AGENT_MENTIONS = ("@statusverifier", "@status verifier", "@verification",
                       "@helper", "@executor")
 
+    # expects_reply is REQUIRED and has no default: a message that asks the
+    # person something and one that only tells them something are different
+    # acts, and the step's completion is decided from which act was called,
+    # never from the words (lifecycle_hooks.send_is_ask).  Live 2026-10-31
+    # 17:13 IST, agent 45620673143 action 3: the step's only output was a
+    # send ending "Ready to begin?", and reading every send as delivery would
+    # have closed the step on its own question.  A call that omits it fails
+    # here (the tool_logging error envelope names the argument) and sends
+    # nothing, so an omission is a visible failed call, never a silent ask
+    # or a silent completion.
     @log_tool_execution
     def send_message_to_user(
         text: Annotated[str, "Text you want to send to the user"],
+        expects_reply: Annotated[bool, "true if this message asks the user something you need answered before your step is done; false if it only tells them something"],
         avatar_id: Annotated[Optional[str], "Unique identifier for the avatar"] = None,
         response_type: Annotated[Optional[str], "Response mode: 'Realistic' (slower, better quality) or 'Realtime' (faster, lower quality)"] = 'Realtime',
     ) -> str:
@@ -2023,6 +2034,23 @@ def build_core_tool_closures(ctx):
                 f'Message directed to agent ({mention}), not sending to user: {text[:50]}...')
             return f'Message directed to {mention} agent, not sending to user'
         tool_logger.info('INSIDE send_message_to_user')
+        # One line per send with what decides the step: which act it was,
+        # the turn it ran in and the action it ran for, so the share of sends
+        # that ask is measured, not guessed (hartos-00's review of the
+        # 476bbd5d8 rework).
+        try:
+            from hartos.threadlocal import thread_local_data as _tld
+            _rid = _tld.get_request_id()
+        except Exception:
+            _rid = None
+        try:
+            from hartos.lifecycle_hooks import action_in_progress
+            _aid = action_in_progress(user_prompt)
+        except Exception:
+            _aid = None
+        tool_logger.info(
+            f'[SEND-KIND] {user_prompt} action={_aid} request={_rid} '
+            f'expects_reply={expects_reply}')
         tool_logger.info(f'SENDING DATA 2 user with values text:{text}, avatar_id:{avatar_id}, response_type:{response_type}')
         # The send runs HERE and its result is the tool's result.  This used
         # to start the send on a thread and return "sent successfully" before
@@ -2038,7 +2066,10 @@ def build_core_tool_closures(ctx):
 
     tools.append((
         "send_message_to_user",
-        "Sends a message/information to user. You can use this if you want to ask a question",
+        "Sends a message to the user. Set expects_reply true when the message "
+        "asks them something you need answered before your step is done (your "
+        "step then waits for their answer), false when it only tells them "
+        "something.",
         send_message_to_user,
     ))
 

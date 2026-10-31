@@ -52,14 +52,14 @@ def _tool(send1, request_id_list=None):
 
 def test_a_failed_send_is_reported_as_failed():
     send1 = MagicMock(return_value=_FAILED)
-    out = _tool(send1)('Which month should I use?')
+    out = _tool(send1)('Which month should I use?', expects_reply=True)
     assert out == _FAILED, out
     send1.assert_called_once_with('u1', 'Which month should I use?', '', 'p1')
 
 
 def test_a_delivered_message_is_reported_with_the_senders_own_words():
     send1 = MagicMock(return_value=_SENT)
-    assert _tool(send1)('hello') == _SENT
+    assert _tool(send1)('hello', expects_reply=False) == _SENT
 
 
 def test_the_send_has_finished_before_the_tool_answers():
@@ -71,7 +71,7 @@ def test_the_send_has_finished_before_the_tool_answers():
         ran_on.append(threading.current_thread())
         return _SENT
 
-    _tool(send1)('hello')
+    _tool(send1)('hello', expects_reply=False)
     assert ran_on == [threading.current_thread()]
 
 
@@ -79,19 +79,19 @@ def test_no_request_id_on_record_does_not_break_the_tool():
     """The tool used to build its own receipt from request_id_list[user_prompt]
     and raised KeyError when there was none; the sender owns the id."""
     send1 = MagicMock(return_value=_SENT)
-    assert _tool(send1, request_id_list={})('hello') == _SENT
+    assert _tool(send1, request_id_list={})('hello', expects_reply=False) == _SENT
 
 
 @pytest.mark.parametrize('result', [None, '', 42])
 def test_a_sender_that_reports_nothing_is_never_read_as_success(result):
-    out = _tool(MagicMock(return_value=result))('hello')
+    out = _tool(MagicMock(return_value=result))('hello', expects_reply=False)
     assert 'successfully' not in out.lower(), out
     assert 'not confirmed' in out, out
 
 
 def test_a_message_for_another_agent_is_still_not_sent():
     send1 = MagicMock(return_value=_SENT)
-    out = _tool(send1)('@helper please run it')
+    out = _tool(send1)('@helper please run it', expects_reply=False)
     send1.assert_not_called()
     assert 'not sending to user' in out
 

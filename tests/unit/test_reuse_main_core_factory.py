@@ -283,11 +283,11 @@ class ReuseMainCoreFactory(unittest.TestCase):
         from unittest import mock
         send1 = mock.Mock()
         tools = self._factory_tools(send1=send1)
-        blocked = tools['send_message_to_user']('please ask @Helper to run it')
+        blocked = tools['send_message_to_user']('please ask @Helper to run it', expects_reply=False)
         self.assertIn('not sending to user', blocked)
         send1.assert_not_called()
         with mock.patch('core.agent_tools.threading.Thread', self._InlineThread):
-            tools['send_message_to_user']('hello there')
+            tools['send_message_to_user']('hello there', expects_reply=False)
         send1.assert_called_once()
 
     def test_reuse_inline_scheduler_is_real_not_stub(self):
