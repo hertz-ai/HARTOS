@@ -2659,6 +2659,19 @@ def _flow_has_action(user_prompt: str, action_id: int) -> bool:
         getattr(get_registered_ledger(user_prompt), 'tasks', None) or {})
 
 
+def claimed_action_int(claimed_action_id) -> Optional[int]:
+    """The action id a verdict names, as an int; None when it names none an
+    int can hold: missing, words ('action_1'), 'inf', '1e999', 'nan'.
+
+    The one parse of a verdict's action_id, for settled_action_id and
+    verdict_names_another_action.  int(float(x)) raised OverflowError on
+    'inf' and '1e999' out of both (task #168, review of 1ca1fbaa5)."""
+    try:
+        return int(float(claimed_action_id))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def verdict_names_another_action(user_prompt: str, action_id,
                                  claimed_action_id):
     """The other action of this flow a verdict names, or None.
@@ -2672,12 +2685,12 @@ def verdict_names_another_action(user_prompt: str, action_id,
     reuse's walk, which asks the verifier again instead of ending the turn
     on the refusal.
     """
-    if claimed_action_id is None:
-        return None
+    claimed = claimed_action_int(claimed_action_id)
     try:
-        claimed = int(float(claimed_action_id))
         posted = int(action_id)
     except (TypeError, ValueError, OverflowError):
+        return None
+    if claimed is None:
         return None
     if claimed != posted and _flow_has_action(user_prompt, claimed):
         return claimed
@@ -3122,9 +3135,8 @@ def settled_action_id(claimed_action_id, current_action_id) -> int:
         logger.warning("settled_action_id: the posted action %r is not an int; "
                        "leaving it as it is", current_action_id)
         return current_action_id
-    try:
-        claimed = int(float(claimed_action_id))
-    except (TypeError, ValueError):
+    claimed = claimed_action_int(claimed_action_id)
+    if claimed is None:
         return current
     if claimed != current:
         logger.warning(

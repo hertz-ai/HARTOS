@@ -562,6 +562,9 @@ class TestReuseCompletesWhenTheVerdictMisnumbersTheAction(
                    lambda *a, **k: None)
         rr._reuse_resteer_counts.pop((self.UP, 1), None)
         rr._reuse_fab_pending.pop((self.UP, 1), None)
+        getattr(rr, '_reuse_reask_counts', {}).pop((self.UP, 1), None)
+        rr.thread_local_data.set_request_id('run-1')
+        self.addCleanup(rr.thread_local_data.set_request_id, None)
         ctx = flask.Flask(__name__).app_context()
         ctx.push()
         self.addCleanup(ctx.pop)
@@ -570,6 +573,18 @@ class TestReuseCompletesWhenTheVerdictMisnumbersTheAction(
     def _advance(self, claimed):
         return rr._advance_reuse_action(self.UP, 1, 'test', None,
                                         claimed_action_id=claimed)
+
+    def _post(self, name, content):
+        """What the live walk appends: the re-ask as the ChatInstructor's
+        message, then the verifier's next verdict."""
+        self.gc.messages.append({'role': 'user', 'name': name,
+                                 'content': content})
+
+    @staticmethod
+    def _verdict(action_id):
+        return json.dumps({'status': 'completed', 'action': _ACTION[:40],
+                           'action_id': action_id,
+                           'message': 'The lesson was given.'})
 
     def test_a_verdict_naming_action_2_of_a_flow_of_one_advances_it(self):
         self._advance(2)
@@ -619,13 +634,55 @@ class TestReuseCompletesWhenTheVerdictMisnumbersTheAction(
         self.assertEqual(lh.get_action_state(self.UP, 1),
                          S.STATUS_VERIFICATION_REQUESTED)
 
-    def test_a_verdict_naming_the_posted_action_after_the_re_ask_completes_it(
-            self):
+    def test_the_lesson_written_before_the_re_ask_completes_the_action(self):
+        """The real log shape (review of 1ca1fbaa5, Critical): the re-ask
+        lands in the group log as the ChatInstructor's message and the
+        verifier answers after it.  Agent 54's action names no tool, so its
+        receipt is the lesson the Assistant wrote BEFORE the re-ask; the
+        written-answer scan stopped at the re-ask, so the corrected verdict
+        was refused as 'it produced no output' while the lesson sat in the
+        log."""
         self.ledger = _Ledger(_ACTION, actions=2)
         self._advance(2)
-        rr._reuse_fab_steer_message(self.UP, 1)
+        self._post('ChatInstructor', rr._reuse_fab_steer_message(self.UP, 1))
+        self._post('StatusVerifier', self._verdict(1))
         self._advance(1)
-        self.assertEqual(lh.get_action_state(self.UP, 1), S.TERMINATED)
+        self.assertEqual(lh.get_action_state(self.UP, 1), S.TERMINATED,
+                         'the lesson before the re-ask was not found')
+
+    def test_a_second_misnumber_after_the_re_ask_asks_again(self):
+        """A verifier that misnumbers once more is asked again, not told
+        the action 'produced no output' (the lesson is in the log) and not
+        recorded GAVE_UP."""
+        self.ledger = _Ledger(_ACTION, actions=2)
+        self._advance(2)
+        self._post('ChatInstructor', rr._reuse_fab_steer_message(self.UP, 1))
+        self._post('StatusVerifier', self._verdict(2))
+        self._advance(2)
+        steer = rr._reuse_fab_steer_message(self.UP, 1) or ''
+        self.assertIn('judge action 1', steer)
+        self.assertNotIn('produced no', steer)
+        self.assertEqual(lh.get_action_state(self.UP, 1),
+                         S.STATUS_VERIFICATION_REQUESTED)
+
+    def test_the_re_ask_budget_is_per_run_and_its_own(self):
+        """Review of 1ca1fbaa5 (Medium-High): the re-asks spent the
+        fabrication re-steer budget, which refills only when the session's
+        agents are rebuilt, so three misnumbers in one run left the next run
+        no re-ask and no fabrication re-steer.  The re-ask budget is its
+        own and starts again with each run (request)."""
+        self.ledger = _Ledger(_ACTION, actions=2)
+        for _ in range(rr._REUSE_FAB_STEER_MAX):
+            self._advance(2)
+            self.assertIsNotNone(rr._reuse_fab_steer_message(self.UP, 1))
+        self._advance(2)
+        self.assertIsNone(rr._reuse_fab_steer_message(self.UP, 1))
+        self.assertFalse(rr._reuse_resteer_counts.get((self.UP, 1)),
+                         'a re-ask spent the fabrication re-steer budget')
+        rr.thread_local_data.set_request_id('run-2')
+        self._advance(2)
+        self.assertIsNotNone(rr._reuse_fab_steer_message(self.UP, 1),
+                             'the next run got no re-ask')
 
 
 class TestTheMentionListIsOneList(unittest.TestCase):

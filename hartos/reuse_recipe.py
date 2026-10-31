@@ -1426,6 +1426,8 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
     # next run about a tool it already ran.
     for _k in [k for k in _reuse_resteer_counts if k[0] == user_prompt]:
         _reuse_resteer_counts.pop(_k, None)
+    for _k in [k for k in _reuse_reask_counts if k[0] == user_prompt]:
+        _reuse_reask_counts.pop(_k, None)
     for _k in [k for k in _reuse_fab_pending if k[0] == user_prompt]:
         _reuse_fab_pending.pop(_k, None)
     # Create a basic function calling config.
@@ -3779,6 +3781,15 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
 _reuse_resteer_counts = {}
 _REUSE_FAB_STEER_MAX = 3
 
+# Re-asks of the verifier per (user_prompt, action_id), stored as
+# (request_id, count) so the count starts again with each run: a verdict
+# that names another action of the flow is asked again up to
+# _REUSE_FAB_STEER_MAX times per run.  Its own budget, not the fabrication
+# gate's: _reuse_resteer_counts refills only when the session's agents are
+# rebuilt, so re-asks spent there left later runs no fabrication re-steer
+# (review of 1ca1fbaa5).
+_reuse_reask_counts = {}
+
 # The MIRROR of the fabrication gate.  That gate catches an action CLAIMING
 # completion whose tool never ran.  This one catches the opposite, measured
 # live 2026-09-05 on Scout2 (77712340019): google_search really ran (three
@@ -3950,10 +3961,11 @@ _REUSE_NON_ANSWER_SEATS = _REUSE_STEER_INITIATOR_NAMES + _REUSE_VERIFIER_SEATS
 _REUSE_ACTION_MESSAGE_PREFIX = 'Perform this action -> Action #'
 
 
-# How every refusal re-steer opens — BOTH branches of
-# _reuse_fab_steer_message ("...the tool(s) X did not produce a real result"
-# and "...it produced no output").  One marker, emitted by the producer, so
-# the recogniser below cannot drift from the wording.
+# How every refusal re-steer opens — EVERY branch of
+# _reuse_fab_steer_message ("...the tool(s) X did not produce a real result",
+# "...it produced no output" and "...the verdict named action M").  One
+# marker, emitted by the producer, so the recogniser below cannot drift from
+# the wording.
 _REUSE_NOT_COMPLETE_MARKER = ' is NOT complete: '
 
 # PRODUCER FOUR.  Posted into the group to tell the agent to proceed without
@@ -4082,6 +4094,19 @@ _REUSE_NO_OUTPUT_SENTINEL = '<no output produced>'
 # it names); this record lets the walk ask the verifier again instead of
 # ending the turn on the refusal.  Internal only, like the sentinel above.
 _REUSE_OTHER_ACTION_SENTINEL = '<verdict names another action>'
+
+# The words only the verifier re-ask carries.  The re-ask asks the verifier
+# to JUDGE work this action already did, so unlike every other re-steer it
+# does not open a new span of work: the written-answer scan steps past it to
+# the answer it follows (_reuse_is_verifier_reask).  One constant, used by
+# the producer and the recogniser.
+_REUSE_VERIFIER_REASK_PHRASE = ', but the action being verified is action '
+
+
+def _reuse_is_verifier_reask(content):
+    """Whether ``content`` is the verifier re-ask of _reuse_fab_steer_message
+    (a verdict that named another action of the flow)."""
+    return _REUSE_VERIFIER_REASK_PHRASE in str(content or '')
 
 
 def _reuse_action_at(user_prompt, action_id):
@@ -4422,13 +4447,18 @@ def _reuse_turn_round_budget(user_prompt):
         n_actions = 1
     return max(1, n_actions) * _REUSE_ROUNDS_PER_ACTION
 
-# Unrun tool names recorded by the fabrication gate for the refusal it just
-# returned, keyed the same way, and consumed by _reuse_fab_steer_message.
+# The refusal _advance_reuse_action just returned, keyed (user_prompt,
+# action_id) and consumed by _reuse_fab_steer_message: the unrun tool names
+# (fabrication gate), [_REUSE_NO_OUTPUT_SENTINEL] (no text produced), or
+# [_REUSE_OTHER_ACTION_SENTINEL, named id] (the verdict named another action).
 _reuse_fab_pending = {}
 
 
 def _reuse_fab_steer_message(user_prompt, current_action_id):
-    """Re-steer text for a fabrication refusal, or None if it was not one.
+    """Re-steer text for a refusal _advance_reuse_action recorded, or None
+    when there is none: a tool with no real result, an action that wrote no
+    output, or a verdict that named another action of the flow (the last one
+    re-asks the verifier, see _REUSE_OTHER_ACTION_SENTINEL).
 
     _advance_reuse_action returns (None, False) for BOTH "this action's tool
     never ran" and "all actions done / state error", so every caller treated a
@@ -4446,8 +4476,8 @@ def _reuse_fab_steer_message(user_prompt, current_action_id):
         named = list(tools)[1] if len(tools) > 1 else '?'
         return (
             f"Action {current_action_id}{_REUSE_NOT_COMPLETE_MARKER}the "
-            f"verdict named action {named}, but the action being verified is "
-            f"action {current_action_id}. @StatusVerifier judge action "
+            f"verdict named action {named}{_REUSE_VERIFIER_REASK_PHRASE}"
+            f"{current_action_id}. @StatusVerifier judge action "
             f"{current_action_id} only: if its result is in this "
             f"conversation, give its verdict with \"action_id\": "
             f"{current_action_id}; if it is not done, say what is missing. "
@@ -4830,6 +4860,12 @@ def _reuse_written_answer(group_chat):
     try:
         for msg in reversed(list(getattr(group_chat, 'messages', None) or [])):
             _m = msg or {}
+            # The verifier re-ask is not a bound: it asks the verifier to
+            # judge the answer it FOLLOWS (a lesson written before it), and
+            # stopping on it hid that answer, so the corrected verdict was
+            # refused as "it produced no output" (review of 1ca1fbaa5).
+            if _reuse_is_verifier_reask(_m.get('content')):
+                continue
             if str(_m.get('name') or '') in _REUSE_STEER_INITIATOR_NAMES:
                 return None                  # reached this action's dispatch
             # ...and by CONTENT, because the seat name does not survive the
@@ -5638,8 +5674,10 @@ def _advance_or_steer(user_prompt, action_id, reason, prompt_id,
     _attach_named_tools_for_action(user_prompt)
 
     if not advanced:
-        # A fabrication refusal is NOT "all actions done" — it wants the
-        # tool actually run, so steer instead of ending the turn.
+        # A recorded refusal is NOT "all actions done": a fabrication
+        # refusal wants the tool actually run, a no-output refusal wants the
+        # text written, a misnumbered verdict wants the verifier to judge
+        # this action.  Steer instead of ending the turn.
         steer_message = _reuse_fab_steer_message(user_prompt, action_id)
         if not steer_message:
             return False
@@ -7253,9 +7291,12 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
         user_prompt, current_action_id, claimed_action_id)
     if _named is not None:
         _rk = (user_prompt, current_action_id)
-        _n = _reuse_resteer_counts.get(_rk, 0)
+        _run = thread_local_data.get_request_id()
+        _run_seen, _n = _reuse_reask_counts.get(_rk, (_run, 0))
+        if _run_seen != _run:
+            _n = 0                     # a new run gets the re-asks back
         if _n < _REUSE_FAB_STEER_MAX:
-            _reuse_resteer_counts[_rk] = _n + 1
+            _reuse_reask_counts[_rk] = (_run, _n + 1)
             _reuse_fab_pending[_rk] = [_REUSE_OTHER_ACTION_SENTINEL, _named]
             current_app.logger.warning(
                 f"[REUSE-VERIFY] the verdict for action {current_action_id} "
