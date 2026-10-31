@@ -456,17 +456,63 @@ def block_for_user_input(user_prompt: str, action_id: int,
     return True
 
 
-def mark_action_waiting_for_user(user_prompt: str, action_id: int, reason: str) -> bool:
+def mark_action_waiting_for_user(user_prompt: str, action_id: int, reason: str,
+                                 flow=None, asked_in=None) -> bool:
     """Project an existing input dependency into both lifecycle authorities.
 
     The ledger is blocked first while the action is still in progress; then
     the canonical ActionState projection becomes ``PENDING``.  This preserves
     the existing ``input_required`` reason instead of creating a second queue
     or allowing the generic pending projection to relabel it as a dependency.
+
+    When a PERSON was asked (``asked_in`` is a genuine user request; None
+    reads this thread's request), the ask is recorded too
+    (record_ask_delivered), the one record of "this action waits for the
+    person's reply" that CREATE and REUSE both read (person_waits_on,
+    ledger_open_ask).  A daemon turn's wait asks nobody and records no ask:
+    _ask_for_help's park, the verifier hook and this function all leave a
+    task BLOCKED with input_required, and only the ask tells a person's wait
+    from a park (hartos-00's review of cb13208d2, items 1 and 4).
     """
     if not block_for_user_input(user_prompt, action_id, reason):
         return False
+    _record_the_persons_ask(user_prompt, action_id, flow, asked_in)
     return safe_set_state(user_prompt, action_id, ActionState.PENDING, reason)
+
+
+def _record_the_persons_ask(user_prompt: str, action_id: int, flow, asked_in) -> bool:
+    """record_ask_delivered for a wait a person was asked in, else nothing.
+
+    ``flow`` comes from the caller (CREATE's current flow, REUSE's task
+    flow).  Without one it falls back to the task's recipe_flow_id, which is
+    the flow the task was CREATED in: action_N is one ledger task across
+    flows, so in a later flow that value is stale, the ask is filed under the
+    earlier flow, and person_waits_on in the later flow does not find it.
+    That mismatch only ever re-asks the person; it never takes a wrong
+    answer."""
+    if asked_in is None:
+        try:
+            from hartos.threadlocal import thread_local_data
+            asked_in = thread_local_data.get_request_id()
+        except Exception:
+            asked_in = None
+    try:
+        from integrations.agent_engine.dispatch import is_genuine_user_request
+    except Exception:
+        return False
+    if not is_genuine_user_request(str(asked_in or '')):
+        return False
+    if flow is None:
+        ledger = _ledger_registry.get(user_prompt)
+        task = ledger.tasks.get(f"action_{action_id}") if ledger else None
+        flow = getattr(task, 'recipe_flow_id', None) or 0
+    if not record_ask_delivered(user_prompt, action_id, asked_in, None, flow):
+        logger.error(
+            "Could not record that the person was asked for action %s in %s: "
+            "the block holds, but after a restart their reply is not "
+            "recognised and they are asked again", action_id, user_prompt)
+        return False
+    return True
 
 
 def resume_blocked_action(user_prompt: str, action_id: int,
@@ -535,10 +581,10 @@ def ledger_holds_no_block(user_prompt: str, action_id: int) -> bool:
             and task.status != _get_ledger_task_status().BLOCKED)
 
 
-#: The key under which the create loop records the person's answer on the
-#: ledger task's context (record_user_answer): the one durable record that a
-#: step stopped for the person and was answered.  resume_from_user_input's
-#: optional evidence uses the same key.
+#: The key under which the person's answer is recorded on the ledger task's
+#: context (record_user_answer, for CREATE's reply and REUSE's user_reply
+#: alike): the one durable record that a step stopped for the person and was
+#: answered.
 USER_INPUT_EVIDENCE_KEY = 'user_input_evidence'
 
 
@@ -564,7 +610,13 @@ def record_user_answer(user_prompt: str, action_id: int, answer: str,
     the flow boundary keeps the ledger (create_action_with_ledger's reuse
     branch; add_actions_to_ledger skips a task id it already holds), so a
     later flow's action_N is the same task.  False when there is no ledger or
-    no such task."""
+    no such task.
+
+    The answer closes the oldest open ask of this action in this flow
+    (ASK_DELIVERED_KEY) in the SAME context update and the same save: the
+    ask closes when, and only when, the answer is recorded.  A failed save
+    therefore leaves the ask open for the retry, and a reply the verifier
+    refused (no record) leaves it open for the next one."""
     ledger = _ledger_registry.get(user_prompt)
     task_id = f"action_{action_id}"
     task = ledger.tasks.get(task_id) if ledger else None
@@ -582,6 +634,14 @@ def record_user_answer(user_prompt: str, action_id: int, answer: str,
         'timestamp': datetime.now(timezone.utc).isoformat(),
     })
     context[USER_INPUT_EVIDENCE_KEY] = items
+    asks = [dict(e) if isinstance(e, dict) else e
+            for e in (context.get(ASK_DELIVERED_KEY) or [])]
+    for entry in asks:
+        if (isinstance(entry, dict) and entry.get('flow') == _flow_index(flow)
+                and not entry.get('answered')):
+            entry['answered'] = True
+            context[ASK_DELIVERED_KEY] = asks
+            break
     if not ledger.update_task_context(task_id, context, defer_save=True):
         return False
     if ledger.save() is False:
@@ -615,37 +675,33 @@ def ledger_user_answered(user_prompt: str, action_id: int, flow) -> bool:
                for entry in (context.get(USER_INPUT_EVIDENCE_KEY) or []))
 
 
-def blocked_action_awaiting_user(user_prompt: str) -> Optional[int]:
-    """The lowest action whose ledger task is BLOCKED for the person
-    (blocked_reason 'input_required'), or None.
+def person_waits_on(user_prompt: str, action_id: int, flow) -> bool:
+    """Whether this one action waits for the PERSON's reply in this flow: its
+    ledger task is BLOCKED with blocked_reason input_required AND it holds an
+    open ask in the flow (ledger_open_ask).  The one reader of that question
+    for CREATE (the reply after a restart, G5) and REUSE (_reuse_held_action).
 
-    The create loop's gate is a sticky flag on the in-memory task
-    (_needs_user_input_action_id); a restart between the ask and the reply
-    loses it, so the first reply after a restart was ignored and the person
-    was asked again (G5).  The ledger is the durable half of that same wait
-    (mark_action_waiting_for_user writes both), so the reply derives the
-    waiting action from it when the flag is gone.  Only the person's wait
-    counts: a task BLOCKED on a dependency is not asking anyone."""
+    The block alone does not say it: _ask_for_help's park, the verifier hook
+    and mark_action_waiting_for_user all write it, and only the last records
+    an ask, and only when a person was asked.  Asked of one action, never a
+    scan: the lowest blocked task answered action 2 with a reply meant for 3
+    (hartos-00's review of cb13208d2, item 5)."""
     ledger = _ledger_registry.get(user_prompt)
-    if ledger is None:
-        return None
-    blocked = _get_ledger_task_status().BLOCKED
-    waiting = []
-    for task_id, task in (getattr(ledger, 'tasks', None) or {}).items():
-        if (getattr(task, 'status', None) == blocked
-                and getattr(task, 'blocked_reason', None) == 'input_required'
-                and str(task_id).startswith('action_')):
-            try:
-                waiting.append(int(str(task_id)[len('action_'):]))
-            except ValueError:
-                continue
-    return min(waiting) if waiting else None
+    task = ledger.tasks.get(f"action_{action_id}") if ledger else None
+    if task is None:
+        return False
+    if (getattr(task, 'status', None) != _get_ledger_task_status().BLOCKED
+            or getattr(task, 'blocked_reason', None) != 'input_required'):
+        return False
+    return ledger_open_ask(user_prompt, action_id, flow) is not None
 
 
-#: The key under which REUSE records that an ask step's question was delivered
-#: to the person (record_ask_delivered): one open entry per step and flow,
-#: closed when the reply completes the step (close_open_ask).  Read by
-#: ledger_open_ask for the gate's user_reply evidence (#161).
+#: The key under which a delivered question is recorded on the action's
+#: ledger task (record_ask_delivered): REUSE's ask step when its question
+#: reaches the person, and mark_action_waiting_for_user when a person's turn
+#: asked.  One open entry per step and flow, closed when the person's answer
+#: is recorded (record_user_answer, same save).  Read by ledger_open_ask and
+#: person_waits_on.
 ASK_DELIVERED_KEY = 'ask_delivered'
 
 #: The group chat's own seats.  A message from one of them is pipeline text,
@@ -671,19 +727,66 @@ def ledger_open_ask(user_prompt: str, action_id: int, flow) -> Optional[dict]:
     wanted = _flow_index(flow)
     for entry in (context.get(ASK_DELIVERED_KEY) or []):
         if (isinstance(entry, dict) and entry.get('flow') == wanted
-                and not entry.get('answered')):
+                and not entry.get('answered') and not entry.get('abandoned')):
             return entry
     return None
 
 
+def _abandon_open_asks(user_prompt: str, action_id: int) -> bool:
+    """Mark every open ask of this action abandoned, through the ledger's own
+    context setter (the seal holds), when the step gives up.  Best effort:
+    a failed save is reverted and logged, never raised into the state
+    write that called it."""
+    try:
+        ledger = _ledger_registry.get(user_prompt)
+        task_id = f"action_{action_id}"
+        task = ledger.tasks.get(task_id) if ledger else None
+        if task is None:
+            return False
+        before = dict(getattr(task, 'context', None) or {})
+        asks = [dict(e) if isinstance(e, dict) else e
+                for e in (before.get(ASK_DELIVERED_KEY) or [])]
+        changed = False
+        for entry in asks:
+            if (isinstance(entry, dict) and not entry.get('answered')
+                    and not entry.get('abandoned')):
+                entry['abandoned'] = True
+                changed = True
+        if not changed:
+            return True
+        context = dict(before)
+        context[ASK_DELIVERED_KEY] = asks
+        if not ledger.update_task_context(task_id, context, defer_save=True):
+            return False
+        if ledger.save() is False:
+            ledger.update_task_context(task_id, before, defer_save=True)
+            logger.error("Could not abandon the open ask of %s after it gave "
+                         "up: ledger persistence failed", task_id)
+            return False
+        logger.info(f"Abandoned the open ask of {task_id}: the step gave up")
+        return True
+    except Exception as exc:
+        logger.error("Abandoning the open ask of action %s in %s failed: %s",
+                     action_id, user_prompt, exc)
+        return False
+
+
 def record_ask_delivered(user_prompt: str, action_id: int, request_id,
-                         message_index, flow) -> bool:
+                         message_index, flow, via=None, question=None) -> bool:
     """Record that this ask step's question reached the person in the turn
     `request_id`, pointing at the send receipt or written question at
     `message_index`.  One open ask per step and flow: while one is open this
     is a no-op that still answers True.  Written through the ledger's own
     context setter so the integrity seal holds (#159); False when there is no
-    ledger or task, or the save fails (the write is reverted)."""
+    ledger or task, or the save fails (the write is reverted).
+
+    ``via`` says how it reached the person: 'send' (a send_message_to_user
+    receipt that did not fail), 'reply' (the text the turn returned to them),
+    'written' (a written answer that was neither), None when the caller
+    knows no more (CREATE's wait).  Only 'send' and 'reply' let REUSE take
+    the reply in place of the step's send (hartos-00's review of c26ae7932,
+    item 1).  ``question`` is the text they were asked, which an id-less turn
+    on the held step gets back (item 4)."""
     ledger = _ledger_registry.get(user_prompt)
     task_id = f"action_{action_id}"
     task = ledger.tasks.get(task_id) if ledger else None
@@ -699,6 +802,8 @@ def record_ask_delivered(user_prompt: str, action_id: int, request_id,
         'flow': _flow_index(flow),
         'request_id': str(request_id or ''),
         'message_index': message_index,
+        'via': via,
+        'question': str(question)[:1000] if question else None,
         'timestamp': datetime.now(timezone.utc).isoformat(),
         'answered': False,
     })
@@ -711,35 +816,6 @@ def record_ask_delivered(user_prompt: str, action_id: int, request_id,
                      "persistence failed", task_id)
         return False
     logger.info(f"Recorded the ask of {task_id} (flow {flow}, request {request_id})")
-    return True
-
-
-def close_open_ask(user_prompt: str, action_id: int, flow) -> bool:
-    """Mark the oldest open ask of this action in this flow answered.  Called
-    in the same step as record_user_answer when a reply completes the step."""
-    ledger = _ledger_registry.get(user_prompt)
-    task_id = f"action_{action_id}"
-    task = ledger.tasks.get(task_id) if ledger else None
-    if task is None:
-        return False
-    before = dict(getattr(task, 'context', None) or {})
-    items = [dict(e) if isinstance(e, dict) else e
-             for e in (before.get(ASK_DELIVERED_KEY) or [])]
-    wanted = _flow_index(flow)
-    for entry in items:
-        if (isinstance(entry, dict) and entry.get('flow') == wanted
-                and not entry.get('answered')):
-            entry['answered'] = True
-            break
-    else:
-        return False
-    context = dict(before)
-    context[ASK_DELIVERED_KEY] = items
-    if not ledger.update_task_context(task_id, context, defer_save=True):
-        return False
-    if ledger.save() is False:
-        ledger.update_task_context(task_id, before, defer_save=True)
-        return False
     return True
 
 
@@ -1216,6 +1292,13 @@ def set_action_state(user_prompt: str, action_id: int, state: ActionState,
             action_states[user_prompt] = {}
         action_states[user_prompt][action_id] = state
     logger.info(f"[TARGET] Action {action_id}: {current_state.value} → {state.value} ({reason})")
+
+    # A step that gave up asks nobody any more: its open ask is abandoned, or
+    # the walk's retry of the step would read the person's next words as the
+    # answer to a question from before the give-up (hartos-00's review of
+    # c26ae7932, item 2).
+    if state == ActionState.GAVE_UP:
+        _abandon_open_asks(user_prompt, action_id)
 
     # Advisory consent check — log when data_access consent is missing (never blocks)
     if state == ActionState.IN_PROGRESS:
@@ -2642,20 +2725,15 @@ def commit_verified_action_completion(user_prompt: str, action_id: int,
         # bridge as the agent's output, no Agent Lightning credit (hartos-f9's
         # review, change 4; the raw chat path already owns history and
         # consented writes).  The answer is recorded the way CREATE records
-        # it and the ask it answers is closed, in the same step.
-        # Both writes land after the COMPLETED write and cannot undo it, so a
-        # refusal is said at error: the first leaves ledger_user_answered
-        # reading False for a step that did take its answer, the second
-        # leaves the ask open so the next reply would be read against it.
+        # it, and that one record closes the ask it answers (same save).
+        # It lands after the COMPLETED write and cannot undo it, so a refusal
+        # is said at error: ledger_user_answered then reads False for a step
+        # that did take its answer, and the ask stays open.
         if not record_user_answer(user_prompt, action_id, evidence.get('reply'),
                                   evidence.get('flow')):
             logger.error("[REUSE-WAIT] action %s in %s completed on the person's "
-                         "reply but the answer record was refused",
-                         action_id, user_prompt)
-        if not close_open_ask(user_prompt, action_id, evidence.get('flow')):
-            logger.error("[REUSE-WAIT] action %s in %s completed on the person's "
-                         "reply but its ask could not be closed",
-                         action_id, user_prompt)
+                         "reply but the answer record (and the ask's close) "
+                         "was refused", action_id, user_prompt)
     else:
         # Learning follows both durable evidence and the successful canonical
         # state write. Never credit a receipt which failed either boundary.

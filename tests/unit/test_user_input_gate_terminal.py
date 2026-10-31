@@ -336,7 +336,10 @@ class TheReplyMovesTheActionOutOfPending(unittest.TestCase):
         task = self.ledger.tasks['action_3']
         task.status = TaskStatus.IN_PROGRESS
         safe_set_state(_UP, 3, ActionState.IN_PROGRESS, 'working')
-        self.assertTrue(self.L.mark_action_waiting_for_user(_UP, 3, 'say ball'))
+        # As the create loop marks it: the flow and the person's request that
+        # asked, an earlier one than the reply's (setUp's user-request-9).
+        self.assertTrue(self.L.mark_action_waiting_for_user(
+            _UP, 3, 'say ball', flow=0, asked_in='user-request-8'))
         return task
 
     def test_the_answer_is_tagged_with_the_flow_it_answers(self):
@@ -379,7 +382,8 @@ class TheReplyMovesTheActionOutOfPending(unittest.TestCase):
         task BLOCKED for the person, so the reply resumes that action."""
         from agent_ledger.core import TaskStatus
         task = self._wait_on_action_3()
-        create_recipe.user_tasks[_UP] = SimpleNamespace()   # a fresh process
+        # A fresh process: the loop is back on the waiting action, no flag.
+        create_recipe.user_tasks[_UP] = SimpleNamespace(current_action=3)
         self.assertTrue(_resume_prior_user_input_block(_UP, 'ball'))
         self.assertEqual(task.status, TaskStatus.IN_PROGRESS)
         self.assertTrue(self.L.ledger_user_answered(_UP, 3, 0))
@@ -557,6 +561,314 @@ class AResumedTaskStillPassesItsIntegrityCheck(unittest.TestCase):
         self.assertTrue(self.L.resume_blocked_action(_UP, 3, 'Block resolved'))
         self.assertTrue(task.verify_integrity())
         self.assertNotIn('unblock_evidence', task.context)
+
+
+class ThePersonsWaitIsTheAskRecord(unittest.TestCase):
+    """hartos-00's review of cb13208d2, items 1, 4 and 5.  The ledger alone
+    could not tell a person's wait from a daemon's park: _ask_for_help, the
+    verifier hook and mark_action_waiting_for_user all leave a task BLOCKED
+    with blocked_reason input_required.  cb13208d2 derived the waiting action
+    from that on any turn, for the lowest such task: a daemon turn and the
+    assigned expert's turn took a gate on a parked action and asked for help
+    again with the wrong reason, a person's unrelated chat answered a
+    daemon's park, a reply for action 3 resumed action 2, and a flow-0 wait
+    was answered in flow 1.  The person's wait is now the ask record REUSE
+    already keeps (record_ask_delivered on a genuine request, read by
+    ledger_open_ask, flow-matched), and only a person's turn derives it, for
+    the current action.  Driven through the real create loop resume, the real
+    hooks and a real JSON ledger."""
+
+    def setUp(self):
+        import tempfile
+        from agent_ledger.core import SmartLedger, add_actions_to_ledger
+        from hartos import lifecycle_hooks as L
+        self.L = L
+        clear_action_states(_UP)
+        self.ledger = SmartLedger(agent_id='54', session_id=f'{_UP}_ask',
+                                  ledger_dir=tempfile.mkdtemp())
+        add_actions_to_ledger(self.ledger, [
+            {'action': 'say Hello Arjun', 'action_id': 1},
+            {'action': 'ask the child his name', 'action_id': 2},
+            {'action': 'ask the child to say ball', 'action_id': 3},
+        ], flow_id=0)
+        L.register_ledger_for_session(_UP, self.ledger)
+        # The create loop holds the session's ledger in both places
+        # (_ask_for_help reads its own cache).
+        create_recipe.user_ledgers[_UP] = self.ledger
+        create_recipe.user_tasks[_UP] = SimpleNamespace(current_action=3)
+        create_recipe.request_id_list[_UP] = 'user-request-2'
+
+    def tearDown(self):
+        clear_action_states(_UP)
+        create_recipe.initialise_current_flow_to_zero(_UP)
+        with self.L._state_lock:
+            self.L._ledger_registry.pop(_UP, None)
+        for store in (create_recipe.user_tasks, create_recipe.request_id_list,
+                      create_recipe.user_ledgers):
+            try:
+                del store[_UP]
+            except Exception:
+                pass
+
+    def _task(self, aid):
+        return self.ledger.tasks[f'action_{aid}']
+
+    def _in_progress(self, aid):
+        from agent_ledger.core import TaskStatus
+        self._task(aid).status = TaskStatus.IN_PROGRESS
+        safe_set_state(_UP, aid, ActionState.IN_PROGRESS, 'working')
+
+    def _park(self, aid=3):
+        """The `_attempt > 3` exit on a daemon turn: _ask_for_help holds the
+        action (PENDING, BLOCKED input_required) and sets no gate flag."""
+        from flask import Flask
+        from agent_ledger.core import TaskStatus
+        from core.agent_tools import is_help_pause
+        self._in_progress(aid)
+        with Flask(__name__).app_context(), patch(
+                'integrations.agent_engine.dispatch.is_current_request_autonomous',
+                return_value=True):
+            reply = create_recipe._ask_for_help(
+                _UP, 54, aid, 'say ball', 'it did not complete after 3 attempts')
+        self.assertTrue(is_help_pause(reply), reply)
+        self.assertEqual(self._task(aid).status, TaskStatus.BLOCKED)
+        self.assertEqual(self._task(aid).blocked_reason, 'input_required')
+        self.assertIsNone(getattr(create_recipe.user_tasks[_UP],
+                                  '_needs_user_input_action_id', None))
+
+    def _person_asked(self, aid=3, request='user-request-1', flow=0):
+        self._in_progress(aid)
+        self.assertTrue(self.L.mark_action_waiting_for_user(
+            _UP, aid, 'say ball', flow=flow, asked_in=request))
+
+    def _turn(self, request, text):
+        create_recipe.request_id_list[_UP] = request
+        return _resume_prior_user_input_block(_UP, text)
+
+    def _flag(self):
+        return getattr(create_recipe.user_tasks[_UP], '_needs_user_input_action_id', None)
+
+    def test_a_daemon_turn_after_the_park_takes_no_gate(self):
+        self._park()
+        self.assertFalse(self._turn('daemon_goal-7', 'tick'))
+        self.assertIsNone(self._flag(), 'the parent ran the step; no gate may be set up')
+
+    def test_the_assigned_experts_turn_after_the_park_takes_no_gate(self):
+        """#106d: the expert's turn must run the step, not meet a gate whose
+        kind it can never clear."""
+        self._park()
+        with patch('hartos.create_recipe._is_serving_escalation_expert',
+                   return_value=True):
+            self.assertFalse(self._turn('daemon_expert_turn', 'expert'))
+        self.assertIsNone(self._flag())
+
+    def test_a_persons_unrelated_message_does_not_answer_the_park(self):
+        from agent_ledger.core import TaskStatus
+        self._park()
+        self.assertFalse(self._turn('user-request-2', 'hi, how is the weather'))
+        self.assertIsNone(self._flag())
+        self.assertEqual(self._task(3).status, TaskStatus.BLOCKED)
+        self.assertFalse(self.L.ledger_user_answered(_UP, 3, 0))
+        self.assertFalse(self._task(3).context.get(self.L.USER_INPUT_EVIDENCE_KEY))
+
+    def test_a_daemon_turns_wait_records_no_ask(self):
+        """The verifier hook and state_transition mark a wait on any turn; on
+        a daemon turn nobody was asked, so no ask is recorded."""
+        self._in_progress(3)
+        self.assertTrue(self.L.mark_action_waiting_for_user(
+            _UP, 3, 'say ball', flow=0, asked_in='daemon_goal-7'))
+        self.assertIsNone(self.L.ledger_open_ask(_UP, 3, 0))
+        self.assertFalse(self._turn('user-request-2', 'hi'))
+        self.assertIsNone(self._flag())
+
+    def test_after_a_restart_the_persons_ask_is_taken_on_a_persons_turn_only(self):
+        from agent_ledger.core import TaskStatus
+        self._person_asked(3, 'user-request-1')
+        self.assertFalse(self._turn('daemon_goal-7', 'tick'))
+        self.assertIsNone(self._flag())
+        self.assertEqual(self._task(3).status, TaskStatus.BLOCKED)
+        self.assertTrue(self._turn('user-request-2', 'ball'))
+        self.assertEqual(self._task(3).status, TaskStatus.IN_PROGRESS)
+        self.assertTrue(self.L.ledger_user_answered(_UP, 3, 0))
+        self.assertIsNone(self.L.ledger_open_ask(_UP, 3, 0), 'the answer closes the ask')
+        self.assertTrue(self._task(3).verify_integrity())
+
+    def test_the_asking_requests_own_retry_is_not_its_answer(self):
+        """The 10-19 retry storm re-posts the asking request; REUSE's rule,
+        now CREATE's too, on both the derived and the flagged path."""
+        self._person_asked(3, 'user-request-2')
+        self.assertFalse(self._turn('user-request-2', 'hello?'))
+        create_recipe.user_tasks[_UP]._needs_user_input_action_id = 3
+        create_recipe.user_tasks[_UP]._needs_user_input_kind = 'human_required'
+        self.assertFalse(self._turn('user-request-2', 'hello?'))
+        self.assertFalse(self.L.ledger_user_answered(_UP, 3, 0))
+
+    def test_the_reply_goes_to_the_current_action_not_the_lowest(self):
+        from agent_ledger.core import TaskStatus
+        self._person_asked(2, 'user-request-1')
+        self._person_asked(3, 'user-request-1')
+        self.assertTrue(self._turn('user-request-2', 'ball'))
+        self.assertTrue(self.L.ledger_user_answered(_UP, 3, 0))
+        self.assertFalse(self.L.ledger_user_answered(_UP, 2, 0))
+        self.assertEqual(self._task(2).status, TaskStatus.BLOCKED)
+
+    def test_a_flow_0_wait_is_not_taken_in_flow_1(self):
+        self._person_asked(3, 'user-request-1', flow=0)
+        create_recipe.recipe_for_persona[_UP] = 1
+        self.assertFalse(self._turn('user-request-2', 'ball'))
+        self.assertFalse(self.L.ledger_user_answered(_UP, 3, 0))
+        self.assertFalse(self.L.ledger_user_answered(_UP, 3, 1))
+
+    def test_a_failed_answer_save_leaves_the_ask_open(self):
+        """The ask closes when the answer is recorded, in the same sealed
+        update and save: a failed save leaves both as they were."""
+        self._person_asked(3, 'user-request-1')
+        with patch.object(self.ledger, 'save', return_value=False):
+            self.assertFalse(self.L.record_user_answer(_UP, 3, 'ball', 0))
+        self.assertIsNotNone(self.L.ledger_open_ask(_UP, 3, 0))
+        self.assertFalse(self.L.ledger_user_answered(_UP, 3, 0))
+        self.assertTrue(self.L.record_user_answer(_UP, 3, 'ball', 0))
+        self.assertIsNone(self.L.ledger_open_ask(_UP, 3, 0))
+        asks = self._task(3).context[self.L.ASK_DELIVERED_KEY]
+        self.assertEqual([a['answered'] for a in asks], [True])
+        self.assertTrue(self._task(3).verify_integrity())
+
+    def test_close_open_ask_is_gone_from_hartos_and_nunba(self):
+        """The ask closes only inside record_user_answer now; a caller left
+        anywhere would import a name that no longer exists.  Tracked files
+        only (git grep), both repositories when the Nunba clone is beside
+        this one."""
+        import os
+        import subprocess
+        self.assertFalse(hasattr(self.L, 'close_open_ask'))
+        here = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+        repos = [here]
+        nunba = os.path.join(os.path.dirname(here), 'Nunba-HART-Companion')
+        if os.path.isdir(os.path.join(nunba, '.git')):
+            repos.append(nunba)
+        hits = []
+        for repo in repos:
+            out = subprocess.run(
+                ['git', '-C', repo, 'grep', '-l', '-w', 'close_open_ask', '--', '*.py'],
+                capture_output=True, text=True)
+            hits += [f'{repo}:{p}' for p in out.stdout.split()
+                     if not p.endswith(os.path.basename(__file__))]
+        self.assertEqual(hits, [])
+
+
+class AnAnswerTheLedgerCannotSaveIsKeptAndRetried(unittest.TestCase):
+    """hartos-00's review of cb13208d2, item 2.  With the answer's save
+    failing, cb13208d2 kept the gate but nothing retried the answer: every
+    turn ran a full model round, the person got "Step 1 ... is waiting for
+    your reply" right after replying, and once storage came back the next
+    message ("what time is it") was recorded as the answer.  Now the answer
+    is kept on the task and retried at the next person's turn before anything
+    else; until it saves, the turn says so and runs no model round."""
+
+    def setUp(self):
+        import tempfile
+        from agent_ledger.core import SmartLedger, add_actions_to_ledger, TaskStatus
+        from hartos import lifecycle_hooks as L
+        self.L = L
+        clear_action_states(_UP)
+        self.ledger = SmartLedger(agent_id='54', session_id=f'{_UP}_unsaved',
+                                  ledger_dir=tempfile.mkdtemp())
+        add_actions_to_ledger(self.ledger, [
+            {'action': 'ask the child to say ball', 'action_id': 3}], flow_id=0)
+        L.register_ledger_for_session(_UP, self.ledger)
+        self.task = self.ledger.tasks['action_3']
+        self.task.status = TaskStatus.IN_PROGRESS
+        safe_set_state(_UP, 3, ActionState.IN_PROGRESS, 'working')
+        self.assertTrue(L.mark_action_waiting_for_user(
+            _UP, 3, 'say ball', flow=0, asked_in='user-request-1'))
+        create_recipe.user_tasks[_UP] = SimpleNamespace(
+            current_action=3, _needs_user_input_action_id=3,
+            _needs_user_input_kind='human_required', _needs_help_reason='say ball')
+
+    def tearDown(self):
+        clear_action_states(_UP)
+        with self.L._state_lock:
+            self.L._ledger_registry.pop(_UP, None)
+        for store in (create_recipe.user_tasks, create_recipe.request_id_list):
+            try:
+                del store[_UP]
+            except Exception:
+                pass
+
+    def _turn(self, request, text, saves=True):
+        create_recipe.request_id_list[_UP] = request
+        if saves:
+            return _resume_prior_user_input_block(_UP, text)
+        with patch.object(self.ledger, 'save', return_value=False):
+            return _resume_prior_user_input_block(_UP, text)
+
+    def _answers(self):
+        return [e['answer'] for e in
+                self.task.context.get(self.L.USER_INPUT_EVIDENCE_KEY) or []]
+
+    def test_the_kept_answer_is_saved_first_and_the_new_message_follows_it(self):
+        self.assertFalse(self._turn('user-request-2', 'ba', saves=False))
+        reply = create_recipe._unsaved_answer_reply(_UP)
+        self.assertIn("couldn't save your answer to step 3", reply)
+        self.assertIn('no need to send it again', reply)
+        self.assertFalse(self._turn('user-request-3', 'what time is it', saves=False))
+        self.assertTrue(self._turn('user-request-4', 'what time is it'))
+        self.assertEqual(self._answers(), ['ba'], 'the next message is not the answer')
+        self.assertIsNone(create_recipe._unsaved_answer_reply(_UP))
+        self.assertEqual(create_recipe._answer_for_this_turn(_UP, 'what time is it'),
+                         'ba\nwhat time is it')
+        self.assertEqual(create_recipe._answer_for_this_turn(_UP, 'later'), 'later',
+                         'the kept answer is owed to one turn only')
+        self.assertIsNone(self.L.ledger_open_ask(_UP, 3, 0))
+        self.assertTrue(self.task.verify_integrity())
+
+    def test_a_resend_of_the_kept_answer_is_dropped(self):
+        self.assertFalse(self._turn('user-request-2', 'ba', saves=False))
+        self.assertTrue(self._turn('user-request-3', 'ba'))
+        self.assertEqual(self._answers(), ['ba'])
+        self.assertEqual(create_recipe._answer_for_this_turn(_UP, 'ba'), 'ba')
+
+    def test_a_record_that_fails_after_the_resume_saved_is_retried_too(self):
+        real_save = self.ledger.save
+        calls = {'n': 0}
+
+        def save_once_then_fail(*args, **kwargs):
+            calls['n'] += 1
+            return real_save(*args, **kwargs) if calls['n'] == 1 else False
+
+        create_recipe.request_id_list[_UP] = 'user-request-2'
+        with patch.object(self.ledger, 'save', side_effect=save_once_then_fail):
+            self.assertFalse(_resume_prior_user_input_block(_UP, 'ba'))
+        self.assertTrue(self._turn('user-request-3', 'what time is it'))
+        self.assertEqual(self._answers(), ['ba'])
+
+    def test_a_daemon_turn_neither_retries_nor_gets_the_reply(self):
+        self.assertFalse(self._turn('user-request-2', 'ba', saves=False))
+        self.assertFalse(self._turn('daemon_goal-7', 'tick'))
+        self.assertEqual(self._answers(), [])
+        self.assertIsNone(create_recipe._unsaved_answer_reply(_UP))
+        create_recipe.request_id_list[_UP] = 'user-request-3'
+        self.assertIsNotNone(create_recipe._unsaved_answer_reply(_UP),
+                             'the kept answer is still waiting for a person\'s turn')
+
+    def test_the_third_failure_is_an_error(self):
+        with self.assertLogs('hartos.create_recipe', level='ERROR') as logs:
+            for n in (2, 3, 4):
+                self.assertFalse(self._turn(f'user-request-{n}', 'ba', saves=False))
+        self.assertTrue(any('3 times' in line for line in logs.output), logs.output)
+
+    def test_the_turn_answers_honestly_and_runs_no_model_round(self):
+        from flask import Flask
+        user_id, prompt_id = _UP.rsplit('_', 1)
+        create_recipe.request_id_list[_UP] = 'user-request-2'
+        create_recipe.user_agents.pop(_UP, None)
+        with Flask(__name__).app_context(), \
+                patch.object(self.ledger, 'save', return_value=False), \
+                patch.object(create_recipe, 'create_agents',
+                             side_effect=AssertionError('a model round ran')) as made:
+            reply = create_recipe.get_response_group(user_id, 'ba', prompt_id)
+        made.assert_not_called()
+        self.assertIn("couldn't save your answer to step 3", reply)
 
 
 if __name__ == '__main__':

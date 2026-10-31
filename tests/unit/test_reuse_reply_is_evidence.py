@@ -200,8 +200,21 @@ def speech(monkeypatch, tmp_path):
             state['turn'] = kind
             return rr.chat_agent(user_id, text, prompt_id, None, request_id)
 
+        def cold(*args):
+            """The cache-miss path over the session's existing Action and
+            ledger (a process that still holds them): the production
+            create_agents_for_user starts action 1 the same way."""
+            rr._start_reuse_action(key, 1, 'reuse: first action')
+            return agents
+
+        def cold_turn(text, request_id, kind='ask'):
+            rr.user_agents.pop(key, None)
+            rr.create_agents_for_user.side_effect = cold
+            return turn(text, request_id, kind)
+
         return SimpleNamespace(rr=rr, L=lifecycle_hooks, key=key, state=state,
-                               ledger=ledger_box['ledger'], turn=turn, gc=gc)
+                               ledger=ledger_box['ledger'], turn=turn, gc=gc,
+                               cold_turn=cold_turn)
 
     with Flask(__name__).app_context():
         yield build
@@ -222,7 +235,11 @@ class TestTheAskTurnWaits:
         run = speech(ask_verdict='pending')
         reply = run.turn('hi, I am ready', 'request-1')
         assert run.state['sends'] == [ASK_LINE]
-        assert ASK_LINE in reply or 'ball' in reply.lower()
+        # The person got the question through the send; the turn's reply is
+        # the synthesis round's line after it (hartos-f9's item 6 on
+        # b9edfd90a, carried: a second message after a send).  Pinned exactly
+        # so a fix there shows.
+        assert reply == FINAL, reply
         assert run.rr.user_tasks[run.key].current_action == 1
         assert _task(run, 1).status == TaskStatus.BLOCKED
         assert _task(run, 1).blocked_reason == 'input_required'
@@ -321,6 +338,25 @@ class TestANoStepNamingAnotherToolStillNeedsItsReceipt:
         assert _task(run, 1).status not in (TaskStatus.COMPLETED, TaskStatus.TERMINATED)
         assert run.rr.user_tasks[run.key].current_action == 1
 
+    def test_an_ask_on_a_tool_step_does_not_switch_off_the_fabrication_gate(self, speech, caplog):
+        """hartos-00's review of c26ae7932, item 5: with an ask recorded by
+        hand on a read_item step, the reply stood in for the send and the gate
+        stopped re-steering.  No writer records such an ask today; the
+        stand-in is limited to ask-only steps all the same."""
+        import logging
+        from agent_ledger.core import TaskStatus
+        run = speech(ask_action={'action': 'read_item 1, then confirm the value with the person',
+                                 'action_id': 1, 'can_perform_without_user_input': 'no',
+                                 'recipe': [{'steps': 'read', 'tool_name': 'read_item'}]})
+        run.turn('go', 'request-1')
+        assert run.L.record_ask_delivered(run.key, 1, 'request-1', 0, 0, via='send')
+        with caplog.at_level(logging.WARNING):
+            run.turn('yes, confirmed', 'request-2', kind='reply')
+        assert any('[FABRICATED-COMPLETE]' in r.getMessage() and 'action 1' in r.getMessage()
+                   for r in caplog.records), 'the gate must still refuse the unrun read_item'
+        assert run.state['read'] == []
+        assert _task(run, 1).status not in (TaskStatus.COMPLETED, TaskStatus.TERMINATED)
+
     def test_the_lifecycle_gate_itself_refuses_a_reply_for_a_tool_step(self, speech):
         """The gate's own scope rule, fed directly (hartos-f9's mutant M1b):
         a user_reply receipt for a step naming read_item is refused by
@@ -384,12 +420,13 @@ class TestAProseNoStepThatOnlyWritesOutputCompletesAsBefore:
         run = speech(actions=[PROSE_NO], assistant_script=_prose_assistant,
                      verdict_script=_completed)
         with patch.object(run.L, '_promote_verified_outcome') as promote:
-            for n, words in enumerate(('hello', 'how are you', 'what can you do'), start=1):
+            for n, words in enumerate(('hello', 'how are you', 'what can you do',
+                                       'tell me a joke', 'thanks'), start=1):
                 run.turn(words, f'request-{n}')
                 assert _task(run, 1).status in (TaskStatus.COMPLETED, TaskStatus.TERMINATED), (
                     f'turn {n}: {_task(run, 1).status} / {_task(run, 1).blocked_reason}')
                 assert _task(run, 1).result == GREETING
-        assert [c.args[1] for c in promote.call_args_list] == [1, 1, 1]
+        assert [c.args[1] for c in promote.call_args_list] == [1, 1, 1, 1, 1]
         assert run.L.ledger_user_answered(run.key, 1, 0) is False
         assert not _task(run, 1).context.get(run.L.USER_INPUT_EVIDENCE_KEY)
         assert run.L.ledger_open_ask(run.key, 1, 0) is None
@@ -516,25 +553,62 @@ class TestAHeldStepResumesFirstAndIsNeverRedispatchedInTheBackground:
         assert resume.call_args.args[:2] == (run.key, 1)
         assert run.rr.user_tasks[run.key].current_action == 4
 
-    @pytest.mark.parametrize('request_id', ['daemon_goal_turn', ''])
-    def test_a_background_turn_on_a_held_step_neither_dispatches_nor_asks_again(self, speech, request_id):
+    def test_a_daemon_turn_on_a_held_step_neither_dispatches_nor_asks_again(self, speech):
         from agent_ledger.core import TaskStatus
         from core.agent_tools import is_waiting_for_person
         run = speech(ask_verdict='pending')
         run.turn('hi, I am ready', 'request-1')
         dispatched, sends = list(run.state['dispatched']), list(run.state['sends'])
-        reply = run.turn('tick', request_id, kind='reply')
+        reply = run.turn('tick', 'daemon_goal_turn', kind='reply')
         assert is_waiting_for_person(reply), reply
         assert run.state['dispatched'] == dispatched, 'the step was dispatched again'
         assert run.state['sends'] == sends, 'the person heard the question again'
         assert _task(run, 1).status == TaskStatus.BLOCKED
         assert run.rr.user_tasks[run.key].current_action == 1
 
+    @pytest.mark.parametrize('request_id', [None, ''])
+    def test_a_turn_with_no_request_id_gets_the_question_back(self, speech, request_id):
+        """hartos-00's review of c26ae7932, item 4: a standalone /chat without
+        a request id is not a dispatcher; it gets the pending question, never
+        the internal sentence, and its words are never the answer (#46)."""
+        from agent_ledger.core import TaskStatus
+        from core.agent_tools import is_waiting_for_person
+        run = speech(ask_verdict='pending')
+        run.turn('hi, I am ready', 'request-1')
+        dispatched, sends = list(run.state['dispatched']), list(run.state['sends'])
+        reply = run.turn('ba', request_id, kind='reply')
+        assert reply == ASK_LINE, reply
+        assert not is_waiting_for_person(reply)
+        assert run.state['dispatched'] == dispatched
+        assert run.state['sends'] == sends
+        assert _task(run, 1).status == TaskStatus.BLOCKED
+        assert run.L.ledger_user_answered(run.key, 1, 0) is False
+
+    def test_the_cold_path_holds_a_held_step_too(self, speech):
+        """Item 3: create_agents_for_user started action 1 before the second
+        gate, moving BLOCKED to IN_PROGRESS, so a daemon tick after a cache
+        miss re-dispatched the held step."""
+        from agent_ledger.core import TaskStatus
+        from core.agent_tools import is_waiting_for_person
+        run = speech(ask_verdict='pending')
+        run.turn('hi, I am ready', 'request-1')
+        dispatched, sends = list(run.state['dispatched']), list(run.state['sends'])
+        reply = run.cold_turn('tick', 'daemon_goal_turn', kind='reply')
+        assert is_waiting_for_person(reply), reply
+        assert run.state['dispatched'] == dispatched
+        assert run.state['sends'] == sends
+        assert _task(run, 1).status == TaskStatus.BLOCKED
+        run.cold_turn('ba', 'request-2', kind='reply')
+        assert run.rr.user_tasks[run.key].current_action == 4
+        assert run.L.ledger_user_answered(run.key, 1, 0) is True
+        assert run.state['sends'] == [ASK_LINE]
+
     def test_the_waiting_reply_is_neither_work_nor_a_strike_for_a_dispatcher(self, monkeypatch):
-        """The daemon: a transient deferral, no backoff, no auto-pause.  The
-        hive worker: held, not recorded, not released."""
+        """The daemon: dispatch_goal returns no response for it (the goal is
+        not completed) and records a transient deferral (no backoff, no
+        auto-pause).  The hive worker: held, not recorded, not released."""
         from core import agent_tools
-        from integrations.agent_engine import agent_daemon, dispatch
+        from integrations.agent_engine import dispatch
         from integrations.distributed_agent.worker_loop import (
             DistributedWorkerLoop, HeldForHelp)
         reply = agent_tools.waiting_for_person_reply(2)
@@ -542,7 +616,6 @@ class TestAHeldStepResumesFirstAndIsNeverRedispatchedInTheBackground:
         assert not agent_tools.is_help_pause(reply) and not agent_tools.is_user_pause(reply)
         assert dispatch._failed_turn('g-wait', reply) is True
         assert dispatch.is_transient_deferral('g-wait') is True
-        assert agent_daemon._reply_failure(reply) is None
 
         class _Task:
             task_id, parent_task_id, description = 'g_task_0', 'g', 'say ball'
@@ -558,6 +631,91 @@ class TestAHeldStepResumesFirstAndIsNeverRedispatchedInTheBackground:
              patch('integrations.agent_engine.dispatch.prompt_id_for_goal', return_value='p'):
             got = loop._execute_task(_Task())
         assert isinstance(got, HeldForHelp), got
+
+
+CLAIM = 'I have sent Arjun a message asking him to say ball.'
+
+
+def _ask_turn_then(reply_turn_verdict, ask_turn_text):
+    """Scripts: on the ask turn the model writes ``ask_turn_text`` (no tool
+    call) and the verifier says pending; on the reply turn the model writes
+    a line and the verifier says ``reply_turn_verdict``."""
+    def assistant(state, aid, content):
+        if aid != 1:
+            return None
+        return ask_turn_text if state['turn'] == 'ask' else 'Arjun answered.'
+
+    def verifier(state, aid, content):
+        if aid != 1:
+            return None
+        status = 'pending' if state['turn'] == 'ask' else reply_turn_verdict
+        return json.dumps({'status': status, 'action_id': 1,
+                           'can_perform_without_user_input': 'no'})
+    return assistant, verifier
+
+
+class TestAClaimedSendIsNotAnAsk:
+    """hartos-00's review of c26ae7932, item 1: the model wrote "I have sent
+    Arjun a message ..." with no tool call, the verifier said pending, and the
+    claim was recorded as the ask; "what message?" plus `completed` then
+    completed the step with sends == [].  A written ask that the turn did not
+    return never stands in for the send."""
+
+    def test_the_probe_does_not_complete_the_step(self, speech):
+        from agent_ledger.core import TaskStatus
+        assistant, verifier = _ask_turn_then('completed', CLAIM)
+        run = speech(assistant_script=assistant, verdict_script=verifier)
+        run.turn('hi, I am ready', 'request-1')
+        ask = run.L.ledger_open_ask(run.key, 1, 0)
+        assert ask is not None and ask['via'] == 'written', ask
+        with patch.object(run.L, '_promote_verified_outcome') as promote:
+            run.turn('what message?', 'request-2', kind='reply')
+        assert run.state['sends'] == []
+        assert _task(run, 1).status not in (TaskStatus.COMPLETED, TaskStatus.TERMINATED)
+        assert run.L.ledger_user_answered(run.key, 1, 0) is False
+        assert run.rr.user_tasks[run.key].current_action == 1
+        assert 1 not in [c.args[1] for c in promote.call_args_list]
+        # The step gave up, so the ask it carried is abandoned and no later
+        # message can answer it (item 2).
+        assert run.L.ledger_open_ask(run.key, 1, 0) is None
+
+    def test_a_returned_claim_followed_by_what_message_and_pending_holds(self, speech):
+        """The half the code owns of hartos-00's note 1: a claim the turn
+        RETURNED is recorded via 'reply' (the person saw it); "what message?"
+        with `pending` holds and records nothing.  With `completed` it would
+        close: that case relies on the verifier."""
+        from agent_ledger.core import TaskStatus
+        assistant, verifier = _ask_turn_then(
+            'pending', '@user ' + json.dumps({'message2userfinal': CLAIM}))
+        run = speech(assistant_script=assistant, verdict_script=verifier)
+        run.turn('hi, I am ready', 'request-1')
+        ask = run.L.ledger_open_ask(run.key, 1, 0)
+        assert ask is not None and ask['via'] == 'reply' and ask['question'] == CLAIM, ask
+        run.turn('what message?', 'request-2', kind='reply')
+        assert run.state['sends'] == []
+        assert _task(run, 1).status == TaskStatus.BLOCKED
+        assert run.L.ledger_user_answered(run.key, 1, 0) is False
+        assert run.rr.user_tasks[run.key].current_action == 1
+
+
+class TestAFailedStepKeepsNoAsk:
+    def test_a_step_that_gave_up_records_no_ask_from_its_last_words(self, speech):
+        """Item 2: nothing was written on the ask turn; turn 2 re-steered to
+        FAILED and the exit hook then recorded "Arjun replied." as a
+        delivered ask, leaving a FAILED step with an open ask."""
+        from agent_ledger.core import TaskStatus
+        assistant, verifier = _ask_turn_then('completed', '')
+
+        def reply_turn_says(state, aid, content):
+            got = assistant(state, aid, content)
+            return 'Arjun replied.' if (got is not None and state['turn'] != 'ask') else got
+
+        run = speech(assistant_script=reply_turn_says, verdict_script=verifier)
+        run.turn('hi, I am ready', 'request-1')
+        assert run.L.ledger_open_ask(run.key, 1, 0) is None, 'nothing reached the person'
+        run.turn('ba', 'request-2', kind='reply')
+        assert _task(run, 1).status == TaskStatus.FAILED
+        assert run.L.ledger_open_ask(run.key, 1, 0) is None
 
 
 class TestTheOpenAskReaderReturnsTheOldest:
@@ -607,6 +765,11 @@ class TestAReplyJudgedInsufficientKeepsTheOneAsk:
         assert _task(run, 1).status == TaskStatus.BLOCKED
         asks = _task(run, 1).context.get(run.L.ASK_DELIVERED_KEY) or []
         assert len(asks) == 1 and asks[0]['request_id'] == 'request-1'
+        # A reply the verifier refused on `pending` records no answer, so the
+        # ask stays open for the next one (the ask closes with the answer's
+        # record, in one sealed save).
+        assert asks[0]['answered'] is False
+        assert run.L.ledger_user_answered(run.key, 1, 0) is False
         run.turn('ball', 'request-3', kind='reply')
         assert run.rr.user_tasks[run.key].current_action == 4
         assert run.state['sends'] == [ASK_LINE, again]

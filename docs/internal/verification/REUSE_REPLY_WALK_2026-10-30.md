@@ -58,9 +58,9 @@ FAILED. The turn ended through `[SYNTHESIS]`, delivering the ask. Three `while1`
 `[REUSE-NODRIVER]`.
 
 Why the finder found nothing is not established. Measured: 0 "receipt search" lines in
-either turn's log, so the named-tool branch did not run; the step read as a prose step and
-`_reuse_written_answer` returned None. Inferred (strong): that function's `except
-Exception: return None` is a silent exit nobody has ruled out. Not the steers: a steer
+either turn's log, so the named-tool branch did not run. Deduced from that: the step read
+as a prose step and `_reuse_written_answer` returned None. Inferred (strong): that
+function's `except Exception: return None` is a silent exit nobody has ruled out. Not the steers: a steer
 carries no leading dispatch marker, so it cannot move the window, and a send ran at
 22:25:57 after the last steer at 22:25:45; the backward walk stops at the first message
 the predicate accepts, and messages 22, 23 and 26 sit after the last steer. hartos-f9's

@@ -785,6 +785,17 @@ BUILD_INCOMPLETE_REPLY: str = (
 # hashed result.
 HELP_PAUSED_REPLY_PREFIX: str = "Paused for help:"
 HELP_EXPERT_REPLY_PREFIX: str = "Handed to the expert model:"
+#: The kinds of the create loop's user-input gate (create_recipe's
+#: _needs_user_input_kind): who may clear it and what the loop says while it
+#: holds.  HUMAN_REQUIRED: a `pending` + `no` verdict, the person answers.
+#: AWAITING_REPLY: a `completed` + `no` verdict, the step already asked and
+#: waits for the reply (the loop says so instead of "isn't coming together").
+#: RECOVERABLE_STALL: a loop-break on an unverified action, which the
+#: assigned expert's turn may also clear.  One home: CREATE writes and reads
+#: them at five sites, and _ask_for_help's tests import them from here.
+USER_INPUT_GATE_HUMAN_REQUIRED: str = 'human_required'
+USER_INPUT_GATE_AWAITING_REPLY: str = 'awaiting_reply'
+USER_INPUT_GATE_RECOVERABLE_STALL: str = 'recoverable_stall'
 #: The reply of a background turn that stopped BETWEEN STEPS because the owner
 #: is using this computer (yield-to-user, owner ruling 2026-10-04).  Not a
 #: result, not a failure, not a parked goal: the goal stays active, and its

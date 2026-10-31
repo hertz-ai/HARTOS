@@ -49,17 +49,22 @@ def _functions(names):
     return ns
 
 
-def _names(state=IN_PROGRESS, task=None):
+def _names(state=IN_PROGRESS, task=None, tasks=None):
     """The create_recipe globals _ask_for_help reads, and a record of the
     state changes it asks for."""
     # The reply prefixes are the real constants: the hive worker recognises
     # the reply by them (core.agent_tools.is_help_pause).
-    from core.constants import HELP_EXPERT_REPLY_PREFIX, HELP_PAUSED_REPLY_PREFIX
+    from core.constants import (
+        HELP_EXPERT_REPLY_PREFIX, HELP_PAUSED_REPLY_PREFIX,
+        USER_INPUT_GATE_AWAITING_REPLY)
     states = []
     ledgers = {'7_1': types.SimpleNamespace(tasks={'action_2': task})} if task else {}
     return states, {
         'HELP_PAUSED_REPLY_PREFIX': HELP_PAUSED_REPLY_PREFIX,
         'HELP_EXPERT_REPLY_PREFIX': HELP_EXPERT_REPLY_PREFIX,
+        'USER_INPUT_GATE_AWAITING_REPLY': USER_INPUT_GATE_AWAITING_REPLY,
+        # _ask_for_help reads the gate's kind off the session's task (G8).
+        'user_tasks': tasks if tasks is not None else {},
         'user_ledgers': ledgers,
         'get_action_state': lambda up, aid: state,
         'safe_set_state': (lambda up, aid, s, reason='':
@@ -98,6 +103,21 @@ def test_a_live_user_is_asked_the_question_as_before():
     assert reply == ns['_needs_input_reply'](2, 'Collect the sources')
     escalate.assert_not_called()
     assert states == [], 'a live user answers; the action is left as it was'
+
+
+def test_a_live_user_whose_step_already_asked_is_told_it_waits():
+    """G8: a `completed` + `no` step has already asked (its send went out),
+    so the loop's own line says the step waits for the reply, not that it
+    "isn't coming together" (hartos-00's mutant M8 survived without this)."""
+    from core.constants import USER_INPUT_GATE_AWAITING_REPLY
+    states, names = _names(tasks={'7_1': types.SimpleNamespace(
+        _needs_user_input_kind=USER_INPUT_GATE_AWAITING_REPLY)})
+    ns = _functions(names)
+    with mock.patch.dict(sys.modules, _modules(autonomous=False)):
+        reply = ns['_ask_for_help']('7_1', 1, 2, 'Collect the sources', 'it looped')
+    assert reply == ns['_needs_input_reply'](2, 'Collect the sources', waiting=True)
+    assert 'is waiting for your reply before I continue' in reply, reply
+    assert states == []
 
 
 def test_an_autonomous_run_parks_the_goal_and_holds_the_action():

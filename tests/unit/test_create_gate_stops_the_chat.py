@@ -230,8 +230,8 @@ class TestACompletedVerdictThatNeedsThePersonStillAsks:
         the action, not "still waiting".  Gating every such verdict asked
         without bound: the flag stays `no` after the reply, so a replay asked
         7 times in 7 turns and the step never closed.  The answer the gate
-        took lives on the ledger task (resume_from_user_input), and that is
-        what closes the question."""
+        took lives on the ledger task (record_user_answer), and that is what
+        closes the question."""
         s = selector
         asked = SimpleNamespace(
             messages=[POSTED, _verdict('no', status='completed')], agents=[])
