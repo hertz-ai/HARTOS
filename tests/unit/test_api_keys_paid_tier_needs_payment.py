@@ -286,7 +286,7 @@ def test_with_the_database_gone_the_charged_card_is_still_named(client, key_db, 
     monkeypatch.delenv('HEVOLVE_DEV_MODE', raising=False)
     log = logging.getLogger('hevolve_social')
     with _as_owner(key_db), patch('integrations.ap2.payment_ledger', ledger), \
-            key_db.gone_after_next_commit(), patch.object(log, 'error') as said:
+            key_db.lost_at_next_commit(), patch.object(log, 'error') as said:
         r = client.post(f'/api/v1/intelligence/keys/{KEY}/upgrade',
                         json={'target_tier': 'pro', 'payment_method': 'pm_card_visa'},
                         headers={'Authorization': 'Bearer tok'})

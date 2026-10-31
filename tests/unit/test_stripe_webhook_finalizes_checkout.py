@@ -492,7 +492,7 @@ class TestAFailedBumpIsNamedWithTheDatabaseGone:
 
     def test_the_webhook_names_it(self, ctx):
         log = logging.getLogger('hevolve_social')
-        with ctx['db'].gone_after_next_commit(), \
+        with ctx['db'].lost_at_next_commit(), \
                 patch.object(log, 'error') as said:
             r = _deliver(ctx, _event(_session()))
         self._assert_named(r, said)
@@ -503,7 +503,7 @@ class TestAFailedBumpIsNamedWithTheDatabaseGone:
     def test_the_buyers_first_visit_names_it(self, ctx):
         ctx['stripe'].checkout.Session.retrieve.return_value = _session()
         log = logging.getLogger('hevolve_social')
-        with ctx['db'].gone_after_next_commit(), \
+        with ctx['db'].lost_at_next_commit(), \
                 patch.object(log, 'error') as said:
             r = _complete(ctx)
         self._assert_named(r, said)
@@ -515,7 +515,7 @@ class TestAFailedBumpIsNamedWithTheDatabaseGone:
         ctx['db'].fail_next_commit()
         assert _deliver(ctx, _event(_session())).status_code == 500   # recorded, unbumped
         log = logging.getLogger('hevolve_social')
-        with ctx['db'].gone_after_next_commit(), \
+        with ctx['db'].lost_at_next_commit(), \
                 patch.object(log, 'error') as said:
             r = _complete(ctx)
         self._assert_named(r, said)

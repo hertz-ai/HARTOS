@@ -119,13 +119,15 @@ class ApiKeyDb:
             self._fail_commits = times
 
     @contextlib.contextmanager
-    def gone_after_next_commit(self):
-        """The next commit fails and the database stays unreachable from
-        then on (a lost connection, not a locked file): every statement
-        after the failed commit raises.  The rollback the bump runs is not
-        a statement.  A route that reads the key row after the failed bump
-        (the rollback expired it) raises inside its failure report, which
-        is what the reconciliation line must survive."""
+    def lost_at_next_commit(self):
+        """The next commit ITSELF fails and the database stays unreachable
+        from then on (a lost connection, not a locked file): every
+        statement after the failed commit raises.  The rollback the bump
+        runs is not a statement.  A route that reads the key row after the
+        failed bump (the rollback expired it) raises while it builds its
+        failure report, which is what the reconciliation line must
+        survive.  Not the case of a commit that succeeds and is followed
+        by an outage: there the bump happened."""
         gone = {'now': False}
 
         def fail_the_commit(session):
