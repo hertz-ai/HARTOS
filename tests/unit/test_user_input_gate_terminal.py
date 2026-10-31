@@ -867,13 +867,23 @@ class AnAnswerTheLedgerCannotSaveIsKeptAndRetried(unittest.TestCase):
         self.assertEqual(self._answers(), ['ba'])
 
     def test_a_daemon_turn_neither_retries_nor_gets_the_reply(self):
+        """And the kept answer survives the daemon turn (hartos-00's review
+        of b599e7f98, Medium 1: with this pin absent, a daemon turn that
+        dropped the kept answer passed every test, cb13208d2 item 2's bug)."""
         self.assertFalse(self._turn('user-request-2', 'ba', saves=False))
         self.assertFalse(self._turn('daemon_goal-7', 'tick'))
         self.assertEqual(self._answers(), [])
         self.assertIsNone(create_recipe._unsaved_answer_reply(_UP))
+        kept = getattr(create_recipe.user_tasks[_UP], '_unsaved_answer', None)
+        self.assertEqual((kept or {}).get('text'), 'ba',
+                         'the daemon turn dropped the kept answer')
         self.assertFalse(self._turn('user-request-3', 'ba?', saves=False))
         self.assertIsNotNone(create_recipe._unsaved_answer_reply(_UP),
                              'the next person\'s turn retried it and failed')
+        kept = getattr(create_recipe.user_tasks[_UP], '_unsaved_answer', None)
+        self.assertEqual((kept or {}).get('text'), 'ba')
+        self.assertEqual((kept or {}).get('later'), ['ba?'],
+                         'the new words are kept beside the answer, not as it')
 
     def test_a_kept_answer_is_dropped_once_its_action_no_longer_waits_for_the_person(self):
         """hartos-00's review of 077e779b7, item 3: on a recoverable_stall
