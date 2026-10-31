@@ -69,9 +69,11 @@ class InterimWindowBoundTest(unittest.TestCase):
     """Part A — interim transcription is invoked on a BOUNDED slice."""
 
     def setUp(self):
-        # The handler tests below replace _transcribe_buffer with a stand-in
-        # that never empties the buffer, so every final reaches the learner
-        # producer with real PCM.  The real producer reads the consent DB
+        # Every final the handler tests below drive reaches the learner
+        # producer with real PCM: _emit_final reads the PCM before the
+        # transcribe, and the _transcribe_buffer stand-ins return non-empty
+        # text.  A stand-in that empties the buffer would not change that.
+        # The real producer reads the consent DB
         # and posts to HevolveAI whenever the box declares an owner
         # (HEVOLVE_OWNER_USER_ID); a window test must do neither.  What the
         # producer receives is pinned in
