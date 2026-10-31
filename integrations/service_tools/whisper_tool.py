@@ -2054,6 +2054,16 @@ def _maybe_ingest_audio_sensor(
       * HEVOLVE_MIC_LEARNING=0 switches the chat-mic path off; call streams
         are unaffected by it.
 
+    One learner session per speaker: HevolveAI pairs each post with the
+    previous post of the same session, and the bridge builds the session
+    from ``sensor_id``, so the speaker is part of ``sensor_id``
+    (``mic_<call_id>_<speaker>`` for a call, ``mic_<identity_source>_
+    <speaker>`` for the chat mic).  A per-call id blended every speaker of a
+    call into one voice (owner, 2026-10-31: without knowing who is who it
+    cannot attend to each speaker).  ``<speaker>`` is
+    security.edge_privacy.pseudonym (salted, stable on this node), never the
+    raw user or platform id.
+
     Runs on a thread-pool executor (the bridge call does a blocking HTTP POST
     and the consent check reads the DB); best-effort, never raises out of the
     WS handler hot path.
@@ -2066,7 +2076,7 @@ def _maybe_ingest_audio_sensor(
         subject, identity_source = str(user_id), 'call'
         if not _mic_learning_consented(subject, ask=False):
             return
-        sensor_id = f'mic_{call_id}'
+        sensor_prefix = f'mic_{call_id}'
     else:
         if os.environ.get('HEVOLVE_MIC_LEARNING', '1') == '0':
             return
@@ -2079,9 +2089,11 @@ def _maybe_ingest_audio_sensor(
             subject, identity_source = str(owner), 'owner_fallback'
         if not _mic_learning_consented(subject):
             return
-        sensor_id = f'mic_{identity_source}_{subject}'
+        sensor_prefix = f'mic_{identity_source}'
     try:
         import base64
+        from security.edge_privacy import pseudonym
+        sensor_id = f"{sensor_prefix}_{pseudonym(subject, 'mic.speaker')}"
         from integrations.agent_engine.world_model_bridge import (
             get_world_model_bridge)
         from integrations.robotics.sensor_model import SensorReading
