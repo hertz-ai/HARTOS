@@ -1426,8 +1426,6 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
     # next run about a tool it already ran.
     for _k in [k for k in _reuse_resteer_counts if k[0] == user_prompt]:
         _reuse_resteer_counts.pop(_k, None)
-    for _k in [k for k in _reuse_reask_counts if k[0] == user_prompt]:
-        _reuse_reask_counts.pop(_k, None)
     for _k in [k for k in _reuse_fab_pending if k[0] == user_prompt]:
         _reuse_fab_pending.pop(_k, None)
     # Create a basic function calling config.
@@ -3781,14 +3779,22 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
 _reuse_resteer_counts = {}
 _REUSE_FAB_STEER_MAX = 3
 
-# Re-asks of the verifier per (user_prompt, action_id), stored as
-# (request_id, count) so the count starts again with each run: a verdict
-# that names another action of the flow is asked again up to
-# _REUSE_FAB_STEER_MAX times per run.  Its own budget, not the fabrication
-# gate's: _reuse_resteer_counts refills only when the session's agents are
-# rebuilt, so re-asks spent there left later runs no fabrication re-steer
-# (review of 1ca1fbaa5).
+# Re-asks of the verifier per (user_prompt, action_id): a verdict that names
+# another action of the flow is asked again up to _REUSE_FAB_STEER_MAX times
+# per run.  Its own budget, not the fabrication gate's: _reuse_resteer_counts
+# refills only when the session's agents are rebuilt, so re-asks spent there
+# left later runs no fabrication re-steer (review of 1ca1fbaa5).  It refills
+# at chat_agent's run boundary (_reuse_forget_reasks), not by request id: a
+# daemon goal's runs all carry daemon_<goal_id> and a /chat call without an
+# id carries None, so keyed on the id they never refilled (review of
+# 9ab9666b5).
 _reuse_reask_counts = {}
+
+
+def _reuse_forget_reasks(user_prompt):
+    """Give a new run of this session its re-asks back (see above)."""
+    for _k in [k for k in _reuse_reask_counts if k[0] == user_prompt]:
+        _reuse_reask_counts.pop(_k, None)
 
 # The MIRROR of the fabrication gate.  That gate catches an action CLAIMING
 # completion whose tool never ran.  This one catches the opposite, measured
@@ -3884,6 +3890,8 @@ from core.constants import (
 # can never be the group's answer, however they are worded.  Every action
 # dispatch goes out through it too, so it is also where one action's span of
 # the group log begins — which is what `_reuse_written_answer` reads it for.
+# The one message of this seat that opens no span is the verifier re-ask
+# (`_reuse_is_verifier_reask`): it asks for a verdict on the answer before it.
 _REUSE_STEER_INITIATOR_NAMES = ("ChatInstructor",)
 
 # Seats whose voice is never the user's answer: the steering seat above, plus
@@ -4105,8 +4113,16 @@ _REUSE_VERIFIER_REASK_PHRASE = ', but the action being verified is action '
 
 def _reuse_is_verifier_reask(content):
     """Whether ``content`` is the verifier re-ask of _reuse_fab_steer_message
-    (a verdict that named another action of the flow)."""
-    return _REUSE_VERIFIER_REASK_PHRASE in str(content or '')
+    (a verdict that named another action of the flow).
+
+    A dispatch never is, even when the person's own words in it carry the
+    phrase: the dispatch is where the written-answer scan stops, and
+    skipping it walked into an earlier action's answer (review of
+    9ab9666b5).  Every dispatch carries _REUSE_ACTION_MESSAGE_PREFIX; the
+    re-ask never does."""
+    c = str(content or '')
+    return (_REUSE_VERIFIER_REASK_PHRASE in c
+            and _REUSE_ACTION_MESSAGE_PREFIX not in c)
 
 
 def _reuse_action_at(user_prompt, action_id):
@@ -4845,7 +4861,11 @@ def _reuse_written_answer(group_chat):
     "Perform this action -> Action #N" that opened the action.  Anything
     before it belongs to an earlier action — or to an earlier TURN, since
     every steer runs with ``clear_history=False`` — and delivering that would
-    answer a question the user did not ask.
+    answer a question the user did not ask.  One message from that seat is
+    not a bound: the verifier re-ask (``_reuse_is_verifier_reask``) asks the
+    verifier to judge the answer written BEFORE it, so the walk steps past
+    it.  The walk relies on the dispatch being in the log: without it, it
+    reaches whatever came earlier, re-ask or not.
 
     The verifier is NOT a bound.  Its verdict is the tail whenever an action
     advances; it sits in ``_REUSE_NON_ANSWER_SEATS``, so
@@ -7312,19 +7332,16 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
     # 14:00:59, agent 54 (three actions) for 10202, "Refusing completion of
     # action 1 ... the verdict names action 2", "Cannot advance action 1 ...
     # aborting advance", and the person got a recap instead of the next step.
-    # Ask the verifier again, on the same budget and pending record as every
-    # other refusal re-steer; once the budget is spent the gate refuses as
-    # before and the turn ends.
+    # Ask the verifier again, through the same pending record as every other
+    # refusal re-steer but on its own per-run budget (_reuse_reask_counts);
+    # once that is spent the gate refuses as before and the turn ends.
     _named = verdict_names_another_action(
         user_prompt, current_action_id, claimed_action_id)
     if _named is not None:
         _rk = (user_prompt, current_action_id)
-        _run = thread_local_data.get_request_id()
-        _run_seen, _n = _reuse_reask_counts.get(_rk, (_run, 0))
-        if _run_seen != _run:
-            _n = 0                     # a new run gets the re-asks back
+        _n = _reuse_reask_counts.get(_rk, 0)
         if _n < _REUSE_FAB_STEER_MAX:
-            _reuse_reask_counts[_rk] = (_run, _n + 1)
+            _reuse_reask_counts[_rk] = _n + 1
             _reuse_fab_pending[_rk] = [_REUSE_OTHER_ACTION_SENTINEL, _named]
             current_app.logger.warning(
                 f"[REUSE-VERIFY] the verdict for action {current_action_id} "
@@ -8442,6 +8459,10 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
         # but only when the previous run went past the end of the recipe.  Both
         # stores, one authority; see its docstring for why that is safe here.
         clear_action_states(user_prompt, user_tasks)
+        # Each run gets its own verifier re-asks, whatever its request id
+        # (a daemon goal's runs share one; see _reuse_reask_counts).  The
+        # agent cache is not a run boundary, so this is the only reset.
+        _reuse_forget_reasks(user_prompt)
 
         # The clear above leaves the current action at ASSIGNED.  A cache MISS
         # starts it inside create_agents_for_user; a cache HIT (warm agents)

@@ -563,8 +563,6 @@ class TestReuseCompletesWhenTheVerdictMisnumbersTheAction(
         rr._reuse_resteer_counts.pop((self.UP, 1), None)
         rr._reuse_fab_pending.pop((self.UP, 1), None)
         getattr(rr, '_reuse_reask_counts', {}).pop((self.UP, 1), None)
-        rr.thread_local_data.set_request_id('run-1')
-        self.addCleanup(rr.thread_local_data.set_request_id, None)
         ctx = flask.Flask(__name__).app_context()
         ctx.push()
         self.addCleanup(ctx.pop)
@@ -665,24 +663,98 @@ class TestReuseCompletesWhenTheVerdictMisnumbersTheAction(
         self.assertEqual(lh.get_action_state(self.UP, 1),
                          S.STATUS_VERIFICATION_REQUESTED)
 
-    def test_the_re_ask_budget_is_per_run_and_its_own(self):
-        """Review of 1ca1fbaa5 (Medium-High): the re-asks spent the
-        fabrication re-steer budget, which refills only when the session's
-        agents are rebuilt, so three misnumbers in one run left the next run
-        no re-ask and no fabrication re-steer.  The re-ask budget is its
-        own and starts again with each run (request)."""
+    def test_a_dispatch_carrying_the_re_ask_words_is_still_the_bound(self):
+        """Review of 9ab9666b5: the scan skipped any message holding the
+        re-ask phrase, so a dispatch whose USER'S WORDS held it was skipped
+        too, and the scan walked past this action's start into an earlier
+        action's lesson."""
+        words = ('Grade my quiz, but the action being verified is action 3 '
+                 'of my plan.')
+        own = self._reuse_log(self.UP, [('StatusVerifier', _VERDICT)])
+        dispatch = rr._build_reuse_action_message(self.UP, 1, user_words=words)
+        self.assertIn(rr._REUSE_VERIFIER_REASK_PHRASE, dispatch)
+        earlier = dict(self.gc.messages[1], content='An earlier lesson on cells.')
+        log = SimpleNamespace(messages=[
+            earlier, dict(own.messages[0], content=dispatch), own.messages[1]])
+        self.assertIsNone(rr._reuse_written_answer(log),
+                          "an earlier action's lesson was credited to this one")
+
+
+class TestEveryRunGetsItsOwnReAsks(_ReuseOnARealLog, _Harness):
+    """Review of 9ab9666b5 (Medium, blocking): the re-ask budget was keyed
+    on the thread's request id, and a daemon goal's runs all carry the same
+    id (daemon_<goal_id>, dispatch.py) while a /chat call without one carries
+    None; measured, both re-asked 3 times in run 1 and never in run 2.  A run
+    starts at chat_agent's run boundary, so that is where the budget refills.
+    Through the real chat_agent (the held-step gate answers right after the
+    boundary, so nothing past it runs) and the real _advance_reuse_action."""
+
+    UP = 'u9_p77'      # chat_agent keys a session '{user_id}_{prompt_id}'
+    USER, PROMPT = 'u9', 'p77'
+
+    def setUp(self):
+        super().setUp()
+        import flask
+        self._install_session(self.UP)
         self.ledger = _Ledger(_ACTION, actions=2)
+        self.gc = self._reuse_log(self.UP, [('Assistant', _LESSON),
+                                            ('StatusVerifier', _VERDICT)])
+        self.patch(rr, '_reuse_fabricated_tools', lambda *a, **k: [])
+        self.patch(rr, '_stamp_action_evidence_watermark',
+                   lambda *a, **k: None)
+        self.patch(rr, 'user_agents', {self.UP: None})
+        self.patch(rr, '_reuse_held_step_gate', lambda *a, **k: 'held')
+        for store in (rr._reuse_resteer_counts, rr._reuse_fab_pending,
+                      rr._reuse_reask_counts):
+            store.pop((self.UP, 1), None)
+            self.addCleanup(store.pop, (self.UP, 1), None)
+        self.addCleanup(rr.request_id_list.pop, self.UP, None)
+        self.addCleanup(rr.thread_local_data.set_request_id, None)
+        ctx = flask.Flask(__name__).app_context()
+        ctx.push()
+        self.addCleanup(ctx.pop)
+
+    def _run(self, request_id):
+        """One run's start, as /chat makes it: the thread carries the run's
+        request id and chat_agent crosses its run boundary; action 1 is then
+        started, as _start_reuse_action starts it."""
+        rr.thread_local_data.set_request_id(request_id)
+        self.assertEqual(
+            rr.chat_agent(self.USER, 'next', self.PROMPT, None, request_id),
+            'held')
+        self._state(S.IN_PROGRESS)
+
+    def _misnumbered(self):
+        rr._advance_reuse_action(self.UP, 1, 'test', None,
+                                 claimed_action_id=2)
+        return rr._reuse_fab_steer_message(self.UP, 1)
+
+    def _spend_the_re_asks(self):
         for _ in range(rr._REUSE_FAB_STEER_MAX):
-            self._advance(2)
-            self.assertIsNotNone(rr._reuse_fab_steer_message(self.UP, 1))
-        self._advance(2)
-        self.assertIsNone(rr._reuse_fab_steer_message(self.UP, 1))
+            self.assertIsNotNone(self._misnumbered())
+        self.assertIsNone(self._misnumbered(), 'the re-ask is unbounded')
+
+    def _assert_the_next_run_is_re_asked(self, request_id):
+        self._run(request_id)
+        self._spend_the_re_asks()
+        self._run(request_id)
+        self.assertIsNotNone(self._misnumbered(),
+                             f'run 2 with request id {request_id!r} got no '
+                             're-ask until the agents were rebuilt')
+
+    def test_a_daemon_goals_next_run_is_re_asked(self):
+        self._assert_the_next_run_is_re_asked('daemon_goal42')
+
+    def test_an_id_less_runs_next_run_is_re_asked(self):
+        self._assert_the_next_run_is_re_asked(None)
+
+    def test_the_re_asks_leave_the_fabrication_budget_alone(self):
+        """Review of 1ca1fbaa5: re-asks spent the fabrication re-steer
+        budget, which refills only when the agents are rebuilt."""
+        self._run('rid-a')
+        self._spend_the_re_asks()
         self.assertFalse(rr._reuse_resteer_counts.get((self.UP, 1)),
                          'a re-ask spent the fabrication re-steer budget')
-        rr.thread_local_data.set_request_id('run-2')
-        self._advance(2)
-        self.assertIsNotNone(rr._reuse_fab_steer_message(self.UP, 1),
-                             'the next run got no re-ask')
 
 
 class TestTheMentionListIsOneList(unittest.TestCase):
