@@ -68,6 +68,19 @@ def _run(coro):
 class InterimWindowBoundTest(unittest.TestCase):
     """Part A — interim transcription is invoked on a BOUNDED slice."""
 
+    def setUp(self):
+        # The handler tests below replace _transcribe_buffer with a stand-in
+        # that never empties the buffer, so every final reaches the learner
+        # producer with real PCM.  The real producer reads the consent DB
+        # and posts to HevolveAI whenever the box declares an owner
+        # (HEVOLVE_OWNER_USER_ID); a window test must do neither.  What the
+        # producer receives is pinned in
+        # tests/unit/test_whisper_stream_call_id.py.
+        patcher = mock.patch.object(
+            whisper_tool, "_maybe_ingest_audio_sensor")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_tail_window_buffer_caps_length_and_aligns(self):
         # Source buffer larger than the window → tail is exactly the window
         # size (already even) and is the LAST bytes, not the first.

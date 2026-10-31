@@ -1849,16 +1849,18 @@ async def _emit_final(websocket, audio_buffer, stt_lang, call_id, user_id) -> bo
     whether a non-empty transcription was sent.  Caller resets the buffer +
     VAD gate (those are caller-local).
 
-    The utterance's PCM is read ONCE, before the transcribe, and that one
-    snapshot reaches both consumers: the STT worker (through
-    _transcribe_buffer, which EMPTIES the caller's buffer on this final
-    path, keep_buffer=False) and the learner (_maybe_ingest_audio_sensor,
-    below).  From fd3cbe670 (2026-06-20) until 2026-10-29 the snapshot was
-    taken after the transcribe, so every final handed the ingest b'' and
-    it returned at its first line: no mic audio reached HevolveAI through
-    this producer, while the unit tests called the ingest directly with
-    audio and stayed green.  Guarded by test_whisper_stream_call_id
-    .FinalizeFeedsTheLearnerTheUtteranceTest.
+    The learner's copy of the utterance's PCM (``pcm``, handed to
+    _maybe_ingest_audio_sensor below) is read BEFORE the transcribe,
+    because _transcribe_buffer reads its own copy of the same bytes for
+    the STT worker and then EMPTIES the caller's buffer on this final path
+    (keep_buffer=False).  The two copies hold equal bytes; they are two
+    reads, not one shared object.  From fd3cbe670 (2026-06-20) until
+    2026-10-29 the learner's read came after the transcribe, so every
+    final handed the ingest b'' and it returned at its first line: no mic
+    audio reached HevolveAI through this producer, while the unit tests
+    called the ingest directly with audio and stayed green.  Guarded by
+    test_whisper_stream_call_id.FinalizeFeedsTheLearnerTheUtteranceTest,
+    which pins the learner's bytes equal to the WAV the STT worker read.
     """
     pcm = audio_buffer.getvalue()
     text, lang = _transcribe_buffer(audio_buffer, language=stt_lang)
