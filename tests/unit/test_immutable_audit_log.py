@@ -6,6 +6,7 @@ Run: pytest tests/unit/test_immutable_audit_log.py -v --noconftest
 import os
 import sys
 import types
+import json
 import unittest
 import threading
 from unittest.mock import MagicMock, patch
@@ -141,6 +142,20 @@ class TestRedactSensitive(unittest.TestCase):
 
     def test_none_detail(self):
         self.assertIsNone(_redact_sensitive(None))
+
+    def test_a_secret_is_named_by_the_one_rule(self):
+        """The log's own substring list kept 'passwd', 'pwd', 'cookie' and
+        'apikey' and redacted 'max_tokens' (claude-autostart-71's review of
+        14e8e7907); it asks security.edge_privacy.is_secret_key now."""
+        detail = {'passwd': 'p1', 'user-pwd': 'p2', 'sessionCookie': 'c1',
+                  'apikey': 'k1', 'x-api-key': 'k2', 'ssn': '123-45-6789',
+                  'card_number': '4111', 'max_tokens': 80, 'name': 'john'}
+        result = json.loads(_redact_sensitive(detail))
+        for key in ('passwd', 'user-pwd', 'sessionCookie', 'apikey', 'x-api-key',
+                    'ssn', 'card_number'):
+            self.assertEqual(result[key], '[REDACTED]', key)
+        self.assertEqual(result['max_tokens'], 80)
+        self.assertEqual(result['name'], 'john')
 
 
 class TestBorrowedSessionContract(unittest.TestCase):

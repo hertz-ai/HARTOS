@@ -24,20 +24,24 @@ from typing import Optional, List, Tuple, Dict, Any
 
 logger = logging.getLogger('hevolve_security')
 
-# Sensitive keys that should be redacted in detail_json
-_SENSITIVE_KEYS = frozenset({
-    'password', 'token', 'api_key', 'secret', 'credential',
-    'private_key', 'ssn', 'credit_card', 'card_number',
-})
+# Besides a secret's name (security.edge_privacy.is_secret_key, the one
+# rule), what the audit log never keeps: a government or card number.
+_SENSITIVE_EXTRA_WORDS = ('ssn', 'credit_card', 'card_number')
 
 
 def _redact_sensitive(detail: Optional[Dict]) -> Optional[str]:
-    """Redact sensitive fields before storing in audit log."""
+    """Redact sensitive fields before storing in audit log.
+
+    A field is sensitive by the one secret-name rule, extended by
+    _SENSITIVE_EXTRA_WORDS.  A substring list of its own redacted
+    'max_tokens' and kept 'passwd', 'pwd', 'cookie' and 'apikey'
+    (claude-autostart-71's review of 14e8e7907)."""
     if detail is None:
         return None
+    from security.edge_privacy import is_secret_key, secret_key_form
     safe = {}
     for k, v in detail.items():
-        if any(s in k.lower() for s in _SENSITIVE_KEYS):
+        if is_secret_key(secret_key_form(str(k)), _SENSITIVE_EXTRA_WORDS):
             safe[k] = '[REDACTED]'
         else:
             safe[k] = v

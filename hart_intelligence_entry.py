@@ -4572,6 +4572,9 @@ def _handle_connect_channel_tool(input_text: str) -> str:
                 visible_fields = [f for f in setup_fields if not f.get('auto')]
                 if visible_fields:
                     from core.platform.registry import get_registry
+                    from security.edge_privacy import (
+                        is_secret_key as _is_secret_key,
+                        secret_key_form as _secret_key_form)
                     _lui = get_registry().get_or_none('LiquidUIService')
                     if _lui:
                         _lui.agent_ui_update(
@@ -4585,10 +4588,15 @@ def _handle_connect_channel_tool(input_text: str) -> str:
                                         'name': f.get('key'),
                                         'label': f.get('label') or f.get('key'),
                                         'placeholder': f.get('placeholder') or '',
+                                        # The one secret-name rule, with any
+                                        # '*_key' masked too: a channel's
+                                        # signing or app key is typed into
+                                        # this box ('password' was not).
                                         'secret': bool(
                                             f.get('secret')
-                                            or (f.get('key') or '').endswith(
-                                                ('_token', '_secret', '_key'))
+                                            or _is_secret_key(
+                                                _secret_key_form(f.get('key') or ''),
+                                                ('key',))
                                         ),
                                         'help': f.get('help') or '',
                                         'type': f.get('type') or 'text',

@@ -687,6 +687,16 @@ def test_a_song_list_carries_no_secret_under_any_name(key):
     assert found and all('secrets' in p for p in found), key
 
 
+def test_a_count_of_tokens_is_not_a_secret():
+    """'max_tokens' was refused only by the list's own 'token' word, a second
+    secret-name list beside the one rule (claude-autostart-71's review of
+    0b7c7ccaf); a token's and a password's names are the one rule's."""
+    doc = _client()
+    doc['songs'][0]['max_tokens'] = 3
+    assert not [p for p in C.validate_trending_songs(doc)
+                if 'max_tokens' in p and 'secrets' in p]
+
+
 def test_malformed_trending_lists_are_refused():
     doc = _published()
     doc['date'] = '13/10/2026'
