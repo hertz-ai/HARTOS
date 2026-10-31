@@ -388,7 +388,9 @@ _last_probe_resume_at = 0.0
 
 #: The structured record of why a goal is paused lives with the ONE pause
 #: routine (GoalManager.pause_goal); the daemon reads only its own cause.
-from .goal_manager import PAUSE_CAUSE_DISPATCH_FAILURES  # noqa: E402
+from .goal_manager import (  # noqa: E402
+    PAUSE_CAUSE_DISPATCH_FAILURES, dispatch_failure_pause_reason,
+    is_dispatch_failure_pause_reason)
 
 #: A row paused before the structured record existed is the daemon's only if
 #: its pause followed the goal's own last dispatch this closely (the daemon
@@ -419,28 +421,29 @@ def _paused_for_dispatch_failures(goal) -> bool:
     grounding, no-op dispatches, budget, a person's help (escalate_goal) or a
     person's own dashboard pause carries a different cause and keeps.
 
-    Three things must all hold (review of 20dc8c996 by hartos-73: trusting
-    the cause alone resumed a goal an escalation had parked):
-      * the record's cause is the daemon's (pause_cause == dispatch_failures),
-        or, for a row paused before the record existed, the prose is the
-        daemon's and the pause followed the goal's own last dispatch within
-        the hour and nothing has resumed it since;
-      * the prose is still the daemon's text (a renewed record is not);
+    Both must hold (review of 20dc8c996 by hartos-73: trusting the cause
+    alone resumed a goal an escalation had parked):
       * no human escalation is on the goal (escalation.next == 'human' is a
-        person's hand, whatever the cause says).
+        person's hand, whatever the cause says);
+      * the record's cause is the daemon's (pause_cause ==
+        dispatch_failures); a renewed record carries its own cause.  Only a
+        row paused before the record existed is read by its words
+        (is_dispatch_failure_pause_reason), and then only when the pause
+        followed the goal's own last dispatch within the hour and nothing
+        has resumed it since.  The words were read first for every row, so
+        rewording either writer's sentence would have left every new
+        dispatch-failure pause unresumed (review of 3d4c5b3a3's set by
+        claude-autostart-71).
     """
     cfg = goal.config_json or {}
     escalation = cfg.get('escalation') or {}
     if isinstance(escalation, dict) and escalation.get('next') == 'human':
         return False
-    reason = str(cfg.get('pause_reason') or '')
-    daemon_text = (reason.startswith('Auto-paused:')
-                   and 'consecutive dispatch failures' in reason)
-    if not daemon_text:
-        return False
     cause = cfg.get('pause_cause')
     if cause is not None:
         return cause == PAUSE_CAUSE_DISPATCH_FAILURES
+    if not is_dispatch_failure_pause_reason(cfg.get('pause_reason')):
+        return False
     if 'resume_count' in cfg:
         return False
     return _paused_right_after_its_last_dispatch(goal)
@@ -461,15 +464,21 @@ def _failure_signature(why):
     (security.edge_privacy.scrub_text) runs on the whole text BEFORE the cut
     (review by claude-autostart-71: a key straddling the cut left a fragment
     too short for the secret patterns, which the proposer's scrub of the cut
-    text then let into a public Post title).  With no scrubber the text is
-    cut as written: it stays on the goal's own row, and the proposer, which
-    scrubs again, publishes nothing without one."""
+    text then let into a public Post title).  With no scrubber, or one that
+    fails, the text is cut as written and the failure logged: it stays on
+    the goal's own row, the pause that calls this still happens, and the
+    proposer, which scrubs again, publishes nothing without a working one
+    (review of 6d557b153 by claude-autostart-71: anything but an
+    ImportError escaped into the pause arm before pause_goal).  A goal
+    paused before 6d557b153 holds a signature cut before the scrub; for a
+    key-free failure it is the same text, and otherwise it does not count
+    with the new ones toward the three-goal proposal, which is transitional."""
     text = str(why or '').strip()
     try:
         from security.edge_privacy import scrub_text
         text = scrub_text(text).strip()
-    except ImportError:
-        pass
+    except Exception as exc:
+        logger.warning(f"Failure signature kept unscrubbed on the goal's row: {exc}")
     return text[:80].rstrip()
 
 
@@ -595,8 +604,7 @@ def _auto_pause_for_dispatch_failures(db, goal, goal_key, failure_count, why):
     if 'spark_at_dispatch' in pending:
         cfg['spark_at_dispatch'] = pending['spark_at_dispatch']
     signature = _failure_signature(why)
-    reason = (f'Auto-paused: {failure_count} consecutive dispatch failures'
-              + (f' (last: {why})' if why else ''))
+    reason = dispatch_failure_pause_reason(failure_count, why)
     result = GoalManager.pause_goal(
         db, goal, cause=PAUSE_CAUSE_DISPATCH_FAILURES, by='daemon',
         reason=reason, config=cfg,

@@ -183,6 +183,25 @@ def test_a_secret_cut_in_half_by_the_signature_never_reaches_the_experiment(db):
     assert 'sk-proj-' not in stored and 'BBBB' not in stored, stored
 
 
+def test_a_scrubber_failure_still_pauses_and_publishes_nothing(db):
+    """Residual from claude-autostart-71's review of 6d557b153: only an
+    ImportError was caught, so any other scrub_text failure escaped
+    _failure_signature into the pause arm before pause_goal, and the goal
+    kept failing unpaused.  The pause stands, its signature cut as written
+    (it stays on the goal's own row); the proposer, which scrubs again,
+    publishes nothing."""
+    with patch('security.edge_privacy.scrub_text',
+               side_effect=RuntimeError('scrubber down')):
+        for gid in ('f1', 'f2', 'f3'):
+            _pause(db, _active(db, gid))
+    for gid in ('f1', 'f2', 'f3'):
+        goal = db.get(AgentGoal, gid)
+        assert goal.status == 'paused'
+        assert goal.config_json['pause_cause'] == 'dispatch_failures'
+        assert goal.config_json['pause_signature'] == WHY[:80].rstrip()
+    assert _harness_experiments(db) == []
+
+
 def test_no_signature_is_stored_for_a_failure_with_no_reason(db):
     """Minor from the review: an empty signature is no key at all."""
     _pause(db, _active(db, 'n1'), why=None)

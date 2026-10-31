@@ -207,6 +207,42 @@ def test_a_resume_retires_every_key_the_pause_wrote(db):
     assert cfg['goal_note'] == 'kept'
 
 
+def test_every_key_a_pause_writes_is_retired_by_the_resume(db):
+    """Residual from claude-autostart-71's review of 0706cabb2: the record's
+    tuple was one list on the retire side only, so a key a writer added
+    would be retired by nobody (the pause_signature miss).  The daemon's own
+    pause at its retry cap writes every optional key (its signature, and
+    told_at once its person is told); every top-level key it adds is in the
+    tuple the resume retires."""
+    goal = _goal(db, 'w1', {'goal_note': 'kept', 'daemon_resume_count': ad._RESUME_CAP})
+    before = set(goal.config_json)
+    with patch.object(GoalManager, '_tell_its_person', return_value=True):
+        ad._auto_pause_for_dispatch_failures(db, goal, 'w1', 5, 'turn failed: 400')
+    added = set(goal.config_json) - before
+    assert {'pause_signature', 'told_at'} <= added, sorted(added)
+    assert added <= set(gm.PAUSE_RECORD_KEYS), sorted(added - set(gm.PAUSE_RECORD_KEYS))
+
+
+def test_the_daemons_pause_is_read_by_its_cause_not_its_words(db):
+    """Review of 3d4c5b3a3's set by claude-autostart-71, item 3:
+    _paused_for_dispatch_failures required the daemon's sentence even when
+    the record's cause already said whose pause it was, so rewording either
+    writer's sentence would have left every new dispatch-failure pause
+    unresumed, silently.  The cause decides; the words are read only for a
+    row paused before pause_cause existed, and never make a pause the
+    daemon's on their own."""
+    goal = _goal(db, 'c1', {'pause_cause': gm.PAUSE_CAUSE_DISPATCH_FAILURES,
+                            'paused_by': 'daemon', 'paused_at': 'x',
+                            'pause_reason': 'Paused after five failed turns'},
+                 status='paused')
+    assert ad._paused_for_dispatch_failures(goal)
+    other = _goal(db, 'c2', {'pause_cause': gm.PAUSE_CAUSE_PERSON,
+                             'paused_by': 'person:a', 'paused_at': 'x',
+                             'pause_reason': 'Auto-paused: 5 consecutive dispatch failures'},
+                  status='paused')
+    assert not ad._paused_for_dispatch_failures(other)
+
+
 def test_update_goal_status_paused_to_active_goes_through_resume_goal(db):
     goal = _goal(db, 'u1', {'pause_cause': 'person', 'paused_by': 'person:a',
                             'pause_reason': 'r', 'paused_at': 'x'}, status='paused')

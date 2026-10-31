@@ -206,6 +206,28 @@ PAUSE_CAUSE_NO_OWNER = 'no_owner_to_ask'              # the consent gate: nobody
 PAUSE_RECORD_KEYS = ('pause_reason', 'paused_at', 'pause_cause', 'paused_by',
                      'told_at', 'pause_signature')
 
+#: The words a dispatch-failure pause says to people (pause_reason).  The
+#: agent daemon and the coding daemon write them through
+#: dispatch_failure_pause_reason; the agent daemon reads them
+#: (is_dispatch_failure_pause_reason) only for a row paused before
+#: pause_cause existed.  The literal was written in two places and read in a
+#: third (review of 3d4c5b3a3's set by claude-autostart-71).
+DISPATCH_FAILURE_PAUSE_PREFIX = 'Auto-paused: '
+DISPATCH_FAILURE_PAUSE_WORDS = 'consecutive dispatch failures'
+
+
+def dispatch_failure_pause_reason(failures, why=None) -> str:
+    """The sentence a dispatch-failure pause leaves for people."""
+    return (f'{DISPATCH_FAILURE_PAUSE_PREFIX}{failures} {DISPATCH_FAILURE_PAUSE_WORDS}'
+            + (f' (last: {why})' if why else ''))
+
+
+def is_dispatch_failure_pause_reason(reason) -> bool:
+    """Whether ``reason`` is that sentence."""
+    text = str(reason or '')
+    return (text.startswith(DISPATCH_FAILURE_PAUSE_PREFIX)
+            and DISPATCH_FAILURE_PAUSE_WORDS in text)
+
 
 class GoalManager:
     """Unified CRUD for agent goals. All execution goes through /chat."""
