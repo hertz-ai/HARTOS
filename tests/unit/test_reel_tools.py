@@ -329,17 +329,23 @@ def test_no_clips_asks_her_for_clips_and_is_not_the_actions_work(env):
 
 
 def test_no_clips_names_how_to_ask_her_and_her_answer_makes_the_reel(env):
-    """Live 2026-11-01 (agent 342): "ask her to attach the videos" named no
-    way to, and the agent asked in words and under purposes the store does
-    not keep.  The reply names ask_person's file_request for the store's reel
-    clips, and the clips her answer sends (bound under the ask's id) are the
-    ones the next reel_make uses."""
+    """"Ask her to attach the videos" named no way to.  The reply names the
+    ask tool (by its registered name) and its file_request purpose for reel
+    clips.  Her picks are then bound the way person_ask binds an answer's
+    picks (_bind_picks: bind_inbound under the ask's id), and the next
+    reel_make uses them.  Only the message half fails on the old code; the
+    binding half guards the reply's promise."""
+    from core.chat_attachments import bind_inbound
     from core.user_file_store import INBOUND_PURPOSES, REEL_SOURCE
+    from integrations.agent_engine.person_ask import ask_person_tool
+    ask_tool_name = ask_person_tool(UID, PID)[0]
     t = _tools(env)
     message = _failed(t.run['reel_make']())['message']
-    assert 'ask_person' in message and REEL_SOURCE in message
+    assert ask_tool_name in message and REEL_SOURCE in message
     assert REEL_SOURCE in INBOUND_PURPOSES
-    picked = _upload(env, b'her-pick' * 500, request_id='ask-7f3a')
+    picked = _upload(env, b'her-pick' * 500, request_id=None)
+    bound = bind_inbound(UID, PID, 'ask-7f3a', [{'file_id': picked, 'purpose': REEL_SOURCE}])
+    assert [f['xid'] for f in bound] == [picked]
     _ok(t.run['reel_make']())
     assert [s.xid for s in env.produced[0]['sources']] == [picked]
 

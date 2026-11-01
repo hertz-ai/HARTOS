@@ -348,10 +348,10 @@ def produce_reel(sources: Sequence[Any], *, style: Mapping, workdir: str, out_pa
 
 # ── what she gets ─────────────────────────────────────────────────────────
 
-# Names the way to ask (live 2026-11-01: told only "ask her to attach", agent
-# 342 asked in words and under purposes the store does not keep).  The clips
-# her answer sends are bound to this agent, and reel_make without clips= uses
-# her newest unused batch.
+# Names the existing way to ask, so an agent that calls reel_make before it
+# has clips is pointed at ask_person's file_request, not told only to "ask her
+# to attach".  The clips her answer sends are bound to this agent, and
+# reel_make without clips= uses her newest unused batch.
 NEEDS_CLIPS_MESSAGE = ('There are no clips to make a reel from. Ask her for them with '
                        'ask_person: a file_request with purpose "%s" (1 to %d videos from '
                        'her gallery). When she has answered, call reel_make again; it uses '
