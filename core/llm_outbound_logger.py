@@ -1672,6 +1672,32 @@ def _task_turn(messages: list):
                  and m.get('name') == speaker), None)
 
 
+def _current_order(messages: list):
+    """The newest order: the dispatch turn for the step the pipeline is on.
+
+    ``None`` when the conversation holds none.  A REUSE or CREATE walk posts
+    its first order as the opener (User, with the person's words) and every
+    later one from ChatInstructor, so the task turn kept the FIRST order and
+    the current one stayed only while it was the newest user turn.  Live
+    2026-11-01, goal 'TTS Engine Venv Provisioning': step 7's order reached
+    the model for 45 s, then the 2,500-token window left it out of every
+    call (743 of them, 08:31-10:13) while step 6's opener stayed; the
+    Assistant worked step 6 and the StatusVerifier answered action_id 6
+    while the pipeline held 7 (tests/unit/test_limiters_keep_the_current_order.py).
+
+    An order is what hartos.lifecycle_hooks.dispatch_action_id reads -- the
+    one parser, a LEADING marker only -- on a role='user' turn, which is how
+    every seat receives it.  A turn seeded from an earlier run
+    (``_from_shared``) is not this run's order; latest_dispatch_before skips
+    it the same way.
+    """
+    from hartos.lifecycle_hooks import dispatch_action_id
+    return next((m for m in reversed(messages)
+                 if isinstance(m, dict) and m.get('role') == 'user'
+                 and not m.get('_from_shared')
+                 and dispatch_action_id(m.get('content')) is not None), None)
+
+
 def protected_messages(messages: list) -> list:
     """The messages no trimming may remove, newest-user first, deduplicated.
 
@@ -1693,7 +1719,10 @@ def protected_messages(messages: list) -> list:
         text is the oldest message (measured 2026-09-25 21:17:36);
       * the newest role='tool' message: what the current step produced, the
         thing the Assistant must use and the StatusVerifier must check (owner
-        decision, delegated 2026-09-26).
+        decision, delegated 2026-09-26);
+      * the current order (:func:`_current_order`): the step the pipeline is
+        on.  The task turn keeps the person's words, which only the opening
+        order carries; this keeps the step a later order moved the walk to.
     """
     anchor = next((m for m in reversed(messages)
                    if isinstance(m, dict) and m.get('role') == 'user'), None)
@@ -1701,7 +1730,8 @@ def protected_messages(messages: list) -> list:
                           if isinstance(m, dict) and m.get('role') == 'tool'),
                          None)
     out = []
-    for m in (anchor, _task_turn(messages), newest_result):
+    for m in (anchor, _task_turn(messages), newest_result,
+              _current_order(messages)):
         if m is not None and not any(m is o for o in out):
             out.append(m)
     return out
