@@ -168,3 +168,48 @@ def test_the_model_repeating_an_order_does_not_replace_it():
         _msg('assistant', 'Assistant', _order(_STEP_6) + ' Starting now.'),
         _msg('user', 'StatusVerifier', '{"status": "pending", "action_id": 7}')]
     assert chat[4] in protected_messages(chat)
+
+
+# ── when the kept set alone is over the budget ──────────────────────────
+# Review of 2f407f3de (claude-autostart-71): the opener (the live TTS goal
+# text is ~577 words), the current order, the newest tool result and the
+# newest user turn can together exceed the window.  Then the cuts decide,
+# and the current order must keep its leading marker.
+
+def _oversized_walk():
+    steps = '[' + ', '.join("{'step 7.%d': {'tool_name': '', 'code': ''}}" % i
+                            for i in range(120)) + ']'
+    return [
+        {'role': 'system', 'content': 'You are a helpful assistant. ' * 40},
+        _msg('user', 'User', _order(_STEP_6, _GOAL + ' ' + _words(577, 'goal'))),
+        _call('c1'),
+        _msg('tool', 'Assistant', _words(1500, 'delta'), tool_call_id='c1'),
+        _msg('user', 'ChatInstructor', _STEP_7 + ACTION_STEPS_SEPARATOR + steps),
+        _msg('user', 'StatusVerifier',
+             '{"status": "pending", "action_id": 7, "message": "'
+             + _words(1500, 'beta') + '"}'),
+    ]
+
+
+def test_the_limiter_keeps_the_order_s_marker_when_it_must_cut_it():
+    kept = token_limiter(**_TOKENS).apply_transform(_oversized_walk())
+    orders = [m for m in kept if m.get('name') == 'ChatInstructor']
+    assert orders, "step 7's order is not in the window"
+    assert str(orders[0]['content']).startswith(_STEP_7 + ACTION_STEPS_SEPARATOR)
+
+
+def test_the_wire_trim_keeps_the_order_s_marker_when_it_must_cut_it(monkeypatch):
+    import core.llm_outbound_logger as lol
+    from core.constants import WIRE_TRIM_SAFETY_MARGIN_TOKENS
+    max_tokens = 64
+    monkeypatch.setattr(lol, '_get_budget_per_slot',
+                        lambda: 900 + max_tokens + WIRE_TRIM_SAFETY_MARGIN_TOKENS)
+    out, _, n_cut, _, _, _ = lol._trim_to_budget(
+        {'model': 'llama', 'messages': _oversized_walk(),
+         'max_tokens': max_tokens})
+    assert n_cut > 0, 'fixture failed to force a cut'
+    text = {m.get('name'): str(m.get('content') or '') for m in out['messages']}
+    assert text.get('ChatInstructor', '').startswith(
+        _STEP_7 + ACTION_STEPS_SEPARATOR), text.get('ChatInstructor', '')[:200]
+    assert text.get('User', '').startswith(_STEP_6), "the opener's head was cut"
+    assert _GOAL in text.get('User', ''), "the person's words were cut"
