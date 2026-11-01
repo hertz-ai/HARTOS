@@ -1686,9 +1686,10 @@ def _current_order(messages: list):
     while the pipeline held 7 (tests/unit/test_limiters_keep_the_current_order.py).
 
     An order is hartos.lifecycle_hooks.latest_dispatch's answer -- the one
-    walk latest_dispatch_before reads too: a LEADING dispatch marker, on a
-    role='user' turn (how every seat receives it), and not a turn seeded from
-    an earlier run (``_from_shared``).
+    walk latest_dispatch_before reads too: a dispatch marker that leads its
+    turn, or opens a turn the ROLE-ORDER-GUARD joined behind another (the wire
+    trim reads joined bodies), on a role='user' turn (how every seat receives
+    it), and not a turn seeded from an earlier run (``_from_shared``).
     """
     try:
         from hartos.lifecycle_hooks import latest_dispatch
@@ -1706,7 +1707,7 @@ def _current_order(messages: list):
                          "and a trimmed seat can lose its step's order",
                          exc_info=True)
         return None
-    return latest_dispatch(messages, user_turns_only=True)
+    return latest_dispatch(messages, user_turns_only=True, joined=True)
 
 
 _order_walk_missing_logged = False

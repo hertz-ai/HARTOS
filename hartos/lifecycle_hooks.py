@@ -3335,8 +3335,14 @@ def dispatch_action_id(content) -> Optional[int]:
     return int(m.group('action_id')) if m else None
 
 
-def latest_dispatch(messages, before=None,
-                    user_turns_only=False) -> Optional[dict]:
+# A dispatch marker opening a turn that hartos.helper's ROLE-ORDER-GUARD joined
+# behind another user turn: the join is a blank line, so the order no longer
+# leads the merged message and _DISPATCH_MARKER cannot see it.
+_JOINED_DISPATCH_MARKER = re.compile(r'\n\n' + _DISPATCH_MARKER.pattern)
+
+
+def latest_dispatch(messages, before=None, user_turns_only=False,
+                    joined=False) -> Optional[dict]:
     """The newest dispatch in ``messages[:before]`` (all of them when
     ``before`` is None), or None when there is none.
 
@@ -3348,6 +3354,12 @@ def latest_dispatch(messages, before=None,
     in the Assistant's own seat a reply of its own that opens by repeating one
     is not taken for it.  In the other seats every agent's text arrives as a
     user turn, so there such an echo still passes (task #270).
+    ``joined``: also a message the ROLE-ORDER-GUARD built by joining an order
+    on behind another user turn.  The wire trim reads bodies after that join:
+    live 2026-11-01 (agent 54, rid msg_1793520815330_r11p3) a verdict and the
+    step-2 order were one message, the trim dropped it, and action 2 re-ran
+    its tools 12 times.  The group chat itself holds no joined messages, so
+    latest_dispatch_before leaves this off.
     """
     try:
         earlier = messages[:before]
@@ -3360,7 +3372,10 @@ def latest_dispatch(messages, before=None,
             continue
         if user_turns_only and m.get('role') != 'user':
             continue
-        if dispatch_action_id(m.get('content')) is not None:
+        content = m.get('content')
+        if dispatch_action_id(content) is not None or (
+                joined and isinstance(content, str)
+                and _JOINED_DISPATCH_MARKER.search(content)):
             return m
     return None
 

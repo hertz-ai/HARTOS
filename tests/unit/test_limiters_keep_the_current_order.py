@@ -269,3 +269,49 @@ def test_an_older_hartos_is_said_once_as_an_error(monkeypatch, caplog):
     errors = [r for r in caplog.records
               if r.levelno == logging.ERROR and 'latest_dispatch' in r.getMessage()]
     assert len(errors) == 1, [r.getMessage() for r in caplog.records]
+
+
+# ── an order merged behind a verdict, on the wire ───────────────────────
+# Live 2026-11-01 13:45-13:48, agent 54 R11 (fix-all's rid
+# msg_1793520815330_r11p3, on 2f407f3de): the ROLE-ORDER-GUARD (hartos.helper
+# ToolMessageHandler) joined StatusVerifier's verdict and ChatInstructor's
+# step-2 order into one user turn with a blank line, so the order no longer
+# led its turn.  The wire trim kept the step-1 order and dropped the joined
+# turn; action 2 re-ran its tools 12 times and gave up (task #270 F2).
+
+_STEP_2 = "Perform this action -> Action #2:Read the learner's book page"
+
+
+def _merged_walk():
+    return [
+        {'role': 'system', 'content': 'You are a tutor. ' * 40},
+        _msg('user', 'User', _order('Perform this action -> Action #1:Load the '
+                                    "learner's progress", "Let's continue my lesson.")),
+        _call('c1', 'get_data_by_key'),
+        _msg('tool', 'Assistant', _words(400, 'progress'), tool_call_id='c1'),
+        _msg('user', 'StatusVerifier',
+             '{"status": "completed", "action_id": 1}\n\n' + _order(_STEP_2)),
+        _call('c2', 'read_book_page'),
+        _msg('tool', 'Assistant', _words(1500, 'page'), tool_call_id='c2'),
+        _msg('user', 'StatusVerifier', '{"status": "pending", "action_id": 2, '
+             '"message": "' + _words(600, 'beta') + '"}'),
+    ]
+
+
+def test_an_order_merged_behind_a_verdict_is_the_current_order():
+    walk = _merged_walk()
+    assert walk[4] in protected_messages(walk)
+
+
+def test_an_order_merged_behind_a_verdict_survives_the_wire_trim(monkeypatch):
+    import core.llm_outbound_logger as lol
+    from core.constants import WIRE_TRIM_SAFETY_MARGIN_TOKENS
+    monkeypatch.setattr(lol, '_get_budget_per_slot',
+                        lambda: 900 + 64 + WIRE_TRIM_SAFETY_MARGIN_TOKENS)
+    out, _, n_cut, _, _, _ = lol._trim_to_budget(
+        {'model': 'llama', 'messages': _merged_walk(), 'max_tokens': 64})
+    assert n_cut > 0, 'fixture failed to force a cut'
+    texts = [str(m.get('content') or '') for m in out['messages']
+             if m.get('role') == 'user']
+    assert any(_STEP_2 in t for t in texts), (
+        "the wire trim dropped step 2's order: %r" % [t[:80] for t in texts])
