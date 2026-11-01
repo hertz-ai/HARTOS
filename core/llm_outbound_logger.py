@@ -1707,7 +1707,24 @@ def _current_order(messages: list):
                          "and a trimmed seat can lose its step's order",
                          exc_info=True)
         return None
-    return latest_dispatch(messages, user_turns_only=True, joined=True)
+    import inspect
+    if 'joined' in inspect.signature(latest_dispatch).parameters:
+        return latest_dispatch(messages, user_turns_only=True, joined=True)
+    # A hartos from before ``joined`` (core hot-swapped over it): an order that
+    # leads its turn is still protected, one joined behind another turn is not.
+    # Said once, as the missing-walk case above is (review of d7dee5cc5: the
+    # keyword raised TypeError, which no guard caught, on every over-budget
+    # trim).
+    global _order_join_missing_logged
+    if not _order_join_missing_logged:
+        _order_join_missing_logged = True
+        logger.error("protected_messages: hartos.lifecycle_hooks.latest_dispatch "
+                     "takes no 'joined'; an order joined behind another turn is "
+                     "NOT protected")
+    return latest_dispatch(messages, user_turns_only=True)
+
+
+_order_join_missing_logged = False
 
 
 _order_walk_missing_logged = False

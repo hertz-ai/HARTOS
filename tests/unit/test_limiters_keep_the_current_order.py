@@ -315,3 +315,38 @@ def test_an_order_merged_behind_a_verdict_survives_the_wire_trim(monkeypatch):
              if m.get('role') == 'user']
     assert any(_STEP_2 in t for t in texts), (
         "the wire trim dropped step 2's order: %r" % [t[:80] for t in texts])
+
+
+def test_a_hartos_without_joined_still_protects_a_leading_order(monkeypatch, caplog):
+    """Review of d7dee5cc5 (finding 1): core over a lifecycle_hooks whose
+    latest_dispatch predates ``joined`` raised TypeError on every
+    over-budget trim.  Now the leading order stays protected, the joined
+    one is not, and that is one ERROR, not a crash."""
+    import logging
+    import sys
+    import types
+    import core.llm_outbound_logger as lol
+    from hartos.lifecycle_hooks import dispatch_action_id
+
+    def latest_dispatch(messages, before=None, user_turns_only=False):
+        for m in reversed(messages[:before]):
+            if (isinstance(m, dict) and not m.get('_from_shared')
+                    and (not user_turns_only or m.get('role') == 'user')
+                    and dispatch_action_id(m.get('content')) is not None):
+                return m
+        return None
+
+    older = types.ModuleType('hartos.lifecycle_hooks')
+    older.latest_dispatch = latest_dispatch
+    monkeypatch.setitem(sys.modules, 'hartos.lifecycle_hooks', older)
+    monkeypatch.setattr(lol, '_order_join_missing_logged', False, raising=False)
+    chat = _walk_past_step_6()
+    walk = _merged_walk()
+    with caplog.at_level(logging.ERROR, logger='llm_outbound'):
+        got = protected_messages(chat)
+        joined = protected_messages(walk)
+    assert chat[4] in got, 'the leading step-7 order lost its protection'
+    assert walk[4] not in joined
+    errors = [r for r in caplog.records
+              if r.levelno == logging.ERROR and "'joined'" in r.getMessage()]
+    assert len(errors) == 1, [r.getMessage() for r in caplog.records]
