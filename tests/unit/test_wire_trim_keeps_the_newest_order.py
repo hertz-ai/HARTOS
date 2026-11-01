@@ -17,7 +17,10 @@ the tool-carrying seats made during action 3:
     seats' token limiter dropped ChatInstructor's dispatch before the wire.
     The protected set keeps the current order since 2f407f3de (the same
     drop, measured again 2026-11-01 on the TTS provisioning goal; see
-    tests/unit/test_limiters_keep_the_current_order.py).  The owner's
+    tests/unit/test_limiters_keep_the_current_order.py), but only while the
+    order leads its own turn: once the ROLE-ORDER-GUARD has merged it behind
+    a verdict, as at 21:33:14 above, the wire trim can still drop that turn
+    (review of 2f407f3de, finding 2; open).  The owner's
     2026-10-28 note stands: what to protect "should ideally be learnt by
     the auto evolve loop".
   * 1 (21:33:14) carried it, merged after a verdict as that turn's first

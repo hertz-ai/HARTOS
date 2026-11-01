@@ -1685,17 +1685,27 @@ def _current_order(messages: list):
     Assistant worked step 6 and the StatusVerifier answered action_id 6
     while the pipeline held 7 (tests/unit/test_limiters_keep_the_current_order.py).
 
-    An order is what hartos.lifecycle_hooks.dispatch_action_id reads -- the
-    one parser, a LEADING marker only -- on a role='user' turn, which is how
-    every seat receives it.  A turn seeded from an earlier run
-    (``_from_shared``) is not this run's order; latest_dispatch_before skips
-    it the same way.
+    An order is hartos.lifecycle_hooks.latest_dispatch's answer -- the one
+    walk latest_dispatch_before reads too: a LEADING dispatch marker, on a
+    role='user' turn (how every seat receives it), and not a turn seeded from
+    an earlier run (``_from_shared``).
     """
-    from hartos.lifecycle_hooks import dispatch_action_id
-    return next((m for m in reversed(messages)
-                 if isinstance(m, dict) and m.get('role') == 'user'
-                 and not m.get('_from_shared')
-                 and dispatch_action_id(m.get('content')) is not None), None)
+    try:
+        from hartos.lifecycle_hooks import latest_dispatch
+    except ImportError:
+        # Only a process without HARTOS gets here; it has no walk to protect
+        # an order of, so the set is what it was before.  Said once.
+        global _order_walk_missing_logged
+        if not _order_walk_missing_logged:
+            _order_walk_missing_logged = True
+            logger.warning("protected_messages: hartos.lifecycle_hooks is not "
+                           "importable; the current order is not protected",
+                           exc_info=True)
+        return None
+    return latest_dispatch(messages, user_turns_only=True)
+
+
+_order_walk_missing_logged = False
 
 
 def protected_messages(messages: list) -> list:
@@ -1816,8 +1826,9 @@ def _trim_to_budget(body: dict, _reserve: int = 0) -> tuple:
       3. Left-drop non-system messages (preserve index 0 if role=system)
          until the remaining set fits.  Never dropped: the system message,
          the most-recent message, the newest role='user' message, the
-         task turn (:func:`_task_turn`, the initiator's newest turn) and the
-         newest role='tool' message.  An assistant message carrying tool_calls drops together with the
+         task turn (:func:`_task_turn`, the initiator's newest turn), the
+         newest role='tool' message and the current order
+         (:func:`_current_order`).  An assistant message carrying tool_calls drops together with the
          results answering it (:func:`_drop_units`), and is kept with them
          when one of them is never dropped.
       4. If still over, cut the middle of the messages step 3 could not drop,
@@ -1968,8 +1979,8 @@ def _trim_to_budget(body: dict, _reserve: int = 0) -> tuple:
 
     has_system = bool(messages and isinstance(messages[0], dict)
                       and messages[0].get('role') == 'system')
-    # Never dropped: the newest user message, the task turn and the newest
-    # tool result -- protected_messages, the one set the seats' context
+    # Never dropped: the newest user message, the task turn, the newest
+    # tool result and the current order -- protected_messages, the one set the seats' context
     # limiters keep too.  Each was added after a measured failure; the
     # reasons live on that function.
     protected = protected_messages(messages)

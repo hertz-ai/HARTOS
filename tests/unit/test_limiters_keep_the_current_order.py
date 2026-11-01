@@ -185,6 +185,13 @@ def _oversized_walk():
         _call('c1'),
         _msg('tool', 'Assistant', _words(1500, 'delta'), tool_call_id='c1'),
         _msg('user', 'ChatInstructor', _STEP_7 + ACTION_STEPS_SEPARATOR + steps),
+        # Enough after the order that autogen's own window ends before it (the
+        # message that crosses the budget is cut to fit, not dropped, so it
+        # takes three full ones), and only the protected set brings it back
+        # (review of 86dc21b59: with the order second-newest the limiter test
+        # could not fail).
+        _msg('user', 'Helper', _words(1500, 'gamma')),
+        _msg('user', 'Helper', _words(1500, 'epsilon')),
         _msg('user', 'StatusVerifier',
              '{"status": "pending", "action_id": 7, "message": "'
              + _words(1500, 'beta') + '"}'),
@@ -192,7 +199,12 @@ def _oversized_walk():
 
 
 def test_the_limiter_keeps_the_order_s_marker_when_it_must_cut_it():
-    kept = token_limiter(**_TOKENS).apply_transform(_oversized_walk())
+    from autogen.agentchat.contrib.capabilities import transforms as ag
+    walk = _oversized_walk()
+    assert not [m for m in ag.MessageTokenLimiter(**_TOKENS).apply_transform(walk)
+                if m.get('name') == 'ChatInstructor'], (
+        "fixture: autogen's own window already holds the order")
+    kept = token_limiter(**_TOKENS).apply_transform(walk)
     orders = [m for m in kept if m.get('name') == 'ChatInstructor']
     assert orders, "step 7's order is not in the window"
     assert str(orders[0]['content']).startswith(_STEP_7 + ACTION_STEPS_SEPARATOR)
@@ -213,3 +225,15 @@ def test_the_wire_trim_keeps_the_order_s_marker_when_it_must_cut_it(monkeypatch)
         _STEP_7 + ACTION_STEPS_SEPARATOR), text.get('ChatInstructor', '')[:200]
     assert text.get('User', '').startswith(_STEP_6), "the opener's head was cut"
     assert _GOAL in text.get('User', ''), "the person's words were cut"
+
+
+def test_without_hartos_the_set_is_what_it_was(monkeypatch):
+    """core can run where hartos.lifecycle_hooks cannot be imported (review of
+    2f407f3de, finding 3): the trim then protects what it did before and does
+    not raise on every call."""
+    import sys
+    monkeypatch.setitem(sys.modules, 'hartos.lifecycle_hooks', None)
+    chat = _walk_past_step_6()
+    got = protected_messages(chat)
+    assert chat[0] in got, 'the task turn is no longer protected'
+    assert not _orders_in(got, _STEP_7)

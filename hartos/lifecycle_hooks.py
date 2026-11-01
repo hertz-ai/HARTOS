@@ -3335,26 +3335,39 @@ def dispatch_action_id(content) -> Optional[int]:
     return int(m.group('action_id')) if m else None
 
 
-def latest_dispatch_before(messages, index) -> Optional[int]:
-    """The action id of the latest dispatch posted before ``messages[index]``,
-    or None when none precedes it.
+def latest_dispatch(messages, before=None,
+                    user_turns_only=False) -> Optional[dict]:
+    """The newest dispatch in ``messages[:before]`` (all of them when
+    ``before`` is None), or None when there is none.
 
-    Seeded messages (``_from_shared``) do not count: an earlier run's marker in
-    the shared history says nothing about which action this run is on.
+    The one walk for "which order is on the floor": latest_dispatch_before
+    reads its action id, and core.llm_outbound_logger keeps it out of every
+    trim.  Seeded messages (``_from_shared``) do not count: an earlier run's
+    marker in the shared history says nothing about which action this run is
+    on.  ``user_turns_only``: an order reaches a seat as a role='user' turn, so
+    an Assistant reply that opens by repeating one is not taken for it.
     """
     try:
-        earlier = messages[:index]
+        earlier = messages[:before]
     except Exception:
-        logger.warning("latest_dispatch_before: cannot slice messages at %r",
-                       index, exc_info=True)
+        logger.warning("latest_dispatch: cannot slice messages at %r",
+                       before, exc_info=True)
         return None
     for m in reversed(earlier):
         if not isinstance(m, dict) or m.get('_from_shared'):
             continue
-        aid = dispatch_action_id(m.get('content'))
-        if aid is not None:
-            return aid
+        if user_turns_only and m.get('role') != 'user':
+            continue
+        if dispatch_action_id(m.get('content')) is not None:
+            return m
     return None
+
+
+def latest_dispatch_before(messages, index) -> Optional[int]:
+    """The action id of the latest dispatch posted before ``messages[index]``,
+    or None when none precedes it (latest_dispatch, read for its id)."""
+    m = latest_dispatch(messages, before=index)
+    return dispatch_action_id(m.get('content')) if m is not None else None
 
 
 def stale_for_unstarted_action(messages, index, user_prompt,
