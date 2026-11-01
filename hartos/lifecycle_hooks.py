@@ -3345,7 +3345,9 @@ def latest_dispatch(messages, before=None,
     trim.  Seeded messages (``_from_shared``) do not count: an earlier run's
     marker in the shared history says nothing about which action this run is
     on.  ``user_turns_only``: an order reaches a seat as a role='user' turn, so
-    an Assistant reply that opens by repeating one is not taken for it.
+    in the Assistant's own seat a reply of its own that opens by repeating one
+    is not taken for it.  In the other seats every agent's text arrives as a
+    user turn, so there such an echo still passes (task #270).
     """
     try:
         earlier = messages[:before]

@@ -1693,14 +1693,18 @@ def _current_order(messages: list):
     try:
         from hartos.lifecycle_hooks import latest_dispatch
     except ImportError:
-        # Only a process without HARTOS gets here; it has no walk to protect
-        # an order of, so the set is what it was before.  Said once.
+        # A process without HARTOS, or a hartos older than this core (a core
+        # file hot-swapped over an install whose lifecycle_hooks has no
+        # latest_dispatch: claude-autostart-71, 2026-11-01).  Either way the
+        # set is what it was before, which brings back the dropped order this
+        # function exists to stop, so it is said as an error, once.
         global _order_walk_missing_logged
         if not _order_walk_missing_logged:
             _order_walk_missing_logged = True
-            logger.warning("protected_messages: hartos.lifecycle_hooks is not "
-                           "importable; the current order is not protected",
-                           exc_info=True)
+            logger.error("protected_messages: hartos.lifecycle_hooks.latest_dispatch "
+                         "is not importable; the current order is NOT protected "
+                         "and a trimmed seat can lose its step's order",
+                         exc_info=True)
         return None
     return latest_dispatch(messages, user_turns_only=True)
 

@@ -237,3 +237,35 @@ def test_without_hartos_the_set_is_what_it_was(monkeypatch):
     got = protected_messages(chat)
     assert chat[0] in got, 'the task turn is no longer protected'
     assert not _orders_in(got, _STEP_7)
+
+
+def test_an_older_hartos_is_said_once_as_an_error(monkeypatch, caplog):
+    """A core file hot-swapped over an install whose lifecycle_hooks has no
+    latest_dispatch (claude-autostart-71, 2026-11-01: the installed build
+    has dispatch_action_id and latest_dispatch_before only).  The trim keeps
+    working, and the lost protection is an ERROR the first time, not a quiet
+    warning that would make a live proof read as "the fix does not work"."""
+    import logging
+    import sys
+    import types
+    import core.llm_outbound_logger as lol
+    older = types.ModuleType('hartos.lifecycle_hooks')
+    older.dispatch_action_id = lambda content: None
+    monkeypatch.setitem(sys.modules, 'hartos.lifecycle_hooks', older)
+    monkeypatch.setattr(lol, '_order_walk_missing_logged', False)
+    from core.constants import WIRE_TRIM_SAFETY_MARGIN_TOKENS
+    monkeypatch.setattr(lol, '_get_budget_per_slot',
+                        lambda: 900 + 64 + WIRE_TRIM_SAFETY_MARGIN_TOKENS)
+    chat = _walk_past_step_6()
+    with caplog.at_level(logging.ERROR, logger='llm_outbound'):
+        got = protected_messages(chat)
+        protected_messages(chat)
+        # and the wire trim, which reads the set, still trims
+        out = lol._trim_to_budget({'model': 'llama', 'messages': _oversized_walk(),
+                                   'max_tokens': 64})[0]
+    assert chat[0] in got, 'the task turn is no longer protected'
+    assert not _orders_in(got, _STEP_7)
+    assert out['messages'], 'the wire trim returned no messages'
+    errors = [r for r in caplog.records
+              if r.levelno == logging.ERROR and 'latest_dispatch' in r.getMessage()]
+    assert len(errors) == 1, [r.getMessage() for r in caplog.records]
