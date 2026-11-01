@@ -569,7 +569,10 @@ def ask_person_tool(user_id, prompt_id, agent_id=None):
     description names them, and a refusal of any other names them again, so
     the agent's next ask can name one (live 2026-11-01: agent 342 made seven
     file_requests under five purposes it made up, 'reel_clips', 'make_reel'
-    and others, and every one was refused).  Nothing is guessed for it."""
+    and others, and every one was refused; the component example below
+    already showed 'reel_source', and no list of the purposes was given).
+    Nothing is guessed for it.  Whether the list changes what the model
+    picks is not yet measured live."""
     from core.user_file_store import INBOUND_PURPOSES
     purposes = list(INBOUND_PURPOSES)
 

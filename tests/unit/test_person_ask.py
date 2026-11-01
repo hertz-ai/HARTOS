@@ -818,9 +818,10 @@ def test_the_tool_reports_a_refusal_instead_of_asking(legs):
 
 
 def test_the_tool_names_the_purposes_a_file_request_takes():
-    """Live, 2026-11-01 (agent 342, request 5da92036): the model asked for
-    purpose 'reel_clips' three times; the store takes 'reel_source', and the
-    tool named no purpose an agent could pick from."""
+    """Live, 2026-11-01 (agent 342, request 5da92036): seven file_requests
+    under five purposes the model made up ('reel_clips' twice), all refused.
+    The store takes 'reel_source'; the tool's component example showed it,
+    but nothing listed the purposes there are."""
     from core.user_file_store import INBOUND_PURPOSES
     from integrations.agent_engine import person_ask
     _name, desc, _func = person_ask.ask_person_tool('10202', '342')

@@ -222,7 +222,9 @@ names them again under `purposes`, so the agent's next ask can name one.
 Nothing is guessed for it. Live 2026-11-01: agent 342 made seven
 `file_request` asks under five purposes it made up ('reel_clips',
 'make_reel' and others); each was refused, and the refusal named no
-purpose.
+purpose. The tool's component example already showed `reel_source`; no
+list of the purposes was given. Whether the list changes what the model
+picks is not yet measured live.
 
 Not done yet: an answer that comes after the turn ended does not start a
 new turn by itself; the agent reads it when it next runs.
