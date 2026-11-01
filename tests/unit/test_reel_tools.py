@@ -328,6 +328,22 @@ def test_no_clips_asks_her_for_clips_and_is_not_the_actions_work(env):
     assert env.produced == [] and _media_pushes(env) == []
 
 
+def test_no_clips_names_how_to_ask_her_and_her_answer_makes_the_reel(env):
+    """Live 2026-11-01 (agent 342): "ask her to attach the videos" named no
+    way to, and the agent asked in words and under purposes the store does
+    not keep.  The reply names ask_person's file_request for the store's reel
+    clips, and the clips her answer sends (bound under the ask's id) are the
+    ones the next reel_make uses."""
+    from core.user_file_store import INBOUND_PURPOSES, REEL_SOURCE
+    t = _tools(env)
+    message = _failed(t.run['reel_make']())['message']
+    assert 'ask_person' in message and REEL_SOURCE in message
+    assert REEL_SOURCE in INBOUND_PURPOSES
+    picked = _upload(env, b'her-pick' * 500, request_id='ask-7f3a')
+    _ok(t.run['reel_make']())
+    assert [s.xid for s in env.produced[0]['sources']] == [picked]
+
+
 REEL_ACTION = ('Call reel_make to make the reel from the clips she attached and send it '
                'to her phone.')
 
