@@ -563,7 +563,15 @@ def open_file_request(ask_id, user_id) -> Optional[dict]:
 
 
 def ask_person_tool(user_id, prompt_id, agent_id=None):
-    """The ``ask_person`` tool every agent has: (name, description, func)."""
+    """The ``ask_person`` tool every agent has: (name, description, func).
+
+    A file_request's purpose is one the store keeps (INBOUND_PURPOSES): the
+    description names them, and a refusal of any other names them again, so
+    the agent's next ask can name one (live 2026-11-01: agent 342 made seven
+    file_requests under five purposes it made up, 'reel_clips', 'make_reel'
+    and others, and every one was refused).  Nothing is guessed for it."""
+    from core.user_file_store import INBOUND_PURPOSES
+    purposes = list(INBOUND_PURPOSES)
 
     def ask_person(
             component: Annotated[str, 'Liquid UI component JSON, e.g. {"type":"file_request",'
@@ -589,8 +597,11 @@ def ask_person_tool(user_id, prompt_id, agent_id=None):
         out = ask(user_id, agent_id if agent_id is not None else prompt_id, comp,
                   prompt_id=prompt_id)
         if not out['ok']:
-            return json.dumps({'answered': False, 'refused': out['refused'],
-                               'status': 'refused'})
+            reply = {'answered': False, 'refused': out['refused'], 'status': 'refused'}
+            if out['refused'] == 'unknown_purpose':
+                reply['purposes'] = purposes
+                reply['note'] = "A file_request's purpose is one of purposes."
+            return json.dumps(reply)
         try:
             wait_s = min(float(wait_seconds or 0), float(MAX_WAIT_S))
         except (TypeError, ValueError):
@@ -607,5 +618,6 @@ def ask_person_tool(user_id, prompt_id, agent_id=None):
 
     return ('ask_person',
             ('Ask your person on any of their devices and get their answer, e.g. a '
-             'file_request for clips. Never for a password or key.'),
+             "file_request for clips. A file_request's purpose is one of: "
+             + ', '.join(purposes) + '. Never for a password or key.'),
             ask_person)

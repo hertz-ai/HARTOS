@@ -216,6 +216,14 @@ result. If not, the tool returns a held reply. Like a help pause, a held
 reply is neither work done nor a failure, and the agent reads the answer
 with `ask_person(ask_id=...)` on its next turn (`ask_state`).
 
+The tool's description names the purposes a `file_request` may take (the
+store's `INBOUND_PURPOSES`), and a refusal for any other (`unknown_purpose`)
+names them again under `purposes`, so the agent's next ask can name one.
+Nothing is guessed for it. Live 2026-11-01: agent 342 made seven
+`file_request` asks under five purposes it made up ('reel_clips',
+'make_reel' and others); each was refused, and the refusal named no
+purpose.
+
 Not done yet: an answer that comes after the turn ended does not start a
 new turn by itself; the agent reads it when it next runs.
 

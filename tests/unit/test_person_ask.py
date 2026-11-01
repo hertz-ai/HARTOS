@@ -817,6 +817,36 @@ def test_the_tool_reports_a_refusal_instead_of_asking(legs):
     assert legs['cards'] == []
 
 
+def test_the_tool_names_the_purposes_a_file_request_takes():
+    """Live, 2026-11-01 (agent 342, request 5da92036): the model asked for
+    purpose 'reel_clips' three times; the store takes 'reel_source', and the
+    tool named no purpose an agent could pick from."""
+    from core.user_file_store import INBOUND_PURPOSES
+    from integrations.agent_engine import person_ask
+    _name, desc, _func = person_ask.ask_person_tool('10202', '342')
+    assert [p for p in INBOUND_PURPOSES if p not in desc] == []
+
+
+def test_a_wrong_purpose_is_told_the_purposes_there_are(legs):
+    """The refusal of a purpose the store does not keep names the ones it
+    does, so the agent's next ask can name one; nothing is guessed for it."""
+    from core.user_file_store import INBOUND_PURPOSES
+    func = _tool()
+    wrong = {'type': 'file_request', 'purpose': 'reel_clips', 'accept': 'video'}
+    reply = json.loads(func(json.dumps(wrong), 0))
+    assert reply['refused'] == 'unknown_purpose'
+    assert reply['purposes'] == list(INBOUND_PURPOSES)
+    assert legs['cards'] == []
+    again = json.loads(func(json.dumps(dict(wrong, purpose='reel_source')), 0))
+    assert again['status'] == 'waiting_for_person', again
+    assert legs['cards'][-1][1]['purpose'] == 'reel_source'
+
+
+def test_other_refusals_name_no_purposes(legs):
+    reply = json.loads(_tool()('not json', 0))
+    assert 'purposes' not in reply
+
+
 def test_the_tool_never_waits_longer_than_its_ceiling(legs, monkeypatch):
     from integrations.agent_engine import person_ask
     monkeypatch.setattr(person_ask, 'MAX_WAIT_S', 0.2)
