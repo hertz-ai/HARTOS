@@ -843,6 +843,14 @@ def test_a_wrong_purpose_is_told_the_purposes_there_are(legs):
     assert legs['cards'][-1][1]['purpose'] == 'reel_source'
 
 
+def test_the_main_leg_menu_offers_the_tool_under_the_name_it_registers():
+    """The menu that decides what a turn's agent sees and the tool's own
+    registration read one name (core.agent_tool_menu.ASK_PERSON_TOOL)."""
+    from core.agent_tool_menu import MAIN_LEG_CORE_TOOLS
+    from integrations.agent_engine import person_ask
+    assert person_ask.ask_person_tool('10202', '342')[0] in MAIN_LEG_CORE_TOOLS
+
+
 def test_other_refusals_name_no_purposes(legs):
     reply = json.loads(_tool()('not json', 0))
     assert 'purposes' not in reply

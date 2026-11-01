@@ -573,12 +573,13 @@ def ask_person_tool(user_id, prompt_id, agent_id=None):
     already showed 'reel_source', and no list of the purposes was given).
     Nothing is guessed for it.  Whether the list changes what the model
     picks is not yet measured live."""
-    from core.user_file_store import INBOUND_PURPOSES
+    from core.agent_tool_menu import ASK_PERSON_TOOL
+    from core.user_file_store import INBOUND_PURPOSES, REEL_SOURCE
     purposes = list(INBOUND_PURPOSES)
 
     def ask_person(
             component: Annotated[str, 'Liquid UI component JSON, e.g. {"type":"file_request",'
-                                      '"purpose":"reel_source","accept":"video"}'],
+                                      '"purpose":"%s","accept":"video"}' % REEL_SOURCE],
             wait_seconds: Annotated[int, f"seconds to wait now, max {MAX_WAIT_S}"] = DEFAULT_WAIT_S,
             ask_id: Annotated[str, "an earlier ask's id: read its answer"] = '') -> str:
         if ask_id:
@@ -619,7 +620,7 @@ def ask_person_tool(user_id, prompt_id, agent_id=None):
                      'yet. This step is not done: read the answer later with '
                      'ask_person(ask_id=...).')})
 
-    return ('ask_person',
+    return (ASK_PERSON_TOOL,
             ('Ask your person on any of their devices and get their answer, e.g. a '
              "file_request for clips. A file_request's purpose is one of: "
              + ', '.join(purposes) + '. Never for a password or key.'),

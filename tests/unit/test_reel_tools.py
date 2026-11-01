@@ -32,6 +32,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -341,7 +342,8 @@ def test_no_clips_names_how_to_ask_her_and_her_answer_makes_the_reel(env):
     ask_tool_name = ask_person_tool(UID, PID)[0]
     t = _tools(env)
     message = _failed(t.run['reel_make']())['message']
-    assert ask_tool_name in message and REEL_SOURCE in message
+    assert re.search(r'\b%s\b' % re.escape(ask_tool_name), message), message
+    assert REEL_SOURCE in message
     assert REEL_SOURCE in INBOUND_PURPOSES
     picked = _upload(env, b'her-pick' * 500, request_id=None)
     bound = bind_inbound(UID, PID, 'ask-7f3a', [{'file_id': picked, 'purpose': REEL_SOURCE}])
