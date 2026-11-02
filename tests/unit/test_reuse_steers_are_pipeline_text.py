@@ -67,8 +67,11 @@ def _predicate():
     compiled alongside it — this runs the same bytes production runs, not a
     restatement of them.
     """
+    from tests.unit.source_constants import module_constant
     tree = ast.parse(_src())
-    ns = {}
+    # A lifted _REUSE_* constant may name another module's constant
+    # (_REUSE_ASK_TOOLS reads SEND_TOOL): bind the shipped value.
+    ns = {'SEND_TOOL': module_constant('SEND_TOOL', 'hartos/lifecycle_hooks.py')}
     wanted_fn = '_reuse_is_pipeline_text'
     body = []
     for node in tree.body:

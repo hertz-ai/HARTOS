@@ -709,6 +709,12 @@ ASK_DELIVERED_KEY = 'ask_delivered'
 _PIPELINE_SEATS = frozenset({'ChatInstructor', 'StatusVerifier', 'Assistant',
                              'Helper', 'Executor'})
 
+#: The seat the person's words arrive from: CREATE's user proxy
+#: (create_recipe.create_agents, 'UserProxy') and REUSE's ('User').  In a
+#: native group log every seat's text is role 'user', so the role alone
+#: never says it came from the person.
+_PERSON_SEATS = frozenset({'UserProxy', 'User'})
+
 
 def _is_open_ask(entry, flow=None) -> bool:
     """THE open-ask rule: an ask record that is neither answered nor
@@ -2008,11 +2014,26 @@ def window_asked(messages, action_id) -> bool:
     waits for their answer, so no line written after it is the action's
     output.  hartos-00's review of 7043d635e: on a daemon tick a step that
     names no tool asked, then completed on the model's next line ("Noted.").
-    Newest first; the first result outside the window ends the search."""
+    Newest first; the first result outside the window ends the search.
+
+    The person's answer closes every question before it: their own words
+    (their seat, _PERSON_SEATS, in a message that is not a dispatch) end the
+    search with False, so a line written after the answer is the action's
+    output again.  Review of 31ec05d14, finding 3: CREATE posts the
+    person's words with no dispatch, and a step that asked, was answered and
+    then wrote its lesson lost the lesson.  A REUSE turn's words ride inside
+    its dispatch (reuse_recipe._reuse_seed_message), which ends nothing
+    here, so REUSE windows read as before."""
     names = tool_call_names([messages or []])
     for index in range(len(messages or []) - 1, -1, -1):
         msg = messages[index]
-        if not isinstance(msg, dict) or msg.get('role') != 'tool':
+        if not isinstance(msg, dict):
+            continue
+        if (msg.get('role') == 'user'
+                and str(msg.get('name') or '') in _PERSON_SEATS
+                and dispatch_action_id(msg.get('content')) is None):
+            return False
+        if msg.get('role') != 'tool':
             continue
         if latest_dispatch_before(messages, index + 1) != action_id:
             break

@@ -25,7 +25,15 @@ by every reader of a send:
     receipt (#161);
   * this run's verdict saying the step waits on the person (status
     'pending', or can_perform_without_user_input 'no') makes its send an
-    ask too, in REUSE as in CREATE.
+    ask too for the receipt readers and the under-report escape, in REUSE
+    as in CREATE;
+  * the drive decision for a 'yes' step (the autonomy nudge and the
+    no-driver break, reuse_recipe._reuse_runs_alone) reads the declaration
+    alone: 'pending' is also a step's plain "not done yet", and a declared
+    progress line is not a question (review of 31ec05d14, option A);
+  * the person's answer closes the questions before it
+    (lifecycle_hooks.window_asked), so a step's output written after the
+    answer is its output.
 
 No new state: expects_reply selects an existing transition.
 
@@ -257,6 +265,56 @@ class TestAQuestionIsNeverTheReceipt(_BothProjectors):
                       _assistant(_LESSON))
         self._assert_both(None)
 
+    def test_create_finds_the_output_written_after_the_persons_answer(self):
+        """Review of 31ec05d14, finding 3 (its probe P3): CREATE posts the
+        person's words with no dispatch.  The step asked, the person
+        answered, then the model wrote the lesson: the lesson (message 4) is
+        the step's output, as on the parent.  window_asked never stopped at
+        the answer, so the question stayed open and the step lost its
+        output."""
+        for seat in ('UserProxy', 'User'):
+            with self.subTest(seat=seat):
+                reply = {'role': 'user', 'name': seat,
+                         'content': 'basic algebra, beginner level'}
+                self._set_log(_dispatch(), *_send(expects_reply=True, text=_LIVE_TEXT),
+                              reply, _assistant(_LESSON))
+                self.assertFalse(lh.window_asked(self.gc.messages, 1))
+                self.assertEqual(lh.derive_completion_evidence(self.UP, 1),
+                                 {'message_index': 4, 'kind': 'user_visible_result'})
+
+    def test_a_question_sent_after_the_answer_is_open_again(self):
+        """The answer closes only the questions before it."""
+        reply = {'role': 'user', 'name': 'UserProxy', 'content': 'basic algebra'}
+        self._set_log(_dispatch(), *_send('s1', True, 'Which topic today?'), reply,
+                      *_send('s2', True, _LIVE_TEXT), _assistant(_LESSON))
+        self.assertTrue(lh.window_asked(self.gc.messages, 1))
+        self.assertIsNone(lh.derive_completion_evidence(self.UP, 1))
+
+    def test_another_seats_line_after_the_question_is_not_an_answer(self):
+        """In a native group log every seat's text is role 'user'.  Only the
+        person's own seat answers; a steer, a verdict, a timer proxy or the
+        model's own line does not."""
+        for seat in ('ChatInstructor', 'StatusVerifier', 'Helper', 'Executor',
+                     'Assistant', 'multi_role_agent', 'user_proxy_u1'):
+            with self.subTest(seat=seat):
+                log = [_dispatch(), *_send(expects_reply=True, text=_LIVE_TEXT),
+                       {'role': 'user', 'name': seat, 'content': 'Please continue.'},
+                       _assistant(_LESSON)]
+                self.assertTrue(lh.window_asked(log, 1))
+
+    def test_a_reuse_turns_seed_after_the_question_reads_as_before(self):
+        """REUSE carries the person's words inside the turn's dispatch
+        (_reuse_seed_message builds it), and a dispatch never closes a
+        question, so every REUSE window reads as it did before this change:
+        the seed after the ask leaves the window asked."""
+        seed = {'role': 'user', 'name': 'User',
+                'content': rr._build_reuse_action_message(
+                    self.UP, 1, user_words='yes, ready')}
+        self.assertEqual(lh.dispatch_action_id(seed['content']), 1)
+        log = [_dispatch(), *_send(expects_reply=True, text=_LIVE_TEXT), seed,
+               _assistant(_LESSON)]
+        self.assertTrue(lh.window_asked(log, 1))
+
     def test_a_question_beside_a_search_in_one_result_is_not_the_output(self):
         """hartos-00's review of 7043d635e, finding 2: one aggregate tool
         message carrying a send that asks and a google_search result, for a
@@ -426,26 +484,189 @@ def test_a_model_that_never_declares_sends_nothing_and_the_turn_ends(speech):
 
 # ── hartos-00's review of 7043d635e ──────────────────────────────────────
 
-@pytest.mark.parametrize('declare', [True, False])
-def test_a_yes_step_that_asked_holds_even_for_a_model_that_resends(speech, declare):
+def test_a_yes_step_that_asked_holds_even_for_a_model_that_resends(speech):
     """Finding 1 (critical): under every-'pending' verdicts a step banked
     'yes' that asked kept its banked autonomy, so every round posted the
     autonomy nudge, every copy of the question counted as progress, and a
     model that re-sends when nudged sent the person the same question 25
-    times.  A step that asked is driven as a 'no' step is: no nudge, the
-    person hears the question once, and the step holds for the answer.  A
-    send declared as telling is an ask too under a verdict that waits."""
+    times.  A step whose send declared expects_reply=true is driven as a
+    'no' step is: no nudge, the person hears the question once, and the
+    step holds for the answer."""
     from agent_ledger.core import TaskStatus
     holder = {}
     run = speech(actions=_FLOW, verdict_script=_pending_for_step_1,
                  assistant_script=lambda s, a, c: holder['fn'](s, a, c))
-    holder['fn'] = _register_send(run, declare, resend=True)
+    holder['fn'] = _register_send(run, True, resend=True)
     run.turn('basic algebra, beginner level', 'request-1')
     assert run.state['sends'] == [_LIVE_TEXT]
     assert not [s for s in run.state['steers'] if rr._REUSE_AUTONOMY_NUDGE in s]
     assert _task(run, 1).status == TaskStatus.BLOCKED, _task(run, 1).status
     assert _task(run, 1).blocked_reason == 'input_required'
     assert run.rr.user_tasks[run.key].current_action == 1
+
+
+def test_a_misdeclared_question_gets_the_nudge_and_never_completes(speech):
+    """Review of 31ec05d14, option A (agreed by hartos-c9 and the
+    reviewer): the declaration is the model's own word, so a question it
+    declared expects_reply=false is driven as the delivery it declared: the
+    nudge is posted, as for any 'yes' step mid-work.  It still never
+    completes the step: the under-report escape keeps its own ask check
+    (this run's 'pending' verdict), so the turn ends with the step
+    unfinished and current.  Cost, stated rather than assumed: the send
+    tool refuses an identical re-send only within one request (key =
+    request id + text), so the person sees the words once per turn and a
+    reworded copy would pass."""
+    from agent_ledger.core import TaskStatus
+    holder = {}
+    run = speech(actions=_FLOW, verdict_script=_pending_for_step_1,
+                 assistant_script=lambda s, a, c: holder['fn'](s, a, c))
+    holder['fn'] = _register_send(run, False, resend=True)
+    run.turn('basic algebra, beginner level', 'request-1')
+    assert [s for s in run.state['steers'] if rr._REUSE_AUTONOMY_NUDGE in s]
+    assert run.state['sends'] and set(run.state['sends']) == {_LIVE_TEXT}
+    assert _task(run, 1).status not in (TaskStatus.COMPLETED, TaskStatus.TERMINATED)
+    assert run.rr.user_tasks[run.key].current_action == 1
+
+
+_PROGRESS = 'One moment, I am reading item 2 for you.'
+
+
+def test_a_progress_line_does_not_stop_a_yes_step_running_its_tool(speech):
+    """Review of 31ec05d14, finding 1 (its probe P1): a step banked 'yes'
+    that names read_item sends a progress line declared expects_reply=false,
+    and the verifier says 'pending' because the tool has not run.  'pending'
+    is the step's plain "not done yet", not a question to the person: the
+    nudge is posted, the tool runs, and the step completes.  31ec05d14 read
+    the 'pending' as making the progress line a question, so the step lost
+    its nudge and its tool never ran (the parent ran it)."""
+    from agent_ledger.core import TaskStatus
+
+    def script(state, aid, content):
+        if aid != 1:
+            return 'Basic algebra is a great place to start.'
+        if not state['sends']:
+            return {'content': '', 'tool_calls': [{
+                'id': 'progress_1', 'type': 'function',
+                'function': {'name': 'send_message_to_user',
+                             'arguments': json.dumps({'text': _PROGRESS,
+                                                      'expects_reply': False})}}]}
+        if not state['read']:
+            if rr._REUSE_AUTONOMY_NUDGE in content:
+                return {'content': '', 'tool_calls': [{
+                    'id': f'read_{len(state["steers"])}', 'type': 'function',
+                    'function': {'name': 'read_item',
+                                 'arguments': json.dumps({'item': 2})}}]}
+            return 'I let the learner know I am on it.'
+        return 'Item 2 holds the value 20.'
+
+    def verdict(state, aid, content):
+        if aid == 1 and not state['read']:
+            return json.dumps({'status': 'pending', 'action_id': 1,
+                               'message': 'read_item has not run yet'})
+        return json.dumps({'status': 'completed', 'action_id': aid})
+
+    flow = [{'action': 'read_item 2, then tell the learner its value',
+             'action_id': 1, 'recipe': [], 'can_perform_without_user_input': 'yes'},
+            _FLOW[1]]
+    run = speech(actions=flow, verdict_script=verdict, assistant_script=script)
+    run.turn('go on', 'request-1')
+    assert run.state['sends'] == [_PROGRESS]
+    assert [s for s in run.state['steers'] if rr._REUSE_AUTONOMY_NUDGE in s]
+    assert run.state['read'] == [2], 'the step never ran its tool'
+    assert _task(run, 1).status in (TaskStatus.COMPLETED, TaskStatus.TERMINATED)
+
+
+def test_a_question_from_an_earlier_turn_does_not_stop_this_turns_work(speech):
+    """Mutant M6 of the 31ec05d14 rework survived without this: the drive
+    decision must read THIS turn's window (from its dispatch), not every
+    window of the action.  A 'yes' step that names read_item asked "Which
+    item should I read?" on the person's first turn and stopped there.  The
+    person answered on the next turn, whose window holds no question, so
+    the step runs alone again: the nudge is posted and the tool runs.
+    Reading the earlier turn's question kept the step from ever running
+    its tool."""
+    from agent_ledger.core import TaskStatus
+
+    def script(state, aid, content):
+        if aid != 1:
+            return 'Basic algebra is a great place to start.'
+        if state['turn'] == 'ask':
+            if not state['sends']:
+                return {'content': '', 'tool_calls': [{
+                    'id': 'which_1', 'type': 'function',
+                    'function': {'name': 'send_message_to_user',
+                                 'arguments': json.dumps({
+                                     'text': 'Which item should I read?',
+                                     'expects_reply': True})}}]}
+            return 'I asked which item to read.'
+        if not state['read']:
+            if rr._REUSE_AUTONOMY_NUDGE in content:
+                return {'content': '', 'tool_calls': [{
+                    'id': f'read_{len(state["steers"])}', 'type': 'function',
+                    'function': {'name': 'read_item',
+                                 'arguments': json.dumps({'item': 2})}}]}
+            return 'Thanks, I will read it.'
+        return 'Item 2 holds the value 20.'
+
+    def verdict(state, aid, content):
+        if aid == 1 and not state['read']:
+            return json.dumps({'status': 'pending', 'action_id': 1,
+                               'message': 'read_item has not run yet'})
+        return json.dumps({'status': 'completed', 'action_id': aid})
+
+    flow = [{'action': 'read_item the item the learner names, then tell them its value',
+             'action_id': 1, 'recipe': [], 'can_perform_without_user_input': 'yes'},
+            _FLOW[1]]
+    run = speech(actions=flow, verdict_script=verdict, assistant_script=script)
+    run.turn('read me an item', 'request-1')
+    assert run.state['read'] == [], 'precondition: the first turn asked and stopped'
+    run.turn('item 2', 'request-2', kind='reply')
+    assert [s for s in run.state['steers'] if rr._REUSE_AUTONOMY_NUDGE in s]
+    assert run.state['read'] == [2], 'the step never ran its tool after the answer'
+    assert _task(run, 1).status in (TaskStatus.COMPLETED, TaskStatus.TERMINATED)
+
+
+def test_a_progress_line_is_not_the_question_a_prose_step_waits_on(speech):
+    """Review of 31ec05d14, finding 1 (its probe P1b): a prose step banked
+    'yes' sends "One moment, I am preparing your lesson." declared
+    expects_reply=false, under 'pending' verdicts until the lesson exists.
+    The lesson is written on that turn and the step completes only after
+    it; no question is held.  31ec05d14 held the progress line as the
+    step's open question, and the person's "ok thanks" then completed the
+    step with no lesson ever written."""
+    from agent_ledger.core import TaskStatus
+    lesson = ('Algebra uses letters for numbers we do not know yet. If x + 3 = 5, '
+              'x is 2, because 2 + 3 = 5.')
+
+    def script(state, aid, content):
+        if aid != 1:
+            return 'Basic algebra is a great place to start.'
+        if not state['sends']:
+            return {'content': '', 'tool_calls': [{
+                'id': 'progress_1', 'type': 'function',
+                'function': {'name': 'send_message_to_user',
+                             'arguments': json.dumps({
+                                 'text': 'One moment, I am preparing your lesson.',
+                                 'expects_reply': False})}}]}
+        if rr._REUSE_AUTONOMY_NUDGE in content or state.get('lesson'):
+            state['lesson'] = True
+            return lesson
+        return 'I let the learner know the lesson is coming.'
+
+    def verdict(state, aid, content):
+        if aid == 1 and not state.get('lesson'):
+            return json.dumps({'status': 'pending', 'action_id': 1,
+                               'message': 'the lesson has not been written yet'})
+        return json.dumps({'status': 'completed', 'action_id': aid})
+
+    flow = [{'action': 'Write one short lesson on basic algebra for the learner.',
+             'action_id': 1, 'recipe': [], 'can_perform_without_user_input': 'yes'},
+            _FLOW[1]]
+    run = speech(actions=flow, verdict_script=verdict, assistant_script=script)
+    run.turn('teach me algebra', 'request-1')
+    assert run.state.get('lesson'), 'the lesson was never written'
+    assert run.L.ledger_open_ask(run.key, 1, 0) is None
+    assert _task(run, 1).status in (TaskStatus.COMPLETED, TaskStatus.TERMINATED)
 
 
 def test_a_resent_question_is_not_progress_for_the_round_budget():

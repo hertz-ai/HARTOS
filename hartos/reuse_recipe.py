@@ -6535,7 +6535,9 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                         and _reuse_current_action not in _reuse_advanced_actions
                         and _reuse_runs_alone(user_prompt, _reuse_current_action, group_chat)
                         and not _reuse_outstanding_tools(user_prompt, _reuse_current_action,
-                                                        group_chat)):
+                                                        group_chat)
+                        and not _reuse_window_holds_an_ask(user_prompt, _reuse_current_action,
+                                                           group_chat)):
                     _pk = (user_prompt, _reuse_current_action)
                     _pn = _reuse_pending_counts.get(_pk, 0)
                     if _pn < _REUSE_PENDING_STEER_MAX:
@@ -7574,9 +7576,22 @@ def _reuse_runs_alone(user_prompt, action_id, group_chat):
     was never reached (13 steers for a model that asks once; a model that
     re-sends when nudged sent the person the same question 25 times).  A
     step that asked is driven as a 'no' step is: no nudge, no escape, and
-    the no-driver break ends the turn, where the exit hook holds it."""
-    return bool(_reuse_action_is_autonomous(user_prompt, action_id)
-                and not _reuse_window_holds_an_ask(user_prompt, action_id, group_chat))
+    the no-driver break ends the turn, where the exit hook holds it.
+
+    "Asked" is the send's own declaration in THIS turn's window
+    (lifecycle_hooks.window_asked from the latest dispatch), never this
+    run's verdict.  Review of 31ec05d14 (critical, option A agreed by
+    hartos-c9 and the reviewer): 'pending' is also a 'yes' step's plain
+    "not done yet", and reading it as a question made a declared progress
+    line ("One moment, I am reading item 2") the step's question, so the
+    step lost its nudge and its tool never ran.  The under-report escape
+    keeps its own verdict-aware ask check (_reuse_window_holds_an_ask)."""
+    if not _reuse_action_is_autonomous(user_prompt, action_id):
+        return False
+    messages = list(getattr(group_chat, 'messages', None) or [])
+    dispatch_index = _reuse_latest_dispatch_index(messages, action_id)
+    return dispatch_index is None or not window_asked(messages[dispatch_index:],
+                                                      action_id)
 
 
 def _reuse_window_holds_an_ask(user_prompt, action_id, group_chat):
