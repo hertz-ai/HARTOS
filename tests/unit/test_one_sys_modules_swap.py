@@ -48,7 +48,6 @@ def sys_modules_patch_dicts(source):
 
 #: Files allowed to keep their patch.dict(sys.modules) calls, and how many.
 FROZEN = {
-    'tests/e2e/test_e2e_pipelines.py': 2,
     'tests/functional/test_vlm_loop_functional.py': 3,
     'tests/test_stt_stream_window.py': 4,
     'tests/test_system_introspect_tool.py': 1,
