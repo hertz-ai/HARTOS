@@ -185,6 +185,28 @@ class TestRedactSensitive(unittest.TestCase):
         for key in kept:
             self.assertEqual(result[key], 'raw-' + key, key)
 
+    def test_a_number_glued_or_plural_and_a_glued_plural_secret_are_withheld(self):
+        """Read only as a word of its own, 'ssn' let through raw ten spellings
+        the log had withheld ('ssns', 'SSNumber', 'userssn'), and the glued
+        plurals of the two-word secrets were never caught (review of
+        d2a2f2ad4, M-1 and m-1).  Everyday names that hold the same letters
+        stay readable."""
+        withheld = ('ssns', 'SSNs', 'SSNumber', 'ssNumber', 'ssnumber',
+                    'ssnlast4', 'ssnhash', 'userssn', 'customerssn',
+                    'encryptedssn', 'mySsnValue', 'apikeys', 'privatekeys',
+                    'creditcards', 'cardnumbers')
+        kept = ('accessNumber', 'accessnumber', 'unlessNested', 'crossNet',
+                'glassNode', 'harnessName', 'fitnessNote', 'chessNotation',
+                'missingNodes', 'bossName', 'lessonNumber', 'successNotice',
+                'businessNumber', 'progressNote', 'processNode', 'pressNumber',
+                'assignee', 'sessionName', 'card_count', 'publicKey')
+        result = json.loads(_redact_sensitive(
+            {n: 'raw-' + n for n in withheld + kept}))
+        for key in withheld:
+            self.assertEqual(result[key], '[REDACTED]', key)
+        for key in kept:
+            self.assertEqual(result[key], 'raw-' + key, key)
+
 
 class TestBorrowedSessionContract(unittest.TestCase):
     """log_event(db=...) rides the CALLER'S transaction.

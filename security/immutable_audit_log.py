@@ -17,6 +17,7 @@ Usage:
 import hashlib
 import json
 import logging
+import re
 import threading
 import time
 from datetime import datetime
@@ -25,41 +26,45 @@ from typing import Optional, List, Tuple, Dict, Any
 logger = logging.getLogger('hevolve_security')
 
 # Besides a secret's name (security.edge_privacy.is_secret_key, the one
-# rule), what the audit log never keeps: a government or card number.
-_SENSITIVE_EXTRA_WORDS = ('ssn', 'credit_card', 'card_number')
-# And any key that holds one of these anywhere ('auth_tokens', 'token_value',
-# 'client_secrets', 'api_keys', 'secret_answer', 'credential_id',
-# 'ssn_last4'): the one rule reads a secret word only as the whole name or
-# its last word, and this log is hash-chained, so a value kept raw is kept for
-# good.  Withholding a harmless 'max_tokens' here is the price (review of
-# 2f3d2255e, which dropped this catch and so kept those names raw).  A key is
-# read as written and in secret_key_form, so 'apiKeys', 'privateKeys' and
-# 'private-key-pem' are caught too (review of fbae5ea36, M1).
-_SENSITIVE_KEY_PARTS = ('password', 'token', 'api_key', 'secret', 'credential',
-                        'private_key', 'credit_card', 'card_number')
-# A government number is a WORD of the key ('ssn', 'ssn_last4', 'mySSN'),
-# never three letters anywhere: matched anywhere, 'classname', 'processName',
-# 'businessName' and 'witnessNode' were withheld, evidence this log keeps
-# for good (review of fbae5ea36).
-_SENSITIVE_KEY_WORDS = ('ssn',)
+# rule), the audit log withholds a key whose letters, run together, hold one
+# of these anywhere ('auth_tokens', 'token_value', 'client_secrets',
+# 'apiKeys', 'apikeys', 'private-key-pem', 'secret_answer', 'credential_id',
+# 'creditcards', 'card_numbers'): the one rule reads a secret word only as
+# the whole name or its last word, and this log is hash-chained, so a value
+# kept raw is kept for good.  Withholding a harmless 'max_tokens' or
+# 'apiKeyName' here is the price (reviews of 2f3d2255e, fbae5ea36 and
+# d2a2f2ad4).
+_SENSITIVE_KEY_PARTS = ('password', 'token', 'apikey', 'secret', 'credential',
+                        'privatekey', 'creditcard', 'cardnumber')
+# A government number is a word of the key that starts or ends with one of
+# these ('ssn', 'ssn_last4', 'ssns', 'SSNumber', 'userssn', 'mySsnValue'),
+# never the letters anywhere in it: matched anywhere, 'classname',
+# 'processName', 'businessName' and 'witnessNode' were withheld (review of
+# fbae5ea36); matched only as a whole word, 'ssns' and 'userssn' were kept
+# raw (review of d2a2f2ad4).
+_SENSITIVE_NUMBER_WORDS = ('ssn',)
 
 
 def _redact_sensitive(detail: Optional[Dict]) -> Optional[str]:
     """Redact sensitive fields before storing in audit log.
 
     A field is sensitive by the one secret-name rule (which also reads
-    'passwd', 'pwd', 'cookie', 'apikey' and 'API-Key') extended by
-    _SENSITIVE_EXTRA_WORDS, when its key holds one of _SENSITIVE_KEY_PARTS
-    anywhere, or when a word of it is one of _SENSITIVE_KEY_WORDS."""
+    'passwd', 'pwd', 'cookie' and 'API-Key'), when its key's letters hold
+    one of _SENSITIVE_KEY_PARTS, or when a word of its key starts or ends
+    with one of _SENSITIVE_NUMBER_WORDS.  The words are read both as
+    written ('ssns', 'userssn') and in secret_key_form ('my_ssn_value')."""
     if detail is None:
         return None
     from security.edge_privacy import is_secret_key, secret_key_form
     safe = {}
     for k, v in detail.items():
         raw, form = str(k).lower(), secret_key_form(str(k))
-        if (is_secret_key(form, _SENSITIVE_EXTRA_WORDS)
-                or any(p in raw or p in form for p in _SENSITIVE_KEY_PARTS)
-                or set(_SENSITIVE_KEY_WORDS).intersection(form.split('_'))):
+        letters = re.sub('[^a-z]+', '', raw)
+        words = set(form.split('_')) | set(re.split('[^a-z]+', raw))
+        if (is_secret_key(form)
+                or any(p in letters for p in _SENSITIVE_KEY_PARTS)
+                or any(w.startswith(n) or w.endswith(n)
+                       for w in words for n in _SENSITIVE_NUMBER_WORDS)):
             safe[k] = '[REDACTED]'
         else:
             safe[k] = v
