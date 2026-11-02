@@ -618,7 +618,7 @@ def ask_person_tool(user_id, prompt_id, agent_id=None):
             'answered': False, 'ask_id': out['ask_id'], 'status': 'waiting_for_person',
             'note': ('The question is on their devices and they have not answered '
                      'yet. This step is not done: read the answer later with '
-                     'ask_person(ask_id=...).')})
+                     '%s(ask_id=...).' % ASK_PERSON_TOOL)})
 
     return (ASK_PERSON_TOOL,
             ('Ask your person on any of their devices and get their answer, e.g. a '

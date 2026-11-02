@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -788,6 +789,10 @@ def test_the_tool_holds_the_ask_when_the_person_has_not_answered(legs):
     func = _tool()
     reply = json.loads(func(json.dumps(POST), 0))
     assert reply['answered'] is False and reply['status'] == 'waiting_for_person'
+    # The held reply names the tool to read the answer with by its
+    # registered name, as a whole word (it was hand-written).
+    name = person_ask.ask_person_tool('10202', '342')[0]
+    assert re.search(r'\b%s\(ask_id=' % re.escape(name), reply['note']), reply['note']
     ask_id = reply['ask_id']
     assert person_ask.answer_ask(ask_id, {'decision': 'approve'}, '10202')[1] == 200
     later = json.loads(func('', 0, ask_id))
