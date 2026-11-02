@@ -35,6 +35,7 @@ is the one place files, turn bindings, consumption and delivery are recorded:
     parse_inbound(raw)            the turn's well-formed references (pure)
     bind_inbound(...)             tie them to (user, prompt, request)
     latest_inbound(...)           what a reel turn may use
+    sent_since(...)               what she sent while an agent waited for it
     take_outbound(...)            this turn's reel media, taken once
     media_to_mirror(media)        the chat mirror's attachment rows (pure)
 
@@ -253,6 +254,26 @@ def latest_inbound(user_id, prompt_id, *, request_id=None, purpose=REEL_SOURCE,
         newest = files[-1].request_id
         files = [f for f in files if f.request_id == newest]
     return [f.to_dict() for f in files]
+
+
+def sent_since(user_id, purpose, since: float, *, prompt_id) -> List[Dict[str, Any]]:
+    """Her unconsumed inbound files of ``purpose`` sent at or after ``since``
+    (epoch seconds, the store's clock), in upload order, that are bound to no
+    turn or to a turn of ``prompt_id``: what she sent while that agent waited
+    for files of that purpose (integrations.agent_engine.person_ask).  A
+    file bound to another agent's turn stays out.  A file she sends again
+    counts from the time she sent it again (its claim is refreshed, its turn
+    kept).  Returns StoredFile dicts.  Never raises."""
+    try:
+        files = get_user_file_store().query_inbox(user_id, purpose=purpose,
+                                                  unconsumed_only=True)
+    except Exception as e:
+        logger.warning('chat_attachments: could not read user %r\'s inbox: %s',
+                       user_id, e)
+        return []
+    pid = None if prompt_id is None else str(prompt_id)
+    return [f.to_dict() for f in files
+            if f.created_at >= since and f.prompt_id in (None, pid)]
 
 
 # ── outbound: the turn's reel ─────────────────────────────────────────────

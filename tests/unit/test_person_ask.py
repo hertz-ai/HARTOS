@@ -869,3 +869,117 @@ def test_the_tool_never_waits_longer_than_its_ceiling(legs, monkeypatch):
     reply = json.loads(func(json.dumps(POST), 3600))
     assert reply['answered'] is False
     assert time.monotonic() - t0 < 2
+
+
+# -- what she sends for an ask reaches the agent that asked -----------------------
+#
+# Owner, 2026-11-02: "what got uplpoaded shd reach agent since the agent asked
+# for them to begin with".  Live that day (request 90e55312, ask aec93adf):
+# her Pad put three clips in her desktop's store, then the app died before it
+# sent its answer, so agent 342 found "No file uploaded from user", asked her
+# again and got the same open ask back with nothing in it.
+
+def _clips(func, ask_id='', **card):
+    """The agent asks for her clips (or, with ``ask_id``, reads that ask)."""
+    if ask_id:
+        return json.loads(func('', 0, ask_id))
+    return json.loads(func(json.dumps(dict(CLIPS, **card)), 0))
+
+
+def _later():
+    """A moment, so what follows is sent after the ask, on the store's clock."""
+    time.sleep(0.02)
+
+
+def test_clips_she_sent_for_an_ask_reach_the_agent_when_it_reads_the_ask(legs, store):
+    from core.chat_attachments import latest_inbound
+    func = _tool()
+    ask_id = _clips(func)['ask_id']
+    _later()
+    xids = [_sent(store, '10202', b'clip one'), _sent(store, '10202', b'clip two')]
+    reply = _clips(func, ask_id)
+    assert reply['answered'] is False
+    assert reply['status'] == 'files_received', reply
+    assert [f['xid'] for f in reply['received']] == xids
+    assert set(reply['received'][0]) == {'xid', 'name', 'size'}
+    # bound to the agent that asked, under the ask: the files a tool of that
+    # agent finds (its newest batch) are hers
+    bound = latest_inbound('10202', '342')
+    assert [f['xid'] for f in bound] == xids
+    assert {f['request_id'] for f in bound} == {ask_id}
+
+
+def test_the_same_question_asked_again_hands_over_what_she_sent(legs, store):
+    func = _tool()
+    first = _clips(func)
+    _later()
+    xid = _sent(store, '10202', b'clip one')
+    again = _clips(func)
+    assert again['ask_id'] == first['ask_id']
+    assert again['status'] == 'files_received', again
+    assert [f['xid'] for f in again['received']] == [xid]
+
+
+def test_with_nothing_sent_the_ask_still_waits(legs, store):
+    func = _tool()
+    ask_id = _clips(func)['ask_id']
+    reply = _clips(func, ask_id)
+    assert reply['status'] == 'waiting_for_person' and 'received' not in reply
+
+
+def test_only_her_files_of_the_asks_kind_sent_since_the_ask_are_taken(legs, store):
+    from core.chat_attachments import bind_inbound
+    before = _sent(store, '10202', b'sent before the ask')
+    _later()
+    func = _tool()
+    ask_id = _clips(func)['ask_id']
+    _later()
+    other_kind = _sent(store, '10202', b'a chat file', 'chat_attachment')
+    his = _sent(store, '777', b'his clip')
+    another_agents = _sent(store, '10202', b'a clip for another agent')
+    bind_inbound('10202', '99', 'its-turn',
+                 [{'file_id': another_agents, 'purpose': 'reel_source'}])
+    mine = _sent(store, '10202', b'her clip')
+    reply = _clips(func, ask_id)
+    assert [f['xid'] for f in reply['received']] == [mine]
+    assert {before, other_kind, his, another_agents}.isdisjoint(
+        f['xid'] for f in reply['received'])
+    # another agent's clip stays on its turn
+    from core.chat_attachments import latest_inbound
+    assert [f['xid'] for f in latest_inbound('10202', '99')] == [another_agents]
+
+
+def test_a_clip_her_desktop_already_holds_counts_when_she_picks_it_again(legs, store):
+    """Bytes the store holds are not uploaded again: her pick of them is a
+    claim sent now (file_have), still bound to the turn it had."""
+    from core.chat_attachments import bind_inbound
+    old = _sent(store, '10202', b'clip from last week')
+    bind_inbound('10202', '342', 'an-older-turn', [{'file_id': old, 'purpose': 'reel_source'}])
+    func = _tool()
+    ask_id = _clips(func)['ask_id']
+    _later()
+    assert _sent(store, '10202', b'clip from last week') == old
+    reply = _clips(func, ask_id)
+    assert [f['xid'] for f in reply['received']] == [old]
+
+
+def test_no_more_files_than_the_ask_takes(legs, store):
+    func = _tool()
+    ask_id = _clips(func, max_files=2)['ask_id']
+    _later()
+    xids = [_sent(store, '10202', b'clip %d' % i) for i in range(3)]
+    reply = _clips(func, ask_id)
+    assert [f['xid'] for f in reply['received']] == xids[:2]
+
+
+def test_her_answer_after_her_files_arrived_still_answers_the_ask(legs, store):
+    from integrations.agent_engine import person_ask
+    func = _tool()
+    ask_id = _clips(func)['ask_id']
+    _later()
+    xid = _sent(store, '10202', b'clip one')
+    assert _clips(func, ask_id)['status'] == 'files_received'
+    body, code = person_ask.answer_ask(ask_id, {'xids': [xid]}, '10202')
+    assert code == 200, body
+    done = _clips(func, ask_id)
+    assert done['answered'] is True and done['answer'] == {'xids': [xid]}
