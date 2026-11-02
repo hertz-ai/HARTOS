@@ -27,7 +27,8 @@ import pytest
 from core.subprocess_safe import BoundedResult
 from integrations.reel_studio import contracts as C
 from integrations.reel_studio.motion import compose, layout, runtime
-from tests.unit.reel_media_fixtures import golden_edl, make_clip, requires_ffmpeg
+from tests.unit.reel_media_fixtures import (
+    golden_edl, make_clip, requires_drawtext, requires_ffmpeg)
 
 runtime_manager = importlib.import_module('integrations.service_tools.runtime_manager')
 model_storage = importlib.import_module('integrations.service_tools.model_storage')
@@ -392,6 +393,7 @@ def test_a_long_plain_card_is_sized_to_its_box(lines):
 
 
 @requires_ffmpeg
+@requires_drawtext
 @pytest.mark.parametrize('lines', [LONG_CARD, TAMIL_CARD], ids=['latin', 'tamil'])
 def test_the_plain_end_card_is_drawn_inside_its_box(tmp_path, lines):
     """The user-visible check: the card rendered by pass 2 (real drawtext, the
