@@ -2019,11 +2019,14 @@ def build_core_tool_closures(ctx):
     # have closed the step on its own question.  A call that omits it fails
     # here (the tool_logging error envelope names the argument) and sends
     # nothing, so an omission is a visible failed call, never a silent ask
-    # or a silent completion.
+    # or a silent completion.  What it means is EXPECTS_REPLY_RULE's one
+    # definition, shared with the tool description and REUSE's rule 11.ii.
+    from core.constants import EXPECTS_REPLY_RULE
+
     @log_tool_execution
     def send_message_to_user(
         text: Annotated[str, "Text you want to send to the user"],
-        expects_reply: Annotated[bool, "true if this message asks the user something you need answered before your step is done; false if it only tells them something"],
+        expects_reply: Annotated[bool, EXPECTS_REPLY_RULE],
         avatar_id: Annotated[Optional[str], "Unique identifier for the avatar"] = None,
         response_type: Annotated[Optional[str], "Response mode: 'Realistic' (slower, better quality) or 'Realtime' (faster, lower quality)"] = 'Realtime',
     ) -> str:
@@ -2038,15 +2041,20 @@ def build_core_tool_closures(ctx):
         # the turn it ran in and the action it ran for, so the share of sends
         # that ask is measured, not guessed (hartos-00's review of the
         # 476bbd5d8 rework).
+        # Attribution is evidence, not behaviour: an unresolved id is logged
+        # as None and never stops the send (tool_logging._session_suffix's
+        # rule, at debug for the same reason: a daemon tick has no request).
         try:
             from hartos.threadlocal import thread_local_data as _tld
             _rid = _tld.get_request_id()
         except Exception:
+            tool_logger.debug('[SEND-KIND] request id unavailable', exc_info=True)
             _rid = None
         try:
             from hartos.lifecycle_hooks import action_in_progress
             _aid = action_in_progress(user_prompt)
         except Exception:
+            tool_logger.debug('[SEND-KIND] action id unavailable', exc_info=True)
             _aid = None
         tool_logger.info(
             f'[SEND-KIND] {user_prompt} action={_aid} request={_rid} '
@@ -2066,10 +2074,9 @@ def build_core_tool_closures(ctx):
 
     tools.append((
         "send_message_to_user",
-        "Sends a message to the user. Set expects_reply true when the message "
-        "asks them something you need answered before your step is done (your "
-        "step then waits for their answer), false when it only tells them "
-        "something.",
+        "Sends a message to the user. " + EXPECTS_REPLY_RULE
+        + " A message that waits for their answer holds your step until "
+        "they answer.",
         send_message_to_user,
     ))
 

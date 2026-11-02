@@ -136,6 +136,46 @@ def _session_suffix() -> str:
     return ""
 
 
+def _action_in_progress():
+    """The action the session's turn is running, or None without context.
+
+    Same session key and same never-raise rule as `_session_suffix`."""
+    try:
+        from hartos.threadlocal import thread_local_data
+        from hartos.lifecycle_hooks import action_in_progress
+
+        user_id = thread_local_data.get_user_id()
+        prompt_id = thread_local_data.get_prompt_id()
+        if user_id and prompt_id:
+            return action_in_progress(f"{user_id}_{prompt_id}")
+    except Exception:
+        _emit_logger.debug("[tool_logging] action in progress unavailable",
+                           exc_info=True)
+    return None
+
+
+def log_refused_call(tool_name: str, reason: str) -> None:
+    """One WARNING for a model's call that was refused before the tool ran.
+
+    Called where the executor refuses arguments that do not fit the tool
+    (hartos/helper.py, tool_argument_error), the path every group's tool
+    call takes; the refusal never reaches `log_tool_execution`.  It names
+    the session and step so an omission is counted per day, e.g.
+    send_message_to_user without expects_reply after the hot-swap
+    (hartos-00's ruling on 7043d635e, finding 4).  ``reason`` is the
+    refusal the model reads, logged raw as a LOCAL record: it names the
+    tool's declared parameters, but any key the model wrote that is
+    unknown, invented, written twice, or read after a JSON repair is echoed
+    as written, and after a repair such a key can be a fragment of the
+    model's own text (the 2026-09-22 split turned "Consulting:" inside a
+    message into a key).  Local logs may hold raw values, as the wrapper's
+    "Arguments:" line already does; only egress is scrubbed.
+    """
+    tool_logger.warning(
+        f"[TOOL-CALL-REFUSED] {tool_name}: {reason} "
+        f"action={_action_in_progress()}{_session_suffix()}")
+
+
 def credential_vault():
     """The credential vault, or None when it cannot load.
 

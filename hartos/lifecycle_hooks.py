@@ -874,7 +874,7 @@ def _user_reply_is_the_evidence(user_prompt: str, action_id: int, evidence: dict
     if ask is None or str(ask.get('request_id') or '') == request_id:
         return False
     _text, named = _tools_this_action_names(user_prompt, action_id)
-    return not (set(named) - {'send_message_to_user'})
+    return not (set(named) - {SEND_TOOL})
 
 
 def resume_from_user_input(user_prompt: str, action_id: int,
@@ -2002,6 +2002,35 @@ def delivered_text(messages, call_id, body) -> Optional[str]:
     return text if written_text_is_answer(text) else None
 
 
+def window_asked(messages, action_id) -> bool:
+    """``action_id``'s dispatch window in ``messages`` holds a question that
+    reached the person (a delivered send that asks, send_is_ask): the action
+    waits for their answer, so no line written after it is the action's
+    output.  hartos-00's review of 7043d635e: on a daemon tick a step that
+    names no tool asked, then completed on the model's next line ("Noted.").
+    Newest first; the first result outside the window ends the search."""
+    names = tool_call_names([messages or []])
+    for index in range(len(messages or []) - 1, -1, -1):
+        msg = messages[index]
+        if not isinstance(msg, dict) or msg.get('role') != 'tool':
+            continue
+        if latest_dispatch_before(messages, index + 1) != action_id:
+            break
+        responses = msg.get('tool_responses')
+        for result in (responses if isinstance(responses, list) and responses
+                       else [msg]):
+            if not isinstance(result, dict):
+                continue
+            call_id = result.get('tool_call_id') or msg.get('tool_call_id')
+            body = result.get('content')
+            if body is None:
+                body = msg.get('content')
+            if (names.get(call_id) == SEND_TOOL and send_delivered(body)
+                    and send_is_ask(messages, call_id)):
+                return True
+    return False
+
+
 def verdict_waits_on_person(verdict) -> bool:
     """This run's verdict says the step waits on the person: status 'pending',
     or a can_perform_without_user_input autonomy_needs_user reads as 'no'."""
@@ -2726,6 +2755,11 @@ def derive_completion_evidence(user_prompt: str, action_id: int,
         # that does not.  No other tool reply in a prose action's window is
         # its receipt.
         if not _tools_this_action_names(user_prompt, action_id)[1]:
+            # A question out and no answer yet: nothing in the window is the
+            # action's output (window_asked); its answer will be.
+            if window_asked(list(getattr(group_chat, 'messages', None) or []),
+                            action_id):
+                return None
             return (_derive_written_answer(user_prompt, action_id, group_chat)
                     or user_output_receipt(user_prompt, action_id, group_chat,
                                            waits_on_person=waits_on_person))

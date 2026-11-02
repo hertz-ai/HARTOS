@@ -418,6 +418,19 @@ NUNBA_WEB_FETCH_POLICY: str = (
     "the limitation only if no tool can be attached."
 )
 
+# What send_message_to_user's expects_reply means has ONE home: this
+# constant.  The tool's parameter and tool descriptions
+# (core/agent_tools.py) and REUSE's rule 11.ii, the line beside the banked
+# steps, embed it, so the definition the model is shown cannot drift between
+# them (hartos-00's ruling on 7043d635e, finding 4).  It names the mixed case
+# because the live send that started this both told the person something and
+# ended "Ready to begin?" (agent 45620673143 action 3, 2026-10-31 17:13 IST).
+EXPECTS_REPLY_RULE: str = (
+    "Every call sets expects_reply: true whenever the message waits for the "
+    "person's answer, even if it also tells them something; false only when "
+    "it asks nothing."
+)
+
 NUNBA_BRAND_IDENTITY: str = (
     "You are Nunba, a friendly and helpful local AI assistant. "
     "Hevolve.ai is the web cloud version of Nunba — same intelligence, "

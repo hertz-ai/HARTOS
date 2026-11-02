@@ -5128,6 +5128,11 @@ def bind_tool_call_arguments(func, func_name, input_string, format_json_str,
                                 as_written=input_string)
     if error is not None:
         print(f" ARGUMENTS REFUSED{where}: {func_name} not run: {error}")
+        # The counted line, one per refused call with its session and step
+        # (a local raw record, see log_refused_call): the print above never
+        # reaches the node's log.
+        from core.tool_logging import log_refused_call
+        log_refused_call(func_name, error)
         if repaired:
             mark_call_refused(records, input_string)
         return None, error

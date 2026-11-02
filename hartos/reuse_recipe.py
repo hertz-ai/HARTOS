@@ -18,6 +18,7 @@ from core.constants import (  # noqa: E402  (after io_guard, intentional)
     AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE,
     AUTOGEN_HISTORY_LIMIT,
     DEFAULT_SINGLE_ROLE,
+    EXPECTS_REPLY_RULE,
     HISTORICAL_TOOL_PLACEHOLDER,
     NUNBA_WEB_FETCH_POLICY,
     TOOL_FAILURE_RESULTS,
@@ -397,7 +398,7 @@ from hartos.lifecycle_hooks import (
     action_is_autonomous, action_named_tools, action_own_text,
     is_written_answer, ANSWER_KEYS, user_output_receipt,
     SEND_TOOL, send_is_ask, verdict_waits_on_person, send_delivered,
-    delivered_text, sent_text,
+    delivered_text, sent_text, window_asked, tool_call_names,
     mark_action_waiting_for_user, resume_from_user_input,
     record_ask_delivered, ledger_open_ask, person_waits_on, is_terminal_state,
 )
@@ -1769,7 +1770,7 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
         10. **Never reveal actions, internal processes, or tools to the user**. Do not ask for user confirmation unless absolutely necessary(You can assume normal things like user's interests).
         11. Calling Other Agents (Important):
             i. When you need to direct a question or route the conversation to a specific agent, use the @ tag followed by the agent's name. Examples include: @Executor or @Helper or @User
-            ii. If you are responding to the user's request or need some clarification/information from user, just tag userproxy agent strictly via `@user {response_format}` or If you need to send data proactively (on your own) while continuing your current action use tools `send_message_to_user`  or `send_message_in_seconds` for sending message to user with delay,  Do not use both to convey the same.
+            ii. If you are responding to the user's request or need some clarification/information from user, just tag userproxy agent strictly via `@user {response_format}` or If you need to send data proactively (on your own) while continuing your current action use tools `send_message_to_user`  or `send_message_in_seconds` for sending message to user with delay,  Do not use both to convey the same. Recorded steps below may show `send_message_to_user` without expects_reply. {EXPECTS_REPLY_RULE}
         12. All actions, recipes, and functions provided below have been reviewed and tested. Follow them exactly—do not make assumptions or modify them unless they fail or produce an error.
         13. Always request the next action from the @StatusVerifier agent—do not determine the next action on your own.
         14. If `can_perform_without_user_input` is `yes`, execute the action automatically without requesting user confirmation.
@@ -3825,7 +3826,7 @@ _reuse_pending_reply = {}
 # The one tool an ask step may name and still be an ASK: its send is its
 # question, never its receipt (#161).  One spelling for the branch choice
 # here and the predicates below.
-_REUSE_ASK_TOOLS = frozenset({'send_message_to_user'})
+_REUSE_ASK_TOOLS = frozenset({SEND_TOOL})
 # How an ask must have reached the person for their reply to stand in for
 # the step's own send at the fabrication gate: a send receipt that did not
 # fail, or the text the turn returned to them.  A written answer the turn did
@@ -4305,15 +4306,28 @@ def _reuse_evidence_count(group_chat):
     Returns -1 when it cannot be measured, which callers compare with `>` so
     an unmeasurable state can never be read as progress and extend a budget
     forever.  Never raises: it runs inside the loop that produces the reply.
+
+    A result that is only sends asking the person something is not
+    progress (lifecycle_hooks.send_is_ask): a model re-sending its question
+    when nudged reset the allowance with every copy (hartos-00's review of
+    7043d635e, 26 steers and 25 copies of one question).
     """
     try:
         n = 0
         for _ml in _reuse_evidence_msg_lists(
                 group_chat, getattr(group_chat, 'agents', None) or []):
+            names = tool_call_names([_ml or []])
             for m in (_ml or []):
                 if not isinstance(m, dict) or m.get('role') != 'tool':
                     continue
                 if HISTORICAL_TOOL_PLACEHOLDER in str(m.get('content') or ''):
+                    continue
+                responses = m.get('tool_responses')
+                ids = [(r or {}).get('tool_call_id') or m.get('tool_call_id')
+                       for r in (responses if isinstance(responses, list) and responses
+                                 else [m])]
+                if ids and all(names.get(cid) == SEND_TOOL and send_is_ask(_ml, cid)
+                               for cid in ids):
                     continue
                 n += 1
         return n
@@ -4939,9 +4953,11 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
         _all_names, referenced = _reuse_registered_and_referenced_tools(
             agents, action_text)
 
-        # An ask-only step (#161) on a PERSON's turn (a daemon turn walks the
-        # parent's paths until the owner rules on daemon replay of 'no'
-        # steps; hartos-f9's review, Critical 2).  Decided before the
+        # An ask-only step (#161) on a PERSON's turn.  A daemon turn records
+        # no ask here: the owner ruled 2026-10-31 that a background step's
+        # question goes to the goal's owner through the goal (parts B1-B3,
+        # not built yet), and until then window_asked below still keeps its
+        # question from completing the step.  Decided before the
         # named-tool branch, because an ask step that names
         # send_message_to_user in its words would otherwise complete on its
         # own ask.  The reply this turn carries is the evidence; else a
@@ -4958,7 +4974,7 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
                 return reply
             if _reuse_record_ask_in_window(
                     user_prompt, action_id, group_chat, messages, dispatch_index,
-                    written_counts='send_message_to_user' in referenced):
+                    written_counts=SEND_TOOL in referenced):
                 return None
 
         if referenced:
@@ -5033,6 +5049,12 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
                 + f" for session: {user_prompt}"))
             return None
 
+        # A question out and no answer yet: no line written after it is the
+        # step's output, on any turn (lifecycle_hooks.window_asked, CREATE's
+        # rule too).  hartos-00's review of 7043d635e: on a daemon tick the
+        # live shape asked and then completed on the model's next "Noted.".
+        if window_asked(messages, action_id):
+            return None
         answer = (_reuse_written_answer(group_chat)
                   if dispatch_index is not None else None)
         if isinstance(answer, dict):
@@ -6511,11 +6533,9 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                 if (isinstance(_pend_vj, dict)
                         and _pend_st in _REUSE_UNDERREPORT_STATUSES
                         and _reuse_current_action not in _reuse_advanced_actions
-                        and _reuse_action_is_autonomous(user_prompt, _reuse_current_action)
+                        and _reuse_runs_alone(user_prompt, _reuse_current_action, group_chat)
                         and not _reuse_outstanding_tools(user_prompt, _reuse_current_action,
-                                                        group_chat)
-                        and not _reuse_window_holds_an_ask(user_prompt, _reuse_current_action,
-                                                           group_chat)):
+                                                        group_chat)):
                     _pk = (user_prompt, _reuse_current_action)
                     _pn = _reuse_pending_counts.get(_pk, 0)
                     if _pn < _REUSE_PENDING_STEER_MAX:
@@ -6693,8 +6713,8 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                 # left, and the helper's docstring already fixes the semantics
                 # for an absent field ("-> False, so an unknown action is
                 # never auto-advanced").
-                if _reuse_action_is_autonomous(
-                        user_prompt, user_tasks[user_prompt].current_action):
+                if _reuse_runs_alone(
+                        user_prompt, user_tasks[user_prompt].current_action, group_chat):
                     current_app.logger.info('GOT can_perform_without_user_input as true')
                     message = _REUSE_AUTONOMY_NUDGE
                     # chat_instructor, not helper — same reason as the
@@ -6828,8 +6848,8 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                 # — asking for the user-facing answer'), so this reaches the
                 # identical outcome deterministically instead of after 11
                 # wasted rounds.  Never `return ''` here (#797/D31).
-                if not _reuse_action_is_autonomous(
-                        user_prompt, user_tasks[user_prompt].current_action):
+                if not _reuse_runs_alone(
+                        user_prompt, user_tasks[user_prompt].current_action, group_chat):
                     current_app.logger.warning(
                         f"[REUSE-NODRIVER] action "
                         f"{user_tasks[user_prompt].current_action} is not "
@@ -7184,6 +7204,21 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
         _gc = get_registered_groupchat(user_prompt)
         if _gc is not None:
             _agents = list(getattr(_gc, 'agents', None) or [])
+            # A question asked on a turn nobody can answer (a daemon or hive
+            # turn records no ask, #161) is never the step's output, and a
+            # re-steer only sends it again.  The step ends GAVE_UP for retry;
+            # the owner's 2026-10-31 ruling routes such a question to the
+            # goal's owner (parts B1-B3).
+            if (not _reuse_person_turn(user_prompt)
+                    and window_asked(list(getattr(_gc, 'messages', None) or []),
+                                     current_action_id)):
+                current_app.logger.warning(
+                    f"[REUSE] action {current_action_id} asked on a turn nobody "
+                    f"can answer; recording GAVE_UP for retry")
+                force_state_through_valid_path(
+                    user_prompt, current_action_id, ActionState.GAVE_UP,
+                    f"{reason}: asked on a turn nobody can answer")
+                return None, False
             # The person's reply to this step's open ask stands in for the
             # ask's own send (#161): a question the model returned to the
             # person instead of sending was answered all the same, so the gate
@@ -7239,11 +7274,18 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
                     and _reuse_written_answer(_gc) is None \
                     and _reuse_output_send(user_prompt, current_action_id, _gc) is None \
                     and not (_reuse_person_turn(user_prompt)
-                             and _reuse_window_holds_an_ask(user_prompt, current_action_id, _gc)
+                             and (_reuse_window_holds_an_ask(user_prompt, current_action_id, _gc)
+                                  or _reuse_reply_evidence(
+                                      user_prompt, current_action_id,
+                                      list(getattr(_gc, 'messages', None) or [])))
                              and _reuse_ask_only_step(user_prompt, current_action_id, _gc)):
                 # A question that reached the person is not "no output": the
                 # receipt finder records it as the step's ask and the step
-                # holds for the answer (the owner on 476bbd5d8).
+                # holds for the answer (the owner on 476bbd5d8).  Nor is the
+                # turn that carries their answer: the answer is the step's
+                # receipt, whatever else the model wrote (hartos-00's review
+                # of 7043d635e: a reply turn whose only line was a note to the
+                # verifier gave up and dropped the person's answer).
                 # The send that delivered the step's output is its output too
                 # (_reuse_output_send, the receipt finder's own rule): live
                 # 2026-10-31 17:13 IST, agent 45620673143 action 3 sent its
@@ -7523,6 +7565,20 @@ def _reuse_ask_only_step(user_prompt, action_id, group_chat):
                 or _reuse_window_holds_an_ask(user_prompt, action_id, group_chat))
 
 
+def _reuse_runs_alone(user_prompt, action_id, group_chat):
+    """The step runs without the person THIS run: banked autonomous ('yes')
+    and its window holds no question that reached them.  hartos-00's review
+    of 7043d635e (critical): a 'yes' step that asked kept its banked
+    autonomy, so every round posted "You should complete this task
+    independently", the under-report escape was only refused, and the hold
+    was never reached (13 steers for a model that asks once; a model that
+    re-sends when nudged sent the person the same question 25 times).  A
+    step that asked is driven as a 'no' step is: no nudge, no escape, and
+    the no-driver break ends the turn, where the exit hook holds it."""
+    return bool(_reuse_action_is_autonomous(user_prompt, action_id)
+                and not _reuse_window_holds_an_ask(user_prompt, action_id, group_chat))
+
+
 def _reuse_window_holds_an_ask(user_prompt, action_id, group_chat):
     """This step's dispatch window holds a send that reached the person as
     its ask (_reuse_ask_index: any send for a step flagged 'no', a send that
@@ -7540,15 +7596,17 @@ def _reuse_step_names_the_ask_tool(user_prompt, action_id, group_chat):
     step naming no tool ("Respond to user") is an output step: its written
     answer is its output, not a question, outside a pending verdict
     (hartos-f9's review of b9edfd90a, Critical 1 and High 3)."""
-    return 'send_message_to_user' in _reuse_step_referenced_tools(
+    return SEND_TOOL in _reuse_step_referenced_tools(
         user_prompt, action_id, group_chat)
 
 
 def _reuse_person_turn(user_prompt):
     """This turn is a person's: the request id the session is serving is
-    genuine.  Every #161 ask record, hold and resume is gated on it, so a
-    daemon, hive or timer turn walks the parent's paths unchanged until the
-    owner rules on daemon replay of 'no' steps (Critical 2)."""
+    genuine.  Every #161 ask record, hold and resume is gated on it: a
+    daemon, hive or timer turn records no ask and resumes nothing here.  The
+    owner ruled 2026-10-31 that such a turn's question goes to the goal's
+    owner through the goal (pause_goal; parts B1-B3, not built yet);
+    meanwhile its question still never completes the step (window_asked)."""
     return _reuse_request_is_a_person(request_id_list.get(user_prompt))
 
 
@@ -8342,7 +8400,7 @@ def _attach_named_tools_for_action(user_prompt):
             # and getting HTTP 400.  The fit only removes a tool from the
             # schema, and only when the schema does not fit.
             from core.agent_tools import fit_schema_to_ctx
-            _protect = set(named or ()) | {'send_message_to_user'}
+            _protect = set(named or ()) | {SEND_TOOL}
             # Her Reel Studio family, whole, while reel_studio is unlocked for
             # the session (arm_turn_attach at construction, or attach_for_turn
             # when a turn's words detect it) -- not only the tool this action
