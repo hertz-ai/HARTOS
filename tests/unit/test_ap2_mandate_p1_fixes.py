@@ -166,7 +166,7 @@ class TestOwnGatewayUrls:
         from integrations.ap2.ap2_protocol import own_gateway_urls
         monkeypatch.setenv('HARTOS_PUBLIC_URL', 'https://node.example/')
         assert own_gateway_urls() == {
-            'redirect_url': 'https://node.example/',
+            'redirect_url': 'https://node.example/api/v1/intelligence/phonepe/return',
             'callback_url': 'https://node.example/api/v1/intelligence/phonepe/callback',
             'refund_callback_url':
                 'https://node.example/api/v1/intelligence/phonepe/refund-callback',

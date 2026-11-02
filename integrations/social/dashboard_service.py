@@ -964,15 +964,32 @@ def steer_response(db, goal_id: str, *, verb: Optional[str] = None,
     return {'success': bool(result.get('ok')), 'data': result}, code
 
 
-def _write_goal_status(db, goal, status: str) -> None:
+def _write_goal_status(db, goal, status: str, actor_id=None) -> None:
     """Set a steered goal's status.  An AgentGoal goes through
     GoalManager.update_goal_status, the writer /api/goals always used (it
     emits goal-changed and runs HiveEthos' ephemeral-agent cleanup on a
-    terminal status); a CodingGoal is set directly, as before."""
+    terminal status); a CodingGoal is set directly, as before.
+
+    A person's pause is RECORDED as the person's (pause_cause / paused_by
+    'person'), so the agent daemon, which resumes only goals it paused
+    itself for dispatch failures, never undoes it; and a resume goes
+    through GoalManager.resume_goal, the one resume routine, so the old
+    pause record and strike count do not ride along into the resumed goal
+    (review of 26b5f8177, findings 2 and 7)."""
     from .models import AgentGoal
     if isinstance(goal, AgentGoal):
         from integrations.agent_engine.goal_manager import GoalManager
-        result = GoalManager.update_goal_status(db, goal.id, status)
+        if status == 'active' and goal.status == 'paused':
+            result = GoalManager.resume_goal(
+                db, goal.id, resumed_by=f'person:{actor_id or "unknown"}')
+        elif status == 'paused':
+            from integrations.agent_engine.goal_manager import PAUSE_CAUSE_PERSON
+            result = GoalManager.pause_goal(
+                db, goal, cause=PAUSE_CAUSE_PERSON,
+                by=f'person:{actor_id or "unknown"}',
+                reason='Paused by its person from the dashboard')
+        else:
+            result = GoalManager.update_goal_status(db, goal.id, status)
         if not result.get('success'):
             raise RuntimeError(result.get('error') or 'status write failed')
     else:
@@ -1019,7 +1036,7 @@ def steer_agent(db, agent_id: str, verb: str, actor_id: str = 'system',
         return out
 
     try:
-        _write_goal_status(db, goal, target)
+        _write_goal_status(db, goal, target, actor_id=actor_id)
         db.commit()
         out['ok'] = True
         out['new_status'] = target
@@ -1217,7 +1234,7 @@ def steering_caller() -> SteeringCaller:
     """
     from flask import g, request
     from core.auth_local import _is_local_request
-    from .auth import _get_user_from_token, holds_central_role
+    from .auth import _get_user_from_token, holds_central_role, user_refusal
     local = _is_local_request()
     user = getattr(g, 'user', None)
     if user is not None:
@@ -1226,11 +1243,12 @@ def steering_caller() -> SteeringCaller:
                               is_local=local)
     auth = request.headers.get('Authorization', '')
     if auth.startswith('Bearer ') and auth[7:]:
-        # The same token lookup require_auth uses; an invalid or banned
-        # token is no token, and the local owner below answers.
+        # The same token lookup require_auth uses, and the same one rule
+        # (auth.user_refusal): a token whose person may not act here is no
+        # token, and the local owner below answers.
         token_user, token_db = _get_user_from_token(auth[7:])
         try:
-            if token_user is not None and not getattr(token_user, 'is_banned', False):
+            if user_refusal(token_user) is None:
                 return SteeringCaller(user_id=str(token_user.id),
                                       is_admin=holds_central_role(token_user),
                                       is_local=local)

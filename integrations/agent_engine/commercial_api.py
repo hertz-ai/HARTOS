@@ -571,7 +571,14 @@ def _metered_backend_chat(prompt: str, label: str):
     try:
         # The canonical /chat client (core.chat_client): the same pooled path,
         # with the body normalised.  The id minted above passes through
-        # untouched, so this is the wire this function always sent.
+        # untouched, so this is the wire this function always sent.  The
+        # backend port only, never the port the node serves on: on a bundled
+        # desktop that is the Flask port, whose /chat is Nunba's chat route,
+        # and it drops agent_tools, lane and draft_first and runs the casual
+        # tool set (measured 2026-10-29, the review of d78c43eae: the turn
+        # ran casual=True, success true, billed).  Nothing listens on the
+        # backend port there, so a paid call fails closed, unbilled, until
+        # that route honours the contract above (task #160).
         result = post_chat(
             f'http://localhost:{get_port("backend")}/chat', payload,
             headers=headers, timeout=120)
@@ -1183,6 +1190,7 @@ def upgrade_key(key_id):
 #
 #   POST /keys/<id>/upgrade/phonepe   → 202 + redirect_url (caller redirects user)
 #   POST /phonepe/callback            → PhonePe S2S webhook, finalizes tier change
+#   GET|POST /phonepe/return          → the page the buyer comes back to; changes nothing
 #
 # The synchronous /upgrade endpoint cannot service PhonePe because PhonePe
 # is a redirect-then-webhook flow — at create_payment time the user has not
@@ -1201,7 +1209,8 @@ def initiate_phonepe_upgrade(key_id: str):
     """Initiate a PhonePe-rail upgrade for a paid tier.
 
     Body: ``target_tier``; optional ``redirect_url`` (the page the buyer
-    returns to after paying, this node's public URL when absent) and
+    returns to after paying, this node's return page, phonepe_return, when
+    absent) and
     ``mobile_number``.  A ``callback_url`` in the body is ignored: the
     server callback is always this node's own
     (integrations.ap2.ap2_protocol.own_gateway_urls), since a caller-named
@@ -1717,6 +1726,38 @@ def phonepe_refund_callback():
                     'code': code}), 200
 
 
+#: The page a buyer's browser lands on when PhonePe's checkout sends it back.
+#: Plain HTML with no style or script (the node's CSP allows neither inline)
+#: and nothing from the request in it.
+_PHONEPE_RETURN_PAGE = (
+    '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+    '<meta name="viewport" content="width=device-width, initial-scale=1">'
+    '<title>Back from PhonePe</title></head><body><main>'
+    '<h1>Thank you</h1>'
+    '<p>If your payment went through, PhonePe confirms it to us directly, '
+    'and your purchase completes when it does.</p>'
+    '<p>You do not need to pay again. You can close this page.</p>'
+    '</main></body></html>')
+
+
+@commercial_api_bp.route('/api/v1/intelligence/phonepe/return',
+                         methods=['GET', 'POST'])
+def phonepe_return():
+    """The page PhonePe sends the buyer back to: the default return of every
+    PhonePe payment, a tier upgrade or a cart (ap2_protocol.PHONEPE_RETURN_PATH).
+
+    It reads nothing from the request and changes nothing.  The signed
+    callback (phonepe_callback) is the only thing that completes a payment,
+    and nothing in the return is believed.  GET and POST alike: the gateway
+    comes back with a form POST (redirectMode POST) and a reload is a GET;
+    the CSRF guard lets this one path through (security.middleware), since a
+    request that changes nothing gives a forger nothing to make.  The return
+    used to be the bare root, which no node serves (task #145).
+    """
+    from flask import Response
+    return Response(_PHONEPE_RETURN_PAGE, status=200, mimetype='text/html')
+
+
 # ═══════════════════════════════════════════════════════════════
 # Stripe Checkout flow (USD market — hosted card UI, lowest friction)
 #
@@ -2189,18 +2230,37 @@ def _finalize_paid_checkout_session(session, db):
             payment_ledger.payments[payment.payment_id] = payment
             payment_ledger.save_ledger()
 
-    # The bought tier: applied on the first finalize, and again by a replay
-    # when a bump failed after the record was made (a 500 asks Stripe to
-    # retry; the retry used to be answered already_completed over a key
-    # still on the old tier, the review of 3153761b3).  Never a downgrade.
+    return _finish_recorded_checkout(db, payment, api_key, target_tier,
+                                     already=already, session_id=session_id)
+
+
+def _finish_recorded_checkout(db, payment, api_key, target_tier, *,
+                              already: bool, session_id: str):
+    """The end of every path that answers for a recorded Checkout payment;
+    ``(payload, http_status)``.
+
+    The finalizer (the webhook and the browser's first visit) and the
+    browser's fast path for a session already recorded both end here, so a
+    step added to the finish runs on each (the reload ran its own copy of
+    this sequence: parallel-path audit 2026-10-27, item 6).  The bought tier
+    is applied on the first finish and again by a replay when a bump failed
+    after the record was made (a 500 asks for a retry; the retry used to be
+    answered already_completed over a key still on the old tier, the review
+    of 3153761b3).  Never a downgrade.  ``target_tier`` is the caller's:
+    Stripe's signed metadata for the finalizer, the ledger record for the
+    fast path.  The key's id is read before the bump: a failed bump rolls
+    the session back, which expires the row, and with the database gone a
+    read after it raised inside the report, so the 500 carried no
+    reconciliation line (the review of 2971c00db)."""
+    api_key_id = api_key.id
     _changed, failure = _apply_bought_tier(db, api_key, target_tier)
     if failure is not None:
         return _bump_failed(f'Stripe session {session_id}', api_key_id, failure,
-                            retry="Stripe redelivers the event on the 500 and the buyer's "
-                                  'reload re-POSTs the session; either runs the bump again',
+                            retry="the buyer's reload re-POSTs the session, and Stripe "
+                                  'redelivers the event to a registered webhook until '
+                                  'it is answered 200; either runs the bump again',
                             retries=True, payment_request_id=payment.payment_id,
                             session_id=session_id)
-
     return _checkout_payload(payment, api_key, already_completed=already), 200
 
 
@@ -2262,16 +2322,10 @@ def complete_upgrade_checkout():
                     'success': False,
                     'error': 'Session belongs to a different user.',
                 }), 403
-            _changed, failure = _apply_bought_tier(db, api_key, recorded.get('target_tier'))
-            if failure is not None:
-                payload, status = _bump_failed(
-                    f'Stripe session {session_id}', api_key.id, failure,
-                    retry="the buyer's reload re-POSTs the session, and Stripe's event, "
-                          'when it is still due, finalizes it; either runs the bump again',
-                    retries=True, payment_request_id=existing.payment_id,
-                    session_id=session_id)
-                return jsonify(payload), status
-            return jsonify(_checkout_payload(existing, api_key, already_completed=True)), 200
+            payload, status = _finish_recorded_checkout(
+                db, existing, api_key, recorded.get('target_tier'),
+                already=True, session_id=session_id)
+            return jsonify(payload), status
 
         try:
             session = stripe_gw._stripe.checkout.Session.retrieve(session_id)

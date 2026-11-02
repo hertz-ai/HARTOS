@@ -314,21 +314,24 @@ def test_parking_writes_pause_reason_and_is_idempotent(monkeypatch):
         yield db
 
     monkeypatch.setattr(social_models, 'db_session', db_session)
+    original = goal.config_json
     writes = {}
-    monkeypatch.setattr(gm.GoalManager, 'update_goal', staticmethod(
-        lambda d, gid, **kw: writes.update(cfg=kw.get('config_json'))
-        or {'success': True}))
     monkeypatch.setattr(gm.GoalManager, 'update_goal_status', staticmethod(
-        lambda d, gid, st: writes.update(status=st) or {'success': True}))
+        lambda d, gid, st, **kw: writes.update(status=st) or {'success': True}))
 
     assert hg._park_goal_for_no_owner({'id': 'g-80'}) is True
     assert writes['status'] == 'paused'
-    assert 'no owner to ask' in writes['cfg']['pause_reason']
-    assert writes['cfg']['paused_at']
-    assert writes['cfg']['require_consent'] is True, \
+    cfg = goal.config_json
+    assert 'no owner to ask' in cfg['pause_reason']
+    assert cfg['paused_at']
+    # The one pause routine (GoalManager.pause_goal) stamps this gate's own
+    # cause, so the daemon's resume never takes a consent park for its own.
+    assert (cfg['pause_cause'], cfg['paused_by']) == (
+        gm.PAUSE_CAUSE_NO_OWNER, 'consent_gate')
+    assert cfg['require_consent'] is True, \
         'parking dropped the rest of the config'
-    assert writes['cfg'] is not goal.config_json, (
-        'config_json is a MutableDict — writing the SAME dict back makes '
+    assert cfg is not original, (
+        'config_json is a MutableDict: writing the SAME dict back makes '
         'SQLAlchemy see no change and silently drop the write')
 
     # already paused -> left alone, so a different reason is never overwritten
