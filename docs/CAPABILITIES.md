@@ -4,7 +4,7 @@ The reference map. Every capability names the file that implements it, so you
 can go from a line in this table to the code without grepping. Start here
 rather than in the source tree.
 
-Back to the [README](README.md).
+Back to the [README](https://github.com/hertz-ai/HARTOS/blob/main/README.md).
 
 ---
 
@@ -396,7 +396,7 @@ ALL tiers participate equally in hive consensus.
 Federation handshake = byte-for-byte guardrail hash match. Mismatch -> refused.
 ```
 
-PeerLink is wired into bootstrap, gossip, federation, compute_mesh, world_model_bridge. [Wire format](docs/architecture/peer_link.md).
+PeerLink is wired into bootstrap, gossip, federation, compute_mesh, world_model_bridge. [Wire format](architecture/peer_link.md).
 
 ---
 
@@ -444,17 +444,17 @@ than a quiet edit:
 | **Developers** | [Build an agent + recipe](https://docs.hevolve.ai/agent-plugin/) - CREATE once, REUSE forever |
 | | [Add a channel adapter](https://docs.hevolve.ai/features/overview/) - wire a new chat surface |
 | | [Add a provider](https://docs.hevolve.ai/neuro-providers/) - new LLM / TTS / STT / VLM backend |
-| | [Add a benchmark](integrations/agent_engine/benchmark_registry.py) - register an adapter, gets RSI-2 protection |
-| | [PeerLink wire format](docs/architecture/peer_link.md) - direct P2P protocol |
-| | [Federation protocol](docs/architecture/FEDERATION.md) - hash-gated peer handshake |
-| | [HART SDK](docs/developer/sdk.md) - Python client + `hart` CLI |
+| | [Add a benchmark](https://github.com/hertz-ai/HARTOS/blob/main/integrations/agent_engine/benchmark_registry.py) - register an adapter, gets RSI-2 protection |
+| | [PeerLink wire format](architecture/peer_link.md) - direct P2P protocol |
+| | [Federation protocol](architecture/FEDERATION.md) - hash-gated peer handshake |
+| | [HART SDK](developer/sdk.md) - Python client + `hart` CLI |
 | **Node operators** | [Run a node](https://docs.hevolve.ai/provider/joining/) - lend compute, host a region, earn from witnessed traffic |
 | | [Compute settings](#api-surface) - cause alignment, electricity rate, idle policy |
 | **End users** | [Nunba desktop](https://github.com/hertz-ai/Nunba) - chat / social / encounter app |
-| **Security reviewers** | [Guardrail network](security/hive_guardrails.py) · [Master key](security/master_key.py) · [Audit log](security/immutable_audit_log.py) · [DLP](security/dlp_engine.py) |
-| **Researchers** | [Auto-evolve](integrations/agent_engine/auto_evolve.py) · [RSI-2 trigger](integrations/agent_engine/rsi_trigger.py) · [Federated aggregator](integrations/agent_engine/federated_aggregator.py) · [Hive contests](integrations/agent_engine/hive_contest.py) |
+| **Security reviewers** | [Guardrail network](https://github.com/hertz-ai/HARTOS/blob/main/security/hive_guardrails.py) · [Master key](https://github.com/hertz-ai/HARTOS/blob/main/security/master_key.py) · [Audit log](https://github.com/hertz-ai/HARTOS/blob/main/security/immutable_audit_log.py) · [DLP](https://github.com/hertz-ai/HARTOS/blob/main/security/dlp_engine.py) |
+| **Researchers** | [Auto-evolve](https://github.com/hertz-ai/HARTOS/blob/main/integrations/agent_engine/auto_evolve.py) · [RSI-2 trigger](https://github.com/hertz-ai/HARTOS/blob/main/integrations/agent_engine/rsi_trigger.py) · [Federated aggregator](https://github.com/hertz-ai/HARTOS/blob/main/integrations/agent_engine/federated_aggregator.py) · [Hive contests](https://github.com/hertz-ai/HARTOS/blob/main/integrations/agent_engine/hive_contest.py) |
 
-Front it with `/v1/chat/completions` (any OpenAI client), the [`hart` CLI](docs/developer/sdk.md), or build for the desktop with [Nunba](https://github.com/hertz-ai/Nunba).
+Front it with `/v1/chat/completions` (any OpenAI client), the [`hart` CLI](developer/sdk.md), or build for the desktop with [Nunba](https://github.com/hertz-ai/Nunba).
 
 ---
 
