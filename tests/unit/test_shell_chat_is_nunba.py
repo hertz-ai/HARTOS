@@ -57,7 +57,12 @@ def svc(monkeypatch, tmp_path):
     monkeypatch.setenv('HOME', str(tmp_path))
     monkeypatch.delenv('HEVOLVE_API_KEY', raising=False)
     monkeypatch.setenv('USERPROFILE', str(tmp_path))
-    monkeypatch.setattr('integrations.social.auth.generate_jwt', lambda user_id, username, role='flat', tenant_id=None: 'tok-' + user_id)
+    # The real generate_jwt's own parameters: dispatch._internal_auth_headers
+    # passes lane and rid too, and a fake without them raised TypeError there,
+    # which that helper swallows into "no Authorization header".
+    monkeypatch.setattr('integrations.social.auth.generate_jwt',
+                        lambda user_id, username, role='flat', tenant_id=None,
+                        lane=None, rid=None: 'tok-' + user_id)
     s = LiquidUIService(a2ui_enabled=False)
     s._nunba_server_name = 'Nunba'
     monkeypatch.setattr(s, '_compose_intent_result', lambda text, payload: False)
