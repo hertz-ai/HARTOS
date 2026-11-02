@@ -147,6 +147,101 @@ def _report_when_live(channel_type: str, meta: dict, owner,
     return False
 
 
+#: What chat_connect_blocker answers, beside None.
+LINKED_FROM_PHONE = 'linked_from_phone'
+SEVERAL_CREDENTIALS = 'several_credentials'
+SERVER_SETTINGS = 'server_settings'
+
+
+def chat_connect_blocker(channel_type: str, meta: dict = None):
+    """Why ``channel_type`` cannot be connected from one value its owner
+    types, or None when it can.
+
+    The one statement of which channels register_channel starts live
+    (``(kind, detail)``):
+      * (LINKED_FROM_PHONE, None): a gateway_qr channel (WhatsApp) is linked
+        by scanning or a pair code from the phone, not by a value;
+      * (SEVERAL_CREDENTIALS, keys): live connect hands the adapter ONE
+        credential, so a channel that needs several is saved, never started;
+      * (SERVER_SETTINGS, names): a setting only the operator can supply
+        (Slack's SLACK_APP_TOKEN) is missing on this server.
+    register_channel refuses on it, and post_to_channel asks the owner for
+    a channel's value only when this answers None: a card for a channel
+    that can never be started from the answer is a question with no use.
+    """
+    from integrations.channels.metadata import get_channel_metadata, required_setup_keys
+    meta = meta if meta is not None else get_channel_metadata(channel_type)
+    if (meta or {}).get('auth_method') == 'gateway_qr':
+        return LINKED_FROM_PHONE, None
+    required = required_setup_keys(meta)
+    if len(required) != 1:
+        return SEVERAL_CREDENTIALS, required
+    from integrations.channels.flask_integration import FlaskChannelIntegration
+    unmet = FlaskChannelIntegration.unmet_required_settings(channel_type)
+    if unmet:
+        return SERVER_SETTINGS, unmet
+    return None
+
+
+def set_announcement_target(channel_type: str, chat_id: str, user_id=None) -> str:
+    """Set where announcements for ``channel_type`` are posted: the
+    channel's ``announce_chat_id``, which announcement_broadcaster's
+    destination rule reads.  Refuses a private one-to-one chat with no
+    subscription (unsolicited messaging, whoever configured it).  Returns
+    what happened, in words.  The one writer: the set_announcement_channel
+    tool and post_to_channel (with the owner's answer) call it.
+
+    Setting a destination is deliberately NOT authorising broadcast: with
+    public_exposure consent absent, a configured destination still sends
+    nothing.  Granting the consent itself is not a tool, and should not
+    become one -- an autonomous goal able to grant its own permission to
+    post publicly is the fail-closed gate flipping its own switch.
+    """
+    from integrations.channels.announcement_broadcaster import (
+        destination_shape, is_subscribed)
+    from integrations.channels.admin.api import get_api
+
+    channel_type = (channel_type or '').strip().lower()
+    chat_id = (chat_id or '').strip()
+    if not channel_type or not chat_id:
+        return "Both channel_type and chat_id are required."
+
+    shape = destination_shape(channel_type, chat_id)
+    if shape == 'one_to_one' and not is_subscribed(channel_type, chat_id):
+        return (f"Refused: {chat_id} is a private one-to-one chat on "
+                f"{channel_type}. Announcements go to groups or channels "
+                f"people joined, not to individuals who did not ask. "
+                f"Use a group id (Telegram groups are negative; WhatsApp "
+                f"groups end in @g.us).")
+
+    api = get_api()
+    cfg = api._channels.get(channel_type)
+    if cfg is None:
+        return (f"Channel '{channel_type}' is not registered. "
+                f"Register it first, then set its announcement target.")
+    cfg['announce_chat_id'] = chat_id
+    api._channels[channel_type] = cfg
+    api._save_config()
+
+    # Say plainly whether this will actually broadcast yet. Reporting
+    # "configured" when nothing can send would be the same false success
+    # this system has been bitten by before.
+    try:
+        from integrations.agent_engine.marketing_tools import (
+            _external_post_allowed)
+        consented = bool(_external_post_allowed(
+            user_id or _get_user_id_from_threadlocal()))
+    except Exception:
+        consented = False
+
+    status = ("Announcements are ENABLED and will post here."
+              if consented else
+              "NOTE: public_exposure consent is not granted, so nothing "
+              "will actually be sent yet. That grant is an operator "
+              "action, deliberately not an agent tool.")
+    return f"Announcement target for {channel_type} set to {chat_id}. {status}"
+
+
 # ---------------------------------------------------------------------------
 # Tool closure factory
 # ---------------------------------------------------------------------------
@@ -192,9 +287,10 @@ def build_channel_tool_closures(ctx):
 
             # The channel integration owns the adapters' loop; ChannelRegistry
             # has none (tests/unit/test_channel_loop_owner.py).
-            from integrations.channels.flask_integration import get_channel_integration
+            from integrations.channels.flask_integration import (
+                CHANNEL_SEND_WAIT_S, get_channel_integration)
             result = get_channel_integration().send_threadsafe(
-                channel_type, chat_id, message, wait=30)
+                channel_type, chat_id, message, wait=CHANNEL_SEND_WAIT_S)
             if result is None:
                 return ("Channel adapters are not running, so the message "
                         "was not sent.")
@@ -246,6 +342,19 @@ def build_channel_tool_closures(ctx):
                     config = {fields[0]['key']: config_json.strip()}
                 else:
                     return f"Could not parse config. Expected JSON. Required fields: {[f['key'] for f in meta.get('setup_fields', [])]}"
+
+            # A {{secret:NAME}} still here was not resolved where the tool
+            # runs (log_tool_execution resolves every owner-entered one), so
+            # the owner has not entered it.  Saved, it became the channel's
+            # token: a dead adapter, an unhealthy banner and a failed restore
+            # on every boot.  Nothing is saved.
+            from hartos.ai_key_vault import SECRET_ALIAS_RE
+            unresolved = sorted({m for v in config.values() if isinstance(v, str)
+                                 for m in SECRET_ALIAS_RE.findall(v)})
+            if unresolved:
+                return (f"{meta['display_name']} was not saved: "
+                        f"{', '.join(unresolved)} has not been entered by the "
+                        f"owner yet. Connect it once they have entered it.")
 
             # Auto-fill auto:True fields from env-var defaults so the
             # user doesn't have to know about gateway infrastructure
@@ -355,7 +464,8 @@ def build_channel_tool_closures(ctx):
                 return (f"{name} registered and enabled! Auth: gateway_qr. "
                         f"Link it from your phone to finish.")
 
-            if len(required) != 1:
+            blocker = chat_connect_blocker(channel_type, meta)
+            if blocker and blocker[0] == SEVERAL_CREDENTIALS:
                 # Live connect hands the adapter ONE credential (the shape
                 # /api/social/channels/bindings wires and boot restore
                 # reads).  A channel that needs several is saved but NOT
@@ -365,15 +475,11 @@ def build_channel_tool_closures(ctx):
                         f"it needs several credentials, and connecting those "
                         f"live isn't supported yet. Nothing will arrive on "
                         f"{name} until an operator starts it.")
-
-            # A setting only the operator can supply (Slack's app-level
-            # SLACK_APP_TOKEN, Zalo's ZALO_OA_ID): name it, instead of the
-            # adapter's bare "returned False".
-            from integrations.channels.flask_integration import (
-                FlaskChannelIntegration,
-            )
-            unmet = FlaskChannelIntegration.unmet_required_settings(channel_type)
-            if unmet:
+            if blocker and blocker[0] == SERVER_SETTINGS:
+                # A setting only the operator can supply (Slack's app-level
+                # SLACK_APP_TOKEN, Zalo's ZALO_OA_ID): name it, instead of
+                # the adapter's bare "returned False".
+                unmet = blocker[1]
                 logger.warning("register_channel: %s saved but cannot run, "
                                "server lacks %s", channel_type, unmet)
                 return (f"{name} was saved, but this server can't run it yet: "
@@ -819,9 +925,11 @@ def build_channel_tool_closures(ctx):
 
             # Dispatch through the channel integration, which owns the
             # adapters' loop (the same plumbing as send_to_channel).
-            from integrations.channels.flask_integration import get_channel_integration
+            from integrations.channels.flask_integration import (
+                CHANNEL_SEND_WAIT_S, get_channel_integration)
             result = get_channel_integration().send_threadsafe(
-                channel_type_n, resolved_chat_id, message, wait=30)
+                channel_type_n, resolved_chat_id, message,
+                wait=CHANNEL_SEND_WAIT_S)
 
             if result is not None:
                 if getattr(result, 'success', False):
@@ -1001,14 +1109,9 @@ def build_channel_tool_closures(ctx):
     # set_announcement_channel — where growth announcements get posted
     # ------------------------------------------------------------------
     #
-    # Setting a destination is deliberately NOT the same as authorising
-    # broadcast. With public_exposure consent absent, a configured
-    # destination still sends nothing, so exposing this as an agent tool
-    # cannot escalate anything: the worst case is an address written down
-    # that never gets used. Granting the consent itself is not a tool, and
-    # should not become one -- an autonomous goal able to grant its own
-    # permission to post publicly is the fail-closed gate flipping its own
-    # switch.
+    # Exposing this as an agent tool cannot escalate anything: without
+    # public_exposure consent a configured destination sends nothing
+    # (set_announcement_target).
     @log_tool_execution
     def set_announcement_channel(
         channel_type: Annotated[str, "Channel to announce on (telegram, discord, slack, whatsapp)"],
@@ -1019,49 +1122,7 @@ def build_channel_tool_closures(ctx):
         Refuses private one-to-one destinations: broadcasting into somebody's
         DM is unsolicited messaging regardless of who configured it."""
         try:
-            from integrations.channels.announcement_broadcaster import (
-                destination_shape, is_subscribed)
-            from integrations.channels.admin.api import get_api
-
-            channel_type = (channel_type or '').strip().lower()
-            chat_id = (chat_id or '').strip()
-            if not channel_type or not chat_id:
-                return "Both channel_type and chat_id are required."
-
-            shape = destination_shape(channel_type, chat_id)
-            if shape == 'one_to_one' and not is_subscribed(channel_type, chat_id):
-                return (f"Refused: {chat_id} is a private one-to-one chat on "
-                        f"{channel_type}. Announcements go to groups or channels "
-                        f"people joined, not to individuals who did not ask. "
-                        f"Use a group id (Telegram groups are negative; WhatsApp "
-                        f"groups end in @g.us).")
-
-            api = get_api()
-            cfg = api._channels.get(channel_type)
-            if cfg is None:
-                return (f"Channel '{channel_type}' is not registered. "
-                        f"Register it first, then set its announcement target.")
-            cfg['announce_chat_id'] = chat_id
-            api._channels[channel_type] = cfg
-            api._save_config()
-
-            # Say plainly whether this will actually broadcast yet. Reporting
-            # "configured" when nothing can send would be the same false
-            # success this system has been bitten by before.
-            try:
-                from integrations.agent_engine.marketing_tools import (
-                    _external_post_allowed)
-                consented = bool(_external_post_allowed(
-                    user_id or _get_user_id_from_threadlocal()))
-            except Exception:
-                consented = False
-
-            status = ("Announcements are ENABLED and will post here."
-                      if consented else
-                      "NOTE: public_exposure consent is not granted, so nothing "
-                      "will actually be sent yet. That grant is an operator "
-                      "action, deliberately not an agent tool.")
-            return f"Announcement target for {channel_type} set to {chat_id}. {status}"
+            return set_announcement_target(channel_type, chat_id, user_id)
         except Exception as e:
             logger.error("set_announcement_channel error: %s", e)
             return f"Error setting announcement channel: {e}"

@@ -342,15 +342,18 @@ def test_flag_off_with_nothing_granted_writes_no_row(consent_db):
     assert consent_db.query(UserConsent).count() == 0
 
 
-# ── 4. post_to_channel: post through the live registry, or ask the owner ──
+# ── 4. post_to_channel: post where the owner chose, or ask the owner ──
 #
 # Measured on central 2026-11-02: every revenue goal "completed" on model
 # spend while no post left the node.  post_to_channel built an extension
 # adapter with no configuration and called send_message with arguments no
-# adapter takes, and when a channel had no credentials it never asked the
-# owner for them.  It now sends through the live channel registry and, for a
-# channel that is not connected, asks the owner for each value connecting it
-# needs.
+# adapter takes, and it never asked the owner for a missing credential.  It
+# now sends through the live channel registry to the channel's announcement
+# destination, and asks the owner for what is missing: the one credential a
+# channel can be connected from (never for one it cannot), or where posts go.
+
+OWNER = '10202'
+
 
 class _Adapter:
     """A channel adapter as the registry holds one, with the real
@@ -377,39 +380,75 @@ class _Integration:
     """The two members of FlaskChannelIntegration that post_to_channel
     reads: the real ChannelRegistry, and send_threadsafe, which runs the
     registry's send_to_channel to its SendResult (None while the channel
-    loop is not running)."""
+    loop is not running; a TimeoutError when the wait runs out, as
+    concurrent.futures.Future.result raises it)."""
 
-    def __init__(self, *adapters, loop_running=True):
+    def __init__(self, *adapters, loop_running=True, times_out=False):
         from integrations.channels.registry import ChannelRegistry
         self.registry = ChannelRegistry()
         for adapter in adapters:
             self.registry.register(adapter)
         self._loop_running = loop_running
+        self._times_out = times_out
+        self.waits = []
 
     def send_threadsafe(self, channel, chat_id, text, *, wait=None, **kwargs):
         if not self._loop_running:
             return None
+        self.waits.append(wait)
         # A loop of its own, as the channel thread has: never this thread's
         # current loop, which core.event_loop.run_async reuses.
         import asyncio
         loop = asyncio.new_event_loop()
         try:
-            return loop.run_until_complete(
+            result = loop.run_until_complete(
                 self.registry.send_to_channel(channel, chat_id, text, **kwargs))
         finally:
             loop.close()
+        if self._times_out:
+            import concurrent.futures
+            raise concurrent.futures.TimeoutError()
+        return result
 
 
-def _post(integration, *args, ask=None, **kwargs):
-    """Call the real post_to_channel with consent granted, the channel
-    integration and the owner ask (request_credential) as the boundaries."""
+class _Vault:
+    """The two AIKeyVault reads post_to_channel makes: the credential's one
+    name, and its value when the owner entered it ('' otherwise)."""
+
+    def __init__(self, entered=None):
+        from hartos.ai_key_vault import AIKeyVault
+        self._naming = AIKeyVault()
+        self.entered = dict(entered or {})
+
+    def credential_name(self, key, channel=''):
+        return self._naming.credential_name(key, channel)
+
+    def owner_credential(self, name, names=None):
+        return self.entered.get(name, '')
+
+
+def _post(integration, *args, targets=None, ask=None, vault=None,
+          owner=OWNER, **kwargs):
+    """Call the real post_to_channel with consent granted; the channel
+    integration, the announcement destinations, the credential ask
+    (request_credential), the vault and the node's owner are the
+    boundaries.  ``targets`` is a mutable {channel: [chat ids]}."""
     funcs = _marketing_funcs()
     ask = ask or Mock(return_value='Asked the owner of this computer on '
                                    'the consent card.')
+    targets = {} if targets is None else targets
     with _consent(True), \
          patch('integrations.channels.flask_integration.get_channel_integration',
                return_value=integration), \
-         patch('hartos.ai_key_vault.request_credential', ask):
+         patch('integrations.channels.announcement_broadcaster.'
+               '_collect_announcement_targets',
+               lambda *a, **k: [(ch, c) for ch, ids in targets.items()
+                                for c in ids]), \
+         patch('hartos.ai_key_vault.request_credential', ask), \
+         patch('hartos.ai_key_vault.get_ai_key_vault',
+               return_value=vault or _Vault()), \
+         patch('integrations.agent_engine.capability_setup.setup_owner',
+               return_value=owner):
         return json.loads(funcs['post_to_channel'](*args, **kwargs)), ask
 
 
@@ -418,82 +457,203 @@ def _sent(**kw):
     return SendResult(**kw)
 
 
-def test_a_connected_channel_posts_and_reports_the_channels_answer():
+@pytest.fixture(autouse=True)
+def _no_destination_asks_left_over():
+    from integrations.agent_engine import marketing_tools
+    asks = getattr(marketing_tools, '_DESTINATION_ASKS', {})
+    asks.clear()
+    yield
+    asks.clear()
+
+
+def test_a_connected_channel_posts_where_the_owner_chose():
+    from integrations.channels.flask_integration import CHANNEL_SEND_WAIT_S
     tg = _Adapter('telegram', _sent(success=True, message_id='m-1'))
-    out, ask = _post(_Integration(tg), 'telegram', 'hello',
-                     extra_config='{"chat_id": "@hevolve"}')
-    assert tg.sent == [{'chat_id': '@hevolve', 'text': 'hello', 'media': None}]
-    assert (out['success'], out['sent'], out['message_id']) == (True, True, 'm-1')
+    integ = _Integration(tg)
+    out, ask = _post(integ, 'telegram', 'hello',
+                     targets={'telegram': ['-1001'], 'discord': ['d-9']},
+                     extra_config='{"chat_id": "@somebody_else"}')
+    assert tg.sent == [{'chat_id': '-1001', 'text': 'hello', 'media': None}]
+    assert integ.waits == [CHANNEL_SEND_WAIT_S]
+    assert (out['success'], out['sent'], out['pending']) == (True, True, False)
+    assert out['posts'] == [{'chat_id': '-1001', 'sent': True,
+                             'message_id': 'm-1', 'error': None}]
     ask.assert_not_called()
 
 
 def test_a_send_the_channel_refuses_is_reported_as_not_sent():
     tg = _Adapter('telegram', _sent(success=False, error='chat not found'))
     out, _ = _post(_Integration(tg), 'Telegram', 'hello',
-                   extra_config='{"chat_id": "@nobody"}')
+                   targets={'telegram': ['-1001']})
     assert len(tg.sent) == 1
-    assert (out['success'], out['sent'], out['error']) == (
-        False, False, 'chat not found')
+    assert (out['success'], out['sent']) == (False, False)
+    assert out['posts'][0]['error'] == 'chat not found'
+
+
+def test_a_send_not_confirmed_in_time_is_pending_and_never_resent():
+    tg = _Adapter('telegram', _sent(success=True))
+    out, _ = _post(_Integration(tg, times_out=True), 'telegram', 'hello',
+                   targets={'telegram': ['-1001']})
+    assert len(tg.sent) == 1                    # one send, no retry
+    assert (out['sent'], out['pending']) == (False, True)
+    assert out['posts'] == [{'chat_id': '-1001', 'sent': None, 'pending': True}]
+    assert 'Do not post it again' in out['note']
 
 
 def test_a_media_url_reaches_the_channel_as_an_attachment():
     from integrations.channels.base import MessageType
     tg = _Adapter('telegram', _sent(success=True))
     _post(_Integration(tg), 'telegram', 'demo',
-          media_url='https://x.test/demo.mp4?sig=1',
-          extra_config='{"chat_id": "@hevolve"}')
+          media_url='https://x.test/demo.MOV?sig=1',
+          targets={'telegram': ['-1001']})
     [media] = tg.sent[0]['media']
-    assert (media.url, media.type) == ('https://x.test/demo.mp4?sig=1',
-                                       MessageType.VIDEO)
+    assert (media.url, media.file_path, media.type) == (
+        'https://x.test/demo.MOV?sig=1', None, MessageType.VIDEO)
+
+
+def test_a_file_this_node_made_rides_as_a_file_not_a_url(tmp_path):
+    from integrations.channels.base import MessageType
+    clip = tmp_path / 'reel.mp4'
+    clip.write_bytes(b'\x00')
+    tg = _Adapter('telegram', _sent(success=True))
+    with patch('core.platform_paths.get_data_dir', return_value=str(tmp_path)):
+        out, _ = _post(_Integration(tg), 'telegram', 'demo',
+                       media_url=str(clip), targets={'telegram': ['-1001']})
+    [media] = tg.sent[0]['media']
+    assert media.url is None and media.type == MessageType.VIDEO
+    assert os.path.realpath(media.file_path) == os.path.realpath(str(clip))
+    assert out['sent'] is True
+
+
+def test_a_file_outside_the_data_folder_is_not_attached_and_nothing_posts(
+        tmp_path):
+    outside = tmp_path / 'secret.png'
+    outside.write_bytes(b'\x00')
+    data = tmp_path / 'data'
+    data.mkdir()
+    tg = _Adapter('telegram', _sent(success=True))
+    with patch('core.platform_paths.get_data_dir', return_value=str(data)):
+        out, _ = _post(_Integration(tg), 'telegram', 'demo',
+                       media_url=str(outside), targets={'telegram': ['-1001']})
+    assert tg.sent == []
+    assert out['sent'] is False and 'data folder' in out['error']
 
 
 def test_nothing_is_posted_while_the_channel_loop_is_down():
     tg = _Adapter('telegram', _sent(success=True))
     out, _ = _post(_Integration(tg, loop_running=False), 'telegram', 'hello',
-                   extra_config='{"chat_id": "@hevolve"}')
+                   targets={'telegram': ['-1001']})
     assert tg.sent == []
     assert (out['success'], out['sent']) == (False, False)
 
 
-def test_a_connected_channel_with_no_target_posts_nothing():
-    tg = _Adapter('telegram', _sent(success=True))
-    out, ask = _post(_Integration(tg), 'telegram', 'hello')
-    assert tg.sent == []
-    assert out['sent'] is False and 'chat_id' in out['error']
+def test_a_channel_that_can_be_connected_asks_the_owner_once_for_its_value():
+    out, ask = _post(_Integration(), 'telegram', 'hello')
+    [call] = ask.call_args_list
+    asked = json.loads(call.args[0])
+    assert (asked['key_name'], asked['channel_type'], asked['used_by']) == (
+        'bot_token', 'telegram', 'post_to_channel')
+    assert call.kwargs == {'agent_id': None}    # one card, not one per agent
+    assert (out['sent'], out['needs_owner']) == (False, True)
+    assert out['asked_owner_for'] == 'TELEGRAM_BOT_TOKEN'
+    assert '{{secret:' not in json.dumps(out)   # nothing to register yet
+    assert 'not report it as done' in out['next']
+
+
+def test_a_registered_channel_that_is_stopped_asks_too():
+    tg = _Adapter('telegram', _sent(success=True), running=False)
+    out, ask = _post(_Integration(tg), 'telegram', 'hello',
+                     targets={'telegram': ['-1001']})
+    assert tg.sent == [] and ask.called and out['needs_owner'] is True
+
+
+@pytest.mark.parametrize('channel', ['twitter', 'whatsapp', 'slack'])
+def test_a_channel_its_answer_could_never_start_asks_nothing(channel):
+    """Twitter needs five credentials, WhatsApp is linked from the phone,
+    Slack needs SLACK_APP_TOKEN on the server: register_channel starts none
+    of them from one value, so no card is filed (the rejected version filed
+    five for Twitter)."""
+    with patch.dict(os.environ, {'SLACK_APP_TOKEN': ''}):
+        out, ask = _post(_Integration(), channel, 'hello')
     ask.assert_not_called()
-
-
-def test_a_channel_that_is_not_connected_asks_the_owner_for_what_it_needs():
-    from integrations.channels.metadata import (
-        get_channel_metadata, required_setup_keys)
-    needed = required_setup_keys(get_channel_metadata('twitter'))
-    assert 'api_key' in needed, needed          # the catalog asks for keys
-    out, ask = _post(_Integration(), 'twitter', 'hello')
-    asked = [json.loads(c.args[0]) for c in ask.call_args_list]
-    assert [a['key_name'] for a in asked] == needed
-    assert {a['channel_type'] for a in asked} == {'twitter'}
-    assert {a['used_by'] for a in asked} == {'post_to_channel'}
-    assert (out['success'], out['sent'], out['needs_owner']) == (
+    assert (out['sent'], out['needs_owner'], out['cannot_connect_here']) == (
         False, False, True)
-    assert 'TWITTER_API_KEY' in out['asked_owner_for']
-    assert out['register_channel_config']['api_key'] == '{{secret:TWITTER_API_KEY}}'
-    assert 'register_channel' in out['next']
 
 
-def test_a_registered_channel_that_is_stopped_asks_the_owner_too():
-    tw = _Adapter('twitter', _sent(success=True), running=False)
-    out, ask = _post(_Integration(tw), 'twitter', 'hello',
-                     extra_config='{"chat_id": "123"}')
-    assert tw.sent == []
-    assert ask.called and out['needs_owner'] is True
+def test_once_the_owner_entered_the_value_the_channel_is_connected_for_them():
+    register = Mock(return_value='Telegram registered and enabled!')
+    built = []
+
+    def _closures(ctx):
+        built.append(ctx)
+        return [('register_channel', 'desc', register)]
+
+    vault = _Vault({'TELEGRAM_BOT_TOKEN': '123:abc'})
+    with patch('integrations.channels.agent_tools.build_channel_tool_closures',
+               _closures):
+        out, ask = _post(_Integration(), 'telegram', 'hello', vault=vault)
+    ask.assert_not_called()
+    register.assert_called_once_with('telegram', '{"bot_token": "123:abc"}')
+    assert built == [{'user_id': OWNER}]        # the binding is the owner's
+    assert (out['sent'], out['connecting']) == (False, True)
+    assert '123:abc' not in json.dumps(out)     # the model never holds it
 
 
-def test_the_owners_answer_reaches_the_agent():
-    ask = Mock(return_value="The owner of this computer said no to "
-                            "providing 'Twitter / X API Key'.")
-    out, _ = _post(_Integration(), 'twitter', 'hello', ask=ask)
-    assert out['owner_answers'][0].startswith(
-        'The owner of this computer said no')
+def test_a_channel_still_connecting_is_left_alone():
+    """register_channel only schedules start(): while the adapter is
+    CONNECTING, a second register would rebuild it mid-connect."""
+    from integrations.channels.base import ChannelStatus
+    tg = _Adapter('telegram', _sent(success=True), running=False)
+    tg.get_status = lambda: ChannelStatus.CONNECTING
+    register = Mock()
+    with patch('integrations.channels.agent_tools.build_channel_tool_closures',
+               lambda ctx: [('register_channel', 'desc', register)]):
+        out, ask = _post(_Integration(tg), 'telegram', 'hello',
+                         vault=_Vault({'TELEGRAM_BOT_TOKEN': '123:abc'}),
+                         targets={'telegram': ['-1001']})
+    register.assert_not_called()
+    ask.assert_not_called()
+    assert tg.sent == [] and (out['sent'], out['connecting']) == (False, True)
+
+
+def test_no_destination_asks_the_owner_where_posts_go_once():
+    tg = _Adapter('telegram', _sent(success=True))
+    asked = Mock(return_value={'ok': True, 'ask_id': 'a1', 'refused': None,
+                               'card': True})
+    with patch('integrations.agent_engine.person_ask.ask', asked), \
+         patch('integrations.agent_engine.person_ask.ask_state',
+               return_value={'status': 'open', 'answer': None}):
+        first, _ = _post(_Integration(tg), 'telegram', 'hello')
+        second, _ = _post(_Integration(tg), 'telegram', 'hello')
+    [call] = asked.call_args_list
+    person, agent, component = call.args
+    assert (person, component['type']) == (OWNER, 'form')
+    assert [f['name'] for f in component['fields']] == ['chat_id']
+    assert tg.sent == []
+    assert (first['needs_owner'], first['ask_id']) == (True, 'a1')
+    assert (second['needs_owner'], second['ask_id']) == (True, 'a1')
+
+
+def test_the_owners_answer_sets_the_destination_and_the_post_goes_out():
+    tg = _Adapter('telegram', _sent(success=True, message_id='m-2'))
+    targets = {}
+    written = []
+
+    def _set(channel, chat_id, user_id=None):
+        written.append((channel, chat_id, user_id))
+        targets.setdefault(channel, []).append(chat_id)
+        return 'set'
+
+    from integrations.agent_engine import marketing_tools
+    marketing_tools._DESTINATION_ASKS['telegram'] = 'a1'
+    with patch('integrations.agent_engine.person_ask.ask_state',
+               return_value={'status': 'answered',
+                             'answer': {'values': {'chat_id': ' -1009 '}}}), \
+         patch('integrations.channels.agent_tools.set_announcement_target', _set):
+        out, _ = _post(_Integration(tg), 'telegram', 'hello', targets=targets)
+    assert written == [('telegram', '-1009', OWNER)]
+    assert tg.sent[0]['chat_id'] == '-1009' and out['sent'] is True
+    assert 'telegram' not in marketing_tools._DESTINATION_ASKS
 
 
 def test_a_channel_with_no_catalog_entry_asks_nothing_and_names_the_browser():
@@ -501,6 +661,19 @@ def test_a_channel_with_no_catalog_entry_asks_nothing_and_names_the_browser():
     ask.assert_not_called()
     assert (out['success'], out['sent']) == (False, False)
     assert 'post_to_channel_via_browser' in out['error']
+
+
+def test_register_channel_never_saves_an_alias_the_owner_has_not_entered():
+    """An unresolved {{secret:NAME}} is a credential nobody entered;
+    saved, it became the token of a dead adapter."""
+    from integrations.channels.agent_tools import build_channel_tool_closures
+    register = next(t[2] for t in build_channel_tool_closures({'user_id': OWNER})
+                    if t[0] == 'register_channel')
+    with patch('integrations.channels.admin.api.get_api') as get_api:
+        said = register('telegram',
+                        '{"bot_token": "{{secret:TELEGRAM_BOT_TOKEN}}"}')
+    get_api.assert_not_called()
+    assert 'was not saved' in said and 'TELEGRAM_BOT_TOKEN' in said
 
 
 def test_the_instagram_feed_posts_a_video_as_a_reel_and_an_image_as_a_photo():
