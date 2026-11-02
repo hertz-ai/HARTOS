@@ -128,6 +128,13 @@ WIRE_TRIM_MARKER: str = '\n...[truncated middle]...\n'
 # 2026-09-27, liveprobe_reuse_1: a fixed half/half cut lost the middle of
 # the user's words).
 ACTION_STEPS_SEPARATOR: str = '\n follow these steps: '
+# How every REUSE dispatch turn begins ("Perform this action -> Action #N:").
+# Written by reuse_recipe._build_reuse_action_message, whose module keeps the
+# same literal as _REUSE_ACTION_MESSAGE_PREFIX (its extract-and-exec tests need
+# its constants literal; tests/unit/test_wire_trim_keeps_the_newest_order.py
+# pins the two equal).  Read by the wire trim to find the NEWEST order in a
+# user turn the ROLE-ORDER-GUARD merged from several (keep_head_cut).
+ACTION_DISPATCH_PREFIX: str = 'Perform this action -> Action #'
 # Seed injected at the wire when an outbound body carries no role='user'
 # turn.  llama-server's Qwen3 chat template raises a hard 500 "No user
 # query found in messages." whenever the messages array reaches it without
@@ -608,7 +615,8 @@ ENCOUNTER_PERSONA_TAG_MAX_CHARS: int = 40
 #
 # Consumers build their own URL from this plus the port that belongs to their
 # service — WAMP takes core.port_registry.get_port('crossbar'); the central DB
-# keeps its own 8443. Do NOT inline the hostname; import it from here.
+# is on the standard HTTPS port at /db (its old :8443 default answered 404,
+# measured 2026-10-26). Do NOT inline the hostname; import it from here.
 #
 # THIS IS A DEFAULT, NOT A MANDATE. Unifying the literal must never cost a system
 # the ability to run its OWN server (steward, 2026-08-18). Every consumer keeps
@@ -813,12 +821,16 @@ HELD_FOR_ANOTHER_TURN_REPLY_PREFIX: str = "Held for another turn:"
 # or cloud endpoint.
 LLM_THINKING_OFF_KWARGS: dict = {'enable_thinking': False}
 
-# The same switch in OpenRouter's own request field.  OpenRouter normalises
-# requests across providers and documents `reasoning.effort: "none"` as
-# "disables reasoning entirely"; a llama.cpp/vLLM chat_template_kwargs is not
-# one of its parameters, so sent there it would not reach the model and every
-# agent turn would think at length.
-LLM_THINKING_OFF_REASONING: dict = {'effort': 'none'}
+# The same intent in OpenRouter's own request field: think as little as the
+# model allows.  A llama.cpp/vLLM chat_template_kwargs is not one of its
+# parameters (sent there it would not reach the model and every agent turn
+# would think at length), and its `reasoning.effort: "none"` cannot be the
+# value: a reasoning-mandatory model answers 400 "Reasoning is mandatory for
+# this endpoint and cannot be disabled.".  Measured on central's
+# openrouter/free, which routes each call to a model of its choosing:
+# 'none' failed 4 of 7 calls (2026-10-26/27), 'low' was answered 3 of 3 with
+# 41-65 reasoning tokens.
+LLM_SHORT_REASONING: dict = {'effort': 'low'}
 
 
 # The two LangChain tools that turn a conversation into agent WORK:

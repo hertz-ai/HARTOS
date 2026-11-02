@@ -185,6 +185,20 @@ def _sanitize_goal_input(text: str, max_length: int = 2000) -> str:
 
 # ─── Goal Manager ───
 
+#: Why a goal is paused, as code reads it (the prose in pause_reason is for
+#: people).  Written by GoalManager.pause_goal, the ONE pause routine, for
+#: every writer; read by the agent daemon, which resumes only its own
+#: dispatch-failure pauses (review of 20dc8c996 by hartos-73: with only two of
+#: seven writers stamping a cause, the daemon resumed goals it did not pause).
+PAUSE_CAUSE_DISPATCH_FAILURES = 'dispatch_failures'   # the daemon: N turns failed
+PAUSE_CAUSE_NOOP_DISPATCHES = 'noop_dispatches'       # the settlement gate: no spark
+PAUSE_CAUSE_LEDGER_GROUNDING = 'ledger_grounding'     # the settlement gate: ledger silent
+PAUSE_CAUSE_BUDGET = 'budget'                         # the budget gate
+PAUSE_CAUSE_NEEDS_HELP = 'needs_help'                 # escalate_goal: a person's hand
+PAUSE_CAUSE_PERSON = 'person'                         # the dashboard's pause verb
+PAUSE_CAUSE_NO_OWNER = 'no_owner_to_ask'              # the consent gate: nobody to ask
+
+
 class GoalManager:
     """Unified CRUD for agent goals. All execution goes through /chat."""
 
@@ -262,20 +276,35 @@ class GoalManager:
         return {'success': True, 'goal': goal.to_dict()}
 
     @staticmethod
-    def update_goal_status(db: Session, goal_id: str, status: str) -> Dict:
+    def update_goal_status(db: Session, goal_id: str, status: str, goal=None,
+                           _via_resume: bool = False,
+                           resumed_by: str = None) -> Dict:
         """Update goal status.
+
+        A paused goal asked to become active is a RESUME and goes through
+        resume_goal, the one resume routine (review of 20dc8c996, #7: any
+        caller could move paused -> active and leave the old pause record and
+        strike count on the goal); resume_goal is the only caller that passes
+        ``_via_resume``.  ``goal`` lets a caller that already holds the row
+        (the daemon's own session object, pause_goal) skip the lookup.
 
         GUARDRAIL: HiveEthos.enforce_ephemeral_agents on completion.
         """
         from integrations.social.models import AgentGoal
 
-        goal = db.query(AgentGoal).filter_by(id=goal_id).first()
+        if goal is None:
+            goal = db.query(AgentGoal).filter_by(id=goal_id).first()
         if not goal:
             return {'success': False, 'error': 'Goal not found'}
+        if status == 'active' and goal.status == 'paused' and not _via_resume:
+            return GoalManager.resume_goal(
+                db, goal_id, resumed_by=resumed_by or 'status_writer:unknown',
+                goal=goal)
 
         goal.status = status
-        db.flush()
-        _emit_goal_changed(goal_id, f'status:{status}', goal.goal_type)
+        if db is not None:
+            db.flush()
+        _emit_goal_changed(goal_id, f'status:{status}', getattr(goal, 'goal_type', None))
 
         # GUARDRAIL: ephemeral agent cleanup on terminal states
         try:
@@ -293,6 +322,116 @@ class GoalManager:
     # are operational parameters — they tune the agent's runtime
     # behavior but do not change WHO the agent is, so they bypass
     # consensus to keep the hot path cheap.
+    @staticmethod
+    def resume_goal(db: Session, goal_id: str, resumed_by: str,
+                    goal=None) -> Dict:
+        """The ONE way a paused goal becomes active again.  The dashboard's
+        resume verb, the agent daemon's resume, and update_goal_status itself
+        (for any caller that asks a paused goal to be active) all end here
+        (review of 26b5f8177, finding 7: two resume paths with different
+        semantics, one leaving the old pause reason and strike count on the
+        goal).
+
+        Moves the pause record (pause_reason, paused_at, pause_cause,
+        paused_by, told_at, pause_signature) to its last_* history keys, and
+        with it a person's hand on the goal (escalate_goal's human stage,
+        escalation.next == 'human': the daemon's guard on it would otherwise
+        exclude the goal from its resume for life, review of fbc54ddd6; the
+        expert's pending turn, next == 'expert', is not a person's hand and
+        stays), counts the resume and stamps who resumed it, then writes the
+        status through update_goal_status.  A goal that is not paused is
+        refused; a refused status write leaves the config exactly as it
+        was.  The config is replaced by a NEW dict so the JSON column sees
+        the change.
+        """
+        from datetime import datetime
+        from integrations.social.models import AgentGoal
+
+        if goal is None:
+            goal = db.query(AgentGoal).filter_by(id=goal_id).first()
+        if not goal:
+            return {'success': False, 'error': 'Goal not found'}
+        if goal.status != 'paused':
+            return {'success': False,
+                    'error': f'not paused (status {goal.status})'}
+        prior = goal.config_json
+        cfg = dict(prior or {})
+        for key in ('pause_reason', 'paused_at', 'pause_cause', 'paused_by', 'told_at',
+                    'pause_signature'):
+            if key in cfg:
+                cfg['last_' + key] = cfg.pop(key)
+        escalation = cfg.get('escalation')
+        if isinstance(escalation, dict) and escalation.get('next') == 'human':
+            cfg['last_escalation'] = cfg.pop('escalation')
+        cfg['resume_count'] = int(cfg.get('resume_count', 0) or 0) + 1
+        cfg['resumed_at'] = datetime.utcnow().isoformat()
+        cfg['resumed_by'] = str(resumed_by or 'unknown')
+        goal.config_json = cfg
+        result = GoalManager.update_goal_status(db, goal_id, 'active', goal=goal,
+                                                _via_resume=True)
+        if not result.get('success'):
+            goal.config_json = prior
+        return result
+
+    @staticmethod
+    def pause_goal(db, goal, cause: str, by: str, reason: str,
+                   config: dict = None, extra: dict = None, at: str = None) -> Dict:
+        """The ONE way a goal becomes paused (the counterpart of resume_goal).
+        Every pause writer calls it: the daemon's dispatch-failure pause, the
+        settlement gate's ledger-grounding and no-op pauses, the budget gate,
+        escalate_goal's hand to a person, the dashboard's pause verb, the
+        consent gate's park on a node with no owner to ask
+        (hive_guardrails._park_goal_for_no_owner) and the coding daemon's
+        dispatch-failure pause (review of 20dc8c996 by hartos-73: only two of
+        the writers stamped a cause, so the daemon resumed goals it did not
+        pause; review of fbc54ddd6: the last two still set the row directly).
+
+        Replaces the WHOLE pause record: pause_cause (one of the PAUSE_CAUSE_*
+        constants), paused_by, paused_at and the prose pause_reason.  ``goal``
+        is the row the caller already holds (the daemon's session object; the
+        budget gate's caller owns the commit, so ``db`` may be None there).
+        ``config`` is a caller-prepared base (the settlement gate drops its
+        wait marks first); otherwise the goal's current config is the base.
+        A previous pause's detail (pause_signature) is dropped unless ``extra``
+        gives this pause's own.  ``at`` is the pause's time when the caller
+        has stamped the same moment elsewhere (escalate_goal's ask carries
+        it); otherwise now.  Runtime state is kept.  An active goal's
+        status moves through update_goal_status; an already-paused goal (an
+        escalation renewing its ask, #194) has its record replaced without a
+        status write.  A finished goal is refused; a refused status write
+        leaves the config exactly as it was.  The config is a NEW dict so the
+        JSON column sees the change.  Returns the writer's result with the
+        config written.
+        """
+        from datetime import datetime
+
+        if goal is None:
+            return {'success': False, 'error': 'Goal not found'}
+        if goal.status not in ('active', 'paused'):
+            return {'success': False,
+                    'error': f'cannot pause a {goal.status} goal'}
+        prior = goal.config_json
+        cfg = dict(config if config is not None else (prior or {}))
+        cfg.pop('pause_signature', None)
+        if extra:
+            cfg.update(extra)
+        cfg['pause_reason'] = str(reason)
+        cfg['paused_at'] = str(at) if at else datetime.utcnow().isoformat()
+        cfg['pause_cause'] = str(cause)
+        cfg['paused_by'] = str(by)
+        goal.config_json = cfg
+        if goal.status != 'paused':
+            result = GoalManager.update_goal_status(db, goal.id, 'paused', goal=goal)
+            if not result.get('success'):
+                goal.config_json = prior
+                return result
+        elif db is not None:
+            try:
+                db.flush()
+            except Exception:
+                pass
+        return {'success': True, 'config': cfg}
+
     _PERSONA_FIELDS = frozenset({'description', 'title'})
 
     @staticmethod
@@ -420,9 +559,11 @@ class GoalManager:
         user_prompt, prompt_id and flow so the action's banked recipe can be
         found.  The time, the stage ('next') and the expert's model id are
         added here; never the expert's config list, which can hold a
-        credential.  Writes through update_goal and update_goal_status, so
-        there is no second writer of either field.  Returns the writer's
-        result with 'stage' set to 'expert' or 'human'.
+        credential.  The pause is GoalManager.pause_goal, the one pause
+        routine (cause needs_help), unless its person paused the goal from
+        the dashboard, whose record then stands with the ask on it; config
+        writes go through update_goal.  Returns the writer's result with
+        'stage' set to 'expert' or 'human'.
         """
         from datetime import datetime
         from integrations.social.models import AgentGoal
@@ -450,18 +591,94 @@ class GoalManager:
             cfg['escalation'] = record
             result = GoalManager.update_goal(db, goal_id, config_json=cfg)
             return dict(result, stage='expert') if result.get('success') else result
+        # Its person was already told about this same action: the pause is
+        # renewed and nobody is told again.  A hive worker re-running a paused
+        # goal's task asks for help each time its claim expires (#194).
+        # 'told_at' is written only when a notification was made, so a goal
+        # that paused before anyone was told (every pause until 2026-10-26)
+        # is told on its next ask; a paused state alone proves nothing.
+        already_told = same_action and bool(prior.get('told_at'))
         record['next'] = 'human'
+        if already_told:
+            record['told_at'] = prior['told_at']
         cfg['escalation'] = record
-        cfg['pause_reason'] = (
-            f"Needs help: action {record.get('action_id')} "
-            f"({str(record.get('action') or '')[:120]}) could not be done "
-            f"autonomously: {record.get('reason')}")
-        cfg['paused_at'] = now
-        result = GoalManager.update_goal(db, goal_id, config_json=cfg)
+        reason = (f"Needs help: action {record.get('action_id')} "
+                  f"({str(record.get('action') or '')[:120]}) could not be done "
+                  f"autonomously: {record.get('reason')}")
+        if goal.status == 'paused' and cfg.get('pause_cause') == PAUSE_CAUSE_PERSON:
+            # Its person paused it from the dashboard and a worker re-asks
+            # (#194): the ask goes on the record, the person's own pause
+            # (cause, name, words) stands (review of fbc54ddd6: the renewal
+            # restamped it as the daemon's).
+            result = GoalManager.update_goal(db, goal_id, config_json=cfg)
+        else:
+            # The ONE pause routine: the record says a person holds this goal
+            # (PAUSE_CAUSE_NEEDS_HELP), so the daemon, which resumes only its
+            # own dispatch-failure pauses, leaves it alone (hartos-73's S1).
+            result = GoalManager.pause_goal(
+                db, goal, cause=PAUSE_CAUSE_NEEDS_HELP, by='daemon',
+                reason=reason, config=cfg, at=now)
         if not result.get('success'):
             return result
-        result = GoalManager.update_goal_status(db, goal_id, 'paused')
-        return dict(result, stage='human') if result.get('success') else result
+        cfg = result.get('config', cfg)
+        if not already_told and GoalManager._tell_its_person(db, goal, reason):
+            # New dicts, so the JSON column sees a change.
+            cfg = dict(cfg, escalation=dict(record, told_at=now))
+            GoalManager.update_goal(db, goal_id, config_json=cfg)
+        return dict(result, stage='human')
+
+    @staticmethod
+    def _tell_its_person(db: Session, goal, reason: str) -> bool:
+        """Tell the person a goal belongs to that it has stopped for them.
+        True when the notification was made.
+
+        The goal's own person (core.event_attribution.goal_owner_user_id) or,
+        for a goal the node seeded itself, the node's owner
+        (capability_setup.setup_owner): one notification, sent to their phone
+        too (NotificationService.create's push).  Until 2026-10-26 the human
+        stage only wrote "Needs help" into the goal, and on central five
+        earning goals waited on it with nobody told.  Nobody to tell, or a
+        person with no account on this node, is logged; nothing here can
+        undo or fail the pause.
+        """
+        try:
+            from core.event_attribution import goal_owner_user_id
+            from integrations.agent_engine.capability_setup import setup_owner
+            from integrations.social.models import User
+            from integrations.social.services import NotificationService
+            person = goal_owner_user_id(goal) or setup_owner()
+            if not person:
+                logger.warning(
+                    "goal %s needs a person and nobody can be told: the goal "
+                    "names no owner and HEVOLVE_OWNER_USER_ID is not set", goal.id)
+                return False
+            if not db.query(User).filter_by(id=str(person)).first():
+                logger.warning(
+                    "goal %s needs a person, but %s has no account on this "
+                    "node to tell", goal.id, person)
+                return False
+            # The push leaves for Google or central's relay: the one egress
+            # scrub (secrets, then PII), or no title at all.
+            title = str(goal.title or 'A goal')[:100]
+            try:
+                from security.edge_privacy import scrub_text
+                title = scrub_text(title)
+            except Exception:
+                logger.warning("goal %s: egress scrub unavailable; the push "
+                               "names no goal", goal.id, exc_info=True)
+                title = 'A goal'
+            NotificationService.create(
+                db, str(person), 'goal_needs_help', target_type='goal',
+                target_id=str(goal.id), message=str(reason or '')[:500],
+                push={'title': 'A goal needs your help',
+                      'body': f'{title} is waiting for you.',
+                      'data': {'type': 'goal_needs_help',
+                               'goal_id': str(goal.id)}})
+            return True
+        except Exception:
+            logger.warning("goal %s: could not tell its person that it needs "
+                           "help", getattr(goal, 'id', '?'), exc_info=True)
+            return False
 
     @staticmethod
     def _escalation_expert(goal_type=None):

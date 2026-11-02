@@ -19,6 +19,7 @@ Functions:
 Pattern extracted from: speculative_dispatcher._check_and_reserve_budget() (lines 314-340)
 """
 import logging
+import math
 import os
 import threading
 import time
@@ -43,15 +44,16 @@ _budget_cache_lock = threading.Lock()
 
 # ── Cost estimation ──────────────────────────────────────────────────
 
-# Approximate Spark cost per 1K tokens by model family.
+# Approximate Spark cost per 1K tokens by model family, for the families
+# that have NO dollar price in the one price table
+# (core.autogen_config.EXPERT_USD_PER_1K); a priced family (Claude) is
+# derived from that table in spark_per_1k, never written here a second time.
 # Order matters: most-specific prefix first (gpt-4o-mini before gpt-4o before gpt-4).
 _MODEL_COST_MAP = {
     'gpt-4o-mini': 1,
     'gpt-4o': 4,
     'gpt-4': 6,
     'gpt-3.5': 1,
-    'claude': 4,    # Anthropic, the expert tier on central (2026-10-12): the
-                    # gpt-4o class, not the unknown-model default of 2
     'groq': 0,      # Groq free tier — zero Spark
     'llama': 0,      # Local model — zero metered cost
     'mistral': 0,    # Local model
@@ -60,15 +62,48 @@ _MODEL_COST_MAP = {
 }
 
 
+def spark_per_usd() -> float:
+    """Spark per dollar, HEVOLVE_SPARK_PER_USD (default 100): the ONE reading
+    of it in this module, for the reservation, the usage record and the
+    meter.  Junk or a non-positive value is the default, so a meter never
+    divides by zero.  (revenue_aggregator.SPARK_PER_USD is the settlement's
+    own import-time reading of the same variable.)"""
+    try:
+        rate = float(os.environ.get('HEVOLVE_SPARK_PER_USD', '') or 100)
+    except (TypeError, ValueError):
+        return 100.0
+    return rate if rate > 0 else 100.0
+
+
 def spark_per_1k(model_name: str) -> int:
-    """Spark per 1K tokens for a model name, by family prefix: 0 for the
-    local and free-tier families, 2 for a cloud model the map does not know.
+    """Spark per 1K tokens for a model name.
+
+    A family with a dollar price (core.autogen_config.EXPERT_USD_PER_1K, the
+    ONE price table, read with the owner's pin by family_usd_per_1k) is
+    priced from it: the larger of its input and output price per 1k, times
+    spark_per_usd(), rounded up, so the reservation's rate per 1k is never
+    below the meter's (per CALL the meter can still record more: it prices
+    output tokens at the output price, while the reservation counts the
+    prompt); the owner's pin on HEVOLVE_<FAMILY>_USD_PER_1K_IN / _OUT and
+    the Spark rate move the reservation and the meter alike.  Every other
+    family is the Spark map above: 0 for the local and free-tier families,
+    2 for a cloud model the map does not know.
 
     ONE lookup for estimate_llm_cost_spark and for the registry's
-    'configured-api' backend, so the pre-dispatch estimate and the expert
-    path's reservation (ModelBackend.cost_per_1k_tokens) price the same model
-    the same way.
+    'configured-api' and configured-expert backends, so the pre-dispatch
+    estimate, the expert path's reservation, the max_cost filter and the
+    speculative dispatcher's affordability check (all readers of
+    ModelBackend.cost_per_1k_tokens) price the same model the same way.
+    Before, Claude was written here a second time as 'claude': 4, and a pin
+    moved the meter but not the reservation (parallel-path audit
+    2026-10-27, item 1).
     """
+    price = usd_price_per_1k(model_name)
+    if price is not None:
+        # round(.., 6) before the ceil: 0.07 * 100 is 7.000000000000001 in
+        # floating point, and a bare ceil reserved 8 Spark for a pin of
+        # exactly 7 (reviewer of c483a7b32, finding 1).
+        return int(math.ceil(round(max(price) * spark_per_usd(), 6)))
     model_lower = (model_name or '').lower()
     for prefix, cost in _MODEL_COST_MAP.items():
         if prefix in model_lower:
@@ -580,15 +615,22 @@ def pause_goal_for_budget(goal_id: Optional[str], reason: str) -> bool:
         from integrations.social.models import db_session, AgentGoal
         with db_session() as db:
             goal = db.query(AgentGoal).filter_by(id=goal_id).first()
-            return apply_budget_pause(goal, reason)
+            return apply_budget_pause(goal, reason, db=db)
     except Exception as e:
         logger.warning("Could not auto-pause goal %s after budget block: %s",
                        goal_id, e)
         return False
 
 
-def apply_budget_pause(goal, reason: str) -> bool:
+def apply_budget_pause(goal, reason: str, db=None) -> bool:
     """Mutate an already-loaded goal row. THE CALLER OWNS THE COMMIT.
+
+    The pause itself is GoalManager.pause_goal, the ONE pause routine, with
+    this gate's own cause (PAUSE_CAUSE_BUDGET), so the agent daemon, which
+    resumes only its own dispatch-failure pauses, never resumes a goal that
+    is out of budget (review of 20dc8c996 by hartos-73).  ``db`` is the
+    caller's session when it has one (the daemon's loop; the wrapper above);
+    with none the status is set on the row and the caller's commit carries it.
 
     Split from pause_goal_for_budget on purpose. agent_daemon holds one session
     open across its whole dispatch loop and commits once at the end, so it must
@@ -613,11 +655,13 @@ def apply_budget_pause(goal, reason: str) -> bool:
             "or clear never_pause.", goal.id, reason)
         return False
 
-    goal.status = 'paused'
-    cfg['pause_reason'] = (
-        f'Auto-paused: budget gate blocked. Reason: {reason}')
-    cfg['paused_at'] = datetime.utcnow().isoformat()
-    goal.config_json = cfg
+    from integrations.agent_engine.goal_manager import GoalManager, PAUSE_CAUSE_BUDGET
+    result = GoalManager.pause_goal(
+        db, goal, cause=PAUSE_CAUSE_BUDGET, by='daemon',
+        reason=f'Auto-paused: budget gate blocked. Reason: {reason}')
+    if not result.get('success'):
+        logger.warning("Goal %s: budget pause refused: %s", goal.id, result.get('error'))
+        return False
     # WARNING, not info: this is the state transition that explains why a goal
     # stopped making progress, and the hevolve loggers run at WARNING in
     # production, where INFO is invisible. A retention sweep that logged its
@@ -762,8 +806,7 @@ def record_metered_usage(node_id: str, model_id: str, task_source: str,
         pass
 
     # Estimate Spark cost
-    estimated_spark = max(1, int(actual_usd_cost * int(
-        os.environ.get('HEVOLVE_SPARK_PER_USD', '100'))))
+    estimated_spark = max(1, int(actual_usd_cost * spark_per_usd()))
 
     # Write MeteredAPIUsage record
     try:
@@ -799,9 +842,11 @@ def meter_llm_call(model: str, tokens_in: int, tokens_out: int,
     """Meter ONE completed LLM call through record_metered_usage.
 
     Derives the two arguments callers could not supply correctly: this node's
-    node_id, and cost_per_1k in USD from the ONE price source (spark_per_1k,
-    0 for local and free-tier models, divided by HEVOLVE_SPARK_PER_USD, the
-    same rate record_metered_usage converts back with). Both production
+    node_id, and cost_per_1k in USD: a priced family at its blended dollar
+    price from the one price table (blended_usd_per_1k), every other model
+    at its Spark (spark_per_1k, 0 for local and free-tier models) divided by
+    spark_per_usd(), the same rate record_metered_usage converts back with
+    and spark_per_1k derives a priced family's reservation with. Both production
     callers had passed keywords record_metered_usage does not accept
     (user_id/model/prompt_tokens/... and provider/model/tokens/...), so every
     call raised TypeError: the coding adapter lost every completion to it and
@@ -824,8 +869,7 @@ def meter_llm_call(model: str, tokens_in: int, tokens_out: int,
             if blended is not None:
                 usd_per_1k = blended
             else:
-                spark_per_usd = float(os.environ.get('HEVOLVE_SPARK_PER_USD', '100') or 100)
-                usd_per_1k = spark_per_1k(_resolve_model_name(model)) / max(spark_per_usd, 1e-9)
+                usd_per_1k = spark_per_1k(_resolve_model_name(model)) / spark_per_usd()
         return record_metered_usage(
             node_id=node_id or 'local', model_id=model or 'unknown',
             task_source=task_source, tokens_in=int(tokens_in or 0),
@@ -841,7 +885,13 @@ def meter_llm_call(model: str, tokens_in: int, tokens_out: int,
 # "No more than $6 a day on Claude in central", and "Claude can never become
 # its own blocker": the cap is enforced where the expert is OFFERED
 # (ModelRegistry._offered asks expert_budget_allows), so a turn past the cap
-# is served by the node's own model instead of failing.  The ledger it reads
+# is served by the node's own model instead of failing; and again before
+# every call to the configured expert leaves the node (core.
+# llm_outbound_logger._day_cap_refusal asks the same function; the node's own
+# model is never refused), so a turn that already holds the
+# expert falls back to the node's own model the moment the ledger crosses
+# (live 2026-10-25: a running turn took central to $4.39 of $3.30 when only
+# the offer was checked).  The ledger it reads
 # is MeteredAPIUsage, fed by the wire hook from every response's usage block
 # (core.llm_outbound_logger._meter_response) at a real dollar price.
 # Topology agnostic: no node-tier branch.  The cap only has anything to cap
@@ -934,12 +984,13 @@ def claude_usd_spent_today() -> Optional[float]:
 
 
 def expert_budget_allows(model_name) -> Tuple[bool, str]:
-    """May the expert model ``model_name`` be offered right now?
+    """May the expert model ``model_name`` be offered, or called, right now?
 
     Only the capped family is ever refused: once today's metered dollars
     reach the day budget, or while the ledger cannot be read.  A refusal is
-    not an error anywhere: the selector simply does not offer the expert and
-    the turn runs on the node's own model.
+    not an error anywhere: the selector simply does not offer the expert, the
+    wire hook answers a call the turn already holds with a no-retry 429, and
+    either way the turn runs on the node's own model.
     """
     if model_family(model_name) != CAPPED_FAMILY:
         return True, 'not a capped family'

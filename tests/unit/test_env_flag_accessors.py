@@ -77,6 +77,25 @@ class EnvIntSemantics(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             self.assertEqual(env_int('X_TEST_INT', 4, minimum=1), 1)
 
+    def test_below_minimum_is_clamped_to_it_when_asked(self):
+        """A reader whose consumer cannot take less than the minimum (a Kong
+        rate limit is at least 1 request) asks for the clamp: the value below
+        it becomes the minimum, not the default, and it is still said.  The
+        Kong onboarding kept its own silent max(1, ...) reader for this
+        (parallel-path audit 2026-10-27, item 2)."""
+        env = {k: v for k, v in os.environ.items() if k != 'X_TEST_INT'}
+        env['X_TEST_INT'] = '0'
+        with patch.dict(os.environ, env, clear=True), \
+                self.assertLogs('hevolve_core', level='WARNING') as logs:
+            self.assertEqual(env_int('X_TEST_INT', 60, minimum=1, clamp=True), 1)
+        self.assertIn('minimum', logs.output[0])
+        self.assertIn('X_TEST_INT', logs.output[0])
+        # junk still takes the default, clamp or not
+        env['X_TEST_INT'] = 'sixty'
+        with patch.dict(os.environ, env, clear=True), \
+                self.assertLogs('hevolve_core', level='WARNING'):
+            self.assertEqual(env_int('X_TEST_INT', 60, minimum=1, clamp=True), 60)
+
 
 class FlagValueSemantics(unittest.TestCase):
     """flag_value is the ONE reading behind env_flag and a request body's

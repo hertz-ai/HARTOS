@@ -837,6 +837,10 @@ def _install_with_usage(monkeypatch, tmp_path, tier, factory=_usage_response):
     import integrations.agent_engine.budget_gate as bg
     seen = []
     monkeypatch.setattr(bg, 'meter_llm_call', lambda **kw: seen.append(kw))
+    # The hosted path asks the Claude day cap before a call that holds the
+    # configured expert; these tests are about stamping and metering, so the
+    # day's ledger reads as empty (under the cap), as on a working node.
+    monkeypatch.setattr(bg, 'usd_spent_since', lambda since, family: 0.0)
     return mod, fake_httpx, seen
 
 

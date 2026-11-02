@@ -35,6 +35,13 @@ logger = logging.getLogger(__name__)
 # rules to them.
 PHONEPE_CALLBACK_PATH = '/api/v1/intelligence/phonepe/callback'
 PHONEPE_REFUND_CALLBACK_PATH = '/api/v1/intelligence/phonepe/refund-callback'
+# Where the buyer's browser comes back to after the hosted checkout, beside
+# the callbacks so the one public route that carries them carries it too
+# (commercial_api.phonepe_return; the CSRF guard lets its form POST through).
+# It was the bare root, which no node serves: on api.hevolve.ai the root is
+# Kong's 404 (measured 2026-10-27), so a buyer who had just paid landed on an
+# error page (task #145).
+PHONEPE_RETURN_PATH = '/api/v1/intelligence/phonepe/return'
 
 
 def own_gateway_urls() -> Dict[str, str]:
@@ -54,7 +61,7 @@ def own_gateway_urls() -> Dict[str, str]:
                        'through one cannot be started until it has one',
                        PUBLIC_URL_VAR)
         return {}
-    return {'redirect_url': base + '/',
+    return {'redirect_url': base + PHONEPE_RETURN_PATH,
             'callback_url': base + PHONEPE_CALLBACK_PATH,
             'refund_callback_url': base + PHONEPE_REFUND_CALLBACK_PATH}
 
@@ -1667,7 +1674,7 @@ __all__ = [
     'create_payment_request_function', 'create_payment_authorization_function',
     'create_payment_processing_function', 'get_ap2_tools_for_autogen',
     'own_gateway_urls', 'PHONEPE_CALLBACK_PATH', 'PHONEPE_REFUND_CALLBACK_PATH',
-    'PHONEPE_SENT_AMOUNT_KEY',
+    'PHONEPE_RETURN_PATH', 'PHONEPE_SENT_AMOUNT_KEY',
     'mock_settlement_allowed', 'mock_would_settle', 'NO_LIVE_GATEWAY',
     'LIVE_GATEWAY_SETTINGS', 'NO_LIVE_GATEWAY_REASON', 'refuse_no_live_gateway',
 ]

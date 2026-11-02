@@ -55,13 +55,78 @@ def test_the_configured_endpoint_turns_thinking_off():
 
 
 def test_openrouter_gets_its_own_reasoning_switch():
-    """OpenRouter has no chat_template_kwargs; it reads reasoning.effort."""
-    from core.constants import LLM_THINKING_OFF_REASONING
+    """OpenRouter has no chat_template_kwargs; it reads reasoning.effort, and
+    the effort is the shortest every routed model accepts ('low'), not
+    'none' (see the next test)."""
+    from core.constants import LLM_SHORT_REASONING
     kind, entry = _central('https://openrouter.ai/api/v1')
     assert kind == 'api'
-    assert entry['extra_body'] == {'reasoning': {'effort': 'none'}}
-    assert entry['extra_body']['reasoning'] is not LLM_THINKING_OFF_REASONING
+    assert entry['extra_body'] == {'reasoning': {'effort': 'low'}}
+    assert entry['extra_body']['reasoning'] is not LLM_SHORT_REASONING
     assert 'chat_template_kwargs' not in entry['extra_body']
+
+
+_MANDATORY = 'Reasoning is mandatory for this endpoint and cannot be disabled.'
+
+
+@pytest.fixture
+def reasoning_mandatory_endpoint():
+    """A loopback endpoint that answers as a reasoning-mandatory OpenRouter
+    model did on central: 400 with OpenRouter's message for effort 'none',
+    a completion for anything else."""
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            if (body.get('reasoning') or {}).get('effort') == 'none':
+                code, reply = 400, {'error': {'message': _MANDATORY, 'code': 400}}
+            else:
+                code, reply = 200, {
+                    'id': 'c', 'object': 'chat.completion', 'created': 0,
+                    'model': body.get('model'),
+                    'choices': [{'index': 0, 'finish_reason': 'stop',
+                                 'message': {'role': 'assistant', 'content': 'OK'}}],
+                    'usage': {'prompt_tokens': 5, 'completion_tokens': 1,
+                              'total_tokens': 6}}
+            raw = json.dumps(reply).encode()
+            self.send_response(code)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), _Handler)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield f'http://127.0.0.1:{server.server_address[1]}/api/v1'
+    server.shutdown()
+    server.server_close()
+
+
+def test_the_openrouter_entry_is_accepted_where_reasoning_is_mandatory(
+        reasoning_mandatory_endpoint):
+    """Measured on central 2026-10-27 00:01 UTC (openrouter/free, one
+    tool-carrying call per row, three per value): effort 'none' -> 200, 200,
+    400 "Reasoning is mandatory for this endpoint and cannot be disabled.";
+    effort 'low' -> 200 x3 (41-65 reasoning tokens); no field -> 200 x3.
+    On 2026-10-26 'none' had failed 3 of 4.  The free router picks a model
+    per call, so 'none' failed whenever it picked one that must think.  The
+    node's own OpenRouter entry, sent by the openai SDK the agents use, is
+    answered."""
+    openai = pytest.importorskip('openai')
+    _kind, entry = _central('https://openrouter.ai/api/v1')
+    client = openai.OpenAI(api_key='k', base_url=reasoning_mandatory_endpoint,
+                           max_retries=0)
+    reply = client.chat.completions.create(
+        model=entry['model'], messages=[{'role': 'user', 'content': 'Say OK.'}],
+        extra_body=entry['extra_body'])
+    assert reply.choices[0].message.content == 'OK'
 
 
 @pytest.mark.parametrize('endpoint', ['https://api.openai.com/v1',
