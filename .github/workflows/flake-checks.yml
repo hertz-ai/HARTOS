@@ -206,6 +206,31 @@ jobs:
           # turn. Warm the cache here, like the nltk data above.
           python -c "import tiktoken; tiktoken.get_encoding('cl100k_base')"
 
+      # core.media_bin picks the ffmpeg from IMAGEIO_FFMPEG_EXE, then the one
+      # bundled in imageio-ffmpeg, then PATH.  The bundled Linux binary
+      # (imageio-ffmpeg 0.6.0, ffmpeg-linux-x86_64-v7.0.2) has no drawtext filter:
+      # its bytes contain the name 0 times, the Windows v7.1 one 1 time, and CI's
+      # test_media_bin::test_real_listings_parse reports 'drawtext' as the one
+      # missing name.  Every reel test that draws real text died with "Filter not
+      # found" (ffmpeg exited 8): 12 tests in test_reel_render, test_reel_pipeline,
+      # test_reel_motion_pipeline, test_media_bin and test_reel_motion_runtime.
+      # Ubuntu's ffmpeg is built with libfreetype, fontconfig, harfbuzz (drawtext)
+      # and libzimg (zscale): libavfilter9 depends on all of them.  The greps fail
+      # the step here, with the name of the missing filter, if that ever stops
+      # being true.
+      - name: Install an ffmpeg that has drawtext
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          # To a file, then grep: `ffmpeg ... | grep -q` under the runner's
+          # `bash -e -o pipefail` can fail on SIGPIPE when grep exits early.
+          ffmpeg -hide_banner -filters > "$RUNNER_TEMP/ffmpeg-filters.txt"
+          for f in drawtext zscale tonemap scale concat; do
+            grep -q " $f " "$RUNNER_TEMP/ffmpeg-filters.txt" || { echo "::error::ffmpeg has no $f filter"; exit 1; }
+          done
+          echo "IMAGEIO_FFMPEG_EXE=$(command -v ffmpeg)" >> "$GITHUB_ENV"
+          ffmpeg -version | head -1
+
       - name: Run unit + functional tests
         env:
           HEVOLVE_DB_PATH: ':memory:'
