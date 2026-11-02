@@ -8604,9 +8604,10 @@ def _autonomous_gather_info(user_id, description, prompt_id):
 
       STAGE 3 (auto): if needs_refinement, send feedback to gather_info
         which refines and re-emits.  Loop up to 3 rounds.  After 3
-        rounds, escalate (currently auto-approve with metadata flag;
-        future: FCM push to Android via the path restored in this
-        session for human verdict with 30-min timeout).
+        rounds, the newest plan (the refinement that answered the last
+        feedback, never reviewed) is staged as its own round and saved
+        as it stands; an oscillating plan is saved the same way.  Asking
+        the owner instead is a follow-up.
 
       STAGE 4: on approved, the approved plan itself is finalized in code
         (_approved_plan_response, no LLM call) → status 'completed' →
@@ -8680,6 +8681,11 @@ def _autonomous_gather_info(user_id, description, prompt_id):
                         f'planner. Force-approving the most recent plan to '
                         f'stop the cycle.'
                     )
+                    # Never reviewed, so staged as its own round, like the
+                    # escalation's (review of cdeca7500, F4).
+                    parsed['prompt_id'] = prompt_id
+                    parsed['creator_user_id'] = user_id
+                    _stage_review_round(parsed, prompt_id, review_rounds)
                     response = _approved_plan_response(parsed)
                     break
                 _prev_action_count = _action_count
@@ -8713,8 +8719,10 @@ def _autonomous_gather_info(user_id, description, prompt_id):
 
     # After MAX_REVIEW_ROUNDS without convergence, the newest plan (the
     # refinement that answered the last feedback, never reviewed) is staged
-    # as its own round and saved as it stands.  Only when the last answer
-    # holds no plan is gather_info asked to approve, as before.
+    # as its own round and saved as it stands, whether the model marked it
+    # 'proposed_plan' or 'completed' (review of cdeca7500, F1: a 'completed'
+    # refinement was re-asked and the re-emission saved).  Only when the
+    # last answer holds no plan is gather_info asked to approve, as before.
     if review_rounds >= MAX_REVIEW_ROUNDS:
         try:
             _newest = retrieve_json(
@@ -8725,7 +8733,8 @@ def _autonomous_gather_info(user_id, description, prompt_id):
         except Exception:
             _newest = None
         if (isinstance(_newest, dict)
-                and (_newest.get('status') or '').lower() == 'proposed_plan'):
+                and (_newest.get('status') or '').lower() in ('proposed_plan',
+                                                              'completed')):
             app.logger.warning(
                 f'Plan review hit {MAX_REVIEW_ROUNDS} rounds without '
                 f'convergence: saving the newest plan, round {review_rounds}, '

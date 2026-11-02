@@ -131,6 +131,9 @@ def test_the_oscillation_force_approve_saves_the_newest_plan_as_it_stands(run):
     assert _actions(saved) == longer
     assert saved['status'] == 'completed' and 'review_required' not in saved
     assert _asked_to_approve(run) == []
+    # The force-approved plan was never reviewed; it is staged as its own
+    # round, like the escalation's (review of cdeca7500, F4).
+    assert _actions(run.staged(1)) == longer
 
 
 def test_the_escalation_saves_the_refinement_that_answered_the_last_feedback(run):
@@ -147,9 +150,42 @@ def test_the_escalation_saves_the_refinement_that_answered_the_last_feedback(run
         'the escalation saved something other than the newest plan')
     assert saved['status'] == 'completed' and 'review_required' not in saved
     assert _asked_to_approve(run) == []
-    # The saved plan was never reviewed; it is staged as its own round.
-    assert _actions(run.staged(3)) == refinement
+    # The saved plan was never reviewed; it is staged as its own round,
+    # stamped like every other round (review of cdeca7500, mutant M6).
+    staged = run.staged(3)
+    assert _actions(staged) == refinement
+    assert (staged['prompt_id'], staged['creator_user_id']) == (PID, USER)
     assert _actions(run.staged(2)) == rounds[2]
+
+
+def test_a_refinement_the_model_marked_completed_is_saved_as_it_stands(run):
+    """Review of cdeca7500, F1 (ran by its reviewer): when the round-3
+    refinement comes back with status 'completed', the escalation still
+    sent 'approved (escalated...)' to gather_info and saved the
+    re-emission.  The newest plan is final whichever status the model gave
+    it."""
+    rounds = [CREATOR,
+              [a.replace('warm feedback', 'kind feedback') for a in CREATOR],
+              [a.replace('warm feedback', 'gentle feedback') for a in CREATOR]]
+    refinement = [a.replace('warm feedback', 'short warm feedback') for a in CREATOR]
+    run.answers = [_plan('proposed_plan', r) for r in rounds] + [
+        _plan('completed', refinement)]
+    run.verdicts = [('needs_refinement', 'tighten the feedback step')] * 3
+    saved = run.go()
+    assert _actions(saved) == refinement
+    assert _asked_to_approve(run) == []
+    assert _actions(run.staged(3)) == refinement
+
+
+def test_the_approved_plan_keeps_text_outside_ascii(run):
+    """The reviewer's probe: non-ASCII words in the steps reach the saved
+    file unchanged (a coach that says the word in the child's language)."""
+    steps = ['send_message_to_user: say "பந்து" (ball) slowly and ask Arjun to say it',
+             "get_chat_history to read Arjun's attempt at பந்து",
+             'send_message_to_user: warm feedback, très bien']
+    run.answers = [_plan('proposed_plan', steps)]
+    run.verdicts = [('approved', '')]
+    assert _actions(run.go()) == steps
 
 
 def test_an_escalation_with_no_plan_to_save_still_asks_gather_as_before(run):
