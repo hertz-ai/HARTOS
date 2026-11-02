@@ -104,6 +104,23 @@ TIER_DESCRIPTIONS: Dict[GpuTier, Dict[str, str]] = {
 }
 
 
+# Seconds the draft-first dispatcher waits for the draft/classifier call.  With
+# no draft server of its own the draft URL is the MAIN llama-server, and a box
+# with no GPU cannot answer a completion in 15 s: measured on a no-CUDA box,
+# main-model completions took a median of 55 to 71 s (min 5 s), and 18 of 18
+# draft-first calls were cut at 30 s (15 s plus pooled_post's one re-send) with
+# an empty reply.  NONE therefore gets the read budget core.http_pool names for
+# a local completion (LLM_COMPLETION_TIMEOUT, guarded by a test); the tiers with
+# a GPU keep the 15 s they always had (not measured, so not changed).
+DEFAULT_DRAFT_CALL_TIMEOUT_S = 15
+DRAFT_CALL_TIMEOUT_S: Dict[GpuTier, int] = {
+    GpuTier.ULTRA: DEFAULT_DRAFT_CALL_TIMEOUT_S,
+    GpuTier.FULL: DEFAULT_DRAFT_CALL_TIMEOUT_S,
+    GpuTier.STANDARD: DEFAULT_DRAFT_CALL_TIMEOUT_S,
+    GpuTier.NONE: 120,
+}
+
+
 def classify(vram_gb: float, cuda_available: bool) -> GpuTier:
     """Return the GPU tier for the given VRAM size and CUDA availability.
 
@@ -134,6 +151,11 @@ def classify(vram_gb: float, cuda_available: bool) -> GpuTier:
     return GpuTier.NONE
 
 
+def draft_call_timeout(tier: GpuTier) -> int:
+    """Seconds the draft-first dispatcher waits for its draft call on ``tier``."""
+    return DRAFT_CALL_TIMEOUT_S[tier]
+
+
 def tier_table() -> List[Dict[str, object]]:
     """Return the canonical tier table for the /api/v1/system/tiers endpoint.
 
@@ -155,6 +177,9 @@ __all__ = [
     'GpuTier',
     'TIER_THRESHOLDS',
     'TIER_DESCRIPTIONS',
+    'DEFAULT_DRAFT_CALL_TIMEOUT_S',
+    'DRAFT_CALL_TIMEOUT_S',
     'classify',
+    'draft_call_timeout',
     'tier_table',
 ]
