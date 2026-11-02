@@ -234,10 +234,11 @@ class WampRelayTransport:
                 transport._session = None
                 transport.joined.clear()
                 transport._loop = None
-                try:
-                    loop.close()
-                except Exception:
-                    pass
+                # The one ending for a WAMP session's loop: pending tasks
+                # cancelled and drained, then closed (the EventBus bridge's
+                # 2026-05-29 fix; a bare loop.close() here abandoned them).
+                from core.platform.events import close_wamp_loop
+                close_wamp_loop(loop)
             return bool(joined), _time.monotonic() - started > 60
 
         def _run():

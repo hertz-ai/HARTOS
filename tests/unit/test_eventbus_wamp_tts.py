@@ -597,5 +597,88 @@ class TestBootstrapWAMP(unittest.TestCase):
         reset_registry()
 
 
+# ═══════════════════════════════════════════════════════════════
+# One ending for a WAMP session's loop (parallel-path audit 2026-10-27, 5)
+# ═══════════════════════════════════════════════════════════════
+
+class TestCloseWampLoop(unittest.TestCase):
+    """close_wamp_loop is the ONE ending of a loop a WAMP session ran on:
+    cancel what is still pending, let it finish cancelling, close.  The
+    EventBus bridge's reconnect loop and the PeerLink relay's session
+    runner both end their sessions here (the relay's own test is in
+    test_peer_link_relay.py), so the 2026-05-29 WAMP-outbound-death fix
+    ("cannot schedule new futures after shutdown" forever, once a loop was
+    abandoned with its tasks) cannot be present on one and absent on the
+    other again."""
+
+    def test_pending_tasks_are_cancelled_and_drained_before_the_loop_closes(self):
+        import asyncio
+        from core.platform.events import close_wamp_loop
+        from tests.unit.loop_support import leftover_task
+        loop = asyncio.new_event_loop()
+        task = leftover_task(loop)
+        loop.run_until_complete(asyncio.sleep(0))      # the task is started
+        self.assertFalse(task.done())
+        close_wamp_loop(loop)
+        self.assertTrue(task.cancelled())
+        self.assertTrue(loop.is_closed())
+
+    def test_a_closed_or_broken_loop_never_raises(self):
+        import asyncio
+        from core.platform.events import close_wamp_loop
+        loop = asyncio.new_event_loop()
+        loop.close()
+        close_wamp_loop(loop)                           # already closed: fine
+        close_wamp_loop(object())                       # not a loop at all: fine
+
+    def test_the_bridge_ends_its_session_loop_through_it(self):
+        """The reconnect loop in EventBus.connect_wamp ends every session's
+        loop with the one helper: a task the component left behind is
+        cancelled and its loop closed before the next attempt."""
+        import sys
+        from core.platform.events import EventBus
+        from tests.unit.loop_support import leftover_task
+        from tests.unit.module_swap import swap_modules
+        bus = EventBus()
+        leftover = {}
+
+        class FakeComponent:
+            def __init__(self, transports, realm):
+                pass
+
+            def on_join(self, fn):
+                return fn
+
+            def on_leave(self, fn):
+                return fn
+
+            async def start(self, loop=None):
+                leftover['loop'] = loop
+                leftover['task'] = leftover_task(loop)
+                bus._wamp_stop = True                   # one attempt is the run
+                raise ConnectionError('router dropped us')
+
+        # autobahn is not in the suite's venv: the modules connect_wamp
+        # imports are swapped in, the way the relay tests do it.
+        autobahn = type(sys)('autobahn')
+        asyncio_pkg = type(sys)('autobahn.asyncio')
+        component_mod = type(sys)('autobahn.asyncio.component')
+        component_mod.Component = FakeComponent
+        wamp_pkg = type(sys)('autobahn.wamp')
+        types_mod = type(sys)('autobahn.wamp.types')
+        types_mod.SubscribeOptions = lambda **kw: kw
+        with swap_modules({'autobahn': autobahn, 'autobahn.asyncio': asyncio_pkg,
+                           'autobahn.asyncio.component': component_mod,
+                           'autobahn.wamp': wamp_pkg,
+                           'autobahn.wamp.types': types_mod}), \
+                patch('time.sleep'):
+            self.assertTrue(bus.connect_wamp('ws://fake:8088/ws', 'realm1'))
+            bus._wamp_thread.join(5)
+        self.assertFalse(bus._wamp_thread.is_alive())
+        self.assertTrue(leftover['task'].cancelled())
+        self.assertTrue(leftover['loop'].is_closed())
+        self.assertIsNone(bus._wamp_loop)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -5703,10 +5703,23 @@ async def subscribe_and_return(message, topic, time=1800000):
 #: rename cannot leave the prompt advertising a key nothing consumes.
 MEDIA_REPLY_KEY = 'media'
 
-#: The kinds an agent may ask for, and the MIME each file must really be.
-#: The FILE decides: a reference whose own file contradicts its kind is
-#: dropped, never relabelled. A model sure enough to name the wrong kind is
-#: guessing, and the next thing it guesses is the path.
+#: The kinds an agent may ask for, and the MIME each EXTENSION maps to.
+#: The file's NAME decides, not its bytes: a reference whose extension
+#: contradicts its kind is dropped, never relabelled. A model sure enough to
+#: name the wrong kind is guessing, and the next thing it guesses is the
+#: path. (Said precisely because ad729fcc9's message claimed "the FILE
+#: decides the kind", which reads as sniffing content; the code reads
+#: path.suffix, and nothing here opens the file to check.)
+#:
+#: NOT the only extension->MIME table in the tree, deliberately.
+#: integrations/channels/registry.py:89 _MEDIA_MIME maps extensions for the
+#: [[MEDIA:]] marker, which SENDS a file out through a channel. These two
+#: agree on every extension both know (.gif .jpeg .jpg .mp4 .png .webp --
+#: pinned by a test, so the values cannot drift apart) and differ only in
+#: what each can carry, because the jobs differ: a channel can post a .pdf,
+#: .mp3 or .ogg that a chat bubble has no way to render, and a reply can
+#: show .html (the owner asked for "even htmls") and .webm, which the
+#: channel senders do not take. Coverage is the difference; meaning is not.
 MEDIA_KIND_MIMES = {
     'image': {'.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
               '.gif': 'image/gif', '.webp': 'image/webp'},

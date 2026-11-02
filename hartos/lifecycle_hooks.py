@@ -1688,12 +1688,34 @@ def _text_names_tool(text: str, name: str) -> bool:
     1,087 configs (5,889 actions, remember and recall among the names): of
     1,664 (action, tool) matches, 13 change and none has that shape -- 3
     English "remember", 3 English "recall", and 7 "recall" read inside
-    "recall_memory", which those actions still name."""
+    "recall_memory", which those actions still name.
+
+    An identifier with underscores is also named where its SPACED form
+    stands as whole words: "Read item 3" names read_item, "google search
+    for ..." names google_search.  A step written for a person spells its
+    tool out that way; read for the identifier alone, such a step named no
+    tool, wanted a written answer, and the real result of the tool it had
+    just run was no receipt (tests/unit/test_reuse_role_handoff.py, 6 of 8
+    red on main after 2026-10-22).  Whole words only: "read items" is not
+    read_item, and "never through a messaging tool" names no messaging
+    tool.  Measured 2026-10-29 on the desktop's 1,104 recipe actions (1,586
+    action/banked-tool pairs): 17 pairs change, every one a step whose
+    words spell its tool out (execute_windows_or_android_command 6,
+    google_search 3, search_chat_history 2, consult_expert 2, web_search,
+    generate_educational_post, create_campaign, send_message_to_user 1
+    each)."""
     n = str(name or '').lower()
-    if len(n) <= 3 or n not in text:
+    if len(n) <= 3:
         return False
-    if '_' in name or any(c.isdigit() for c in name) or any(
-            c.isupper() for c in name[1:]):
+    identifier = ('_' in name or any(c.isdigit() for c in name)
+                  or any(c.isupper() for c in name[1:]))
+    if n not in text:
+        if identifier and '_' in n:
+            spaced = re.escape(n.replace('_', ' '))
+            return re.search(r'(?<![a-z0-9_])' + spaced + r'(?![a-z0-9_])',
+                             text) is not None
+        return False
+    if identifier:
         return True
     for m in re.finditer(r'(?<![a-z0-9_])' + re.escape(n) + r'(?![a-z0-9_])',
                          text):

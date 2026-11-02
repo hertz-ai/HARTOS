@@ -95,15 +95,18 @@ def _switched_off(db, kind: str) -> Optional[str]:
 
 
 def _person_refusal(db, rid: str, person: str) -> Optional[dict]:
-    """What require_auth would refuse: a person this node has no account
-    for, or a banned one."""
-    from sqlalchemy import text
-    row = db.execute(text("SELECT is_banned FROM users WHERE id = :id"),
-                     {'id': person}).fetchone()
-    if row is None:
+    """What require_auth would refuse, by the ONE rule the Bearer doors ask
+    (auth.user_refusal): a person this node has no account for answers
+    'no_user'; any other refusal of the person answers 'not_allowed' with
+    the rule's word as the detail ('banned').  A refusal added to the rule
+    reaches this door unchanged."""
+    from .auth import user_refusal
+    from .models import User
+    why = user_refusal(db.query(User).filter(User.id == person).first())
+    if why == 'no_user':
         return _refused(rid, 'no_user')
-    if row[0]:
-        return _refused(rid, 'not_allowed', 'banned')
+    if why:
+        return _refused(rid, 'not_allowed', why)
     return None
 
 
