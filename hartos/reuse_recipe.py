@@ -1669,7 +1669,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
         try:
             with open(helper_fun.safe_prompt_path(prompt_id, role_number, i), 'r') as f:
                 config = json.load(f)
-                individual_recipe.append(config)
+                individual_recipe.append(_saved_action_without_values(config))
         except Exception as e:
             current_app.logger.error(f'Got error as :{e} while checking for {helper_fun.safe_prompt_path(prompt_id, role_number, i)}')
 
@@ -7936,6 +7936,48 @@ def _reuse_seed_message(user_prompt, message):
         return message
 
 
+# A step the trace saver banked from a creation run
+# (create_recipe._bank_action_recipe_from_trace) is the call as it ran:
+# "tool(<raw JSON arguments, cut at 400 chars>)".  Its values are that run's
+# data: on 2026-11-02 the Syllable Coach's saved send held the 30 Oct child's
+# attempt, "You said \"Ba\"", and a reuse turn sent it verbatim to a child who
+# had said "bal" (docs/VERIFICATION.md, aae1bce84); agent 54's saved step 3
+# (prompts/54_0_3.json) writes memory under another person's literal key.
+# Such a step reaches the model as the tool and its argument names only
+# (rule D, hartos-c9).  A model-authored recipe, and code steps (whose code
+# can also carry creation literals: out of scope here), are unchanged.
+_TRACE_RECIPE_SOURCE = 'execution_trace'
+
+
+def _step_without_values(step):
+    """``step`` with its saved call shown as "tool(arg, arg)", or
+    "tool(...)" when the saved arguments do not parse (cut at 400)."""
+    tool = step.get('tool_name') if isinstance(step, dict) else None
+    if not tool:
+        return step
+    raw = str(step.get('steps') or '')
+    names = '...'
+    if raw.startswith(f'{tool}(') and raw.endswith(')'):
+        inner = raw[len(tool) + 1:-1].strip()
+        try:
+            args = json.loads(inner) if inner else {}
+        except ValueError:
+            args = None
+        if isinstance(args, dict):
+            names = ', '.join(str(k) for k in args)
+    return dict(step, steps=f'{tool}({names})')
+
+
+def _saved_action_without_values(action):
+    """A copy of a saved action whose trace-saved steps carry no values; any
+    other action is returned as it is.  Never mutates the session's recipe
+    or the file it came from."""
+    if not isinstance(action, dict) or action.get('recipe_source') != _TRACE_RECIPE_SOURCE:
+        return action
+    return dict(action, recipe=[_step_without_values(s)
+                                for s in (action.get('recipe') or [])])
+
+
 def _build_reuse_action_message(user_prompt, action_id, user_words=None):
     """Build the action execution message for REUSE mode.
 
@@ -7960,7 +8002,7 @@ def _build_reuse_action_message(user_prompt, action_id, user_words=None):
         # str(s) is s, so the rendered message is byte-identical.
         steps = [{str(x['steps']): {'tool_name': x.get('tool_name', None),
                                     'code': x.get('generalized_functions', None)}} for x in
-                 recipe_actions[action_id - 1].get('recipe', [])]
+                 _saved_action_without_values(recipe_actions[action_id - 1]).get('recipe', [])]
     else:
         steps = []
         current_app.logger.warning(f"[REUSE] No recipe for action {action_id} — executing without steps")
