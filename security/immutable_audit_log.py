@@ -27,21 +27,30 @@ logger = logging.getLogger('hevolve_security')
 # Besides a secret's name (security.edge_privacy.is_secret_key, the one
 # rule), what the audit log never keeps: a government or card number.
 _SENSITIVE_EXTRA_WORDS = ('ssn', 'credit_card', 'card_number')
+# And any key that holds one of these anywhere ('auth_tokens', 'token_value',
+# 'client_secrets', 'api_keys', 'secret_answer', 'credential_id',
+# 'ssn_last4'): the one rule reads a secret word only as the whole name or
+# its last word, and this log is hash-chained, so a value kept raw is kept for
+# good.  Withholding a harmless 'max_tokens' here is the price (review of
+# 2f3d2255e, which dropped this catch and so kept those names raw).
+_SENSITIVE_KEY_PARTS = ('password', 'token', 'api_key', 'secret', 'credential',
+                        'private_key', 'ssn', 'credit_card', 'card_number')
 
 
 def _redact_sensitive(detail: Optional[Dict]) -> Optional[str]:
     """Redact sensitive fields before storing in audit log.
 
-    A field is sensitive by the one secret-name rule, extended by
-    _SENSITIVE_EXTRA_WORDS.  A substring list of its own redacted
-    'max_tokens' and kept 'passwd', 'pwd', 'cookie' and 'apikey'
-    (claude-autostart-71's review of 14e8e7907)."""
+    A field is sensitive by the one secret-name rule (which also reads
+    'passwd', 'pwd', 'cookie', 'apikey' and 'API-Key') extended by
+    _SENSITIVE_EXTRA_WORDS, or when its key holds one of
+    _SENSITIVE_KEY_PARTS anywhere."""
     if detail is None:
         return None
     from security.edge_privacy import is_secret_key, secret_key_form
     safe = {}
     for k, v in detail.items():
-        if is_secret_key(secret_key_form(str(k)), _SENSITIVE_EXTRA_WORDS):
+        if (is_secret_key(secret_key_form(str(k)), _SENSITIVE_EXTRA_WORDS)
+                or any(p in str(k).lower() for p in _SENSITIVE_KEY_PARTS)):
             safe[k] = '[REDACTED]'
         else:
             safe[k] = v

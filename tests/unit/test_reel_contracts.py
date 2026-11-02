@@ -679,22 +679,18 @@ def test_trending_lists_carry_no_urls_and_no_session_data():
     'sessionid', 'csrftoken', 'cookies', 'authorization_data', 'preview_url',
     'accesstoken', 'authtoken', 'apitoken', 'refreshtoken', 'bearertoken',
     'userpassword', 'igpassword',
+    # a secret word not last, or plural, which the one rule does not read;
+    # 2f3d2255e let these through (its review)
+    'tokens', 'auth_tokens', 'access_tokens', 'refresh_tokens', 'token_value',
+    'tokenValue',
+    # a song list has no count of tokens: refused with them
+    'max_tokens',
 ])
 def test_a_song_list_carries_no_secret_under_any_name(key):
     doc = _client()
     doc['songs'][0][key] = 'x'
     found = [p for p in C.validate_trending_songs(doc) if key in p]
     assert found and all('secrets' in p for p in found), key
-
-
-def test_a_count_of_tokens_is_not_a_secret():
-    """'max_tokens' was refused only by the list's own 'token' word, a second
-    secret-name list beside the one rule (claude-autostart-71's review of
-    0b7c7ccaf); a token's and a password's names are the one rule's."""
-    doc = _client()
-    doc['songs'][0]['max_tokens'] = 3
-    assert not [p for p in C.validate_trending_songs(doc)
-                if 'max_tokens' in p and 'secrets' in p]
 
 
 def test_malformed_trending_lists_are_refused():

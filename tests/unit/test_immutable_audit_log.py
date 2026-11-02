@@ -145,16 +145,29 @@ class TestRedactSensitive(unittest.TestCase):
 
     def test_a_secret_is_named_by_the_one_rule(self):
         """The log's own substring list kept 'passwd', 'pwd', 'cookie' and
-        'apikey' and redacted 'max_tokens' (claude-autostart-71's review of
-        14e8e7907); it asks security.edge_privacy.is_secret_key now."""
+        'apikey' (claude-autostart-71's review of 14e8e7907); the one rule
+        (security.edge_privacy.is_secret_key) names them."""
         detail = {'passwd': 'p1', 'user-pwd': 'p2', 'sessionCookie': 'c1',
                   'apikey': 'k1', 'x-api-key': 'k2', 'ssn': '123-45-6789',
-                  'card_number': '4111', 'max_tokens': 80, 'name': 'john'}
+                  'card_number': '4111', 'name': 'john'}
         result = json.loads(_redact_sensitive(detail))
         for key in ('passwd', 'user-pwd', 'sessionCookie', 'apikey', 'x-api-key',
                     'ssn', 'card_number'):
             self.assertEqual(result[key], '[REDACTED]', key)
-        self.assertEqual(result['max_tokens'], 80)
+        self.assertEqual(result['name'], 'john')
+
+    def test_a_secret_word_anywhere_in_the_key_is_withheld(self):
+        """The one rule reads a secret word only as the whole name or its
+        last word; the log is hash-chained, so these stay withheld by the
+        log's own catch (review of 2f3d2255e, which kept them raw).  A count
+        of tokens is withheld with them."""
+        names = ('tokens', 'auth_tokens', 'access_tokens', 'refresh_tokens',
+                 'token_value', 'secrets', 'client_secrets', 'api_keys',
+                 'secret_answer', 'credential_id', 'ssn_last4', 'max_tokens')
+        result = json.loads(_redact_sensitive(
+            dict({n: 'raw-' + n for n in names}, name='john')))
+        for key in names:
+            self.assertEqual(result[key], '[REDACTED]', key)
         self.assertEqual(result['name'], 'john')
 
 

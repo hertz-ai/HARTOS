@@ -515,11 +515,10 @@ class TestAuditLogDetailJsonRoundTrip(unittest.TestCase):
         self.assertEqual(result['token'], '[REDACTED]')
 
     def test_redact_nested_key_names(self):
-        """A secret's name with more words before it is caught.  A name that
-        ends in another word names that thing: 'private_key_path' is where a
-        key lives, not the key, as the egress scrub reads it too (the one
-        rule, security.edge_privacy.is_secret_key; claude-autostart-71's
-        review of 14e8e7907)."""
+        """Keys containing sensitive substrings are also caught: the log is
+        hash-chained, so it keeps its own substring catch on top of the one
+        rule (security.edge_privacy.is_secret_key), and 'private_key_path'
+        is withheld with the rest (review of 2f3d2255e)."""
         from security.immutable_audit_log import _redact_sensitive
         detail = {
             'old_password': 'abc',
@@ -531,7 +530,7 @@ class TestAuditLogDetailJsonRoundTrip(unittest.TestCase):
         self.assertEqual(result['old_password'], '[REDACTED]')
         self.assertEqual(result['new_credential'], '[REDACTED]')
         self.assertEqual(result['node_private_key'], '[REDACTED]')
-        self.assertEqual(result['private_key_path'], '/keys/node.pem')
+        self.assertEqual(result['private_key_path'], '[REDACTED]')
 
 
 class TestAuditLogLargeChain(unittest.TestCase):
