@@ -545,10 +545,56 @@ class TestABumpWrittenBeforeTheDatabaseWentIsAnUpgrade:
     def test_the_webhook(self, ctx):
         log = logging.getLogger('hevolve_social')
         with ctx['db'].lost_after_next_commit(), \
-                patch.object(log, 'error') as said:
+                patch.object(log, 'error') as said, patch.object(log, 'warning') as warned:
             r = _deliver(ctx, _event(_session()))
         self._assert_upgraded(r, said)
         assert ctx['db'].key() == PRO and len(ctx['ledger'].payments) == 1
+        (line,) = [c.args[0] % c.args[1:] for c in warned.call_args_list]
+        assert 'the bought tier pro is written' in line and 'refund' not in line
+
+    def test_a_key_already_above_stays_and_names_the_refund(self, ctx):
+        """An enterprise key buys pro and the database goes after the
+        commit: the reply shows the key's own tier, the WARNING does not
+        claim the bought tier was written (no row moved), and the refund
+        line names the case (the review of 2cd3c6720, findings 2 and 3)."""
+        ctx['db'].put_key_on('enterprise')
+        log = logging.getLogger('hevolve_social')
+        with ctx['db'].lost_after_next_commit(), \
+                patch.object(log, 'error') as said, patch.object(log, 'warning') as warned:
+            r = _deliver(ctx, _event(_session()))
+        assert r.status_code == 200, r.data[:300]
+        assert r.get_json()['api_key']['tier'] == 'enterprise'
+        said.assert_not_called()
+        lines = [c.args[0] % c.args[1:] for c in warned.call_args_list]
+        assert not any('is written' in l for l in lines), lines
+        assert any('stays on enterprise' in l and 'may need a refund' in l for l in lines), lines
+        assert ctx['db'].key() == tier_tuple('enterprise')
+
+    def test_a_payment_that_raced_another_names_the_refund(self, ctx):
+        """The key is read on free, another payment raises it to pro, this
+        starter write moves no row, and the read back fails.  The reply
+        floor is starter (the key holds at least that); the refund question
+        is asked by the read-back WARNING, since the "stays on" line only
+        sees the earlier read.  It was suppressed: the line said starter
+        "is written" (the review of 2cd3c6720, finding 1)."""
+        from integrations.agent_engine.commercial_api import _apply_bought_tier
+        from integrations.social.models import CommercialAPIKey
+        s = ctx['db'].session()
+        try:
+            api_key = s.query(CommercialAPIKey).filter_by(id=KEY).first()
+            assert api_key.tier == 'free'
+            ctx['db'].put_key_on('pro')                   # the other payment
+            log = logging.getLogger('hevolve_social')
+            with ctx['db'].lost_after_next_commit(), patch.object(log, 'warning') as warned:
+                key, failure = _apply_bought_tier(s, api_key, 'starter')
+        finally:
+            s.close()
+        assert failure is None
+        assert key['tier'] == 'starter'
+        lines = [c.args[0] % c.args[1:] for c in warned.call_args_list]
+        assert any('no row moved' in l and 'refund' in l for l in lines), lines
+        assert not any('is written' in l for l in lines), lines
+        assert ctx['db'].key() == PRO
 
     def test_the_buyers_first_visit(self, ctx):
         ctx['stripe'].checkout.Session.retrieve.return_value = _session()

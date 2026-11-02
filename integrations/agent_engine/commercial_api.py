@@ -2032,8 +2032,10 @@ def _bump_failed(what_paid: str, api_key_id, failure: str, *, retry: str,
     route and PhonePe's return page against it).  ``exc_info`` is the
     exception the caller caught, when it caught one, so the traceback rides
     on this line and not on a second ERROR record.  ``api_key_id`` is a plain
-    value: the id of the key _apply_bought_tier hands back, read before the
-    write.  Writing ``api_key.id`` off the row in the call re-loads it after
+    value, never read off the key row in the call: the card and Stripe
+    callers pass the id _apply_bought_tier hands back (read before the
+    write), the PhonePe callback the id its payment record carries.
+    Writing ``api_key.id`` off the row in the call re-loads it after
     the failed bump's rollback expired it, while Python evaluates the
     arguments, in the CALLER, before this function runs; with the database
     gone that load raised and the charged card got Flask's HTML 500 with no
@@ -2134,9 +2136,16 @@ def _apply_bought_tier(db, api_key, target_tier: str):
     a committed write it is the row read back.  When that read back fails
     (the database went away after the commit), the write still happened, so
     there is no error, and ``key`` is the least the table holds: the bought
-    tier, or the key's own when it was already there or above.  The read
+    tier, or the key's own when it was already there or above (no writer
+    ever lowers a tier, so the higher of the two is a floor).  The read
     back shared the write's try, so a bump that was done was reported as
-    failed and a person was asked to apply it by hand (task #214)."""
+    failed and a person was asked to apply it by hand (task #214).
+
+    ``before`` reads attributes the caller already loaded and touches no
+    database: every caller loads ``api_key`` on the session it passes, with
+    no commit between that load and this call (the payment ledger the rails
+    record into is a JSON file, not this session).  A caller that adds a
+    commit there must read the key before it."""
     from sqlalchemy import or_
     from integrations.social.models import CommercialAPIKey
 
@@ -2153,16 +2162,19 @@ def _apply_bought_tier(db, api_key, target_tier: str):
         # a KeyError outside this try (the review of ec0dbe7be).
         return before, f'bought tier {target_tier!r} is not a tier'
     cfg = TIER_CONFIG[target_tier]
+    # What the bought tier writes: the UPDATE's values and the reply's when
+    # the row cannot be read back.
+    bought = {'tier': target_tier,
+              'rate_limit_per_day': cfg['rate_limit_per_day'],
+              'monthly_quota': cfg['monthly_quota']}
     try:
         rows = db.query(CommercialAPIKey).filter(
             CommercialAPIKey.id == before['id'],
             or_(CommercialAPIKey.tier.is_(None),
                 CommercialAPIKey.tier.notin_(_tiers_at_least(target_tier))),
-        ).update({
-            CommercialAPIKey.tier: target_tier,
-            CommercialAPIKey.rate_limit_per_day: cfg['rate_limit_per_day'],
-            CommercialAPIKey.monthly_quota: cfg['monthly_quota'],
-        }, synchronize_session=False)
+        ).update({getattr(CommercialAPIKey, column): value
+                  for column, value in bought.items()},
+                 synchronize_session=False)
         db.commit()
     except Exception as e:
         roll_back(e)
@@ -2172,15 +2184,22 @@ def _apply_bought_tier(db, api_key, target_tier: str):
         key = _key_fields(api_key)
     except Exception as e:
         roll_back(e)
-        if _is_tier_upgrade(before['tier'], target_tier):
-            key = dict(before, tier=target_tier,
-                       rate_limit_per_day=cfg['rate_limit_per_day'],
-                       monthly_quota=cfg['monthly_quota'])
+        below = _is_tier_upgrade(before['tier'], target_tier)
+        key = dict(before, **bought) if below else before
+        if rows:
+            done = f'the bought tier {target_tier} is written'
+        elif below:
+            # Read below the bought tier, yet no row moved: another payment
+            # raised the key between that read and this write, to this tier
+            # or one that costs more.  Which, the lost read cannot say, so
+            # the refund question is asked here; the "stays on" line below
+            # cannot see it (the review of 2cd3c6720, finding 1).
+            done = (f'no row moved for the bought tier {target_tier}: another payment '
+                    f'raised the key meanwhile, so check whether this payment needs a refund')
         else:
-            key = before
-        logger.warning("api_key %s: the bought tier %s is written (%d row moved) but "
-                       "the row could not be read back: %s", before['id'], target_tier,
-                       rows, e)
+            done = f'no row moved for the bought tier {target_tier}'
+        logger.warning("api_key %s: %s, and the row could not be read back: %s",
+                       before['id'], done, e)
     if not rows and key['tier'] != target_tier:
         # Money was taken for a tier the key is already above: a refund
         # case the operator must see.  A replay of an applied session (the
