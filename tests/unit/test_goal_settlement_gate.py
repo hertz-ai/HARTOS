@@ -341,6 +341,18 @@ def test_a_refused_pause_is_not_logged_as_a_pause(caplog):
 _HEALTH = 'integrations.agent_engine.ip_service.IPService.get_loop_health'
 
 
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _no_health_kept_between_tests(monkeypatch):
+    """The settle may read the daemon scan's last loop health; each test
+    sees only the health it patches."""
+    from integrations.agent_engine import goal_seeding
+    monkeypatch.setattr(goal_seeding, '_loop_health_seen',
+                        {'at': None, 'health': None}, raising=False)
+
+
 def _remediation_goal(spark=4):
     return Goal(spark=spark, cfg={'mode': 'monitor', 'remediation': 'single_node',
                                   'spark_at_dispatch': 0})
@@ -374,12 +386,53 @@ def test_a_remediation_whose_loophole_is_gone_completes():
 
 def test_a_loophole_missing_because_its_check_failed_is_not_done():
     """get_loop_health swallows each check's error, so a failed check reports
-    no loophole: missing is not the same as fixed."""
+    nothing it measures: missing is not the same as fixed."""
     g = _remediation_goal()
     with patch(_HEALTH, return_value=_health(failed=['hivemind_agents'])):
         _settle_dispatched_goal(Db(), g, 'g1')
     assert g.status == 'paused'
-    assert 'hivemind_agents failed' in g.config_json['pause_reason']
+    assert 'hivemind_agents not measured' in g.config_json['pause_reason']
+
+
+def test_a_loophole_below_the_seeded_severity_does_not_hold_the_goal():
+    """One severity rule (review of 6047bcf19, finding 2): seeding answers
+    critical and high only, so a medium report of the same type (goal volume
+    under 100) is not the loophole the goal was seeded for."""
+    g = _remediation_goal()
+    health = _health()
+    health['flywheel_loopholes'].append(
+        {'type': 'single_node', 'severity': 'medium',
+         'message': 'Insufficient goal volume (40) — need 100+'})
+    with patch(_HEALTH, return_value=health):
+        _settle_dispatched_goal(Db(), g, 'g1')
+    assert g.status == 'completed'
+
+
+def test_a_hive_run_whose_loophole_is_still_there_pauses_not_completes():
+    """The hive arm reaches the same test (review of 6047bcf19, finding 5:
+    no test held it, and a mutant skipping it there survived)."""
+    g = Goal(spark=9, cfg={'remediation': 'single_node', 'spark_at_dispatch': 4,
+                           'spark_at_handoff': 4})
+    with _with_coordinator({'total_tasks': 1, 'completed': 1}), \
+            patch(_HEALTH, return_value=_health('single_node')):
+        _settle_dispatched_goal(Db(), g, 'g1', handed_to_hive=True)
+    assert g.status == 'paused'
+    assert g.config_json['pause_cause'] == 'remediation_open'
+    assert 'completed_at' not in g.config_json
+
+
+def test_a_refused_remediation_pause_neither_completes_nor_logs_a_pause(caplog):
+    import logging
+    from integrations.agent_engine.goal_manager import GoalManager
+    g = _remediation_goal()
+    with patch(_HEALTH, return_value=_health('single_node')), \
+            patch.object(GoalManager, 'pause_goal',
+                         return_value={'success': False, 'error': 'refused'}), \
+            caplog.at_level(logging.INFO):
+        _settle_dispatched_goal(Db(), g, 'g1')
+    assert g.status == 'active'
+    assert 'completed_at' not in g.config_json
+    assert 'PAUSED, not completed' not in caplog.text
 
 
 def test_a_health_check_that_raises_is_not_done():

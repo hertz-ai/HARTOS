@@ -2088,6 +2088,19 @@ class AgentDaemon:
             # 400) must re-test its cause without a person at the dashboard.
             _resume_goals_paused_for_a_cleared_cause(db, cause_cleared=False)
 
+            # Remediation goals the settlement gate paused because their
+            # loophole was still there are judged again on the scan's tick,
+            # also before the no-goals stop: an all-paused node must still
+            # see a loophole go (review of 6047bcf19, finding 1).  The
+            # health it read is handed to the seeding scan below.
+            remediation_health = None
+            if self._tick_count % self._remediate_every == 0:
+                try:
+                    from .goal_seeding import recheck_paused_remediations
+                    remediation_health = recheck_paused_remediations(db)
+                except Exception as e:
+                    logger.warning(f"Paused remediation re-check skipped: {e}")
+
             # DETERMINISTIC STOP: no goals = no action = system is inert
             # Skip CODING_GOAL_TYPES — coding_daemon handles those with
             # idle-agent detection + benchmark sync for backend routing.
@@ -2722,7 +2735,8 @@ class AgentDaemon:
             if self._tick_count % self._remediate_every == 0:
                 try:
                     from .goal_seeding import auto_remediate_loopholes
-                    rem_count = auto_remediate_loopholes(db)
+                    rem_count = auto_remediate_loopholes(
+                        db, health=remediation_health)
                     if rem_count > 0:
                         logger.info(f"Auto-remediation: created {rem_count} goal(s)")
                 except Exception as e:
