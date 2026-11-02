@@ -8558,6 +8558,37 @@ def _review_proposed_plan(plan, max_rounds_remaining):
         return ('approved', None)
 
 
+def _approved_plan_response(plan):
+    """The approved ``plan`` as the response the save path reads: status
+    'completed', review_required dropped, nothing else changed.
+
+    Finalized here, in code.  Sending 'approved' to gather_info and saving
+    its re-emission saved a new LLM answer, not the reviewed plan: on
+    2026-10-30 the Syllable Coach (prompt 1793359802508) was saved with
+    "read Arjun's latest attempt" ahead of "ask him to say ball", reworded,
+    though all three staged rounds kept the creator's order (hartos-c9).
+    """
+    final = {k: v for k, v in plan.items() if k != 'review_required'}
+    final['status'] = 'completed'
+    return json.dumps(final)
+
+
+def _stage_review_round(plan, prompt_id, review_round):
+    """Write one auto-review round's plan to its proposed-plan file (audit)."""
+    try:
+        from core.prompt_files import proposed_plan_filename
+        _plan_path = os.path.join(
+            PROMPTS_DIR,
+            proposed_plan_filename(prompt_id, review_round))
+        os.makedirs(os.path.dirname(_plan_path), exist_ok=True)
+        with open(_plan_path, 'w') as f:
+            json.dump(plan, f)
+        app.logger.info(
+            f'Plan round {review_round} staged at {_plan_path}')
+    except Exception as e:
+        app.logger.warning(f'Plan stage write failed: {e}')
+
+
 def _autonomous_gather_info(user_id, description, prompt_id):
     """Run gather_info autonomously with HART OS peer-review pattern.
 
@@ -8577,8 +8608,9 @@ def _autonomous_gather_info(user_id, description, prompt_id):
         future: FCM push to Android via the path restored in this
         session for human verdict with 30-min timeout).
 
-      STAGE 4: on approved, send 'approved' to gather_info → status
-        becomes 'completed' → persona JSON saved → next /chat call
+      STAGE 4: on approved, the approved plan itself is finalized in code
+        (_approved_plan_response, no LLM call) → status 'completed' →
+        persona JSON saved → next /chat call
         dispatches to the autogen multi-agent team (Helper + Executor
         + StatusVerifier) which executes the atomic steps using
         execute_windows_or_android_command and saves per-step recipe
@@ -8648,44 +8680,24 @@ def _autonomous_gather_info(user_id, description, prompt_id):
                         f'planner. Force-approving the most recent plan to '
                         f'stop the cycle.'
                     )
-                    try:
-                        response = gather_info(
-                            user_id,
-                            'approved (oscillation-detected after '
-                            f'{review_rounds + 1} rounds)',
-                            prompt_id, autonomous=True)
-                    except Exception as _osc_err:
-                        app.logger.error(
-                            f'Oscillation force-approve failed: {_osc_err}')
+                    response = _approved_plan_response(parsed)
                     break
                 _prev_action_count = _action_count
                 # Stage plan for audit + run auto-review
                 parsed['prompt_id'] = prompt_id
                 parsed['creator_user_id'] = user_id
-                try:
-                    from core.prompt_files import proposed_plan_filename
-                    _plan_path = os.path.join(
-                        PROMPTS_DIR,
-                        proposed_plan_filename(prompt_id, review_rounds))
-                    os.makedirs(os.path.dirname(_plan_path), exist_ok=True)
-                    with open(_plan_path, 'w') as f:
-                        json.dump(parsed, f)
-                    app.logger.info(
-                        f'Plan round {review_rounds} staged at {_plan_path}')
-                except Exception as e:
-                    app.logger.warning(f'Plan stage write failed: {e}')
+                _stage_review_round(parsed, prompt_id, review_rounds)
 
                 verdict, feedback = _review_proposed_plan(
                     parsed, MAX_REVIEW_ROUNDS - review_rounds)
 
                 if verdict == 'approved':
-                    # Tell gather_info we approve → it re-emits status=completed
+                    # The plan the reviewer approved is the one saved.
                     app.logger.info(
                         f'Plan approved by StatusVerifier after '
                         f'{review_rounds + 1} rounds, finalizing')
-                    response = gather_info(user_id, 'approved',
-                                           prompt_id, autonomous=True)
-                    continue  # re-parse on next iteration; should be completed
+                    response = _approved_plan_response(parsed)
+                    continue  # re-parse on next iteration: completed
                 else:
                     # Send feedback to gather_info for refinement
                     review_rounds += 1
@@ -8699,19 +8711,39 @@ def _autonomous_gather_info(user_id, description, prompt_id):
                 f'Auto-review round {review_rounds} parse error: {e}')
             break
 
-    # After MAX_REVIEW_ROUNDS without convergence, escalate by force-approving
-    # the latest plan with metadata flag (future: FCM push to Android, wait
-    # 30 min for human verdict, fall back to auto-approve on timeout).
+    # After MAX_REVIEW_ROUNDS without convergence, the newest plan (the
+    # refinement that answered the last feedback, never reviewed) is staged
+    # as its own round and saved as it stands.  Only when the last answer
+    # holds no plan is gather_info asked to approve, as before.
     if review_rounds >= MAX_REVIEW_ROUNDS:
-        app.logger.warning(
-            f'Plan review hit {MAX_REVIEW_ROUNDS} rounds without '
-            f'convergence — escalating to auto-approve with '
-            f'metadata flag auto_approved_timeout=true')
         try:
-            response = gather_info(user_id, 'approved (escalated after 3 review rounds)',
-                                   prompt_id, autonomous=True)
-        except Exception as e:
-            app.logger.error(f'Escalation gather_info failed: {e}')
+            _newest = retrieve_json(
+                response.replace('true', 'True').replace('false', 'False'))
+            if isinstance(_newest, list):
+                _newest = next((item for item in reversed(_newest)
+                                if isinstance(item, dict) and 'status' in item), {})
+        except Exception:
+            _newest = None
+        if (isinstance(_newest, dict)
+                and (_newest.get('status') or '').lower() == 'proposed_plan'):
+            app.logger.warning(
+                f'Plan review hit {MAX_REVIEW_ROUNDS} rounds without '
+                f'convergence: saving the newest plan, round {review_rounds}, '
+                f'which was never reviewed')
+            _newest['prompt_id'] = prompt_id
+            _newest['creator_user_id'] = user_id
+            _stage_review_round(_newest, prompt_id, review_rounds)
+            response = _approved_plan_response(_newest)
+        else:
+            app.logger.warning(
+                f'Plan review hit {MAX_REVIEW_ROUNDS} rounds without '
+                f'convergence and the last answer holds no plan: asking '
+                f'gather_info to approve')
+            try:
+                response = gather_info(user_id, 'approved (escalated after 3 review rounds)',
+                                       prompt_id, autonomous=True)
+            except Exception as e:
+                app.logger.error(f'Escalation gather_info failed: {e}')
 
     # Single-shot: LLM should emit a complete plan on first call.
     # If status is "proposed_plan" we return the plan to the peer
