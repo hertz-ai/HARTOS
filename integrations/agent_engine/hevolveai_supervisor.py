@@ -62,7 +62,6 @@ hivemind 0x05 channel as a federation participant.
 from __future__ import annotations
 
 import atexit
-import ctypes
 import logging
 import os
 import socket
@@ -76,18 +75,16 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger('hevolve_agent_engine')
 
 
-# -- Windows Job Object constants -------------------------------------
-# (Mirrors the values used in core/resource_governor.py for the parent
-# process's own resource cage.  Defined inline here to avoid coupling
-# this module to the governor's private structs.)
-_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
-_JOB_OBJECT_LIMIT_BREAKAWAY_OK      = 0x0800
-_JOBOBJECT_EXTENDED_LIMIT_INFO_CLS  = 9    # JobObjectExtendedLimitInformation
-_JOBOBJECT_CPU_RATE_CONTROL_INFO_CLS = 15  # JobObjectCpuRateControlInformation
-_JOB_OBJECT_CPU_RATE_CONTROL_ENABLE = 0x1
-_JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP = 0x4
+# -- Windows Job Object ------------------------------------------------
+# The Job Object helper lives in core.child_lifecycle (shared with every
+# child that must die with Nunba).  This module keeps its OWN job: it caps
+# the child's CPU rate job-wide (set_cpu_rate), which must never touch the
+# shared lifecycle job that llama-server and the GPU workers are bound to.
+from core.child_lifecycle import (  # noqa: E402
+    CREATE_BREAKAWAY_FROM_JOB as _CREATE_BREAKAWAY_FROM_JOB,
+    JobHandle as _JobHandle,
+)
 
-_CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 _CREATE_NO_WINDOW          = 0x08000000
 
 # Governor-mode -> CPU fraction the child is allowed to use of one
@@ -476,166 +473,7 @@ def _port_in_use(port: int) -> bool:
         return False
 
 
-# -- Job Object helpers -----------------------------------------------
-class _JobHandle:
-    """Owns a Windows Job Object handle with KILL_ON_JOB_CLOSE set.
-
-    Keep one instance alive in module scope for the lifetime of the
-    parent process -- releasing the last reference closes the handle,
-    which kills every assigned process.  That is the intended lifecycle
-    binding; do NOT call ``.close()`` from supervisor restart code.
-    """
-
-    def __init__(self) -> None:
-        self.handle: Optional[int] = None
-        self._kernel32 = None
-
-    def create(self) -> Optional[int]:
-        """Create the Job Object and set the kill-on-close + breakaway-ok
-        limit flags.  Returns the handle (a Windows HANDLE as int) or
-        None if anything fails -- caller falls back to no-binding spawn.
-        """
-        if sys.platform != 'win32':
-            return None
-        try:
-            # use_last_error=True so ctypes captures the per-call Win32
-            # error into get_last_error() (windll.kernel32 does NOT, so
-            # the error code logged on Assign failure would be stale).
-            self._kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)  # type: ignore[attr-defined]
-            # Declare argtypes/restype so 64-bit HANDLEs round-trip without
-            # truncation. Without this, ctypes treats the HANDLE return as a
-            # 32-bit int and a handle above 0x7FFFFFFF gets sign-corrupted,
-            # silently breaking the kill-on-close binding this file exists for.
-            k = self._kernel32
-            k.CreateJobObjectW.restype = ctypes.c_void_p
-            k.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
-            k.SetInformationJobObject.restype = ctypes.c_bool
-            k.SetInformationJobObject.argtypes = [
-                ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong]
-            k.AssignProcessToJobObject.restype = ctypes.c_bool
-            k.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-            self.handle = self._kernel32.CreateJobObjectW(None, None)
-            if not self.handle:
-                logger.warning(
-                    "hevolveai_supervisor: CreateJobObjectW failed; "
-                    "child will NOT be killed on parent exit")
-                self.handle = None
-                return None
-            if not self._set_limits():
-                # SetInformationJobObject failed.  Leave the handle open;
-                # AssignProcessToJobObject still works, just no kill-on-close.
-                logger.warning(
-                    "hevolveai_supervisor: SetInformationJobObject failed; "
-                    "Job Object created without KILL_ON_JOB_CLOSE")
-            return self.handle
-        except Exception as e:  # pragma: no cover -- defensive
-            logger.warning(
-                "hevolveai_supervisor: Job Object setup failed: %s", e)
-            self.handle = None
-            return None
-
-    def _set_limits(self) -> bool:
-        """Apply KILL_ON_JOB_CLOSE + BREAKAWAY_OK to the job."""
-        # JOBOBJECT_EXTENDED_LIMIT_INFORMATION (matches resource_governor.py)
-        class _IO_COUNTERS(ctypes.Structure):
-            _fields_ = [('_' + str(i), ctypes.c_ulonglong) for i in range(6)]
-
-        class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
-            _fields_ = [
-                ('PerProcessUserTimeLimit', ctypes.c_longlong),
-                ('PerJobUserTimeLimit', ctypes.c_longlong),
-                ('LimitFlags', ctypes.c_ulong),
-                ('MinimumWorkingSetSize', ctypes.c_size_t),
-                ('MaximumWorkingSetSize', ctypes.c_size_t),
-                ('ActiveProcessLimit', ctypes.c_ulong),
-                ('Affinity', ctypes.c_size_t),
-                ('PriorityClass', ctypes.c_ulong),
-                ('SchedulingClass', ctypes.c_ulong),
-            ]
-
-        class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
-            _fields_ = [
-                ('BasicLimitInformation', _JOBOBJECT_BASIC_LIMIT_INFORMATION),
-                ('IoInfo', _IO_COUNTERS),
-                ('ProcessMemoryLimit', ctypes.c_size_t),
-                ('JobMemoryLimit', ctypes.c_size_t),
-                ('PeakProcessMemoryUsed', ctypes.c_size_t),
-                ('PeakJobMemoryUsed', ctypes.c_size_t),
-            ]
-
-        info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-        info.BasicLimitInformation.LimitFlags = (
-            _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-            | _JOB_OBJECT_LIMIT_BREAKAWAY_OK
-        )
-        ok = self._kernel32.SetInformationJobObject(
-            self.handle,
-            _JOBOBJECT_EXTENDED_LIMIT_INFO_CLS,
-            ctypes.byref(info),
-            ctypes.sizeof(info),
-        )
-        return bool(ok)
-
-    def assign(self, proc_handle: int) -> bool:
-        """Assign a child process to this job.  proc_handle must be a
-        Windows HANDLE (subprocess.Popen._handle is one)."""
-        if self.handle is None or self._kernel32 is None:
-            return False
-        try:
-            ok = self._kernel32.AssignProcessToJobObject(
-                self.handle, int(proc_handle))
-            if not ok:
-                err = ctypes.get_last_error()
-                logger.warning(
-                    "hevolveai_supervisor: AssignProcessToJobObject "
-                    "failed (err=%d); child WILL outlive parent on crash",
-                    err)
-            return bool(ok)
-        except Exception as e:  # pragma: no cover
-            logger.warning(
-                "hevolveai_supervisor: AssignProcessToJobObject "
-                "exception: %s", e)
-            return False
-
-    def set_cpu_rate(self, cpu_fraction: float) -> bool:
-        """Live-update the job's CPU rate cap.
-
-        Reuses the existing Job Object so the running child immediately
-        sees the new cap -- no restart required.  ``cpu_fraction`` is a
-        fraction of ONE logical core (0.05 = 5% of one core).  Windows
-        clamps the rate field at 1 (0.01%); we floor at 100 (1%) so
-        SLEEP mode doesn't drop to literal zero and starve the child
-        out of even emitting its shutdown logs.
-        """
-        if self.handle is None or self._kernel32 is None:
-            return False
-        try:
-            class _RATE(ctypes.Structure):
-                _fields_ = [
-                    ('ControlFlags', ctypes.c_ulong),
-                    ('Value', ctypes.c_ulong),
-                ]
-            info = _RATE()
-            info.ControlFlags = (
-                _JOB_OBJECT_CPU_RATE_CONTROL_ENABLE
-                | _JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP
-            )
-            info.Value = max(100, int(cpu_fraction * 10000))
-            ok = self._kernel32.SetInformationJobObject(
-                self.handle,
-                _JOBOBJECT_CPU_RATE_CONTROL_INFO_CLS,
-                ctypes.byref(info),
-                ctypes.sizeof(info),
-            )
-            return bool(ok)
-        except Exception as e:  # pragma: no cover
-            logger.debug(
-                "hevolveai_supervisor: SetInformationJobObject "
-                "CpuRate failed: %s", e)
-            return False
-
-
-_JOB = _JobHandle()
+_JOB = _JobHandle(owner='hevolveai_supervisor')
 
 
 # -- Supervisor lifecycle ---------------------------------------------

@@ -14,6 +14,11 @@ def _load():
     # isolated worker redirects fd 1 and sys.stdout to stderr before
     # calling _load(), so these writes go to the log stream.
     import os, sys
+    # Tests set this to simulate a cold start slower than startup_timeout.
+    _load_s = float(os.environ.get('HEVOLVE_TEST_ECHO_LOAD_S', '0') or 0)
+    if _load_s > 0:
+        import time as _t
+        _t.sleep(_load_s)
     print('[noise] library init message on sys.stdout')
     sys.stdout.write('[noise] raw sys.stdout.write\n')
     try:
