@@ -330,3 +330,95 @@ def test_a_refused_pause_is_not_logged_as_a_pause(caplog):
     assert g.status == 'active'
     assert g.config_json['noop_dispatch_count'] == 5
     assert 'AUTO-PAUSED' not in caplog.text
+
+
+# ── A remediation goal completes only when its loophole is gone ──────
+#
+# Measured on central 2026-11-02: 269 'Remediate Single Node' goals completed
+# on about 4 spark each while central stayed one node; each completion let the
+# next hourly re-seed in.  Spend shows the remediation ran, not that it worked.
+
+_HEALTH = 'integrations.agent_engine.ip_service.IPService.get_loop_health'
+
+
+def _remediation_goal(spark=4):
+    return Goal(spark=spark, cfg={'mode': 'monitor', 'remediation': 'single_node',
+                                  'spark_at_dispatch': 0})
+
+
+def _health(*types, failed=()):
+    return {'flywheel_loopholes': [
+                {'type': t, 'severity': 'high', 'message': f'{t} still here'}
+                for t in types],
+            'failed_checks': list(failed)}
+
+
+def test_a_remediation_whose_loophole_is_still_reported_pauses_not_completes():
+    g = _remediation_goal()
+    with patch(_HEALTH, return_value=_health('single_node', 'cold_start')):
+        _settle_dispatched_goal(Db(), g, 'g1')
+    assert g.status == 'paused', 'spend with the loophole still there is not done'
+    assert 'completed_at' not in g.config_json
+    assert g.config_json['pause_cause'] == 'remediation_open'
+    assert "'single_node' is still reported" in g.config_json['pause_reason']
+    assert g.config_json['paused_by'] == 'daemon'
+
+
+def test_a_remediation_whose_loophole_is_gone_completes():
+    g = _remediation_goal()
+    with patch(_HEALTH, return_value=_health('cold_start')):   # another type only
+        _settle_dispatched_goal(Db(), g, 'g1')
+    assert g.status == 'completed'
+    assert 'pause_cause' not in g.config_json
+
+
+def test_a_loophole_missing_because_its_check_failed_is_not_done():
+    """get_loop_health swallows each check's error, so a failed check reports
+    no loophole: missing is not the same as fixed."""
+    g = _remediation_goal()
+    with patch(_HEALTH, return_value=_health(failed=['hivemind_agents'])):
+        _settle_dispatched_goal(Db(), g, 'g1')
+    assert g.status == 'paused'
+    assert 'hivemind_agents failed' in g.config_json['pause_reason']
+
+
+def test_a_health_check_that_raises_is_not_done():
+    g = _remediation_goal()
+    with patch(_HEALTH, side_effect=RuntimeError('bridge gone')):
+        _settle_dispatched_goal(Db(), g, 'g1')
+    assert g.status == 'paused'
+    assert 'could not run' in g.config_json['pause_reason']
+
+
+def test_a_remediation_turn_that_spent_nothing_is_still_a_noop():
+    g = _remediation_goal(spark=0)
+    with patch(_HEALTH) as health:
+        _settle_dispatched_goal(Db(), g, 'g1')
+    health.assert_not_called()
+    assert g.status == 'active' and g.config_json['noop_dispatch_count'] == 1
+
+
+def test_a_goal_without_a_test_settles_as_before():
+    g = Goal(spark=7)
+    with patch(_HEALTH) as health:
+        _settle_dispatched_goal(Db(), g, 'g1')
+    health.assert_not_called()
+    assert g.status == 'completed'
+
+
+def test_loop_health_names_the_checks_that_failed():
+    """The real get_loop_health with its sources down: every check that
+    raised is listed, so a reader can tell 'not reported' from 'not checked'."""
+    from integrations.agent_engine.ip_service import IPService
+
+    def _down(*a, **k):
+        raise RuntimeError('down')
+
+    with patch('integrations.agent_engine.world_model_bridge.get_world_model_bridge',
+               side_effect=_down), \
+         patch('integrations.social.models.get_db', side_effect=_down):
+        health = IPService.get_loop_health()
+    assert {'world_model', 'agent_performance', 'ralt_propagation',
+            'hivemind_agents'} <= set(health['failed_checks'])
+    assert 'single_node' not in {l['type'] for l in health['flywheel_loopholes']}, \
+        'with both of its checks down, single_node is not reported at all'

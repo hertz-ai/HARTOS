@@ -186,6 +186,11 @@ class IPService:
             'loop_verified': False,
             'improvement_rate': 0.0,
             'flywheel_loopholes': [],
+            # The checks below that raised.  Each one swallows its error, so a
+            # check that failed reports no loophole: a type missing from
+            # flywheel_loopholes means "fixed" only when its check is not
+            # listed here (goal_seeding.remediation_still_open reads both).
+            'failed_checks': [],
         }
 
         # Loophole ownership map — which agent is responsible for fixing each
@@ -221,6 +226,7 @@ class IPService:
                     'remediation': 'Coding agent: optimize _flush_to_world_model batch size or add workers',
                 })
         except Exception:
+            result['failed_checks'].append('world_model')
             result['flywheel_loopholes'].append({
                 'type': 'cold_start',
                 'owner': loophole_owners['cold_start'],
@@ -252,7 +258,7 @@ class IPService:
             finally:
                 db.close()
         except Exception:
-            pass
+            result['failed_checks'].append('agent_performance')
 
         # 3. RALT propagation
         try:
@@ -283,7 +289,7 @@ class IPService:
                                   'deterministic gates may be too restrictive',
                 })
         except Exception:
-            pass
+            result['failed_checks'].append('ralt_propagation')
 
         # 4. Recipe adoption
         try:
@@ -312,7 +318,7 @@ class IPService:
                                       'staleness check before probabilistic re-creation',
                     })
         except Exception:
-            pass
+            result['failed_checks'].append('recipe_adoption')
 
         # 5. HiveMind agents
         try:
@@ -330,7 +336,7 @@ class IPService:
                                   'new nodes with collective knowledge instantly',
                 })
         except Exception:
-            pass
+            result['failed_checks'].append('hivemind_agents')
 
         return result
 

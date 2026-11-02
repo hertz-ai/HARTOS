@@ -2473,6 +2473,39 @@ def seed_bootstrap_goals(db, platform_product_id: Optional[str] = None) -> int:
 REMEDIATION_COOLDOWN_MINUTES = 60
 
 
+def remediation_still_open(loophole_type):
+    """Why a remediation goal for ``loophole_type`` is not done, or None when
+    it is: the loop health check ran in full and no longer reports that
+    loophole.
+
+    The completion test for a goal auto_remediate_loopholes seeded (its
+    config 'remediation'), read by the daemon's one completion gate
+    (agent_daemon._settle_dispatched_goal).  Spend on a turn shows the
+    remediation ran, not that it worked: measured on central 2026-11-02, 269
+    'Remediate Single Node' goals completed on about 4 spark each while
+    central stayed one node, and every completion let the next re-seed in.
+
+    get_loop_health swallows each check's error, so a check that failed
+    reports no loophole.  A loophole that is missing while any check failed
+    is therefore "not confirmed", never "fixed".
+    """
+    from .ip_service import IPService
+    try:
+        health = IPService.get_loop_health()
+    except Exception as e:
+        return f"the loop health check could not run ({type(e).__name__})"
+    for loophole in health.get('flywheel_loopholes') or []:
+        if loophole.get('type') == loophole_type:
+            detail = loophole.get('message')
+            return (f"the loophole '{loophole_type}' is still reported"
+                    + (f" ({detail})" if detail else ''))
+    failed = health.get('failed_checks') or []
+    if failed:
+        return ("the loop health check could not confirm it: "
+                f"{', '.join(failed)} failed")
+    return None
+
+
 def auto_remediate_loopholes(db) -> int:
     """Check flywheel loopholes and create remediation goals for severe ones.
 

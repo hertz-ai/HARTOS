@@ -771,7 +771,10 @@ def _settle_dispatched_goal(db, goal, goal_key, served_escalation=None,
       awaiting_verification — spark spent, work genuinely in flight; no noop
                               strike, bounded by HEVOLVE_GOAL_VERIFY_TIMEOUT_S
       noop                  — no new spark at all; unchanged 5-strike pause
-    Continuous goals still never auto-complete.
+    Continuous goals still never auto-complete.  A remediation goal (config
+    'remediation') that would complete is checked against its loophole
+    first: still reported, or not confirmable, and it is paused with cause
+    remediation_open instead (goal_seeding.remediation_still_open).
 
     ``handed_to_hive`` (dispatch.handed_to_hive): the dispatch gave the goal
     to the coordinator, so it returned before any work existed and "this
@@ -901,7 +904,39 @@ def _settle_dispatched_goal(db, goal, goal_key, served_escalation=None,
         outcome = 'awaiting' if grounded is False else 'completed'
     else:
         outcome = 'noop'
-    if outcome == 'awaiting':
+    # Spend is necessary, not sufficient, for a goal that names its own test.
+    # A remediation goal (seeded by goal_seeding.auto_remediate_loopholes,
+    # config 'remediation') is done only when its loophole is gone; its turn
+    # costing spark shows only that it ran.  269 of them completed on central
+    # 2026-11-02 while the loophole stayed, and each completion let the next
+    # hourly re-seed in.  Goals without a test settle exactly as before.
+    still_open = None
+    if outcome == 'completed' and cfg.get('remediation'):
+        from .goal_seeding import remediation_still_open
+        still_open = remediation_still_open(cfg['remediation'])
+        if still_open:
+            outcome = 'remediation_open'
+    if outcome == 'remediation_open':
+        # Paused, not left active: an active goal is dispatched again on the
+        # next tick, and re-running a remediation whose loophole is still
+        # there spends again for nothing.  A paused one also blocks the
+        # hourly re-seed (auto_remediate_loopholes skips active and paused
+        # goals of the same type).  It did work, so the noop trail goes.
+        cfg.pop('noop_dispatch_count', None)
+        cfg.pop('awaiting_verification_since', None)
+        cfg.pop('spark_at_handoff', None)
+        from .goal_manager import GoalManager, PAUSE_CAUSE_REMEDIATION_OPEN
+        _res = GoalManager.pause_goal(
+            db, goal, cause=PAUSE_CAUSE_REMEDIATION_OPEN, by='daemon',
+            reason=(f'Paused: its remediation ran, but {still_open}.  It is '
+                    f'done only when the loophole is gone.'),
+            config=cfg)
+        cfg = _res.get('config', cfg)
+        if _res.get('success'):
+            logger.warning(f"Goal {goal_key} PAUSED, not completed: "
+                           f"{still_open}")
+        goal.config_json = cfg
+    elif outcome == 'awaiting':
         # In flight. Not a noop — do not touch the noop counter, and do
         # not re-spin the goal — but do not sit here silently forever
         # either: the pause below is the bound.

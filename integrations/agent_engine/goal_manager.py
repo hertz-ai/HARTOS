@@ -197,6 +197,7 @@ PAUSE_CAUSE_BUDGET = 'budget'                         # the budget gate
 PAUSE_CAUSE_NEEDS_HELP = 'needs_help'                 # escalate_goal: a person's hand
 PAUSE_CAUSE_PERSON = 'person'                         # the dashboard's pause verb
 PAUSE_CAUSE_NO_OWNER = 'no_owner_to_ask'              # the consent gate: nobody to ask
+PAUSE_CAUSE_REMEDIATION_OPEN = 'remediation_open'     # the settlement gate: the loophole is still there
 
 #: The pause record: what GoalManager.pause_goal and its writers set on a
 #: paused goal, and what resume_goal moves to its last_* history keys.  One
