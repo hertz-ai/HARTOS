@@ -183,3 +183,114 @@ def test_try_another_is_also_bounded(monkeypatch):
 
     assert elapsed < s.REVEAL_WAIT_S + 2.0, \
         "'try another' blocked %.2fs" % elapsed
+
+
+# ── the steps Nunba's ceremony sends reach the prewarm ───────────────────────
+#
+# Nunba's ceremony drives this session through /api/hart/advance.  It used to
+# send only select_language and the two answers, never the bare steps for the
+# greeting and the two acknowledgements, so the greeting branch swallowed the
+# passion answer, the escape answer landed in 'passion', and _start_prewarm
+# never ran.  These tests drive a REAL session with the ceremony's steps.
+
+CEREMONY_STEPS_TO_ESCAPE = [
+    ('select_language', {'language': 'en', 'locale': 'en_US'}),
+    (None, None),                                     # greeting -> passion
+    ('answer', {'key': 'building_coding'}),           # passion -> ack_passion
+    (None, None),                                     # ack_passion -> escape
+    ('answer', {'key': 'nature_open'}),               # escape -> ack_escape
+]
+
+
+def _named(name, *others):
+    return {'name': name, 'candidates': [name, *others], 'dimensions': {},
+            'emoji_combo': 'x', 'element': '', 'spirit': '',
+            'hart_tag': '@' + name}
+
+
+def test_the_ceremony_steps_start_the_prewarm_with_both_answers(monkeypatch):
+    seen = []
+
+    def _gen(*a, **k):
+        seen.append(dict(k))
+        return _named('modelname', 'backup')
+
+    monkeypatch.setattr(ho, 'generate_hart_name', _gen)
+    s = ho.HARTOnboardingSession('ceremony-key')
+    for action, data in CEREMONY_STEPS_TO_ESCAPE:
+        s.advance(action=action, data=data)
+
+    assert s.phase == 'ack_escape'
+    assert s._prewarm_thread is not None, "the escape answer must start it"
+    s._prewarm_thread.join(2)
+    model_calls = [k for k in seen if k.get('use_llm')]
+    assert model_calls and model_calls[0]['passion_key'] == 'building_coding'
+    assert model_calls[0]['escape_key'] == 'nature_open'
+
+
+def test_the_reveal_answers_with_the_name_and_its_backups(monkeypatch):
+    monkeypatch.setattr(ho, 'generate_hart_name',
+                        lambda *a, **k: _named('modelname', 'backup1', 'backup2'))
+    s = ho.HARTOnboardingSession('ceremony-key')
+    for action, data in CEREMONY_STEPS_TO_ESCAPE:
+        s.advance(action=action, data=data)
+    s.advance()                                       # ack_escape -> pre_reveal
+    out = s.advance()                                 # pre_reveal -> reveal
+
+    assert out['phase'] == 'reveal'
+    assert out['hart_name'] == 'modelname'
+    assert out['hart_tag'] == '@modelname'
+    assert out['candidates'] == ['backup1', 'backup2'],         "the client seals through /api/hart/seal and needs the backups for a 409"
+
+
+def test_one_model_call_per_session_however_often_it_is_asked(monkeypatch):
+    """A second prewarm while one is cooking starts no second model thread,
+    so a slow model holds one llama-server slot per ceremony, not one per call."""
+    release = threading.Event()
+    calls = []
+
+    def _slow(*a, **k):
+        calls.append(1)
+        release.wait(5)
+        return _named('modelname')
+
+    monkeypatch.setattr(ho, 'generate_hart_name', _slow)
+    s = _session()
+    s._start_prewarm()
+    s._start_prewarm()
+    time.sleep(0.2)
+    release.set()
+    s._prewarm_thread.join(2)
+    assert len(calls) == 1
+
+
+def test_try_another_never_offers_the_declined_name_as_a_backup(monkeypatch):
+    monkeypatch.setattr(ho, 'generate_hart_name',
+                        lambda *a, **k: _named('first', 'second', 'third'))
+    s = _session()
+    s._start_prewarm()
+    s._prewarm_thread.join(2)
+    first = s._do_reveal()
+    assert first['hart_name'] == 'first'
+
+    again = s._do_reveal(alternative=True)
+    assert again['hart_name'] == 'second'
+    assert 'first' not in again['candidates'], \
+        "the name the person turned down must not come back as a seal backup"
+    assert again['candidates'] == ['third']
+
+
+def test_a_model_failure_is_logged_where_it_can_be_seen(monkeypatch, caplog):
+    def _boom(*a, **k):
+        if k.get('use_llm'):
+            raise RuntimeError('llama-server went away')
+        return _named('curated')
+
+    monkeypatch.setattr(ho, 'generate_hart_name', _boom)
+    s = _session()
+    with caplog.at_level('WARNING', logger=ho.logger.name):
+        s._start_prewarm()
+        s._prewarm_thread.join(2)
+    failures = [r for r in caplog.records if 'prewarm failed' in r.getMessage()]
+    assert failures and failures[0].levelname == 'WARNING'
+    assert s._do_reveal()['hart_name'] == 'curated'
