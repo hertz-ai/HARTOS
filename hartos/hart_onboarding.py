@@ -1858,7 +1858,9 @@ class HARTOnboardingSession:
                     use_llm=True,
                 )
             except Exception:
-                logger.debug("HART name prewarm failed", exc_info=True)
+                # The reveal still hands over a curated name; say why the
+                # model's did not land (a dead llama-server looks like this).
+                logger.warning("HART name prewarm failed", exc_info=True)
                 r = None
             with self._prewarm_lock:
                 # A 'try another' restarts the prewarm; a straggler from the
@@ -1901,6 +1903,8 @@ class HARTOnboardingSession:
 
         if result is None:
             # Nothing landed in time. Hand over a curated name NOW.
+            logger.info("HART reveal: no model name within the %.1fs grace "
+                        "period, revealing a curated name", self.REVEAL_WAIT_S)
             result = generate_hart_name(
                 language=self.language,
                 passion_key=self.passion_key or 'reading_learning',
@@ -1911,10 +1915,11 @@ class HARTOnboardingSession:
                 use_llm=False,
             )
 
+        declined = None
         if alternative and self.generated_name:
             # Pick a different candidate
-            prev = self.generated_name['name']
-            candidates = [c for c in result['candidates'] if c != prev]
+            declined = self.generated_name['name']
+            candidates = [c for c in result['candidates'] if c != declined]
             if candidates:
                 result['name'] = candidates[0]
 
@@ -1931,6 +1936,11 @@ class HARTOnboardingSession:
             element=result.get('element', ''),
             spirit=result.get('spirit', ''),
             emoji_combo=result['emoji_combo'],
+            # The other candidates, so a client that seals through
+            # /api/hart/seal can try the next one when a name is taken (409).
+            # Never the name the person just turned down with 'try another'.
+            candidates=[c for c in result.get('candidates', [])
+                        if c not in (result['name'], declined)],
             animation_hint='name_reveal',
             can_try_another=not alternative,  # only one retry allowed
         )
