@@ -158,8 +158,20 @@ _VLM_PRESERVED_CONTRACT_FIELDS = (
 )
 
 
-def _action_persona(action, role):
+def _action_persona(action, role, declared_personas=None):
     """Owner of a recipe action, defaulting to the role this turn runs as.
+
+    `declared_personas` is the agent record's `personas` list (names).  The
+    `persona` field has three producers with three vocabularies: the trace
+    bank wrote the create group's AGENT name ('Executor'), the VLM path writes
+    'user<id>', the model-written recipe writes the flow persona.  MEASURED
+    live 2026-10-30 17:09:43 (agent 1793359802508, flow persona 'Speech
+    Companion', 9 actions): 8 x 'Executor' failed the role filter below and
+    the ledger ran ONE action; the len(role_actions)==0 fallback only fires
+    when nothing matches.  A persona is a name the agent DECLARES; any other
+    value in the field is a producer's bookkeeping and the action belongs to
+    the flow's role, exactly like a missing persona.  Without a declared list
+    (legacy records, other call sites) the explicit value still wins.
 
     `persona` is OPTIONAL in a saved action.  MEASURED live 2026-09-10 on the
     installed build: create wrote actions 4 and 5 of agent 28160128202 with no
@@ -181,7 +193,9 @@ def _action_persona(action, role):
     if isinstance(action, dict):
         _p = action.get('persona')
         if _p:
-            return str(_p)
+            _names = {str(n).strip().lower() for n in (declared_personas or []) if n}
+            if not _names or str(_p).strip().lower() in _names:
+                return str(_p)
     return str(role or '')
 
 
@@ -604,11 +618,38 @@ def response_format_template() -> str:
     return (
         '{"message2userfinal": "Your message here", '
         '"%s": [{"type": "image|video|html", "url": "/uploads/..."}]}'
-        ' -- "%s" is OPTIONAL. Include it ONLY to show the person a file, and'
-        ' ONLY with a url a tool gave you. Omit it entirely if you have none.'
-        ' A url you write yourself is dropped and the person never sees it.'
+        ' %s is optional; use only a /uploads path from a tool result,'
+        ' others are dropped.'
         % (MEDIA_REPLY_KEY, MEDIA_REPLY_KEY)
     )
+
+
+def _carry_reply_media(user_id, json_obj, prompt_id, request_id):
+    """Put the media an agent named on its answer into her outbox.
+
+    The reply needs no new field: _chat_reply already takes this turn's
+    outbox with chat_attachments.take_outbound and puts it on the reply as
+    ``media`` (hart_intelligence_entry.py:9024).  So landing the files here
+    IS delivering them, on the path a reel has used since reel_studio.
+
+    Added because 19836e605 offered ``media`` at six prompt sites and only
+    ONE reader honoured it.  get_agent_response returned message2userfinal
+    alone, so the MAIN /chat answer -- a book page being exactly the case --
+    dropped every item, with media_items_for called zero times.
+
+    Never the reason an answer fails: a raise here would cost the person
+    their words for the sake of a picture.
+    """
+    try:
+        refs = (json_obj or {}).get(MEDIA_REPLY_KEY)
+        if not refs:
+            return []
+        from hartos.helper import media_items_for
+        return media_items_for(user_id, refs, prompt_id=prompt_id,
+                               request_id=request_id)
+    except Exception as e:
+        _ctx_safe_log('warning', f"reply media skipped: {e}")
+        return []
 
 
 def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_delay=50,
@@ -1033,7 +1074,7 @@ def visual_based_execution(task_description: str, user_id: int, prompt_id: int):
             Note: Visual input is available because the user's camera is ON.
             <Last_{minutes}_Minutes_Visual_Context_End>: {actions}
             If the user needs to be informed (e.g., task completed, input needed, error), respond in this exact JSON format:
-            {{"message2userfinal": "Your clear and useful message here"}}
+            {response_format_template()}
             Only send this if you have something meaningful to say.
             Do not interrupt the user unless they have asked for a response or the task cannot proceed without their input.
             You must now perform this task: {task_description}'''
@@ -1454,6 +1495,12 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
         # (Lever 2, owner 2026-09-01).  Absent on legacy records — the
         # gate below then resolves to pure detection, exactly as before.
         stored_goal_tags = config.get('goal_tags')
+        # The names this agent declares as personas: the only values of an
+        # action's `persona` field that mean "another role's action".  See
+        # _action_persona.
+        declared_personas = [
+            p.get('name') for p in (config.get('personas') or [])
+            if isinstance(p, dict) and p.get('name')]
 
     current_app.logger.info(f'Got goal as {goal}')
     role_actions = []
@@ -1475,11 +1522,11 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
             f"[VLM-MERGE] {len(vlm_actions)} override(s); actions "
             f"{_before} -> {len(recipes[user_prompt]['actions'])}, "
             f"persona-matching role {role!r}: "
-            f"{sum(1 for a in recipes[user_prompt]['actions'] if _action_persona(a, role).lower() == str(role or '').lower())}")
+            f"{sum(1 for a in recipes[user_prompt]['actions'] if _action_persona(a, role, declared_personas).lower() == str(role or '').lower())}")
 
     current_app.logger.info(f'Getting role actions')
     for i in recipes[user_prompt]['actions']:
-        _persona = _action_persona(i, role)
+        _persona = _action_persona(i, role, declared_personas)
         current_app.logger.info(f'this is action persona:{_persona} ')
         if _persona.lower() == str(role or '').lower():
             role_actions.append(i)
@@ -3989,8 +4036,10 @@ def _reuse_is_pipeline_text(content):
             # untouched (it carries no braces, by its own design note).  So
             # one marker covers both producers and survives the formatting.
             # It is defined further down, beside the steers that emit it —
-            # resolved at call time like every other global here.
-            or _REUSE_SYNTHESIS_ANSWER_SHAPE in _c)
+            # resolved at call time like every other global here.  Keyed on
+            # the shape's value clause, the part every wording has carried
+            # (see _REUSE_SYNTHESIS_ANSWER_VALUE).
+            or _REUSE_SYNTHESIS_ANSWER_VALUE in _c)
 
 # Recorded in _reuse_fab_pending when the thing that did not happen is not a
 # tool run but the ACTION'S OWN TEXT.  Angle brackets, so _TOOL_IDENT_RE can
@@ -4889,12 +4938,35 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
 #
 # Keeps the message2userfinal name (get_agent_response unwraps it, #797/D31)
 # and carries no braces, so .format(unrun=...) below stays safe.
-_REUSE_SYNTHESIS_ANSWER_SHAPE = (
-    "Address your reply to @user, and send one JSON object whose only key is "
-    "message2userfinal and whose value is the answer itself, written out as "
-    "sentences the user will read. Substitute the real text — a placeholder, "
-    "an empty value, or anything in angle brackets is not an answer."
+#
+# _REUSE_SYNTHESIS_ANSWER_VALUE: the clause every wording of the shape has
+# carried, and what _reuse_is_pipeline_text keys on.  e0661827a reworded the
+# part before it
+# ("only key" -> "answer key"), and the recogniser, keyed on the whole shape,
+# then let the 2026-09-10 steer the user received pass as an answer again
+# (tests/unit/test_reuse_never_delivers_its_own_steer.py, red from 10-25).  A
+# steer written before a rewording still sits in stored conversations, so the
+# marker is the part a rewording of the key leaves alone.
+_REUSE_SYNTHESIS_ANSWER_VALUE = (
+    "and whose value is the answer itself, written out as sentences the user "
+    "will read. Substitute the real text — a placeholder, an empty value, or "
+    "anything in angle brackets is not an answer."
 )
+_REUSE_SYNTHESIS_ANSWER_SHAPE = (
+    "Address your reply to @user, and send one JSON object whose answer key is "
+    "message2userfinal " + _REUSE_SYNTHESIS_ANSWER_VALUE
+)
+# "only key" until 19836e605's review: it contradicted the reply schema,
+# which now also offers `media`.  "answer key" leaves room for it.
+#
+# SAYS NOTHING ABOUT MEDIA, deliberately, and e0661827a got this wrong: it
+# appended "Attach no media here: nothing ran that could ground a file" to
+# THIS shared text, which both steers end with -- including
+# _REUSE_SYNTHESIS_STEER, which fires when the tools DID all run.  So it
+# forbade media on the one path where media is grounded, and the comment
+# justifying it ("fires exactly when the action's tools did not run") was
+# contradicted by its own use at :4962.  The rule belongs to the INCOMPLETE
+# steer alone, and lives there now.
 
 # "using the real tool results from this conversation" WAS A FALSE PREMISE
 # whenever the tools ran and returned NOTHING, and this file already records
@@ -4959,8 +5031,22 @@ _REUSE_SYNTHESIS_STEER_INCOMPLETE = (
     "for the user now, in your own words: report what WAS actually done, "
     "using only the real tool results present in this conversation, and say "
     "plainly which part could not be completed. Do not describe unexecuted "
-    "work as done. " + _REUSE_SYNTHESIS_ANSWER_SHAPE
+    "work as done. Attach no media: this turn did not finish, so no file in "
+    "it is vouched for. " + _REUSE_SYNTHESIS_ANSWER_SHAPE
 )
+# The media rule is HERE and not in the shared shape, because only this
+# branch knows the turn is incomplete.  Why it exists: an image beside an
+# answer nothing grounded is read as evidence FOR it, and this is the
+# branch behind "4000" where the page said 47.3 (measured 12:07 2026-10-25).
+#
+# WORDED FOR WHEN IT ACTUALLY FIRES.  bc93648fa said "nothing ran here that
+# could ground a file", and that was still false: the gate is `_unrun OR
+# _unfinished` (:5221), so this steer also reaches a turn whose EARLIER
+# actions ran their tools -- the same message would then say "report what
+# WAS actually done using the real tool results" and "nothing ran". It
+# claims only what the gate knows: the turn did not finish.
+#
+# No braces, so .format(unrun=...) stays safe.
 
 
 # THE HONEST ANSWER WHEN THE LOOKUP FOUND NOTHING.  Authored here, not asked
@@ -6498,6 +6584,7 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                         # had just done and saved (#797/D31, #803/D37).  What
                         # else the answer is sent through, and why the desktop
                         # gets nothing else: _reuse_answer_off_box.
+                        _carry_reply_media(user_id, json_obj, prompt_id, request_id)
                         _reuse_answer_off_box(
                             user_id, json_obj['message2userfinal'], prompt_id)
                         return json_obj['message2userfinal']
@@ -6638,6 +6725,7 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
             try:
                 json_obj = retrieve_json(last_message['content'])
                 if json_obj and 'message2userfinal' in json_obj:
+                    _carry_reply_media(user_id, json_obj, prompt_id, request_id)
                     last_message['content'] = json_obj['message2userfinal']
                     return last_message['content']
 

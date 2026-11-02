@@ -146,7 +146,12 @@ _PERSON_IP_SEGMENTS = frozenset({'client', 'remote', 'user', 'source',
 # 'private_mode' are protocol, not secrets.
 _SECRET_KEY_WORDS = ('secret', 'password', 'passwd', 'pwd', 'pass', 'token',
                      'api_key', 'apikey', 'access_key', 'private_key',
-                     'credential', 'credentials', 'cookie')
+                     'secret_key', 'credential', 'credentials', 'cookie')
+# A name glued into one word ('accesstoken', 'clientsecret', 'secretkey')
+# ends in a secret word this long or longer; a shorter one ('pass', 'pwd',
+# 'pin', 'otp') ends too many everyday names glued ('compass',
+# 'boardingpass', 'spin'), so it counts only as a word of its own.
+_GLUED_WORD_MIN = 5
 _CONTACT_KEY_WORDS = ('email', 'phone', 'mobile', 'cell', 'ssn')
 # A secret-keyed value that says there is no secret stays readable.
 _SECRET_STATUS_WORDS = frozenset({
@@ -180,10 +185,40 @@ _PERSON_PLACEHOLDER = re.compile(r'\[(?!IP_)[A-Z_]+_REDACTED\]')
 _CONTENT, _EXEMPT, _CONTACT, _SECRET = 'content', 'exempt', 'contact', 'secret'
 
 
-def _is_secret_key(key: str) -> bool:
-    if {'password', 'passwd', 'pwd'}.intersection(key.split('_')):
+def secret_key_form(name: str) -> str:
+    """``name`` as is_secret_key reads it: lowercase, split into words where
+    camelCase or an acronym ends, and every run of other characters, digits
+    too, one underscore ('userPassword' -> 'user_password', 'DBPassword' ->
+    'db_password', 'APIToken' -> 'api_token', 'API-Key' -> 'api_key',
+    'password2' -> 'password', 'otp1' -> 'otp').  A number in a name counts
+    fields; it is not a word of the name."""
+    name = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1_\2', str(name or ''))
+    name = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', name)
+    return re.sub(r'[^a-z]+', '_', name.lower()).strip('_')
+
+
+def is_secret_key(key: str, extra: Tuple[str, ...] = ()) -> bool:
+    """Is a lowercase, underscore-separated name (secret_key_form) a
+    secret's?  The one rule: what a scrub withholds here, and what person_ask
+    refuses to ask for.  ``extra`` are a caller's own words, matched like the
+    secret key words (the whole name or its last word), so a caller extends
+    this rule instead of keeping a second list.
+
+    A name glued into one word is read too ('newpassword', 'accesstoken',
+    'otpcode' for a caller whose words hold 'otp_code'): a password word
+    anywhere in a word of it, or a secret word of _GLUED_WORD_MIN letters or
+    more at the end of its last word.  The egress scrub meets 'accessToken'
+    as 'accesstoken', so this is the spelling it reads."""
+    words = _SECRET_KEY_WORDS + tuple(extra)
+    segments = key.split('_')
+    if {'password', 'passwd', 'pwd'}.intersection(segments):
         return True                              # password_hash, pwd_salt
-    return any(key == w or key.endswith('_' + w) for w in _SECRET_KEY_WORDS)
+    if any(key == w or key.endswith('_' + w) for w in words):
+        return True
+    if any('password' in s or 'passwd' in s for s in segments):
+        return True                              # newpassword, passwordhash
+    glued = {w.replace('_', '') for w in words}
+    return any(segments[-1].endswith(g) for g in glued if len(g) >= _GLUED_WORD_MIN)
 
 
 def _is_contact_key(key: str) -> bool:
@@ -250,7 +285,7 @@ def _leaf_policy(key: Any, value: str, gossip: bool) -> str:
     lk = key.lower()
     if _is_contact_key(lk):
         return _CONTACT
-    if _is_secret_key(lk):
+    if is_secret_key(lk):
         if gossip and lk in _GOSSIP_SECRET_KEYS:
             return _EXEMPT
         return _SECRET

@@ -20,9 +20,16 @@ timeout-bounded, exception-swallowing fetch), and the same never-raise
 best-effort contract.  The only structural difference is WHICH central service
 holds the data: the FCM token lives at ``HART_FCM_REGISTRY`` (mailer), but the
 full profile (name / email / phone / preferred_language) lives in the central
-account store (Hevolve_Database), reached via the SAME env keys the up-sync
-drain resolves its parent with — ``SyncEngine.parent_tier_url()`` — so "where
-is central" has ONE resolver, not a second invented here.
+account store (Hevolve_Database), reached through the one account-store
+resolver, ``core.config_cache.get_central_db_url()``.  It used to reuse the
+up-sync drain's ``SyncEngine.parent_tier_url()``, which names the hive PARENT
+(a HARTOS node, central.hevolve.ai), not the account store: measured from
+central 2026-10-26, that host answered 404 for the owner's account 10202
+while the account store answered 200, so no account ever arrived.
+
+The social DB and the account store are separate databases, and an account
+belongs in both under the same id (owner, 2026-10-26).  ``sync_owner_account``
+is the boot trigger that copies the node's own owner across.
 
 GATE (only the user's OWN profile): ``sync_profile`` takes a SINGLE
 ``central_user_id`` and feeds a SINGLE ``sync_user`` payload to the receiver —
@@ -40,18 +47,12 @@ logger = logging.getLogger('hevolve.profile_sync')
 
 def _central_url():
     """Base URL of the central account store (Hevolve_Database) this node pulls
-    a profile from.  REUSES the same env resolution the up-sync drain uses
-    (``SyncEngine.parent_tier_url`` → HEVOLVE_CENTRAL_URL, else
-    HEVOLVE_REGIONAL_URL) so there is ONE "where is my parent" source, not a
-    second.  Empty on a flat/standalone node (no central → no down-sync)."""
-    try:
-        from integrations.social.sync_engine import SyncEngine
-        return (SyncEngine.parent_tier_url() or '').rstrip('/')
-    except Exception:
-        # Fall back to the raw env keys if the sync engine import is unavailable
-        # (keeps the resolver identical, just without the indirection).
-        return (os.environ.get('HEVOLVE_CENTRAL_URL', '')
-                or os.environ.get('HEVOLVE_REGIONAL_URL', '')).rstrip('/')
+    a profile from: ``core.config_cache.get_central_db_url()``, the one
+    resolver for that service (HEVOLVE_CENTRAL_DB_URL, else the Kong-routed
+    default).  Empty when the operator set HEVOLVE_CENTRAL_DB_URL='' (no
+    account store, so no down-sync)."""
+    from core.config_cache import get_central_db_url
+    return (get_central_db_url() or '').rstrip('/')
 
 
 def build_user_sync_payload(local_user_id, central_user_id, central_resp):
@@ -164,3 +165,27 @@ def sync_profile(local_user_id, central_user_id):
         logger.debug("sync_profile(%s→%s) failed: %s",
                      central_user_id, local_user_id, e)
         return False
+
+
+def sync_owner_account():
+    """Copy this node's owner account (HEVOLVE_OWNER_USER_ID) from the account
+    store into the social DB, under the SAME id.
+
+    Every ask a node files (consent, credential, setup) is addressed to its
+    owner, so the owner must exist in the social DB.  Measured on central
+    2026-10-26: owner 10202 had no social row, so its five pending asks were
+    addressed to nobody.  One account, by the node's own configuration, never
+    a list.  Returns ``sync_profile``'s answer, or False when the node has no
+    owner (nothing is asked).  Never raises.
+    """
+    owner = (os.environ.get('HEVOLVE_OWNER_USER_ID') or '').strip()
+    if not owner:
+        return False
+    synced = sync_profile(owner, owner)
+    if not synced:
+        logger.warning(
+            "profile_sync: the owner account %s did not reach the social DB "
+            "(account store %s unreachable or has no such account); asks to "
+            "the owner stay unaddressed until it does", owner,
+            _central_url() or '<disabled>')
+    return synced

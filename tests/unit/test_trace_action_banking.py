@@ -88,6 +88,22 @@ class TestTraceBanking:
         assert 'query revenue' in data['recipe'][0]['steps']
         assert data['action'] == 'synthesize weekly recap'
 
+    def test_a_banked_action_carries_no_agent_name_as_its_persona(self, banked):
+        """'Executor' is the create group's AGENT, not a persona. Reuse filters
+        actions by persona == the flow's role, so the stamp dropped 8 of 9
+        Syllable Coach actions out of the ledger (2026-10-30 17:09:43,
+        "[REUSE-LEDGER] tasks=1 actions=1"). An empty persona means "owned by
+        the flow", which is what reuse_recipe._action_persona resolves it to."""
+        ok, data, _ = banked([
+            {'content': 'Execute Action 2: synthesize weekly recap'},
+            {'tool_calls': [{'function': {
+                'name': 'execute_windows_or_android_command',
+                'arguments': '{"instructions": "query revenue"}'}}]},
+            {'content': 'numbers retrieved'},
+        ])
+        assert ok is True
+        assert data['persona'] == ''
+
     def test_only_this_actions_window_counts(self, banked):
         """Tool calls BEFORE the action's Execute message belong to earlier
         actions and must not leak into this action's recipe."""

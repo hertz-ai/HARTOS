@@ -37,12 +37,19 @@ def is_commerce_action(action) -> bool:
 def approver_from_request(req) -> Optional[str]:
     """Whose Bearer token this is, or None -- never a body field.
 
-    A HARTOS JWT (what /api/commerce/session issues and /chat accepts) is
-    decoded locally; anything else goes through
-    integrations.social.auth.user_id_for_token (a hive JWT or a stored
-    api_token, e.g. a cloud login on a desktop).  A node API key names no
-    person, so it answers None.
+    A phone the owner allowed is the user its token names: the API gate
+    verified that token and set the device verdict (security.middleware,
+    ``g.auth_source == 'device'``; only the gate sets it), the way /chat
+    reads it.  A verdict without a user names nobody.  A HARTOS JWT (what
+    /api/commerce/session issues and /chat accepts) is decoded locally;
+    anything else goes through integrations.social.auth.user_id_for_token (a
+    hive JWT or a stored api_token, e.g. a cloud login on a desktop).  A node
+    API key names no person, so it answers None.
     """
+    from flask import g, has_request_context
+    if has_request_context() and getattr(g, 'auth_source', None) == 'device':
+        uid = (getattr(g, 'jwt_payload', None) or {}).get('user_id')
+        return str(uid) if uid else None
     auth = req.headers.get('Authorization', '')
     if not auth.startswith('Bearer '):
         return None

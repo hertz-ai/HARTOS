@@ -75,6 +75,12 @@ MAIN_LEG_CORE_TOOLS = frozenset({
     # silently dropped for the main leg.
     'list_books', 'list_book_chapters', 'read_book_page',
     'read_book_chapter', 'parse_book_pdf',
+    # The person's answer on any of their devices (a file_request for the
+    # clips a step needs, a form, a choice): integrations.agent_engine.
+    # person_ask.  On the main leg because the step that needs the person is
+    # a recipe action; like send_message_to_user it only puts something in
+    # front of the person, and it refuses to ask for a secret.
+    'ask_person',
 })
 
 # The closures the CREATE leg registers always-on, on top of

@@ -172,7 +172,7 @@ class TheCentralHostIsCanonicalised(unittest.TestCase):
     def test_no_regression_in_either_composed_value(self):
         from core.config_cache import _DEFAULT_CENTRAL_DB_URL
         self.assertEqual('ws://azurekong.hertzai.com:8088/ws', DEFAULT_ROUTER_URL)
-        self.assertEqual('https://azurekong.hertzai.com:8443/db', _DEFAULT_CENTRAL_DB_URL)
+        self.assertEqual('https://azurekong.hertzai.com/db', _DEFAULT_CENTRAL_DB_URL)
 
 
 class UnifyingTheHostDidNotCostTheFlexibility(unittest.TestCase):
