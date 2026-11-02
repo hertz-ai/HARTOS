@@ -25,7 +25,7 @@ import tempfile
 os.environ['HEVOLVE_DB_PATH'] = ':memory:'
 os.environ.setdefault('HEVOLVE_CACHE_DIR', tempfile.mkdtemp())
 
-from unittest.mock import MagicMock, patch  # noqa: E402
+from unittest.mock import MagicMock  # noqa: E402
 
 import pytest  # noqa: E402
 
@@ -34,6 +34,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
 
 from integrations.social.consent_service import ConsentService, device_scope  # noqa: E402
 from integrations.social.models import Base, User, db_session, get_engine  # noqa: E402
+from tests.unit.module_swap import swap_modules  # noqa: E402
 from tests.unit.test_device_access_gate import Phone  # noqa: E402
 
 LAN = {'REMOTE_ADDR': '192.168.0.164'}
@@ -107,7 +108,7 @@ def _answer(hie, monkeypatch, phone, body):
     monkeypatch.setitem(hie.app.config, 'PROPAGATE_EXCEPTIONS', True)
     secrets = {'security.secrets_manager': MagicMock(
         get_secret=lambda name: os.environ.get(name, ''))}
-    with patch.dict(sys.modules, secrets):
+    with swap_modules(secrets):
         return hie.app.test_client().post(
             '/api/agent/approval', json=body, environ_base=LAN,
             headers={'Authorization': f'Bearer {phone.token()}'})
