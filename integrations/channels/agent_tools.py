@@ -183,13 +183,41 @@ def chat_connect_blocker(channel_type: str, meta: dict = None):
     return None
 
 
+#: Marks an admin channel entry that exists only to hold the channel's
+#: announcement target: the channel runs from the environment or a saved
+#: binding, which start it at boot.  The boot loop that activates admin
+#: entries (hartos_bootstrap) skips it, and register_channel drops the mark
+#: when it writes the channel's own config.
+ANNOUNCE_ONLY_KEY = 'announce_only'
+
+
+def _running_here(channel_type: str) -> bool:
+    """Whether a live adapter for ``channel_type`` is registered."""
+    try:
+        from integrations.channels.flask_integration import get_channel_integration
+        return get_channel_integration().registry.get(channel_type) is not None
+    except Exception:
+        return False
+
+
 def set_announcement_target(channel_type: str, chat_id: str, user_id=None) -> str:
     """Set where announcements for ``channel_type`` are posted: the
     channel's ``announce_chat_id``, which announcement_broadcaster's
-    destination rule reads.  Refuses a private one-to-one chat with no
-    subscription (unsolicited messaging, whoever configured it).  Returns
-    what happened, in words.  The one writer: the set_announcement_channel
-    tool and post_to_channel (with the owner's answer) call it.
+    destination rule reads.  Returns what happened, in words.  The one
+    writer in code: the set_announcement_channel tool and post_to_channel
+    (with the owner's answer) call it.  Not yet the admin page's PUT
+    /api/admin/channels/<type>, which merges any key, this one included,
+    without this check (task #222); the broadcaster applies the same rule
+    at send time, so a target written there that this would refuse is
+    refused at send, never used.
+
+    Refuses exactly what the broadcaster would refuse at send time
+    (announcement_broadcaster.needs_subscription with no subscription
+    record), so "set" means it will be used.  A channel running here with no
+    admin entry (started from the environment or a saved binding) gets one
+    that only holds the target (ANNOUNCE_ONLY_KEY); before that, the owner's
+    answer for such a channel was dropped as "not registered" and they were
+    asked again on every post (review of f8fdb9c64, H1).
 
     Setting a destination is deliberately NOT authorising broadcast: with
     public_exposure consent absent, a configured destination still sends
@@ -198,7 +226,7 @@ def set_announcement_target(channel_type: str, chat_id: str, user_id=None) -> st
     post publicly is the fail-closed gate flipping its own switch.
     """
     from integrations.channels.announcement_broadcaster import (
-        destination_shape, is_subscribed)
+        is_subscribed, needs_subscription)
     from integrations.channels.admin.api import get_api
 
     channel_type = (channel_type or '').strip().lower()
@@ -206,22 +234,35 @@ def set_announcement_target(channel_type: str, chat_id: str, user_id=None) -> st
     if not channel_type or not chat_id:
         return "Both channel_type and chat_id are required."
 
-    shape = destination_shape(channel_type, chat_id)
-    if shape == 'one_to_one' and not is_subscribed(channel_type, chat_id):
-        return (f"Refused: {chat_id} is a private one-to-one chat on "
-                f"{channel_type}. Announcements go to groups or channels "
-                f"people joined, not to individuals who did not ask. "
-                f"Use a group id (Telegram groups are negative; WhatsApp "
-                f"groups end in @g.us).")
+    if needs_subscription(channel_type, chat_id) and not is_subscribed(
+            channel_type, chat_id):
+        if channel_type == 'telegram':
+            return (f"Refused: {chat_id} is a private one-to-one chat on "
+                    f"telegram. Announcements go to groups or channels people "
+                    f"joined, not to individuals who did not ask. Telegram "
+                    f"groups and channels have negative ids.")
+        return (f"Refused: on {channel_type}, announcements go only to a "
+                f"destination that subscribed to them, and {chat_id} has no "
+                f"subscription record.")
 
     api = get_api()
     cfg = api._channels.get(channel_type)
     if cfg is None:
-        return (f"Channel '{channel_type}' is not registered. "
-                f"Register it first, then set its announcement target.")
+        if not _running_here(channel_type):
+            return (f"Channel '{channel_type}' is not registered. "
+                    f"Register it first, then set its announcement target.")
+        from integrations.channels.metadata import get_channel_metadata
+        cfg = {'channel_type': channel_type,
+               'name': (get_channel_metadata(channel_type) or {}).get(
+                   'display_name') or channel_type,
+               'enabled': True, ANNOUNCE_ONLY_KEY: True}
     cfg['announce_chat_id'] = chat_id
     api._channels[channel_type] = cfg
     api._save_config()
+    if cfg.get('enabled', True) is False:
+        return (f"Announcement target for {channel_type} set to {chat_id}. "
+                f"NOTE: {channel_type} is disabled in its channel settings, so "
+                f"nothing is sent there until it is enabled.")
 
     # Say plainly whether this will actually broadcast yet. Reporting
     # "configured" when nothing can send would be the same false success
@@ -287,10 +328,18 @@ def build_channel_tool_closures(ctx):
 
             # The channel integration owns the adapters' loop; ChannelRegistry
             # has none (tests/unit/test_channel_loop_owner.py).
+            import concurrent.futures
             from integrations.channels.flask_integration import (
                 CHANNEL_SEND_WAIT_S, get_channel_integration)
-            result = get_channel_integration().send_threadsafe(
-                channel_type, chat_id, message, wait=CHANNEL_SEND_WAIT_S)
+            try:
+                result = get_channel_integration().send_threadsafe(
+                    channel_type, chat_id, message, wait=CHANNEL_SEND_WAIT_S)
+            except concurrent.futures.TimeoutError:
+                # Still running on the adapter loop: it may yet arrive, and
+                # an "error" here made the agent send it a second time.
+                return (f"The message to {channel_type}:{chat_id} was not "
+                        f"confirmed after {CHANNEL_SEND_WAIT_S}s; it may still "
+                        f"arrive. Do not send it again.")
             if result is None:
                 return ("Channel adapters are not running, so the message "
                         "was not sent.")
@@ -382,23 +431,41 @@ def build_channel_tool_closures(ctx):
                 else:
                     config[key] = ''
 
+            from integrations.channels.flask_integration import (
+                seal_binding_credential,
+            )
+            from integrations.channels.metadata import required_setup_keys
+            required = required_setup_keys(meta)
+
+            # The copy kept in admin_config.json carries each credential
+            # sealed, as the binding below does (seal_binding_credential):
+            # nothing starts a channel from this copy (boot reads the
+            # binding), and the card that asked the owner for the value said
+            # it is kept encrypted (review of f8fdb9c64: it was written in
+            # plain text).  The live connect below uses ``config`` itself.
+            saved = dict(config)
+            if meta['auth_method'] != 'gateway_qr':
+                for k in required:
+                    if saved.get(k):
+                        saved[k] = seal_binding_credential(channel_type, saved[k])
+
             # Save via admin API singleton
             from integrations.channels.admin.api import get_api
             api = get_api()
 
             if channel_type in api._channels:
-                api._channels[channel_type].update({'config': config, 'enabled': True})
+                api._channels[channel_type].update({'config': saved, 'enabled': True})
+                # Its own config now: no longer an entry that only holds the
+                # announcement target.
+                api._channels[channel_type].pop(ANNOUNCE_ONLY_KEY, None)
             else:
                 api._channels[channel_type] = {
                     'channel_type': channel_type,
                     'name': meta['display_name'],
                     'enabled': True,
-                    'config': config,
+                    'config': saved,
                 }
             api._save_config()
-
-            from integrations.channels.metadata import required_setup_keys
-            required = required_setup_keys(meta)
             # A single-credential channel's token is also kept on the user's
             # binding: that row is what restore_persisted_channels reads at
             # boot (flask_integration._binding_credentials), and the same
@@ -408,11 +475,7 @@ def build_channel_tool_closures(ctx):
             cred_meta = {}
             if (len(required) == 1 and meta['auth_method'] != 'gateway_qr'
                     and config.get(required[0])):
-                from integrations.channels.flask_integration import (
-                    seal_binding_credential,
-                )
-                cred_meta = {required[0]: seal_binding_credential(
-                    channel_type, config[required[0]])}
+                cred_meta = {required[0]: saved[required[0]]}
 
             # Create user binding
             uid = user_id or _get_user_id_from_threadlocal()
@@ -1115,7 +1178,7 @@ def build_channel_tool_closures(ctx):
     @log_tool_execution
     def set_announcement_channel(
         channel_type: Annotated[str, "Channel to announce on (telegram, discord, slack, whatsapp)"],
-        chat_id: Annotated[str, "Destination id. Telegram groups/channels are NEGATIVE ids; WhatsApp groups end in @g.us"],
+        chat_id: Annotated[str, "Destination id. Telegram groups/channels are NEGATIVE ids; on WhatsApp, Signal and iMessage only a destination that subscribed is accepted"],
     ) -> str:
         """Set where HARTOS posts growth announcements for a channel.
 

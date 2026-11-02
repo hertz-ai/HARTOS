@@ -14,7 +14,7 @@ Two regressions this pins (both were the reason the flywheel moved 0 strangers):
      standing ``public_exposure`` consent and proceed with it. That grant/revoke
      is the operator's autonomy on/off switch (humans-in-control).
 
-Behavioural — imports the real code, mocks the consent + adapter boundaries,
+Behavioural — imports the real code, mocks only what leaves the node (see section 4),
 calls the real tool closures, asserts the observable result. No grep tests.
 """
 from __future__ import annotations
@@ -351,174 +351,337 @@ def test_flag_off_with_nothing_granted_writes_no_row(consent_db):
 # now sends through the live channel registry to the channel's announcement
 # destination, and asks the owner for what is missing: the one credential a
 # channel can be connected from (never for one it cannot), or where posts go.
+#
+# Review of f8fdb9c64 (REJECTED): its tests mocked exactly what changed (the
+# destination collector and writer, the person_ask calls, the credential
+# answer, an adapter with no status), so none of its findings could show.
+# These run the real ones: the destination collector and its one writer on a
+# real admin config (a temp file), request_credential and ConsentService on a
+# real consent table, a fresh vault, person_ask, register_channel, and the
+# channel integration's own send over a running event loop.  The boundaries
+# are what reaches outside the node: the platform behind each adapter, the
+# live adapter wiring (_wire_live_adapter), the connect watcher
+# (_report_when_live), the Liquid UI card push, the notification row with its
+# Firebase push, and the consent broadcast.
+
+import asyncio  # noqa: E402
+import threading  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+from integrations.channels.base import (  # noqa: E402
+    ChannelAdapter, ChannelConfig, ChannelStatus, SendResult,
+)
 
 OWNER = '10202'
+TOKEN = '123:abc-test-token'
+TOKEN_NAME = 'TELEGRAM_BOT_TOKEN'
 
 
-class _Adapter:
-    """A channel adapter as the registry holds one, with the real
-    ChannelAdapter.send_message signature (no **kwargs), so a call with the
-    wrong arguments fails here as it does in production."""
+class _Adapter(ChannelAdapter):
+    """A channel as the registry holds one, standing in for its platform:
+    it records each message it is asked to send.  ``status`` is what the
+    adapter reports (it runs only when CONNECTED); ``hold`` keeps a send
+    unconfirmed past the caller's wait, as a slow platform does."""
 
-    def __init__(self, name, result=None, running=True):
-        self.name, self._result, self._running = name, result, running
+    def __init__(self, channel_name, result=None,
+                 status=ChannelStatus.CONNECTED, hold=0.0):
+        super().__init__(ChannelConfig())
+        self._channel_name = channel_name
+        self._result = result or SendResult(success=True, message_id='m-1')
+        self.status = status
+        self._running = status == ChannelStatus.CONNECTED
+        self._hold = hold
         self.sent = []
 
-    def on_message(self, handler):
-        pass
+    @property
+    def name(self):
+        return self._channel_name
 
-    def is_running(self):
-        return self._running
+    async def connect(self):
+        return True
+
+    async def disconnect(self):
+        return None
 
     async def send_message(self, chat_id, text, reply_to=None, media=None,
                            buttons=None):
         self.sent.append({'chat_id': chat_id, 'text': text, 'media': media})
+        if self._hold:
+            await asyncio.sleep(self._hold)
         return self._result
 
+    async def edit_message(self, chat_id, message_id, text, buttons=None):
+        return SendResult(success=True, message_id=message_id)
 
-class _Integration:
-    """The two members of FlaskChannelIntegration that post_to_channel
-    reads: the real ChannelRegistry, and send_threadsafe, which runs the
-    registry's send_to_channel to its SendResult (None while the channel
-    loop is not running; a TimeoutError when the wait runs out, as
-    concurrent.futures.Future.result raises it)."""
+    async def delete_message(self, chat_id, message_id):
+        return True
 
-    def __init__(self, *adapters, loop_running=True, times_out=False):
-        from integrations.channels.registry import ChannelRegistry
-        self.registry = ChannelRegistry()
-        for adapter in adapters:
-            self.registry.register(adapter)
-        self._loop_running = loop_running
-        self._times_out = times_out
-        self.waits = []
+    async def send_typing(self, chat_id):
+        return None
 
-    def send_threadsafe(self, channel, chat_id, text, *, wait=None, **kwargs):
-        if not self._loop_running:
-            return None
-        self.waits.append(wait)
-        # A loop of its own, as the channel thread has: never this thread's
-        # current loop, which core.event_loop.run_async reuses.
-        import asyncio
-        loop = asyncio.new_event_loop()
-        try:
-            result = loop.run_until_complete(
-                self.registry.send_to_channel(channel, chat_id, text, **kwargs))
-        finally:
-            loop.close()
-        if self._times_out:
-            import concurrent.futures
-            raise concurrent.futures.TimeoutError()
-        return result
+    async def get_chat_info(self, chat_id):
+        return None
 
 
-class _Vault:
-    """The two AIKeyVault reads post_to_channel makes: the credential's one
-    name, and its value when the owner entered it ('' otherwise)."""
+@pytest.fixture
+def world(tmp_path, monkeypatch):
+    """Every store post_to_channel reads and writes, fresh: a consent and
+    binding database behind models.get_db, the admin channel config on a
+    temp file, a vault on temp files with its own key, this node's owner,
+    and a channel integration over a running loop installed as the
+    process's own.  Yields what the boundaries saw."""
+    from datetime import datetime
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+    from hartos import ai_key_vault
+    from integrations.agent_engine import (
+        liquid_ui_service, marketing_tools, person_ask)
+    from integrations.channels import agent_tools, flask_integration
+    from integrations.channels import registry as registry_mod
+    from integrations.channels.admin import api as admin_api
+    from integrations.channels.registry import ChannelRegistry
+    from integrations.social import (
+        api_channels, consent_service, models, realtime, services)
+    from security import secrets_manager
+    from security.secrets_manager import SecretsManager
 
-    def __init__(self, entered=None):
-        from hartos.ai_key_vault import AIKeyVault
-        self._naming = AIKeyVault()
-        self.entered = dict(entered or {})
+    engine = create_engine('sqlite://', poolclass=StaticPool,
+                           connect_args={'check_same_thread': False})
+    for table in (models.UserConsent, models.UserChannelBinding):
+        table.__table__.create(engine)
+    monkeypatch.setattr(models, 'get_db',
+                        sessionmaker(bind=engine, expire_on_commit=False))
+    said = []
+    monkeypatch.setattr(consent_service, '_emit',
+                        lambda topic, data, msg_id=None:
+                        said.append((topic, dict(data), msg_id)))
 
-    def credential_name(self, key, channel=''):
-        return self._naming.credential_name(key, channel)
+    monkeypatch.setattr(admin_api.AdminAPI, '_config_path',
+                        lambda self: str(tmp_path / 'admin_config.json'))
+    monkeypatch.setattr(admin_api.AdminAPI, '_legacy_config_path',
+                        staticmethod(lambda: str(tmp_path / 'legacy.json')))
+    admin = admin_api.AdminAPI()
+    monkeypatch.setattr(admin_api, 'get_api', lambda: admin)
 
-    def owner_credential(self, name, names=None):
-        return self.entered.get(name, '')
+    monkeypatch.setattr(secrets_manager, '_SALT_PATH', str(tmp_path / 'salt'))
+    monkeypatch.setattr(secrets_manager, '_VAULT_PATH', str(tmp_path / 'vault'))
+    monkeypatch.setenv('HEVOLVE_MASTER_KEY', 'test-only-vault-passphrase')
+    for name in (TOKEN_NAME, 'SLACK_APP_TOKEN'):
+        monkeypatch.setenv(name, 'x')      # recorded, so it is restored
+        monkeypatch.delenv(name)
+    SecretsManager.reset()
+    ai_key_vault.AIKeyVault.reset()
+    monkeypatch.setattr(ai_key_vault, '_instance', None)
+    monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', OWNER)
+
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    registry = ChannelRegistry()
+    integration = flask_integration.FlaskChannelIntegration.__new__(
+        flask_integration.FlaskChannelIntegration)
+    integration.registry = registry
+    integration._loop = loop
+    integration._thread = None
+    monkeypatch.setattr(registry_mod, '_registry', registry)
+    monkeypatch.setattr(flask_integration, '_integration', integration)
+
+    wired, watched, cards, rows = [], [], [], []
+    monkeypatch.setattr(api_channels, '_wire_live_adapter',
+                        lambda ch, cred: wired.append((ch, cred))
+                        or {'success': True})
+    monkeypatch.setattr(agent_tools, '_report_when_live',
+                        lambda channel, *a, **k: watched.append(channel))
+    monkeypatch.setattr(liquid_ui_service, 'push_agent_ui',
+                        lambda agent_id, card, user_id=None:
+                        cards.append((agent_id, dict(card), user_id)) or True)
+    monkeypatch.setattr(liquid_ui_service, 'withdraw_agent_ui',
+                        lambda ask_id: None)
+    monkeypatch.setattr(services.NotificationService, 'create',
+                        staticmethod(lambda db, user_id, ntype, **kw:
+                                     rows.append((user_id, ntype, kw))))
+    monkeypatch.setattr(services.NotificationService, 'mark_read',
+                        staticmethod(lambda db, ids, user_id: None))
+    monkeypatch.setattr(realtime, 'on_notification', lambda *a, **k: None)
+
+    # The posting identity's standing public_exposure grant (the operator's
+    # switch, section 3).
+    with models.db_session() as db:
+        db.add(models.UserConsent(
+            id='public-exposure', user_id='system_bootstrap',
+            consent_type='public_exposure', scope='*', granted=True,
+            granted_at=datetime.utcnow()))
+    # getattr: on the parent these maps do not exist, and its tests must
+    # fail on what it does, not on the fixture.
+    for name in ('_SELF_CONNECTS', '_DESTINATION_ASKS', '_DESTINATION_SAID'):
+        getattr(marketing_tools, name, {}).clear()
+    with person_ask._lock:
+        person_ask._asks.clear()
+
+    yield SimpleNamespace(admin=admin, registry=registry,
+                          integration=integration, said=said, wired=wired,
+                          watched=watched, cards=cards, rows=rows,
+                          config_file=tmp_path / 'admin_config.json')
+
+    # A destination waiter still waiting gets no answer and ends.
+    with person_ask._lock:
+        for a in person_ask._asks.values():
+            a.event.set()
+        person_ask._asks.clear()
+    _join_destination_waiters()
+
+    async def _drain():           # a held send still sleeping on the loop
+        await asyncio.gather(*(t for t in asyncio.all_tasks()
+                               if t is not asyncio.current_task()),
+                             return_exceptions=True)
+    asyncio.run_coroutine_threadsafe(_drain(), loop).result(timeout=5)
+    loop.call_soon_threadsafe(loop.stop)
+    thread.join(timeout=5)
+    loop.close()
+    SecretsManager.reset()
+    ai_key_vault.AIKeyVault.reset()
 
 
-def _post(integration, *args, targets=None, ask=None, vault=None,
-          owner=OWNER, **kwargs):
-    """Call the real post_to_channel with consent granted; the channel
-    integration, the announcement destinations, the credential ask
-    (request_credential), the vault and the node's owner are the
-    boundaries.  ``targets`` is a mutable {channel: [chat ids]}."""
-    funcs = _marketing_funcs()
-    ask = ask or Mock(return_value='Asked the owner of this computer on '
-                                   'the consent card.')
-    targets = {} if targets is None else targets
-    with _consent(True), \
-         patch('integrations.channels.flask_integration.get_channel_integration',
-               return_value=integration), \
-         patch('integrations.channels.announcement_broadcaster.'
-               '_collect_announcement_targets',
-               lambda *a, **k: [(ch, c) for ch, ids in targets.items()
-                                for c in ids]), \
-         patch('hartos.ai_key_vault.request_credential', ask), \
-         patch('hartos.ai_key_vault.get_ai_key_vault',
-               return_value=vault or _Vault()), \
-         patch('integrations.agent_engine.capability_setup.setup_owner',
-               return_value=owner):
-        return json.loads(funcs['post_to_channel'](*args, **kwargs)), ask
+def _announce_only_key():
+    """agent_tools.ANNOUNCE_ONLY_KEY ('announce_only' where it does not exist
+    yet, so the parent fails on behaviour, not on the import)."""
+    from integrations.channels import agent_tools
+    return getattr(agent_tools, 'ANNOUNCE_ONLY_KEY', 'announce_only')
 
 
-def _sent(**kw):
-    from integrations.channels.base import SendResult
-    return SendResult(**kw)
+def _join_destination_waiters():
+    for t in threading.enumerate():
+        if t.name.startswith('post-destination-'):
+            t.join(timeout=5)
 
 
-@pytest.fixture(autouse=True)
-def _no_destination_asks_left_over():
-    from integrations.agent_engine import marketing_tools
-    asks = getattr(marketing_tools, '_DESTINATION_ASKS', {})
-    asks.clear()
-    yield
-    asks.clear()
+def _post(*args, **kwargs):
+    """The real post_to_channel tool, as the marketing agent calls it."""
+    return json.loads(_marketing_funcs()['post_to_channel'](*args, **kwargs))
 
 
-def test_a_connected_channel_posts_where_the_owner_chose():
-    from integrations.channels.flask_integration import CHANNEL_SEND_WAIT_S
-    tg = _Adapter('telegram', _sent(success=True, message_id='m-1'))
-    integ = _Integration(tg)
-    out, ask = _post(integ, 'telegram', 'hello',
-                     targets={'telegram': ['-1001'], 'discord': ['d-9']},
-                     extra_config='{"chat_id": "@somebody_else"}')
+def _destination(world, channel, chat_id):
+    """The owner chose ``chat_id`` for ``channel`` on the Channels page."""
+    world.admin._channels[channel] = {'channel_type': channel, 'enabled': True,
+                                      'announce_chat_id': chat_id}
+
+
+def _credential_asks():
+    from integrations.social.models import UserConsent, db_session
+    with db_session(commit=False) as db:
+        return [(r.scope, r.agent_id, bool(r.granted)) for r in
+                db.query(UserConsent).filter_by(user_id=OWNER,
+                                                consent_type='credential')]
+
+
+def _card_requests(world):
+    return [(data, msg_id) for topic, data, msg_id in world.said
+            if topic == 'consent.request']
+
+
+def _owner_enters(value):
+    """The owner's Accept on the consent card: the desktop vault keeps the
+    value and hands it over (hold_credential), and the grant row says the
+    owner entered it (consent_api.grant_consent writes the same row)."""
+    from hartos.ai_key_vault import get_ai_key_vault
+    from integrations.social.consent_service import ConsentService
+    from integrations.social.models import db_session
+    get_ai_key_vault().hold_credential(TOKEN_NAME, value)
+    with db_session() as db:
+        ConsentService.grant_consent(db, OWNER, 'credential',
+                                     'secret:' + TOKEN_NAME)
+
+
+def _owner_answers(ask_id, chat_id):
+    """The owner answers the destination card from any surface."""
+    from integrations.agent_engine import person_ask
+    body, status = person_ask.answer_ask(
+        ask_id, {'values': {'chat_id': chat_id}}, OWNER)
+    assert status == 200, body
+    _join_destination_waiters()
+
+
+# ── Posting ─────────────────────────────────────────────────────────
+
+def test_a_connected_channel_posts_where_the_owner_chose(world):
+    tg = _Adapter('telegram')
+    world.registry.register(tg)
+    _destination(world, 'telegram', '-1001')
+    _destination(world, 'discord', 'd-9')
+    out = _post('telegram', 'hello', extra_config='{"chat_id": "@somebody_else"}')
     assert tg.sent == [{'chat_id': '-1001', 'text': 'hello', 'media': None}]
-    assert integ.waits == [CHANNEL_SEND_WAIT_S]
     assert (out['success'], out['sent'], out['pending']) == (True, True, False)
     assert out['posts'] == [{'chat_id': '-1001', 'sent': True,
                              'message_id': 'm-1', 'error': None}]
-    ask.assert_not_called()
+    assert _card_requests(world) == [] and world.cards == []
 
 
-def test_a_send_the_channel_refuses_is_reported_as_not_sent():
-    tg = _Adapter('telegram', _sent(success=False, error='chat not found'))
-    out, _ = _post(_Integration(tg), 'Telegram', 'hello',
-                   targets={'telegram': ['-1001']})
+def test_a_send_the_channel_refuses_is_reported_as_not_sent(world):
+    tg = _Adapter('telegram', SendResult(success=False, error='chat not found'))
+    world.registry.register(tg)
+    _destination(world, 'telegram', '-1001')
+    out = _post('Telegram', 'hello')
     assert len(tg.sent) == 1
     assert (out['success'], out['sent']) == (False, False)
     assert out['posts'][0]['error'] == 'chat not found'
 
 
-def test_a_send_not_confirmed_in_time_is_pending_and_never_resent():
-    tg = _Adapter('telegram', _sent(success=True))
-    out, _ = _post(_Integration(tg, times_out=True), 'telegram', 'hello',
-                   targets={'telegram': ['-1001']})
+def test_a_send_not_confirmed_in_time_is_pending_and_never_resent(
+        world, monkeypatch):
+    from integrations.channels import flask_integration
+    monkeypatch.setattr(flask_integration, 'CHANNEL_SEND_WAIT_S', 0.1)
+    tg = _Adapter('telegram', hold=0.5)
+    world.registry.register(tg)
+    _destination(world, 'telegram', '-1001')
+    out = _post('telegram', 'hello')
     assert len(tg.sent) == 1                    # one send, no retry
-    assert (out['sent'], out['pending']) == (False, True)
+    # Neither sent nor not sent: it may still appear.
+    assert (out['success'], out['sent'], out['pending']) == (None, None, True)
     assert out['posts'] == [{'chat_id': '-1001', 'sent': None, 'pending': True}]
     assert 'Do not post it again' in out['note']
 
 
-def test_a_media_url_reaches_the_channel_as_an_attachment():
+def test_a_media_url_reaches_the_channel_as_an_attachment(world):
     from integrations.channels.base import MessageType
-    tg = _Adapter('telegram', _sent(success=True))
-    _post(_Integration(tg), 'telegram', 'demo',
-          media_url='https://x.test/demo.MOV?sig=1',
-          targets={'telegram': ['-1001']})
+    tg = _Adapter('telegram')
+    world.registry.register(tg)
+    _destination(world, 'telegram', '-1001')
+    _post('telegram', 'demo', media_url='https://x.test/demo.MOV?sig=1')
     [media] = tg.sent[0]['media']
     assert (media.url, media.file_path, media.type) == (
         'https://x.test/demo.MOV?sig=1', None, MessageType.VIDEO)
 
 
-def test_a_file_this_node_made_rides_as_a_file_not_a_url(tmp_path):
+def test_a_url_that_does_not_name_its_type_goes_out_as_a_link(world):
+    """A share page or a CDN id is no attachment; the post carries it as a
+    link (f8fdb9c64 refused the whole post for it)."""
+    tg = _Adapter('telegram')
+    world.registry.register(tg)
+    _destination(world, 'telegram', '-1001')
+    out = _post('telegram', 'demo', media_url='https://x.test/share/abc123')
+    assert tg.sent == [{'chat_id': '-1001', 'media': None,
+                        'text': 'demo\nhttps://x.test/share/abc123'}]
+    assert out['sent'] is True
+
+
+@pytest.mark.parametrize('name', ['reel.mp4', 'clip#1.mp4', 'take?2.mp4'])
+def test_a_file_this_node_made_rides_as_a_file_not_a_url(
+        world, tmp_path, name):
+    """'#' and '?' are ordinary characters in a file name: cutting at them
+    dropped "clip#1.mp4" (review of f8fdb9c64)."""
     from integrations.channels.base import MessageType
-    clip = tmp_path / 'reel.mp4'
+    if name == 'take?2.mp4' and sys.platform == 'win32':
+        pytest.skip("'?' cannot be in a Windows file name")
+    data = tmp_path / 'data'
+    data.mkdir()
+    clip = data / name
     clip.write_bytes(b'\x00')
-    tg = _Adapter('telegram', _sent(success=True))
-    with patch('core.platform_paths.get_data_dir', return_value=str(tmp_path)):
-        out, _ = _post(_Integration(tg), 'telegram', 'demo',
-                       media_url=str(clip), targets={'telegram': ['-1001']})
+    tg = _Adapter('telegram')
+    world.registry.register(tg)
+    _destination(world, 'telegram', '-1001')
+    with patch('core.platform_paths.get_data_dir', return_value=str(data)):
+        out = _post('telegram', 'demo', media_url=str(clip))
     [media] = tg.sent[0]['media']
     assert media.url is None and media.type == MessageType.VIDEO
     assert os.path.realpath(media.file_path) == os.path.realpath(str(clip))
@@ -526,141 +689,328 @@ def test_a_file_this_node_made_rides_as_a_file_not_a_url(tmp_path):
 
 
 def test_a_file_outside_the_data_folder_is_not_attached_and_nothing_posts(
-        tmp_path):
+        world, tmp_path):
     outside = tmp_path / 'secret.png'
     outside.write_bytes(b'\x00')
     data = tmp_path / 'data'
     data.mkdir()
-    tg = _Adapter('telegram', _sent(success=True))
+    tg = _Adapter('telegram')
+    world.registry.register(tg)
+    _destination(world, 'telegram', '-1001')
     with patch('core.platform_paths.get_data_dir', return_value=str(data)):
-        out, _ = _post(_Integration(tg), 'telegram', 'demo',
-                       media_url=str(outside), targets={'telegram': ['-1001']})
+        out = _post('telegram', 'demo', media_url=str(outside))
     assert tg.sent == []
     assert out['sent'] is False and 'data folder' in out['error']
 
 
-def test_nothing_is_posted_while_the_channel_loop_is_down():
-    tg = _Adapter('telegram', _sent(success=True))
-    out, _ = _post(_Integration(tg, loop_running=False), 'telegram', 'hello',
-                   targets={'telegram': ['-1001']})
+def test_nothing_is_posted_while_the_channel_loop_is_down(world):
+    tg = _Adapter('telegram')
+    world.registry.register(tg)
+    _destination(world, 'telegram', '-1001')
+    world.integration._loop = None
+    out = _post('telegram', 'hello')
     assert tg.sent == []
     assert (out['success'], out['sent']) == (False, False)
 
 
-def test_a_channel_that_can_be_connected_asks_the_owner_once_for_its_value():
-    out, ask = _post(_Integration(), 'telegram', 'hello')
-    [call] = ask.call_args_list
-    asked = json.loads(call.args[0])
-    assert (asked['key_name'], asked['channel_type'], asked['used_by']) == (
-        'bot_token', 'telegram', 'post_to_channel')
-    assert call.kwargs == {'agent_id': None}    # one card, not one per agent
-    assert (out['sent'], out['needs_owner']) == (False, True)
-    assert out['asked_owner_for'] == 'TELEGRAM_BOT_TOKEN'
-    assert '{{secret:' not in json.dumps(out)   # nothing to register yet
-    assert 'not report it as done' in out['next']
+# ── A channel that is not connected ─────────────────────────────────
+
+def test_a_channel_that_can_be_connected_asks_the_owner_once_for_its_value(world):
+    first = _post('telegram', 'hello')
+    second = _post('telegram', 'hello')
+    assert _credential_asks() == [('secret:' + TOKEN_NAME, None, False)]
+    requests = _card_requests(world)
+    assert {msg_id for _d, msg_id in requests} == {requests[0][1]}  # one card
+    assert 'post_to_channel' in requests[0][0]['reason']
+    for out in (first, second):
+        assert (out['sent'], out['needs_owner']) == (False, True)
+        assert out['asked_owner_for'] == TOKEN_NAME
+        assert 'Asked the owner' in out['owner_answer']
+        assert 'not report it as done' in out['next']
+        # The agent is never handed an alias to pass anywhere itself.
+        assert '{{secret:' not in json.dumps(out)
+    assert '{{secret:' not in requests[0][0]['reason']
+    assert world.wired == []
 
 
-def test_a_registered_channel_that_is_stopped_asks_too():
-    tg = _Adapter('telegram', _sent(success=True), running=False)
-    out, ask = _post(_Integration(tg), 'telegram', 'hello',
-                     targets={'telegram': ['-1001']})
-    assert tg.sent == [] and ask.called and out['needs_owner'] is True
+def test_a_registered_channel_that_is_stopped_asks_too(world):
+    tg = _Adapter('telegram', status=ChannelStatus.DISCONNECTED)
+    world.registry.register(tg)
+    _destination(world, 'telegram', '-1001')
+    out = _post('telegram', 'hello')
+    assert tg.sent == [] and out['needs_owner'] is True
+    assert len(_card_requests(world)) == 1
 
 
-@pytest.mark.parametrize('channel', ['twitter', 'whatsapp', 'slack'])
-def test_a_channel_its_answer_could_never_start_asks_nothing(channel):
-    """Twitter needs five credentials, WhatsApp is linked from the phone,
-    Slack needs SLACK_APP_TOKEN on the server: register_channel starts none
-    of them from one value, so no card is filed (the rejected version filed
-    five for Twitter)."""
-    with patch.dict(os.environ, {'SLACK_APP_TOKEN': ''}):
-        out, ask = _post(_Integration(), channel, 'hello')
-    ask.assert_not_called()
+@pytest.mark.parametrize('channel', ['twitter', 'slack'])
+def test_a_channel_its_answer_could_never_start_asks_nothing(world, channel):
+    """Twitter needs five credentials, and Slack needs SLACK_APP_TOKEN on
+    the server: register_channel starts neither from one value, so no card
+    is filed (the rejected version filed five for Twitter)."""
+    out = _post(channel, 'hello')
+    assert _credential_asks() == [] and _card_requests(world) == []
     assert (out['sent'], out['needs_owner'], out['cannot_connect_here']) == (
         False, False, True)
 
 
-def test_once_the_owner_entered_the_value_the_channel_is_connected_for_them():
-    register = Mock(return_value='Telegram registered and enabled!')
-    built = []
+@pytest.mark.parametrize('channel', ['signal', 'whatsapp', 'imessage'])
+def test_a_channel_where_no_answer_could_be_used_asks_nothing(world, channel):
+    """On a person-to-person channel every destination needs a
+    subscription, which the owner cannot give on a card: connecting it or
+    asking where posts go only led to answers refused on every post."""
+    out = _post(channel, 'hello')
+    assert _credential_asks() == [] and _card_requests(world) == []
+    assert world.cards == [] and world.wired == []
+    assert (out['sent'], out['needs_owner'], out['cannot_post_here']) == (
+        False, False, True)
 
-    def _closures(ctx):
-        built.append(ctx)
-        return [('register_channel', 'desc', register)]
 
-    vault = _Vault({'TELEGRAM_BOT_TOKEN': '123:abc'})
-    with patch('integrations.channels.agent_tools.build_channel_tool_closures',
-               _closures):
-        out, ask = _post(_Integration(), 'telegram', 'hello', vault=vault)
-    ask.assert_not_called()
-    register.assert_called_once_with('telegram', '{"bot_token": "123:abc"}')
-    assert built == [{'user_id': OWNER}]        # the binding is the owner's
+def test_once_the_owner_entered_the_value_the_channel_is_connected_for_them(
+        world):
+    from security.secrets_manager import SEALED_PREFIX, SecretsManager
+    from integrations.social.models import UserChannelBinding, db_session
+    _owner_enters(TOKEN)
+    out = _post('telegram', 'hello')
+    assert world.wired == [('telegram', TOKEN)]
+    assert world.watched == ['telegram']
     assert (out['sent'], out['connecting']) == (False, True)
-    assert '123:abc' not in json.dumps(out)     # the model never holds it
+    assert TOKEN not in json.dumps(out)          # the model never holds it
+    assert _card_requests(world) == []
+    # Kept sealed in the admin config and on the owner's binding, as the
+    # card said ("kept encrypted on this computer"); f8fdb9c64 wrote the
+    # admin copy in plain text.
+    kept = world.admin._channels['telegram']['config']['bot_token']
+    assert kept.startswith(SEALED_PREFIX)
+    assert SecretsManager.get_instance().decrypt_value(kept) == TOKEN
+    assert TOKEN not in world.config_file.read_text()
+    with db_session(commit=False) as db:
+        [binding] = db.query(UserChannelBinding).all()
+        assert binding.user_id == OWNER
+        assert binding.metadata_json['bot_token'].startswith(SEALED_PREFIX)
 
 
-def test_a_channel_still_connecting_is_left_alone():
+def test_a_refused_value_is_never_tried_again_and_the_owner_is_asked_anew(
+        world, monkeypatch):
+    """H2 of the f8fdb9c64 review: the same refused value was registered
+    again on every call (a new watcher, an error toast and an unhealthy
+    banner each time) and the owner was never asked."""
+    from integrations.channels import agent_tools
+    _owner_enters(TOKEN)
+    _post('telegram', 'hello')
+    still = _post('telegram', 'hello')           # its start is being watched
+    assert still['connecting'] is True and world.wired == [('telegram', TOKEN)]
+    monkeypatch.setattr(agent_tools, '_LIVE_WAIT_SECONDS', 0)   # watch ended
+    refused = _post('telegram', 'hello')
+    assert world.wired == [('telegram', TOKEN)]  # not registered again
+    assert refused['value_refused'] is True and refused['needs_owner'] is True
+    [(card, _msg)] = _card_requests(world)
+    assert 'rejected' in card['reason']
+    assert '{{secret:' not in json.dumps(refused)
+    _owner_enters('456:a-new-value')
+    _post('telegram', 'hello')
+    assert world.wired == [('telegram', TOKEN), ('telegram', '456:a-new-value')]
+
+
+def test_a_start_that_failed_is_not_waited_for(world):
+    _owner_enters(TOKEN)
+    _post('telegram', 'hello')
+    world.registry.register(_Adapter('telegram', status=ChannelStatus.ERROR))
+    out = _post('telegram', 'hello')
+    assert out['value_refused'] is True and world.wired == [('telegram', TOKEN)]
+
+
+def test_a_channel_still_connecting_is_left_alone(world):
     """register_channel only schedules start(): while the adapter is
     CONNECTING, a second register would rebuild it mid-connect."""
-    from integrations.channels.base import ChannelStatus
-    tg = _Adapter('telegram', _sent(success=True), running=False)
-    tg.get_status = lambda: ChannelStatus.CONNECTING
-    register = Mock()
-    with patch('integrations.channels.agent_tools.build_channel_tool_closures',
-               lambda ctx: [('register_channel', 'desc', register)]):
-        out, ask = _post(_Integration(tg), 'telegram', 'hello',
-                         vault=_Vault({'TELEGRAM_BOT_TOKEN': '123:abc'}),
-                         targets={'telegram': ['-1001']})
-    register.assert_not_called()
-    ask.assert_not_called()
+    tg = _Adapter('telegram', status=ChannelStatus.CONNECTING)
+    world.registry.register(tg)
+    _destination(world, 'telegram', '-1001')
+    _owner_enters(TOKEN)
+    out = _post('telegram', 'hello')
+    assert world.wired == [] and _card_requests(world) == []
     assert tg.sent == [] and (out['sent'], out['connecting']) == (False, True)
 
 
-def test_no_destination_asks_the_owner_where_posts_go_once():
-    tg = _Adapter('telegram', _sent(success=True))
-    asked = Mock(return_value={'ok': True, 'ask_id': 'a1', 'refused': None,
-                               'card': True})
-    with patch('integrations.agent_engine.person_ask.ask', asked), \
-         patch('integrations.agent_engine.person_ask.ask_state',
-               return_value={'status': 'open', 'answer': None}):
-        first, _ = _post(_Integration(tg), 'telegram', 'hello')
-        second, _ = _post(_Integration(tg), 'telegram', 'hello')
-    [call] = asked.call_args_list
-    person, agent, component = call.args
-    assert (person, component['type']) == (OWNER, 'form')
-    assert [f['name'] for f in component['fields']] == ['chat_id']
+def test_an_owner_who_said_no_is_not_asked_again(world):
+    from integrations.social.consent_service import ConsentService
+    from integrations.social.models import db_session
+    _post('telegram', 'hello')
+    with db_session() as db:                      # the card's "Don't allow"
+        ConsentService.decline(db, OWNER, 'credential', 'secret:' + TOKEN_NAME)
+    world.said.clear()
+    out = _post('telegram', 'hello')
+    assert _card_requests(world) == [] and world.wired == []
+    assert (out['sent'], out['needs_owner'], out['owner_declined']) == (
+        False, False, True)
+    assert 'do not ask' in out['next'].lower()
+
+
+def test_a_node_with_no_owner_connects_nothing_and_asks_no_one(
+        world, monkeypatch):
+    monkeypatch.delenv('HEVOLVE_OWNER_USER_ID')
+    out = _post('telegram', 'hello')
+    assert _credential_asks() == [] and _card_requests(world) == []
+    assert out['needs_owner'] is True and 'no owner' in out['error']
+    world.registry.register(_Adapter('telegram'))
+    out = _post('telegram', 'hello')
+    assert world.cards == [] and out['sent'] is False
+
+
+# ── Where posts go ──────────────────────────────────────────────────
+
+def test_no_destination_asks_the_owner_where_posts_go_once(world):
+    tg = _Adapter('telegram')
+    world.registry.register(tg)
+    first = _post('telegram', 'hello')
+    second = _post('telegram', 'hello')
+    [(_agent, card, person)] = world.cards
+    assert (person, card['type']) == (OWNER, 'form')
+    assert [f['name'] for f in card['fields']] == ['chat_id']
+    [(row_person, _type, row)] = world.rows       # one row, one phone push
+    assert row_person == OWNER and row['push']['data']['ask_id'] == first['ask_id']
     assert tg.sent == []
-    assert (first['needs_owner'], first['ask_id']) == (True, 'a1')
-    assert (second['needs_owner'], second['ask_id']) == (True, 'a1')
+    assert (first['needs_owner'], second['ask_id']) == (True, first['ask_id'])
 
 
-def test_the_owners_answer_sets_the_destination_and_the_post_goes_out():
-    tg = _Adapter('telegram', _sent(success=True, message_id='m-2'))
-    targets = {}
-    written = []
+def test_the_owners_answer_is_saved_when_given_and_the_post_goes_out(world):
+    """H1 of the f8fdb9c64 review: a channel started from the environment
+    has no admin entry, and the answer was dropped as "not registered".
+    It is now written the moment it comes, so it survives the ask leaving
+    memory before the agent's next call."""
+    from integrations.agent_engine import person_ask
+    ANNOUNCE_ONLY_KEY = _announce_only_key()
+    tg = _Adapter('telegram')
+    world.registry.register(tg)
+    asked = _post('telegram', 'hello')
+    _owner_answers(asked['ask_id'], ' -1009 ')
+    entry = world.admin._channels['telegram']
+    assert (entry['announce_chat_id'], entry[ANNOUNCE_ONLY_KEY]) == ('-1009', True)
+    assert '-1009' in world.config_file.read_text()
+    with person_ask._lock:                        # a restart, or an hour later
+        person_ask._asks.clear()
+    out = _post('telegram', 'hello')
+    assert tg.sent == [{'chat_id': '-1009', 'text': 'hello', 'media': None}]
+    assert out['sent'] is True and len(world.cards) == 1
 
-    def _set(channel, chat_id, user_id=None):
-        written.append((channel, chat_id, user_id))
-        targets.setdefault(channel, []).append(chat_id)
-        return 'set'
 
-    from integrations.agent_engine import marketing_tools
-    marketing_tools._DESTINATION_ASKS['telegram'] = 'a1'
-    with patch('integrations.agent_engine.person_ask.ask_state',
-               return_value={'status': 'answered',
-                             'answer': {'values': {'chat_id': ' -1009 '}}}), \
-         patch('integrations.channels.agent_tools.set_announcement_target', _set):
-        out, _ = _post(_Integration(tg), 'telegram', 'hello', targets=targets)
-    assert written == [('telegram', '-1009', OWNER)]
-    assert tg.sent[0]['chat_id'] == '-1009' and out['sent'] is True
-    assert 'telegram' not in marketing_tools._DESTINATION_ASKS
+def test_a_refused_answer_is_named_in_the_next_question(world):
+    tg = _Adapter('telegram')
+    world.registry.register(tg)
+    asked = _post('telegram', 'hello')
+    _owner_answers(asked['ask_id'], '12345')      # a private chat
+    assert 'telegram' not in world.admin._channels
+    again = _post('telegram', 'hello')
+    assert again['ask_id'] != asked['ask_id'] and len(world.cards) == 2
+    assert 'could not be used' in world.cards[1][1]['description']
+    assert 'one-to-one' in world.cards[1][1]['description']
+    assert tg.sent == []
 
 
-def test_a_channel_with_no_catalog_entry_asks_nothing_and_names_the_browser():
-    out, ask = _post(_Integration(), 'linkedin', 'hello')
-    ask.assert_not_called()
+def test_a_channel_with_no_catalog_entry_asks_nothing_and_names_the_browser(
+        world):
+    out = _post('linkedin', 'hello')
+    assert _card_requests(world) == [] and world.cards == []
     assert (out['success'], out['sent']) == (False, False)
     assert 'post_to_channel_via_browser' in out['error']
+
+
+def test_an_entry_that_only_holds_a_destination_is_never_activated_at_boot():
+    """The channel runs from the environment or a saved binding; activated
+    from its admin entry it would be built with no credential."""
+    from hartos import hartos_bootstrap
+    ANNOUNCE_ONLY_KEY = _announce_only_key()
+    channels = Mock()
+    channels.registry._adapters = {}
+    channels.register_channel.return_value = True
+    admin = Mock()
+    admin._channels = {
+        'telegram': {'channel_type': 'telegram', 'enabled': True,
+                     'announce_chat_id': '-1009', ANNOUNCE_ONLY_KEY: True},
+        'discord': {'channel_type': 'discord', 'enabled': True, 'token': 'd'},
+    }
+    with patch('integrations.channels.flask_integration.init_channels',
+               return_value=channels), \
+         patch('integrations.channels.admin.api.get_api', return_value=admin):
+        hartos_bootstrap._init_channel_adapters(Mock(), {})
+    registered = [c.args[0] for c in channels.register_channel.call_args_list]
+    assert registered == ['discord', 'web'], registered
+
+
+# ── Other senders on the same channels ──────────────────────────────
+
+def test_send_to_channel_says_an_unconfirmed_message_may_still_arrive(
+        world, monkeypatch):
+    from integrations.channels import flask_integration
+    from integrations.channels.agent_tools import build_channel_tool_closures
+    monkeypatch.setattr(flask_integration, 'CHANNEL_SEND_WAIT_S', 0.1)
+    tg = _Adapter('telegram', hold=0.5)
+    world.registry.register(tg)
+    send = next(t[2] for t in build_channel_tool_closures({'user_id': OWNER})
+                if t[0] == 'send_to_channel')
+    said = send('telegram', 'Your order is ready', '-1001')
+    assert len(tg.sent) == 1
+    assert 'may still arrive' in said and 'Do not send it again' in said
+
+
+def test_a_journey_message_not_confirmed_is_not_sent_on_another_channel(
+        world, monkeypatch):
+    from integrations.agent_engine.journey_engine import JourneyEngine
+    from integrations.channels import flask_integration
+    monkeypatch.setattr(flask_integration, 'CHANNEL_SEND_WAIT_S', 0.1)
+    tg = _Adapter('telegram', hold=0.5)
+    discord = _Adapter('discord')
+    world.registry.register(tg)
+    world.registry.register(discord)
+    engine = JourneyEngine()
+    monkeypatch.setattr(engine, 'get_channels_for_stage',
+                        lambda stage: ['email', 'telegram', 'discord'])
+    prospect = {'id': 'p1', 'email': 'ana@shop.example',
+                'channel_ids': {'telegram': 'tg-ana', 'discord': 'dc-ana'}}
+    assert engine.send_via_channel(prospect, 'hi', 'telegram') == {
+        'success': None, 'pending': True, 'channel': 'telegram'}
+    tg.sent.clear()
+    engine._try_alternate_channel(prospect)
+    assert len(tg.sent) == 1 and discord.sent == []
+    assert prospect['alternate_channel_tried'] == 'telegram'
+
+
+# ── Instagram feed and the channel registration guard ───────────────
+
+class _Instagram(_Adapter):
+    def __init__(self):
+        super().__init__('instagram')
+        self.calls = []
+
+    async def publish_reel(self, url, caption):
+        self.calls.append(('reel', url))
+        return SendResult(success=True, message_id='r-1')
+
+    async def publish_photo(self, url, caption):
+        self.calls.append(('photo', url))
+        return SendResult(success=True, message_id='p-1')
+
+
+def test_the_instagram_feed_posts_through_the_running_instagram_channel(world):
+    """It built a fresh adapter that nothing had connected, so every call
+    answered "Not connected" (review of f8fdb9c64)."""
+    from integrations.agent_engine.marketing_tools import _publish_instagram_feed
+    ig = _Instagram()
+    world.registry.register(ig)
+    reel = json.loads(_publish_instagram_feed(
+        'u', 'https://x.test/a.MOV?sig=1', 'c', _consent=lambda _u: True))
+    photo = json.loads(_publish_instagram_feed(
+        'u', 'https://x.test/a.jpg', 'c', _consent=lambda _u: True))
+    assert ig.calls == [('reel', 'https://x.test/a.MOV?sig=1'),
+                        ('photo', 'https://x.test/a.jpg')]
+    assert (reel['kind'], reel['media_id'], reel['success']) == ('reel', 'r-1', True)
+    assert (photo['kind'], photo['media_id']) == ('photo', 'p-1')
+
+
+def test_the_instagram_feed_with_instagram_not_running_posts_nothing(world):
+    from integrations.agent_engine.marketing_tools import _publish_instagram_feed
+    out = json.loads(_publish_instagram_feed(
+        'u', 'https://x.test/a.jpg', 'c', _consent=lambda _u: True))
+    assert out['success'] is False and out.get('sent') is False
 
 
 def test_register_channel_never_saves_an_alias_the_owner_has_not_entered():
@@ -674,33 +1024,3 @@ def test_register_channel_never_saves_an_alias_the_owner_has_not_entered():
                         '{"bot_token": "{{secret:TELEGRAM_BOT_TOKEN}}"}')
     get_api.assert_not_called()
     assert 'was not saved' in said and 'TELEGRAM_BOT_TOKEN' in said
-
-
-def test_the_instagram_feed_posts_a_video_as_a_reel_and_an_image_as_a_photo():
-    """_publish_instagram_feed and post_to_channel read one video rule
-    (_is_video_url); a case or query string does not change the answer."""
-    from integrations.agent_engine.marketing_tools import _publish_instagram_feed
-
-    class _Instagram:
-        def __init__(self):
-            self.calls = []
-
-        async def publish_reel(self, url, caption):
-            self.calls.append(('reel', url))
-            return _sent(success=True, message_id='r-1')
-
-        async def publish_photo(self, url, caption):
-            self.calls.append(('photo', url))
-            return _sent(success=True, message_id='p-1')
-
-    ig = _Instagram()
-    reel = json.loads(_publish_instagram_feed(
-        'u', 'https://x.test/a.MOV?sig=1', 'c', _adapter=ig,
-        _consent=lambda _u: True))
-    photo = json.loads(_publish_instagram_feed(
-        'u', 'https://x.test/a.jpg', 'c', _adapter=ig,
-        _consent=lambda _u: True))
-    assert ig.calls == [('reel', 'https://x.test/a.MOV?sig=1'),
-                        ('photo', 'https://x.test/a.jpg')]
-    assert (reel['kind'], reel['media_id']) == ('reel', 'r-1')
-    assert (photo['kind'], photo['media_id']) == ('photo', 'p-1')

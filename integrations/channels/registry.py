@@ -95,12 +95,17 @@ _MEDIA_MIME = {
 
 
 def media_kind(name):
-    """``(mime, MessageType)`` of the file ``name`` names (a path or a URL; a
-    URL's query string is ignored, case too), or None for a type no channel
-    is sent.  The one rule for what kind of attachment a file is: the reply
-    path's [[MEDIA:]] markers and the marketing tools' posts read it."""
+    """``(mime, MessageType)`` of the file ``name`` names (a path or a URL;
+    case is ignored, and so are a URL's query string and fragment), or None
+    for a type no channel is sent.  The one rule for what kind of attachment
+    a file is: the reply path's [[MEDIA:]] markers and the marketing tools'
+    posts read it.  A path is a name as it stands: '?' and '#' are ordinary
+    characters in a file name, and cutting at them dropped "clip#1.mp4" from
+    the reply path (review of f8fdb9c64)."""
     from .base import MessageType
-    base = str(name or '').split('?', 1)[0].split('#', 1)[0]
+    base = str(name or '')
+    if '://' in base:
+        base = base.split('?', 1)[0].split('#', 1)[0]
     mime = _MEDIA_MIME.get(os.path.splitext(base)[1].lower())
     if mime is None:
         return None

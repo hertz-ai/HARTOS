@@ -609,7 +609,8 @@ def _recent_entries(rows) -> int:
                and not _reopened(row))
 
 
-def request_credential(resource_description, agent_id=None) -> str:
+def request_credential(resource_description, agent_id=None, *,
+                       tell_alias=True) -> str:
     """What Request_Resource (both the LangChain tool and core.agent_tools
     request_resource) does: get the agent a credential without the agent
     ever seeing it.
@@ -621,6 +622,11 @@ def request_credential(resource_description, agent_id=None) -> str:
     consent card shows with a password field.  Accept stores the value and
     grants the row.  The agent is told the alias either way; resolve_aliases
     puts the value in where a tool runs.
+
+    ``tell_alias=False`` is for a tool that uses the value itself once the
+    owner enters it (post_to_channel connects the channel with it): the
+    agent is told that tool carries on, never the alias, which would invite
+    it to pass the credential somewhere itself (review of f8fdb9c64).
     """
     req = _parse_resource_request(resource_description)
     label = str(req.get('label') or req.get('key_name') or 'a credential')[:100]
@@ -629,10 +635,15 @@ def request_credential(resource_description, agent_id=None) -> str:
     name = vault.credential_name(req.get('key_name') or label,
                                  req.get('channel_type') or '')
     alias = '{{secret:' + name + '}}'
-    use = (f"use {alias} wherever the value is needed: it is filled in only "
-           f"when a tool runs, and you never see it. Do not ask for it in chat. "
-           f"If signing in with it fails, call this tool again with the same "
-           f'key_name and "rejected": true, and the owner is asked for it again.')
+    if tell_alias:
+        use = (f"use {alias} wherever the value is needed: it is filled in "
+               f"only when a tool runs, and you never see it. Do not ask for "
+               f"it in chat. If signing in with it fails, call this tool again "
+               f'with the same key_name and "rejected": true, and the owner is '
+               f'asked for it again.')
+    else:
+        use = (f"{used_by} uses it itself: you never see it and never need "
+               f"it. Do not ask for it in chat.")
     # The site refused the stored value: never hand it back, ask again.
     rejected = req.get('rejected') is True
 
@@ -663,7 +674,9 @@ def request_credential(resource_description, agent_id=None) -> str:
         (f"{label} was rejected when {used_by} tried it; enter it again."
          if rejected else f"{label} is needed for {used_by}."),
         str(req.get('description') or '').strip(),
-        f"It is kept encrypted on this computer; the agent only sees {alias}.",
+        (f"It is kept encrypted on this computer; the agent only sees {alias}."
+         if tell_alias else
+         "It is kept encrypted on this computer; the agent never sees it."),
     ]))
     try:
         from integrations.social.consent_service import (

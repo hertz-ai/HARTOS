@@ -793,7 +793,15 @@ def _init_channel_adapters(app, cfg: dict) -> None:
         activated_from_cfg = 0
         try:
             from integrations.channels.admin.api import get_api
+            from integrations.channels.agent_tools import ANNOUNCE_ONLY_KEY
             for ch_type, ch_cfg in get_api()._channels.items():
+                # An entry that only holds an announcement target: the
+                # channel runs from the environment or a saved binding, which
+                # start it below.  Activated here it would be built without
+                # its credential (for WhatsApp, the identity-less adapter
+                # _RESTORE_EXCLUDED rules out).
+                if ch_cfg.get(ANNOUNCE_ONLY_KEY):
+                    continue
                 if ch_cfg.get('enabled', True):
                     tok = ch_cfg.get('token') or ch_cfg.get('api_key')
                     if channels.register_channel(ch_type, token=tok):

@@ -345,7 +345,9 @@ class JourneyEngine:
 
         for ch in channels:
             result = self._send_channel_message(prospect, message, ch)
-            if result.get('success'):
+            # Pending may still arrive: the prospect is not messaged again on
+            # the next channel too.
+            if result.get('success') or result.get('pending'):
                 return result
 
         return {'success': False, 'error': 'no channel available'}
@@ -428,10 +430,18 @@ class JourneyEngine:
         if not chat_id:
             return {'success': False, 'channel': channel,
                     'error': f'no {channel} chat for this prospect'}
+        import concurrent.futures
         try:
-            from integrations.channels.flask_integration import get_channel_integration
+            from integrations.channels.flask_integration import (
+                CHANNEL_SEND_WAIT_S, get_channel_integration)
             result = get_channel_integration().send_threadsafe(
-                channel, chat_id, message, wait=15)
+                channel, chat_id, message, wait=CHANNEL_SEND_WAIT_S)
+        except concurrent.futures.TimeoutError:
+            # Still running on the adapter loop; it may yet arrive.  Not a
+            # failure: sending again would reach the prospect twice.
+            logger.warning('Journey message on %s not confirmed after %ss; it '
+                           'may still arrive', channel, CHANNEL_SEND_WAIT_S)
+            return {'success': None, 'pending': True, 'channel': channel}
         except Exception as e:
             logger.warning('Journey message on %s not sent: %s', channel, e)
             return {'success': False, 'channel': channel, 'error': str(e)}
@@ -455,7 +465,7 @@ class JourneyEngine:
                     "happy to chat here if that's easier."
                 )
                 result = self.send_via_channel(prospect, message, ch)
-                if result.get('success'):
+                if result.get('success') or result.get('pending'):
                     prospect['alternate_channel_tried'] = ch
                     prospect['updated_at'] = datetime.utcnow().isoformat()
                     return
