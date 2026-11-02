@@ -187,14 +187,17 @@ class ToolSchemaFitsLiveCtx(unittest.TestCase):
             f'message floor (1024) — otherwise llama-server answers '
             f'"request (N tokens) exceeds the available context size"')
 
-    def test_the_twenty_three_tool_set_that_works_is_left_alone(self):
-        """MAIN_LEG_CORE_TOOLS at 2,489 tok fits 4,096 — 516 such bodies
-        returned 200 and must not be pruned by a fix aimed at the 400s."""
+    def test_the_main_leg_core_tool_set_that_works_is_left_alone(self):
+        """MAIN_LEG_CORE_TOOLS fits 4,096 — measured at 23 names and 2,489 tok,
+        when 516 such bodies returned 200 and must not be pruned by a fix aimed
+        at the 400s.  It is 24 names since ask_person joined it (9d7bcef0); the
+        pin is the set as it is, and that it still fits untouched, not the
+        count: a name that no longer fits is what this test must catch."""
         _pin_ctx(self._restore, 4096)
         assistant = _FakeAgent(sorted(MAIN_LEG_CORE_TOOLS), n_props=1)
-        self.assertEqual(len(assistant.llm_config['tools']), 23,
-                         'MAIN_LEG_CORE_TOOLS is the 23-name set the 200 '
-                         'bodies carry')
+        self.assertEqual(len(assistant.llm_config['tools']),
+                         len(MAIN_LEG_CORE_TOOLS),
+                         'every MAIN_LEG_CORE_TOOLS name is on the assistant')
         dropped = fit_schema_to_ctx(assistant)
         self.assertEqual(dropped, set(),
                          f'the working set must survive untouched; dropped '
