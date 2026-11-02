@@ -10,10 +10,16 @@ that later went away left its goal paused for good, and one that stayed was
 never put to anyone.
 
 The scan now completes such a goal once its loophole is gone and the checks
-that report it ran; otherwise resumes it once per cooldown, up to a cap;
-then tells its person.  Driven through the scan's real entry point
-(auto_remediate_loopholes) on real goal rows; the person's notification is
-the boundary.
+that report it ran; otherwise resumes it once per cooldown, up to a cap,
+while the loophole is still reported; never resumes it while the loophole
+cannot be measured; then tells its person in plain words.  Driven as the
+daemon's scan tick drives it (recheck_paused_remediations, then
+auto_remediate_loopholes with the same health) on real goal rows; the
+person's notification is the boundary.
+
+Review of 3bb05b2e8 added: a re-check that fails must not wipe the tick
+(M1), a kept "gone" never completes a goal (M2), an unmeasured loophole is
+not resumed (M3).
 """
 import os
 import sys
@@ -86,8 +92,11 @@ def _health(*types, severity='high', failed=()):
 
 
 def _scan(db, health):
+    """One scan tick, as agent_daemon._tick runs it: the re-check reads the
+    loop health, and the seeding scan gets what it read."""
     with patch(HEALTH, return_value=health):
-        return goal_seeding.auto_remediate_loopholes(db)
+        read = goal_seeding.recheck_paused_remediations(db)
+        return goal_seeding.auto_remediate_loopholes(db, health=read)
 
 
 def test_a_loophole_that_has_gone_completes_its_paused_goal(db):
@@ -140,7 +149,9 @@ def test_after_the_cap_its_person_is_told_once_and_it_stays_paused(db):
     assert goal.status == 'paused'
     tell.assert_called_once()
     reason = tell.call_args.args[2]
-    assert "'single_node' is still reported" in reason
+    assert 'ran again and the problem it works on is still there' in reason
+    assert 'single_node still here' in reason          # the check's own message
+    assert 'loophole' not in reason and 'times' not in reason
     assert goal.config_json.get('told_at')
 
 
@@ -153,6 +164,67 @@ def test_nobody_to_tell_is_tried_again_only_after_the_cooldown(db):
     assert tell.call_count == 1, 'a scan every five minutes re-tried the notice'
     db.refresh(goal)
     assert not goal.config_json.get('told_at')
+
+
+def test_nobody_to_tell_is_tried_again_once_the_cooldown_has_passed(db):
+    goal = _paused(db, paused_minutes_ago=600, remediation_resume_count=_CAP,
+                   tell_tried_at=(datetime.utcnow()
+                                  - timedelta(minutes=61)).isoformat())
+    with patch.object(GoalManager, '_tell_its_person', return_value=True) as tell:
+        _scan(db, _health('single_node'))
+    tell.assert_called_once()
+    db.refresh(goal)
+    assert goal.config_json.get('told_at')
+
+
+def test_a_loophole_that_cannot_be_measured_is_never_resumed(db):
+    """Review of 3bb05b2e8, M3: with the hive-agent check unable to run
+    (no world model answering), central resumed a paused single_node goal
+    three times for marketing turns nothing could judge, then sent a push
+    naming internal check ids."""
+    goal = _paused(db, paused_minutes_ago=90)
+    with patch.object(GoalManager, '_tell_its_person', return_value=True) as tell:
+        _scan(db, _health(failed=['hivemind_agents']))
+    db.refresh(goal)
+    assert goal.status == 'paused'
+    assert not goal.config_json.get('remediation_resume_count')
+    tell.assert_called_once()
+    reason = tell.call_args.args[2]
+    assert 'cannot check whether the problem it works on is fixed' in reason
+    for internal in ('hivemind_agents', 'not measured', 'loophole'):
+        assert internal not in reason
+
+
+def test_a_refused_resume_does_not_count_toward_the_cap(db):
+    goal = _paused(db, 'cold_start', paused_minutes_ago=61)
+    with patch.object(GoalManager, 'resume_goal',
+                      return_value={'success': False, 'error': 'refused'}):
+        _scan(db, _health('cold_start'))
+    db.refresh(goal)
+    assert goal.status == 'paused'
+    assert not goal.config_json.get('remediation_resume_count')
+
+
+def test_a_refused_completion_leaves_the_goal_as_it_was(db):
+    goal = _paused(db)
+    before = dict(goal.config_json)
+    with patch.object(GoalManager, 'update_goal_status',
+                      return_value={'success': False, 'error': 'refused'}):
+        _scan(db, _health())
+    db.flush()                  # what the session would write, read back
+    db.refresh(goal)
+    assert goal.status == 'paused'
+    assert goal.config_json == before
+
+
+def test_the_goal_volume_check_failing_does_not_hold_a_single_node_goal(db):
+    """That check reports single_node only at medium, which never holds a
+    goal, so its failing says nothing about the high report (review of
+    3bb05b2e8)."""
+    goal = _paused(db)
+    _scan(db, _health(failed=['agent_performance']))
+    db.refresh(goal)
+    assert goal.status == 'completed'
 
 
 def test_a_goal_paused_for_another_reason_is_left_alone(db):
@@ -191,15 +263,37 @@ class _SettleDb:
         return q
 
 
-def test_the_settle_reads_the_scans_health_while_it_is_fresh():
+def test_a_kept_still_there_pauses_the_settle_with_no_new_check():
     """Review of 6047bcf19, finding 4: every settle ran every check again,
-    up to 109 s with the HevolveAI address an unreachable host."""
+    up to 109 s with the HevolveAI address an unreachable host.  The scan's
+    result, while fresh, is enough to PAUSE."""
     from integrations.agent_engine.agent_daemon import _settle_dispatched_goal
     goal = _SettleGoal()
-    with patch(HEALTH, return_value=_health()) as health:
-        goal_seeding.auto_remediate_loopholes(_SettleDb())
+    with patch(HEALTH, return_value=_health('single_node')) as health:
+        goal_seeding.recheck_paused_remediations(_SettleDb())   # the scan keeps it
         _settle_dispatched_goal(_SettleDb(), goal, 'g1')
     assert health.call_count == 1, 'the settle ran every check again'
+    assert goal.status == 'paused'
+
+
+def test_a_kept_gone_is_checked_again_before_a_goal_completes():
+    """Review of 3bb05b2e8, M2: a "gone" kept up to ten minutes completed
+    a goal whose loophole was back."""
+    from integrations.agent_engine.agent_daemon import _settle_dispatched_goal
+    goal = _SettleGoal()
+    with patch(HEALTH, side_effect=[_health(), _health('single_node')]) as health:
+        goal_seeding.recheck_paused_remediations(_SettleDb())   # kept: gone
+        _settle_dispatched_goal(_SettleDb(), goal, 'g1')        # now: back
+    assert health.call_count == 2
+    assert goal.status == 'paused', 'a kept "gone" completed the goal'
+
+
+def test_a_fresh_gone_completes_the_goal():
+    from integrations.agent_engine.agent_daemon import _settle_dispatched_goal
+    goal = _SettleGoal()
+    with patch(HEALTH, side_effect=[_health(), _health()]):
+        goal_seeding.recheck_paused_remediations(_SettleDb())
+        _settle_dispatched_goal(_SettleDb(), goal, 'g1')
     assert goal.status == 'completed'
 
 
@@ -298,3 +392,57 @@ def test_a_node_whose_goals_are_all_paused_still_judges_them():
     recheck.assert_called_once()
     assert recheck.call_args.args[0] is db
     seed.assert_not_called()      # no active goals: nothing new is seeded
+
+
+def test_a_recheck_that_fails_does_not_wipe_the_tick(db, monkeypatch, caplog):
+    """Review of 3bb05b2e8, M1: the re-check's error was caught without a
+    rollback, so every later query in the tick failed on the failed
+    transaction and the tick's reset emptied _dispatch_backoff: a backed-off
+    failing goal was dispatched again at once.  Real session; the re-check
+    leaves it failed as a refused write does."""
+    import logging
+    from integrations.agent_engine import agent_daemon
+
+    def _write_refused(session, health=None):
+        for _ in range(2):          # the second insert of one id is refused
+            session.add(AgentGoal(id='same-id', goal_type='marketing',
+                                  title='t', description='', config_json={},
+                                  status='paused', created_by='auto_remediation',
+                                  spark_budget=1))
+            session.flush()
+
+    monkeypatch.setitem(agent_daemon._dispatch_backoff, 'goal-backing-off',
+                        {'failures': 2})
+    daemon = agent_daemon.AgentDaemon()
+    daemon._tick_count = daemon._remediate_every - 1                 # a scan tick
+    with patch('integrations.social.models.get_db', return_value=db), \
+            patch('integrations.agent_engine.dispatch.should_yield_to_user',
+                  return_value=False), \
+            patch.object(agent_daemon.AgentDaemon, '_settle_metered_usage'), \
+            patch.object(agent_daemon.AgentDaemon, '_trends_tick'), \
+            patch.object(goal_seeding, 'recheck_paused_remediations',
+                         _write_refused), \
+            caplog.at_level(logging.WARNING):
+        daemon._tick()
+    assert 'Paused remediation re-check skipped' in caplog.text
+    assert 'state reset' not in caplog.text
+    assert agent_daemon._dispatch_backoff.get('goal-backing-off') == {'failures': 2}
+
+
+def test_every_seeded_loophole_names_the_checks_that_judge_it():
+    """A type with a remediation template and no LOOPHOLE_CHECKS entry
+    (learning_stall) could be seeded and never judged."""
+    from integrations.agent_engine.ip_service import LOOPHOLE_CHECKS
+    assert set(goal_seeding.LOOPHOLE_REMEDIATION_MAP) <= set(LOOPHOLE_CHECKS)
+
+
+def test_the_improvement_verdict_says_a_skill_count_was_not_measured():
+    """With no world model answering, the RALT check does not run; its 0 is
+    no count of skills."""
+    from integrations.agent_engine.ip_service import IPService
+    health = _loop_health_with(_Bridge(answering=False))
+    with patch(HEALTH, return_value=health):
+        verdict = IPService.verify_exponential_improvement(None)
+    evidence = ' | '.join(verdict['evidence'])
+    assert 'RALT propagation not measured' in evidence
+    assert 'Only 0 RALT' not in evidence

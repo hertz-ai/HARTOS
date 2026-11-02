@@ -31,14 +31,20 @@ logger = logging.getLogger('hevolve_social')
 #: type.  A check that failed, or could not measure, leaves only these types
 #: unconfirmed (goal_seeding.remediation_still_open); before this map any
 #: failed check blocked every type (review of 6047bcf19, finding 3).  A type
-#: no check reports (gossip_partition) cannot be confirmed fixed from here.
+#: no check reports (gossip_partition, learning_stall) cannot be confirmed
+#: fixed from here.  Every type goal_seeding.LOOPHOLE_REMEDIATION_MAP can seed
+#: has an entry (tests/unit/test_paused_remediation_is_judged_again.py).
+#: single_node lists only the hive-agent check: the goal-volume check reports
+#: it at medium, which never holds a goal (SEVERE_SEVERITIES), so its failing
+#: says nothing about the high report (review of 3bb05b2e8).
 LOOPHOLE_CHECKS = {
     'cold_start': ('world_model', 'ralt_propagation'),
     'feedback_staleness': ('world_model',),
-    'single_node': ('agent_performance', 'hivemind_agents'),
+    'single_node': ('hivemind_agents',),
     'guardrail_drift': ('ralt_propagation',),
     'recipe_drift': ('recipe_adoption',),
     'gossip_partition': (),
+    'learning_stall': (),
 }
 
 #: The severities that make a loophole severe, in one place: the daemon
@@ -550,7 +556,11 @@ class IPService:
 
         # Check 3: RALT propagation
         ralt = health['ralt_propagation']
-        if ralt.get('total_distributed', 0) >= 3:
+        if 'ralt_propagation' in health.get('failed_checks', []):
+            # Not run (no world model answering): its 0 is no count.
+            evidence.append('FAIL: RALT propagation not measured (the world '
+                            'model does not answer)')
+        elif ralt.get('total_distributed', 0) >= 3:
             checks_passed += 1
             evidence.append(
                 f'RALT distributed {ralt["total_distributed"]} skills across hive')

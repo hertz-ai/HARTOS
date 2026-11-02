@@ -2481,27 +2481,38 @@ REMEDIATION_COOLDOWN_MINUTES = 60
 #: person and leaves the goal paused.
 REMEDIATION_RESUME_CAP = 3
 
-#: How old a loop health result may be and still settle a remediation goal.
+#: How old a loop health result may be and still PAUSE a remediation goal.
 #: The daemon's scan (every HEVOLVE_REMEDIATE_INTERVAL_TICKS ticks, five
 #: minutes by default) refreshes it, and a settle in between reads that result
 #: instead of running every check again (review of 6047bcf19, finding 4: up to
-#: 109 s per settle with the HevolveAI address an unreachable host).  A stale
-#: "still there" only pauses the goal; the next scan judges it again on a
-#: fresh result (recheck_paused_remediations).
+#: 109 s per settle with the HevolveAI address an unreachable host).  A kept
+#: "still there" only pauses the goal, and the next scan judges it again on a
+#: fresh result (recheck_paused_remediations).  A kept "gone" never completes
+#: one: the loophole may be back, so completion reads a fresh result (review
+#: of 3bb05b2e8, M2).
 LOOP_HEALTH_FRESH_S = 600
 
 _loop_health_seen = {'at': None, 'health': None}
 _loop_health_lock = threading.Lock()
 
 
-def loop_health(max_age_s=0):
-    """IPService.get_loop_health, or its last result while that is younger
-    than ``max_age_s`` seconds.  Raises what the health check raises; a check
-    that raised is never kept."""
+def _kept_loop_health(max_age_s):
+    """The last loop health result while it is younger than ``max_age_s``
+    seconds, else None."""
     with _loop_health_lock:
         at, health = _loop_health_seen['at'], _loop_health_seen['health']
     if max_age_s and at is not None and time.monotonic() - at <= max_age_s:
         return health
+    return None
+
+
+def loop_health(max_age_s=0):
+    """IPService.get_loop_health, or its last result while that is younger
+    than ``max_age_s`` seconds.  Raises what the health check raises; a check
+    that raised is never kept."""
+    kept = _kept_loop_health(max_age_s)
+    if kept is not None:
+        return kept
     from .ip_service import IPService
     health = IPService.get_loop_health()
     with _loop_health_lock:
@@ -2534,34 +2545,74 @@ def remediation_still_open(loophole_type, health=None):
     each while central stayed one node, and every completion let the next
     re-seed in.
 
-    ``health`` is a loop health result the caller holds (the scan's); without
-    one, the last result is read while it is fresh (LOOP_HEALTH_FRESH_S).
-    get_loop_health swallows each check's error, so a check that failed or
-    could not measure reports nothing it measures (the world-model check
-    reports cold_start in its place).  A loophole that is missing while one
-    of ITS checks (ip_service.LOOPHOLE_CHECKS) is listed in failed_checks is
-    "not confirmed", never "fixed".
+    ``health`` is a loop health result the caller holds (the scan's, read
+    this tick).  Without one, the last result is read while it is fresh
+    (LOOP_HEALTH_FRESH_S), and only to pause: a kept "still there" answers
+    here, a kept "gone" is read again fresh before it completes anything
+    (review of 3bb05b2e8, M2).  get_loop_health swallows each check's error,
+    so a check that failed or could not measure reports nothing it measures
+    (the world-model check reports cold_start in its place).  A loophole that
+    is missing while one of ITS checks (ip_service.LOOPHOLE_CHECKS) is listed
+    in failed_checks is "not confirmed", never "fixed".
     """
+    try:
+        if health is None:
+            kept = _kept_loop_health(LOOP_HEALTH_FRESH_S)
+            if kept is not None:
+                state, reason = _remediation_state(loophole_type, kept)
+                if state != REMEDIATION_GONE:
+                    return reason
+            health = loop_health()
+    except Exception as e:
+        return f"the loop health check could not run ({type(e).__name__})"
+    return _remediation_state(loophole_type, health)[1]
+
+
+#: What _remediation_state finds of a remediation goal's loophole.
+REMEDIATION_GONE = 'gone'
+REMEDIATION_REPORTED = 'reported'
+REMEDIATION_UNMEASURED = 'unmeasured'
+
+
+def _remediation_state(loophole_type, health):
+    """``(state, reason)`` for a remediation goal's loophole in ``health``:
+    REMEDIATION_GONE (reason None), REMEDIATION_REPORTED (still reported at a
+    severity a remediation answers; running it again may fix it), or
+    REMEDIATION_UNMEASURED (a check that reports it did not run, or none
+    does: nothing on this node can judge another run)."""
     from .ip_service import LOOPHOLE_CHECKS
-    if health is None:
-        try:
-            health = loop_health(LOOP_HEALTH_FRESH_S)
-        except Exception as e:
-            return f"the loop health check could not run ({type(e).__name__})"
     for loophole in _severe_loopholes(health, loophole_type):
         detail = loophole.get('message')
-        return (f"the loophole '{loophole_type}' is still reported"
-                + (f" ({detail})" if detail else ''))
+        return REMEDIATION_REPORTED, (
+            f"the loophole '{loophole_type}' is still reported"
+            + (f" ({detail})" if detail else ''))
     checks = LOOPHOLE_CHECKS.get(loophole_type)
     if not checks:
-        return (f"no loop health check reports '{loophole_type}', so its fix "
-                f"cannot be confirmed")
+        return REMEDIATION_UNMEASURED, (
+            f"no loop health check reports '{loophole_type}', so its fix "
+            f"cannot be confirmed")
     failed = set(health.get('failed_checks') or [])
     unmeasured = [check for check in checks if check in failed]
     if unmeasured:
-        return ("the loop health check could not confirm it: "
-                f"{', '.join(unmeasured)} not measured")
-    return None
+        return REMEDIATION_UNMEASURED, (
+            "the loop health check could not confirm it: "
+            f"{', '.join(unmeasured)} not measured")
+    return REMEDIATION_GONE, None
+
+
+def _remediation_notice(goal, state, health, loophole_type):
+    """What a paused remediation goal's person is told, in plain words: no
+    check or loophole ids (review of 3bb05b2e8, M3)."""
+    if state == REMEDIATION_UNMEASURED:
+        return (f"'{goal.title}' did its work, but this computer cannot check "
+                f"whether the problem it works on is fixed, so it stays "
+                f"paused.  Resume it if you want it to run again, or archive "
+                f"it.")
+    details = [l.get('message') for l in _severe_loopholes(health, loophole_type)
+               if l.get('message')]
+    return (f"'{goal.title}' ran again and the problem it works on is still "
+            f"there" + (f": {details[0]}" if details else '') + ".  It stays "
+            f"paused until that changes, or until you resume it.")
 
 
 def recheck_paused_remediations(db, health=None):
@@ -2574,18 +2625,22 @@ def recheck_paused_remediations(db, health=None):
     paused goal blocks the re-seed of its type, so a loophole that went away
     left its goal paused for good and one that stayed was never put to
     anyone.  Each goal now:
-      - completes once remediation_still_open finds its loophole gone and its
-        checks run (completion_grounding 'loophole_gone');
-      - otherwise is resumed through GoalManager.resume_goal once its pause
-        is a cooldown old (REMEDIATION_COOLDOWN_MINUTES), up to
-        REMEDIATION_RESUME_CAP times, so its remediation runs again and the
-        gate judges it again;
-      - then stays paused and its person is told once
-        (GoalManager._tell_its_person, phone push included).  With nobody to
-        tell, the notice is tried again once per cooldown, not on every scan.
-    A second call with the same health changes nothing.  The daemon calls
-    this before its no-goals stop, whose early return skips the tick's own
-    commit, so the writes are committed here (as in
+      - completes once its loophole is gone and its checks ran
+        (_remediation_state; completion_grounding 'loophole_gone');
+      - while its loophole is still reported, is resumed through
+        GoalManager.resume_goal once its pause is a cooldown old
+        (REMEDIATION_COOLDOWN_MINUTES), up to REMEDIATION_RESUME_CAP times,
+        so its remediation runs again and the gate judges it again;
+      - while its loophole cannot be measured here, is never resumed: no
+        check could judge another run (review of 3bb05b2e8, M3: central ran
+        three such turns for nothing);
+      - otherwise stays paused and its person is told once, in plain words
+        (_remediation_notice; GoalManager._tell_its_person, phone push
+        included).  With nobody to tell, the notice is tried again once per
+        cooldown, not on every scan.
+    The daemon calls this once per scan tick, before its no-goals stop,
+    whose early return skips the tick's own commit, so the writes are
+    committed here (as in
     agent_daemon._resume_goals_paused_for_a_cleared_cause).  A refused write
     leaves the goal as it was.
     """
@@ -2615,8 +2670,8 @@ def recheck_paused_remediations(db, health=None):
         if (goal.status != 'paused' or not cfg.get('remediation')
                 or cfg.get('pause_cause') != PAUSE_CAUSE_REMEDIATION_OPEN):
             continue
-        still_open = remediation_still_open(cfg['remediation'], health)
-        if still_open is None:
+        state, still_open = _remediation_state(cfg['remediation'], health)
+        if state == REMEDIATION_GONE:
             done = dict(cfg)
             for key in PAUSE_RECORD_KEYS:
                 if key in done:
@@ -2634,7 +2689,7 @@ def recheck_paused_remediations(db, health=None):
                 goal.config_json = cfg
             continue
         resumes = int(cfg.get('remediation_resume_count', 0) or 0)
-        if resumes < REMEDIATION_RESUME_CAP:
+        if state == REMEDIATION_REPORTED and resumes < REMEDIATION_RESUME_CAP:
             if not _a_cooldown_ago(cfg.get('paused_at')):
                 continue
             result = GoalManager.resume_goal(
@@ -2652,9 +2707,7 @@ def recheck_paused_remediations(db, health=None):
         tried = cfg.get('tell_tried_at')
         if cfg.get('told_at') or (tried and not _a_cooldown_ago(tried)):
             continue
-        reason = (f"'{goal.title}' was run again {resumes} times and "
-                  f"{still_open}.  It stays paused until the loophole goes "
-                  f"or you resume it.")
+        reason = _remediation_notice(goal, state, health, cfg['remediation'])
         mark = {'tell_tried_at': now.isoformat()}
         if GoalManager._tell_its_person(db, goal, reason):
             mark['told_at'] = now.isoformat()
@@ -2674,8 +2727,10 @@ def auto_remediate_loopholes(db, health=None) -> int:
     AND no existing remediation goal for that
     loophole type within the cooldown window — counting completed/archived
     goals too, not just active/paused (the flap bug prior to 2026-04-29).
-    The goals the completion gate paused are judged again first
-    (recheck_paused_remediations), with the same health.
+    The goals the completion gate paused are judged by the daemon earlier
+    in the same tick (recheck_paused_remediations, whose health it passes
+    here); judging them here too told a goal this tick's settle had just
+    paused, mid-tick (review of 3bb05b2e8).
 
     Args:
         db: SQLAlchemy session (caller owns transaction)
@@ -2695,8 +2750,6 @@ def auto_remediate_loopholes(db, health=None) -> int:
         except Exception as e:
             logger.debug(f"Loop health check failed: {e}")
             return 0
-
-    recheck_paused_remediations(db, health)
 
     loopholes = _severe_loopholes(health)
     if not loopholes:

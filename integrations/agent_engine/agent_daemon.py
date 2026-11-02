@@ -2099,6 +2099,11 @@ class AgentDaemon:
                     from .goal_seeding import recheck_paused_remediations
                     remediation_health = recheck_paused_remediations(db)
                 except Exception as e:
+                    # Rolled back, or every later query in this tick fails
+                    # on the failed transaction and the tick's reset empties
+                    # _dispatch_backoff (review of 3bb05b2e8, M1: measured
+                    # with "database is locked").
+                    db.rollback()
                     logger.warning(f"Paused remediation re-check skipped: {e}")
 
             # DETERMINISTIC STOP: no goals = no action = system is inert
