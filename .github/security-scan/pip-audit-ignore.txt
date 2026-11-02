@@ -305,7 +305,11 @@ PYSEC-2026-1806  # protobuf==4.23.3 fixed in 4.25.8, 5.29.5, 6.31.1
 # pyarrow==14.0.1: 1 ids; inherited pin, not in KNOWN_ISSUES.md
 PYSEC-2024-161  # pyarrow==14.0.1 fixed in 17.0.0
 
-# pyasn1==0.5.0: 4 ids; inherited pin, not in KNOWN_ISSUES.md
+# pyasn1==0.5.0: 8 ids; inherited pin, not in KNOWN_ISSUES.md
+CVE-2026-119194  # pyasn1==0.5.0 fixed in 0.6.5
+CVE-2026-119195  # pyasn1==0.5.0 fixed in 0.6.5
+CVE-2026-119196  # pyasn1==0.5.0 fixed in 0.6.5
+CVE-2026-119197  # pyasn1==0.5.0 fixed in 0.6.5
 PYSEC-2026-2263  # pyasn1==0.5.0 fixed in 0.6.3
 PYSEC-2026-3455  # pyasn1==0.5.0 fixed in 0.6.4
 PYSEC-2026-3456  # pyasn1==0.5.0 fixed in 0.6.4
@@ -315,7 +319,7 @@ PYSEC-2026-3457  # pyasn1==0.5.0 fixed in 0.6.4
 PYSEC-2026-4141  # pyjwt==2.14.0 fixed in 2.15.0
 PYSEC-2026-4183  # pyjwt==2.14.0 fixed in 2.15.0
 
-# pypdf==3.17.1: 60 ids; inherited pin, not in KNOWN_ISSUES.md
+# pypdf==3.17.1: 67 ids; inherited pin, not in KNOWN_ISSUES.md
 CVE-2026-113786  # pypdf==3.17.1 fixed in 6.21.1
 CVE-2026-113789  # pypdf==3.17.1 fixed in 6.21.0
 CVE-2026-113790  # pypdf==3.17.1 fixed in 6.21.0
@@ -327,6 +331,13 @@ CVE-2026-113795  # pypdf==3.17.1 fixed in 6.20.0
 CVE-2026-115572  # pypdf==3.17.1 fixed in 6.21.2
 CVE-2026-115580  # pypdf==3.17.1 fixed in 6.21.2
 CVE-2026-115585  # pypdf==3.17.1 fixed in 6.21.2
+CVE-2026-119203  # pypdf==3.17.1 fixed in 6.21.4
+CVE-2026-119204  # pypdf==3.17.1 fixed in 6.21.4
+CVE-2026-119205  # pypdf==3.17.1 fixed in 6.21.4
+CVE-2026-119206  # pypdf==3.17.1 fixed in 6.21.3
+CVE-2026-119207  # pypdf==3.17.1 fixed in 6.21.3
+CVE-2026-119208  # pypdf==3.17.1 fixed in 6.21.3
+CVE-2026-119209  # pypdf==3.17.1 fixed in 6.21.3
 CVE-2026-57204  # pypdf==3.17.1 fixed in 6.13.3
 PYSEC-2026-1827  # pypdf==3.17.1 fixed in 6.6.2
 PYSEC-2026-1828  # pypdf==3.17.1 fixed in 6.6.0
