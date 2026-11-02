@@ -10,6 +10,8 @@ from typing import Optional, List
 from datetime import datetime
 
 from .models import get_db, User, Post
+# The module, not the names: the one refusal rule is read at call time.
+from . import auth as _auth
 from .services import (
     UserService, PostService, CommentService, VoteService, FollowService
 )
@@ -59,6 +61,14 @@ class ExternalBotRegistry:
             user = db.query(User).filter(User.username == username).first()
             if not user or user.agent_id != agent_id:
                 raise
+
+        # The caller is handed this account's api_token, so the door asks
+        # the ONE "may this account act here" rule the Bearer doors ask
+        # (auth.user_refusal), in its own reply shape ("Account is banned"):
+        # a banned bot re-registering gets no token back.
+        why = _auth.user_refusal(user)
+        if why:
+            raise ValueError("Account is " + _auth.user_refusal_words(why))
 
         # Store bot metadata in settings JSON
         user.settings = {

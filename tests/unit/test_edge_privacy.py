@@ -273,3 +273,74 @@ class TestSingletonAndDRY:
         assert 'PII_PATTERNS' not in source
         assert r'\b\d{3}-\d{2}-\d{4}' not in source  # No SSN regex
         assert r'@[A-Za-z0-9' not in source  # No email regex
+
+
+# ═══════════════════════════════════════════════════════════════
+# 6. A secret's name, in any spelling
+# ═══════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize('name, form', [
+    ('userPassword', 'user_password'), ('API-Key', 'api_key'),
+    ('Your UPI PIN', 'your_upi_pin'),
+    # where an acronym ends, and a number on a name (review of e6eed01ae)
+    ('DBPassword', 'db_password'), ('APIToken', 'api_token'),
+    ('JWTToken', 'jwt_token'), ('AWSSecretKey', 'aws_secret_key'),
+    ('OTPCode', 'otp_code'), ('password2', 'password'), ('pwd2', 'pwd'),
+    ('otp1', 'otp'), ('oauth2Token', 'oauth_token'), ('', ''), (None, ''),
+])
+def test_secret_key_form_reads_a_name_in_any_spelling(name, form):
+    from security.edge_privacy import secret_key_form
+    assert secret_key_form(name) == form
+
+
+@pytest.mark.parametrize('name', ['DBPassword', 'SSHPassword', 'APIToken',
+                                  'JWTToken', 'password1', 'password2', 'pwd2',
+                                  'clientSecret'])
+def test_a_secrets_name_in_any_spelling_is_a_secret(name):
+    from security.edge_privacy import is_secret_key, secret_key_form
+    assert is_secret_key(secret_key_form(name))
+
+
+@pytest.mark.parametrize('name', ['max_tokens', 'tokenizer', 'token_type',
+                                  'secret_name', 'mp3_url', 'top50'])
+def test_a_name_that_only_holds_a_secrets_word_is_not_a_secret(name):
+    from security.edge_privacy import is_secret_key, secret_key_form
+    assert not is_secret_key(secret_key_form(name))
+
+
+# A secret's name glued into one word (review of 83f44ebb1, M1): the rule
+# reads it at the end of the name (accesstoken, clientsecret, secretkey) or,
+# for a password, anywhere in it (newpassword), so the scrub, person_ask and
+# the song lists give one answer.
+@pytest.mark.parametrize('name', ['newpassword', 'confirmpassword', 'userpassword',
+                                  'NEWPASSWORD', 'passwordhash', 'accesstoken',
+                                  'apitoken', 'authtoken', 'refreshtoken',
+                                  'bearertoken', 'clientsecret', 'secretkey',
+                                  'privatekey', 'accesskey', 'myapikey',
+                                  'sessioncookie', 'usercredentials', 'secret_key'])
+def test_a_secrets_name_glued_into_one_word_is_a_secret(name):
+    from security.edge_privacy import is_secret_key, secret_key_form
+    assert is_secret_key(secret_key_form(name))
+
+
+# A short secret word (pass, pwd, pin, otp) is read only as a word of its
+# own: glued, it ends too many everyday names.
+@pytest.mark.parametrize('name', ['compass', 'boardingpass', 'bypass', 'spin',
+                                  'gpiopin', 'tokenizer', 'max_tokens', 'secretary',
+                                  'cookbook', 'token_count'])
+def test_a_short_secret_word_is_not_read_inside_a_glued_name(name):
+    from security.edge_privacy import is_secret_key, secret_key_form
+    assert not is_secret_key(secret_key_form(name))
+
+
+@pytest.mark.parametrize('key', ['newPassword', 'accessToken', 'clientsecret',
+                                 'secretKey'])
+def test_a_value_under_a_glued_secret_name_never_leaves_the_node(key):
+    """The egress scrub reads the raw key lowercased: 'accessToken' reaches
+    it as 'accesstoken', so a glued name is the one it meets."""
+    from security.edge_privacy import redact_secret_leaves, scrub_for_egress
+    data = {'note': 'hello', key: 'opaque-value-1234'}
+    out = scrub_for_egress(data)
+    assert out[key] != 'opaque-value-1234' and out['note'] == 'hello'
+    copy, n = redact_secret_leaves(data)
+    assert copy[key] != 'opaque-value-1234' and n == 1

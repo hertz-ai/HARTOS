@@ -154,7 +154,8 @@ def env_flag(name: str, default: bool) -> bool:
     return flag_value(os.environ.get(name, ''), default)
 
 
-def env_int(name: str, default: int, minimum: int = None) -> int:
+def env_int(name: str, default: int, minimum: int = None,
+            clamp: bool = False) -> int:
     """Integer env value; '' and junk fall back to the default instead
     of int('') crashing (the HEVOLVE_VLM_CAPTION_PORT class of bug —
     and the default is typed int, never the '8080'-str-vs-8080-int
@@ -162,6 +163,13 @@ def env_int(name: str, default: int, minimum: int = None) -> int:
 
     A value that is set but unusable (junk, or below ``minimum``) falls back
     LOUDLY: the operator set it for a reason, so say it was not applied.
+
+    ``clamp=True`` makes a value below ``minimum`` the minimum itself, said
+    the same way, for a consumer that can take no less (a Kong rate limit
+    is at least 1 request): the operator's 0 then means "as few as it can
+    be", not "whatever the default is".  The Kong LLM-gateway onboarding
+    used to keep its own silent ``max(1, int(...))`` reader for this
+    (parallel-path audit 2026-10-27, item 2); this is the ONE reader.
     """
     raw = os.environ.get(name, '').strip()
     if not raw:
@@ -173,6 +181,10 @@ def env_int(name: str, default: int, minimum: int = None) -> int:
                        name, raw, default)
         return default
     if minimum is not None and value < minimum:
+        if clamp:
+            logger.warning("%s=%s is below the minimum %s; using the minimum",
+                           name, value, minimum)
+            return minimum
         logger.warning("%s=%s is below the minimum %s; using the default %s",
                        name, value, minimum, default)
         return default
@@ -257,11 +269,15 @@ def get_db_url() -> str:
 # running against a private Hevolve installation.  Resolves to '' if
 # the env override is set to empty, which callers must treat as
 # "no central available — skip cross-device merge".
-# Host comes from the ONE literal (core.constants.CENTRAL_HOST); the 8443/db
-# path is this service's own and stays here. Composing keeps the hostname from
+# Host comes from the ONE literal (core.constants.CENTRAL_HOST); the /db path
+# is this service's own and stays here. Composing keeps the hostname from
 # being written out a second time — it was in four places before.
-_CENTRAL_DB_PORT = 8443
-_DEFAULT_CENTRAL_DB_URL = 'https://%s:%d/db' % (_CENTRAL_HOST, _CENTRAL_DB_PORT)
+# The account store answers on the standard HTTPS port behind Kong.  Measured
+# from central 2026-10-26: https://azurekong.hertzai.com/db/get_user/10202
+# -> 200 with the account; the old default :8443/db -> 404 (port 8443 is an
+# Apache-Coyote that is not the DB service, first seen 2026-10-04), so every
+# reader of this default had been failing quietly.
+_DEFAULT_CENTRAL_DB_URL = 'https://%s/db' % _CENTRAL_HOST
 
 
 def get_central_db_url() -> str:
