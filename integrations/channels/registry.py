@@ -108,11 +108,12 @@ def extract_media_markers(text):
     if not text or '[[MEDIA:' not in text:
         return text, []
     from .base import MessageType
+    from core.platform_paths import is_within
     root = _media_allowlist_root()
     media = []
     for raw in _MEDIA_MARKER.findall(text):
         path = os.path.realpath(raw.strip().strip('"'))
-        if not path.startswith(root):
+        if not is_within(path, root):
             logger.warning('media marker outside data dir dropped: %s', raw)
             continue
         if not os.path.isfile(path):

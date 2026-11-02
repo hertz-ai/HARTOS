@@ -428,6 +428,7 @@ class Notification(Base):
     TITLES = {
         'agent_game_sound_review': 'A new game sound',
         'agent_consent_request': 'An agent needs your consent',
+        'agent_ask': 'Your agent asks you something',
         'follow': 'New follower',
         'like': 'New like',
         'comment': 'New comment',

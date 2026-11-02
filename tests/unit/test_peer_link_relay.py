@@ -575,6 +575,51 @@ def _fake_autobahn(attempts, join_on, transport, stop_after):
             'autobahn.asyncio.component': component_mod}
 
 
+def test_a_relay_session_that_ends_cancels_its_leftover_tasks_before_closing_the_loop():
+    """A session's loop is ended the way EventBus.connect_wamp ends its own
+    (core.platform.events.close_wamp_loop, the 2026-05-29 WAMP-outbound-death
+    fix): the tasks still pending on it are cancelled and drained, then the
+    loop is closed.  The relay used to call loop.close() alone, so a task the
+    component left behind was abandoned with its loop, the shape that killed
+    the EventBus bridge's outbound publish until a process restart
+    (parallel-path audit 2026-10-27, item 5)."""
+    from tests.unit.loop_support import leftover_task
+    leftover = {}
+    transport = relay_mod.WampRelayTransport(['ws://up.example/ws'])
+
+    class FakeComponent:
+        def __init__(self, transports, realm):
+            pass
+
+        def on_join(self, fn):
+            return fn
+
+        def on_leave(self, fn):
+            return fn
+
+        async def start(self, loop=None):
+            leftover['loop'] = loop
+            leftover['task'] = leftover_task(loop)
+            transport._stop = True          # one session is the whole run
+            raise ConnectionError('router dropped us')
+
+    autobahn = type(sys)('autobahn')
+    asyncio_pkg = type(sys)('autobahn.asyncio')
+    component_mod = type(sys)('autobahn.asyncio.component')
+    component_mod.Component = FakeComponent
+    with swap_modules({'autobahn': autobahn, 'autobahn.asyncio': asyncio_pkg,
+                       'autobahn.asyncio.component': component_mod}):
+        try:
+            assert transport.start('com.hertzai.hevolve.peerlink.relay.node-x', lambda e: None)
+            transport._thread.join(5)
+        finally:
+            transport._stop = True
+    assert not transport._thread.is_alive()
+    assert leftover['task'].cancelled(), 'the leftover task was abandoned, not cancelled'
+    assert leftover['loop'].is_closed()
+    assert transport._loop is None
+
+
 def test_a_router_that_took_us_and_dropped_us_is_retried_before_the_plaintext_one():
     """The TLS router joined and then dropped the session: the next try is
     that router again, after the backoff, not an immediate step down to the

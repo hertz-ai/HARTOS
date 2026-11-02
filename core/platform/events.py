@@ -290,6 +290,42 @@ def _is_sse_global(topic: str) -> bool:
     return topic_audience(topic) == AUDIENCE_EVERYONE
 
 
+def close_wamp_loop(loop) -> None:
+    """End the asyncio loop a WAMP session ran on: cancel the tasks still
+    pending on it, let them finish cancelling, then close it.  Never raises.
+
+    The ONE ending for such a loop.  EventBus.connect_wamp's reconnect loop
+    and the PeerLink relay's session runner (core.peer_link.relay
+    .WampRelayTransport) both end every session here, so a fix to the ending
+    reaches both; the relay used to call loop.close() alone (parallel-path
+    audit 2026-10-27, item 5).
+
+    Why the cancel-and-drain (the 2026-05-29 WAMP-outbound-death fix): each
+    reconnect iteration abandoned its loop; the abandoned loop's default
+    ThreadPoolExecutor got torn down (GC / anyio teardown / atexit on the
+    global crossbar executor) while the REUSED autobahn ``component`` was
+    still trying to reconnect via run_in_executor on it, so every attempt
+    after that raised "RuntimeError: cannot schedule new futures after
+    shutdown" (59+ occurrences in the live log), which killed WAMP outbound
+    publish until the process restarted and forced the relay workaround.
+    Cancelling what is pending and closing the loop lets the next iteration
+    start with a clean loop and a fresh executor.
+    """
+    try:
+        pending = asyncio.all_tasks(loop=loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            loop.run_until_complete(
+                asyncio.gather(*pending, return_exceptions=True))
+    except Exception:
+        pass
+    try:
+        loop.close()
+    except Exception:
+        pass
+
+
 class EventBus:
     """Topic-based pub/sub event bus with optional Crossbar WAMP bridge.
 
@@ -558,33 +594,11 @@ class EventBus:
                     bus._wamp_loop = None
                     bus._wamp_connected = False
                     bus._wamp_session = None
-                    # CRITICAL (2026-05-29 WAMP-outbound-death fix):
-                    # close the loop before the next reconnect iteration
-                    # creates a fresh one.  Without this, each iteration
-                    # abandoned its asyncio loop; the abandoned loop's
-                    # default ThreadPoolExecutor got torn down (GC /
-                    # anyio teardown / atexit on the global crossbar
-                    # executor) while the REUSED `component` instance was
-                    # still trying to reconnect via run_in_executor on it
-                    # → "RuntimeError: cannot schedule new futures after
-                    # shutdown" forever (live log: 59+ occurrences), which
-                    # permanently killed WAMP outbound publish until
-                    # process restart and forced the relay workaround.
-                    # Cancel any pending tasks, then close, so the next
-                    # iteration starts with a clean loop + fresh executor.
-                    try:
-                        _pending = asyncio.all_tasks(loop=loop)
-                        for _t in _pending:
-                            _t.cancel()
-                        if _pending:
-                            loop.run_until_complete(
-                                asyncio.gather(*_pending, return_exceptions=True))
-                    except Exception:
-                        pass
-                    try:
-                        loop.close()
-                    except Exception:
-                        pass
+                    # CRITICAL (2026-05-29 WAMP-outbound-death fix): end
+                    # this iteration's loop, pending tasks cancelled, before
+                    # the next one creates a fresh loop; close_wamp_loop
+                    # says why, and the relay ends its sessions the same way.
+                    close_wamp_loop(loop)
                 # Reset backoff if connection lived > 60s (was a real session)
                 if connected_at and (_time.time() - connected_at) > 60:
                     backoff = 1

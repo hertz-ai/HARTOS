@@ -1848,7 +1848,19 @@ async def _emit_final(websocket, audio_buffer, stt_lang, call_id, user_id) -> bo
     identically (no parallel finalization logic — #131 Gate-2/4).  Returns
     whether a non-empty transcription was sent.  Caller resets the buffer +
     VAD gate (those are caller-local).
+
+    The utterance's PCM is read ONCE, before the transcribe, and that one
+    snapshot reaches both consumers: the STT worker (through
+    _transcribe_buffer, which EMPTIES the caller's buffer on this final
+    path, keep_buffer=False) and the learner (_maybe_ingest_audio_sensor,
+    below).  From fd3cbe670 (2026-06-20) until 2026-10-29 the snapshot was
+    taken after the transcribe, so every final handed the ingest b'' and
+    it returned at its first line: no mic audio reached HevolveAI through
+    this producer, while the unit tests called the ingest directly with
+    audio and stayed green.  Guarded by test_whisper_stream_call_id
+    .FinalizeFeedsTheLearnerTheUtteranceTest.
     """
+    pcm = audio_buffer.getvalue()
     text, lang = _transcribe_buffer(audio_buffer, language=stt_lang)
     # Non-speech annotations must not leave the server.  The WS streaming legs
     # were the only STT routes that never passed through this gate — it was
@@ -1864,8 +1876,8 @@ async def _emit_final(websocket, audio_buffer, stt_lang, call_id, user_id) -> bo
         # Feed this finalized mic segment to HevolveAI's world model for
         # continual learning. The bridge call does a SYNCHRONOUS HTTP POST and
         # the consent lookup reads the DB, so both run on the default executor
-        # to avoid blocking the realtime STT event loop. Snapshot the PCM now
-        # -- the caller resets the buffer right after this returns.
+        # to avoid blocking the realtime STT event loop. ``pcm`` is the
+        # snapshot taken above, before the transcribe emptied the buffer.
         #
         # INTENT REVERSAL (owner, 2026-09-10). This was gated on call_id "so
         # the push-to-talk chat mic is untouched". The owner has since directed
@@ -1879,7 +1891,7 @@ async def _emit_final(websocket, audio_buffer, stt_lang, call_id, user_id) -> bo
         import asyncio
         asyncio.get_running_loop().run_in_executor(
             None, _maybe_ingest_audio_sensor,
-            call_id, user_id, audio_buffer.getvalue(), text, lang)
+            call_id, user_id, pcm, text, lang)
     return bool(text)
 
 
@@ -2344,6 +2356,13 @@ def _transcribe_buffer(audio_buffer, keep_buffer: bool = False,
     Returns (text, language) tuple.  ``language`` is an optional forced
     language code (from the stream's {type:config} message); None lets
     faster-whisper auto-detect per utterance.
+
+    With ``keep_buffer`` False (the final path) the caller's buffer is
+    EMPTIED before the decode, so a caller that also needs the utterance's
+    audio must read it first (_emit_final does, for the learner).  Every
+    current caller rebinds its buffer after a final anyway, so this truncate
+    is a leftover of the shared-buffer design of 54d568719; folding
+    ``keep_buffer`` out is its own change (the window tests key on it).
 
     Runs through `_stt_tool` so CUDA OOM or faster-whisper/CTranslate2
     crashes on the realtime path only kill the worker subprocess — the

@@ -176,11 +176,13 @@ def app(sf, monkeypatch, tmp_path):
     real_status_write = GoalManager.update_goal_status
     writes = []
 
-    def _recorded_write(db, goal_id, status):
+    def _recorded_write(db, goal_id, status, **kwargs):
+        # The writer's own keyword arguments (goal=, the row a caller already
+        # holds) pass through; this seam records, it does not narrow.
         import inspect
         callers = [f.function for f in inspect.stack()[1:6]]
         writes.append((goal_id, status, callers))
-        return real_status_write(db, goal_id, status)
+        return real_status_write(db, goal_id, status, **kwargs)
 
     coordinator = MagicMock()
     # Plain values for the rest of the coordinator the routes call, so a
