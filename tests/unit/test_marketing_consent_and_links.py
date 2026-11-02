@@ -340,3 +340,194 @@ def test_flag_off_with_nothing_granted_writes_no_row(consent_db):
     from integrations.social.models import UserConsent
     assert _apply(consent_db, '0') == ('revoked', 0)
     assert consent_db.query(UserConsent).count() == 0
+
+
+# ── 4. post_to_channel: post through the live registry, or ask the owner ──
+#
+# Measured on central 2026-11-02: every revenue goal "completed" on model
+# spend while no post left the node.  post_to_channel built an extension
+# adapter with no configuration and called send_message with arguments no
+# adapter takes, and when a channel had no credentials it never asked the
+# owner for them.  It now sends through the live channel registry and, for a
+# channel that is not connected, asks the owner for each value connecting it
+# needs.
+
+class _Adapter:
+    """A channel adapter as the registry holds one, with the real
+    ChannelAdapter.send_message signature (no **kwargs), so a call with the
+    wrong arguments fails here as it does in production."""
+
+    def __init__(self, name, result=None, running=True):
+        self.name, self._result, self._running = name, result, running
+        self.sent = []
+
+    def on_message(self, handler):
+        pass
+
+    def is_running(self):
+        return self._running
+
+    async def send_message(self, chat_id, text, reply_to=None, media=None,
+                           buttons=None):
+        self.sent.append({'chat_id': chat_id, 'text': text, 'media': media})
+        return self._result
+
+
+class _Integration:
+    """The two members of FlaskChannelIntegration that post_to_channel
+    reads: the real ChannelRegistry, and send_threadsafe, which runs the
+    registry's send_to_channel to its SendResult (None while the channel
+    loop is not running)."""
+
+    def __init__(self, *adapters, loop_running=True):
+        from integrations.channels.registry import ChannelRegistry
+        self.registry = ChannelRegistry()
+        for adapter in adapters:
+            self.registry.register(adapter)
+        self._loop_running = loop_running
+
+    def send_threadsafe(self, channel, chat_id, text, *, wait=None, **kwargs):
+        if not self._loop_running:
+            return None
+        # A loop of its own, as the channel thread has: never this thread's
+        # current loop, which core.event_loop.run_async reuses.
+        import asyncio
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(
+                self.registry.send_to_channel(channel, chat_id, text, **kwargs))
+        finally:
+            loop.close()
+
+
+def _post(integration, *args, ask=None, **kwargs):
+    """Call the real post_to_channel with consent granted, the channel
+    integration and the owner ask (request_credential) as the boundaries."""
+    funcs = _marketing_funcs()
+    ask = ask or Mock(return_value='Asked the owner of this computer on '
+                                   'the consent card.')
+    with _consent(True), \
+         patch('integrations.channels.flask_integration.get_channel_integration',
+               return_value=integration), \
+         patch('hartos.ai_key_vault.request_credential', ask):
+        return json.loads(funcs['post_to_channel'](*args, **kwargs)), ask
+
+
+def _sent(**kw):
+    from integrations.channels.base import SendResult
+    return SendResult(**kw)
+
+
+def test_a_connected_channel_posts_and_reports_the_channels_answer():
+    tg = _Adapter('telegram', _sent(success=True, message_id='m-1'))
+    out, ask = _post(_Integration(tg), 'telegram', 'hello',
+                     extra_config='{"chat_id": "@hevolve"}')
+    assert tg.sent == [{'chat_id': '@hevolve', 'text': 'hello', 'media': None}]
+    assert (out['success'], out['sent'], out['message_id']) == (True, True, 'm-1')
+    ask.assert_not_called()
+
+
+def test_a_send_the_channel_refuses_is_reported_as_not_sent():
+    tg = _Adapter('telegram', _sent(success=False, error='chat not found'))
+    out, _ = _post(_Integration(tg), 'Telegram', 'hello',
+                   extra_config='{"chat_id": "@nobody"}')
+    assert len(tg.sent) == 1
+    assert (out['success'], out['sent'], out['error']) == (
+        False, False, 'chat not found')
+
+
+def test_a_media_url_reaches_the_channel_as_an_attachment():
+    from integrations.channels.base import MessageType
+    tg = _Adapter('telegram', _sent(success=True))
+    _post(_Integration(tg), 'telegram', 'demo',
+          media_url='https://x.test/demo.mp4?sig=1',
+          extra_config='{"chat_id": "@hevolve"}')
+    [media] = tg.sent[0]['media']
+    assert (media.url, media.type) == ('https://x.test/demo.mp4?sig=1',
+                                       MessageType.VIDEO)
+
+
+def test_nothing_is_posted_while_the_channel_loop_is_down():
+    tg = _Adapter('telegram', _sent(success=True))
+    out, _ = _post(_Integration(tg, loop_running=False), 'telegram', 'hello',
+                   extra_config='{"chat_id": "@hevolve"}')
+    assert tg.sent == []
+    assert (out['success'], out['sent']) == (False, False)
+
+
+def test_a_connected_channel_with_no_target_posts_nothing():
+    tg = _Adapter('telegram', _sent(success=True))
+    out, ask = _post(_Integration(tg), 'telegram', 'hello')
+    assert tg.sent == []
+    assert out['sent'] is False and 'chat_id' in out['error']
+    ask.assert_not_called()
+
+
+def test_a_channel_that_is_not_connected_asks_the_owner_for_what_it_needs():
+    from integrations.channels.metadata import (
+        get_channel_metadata, required_setup_keys)
+    needed = required_setup_keys(get_channel_metadata('twitter'))
+    assert 'api_key' in needed, needed          # the catalog asks for keys
+    out, ask = _post(_Integration(), 'twitter', 'hello')
+    asked = [json.loads(c.args[0]) for c in ask.call_args_list]
+    assert [a['key_name'] for a in asked] == needed
+    assert {a['channel_type'] for a in asked} == {'twitter'}
+    assert {a['used_by'] for a in asked} == {'post_to_channel'}
+    assert (out['success'], out['sent'], out['needs_owner']) == (
+        False, False, True)
+    assert 'TWITTER_API_KEY' in out['asked_owner_for']
+    assert out['register_channel_config']['api_key'] == '{{secret:TWITTER_API_KEY}}'
+    assert 'register_channel' in out['next']
+
+
+def test_a_registered_channel_that_is_stopped_asks_the_owner_too():
+    tw = _Adapter('twitter', _sent(success=True), running=False)
+    out, ask = _post(_Integration(tw), 'twitter', 'hello',
+                     extra_config='{"chat_id": "123"}')
+    assert tw.sent == []
+    assert ask.called and out['needs_owner'] is True
+
+
+def test_the_owners_answer_reaches_the_agent():
+    ask = Mock(return_value="The owner of this computer said no to "
+                            "providing 'Twitter / X API Key'.")
+    out, _ = _post(_Integration(), 'twitter', 'hello', ask=ask)
+    assert out['owner_answers'][0].startswith(
+        'The owner of this computer said no')
+
+
+def test_a_channel_with_no_catalog_entry_asks_nothing_and_names_the_browser():
+    out, ask = _post(_Integration(), 'linkedin', 'hello')
+    ask.assert_not_called()
+    assert (out['success'], out['sent']) == (False, False)
+    assert 'post_to_channel_via_browser' in out['error']
+
+
+def test_the_instagram_feed_posts_a_video_as_a_reel_and_an_image_as_a_photo():
+    """_publish_instagram_feed and post_to_channel read one video rule
+    (_is_video_url); a case or query string does not change the answer."""
+    from integrations.agent_engine.marketing_tools import _publish_instagram_feed
+
+    class _Instagram:
+        def __init__(self):
+            self.calls = []
+
+        async def publish_reel(self, url, caption):
+            self.calls.append(('reel', url))
+            return _sent(success=True, message_id='r-1')
+
+        async def publish_photo(self, url, caption):
+            self.calls.append(('photo', url))
+            return _sent(success=True, message_id='p-1')
+
+    ig = _Instagram()
+    reel = json.loads(_publish_instagram_feed(
+        'u', 'https://x.test/a.MOV?sig=1', 'c', _adapter=ig,
+        _consent=lambda _u: True))
+    photo = json.loads(_publish_instagram_feed(
+        'u', 'https://x.test/a.jpg', 'c', _adapter=ig,
+        _consent=lambda _u: True))
+    assert ig.calls == [('reel', 'https://x.test/a.MOV?sig=1'),
+                        ('photo', 'https://x.test/a.jpg')]
+    assert (reel['kind'], reel['media_id']) == ('reel', 'r-1')
+    assert (photo['kind'], photo['media_id']) == ('photo', 'p-1')

@@ -75,6 +75,129 @@ def _consent_required_result(channel: str) -> str:
     })
 
 
+def _is_video_url(url) -> bool:
+    """Does ``url`` name a video file (its path, ignoring a query string)?"""
+    base = str(url).split('?', 1)[0].lower()
+    return base.endswith(('.mp4', '.mov', '.m4v', '.webm'))
+
+
+#: Seconds post_to_channel waits for the channel to confirm a send: the bound
+#: the channels' own send_to_channel tool waits (integrations/channels/
+#: agent_tools.py).
+_CHANNEL_SEND_WAIT_S = 30
+
+
+def _not_posted(channel, error, **extra) -> str:
+    """The answer for a post that did not happen."""
+    return json.dumps(dict({'success': False, 'sent': False,
+                            'channel': channel, 'error': error}, **extra))
+
+
+def _ask_owner_to_connect(channel: str) -> str:
+    """Ask the owner of this computer for what ``channel`` needs before
+    anything can be posted on it, and tell the agent what was asked.
+
+    The values a channel needs are its required setup fields
+    (integrations.channels.metadata.required_setup_keys, the list the
+    connect form asks for).  Each one is asked for through
+    hartos.ai_key_vault.request_credential, what request_resource calls: a
+    consent card for the owner, who types the value; the agent only ever
+    holds its {{secret:NAME}} alias, which register_channel resolves when
+    it runs.  The owner's answer for each value (asked, already stored,
+    said no, nobody to ask) goes back to the agent as request_credential
+    words it.
+    """
+    from integrations.channels.metadata import (
+        get_channel_metadata, list_all_channels, required_setup_keys)
+    meta = get_channel_metadata(channel)
+    if not meta:
+        return _not_posted(channel, (
+            f"There is no {channel} channel to post through, so nothing was "
+            f"posted. Channels: {', '.join(sorted(list_all_channels()))}. "
+            f"For a site the owner is signed in to on the desktop, "
+            f"post_to_channel_via_browser posts through their browser."))
+    from hartos.ai_key_vault import get_ai_key_vault, request_credential
+    from hartos.threadlocal import thread_local_data
+    vault = get_ai_key_vault()
+    display = meta.get('display_name') or channel
+    labels = {f.get('key'): f.get('label') or f.get('key')
+              for f in meta.get('setup_fields') or []}
+    agent_id = thread_local_data.get_prompt_id()
+    config, names, answers = {}, [], []
+    for key in required_setup_keys(meta):
+        answers.append(request_credential(json.dumps({
+            'resource_type': 'channel_secret',
+            'channel_type': channel,
+            'key_name': key,
+            'label': f"{display} {labels.get(key) or key}",
+            'used_by': 'post_to_channel',
+            'description': f"Needed to post on {display}.",
+        }), agent_id=agent_id))
+        name = vault.credential_name(key, channel)
+        names.append(name)
+        config[key] = '{{secret:' + name + '}}'
+    return _not_posted(
+        channel,
+        f"{display} is not connected on this node, so nothing was posted.",
+        needs_owner=bool(names),
+        asked_owner_for=names,
+        owner_answers=answers,
+        register_channel_config=config,
+        next=(f"When the owner has entered what was asked, connect it: "
+              f"register_channel with channel_type '{channel}' and "
+              f"register_channel_config as config_json. Then call "
+              f"post_to_channel again. Until it posts, this post has not "
+              f"happened; do not report it as done."))
+
+
+def _post_to_channel(channel, content, media_url=None, extra_config=None) -> str:
+    """Post ``content`` on a connected channel, or ask the owner for what
+    connecting it needs (_ask_owner_to_connect).
+
+    The send goes through the live channel registry, the one every channel
+    send uses (FlaskChannelIntegration.send_threadsafe), and the answer is
+    the channel's own SendResult: a post is reported sent only when the
+    channel says it was.
+    """
+    channel = str(channel or '').strip().lower()
+    try:
+        config = json.loads(extra_config) if extra_config else {}
+    except ValueError as e:
+        return _not_posted(channel, f"extra_config is not JSON: {e}")
+    if not isinstance(config, dict):
+        return _not_posted(channel, 'extra_config must be a JSON object')
+    from integrations.channels.flask_integration import get_channel_integration
+    integration = get_channel_integration()
+    adapter = integration.registry.get(channel)
+    if adapter is None or not adapter.is_running():
+        return _ask_owner_to_connect(channel)
+    chat_id = config.get('chat_id')
+    if not chat_id:
+        return _not_posted(channel, (
+            f'Say where on {channel} to post: extra_config '
+            f'{{"chat_id": "..."}} names the chat, channel or user.'))
+    media = None
+    if media_url:
+        from integrations.channels.base import MediaAttachment, MessageType
+        media = [MediaAttachment(
+            type=MessageType.VIDEO if _is_video_url(media_url) else MessageType.IMAGE,
+            url=media_url)]
+    result = integration.send_threadsafe(
+        channel, str(chat_id), content, wait=_CHANNEL_SEND_WAIT_S, media=media)
+    if result is None:
+        return _not_posted(channel, (
+            'The channel adapters are not running on this node, so nothing '
+            'was posted.'))
+    return json.dumps({
+        'success': bool(result.success),
+        'sent': bool(result.success),
+        'channel': channel,
+        'chat_id': str(chat_id),
+        'message_id': result.message_id,
+        'error': result.error,
+    })
+
+
 def _publish_instagram_feed(user_id, media_url, caption='', *,
                             _adapter=None, _consent=None):
     """Publish media to the Instagram FEED (Content Publishing API).
@@ -116,9 +239,8 @@ def _publish_instagram_feed(user_id, media_url, caption='', *,
             adapter = factory()
 
         from core.event_loop import run_async
-        base = str(media_url).split('?', 1)[0].lower()
-        is_video = base.endswith(('.mp4', '.mov', '.m4v', '.webm'))
-        coro = (adapter.publish_reel(media_url, caption or '')
+        is_video = _is_video_url(media_url)
+        coro =(adapter.publish_reel(media_url, caption or '')
                 if is_video else
                 adapter.publish_photo(media_url, caption or ''))
         res = run_async(coro)
@@ -234,15 +356,17 @@ def register_marketing_tools(helper, assistant, user_id: str):
             return json.dumps({'success': False, 'error': str(e)})
 
     def post_to_channel(
-        channel: Annotated[str, "Channel name: twitter|instagram|email|discord|telegram|whatsapp|slack|linkedin|nostr|matrix"],
+        channel: Annotated[str, "Channel name: telegram|discord|slack|twitter|instagram|nostr|matrix|whatsapp|email ..."],
         content: Annotated[str, "Content to post — write as one real person to another; never AI/marketing-speak (it gets scrolled past)"],
         media_url: Annotated[Optional[str], "Media URL to include (optional)"] = None,
-        extra_config: Annotated[Optional[str], "JSON string with channel-specific config (optional)"] = None,
+        extra_config: Annotated[Optional[str], "JSON naming where to post: {\"chat_id\": \"...\"}, the chat, channel or user id on that channel"] = None,
     ) -> str:
-        """Post content to an external channel via the unified channel adapter system.
+        """Post content on an external channel that is connected on this node.
 
-        Routes to the appropriate channel adapter (Twitter, Instagram, Email, etc.).
-        If the channel adapter is not available, delegates to a specialist agent.
+        The answer says whether the channel accepted it (sent true/false).
+        When the channel is not connected, nothing is posted: the owner is
+        asked on a consent card for each value connecting it needs, and the
+        answer says what was asked and how to connect once they enter it.
 
         Gated on standing operator ``public_exposure`` consent — returns a
         consent_required result (no post) until a human opts in.
@@ -250,35 +374,10 @@ def register_marketing_tools(helper, assistant, user_id: str):
         if not _external_post_allowed(user_id):
             return _consent_required_result(channel)
         try:
-            from integrations.channels.extensions import get_available_adapters
-            adapters = get_available_adapters()
-
-            # Find matching adapter
-            adapter_name = f"{channel}_adapter"
-            adapter_factory = None
-            for name, factory in adapters.items():
-                if channel.lower() in name.lower():
-                    adapter_factory = factory
-                    break
-
-            if adapter_factory:
-                adapter = adapter_factory()
-                config = json.loads(extra_config) if extra_config else {}
-                result = adapter.send_message(
-                    content=content,
-                    media_url=media_url,
-                    **config,
-                )
-                return json.dumps({'success': True, 'channel': channel, 'result': str(result)})
-            else:
-                return json.dumps({
-                    'success': False,
-                    'error': f'Channel adapter for {channel} not available. '
-                             f'Use delegate_to_specialist to find an agent with {channel} skills.',
-                    'available_channels': list(adapters.keys()),
-                })
+            return _post_to_channel(channel, content, media_url, extra_config)
         except Exception as e:
-            return json.dumps({'success': False, 'error': str(e)})
+            logger.warning("post_to_channel %s: not posted: %s", channel, e)
+            return _not_posted(channel, str(e))
 
     def publish_to_instagram_feed(
         media_url: Annotated[str, "URL of the video (.mp4/.mov -> Reel) or image (-> feed photo) to publish"],
@@ -485,7 +584,7 @@ def register_marketing_tools(helper, assistant, user_id: str):
         ('create_social_post', 'Create a post on the HART social platform for marketing', create_social_post),
         ('create_campaign', 'Create a marketing campaign with strategy, targeting, and budget', create_campaign),
         ('create_ad', 'Create a targeted ad unit with budget and audience targeting', create_ad),
-        ('post_to_channel', 'Post content to external channels (Twitter, Instagram, Email, Discord, etc.)', post_to_channel),
+        ('post_to_channel', 'Post content on a connected external channel (Telegram, Discord, Slack, ...); when it is not connected, asks the owner for what connecting it needs', post_to_channel),
         ('publish_to_instagram_feed', 'Publish a video Reel or photo to the Instagram FEED (Content Publishing API) — the daemon video-editor publish step; consent-gated, needs a connected IG business account', publish_to_instagram_feed),
         ('create_referral_campaign', 'Create a referral-driven growth campaign with auto-generated referral code', create_referral_campaign),
         ('get_growth_metrics', 'Get platform growth metrics including viral coefficient (K factor)', get_growth_metrics),
