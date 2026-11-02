@@ -55,6 +55,16 @@ class SignalPort:
 
     def __init__(self):
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # A small, FIXED receive buffer, set before listen() so every accepted
+        # connection inherits it.  Left to autotuning, Linux grows an unread
+        # connection's receive buffer to tcp_rmem's maximum (6 MiB) and the
+        # sender's buffer to tcp_wmem's (4 MiB): 10 MiB of kernel buffering,
+        # which swallowed the 10 MiB test_a_livekit_that_stops_reading_ends_the_tunnel
+        # writes, so the tunnel's writer never blocked and never gave up (CI:
+        # queue.Empty waiting for 'livekit_stalled').  Windows' loopback buffers
+        # are small, which is why it only failed on Linux.  Setting SO_RCVBUF
+        # also turns receive autotuning off for the socket.
+        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 64 * 1024)
         self.server.bind(('127.0.0.1', 0))
         self.server.listen(8)
         self.port = self.server.getsockname()[1]
