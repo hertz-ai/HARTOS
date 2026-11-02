@@ -8802,8 +8802,13 @@ def _autonomous_gather_info(user_id, description, prompt_id):
                         'text to refine the plan.'),
                 })
 
-            if _status == 'completed':
+            # Only a config that can be built is saved as built (#206); one
+            # that cannot falls to the legacy loop below, as unfinished.
+            _built = (_buildable_completed_config(parsed, prompt_id)
+                      if _status == 'completed' else None)
+            if _built is not None:
                 # Save final agent config and dispatch
+                parsed = _built
                 parsed['prompt_id'] = prompt_id
                 parsed['creator_user_id'] = user_id
                 name = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
@@ -8846,7 +8851,9 @@ def _autonomous_gather_info(user_id, description, prompt_id):
                         break
                 else:
                     parsed = {}
-            if isinstance(parsed, dict) and parsed.get('status', '').lower() == 'completed':
+            _built = _buildable_completed_config(parsed, prompt_id)
+            if _built is not None:
+                parsed = _built
                 parsed['prompt_id'] = prompt_id
                 parsed['creator_user_id'] = user_id
                 name = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
@@ -9823,12 +9830,44 @@ def _read_gather_config(response, prompt_id):
     if new_res is None:
         raise ValueError('new_res is None after parsing')
 
-    new_res, _decoded = _decode_config_lists(new_res)
-    if _decoded:
+    return _decoded_config(new_res, prompt_id)
+
+
+def _decoded_config(cfg, prompt_id):
+    """``cfg`` with its list fields decoded (_decode_config_lists), and the
+    decoding logged.  The one reading of a config's lists, for the
+    interactive reply (_read_gather_config) and the autonomous save
+    (_buildable_completed_config)."""
+    cfg, decoded = _decode_config_lists(cfg)
+    if decoded:
         app.logger.info(
             "[GATHER] %s came as JSON text for %s - decoded",
-            ', '.join(_decoded), prompt_id)
-    return new_res
+            ', '.join(decoded), prompt_id)
+    return cfg
+
+
+def _buildable_completed_config(cfg, prompt_id):
+    """``cfg`` ready to save as a built agent, or None.
+
+    The autonomous creation's save rule, the same as the interactive one
+    (#205/#718): list fields written as JSON text are decoded, and a
+    'completed' config that is not _config_is_buildable is not saved as
+    built (#206).  F2 of the cdeca7500 review (ran by its reviewer,
+    2026-11-02): once _autonomous_gather_info finalized an approved plan in
+    code instead of asking the model to re-emit it, a plan with no `flows`
+    reached the save as 'completed', and recipe() fails on config['flows']
+    (hartos/create_recipe.py:1097, :7131).  None for anything that is not a
+    'completed' config, so the caller treats it as not finished."""
+    if not isinstance(cfg, dict) or (cfg.get('status') or '').lower() != 'completed':
+        return None
+    config = _decoded_config(cfg, prompt_id)
+    if _config_is_buildable(config):
+        return config
+    app.logger.warning(
+        "[EMPTY-BUILD] autonomous creation of %s finished without a step for "
+        "every action (flows: %.300s) - not saved as built (#206)",
+        prompt_id, config.get('flows'))
+    return None
 
 
 #: A step's own number, as the model sometimes writes it ("1. Call ...").
