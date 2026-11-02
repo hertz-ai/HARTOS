@@ -32,9 +32,16 @@ _SENSITIVE_EXTRA_WORDS = ('ssn', 'credit_card', 'card_number')
 # 'ssn_last4'): the one rule reads a secret word only as the whole name or
 # its last word, and this log is hash-chained, so a value kept raw is kept for
 # good.  Withholding a harmless 'max_tokens' here is the price (review of
-# 2f3d2255e, which dropped this catch and so kept those names raw).
+# 2f3d2255e, which dropped this catch and so kept those names raw).  A key is
+# read as written and in secret_key_form, so 'apiKeys', 'privateKeys' and
+# 'private-key-pem' are caught too (review of fbae5ea36, M1).
 _SENSITIVE_KEY_PARTS = ('password', 'token', 'api_key', 'secret', 'credential',
-                        'private_key', 'ssn', 'credit_card', 'card_number')
+                        'private_key', 'credit_card', 'card_number')
+# A government number is a WORD of the key ('ssn', 'ssn_last4', 'mySSN'),
+# never three letters anywhere: matched anywhere, 'classname', 'processName',
+# 'businessName' and 'witnessNode' were withheld, evidence this log keeps
+# for good (review of fbae5ea36).
+_SENSITIVE_KEY_WORDS = ('ssn',)
 
 
 def _redact_sensitive(detail: Optional[Dict]) -> Optional[str]:
@@ -42,15 +49,17 @@ def _redact_sensitive(detail: Optional[Dict]) -> Optional[str]:
 
     A field is sensitive by the one secret-name rule (which also reads
     'passwd', 'pwd', 'cookie', 'apikey' and 'API-Key') extended by
-    _SENSITIVE_EXTRA_WORDS, or when its key holds one of
-    _SENSITIVE_KEY_PARTS anywhere."""
+    _SENSITIVE_EXTRA_WORDS, when its key holds one of _SENSITIVE_KEY_PARTS
+    anywhere, or when a word of it is one of _SENSITIVE_KEY_WORDS."""
     if detail is None:
         return None
     from security.edge_privacy import is_secret_key, secret_key_form
     safe = {}
     for k, v in detail.items():
-        if (is_secret_key(secret_key_form(str(k)), _SENSITIVE_EXTRA_WORDS)
-                or any(p in str(k).lower() for p in _SENSITIVE_KEY_PARTS)):
+        raw, form = str(k).lower(), secret_key_form(str(k))
+        if (is_secret_key(form, _SENSITIVE_EXTRA_WORDS)
+                or any(p in raw or p in form for p in _SENSITIVE_KEY_PARTS)
+                or set(_SENSITIVE_KEY_WORDS).intersection(form.split('_'))):
             safe[k] = '[REDACTED]'
         else:
             safe[k] = v

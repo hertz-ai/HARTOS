@@ -170,6 +170,21 @@ class TestRedactSensitive(unittest.TestCase):
             self.assertEqual(result[key], '[REDACTED]', key)
         self.assertEqual(result['name'], 'john')
 
+    def test_the_catch_reads_every_spelling_and_a_number_only_as_a_word(self):
+        """Read only lowercased, 'apiKeys' and 'privateKeys' stayed raw while
+        'api_keys' was withheld; read as three letters anywhere, 'ssn'
+        withheld 'classname' and 'processName' (review of fbae5ea36)."""
+        withheld = ('apiKeys', 'API-Keys', 'privateKeys', 'private-key-pem',
+                    'ssn_last4', 'ssnLast4', 'mySSN', 'user_ssn', 'SSN')
+        kept = ('classname', 'className', 'processName', 'businessName',
+                'addressName', 'witnessNode')
+        result = json.loads(_redact_sensitive(
+            {n: 'raw-' + n for n in withheld + kept}))
+        for key in withheld:
+            self.assertEqual(result[key], '[REDACTED]', key)
+        for key in kept:
+            self.assertEqual(result[key], 'raw-' + key, key)
+
 
 class TestBorrowedSessionContract(unittest.TestCase):
     """log_event(db=...) rides the CALLER'S transaction.
