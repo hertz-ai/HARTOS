@@ -46,9 +46,11 @@ class SignalPort:
     upgrade with 101, after which it echoes what it reads (the WebSocket),
     anything else with REFUSAL, keeping the connection for the next request.
     It records every connection, every byte it read before an upgrade, every
-    request line it was sent, and every connection's end.  A refusal's head
-    and body go out as two writes, as a slow answer would arrive, and an
-    upgrade answer in ``answer_piece``-byte writes when that is set; clearing
+    request line it was sent, and every connection's end (a write the other
+    end reset counts as its end, the error kept in ``write_errors``).  A
+    refusal's head and body go out as two writes, as a slow answer would
+    arrive, and an upgrade answer in ``answer_piece``-byte writes when that
+    is set; clearing
     ``answering`` holds every answer until it is set again, and clearing
     ``reading`` stops it reading an upgraded connection (a LiveKit that
     stalled)."""
@@ -62,6 +64,7 @@ class SignalPort:
         self.read = queue.Queue()
         self.requests = queue.Queue()
         self.ended = queue.Queue()
+        self.write_errors = queue.Queue()
         self.answering = threading.Event()
         self.answering.set()
         self.reading = threading.Event()
@@ -80,6 +83,18 @@ class SignalPort:
             threading.Thread(target=self._http, args=(conn,), daemon=True).start()
 
     def _http(self, conn):
+        try:
+            self._converse(conn)
+        except OSError as exc:
+            # The other end went away while this side was writing: on Linux,
+            # echoing what a stalled LiveKit had buffered to a tunnel the
+            # desktop already closed raises ECONNRESET.  That is this
+            # connection's end like an empty recv, and is recorded the same
+            # way; unrecorded, the test waiting on ``ended`` saw nothing.
+            self.write_errors.put(exc)
+        self.ended.put(conn)
+
+    def _converse(self, conn):
         buf, upgraded = b'', False
         while True:
             if upgraded:
@@ -89,7 +104,6 @@ class SignalPort:
             except OSError:
                 data = b''
             if not data:
-                self.ended.put(conn)
                 return
             if upgraded:
                 conn.sendall(data)
