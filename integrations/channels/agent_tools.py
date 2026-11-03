@@ -18,11 +18,13 @@ All tools reuse existing infrastructure:
 - thread_local_data for channel context
 """
 
+import hashlib
 import itertools
 import json
 import logging
 import re
 import threading
+from datetime import datetime
 from typing import Annotated, Optional
 
 logger = logging.getLogger(__name__)
@@ -155,37 +157,48 @@ START_WATCHING = 'watching'
 START_CONNECTED = 'connected'
 START_FAILED = 'failed'
 
-#: channel -> {'start': n, 'state': START_*} for the latest start of each
-#: channel.  n grows with every start, so a caller can tell the start it
-#: scheduled from a later one.
+#: channel -> {'start': n, 'state': START_*, 'fp': fingerprint of the value
+#: it started with (None when unknown), 'at': when it started (naive UTC,
+#: as the consent table's granted_at)} for the latest start of each
+#: channel.  n grows with every start.
 _STARTS = {}
 _STARTS_LOCK = threading.Lock()
 _START_NUMBERS = itertools.count(1)
 
 
-def start_verdict(channel_type: str) -> Optional[dict]:
-    """The latest start register_channel scheduled for ``channel_type`` and
-    how it ended (a copy: {'start': n, 'state': START_*}), or None when it
-    scheduled none in this process.
+def credential_fingerprint(value) -> str:
+    """Which credential value a start used, comparable without keeping the
+    value itself (sha256 hex)."""
+    return hashlib.sha256(str(value).encode('utf-8')).hexdigest()
 
-    post_to_channel judges the owner's value by this verdict: still being
-    watched is connecting, CONNECTED proves the value (a later drop is
-    connected again with it), FAILED is a value the channel refused.  It
-    used to judge by the clock alone, so a value that had connected and then
-    dropped was treated as refused (review of 506a79c1f)."""
+
+def start_verdict(channel_type: str) -> Optional[dict]:
+    """The latest live start of ``channel_type`` in this process (a copy:
+    {'start', 'state', 'fp', 'at'}), or None when there was none.
+
+    Every start that wires an adapter from one credential records itself
+    here: register_channel (the agent tool, Connect_Channel, OAuth) and the
+    connect form's create_binding.  post_to_channel decides from it: still
+    being watched is connecting; a start with the owner's value that
+    CONNECTED proves the value, so a later drop is connected again; one that
+    FAILED is a value the channel refused; a start with ANOTHER value is
+    someone's newer choice, which the owner's older vault value never
+    replaces (reviews of 506a79c1f and 1feb76f14)."""
     with _STARTS_LOCK:
         entry = _STARTS.get(channel_type)
         return dict(entry) if entry else None
 
 
-def _watch_start(channel_type: str, meta: dict, owner) -> None:
-    """Record a just-scheduled start of ``channel_type`` as being watched,
+def _watch_start(channel_type: str, meta: dict, owner, fp=None) -> int:
+    """Record a just-scheduled start of ``channel_type`` (``fp``: the
+    credential_fingerprint of the value it started with) as being watched,
     then watch it on a daemon thread (_report_when_live) and record how it
-    ended.  A later start replaces the record; an earlier watcher ending
-    after that leaves the later record alone."""
+    ended.  Returns the start's number.  A later start replaces the record;
+    an earlier watcher ending after that leaves the later record alone."""
     with _STARTS_LOCK:
         start = next(_START_NUMBERS)
-        _STARTS[channel_type] = {'start': start, 'state': START_WATCHING}
+        _STARTS[channel_type] = {'start': start, 'state': START_WATCHING,
+                                 'fp': fp, 'at': datetime.utcnow()}
 
     def _watch():
         connected = False
@@ -195,13 +208,13 @@ def _watch_start(channel_type: str, meta: dict, owner) -> None:
             logger.warning("%s: start watcher failed; the start counts as "
                            "failed", channel_type, exc_info=True)
         with _STARTS_LOCK:
-            if (_STARTS.get(channel_type) or {}).get('start') == start:
-                _STARTS[channel_type] = {
-                    'start': start,
-                    'state': START_CONNECTED if connected else START_FAILED}
+            entry = _STARTS.get(channel_type)
+            if entry is not None and entry['start'] == start:
+                entry['state'] = START_CONNECTED if connected else START_FAILED
 
     threading.Thread(target=_watch, name=f'channel-probe-{channel_type}',
                      daemon=True).start()
+    return start
 
 
 #: What chat_connect_blocker answers, beside None.
@@ -627,7 +640,8 @@ def build_channel_tool_closures(ctx):
             # when it is not.  A daemon thread so the tool returns now; the
             # verdict is kept (start_verdict).
             owner = user_id or _get_user_id_from_threadlocal() or None
-            _watch_start(channel_type, meta, owner)
+            _watch_start(channel_type, meta, owner,
+                         credential_fingerprint(credential) if credential else None)
             return (f"{name} registered and enabled! Auth: {meta['auth_method']}. "
                     f"Connecting now; you'll see a confirmation here once it's live.")
 

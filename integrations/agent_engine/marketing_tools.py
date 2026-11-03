@@ -8,7 +8,6 @@ Tier 1 (Default): google_search, text_2_image, delegate_to_specialist, etc.
 Tier 2 (Category): create_social_post, create_campaign, create_ad, post_to_channel
 Tier 3 (Runtime): delegate_to_specialist finds agents with needed skills via A2A
 """
-import hashlib
 import json
 import logging
 import re
@@ -98,38 +97,21 @@ _NOT_DONE = ("Until it posts, this post has not happened; do not report it "
              "as done. Call post_to_channel again later: it carries on from "
              "the owner's answer.")
 
-#: The owner's value post_to_channel connected each channel with: its
-#: fingerprint, the register_channel start that carried it
-#: (agent_tools.start_verdict's 'start') and when the owner had last
-#: entered it (_owner_entered_at).  How that start ended is its watcher's
-#: verdict, never a clock: a value that connected and later dropped is
-#: connected again; a value whose start failed is not tried again until the
-#: owner enters a value (the same one included), and the owner is asked for
-#: another (reviews of f8fdb9c64 H2 and 506a79c1f).
-_SELF_CONNECTS = {}
-_SELF_CONNECTS_LOCK = threading.Lock()
+#: One connect of a channel at a time: _connect_or_ask holds the channel's
+#: lock from its "still connecting?" check through register_channel, so two
+#: posts at once start it once (review of 1feb76f14: both registered, the
+#: second rebuilding the adapter mid-connect).
+_CONNECT_LOCKS = {}
+_CONNECT_LOCKS_GUARD = threading.Lock()
 
 
-def _fingerprint(value) -> str:
-    return hashlib.sha256(str(value).encode('utf-8')).hexdigest()
-
-
-def _own_start(channel: str) -> Optional[dict]:
-    """post_to_channel's latest connect of ``channel`` with 'state', how its
-    start ended (agent_tools.start_verdict; None once a later start replaced
-    it), or None when it has connected nothing here."""
-    from integrations.channels.agent_tools import start_verdict
-    with _SELF_CONNECTS_LOCK:
-        tried = _SELF_CONNECTS.get(channel)
-    if tried is None:
-        return None
-    verdict = start_verdict(channel) or {}
-    return dict(tried, state=(verdict.get('state')
-                              if verdict.get('start') == tried['start'] else None))
+def _connect_lock(channel: str) -> threading.Lock:
+    with _CONNECT_LOCKS_GUARD:
+        return _CONNECT_LOCKS.setdefault(channel, threading.Lock())
 
 
 def _connecting_now(channel: str) -> bool:
-    """Whether the latest start register_channel scheduled for ``channel``
+    """Whether the latest start of ``channel`` (agent_tools.start_verdict)
     is still being watched.  Only Discord reports CONNECTING, so the watch
     is what says the others are mid-connect."""
     from integrations.channels.agent_tools import START_WATCHING, start_verdict
@@ -157,11 +139,12 @@ def _owner_declined(owner, name) -> bool:
 
 
 def _owner_entered_at(owner, name):
-    """When the owner last entered credential ``name``: the newest granted
-    'credential' row for scope 'secret:NAME' (the card's Accept appends one
-    per value entered; ai_key_vault._recent_entries counts the same rows).
-    None when they never did or it cannot be read."""
+    """When the owner last entered credential ``name``: the newest entry
+    row for scope 'secret:NAME', by the vault's own rule for what an entry
+    is (ai_key_vault._recent_entries: granted_at set, not taken back with
+    "Allow asking again").  None when they never did or it cannot be read."""
     try:
+        from hartos.ai_key_vault import _reopened
         from integrations.social.consent_service import (
             CREDENTIAL_SCOPE_PREFIX, ConsentService)
         from integrations.social.models import db_session
@@ -169,8 +152,8 @@ def _owner_entered_at(owner, name):
         with db_session(commit=False) as db:
             times = [row.granted_at for row in ConsentService.list_consents(
                          db, str(owner), 'credential')
-                     if row.scope == scope and row.granted
-                     and row.granted_at is not None]
+                     if row.scope == scope and row.granted_at is not None
+                     and not _reopened(row)]
         return max(times) if times else None
     except Exception:
         logger.warning("credential %s: when the owner entered it could not be "
@@ -221,18 +204,33 @@ def _connect_or_ask(channel: str, meta: dict, adapter=None) -> str:
     owner's account, with the value itself: the model never holds it, and
     no unresolved {{secret:NAME}} ever becomes a token.
 
-    How that start ended decides the next call (_own_start): a value whose
-    start failed is not tried again until the owner enters a value, and the
-    owner is asked for a new one (request_credential's "rejected"); a value
-    that connected and has since dropped is connected again.  A start
-    register_channel did not schedule (it refused, or the adapter could not
-    be started here) asks nothing: no value the owner types would change
-    it.  An owner who said no is not asked again.  A node with no owner
-    connects nothing: there is nobody to connect it for.
+    The channel's latest start (agent_tools.start_verdict: the value's
+    fingerprint, when it started, how it ended) decides what the owner's
+    value gets, unless the owner entered it after that start, which always
+    tries it:
+      * no start yet: connect with it;
+      * started with this value and connected, since dropped: connect again;
+      * started with this value and failed: not tried again; the owner is
+        asked for a new one (request_credential's "rejected");
+      * started with ANOTHER value (Connect_Channel, the connect form,
+        OAuth): that is the newer choice, and the older vault value is never
+        written over it; nothing is asked (review of 1feb76f14).
+    A start register_channel did not schedule for this value (it refused,
+    or the adapter could not be started here) asks nothing: no value the
+    owner types would change it.  An owner who said no is not asked again.
+    A node with no owner connects nothing: there is nobody to connect it
+    for.  One connect per channel at a time (_connect_lock).
     """
+    with _connect_lock(channel):
+        return _connect_or_ask_locked(channel, meta, adapter)
+
+
+def _connect_or_ask_locked(channel: str, meta: dict, adapter) -> str:
+    """_connect_or_ask, under the channel's connect lock."""
     from integrations.channels.agent_tools import (
         LINKED_FROM_PHONE, SEVERAL_CREDENTIALS, START_FAILED,
-        build_channel_tool_closures, chat_connect_blocker, start_verdict)
+        build_channel_tool_closures, chat_connect_blocker,
+        credential_fingerprint, start_verdict)
     from integrations.channels.base import ChannelStatus
     from integrations.channels.metadata import required_setup_keys
     display = meta.get('display_name') or channel
@@ -301,39 +299,54 @@ def _connect_or_ask(channel: str, meta: dict, adapter=None) -> str:
 
     value = vault.owner_credential(name)
     if value:
-        fp = _fingerprint(value)
+        fp = credential_fingerprint(value)
+        latest = start_verdict(channel)
         entered = _owner_entered_at(owner, name)
-        own = _own_start(channel)
-        if (own is not None and own['fp'] == fp
-                and own['state'] == START_FAILED and own['entered'] == entered):
-            # This very value's start failed, and the owner has entered
-            # nothing since: ask for another.
-            return _not_posted(
-                channel, (f"{display} could not connect with the {label} the "
-                          f"owner entered, so nothing was posted."),
-                needs_owner=True, asked_owner_for=name, value_refused=True,
-                owner_answer=_ask(rejected=True), next=_NOT_DONE)
-        # Not tried yet, a new value, the owner entered it again, a later
-        # start replaced ours, or it connected and has since dropped.
+        fresh = (latest is not None and entered is not None
+                 and entered > latest['at'])
+        if latest is not None and not fresh:
+            if latest.get('fp') != fp:
+                # Last started with another value (Connect_Channel, the
+                # connect form, OAuth), after the owner entered this one:
+                # writing it back would replace the token that start chose,
+                # in the binding too (review of 1feb76f14).  That start's
+                # own watcher already told the owner how it went.
+                return _not_posted(
+                    channel, (f"{display} is not running, and it was last "
+                              f"connected with a different {label} than the "
+                              f"one the owner entered here, so nothing was "
+                              f"posted."),
+                    needs_owner=False, connected_elsewhere=True,
+                    next=(f"Nothing asked and nothing reconnected: the owner "
+                          f"connected {display} another way since, and that "
+                          f"connect tells them how it went. Do not report a "
+                          f"post on {display}."))
+            if latest['state'] == START_FAILED:
+                # This very value's start failed, and the owner has entered
+                # nothing since: ask for another.
+                return _not_posted(
+                    channel, (f"{display} could not connect with the {label} "
+                              f"the owner entered, so nothing was posted."),
+                    needs_owner=True, asked_owner_for=name, value_refused=True,
+                    owner_answer=_ask(rejected=True), next=_NOT_DONE)
+            # It connected with this value and has since dropped.
         register = next(t[2] for t in build_channel_tool_closures(
             {'user_id': owner}) if t[0] == 'register_channel')
-        before = (start_verdict(channel) or {}).get('start')
-        started = register(channel, json.dumps({key: value}))
-        after = (start_verdict(channel) or {}).get('start')
-        if after is None or after == before:
-            # register_channel scheduled no start: it refused, or the
-            # adapter could not be started here.  Nothing the owner types
-            # would change that, so nothing is asked and no try is kept.
-            # Its words go to the agent, which never sees the value.
+        started = vault.mask_secrets(register(channel, json.dumps({key: value})))
+        after = start_verdict(channel)
+        if (after is None or after.get('fp') != fp
+                or after['start'] == (latest or {}).get('start')):
+            # No start of this value was scheduled: register_channel
+            # refused, or the adapter could not be started here.  Nothing
+            # the owner types would change that, so nothing is asked.  A
+            # start of another value landing meanwhile is not taken as
+            # ours (review of 1feb76f14).  The agent never sees the value.
             return _not_posted(
                 channel, (f"{display} could not be started here, so nothing "
-                          f"was posted: {vault.mask_secrets(started)}"),
+                          f"was posted: {started}"),
                 needs_owner=False, cannot_connect_here=True,
                 next=(f"Nothing asked: a value from the owner would not "
                       f"start {display}. Do not report a post on {display}."))
-        with _SELF_CONNECTS_LOCK:
-            _SELF_CONNECTS[channel] = {'fp': fp, 'start': after,
-                                       'entered': entered}
         return _not_posted(
             channel, f"{display} was not connected, so nothing was posted yet.",
             connecting=True, register_channel=started,
@@ -643,6 +656,18 @@ def _publish_instagram_feed(user_id, media_url, caption='', *, _consent=None):
         return json.dumps({'success': False, 'error': str(e)})
 
 
+def _channel_arg_text() -> str:
+    """post_to_channel's channel argument, naming the channels where no
+    announcement can go out (announcement_broadcaster.PERSON_TO_PERSON_CHANNELS,
+    the one list)."""
+    from integrations.channels.announcement_broadcaster import (
+        PERSON_TO_PERSON_CHANNELS)
+    return ("Chat channel to post on: telegram, discord, viber ... (not "
+            f"{', '.join(sorted(PERSON_TO_PERSON_CHANNELS))}: there "
+            "announcements reach only people who subscribed; for twitter, "
+            "linkedin and other sites, use post_to_channel_via_browser)")
+
+
 def register_marketing_tools(helper, assistant, user_id: str):
     """Register marketing-specific tools with the agent (Tier 2).
 
@@ -654,6 +679,7 @@ def register_marketing_tools(helper, assistant, user_id: str):
         assistant: AutoGen assistant agent (registers for execution)
         user_id: Current user ID for ownership
     """
+    _CHANNEL_ARG = _channel_arg_text()
 
     def create_social_post(
         title: Annotated[str, "Post title"],
@@ -744,7 +770,7 @@ def register_marketing_tools(helper, assistant, user_id: str):
             return json.dumps({'success': False, 'error': str(e)})
 
     def post_to_channel(
-        channel: Annotated[str, "Chat channel to post on: telegram, discord, viber ... (not signal, whatsapp or imessage: there announcements reach only people who subscribed; for twitter, linkedin and other sites, use post_to_channel_via_browser)"],
+        channel: Annotated[str, _CHANNEL_ARG],
         content: Annotated[str, "Content to post — write as one real person to another; never AI/marketing-speak (it gets scrolled past)"],
         media_url: Annotated[Optional[str], "Media to include (optional): a URL, or a file this node made"] = None,
         extra_config: Annotated[Optional[str], "Not used: posts go to the group or channel the owner chose for this channel"] = None,

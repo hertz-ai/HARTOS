@@ -896,10 +896,12 @@ def test_a_start_that_could_not_be_scheduled_asks_nothing_and_keeps_no_try(
     not asked, and the next post tries again (review of 506a79c1f: it was
     kept as a try, and the value later counted as refused)."""
     from integrations.social import api_channels
+    # The error names the credential, as a library's error text can: the
+    # agent must still never see it (review of 1feb76f14, mutant M5).
     monkeypatch.setattr(api_channels, '_wire_live_adapter',
                         lambda ch, cred: world.wired.append((ch, cred))
                         or {'success': False,
-                            'error': 'the channel loop is not running'})
+                            'error': f'the channel loop is not running for {cred}'})
     _owner_enters(TOKEN)
     first = _post('telegram', 'hello')
     assert first.get('cannot_connect_here') is True
@@ -927,6 +929,136 @@ def test_the_owner_entering_the_same_value_again_retries_it_once(world):
     _watch_ends(world, connected=False)
     third = _post('telegram', 'hello')
     assert third.get('value_refused') is True and len(world.wired) == 2
+
+
+OTHER = '789:another-bot-token'
+
+
+def _other_start(channel, value):
+    """Another path (Connect_Channel, the connect form, OAuth) starts
+    ``channel`` with ``value``."""
+    from integrations.channels import agent_tools
+    fp = getattr(agent_tools, 'credential_fingerprint', None)
+    try:
+        agent_tools._watch_start(channel, {}, OWNER, fp(value) if fp else None)
+    except TypeError:           # where _watch_start takes no fingerprint
+        agent_tools._watch_start(channel, {}, OWNER)
+
+
+def test_a_newer_connect_with_another_value_is_never_overwritten(world):
+    """Review of 1feb76f14 (critical, measured): the owner's vault value A
+    failed, the owner connected the bot with B another way, B connected and
+    later dropped, and the next post registered A over B, binding included,
+    so the working token was gone after a restart."""
+    from integrations.channels.agent_tools import build_channel_tool_closures
+    from integrations.social.models import UserChannelBinding, db_session
+    from security.secrets_manager import SecretsManager
+    _owner_enters(TOKEN)
+    _post('telegram', 'hello')                       # A is tried...
+    _watch_ends(world, connected=False)              # ...and refused
+    register = next(t[2] for t in build_channel_tool_closures({'user_id': OWNER})
+                    if t[0] == 'register_channel')
+    register('telegram', json.dumps({'bot_token': OTHER}))   # B, another way
+    _watch_ends(world, connected=True)
+    world.registry.register(_Adapter('telegram', status=ChannelStatus.DISCONNECTED))
+    out = _post('telegram', 'hello')                 # B has dropped
+    assert world.wired == [('telegram', TOKEN), ('telegram', OTHER)]
+    assert out.get('connected_elsewhere') is True and out['needs_owner'] is False
+    assert _card_requests(world) == []
+    with db_session(commit=False) as db:
+        [binding] = db.query(UserChannelBinding).all()
+        kept = binding.metadata_json['bot_token']
+    assert SecretsManager.get_instance().decrypt_value(kept) == OTHER
+    # The owner entering their value again is their choice: it is tried.
+    _owner_enters(TOKEN)
+    _post('telegram', 'hello')
+    assert world.wired[-1] == ('telegram', TOKEN)
+
+
+def test_another_start_during_a_refused_register_is_not_taken_as_ours(
+        world, monkeypatch):
+    """Review of 1feb76f14: our register_channel refused while another start
+    of the channel landed inside the call; the other start was kept as our
+    try, the next post sent a "rejected" card for a value never started,
+    and the unmasked register text carried the token to the agent."""
+    from integrations.social import api_channels
+
+    def wire(ch, cred):
+        world.wired.append((ch, cred))
+        if cred == TOKEN:
+            _other_start(ch, OTHER)                  # lands meanwhile
+            return {'success': False, 'error': f'could not start with {cred}'}
+        return {'success': True}
+    monkeypatch.setattr(api_channels, '_wire_live_adapter', wire)
+    _owner_enters(TOKEN)
+    out = _post('telegram', 'hello')
+    assert out.get('cannot_connect_here') is True and out['needs_owner'] is False
+    assert TOKEN not in json.dumps(out)
+    _watch_ends(world, connected=False)              # the other start fails
+    later = _post('telegram', 'hello')
+    assert later.get('value_refused') is None
+    assert _card_requests(world) == []
+
+
+def test_two_posts_at_once_connect_the_channel_once(world, monkeypatch):
+    """Review of 1feb76f14: two posts at once both registered the channel,
+    the second rebuilding the adapter mid-connect."""
+    from integrations.social import api_channels
+    in_wire = threading.Event()
+
+    def slow_wire(ch, cred):
+        in_wire.set()
+        time.sleep(0.3)
+        world.wired.append((ch, cred))
+        return {'success': True}
+    monkeypatch.setattr(api_channels, '_wire_live_adapter', slow_wire)
+    _owner_enters(TOKEN)
+    outs = []
+    first = threading.Thread(target=lambda: outs.append(_post('telegram', 'hi')))
+    second = threading.Thread(target=lambda: outs.append(_post('telegram', 'hi')))
+    first.start()
+    assert in_wire.wait(5)
+    second.start()
+    first.join(10)
+    second.join(10)
+    assert world.wired == [('telegram', TOKEN)]
+    assert len(outs) == 2 and all(o.get('connecting') for o in outs)
+
+
+def test_a_late_watcher_never_overwrites_a_later_start(monkeypatch):
+    """The first start's watcher ending after a second start leaves the
+    second start's record alone (review of 1feb76f14, mutant M10)."""
+    from integrations.channels import agent_tools
+    monkeypatch.setattr(agent_tools, '_report_when_live',
+                        lambda ch, meta, owner: meta['gate'].wait(5)
+                        and not meta['done'].set())
+    channel = 'zz-late-watcher'
+    first = {'gate': threading.Event(), 'done': threading.Event()}
+    second = {'gate': threading.Event(), 'done': threading.Event()}
+
+    def start(meta, fp):
+        try:
+            agent_tools._watch_start(channel, meta, OWNER, fp)
+        except TypeError:       # where _watch_start takes no fingerprint
+            agent_tools._watch_start(channel, meta, OWNER)
+    try:
+        start(first, 'fp-first')
+        start(second, 'fp-second')
+        latest = agent_tools.start_verdict(channel)
+        first['gate'].set()
+        assert first['done'].wait(5)
+        time.sleep(0.05)              # the first watcher writes its verdict
+        now = agent_tools.start_verdict(channel)
+        assert (now['start'], now['state'], now.get('fp')) == (
+            latest['start'], agent_tools.START_WATCHING, latest.get('fp'))
+        second['gate'].set()
+        assert second['done'].wait(5)
+        time.sleep(0.05)
+        assert agent_tools.start_verdict(channel)['state'] == agent_tools.START_CONNECTED
+    finally:
+        first['gate'].set()
+        second['gate'].set()
+        agent_tools._STARTS.pop(channel, None)
 
 
 @pytest.mark.parametrize('running', [True, False])
@@ -1141,6 +1273,20 @@ def test_the_instagram_feed_with_instagram_not_running_posts_nothing(world):
     out = json.loads(_publish_instagram_feed(
         'u', 'https://x.test/a.jpg', 'c', _consent=lambda _u: True))
     assert out['success'] is False and out.get('sent') is False
+
+
+def test_the_instagram_feed_leaves_a_connecting_instagram_alone(world):
+    """An Instagram adapter still connecting is not rebuilt and nothing is
+    asked (review of 1feb76f14, mutant M13)."""
+    from integrations.agent_engine.marketing_tools import _publish_instagram_feed
+    ig = _Instagram()
+    ig.status = ChannelStatus.CONNECTING
+    ig._running = False
+    world.registry.register(ig)
+    out = json.loads(_publish_instagram_feed(
+        'u', 'https://x.test/a.jpg', 'c', _consent=lambda _u: True))
+    assert ig.calls == [] and world.wired == [] and _card_requests(world) == []
+    assert out.get('connecting') is True and out['sent'] is False
 
 
 def test_the_instagram_feed_posts_nothing_on_a_channel_the_owner_turned_off(
