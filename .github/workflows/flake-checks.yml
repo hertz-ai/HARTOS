@@ -115,6 +115,11 @@ concurrency:
   group: flake-checks-${{ github.ref }}-${{ github.event_name }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'shared' }}
   cancel-in-progress: true
 
+env:
+  # pip below 26.3 for every pip run, pip-audit's own venv included
+  # (.github/pip-constraint.txt says why)
+  PIP_CONSTRAINT: ${{ github.workspace }}/.github/pip-constraint.txt
+
 jobs:
   # ─── Python: unit + functional (the runtime gate) ──────────────────────────
   unit-tests:
