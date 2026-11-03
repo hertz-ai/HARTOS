@@ -155,6 +155,9 @@ def test_a_stored_credential_is_answered_without_the_model(world, model):
     # A NO that names who issues it contradicts itself.
     json.dumps({'issued_by': 'OpenWeather', 'answer': 'NO'}),
     json.dumps(['NO']),
+    # A reply whose content is a list of parts, not text (review of 133ab4a07,
+    # M2: it raised TypeError out of the tool).
+    [{'type': 'text', 'text': NO}],
 ])
 def test_a_reply_that_is_not_a_clear_no_is_not_a_refusal(world, model, caplog, reply):
     """Refusing a real ask breaks the agent; asking a made-up one is what
@@ -182,6 +185,27 @@ def test_the_langchain_request_resource_tool_takes_the_same_road(world, model, m
     out = hie._handle_request_resource(INVENTED)
     assert _cards(world) == []
     assert TOLD in out
+
+
+def test_the_description_fits_the_chat_agent_prompt():
+    """hart_intelligence_entry hands this description to LangChain's
+    Request_Resource tool, and the chat agent's prompt is an f-string template
+    that lists each tool as '> name: description'.  A single brace in the
+    description becomes a template slot, and then every chat turn with tools
+    fails before the model runs.  Live on 2026-11-03 06:58 IST, request
+    msg_1793669313883_upp4xc: "Missing some input keys: {'"key_name"'}", and
+    the person was told their local AI was busy.  The check is LangChain's
+    own (the formatter its prompt templates validate with)."""
+    from langchain_core.utils.formatting import formatter
+    from hartos.ai_key_vault import REQUEST_RESOURCE_DESCRIPTION
+    human = ('TOOLS\n> Request_Resource: ' + REQUEST_RESOURCE_DESCRIPTION
+             + '\nUSER INPUT: {input}')
+    formatter.validate_input_variables(human, ['input'])
+    # resource_type too: request_credential files the ask under it (or
+    # 'api_key' when it is missing).
+    for field in ('resource_type', 'key_name', 'service', 'where_to_get'):
+        assert field in REQUEST_RESOURCE_DESCRIPTION, (
+            f'the description no longer tells the agent to give {field}')
 
 
 def test_both_tools_describe_the_ask_the_same_way():

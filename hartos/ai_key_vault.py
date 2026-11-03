@@ -611,9 +611,10 @@ def _recent_entries(rows) -> int:
 
 def request_credential(resource_description, agent_id=None, *,
                        tell_alias=True) -> str:
-    """What Request_Resource (both the LangChain tool and core.agent_tools
-    request_resource) does: get the agent a credential without the agent
-    ever seeing it.
+    """Get the agent a credential without the agent ever seeing it.  The
+    agent tools (Request_Resource and core.agent_tools request_resource) come
+    here through request_credential_for_agent; code that asks for its own
+    fixed credential (post_to_channel) calls it directly.
 
     A stored credential is answered with its {{secret:NAME}} alias.  A
     missing one is asked for through ConsentService, like every other ask:
@@ -763,18 +764,27 @@ def request_credential(resource_description, agent_id=None, *,
 #: "any configuration value", and on 2026-11-02 a background goal asked the
 #: owner for 'Hive Network Configuration'.
 REQUEST_RESOURCE_INPUT = (
-    'JSON: {"key_name": "OPENWEATHER_API_KEY", "label": "OpenWeather API key", '
+    'JSON: {"resource_type": "api_key", "key_name": "OPENWEATHER_API_KEY", '
+    '"label": "OpenWeather API key", '
     '"service": "OpenWeather (openweathermap.org)", "used_by": "the forecast step", '
     '"description": "what you will do with it, in plain words", '
     '"where_to_get": "where the person finds it, e.g. openweathermap.org, My API keys"}')
+#: No braces in it: hart_intelligence_entry hands it to LangChain, whose chat
+#: agent prompt is an f-string template, so a brace would be read as a slot
+#: and every chat turn with tools would fail ("Missing some input keys",
+#: live 2026-11-03).  The JSON example stays in REQUEST_RESOURCE_INPUT, which
+#: only core.agent_tools reads, as its input's description.
 REQUEST_RESOURCE_DESCRIPTION = (
     "Ask the person for a credential of an OUTSIDE service they have an account "
     "with (an API key, a bot token, a login for a website or app) when a step "
     "needs one and it is not stored yet. Say which service, what you will do with "
     "it and where they get it, so they can act on it. The value is kept encrypted "
-    "on this computer and you only get its {{secret:NAME}} alias. Never ask for "
+    "on this computer and you only get an alias that tools fill in. Never ask for "
     "this computer's own settings, network or configuration: it already has them, "
-    "and such an ask is not shown to anyone. Input: " + REQUEST_RESOURCE_INPUT)
+    "and such an ask is not shown to anyone. Input: one JSON object with "
+    "resource_type (api_key, token or channel_secret), key_name (for example "
+    "OPENWEATHER_API_KEY), label, service, used_by, description (what you will do "
+    "with it, in plain words) and where_to_get (where the person finds it).")
 
 #: Seconds the node's own model gets to judge one ask.
 _ASK_CHECK_TIMEOUT_S = 20
@@ -844,7 +854,7 @@ def _ask_verdict(req) -> Optional[str]:
         return None
     try:
         reply = json.loads(text)
-    except ValueError:
+    except (TypeError, ValueError):  # TypeError: content as a list of parts, not text
         return None
     if not isinstance(reply, dict):
         return None

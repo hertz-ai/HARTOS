@@ -5052,8 +5052,9 @@ def _handle_agentic_router_tool(input_text):
 def _handle_request_resource(input_text: str) -> str:
     """Request_Resource: the agent needs a credential, API key or token.
 
-    hartos.ai_key_vault.request_credential does the work, for this tool and
-    for core.agent_tools request_resource alike: the owner is asked on the
+    hartos.ai_key_vault.request_credential_for_agent does the work, for this
+    tool and for core.agent_tools request_resource alike: an ask no person
+    could act on goes back to the agent; any other is asked on the owner's
     consent card and the agent gets only the {{secret:NAME}} alias.
     """
     from hartos.ai_key_vault import request_credential_for_agent
