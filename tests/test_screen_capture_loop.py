@@ -137,8 +137,12 @@ def _started_capture_callbacks(monkeypatch, owner):
     monkeypatch.setattr(vsmod, 'run_screen_capture_loop', fake_loop)
     monkeypatch.setitem(sys.modules, 'integrations.social.models',
                         SimpleNamespace(db_session=fake_db_session))
+    # _start_screen_capture also imports central_lacks from this module (central
+    # with no screen has nothing to capture); '' is its answer for a node that
+    # has the part, which is every node this test stands in for.
     monkeypatch.setitem(sys.modules, 'integrations.social.consent_service',
-                        SimpleNamespace(ConsentService=FakeConsent))
+                        SimpleNamespace(ConsentService=FakeConsent,
+                                        central_lacks=lambda consent_type: ''))
     monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', owner)
     vs = VisionService.__new__(VisionService)
     vs._running = True
