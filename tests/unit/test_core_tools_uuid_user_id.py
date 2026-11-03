@@ -131,7 +131,7 @@ class CoreToolsAcceptUuidUserId(unittest.TestCase):
         exists in the function; it was unreachable.
         """
         fn = _tool(_ctx(UUID_USER), 'get_user_uploaded_file')
-        self.assertTrue(fn().startswith('No file uploaded from user'))
+        self.assertEqual(fn(), 'No file uploaded from user')
 
     def test_uploaded_file_tool_still_reports_a_real_upload(self):
         """Proves the fix did not simply swallow the lookup.
@@ -151,7 +151,7 @@ class CoreToolsAcceptUuidUserId(unittest.TestCase):
         cache[UUID_USER] = None
         fn = _tool(_ctx(UUID_USER, recent_file_id=cache),
                    'get_user_uploaded_file')
-        self.assertTrue(fn().startswith('No file uploaded from user'))
+        self.assertEqual(fn(), 'No file uploaded from user')
 
 
 class _FakeResponse:
