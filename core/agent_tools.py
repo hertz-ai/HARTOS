@@ -2667,20 +2667,22 @@ def build_core_tool_closures(ctx):
     # ------------------------------------------------------------------
     # request_resource — Parity with LangChain Request_Resource
     # ------------------------------------------------------------------
+    # The one description of a credential ask, shared with Request_Resource in
+    # hart_intelligence_entry; the ask goes through the same gate there too.
+    from hartos.ai_key_vault import (
+        REQUEST_RESOURCE_DESCRIPTION, REQUEST_RESOURCE_INPUT)
+
     @log_tool_execution
     def request_resource(
-        resource_description: Annotated[str, "JSON or plain text describing the needed resource. JSON format: {\"resource_type\": \"api_key\", \"key_name\": \"GOOGLE_API_KEY\", \"label\": \"Google API Key\", \"used_by\": \"search tool\", \"description\": \"needed for web search\"}"],
+        resource_description: Annotated[str, REQUEST_RESOURCE_INPUT],
     ) -> str:
-        """Request an API key, credential, token, or config value that is not currently available."""
-        from hartos.ai_key_vault import request_credential
-        return request_credential(resource_description, agent_id=prompt_id)
+        """Ask the person for an outside service's credential a step needs."""
+        from hartos.ai_key_vault import request_credential_for_agent
+        return request_credential_for_agent(resource_description, agent_id=prompt_id)
 
     tools.append((
         "request_resource",
-        "Request an API key, credential, token, or config value. Checks vault/env first, "
-        "then prompts the user if not found. Handles: API keys (OpenAI, Google, Slack), "
-        "OAuth tokens, channel secrets, service credentials. "
-        "Input: JSON with resource_type, key_name, label, used_by, description.",
+        REQUEST_RESOURCE_DESCRIPTION,
         request_resource,
     ))
 

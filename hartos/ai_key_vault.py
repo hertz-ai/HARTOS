@@ -755,6 +755,162 @@ def request_credential(resource_description, agent_id=None, *,
             f"card. Once they enter it, {use}")
 
 
+# ── An agent's ask, before it reaches a person ─────────────────────
+
+#: The input an agent's credential tool takes, and what the tool is for: ONE
+#: text, read by core.agent_tools request_resource and the Request_Resource
+#: tool in hart_intelligence_entry, so both say the same.  It used to invite
+#: "any configuration value", and on 2026-11-02 a background goal asked the
+#: owner for 'Hive Network Configuration'.
+REQUEST_RESOURCE_INPUT = (
+    'JSON: {"key_name": "OPENWEATHER_API_KEY", "label": "OpenWeather API key", '
+    '"service": "OpenWeather (openweathermap.org)", "used_by": "the forecast step", '
+    '"description": "what you will do with it, in plain words", '
+    '"where_to_get": "where the person finds it, e.g. openweathermap.org, My API keys"}')
+REQUEST_RESOURCE_DESCRIPTION = (
+    "Ask the person for a credential of an OUTSIDE service they have an account "
+    "with (an API key, a bot token, a login for a website or app) when a step "
+    "needs one and it is not stored yet. Say which service, what you will do with "
+    "it and where they get it, so they can act on it. The value is kept encrypted "
+    "on this computer and you only get its {{secret:NAME}} alias. Never ask for "
+    "this computer's own settings, network or configuration: it already has them, "
+    "and such an ask is not shown to anyone. Input: " + REQUEST_RESOURCE_INPUT)
+
+#: Seconds the node's own model gets to judge one ask.
+_ASK_CHECK_TIMEOUT_S = 20
+#: The model first names who gives the person this secret, then answers.
+#: Measured 2026-11-03 on the desktop's own model (Qwen3.5-2B): asked for a
+#: free-text "YES / NO: reason", it judged right but wrote "NO, because ...",
+#: so no exact word ever matched; asked for a bare verdict, it refused 5 of 10
+#: real outside-service asks (bot tokens, a Stripe key) as "system
+#: credentials".  Naming the issuer first: 0 wrong of 51 asks (27 real, 21
+#: made up, 3 sets) once the keys this computer reads skip the check.
+_ASK_CHECK_PROMPT = (
+    "A software agent on a person's computer wants to ask the person to type in a "
+    "secret: an API key, token, password or similar.\n"
+    "Step 1, issued_by: the outside company, website or app where the person has an "
+    "account and gets this secret (for example Telegram, Stripe, AWS, Zoom, their "
+    "email provider or online shop). Write NONE only if the secret belongs to the "
+    "computer itself or to the agent software (its own settings, network, "
+    "configuration, storage, scheduler, model server, node identity, certificates "
+    "or internal keys), which the system already has.\n"
+    "Step 2, answer: YES if issued_by names a company, website or app; NO if "
+    "issued_by is NONE.\nThe request:\n{request}\n")
+#: The reply's exact shape, enforced by the server (llama.cpp makes it a
+#: grammar; OpenAI-style APIs take it as structured output), so the answer is
+#: one of two words and never free text to pattern-match.
+_ASK_CHECK_SCHEMA = {
+    'type': 'object',
+    'properties': {'issued_by': {'type': 'string', 'maxLength': 80},
+                   'answer': {'type': 'string', 'enum': ['YES', 'NO']}},
+    'required': ['issued_by', 'answer'], 'additionalProperties': False}
+_ASK_FIELDS = ('label', 'key_name', 'service', 'used_by', 'description',
+               'where_to_get')
+
+
+def _ask_verdict(req) -> Optional[str]:
+    """'yes' | 'no' | None: the node's own model's word on whether an outside
+    company, website or app gives the person this secret.  The model this
+    node's turns run on (core.autogen_config.llm_http_target), so it works
+    where there is no local model too.
+
+    'no' only when both fields say so (issued_by NONE and answer NO); a NO that
+    names a company contradicts itself and counts as no answer, as does any
+    reply that is not the asked-for object, an error or a model that is down
+    (None).  Refusing a real ask costs the person a working agent; asking a
+    made-up one costs them a puzzling card, which is what happened before."""
+    request = '\n'.join(f'{key}: {str(req.get(key))[:300]}' for key in _ASK_FIELDS
+                        if str(req.get(key) or '').strip())
+    try:
+        from core.autogen_config import llm_http_target, llm_stays_on_premises
+        from core.http_pool import pooled_post
+        url, headers, model = llm_http_target()
+        body = {'model': model, 'temperature': 0, 'max_tokens': 80,
+                'messages': [{'role': 'user',
+                              'content': _ASK_CHECK_PROMPT.format(request=request)}],
+                'response_format': {'type': 'json_schema', 'json_schema': {
+                    'name': 'credential_ask_check', 'strict': True,
+                    'schema': _ASK_CHECK_SCHEMA}}}
+        if llm_stays_on_premises():
+            from core.constants import LLM_THINKING_OFF_KWARGS
+            body['chat_template_kwargs'] = dict(LLM_THINKING_OFF_KWARGS)
+        resp = pooled_post(url, headers=headers, json=body, timeout=_ASK_CHECK_TIMEOUT_S)
+        if resp.status_code != 200:
+            raise RuntimeError(f'HTTP {resp.status_code}')
+        text = ((resp.json().get('choices') or [{}])[0].get('message') or {}).get(
+            'content') or ''
+    except Exception as e:
+        logger.warning("credential ask: the model could not be asked (%s)", e)
+        return None
+    try:
+        reply = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(reply, dict):
+        return None
+    answer = reply.get('answer')
+    issuer = str(reply.get('issued_by') or '').strip().upper()
+    if answer == 'YES':
+        return 'yes'
+    if answer == 'NO' and issuer == 'NONE':
+        return 'no'
+    return None
+
+
+def request_credential_for_agent(resource_description, agent_id=None) -> str:
+    """What an agent's credential tool does (core.agent_tools request_resource
+    and Request_Resource in hart_intelligence_entry): request_credential,
+    unless no person could act on the ask.
+
+    Owner, 2026-11-02: agents ask for credentials at runtime, while being
+    created or in any task, but never for a made-up one "as if everyone else
+    understands what it asks for".  Live that day: a background goal asked the
+    owner for 'Hive Network Configuration' (hive_network_config, used_by
+    network_discovery), names nothing in the code reads.
+
+    A credential this computer's code reads (reads_from_env: API keys, channel
+    tokens) or one the owner already stored goes straight on, with no model
+    call.  Any other ask is judged by the node's own model (_ask_verdict): YES
+    is asked, with the service and where to get it put on the card; NO (no
+    outside company gives it out) goes back to the agent with no card; no
+    answer (model down, or not the asked-for reply) is asked as before and
+    logged.  Code that asks for its own fixed credential (post_to_channel, the
+    trending-songs job) calls request_credential itself.
+    """
+    req = _parse_resource_request(resource_description)
+    vault = get_ai_key_vault()
+    label = str(req.get('label') or req.get('key_name') or 'a credential')[:100]
+    # The name request_credential gives it (its own two lines), so a stored or
+    # declared credential is recognised as the same one.
+    name = vault.credential_name(req.get('key_name') or label,
+                                 req.get('channel_type') or '')
+    if not (reads_from_env(name) or vault.owner_credential(name)):
+        verdict = _ask_verdict(req)
+        if verdict == 'no':
+            logger.info("credential %s not asked: no outside company, website or "
+                        "app gives it out", name)
+            return (f"Did not ask the owner for '{label}': no outside company, "
+                    f"website or app gives it out, so no person could find it. "
+                    f"Ask a person only for a credential of an outside service "
+                    f"they have an account with, and say which service, what you "
+                    f"will do with it and where they get it. This computer's own "
+                    f"settings, network and configuration need no secret from "
+                    f"anyone.")
+        if verdict is None:
+            logger.warning("credential %s could not be checked (the model gave no "
+                           "answer): asked as before", name)
+    # The card shows what the person needs to act on it (request_credential
+    # puts the description in the card's reason).
+    extra = [f"Service: {req['service']}." if str(req.get('service') or '').strip()
+             else '',
+             f"Where to get it: {req['where_to_get']}."
+             if str(req.get('where_to_get') or '').strip() else '']
+    if any(extra):
+        req = dict(req, description=' '.join(filter(None, [
+            str(req.get('description') or '').strip()] + extra)))
+    return request_credential(json.dumps(req), agent_id=agent_id)
+
+
 # ── Localhost enforcement ──────────────────────────────────────────
 
 def is_local_request() -> bool:

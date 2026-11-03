@@ -260,6 +260,8 @@ from bs4 import BeautifulSoup
 from enum import Enum
 from hartos.cultural_wisdom import get_cultural_prompt_compact
 from hartos.agent_identity import build_identity_prompt, SECRETS_GUARDRAIL, extract_owner_name
+# The one description of an agent's credential ask (core.agent_tools shares it).
+from hartos.ai_key_vault import REQUEST_RESOURCE_DESCRIPTION
 
 # langchain_classic — pydantic v2-compatible fork of langchain 0.0.230.
 # Fail-safe (#99): in a frozen env where langchain_classic is absent (the HART OS
@@ -5054,9 +5056,9 @@ def _handle_request_resource(input_text: str) -> str:
     for core.agent_tools request_resource alike: the owner is asked on the
     consent card and the agent gets only the {{secret:NAME}} alias.
     """
-    from hartos.ai_key_vault import request_credential
+    from hartos.ai_key_vault import request_credential_for_agent
     from integrations.social.consent_service import known_agent_id
-    return request_credential(
+    return request_credential_for_agent(
         input_text, agent_id=known_agent_id(thread_local_data.get_prompt_id()))
 
 
@@ -5577,17 +5579,7 @@ def get_tools(req_tool, is_first: bool = False, agent_tools=None):
             labeled_tool(
                 name="Request_Resource",
                 func=_handle_request_resource,
-                description=(
-                    "Use this tool when you need an API key, credential, token, or any external "
-                    "resource that is not currently available. This handles ALL resource types: "
-                    "API keys (OpenAI, Google, Slack, Discord, etc.), OAuth tokens, service "
-                    "credentials, channel secrets, or any configuration value. "
-                    "Input should be a JSON string with: resource_type (api_key, channel_secret, "
-                    "token, config), key_name (e.g. GOOGLE_API_KEY), label (human-readable name), "
-                    "used_by (which tool/service needs it), description (why it's needed). "
-                    "If the resource is already configured, it returns immediately. "
-                    "If not, the user will be prompted securely."
-                ),
+                description=REQUEST_RESOURCE_DESCRIPTION,
                 ui_label='Requesting a resource…',
             ),
             labeled_tool(
@@ -6049,17 +6041,7 @@ def get_tools(req_tool, is_first: bool = False, agent_tools=None):
             Tool(
                 name="Request_Resource",
                 func=_handle_request_resource,
-                description=(
-                    "Use this tool when you need an API key, credential, token, or any external "
-                    "resource that is not currently available. This handles ALL resource types: "
-                    "API keys (OpenAI, Google, Slack, Discord, etc.), OAuth tokens, service "
-                    "credentials, channel secrets, or any configuration value. "
-                    "Input should be a JSON string with: resource_type (api_key, channel_secret, "
-                    "token, config), key_name (e.g. GOOGLE_API_KEY), label (human-readable name), "
-                    "used_by (which tool/service needs it), description (why it's needed). "
-                    "If the resource is already configured, it returns immediately. "
-                    "If not, the user will be prompted securely."
-                ),
+                description=REQUEST_RESOURCE_DESCRIPTION,
             ),
             Tool(
                 name="Suggest_Share_Worthy_Content",
