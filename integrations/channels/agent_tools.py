@@ -158,9 +158,11 @@ START_CONNECTED = 'connected'
 START_FAILED = 'failed'
 
 #: channel -> {'start': n, 'state': START_*, 'fp': fingerprint of the value
-#: it started with (None when unknown), 'at': when it started (naive UTC,
-#: as the consent table's granted_at)} for the latest start of each
-#: channel.  n grows with every start.
+#: it started with (None when unknown), 'owner_fp': fingerprint of the
+#: owner's own stored value at that moment ('' when they had none, None when
+#: it could not be read), 'at': when it started (naive UTC, as the consent
+#: table's granted_at)} for the latest start of each channel.  n grows with
+#: every start.
 _STARTS = {}
 _STARTS_LOCK = threading.Lock()
 _START_NUMBERS = itertools.count(1)
@@ -181,12 +183,32 @@ def start_verdict(channel_type: str) -> Optional[dict]:
     connect form's create_binding.  post_to_channel decides from it: still
     being watched is connecting; a start with the owner's value that
     CONNECTED proves the value, so a later drop is connected again; one that
-    FAILED is a value the channel refused; a start with ANOTHER value is
-    someone's newer choice, which the owner's older vault value never
-    replaces (reviews of 506a79c1f and 1feb76f14)."""
+    FAILED is a value the channel refused; a start with ANOTHER value is a
+    newer choice, which the owner's stored value replaces only once that
+    value has changed since ('owner_fp'; reviews of 506a79c1f, 1feb76f14 and
+    b6dcae15e)."""
     with _STARTS_LOCK:
         entry = _STARTS.get(channel_type)
         return dict(entry) if entry else None
+
+
+def _owner_value_fingerprint(channel_type: str, meta: dict):
+    """The credential_fingerprint of the value the owner has stored for
+    ``channel_type``'s one credential (the vault's owner_credential), ''
+    when they have none, None when it cannot be told."""
+    try:
+        from hartos.ai_key_vault import get_ai_key_vault
+        from integrations.channels.metadata import required_setup_keys
+        keys = required_setup_keys(meta or {})
+        if len(keys) != 1:
+            return None
+        vault = get_ai_key_vault()
+        value = vault.owner_credential(vault.credential_name(keys[0], channel_type))
+        return credential_fingerprint(value) if value else ''
+    except Exception:
+        logger.warning("%s: the owner's stored value could not be read",
+                       channel_type, exc_info=True)
+        return None
 
 
 def _watch_start(channel_type: str, meta: dict, owner, fp=None) -> int:
@@ -194,11 +216,15 @@ def _watch_start(channel_type: str, meta: dict, owner, fp=None) -> int:
     credential_fingerprint of the value it started with) as being watched,
     then watch it on a daemon thread (_report_when_live) and record how it
     ended.  Returns the start's number.  A later start replaces the record;
-    an earlier watcher ending after that leaves the later record alone."""
+    an earlier watcher ending after that leaves the later record alone.
+    The owner's stored value at this moment is kept beside it ('owner_fp'),
+    so a later change of that value, by any path, is seen as theirs."""
+    owner_fp = _owner_value_fingerprint(channel_type, meta)
     with _STARTS_LOCK:
         start = next(_START_NUMBERS)
         _STARTS[channel_type] = {'start': start, 'state': START_WATCHING,
-                                 'fp': fp, 'at': datetime.utcnow()}
+                                 'fp': fp, 'owner_fp': owner_fp,
+                                 'at': datetime.utcnow()}
 
     def _watch():
         connected = False

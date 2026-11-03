@@ -97,10 +97,12 @@ _NOT_DONE = ("Until it posts, this post has not happened; do not report it "
              "as done. Call post_to_channel again later: it carries on from "
              "the owner's answer.")
 
-#: One connect of a channel at a time: _connect_or_ask holds the channel's
-#: lock from its "still connecting?" check through register_channel, so two
-#: posts at once start it once (review of 1feb76f14: both registered, the
-#: second rebuilding the adapter mid-connect).
+#: post_to_channel's own connects of a channel run one at a time:
+#: _connect_or_ask holds the channel's lock from its "still connecting?"
+#: check through register_channel, so two posts at once start it once
+#: (review of 1feb76f14: both registered, the second rebuilding the adapter
+#: mid-connect).  Connect_Channel, the connect form and OAuth do not take
+#: this lock (#226).
 _CONNECT_LOCKS = {}
 _CONNECT_LOCKS_GUARD = threading.Lock()
 
@@ -204,22 +206,26 @@ def _connect_or_ask(channel: str, meta: dict, adapter=None) -> str:
     owner's account, with the value itself: the model never holds it, and
     no unresolved {{secret:NAME}} ever becomes a token.
 
-    The channel's latest start (agent_tools.start_verdict: the value's
-    fingerprint, when it started, how it ended) decides what the owner's
-    value gets, unless the owner entered it after that start, which always
-    tries it:
+    The channel's latest start in this process (agent_tools.start_verdict:
+    the value's fingerprint, the owner's stored value at that moment, when
+    it started, how it ended) decides what the owner's value gets.  It is
+    always tried when the owner entered it after that start, or when their
+    stored value has changed since, by any path (review of b6dcae15e).
+    Otherwise:
       * no start yet: connect with it;
       * started with this value and connected, since dropped: connect again;
       * started with this value and failed: not tried again; the owner is
         asked for a new one (request_credential's "rejected");
       * started with ANOTHER value (Connect_Channel, the connect form,
-        OAuth): that is the newer choice, and the older vault value is never
-        written over it; nothing is asked (review of 1feb76f14).
-    A start register_channel did not schedule for this value (it refused,
-    or the adapter could not be started here) asks nothing: no value the
-    owner types would change it.  An owner who said no is not asked again.
-    A node with no owner connects nothing: there is nobody to connect it
-    for.  One connect per channel at a time (_connect_lock).
+        OAuth): that newer choice is left alone and nothing is asked
+        (review of 1feb76f14).
+    Starts before a restart are not known here (#226).  A start
+    register_channel did not schedule for this value (it refused, or the
+    adapter could not be started here) asks nothing: no value the owner
+    types would change it.  An owner who said no is not asked again.  A node
+    with no owner connects nothing: there is nobody to connect it for.
+    post_to_channel's own connects of a channel run one at a time
+    (_connect_lock); other connect paths do not take that lock.
     """
     with _connect_lock(channel):
         return _connect_or_ask_locked(channel, meta, adapter)
@@ -304,23 +310,28 @@ def _connect_or_ask_locked(channel: str, meta: dict, adapter) -> str:
         entered = _owner_entered_at(owner, name)
         fresh = (latest is not None and entered is not None
                  and entered > latest['at'])
-        if latest is not None and not fresh:
+        owner_changed = (latest is not None
+                         and latest.get('owner_fp') is not None
+                         and latest['owner_fp'] != fp)
+        if latest is not None and not fresh and not owner_changed:
             if latest.get('fp') != fp:
                 # Last started with another value (Connect_Channel, the
-                # connect form, OAuth), after the owner entered this one:
-                # writing it back would replace the token that start chose,
-                # in the binding too (review of 1feb76f14).  That start's
-                # own watcher already told the owner how it went.
+                # connect form, OAuth), and the owner's own value is the
+                # one they had then: writing it back would replace the
+                # token that start chose, in the binding too (review of
+                # 1feb76f14).  That start's own watcher told the owner how
+                # it went.  An owner value changed since, by any path, is
+                # theirs and is tried (owner_changed; review of b6dcae15e).
                 return _not_posted(
                     channel, (f"{display} is not running, and it was last "
                               f"connected with a different {label} than the "
                               f"one the owner entered here, so nothing was "
                               f"posted."),
                     needs_owner=False, connected_elsewhere=True,
-                    next=(f"Nothing asked and nothing reconnected: the owner "
-                          f"connected {display} another way since, and that "
-                          f"connect tells them how it went. Do not report a "
-                          f"post on {display}."))
+                    next=(f"Nothing asked and nothing reconnected: {display} "
+                          f"was last connected another way, and that connect "
+                          f"tells the owner how it went. Do not report a post "
+                          f"on {display}."))
             if latest['state'] == START_FAILED:
                 # This very value's start failed, and the owner has entered
                 # nothing since: ask for another.

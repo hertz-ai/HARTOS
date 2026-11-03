@@ -975,6 +975,46 @@ def test_a_newer_connect_with_another_value_is_never_overwritten(world):
     assert world.wired[-1] == ('telegram', TOKEN)
 
 
+@pytest.mark.parametrize('how', ['held', 'stored'])
+def test_the_owner_replacing_their_value_without_a_card_is_tried(world, how):
+    """Review of b6dcae15e (critical, measured): the owner's value changed
+    without a consent row (Nunba's vault hands it over, or
+    /api/credentials/submit stores it), and every later post answered
+    "connected another way", connecting nothing and asking nothing."""
+    from hartos.ai_key_vault import get_ai_key_vault
+    NEW = '555:the-owners-new-token'
+    _owner_enters(TOKEN)
+    _post('telegram', 'hello')
+    _watch_ends(world, connected=False)              # A refused
+    vault = get_ai_key_vault()
+    if how == 'held':
+        vault.hold_credential(TOKEN_NAME, NEW)       # no new grant row
+    else:
+        vault.store_credential(TOKEN_NAME, NEW)
+    out = _post('telegram', 'hello')
+    assert world.wired == [('telegram', TOKEN), ('telegram', NEW)]
+    assert out.get('connecting') is True and out.get('connected_elsewhere') is None
+    assert NEW not in json.dumps(out)
+
+
+def test_a_reconnect_that_cannot_start_is_not_reported_as_connecting(
+        world, monkeypatch):
+    """The value connected, the channel dropped, and the reconnect could
+    not be started: that is "cannot be started here", not "connecting"
+    (review of b6dcae15e, mutant N5)."""
+    from integrations.social import api_channels
+    _owner_enters(TOKEN)
+    _post('telegram', 'hello')
+    _watch_ends(world, connected=True)
+    world.registry.register(_Adapter('telegram', status=ChannelStatus.DISCONNECTED))
+    monkeypatch.setattr(api_channels, '_wire_live_adapter',
+                        lambda ch, cred: world.wired.append((ch, cred))
+                        or {'success': False, 'error': 'the channel loop is down'})
+    out = _post('telegram', 'hello')
+    assert world.wired == [('telegram', TOKEN), ('telegram', TOKEN)]
+    assert out.get('cannot_connect_here') is True and out.get('connecting') is None
+
+
 def test_another_start_during_a_refused_register_is_not_taken_as_ours(
         world, monkeypatch):
     """Review of 1feb76f14: our register_channel refused while another start
