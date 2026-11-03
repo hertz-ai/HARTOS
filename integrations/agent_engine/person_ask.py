@@ -562,40 +562,6 @@ def open_file_request(ask_id, user_id) -> Optional[dict]:
         return {'purpose': a.purpose, 'prompt_id': a.prompt_id, 'max_files': a.max_files}
 
 
-def files_sent_for(ask_id, user_id) -> list:
-    """What ``user_id`` sent for her OPEN file_request ``ask_id``, bound to
-    the agent that asked; [] for any other ask, or when nothing has come.
-
-    Owner, 2026-11-02: "what got uplpoaded shd reach agent since the agent
-    asked for them to begin with".  Her files reach her desktop's store
-    before her device answers the ask, and live that day (request 90e55312)
-    three clips did and the answer never came: the phone app died between
-    the uploads and the answer, so agent 342 found no file and asked her for
-    "clip IDs".  So the files she sent since the ask, of its purpose, bound
-    to no turn or to a turn of the asking agent (core.chat_attachments
-    .sent_since), at most the ask's max_files in upload order, are bound to
-    that agent under the ask's id by the one binding rule (bind_inbound), as
-    her answer would bind them.  A file on another agent's turn stays there.
-    Her answer, when it comes, still answers the ask.  Returns the bound
-    files' StoredFile dicts."""
-    with _lock:
-        a = _asks.get(str(ask_id or ''))
-        if (a is None or a.ctype != 'file_request' or a.answered_at is not None
-                or a.user_id != str(user_id or '')):
-            return []
-        purpose, prompt_id, since, cap = a.purpose, a.prompt_id, a.created, a.max_files
-    from core.chat_attachments import MAX_ATTACHMENTS, bind_inbound, sent_since
-    sent = sent_since(user_id, purpose, since, prompt_id=prompt_id)[:cap or MAX_ATTACHMENTS]
-    if not sent:
-        return []
-    bound = bind_inbound(user_id, prompt_id, ask_id,
-                         [{'file_id': f['xid'], 'purpose': purpose} for f in sent])
-    if bound:
-        logger.info("person ask %s: %d file(s) of user %s reached the store; bound to "
-                    "agent %s", ask_id, len(bound), user_id, prompt_id)
-    return bound
-
-
 def ask_person_tool(user_id, prompt_id, agent_id=None):
     """The ``ask_person`` tool every agent has: (name, description, func).
 
@@ -611,19 +577,6 @@ def ask_person_tool(user_id, prompt_id, agent_id=None):
     from core.user_file_store import INBOUND_PURPOSES, REEL_SOURCE
     purposes = list(INBOUND_PURPOSES)
 
-    def with_files_sent(reply: dict) -> dict:
-        """An open ask's reply, with what she has sent for it (files_sent_for)."""
-        sent = files_sent_for(reply['ask_id'], user_id)
-        if sent:
-            reply['status'] = 'files_received'
-            reply['received'] = [{'xid': f['xid'], 'name': f['name'], 'size': f['size']}
-                                 for f in sent]
-            reply['note'] = ('Their files for this ask have reached their desktop and are '
-                             'bound to you: a tool that takes their files of this purpose '
-                             'uses them now. They may still send more: read this ask '
-                             'again with %s(ask_id=...).' % ASK_PERSON_TOOL)
-        return reply
-
     def ask_person(
             component: Annotated[str, 'Liquid UI component JSON, e.g. {"type":"file_request",'
                                       '"purpose":"%s","accept":"video"}' % REEL_SOURCE],
@@ -638,8 +591,6 @@ def ask_person_tool(user_id, prompt_id, agent_id=None):
             if state['status'] == 'expired':
                 reply['note'] = ('This ask is gone (the node restarted, or its answer '
                                  'was kept too long). Ask again if you still need it.')
-            elif state['status'] == 'open':
-                with_files_sent(reply)
             return json.dumps(reply)
         try:
             comp = json.loads(component) if isinstance(component, str) else component
@@ -663,11 +614,11 @@ def ask_person_tool(user_id, prompt_id, agent_id=None):
         if got is not None:
             return json.dumps({'answered': True, 'ask_id': out['ask_id'], 'answer': got,
                                'status': 'answered'})
-        return json.dumps(with_files_sent({
+        return json.dumps({
             'answered': False, 'ask_id': out['ask_id'], 'status': 'waiting_for_person',
             'note': ('The question is on their devices and they have not answered '
                      'yet. This step is not done: read the answer later with '
-                     '%s(ask_id=...).' % ASK_PERSON_TOOL)}))
+                     '%s(ask_id=...).' % ASK_PERSON_TOOL)})
 
     return (ASK_PERSON_TOOL,
             ('Ask your person on any of their devices and get their answer, e.g. a '

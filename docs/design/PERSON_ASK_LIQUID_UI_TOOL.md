@@ -229,20 +229,6 @@ picks is not yet measured live.
 Not done yet: an answer that comes after the turn ended does not start a
 new turn by itself; the agent reads it when it next runs.
 
-What she sends for a `file_request` reaches the agent that asked even when
-her answer does not (owner, 2026-11-02: "what got uplpoaded shd reach agent
-since the agent asked for them to begin with"). Live that day her Pad put
-three clips in her desktop's store and the app died before it answered, so
-agent 342 found no file. Now, while the ask is open, each time the agent
-reads it or asks the same question again (`files_sent_for`), the files of
-the ask's purpose she sent since the ask, bound to no turn or to a turn of
-that agent (`core.chat_attachments.sent_since`), at most its `max_files`,
-are bound to the agent under the ask's id by the one binding rule, and the
-reply says `files_received` with them. A file on another agent's turn stays
-there. Her answer, when it comes, still answers the ask. The asks themselves
-are still held in memory, so a file that arrives after a restart has no ask
-to reach.
-
 ### `file_request` (new `COMPONENT_TYPES` entry)
 
 `{title, purpose (reel_source|logo|song_audio|chat_attachment), accept
