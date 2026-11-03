@@ -544,9 +544,17 @@ def _user_chat_marker_recent() -> bool:
 # it may use the expert model and falls back to the free model when the day
 # fuse trips, so it never stops.  Every other goal type is background work on
 # the free model.  HEVOLVE_REVENUE_GOAL_TYPES (comma list) replaces the set.
+#
+# Owner 2026-10-21: "autonomous marketing and sales and seller onboarding and
+# buyer onboarding shd be goals" (revenue); owner 2026-11-03: the marketing,
+# sales and customer care agents run on the Claude credits.  So the sales
+# outreach turn (outreach_crm_tools, 'outreach'), the customer-care reply
+# (hive_signal_bridge, 'support') and the buyer onboarding turn
+# (app_marketplace, 'onboarding') earn too.
 REVENUE_GOAL_TYPES = frozenset({
     'marketing', 'seo', 'revenue', 'hive_growth', 'hive_economics',
     'mcgroce_merchant', 'mcgroce_shopper',
+    'outreach', 'support', 'onboarding',
 })
 REVENUE_GOAL_TYPE_PREFIXES = ('p2p_',)
 
@@ -567,6 +575,44 @@ def lane_for_goal_type(goal_type) -> str:
     'daemon'.  The daemon-side twin of core.request_lane.lane_for_chat."""
     from core.llm_outbound_logger import LANE_REVENUE, LANE_DAEMON
     return LANE_REVENUE if is_revenue_goal_type(goal_type) else LANE_DAEMON
+
+
+def revenue_expert_config(goal_type) -> Optional[list]:
+    """The model list a turn of a goal that earns runs on: the configured
+    expert first, this node's own model after it (with_local_fallback), or
+    None when the turn runs on the node's own model as before.
+
+    The policy written above REVENUE_GOAL_TYPES: a goal that earns may use the
+    expert and falls back to the free model when the day fuse trips.  The
+    lane was registered and nothing ever used it: a turn dispatched with no
+    model_config ran on the node's default model.  Measured on central
+    2026-11-03: the expert offered to the revenue lane with $0.00 of $3.30
+    spent, while 21 revenue goals sat paused after five failed turns each on
+    openrouter/free.
+
+    Only the CONFIGURED expert (the owner's trio, central only by
+    configuration), never another expert-tier backend such as the owner's
+    Claude Code subscription.  Offered by the registry's own lane and day-cap
+    gate (ModelRegistry._offered); past the cap or with no trio, None.  An
+    expert call refused at the wire by the cap falls to the node's own model
+    through the same list (llm_outbound_logger._day_cap_refusal)."""
+    if not is_revenue_goal_type(goal_type):
+        return None
+    try:
+        from core.autogen_config import with_local_fallback
+        from core.llm_outbound_logger import LANE_REVENUE
+        from integrations.agent_engine.model_registry import (
+            CONFIGURED_EXPERT_ID, ModelRegistry, model_registry)
+        expert = model_registry.get_model(CONFIGURED_EXPERT_ID)
+        if (expert is None or not expert.is_dispatchable()
+                or not ModelRegistry._offered(expert, LANE_REVENUE)):
+            return None
+        return with_local_fallback(expert.to_config_list())
+    except Exception as e:
+        logger.warning("revenue goal (%s) runs on the node's own model: the "
+                       "configured expert could not be read (%s)",
+                       goal_type, type(e).__name__)
+        return None
 
 
 def is_genuine_user_request(request_id) -> bool:
@@ -1596,6 +1642,12 @@ def _dispatch_goal_turn(prompt: str, user_id: str, goal_id: str,
             register_request_lane(daemon_request_id(goal_id), LANE_REVENUE)
     except Exception as _lane_err:
         logger.debug(f"lane not registered for goal {goal_id}: {_lane_err}")
+
+    # ...and that lane's turn runs on the expert while the day cap allows
+    # (revenue_expert_config).  A caller that names its model (the daemon's
+    # escalation turn) keeps its own choice.
+    if model_config is None:
+        model_config = revenue_expert_config(goal_type)
 
     # BUDGET GATE: check goal budget + platform affordability before dispatch
     try:
