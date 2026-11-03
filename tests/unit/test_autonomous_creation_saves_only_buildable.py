@@ -31,11 +31,19 @@ from tests.unit.test_the_approved_plan_is_the_saved_plan import (  # noqa: F401
 NOTHING = 'I could not finish the plan.'
 
 
-def test_an_approved_plan_with_no_flows_is_not_saved_as_built(run, caplog):
+def test_an_approved_plan_with_no_flows_is_not_saved_as_built(run, hie, caplog):
     run.answers = [_plan('proposed_plan', CREATOR, flows=[])] + [NOTHING] * 5
     run.verdicts = [('approved', '')]
-    with caplog.at_level(logging.WARNING):
-        saved = run.go()
+    # The refusal is logged on the Flask app's logger, which does not
+    # propagate to the root logger off the bundle (hart_intelligence_entry
+    # sets propagate=False when standalone), so caplog listens on it
+    # directly; through the root alone the assert below never saw it.
+    hie.app.logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.WARNING):
+            saved = run.go()
+    finally:
+        hie.app.logger.removeHandler(caplog.handler)
     assert saved['status'] != 'completed', (
         'a plan with no flows was saved as a built agent; recipe() fails on it')
     assert saved['status'] == 'pending'
@@ -77,3 +85,23 @@ def test_a_plan_that_can_be_built_is_saved_as_before(run):
     assert _actions(saved) == CREATOR
     assert (saved['prompt_id'], saved['creator_user_id']) == (PID, USER)
     assert run.sent == ['Create an agent named "Syllable Coach"']
+
+
+def test_the_legacy_loop_saves_flows_written_as_json_text_as_a_list(run):
+    """The legacy loop's save writes the decoded config, as the first save
+    does.  Review of 3ede948ab, test gap 5: deleting `parsed = _built` at
+    the legacy save kept the undecoded config and no test failed.  The
+    first answer cannot be built, so the run reaches the legacy loop; the
+    answer to its 'proceed' carries its flows as JSON text."""
+    broken = CREATOR[:2] + ['   ']
+    flows = [{'flow_name': 'Syllable exercise ball', 'persona': 'Speech Companion',
+              'actions': CREATOR, 'sub_goal': 'Arjun says ball'}]
+    run.answers = [_plan('completed', broken),
+                   _plan('completed', CREATOR, flows=json.dumps(flows))]
+    run.verdicts = [('approved', '')]
+    saved = run.go()
+    assert 'proceed' in run.sent, 'the run never reached the legacy loop'
+    assert saved['status'] == 'completed'
+    assert isinstance(saved['flows'], list), (
+        'the legacy loop saved flows as JSON text, which no reader can build from')
+    assert _actions(saved) == CREATOR
