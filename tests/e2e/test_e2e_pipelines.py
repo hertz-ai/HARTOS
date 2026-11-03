@@ -1239,6 +1239,16 @@ class TestVLMVisionServiceCircuitBreaker:
 class TestComputerUseLocalLoop:
     """E2E: local_loop.py — screenshot→parse→LLM→action loop with all externals mocked."""
 
+    @pytest.fixture(autouse=True)
+    def _legacy_loop(self, monkeypatch):
+        """These tests mock the legacy path (local_omniparser.parse_screen and
+        local_loop._call_local_llm).  Since 2026-09-01 the loop defaults to the
+        unified Qwen3-VL backend, so without this the mocks are bypassed and the
+        loop calls the real backend ("network boundary is sealed" in this suite):
+        'incomplete' instead of 'success', 'action_error' instead of
+        'max_iterations'.  HEVOLVE_VLM_UNIFIED=0 is the loop's own opt-in."""
+        monkeypatch.setenv('HEVOLVE_VLM_UNIFIED', '0')
+
     def _make_message(self, instruction='Click the submit button', max_eta=60):
         return {
             'instruction_to_vlm_agent': instruction,
@@ -1557,8 +1567,13 @@ class TestComputerUseActions:
         assert 'file_b.txt' in result['output']
 
 
+@pytest.mark.usefixtures('computer_control_granted')
 class TestComputerUseAdapter:
-    """E2E: vlm_adapter.py — 3-tier routing with circuit breaker."""
+    """E2E: vlm_adapter.py — 3-tier routing with circuit breaker.
+
+    The routing and the breaker are what these test, so the owner's permission
+    to control the computer is a precondition they declare (tests/conftest.py);
+    without it the loop answers 'blocked' / consent_required before routing."""
 
     def test_tier1_bundled_routes_inprocess(self):
         """NUNBA_BUNDLED=true → run_local_agentic_loop(tier='inprocess')."""
