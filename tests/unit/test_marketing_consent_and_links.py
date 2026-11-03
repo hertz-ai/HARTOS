@@ -365,7 +365,9 @@ def test_flag_off_with_nothing_granted_writes_no_row(consent_db):
 # Firebase push, and the consent broadcast.
 
 import asyncio  # noqa: E402
+import queue  # noqa: E402
 import threading  # noqa: E402
+import time  # noqa: E402
 from types import SimpleNamespace  # noqa: E402
 
 from integrations.channels.base import (  # noqa: E402
@@ -491,8 +493,21 @@ def world(tmp_path, monkeypatch):
     monkeypatch.setattr(api_channels, '_wire_live_adapter',
                         lambda ch, cred: wired.append((ch, cred))
                         or {'success': True})
-    monkeypatch.setattr(agent_tools, '_report_when_live',
-                        lambda channel, *a, **k: watched.append(channel))
+    # The connect watcher stands in for the platform's answer: a start is
+    # watched until the test says how it ended (_watch_ends), as the real
+    # one watches until the adapter connects or gives up.
+    ends, closing = queue.Queue(), threading.Event()
+    real_watch = agent_tools._report_when_live
+
+    def _watch(channel, *a, **k):
+        watched.append(channel)
+        while not closing.is_set():
+            try:
+                return ends.get(timeout=0.05)
+            except queue.Empty:
+                pass
+        return False
+    monkeypatch.setattr(agent_tools, '_report_when_live', _watch)
     monkeypatch.setattr(liquid_ui_service, 'push_agent_ui',
                         lambda agent_id, card, user_id=None:
                         cards.append((agent_id, dict(card), user_id)) or True)
@@ -516,14 +531,18 @@ def world(tmp_path, monkeypatch):
     # fail on what it does, not on the fixture.
     for name in ('_SELF_CONNECTS', '_DESTINATION_ASKS', '_DESTINATION_SAID'):
         getattr(marketing_tools, name, {}).clear()
+    getattr(agent_tools, '_STARTS', {}).clear()
     with person_ask._lock:
         person_ask._asks.clear()
 
     yield SimpleNamespace(admin=admin, registry=registry,
                           integration=integration, said=said, wired=wired,
-                          watched=watched, cards=cards, rows=rows,
+                          watched=watched, cards=cards, rows=rows, ends=ends,
+                          real_watch=real_watch,
                           config_file=tmp_path / 'admin_config.json')
 
+    closing.set()                 # a start still being watched ends
+    _join_watchers()
     # A destination waiter still waiting gets no answer and ends.
     with person_ask._lock:
         for a in person_ask._asks.values():
@@ -554,6 +573,28 @@ def _join_destination_waiters():
     for t in threading.enumerate():
         if t.name.startswith('post-destination-'):
             t.join(timeout=5)
+
+
+def _join_watchers():
+    for t in threading.enumerate():
+        if t.name.startswith('channel-probe-'):
+            t.join(timeout=5)
+
+
+def _watch_ends(world, connected):
+    """The start being watched ends: the channel connected with the value,
+    or refused it."""
+    world.ends.put(connected)
+    _join_watchers()
+
+
+def _watching(world, count=1):
+    """The starts being watched, once ``count`` of them are (each watcher
+    runs on its own thread)."""
+    deadline = time.monotonic() + 5
+    while len(world.watched) < count and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return list(world.watched)
 
 
 def _post(*args, **kwargs):
@@ -772,7 +813,7 @@ def test_once_the_owner_entered_the_value_the_channel_is_connected_for_them(
     _owner_enters(TOKEN)
     out = _post('telegram', 'hello')
     assert world.wired == [('telegram', TOKEN)]
-    assert world.watched == ['telegram']
+    assert _watching(world) == ['telegram']
     assert (out['sent'], out['connecting']) == (False, True)
     assert TOKEN not in json.dumps(out)          # the model never holds it
     assert _card_requests(world) == []
@@ -790,19 +831,19 @@ def test_once_the_owner_entered_the_value_the_channel_is_connected_for_them(
 
 
 def test_a_refused_value_is_never_tried_again_and_the_owner_is_asked_anew(
-        world, monkeypatch):
+        world):
     """H2 of the f8fdb9c64 review: the same refused value was registered
     again on every call (a new watcher, an error toast and an unhealthy
-    banner each time) and the owner was never asked."""
-    from integrations.channels import agent_tools
+    banner each time) and the owner was never asked.  Refused is what the
+    watcher saw, not a clock (review of 506a79c1f)."""
     _owner_enters(TOKEN)
     _post('telegram', 'hello')
     still = _post('telegram', 'hello')           # its start is being watched
     assert still['connecting'] is True and world.wired == [('telegram', TOKEN)]
-    monkeypatch.setattr(agent_tools, '_LIVE_WAIT_SECONDS', 0)   # watch ended
+    _watch_ends(world, connected=False)          # the channel refused it
     refused = _post('telegram', 'hello')
     assert world.wired == [('telegram', TOKEN)]  # not registered again
-    assert refused['value_refused'] is True and refused['needs_owner'] is True
+    assert refused.get('value_refused') is True and refused['needs_owner'] is True
     [(card, _msg)] = _card_requests(world)
     assert 'rejected' in card['reason']
     assert '{{secret:' not in json.dumps(refused)
@@ -811,12 +852,101 @@ def test_a_refused_value_is_never_tried_again_and_the_owner_is_asked_anew(
     assert world.wired == [('telegram', TOKEN), ('telegram', '456:a-new-value')]
 
 
-def test_a_start_that_failed_is_not_waited_for(world):
+def test_a_start_that_failed_is_judged_by_the_real_watcher(world, monkeypatch):
+    """The real watcher ends at ERROR, where a failed start ends
+    (ChannelAdapter.start), and its verdict makes the value refused; the
+    owner sees one error toast for it."""
+    from integrations.channels import agent_tools
+    from integrations.social import fleet_command
+    toasts, banners = [], []
+    monkeypatch.setattr(agent_tools, '_report_when_live', world.real_watch)
+    monkeypatch.setattr(agent_tools, '_emit_to_user',
+                        lambda owner, payload: toasts.append((owner, payload)))
+    monkeypatch.setattr(fleet_command, 'emit_channel_unhealthy',
+                        lambda db, **kw: banners.append(kw))
     _owner_enters(TOKEN)
     _post('telegram', 'hello')
     world.registry.register(_Adapter('telegram', status=ChannelStatus.ERROR))
+    _join_watchers()
     out = _post('telegram', 'hello')
-    assert out['value_refused'] is True and world.wired == [('telegram', TOKEN)]
+    assert out.get('value_refused') is True and world.wired == [('telegram', TOKEN)]
+    assert [(o, p['type']) for o, p in toasts] == [(OWNER, 'toast')]
+    assert [b['user_id'] for b in banners] == [OWNER]
+
+
+def test_a_value_that_connected_and_later_dropped_is_connected_again(world):
+    """A value that reached CONNECTED is proven: when the channel later
+    drops, it is connected again with it, not treated as refused and asked
+    for (review of 506a79c1f)."""
+    _owner_enters(TOKEN)
+    _post('telegram', 'hello')
+    _watch_ends(world, connected=True)
+    # ...and later it stopped: registered, not running.
+    world.registry.register(_Adapter('telegram', status=ChannelStatus.DISCONNECTED))
+    out = _post('telegram', 'hello')
+    assert world.wired == [('telegram', TOKEN), ('telegram', TOKEN)]
+    assert out.get('connecting') is True and out.get('value_refused') is None
+    assert _card_requests(world) == []
+
+
+def test_a_start_that_could_not_be_scheduled_asks_nothing_and_keeps_no_try(
+        world, monkeypatch):
+    """register_channel answered without starting anything (here the live
+    wiring failed): no value from the owner would change that, so they are
+    not asked, and the next post tries again (review of 506a79c1f: it was
+    kept as a try, and the value later counted as refused)."""
+    from integrations.social import api_channels
+    monkeypatch.setattr(api_channels, '_wire_live_adapter',
+                        lambda ch, cred: world.wired.append((ch, cred))
+                        or {'success': False,
+                            'error': 'the channel loop is not running'})
+    _owner_enters(TOKEN)
+    first = _post('telegram', 'hello')
+    assert first.get('cannot_connect_here') is True
+    assert first['needs_owner'] is False and first['sent'] is False
+    assert 'the channel loop is not running' in first['error']
+    assert TOKEN not in json.dumps(first)
+    second = _post('telegram', 'hello')
+    assert world.wired == [('telegram', TOKEN), ('telegram', TOKEN)]
+    assert second.get('cannot_connect_here') is True
+    assert world.watched == [] and _card_requests(world) == []
+
+
+def test_the_owner_entering_the_same_value_again_retries_it_once(world):
+    """A fresh entry by the owner is their answer to "it was rejected", even
+    when the value is the same: it is tried once more (review of
+    506a79c1f: the same value was refused forever)."""
+    _owner_enters(TOKEN)
+    _post('telegram', 'hello')
+    _watch_ends(world, connected=False)
+    assert _post('telegram', 'hello').get('value_refused') is True
+    _owner_enters(TOKEN)                         # the same value, entered again
+    again = _post('telegram', 'hello')
+    assert world.wired == [('telegram', TOKEN), ('telegram', TOKEN)]
+    assert again.get('connecting') is True
+    _watch_ends(world, connected=False)
+    third = _post('telegram', 'hello')
+    assert third.get('value_refused') is True and len(world.wired) == 2
+
+
+@pytest.mark.parametrize('running', [True, False])
+def test_a_channel_the_owner_turned_off_is_left_alone(world, running):
+    """Turned off in its channel settings: nothing is posted, nothing is
+    asked, and it is not connected again (register_channel would turn it
+    back on).  It was asked about on every post (review of 506a79c1f)."""
+    tg = _Adapter('telegram')
+    if running:
+        world.registry.register(tg)
+    world.admin._channels['telegram'] = {'channel_type': 'telegram',
+                                         'enabled': False,
+                                         'announce_chat_id': '-1001'}
+    _owner_enters(TOKEN)
+    out = _post('telegram', 'hello')
+    assert tg.sent == [] and world.wired == [] and world.cards == []
+    assert _card_requests(world) == []
+    assert world.admin._channels['telegram']['enabled'] is False
+    assert (out['sent'], out.get('needs_owner'), out.get('channel_off')) == (
+        False, False, True)
 
 
 def test_a_channel_still_connecting_is_left_alone(world):
@@ -1011,6 +1141,82 @@ def test_the_instagram_feed_with_instagram_not_running_posts_nothing(world):
     out = json.loads(_publish_instagram_feed(
         'u', 'https://x.test/a.jpg', 'c', _consent=lambda _u: True))
     assert out['success'] is False and out.get('sent') is False
+
+
+def test_the_instagram_feed_posts_nothing_on_a_channel_the_owner_turned_off(
+        world):
+    from integrations.agent_engine.marketing_tools import _publish_instagram_feed
+    ig = _Instagram()
+    world.registry.register(ig)
+    world.admin._channels['instagram'] = {'channel_type': 'instagram',
+                                          'enabled': False}
+    out = json.loads(_publish_instagram_feed(
+        'u', 'https://x.test/a.jpg', 'c', _consent=lambda _u: True))
+    assert ig.calls == [] and out.get('channel_off') is True
+
+
+def test_activate_refuses_an_entry_that_only_holds_a_destination(
+        world, monkeypatch):
+    """POST /api/admin/channels/<type>/activate registered an adapter from
+    the admin entry: for an entry that only holds the announcement target,
+    that is an adapter with no credential replacing the running one (boot
+    already skips such entries; review of 506a79c1f)."""
+    import flask
+    from integrations.channels.admin import api as admin_api
+    ANNOUNCE_ONLY_KEY = _announce_only_key()
+    world.admin._channels['telegram'] = {
+        'channel_type': 'telegram', 'enabled': True,
+        'announce_chat_id': '-1009', ANNOUNCE_ONLY_KEY: True}
+    world.admin._channels['discord'] = {'channel_type': 'discord',
+                                        'enabled': True, 'token': 'd-token'}
+    register = Mock(return_value=False)
+    monkeypatch.setattr(world.integration, 'register_channel', register)
+    with flask.Flask(__name__).test_request_context(method='POST'):
+        refused = admin_api.activate_channel('telegram')
+        admin_api.activate_channel('discord')
+    assert [c.args[0] for c in register.call_args_list] == ['discord']
+    assert isinstance(refused, tuple), refused
+    body, status = refused
+    assert status == 400
+    assert 'announcement destination' in body.get_json()['error']
+
+
+def test_registering_the_channel_drops_the_destination_only_mark(world):
+    """Once the channel has its own config, boot activates its entry."""
+    from integrations.channels.agent_tools import (
+        build_channel_tool_closures, set_announcement_target)
+    ANNOUNCE_ONLY_KEY = _announce_only_key()
+    world.registry.register(_Adapter('telegram'))
+    set_announcement_target('telegram', '-1009', OWNER)
+    assert world.admin._channels['telegram'][ANNOUNCE_ONLY_KEY] is True
+    register = next(t[2] for t in build_channel_tool_closures({'user_id': OWNER})
+                    if t[0] == 'register_channel')
+    register('telegram', json.dumps({'bot_token': TOKEN}))
+    entry = world.admin._channels['telegram']
+    assert ANNOUNCE_ONLY_KEY not in entry
+    assert entry['announce_chat_id'] == '-1009' and entry['enabled'] is True
+
+
+def test_the_journey_tool_says_not_to_send_a_pending_message_again(
+        world, monkeypatch):
+    """The agent read a pending send as a failure and sent it again
+    (review of 506a79c1f)."""
+    import core.labeled_autogen_function as labeled
+    from integrations.agent_engine import journey_engine, outreach_crm_tools
+    from integrations.channels import flask_integration
+    monkeypatch.setattr(flask_integration, 'CHANNEL_SEND_WAIT_S', 0.1)
+    tg = _Adapter('telegram', hold=0.5)
+    world.registry.register(tg)
+    monkeypatch.setattr(outreach_crm_tools, '_load_prospects', lambda: {
+        'prospects': {'p1': {'id': 'p1', 'journey_stage': 'outreach',
+                             'channel_ids': {'telegram': 'tg-ana'}}}})
+    funcs = {}
+    monkeypatch.setattr(labeled, 'register_labeled_function',
+                        lambda func, **kw: funcs.setdefault(func.__name__, func))
+    journey_engine.register_journey_tools(None, None, OWNER)
+    out = json.loads(funcs['send_prospect_message']('p1', 'hi', 'telegram'))
+    assert len(tg.sent) == 1 and out['pending'] is True
+    assert 'Do not send it again' in out.get('note', '')
 
 
 def test_register_channel_never_saves_an_alias_the_owner_has_not_entered():

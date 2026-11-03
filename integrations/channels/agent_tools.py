@@ -18,9 +18,11 @@ All tools reuse existing infrastructure:
 - thread_local_data for channel context
 """
 
+import itertools
 import json
 import logging
 import re
+import threading
 from typing import Annotated, Optional
 
 logger = logging.getLogger(__name__)
@@ -145,6 +147,61 @@ def _report_when_live(channel_type: str, meta: dict, owner,
     except Exception as e:
         logger.warning("%s: channel_unhealthy fan-out not sent: %s", channel_type, e)
     return False
+
+
+#: How a live start scheduled by register_channel ended, as its watcher
+#: (_report_when_live) saw it.  start_verdict answers with one of these.
+START_WATCHING = 'watching'
+START_CONNECTED = 'connected'
+START_FAILED = 'failed'
+
+#: channel -> {'start': n, 'state': START_*} for the latest start of each
+#: channel.  n grows with every start, so a caller can tell the start it
+#: scheduled from a later one.
+_STARTS = {}
+_STARTS_LOCK = threading.Lock()
+_START_NUMBERS = itertools.count(1)
+
+
+def start_verdict(channel_type: str) -> Optional[dict]:
+    """The latest start register_channel scheduled for ``channel_type`` and
+    how it ended (a copy: {'start': n, 'state': START_*}), or None when it
+    scheduled none in this process.
+
+    post_to_channel judges the owner's value by this verdict: still being
+    watched is connecting, CONNECTED proves the value (a later drop is
+    connected again with it), FAILED is a value the channel refused.  It
+    used to judge by the clock alone, so a value that had connected and then
+    dropped was treated as refused (review of 506a79c1f)."""
+    with _STARTS_LOCK:
+        entry = _STARTS.get(channel_type)
+        return dict(entry) if entry else None
+
+
+def _watch_start(channel_type: str, meta: dict, owner) -> None:
+    """Record a just-scheduled start of ``channel_type`` as being watched,
+    then watch it on a daemon thread (_report_when_live) and record how it
+    ended.  A later start replaces the record; an earlier watcher ending
+    after that leaves the later record alone."""
+    with _STARTS_LOCK:
+        start = next(_START_NUMBERS)
+        _STARTS[channel_type] = {'start': start, 'state': START_WATCHING}
+
+    def _watch():
+        connected = False
+        try:
+            connected = bool(_report_when_live(channel_type, meta, owner))
+        except Exception:
+            logger.warning("%s: start watcher failed; the start counts as "
+                           "failed", channel_type, exc_info=True)
+        with _STARTS_LOCK:
+            if (_STARTS.get(channel_type) or {}).get('start') == start:
+                _STARTS[channel_type] = {
+                    'start': start,
+                    'state': START_CONNECTED if connected else START_FAILED}
+
+    threading.Thread(target=_watch, name=f'channel-probe-{channel_type}',
+                     daemon=True).start()
 
 
 #: What chat_connect_blocker answers, beside None.
@@ -567,15 +624,10 @@ def build_channel_tool_closures(ctx):
             # The adapter's start() is scheduled, not finished.  Watch its
             # status and tell the user how it ended: a success card when it
             # is live, a toast (and a fleet banner on their other devices)
-            # when it is not.  A daemon thread so the tool returns now.
+            # when it is not.  A daemon thread so the tool returns now; the
+            # verdict is kept (start_verdict).
             owner = user_id or _get_user_id_from_threadlocal() or None
-            import threading as _threading
-            _threading.Thread(
-                target=_report_when_live,
-                args=(channel_type, meta, owner),
-                name=f'channel-probe-{channel_type}',
-                daemon=True,
-            ).start()
+            _watch_start(channel_type, meta, owner)
             return (f"{name} registered and enabled! Auth: {meta['auth_method']}. "
                     f"Connecting now; you'll see a confirmation here once it's live.")
 

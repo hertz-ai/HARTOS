@@ -741,6 +741,12 @@ def register_journey_tools(helper, assistant, user_id: str):
             return json.dumps({'error': 'prospect not found'})
 
         result = engine.send_via_channel(prospect, message, channel)
+        if result.get('pending'):
+            # Not confirmed in time: it may still arrive, and a second send
+            # would reach the prospect twice (review of 506a79c1f).
+            result = dict(result, note=(
+                f"The message on {result.get('channel')} is not confirmed yet; "
+                f"it may still arrive. Do not send it again."))
         return json.dumps(result, default=str)
 
     # UI labels for these tool names live in core/constants.py:TOOL_LABELS

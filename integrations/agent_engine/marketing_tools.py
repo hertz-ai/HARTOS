@@ -13,7 +13,6 @@ import json
 import logging
 import re
 import threading
-import time
 from types import MappingProxyType
 from typing import Annotated, Optional
 
@@ -100,14 +99,13 @@ _NOT_DONE = ("Until it posts, this post has not happened; do not report it "
              "the owner's answer.")
 
 #: The owner's value post_to_channel connected each channel with: its
-#: fingerprint and when (time.monotonic).  Until the start is watched to its
-#: end (agent_tools._LIVE_WAIT_SECONDS) the channel is connecting, whatever
-#: status its adapter reports (only Discord reports CONNECTING).  After that,
-#: a channel still not running was refused that value: it is never
-#: registered again, and the owner is asked for another one.  It used to be
-#: registered again on every call: a new watcher, an error toast and an
-#: unhealthy banner each time, and the owner never asked (review of
-#: f8fdb9c64, H2).
+#: fingerprint, the register_channel start that carried it
+#: (agent_tools.start_verdict's 'start') and when the owner had last
+#: entered it (_owner_entered_at).  How that start ended is its watcher's
+#: verdict, never a clock: a value that connected and later dropped is
+#: connected again; a value whose start failed is not tried again until the
+#: owner enters a value (the same one included), and the owner is asked for
+#: another (reviews of f8fdb9c64 H2 and 506a79c1f).
 _SELF_CONNECTS = {}
 _SELF_CONNECTS_LOCK = threading.Lock()
 
@@ -116,20 +114,34 @@ def _fingerprint(value) -> str:
     return hashlib.sha256(str(value).encode('utf-8')).hexdigest()
 
 
-def _connecting_now(channel: str, status) -> bool:
-    """Whether post_to_channel's own connect of ``channel`` is still within
-    its watch window and has not failed."""
-    from integrations.channels.agent_tools import _LIVE_WAIT_SECONDS
-    from integrations.channels.base import ChannelStatus
+def _own_start(channel: str) -> Optional[dict]:
+    """post_to_channel's latest connect of ``channel`` with 'state', how its
+    start ended (agent_tools.start_verdict; None once a later start replaced
+    it), or None when it has connected nothing here."""
+    from integrations.channels.agent_tools import start_verdict
     with _SELF_CONNECTS_LOCK:
         tried = _SELF_CONNECTS.get(channel)
-    return (tried is not None and status != ChannelStatus.ERROR
-            and time.monotonic() - tried['at'] < _LIVE_WAIT_SECONDS)
+    if tried is None:
+        return None
+    verdict = start_verdict(channel) or {}
+    return dict(tried, state=(verdict.get('state')
+                              if verdict.get('start') == tried['start'] else None))
+
+
+def _connecting_now(channel: str) -> bool:
+    """Whether the latest start register_channel scheduled for ``channel``
+    is still being watched.  Only Discord reports CONNECTING, so the watch
+    is what says the others are mid-connect."""
+    from integrations.channels.agent_tools import START_WATCHING, start_verdict
+    return (start_verdict(channel) or {}).get('state') == START_WATCHING
 
 
 def _owner_declined(owner, name) -> bool:
-    """Whether the owner said no to providing credential ``name`` (the
-    vault's own record: ConsentService.declined on scope 'secret:NAME')."""
+    """Whether credential ``name`` stands refused: the owner said no to
+    providing it or took it back, or the vault stopped asking after the
+    values they gave were refused too often (request_credential revokes the
+    grant then).  The vault's own record: ConsentService.declined on scope
+    'secret:NAME'."""
     try:
         from integrations.social.consent_service import (
             CREDENTIAL_SCOPE_PREFIX, ConsentService)
@@ -144,30 +156,93 @@ def _owner_declined(owner, name) -> bool:
         return False
 
 
-def _connect_or_ask(channel: str, meta: dict) -> str:
-    """``channel`` is not running here: connect it from what the owner
-    entered, or ask the owner for it.
+def _owner_entered_at(owner, name):
+    """When the owner last entered credential ``name``: the newest granted
+    'credential' row for scope 'secret:NAME' (the card's Accept appends one
+    per value entered; ai_key_vault._recent_entries counts the same rows).
+    None when they never did or it cannot be read."""
+    try:
+        from integrations.social.consent_service import (
+            CREDENTIAL_SCOPE_PREFIX, ConsentService)
+        from integrations.social.models import db_session
+        scope = CREDENTIAL_SCOPE_PREFIX + name
+        with db_session(commit=False) as db:
+            times = [row.granted_at for row in ConsentService.list_consents(
+                         db, str(owner), 'credential')
+                     if row.scope == scope and row.granted
+                     and row.granted_at is not None]
+        return max(times) if times else None
+    except Exception:
+        logger.warning("credential %s: when the owner entered it could not be "
+                       "read", name, exc_info=True)
+        return None
 
-    Which channels can be connected from one value the owner types is
-    integrations.channels.agent_tools.chat_connect_blocker, the rule
-    register_channel starts adapters by; no card is filed for any other (a
-    question whose answer can never start the channel).  The value is asked
-    for through hartos.ai_key_vault.request_credential, the one credential
-    ask: one card per credential, not one per agent.  Once the owner has
-    entered it, the channel is connected through register_channel (the one
-    registration path, as Connect_Channel calls it) under the owner's
-    account, with the value itself: the model never holds it, and no
-    unresolved {{secret:NAME}} ever becomes a token.  A value that failed is
-    never tried again (_SELF_CONNECTS): the owner is asked for a new one
-    (request_credential's "rejected"), and an owner who said no is not
-    asked again.  A node with no owner connects nothing: there is nobody to
-    connect it for.
+
+def _channel_turned_off(channel: str, meta: dict) -> Optional[str]:
+    """The answer when the owner turned ``channel`` off in its channel
+    settings (its admin entry says enabled false), else None.  Such a
+    channel is not posted on, not reconnected (register_channel would turn
+    it back on) and not asked about; before, it was asked about on every
+    post (review of 506a79c1f)."""
+    try:
+        from integrations.channels.admin.api import get_api
+        cfg = (getattr(get_api(), '_channels', {}) or {}).get(channel)
+    except Exception:
+        logger.warning("post_to_channel %s: channel settings unreadable",
+                       channel, exc_info=True)
+        return None
+    if not isinstance(cfg, dict) or cfg.get('enabled', True) is not False:
+        return None
+    display = meta.get('display_name') or channel
+    return _not_posted(
+        channel, (f"{display} is turned off in its channel settings, so "
+                  f"nothing was posted."),
+        needs_owner=False, channel_off=True,
+        next=(f"Nothing asked and nothing reconnected: the owner turned "
+              f"{display} off. Do not post on {display} until they turn it "
+              f"back on."))
+
+
+def _connect_or_ask(channel: str, meta: dict, adapter=None) -> str:
+    """``channel`` is not running here: connect it from what the owner
+    entered, or ask the owner for it.  ``adapter`` is the channel's adapter
+    in the live registry, if any.
+
+    A channel mid-connect is left alone: an adapter reporting CONNECTING, or
+    a start register_channel scheduled that is still being watched
+    (_connecting_now).  Which channels can be connected from one value the
+    owner types is integrations.channels.agent_tools.chat_connect_blocker,
+    the rule register_channel starts adapters by; no card is filed for any
+    other (a question whose answer can never start the channel).  The value
+    is asked for through hartos.ai_key_vault.request_credential, the one
+    credential ask: one card per credential, not one per agent.  Once the
+    owner has entered it, the channel is connected through register_channel
+    (the one registration path, as Connect_Channel calls it) under the
+    owner's account, with the value itself: the model never holds it, and
+    no unresolved {{secret:NAME}} ever becomes a token.
+
+    How that start ended decides the next call (_own_start): a value whose
+    start failed is not tried again until the owner enters a value, and the
+    owner is asked for a new one (request_credential's "rejected"); a value
+    that connected and has since dropped is connected again.  A start
+    register_channel did not schedule (it refused, or the adapter could not
+    be started here) asks nothing: no value the owner types would change
+    it.  An owner who said no is not asked again.  A node with no owner
+    connects nothing: there is nobody to connect it for.
     """
     from integrations.channels.agent_tools import (
-        LINKED_FROM_PHONE, SEVERAL_CREDENTIALS, build_channel_tool_closures,
-        chat_connect_blocker)
+        LINKED_FROM_PHONE, SEVERAL_CREDENTIALS, START_FAILED,
+        build_channel_tool_closures, chat_connect_blocker, start_verdict)
+    from integrations.channels.base import ChannelStatus
     from integrations.channels.metadata import required_setup_keys
     display = meta.get('display_name') or channel
+    status = getattr(adapter, 'get_status', lambda: None)()
+    if status == ChannelStatus.CONNECTING or _connecting_now(channel):
+        # Started and not finished: a second register now would rebuild the
+        # adapter mid-connect.
+        return _not_posted(
+            channel, f"{display} is still connecting, so nothing was posted yet.",
+            connecting=True, next=_NOT_DONE)
     blocker = chat_connect_blocker(channel, meta)
     if blocker:
         kind, detail = blocker
@@ -204,12 +279,14 @@ def _connect_or_ask(channel: str, meta: dict) -> str:
     name = vault.credential_name(key, channel)
     if _owner_declined(owner, name):
         return _not_posted(
-            channel, (f"{display} is not connected: the owner said no to "
-                      f"providing the {label}, so nothing was posted."),
+            channel, (f"{display} is not connected, so nothing was posted: the "
+                      f"owner said no to giving the {label} or took it back, "
+                      f"or the values they gave were refused too many times "
+                      f"and asking stopped."),
             needs_owner=False, owner_declined=True,
             next=(f"Do not post on {display} and do not ask for the {label} "
-                  f"again. The owner can allow asking again in Privacy "
-                  f"settings."))
+                  f"again. The owner can choose \"Allow asking again\" for it "
+                  f"in Privacy settings."))
 
     def _ask(rejected=False):
         return request_credential(json.dumps(dict({
@@ -225,21 +302,38 @@ def _connect_or_ask(channel: str, meta: dict) -> str:
     value = vault.owner_credential(name)
     if value:
         fp = _fingerprint(value)
-        with _SELF_CONNECTS_LOCK:
-            tried = _SELF_CONNECTS.get(channel)
-        if tried is not None and tried['fp'] == fp:
-            # Connected with this very value already and still not running
-            # once its start was watched to the end: it was refused.
+        entered = _owner_entered_at(owner, name)
+        own = _own_start(channel)
+        if (own is not None and own['fp'] == fp
+                and own['state'] == START_FAILED and own['entered'] == entered):
+            # This very value's start failed, and the owner has entered
+            # nothing since: ask for another.
             return _not_posted(
                 channel, (f"{display} could not connect with the {label} the "
                           f"owner entered, so nothing was posted."),
                 needs_owner=True, asked_owner_for=name, value_refused=True,
                 owner_answer=_ask(rejected=True), next=_NOT_DONE)
+        # Not tried yet, a new value, the owner entered it again, a later
+        # start replaced ours, or it connected and has since dropped.
         register = next(t[2] for t in build_channel_tool_closures(
             {'user_id': owner}) if t[0] == 'register_channel')
+        before = (start_verdict(channel) or {}).get('start')
         started = register(channel, json.dumps({key: value}))
+        after = (start_verdict(channel) or {}).get('start')
+        if after is None or after == before:
+            # register_channel scheduled no start: it refused, or the
+            # adapter could not be started here.  Nothing the owner types
+            # would change that, so nothing is asked and no try is kept.
+            # Its words go to the agent, which never sees the value.
+            return _not_posted(
+                channel, (f"{display} could not be started here, so nothing "
+                          f"was posted: {vault.mask_secrets(started)}"),
+                needs_owner=False, cannot_connect_here=True,
+                next=(f"Nothing asked: a value from the owner would not "
+                      f"start {display}. Do not report a post on {display}."))
         with _SELF_CONNECTS_LOCK:
-            _SELF_CONNECTS[channel] = {'fp': fp, 'at': time.monotonic()}
+            _SELF_CONNECTS[channel] = {'fp': fp, 'start': after,
+                                       'entered': entered}
         return _not_posted(
             channel, f"{display} was not connected, so nothing was posted yet.",
             connecting=True, register_channel=started,
@@ -423,6 +517,9 @@ def _post_to_channel(channel, content, media_url=None) -> str:
             f"posted. Channels: {', '.join(sorted(list_all_channels()))}. "
             f"For a site the owner is signed in to on the desktop, "
             f"post_to_channel_via_browser posts through their browser."))
+    turned_off = _channel_turned_off(channel, meta)
+    if turned_off:
+        return turned_off
     from integrations.channels.announcement_broadcaster import (
         every_destination_needs_subscription)
     targets = _announcement_targets(channel)
@@ -441,18 +538,7 @@ def _post_to_channel(channel, content, media_url=None) -> str:
     integration = get_channel_integration()
     adapter = integration.registry.get(channel)
     if adapter is None or not adapter.is_running():
-        from integrations.channels.base import ChannelStatus
-        status = getattr(adapter, 'get_status', lambda: None)()
-        if status == ChannelStatus.CONNECTING or _connecting_now(channel, status):
-            # Started (register_channel schedules start() and returns): a
-            # second register now would rebuild the adapter mid-connect.
-            # Only Discord reports CONNECTING, so post_to_channel's own
-            # connect is judged by its watch window too.
-            return _not_posted(
-                channel, (f"{meta.get('display_name') or channel} is still "
-                          f"connecting, so nothing was posted yet."),
-                connecting=True, next=_NOT_DONE)
-        return _connect_or_ask(channel, meta)
+        return _connect_or_ask(channel, meta, adapter)
     if not targets:
         waiting = _ask_where_to_post(channel, meta)
         if waiting is not None:
@@ -524,12 +610,15 @@ def _publish_instagram_feed(user_id, media_url, caption='', *, _consent=None):
             CHANNEL_SEND_WAIT_S, get_channel_integration)
         from integrations.channels.metadata import get_channel_metadata
         is_video = _is_video_url(media_url)
+        meta = get_channel_metadata('instagram') or {}
+        turned_off = _channel_turned_off('instagram', meta)
+        if turned_off:
+            return turned_off
         integration = get_channel_integration()
         adapter = integration.registry.get('instagram')
         loop = integration.running_loop()
         if adapter is None or not adapter.is_running() or loop is None:
-            return _connect_or_ask(
-                'instagram', get_channel_metadata('instagram') or {})
+            return _connect_or_ask('instagram', meta, adapter)
         coro = (adapter.publish_reel(media_url, caption or '')
                 if is_video else
                 adapter.publish_photo(media_url, caption or ''))
@@ -655,7 +744,7 @@ def register_marketing_tools(helper, assistant, user_id: str):
             return json.dumps({'success': False, 'error': str(e)})
 
     def post_to_channel(
-        channel: Annotated[str, "Chat channel to post on: telegram, discord, signal, viber ... (for twitter, linkedin and other sites, use post_to_channel_via_browser)"],
+        channel: Annotated[str, "Chat channel to post on: telegram, discord, viber ... (not signal, whatsapp or imessage: there announcements reach only people who subscribed; for twitter, linkedin and other sites, use post_to_channel_via_browser)"],
         content: Annotated[str, "Content to post — write as one real person to another; never AI/marketing-speak (it gets scrolled past)"],
         media_url: Annotated[Optional[str], "Media to include (optional): a URL, or a file this node made"] = None,
         extra_config: Annotated[Optional[str], "Not used: posts go to the group or channel the owner chose for this channel"] = None,
