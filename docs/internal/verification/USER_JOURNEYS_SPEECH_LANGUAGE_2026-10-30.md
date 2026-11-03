@@ -213,3 +213,43 @@ gates all of it.
 
 Deferred from the reviews, not resolved here: a per-row account of the 42 clips against
 61 sends.
+
+## 6. Re-measured on the installed build, 3 Nov 2026
+
+The owner asked on 3 Nov for each agent to be proven as installed, with no change. Two
+runs on the desktop, both through `/chat` with `media_mode` text and user 10202, every
+line below read from `frozen_debug.log` by its RequestID tag. Both runs started at 11:57
+IST and shared the one local model, because my runner's check for the first run missed it.
+What each run did holds; its duration is not the agent's latency.
+
+REUSE, Syllable Coach (prompt 1793359802508), request `msg_1793687253807_hv66proof`,
+11:57:33 to 12:09:48 IST, a new conversation. The person's text: "Hi, Arjun is here and
+ready for his ball practice."
+- MEASURED: `[REUSE-LEDGER] tasks=9 actions=9`; the walk reached actions 1 to 9 inside
+  this one turn and waited for no reply.
+- MEASURED: 7 sends were attempted (`SENDING DATA`) and 6 were published to the chat
+  (`Message published locally`); which attempt was not published was not read. The first
+  attempt asked: "Hey Arjun! I'm so excited to practice "ball" with you! Let's say it
+  together - can you try to say "ball" please?" The other six praised an attempt nobody
+  made in this conversation, for example "You did AMAZING, Arjun! You said "Ba" which is
+  so close to "ball"!" (quotes here leave out the emoji the messages carried). The
+  turn's reply praised "Ba" the same way.
+- The same failure as on 2 Nov (docs/VERIFICATION.md, its Syllable Coach row), with the
+  same three causes recorded there; their fixes are local commits, none on the desktop.
+- NOT RUN: the child's attempt and the same words in Hindi, the two turns planned next;
+  the owner was at the desk, so the runner stopped.
+
+CREATE, the owner's Teams note "Speech therapy Agent Flows" (29-10-2024) verbatim through
+the chat-create path with autonomous creation, request `msg_1793687224401_create`, prompt
+1793687224400.
+- MEASURED: 11:57:29 round 0 staged one flow `main` of 9 actions, all of them about the
+  note's overall prompt (caption the kid's activity, approximate the word, keep the
+  metrics); none of the note's flows 1 to 7 was in it.
+- MEASURED: 11:57:38 the plan review answered `needs_refinement` on the step
+  "execute_windows_or_android_command: overlay text caption on video".
+- MEASURED: 11:58:04 the refinement had 13 actions; the oscillation guard logged
+  "action_count 9 -> 13 (delta 4 > threshold 3)" and force-approved it.
+- MEASURED: 11:58:52 the config was saved, status `completed`: one flow `main`, 13
+  actions, the first `get_user_camera_inp`, five of them desktop video-editor commands.
+  The driver sent no proceed turn after it read those steps. The record stays on the node;
+  deleting it is the owner's call.
