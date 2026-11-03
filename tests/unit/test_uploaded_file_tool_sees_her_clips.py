@@ -12,6 +12,13 @@ the one rule reel_make reads (core.chat_attachments.latest_inbound).  These
 tests drive the real store on a temporary root, installed as the process
 singleton the tool asks.
 
+Measured live 2026-11-02 20:32 (request 346ea378): with nothing of hers for
+agent 342, the tool's whole answer was "No file uploaded from user"; the
+agent never opened her file picker and ended its step asking her in words
+how the step should work.  That answer now also names the ask that opens
+her picker (ask_person's file_request), with the component written as
+ask_person takes it.
+
     python -m pytest tests/unit/test_uploaded_file_tool_sees_her_clips.py -q
 """
 import hashlib
@@ -20,6 +27,7 @@ import json
 import pytest
 
 from core import user_file_store as ufs
+from core.agent_tool_menu import ASK_PERSON_TOOL
 from core.chat_attachments import bind_inbound, parse_inbound
 from core.session_cache import TTLCache
 from tests.unit.test_core_tools_uuid_user_id import _ctx, _tool
@@ -75,6 +83,12 @@ def _ask(recent_file_id=None):
     return _tool(_ctx(USER, recent_file_id=recent_file_id), 'get_user_uploaded_file')()
 
 
+def _told_to_ask(reply):
+    """The answer when nothing of hers is for this agent: no file, and the
+    ask that opens her file picker."""
+    return reply.startswith('No file uploaded from user') and ASK_PERSON_TOOL in reply
+
+
 def test_her_clips_for_this_agent_are_the_answer(store):
     """THE REGRESSION: 46 hours after she sent them, still unused."""
     xids = _her_five_clips(store)
@@ -93,20 +107,43 @@ def test_her_clips_for_this_agent_are_the_answer(store):
     assert 'path' not in first and 'user_id' not in first
 
 
+def test_no_file_for_this_agent_names_the_ask_that_opens_her_picker(store):
+    """THE 11-02 REGRESSION: the answer named no way to get her files."""
+    reply = _ask()
+
+    assert _told_to_ask(reply)
+    assert 'file_request' in reply
+    for purpose in ufs.INBOUND_PURPOSES:
+        assert purpose in reply
+    # The component it shows is one ask_person takes as written.
+    from integrations.agent_engine.person_ask import _refusal
+    component = json.loads(reply[reply.index('{'):reply.index('}') + 1])
+    assert component == {'type': 'file_request', 'purpose': ufs.REEL_SOURCE}
+    assert _refusal(component, AGENT) is None
+
+
 def test_another_agents_clips_are_not_this_agents(store):
     _her_five_clips(store, agent='p2')
-    assert _ask() == 'No file uploaded from user'
+    assert _told_to_ask(_ask())
+
+
+def test_clips_sent_with_no_turn_are_not_this_agents(store):
+    """Clips that reached her desktop on no turn (her 11-02 18:37 upload,
+    whose answer never came) are bound to no agent: this one is told to
+    ask, and her picks for its ask are then bound to it."""
+    _upload(store, b'clip sent with no turn' * 40, 'VID_1837.mp4')
+    assert _told_to_ask(_ask())
 
 
 def test_clips_a_reel_already_used_are_not_offered_again(store):
     store.mark_consumed(USER, _her_five_clips(store))
-    assert _ask() == 'No file uploaded from user'
+    assert _told_to_ask(_ask())
 
 
 def test_clips_the_store_no_longer_keeps_are_not_offered(store):
     _her_five_clips(store)
     store.test_clock.now += ufs.PURPOSES['reel_source'].unused_s + 1
-    assert _ask() == 'No file uploaded from user'
+    assert _told_to_ask(_ask())
 
 
 def test_a_file_id_sent_with_the_turn_still_answers_first(store):

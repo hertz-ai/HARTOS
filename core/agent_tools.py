@@ -1926,7 +1926,17 @@ def build_core_tool_closures(ctx):
                 'note': ('The files she sent this agent that no reel has used yet, '
                          'in the order she sent them.'),
             })
-        return 'No file uploaded from user'
+        # None for this agent: name the tool that asks her for them.  Live
+        # 2026-11-02 20:32 (request 346ea378) agent 342 read only "No file
+        # uploaded from user" here, never opened her file picker, and asked
+        # her in words how its step should work.
+        from core.agent_tool_menu import ASK_PERSON_TOOL
+        from core.user_file_store import INBOUND_PURPOSES, REEL_SOURCE
+        return ('No file uploaded from user for this agent yet. To get one, ask them: '
+                'call %s with component {"type": "file_request", "purpose": "%s"} '
+                '(purpose is one of: %s). Their devices open the file picker, and the '
+                'files they pick are bound to you.'
+                % (ASK_PERSON_TOOL, REEL_SOURCE, ', '.join(INBOUND_PURPOSES)))
 
     tools.append((
         "get_user_uploaded_file",
