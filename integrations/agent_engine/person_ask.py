@@ -28,10 +28,17 @@ the ones that exist, in this order:
     the fan-out consent answers use), and every surface drops its copy
     (H-1024); the row is marked read and the card leaves the shell's store.
     Reading the row in the bell is NOT an answer and drops nothing.
+  * A dismissal, from whichever surface, goes through dismiss_ask(): the
+    person asked and nobody else, before any answer.  The ask closes exactly
+    as an answered one does (every surface drops its card, the row is marked
+    read), and the asking agent reads ``dismissed`` (owner, 2026-11-03:
+    "dismissing a request dismisses and answering in one client device clears
+    everything").
 
-The one door that calls answer_ask() is /api/agent/approval with an
-``ask_id`` (hart_intelligence_entry, and the shell's own route), always with
-the caller's verified Bearer identity (answer_from_request).  No reply topic
+The one door that calls answer_ask() and dismiss_ask() is
+/api/agent/approval with an ``ask_id`` (hart_intelligence_entry, and the
+shell's own route; ``"dismiss": true`` dismisses), always with the caller's
+verified Bearer identity (answer_from_request).  No reply topic
 is a door: central's router is anonymous, so a payload published there could
 answer for anyone (decision 2026-10-27 in the design doc).
 
@@ -92,7 +99,8 @@ _asks: Dict[str, '_Ask'] = {}
 
 class _Ask:
     __slots__ = ('ask_id', 'user_id', 'agent_id', 'prompt_id', 'ctype', 'purpose',
-                 'max_files', 'same', 'created', 'answered_at', 'answer', 'event')
+                 'max_files', 'same', 'created', 'answered_at', 'answer', 'event',
+                 'dismissed')
 
     def __init__(self, ask_id, user_id, agent_id, prompt_id, ctype, card, same):
         self.ask_id = ask_id
@@ -107,6 +115,9 @@ class _Ask:
         self.answered_at = None
         self.answer = None
         self.event = threading.Event()
+        # Closed by the person without an answer (dismiss_ask): answered_at
+        # is set too, so it no longer counts as open anywhere.
+        self.dismissed = False
 
 
 def _refused(reason) -> dict:
@@ -474,7 +485,8 @@ def answer_ask(ask_id, answer, answerer_id) -> Tuple[dict, int]:
     Returns ``(body, http_status)``: 200 answered; 400 'bad_answer',
     'secrets_go_to_the_vault' or 'files_not_received' (the ask stays open);
     403 'not_yours'; 404 'not_found'; 409 'already_answered' (with the answer
-    already given, which stands); 410 'expired' (the turn that asked ended).
+    already given, which stands) or 'dismissed' (she closed it on a surface);
+    410 'expired' (the turn that asked ended).
     """
     ask_id = str(ask_id or '')
     with _lock:
@@ -487,8 +499,7 @@ def answer_ask(ask_id, answer, answerer_id) -> Tuple[dict, int]:
         return {'status': 'error', 'reason': 'not_yours'}, 403
     with _lock:
         if a.answered_at is not None:
-            return {'status': 'error', 'reason': 'already_answered',
-                    'answer': a.answer}, 409
+            return _already_closed(a)
     problem = _answer_problem(a, answer)
     if problem is None and a.ctype == 'file_request':
         problem = _bind_picks(a, answer['xids'])
@@ -496,8 +507,7 @@ def answer_ask(ask_id, answer, answerer_id) -> Tuple[dict, int]:
         return {'status': 'error', 'reason': problem}, 400
     with _lock:
         if a.answered_at is not None:
-            return {'status': 'error', 'reason': 'already_answered',
-                    'answer': a.answer}, 409
+            return _already_closed(a)
         a.answer = dict(answer)
         a.answered_at = time.time()
         a.event.set()
@@ -506,16 +516,57 @@ def answer_ask(ask_id, answer, answerer_id) -> Tuple[dict, int]:
     return {'status': 'ok', 'ask_id': ask_id}, 200
 
 
+def _already_closed(a: '_Ask') -> Tuple[dict, int]:
+    """409 for an ask that is no longer open: answered (the answer stands) or
+    dismissed.  Called under _lock."""
+    if a.dismissed:
+        return {'status': 'error', 'reason': 'dismissed'}, 409
+    return {'status': 'error', 'reason': 'already_answered', 'answer': a.answer}, 409
+
+
+def dismiss_ask(ask_id, dismisser_id) -> Tuple[dict, int]:
+    """The person closes ask ``ask_id`` without answering, from any surface.
+
+    The same door and the same rules as answer_ask: ``dismisser_id`` is the
+    caller's VERIFIED identity, only the person asked may close it, and only
+    while it is open.  It then closes the way an answered ask closes (every
+    surface drops its card, the bell row is marked read) and the waiting
+    agent wakes to ``dismissed``.  Returns 200; 403 'not_yours'; 404
+    'not_found'; 409 'already_answered' or 'dismissed'; 410 'expired' (the
+    turn that asked ended: the card is still dropped everywhere)."""
+    ask_id = str(ask_id or '')
+    with _lock:
+        a = _asks.get(ask_id)
+    if a is None:
+        return _expired_or_unknown(ask_id, dismisser_id)
+    if not dismisser_id or str(dismisser_id) != a.user_id:
+        logger.warning("person ask %s: a dismissal from %r refused, the ask is for "
+                       "user %s", ask_id, dismisser_id, a.user_id)
+        return {'status': 'error', 'reason': 'not_yours'}, 403
+    with _lock:
+        if a.answered_at is not None:
+            return _already_closed(a)
+        a.dismissed = True
+        a.answered_at = time.time()
+        a.event.set()
+    _close(ask_id, a.user_id)
+    logger.info("person ask %s (%s) dismissed by user %s", ask_id, a.ctype, a.user_id)
+    return {'status': 'ok', 'ask_id': ask_id, 'dismissed': True}, 200
+
+
 def answer_from_request(req, data) -> Tuple[dict, int]:
     """/api/agent/approval's ask branch, for both of its routes (this node's
     and the shell's): the answerer is the caller's Bearer identity.  A
     signed-in person is who their token names (approver_from_request).  A
     phone is this desktop's owner when the owner allowed it and it signed as
     them, else nobody (integrations.social.auth.allowed_device_owner): the
-    owner's phone answers the owner's asks, and only asks."""
+    owner's phone answers the owner's asks, and only asks.  ``"dismiss":
+    true`` closes the ask unanswered (dismiss_ask), by the same identity."""
     from integrations.commerce.approvals import approver_from_request, bearer_token
     from integrations.social.auth import allowed_device_owner
     answerer = approver_from_request(req) or allowed_device_owner(bearer_token(req))
+    if (data or {}).get('dismiss') is True:
+        return dismiss_ask((data or {}).get('ask_id'), answerer)
     return answer_ask((data or {}).get('ask_id'), (data or {}).get('answer'), answerer)
 
 
@@ -532,15 +583,17 @@ def wait_for_answer(ask_id, timeout_s) -> Optional[dict]:
 def ask_state(ask_id, user_id) -> dict:
     """``{'status', 'answer'}`` of an ask, as ``user_id``'s agent may read it.
 
-    'open', 'answered' (with the answer), 'expired' (her ask, no longer held
-    here: a restart, or kept past ANSWERED_KEEP_S; ask again) or 'not_found'
-    (no such ask of hers)."""
+    'open', 'answered' (with the answer), 'dismissed' (she closed it without
+    an answer), 'expired' (her ask, no longer held here: a restart, or kept
+    past ANSWERED_KEEP_S; ask again) or 'not_found' (no such ask of hers)."""
     ask_id, user_id = str(ask_id or ''), str(user_id or '')
     with _lock:
         a = _asks.get(ask_id)
         if a is not None:
             if a.user_id != user_id:
                 return {'status': 'not_found', 'answer': None}
+            if a.dismissed:
+                return {'status': 'dismissed', 'answer': None}
             if a.answer is not None:
                 return {'status': 'answered', 'answer': dict(a.answer)}
             return {'status': 'open', 'answer': None}
