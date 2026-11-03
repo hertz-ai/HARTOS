@@ -1,0 +1,12 @@
+# Applied to every pip run in CI through PIP_CONSTRAINT (set at workflow level
+# in each workflow that installs requirements.txt).
+#
+# pip 26.3 (released 2026-11-02) refuses autobahn==23.1.2 from PyPI:
+#   "Distributions from PyPI cannot declare direct URL dependencies.
+#    autobahn depends on web3[ipfs] @ git+https://github.com/ethereum/web3.py.git
+#    ... ; extra == "all""
+# so `pip install -r requirements.txt` and pip-audit (whose own venv upgrades
+# pip) failed before any test ran.  pip 26.2.2 installs it.  autobahn stays
+# pinned at 23.1.2 for the reason given in requirements.txt; lift this cap
+# when that pin moves to a release whose metadata pip accepts (24.4.2 does).
+pip<26.3
