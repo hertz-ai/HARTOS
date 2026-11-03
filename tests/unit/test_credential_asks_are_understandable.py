@@ -17,10 +17,11 @@ hart_intelligence_entry) handed any ask to request_credential.
 Now both go through ai_key_vault.request_credential_for_agent: a credential
 this computer's code reads (reads_from_env) or the owner already stored goes
 straight on; any other ask is judged by the node's own model, which must
-reply with the two-field object the request names (who issues the secret,
-then YES or NO).  YES is asked with the service and where to get it on the
-card; NO goes back to the agent with no card; anything else is asked as
-before and logged.  The model is the boundary mocked here
+reply with the object the request names (who issues the secret, whether the
+use is done on the person's account there, then YES or NO).  YES is asked
+with the service and where to get it on the card; NO goes back to the agent
+with no card; anything else is asked as before and logged.  The 17:53 card of
+2026-11-03 (HIVENET below) is why the middle question exists.  The model is the boundary mocked here
 (core.http_pool.pooled_post); the consent service, the database and the
 vault are real, as in test_credential_ask.
 
@@ -55,10 +56,24 @@ TELEGRAM = json.dumps({
     'resource_type': 'channel_secret', 'channel_type': 'telegram',
     'key_name': 'bot_token', 'label': 'Telegram Bot Token',
     'used_by': 'post_to_channel', 'description': 'Needed to post on Telegram.'})
+# Live 2026-11-03 17:53:49 IST on the owner's desktop (frozen_debug.log.old,
+# request daemon_0f4b1e5b-c75a-4386-adcd-d3c61663f9ea, agent 'Hive Infra
+# Guardian'), verbatim: a real company named for this computer's own work.  The
+# agent had googled "Hivenet API ..." five times with unrelated results, then
+# asked; the check of the day asked only who issues the key, and the card
+# reached the owner.
+HIVENET = json.dumps({
+    'resource_type': 'api_key', 'key_name': 'HIVENET_API_KEY',
+    'label': 'Hivenet API key', 'service': 'Hivenet (hivenet.io)',
+    'used_by': 'model provisioning agent',
+    'description': 'Hivenet API key needed to monitor idle nodes and onboard '
+                   'models via POST /api/models/onboard',
+    'where_to_get': 'hivenet.io API documentation or developer portal'})
 # The reply shape the request demands (_ASK_CHECK_SCHEMA).
-YES = json.dumps({'issued_by': 'OpenWeather', 'answer': 'YES'})
-NO = json.dumps({'issued_by': 'NONE', 'answer': 'NO'})
-TOLD = 'no outside company, website or app gives it out'
+YES = json.dumps({'issued_by': 'OpenWeather', 'their_account_used': 'YES',
+                  'answer': 'YES'})
+NO = json.dumps({'issued_by': 'NONE', 'their_account_used': 'NO', 'answer': 'NO'})
+TOLD = 'no person could act on it'
 
 
 @pytest.fixture
@@ -111,13 +126,40 @@ def test_a_made_up_credential_never_reaches_the_owner(world, model):
 
 def test_the_model_is_held_to_two_words(world, model):
     """The request names the reply's shape, so the server holds the model to
-    it: the answer is YES or NO, never free text to read a word out of."""
+    it: the answers are YES or NO, never free text to read a word out of."""
     _request_resource()(INVENTED)
     fmt = model.bodies[0]['response_format']
     schema = fmt['json_schema']['schema']
     assert fmt['type'] == 'json_schema'
     assert schema['properties']['answer']['enum'] == ['YES', 'NO']
-    assert set(schema['required']) == {'issued_by', 'answer'}
+    assert schema['properties']['their_account_used']['enum'] == ['YES', 'NO']
+    assert set(schema['required']) == {'issued_by', 'their_account_used', 'answer'}
+
+
+def test_a_real_company_named_for_this_computers_own_work_is_not_asked(world, model):
+    """The 17:53 card: Hivenet is a real company, but monitoring idle nodes and
+    onboarding models through this node's own /api/models/onboard is this
+    computer's work, done on no account of the person's.  The model answers
+    that the person's account there is not used, and no card goes out."""
+    model.reply = json.dumps({'issued_by': 'Hivenet', 'their_account_used': 'NO',
+                              'answer': 'NO'})
+    out = _request_resource()(HIVENET)
+    assert _cards(world) == [], 'the made-up Hivenet ask reached the owner as a card'
+    assert _asks() == []
+    assert 'Hivenet API key' in out and TOLD in out
+    assert '/api/models/onboard' in model.prompts[0], (
+        'the model was not shown what the secret is for')
+
+
+def test_a_real_company_used_on_the_persons_account_is_asked(world, model):
+    """The same company, for a step done on the person's account there: asked."""
+    model.reply = json.dumps({'issued_by': 'Hivenet', 'their_account_used': 'YES',
+                              'answer': 'YES'})
+    _request_resource()(json.dumps(dict(
+        json.loads(HIVENET), used_by='rent_compute',
+        description='To rent extra compute on your Hivenet account for the '
+                    'overnight batch.')))
+    assert len(_cards(world)) == 1
 
 
 def test_an_ask_a_person_can_act_on_reaches_them_with_where_to_get_it(world, model):
@@ -152,8 +194,15 @@ def test_a_stored_credential_is_answered_without_the_model(world, model):
 @pytest.mark.parametrize('reply', [
     # What the desktop's model wrote on 2026-11-03 when asked for free text.
     "NO, because this request asks for the computer's own network configuration",
-    # A NO that names who issues it contradicts itself.
-    json.dumps({'issued_by': 'OpenWeather', 'answer': 'NO'}),
+    # A NO that names who issues it and says the person's account is used
+    # contradicts itself.
+    json.dumps({'issued_by': 'OpenWeather', 'their_account_used': 'YES',
+                'answer': 'NO'}),
+    # A YES that says the person's account is not used contradicts itself.
+    json.dumps({'issued_by': 'OpenWeather', 'their_account_used': 'NO',
+                'answer': 'YES'}),
+    # A YES that names nobody who issues it contradicts itself.
+    json.dumps({'issued_by': 'NONE', 'their_account_used': 'YES', 'answer': 'YES'}),
     json.dumps(['NO']),
     # A reply whose content is a list of parts, not text (review of 133ab4a07,
     # M2: it raised TypeError out of the tool).
