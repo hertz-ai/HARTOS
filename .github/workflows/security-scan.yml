@@ -18,6 +18,11 @@ concurrency:
   group: security-scan-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'auto' }}
   cancel-in-progress: true
 
+env:
+  # pip below 26.3 for every pip run, pip-audit's own venv included
+  # (.github/pip-constraint.txt says why)
+  PIP_CONSTRAINT: ${{ github.workspace }}/.github/pip-constraint.txt
+
 jobs:
   sast:
     name: SAST (Bandit)
