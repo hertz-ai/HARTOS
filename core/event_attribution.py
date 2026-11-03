@@ -18,7 +18,7 @@ than each re-deriving the owner.
 import time
 from typing import Optional
 
-from core.constants import MACHINE_GOAL_AUTHORS
+from core.constants import MACHINE_GOAL_AUTHORS, SYSTEM_IDENTITIES
 
 
 def goal_owner_user_id(goal) -> Optional[str]:
@@ -52,6 +52,50 @@ def goal_owner_user_id(goal) -> Optional[str]:
            or created_by
            or getattr(goal, 'user_id', None))
     return str(uid) if uid else None
+
+
+def person_for(uid, db=None) -> Optional[str]:
+    """The person who answers for ``uid``: a human or a guest is their own
+    person; an agent or system row answers to its owner_id, else to the
+    node's owner (capability_setup.setup_owner); no uid at all is the node's
+    owner too, and so is a system identity (core.constants.SYSTEM_IDENTITIES:
+    'system_daemon' is a string, never a users row id, and a daemon turn for
+    an unowned goal runs as it; measured on central 2026-10-31 10:29:25Z, an
+    ask_person push to system_daemon reached nobody).  Any other id with no
+    users row here is returned as it is: a caller
+    that must reach someone on this node checks the row
+    (GoalManager._person_to_tell).
+
+    The one resolver for "who is asked" (task #175: asks addressed to agent
+    rows reached nobody; Part B: a background goal's question).  Measured on
+    the owner's desktop 2026-11-02: 38 of 38 active goals have owner_id
+    NULL (system_bootstrap), and a goal's REUSE session runs as an agent row
+    (agent_27130929014_0, owner_id NULL), whose sends no person reads.
+    Never raises; a failed read answers the node's owner."""
+    from integrations.agent_engine.capability_setup import setup_owner
+    if not uid or str(uid) in SYSTEM_IDENTITIES:
+        return setup_owner()
+    try:
+        from integrations.social.models import User, db_session
+        if db is not None:
+            row = db.query(User).filter_by(id=str(uid)).first()
+            kind, owner = ((getattr(row, 'user_type', None), getattr(row, 'owner_id', None))
+                           if row is not None else (None, None))
+        else:
+            with db_session() as _db:
+                row = _db.query(User).filter_by(id=str(uid)).first()
+                kind, owner = ((getattr(row, 'user_type', None),
+                                getattr(row, 'owner_id', None))
+                               if row is not None else (None, None))
+    except Exception:
+        import logging
+        logging.getLogger(__name__).warning(
+            "person_for(%s): the users row could not be read; asking the "
+            "node's owner", uid, exc_info=True)
+        return setup_owner()
+    if str(kind or '').lower() in ('agent', 'system'):
+        return str(owner) if owner else setup_owner()
+    return str(uid)
 
 
 def owner_user_id(user_prompt=None, goal_id=None, metadata=None) -> Optional[str]:
