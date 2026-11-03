@@ -47,9 +47,14 @@ _module_lock = threading.Lock()
 # Track which tasks we've already sent HITL notifications for (avoid spam)
 _hitl_notified: set = set()
 
-# Goals that are budget-blocked are immediately paused (no retries).
-# Previously we retried 3 times, but that just re-dispatches a blocked goal
-# every 30 seconds with no chance of success (budget doesn't change between ticks).
+# Goals refused for budget that stayed active (never_pause, or a refused
+# pause): the refusal was already said once, so later ticks do not say it
+# again.  Their budget is still read on every tick, and a goal with enough
+# spark is dispatched and leaves this set.  A goal the budget pause did pause
+# is never put here: it leaves the active goals, and if the owner resumes it,
+# its budget is judged afresh.  It used to be skipped here before its budget
+# was read, so a top-up never reached it: central's hive_growth goal waited
+# about 63 hours after its top-up on 2026-10-31.
 _budget_blocked_goals: set = set()
 
 # Track dispatch failures per goal for exponential backoff.
@@ -2326,12 +2331,6 @@ class AgentDaemon:
                     from .budget_gate import estimate_llm_cost_spark, _resolve_model_name
                     goal_key = str(goal.id)
 
-                    # Skip goals already known to be budget-blocked (avoids
-                    # re-checking every 30s when nothing has changed).
-                    with _module_lock:
-                        if goal_key in _budget_blocked_goals:
-                            continue
-
                     # Read-only check: compare remaining budget vs estimated cost
                     # without reserving (no spark_spent increment).  The pause
                     # is decided on the spark spent on work: a reservation
@@ -2354,8 +2353,7 @@ class AgentDaemon:
                             f"running work before its next dispatch")
                         continue
                     if not bg_allowed:
-                        # Immediately pause — budget won't change between daemon
-                        # ticks, so retrying is wasteful.
+                        # Pause at once: retrying a refused goal is wasteful.
                         #
                         # The mutation itself lives in budget_gate, which is
                         # also reached from pre_dispatch_budget_gate.  It used
@@ -2364,15 +2362,21 @@ class AgentDaemon:
                         # one blocked here was paused: two behaviours for one
                         # decision.  The pause also now honours never_pause,
                         # which this inline copy ignored.
-                        from .budget_gate import apply_budget_pause
-                        apply_budget_pause(goal, bg_reason, db=db)
+                        #
+                        # A goal that stays active (never_pause, a refused
+                        # pause) is refused once; later ticks still read its
+                        # budget above and skip it quietly until it has spark.
                         with _module_lock:
-                            _budget_blocked_goals.add(goal_key)
+                            refused_before = goal_key in _budget_blocked_goals
+                        if not refused_before:
+                            from .budget_gate import apply_budget_pause
+                            if not apply_budget_pause(goal, bg_reason, db=db):
+                                with _module_lock:
+                                    _budget_blocked_goals.add(goal_key)
                         continue
                     else:
-                        # Budget passed — clear from blocked set if it was
-                        # previously blocked (e.g. goal was resumed with
-                        # more budget).
+                        # Enough spark now (a top-up, or a resume with more
+                        # budget): no longer refused.
                         with _module_lock:
                             _budget_blocked_goals.discard(goal_key)
                 except ImportError:
