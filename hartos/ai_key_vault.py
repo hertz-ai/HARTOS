@@ -271,7 +271,7 @@ class AIKeyVault:
             return type(value)(cls._map_strings(v, fn) for v in value)
         return value
 
-    def owner_credential_names(self) -> set:
+    def owner_credential_names(self, strict: bool = False) -> set:
         """The names of the credentials the owner of this computer entered:
         the only names an alias resolves and "is stored" answers for.
 
@@ -290,12 +290,17 @@ class AIKeyVault:
         Never "any environment variable": os.environ also holds API keys,
         database URLs and key material nobody entered for an agent, and an
         alias that reached them let a model (or a page it read) put them in
-        a tool URL.  A consent lookup that fails counts no grants.
+        a tool URL.  A consent lookup that fails counts no grants, unless
+        ``strict``: then it raises, for a caller that must tell "the owner
+        has none" from "it cannot be told" (channels.agent_tools
+        _owner_value_fingerprint).
         """
         names = set(self._stored)
         try:
             names |= self._granted_names()
         except Exception:
+            if strict:
+                raise
             logger.warning("credential grants could not be read; only "
                            "credentials stored this session resolve",
                            exc_info=True)

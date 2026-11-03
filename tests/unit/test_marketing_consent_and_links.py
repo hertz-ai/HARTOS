@@ -997,6 +997,68 @@ def test_the_owner_replacing_their_value_without_a_card_is_tried(world, how):
     assert NEW not in json.dumps(out)
 
 
+def _register_another_way(value):
+    """Another path (Connect_Channel, the connect form, OAuth) starts
+    telegram with ``value`` through the real register_channel tool."""
+    from integrations.channels.agent_tools import build_channel_tool_closures
+    register = next(t[2] for t in build_channel_tool_closures({'user_id': OWNER})
+                    if t[0] == 'register_channel')
+    register('telegram', json.dumps({'bot_token': value}))
+
+
+@pytest.mark.parametrize('unreadable', ['grants_locked', 'value_not_handed_over'])
+def test_a_newer_start_while_the_owner_value_was_unreadable_is_never_overwritten(
+        world, monkeypatch, unreadable):
+    """Review of f6978d245 (N1, measured): while another path started the
+    channel with B, the owner's own value could not be read: the consent
+    table was locked, or the grant row stood and Nunba had not yet handed
+    the value over.  The start recorded "the owner had none", so when B
+    dropped, the next post took the owner's old value A as changed since,
+    wrote it over B (binding included), and A was refused again: a rejected
+    card.  FAILS BEFORE THE FIX: wired A, B, A."""
+    from sqlalchemy.exc import OperationalError
+    from hartos.ai_key_vault import get_ai_key_vault
+    from integrations.social.consent_service import ConsentService
+    _owner_enters(TOKEN)
+    _post('telegram', 'hello')                       # A is tried...
+    _watch_ends(world, connected=False)              # ...and refused
+    with monkeypatch.context() as m:
+        if unreadable == 'grants_locked':
+            real = ConsentService.list_consents
+
+            def _locked(db, user_id, consent_type=None, *a, **k):
+                if consent_type == 'credential':
+                    raise OperationalError('SELECT', {}, Exception('database is locked'))
+                return real(db, user_id, consent_type, *a, **k)
+            m.setattr(ConsentService, 'list_consents', staticmethod(_locked))
+        else:
+            # The grant row stands; the desktop vault has not handed the
+            # value to this process yet (as after a restart).
+            m.setattr(get_ai_key_vault(), '_held', {})
+        _register_another_way(OTHER)                 # B, another way
+    _watch_ends(world, connected=True)
+    world.registry.register(_Adapter('telegram', status=ChannelStatus.DISCONNECTED))
+    out = _post('telegram', 'hello')                 # B has dropped
+    assert world.wired == [('telegram', TOKEN), ('telegram', OTHER)]
+    assert out.get('connected_elsewhere') is True and out['needs_owner'] is False
+    assert _card_requests(world) == []
+
+
+def test_a_start_records_the_owner_value_only_as_far_as_it_is_known(world):
+    """The start record's owner_fp: '' only when the owner has no value
+    here at all (no grant, nothing stored), the value's fingerprint when
+    they have one.  A value that cannot be read is neither (above)."""
+    from integrations.channels.agent_tools import (
+        credential_fingerprint, start_verdict)
+    _register_another_way(OTHER)
+    assert start_verdict('telegram')['owner_fp'] == ''
+    _watch_ends(world, connected=True)
+    _owner_enters(TOKEN)
+    _register_another_way(OTHER)
+    assert start_verdict('telegram')['owner_fp'] == credential_fingerprint(TOKEN)
+    _watch_ends(world, connected=True)
+
+
 def test_a_reconnect_that_cannot_start_is_not_reported_as_connecting(
         world, monkeypatch):
     """The value connected, the channel dropped, and the reconnect could

@@ -236,7 +236,7 @@ def _connect_or_ask_locked(channel: str, meta: dict, adapter) -> str:
     from integrations.channels.agent_tools import (
         LINKED_FROM_PHONE, SEVERAL_CREDENTIALS, START_FAILED,
         build_channel_tool_closures, chat_connect_blocker,
-        credential_fingerprint, start_verdict)
+        credential_fingerprint, owner_credential_name, start_verdict)
     from integrations.channels.base import ChannelStatus
     from integrations.channels.metadata import required_setup_keys
     display = meta.get('display_name') or channel
@@ -280,7 +280,8 @@ def _connect_or_ask_locked(channel: str, meta: dict, adapter) -> str:
               for f in meta.get('setup_fields') or []}
     label = f"{display} {labels.get(key) or key}"
     vault = get_ai_key_vault()
-    name = vault.credential_name(key, channel)
+    # The name a start records the owner's value under (one derivation).
+    name = owner_credential_name(channel, meta)
     if _owner_declined(owner, name):
         return _not_posted(
             channel, (f"{display} is not connected, so nothing was posted: the "

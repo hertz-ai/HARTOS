@@ -159,8 +159,9 @@ START_FAILED = 'failed'
 
 #: channel -> {'start': n, 'state': START_*, 'fp': fingerprint of the value
 #: it started with (None when unknown), 'owner_fp': fingerprint of the
-#: owner's own stored value at that moment ('' when they had none, None when
-#: it could not be read), 'at': when it started (naive UTC, as the consent
+#: owner's own stored value at that moment ('' when the name was not theirs
+#: at all, None when it could not be told: _owner_value_fingerprint), 'at':
+#: when it started (naive UTC, as the consent
 #: table's granted_at)} for the latest start of each channel.  n grows with
 #: every start.
 _STARTS = {}
@@ -176,7 +177,8 @@ def credential_fingerprint(value) -> str:
 
 def start_verdict(channel_type: str) -> Optional[dict]:
     """The latest live start of ``channel_type`` in this process (a copy:
-    {'start', 'state', 'fp', 'at'}), or None when there was none.
+    {'start', 'state', 'fp', 'owner_fp', 'at'}), or None when there was
+    none.
 
     Every start that wires an adapter from one credential records itself
     here: register_channel (the agent tool, Connect_Channel, OAuth) and the
@@ -192,19 +194,44 @@ def start_verdict(channel_type: str) -> Optional[dict]:
         return dict(entry) if entry else None
 
 
+def owner_credential_name(channel_type: str, meta: dict) -> Optional[str]:
+    """The vault name the owner's value for ``channel_type``'s one
+    credential goes by (its alias and consent scope), or None for a channel
+    that does not take exactly one.  The one derivation: post_to_channel
+    reads the owner's value under it, and a start records that value's
+    fingerprint under it, so the two compare the same name (review of
+    f6978d245, N3)."""
+    from hartos.ai_key_vault import get_ai_key_vault
+    from integrations.channels.metadata import required_setup_keys
+    keys = required_setup_keys(meta or {})
+    if len(keys) != 1:
+        return None
+    return get_ai_key_vault().credential_name(keys[0], channel_type)
+
+
 def _owner_value_fingerprint(channel_type: str, meta: dict):
     """The credential_fingerprint of the value the owner has stored for
-    ``channel_type``'s one credential (the vault's owner_credential), ''
-    when they have none, None when it cannot be told."""
+    ``channel_type``'s one credential (the vault's owner_credential); ''
+    only when the name is not the owner's at all (no grant, nothing
+    stored); None when it cannot be told: the grants could not be read, or
+    the owner granted the name and the value has not reached this process
+    yet (Nunba's vault hands it over after the grant).  '' for either of
+    those let the owner's older value replace a newer start (review of
+    f6978d245, N1)."""
     try:
         from hartos.ai_key_vault import get_ai_key_vault
-        from integrations.channels.metadata import required_setup_keys
-        keys = required_setup_keys(meta or {})
-        if len(keys) != 1:
+        name = owner_credential_name(channel_type, meta)
+        if name is None:
             return None
         vault = get_ai_key_vault()
-        value = vault.owner_credential(vault.credential_name(keys[0], channel_type))
-        return credential_fingerprint(value) if value else ''
+        value = vault.owner_credential(name)
+        if value:
+            return credential_fingerprint(value)
+        # No value here: none at all, or not knowable now.  Raises when the
+        # grants cannot be read.
+        if name in vault.owner_credential_names(strict=True):
+            return None       # granted, not handed over yet
+        return ''
     except Exception:
         logger.warning("%s: the owner's stored value could not be read",
                        channel_type, exc_info=True)
