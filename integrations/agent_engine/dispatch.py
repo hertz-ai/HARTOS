@@ -547,14 +547,16 @@ def _user_chat_marker_recent() -> bool:
 #
 # Owner 2026-10-21: "autonomous marketing and sales and seller onboarding and
 # buyer onboarding shd be goals" (revenue); owner 2026-11-03: the marketing,
-# sales and customer care agents run on the Claude credits.  So the sales
-# outreach turn (outreach_crm_tools, 'outreach'), the customer-care reply
-# (hive_signal_bridge, 'support') and the buyer onboarding turn
-# (app_marketplace, 'onboarding') earn too.
+# sales and customer care agents run on the Claude credits.  So the two sales
+# goal types registered at boot earn too: 'outreach' (outreach_crm_tools) and
+# 'sales' (journey_engine).  The customer-care reply (hive_signal_bridge
+# 'support') and buyer onboarding (app_marketplace) have no live producer yet;
+# they join when one exists, so that a stranger's "help" in a group chat can
+# never start a Claude turn unseen (review of 865afa851, M3).
 REVENUE_GOAL_TYPES = frozenset({
     'marketing', 'seo', 'revenue', 'hive_growth', 'hive_economics',
     'mcgroce_merchant', 'mcgroce_shopper',
-    'outreach', 'support', 'onboarding',
+    'outreach', 'sales',
 })
 REVENUE_GOAL_TYPE_PREFIXES = ('p2p_',)
 
@@ -578,9 +580,9 @@ def lane_for_goal_type(goal_type) -> str:
 
 
 def revenue_expert_config(goal_type) -> Optional[list]:
-    """The model list a turn of a goal that earns runs on: the configured
-    expert first, this node's own model after it (with_local_fallback), or
-    None when the turn runs on the node's own model as before.
+    """The model a local turn of a goal that earns names: the configured
+    expert's ONE entry, or None when the turn runs on the node's own model
+    as before.
 
     The policy written above REVENUE_GOAL_TYPES: a goal that earns may use the
     expert and falls back to the free model when the day fuse trips.  The
@@ -590,29 +592,82 @@ def revenue_expert_config(goal_type) -> Optional[list]:
     spent, while 21 revenue goals sat paused after five failed turns each on
     openrouter/free.
 
+    One entry, as every producer sends (ModelBackend.to_config_list): /chat
+    is the one consumer that puts this node's own model after it
+    (hart_intelligence_entry, with_local_fallback), so an expert call the
+    wire refuses at the cap (llm_outbound_logger._day_cap_refusal) or that
+    fails falls to the own model there.  Composing it here put the own
+    entry's live http_client in the /chat body, which no transport can
+    encode: every revenue dispatch raised (review of 865afa851, C1).
+
     Only the CONFIGURED expert (the owner's trio, central only by
     configuration), never another expert-tier backend such as the owner's
     Claude Code subscription.  Offered by the registry's own lane and day-cap
-    gate (ModelRegistry._offered); past the cap or with no trio, None.  An
-    expert call refused at the wire by the cap falls to the node's own model
-    through the same list (llm_outbound_logger._day_cap_refusal)."""
+    gate (ModelRegistry.get_configured_expert); past the cap or with no trio,
+    None.  None too while the expert's provider is refusing the account (its
+    breaker OPEN): the turn then runs on the own model instead of waiting on
+    the expert's host and striking the goal (review of 865afa851, C2).
+
+    None too for an expert whose spend no day cap holds: the cap
+    (budget_gate.expert_budget_allows) is kept for the claude family only, so
+    any other configured model would run every earning turn with no limit
+    (second review of 865afa851, M1).
+
+    ``goal_type`` is the goal's OWN type, and only for a goal that is the
+    node's own (_org_goal); a caller passes None for any other goal."""
     if not is_revenue_goal_type(goal_type):
         return None
     try:
-        from core.autogen_config import with_local_fallback
+        from core.autogen_config import model_family
         from core.llm_outbound_logger import LANE_REVENUE
-        from integrations.agent_engine.model_registry import (
-            CONFIGURED_EXPERT_ID, ModelRegistry, model_registry)
-        expert = model_registry.get_model(CONFIGURED_EXPERT_ID)
-        if (expert is None or not expert.is_dispatchable()
-                or not ModelRegistry._offered(expert, LANE_REVENUE)):
+        from integrations.agent_engine.budget_gate import CAPPED_FAMILY
+        from integrations.agent_engine.model_registry import model_registry
+        expert = model_registry.get_configured_expert(LANE_REVENUE)
+        if expert is None:
             return None
-        return with_local_fallback(expert.to_config_list())
+        config = expert.to_config_list()
+        model = config[0].get('model') if config else ''
+        if model_family(model) != CAPPED_FAMILY:
+            logger.warning("revenue goal (%s) runs on the node's own model: "
+                           "the configured expert %s is not in the capped "
+                           "family '%s', so no day cap would hold its spend",
+                           goal_type, model, CAPPED_FAMILY)
+            return None
+        host = _dispatch_provider_host(config)
+        if host:
+            from core.circuit_breaker import CircuitState, llm_provider_breaker
+            if llm_provider_breaker.state(host) == CircuitState.OPEN:
+                logger.info("revenue goal (%s) runs on the node's own model: "
+                            "the expert's provider %s is refusing the account",
+                            goal_type, host)
+                return None
+        return config
     except Exception as e:
         logger.warning("revenue goal (%s) runs on the node's own model: the "
                        "configured expert could not be read (%s)",
                        goal_type, type(e).__name__)
         return None
+
+
+def _org_goal(goal, db=None) -> bool:
+    """Is ``goal`` the node's own work, which the owner's expert credits are
+    for: seeded by the node (it names no owner), or owned by the node's
+    owner (core.event_attribution.person_for, so an agent row the owner
+    owns counts as the owner's)?
+
+    The policy above REVENUE_GOAL_TYPES is for an ORG goal that earns.  Any
+    signed-in account can create a goal of an earning type (POST /api/goals
+    names it created_by), and the daemon dispatches every active goal
+    whoever owns it, so without this a stranger's goal would spend the
+    owner's day cap (second review of 865afa851, M2).  Measured on central
+    2026-11-03: all 299 earning goals name no owner."""
+    from core.event_attribution import goal_owner_user_id, person_for
+    from integrations.agent_engine.capability_setup import setup_owner
+    uid = goal_owner_user_id(goal)
+    if uid is None:
+        return True
+    owner = setup_owner()
+    return bool(owner) and person_for(uid, db) == owner
 
 
 def is_genuine_user_request(request_id) -> bool:
@@ -1643,12 +1698,6 @@ def _dispatch_goal_turn(prompt: str, user_id: str, goal_id: str,
     except Exception as _lane_err:
         logger.debug(f"lane not registered for goal {goal_id}: {_lane_err}")
 
-    # ...and that lane's turn runs on the expert while the day cap allows
-    # (revenue_expert_config).  A caller that names its model (the daemon's
-    # escalation turn) keeps its own choice.
-    if model_config is None:
-        model_config = revenue_expert_config(goal_type)
-
     # BUDGET GATE: check goal budget + platform affordability before dispatch
     try:
         from integrations.agent_engine.budget_gate import pre_dispatch_budget_gate
@@ -1689,12 +1738,20 @@ def _dispatch_goal_turn(prompt: str, user_id: str, goal_id: str,
     # path; agent_daemon.py:1268 passes goal.to_dict() the same way, and
     # prompt-only here left those checks dormant for dispatch_goal.
     _guard_goal_dict = None
+    # The same read says whether the turn may use the owner's expert: the
+    # goal's OWN type, kept only for a goal that is the node's own
+    # (_org_goal).  The goal_type argument defaults to 'marketing', so a
+    # caller naming none would otherwise earn its turn the expert (second
+    # review of 865afa851, M2).  No row, or a row that cannot be read: None.
+    _expert_goal_type = None
     try:
         from integrations.social.models import db_session, AgentGoal
         with db_session(commit=False) as _gdb:
             _grow = _gdb.query(AgentGoal).filter_by(id=goal_id).first()
             if _grow is not None:
                 _guard_goal_dict = _grow.to_dict()
+                if _org_goal(_grow, _gdb):
+                    _expert_goal_type = _grow.goal_type
     except Exception as _gerr:
         logger.debug(f"Goal row unavailable for guardrail checks "
                      f"({goal_id}): {_gerr}")
@@ -1763,6 +1820,15 @@ def _dispatch_goal_turn(prompt: str, user_id: str, goal_id: str,
         else:
             _why_here = ('no coordinator' if not coordinator
                          else 'no other active node')
+
+    # A goal that earns runs the turn it runs HERE on the configured expert
+    # while the owner's cap and the expert's provider allow
+    # (revenue_expert_config).  Chosen after the hive routing above, which
+    # stays exactly as it was (review of 865afa851, M2).  A caller that names
+    # its model (the daemon's escalation turn) keeps its own choice.  Only
+    # the node's own goals, by their own type (_expert_goal_type above).
+    if model_config is None:
+        model_config = revenue_expert_config(_expert_goal_type)
 
     # NUMERIC prompt_id (same format as hart_intelligence_entry._next_prompt_id)
     # so it passes the isdigit() check in the adapter and /chat handler.
