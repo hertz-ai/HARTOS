@@ -3414,17 +3414,13 @@ def instantiate_assistant_agent(list_of_persona, user_prompt, personality=None, 
             )
         except Exception:
             pass
-    # Expert agent guidance — domain-specific prompt enhancement
-    _expert_block = ""
-    try:
-        from integrations.expert_agents import match_expert_for_context
-        _actions_text = str(user_tasks.get(user_prompt, Action("")).actions) if user_prompt in user_tasks else ""
-        _expert_match = match_expert_for_context(_actions_text)
-        if _expert_match:
-            _expert_block = _expert_match['prompt_block']
-            tool_logger.info(f"Expert match: {_expert_match['name']} (score={_expert_match['score']})")
-    except Exception:
-        pass
+    # No expert persona is matched onto the agent here.  A keyword match over
+    # the plan used to append "[Expert Guidance: <expert>]" to every CREATE
+    # agent's prompt (c77ad05d9); measured 2026-11-04 it gave Reel Studio
+    # (agent 342) "STEM Education Expert" because "each" is in "teaching".
+    # The agent opts into an expert when it needs one: consult_expert,
+    # registered on this leg (owner 2026-11-04, "opt in agentically when
+    # needed").
 
     if not _personality_block:
         try:
@@ -3571,7 +3567,7 @@ def instantiate_assistant_agent(list_of_persona, user_prompt, personality=None, 
         •Working Directory: {os.getcwd()}/ - CRITICAL: Always use os.path.join(os.getcwd(), filename) for file paths. NEVER use hardcoded absolute paths.
 
         •Reminder: If camera input is needed, ask the user to turn on their camera. All responses should be played via TTS with a talking-head animation.
-        """ + _personality_block + _expert_block + f"\nExtra Information: below are the list of actions the chat_manager is gonna give you keep this in mind but dont use this directly\n{user_tasks[user_prompt].actions}",
+        """ + _personality_block + f"\nExtra Information: below are the list of actions the chat_manager is gonna give you keep this in mind but dont use this directly\n{user_tasks[user_prompt].actions}",
         is_termination_msg=_is_terminate_msg,
     )
     return assistant
@@ -4962,6 +4958,21 @@ def _answer_the_pause(user_prompt, group_chat, where):
         where)
 
 
+def step_instruction(action_no, action_text, user_text) -> str:
+    """The line ChatInstructor sends to run one plan step:
+    'Execute Action N: <step> ,Latest User message: <the person's words>'.
+
+    It carries the step and the person's words, nothing matched to them.  It
+    used to append "[Expert Tip from <expert>]: Focus on <caps>", picked by
+    word matching over 96 personas (c77ad05d9); measured live 2026-11-04 on
+    Reel Studio (agent 342) every step said "[Expert Tip from STEM Education
+    Expert]: Focus on math, science" because "each" is in "teaching".  Owner
+    2026-11-04: an expert is opted into by the agent when it needs one (the
+    consult_expert tool), never put on every agent.
+    """
+    return f'Execute Action {action_no}: {action_text} ,Latest User message: {user_text}'
+
+
 def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
     """
     Handles the response generation process for an agent group.
@@ -5096,22 +5107,11 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             message = user_tasks[user_prompt].get_action(current_action_id - 1)
             current_state = get_action_state(user_prompt, current_action_id)
 
-            # Expert hint for current action (higher threshold — only inject on strong match)
-            _action_expert_hint = ""
-            try:
-                from integrations.expert_agents import match_expert_for_context
-                _action_match = match_expert_for_context(str(message), min_score=6)
-                if _action_match:
-                    _caps = ', '.join(c['name'] for c in _action_match['capabilities'][:2])
-                    _action_expert_hint = f"\n[Expert Tip from {_action_match['name']}]: Focus on {_caps}"
-            except Exception:
-                pass
-
-            message = f'Execute Action {user_tasks[user_prompt].current_action}: {message} '+f',Latest User message: {text}' + _action_expert_hint
+            message = step_instruction(user_tasks[user_prompt].current_action, message, text)
             _push_thinking(user_id, f'Executing action {user_tasks[user_prompt].current_action} of {_action_count}...')
             # No second publish here.  `message` at this point is the raw model
             # instruction — 'Execute Action N: <prompt> ,Latest User message:
-            # <...>' plus the [Expert Tip from ...] hint — and publishing it put
+            # <...>' — and publishing it put
             # the whole internal prompt in the user's thinking bubble, right
             # after the clean line above (task #649).  The user got two bubbles
             # per action: one readable, one internal.  The readable one already
@@ -6049,7 +6049,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     actions_prompt = user_tasks[user_prompt].get_action(_ca_pending - 1)
                     current_app.logger.info(f'[EXECUTE-PENDING] Starting action {_ca_pending} (attempt {_attempt}): {actions_prompt}')
                     safe_set_state(user_prompt, _ca_pending, ActionState.IN_PROGRESS, "executing pending action")
-                    _exec_msg = f'Execute Action {_ca_pending}: {actions_prompt} ,Latest User message: {text}'
+                    _exec_msg = step_instruction(_ca_pending, actions_prompt, text)
                     try:
                         result = chat_instructor.initiate_chat(
                             recipient=manager, message=_exec_msg, clear_history=False, silent=False)
