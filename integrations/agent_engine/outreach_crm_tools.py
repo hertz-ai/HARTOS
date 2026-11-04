@@ -205,14 +205,14 @@ def _send_error_text(result: Dict) -> str:
     return f"{sender} gave no reason"
 
 
-def _count_delivered(prospect: Dict, when: datetime):
-    """One more email reached ``prospect``."""
+def count_delivered(prospect: Dict, when: datetime):
+    """One more email reached ``prospect`` (it also moves updated_at)."""
     prospect['emails_sent'] = prospect.get('emails_sent', 0) + 1
     prospect['last_email_at'] = when.isoformat()
     prospect['updated_at'] = when.isoformat()
 
 
-def _retry_due(planned: Dict, now: datetime) -> bool:
+def retry_due(planned: Dict, now: datetime) -> bool:
     """May a planned email that was refused before be tried again now?"""
     after = planned.get('retry_after')
     if not after:
@@ -223,19 +223,60 @@ def _retry_due(planned: Dict, now: datetime) -> bool:
         return True
 
 
-def _note_refused(planned: Dict, result: Dict, now: datetime) -> bool:
-    """Record a refused send on a planned email.  Returns True when it is
-    given up ('failed') after OUTREACH_SEND_ATTEMPTS sends; otherwise the
-    next try waits OUTREACH_RETRY_WAIT times the tries so far."""
+def note_refused(planned: Dict, result: Dict, now: datetime, what: str) -> bool:
+    """Record and log a refused send of a planned email (``what`` names it
+    in the log: "Shop, follow-up step 2").  Returns True when it is given
+    up ('failed') after OUTREACH_SEND_ATTEMPTS sends; otherwise the next try
+    waits OUTREACH_RETRY_WAIT times the tries so far (1 h, then 2 h).
+
+    The one place a refusal is logged, so every path that sends a planned
+    email (the daemon's checker, a journey tick, an agent tool) leaves the
+    same WARNING (review of 6da8b09c7: the journey path logged nothing)."""
     planned['attempts'] = planned.get('attempts', 0) + 1
     planned['last_error'] = _send_error_text(result)
-    if planned['attempts'] >= OUTREACH_SEND_ATTEMPTS:
+    gave_up = planned['attempts'] >= OUTREACH_SEND_ATTEMPTS
+    if gave_up:
         planned['status'] = 'failed'
         planned.pop('retry_after', None)
-        return True
-    planned['retry_after'] = (
-        now + OUTREACH_RETRY_WAIT * planned['attempts']).isoformat()
-    return False
+    else:
+        planned['retry_after'] = (
+            now + OUTREACH_RETRY_WAIT * planned['attempts']).isoformat()
+    logger.warning("Outreach email NOT sent (%s), try %d of %d%s: %s",
+                   what, planned['attempts'], OUTREACH_SEND_ATTEMPTS,
+                   ', given up' if gave_up else
+                   ', next try after ' + planned['retry_after'],
+                   planned['last_error'])
+    return gave_up
+
+
+def undelivered_emails(data: Dict) -> List[Dict]:
+    """Every planned email in the store that was refused at least once: the
+    journey's first emails and the follow-up steps, waiting to be tried
+    again or given up.  What get_pipeline_status and view_journey_pipeline
+    show, so a given-up email is not seen only in the log (review of
+    6da8b09c7)."""
+    out = []
+    for pid, p in (data.get('prospects') or {}).items():
+        draft = p.get('email_draft')
+        if isinstance(draft, dict) and draft.get('attempts'):
+            out.append({'prospect_id': pid, 'company': p.get('company'),
+                        'email': 'first email',
+                        'attempts': draft['attempts'],
+                        'given_up': draft.get('status') == 'failed',
+                        'retry_after': draft.get('retry_after'),
+                        'last_error': draft.get('last_error')})
+    for seq in (data.get('sequences') or {}).values():
+        p = (data.get('prospects') or {}).get(seq.get('prospect_id'), {})
+        for step in seq.get('steps', []):
+            if step.get('attempts') and step.get('status') != 'sent':
+                out.append({'prospect_id': seq.get('prospect_id'),
+                            'company': p.get('company'),
+                            'email': f"follow-up step {step.get('step_number')}",
+                            'attempts': step['attempts'],
+                            'given_up': step.get('status') == 'failed',
+                            'retry_after': step.get('retry_after'),
+                            'last_error': step.get('last_error')})
+    return out
 
 
 def register_outreach_tools(helper, assistant, user_id: str):
@@ -339,7 +380,7 @@ def register_outreach_tools(helper, assistant, user_id: str):
         data['sent_log'].append(send_entry)
 
         # Update prospect state
-        _count_delivered(prospect, now)
+        count_delivered(prospect, now)
         if prospect['stage'] == 'new':
             prospect['stage'] = 'contacted'
 
@@ -389,7 +430,7 @@ def register_outreach_tools(helper, assistant, user_id: str):
                 'subject': step['subject'],
                 'body_html': step['body_html'],
                 # pending -> sent, or failed after OUTREACH_SEND_ATTEMPTS
-                # refused sends (_note_refused), which ends the sequence;
+                # refused sends (note_refused), which ends the sequence;
                 # a reply completes the whole sequence.
                 'status': 'pending',
                 'sent_at': None,
@@ -495,6 +536,8 @@ def register_outreach_tools(helper, assistant, user_id: str):
             'pipeline': pipeline,
             'total_prospects': len(data.get('prospects', {})),
             'active_sequences': active_sequences,
+            # Refused emails, waiting to be tried again or given up.
+            'not_delivered': undelivered_emails(data),
             'erxes_pipeline': erxes_status,
         })
 
@@ -742,7 +785,18 @@ def send_due_followups(data: Dict, now: datetime,
                 continue
 
             scheduled = datetime.fromisoformat(step['scheduled_at'])
-            if now >= scheduled and _retry_due(step, now):
+            if now >= scheduled and not retry_due(step, now):
+                # Refused before and waiting out its wait: said, so a
+                # check that sends nothing tells the agent why.
+                actions_taken.append({
+                    'action': 'followup_waiting',
+                    'prospect': prospect['company'],
+                    'step': step['step_number'],
+                    'attempts': step.get('attempts', 0),
+                    'retry_after': step.get('retry_after'),
+                    'error': step.get('last_error'),
+                })
+            elif now >= scheduled:
                 result = _send_email(
                     to_email=prospect['email'],
                     subject=step['subject'],
@@ -751,7 +805,7 @@ def send_due_followups(data: Dict, now: datetime,
                 if result.get('success'):
                     step['status'] = 'sent'
                     step['sent_at'] = now.isoformat()
-                    _count_delivered(prospect, now)
+                    count_delivered(prospect, now)
                     actions_taken.append({
                         'action': 'followup_sent',
                         'prospect': prospect['company'],
@@ -761,10 +815,13 @@ def send_due_followups(data: Dict, now: datetime,
                     })
                 else:
                     # Not sent: tried again after a wait, then given up
-                    # (_note_refused).  A step given up ends the sequence:
-                    # the address or the sender is not taking mail, and the
-                    # later steps would only be refused the same way.
-                    gave_up = _note_refused(step, result, now)
+                    # (note_refused, which logs it).  A step given up ends
+                    # the sequence: the address or the sender is not taking
+                    # mail, and the later steps would only be refused the
+                    # same way.
+                    gave_up = note_refused(
+                        step, result, now,
+                        f"{prospect['company']}, follow-up step {step['step_number']}")
                     if gave_up:
                         sequence['status'] = 'failed'
                     actions_taken.append({
@@ -857,14 +914,9 @@ def check_pending_followups_daemon() -> dict:
     result = json.loads(result_json)
     sent = len([a for a in result.get('actions', []) if a.get('action') == 'followup_sent'])
     for action in result.get('actions', []):
+        # A refused step is logged where it is refused (note_refused).
         if action.get('action') == 'followup_sent':
             logger.info(f"Follow-up sent: {action.get('prospect')} step {action.get('step')} subject='{action.get('subject')}'")
-        elif action.get('action') == 'followup_failed':
-            logger.warning("Follow-up NOT sent: %s step %s, attempt %s%s: %s",
-                           action.get('prospect'), action.get('step'),
-                           action.get('attempts'),
-                           ' (given up)' if action.get('gave_up') else '',
-                           action.get('error'))
         elif action.get('action') == 'sequence_completed':
             logger.info(f"Sequence completed: {action.get('prospect')} ({action.get('reason')})")
     return {'sent': sent, 'checked_at': result.get('checked_at', '')}

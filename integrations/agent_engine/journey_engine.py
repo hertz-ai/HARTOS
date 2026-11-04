@@ -553,9 +553,11 @@ class JourneyEngine:
     def _action_send_email(self, prospect: Dict, ctx: Dict) -> Dict:
         """Send the outreach email (the prospect's draft), once.  A refused
         send is tried again after a wait and then given up, by the same rule
-        as a follow-up step (outreach_crm_tools._note_refused): the draft
-        carries its tries.  Retried on every tick, a refused address was
-        mailed ~576 times a day (review of 1c4b2b650)."""
+        as a follow-up step (outreach_crm_tools.note_refused, which logs
+        it): the draft carries its tries, and get_pipeline_status /
+        view_journey_pipeline list it under not_delivered.  Retried on every
+        tick, a refused address was mailed ~576 times a day (review of
+        1c4b2b650)."""
         draft = prospect.get('email_draft')
         if not draft:
             return {'skipped': True, 'reason': 'no draft'}
@@ -565,22 +567,23 @@ class JourneyEngine:
 
         try:
             from integrations.agent_engine.outreach_crm_tools import (
-                _count_delivered, _note_refused, _retry_due, _send_email)
+                _send_email, count_delivered, note_refused, retry_due)
             if draft.get('status') == 'failed':
                 return {'skipped': True, 'reason': 'given up',
                         'error': draft.get('last_error')}
             now = datetime.utcnow()
-            if not _retry_due(draft, now):
+            if not retry_due(draft, now):
                 return {'skipped': True, 'reason': 'waiting to try again',
                         'retry_after': draft.get('retry_after')}
             result = _send_email(prospect['email'], draft['subject'], draft['body'])
             # 'via' names the sender on a refused send too: only success
             # counts as sent.
             if result.get('success'):
-                _count_delivered(prospect, now)
+                count_delivered(prospect, now)
                 prospect['stage'] = 'contacted'
                 return {'sent': True, 'result': result}
-            gave_up = _note_refused(draft, result, now)
+            gave_up = note_refused(draft, result, now,
+                                   f"{prospect.get('company', '?')}, first email")
         except Exception as e:
             return {'error': str(e)}
 
@@ -712,8 +715,11 @@ def register_journey_tools(helper, assistant, user_id: str):
     engine = get_journey_engine()
 
     def view_journey_pipeline() -> str:
-        """View the full prospect journey pipeline with stage counts and A/B stats."""
-        from integrations.agent_engine.outreach_crm_tools import _load_prospects
+        """View the full prospect journey pipeline with stage counts, A/B
+        stats, and the emails that were refused (waiting to be tried again
+        or given up)."""
+        from integrations.agent_engine.outreach_crm_tools import (
+            _load_prospects, undelivered_emails)
         data = _load_prospects()
         prospects = data.get('prospects', {})
 
@@ -735,6 +741,7 @@ def register_journey_tools(helper, assistant, user_id: str):
             'pipeline': {k: {'count': len(v), 'prospects': v} for k, v in pipeline.items()},
             'total': len(prospects),
             'ab_test': ab,
+            'not_delivered': undelivered_emails(data),
         }, default=str)
 
     def advance_prospect_stage(
@@ -892,17 +899,24 @@ def _build_sales_prompt(goal_dict: Dict, product_dict: Dict = None) -> str:
         verticals[v] = verticals.get(v, 0) + 1
     vertical_text = ', '.join('%s(%d)' % (v, c) for v, c in sorted(verticals.items(), key=lambda x: -x[1]))
 
-    # Pending follow-ups
+    # Pending follow-ups.  Overdue = due and not waiting out a refused
+    # send's wait (outreach_crm_tools.retry_due): a waiting step is not one
+    # the agent can send now, and counting it told the agent to investigate
+    # while check_pending_followups had nothing to send (review of
+    # 6da8b09c7).  The waiting step is still pending.
+    from integrations.agent_engine.outreach_crm_tools import retry_due
     pending_followups = 0
     overdue_followups = 0
-    now_iso = datetime.utcnow().isoformat()
+    now = datetime.utcnow()
+    now_iso = now.isoformat()
     for seq in sequences.values():
         if seq.get('status') != 'active':
             continue
         for step in seq.get('steps', []):
             if step.get('status') == 'pending':
                 pending_followups += 1
-                if step.get('scheduled_at', '9999') < now_iso:
+                if (step.get('scheduled_at', '9999') < now_iso
+                        and retry_due(step, now)):
                     overdue_followups += 1
 
     # Stale prospects (no activity > 7 days)

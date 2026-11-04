@@ -211,23 +211,26 @@ def test_a_follow_up_that_failed_stays_due_and_is_not_counted(channels, store, n
     assert data['prospects']['p1']['emails_sent'] == 1
 
 
-def test_a_follow_up_that_keeps_failing_ends_its_sequence(channels, store, no_mailer, no_wait):
+@pytest.mark.parametrize('steps', [1, 2])
+def test_a_follow_up_that_keeps_failing_ends_its_sequence(channels, store, no_mailer, no_wait, steps):
     """Given up after OUTREACH_SEND_ATTEMPTS refused sends, and the later
     step is not sent to the same refusing address (review of 1c4b2b650:
-    3 steps cost 9 refused sends and ended 'completed')."""
+    3 steps cost 9 refused sends and ended 'completed').  A one-step
+    sequence ends 'failed' too, not 'completed' as if it had been sent."""
     email = _EmailChannel(ok=False, error='550 mailbox unavailable')
     channels.registry.register(email)
-    _due_sequence(store, steps=2)
+    _due_sequence(store, steps=steps)
 
     for _ in range(10):
         store.check_pending_followups_daemon()
 
     data = store._load_prospects()
-    first, second = data['sequences']['s1']['steps']
+    first = data['sequences']['s1']['steps'][0]
     assert first['status'] == 'failed'
     assert first['attempts'] == _tries(store)
     assert '550' in first['last_error']
-    assert second['status'] == 'pending' and 'attempts' not in second
+    for later in data['sequences']['s1']['steps'][1:]:
+        assert later['status'] == 'pending' and 'attempts' not in later
     assert data['sequences']['s1']['status'] == 'failed'
     assert len(email.emails) == _tries(store)
 
@@ -390,3 +393,151 @@ def test_a_delivered_follow_up_goes_out_once_from_the_journey_tick(channels, sto
     data = store._load_prospects()
     assert data['sequences']['s1']['steps'][0]['status'] == 'sent'
     assert data['prospects']['p1']['emails_sent'] == 2
+
+
+def _journey_tools(store, monkeypatch):
+    """The journey tools exactly as register_journey_tools builds them."""
+    from core import labeled_autogen_function
+    from integrations.agent_engine.journey_engine import register_journey_tools
+    tools = {}
+    monkeypatch.setattr(labeled_autogen_function, 'register_labeled_function',
+                        lambda func, **kw: tools.__setitem__(func.__name__, func))
+    register_journey_tools(object(), object(), 'owner-1')
+    return tools
+
+
+def test_the_run_journey_tick_tool_sends_a_delivered_step_once(channels, store, no_mailer, monkeypatch):
+    """Review of 6da8b09c7: drop store=data from run_journey_tick and the
+    tool's older copy puts the delivered step back to pending."""
+    email = _EmailChannel(ok=True)
+    channels.registry.register(email)
+    _nurture_pipeline(store)
+    tools = _journey_tools(store, monkeypatch)
+
+    for _ in range(3):
+        tools['run_journey_tick']()
+
+    assert [s for _, s in email.emails] == ['bump 2']
+
+
+def test_the_advance_prospect_stage_tool_sends_a_delivered_step_once(channels, store, no_mailer, monkeypatch):
+    """Review of 6da8b09c7: drop store=data from advance_prospect_stage and
+    the step it sends on entering nurture goes out again on the next tick."""
+    email = _EmailChannel(ok=True)
+    channels.registry.register(email)
+    _due_sequence(store, journey_stage='outreach',
+                  last_email_at=datetime.utcnow().isoformat())
+    tools = _journey_tools(store, monkeypatch)
+
+    moved = json.loads(tools['advance_prospect_stage']('p1', 'nurture'))
+    tools['run_journey_tick']()
+
+    assert moved['moved'] is True
+    assert [s for _, s in email.emails] == ['bump 2']
+
+
+@pytest.fixture
+def warned(store, monkeypatch):
+    """The outreach log's WARNING lines."""
+    lines = []
+    monkeypatch.setattr(store.logger, 'warning',
+                        lambda msg, *a, **k: lines.append(msg % a if a else msg))
+    return lines
+
+
+def test_a_given_up_first_email_is_logged_and_listed(channels, store, no_mailer, no_wait, warned, monkeypatch):
+    """Review of 6da8b09c7: a given-up first email reached no log, and every
+    read the agent has still showed the prospect as contacted with nothing
+    wrong."""
+    from integrations.agent_engine.journey_engine import journey_daemon_tick
+    channels.registry.register(_EmailChannel(ok=False, error='550 mailbox unavailable'))
+    _outreach_prospect(store)
+
+    for _ in range(3):
+        journey_daemon_tick()
+
+    assert any('first email' in w and 'given up' in w and '550' in w for w in warned), warned
+    for listed in (
+            json.loads(_tools(store, monkeypatch)['get_pipeline_status']())['not_delivered'],
+            json.loads(_journey_tools(store, monkeypatch)['view_journey_pipeline']())['not_delivered']):
+        assert [(e['prospect_id'], e['email'], e['given_up']) for e in listed] == [
+            ('p1', 'first email', True)], listed
+
+
+def test_a_follow_up_given_up_on_the_journey_path_is_logged(channels, store, no_mailer, no_wait, warned):
+    """Review of 6da8b09c7: the journey tick's checks logged nothing; only
+    the daemon checker's wrapper did."""
+    from integrations.agent_engine.journey_engine import journey_daemon_tick
+    channels.registry.register(_EmailChannel(ok=False, error='550 mailbox unavailable'))
+    _nurture_pipeline(store)
+
+    for _ in range(3):
+        journey_daemon_tick()
+
+    refused = [w for w in warned if 'follow-up step 2' in w]
+    assert len(refused) == _tries(store), warned
+    assert 'given up' in refused[-1]
+
+
+def test_a_waiting_step_is_reported_and_is_not_overdue(channels, store, no_mailer):
+    """Review of 6da8b09c7: while a refused step waited, the check returned
+    nothing and the sales prompt still counted it overdue and told the agent
+    to investigate."""
+    from integrations.agent_engine.journey_engine import _build_sales_prompt
+    channels.registry.register(_EmailChannel(ok=False, error='451 try later'))
+    _due_sequence(store)
+    store.check_pending_followups_daemon()
+
+    checked = json.loads(store._check_pending_followups_impl())
+
+    waiting = [a for a in checked['actions'] if a['action'] == 'followup_waiting']
+    assert [(a['step'], a['attempts']) for a in waiting] == [(2, 1)], checked
+    assert waiting[0]['retry_after'] and '451' in waiting[0]['error']
+    assert 'Pending follow-ups: 1 (overdue: 0)' in _build_sales_prompt({})
+
+
+def test_the_wait_grows_with_each_refused_try(channels, store, no_mailer):
+    """1 h after the first refusal, 2 h after the second."""
+    channels.registry.register(_EmailChannel(ok=False, error='451 try later'))
+    _due_sequence(store)
+    waits = []
+    for _ in range(2):
+        before = datetime.utcnow()
+        store.check_pending_followups_daemon()
+        data = store._load_prospects()
+        step = data['sequences']['s1']['steps'][0]
+        waits.append(datetime.fromisoformat(step['retry_after']) - before)
+        step['retry_after'] = (datetime.utcnow() - timedelta(seconds=1)).isoformat()
+        store._save_prospects(data)
+
+    assert [round(w.total_seconds() / 3600) for w in waits] == [1, 2], waits
+
+
+def test_a_mailer_refusal_says_what_the_mailer_answered(channels, store, monkeypatch):
+    """No email channel: the mailer answers 500, and the step keeps that."""
+    from core import http_pool
+    monkeypatch.setattr(http_pool, 'pooled_post', lambda *a, **k: SimpleNamespace(
+        status_code=500, json=lambda: {}, text=''))
+    _due_sequence(store)
+
+    store.check_pending_followups_daemon()
+
+    step = store._load_prospects()['sequences']['s1']['steps'][0]
+    assert step['last_error'] == 'mailer_service answered 500'
+
+
+def test_a_journey_tick_sends_only_its_nurture_prospects_steps(channels, store, no_mailer):
+    """A prospect outside the journey's nurture stage is the daemon
+    checker's: a nurture prospect's check does not send its steps."""
+    from integrations.agent_engine.journey_engine import journey_daemon_tick
+    email = _EmailChannel(ok=True)
+    channels.registry.register(email)
+    data = _due_sequence(store)                     # p1: stage 'contacted'
+    data['prospects']['p2'] = dict(data['prospects']['p1'], id='p2',
+                                   journey_stage='nurture',
+                                   last_email_at=datetime.utcnow().isoformat())
+    store._save_prospects(data)
+
+    journey_daemon_tick()
+
+    assert email.emails == []
