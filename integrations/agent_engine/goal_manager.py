@@ -195,7 +195,7 @@ _PRODUCT_KEYWORD_CAP = 60
 
 def product_fields(product_dict) -> Optional[Dict]:
     """A Product row's fields as goal prompts show them, or None when there
-    is no row or it names no product.
+    is no row (not a dict, or an empty one).
 
     The one reader of a Product row for prompts (the marketing and sales
     builders).  Every field comes back as text, cleaned and capped by
@@ -204,8 +204,11 @@ def product_fields(product_dict) -> Optional[Dict]:
     split, anything else none.  Keywords are not type-checked when a row is
     written, and a number there crashed the prompt (review of 44f21b312:
     keywords 7 raised TypeError; a text came out letter by letter);
-    'is_platform_product' as a bool."""
-    if not isinstance(product_dict, dict):
+    'is_platform_product' as a bool.  A row whose name is blank is still
+    its owner's product ('name' comes back ''): the API refuses a blank
+    name now, but an older row was marketed as the owner's (review of
+    d2ad38b22)."""
+    if not isinstance(product_dict, dict) or not product_dict:
         return None
     out = {}
     for key, cap in _PRODUCT_FIELD_CAPS.items():
@@ -213,8 +216,6 @@ def product_fields(product_dict) -> Optional[Dict]:
         if value is None or isinstance(value, (dict, list, tuple, set, bool)):
             value = ''
         out[key] = _sanitize_goal_input(str(value), max_length=cap).strip()
-    if not out['name']:
-        return None
     raw = product_dict.get('keywords')
     if isinstance(raw, str):
         raw = raw.split(',')
@@ -1013,16 +1014,22 @@ def _build_marketing_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None
     product = product_fields(product_dict)
     if product:
         is_platform_product = product['is_platform_product']
+        # The two defaults apply only when the row has no such key, as
+        # before product_fields: a row the API wrote with a blank audience
+        # shows it blank (review of d2ad38b22).
+        audience = (product['target_audience'] if 'target_audience' in product_dict
+                    else 'everyone who wants a better life')
+        category = product['category'] if 'category' in product_dict else 'platform'
         product_section = (
             f"PRODUCT YOU ARE MARKETING:\n"
             f"  Name: {product['name']}\n"
             f"  Description: {product['description']}\n"
             f"  Tagline: {product['tagline']}\n"
-            f"  Target audience: {product['target_audience'] or 'everyone who wants a better life'}\n"
+            f"  Target audience: {audience}\n"
             f"  Unique value: {product['unique_value_prop']}\n"
             f"  Product URL: {product['product_url']}\n"
             f"  Keywords: {', '.join(product['keywords'])}\n"
-            f"  Category: {product['category'] or 'platform'}\n\n"
+            f"  Category: {category}\n\n"
         )
     else:
         # No specific product — marketing the platform itself

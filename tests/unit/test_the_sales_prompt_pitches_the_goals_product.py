@@ -225,7 +225,173 @@ def test_a_product_with_only_a_name_still_reads_whole(store):
     assert '%(' not in prompt
 
 
-def test_a_product_with_no_name_is_no_product(store):
-    """A product dict without a name cannot be pitched: the default stays."""
-    assert _prompt('sales', {'name': '  ', 'description': 'x'}) == _prompt('sales')
+def test_no_product_row_keeps_the_default(store):
+    """No row (None) or an empty one: the default pitch, as before."""
     assert _prompt('sales', json.loads('null')) == _prompt('sales')
+    assert _prompt('sales', {}) == _prompt('sales')
+
+
+# ── review of d2ad38b22 ─────────────────────────────────────────────────
+#
+# The flag that makes a product HevolveAI's own (its sales prompt is signed
+# by HevolveAI's founder) was writable by any signed-in person on POST and
+# PUT; a row with a blank name was marketed as the HART platform; and the
+# marketing block's two defaults moved from 'key missing' to 'value blank'.
+# These drive the real product routes (agent_engine_bp) over SQLite, then
+# build the prompts from the row the route stored.
+
+REMOTE = {'REMOTE_ADDR': '203.0.113.7'}
+TOKEN = {'Authorization': 'Bearer t'}
+
+
+@pytest.fixture
+def api(monkeypatch):
+    """The product routes on a fresh SQLite database; ``api.as_(user)``
+    signs the next requests in as that user."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from flask import Flask
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+
+    from integrations.agent_engine.api import agent_engine_bp
+    from integrations.social.models import Base
+
+    for var in ('TRUSTED_PROXY', 'NUNBA_CI', 'HEVOLVE_TRUST_KONG',
+                'HEVOLVE_CLOUD_MODE'):
+        monkeypatch.delenv(var, raising=False)
+    eng = create_engine('sqlite://', connect_args={'check_same_thread': False},
+                        poolclass=StaticPool)
+    Base.metadata.create_all(eng)
+    maker = sessionmaker(bind=eng)
+    app = Flask(__name__)
+    app.config['TESTING'] = True
+    app.register_blueprint(agent_engine_bp)
+    client = app.test_client()
+
+    def as_(uid, role='flat', is_admin=False):
+        user = SimpleNamespace(id=uid, role=role, is_admin=is_admin,
+                               is_banned=False)
+        return patch('integrations.social.auth._get_user_from_token',
+                     side_effect=lambda token: (user, maker()))
+
+    def row(product_id):
+        from integrations.social.models import Product
+        db = maker()
+        try:
+            return db.query(Product).filter_by(id=product_id).first().to_dict()
+        finally:
+            db.close()
+
+    with patch('integrations.social.models.get_db', side_effect=lambda: maker()):
+        yield SimpleNamespace(client=client, as_=as_, row=row, maker=maker)
+
+
+def _post(api, body):
+    return api.client.post('/api/marketing/products', json=body,
+                           headers=TOKEN, environ_base=REMOTE)
+
+
+def _put(api, product_id, body):
+    return api.client.put(f'/api/marketing/products/{product_id}', json=body,
+                          headers=TOKEN, environ_base=REMOTE)
+
+
+def test_a_person_cannot_make_their_product_hevolveais(store, api):
+    """FAILS BEFORE THE FIX: a plain signed-in person's POST stored
+    is_platform_product True, and the sales prompt for the row signed it
+    as HevolveAI's founder."""
+    with api.as_('u-1'):
+        r = _post(api, dict(GROCERY, is_platform_product=True))
+    assert r.status_code == 201, r.get_json()
+    stored = api.row(r.get_json()['product']['id'])
+
+    assert stored['is_platform_product'] is False
+    prompt = _prompt('sales', stored)
+    assert 'Creator: Sathish' not in prompt and 'founder' not in prompt
+    assert '- Sign as: the McGroce team / https://example.test/mcgroce' in prompt
+
+
+def test_a_person_cannot_flag_or_give_away_their_product_by_put(store, api):
+    """FAILS BEFORE THE FIX: PUT wrote every key of the body onto the row
+    (setattr for any column): the flag, and the owner too."""
+    with api.as_('u-1'):
+        pid = _post(api, GROCERY).get_json()['product']['id']
+        r = _put(api, pid, {'is_platform_product': True, 'owner_id': 'u-2',
+                            'tagline': 'fresh every morning'})
+    assert r.status_code == 200, r.get_json()
+    stored = api.row(pid)
+
+    assert stored['is_platform_product'] is False
+    assert stored['owner_id'] == 'u-1'
+    assert stored['tagline'] == 'fresh every morning'
+
+
+def test_the_steward_marks_a_product_as_hevolveais(store, api):
+    """The steward (holds_central_role) still sets the flag, on POST and
+    on PUT, and HevolveAI then signs the prompt."""
+    with api.as_('steward', role='central'):
+        made = _post(api, dict(GROCERY, is_platform_product=True))
+        pid = made.get_json()['product']['id']
+        plain = _post(api, GROCERY).get_json()['product']['id']
+        _put(api, plain, {'is_platform_product': True})
+
+    assert api.row(pid)['is_platform_product'] is True
+    assert api.row(plain)['is_platform_product'] is True
+    assert 'Creator: Sathish, founder of HevolveAI' in _prompt('sales', api.row(pid))
+
+
+@pytest.mark.parametrize('name', ['', '   ', None])
+def test_a_blank_name_is_refused(store, api, name):
+    """FAILS BEFORE THE FIX for '   ' on POST and for any blank name on PUT:
+    a row with a blank name was stored."""
+    from integrations.social.models import Product
+    with api.as_('u-1'):
+        posted = _post(api, dict(GROCERY, name=name))
+        pid = _post(api, GROCERY).get_json()['product']['id']
+        put = _put(api, pid, {'name': name})
+
+    assert posted.status_code == 400
+    assert put.status_code == 400
+    assert api.row(pid)['name'] == 'McGroce'
+    db = api.maker()
+    try:
+        assert db.query(Product).count() == 1
+    finally:
+        db.close()
+
+
+def test_a_row_with_no_audience_shows_none_in_marketing(store, api):
+    """The API stores '' for an audience it was not given, and the
+    category it was sent.  FAILS BEFORE THE FIX: marketing showed
+    'everyone who wants a better life' and 'platform' for them.  A row
+    with no such key at all keeps both defaults, as before."""
+    with api.as_('u-1'):
+        pid = _post(api, {'name': 'SpeakEasy', 'category': ''}).get_json()['product']['id']
+    stored = _prompt('marketing', api.row(pid))
+    keyless = _prompt('marketing', {'name': 'SpeakEasy'})
+
+    assert '  Target audience: \n' in stored
+    assert '  Category: \n' in stored
+    assert '  Target audience: everyone who wants a better life\n' in keyless
+    assert '  Category: platform\n' in keyless
+
+
+def test_an_older_row_with_a_blank_name_is_still_its_owners_product(store):
+    """A row stored before the API refused blank names.  FAILS BEFORE THE
+    FIX: marketing promoted the HART platform and sales pitched HARTOS for
+    robotics in its place."""
+    row = dict(GROCERY, name='  ')
+    marketing = _prompt('marketing', row)
+    sales = _prompt('sales', row)
+
+    assert 'PRODUCT YOU ARE MARKETING:\n  Name: \n' in marketing
+    assert 'marketing the HART platform itself' not in marketing
+    assert 'You are the sales agent for this product.' in sales
+    assert 'Groceries from the corner shop to your door in 30 minutes' in sales
+    assert ('- Sign as: the team behind this product / '
+            'https://example.test/mcgroce') in sales
+    for wrong in NOT_FOR_A_PRODUCT:
+        assert wrong not in sales, wrong

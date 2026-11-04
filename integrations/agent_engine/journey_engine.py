@@ -952,7 +952,11 @@ def _sales_pitch(product_dict: Optional[Dict]) -> Dict:
     p = product_fields(product_dict)
     if p is None:
         return dict(_HARTOS_PITCH)
-    name, url, keywords = p['name'], p['product_url'], p['keywords']
+    # A row with a blank name is still its owner's product, never HARTOS
+    # (review of d2ad38b22); the prompt calls it 'this product'.
+    name = p['name'] or 'this product'
+    team = f"the {p['name']} team" if p['name'] else 'the team behind this product'
+    url, keywords = p['product_url'], p['keywords']
     block = [f'PRODUCT: {name}', '=' * 60]
     for label, key in (('What it is', 'description'), ('In one line', 'tagline'),
                        ('Who it is for', 'target_audience'),
@@ -994,9 +998,9 @@ def _sales_pitch(product_dict: Optional[Dict]) -> Dict:
             'creator_line': f'Selling for: {name}, on behalf of its owner\n',
             'replies_line': '',
             'website_line': f'Website: {url}\n' if url else '',
-            'voice_line': f'- Sound like a real person from the {name} team, '
+            'voice_line': f'- Sound like a real person from {team}, '
                           f'not a bot or marketer',
-            'signature_line': f'- Sign as: the {name} team' + (f' / {url}' if url else ''),
+            'signature_line': f'- Sign as: {team}' + (f' / {url}' if url else ''),
         })
     return pitch
 
