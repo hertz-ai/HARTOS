@@ -241,8 +241,8 @@ ready for his ball practice."
   emoji the messages carried). The turn's reply praised "Ba" the same way.
 - MEASURED (`agent_system.log`, session `10202_1793359802508`): the turn saved
   `last_attempt` "Ba" at 12:07:27 and "ba" at 12:08:59, though nobody made an attempt in
-  this conversation, and the agent's next session read it: at 17:05:56 the next walk of
-  this agent called `get_data_by_key` `last_attempt` and got "ba" (same log and session).
+  this conversation, and the agent's next walk read it: at 17:05:56 that walk called
+  `get_data_by_key` `last_attempt` and got "ba" (same log, same session tag).
 - The same praise of an attempt nobody made as on 2 Nov (docs/VERIFICATION.md, its
   Syllable Coach row); the walk was not the same: in 2 Nov's second turn action 3 gave up
   and actions 4 to 9 were never reached, here all nine ran inside the one turn without
@@ -258,18 +258,18 @@ ready for his ball practice."
     agents are saved from now on, not the Syllable Coach's order saved on 30 Oct.
   - Nothing addresses the cross-session read.
   At this 11:57 run fd4a8c353 was not installed: the installed reuse, create and
-  lifecycle files hash-matched b599e7f98 (review), which does not contain it. For
-  cdeca7500 that check proves nothing, since it did not cover
-  `hart_intelligence_entry.py`, the file cdeca7500 changes; the build last recorded before
-  this run (docs/VERIFICATION.md's 2 Nov row: HARTOS 1b6e34f42, with only those three
-  files hot-swapped to b599e7f98) does
-  not contain it either, but which `hart_intelligence_entry.py` ran at 11:57 was not
-  measured. A newer build was installed after this run (its `BUILD_INFO.txt`: built
-  2026-11-03T09:41:20Z, i.e. 15:11 IST, HARTOS e7cbc5d36, a sha the main clone does not
-  hold). Read on 5 Nov: cdeca7500's `_approved_plan_response` is in the python-embed copy
-  of `hart_intelligence_entry.py` and not in the install-root copy (the review of
-  0d6062424 also found it in the `.pyc` and `library.zip` copies); fd4a8c353's helpers
-  are in neither installed `reuse_recipe.py`. Which copy runs was not measured.
+  lifecycle files hash-matched b599e7f98 (review), which does not contain it. That check
+  did not cover `hart_intelligence_entry.py`, the file cdeca7500 changes. The 31 Oct
+  17:07 IST hot-swap to b599e7f98 (166 files; its manifest, read on 5 Nov, carries
+  b599e7f98's `hart_intelligence_entry.py` for all three installed copies, two `.py` and
+  one `.pyc`) put a copy without cdeca7500 on the desktop, and no swap recorded between
+  then and this run touched that file (review); it was not hashed at 11:57. A newer build
+  was installed after this run (its `BUILD_INFO.txt`: built 2026-11-03T09:41:20Z, i.e.
+  15:11 IST, HARTOS e7cbc5d36, a sha the main clone does not hold). Read on 5 Nov:
+  cdeca7500's `_approved_plan_response` is in the python-embed copy of
+  `hart_intelligence_entry.py` and not in the install-root copy (the review of 0d6062424
+  also found it in the `.pyc` and `library.zip` copies); fd4a8c353's helpers are in
+  neither installed `reuse_recipe.py`. Which copy runs was not measured.
 - NOT RUN: the child's attempt and the same words in Hindi, the two turns planned next;
   the owner was at the desk, so the runner stopped.
 
@@ -289,14 +289,14 @@ the chat-create path with autonomous creation, request `msg_1793687224401_create
   deleting it is the owner's call.
 - (review) Between the force-approve and the save a third `gather_info` model call ran,
   so the 13 saved actions are a re-emitted answer, not shown to be the refinement that was
-  force-approved: the defect cdeca7500 fixes (whether it was installed at this run was
-  not measured; above). No round-1 file was staged.
+  force-approved: the defect cdeca7500 fixes; by the swap record above it was not on the
+  desktop at this run (not hashed then). No round-1 file was staged.
 - MEASURED (`agent_system.log`, session `10202_1793687224400`): the run did not end at
   the save. The same session went on to call `save_to_long_term_memory` (11:59:46), asked
   the person once for a video file through `ask_person` (a `reel_source` file request,
   11:59:54), read that same ask again by its id at 12:01:02 (still waiting for the person
-  both times), and sent three messages
-  (`send_message_to_user`, 12:02:29, 12:03:36, 12:04:55). Three `get_user_camera_inp`
+  both times), and sent three messages (`send_message_to_user`, 12:02:29, 12:03:36,
+  12:04:55). Three `get_user_camera_inp`
   calls failed with "No camera frame" at 12:01:48, 12:03:04 and 12:04:17 (those error
   lines name no session).
 - (review) The three messages reached user 10202's two clients; the same request ran
