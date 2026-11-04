@@ -874,8 +874,11 @@ def register_sales_goal_type():
         logger.error('Failed to register sales goal type: %s', e)
 
 
-#: What the sales prompt says about the product when the goal names none:
-#: the HARTOS-for-robotics pitch it always carried, word for word.
+#: What the sales prompt says when the goal names no product: the
+#: HARTOS-for-robotics pitch it always carried, word for word (every
+#: product-dependent line of the template is a key here).  A named product
+#: replaces every one of them (_sales_pitch); the HevolveAI seller lines
+#: (_SELLER_KEYS) stay only for HevolveAI's own products.
 _HARTOS_PITCH = {
     'product_section': """PRODUCT: HARTOS (Hevolve Hive Agentic Runtime OS)
 ============================================================
@@ -910,36 +913,92 @@ Partnership offer:
     'pains': '   - Look for pain points HARTOS solves (latency, offline ops, multi-sensor fusion)',
     'name': 'HARTOS',
     'topic': 'on-device AI',
-    'value_step': 'Hive network value',
     'search_hint': 'find new robotics companies',
+    'agent_line': 'You are the HARTOS Sales & Marketing Agent.',
+    'creator_line': 'Creator: Sathish, founder of HevolveAI\n',
+    'replies_line': 'Replies go to: sathish@hertzai.com\n',
+    'website_line': 'Website: https://hevolve.ai\n',
+    'discover': '   - Use google_search to find companies in underrepresented verticals\n   - Call create_prospect() for each new company found\n   - Include: company name, info@domain email, vertical, product description',
+    'template_a': '     Body: reference their product > what HARTOS does > teams in {vertical}\n           testing it > one slot per vertical > worth a 15-min call?',
+    'template_b': '     Body: what caught your attention > HARTOS pitch > Hive network value >\n           one slot per vertical for Q2 > open to a quick chat?',
+    'crm_line': '  Board: HARTOS Sales | Pipeline: Robotics Outreach',
+    'voice_line': '- Sound like a real human founder, not a bot or marketer',
+    'subject_example': 'digit',
+    'signature_line': '- Sign as: sathish / founder, HevolveAI / hevolve.ai',
 }
+
+
+#: The lines that say who sells and signs: HevolveAI's for its own products
+#: (Product.is_platform_product) and for the default pitch, never for a
+#: product someone else owns (review of 44f21b312: a third party's product
+#: was pitched in emails signed as HevolveAI's founder).
+_SELLER_KEYS = ('creator_line', 'replies_line', 'website_line', 'voice_line',
+                'signature_line')
 
 
 def _sales_pitch(product_dict: Optional[Dict]) -> Dict:
     """The product-dependent parts of the sales prompt: the goal's own
-    product (outreach_crm_tools.product_pitch) when it names one, else the
-    HARTOS-for-robotics pitch (_HARTOS_PITCH).  Every value is text the
+    product when it names one, else the HARTOS-for-robotics pitch
+    (_HARTOS_PITCH), word for word.
+
+    The product's fields come from goal_manager.product_fields, the one
+    reader of a Product row (cleaned, capped, keywords of any shape).  For
+    a product, no line carries the HARTOS pitch's robotics framing, its
+    one-slot-per-vertical scarcity or its Q2 deadline (review of 44f21b312:
+    they were still in every product prompt).  Every value is text the
     prompt shows as it is (a '%' in one is safe: % formatting does not
     re-read the text it puts in)."""
-    from integrations.agent_engine.outreach_crm_tools import product_pitch
-    pitch = product_pitch(product_dict)
-    if pitch is None:
+    from integrations.agent_engine.goal_manager import product_fields
+    p = product_fields(product_dict)
+    if p is None:
         return dict(_HARTOS_PITCH)
-    name = pitch['name']
-    first, _, rest = pitch['block'].partition('\n')
-    who = pitch['audience'] or (
-        'the people and businesses who need it' + (
-            f" ({', '.join(pitch['keywords'])})" if pitch['keywords'] else ''))
-    return {
-        'product_section': first + '\n' + '=' * 60 + ('\n' + rest if rest else ''),
+    name, url, keywords = p['name'], p['product_url'], p['keywords']
+    block = [f'PRODUCT: {name}', '=' * 60]
+    for label, key in (('What it is', 'description'), ('In one line', 'tagline'),
+                       ('Who it is for', 'target_audience'),
+                       ('Why it is better', 'unique_value_prop'),
+                       ('Link', 'product_url'), ('Category', 'category')):
+        if p[key]:
+            block.append(f'  - {label}: {p[key]}')
+    if keywords:
+        block.append(f"  - Keywords: {', '.join(keywords)}")
+    who = p['target_audience'] or (
+        'the people and businesses who need it'
+        + (f" ({', '.join(keywords)})" if keywords else ''))
+    pitch = {
+        'product_section': '\n'.join(block),
         'targets': f'   - Target the people and businesses {name} is for: {who}',
         'pains': f'   - Look for pain points {name} solves'
-                 + (f' ({pitch["value"]})' if pitch['value'] else ''),
+                 + (f" ({p['unique_value_prop']})" if p['unique_value_prop'] else ''),
         'name': name,
         'topic': name,
-        'value_step': f'why {name} is better for them',
         'search_hint': f'find people and businesses who need {name}',
+        'agent_line': f'You are the sales agent for {name}.',
+        'discover': ('   - Use google_search to find the organisations that reach them: '
+                     'the businesses,\n     groups, communities and services they '
+                     'already use\n'
+                     '   - Call create_prospect() for each one found\n'
+                     '   - Include: its name, its public contact email, the kind of '
+                     'organisation as vertical, what it does'),
+        'template_a': (f'     Body: reference what they do > what {name} does > '
+                       f'why it helps them\n           > worth a 15-min call?'),
+        'template_b': (f'     Body: what caught your attention > {name} pitch > '
+                       f'why {name} is better for them\n           > open to a quick chat?'),
+        'crm_line': "  Board: HARTOS Sales | Pipeline: this node's deal pipeline",
+        'subject_example': (keywords[0] if keywords else name).lower(),
     }
+    if p['is_platform_product']:
+        pitch.update({k: _HARTOS_PITCH[k] for k in _SELLER_KEYS})
+    else:
+        pitch.update({
+            'creator_line': f'Selling for: {name}, on behalf of its owner\n',
+            'replies_line': '',
+            'website_line': f'Website: {url}\n' if url else '',
+            'voice_line': f'- Sound like a real person from the {name} team, '
+                          f'not a bot or marketer',
+            'signature_line': f'- Sign as: the {name} team' + (f' / {url}' if url else ''),
+        })
+    return pitch
 
 
 def _sales_goal_section(goal_dict: Dict) -> str:
@@ -1035,17 +1094,14 @@ def _build_sales_prompt(goal_dict: Dict, product_dict: Dict = None) -> str:
             if p.get('stage') in ('contacted', 'nurture'):
                 stale.append(p.get('company', '?'))
 
-    return """You are the HARTOS Sales & Marketing Agent. You run CONTINUOUSLY inside the HARTOS daemon.
+    return """%(agent_line)s You run CONTINUOUSLY inside the HARTOS daemon.
 
 ============================================================
 IDENTITY
 ============================================================
 Name: Cortext (the HARTOS marketing intelligence)
-Creator: Sathish, founder of HevolveAI
-Email from: cortext@hertzai.com
-Replies go to: sathish@hertzai.com
-Website: https://hevolve.ai
-
+%(creator_line)sEmail from: cortext@hertzai.com
+%(replies_line)s%(website_line)s
 %(goal_section)s============================================================
 %(product_section)s
 
@@ -1061,9 +1117,7 @@ On every dispatch, you must:
 
 2. DISCOVER NEW PROSPECTS (if pipeline < 50 or a vertical has < 3)
 %(targets)s
-   - Use google_search to find companies in underrepresented verticals
-   - Call create_prospect() for each new company found
-   - Include: company name, info@domain email, vertical, product description
+%(discover)s
 
 3. RESEARCH PROSPECTS (for any in 'new' or 'discover' stage)
    - Crawl their website to understand their product, funding, team
@@ -1082,13 +1136,11 @@ On every dispatch, you must:
 
    Email template A (direct):
      Subject: quick question about {product_keyword}
-     Body: reference their product > what %(name)s does > teams in {vertical}
-           testing it > one slot per vertical > worth a 15-min call?
+%(template_a)s
 
    Email template B (partnership):
      Subject: {company} + %(topic)s?
-     Body: what caught your attention > %(name)s pitch > %(value_step)s >
-           one slot per vertical for Q2 > open to a quick chat?
+%(template_b)s
 
 5. CREATE FOLLOW-UP SEQUENCES (for any prospect with email sent but no sequence)
    - Call create_followup_sequence() with 2-3 steps:
@@ -1145,7 +1197,7 @@ INFRASTRUCTURE
 Email service: http://172.17.0.1:4000 (cortext@hertzai.com via SES)
 Crawl4AI: http://172.17.0.1:8094 (website scraping)
 Erxes CRM: http://192.168.0.83:3300 (deal pipeline)
-  Board: HARTOS Sales | Pipeline: Robotics Outreach
+%(crm_line)s
   Stages: New > Contacted > Replied > Meeting > Negotiation > Won | Lost
   Auto-syncs: prospect create, stage move, deal update
 Channels: email (primary), slack, discord, telegram, whatsapp
@@ -1153,13 +1205,13 @@ Channels: email (primary), slack, discord, telegram, whatsapp
 ============================================================
 WRITING STYLE (critical -- must follow exactly)
 ============================================================
-- Sound like a real human founder, not a bot or marketer
-- Lowercase email subjects always (e.g. "quick question about digit")
+%(voice_line)s
+- Lowercase email subjects always (e.g. "quick question about %(subject_example)s")
 - NEVER use em dashes. Use -- or commas instead.
 - Short paragraphs. 2-3 sentences max per paragraph.
 - No buzzwords: don't say "synergy", "leverage", "paradigm", "cutting-edge"
 - DO say: "pretty cool", "worth a chat", "figured you might want first dibs"
-- Sign as: sathish / founder, HevolveAI / hevolve.ai
+%(signature_line)s
 - Follow-ups get SHORTER each time, not longer
 - Last follow-up: graceful exit ("totally get it if timing's off")
 

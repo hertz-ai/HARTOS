@@ -49,20 +49,106 @@ def _prompt(goal_type, product=None):
          'config': {}}, product)
 
 
+#: Every line of the HARTOS-for-robotics pitch that is wrong for another
+#: product: its robotics framing, its one-slot-per-vertical scarcity and Q2
+#: deadline, its example subject, and HevolveAI's founder as the seller
+#: (review of 44f21b312 found each of these in every product prompt).
+NOT_FOR_A_PRODUCT = (
+    'robotics', 'Robotics', 'HARTOS (Hevolve Hive', 'on-device AI?',
+    'Hive network value', 'one slot per vertical', 'Q2',
+    'quick question about digit', 'HARTOS Sales & Marketing Agent',
+    'HARTOS solves', 'companies in underrepresented verticals', 'info@domain',
+    'Creator: Sathish', 'founder', 'Replies go to', 'https://hevolve.ai',
+)
+
+
 @pytest.mark.parametrize('goal_type', ['sales', 'outreach'])
 def test_a_sales_goal_for_a_product_pitches_that_product(store, goal_type):
     """FAILS BEFORE THE FIX: both prompts pitched HARTOS for robotics."""
     prompt = _prompt(goal_type, GROCERY)
 
+    assert 'You are the sales agent for McGroce.' in prompt
     assert 'PRODUCT: McGroce' in prompt
     assert 'Groceries from the corner shop to your door in 30 minutes' in prompt
     assert ('Target the people and businesses McGroce is for: '
             'households and small shops in Chennai') in prompt
     assert 'what McGroce is' in prompt and '{company} + McGroce?' in prompt
-    assert 'local shops keep 95% of every sale' in prompt
-    for robotics in ('robotics companies', 'HARTOS (Hevolve Hive', 'on-device AI?',
-                     'Why robotics companies care', 'Hive network value'):
-        assert robotics not in prompt, robotics
+    assert ('Look for pain points McGroce solves '
+            '(local shops keep 95% of every sale)') in prompt
+    assert 'quick question about grocery' in prompt
+    assert '- Sign as: the McGroce team / https://example.test/mcgroce' in prompt
+    for wrong in NOT_FOR_A_PRODUCT:
+        assert wrong not in prompt, wrong
+
+
+def test_a_hevolveai_product_keeps_hevolveai_as_the_seller(store):
+    """HevolveAI's own product (is_platform_product): HevolveAI still sells
+    and signs, but nothing of the robotics pitch stays."""
+    prompt = _prompt('sales', dict(GROCERY, is_platform_product=True))
+
+    assert 'Creator: Sathish, founder of HevolveAI' in prompt
+    assert '- Sign as: sathish / founder, HevolveAI / hevolve.ai' in prompt
+    for wrong in ('robotics', 'Robotics', 'one slot per vertical', 'Q2',
+                  'quick question about digit', 'HARTOS Sales & Marketing Agent'):
+        assert wrong not in prompt, wrong
+
+
+def test_the_default_prompt_is_the_old_one_word_for_word(store):
+    """No product and no goal words: the prompt is byte for byte the one
+    before #233 (sha256 of ff45f77a4's, 8320 characters), so a cut or
+    changed line of the default pitch fails here."""
+    import hashlib
+    from integrations.agent_engine.journey_engine import _build_sales_prompt
+    prompt = _build_sales_prompt({})
+
+    assert len(prompt) == 8320
+    assert hashlib.sha256(prompt.encode('utf-8')).hexdigest() == (
+        'd62beafea85ea766147def96c7c6b0bbe7e6beed3abc1a2059eade930064864f')
+
+
+@pytest.mark.parametrize('keywords, shown', [
+    (7, None),
+    ('grocery, kirana', 'grocery, kirana'),
+    ({'grocery': 1}, None),
+    (None, None),
+    ([1, None, '  ', True, 'kirana'], '1, kirana'),
+])
+@pytest.mark.parametrize('goal_type', ['sales', 'marketing'])
+def test_a_product_row_of_any_shape_never_breaks_the_prompt(store, goal_type,
+                                                           keywords, shown):
+    """A Product row is a person's own text and its keywords are not
+    type-checked on write.  FAILS BEFORE THE FIX: keywords 7 raised
+    TypeError in both builders and a text came out letter by letter."""
+    prompt = _prompt(goal_type, dict(GROCERY, keywords=keywords))
+
+    assert 'McGroce' in prompt
+    shown_keywords = [ln.split('Keywords:', 1)[1].strip()
+                      for ln in prompt.splitlines() if 'Keywords:' in ln]
+    assert [k for k in shown_keywords if k] == ([shown] if shown else [])
+
+
+def test_a_long_product_field_is_capped(store):
+    """Product fields are capped like a goal's description: a 5000-letter
+    description shows its first 1000 letters."""
+    prompt = _prompt('sales', dict(GROCERY, description='d' * 5000))
+
+    assert 'd' * 1000 in prompt and 'd' * 1001 not in prompt
+
+
+def test_the_marketing_prompt_shows_a_whole_row_as_before(store):
+    """The marketing builder reads the row through the same reader
+    (goal_manager.product_fields) and shows a well-formed row as before."""
+    prompt = _prompt('marketing', GROCERY)
+
+    assert ('PRODUCT YOU ARE MARKETING:\n'
+            '  Name: McGroce\n'
+            '  Description: Groceries from the corner shop to your door in 30 minutes\n'
+            '  Tagline: your kirana, online\n'
+            '  Target audience: households and small shops in Chennai\n'
+            '  Unique value: local shops keep 95% of every sale\n'
+            '  Product URL: https://example.test/mcgroce\n'
+            '  Keywords: grocery, delivery, kirana\n'
+            '  Category: ecommerce\n') in prompt
 
 
 def test_a_sales_goal_with_no_product_keeps_the_hartos_pitch(store):

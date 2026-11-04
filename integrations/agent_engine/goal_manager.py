@@ -183,6 +183,51 @@ def _sanitize_goal_input(text: str, max_length: int = 2000) -> str:
     return sanitized
 
 
+#: How much of each Product field a goal prompt shows.  A Product row is a
+#: signed-in person's own text (POST /api/marketing/products), so it is
+#: cleaned and capped the way a goal's title and description are.
+_PRODUCT_FIELD_CAPS = {'name': 200, 'description': 1000, 'tagline': 200,
+                       'target_audience': 300, 'unique_value_prop': 300,
+                       'product_url': 300, 'category': 100}
+_PRODUCT_KEYWORDS_MAX = 12
+_PRODUCT_KEYWORD_CAP = 60
+
+
+def product_fields(product_dict) -> Optional[Dict]:
+    """A Product row's fields as goal prompts show them, or None when there
+    is no row or it names no product.
+
+    The one reader of a Product row for prompts (the marketing and sales
+    builders).  Every field comes back as text, cleaned and capped by
+    _sanitize_goal_input ('' when missing, None or not text-like);
+    'keywords' as a list of words: a list as given, a comma-separated text
+    split, anything else none.  Keywords are not type-checked when a row is
+    written, and a number there crashed the prompt (review of 44f21b312:
+    keywords 7 raised TypeError; a text came out letter by letter);
+    'is_platform_product' as a bool."""
+    if not isinstance(product_dict, dict):
+        return None
+    out = {}
+    for key, cap in _PRODUCT_FIELD_CAPS.items():
+        value = product_dict.get(key)
+        if value is None or isinstance(value, (dict, list, tuple, set, bool)):
+            value = ''
+        out[key] = _sanitize_goal_input(str(value), max_length=cap).strip()
+    if not out['name']:
+        return None
+    raw = product_dict.get('keywords')
+    if isinstance(raw, str):
+        raw = raw.split(',')
+    if not isinstance(raw, (list, tuple, set)):
+        raw = []
+    words = [_sanitize_goal_input(str(k), max_length=_PRODUCT_KEYWORD_CAP).strip()
+             for k in raw
+             if isinstance(k, (str, int, float)) and not isinstance(k, bool)]
+    out['keywords'] = [w for w in words if w][:_PRODUCT_KEYWORDS_MAX]
+    out['is_platform_product'] = bool(product_dict.get('is_platform_product'))
+    return out
+
+
 # ─── Goal Manager ───
 
 #: Why a goal is paused, as code reads it (the prose in pause_reason is for
@@ -965,18 +1010,19 @@ def _build_marketing_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None
     # Product-specific information
     product_section = ''
     is_platform_product = False
-    if product_dict:
-        is_platform_product = product_dict.get('is_platform_product', False)
+    product = product_fields(product_dict)
+    if product:
+        is_platform_product = product['is_platform_product']
         product_section = (
             f"PRODUCT YOU ARE MARKETING:\n"
-            f"  Name: {product_dict['name']}\n"
-            f"  Description: {product_dict.get('description', '')}\n"
-            f"  Tagline: {product_dict.get('tagline', '')}\n"
-            f"  Target audience: {product_dict.get('target_audience', 'everyone who wants a better life')}\n"
-            f"  Unique value: {product_dict.get('unique_value_prop', '')}\n"
-            f"  Product URL: {product_dict.get('product_url', '')}\n"
-            f"  Keywords: {', '.join(product_dict.get('keywords', []))}\n"
-            f"  Category: {product_dict.get('category', 'platform')}\n\n"
+            f"  Name: {product['name']}\n"
+            f"  Description: {product['description']}\n"
+            f"  Tagline: {product['tagline']}\n"
+            f"  Target audience: {product['target_audience'] or 'everyone who wants a better life'}\n"
+            f"  Unique value: {product['unique_value_prop']}\n"
+            f"  Product URL: {product['product_url']}\n"
+            f"  Keywords: {', '.join(product['keywords'])}\n"
+            f"  Category: {product['category'] or 'platform'}\n\n"
         )
     else:
         # No specific product — marketing the platform itself

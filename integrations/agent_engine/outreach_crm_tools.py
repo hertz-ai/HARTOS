@@ -901,41 +901,6 @@ def send_due_followups(data: Dict, now: datetime,
 
 # ── Goal Type Registration ──
 
-def product_pitch(product_dict: Optional[Dict]) -> Optional[Dict]:
-    """The goal's own product as a sales prompt shows it, or None when the
-    goal names none (the prompt keeps its default pitch).
-
-    ``product_dict`` is the Product row's to_dict(), which agent_daemon
-    passes every goal prompt builder for the goal's product_id.  Both sales
-    builders ignored it and pitched HARTOS-for-robotics whatever the goal
-    sold (#233), so a sales goal for a grocery, a ride service or a speech
-    clinic would have cold-emailed robotics companies.
-
-    Returns {'name', 'block' (the PRODUCT lines), 'audience', 'keywords',
-    'value'}: every field the Product row carries that the prompt reads."""
-    if not isinstance(product_dict, dict):
-        return None
-    name = str(product_dict.get('name') or '').strip()
-    if not name:
-        return None
-    keywords = [str(k).strip() for k in (product_dict.get('keywords') or [])
-                if str(k).strip()]
-    lines = [f'PRODUCT: {name}']
-    for label, key in (('What it is', 'description'), ('In one line', 'tagline'),
-                       ('Who it is for', 'target_audience'),
-                       ('Why it is better', 'unique_value_prop'),
-                       ('Link', 'product_url'), ('Category', 'category')):
-        value = str(product_dict.get(key) or '').strip()
-        if value:
-            lines.append(f'  - {label}: {value}')
-    if keywords:
-        lines.append(f"  - Keywords: {', '.join(keywords)}")
-    return {'name': name, 'block': '\n'.join(lines),
-            'audience': str(product_dict.get('target_audience') or '').strip(),
-            'keywords': keywords,
-            'value': str(product_dict.get('unique_value_prop') or '').strip()}
-
-
 def build_outreach_prompt(goal_dict: Dict, product_dict: Dict = None) -> str:
     """The prompt of an 'outreach' goal: the sales agent's
     (journey_engine._build_sales_prompt).
