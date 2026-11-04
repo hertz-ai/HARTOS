@@ -597,6 +597,13 @@ def test_a_long_bounce_list_is_bounded_and_the_trimmed_view_keeps_the_ab_stats(
         cut, _ = _truncate_msg_content({'role': 'tool', 'content': out},
                                        budget, '...', lambda c: c)
         assert '"ab_test"' in cut['content'], (budget, len(out))
+        # Review of 82a1248ee: the counts sat before the list, where the
+        # cut removed them, so the agent could not tell 20 had bounced.
+        assert '"given_up": 20' in cut['content'], (budget, len(out))
+    status = _tools(store, monkeypatch)['get_pipeline_status']()
+    cut, _ = _truncate_msg_content({'role': 'tool', 'content': status},
+                                   4000, '...', lambda c: c)
+    assert '"given_up": 20' in cut['content'], len(status)
     listed = json.loads(out)['not_delivered']
     limit = getattr(store, 'UNDELIVERED_LIST_LIMIT', 10)
     assert (listed['given_up'], listed['waiting']) == (20, 0)
@@ -654,6 +661,39 @@ def test_a_step_behind_a_waiting_step_is_not_overdue(channels, store, no_mailer)
     assert [a['action'] for a in checked['actions']] == ['followup_waiting'], checked
     assert [s for _, s in email.emails] == ['bump 2']
     assert 'Pending follow-ups: 2 (overdue: 0)' in _build_sales_prompt({})
+
+
+def test_a_step_not_yet_due_is_neither_sent_nor_overdue(channels, store, no_mailer):
+    """Review of 82a1248ee: no test had a step whose time had not come, so
+    a checker that sent it early, or a count that called it overdue,
+    passed every test.  Step 2 is due, step 3 is two days out."""
+    from integrations.agent_engine.journey_engine import _build_sales_prompt
+    email = _EmailChannel(ok=True)
+    channels.registry.register(email)
+    data = _due_sequence(store, steps=2)
+    data['sequences']['s1']['steps'][1]['scheduled_at'] = (
+        datetime.utcnow() + timedelta(days=2)).isoformat()
+    store._save_prospects(data)
+    assert 'Pending follow-ups: 2 (overdue: 1)' in _build_sales_prompt({})
+
+    store.check_pending_followups_daemon()
+    store.check_pending_followups_daemon()
+
+    assert [s for _, s in email.emails] == ['bump 2']
+    steps = store._load_prospects()['sequences']['s1']['steps']
+    assert [s['status'] for s in steps] == ['sent', 'pending']
+    assert 'Pending follow-ups: 1 (overdue: 0)' in _build_sales_prompt({})
+
+
+def test_planned_emails_never_tried_are_not_listed(channels, store, no_mailer, monkeypatch):
+    """Review of 82a1248ee: an untried pending step and an untried first
+    email draft are planned, not undelivered; nothing pinned that."""
+    _due_sequence(store, emails_sent=0, journey_stage='outreach',
+                  email_draft={'subject': 'hi', 'body': '<p>hello</p>'})
+
+    for listed in _listed(store, monkeypatch):
+        assert _entries(listed) == [], listed
+        assert (listed['given_up'], listed['waiting']) == (0, 0), listed
 
 
 def test_due_steps_with_nothing_waiting_are_all_overdue(store):

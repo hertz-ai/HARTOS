@@ -278,6 +278,7 @@ UNDELIVERED_LIST_LIMIT = 10
 
 
 def _undelivered_entry(prospect_id, company, which, planned) -> Dict:
+    """One refused planned email as the pipeline tools list it."""
     return {'prospect_id': prospect_id, 'company': company, 'which': which,
             'attempts': planned.get('attempts', 0),
             'given_up': planned.get('status') == 'failed',
@@ -319,13 +320,18 @@ def undelivered_emails(data: Dict) -> List[Dict]:
 
 
 def undelivered_summary(data: Dict, limit: int = UNDELIVERED_LIST_LIMIT) -> Dict:
-    """undelivered_emails as the pipeline tools show it: counts of all of
-    them, and the ``limit`` most recently tried."""
+    """undelivered_emails as the pipeline tools show it: the ``limit`` most
+    recently tried, then the counts of all of them.
+
+    The counts come after the list: the wire trim keeps a long tool
+    result's head and tail and cuts its middle, and both tools put this
+    near the tail, so the counts are what survives a cut (review of
+    82a1248ee: before the list, a 4,000-char cut removed them)."""
     entries = undelivered_emails(data)
     entries.sort(key=lambda e: e.get('last_tried_at') or '', reverse=True)
     given_up = sum(1 for e in entries if e['given_up'])
-    return {'given_up': given_up, 'waiting': len(entries) - given_up,
-            'latest': entries[:limit]}
+    return {'latest': entries[:limit],
+            'given_up': given_up, 'waiting': len(entries) - given_up}
 
 
 def register_outreach_tools(helper, assistant, user_id: str):
