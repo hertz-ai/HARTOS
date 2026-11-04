@@ -33,6 +33,10 @@ logger = logging.getLogger('hevolve_outreach')
 ERXES_API_URL = os.environ.get('ERXES_API_URL', 'http://localhost:3300')
 EMAIL_SERVICE_URL = os.environ.get('EMAIL_SERVICE_URL', 'http://localhost:4000')
 
+#: How many times a due follow-up email is tried before the step is given
+#: up ('failed').  A refused send is not a sent one; this bounds the retry.
+FOLLOWUP_SEND_ATTEMPTS = 3
+
 # ── Thread lock for prospect file access (daemon + request thread) ──
 _prospect_lock = threading.Lock()
 
@@ -256,6 +260,17 @@ def register_outreach_tools(helper, assistant, user_id: str):
             subject=subject,
             html_body=body_html,
         )
+        if not result.get('success'):
+            # Not sent: the prospect stays as it was and the agent reads
+            # why.  Counting it moved prospects nobody had reached to
+            # 'contacted' and used up their follow-ups.
+            return json.dumps({
+                'success': False, 'sent': False, 'send_result': result,
+                'prospect_stage': prospect['stage'],
+                'error': (result.get('error')
+                          or f"the email was not sent ({result.get('via') or 'no sender'}, "
+                             f"status {result.get('status_code')})"),
+            })
 
         # Log the send
         send_entry = {
@@ -276,7 +291,8 @@ def register_outreach_tools(helper, assistant, user_id: str):
         prospect['updated_at'] = datetime.utcnow().isoformat()
 
         _save_prospects(data)
-        return json.dumps({'success': True, 'send_result': result, 'prospect_stage': prospect['stage']})
+        return json.dumps({'success': True, 'sent': True, 'send_result': result,
+                           'prospect_stage': prospect['stage']})
 
     def create_followup_sequence(
         prospect_id: Annotated[str, "Prospect ID to create sequence for"],
@@ -319,7 +335,9 @@ def register_outreach_tools(helper, assistant, user_id: str):
                 'scheduled_at': (base_time + timedelta(days=cumulative_days)).isoformat(),
                 'subject': step['subject'],
                 'body_html': step['body_html'],
-                'status': 'pending',  # pending → sent → skipped (if replied)
+                # pending -> sent, or failed after FOLLOWUP_SEND_ATTEMPTS
+                # refused sends; a reply completes the whole sequence.
+                'status': 'pending',
                 'sent_at': None,
             })
 
@@ -653,20 +671,37 @@ def _check_pending_followups_impl() -> str:
                     subject=step['subject'],
                     html_body=step['body_html'],
                 )
-                step['status'] = 'sent'
-                step['sent_at'] = now.isoformat()
-
-                prospect['emails_sent'] = prospect.get('emails_sent', 0) + 1
-                prospect['last_email_at'] = now.isoformat()
-
-                actions_taken.append({
-                    'action': 'followup_sent',
-                    'prospect': prospect['company'],
-                    'step': step['step_number'],
-                    'subject': step['subject'],
-                    'result': result,
-                })
-                break  # Only send one step per check cycle
+                if result.get('success'):
+                    step['status'] = 'sent'
+                    step['sent_at'] = now.isoformat()
+                    prospect['emails_sent'] = prospect.get('emails_sent', 0) + 1
+                    prospect['last_email_at'] = now.isoformat()
+                    actions_taken.append({
+                        'action': 'followup_sent',
+                        'prospect': prospect['company'],
+                        'step': step['step_number'],
+                        'subject': step['subject'],
+                        'result': result,
+                    })
+                else:
+                    # Not sent: the step stays due and is tried on a later
+                    # check, up to FOLLOWUP_SEND_ATTEMPTS sends, then it is
+                    # given up so a dead address is not retried forever.
+                    step['attempts'] = step.get('attempts', 0) + 1
+                    step['last_error'] = str(
+                        result.get('error') or result.get('status_code')
+                        or 'not sent')[:200]
+                    if step['attempts'] >= FOLLOWUP_SEND_ATTEMPTS:
+                        step['status'] = 'failed'
+                    actions_taken.append({
+                        'action': 'followup_failed',
+                        'prospect': prospect['company'],
+                        'step': step['step_number'],
+                        'attempts': step['attempts'],
+                        'gave_up': step['status'] == 'failed',
+                        'error': step['last_error'],
+                    })
+                break  # Only one step per check cycle
 
         # Check if all steps are done
         if all(s['status'] != 'pending' for s in sequence['steps']):
@@ -750,6 +785,12 @@ def check_pending_followups_daemon() -> dict:
     for action in result.get('actions', []):
         if action.get('action') == 'followup_sent':
             logger.info(f"Follow-up sent: {action.get('prospect')} step {action.get('step')} subject='{action.get('subject')}'")
+        elif action.get('action') == 'followup_failed':
+            logger.warning("Follow-up NOT sent: %s step %s, attempt %s%s: %s",
+                           action.get('prospect'), action.get('step'),
+                           action.get('attempts'),
+                           ' (given up)' if action.get('gave_up') else '',
+                           action.get('error'))
         elif action.get('action') == 'sequence_completed':
             logger.info(f"Sequence completed: {action.get('prospect')} ({action.get('reason')})")
     return {'sent': sent, 'checked_at': result.get('checked_at', '')}

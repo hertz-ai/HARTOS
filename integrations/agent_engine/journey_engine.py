@@ -551,7 +551,9 @@ class JourneyEngine:
         try:
             from integrations.agent_engine.outreach_crm_tools import _send_email
             result = _send_email(prospect['email'], draft['subject'], draft['body'])
-            if result.get('success') or result.get('via'):
+            # 'via' names the sender on a refused send too: only success
+            # counts as sent.
+            if result.get('success'):
                 prospect['emails_sent'] = 1
                 prospect['last_email_at'] = datetime.utcnow().isoformat()
                 prospect['stage'] = 'contacted'
@@ -559,7 +561,7 @@ class JourneyEngine:
         except Exception as e:
             return {'error': str(e)}
 
-        return {'sent': False}
+        return {'sent': False, 'result': result}
 
     def _action_check_followups(self, prospect: Dict, ctx: Dict) -> Dict:
         """Check and send pending follow-ups (delegates to outreach tools)."""
@@ -627,6 +629,10 @@ class JourneyEngine:
                 '<p>happy to adjust to your timezone.</p>'
                 '<p>sathish</p>',
             )
+            # Proposed only when the email went out; otherwise the next
+            # tick proposes again.
+            if not result.get('success'):
+                return {'proposed': False, 'result': result}
             prospect['meeting_proposed'] = True
             return {'proposed': True, 'result': result}
         except Exception as e:
