@@ -9,8 +9,9 @@ ask_person push to 'system_daemon' "did not go out" (hartos-95, task #231).
 The rule: a human is their own person; an agent or system row answers to its
 owner_id, else to the node's owner (HEVOLVE_OWNER_USER_ID); no id, or a
 system identity (core.constants.SYSTEM_IDENTITIES), is the node's owner; any
-other id with no users row here comes back as it is; a failed read answers
-the node's owner and never raises.
+other id with no users row here comes back as it is; a failed read never
+raises and answers the node's one person only when it has exactly one, else
+the id as given (review of 24e05f5b7: never the steward for someone else).
 
 Real in-memory social DB (the harness of test_central_asks_reach_the_person).
 
@@ -112,14 +113,46 @@ class TestPersonFor:
         assert person_for('pf-only-in-that-session', db) == 'pf-in-session'
         assert db.asked == {'id': 'pf-only-in-that-session'}
 
-    def test_a_failed_read_asks_the_node_owner(self, pushes, monkeypatch, caplog):
+    def test_a_failed_read_on_a_node_of_several_people_keeps_the_id(self, pushes,
+                                                                    monkeypatch, caplog):
+        """Review of 24e05f5b7: a failed read cannot tell a person from an
+        agent, and answering the node's owner sent one person's question to
+        the steward.  Two people here, so the id comes back as it is."""
+        import core.event_attribution as ea
         import integrations.social.models as models
-        from core.event_attribution import person_for
         monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', _NODE_OWNER)
+        monkeypatch.setattr(ea, '_SOLE_USER_CACHE', [])
+        monkeypatch.setattr(ea, '_ZERO_USER_LAST_CHECK', [0.0])
+        _person('pf-alice-tenant')
+        _person('pf-bob-tenant')
 
+        class _Failed:
+            def query(self, _model):
+                raise RuntimeError('database is locked')
+
+        # The caller's own session failed; the node itself still reads.
+        assert ea.person_for('pf-alice-tenant', _Failed()) == 'pf-alice-tenant'
+        assert any('pf-alice-tenant' in r.getMessage() for r in caplog.records)
+
+        # Nothing reads at all: still the id, never the owner, never None.
         def _down():
             raise RuntimeError('database is locked')
 
         monkeypatch.setattr(models, 'db_session', _down)
-        assert person_for('pf-unreadable') == _NODE_OWNER
-        assert any('pf-unreadable' in r.getMessage() for r in caplog.records)
+        assert ea.person_for('pf-alice-tenant') == 'pf-alice-tenant'
+        monkeypatch.delenv('HEVOLVE_OWNER_USER_ID')
+        assert ea.person_for('pf-alice-tenant') == 'pf-alice-tenant'
+
+    def test_a_failed_read_on_a_one_person_node_asks_that_person(self, pushes,
+                                                                 monkeypatch):
+        """With exactly one person here, whoever the id was (that person or
+        one of their agents) answers to them (attribution's step 4 rule)."""
+        import core.event_attribution as ea
+        monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', _NODE_OWNER)
+        monkeypatch.setattr(ea, '_sole_local_user_id', lambda: 'pf-the-one-person')
+
+        class _Failed:
+            def query(self, _model):
+                raise RuntimeError('database is locked')
+
+        assert ea.person_for('agent-unreadable', _Failed()) == 'pf-the-one-person'
