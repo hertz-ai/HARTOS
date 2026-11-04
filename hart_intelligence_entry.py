@@ -8504,10 +8504,17 @@ def _review_proposed_plan(plan, max_rounds_remaining):
             "you see a malformed brace, stray quote, or syntax error, assume it's\n"
             "a serialization artifact and ignore it.\n\n"
             "Plan to review (JSON):\n"
-            + json.dumps(plan, indent=2)[:6000]  # cap to keep ctx small
+            # Whole, never cut: a task that names its own flows keeps one
+            # flow per named flow, and seven flows of nine real steps come
+            # to about 8.9k even compact, so the old 6000 cut ended the plan
+            # mid-JSON and the reviewer judged a different plan.  No cap is
+            # needed for the context: the plan is this same endpoint's own
+            # output, written after a longer prompt than these rules, and a
+            # call that still fails is fail-open below.  Compact for tokens.
+            + json.dumps(plan, separators=(',', ':'))
             + "\n\nRespond with ONLY a JSON object:\n"
             "  {\"status\":\"approved\"} if all gates pass\n"
-            "  {\"status\":\"needs_refinement\",\"feedback\":\"specific fix needed\"} otherwise\n"
+            "  {\"status\":\"needs_refinement\",\"flow_name\":\"the flow to fix\",\"feedback\":\"specific fix needed\"} otherwise\n"
             "ASCII only.  No prose.  Start with { end with }."
         )
         # Reuse pooled_post that gather_info uses; same endpoint
@@ -8529,6 +8536,12 @@ def _review_proposed_plan(plan, max_rounds_remaining):
                 app.logger.info('Plan review: approved')
                 return ('approved', None)
             fb = verdict.get('feedback') or 'plan needs more atomic detail'
+            # The planner applies feedback to the flow it names
+            # (gather_agentdetails' autonomous prompt), so the flow travels
+            # inside the feedback text, the one thing passed back.
+            _flow = verdict.get('flow_name')
+            if isinstance(_flow, str) and _flow.strip():
+                fb = f"In flow '{_flow.strip()}': {fb}"
             app.logger.info(f'Plan review: needs_refinement — {fb[:200]}')
             return ('needs_refinement', fb)
         # Couldn't parse — fail-open
