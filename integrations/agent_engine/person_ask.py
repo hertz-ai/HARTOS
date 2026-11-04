@@ -615,8 +615,43 @@ def open_file_request(ask_id, user_id) -> Optional[dict]:
         return {'purpose': a.purpose, 'prompt_id': a.prompt_id, 'max_files': a.max_files}
 
 
-def ask_person_tool(user_id, prompt_id, agent_id=None):
+def person_to_ask(user_id, request_id=None) -> Optional[str]:
+    """Whom an ask from a turn reaches.  A background turn (request id
+    daemon_<goal id>, core.chat_client.daemon_goal_id) asks its goal's
+    person; any other turn asks the person behind ``user_id``.  Who the
+    person is, is core.event_attribution.person_for's to say: a goal with no
+    owner (system seeded), or a system identity, is the node owner's.
+
+    Every daemon turn on a keyless node runs as 'system_daemon'
+    (dispatch._internal_auth_headers), so its asks went to that name and
+    reached nobody (central 2026-10-31 10:29:25Z).  Owner, relayed
+    2026-11-03: daemon goals reach the owner of central (10202) or their
+    co-owners."""
+    from core.chat_client import daemon_goal_id
+    from core.event_attribution import goal_owner_user_id, person_for
+    goal_id = daemon_goal_id(request_id)
+    if goal_id:
+        try:
+            from integrations.social.models import AgentGoal, db_session
+            with db_session(commit=False) as db:
+                goal = db.query(AgentGoal).filter_by(id=goal_id).first()
+                if goal is not None:
+                    return person_for(goal_owner_user_id(goal), db)
+            logger.warning("person ask: goal %s of request %s is not here; the "
+                           "turn's own person is asked", goal_id, request_id)
+        except Exception:
+            logger.warning("person ask: goal %s could not be read; the turn's "
+                           "own person is asked", goal_id, exc_info=True)
+    return person_for(user_id)
+
+
+def ask_person_tool(user_id, prompt_id, agent_id=None, request_id=None):
     """The ``ask_person`` tool every agent has: (name, description, func).
+
+    ``request_id`` gives the turn's request id (a callable, read at each
+    call): the person asked is person_to_ask's, worked out per call,
+    because one agent's session and its tools serve every goal of that
+    agent.
 
     A file_request's purpose is one the store keeps (INBOUND_PURPOSES): the
     description names them, and a refusal of any other names them again, so
@@ -635,8 +670,10 @@ def ask_person_tool(user_id, prompt_id, agent_id=None):
                                       '"purpose":"%s","accept":"video"}' % REEL_SOURCE],
             wait_seconds: Annotated[int, f"seconds to wait now, max {MAX_WAIT_S}"] = DEFAULT_WAIT_S,
             ask_id: Annotated[str, "an earlier ask's id: read its answer"] = '') -> str:
+        person = person_to_ask(
+            user_id, request_id() if callable(request_id) else request_id)
         if ask_id:
-            state = ask_state(ask_id, user_id)
+            state = ask_state(ask_id, person)
             reply = {'answered': state['status'] == 'answered', 'ask_id': ask_id,
                      'answer': state['answer'],
                      'status': ('waiting_for_person' if state['status'] == 'open'
@@ -651,7 +688,7 @@ def ask_person_tool(user_id, prompt_id, agent_id=None):
             comp = None
         if isinstance(comp, dict) and prompt_id is not None:
             comp.setdefault('prompt_id', str(prompt_id))
-        out = ask(user_id, agent_id if agent_id is not None else prompt_id, comp,
+        out = ask(person, agent_id if agent_id is not None else prompt_id, comp,
                   prompt_id=prompt_id)
         if not out['ok']:
             reply = {'answered': False, 'refused': out['refused'], 'status': 'refused'}

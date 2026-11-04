@@ -3142,10 +3142,13 @@ def build_core_tool_closures(ctx):
     # The person's answer, asked on whichever of their devices they answer
     # (a file_request for clips, a form, a choice), for every agent alike:
     # integrations.agent_engine.person_ask (owner 2026-10-27, "liquid ui is
-    # asked as a tool by server").
+    # asked as a tool by server").  The turn's request id is read at each
+    # call: a background turn asks its goal's person (person_to_ask).
     try:
         from integrations.agent_engine.person_ask import ask_person_tool
-        _name, _desc, _ask_fn = ask_person_tool(user_id, prompt_id)
+        _name, _desc, _ask_fn = ask_person_tool(
+            user_id, prompt_id,
+            request_id=lambda: request_id_list.get(user_prompt))
         tools.append((_name, _desc, log_tool_execution(_ask_fn)))
     except Exception as e:
         tool_logger.warning("ask_person tool not registered: %s", e)
