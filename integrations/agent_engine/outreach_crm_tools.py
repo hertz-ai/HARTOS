@@ -234,6 +234,7 @@ def note_refused(planned: Dict, result: Dict, now: datetime, what: str) -> bool:
     same WARNING (review of 6da8b09c7: the journey path logged nothing)."""
     planned['attempts'] = planned.get('attempts', 0) + 1
     planned['last_error'] = _send_error_text(result)
+    planned['last_tried_at'] = now.isoformat()
     gave_up = planned['attempts'] >= OUTREACH_SEND_ATTEMPTS
     if gave_up:
         planned['status'] = 'failed'
@@ -244,39 +245,87 @@ def note_refused(planned: Dict, result: Dict, now: datetime, what: str) -> bool:
     logger.warning("Outreach email NOT sent (%s), try %d of %d%s: %s",
                    what, planned['attempts'], OUTREACH_SEND_ATTEMPTS,
                    ', given up' if gave_up else
-                   ', next try after ' + planned['retry_after'],
+                   ', next try after ' + planned['retry_after'] + ' UTC',
                    planned['last_error'])
     return gave_up
 
 
+def next_followup(sequence: Dict, now: datetime):
+    """The one rule for a sequence's next follow-up: ``(step, state)`` for
+    its FIRST pending step, state 'due' (scheduled time passed, no wait
+    running), 'waiting' (refused before, its wait not over) or 'scheduled'
+    (not due yet); ``(None, None)`` when no step is pending.  The steps
+    after the first pending one wait for it.
+
+    The checker (send_due_followups) sends by it and the sales prompt
+    counts overdue steps by it, so the count is what a check would send
+    (review of 5970e07a1: the prompt counted a step queued behind a waiting
+    one as overdue)."""
+    for step in sequence.get('steps', []):
+        if step.get('status') != 'pending':
+            continue
+        if now < datetime.fromisoformat(step['scheduled_at']):
+            return step, 'scheduled'
+        return step, ('due' if retry_due(step, now) else 'waiting')
+    return None, None
+
+
+#: How many refused emails get_pipeline_status / view_journey_pipeline
+#: list (the newest tries); the counts cover all of them.  Unbounded, 20
+#: bounced prospects grew the journey view past the wire trim's cut, which
+#: then dropped the A/B stats (review of 5970e07a1).
+UNDELIVERED_LIST_LIMIT = 10
+
+
+def _undelivered_entry(prospect_id, company, which, planned) -> Dict:
+    return {'prospect_id': prospect_id, 'company': company, 'which': which,
+            'attempts': planned.get('attempts', 0),
+            'given_up': planned.get('status') == 'failed',
+            'retry_after': planned.get('retry_after'),
+            'last_tried_at': planned.get('last_tried_at'),
+            'last_error': planned.get('last_error')}
+
+
 def undelivered_emails(data: Dict) -> List[Dict]:
-    """Every planned email in the store that was refused at least once: the
-    journey's first emails and the follow-up steps, waiting to be tried
-    again or given up.  What get_pipeline_status and view_journey_pipeline
-    show, so a given-up email is not seen only in the log (review of
-    6da8b09c7)."""
+    """Every planned email in the store that was refused and has still not
+    reached its prospect: waiting to be tried again, or given up.
+
+    A first email is listed only while the prospect has had no email at
+    all (one delivered later, on a retry or by the agent's own
+    send_outreach_email, is not undelivered).  A follow-up step is listed
+    when it was given up, or while it waits in a sequence that is still
+    active (a sequence ended by a reply sends nothing more, so its refused
+    step is not 'waiting')."""
+    prospects = data.get('prospects') or {}
     out = []
-    for pid, p in (data.get('prospects') or {}).items():
+    for pid, p in prospects.items():
         draft = p.get('email_draft')
-        if isinstance(draft, dict) and draft.get('attempts'):
-            out.append({'prospect_id': pid, 'company': p.get('company'),
-                        'email': 'first email',
-                        'attempts': draft['attempts'],
-                        'given_up': draft.get('status') == 'failed',
-                        'retry_after': draft.get('retry_after'),
-                        'last_error': draft.get('last_error')})
+        if (isinstance(draft, dict) and draft.get('attempts')
+                and not p.get('emails_sent')):
+            out.append(_undelivered_entry(pid, p.get('company'),
+                                          'first email', draft))
     for seq in (data.get('sequences') or {}).values():
-        p = (data.get('prospects') or {}).get(seq.get('prospect_id'), {})
+        p = prospects.get(seq.get('prospect_id'), {})
         for step in seq.get('steps', []):
-            if step.get('attempts') and step.get('status') != 'sent':
-                out.append({'prospect_id': seq.get('prospect_id'),
-                            'company': p.get('company'),
-                            'email': f"follow-up step {step.get('step_number')}",
-                            'attempts': step['attempts'],
-                            'given_up': step.get('status') == 'failed',
-                            'retry_after': step.get('retry_after'),
-                            'last_error': step.get('last_error')})
+            if not step.get('attempts'):
+                continue
+            waiting = (step.get('status') == 'pending'
+                       and seq.get('status') == 'active')
+            if step.get('status') == 'failed' or waiting:
+                out.append(_undelivered_entry(
+                    seq.get('prospect_id'), p.get('company'),
+                    f"follow-up step {step.get('step_number')}", step))
     return out
+
+
+def undelivered_summary(data: Dict, limit: int = UNDELIVERED_LIST_LIMIT) -> Dict:
+    """undelivered_emails as the pipeline tools show it: counts of all of
+    them, and the ``limit`` most recently tried."""
+    entries = undelivered_emails(data)
+    entries.sort(key=lambda e: e.get('last_tried_at') or '', reverse=True)
+    given_up = sum(1 for e in entries if e['given_up'])
+    return {'given_up': given_up, 'waiting': len(entries) - given_up,
+            'latest': entries[:limit]}
 
 
 def register_outreach_tools(helper, assistant, user_id: str):
@@ -537,7 +586,7 @@ def register_outreach_tools(helper, assistant, user_id: str):
             'total_prospects': len(data.get('prospects', {})),
             'active_sequences': active_sequences,
             # Refused emails, waiting to be tried again or given up.
-            'not_delivered': undelivered_emails(data),
+            'not_delivered': undelivered_summary(data),
             'erxes_pipeline': erxes_status,
         })
 
@@ -779,60 +828,55 @@ def send_due_followups(data: Dict, now: datetime,
             })
             continue
 
-        # Check each pending step
-        for step in sequence['steps']:
-            if step['status'] != 'pending':
-                continue
-
-            scheduled = datetime.fromisoformat(step['scheduled_at'])
-            if now >= scheduled and not retry_due(step, now):
-                # Refused before and waiting out its wait: said, so a
-                # check that sends nothing tells the agent why.
+        # The sequence's next step (only its first pending one), once per
+        # check cycle (next_followup: the one rule the prompt counts by).
+        step, state = next_followup(sequence, now)
+        if state == 'waiting':
+            # Refused before and waiting out its wait: said, so a check
+            # that sends nothing tells the agent why.
+            actions_taken.append({
+                'action': 'followup_waiting',
+                'prospect': prospect['company'],
+                'step': step['step_number'],
+                'attempts': step.get('attempts', 0),
+                'retry_after': step.get('retry_after'),
+                'error': step.get('last_error'),
+            })
+        elif state == 'due':
+            result = _send_email(
+                to_email=prospect['email'],
+                subject=step['subject'],
+                html_body=step['body_html'],
+            )
+            if result.get('success'):
+                step['status'] = 'sent'
+                step['sent_at'] = now.isoformat()
+                count_delivered(prospect, now)
                 actions_taken.append({
-                    'action': 'followup_waiting',
+                    'action': 'followup_sent',
                     'prospect': prospect['company'],
                     'step': step['step_number'],
-                    'attempts': step.get('attempts', 0),
-                    'retry_after': step.get('retry_after'),
-                    'error': step.get('last_error'),
+                    'subject': step['subject'],
+                    'result': result,
                 })
-            elif now >= scheduled:
-                result = _send_email(
-                    to_email=prospect['email'],
-                    subject=step['subject'],
-                    html_body=step['body_html'],
-                )
-                if result.get('success'):
-                    step['status'] = 'sent'
-                    step['sent_at'] = now.isoformat()
-                    count_delivered(prospect, now)
-                    actions_taken.append({
-                        'action': 'followup_sent',
-                        'prospect': prospect['company'],
-                        'step': step['step_number'],
-                        'subject': step['subject'],
-                        'result': result,
-                    })
-                else:
-                    # Not sent: tried again after a wait, then given up
-                    # (note_refused, which logs it).  A step given up ends
-                    # the sequence: the address or the sender is not taking
-                    # mail, and the later steps would only be refused the
-                    # same way.
-                    gave_up = note_refused(
-                        step, result, now,
-                        f"{prospect['company']}, follow-up step {step['step_number']}")
-                    if gave_up:
-                        sequence['status'] = 'failed'
-                    actions_taken.append({
-                        'action': 'followup_failed',
-                        'prospect': prospect['company'],
-                        'step': step['step_number'],
-                        'attempts': step['attempts'],
-                        'gave_up': gave_up,
-                        'error': step['last_error'],
-                    })
-            break  # Only the first pending step, once per check cycle
+            else:
+                # Not sent: tried again after a wait, then given up
+                # (note_refused, which logs it).  A step given up ends the
+                # sequence: the address or the sender is not taking mail,
+                # and the later steps would only be refused the same way.
+                gave_up = note_refused(
+                    step, result, now,
+                    f"{prospect['company']}, follow-up step {step['step_number']}")
+                if gave_up:
+                    sequence['status'] = 'failed'
+                actions_taken.append({
+                    'action': 'followup_failed',
+                    'prospect': prospect['company'],
+                    'step': step['step_number'],
+                    'attempts': step['attempts'],
+                    'gave_up': gave_up,
+                    'error': step['last_error'],
+                })
 
         # Check if all steps are done
         if (sequence['status'] == 'active'

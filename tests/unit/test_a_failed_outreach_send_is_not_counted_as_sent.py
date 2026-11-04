@@ -445,6 +445,22 @@ def warned(store, monkeypatch):
     return lines
 
 
+def _listed(store, monkeypatch):
+    """not_delivered as both agent tools return it, one per tool."""
+    return (
+        json.loads(_tools(store, monkeypatch)['get_pipeline_status']())['not_delivered'],
+        json.loads(_journey_tools(store, monkeypatch)['view_journey_pipeline']())['not_delivered'])
+
+
+def _entries(listed):
+    """The listed emails as (prospect, which email, given up).  5970e07a1
+    returned a bare list keyed 'email': read both, so a run on that commit
+    fails by what it lists, not by the shape."""
+    rows = listed['latest'] if isinstance(listed, dict) else listed
+    return sorted((e['prospect_id'], e.get('which', e.get('email')), e['given_up'])
+                  for e in rows)
+
+
 def test_a_given_up_first_email_is_logged_and_listed(channels, store, no_mailer, no_wait, warned, monkeypatch):
     """Review of 6da8b09c7: a given-up first email reached no log, and every
     read the agent has still showed the prospect as contacted with nothing
@@ -457,11 +473,138 @@ def test_a_given_up_first_email_is_logged_and_listed(channels, store, no_mailer,
         journey_daemon_tick()
 
     assert any('first email' in w and 'given up' in w and '550' in w for w in warned), warned
-    for listed in (
-            json.loads(_tools(store, monkeypatch)['get_pipeline_status']())['not_delivered'],
-            json.loads(_journey_tools(store, monkeypatch)['view_journey_pipeline']())['not_delivered']):
-        assert [(e['prospect_id'], e['email'], e['given_up']) for e in listed] == [
-            ('p1', 'first email', True)], listed
+    for listed in _listed(store, monkeypatch):
+        assert _entries(listed) == [('p1', 'first email', True)], listed
+        assert (listed['given_up'], listed['waiting']) == (1, 0), listed
+        assert '550' in listed['latest'][0]['last_error']
+
+
+def test_a_first_email_that_reached_its_prospect_later_is_not_listed(channels, store, no_mailer, monkeypatch):
+    """Review of 5970e07a1: a first email refused once and delivered on its
+    retry was listed as not delivered forever, and so was a given-up one
+    after the agent's own send_outreach_email reached the prospect."""
+    from integrations.agent_engine.journey_engine import journey_daemon_tick
+    email = _EmailChannel(ok=False, error='451 try later')
+    channels.registry.register(email)
+    _outreach_prospect(store)
+    journey_daemon_tick()                               # refused, waits
+    email.ok, email.error = True, None
+    data = store._load_prospects()
+    data['prospects']['p1']['email_draft']['retry_after'] = (
+        datetime.utcnow() - timedelta(seconds=1)).isoformat()
+    store._save_prospects(data)
+
+    journey_daemon_tick()                               # delivered
+
+    assert len(email.emails) == 2
+    assert store._load_prospects()['prospects']['p1']['emails_sent'] == 1
+    for listed in _listed(store, monkeypatch):
+        assert _entries(listed) == [], listed
+
+
+def test_a_given_up_first_email_the_agent_then_delivered_is_not_listed(
+        channels, store, no_mailer, no_wait, monkeypatch):
+    from integrations.agent_engine.journey_engine import journey_daemon_tick
+    email = _EmailChannel(ok=False, error='550 mailbox unavailable')
+    channels.registry.register(email)
+    _outreach_prospect(store)
+    for _ in range(3):
+        journey_daemon_tick()                           # given up
+    email.ok, email.error = True, None
+
+    sent = json.loads(_tools(store, monkeypatch)['send_outreach_email'](
+        'p1', 'your shop on mcgroce', '<p>hello Ana</p>'))
+
+    assert sent['success'] is True
+    for listed in _listed(store, monkeypatch):
+        assert _entries(listed) == [], listed
+
+
+def test_the_follow_up_listing_holds_only_steps_that_did_not_reach_their_prospect(
+        channels, store, no_mailer, monkeypatch):
+    """Review of 5970e07a1: a step in a sequence a reply had ended was
+    listed as waiting with a retry time though it is never tried again,
+    and nothing pinned the follow-up half of the listing.  Four prospects,
+    each refused once: p1 waits, p2 is given up, p3 is delivered on its
+    retry, p4 replies.  Only p1 and p2 are listed."""
+    email = _EmailChannel(ok=False, error='451 try later')
+    channels.registry.register(email)
+    data = _due_sequence(store)
+    for n, pid in enumerate(('p2', 'p3', 'p4'), 2):
+        data['prospects'][pid] = dict(data['prospects']['p1'], id=pid,
+                                      company=f'Shop {n}', email=f'{pid}@shop.example')
+        data['sequences'][f's{n}'] = dict(json.loads(json.dumps(data['sequences']['s1'])),
+                                          id=f's{n}', prospect_id=pid)
+    now = datetime.utcnow()
+    store.send_due_followups(data, now)                 # all four refused once
+    later = now
+    for _ in range(_tries(store) - 1):                  # p2: given up
+        later += timedelta(hours=10)
+        store.send_due_followups(data, later, prospect_id='p2')
+    email.ok, email.error = True, None
+    store.send_due_followups(data, later, prospect_id='p3')     # delivered
+    data['prospects']['p4']['last_reply_at'] = later.isoformat()
+    store.send_due_followups(data, later, prospect_id='p4')     # ended by the reply
+    store._save_prospects(data)
+    assert data['sequences']['s3']['steps'][0]['status'] == 'sent'
+    assert data['sequences']['s4']['status'] == 'completed'
+
+    for listed in _listed(store, monkeypatch):
+        assert _entries(listed) == [('p1', 'follow-up step 2', False),
+                                    ('p2', 'follow-up step 2', True)], listed
+        rows = {e['prospect_id']: e for e in listed['latest']}
+        assert rows['p1']['retry_after'] and rows['p1']['attempts'] == 1
+        assert rows['p2']['retry_after'] is None and rows['p2']['attempts'] == _tries(store)
+        assert (listed['given_up'], listed['waiting']) == (1, 1)
+
+
+def test_a_long_bounce_list_is_bounded_and_the_trimmed_view_keeps_the_ab_stats(
+        channels, store, no_mailer, no_wait, monkeypatch):
+    """Review of 5970e07a1: with 20 of 50 prospects bounced the journey view
+    grew from 6.1K to 10.8K chars, and the wire trim's middle cut at 4,000
+    or 8,000 chars (n_ctx 4096 on the installed build) then dropped the A/B
+    stats, which sat before the list.  Now the counts cover all of them,
+    the list holds the newest UNDELIVERED_LIST_LIMIT, and ab_test is last."""
+    from core.llm_outbound_logger import _truncate_msg_content
+    from integrations.agent_engine.journey_engine import journey_daemon_tick
+    channels.registry.register(_EmailChannel(ok=False, error='550 mailbox unavailable'))
+    data = {'prospects': {}, 'sequences': {}, 'sent_log': []}
+    for n in range(20):
+        pid = f'b{n}'
+        data['prospects'][pid] = {
+            'id': pid, 'company': f'Bounced shop {n}', 'contact_name': 'Ana',
+            'email': f'{pid}@shop.example', 'stage': 'new', 'emails_sent': 0,
+            'last_email_at': None, 'last_reply_at': None, 'created_by': 'owner-1',
+            'journey_stage': 'outreach',
+            'email_draft': {'subject': 'hi', 'body': '<p>hello</p>'}}
+    store._save_prospects(data)
+    for _ in range(_tries(store)):
+        journey_daemon_tick()                           # all 20 given up
+    data = store._load_prospects()
+    for n in range(30):                                 # and 30 that are fine
+        pid = f'f{n}'
+        data['prospects'][pid] = dict(data['prospects']['b0'], id=pid,
+                                      company=f'Fine shop {n}', email=f'{pid}@shop.example',
+                                      emails_sent=1, stage='contacted',
+                                      journey_stage='nurture')
+        data['prospects'][pid].pop('email_draft')
+    store._save_prospects(data)
+
+    out = _journey_tools(store, monkeypatch)['view_journey_pipeline']()
+
+    assert len(out) > 4000, len(out)                    # the 4,000 cut happens
+    for budget in (4000, 8000):
+        cut, _ = _truncate_msg_content({'role': 'tool', 'content': out},
+                                       budget, '...', lambda c: c)
+        assert '"ab_test"' in cut['content'], (budget, len(out))
+    listed = json.loads(out)['not_delivered']
+    limit = getattr(store, 'UNDELIVERED_LIST_LIMIT', 10)
+    assert (listed['given_up'], listed['waiting']) == (20, 0)
+    assert len(listed['latest']) == limit
+    tried = [e['last_tried_at'] for e in listed['latest']]
+    assert all(tried) and tried == sorted(tried, reverse=True)
+    pipeline = json.loads(_tools(store, monkeypatch)['get_pipeline_status']())['not_delivered']
+    assert (pipeline['given_up'], len(pipeline['latest'])) == (20, limit)
 
 
 def test_a_follow_up_given_up_on_the_journey_path_is_logged(channels, store, no_mailer, no_wait, warned):
@@ -494,6 +637,43 @@ def test_a_waiting_step_is_reported_and_is_not_overdue(channels, store, no_maile
     assert [(a['step'], a['attempts']) for a in waiting] == [(2, 1)], checked
     assert waiting[0]['retry_after'] and '451' in waiting[0]['error']
     assert 'Pending follow-ups: 1 (overdue: 0)' in _build_sales_prompt({})
+
+
+def test_a_step_behind_a_waiting_step_is_not_overdue(channels, store, no_mailer):
+    """Review of 5970e07a1 (its own case): two due steps, the first refused
+    and waiting.  The check sends nothing, so the prompt read 'overdue: 1'
+    and told the agent to investigate a step the check never reaches."""
+    from integrations.agent_engine.journey_engine import _build_sales_prompt
+    email = _EmailChannel(ok=False, error='451 try later')
+    channels.registry.register(email)
+    _due_sequence(store, steps=2)
+    store.check_pending_followups_daemon()
+
+    checked = json.loads(store._check_pending_followups_impl())
+
+    assert [a['action'] for a in checked['actions']] == ['followup_waiting'], checked
+    assert [s for _, s in email.emails] == ['bump 2']
+    assert 'Pending follow-ups: 2 (overdue: 0)' in _build_sales_prompt({})
+
+
+def test_due_steps_with_nothing_waiting_are_all_overdue(store):
+    """Unchanged by the reviews: a sequence whose next step is due counts
+    every step past its time."""
+    from integrations.agent_engine.journey_engine import _build_sales_prompt
+    _due_sequence(store, steps=2)
+
+    assert 'Pending follow-ups: 2 (overdue: 2)' in _build_sales_prompt({})
+
+
+def test_a_refusal_on_the_daemons_check_is_logged_once(channels, store, no_mailer, warned):
+    """Review nit of 5970e07a1: 'logged in one place' was unpinned; a second
+    warning in the daemon checker's wrapper passed every test."""
+    channels.registry.register(_EmailChannel(ok=False, error='550 mailbox unavailable'))
+    _due_sequence(store)
+
+    store.check_pending_followups_daemon()
+
+    assert len([w for w in warned if '550' in w]) == 1, warned
 
 
 def test_the_wait_grows_with_each_refused_try(channels, store, no_mailer):

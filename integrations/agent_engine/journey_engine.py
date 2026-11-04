@@ -719,7 +719,7 @@ def register_journey_tools(helper, assistant, user_id: str):
         stats, and the emails that were refused (waiting to be tried again
         or given up)."""
         from integrations.agent_engine.outreach_crm_tools import (
-            _load_prospects, undelivered_emails)
+            _load_prospects, undelivered_summary)
         data = _load_prospects()
         prospects = data.get('prospects', {})
 
@@ -740,8 +740,12 @@ def register_journey_tools(helper, assistant, user_id: str):
         return json.dumps({
             'pipeline': {k: {'count': len(v), 'prospects': v} for k, v in pipeline.items()},
             'total': len(prospects),
+            # Bounded (UNDELIVERED_LIST_LIMIT) and before ab_test: the wire
+            # trim cuts a long result's middle, so ab_test stays at the
+            # tail it kept before not_delivered existed (review of
+            # 5970e07a1).
+            'not_delivered': undelivered_summary(data),
             'ab_test': ab,
-            'not_delivered': undelivered_emails(data),
         }, default=str)
 
     def advance_prospect_stage(
@@ -899,25 +903,27 @@ def _build_sales_prompt(goal_dict: Dict, product_dict: Dict = None) -> str:
         verticals[v] = verticals.get(v, 0) + 1
     vertical_text = ', '.join('%s(%d)' % (v, c) for v, c in sorted(verticals.items(), key=lambda x: -x[1]))
 
-    # Pending follow-ups.  Overdue = due and not waiting out a refused
-    # send's wait (outreach_crm_tools.retry_due): a waiting step is not one
-    # the agent can send now, and counting it told the agent to investigate
-    # while check_pending_followups had nothing to send (review of
-    # 6da8b09c7).  The waiting step is still pending.
-    from integrations.agent_engine.outreach_crm_tools import retry_due
+    # Pending follow-ups.  Overdue = pending and past its time, in a
+    # sequence whose next step is due (outreach_crm_tools.next_followup, the
+    # checker's own rule).  A sequence whose next step waits out a refused
+    # send's wait sends nothing now, and the steps behind that one wait for
+    # it, so none of them is overdue: counting them told the agent to
+    # investigate while check_pending_followups had nothing to send
+    # (reviews of 6da8b09c7 and 5970e07a1).  They are still pending.
+    from integrations.agent_engine.outreach_crm_tools import next_followup
     pending_followups = 0
     overdue_followups = 0
     now = datetime.utcnow()
-    now_iso = now.isoformat()
     for seq in sequences.values():
         if seq.get('status') != 'active':
             continue
-        for step in seq.get('steps', []):
-            if step.get('status') == 'pending':
-                pending_followups += 1
-                if (step.get('scheduled_at', '9999') < now_iso
-                        and retry_due(step, now)):
-                    overdue_followups += 1
+        pending = [step for step in seq.get('steps', [])
+                   if step.get('status') == 'pending']
+        pending_followups += len(pending)
+        if next_followup(seq, now)[1] == 'due':
+            overdue_followups += sum(
+                1 for step in pending
+                if datetime.fromisoformat(step['scheduled_at']) <= now)
 
     # Stale prospects (no activity > 7 days)
     stale = []
