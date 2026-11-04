@@ -874,11 +874,109 @@ def register_sales_goal_type():
         logger.error('Failed to register sales goal type: %s', e)
 
 
+#: What the sales prompt says about the product when the goal names none:
+#: the HARTOS-for-robotics pitch it always carried, word for word.
+_HARTOS_PITCH = {
+    'product_section': """PRODUCT: HARTOS (Hevolve Hive Agentic Runtime OS)
+============================================================
+What it is:
+  - Open-source on-device AI runtime for robotics
+  - Runs LLM inference, computer vision, speech recognition, and multi-agent
+    orchestration DIRECTLY on robot hardware. No cloud round-trips.
+  - Every robot running HARTOS joins the Hive intelligence network:
+    private data stays local, but collective models improve with scale.
+
+Why robotics companies care:
+  - Eliminates cloud latency for real-time autonomy
+  - Works offline (warehouses, surgical theaters, field, underwater, space)
+  - One OS handles perception + reasoning + action (replaces 5+ SDKs)
+  - Early partners shape the intelligence layer for their vertical
+  - Open-source: no vendor lock-in, full hardware access
+
+Key differentiators vs competitors:
+  - NVIDIA Isaac: HARTOS adds LLM reasoning + multi-agent orchestration
+  - ROS2: HARTOS adds native AI inference, not just message passing
+  - Custom stacks: HARTOS is batteries-included, saves 6-12 months eng time
+
+Partnership offer:
+  - One partner per vertical (exclusive early access)
+  - Partner shapes the runtime for their use case
+  - Q2 2026 deadline for early access cohort
+  - Free integration support from the core team""",
+    'targets': """   - Target robotics companies across these verticals:
+     humanoid, healthcare/surgical, industrial, warehouse/logistics,
+     delivery, construction, defense/security, cobot, manufacturing,
+     agriculture, inspection, underwater, space, cleaning, hospitality""",
+    'pains': '   - Look for pain points HARTOS solves (latency, offline ops, multi-sensor fusion)',
+    'name': 'HARTOS',
+    'topic': 'on-device AI',
+    'value_step': 'Hive network value',
+    'search_hint': 'find new robotics companies',
+}
+
+
+def _sales_pitch(product_dict: Optional[Dict]) -> Dict:
+    """The product-dependent parts of the sales prompt: the goal's own
+    product (outreach_crm_tools.product_pitch) when it names one, else the
+    HARTOS-for-robotics pitch (_HARTOS_PITCH).  Every value is text the
+    prompt shows as it is (a '%' in one is safe: % formatting does not
+    re-read the text it puts in)."""
+    from integrations.agent_engine.outreach_crm_tools import product_pitch
+    pitch = product_pitch(product_dict)
+    if pitch is None:
+        return dict(_HARTOS_PITCH)
+    name = pitch['name']
+    first, _, rest = pitch['block'].partition('\n')
+    who = pitch['audience'] or (
+        'the people and businesses who need it' + (
+            f" ({', '.join(pitch['keywords'])})" if pitch['keywords'] else ''))
+    return {
+        'product_section': first + '\n' + '=' * 60 + ('\n' + rest if rest else ''),
+        'targets': f'   - Target the people and businesses {name} is for: {who}',
+        'pains': f'   - Look for pain points {name} solves'
+                 + (f' ({pitch["value"]})' if pitch['value'] else ''),
+        'name': name,
+        'topic': name,
+        'value_step': f'why {name} is better for them',
+        'search_hint': f'find people and businesses who need {name}',
+    }
+
+
+def _sales_goal_section(goal_dict: Dict) -> str:
+    """The goal's own words for the sales prompt: its title and
+    description, in the lines the other goal builders use, or '' when the
+    goal carries neither.
+
+    The 'outreach' builder this one replaced showed them; the 'sales'
+    builder never did, so the agent was told what to sell but not what
+    the person who set the goal asked for.  (That builder's CONFIG line
+    read goal_dict['config'], a key the daemon's goal dict lacks:
+    AgentGoal.to_dict merges the config into the top level, so the line
+    printed {} unless the config itself held a key named 'config'; it is
+    not carried over.)
+    GoalManager.build_prompt has already sanitised both fields."""
+    lines = []
+    if goal_dict.get('title'):
+        lines.append(f"Goal: {goal_dict['title']}")
+    if goal_dict.get('description'):
+        lines.append(f"Description: {goal_dict['description']}")
+    if not lines:
+        return ''
+    return ('=' * 60 + '\nYOUR GOAL\n' + '=' * 60 + '\n'
+            + '\n'.join(lines) + '\n\n')
+
+
 def _build_sales_prompt(goal_dict: Dict, product_dict: Dict = None) -> str:
     """Build the system prompt for the sales agent.
 
     Injects live pipeline state, A/B stats, and vertical coverage
     so the agent can make informed decisions each dispatch.
+
+    It pitches the goal's own product (product_dict, the Product row the
+    daemon passes), and the HARTOS-for-robotics pitch, word for word, only
+    when the goal names none: a sales goal for any other business used to
+    cold-email robotics companies (#233).  It also shows the goal's own
+    title and description (_sales_goal_section).
     """
     from integrations.agent_engine.outreach_crm_tools import _load_prospects
     data = _load_prospects()
@@ -948,33 +1046,8 @@ Email from: cortext@hertzai.com
 Replies go to: sathish@hertzai.com
 Website: https://hevolve.ai
 
-============================================================
-PRODUCT: HARTOS (Hevolve Hive Agentic Runtime OS)
-============================================================
-What it is:
-  - Open-source on-device AI runtime for robotics
-  - Runs LLM inference, computer vision, speech recognition, and multi-agent
-    orchestration DIRECTLY on robot hardware. No cloud round-trips.
-  - Every robot running HARTOS joins the Hive intelligence network:
-    private data stays local, but collective models improve with scale.
-
-Why robotics companies care:
-  - Eliminates cloud latency for real-time autonomy
-  - Works offline (warehouses, surgical theaters, field, underwater, space)
-  - One OS handles perception + reasoning + action (replaces 5+ SDKs)
-  - Early partners shape the intelligence layer for their vertical
-  - Open-source: no vendor lock-in, full hardware access
-
-Key differentiators vs competitors:
-  - NVIDIA Isaac: HARTOS adds LLM reasoning + multi-agent orchestration
-  - ROS2: HARTOS adds native AI inference, not just message passing
-  - Custom stacks: HARTOS is batteries-included, saves 6-12 months eng time
-
-Partnership offer:
-  - One partner per vertical (exclusive early access)
-  - Partner shapes the runtime for their use case
-  - Q2 2026 deadline for early access cohort
-  - Free integration support from the core team
+%(goal_section)s============================================================
+%(product_section)s
 
 ============================================================
 YOUR MISSION
@@ -987,37 +1060,34 @@ On every dispatch, you must:
    - Identify what needs attention RIGHT NOW
 
 2. DISCOVER NEW PROSPECTS (if pipeline < 50 or a vertical has < 3)
-   - Target robotics companies across these verticals:
-     humanoid, healthcare/surgical, industrial, warehouse/logistics,
-     delivery, construction, defense/security, cobot, manufacturing,
-     agriculture, inspection, underwater, space, cleaning, hospitality
+%(targets)s
    - Use google_search to find companies in underrepresented verticals
    - Call create_prospect() for each new company found
    - Include: company name, info@domain email, vertical, product description
 
 3. RESEARCH PROSPECTS (for any in 'new' or 'discover' stage)
    - Crawl their website to understand their product, funding, team
-   - Look for pain points HARTOS solves (latency, offline ops, multi-sensor fusion)
+%(pains)s
    - Update prospect notes with research findings
 
 4. SEND PERSONALIZED OUTREACH (for any in 'new' stage with no emails sent)
    - A/B test two subject line styles:
      Variant A (direct): "quick question about {product_keyword}"
-     Variant B (partnership): "{company} + on-device AI?"
+     Variant B (partnership): "{company} + %(topic)s?"
    - Alternate A/B assignment (even index = A, odd = B)
    - Call send_outreach_email() with personalized HTML body
    - Body must reference their SPECIFIC product and vertical
-   - Always include: what HARTOS is, why they should care, clear CTA (15-min call)
+   - Always include: what %(name)s is, why they should care, clear CTA (15-min call)
    - Tone: casual, human, lowercase subjects, no em dashes, no corporate speak
 
    Email template A (direct):
      Subject: quick question about {product_keyword}
-     Body: reference their product > what HARTOS does > teams in {vertical}
+     Body: reference their product > what %(name)s does > teams in {vertical}
            testing it > one slot per vertical > worth a 15-min call?
 
    Email template B (partnership):
-     Subject: {company} + on-device AI?
-     Body: what caught your attention > HARTOS pitch > Hive network value >
+     Subject: {company} + %(topic)s?
+     Body: what caught your attention > %(name)s pitch > %(value_step)s >
            one slot per vertical for Q2 > open to a quick chat?
 
 5. CREATE FOLLOW-UP SEQUENCES (for any prospect with email sent but no sequence)
@@ -1066,7 +1136,7 @@ Journey tools (4):
   - send_prospect_message(prospect_id, message, channel)
 
 General tools:
-  - google_search(query)       -- find new robotics companies
+  - google_search(query)       -- %(search_hint)s
   - delegate_to_specialist()   -- hand off complex tasks
 
 ============================================================
@@ -1096,20 +1166,20 @@ WRITING STYLE (critical -- must follow exactly)
 ============================================================
 LIVE PIPELINE STATE (as of this dispatch)
 ============================================================
-%s
+%(pipeline_text)s
 
-Total prospects: %d
-Active sequences: %d
-Pending follow-ups: %d (overdue: %d)
-Stale (>7d no activity): %s
-Total emails sent: %d
+Total prospects: %(total)d
+Active sequences: %(active)d
+Pending follow-ups: %(pending)d (overdue: %(overdue)d)
+Stale (>7d no activity): %(stale)s
+Total emails sent: %(sent)d
 
-Vertical coverage: %s
+Vertical coverage: %(verticals)s
 
 A/B TEST:
-  Variant A (direct): %d sent, %.1f%% reply rate
-  Variant B (partnership): %d sent, %.1f%% reply rate
-  Winner: %s (confidence: %s)
+  Variant A (direct): %(a_sent)d sent, %(a_rate).1f%% reply rate
+  Variant B (partnership): %(b_sent)d sent, %(b_rate).1f%% reply rate
+  Winner: %(winner)s (confidence: %(confidence)s)
 
 ============================================================
 EXECUTION ORDER (do this NOW)
@@ -1121,16 +1191,18 @@ EXECUTION ORDER (do this NOW)
 5. If any vertical has < 2 prospects, discover more
 6. If any prospect has no sequence, create one
 7. Report summary of all actions taken
-""" % (
-        pipeline_text or '  (empty pipeline -- seed prospects first!)',
-        len(prospects),
-        len([s for s in sequences.values() if s.get('status') == 'active']),
-        pending_followups,
-        overdue_followups,
-        ', '.join(stale[:5]) if stale else 'none',
-        len(sent_log),
-        vertical_text or 'none',
-        ab_stats['A']['sent'], ab_stats['A']['reply_rate'],
-        ab_stats['B']['sent'], ab_stats['B']['reply_rate'],
-        ab_stats['winner'], ab_stats['confidence'],
+""" % dict(
+        _sales_pitch(product_dict),
+        goal_section=_sales_goal_section(goal_dict),
+        pipeline_text=pipeline_text or '  (empty pipeline -- seed prospects first!)',
+        total=len(prospects),
+        active=len([s for s in sequences.values() if s.get('status') == 'active']),
+        pending=pending_followups,
+        overdue=overdue_followups,
+        stale=', '.join(stale[:5]) if stale else 'none',
+        sent=len(sent_log),
+        verticals=vertical_text or 'none',
+        a_sent=ab_stats['A']['sent'], a_rate=ab_stats['A']['reply_rate'],
+        b_sent=ab_stats['B']['sent'], b_rate=ab_stats['B']['reply_rate'],
+        winner=ab_stats['winner'], confidence=ab_stats['confidence'],
     )

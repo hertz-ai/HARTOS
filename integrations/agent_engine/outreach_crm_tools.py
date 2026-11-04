@@ -901,46 +901,52 @@ def send_due_followups(data: Dict, now: datetime,
 
 # ── Goal Type Registration ──
 
+def product_pitch(product_dict: Optional[Dict]) -> Optional[Dict]:
+    """The goal's own product as a sales prompt shows it, or None when the
+    goal names none (the prompt keeps its default pitch).
+
+    ``product_dict`` is the Product row's to_dict(), which agent_daemon
+    passes every goal prompt builder for the goal's product_id.  Both sales
+    builders ignored it and pitched HARTOS-for-robotics whatever the goal
+    sold (#233), so a sales goal for a grocery, a ride service or a speech
+    clinic would have cold-emailed robotics companies.
+
+    Returns {'name', 'block' (the PRODUCT lines), 'audience', 'keywords',
+    'value'}: every field the Product row carries that the prompt reads."""
+    if not isinstance(product_dict, dict):
+        return None
+    name = str(product_dict.get('name') or '').strip()
+    if not name:
+        return None
+    keywords = [str(k).strip() for k in (product_dict.get('keywords') or [])
+                if str(k).strip()]
+    lines = [f'PRODUCT: {name}']
+    for label, key in (('What it is', 'description'), ('In one line', 'tagline'),
+                       ('Who it is for', 'target_audience'),
+                       ('Why it is better', 'unique_value_prop'),
+                       ('Link', 'product_url'), ('Category', 'category')):
+        value = str(product_dict.get(key) or '').strip()
+        if value:
+            lines.append(f'  - {label}: {value}')
+    if keywords:
+        lines.append(f"  - Keywords: {', '.join(keywords)}")
+    return {'name': name, 'block': '\n'.join(lines),
+            'audience': str(product_dict.get('target_audience') or '').strip(),
+            'keywords': keywords,
+            'value': str(product_dict.get('unique_value_prop') or '').strip()}
+
+
 def build_outreach_prompt(goal_dict: Dict, product_dict: Dict = None) -> str:
-    """Build the prompt for an outreach goal.
+    """The prompt of an 'outreach' goal: the sales agent's
+    (journey_engine._build_sales_prompt).
 
-    This prompt is sent to /chat → CREATE/REUSE pipeline.
-    """
-    title = goal_dict.get('title', 'Sales Outreach')
-    description = goal_dict.get('description', '')
-    config = goal_dict.get('config', {})
-
-    prospects_summary = ''
-    data = _load_prospects()
-    if data['prospects']:
-        lines = []
-        for pid, p in data['prospects'].items():
-            lines.append(f"- {p['company']} ({p['contact_name']}, {p['email']}) — stage: {p['stage']}, emails sent: {p.get('emails_sent', 0)}")
-        prospects_summary = '\n'.join(lines)
-
-    return f"""You are a B2B sales outreach agent for HevolveAI.
-
-PRODUCT: HARTOS (Hevolve Hive Agentic Runtime OS)
-- On-device AI runtime for robotics: LLM inference, vision, speech, semantic memory, multi-agent orchestration
-- Democratically evolving Hive network (not controlled by any single LLM vendor)
-- Flywheel: more robots deployed → more data → better model → more developers → more robots
-- Early partners shape how the intelligence evolves for their vertical
-
-GOAL: {title}
-{description}
-
-CURRENT PIPELINE:
-{prospects_summary or '(No prospects yet — use create_prospect to add them)'}
-
-RULES:
-1. Sound human. No em dashes. Casual lowercase subject lines. Short sentences.
-2. Create FOMO: one partner per vertical, Q2 deadline, name competitors who locked into Big Tech
-3. Follow-up sequence: day 3, day 7, day 14 — each shorter and more direct
-4. If a prospect replies, move them to 'replied' stage and stop the sequence
-5. Use the outreach CRM tools to track everything
-
-CONFIG: {json.dumps(config)}
-"""
+    'outreach' and 'sales' were two goal types with two builders for one
+    job, and both pitched HARTOS-for-robotics only (#233/#234); this one
+    also listed every prospect's email address in the prompt.  One builder
+    now serves both goal types: it pitches the goal's own product and
+    keeps the goal's title and description, which this one showed."""
+    from integrations.agent_engine.journey_engine import _build_sales_prompt
+    return _build_sales_prompt(goal_dict, product_dict)
 
 
 def register_outreach_goal_type():
