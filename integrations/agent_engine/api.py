@@ -224,12 +224,14 @@ def get_guardrail_status():
         HiveCircuitBreaker, CONSTITUTIONAL_RULES, COMPUTE_CAPS,
         WORLD_MODEL_BOUNDS,
     )
+    # Both are read-only MappingProxyType views (3d468794); JSON cannot encode
+    # one, so the reply sends plain copies and the guardrails stay frozen.
     return jsonify({
         'success': True,
         'circuit_breaker': HiveCircuitBreaker.get_status(),
         'constitutional_rules_count': len(CONSTITUTIONAL_RULES),
-        'compute_caps': COMPUTE_CAPS,
-        'world_model_bounds': WORLD_MODEL_BOUNDS,
+        'compute_caps': dict(COMPUTE_CAPS),
+        'world_model_bounds': dict(WORLD_MODEL_BOUNDS),
     })
 
 
