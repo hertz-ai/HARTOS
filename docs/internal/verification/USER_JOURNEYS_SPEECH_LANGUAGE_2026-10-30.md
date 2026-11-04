@@ -68,7 +68,8 @@ How the person's side was played, exactly:
   owner flow.
 
 Legend: MEASURED = run on the desktop and read from its output; READ = read from code or
-files without a run; NOT CHECKED = no evidence either way; (review) = hartos-f9's reading.
+files without a run; NOT CHECKED = no evidence either way; (review) = a reviewer's reading
+(hartos-f9's in sections 0 to 5; in section 6, the review of 5818bb9b7 on 3 Nov).
 
 ## 0. Cross-cutting steps every agent journey depends on
 
@@ -234,8 +235,18 @@ ready for his ball practice."
   made in this conversation, for example "You did AMAZING, Arjun! You said "Ba" which is
   so close to "ball"!" (quotes here leave out the emoji the messages carried). The
   turn's reply praised "Ba" the same way.
-- The same failure as on 2 Nov (docs/VERIFICATION.md, its Syllable Coach row), with the
-  same three causes recorded there; their fixes are local commits, none on the desktop.
+- The same praise of an attempt nobody made as on 2 Nov (docs/VERIFICATION.md, its
+  Syllable Coach row), on the same installed code; the walk was not the same: on 2 Nov
+  action 3 gave up and actions 4 to 9 were never reached, here all nine ran inside the one
+  turn without waiting (review). That row records three causes as addressed by no commit:
+  the saved steps carry the 30 Oct creation run's literal values, a session reads another
+  session's attempt from agent memory, and the banked order reads before it asks. Since
+  then, local commits touch two of them and fix none for this agent: fd4a8c353 keeps the
+  creation-time values out of the saved steps the model is shown (its own test keeps
+  cross-session key reads working, review), and cdeca7500 saves the approved plan instead
+  of re-asking the model, which changes how future agents are saved, not the Syllable
+  Coach's order saved on 30 Oct. Nothing addresses the cross-session read. Neither commit
+  is on the desktop (the installed reuse, create and lifecycle files hash-match b599e7f98).
 - NOT RUN: the child's attempt and the same words in Hindi, the two turns planned next;
   the owner was at the desk, so the runner stopped.
 
@@ -253,3 +264,14 @@ the chat-create path with autonomous creation, request `msg_1793687224401_create
   actions, the first `get_user_camera_inp`, five of them desktop video-editor commands.
   The driver sent no proceed turn after it read those steps. The record stays on the node;
   deleting it is the owner's call.
+- (review) Between the force-approve and the save a third `gather_info` model call ran,
+  so the 13 saved actions are a re-emitted answer, not shown to be the refinement that was
+  force-approved: the defect cdeca7500 fixes, not installed. No round-1 file was staged.
+- (review) The run did not end at the save. The same request went on to run action 1
+  until 12:06:07: three `get_user_camera_inp` calls failed with "No camera frame", three
+  messages were delivered to user 10202's two clients (12:02:29, 12:03:36, 12:04:55),
+  then action 1 blocked waiting for the person and the turn replied "Agent details
+  gathered autonomously. Moving to review....". Section 4's hazards recur here: the camera
+  tool, and a creation turn that acts on the person's devices. These lines are the review's
+  reading of that day's `frozen_debug.log`, which has since rotated; they were not re-read
+  for this correction.
