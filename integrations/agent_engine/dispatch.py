@@ -1733,11 +1733,22 @@ def _dispatch_goal_turn(prompt: str, user_id: str, goal_id: str,
                          'restriction', goal_id, exc_info=True)
 
     # GUARDRAIL: full pre-dispatch gate (fail-closed: block if guardrails unavailable)
-    # Pass the goal dict + user_id so before_dispatch's goal-specific checks
+    # Pass the goal dict so before_dispatch's goal-specific checks
     # (constitutional, ethos, require_consent — #698) actually run on this
-    # path; agent_daemon.py:1268 passes goal.to_dict() the same way, and
-    # prompt-only here left those checks dormant for dispatch_goal.
+    # path; prompt-only here left those checks dormant for dispatch_goal.
+    #
+    # The requester the gate asks for consent is the goal's OWNER
+    # (core.event_attribution.goal_owner_user_id), the person agent_daemon's
+    # own gate names too, never this function's user_id: the daemon
+    # dispatches with agent['user_id'], an agent account, which can neither
+    # grant consent nor see the ask.  Measured on the owner's desktop
+    # 2026-11-04/05: every consent-flagged seeded goal was refused here 44
+    # times ("pending request filed") although the owner had granted
+    # data_access and the daemon's gate had passed them, and 25 agent
+    # accounts held pending requests nobody could answer.  A seeded goal
+    # names no owner, so the gate asks the boot owner (HEVOLVE_OWNER_USER_ID).
     _guard_goal_dict = None
+    _consent_requester = None
     # The same read says whether the turn may use the owner's expert: the
     # goal's OWN type, kept only for a goal that is the node's own
     # (_org_goal).  The goal_type argument defaults to 'marketing', so a
@@ -1750,6 +1761,8 @@ def _dispatch_goal_turn(prompt: str, user_id: str, goal_id: str,
             _grow = _gdb.query(AgentGoal).filter_by(id=goal_id).first()
             if _grow is not None:
                 _guard_goal_dict = _grow.to_dict()
+                from core.event_attribution import goal_owner_user_id
+                _consent_requester = goal_owner_user_id(_grow)
                 if _org_goal(_grow, _gdb):
                     _expert_goal_type = _grow.goal_type
     except Exception as _gerr:
@@ -1758,7 +1771,7 @@ def _dispatch_goal_turn(prompt: str, user_id: str, goal_id: str,
     try:
         from security.hive_guardrails import GuardrailEnforcer
         allowed, reason, prompt = GuardrailEnforcer.before_dispatch(
-            prompt, goal_dict=_guard_goal_dict, user_id=user_id)
+            prompt, goal_dict=_guard_goal_dict, user_id=_consent_requester)
         if not allowed:
             logger.warning(f"Dispatch blocked for {goal_type} goal {goal_id}: {reason}")
             return None
