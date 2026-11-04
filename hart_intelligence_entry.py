@@ -10994,7 +10994,8 @@ def chat():
                             mark_create_start(request_id=request_id)
                         except ImportError:
                             mark_create_end = None
-                        recipe_response = recipe(user_id, prompt, prompt_id, file_id, request_id)
+                        recipe_response = recipe(user_id, prompt, prompt_id, file_id, request_id,
+                                                 autonomous=True)
                         if recipe_response == 'Agent Created Successfully':
                             with _user_lock:
                                 review_agents[_ak] = True
@@ -11449,7 +11450,11 @@ def chat():
                 review_agents[_ak] = True
                 conversation_agent[_ak] = False
                 _touch_agent_timestamp(_ak)
-            response = recipe(user_id, prompt, prompt_id, file_id, request_id)
+            # autonomous=True carries the steward rule above into CREATE: the
+            # approved plan runs with the AUTONOMOUS prompt (2026-11-04: on
+            # the person's request id it read INTERACTIVE and Reel Studio,
+            # agent 342, stalled on step 2 asking her questions).
+            response = recipe(user_id, prompt, prompt_id, file_id, request_id, autonomous=True)
             if response in ('Agent Created Successfully',
                             'Agent Already Created Successfully'):
                 with _rr_lock:

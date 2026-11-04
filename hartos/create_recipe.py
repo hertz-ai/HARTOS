@@ -1036,7 +1036,7 @@ def _drop_unregistered_tool_names(recipe_steps, agents):
     return recipe_steps
 
 
-def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any, Any, Any]:
+def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tuple[Any, Any, Any, Any, Any, Any, Any]:
     """Create new assistant & user agents for a given user_id"""
     user_prompt = f'{user_id}_{prompt_id}'
     individual_json[user_prompt] = None
@@ -1153,12 +1153,22 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     # core Gate-1 stall, seen directly in the :8080 capture of a daemon coding
     # goal running in INTERACTIVE mode.  Resolve it from the request_id so
     # autonomous runs are told to use sensible defaults and never block.
-    _autonomous_run = False
-    try:
-        from integrations.agent_engine.dispatch import is_current_request_autonomous
-        _autonomous_run = is_current_request_autonomous()
-    except Exception:
-        _autonomous_run = False
+    #
+    # A caller that is finishing an agent the person already approved says so
+    # (``autonomous``): chat()'s config-without-recipe branch, whose steward
+    # rule (2026-08-22) is to finish the recipe AUTONOMOUSLY.  Measured live
+    # 2026-11-04 on Reel Studio (agent 342): that branch ran on the person's
+    # request id, so this read INTERACTIVE and the approved plan stalled on
+    # step 2 asking her questions (owner 2026-11-04: "approved plan shd run
+    # autonomously").  Only the assistant's prompt follows this flag; where
+    # an ask goes is still is_current_request_autonomous's call.
+    _autonomous_run = bool(autonomous)
+    if not _autonomous_run:
+        try:
+            from integrations.agent_engine.dispatch import is_current_request_autonomous
+            _autonomous_run = is_current_request_autonomous()
+        except Exception:
+            _autonomous_run = False
     assistant = instantiate_assistant_agent(
         list_of_persona, user_prompt, personality=_agent_personality,
         resonance_profile=_resonance_profile, autonomous=_autonomous_run)
@@ -1177,7 +1187,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             tool_logger.warning(f"Could not apply Agent Lightning: {e}. Continuing with standard agent.")
 
     helper = instantiate_helper_agent()
-    verify = instantiate_status_verifier_agent(user_prompt)
+    verify = instantiate_status_verifier_agent(user_prompt, autonomous=_autonomous_run)
     executor = instantiate_executor_agent()
 
     chat_instructor = autogen.UserProxyAgent(
@@ -2699,13 +2709,18 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                             _needs_user_input = False
                             try:
                                 _gate_value = (json_obj.get('can_perform_without_user_input') or '').strip().lower()
+                                _verdict_status = json_obj['status'].lower()
                                 # `safe_set_state(..., PENDING)` above is REFUSED on a
                                 # terminal action, so the verdict can arrive for an
                                 # action that is already over.  Flagging that one asks
                                 # the user a question no answer can resolve — see
                                 # _should_block_on_user_input for the 20-minute live
-                                # stall this closes.
-                                if _should_block_on_user_input(user_prompt, current_action_id, _gate_value):
+                                # stall this closes.  A run its creator freed keeps a
+                                # pending step with the agent (owner 2026-11-04).
+                                if _should_block_on_user_input(
+                                        user_prompt, current_action_id, _gate_value,
+                                        status=_verdict_status,
+                                        autonomous=_autonomous_run):
                                     _needs_user_input = True
                                     user_tasks[user_prompt]._needs_user_input_action_id = current_action_id
                                     # A `completed` + `no` step has already asked
@@ -2726,9 +2741,12 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                 elif autonomy_needs_user(_gate_value):
                                     current_app.logger.info(
                                         f"[USER-INPUT-GATE] NOT flagging action {current_action_id}: "
-                                        f"verdict said {_gate_value!r} but the action is already "
-                                        f"{get_action_state(user_prompt, current_action_id).value} — "
-                                        f"a finished action cannot be waiting for the user."
+                                        f"verdict said {_gate_value!r} on {_verdict_status!r}, "
+                                        f"action is "
+                                        f"{get_action_state(user_prompt, current_action_id).value}, "
+                                        f"freed run {_autonomous_run} (a finished action cannot "
+                                        f"wait for the person; a freed run's pending step goes "
+                                        f"back to the agent)"
                                     )
                             except Exception as _gate_err:
                                 current_app.logger.debug(
@@ -3284,7 +3302,17 @@ def instantiate_executor_agent():
     return executor
 
 
-def instantiate_status_verifier_agent(user_prompt):
+#: f31aff772 (2026-05-08): a verifier "no" sticks until the person replies.
+#: Written for an interactive build whose verifier flipped to "yes" and faked
+#: "Sitemap structure confirmed".  Not given to a run its creator freed (owner
+#: 2026-11-04, "the verifier used to flip to "yes" on its own so that it can
+#: progress autonomously when the creator has given it freedom"); there a step
+#: that asked the person still waits through _completed_verdict_still_waits.
+_USER_INPUT_HARD_RULE = """        USER-INPUT GATE (HARD RULE): If a previous turn for THIS action returned `can_perform_without_user_input: "no"` (explicitly marked as requiring user input — e.g. "Confirm sitemap with user", "Choose payment method", "Approve plan"), you MUST NOT flip it to `"yes"` and you MUST NOT mark `"status": "completed"` until the user has actually replied. The autonomous-mode preference for "completed" does NOT override an explicit user-input requirement. For these actions, return `"status": "pending"` and keep `can_perform_without_user_input: "no"` until a fresh user message arrives in the conversation. Hallucinating a user confirmation ("user confirmed the structure", "sitemap approved") when the user hasn't actually replied is a contract violation — the user's reply must be visibly present in the message history.
+"""
+
+
+def instantiate_status_verifier_agent(user_prompt, autonomous=False):
     # This agent AUTHORS every recipe.  state_transition pins recipe-creation
     # requests to it deterministically (is_recipe_creation_request -> return
     # verify), and the authoring prompt orders it verbatim to "put the EXACT
@@ -3322,8 +3350,7 @@ def instantiate_status_verifier_agent(user_prompt):
         code_execution_config=False,
         system_message=""""You are a Status Verification Agent in a multi-agent system.
         AUTONOMOUS MODE: Use sensible defaults for ordinary preferences, but never treat a plan, a claimed click, a simulated attempt, or a model statement as completion. Mark an action "completed" only when a matching tool receipt or a user-visible result is already present in this conversation. If it is not, return "pending" and state the missing evidence or user input.
-        USER-INPUT GATE (HARD RULE): If a previous turn for THIS action returned `can_perform_without_user_input: "no"` (explicitly marked as requiring user input — e.g. "Confirm sitemap with user", "Choose payment method", "Approve plan"), you MUST NOT flip it to `"yes"` and you MUST NOT mark `"status": "completed"` until the user has actually replied. The autonomous-mode preference for "completed" does NOT override an explicit user-input requirement. For these actions, return `"status": "pending"` and keep `can_perform_without_user_input: "no"` until a fresh user message arrives in the conversation. Hallucinating a user confirmation ("user confirmed the structure", "sitemap approved") when the user hasn't actually replied is a contract violation — the user's reply must be visibly present in the message history.
-        Role: Track, validate and verify the status of actions performed by other agents. Respond strictly in JSON:
+""" + ('' if autonomous else _USER_INPUT_HARD_RULE) + """        Role: Track, validate and verify the status of actions performed by other agents. Respond strictly in JSON:
         Response formats:
             1. Action Completed: {"status": "completed","action": "current action","action_id": 1/2/3...,"message": "message here","evidence": {"message_index": 0,"kind": "tool_receipt|user_visible_result"},"can_perform_without_user_input":"yes by default. Only no when absolutely impossible (e.g. payment auth, physical access) OR when the action verbatim asks the user to choose/confirm/approve","persona_name":"persona name","fallback_action": "Context-aware retry strategy. NEVER leave empty."}
             2. Action Error: {"status": "error","action": "current action","action_id": 1/2/3...,"message": "error details"}
@@ -4361,8 +4388,20 @@ def _is_terminate(content):
     return _strip_memory_skeleton(content).upper().startswith('TERMINATE')
 
 
-def _should_block_on_user_input(user_prompt, action_id, gate_value) -> bool:
+def _should_block_on_user_input(user_prompt, action_id, gate_value, *,
+                                status='pending', autonomous=False) -> bool:
     """Should the StatusVerifier's `can_perform_without_user_input` block this action?
+
+    A run its creator freed (``autonomous``: an approved plan finished by
+    chat()'s resume branch, or a daemon goal) is not stopped by a `pending` +
+    `no`: the step goes back to the agent, which asks the person itself if it
+    really must, and the loop's own bounds end in _ask_for_help as before.
+    Owner 2026-11-04: "the verifier used to flip to "yes" on its own so that
+    it can progress autonomously when the creator has given it freedom".
+    Measured that day, Reel Studio (agent 342): this gate stopped step 2,
+    which asks the person nothing, at 12:50:36 and 13:00:43.  A `completed` +
+    `no` (the step has asked the person, _completed_verdict_still_waits) is
+    still the gate's on every run.
 
     Only an action that still has work left can be waiting on the USER.  A
     TERMINAL action is over — nothing the user types can change its outcome — so
@@ -4403,6 +4442,8 @@ def _should_block_on_user_input(user_prompt, action_id, gate_value) -> bool:
     paying for.
     """
     if not autonomy_needs_user(gate_value):
+        return False
+    if autonomous and status == 'pending':
         return False
     try:
         if is_terminal_state(get_action_state(user_prompt, action_id)):
@@ -4973,7 +5014,7 @@ def step_instruction(action_no, action_text, user_text) -> str:
     return f'Execute Action {action_no}: {action_text} ,Latest User message: {user_text}'
 
 
-def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
+def get_response_group(user_id,text,prompt_id,Failure=False,error=None,autonomous=False):
     """
     Handles the response generation process for an agent group.
     Args:
@@ -5006,7 +5047,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
         current_app.logger.info(f"Creating new agents for user_prompt={user_prompt}")
         try:
             author, assistant_agent, executor, group_chat, manager, chat_instructor, agents_object = create_agents(
-                user_id, user_tasks[user_prompt], prompt_id)
+                user_id, user_tasks[user_prompt], prompt_id, autonomous=autonomous)
             user_agents[user_prompt] = (author, assistant_agent, executor, group_chat, manager, chat_instructor,agents_object)
             messages[user_prompt] = []
             current_app.logger.info(f"Successfully created agents for user_prompt={user_prompt}")
@@ -7316,7 +7357,10 @@ from core.llm_outbound_logger import with_llm_context as _with_llm_context
 
 
 @_with_llm_context('autogen.create')
-def recipe(user_id, text, prompt_id, file_id, request_id):
+def recipe(user_id, text, prompt_id, file_id, request_id, autonomous=False):
+    """Run one CREATE turn for this agent's approved plan.  ``autonomous``:
+    the caller is finishing an agent already approved, so the plan runs with
+    the assistant's AUTONOMOUS prompt (create_agents)."""
     user_prompt = f'{user_id}_{prompt_id}'
     request_id_list[user_prompt] = request_id
     # A turn begins with no pause pending (helper_fun.clear_pause_request).
@@ -7351,12 +7395,12 @@ def recipe(user_id, text, prompt_id, file_id, request_id):
     # an ended turn by asking _another_turn_in_flight.
     with _turn_in_flight(user_prompt):
         try:
-            last_response = get_response_group(user_id, text, prompt_id)
+            last_response = get_response_group(user_id, text, prompt_id, autonomous=autonomous)
         except Exception as e:
             current_app.logger.error(f"Error occurred in create Recipe: {str(e)}")
             error_message = traceback.format_exc()
             current_app.logger.error(f"Error occurred in create Recipe stack trace:\n{error_message}")
-            last_response = get_response_group(user_id, text, prompt_id, True, e)
+            last_response = get_response_group(user_id, text, prompt_id, True, e, autonomous=autonomous)
 
     # Rest of the function remains the same...
     if scheduler_check.get(user_prompt) is True:

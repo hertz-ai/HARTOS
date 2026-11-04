@@ -113,6 +113,21 @@ def selector(test_user_id, test_prompt_id, mock_flask_app, sample_config_json):
     """The REAL state_transition closure of create_agents, with autogen's
     constructors mocked (the same seam tests/unit/test_agent_creation.py
     uses), bound to a one-action task like agent 20's."""
+    with _built_selector(test_user_id, test_prompt_id) as built:
+        yield built
+
+
+@pytest.fixture
+def freed_selector(test_user_id, test_prompt_id, mock_flask_app, sample_config_json):
+    """The same closure for a run its creator freed: an approved plan that
+    chat()'s config-without-recipe branch finishes with autonomous=True, on
+    the person's own request id (no daemon_ prefix)."""
+    with _built_selector(test_user_id, test_prompt_id, autonomous=True) as built:
+        yield built
+
+
+@contextmanager
+def _built_selector(test_user_id, test_prompt_id, autonomous=False):
     up = f'{test_user_id}_{test_prompt_id}'
     clear_action_states(up)
     cr._STATE_TRANSITION_LOOP_STATE.pop(up, None)
@@ -130,13 +145,17 @@ def selector(test_user_id, test_prompt_id, mock_flask_app, sample_config_json):
     for p in patches[:2]:
         p.start()
     try:
-        out = cr.create_agents(test_user_id, task, test_prompt_id)
+        out = cr.create_agents(test_user_id, task, test_prompt_id, autonomous=autonomous)
         select = mocks['GroupChat'].call_args.kwargs['speaker_selection_method']
         agents_object = out[6]
+        verifier_prompt = next(
+            c.kwargs['system_message'] for c in mocks['AssistantAgent'].call_args_list
+            if c.kwargs.get('name') == 'StatusVerifier')
         yield SimpleNamespace(up=up, task=task, select=select,
                               assistant=agents_object['assistant'],
                               verify=agents_object['verify'],
-                              chat_instructor=out[5])
+                              chat_instructor=out[5],
+                              verifier_prompt=verifier_prompt)
     finally:
         for p in reversed(patches):
             p.stop()
@@ -326,6 +345,52 @@ class TestACompletedVerdictThatNeedsThePersonStillAsks:
             thread_local_data.set_request_id(previous_rid or '')
         assert getattr(s.task, '_needs_user_input_action_id', None) is None
         assert chosen is s.chat_instructor
+
+
+class TestARunItsCreatorFreedKeepsWorking:
+    """Owner 2026-11-04: "the verifier used to flip to "yes" on its own so
+    that it can progress autonomously when the creator has given it freedom".
+
+    f31aff772 (2026-05-08) made every verifier "no" stop the round and stick
+    until the person replies, for an interactive build that faked "Sitemap
+    structure confirmed".  It never asked whether the run was freed.  MEASURED
+    live 2026-11-04, Reel Studio (agent 342), an approved plan finished by
+    chat()'s resume branch: the verifier said "no" on step 2 ("Extract the key
+    visual elements and transitions from each clip"), a step that asks the
+    person nothing, at 12:50:36 and again at 13:00:43; the gate ended both
+    rounds and the person was sent "Step 2 ... isn't coming together".
+
+    A freed run's pending step goes back to the agent, which asks the person
+    itself if it really must; the loop's existing bounds (3 attempts, 30
+    rounds, 30 minutes) end in _ask_for_help as before.  A step that already
+    asked the person (`completed` + `no`) still waits for the reply (#158).
+    """
+
+    def test_a_verifier_no_on_a_pending_step_goes_back_to_the_agent(self, freed_selector):
+        s = freed_selector
+        group = SimpleNamespace(messages=[POSTED, _verdict('no')], agents=[])
+        chosen = s.select(s.verify, group)
+        assert getattr(s.task, '_needs_user_input_action_id', None) is None, (
+            'a freed run was stopped to ask the person (342 step 2, 12:50:36)')
+        assert chosen is s.assistant
+
+    def test_a_step_that_asked_the_person_still_waits_for_the_reply(self, freed_selector):
+        s = freed_selector
+        group = SimpleNamespace(
+            messages=[POSTED, _verdict('no', status='completed')], agents=[])
+        assert s.select(s.verify, group) is None
+        assert s.task._needs_user_input_action_id == 1
+        assert s.task._needs_user_input_kind == 'awaiting_reply'
+
+    def test_its_verifier_is_not_told_to_keep_a_no(self, freed_selector):
+        prompt = freed_selector.verifier_prompt
+        assert 'USER-INPUT GATE (HARD RULE)' not in prompt
+        # The rest of the verifier's contract is unchanged.
+        assert 'Completion evidence rule' in prompt
+        assert 'Status Verification Agent' in prompt
+
+    def test_an_interactive_build_keeps_the_rule(self, selector):
+        assert 'USER-INPUT GATE (HARD RULE)' in selector.verifier_prompt
 
 
 @pytest.fixture
