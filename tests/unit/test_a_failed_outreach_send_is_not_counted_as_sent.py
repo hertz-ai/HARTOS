@@ -445,11 +445,23 @@ def warned(store, monkeypatch):
     return lines
 
 
+def _summary(out):
+    """A tool result's refused emails as {'latest', 'given_up', 'waiting'}.
+    Since fe99feac3's review the counts sit at the head of the result
+    ('not_delivered_count') and the rows stay in 'not_delivered'; earlier
+    commits kept one 'not_delivered' dict (or list).  Read every shape, so a
+    run on an earlier commit fails by what it shows, not by a missing key."""
+    out = json.loads(out)
+    if 'not_delivered_count' in out:
+        return dict(out['not_delivered_count'], latest=out['not_delivered'])
+    return out['not_delivered']
+
+
 def _listed(store, monkeypatch):
     """not_delivered as both agent tools return it, one per tool."""
     return (
-        json.loads(_tools(store, monkeypatch)['get_pipeline_status']())['not_delivered'],
-        json.loads(_journey_tools(store, monkeypatch)['view_journey_pipeline']())['not_delivered'])
+        _summary(_tools(store, monkeypatch)['get_pipeline_status']()),
+        _summary(_journey_tools(store, monkeypatch)['view_journey_pipeline']()))
 
 
 def _entries(listed):
@@ -558,14 +570,9 @@ def test_the_follow_up_listing_holds_only_steps_that_did_not_reach_their_prospec
         assert (listed['given_up'], listed['waiting']) == (1, 1)
 
 
-def test_a_long_bounce_list_is_bounded_and_the_trimmed_view_keeps_the_ab_stats(
-        channels, store, no_mailer, no_wait, monkeypatch):
-    """Review of 5970e07a1: with 20 of 50 prospects bounced the journey view
-    grew from 6.1K to 10.8K chars, and the wire trim's middle cut at 4,000
-    or 8,000 chars (n_ctx 4096 on the installed build) then dropped the A/B
-    stats, which sat before the list.  Now the counts cover all of them,
-    the list holds the newest UNDELIVERED_LIST_LIMIT, and ab_test is last."""
-    from core.llm_outbound_logger import _truncate_msg_content
+def _twenty_bounced(store, channels):
+    """20 prospects whose first email was refused until given up (by the
+    real journey ticks), and 30 more that are fine."""
     from integrations.agent_engine.journey_engine import journey_daemon_tick
     channels.registry.register(_EmailChannel(ok=False, error='550 mailbox unavailable'))
     data = {'prospects': {}, 'sequences': {}, 'sent_log': []}
@@ -590,6 +597,17 @@ def test_a_long_bounce_list_is_bounded_and_the_trimmed_view_keeps_the_ab_stats(
         data['prospects'][pid].pop('email_draft')
     store._save_prospects(data)
 
+
+def test_a_long_bounce_list_is_bounded_and_the_trimmed_view_keeps_the_ab_stats(
+        channels, store, no_mailer, no_wait, monkeypatch):
+    """Review of 5970e07a1: with 20 of 50 prospects bounced the journey view
+    grew from 6.1K to 10.8K chars, and the wire trim's middle cut at 4,000
+    or 8,000 chars (n_ctx 4096 on the installed build) then dropped the A/B
+    stats, which sat before the list.  Now the counts cover all of them,
+    the list holds the newest UNDELIVERED_LIST_LIMIT, and ab_test is last."""
+    from core.llm_outbound_logger import _truncate_msg_content
+    _twenty_bounced(store, channels)
+
     out = _journey_tools(store, monkeypatch)['view_journey_pipeline']()
 
     assert len(out) > 4000, len(out)                    # the 4,000 cut happens
@@ -604,14 +622,48 @@ def test_a_long_bounce_list_is_bounded_and_the_trimmed_view_keeps_the_ab_stats(
     cut, _ = _truncate_msg_content({'role': 'tool', 'content': status},
                                    4000, '...', lambda c: c)
     assert '"given_up": 20' in cut['content'], len(status)
-    listed = json.loads(out)['not_delivered']
+    listed = _summary(out)
     limit = getattr(store, 'UNDELIVERED_LIST_LIMIT', 10)
     assert (listed['given_up'], listed['waiting']) == (20, 0)
     assert len(listed['latest']) == limit
     tried = [e['last_tried_at'] for e in listed['latest']]
     assert all(tried) and tried == sorted(tried, reverse=True)
-    pipeline = json.loads(_tools(store, monkeypatch)['get_pipeline_status']())['not_delivered']
+    pipeline = _summary(status)
     assert (pipeline['given_up'], len(pipeline['latest'])) == (20, limit)
+
+
+@pytest.mark.parametrize('tool', ['view_journey_pipeline', 'get_pipeline_status'])
+def test_the_seats_token_cut_keeps_the_bounce_counts(channels, store, no_mailer, no_wait,
+                                                     monkeypatch, tool):
+    """Review of fe99feac3: the create and reuse seats register these tools
+    behind hartos.helper.token_limiter, which keeps only the head of a tool
+    message, and that cut comes before the wire trim.  Counts moved to the
+    tail survived the wire trim and were cut there: the agent could not
+    tell that 20 had bounced."""
+    from core.constants import (AUTOGEN_MESSAGE_TOKEN_BUDGET,
+                                AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE)
+    from hartos.helper import token_limiter
+    _twenty_bounced(store, channels)
+    tools = dict(_tools(store, monkeypatch), **_journey_tools(store, monkeypatch))
+    out = tools[tool]()
+    turn = [
+        {'role': 'user', 'name': 'ChatInstructor',
+         'content': 'Check the outreach pipeline and say what bounced.'},
+        {'role': 'assistant', 'name': 'Assistant', 'content': '',
+         'tool_calls': [{'id': 'call_1', 'type': 'function',
+                         'function': {'name': tool, 'arguments': '{}'}}]},
+        {'role': 'tool', 'name': 'Assistant', 'tool_call_id': 'call_1',
+         'content': out},
+    ]
+    limiter = token_limiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET,
+                            max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE,
+                            min_tokens=0)
+
+    kept = [m for m in limiter.apply_transform(turn) if m.get('role') == 'tool']
+
+    assert len(kept) == 1 and len(kept[0]['content']) < len(out), (
+        'the seat cut did not cut this result', len(out))
+    assert '"given_up": 20' in kept[0]['content'], kept[0]['content'][:300]
 
 
 def test_a_follow_up_given_up_on_the_journey_path_is_logged(channels, store, no_mailer, no_wait, warned):

@@ -320,18 +320,22 @@ def undelivered_emails(data: Dict) -> List[Dict]:
 
 
 def undelivered_summary(data: Dict, limit: int = UNDELIVERED_LIST_LIMIT) -> Dict:
-    """undelivered_emails as the pipeline tools show it: the ``limit`` most
-    recently tried, then the counts of all of them.
+    """undelivered_emails as the pipeline tools show it: ``counts`` (given
+    up, waiting) of all of them, and the ``limit`` most recently tried as
+    ``latest``.
 
-    The counts come after the list: the wire trim keeps a long tool
-    result's head and tail and cuts its middle, and both tools put this
-    near the tail, so the counts are what survives a cut (review of
-    82a1248ee: before the list, a 4,000-char cut removed them)."""
+    The two go to different places in a tool's result.  The counts go at
+    its HEAD: a long tool result meets two cuts, and both keep the head --
+    the seats' token_limiter (hartos.helper, AUTOGEN_MESSAGE_TOKENS_PER_
+    MESSAGE) keeps only the head, and the wire trim keeps the head and the
+    tail.  The rows stay where they were.  Review of fe99feac3: counts
+    moved to the tail survived the wire trim but reached the model less
+    often than before through the seats' cut, which comes first."""
     entries = undelivered_emails(data)
     entries.sort(key=lambda e: e.get('last_tried_at') or '', reverse=True)
     given_up = sum(1 for e in entries if e['given_up'])
-    return {'latest': entries[:limit],
-            'given_up': given_up, 'waiting': len(entries) - given_up}
+    return {'counts': {'given_up': given_up, 'waiting': len(entries) - given_up},
+            'latest': entries[:limit]}
 
 
 def register_outreach_tools(helper, assistant, user_id: str):
@@ -586,13 +590,16 @@ def register_outreach_tools(helper, assistant, user_id: str):
             except Exception as e:
                 erxes_status = {'error': str(e)}
 
+        # Refused emails, waiting to be tried again or given up: the counts
+        # at the head, where every cut keeps them (undelivered_summary).
+        not_delivered = undelivered_summary(data)
         return json.dumps({
             'success': True,
+            'not_delivered_count': not_delivered['counts'],
             'pipeline': pipeline,
             'total_prospects': len(data.get('prospects', {})),
             'active_sequences': active_sequences,
-            # Refused emails, waiting to be tried again or given up.
-            'not_delivered': undelivered_summary(data),
+            'not_delivered': not_delivered['latest'],
             'erxes_pipeline': erxes_status,
         })
 

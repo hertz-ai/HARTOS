@@ -737,14 +737,18 @@ def register_journey_tools(helper, assistant, user_id: str):
         # A/B stats
         ab = engine.get_ab_stats(prospects)
 
+        not_delivered = undelivered_summary(data)
         return json.dumps({
+            # The counts at the head, where every cut keeps them
+            # (undelivered_summary; review of fe99feac3).
+            'not_delivered_count': not_delivered['counts'],
             'pipeline': {k: {'count': len(v), 'prospects': v} for k, v in pipeline.items()},
             'total': len(prospects),
-            # Bounded (UNDELIVERED_LIST_LIMIT) and before ab_test: the wire
-            # trim cuts a long result's middle, so ab_test stays at the
-            # tail it kept before not_delivered existed (review of
+            # The rows, bounded (UNDELIVERED_LIST_LIMIT) and before ab_test:
+            # the wire trim cuts a long result's middle, so ab_test stays at
+            # the tail it kept before not_delivered existed (review of
             # 5970e07a1).
-            'not_delivered': undelivered_summary(data),
+            'not_delivered': not_delivered['latest'],
             'ab_test': ab,
         }, default=str)
 
