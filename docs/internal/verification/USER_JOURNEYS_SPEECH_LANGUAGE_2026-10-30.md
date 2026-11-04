@@ -220,9 +220,10 @@ Deferred from the reviews, not resolved here: a per-row account of the 42 clips 
 The owner asked on 3 Nov for each agent to be proven as installed, with no change. Two
 runs on the desktop, both through `/chat` with `media_mode` text and user 10202. Every
 MEASURED line below was read from `frozen_debug.log` by its RequestID tag, or, where it
-says so, from `agent_system.log` by its session (`10202_<prompt>`); a (review) line is the
-review's reading of that day's `frozen_debug.log`, which has since rotated. Both runs started at 11:57
-IST and shared the one local model, because my runner's check for the first run missed it.
+says so, from `agent_system.log` by its session (`10202_<prompt>`); a (review) line is a
+reviewer's reading, of that day's `frozen_debug.log` (since rotated) or of the installed
+files. Both runs started at 11:57 IST and shared the one local model, because my
+runner's check for the first run missed it.
 What each run did holds; its duration is not the agent's latency.
 
 REUSE, Syllable Coach (prompt 1793359802508), request `msg_1793687253807_hv66proof`,
@@ -233,15 +234,15 @@ ready for his ball practice."
 - MEASURED: 7 sends were attempted (`SENDING DATA`) and 6 were published to the chat
   (`Message published locally`); the one not published was the 12:08:48 send, refused as
   "Message already sent successfully", a repeat of the 12:08:37 send (`agent_system.log`,
-  session `10202_1793359802508`). The first
-  attempt asked: "Hey Arjun! I'm so excited to practice "ball" with you! Let's say it
-  together - can you try to say "ball" please?" The other six praised an attempt nobody
-  made in this conversation, for example "You did AMAZING, Arjun! You said "Ba" which is
-  so close to "ball"!" (quotes here leave out the emoji the messages carried). The
-  turn's reply praised "Ba" the same way.
+  session `10202_1793359802508`). The first attempt asked: "Hey Arjun! I'm so excited to
+  practice "ball" with you! Let's say it together - can you try to say "ball" please?"
+  The other six praised an attempt nobody made in this conversation, for example "You did
+  AMAZING, Arjun! You said "Ba" which is so close to "ball"!" (quotes here leave out the
+  emoji the messages carried). The turn's reply praised "Ba" the same way.
 - MEASURED (`agent_system.log`, session `10202_1793359802508`): the turn saved
   `last_attempt` "Ba" at 12:07:27 and "ba" at 12:08:59, though nobody made an attempt in
-  this conversation, so the agent's next session reads an attempt this one made up.
+  this conversation, and the agent's next session read it: at 17:05:56 the next walk of
+  this agent called `get_data_by_key` `last_attempt` and got "ba" (same log and session).
 - The same praise of an attempt nobody made as on 2 Nov (docs/VERIFICATION.md, its
   Syllable Coach row); the walk was not the same: in 2 Nov's second turn action 3 gave up
   and actions 4 to 9 were never reached, here all nine ran inside the one turn without
@@ -256,15 +257,19 @@ ready for his ball practice."
   - cdeca7500 saves the approved plan instead of re-asking the model, which changes how
     agents are saved from now on, not the Syllable Coach's order saved on 30 Oct.
   - Nothing addresses the cross-session read.
-  At this 11:57 run neither commit was installed: the installed reuse, create and
-  lifecycle files hash-matched b599e7f98 (review), a check that did not cover
-  `hart_intelligence_entry.py`, the file cdeca7500 changes. A newer build was installed
-  after this run (its `BUILD_INFO.txt`: built 2026-11-03T09:41:20Z, i.e. 15:11 IST, HARTOS
-  e7cbc5d36, a sha the main clone does not hold). Read
-  on 5 Nov: cdeca7500's `_approved_plan_response` is in the python-embed copy of
-  `hart_intelligence_entry.py` and not in the install-root copy (the review of 0d6062424
-  also found it in the `.pyc` and `library.zip` copies); fd4a8c353's helpers are in
-  neither installed `reuse_recipe.py`. Which copy runs was not measured.
+  At this 11:57 run fd4a8c353 was not installed: the installed reuse, create and
+  lifecycle files hash-matched b599e7f98 (review), which does not contain it. For
+  cdeca7500 that check proves nothing, since it did not cover
+  `hart_intelligence_entry.py`, the file cdeca7500 changes; the build last recorded before
+  this run (docs/VERIFICATION.md's 2 Nov row: HARTOS 1b6e34f42, with only those three
+  files hot-swapped to b599e7f98) does
+  not contain it either, but which `hart_intelligence_entry.py` ran at 11:57 was not
+  measured. A newer build was installed after this run (its `BUILD_INFO.txt`: built
+  2026-11-03T09:41:20Z, i.e. 15:11 IST, HARTOS e7cbc5d36, a sha the main clone does not
+  hold). Read on 5 Nov: cdeca7500's `_approved_plan_response` is in the python-embed copy
+  of `hart_intelligence_entry.py` and not in the install-root copy (the review of
+  0d6062424 also found it in the `.pyc` and `library.zip` copies); fd4a8c353's helpers
+  are in neither installed `reuse_recipe.py`. Which copy runs was not measured.
 - NOT RUN: the child's attempt and the same words in Hindi, the two turns planned next;
   the owner was at the desk, so the runner stopped.
 
@@ -284,12 +289,13 @@ the chat-create path with autonomous creation, request `msg_1793687224401_create
   deleting it is the owner's call.
 - (review) Between the force-approve and the save a third `gather_info` model call ran,
   so the 13 saved actions are a re-emitted answer, not shown to be the refinement that was
-  force-approved: the defect cdeca7500 fixes, which was not installed at this run. No
-  round-1 file was staged.
+  force-approved: the defect cdeca7500 fixes (whether it was installed at this run was
+  not measured; above). No round-1 file was staged.
 - MEASURED (`agent_system.log`, session `10202_1793687224400`): the run did not end at
   the save. The same session went on to call `save_to_long_term_memory` (11:59:46), asked
-  the person twice for a video file through `ask_person` (a `reel_source` file request,
-  11:59:54 and 12:01:02; both left waiting for the person) and sent three messages
+  the person once for a video file through `ask_person` (a `reel_source` file request,
+  11:59:54), read that same ask again by its id at 12:01:02 (still waiting for the person
+  both times), and sent three messages
   (`send_message_to_user`, 12:02:29, 12:03:36, 12:04:55). Three `get_user_camera_inp`
   calls failed with "No camera frame" at 12:01:48, 12:03:04 and 12:04:17 (those error
   lines name no session).
