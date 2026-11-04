@@ -188,6 +188,42 @@ def test_the_owners_own_asks_never_take_the_place_of_background_asks(node):
     assert cards == [OWNER] and row_user == OWNER
 
 
+def test_the_same_question_is_one_ask_whichever_kind_asks_it(node):
+    """A background turn and the owner's own turn asking the same question
+    get the same ask (no second card, no second push), even when the
+    second kind's own limit is already full (review of 85e3e0286: the
+    reuse was not pinned)."""
+    from integrations.agent_engine import person_ask
+    _goal('g-seeded')
+    background = _ask_tool('system_daemon', {'system_daemon_342': 'daemon_g-seeded'})
+    first = json.loads(background(json.dumps(POST), 0))
+    own = _ask_tool(OWNER, {f'{OWNER}_342': '1730600000'})
+    for i in range(person_ask.MAX_OPEN_PER_PERSON):
+        json.loads(own(json.dumps(dict(POST, action=f'mine_{i}')), 0))
+    again = json.loads(own(json.dumps(POST), 0))
+
+    assert again['status'] == 'waiting_for_person', again
+    assert again['ask_id'] == first['ask_id']
+    assert len([c for c in node['cards'] if c[1].get('ask_id') == first['ask_id']]) == 1
+
+
+@pytest.mark.parametrize('request_id', ['', None])
+def test_a_turn_with_no_request_id_asks_as_background(node, request_id):
+    """No request id is not the person's own turn (core.chat_client.
+    is_user_turn, dispatch's rule): with the owner's own limit full, such a
+    turn's ask still goes out, as background work (review of 85e3e0286:
+    the 'id is set' half of the rule was not pinned)."""
+    from integrations.agent_engine import person_ask
+    own = _ask_tool(OWNER, {f'{OWNER}_342': '1730600000'})
+    for i in range(person_ask.MAX_OPEN_PER_PERSON):
+        json.loads(own(json.dumps(dict(POST, action=f'mine_{i}')), 0))
+    unlabelled = _ask_tool(OWNER, {f'{OWNER}_342': request_id})
+    reply = unlabelled(json.dumps(dict(POST, action='no_id')), 0)
+
+    assert json.loads(reply)['status'] == 'waiting_for_person', reply
+    assert person_ask._asks[json.loads(reply)['ask_id']].background is True
+
+
 def test_one_session_asks_each_goals_own_person(node):
     """Two goals of one agent share its session and its tools: each turn's
     ask reaches its own goal's person. FAILS BEFORE THE FIX."""

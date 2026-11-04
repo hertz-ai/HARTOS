@@ -78,12 +78,13 @@ OPEN_KEEP_S = 24 * 3600
 #: An answer is a small, shallow object, never a payload.
 MAX_ANSWER_BYTES = 16 * 1024
 MAX_ANSWER_DEPTH = 4
-#: Open asks one person may have at once (a runaway agent cannot ring her
-#: phone without end).  The same question asked again is the same ask.
-#: Counted apart for her own turns and for background work (a daemon
-#: goal's turn): background asks never take the place of the asks of her
-#: own conversations, nor hers theirs (review of ff45f77a4: with three
-#: background asks open, the owner's own agent was refused).
+#: Open asks one person may have at once OF EACH KIND, her own turns' and
+#: background work's (a daemon goal's turn), so at most twice this many
+#: in all (a runaway agent cannot ring her phone without end).  The same
+#: question asked again is the same ask, whatever its kind.  Background
+#: asks never take the place of the asks of her own conversations, nor
+#: hers theirs (review of ff45f77a4: with three background asks open, the
+#: owner's own agent was refused).
 MAX_OPEN_PER_PERSON = 3
 
 #: Keys that type a field, and the keys that name one.

@@ -90,8 +90,13 @@ no owner today):
      kind of file the store takes for the purpose (video for `reel_source`,
      image for `logo`, audio for `song_audio`; none for a chat attachment,
      which takes several kinds), so every surface opens the right picker.
-  3. The same question already open is the same ask (no second push). A
-     person has at most `MAX_OPEN_PER_PERSON` (3) open asks.
+  3. The same question already open is the same ask (no second push),
+     whichever kind of turn asks it. A person has at most
+     `MAX_OPEN_PER_PERSON` (3) open asks of each kind: 3 from their own
+     turns and 3 from background work (a turn that is not theirs by
+     `core.chat_client.is_user_turn`: a `daemon_` request id, or none), so
+     6 open asks and 6 pushes at most, and background work never takes the
+     place of the person's own asks.
   4. Pushes the card FIRST, through `push_agent_ui`, with `ask_id` on it;
      `agent_ui_compose` keeps a card's `ask_id` as its `msg_id`, so every
      copy on every surface is the ask. The card's gates are the human's and
