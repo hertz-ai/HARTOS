@@ -11119,7 +11119,11 @@ def chat():
                 # saw last: the exits below write the mark for a review,
                 # and leave it clear for anything else.
                 _gather_reviews_shown.pop(turn_key, None)
-                response = gather_info(user_id, prompt, prompt_id)
+                # The tags the agent is saved with (_save_and_enter_review
+                # stamps _creation_hint): its plan is written with its own
+                # tools (gather_agentdetails.plan_writer_tools; 342, 2026-11-04).
+                response = gather_info(user_id, prompt, prompt_id,
+                                       goal_tags=_creation_hint)
                 app.logger.info('AFTER GATHER INFO')
 
             # --- Helper: save completed agent config and transition to Review ---
