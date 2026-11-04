@@ -674,6 +674,48 @@ def ledger_user_answered(user_prompt: str, action_id: int, flow) -> bool:
                for entry in (context.get(USER_INPUT_EVIDENCE_KEY) or []))
 
 
+def recorded_answers(user_prompt: str, action_id: int, flow=None) -> list:
+    """The person's answers recorded for this action (record_user_answer),
+    oldest first: in ``flow``, or in any flow when it is None.
+
+    What window_asked reads to know a message in a step's window came from
+    the person.  The seat it was posted from does not say so: CREATE posts
+    every turn's text from the user proxy, a daemon tick's "Build the agent
+    now" too, and the model's "Noted." after that tick completed a step
+    whose question was still open (review of ec41bdbf6, P5).  Only a
+    genuine reply is recorded (the gate's is_genuine_user_request), so a
+    daemon, expert or visual turn's text is never among these."""
+    ledger = _ledger_registry.get(user_prompt)
+    task = ledger.tasks.get(f"action_{action_id}") if ledger else None
+    context = getattr(task, 'context', None) if task is not None else None
+    if not isinstance(context, dict):
+        return []
+    wanted = None if flow is None else _flow_index(flow)
+    return [str(entry.get('answer'))
+            for entry in (context.get(USER_INPUT_EVIDENCE_KEY) or [])
+            if isinstance(entry, dict)
+            and (wanted is None or entry.get('flow') == wanted)
+            and str(entry.get('answer') or '').strip()]
+
+
+def _carries_recorded_answer(content, answers) -> bool:
+    """``content`` holds one of ``answers`` as whole lines: the person's
+    recorded words as their turn posted them, alone, or after the words an
+    earlier unsaved answer owed the turn, one per line
+    (create_recipe._answer_for_this_turn).  An answer of several lines must
+    appear as the same run of lines.  Lines compare with surrounding spaces
+    ignored, as create_recipe._same_message compares a resend."""
+    def lines(text):
+        return [line.strip() for line in str(text or '').strip().splitlines()]
+    posted = lines(content)
+    for answer in answers or ():
+        wanted = lines(answer)
+        if wanted and any(posted[i:i + len(wanted)] == wanted
+                          for i in range(len(posted) - len(wanted) + 1)):
+            return True
+    return False
+
+
 def person_waits_on(user_prompt: str, action_id: int, flow) -> bool:
     """Whether this one action waits for the PERSON's reply in this flow: its
     ledger task is BLOCKED with blocked_reason input_required AND it holds an
@@ -2008,7 +2050,7 @@ def delivered_text(messages, call_id, body) -> Optional[str]:
     return text if written_text_is_answer(text) else None
 
 
-def window_asked(messages, action_id) -> bool:
+def window_asked(messages, action_id, answers=()) -> bool:
     """``action_id``'s dispatch window in ``messages`` holds a question that
     reached the person (a delivered send that asks, send_is_ask): the action
     waits for their answer, so no line written after it is the action's
@@ -2016,14 +2058,20 @@ def window_asked(messages, action_id) -> bool:
     names no tool asked, then completed on the model's next line ("Noted.").
     Newest first; the first result outside the window ends the search.
 
-    The person's answer closes every question before it: their own words
-    (their seat, _PERSON_SEATS, in a message that is not a dispatch) end the
-    search with False, so a line written after the answer is the action's
-    output again.  Review of 31ec05d14, finding 3: CREATE posts the
-    person's words with no dispatch, and a step that asked, was answered and
-    then wrote its lesson lost the lesson.  A REUSE turn's words ride inside
-    its dispatch (reuse_recipe._reuse_seed_message), which ends nothing
-    here, so REUSE windows read as before."""
+    The person's answer closes every question before it, so a line written
+    after the answer is the action's output again (review of 31ec05d14,
+    finding 3: a step that asked, was answered and then wrote its lesson
+    lost the lesson).  The answer is a message from their seat
+    (_PERSON_SEATS), not a dispatch, that carries one of ``answers``, the
+    answers recorded for this action (recorded_answers).  The seat alone is
+    not the person: CREATE posts every turn's text from it, daemon ticks
+    included, and a tick's "Build the agent now" closed the question so the
+    model's "Noted." became the step's output (review of ec41bdbf6, P5).
+    With no recorded answer nothing closes: a step that asked on a turn
+    that was never held records no reply, keeps its question open and ends
+    GAVE_UP rather than completing on a non-answer.  A REUSE turn's words
+    ride inside its dispatch (reuse_recipe._reuse_seed_message), which
+    closes nothing either way."""
     names = tool_call_names([messages or []])
     for index in range(len(messages or []) - 1, -1, -1):
         msg = messages[index]
@@ -2031,7 +2079,8 @@ def window_asked(messages, action_id) -> bool:
             continue
         if (msg.get('role') == 'user'
                 and str(msg.get('name') or '') in _PERSON_SEATS
-                and dispatch_action_id(msg.get('content')) is None):
+                and dispatch_action_id(msg.get('content')) is None
+                and _carries_recorded_answer(msg.get('content'), answers)):
             return False
         if msg.get('role') != 'tool':
             continue
@@ -2777,9 +2826,10 @@ def derive_completion_evidence(user_prompt: str, action_id: int,
         # its receipt.
         if not _tools_this_action_names(user_prompt, action_id)[1]:
             # A question out and no answer yet: nothing in the window is the
-            # action's output (window_asked); its answer will be.
+            # action's output (window_asked); its answer will be.  Any flow:
+            # CREATE's ledger keeps one task per action id across flows.
             if window_asked(list(getattr(group_chat, 'messages', None) or []),
-                            action_id):
+                            action_id, recorded_answers(user_prompt, action_id)):
                 return None
             return (_derive_written_answer(user_prompt, action_id, group_chat)
                     or user_output_receipt(user_prompt, action_id, group_chat,

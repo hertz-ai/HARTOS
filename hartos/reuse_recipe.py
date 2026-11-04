@@ -399,6 +399,7 @@ from hartos.lifecycle_hooks import (
     is_written_answer, ANSWER_KEYS, user_output_receipt,
     SEND_TOOL, send_is_ask, verdict_waits_on_person, send_delivered,
     delivered_text, sent_text, window_asked, tool_call_names,
+    recorded_answers,
     mark_action_waiting_for_user, resume_from_user_input,
     record_ask_delivered, ledger_open_ask, person_waits_on, is_terminal_state,
 )
@@ -5053,7 +5054,8 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
         # step's output, on any turn (lifecycle_hooks.window_asked, CREATE's
         # rule too).  hartos-00's review of 7043d635e: on a daemon tick the
         # live shape asked and then completed on the model's next "Noted.".
-        if window_asked(messages, action_id):
+        if window_asked(messages, action_id, recorded_answers(
+                user_prompt, action_id, _reuse_action_flow(user_prompt, action_id))):
             return None
         answer = (_reuse_written_answer(group_chat)
                   if dispatch_index is not None else None)
@@ -7213,7 +7215,10 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
             # goal's owner (parts B1-B3).
             if (not _reuse_person_turn(user_prompt)
                     and window_asked(list(getattr(_gc, 'messages', None) or []),
-                                     current_action_id)):
+                                     current_action_id,
+                                     recorded_answers(user_prompt, current_action_id,
+                                                      _reuse_action_flow(
+                                                          user_prompt, current_action_id)))):
                 current_app.logger.warning(
                     f"[REUSE] action {current_action_id} asked on a turn nobody "
                     f"can answer; recording GAVE_UP for retry")
@@ -7590,8 +7595,10 @@ def _reuse_runs_alone(user_prompt, action_id, group_chat):
         return False
     messages = list(getattr(group_chat, 'messages', None) or [])
     dispatch_index = _reuse_latest_dispatch_index(messages, action_id)
-    return dispatch_index is None or not window_asked(messages[dispatch_index:],
-                                                      action_id)
+    return dispatch_index is None or not window_asked(
+        messages[dispatch_index:], action_id,
+        recorded_answers(user_prompt, action_id,
+                         _reuse_action_flow(user_prompt, action_id)))
 
 
 def _reuse_window_holds_an_ask(user_prompt, action_id, group_chat):

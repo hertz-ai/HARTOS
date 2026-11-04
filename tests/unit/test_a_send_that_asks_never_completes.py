@@ -268,19 +268,93 @@ class TestAQuestionIsNeverTheReceipt(_BothProjectors):
     def test_create_finds_the_output_written_after_the_persons_answer(self):
         """Review of 31ec05d14, finding 3 (its probe P3): CREATE posts the
         person's words with no dispatch.  The step asked, the person
-        answered, then the model wrote the lesson: the lesson (message 4) is
-        the step's output, as on the parent.  window_asked never stopped at
-        the answer, so the question stayed open and the step lost its
-        output."""
+        answered (their answer recorded, record_user_answer), then the model
+        wrote the lesson: the lesson (message 4) is the step's output, as on
+        the parent."""
+        answer = 'basic algebra, beginner level'
+        self.patch(lh, 'recorded_answers', lambda up, aid, flow=None: [answer])
         for seat in ('UserProxy', 'User'):
             with self.subTest(seat=seat):
-                reply = {'role': 'user', 'name': seat,
-                         'content': 'basic algebra, beginner level'}
+                reply = {'role': 'user', 'name': seat, 'content': answer}
                 self._set_log(_dispatch(), *_send(expects_reply=True, text=_LIVE_TEXT),
                               reply, _assistant(_LESSON))
-                self.assertFalse(lh.window_asked(self.gc.messages, 1))
+                self.assertFalse(lh.window_asked(self.gc.messages, 1, [answer]))
                 self.assertEqual(lh.derive_completion_evidence(self.UP, 1),
                                  {'message_index': 4, 'kind': 'user_visible_result'})
+
+    def test_a_daemon_ticks_text_from_the_persons_seat_is_not_an_answer(self):
+        """Review of ec41bdbf6, P5, its measured log: CREATE posts every
+        turn's text from the user proxy, a daemon tick's too, and records
+        no answer for it.  The question stays open: the model's "Noted."
+        after the tick is not the step's output, in either projector."""
+        tick = {'role': 'user', 'name': 'UserProxy', 'content': 'Build the agent now'}
+        noted = _assistant('Noted. I will continue with the lesson once the '
+                           'learner tells me which topic they want.')
+        self._set_log(_dispatch(), *_send(expects_reply=True, text=_LIVE_TEXT),
+                      tick, noted)
+        self.assertTrue(lh.window_asked(self.gc.messages, 1))
+        self.assertTrue(lh.window_asked(self.gc.messages, 1, ['basic algebra']))
+        self._assert_both(None)
+
+    def test_a_line_from_the_persons_seat_that_is_not_their_answer_closes_nothing(self):
+        answer = 'basic algebra, beginner level'
+        log = [_dispatch(), *_send(expects_reply=True, text=_LIVE_TEXT),
+               {'role': 'user', 'name': 'UserProxy', 'content': 'ok thanks'},
+               _assistant(_LESSON)]
+        self.assertTrue(lh.window_asked(log, 1, [answer]))
+
+    def test_the_answer_closes_inside_a_retry_join_and_as_a_block_of_lines(self):
+        """The two places the posted text is not the recorded answer alone
+        (create_recipe._answer_for_this_turn): a kept answer posted ahead of
+        the turn's new words, one per line; and an answer of several lines,
+        which must appear as the same run of lines."""
+        cases = [
+            ('basic algebra', 'basic algebra\nand fractions next please', False),
+            ('first line\nsecond line',
+             'an earlier word\nfirst line\nsecond line\nthen this turn', False),
+            ('first line\nsecond line', 'first line\nsomething else\nsecond line', True),
+            ('basic algebra', 'not basic algebra', True),
+        ]
+        for answer, posted, still_open in cases:
+            with self.subTest(posted=posted):
+                log = [_dispatch(), *_send(expects_reply=True, text=_LIVE_TEXT),
+                       {'role': 'user', 'name': 'UserProxy', 'content': posted},
+                       _assistant(_LESSON)]
+                self.assertEqual(lh.window_asked(log, 1, [answer]), still_open)
+
+    def test_the_search_ends_at_the_edge_of_the_actions_window(self):
+        """Review of ec41bdbf6, mutant R1 (the scan reads the whole log):
+        another action's results end the search, so neither action 2's
+        window nor an earlier window of action 1 behind it is read as this
+        window's question."""
+        search = [_call('g1', 'google_search', '{}'), _result('g1', 'Algebra basics')]
+        log = [_dispatch(1), *_send(expects_reply=True, text=_LIVE_TEXT),
+               _dispatch(2, 'step two'), *search, _assistant(_LESSON)]
+        self.assertFalse(lh.window_asked(log, 2))
+        log = [_dispatch(1), *_send(expects_reply=True, text=_LIVE_TEXT),
+               _dispatch(2, 'step two'), *search,
+               _dispatch(1), _assistant(_LESSON)]
+        self.assertFalse(lh.window_asked(log, 1))
+
+    def test_the_answers_are_the_ones_recorded_for_this_action_in_its_flow(self):
+        """What closes a question (recorded_answers): the answers
+        record_user_answer kept on the action's task, oldest first, in the
+        flow asked for or in any flow, never a blank one."""
+        key = 'p5_recorded_answers'
+        task = SimpleNamespace(context={lh.USER_INPUT_EVIDENCE_KEY: [
+            {'flow': 0, 'answer': 'fractions'},
+            {'flow': 1, 'answer': 'decimals'},
+            {'flow': 0, 'answer': '   '},
+            'not an entry',
+            {'flow': 0, 'answer': 'then percentages'}]})
+        lh._ledger_registry[key] = SimpleNamespace(tasks={'action_1': task})
+        self.addCleanup(lh._ledger_registry.pop, key, None)
+        self.assertEqual(lh.recorded_answers(key, 1, 0), ['fractions', 'then percentages'])
+        self.assertEqual(lh.recorded_answers(key, 1, '1'), ['decimals'])
+        self.assertEqual(lh.recorded_answers(key, 1),
+                         ['fractions', 'decimals', 'then percentages'])
+        self.assertEqual(lh.recorded_answers(key, 2), [])
+        self.assertEqual(lh.recorded_answers('no ledger here', 1), [])
 
     def test_a_question_sent_after_the_answer_is_open_again(self):
         """The answer closes only the questions before it."""
