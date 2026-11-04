@@ -166,8 +166,13 @@ class JourneyEngine:
 
     # ---- Journey Execution ----
 
-    def advance_prospect(self, prospect: Dict, force_stage: str = None) -> Dict:
+    def advance_prospect(self, prospect: Dict, force_stage: str = None,
+                         store: Dict = None) -> Dict:
         """Move a prospect to the next stage and execute actions.
+
+        ``store`` is the prospect store the caller loaded and will save
+        (outreach_crm_tools._load_prospects); actions that need more than
+        the prospect (its follow-up sequences) change it in place.
 
         Returns updated prospect with actions taken.
         """
@@ -195,7 +200,7 @@ class JourneyEngine:
         self._fire_hooks('stage_enter', prospect=prospect, stage=target)
 
         # Execute auto-actions for the new stage
-        actions_taken = self._execute_stage_actions(prospect, target)
+        actions_taken = self._execute_stage_actions(prospect, target, store)
 
         # Sync to CRM
         self._sync_crm(prospect)
@@ -205,13 +210,13 @@ class JourneyEngine:
 
         return {'moved': True, 'from': current, 'to': target, 'actions': actions_taken}
 
-    def run_stage_actions(self, prospect: Dict) -> List[Dict]:
+    def run_stage_actions(self, prospect: Dict, store: Dict = None) -> List[Dict]:
         """Execute pending actions for the prospect's current stage.
 
-        Called by the daemon on each tick.
+        Called by the daemon on each tick.  ``store``: as advance_prospect.
         """
         stage = prospect.get('journey_stage', prospect.get('stage', 'discover'))
-        return self._execute_stage_actions(prospect, stage)
+        return self._execute_stage_actions(prospect, stage, store)
 
     def process_event(self, event_type: str, prospect: Dict, event_data: Dict = None) -> Dict:
         """Process an external event that may trigger a stage transition.
@@ -253,7 +258,7 @@ class JourneyEngine:
 
     # ---- Tick-based Processing (called by daemon) ----
 
-    def tick(self, all_prospects: Dict) -> Dict:
+    def tick(self, all_prospects: Dict, store: Dict = None) -> Dict:
         """Process all prospects on a daemon tick.
 
         Checks for:
@@ -261,6 +266,9 @@ class JourneyEngine:
         - Stage transitions that should happen
         - Prospects stuck in a stage too long
         - A/B test results to analyze
+
+        ``store``: the prospect store ``all_prospects`` came from, which the
+        caller saves (as advance_prospect).
 
         Returns summary of actions taken.
         """
@@ -272,18 +280,18 @@ class JourneyEngine:
 
             # Check if prospect should auto-advance
             if stage == 'discover' and not prospect.get('researched'):
-                result = self.advance_prospect(prospect, 'research')
+                result = self.advance_prospect(prospect, 'research', store)
                 if result.get('moved'):
                     summary['transitions'] += 1
 
             elif stage == 'research' and prospect.get('email_draft'):
-                result = self.advance_prospect(prospect, 'outreach')
+                result = self.advance_prospect(prospect, 'outreach', store)
                 if result.get('moved'):
                     summary['transitions'] += 1
 
             elif stage in ('outreach', 'nurture', 'contacted'):
                 # Check for due follow-ups
-                actions = self.run_stage_actions(prospect)
+                actions = self.run_stage_actions(prospect, store)
                 summary['actions'] += len(actions)
 
             # Check for stale prospects (no activity for 21+ days)
@@ -376,17 +384,20 @@ class JourneyEngine:
             'analyze_loss_reason': self._action_noop,
         })
 
-    def _execute_stage_actions(self, prospect: Dict, stage: str) -> List[Dict]:
-        """Execute all auto-actions for a stage."""
+    def _execute_stage_actions(self, prospect: Dict, stage: str,
+                               store: Dict = None) -> List[Dict]:
+        """Execute all auto-actions for a stage.  Each handler gets the
+        caller's prospect store as ctx['store'] when there is one."""
         stage_config = self._stages.get(stage, {})
         actions = stage_config.get('auto_actions', [])
         results = []
+        ctx = {'store': store} if store is not None else {}
 
         for action_name in actions:
             handler = self._action_handlers.get(action_name)
             if handler:
                 try:
-                    result = handler(prospect, {})
+                    result = handler(prospect, ctx)
                     results.append({'action': action_name, 'result': result})
                 except Exception as e:
                     logger.error('Journey action %s failed: %s', action_name, e)
@@ -540,7 +551,11 @@ class JourneyEngine:
         return {'generated': True}
 
     def _action_send_email(self, prospect: Dict, ctx: Dict) -> Dict:
-        """Send the outreach email."""
+        """Send the outreach email (the prospect's draft), once.  A refused
+        send is tried again after a wait and then given up, by the same rule
+        as a follow-up step (outreach_crm_tools._note_refused): the draft
+        carries its tries.  Retried on every tick, a refused address was
+        mailed ~576 times a day (review of 1c4b2b650)."""
         draft = prospect.get('email_draft')
         if not draft:
             return {'skipped': True, 'reason': 'no draft'}
@@ -549,25 +564,44 @@ class JourneyEngine:
             return {'skipped': True, 'reason': 'already sent'}
 
         try:
-            from integrations.agent_engine.outreach_crm_tools import _send_email
+            from integrations.agent_engine.outreach_crm_tools import (
+                _count_delivered, _note_refused, _retry_due, _send_email)
+            if draft.get('status') == 'failed':
+                return {'skipped': True, 'reason': 'given up',
+                        'error': draft.get('last_error')}
+            now = datetime.utcnow()
+            if not _retry_due(draft, now):
+                return {'skipped': True, 'reason': 'waiting to try again',
+                        'retry_after': draft.get('retry_after')}
             result = _send_email(prospect['email'], draft['subject'], draft['body'])
             # 'via' names the sender on a refused send too: only success
             # counts as sent.
             if result.get('success'):
-                prospect['emails_sent'] = 1
-                prospect['last_email_at'] = datetime.utcnow().isoformat()
+                _count_delivered(prospect, now)
                 prospect['stage'] = 'contacted'
                 return {'sent': True, 'result': result}
+            gave_up = _note_refused(draft, result, now)
         except Exception as e:
             return {'error': str(e)}
 
-        return {'sent': False, 'result': result}
+        return {'sent': False, 'gave_up': gave_up, 'result': result}
 
     def _action_check_followups(self, prospect: Dict, ctx: Dict) -> Dict:
-        """Check and send pending follow-ups (delegates to outreach tools)."""
+        """Send this prospect's due follow-ups.  On the caller's store when
+        it passes one (ctx['store'], which it saves), so the tick's copy
+        and the checker's writes are one; otherwise the checker loads and
+        saves the store itself."""
         try:
-            from integrations.agent_engine.outreach_crm_tools import check_pending_followups_daemon
-            return check_pending_followups_daemon()
+            from integrations.agent_engine.outreach_crm_tools import (
+                check_pending_followups_daemon, send_due_followups)
+            store = ctx.get('store')
+            if store is None:
+                return check_pending_followups_daemon()
+            actions = send_due_followups(store, datetime.utcnow(),
+                                         prospect_id=prospect.get('id'))
+            return {'sent': sum(1 for a in actions
+                                if a.get('action') == 'followup_sent'),
+                    'actions': actions}
         except Exception as e:
             return {'error': str(e)}
 
@@ -629,8 +663,10 @@ class JourneyEngine:
                 '<p>happy to adjust to your timezone.</p>'
                 '<p>sathish</p>',
             )
-            # Proposed only when the email went out; otherwise the next
-            # tick proposes again.
+            # Proposed only when the email went out.  A refused proposal is
+            # not retried on its own: tick() has no 'engaged' branch, so
+            # this runs again only when the prospect enters 'engaged' again
+            # (process_event, advance_prospect_stage).
             if not result.get('success'):
                 return {'proposed': False, 'result': result}
             prospect['meeting_proposed'] = True
@@ -715,7 +751,8 @@ def register_journey_tools(helper, assistant, user_id: str):
         if not prospect:
             return json.dumps({'error': 'prospect not found'})
 
-        result = engine.advance_prospect(prospect, force_stage=target_stage)
+        result = engine.advance_prospect(prospect, force_stage=target_stage,
+                                         store=data)
         _save_prospects(data)
         return json.dumps(result, default=str)
 
@@ -726,7 +763,7 @@ def register_journey_tools(helper, assistant, user_id: str):
         """
         from integrations.agent_engine.outreach_crm_tools import _load_prospects, _save_prospects
         data = _load_prospects()
-        summary = engine.tick(data.get('prospects', {}))
+        summary = engine.tick(data.get('prospects', {}), store=data)
         _save_prospects(data)
         return json.dumps(summary, default=str)
 
@@ -786,7 +823,9 @@ def journey_daemon_tick() -> Dict:
         data = _load_prospects()
         if not data.get('prospects'):
             return {'skipped': True, 'reason': 'no prospects'}
-        summary = engine.tick(data.get('prospects', {}))
+        # The tick's follow-up checks work on this same copy (store=data),
+        # so saving it keeps their writes (review of 1c4b2b650).
+        summary = engine.tick(data.get('prospects', {}), store=data)
         # Only save if something happened
         if summary.get('transitions', 0) > 0 or summary.get('actions', 0) > 0:
             _save_prospects(data)

@@ -33,9 +33,17 @@ logger = logging.getLogger('hevolve_outreach')
 ERXES_API_URL = os.environ.get('ERXES_API_URL', 'http://localhost:3300')
 EMAIL_SERVICE_URL = os.environ.get('EMAIL_SERVICE_URL', 'http://localhost:4000')
 
-#: How many times a due follow-up email is tried before the step is given
-#: up ('failed').  A refused send is not a sent one; this bounds the retry.
-FOLLOWUP_SEND_ATTEMPTS = 3
+#: A planned outreach email (a follow-up step, or the journey's first email
+#: draft) that the sender refuses is tried again later, up to this many
+#: sends in all; then it is given up ('failed').  A refused send is not a
+#: sent one, and a dead address must not be mailed forever from the owner's
+#: account (review of 1c4b2b650: the first email was retried on every tick).
+OUTREACH_SEND_ATTEMPTS = 3
+#: Wait before the next try of a refused planned email: this times the tries
+#: so far (1 h, then 2 h), so a short mail outage does not use up the email.
+OUTREACH_RETRY_WAIT = timedelta(hours=1)
+#: Longest sender error kept on a planned email.
+_SEND_ERROR_CAP = 200
 
 # ── Thread lock for prospect file access (daemon + request thread) ──
 _prospect_lock = threading.Lock()
@@ -182,6 +190,54 @@ def _send_email(to_email: str, subject: str, html_body: str) -> Dict:
         return {'success': False, 'error': str(e)}
 
 
+# ── One rule for a planned email that was, or was not, delivered ──
+# A planned email is a follow-up step or the journey's first email draft:
+# a dict the store keeps.  send_outreach_email, the follow-up checker and
+# JourneyEngine._action_send_email all count a delivery and a refusal here.
+
+def _send_error_text(result: Dict) -> str:
+    """Why _send_email did not deliver, in words the agent can read."""
+    if result.get('error'):
+        return str(result['error'])[:_SEND_ERROR_CAP]
+    sender = result.get('via') or 'no sender'
+    if result.get('status_code') is not None:
+        return f"{sender} answered {result['status_code']}"
+    return f"{sender} gave no reason"
+
+
+def _count_delivered(prospect: Dict, when: datetime):
+    """One more email reached ``prospect``."""
+    prospect['emails_sent'] = prospect.get('emails_sent', 0) + 1
+    prospect['last_email_at'] = when.isoformat()
+    prospect['updated_at'] = when.isoformat()
+
+
+def _retry_due(planned: Dict, now: datetime) -> bool:
+    """May a planned email that was refused before be tried again now?"""
+    after = planned.get('retry_after')
+    if not after:
+        return True
+    try:
+        return now >= datetime.fromisoformat(after)
+    except (TypeError, ValueError):
+        return True
+
+
+def _note_refused(planned: Dict, result: Dict, now: datetime) -> bool:
+    """Record a refused send on a planned email.  Returns True when it is
+    given up ('failed') after OUTREACH_SEND_ATTEMPTS sends; otherwise the
+    next try waits OUTREACH_RETRY_WAIT times the tries so far."""
+    planned['attempts'] = planned.get('attempts', 0) + 1
+    planned['last_error'] = _send_error_text(result)
+    if planned['attempts'] >= OUTREACH_SEND_ATTEMPTS:
+        planned['status'] = 'failed'
+        planned.pop('retry_after', None)
+        return True
+    planned['retry_after'] = (
+        now + OUTREACH_RETRY_WAIT * planned['attempts']).isoformat()
+    return False
+
+
 def register_outreach_tools(helper, assistant, user_id: str):
     """Register outreach CRM tools with the agent (Tier 2).
 
@@ -267,28 +323,25 @@ def register_outreach_tools(helper, assistant, user_id: str):
             return json.dumps({
                 'success': False, 'sent': False, 'send_result': result,
                 'prospect_stage': prospect['stage'],
-                'error': (result.get('error')
-                          or f"the email was not sent ({result.get('via') or 'no sender'}, "
-                             f"status {result.get('status_code')})"),
+                'error': 'the email was not sent: ' + _send_error_text(result),
             })
 
         # Log the send
+        now = datetime.utcnow()
         send_entry = {
             'prospect_id': prospect_id,
             'to': prospect['email'],
             'subject': subject,
             'sequence_step': sequence_step,
-            'sent_at': datetime.utcnow().isoformat(),
+            'sent_at': now.isoformat(),
             'send_result': result,
         }
         data['sent_log'].append(send_entry)
 
         # Update prospect state
-        prospect['emails_sent'] = prospect.get('emails_sent', 0) + 1
-        prospect['last_email_at'] = datetime.utcnow().isoformat()
+        _count_delivered(prospect, now)
         if prospect['stage'] == 'new':
             prospect['stage'] = 'contacted'
-        prospect['updated_at'] = datetime.utcnow().isoformat()
 
         _save_prospects(data)
         return json.dumps({'success': True, 'sent': True, 'send_result': result,
@@ -335,8 +388,9 @@ def register_outreach_tools(helper, assistant, user_id: str):
                 'scheduled_at': (base_time + timedelta(days=cumulative_days)).isoformat(),
                 'subject': step['subject'],
                 'body_html': step['body_html'],
-                # pending -> sent, or failed after FOLLOWUP_SEND_ATTEMPTS
-                # refused sends; a reply completes the whole sequence.
+                # pending -> sent, or failed after OUTREACH_SEND_ATTEMPTS
+                # refused sends (_note_refused), which ends the sequence;
+                # a reply completes the whole sequence.
                 'status': 'pending',
                 'sent_at': None,
             })
@@ -347,7 +401,10 @@ def register_outreach_tools(helper, assistant, user_id: str):
             'name': sequence_name,
             'steps': scheduled_steps,
             'created_at': datetime.utcnow().isoformat(),
-            'status': 'active',  # active → paused → completed
+            # active -> completed (every step done, or a reply), or
+            # failed (a step given up: the address or the sender is not
+            # taking mail, so later steps are not sent to it).
+            'status': 'active',
             'exit_on_reply': True,
         }
 
@@ -632,17 +689,37 @@ def register_outreach_tools(helper, assistant, user_id: str):
 
 
 def _check_pending_followups_impl() -> str:
-    """Shared logic for checking pending follow-ups. Caller must hold _prospect_lock.
+    """Send the follow-ups that are due, on the store as it is on disk now.
 
     Returns JSON string with actions taken. Used by both the tool-level
     check_pending_followups and the daemon-level check_pending_followups_daemon.
     """
     data = _load_prospects()
     now = datetime.utcnow()
+    actions_taken = send_due_followups(data, now)
+    _save_prospects(data)
+    return json.dumps({'success': True, 'actions': actions_taken, 'checked_at': now.isoformat()})
+
+
+def send_due_followups(data: Dict, now: datetime,
+                       prospect_id: Optional[str] = None) -> List[Dict]:
+    """Send the follow-up steps that are due in ``data`` (the prospect store
+    as the caller holds it), one step per sequence; only ``prospect_id``'s
+    sequences when given.  Changes ``data`` in place and saves nothing: the
+    caller that loaded the store saves it.
+
+    The journey engine runs this on the copy it is ticking (review of
+    1c4b2b650): the checker loading and saving the file on its own inside
+    a journey tick had its writes overwritten by the tick's older copy, so
+    a delivered step went out again and a refused one was counted twice
+    as often as OUTREACH_SEND_ATTEMPTS allows.
+    """
     actions_taken = []
 
     for seq_id, sequence in data.get('sequences', {}).items():
         if sequence['status'] != 'active':
+            continue
+        if prospect_id is not None and sequence.get('prospect_id') != prospect_id:
             continue
 
         prospect = data['prospects'].get(sequence['prospect_id'])
@@ -665,7 +742,7 @@ def _check_pending_followups_impl() -> str:
                 continue
 
             scheduled = datetime.fromisoformat(step['scheduled_at'])
-            if now >= scheduled:
+            if now >= scheduled and _retry_due(step, now):
                 result = _send_email(
                     to_email=prospect['email'],
                     subject=step['subject'],
@@ -674,8 +751,7 @@ def _check_pending_followups_impl() -> str:
                 if result.get('success'):
                     step['status'] = 'sent'
                     step['sent_at'] = now.isoformat()
-                    prospect['emails_sent'] = prospect.get('emails_sent', 0) + 1
-                    prospect['last_email_at'] = now.isoformat()
+                    _count_delivered(prospect, now)
                     actions_taken.append({
                         'action': 'followup_sent',
                         'prospect': prospect['company'],
@@ -684,31 +760,29 @@ def _check_pending_followups_impl() -> str:
                         'result': result,
                     })
                 else:
-                    # Not sent: the step stays due and is tried on a later
-                    # check, up to FOLLOWUP_SEND_ATTEMPTS sends, then it is
-                    # given up so a dead address is not retried forever.
-                    step['attempts'] = step.get('attempts', 0) + 1
-                    step['last_error'] = str(
-                        result.get('error') or result.get('status_code')
-                        or 'not sent')[:200]
-                    if step['attempts'] >= FOLLOWUP_SEND_ATTEMPTS:
-                        step['status'] = 'failed'
+                    # Not sent: tried again after a wait, then given up
+                    # (_note_refused).  A step given up ends the sequence:
+                    # the address or the sender is not taking mail, and the
+                    # later steps would only be refused the same way.
+                    gave_up = _note_refused(step, result, now)
+                    if gave_up:
+                        sequence['status'] = 'failed'
                     actions_taken.append({
                         'action': 'followup_failed',
                         'prospect': prospect['company'],
                         'step': step['step_number'],
                         'attempts': step['attempts'],
-                        'gave_up': step['status'] == 'failed',
+                        'gave_up': gave_up,
                         'error': step['last_error'],
                     })
-                break  # Only one step per check cycle
+            break  # Only the first pending step, once per check cycle
 
         # Check if all steps are done
-        if all(s['status'] != 'pending' for s in sequence['steps']):
+        if (sequence['status'] == 'active'
+                and all(s['status'] != 'pending' for s in sequence['steps'])):
             sequence['status'] = 'completed'
 
-    _save_prospects(data)
-    return json.dumps({'success': True, 'actions': actions_taken, 'checked_at': now.isoformat()})
+    return actions_taken
 
 
 # ── Goal Type Registration ──

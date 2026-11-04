@@ -134,16 +134,33 @@ def _seed(store, **prospect):
     return data
 
 
-def _due_sequence(store):
-    data = _seed(store, stage='contacted', emails_sent=1)
+def _due_sequence(store, steps=1, **prospect):
+    """p1 with an active sequence whose ``steps`` steps are all due."""
+    data = _seed(store, **dict({'stage': 'contacted', 'emails_sent': 1}, **prospect))
+    due = (datetime.utcnow() - timedelta(hours=1)).isoformat()
     data['sequences']['s1'] = {
         'id': 's1', 'prospect_id': 'p1', 'name': 'bump', 'status': 'active',
         'exit_on_reply': True,
-        'steps': [{'step_number': 2, 'delay_days': 3, 'status': 'pending',
-                   'scheduled_at': (datetime.utcnow() - timedelta(hours=1)).isoformat(),
-                   'subject': 'quick bump', 'body_html': '<p>hi again</p>',
-                   'sent_at': None}]}
+        'steps': [{'step_number': n + 2, 'delay_days': 3, 'status': 'pending',
+                   'scheduled_at': due, 'subject': f'bump {n + 2}',
+                   'body_html': '<p>hi again</p>', 'sent_at': None}
+                  for n in range(steps)]}
     store._save_prospects(data)
+    return data
+
+
+@pytest.fixture
+def no_wait(store, monkeypatch):
+    """A refused planned email may be tried again at once."""
+    monkeypatch.setattr(store, 'OUTREACH_RETRY_WAIT', timedelta(0), raising=False)
+
+
+def _tries(store):
+    """OUTREACH_SEND_ATTEMPTS.  1c4b2b650 named it FOLLOWUP_SEND_ATTEMPTS:
+    read either, so a run on that commit fails by what it sends, not by a
+    missing name."""
+    return getattr(store, 'OUTREACH_SEND_ATTEMPTS',
+                   getattr(store, 'FOLLOWUP_SEND_ATTEMPTS', 3))
 
 
 # ── send_outreach_email ────────────────────────────────────────────
@@ -194,20 +211,56 @@ def test_a_follow_up_that_failed_stays_due_and_is_not_counted(channels, store, n
     assert data['prospects']['p1']['emails_sent'] == 1
 
 
-def test_a_follow_up_that_keeps_failing_stops_being_retried(channels, store, no_mailer):
+def test_a_follow_up_that_keeps_failing_ends_its_sequence(channels, store, no_mailer, no_wait):
+    """Given up after OUTREACH_SEND_ATTEMPTS refused sends, and the later
+    step is not sent to the same refusing address (review of 1c4b2b650:
+    3 steps cost 9 refused sends and ended 'completed')."""
     email = _EmailChannel(ok=False, error='550 mailbox unavailable')
     channels.registry.register(email)
-    _due_sequence(store)
+    _due_sequence(store, steps=2)
 
     for _ in range(10):
         store.check_pending_followups_daemon()
 
     data = store._load_prospects()
+    first, second = data['sequences']['s1']['steps']
+    assert first['status'] == 'failed'
+    assert first['attempts'] == _tries(store)
+    assert '550' in first['last_error']
+    assert second['status'] == 'pending' and 'attempts' not in second
+    assert data['sequences']['s1']['status'] == 'failed'
+    assert len(email.emails) == _tries(store)
+
+
+def test_a_refused_follow_up_waits_before_it_is_tried_again(channels, store, no_mailer):
+    email = _EmailChannel(ok=False, error='451 try later')
+    channels.registry.register(email)
+    _due_sequence(store)
+
+    for _ in range(5):
+        store.check_pending_followups_daemon()
+    assert len(email.emails) == 1
+
+    data = store._load_prospects()
     step = data['sequences']['s1']['steps'][0]
-    assert step['status'] == 'failed'
-    assert step['attempts'] == store.FOLLOWUP_SEND_ATTEMPTS
-    assert data['sequences']['s1']['status'] == 'completed'
-    assert len(email.emails) == store.FOLLOWUP_SEND_ATTEMPTS
+    assert step['status'] == 'pending'
+    step['retry_after'] = (datetime.utcnow() - timedelta(seconds=1)).isoformat()
+    store._save_prospects(data)
+    store.check_pending_followups_daemon()
+    assert len(email.emails) == 2
+
+
+def test_a_step_waiting_to_be_tried_again_is_not_overtaken_by_the_next(channels, store, no_mailer):
+    email = _EmailChannel(ok=False, error='451 try later')
+    channels.registry.register(email)
+    _due_sequence(store, steps=2)
+
+    for _ in range(3):
+        store.check_pending_followups_daemon()
+
+    assert [s for _, s in email.emails] == ['bump 2']
+    second = store._load_prospects()['sequences']['s1']['steps'][1]
+    assert second['status'] == 'pending' and 'attempts' not in second
 
 
 def test_a_delivered_follow_up_is_counted(channels, store, no_mailer):
@@ -247,3 +300,93 @@ def test_a_meeting_is_not_marked_proposed_when_its_email_failed(channels, store,
 
     assert result.get('proposed') is not True
     assert not prospect.get('meeting_proposed')
+
+
+# ── the daemon's journey tick (agent_daemon: the follow-up checker, then
+# journey_daemon_tick, every 5 ticks) ───────────────────────────────
+
+def _outreach_prospect(store):
+    _seed(store, journey_stage='outreach',
+          email_draft={'subject': 'hi', 'body': '<p>hello</p>'})
+
+
+def test_the_journeys_first_email_is_given_up_after_its_tries(channels, store, no_mailer, no_wait):
+    """FAILS ON 1c4b2b650: a refused first email went out again on every
+    journey tick (10 sends in 10 ticks)."""
+    from integrations.agent_engine.journey_engine import journey_daemon_tick
+    email = _EmailChannel(ok=False, error='550 mailbox unavailable')
+    channels.registry.register(email)
+    _outreach_prospect(store)
+
+    for _ in range(10):
+        journey_daemon_tick()
+
+    assert len(email.emails) == _tries(store)
+    p = store._load_prospects()['prospects']['p1']
+    assert p['email_draft']['status'] == 'failed'
+    assert (p['emails_sent'], p['stage']) == (0, 'new')
+
+
+def test_the_journeys_refused_first_email_waits_before_it_is_tried_again(channels, store, no_mailer):
+    from integrations.agent_engine.journey_engine import journey_daemon_tick
+    email = _EmailChannel(ok=False, error='451 try later')
+    channels.registry.register(email)
+    _outreach_prospect(store)
+
+    for _ in range(5):
+        journey_daemon_tick()
+
+    assert len(email.emails) == 1
+    assert store._load_prospects()['prospects']['p1']['email_draft']['attempts'] == 1
+
+
+def _daemon_cycles(store, n):
+    """What agent_daemon runs every 5 ticks, ``n`` times."""
+    from integrations.agent_engine.journey_engine import journey_daemon_tick
+    for _ in range(n):
+        store.check_pending_followups_daemon()
+        journey_daemon_tick()
+
+
+def _nurture_pipeline(store, steps=1):
+    """p1 in the journey's nurture stage with a due sequence, and two more
+    nurture prospects with no sequence."""
+    now = datetime.utcnow().isoformat()
+    data = _due_sequence(store, steps=steps, journey_stage='nurture', last_email_at=now)
+    for pid in ('p2', 'p3'):
+        data['prospects'][pid] = dict(data['prospects']['p1'], id=pid,
+                                      email=f'{pid}@shop.example')
+    store._save_prospects(data)
+
+
+def test_a_refused_follow_up_is_counted_once_per_send_in_the_daemons_order(
+        channels, store, no_mailer, no_wait):
+    """FAILS ON 1c4b2b650: the journey tick ran the checker once per nurture
+    prospect, each loading and saving the store, then saved its older copy
+    over their tries, so one step took 6 refused sends, not 3."""
+    email = _EmailChannel(ok=False, error='550 mailbox unavailable')
+    channels.registry.register(email)
+    _nurture_pipeline(store)
+
+    _daemon_cycles(store, 5)
+
+    assert len(email.emails) == _tries(store)
+    step = store._load_prospects()['sequences']['s1']['steps'][0]
+    assert (step['status'], step['attempts']) == ('failed', _tries(store))
+
+
+def test_a_delivered_follow_up_goes_out_once_from_the_journey_tick(channels, store, no_mailer):
+    """FAILS ON 1c4b2b650 (and before it): the journey tick's older copy put
+    the delivered step back to 'pending', so it was sent again."""
+    from integrations.agent_engine.journey_engine import journey_daemon_tick
+    email = _EmailChannel(ok=True)
+    channels.registry.register(email)
+    _nurture_pipeline(store)
+
+    for _ in range(3):
+        journey_daemon_tick()
+
+    assert [s for _, s in email.emails] == ['bump 2']
+    data = store._load_prospects()
+    assert data['sequences']['s1']['steps'][0]['status'] == 'sent'
+    assert data['prospects']['p1']['emails_sent'] == 2
