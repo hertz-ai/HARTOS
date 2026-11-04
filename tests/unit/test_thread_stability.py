@@ -426,19 +426,24 @@ class TestSQLiteConfig:
     """Verify SQLite is configured for concurrent thread safety."""
 
     def test_busy_timeout_is_3000(self):
-        """busy_timeout must be 3000ms (3s) — fail fast to avoid watchdog restarts."""
-        # Read the source to verify the PRAGMA value
+        """busy_timeout must be 3000ms (3s) — fail fast to avoid watchdog restarts.
+
+        The PRAGMA text is the module constant SQLITE_BOOT_PRAGMAS (built from
+        SQLITE_BUSY_TIMEOUT_MS), which the engine's connect hook executes, so
+        the test reads what will really run and checks the hook runs it."""
         import inspect
-        from integrations.social.models import get_engine
-        source = inspect.getsource(get_engine)
-        assert 'busy_timeout=3000' in source or 'busy_timeout = 3000' in source
+        from integrations.social.models import (
+            SQLITE_BOOT_PRAGMAS, SQLITE_BUSY_TIMEOUT_MS, get_engine)
+        assert SQLITE_BUSY_TIMEOUT_MS == 3000
+        assert 'PRAGMA busy_timeout=3000;' in SQLITE_BOOT_PRAGMAS
+        assert 'SQLITE_BOOT_PRAGMAS' in inspect.getsource(get_engine)
 
     def test_wal_mode_enabled(self):
         """WAL journal mode must be set for concurrent access."""
         import inspect
-        from integrations.social.models import get_engine
-        source = inspect.getsource(get_engine)
-        assert 'journal_mode=WAL' in source
+        from integrations.social.models import SQLITE_BOOT_PRAGMAS, get_engine
+        assert 'PRAGMA journal_mode=WAL;' in SQLITE_BOOT_PRAGMAS
+        assert 'SQLITE_BOOT_PRAGMAS' in inspect.getsource(get_engine)
 
     def test_check_same_thread_false(self):
         """check_same_thread must be False for multi-threaded access."""

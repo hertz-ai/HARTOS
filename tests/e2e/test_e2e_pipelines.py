@@ -24,6 +24,8 @@ import pytest
 from datetime import datetime, timedelta
 from unittest.mock import patch, MagicMock
 
+from tests.conftest import hidden_modules
+
 os.environ['HEVOLVE_DB_PATH'] = ':memory:'
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -542,10 +544,6 @@ class TestCodingDispatchReview:
     """E2E: coding goals pass through constitutional review post-dispatch."""
 
     @patch('integrations.agent_engine.dispatch.pooled_post')
-    @patch.dict('sys.modules', {
-        'routes.hartos_backend_adapter': None,
-        'hartos_backend_adapter': None,
-    })
     def test_coding_dispatch_passes_constitutional_review(self, mock_post):
         """Normal coding output passes review."""
         from integrations.agent_engine.dispatch import dispatch_goal
@@ -560,8 +558,14 @@ class TestCodingDispatchReview:
         }
         mock_post.return_value = mock_resp
 
-        result = dispatch_goal(
-            'Fix auth tests', 'user1', 'goal123', goal_type='coding')
+        # hidden_modules, not @patch.dict('sys.modules'): that restores the WHOLE
+        # dict on exit and so evicts every module first imported inside the block
+        # (torch among them), which broke the next torch import in the same
+        # process ("_has_torch_function already has a docstring", "_C is not
+        # defined" in TestVLMVisualAgentPayload).  See tests/unit/module_swap.py.
+        with hidden_modules('routes.hartos_backend_adapter', 'hartos_backend_adapter'):
+            result = dispatch_goal(
+                'Fix auth tests', 'user1', 'goal123', goal_type='coding')
         assert result is not None
 
     # The mock MUST target the seam dispatch_goal actually calls. It calls
@@ -578,16 +582,13 @@ class TestCodingDispatchReview:
     @patch('integrations.agent_engine.dispatch.pooled_post')
     @patch('security.hive_guardrails.GuardrailEnforcer.before_dispatch',
            return_value=(False, 'Violates constructive humanity rule', 'Some goal'))
-    @patch.dict('sys.modules', {
-        'routes.hartos_backend_adapter': None,
-        'hartos_backend_adapter': None,
-    })
     def test_coding_dispatch_blocked_by_constitution(self, mock_gate, mock_post):
         """dispatch_goal returns None when the pre-dispatch guardrail blocks."""
         from integrations.agent_engine.dispatch import dispatch_goal
 
-        result = dispatch_goal(
-            'Some goal', 'user1', 'goal456', goal_type='coding')
+        with hidden_modules('routes.hartos_backend_adapter', 'hartos_backend_adapter'):
+            result = dispatch_goal(
+                'Some goal', 'user1', 'goal456', goal_type='coding')
         assert result is None  # Blocked by the guardrail gate
         # The block is the WHOLE point: it must short-circuit before any
         # network call, so a blocked dispatch never touches /chat.
@@ -1239,6 +1240,16 @@ class TestVLMVisionServiceCircuitBreaker:
 class TestComputerUseLocalLoop:
     """E2E: local_loop.py — screenshot→parse→LLM→action loop with all externals mocked."""
 
+    @pytest.fixture(autouse=True)
+    def _legacy_loop(self, monkeypatch):
+        """These tests mock the legacy path (local_omniparser.parse_screen and
+        local_loop._call_local_llm).  Since 2026-09-01 the loop defaults to the
+        unified Qwen3-VL backend, so without this the mocks are bypassed and the
+        loop calls the real backend ("network boundary is sealed" in this suite):
+        'incomplete' instead of 'success', 'action_error' instead of
+        'max_iterations'.  HEVOLVE_VLM_UNIFIED=0 is the loop's own opt-in."""
+        monkeypatch.setenv('HEVOLVE_VLM_UNIFIED', '0')
+
     def _make_message(self, instruction='Click the submit button', max_eta=60):
         return {
             'instruction_to_vlm_agent': instruction,
@@ -1557,8 +1568,13 @@ class TestComputerUseActions:
         assert 'file_b.txt' in result['output']
 
 
+@pytest.mark.usefixtures('computer_control_granted')
 class TestComputerUseAdapter:
-    """E2E: vlm_adapter.py — 3-tier routing with circuit breaker."""
+    """E2E: vlm_adapter.py — 3-tier routing with circuit breaker.
+
+    The routing and the breaker are what these test, so the owner's permission
+    to control the computer is a precondition they declare (tests/conftest.py);
+    without it the loop answers 'blocked' / consent_required before routing."""
 
     def test_tier1_bundled_routes_inprocess(self):
         """NUNBA_BUNDLED=true → run_local_agentic_loop(tier='inprocess')."""

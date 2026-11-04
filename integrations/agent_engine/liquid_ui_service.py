@@ -2670,8 +2670,10 @@ class LiquidUIService:
                 uid = (json.load(fh) or {}).get('user_id')
             if uid:
                 return str(uid)
-        except Exception:
-            pass
+        except (OSError, ValueError, AttributeError) as e:
+            # No owner file (nobody signed in: the normal case), one that is
+            # not JSON, or JSON that is not an object: the guest id below.
+            logger.debug("shell chat: no signed-in owner file: %s", e)
         cached = getattr(self, '_nunba_guest_id', None)
         if cached:
             return cached

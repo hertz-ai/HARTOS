@@ -51,7 +51,10 @@ def _say(rr, message):
 def test_the_agents_real_message_is_sent(rr):
     sent, send = _say(rr, _msg('Assistant', 'Which month should I check?'))
     assert sent is True
-    send.assert_called_once_with('u7', 'Which month should I check?', '', 42)
+    # media_refs=None: the message names no file (_reuse_speaker_says_to_user
+    # forwards whatever the agent wrote under MEDIA_REPLY_KEY).
+    send.assert_called_once_with('u7', 'Which month should I check?', '', 42,
+                                 media_refs=None)
 
 
 @pytest.mark.parametrize('message', [
@@ -112,7 +115,8 @@ def _run_timer(rr, monkeypatch, timer_tail, main_tail=None):
 def test_a_scheduled_run_sends_its_own_result(rr, monkeypatch):
     send = _run_timer(rr, monkeypatch,
                       _msg('time_agent', 'Time to drink water.'))
-    send.assert_called_once_with(_UID, 'Time to drink water.', _TASK, _PID)
+    send.assert_called_once_with(_UID, 'Time to drink water.', _TASK, _PID,
+                                 media_refs=None)
 
 
 def test_a_scheduled_run_never_sends_the_main_conversation(rr, monkeypatch):
@@ -158,7 +162,7 @@ def test_a_visual_run_sends_its_real_message(rr, monkeypatch):
     send = _run_visual(rr, monkeypatch,
                        _msg('visual_agent', 'You look tired; take a break.'))
     send.assert_called_once_with(_UID, 'You look tired; take a break.',
-                                 _TASK, _PID)
+                                 _TASK, _PID, media_refs=None)
 
 
 @pytest.mark.parametrize('tail', [
