@@ -7,12 +7,16 @@ window autogen raised ``TypeError: 'NoneType' object is not iterable`` in
 response.choices`` then iterated), each one after an OpenRouter 200.  The 200
 carried no ``choices``.  autogen's ``OpenAIWrapper.create`` moves to the next
 config entry only when ``client.create`` raises ``APIError``; a 200 does not
-raise, so the reply was returned as if it were a completion and the turn died
-later, on the snag reply, with the next entry never tried.  What those bodies
+raise, so the reply was returned as if it were a completion, reading it
+raised, and the next entry was never tried.  The person read that raw
+exception ("I couldn't finish that: 'NoneType' object is not iterable",
+measured by the review of f8af9b3af), not the snag reply.  What those bodies
 held was NOT measured: the hosted path writes no record of a reply.
 
-So the wire hook (core.llm_outbound_logger), the one place every framework's
-LLM traffic passes, answers such a reply itself with a no-retry 502 of type
+So the wire hook (core.llm_outbound_logger), which every httpx-based LLM call
+passes (autogen, langchain, the openai SDK; not the raw callers that post
+through core.http_pool's requests session), answers such a reply itself with
+a no-retry 502 of type
 ``server_error``, the way ``_day_cap_refusal`` answers a refused expert call
 with a no-retry 429.  The openai SDK raises it once, autogen moves to the
 next entry, and the provider's own words are logged.
@@ -179,9 +183,11 @@ def test_the_sdk_raises_once_and_says_what_the_provider_said(node):
 
 
 def test_the_person_still_gets_the_snag_reply_when_no_entry_is_left(node):
-    """With one entry there is nothing to fall to.  The failed turn must read
-    to the person as it did before (the snag reply, never an HTTP error
-    string spoken by TTS) and still count as a failed turn."""
+    """With one entry there is nothing to fall to.  The failed turn reads to
+    the person as the snag reply (never an HTTP error string spoken by TTS)
+    and still counts as a failed turn.  Before, the person read the raw
+    exception ("I couldn't finish that: 'NoneType' object is not
+    iterable"), which also counted as failed."""
     import autogen
     from core.agent_tools import _SNAG_REPLY, is_user_facing_error, user_facing_error
     node['replies']['empty'] = _raw(NOT_A_COMPLETION['an empty body'])
@@ -234,6 +240,90 @@ def test_the_async_path_answers_the_same_way(node):
     with pytest.raises(openai.InternalServerError):
         asyncio.run(_call())
     assert len(seen) == 1, seen
+
+
+def test_agent_lightning_does_not_resample_a_reply_with_no_completion(node, monkeypatch):
+    """FAILS ON f8af9b3af: agent_lightning's wrapper (on by default in Nunba)
+    took the hook's 502 for a bad sample, called the endpoint 3 times, filed
+    a self-heal report and returned its fallback sentence as the Assistant's
+    answer.  The real autogen Assistant on one entry, wrapped the way
+    test_toolcall_parse_500_retry wraps it."""
+    import autogen
+    import openai
+    from hartos import exception_collector
+    from integrations.agent_lightning.wrapper import AgentLightningWrapper
+    reports = []
+    monkeypatch.setattr(exception_collector, 'report_subsystem_failure',
+                        lambda **kw: reports.append(kw))
+    node['replies']['empty'] = _raw(NOT_A_COMPLETION['choices null'])
+    assistant = autogen.AssistantAgent('Assistant', llm_config={
+        'config_list': [{'model': 'gateway-model', 'api_key': 'dummy',
+                         'base_url': node['base'] + '/empty/v1'}],
+        'cache_seed': None})
+    w = AgentLightningWrapper.__new__(AgentLightningWrapper)
+    w.agent, w.agent_id = assistant, 'Assistant'
+    w.track_rewards = w.auto_trace = False
+    w.tracer = w.reward_calculator = w.current_span_id = None
+    w.execution_count = 0
+    generate_reply = w._wrap_generate_reply(assistant.generate_reply)
+
+    with pytest.raises(openai.InternalServerError):
+        generate_reply(messages=_hi())
+    assert node['hits'] == {'empty': 1}, node['hits']
+    assert reports == []
+
+
+def test_a_completion_that_starts_with_a_byte_order_mark_is_returned(node):
+    """FAILS ON f8af9b3af: the body was decoded as text before it was
+    parsed, so a real completion behind a UTF-8 byte order mark was 'not a
+    JSON object' and was answered with a 502.  Read at the hook, on the real
+    httpx: the reply comes back as the provider sent it."""
+    import httpx
+    node['replies']['bom'] = b'\xef\xbb\xbf' + _completion('answered behind a bom')
+    reply = httpx.post(node['base'] + '/bom/v1/chat/completions',
+                       json={'model': 'gateway-model', 'messages': _hi()})
+    assert reply.status_code == 200, reply.text
+    assert reply.content.startswith(b'\xef\xbb\xbf')
+    assert node['hits'] == {'bom': 1}
+
+
+def test_the_breaker_reads_the_real_reply_not_the_hooks_answer(node):
+    """Pins a claim, not a fail-first test: a 200 says the account is in
+    good standing, so it clears the provider breaker's count even when the
+    hook answers it with a 502."""
+    import openai
+    from core.circuit_breaker import CircuitState, llm_provider_breaker
+    host = '127.0.0.1'
+    llm_provider_breaker.reset(host)
+    try:
+        for _ in range(llm_provider_breaker._threshold - 1):
+            llm_provider_breaker.record_failure(host)
+        node['replies']['empty'] = _raw(NOT_A_COMPLETION['choices null'])
+        client = openai.OpenAI(base_url=node['base'] + '/empty/v1',
+                               api_key='dummy', max_retries=0)
+        with pytest.raises(openai.InternalServerError):
+            client.chat.completions.create(model='gateway-model', messages=_hi())
+        llm_provider_breaker.record_failure(host)
+        assert llm_provider_breaker.state(host) == CircuitState.CLOSED
+    finally:
+        llm_provider_breaker.reset(host)
+
+
+def test_the_providers_words_are_logged(node, monkeypatch):
+    """Pins a claim, not a fail-first test: the hosted path keeps no record
+    of a reply, so the warning is the only place the provider's words land."""
+    import openai
+    import core.llm_outbound_logger as hook
+    warned = []
+    monkeypatch.setattr(hook.logger, 'warning',
+                        lambda msg, *a, **k: warned.append(msg % a))
+    node['replies']['empty'] = _raw(NOT_A_COMPLETION['an error object and no choices'])
+    client = openai.OpenAI(base_url=node['base'] + '/empty/v1',
+                           api_key='dummy', max_retries=0)
+    with pytest.raises(openai.InternalServerError):
+        client.chat.completions.create(model='gateway-model', messages=_hi())
+    assert any('upstream provider failed' in w and 'failed call' in w
+               for w in warned), warned
 
 
 def test_a_completion_is_returned_as_it_came(node):

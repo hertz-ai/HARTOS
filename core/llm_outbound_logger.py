@@ -657,6 +657,27 @@ def _day_cap_refusal(httpx_module, request, body):
                         'message': why}})
 
 
+#: The ``code`` of HARTOS's own answer to a 2xx reply with no completion
+#: (_no_completion_answer).  A reader that retries 5xx replies reads it
+#: through is_no_completion_answer: the provider sent nothing, and asking
+#: again only spends another call (review of f8af9b3af: agent_lightning's
+#: re-sample loop made 3 calls, then returned a fallback sentence as the
+#: Assistant's answer).
+NO_COMPLETION_CODE = 'hartos_no_completion'
+
+
+def is_no_completion_answer(exc) -> bool:
+    """Is ``exc`` the openai SDK's exception for _no_completion_answer's
+    502?  Read from the error object the SDK keeps (``code``, else
+    ``body['code']``), never from the message text."""
+    code = getattr(exc, 'code', None)
+    if code is None:
+        body = getattr(exc, 'body', None)
+        if isinstance(body, dict):
+            code = body.get('code')
+    return code == NO_COMPLETION_CODE
+
+
 def _not_a_completion(response, status) -> Optional[str]:
     """Why a 2xx chat/completions reply carries no completion, in plain words,
     or None when it carries one, is not a 2xx, or was never buffered.
@@ -665,8 +686,14 @@ def _not_a_completion(response, status) -> Optional[str]:
     objects that each carry a ``message`` object: what autogen's
     ``message_retrieval`` (and langchain, and every other reader of a chat
     completion) iterates and indexes into.  The words say which part was
-    missing and quote the provider's own ``error`` object when it sent one;
-    no other field of the reply is copied.
+    missing and quote the provider's own ``error`` object when it sent one,
+    or the body itself when it is not JSON (the provider's words either
+    way), capped at _RESP_ERROR_CAP; no other field of the reply is copied.
+
+    The bytes are parsed as httpx's Response.json parses them (json.loads on
+    bytes detects the encoding, a UTF byte order mark included): decoding
+    them as text first made a real completion that starts with a BOM 'not a
+    JSON object' (review of f8af9b3af).
 
     Same read discipline as _response_error: only ``_content``, which httpx
     sets when a non-streaming send has already buffered the body.  A stream
@@ -679,15 +706,15 @@ def _not_a_completion(response, status) -> Optional[str]:
         raw = getattr(response, '_content', None)
         if not isinstance(raw, (bytes, bytearray)):
             return None
-        text = bytes(raw).decode('utf-8', 'replace').strip()
-        if not text:
+        raw = bytes(raw)
+        if not raw.strip():
             return 'an empty body'
         try:
-            data = json.loads(text)
+            data = json.loads(raw)
         except ValueError:
             data = None
         if not isinstance(data, dict):
-            said = 'not a JSON object: ' + text
+            said = 'not a JSON object: ' + raw.decode('utf-8', 'replace').strip()
         else:
             choices = data.get('choices')
             if isinstance(choices, list) and choices and all(
@@ -752,7 +779,7 @@ def _no_completion_answer(httpx_module, request, response, status):
         answer = httpx_module.Response(
             502, request=request,
             headers={'x-should-retry': 'false'},
-            json={'error': {'type': 'server_error', 'code': 'hartos_no_completion',
+            json={'error': {'type': 'server_error', 'code': NO_COMPLETION_CODE,
                             'message': 'the provider answered %s with no completion: %s'
                                        % (status, why)}})
     except Exception as e:
