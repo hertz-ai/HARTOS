@@ -218,8 +218,10 @@ Deferred from the reviews, not resolved here: a per-row account of the 42 clips 
 ## 6. Re-measured on the installed build, 3 Nov 2026
 
 The owner asked on 3 Nov for each agent to be proven as installed, with no change. Two
-runs on the desktop, both through `/chat` with `media_mode` text and user 10202, every
-line below read from `frozen_debug.log` by its RequestID tag. Both runs started at 11:57
+runs on the desktop, both through `/chat` with `media_mode` text and user 10202. Every
+MEASURED line below was read from `frozen_debug.log` by its RequestID tag, or, where it
+says so, from `agent_system.log` by its session (`10202_<prompt>`); a (review) line is the
+review's reading of that day's `frozen_debug.log`, which has since rotated. Both runs started at 11:57
 IST and shared the one local model, because my runner's check for the first run missed it.
 What each run did holds; its duration is not the agent's latency.
 
@@ -229,24 +231,40 @@ ready for his ball practice."
 - MEASURED: `[REUSE-LEDGER] tasks=9 actions=9`; the walk reached actions 1 to 9 inside
   this one turn and waited for no reply.
 - MEASURED: 7 sends were attempted (`SENDING DATA`) and 6 were published to the chat
-  (`Message published locally`); which attempt was not published was not read. The first
+  (`Message published locally`); the one not published was the 12:08:48 send, refused as
+  "Message already sent successfully", a repeat of the 12:08:37 send (`agent_system.log`,
+  session `10202_1793359802508`). The first
   attempt asked: "Hey Arjun! I'm so excited to practice "ball" with you! Let's say it
   together - can you try to say "ball" please?" The other six praised an attempt nobody
   made in this conversation, for example "You did AMAZING, Arjun! You said "Ba" which is
   so close to "ball"!" (quotes here leave out the emoji the messages carried). The
   turn's reply praised "Ba" the same way.
+- MEASURED (`agent_system.log`, session `10202_1793359802508`): the turn saved
+  `last_attempt` "Ba" at 12:07:27 and "ba" at 12:08:59, though nobody made an attempt in
+  this conversation, so the agent's next session reads an attempt this one made up.
 - The same praise of an attempt nobody made as on 2 Nov (docs/VERIFICATION.md, its
-  Syllable Coach row), on the same installed code; the walk was not the same: on 2 Nov
-  action 3 gave up and actions 4 to 9 were never reached, here all nine ran inside the one
-  turn without waiting (review). That row records three causes as addressed by no commit:
-  the saved steps carry the 30 Oct creation run's literal values, a session reads another
-  session's attempt from agent memory, and the banked order reads before it asks. Since
-  then, local commits touch two of them and fix none for this agent: fd4a8c353 keeps the
-  creation-time values out of the saved steps the model is shown (its own test keeps
-  cross-session key reads working, review), and cdeca7500 saves the approved plan instead
-  of re-asking the model, which changes how future agents are saved, not the Syllable
-  Coach's order saved on 30 Oct. Nothing addresses the cross-session read. Neither commit
-  is on the desktop (the installed reuse, create and lifecycle files hash-match b599e7f98).
+  Syllable Coach row); the walk was not the same: in 2 Nov's second turn action 3 gave up
+  and actions 4 to 9 were never reached, here all nine ran inside the one turn without
+  waiting. That row records three causes as addressed by no commit: the saved steps carry
+  the 30 Oct creation run's literal values, a session reads another session's attempt
+  from agent memory, and the banked order reads before it asks. Local commits since:
+  - fd4a8c353 rewrites, at reuse, the saved execution-trace steps the model is shown so
+    they no longer carry the creation run's values. This agent's saved step
+    `1793359802508_0_6.json` is such a step and holds the very praise quoted above, so
+    fd4a8c353 would change what this agent is shown; it has not been walked on this
+    agent, and the agent's memory still holds "Ba" (above).
+  - cdeca7500 saves the approved plan instead of re-asking the model, which changes how
+    agents are saved from now on, not the Syllable Coach's order saved on 30 Oct.
+  - Nothing addresses the cross-session read.
+  At this 11:57 run neither commit was installed: the installed reuse, create and
+  lifecycle files hash-matched b599e7f98 (review), a check that did not cover
+  `hart_intelligence_entry.py`, the file cdeca7500 changes. A newer build was installed
+  after this run (its `BUILD_INFO.txt`: built 2026-11-03T09:41:20Z, i.e. 15:11 IST, HARTOS
+  e7cbc5d36, a sha the main clone does not hold). Read
+  on 5 Nov: cdeca7500's `_approved_plan_response` is in the python-embed copy of
+  `hart_intelligence_entry.py` and not in the install-root copy (the review of 0d6062424
+  also found it in the `.pyc` and `library.zip` copies); fd4a8c353's helpers are in
+  neither installed `reuse_recipe.py`. Which copy runs was not measured.
 - NOT RUN: the child's attempt and the same words in Hindi, the two turns planned next;
   the owner was at the desk, so the runner stopped.
 
@@ -266,12 +284,17 @@ the chat-create path with autonomous creation, request `msg_1793687224401_create
   deleting it is the owner's call.
 - (review) Between the force-approve and the save a third `gather_info` model call ran,
   so the 13 saved actions are a re-emitted answer, not shown to be the refinement that was
-  force-approved: the defect cdeca7500 fixes, not installed. No round-1 file was staged.
-- (review) The run did not end at the save. The same request went on to run action 1
-  until 12:06:07: three `get_user_camera_inp` calls failed with "No camera frame", three
-  messages were delivered to user 10202's two clients (12:02:29, 12:03:36, 12:04:55),
-  then action 1 blocked waiting for the person and the turn replied "Agent details
-  gathered autonomously. Moving to review....". Section 4's hazards recur here: the camera
-  tool, and a creation turn that acts on the person's devices. These lines are the review's
-  reading of that day's `frozen_debug.log`, which has since rotated; they were not re-read
-  for this correction.
+  force-approved: the defect cdeca7500 fixes, which was not installed at this run. No
+  round-1 file was staged.
+- MEASURED (`agent_system.log`, session `10202_1793687224400`): the run did not end at
+  the save. The same session went on to call `save_to_long_term_memory` (11:59:46), asked
+  the person twice for a video file through `ask_person` (a `reel_source` file request,
+  11:59:54 and 12:01:02; both left waiting for the person) and sent three messages
+  (`send_message_to_user`, 12:02:29, 12:03:36, 12:04:55). Three `get_user_camera_inp`
+  calls failed with "No camera frame" at 12:01:48, 12:03:04 and 12:04:17 (those error
+  lines name no session).
+- (review) The three messages reached user 10202's two clients; the same request ran
+  action 1 until 12:06:07, when it blocked waiting for the person, and the turn replied
+  "Agent details gathered autonomously. Moving to review....". Section 4's hazards recur
+  here: the camera tool, and a creation turn that asks the person and acts on their
+  devices.
