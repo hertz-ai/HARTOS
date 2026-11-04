@@ -80,6 +80,10 @@ MAX_ANSWER_BYTES = 16 * 1024
 MAX_ANSWER_DEPTH = 4
 #: Open asks one person may have at once (a runaway agent cannot ring her
 #: phone without end).  The same question asked again is the same ask.
+#: Counted apart for her own turns and for background work (a daemon
+#: goal's turn): background asks never take the place of the asks of her
+#: own conversations, nor hers theirs (review of ff45f77a4: with three
+#: background asks open, the owner's own agent was refused).
 MAX_OPEN_PER_PERSON = 3
 
 #: Keys that type a field, and the keys that name one.
@@ -100,10 +104,14 @@ _asks: Dict[str, '_Ask'] = {}
 class _Ask:
     __slots__ = ('ask_id', 'user_id', 'agent_id', 'prompt_id', 'ctype', 'purpose',
                  'max_files', 'same', 'created', 'answered_at', 'answer', 'event',
-                 'dismissed')
+                 'dismissed', 'background')
 
-    def __init__(self, ask_id, user_id, agent_id, prompt_id, ctype, card, same):
+    def __init__(self, ask_id, user_id, agent_id, prompt_id, ctype, card, same,
+                 background=False):
         self.ask_id = ask_id
+        # Asked by background work, not by the person's own turn: it counts
+        # against its own open-ask limit (MAX_OPEN_PER_PERSON).
+        self.background = bool(background)
         self.user_id = user_id
         self.agent_id = agent_id
         self.prompt_id = prompt_id
@@ -269,8 +277,13 @@ def _withdraw_card(ask_id: str) -> None:
 
 
 def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
-        body: str = '') -> dict:
+        body: str = '',
+        background: bool = False) -> dict:
     """Put ``component`` in front of ``user_id`` on every surface they have.
+
+    ``background``: asked by background work (a daemon goal's turn), so it
+    counts against the background asks' own open limit, never against the
+    asks of the person's own turns (MAX_OPEN_PER_PERSON).
 
     Returns ``{'ok', 'ask_id', 'refused', 'card'}`` (plus ``'reused': True``
     when the same question is already open).  ``refused`` names why nothing
@@ -304,13 +317,16 @@ def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
             if a.same == same:
                 return {'ok': True, 'ask_id': a.ask_id, 'refused': None, 'card': True,
                         'reused': True}
-        if len(mine) >= MAX_OPEN_PER_PERSON:
-            logger.warning("person ask refused for user %s by agent %s: %d asks "
-                           "already open", user_id, agent_id, len(mine))
+        kind = [a for a in mine if a.background == bool(background)]
+        if len(kind) >= MAX_OPEN_PER_PERSON:
+            logger.warning("person ask refused for user %s by agent %s: %d %s asks "
+                           "already open", user_id, agent_id, len(kind),
+                           'background' if background else 'own')
             return _refused('too_many_open_asks')
         ask_id = uuid.uuid4().hex
         a = _Ask(ask_id, user_id, agent_id,
-                 None if prompt_id is None else str(prompt_id), ctype, card, same)
+                 None if prompt_id is None else str(prompt_id), ctype, card, same,
+                 background=background)
         _asks[ask_id] = a
     card['ask_id'] = ask_id
     card['msg_id'] = ask_id
@@ -651,7 +667,8 @@ def ask_person_tool(user_id, prompt_id, agent_id=None, request_id=None):
     ``request_id`` gives the turn's request id (a callable, read at each
     call): the person asked is person_to_ask's, worked out per call,
     because one agent's session and its tools serve every goal of that
-    agent.
+    agent.  A turn that is not the person's own (core.chat_client.
+    is_user_turn) asks as background work, under its own open-ask limit.
 
     A file_request's purpose is one the store keeps (INBOUND_PURPOSES): the
     description names them, and a refusal of any other names them again, so
@@ -662,6 +679,7 @@ def ask_person_tool(user_id, prompt_id, agent_id=None, request_id=None):
     Nothing is guessed for it.  Whether the list changes what the model
     picks is not yet measured live."""
     from core.agent_tool_menu import ASK_PERSON_TOOL
+    from core.chat_client import is_user_turn
     from core.user_file_store import INBOUND_PURPOSES, REEL_SOURCE
     purposes = list(INBOUND_PURPOSES)
 
@@ -670,8 +688,8 @@ def ask_person_tool(user_id, prompt_id, agent_id=None, request_id=None):
                                       '"purpose":"%s","accept":"video"}' % REEL_SOURCE],
             wait_seconds: Annotated[int, f"seconds to wait now, max {MAX_WAIT_S}"] = DEFAULT_WAIT_S,
             ask_id: Annotated[str, "an earlier ask's id: read its answer"] = '') -> str:
-        person = person_to_ask(
-            user_id, request_id() if callable(request_id) else request_id)
+        rid = request_id() if callable(request_id) else request_id
+        person = person_to_ask(user_id, rid)
         if ask_id:
             state = ask_state(ask_id, person)
             reply = {'answered': state['status'] == 'answered', 'ask_id': ask_id,
@@ -688,8 +706,11 @@ def ask_person_tool(user_id, prompt_id, agent_id=None, request_id=None):
             comp = None
         if isinstance(comp, dict) and prompt_id is not None:
             comp.setdefault('prompt_id', str(prompt_id))
+        # Not the person's own turn (core.chat_client.is_user_turn, the one
+        # rule dispatch uses): its ask is background work's.
         out = ask(person, agent_id if agent_id is not None else prompt_id, comp,
-                  prompt_id=prompt_id)
+                  prompt_id=prompt_id,
+                  background=not is_user_turn({'request_id': rid}))
         if not out['ok']:
             reply = {'answered': False, 'refused': out['refused'], 'status': 'refused'}
             if out['refused'] == 'unknown_purpose':

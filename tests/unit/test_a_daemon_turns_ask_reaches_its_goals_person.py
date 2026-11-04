@@ -98,6 +98,96 @@ def test_a_daemon_turn_whose_goal_cannot_be_found_asks_the_node_owner(node):
     assert cards == [OWNER] and row_user == OWNER
 
 
+def test_a_daemon_turn_whose_goal_cannot_be_found_asks_the_turns_own_person(node):
+    """No goal row, and the turn runs as a person (not a system identity):
+    that person is asked, not the node owner (review of ff45f77a4: a
+    'missing goal asks the node owner' mutant passed every test)."""
+    ask = _ask_tool(CO_OWNER, {f'{CO_OWNER}_342': 'daemon_g-gone'})
+    cards, row_user, _ = _asked(node, ask(json.dumps(POST), 0))
+    assert cards == [CO_OWNER] and row_user == CO_OWNER
+
+
+def test_a_daemon_turn_whose_goal_cannot_be_found_as_an_agent_asks_its_owner(node):
+    """No goal row, and the turn runs as an agent row owned by a person:
+    the agent's owner is asked (person_for), not the node owner."""
+    from integrations.social.models import User, db_session
+    with db_session() as db:
+        if not db.query(User).filter_by(id='agent_y').first():
+            db.add(User(id='agent_y', username='agent_y', display_name='Agent Y',
+                        user_type='agent', owner_id=CO_OWNER, api_token='tok-agent_y'))
+    ask = _ask_tool('agent_y', {'agent_y_342': 'daemon_g-gone'})
+    cards, row_user, _ = _asked(node, ask(json.dumps(POST), 0))
+    assert cards == [CO_OWNER] and row_user == CO_OWNER
+
+
+def test_a_daemon_turn_whose_goal_cannot_be_read_asks_the_turns_own_person(
+        node, monkeypatch):
+    """The goal read fails: the tool neither raises nor drops the ask; the
+    turn's own person is asked (review of ff45f77a4: 'raises out of the
+    tool' and 'no person' mutants passed every test)."""
+    import integrations.social.models as models
+    _goal('g-co', owner_id=OWNER)
+    monkeypatch.setattr(models, 'AgentGoal', object())     # the query raises
+    ask = _ask_tool(CO_OWNER, {f'{CO_OWNER}_342': 'daemon_g-co'})
+    reply = ask(json.dumps(POST), 0)
+    assert json.loads(reply)['status'] == 'waiting_for_person', reply
+    cards, row_user, _ = _asked(node, reply)
+    assert cards == [CO_OWNER] and row_user == CO_OWNER
+
+
+def test_a_goal_made_by_a_person_with_no_owner_set_asks_its_maker(node):
+    """owner_id empty, created_by a person: that person is the goal's
+    (core.event_attribution.goal_owner_user_id precedence; review of
+    ff45f77a4: an 'owner_id only' mutant passed every test)."""
+    _goal('g-made', owner_id=None, created_by=CO_OWNER)
+    ask = _ask_tool('system_daemon', {'system_daemon_342': 'daemon_g-made'})
+    cards, row_user, _ = _asked(node, ask(json.dumps(POST), 0))
+    assert cards == [CO_OWNER] and row_user == CO_OWNER
+
+
+def test_background_asks_never_take_the_place_of_the_owners_own_ask(node):
+    """Three background asks are open for the owner (the per-person limit):
+    his own turn's ask still reaches him, and a fourth background ask is
+    still refused.  FAILS BEFORE THE FIX: background asks for unowned goals
+    used the owner's own limit, so his own agent got 'too_many_open_asks'
+    (review of ff45f77a4; 37 of 37 active desktop goals have no owner)."""
+    from integrations.agent_engine import person_ask
+    rids = {}
+    background = _ask_tool('system_daemon', rids)
+    for i in range(person_ask.MAX_OPEN_PER_PERSON):
+        _goal(f'g-{i}')
+        rids['system_daemon_342'] = f'daemon_g-{i}'
+        reply = json.loads(background(json.dumps(dict(POST, action=f'step_{i}')), 0))
+        assert reply['status'] == 'waiting_for_person', reply
+    _goal('g-more')
+    rids['system_daemon_342'] = 'daemon_g-more'
+    more = json.loads(background(json.dumps(dict(POST, action='one_more')), 0))
+    assert more == {'answered': False, 'refused': 'too_many_open_asks',
+                    'status': 'refused'}
+
+    own = _ask_tool(OWNER, {f'{OWNER}_342': '1730600000'})
+    reply = own(json.dumps(dict(POST, action='mine')), 0)
+    assert json.loads(reply)['status'] == 'waiting_for_person', reply
+    cards, row_user, _ = _asked(node, reply)
+    assert cards == [OWNER] and row_user == OWNER
+
+
+def test_the_owners_own_asks_never_take_the_place_of_background_asks(node):
+    """The other way round: three of his own asks open, a background goal's
+    ask still reaches him (each kind keeps its own limit)."""
+    from integrations.agent_engine import person_ask
+    own = _ask_tool(OWNER, {f'{OWNER}_342': '1730600000'})
+    for i in range(person_ask.MAX_OPEN_PER_PERSON):
+        reply = json.loads(own(json.dumps(dict(POST, action=f'mine_{i}')), 0))
+        assert reply['status'] == 'waiting_for_person', reply
+    _goal('g-seeded')
+    background = _ask_tool('system_daemon', {'system_daemon_342': 'daemon_g-seeded'})
+    reply = background(json.dumps(POST), 0)
+    assert json.loads(reply)['status'] == 'waiting_for_person', reply
+    cards, row_user, _ = _asked(node, reply)
+    assert cards == [OWNER] and row_user == OWNER
+
+
 def test_one_session_asks_each_goals_own_person(node):
     """Two goals of one agent share its session and its tools: each turn's
     ask reaches its own goal's person. FAILS BEFORE THE FIX."""
