@@ -657,6 +657,114 @@ def _day_cap_refusal(httpx_module, request, body):
                         'message': why}})
 
 
+def _not_a_completion(response, status) -> Optional[str]:
+    """Why a 2xx chat/completions reply carries no completion, in plain words,
+    or None when it carries one, is not a 2xx, or was never buffered.
+
+    A completion is a JSON object whose ``choices`` is a non-empty list of
+    objects that each carry a ``message`` object: what autogen's
+    ``message_retrieval`` (and langchain, and every other reader of a chat
+    completion) iterates and indexes into.  The words say which part was
+    missing and quote the provider's own ``error`` object when it sent one;
+    no other field of the reply is copied.
+
+    Same read discipline as _response_error: only ``_content``, which httpx
+    sets when a non-streaming send has already buffered the body.  A stream
+    is never read here, and neither is anything that is not the bytes httpx
+    buffers (a stand-in's invented attribute is not a body).
+    """
+    try:
+        if not (isinstance(status, int) and 200 <= status < 300):
+            return None
+        raw = getattr(response, '_content', None)
+        if not isinstance(raw, (bytes, bytearray)):
+            return None
+        text = bytes(raw).decode('utf-8', 'replace').strip()
+        if not text:
+            return 'an empty body'
+        try:
+            data = json.loads(text)
+        except ValueError:
+            data = None
+        if not isinstance(data, dict):
+            said = 'not a JSON object: ' + text
+        else:
+            choices = data.get('choices')
+            if isinstance(choices, list) and choices and all(
+                    isinstance(c, dict) and isinstance(c.get('message'), dict)
+                    for c in choices):
+                return None
+            if 'choices' not in data:
+                said = 'no choices field'
+            elif not isinstance(choices, list):
+                said = 'choices was %s' % json.dumps(choices, default=str)[:40]
+            elif not choices:
+                said = 'choices was empty'
+            else:
+                said = 'a choice carried no message'
+            err = data.get('error')
+            if err:
+                said += '; its error: ' + (
+                    err if isinstance(err, str)
+                    else json.dumps(err, ensure_ascii=False, default=str))
+        if len(said) > _RESP_ERROR_CAP:
+            said = said[:_RESP_ERROR_CAP] + '...[cut]'
+        return said
+    except Exception:
+        # A hook that cannot read the reply returns it as it came.
+        return None
+
+
+def _no_completion_answer(httpx_module, request, response, status):
+    """HARTOS's own answer in place of a 2xx reply that carries no
+    completion, or None to return the reply as it came.
+
+    Measured on central 2026-11-03 (read-only, 72 h of docker logs): 433 of
+    2,236 OpenRouter calls answered 200, and 418 times in the same window
+    autogen raised ``TypeError: 'NoneType' object is not iterable`` in
+    ``OpenAIClient.message_retrieval``, each time after an OpenRouter 200
+    (the ``choices`` it iterated was None).  ``OpenAIWrapper.create`` moves to the next
+    config entry only when the client raises ``APIError``; a 200 raises
+    nothing, so the empty reply was returned as a completion, the turn died
+    on the snag reply when it was read, and the next entry (the node's own
+    model, which with_local_fallback puts last in every override) was never
+    tried.
+
+    The answer is a 502 of type ``server_error`` with ``x-should-retry:
+    false``, the same mechanism as _day_cap_refusal's 429: the openai SDK
+    raises InternalServerError once without retrying (a retry would spend
+    another call, against a free tier's daily cap, on a provider that just
+    sent no completion), and autogen moves to the next entry.  With no entry
+    left the turn fails as before: ``server_error`` is one of
+    core.agent_tools._INTERNAL_ERROR_MARKERS, so the person still reads the
+    snag reply.  The provider's words are logged here, since the hosted path
+    writes no record of the reply.
+
+    The caller has already fed the breaker and the meter from the real reply:
+    a 200 says the account is in good standing, and a reply the provider
+    billed was paid for whether or not it held a completion.
+    """
+    why = _not_a_completion(response, status)
+    if why is None:
+        return None
+    host = str(getattr(getattr(request, 'url', None), 'host', '') or '')
+    try:
+        answer = httpx_module.Response(
+            502, request=request,
+            headers={'x-should-retry': 'false'},
+            json={'error': {'type': 'server_error', 'code': 'hartos_no_completion',
+                            'message': 'the provider answered %s with no completion: %s'
+                                       % (status, why)}})
+    except Exception as e:
+        # A hook may never fail an LLM call: the reply goes back as it came.
+        logger.warning("[outbound] %s answered %s with no completion (%s); "
+                       "could not answer in its place: %s", host, status, why, e)
+        return None
+    logger.warning("[outbound] %s answered %s with no completion (%s); "
+                   "counted as a failed call", host, status, why)
+    return answer
+
+
 def _hosted_body(request):
     """The JSON body of a hosted chat/completions request, read without
     mutation, or None.  Only for header stamping and metering: the hosted
@@ -796,8 +904,9 @@ def _send_and_feed(httpx_module, orig_send, client, request, kwargs):
     took this branch unlabelled and unmetered, the day cap never saw a dollar
     and Kong routed the calls to its default lane.  Of the calls it meters,
     those that hold the configured expert are the ones the day cap can refuse
-    (_day_cap_refusal).  Any other host is left exactly as it was
-    (_is_configured_endpoint)."""
+    (_day_cap_refusal), and a 2xx reply that carries no completion is
+    answered as a failed call (_no_completion_answer).  Any other host is
+    left exactly as it was (_is_configured_endpoint)."""
     gateway = _is_configured_endpoint(request.url)
     body = _hosted_body(request) if gateway else None
     if gateway:
@@ -810,6 +919,9 @@ def _send_and_feed(httpx_module, orig_send, client, request, kwargs):
     _feed_provider_breaker(request.url, _status)
     if gateway:
         _meter_response(body, response, _status)
+        answer = _no_completion_answer(httpx_module, request, response, _status)
+        if answer is not None:
+            return answer
     return response
 
 
@@ -2693,8 +2805,8 @@ def _install_async_patch(httpx_module) -> None:
     async def _patched(self, request, **kwargs):
         if not _is_target_request(request.url, request.method):
             # Hosted chat/completions: lane and model headers, the day cap,
-            # the provider breaker (#106b b) and the dollar meter, as in
-            # _send_and_feed.
+            # the provider breaker (#106b b), the dollar meter and the
+            # no-completion answer, as in _send_and_feed.
             if _is_chat_completions_post(request):
                 _gateway = _is_configured_endpoint(request.url)
                 _hbody = _hosted_body(request) if _gateway else None
@@ -2708,6 +2820,9 @@ def _install_async_patch(httpx_module) -> None:
                 _feed_provider_breaker(request.url, _hstatus)
                 if _gateway:
                     _meter_response(_hbody, _resp, _hstatus)
+                    _answer = _no_completion_answer(httpx_module, request, _resp, _hstatus)
+                    if _answer is not None:
+                        return _answer
                 return _resp
             return await _orig(self, request, **kwargs)
         try:
