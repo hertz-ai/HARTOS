@@ -716,33 +716,78 @@ def _carries_recorded_answer(content, answers) -> bool:
     return False
 
 
-def reply_closes_open_question(user_prompt: str, action_id: int, text) -> bool:
-    """Whether the person's message ``text``, on their own turn, answers a
-    question ``action_id``'s window holds open: a delivered send that asks
-    (window_asked) that no recorded answer has closed, in the session's
-    registered group chat.  False for a blank message and for a resend: the
-    latest message from the person's seat already carries the same words (a
-    retried request posts its words again, and the words that led to the
-    question are not its answer).
+def _receipt_request_id(message) -> str:
+    """The request a delivered send in tool message ``message`` went out in,
+    read off the send tool's own success reply ("Message sent successfully
+    to user with request_id: <id>", SEND_DELIVERED_PREFIX).  CREATE's copy
+    (create_recipe.send_message_to_user1) writes the turn's request with
+    '-intermediate' after it; REUSE's writes it bare.  Every result in one
+    tool message comes from one round of one turn, so any delivered one
+    names it.  '' when none does."""
+    if not isinstance(message, dict):
+        return ''
+    responses = message.get('tool_responses')
+    bodies = ([r.get('content') for r in responses if isinstance(r, dict)]
+              if isinstance(responses, list) else [])
+    bodies.append(message.get('content'))
+    for body in bodies:
+        if not send_delivered(body):
+            continue
+        _, found, request_id = str(body).partition('with request_id:')
+        request_id = request_id.strip()
+        if found and request_id:
+            if request_id.endswith('-intermediate'):
+                request_id = request_id[:-len('-intermediate')]
+            return request_id
+    return ''
 
-    The create loop records such a reply (record_user_answer) when nothing
-    holds the step for the person, the question the gate never held.  Before
-    the recorded-answer rule (review of ec41bdbf6, P5) any line from the
-    person's seat closed the question, daemon ticks included; the person's
-    own reply still does (review of 65db06972, must-fix 3)."""
+
+def step_open_question(user_prompt: str, action_id: int):
+    """The question ``action_id``'s window holds open in the session's
+    registered group chat, as (message index, the text sent, the request it
+    went out in), or None: window_question with the answers recorded for the
+    action in any flow (CREATE's ledger keeps one task per action id across
+    flows).
+
+    CREATE's one reader of "the step's question is still open":
+    derive_completion_evidence (no line in the window is the step's output
+    yet), create_recipe._completed_verdict_still_waits (a `completed` + `no`
+    still waits when the step asked again after the person's answer) and
+    reply_closes_open_question (the person's reply answers it)."""
+    group_chat = get_registered_groupchat(user_prompt)
+    if group_chat is None:
+        return None
+    messages = list(getattr(group_chat, 'messages', None) or [])
+    found = window_question(messages, action_id,
+                            recorded_answers(user_prompt, action_id))
+    if found is None:
+        return None
+    index, text = found
+    return index, text, _receipt_request_id(messages[index])
+
+
+def reply_closes_open_question(user_prompt: str, action_id: int, text,
+                               request_id) -> bool:
+    """Whether the person's message ``text``, sent in their request
+    ``request_id``, answers the question ``action_id``'s window holds open
+    (step_open_question).  False for a blank message and for the asking
+    request's own retry: the request that asked is not its own answer, the
+    rule REUSE (_user_reply_is_the_evidence) and the held gate
+    (create_recipe._resume_prior_user_input_block, by the ask record) apply,
+    read here off the asking send's receipt because nothing recorded an ask
+    (the 10-19 web retry storm re-posts a request id with its words).  Any
+    later request answers it, whatever its words: a "yes" after an earlier
+    "yes" is an answer (review of c906283b6, must-fix 2: the words were
+    compared, and a person who said the same thing twice was not heard).
+
+    The create loop takes such a reply into its gate when nothing holds the
+    step for the person (review of 65db06972, must-fix 3), so the one writer
+    records it: only a recorded answer closes a question (window_asked;
+    review of ec41bdbf6, P5)."""
     if not str(text or '').strip():
         return False
-    group_chat = get_registered_groupchat(user_prompt)
-    messages = list(getattr(group_chat, 'messages', None) or [])
-    if not window_asked(messages, action_id,
-                        recorded_answers(user_prompt, action_id)):
-        return False
-    for msg in reversed(messages):
-        if (isinstance(msg, dict) and msg.get('role') == 'user'
-                and str(msg.get('name') or '') in _PERSON_SEATS
-                and dispatch_action_id(msg.get('content')) is None):
-            return not _carries_recorded_answer(msg.get('content'), [text])
-    return True
+    question = step_open_question(user_prompt, action_id)
+    return question is not None and question[2] != str(request_id or '')
 
 
 def person_waits_on(user_prompt: str, action_id: int, flow) -> bool:
@@ -2096,11 +2141,19 @@ def window_asked(messages, action_id, answers=()) -> bool:
     not the person: CREATE posts every turn's text from it, daemon ticks
     included, and a tick's "Build the agent now" closed the question so the
     model's "Noted." became the step's output (review of ec41bdbf6, P5).
-    With no recorded answer nothing closes: a step that asked on a turn
-    that was never held records no reply, keeps its question open and ends
-    GAVE_UP rather than completing on a non-answer.  A REUSE turn's words
+    With no recorded answer nothing closes: a step whose question was never
+    held keeps it open until the create loop records the person's reply
+    (reply_closes_open_question), and with no reply ends GAVE_UP rather than
+    completing on a non-answer.  A REUSE turn's words
     ride inside its dispatch (reuse_recipe._reuse_seed_message), which
     closes nothing either way."""
+    return window_question(messages, action_id, answers) is not None
+
+
+def window_question(messages, action_id, answers=()):
+    """The open question window_asked finds, as (message index, the text
+    sent), or None.  The one scan: window_asked reads it, and
+    step_open_question reads the request it went out in."""
     names = tool_call_names([messages or []])
     for index in range(len(messages or []) - 1, -1, -1):
         msg = messages[index]
@@ -2110,7 +2163,7 @@ def window_asked(messages, action_id, answers=()) -> bool:
                 and str(msg.get('name') or '') in _PERSON_SEATS
                 and dispatch_action_id(msg.get('content')) is None
                 and _carries_recorded_answer(msg.get('content'), answers)):
-            return False
+            return None
         if msg.get('role') != 'tool':
             continue
         if latest_dispatch_before(messages, index + 1) != action_id:
@@ -2126,8 +2179,8 @@ def window_asked(messages, action_id, answers=()) -> bool:
                 body = msg.get('content')
             if (names.get(call_id) == SEND_TOOL and send_delivered(body)
                     and send_is_ask(messages, call_id)):
-                return True
-    return False
+                return index, str(sent_text(messages, call_id) or '')
+    return None
 
 
 def verdict_waits_on_person(verdict) -> bool:
@@ -2855,10 +2908,8 @@ def derive_completion_evidence(user_prompt: str, action_id: int,
         # its receipt.
         if not _tools_this_action_names(user_prompt, action_id)[1]:
             # A question out and no answer yet: nothing in the window is the
-            # action's output (window_asked); its answer will be.  Any flow:
-            # CREATE's ledger keeps one task per action id across flows.
-            if window_asked(list(getattr(group_chat, 'messages', None) or []),
-                            action_id, recorded_answers(user_prompt, action_id)):
+            # action's output (step_open_question); its answer will be.
+            if step_open_question(user_prompt, action_id) is not None:
                 return None
             return (_derive_written_answer(user_prompt, action_id, group_chat)
                     or user_output_receipt(user_prompt, action_id, group_chat,

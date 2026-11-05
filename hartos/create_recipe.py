@@ -258,7 +258,7 @@ from hartos.lifecycle_hooks import (
     lifecycle_hook_check_all_actions_terminated, StateTransitionError, lifecycle_hook_validate_final_agent_creation,
     mark_action_waiting_for_user, resume_blocked_action, resume_from_user_input,
     ledger_holds_no_block, ledger_user_answered, record_user_answer,
-    reply_closes_open_question,
+    reply_closes_open_question, step_open_question,
     person_waits_on, ledger_open_ask,
     sync_action_state_to_ledger,  # Sync ActionState to SmartLedger
     register_ledger_for_session,  # Register ledger for auto-sync
@@ -4476,11 +4476,17 @@ def _completed_verdict_still_waits(user_prompt, action_id, gate_value):
     So the question is whether the person has answered THIS action in THIS
     flow, and the ledger task records that (the create loop's resume writes
     it, lifecycle_hooks.ledger_user_answered reads it): a `no` with no answer
-    yet asks once; a `no` whose task holds the answer closes.  A daemon turn
-    has nobody to ask, so its `completed` closes as it did before 51c6f6c2d (a
-    mislabelled `no` would otherwise park the goal: the parent flow finished 3
-    of 3, the same flow under the gate paused at action 2 with 1 banked);
-    holding such a step for the expert instead is PENDING the owner's ruling,
+    yet asks once; a `no` whose task holds the answer closes, unless the step
+    put out a question after that answer (lifecycle_hooks.step_open_question):
+    its answer is still owed, and closing there gave the step up with the new
+    question never put to the person (review of c906283b6, must-fix 1: once
+    the reply to an unheld question was recorded, "umm" and a re-ask ended
+    GAVE_UP; the held gate's own re-ask ended the same way before it).  A
+    daemon turn has nobody to ask, so its `completed` closes as it did before
+    51c6f6c2d (a mislabelled `no` would otherwise park the goal: the parent
+    flow finished 3 of 3, the same flow under the gate paused at action 2 with
+    1 banked); holding such a step for the expert instead is PENDING the
+    owner's ruling,
     asked 2026-10-30, not decided here.  The terminal case is
     _should_block_on_user_input's, downstream."""
     if not autonomy_needs_user(gate_value):
@@ -4492,8 +4498,10 @@ def _completed_verdict_still_waits(user_prompt, action_id, gate_value):
     except Exception:
         # An unreadable request kind degrades to asking, the interactive side.
         pass
-    return not ledger_user_answered(user_prompt, action_id,
-                                    get_current_flow(user_prompt))
+    if not ledger_user_answered(user_prompt, action_id,
+                                get_current_flow(user_prompt)):
+        return True
+    return step_open_question(user_prompt, action_id) is not None
 
 
 def _needs_input_reply(action_id, action_text, waiting=False):
@@ -4742,6 +4750,12 @@ def _resume_prior_user_input_block(user_prompt, text, failure=False):
     the request which created the block as the answer to it. Background daemon
     retries were also able to clear it. Checking at function entry with the
     canonical request classifier keeps both cases apart.
+
+    A person's reply to a question the current step's window holds, which
+    nothing held for them (a send that asked, the gate never flagged), enters
+    the same gate as a wait the ledger never held: the one writer records it,
+    and a save the ledger refuses keeps it for their next turn (reviews of
+    65db06972 and c906283b6).
     """
     if failure:
         return False
@@ -4811,37 +4825,41 @@ def _resume_prior_user_input_block(user_prompt, text, failure=False):
         # about; nor the lowest blocked task, which took action 3's reply
         # for action 2 (hartos-00's review of cb13208d2, items 1, 4, 5).
         current = getattr(task, 'current_action', None)
-        if not (is_user and isinstance(current, int)
+        if (is_user and isinstance(current, int)
                 and person_waits_on(user_prompt, current, flow)):
-            # Nothing holds the step for the person, yet its window may hold
-            # a question they were sent (a send that asks, which the gate
-            # never held).  Their reply on their own turn is its answer: only
-            # a recorded answer closes a question (lifecycle_hooks.
+            logging.getLogger(__name__).info(
+                '[USER-INPUT-GATE] action %s waits for the person in the ledger '
+                'with no gate flag (restart between the ask and the reply); '
+                'taking the reply for it', current)
+            _taken_kind = USER_INPUT_GATE_HUMAN_REQUIRED
+        elif (is_user and isinstance(current, int)
+                and ledger_holds_no_block(user_prompt, current)
+                and reply_closes_open_question(user_prompt, current, text,
+                                               request_id)):
+            # Nothing holds the step for the person, yet its window holds a
+            # question they were sent (a send that asks, which the gate never
+            # held).  Their reply on their own turn is its answer: only a
+            # recorded answer closes a question (lifecycle_hooks.
             # window_asked), so unrecorded, the step's output written after
             # their reply never counted and the step ended GAVE_UP (review of
-            # 65db06972, must-fix 3).  Never on a daemon or expert turn
-            # (is_user), never a resend, and never for a step a park holds
-            # BLOCKED: a person's unrelated message does not answer a park.
-            if (is_user and isinstance(current, int)
-                    and ledger_holds_no_block(user_prompt, current)
-                    and reply_closes_open_question(user_prompt, current, text)):
-                if record_user_answer(user_prompt, current, text, flow):
-                    logging.getLogger(__name__).info(
-                        '[USER-INPUT-GATE] Action %s: the person replied to the '
-                        'question its window holds; recorded as its answer',
-                        current)
-                else:
-                    logging.getLogger(__name__).warning(
-                        "[USER-INPUT-GATE] Action %s: the person's reply to its "
-                        "open question could not be recorded", current)
+            # 65db06972, must-fix 3).  Taken into this gate as a wait the
+            # ledger never held, it is recorded by the one writer below, and
+            # a save the ledger refuses keeps it for their next turn like any
+            # answer (review of c906283b6: recorded beside the gate, a refused
+            # save dropped it).  Never on a daemon or expert turn (is_user),
+            # never the asking request's own retry, and never for a step a
+            # park holds BLOCKED: a person's unrelated message does not
+            # answer a park.
+            logging.getLogger(__name__).info(
+                '[USER-INPUT-GATE] action %s: the person replied to the '
+                'question its window holds, which nothing held for them; '
+                'taking the reply for it', current)
+            _taken_kind = USER_INPUT_GATE_AWAITING_REPLY
+        else:
             return False
         action_id = current
-        logging.getLogger(__name__).info(
-            '[USER-INPUT-GATE] action %s waits for the person in the ledger '
-            'with no gate flag (restart between the ask and the reply); '
-            'taking the reply for it', action_id)
         task._needs_user_input_action_id = action_id
-        task._needs_user_input_kind = USER_INPUT_GATE_HUMAN_REQUIRED
+        task._needs_user_input_kind = _taken_kind
     gate_kind = (getattr(task, '_needs_user_input_kind', None)
                  or USER_INPUT_GATE_HUMAN_REQUIRED)
     if is_user:
