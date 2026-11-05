@@ -716,6 +716,35 @@ def _carries_recorded_answer(content, answers) -> bool:
     return False
 
 
+def reply_closes_open_question(user_prompt: str, action_id: int, text) -> bool:
+    """Whether the person's message ``text``, on their own turn, answers a
+    question ``action_id``'s window holds open: a delivered send that asks
+    (window_asked) that no recorded answer has closed, in the session's
+    registered group chat.  False for a blank message and for a resend: the
+    latest message from the person's seat already carries the same words (a
+    retried request posts its words again, and the words that led to the
+    question are not its answer).
+
+    The create loop records such a reply (record_user_answer) when nothing
+    holds the step for the person, the question the gate never held.  Before
+    the recorded-answer rule (review of ec41bdbf6, P5) any line from the
+    person's seat closed the question, daemon ticks included; the person's
+    own reply still does (review of 65db06972, must-fix 3)."""
+    if not str(text or '').strip():
+        return False
+    group_chat = get_registered_groupchat(user_prompt)
+    messages = list(getattr(group_chat, 'messages', None) or [])
+    if not window_asked(messages, action_id,
+                        recorded_answers(user_prompt, action_id)):
+        return False
+    for msg in reversed(messages):
+        if (isinstance(msg, dict) and msg.get('role') == 'user'
+                and str(msg.get('name') or '') in _PERSON_SEATS
+                and dispatch_action_id(msg.get('content')) is None):
+            return not _carries_recorded_answer(msg.get('content'), [text])
+    return True
+
+
 def person_waits_on(user_prompt: str, action_id: int, flow) -> bool:
     """Whether this one action waits for the PERSON's reply in this flow: its
     ledger task is BLOCKED with blocked_reason input_required AND it holds an

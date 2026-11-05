@@ -272,7 +272,11 @@ class TestAQuestionIsNeverTheReceipt(_BothProjectors):
         wrote the lesson: the lesson (message 4) is the step's output, as on
         the parent."""
         answer = 'basic algebra, beginner level'
-        self.patch(lh, 'recorded_answers', lambda up, aid, flow=None: [answer])
+        # Recorded by the real writer, in flow 1: CREATE's projector reads the
+        # action's answers in any flow (its ledger keeps one task per action
+        # id across flows), so a later flow's answer closes its question too.
+        self._real_ledger()
+        self.assertTrue(lh.record_user_answer(self.UP, 1, answer, 1))
         for seat in ('UserProxy', 'User'):
             with self.subTest(seat=seat):
                 reply = {'role': 'user', 'name': seat, 'content': answer}
@@ -281,6 +285,42 @@ class TestAQuestionIsNeverTheReceipt(_BothProjectors):
                 self.assertFalse(lh.window_asked(self.gc.messages, 1, [answer]))
                 self.assertEqual(lh.derive_completion_evidence(self.UP, 1),
                                  {'message_index': 4, 'kind': 'user_visible_result'})
+
+    def _real_ledger(self):
+        """A real ledger registered for this session, so record_user_answer
+        and recorded_answers run as they ship."""
+        import tempfile
+        from agent_ledger.core import SmartLedger, add_actions_to_ledger
+        ledger = SmartLedger(agent_id='p5', session_id=f'{self.UP}_p5',
+                             ledger_dir=tempfile.mkdtemp())
+        add_actions_to_ledger(ledger, [{'action': _ACTION, 'action_id': 1}],
+                              flow_id=0)
+        lh.register_ledger_for_session(self.UP, ledger)
+
+        def _unregister():
+            with lh._state_lock:
+                lh._ledger_registry.pop(self.UP, None)
+        self.addCleanup(_unregister)
+        return ledger
+
+    def test_reuse_reads_the_answers_of_its_run_flow(self):
+        """REUSE's projector reads the answers recorded in the step's run
+        flow (_reuse_action_flow, 0 here).  Its words usually ride inside the
+        dispatch, which closes nothing; when the seed falls back to the raw
+        words they arrive from the 'User' seat, and then the run flow's
+        answer closes the question and another flow's does not."""
+        answer = 'basic algebra, beginner level'
+        log = [_dispatch(), *_send(expects_reply=True, text=_LIVE_TEXT),
+               {'role': 'user', 'name': 'User', 'content': answer},
+               _assistant(_LESSON)]
+        self._real_ledger()
+        self.assertTrue(lh.record_user_answer(self.UP, 1, answer, 1))
+        self._set_log(*log)
+        self.assertIsNone(rr._reuse_completion_evidence(self.UP, 1, self.gc),
+                          "another flow's answer closed REUSE's question")
+        self.assertTrue(lh.record_user_answer(self.UP, 1, answer, 0))
+        self.assertEqual(rr._reuse_completion_evidence(self.UP, 1, self.gc),
+                         {'message_index': 4, 'kind': 'user_visible_result'})
 
     def test_a_daemon_ticks_text_from_the_persons_seat_is_not_an_answer(self):
         """Review of ec41bdbf6, P5, its measured log: CREATE posts every
@@ -368,13 +408,22 @@ class TestAQuestionIsNeverTheReceipt(_BothProjectors):
         """In a native group log every seat's text is role 'user'.  Only the
         person's own seat answers; a steer, a verdict, a timer proxy or the
         model's own line does not."""
+        # The line carries a recorded answer, so only the seat keeps the
+        # question open (with no answer at all nothing closes, and the seat
+        # check would go untested; review of 65db06972, must-fix 1).
+        answer = 'Please continue.'
         for seat in ('ChatInstructor', 'StatusVerifier', 'Helper', 'Executor',
                      'Assistant', 'multi_role_agent', 'user_proxy_u1'):
             with self.subTest(seat=seat):
                 log = [_dispatch(), *_send(expects_reply=True, text=_LIVE_TEXT),
-                       {'role': 'user', 'name': seat, 'content': 'Please continue.'},
+                       {'role': 'user', 'name': seat, 'content': answer},
                        _assistant(_LESSON)]
-                self.assertTrue(lh.window_asked(log, 1))
+                self.assertTrue(lh.window_asked(log, 1, [answer]))
+        log = [_dispatch(), *_send(expects_reply=True, text=_LIVE_TEXT),
+               {'role': 'user', 'name': 'UserProxy', 'content': answer},
+               _assistant(_LESSON)]
+        self.assertFalse(lh.window_asked(log, 1, [answer]),
+                         "the control: the person's seat with the answer closes")
 
     def test_a_reuse_turns_seed_after_the_question_reads_as_before(self):
         """REUSE carries the person's words inside the turn's dispatch
@@ -387,7 +436,14 @@ class TestAQuestionIsNeverTheReceipt(_BothProjectors):
         self.assertEqual(lh.dispatch_action_id(seed['content']), 1)
         log = [_dispatch(), *_send(expects_reply=True, text=_LIVE_TEXT), seed,
                _assistant(_LESSON)]
-        self.assertTrue(lh.window_asked(log, 1))
+        # Even with the person's words recorded as the answer, the dispatch
+        # carrying them closes nothing (review of 65db06972, must-fix 1).
+        self.assertTrue(lh.window_asked(log, 1, ['yes, ready']))
+        raw = {'role': 'user', 'name': 'User', 'content': 'yes, ready'}
+        self.assertFalse(lh.window_asked(
+            [_dispatch(), *_send(expects_reply=True, text=_LIVE_TEXT), raw,
+             _assistant(_LESSON)], 1, ['yes, ready']),
+            'the control: the same words outside a dispatch close')
 
     def test_a_question_beside_a_search_in_one_result_is_not_the_output(self):
         """hartos-00's review of 7043d635e, finding 2: one aggregate tool

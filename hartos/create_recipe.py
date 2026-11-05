@@ -258,6 +258,7 @@ from hartos.lifecycle_hooks import (
     lifecycle_hook_check_all_actions_terminated, StateTransitionError, lifecycle_hook_validate_final_agent_creation,
     mark_action_waiting_for_user, resume_blocked_action, resume_from_user_input,
     ledger_holds_no_block, ledger_user_answered, record_user_answer,
+    reply_closes_open_question,
     person_waits_on, ledger_open_ask,
     sync_action_state_to_ledger,  # Sync ActionState to SmartLedger
     register_ledger_for_session,  # Register ledger for auto-sync
@@ -4812,6 +4813,27 @@ def _resume_prior_user_input_block(user_prompt, text, failure=False):
         current = getattr(task, 'current_action', None)
         if not (is_user and isinstance(current, int)
                 and person_waits_on(user_prompt, current, flow)):
+            # Nothing holds the step for the person, yet its window may hold
+            # a question they were sent (a send that asks, which the gate
+            # never held).  Their reply on their own turn is its answer: only
+            # a recorded answer closes a question (lifecycle_hooks.
+            # window_asked), so unrecorded, the step's output written after
+            # their reply never counted and the step ended GAVE_UP (review of
+            # 65db06972, must-fix 3).  Never on a daemon or expert turn
+            # (is_user), never a resend, and never for a step a park holds
+            # BLOCKED: a person's unrelated message does not answer a park.
+            if (is_user and isinstance(current, int)
+                    and ledger_holds_no_block(user_prompt, current)
+                    and reply_closes_open_question(user_prompt, current, text)):
+                if record_user_answer(user_prompt, current, text, flow):
+                    logging.getLogger(__name__).info(
+                        '[USER-INPUT-GATE] Action %s: the person replied to the '
+                        'question its window holds; recorded as its answer',
+                        current)
+                else:
+                    logging.getLogger(__name__).warning(
+                        "[USER-INPUT-GATE] Action %s: the person's reply to its "
+                        "open question could not be recorded", current)
             return False
         action_id = current
         logging.getLogger(__name__).info(

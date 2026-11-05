@@ -781,6 +781,131 @@ class ThePersonsWaitIsTheAskRecord(unittest.TestCase):
         self.assertEqual(hits, [])
 
 
+class APersonsReplyToAnUnheldQuestionIsItsAnswer(unittest.TestCase):
+    """Review of 65db06972, must-fix 3.  Only a recorded answer closes a
+    step's question (review of ec41bdbf6, P5), and the gate records only
+    the reply to a question it held.  A step that sent a question the gate
+    never held (no flag, no ask record) left the person's real reply
+    unrecorded, so the lesson after it never counted and the step ended
+    GAVE_UP where it used to complete.  The create loop now records the
+    person's reply on their own turn when the current action's window holds
+    the open question; never a daemon turn's text, a resend, or a reply
+    meant for a parked step.  Driven through the real create loop resume,
+    the real hooks, a real ledger and a registered group chat."""
+
+    _QUESTION = 'Which sound should we practise first?'
+
+    def setUp(self):
+        import tempfile
+        from agent_ledger.core import SmartLedger, add_actions_to_ledger
+        from hartos import lifecycle_hooks as L
+        self.L = L
+        clear_action_states(_UP)
+        self.ledger = SmartLedger(agent_id='54', session_id=f'{_UP}_unheld',
+                                  ledger_dir=tempfile.mkdtemp())
+        add_actions_to_ledger(self.ledger, [
+            {'action': 'say Hello Arjun', 'action_id': 1},
+            {'action': 'ask the child which sound to practise', 'action_id': 3},
+        ], flow_id=0)
+        L.register_ledger_for_session(_UP, self.ledger)
+        create_recipe.user_ledgers[_UP] = self.ledger
+        create_recipe.user_tasks[_UP] = SimpleNamespace(current_action=3)
+        create_recipe.request_id_list[_UP] = 'user-request-2'
+        self.gc = SimpleNamespace(messages=[], agents=[])
+        L.register_groupchat_for_session(_UP, self.gc)
+        from agent_ledger.core import TaskStatus
+        self.ledger.tasks['action_3'].status = TaskStatus.IN_PROGRESS
+        safe_set_state(_UP, 3, ActionState.IN_PROGRESS, 'working')
+
+    def tearDown(self):
+        clear_action_states(_UP)
+        create_recipe.initialise_current_flow_to_zero(_UP)
+        with self.L._state_lock:
+            self.L._ledger_registry.pop(_UP, None)
+            self.L._groupchat_registry.pop(_UP, None)
+        for store in (create_recipe.user_tasks, create_recipe.request_id_list,
+                      create_recipe.user_ledgers):
+            try:
+                del store[_UP]
+            except Exception:
+                pass
+
+    def _window(self, *before, expects_reply=True):
+        """Action 3's window: its dispatch, then a send it made (asking, or
+        a delivery), after any earlier messages ``before``."""
+        import json
+        call = {'role': 'assistant', 'name': 'Assistant', 'content': '',
+                'tool_calls': [{'id': 's3', 'type': 'function', 'function': {
+                    'name': 'send_message_to_user',
+                    'arguments': json.dumps({'text': self._QUESTION,
+                                             'expects_reply': expects_reply})}}]}
+        result = {'role': 'tool', 'name': 'Assistant',
+                  'content': 'Message sent successfully to user with request_id: r3',
+                  'tool_responses': [{
+                      'tool_call_id': 's3', 'role': 'tool',
+                      'content': 'Message sent successfully to user with request_id: r3'}]}
+        dispatch = {'role': 'assistant', 'name': 'ChatInstructor',
+                    'content': 'Execute Action 3: ask the child which sound to practise'}
+        self.gc.messages = [*before, dispatch, call, result]
+
+    def _turn(self, request, text):
+        create_recipe.request_id_list[_UP] = request
+        return _resume_prior_user_input_block(_UP, text)
+
+    def _answers(self):
+        return self.L.recorded_answers(_UP, 3)
+
+    def test_the_persons_reply_is_recorded_and_closes_the_question(self):
+        self._window()
+        self.assertFalse(self._turn('user-request-2', 'the b sound'),
+                         'nothing was held, so nothing is resumed')
+        self.assertEqual(self._answers(), ['the b sound'])
+        self.assertTrue(self.L.ledger_user_answered(_UP, 3, 0))
+        self.assertTrue(self.ledger.tasks['action_3'].verify_integrity())
+        posted = [*self.gc.messages,
+                  {'role': 'user', 'name': 'UserProxy', 'content': 'the b sound'},
+                  {'role': 'assistant', 'name': 'Assistant',
+                   'content': 'Great, the b sound. Say ball with me: b, b, ball.'}]
+        self.assertTrue(self.L.window_asked(self.gc.messages, 3, self._answers()))
+        self.assertFalse(self.L.window_asked(posted, 3, self._answers()),
+                         'the recorded reply closes the question it answers')
+
+    def test_a_daemon_turns_text_is_not_recorded(self):
+        self._window()
+        self.assertFalse(self._turn('daemon_goal-7', 'Build the agent now'))
+        self.assertEqual(self._answers(), [])
+
+    def test_a_resend_of_the_words_that_led_to_the_question_is_not_its_answer(self):
+        before = {'role': 'user', 'name': 'UserProxy', 'content': 'teach Arjun a sound'}
+        self._window(before)
+        self.assertFalse(self._turn('user-request-2', 'teach Arjun a sound'))
+        self.assertEqual(self._answers(), [])
+        self.assertFalse(self._turn('user-request-3', 'the b sound'))
+        self.assertEqual(self._answers(), ['the b sound'])
+
+    def test_a_delivery_that_asks_nothing_takes_no_answer(self):
+        self._window(expects_reply=False)
+        self.assertFalse(self._turn('user-request-2', 'thanks'))
+        self.assertEqual(self._answers(), [])
+
+    def test_a_reply_meant_for_a_parked_step_is_not_recorded(self):
+        """A park holds the task BLOCKED (input_required) with no ask: the
+        person's next message does not answer it (as the ask-record tests
+        above pin for the gate)."""
+        self._window()
+        self.assertTrue(self.L.block_for_user_input(_UP, 3, 'it did not complete'))
+        self.assertFalse(self._turn('user-request-2', 'hi, how is the weather'))
+        self.assertEqual(self._answers(), [])
+
+    def test_an_answered_question_takes_no_second_answer(self):
+        self._window()
+        self.assertFalse(self._turn('user-request-2', 'the b sound'))
+        self.gc.messages.append(
+            {'role': 'user', 'name': 'UserProxy', 'content': 'the b sound'})
+        self.assertFalse(self._turn('user-request-3', 'and now the m sound'))
+        self.assertEqual(self._answers(), ['the b sound'])
+
+
 class AnAnswerTheLedgerCannotSaveIsKeptAndRetried(unittest.TestCase):
     """hartos-00's review of cb13208d2, item 2.  With the answer's save
     failing, cb13208d2 kept the gate but nothing retried the answer: every
