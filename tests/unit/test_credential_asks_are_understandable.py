@@ -17,13 +17,19 @@ hart_intelligence_entry) handed any ask to request_credential.
 Now both go through ai_key_vault.request_credential_for_agent: a credential
 this computer's code reads (reads_from_env) or the owner already stored goes
 straight on; any other ask is judged by the node's own model, which must
-reply with the object the request names (who issues the secret, whether the
-use is done on the person's account there, then YES or NO).  YES is asked
-with the service and where to get it on the card; NO goes back to the agent
-with no card; anything else is asked as before and logged.  The 17:53 card of
-2026-11-03 (HIVENET below) is why the middle question exists.  The model is the boundary mocked here
-(core.http_pool.pooled_post); the consent service, the database and the
-vault are real, as in test_credential_ask.
+reply with the two-field object the request names (who issues the secret,
+then YES or NO).  YES is asked with the service and where to get it on the
+card; NO goes back to the agent with no card; anything else is asked as
+before and logged.  An ask that goes to the person is put a second question
+(is its stated use done on the person's account at that company?).  A NO
+there never refuses: the card says first that it sounds like this
+computer's own work (ai_key_vault.ASK_DOUBT_NOTE), and the person decides.
+The 17:53 card of 2026-11-03 (HIVENET below) is why the second question
+exists.  Folding it into the first (6a1f2e46d) was REJECTED on review: the
+desktop's 4B then refused 10 of 41 real asks a reviewer wrote, with no card.
+The model is the boundary mocked here (core.http_pool.pooled_post); the
+consent service, the database and the vault are real, as in
+test_credential_ask.
 
     python -m pytest tests/unit/test_credential_asks_are_understandable.py -q
 """
@@ -69,18 +75,32 @@ HIVENET = json.dumps({
     'description': 'Hivenet API key needed to monitor idle nodes and onboard '
                    'models via POST /api/models/onboard',
     'where_to_get': 'hivenet.io API documentation or developer portal'})
-# The reply shape the request demands (_ASK_CHECK_SCHEMA).
-YES = json.dumps({'issued_by': 'OpenWeather', 'their_account_used': 'YES',
-                  'answer': 'YES'})
-NO = json.dumps({'issued_by': 'NONE', 'their_account_used': 'NO', 'answer': 'NO'})
-TOLD = 'no person could act on it'
+# A real ask from the review of 6a1f2e46d, word for word (its fresh_battery):
+# the person's own PagerDuty pages them when this computer goes offline.
+PAGERDUTY = json.dumps({
+    'resource_type': 'api_key', 'key_name': 'PAGERDUTY_ROUTING_KEY',
+    'label': 'PagerDuty integration key', 'service': 'PagerDuty',
+    'used_by': 'outage alerts',
+    'description': "To page you through PagerDuty when this computer's node "
+                   "goes offline or a model crashes.",
+    'where_to_get': 'PagerDuty, Services, Integrations, Events API v2'})
+# The reply shapes the requests demand (_ASK_CHECK_SCHEMA, _ASK_USE_SCHEMA).
+YES = json.dumps({'issued_by': 'OpenWeather', 'answer': 'YES'})
+NO = json.dumps({'issued_by': 'NONE', 'answer': 'NO'})
+USED = json.dumps({'their_account_used': 'YES'})
+NOT_USED = json.dumps({'their_account_used': 'NO'})
+TOLD = 'no outside company, website or app gives it out'
 
 
 @pytest.fixture
 def model(monkeypatch):
-    """The node's own model, answering with ``state.reply`` (None: down)."""
+    """The node's own model.  The first question (credential_ask_check) gets
+    ``state.reply``; the second (credential_ask_use) gets ``state.use_reply``.
+    None: the model is down for that question.  A callable is handed the
+    schema the request holds the model to and returns the reply, for a model
+    that answers whatever fields it is asked."""
     from core import autogen_config, http_pool
-    state = SimpleNamespace(reply=YES, prompts=[], bodies=[])
+    state = SimpleNamespace(reply=YES, use_reply=USED, prompts=[], bodies=[])
     monkeypatch.setattr(autogen_config, 'llm_http_target',
                         lambda draft=False: ('http://model.invalid/v1/chat/completions',
                                              {}, 'test-model'))
@@ -88,10 +108,14 @@ def model(monkeypatch):
     def post(url, headers=None, json=None, timeout=None, **_):
         state.prompts.append(json['messages'][-1]['content'])
         state.bodies.append(json)
-        if state.reply is None:
+        name = json['response_format']['json_schema']['name']
+        reply = state.use_reply if name == 'credential_ask_use' else state.reply
+        if callable(reply):
+            reply = reply(json['response_format']['json_schema']['schema'])
+        if reply is None:
             raise ConnectionError('model down')
         return SimpleNamespace(status_code=200, json=lambda: {
-            'choices': [{'message': {'content': state.reply}}]})
+            'choices': [{'message': {'content': reply}}]})
 
     monkeypatch.setattr(http_pool, 'pooled_post', post)
     return state
@@ -126,40 +150,119 @@ def test_a_made_up_credential_never_reaches_the_owner(world, model):
 
 def test_the_model_is_held_to_two_words(world, model):
     """The request names the reply's shape, so the server holds the model to
-    it: the answers are YES or NO, never free text to read a word out of."""
-    _request_resource()(INVENTED)
-    fmt = model.bodies[0]['response_format']
-    schema = fmt['json_schema']['schema']
-    assert fmt['type'] == 'json_schema'
+    it: each answer is YES or NO, never free text to read a word out of."""
+    _request_resource()(WEATHER)
+    check, use = (b['response_format'] for b in model.bodies)
+    assert check['type'] == use['type'] == 'json_schema'
+    schema = check['json_schema']['schema']
     assert schema['properties']['answer']['enum'] == ['YES', 'NO']
-    assert schema['properties']['their_account_used']['enum'] == ['YES', 'NO']
-    assert set(schema['required']) == {'issued_by', 'their_account_used', 'answer'}
+    assert set(schema['required']) == {'issued_by', 'answer'}
+    use_schema = use['json_schema']['schema']
+    assert use_schema['properties']['their_account_used']['enum'] == ['YES', 'NO']
+    assert use_schema['required'] == ['their_account_used']
 
 
-def test_a_real_company_named_for_this_computers_own_work_is_not_asked(world, model):
-    """The 17:53 card: Hivenet is a real company, but monitoring idle nodes and
-    onboarding models through this node's own /api/models/onboard is this
-    computer's work, done on no account of the person's.  The model answers
-    that the person's account there is not used, and no card goes out."""
-    model.reply = json.dumps({'issued_by': 'Hivenet', 'their_account_used': 'NO',
-                              'answer': 'NO'})
+def test_a_real_company_named_for_this_computers_own_work_is_asked_with_a_doubt(world, model):
+    """The 17:53 card: Hivenet is a real company, so the first question lets it
+    through; the second says monitoring idle nodes and onboarding models
+    through this node's own /api/models/onboard is not done on the person's
+    account there.  The card goes out with the doubt right after the line
+    that names the key, ahead of the agent's own words, so the person reads
+    it before deciding; it is never refused on that alone (review of
+    6a1f2e46d: the 4B says NO there for real asks too, e.g. metrics sent to
+    the person's Datadog)."""
+    from hartos.ai_key_vault import ASK_DOUBT_NOTE
+    model.reply = json.dumps({'issued_by': 'Hivenet', 'answer': 'YES'})
+    model.use_reply = NOT_USED
     out = _request_resource()(HIVENET)
-    assert _cards(world) == [], 'the made-up Hivenet ask reached the owner as a card'
-    assert _asks() == []
-    assert 'Hivenet API key' in out and TOLD in out
-    assert '/api/models/onboard' in model.prompts[0], (
-        'the model was not shown what the secret is for')
+    cards = _cards(world)
+    assert len(cards) == 1, 'the ask was refused on the doubt alone'
+    ask = json.loads(HIVENET)
+    assert cards[0]['reason'].startswith(
+        f"{ask['label']} is needed for {ask['used_by']}. {ASK_DOUBT_NOTE}"), (
+        'the card does not say, right after naming the key, that this sounds '
+        'like the computer\'s own work')
+    assert 'monitor idle nodes' in cards[0]['reason']
+    assert '{{secret:HIVENET_API_KEY}}' in out
+    assert '/api/models/onboard' in model.prompts[1], (
+        'the second question was not shown what the secret is for')
 
 
-def test_a_real_company_used_on_the_persons_account_is_asked(world, model):
-    """The same company, for a step done on the person's account there: asked."""
-    model.reply = json.dumps({'issued_by': 'Hivenet', 'their_account_used': 'YES',
-                              'answer': 'YES'})
+def test_a_real_ask_the_model_doubts_still_reaches_the_person(world, model):
+    """The regression that REJECTED 6a1f2e46d.  Asked in one question whether
+    a company issues the key AND the use is done on the person's account
+    there, the desktop's Qwen3.5-4B answered this ask with issued_by
+    PagerDuty, their_account_used NO, answer NO (reviewer's runs, 2026-11-03,
+    twice), and it was refused with no card.  This model answers every
+    question the way it answered that one: PagerDuty issues it, and NO, the
+    use is not on the person's account.  Only "nobody issues it" refuses; a
+    doubt about the use goes on the card and the person decides."""
+    def desktop_4b(schema):
+        asked = set(schema['properties'])
+        reply = {'issued_by': 'PagerDuty', 'their_account_used': 'NO'}
+        if 'answer' in asked:
+            # Folded into one question the use decides the answer (measured);
+            # the issuer question's answer is YES for a named company.
+            reply['answer'] = 'NO' if 'their_account_used' in asked else 'YES'
+        return json.dumps({k: v for k, v in reply.items() if k in asked})
+    model.reply = model.use_reply = desktop_4b
+    _request_resource()(PAGERDUTY)
+    cards = _cards(world)
+    assert len(cards) == 1, 'a real ask was refused with no card'
+    from hartos.ai_key_vault import ASK_DOUBT_NOTE
+    assert ASK_DOUBT_NOTE in cards[0]['reason']
+    assert 'Events API v2' in cards[0]['reason']
+
+
+def test_a_doubt_reaches_the_card_when_the_agent_names_no_service(world, model):
+    """Nothing tells the agent it must give service or where_to_get, and the
+    17:53 kind of ask is the one most likely to leave them out: the doubt
+    still goes on the card."""
+    from hartos.ai_key_vault import ASK_DOUBT_NOTE
+    bare = {k: v for k, v in json.loads(HIVENET).items()
+            if k not in ('service', 'where_to_get')}
+    model.reply = json.dumps({'issued_by': 'Hivenet', 'answer': 'YES'})
+    model.use_reply = NOT_USED
+    _request_resource()(json.dumps(bare))
+    cards = _cards(world)
+    assert len(cards) == 1
+    assert ASK_DOUBT_NOTE in cards[0]['reason']
+
+
+def test_a_real_company_used_on_the_persons_account_is_asked_plainly(world, model):
+    """The same company, for a step done on the person's account there: a
+    plain card, no doubt on it."""
+    from hartos.ai_key_vault import ASK_DOUBT_NOTE
+    model.reply = json.dumps({'issued_by': 'Hivenet', 'answer': 'YES'})
+    model.use_reply = USED
     _request_resource()(json.dumps(dict(
         json.loads(HIVENET), used_by='rent_compute',
         description='To rent extra compute on your Hivenet account for the '
                     'overnight batch.')))
-    assert len(_cards(world)) == 1
+    cards = _cards(world)
+    assert len(cards) == 1
+    assert ASK_DOUBT_NOTE not in cards[0]['reason']
+
+
+@pytest.mark.parametrize('use_reply', [
+    None,                                           # the model is down
+    'NO, this is the computer\'s own work',         # not the asked-for object
+    json.dumps({'their_account_used': 'MAYBE'}),
+])
+def test_a_second_answer_that_is_not_a_clear_no_adds_no_doubt(world, model, use_reply):
+    """Not knowing adds nothing: the card goes out as it would have."""
+    from hartos.ai_key_vault import ASK_DOUBT_NOTE
+    model.use_reply = use_reply
+    _request_resource()(WEATHER)
+    cards = _cards(world)
+    assert len(cards) == 1
+    assert ASK_DOUBT_NOTE not in cards[0]['reason']
+
+
+def test_a_refused_ask_is_not_put_the_second_question(world, model):
+    model.reply = NO
+    _request_resource()(INVENTED)
+    assert len(model.bodies) == 1
 
 
 def test_an_ask_a_person_can_act_on_reaches_them_with_where_to_get_it(world, model):
@@ -194,15 +297,8 @@ def test_a_stored_credential_is_answered_without_the_model(world, model):
 @pytest.mark.parametrize('reply', [
     # What the desktop's model wrote on 2026-11-03 when asked for free text.
     "NO, because this request asks for the computer's own network configuration",
-    # A NO that names who issues it and says the person's account is used
-    # contradicts itself.
-    json.dumps({'issued_by': 'OpenWeather', 'their_account_used': 'YES',
-                'answer': 'NO'}),
-    # A YES that says the person's account is not used contradicts itself.
-    json.dumps({'issued_by': 'OpenWeather', 'their_account_used': 'NO',
-                'answer': 'YES'}),
-    # A YES that names nobody who issues it contradicts itself.
-    json.dumps({'issued_by': 'NONE', 'their_account_used': 'YES', 'answer': 'YES'}),
+    # A NO that names who issues it contradicts itself.
+    json.dumps({'issued_by': 'OpenWeather', 'answer': 'NO'}),
     json.dumps(['NO']),
     # A reply whose content is a list of parts, not text (review of 133ab4a07,
     # M2: it raised TypeError out of the tool).

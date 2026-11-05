@@ -793,103 +793,108 @@ REQUEST_RESOURCE_DESCRIPTION = (
 
 #: Seconds the node's own model gets to judge one ask.
 _ASK_CHECK_TIMEOUT_S = 20
-#: The model names who gives the person this secret, then says whether the
-#: stated use is done on the person's account there, then answers.
-#: Measured 2026-11-03 on the desktop's own model: asked for a free-text
-#: "YES / NO: reason", it judged right but wrote "NO, because ...", so no exact
-#: word ever matched; asked for a bare verdict, it refused real outside-service
-#: asks as "system credentials".  The issuer-only check that followed passed
-#: the 17:53 IST card: HIVENET_API_KEY, "to monitor idle nodes and onboard
-#: models via POST /api/models/onboard", this computer's own work, but Hivenet
-#: is a real company.  On the desktop's Qwen3.5-4B (port 8080), over 69 asks
-#: (the 51 of the issuer-only check, 10 real asks naming nodes, GPUs or models,
-#: 8 made-up ones naming a real company) the issuer-only check got 17 wrong
-#: and this one 0; over 18 asks written after this text was fixed, 7 and 0.
+#: The model first names who gives the person this secret, then answers.
+#: Measured 2026-11-03 on the desktop's own model (Qwen3.5-2B): asked for a
+#: free-text "YES / NO: reason", it judged right but wrote "NO, because ...",
+#: so no exact word ever matched; asked for a bare verdict, it refused 5 of 10
+#: real outside-service asks (bot tokens, a Stripe key) as "system
+#: credentials".  Naming the issuer first: 0 wrong of 51 asks (27 real, 21
+#: made up, 3 sets) once the keys this computer reads skip the check.
+#: This question alone decides a refusal.  Folding "is it the person's own
+#: account" into it (6a1f2e46d, REJECTED on review 2026-11-03) made the
+#: desktop's Qwen3.5-4B refuse 10 of 41 real asks a reviewer wrote (Datadog,
+#: B2, S3, a Hugging Face download ...) with no card; this check refused 1.
 _ASK_CHECK_PROMPT = (
     "A software agent on a person's computer wants to ask the person to type in a "
     "secret: an API key, token, password or similar.\n"
     "Step 1, issued_by: the outside company, website or app where the person has an "
     "account and gets this secret (for example Telegram, Stripe, AWS, Zoom, their "
-    "email provider or online shop). The label, key name or service usually names "
-    "it: \"Airtable personal access token\" is issued by Airtable, \"WordPress "
-    "application password\" by WordPress. Write NONE only if the secret belongs to "
-    "the computer itself or to the agent software (its own settings, network, "
+    "email provider or online shop). Write NONE only if the secret belongs to the "
+    "computer itself or to the agent software (its own settings, network, "
     "configuration, storage, scheduler, model server, node identity, certificates "
     "or internal keys), which the system already has.\n"
-    "Step 2, their_account_used: read what the secret will be used for. YES if that "
-    "use is done at issued_by, on the person's account there (for example posting, "
-    "paying, sending, downloading from it, or renting or using its service). NO if "
-    "the use is this computer's own work: monitoring, restarting, configuring or "
-    "reading its own nodes, hive, peers, models, memory, GPU, scheduler or "
-    "settings, or calling its own addresses such as /api/... That work needs no "
-    "outside account, even when a company is named.\n"
-    "Step 3, answer: YES only if issued_by names a company, website or app and "
-    "their_account_used is YES; otherwise NO.\nThe request:\n{request}\n")
+    "Step 2, answer: YES if issued_by names a company, website or app; NO if "
+    "issued_by is NONE.\nThe request:\n{request}\n")
 #: The reply's exact shape, enforced by the server (llama.cpp makes it a
-#: grammar; OpenAI-style APIs take it as structured output), so each verdict is
+#: grammar; OpenAI-style APIs take it as structured output), so the answer is
 #: one of two words and never free text to pattern-match.
 _ASK_CHECK_SCHEMA = {
     'type': 'object',
     'properties': {'issued_by': {'type': 'string', 'maxLength': 80},
-                   'their_account_used': {'type': 'string', 'enum': ['YES', 'NO']},
                    'answer': {'type': 'string', 'enum': ['YES', 'NO']}},
-    'required': ['issued_by', 'their_account_used', 'answer'],
-    'additionalProperties': False}
+    'required': ['issued_by', 'answer'], 'additionalProperties': False}
+#: The second question, put only to an ask the first one lets through: is the
+#: stated use done on the person's account at the company it names?  It never
+#: refuses; a NO puts ASK_DOUBT_NOTE on the card right after the line naming
+#: the key, ahead of the agent's own words, so the person still decides.  The live case (2026-11-03 17:53:49 IST, desktop): an agent that
+#: had googled "Hivenet API" five times asked for HIVENET_API_KEY "to monitor
+#: idle nodes and onboard models via POST /api/models/onboard", this
+#: computer's own work, and the first question passed it (Hivenet is real).
+_ASK_USE_PROMPT = (
+    "A software agent on a person's computer wants the person to type in a secret "
+    "for an outside company, website or app.\n"
+    "their_account_used: read what the secret will be used for. YES if that use "
+    "is done at that company, on the person's account there (for example posting, "
+    "paying, sending, storing or backing up files there, downloading from it, "
+    "monitoring or alerting through it, or renting or using its service). NO if "
+    "the use is only this computer's own work, with no outside account in it: "
+    "monitoring, restarting, configuring or reading its own nodes, hive, peers, "
+    "models, memory, GPU, scheduler or settings, or calling its own addresses "
+    "such as /api/...\nThe request:\n{request}\n")
+_ASK_USE_SCHEMA = {
+    'type': 'object',
+    'properties': {'their_account_used': {'type': 'string', 'enum': ['YES', 'NO']}},
+    'required': ['their_account_used'], 'additionalProperties': False}
+#: What the card says first when the second question answers NO.
+ASK_DOUBT_NOTE = (
+    "Check before you enter anything: what this is for sounds like work this "
+    "computer does on its own, which needs no outside key. Enter it only if you "
+    "use this service for this.")
 _ASK_FIELDS = ('label', 'key_name', 'service', 'used_by', 'description',
                'where_to_get')
 
 
-def _ask_verdict(req) -> Optional[str]:
-    """'yes' | 'no' | None: the node's own model's word on whether an outside
-    company, website or app gives the person this secret AND the stated use is
-    done on the person's account there.  The model this node's turns run on
-    (core.autogen_config.llm_http_target), so it works where there is no local
-    model too.
-
-    'yes' only when all three fields agree (a company named, their account
-    used, YES); 'no' when the answer is NO and either nobody issues it (NONE)
-    or their account is not used (this computer's own work, the 17:53 card of
-    2026-11-03).  A reply that contradicts itself counts as no answer, as does
-    any reply that is not the asked-for object, an error or a model that is
-    down (None).  Refusing a real ask costs the person a working agent; asking
-    a made-up one costs them a puzzling card, which is what happened before."""
+def _ask_model(req, prompt, schema, name) -> Optional[dict]:
+    """The node's own model's reply to ``prompt`` about ask ``req``, held to
+    ``schema`` by the server; None when it cannot be asked or the reply is not
+    the asked-for object.  The one stateless JSON call is
+    core.llm_json.ask_model_json (the model this node's turns run on, so it
+    works where there is no local model too); this only writes the ask out."""
+    from core.llm_json import ask_model_json
     request = '\n'.join(f'{key}: {str(req.get(key))[:300]}' for key in _ASK_FIELDS
                         if str(req.get(key) or '').strip())
-    try:
-        from core.autogen_config import llm_http_target, llm_stays_on_premises
-        from core.http_pool import pooled_post
-        url, headers, model = llm_http_target()
-        body = {'model': model, 'temperature': 0, 'max_tokens': 80,
-                'messages': [{'role': 'user',
-                              'content': _ASK_CHECK_PROMPT.format(request=request)}],
-                'response_format': {'type': 'json_schema', 'json_schema': {
-                    'name': 'credential_ask_check', 'strict': True,
-                    'schema': _ASK_CHECK_SCHEMA}}}
-        if llm_stays_on_premises():
-            from core.constants import LLM_THINKING_OFF_KWARGS
-            body['chat_template_kwargs'] = dict(LLM_THINKING_OFF_KWARGS)
-        resp = pooled_post(url, headers=headers, json=body, timeout=_ASK_CHECK_TIMEOUT_S)
-        if resp.status_code != 200:
-            raise RuntimeError(f'HTTP {resp.status_code}')
-        text = ((resp.json().get('choices') or [{}])[0].get('message') or {}).get(
-            'content') or ''
-    except Exception as e:
-        logger.warning("credential ask: the model could not be asked (%s)", e)
-        return None
-    try:
-        reply = json.loads(text)
-    except (TypeError, ValueError):  # TypeError: content as a list of parts, not text
-        return None
-    if not isinstance(reply, dict):
+    return ask_model_json(prompt.format(request=request), schema, name,
+                          max_tokens=80, timeout=_ASK_CHECK_TIMEOUT_S)
+
+
+def _ask_verdict(req) -> Optional[str]:
+    """'yes' | 'no' | None: the node's own model's word on whether an outside
+    company, website or app gives the person this secret.
+
+    'no' only when both fields say so (issued_by NONE and answer NO); a NO that
+    names a company contradicts itself and counts as no answer, as does any
+    reply that is not the asked-for object, an error or a model that is down
+    (None).  Refusing a real ask costs the person a working agent; asking a
+    made-up one costs them a puzzling card, which is what happened before."""
+    reply = _ask_model(req, _ASK_CHECK_PROMPT, _ASK_CHECK_SCHEMA, 'credential_ask_check')
+    if reply is None:
         return None
     answer = reply.get('answer')
-    used = reply.get('their_account_used')
     issuer = str(reply.get('issued_by') or '').strip().upper()
-    if answer == 'YES' and used == 'YES' and issuer not in ('', 'NONE'):
+    if answer == 'YES':
         return 'yes'
-    if answer == 'NO' and (issuer == 'NONE' or used == 'NO'):
+    if answer == 'NO' and issuer == 'NONE':
         return 'no'
     return None
+
+
+def _ask_doubted(req) -> bool:
+    """True when the node's own model says the stated use is NOT done on the
+    person's account at the company it names (this computer's own work).
+    False for YES, and for any failure or other reply: a doubt only adds
+    ASK_DOUBT_NOTE to a card, so not knowing adds nothing."""
+    reply = _ask_model(req, _ASK_USE_PROMPT, _ASK_USE_SCHEMA, 'credential_ask_use')
+    return bool(reply) and reply.get('their_account_used') == 'NO'
 
 
 def request_credential_for_agent(resource_description, agent_id=None) -> str:
@@ -907,11 +912,14 @@ def request_credential_for_agent(resource_description, agent_id=None) -> str:
     tokens) or one the owner already stored goes straight on, with no model
     call.  Any other ask is judged by the node's own model (_ask_verdict): YES
     is asked, with the service and where to get it put on the card; NO (no
-    outside company gives it out, or the use is this computer's own work, as
-    the 17:53 IST HIVENET_API_KEY card of 2026-11-03 was) goes back to the
-    agent with no card; no
+    outside company gives it out) goes back to the agent with no card; no
     answer (model down, or not the asked-for reply) is asked as before and
-    logged.  Code that asks for its own fixed credential (post_to_channel, the
+    logged.  An ask that goes to the person is put the second question
+    (_ask_doubted): when its stated use is this computer's own work, as the
+    17:53 IST HIVENET_API_KEY card of 2026-11-03 was, the card says so
+    (ASK_DOUBT_NOTE) right after the line naming the key, ahead of the
+    agent's own words, and the person decides; it is never refused on that
+    alone.  Code that asks for its own fixed credential (post_to_channel, the
     trending-songs job) calls request_credential itself.
     """
     req = _parse_resource_request(resource_description)
@@ -921,30 +929,35 @@ def request_credential_for_agent(resource_description, agent_id=None) -> str:
     # declared credential is recognised as the same one.
     name = vault.credential_name(req.get('key_name') or label,
                                  req.get('channel_type') or '')
+    doubted = False
     if not (reads_from_env(name) or vault.owner_credential(name)):
         verdict = _ask_verdict(req)
         if verdict == 'no':
             logger.info("credential %s not asked: no outside company, website or "
-                        "app gives it out for this use", name)
+                        "app gives it out", name)
             return (f"Did not ask the owner for '{label}': no outside company, "
-                    f"website or app gives it out, or what it is for is this "
-                    f"computer's own work, so no person could act on it. Ask a "
-                    f"person only for a credential of an outside service they "
-                    f"have an account with, for a step done on that account, and "
-                    f"say which service, what you will do there and where they "
-                    f"get it. This computer's own nodes, models, settings, "
-                    f"network and configuration need no secret from anyone.")
+                    f"website or app gives it out, so no person could find it. "
+                    f"Ask a person only for a credential of an outside service "
+                    f"they have an account with, and say which service, what you "
+                    f"will do with it and where they get it. This computer's own "
+                    f"settings, network and configuration need no secret from "
+                    f"anyone.")
         if verdict is None:
             logger.warning("credential %s could not be checked (the model gave no "
                            "answer): asked as before", name)
+        doubted = _ask_doubted(req)
+        if doubted:
+            logger.info("credential %s asked with a doubt: its stated use sounds "
+                        "like this computer's own work", name)
     # The card shows what the person needs to act on it (request_credential
     # puts the description in the card's reason).
     extra = [f"Service: {req['service']}." if str(req.get('service') or '').strip()
              else '',
              f"Where to get it: {req['where_to_get']}."
              if str(req.get('where_to_get') or '').strip() else '']
-    if any(extra):
+    if any(extra) or doubted:
         req = dict(req, description=' '.join(filter(None, [
+            ASK_DOUBT_NOTE if doubted else '',
             str(req.get('description') or '').strip()] + extra)))
     return request_credential(json.dumps(req), agent_id=agent_id)
 

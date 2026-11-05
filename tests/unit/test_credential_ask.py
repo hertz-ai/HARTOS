@@ -660,10 +660,16 @@ def test_a_value_the_card_stored_resolves_and_is_masked_once_granted(world, monk
 def test_the_autogen_request_resource_tool_files_the_same_ask(world, monkeypatch):
     from core import agent_tools
     from hartos import ai_key_vault
-    # The agent tool first asks the node's model whether a person can act on
-    # the ask (test_credential_asks_are_understandable.py); here it says yes,
-    # so this test stays on the card and the alias, with no live model.
-    monkeypatch.setattr(ai_key_vault, '_ask_verdict', lambda req: 'yes')
+    # The agent tool asks the node's model two questions about the ask (who
+    # issues it; is the use done on the person's account there:
+    # test_credential_asks_are_understandable.py).  Both go through
+    # _ask_model, so that is where the model stands in: it lets the ask
+    # straight through, and this test stays on the card and the alias with
+    # no live model.  (Faking only _ask_verdict let the second question reach
+    # the desktop's real model.)
+    monkeypatch.setattr(ai_key_vault, '_ask_model', lambda req, prompt, schema, name: (
+        {'issued_by': 'Example site', 'answer': 'YES'} if name == 'credential_ask_check'
+        else {'their_account_used': 'YES'}))
     ctx = {
         'user_id': 'someone-remote', 'prompt_id': '42', 'agent_data': {},
         'helper_fun': MagicMock(), 'user_prompt': 's-1', 'request_id_list': [],
