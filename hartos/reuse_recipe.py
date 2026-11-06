@@ -577,6 +577,14 @@ def save_conversation_db(text, user_id, prompt_id, database_url, request_id):
 
 
 def get_role(user_id, prompt_id):
+    # The person's own pick (update_persona), kept across restarts, comes
+    # first: the caches below forget it after 2 h idle or a restart, and
+    # after a CREATE in this process they hold the agent's WHOLE persona list
+    # under the creator, whose first entry won over the pick (hartos-7a).
+    from core.flow_progress import stored_persona
+    picked = stored_persona(user_id, prompt_id)
+    if picked:
+        return picked
     creator = True if f'{user_id}_{prompt_id}' in agents_session.keys() else False
     role = None
     if creator:
@@ -585,15 +593,47 @@ def get_role(user_id, prompt_id):
                 role = i['role']
                 break
     if not role:
-        if user_id in chat_joinees.keys():
-            chat_creator_user_id = f"{chat_joinees[user_id][prompt_id]}_{prompt_id}"
-            for i in agents_session[f"{chat_creator_user_id}"]:
+        # A person may have joined other agents' chats, not this one, and the
+        # creator's session may have expired: neither raises (hartos-7a).
+        creator = (chat_joinees.get(user_id) or {}).get(prompt_id)
+        if creator is not None:
+            for i in (agents_session.get(f"{creator}_{prompt_id}") or []):
                 if i['user_id'] == user_id:
                     role = i['role']
                     break
     if not role:
         role = 'user'
     return role
+
+
+def _reuse_join_chat(user_id, prompt_id, name, contact_number):
+    """``user_id`` joins, as persona ``name``, the chat of the person
+    ``contact_number`` names: by that person's user id, the key the same
+    person's other devices already join by (owner 2026-11-04), or by a
+    contact number the node mapped to one (temp_users, which nothing fills).
+    The creator must have this agent's chat: a live session, or a pick kept
+    in core.flow_progress.  The joiner's own pick is kept there too, so it
+    outlives the 2 h caches.  'terminate' on a join, else what to ask."""
+    from core.flow_progress import set_persona, stored_persona
+    creator = temp_users.get(contact_number) or str(contact_number or '').strip()
+    key = f'{creator}_{prompt_id}'
+    if not creator or (key not in agents_session and not stored_persona(creator, prompt_id)):
+        return (f'Ask the person with user id or contact {contact_number} '
+                f'to start this chat first')
+    members = list(agents_session.get(key) or [])
+    members.append({'agentInstanceID': f'com.hertzai.hevolve.chat.{prompt_id}.{user_id}',
+                    'user_id': user_id, 'role': name, 'deviceID': 'something'})
+    agents_session[key] = members
+    own = f'{user_id}_{prompt_id}'
+    roles = dict(agents_roles.get(own) or {})          # a first join has no entry yet
+    roles[user_id] = name
+    agents_roles[own] = roles
+    joins = dict(chat_joinees.get(user_id) or {})      # keeps their joins to other agents
+    joins[prompt_id] = creator
+    chat_joinees[user_id] = joins
+    set_persona(user_id, prompt_id, name)
+    current_app.logger.info(f'[REUSE] {user_id} joined {creator}\'s chat of agent {prompt_id} as {name}')
+    return 'terminate'
 
 
 def clear_message_tracking(user_prompt, unique_message_key):
@@ -1227,7 +1267,7 @@ def create_agents_for_role(user_id: str, prompt_id):
         def update_persona(name: Annotated[str, "The persona name user selected"],
                            description: Annotated[str, "The persona description user selected"],
                            new: Annotated[bool, "Wethere it is a new chat or no"],
-                           contact_number: Annotated[str, "user's contact of which we will join conversation"]) -> str:
+                           contact_number: Annotated[str, "the user id (or contact number) of the person whose chat this user joins"]) -> str:
             current_app.logger.info('INSIDE update_persona')
             current_app.logger.info(f'agents_session {agents_session}')
             current_app.logger.info(f'chat_joinees {chat_joinees}')
@@ -1244,28 +1284,12 @@ def create_agents_for_role(user_id: str, prompt_id):
                          'user_id': user_id, 'role': name, 'deviceID': 'something'})
                     agents_roles[f"{user_id}_{prompt_id}"][user_id] = name
                 current_app.logger.info(f'After persona update {agents_session[f"{user_id}_{prompt_id}"]}')
+                from core.flow_progress import set_persona
+                set_persona(user_id, prompt_id, name)
                 return 'terminate'
             else:
                 current_app.logger.info('adding in existing chat')
-                if contact_number in temp_users.keys():
-                    current_app.logger.info('user found with contact number')
-                    if f"{temp_users[contact_number]}_{prompt_id}" in agents_session.keys():
-                        current_app.logger.info('user found with contact number in agents_sessiion')
-                        agents_session[f"{temp_users[contact_number]}_{prompt_id}"].append(
-                            {'agentInstanceID': f'com.hertzai.hevolve.chat.{prompt_id}.{user_id}',
-                             'user_id': user_id, 'role': name, 'deviceID': 'something'})
-                        agents_roles[f"{user_id}_{prompt_id}"][user_id] = name
-                        current_app.logger.info('after append in agent_sessions')
-                        chat_joinees[user_id] = {prompt_id: temp_users[contact_number]}
-
-                        current_app.logger.info(f'agents_session {agents_session}')
-                        current_app.logger.info(f'chat_joinees {chat_joinees}')
-                        return 'terminate'
-                    else:
-                        return f'Ask the user with contact number:{contact_number} to create a new chat'
-                else:
-                    current_app.logger.info('user found not with contact number')
-                    return f'Ask the user with contact number:{contact_number} to create a new chat'
+                return _reuse_join_chat(user_id, prompt_id, name, contact_number)
 
         assistant.description = 'Agent that is designed ask the roles to the user agent'
         user_proxy.description = 'agent will act as user & perform task assigned to user'
@@ -2160,7 +2184,7 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
         try:
             current_app.logger.info('INSIDE execute_windows_or_android_command')
             user_prompt = f'{user_id}_{prompt_id}'
-            role_number, role = get_flow_number(user_id, prompt_id)
+            role_number = _reuse_run_flow(user_id, prompt_id)
 
             import os
             import re
@@ -2383,7 +2407,7 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
                             action_id = user_tasks[user_prompt].current_action
 
                         # Determine file path with the action_id
-                        role_number, role = get_flow_number(user_id, prompt_id)
+                        role_number = _reuse_run_flow(user_id, prompt_id)
 
                         # Import os here to ensure it's available
                         import os
@@ -7040,6 +7064,14 @@ def get_flow_number(user_id, prompt_id):
             # 58 of 711 stored agents have a persona owning 2+ flows; the
             # other 653 select the same index either way.
             break
+    # The person's place in their persona's flows when one is kept
+    # (core.flow_progress: moved when a flow's goal is met, owner 2026-11-03);
+    # else the first match above.  Read only by the two session builders;
+    # code filing into a running flow reads _reuse_run_flow.
+    from core.flow_progress import current_flow
+    stored = current_flow(user_id, prompt_id, available_flows, role)
+    if stored is not None:
+        role_number = stored
     return role_number, role
 
 
@@ -7479,6 +7511,7 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
             except Exception as _spark_err:
                 current_app.logger.debug(
                     f'[REUSE] completed-work spark charge skipped: {_spark_err}')
+        _reuse_note_flow_finished(user_prompt, prompt_id)
         return None, False
 
     _start_reuse_action(user_prompt, next_id, f"{reason}: next")
@@ -7515,6 +7548,90 @@ def _reuse_session_ledger(user_prompt):
         return get_registered_ledger(user_prompt)
     except Exception:
         return None
+
+
+def _reuse_flow_evidence(user_prompt, flow):
+    """What this run of ``flow`` recorded, for the flow-goal judge: each step
+    and its verified result from the run's ledger (a reply step's result is
+    the person's own reply, commit_verified_action_completion).  Never the
+    group chat, whose trims drop a run that spans several turns (hartos-7a)."""
+    ledger = _reuse_session_ledger(user_prompt)
+    steps = []
+    for key, task in list((getattr(ledger, 'tasks', None) or {}).items()):
+        if not str(key).startswith('action_') or not str(key)[7:].isdigit():
+            continue
+        action_id = int(str(key)[7:])
+        if _reuse_action_flow(user_prompt, action_id) != flow:
+            continue
+        result = getattr(task, 'result', None)
+        if result in (None, ''):
+            continue
+        steps.append((action_id, f"step {action_id} ({str(getattr(task, 'description', '') or '')[:100]}): "
+                                 f"{str(result)[:400]}"))
+    return '\n'.join(text for _, text in sorted(steps))
+
+
+def _reuse_note_flow_finished(user_prompt, prompt_id):
+    """Every action of this person's flow completed on evidence: keep that,
+    with what the run recorded, for the judge at their next run's start
+    (core.flow_progress; owner 2026-11-03: "When its goal is met").  Only a
+    person's own turn counts: a daemon tick that finishes the flow is not the
+    person's evidence (hartos-7a).  Never fails the turn."""
+    suffix = f'_{prompt_id}'
+    if prompt_id is None or not str(user_prompt).endswith(suffix) \
+            or not _reuse_person_turn(user_prompt):
+        return
+    try:
+        from core.flow_progress import record_flow_finished
+        flow = _reuse_action_flow(user_prompt, 1)
+        record_flow_finished(str(user_prompt)[:-len(suffix)], prompt_id, flow,
+                             request_id_list.get(user_prompt),
+                             _reuse_flow_evidence(user_prompt, flow))
+        current_app.logger.info(f'[REUSE] flow {flow} finished for {user_prompt}; judged at the next run')
+    except Exception as e:
+        current_app.logger.warning(f'[REUSE] flow-finished record for {user_prompt} not kept: {e}')
+
+
+def _reuse_settle_person_flow(user_id, prompt_id, user_prompt):
+    """At a person's run start: judge the flows they finished since their
+    last run and move them (core.flow_progress.settle: a model call only
+    when a finished run waits), then, when their place differs from the
+    flow this warm session was built for (a goal met, or a therapist's
+    move), drop the session so the cold path builds the right flow.  Only
+    the builders read the place, and a warm session would replay the old
+    flow from action 1 (hartos-7a).  Never fails the turn."""
+    if not _reuse_person_turn(user_prompt):
+        return
+    try:
+        from core.flow_progress import settle
+        with open(helper_fun.safe_prompt_path(prompt_id), 'r') as f:
+            flows = (json.load(f) or {}).get('flows') or []
+        flow = settle(user_id, prompt_id, flows, get_role(user_id, prompt_id))
+        if (flow is None or user_prompt not in user_agents
+                or _reuse_session_ledger(user_prompt) is None):
+            return
+        loaded = _reuse_action_flow(user_prompt, 1)
+        if loaded != flow:
+            for cache in (user_agents, user_tasks, recipes, time_actions, user_ledgers):
+                cache.pop(user_prompt, None)
+            current_app.logger.info(
+                f'[REUSE] {user_prompt} moves from flow {loaded} to flow {flow}; session rebuilt')
+    except Exception as e:
+        current_app.logger.warning(f'[REUSE] flow settle for {user_prompt} skipped: {e}')
+
+
+def _reuse_run_flow(user_id, prompt_id):
+    """The flow this person's current run was built for, for code that files
+    into the run's recipe (a VLM step, a relearned step that can land after
+    the run ended): its ledger tasks carry it (recipe_flow_id).  Not the
+    person's stored place, which can move while the run goes on (a goal met,
+    a therapist's move), and a step must land in the flow that made it
+    (hartos-7a).  With no run ledger, get_flow_number, as before."""
+    user_prompt = f'{user_id}_{prompt_id}'
+    if _reuse_session_ledger(user_prompt) is not None:
+        action_id = getattr(user_tasks.get(user_prompt), 'current_action', 1) or 1
+        return _reuse_action_flow(user_prompt, action_id)
+    return get_flow_number(user_id, prompt_id)[0]
 
 
 def _reuse_action_flow(user_prompt, action_id):
@@ -8647,6 +8764,10 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
         # (a daemon goal's runs share one; see _reuse_reask_counts).  The
         # agent cache is not a run boundary, so this is the only reset.
         _reuse_forget_reasks(user_prompt)
+        # A person's flow moves on when its goal is met (owner 2026-11-03):
+        # judged here, before the warm-run start below, and a warm session
+        # built for another flow is dropped so the builders run the new one.
+        _reuse_settle_person_flow(user_id, prompt_id, user_prompt)
 
         # The clear above leaves the current action at ASSIGNED.  A cache MISS
         # starts it inside create_agents_for_user; a cache HIT (warm agents)
@@ -8668,6 +8789,11 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
         # Get or create agents for this user
         if user_prompt not in user_agents:
             llm_call_track[user_prompt] = {'count': 0, 'original_prompt': False}
+            # A person who already picked their persona is not asked again
+            # after 2 h idle or a restart (core.flow_progress keeps the pick).
+            from core.flow_progress import stored_persona
+            if user_prompt not in user_journey and stored_persona(user_id, prompt_id):
+                user_journey[user_prompt] = 'UseBot'
             if user_prompt not in user_journey:
                 # Load-or-create.  `prompt_id not in agent_data.keys()` asked
                 # only what was CACHED (keys() never runs the loader), so the
