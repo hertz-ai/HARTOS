@@ -612,11 +612,13 @@ def record_user_answer(user_prompt: str, action_id: int, answer: str,
     later flow's action_N is the same task.  False when there is no ledger or
     no such task.
 
-    ``request_id`` is the person's request whose turn posts the answer into
-    the chat (CREATE's gate); the entry keeps it, so a retry of that request
-    posting the same words again closes no question that request put out
-    (window_question; review of 328ad07d0, must-fix 1).  REUSE's reply,
-    recorded by the verifier hook, carries none.
+    ``request_id`` is the person's request that sent the answer (CREATE's
+    gate; for an answer kept unsaved, the request it came in, though a later
+    turn posts it); the entry keeps it, so a retry of that request posting
+    the same words again closes no question that request put out
+    (window_question; review of 328ad07d0, must-fix 1), and a late retry of
+    it is no second answer (reply_closes_open_question; review of 9cd51ded9,
+    finding a).  REUSE's reply, recorded by the verifier hook, carries none.
 
     The answer closes the oldest open ask of this action in this flow
     (ASK_DELIVERED_KEY) in the SAME context update and the same save: the
@@ -2202,6 +2204,9 @@ def window_asked(messages, action_id, answers=()) -> bool:
     carried it (recorded_answer_requests) never closes a question that same
     request put out: a retried request posts its words again after the
     question its first round asked (review of 328ad07d0, must-fix 1).  A
+    message counts toward the newest recorded answer with its words only: a
+    person who said "yes" twice, then a retry of the second request, is not
+    also the first request's answer (review of 9cd51ded9, must-fix 1).  A
     REUSE turn's words
     ride inside its dispatch (reuse_recipe._reuse_seed_message), which
     closes nothing either way."""
@@ -2225,8 +2230,12 @@ def window_question(messages, action_id, answers=()):
         if (msg.get('role') == 'user'
                 and str(msg.get('name') or '') in _PERSON_SEATS
                 and dispatch_action_id(msg.get('content')) is None):
+            # The newest recorded answer with these words only: a retry of
+            # the person's second "yes" is not their first one too, whose
+            # request would close the question the second's request put out
+            # (review of 9cd51ded9, must-fix 1).
             carried = [request for words, request in answers
-                       if _carries_recorded_answer(msg.get('content'), [words])]
+                       if _carries_recorded_answer(msg.get('content'), [words])][-1:]
             if None in carried:
                 return None
             answered_in += carried

@@ -4665,7 +4665,10 @@ def _keep_unsaved_answer(task, action_id, answer, flow, later=(), failed_in=None
     the person's round with it, never a daemon tick's (hartos-00's review of
     ca2e52c91, finding 1).  The newest _UNSAVED_ANSWER_LATER_MAX of each are
     kept.  ``failed_in`` is the request whose save just failed: the turn's
-    "couldn't save" line is for that turn only (item 3)."""
+    "couldn't save" line is for that turn only (item 3).  ``sent_in`` is the
+    request the person sent the answer in (the first failure's): the answer
+    is recorded under it once it saves, so a late retry of that request is
+    no second answer (review of 9cd51ded9, finding a)."""
     kept = getattr(task, '_unsaved_answer', None)
     same = isinstance(kept, dict) and kept.get('action_id') == action_id
     failures = (kept.get('failures', 0) if same else 0) + 1
@@ -4677,7 +4680,9 @@ def _keep_unsaved_answer(task, action_id, answer, flow, later=(), failed_in=None
                             'flow': flow, 'failures': failures,
                             'before': before,
                             'later': _newest_kept(later, action_id),
-                            'failed_in': failed_in}
+                            'failed_in': failed_in,
+                            'sent_in': (kept.get('sent_in') if same else None)
+                            or failed_in}
     (logging.getLogger(__name__).error
      if failures >= _UNSAVED_ANSWER_ERROR_AFTER
      else logging.getLogger(__name__).warning)(
@@ -4976,10 +4981,12 @@ def _resume_prior_user_input_block(user_prompt, text, failure=False):
         # before their new words (_keep_unsaved_answer above); until it
         # saves, the turn says so and runs no model round (get_response_group,
         # _unsaved_answer_reply).  record_user_answer logs the cause.
-        # Kept with this request: its turn posts the words, and a retry
-        # posting them again closes no question this request put out.
+        # Kept with the request that sent it: a retry posting the words again
+        # closes no question that request put out, and a kept answer's late
+        # retry is no second answer.
         if not record_user_answer(user_prompt, action_id, answer, answer_flow,
-                                  request_id=request_id):
+                                  request_id=(_kept.get('sent_in') or request_id)
+                                  if _retrying else request_id):
             logging.getLogger(__name__).warning(
                 '[USER-INPUT-GATE] Keeping action %s flagged: the person\'s '
                 'answer could not be recorded on the ledger', action_id)

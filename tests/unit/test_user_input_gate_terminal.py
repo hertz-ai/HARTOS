@@ -794,7 +794,9 @@ class APersonsReplyToAnUnheldQuestionIsItsAnswer(unittest.TestCase):
     refused save keeps it; never a daemon turn's text, the asking request's
     own retry (told by its request id, never its words: review of
     c906283b6, must-fix 2), or a reply meant for a parked step.  And once
-    answered, a question the step asks again still waits (must-fix 1).
+    answered, a question the step asks again still waits (must-fix 1), also
+    when the person's words repeat an earlier answer (review of 9cd51ded9,
+    must-fix 1).
     Driven through the real create loop resume, the real hooks, a real
     ledger and a registered group chat."""
 
@@ -1067,6 +1069,104 @@ class APersonsReplyToAnUnheldQuestionIsItsAnswer(unittest.TestCase):
         self.assertIsNone(self.L.step_open_question(_UP, 3))
         self.assertFalse(self._still_waits('user-request-4'))
         self.assertEqual(self._answers(), ['umm', 'the b sound'])
+
+    def test_a_repeated_answer_leaves_the_question_after_it_open(self):
+        """Review of 9cd51ded9, must-fix 1: "yes" in request 2 answers the
+        first question, "yes" in request 3 the second, the model asks a
+        third in request 3's round and request 3 is retried.  Its "yes" was
+        counted as request 2's answer too, which closed request 3's own
+        question: the step COMPLETED on "Noted."."""
+        self._window()
+        self.assertTrue(self._turn('user-request-2', 'yes'))
+        self._posted('yes')
+        self.gc.messages.extend(self._send(
+            's4', 'Shall we start with the b sound?', 'user-request-2'))
+        self.assertTrue(self._turn('user-request-3', 'yes'))
+        self._posted('yes')
+        self.gc.messages.extend(self._send(
+            's5', 'Can you say ball with me?', 'user-request-3'))
+        self.assertFalse(self._turn('user-request-3', 'yes'), 'the retry is no answer')
+        self._posted('yes')
+        self.gc.messages.append({'role': 'assistant', 'name': 'Assistant',
+                                 'content': 'Noted. I will wait for the child.'})
+        found = self.L.step_open_question(_UP, 3)
+        self.assertEqual((found or (None, None, None))[1:],
+                         ('Can you say ball with me?', 'user-request-3'))
+        self.assertTrue(self._still_waits())
+        self.assertEqual(self._answers(), ['yes', 'yes'])
+
+    def test_an_answer_from_an_earlier_flow_does_not_close_a_re_ask(self):
+        """The same across flows: flow 0's action 3 was answered "yes"
+        (request 2); flow 1's action 3 asks (request 5), the person says
+        "yes" (request 6), the model asks again in request 6's round and
+        request 6 is retried."""
+        create_recipe.recipe_for_persona[_UP] = 1
+        self._window()
+        self.gc.messages.append({'role': 'user', 'name': 'UserProxy', 'content': 'yes'})
+        self.assertTrue(self.L.record_user_answer(_UP, 3, 'yes', 0,
+                                                  request_id='user-request-2'))
+        self.gc.messages += [
+            {'role': 'assistant', 'name': 'Assistant',
+             'content': 'Great, the b sound. Say ball with me.'},
+            {'role': 'assistant', 'name': 'ChatInstructor',
+             'content': 'Execute Action 1: say Hello Arjun'},
+            {'role': 'assistant', 'name': 'Assistant', 'content': 'Hello Arjun!'},
+            {'role': 'assistant', 'name': 'ChatInstructor',
+             'content': 'Execute Action 3: ask the child which sound to practise'},
+            *self._send('s13', 'Shall we practise the m sound today?', 'user-request-5')]
+        self.assertTrue(self._turn('user-request-6', 'yes'))
+        self._posted('yes')
+        self.gc.messages.extend(self._send(
+            's14', 'Can you say moon with me?', 'user-request-6'))
+        self.assertFalse(self._turn('user-request-6', 'yes'), 'the retry is no answer')
+        self._posted('yes')
+        self.gc.messages.append({'role': 'assistant', 'name': 'Assistant',
+                                 'content': 'Noted. I will wait for the child.'})
+        found = self.L.step_open_question(_UP, 3)
+        self.assertEqual((found or (None, None, None))[1:],
+                         ('Can you say moon with me?', 'user-request-6'))
+        self.assertTrue(self._still_waits('user-request-6'))
+
+    def test_a_kept_answer_is_recorded_under_the_request_it_came_in(self):
+        """Review of 9cd51ded9, finding a: request 2's answer could not be
+        saved and was kept; request 3 recorded it under request 3, so a late
+        retry of request 2 after request 3's new question was taken as a
+        second answer.  Recorded under request 2, the retry is no answer;
+        also when request 3's retry of it failed as well."""
+        for refused in (1, 2):
+            with self.subTest(refused_saves=refused):
+                self.tearDown()
+                self.setUp()
+                self._window()
+                self.assertFalse(self._turn('user-request-2', 'the b sound', saves=False))
+                if refused == 2:
+                    self.assertFalse(self._turn('user-request-3', 'and m too', saves=False))
+                saved_in = f'user-request-{refused + 2}'
+                self.assertTrue(self._turn(saved_in, 'ok'))
+                self._posted('ok')
+                self.gc.messages.extend(self._send(
+                    's4', 'Shall we do b first, then m?', saved_in))
+                self.assertFalse(self._turn('user-request-2', 'the b sound'),
+                                 'a late retry of the request it came in')
+                entries = self.ledger.tasks['action_3'].context[
+                    self.L.USER_INPUT_EVIDENCE_KEY]
+                self.assertEqual([(e.get('answer'), e.get('request_id')) for e in entries],
+                                 [('the b sound', 'user-request-2')])
+                self.assertIsNone(self._flag())
+                found = self.L.step_open_question(_UP, 3)
+                self.assertEqual((found or (None, None, None))[1:],
+                                 ('Shall we do b first, then m?', saved_in))
+
+    def test_a_reply_taken_for_an_unheld_question_is_no_warning(self):
+        """Every reply to a question the gate never held is released here,
+        so the release is logged at INFO (review of 328ad07d0; no test
+        pinned it: review of 9cd51ded9)."""
+        self._window()
+        with self.assertLogs('hartos.create_recipe', level='INFO') as logs:
+            self.assertTrue(self._turn('user-request-2', 'the b sound'))
+        released = [r.levelname for r in logs.records
+                    if 'Releasing action 3' in r.getMessage()]
+        self.assertEqual(released, ['INFO'])
 
     def test_an_answer_closes_only_questions_another_request_put_out(self):
         """window_question with answers known by request; a plain string
