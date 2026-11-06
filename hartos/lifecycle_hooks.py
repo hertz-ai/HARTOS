@@ -596,7 +596,7 @@ def _flow_index(flow):
 
 
 def record_user_answer(user_prompt: str, action_id: int, answer: str,
-                       flow) -> bool:
+                       flow, request_id=None) -> bool:
     """Record that the person answered this action in this flow, on the
     registered ledger task, through the ledger's own context setter so the
     integrity seal holds (#159).
@@ -611,6 +611,12 @@ def record_user_answer(user_prompt: str, action_id: int, answer: str,
     branch; add_actions_to_ledger skips a task id it already holds), so a
     later flow's action_N is the same task.  False when there is no ledger or
     no such task.
+
+    ``request_id`` is the person's request whose turn posts the answer into
+    the chat (CREATE's gate); the entry keeps it, so a retry of that request
+    posting the same words again closes no question that request put out
+    (window_question; review of 328ad07d0, must-fix 1).  REUSE's reply,
+    recorded by the verifier hook, carries none.
 
     The answer closes the oldest open ask of this action in this flow
     (ASK_DELIVERED_KEY) in the SAME context update and the same save: the
@@ -633,6 +639,8 @@ def record_user_answer(user_prompt: str, action_id: int, answer: str,
         'answer': str(answer),
         'timestamp': datetime.now(timezone.utc).isoformat(),
     })
+    if request_id:
+        items[-1]['request_id'] = str(request_id)
     context[USER_INPUT_EVIDENCE_KEY] = items
     asks = [dict(e) if isinstance(e, dict) else e
             for e in (context.get(ASK_DELIVERED_KEY) or [])]
@@ -674,9 +682,12 @@ def ledger_user_answered(user_prompt: str, action_id: int, flow) -> bool:
                for entry in (context.get(USER_INPUT_EVIDENCE_KEY) or []))
 
 
-def recorded_answers(user_prompt: str, action_id: int, flow=None) -> list:
+def recorded_answer_requests(user_prompt: str, action_id: int,
+                             flow=None) -> list:
     """The person's answers recorded for this action (record_user_answer),
-    oldest first: in ``flow``, or in any flow when it is None.
+    oldest first, each as (answer, the request whose turn carried it, None
+    when none was recorded): in ``flow``, or in any flow when it is None.
+    Blank answers are left out.
 
     What window_asked reads to know a message in a step's window came from
     the person.  The seat it was posted from does not say so: CREATE posts
@@ -691,11 +702,20 @@ def recorded_answers(user_prompt: str, action_id: int, flow=None) -> list:
     if not isinstance(context, dict):
         return []
     wanted = None if flow is None else _flow_index(flow)
-    return [str(entry.get('answer'))
+    return [(str(entry.get('answer')),
+             str(entry['request_id']) if entry.get('request_id') else None)
             for entry in (context.get(USER_INPUT_EVIDENCE_KEY) or [])
             if isinstance(entry, dict)
             and (wanted is None or entry.get('flow') == wanted)
             and str(entry.get('answer') or '').strip()]
+
+
+def recorded_answers(user_prompt: str, action_id: int, flow=None) -> list:
+    """The words of recorded_answer_requests alone, for the readers that
+    close a question on them (REUSE's scans, whose own words ride inside a
+    dispatch and close nothing)."""
+    return [answer for answer, _request in
+            recorded_answer_requests(user_prompt, action_id, flow)]
 
 
 def _carries_recorded_answer(content, answers) -> bool:
@@ -716,14 +736,37 @@ def _carries_recorded_answer(content, answers) -> bool:
     return False
 
 
+def _answer_and_request(answer) -> tuple:
+    """One recorded answer as window_question reads it: (its words, the
+    request whose turn carried it).  A plain string is an answer whose
+    request is not known (recorded_answers, REUSE's scans): it closes every
+    question before it, as every answer did before requests were kept."""
+    if isinstance(answer, (tuple, list)) and len(answer) == 2:
+        words, request = answer
+        return str(words or ''), (str(request) if request else None)
+    return str(answer or ''), None
+
+
+def _receipt_request(body) -> Optional[str]:
+    """The request a send went out in, read off the send tool's own success
+    reply ("Message sent successfully to user with request_id: <id>",
+    SEND_DELIVERED_PREFIX).  CREATE's copy (create_recipe.
+    send_message_to_user1) writes the turn's request with '-intermediate'
+    after it; REUSE's writes it bare.  None when ``body`` is not a delivered
+    send; '' when it names no request."""
+    if not send_delivered(body):
+        return None
+    _, found, request_id = str(body).partition('with request_id:')
+    request_id = request_id.strip() if found else ''
+    if request_id.endswith('-intermediate'):
+        request_id = request_id[:-len('-intermediate')]
+    return request_id
+
+
 def _receipt_request_id(message) -> str:
-    """The request a delivered send in tool message ``message`` went out in,
-    read off the send tool's own success reply ("Message sent successfully
-    to user with request_id: <id>", SEND_DELIVERED_PREFIX).  CREATE's copy
-    (create_recipe.send_message_to_user1) writes the turn's request with
-    '-intermediate' after it; REUSE's writes it bare.  Every result in one
-    tool message comes from one round of one turn, so any delivered one
-    names it.  '' when none does."""
+    """The request a delivered send in tool message ``message`` went out in
+    (_receipt_request).  Every result in one tool message comes from one
+    round of one turn, so any delivered one names it.  '' when none does."""
     if not isinstance(message, dict):
         return ''
     responses = message.get('tool_responses')
@@ -731,13 +774,8 @@ def _receipt_request_id(message) -> str:
               if isinstance(responses, list) else [])
     bodies.append(message.get('content'))
     for body in bodies:
-        if not send_delivered(body):
-            continue
-        _, found, request_id = str(body).partition('with request_id:')
-        request_id = request_id.strip()
-        if found and request_id:
-            if request_id.endswith('-intermediate'):
-                request_id = request_id[:-len('-intermediate')]
+        request_id = _receipt_request(body)
+        if request_id:
             return request_id
     return ''
 
@@ -746,8 +784,9 @@ def step_open_question(user_prompt: str, action_id: int):
     """The question ``action_id``'s window holds open in the session's
     registered group chat, as (message index, the text sent, the request it
     went out in), or None: window_question with the answers recorded for the
-    action in any flow (CREATE's ledger keeps one task per action id across
-    flows).
+    action in any flow, each with the request that carried it
+    (recorded_answer_requests; CREATE's ledger keeps one task per action id
+    across flows).
 
     CREATE's one reader of "the step's question is still open":
     derive_completion_evidence (no line in the window is the step's output
@@ -759,7 +798,7 @@ def step_open_question(user_prompt: str, action_id: int):
         return None
     messages = list(getattr(group_chat, 'messages', None) or [])
     found = window_question(messages, action_id,
-                            recorded_answers(user_prompt, action_id))
+                            recorded_answer_requests(user_prompt, action_id))
     if found is None:
         return None
     index, text = found
@@ -779,6 +818,12 @@ def reply_closes_open_question(user_prompt: str, action_id: int, text,
     later request answers it, whatever its words: a "yes" after an earlier
     "yes" is an answer (review of c906283b6, must-fix 2: the words were
     compared, and a person who said the same thing twice was not heard).
+    Also False when this request already gave the step its answer (a turn
+    refused before its words were posted, then retried, recorded it twice),
+    and when the chat's newest order is another action's: a question left
+    from an earlier order of the same action id (flow 0's action 3 seen
+    from flow 1 before its action 3 runs) is no question of the current
+    step (review of 328ad07d0).
 
     The create loop takes such a reply into its gate when nothing holds the
     step for the person (review of 65db06972, must-fix 3), so the one writer
@@ -786,8 +831,17 @@ def reply_closes_open_question(user_prompt: str, action_id: int, text,
     review of ec41bdbf6, P5)."""
     if not str(text or '').strip():
         return False
+    request_id = str(request_id or '')
+    if request_id and any(
+            carried_in == request_id for _answer, carried_in
+            in recorded_answer_requests(user_prompt, action_id)):
+        return False
+    group_chat = get_registered_groupchat(user_prompt)
+    messages = list(getattr(group_chat, 'messages', None) or [])
+    if latest_dispatch_before(messages, len(messages)) != action_id:
+        return False
     question = step_open_question(user_prompt, action_id)
-    return question is not None and question[2] != str(request_id or '')
+    return question is not None and question[2] != request_id
 
 
 def person_waits_on(user_prompt: str, action_id: int, flow) -> bool:
@@ -2144,7 +2198,11 @@ def window_asked(messages, action_id, answers=()) -> bool:
     With no recorded answer nothing closes: a step whose question was never
     held keeps it open until the create loop records the person's reply
     (reply_closes_open_question), and with no reply ends GAVE_UP rather than
-    completing on a non-answer.  A REUSE turn's words
+    completing on a non-answer.  An answer known with the request that
+    carried it (recorded_answer_requests) never closes a question that same
+    request put out: a retried request posts its words again after the
+    question its first round asked (review of 328ad07d0, must-fix 1).  A
+    REUSE turn's words
     ride inside its dispatch (reuse_recipe._reuse_seed_message), which
     closes nothing either way."""
     return window_question(messages, action_id, answers) is not None
@@ -2155,15 +2213,24 @@ def window_question(messages, action_id, answers=()):
     sent), or None.  The one scan: window_asked reads it, and
     step_open_question reads the request it went out in."""
     names = tool_call_names([messages or []])
+    answers = [_answer_and_request(answer) for answer in (answers or ())]
+    # The requests whose answers were posted after the point the scan has
+    # reached (it runs newest first): each closes the questions before it
+    # that another request put out.
+    answered_in = []
     for index in range(len(messages or []) - 1, -1, -1):
         msg = messages[index]
         if not isinstance(msg, dict):
             continue
         if (msg.get('role') == 'user'
                 and str(msg.get('name') or '') in _PERSON_SEATS
-                and dispatch_action_id(msg.get('content')) is None
-                and _carries_recorded_answer(msg.get('content'), answers)):
-            return None
+                and dispatch_action_id(msg.get('content')) is None):
+            carried = [request for words, request in answers
+                       if _carries_recorded_answer(msg.get('content'), [words])]
+            if None in carried:
+                return None
+            answered_in += carried
+            continue
         if msg.get('role') != 'tool':
             continue
         if latest_dispatch_before(messages, index + 1) != action_id:
@@ -2179,6 +2246,9 @@ def window_question(messages, action_id, answers=()):
                 body = msg.get('content')
             if (names.get(call_id) == SEND_TOOL and send_delivered(body)
                     and send_is_ask(messages, call_id)):
+                if any(request != _receipt_request(body)
+                       for request in answered_in):
+                    return None
                 return index, str(sent_text(messages, call_id) or '')
     return None
 

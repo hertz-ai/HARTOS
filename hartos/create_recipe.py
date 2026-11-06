@@ -4810,6 +4810,7 @@ def _resume_prior_user_input_block(user_prompt, text, failure=False):
             list(getattr(task, '_answer_owed_to_turn', None) or []) + _words) or None
         task._unsaved_answer = None
     action_id = getattr(task, '_needs_user_input_action_id', None)
+    _adopted = False
     if not isinstance(action_id, int):
         # The flag lives on the in-memory task and a restart between the ask
         # and the reply loses it, so the first reply after a restart was
@@ -4855,6 +4856,7 @@ def _resume_prior_user_input_block(user_prompt, text, failure=False):
                 'question its window holds, which nothing held for them; '
                 'taking the reply for it', current)
             _taken_kind = USER_INPUT_GATE_AWAITING_REPLY
+            _adopted = True
         else:
             return False
         action_id = current
@@ -4871,6 +4873,12 @@ def _resume_prior_user_input_block(user_prompt, text, failure=False):
             logging.getLogger(__name__).info(
                 '[USER-INPUT-GATE] Keeping action %s blocked: request %r is '
                 'the one that asked', action_id, request_id)
+            if _adopted:
+                # Taken into the gate above, with nothing holding the step:
+                # the flag goes again rather than outlive this turn (review
+                # of 328ad07d0).
+                task._needs_user_input_action_id = None
+                task._needs_user_input_kind = None
             return False
     else:
         try:
@@ -4935,7 +4943,10 @@ def _resume_prior_user_input_block(user_prompt, text, failure=False):
     # resume can ever succeed and every answer got the same question back.
     # Nothing durable is waiting there; this attributed answer releases it.
     if not resumed and ledger_holds_no_block(user_prompt, action_id):
-        logging.getLogger(__name__).warning(
+        # Every reply to an unheld question lands here (taken above), so
+        # that is no warning.
+        _log = logging.getLogger(__name__)
+        (_log.info if _adopted else _log.warning)(
             '[USER-INPUT-GATE] Releasing action %s: the ledger never held its '
             'block, so %s answers it', action_id,
             'a genuine user reply' if is_user else 'its assigned expert turn')
@@ -4965,7 +4976,10 @@ def _resume_prior_user_input_block(user_prompt, text, failure=False):
         # before their new words (_keep_unsaved_answer above); until it
         # saves, the turn says so and runs no model round (get_response_group,
         # _unsaved_answer_reply).  record_user_answer logs the cause.
-        if not record_user_answer(user_prompt, action_id, answer, answer_flow):
+        # Kept with this request: its turn posts the words, and a retry
+        # posting them again closes no question this request put out.
+        if not record_user_answer(user_prompt, action_id, answer, answer_flow,
+                                  request_id=request_id):
             logging.getLogger(__name__).warning(
                 '[USER-INPUT-GATE] Keeping action %s flagged: the person\'s '
                 'answer could not be recorded on the ledger', action_id)
