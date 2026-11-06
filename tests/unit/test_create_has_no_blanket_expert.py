@@ -18,6 +18,7 @@ what the model would be sent.
 
     python -m pytest tests/unit/test_create_has_no_blanket_expert.py -q
 """
+import json
 from unittest.mock import patch
 
 import pytest
@@ -26,6 +27,9 @@ pytest.importorskip('autogen', reason='autogen not installed')
 
 from hartos import create_recipe as cr  # noqa: E402
 from hartos.helper import Action  # noqa: E402
+# The scripted whole-loop harness (no LLM); its fixture is used by name.
+from tests.unit.test_create_loop_end_to_end import (  # noqa: E402,F401
+    PROMPT_ID, _MARKER, _content, _run, create_env)
 
 #: Reel Studio's approved plan, first two steps (prompts/342.json).
 REEL_PLAN = [
@@ -65,3 +69,21 @@ def test_a_step_line_is_the_step_and_her_words_only():
     assert line == ('Execute Action 2: ' + REEL_PLAN[1]
                     + ' ,Latest User message: Make a 20 second Instagram reel from my clips')
     assert '[Expert Tip' not in line
+
+
+def test_every_step_the_loop_posts_is_the_step_and_her_words_only(create_env):
+    """The create loop's own step lines, not just the builder: the real loop
+    runs her plan (whose words match the STEM expert) with scripted agents,
+    and no step it posts carries an expert tip.  Review of 5b7539dc8:
+    mutant M1b (the main loop's line regains the tip) survived the builder
+    test above."""
+    env = create_env
+    cfg_path = env.prompts / f'{PROMPT_ID}.json'
+    cfg = json.loads(cfg_path.read_text(encoding='utf-8'))
+    cfg['flows'][0]['actions'] = list(REEL_PLAN)
+    cfg_path.write_text(json.dumps(cfg), encoding='utf-8')
+    replies = _run(env, turns=1)
+    steps = [_content(m) for m in env.script.gc.messages if _MARKER.search(_content(m))]
+    assert steps, f'no step was posted; replies {replies!r}'
+    assert not [t for t in steps if '[Expert Tip' in t], steps
+    assert steps[0].startswith(cr.step_instruction(1, REEL_PLAN[0], '')[:-1]), steps[0]

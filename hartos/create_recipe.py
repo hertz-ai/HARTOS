@@ -1161,8 +1161,14 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
     # 2026-11-04 on Reel Studio (agent 342): that branch ran on the person's
     # request id, so this read INTERACTIVE and the approved plan stalled on
     # step 2 asking her questions (owner 2026-11-04: "approved plan shd run
-    # autonomously").  Only the assistant's prompt follows this flag; where
-    # an ask goes is still is_current_request_autonomous's call.
+    # autonomously").
+    #
+    # A freed run gets the assistant's AUTONOMOUS prompt, the verifier
+    # without the HARD RULE and the gate that hands a pending step back to
+    # the agent.  A daemon run is freed too (owner 2026-11-05, "Retry first,
+    # then ask"): its step that needs a person is retried, then handed to the
+    # owner through _ask_for_help with the attempts as its reason.  Where an
+    # ask goes is still is_current_request_autonomous's call.
     _autonomous_run = bool(autonomous)
     if not _autonomous_run:
         try:
@@ -4393,10 +4399,11 @@ def _should_block_on_user_input(user_prompt, action_id, gate_value, *,
                                 status='pending', autonomous=False) -> bool:
     """Should the StatusVerifier's `can_perform_without_user_input` block this action?
 
-    A run its creator freed (``autonomous``: an approved plan finished by
-    chat()'s resume branch, or a daemon goal) is not stopped by a `pending` +
-    `no`: the step goes back to the agent, which asks the person itself if it
-    really must, and the loop's own bounds end in _ask_for_help as before.
+    A run its creator freed (``autonomous``: a plan the person approved, run
+    by chat(), or a daemon goal, owner 2026-11-05 "Retry first, then ask") is
+    not stopped by a `pending` + `no`: the step goes back to the agent, which
+    asks the person itself if it really must, and the attempts bound ends in
+    _ask_for_help.
     Owner 2026-11-04: "the verifier used to flip to "yes" on its own so that
     it can progress autonomously when the creator has given it freedom".
     Measured that day, Reel Studio (agent 342): this gate stopped step 2,
@@ -5190,7 +5197,8 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None,autonomou
             current_app.logger.warning(
                 f"current_action_id {user_tasks[user_prompt].current_action} for actions of length {total_actions_for_current_flow} and ")
 
-            should_continue, early_response = safe_action_boundary_check(user_prompt, prompt_id, text, user_id)
+            should_continue, early_response = safe_action_boundary_check(
+                user_prompt, prompt_id, text, user_id, autonomous=autonomous)
             if not should_continue:
                 return early_response
 
@@ -5853,7 +5861,10 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None,autonomou
                                 del user_ledgers[user_prompt]
                             user_tasks[user_prompt] = create_action_with_ledger(flow_actions, user_id, prompt_id, user_prompt)
                             del user_agents[user_prompt]
-                            x = get_response_group(user_id,text,prompt_id)
+                            # The next flow's agents are built as this run's
+                            # were: an approved plan stays freed past flow 1.
+                            x = get_response_group(user_id, text, prompt_id,
+                                                   autonomous=autonomous)
                             continue
                         scheduler_check[user_prompt] = True
                         safe_increment_flow(user_prompt, prompt_id)
@@ -6100,7 +6111,8 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None,autonomou
                                     del user_ledgers[user_prompt]
                                 user_tasks[user_prompt] = create_action_with_ledger(flow_actions, user_id, prompt_id, user_prompt)
                                 del user_agents[user_prompt]
-                                x = get_response_group(user_id, text, prompt_id)
+                                x = get_response_group(user_id, text, prompt_id,
+                                                       autonomous=autonomous)
                                 continue
 
                             # All flows done
@@ -7222,10 +7234,12 @@ def _agent_build_is_complete(prompt_id) -> bool:
         return False
 
 
-def safe_action_boundary_check(user_prompt, prompt_id, text, user_id):
+def safe_action_boundary_check(user_prompt, prompt_id, text, user_id, autonomous=False):
     """
     Enhanced boundary check with proper flow transition logic
     Returns: (should_continue, response_or_none)
+    ``autonomous``: the run's own flag (recipe()), handed to the next flow's
+    agent build.
     """
     current_action_id = user_tasks[user_prompt].current_action
     config = get_prompt_config_json(prompt_id)
@@ -7291,7 +7305,8 @@ def safe_action_boundary_check(user_prompt, prompt_id, text, user_id):
             # Delete old agents and create new ones
             if user_prompt in user_agents:
                 del user_agents[user_prompt]
-            return False, get_response_group(user_id, text, prompt_id)
+            return False, get_response_group(user_id, text, prompt_id,
+                                             autonomous=autonomous)
 
         else:
             # All flows completed
@@ -7420,8 +7435,9 @@ from core.llm_outbound_logger import with_llm_context as _with_llm_context
 @_with_llm_context('autogen.create')
 def recipe(user_id, text, prompt_id, file_id, request_id, autonomous=False):
     """Run one CREATE turn for this agent's approved plan.  ``autonomous``:
-    the caller is finishing an agent already approved, so the plan runs with
-    the assistant's AUTONOMOUS prompt (create_agents)."""
+    the caller is finishing an agent the person already approved, so every
+    flow's agents are built freed (create_agents): the assistant's AUTONOMOUS
+    prompt, the verifier without the HARD RULE, and the freed gate."""
     user_prompt = f'{user_id}_{prompt_id}'
     request_id_list[user_prompt] = request_id
     # A turn begins with no pause pending (helper_fun.clear_pause_request).

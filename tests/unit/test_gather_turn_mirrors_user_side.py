@@ -123,7 +123,7 @@ def _drive(tmp_path, gather_reply, *, turn_before=0, first_turn_cloud=None,
     if reviews_shown is None:
         reviews_shown = {f'{USER_ID}_{PROMPT_ID}': None}
 
-    def gather_info(user_id, user_message, prompt_id, autonomous=False):
+    def gather_info(user_id, user_message, prompt_id, autonomous=False, goal_tags=()):
         gather_calls.append(user_message)
         return replies[min(len(gather_calls), len(replies)) - 1]
 

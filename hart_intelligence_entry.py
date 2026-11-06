@@ -11357,7 +11357,13 @@ def chat():
             except ImportError:
                 mark_create_end = None
             try:
-                response = recipe(user_id,prompt,prompt_id,file_id,request_id)
+                # The plan saved here is one the person approved (or the
+                # gather's own after repeated failures): it runs freed, as
+                # the after-restart branch below runs it.  Owner 2026-11-05:
+                # Phase 2 is freed too; the Pad sends create_agent on every
+                # turn, so its approved Reel Studio plan runs here.
+                response = recipe(user_id, prompt, prompt_id, file_id, request_id,
+                                  autonomous=True)
             finally:
                 try:
                     from integrations.agent_engine.dispatch import mark_create_end as _mce
