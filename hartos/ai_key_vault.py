@@ -804,28 +804,16 @@ _ASK_CHECK_TIMEOUT_S = 20
 #: account" into it (6a1f2e46d, REJECTED on review 2026-11-03) made the
 #: desktop's Qwen3.5-4B refuse 10 of 41 real asks a reviewer wrote (Datadog,
 #: B2, S3, a Hugging Face download ...) with no card; this check refused 1.
-#: A real ask with no company in it is refused too unless the question names
-#: who else gives a secret.  Measured 2026-11-06 on the desktop's Qwen3.5-4B:
-#: asked only for a company, it answered NONE, and the person never saw the ask,
-#: for a home router or NAS password, an Outlook or SMTP app password and a
-#: ZeroTier token (5 of 75 real asks on the sets it was tuned on; 10 of 26 on a
-#: set another session wrote that it never saw, mostly the person's own devices
-#: and logins with no service named).  Naming a site login and the person's own
-#: devices as issuers: 1 of 75, and 6 of 26 on that set; made-up asks reaching a
-#: card with no doubt note stayed 5 of 22 there.
 _ASK_CHECK_PROMPT = (
     "A software agent on a person's computer wants to ask the person to type in a "
     "secret: an API key, token, password or similar.\n"
-    "Step 1, issued_by: who gives the person this secret. Usually it is the outside "
-    "company, website or app where the person has an account (for example Telegram, "
-    "Stripe, AWS, Zoom, a shop, a ticket or food-delivery site, their email provider; "
-    "a login or an app password for an account is issued by that site or provider). "
-    "It can also be a device of the person's own other than this computer (their "
-    "router, NAS, camera, printer or another computer). Write NONE only if the secret "
-    "belongs to this computer itself or to the agent software (its own settings, "
-    "network, configuration, storage, scheduler, model server, node identity, "
-    "certificates or internal keys), which the system already has.\n"
-    "Step 2, answer: YES if issued_by names a company, website, app or device; NO if "
+    "Step 1, issued_by: the outside company, website or app where the person has an "
+    "account and gets this secret (for example Telegram, Stripe, AWS, Zoom, their "
+    "email provider or online shop). Write NONE only if the secret belongs to the "
+    "computer itself or to the agent software (its own settings, network, "
+    "configuration, storage, scheduler, model server, node identity, certificates "
+    "or internal keys), which the system already has.\n"
+    "Step 2, answer: YES if issued_by names a company, website or app; NO if "
     "issued_by is NONE.\nThe request:\n{request}\n")
 #: The reply's exact shape, enforced by the server (llama.cpp makes it a
 #: grammar; OpenAI-style APIs take it as structured output), so the answer is
