@@ -106,7 +106,7 @@ def _verifier_hard_rules(env, monkeypatch):
     return built
 
 
-def _finish_approved_plan(env, request_id, turns=3):
+def _finish_approved_plan(env, request_id, turns=3, text='Build the agent now'):
     """The turns of a caller finishing an approved plan:
     recipe(..., autonomous=True), as chat() calls it."""
     from hartos.threadlocal import thread_local_data
@@ -115,11 +115,27 @@ def _finish_approved_plan(env, request_id, turns=3):
     replies = []
     with env.app.app_context():
         for _ in range(turns):
-            replies.append(env.cr.recipe(USER_ID, 'Build the agent now', PROMPT_ID,
+            replies.append(env.cr.recipe(USER_ID, text, PROMPT_ID,
                                          None, request_id, autonomous=True))
             if env.cr.scheduler_check.get(UP):
                 break
     return replies
+
+
+def _owner_asks(monkeypatch):
+    """Every hand-off of a daemon step to the owner (GoalManager.escalate_goal),
+    with no database behind it."""
+    asks = []
+    import integrations.agent_engine.goal_manager as gm
+    monkeypatch.setattr(gm.GoalManager, 'escalate_goal', staticmethod(
+        lambda db, goal_id, escalation: asks.append(escalation) or {'success': True}))
+    import integrations.social.models as models
+
+    @contextmanager
+    def _no_db(commit=False):
+        yield None
+    monkeypatch.setattr(models, 'db_session', _no_db)
+    return asks
 
 
 def _two_flow_plan(env):
@@ -197,16 +213,7 @@ def test_a_daemon_step_that_needs_a_person_is_retried_then_handed_to_the_owner(
     attempts as the reason (ruling 2026-10-31: the ask reaches the owner)."""
     env = create_env
     env.script.pending_ids = {2}          # the verifier: action 2 needs a person
-    asks = []
-    import integrations.agent_engine.goal_manager as gm
-    monkeypatch.setattr(gm.GoalManager, 'escalate_goal', staticmethod(
-        lambda db, goal_id, escalation: asks.append(escalation) or {'success': True}))
-    import integrations.social.models as models
-
-    @contextmanager
-    def _no_db(commit=False):
-        yield None
-    monkeypatch.setattr(models, 'db_session', _no_db)
+    asks = _owner_asks(monkeypatch)
     hard_rule = _verifier_hard_rules(env, monkeypatch)
 
     replies = _finish_approved_plan(env, 'daemon_e2e_create', turns=1)
@@ -218,3 +225,124 @@ def test_a_daemon_step_that_needs_a_person_is_retried_then_handed_to_the_owner(
     assert 'attempts' in asks[0].get('reason', ''), asks
     assert 'Paused for help' in str(replies), replies
     assert hard_rule and not any(hard_rule), hard_rule
+
+
+# ── a step that needs her, on a freed run (review of 4bcad9583) ──────────────
+
+HER_ANSWER = 'Yes, those three sources are the right ones.'
+
+
+def _flow_1_step_2_needs_a_person(env):
+    """Flow 1's step 2 is held for a person (`pending` + `no`) at every
+    verdict; every other step is verified as the harness does."""
+    real = env.script.verifier
+
+    def verifier(recipient, messages=None, sender=None, config=None):
+        if (env.cr.get_current_flow(UP) == 1 and env.script.current() == 2
+                and 'please verify' in _content(env.script._last())):
+            return True, json.dumps({
+                'status': 'pending', 'action': ACTIONS[1], 'action_id': 2,
+                'message': 'a person has to confirm the sources',
+                'can_perform_without_user_input': 'no'})
+        return real(recipient, messages, sender, config)
+    env.script.verifier = verifier
+
+
+def test_a_flow_1_step_that_needs_her_is_put_to_her(create_env):
+    """Review of 4bcad9583, finding 1: on her request id, flow 1's step 2
+    needs her.  The next flow's run asks her (attempts bound, _ask_for_help)
+    and holds the step for her answer; the turn hands her that question.
+    Measured on 4bcad9583: "I couldn't finish that: Action 2 must be
+    terminal before incrementing" (the next-flow site dropped the reply and
+    went on with flow 0's agents)."""
+    env = create_env
+    _two_flow_plan(env)
+    _flow_1_step_2_needs_a_person(env)
+
+    replies = _finish_approved_plan(env, 'her-request-4', turns=1)
+
+    assert 'need your input' in replies[0] and 'Step 2' in replies[0], replies
+    with env.app.app_context():
+        assert env.cr.person_waits_on(UP, 2, 1), (
+            'flow 1 step 2 is not held for her answer')
+
+
+def test_a_flow_1_step_on_a_daemon_run_is_handed_to_the_owner(
+        create_env, monkeypatch):
+    """The same plan on a daemon turn: flow 1's step 2 is handed to the owner
+    once, and the turn says the goal is paused for help (the hive worker
+    holds its task on that prefix, core.agent_tools.is_help_pause).
+    Measured on 4bcad9583 (and before it): the escalation was recorded, the
+    turn answered "Action 2 must be terminal before incrementing"."""
+    env = create_env
+    _two_flow_plan(env)
+    _flow_1_step_2_needs_a_person(env)
+    asks = _owner_asks(monkeypatch)
+
+    replies = _finish_approved_plan(env, 'daemon_e2e_create', turns=1)
+
+    assert [(e.get('action_id'), e.get('flow')) for e in asks] == [(2, 1)], asks
+    assert 'Paused for help' in str(replies), replies
+
+
+def _her_answer_closes_step_2(env):
+    """Step 2 asks her to confirm the sources.  Until her answer is in the
+    conversation the verifier holds it (`pending` + `no`); once it is there
+    the verifier says `completed` + `no` (the step itself asks her)."""
+    real_verifier = env.script.verifier
+    real_assistant = env.script.assistant
+
+    def her_answer_seen():
+        return any(HER_ANSWER in _content(m) for m in env.script._msgs())
+
+    def verifier(recipient, messages=None, sender=None, config=None):
+        if (env.script.current() == 2
+                and 'please verify' in _content(env.script._last())):
+            if not her_answer_seen():
+                return True, json.dumps({
+                    'status': 'pending', 'action': ACTIONS[1], 'action_id': 2,
+                    'message': 'she has to confirm the sources',
+                    'can_perform_without_user_input': 'no'})
+            receipt = max(i for i, m in enumerate(env.script._msgs())
+                          if isinstance(m, dict) and m.get('role') == 'tool')
+            return True, json.dumps({
+                'status': 'completed', 'action': ACTIONS[1], 'action_id': 2,
+                'message': 'she confirmed the sources',
+                'evidence': {'message_index': receipt, 'kind': 'tool_receipt'},
+                'can_perform_without_user_input': 'no',
+                'persona_name': 'Researcher', 'fallback_action': 'retry once'})
+        return real_verifier(recipient, messages, sender, config)
+
+    def assistant(recipient, messages=None, sender=None, config=None):
+        c = _content(env.script._last())
+        if HER_ANSWER in c and not _MARKER.search(c):
+            n = env.script.current()
+            return True, f'Working on step {n}. @Helper please save step {n}.'
+        return real_assistant(recipient, messages, sender, config)
+
+    env.script.verifier = verifier
+    env.script.assistant = assistant
+
+
+def test_her_answer_to_the_step_she_was_asked_about_is_taken_once(create_env):
+    """Review of 4bcad9583, finding 2: on a freed run the attempts bound
+    asks her about step 2.  Her next message is that step's answer: it is
+    recorded, the step closes, and she is not asked again.  Measured on
+    4bcad9583: nothing held the step, so her answer was not recorded and
+    the step's `completed` + `no` answered "Step 2 ... is waiting for your
+    reply before I continue." after she had replied."""
+    env = create_env
+    _her_answer_closes_step_2(env)
+
+    first = _finish_approved_plan(env, 'her-request-5', turns=1)
+    assert 'need your input' in first[0] and 'Step 2' in first[0], first
+
+    second = _finish_approved_plan(env, 'her-request-6', turns=1, text=HER_ANSWER)
+
+    with env.app.app_context():
+        assert env.cr.ledger_user_answered(UP, 2, 0), 'her answer was not recorded'
+    assert (env.prompts / f'{PROMPT_ID}_0_2.json').exists(), (
+        f'step 2 did not close on her answer: {second!r}')
+    assert not any(ask in second[0] for ask in ('need your input',
+                                                'waiting for your reply')), (
+        f'she was asked again after answering: {second!r}')

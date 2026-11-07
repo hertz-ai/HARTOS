@@ -918,9 +918,9 @@ class TestTheChatFirstDispatchAnswersThePause:
 
     def test_the_plan_it_wrote_runs_with_the_autonomous_flag(self, tmp_path):
         """The block's recipe() runs the plan the autonomous gather just
-        wrote with autonomous=True (ed427a072): its assistant gets the
-        AUTONOMOUS prompt.  Whether the verifier is freed too is
-        create_agents' call (only when a person asked for the run)."""
+        wrote with autonomous=True (ed427a072): every flow's agents are
+        built freed (create_agents), the assistant with the AUTONOMOUS prompt
+        and the verifier without the HARD RULE."""
         seen = []
 
         def _recipe(*a, **k):

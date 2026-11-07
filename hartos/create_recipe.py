@@ -4399,11 +4399,12 @@ def _should_block_on_user_input(user_prompt, action_id, gate_value, *,
                                 status='pending', autonomous=False) -> bool:
     """Should the StatusVerifier's `can_perform_without_user_input` block this action?
 
-    A run its creator freed (``autonomous``: a plan the person approved, run
-    by chat(), or a daemon goal, owner 2026-11-05 "Retry first, then ask") is
-    not stopped by a `pending` + `no`: the step goes back to the agent, which
-    asks the person itself if it really must, and the attempts bound ends in
-    _ask_for_help.
+    A freed run (``autonomous``: every CREATE run chat() starts, and a daemon
+    goal, owner 2026-11-05 "Retry first, then ask") is not stopped by a
+    `pending` + `no`: the step goes back to the agent (whose freed prompt
+    tells it not to ask), and a step still unfinished at the attempts bound
+    goes to _ask_for_help, which asks the person and holds the step for her
+    answer, or on a daemon run hands it to the owner.
     Owner 2026-11-04: "the verifier used to flip to "yes" on its own so that
     it can progress autonomously when the creator has given it freedom".
     Measured that day, Reel Studio (agent 342): this gate stopped step 2,
@@ -4524,14 +4525,56 @@ def _needs_input_reply(action_id, action_text, waiting=False):
             f"from there.")
 
 
+def _hold_for_the_person(user_prompt, action_id, reason):
+    """Hold a step a live person is being asked about, the way the gate holds
+    one (state_transition's USER-INPUT GATE): the gate flag, and the wait in
+    both lifecycle authorities with the ask recorded
+    (mark_action_waiting_for_user), so the person's next message is taken as
+    the answer (_resume_prior_user_input_block) and recorded
+    (record_user_answer).
+
+    For an ask the gate did not raise: the attempts bound, which ends a freed
+    run's step that keeps waiting for her.  Review of 4bcad9583, finding 2:
+    held by nothing, her answer was never recorded, the step's `completed` +
+    `no` asked her again, and she answered twice.  A step the gate already
+    holds keeps its own hold and kind; a finished step waits for nobody
+    (_should_block_on_user_input)."""
+    task = user_tasks.get(user_prompt)
+    if task is None or getattr(task, '_needs_user_input_action_id', None) == action_id:
+        return
+    try:
+        if is_terminal_state(get_action_state(user_prompt, action_id)):
+            return
+    except Exception:
+        return
+    task._needs_user_input_action_id = action_id
+    task._needs_user_input_kind = USER_INPUT_GATE_HUMAN_REQUIRED
+    # The ledger blocks a task that is running: a `pending` verdict left the
+    # step PENDING, and PENDING -> IN_PROGRESS is the resume edge.
+    if get_action_state(user_prompt, action_id) in (ActionState.ASSIGNED,
+                                                    ActionState.PENDING):
+        safe_set_state(user_prompt, action_id, ActionState.IN_PROGRESS,
+                       'held for the person')
+    if not mark_action_waiting_for_user(
+            user_prompt, action_id, f'asked the person: {reason}',
+            flow=get_current_flow(user_prompt),
+            asked_in=request_id_list.get(user_prompt)):
+        # As at the gate: she is still asked, and her answer releases a
+        # block the ledger never held.
+        current_app.logger.warning(
+            f'[USER-INPUT-GATE] Action {action_id} waits for the person, but '
+            f'the ledger refused the block')
+
+
 def _ask_for_help(user_prompt, prompt_id, action_id, action_text, reason):
     """Hand an action the agent could not finish to someone who can (#106).
 
     Owner, 2026-09-14: when an autonomous agent cannot do an action, ask a
     human or an expert (the Claude co-pilot, which reaches goals through MCP
     list_goals and steer_goal); never record a completion that did not happen.
-    This is the one place the create loop asks.  A live user is asked directly,
-    as before.  On an autonomous run nobody reads a question, so the action is
+    This is the one place the create loop asks.  A live user is asked
+    directly, and the step is held for her answer (_hold_for_the_person),
+    whichever bound asked.  On an autonomous run nobody reads a question, so the action is
     held as waiting (PENDING, which the ledger records as BLOCKED, with
     blocked_reason input_required) and handed on through
     GoalManager.escalate_goal: to this node's expert model first when it has
@@ -4540,6 +4583,7 @@ def _ask_for_help(user_prompt, prompt_id, action_id, action_text, reason):
     """
     from integrations.agent_engine.dispatch import is_current_request_autonomous
     if not is_current_request_autonomous():
+        _hold_for_the_person(user_prompt, action_id, reason)
         _kind = getattr(user_tasks.get(user_prompt), '_needs_user_input_kind', None)
         return _needs_input_reply(action_id, action_text,
                                   waiting=(_kind == USER_INPUT_GATE_AWAITING_REPLY))
@@ -5080,6 +5124,22 @@ def step_instruction(action_no, action_text, user_text) -> str:
     consult_expert tool), never put on every agent.
     """
     return f'Execute Action {action_no}: {action_text} ,Latest User message: {user_text}'
+
+
+def _next_flow_reply(user_id, text, prompt_id, autonomous):
+    """Run the next flow of this turn's plan and hand back its reply.
+
+    The one way a CREATE turn moves to its next flow once the caller has
+    advanced the flow index and dropped the finished flow's agents (both
+    next-flow sites in get_response_group, and safe_action_boundary_check's
+    move).  The next flow's agents are built as this run's were (the run's
+    own ``autonomous``).  Its reply is this turn's reply: the next flow's run
+    ends in done, a question for the person, a pause or an error, and the
+    finished flow's loop has nothing left to add.  Review of 4bcad9583,
+    finding 1: the two loop sites dropped the reply and went on with the
+    finished flow's agents, so on a freed run flow 1's question for the
+    person came back as "Action 2 must be terminal before incrementing"."""
+    return get_response_group(user_id, text, prompt_id, autonomous=autonomous)
 
 
 def get_response_group(user_id,text,prompt_id,Failure=False,error=None,autonomous=False):
@@ -5863,9 +5923,11 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None,autonomou
                             del user_agents[user_prompt]
                             # The next flow's agents are built as this run's
                             # were: an approved plan stays freed past flow 1.
-                            x = get_response_group(user_id, text, prompt_id,
-                                                   autonomous=autonomous)
-                            continue
+                            # Its run is this turn's run, so its reply (done,
+                            # a question for the person, a pause) is this
+                            # turn's reply (_next_flow_reply).
+                            return _next_flow_reply(user_id, text, prompt_id,
+                                                    autonomous)
                         scheduler_check[user_prompt] = True
                         safe_increment_flow(user_prompt, prompt_id)
                         current_app.logger.info(f'[ALL-FLOWS-DONE] Agent creation complete')
@@ -6111,9 +6173,8 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None,autonomou
                                     del user_ledgers[user_prompt]
                                 user_tasks[user_prompt] = create_action_with_ledger(flow_actions, user_id, prompt_id, user_prompt)
                                 del user_agents[user_prompt]
-                                x = get_response_group(user_id, text, prompt_id,
-                                                       autonomous=autonomous)
-                                continue
+                                return _next_flow_reply(user_id, text, prompt_id,
+                                                        autonomous)
 
                             # All flows done
                             scheduler_check[user_prompt] = True
@@ -7305,8 +7366,7 @@ def safe_action_boundary_check(user_prompt, prompt_id, text, user_id, autonomous
             # Delete old agents and create new ones
             if user_prompt in user_agents:
                 del user_agents[user_prompt]
-            return False, get_response_group(user_id, text, prompt_id,
-                                             autonomous=autonomous)
+            return False, _next_flow_reply(user_id, text, prompt_id, autonomous)
 
         else:
             # All flows completed
@@ -7434,10 +7494,15 @@ from core.llm_outbound_logger import with_llm_context as _with_llm_context
 
 @_with_llm_context('autogen.create')
 def recipe(user_id, text, prompt_id, file_id, request_id, autonomous=False):
-    """Run one CREATE turn for this agent's approved plan.  ``autonomous``:
-    the caller is finishing an agent the person already approved, so every
+    """Run one CREATE turn of this agent's plan.  ``autonomous``: the caller
+    runs the plan without stopping for the person at each step, so every
     flow's agents are built freed (create_agents): the assistant's AUTONOMOUS
-    prompt, the verifier without the HARD RULE, and the freed gate."""
+    prompt, the verifier without the HARD RULE, and the freed gate.  Every
+    caller in chat() passes it: Phase 2 (the plan the person approved, or
+    Phase 1's salvaged config, which she has not seen), the after-restart
+    branch, and the autonomous pipeline (the daemon's own plan).  A step
+    that needs her is still put to her at the attempts bound
+    (_ask_for_help)."""
     user_prompt = f'{user_id}_{prompt_id}'
     request_id_list[user_prompt] = request_id
     # A turn begins with no pause pending (helper_fun.clear_pause_request).
