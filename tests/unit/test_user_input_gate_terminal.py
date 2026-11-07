@@ -213,10 +213,12 @@ class UserInputGateTerminal(unittest.TestCase):
         resume.assert_called_once_with(
             _UP, 3, 'User supplied input for the blocked action')
         # The one writer of the person's answer, tagged with the flow it
-        # answers (a later flow's action_1 is the same ledger task).
+        # answers (a later flow's action_1 is the same ledger task), under the
+        # request whose turn carries it; an answer sent in this turn names no
+        # earlier request (sent_in is for an answer kept unsaved first).
         record.assert_called_once_with(
             _UP, 3, 'Use account A', create_recipe.get_current_flow(_UP),
-            request_id='user-request-2')
+            request_id='user-request-2', sent_in=None)
         self.assertIsNone(task._needs_user_input_action_id)
 
     def test_failed_durable_resume_keeps_the_sticky_gate(self):
@@ -1127,12 +1129,15 @@ class APersonsReplyToAnUnheldQuestionIsItsAnswer(unittest.TestCase):
                          ('Can you say moon with me?', 'user-request-6'))
         self.assertTrue(self._still_waits('user-request-6'))
 
-    def test_a_kept_answer_is_recorded_under_the_request_it_came_in(self):
-        """Review of 9cd51ded9, finding a: request 2's answer could not be
-        saved and was kept; request 3 recorded it under request 3, so a late
-        retry of request 2 after request 3's new question was taken as a
-        second answer.  Recorded under request 2, the retry is no answer;
-        also when request 3's retry of it failed as well."""
+    def test_a_kept_answers_late_retry_is_no_answer_and_closes_nothing(self):
+        """Review of 9cd51ded9, finding a, and of b1fb02abd: request 2's
+        answer could not be saved and was kept; a later request saved it and
+        the model asked again in that request's round.  A late retry of
+        request 2 was taken as a second answer; recorded under request 2
+        instead, the retry's posted words closed the new question and the
+        step COMPLETED on "Noted.".  The retry is no answer and the question
+        stays open; also when a second request's retry of the answer failed
+        as well (the request it came in is still request 2)."""
         for refused in (1, 2):
             with self.subTest(refused_saves=refused):
                 self.tearDown()
@@ -1148,14 +1153,62 @@ class APersonsReplyToAnUnheldQuestionIsItsAnswer(unittest.TestCase):
                     's4', 'Shall we do b first, then m?', saved_in))
                 self.assertFalse(self._turn('user-request-2', 'the b sound'),
                                  'a late retry of the request it came in')
-                entries = self.ledger.tasks['action_3'].context[
-                    self.L.USER_INPUT_EVIDENCE_KEY]
-                self.assertEqual([(e.get('answer'), e.get('request_id')) for e in entries],
-                                 [('the b sound', 'user-request-2')])
+                self._posted('the b sound')
+                self.gc.messages.append({'role': 'assistant', 'name': 'Assistant',
+                                         'content': 'Noted. I will wait for the child.'})
+                self.assertEqual(self._answers(), ['the b sound'])
                 self.assertIsNone(self._flag())
                 found = self.L.step_open_question(_UP, 3)
                 self.assertEqual((found or (None, None, None))[1:],
                                  ('Shall we do b first, then m?', saved_in))
+                self.assertTrue(self._still_waits('user-request-2'))
+
+    def test_a_resent_kept_answer_leaves_the_question_after_it_open(self):
+        """Review of b1fb02abd, must-fix 1: request 2's answer could not be
+        saved; the person sends the same words again in request 3, which
+        saves it; the model asks again in request 3's round and request 3 is
+        retried.  Recorded under request 2, the retry's words were taken as
+        request 2's answer, which closed request 3's own question: the step
+        COMPLETED on "Noted.".  Also for a word as short as "yes"."""
+        for word in ('ba', 'yes'):
+            with self.subTest(word=word):
+                self.tearDown()
+                self.setUp()
+                self._window()
+                self.assertFalse(self._turn('user-request-2', word, saves=False))
+                self.assertTrue(self._turn('user-request-3', word))
+                self._posted(word)
+                self.gc.messages.extend(self._send(
+                    's4', 'Can you say ball with me?', 'user-request-3'))
+                self.assertFalse(self._turn('user-request-3', word), 'the retry is no answer')
+                self._posted(word)
+                self.gc.messages.append({'role': 'assistant', 'name': 'Assistant',
+                                         'content': 'Noted. I will wait for the child.'})
+                self.assertEqual(self._answers(), [word])
+                found = self.L.step_open_question(_UP, 3)
+                self.assertEqual((found or (None, None, None))[1:],
+                                 ('Can you say ball with me?', 'user-request-3'))
+                self.assertTrue(self._still_waits())
+
+    def test_the_saving_requests_retry_is_no_second_answer(self):
+        """Review of b1fb02abd, must-fix 2: request 2's answer was kept,
+        request 3 saved it, request 3's turn was refused before its words
+        were posted, and request 3 was retried.  Recorded under request 2,
+        request 3's own words ("what time is it") were recorded as a second
+        answer.  The retry records nothing; once its round posts the kept
+        answer, the question it answers closes and the lesson completes."""
+        self._window()
+        self.assertFalse(self._turn('user-request-2', 'the b sound', saves=False))
+        self.assertTrue(self._turn('user-request-3', 'what time is it'))
+        self.assertFalse(self._turn('user-request-3', 'what time is it'),
+                         'the retry is no answer')
+        self.assertEqual(self._answers(), ['the b sound'])
+        self.assertIsNone(self._flag())
+        self._posted('what time is it')
+        self.assertIsNone(self.L.step_open_question(_UP, 3))
+        self.gc.messages.append({'role': 'assistant', 'name': 'Assistant',
+                                 'content': 'Great, the b sound. Say ball with me.'})
+        self.assertFalse(self._still_waits('user-request-4'))
 
     def test_a_reply_taken_for_an_unheld_question_is_no_warning(self):
         """Every reply to a question the gate never held is released here,

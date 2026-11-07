@@ -596,7 +596,7 @@ def _flow_index(flow):
 
 
 def record_user_answer(user_prompt: str, action_id: int, answer: str,
-                       flow, request_id=None) -> bool:
+                       flow, request_id=None, sent_in=None) -> bool:
     """Record that the person answered this action in this flow, on the
     registered ledger task, through the ledger's own context setter so the
     integrity seal holds (#159).
@@ -612,13 +612,19 @@ def record_user_answer(user_prompt: str, action_id: int, answer: str,
     later flow's action_N is the same task.  False when there is no ledger or
     no such task.
 
-    ``request_id`` is the person's request that sent the answer (CREATE's
-    gate; for an answer kept unsaved, the request it came in, though a later
-    turn posts it); the entry keeps it, so a retry of that request posting
-    the same words again closes no question that request put out
-    (window_question; review of 328ad07d0, must-fix 1), and a late retry of
-    it is no second answer (reply_closes_open_question; review of 9cd51ded9,
-    finding a).  REUSE's reply, recorded by the verifier hook, carries none.
+    ``request_id`` is the person's request whose turn posts the answer into
+    the chat (CREATE's gate); the entry keeps it, so a retry of that request
+    posting the same words again closes no question that request put out
+    (window_question; review of 328ad07d0, must-fix 1).  ``sent_in`` is the
+    request an answer kept unsaved came in, when a later request saved it
+    (create_recipe._keep_unsaved_answer); the entry keeps it beside
+    ``request_id``, so a late retry of it is no second answer either
+    (reply_closes_open_question; review of 9cd51ded9, finding a).  Recorded
+    under ``sent_in`` instead, the saving request's own retry posted the
+    words after the question its round asked and closed it, and its later
+    words were recorded as a second answer (review of b1fb02abd, must-fixes
+    1 and 2).  REUSE's reply, recorded by the verifier hook, carries
+    neither.
 
     The answer closes the oldest open ask of this action in this flow
     (ASK_DELIVERED_KEY) in the SAME context update and the same save: the
@@ -643,6 +649,8 @@ def record_user_answer(user_prompt: str, action_id: int, answer: str,
     })
     if request_id:
         items[-1]['request_id'] = str(request_id)
+    if sent_in and str(sent_in) != str(request_id or ''):
+        items[-1]['sent_in'] = str(sent_in)
     context[USER_INPUT_EVIDENCE_KEY] = items
     asks = [dict(e) if isinstance(e, dict) else e
             for e in (context.get(ASK_DELIVERED_KEY) or [])]
@@ -698,18 +706,41 @@ def recorded_answer_requests(user_prompt: str, action_id: int,
     whose question was still open (review of ec41bdbf6, P5).  Only a
     genuine reply is recorded (the gate's is_genuine_user_request), so a
     daemon, expert or visual turn's text is never among these."""
+    return [(str(entry.get('answer')),
+             str(entry['request_id']) if entry.get('request_id') else None)
+            for entry in _recorded_answer_entries(user_prompt, action_id, flow)]
+
+
+def _recorded_answer_entries(user_prompt: str, action_id: int,
+                             flow=None) -> list:
+    """The answer entries record_user_answer kept on this action's ledger
+    task, oldest first: in ``flow``, or in any flow when it is None.  Blank
+    answers are left out.  The one walk recorded_answer_requests and
+    _requests_that_answered read."""
     ledger = _ledger_registry.get(user_prompt)
     task = ledger.tasks.get(f"action_{action_id}") if ledger else None
     context = getattr(task, 'context', None) if task is not None else None
     if not isinstance(context, dict):
         return []
     wanted = None if flow is None else _flow_index(flow)
-    return [(str(entry.get('answer')),
-             str(entry['request_id']) if entry.get('request_id') else None)
-            for entry in (context.get(USER_INPUT_EVIDENCE_KEY) or [])
+    return [entry for entry in (context.get(USER_INPUT_EVIDENCE_KEY) or [])
             if isinstance(entry, dict)
             and (wanted is None or entry.get('flow') == wanted)
             and str(entry.get('answer') or '').strip()]
+
+
+def _requests_that_answered(user_prompt: str, action_id: int) -> set:
+    """Every request that already gave this action an answer, in any flow:
+    the request each recorded answer's turn posted it in, and for an answer
+    kept unsaved first, the request it came in (record_user_answer's
+    ``sent_in``).  A retry of either is no second answer
+    (reply_closes_open_question)."""
+    found = set()
+    for entry in _recorded_answer_entries(user_prompt, action_id):
+        for key in ('request_id', 'sent_in'):
+            if entry.get(key):
+                found.add(str(entry[key]))
+    return found
 
 
 def recorded_answers(user_prompt: str, action_id: int, flow=None) -> list:
@@ -822,7 +853,9 @@ def reply_closes_open_question(user_prompt: str, action_id: int, text,
     compared, and a person who said the same thing twice was not heard).
     Also False when this request already gave the step its answer (a turn
     refused before its words were posted, then retried, recorded it twice),
-    and when the chat's newest order is another action's: a question left
+    including an answer it sent that a later request saved (a kept answer's
+    late retry; _requests_that_answered), and when the chat's newest order
+    is another action's: a question left
     from an earlier order of the same action id (flow 0's action 3 seen
     from flow 1 before its action 3 runs) is no question of the current
     step (review of 328ad07d0).
@@ -834,9 +867,7 @@ def reply_closes_open_question(user_prompt: str, action_id: int, text,
     if not str(text or '').strip():
         return False
     request_id = str(request_id or '')
-    if request_id and any(
-            carried_in == request_id for _answer, carried_in
-            in recorded_answer_requests(user_prompt, action_id)):
+    if request_id and request_id in _requests_that_answered(user_prompt, action_id):
         return False
     group_chat = get_registered_groupchat(user_prompt)
     messages = list(getattr(group_chat, 'messages', None) or [])
@@ -2207,9 +2238,8 @@ def window_asked(messages, action_id, answers=()) -> bool:
     message counts toward the newest recorded answer with its words only: a
     person who said "yes" twice, then a retry of the second request, is not
     also the first request's answer (review of 9cd51ded9, must-fix 1).  A
-    REUSE turn's words
-    ride inside its dispatch (reuse_recipe._reuse_seed_message), which
-    closes nothing either way."""
+    REUSE turn's words ride inside its dispatch
+    (reuse_recipe._reuse_seed_message), which closes nothing either way."""
     return window_question(messages, action_id, answers) is not None
 
 
