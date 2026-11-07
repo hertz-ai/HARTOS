@@ -2714,6 +2714,7 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
                             # sitemap looped 8 iterations before
                             # hallucinating user confirmation).
                             _needs_user_input = False
+                            _gate_kind = USER_INPUT_GATE_HUMAN_REQUIRED
                             try:
                                 _gate_value = (json_obj.get('can_perform_without_user_input') or '').strip().lower()
                                 _verdict_status = json_obj['status'].lower()
@@ -2729,13 +2730,12 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
                                         status=_verdict_status,
                                         autonomous=_autonomous_run):
                                     _needs_user_input = True
-                                    user_tasks[user_prompt]._needs_user_input_action_id = current_action_id
                                     # A `completed` + `no` step has already asked
                                     # (its send went out); the loop's own line
                                     # must say it waits, not that the step "isn't
                                     # coming together" (G8).  Resume treats both
                                     # kinds as the person's gate.
-                                    user_tasks[user_prompt]._needs_user_input_kind = (
+                                    _gate_kind = (
                                         USER_INPUT_GATE_AWAITING_REPLY
                                         if json_obj['status'].lower() != 'pending'
                                         else USER_INPUT_GATE_HUMAN_REQUIRED)
@@ -2760,20 +2760,12 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
                                     f"[USER-INPUT-GATE] flag set failed (non-blocking): {_gate_err}"
                                 )
                             if _needs_user_input:
-                                if not mark_action_waiting_for_user(
-                                        user_prompt, current_action_id,
-                                        json_obj.get('message') or 'Waiting for user input',
-                                        flow=get_current_flow(user_prompt),
-                                        asked_in=request_id_list.get(user_prompt)):
-                                    # Not silent: the person is still asked,
-                                    # and _resume_prior_user_input_block lets
-                                    # their answer release a block the ledger
-                                    # never held (live 2026-10-10, agent 54).
-                                    current_app.logger.warning(
-                                        f"[USER-INPUT-GATE] Action "
-                                        f"{current_action_id} waits for the "
-                                        f"person, but the ledger refused the "
-                                        f"block (its task is not in progress)")
+                                # The one hold for the person: the gate flag
+                                # and the wait in both lifecycle authorities.
+                                _hold_for_the_person(
+                                    user_prompt, current_action_id,
+                                    json_obj.get('message') or 'Waiting for user input',
+                                    kind=_gate_kind)
                                 # END the chat round here, the way the loop-break
                                 # (#485) and the TERMINATE guard do: autogen's
                                 # run_chat breaks on a None speaker, and the OUTER
@@ -4525,42 +4517,52 @@ def _needs_input_reply(action_id, action_text, waiting=False):
             f"from there.")
 
 
-def _hold_for_the_person(user_prompt, action_id, reason):
-    """Hold a step a live person is being asked about, the way the gate holds
-    one (state_transition's USER-INPUT GATE): the gate flag, and the wait in
-    both lifecycle authorities with the ask recorded
-    (mark_action_waiting_for_user), so the person's next message is taken as
-    the answer (_resume_prior_user_input_block) and recorded
-    (record_user_answer).
+def _hold_for_the_person(user_prompt, action_id, reason,
+                         kind=USER_INPUT_GATE_HUMAN_REQUIRED):
+    """THE hold of a step that waits for a live person's answer: the gate
+    flag and its ``kind``, and the wait in both lifecycle authorities with
+    the ask recorded (mark_action_waiting_for_user), so the person's next
+    message is taken as the answer (_resume_prior_user_input_block) and
+    recorded (record_user_answer).
 
-    For an ask the gate did not raise: the attempts bound, which ends a freed
-    run's step that keeps waiting for her.  Review of 4bcad9583, finding 2:
-    held by nothing, her answer was never recorded, the step's `completed` +
-    `no` asked her again, and she answered twice.  A step the gate already
-    holds keeps its own hold and kind; a finished step waits for nobody
-    (_should_block_on_user_input)."""
+    Its two callers: state_transition's USER-INPUT GATE (a verdict that the
+    step needs her; ``kind`` says whether it has already asked) and
+    _ask_for_help on a person's turn, for an ask the gate did not raise (the
+    attempts bound that ends a freed run's step which keeps waiting for her;
+    review of 4bcad9583, finding 2: held by nothing, her answer was never
+    recorded, the step's `completed` + `no` asked her again, and she
+    answered twice).  One writer, so the two holds cannot drift (review of
+    5dfba1d2a by claude-autostart-6d: the gate's three writes were copied).
+
+    The ledger blocks only a task that is running, so a step a `pending`
+    verdict left PENDING (or one never started) is resumed first, through
+    the PENDING -> IN_PROGRESS resume edge; before this the gate's block was
+    refused there and the wait lived only in the flag.  A finished step
+    waits for nobody (_should_block_on_user_input)."""
     task = user_tasks.get(user_prompt)
-    if task is None or getattr(task, '_needs_user_input_action_id', None) == action_id:
+    if task is None:
         return
     try:
         if is_terminal_state(get_action_state(user_prompt, action_id)):
             return
-    except Exception:
+    except Exception as exc:
+        current_app.logger.warning(
+            f'[USER-INPUT-GATE] Action {action_id} not held for the person: '
+            f'its state could not be read ({exc})')
         return
     task._needs_user_input_action_id = action_id
-    task._needs_user_input_kind = USER_INPUT_GATE_HUMAN_REQUIRED
-    # The ledger blocks a task that is running: a `pending` verdict left the
-    # step PENDING, and PENDING -> IN_PROGRESS is the resume edge.
+    task._needs_user_input_kind = kind
     if get_action_state(user_prompt, action_id) in (ActionState.ASSIGNED,
                                                     ActionState.PENDING):
         safe_set_state(user_prompt, action_id, ActionState.IN_PROGRESS,
                        'held for the person')
     if not mark_action_waiting_for_user(
-            user_prompt, action_id, f'asked the person: {reason}',
+            user_prompt, action_id, reason,
             flow=get_current_flow(user_prompt),
             asked_in=request_id_list.get(user_prompt)):
-        # As at the gate: she is still asked, and her answer releases a
-        # block the ledger never held.
+        # Not silent: the person is still asked, and
+        # _resume_prior_user_input_block lets their answer release a block
+        # the ledger never held (live 2026-10-10, agent 54).
         current_app.logger.warning(
             f'[USER-INPUT-GATE] Action {action_id} waits for the person, but '
             f'the ledger refused the block')
@@ -4574,16 +4576,29 @@ def _ask_for_help(user_prompt, prompt_id, action_id, action_text, reason):
     list_goals and steer_goal); never record a completion that did not happen.
     This is the one place the create loop asks.  A live user is asked
     directly, and the step is held for her answer (_hold_for_the_person),
-    whichever bound asked.  On an autonomous run nobody reads a question, so the action is
-    held as waiting (PENDING, which the ledger records as BLOCKED, with
-    blocked_reason input_required) and handed on through
-    GoalManager.escalate_goal: to this node's expert model first when it has
-    one (the daemon runs the goal's next turn on it, #106d), else to the owner
-    and the co-pilot, with the goal parked where they see it.
+    whichever bound asked: the gate's own hold is kept, and the attempts
+    bound's ask and the loop-break's flag are held here.  On an autonomous
+    run nobody reads a question, so the action is held as waiting (PENDING,
+    which the ledger records as BLOCKED, with blocked_reason input_required)
+    and handed on through GoalManager.escalate_goal: to this node's expert
+    model first when it has one (the daemon runs the goal's next turn on it,
+    #106d), else to the owner and the co-pilot, with the goal parked where
+    they see it.
     """
     from integrations.agent_engine.dispatch import is_current_request_autonomous
     if not is_current_request_autonomous():
-        _hold_for_the_person(user_prompt, action_id, reason)
+        # A step the gate already holds keeps its own hold and kind.  The
+        # loop-break only flags its step (RECOVERABLE_STALL, a stall an
+        # expert may retry on a daemon run) and holds nothing, so on her
+        # turn that step is held here (review of 5dfba1d2a: unheld, a
+        # re-post of the asking request was recorded as her answer, and a
+        # lost flag asked her twice).
+        _task = user_tasks.get(user_prompt)
+        if (getattr(_task, '_needs_user_input_action_id', None) != action_id
+                or getattr(_task, '_needs_user_input_kind', None)
+                == USER_INPUT_GATE_RECOVERABLE_STALL):
+            _hold_for_the_person(user_prompt, action_id,
+                                 f'asked the person: {reason}')
         _kind = getattr(user_tasks.get(user_prompt), '_needs_user_input_kind', None)
         return _needs_input_reply(action_id, action_text,
                                   waiting=(_kind == USER_INPUT_GATE_AWAITING_REPLY))
@@ -5129,10 +5144,13 @@ def step_instruction(action_no, action_text, user_text) -> str:
 def _next_flow_reply(user_id, text, prompt_id, autonomous):
     """Run the next flow of this turn's plan and hand back its reply.
 
-    The one way a CREATE turn moves to its next flow once the caller has
-    advanced the flow index and dropped the finished flow's agents (both
-    next-flow sites in get_response_group, and safe_action_boundary_check's
-    move).  The next flow's agents are built as this run's were (the run's
+    How a CREATE turn moves to its next flow once the caller has advanced
+    the flow index and dropped the finished flow's agents (both next-flow
+    sites in get_response_group, and safe_action_boundary_check's move).
+    Not yet the exception path (after_all_actions_terminated_from_exception
+    in get_response_group), which advances inline and goes on with the
+    finished flow's agents: no measured run reaches it (review of
+    5dfba1d2a), so it waits for a test that does.  The next flow's agents are built as this run's were (the run's
     own ``autonomous``).  Its reply is this turn's reply: the next flow's run
     ends in done, a question for the person, a pause or an error, and the
     finished flow's loop has nothing left to add.  Review of 4bcad9583,

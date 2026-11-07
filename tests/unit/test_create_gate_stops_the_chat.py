@@ -268,14 +268,18 @@ class TestACompletedVerdictThatNeedsThePersonStillAsks:
     def test_an_answer_the_ledger_could_not_block_for_still_closes_the_step(
             self, selector, tmp_path):
         """block_for_user_input refuses a task that is not in progress (live
-        2026-10-10, agent 54); the reply then releases the gate through
-        ledger_holds_no_block with no resume.  The answer must still be
-        recorded, or every later `completed` + `no` asks again (hartos-f9's
-        reading of my first design)."""
+        2026-10-10, agent 54: a resumed session's FAILED action_2); the reply
+        then releases the gate through ledger_holds_no_block with no resume.
+        The answer must still be recorded, or every later `completed` + `no`
+        asks again (hartos-f9's reading of my first design).  A task that has
+        only not started yet is resumed before the block now
+        (_hold_for_the_person), so the refusal is the live FAILED task."""
+        from agent_ledger.core import TaskStatus
         s = selector
         asked = SimpleNamespace(
             messages=[POSTED, _verdict('no', status='completed')], agents=[])
         with _ledger_for(s.up, tmp_path, in_progress=False) as led:
+            led.tasks['action_1'].status = TaskStatus.FAILED
             assert s.select(s.verify, asked) is None
             assert s.task._needs_user_input_action_id == 1
             assert led.tasks['action_1'].status.value != 'blocked', (

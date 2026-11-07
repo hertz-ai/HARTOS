@@ -346,3 +346,181 @@ def test_her_answer_to_the_step_she_was_asked_about_is_taken_once(create_env):
     assert not any(ask in second[0] for ask in ('need your input',
                                                 'waiting for your reply')), (
         f'she was asked again after answering: {second!r}')
+
+
+# ── one hold for the person (review of 5dfba1d2a) ────────────────────────────
+
+def _step_2_asks_her_after_a_pending_verdict(env):
+    """Step 2's first verdict holds it for a person (`pending` + `no`: on a
+    freed run the step goes back to the agent, PENDING).  The agent then
+    reports the question sent, and the verifier says `completed` + `no`
+    with no answer from her yet: the gate holds the step."""
+    real_verifier = env.script.verifier
+    real_assistant = env.script.assistant
+    verdicts = []
+
+    def verifier(recipient, messages=None, sender=None, config=None):
+        if (env.script.current() == 2
+                and 'please verify' in _content(env.script._last())):
+            verdicts.append(2)
+            if len(verdicts) == 1:
+                return True, json.dumps({
+                    'status': 'pending', 'action': ACTIONS[1], 'action_id': 2,
+                    'message': 'she has to confirm the sources',
+                    'can_perform_without_user_input': 'no'})
+            receipt = max(i for i, m in enumerate(env.script._msgs())
+                          if isinstance(m, dict) and m.get('role') == 'tool')
+            return True, json.dumps({
+                'status': 'completed', 'action': ACTIONS[1], 'action_id': 2,
+                'message': 'the question went to her',
+                'evidence': {'message_index': receipt, 'kind': 'tool_receipt'},
+                'can_perform_without_user_input': 'no',
+                'persona_name': 'Researcher', 'fallback_action': 'retry once'})
+        return real_verifier(recipient, messages, sender, config)
+
+    def assistant(recipient, messages=None, sender=None, config=None):
+        c = _content(env.script._last())
+        if env.script.current() == 2 and '"status": "pending"' in c:
+            return True, 'I asked her to confirm the sources. @StatusVerifier please verify.'
+        return real_assistant(recipient, messages, sender, config)
+
+    env.script.verifier = verifier
+    env.script.assistant = assistant
+    return verdicts
+
+
+def test_the_gate_records_her_wait_on_a_step_a_pending_verdict_left_waiting(
+        create_env):
+    """The gate holds through _hold_for_the_person, as _ask_for_help does.
+    On a freed run a `pending` verdict leaves the step PENDING, and the
+    ledger blocks only a running task, so the gate's own block used to be
+    refused there: the wait lived only in the in-memory flag (lost on a
+    restart, and the ask unrecorded).  Held through the one helper, the step
+    is resumed first and the ledger records her wait."""
+    env = create_env
+    verdicts = _step_2_asks_her_after_a_pending_verdict(env)
+
+    replies = _finish_approved_plan(env, 'her-request-7', turns=1)
+
+    assert verdicts == [2, 2], verdicts
+    assert 'waiting for your reply' in replies[0], replies
+    with env.app.app_context():
+        assert env.cr.person_waits_on(UP, 2, 0), 'her wait is not in the ledger'
+
+
+def _loop_break_on_step_2(env):
+    """What the loop-break leaves for an unverified step (state_transition,
+    #485): the gate flag with kind RECOVERABLE_STALL, a help reason, and the
+    round ended.  Set at step 2's verdict until her answer is in the chat;
+    after it, `completed` + `no` (the step asked her to confirm)."""
+    from core.constants import USER_INPUT_GATE_RECOVERABLE_STALL
+    real_verifier = env.script.verifier
+    real_assistant = env.script.assistant
+
+    def her_answer_seen():
+        return any(HER_ANSWER in _content(m) for m in env.script._msgs())
+
+    def verifier(recipient, messages=None, sender=None, config=None):
+        if (env.script.current() == 2
+                and 'please verify' in _content(env.script._last())):
+            if not her_answer_seen():
+                task = env.cr.user_tasks[UP]
+                task._needs_user_input_action_id = 2
+                task._needs_user_input_kind = USER_INPUT_GATE_RECOVERABLE_STALL
+                task._needs_help_reason = (
+                    'the conversation looped without finishing it')
+                return True, 'TERMINATE'
+            receipt = max(i for i, m in enumerate(env.script._msgs())
+                          if isinstance(m, dict) and m.get('role') == 'tool')
+            return True, json.dumps({
+                'status': 'completed', 'action': ACTIONS[1], 'action_id': 2,
+                'message': 'she confirmed the sources',
+                'evidence': {'message_index': receipt, 'kind': 'tool_receipt'},
+                'can_perform_without_user_input': 'no',
+                'persona_name': 'Researcher', 'fallback_action': 'retry once'})
+        return real_verifier(recipient, messages, sender, config)
+
+    def assistant(recipient, messages=None, sender=None, config=None):
+        c = _content(env.script._last())
+        if HER_ANSWER in c and not _MARKER.search(c):
+            n = env.script.current()
+            return True, f'Working on step {n}. @Helper please save step {n}.'
+        return real_assistant(recipient, messages, sender, config)
+
+    env.script.verifier = verifier
+    env.script.assistant = assistant
+
+
+def _lose_the_flag(env):
+    """A restart between the ask and her answer: the in-memory flag is gone."""
+    task = env.cr.user_tasks[UP]
+    task._needs_user_input_action_id = None
+    task._needs_user_input_kind = None
+
+
+@pytest.mark.parametrize('between', ['her_ask_is_re_posted', 'the_flag_is_lost'])
+def test_a_step_the_loop_break_put_to_her_is_held_for_her_answer(
+        create_env, between):
+    """Review of 5dfba1d2a (Medium): the loop-break only flags its step
+    (RECOVERABLE_STALL) and holds nothing, and _ask_for_help left a flagged
+    step alone, so on her turn the ask was never recorded and the ledger
+    held no wait.  Measured on 5dfba1d2a: a re-post of the asking request
+    ("Build the agent now", the web retry) was recorded as her answer to
+    step 2, and with the flag lost before her answer she was asked twice
+    over three turns.  Held for her, the re-post answers nothing, and her
+    answer is taken once whether or not the flag survived."""
+    env = create_env
+    _loop_break_on_step_2(env)
+
+    first = _finish_approved_plan(env, 'her-request-8', turns=1)
+    assert 'need your input' in first[0] and 'Step 2' in first[0], first
+    with env.app.app_context():
+        assert env.cr.person_waits_on(UP, 2, 0), 'her wait is not in the ledger'
+
+    if between == 'her_ask_is_re_posted':
+        _finish_approved_plan(env, 'her-request-8', turns=1)
+        with env.app.app_context():
+            assert not env.cr.ledger_user_answered(UP, 2, 0), (
+                'the re-posted ask was recorded as her answer')
+    else:
+        _lose_the_flag(env)
+
+    answer = _finish_approved_plan(env, 'her-request-9', turns=1, text=HER_ANSWER)
+
+    with env.app.app_context():
+        assert env.cr.ledger_user_answered(UP, 2, 0), 'her answer was not recorded'
+    assert (env.prompts / f'{PROMPT_ID}_0_2.json').exists(), (
+        f'step 2 did not close on her answer: {answer!r}')
+    assert not any(ask in answer[0] for ask in ('need your input',
+                                                'waiting for your reply')), (
+        f'she was asked again after answering: {answer!r}')
+
+
+def test_source_guard_one_hold_for_the_person():
+    """DRY guard for the fold above (review of 5dfba1d2a): the person's wait
+    is written by _hold_for_the_person alone, so the gate's hold and the
+    attempts bound's cannot drift apart again.  A source guard by design: a
+    second caller of mark_action_waiting_for_user anywhere in create_recipe
+    is the regression, and no single behaviour test sees all call sites."""
+    import ast
+    import inspect
+
+    class _Callers(ast.NodeVisitor):
+        """Each call of mark_action_waiting_for_user, named by the innermost
+        function it sits in (state_transition is nested in create_agents)."""
+        def __init__(self):
+            self.stack, self.found = [], []
+
+        def visit_FunctionDef(self, node):
+            self.stack.append(node.name)
+            self.generic_visit(node)
+            self.stack.pop()
+
+        def visit_Call(self, node):
+            if getattr(node.func, 'id', None) == 'mark_action_waiting_for_user':
+                self.found.append(self.stack[-1] if self.stack else '<module>')
+            self.generic_visit(node)
+
+    callers = _Callers()
+    callers.visit(ast.parse(inspect.getsource(cr)))
+    assert callers.found == ['_hold_for_the_person'], callers.found

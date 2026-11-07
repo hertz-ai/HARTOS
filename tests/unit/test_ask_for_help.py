@@ -57,7 +57,8 @@ def _names(state=IN_PROGRESS, task=None, tasks=None):
     # the reply by them (core.agent_tools.is_help_pause).
     from core.constants import (
         HELP_EXPERT_REPLY_PREFIX, HELP_PAUSED_REPLY_PREFIX,
-        USER_INPUT_GATE_AWAITING_REPLY, USER_INPUT_GATE_HUMAN_REQUIRED)
+        USER_INPUT_GATE_AWAITING_REPLY, USER_INPUT_GATE_HUMAN_REQUIRED,
+        USER_INPUT_GATE_RECOVERABLE_STALL)
     states, holds = [], []
     ledgers = {'7_1': types.SimpleNamespace(tasks={'action_2': task})} if task else {}
     return states, {
@@ -68,6 +69,7 @@ def _names(state=IN_PROGRESS, task=None, tasks=None):
         # kind, its terminal rule, and the wait recorded in both lifecycle
         # authorities; `holds` records each mark_action_waiting_for_user.
         'USER_INPUT_GATE_HUMAN_REQUIRED': USER_INPUT_GATE_HUMAN_REQUIRED,
+        'USER_INPUT_GATE_RECOVERABLE_STALL': USER_INPUT_GATE_RECOVERABLE_STALL,
         'is_terminal_state': lambda s: False,
         'holds': holds,
         'mark_action_waiting_for_user': (
@@ -143,11 +145,12 @@ def test_a_live_users_step_is_held_for_her_answer():
     her next message is taken as its answer.  A `pending` verdict left the
     step PENDING; the ledger blocks a running task, so it is resumed first."""
     from core.constants import USER_INPUT_GATE_HUMAN_REQUIRED
+    from tests.unit.module_swap import swap_modules
     task = types.SimpleNamespace()
     states, names = _names(state=PENDING, tasks={'7_1': task})
     ns = _functions(names)
     escalate = mock.Mock()
-    with mock.patch.dict(sys.modules, _modules(autonomous=False, escalate=escalate)):
+    with swap_modules(_modules(autonomous=False, escalate=escalate)):
         reply = ns['_ask_for_help']('7_1', 1, 2, 'Collect the sources',
                                     'it did not complete after 3 attempts')
     assert reply == ns['_needs_input_reply'](2, 'Collect the sources')
@@ -160,13 +163,36 @@ def test_a_live_users_step_is_held_for_her_answer():
         0, 'her-request-1')]
 
 
+def test_a_step_the_loop_break_flagged_is_held_for_her():
+    """Review of 5dfba1d2a (Medium): the loop-break flags its step
+    (RECOVERABLE_STALL) and holds nothing.  On her turn the step is held for
+    her, and the kind becomes the person's: there is no expert to retry it."""
+    from core.constants import (USER_INPUT_GATE_HUMAN_REQUIRED,
+                                USER_INPUT_GATE_RECOVERABLE_STALL)
+    from tests.unit.module_swap import swap_modules
+    task = types.SimpleNamespace(
+        _needs_user_input_action_id=2,
+        _needs_user_input_kind=USER_INPUT_GATE_RECOVERABLE_STALL)
+    states, names = _names(tasks={'7_1': task})
+    ns = _functions(names)
+    with swap_modules(_modules(autonomous=False)):
+        reply = ns['_ask_for_help']('7_1', 1, 2, 'Collect the sources',
+                                    'the conversation looped without finishing it')
+    assert reply == ns['_needs_input_reply'](2, 'Collect the sources')
+    assert task._needs_user_input_kind == USER_INPUT_GATE_HUMAN_REQUIRED
+    assert names['holds'] == [(
+        '7_1', 2, 'asked the person: the conversation looped without finishing it',
+        0, 'her-request-1')]
+
+
 def test_a_finished_step_is_not_held_for_her():
     """A terminal step waits for nobody (_should_block_on_user_input's rule)."""
+    from tests.unit.module_swap import swap_modules
     task = types.SimpleNamespace()
     states, names = _names(tasks={'7_1': task})
     names['is_terminal_state'] = lambda s: True
     ns = _functions(names)
-    with mock.patch.dict(sys.modules, _modules(autonomous=False)):
+    with swap_modules(_modules(autonomous=False)):
         ns['_ask_for_help']('7_1', 1, 2, 'Collect the sources', 'it looped')
     assert getattr(task, '_needs_user_input_action_id', None) is None
     assert states == [] and names['holds'] == []
