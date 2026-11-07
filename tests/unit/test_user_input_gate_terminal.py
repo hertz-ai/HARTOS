@@ -1195,20 +1195,31 @@ class APersonsReplyToAnUnheldQuestionIsItsAnswer(unittest.TestCase):
         request 3 saved it, request 3's turn was refused before its words
         were posted, and request 3 was retried.  Recorded under request 2,
         request 3's own words ("what time is it") were recorded as a second
-        answer.  The retry records nothing; once its round posts the kept
-        answer, the question it answers closes and the lesson completes."""
+        answer.  The retry records nothing.  The refused turn took the kept
+        answer's words for its round (get_response_group takes them before
+        it can be refused), as the real loop does; that those words are then
+        lost is task #260, not pinned here (review of 5a311e2ef, nit 1)."""
         self._window()
         self.assertFalse(self._turn('user-request-2', 'the b sound', saves=False))
         self.assertTrue(self._turn('user-request-3', 'what time is it'))
+        create_recipe._answer_for_this_turn(_UP, 'what time is it')
         self.assertFalse(self._turn('user-request-3', 'what time is it'),
                          'the retry is no answer')
         self.assertEqual(self._answers(), ['the b sound'])
         self.assertIsNone(self._flag())
-        self._posted('what time is it')
-        self.assertIsNone(self.L.step_open_question(_UP, 3))
-        self.gc.messages.append({'role': 'assistant', 'name': 'Assistant',
-                                 'content': 'Great, the b sound. Say ball with me.'})
-        self.assertFalse(self._still_waits('user-request-4'))
+
+    def test_a_refused_turn_retried_records_its_answer_once_in_a_later_flow_too(self):
+        """The one-answer-per-request guard reads every flow's answers: in
+        flow 1, a turn refused after its answer was recorded, then retried,
+        records it once (review of 5a311e2ef, nit 4: a guard reading flow 0
+        only recorded it twice)."""
+        create_recipe.recipe_for_persona[_UP] = 1
+        self._window()
+        self.assertTrue(self._turn('user-request-2', 'the b sound'))
+        self.assertFalse(self._turn('user-request-2', 'the b sound'))
+        entries = self.ledger.tasks['action_3'].context[self.L.USER_INPUT_EVIDENCE_KEY]
+        self.assertEqual([(e.get('answer'), e.get('flow')) for e in entries],
+                         [('the b sound', 1)])
 
     def test_a_reply_taken_for_an_unheld_question_is_no_warning(self):
         """Every reply to a question the gate never held is released here,

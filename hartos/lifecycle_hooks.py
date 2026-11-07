@@ -715,8 +715,9 @@ def _recorded_answer_entries(user_prompt: str, action_id: int,
                              flow=None) -> list:
     """The answer entries record_user_answer kept on this action's ledger
     task, oldest first: in ``flow``, or in any flow when it is None.  Blank
-    answers are left out.  The one walk recorded_answer_requests and
-    _requests_that_answered read."""
+    answers are left out.  The walk recorded_answer_requests and
+    _requests_that_answered both read (ledger_user_answered keeps its own:
+    it counts a blank answer too)."""
     ledger = _ledger_registry.get(user_prompt)
     task = ledger.tasks.get(f"action_{action_id}") if ledger else None
     context = getattr(task, 'context', None) if task is not None else None
@@ -855,10 +856,9 @@ def reply_closes_open_question(user_prompt: str, action_id: int, text,
     refused before its words were posted, then retried, recorded it twice),
     including an answer it sent that a later request saved (a kept answer's
     late retry; _requests_that_answered), and when the chat's newest order
-    is another action's: a question left
-    from an earlier order of the same action id (flow 0's action 3 seen
-    from flow 1 before its action 3 runs) is no question of the current
-    step (review of 328ad07d0).
+    is another action's: a question left from an earlier order of the same
+    action id (flow 0's action 3 seen from flow 1 before its action 3 runs)
+    is no question of the current step (review of 328ad07d0).
 
     The create loop takes such a reply into its gate when nothing holds the
     step for the person (review of 65db06972, must-fix 3), so the one writer
