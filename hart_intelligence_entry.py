@@ -8597,13 +8597,17 @@ def _autonomous_gather_info(user_id, description, prompt_id):
       STAGE 2 (auto, no human in loop): _review_proposed_plan calls
         a single-shot StatusVerifier-style LLM review against quality
         gates.  Returns 'approved' or 'needs_refinement' + feedback.
+        Every plan is reviewed, including one the model marked
+        'completed' itself.
 
       STAGE 3 (auto): if needs_refinement, send feedback to gather_info
         which refines and re-emits.  Loop up to 3 rounds.  After 3
         rounds, the newest plan (the refinement that answered the last
         feedback, never reviewed) is staged as its own round and saved
-        as it stands; an oscillating plan is saved the same way.  Asking
-        the owner instead is a follow-up.
+        as it stands; an oscillating plan is saved the same way.  A
+        refinement call that fails leaves the rejected plan proposed,
+        handed to a peer reviewer, never saved.  Asking the owner
+        instead is a follow-up.
 
       STAGE 4: on approved, the approved plan itself is finalized in code
         (_approved_plan_response, no LLM call) → status 'completed' →
@@ -8643,10 +8647,10 @@ def _autonomous_gather_info(user_id, description, prompt_id):
         OSC_DELTA as _OSC_DELTA,
     )
     _prev_action_count = None
+    _approved = False
     while review_rounds < MAX_REVIEW_ROUNDS:
         try:
-            new_response = response.replace('true', 'True').replace('false', 'False')
-            parsed = retrieve_json(new_response)
+            parsed = _parse_plan_reply(response)
             if isinstance(parsed, list):
                 for item in reversed(parsed):
                     if isinstance(item, dict) and 'status' in item:
@@ -8659,9 +8663,17 @@ def _autonomous_gather_info(user_id, description, prompt_id):
 
             _status = (parsed.get('status') or '').lower()
 
-            if _status == 'completed':
-                # Already approved + finalized (single-shot success)
+            if _status == 'completed' and _approved:
+                # The plan the reviewer approved, finalized; saved below.
                 break
+            if _status == 'completed':
+                # A plan the model marked completed that no reviewer
+                # approved is reviewed like any other.  The autonomous
+                # system message's STAGE 1 has the first call emit a plan
+                # for review, so 'completed' at round 0 or on a refinement
+                # is the model skipping review; it was saved unreviewed and
+                # unstaged (review of a88258c98, F-d).
+                _status = 'proposed_plan'
 
             if _status == 'proposed_plan':
                 # Oscillation guard — must run BEFORE the reviewer is
@@ -8698,13 +8710,27 @@ def _autonomous_gather_info(user_id, description, prompt_id):
                     app.logger.info(
                         f'Plan approved by StatusVerifier after '
                         f'{review_rounds + 1} rounds, finalizing')
+                    _approved = True
                     response = _approved_plan_response(parsed)
                     continue  # re-parse on next iteration: completed
                 else:
-                    # Send feedback to gather_info for refinement
+                    # Send feedback to gather_info for refinement.  A
+                    # refinement call that fails (the model down) ends the
+                    # loop before the round is counted, so the plan the
+                    # reviewer rejected stays a proposed plan and is never
+                    # saved; counted first, the escalation saved it as the
+                    # "never reviewed" newest (review of a88258c98, F-c).
+                    try:
+                        refined = gather_info(user_id, feedback,
+                                              prompt_id, autonomous=True)
+                    except Exception as e:
+                        app.logger.warning(
+                            f'Plan refinement round {review_rounds + 1} failed: '
+                            f'{e}; the plan the reviewer rejected stays '
+                            f'proposed, not saved')
+                        break
                     review_rounds += 1
-                    response = gather_info(user_id, feedback,
-                                           prompt_id, autonomous=True)
+                    response = refined
                     continue
             # Unknown status — exit the auto-review loop, fall to legacy below
             break
@@ -8721,8 +8747,7 @@ def _autonomous_gather_info(user_id, description, prompt_id):
     # last answer holds no plan is gather_info asked to approve, as before.
     if review_rounds >= MAX_REVIEW_ROUNDS:
         try:
-            _newest = retrieve_json(
-                response.replace('true', 'True').replace('false', 'False'))
+            _newest = _parse_plan_reply(response)
             if isinstance(_newest, list):
                 _newest = next((item for item in reversed(_newest)
                                 if isinstance(item, dict) and 'status' in item), {})
@@ -8756,8 +8781,7 @@ def _autonomous_gather_info(user_id, description, prompt_id):
     # (including stale "pending" Q&A behavior) falls back to the
     # legacy partial-config rescue at end of this function.
     try:
-        new_response = response.replace('true', 'True').replace('false', 'False')
-        parsed = retrieve_json(new_response)
+        parsed = _parse_plan_reply(response)
         if isinstance(parsed, list):
             for item in reversed(parsed):
                 if isinstance(item, dict) and 'status' in item:
@@ -8838,8 +8862,7 @@ def _autonomous_gather_info(user_id, description, prompt_id):
     iteration = 0
     while iteration < max_iterations:
         try:
-            new_response = response.replace('true', 'True').replace('false', 'False')
-            parsed = retrieve_json(new_response)
+            parsed = _parse_plan_reply(response)
             if isinstance(parsed, list):
                 for item in reversed(parsed):
                     if isinstance(item, dict) and 'status' in item:
@@ -9777,6 +9800,32 @@ _BUILDABLE_REASK = (
     'person confirmed, each step as its own string in "actions".')
 
 
+def _parse_plan_reply(text):
+    """A gather_info reply, parsed: the one parse every gather site uses.
+
+    A reply that is valid JSON is taken as the model wrote it.  Anything
+    else is read as before: JSON's true/false capitalised for
+    helper.retrieve_json's literal fallback, then retrieve_json.  That
+    rewrite is blind, so it also changed words inside the plan ("construe"
+    became "consTrue", "true or false" became "True or False").
+
+    Measured 2026-11-02 on the owner's desktop (review of a88258c98, F-e):
+    of 2,328 saved configs and staged plans written as JSON, the rewrite
+    then retrieve_json returned 1,922 exactly and 406 with words changed;
+    JSON first returns all 2,328.  Written as Python dicts, with True/False
+    or with true/false, both parses read the same.  Of 326 real replies in
+    the outbound LLM log (288 valid JSON), 324 parse the same and 2 keep
+    words the rewrite changed.  The cost: a reply that is valid JSON keeps
+    its curly quotes and dashes, which retrieve_json flattens to ASCII.
+
+    The only place the rewrite remains; a source guard
+    (tests/unit/test_the_approved_plan_is_the_saved_plan.py) keeps it so."""
+    try:
+        return json.loads(text)
+    except (TypeError, ValueError):
+        return retrieve_json(text.replace('true', 'True').replace('false', 'False'))
+
+
 def _read_gather_config(response, prompt_id):
     """The agent config in a gather_info reply, with its list fields decoded
     (_decode_config_lists).  Raises ValueError when the reply holds none.
@@ -9787,9 +9836,8 @@ def _read_gather_config(response, prompt_id):
     if 'Context size has been exceeded' in response:
         raise ValueError('LLM context size exceeded — cannot parse gather_info response')
 
-    new_response = response.replace('true','True').replace("false", "False")
     try:
-        new_res = retrieve_json(new_response)
+        new_res = _parse_plan_reply(response)
         app.logger.info(f"new_res: {new_res}")
     except Exception as e:
         app.logger.error(f'Got some error while will try with re match error:{e}')
@@ -11685,9 +11733,8 @@ def chat():
             # Interactive: start gather_info, return first question
             from hartos.gather_agentdetails import gather_info
             response = gather_info(user_id, agent_description, new_prompt_id)
-            new_response = response.replace('true', 'True').replace("false", "False")
             try:
-                new_res = retrieve_json(new_response)
+                new_res = _parse_plan_reply(response)
                 if isinstance(new_res, list):
                     for item in reversed(new_res):
                         if isinstance(item, dict) and 'status' in item:

@@ -66,11 +66,14 @@ def test_flows_written_as_json_text_are_saved_as_a_list(run):
 def test_a_completed_answer_with_an_empty_step_waits_for_one_that_builds(run):
     """The legacy loop's save: the first answer is 'completed' with a step
     that is no step; it is not saved, and the next answer that can be built
-    is."""
+    is.  The first answer is reviewed like any plan (review of a88258c98,
+    F-d), once: the walk takes the reviewer's real path, not a fall-back
+    on a fake reviewer that crashed."""
     broken = CREATOR[:2] + ['   ']
     run.answers = [_plan('completed', broken), _plan('completed', CREATOR)]
-    run.verdicts = []
+    run.verdicts = [('approved', '')]
     saved = run.go()
+    assert run.reviewed == [broken], 'the first answer was not reviewed exactly once'
     assert _actions(saved) == CREATOR, (
         'the config with an empty step was saved as built')
     assert saved['status'] == 'completed'

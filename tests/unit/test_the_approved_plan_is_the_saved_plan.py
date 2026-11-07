@@ -75,25 +75,48 @@ def run(hie, tmp_path, monkeypatch):
     ``verdicts`` are the reviewer's, in order."""
     monkeypatch.setattr(hie, 'PROMPTS_DIR', str(tmp_path))
     monkeypatch.setattr(hie, 'pooled_post', MagicMock(name='pooled_post'))
-    state = SimpleNamespace(answers=[], verdicts=[], sent=[])
+    state = SimpleNamespace(answers=[], verdicts=[], sent=[], reviewed=[])
 
     def gather_info(user_id, message, prompt_id, autonomous=False):
         state.sent.append(message)
         if str(message).startswith('approved'):
             return _plan('completed', REWRITTEN)
-        return state.answers.pop(0)
+        # An exception in ``answers`` is the planner's model failing.
+        answer = state.answers.pop(0)
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
 
     monkeypatch.setitem(sys.modules, 'hartos.gather_agentdetails',
                         SimpleNamespace(gather_info=gather_info))
-    monkeypatch.setattr(hie, '_review_proposed_plan',
-                        lambda plan, remaining: state.verdicts.pop(0))
+
+    def review(plan, remaining):
+        # Every plan the reviewer is shown, in order (its steps, or the plan
+        # itself when it has none to read).  An exception in ``verdicts`` is
+        # the reviewer's model failing.
+        try:
+            state.reviewed.append(_actions(plan))
+        except (KeyError, IndexError, TypeError):
+            state.reviewed.append(plan)
+        verdict = state.verdicts.pop(0)
+        if isinstance(verdict, BaseException):
+            raise verdict
+        return verdict
+    monkeypatch.setattr(hie, '_review_proposed_plan', review)
+
+    def call():
+        return hie._autonomous_gather_info(
+            USER, 'Create an agent named "Syllable Coach"', PID)
 
     def go():
-        hie._autonomous_gather_info(USER, 'Create an agent named "Syllable Coach"', PID)
+        call()
         with open(tmp_path / f'{PID}.json', encoding='utf-8') as f:
             return json.load(f)
 
-    state.go = go
+    state.call, state.go = call, go
+    state.saved_path = tmp_path / f'{PID}.json'
+    state.staged_exists = lambda n: (tmp_path / proposed_plan_filename(PID, n)).exists()
+    # ``n`` None is the plan handed to a peer reviewer (the unnumbered file).
     state.staged = lambda n: json.loads(
         (tmp_path / proposed_plan_filename(PID, n)).read_text(encoding='utf-8'))
     return state
@@ -132,8 +155,27 @@ def test_the_oscillation_force_approve_saves_the_newest_plan_as_it_stands(run):
     assert saved['status'] == 'completed' and 'review_required' not in saved
     assert _asked_to_approve(run) == []
     # The force-approved plan was never reviewed; it is staged as its own
-    # round, like the escalation's (review of cdeca7500, F4).
-    assert _actions(run.staged(1)) == longer
+    # round, like the escalation's (review of cdeca7500, F4), with its ids
+    # (review of a88258c98, F-a: dropping this site's stamps failed no test).
+    staged = run.staged(1)
+    assert _actions(staged) == longer
+    assert (staged['prompt_id'], staged['creator_user_id']) == (PID, USER)
+
+
+def test_the_plan_handed_to_a_peer_reviewer_is_staged_with_its_ids(run):
+    """The fourth staging, the plan the loop hands to a peer reviewer (here
+    because the auto-reviewer's model is down), goes through the one writer
+    too (review of a88258c98, F-b): the unnumbered file, stamped, and no
+    agent saved."""
+    run.answers = [_plan('proposed_plan', CREATOR)]
+    run.verdicts = [RuntimeError('the reviewer model is down')]
+    handed = json.loads(run.call())
+    assert handed['status'] == 'proposed_plan'
+    assert _actions(handed['plan']) == CREATOR
+    staged = run.staged(None)
+    assert _actions(staged) == CREATOR
+    assert (staged['prompt_id'], staged['creator_user_id']) == (PID, USER)
+    assert not run.saved_path.exists()
 
 
 def test_the_escalation_saves_the_refinement_that_answered_the_last_feedback(run):
@@ -177,15 +219,135 @@ def test_a_refinement_the_model_marked_completed_is_saved_as_it_stands(run):
     assert _actions(run.staged(3)) == refinement
 
 
-def test_the_approved_plan_keeps_text_outside_ascii(run):
-    """The reviewer's probe: non-ASCII words in the steps reach the saved
-    file unchanged (a coach that says the word in the child's language)."""
+def test_a_refinement_that_fails_leaves_the_rejected_plan_proposed(run):
+    """Review of a88258c98, F-c: the round-3 refinement call fails (the
+    model down).  The round was counted before the call, so the escalation
+    saved the plan the reviewer had just rejected, staged as the "never
+    reviewed" newest.  Now no agent is saved: the rejected plan goes back as
+    a proposed plan for a peer reviewer, as on any other break."""
+    rounds = [CREATOR,
+              [a.replace('warm feedback', 'kind feedback') for a in CREATOR],
+              [a.replace('warm feedback', 'gentle feedback') for a in CREATOR]]
+    run.answers = [_plan('proposed_plan', r) for r in rounds] + [
+        RuntimeError('the planner model is down')]
+    run.verdicts = [('needs_refinement', 'tighten the feedback step')] * 3
+    result = run.call()
+    assert not run.saved_path.exists(), 'the plan the reviewer rejected was saved'
+    assert not run.staged_exists(3), 'a rejected plan was staged as never reviewed'
+    handed = json.loads(result)
+    assert handed['status'] == 'proposed_plan'
+    assert _actions(handed['plan']) == rounds[2]
+    assert _actions(run.staged(None)) == rounds[2]
+    assert _asked_to_approve(run) == []
+
+
+def test_a_first_answer_the_model_marked_completed_is_reviewed(run):
+    """Review of a88258c98, F-d: the autonomous system message's STAGE 1
+    has the first call emit a plan for review, so a 'completed' first
+    answer is the model skipping review; it was saved unreviewed and
+    unstaged.  It goes to the reviewer once (one reviewer call more per
+    such creation), is staged as round 0, and the approved plan is
+    saved."""
+    run.answers = [_plan('completed', CREATOR)]
+    run.verdicts = [('approved', '')]
+    saved = run.go()
+    assert run.reviewed == [CREATOR], 'the plan was not reviewed exactly once'
+    assert _actions(saved) == CREATOR
+    assert _actions(run.staged(0)) == CREATOR
+
+
+def test_a_refinement_the_model_marked_completed_is_reviewed_before_rounds_end(run):
+    """Review of a88258c98, F-d: a refinement marked 'completed' at round 1
+    was saved unreviewed.  It is reviewed like any plan; rejected, it is
+    refined again, and the plan saved is the one approved."""
+    kind = [a.replace('warm feedback', 'kind feedback') for a in CREATOR]
+    gentle = [a.replace('warm feedback', 'gentle feedback') for a in CREATOR]
+    run.answers = [_plan('proposed_plan', CREATOR), _plan('completed', kind),
+                   _plan('proposed_plan', gentle)]
+    run.verdicts = [('needs_refinement', 'kinder feedback'),
+                    ('needs_refinement', 'gentler feedback'), ('approved', '')]
+    saved = run.go()
+    assert run.reviewed == [CREATOR, kind, gentle]
+    assert _actions(saved) == gentle
+    assert _actions(run.staged(1)) == kind
+
+
+def test_the_approved_plan_keeps_letters_outside_ascii(run):
+    """The reviewer's probe: letters outside ASCII in the steps reach the
+    saved file unchanged (a coach that says the word in the child's
+    language)."""
     steps = ['send_message_to_user: say "பந்து" (ball) slowly and ask Arjun to say it',
              "get_chat_history to read Arjun's attempt at பந்து",
              'send_message_to_user: warm feedback, très bien']
     run.answers = [_plan('proposed_plan', steps)]
     run.verdicts = [('approved', '')]
     assert _actions(run.go()) == steps
+
+
+def test_the_plan_keeps_its_own_words_true_and_false(run):
+    """Review of a88258c98, F-e: every gather parse capitalised JSON's
+    true/false blindly, so the plan's own words changed too ("construe"
+    became "consTrue"; 406 of 2,328 saved configs on the owner's desktop
+    came back with words changed).  A reply that is valid JSON is taken as
+    the model wrote it (_parse_plan_reply)."""
+    steps = ['send_message_to_user: ask Arjun whether "the ball is red" is true or false',
+             'save_data_in_memory key how_to_construe value the answer as Arjun says it',
+             "get_chat_history to read Arjun's answer",
+             'send_message_to_user: warm feedback, never a falsehood']
+    run.answers = [_plan('proposed_plan', steps)]
+    run.verdicts = [('approved', '')]
+    saved = run.go()
+    assert _actions(saved) == steps
+    assert saved['broadcast_agent'] is False
+
+
+def test_the_interactive_reply_keeps_its_own_words_too(hie):
+    """_read_gather_config, the interactive reply and the model's second
+    answer (#205), reads through the same parser."""
+    steps = ['send_message_to_user: ask Arjun whether the ball is red, true or false',
+             'save_data_in_memory key how_to_construe value his answer']
+    cfg = hie._read_gather_config(_plan('completed', steps), PID)
+    assert _actions(cfg) == steps
+
+
+def test_a_plan_written_as_json_keeps_its_quotes_and_dashes(run):
+    """The cost of taking a valid JSON reply as written, chosen with
+    hartos-c9 (review of a88258c98, F-e): curly quotes and dashes stay as
+    the model wrote them; only a reply that is not valid JSON goes through
+    helper.retrieve_json, which flattens them to ASCII."""
+    steps = ['send_message_to_user: say “ball” slowly — then wait',
+             "get_chat_history to read Arjun’s attempt"]
+    run.answers = [_plan('proposed_plan', steps)]
+    run.verdicts = [('approved', '')]
+    assert _actions(run.go()) == steps
+
+
+def test_a_reply_written_as_a_python_dict_is_still_read(run):
+    """A reply that is not valid JSON is read as before: True/False and
+    single quotes through helper.retrieve_json."""
+    reply = repr(json.loads(_plan('proposed_plan', CREATOR)))
+    assert "'review_required': True" in reply
+    run.answers = [reply]
+    run.verdicts = [('approved', '')]
+    assert _actions(run.go()) == CREATOR
+
+
+def test_only_the_one_plan_parser_capitalises_true_and_false():
+    """Source guard, beside the behaviour tests above: the blind true/false
+    rewrite lives in _parse_plan_reply alone, so a seventh gather site
+    cannot drift back to it (hartos-c9's condition on F-e)."""
+    import ast
+    path = os.path.join(os.path.dirname(__file__), '..', '..', 'hart_intelligence_entry.py')
+    tree = ast.parse(open(path, encoding='utf-8').read())
+    sites = []
+    for top in tree.body:
+        for node in ast.walk(top):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == 'replace' and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and node.args[0].value in ('true', 'false')):
+                sites.append(getattr(top, 'name', type(top).__name__))
+    assert sites == ['_parse_plan_reply', '_parse_plan_reply'], sites
 
 
 def test_an_escalation_with_no_plan_to_save_still_asks_gather_as_before(run):
