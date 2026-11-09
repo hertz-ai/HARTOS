@@ -3542,11 +3542,55 @@ def get_user_camera_inp(inp: Annotated[str, "The Question to check from visual c
                 "could read it, so this question about the camera was not "
                 "answered.") from e
     else:
-        raise RuntimeError(
-            "No camera frame is shared for this user right now, so there is "
-            "nothing to look at. get_user_camera_inp only answers questions "
-            "about what the user's live camera shows; it cannot answer "
-            "anything else.")
+        raise RuntimeError(_no_camera_frame_reason(inp, user_id))
+
+
+_NO_CAMERA_FRAME = (
+    "No camera frame is shared for this user right now, so there is nothing "
+    "to look at. get_user_camera_inp only answers questions about what the "
+    "user's live camera shows; it cannot answer anything else.")
+
+
+def _no_camera_frame_reason(inp, user_id) -> str:
+    """Why get_user_camera_inp had no frame, after asking through the one gate.
+
+    The camera is this computer's.  Its frames come from the owner's own
+    Nunba window, keyed by the owner's user id, and the window streams only
+    while the owner's camera_capture consent is on file.  So only the owner's
+    own turn (HEVOLVE_OWNER_USER_ID, which Nunba keeps in step with sign-in)
+    can ever be answered by a frame, and only that turn asks: through
+    ConsentService.check_or_request, the call Request_Camera_Access makes
+    (hart_intelligence_entry._request_consent).  The ask dedupes to one card,
+    and once the owner answered nothing is asked again.  A turn of the
+    daemon's account or of another user asks nobody: no camera here is keyed
+    to it.  Measured 2026-11-07: the owner's turns called this tool 28 times
+    with no frame, and no ask was ever filed (0 camera_capture rows).
+    """
+    owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
+    if not owner or str(user_id) != str(owner):
+        return _NO_CAMERA_FRAME
+    try:
+        from integrations.social.consent_service import (
+            ConsentService, known_agent_id)
+        from integrations.social.models import db_session
+        from hartos.threadlocal import thread_local_data
+        agent = known_agent_id(thread_local_data.get_prompt_id())
+        reason = f'Camera access needed: {inp}'.strip()[:300]
+        with db_session(commit=True) as db:
+            if ConsentService.check_or_request(db, owner, 'camera_capture',
+                                               agent_id=agent, reason=reason):
+                return (_NO_CAMERA_FRAME + " The owner has allowed the camera, "
+                        "but this computer's Nunba window is not sending "
+                        "camera frames yet.")
+            if ConsentService.declined(db, owner, 'camera_capture',
+                                       agent_id=agent):
+                return (_NO_CAMERA_FRAME + " The owner of this computer said "
+                        "no to camera access.")
+    except Exception:
+        current_app.logger.exception('camera consent ask could not be filed')
+        return _NO_CAMERA_FRAME
+    return (_NO_CAMERA_FRAME + " The owner of this computer has been asked "
+            "to allow the camera; it can be used once they allow it.")
 
 
 
