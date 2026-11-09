@@ -520,6 +520,15 @@ def get_llm_config():
 
 message_tracking_lock = threading.Lock()
 
+import logging  # noqa: E402
+
+# The log REUSE's tool-family registration writes "... registration skipped"
+# to: CREATE's "agent_logger" (create_recipe.tool_logger).  It was called
+# here (channel, media and news tools in create_agents_for_user) but never
+# defined, so a family that failed to register raised NameError out of the
+# except meant to log it, and the agent was never built.
+tool_logger = logging.getLogger("agent_logger")
+
 # Register 96 Expert Agents with skill registry for dream fulfillment
 try:
     import logging
@@ -1861,8 +1870,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
                 # A profile that cannot be read leaves the turn untuned, never
                 # without the agent's personality; CREATE does the same
                 # (create_recipe.py, "Resonance profile loading skipped").
-                import logging
-                logging.getLogger(__name__).debug(f"Resonance profile loading skipped: {e}")
+                tool_logger.debug(f"Resonance profile loading skipped: {e}")
             # REUSE = execution: the recipe IS the plan.  execution_mode=True
             # suppresses the persona's "ask 1-2 clarifying questions before
             # executing" behaviour, and we deliberately do NOT append
