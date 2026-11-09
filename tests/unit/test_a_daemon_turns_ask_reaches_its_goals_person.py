@@ -162,8 +162,10 @@ def test_background_asks_never_take_the_place_of_the_owners_own_ask(node):
     _goal('g-more')
     rids['system_daemon_342'] = 'daemon_g-more'
     more = json.loads(background(json.dumps(dict(POST, action='one_more')), 0))
+    note = more.pop('note')            # what to do instead (test_person_ask pins it)
     assert more == {'answered': False, 'refused': 'too_many_open_asks',
                     'status': 'refused'}
+    assert 'from background work' in note, note
 
     own = _ask_tool(OWNER, {f'{OWNER}_342': '1730600000'})
     reply = own(json.dumps(dict(POST, action='mine')), 0)

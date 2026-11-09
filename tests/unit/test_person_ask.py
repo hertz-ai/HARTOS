@@ -863,6 +863,102 @@ def test_other_refusals_name_no_purposes(legs):
     assert 'purposes' not in reply
 
 
+# -- every refusal says what was wrong and what to do (owner 11-09) ------------------
+
+def _refused_reply(func, component):
+    """The tool's refused reply: the failed shape it always had, plus a note."""
+    sent = component if isinstance(component, str) else json.dumps(component)
+    reply = json.loads(func(sent, 0))
+    assert reply['answered'] is False and reply['status'] == 'refused', reply
+    assert reply['note'].startswith('Not sent'), reply
+    return reply
+
+
+def test_too_many_open_asks_names_the_agents_own_questions_to_read(legs):
+    """Owner 11-09: "all refusals shd hint llm on what was wrong with tool
+    call".  66 of the desktop's 135 failing tool replies were this refusal
+    as a bare code, and the 4B asked again (hartos-16, llm_outbound.jsonl).
+    The note says how many are open, not to ask again, and which of this
+    agent's own asks to read; another agent is never shown them."""
+    from integrations.agent_engine import person_ask
+    func = _tool()
+    ids = [json.loads(func(json.dumps(dict(POST, action=f'a{i}')), 0))['ask_id']
+           for i in range(person_ask.MAX_OPEN_PER_PERSON)]
+    reply = _refused_reply(func, dict(POST, action='one_more'))
+    assert reply['refused'] == 'too_many_open_asks'
+    note = reply['note']
+    assert f'{person_ask.MAX_OPEN_PER_PERSON} questions' in note, note
+    assert 'Do not ask again' in note and all(i in note for i in ids), note
+    assert re.search(r'\bask_person\(ask_id=', note), note
+    theirs = _refused_reply(person_ask.ask_person_tool('10202', '999')[2],
+                            dict(POST, action='theirs'))
+    assert theirs['refused'] == 'too_many_open_asks'
+    assert not any(i in theirs['note'] for i in ids), theirs['note']
+    assert "other agents' questions" in theirs['note'], theirs['note']
+    person_ask.answer_ask(ids[0], {'decision': 'approve'}, '10202')
+    again = json.loads(func(json.dumps(dict(POST, action='one_more')), 0))
+    assert again['status'] == 'waiting_for_person', again
+
+
+@pytest.mark.parametrize('sent, says', [
+    ('not json', 'not JSON'),
+    ('[1, 2]', 'not an object'),
+    ('{"description": "Why I ask."}', 'no "type"'),
+])
+def test_a_component_that_is_not_an_ask_is_told_its_shape(legs, sent, says):
+    reply = _refused_reply(_tool(), sent)
+    assert reply['refused'] == 'not_an_object'
+    assert says in reply['note'] and '"type": "form"' in reply['note'], reply['note']
+    assert legs['cards'] == []
+
+
+SECRET = {'type': 'form', 'description': 'To sign you in.',
+          'fields': [{'name': 'password', 'type': 'password'}]}
+FILES = {'type': 'file_request', 'purpose': 'reel_source',
+         'description': 'Send the clips for your reel.'}
+
+
+@pytest.mark.parametrize('case, code, says', [
+    ('no_person', 'no_person', 'no person to ask'),
+    ('secret', 'secrets_go_to_the_vault', 'request_resource'),
+    ('purpose', 'unknown_purpose', 'one of purposes'),
+    ('no_reason', 'say_why_in_description', '"description"'),
+    ('no_agent', 'no_agent', 'without the files'),
+    ('not_shown', 'not_shown', 'carry on without asking'),
+    ('not_filed', 'not_filed', 'Try once more later'),
+])
+def test_every_refusal_says_what_was_wrong_and_what_to_do(legs, monkeypatch, case, code, says):
+    from integrations.agent_engine import person_ask
+    import integrations.agent_engine.liquid_ui_service as lui
+    from integrations.social.services import NotificationService
+    func, comp = _tool(), dict(POST)
+    if case == 'no_person':
+        monkeypatch.setattr(person_ask, 'person_to_ask', lambda *a, **k: '')
+    elif case == 'secret':
+        comp = dict(SECRET)
+    elif case == 'purpose':
+        comp = dict(FILES, purpose='reel_clips')
+    elif case == 'no_reason':
+        comp = {'type': 'approval', 'action': 'post_the_reel'}
+    elif case == 'no_agent':
+        func, comp = person_ask.ask_person_tool('10202', None)[2], dict(FILES)
+    elif case == 'not_shown':
+        monkeypatch.setattr(lui, 'push_agent_ui', lambda *a, **k: False)
+    elif case == 'not_filed':
+        def _no_row(*a, **k):
+            raise RuntimeError('the row could not be written')
+        monkeypatch.setattr(NotificationService, 'create', _no_row)
+    reply = _refused_reply(func, comp)
+    assert reply['refused'] == code, reply
+    assert says in reply['note'], reply['note']
+
+
+def test_an_ask_id_she_has_no_question_under_says_which_id_to_use(legs):
+    reply = json.loads(_tool()('', 0, 'no-such-ask'))
+    assert reply['answered'] is False and reply['status'] == 'not_found', reply
+    assert 'ask_id' in reply['note'], reply
+
+
 def test_the_tool_never_waits_longer_than_its_ceiling(legs, monkeypatch):
     from integrations.agent_engine import person_ask
     monkeypatch.setattr(person_ask, 'MAX_WAIT_S', 0.2)

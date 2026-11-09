@@ -647,6 +647,20 @@ def ask_state(ask_id, user_id) -> dict:
     return {'status': 'not_found', 'answer': None}
 
 
+def open_ask_ids(user_id, agent_id, background=False) -> list:
+    """The ids of ``agent_id``'s own asks of ``user_id`` still open, of one
+    kind (background work's, or the person's own turns'), oldest first: what
+    an agent refused for too_many_open_asks is told to read instead of
+    asking again.  Never another agent's: ask_state lets any agent of the
+    person read an id it is given."""
+    user_id, agent_id = str(user_id or ''), str(agent_id or '')
+    with _lock:
+        mine = [a for a in _asks.values()
+                if a.user_id == user_id and a.agent_id == agent_id
+                and a.answered_at is None and a.background == bool(background)]
+    return [a.ask_id for a in sorted(mine, key=lambda a: a.created)]
+
+
 def open_file_request(ask_id, user_id) -> Optional[dict]:
     """``{'purpose', 'prompt_id', 'max_files'}`` of ``user_id``'s OPEN
     file_request ``ask_id``, else None.  The door that takes the picked files
@@ -731,6 +745,8 @@ def ask_person_tool(user_id, prompt_id, agent_id=None, request_id=None):
             if state['status'] == 'expired':
                 reply['note'] = ('This ask is gone (the node restarted, or its answer '
                                  'was kept too long). Ask again if you still need it.')
+            elif state['status'] == 'not_found':
+                reply['note'] = _NOT_FOUND
             return json.dumps(reply)
         try:
             comp = json.loads(component) if isinstance(component, str) else component
@@ -740,16 +756,17 @@ def ask_person_tool(user_id, prompt_id, agent_id=None, request_id=None):
             comp.setdefault('prompt_id', str(prompt_id))
         # Not the person's own turn (core.chat_client.is_user_turn, the one
         # rule dispatch uses): its ask is background work's.
-        out = ask(person, agent_id if agent_id is not None else prompt_id, comp,
-                  prompt_id=prompt_id,
-                  background=not is_user_turn({'request_id': rid}))
+        background = not is_user_turn({'request_id': rid})
+        asker = agent_id if agent_id is not None else prompt_id
+        out = ask(person, asker, comp, prompt_id=prompt_id, background=background)
         if not out['ok']:
-            reply = {'answered': False, 'refused': out['refused'], 'status': 'refused'}
+            # The failed shape stays ('refused', status 'refused'); the note
+            # says what was wrong and what to do instead (owner 11-09).
+            reply = {'answered': False, 'refused': out['refused'], 'status': 'refused',
+                     'note': _refusal_note(out['refused'], comp, person,
+                                           '' if asker is None else asker, background)}
             if out['refused'] == 'unknown_purpose':
                 reply['purposes'] = purposes
-                reply['note'] = "A file_request's purpose is one of purposes."
-            elif out['refused'] == 'say_why_in_description':
-                reply['note'] = _SAY_WHY
             return json.dumps(reply)
         try:
             wait_s = min(float(wait_seconds or 0), float(MAX_WAIT_S))
@@ -785,3 +802,58 @@ _ASK_SHAPE = ('Liquid UI component JSON. Always put why you ask in "description"
 #: The refusal note of an ask with no reason.
 _SAY_WHY = ('Not sent: say why you ask in the component\'s "description", in your '
             'own words. The person reads it on the card.')
+#: What each refusal tells the model: what was wrong with the call and what
+#: to do instead (owner 11-09: "all refusals shd hint llm on what was wrong
+#: with tool call").  A bare code made the 4B ask again: 66 of the desktop's
+#: 135 failing tool replies were this tool's too_many_open_asks (measured by
+#: hartos-16 in llm_outbound.jsonl).  not_an_object and too_many_open_asks
+#: are worded per call, in _refusal_note.
+_REFUSAL_NOTES = {
+    'no_person': ('Not sent: this turn has no person to ask. Do the step without '
+                  'asking, or say in your reply that it needs a person.'),
+    'secrets_go_to_the_vault': (
+        'Not sent: it asks for a password, key, code or other secret, and a person '
+        'is never asked for one this way. Ask for it with the request_resource tool, '
+        'which keeps it in the vault.'),
+    'unknown_purpose': ('Not sent: that "purpose" is not one this node keeps files '
+                        'for. Use one of purposes.'),
+    'no_agent': ('Not sent: files are kept for the agent that asks, and this turn has '
+                 'no agent to keep them for. Do the step without the files, or say in '
+                 'your reply that it needs them.'),
+    'say_why_in_description': _SAY_WHY,
+    'not_shown': ('Not sent: the card was stopped before it reached the person (cards '
+                  'switched off, the hive halted, unsafe content, a "type" their '
+                  'devices do not show, or too many cards at once). Use a "type" such '
+                  'as "form" or "file_request"; if it is stopped again, carry on '
+                  'without asking.'),
+    'not_filed': ('Not sent: the question could not be saved on this node, so it never '
+                  'reached the person. Try once more later; if it fails again, carry '
+                  'on without asking.'),
+}
+#: An ask_id this person has no question under.
+_NOT_FOUND = ('No question of this person has that ask_id. Use the ask_id an earlier '
+              'reply of this tool gave you, or ask again.')
+
+
+def _refusal_note(refused, comp, person, asker, background) -> str:
+    """The note on a refused ask: what was wrong with the call and what to
+    do instead, in words the model can act on."""
+    from core.agent_tool_menu import ASK_PERSON_TOOL
+    if refused == 'not_an_object':
+        got = ('it has no "type"' if isinstance(comp, dict)
+               else 'what you sent is not JSON' if comp is None
+               else 'what you sent is JSON but not an object')
+        return f'Not sent: component must be a JSON object with a "type"; {got}. {_ASK_SHAPE}'
+    if refused == 'too_many_open_asks':
+        whose = 'from background work ' if background else ''
+        said = (f'Not sent: this person already has {MAX_OPEN_PER_PERSON} questions '
+                f'{whose}open, the most at once. Do not ask again now. ')
+        mine = open_ask_ids(person, asker, background)
+        if mine:
+            return said + ('Yours are %s: read each answer with %s(ask_id=...), and '
+                           'ask something new once one is answered.'
+                           % (', '.join(mine), ASK_PERSON_TOOL))
+        return said + ("They are other agents' questions: carry on without asking, "
+                       'and ask once one of them is answered.')
+    return _REFUSAL_NOTES.get(refused) or (
+        f'Not sent ({refused}): change the component before asking again.')
