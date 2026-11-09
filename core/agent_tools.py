@@ -581,6 +581,53 @@ def memory_view(agent_data, prompt_id, user_prompt):
                     own if isinstance(own, dict) else {})
 
 
+def unfilled_key_placeholder(key) -> Optional[str]:
+    """The first ``<...>`` still left in a memory key, or None.
+
+    A placeholder is a '<', then something other than spaces, then the next
+    '>': the shape a saved step uses for "fill this in" ("teach.<that same
+    user id>").  It is found anywhere in the key, because the model copies
+    it in more than one shape: whole ('teach.<user_id>'), holding a dot
+    ('teach.<user.id>', twice on 10-10, each read answered by a loose match
+    as if it were the record) and glued to text ('<experiment_id>_state',
+    agent 29023956042's saved step).  A lone '<' or '>' and an empty '<>'
+    are not placeholders.  This reads the tool's own argument, not the
+    model's words.  Measured 2026-11-09 by the change's reviewer: all 48
+    logged placeholder calls have this shape, and no stored key outside the
+    incident's own record does.
+
+    Measured live 2026-11-07 14:12 IST (request msg_1794040636536_3y7gjm,
+    agent 54): save_data_in_memory(key='teach.<user_id>') stored the
+    learner's progress under the literal part '<user_id>', not teach.10202,
+    and the fabrication gate credited the save because the tool reported
+    success.  Read shape: get_data_by_key('teach.<d68c9dee-...>') on
+    2026-10-14 23:10, the real id in brackets.
+    """
+    text = str(key or '')
+    start = text.find('<')
+    while start != -1:
+        end = text.find('>', start + 1)
+        if end == -1:
+            return None
+        inner = text[start + 1:end]
+        if '<' in inner:                 # a later '<' opens the nearer pair
+            start = text.find('<', start + 1)
+            continue
+        if inner.strip():
+            return text[start:end + 1]
+        start = text.find('<', end + 1)
+    return None
+
+
+def _placeholder_key_refusal(key, placeholder, outcome) -> str:
+    """The failed-call reply for a key ``unfilled_key_placeholder`` found.
+    Starts with "Error:", so core.constants.tool_reply_failed reads it as a
+    failed call and the fabrication gate re-steers instead of crediting it."""
+    return (f"Error: the key {key} still holds the placeholder {placeholder}. "
+            f"Look up the real value and call it again with that value in its "
+            f"place (for example, a user id comes from get_user_id). {outcome}")
+
+
 def build_core_tool_closures(ctx):
     """Build session-scoped tool closures.  Returns list of (name, desc, func).
 
@@ -706,6 +753,11 @@ def build_core_tool_closures(ctx):
         save reaches another user.
         """
         tool_logger.info('INSIDE save_data_in_memory')
+        _placeholder = unfilled_key_placeholder(key)
+        if _placeholder:
+            tool_logger.warning(f"save_data_in_memory refused: key {key!r} holds "
+                                f"the placeholder {_placeholder!r}")
+            return _placeholder_key_refusal(key, _placeholder, 'Data not saved')
         try:
             if isinstance(value, str) and (value.startswith('{') or value.startswith('[')):
                 value = _retrieve_json(value)
@@ -1519,6 +1571,11 @@ def build_core_tool_closures(ctx):
                 return (f'Nothing is stored for {key}: the elided text is kept '
                         f'for a day, and this one is gone or never existed.')
         else:
+            _placeholder = unfilled_key_placeholder(key)
+            if _placeholder:
+                tool_logger.warning(f"get_data_by_key refused: key {key!r} holds "
+                                    f"the placeholder {_placeholder!r}")
+                return _placeholder_key_refusal(key, _placeholder, 'Nothing was read')
             value = _read_saved(key)
         try:
             start = max(0, int(offset or 0))
