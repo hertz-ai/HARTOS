@@ -26,13 +26,21 @@ def plan_action_count(parsed) -> Optional[int]:
     let a refinement that folded seven flows back into one look like a jump of
     the first flow's steps, and a swing inside any later flow go unseen.
     Never raises.  A non-dict input returns None (no plan); a dict with
-    no/empty flows returns 0; a flow that is not a dict counts 0.
+    no/empty flows returns 0; a flow that is not a dict counts 0.  Flows
+    that are not a list (the model wrote them as JSON text) return None:
+    iterating the text counted every character's actions as 0, so a format
+    slip read as a swing to 0 and fired the guard (review of 494d5a4e1, Y2).
     """
     if not isinstance(parsed, dict):
         return None
+    flows = parsed.get('flows')
+    if flows is None:
+        return 0
+    if not isinstance(flows, list):
+        return None
     try:
         return sum(len((f.get('actions') if isinstance(f, dict) else None) or [])
-                   for f in (parsed.get('flows') or []))
+                   for f in flows)
     except Exception:
         return None
 

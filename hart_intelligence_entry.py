@@ -8585,7 +8585,140 @@ def _stage_review_round(plan, prompt_id, review_round):
         app.logger.warning(f'Plan stage write failed: {e}')
 
 
-def _autonomous_gather_info(user_id, description, prompt_id):
+def _plan_name(plan, prompt_id):
+    plan = plan if isinstance(plan, dict) else {}
+    return str(plan.get('name') or plan.get('agent_name') or f'agent {prompt_id}')
+
+
+def _write_staged_plan(prompt_id, plan) -> None:
+    """The one writer of the plan staged under ``prompt_id``, held or ended
+    (core.prompt_files.staged_plan reads it back).  Raises on failure; the
+    callers say what was lost."""
+    from core.prompt_files import proposed_plan_filename
+    path = os.path.join(PROMPTS_DIR, proposed_plan_filename(prompt_id))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w') as f:
+        json.dump(plan, f)
+
+
+def _hold_for_the_creator(plan, prompt_id, user_id, why, background):
+    """A plan nobody approved waits on its creator's approval card; it is
+    never saved unapproved (owner 11-04: the whole plan reviewed, no forced
+    approval).  Before this the oscillation guard and the three-round
+    escalation saved it as it stood (live 11-07, agent 1794031134533).
+
+    The plan is staged as the peer-review plan with the ask kept in it
+    (core.prompt_files.staged_plan reads it back).  A person's create also
+    keeps a hold under the CREATING user, one per person, because the person
+    paths mint a new prompt id on every create (_creation_prompt_id); a
+    background create resumes by its goal's own stable prompt id and keeps
+    none, since one daemon persona serves many goals (hartos-16, 11-07).  The
+    card's buttons are the ones every client draws: approve builds the plan,
+    deny drops it.  An ask that could not be filed (ok False: a database
+    lock on a daemon tick) still holds, and the next turn asks again.  What
+    to tell the creator."""
+    from integrations.agent_engine import person_ask
+    from core.prompt_files import hold_plan
+    held = {k: v for k, v in plan.items() if k not in ('review_required', 'hold')}
+    held.update(status='proposed_plan', prompt_id=prompt_id, creator_user_id=user_id)
+    name = _plan_name(held, prompt_id)
+    card = {'type': 'approval', 'action': f'approve_plan:{prompt_id}',
+            'description': (f'The plan for {name} did not settle in review ({why}). '
+                            f'Approve to build it on your next message, or deny to drop it.')}
+    asked, out = None, {'ok': False, 'refused': 'no_person'}
+    try:
+        asked = person_ask.person_to_ask(user_id)
+        if asked:
+            out = person_ask.ask(asked, prompt_id, card, prompt_id=prompt_id,
+                                 background=background)
+    except Exception as e:
+        app.logger.warning(f'Plan {prompt_id}: the approval could not be asked: {e}')
+        out = {'ok': False, 'refused': 'error'}
+    held['hold'] = {'ask_id': out.get('ask_id') if out.get('ok') else None,
+                    'asked': asked, 'why': why}
+    try:
+        _write_staged_plan(prompt_id, held)
+        if not background:
+            hold_plan(user_id, prompt_id)
+    except Exception as e:
+        app.logger.warning(f'Plan {prompt_id}: the hold could not be kept: {e}')
+    app.logger.warning(
+        f'Plan {prompt_id} held for approval ({why}): ask {held["hold"]["ask_id"]} to {asked}'
+        + ('' if out.get('ok') else f'; not filed ({out.get("refused")}), asked again next turn'))
+    return (f'The plan for {name} did not settle in review ({why}), so it waits for '
+            f'your approval: approve it on the card and it is built on your next '
+            f'message, or deny it to drop it.')
+
+
+def _held_plan_turn(user_id, prompt_id, background):
+    """A creator's turn on a plan of ``prompt_id`` that waits on their card:
+    ('approved', response), the staged plan finalized in code, never a
+    re-emission; ('reply', text), what to tell them (still waiting, dropped,
+    or asked again because the answer is no longer kept); None when no plan
+    of this id waits."""
+    from integrations.agent_engine import person_ask
+    from core.prompt_files import clear_held_plan, staged_plan
+    staged = staged_plan(PROMPTS_DIR, prompt_id)
+    hold = (staged or {}).get('hold')
+    if not isinstance(hold, dict):
+        return None
+    name = _plan_name(staged, prompt_id)
+    plan = {k: v for k, v in staged.items() if k != 'hold'}
+
+    def _end():
+        try:
+            _write_staged_plan(prompt_id, plan)
+        except Exception as e:
+            app.logger.warning(f'Plan {prompt_id}: the ended hold could not be written: {e}')
+        if not background:
+            clear_held_plan(user_id)
+
+    state = {'status': None}
+    if hold.get('ask_id') and hold.get('asked'):
+        try:
+            state = person_ask.ask_state(hold['ask_id'], hold['asked'])
+        except Exception as e:
+            app.logger.warning(f'Plan {prompt_id}: its approval could not be read: {e}')
+    status = state.get('status')
+    decision = str((state.get('answer') or {}).get('decision') or '').strip().lower()
+    if status == 'answered' and decision == 'approve':
+        _end()
+        app.logger.info(f'Plan {prompt_id} approved on its card; building the staged plan')
+        return 'approved', _approved_plan_response(plan)
+    if status == 'dismissed' or (status == 'answered' and decision == 'deny'):
+        _end()
+        app.logger.info(f'Plan {prompt_id} dropped on its card')
+        return 'reply', (f'Dropped the plan for {name}. Tell me what you want and '
+                         f'I will plan it again.')
+    if status == 'open':
+        return 'reply', (f'Your plan for {name} is waiting on the card: approve it '
+                         f'to build it, or deny it to drop it.')
+    # The answer is no longer kept (an hour passed, a restart), or the ask
+    # was never filed: ask again; nothing is built without an approval.
+    return 'reply', _hold_for_the_creator(plan, prompt_id, user_id,
+                                          hold.get('why') or 'review did not settle',
+                                          background)
+
+
+def _creation_prompt_id(user_id, proposed):
+    """The id a PERSON's create runs under: the plan waiting on their card
+    when they have one (one per person, core.prompt_files.held_plan), else
+    ``proposed``.  Not for background creates (:11033 keeps its goal's id).
+    A hold record whose plan no longer waits is cleared, never followed."""
+    from core.prompt_files import clear_held_plan, held_plan, staged_plan
+    try:
+        held = held_plan(user_id)
+        if held is None:
+            return proposed
+        if isinstance((staged_plan(PROMPTS_DIR, held) or {}).get('hold'), dict):
+            return held
+        clear_held_plan(user_id)
+    except Exception as e:
+        app.logger.warning(f'Plan hold of {user_id} could not be read: {e}')
+    return proposed
+
+
+def _autonomous_gather_info(user_id, description, prompt_id, background=False):
     """Run gather_info autonomously with HART OS peer-review pattern.
 
     Four-stage flow (matches gather_agentdetails.py PLAN_FIRST prompt
@@ -8625,7 +8758,13 @@ def _autonomous_gather_info(user_id, description, prompt_id):
     uses handles the review verdict at zero marginal cost.
     """
     from hartos.gather_agentdetails import gather_info
-    response = gather_info(user_id, description, prompt_id, autonomous=True)
+    # A plan of this id waiting on its creator's card is answered first.
+    _held = _held_plan_turn(user_id, prompt_id, background)
+    if _held is not None and _held[0] == 'reply':
+        return _held[1]
+    _resumed = _held is not None
+    response = (_held[1] if _resumed
+                else gather_info(user_id, description, prompt_id, autonomous=True))
 
     # Auto-review + refinement loop (no human in path)
     review_rounds = 0
@@ -8647,7 +8786,7 @@ def _autonomous_gather_info(user_id, description, prompt_id):
         OSC_DELTA as _OSC_DELTA,
     )
     _prev_action_count = None
-    _approved = False
+    _approved = _resumed            # approved on its card: finalized, saved below
     while review_rounds < MAX_REVIEW_ROUNDS:
         try:
             parsed = _parse_plan_reply(response)
@@ -8674,6 +8813,12 @@ def _autonomous_gather_info(user_id, description, prompt_id):
                 # is the model skipping review; it was saved unreviewed and
                 # unstaged (review of a88258c98, F-d).
                 _status = 'proposed_plan'
+                # The reply itself is relabelled: every exit below reads
+                # `response`, and a break after a failed refinement saved
+                # this unreviewed plan as 'completed' while the log said
+                # "not saved" (review of 7e130b0df, must-fix 2).
+                parsed['status'] = 'proposed_plan'
+                response = json.dumps(parsed)
 
             if _status == 'proposed_plan':
                 # Oscillation guard — must run BEFORE the reviewer is
@@ -8686,16 +8831,19 @@ def _autonomous_gather_info(user_id, description, prompt_id):
                         f'action_count {_prev_action_count} -> {_action_count} '
                         f'(delta {abs(_action_count - _prev_action_count)} > '
                         f'threshold {_OSC_DELTA}). Reviewer is yo-yoing the '
-                        f'planner. Force-approving the most recent plan to '
-                        f'stop the cycle.'
+                        f'planner. Holding the most recent plan for its '
+                        f'creator\'s approval to stop the cycle.'
                     )
                     # Never reviewed, so staged as its own round, like the
-                    # escalation's (review of cdeca7500, F4).
+                    # escalation's (review of cdeca7500, F4), and held for
+                    # the creator's approval, never saved as it stands.
                     parsed['prompt_id'] = prompt_id
                     parsed['creator_user_id'] = user_id
                     _stage_review_round(parsed, prompt_id, review_rounds)
-                    response = _approved_plan_response(parsed)
-                    break
+                    return _hold_for_the_creator(
+                        parsed, prompt_id, user_id,
+                        'the reviewer and the planner kept changing the step count',
+                        background)
                 _prev_action_count = _action_count
                 # Stage plan for audit + run auto-review
                 parsed['prompt_id'] = prompt_id
@@ -8720,14 +8868,24 @@ def _autonomous_gather_info(user_id, description, prompt_id):
                     # reviewer rejected stays a proposed plan and is never
                     # saved; counted first, the escalation saved it as the
                     # "never reviewed" newest (review of a88258c98, F-c).
+                    # gather_info does not raise on a model failure: it
+                    # returns the failed turn as a sentence ("I couldn't
+                    # finish that: ..."), which counted as round 3 and let the
+                    # escalation save the plan just rejected (review of
+                    # 7e130b0df, must-fix 1, measured with the real
+                    # gather_info).  Either form ends the loop uncounted.
+                    from core.agent_tools import is_user_facing_error
                     try:
                         refined = gather_info(user_id, feedback,
                                               prompt_id, autonomous=True)
+                        _failed = refined if is_user_facing_error(refined) else None
                     except Exception as e:
+                        _failed = str(e)
+                    if _failed is not None:
                         app.logger.warning(
                             f'Plan refinement round {review_rounds + 1} failed: '
-                            f'{e}; the plan the reviewer rejected stays '
-                            f'proposed, not saved')
+                            f'{str(_failed)[:200]}; the plan the reviewer '
+                            f'rejected stays proposed, not saved')
                         break
                     review_rounds += 1
                     response = refined
@@ -8758,12 +8916,14 @@ def _autonomous_gather_info(user_id, description, prompt_id):
                                                               'completed')):
             app.logger.warning(
                 f'Plan review hit {MAX_REVIEW_ROUNDS} rounds without '
-                f'convergence: saving the newest plan, round {review_rounds}, '
-                f'which was never reviewed')
+                f'convergence: holding the newest plan, round {review_rounds}, '
+                f'which was never reviewed, for its creator\'s approval')
             _newest['prompt_id'] = prompt_id
             _newest['creator_user_id'] = user_id
             _stage_review_round(_newest, prompt_id, review_rounds)
-            response = _approved_plan_response(_newest)
+            return _hold_for_the_creator(
+                _newest, prompt_id, user_id,
+                f'{MAX_REVIEW_ROUNDS} review rounds did not agree', background)
         else:
             app.logger.warning(
                 f'Plan review hit {MAX_REVIEW_ROUNDS} rounds without '
@@ -8794,33 +8954,13 @@ def _autonomous_gather_info(user_id, description, prompt_id):
             _status = (parsed.get('status') or '').lower()
 
             if _status == 'proposed_plan':
-                # Stash the plan so the next /chat (with "approved" /
-                # feedback) can refine; surface it to the peer reviewer.
-                parsed['prompt_id'] = prompt_id
-                parsed['creator_user_id'] = user_id
-                from core.prompt_files import proposed_plan_filename
-                _plan_path = os.path.join(
-                    PROMPTS_DIR, proposed_plan_filename(prompt_id))
-                try:
-                    os.makedirs(os.path.dirname(_plan_path), exist_ok=True)
-                    with open(_plan_path, 'w') as f:
-                        json.dump(parsed, f)
-                    app.logger.info(
-                        f'Proposed plan staged at {_plan_path} '
-                        f'awaiting peer review')
-                except Exception as e:
-                    app.logger.warning(f'Could not stage proposed plan: {e}')
-                # Return the plan as JSON string so /chat caller can
-                # render the atomic steps for the reviewing peer agent.
-                return json.dumps({
-                    'status': 'proposed_plan',
-                    'plan': parsed,
-                    'instructions_for_reviewer': (
-                        'Review the atomic steps in plan.flows[].actions[]. '
-                        'Reply with "approved" to commit and dispatch to '
-                        'the autogen execution team, or reply with feedback '
-                        'text to refine the plan.'),
-                })
+                # A plan the review could not finish (its model failed) waits
+                # on its creator's card like the other two; the card is the
+                # only approval.  The reply used to ask for a free-text
+                # "approved" that nothing read (hartos-16, 11-07).
+                return _hold_for_the_creator(
+                    parsed, prompt_id, user_id, 'the review could not finish',
+                    background)
 
             # Only a config that can be built is saved as built (#206); one
             # that cannot falls to the legacy loop below, as unfinished.
@@ -10562,7 +10702,8 @@ def chat():
         else:
             # No matching agent — auto-create one, then execute
             # Reuse prompt_id from Plan Mode response if available
-            new_prompt_id = prompt_id if prompt_id else _next_prompt_id()
+            new_prompt_id = _creation_prompt_id(
+                user_id, prompt_id if prompt_id else _next_prompt_id())
             auto_response = _autonomous_gather_info(user_id, prompt, new_prompt_id)
             _ak = f'{user_id}_{new_prompt_id}'
             review_agents[_ak] = True
@@ -11030,7 +11171,10 @@ def chat():
                 # Autonomous dispatch (from daemon or API): LLM self-generates agent config
                 # AND immediately creates recipe — no human review step needed.
                 # Full pipeline: gather_info → save config → recipe() → completed
-                auto_response = _autonomous_gather_info(user_id, prompt, prompt_id)
+                # Background work: its goal's own stable prompt id, and a
+                # held plan asks under the background limit (hartos-16).
+                auto_response = _autonomous_gather_info(user_id, prompt, prompt_id,
+                                                        background=True)
 
                 # Now immediately create the recipe so next dispatch enters REUSE
                 recipe_response = None
@@ -11560,6 +11704,7 @@ def chat():
                 new_prompt_id = _next_prompt_id()
                 if is_auto:
                     # Autonomous: run gather_info with LLM-generated answers
+                    new_prompt_id = _creation_prompt_id(user_id, new_prompt_id)
                     auto_response = _autonomous_gather_info(user_id, agent_desc, new_prompt_id)
                     _ak_new = f'{user_id}_{new_prompt_id}'
                     review_agents[_ak_new] = True
@@ -11715,6 +11860,7 @@ def chat():
 
         if is_autonomous:
             # Autonomous: run gather_info with LLM-generated answers
+            new_prompt_id = _creation_prompt_id(user_id, new_prompt_id)
             auto_response = _autonomous_gather_info(user_id, agent_description, new_prompt_id)
             _ak_new = f'{user_id}_{new_prompt_id}'
             review_agents[_ak_new] = True
