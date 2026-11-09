@@ -3545,52 +3545,72 @@ def get_user_camera_inp(inp: Annotated[str, "The Question to check from visual c
         raise RuntimeError(_no_camera_frame_reason(inp, user_id))
 
 
-_NO_CAMERA_FRAME = (
-    "No camera frame is shared for this user right now, so there is nothing "
-    "to look at. get_user_camera_inp only answers questions about what the "
-    "user's live camera shows; it cannot answer anything else.")
+_CAMERA_TOOL = 'get_user_camera_inp'
 
 
 def _no_camera_frame_reason(inp, user_id) -> str:
-    """Why get_user_camera_inp had no frame, after asking through the one gate.
+    """Why get_user_camera_inp had no frame, after asking through the one ask.
 
     The camera is this computer's.  Its frames come from the owner's own
     Nunba window, keyed by the owner's user id, and the window streams only
     while the owner's camera_capture consent is on file.  So only the owner's
-    own turn (HEVOLVE_OWNER_USER_ID, which Nunba keeps in step with sign-in)
-    can ever be answered by a frame, and only that turn asks: through
-    ConsentService.check_or_request, the call Request_Camera_Access makes
-    (hart_intelligence_entry._request_consent).  The ask dedupes to one card,
-    and once the owner answered nothing is asked again.  A turn of the
-    daemon's account or of another user asks nobody: no camera here is keyed
-    to it.  Measured 2026-11-07: the owner's turns called this tool 28 times
-    with no frame, and no ask was ever filed (0 camera_capture rows).
+    own turn can ever be answered by a frame, and only that turn asks:
+    through consent_service.ask_owner, the ask Request_Camera_Access makes
+    too (hart_intelligence_entry._request_consent).  The ask is one card, and
+    once the owner answered nothing is asked again; a No to any agent, or a
+    revoke, stops these automatic asks (stop_at_last_no), because the camera
+    is one device and its last answer stands.  A turn of the daemon's account
+    or of another user asks nobody: no camera here is keyed to it.  Measured
+    2026-11-07: the owner's turns called this tool 28 times with no frame,
+    and no ask was ever filed (0 camera_capture rows).
+
+    The text is a core.tool_refusal refusal (owner 2026-11-09: every refusal
+    says what was wrong and what to do), so the model stops calling the
+    camera and tells the person instead of retrying it.  It names the camera,
+    never the Redis leg of get_frame (tests/unit/test_get_frame_redis_down.py).
     """
-    owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
-    if not owner or str(user_id) != str(owner):
-        return _NO_CAMERA_FRAME
+    from core.tool_refusal import RETRY_LATER, RETRY_NEVER, refuse
+    nothing = refuse(
+        _CAMERA_TOOL,
+        "no camera frame is shared for this user right now, so there is "
+        "nothing to look at",
+        "This tool only answers questions about what the user's live camera "
+        "shows and cannot answer anything else; answer without it",
+        retry=RETRY_NEVER)
     try:
         from integrations.social.consent_service import (
-            ConsentService, known_agent_id)
-        from integrations.social.models import db_session
+            OWNER_ALLOWED, OWNER_ASKED, OWNER_SAID_NO, ask_owner)
         from hartos.threadlocal import thread_local_data
-        agent = known_agent_id(thread_local_data.get_prompt_id())
-        reason = f'Camera access needed: {inp}'.strip()[:300]
-        with db_session(commit=True) as db:
-            if ConsentService.check_or_request(db, owner, 'camera_capture',
-                                               agent_id=agent, reason=reason):
-                return (_NO_CAMERA_FRAME + " The owner has allowed the camera, "
-                        "but this computer's Nunba window is not sending "
-                        "camera frames yet.")
-            if ConsentService.declined(db, owner, 'camera_capture',
-                                       agent_id=agent):
-                return (_NO_CAMERA_FRAME + " The owner of this computer said "
-                        "no to camera access.")
+        outcome = ask_owner('camera_capture',
+                            f'Camera access needed: {inp}'.strip()[:300],
+                            thread_local_data.get_prompt_id(),
+                            turn_user=user_id, stop_at_last_no=True)
     except Exception:
-        current_app.logger.exception('camera consent ask could not be filed')
-        return _NO_CAMERA_FRAME
-    return (_NO_CAMERA_FRAME + " The owner of this computer has been asked "
-            "to allow the camera; it can be used once they allow it.")
+        current_app.logger.exception('camera consent ask could not be made')
+        return nothing
+    if outcome == OWNER_ASKED:
+        return refuse(
+            _CAMERA_TOOL,
+            "no camera frame is shared yet: the owner of this computer has "
+            "been asked to allow the camera",
+            "Tell the person the camera can be used once they allow it on the "
+            "card now showing",
+            retry=RETRY_LATER)
+    if outcome == OWNER_ALLOWED:
+        return refuse(
+            _CAMERA_TOOL,
+            "the owner has allowed the camera, but this computer's Nunba "
+            "window is not sending camera frames yet",
+            "Tell the person to open Nunba on this computer with a camera "
+            "connected",
+            retry=RETRY_LATER)
+    if outcome == OWNER_SAID_NO:
+        return refuse(
+            _CAMERA_TOOL,
+            "the owner of this computer said no to camera access",
+            "Do not ask for the camera again; answer without it",
+            retry=RETRY_NEVER)
+    return nothing
 
 
 

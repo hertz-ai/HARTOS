@@ -3238,13 +3238,11 @@ def _request_consent(action: str, label: str, input_text: str) -> str:
     /visual_agent (#66).  Which agent is asking comes from the request's own
     prompt id, not the capability label the tool wrapper passes.
     """
-    # ONE normaliser for "is this a real agent id", shared with the
-    # computer_control and credential asks rather than copied (it already
-    # handles the '0' and 'None' spellings this codebase passes around).
+    # The ask itself is consent_service.ask_owner, shared with the camera
+    # tool's own ask (hartos.helper), so the two cannot drift apart.
     from integrations.social.consent_service import (
-        ConsentService, central_lacks, consent_type_for_action,
-        known_agent_id)
-    from integrations.social.models import db_session
+        ASK_FAILED, NO_OWNER, NOT_HERE, OWNER_ALLOWED, OWNER_SAID_NO,
+        ask_owner, central_lacks, consent_type_for_action)
 
     log = logging.getLogger(__name__)
     consent_type = consent_type_for_action(action)
@@ -3252,29 +3250,21 @@ def _request_consent(action: str, label: str, input_text: str) -> str:
         log.error('_request_consent: %r maps to no consent type', action)
         return (f"Could not request {label.lower()} access — this computer "
                 f"records no permission for '{action}'.")
-    part = central_lacks(consent_type)
-    if part:
-        return f"Not asked: central has no {part}."
-
-    owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
-    if not owner:
+    outcome = ask_owner(consent_type, f'{label} access needed: {input_text}'.strip(),
+                        thread_local_data.get_prompt_id())
+    if outcome == NOT_HERE:
+        return f"Not asked: central has no {central_lacks(consent_type)}."
+    if outcome == NO_OWNER:
         log.warning('%s consent not asked: no owner identity '
                     '(HEVOLVE_OWNER_USER_ID is not set)', label)
         return (f"Not asked: nobody is signed in on this computer who could "
                 f"allow {label.lower()} access.")
-
-    agent = known_agent_id(thread_local_data.get_prompt_id())
-    reason = f'{label} access needed: {input_text}'.strip()
-    try:
-        with db_session(commit=True) as db:
-            if ConsentService.check_or_request(db, owner, consent_type,
-                                               agent_id=agent, reason=reason):
-                return f"{label} access is already allowed — go ahead."
-            if ConsentService.declined(db, owner, consent_type, agent_id=agent):
-                return (f"The owner of this computer said no to "
-                        f"{label.lower()} access.")
-    except Exception:
-        log.exception('_request_consent: %s ask could not be filed', label)
+    if outcome == OWNER_ALLOWED:
+        return f"{label} access is already allowed — go ahead."
+    if outcome == OWNER_SAID_NO:
+        return (f"The owner of this computer said no to "
+                f"{label.lower()} access.")
+    if outcome == ASK_FAILED:
         return (f"Could not request {label.lower()} access — the permission "
                 f"system is unavailable.")
     return (f"{label} access request sent to the owner of this computer. "

@@ -1327,6 +1327,71 @@ class ConsentService:
         return q.order_by(UserConsent.created_at.desc()).all()
 
 
+# ── Asking this computer's owner for a capability ─────────────────────────
+
+#: What ask_owner found.
+OWNER_ALLOWED = 'allowed'      # the consent is on file
+OWNER_SAID_NO = 'said_no'      # the owner said no; nothing was asked
+OWNER_ASKED = 'asked'          # the ask is on file (filed now, or sent again)
+NO_OWNER = 'no_owner'          # nobody is signed in on this computer
+NOT_THE_OWNER = 'not_owner'    # the turn is not the owner's; nobody was asked
+NOT_HERE = 'not_here'          # central has no such part (central_lacks)
+ASK_FAILED = 'failed'          # the consent store could not be read or written
+
+
+def ask_owner(consent_type: str, reason: str = '', prompt_id=None, *,
+              turn_user=None, stop_at_last_no: bool = False) -> str:
+    """Ask this computer's owner for ``consent_type``; return what came of it.
+
+    The one ask for a part of this machine (the camera, the screen), shared
+    by the Request_Camera_Access / Request_Screen_Access tools
+    (hart_intelligence_entry._request_consent) and by the camera tool when it
+    finds no frame (hartos.helper.get_user_camera_inp), so the two cannot
+    drift apart.  Whose permission: the desktop's owner
+    (HEVOLVE_OWNER_USER_ID, which Nunba exports at boot and keeps in step
+    with sign-in), never the caller.  Which agent asks: the turn's prompt id
+    (known_agent_id).  The ask itself is request_consent: one row, one card,
+    and nothing asked again once the owner answered.
+
+    ``turn_user``: the user whose turn needs the part.  When given and not
+    the owner, nobody is asked (NOT_THE_OWNER): the camera's frames are keyed
+    by the owner's own window, so no answer could serve that turn.
+
+    ``stop_at_last_no``: for an ask the agent did not make in so many words
+    (the camera tool asking on its own).  When the latest answer on file for
+    this feed is a No (feed_said_no: any agent, any surface, a "Don't allow"
+    or a revoke), nothing is filed and the outcome is OWNER_SAID_NO.  Without
+    it a No to one agent stays that agent's (declined), as the card promises.
+
+    Returns one of the outcomes above.  Never raises: a store error is logged
+    here and returned as ASK_FAILED.
+    """
+    if central_lacks(consent_type):
+        return NOT_HERE
+    owner = (os.environ.get('HEVOLVE_OWNER_USER_ID') or '').strip()
+    if not owner:
+        return NO_OWNER
+    if turn_user is not None and str(turn_user).strip() != owner:
+        return NOT_THE_OWNER
+    agent = known_agent_id(prompt_id)
+    try:
+        from .models import db_session
+        with db_session(commit=True) as db:
+            if ConsentService.check_consent(db, owner, consent_type,
+                                            agent_id=agent):
+                return OWNER_ALLOWED
+            if stop_at_last_no and ConsentService.feed_said_no(db, consent_type):
+                return OWNER_SAID_NO
+            ConsentService.request_consent(db, owner, consent_type,
+                                           agent_id=agent, reason=reason)
+            if ConsentService.declined(db, owner, consent_type, agent_id=agent):
+                return OWNER_SAID_NO
+    except Exception:
+        _logger.exception("%s ask for the owner could not be filed", consent_type)
+        return ASK_FAILED
+    return OWNER_ASKED
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Legacy ``register_consent_routes`` was REMOVED in the consent-surface
 # consolidation (orchestrator review acd11f55, 2026-04-25).  The HTTP
