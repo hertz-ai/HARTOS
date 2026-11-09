@@ -140,6 +140,14 @@ CONSENT_TYPES = frozenset({
                          # names the ONE credential ('secret:SITE_PASSWORD'),
                          # and the agent only ever gets its alias
                          # {{secret:SITE_PASSWORD}} (hartos.ai_key_vault).
+    'chat_join',         # Another account joins this account's chat with an
+                         # agent (a parent or therapist joining a child's,
+                         # owner 2026-11-06).  Granted when this account's
+                         # side approves the join card; agent_id is the
+                         # agent, scope '<joiner's user id>#<approval time>'
+                         # (one row per approval, so a join can be allowed
+                         # again after a revoke).  Revoking it ends the join
+                         # (core.persona_registry.joined_chats).
 })
 
 #: A credential ask's scope is this prefix + the credential's name, the same
@@ -1282,6 +1290,29 @@ class ConsentService:
             UserConsent.revoked_at.is_(None),
         ).order_by(UserConsent.granted_at.desc()).first()
         return record.scope if record else ''
+
+    @staticmethod
+    def granted_by(db, consent_type: str, scope: str, agent_id=None,
+                   prefix: bool = False) -> list:
+        """The user ids holding an active grant of ``consent_type`` for
+        ``scope`` (or, with ``prefix``, any scope starting with it) and
+        ``agent_id``, oldest grant first: the reverse of active_grant, for a
+        grant whose scope names who it lets in (chat_join: whose chats a
+        joiner may use)."""
+        _validate_consent_type(consent_type)
+        q = db.query(UserConsent.user_id).filter(
+            UserConsent.consent_type == consent_type,
+            UserConsent.agent_id == agent_id,
+            UserConsent.granted == True,
+            UserConsent.revoked_at.is_(None),
+        )
+        q = q.filter(UserConsent.scope.startswith(scope, autoescape=True) if prefix
+                     else UserConsent.scope == scope)
+        out = []
+        for (uid,) in q.order_by(UserConsent.granted_at.asc()).all():
+            if uid not in out:
+                out.append(uid)
+        return out
 
     @staticmethod
     def list_consents(db, user_id: str, consent_type: str = None,

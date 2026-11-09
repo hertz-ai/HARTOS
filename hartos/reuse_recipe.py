@@ -492,6 +492,7 @@ temp_users = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_temp_users')
 from core.persona_registry import (
     agents_session, agents_roles, chat_joinees,
     register_persona_for_session, _send_message_to_roles_impl,
+    joined_chats, record_join, move_person_to_flow_impl,
 )
 llm_call_track = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_llm_call_track')
 
@@ -618,18 +619,21 @@ def get_role(user_id, prompt_id):
     if not role:
         # A person may have joined other agents' chats, not this one, and the
         # creator's session may have expired: neither raises (hartos-7a).
-        creator = (chat_joinees.get(user_id) or {}).get(prompt_id)
-        if creator is not None:
+        for creator in joined_chats(user_id, prompt_id):
             for i in (agents_session.get(f"{creator}_{prompt_id}") or []):
                 if i['user_id'] == user_id:
                     role = i['role']
                     break
+            if role:
+                break
     if not role:
         role = 'user'
     return role
 
 
-_JOIN_YES = ('approve', 'approved', 'allow', 'yes')
+# An approval card answers approve / deny / later (liquid_ui_service); only
+# its yes joins.
+_JOIN_YES = ('approve',)
 
 
 def _reuse_join_card(user_id, prompt_id, name):
@@ -683,8 +687,10 @@ def _reuse_pending_join_turn(user_id, prompt_id):
         decision = str((state.get('answer') or {}).get('decision') or '').strip().lower()
         clear_pending_join(user_id, prompt_id)
         if decision in _JOIN_YES:
-            _reuse_join_chat(user_id, prompt_id, name, creator)
-            return None
+            # A join that could not be made says why; dropping that reply let
+            # the turn go on as if they had joined.
+            joined = _reuse_join_chat(user_id, prompt_id, name, creator)
+            return None if joined == 'terminate' else joined
         return f'The account holder of {creator} did not allow you to join as {name}.'
     if status == 'dismissed':
         clear_pending_join(user_id, prompt_id)
@@ -709,6 +715,15 @@ def _reuse_join_chat(user_id, prompt_id, name, contact_number):
     if not creator or (key not in agents_session and not stored_persona(creator, prompt_id, personas)):
         return (f'Ask the person with user id or contact {contact_number} '
                 f'to start this chat first')
+    # The approval outlives this process and a revoke ends it
+    # (core.persona_registry.joined_chats reads it back).  Kept first: on a
+    # node with a consent store, a join it does not hold would be invisible
+    # to every reader, so it is not made half-way (hartos-16).
+    if record_join(creator, prompt_id, user_id) is False:
+        current_app.logger.warning(f'[REUSE] {user_id}\'s join to {creator}\'s chat of agent '
+                                   f'{prompt_id} was allowed but could not be kept; not joined')
+        return (f'The account holder of {creator} allowed you to join, but the join could not '
+                f'be saved on this computer; nothing was changed. Ask to join again.')
     members = list(agents_session.get(key) or [])
     members.append({'agentInstanceID': f'com.hertzai.hevolve.chat.{prompt_id}.{user_id}',
                     'user_id': user_id, 'role': name, 'deviceID': 'something'})
@@ -2118,6 +2133,32 @@ You are a Helpful {role} Assistant. Your primary role is to assist the user effi
     ) -> str:
         return _send_message_to_roles_impl(
             user_id, prompt_id, role, message, publish_fn=publish_async)
+
+    # A parent or therapist who joined a child's chat moves the child to
+    # another of the child's flows from their own chat (owner 2026-11-04).
+    # Offered only to someone who has joined; the body re-reads the join, so
+    # a join the child's side revoked since moves no one.
+    if joined_chats(user_id, prompt_id):
+        @assistant.register_for_execution()
+        @helper.register_for_llm(
+            api_style="tool",
+            description=("Move the child whose chat you joined to another of their flows, "
+                         "when their parent or therapist asks for it. Their next session "
+                         "starts on that flow."))
+        @log_tool_execution
+        def move_person_to_flow(
+            flow_name: Annotated[str, "The name of the flow to move them to, as the agent's flows name it"],
+            person: Annotated[str, "The user id of the child, only when you joined more than one child's chat; else empty"] = '',
+        ) -> str:
+            try:
+                with open(helper_fun.safe_prompt_path(prompt_id), 'r') as f:
+                    data = json.load(f) or {}
+            except Exception as e:
+                current_app.logger.warning(f'[REUSE] move_person_to_flow: agent {prompt_id} unreadable: {e}')
+                return 'This agent\'s flows could not be read; nothing was changed.'
+            return move_person_to_flow_impl(
+                user_id, prompt_id, data.get('flows') or [], _reuse_agent_personas(prompt_id),
+                flow_name, person or None)
     database_url = get_db_url() or 'https://mailer.hertzai.com'
 
     # --- Visual/audio trigger watcher (continuous monitoring) ---
@@ -7694,6 +7735,15 @@ def _reuse_flow_evidence(user_prompt, flow):
             '\n'.join(text for _, text in sorted(steps)))
 
 
+def _reuse_flow_persona(prompt_id, flow):
+    """The persona flow number ``flow`` of this agent belongs to (its prompt
+    file's 'flows'); None when there is no such flow.  Raises when the file
+    cannot be read: both callers keep their own never-fail handling."""
+    with open(helper_fun.safe_prompt_path(prompt_id), 'r') as f:
+        flows = (json.load(f) or {}).get('flows') or []
+    return (flows[flow] or {}).get('persona') if 0 <= flow < len(flows) else None
+
+
 def _reuse_note_run_started(user_prompt):
     """The first step of a run of this session's flow is starting (cold or
     warm, _start_reuse_action): stamp the run's start, so a move made while
@@ -7704,9 +7754,7 @@ def _reuse_note_run_started(user_prompt):
         from core.flow_progress import note_run_started
         user_id, _sep, prompt_id = str(user_prompt).rpartition('_')
         flow = _reuse_action_flow(user_prompt, 1)
-        with open(helper_fun.safe_prompt_path(prompt_id), 'r') as f:
-            flows = (json.load(f) or {}).get('flows') or []
-        persona = (flows[flow] or {}).get('persona') if 0 <= flow < len(flows) else None
+        persona = _reuse_flow_persona(prompt_id, flow)
         if persona and user_id:
             note_run_started(user_id, prompt_id, persona, flow)
     except Exception as e:
@@ -7726,11 +7774,9 @@ def _reuse_note_flow_finished(user_prompt, prompt_id):
     try:
         from core.flow_progress import record_flow_finished
         flow = _reuse_action_flow(user_prompt, 1)
-        with open(helper_fun.safe_prompt_path(prompt_id), 'r') as f:
-            flows = (json.load(f) or {}).get('flows') or []
         # The persona is the flow's own: the record is judged against that
         # persona's flows whoever's turn comes next (review of f9951c0d2).
-        persona = (flows[flow] or {}).get('persona') if 0 <= flow < len(flows) else None
+        persona = _reuse_flow_persona(prompt_id, flow)
         observed, steps = _reuse_flow_evidence(user_prompt, flow)
         record_flow_finished(str(user_prompt)[:-len(suffix)], prompt_id, flow, persona,
                              request_id_list.get(user_prompt), observed, steps)
@@ -8762,6 +8808,12 @@ def _attach_named_tools_for_action(user_prompt):
                         _reel_names = ()
                     _runs = getattr(assistant, '_function_map', None) or {}
                     _protect |= {n for n in _reel_names if n in _runs}
+            # The move-the-child tool, which only someone who joined a child's
+            # chat has (create_agents_for_user).  No saved step names it, so
+            # without this it is among the first the fit defers and the
+            # parent's "move her to flash cards" never reaches it (hartos-16).
+            if 'move_person_to_flow' in (getattr(assistant, '_function_map', None) or {}):
+                _protect.add('move_person_to_flow')
             fit_schema_to_ctx(helper, protect=_protect, turn_protect=True)
             fit_schema_to_ctx(assistant, protect=_protect, turn_protect=True)
 
