@@ -1857,6 +1857,12 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
                 _resonance_profile = get_or_create_profile(str(user_id))
             except ImportError:
                 pass
+            except Exception as e:
+                # A profile that cannot be read leaves the turn untuned, never
+                # without the agent's personality; CREATE does the same
+                # (create_recipe.py, "Resonance profile loading skipped").
+                import logging
+                logging.getLogger(__name__).debug(f"Resonance profile loading skipped: {e}")
             # REUSE = execution: the recipe IS the plan.  execution_mode=True
             # suppresses the persona's "ask 1-2 clarifying questions before
             # executing" behaviour, and we deliberately do NOT append
@@ -1875,6 +1881,14 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
         pass
 
     response_format = response_format_template()
+    # Who the agent is comes from the agent, never from the person this turn
+    # serves: "You are a Helpful {role} Assistant" made every REUSE turn tell
+    # the agent it IS that person ("a Helpful the child Assistant") once
+    # personas are people (owner 11-07: a user persona is never an agent name
+    # and the reverse).  {role} stays where it names the person served (rule
+    # 2 below) and in the action filter above.  No name here: the personality
+    # block already says "You are <name>, ..." (hartos-16).
+    from core.agent_personality import AGENT_ROLE
     # DATE-CONTEXT: the local model's training cutoff makes it assume an earlier
     # year — it refused "2026" research as "the future" and injected "2024" into
     # its own search queries (measured live 2026-09-05, agent 18088688973).
@@ -1887,7 +1901,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
     )
     agent_prompt = f'''{_date_ctx}
 
-You are a Helpful {role} Assistant. Your primary role is to assist the user efficiently while keeping all internal actions and processes hidden from the end user. Follow the guidelines below to perform tasks correctly:
+You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficiently while keeping all internal actions and processes hidden from the end user. Follow the guidelines below to perform tasks correctly:
 {get_cultural_prompt()}
 {_personality_block}
 
