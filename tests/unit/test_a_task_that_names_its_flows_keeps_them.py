@@ -116,3 +116,30 @@ def test_the_plan_author_keeps_each_named_flow():
     assert 'RULES for the actions[] of EACH flow' in words
     assert 'RULES for flows[0].actions[]' not in words
     assert 'apply the feedback to the actions[] of the flow it names' in words
+
+
+def test_the_shape_example_holds_up_no_name_to_copy():
+    """Live 2026-11-07 (agent 1794031134533, build67): the plan author was
+    told each flow's persona is the PERSON it talks with, yet the shape
+    example right above showed personas [{"name": "Executor"}] and one flow
+    "main" with persona "Executor", and the local 4B copied both: five flows
+    for a task naming seven, "main" holding 27 steps, Executor on every
+    flow, no sub_goal anywhere.  The example now names nothing a model could
+    copy as a person or a flow (owner 11-07: a user persona is never an
+    agent name), and asks for the sub_goal before the steps."""
+    from hartos import gather_agentdetails as ga
+    assistant, _proxy = ga.create_agents_for_user('u-shape', autonomous=True,
+                                                  initial_description=NOTE)
+    words = assistant.system_message
+    line = words.split('Response shape (EXACT keys, JSON only):', 1)[1].strip().splitlines()[0]
+    example = json.loads(line)
+
+    def placeholder(value):
+        return isinstance(value, str) and value.startswith('<') and value.endswith('>')
+
+    assert example['personas'] and all(placeholder(p['name']) for p in example['personas']), line
+    for flow in example['flows']:
+        assert placeholder(flow['flow_name']) and placeholder(flow['persona']), line
+        assert 'one turn' in flow['sub_goal'], line
+        keys = list(flow)
+        assert keys.index('sub_goal') < keys.index('actions'), line
