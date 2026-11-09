@@ -1120,10 +1120,14 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
     # Generate or load agent personality
     _agent_personality = None
     try:
-        from core.agent_personality import load_personality, generate_personality, save_personality
+        from core.agent_personality import (
+            AGENT_ROLE, load_personality, generate_personality, save_personality)
         _agent_personality = load_personality(str(prompt_id))
         if not _agent_personality:
-            _role = config.get('personas', [{}])[0].get('name', 'Assistant') if config.get('personas') else list_of_persona
+            # The agent's own role, never a persona's: a persona is the PERSON
+            # a flow talks with (gather_agentdetails), so personas[0] gave
+            # "You are <name>, a the child" (review of 494d5a4e1, must-fix 1).
+            _role = AGENT_ROLE
             _goal = config.get('goal', task if isinstance(task, str) else '')
             _agent_name = config.get('agent_name', '')
             _agent_personality = generate_personality(str(_role), str(_goal), _agent_name)
