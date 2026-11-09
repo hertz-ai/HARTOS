@@ -394,12 +394,18 @@ def settle(user_id, prompt_id, flows, persona=None, ask: Optional[Callable] = No
         _keep_verdict(user_id, prompt_id, index, met, evidence, record['run'])
         logger.info("flow progress %s_%s: flow %s (%s) met=%s: %s", user_id, prompt_id, index,
                     _flow_name(flows, index), met, evidence[:120])
-        started = record.get('started') or record.get('at') or 0
+        run_started = record.get('started') or record.get('at') or 0
+        run_finished = record.get('at') or run_started
         place = _place(read(user_id, prompt_id), ran_as)
-        # Only a person's move counts: a verdict's own earlier move
-        # ('goal_met') must never block the next verdict, or a child on a
-        # warm session would stop progressing (hartos-16, 11-07).
-        moved_since = place.get('by') != 'goal_met' and (place.get('at') or 0) > started
+        # A person's move (a therapist, a parent) made after this run STARTED
+        # is never undone by a verdict on it.  A verdict's own move
+        # ('goal_met') blocks only when made after this run FINISHED: a newer
+        # run judged first has moved them on, and this older one must not
+        # move them back (review of 2eb963781, R3).  One made while this run
+        # was going on never blocks, or a warm session would stop
+        # progressing (hartos-16, 11-07).
+        since = run_finished if place.get('by') == 'goal_met' else run_started
+        moved_since = (place.get('at') or 0) > since
         if met and moved_since:
             # Someone (a therapist, a parent) moved them after this run
             # STARTED: a verdict on that run never undoes the move, even

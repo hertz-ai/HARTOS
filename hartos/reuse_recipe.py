@@ -685,12 +685,24 @@ def _reuse_pending_join_turn(user_id, prompt_id):
     status = state.get('status')
     if status == 'answered':
         decision = str((state.get('answer') or {}).get('decision') or '').strip().lower()
-        clear_pending_join(user_id, prompt_id)
         if decision in _JOIN_YES:
-            # A join that could not be made says why; dropping that reply let
-            # the turn go on as if they had joined.
+            # A join that could not be made yet (the chat not started, or
+            # not saved) says why and keeps the approval, so the next message
+            # tries again without asking the child's side twice (review of
+            # 2eb963781, R2).
             joined = _reuse_join_chat(user_id, prompt_id, name, creator)
-            return None if joined == 'terminate' else joined
+            if joined != 'terminate':
+                return joined
+            clear_pending_join(user_id, prompt_id)
+            # The turn that asked to join went to the persona group, and the
+            # 2 h journey cache still says so: without this the joined
+            # person's turns go back to that group, whose model can ask the
+            # child's side again (R1).  Decided here, where the join lands.
+            own = f'{user_id}_{prompt_id}'
+            user_journey[own] = 'UseBot'
+            role_agents.pop(own, None)
+            return None
+        clear_pending_join(user_id, prompt_id)
         return f'The account holder of {creator} did not allow you to join as {name}.'
     if status == 'dismissed':
         clear_pending_join(user_id, prompt_id)
@@ -723,7 +735,7 @@ def _reuse_join_chat(user_id, prompt_id, name, contact_number):
         current_app.logger.warning(f'[REUSE] {user_id}\'s join to {creator}\'s chat of agent '
                                    f'{prompt_id} was allowed but could not be kept; not joined')
         return (f'The account holder of {creator} allowed you to join, but the join could not '
-                f'be saved on this computer; nothing was changed. Ask to join again.')
+                f'be saved on this computer; nothing was changed. Message me again to try once more.')
     members = list(agents_session.get(key) or [])
     members.append({'agentInstanceID': f'com.hertzai.hevolve.chat.{prompt_id}.{user_id}',
                     'user_id': user_id, 'role': name, 'deviceID': 'something'})
