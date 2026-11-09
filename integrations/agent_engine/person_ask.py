@@ -277,6 +277,19 @@ def _withdraw_card(ask_id: str) -> None:
                        "shell's store", ask_id, exc_info=True)
 
 
+def _agent_name(agent_id) -> Optional[str]:
+    """The name the person knows the asking agent by, or None: the one lookup
+    consent cards use (consent_service.agent_display_name).  Never raises."""
+    try:
+        from integrations.social.consent_service import agent_display_name
+        from integrations.social.models import db_session
+        with db_session(commit=False) as db:
+            return agent_display_name(db, agent_id)
+    except Exception:
+        logger.debug("person ask: no name for agent %s", agent_id, exc_info=True)
+        return None
+
+
 def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
         body: str = '',
         background: bool = False) -> dict:
@@ -289,7 +302,9 @@ def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
     Returns ``{'ok', 'ask_id', 'refused', 'card'}`` (plus ``'reused': True``
     when the same question is already open).  ``refused`` names why nothing
     was sent: 'no_person', 'not_an_object', 'secrets_go_to_the_vault',
-    'unknown_purpose', 'no_agent', 'too_many_open_asks', 'not_shown' (the
+    'unknown_purpose', 'no_agent', 'say_why_in_description' (no reason given:
+    neither ``body`` nor the component's description), 'too_many_open_asks',
+    'not_shown' (the
     Liquid UI gates refused the card: switched off, the hive halted, unsafe
     content, an unknown type, too many pushes; the log says which) or
     'not_filed' (its row could not be written).
@@ -304,9 +319,22 @@ def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
         return _refused(refused)
     ctype = component['type']
     agent_id = str(agent_id if agent_id is not None else (prompt_id or ''))
-    title = (title or component.get('title') or 'Your agent needs your answer').strip()
+    # The card says who asks and why (owner 2026-11-03: "Your agent asks for
+    # files ... not why, for what"): the reason is the agent's own words, so an
+    # ask without one is not sent; with no title of its own, the title names
+    # the agent as the person knows it.  The card, the bell row and the push
+    # carry the same title and reason.
     body = (body or component.get('description') or '').strip()
+    if not body:
+        logger.info("person ask refused (say_why_in_description) for user %s by "
+                    "agent %s", user_id, agent_id)
+        return _refused('say_why_in_description')
+    title = (title or component.get('title') or '').strip()
+    if not title:
+        name = _agent_name(agent_id)
+        title = (f'{name} asks you' if name else 'Your agent needs your answer')
     card = dict(component)
+    card['title'], card['description'] = title, body
     card.pop('msg_id', None)
     if ctype == 'file_request':
         _file_card(card, prompt_id)
@@ -672,21 +700,24 @@ def ask_person_tool(user_id, prompt_id, agent_id=None, request_id=None):
     is_user_turn) asks as background work, under its own open-ask limit.
 
     A file_request's purpose is one the store keeps (INBOUND_PURPOSES): the
-    description names them, and a refusal of any other names them again, so
-    the agent's next ask can name one (live 2026-11-01: agent 342 made seven
-    file_requests under five purposes it made up, 'reel_clips', 'make_reel'
-    and others, and every one was refused; the component example below
-    already showed 'reel_source', and no list of the purposes was given).
-    Nothing is guessed for it.  Whether the list changes what the model
-    picks is not yet measured live."""
+    description names each with what it is for (UploadPurpose.use), and a
+    refusal of any other names them again, so the agent's next ask can name
+    one (live 2026-11-01: agent 342 made seven file_requests under five
+    purposes it made up, 'reel_clips', 'make_reel' and others, and every one
+    was refused).  Nothing is guessed for it.
+
+    The hint shows the shape of an ask, with its reason, and holds up no
+    agent's purpose: it showed one example, Reel Studio's video request, and
+    the speech-therapy agent sent it word for word, twice (live 2026-11-07,
+    agent 1794031134533, "choose video" cards with no reason on them).
+    Whether this hint changes what the model sends is measured live."""
     from core.agent_tool_menu import ASK_PERSON_TOOL
     from core.chat_client import is_user_turn
-    from core.user_file_store import INBOUND_PURPOSES, REEL_SOURCE
+    from core.user_file_store import INBOUND_PURPOSES, PURPOSES
     purposes = list(INBOUND_PURPOSES)
 
     def ask_person(
-            component: Annotated[str, 'Liquid UI component JSON, e.g. {"type":"file_request",'
-                                      '"purpose":"%s","accept":"video"}' % REEL_SOURCE],
+            component: Annotated[str, _ASK_SHAPE],
             wait_seconds: Annotated[int, f"seconds to wait now, max {MAX_WAIT_S}"] = DEFAULT_WAIT_S,
             ask_id: Annotated[str, "an earlier ask's id: read its answer"] = '') -> str:
         rid = request_id() if callable(request_id) else request_id
@@ -717,6 +748,8 @@ def ask_person_tool(user_id, prompt_id, agent_id=None, request_id=None):
             if out['refused'] == 'unknown_purpose':
                 reply['purposes'] = purposes
                 reply['note'] = "A file_request's purpose is one of purposes."
+            elif out['refused'] == 'say_why_in_description':
+                reply['note'] = _SAY_WHY
             return json.dumps(reply)
         try:
             wait_s = min(float(wait_seconds or 0), float(MAX_WAIT_S))
@@ -733,7 +766,22 @@ def ask_person_tool(user_id, prompt_id, agent_id=None, request_id=None):
                      '%s(ask_id=...).' % ASK_PERSON_TOOL)})
 
     return (ASK_PERSON_TOOL,
-            ('Ask your person on any of their devices and get their answer, e.g. a '
-             "file_request for clips. A file_request's purpose is one of: "
-             + ', '.join(purposes) + '. Never for a password or key.'),
+            ('Ask your person on any of their devices and get their answer. To ask '
+             'for files, send a file_request whose purpose is the one that fits: '
+             + '; '.join(f'{p} ({PURPOSES[p].use})' if PURPOSES[p].use else p
+                         for p in purposes)
+             + '. Never for a password or key.'),
             ask_person)
+
+
+#: How an ask is shaped, as the tool's component parameter tells the model: a
+#: reason always, and no agent's purpose held up as the example.
+_ASK_SHAPE = ('Liquid UI component JSON. Always put why you ask in "description", '
+              'in your own words: the person reads it on the card. A question: '
+              '{"type": "form", "description": "<why you ask>", "fields": '
+              '[{"name": "answer", "label": "<your question>", "type": "text"}]}. '
+              'Files: type "file_request", with the "description" and the "purpose" '
+              'that fits, from the tool description.')
+#: The refusal note of an ask with no reason.
+_SAY_WHY = ('Not sent: say why you ask in the component\'s "description", in your '
+            'own words. The person reads it on the card.')

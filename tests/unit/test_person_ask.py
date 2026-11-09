@@ -843,7 +843,9 @@ def test_a_wrong_purpose_is_told_the_purposes_there_are(legs):
     assert reply['refused'] == 'unknown_purpose'
     assert reply['purposes'] == list(INBOUND_PURPOSES)
     assert legs['cards'] == []
-    again = json.loads(func(json.dumps(dict(wrong, purpose='reel_source')), 0))
+    # Its reason too: an ask with none is not sent (test_an_ask_says_who_and_why).
+    again = json.loads(func(json.dumps(dict(wrong, purpose='reel_source',
+                                            description='Send the clips for your reel.')), 0))
     assert again['status'] == 'waiting_for_person', again
     assert legs['cards'][-1][1]['purpose'] == 'reel_source'
 
