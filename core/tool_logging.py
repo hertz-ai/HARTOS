@@ -200,18 +200,56 @@ def _mask(text: str) -> str:
     return vault.mask_secrets(text) if vault is not None else text
 
 
+def note_unhinted_refusal(tool_name: str, result) -> bool:
+    """Count a failed reply that tells the model nothing it can fix.
+
+    The enforcement half of core.tool_refusal (owner 2026-11-09: "enforce a
+    framework for tool call so that validation errors are semantically
+    understood by LLM so that retry can correct them").  Every registered
+    tool returns through log_tool_execution, so this is the one place that
+    sees every reply.  A reply that failed (core.constants.tool_reply_failed)
+    but carries no hint (core.tool_refusal.refusal_has_hint: not built by
+    refuse(), or refused JSON without a note) is logged once per call as
+    ``[TOOL-REFUSAL-NO-HINT] <tool>``, with the session, so each lane can
+    count and move its own.  Returns whether it logged.  Never raises: it
+    sits on every tool's return path."""
+    try:
+        from core.constants import tool_reply_failed
+        from core.tool_refusal import refusal_has_hint
+        body = '' if result is None else str(result)
+        if not tool_reply_failed(body) or refusal_has_hint(body):
+            return False
+        tool_logger.warning(
+            f"[TOOL-REFUSAL-NO-HINT] {tool_name}: {_mask(body[:160])!r}"
+            f"{_session_suffix()}")
+        return True
+    except Exception:
+        _emit_logger.debug("[tool_logging] refusal hint check failed",
+                           exc_info=True)
+        return False
+
+
 def _error_envelope(func_name: str, exc: BaseException) -> str:
     """Structured JSON error returned to the LLM on tool failure.
 
     Preserves the legacy contract from create_recipe.py:344-359 so the
     40+ existing tools using `@log_tool_execution` see identical output.
     """
+    # The suggestion is read by the MODEL, which cannot read logs.  "Check logs
+    # for detailed traceback information" told it nothing it could act on
+    # (owner 2026-11-09: a refusal must say what was wrong so a retry can
+    # correct it), so it says what the failure means for the next call.
     payload = {
         "status": "error",
         "tool_function": func_name,
         "error_type": type(exc).__name__,
         "error_message": str(exc),
-        "suggestion": "Check logs for detailed traceback information",
+        "suggestion": (
+            f"{func_name} failed while it ran, after its arguments were "
+            f"accepted. If error_message names one of your arguments or its "
+            f"value, call {func_name} again with that fixed. Otherwise the "
+            f"same call will fail the same way: do not repeat it; tell the "
+            f"person what could not be done."),
     }
     # The prefix lives in core.constants so tool_reply_failed, which CREATE's
     # trace banker and REUSE's fabrication gate both read, cannot drift from it.
@@ -340,6 +378,7 @@ def log_tool_execution(func=None, *, name=None, plain_errors=False):
                     f"Result: {result[:100]}..."
                     if len(result) > 100 else f"Result: {result}"
                 )
+                note_unhinted_refusal(tool_name, result)
                 return result
             except Exception as e:
                 return _on_error(e, _t0)
@@ -385,6 +424,7 @@ def log_tool_execution(func=None, *, name=None, plain_errors=False):
                 f"Result: {result[:100]}..."
                 if len(result) > 100 else f"Result: {result}"
             )
+            note_unhinted_refusal(tool_name, result)
             return result
         except Exception as e:
             return _on_error(e, _t0)

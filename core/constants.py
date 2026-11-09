@@ -1447,6 +1447,18 @@ def tool_reply_failed(content) -> bool:
     body = "" if content is None else str(content)
     if body.lstrip().startswith(TOOL_ERROR_REPLY_PREFIXES):
         return True
+    # A tool that answers JSON refuses with a top-level {"status": "refused"}
+    # (core.tool_refusal.refusal_fields; person_ask's refusals).  Measured
+    # 2026-11-09: 66 refused ask_person calls in two days opened with '{', so
+    # neither rule above saw them, and the banker and the REUSE gate could
+    # count a refused call as the step's work (hevolve-66e6's finding).
+    # Top level and exact only: 'refused' means the CALL could not be done.
+    # A person's "no" is an answer and keeps its own status word (person_ask
+    # answers 'answered'), and a 'refused' entry inside a results list
+    # (aider_native_backend) is one item's outcome, not the call's.
+    from core.tool_refusal import is_json_refusal
+    if is_json_refusal(body):
+        return True
     return any(failure in body for failure in TOOL_FAILURE_RESULTS)
 
 

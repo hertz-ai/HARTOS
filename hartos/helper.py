@@ -4876,6 +4876,38 @@ def _exact_int_arguments(func, arguments):
     return out
 
 
+def executor_refusal(func_name, function_map, raised=None) -> str:
+    """The executor's reply when a model's call cannot run, through
+    core.tool_refusal.refuse (owner 2026-11-09: a refusal says what was
+    wrong and what to do, so a retry can correct it).
+
+    * ``raised`` None: the call named no tool this agent registered.  It was
+      "Error: Function X not found.", which told the model nothing about what
+      it could call instead (1 such call in the 482 measured 11-09; daemon
+      agent 52612946585's step 1 names huggingface_search_models, which
+      exists nowhere).  The reply lists this agent's own tool names (already
+      in the schemas it was sent), so the next call can use one; no guess is
+      made at which one.
+    * ``raised`` an exception: a tool not wrapped by core.tool_logging
+      raised while it ran.  It was "Error: <exception text>", with no word on
+      whether calling again could help.
+
+    Both open with "Error:", so core.constants.tool_reply_failed still reads
+    them as failed calls.  Used by the sync and the async executor alike."""
+    from core.tool_refusal import refuse
+    name = str(func_name or '').strip() or 'unnamed'
+    if raised is not None:
+        return refuse(name, f"it raised {type(raised).__name__}: {raised}",
+                      "If that names one of your arguments or its value, fix it; "
+                      "otherwise do not repeat the call and tell the person "
+                      "what could not be done")
+    names = sorted(str(n) for n in (function_map or {}))
+    shown = ', '.join(names[:40]) + (', ...' if len(names) > 40 else '')
+    fix = (f"Use one of this agent's tools, by its exact name: {shown}" if names
+           else "This agent has no tools: answer in writing instead")
+    return refuse(name, f"no tool named {name} is registered with this agent", fix)
+
+
 def tool_argument_error(func, func_name, arguments, repaired, as_written=None):
     """Why ``func`` cannot be called with ``arguments``, or None.
 
@@ -5229,10 +5261,10 @@ def force_apply_autogen_json_fix():
                     is_exec_success = True
                     print(f" EXECUTED: Successfully executed {func_name}")
                 except Exception as e:
-                    content = f"Error: {e}"
+                    content = executor_refusal(func_name, self._function_map, raised=e)
                     print(f" EXECUTION FAILED: {func_name}: {e}")
         else:
-            content = f"Error: Function {func_name} not found."
+            content = executor_refusal(func_name, self._function_map)
 
         if verbose:
             iostream.print(f"\nInput arguments: {arguments}\nOutput:\n{content}", flush=True)
@@ -5286,10 +5318,10 @@ def force_apply_autogen_json_fix():
                     is_exec_success = True
                     print(f" EXECUTED ASYNC: Successfully executed {func_name}")
                 except Exception as e:
-                    content = f"Error: {e}"
+                    content = executor_refusal(func_name, self._function_map, raised=e)
                     print(f" EXECUTION ASYNC FAILED: {func_name}: {e}")
         else:
-            content = f"Error: Function {func_name} not found."
+            content = executor_refusal(func_name, self._function_map)
 
         return is_exec_success, {
             "name": func_name,
