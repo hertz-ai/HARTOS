@@ -52,6 +52,13 @@ logger = logging.getLogger(__name__)
 _MAX_CHARS_PER_PAGE = 4000
 _MAX_PAGES_PER_CHAPTER = 12
 
+#: How many of the user's book names a refusal lists back, so the model
+#: can correct its book_name. Beyond this the refusal says how many more
+#: there are and points at list_books, because naming a prefix as though
+#: it were the whole library makes the agent tell the person their book
+#: is not there when it is only number _NAME_HINT_CAP + 1.
+_NAME_HINT_CAP = 20
+
 
 class _LibraryUnavailable(Exception):
     """The book library could not be read -- a storage error, as opposed to
@@ -209,12 +216,12 @@ def build_book_tools(ctx) -> List[Tuple[str, str, Any]]:
                 'this user has no parsed books yet, so no book_name can resolve',
                 'Ask the person to upload a PDF, then call parse_book_pdf',
                 retry=tool_refusal.RETRY_LATER)
-        shown = '; '.join(names[:20])
-        if len(names) > 20:
-            # Saying 20 names as if they were all of them makes the agent tell
-            # the person their book is not there when it is just number 21.
+        # Saying N names as if they were all of them makes the agent tell
+        # the person their book is not there when it is just number N+1.
+        shown = '; '.join(names[:_NAME_HINT_CAP])
+        if len(names) > _NAME_HINT_CAP:
             shown += (' (and %d more -- call list_books for the full list)'
-                      % (len(names) - 20,))
+                      % (len(names) - _NAME_HINT_CAP,))
         return tool_refusal.refuse(
             tool,
             "no parsed book matches book_name=%r" % (str(book_name or '').strip(),),
@@ -227,6 +234,16 @@ def build_book_tools(ctx) -> List[Tuple[str, str, Any]]:
     # ── 1. list_books ────────────────────────────────────────────────
     def list_books() -> str:
         """Which books this user has parsed and can be taught from."""
+        if user_id in (None, ''):
+            # Same confusion _no_book carried until 2026-11-10: _books()
+            # returns [] for a turn with no user AND for a user with no
+            # books, and only one of those is fixed by uploading a PDF.
+            return tool_refusal.refuse(
+                'list_books',
+                'this turn carries no user id, so there is no library to read',
+                'Tell the person their session is not identified; uploading '
+                'a book cannot fix it',
+                retry=tool_refusal.RETRY_NEVER)
         books = _books()
         if not books:
             return ('No books parsed yet. Ask the user to upload a PDF, then '

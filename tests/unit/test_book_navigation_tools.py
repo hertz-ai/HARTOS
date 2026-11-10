@@ -107,13 +107,24 @@ class BookToolSurface(unittest.TestCase):
             self.assertIn(name, MAIN_LEG_CORE_TOOLS, f'{name} would never reach the assistant')
 
     def test_a_turn_with_no_user_sees_no_books(self):
-        """list_books answers EVERY user's books for an empty id."""
+        """The property this has always guarded, unchanged: an empty id must
+        NEVER reach the backend, or list_books answers EVERY user's books.
+        The assert_not_called below is that pin and is untouched.
+
+        What changed 2026-11-10 is only the words. This used to assert "No
+        books parsed yet", which told a turn with no user to go and ask for
+        a PDF upload -- the wrong problem, since there is nobody to upload
+        it for. That is this module's THIRD instance of the same conflation
+        (see the header: a backend outage was once reported as "no books"
+        too), so the wording is now a refusal naming the real cause.
+        """
         list_books, get_layouts = _library()
         with patch.object(bp, 'list_books', list_books), \
              patch.object(bp, 'get_layouts', get_layouts):
             out = _tools(user_id='')['list_books']()
         list_books.assert_not_called()
-        self.assertIn('No books parsed yet', out)
+        self.assertIn('no user id', out)
+        self.assertNotIn('No books parsed yet', out)
 
     def test_the_library_is_read_for_the_turns_user(self):
         list_books, get_layouts = _library()
@@ -509,6 +520,30 @@ class ANamedBookIsNeverSwapped(unittest.TestCase):
                 'The Art of Computer Programming')
         self.assertTrue(out.startswith('Error:'), out)
         self.assertEqual(list_books.call_count, 1)
+
+
+    def test_list_books_itself_does_not_tell_a_no_user_turn_to_upload(self):
+        """The sibling of the _no_book fix: list_books had the same
+        confusion, because _books() returns [] for a turn with no user AND
+        for a user with no books, and only one of those is fixed by
+        uploading a PDF."""
+        list_books, get_layouts = _library()
+        with patch.object(bp, 'list_books', list_books), \
+             patch.object(bp, 'get_layouts', get_layouts):
+            tools = dict((n, f)
+                         for n, _d, f in build_book_tools({'user_id': None}))
+            out = tools['list_books']()
+        self.assertTrue(out.startswith('Error:'), out)
+        self.assertIn('no user id', out)
+        self.assertNotIn('upload a PDF', out)
+        self.assertEqual(list_books.call_count, 0)
+
+    def test_a_user_with_no_books_is_still_told_to_upload(self):
+        """The other half: this one IS fixed by uploading, so the wording
+        must not have moved with the fix above."""
+        out = _call('list_books', _books=[])
+        self.assertIn('upload a PDF', out)
+        self.assertIn('parse_book_pdf', out)
 
 
 if __name__ == '__main__':
