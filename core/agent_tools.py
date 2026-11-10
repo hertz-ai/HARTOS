@@ -631,42 +631,49 @@ def _placeholder_key_refusal(tool, key, placeholder) -> str:
                   "(for example, a user id comes from get_user_id)")
 
 
-def key_not_found_reply(view, key) -> str:
+def key_not_found_reply(own, key) -> str:
     """get_data_by_key's answer when nothing is saved at ``key``.
 
     It opens with the sentence agents' saved steps already quote ("'Key not
     found' means a new learner"), so those steps read it as before, and adds
-    what IS saved where the key's path stopped, so the next call can use a
-    real key instead of guessing another (owner 2026-11-09: every refusal
-    says what was wrong; measured that day, 22 'Key not found' replies in
-    two days and no hint of which keys exist).  It is a real answer, not a
-    failed call: a key nobody saved yet is how a first visit looks.
+    what THIS PERSON has saved where the key's path stopped, so the next call
+    can use a real key instead of guessing another (owner 2026-11-09: every
+    refusal says what was wrong; measured that day, 22 'Key not found'
+    replies in two days and no hint of which keys exist).  It is a real
+    answer, not a failed call: a key nobody saved yet is how a first visit
+    looks.
 
-    ``view`` is the person's memory view (memory_view), so only key names
-    this person can already read through get_saved_metadata are named.
+    ``own`` is the person's OWN store (person_store_id), never the agent's
+    shared store.  The shared store holds templates and, on older agents,
+    records saved before the per-person ruling, other people's among them:
+    measured on the owner's desktop 2026-11-09 (review of 2ddf102da), agent
+    54's shared 'teach' is the creator's own progress and agent
+    96985165407's shared 'tutor' holds another person's id.  The first cut
+    named keys from the whole view and told the model to read them, steering
+    a new learner's turn to someone else's record.  It also said "read that
+    key" when no key was named; now that is said only after a list.
     """
-    node, walked = view, []
+    node, walked = own if isinstance(own, dict) else {}, []
     for part in str(key or '').split('.'):
         if isinstance(node, dict) and part in node:
             node, walked = node[part], walked + [part]
         else:
             break
     where = '.'.join(walked)
+    names = sorted(str(k) for k in node) if isinstance(node, dict) else []
     if walked and not isinstance(node, dict):
-        known = f" {where} holds a value, not keys under it: read {where} itself."
+        known = (f" This person's saved {where} is a single value, with no keys "
+                 f"under it.")
+    elif not names:
+        known = (f" This person has nothing saved under {where}." if where
+                 else " This person has nothing saved in this memory yet.")
     else:
-        names = sorted(str(k) for k in node) if isinstance(node, dict) else []
         shown = ', '.join(names[:20]) + (', ...' if len(names) > 20 else '')
-        if not names:
-            known = (f" Nothing is saved under {where}." if where
-                     else " Nothing is saved in this memory yet.")
-        elif where:
-            known = f" The keys saved under {where} are: {shown}."
-        else:
-            known = f" The saved top-level keys are: {shown}."
-    return (f"{KEY_NOT_FOUND} Nothing is saved at {key}.{known} If you meant "
-            f"one of those, read that key; if nothing was saved yet, this is a "
-            f"first visit: carry on without it.")
+        known = ((f" This person's keys under {where} are: {shown}." if where
+                  else f" This person's saved top-level keys are: {shown}.")
+                 + " If you meant one of those, read that key.")
+    return (f"{KEY_NOT_FOUND} Nothing is saved at {key}.{known} If nothing was "
+            f"saved yet, this is a first visit: carry on without it.")
 
 
 #: The opening sentence of get_data_by_key's not-found answer, quoted by
@@ -1625,7 +1632,7 @@ def build_core_tool_closures(ctx):
             value = _read_saved(key)
             if value == _KEY_NOT_FOUND:
                 return key_not_found_reply(
-                    memory_view(agent_data, prompt_id, user_prompt), key)
+                    agent_data.get(person_store_id(user_prompt)) or {}, key)
         try:
             start = max(0, int(offset or 0))
         except (TypeError, ValueError):

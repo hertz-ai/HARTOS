@@ -39,9 +39,10 @@ import core.tool_logging as tl  # noqa: E402
 from core.constants import (  # noqa: E402
     TOOL_EXECUTION_FAILED_PREFIX, tool_reply_failed)
 from core.tool_logging import log_tool_execution  # noqa: E402
+import core.tool_refusal as tool_refusal  # noqa: E402
 from core.tool_refusal import (  # noqa: E402
-    NOTE_KEY, RETRY_AFTER_FIX, RETRY_LATER, RETRY_NEVER, is_json_refusal,
-    refusal_fields, refusal_has_hint, refuse)
+    NOTE_KEY, RETRY_AFTER_FIX, RETRY_LATER, RETRY_NEVER, RETRY_OTHER_TOOL,
+    is_json_refusal, refusal_fields, refusal_has_hint, refuse)
 from tests.unit.test_trace_action_banking import banked  # noqa: E402,F401
 
 NO_HINT = '[TOOL-REFUSAL-NO-HINT]'
@@ -98,6 +99,7 @@ def test_a_refusal_names_the_problem_the_fix_and_the_retry():
     (RETRY_AFTER_FIX, 'again only with that changed'),
     (RETRY_LATER, 'do not call ask_person again now'),
     (RETRY_NEVER, 'tell the person what could not be done'),
+    (RETRY_OTHER_TOOL, 'There is no ask_person to call again'),
 ])
 def test_each_retry_mode_says_whether_calling_again_can_help(retry, words):
     reply = refuse('ask_person', 'three questions are already waiting',
@@ -154,6 +156,27 @@ def test_a_json_reply_with_status_refused_is_a_failed_call():
 ])
 def test_a_reply_that_only_mentions_a_refusal_is_not_a_failed_call(reply):
     assert not tool_reply_failed(reply), reply
+
+
+def test_a_reply_that_cannot_be_a_refusal_is_never_parsed(monkeypatch):
+    """Both checks run on every wrapped tool's reply; the review of
+    2ddf102da measured a 1.2 MB JSON reply going from 0.38 ms to 33 ms when
+    each one was parsed.  A reply without the word they look for is
+    answered without a parse; one with it is still parsed and read."""
+    parsed = []
+    real = tool_refusal._json_object
+
+    def counting(body):
+        parsed.append(len(body))
+        return real(body)
+
+    monkeypatch.setattr(tool_refusal, '_json_object', counting)
+    big = json.dumps({'status': 'ok', 'rows': ['x' * 64] * 20000})
+    assert not is_json_refusal(big)
+    assert not refusal_has_hint(big)
+    assert parsed == [], parsed
+    assert is_json_refusal(ASK_REFUSED)
+    assert parsed, 'a reply naming "refused" must still be read'
 
 
 def test_a_refused_ask_is_not_banked_as_a_recipe_step(banked):
@@ -265,7 +288,8 @@ def test_a_tool_that_raised_tells_the_model_what_to_do(tool_log):
 # core/agent_tools' own refusals, called through the real tool closures.
 # ---------------------------------------------------------------------------
 from tests.unit.test_a_memory_key_with_a_placeholder_is_refused import (  # noqa: E402
-    LEARNER, PROGRESS, _store, _tools, store_dir)  # noqa: F401
+    AGENT, LEARNER, PROGRESS, _store, _tools, store_dir)  # noqa: F401
+from core import cache_loaders  # noqa: E402
 
 # Agents' saved steps quote this sentence ("'Key not found' means a new
 # learner"), so the answer keeps it first.
@@ -277,7 +301,8 @@ def test_a_read_of_an_unsaved_key_names_the_keys_that_are_saved(store_dir):
     tools['save_data_in_memory'](f'teach.{LEARNER}', PROGRESS)
     reply = tools['get_data_by_key']('teach.10203')
     assert reply.startswith(KEY_NOT_FOUND), reply
-    assert f'The keys saved under teach are: {LEARNER}.' in reply, reply
+    assert f"This person's keys under teach are: {LEARNER}." in reply, reply
+    assert 'If you meant one of those, read that key.' in reply, reply
     # A key nobody saved yet is how a first visit looks: an answer, not a
     # failed call, so a step that reads it is not re-steered.
     assert not tool_reply_failed(reply), reply
@@ -286,17 +311,58 @@ def test_a_read_of_an_unsaved_key_names_the_keys_that_are_saved(store_dir):
 def test_a_first_visit_read_says_nothing_is_saved_yet(store_dir):
     reply = _tools(_store())['get_data_by_key']('teach')
     assert reply.startswith(KEY_NOT_FOUND), reply
-    assert 'Nothing is saved in this memory yet.' in reply, reply
+    assert 'This person has nothing saved in this memory yet.' in reply, reply
     assert 'first visit' in reply, reply
+    # No key was named, so none is offered to read.
+    assert 'read that key' not in reply, reply
     assert not tool_reply_failed(reply), reply
 
 
-def test_a_read_through_a_single_value_says_to_read_the_value(store_dir):
+def test_a_read_through_a_single_value_says_it_is_a_single_value(store_dir):
     tools = _tools(_store())
     tools['save_data_in_memory']('name', 'Ada')
     reply = tools['get_data_by_key']('name.first')
     assert reply.startswith(KEY_NOT_FOUND), reply
-    assert 'name holds a value, not keys under it: read name itself.' in reply
+    assert ("This person's saved name is a single value, with no keys under "
+            "it.") in reply, reply
+    assert 'read that key' not in reply, reply
+
+
+OTHER = '96985'
+
+
+@pytest.mark.parametrize('shared', [
+    # Another person's record kept in the agent's shared store before the
+    # per-person ruling (agent 96985165407's shared 'tutor', 11-09).
+    {'teach': {OTHER: PROGRESS}},
+    # The creator's own progress saved straight under 'teach' (agent 54's
+    # shared 'teach', 11-09): a single value there.
+    {'teach': PROGRESS},
+])
+def test_a_new_learner_is_never_steered_to_a_record_in_the_shared_store(
+        store_dir, shared):
+    """Review of 2ddf102da, F1, measured on the owner's agent_data: the
+    first cut walked the whole memory view, so a new learner's read of
+    teach.<id> named the shared store's keys and said to read them -- the
+    creator's progress, or another person's id.  Only this person's own
+    store is described."""
+    cache_loaders.save_agent_data(AGENT, shared)
+    tools = _tools(_store(), user_id='10203')
+    reply = tools['get_data_by_key']('teach.10203')
+    assert reply.startswith(KEY_NOT_FOUND), reply
+    assert 'This person has nothing saved in this memory yet.' in reply, reply
+    assert OTHER not in reply, reply
+    assert 'single value' not in reply and 'read that key' not in reply, reply
+    assert not tool_reply_failed(reply), reply
+
+
+def test_a_learner_with_records_is_shown_only_their_own_keys(store_dir):
+    cache_loaders.save_agent_data(AGENT, {'teach': {OTHER: PROGRESS}})
+    tools = _tools(_store())
+    tools['save_data_in_memory'](f'teach.{LEARNER}', PROGRESS)
+    reply = tools['get_data_by_key']('teach.10203')
+    assert f"This person's keys under teach are: {LEARNER}." in reply, reply
+    assert OTHER not in reply, reply
 
 
 @pytest.mark.parametrize('tool', ['save_data_in_memory', 'get_data_by_key'])
@@ -408,6 +474,29 @@ def test_a_call_to_a_tool_that_does_not_exist_names_the_ones_that_do(
     assert reply.startswith('Error: the huggingface_search_models call could not '
                             'be done: no tool named huggingface_search_models'), reply
     assert 'by its exact name: get_item, save_note.' in reply, reply
+    # Review of 2ddf102da, F3: the reply pointed back at the missing tool
+    # ("Call huggingface_search_models again only with that changed").
+    assert 'There is no huggingface_search_models to call again' in reply, reply
+    assert 'again only with that changed' not in reply, reply
+    assert 'request_tools' not in reply, reply
+    assert tool_reply_failed(reply) and refusal_has_hint(reply), reply
+
+
+def test_an_unknown_tool_reply_names_request_tools_when_the_agent_has_it(executor):
+    tools = dict(_two_tools(), request_tools=lambda need: 'attached')
+    reply = _executed(executor, tools, 'huggingface_search_models')
+    assert 'get_item, request_tools, save_note' in reply, reply
+    assert ('call request_tools with a short description of that capability'
+            in reply), reply
+    assert 'There is no huggingface_search_models to call again' in reply, reply
+
+
+def test_an_unknown_tool_on_an_agent_with_no_tools_says_to_answer_in_writing():
+    from hartos.helper import executor_refusal
+    reply = executor_refusal('huggingface_search_models', {})
+    assert 'This agent has no tools: answer in writing instead.' in reply, reply
+    assert 'Calling huggingface_search_models again cannot work' in reply, reply
+    assert 'one of the tool names given' not in reply, reply
     assert tool_reply_failed(reply) and refusal_has_hint(reply), reply
 
 

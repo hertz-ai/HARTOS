@@ -3577,6 +3577,10 @@ def _no_camera_frame_reason(inp, user_id) -> str:
         "This tool only answers questions about what the user's live camera "
         "shows and cannot answer anything else; answer without it",
         retry=RETRY_NEVER)
+    if user_id is None or not str(user_id).strip():
+        # A turn of nobody: no camera here is keyed to it, so nobody is
+        # asked (ask_owner reads a missing turn user as "no turn check").
+        return nothing
     try:
         from integrations.social.consent_service import (
             OWNER_ALLOWED, OWNER_ASKED, OWNER_SAID_NO, ask_owner)
@@ -4912,9 +4916,15 @@ def executor_refusal(func_name, function_map, raised=None) -> str:
       raised while it ran.  It was "Error: <exception text>", with no word on
       whether calling again could help.
 
+    The unknown-tool reply ends with RETRY_OTHER_TOOL, not "call it again
+    with that changed" (review of 2ddf102da, F3: that told the model to call
+    the missing tool again), and, when request_tools is registered, names it
+    as the way to find a tool for a capability none of the listed ones has.
+    With no tools at all no call can work, so it ends with RETRY_NEVER.
+
     Both open with "Error:", so core.constants.tool_reply_failed still reads
     them as failed calls.  Used by the sync and the async executor alike."""
-    from core.tool_refusal import refuse
+    from core.tool_refusal import (RETRY_NEVER, RETRY_OTHER_TOOL, refuse)
     name = str(func_name or '').strip() or 'unnamed'
     if raised is not None:
         return refuse(name, f"it raised {type(raised).__name__}: {raised}",
@@ -4922,10 +4932,17 @@ def executor_refusal(func_name, function_map, raised=None) -> str:
                       "otherwise do not repeat the call and tell the person "
                       "what could not be done")
     names = sorted(str(n) for n in (function_map or {}))
+    problem = f"no tool named {name} is registered with this agent"
+    if not names:
+        return refuse(name, problem,
+                      "This agent has no tools: answer in writing instead",
+                      retry=RETRY_NEVER)
     shown = ', '.join(names[:40]) + (', ...' if len(names) > 40 else '')
-    fix = (f"Use one of this agent's tools, by its exact name: {shown}" if names
-           else "This agent has no tools: answer in writing instead")
-    return refuse(name, f"no tool named {name} is registered with this agent", fix)
+    fix = f"Use one of this agent's tools, by its exact name: {shown}"
+    if 'request_tools' in names:
+        fix += ("; if none of them does what you need, call request_tools "
+                "with a short description of that capability")
+    return refuse(name, problem, fix, retry=RETRY_OTHER_TOOL)
 
 
 def tool_argument_error(func, func_name, arguments, repaired, as_written=None):

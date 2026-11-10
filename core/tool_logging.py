@@ -205,10 +205,14 @@ def note_unhinted_refusal(tool_name: str, result) -> bool:
 
     The enforcement half of core.tool_refusal (owner 2026-11-09: "enforce a
     framework for tool call so that validation errors are semantically
-    understood by LLM so that retry can correct them").  Every registered
-    tool returns through log_tool_execution, so this is the one place that
-    sees every reply.  A reply that failed (core.constants.tool_reply_failed)
-    but carries no hint (core.tool_refusal.refusal_has_hint: not built by
+    understood by LLM so that retry can correct them").  It sees every tool
+    wrapped by log_tool_execution, NOT every registered tool: families that
+    register plain callables (reel studio, news, finance, commerce,
+    remote_desktop, media and others; review of 2ddf102da, probe: 0 lines for
+    a plain tool, 1 once wrapped) never return through here, so their
+    unhinted refusals are not counted yet.  Counting in the autogen executor,
+    which every tool reply passes, is the follow-up.  A reply that failed
+    (core.constants.tool_reply_failed) but carries no hint (core.tool_refusal.refusal_has_hint: not built by
     refuse(), or refused JSON without a note) is logged once per call as
     ``[TOOL-REFUSAL-NO-HINT] <tool>``, with the session, so each lane can
     count and move its own.  Returns whether it logged.  Never raises: it

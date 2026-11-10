@@ -18,7 +18,9 @@ A refusal built here carries the three things a retry needs:
     terms;
   * how to fix it: the change to make, or the tool to call first;
   * whether calling again can help at all (RETRY_AFTER_FIX, RETRY_LATER,
-    RETRY_NEVER), so a refusal no retry can fix is not retried as it was.
+    RETRY_NEVER, or RETRY_OTHER_TOOL when the named tool does not exist and
+    another one should be called), so a refusal no retry can fix is not
+    retried as it was.
 
 A text refusal opens with "Error:" (core.constants.TOOL_ERROR_REPLY_PREFIXES),
 so core.constants.tool_reply_failed reads it as a failed call and the REUSE
@@ -30,16 +32,22 @@ already uses for its refusals); tool_reply_failed reads a top-level
 Scope: what a tool finds wrong once its arguments are bound -- a value it
 cannot use, a precondition not met.  Argument-shape refusals (unknown or
 missing names, broken JSON) are made before the tool runs, by
-hartos/helper.py tool_argument_error, in the same voice.  core.tool_logging
-counts every failed reply that came back without a hint
-([TOOL-REFUSAL-NO-HINT]), which is how this framework is enforced: each lane
-can see the refusals it has not moved here yet.
+hartos/helper.py tool_argument_error, in their own words ("Error: <tool> was
+not run: ...", each naming the argument and what to send instead); they do
+not carry REFUSAL_MARK and never reach the count below, since the tool did
+not run.  core.tool_logging
+counts every failed reply that came back without a hint from a tool wrapped
+by log_tool_execution ([TOOL-REFUSAL-NO-HINT]), which is how this framework
+is enforced: each lane can see the refusals it has not moved here yet.
+Tools registered as plain callables are not counted yet (review of
+2ddf102da); counting in the executor is the follow-up.
 """
 from __future__ import annotations
 
 RETRY_AFTER_FIX = 'after_fix'
 RETRY_LATER = 'later'
 RETRY_NEVER = 'never'
+RETRY_OTHER_TOOL = 'other_tool'
 
 # The words every text refusal built here carries, and the JSON key that
 # holds the sentence in a JSON refusal.  core.tool_logging reads both to tell
@@ -54,6 +62,11 @@ _RETRY_SENTENCES = {
                   "again now."),
     RETRY_NEVER: ("Calling {tool} again cannot work; tell the person what "
                   "could not be done."),
+    # A call to a tool that does not exist: "call it again with that
+    # changed" told the model to call the missing tool again (review of
+    # 2ddf102da, F3), so this one points away from it.
+    RETRY_OTHER_TOOL: ("There is no {tool} to call again; make the next call "
+                       "with one of the tool names given."),
 }
 
 
@@ -99,14 +112,24 @@ def refusal_has_hint(content) -> bool:
     body = '' if content is None else str(content)
     if REFUSAL_MARK in body:
         return True
+    if f'"{NOTE_KEY}"' not in body:      # no note key: skip the parse
+        return False
     payload = _json_object(body)
     return bool(payload and str(payload.get(NOTE_KEY) or '').strip())
 
 
 def is_json_refusal(content) -> bool:
     """Whether ``content`` is a JSON object whose top-level ``status`` is
-    'refused' -- the shape JSON-answering tools refuse with."""
-    payload = _json_object('' if content is None else str(content))
+    'refused' -- the shape JSON-answering tools refuse with.
+
+    It runs on every wrapped tool's reply and in every gate reader, so a
+    reply that cannot be a refusal is never parsed: measured by the review
+    of 2ddf102da, parsing every JSON reply took a 1.2 MB reply from 0.38 ms
+    to 33 ms."""
+    body = '' if content is None else str(content)
+    if '"refused"' not in body:
+        return False
+    payload = _json_object(body)
     return bool(payload) and payload.get('status') == 'refused'
 
 
@@ -123,5 +146,5 @@ def _json_object(body: str):
 
 
 __all__ = ['NOTE_KEY', 'REFUSAL_MARK', 'RETRY_AFTER_FIX', 'RETRY_LATER',
-           'RETRY_NEVER', 'is_json_refusal', 'refusal_fields',
+           'RETRY_NEVER', 'RETRY_OTHER_TOOL', 'is_json_refusal', 'refusal_fields',
            'refusal_has_hint', 'refuse']
