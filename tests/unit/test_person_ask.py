@@ -920,7 +920,10 @@ FILES = {'type': 'file_request', 'purpose': 'reel_source',
 
 @pytest.mark.parametrize('case, code, says', [
     ('no_person', 'no_person', 'no person to ask'),
-    ('secret', 'secrets_go_to_the_vault', 'request_resource'),
+    # request_resource is not on the main leg (MAIN_LEG_CORE_TOOLS), so the
+    # note also names request_tools, which attaches it by name (review of
+    # dead56131: a model told only "request_resource" got "tool not found").
+    ('secret', 'secrets_go_to_the_vault', 'request_tools with need="request_resource"'),
     ('purpose', 'unknown_purpose', 'one of purposes'),
     ('no_reason', 'say_why_in_description', '"description"'),
     ('no_agent', 'no_agent', 'without the files'),
@@ -954,9 +957,48 @@ def test_every_refusal_says_what_was_wrong_and_what_to_do(legs, monkeypatch, cas
 
 
 def test_an_ask_id_she_has_no_question_under_says_which_id_to_use(legs):
+    """5 of the 6 ask_id reads measured were made-up ids (review of
+    dead56131): the note says how to ask instead."""
     reply = json.loads(_tool()('', 0, 'no-such-ask'))
     assert reply['answered'] is False and reply['status'] == 'not_found', reply
-    assert 'ask_id' in reply['note'], reply
+    assert 'leave ask_id empty' in reply['note'], reply
+
+
+def test_the_secret_note_names_tools_the_agent_can_reach():
+    """The note's route works from the main leg: request_tools is registered
+    on both legs (register_request_tools) and attaches a core closure the
+    need names; request_resource is one (build_core_tool_closures)."""
+    from core.agent_tool_menu import MAIN_LEG_CORE_TOOLS
+    from integrations.agent_engine import person_ask
+    note = person_ask._refusal_note('secrets_go_to_the_vault', {}, '10202', '342', False)
+    assert 'request_resource' not in MAIN_LEG_CORE_TOOLS
+    assert 'request_tools with need="request_resource"' in note, note
+
+
+def test_too_many_open_asks_lists_only_this_persons_questions(legs):
+    """Review of dead56131 (mutant M7 survived): the same agent asking two
+    people; the one refused is shown only the questions open with them."""
+    from integrations.agent_engine import person_ask
+    hers, his = _tool('10202'), _tool('777')
+    her_ids = [json.loads(hers(json.dumps(dict(POST, action=f'h{i}')), 0))['ask_id']
+               for i in range(person_ask.MAX_OPEN_PER_PERSON)]
+    his_ids = [json.loads(his(json.dumps(dict(POST, action=f'm{i}')), 0))['ask_id']
+               for i in range(person_ask.MAX_OPEN_PER_PERSON)]
+    note = _refused_reply(his, dict(POST, action='one_more'))['note']
+    assert all(i in note for i in his_ids), note
+    assert not any(i in note for i in her_ids), note
+
+
+def test_an_own_turn_refusal_lists_own_turn_questions(legs):
+    """The person's own turn counts and lists the asks of the person's own
+    turns, never background work's (the open-ask limit is per kind)."""
+    from integrations.agent_engine import person_ask
+    own = person_ask.ask_person_tool('10202', '342', request_id=lambda: 'req-own-turn')[2]
+    ids = [json.loads(own(json.dumps(dict(POST, action=f'o{i}')), 0))['ask_id']
+           for i in range(person_ask.MAX_OPEN_PER_PERSON)]
+    note = _refused_reply(own, dict(POST, action='one_more'))['note']
+    assert 'from background work' not in note, note
+    assert all(i in note for i in ids), note
 
 
 def test_the_tool_never_waits_longer_than_its_ceiling(legs, monkeypatch):

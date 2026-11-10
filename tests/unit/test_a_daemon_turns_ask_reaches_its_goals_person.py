@@ -154,11 +154,13 @@ def test_background_asks_never_take_the_place_of_the_owners_own_ask(node):
     from integrations.agent_engine import person_ask
     rids = {}
     background = _ask_tool('system_daemon', rids)
+    open_ids = []
     for i in range(person_ask.MAX_OPEN_PER_PERSON):
         _goal(f'g-{i}')
         rids['system_daemon_342'] = f'daemon_g-{i}'
         reply = json.loads(background(json.dumps(dict(POST, action=f'step_{i}')), 0))
         assert reply['status'] == 'waiting_for_person', reply
+        open_ids.append(reply['ask_id'])
     _goal('g-more')
     rids['system_daemon_342'] = 'daemon_g-more'
     more = json.loads(background(json.dumps(dict(POST, action='one_more')), 0))
@@ -166,6 +168,10 @@ def test_background_asks_never_take_the_place_of_the_owners_own_ask(node):
     assert more == {'answered': False, 'refused': 'too_many_open_asks',
                     'status': 'refused'}
     assert 'from background work' in note, note
+    # The ids are read for the PERSON asked (the goal's owner), not the
+    # turn's user (system_daemon): all 66 refusals measured on the desktop
+    # were daemon turns (review of dead56131, mutant M4).
+    assert all(ask_id in note for ask_id in open_ids), note
 
     own = _ask_tool(OWNER, {f'{OWNER}_342': '1730600000'})
     reply = own(json.dumps(dict(POST, action='mine')), 0)

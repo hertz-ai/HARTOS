@@ -813,8 +813,9 @@ _REFUSAL_NOTES = {
                   'asking, or say in your reply that it needs a person.'),
     'secrets_go_to_the_vault': (
         'Not sent: it asks for a password, key, code or other secret, and a person '
-        'is never asked for one this way. Ask for it with the request_resource tool, '
-        'which keeps it in the vault.'),
+        'is never asked for one this way. Ask for it with request_resource, the '
+        'vault\'s credential tool; if request_resource is not in your tools, call '
+        'request_tools with need="request_resource" first.'),
     'unknown_purpose': ('Not sent: that "purpose" is not one this node keeps files '
                         'for. Use one of purposes.'),
     'no_agent': ('Not sent: files are kept for the agent that asks, and this turn has '
@@ -831,8 +832,9 @@ _REFUSAL_NOTES = {
                   'on without asking.'),
 }
 #: An ask_id this person has no question under.
-_NOT_FOUND = ('No question of this person has that ask_id. Use the ask_id an earlier '
-              'reply of this tool gave you, or ask again.')
+_NOT_FOUND = ('No question of this person has that ask_id. To read an answer, use the '
+              'exact ask_id an earlier reply of this tool gave you; to ask a new '
+              'question, leave ask_id empty.')
 
 
 def _refusal_note(refused, comp, person, asker, background) -> str:
