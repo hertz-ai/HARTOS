@@ -47,9 +47,14 @@ _module_lock = threading.Lock()
 # Track which tasks we've already sent HITL notifications for (avoid spam)
 _hitl_notified: set = set()
 
-# Goals that are budget-blocked are immediately paused (no retries).
-# Previously we retried 3 times, but that just re-dispatches a blocked goal
-# every 30 seconds with no chance of success (budget doesn't change between ticks).
+# Goals refused for budget that stayed active (never_pause, or a refused
+# pause): the refusal was already said once, so later ticks do not say it
+# again.  Their budget is still read on every tick, and a goal with enough
+# spark is dispatched and leaves this set.  A goal the budget pause did pause
+# is never put here: it leaves the active goals, and if the owner resumes it,
+# its budget is judged afresh.  It used to be skipped here before its budget
+# was read, so a top-up never reached it: central's hive_growth goal waited
+# about 63 hours after its top-up on 2026-10-31.
 _budget_blocked_goals: set = set()
 
 # Track dispatch failures per goal for exponential backoff.
@@ -388,7 +393,9 @@ _last_probe_resume_at = 0.0
 
 #: The structured record of why a goal is paused lives with the ONE pause
 #: routine (GoalManager.pause_goal); the daemon reads only its own cause.
-from .goal_manager import PAUSE_CAUSE_DISPATCH_FAILURES  # noqa: E402
+from .goal_manager import (  # noqa: E402
+    PAUSE_CAUSE_DISPATCH_FAILURES, dispatch_failure_pause_reason,
+    is_dispatch_failure_pause_reason)
 
 #: A row paused before the structured record existed is the daemon's only if
 #: its pause followed the goal's own last dispatch this closely (the daemon
@@ -419,28 +426,29 @@ def _paused_for_dispatch_failures(goal) -> bool:
     grounding, no-op dispatches, budget, a person's help (escalate_goal) or a
     person's own dashboard pause carries a different cause and keeps.
 
-    Three things must all hold (review of 20dc8c996 by hartos-73: trusting
-    the cause alone resumed a goal an escalation had parked):
-      * the record's cause is the daemon's (pause_cause == dispatch_failures),
-        or, for a row paused before the record existed, the prose is the
-        daemon's and the pause followed the goal's own last dispatch within
-        the hour and nothing has resumed it since;
-      * the prose is still the daemon's text (a renewed record is not);
+    Both must hold (review of 20dc8c996 by hartos-73: trusting the cause
+    alone resumed a goal an escalation had parked):
       * no human escalation is on the goal (escalation.next == 'human' is a
-        person's hand, whatever the cause says).
+        person's hand, whatever the cause says);
+      * the record's cause is the daemon's (pause_cause ==
+        dispatch_failures); a renewed record carries its own cause.  Only a
+        row paused before the record existed is read by its words
+        (is_dispatch_failure_pause_reason), and then only when the pause
+        followed the goal's own last dispatch within the hour and nothing
+        has resumed it since.  The words were read first for every row, so
+        rewording either writer's sentence would have left every new
+        dispatch-failure pause unresumed (review of 3d4c5b3a3's set by
+        claude-autostart-71).
     """
     cfg = goal.config_json or {}
     escalation = cfg.get('escalation') or {}
     if isinstance(escalation, dict) and escalation.get('next') == 'human':
         return False
-    reason = str(cfg.get('pause_reason') or '')
-    daemon_text = (reason.startswith('Auto-paused:')
-                   and 'consecutive dispatch failures' in reason)
-    if not daemon_text:
-        return False
     cause = cfg.get('pause_cause')
     if cause is not None:
         return cause == PAUSE_CAUSE_DISPATCH_FAILURES
+    if not is_dispatch_failure_pause_reason(cfg.get('pause_reason')):
+        return False
     if 'resume_count' in cfg:
         return False
     return _paused_right_after_its_last_dispatch(goal)
@@ -451,14 +459,44 @@ def _paused_for_dispatch_failures(goal) -> bool:
 _HARNESS_EXPERIMENT_MIN_GOALS = 3
 
 
-def _failure_signature(why):
-    """The failure's key: ONE normaliser for the pause that stores it and the
-    proposer that matches it (review of 3d4c5b3a3: the stored why[:80] was
-    compared with a stripped copy, so a cut landing on a space, or a reason
-    led by whitespace, matched nothing and three identical pauses filed no
-    experiment, silently).  Stripped, cut to 80, stripped again where the cut
-    left whitespace; '' for no reason at all."""
-    return str(why or '').strip()[:80].rstrip()
+def _failure_signature(why, goal_key=None):
+    """The failure's key, as (signature, scrubbed): ONE normaliser for the
+    pause that stores it and the proposer that matches it (review of
+    3d4c5b3a3: the stored why[:80] was compared with a stripped copy, so a
+    cut landing on a space, or a reason led by whitespace, matched nothing
+    and three identical pauses filed no experiment, silently).  Stripped, cut
+    to 80, stripped again where the cut left whitespace; '' for no reason at
+    all.  The egress scrub (security.edge_privacy.scrub_text) runs on the
+    whole text BEFORE the cut (review by claude-autostart-71: a key
+    straddling the cut left a fragment too short for the secret patterns,
+    which the proposer's scrub of the cut text then let into a public Post
+    title).
+
+    With no scrubber, or one that fails, the text is cut as written and
+    ``scrubbed`` is False: it stays on the goal's own row, the pause that
+    calls this still happens (review of 6d557b153 by claude-autostart-71:
+    anything but an ImportError escaped into the pause arm before
+    pause_goal), and the caller proposes nothing from it.  Raw stays local,
+    what leaves is refused: hartos-00's review of cd49395bc reproduced a
+    scrubber that failed on the whole text but not on the 80-char cut, and
+    the proposer's own scrub of the cut passed a key fragment into a public
+    ThoughtExperiment.  A goal paused before 6d557b153 holds a signature cut
+    before the scrub; for a key-free failure it is the same text, and
+    otherwise it does not count with the new ones toward the three-goal
+    proposal, which is transitional."""
+    text = str(why or '').strip()
+    scrubbed = False
+    try:
+        from security.edge_privacy import scrub_text
+        text = scrub_text(text).strip()
+        scrubbed = True
+    except ImportError:
+        logger.debug(f"Goal {goal_key}: no egress scrubber; its failure "
+                     f"signature stays on its own row and is not proposed")
+    except Exception as exc:
+        logger.warning(f"Goal {goal_key}: failure signature kept unscrubbed on "
+                       f"its own row and not proposed: {exc}")
+    return text[:80].rstrip(), scrubbed
 
 
 def _propose_harness_experiment_for_signature(db, signature):
@@ -582,9 +620,8 @@ def _auto_pause_for_dispatch_failures(db, goal, goal_key, failure_count, why):
     cfg = dict(goal.config_json or {})
     if 'spark_at_dispatch' in pending:
         cfg['spark_at_dispatch'] = pending['spark_at_dispatch']
-    signature = _failure_signature(why)
-    reason = (f'Auto-paused: {failure_count} consecutive dispatch failures'
-              + (f' (last: {why})' if why else ''))
+    signature, scrubbed = _failure_signature(why, goal_key)
+    reason = dispatch_failure_pause_reason(failure_count, why)
     result = GoalManager.pause_goal(
         db, goal, cause=PAUSE_CAUSE_DISPATCH_FAILURES, by='daemon',
         reason=reason, config=cfg,
@@ -595,7 +632,7 @@ def _auto_pause_for_dispatch_failures(db, goal, goal_key, failure_count, why):
     cfg = result['config']
     logger.warning(
         f"Goal {goal_key} AUTO-PAUSED after {failure_count} dispatch failures")
-    if signature:
+    if signature and scrubbed:
         _propose_harness_experiment_for_signature(db, signature)
     if (int(cfg.get('daemon_resume_count', 0) or 0) >= _RESUME_CAP
             and not cfg.get('told_at')):
@@ -739,7 +776,10 @@ def _settle_dispatched_goal(db, goal, goal_key, served_escalation=None,
       awaiting_verification — spark spent, work genuinely in flight; no noop
                               strike, bounded by HEVOLVE_GOAL_VERIFY_TIMEOUT_S
       noop                  — no new spark at all; unchanged 5-strike pause
-    Continuous goals still never auto-complete.
+    Continuous goals still never auto-complete.  A remediation goal (config
+    'remediation') that would complete is checked against its loophole
+    first: still reported, or not confirmable, and it is paused with cause
+    remediation_open instead (goal_seeding.remediation_still_open).
 
     ``handed_to_hive`` (dispatch.handed_to_hive): the dispatch gave the goal
     to the coordinator, so it returned before any work existed and "this
@@ -869,7 +909,39 @@ def _settle_dispatched_goal(db, goal, goal_key, served_escalation=None,
         outcome = 'awaiting' if grounded is False else 'completed'
     else:
         outcome = 'noop'
-    if outcome == 'awaiting':
+    # Spend is necessary, not sufficient, for a goal that names its own test.
+    # A remediation goal (seeded by goal_seeding.auto_remediate_loopholes,
+    # config 'remediation') is done only when its loophole is gone; its turn
+    # costing spark shows only that it ran.  269 of them completed on central
+    # 2026-11-02 while the loophole stayed, and each completion let the next
+    # hourly re-seed in.  Goals without a test settle exactly as before.
+    still_open = None
+    if outcome == 'completed' and cfg.get('remediation'):
+        from .goal_seeding import remediation_still_open
+        still_open = remediation_still_open(cfg['remediation'])
+        if still_open:
+            outcome = 'remediation_open'
+    if outcome == 'remediation_open':
+        # Paused, not left active: an active goal is dispatched again on the
+        # next tick, and re-running a remediation whose loophole is still
+        # there spends again for nothing.  A paused one also blocks the
+        # hourly re-seed (auto_remediate_loopholes skips active and paused
+        # goals of the same type).  It did work, so the noop trail goes.
+        cfg.pop('noop_dispatch_count', None)
+        cfg.pop('awaiting_verification_since', None)
+        cfg.pop('spark_at_handoff', None)
+        from .goal_manager import GoalManager, PAUSE_CAUSE_REMEDIATION_OPEN
+        _res = GoalManager.pause_goal(
+            db, goal, cause=PAUSE_CAUSE_REMEDIATION_OPEN, by='daemon',
+            reason=(f'Paused: its remediation ran, but {still_open}.  It is '
+                    f'done only when the loophole is gone.'),
+            config=cfg)
+        cfg = _res.get('config', cfg)
+        if _res.get('success'):
+            logger.warning(f"Goal {goal_key} PAUSED, not completed: "
+                           f"{still_open}")
+        goal.config_json = cfg
+    elif outcome == 'awaiting':
         # In flight. Not a noop — do not touch the noop counter, and do
         # not re-spin the goal — but do not sit here silently forever
         # either: the pause below is the bound.
@@ -2021,6 +2093,24 @@ class AgentDaemon:
             # 400) must re-test its cause without a person at the dashboard.
             _resume_goals_paused_for_a_cleared_cause(db, cause_cleared=False)
 
+            # Remediation goals the settlement gate paused because their
+            # loophole was still there are judged again on the scan's tick,
+            # also before the no-goals stop: an all-paused node must still
+            # see a loophole go (review of 6047bcf19, finding 1).  The
+            # health it read is handed to the seeding scan below.
+            remediation_health = None
+            if self._tick_count % self._remediate_every == 0:
+                try:
+                    from .goal_seeding import recheck_paused_remediations
+                    remediation_health = recheck_paused_remediations(db)
+                except Exception as e:
+                    # Rolled back, or every later query in this tick fails
+                    # on the failed transaction and the tick's reset empties
+                    # _dispatch_backoff (review of 3bb05b2e8, M1: measured
+                    # with "database is locked").
+                    db.rollback()
+                    logger.warning(f"Paused remediation re-check skipped: {e}")
+
             # DETERMINISTIC STOP: no goals = no action = system is inert
             # Skip CODING_GOAL_TYPES — coding_daemon handles those with
             # idle-agent detection + benchmark sync for backend routing.
@@ -2241,12 +2331,6 @@ class AgentDaemon:
                     from .budget_gate import estimate_llm_cost_spark, _resolve_model_name
                     goal_key = str(goal.id)
 
-                    # Skip goals already known to be budget-blocked (avoids
-                    # re-checking every 30s when nothing has changed).
-                    with _module_lock:
-                        if goal_key in _budget_blocked_goals:
-                            continue
-
                     # Read-only check: compare remaining budget vs estimated cost
                     # without reserving (no spark_spent increment).  The pause
                     # is decided on the spark spent on work: a reservation
@@ -2269,8 +2353,7 @@ class AgentDaemon:
                             f"running work before its next dispatch")
                         continue
                     if not bg_allowed:
-                        # Immediately pause — budget won't change between daemon
-                        # ticks, so retrying is wasteful.
+                        # Pause at once: retrying a refused goal is wasteful.
                         #
                         # The mutation itself lives in budget_gate, which is
                         # also reached from pre_dispatch_budget_gate.  It used
@@ -2279,15 +2362,21 @@ class AgentDaemon:
                         # one blocked here was paused: two behaviours for one
                         # decision.  The pause also now honours never_pause,
                         # which this inline copy ignored.
-                        from .budget_gate import apply_budget_pause
-                        apply_budget_pause(goal, bg_reason, db=db)
+                        #
+                        # A goal that stays active (never_pause, a refused
+                        # pause) is refused once; later ticks still read its
+                        # budget above and skip it quietly until it has spark.
                         with _module_lock:
-                            _budget_blocked_goals.add(goal_key)
+                            refused_before = goal_key in _budget_blocked_goals
+                        if not refused_before:
+                            from .budget_gate import apply_budget_pause
+                            if not apply_budget_pause(goal, bg_reason, db=db):
+                                with _module_lock:
+                                    _budget_blocked_goals.add(goal_key)
                         continue
                     else:
-                        # Budget passed — clear from blocked set if it was
-                        # previously blocked (e.g. goal was resumed with
-                        # more budget).
+                        # Enough spark now (a top-up, or a resume with more
+                        # budget): no longer refused.
                         with _module_lock:
                             _budget_blocked_goals.discard(goal_key)
                 except ImportError:
@@ -2655,7 +2744,8 @@ class AgentDaemon:
             if self._tick_count % self._remediate_every == 0:
                 try:
                     from .goal_seeding import auto_remediate_loopholes
-                    rem_count = auto_remediate_loopholes(db)
+                    rem_count = auto_remediate_loopholes(
+                        db, health=remediation_health)
                     if rem_count > 0:
                         logger.info(f"Auto-remediation: created {rem_count} goal(s)")
                 except Exception as e:

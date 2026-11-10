@@ -33,6 +33,18 @@ logger = logging.getLogger('hevolve_outreach')
 ERXES_API_URL = os.environ.get('ERXES_API_URL', 'http://localhost:3300')
 EMAIL_SERVICE_URL = os.environ.get('EMAIL_SERVICE_URL', 'http://localhost:4000')
 
+#: A planned outreach email (a follow-up step, or the journey's first email
+#: draft) that the sender refuses is tried again later, up to this many
+#: sends in all; then it is given up ('failed').  A refused send is not a
+#: sent one, and a dead address must not be mailed forever from the owner's
+#: account (review of 1c4b2b650: the first email was retried on every tick).
+OUTREACH_SEND_ATTEMPTS = 3
+#: Wait before the next try of a refused planned email: this times the tries
+#: so far (1 h, then 2 h), so a short mail outage does not use up the email.
+OUTREACH_RETRY_WAIT = timedelta(hours=1)
+#: Longest sender error kept on a planned email.
+_SEND_ERROR_CAP = 200
+
 # ── Thread lock for prospect file access (daemon + request thread) ──
 _prospect_lock = threading.Lock()
 
@@ -178,6 +190,154 @@ def _send_email(to_email: str, subject: str, html_body: str) -> Dict:
         return {'success': False, 'error': str(e)}
 
 
+# ── One rule for a planned email that was, or was not, delivered ──
+# A planned email is a follow-up step or the journey's first email draft:
+# a dict the store keeps.  send_outreach_email, the follow-up checker and
+# JourneyEngine._action_send_email all count a delivery and a refusal here.
+
+def _send_error_text(result: Dict) -> str:
+    """Why _send_email did not deliver, in words the agent can read."""
+    if result.get('error'):
+        return str(result['error'])[:_SEND_ERROR_CAP]
+    sender = result.get('via') or 'no sender'
+    if result.get('status_code') is not None:
+        return f"{sender} answered {result['status_code']}"
+    return f"{sender} gave no reason"
+
+
+def count_delivered(prospect: Dict, when: datetime):
+    """One more email reached ``prospect`` (it also moves updated_at)."""
+    prospect['emails_sent'] = prospect.get('emails_sent', 0) + 1
+    prospect['last_email_at'] = when.isoformat()
+    prospect['updated_at'] = when.isoformat()
+
+
+def retry_due(planned: Dict, now: datetime) -> bool:
+    """May a planned email that was refused before be tried again now?"""
+    after = planned.get('retry_after')
+    if not after:
+        return True
+    try:
+        return now >= datetime.fromisoformat(after)
+    except (TypeError, ValueError):
+        return True
+
+
+def note_refused(planned: Dict, result: Dict, now: datetime, what: str) -> bool:
+    """Record and log a refused send of a planned email (``what`` names it
+    in the log: "Shop, follow-up step 2").  Returns True when it is given
+    up ('failed') after OUTREACH_SEND_ATTEMPTS sends; otherwise the next try
+    waits OUTREACH_RETRY_WAIT times the tries so far (1 h, then 2 h).
+
+    The one place a refusal is logged, so every path that sends a planned
+    email (the daemon's checker, a journey tick, an agent tool) leaves the
+    same WARNING (review of 6da8b09c7: the journey path logged nothing)."""
+    planned['attempts'] = planned.get('attempts', 0) + 1
+    planned['last_error'] = _send_error_text(result)
+    planned['last_tried_at'] = now.isoformat()
+    gave_up = planned['attempts'] >= OUTREACH_SEND_ATTEMPTS
+    if gave_up:
+        planned['status'] = 'failed'
+        planned.pop('retry_after', None)
+    else:
+        planned['retry_after'] = (
+            now + OUTREACH_RETRY_WAIT * planned['attempts']).isoformat()
+    logger.warning("Outreach email NOT sent (%s), try %d of %d%s: %s",
+                   what, planned['attempts'], OUTREACH_SEND_ATTEMPTS,
+                   ', given up' if gave_up else
+                   ', next try after ' + planned['retry_after'] + ' UTC',
+                   planned['last_error'])
+    return gave_up
+
+
+def next_followup(sequence: Dict, now: datetime):
+    """The one rule for a sequence's next follow-up: ``(step, state)`` for
+    its FIRST pending step, state 'due' (scheduled time passed, no wait
+    running), 'waiting' (refused before, its wait not over) or 'scheduled'
+    (not due yet); ``(None, None)`` when no step is pending.  The steps
+    after the first pending one wait for it.
+
+    The checker (send_due_followups) sends by it and the sales prompt
+    counts overdue steps by it, so the count is what a check would send
+    (review of 5970e07a1: the prompt counted a step queued behind a waiting
+    one as overdue)."""
+    for step in sequence.get('steps', []):
+        if step.get('status') != 'pending':
+            continue
+        if now < datetime.fromisoformat(step['scheduled_at']):
+            return step, 'scheduled'
+        return step, ('due' if retry_due(step, now) else 'waiting')
+    return None, None
+
+
+#: How many refused emails get_pipeline_status / view_journey_pipeline
+#: list (the newest tries); the counts cover all of them.  Unbounded, 20
+#: bounced prospects grew the journey view past the wire trim's cut, which
+#: then dropped the A/B stats (review of 5970e07a1).
+UNDELIVERED_LIST_LIMIT = 10
+
+
+def _undelivered_entry(prospect_id, company, which, planned) -> Dict:
+    """One refused planned email as the pipeline tools list it."""
+    return {'prospect_id': prospect_id, 'company': company, 'which': which,
+            'attempts': planned.get('attempts', 0),
+            'given_up': planned.get('status') == 'failed',
+            'retry_after': planned.get('retry_after'),
+            'last_tried_at': planned.get('last_tried_at'),
+            'last_error': planned.get('last_error')}
+
+
+def undelivered_emails(data: Dict) -> List[Dict]:
+    """Every planned email in the store that was refused and has still not
+    reached its prospect: waiting to be tried again, or given up.
+
+    A first email is listed only while the prospect has had no email at
+    all (one delivered later, on a retry or by the agent's own
+    send_outreach_email, is not undelivered).  A follow-up step is listed
+    when it was given up, or while it waits in a sequence that is still
+    active (a sequence ended by a reply sends nothing more, so its refused
+    step is not 'waiting')."""
+    prospects = data.get('prospects') or {}
+    out = []
+    for pid, p in prospects.items():
+        draft = p.get('email_draft')
+        if (isinstance(draft, dict) and draft.get('attempts')
+                and not p.get('emails_sent')):
+            out.append(_undelivered_entry(pid, p.get('company'),
+                                          'first email', draft))
+    for seq in (data.get('sequences') or {}).values():
+        p = prospects.get(seq.get('prospect_id'), {})
+        for step in seq.get('steps', []):
+            if not step.get('attempts'):
+                continue
+            waiting = (step.get('status') == 'pending'
+                       and seq.get('status') == 'active')
+            if step.get('status') == 'failed' or waiting:
+                out.append(_undelivered_entry(
+                    seq.get('prospect_id'), p.get('company'),
+                    f"follow-up step {step.get('step_number')}", step))
+    return out
+
+
+def undelivered_summary(data: Dict, limit: int = UNDELIVERED_LIST_LIMIT) -> Dict:
+    """undelivered_emails as the pipeline tools show it: ``counts`` (given
+    up, waiting) of all of them, and the ``limit`` most recently tried as
+    ``latest``.
+
+    The two go to different places in a tool's result.  The counts go at
+    its HEAD: a long tool result meets two cuts, and both keep the head --
+    the seats' token_limiter (hartos.helper, AUTOGEN_MESSAGE_TOKENS_PER_
+    MESSAGE) keeps only the head, and the wire trim keeps the head and the
+    tail.  The rows stay where they were.  Review of fe99feac3: counts
+    moved to the tail survived the wire trim but reached the model less
+    often than before through the seats' cut, which comes first."""
+    entries = undelivered_emails(data)
+    entries.sort(key=lambda e: e.get('last_tried_at') or '', reverse=True)
+    given_up = sum(1 for e in entries if e['given_up'])
+    return {'counts': {'given_up': given_up, 'waiting': len(entries) - given_up},
+            'latest': entries[:limit]}
+
+
 def register_outreach_tools(helper, assistant, user_id: str):
     """Register outreach CRM tools with the agent (Tier 2).
 
@@ -256,27 +416,36 @@ def register_outreach_tools(helper, assistant, user_id: str):
             subject=subject,
             html_body=body_html,
         )
+        if not result.get('success'):
+            # Not sent: the prospect stays as it was and the agent reads
+            # why.  Counting it moved prospects nobody had reached to
+            # 'contacted' and used up their follow-ups.
+            return json.dumps({
+                'success': False, 'sent': False, 'send_result': result,
+                'prospect_stage': prospect['stage'],
+                'error': 'the email was not sent: ' + _send_error_text(result),
+            })
 
         # Log the send
+        now = datetime.utcnow()
         send_entry = {
             'prospect_id': prospect_id,
             'to': prospect['email'],
             'subject': subject,
             'sequence_step': sequence_step,
-            'sent_at': datetime.utcnow().isoformat(),
+            'sent_at': now.isoformat(),
             'send_result': result,
         }
         data['sent_log'].append(send_entry)
 
         # Update prospect state
-        prospect['emails_sent'] = prospect.get('emails_sent', 0) + 1
-        prospect['last_email_at'] = datetime.utcnow().isoformat()
+        count_delivered(prospect, now)
         if prospect['stage'] == 'new':
             prospect['stage'] = 'contacted'
-        prospect['updated_at'] = datetime.utcnow().isoformat()
 
         _save_prospects(data)
-        return json.dumps({'success': True, 'send_result': result, 'prospect_stage': prospect['stage']})
+        return json.dumps({'success': True, 'sent': True, 'send_result': result,
+                           'prospect_stage': prospect['stage']})
 
     def create_followup_sequence(
         prospect_id: Annotated[str, "Prospect ID to create sequence for"],
@@ -319,7 +488,10 @@ def register_outreach_tools(helper, assistant, user_id: str):
                 'scheduled_at': (base_time + timedelta(days=cumulative_days)).isoformat(),
                 'subject': step['subject'],
                 'body_html': step['body_html'],
-                'status': 'pending',  # pending → sent → skipped (if replied)
+                # pending -> sent, or failed after OUTREACH_SEND_ATTEMPTS
+                # refused sends (note_refused), which ends the sequence;
+                # a reply completes the whole sequence.
+                'status': 'pending',
                 'sent_at': None,
             })
 
@@ -329,7 +501,10 @@ def register_outreach_tools(helper, assistant, user_id: str):
             'name': sequence_name,
             'steps': scheduled_steps,
             'created_at': datetime.utcnow().isoformat(),
-            'status': 'active',  # active → paused → completed
+            # active -> completed (every step done, or a reply), or
+            # failed (a step given up: the address or the sender is not
+            # taking mail, so later steps are not sent to it).
+            'status': 'active',
             'exit_on_reply': True,
         }
 
@@ -415,11 +590,16 @@ def register_outreach_tools(helper, assistant, user_id: str):
             except Exception as e:
                 erxes_status = {'error': str(e)}
 
+        # Refused emails, waiting to be tried again or given up: the counts
+        # at the head, where every cut keeps them (undelivered_summary).
+        not_delivered = undelivered_summary(data)
         return json.dumps({
             'success': True,
+            'not_delivered_count': not_delivered['counts'],
             'pipeline': pipeline,
             'total_prospects': len(data.get('prospects', {})),
             'active_sequences': active_sequences,
+            'not_delivered': not_delivered['latest'],
             'erxes_pipeline': erxes_status,
         })
 
@@ -614,17 +794,37 @@ def register_outreach_tools(helper, assistant, user_id: str):
 
 
 def _check_pending_followups_impl() -> str:
-    """Shared logic for checking pending follow-ups. Caller must hold _prospect_lock.
+    """Send the follow-ups that are due, on the store as it is on disk now.
 
     Returns JSON string with actions taken. Used by both the tool-level
     check_pending_followups and the daemon-level check_pending_followups_daemon.
     """
     data = _load_prospects()
     now = datetime.utcnow()
+    actions_taken = send_due_followups(data, now)
+    _save_prospects(data)
+    return json.dumps({'success': True, 'actions': actions_taken, 'checked_at': now.isoformat()})
+
+
+def send_due_followups(data: Dict, now: datetime,
+                       prospect_id: Optional[str] = None) -> List[Dict]:
+    """Send the follow-up steps that are due in ``data`` (the prospect store
+    as the caller holds it), one step per sequence; only ``prospect_id``'s
+    sequences when given.  Changes ``data`` in place and saves nothing: the
+    caller that loaded the store saves it.
+
+    The journey engine runs this on the copy it is ticking (review of
+    1c4b2b650): the checker loading and saving the file on its own inside
+    a journey tick had its writes overwritten by the tick's older copy, so
+    a delivered step went out again and a refused one was counted twice
+    as often as OUTREACH_SEND_ATTEMPTS allows.
+    """
     actions_taken = []
 
     for seq_id, sequence in data.get('sequences', {}).items():
         if sequence['status'] != 'active':
+            continue
+        if prospect_id is not None and sequence.get('prospect_id') != prospect_id:
             continue
 
         prospect = data['prospects'].get(sequence['prospect_id'])
@@ -641,24 +841,30 @@ def _check_pending_followups_impl() -> str:
             })
             continue
 
-        # Check each pending step
-        for step in sequence['steps']:
-            if step['status'] != 'pending':
-                continue
-
-            scheduled = datetime.fromisoformat(step['scheduled_at'])
-            if now >= scheduled:
-                result = _send_email(
-                    to_email=prospect['email'],
-                    subject=step['subject'],
-                    html_body=step['body_html'],
-                )
+        # The sequence's next step (only its first pending one), once per
+        # check cycle (next_followup: the one rule the prompt counts by).
+        step, state = next_followup(sequence, now)
+        if state == 'waiting':
+            # Refused before and waiting out its wait: said, so a check
+            # that sends nothing tells the agent why.
+            actions_taken.append({
+                'action': 'followup_waiting',
+                'prospect': prospect['company'],
+                'step': step['step_number'],
+                'attempts': step.get('attempts', 0),
+                'retry_after': step.get('retry_after'),
+                'error': step.get('last_error'),
+            })
+        elif state == 'due':
+            result = _send_email(
+                to_email=prospect['email'],
+                subject=step['subject'],
+                html_body=step['body_html'],
+            )
+            if result.get('success'):
                 step['status'] = 'sent'
                 step['sent_at'] = now.isoformat()
-
-                prospect['emails_sent'] = prospect.get('emails_sent', 0) + 1
-                prospect['last_email_at'] = now.isoformat()
-
+                count_delivered(prospect, now)
                 actions_taken.append({
                     'action': 'followup_sent',
                     'prospect': prospect['company'],
@@ -666,58 +872,46 @@ def _check_pending_followups_impl() -> str:
                     'subject': step['subject'],
                     'result': result,
                 })
-                break  # Only send one step per check cycle
+            else:
+                # Not sent: tried again after a wait, then given up
+                # (note_refused, which logs it).  A step given up ends the
+                # sequence: the address or the sender is not taking mail,
+                # and the later steps would only be refused the same way.
+                gave_up = note_refused(
+                    step, result, now,
+                    f"{prospect['company']}, follow-up step {step['step_number']}")
+                if gave_up:
+                    sequence['status'] = 'failed'
+                actions_taken.append({
+                    'action': 'followup_failed',
+                    'prospect': prospect['company'],
+                    'step': step['step_number'],
+                    'attempts': step['attempts'],
+                    'gave_up': gave_up,
+                    'error': step['last_error'],
+                })
 
         # Check if all steps are done
-        if all(s['status'] != 'pending' for s in sequence['steps']):
+        if (sequence['status'] == 'active'
+                and all(s['status'] != 'pending' for s in sequence['steps'])):
             sequence['status'] = 'completed'
 
-    _save_prospects(data)
-    return json.dumps({'success': True, 'actions': actions_taken, 'checked_at': now.isoformat()})
+    return actions_taken
 
 
 # ── Goal Type Registration ──
 
 def build_outreach_prompt(goal_dict: Dict, product_dict: Dict = None) -> str:
-    """Build the prompt for an outreach goal.
+    """The prompt of an 'outreach' goal: the sales agent's
+    (journey_engine._build_sales_prompt).
 
-    This prompt is sent to /chat → CREATE/REUSE pipeline.
-    """
-    title = goal_dict.get('title', 'Sales Outreach')
-    description = goal_dict.get('description', '')
-    config = goal_dict.get('config', {})
-
-    prospects_summary = ''
-    data = _load_prospects()
-    if data['prospects']:
-        lines = []
-        for pid, p in data['prospects'].items():
-            lines.append(f"- {p['company']} ({p['contact_name']}, {p['email']}) — stage: {p['stage']}, emails sent: {p.get('emails_sent', 0)}")
-        prospects_summary = '\n'.join(lines)
-
-    return f"""You are a B2B sales outreach agent for HevolveAI.
-
-PRODUCT: HARTOS (Hevolve Hive Agentic Runtime OS)
-- On-device AI runtime for robotics: LLM inference, vision, speech, semantic memory, multi-agent orchestration
-- Democratically evolving Hive network (not controlled by any single LLM vendor)
-- Flywheel: more robots deployed → more data → better model → more developers → more robots
-- Early partners shape how the intelligence evolves for their vertical
-
-GOAL: {title}
-{description}
-
-CURRENT PIPELINE:
-{prospects_summary or '(No prospects yet — use create_prospect to add them)'}
-
-RULES:
-1. Sound human. No em dashes. Casual lowercase subject lines. Short sentences.
-2. Create FOMO: one partner per vertical, Q2 deadline, name competitors who locked into Big Tech
-3. Follow-up sequence: day 3, day 7, day 14 — each shorter and more direct
-4. If a prospect replies, move them to 'replied' stage and stop the sequence
-5. Use the outreach CRM tools to track everything
-
-CONFIG: {json.dumps(config)}
-"""
+    'outreach' and 'sales' were two goal types with two builders for one
+    job, and both pitched HARTOS-for-robotics only (#233/#234); this one
+    also listed every prospect's email address in the prompt.  One builder
+    now serves both goal types: it pitches the goal's own product and
+    keeps the goal's title and description, which this one showed."""
+    from integrations.agent_engine.journey_engine import _build_sales_prompt
+    return _build_sales_prompt(goal_dict, product_dict)
 
 
 def register_outreach_goal_type():
@@ -748,6 +942,7 @@ def check_pending_followups_daemon() -> dict:
     result = json.loads(result_json)
     sent = len([a for a in result.get('actions', []) if a.get('action') == 'followup_sent'])
     for action in result.get('actions', []):
+        # A refused step is logged where it is refused (note_refused).
         if action.get('action') == 'followup_sent':
             logger.info(f"Follow-up sent: {action.get('prospect')} step {action.get('step')} subject='{action.get('subject')}'")
         elif action.get('action') == 'sequence_completed':

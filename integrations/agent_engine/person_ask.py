@@ -28,10 +28,17 @@ the ones that exist, in this order:
     the fan-out consent answers use), and every surface drops its copy
     (H-1024); the row is marked read and the card leaves the shell's store.
     Reading the row in the bell is NOT an answer and drops nothing.
+  * A dismissal, from whichever surface, goes through dismiss_ask(): the
+    person asked and nobody else, before any answer.  The ask closes exactly
+    as an answered one does (every surface drops its card, the row is marked
+    read), and the asking agent reads ``dismissed`` (owner, 2026-11-03:
+    "dismissing a request dismisses and answering in one client device clears
+    everything").
 
-The one door that calls answer_ask() is /api/agent/approval with an
-``ask_id`` (hart_intelligence_entry, and the shell's own route), always with
-the caller's verified Bearer identity (answer_from_request).  No reply topic
+The one door that calls answer_ask() and dismiss_ask() is
+/api/agent/approval with an ``ask_id`` (hart_intelligence_entry, and the
+shell's own route; ``"dismiss": true`` dismisses), always with the caller's
+verified Bearer identity (answer_from_request).  No reply topic
 is a door: central's router is anonymous, so a payload published there could
 answer for anyone (decision 2026-10-27 in the design doc).
 
@@ -71,8 +78,13 @@ OPEN_KEEP_S = 24 * 3600
 #: An answer is a small, shallow object, never a payload.
 MAX_ANSWER_BYTES = 16 * 1024
 MAX_ANSWER_DEPTH = 4
-#: Open asks one person may have at once (a runaway agent cannot ring her
-#: phone without end).  The same question asked again is the same ask.
+#: Open asks one person may have at once OF EACH KIND, her own turns' and
+#: background work's (a daemon goal's turn), so at most twice this many
+#: in all (a runaway agent cannot ring her phone without end).  The same
+#: question asked again is the same ask, whatever its kind.  Background
+#: asks never take the place of the asks of her own conversations, nor
+#: hers theirs (review of ff45f77a4: with three background asks open, the
+#: owner's own agent was refused).
 MAX_OPEN_PER_PERSON = 3
 
 #: Keys that type a field, and the keys that name one.
@@ -92,10 +104,15 @@ _asks: Dict[str, '_Ask'] = {}
 
 class _Ask:
     __slots__ = ('ask_id', 'user_id', 'agent_id', 'prompt_id', 'ctype', 'purpose',
-                 'max_files', 'same', 'created', 'answered_at', 'answer', 'event')
+                 'max_files', 'same', 'created', 'answered_at', 'answer', 'event',
+                 'dismissed', 'background')
 
-    def __init__(self, ask_id, user_id, agent_id, prompt_id, ctype, card, same):
+    def __init__(self, ask_id, user_id, agent_id, prompt_id, ctype, card, same,
+                 background=False):
         self.ask_id = ask_id
+        # Asked by background work, not by the person's own turn: it counts
+        # against its own open-ask limit (MAX_OPEN_PER_PERSON).
+        self.background = bool(background)
         self.user_id = user_id
         self.agent_id = agent_id
         self.prompt_id = prompt_id
@@ -107,6 +124,9 @@ class _Ask:
         self.answered_at = None
         self.answer = None
         self.event = threading.Event()
+        # Closed by the person without an answer (dismiss_ask): answered_at
+        # is set too, so it no longer counts as open anywhere.
+        self.dismissed = False
 
 
 def _refused(reason) -> dict:
@@ -188,14 +208,19 @@ def _refusal(component, prompt_id) -> Optional[str]:
 def _file_card(card: dict, prompt_id) -> None:
     """A file_request asks for as many files as the store keeps of its
     purpose (one logo), at most a turn's attachments, for the agent asking.
-    An agent that names no ``accept`` gets the one kind of file the store
-    takes for the purpose (video, image or audio), so every surface opens
-    the right picker; a purpose that takes several kinds names none."""
+    Its ``accept`` is the one kind of file the store takes for the purpose
+    (video, image or audio), whatever the agent wrote, so every surface
+    opens the picker for files the store will keep; for a purpose that
+    takes several kinds, an agent's ``accept`` stands only when it names one
+    of them (the store refused every pick of a contradicting one: review of
+    ec468c821)."""
     from core.chat_attachments import MAX_ATTACHMENTS
     from core.user_file_store import PURPOSES
     kinds = {mime.split('/', 1)[0] for mime in PURPOSES[card['purpose']].types}
-    if not card.get('accept') and len(kinds) == 1:
-        card['accept'] = kinds.pop()
+    if len(kinds) == 1:
+        card['accept'] = next(iter(kinds))
+    elif str(card.get('accept') or '').split('/', 1)[0].strip().lower() not in kinds:
+        card.pop('accept', None)
     if PURPOSES[card['purpose']].newest_only:
         card['max_files'] = 1
     else:
@@ -252,14 +277,34 @@ def _withdraw_card(ask_id: str) -> None:
                        "shell's store", ask_id, exc_info=True)
 
 
+def _agent_name(agent_id) -> Optional[str]:
+    """The name the person knows the asking agent by, or None: the one lookup
+    consent cards use (consent_service.agent_display_name).  Never raises."""
+    try:
+        from integrations.social.consent_service import agent_display_name
+        from integrations.social.models import db_session
+        with db_session(commit=False) as db:
+            return agent_display_name(db, agent_id)
+    except Exception:
+        logger.debug("person ask: no name for agent %s", agent_id, exc_info=True)
+        return None
+
+
 def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
-        body: str = '') -> dict:
+        body: str = '',
+        background: bool = False) -> dict:
     """Put ``component`` in front of ``user_id`` on every surface they have.
+
+    ``background``: asked by background work (a daemon goal's turn), so it
+    counts against the background asks' own open limit, never against the
+    asks of the person's own turns (MAX_OPEN_PER_PERSON).
 
     Returns ``{'ok', 'ask_id', 'refused', 'card'}`` (plus ``'reused': True``
     when the same question is already open).  ``refused`` names why nothing
     was sent: 'no_person', 'not_an_object', 'secrets_go_to_the_vault',
-    'unknown_purpose', 'no_agent', 'too_many_open_asks', 'not_shown' (the
+    'unknown_purpose', 'no_agent', 'say_why_in_description' (no reason given:
+    neither ``body`` nor the component's description), 'too_many_open_asks',
+    'not_shown' (the
     Liquid UI gates refused the card: switched off, the hive halted, unsafe
     content, an unknown type, too many pushes; the log says which) or
     'not_filed' (its row could not be written).
@@ -274,9 +319,22 @@ def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
         return _refused(refused)
     ctype = component['type']
     agent_id = str(agent_id if agent_id is not None else (prompt_id or ''))
-    title = (title or component.get('title') or 'Your agent needs your answer').strip()
+    # The card says who asks and why (owner 2026-11-03: "Your agent asks for
+    # files ... not why, for what"): the reason is the agent's own words, so an
+    # ask without one is not sent; with no title of its own, the title names
+    # the agent as the person knows it.  The card, the bell row and the push
+    # carry the same title and reason.
     body = (body or component.get('description') or '').strip()
+    if not body:
+        logger.info("person ask refused (say_why_in_description) for user %s by "
+                    "agent %s", user_id, agent_id)
+        return _refused('say_why_in_description')
+    title = (title or component.get('title') or '').strip()
+    if not title:
+        name = _agent_name(agent_id)
+        title = (f'{name} asks you' if name else 'Your agent needs your answer')
     card = dict(component)
+    card['title'], card['description'] = title, body
     card.pop('msg_id', None)
     if ctype == 'file_request':
         _file_card(card, prompt_id)
@@ -288,13 +346,16 @@ def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
             if a.same == same:
                 return {'ok': True, 'ask_id': a.ask_id, 'refused': None, 'card': True,
                         'reused': True}
-        if len(mine) >= MAX_OPEN_PER_PERSON:
-            logger.warning("person ask refused for user %s by agent %s: %d asks "
-                           "already open", user_id, agent_id, len(mine))
+        kind = [a for a in mine if a.background == bool(background)]
+        if len(kind) >= MAX_OPEN_PER_PERSON:
+            logger.warning("person ask refused for user %s by agent %s: %d %s asks "
+                           "already open", user_id, agent_id, len(kind),
+                           'background' if background else 'own')
             return _refused('too_many_open_asks')
         ask_id = uuid.uuid4().hex
         a = _Ask(ask_id, user_id, agent_id,
-                 None if prompt_id is None else str(prompt_id), ctype, card, same)
+                 None if prompt_id is None else str(prompt_id), ctype, card, same,
+                 background=background)
         _asks[ask_id] = a
     card['ask_id'] = ask_id
     card['msg_id'] = ask_id
@@ -469,7 +530,8 @@ def answer_ask(ask_id, answer, answerer_id) -> Tuple[dict, int]:
     Returns ``(body, http_status)``: 200 answered; 400 'bad_answer',
     'secrets_go_to_the_vault' or 'files_not_received' (the ask stays open);
     403 'not_yours'; 404 'not_found'; 409 'already_answered' (with the answer
-    already given, which stands); 410 'expired' (the turn that asked ended).
+    already given, which stands) or 'dismissed' (she closed it on a surface);
+    410 'expired' (the turn that asked ended).
     """
     ask_id = str(ask_id or '')
     with _lock:
@@ -482,8 +544,7 @@ def answer_ask(ask_id, answer, answerer_id) -> Tuple[dict, int]:
         return {'status': 'error', 'reason': 'not_yours'}, 403
     with _lock:
         if a.answered_at is not None:
-            return {'status': 'error', 'reason': 'already_answered',
-                    'answer': a.answer}, 409
+            return _already_closed(a)
     problem = _answer_problem(a, answer)
     if problem is None and a.ctype == 'file_request':
         problem = _bind_picks(a, answer['xids'])
@@ -491,8 +552,7 @@ def answer_ask(ask_id, answer, answerer_id) -> Tuple[dict, int]:
         return {'status': 'error', 'reason': problem}, 400
     with _lock:
         if a.answered_at is not None:
-            return {'status': 'error', 'reason': 'already_answered',
-                    'answer': a.answer}, 409
+            return _already_closed(a)
         a.answer = dict(answer)
         a.answered_at = time.time()
         a.event.set()
@@ -501,12 +561,58 @@ def answer_ask(ask_id, answer, answerer_id) -> Tuple[dict, int]:
     return {'status': 'ok', 'ask_id': ask_id}, 200
 
 
+def _already_closed(a: '_Ask') -> Tuple[dict, int]:
+    """409 for an ask that is no longer open: answered (the answer stands) or
+    dismissed.  Called under _lock."""
+    if a.dismissed:
+        return {'status': 'error', 'reason': 'dismissed'}, 409
+    return {'status': 'error', 'reason': 'already_answered', 'answer': a.answer}, 409
+
+
+def dismiss_ask(ask_id, dismisser_id) -> Tuple[dict, int]:
+    """The person closes ask ``ask_id`` without answering, from any surface.
+
+    The same door and the same rules as answer_ask: ``dismisser_id`` is the
+    caller's VERIFIED identity, only the person asked may close it, and only
+    while it is open.  It then closes the way an answered ask closes (every
+    surface drops its card, the bell row is marked read) and the waiting
+    agent wakes to ``dismissed``.  Returns 200; 403 'not_yours'; 404
+    'not_found'; 409 'already_answered' or 'dismissed'; 410 'expired' (the
+    turn that asked ended: the card is still dropped everywhere)."""
+    ask_id = str(ask_id or '')
+    with _lock:
+        a = _asks.get(ask_id)
+    if a is None:
+        return _expired_or_unknown(ask_id, dismisser_id)
+    if not dismisser_id or str(dismisser_id) != a.user_id:
+        logger.warning("person ask %s: a dismissal from %r refused, the ask is for "
+                       "user %s", ask_id, dismisser_id, a.user_id)
+        return {'status': 'error', 'reason': 'not_yours'}, 403
+    with _lock:
+        if a.answered_at is not None:
+            return _already_closed(a)
+        a.dismissed = True
+        a.answered_at = time.time()
+        a.event.set()
+    _close(ask_id, a.user_id)
+    logger.info("person ask %s (%s) dismissed by user %s", ask_id, a.ctype, a.user_id)
+    return {'status': 'ok', 'ask_id': ask_id, 'dismissed': True}, 200
+
+
 def answer_from_request(req, data) -> Tuple[dict, int]:
     """/api/agent/approval's ask branch, for both of its routes (this node's
-    and the shell's): the answerer is the caller's Bearer identity."""
-    from integrations.commerce.approvals import approver_from_request
-    return answer_ask((data or {}).get('ask_id'), (data or {}).get('answer'),
-                      approver_from_request(req))
+    and the shell's): the answerer is the caller's Bearer identity.  A
+    signed-in person is who their token names (approver_from_request).  A
+    phone is this desktop's owner when the owner allowed it and it signed as
+    them, else nobody (integrations.social.auth.allowed_device_owner): the
+    owner's phone answers the owner's asks, and only asks.  ``"dismiss":
+    true`` closes the ask unanswered (dismiss_ask), by the same identity."""
+    from integrations.commerce.approvals import approver_from_request, bearer_token
+    from integrations.social.auth import allowed_device_owner
+    answerer = approver_from_request(req) or allowed_device_owner(bearer_token(req))
+    if (data or {}).get('dismiss') is True:
+        return dismiss_ask((data or {}).get('ask_id'), answerer)
+    return answer_ask((data or {}).get('ask_id'), (data or {}).get('answer'), answerer)
 
 
 def wait_for_answer(ask_id, timeout_s) -> Optional[dict]:
@@ -522,21 +628,37 @@ def wait_for_answer(ask_id, timeout_s) -> Optional[dict]:
 def ask_state(ask_id, user_id) -> dict:
     """``{'status', 'answer'}`` of an ask, as ``user_id``'s agent may read it.
 
-    'open', 'answered' (with the answer), 'expired' (her ask, no longer held
-    here: a restart, or kept past ANSWERED_KEEP_S; ask again) or 'not_found'
-    (no such ask of hers)."""
+    'open', 'answered' (with the answer), 'dismissed' (she closed it without
+    an answer), 'expired' (her ask, no longer held here: a restart, or kept
+    past ANSWERED_KEEP_S; ask again) or 'not_found' (no such ask of hers)."""
     ask_id, user_id = str(ask_id or ''), str(user_id or '')
     with _lock:
         a = _asks.get(ask_id)
         if a is not None:
             if a.user_id != user_id:
                 return {'status': 'not_found', 'answer': None}
+            if a.dismissed:
+                return {'status': 'dismissed', 'answer': None}
             if a.answer is not None:
                 return {'status': 'answered', 'answer': dict(a.answer)}
             return {'status': 'open', 'answer': None}
     if ask_id and user_id and _owner_of_row(ask_id) == user_id:
         return {'status': 'expired', 'answer': None}
     return {'status': 'not_found', 'answer': None}
+
+
+def open_ask_ids(user_id, agent_id, background=False) -> list:
+    """The ids of ``agent_id``'s own asks of ``user_id`` still open, of one
+    kind (background work's, or the person's own turns'), oldest first: what
+    an agent refused for too_many_open_asks is told to read instead of
+    asking again.  Never another agent's: ask_state lets any agent of the
+    person read an id it is given."""
+    user_id, agent_id = str(user_id or ''), str(agent_id or '')
+    with _lock:
+        mine = [a for a in _asks.values()
+                if a.user_id == user_id and a.agent_id == agent_id
+                and a.answered_at is None and a.background == bool(background)]
+    return [a.ask_id for a in sorted(mine, key=lambda a: a.created)]
 
 
 def open_file_request(ask_id, user_id) -> Optional[dict]:
@@ -552,16 +674,70 @@ def open_file_request(ask_id, user_id) -> Optional[dict]:
         return {'purpose': a.purpose, 'prompt_id': a.prompt_id, 'max_files': a.max_files}
 
 
-def ask_person_tool(user_id, prompt_id, agent_id=None):
-    """The ``ask_person`` tool every agent has: (name, description, func)."""
+def person_to_ask(user_id, request_id=None) -> Optional[str]:
+    """Whom an ask from a turn reaches.  A background turn (request id
+    daemon_<goal id>, core.chat_client.daemon_goal_id) asks its goal's
+    person; any other turn asks the person behind ``user_id``.  Who the
+    person is, is core.event_attribution.person_for's to say: a goal with no
+    owner (system seeded), or a system identity, is the node owner's.
+
+    Every daemon turn on a keyless node runs as 'system_daemon'
+    (dispatch._internal_auth_headers), so its asks went to that name and
+    reached nobody (central 2026-10-31 10:29:25Z).  Owner, relayed
+    2026-11-03: daemon goals reach the owner of central (10202) or their
+    co-owners."""
+    from core.chat_client import daemon_goal_id
+    from core.event_attribution import goal_owner_user_id, person_for
+    goal_id = daemon_goal_id(request_id)
+    if goal_id:
+        try:
+            from integrations.social.models import AgentGoal, db_session
+            with db_session(commit=False) as db:
+                goal = db.query(AgentGoal).filter_by(id=goal_id).first()
+                if goal is not None:
+                    return person_for(goal_owner_user_id(goal), db)
+            logger.warning("person ask: goal %s of request %s is not here; the "
+                           "turn's own person is asked", goal_id, request_id)
+        except Exception:
+            logger.warning("person ask: goal %s could not be read; the turn's "
+                           "own person is asked", goal_id, exc_info=True)
+    return person_for(user_id)
+
+
+def ask_person_tool(user_id, prompt_id, agent_id=None, request_id=None):
+    """The ``ask_person`` tool every agent has: (name, description, func).
+
+    ``request_id`` gives the turn's request id (a callable, read at each
+    call): the person asked is person_to_ask's, worked out per call,
+    because one agent's session and its tools serve every goal of that
+    agent.  A turn that is not the person's own (core.chat_client.
+    is_user_turn) asks as background work, under its own open-ask limit.
+
+    A file_request's purpose is one the store keeps (INBOUND_PURPOSES): the
+    description names each with what it is for (UploadPurpose.use), and a
+    refusal of any other names them again, so the agent's next ask can name
+    one (live 2026-11-01: agent 342 made seven file_requests under five
+    purposes it made up, 'reel_clips', 'make_reel' and others, and every one
+    was refused).  Nothing is guessed for it.
+
+    The hint shows the shape of an ask, with its reason, and holds up no
+    agent's purpose: it showed one example, Reel Studio's video request, and
+    the speech-therapy agent sent it word for word, twice (live 2026-11-07,
+    agent 1794031134533, "choose video" cards with no reason on them).
+    Whether this hint changes what the model sends is measured live."""
+    from core.agent_tool_menu import ASK_PERSON_TOOL
+    from core.chat_client import is_user_turn
+    from core.user_file_store import INBOUND_PURPOSES, PURPOSES
+    purposes = list(INBOUND_PURPOSES)
 
     def ask_person(
-            component: Annotated[str, 'Liquid UI component JSON, e.g. {"type":"file_request",'
-                                      '"purpose":"reel_source","accept":"video"}'],
+            component: Annotated[str, _ASK_SHAPE],
             wait_seconds: Annotated[int, f"seconds to wait now, max {MAX_WAIT_S}"] = DEFAULT_WAIT_S,
             ask_id: Annotated[str, "an earlier ask's id: read its answer"] = '') -> str:
+        rid = request_id() if callable(request_id) else request_id
+        person = person_to_ask(user_id, rid)
         if ask_id:
-            state = ask_state(ask_id, user_id)
+            state = ask_state(ask_id, person)
             reply = {'answered': state['status'] == 'answered', 'ask_id': ask_id,
                      'answer': state['answer'],
                      'status': ('waiting_for_person' if state['status'] == 'open'
@@ -569,6 +745,8 @@ def ask_person_tool(user_id, prompt_id, agent_id=None):
             if state['status'] == 'expired':
                 reply['note'] = ('This ask is gone (the node restarted, or its answer '
                                  'was kept too long). Ask again if you still need it.')
+            elif state['status'] == 'not_found':
+                reply['note'] = _NOT_FOUND
             return json.dumps(reply)
         try:
             comp = json.loads(component) if isinstance(component, str) else component
@@ -576,11 +754,20 @@ def ask_person_tool(user_id, prompt_id, agent_id=None):
             comp = None
         if isinstance(comp, dict) and prompt_id is not None:
             comp.setdefault('prompt_id', str(prompt_id))
-        out = ask(user_id, agent_id if agent_id is not None else prompt_id, comp,
-                  prompt_id=prompt_id)
+        # Not the person's own turn (core.chat_client.is_user_turn, the one
+        # rule dispatch uses): its ask is background work's.
+        background = not is_user_turn({'request_id': rid})
+        asker = agent_id if agent_id is not None else prompt_id
+        out = ask(person, asker, comp, prompt_id=prompt_id, background=background)
         if not out['ok']:
-            return json.dumps({'answered': False, 'refused': out['refused'],
-                               'status': 'refused'})
+            # The failed shape stays ('refused', status 'refused'); the note
+            # says what was wrong and what to do instead (owner 11-09).
+            reply = {'answered': False, 'refused': out['refused'], 'status': 'refused',
+                     'note': _refusal_note(out['refused'], comp, person,
+                                           '' if asker is None else asker, background)}
+            if out['refused'] == 'unknown_purpose':
+                reply['purposes'] = purposes
+            return json.dumps(reply)
         try:
             wait_s = min(float(wait_seconds or 0), float(MAX_WAIT_S))
         except (TypeError, ValueError):
@@ -593,9 +780,82 @@ def ask_person_tool(user_id, prompt_id, agent_id=None):
             'answered': False, 'ask_id': out['ask_id'], 'status': 'waiting_for_person',
             'note': ('The question is on their devices and they have not answered '
                      'yet. This step is not done: read the answer later with '
-                     'ask_person(ask_id=...).')})
+                     '%s(ask_id=...).' % ASK_PERSON_TOOL)})
 
-    return ('ask_person',
-            ('Ask your person on any of their devices and get their answer, e.g. a '
-             'file_request for clips. Never for a password or key.'),
+    return (ASK_PERSON_TOOL,
+            ('Ask your person on any of their devices and get their answer. To ask '
+             'for files, send a file_request whose purpose is the one that fits: '
+             + '; '.join(f'{p} ({PURPOSES[p].use})' if PURPOSES[p].use else p
+                         for p in purposes)
+             + '. Never for a password or key.'),
             ask_person)
+
+
+#: How an ask is shaped, as the tool's component parameter tells the model: a
+#: reason always, and no agent's purpose held up as the example.
+_ASK_SHAPE = ('Liquid UI component JSON. Always put why you ask in "description", '
+              'in your own words: the person reads it on the card. A question: '
+              '{"type": "form", "description": "<why you ask>", "fields": '
+              '[{"name": "answer", "label": "<your question>", "type": "text"}]}. '
+              'Files: type "file_request", with the "description" and the "purpose" '
+              'that fits, from the tool description.')
+#: The refusal note of an ask with no reason.
+_SAY_WHY = ('Not sent: say why you ask in the component\'s "description", in your '
+            'own words. The person reads it on the card.')
+#: What each refusal tells the model: what was wrong with the call and what
+#: to do instead (owner 11-09: "all refusals shd hint llm on what was wrong
+#: with tool call").  A bare code made the 4B ask again: 66 of the desktop's
+#: 135 failing tool replies were this tool's too_many_open_asks (measured by
+#: hartos-16 in llm_outbound.jsonl).  not_an_object and too_many_open_asks
+#: are worded per call, in _refusal_note.
+_REFUSAL_NOTES = {
+    'no_person': ('Not sent: this turn has no person to ask. Do the step without '
+                  'asking, or say in your reply that it needs a person.'),
+    'secrets_go_to_the_vault': (
+        'Not sent: it asks for a password, key, code or other secret, and a person '
+        'is never asked for one this way. Ask for it with request_resource, the '
+        'vault\'s credential tool; if request_resource is not in your tools, call '
+        'request_tools with need="request_resource" first.'),
+    'unknown_purpose': ('Not sent: that "purpose" is not one this node keeps files '
+                        'for. Use one of purposes.'),
+    'no_agent': ('Not sent: files are kept for the agent that asks, and this turn has '
+                 'no agent to keep them for. Do the step without the files, or say in '
+                 'your reply that it needs them.'),
+    'say_why_in_description': _SAY_WHY,
+    'not_shown': ('Not sent: the card was stopped before it reached the person (cards '
+                  'switched off, the hive halted, unsafe content, a "type" their '
+                  'devices do not show, or too many cards at once). Use a "type" such '
+                  'as "form" or "file_request"; if it is stopped again, carry on '
+                  'without asking.'),
+    'not_filed': ('Not sent: the question could not be saved on this node, so it never '
+                  'reached the person. Try once more later; if it fails again, carry '
+                  'on without asking.'),
+}
+#: An ask_id this person has no question under.
+_NOT_FOUND = ('No question of this person has that ask_id. To read an answer, use the '
+              'exact ask_id an earlier reply of this tool gave you; to ask a new '
+              'question, leave ask_id empty.')
+
+
+def _refusal_note(refused, comp, person, asker, background) -> str:
+    """The note on a refused ask: what was wrong with the call and what to
+    do instead, in words the model can act on."""
+    from core.agent_tool_menu import ASK_PERSON_TOOL
+    if refused == 'not_an_object':
+        got = ('it has no "type"' if isinstance(comp, dict)
+               else 'what you sent is not JSON' if comp is None
+               else 'what you sent is JSON but not an object')
+        return f'Not sent: component must be a JSON object with a "type"; {got}. {_ASK_SHAPE}'
+    if refused == 'too_many_open_asks':
+        whose = 'from background work ' if background else ''
+        said = (f'Not sent: this person already has {MAX_OPEN_PER_PERSON} questions '
+                f'{whose}open, the most at once. Do not ask again now. ')
+        mine = open_ask_ids(person, asker, background)
+        if mine:
+            return said + ('Yours are %s: read each answer with %s(ask_id=...), and '
+                           'ask something new once one is answered.'
+                           % (', '.join(mine), ASK_PERSON_TOOL))
+        return said + ("They are other agents' questions: carry on without asking, "
+                       'and ask once one of them is answered.')
+    return _REFUSAL_NOTES.get(refused) or (
+        f'Not sent ({refused}): change the component before asking again.')

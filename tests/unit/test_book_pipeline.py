@@ -44,6 +44,11 @@ def _by_page(file_id, field='passage'):
 #: together, so this literal cannot drift from the column either.
 READER_ID_CHARS = 64
 
+#: 1.0 s after the epoch, a multiple of 100 ns so it round-trips exactly on
+#: NTFS (measured). Nothing real carries this mtime, so finding it unchanged
+#: proves nothing rewrote the file after it was published.
+_MTIME_SENTINEL = 1_000_000_000
+
 
 def _row(file_id):
     return bp.get_book(file_id)
@@ -149,7 +154,15 @@ class TestPageImages:
                 # Recorded only if it SUCCEEDED. shutil.move tries os.rename
                 # first and falls back to copy+delete on EXDEV, so counting
                 # the attempt let a cross-volume copy pass as a publish.
-                published.append((Path(dst), existed, Path(dst).stat().st_mtime_ns))
+                # A rewrite inside one clock tick leaves st_mtime_ns
+                # untouched (~15.6 ms on Windows), so comparing the
+                # publish-time mtime to the end-time mtime cannot see the
+                # rewrite it is here to catch: measured, an immediate second
+                # write_bytes left the value identical. A sentinel the OS
+                # would never produce has no resolution to lose, because any
+                # write at all resets mtime to now.
+                os.utime(dst, ns=(_MTIME_SENTINEL, _MTIME_SENTINEL))
+                published.append((Path(dst), existed))
                 return result
             return spy
 
@@ -181,7 +194,7 @@ class TestPageImages:
         # the copy -- exactly what this test's name forbids -- and survived all
         # 195 (MC_copy_publish). An atomic rename has no such window.
         assert len(published) == 1, published
-        target, served_existed, at_publish = published[0]
+        target, served_existed = published[0]
         assert target == out
         # Nothing had reached the served name before that atomic publish. A
         # copy into place FOLLOWED by a same-folder rename counts one rename
@@ -198,7 +211,7 @@ class TestPageImages:
         # And nothing touched the served name AFTER the publish. An atomic
         # publish followed by an in-place rewrite serves a half-written file
         # just as surely, and passed because nothing looked past the rename.
-        assert out.stat().st_mtime_ns == at_publish
+        assert out.stat().st_mtime_ns == _MTIME_SENTINEL
         assert list(tmp_path.iterdir()) == [out]
 
     def test_every_page_gets_an_image(self, book_node, tmp_path):

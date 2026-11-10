@@ -183,6 +183,52 @@ def _sanitize_goal_input(text: str, max_length: int = 2000) -> str:
     return sanitized
 
 
+#: How much of each Product field a goal prompt shows.  A Product row is a
+#: signed-in person's own text (POST /api/marketing/products), so it is
+#: cleaned and capped the way a goal's title and description are.
+_PRODUCT_FIELD_CAPS = {'name': 200, 'description': 1000, 'tagline': 200,
+                       'target_audience': 300, 'unique_value_prop': 300,
+                       'product_url': 300, 'category': 100}
+_PRODUCT_KEYWORDS_MAX = 12
+_PRODUCT_KEYWORD_CAP = 60
+
+
+def product_fields(product_dict) -> Optional[Dict]:
+    """A Product row's fields as goal prompts show them, or None when there
+    is no row (not a dict, or an empty one).
+
+    The one reader of a Product row for prompts (the marketing and sales
+    builders).  Every field comes back as text, cleaned and capped by
+    _sanitize_goal_input ('' when missing, None or not text-like);
+    'keywords' as a list of words: a list as given, a comma-separated text
+    split, anything else none.  Keywords are not type-checked when a row is
+    written, and a number there crashed the prompt (review of 44f21b312:
+    keywords 7 raised TypeError; a text came out letter by letter);
+    'is_platform_product' as a bool.  A row whose name is blank is still
+    its owner's product ('name' comes back ''): the API refuses a blank
+    name now, but an older row was marketed as the owner's (review of
+    d2ad38b22)."""
+    if not isinstance(product_dict, dict) or not product_dict:
+        return None
+    out = {}
+    for key, cap in _PRODUCT_FIELD_CAPS.items():
+        value = product_dict.get(key)
+        if value is None or isinstance(value, (dict, list, tuple, set, bool)):
+            value = ''
+        out[key] = _sanitize_goal_input(str(value), max_length=cap).strip()
+    raw = product_dict.get('keywords')
+    if isinstance(raw, str):
+        raw = raw.split(',')
+    if not isinstance(raw, (list, tuple, set)):
+        raw = []
+    words = [_sanitize_goal_input(str(k), max_length=_PRODUCT_KEYWORD_CAP).strip()
+             for k in raw
+             if isinstance(k, (str, int, float)) and not isinstance(k, bool)]
+    out['keywords'] = [w for w in words if w][:_PRODUCT_KEYWORDS_MAX]
+    out['is_platform_product'] = bool(product_dict.get('is_platform_product'))
+    return out
+
+
 # ─── Goal Manager ───
 
 #: Why a goal is paused, as code reads it (the prose in pause_reason is for
@@ -197,6 +243,46 @@ PAUSE_CAUSE_BUDGET = 'budget'                         # the budget gate
 PAUSE_CAUSE_NEEDS_HELP = 'needs_help'                 # escalate_goal: a person's hand
 PAUSE_CAUSE_PERSON = 'person'                         # the dashboard's pause verb
 PAUSE_CAUSE_NO_OWNER = 'no_owner_to_ask'              # the consent gate: nobody to ask
+PAUSE_CAUSE_REMEDIATION_OPEN = 'remediation_open'     # the settlement gate: the loophole is still there
+
+#: The pause record: what GoalManager.pause_goal and its writers set on a
+#: paused goal, and what resume_goal moves to its last_* history keys.  One
+#: tuple, so a key added to the record is also retired by the resume (review
+#: of d73463359 by claude-autostart-71: pause_signature was missing from the
+#: hand-kept list until that commit).
+PAUSE_RECORD_KEYS = ('pause_reason', 'paused_at', 'pause_cause', 'paused_by',
+                     'told_at', 'pause_signature')
+
+#: The words a dispatch-failure pause says to people (pause_reason).  The
+#: agent daemon and the coding daemon write them through
+#: dispatch_failure_pause_reason (the literal was written in two places,
+#: review of 3d4c5b3a3's set by claude-autostart-71).  Rewording them is
+#: safe: a new row is read by its pause_cause, and an old row by the frozen
+#: copy below.
+DISPATCH_FAILURE_PAUSE_PREFIX = 'Auto-paused: '
+DISPATCH_FAILURE_PAUSE_WORDS = 'consecutive dispatch failures'
+
+
+def dispatch_failure_pause_reason(failures, why=None) -> str:
+    """The sentence a dispatch-failure pause leaves for people."""
+    return (f'{DISPATCH_FAILURE_PAUSE_PREFIX}{failures} {DISPATCH_FAILURE_PAUSE_WORDS}'
+            + (f' (last: {why})' if why else ''))
+
+
+#: The sentence as rows paused before pause_cause existed hold it, frozen
+#: from the reader those rows were written for (agent_daemon before
+#: cd49395bc): an old row keeps the words it was written with, so its reader
+#: must not follow a later rewording of the writer's constants above
+#: (hartos-00's review of cd49395bc, F3).
+_PRE_CAUSE_DISPATCH_FAILURE_PAUSE = ('Auto-paused:', 'consecutive dispatch failures')
+
+
+def is_dispatch_failure_pause_reason(reason) -> bool:
+    """Whether ``reason`` is the dispatch-failure sentence of a row paused
+    before pause_cause existed, the only rows whose words are read."""
+    text = str(reason or '')
+    prefix, words = _PRE_CAUSE_DISPATCH_FAILURE_PAUSE
+    return text.startswith(prefix) and words in text
 
 
 class GoalManager:
@@ -332,8 +418,10 @@ class GoalManager:
         semantics, one leaving the old pause reason and strike count on the
         goal).
 
-        Moves the pause record (pause_reason, paused_at, pause_cause,
-        paused_by, told_at, pause_signature) to its last_* history keys, and
+        Moves the pause record (PAUSE_RECORD_KEYS) to its last_* history keys,
+        ends the coding daemon's strike count (_dispatch_failures, which only
+        a turn that ran cleared, so the first failure after a resume paused
+        the goal again: review of d73463359 by claude-autostart-71), and
         with it a person's hand on the goal (escalate_goal's human stage,
         escalation.next == 'human': the daemon's guard on it would otherwise
         exclude the goal from its resume for life, review of fbc54ddd6; the
@@ -356,10 +444,10 @@ class GoalManager:
                     'error': f'not paused (status {goal.status})'}
         prior = goal.config_json
         cfg = dict(prior or {})
-        for key in ('pause_reason', 'paused_at', 'pause_cause', 'paused_by', 'told_at',
-                    'pause_signature'):
+        for key in PAUSE_RECORD_KEYS:
             if key in cfg:
                 cfg['last_' + key] = cfg.pop(key)
+        cfg.pop('_dispatch_failures', None)
         escalation = cfg.get('escalation')
         if isinstance(escalation, dict) and escalation.get('next') == 'human':
             cfg['last_escalation'] = cfg.pop('escalation')
@@ -923,18 +1011,25 @@ def _build_marketing_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None
     # Product-specific information
     product_section = ''
     is_platform_product = False
-    if product_dict:
-        is_platform_product = product_dict.get('is_platform_product', False)
+    product = product_fields(product_dict)
+    if product:
+        is_platform_product = product['is_platform_product']
+        # The two defaults apply only when the row has no such key, as
+        # before product_fields: a row the API wrote with a blank audience
+        # shows it blank (review of d2ad38b22).
+        audience = (product['target_audience'] if 'target_audience' in product_dict
+                    else 'everyone who wants a better life')
+        category = product['category'] if 'category' in product_dict else 'platform'
         product_section = (
             f"PRODUCT YOU ARE MARKETING:\n"
-            f"  Name: {product_dict['name']}\n"
-            f"  Description: {product_dict.get('description', '')}\n"
-            f"  Tagline: {product_dict.get('tagline', '')}\n"
-            f"  Target audience: {product_dict.get('target_audience', 'everyone who wants a better life')}\n"
-            f"  Unique value: {product_dict.get('unique_value_prop', '')}\n"
-            f"  Product URL: {product_dict.get('product_url', '')}\n"
-            f"  Keywords: {', '.join(product_dict.get('keywords', []))}\n"
-            f"  Category: {product_dict.get('category', 'platform')}\n\n"
+            f"  Name: {product['name']}\n"
+            f"  Description: {product['description']}\n"
+            f"  Tagline: {product['tagline']}\n"
+            f"  Target audience: {audience}\n"
+            f"  Unique value: {product['unique_value_prop']}\n"
+            f"  Product URL: {product['product_url']}\n"
+            f"  Keywords: {', '.join(product['keywords'])}\n"
+            f"  Category: {category}\n\n"
         )
     else:
         # No specific product — marketing the platform itself

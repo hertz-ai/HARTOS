@@ -90,8 +90,13 @@ no owner today):
      kind of file the store takes for the purpose (video for `reel_source`,
      image for `logo`, audio for `song_audio`; none for a chat attachment,
      which takes several kinds), so every surface opens the right picker.
-  3. The same question already open is the same ask (no second push). A
-     person has at most `MAX_OPEN_PER_PERSON` (3) open asks.
+  3. The same question already open is the same ask (no second push),
+     whichever kind of turn asks it. A person has at most
+     `MAX_OPEN_PER_PERSON` (3) open asks of each kind: 3 from their own
+     turns and 3 from background work (a turn that is not theirs by
+     `core.chat_client.is_user_turn`: a `daemon_` request id, or none), so
+     6 open asks and 6 pushes at most, and background work never takes the
+     place of the person's own asks.
   4. Pushes the card FIRST, through `push_agent_ui`, with `ask_id` on it;
      `agent_ui_compose` keeps a card's `ask_id` as its `msg_id`, so every
      copy on every surface is the ask. The card's gates are the human's and
@@ -159,11 +164,25 @@ capability consent.
   relay), desktop-only: a mobile-adapter alias row (`aliases.py`, `POST
   azurekong.hertzai.com/api/agent/approval`) maps the call to this door, and
   the adapter runs it through the API gate as the device the owner allowed
-  (its token; the body names the token's user, #51). The door takes the
-  gate's verdict as the answerer (`approver_from_request`: `g.auth_source
-  == 'device'`, the token's user); a verdict without a user answers for
-  nobody. Not done: central's own asks are not answered from the phone (a
-  desktop-only answer never goes to the cloud).
+  (its token; the body names the token's user, #51).
+- The door checks the phone's token itself, with the gate's own check
+  (`social.auth.allowed_device_owner` on `verify_device_jwt`). It never
+  reads the gate's verdict on `flask.g`: on a desktop Nunba runs this route
+  in-process through `test_client()`, which carries only the Authorization
+  header (review of ec468c821, C1).
+- A phone answers as the desktop's owner, and only when two things hold:
+  the owner allowed its key ("Allow it only if the phone is yours"), and
+  the token is signed as the owner. Signed as anyone else, it names nobody.
+- A phone's token names nobody on the door's other branches: payments,
+  store drafts, game sounds and mandate reads. They take a signed-in person
+  (`approver_from_request`). Whether a phone may approve those is the
+  owner's call, per phone and per action (review C2/M1).
+- A capability consent (camera, screen) is recorded as the owner whoever
+  answers, as it always was. The alias row lets the owner's allowed phone
+  answer one off the LAN too (review M2). Scoping that per phone is the
+  same open call.
+- Not done: central's own asks are not answered from the phone, because a
+  desktop-only answer never goes to the cloud.
 
 NOT a door, by decision (2026-10-27, security): the reply topic
 `com.hertzai.pupit.{user}`. Central's router is anonymous (realm1, measured
@@ -201,6 +220,16 @@ with no per-agent code. It files the ask and waits up to `wait_seconds`
 result. If not, the tool returns a held reply. Like a help pause, a held
 reply is neither work done nor a failure, and the agent reads the answer
 with `ask_person(ask_id=...)` on its next turn (`ask_state`).
+
+The tool's description names the purposes a `file_request` may take (the
+store's `INBOUND_PURPOSES`), and a refusal for any other (`unknown_purpose`)
+names them again under `purposes`, so the agent's next ask can name one.
+Nothing is guessed for it. Live 2026-11-01: agent 342 made seven
+`file_request` asks under five purposes it made up ('reel_clips',
+'make_reel' and others); each was refused, and the refusal named no
+purpose. The tool's component example already showed `reel_source`; no
+list of the purposes was given. Whether the list changes what the model
+picks is not yet measured live.
 
 Not done yet: an answer that comes after the turn ended does not start a
 new turn by itself; the agent reads it when it next runs.

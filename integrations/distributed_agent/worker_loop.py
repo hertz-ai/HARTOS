@@ -695,11 +695,15 @@ class DistributedWorkerLoop:
         # create loop just parked.  _tick holds the task.  Measured on the
         # Nunba desktop 2026-09-15: three "Paused for help" replies were
         # submitted, hashed and notified as completed contributions.
-        if is_help_pause(response):
+        # ...or the session's REUSE step waits for the person's reply to a
+        # question it asked them (#161, core.agent_tools.is_waiting_for_person):
+        # the same hold, since a retry claim would only find it waiting again.
+        from core.agent_tools import is_waiting_for_person
+        if is_help_pause(response) or is_waiting_for_person(response):
             logger.warning(
-                f"Worker task {task.task_id}: the action was handed on "
-                f"({response[:120]!r}); holding the task instead of "
-                f"recording it as a result")
+                f"Worker task {task.task_id}: the action was handed on or waits "
+                f"for the person ({response[:120]!r}); holding the task instead "
+                f"of recording it as a result")
             return HeldForHelp(response)
 
         # GUARDRAIL: post-response check (fail-closed)

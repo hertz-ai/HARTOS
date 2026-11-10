@@ -43,10 +43,12 @@ ALIASES: tuple = (
     # serve (kids transport scopes: 501) goes to the cloud.
     Alias('POST', CLOUD, '/chat/teachme2', '/chat/teachme2', CHAT_WAIT_S),
     Alias('POST', CLOUD, '/chat/custom_gpt', '/chat/custom_gpt', CHAT_WAIT_S),
-    # The answer to an agent's ask, and a card's approval (Android
-    # PersonAsk.send; integrations.agent_engine.person_ask): the desktop
-    # holds its own asks, and its one door names the answerer from the
-    # device's verified token (commerce.approvals.approver_from_request).
+    # The answer to an agent's ask (Android PersonAsk.send, desktop-only;
+    # integrations.agent_engine.person_ask): the desktop holds its own asks,
+    # and its one door takes the phone as the owner who allowed it
+    # (social.auth.allowed_device_owner).  A phone's token names nobody on
+    # the door's payment, draft and game-sound branches
+    # (commerce.approvals.approver_from_request).
     Alias('POST', CLOUD, '/api/agent/approval', '/api/agent/approval'),
 )
 

@@ -208,6 +208,31 @@ def is_held_for_another_turn(reply) -> bool:
     return reply.strip().startswith(HELD_FOR_ANOTHER_TURN_REPLY_PREFIX)
 
 
+def waiting_for_person_reply(action_id) -> str:
+    """The sentence a background turn answers when the session's current
+    REUSE step is held for the person's reply (#161): the step asked them in
+    their own turn, and this turn neither ran it nor asked again.  Written
+    here, beside the predicate that recognises it, so a reworded sentence
+    cannot stop being recognised."""
+    from core.constants import WAITING_FOR_PERSON_REPLY_PREFIX
+    return (f"{WAITING_FOR_PERSON_REPLY_PREFIX} step {action_id} asked them a "
+            f"question and waits for their reply; this turn did not run it or "
+            f"ask again.")
+
+
+def is_waiting_for_person(reply) -> bool:
+    """True when ``reply`` is waiting_for_person_reply: the turn did not run
+    its step because the step waits for the person.  Neither a result nor a
+    failure nor a parked goal: the daemon counts no strike and keeps the goal
+    active (dispatch treats it as a transient defer), the hive worker holds
+    the task (HeldForHelp), nobody records it as work.  Recognised by the
+    prefix in core.constants."""
+    if not isinstance(reply, str):
+        return False
+    from core.constants import WAITING_FOR_PERSON_REPLY_PREFIX
+    return reply.strip().startswith(WAITING_FOR_PERSON_REPLY_PREFIX)
+
+
 def is_action_error_reply(reply) -> bool:
     """True when ``reply`` is the CREATE pipeline's structured error envelope,
     {"status": "error", "action": ..., "action_id": ..., "message": ...} — the
@@ -556,6 +581,99 @@ def memory_view(agent_data, prompt_id, user_prompt):
                     own if isinstance(own, dict) else {})
 
 
+def unfilled_key_placeholder(key) -> Optional[str]:
+    """The first ``<...>`` still left in a memory key, or None.
+
+    A placeholder is a '<', then something other than spaces, then the next
+    '>': the shape a saved step uses for "fill this in" ("teach.<that same
+    user id>").  It is found anywhere in the key, because the model copies
+    it in more than one shape: whole ('teach.<user_id>'), holding a dot
+    ('teach.<user.id>', twice on 10-10, each read answered by a loose match
+    as if it were the record) and glued to text ('<experiment_id>_state',
+    agent 29023956042's saved step).  A lone '<' or '>' and an empty '<>'
+    are not placeholders.  This reads the tool's own argument, not the
+    model's words.  Measured 2026-11-09 by the change's reviewer: all 48
+    logged placeholder calls have this shape, and no stored key outside the
+    incident's own record does.
+
+    Measured live 2026-11-07 14:12 IST (request msg_1794040636536_3y7gjm,
+    agent 54): save_data_in_memory(key='teach.<user_id>') stored the
+    learner's progress under the literal part '<user_id>', not teach.10202,
+    and the fabrication gate credited the save because the tool reported
+    success.  Read shape: get_data_by_key('teach.<d68c9dee-...>') on
+    2026-10-14 23:10, the real id in brackets.
+    """
+    text = str(key or '')
+    start = text.find('<')
+    while start != -1:
+        end = text.find('>', start + 1)
+        if end == -1:
+            return None
+        inner = text[start + 1:end]
+        if '<' in inner:                 # a later '<' opens the nearer pair
+            start = text.find('<', start + 1)
+            continue
+        if inner.strip():
+            return text[start:end + 1]
+        start = text.find('<', end + 1)
+    return None
+
+
+def _placeholder_key_refusal(tool, key, placeholder) -> str:
+    """The failed-call reply for a key ``unfilled_key_placeholder`` found,
+    built by core.tool_refusal.refuse: it starts with "Error:", so
+    core.constants.tool_reply_failed reads it as a failed call and the
+    fabrication gate re-steers instead of crediting it, and it says what to
+    change before calling again."""
+    from core.tool_refusal import refuse
+    return refuse(tool, f"the key {key} still holds the placeholder {placeholder}",
+                  "Look up the real value and put it in the placeholder's place "
+                  "(for example, a user id comes from get_user_id)")
+
+
+def key_not_found_reply(view, key) -> str:
+    """get_data_by_key's answer when nothing is saved at ``key``.
+
+    It opens with the sentence agents' saved steps already quote ("'Key not
+    found' means a new learner"), so those steps read it as before, and adds
+    what IS saved where the key's path stopped, so the next call can use a
+    real key instead of guessing another (owner 2026-11-09: every refusal
+    says what was wrong; measured that day, 22 'Key not found' replies in
+    two days and no hint of which keys exist).  It is a real answer, not a
+    failed call: a key nobody saved yet is how a first visit looks.
+
+    ``view`` is the person's memory view (memory_view), so only key names
+    this person can already read through get_saved_metadata are named.
+    """
+    node, walked = view, []
+    for part in str(key or '').split('.'):
+        if isinstance(node, dict) and part in node:
+            node, walked = node[part], walked + [part]
+        else:
+            break
+    where = '.'.join(walked)
+    if walked and not isinstance(node, dict):
+        known = f" {where} holds a value, not keys under it: read {where} itself."
+    else:
+        names = sorted(str(k) for k in node) if isinstance(node, dict) else []
+        shown = ', '.join(names[:20]) + (', ...' if len(names) > 20 else '')
+        if not names:
+            known = (f" Nothing is saved under {where}." if where
+                     else " Nothing is saved in this memory yet.")
+        elif where:
+            known = f" The keys saved under {where} are: {shown}."
+        else:
+            known = f" The saved top-level keys are: {shown}."
+    return (f"{KEY_NOT_FOUND} Nothing is saved at {key}.{known} If you meant "
+            f"one of those, read that key; if nothing was saved yet, this is a "
+            f"first visit: carry on without it.")
+
+
+#: The opening sentence of get_data_by_key's not-found answer, quoted by
+#: agents' saved steps, and the sentinel code here compares against.
+KEY_NOT_FOUND = "Key not found in stored data."
+
+
 def build_core_tool_closures(ctx):
     """Build session-scoped tool closures.  Returns list of (name, desc, func).
 
@@ -681,6 +799,11 @@ def build_core_tool_closures(ctx):
         save reaches another user.
         """
         tool_logger.info('INSIDE save_data_in_memory')
+        _placeholder = unfilled_key_placeholder(key)
+        if _placeholder:
+            tool_logger.warning(f"save_data_in_memory refused: key {key!r} holds "
+                                f"the placeholder {_placeholder!r}")
+            return _placeholder_key_refusal('save_data_in_memory', key, _placeholder)
         try:
             if isinstance(value, str) and (value.startswith('{') or value.startswith('[')):
                 value = _retrieve_json(value)
@@ -1423,7 +1546,7 @@ def build_core_tool_closures(ctx):
     # ------------------------------------------------------------------
     # 5. get_data_by_key
     # ------------------------------------------------------------------
-    _KEY_NOT_FOUND = "Key not found in stored data."
+    _KEY_NOT_FOUND = KEY_NOT_FOUND
 
     def _read_saved(key):
         """The value saved at ``key``, whole, or the not-found sentinel.
@@ -1494,7 +1617,15 @@ def build_core_tool_closures(ctx):
                 return (f'Nothing is stored for {key}: the elided text is kept '
                         f'for a day, and this one is gone or never existed.')
         else:
+            _placeholder = unfilled_key_placeholder(key)
+            if _placeholder:
+                tool_logger.warning(f"get_data_by_key refused: key {key!r} holds "
+                                    f"the placeholder {_placeholder!r}")
+                return _placeholder_key_refusal('get_data_by_key', key, _placeholder)
             value = _read_saved(key)
+            if value == _KEY_NOT_FOUND:
+                return key_not_found_reply(
+                    memory_view(agent_data, prompt_id, user_prompt), key)
         try:
             start = max(0, int(offset or 0))
         except (TypeError, ValueError):
@@ -1924,7 +2055,10 @@ def build_core_tool_closures(ctx):
             image_url = validate_url(image_url)
         except (ImportError, ValueError) as e:
             tool_logger.warning(f"Image URL blocked by SSRF filter: {image_url} — {e}")
-            return f"Error: URL blocked by security filter: {e}"
+            from core.tool_refusal import refuse
+            return refuse('get_text_from_image',
+                          f"image_url was refused by the security filter ({e})",
+                          "Pass a public http or https link to the image itself")
         # Try local Qwen Vision first (bundled mode), fall back to cloud
         from core.config_cache import get_vision_api, is_bundled
         url = get_vision_api()
@@ -1942,8 +2076,21 @@ def build_core_tool_closures(ctx):
             response = requests.request("POST", url, headers={}, data=payload, files=[], timeout=300)
         if response.status_code == 200:
             return response.text
-        else:
-            return 'Not able to get this page details try later'
+        # Was 'Not able to get this page details try later': not a failure to
+        # core.constants.tool_reply_failed, so a step could be credited with
+        # it, and it did not say whether the link or the service was at fault
+        # (owner 2026-11-09: every refusal says what was wrong).
+        from core.tool_refusal import RETRY_LATER, refuse
+        code = response.status_code
+        if 400 <= code < 500:
+            return refuse('get_text_from_image',
+                          f"the image service could not read image_url (HTTP {code})",
+                          "Check that image_url is a direct link to an image file "
+                          "that opens without signing in")
+        return refuse('get_text_from_image',
+                      f"the image service is failing (HTTP {code})",
+                      "Carry on without this image's details, or tell the person "
+                      "the image could not be read", retry=RETRY_LATER)
 
     tools.append((
         "get_text_from_image",
@@ -1985,9 +2132,23 @@ def build_core_tool_closures(ctx):
     _AGENT_MENTIONS = ("@statusverifier", "@status verifier", "@verification",
                       "@helper", "@executor")
 
+    # expects_reply is REQUIRED and has no default: a message that asks the
+    # person something and one that only tells them something are different
+    # acts, and the step's completion is decided from which act was called,
+    # never from the words (lifecycle_hooks.send_is_ask).  Live 2026-10-31
+    # 17:13 IST, agent 45620673143 action 3: the step's only output was a
+    # send ending "Ready to begin?", and reading every send as delivery would
+    # have closed the step on its own question.  A call that omits it fails
+    # here (the tool_logging error envelope names the argument) and sends
+    # nothing, so an omission is a visible failed call, never a silent ask
+    # or a silent completion.  What it means is EXPECTS_REPLY_RULE's one
+    # definition, shared with the tool description and REUSE's rule 11.ii.
+    from core.constants import EXPECTS_REPLY_RULE
+
     @log_tool_execution
     def send_message_to_user(
         text: Annotated[str, "Text you want to send to the user"],
+        expects_reply: Annotated[bool, EXPECTS_REPLY_RULE],
         avatar_id: Annotated[Optional[str], "Unique identifier for the avatar"] = None,
         response_type: Annotated[Optional[str], "Response mode: 'Realistic' (slower, better quality) or 'Realtime' (faster, lower quality)"] = 'Realtime',
     ) -> str:
@@ -1998,6 +2159,28 @@ def build_core_tool_closures(ctx):
                 f'Message directed to agent ({mention}), not sending to user: {text[:50]}...')
             return f'Message directed to {mention} agent, not sending to user'
         tool_logger.info('INSIDE send_message_to_user')
+        # One line per send with what decides the step: which act it was,
+        # the turn it ran in and the action it ran for, so the share of sends
+        # that ask is measured, not guessed (hartos-00's review of the
+        # 476bbd5d8 rework).
+        # Attribution is evidence, not behaviour: an unresolved id is logged
+        # as None and never stops the send (tool_logging._session_suffix's
+        # rule, at debug for the same reason: a daemon tick has no request).
+        try:
+            from hartos.threadlocal import thread_local_data as _tld
+            _rid = _tld.get_request_id()
+        except Exception:
+            tool_logger.debug('[SEND-KIND] request id unavailable', exc_info=True)
+            _rid = None
+        try:
+            from hartos.lifecycle_hooks import action_in_progress
+            _aid = action_in_progress(user_prompt)
+        except Exception:
+            tool_logger.debug('[SEND-KIND] action id unavailable', exc_info=True)
+            _aid = None
+        tool_logger.info(
+            f'[SEND-KIND] {user_prompt} action={_aid} request={_rid} '
+            f'expects_reply={expects_reply}')
         tool_logger.info(f'SENDING DATA 2 user with values text:{text}, avatar_id:{avatar_id}, response_type:{response_type}')
         # The send runs HERE and its result is the tool's result.  This used
         # to start the send on a thread and return "sent successfully" before
@@ -2013,7 +2196,9 @@ def build_core_tool_closures(ctx):
 
     tools.append((
         "send_message_to_user",
-        "Sends a message/information to user. You can use this if you want to ask a question",
+        "Sends a message to the user. " + EXPECTS_REPLY_RULE
+        + " A message that waits for their answer holds your step until "
+        "they answer.",
         send_message_to_user,
     ))
 
@@ -2594,20 +2779,22 @@ def build_core_tool_closures(ctx):
     # ------------------------------------------------------------------
     # request_resource — Parity with LangChain Request_Resource
     # ------------------------------------------------------------------
+    # The one description of a credential ask, shared with Request_Resource in
+    # hart_intelligence_entry; the ask goes through the same gate there too.
+    from hartos.ai_key_vault import (
+        REQUEST_RESOURCE_DESCRIPTION, REQUEST_RESOURCE_INPUT)
+
     @log_tool_execution
     def request_resource(
-        resource_description: Annotated[str, "JSON or plain text describing the needed resource. JSON format: {\"resource_type\": \"api_key\", \"key_name\": \"GOOGLE_API_KEY\", \"label\": \"Google API Key\", \"used_by\": \"search tool\", \"description\": \"needed for web search\"}"],
+        resource_description: Annotated[str, REQUEST_RESOURCE_INPUT],
     ) -> str:
-        """Request an API key, credential, token, or config value that is not currently available."""
-        from hartos.ai_key_vault import request_credential
-        return request_credential(resource_description, agent_id=prompt_id)
+        """Ask the person for an outside service's credential a step needs."""
+        from hartos.ai_key_vault import request_credential_for_agent
+        return request_credential_for_agent(resource_description, agent_id=prompt_id)
 
     tools.append((
         "request_resource",
-        "Request an API key, credential, token, or config value. Checks vault/env first, "
-        "then prompts the user if not found. Handles: API keys (OpenAI, Google, Slack), "
-        "OAuth tokens, channel secrets, service credentials. "
-        "Input: JSON with resource_type, key_name, label, used_by, description.",
+        REQUEST_RESOURCE_DESCRIPTION,
         request_resource,
     ))
 
@@ -3077,10 +3264,13 @@ def build_core_tool_closures(ctx):
     # The person's answer, asked on whichever of their devices they answer
     # (a file_request for clips, a form, a choice), for every agent alike:
     # integrations.agent_engine.person_ask (owner 2026-10-27, "liquid ui is
-    # asked as a tool by server").
+    # asked as a tool by server").  The turn's request id is read at each
+    # call: a background turn asks its goal's person (person_to_ask).
     try:
         from integrations.agent_engine.person_ask import ask_person_tool
-        _name, _desc, _ask_fn = ask_person_tool(user_id, prompt_id)
+        _name, _desc, _ask_fn = ask_person_tool(
+            user_id, prompt_id,
+            request_id=lambda: request_id_list.get(user_prompt))
         tools.append((_name, _desc, log_tool_execution(_ask_fn)))
     except Exception as e:
         tool_logger.warning("ask_person tool not registered: %s", e)

@@ -221,13 +221,20 @@ class HandlerWiringDriftGuardTest(unittest.TestCase):
 
 
 class MicLearningConsentGateTest(unittest.TestCase):
-    """The chat mic feeds learning only on EXISTING consent; voice rooms are
-    unchanged.
+    """Every voice feeds learning only on its own speaker's EXISTING consent.
 
     Owner intent reversal, 2026-09-10: the finalize path was gated on call_id
     "so the push-to-talk chat mic is untouched", which meant a child speaking
     into the ordinary mic never reached the learner. The gate is now the
     consent the voice agents already require, checked off the event loop.
+
+    Calls (2026-10-31): a call stream carries OTHER people's voices (the
+    Discord receiver and the LiveKit subscriber forward every remote speaker
+    on ?call_id=&user_id=). It used to be ingested with no consent lookup,
+    which cost nothing only because every final reached the learner as b''
+    until 5aa2c905f. A call speaker now needs the same consent, checked
+    without filing an ask (a remote speaker id has no local person to
+    answer it).
     """
 
     def setUp(self):
@@ -259,15 +266,73 @@ class MicLearningConsentGateTest(unittest.TestCase):
 
     PCM = b'\x00\x01' * 8
 
-    def test_voice_room_ingests_without_a_consent_lookup(self):
+    def test_a_call_speaker_with_consent_is_ingested(self):
         from integrations.service_tools.whisper_tool import (
             _maybe_ingest_audio_sensor)
-        with self._consent(False) as consent:
+        with self._consent(True) as consent:
             _maybe_ingest_audio_sensor('room-1', 'alice', self.PCM, 'hi', 'en')
-        consent.assert_not_called()
+        consent.assert_called_once_with('alice', ask=False)
         self.assertEqual(len(self.sent), 1)
-        self.assertEqual(self.sent[0]['sensor_id'], 'mic_room-1',
-                         'voice-room readings must stay byte-identical')
+        self.assertTrue(self.sent[0]['sensor_id'].startswith('mic_room-1_'),
+                        self.sent[0]['sensor_id'])
+        self.assertEqual(self.sent[0]['data']['identity_source'], 'call')
+
+    def test_each_call_speaker_gets_their_own_learner_session(self):
+        """Owner 2026-10-31 (via hevolve-cc12): without knowing who is who the
+        learner cannot attend to each speaker. HevolveAI pairs each post
+        with the previous post of the SAME session, and the session is
+        built from sensor_id, so one sensor_id per call blended every
+        speaker into one voice. The speaker part is a per-node pseudonym,
+        never the raw platform id."""
+        import json
+        from integrations.service_tools.whisper_tool import (
+            _maybe_ingest_audio_sensor)
+        with self._consent(True):
+            _maybe_ingest_audio_sensor('room-1', 'discord-42', self.PCM, 'a', 'en')
+            _maybe_ingest_audio_sensor('room-1', 'discord-77', self.PCM, 'b', 'en')
+            _maybe_ingest_audio_sensor('room-1', 'discord-42', self.PCM, 'c', 'en')
+        ids = [r['sensor_id'] for r in self.sent]
+        self.assertEqual(len(ids), 3)
+        self.assertNotEqual(ids[0], ids[1],
+                            'two speakers in one call share a learner session')
+        self.assertEqual(ids[0], ids[2],
+                         "one speaker's utterances must stay in one session")
+        wire = json.dumps(self.sent)
+        for raw in ('discord-42', 'discord-77'):
+            self.assertNotIn(raw, wire, 'a raw platform id reached the learner')
+
+    def test_a_call_speaker_without_consent_is_not_ingested(self):
+        from integrations.service_tools.whisper_tool import (
+            _maybe_ingest_audio_sensor)
+        with self._consent(False):
+            _maybe_ingest_audio_sensor('room-1', 'alice', self.PCM, 'hi', 'en')
+        self.assertEqual(self.sent, [],
+                         "a remote speaker's voice reached the learner "
+                         "without that speaker's consent")
+
+    def test_a_call_with_no_speaker_is_not_ingested(self):
+        from integrations.service_tools.whisper_tool import (
+            _maybe_ingest_audio_sensor)
+        with self._consent(True) as consent:
+            _maybe_ingest_audio_sensor('room-1', None, self.PCM, 'hi', 'en')
+        consent.assert_not_called()
+        self.assertEqual(self.sent, [])
+
+    def test_a_call_speaker_is_checked_but_never_asked(self):
+        """The real gate: an undecided call speaker gets no consent ask (a
+        Discord id has no local person to answer it); an undecided chat-mic
+        speaker still gets one."""
+        from unittest import mock
+        from integrations.service_tools.whisper_tool import (
+            _maybe_ingest_audio_sensor)
+        cs = 'integrations.social.consent_service.ConsentService'
+        with mock.patch(cs + '.check_consent', return_value=False), \
+                mock.patch(cs + '.request_consent') as ask:
+            _maybe_ingest_audio_sensor(
+                'room-1', 'discord-42', self.PCM, 'hi', 'en')
+            _maybe_ingest_audio_sensor(None, 'alice', self.PCM, 'hi', 'en')
+        self.assertEqual([c.args[1] for c in ask.call_args_list], ['alice'])
+        self.assertEqual(self.sent, [])
 
     def test_chat_mic_with_consent_ingests_and_tags_the_identity(self):
         from integrations.service_tools.whisper_tool import (
@@ -280,8 +345,12 @@ class MicLearningConsentGateTest(unittest.TestCase):
         self.assertEqual(data['transcript'], 'red ball',
                          'the WORDS must travel with the audio')
         self.assertEqual(data['identity_source'], 'owner_fallback')
-        self.assertEqual(self.sent[0]['sensor_id'],
-                         'mic_owner_fallback_owner-1',
+        sid = self.sent[0]['sensor_id']
+        self.assertTrue(sid.startswith('mic_owner_fallback_'), sid)
+        self.assertNotIn('owner-1', sid, 'the raw user id reached the learner')
+        with self._consent(True):
+            _maybe_ingest_audio_sensor(None, None, self.PCM, 'blue', 'en')
+        self.assertEqual(self.sent[1]['sensor_id'], sid,
                          'an owner-attributed segment must stay identifiable')
 
     def test_chat_mic_without_consent_is_not_ingested(self):
@@ -298,6 +367,7 @@ class MicLearningConsentGateTest(unittest.TestCase):
             _maybe_ingest_audio_sensor(None, 'alice', self.PCM, 'x', 'en')
         consent.assert_called_once_with('alice')
         self.assertEqual(self.sent[0]['data']['identity_source'], 'ws_param')
+        self.assertNotIn('alice', self.sent[0]['sensor_id'])
 
     def test_no_owner_declared_skips_rather_than_guesses(self):
         import os
@@ -316,8 +386,9 @@ class MicLearningConsentGateTest(unittest.TestCase):
         os.environ['HEVOLVE_MIC_LEARNING'] = '0'
         with self._consent(True):
             _maybe_ingest_audio_sensor(None, None, self.PCM, 'x', 'en')
-            _maybe_ingest_audio_sensor('room-1', None, self.PCM, 'y', 'en')
-        self.assertEqual([r['sensor_id'] for r in self.sent], ['mic_room-1'])
+            _maybe_ingest_audio_sensor('room-1', 'alice', self.PCM, 'y', 'en')
+        self.assertEqual(len(self.sent), 1)
+        self.assertTrue(self.sent[0]['sensor_id'].startswith('mic_room-1_'))
 
     def test_consent_machinery_failure_fails_closed(self):
         from unittest import mock
