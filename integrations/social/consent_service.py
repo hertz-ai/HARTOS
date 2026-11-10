@@ -302,7 +302,9 @@ def consent_prompt_push(data: dict, request_id) -> dict:
     if the scrub cannot run, the reason is left out.
     """
     user_id = str(data.get('user_id', ''))
-    who = str(data.get('agent_name') or data.get('requester_name') or 'An agent')
+    agent = str(data.get('agent_name') or '').strip()
+    who = (agent_as_asker(agent) if agent
+           else str(data.get('requester_name') or 'An agent'))
     what = str(data.get('consent_type') or 'your permission').replace('_', ' ')
     title = f"{who} needs your OK"
     body = str(data.get('reason') or '').strip() or f"{who} asks for {what}."
@@ -406,6 +408,10 @@ def _validate_consent_type(consent_type: str):
 
 _AGENT_ID_RE = re.compile(r'[A-Za-z0-9_-]+')
 
+#: The placeholder the agent mirror builds from an id ("Agent <id>",
+#: "agent-<id>"), for ANY id: six digits or more, so "Agent 7" stays a name.
+_PLACEHOLDER_NAME_RE = re.compile(r'agent[ -]\d{6,}', re.IGNORECASE)
+
 
 def known_agent_id(agent_id):
     """The asking agent's id for a consent row, or None when no agent is
@@ -427,11 +433,16 @@ def _is_a_name(name, aid):
     _create_social_agent_from_prompt :10993/:11005) and for the bare id:
     those are the identifier the owner cannot read, dressed as a name.
     Exact matches only: a real name may contain a digit sequence that
-    happens to be a short id ("Studio 1 Assistant" with id 1)."""
+    happens to be a short id ("Studio 1 Assistant" with id 1).  The same
+    placeholder built from ANOTHER id is no name either: measured on central
+    2026-11-10, agent 93731340723's mirror carried "Agent 69922589936" and
+    the owner's card read "Agent 69922589936 asks you"."""
     name = (name or '').strip()
     if not name or name == aid:
         return False
-    return name.lower() not in (f'agent {aid}'.lower(), f'agent-{aid}'.lower())
+    if name.lower() in (f'agent {aid}'.lower(), f'agent-{aid}'.lower()):
+        return False
+    return _PLACEHOLDER_NAME_RE.fullmatch(name) is None
 
 
 def agent_display_name(db, agent_id):
@@ -480,6 +491,16 @@ def agent_display_name(db, agent_id):
         _logger.debug("agent_display_name: prompt file read failed for %s",
                       aid, exc_info=True)
     return None
+
+
+def agent_as_asker(name: str) -> str:
+    """How a card names an AGENT that asks: 'Agent <name>'.  An agent may
+    carry a person's name ("Vijai"), and "Vijai asks you" read as another
+    person asking (owner 2026-11-11: "why does the question appear like
+    another user asking question instead of qualifying as agent").  The one
+    wording for the ask card (person_ask) and the consent push; a PERSON who
+    asks (a device ask's requester_name) keeps their own name."""
+    return f'Agent {name}'
 
 
 def _copilot_switch_from_consent(consent_type: str, granted: bool) -> None:
