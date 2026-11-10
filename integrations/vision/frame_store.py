@@ -73,6 +73,7 @@ class FrameStore:
         max_frames: int = 5,
         description_ttl: float = 30.0,
         screen_description_ttl: float = 15.0,
+        frame_ttl: float = 10.0,
     ):
         self._lock = threading.RLock()
         # Camera channel (default, backward compatible)
@@ -86,7 +87,15 @@ class FrameStore:
         self._screen_desc_history: Dict[str, deque] = {}
         self._max_desc_history = 20  # Keep last 20 descriptions per channel
 
+        # (user_id, 'camera' | 'screen') -> who sent the latest frame
+        self._frame_source: Dict[tuple, str] = {}
         self._max_frames = max_frames
+        # A camera frame older than this is not "the latest frame": nothing
+        # takes a frame out when the camera stops, so the last one was read
+        # as live for as long as the process ran (measured 2026-11-10: the
+        # description loop logged a camera frame 46 s after the session
+        # ended).  A streaming camera sends several frames a second.
+        self._frame_ttl = frame_ttl
         self._description_ttl = description_ttl
         self._screen_description_ttl = screen_description_ttl
 
@@ -108,15 +117,34 @@ class FrameStore:
 
     # ─── Camera Channel (default, backward compatible) ───
 
-    def put_frame(self, user_id: str, frame_bytes: bytes):
+    def put_frame(self, user_id: str, frame_bytes: bytes,
+                  source: Optional[str] = None):
         """Store a raw camera frame for a user (FIFO bounded); dropped while
-        the camera may not be sensed."""
+        the camera may not be sensed.  ``source`` says who sent it (the
+        producer and its connection); see frame_source."""
         with self._lock:
             if not self._open('camera', self._frames):
                 return
             if user_id not in self._frames:
                 self._frames[user_id] = deque(maxlen=self._max_frames)
             self._frames[user_id].append((time.time(), frame_bytes))
+            self._frame_source[(user_id, 'camera')] = source or self.UNSTATED
+
+    #: The source of a frame whose producer did not say who it is.
+    UNSTATED = 'unstated'
+
+    def frame_source(self, user_id: str, channel: str = 'camera') -> Optional[str]:
+        """Who sent ``user_id``'s latest frame on ``channel`` ('camera' or
+        'screen'), as the producer stated it; UNSTATED when it did not; None
+        when there is no frame.  A frame carried only (time, bytes): a caption
+        could not be traced to a camera, a screen grab or a connection, and
+        the receiver takes the account id on trust (owner 2026-11-10: "my
+        images do not have source provenance?")."""
+        with self._lock:
+            held = self._screen_frames if channel == 'screen' else self._frames
+            if not held.get(user_id):
+                return None
+            return self._frame_source.get((user_id, channel))
 
     def get_frame(self, user_id: str) -> Optional[bytes]:
         """Get the latest camera frame for a user, or None."""
@@ -125,7 +153,10 @@ class FrameStore:
                 return None
             buf = self._frames.get(user_id)
             if buf:
-                return buf[-1][1]
+                taken, frame_bytes = buf[-1]
+                if self._frame_ttl and time.time() - taken > self._frame_ttl:
+                    return None
+                return frame_bytes
             return None
 
     def get_frame_count(self, user_id: str) -> int:
@@ -161,15 +192,17 @@ class FrameStore:
 
     # ─── Screen Channel ───
 
-    def put_screen_frame(self, user_id: str, frame_bytes: bytes):
+    def put_screen_frame(self, user_id: str, frame_bytes: bytes,
+                         source: Optional[str] = None):
         """Store a raw screen capture frame for a user (FIFO bounded);
-        dropped while the screen may not be sensed."""
+        dropped while the screen may not be sensed.  ``source`` as put_frame."""
         with self._lock:
             if not self._open('screen', self._screen_frames):
                 return
             if user_id not in self._screen_frames:
                 self._screen_frames[user_id] = deque(maxlen=self._max_frames)
             self._screen_frames[user_id].append((time.time(), frame_bytes))
+            self._frame_source[(user_id, 'screen')] = source or self.UNSTATED
 
     def get_screen_frame(self, user_id: str) -> Optional[bytes]:
         """Get the latest screen frame for a user, or None."""
@@ -247,6 +280,8 @@ class FrameStore:
             self._screen_descriptions.pop(user_id, None)
             self._camera_desc_history.pop(user_id, None)
             self._screen_desc_history.pop(user_id, None)
+            self._frame_source.pop((user_id, 'camera'), None)
+            self._frame_source.pop((user_id, 'screen'), None)
 
     def active_users(self) -> list:
         """Return list of user_ids with stored frames (either channel)."""
