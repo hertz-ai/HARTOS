@@ -28,9 +28,12 @@ This is deliberately not a third opinion on the same question:
   When a draft model is loaded, that path decides what the ANSWER is.
   CORRECTED 2026-11-10: this module is no longer unconsulted -- /chat
   resolves ``casual_conv`` through ``resolve_casual_conv`` before the
-  draft runs, so this module decides which TOOL SET the draft gets.
-  The two no longer sit on the same question, and that is the point:
-  the draft cannot escalate itself out of a tool set it was not given.
+  draft runs. Precisely: the resolved flag selects the 0.8B draft with
+  the casual tool set over the 4B with the full set, and on the Nunba
+  path it changes that selection ONLY for a prompt that assesses HARD
+  -- five of the reviewer's 84 probes. The two no longer sit on the
+  same question, and that is the point: the draft cannot escalate
+  itself out of a tier it was not given.
 * ``hive_task_protocol.estimate_complexity`` scores *coding tasks* in Spark
   units from file references and refactor keywords. Different domain,
   different output, not applicable to a sentence someone typed.
@@ -123,9 +126,14 @@ _INTERROGATIVE = re.compile(
 # resolve_casual_conv(prompt, client_value=None) directly: "remember that
 # my exam is on friday" and "open my downloads folder" both came back
 # casual=True / 'short-and-plain' (score 0, <=8 words, no '?', and no
-# opener in this regex), i.e. the fast path with NO tools -- so remember()
-# and open_file_gui() can never run, and a tool-less model then answers as
-# though they had.  Those are the exact two cases the route-level keyword
+# opener in this regex), i.e. the casual tier.  WITHDRAWN 2026-11-10, same
+# unmeasured claim 37e0781 pulled out of Nunba: this used to add "the fast
+# path with NO tools -- so remember() and open_file_gui() can never run,
+# and a tool-less model then answers as though they had".  Nobody measured
+# that.  The casual set carries the memory tools and Shell_Command, so
+# whether those calls actually happen is UNCHECKED and needs one live
+# turn.  What IS established is the flag.  Those are the exact two cases
+# the route-level keyword
 # stopgap at Nunba chatbot_routes.py:3478 was added for on 2026-09-25, and
 # the reason that shadow table could not just be deleted in favour of this
 # module.  CORRECTED 2026-11-10 -- this said "adding them here is what

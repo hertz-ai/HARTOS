@@ -305,6 +305,36 @@ class TestTheWiringInChat:
         assert self._run_resolve(123, True) is True
         assert self._run_resolve(None, False) is False
 
+    def test_nothing_rebinds_casual_conv_between_bind_and_resolve(self):
+        """The surviving mutant, and the honest limit of the two above.
+
+        _run_bind and _run_resolve exec the two blocks SEPARATELY, so a
+        second raw bind inserted BETWEEN them passes every other test here
+        -- REVIEW 2026-11-10 built exactly that mutant and it survived
+        44/44. chat() is thousands of lines in a Flask module that cannot
+        be imported in a unit test, so the end-to-end test the reviewer
+        wants is not available to me. What IS available is to pin the gap:
+        between the bind and the resolve, casual_conv may be READ and must
+        never be WRITTEN. If this fails, either someone added a second bind
+        or the resolve moved, and both make the tests above a lie.
+        """
+        src = self._entry_src()
+        start = src.index("    casual_conv = data.get('casual_conv'")
+        bind_end = src.index("    autonomous = data.get('autonomous'", start)
+        resolve_start = src.index('    if isinstance(prompt, str):', bind_end)
+        writes = []
+        for line in src[bind_end:resolve_start].splitlines():
+            text = line.strip().split('#')[0].strip()
+            if not text.startswith('casual_conv') or '=' in text[:11]:
+                continue
+            lhs, sep, rhs = text.partition('=')
+            if sep and lhs.strip() == 'casual_conv' and not rhs.startswith('='):
+                writes.append(text)
+        assert not writes, (
+            'casual_conv is written between the bind and the resolve, so the '
+            'value /chat actually uses is not the one those tests check: %r'
+            % (writes,))
+
     def test_an_ordinary_tool_prompt_with_a_casual_hint_is_still_casual(self):
         """C2, pinned as the KNOWN HOLE it is, so that no one reads the
         _TASK_VERB list and concludes these are handled.
