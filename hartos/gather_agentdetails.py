@@ -257,7 +257,7 @@ THREE-STAGE FLOW (strict, autonomous, no human-in-loop):
 
 STAGE 1 — FIRST CALL: emit a COMPLETE proposed plan with atomic steps.
 Response shape (EXACT keys, JSON only):
-{{"status":"proposed_plan","name":"<short readable name>","agent_name":"skill.local.name","goal":"<one-line goal>","broadcast_agent":false,"personas":[{{"name":"<a person a flow talks with>","description":"<one line>"}}],"flows":[{{"flow_name":"<flow name>","persona":"<that person's name, as in personas>","sub_goal":"<a result one turn can show>","actions":["<atomic step 1>","<atomic step 2>","..."]}}],"extra_information":"<optional>","review_required":true}}
+{{"status":"proposed_plan","name":"<short readable name>","agent_name":"skill.local.name","goal":"<one-line goal>","broadcast_agent":false,"personas":[{{"name":"Executor","description":"<one line>"}}],"flows":[{{"flow_name":"main","persona":"Executor","actions":["<atomic step 1>","<atomic step 2>","..."],"sub_goal":"<one line>"}}],"extra_information":"<optional>","review_required":true}}
 
 FLOWS: "flows" is a list.  A simple task is ONE flow named "main".  A task
 description that names its own flows or stages (e.g. "Flow 1 ... Flow 7")
