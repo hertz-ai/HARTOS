@@ -315,16 +315,16 @@ class TestTheWiringInChat:
         be imported in a unit test, so the end-to-end test the reviewer
         wants is not available to me. What IS available is to pin the gap:
         between the bind and the resolve, casual_conv may be READ and must
-        never be WRITTEN.
+        never be REBOUND.
 
-        This walks the AST rather than matching text, because the text
-        version was a weaker check than it looked: of nine ways to write
-        the flag in that gap it caught three (plain rebind, nested rebind,
-        no-space rebind) and missed six -- augmented, walrus, tuple target,
-        annotated, after a semicolon, chained -- while FALSE-FAILING on a
-        legitimate read, a keyword argument sitting on its own line.
-        Binding forms are the thing being tested, so ask the parser which
-        nodes bind the name instead of guessing at its spelling.
+        Ask the parser which nodes BIND a name rather than matching text.
+        The text version caught 3 of 9 binding spellings and reported a
+        kwarg-on-its-own-line READ as a write. The first AST version
+        caught 14 of 21 and still false-failed on a nested def with its
+        own local called casual_conv -- which is why this walks SCOPES:
+        a name bound inside a nested def, class or lambda is that scope's,
+        not /chat's, and reporting it would send someone hunting a bug
+        that is not there.
         """
         import ast
         import textwrap
@@ -333,23 +333,57 @@ class TestTheWiringInChat:
         bind_end = src.index("    autonomous = data.get('autonomous'", first)
         resolve_start = src.index('    if isinstance(prompt, str):', bind_end)
         gap = textwrap.dedent(src[bind_end:resolve_start])
-        writes = []
-        for node in ast.walk(ast.parse(gap)):
-            if isinstance(node, ast.Assign):
-                targets = list(node.targets)
-            elif isinstance(node, (ast.AugAssign, ast.AnnAssign,
-                                   ast.NamedExpr, ast.For, ast.AsyncFor)):
-                targets = [node.target]
-            elif isinstance(node, ast.withitem):
-                targets = [node.optional_vars] if node.optional_vars else []
-            else:
-                continue
-            for target in targets:
-                for sub in ast.walk(target):
-                    if isinstance(sub, ast.Name) and sub.id == 'casual_conv':
-                        writes.append(ast.unparse(node).splitlines()[0])
+
+        own_scope = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+                     ast.Lambda)
+        targeted = {
+            ast.Assign: lambda n: n.targets,
+            ast.AugAssign: lambda n: [n.target],
+            ast.AnnAssign: lambda n: [n.target],
+            ast.NamedExpr: lambda n: [n.target],
+            ast.For: lambda n: [n.target],
+            ast.AsyncFor: lambda n: [n.target],
+            ast.Delete: lambda n: n.targets,
+            ast.withitem: lambda n: ([n.optional_vars] if n.optional_vars
+                                     else []),
+        }
+
+        def first_line(node):
+            try:
+                return ast.unparse(node).splitlines()[0]
+            except Exception:
+                return type(node).__name__
+
+        def collect(node, out):
+            for child in ast.iter_child_nodes(node):
+                getter = targeted.get(type(child))
+                if getter is not None:
+                    for target in getter(child):
+                        for sub in ast.walk(target):
+                            if isinstance(sub, ast.Name):
+                                out.append((sub.id, first_line(child)))
+                elif isinstance(child, (ast.Import, ast.ImportFrom)):
+                    for alias in child.names:
+                        bound = alias.asname or alias.name.split('.')[0]
+                        out.append((bound, first_line(child)))
+                elif isinstance(child, ast.ExceptHandler) and child.name:
+                    out.append((child.name, 'except ... as ' + child.name))
+                elif isinstance(child, (ast.MatchAs, ast.MatchStar)) \
+                        and child.name:
+                    out.append((child.name, 'case ... as ' + child.name))
+                elif isinstance(child, ast.MatchMapping) and child.rest:
+                    out.append((child.rest, 'case ... **' + child.rest))
+                elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                        ast.ClassDef)):
+                    out.append((child.name, first_line(child)))
+                if not isinstance(child, own_scope):
+                    collect(child, out)
+
+        bound = []
+        collect(ast.parse(gap), bound)
+        writes = [text for name, text in bound if name == 'casual_conv']
         assert not writes, (
-            'casual_conv is written between the bind and the resolve, so the '
+            'casual_conv is rebound between the bind and the resolve, so the '
             'value /chat actually uses is not the one the tests above check: '
             '%r' % (writes,))
 
