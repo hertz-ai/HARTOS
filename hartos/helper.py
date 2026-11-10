@@ -3406,14 +3406,11 @@ def get_frame(user_id, frame_store=None):
     if frame_store is not None:
         frame_bytes = frame_store.get_frame(str(user_id))
         if frame_bytes is not None:
-            import cv2
-            frame = cv2.imdecode(
-                np.frombuffer(frame_bytes, np.uint8), cv2.IMREAD_COLOR,
-            )
+            frame = _decode_stored_frame(frame_bytes)
             if frame is not None:
                 current_app.logger.info(
                     f"Frame for user_id {user_id} from injected FrameStore")
-                return frame[:, :, ::-1]  # BGR → RGB
+                return frame
 
     # Primary: FrameStore via get_frame_store (in-process, zero latency).
     # Go through the helper so there's one accessor for the store, not
@@ -3425,16 +3422,20 @@ def get_frame(user_id, frame_store=None):
         if fs is not None:
             frame_bytes = fs.get_frame(str(user_id))
             if frame_bytes is not None:
-                import cv2
-                frame = cv2.imdecode(
-                    np.frombuffer(frame_bytes, np.uint8), cv2.IMREAD_COLOR,
-                )
+                frame = _decode_stored_frame(frame_bytes)
                 if frame is not None:
                     current_app.logger.info(
                         f"Frame for user_id {user_id} from FrameStore")
-                    return frame[:, :, ::-1]  # BGR → RGB
+                    return frame
     except Exception:
-        pass
+        # Never silent.  This guard used to be `except Exception: pass`, and
+        # it hid a NameError on every stored frame for ten weeks: the decode
+        # used `np` and this module never bound it (since 3200888d3,
+        # 2026-08-30), so the agent was told "no camera frame" while frames
+        # sat in the store (measured live 2026-11-10 12:40:03).
+        current_app.logger.warning(
+            f"get_frame: the stored camera frame for user_id {user_id} could "
+            f"not be read", exc_info=True)
 
     # Fallback: Redis (legacy path).  Only a cloud camera pipeline writes
     # frames there; a desktop runs no Redis, and redis_client is built lazily
@@ -3468,6 +3469,16 @@ def get_frame(user_id, frame_store=None):
             return None
     except ModuleNotFoundError as e:
         raise e
+
+def _decode_stored_frame(frame_bytes):
+    """The RGB array of a JPEG the FrameStore holds, or None when it does not
+    decode.  The one decode both FrameStore branches of get_frame use; it
+    imports what it uses, so it cannot depend on a module-level name."""
+    import cv2
+    import numpy as np
+    frame = cv2.imdecode(np.frombuffer(frame_bytes, np.uint8), cv2.IMREAD_COLOR)
+    return None if frame is None else frame[:, :, ::-1]  # BGR -> RGB
+
 
 def get_user_camera_inp(inp: Annotated[str, "The Question to check from visual context"],user_id:int,request_id:str) -> str:
     """Answer ``inp`` from the user's latest camera frame.
