@@ -25,8 +25,12 @@ This is deliberately not a third opinion on the same question:
   assessor and remains the primary one. The draft model answers and emits a
   ``delegate`` signal, and its escalation guards (refusal patterns, low
   confidence, agent-bound prompts) are richer than anything a regex can do.
-  When a draft model is loaded, that path decides and this module is not
-  consulted for the routing decision.
+  When a draft model is loaded, that path decides what the ANSWER is.
+  CORRECTED 2026-11-10: this module is no longer unconsulted -- /chat
+  resolves ``casual_conv`` through ``resolve_casual_conv`` before the
+  draft runs, so this module decides which TOOL SET the draft gets.
+  The two no longer sit on the same question, and that is the point:
+  the draft cannot escalate itself out of a tool set it was not given.
 * ``hive_task_protocol.estimate_complexity`` scores *coding tasks* in Spark
   units from file references and refactor keywords. Different domain,
   different output, not applicable to a sentence someone typed.
@@ -124,7 +128,18 @@ _INTERROGATIVE = re.compile(
 # though they had.  Those are the exact two cases the route-level keyword
 # stopgap at Nunba chatbot_routes.py:3478 was added for on 2026-09-25, and
 # the reason that shadow table could not just be deleted in favour of this
-# module.  Adding them here is what lets it be deleted: a question about
+# module.  CORRECTED 2026-11-10 -- this said "adding them here is what
+# lets it be deleted", and that was WRONG.  Verbs in this list only
+# matter when the caller has NO opinion; the override fires at HARD
+# only, these score ORDINARY, and the live caller always sends a bool,
+# so on the Nunba path these verbs do NOTHING:
+#     resolve_casual_conv('remember that my exam is on friday', True)
+#         -> (True, 'client:True')
+# The table was deleted anyway (the owner's order) and that capability
+# is currently LOST.  Closing it means overriding on TOOL-NEED as well
+# as on difficulty -- difficulty is not tool-need -- which changes the
+# owner's 2026-08-24 session-shape design, so it is with the owner.
+# What IS true here: a question about
 # the person's book ("how tall is the ridge in chapter 3", "what does my
 # textbook say about nesting") already resolves to the full path via
 # _INTERROGATIVE, with no phrase table anywhere.  "don'?t forget" is

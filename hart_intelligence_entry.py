@@ -10402,6 +10402,13 @@ def chat():
     # full -> casual.  Absent keeps its old meaning; only a caller that
     # states a value is resolved against the prompt below.
     casual_conv = data.get('casual_conv', False)
+    if casual_conv is None:
+        # A literal JSON null is not 'no opinion' -- it is a client that
+        # sent the key and left it empty, and the default above cannot
+        # see it because the key IS present.  REVIEW 11-10 caught this
+        # as the remainder of C1: {"casual_conv": null} with "hi" went
+        # casual where the old code went full.  Same rule as absent.
+        casual_conv = False
     autonomous = data.get('autonomous', False)
     probe = data.get('probe', None)
     intermediate = data.get('intermediate', None)

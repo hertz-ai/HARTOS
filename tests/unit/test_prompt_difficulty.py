@@ -233,25 +233,77 @@ class TestTheWiringInChat:
             casual, why = resolve_casual_conv(p, False)
             assert casual is False, (p, why)
 
-    def test_chat_still_defaults_an_absent_flag_to_false(self):
-        """C1 itself.  Dropping the default made an absent flag mean
-        'assess', and every prompt above scores easy(0):short-and-plain --
-        53 of the reviewer's 84 probes flipped full -> casual, including
-        'delete my account' and every non-English prompt, because the
-        regexes are English-only.
-        """
-        assert "data.get('casual_conv', False)" in self._entry_src(), (
-            'the False default was removed again: an absent casual_conv '
-            'must keep meaning the FULL path, or every caller that omits '
-            'it is routed by an English-only regex')
+    def _run_bind(self, payload):
+        """EXEC the real bind lines out of hart_intelligence_entry.py.
 
-    def test_chat_does_not_assess_a_non_string_prompt(self):
-        """prompt is data.get('prompt', None) and callers do send
-        non-strings; assess() calls .strip(), so an unguarded resolve
-        raises AttributeError on a line every /chat call runs."""
-        assert 'if isinstance(prompt, str):' in self._entry_src(), (
-            'the isinstance guard around the resolve call was removed; '
-            'a non-string prompt now crashes /chat')
+        A source grep still passes against a file that no longer calls the
+        resolver at all, which is why REVIEW 2026-11-10 killed 4 mutants
+        against the greps and 2 SURVIVED: (i) both literals kept but an
+        absent flag handed to the resolver as None, (ii) the resolve call
+        deleted outright. Running the lines catches both.
+        """
+        import textwrap
+        src = self._entry_src()
+        start = src.index("    casual_conv = data.get('casual_conv'")
+        end = src.index("    autonomous = data.get('autonomous'", start)
+        ns = {'data': payload}
+        exec(compile(textwrap.dedent(src[start:end]), 'entry-bind', 'exec'), ns)
+        return ns['casual_conv']
+
+    def _run_resolve(self, prompt, casual_conv):
+        """EXEC the real resolve block out of /chat, guard and all."""
+        import textwrap
+        src = self._entry_src()
+        start = src.index('    if isinstance(prompt, str):')
+        marker = src.index('app.logger.info("casual_conv resolved', start)
+        end = src.index(chr(10), marker) + 1
+
+        class _Logger:
+            @staticmethod
+            def info(*a, **k):
+                pass
+
+        class _App:
+            logger = _Logger
+
+        ns = {'prompt': prompt, 'casual_conv': casual_conv, 'app': _App}
+        exec(compile(textwrap.dedent(src[start:end]), 'entry-resolve', 'exec'),
+             ns)
+        return ns['casual_conv']
+
+    def test_an_absent_flag_binds_to_false(self):
+        """C1 itself. ~11 internal callers omit the flag on purpose; if it
+        binds to None they are routed by an English-only regex instead."""
+        assert self._run_bind({}) is False
+
+    def test_a_json_null_binds_to_false(self):
+        """C1's remainder, found by review: the key IS present, so the
+        default above it cannot fire. A client sending
+        {"casual_conv": null} with "hi" went casual where the old code
+        went full."""
+        assert self._run_bind({'casual_conv': None}) is False
+
+    def test_a_stated_hint_survives_the_bind(self):
+        assert self._run_bind({'casual_conv': True}) is True
+        assert self._run_bind({'casual_conv': False}) is False
+
+    def test_the_resolve_block_overrides_a_casual_claim_on_a_hard_prompt(self):
+        """The only thing the wiring does on the Nunba path. Kills the
+        'resolve call deleted' mutant: without it the hint comes back
+        unchanged."""
+        assert self._run_resolve('how does a transformer work', True) is False
+
+    def test_the_resolve_block_never_makes_a_full_request_casual(self):
+        """The hint is only ever overridden toward MORE capability."""
+        for p in ('delete my account', 'send an email to ravi',
+                  'take a screenshot', 'hi'):
+            assert self._run_resolve(p, False) is False
+
+    def test_the_resolve_block_skips_a_non_string_prompt(self):
+        """prompt is data.get('prompt', None) and assess() calls .strip(),
+        so an unguarded resolve raises on a line every /chat call runs."""
+        assert self._run_resolve(123, True) is True
+        assert self._run_resolve(None, False) is False
 
     def test_an_ordinary_tool_prompt_with_a_casual_hint_is_still_casual(self):
         """C2, pinned as the KNOWN HOLE it is, so that no one reads the
