@@ -4125,6 +4125,7 @@ _REUSE_PENDING_STEER_MAX = 2
 # changing any grouping — and they were dropping the model's 'done'
 # spelling, 6 verdicts of 22 measured live.
 from core.constants import (
+    BOOKKEEPING_SAVE_TOOLS as _REUSE_SAVE_ONLY_TOOLS,
     VERDICT_ROUND_TERMINAL_STATUSES,
     VERDICT_UNDERREPORT_STATUSES as _REUSE_UNDERREPORT_STATUSES,
 )
@@ -5164,6 +5165,87 @@ def _reuse_written_answer(group_chat):
         return None
 
 
+# Where the turn now running begins, per session: the seed text
+# _reuse_seed_message built for this request.  The seed is found in the group
+# log by that exact text (it keeps earlier turns: clear_history=False), the
+# way _reuse_reply_evidence finds it, never by position (the #725 sync can
+# shift those) or by the person's words inside it ("ok" is inside "book").
+# A TTLCache like this module's other per-session state, so the person's words
+# do not outlive the session.
+_reuse_turn_start = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_turn_start')
+
+# _REUSE_SAVE_ONLY_TOOLS (imported above) is core.constants
+# .BOOKKEEPING_SAVE_TOOLS: the saves of the agent's own notes, whose result
+# the person never reads.  It is imported, not built here, because the
+# extract-and-exec tests lift every _REUSE_* assignment on its own.
+
+
+def _reuse_turn_written_reply(user_prompt, group_chat):
+    """The reply this turn's writing step wrote, when the turn ends on a step
+    that only SAVES; else None, and the caller recovers as before.
+
+    MEASURED live 2026-11-09 12:52 IST (agent 54, msg_1794208521422_odljlx):
+    step 2 ("Write this turn's reply to the learner yourself ...") wrote the
+    learner an honest answer, and step 3 ("Call save_data_in_memory ...")
+    ended the turn.  Step 3's last line was the model's answer to the
+    fabrication re-steer ("report the actual returned result verbatim"):
+    "Great! The progress has been saved successfully ... Page range: 1-12"
+    (it had saved 1-2).  _reuse_written_answer, bounded at the LAST action's
+    dispatch, delivered that line as the whole reply; on 11-07 the same shape
+    delivered an apology for "the confusion".
+
+    Only a last step whose named tools are all saves (_REUSE_SAVE_ONLY_TOOLS,
+    read from its own words as the gates read them,
+    _reuse_step_referenced_tools): a save is nothing the person reads, so its
+    lines answer the gate, not the person.  A last step naming any other tool
+    keeps today's recovery: its result IS the answer ("Use google_search ...
+    tell the learner the number"; the first cut took every tool step and
+    replied "Sure, let me look that up", review of the uncommitted fix).
+
+    The reply is then the longest written answer in the window of this turn's
+    latest step that names no tool and wrote one (the lesson, not a one-line
+    note after it; a tie goes to the newer), the choice
+    lifecycle_hooks._derive_written_answer makes.  Never earlier than this
+    request's seed: without a seed for this request (no entry, or the seed
+    fell back to the bare words) it returns None.
+    """
+    try:
+        from hartos.lifecycle_hooks import latest_dispatch_before
+        seed_text = (_reuse_turn_start.get(user_prompt) or {}).get('seed_text')
+        messages = list(getattr(group_chat, 'messages', None) or [])
+        if not seed_text or not messages:
+            return None
+        boundary = next((idx for idx in range(len(messages) - 1, -1, -1)
+                         if (messages[idx] or {}).get('content') == seed_text),
+                        None)
+        last = latest_dispatch_before(messages, len(messages))
+        if boundary is None or last is None:
+            return None
+        last_tools = set(_reuse_step_referenced_tools(user_prompt, last, group_chat))
+        if not last_tools or not last_tools <= _REUSE_SAVE_ONLY_TOOLS:
+            return None
+        writer, best, best_size = None, None, -1
+        for idx in range(len(messages) - 1, boundary, -1):
+            action = latest_dispatch_before(messages, idx)
+            if action is None or (writer is not None and action != writer):
+                if writer is not None:
+                    break                    # past the writing step's window
+                continue
+            msg = messages[idx]
+            if not (_reuse_message_is_user_answer(msg) and is_written_answer(msg)):
+                continue
+            if writer is None:
+                if _reuse_step_referenced_tools(user_prompt, action, group_chat):
+                    continue                 # a tool step's line is not the reply
+                writer = action
+            size = len(str(msg.get('content') or '').strip())
+            if size > best_size:             # walking back: a tie keeps the newer
+                best, best_size = msg, size
+        return best
+    except Exception:
+        return None
+
+
 def _reuse_completion_evidence(user_prompt, action_id, group_chat):
     """Locate the receipt the REUSE gate just proved.
 
@@ -5754,7 +5836,17 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
         # model asserted, and over an unrun tool that is exactly the
         # "successfully completed" the honest-report fix removed (#808).
         # Deliberately BELOW the _unrun branch for that reason.
-        _written = _reuse_written_answer(group_chat)
+        #
+        # A turn that ends on a step that only saves replies with the answer
+        # its writing step wrote (_reuse_turn_written_reply): the save step's
+        # own lines answer the gate, not the person (live 2026-11-09, agent
+        # 54: the save step's "progress has been saved successfully" replaced
+        # step 2's answer).
+        _written = _reuse_turn_written_reply(user_prompt, group_chat)
+        _picker = 'turn'
+        if _written is None:
+            _written = _reuse_written_answer(group_chat)
+            _picker = 'action'
         if _written is not None:
             # A COPY: the extractor edits last_message['content'] in place
             # (strips '@user '), and that must not rewrite the history it
@@ -5778,7 +5870,7 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
                      f"recovered {len(_txt)} chars from the group log, no "
                      f"steer posted (session: {user_prompt}, {_before} msgs, "
                      f"from={_written.get('name') or '?'}, "
-                     f"head={_txt[:120]!r})")
+                     f"picker={_picker}, head={_txt[:120]!r})")
                 return False
         _steer = _REUSE_SYNTHESIS_STEER
     _say('info', f"[SYNTHESIS] reply would be raw control JSON — asking for "
@@ -8307,6 +8399,11 @@ def _reuse_seed_message(user_prompt, message):
     # to 1547 tokens, and dispatch-first cut the user's request off the wire.
     # The steps are the redundant part (the recipe is also in the system
     # prompt), so they sit last, where the cap eats them first.
+    # This request's turn start is set below only once its seed is built; a
+    # seed that falls back to the bare words leaves none, so
+    # _reuse_turn_written_reply never reads the PREVIOUS turn's start and
+    # delivers that turn's answer (review of the uncommitted fix, P2).
+    _reuse_turn_start.pop(user_prompt, None)
     try:
         current_action_id = user_tasks[user_prompt].current_action
         words = message
@@ -8325,6 +8422,9 @@ def _reuse_seed_message(user_prompt, message):
             words = f"{_REUSE_REPLY_PREFACE}{message}"
         seeded = _build_reuse_action_message(
             user_prompt, current_action_id, user_words=words)
+        # Where this turn starts, for _reuse_turn_written_reply: the seed text
+        # itself, found in the group log by exact content.
+        _reuse_turn_start[user_prompt] = {'seed_text': seeded}
         if words is not message:
             _reuse_pending_reply[user_prompt] = {
                 'action_id': current_action_id, 'request_id': _rid,

@@ -1587,6 +1587,14 @@ BOOKKEEPING_TOOLS: frozenset = frozenset({
     'get_user_id', 'get_prompt_id', 'get_chat_history', 'request_tools',
 })
 
+# The saves among them: calls whose result the person never reads (the agent's
+# own notes).  A READ (get_data_by_key, get_chat_history,
+# search_long_term_memory) is not one: its result is what a step answers from.
+# Read by the REUSE turn-reply picker
+# (hartos.reuse_recipe._reuse_turn_written_reply).
+BOOKKEEPING_SAVE_TOOLS: frozenset = frozenset(
+    t for t in BOOKKEEPING_TOOLS if t.startswith('save_'))
+
 # The agents the Assistant hands work to.  A message that tags one of them is
 # addressed to that agent, never to the person: routing, not an answer.
 # Lowercase, to be compared against lowercased text.  Read by the completion
