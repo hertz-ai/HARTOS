@@ -649,9 +649,40 @@ def _reuse_join_card(user_id, prompt_id, name):
     """The approval put to the child's side for a join.  Built the same way
     every time, so asking again while it is open is the same ask, not a
     second card (person_ask dedupes on the card)."""
+    # Says who asks, by name AND user id, which agent the join is for, by name
+    # AND id, and what allowing gives them: the approval is kept, lets them move
+    # this chat to another flow, and holds for this one agent only (owner
+    # 2026-11-10: "the consent shd say which user id and who ... and for which
+    # agent ... so that agent wise isolation and authorization of multiple
+    # persona agent is respected"; review of 31c54b71b, R8).  The grant itself
+    # is per agent (record_join keys it on the agent id).
+    person, agent = _reuse_join_names(user_id, prompt_id)
+    who = f'{person} (user {user_id})' if person else f'User {user_id}'
+    which = f'{agent} (agent {prompt_id})' if agent else f'agent {prompt_id}'
     return {'type': 'approval', 'action': f'join_chat:{prompt_id}:{user_id}',
-            'description': (f'User {user_id} asks to join your chat with this agent '
-                            f'as {name}. Allow?')}
+            'description': (f'{who} asks to join your chat with {which} as {name}. '
+                            f'If you allow it, they can talk with this agent in your chat '
+                            f'and move your chat to another of its flows. It is for this '
+                            f'agent only; your other agents stay closed to them. Allow?')}
+
+
+def _reuse_join_names(user_id, prompt_id):
+    """(the name ``user_id`` goes by, the name the agent ``prompt_id`` goes by)
+    on this node, for a card someone else reads; None for a name not kept.
+    The agent's is the one lookup consent cards use (agent_display_name)."""
+    try:
+        from integrations.social.consent_service import agent_display_name
+        from integrations.social.models import User, db_session
+        with db_session(commit=False) as db:
+            row = db.query(User).filter_by(id=str(user_id)).first()
+            person = row is not None and (row.display_name or row.username)
+            person = str(person).strip() if person else ''
+            return (person if person and person != str(user_id) else None,
+                    agent_display_name(db, prompt_id))
+    except Exception:
+        current_app.logger.debug(f'[REUSE] no names kept for {user_id} / agent {prompt_id}',
+                                 exc_info=True)
+        return None, None
 
 
 def _reuse_ask_to_join(user_id, prompt_id, name, creator):
@@ -2178,13 +2209,14 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
         @assistant.register_for_execution()
         @helper.register_for_llm(
             api_style="tool",
-            description=("Move the child whose chat you joined to another of their flows, "
-                         "when their parent or therapist asks for it. Their next session "
-                         "starts on that flow."))
+            description=("Move someone whose chat the person you are serving joined (for "
+                         "example a child whose parent joined) to another of that someone's "
+                         "own flows, when the person you are serving asks for it. Their next "
+                         "turn starts on that flow."))
         @log_tool_execution
         def move_person_to_flow(
             flow_name: Annotated[str, "The name of the flow to move them to, as the agent's flows name it"],
-            person: Annotated[str, "The user id of the child, only when you joined more than one child's chat; else empty"] = '',
+            person: Annotated[str, "The user id of the one to move, only when the person you are serving joined more than one chat with this agent; else empty"] = '',
         ) -> str:
             try:
                 with open(helper_fun.safe_prompt_path(prompt_id), 'r') as f:

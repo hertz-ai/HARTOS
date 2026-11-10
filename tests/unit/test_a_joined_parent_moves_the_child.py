@@ -47,6 +47,10 @@ FLOWS = [{'flow_name': 'Name calling', 'persona': 'Child'},
 def pr(monkeypatch, tmp_path):
     """core.persona_registry with empty in-process maps, a fresh consent
     table and a temp flow_progress store."""
+    # reuse_recipe binds persona_registry's caches when it is first imported;
+    # imported after the patch below, it would keep this test's {} for good
+    # (review of 31c54b71b, nit 1).
+    import hartos.reuse_recipe  # noqa: F401
     import core.platform_paths as platform_paths
     monkeypatch.setattr(platform_paths, '_cached_data_dir', str(tmp_path))
     import core.persona_registry as pr
@@ -174,6 +178,102 @@ def test_a_joiners_messages_reach_the_childs_session_through_the_grant(pr):
     assert pr._resolve_session_for_user(PARENT, P) == ([], f'{PARENT}_{P}')
 
 
+def test_a_joiner_whose_id_begins_another_joiners_id_has_not_joined(pr):
+    """The grant's scope is '<joiner>#<time>': 'u-parent' is not 'u-parent2'
+    (review of 31c54b71b, mutant K5)."""
+    pr.record_join(CHILD, P, f'{PARENT}2')
+    assert pr.joined_chats(f'{PARENT}2', P) == [CHILD]
+    assert pr.joined_chats(PARENT, P) == []
+
+
+def _members_of_the_childs_chat(pr):
+    """The child's chat as a join leaves it: the joiner is written into the
+    child's member list (reuse_recipe._reuse_join_chat)."""
+    pr.agents_session[f'{CHILD}_{P}'] = [
+        {'agentInstanceID': f'com.hertzai.hevolve.chat.{P}.{CHILD}',
+         'user_id': CHILD, 'role': 'Child', 'deviceID': 'something'},
+        {'agentInstanceID': f'com.hertzai.hevolve.chat.{P}.{PARENT}',
+         'user_id': PARENT, 'role': 'Parent', 'deviceID': 'something'}]
+
+
+def _childs_agent_sends(pr, role):
+    """The child's agent calls send_message_to_roles; the topics it reached."""
+    topics = []
+    out = pr._send_message_to_roles_impl(
+        CHILD, P, role, 'Arjun cried at 4 pm',
+        publish_fn=lambda topic, *_a, **_k: topics.append(topic))
+    return out, topics
+
+
+def test_a_revoked_join_stops_the_childs_agent_reaching_the_joiner(pr):
+    """Review of 31c54b71b, MF1 (probe P1): nothing takes the joiner out of
+    the child's member list, so after a revoke the child's agent still sent
+    to the parent.  Every send asks whether the member is still joined."""
+    _members_of_the_childs_chat(pr)
+    pr.record_join(CHILD, P, PARENT)
+    assert _childs_agent_sends(pr, 'Parent') == (
+        'Message sent Successfully', [pr.multichat_topic_for(PARENT)])
+    _revoke(CHILD, PARENT)
+    out, topics = _childs_agent_sends(pr, 'Parent')
+    assert topics == []
+    assert 'No persona' in out
+    # The child's own member is still reached.
+    assert _childs_agent_sends(pr, 'Child') == (
+        'Message sent Successfully', [pr.multichat_topic_for(CHILD)])
+
+
+def test_a_joiner_reaches_no_one_whose_join_to_the_same_chat_was_revoked(pr):
+    """The parent is still joined, the therapist's join was revoked: through
+    the child's chat the parent's agent reaches the child, not the therapist."""
+    _members_of_the_childs_chat(pr)
+    pr.agents_session[f'{CHILD}_{P}'].append(
+        {'agentInstanceID': f'com.hertzai.hevolve.chat.{P}.{THERAPIST}',
+         'user_id': THERAPIST, 'role': 'Therapist', 'deviceID': 'something'})
+    pr.record_join(CHILD, P, PARENT)
+    pr.record_join(CHILD, P, THERAPIST)
+    _revoke(CHILD, THERAPIST)
+    topics = []
+
+    def publish(topic, *_a, **_k):
+        topics.append(topic)
+    out = pr._send_message_to_roles_impl(PARENT, P, 'Therapist', 'how was today?',
+                                         publish_fn=publish)
+    assert topics == [] and 'No persona' in out
+    assert pr._send_message_to_roles_impl(PARENT, P, 'Child', 'well done',
+                                          publish_fn=publish) == 'Message sent Successfully'
+    assert topics == [pr.multichat_topic_for(CHILD)]
+
+
+def test_on_a_node_without_a_consent_store_this_process_join_still_reaches(pr, monkeypatch):
+    """Central keeps no grants: the join lives in this process
+    (chat_joinees), and the child's agent still reaches the joiner."""
+    def no_store(*_a, **_k):
+        raise RuntimeError('no consent store on this node')
+    monkeypatch.setattr(pr, '_kept_joins', no_store)
+    _members_of_the_childs_chat(pr)
+    pr.chat_joinees[PARENT] = {P: CHILD}
+    assert _childs_agent_sends(pr, 'Parent') == (
+        'Message sent Successfully', [pr.multichat_topic_for(PARENT)])
+
+
+def test_a_joiner_whose_join_cannot_be_read_is_not_reached(pr, monkeypatch):
+    """Neither the grants nor this process's joins can be read: the joiner is
+    not reached, the child still is."""
+    class Unreadable:
+        def get(self, *_a, **_k):
+            raise RuntimeError('cache boom')
+
+    def no_store(*_a, **_k):
+        raise RuntimeError('no consent store on this node')
+    monkeypatch.setattr(pr, '_kept_joins', no_store)
+    monkeypatch.setattr(pr, 'chat_joinees', Unreadable())
+    _members_of_the_childs_chat(pr)
+    out, topics = _childs_agent_sends(pr, 'Parent')
+    assert topics == [] and 'No persona' in out
+    assert _childs_agent_sends(pr, 'Child') == (
+        'Message sent Successfully', [pr.multichat_topic_for(CHILD)])
+
+
 # ── the move ──────────────────────────────────────────────────────────────
 
 def test_a_joined_parent_moves_the_child_to_another_of_their_flows(pr):
@@ -271,6 +371,27 @@ def test_an_allowed_join_keeps_the_childs_grant(rr, pr):
     assert rr._reuse_join_chat(PARENT, P, 'Parent', CHILD) == 'terminate'
     # Not from this process's map (pr.chat_joinees is empty): from the grant.
     assert pr.joined_chats(PARENT, P) == [CHILD]
+
+
+def test_the_join_card_says_who_by_name_and_id_and_for_which_agent(rr, pr):
+    """Owner 2026-11-10: "the consent shd say which user id and who (person's
+    name while joining and for which agent they are being requested for
+    association) so that agent wise isolation and authorization of multiple
+    persona agent is respected".  Review of 31c54b71b, R8: the approval is kept
+    and lets the joiner move the chat, so the card says so."""
+    from integrations.social.models import User, db_session
+    with db_session() as db:
+        db.add(User(id=PARENT, username='priya_k', display_name='Priya', user_type='human'))
+        db.add(User(id='agent-row-77', username='speech_coach_77', display_name='Speech Coach',
+                    user_type='agent', agent_id=str(P)))
+    said = rr._reuse_join_card(PARENT, P, 'Parent')['description']
+    assert said.startswith(f'Priya (user {PARENT}) asks to join your chat with '
+                           f'Speech Coach (agent {P}) as Parent.')
+    assert 'move your chat to another of its flows' in said
+    assert 'for this agent only' in said
+    # No name kept on this node: the id, never a blank.
+    assert rr._reuse_join_card(THERAPIST, OTHER_P, 'Therapist')['description'].startswith(
+        f'User {THERAPIST} asks to join your chat with agent {OTHER_P} as Therapist.')
 
 
 def test_get_role_finds_a_joiners_role_through_the_grant(rr, pr):

@@ -208,11 +208,41 @@ def joined_chats(joiner: Any, prompt_id: Any) -> List[str]:
     return [str(creator)] if creator else []
 
 
+def _still_joined(entries, creator: Any, prompt_id: Any) -> List[Dict[str, Any]]:
+    """The members of ``creator``'s chat of agent ``prompt_id`` that may still
+    be reached: the creator's own entries, and a joiner's only while
+    joined_chats still names this chat.  The join wrote the joiner into the
+    creator's member list (reuse_recipe._reuse_join_chat) and nothing takes
+    it out, so a revoked grant left the child's agent still sending to the
+    parent (review of 31c54b71b, MF1).  A joiner whose join cannot be read is
+    not reached."""
+    creator = str(creator)
+    kept, joined = [], {}
+    for entry in entries or []:
+        member = str(entry.get('user_id') or creator)
+        if member == creator:
+            kept.append(entry)
+            continue
+        if member not in joined:
+            try:
+                joined[member] = creator in [str(c) for c in joined_chats(member, prompt_id)]
+            except Exception:
+                logger.warning("_still_joined: %s's join to %s's chat of agent %s could "
+                               "not be read; not reached", member, creator, prompt_id,
+                               exc_info=True)
+                joined[member] = False
+        if joined[member]:
+            kept.append(entry)
+    return kept
+
+
 def _resolve_session_for_user(user_id: Any, prompt_id: Any):
     """Return (session_entries, key) for the user, falling back to the
-    chat-creator's session if this user joined another user's chat."""
+    chat-creator's session if this user joined another user's chat.  Only
+    members still joined are returned (_still_joined): every send to a
+    persona looks members up here."""
     key = f"{user_id}_{prompt_id}"
-    sessions = agents_session.get(key, [])
+    sessions = _still_joined(agents_session.get(key, []), user_id, prompt_id)
     if sessions:
         return sessions, key
 
@@ -221,7 +251,7 @@ def _resolve_session_for_user(user_id: Any, prompt_id: Any):
     try:
         for creator in joined_chats(user_id, prompt_id):
             creator_key = f"{creator}_{prompt_id}"
-            sessions = agents_session.get(creator_key, [])
+            sessions = _still_joined(agents_session.get(creator_key, []), creator, prompt_id)
             if sessions:
                 return sessions, creator_key
     except Exception:
@@ -244,19 +274,25 @@ def move_person_to_flow_impl(joiner: Any, prompt_id: Any, flows: List[dict],
     contract)."""
     from core.flow_progress import _flow_name, persona_flows, set_person_flow, stored_persona
     joined = [c for c in joined_chats(joiner, prompt_id) if c != str(joiner)]
+    # Told to the agent, about the person it serves: the agent never joined
+    # anything (owner 11-07: a person is never the agent).
     if not joined:
-        return "You have not joined anyone's chat with this agent, so there is no one to move."
+        return ("Not moved: the person you are serving has not joined anyone's chat "
+                "with this agent, so there is no one to move. Whoever's chat they want "
+                "to join has to allow the join first.")
     wanted = str(person or '').strip()
     if wanted:
         if wanted not in joined:
-            return (f"You have not joined {wanted}'s chat with this agent; "
-                    f"you joined: {', '.join(joined)}.")
+            return (f"Not moved: the person you are serving has not joined {wanted}'s chat "
+                    f"with this agent; they joined {', '.join(joined)}. Call again with "
+                    f"one of those as person.")
         child = wanted
     elif len(joined) == 1:
         child = joined[0]
     else:
-        return (f"You joined more than one chat with this agent ({', '.join(joined)}); "
-                f"say whose flow to change.")
+        return (f"Not moved: the person you are serving joined more than one chat with "
+                f"this agent ({', '.join(joined)}). Call again with person set to the "
+                f"one to move.")
     persona = stored_persona(child, prompt_id, personas)
     if not persona:
         return (f"{child} has not used this agent yet, so they are on no flow to move from; "
@@ -271,7 +307,7 @@ def move_person_to_flow_impl(joiner: Any, prompt_id: Any, flows: List[dict],
         return f"{child} could not be moved to '{own[target]}'; nothing was changed."
     logger.info("move_person_to_flow: %s moved %s to flow %s of agent %s",
                 joiner, child, target, prompt_id)
-    return f"{child} is now on '{own[target]}'; their next session starts there."
+    return f"{child} is now on '{own[target]}'; their next turn starts there."
 
 
 def _send_message_to_roles_impl(
