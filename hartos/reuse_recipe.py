@@ -1895,8 +1895,10 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
     # personas are people (owner 11-07: a user persona is never an agent name
     # and the reverse).  {role} stays where it names the person served (rule
     # 2 below) and in the action filter above.  No name here: the personality
-    # block already says "You are <name>, ..." (hartos-16).
-    from core.agent_personality import AGENT_ROLE
+    # block already says "You are <name>, ..." (hartos-16).  From
+    # core.constants: agent_personality is imported only inside the guard
+    # above, so this line never fails a turn that had no personality.
+    from core.constants import AGENT_ROLE
     # DATE-CONTEXT: the local model's training cutoff makes it assume an earlier
     # year — it refused "2026" research as "the future" and injected "2024" into
     # its own search queries (measured live 2026-09-05, agent 18088688973).

@@ -1599,6 +1599,14 @@ BOOKKEEPING_TOOLS: frozenset = frozenset({
 AGENT_MENTIONS: tuple = ("@statusverifier", "@status verifier", "@verification",
                          "@helper", "@executor")
 
+# The agent's OWN role: the seat it sits in, never a person it talks with
+# (owner 11-07: a user persona is never an agent name, and the reverse).
+# CREATE's personality takes it through core.agent_personality, which
+# re-exports it; REUSE's "You are a helpful ..." line reads it here, so a
+# REUSE turn never imports agent_personality outside that module's own guard
+# (it asserts at import by design; review of 33d7dea57).
+AGENT_ROLE: str = 'assistant'
+
 # How much of what a tool OBSERVED may ride back in its return string.
 #
 # Same family as the failure strings above, hence the same home: both decide

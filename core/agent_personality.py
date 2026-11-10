@@ -586,9 +586,10 @@ def get_regional_tone_prompt(language: str = '') -> str:
 # (review of 494d5a4e1, must-fix 1; owner 11-07: a user persona is never an
 # agent name and the reverse).  'assistant' is _ROLE_TONE_MAP's own key and
 # its default, so the tone is the one an agent with no role always got; no
-# category is guessed from the goal's words (owner, 10-20).  The one source
-# for CREATE's personality and REUSE's "You are a helpful ..." line.
-AGENT_ROLE = 'assistant'
+# category is guessed from the goal's words (owner, 10-20).  One value, in
+# core.constants (REUSE's "You are a helpful ..." line reads it there); this
+# module re-exports it for CREATE's personality.
+from core.constants import AGENT_ROLE  # noqa: E402,F401  (re-exported)
 
 
 def _role_phrase(role) -> str:

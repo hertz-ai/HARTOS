@@ -7,8 +7,8 @@ personas are people (494d5a4e1) that read "You are a Helpful the child
 Assistant" on every turn; with agent names as personas it read "a Helpful
 Executor Assistant" (owner 11-07: a user persona is never an agent name and
 the reverse; found by hartos-16 in the sweep of that ruling).  The line now
-takes the agent's own role from core.agent_personality.AGENT_ROLE, the one
-source CREATE's personality uses too.
+takes the agent's own role from core.constants.AGENT_ROLE, the one source
+CREATE's personality uses too (core.agent_personality re-exports it).
 
 What must NOT change: {role} where it names the person served ("Only execute
 actions where the persona is: {role}") and the action filter, which runs on
@@ -144,9 +144,42 @@ def test_the_person_served_is_still_named_where_the_actions_are_filtered(reuse_t
     assert {a['persona'] for a in kept} == {'the child'}
 
 
-def test_the_role_comes_from_the_one_source_create_uses():
-    from core.agent_personality import AGENT_ROLE
-    assert SELF_LINE.startswith(f'You are a helpful {AGENT_ROLE}.')
+def test_the_role_comes_from_the_one_source_create_uses(reuse_turn, monkeypatch):
+    """The REUSE line reads core.constants.AGENT_ROLE when the turn is built,
+    and CREATE's personality re-exports the same value.  The review of
+    33d7dea57 found the earlier test compared two constants and passed on
+    the parent; a REUSE line hard-coding 'assistant' survived it."""
+    from core import agent_personality as ap
+    from core import constants
+    assert ap.AGENT_ROLE == constants.AGENT_ROLE == 'assistant'
+    assert SELF_LINE.startswith(f'You are a helpful {constants.AGENT_ROLE}.')
+    monkeypatch.setattr(constants, 'AGENT_ROLE', 'guide')
+    msg, _kept = reuse_turn('executor_only')
+    assert 'You are a helpful guide. Your primary role' in msg, msg[:400]
+
+
+def test_no_you_are_line_names_the_person_served(reuse_turn):
+    """Wherever the turn tells the agent who it is, it never says it is the
+    person: the review of 33d7dea57 added "You are {role}." to rule 2 and no
+    test failed."""
+    msg, _kept = reuse_turn('people')
+    said = [line for line in msg.splitlines() if 'you are' in line.lower()]
+    assert said, msg[:400]
+    for line in said:
+        for person in ('the child', 'parent', 'therapist'):
+            assert person not in line.lower(), line
+
+
+def test_a_turn_builds_when_the_personality_module_cannot_load(reuse_turn, monkeypatch):
+    """Review of 33d7dea57 (must fix): the self line imported AGENT_ROLE from
+    core.agent_personality outside any guard, so with that module failing
+    (it asserts at import by design) every REUSE turn raised ImportError
+    where it used to run without a personality.  The line now reads
+    core.constants; the personality module stays inside its own guard."""
+    monkeypatch.setitem(sys.modules, 'core.agent_personality', None)
+    msg, kept = reuse_turn('executor_only')
+    assert SELF_LINE in msg, msg[:400]
+    assert len(kept) == KEPT['executor_only']
 
 
 def test_an_unreadable_profile_keeps_the_agents_personality(reuse_turn, monkeypatch):
