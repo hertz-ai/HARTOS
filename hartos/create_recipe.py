@@ -4800,7 +4800,8 @@ def _answer_for_this_turn(user_prompt, text):
     the PERSON's round only: a daemon or expert turn gets ``text`` unchanged
     and leaves the words for the person (hartos-00's review of ca2e52c91,
     finding 1: a daemon tick's round got 'ba\\nhello\\ntick').  Owed to one
-    round only."""
+    round only, and taken only when that round starts (get_response_group):
+    a turn refused before its round leaves them owed (#260)."""
     task = user_tasks.get(user_prompt)
     owed = getattr(task, '_answer_owed_to_turn', None) if task is not None else None
     if owed is None:
@@ -5195,7 +5196,6 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None,autonomou
                 f"[USER-INPUT-GATE] {user_prompt}: the person's answer is kept "
                 f"unsaved; answering without a model round")
             return _unsaved_reply
-        text = _answer_for_this_turn(user_prompt, text)
     # Get or create agents for this user
     if user_prompt not in user_agents:
         current_app.logger.info(f"Creating new agents for user_prompt={user_prompt}")
@@ -5252,6 +5252,12 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None,autonomou
             except Exception:
                 message = ""
                 text = f'Properly Execute Action {user_tasks[user_prompt].current_action}: {message} '
+    if not Failure:
+        # The words a kept answer owes the person's round are taken here,
+        # once nothing above can still refuse the turn: taken at the top, a
+        # turn held for another one (#172) or for a tool call still running
+        # lost them, and the person was asked again (#260).
+        text = _answer_for_this_turn(user_prompt, text)
     _attach_for_create_turn(agents_object, text, user_prompt)
 
     # Initiate or resume chat
