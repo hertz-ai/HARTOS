@@ -7988,13 +7988,7 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
     start_time = time.time()
     _stage_req_id = str(thread_local_data.get_request_id() or '')
     publish_chat_stage('loading_context', user_id=str(user_id), request_id=_stage_req_id)
-    # STALE SINCE 2026-11-10, corrected in place rather than deleted because
-    # the history matters: this is no longer the raw route flag.  /chat now
-    # resolves it once through core.prompt_difficulty.resolve_casual_conv
-    # (search 'casual_conv resolved' in this file), which may have flipped a
-    # 'casual' hint to False on a HARD prompt.  Everything below about what
-    # the flag MEANS still holds; what changed is who last set it.
-    # casual_conv began as the SESSION-SHAPE flag from the route (chatbot_routes:486
+    # casual_conv is the SESSION-SHAPE flag from the route (chatbot_routes:486
     # `not bool(prompt_id or create_agent)`): no prompt_id = casual companion
     # session (light path), prompt_id = agent-bound session (full tool path).
     # It is NOT the draft classifier's per-turn `is_casual` verdict — a
@@ -10391,16 +10385,26 @@ def chat():
     thread_local_data.clear_agentic_flags()
 
     create_agent = data.get('create_agent', None)
-    # The caller's HINT, not the decision -- but an ABSENT flag still means
-    # False, the full path, exactly as it has always meant.  REVIEW 11-10
-    # (C1) measured what dropping that default cost and I reproduced it:
-    # ~11 internal callers omit this flag deliberately (commercial_api.py
-    # :548 omits it so a billed call never gets the casual tool set), and
-    # with None they were assessed instead -- 'delete my account', 'send an
-    # email to ravi', 'take a screenshot', 'continue' and EVERY non-English
-    # prompt score easy(0):short-and-plain, so all of them flipped
-    # full -> casual.  Absent keeps its old meaning; only a caller that
-    # states a value is resolved against the prompt below.
+    # The caller's value, believed.  OWNER 2026-11-10: "do propr review and
+    # delete these hardcodings".  A resolver lived here from 11-09 to 11-10
+    # (core/prompt_difficulty.resolve_casual_conv) that re-decided this flag
+    # from EIGHT regex word lists.  That was keyword matching one layer down
+    # from the Nunba tuple the owner had just had deleted, not a replacement
+    # for it, and the module is gone with this change.
+    #
+    # What decides the tier instead, and already did: the route sends SESSION
+    # SHAPE (not bool(prompt_id or create_agent), the owner's 2026-08-24
+    # design), and the model-based classifier escalates per turn --
+    # speculative_dispatcher.py promotes delegate='none' to 'local' on
+    # memory_query, channel_connect, is_create_agent, language_change,
+    # invite_intent and join_room_intent, so the expert turn binds the full
+    # registry.  A model reads the sentence; no word list does.
+    #
+    # The False default is NOT cosmetic: ~11 internal callers omit this flag
+    # deliberately (commercial_api.py:548 omits it so a billed call never
+    # gets the casual tool set).  The None coercion below is kept for the
+    # same reason -- a client sending {"casual_conv": null} is not stating
+    # an opinion, and the key being present stops the default from firing.
     casual_conv = data.get('casual_conv', False)
     if casual_conv is None:
         # A literal JSON null is not 'no opinion' -- it is a client that
@@ -10607,47 +10611,6 @@ def chat():
 
     prompt = data.get('prompt', None)
 
-    # THE ROUTING DECISION, made here and nowhere else.  OWNER 2026-11-09:
-    # "remove the friggin hardcodi".  core/prompt_difficulty.py has been the
-    # canonical resolver since July and had ZERO callers -- this line is the
-    # wiring it was written for, and the reason the phrase tables upstream
-    # (Nunba chatbot_routes.py:3478, deleted in the same change) could keep
-    # growing back.  Its docstring names exactly what used to happen here:
-    # "/chat read casual_conv straight from the request body and believed
-    # it, and the web client set that flag from whether an agent prompt
-    # happened to be configured -- which has nothing to do with how hard
-    # the question is."
-    #
-    # The hint is honoured in the cheap direction (a caller asking for the
-    # full path gets it); it is overridden only when it claims 'casual'
-    # about a prompt that assesses HARD, because that direction is the one
-    # that ships a tool-less model's description of work as if the work had
-    # happened -- the same asymmetry escalation_reasons.draft_delegates was
-    # written for.  Pure string inspection: no model call, no network.
-    #
-    # KNOWN HOLE, stated here because a reader will otherwise assume it is
-    # covered (REVIEW 11-10, C2, reproduced): the override fires at HARD
-    # (score >= 30) ONLY, so a tool-NEEDING but ORDINARY prompt with a
-    # 'casual' hint is still honoured as casual --
-    # resolve_casual_conv('remember that my exam is on friday', True) is
-    # (True, 'client:True').  Difficulty is not tool-need, and this resolver
-    # only answers the first question.  Nunba always sends a bool, so on
-    # that path the _TASK_VERB list does nothing.  Closing it means
-    # overriding on tool-need as well as on difficulty, which changes the
-    # owner's 2026-08-24 session-shape design and is the owner's call, not
-    # this lane's.
-    #
-    # Guarded on isinstance: `prompt` is data.get('prompt', None), callers
-    # do send non-strings, and assess() calls .strip() -- an AttributeError
-    # here would crash a line that every /chat call runs.  A prompt we
-    # cannot read is not evidence against the caller, so the hint stands.
-    #
-    # Imported at the use site, not at module scope: this file's imports are
-    # load-order sensitive and this is the only place that needs it.
-    if isinstance(prompt, str):
-        from core.prompt_difficulty import resolve_casual_conv as _resolve_casual
-        casual_conv, _casual_why = _resolve_casual(prompt, casual_conv)
-        app.logger.info("casual_conv resolved: %s (%s)", casual_conv, _casual_why)
 
     # GUARDRAIL: full pre-dispatch gate on every /chat call
     if prompt:
@@ -11068,12 +11031,7 @@ def chat():
                         f"recall/Q&A directly or escalates a genuine task via "
                         f"its own tools."
                     )
-                    # STALE SINCE 2026-11-10: casual_conv is NO LONGER left as
-                    # the route sent it -- /chat resolves it once through
-                    # core.prompt_difficulty.resolve_casual_conv before this
-                    # point.  The session-shape meaning below still describes
-                    # what the route sends; it is just no longer the last word.
-                    # It used to be DELIBERATELY left as the route sent it
+                    # casual_conv is DELIBERATELY left as the route sent it
                     # (chatbot_routes:486 `not bool(prompt_id or
                     # create_agent)`): it is a SESSION-SHAPE flag — no
                     # prompt_id = casual companion session (draft-first,
