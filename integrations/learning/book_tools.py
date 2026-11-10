@@ -142,6 +142,7 @@ def build_book_tools(ctx) -> List[Tuple[str, str, Any]]:
         in-process, so the tools are always built.
     """
     from integrations.learning import book_pipeline as bp
+    from core import tool_refusal
 
     user_id = ctx.get('user_id', '')
     tools: List[Tuple[str, str, Any]] = []
@@ -154,7 +155,19 @@ def build_book_tools(ctx) -> List[Tuple[str, str, Any]]:
         return _read(bp.list_books, user_id)
 
     def _find_book(book_name=''):
-        """Resolve a book by fuzzy name, else the most recent one."""
+        """The book this call names, or the most recent one for an empty name.
+
+        A NAME THAT MATCHES NOTHING IS NOT THE MOST RECENT BOOK.  This used
+        to fall through to books[0] for a non-empty name too, so a book the
+        user does not have was answered with the latest book's chapters and
+        pages, and nothing in the reply said so -- the three callers' "No
+        matching book" refusals were unreachable whenever the library held
+        anything.  Measured live by hartos-16, turn msg_1794208521422_odljlx:
+        list_book_chapters(book_name='The Art of Computer Programming')
+        returned the chapters of 'How Rain Happens'.  All three tool
+        signatures document "Empty = most recent book", so the most-recent
+        fallback belongs to the empty name only.
+        """
         books = _books()
         if not books:
             return None
@@ -166,7 +179,28 @@ def build_book_tools(ctx) -> List[Tuple[str, str, Any]]:
             for b in books:
                 if want in str(b.get('filename') or '').lower():
                     return b
+            return None
         return books[0]
+
+    def _no_book(tool, book_name):
+        """The refusal for a book this call cannot resolve, in the call's own
+        terms.  Owner rule 2026-11-09: a refusal says what was wrong and how
+        to fix it, built by core.tool_refusal so core.tool_logging does not
+        count it as a hintless one."""
+        names = [str(b.get('book_name') or b.get('filename') or '').strip()
+                 for b in _books()]
+        names = [n for n in names if n]
+        if not names:
+            return tool_refusal.refuse(
+                tool,
+                'this user has no parsed books yet, so no book_name can resolve',
+                'Ask the person to upload a PDF, then call parse_book_pdf',
+                retry=tool_refusal.RETRY_LATER)
+        return tool_refusal.refuse(
+            tool,
+            "no parsed book matches book_name=%r" % (str(book_name or '').strip(),),
+            "Use one of this user's exact book names: %s, or pass an empty "
+            "book_name for the most recent" % ('; '.join(names[:20]),))
 
     def _layouts(file_id):
         return _read(bp.get_layouts, file_id)
@@ -207,7 +241,7 @@ def build_book_tools(ctx) -> List[Tuple[str, str, Any]]:
         """Chapters in a book, in page order, so the agent can navigate."""
         book = _find_book(book_name)
         if not book:
-            return 'No matching book. Call list_books to see what is available.'
+            return _no_book('list_book_chapters', book_name)
         rows = _layouts(book.get('file_id'))
         if not rows:
             return f"No parsed pages for '{book.get('book_name')}'. It may still be parsing."
@@ -252,7 +286,7 @@ def build_book_tools(ctx) -> List[Tuple[str, str, Any]]:
         """One page's text plus the URL of that page's image, for quoting."""
         book = _find_book(book_name)
         if not book:
-            return 'No matching book. Call list_books first.'
+            return _no_book('read_book_page', book_name)
         rows = _layouts(book.get('file_id'))
         want = int(page_number or 0)
         page_rows = [r for r in rows if int(r.get('page_number') or 0) == want]
@@ -293,7 +327,7 @@ def build_book_tools(ctx) -> List[Tuple[str, str, Any]]:
         """A chapter's pages, each with its own image URL for quoting."""
         book = _find_book(book_name)
         if not book:
-            return 'No matching book. Call list_books first.'
+            return _no_book('read_book_chapter', book_name)
         rows = _layouts(book.get('file_id'))
         want = str(chapter or '').strip().lower()
         hit = [r for r in rows if want and want in str(r.get('chapter_name') or '').lower()]

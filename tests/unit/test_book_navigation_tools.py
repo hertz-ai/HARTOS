@@ -411,5 +411,78 @@ class PublisherCarriesTheImage(unittest.TestCase):
         self.assertNotIn('page_image_url', sent['envelope'])
 
 
+
+
+# ── A named book that is not there is refused, never swapped ────────────────
+OTHER_BOOK = {
+    'file_id': 9,
+    'user_id': '42',
+    'filename': 'rain.pdf',
+    'book_name': 'How Rain Happens',
+    'total_pages': 1,
+    'status': 'completed',
+}
+
+
+class ANamedBookIsNeverSwapped(unittest.TestCase):
+    """_find_book used to fall through to books[0] for a non-empty name, so a
+    book the user does not have was answered with the most recent book's
+    chapters and pages and nothing in the reply said so.  The three callers'
+    "No matching book" refusals were therefore unreachable whenever the
+    library held anything.  MEASURED LIVE by hartos-16, turn
+    msg_1794208521422_odljlx: list_book_chapters(book_name='The Art of
+    Computer Programming') returned the chapters of 'How Rain Happens'.
+    """
+
+    def test_a_book_the_user_does_not_have_is_refused(self):
+        out = _call('list_book_chapters', 'The Art of Computer Programming',
+                    _books=[OTHER_BOOK] + BOOKS)
+        self.assertTrue(out.startswith('Error:'), out)
+        # the swap itself: no chapter of another book may appear
+        self.assertNotIn('Chapter 1: Units', out)
+        self.assertNotIn('"chapters"', out)
+
+    def test_the_refusal_names_the_ask_and_the_real_names(self):
+        """Owner rule 2026-11-09: a refusal says what was wrong and how to fix
+        it, so the next call can be corrected."""
+        out = _call('read_book_page', 1, 'The Art of Computer Programming',
+                    _books=[OTHER_BOOK] + BOOKS)
+        self.assertIn('read_book_page', out)
+        self.assertIn('The Art of Computer Programming', out)   # what was wrong
+        self.assertIn('How Rain Happens', out)                   # how to fix it
+        self.assertIn('NCERT Physics Class 11', out)
+
+    def test_read_book_chapter_refuses_in_its_own_name(self):
+        out = _call('read_book_chapter', 'Chapter 1', 'Nonexistent Title')
+        self.assertTrue(out.startswith('Error: the read_book_chapter'), out)
+
+    def test_an_empty_name_still_means_the_most_recent_book(self):
+        """All three signatures document "Empty = most recent book" -- the
+        fallback belongs to the empty name, and only to it."""
+        out = _call('list_book_chapters', '')
+        self.assertIn('NCERT Physics Class 11', out)
+        self.assertFalse(out.startswith('Error:'), out)
+
+    def test_a_partial_name_and_a_filename_still_resolve(self):
+        by_part = _call('list_book_chapters', 'physics')
+        by_file = _call('list_book_chapters', 'ncert_physics_11.pdf')
+        for out in (by_part, by_file):
+            self.assertIn('Chapter 1: Units', out)
+
+    def test_no_books_at_all_says_what_to_do_first(self):
+        out = _call('list_book_chapters', 'anything', _books=[])
+        self.assertTrue(out.startswith('Error:'), out)
+        self.assertIn('parse_book_pdf', out)
+
+
 if __name__ == '__main__':
+    # Run as a script there is no pytest, so the autouse `_uploads` fixture
+    # above never fires and `_render_images` would write page jpegs into the
+    # REAL uploads directory -- the owner's own books.  Redirect it here
+    # for the same reason the fixture exists, and by the same name, so the
+    # two modes cannot drift.  (The class below this guard used to be
+    # unreachable in script mode: the guard was above it.)
+    import tempfile
+    import core.platform_paths as _pp
+    _pp.get_uploads_dir = lambda _d=tempfile.mkdtemp(prefix='book_nav_'): _d
     unittest.main()
