@@ -315,25 +315,43 @@ class TestTheWiringInChat:
         be imported in a unit test, so the end-to-end test the reviewer
         wants is not available to me. What IS available is to pin the gap:
         between the bind and the resolve, casual_conv may be READ and must
-        never be WRITTEN. If this fails, either someone added a second bind
-        or the resolve moved, and both make the tests above a lie.
+        never be WRITTEN.
+
+        This walks the AST rather than matching text, because the text
+        version was a weaker check than it looked: of nine ways to write
+        the flag in that gap it caught three (plain rebind, nested rebind,
+        no-space rebind) and missed six -- augmented, walrus, tuple target,
+        annotated, after a semicolon, chained -- while FALSE-FAILING on a
+        legitimate read, a keyword argument sitting on its own line.
+        Binding forms are the thing being tested, so ask the parser which
+        nodes bind the name instead of guessing at its spelling.
         """
+        import ast
+        import textwrap
         src = self._entry_src()
-        start = src.index("    casual_conv = data.get('casual_conv'")
-        bind_end = src.index("    autonomous = data.get('autonomous'", start)
+        first = src.index("    casual_conv = data.get('casual_conv'")
+        bind_end = src.index("    autonomous = data.get('autonomous'", first)
         resolve_start = src.index('    if isinstance(prompt, str):', bind_end)
+        gap = textwrap.dedent(src[bind_end:resolve_start])
         writes = []
-        for line in src[bind_end:resolve_start].splitlines():
-            text = line.strip().split('#')[0].strip()
-            if not text.startswith('casual_conv') or '=' in text[:11]:
+        for node in ast.walk(ast.parse(gap)):
+            if isinstance(node, ast.Assign):
+                targets = list(node.targets)
+            elif isinstance(node, (ast.AugAssign, ast.AnnAssign,
+                                   ast.NamedExpr, ast.For, ast.AsyncFor)):
+                targets = [node.target]
+            elif isinstance(node, ast.withitem):
+                targets = [node.optional_vars] if node.optional_vars else []
+            else:
                 continue
-            lhs, sep, rhs = text.partition('=')
-            if sep and lhs.strip() == 'casual_conv' and not rhs.startswith('='):
-                writes.append(text)
+            for target in targets:
+                for sub in ast.walk(target):
+                    if isinstance(sub, ast.Name) and sub.id == 'casual_conv':
+                        writes.append(ast.unparse(node).splitlines()[0])
         assert not writes, (
             'casual_conv is written between the bind and the resolve, so the '
-            'value /chat actually uses is not the one those tests check: %r'
-            % (writes,))
+            'value /chat actually uses is not the one the tests above check: '
+            '%r' % (writes,))
 
     def test_an_ordinary_tool_prompt_with_a_casual_hint_is_still_casual(self):
         """C2, pinned as the KNOWN HOLE it is, so that no one reads the
