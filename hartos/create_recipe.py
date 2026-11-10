@@ -538,12 +538,9 @@ def send_message_to_user1(user_id, response, inp, prompt_id, media_refs=None):
       via the local chat fan-out (no need to re-trigger here).
 
     - **Standalone central HARTOS** (sys.frozen absent — Docker, dev):
-      POST to https://azurekong.hertzai.com:8443/autogen_response — the
-      canonical Kong gateway in front of the chatbot_pipeline backend
-      that historically owned this endpoint (handler at
-      chatbot_pipeline/chatbot.py:8009).  Same backend as the prior
-      aws_rasa.hertzai.com:9890, just via the TLS+auth+rate-limited
-      gateway instead of the raw HTTP backend.
+      POST to the chatbot_pipeline backend's /autogen_response (handler
+      at chatbot_pipeline/chatbot.py:8009), at the ONE URL REUSE's copy
+      posts to too: hartos.helper.autogen_response_url.
 
     Per user 2026-06-09: ``Agent_status`` field omitted on the local
     path — it was an artefact of the cloud server's per-user session
@@ -580,8 +577,9 @@ def send_message_to_user1(user_id, response, inp, prompt_id, media_refs=None):
             return sent
         return failed
 
-    # Standalone central HARTOS — canonical Kong gateway.
-    url = 'https://azurekong.hertzai.com:8443/autogen_response'
+    # Standalone central HARTOS: the chatbot_pipeline backend.
+    from hartos.helper import autogen_response_url
+    url = autogen_response_url()
     body = json.dumps({
         'user_id': user_id,
         'message': response,

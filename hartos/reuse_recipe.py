@@ -948,8 +948,10 @@ def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_dela
             f'Local publish to user failed for request_id: {intermediate_request_id}')
         return f'Failed to send message to user with request_id: {original_request_id}'
 
-    # Standalone central HARTOS: forward to the chatbot_pipeline backend.
-    url = 'http://aws_rasa.hertzai.com:9890/autogen_response'
+    # Standalone central HARTOS: forward to the chatbot_pipeline backend,
+    # at the one URL CREATE's copy posts to too.
+    from hartos.helper import autogen_response_url
+    url = autogen_response_url()
     body = json.dumps({'user_id': user_id, 'message': response, 'inp': inp, 'request_id': intermediate_request_id, 'Agent_status': 'Reuse Mode'})
     headers = {'Content-Type': 'application/json'}
 

@@ -488,6 +488,12 @@ ADV_ARGS=""
 # 2026-11-10 when the disk was full and the deploy could not build. The
 # rollback start below uses the same bound.
 LOG_ARGS="--log-driver json-file --log-opt max-size=200m --log-opt max-file=5"
+# Where an agent's message to its person goes (hartos.helper.
+# autogen_response_url): the chatbot_pipeline container's /autogen_response,
+# published on this host's port 8001.  The names the code fell back to answer
+# nothing from here (measured 2026-11-10: aws_rasa:9890 and azurekong:8443;
+# Kong has no route for it), so every agent message on central was lost.
+SEND_ARGS="-e AUTOGEN_RESPONSE_URL=http://172.17.0.1:8001/autogen_response"
 # Flywheel state (goals DB, prospects, node keys) must survive rebuilds.
 AD="${DEPLOY_AGENT_DATA_PATH}"; [ -z "$AD" ] && AD=/opt/hzai-LLM-Langchain-Chatbot-Agent/agent_data; sudo mkdir -p "$AD"
 
@@ -511,6 +517,7 @@ sudo docker run -d --name langchain --restart unless-stopped \
   --env-file oauth.env \
   $ADV_ARGS \
   $LOG_ARGS \
+  $SEND_ARGS \
   -e HEVOLVE_MASTER_PRIVATE_KEY="$(sudo cat ${DEPLOY_MASTER_KEY_PATH})" \
   -e HARTOS_GIT_SHA="$DEPLOY_COMMIT" \
   -e HARTOS_IMAGE_TAG="$DEPLOY_COMMIT_SHORT" \
@@ -659,6 +666,7 @@ if [ -z "$STATUS_JSON" ]; then
        --env-file oauth.env \
        $ADV_ARGS \
        $LOG_ARGS \
+       $SEND_ARGS \
        -e HEVOLVE_MASTER_PRIVATE_KEY="$(sudo cat ${DEPLOY_MASTER_KEY_PATH})" \
        -e HARTOS_GIT_SHA="${ROLLBACK_SHA:-$ROLLBACK_VERSION}" \
        -e HARTOS_IMAGE_TAG="$ROLLBACK_VERSION" \

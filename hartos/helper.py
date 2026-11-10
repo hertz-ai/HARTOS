@@ -27,7 +27,7 @@ import ast
 from core.optional_import import lazy_module
 # The fabrication gate in reuse_recipe keys on this EXACT string to tell a
 # back-filled stand-in from a real tool result — one definition, no drift.
-from core.constants import HISTORICAL_TOOL_PLACEHOLDER
+from core.constants import CENTRAL_HOST, HISTORICAL_TOOL_PLACEHOLDER
 autogen = lazy_module("autogen")
 transform_messages = lazy_module(
     "autogen.agentchat.contrib.capabilities.transform_messages")
@@ -5855,6 +5855,25 @@ MEDIA_KIND_MIMES = {
     'video': {'.mp4': 'video/mp4', '.webm': 'video/webm'},
     'html': {'.html': 'text/html', '.htm': 'text/html'},
 }
+
+
+#: Where an agent's message to its person goes on a standalone HARTOS node
+#: (central): the chatbot_pipeline backend's /autogen_response.  ONE URL for
+#: CREATE's and REUSE's send_message_to_user1, which had drifted to two, and
+#: on central 2026-11-10 both were dead: REUSE posted to
+#: aws_rasa.hertzai.com:9890 (36 sends in the experiment's first 15 minutes,
+#: every one "Max retries exceeded") and CREATE to port 8443 of the same box,
+#: where nothing answers (Kong publishes its 8443 as 8543 and has no
+#: /autogen_response route).  AUTOGEN_RESPONSE_URL overrides it: central's
+#: deploy sets the backend's own published port, the e2e compose its mock.
+AUTOGEN_RESPONSE_URL_DEFAULT = f'https://{CENTRAL_HOST}:8443/autogen_response'
+
+
+def autogen_response_url() -> str:
+    """The URL an agent's message to its person is POSTed to off the
+    desktop: AUTOGEN_RESPONSE_URL when set, else the default above."""
+    return (os.environ.get('AUTOGEN_RESPONSE_URL') or '').strip() or \
+        AUTOGEN_RESPONSE_URL_DEFAULT
 
 
 def media_items_for(user_id, refs, *, prompt_id, request_id):
