@@ -10385,7 +10385,10 @@ def chat():
     thread_local_data.clear_agentic_flags()
 
     create_agent = data.get('create_agent', None)
-    casual_conv = data.get('casual_conv', False)
+    # A HINT from the caller, not the decision, and no default of False:
+    # absent now means 'no opinion' and is resolved against the prompt
+    # below, once `prompt` is bound.  See the resolve call after it.
+    casual_conv = data.get('casual_conv')
     autonomous = data.get('autonomous', False)
     probe = data.get('probe', None)
     intermediate = data.get('intermediate', None)
@@ -10583,6 +10586,30 @@ def chat():
         thread_local_data.clear_model_config_override()
 
     prompt = data.get('prompt', None)
+
+    # THE ROUTING DECISION, made here and nowhere else.  OWNER 2026-11-09:
+    # "remove the friggin hardcodi".  core/prompt_difficulty.py has been the
+    # canonical resolver since July and had ZERO callers -- this line is the
+    # wiring it was written for, and the reason the phrase tables upstream
+    # (Nunba chatbot_routes.py:3478, deleted in the same change) could keep
+    # growing back.  Its docstring names exactly what used to happen here:
+    # "/chat read casual_conv straight from the request body and believed
+    # it, and the web client set that flag from whether an agent prompt
+    # happened to be configured -- which has nothing to do with how hard
+    # the question is."
+    #
+    # The hint is still honoured in the cheap direction (a caller asking for
+    # the full path gets it); it is overridden only when it claims 'casual'
+    # about a prompt that assesses HARD, because that direction is the one
+    # that ships a tool-less model's description of work as if the work had
+    # happened -- the same asymmetry escalation_reasons.draft_delegates was
+    # written for.  Pure string inspection: no model call, no network.
+    #
+    # Imported at the use site, not at module scope: this file's imports are
+    # load-order sensitive and this is the only place that needs it.
+    from core.prompt_difficulty import resolve_casual_conv as _resolve_casual
+    casual_conv, _casual_why = _resolve_casual(prompt, casual_conv)
+    app.logger.info("casual_conv resolved: %s (%s)", casual_conv, _casual_why)
 
     # GUARDRAIL: full pre-dispatch gate on every /chat call
     if prompt:

@@ -163,3 +163,43 @@ class TestResolveCasualConv:
         # bool(client_value) — a truthy non-bool hint on an easy prompt.
         casual, why = resolve_casual_conv('hi', client_value=1)
         assert casual is True and why == 'client:True'
+
+
+# ── Imperatives on the person's OWN data are never EASY ─────────────────────
+class TestOwnDataImperativesAreNotEasy:
+    """The asymmetric-cost rule applied to the cases that actually fabricated.
+
+    These four shapes reach the fast path with no tools if _TASK_VERB does
+    not list their opener, which means remember() / open_file_gui() /
+    list_book_chapters() cannot run and the model describes work it never
+    did. MEASURED 2026-11-07 before the fix: every prompt below returned
+    EASY / 'short-and-plain'. They are the same cases the route-level
+    keyword tuple at Nunba chatbot_routes.py:3478 exists to catch, so this
+    class is what allows that shadow table to be deleted.
+    """
+
+    def test_remember_is_not_easy(self):
+        assert assess('remember that my exam is on friday')[0] != EASY
+        assert is_casual("Remember my sister's birthday is the 4th") is False
+
+    def test_forget_is_not_easy(self):
+        assert is_casual("don't forget my dentist appointment") is False
+        assert is_casual('forget about the gym thing') is False
+
+    def test_open_is_not_easy(self):
+        assert is_casual('open my downloads folder') is False
+
+    def test_a_question_about_her_own_book_is_not_easy(self):
+        # No book phrasing anywhere in this module: these resolve through
+        # _INTERROGATIVE, which is why no phrase table is needed.
+        for q in ('In my book, how many metres does the Drellith ridge rise?',
+                  'how tall is the ridge in chapter 3',
+                  'what does my textbook say about nesting',
+                  'how many nests were counted'):
+            assert is_casual(q) is False, q
+
+    def test_pleasantries_still_take_the_fast_path(self):
+        # The widening must not drag chit-chat onto the full path.
+        for p in ('hi', 'hii', 'thanks', 'good morning', 'nice one',
+                  'ok cool', 'that worked', 'lol', 'see you'):
+            assert is_casual(p) is True, p

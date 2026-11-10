@@ -113,11 +113,27 @@ _INTERROGATIVE = re.compile(
     r'was|were|can|could|do|does|did|will|would|should|has|have|had|may|might|'
     r'am)\b', re.I)
 
+# Imperatives that act on the person's OWN data -- her memory, her files,
+# her library -- were missing from this list, and they are the ones whose
+# EASY verdict costs the most.  MEASURED 2026-11-07 by calling
+# resolve_casual_conv(prompt, client_value=None) directly: "remember that
+# my exam is on friday" and "open my downloads folder" both came back
+# casual=True / 'short-and-plain' (score 0, <=8 words, no '?', and no
+# opener in this regex), i.e. the fast path with NO tools -- so remember()
+# and open_file_gui() can never run, and a tool-less model then answers as
+# though they had.  Those are the exact two cases the route-level keyword
+# stopgap at Nunba chatbot_routes.py:3478 was added for on 2026-09-25, and
+# the reason that shadow table could not just be deleted in favour of this
+# module.  Adding them here is what lets it be deleted: a question about
+# the person's book ("how tall is the ridge in chapter 3", "what does my
+# textbook say about nesting") already resolves to the full path via
+# _INTERROGATIVE, with no phrase table anywhere.  "don'?t forget" is
+# spelled out because the anchor is ^ and the negation comes first.
 _TASK_VERB = re.compile(
     r'^\s*(summari[sz]e|write|draft|translate|explain|list|find|search|'
     r'calculate|compute|convert|fix|debug|generate|create|make|build|rewrite|'
     r'review|check|compare|tell|show|give|help|suggest|recommend|plan|'
-    r'describe|define|outline)\b', re.I)
+    r"describe|define|outline|remember|don'?t forget|forget|open)\b", re.I)
 
 
 def assess(prompt: str) -> Tuple[str, int, str]:
