@@ -475,6 +475,42 @@ class ANamedBookIsNeverSwapped(unittest.TestCase):
         self.assertIn('parse_book_pdf', out)
 
 
+    def test_a_turn_with_no_user_is_not_told_to_upload_a_book(self):
+        """_books() returns [] both for "no user" and "no books", so the two
+        looked alike at the refusal and a turn with no user id was sent to
+        ask for a PDF upload -- which cannot help, there being nobody to
+        upload it for."""
+        list_books, get_layouts = _library()
+        with patch.object(bp, 'list_books', list_books), \
+             patch.object(bp, 'get_layouts', get_layouts):
+            tools = dict((n, f)
+                         for n, _d, f in build_book_tools({'user_id': None}))
+            out = tools['list_book_chapters']('anything')
+        self.assertTrue(out.startswith('Error:'), out)
+        self.assertIn('no user id', out)
+        self.assertNotIn('parse_book_pdf', out)
+
+    def test_more_than_twenty_books_says_there_are_more(self):
+        """Naming 20 as if they were all of them makes the agent tell the
+        person their book is not there when it is just number 21."""
+        many = [dict(OTHER_BOOK, file_id=i, book_name='Book %d' % i)
+                for i in range(1, 26)]
+        out = _call('list_book_chapters', 'not here at all', _books=many)
+        self.assertTrue(out.startswith('Error:'), out)
+        self.assertIn('and 5 more', out)
+        self.assertIn('list_books', out)
+
+    def test_a_refused_call_reads_the_library_once(self):
+        """_find_book read it, then _no_book read it again for the names."""
+        list_books, get_layouts = _library()
+        with patch.object(bp, 'list_books', list_books), \
+             patch.object(bp, 'get_layouts', get_layouts):
+            out = _tools()['list_book_chapters'](
+                'The Art of Computer Programming')
+        self.assertTrue(out.startswith('Error:'), out)
+        self.assertEqual(list_books.call_count, 1)
+
+
 if __name__ == '__main__':
     # Run as a script there is no pytest, so the autouse `_uploads` fixture
     # above never fires and `_render_images` would write page jpegs into the

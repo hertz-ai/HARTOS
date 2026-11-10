@@ -154,7 +154,7 @@ def build_book_tools(ctx) -> List[Tuple[str, str, Any]]:
             return []
         return _read(bp.list_books, user_id)
 
-    def _find_book(book_name=''):
+    def _find_book(book_name='', books=None):
         """The book this call names, or the most recent one for an empty name.
 
         A NAME THAT MATCHES NOTHING IS NOT THE MOST RECENT BOOK.  This used
@@ -168,7 +168,9 @@ def build_book_tools(ctx) -> List[Tuple[str, str, Any]]:
         signatures document "Empty = most recent book", so the most-recent
         fallback belongs to the empty name only.
         """
-        books = _books()
+        # `books` is passed in by the three callers so a refused call
+        # reads the library ONCE, not once here and again in _no_book.
+        books = _books() if books is None else books
         if not books:
             return None
         want = str(book_name or '').strip().lower()
@@ -182,13 +184,24 @@ def build_book_tools(ctx) -> List[Tuple[str, str, Any]]:
             return None
         return books[0]
 
-    def _no_book(tool, book_name):
+    def _no_book(tool, book_name, books=None):
         """The refusal for a book this call cannot resolve, in the call's own
         terms.  Owner rule 2026-11-09: a refusal says what was wrong and how
         to fix it, built by core.tool_refusal so core.tool_logging does not
         count it as a hintless one."""
+        if user_id in (None, ''):
+            # NOT the same problem as an empty library, and the old text sent
+            # the agent to ask for a PDF upload -- which cannot help, because
+            # there is nobody to upload it for.  _books() returns [] in both
+            # cases, which is why the two looked alike here.
+            return tool_refusal.refuse(
+                tool,
+                'this turn carries no user id, so there is no library to search',
+                'Tell the person their session is not identified; uploading a '
+                'book cannot fix it',
+                retry=tool_refusal.RETRY_NEVER)
         names = [str(b.get('book_name') or b.get('filename') or '').strip()
-                 for b in _books()]
+                 for b in (_books() if books is None else books)]
         names = [n for n in names if n]
         if not names:
             return tool_refusal.refuse(
@@ -196,11 +209,17 @@ def build_book_tools(ctx) -> List[Tuple[str, str, Any]]:
                 'this user has no parsed books yet, so no book_name can resolve',
                 'Ask the person to upload a PDF, then call parse_book_pdf',
                 retry=tool_refusal.RETRY_LATER)
+        shown = '; '.join(names[:20])
+        if len(names) > 20:
+            # Saying 20 names as if they were all of them makes the agent tell
+            # the person their book is not there when it is just number 21.
+            shown += (' (and %d more -- call list_books for the full list)'
+                      % (len(names) - 20,))
         return tool_refusal.refuse(
             tool,
             "no parsed book matches book_name=%r" % (str(book_name or '').strip(),),
             "Use one of this user's exact book names: %s, or pass an empty "
-            "book_name for the most recent" % ('; '.join(names[:20]),))
+            "book_name for the most recent" % (shown,))
 
     def _layouts(file_id):
         return _read(bp.get_layouts, file_id)
@@ -239,9 +258,10 @@ def build_book_tools(ctx) -> List[Tuple[str, str, Any]]:
         book_name: Annotated[str, "Book name or part of it. Empty = most recent book."] = '',
     ) -> str:
         """Chapters in a book, in page order, so the agent can navigate."""
-        book = _find_book(book_name)
+        books = _books()
+        book = _find_book(book_name, books)
         if not book:
-            return _no_book('list_book_chapters', book_name)
+            return _no_book('list_book_chapters', book_name, books)
         rows = _layouts(book.get('file_id'))
         if not rows:
             return f"No parsed pages for '{book.get('book_name')}'. It may still be parsing."
@@ -284,9 +304,10 @@ def build_book_tools(ctx) -> List[Tuple[str, str, Any]]:
         book_name: Annotated[str, "Book name or part of it. Empty = most recent."] = '',
     ) -> str:
         """One page's text plus the URL of that page's image, for quoting."""
-        book = _find_book(book_name)
+        books = _books()
+        book = _find_book(book_name, books)
         if not book:
-            return _no_book('read_book_page', book_name)
+            return _no_book('read_book_page', book_name, books)
         rows = _layouts(book.get('file_id'))
         want = int(page_number or 0)
         page_rows = [r for r in rows if int(r.get('page_number') or 0) == want]
@@ -325,9 +346,10 @@ def build_book_tools(ctx) -> List[Tuple[str, str, Any]]:
         from_page: Annotated[int, "Resume from this page inside the chapter. 0 = start."] = 0,
     ) -> str:
         """A chapter's pages, each with its own image URL for quoting."""
-        book = _find_book(book_name)
+        books = _books()
+        book = _find_book(book_name, books)
         if not book:
-            return _no_book('read_book_chapter', book_name)
+            return _no_book('read_book_chapter', book_name, books)
         rows = _layouts(book.get('file_id'))
         want = str(chapter or '').strip().lower()
         hit = [r for r in rows if want and want in str(r.get('chapter_name') or '').lower()]
