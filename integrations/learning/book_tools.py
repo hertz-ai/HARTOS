@@ -154,10 +154,22 @@ def build_book_tools(ctx) -> List[Tuple[str, str, Any]]:
     user_id = ctx.get('user_id', '')
     tools: List[Tuple[str, str, Any]] = []
 
+    def _no_user():
+        """True when this turn carries no user id.
+
+        ONE spelling on purpose. This condition used to be written out
+        in _books, _no_book and list_books, and that is exactly how the
+        2026-11-10 refusal fix landed in _no_book and missed list_books
+        next door. The three still do different things with the answer
+        -- _books refuses to read, the other two explain -- but they no
+        longer disagree about what "no user" means.
+        """
+        return user_id in (None, '')
+
     def _books():
         # A turn with no user has no library -- never every user's books,
         # which is what list_books answers for an empty id.
-        if user_id in (None, ''):
+        if _no_user():
             return []
         return _read(bp.list_books, user_id)
 
@@ -196,7 +208,7 @@ def build_book_tools(ctx) -> List[Tuple[str, str, Any]]:
         terms.  Owner rule 2026-11-09: a refusal says what was wrong and how
         to fix it, built by core.tool_refusal so core.tool_logging does not
         count it as a hintless one."""
-        if user_id in (None, ''):
+        if _no_user():
             # NOT the same problem as an empty library, and the old text sent
             # the agent to ask for a PDF upload -- which cannot help, because
             # there is nobody to upload it for.  _books() returns [] in both
@@ -234,7 +246,7 @@ def build_book_tools(ctx) -> List[Tuple[str, str, Any]]:
     # ── 1. list_books ────────────────────────────────────────────────
     def list_books() -> str:
         """Which books this user has parsed and can be taught from."""
-        if user_id in (None, ''):
+        if _no_user():
             # Same confusion _no_book carried until 2026-11-10: _books()
             # returns [] for a turn with no user AND for a user with no
             # books, and only one of those is fixed by uploading a PDF.

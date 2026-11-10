@@ -109,7 +109,13 @@ class BookToolSurface(unittest.TestCase):
     def test_a_turn_with_no_user_sees_no_books(self):
         """The property this has always guarded, unchanged: an empty id must
         NEVER reach the backend, or list_books answers EVERY user's books.
-        The assert_not_called below is that pin and is untouched.
+        CORRECTED: I wrote that the assert_not_called below was that
+        pin and was untouched. It is not -- list_books now returns
+        before _books(), so this call never reaches the shared guard
+        and this line pins only the early return. The shared guard is
+        pinned by test_a_navigation_tool_with_no_user_never_reads_the
+        _library below, which goes through a tool that has no early
+        return. Both are needed; neither covers the other.
 
         What changed 2026-11-10 is only the words. This used to assert "No
         books parsed yet", which told a turn with no user to go and ask for
@@ -544,6 +550,36 @@ class ANamedBookIsNeverSwapped(unittest.TestCase):
         out = _call('list_books', _books=[])
         self.assertIn('upload a PDF', out)
         self.assertIn('parse_book_pdf', out)
+
+
+    def test_a_navigation_tool_with_no_user_never_reads_the_library(self):
+        """The must-fix from REVIEW 2026-11-10, and the coverage I removed
+        without noticing.
+
+        The guard that matters lives in _books() and protects all four
+        tools. test_a_turn_with_no_user_sees_no_books used to pin it
+        TRANSITIVELY, because list_books went through _books(). Since
+        38dda7ba5 list_books returns before that call, so its
+        assert_not_called pins only the new early return -- measured:
+        delete the guard inside _books() and all 48 tests in this file
+        still pass while these three tools call the backend and answer
+        with another user's book, because book_pipeline.list_books
+        answers EVERY user's books for an empty id.
+
+        So pin it where it actually lives, through a tool that has no
+        early return of its own.
+        """
+        for name, args in (('list_book_chapters', ('',)),
+                           ('read_book_page', (1, '')),
+                           ('read_book_chapter', ('Chapter 1', ''))):
+            list_books, get_layouts = _library()
+            with patch.object(bp, 'list_books', list_books), \
+                 patch.object(bp, 'get_layouts', get_layouts):
+                out = _tools(user_id='')[name](*args)
+            list_books.assert_not_called()
+            self.assertTrue(out.startswith('Error:'), (name, out))
+            self.assertNotIn('NCERT', out)
+            self.assertNotIn('Units', out)
 
 
 if __name__ == '__main__':
