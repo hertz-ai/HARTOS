@@ -34,26 +34,30 @@ def is_commerce_action(action) -> bool:
     return str(action or '').strip().lower().startswith(COMMERCE_ACTION_PREFIXES)
 
 
+def bearer_token(req) -> str:
+    """The token of the request's ``Authorization: Bearer`` header, or ''."""
+    auth = req.headers.get('Authorization', '')
+    return auth[7:].strip() if auth.startswith('Bearer ') else ''
+
+
 def approver_from_request(req) -> Optional[str]:
     """Whose Bearer token this is, or None -- never a body field.
 
-    A phone the owner allowed is the user its token names: the API gate
-    verified that token and set the device verdict (security.middleware,
-    ``g.auth_source == 'device'``; only the gate sets it), the way /chat
-    reads it.  A verdict without a user names nobody.  A HARTOS JWT (what
-    /api/commerce/session issues and /chat accepts) is decoded locally;
-    anything else goes through integrations.social.auth.user_id_for_token (a
-    hive JWT or a stored api_token, e.g. a cloud login on a desktop).  A node
-    API key names no person, so it answers None.
+    A HARTOS JWT (what /api/commerce/session issues and /chat accepts) is
+    decoded locally; anything else goes through
+    integrations.social.auth.user_id_for_token (a hive JWT or a stored
+    api_token, e.g. a cloud login on a desktop).  A node API key names no
+    person, so it answers None.
+
+    A phone's device token names nobody here, so no phone approves a
+    payment or a store draft, reads a mandate or keeps a game's sound: its
+    token's user_id is whatever the phone signs (review of ec468c821, C2
+    and M1).  A phone answers only its owner's asks, through the ask door's
+    own rule (person_ask.answer_from_request).
     """
-    from flask import g, has_request_context
-    if has_request_context() and getattr(g, 'auth_source', None) == 'device':
-        uid = (getattr(g, 'jwt_payload', None) or {}).get('user_id')
-        return str(uid) if uid else None
-    auth = req.headers.get('Authorization', '')
-    if not auth.startswith('Bearer '):
+    token = bearer_token(req)
+    if not token:
         return None
-    token = auth[7:].strip()
     try:
         from integrations.social.auth import decode_jwt
         uid = (decode_jwt(token) or {}).get('user_id')

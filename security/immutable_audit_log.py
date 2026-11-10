@@ -17,6 +17,7 @@ Usage:
 import hashlib
 import json
 import logging
+import re
 import threading
 import time
 from datetime import datetime
@@ -24,20 +25,46 @@ from typing import Optional, List, Tuple, Dict, Any
 
 logger = logging.getLogger('hevolve_security')
 
-# Sensitive keys that should be redacted in detail_json
-_SENSITIVE_KEYS = frozenset({
-    'password', 'token', 'api_key', 'secret', 'credential',
-    'private_key', 'ssn', 'credit_card', 'card_number',
-})
+# Besides a secret's name (security.edge_privacy.is_secret_key, the one
+# rule), the audit log withholds a key whose letters, run together, hold one
+# of these anywhere ('auth_tokens', 'token_value', 'client_secrets',
+# 'apiKeys', 'apikeys', 'private-key-pem', 'secret_answer', 'credential_id',
+# 'creditcards', 'card_numbers'): the one rule reads a secret word only as
+# the whole name or its last word, and this log is hash-chained, so a value
+# kept raw is kept for good.  Withholding a harmless 'max_tokens' or
+# 'apiKeyName' here is the price (reviews of 2f3d2255e, fbae5ea36 and
+# d2a2f2ad4).
+_SENSITIVE_KEY_PARTS = ('password', 'token', 'apikey', 'secret', 'credential',
+                        'privatekey', 'creditcard', 'cardnumber')
+# A government number is a word of the key that starts or ends with one of
+# these ('ssn', 'ssn_last4', 'ssns', 'SSNumber', 'userssn', 'mySsnValue'),
+# never the letters anywhere in it: matched anywhere, 'classname',
+# 'processName', 'businessName' and 'witnessNode' were withheld (review of
+# fbae5ea36); matched only as a whole word, 'ssns' and 'userssn' were kept
+# raw (review of d2a2f2ad4).
+_SENSITIVE_NUMBER_WORDS = ('ssn',)
 
 
 def _redact_sensitive(detail: Optional[Dict]) -> Optional[str]:
-    """Redact sensitive fields before storing in audit log."""
+    """Redact sensitive fields before storing in audit log.
+
+    A field is sensitive by the one secret-name rule (which also reads
+    'passwd', 'pwd', 'cookie' and 'API-Key'), when its key's letters hold
+    one of _SENSITIVE_KEY_PARTS, or when a word of its key starts or ends
+    with one of _SENSITIVE_NUMBER_WORDS.  The words are read both as
+    written ('ssns', 'userssn') and in secret_key_form ('my_ssn_value')."""
     if detail is None:
         return None
+    from security.edge_privacy import is_secret_key, secret_key_form
     safe = {}
     for k, v in detail.items():
-        if any(s in k.lower() for s in _SENSITIVE_KEYS):
+        raw, form = str(k).lower(), secret_key_form(str(k))
+        letters = re.sub('[^a-z]+', '', raw)
+        words = set(form.split('_')) | set(re.split('[^a-z]+', raw))
+        if (is_secret_key(form)
+                or any(p in letters for p in _SENSITIVE_KEY_PARTS)
+                or any(w.startswith(n) or w.endswith(n)
+                       for w in words for n in _SENSITIVE_NUMBER_WORDS)):
             safe[k] = '[REDACTED]'
         else:
             safe[k] = v

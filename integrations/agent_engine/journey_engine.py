@@ -166,8 +166,13 @@ class JourneyEngine:
 
     # ---- Journey Execution ----
 
-    def advance_prospect(self, prospect: Dict, force_stage: str = None) -> Dict:
+    def advance_prospect(self, prospect: Dict, force_stage: str = None,
+                         store: Dict = None) -> Dict:
         """Move a prospect to the next stage and execute actions.
+
+        ``store`` is the prospect store the caller loaded and will save
+        (outreach_crm_tools._load_prospects); actions that need more than
+        the prospect (its follow-up sequences) change it in place.
 
         Returns updated prospect with actions taken.
         """
@@ -195,7 +200,7 @@ class JourneyEngine:
         self._fire_hooks('stage_enter', prospect=prospect, stage=target)
 
         # Execute auto-actions for the new stage
-        actions_taken = self._execute_stage_actions(prospect, target)
+        actions_taken = self._execute_stage_actions(prospect, target, store)
 
         # Sync to CRM
         self._sync_crm(prospect)
@@ -205,13 +210,13 @@ class JourneyEngine:
 
         return {'moved': True, 'from': current, 'to': target, 'actions': actions_taken}
 
-    def run_stage_actions(self, prospect: Dict) -> List[Dict]:
+    def run_stage_actions(self, prospect: Dict, store: Dict = None) -> List[Dict]:
         """Execute pending actions for the prospect's current stage.
 
-        Called by the daemon on each tick.
+        Called by the daemon on each tick.  ``store``: as advance_prospect.
         """
         stage = prospect.get('journey_stage', prospect.get('stage', 'discover'))
-        return self._execute_stage_actions(prospect, stage)
+        return self._execute_stage_actions(prospect, stage, store)
 
     def process_event(self, event_type: str, prospect: Dict, event_data: Dict = None) -> Dict:
         """Process an external event that may trigger a stage transition.
@@ -253,7 +258,7 @@ class JourneyEngine:
 
     # ---- Tick-based Processing (called by daemon) ----
 
-    def tick(self, all_prospects: Dict) -> Dict:
+    def tick(self, all_prospects: Dict, store: Dict = None) -> Dict:
         """Process all prospects on a daemon tick.
 
         Checks for:
@@ -261,6 +266,9 @@ class JourneyEngine:
         - Stage transitions that should happen
         - Prospects stuck in a stage too long
         - A/B test results to analyze
+
+        ``store``: the prospect store ``all_prospects`` came from, which the
+        caller saves (as advance_prospect).
 
         Returns summary of actions taken.
         """
@@ -272,18 +280,18 @@ class JourneyEngine:
 
             # Check if prospect should auto-advance
             if stage == 'discover' and not prospect.get('researched'):
-                result = self.advance_prospect(prospect, 'research')
+                result = self.advance_prospect(prospect, 'research', store)
                 if result.get('moved'):
                     summary['transitions'] += 1
 
             elif stage == 'research' and prospect.get('email_draft'):
-                result = self.advance_prospect(prospect, 'outreach')
+                result = self.advance_prospect(prospect, 'outreach', store)
                 if result.get('moved'):
                     summary['transitions'] += 1
 
             elif stage in ('outreach', 'nurture', 'contacted'):
                 # Check for due follow-ups
-                actions = self.run_stage_actions(prospect)
+                actions = self.run_stage_actions(prospect, store)
                 summary['actions'] += len(actions)
 
             # Check for stale prospects (no activity for 21+ days)
@@ -345,7 +353,9 @@ class JourneyEngine:
 
         for ch in channels:
             result = self._send_channel_message(prospect, message, ch)
-            if result.get('success'):
+            # Pending may still arrive: the prospect is not messaged again on
+            # the next channel too.
+            if result.get('success') or result.get('pending'):
                 return result
 
         return {'success': False, 'error': 'no channel available'}
@@ -374,17 +384,20 @@ class JourneyEngine:
             'analyze_loss_reason': self._action_noop,
         })
 
-    def _execute_stage_actions(self, prospect: Dict, stage: str) -> List[Dict]:
-        """Execute all auto-actions for a stage."""
+    def _execute_stage_actions(self, prospect: Dict, stage: str,
+                               store: Dict = None) -> List[Dict]:
+        """Execute all auto-actions for a stage.  Each handler gets the
+        caller's prospect store as ctx['store'] when there is one."""
         stage_config = self._stages.get(stage, {})
         actions = stage_config.get('auto_actions', [])
         results = []
+        ctx = {'store': store} if store is not None else {}
 
         for action_name in actions:
             handler = self._action_handlers.get(action_name)
             if handler:
                 try:
-                    result = handler(prospect, {})
+                    result = handler(prospect, ctx)
                     results.append({'action': action_name, 'result': result})
                 except Exception as e:
                     logger.error('Journey action %s failed: %s', action_name, e)
@@ -428,10 +441,18 @@ class JourneyEngine:
         if not chat_id:
             return {'success': False, 'channel': channel,
                     'error': f'no {channel} chat for this prospect'}
+        import concurrent.futures
         try:
-            from integrations.channels.flask_integration import get_channel_integration
+            from integrations.channels.flask_integration import (
+                CHANNEL_SEND_WAIT_S, get_channel_integration)
             result = get_channel_integration().send_threadsafe(
-                channel, chat_id, message, wait=15)
+                channel, chat_id, message, wait=CHANNEL_SEND_WAIT_S)
+        except concurrent.futures.TimeoutError:
+            # Still running on the adapter loop; it may yet arrive.  Not a
+            # failure: sending again would reach the prospect twice.
+            logger.warning('Journey message on %s not confirmed after %ss; it '
+                           'may still arrive', channel, CHANNEL_SEND_WAIT_S)
+            return {'success': None, 'pending': True, 'channel': channel}
         except Exception as e:
             logger.warning('Journey message on %s not sent: %s', channel, e)
             return {'success': False, 'channel': channel, 'error': str(e)}
@@ -455,7 +476,7 @@ class JourneyEngine:
                     "happy to chat here if that's easier."
                 )
                 result = self.send_via_channel(prospect, message, ch)
-                if result.get('success'):
+                if result.get('success') or result.get('pending'):
                     prospect['alternate_channel_tried'] = ch
                     prospect['updated_at'] = datetime.utcnow().isoformat()
                     return
@@ -530,7 +551,13 @@ class JourneyEngine:
         return {'generated': True}
 
     def _action_send_email(self, prospect: Dict, ctx: Dict) -> Dict:
-        """Send the outreach email."""
+        """Send the outreach email (the prospect's draft), once.  A refused
+        send is tried again after a wait and then given up, by the same rule
+        as a follow-up step (outreach_crm_tools.note_refused, which logs
+        it): the draft carries its tries, and get_pipeline_status /
+        view_journey_pipeline list it under not_delivered.  Retried on every
+        tick, a refused address was mailed ~576 times a day (review of
+        1c4b2b650)."""
         draft = prospect.get('email_draft')
         if not draft:
             return {'skipped': True, 'reason': 'no draft'}
@@ -539,23 +566,45 @@ class JourneyEngine:
             return {'skipped': True, 'reason': 'already sent'}
 
         try:
-            from integrations.agent_engine.outreach_crm_tools import _send_email
+            from integrations.agent_engine.outreach_crm_tools import (
+                _send_email, count_delivered, note_refused, retry_due)
+            if draft.get('status') == 'failed':
+                return {'skipped': True, 'reason': 'given up',
+                        'error': draft.get('last_error')}
+            now = datetime.utcnow()
+            if not retry_due(draft, now):
+                return {'skipped': True, 'reason': 'waiting to try again',
+                        'retry_after': draft.get('retry_after')}
             result = _send_email(prospect['email'], draft['subject'], draft['body'])
-            if result.get('success') or result.get('via'):
-                prospect['emails_sent'] = 1
-                prospect['last_email_at'] = datetime.utcnow().isoformat()
+            # 'via' names the sender on a refused send too: only success
+            # counts as sent.
+            if result.get('success'):
+                count_delivered(prospect, now)
                 prospect['stage'] = 'contacted'
                 return {'sent': True, 'result': result}
+            gave_up = note_refused(draft, result, now,
+                                   f"{prospect.get('company', '?')}, first email")
         except Exception as e:
             return {'error': str(e)}
 
-        return {'sent': False}
+        return {'sent': False, 'gave_up': gave_up, 'result': result}
 
     def _action_check_followups(self, prospect: Dict, ctx: Dict) -> Dict:
-        """Check and send pending follow-ups (delegates to outreach tools)."""
+        """Send this prospect's due follow-ups.  On the caller's store when
+        it passes one (ctx['store'], which it saves), so the tick's copy
+        and the checker's writes are one; otherwise the checker loads and
+        saves the store itself."""
         try:
-            from integrations.agent_engine.outreach_crm_tools import check_pending_followups_daemon
-            return check_pending_followups_daemon()
+            from integrations.agent_engine.outreach_crm_tools import (
+                check_pending_followups_daemon, send_due_followups)
+            store = ctx.get('store')
+            if store is None:
+                return check_pending_followups_daemon()
+            actions = send_due_followups(store, datetime.utcnow(),
+                                         prospect_id=prospect.get('id'))
+            return {'sent': sum(1 for a in actions
+                                if a.get('action') == 'followup_sent'),
+                    'actions': actions}
         except Exception as e:
             return {'error': str(e)}
 
@@ -617,6 +666,12 @@ class JourneyEngine:
                 '<p>happy to adjust to your timezone.</p>'
                 '<p>sathish</p>',
             )
+            # Proposed only when the email went out.  A refused proposal is
+            # not retried on its own: tick() has no 'engaged' branch, so
+            # this runs again only when the prospect enters 'engaged' again
+            # (process_event, advance_prospect_stage).
+            if not result.get('success'):
+                return {'proposed': False, 'result': result}
             prospect['meeting_proposed'] = True
             return {'proposed': True, 'result': result}
         except Exception as e:
@@ -660,8 +715,11 @@ def register_journey_tools(helper, assistant, user_id: str):
     engine = get_journey_engine()
 
     def view_journey_pipeline() -> str:
-        """View the full prospect journey pipeline with stage counts and A/B stats."""
-        from integrations.agent_engine.outreach_crm_tools import _load_prospects
+        """View the full prospect journey pipeline with stage counts, A/B
+        stats, and the emails that were refused (waiting to be tried again
+        or given up)."""
+        from integrations.agent_engine.outreach_crm_tools import (
+            _load_prospects, undelivered_summary)
         data = _load_prospects()
         prospects = data.get('prospects', {})
 
@@ -679,9 +737,18 @@ def register_journey_tools(helper, assistant, user_id: str):
         # A/B stats
         ab = engine.get_ab_stats(prospects)
 
+        not_delivered = undelivered_summary(data)
         return json.dumps({
+            # The counts at the head, where every cut keeps them
+            # (undelivered_summary; review of fe99feac3).
+            'not_delivered_count': not_delivered['counts'],
             'pipeline': {k: {'count': len(v), 'prospects': v} for k, v in pipeline.items()},
             'total': len(prospects),
+            # The rows, bounded (UNDELIVERED_LIST_LIMIT) and before ab_test:
+            # the wire trim cuts a long result's middle, so ab_test stays at
+            # the tail it kept before not_delivered existed (review of
+            # 5970e07a1).
+            'not_delivered': not_delivered['latest'],
             'ab_test': ab,
         }, default=str)
 
@@ -699,7 +766,8 @@ def register_journey_tools(helper, assistant, user_id: str):
         if not prospect:
             return json.dumps({'error': 'prospect not found'})
 
-        result = engine.advance_prospect(prospect, force_stage=target_stage)
+        result = engine.advance_prospect(prospect, force_stage=target_stage,
+                                         store=data)
         _save_prospects(data)
         return json.dumps(result, default=str)
 
@@ -710,7 +778,7 @@ def register_journey_tools(helper, assistant, user_id: str):
         """
         from integrations.agent_engine.outreach_crm_tools import _load_prospects, _save_prospects
         data = _load_prospects()
-        summary = engine.tick(data.get('prospects', {}))
+        summary = engine.tick(data.get('prospects', {}), store=data)
         _save_prospects(data)
         return json.dumps(summary, default=str)
 
@@ -731,6 +799,12 @@ def register_journey_tools(helper, assistant, user_id: str):
             return json.dumps({'error': 'prospect not found'})
 
         result = engine.send_via_channel(prospect, message, channel)
+        if result.get('pending'):
+            # Not confirmed in time: it may still arrive, and a second send
+            # would reach the prospect twice (review of 506a79c1f).
+            result = dict(result, note=(
+                f"The message on {result.get('channel')} is not confirmed yet; "
+                f"it may still arrive. Do not send it again."))
         return json.dumps(result, default=str)
 
     # UI labels for these tool names live in core/constants.py:TOOL_LABELS
@@ -764,7 +838,9 @@ def journey_daemon_tick() -> Dict:
         data = _load_prospects()
         if not data.get('prospects'):
             return {'skipped': True, 'reason': 'no prospects'}
-        summary = engine.tick(data.get('prospects', {}))
+        # The tick's follow-up checks work on this same copy (store=data),
+        # so saving it keeps their writes (review of 1c4b2b650).
+        summary = engine.tick(data.get('prospects', {}), store=data)
         # Only save if something happened
         if summary.get('transitions', 0) > 0 or summary.get('actions', 0) > 0:
             _save_prospects(data)
@@ -798,11 +874,172 @@ def register_sales_goal_type():
         logger.error('Failed to register sales goal type: %s', e)
 
 
+#: What the sales prompt says when the goal names no product: the
+#: HARTOS-for-robotics pitch it always carried, word for word (every
+#: product-dependent line of the template is a key here).  A named product
+#: replaces every one of them (_sales_pitch); the HevolveAI seller lines
+#: (_SELLER_KEYS) stay only for HevolveAI's own products.
+_HARTOS_PITCH = {
+    'product_section': """PRODUCT: HARTOS (Hevolve Hive Agentic Runtime OS)
+============================================================
+What it is:
+  - Open-source on-device AI runtime for robotics
+  - Runs LLM inference, computer vision, speech recognition, and multi-agent
+    orchestration DIRECTLY on robot hardware. No cloud round-trips.
+  - Every robot running HARTOS joins the Hive intelligence network:
+    private data stays local, but collective models improve with scale.
+
+Why robotics companies care:
+  - Eliminates cloud latency for real-time autonomy
+  - Works offline (warehouses, surgical theaters, field, underwater, space)
+  - One OS handles perception + reasoning + action (replaces 5+ SDKs)
+  - Early partners shape the intelligence layer for their vertical
+  - Open-source: no vendor lock-in, full hardware access
+
+Key differentiators vs competitors:
+  - NVIDIA Isaac: HARTOS adds LLM reasoning + multi-agent orchestration
+  - ROS2: HARTOS adds native AI inference, not just message passing
+  - Custom stacks: HARTOS is batteries-included, saves 6-12 months eng time
+
+Partnership offer:
+  - One partner per vertical (exclusive early access)
+  - Partner shapes the runtime for their use case
+  - Q2 2026 deadline for early access cohort
+  - Free integration support from the core team""",
+    'targets': """   - Target robotics companies across these verticals:
+     humanoid, healthcare/surgical, industrial, warehouse/logistics,
+     delivery, construction, defense/security, cobot, manufacturing,
+     agriculture, inspection, underwater, space, cleaning, hospitality""",
+    'pains': '   - Look for pain points HARTOS solves (latency, offline ops, multi-sensor fusion)',
+    'name': 'HARTOS',
+    'topic': 'on-device AI',
+    'search_hint': 'find new robotics companies',
+    'agent_line': 'You are the HARTOS Sales & Marketing Agent.',
+    'creator_line': 'Creator: Sathish, founder of HevolveAI\n',
+    'replies_line': 'Replies go to: sathish@hertzai.com\n',
+    'website_line': 'Website: https://hevolve.ai\n',
+    'discover': '   - Use google_search to find companies in underrepresented verticals\n   - Call create_prospect() for each new company found\n   - Include: company name, info@domain email, vertical, product description',
+    'template_a': '     Body: reference their product > what HARTOS does > teams in {vertical}\n           testing it > one slot per vertical > worth a 15-min call?',
+    'template_b': '     Body: what caught your attention > HARTOS pitch > Hive network value >\n           one slot per vertical for Q2 > open to a quick chat?',
+    'crm_line': '  Board: HARTOS Sales | Pipeline: Robotics Outreach',
+    'voice_line': '- Sound like a real human founder, not a bot or marketer',
+    'subject_example': 'digit',
+    'signature_line': '- Sign as: sathish / founder, HevolveAI / hevolve.ai',
+}
+
+
+#: The lines that say who sells and signs: HevolveAI's for its own products
+#: (Product.is_platform_product) and for the default pitch, never for a
+#: product someone else owns (review of 44f21b312: a third party's product
+#: was pitched in emails signed as HevolveAI's founder).
+_SELLER_KEYS = ('creator_line', 'replies_line', 'website_line', 'voice_line',
+                'signature_line')
+
+
+def _sales_pitch(product_dict: Optional[Dict]) -> Dict:
+    """The product-dependent parts of the sales prompt: the goal's own
+    product when it names one, else the HARTOS-for-robotics pitch
+    (_HARTOS_PITCH), word for word.
+
+    The product's fields come from goal_manager.product_fields, the one
+    reader of a Product row (cleaned, capped, keywords of any shape).  For
+    a product, no line carries the HARTOS pitch's robotics framing, its
+    one-slot-per-vertical scarcity or its Q2 deadline (review of 44f21b312:
+    they were still in every product prompt).  Every value is text the
+    prompt shows as it is (a '%' in one is safe: % formatting does not
+    re-read the text it puts in)."""
+    from integrations.agent_engine.goal_manager import product_fields
+    p = product_fields(product_dict)
+    if p is None:
+        return dict(_HARTOS_PITCH)
+    # A row with a blank name is still its owner's product, never HARTOS
+    # (review of d2ad38b22); the prompt calls it 'this product'.
+    name = p['name'] or 'this product'
+    team = f"the {p['name']} team" if p['name'] else 'the team behind this product'
+    url, keywords = p['product_url'], p['keywords']
+    block = [f'PRODUCT: {name}', '=' * 60]
+    for label, key in (('What it is', 'description'), ('In one line', 'tagline'),
+                       ('Who it is for', 'target_audience'),
+                       ('Why it is better', 'unique_value_prop'),
+                       ('Link', 'product_url'), ('Category', 'category')):
+        if p[key]:
+            block.append(f'  - {label}: {p[key]}')
+    if keywords:
+        block.append(f"  - Keywords: {', '.join(keywords)}")
+    who = p['target_audience'] or (
+        'the people and businesses who need it'
+        + (f" ({', '.join(keywords)})" if keywords else ''))
+    pitch = {
+        'product_section': '\n'.join(block),
+        'targets': f'   - Target the people and businesses {name} is for: {who}',
+        'pains': f'   - Look for pain points {name} solves'
+                 + (f" ({p['unique_value_prop']})" if p['unique_value_prop'] else ''),
+        'name': name,
+        'topic': name,
+        'search_hint': f'find people and businesses who need {name}',
+        'agent_line': f'You are the sales agent for {name}.',
+        'discover': ('   - Use google_search to find the organisations that reach them: '
+                     'the businesses,\n     groups, communities and services they '
+                     'already use\n'
+                     '   - Call create_prospect() for each one found\n'
+                     '   - Include: its name, its public contact email, the kind of '
+                     'organisation as vertical, what it does'),
+        'template_a': (f'     Body: reference what they do > what {name} does > '
+                       f'why it helps them\n           > worth a 15-min call?'),
+        'template_b': (f'     Body: what caught your attention > {name} pitch > '
+                       f'why {name} is better for them\n           > open to a quick chat?'),
+        'crm_line': "  Board: HARTOS Sales | Pipeline: this node's deal pipeline",
+        'subject_example': (keywords[0] if keywords else name).lower(),
+    }
+    if p['is_platform_product']:
+        pitch.update({k: _HARTOS_PITCH[k] for k in _SELLER_KEYS})
+    else:
+        pitch.update({
+            'creator_line': f'Selling for: {name}, on behalf of its owner\n',
+            'replies_line': '',
+            'website_line': f'Website: {url}\n' if url else '',
+            'voice_line': f'- Sound like a real person from {team}, '
+                          f'not a bot or marketer',
+            'signature_line': f'- Sign as: {team}' + (f' / {url}' if url else ''),
+        })
+    return pitch
+
+
+def _sales_goal_section(goal_dict: Dict) -> str:
+    """The goal's own words for the sales prompt: its title and
+    description, in the lines the other goal builders use, or '' when the
+    goal carries neither.
+
+    The 'outreach' builder this one replaced showed them; the 'sales'
+    builder never did, so the agent was told what to sell but not what
+    the person who set the goal asked for.  (That builder's CONFIG line
+    read goal_dict['config'], a key the daemon's goal dict lacks:
+    AgentGoal.to_dict merges the config into the top level, so the line
+    printed {} unless the config itself held a key named 'config'; it is
+    not carried over.)
+    GoalManager.build_prompt has already sanitised both fields."""
+    lines = []
+    if goal_dict.get('title'):
+        lines.append(f"Goal: {goal_dict['title']}")
+    if goal_dict.get('description'):
+        lines.append(f"Description: {goal_dict['description']}")
+    if not lines:
+        return ''
+    return ('=' * 60 + '\nYOUR GOAL\n' + '=' * 60 + '\n'
+            + '\n'.join(lines) + '\n\n')
+
+
 def _build_sales_prompt(goal_dict: Dict, product_dict: Dict = None) -> str:
     """Build the system prompt for the sales agent.
 
     Injects live pipeline state, A/B stats, and vertical coverage
     so the agent can make informed decisions each dispatch.
+
+    It pitches the goal's own product (product_dict, the Product row the
+    daemon passes), and the HARTOS-for-robotics pitch, word for word, only
+    when the goal names none: a sales goal for any other business used to
+    cold-email robotics companies (#233).  It also shows the goal's own
+    title and description (_sales_goal_section).
     """
     from integrations.agent_engine.outreach_crm_tools import _load_prospects
     data = _load_prospects()
@@ -831,18 +1068,27 @@ def _build_sales_prompt(goal_dict: Dict, product_dict: Dict = None) -> str:
         verticals[v] = verticals.get(v, 0) + 1
     vertical_text = ', '.join('%s(%d)' % (v, c) for v, c in sorted(verticals.items(), key=lambda x: -x[1]))
 
-    # Pending follow-ups
+    # Pending follow-ups.  Overdue = pending and past its time, in a
+    # sequence whose next step is due (outreach_crm_tools.next_followup, the
+    # checker's own rule).  A sequence whose next step waits out a refused
+    # send's wait sends nothing now, and the steps behind that one wait for
+    # it, so none of them is overdue: counting them told the agent to
+    # investigate while check_pending_followups had nothing to send
+    # (reviews of 6da8b09c7 and 5970e07a1).  They are still pending.
+    from integrations.agent_engine.outreach_crm_tools import next_followup
     pending_followups = 0
     overdue_followups = 0
-    now_iso = datetime.utcnow().isoformat()
+    now = datetime.utcnow()
     for seq in sequences.values():
         if seq.get('status') != 'active':
             continue
-        for step in seq.get('steps', []):
-            if step.get('status') == 'pending':
-                pending_followups += 1
-                if step.get('scheduled_at', '9999') < now_iso:
-                    overdue_followups += 1
+        pending = [step for step in seq.get('steps', [])
+                   if step.get('status') == 'pending']
+        pending_followups += len(pending)
+        if next_followup(seq, now)[1] == 'due':
+            overdue_followups += sum(
+                1 for step in pending
+                if datetime.fromisoformat(step['scheduled_at']) <= now)
 
     # Stale prospects (no activity > 7 days)
     stale = []
@@ -852,44 +1098,16 @@ def _build_sales_prompt(goal_dict: Dict, product_dict: Dict = None) -> str:
             if p.get('stage') in ('contacted', 'nurture'):
                 stale.append(p.get('company', '?'))
 
-    return """You are the HARTOS Sales & Marketing Agent. You run CONTINUOUSLY inside the HARTOS daemon.
+    return """%(agent_line)s You run CONTINUOUSLY inside the HARTOS daemon.
 
 ============================================================
 IDENTITY
 ============================================================
 Name: Cortext (the HARTOS marketing intelligence)
-Creator: Sathish, founder of HevolveAI
-Email from: cortext@hertzai.com
-Replies go to: sathish@hertzai.com
-Website: https://hevolve.ai
-
-============================================================
-PRODUCT: HARTOS (Hevolve Hive Agentic Runtime OS)
-============================================================
-What it is:
-  - Open-source on-device AI runtime for robotics
-  - Runs LLM inference, computer vision, speech recognition, and multi-agent
-    orchestration DIRECTLY on robot hardware. No cloud round-trips.
-  - Every robot running HARTOS joins the Hive intelligence network:
-    private data stays local, but collective models improve with scale.
-
-Why robotics companies care:
-  - Eliminates cloud latency for real-time autonomy
-  - Works offline (warehouses, surgical theaters, field, underwater, space)
-  - One OS handles perception + reasoning + action (replaces 5+ SDKs)
-  - Early partners shape the intelligence layer for their vertical
-  - Open-source: no vendor lock-in, full hardware access
-
-Key differentiators vs competitors:
-  - NVIDIA Isaac: HARTOS adds LLM reasoning + multi-agent orchestration
-  - ROS2: HARTOS adds native AI inference, not just message passing
-  - Custom stacks: HARTOS is batteries-included, saves 6-12 months eng time
-
-Partnership offer:
-  - One partner per vertical (exclusive early access)
-  - Partner shapes the runtime for their use case
-  - Q2 2026 deadline for early access cohort
-  - Free integration support from the core team
+%(creator_line)sEmail from: cortext@hertzai.com
+%(replies_line)s%(website_line)s
+%(goal_section)s============================================================
+%(product_section)s
 
 ============================================================
 YOUR MISSION
@@ -902,38 +1120,31 @@ On every dispatch, you must:
    - Identify what needs attention RIGHT NOW
 
 2. DISCOVER NEW PROSPECTS (if pipeline < 50 or a vertical has < 3)
-   - Target robotics companies across these verticals:
-     humanoid, healthcare/surgical, industrial, warehouse/logistics,
-     delivery, construction, defense/security, cobot, manufacturing,
-     agriculture, inspection, underwater, space, cleaning, hospitality
-   - Use google_search to find companies in underrepresented verticals
-   - Call create_prospect() for each new company found
-   - Include: company name, info@domain email, vertical, product description
+%(targets)s
+%(discover)s
 
 3. RESEARCH PROSPECTS (for any in 'new' or 'discover' stage)
    - Crawl their website to understand their product, funding, team
-   - Look for pain points HARTOS solves (latency, offline ops, multi-sensor fusion)
+%(pains)s
    - Update prospect notes with research findings
 
 4. SEND PERSONALIZED OUTREACH (for any in 'new' stage with no emails sent)
    - A/B test two subject line styles:
      Variant A (direct): "quick question about {product_keyword}"
-     Variant B (partnership): "{company} + on-device AI?"
+     Variant B (partnership): "{company} + %(topic)s?"
    - Alternate A/B assignment (even index = A, odd = B)
    - Call send_outreach_email() with personalized HTML body
    - Body must reference their SPECIFIC product and vertical
-   - Always include: what HARTOS is, why they should care, clear CTA (15-min call)
+   - Always include: what %(name)s is, why they should care, clear CTA (15-min call)
    - Tone: casual, human, lowercase subjects, no em dashes, no corporate speak
 
    Email template A (direct):
      Subject: quick question about {product_keyword}
-     Body: reference their product > what HARTOS does > teams in {vertical}
-           testing it > one slot per vertical > worth a 15-min call?
+%(template_a)s
 
    Email template B (partnership):
-     Subject: {company} + on-device AI?
-     Body: what caught your attention > HARTOS pitch > Hive network value >
-           one slot per vertical for Q2 > open to a quick chat?
+     Subject: {company} + %(topic)s?
+%(template_b)s
 
 5. CREATE FOLLOW-UP SEQUENCES (for any prospect with email sent but no sequence)
    - Call create_followup_sequence() with 2-3 steps:
@@ -981,7 +1192,7 @@ Journey tools (4):
   - send_prospect_message(prospect_id, message, channel)
 
 General tools:
-  - google_search(query)       -- find new robotics companies
+  - google_search(query)       -- %(search_hint)s
   - delegate_to_specialist()   -- hand off complex tasks
 
 ============================================================
@@ -990,7 +1201,7 @@ INFRASTRUCTURE
 Email service: http://172.17.0.1:4000 (cortext@hertzai.com via SES)
 Crawl4AI: http://172.17.0.1:8094 (website scraping)
 Erxes CRM: http://192.168.0.83:3300 (deal pipeline)
-  Board: HARTOS Sales | Pipeline: Robotics Outreach
+%(crm_line)s
   Stages: New > Contacted > Replied > Meeting > Negotiation > Won | Lost
   Auto-syncs: prospect create, stage move, deal update
 Channels: email (primary), slack, discord, telegram, whatsapp
@@ -998,33 +1209,33 @@ Channels: email (primary), slack, discord, telegram, whatsapp
 ============================================================
 WRITING STYLE (critical -- must follow exactly)
 ============================================================
-- Sound like a real human founder, not a bot or marketer
-- Lowercase email subjects always (e.g. "quick question about digit")
+%(voice_line)s
+- Lowercase email subjects always (e.g. "quick question about %(subject_example)s")
 - NEVER use em dashes. Use -- or commas instead.
 - Short paragraphs. 2-3 sentences max per paragraph.
 - No buzzwords: don't say "synergy", "leverage", "paradigm", "cutting-edge"
 - DO say: "pretty cool", "worth a chat", "figured you might want first dibs"
-- Sign as: sathish / founder, HevolveAI / hevolve.ai
+%(signature_line)s
 - Follow-ups get SHORTER each time, not longer
 - Last follow-up: graceful exit ("totally get it if timing's off")
 
 ============================================================
 LIVE PIPELINE STATE (as of this dispatch)
 ============================================================
-%s
+%(pipeline_text)s
 
-Total prospects: %d
-Active sequences: %d
-Pending follow-ups: %d (overdue: %d)
-Stale (>7d no activity): %s
-Total emails sent: %d
+Total prospects: %(total)d
+Active sequences: %(active)d
+Pending follow-ups: %(pending)d (overdue: %(overdue)d)
+Stale (>7d no activity): %(stale)s
+Total emails sent: %(sent)d
 
-Vertical coverage: %s
+Vertical coverage: %(verticals)s
 
 A/B TEST:
-  Variant A (direct): %d sent, %.1f%% reply rate
-  Variant B (partnership): %d sent, %.1f%% reply rate
-  Winner: %s (confidence: %s)
+  Variant A (direct): %(a_sent)d sent, %(a_rate).1f%% reply rate
+  Variant B (partnership): %(b_sent)d sent, %(b_rate).1f%% reply rate
+  Winner: %(winner)s (confidence: %(confidence)s)
 
 ============================================================
 EXECUTION ORDER (do this NOW)
@@ -1036,16 +1247,18 @@ EXECUTION ORDER (do this NOW)
 5. If any vertical has < 2 prospects, discover more
 6. If any prospect has no sequence, create one
 7. Report summary of all actions taken
-""" % (
-        pipeline_text or '  (empty pipeline -- seed prospects first!)',
-        len(prospects),
-        len([s for s in sequences.values() if s.get('status') == 'active']),
-        pending_followups,
-        overdue_followups,
-        ', '.join(stale[:5]) if stale else 'none',
-        len(sent_log),
-        vertical_text or 'none',
-        ab_stats['A']['sent'], ab_stats['A']['reply_rate'],
-        ab_stats['B']['sent'], ab_stats['B']['reply_rate'],
-        ab_stats['winner'], ab_stats['confidence'],
+""" % dict(
+        _sales_pitch(product_dict),
+        goal_section=_sales_goal_section(goal_dict),
+        pipeline_text=pipeline_text or '  (empty pipeline -- seed prospects first!)',
+        total=len(prospects),
+        active=len([s for s in sequences.values() if s.get('status') == 'active']),
+        pending=pending_followups,
+        overdue=overdue_followups,
+        stale=', '.join(stale[:5]) if stale else 'none',
+        sent=len(sent_log),
+        verticals=vertical_text or 'none',
+        a_sent=ab_stats['A']['sent'], a_rate=ab_stats['A']['reply_rate'],
+        b_sent=ab_stats['B']['sent'], b_rate=ab_stats['B']['reply_rate'],
+        winner=ab_stats['winner'], confidence=ab_stats['confidence'],
     )

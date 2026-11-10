@@ -297,6 +297,17 @@ class ModelRegistry:
             return None
         return max(candidates, key=lambda m: m.accuracy_score)
 
+    def get_configured_expert(self, lane: Optional[str] = None) -> Optional[ModelBackend]:
+        """The configured expert (the HEVOLVE_EXPERT_LLM_* trio,
+        CONFIGURED_EXPERT_ID) when it may serve a call of ``lane``:
+        registered, dispatchable and offered (_offered: the lane and the
+        owner's day cap).  None otherwise.  Never another expert-tier backend
+        (Claude Code, a hive peer's expert)."""
+        m = self.get_model(CONFIGURED_EXPERT_ID)
+        if m is None or not m.is_dispatchable():
+            return None
+        return m if self._offered(m, lane) else None    # outside the lock
+
     def get_escalation_expert(self, lane: Optional[str] = None) -> Optional[ModelBackend]:
         """The model a stuck goal action is handed to before a person (#106d).
 

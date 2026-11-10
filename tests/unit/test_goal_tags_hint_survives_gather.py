@@ -97,8 +97,10 @@ def chat(hie, tmp_path, monkeypatch):
     monkeypatch.setattr(hie, 'pooled_post', posts)
 
     answers = []
+    asked_with = []          # the goal_tags each gather turn was asked with
 
-    def gather_info(user_id, prompt, prompt_id, autonomous=False):
+    def gather_info(user_id, prompt, prompt_id, autonomous=False, goal_tags=()):
+        asked_with.append(list(goal_tags))
         return answers.pop(0)
     monkeypatch.setitem(sys.modules, 'hartos.gather_agentdetails',
                         SimpleNamespace(gather_info=gather_info))
@@ -107,11 +109,11 @@ def chat(hie, tmp_path, monkeypatch):
     user = 'phone-user-%s' % pid[-6:]
     client = hie.app.test_client()
 
-    def turn(text, goal_tags=None):
+    def turn(text, goal_tags=None, create_agent=True):
         body = {'prompt': text, 'user_id': user, 'prompt_id': int(pid),
                 'request_id': 'rid-%s' % uuid.uuid4().hex[:12],
                 'casual_conv': False, 'probe': False, 'intermediate': False,
-                'create_agent': True, 'file_id': 0, 'preferred_lang': 'en',
+                'create_agent': create_agent, 'file_id': 0, 'preferred_lang': 'en',
                 'tools': None, 'video_req': False, 'media_request': False,
                 'media_mode': 'text', 'autonomous': False,
                 'agentic_execute': False, 'device_id': 'phone-1'}
@@ -148,7 +150,8 @@ def chat(hie, tmp_path, monkeypatch):
         hie._agent_timestamps[key] = time.time() - hours * 3600
         real_cleanup()
 
-    yield SimpleNamespace(turn=turn, answers=answers, saved=saved, pid=pid,
+    yield SimpleNamespace(turn=turn, answers=answers, asked_with=asked_with,
+                          saved=saved, pid=pid,
                           user=user, cloud_syncs=cloud_syncs, hie=hie,
                           saved_bytes=saved_bytes, restart=forget, idle=idle)
     forget()
@@ -282,3 +285,58 @@ def test_any_other_agents_record_is_written_as_before(chat):
     expected = dict(json.loads(answer), prompt_id=chat.pid, creator_user_id=chat.user)
     assert chat.saved_bytes() == json.dumps(expected).encode('ascii')
     assert len(chat.cloud_syncs()) == 1
+
+
+# -- what her tags reach beyond the record (agent 342, 2026-11-04) -----------
+
+def test_her_plan_is_written_with_her_agents_tools(chat):
+    """f790311c7: each gather turn is asked with the hint that turn carries,
+    so the plan writer lists her agent's own tools
+    (gather_agentdetails.plan_writer_tools).  A turn with no hint asks with
+    none."""
+    chat.answers += [PLAIN, PLAIN]
+    chat.turn('I want help with my salon', goal_tags=HER_TAGS)
+    chat.turn('weekend bookings, captions')
+    assert chat.asked_with == [['reel_studio'], []]
+
+
+def _her_plan_approved(chat, monkeypatch):
+    """She approves her plan; returns the list each recipe() run's keyword
+    arguments land in (recipe() itself is replaced: no agent is built)."""
+    chat.answers += [REVIEW, _completed('Help my salon', ['Edit the clips'])]
+    chat.turn('help my salon', goal_tags=HER_TAGS)
+    assert chat.turn('yes', goal_tags=HER_TAGS)['Agent_status'] == 'Review Mode'
+    assert chat.saved()['goal_tags'] == ['reel_studio']
+    runs = []
+
+    def recipe(user_id, text, prompt_id, file_id, request_id, **kw):
+        runs.append(kw)
+        return 'Agent Created Successfully'
+    monkeypatch.setattr(chat.hie, 'recipe', recipe)
+    monkeypatch.setattr(chat.hie, '_create_social_agent_from_prompt',
+                        lambda *a, **k: None)
+    monkeypatch.setattr(chat.hie, '_push_workflow_flowchart', lambda *a, **k: None)
+    return runs
+
+
+def test_her_approved_plan_runs_freed_on_her_next_turn(chat, monkeypatch):
+    """Owner 2026-11-05: the plan she approved runs freed on the very next
+    turn too (chat()'s Phase 2).  The Pad sends create_agent on every turn
+    of her agent, so this is the way her approved plan is built."""
+    runs = _her_plan_approved(chat, monkeypatch)
+    done = chat.turn('make my reel', goal_tags=HER_TAGS)
+    assert runs == [{'autonomous': True}], (runs, done)
+    assert done['Agent_status'] == 'completed', done
+
+
+def test_her_approved_plan_is_finished_autonomously_after_a_restart(chat, monkeypatch):
+    """Her agent is saved and this node restarts before it is built.  Her
+    next turn has a config with no recipe, which chat() finishes
+    autonomously (steward rule 2026-08-22); live 2026-11-04 agent 342 went
+    this way and stalled asking her for clips it had.  recipe() is told the
+    plan is approved (ed427a072)."""
+    runs = _her_plan_approved(chat, monkeypatch)
+    chat.restart()
+    done = chat.turn('make my reel', goal_tags=HER_TAGS, create_agent=False)
+    assert runs == [{'autonomous': True}], (runs, done)
+    assert done['Agent_status'] == 'completed', done

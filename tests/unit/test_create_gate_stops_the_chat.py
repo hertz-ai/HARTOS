@@ -38,6 +38,7 @@ Three contracts, each driven through the REAL code:
 """
 import json
 import threading
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -50,7 +51,8 @@ from hartos import create_recipe as cr  # noqa: E402
 from hartos import helper as h  # noqa: E402
 from hartos.helper import Action  # noqa: E402
 from hartos.lifecycle_hooks import (  # noqa: E402
-    ActionState, clear_action_states, get_action_state,
+    ActionState, clear_action_states, force_state_through_valid_path,
+    get_action_state,
 )
 from hartos.threadlocal import thread_local_data  # noqa: E402
 
@@ -67,12 +69,35 @@ POSTED = {'role': 'user', 'name': 'ChatInstructor',
                      'Run a thought experiment'}
 
 
-def _verdict(gate):
+def _verdict(gate, status='pending'):
     """The StatusVerifier's live verdict shape, with the gate value under test."""
     return {'role': 'user', 'name': 'StatusVerifier', 'content': json.dumps({
-        'status': 'pending', 'action': 'Respond to user', 'action_id': 1,
+        'status': status, 'action': 'Respond to user', 'action_id': 1,
         'message': 'the person has to say what the experiment is about',
         'can_perform_without_user_input': gate})}
+
+
+@contextmanager
+def _ledger_for(up, tmp_path, in_progress):
+    """A real ledger holding action_1, registered for the session the way
+    create_action_with_ledger registers it, so the gate's block, the reply's
+    resume and the answer record go through the real hooks.  `in_progress`
+    False leaves the task where block_for_user_input refuses it."""
+    import hartos.lifecycle_hooks as L
+    from agent_ledger.core import SmartLedger, Task, TaskStatus, TaskType
+    led = SmartLedger(agent_id='gate', session_id=f'{up}_1',
+                      ledger_dir=str(tmp_path))
+    led.tasks['action_1'] = Task(task_id='action_1', description='Respond to user',
+                                 task_type=TaskType.PRE_ASSIGNED)
+    if in_progress:
+        led.tasks['action_1'].status = TaskStatus.IN_PROGRESS
+    L.register_ledger_for_session(up, led)
+    try:
+        yield led
+    finally:
+        with L._state_lock:
+            L._ledger_registry.pop(up, None)
+        cr.request_id_list.pop(up, None)
 
 
 def _named(*args, **kwargs):
@@ -88,6 +113,21 @@ def selector(test_user_id, test_prompt_id, mock_flask_app, sample_config_json):
     """The REAL state_transition closure of create_agents, with autogen's
     constructors mocked (the same seam tests/unit/test_agent_creation.py
     uses), bound to a one-action task like agent 20's."""
+    with _built_selector(test_user_id, test_prompt_id) as built:
+        yield built
+
+
+@pytest.fixture
+def freed_selector(test_user_id, test_prompt_id, mock_flask_app, sample_config_json):
+    """The same closure for a run its creator freed: an approved plan that
+    chat()'s config-without-recipe branch finishes with autonomous=True, on
+    the person's own request id (no daemon_ prefix)."""
+    with _built_selector(test_user_id, test_prompt_id, autonomous=True) as built:
+        yield built
+
+
+@contextmanager
+def _built_selector(test_user_id, test_prompt_id, autonomous=False):
     up = f'{test_user_id}_{test_prompt_id}'
     clear_action_states(up)
     cr._STATE_TRANSITION_LOOP_STATE.pop(up, None)
@@ -105,12 +145,17 @@ def selector(test_user_id, test_prompt_id, mock_flask_app, sample_config_json):
     for p in patches[:2]:
         p.start()
     try:
-        out = cr.create_agents(test_user_id, task, test_prompt_id)
+        out = cr.create_agents(test_user_id, task, test_prompt_id, autonomous=autonomous)
         select = mocks['GroupChat'].call_args.kwargs['speaker_selection_method']
         agents_object = out[6]
+        verifier_prompt = next(
+            c.kwargs['system_message'] for c in mocks['AssistantAgent'].call_args_list
+            if c.kwargs.get('name') == 'StatusVerifier')
         yield SimpleNamespace(up=up, task=task, select=select,
                               assistant=agents_object['assistant'],
-                              verify=agents_object['verify'])
+                              verify=agents_object['verify'],
+                              chat_instructor=out[5],
+                              verifier_prompt=verifier_prompt)
     finally:
         for p in reversed(patches):
             p.stop()
@@ -137,6 +182,219 @@ class TestTheGateEndsTheInnerChat:
         chosen = s.select(s.verify, group)
         assert getattr(s.task, '_needs_user_input_action_id', None) is None
         assert chosen is s.assistant
+
+
+class TestACompletedVerdictThatNeedsThePersonStillAsks:
+    """#158, MEASURED 2026-10-30 on the installed desktop (hartos-f9's reading
+    of the logs): the StatusVerifier answered {"status": "completed",
+    "can_perform_without_user_input": "no"} for send_message_to_user steps
+    whose text asked the child to reply (flow 1 agent 1793365817449 actions 3
+    and 4 at 18:44:09 and 18:44:40, with the note "assumption of response";
+    flow 7 agent 1793371954882 action 1 at 20:23:18).  The handler returned on
+    `completed` before reading the flag, so a step the verifier itself said
+    needed the person was closed, the model wrote the child's reply, and four
+    agents banked flows whose recipes hold invented exchanges.  A verdict that
+    says the action cannot be performed without the person is the gate's case
+    whatever its status word says.
+    """
+
+    def test_completed_plus_no_flags_and_ends_the_chat(self, selector):
+        s = selector
+        assert get_action_state(s.up, 1) != ActionState.TERMINATED
+        group = SimpleNamespace(
+            messages=[POSTED, _verdict('no', status='completed')], agents=[])
+        chosen = s.select(s.verify, group)
+        assert s.task._needs_user_input_action_id == 1, (
+            'completed + no closed the step instead of asking the person '
+            '(live 18:44:09, 18:44:40, 20:23:18 on 2026-10-30)')
+        assert chosen is None, 'the gate must end the round so the OUTER loop asks'
+        # G8: the step has asked already; the loop's own line says it waits.
+        assert s.task._needs_user_input_kind == 'awaiting_reply'
+        line = cr._needs_input_reply(1, 'Respond to user', waiting=True)
+        assert 'waiting for your reply' in line and "isn't coming together" not in line
+
+    def test_a_pending_plus_no_still_reads_as_human_required(self, selector):
+        s = selector
+        group = SimpleNamespace(messages=[POSTED, _verdict('no', status='pending')], agents=[])
+        assert s.select(s.verify, group) is None
+        assert s.task._needs_user_input_kind == 'human_required'
+
+    def test_the_reasoned_no_is_read_the_same_way(self, selector):
+        """The CREATE prompt asks for 'no' WITH a reason; autonomy_needs_user
+        is the one reader of that value."""
+        s = selector
+        group = SimpleNamespace(
+            messages=[POSTED, _verdict('no - the child has to answer first',
+                                       status='completed')], agents=[])
+        chosen = s.select(s.verify, group)
+        assert s.task._needs_user_input_action_id == 1
+        assert chosen is None
+
+    def test_a_completed_verdict_without_no_still_goes_to_the_completion_owner(self, selector):
+        """Preservation: the main-loop lifecycle hook stays the only completion
+        owner; a plain completed verdict hands the turn to the ChatInstructor
+        as before."""
+        s = selector
+        group = SimpleNamespace(
+            messages=[POSTED, _verdict('yes', status='completed')], agents=[])
+        chosen = s.select(s.verify, group)
+        assert getattr(s.task, '_needs_user_input_action_id', None) is None
+        assert chosen is s.chat_instructor
+
+    def test_once_the_person_has_answered_a_completed_plus_no_closes_the_step(
+            self, selector, tmp_path):
+        """hartos-f9's review of 51c6f6c2d: the verifier's prompt lets
+        `completed` carry `no` when the action verbatim asks the person to
+        choose, confirm or approve, so on a completed verdict `no` describes
+        the action, not "still waiting".  Gating every such verdict asked
+        without bound: the flag stays `no` after the reply, so a replay asked
+        7 times in 7 turns and the step never closed.  The answer the gate
+        took lives on the ledger task (record_user_answer), and that is what
+        closes the question."""
+        s = selector
+        asked = SimpleNamespace(
+            messages=[POSTED, _verdict('no', status='completed')], agents=[])
+        with _ledger_for(s.up, tmp_path, in_progress=True):
+            assert s.select(s.verify, asked) is None, 'precondition: the first ask'
+            assert s.task._needs_user_input_action_id == 1
+            # The person's next turn, through the create loop's own resume.
+            cr.request_id_list[s.up] = 'user-request-1'
+            assert cr._resume_prior_user_input_block(s.up, 'black holes') is True
+            chosen = s.select(s.verify, asked)
+        assert getattr(s.task, '_needs_user_input_action_id', None) is None, (
+            'the person already answered; asking again is the unbounded loop')
+        assert chosen is s.chat_instructor
+
+    def test_an_answer_the_ledger_could_not_block_for_still_closes_the_step(
+            self, selector, tmp_path):
+        """block_for_user_input refuses a task that is not in progress (live
+        2026-10-10, agent 54: a resumed session's FAILED action_2); the reply
+        then releases the gate through ledger_holds_no_block with no resume.
+        The answer must still be recorded, or every later `completed` + `no`
+        asks again (hartos-f9's reading of my first design).  A task that has
+        only not started yet is resumed before the block now
+        (_hold_for_the_person), so the refusal is the live FAILED task."""
+        from agent_ledger.core import TaskStatus
+        s = selector
+        asked = SimpleNamespace(
+            messages=[POSTED, _verdict('no', status='completed')], agents=[])
+        with _ledger_for(s.up, tmp_path, in_progress=False) as led:
+            led.tasks['action_1'].status = TaskStatus.FAILED
+            assert s.select(s.verify, asked) is None
+            assert s.task._needs_user_input_action_id == 1
+            assert led.tasks['action_1'].status.value != 'blocked', (
+                'precondition: the ledger refused the block')
+            cr.request_id_list[s.up] = 'user-request-2'
+            assert cr._resume_prior_user_input_block(s.up, 'black holes') is True
+            chosen = s.select(s.verify, asked)
+        assert getattr(s.task, '_needs_user_input_action_id', None) is None
+        assert chosen is s.chat_instructor
+
+    def test_an_answer_from_an_earlier_flow_does_not_close_this_flows_step(
+            self, selector, tmp_path):
+        """action_id restarts per flow and the flow boundary keeps the ledger
+        (create_action_with_ledger's reuse branch; add_actions_to_ledger
+        skips a task id it already holds), so flow 1's action_1 is flow 0's
+        task.  Flow 0's answer must not close flow 1's question."""
+        s = selector
+        asked = SimpleNamespace(
+            messages=[POSTED, _verdict('no', status='completed')], agents=[])
+        with _ledger_for(s.up, tmp_path, in_progress=True):
+            assert s.select(s.verify, asked) is None
+            cr.request_id_list[s.up] = 'user-request-3'
+            assert cr._resume_prior_user_input_block(s.up, 'black holes') is True
+            assert s.select(s.verify, asked) is s.chat_instructor, 'flow 0 closes'
+            # Flow 1 is a later turn: the selector's stuck-loop guard counts
+            # byte-identical verdicts within one turn and breaks at its
+            # threshold, which is not the contract under test here.
+            cr._STATE_TRANSITION_LOOP_STATE.pop(s.up, None)
+            cr.recipe_for_persona[s.up] = 1
+            try:
+                chosen = s.select(s.verify, asked)
+                flagged = s.task._needs_user_input_action_id
+            finally:
+                cr.initialise_current_flow_to_zero(s.up)
+        assert flagged == 1, 'flow 1 has not been answered; it must ask'
+        assert chosen is None
+
+    def test_a_finished_action_keeps_its_route_to_the_completion_owner(self, selector):
+        """`completed` + `no` on an action the gate refuses to block (already
+        terminal, _should_block_on_user_input) has nothing left to ask about
+        and goes to the completion owner, never to the Assistant (which would
+        run the chat on).  Pins the terminal hunk the review found untested."""
+        s = selector
+        force_state_through_valid_path(s.up, 1, ActionState.TERMINATED,
+                                       'flow-complete force')
+        assert get_action_state(s.up, 1) == ActionState.TERMINATED
+        group = SimpleNamespace(
+            messages=[POSTED, _verdict('no', status='completed')], agents=[])
+        chosen = s.select(s.verify, group)
+        assert getattr(s.task, '_needs_user_input_action_id', None) is None
+        assert chosen is s.chat_instructor
+
+    def test_a_daemon_turn_has_nobody_to_ask_so_its_completed_closes(self, selector):
+        """A daemon or flywheel dispatch has no person to answer.  Gating its
+        `completed` + `no` parked the goal (the parent flow finished 3 of 3
+        banked; the same flow under the gate paused at action 2 with 1
+        banked), so it closes as it did before 51c6f6c2d.  The one request
+        discriminator decides (is_current_request_autonomous: a daemon_ id)."""
+        s = selector
+        previous_rid = thread_local_data.get_request_id()
+        thread_local_data.set_request_id('daemon_goal_turn')
+        try:
+            group = SimpleNamespace(
+                messages=[POSTED, _verdict('no', status='completed')], agents=[])
+            chosen = s.select(s.verify, group)
+        finally:
+            thread_local_data.set_request_id(previous_rid or '')
+        assert getattr(s.task, '_needs_user_input_action_id', None) is None
+        assert chosen is s.chat_instructor
+
+
+class TestARunItsCreatorFreedKeepsWorking:
+    """Owner 2026-11-04: "the verifier used to flip to "yes" on its own so
+    that it can progress autonomously when the creator has given it freedom".
+
+    f31aff772 (2026-05-08) made every verifier "no" stop the round and stick
+    until the person replies, for an interactive build that faked "Sitemap
+    structure confirmed".  It never asked whether the run was freed.  MEASURED
+    live 2026-11-04, Reel Studio (agent 342), an approved plan finished by
+    chat()'s resume branch: the verifier said "no" on step 2 ("Extract the key
+    visual elements and transitions from each clip"), a step that asks the
+    person nothing, at 12:50:36 and again at 13:00:43; the gate ended both
+    rounds and the person was sent "Step 2 ... isn't coming together".
+
+    A freed run's pending step goes back to the agent, which asks the person
+    itself if it really must; the loop's existing bounds (3 attempts, 30
+    rounds, 30 minutes) end in _ask_for_help as before.  A step that already
+    asked the person (`completed` + `no`) still waits for the reply (#158).
+    """
+
+    def test_a_verifier_no_on_a_pending_step_goes_back_to_the_agent(self, freed_selector):
+        s = freed_selector
+        group = SimpleNamespace(messages=[POSTED, _verdict('no')], agents=[])
+        chosen = s.select(s.verify, group)
+        assert getattr(s.task, '_needs_user_input_action_id', None) is None, (
+            'a freed run was stopped to ask the person (342 step 2, 12:50:36)')
+        assert chosen is s.assistant
+
+    def test_a_step_that_asked_the_person_still_waits_for_the_reply(self, freed_selector):
+        s = freed_selector
+        group = SimpleNamespace(
+            messages=[POSTED, _verdict('no', status='completed')], agents=[])
+        assert s.select(s.verify, group) is None
+        assert s.task._needs_user_input_action_id == 1
+        assert s.task._needs_user_input_kind == 'awaiting_reply'
+
+    def test_its_verifier_is_not_told_to_keep_a_no(self, freed_selector):
+        prompt = freed_selector.verifier_prompt
+        assert 'USER-INPUT GATE (HARD RULE)' not in prompt
+        # The rest of the verifier's contract is unchanged.
+        assert 'Completion evidence rule' in prompt
+        assert 'Status Verification Agent' in prompt
+
+    def test_an_interactive_build_keeps_the_rule(self, selector):
+        assert 'USER-INPUT GATE (HARD RULE)' in selector.verifier_prompt
 
 
 @pytest.fixture

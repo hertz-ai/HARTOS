@@ -9,6 +9,8 @@ Follows the exact same idempotent seed pattern as:
   - AdService.seed_placements()
 """
 import logging
+import threading
+import time
 from typing import List, Optional, Tuple
 
 logger = logging.getLogger('hevolve_social')
@@ -102,10 +104,11 @@ SEED_BOOTSTRAP_GOALS = [
             'docs.hevolve.ai/downloads/ (the live installer page), '
             'github.com/hertz-ai/HARTOS, or hevolve.ai/pricing. '
             '5) Publish: post_to_channel(channel, caption, media_url=<path>) for each '
-            'external platform whose adapter has credentials, AND create_social_post('
-            'title, content=caption, media_url=<path>) for the platform feed. If a '
-            'channel lacks credentials, save the caption + the returned path and note '
-            'the gap rather than failing silently. 6) Track the ref-tag via the growth '
+            'external platform, AND create_social_post('
+            'title, content=caption, media_url=<path>) for the platform feed. When '
+            'post_to_channel answers needs_owner, the owner has been asked for what is '
+            'missing: save the caption + the returned path, call it again on a later '
+            'run, and never report a post it did not confirm. 6) Track the ref-tag via the growth '
             'tracker so signups attribute to the video. '
             'CONSENT: gate every EXTERNAL publish on the operator consent push before '
             'it goes out. No fake claims — every demo shows the real product doing a '
@@ -374,7 +377,8 @@ SEED_BOOTSTRAP_GOALS = [
             '5) For each GROUNDED fact only, name the human problem it bears on, using '
             'the evidence text the verifier stored rather than your memory of the fact, '
             '6) Use text_2_image for one slide per grounded fact, '
-            '7) Use post_to_channel with channel=instagram to publish the carousel. '
+            '7) Use publish_to_instagram_feed with each slide to publish them to the '
+            'Instagram feed (post_to_channel on instagram is a direct message, not a post). '
             'NEVER compose or post a claim that verify_facts did not return in its '
             'grounded list. A rejected claim is not a draft to reword — the number was '
             'not in the source. Publishing fewer facts is the correct outcome; this '
@@ -2472,33 +2476,282 @@ def seed_bootstrap_goals(db, platform_product_id: Optional[str] = None) -> int:
 # by an agent run; tighter intervals just spam the dashboard.
 REMEDIATION_COOLDOWN_MINUTES = 60
 
+#: How many times the scan runs a remediation goal again while its loophole
+#: is still reported (one resume per cooldown) before it tells the goal's
+#: person and leaves the goal paused.
+REMEDIATION_RESUME_CAP = 3
 
-def auto_remediate_loopholes(db) -> int:
+#: How old a loop health result may be and still PAUSE a remediation goal.
+#: The daemon's scan (every HEVOLVE_REMEDIATE_INTERVAL_TICKS ticks, five
+#: minutes by default) refreshes it, and a settle in between reads that result
+#: instead of running every check again (review of 6047bcf19, finding 4: up to
+#: 109 s per settle with the HevolveAI address an unreachable host).  A kept
+#: "still there" only pauses the goal, and the next scan judges it again on a
+#: fresh result (recheck_paused_remediations).  A kept "gone" never completes
+#: one: the loophole may be back, so completion reads a fresh result (review
+#: of 3bb05b2e8, M2).
+LOOP_HEALTH_FRESH_S = 600
+
+_loop_health_seen = {'at': None, 'health': None}
+_loop_health_lock = threading.Lock()
+
+
+def _kept_loop_health(max_age_s):
+    """The last loop health result while it is younger than ``max_age_s``
+    seconds, else None."""
+    with _loop_health_lock:
+        at, health = _loop_health_seen['at'], _loop_health_seen['health']
+    if max_age_s and at is not None and time.monotonic() - at <= max_age_s:
+        return health
+    return None
+
+
+def loop_health(max_age_s=0):
+    """IPService.get_loop_health, or its last result while that is younger
+    than ``max_age_s`` seconds.  Raises what the health check raises; a check
+    that raised is never kept."""
+    kept = _kept_loop_health(max_age_s)
+    if kept is not None:
+        return kept
+    from .ip_service import IPService
+    health = IPService.get_loop_health()
+    with _loop_health_lock:
+        _loop_health_seen.update(at=time.monotonic(), health=health)
+    return health
+
+
+def _severe_loopholes(health, loophole_type=None):
+    """The loopholes in ``health`` a remediation answers (severe, by
+    ip_service.SEVERE_SEVERITIES: one rule for seeding and completion; a
+    medium report of a type, such as single_node's "goal volume under 100",
+    never held a goal seeded for its high one), of one type or all."""
+    from .ip_service import SEVERE_SEVERITIES
+    return [l for l in (health.get('flywheel_loopholes') or [])
+            if l.get('severity', 'low') in SEVERE_SEVERITIES
+            and (loophole_type is None or l.get('type') == loophole_type)]
+
+
+def remediation_still_open(loophole_type, health=None):
+    """Why a remediation goal for ``loophole_type`` is not done, or None when
+    it is: the loop health check no longer reports that loophole at a
+    severity a remediation answers, and every check that can report it ran.
+
+    The completion test for a goal auto_remediate_loopholes seeded (its
+    config 'remediation'), read by the daemon's completion gate
+    (agent_daemon._settle_dispatched_goal) and by the scan's re-check of the
+    goals that gate paused (recheck_paused_remediations).  Spend on a turn
+    shows the remediation ran, not that it worked: measured on central
+    2026-11-02, 269 'Remediate Single Node' goals completed on about 4 spark
+    each while central stayed one node, and every completion let the next
+    re-seed in.
+
+    ``health`` is a loop health result the caller holds (the scan's, read
+    this tick).  Without one, the last result is read while it is fresh
+    (LOOP_HEALTH_FRESH_S), and only to pause: a kept "still there" answers
+    here, a kept "gone" is read again fresh before it completes anything
+    (review of 3bb05b2e8, M2).  get_loop_health swallows each check's error,
+    so a check that failed or could not measure reports nothing it measures
+    (the world-model check reports cold_start in its place).  A loophole that
+    is missing while one of ITS checks (ip_service.LOOPHOLE_CHECKS) is listed
+    in failed_checks is "not confirmed", never "fixed".
+    """
+    try:
+        if health is None:
+            kept = _kept_loop_health(LOOP_HEALTH_FRESH_S)
+            if kept is not None:
+                state, reason = _remediation_state(loophole_type, kept)
+                if state != REMEDIATION_GONE:
+                    return reason
+            health = loop_health()
+    except Exception as e:
+        return f"the loop health check could not run ({type(e).__name__})"
+    return _remediation_state(loophole_type, health)[1]
+
+
+#: What _remediation_state finds of a remediation goal's loophole.
+REMEDIATION_GONE = 'gone'
+REMEDIATION_REPORTED = 'reported'
+REMEDIATION_UNMEASURED = 'unmeasured'
+
+
+def _remediation_state(loophole_type, health):
+    """``(state, reason)`` for a remediation goal's loophole in ``health``:
+    REMEDIATION_GONE (reason None), REMEDIATION_REPORTED (still reported at a
+    severity a remediation answers; running it again may fix it), or
+    REMEDIATION_UNMEASURED (a check that reports it did not run, or none
+    does: nothing on this node can judge another run)."""
+    from .ip_service import LOOPHOLE_CHECKS
+    for loophole in _severe_loopholes(health, loophole_type):
+        detail = loophole.get('message')
+        return REMEDIATION_REPORTED, (
+            f"the loophole '{loophole_type}' is still reported"
+            + (f" ({detail})" if detail else ''))
+    checks = LOOPHOLE_CHECKS.get(loophole_type)
+    if not checks:
+        return REMEDIATION_UNMEASURED, (
+            f"no loop health check reports '{loophole_type}', so its fix "
+            f"cannot be confirmed")
+    failed = set(health.get('failed_checks') or [])
+    unmeasured = [check for check in checks if check in failed]
+    if unmeasured:
+        return REMEDIATION_UNMEASURED, (
+            "the loop health check could not confirm it: "
+            f"{', '.join(unmeasured)} not measured")
+    return REMEDIATION_GONE, None
+
+
+def _remediation_notice(goal, state, health, loophole_type):
+    """What a paused remediation goal's person is told, in plain words: no
+    check or loophole ids (review of 3bb05b2e8, M3)."""
+    if state == REMEDIATION_UNMEASURED:
+        return (f"'{goal.title}' did its work, but this computer cannot check "
+                f"whether the problem it works on is fixed, so it stays "
+                f"paused.  Resume it if you want it to run again, or archive "
+                f"it.")
+    details = [l.get('message') for l in _severe_loopholes(health, loophole_type)
+               if l.get('message')]
+    return (f"'{goal.title}' ran again and the problem it works on is still "
+            f"there" + (f": {details[0]}" if details else '') + ".  It stays "
+            f"paused until that changes, or until you resume it.")
+
+
+def recheck_paused_remediations(db, health=None):
+    """Judge again the remediation goals the completion gate paused because
+    their loophole was still there (pause cause remediation_open).  Returns
+    the loop health it judged with, for the seeding scan on the same tick, or
+    None when the health check could not run.
+
+    Review of 6047bcf19, finding 1: nothing looked at such a goal again, and a
+    paused goal blocks the re-seed of its type, so a loophole that went away
+    left its goal paused for good and one that stayed was never put to
+    anyone.  Each goal now:
+      - completes once its loophole is gone and its checks ran
+        (_remediation_state; completion_grounding 'loophole_gone');
+      - while its loophole is still reported, is resumed through
+        GoalManager.resume_goal once its pause is a cooldown old
+        (REMEDIATION_COOLDOWN_MINUTES), up to REMEDIATION_RESUME_CAP times,
+        so its remediation runs again and the gate judges it again;
+      - while its loophole cannot be measured here, is never resumed: no
+        check could judge another run (review of 3bb05b2e8, M3: central ran
+        three such turns for nothing);
+      - otherwise stays paused and its person is told once, in plain words
+        (_remediation_notice; GoalManager._tell_its_person, phone push
+        included).  With nobody to tell, the notice is tried again once per
+        cooldown, not on every scan.
+    The daemon calls this once per scan tick, before its no-goals stop,
+    whose early return skips the tick's own commit, so the writes are
+    committed here (as in
+    agent_daemon._resume_goals_paused_for_a_cleared_cause).  A refused write
+    leaves the goal as it was.
+    """
+    from datetime import datetime, timedelta
+    from integrations.social.models import AgentGoal
+    from .goal_manager import (GoalManager, PAUSE_CAUSE_REMEDIATION_OPEN,
+                               PAUSE_RECORD_KEYS)
+    if health is None:
+        try:
+            health = loop_health()
+        except Exception as e:
+            logger.warning(f"Paused remediation goals not judged: the loop "
+                           f"health check could not run ({type(e).__name__})")
+            return None
+    now = datetime.utcnow()
+    cooldown = timedelta(minutes=REMEDIATION_COOLDOWN_MINUTES)
+
+    def _a_cooldown_ago(stamp):
+        try:
+            return now - datetime.fromisoformat(str(stamp)) >= cooldown
+        except (TypeError, ValueError):
+            return True        # an unreadable stamp never holds a goal for good
+
+    changed = False
+    for goal in db.query(AgentGoal).filter(AgentGoal.status == 'paused').all():
+        cfg = goal.config_json or {}
+        if (goal.status != 'paused' or not cfg.get('remediation')
+                or cfg.get('pause_cause') != PAUSE_CAUSE_REMEDIATION_OPEN):
+            continue
+        state, still_open = _remediation_state(cfg['remediation'], health)
+        if state == REMEDIATION_GONE:
+            done = dict(cfg)
+            for key in PAUSE_RECORD_KEYS:
+                if key in done:
+                    done['last_' + key] = done.pop(key)
+            done['completed_at'] = now.isoformat()
+            done['completion_grounding'] = 'loophole_gone'
+            goal.config_json = done
+            result = GoalManager.update_goal_status(db, goal.id, 'completed',
+                                                    goal=goal)
+            if result.get('success'):
+                changed = True
+                logger.info(f"Goal {goal.id} COMPLETED: its loophole "
+                            f"'{cfg['remediation']}' is gone")
+            else:
+                goal.config_json = cfg
+            continue
+        resumes = int(cfg.get('remediation_resume_count', 0) or 0)
+        if state == REMEDIATION_REPORTED and resumes < REMEDIATION_RESUME_CAP:
+            if not _a_cooldown_ago(cfg.get('paused_at')):
+                continue
+            result = GoalManager.resume_goal(
+                db, goal.id, resumed_by='daemon:remediation_recheck', goal=goal)
+            if not result.get('success'):
+                logger.warning(f"Goal {goal.id}: resume refused "
+                               f"({result.get('error')}); left paused")
+                continue
+            goal.config_json = dict(goal.config_json or {},
+                                    remediation_resume_count=resumes + 1)
+            changed = True
+            logger.info(f"Goal {goal.id} RESUMED for remediation run "
+                        f"{resumes + 1} of {REMEDIATION_RESUME_CAP}: {still_open}")
+            continue
+        tried = cfg.get('tell_tried_at')
+        if cfg.get('told_at') or (tried and not _a_cooldown_ago(tried)):
+            continue
+        reason = _remediation_notice(goal, state, health, cfg['remediation'])
+        mark = {'tell_tried_at': now.isoformat()}
+        if GoalManager._tell_its_person(db, goal, reason):
+            mark['told_at'] = now.isoformat()
+        goal.config_json = dict(cfg, **mark)
+        changed = True
+    if changed:
+        commit = getattr(db, 'commit', None)
+        if callable(commit):
+            commit()
+    return health
+
+
+def auto_remediate_loopholes(db, health=None) -> int:
     """Check flywheel loopholes and create remediation goals for severe ones.
 
-    Only creates goals for loopholes with severity >= 'high' AND no existing
-    remediation goal for that loophole type within the cooldown window —
-    counting completed/archived goals too, not just active/paused (the
-    flap bug prior to 2026-04-29).
+    Only creates goals for severe loopholes (ip_service.SEVERE_SEVERITIES)
+    AND no existing remediation goal for that
+    loophole type within the cooldown window — counting completed/archived
+    goals too, not just active/paused (the flap bug prior to 2026-04-29).
+    The goals the completion gate paused are judged by the daemon earlier
+    in the same tick (recheck_paused_remediations, whose health it passes
+    here); judging them here too told a goal this tick's settle had just
+    paused, mid-tick (review of 3bb05b2e8).
 
     Args:
         db: SQLAlchemy session (caller owns transaction)
+        health: the loop health the daemon's scan already read this tick;
+            read fresh (and kept for settles) when not given
 
     Returns:
         Number of remediation goals created
     """
     from datetime import datetime, timedelta
     from .goal_manager import GoalManager
-    from .ip_service import IPService
     from integrations.social.models import AgentGoal
 
-    try:
-        health = IPService.get_loop_health()
-    except Exception as e:
-        logger.debug(f"Loop health check failed: {e}")
-        return 0
+    if health is None:
+        try:
+            health = loop_health()
+        except Exception as e:
+            logger.debug(f"Loop health check failed: {e}")
+            return 0
 
-    loopholes = health.get('flywheel_loopholes', [])
+    loopholes = _severe_loopholes(health)
     if not loopholes:
         return 0
 
@@ -2524,10 +2777,6 @@ def auto_remediate_loopholes(db) -> int:
     count = 0
     skipped_by_cooldown = []
     for loophole in loopholes:
-        severity = loophole.get('severity', 'low')
-        if severity not in ('critical', 'high'):
-            continue
-
         loophole_type = loophole.get('type', '')
         if loophole_type in recent_remediations:
             skipped_by_cooldown.append(loophole_type)

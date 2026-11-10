@@ -657,6 +657,141 @@ def _day_cap_refusal(httpx_module, request, body):
                         'message': why}})
 
 
+#: The ``code`` of HARTOS's own answer to a 2xx reply with no completion
+#: (_no_completion_answer).  A reader that retries 5xx replies reads it
+#: through is_no_completion_answer: the provider sent nothing, and asking
+#: again only spends another call (review of f8af9b3af: agent_lightning's
+#: re-sample loop made 3 calls, then returned a fallback sentence as the
+#: Assistant's answer).
+NO_COMPLETION_CODE = 'hartos_no_completion'
+
+
+def is_no_completion_answer(exc) -> bool:
+    """Is ``exc`` the openai SDK's exception for _no_completion_answer's
+    502?  Read from the error object the SDK keeps (``code``, else
+    ``body['code']``), never from the message text."""
+    code = getattr(exc, 'code', None)
+    if code is None:
+        body = getattr(exc, 'body', None)
+        if isinstance(body, dict):
+            code = body.get('code')
+    return code == NO_COMPLETION_CODE
+
+
+def _not_a_completion(response, status) -> Optional[str]:
+    """Why a 2xx chat/completions reply carries no completion, in plain words,
+    or None when it carries one, is not a 2xx, or was never buffered.
+
+    A completion is a JSON object whose ``choices`` is a non-empty list of
+    objects that each carry a ``message`` object: what autogen's
+    ``message_retrieval`` (and langchain, and every other reader of a chat
+    completion) iterates and indexes into.  The words say which part was
+    missing and quote the provider's own ``error`` object when it sent one,
+    or the body itself when it is not JSON (the provider's words either
+    way), capped at _RESP_ERROR_CAP; no other field of the reply is copied.
+
+    The bytes are parsed as httpx's Response.json parses them (json.loads on
+    bytes detects the encoding, a UTF byte order mark included): decoding
+    them as text first made a real completion that starts with a BOM 'not a
+    JSON object' (review of f8af9b3af).
+
+    Same read discipline as _response_error: only ``_content``, which httpx
+    sets when a non-streaming send has already buffered the body.  A stream
+    is never read here, and neither is anything that is not the bytes httpx
+    buffers (a stand-in's invented attribute is not a body).
+    """
+    try:
+        if not (isinstance(status, int) and 200 <= status < 300):
+            return None
+        raw = getattr(response, '_content', None)
+        if not isinstance(raw, (bytes, bytearray)):
+            return None
+        raw = bytes(raw)
+        if not raw.strip():
+            return 'an empty body'
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            data = None
+        if not isinstance(data, dict):
+            said = 'not a JSON object: ' + raw.decode('utf-8', 'replace').strip()
+        else:
+            choices = data.get('choices')
+            if isinstance(choices, list) and choices and all(
+                    isinstance(c, dict) and isinstance(c.get('message'), dict)
+                    for c in choices):
+                return None
+            if 'choices' not in data:
+                said = 'no choices field'
+            elif not isinstance(choices, list):
+                said = 'choices was %s' % json.dumps(choices, default=str)[:40]
+            elif not choices:
+                said = 'choices was empty'
+            else:
+                said = 'a choice carried no message'
+            err = data.get('error')
+            if err:
+                said += '; its error: ' + (
+                    err if isinstance(err, str)
+                    else json.dumps(err, ensure_ascii=False, default=str))
+        if len(said) > _RESP_ERROR_CAP:
+            said = said[:_RESP_ERROR_CAP] + '...[cut]'
+        return said
+    except Exception:
+        # A hook that cannot read the reply returns it as it came.
+        return None
+
+
+def _no_completion_answer(httpx_module, request, response, status):
+    """HARTOS's own answer in place of a 2xx reply that carries no
+    completion, or None to return the reply as it came.
+
+    Measured on central 2026-11-03 (read-only, 72 h of docker logs): 433 of
+    2,236 OpenRouter calls answered 200, and 418 times in the same window
+    autogen raised ``TypeError: 'NoneType' object is not iterable`` in
+    ``OpenAIClient.message_retrieval``, each time after an OpenRouter 200
+    (the ``choices`` it iterated was None).  ``OpenAIWrapper.create`` moves to the next
+    config entry only when the client raises ``APIError``; a 200 raises
+    nothing, so the empty reply was returned as a completion, the turn died
+    on the snag reply when it was read, and the next entry (the node's own
+    model, which with_local_fallback puts last in every override) was never
+    tried.
+
+    The answer is a 502 of type ``server_error`` with ``x-should-retry:
+    false``, the same mechanism as _day_cap_refusal's 429: the openai SDK
+    raises InternalServerError once without retrying (a retry would spend
+    another call, against a free tier's daily cap, on a provider that just
+    sent no completion), and autogen moves to the next entry.  With no entry
+    left the turn fails as before: ``server_error`` is one of
+    core.agent_tools._INTERNAL_ERROR_MARKERS, so the person still reads the
+    snag reply.  The provider's words are logged here, since the hosted path
+    writes no record of the reply.
+
+    The caller has already fed the breaker and the meter from the real reply:
+    a 200 says the account is in good standing, and a reply the provider
+    billed was paid for whether or not it held a completion.
+    """
+    why = _not_a_completion(response, status)
+    if why is None:
+        return None
+    host = str(getattr(getattr(request, 'url', None), 'host', '') or '')
+    try:
+        answer = httpx_module.Response(
+            502, request=request,
+            headers={'x-should-retry': 'false'},
+            json={'error': {'type': 'server_error', 'code': NO_COMPLETION_CODE,
+                            'message': 'the provider answered %s with no completion: %s'
+                                       % (status, why)}})
+    except Exception as e:
+        # A hook may never fail an LLM call: the reply goes back as it came.
+        logger.warning("[outbound] %s answered %s with no completion (%s); "
+                       "could not answer in its place: %s", host, status, why, e)
+        return None
+    logger.warning("[outbound] %s answered %s with no completion (%s); "
+                   "counted as a failed call", host, status, why)
+    return answer
+
+
 def _hosted_body(request):
     """The JSON body of a hosted chat/completions request, read without
     mutation, or None.  Only for header stamping and metering: the hosted
@@ -796,8 +931,9 @@ def _send_and_feed(httpx_module, orig_send, client, request, kwargs):
     took this branch unlabelled and unmetered, the day cap never saw a dollar
     and Kong routed the calls to its default lane.  Of the calls it meters,
     those that hold the configured expert are the ones the day cap can refuse
-    (_day_cap_refusal).  Any other host is left exactly as it was
-    (_is_configured_endpoint)."""
+    (_day_cap_refusal), and a 2xx reply that carries no completion is
+    answered as a failed call (_no_completion_answer).  Any other host is
+    left exactly as it was (_is_configured_endpoint)."""
     gateway = _is_configured_endpoint(request.url)
     body = _hosted_body(request) if gateway else None
     if gateway:
@@ -810,6 +946,9 @@ def _send_and_feed(httpx_module, orig_send, client, request, kwargs):
     _feed_provider_breaker(request.url, _status)
     if gateway:
         _meter_response(body, response, _status)
+        answer = _no_completion_answer(httpx_module, request, response, _status)
+        if answer is not None:
+            return answer
     return response
 
 
@@ -1672,6 +1811,64 @@ def _task_turn(messages: list):
                  and m.get('name') == speaker), None)
 
 
+def _current_order(messages: list):
+    """The newest order: the dispatch turn for the step the pipeline is on.
+
+    ``None`` when the conversation holds none.  A REUSE or CREATE walk posts
+    its first order as the opener (User, with the person's words) and every
+    later one from ChatInstructor, so the task turn kept the FIRST order and
+    the current one stayed only while it was the newest user turn.  Live
+    2026-11-01, goal 'TTS Engine Venv Provisioning': step 7's order reached
+    the model for 45 s, then the 2,500-token window left it out of every
+    call (743 of them, 08:31-10:13) while step 6's opener stayed; the
+    Assistant worked step 6 and the StatusVerifier answered action_id 6
+    while the pipeline held 7 (tests/unit/test_limiters_keep_the_current_order.py).
+
+    An order is hartos.lifecycle_hooks.latest_dispatch's answer -- the one
+    walk latest_dispatch_before reads too: a dispatch marker that leads its
+    turn, or opens a turn the ROLE-ORDER-GUARD joined behind another (the wire
+    trim reads joined bodies), on a role='user' turn (how every seat receives
+    it), and not a turn seeded from an earlier run (``_from_shared``).
+    """
+    try:
+        from hartos.lifecycle_hooks import latest_dispatch
+    except ImportError:
+        # A process without HARTOS, or a hartos older than this core (a core
+        # file hot-swapped over an install whose lifecycle_hooks has no
+        # latest_dispatch: claude-autostart-71, 2026-11-01).  Either way the
+        # set is what it was before, which brings back the dropped order this
+        # function exists to stop, so it is said as an error, once.
+        global _order_walk_missing_logged
+        if not _order_walk_missing_logged:
+            _order_walk_missing_logged = True
+            logger.error("protected_messages: hartos.lifecycle_hooks.latest_dispatch "
+                         "is not importable; the current order is NOT protected "
+                         "and a trimmed seat can lose its step's order",
+                         exc_info=True)
+        return None
+    import inspect
+    if 'joined' in inspect.signature(latest_dispatch).parameters:
+        return latest_dispatch(messages, user_turns_only=True, joined=True)
+    # A hartos from before ``joined`` (core hot-swapped over it): an order that
+    # leads its turn is still protected, one joined behind another turn is not.
+    # Said once, as the missing-walk case above is (review of d7dee5cc5: the
+    # keyword raised TypeError, which no guard caught, on every over-budget
+    # trim).
+    global _order_join_missing_logged
+    if not _order_join_missing_logged:
+        _order_join_missing_logged = True
+        logger.error("protected_messages: hartos.lifecycle_hooks.latest_dispatch "
+                     "takes no 'joined'; an order joined behind another turn is "
+                     "NOT protected")
+    return latest_dispatch(messages, user_turns_only=True)
+
+
+_order_join_missing_logged = False
+
+
+_order_walk_missing_logged = False
+
+
 def protected_messages(messages: list) -> list:
     """The messages no trimming may remove, newest-user first, deduplicated.
 
@@ -1693,7 +1890,10 @@ def protected_messages(messages: list) -> list:
         text is the oldest message (measured 2026-09-25 21:17:36);
       * the newest role='tool' message: what the current step produced, the
         thing the Assistant must use and the StatusVerifier must check (owner
-        decision, delegated 2026-09-26).
+        decision, delegated 2026-09-26);
+      * the current order (:func:`_current_order`): the step the pipeline is
+        on.  The task turn keeps the person's words, which only the opening
+        order carries; this keeps the step a later order moved the walk to.
     """
     anchor = next((m for m in reversed(messages)
                    if isinstance(m, dict) and m.get('role') == 'user'), None)
@@ -1701,7 +1901,8 @@ def protected_messages(messages: list) -> list:
                           if isinstance(m, dict) and m.get('role') == 'tool'),
                          None)
     out = []
-    for m in (anchor, _task_turn(messages), newest_result):
+    for m in (anchor, _task_turn(messages), newest_result,
+              _current_order(messages)):
         if m is not None and not any(m is o for o in out):
             out.append(m)
     return out
@@ -1786,8 +1987,9 @@ def _trim_to_budget(body: dict, _reserve: int = 0) -> tuple:
       3. Left-drop non-system messages (preserve index 0 if role=system)
          until the remaining set fits.  Never dropped: the system message,
          the most-recent message, the newest role='user' message, the
-         task turn (:func:`_task_turn`, the initiator's newest turn) and the
-         newest role='tool' message.  An assistant message carrying tool_calls drops together with the
+         task turn (:func:`_task_turn`, the initiator's newest turn), the
+         newest role='tool' message and the current order
+         (:func:`_current_order`).  An assistant message carrying tool_calls drops together with the
          results answering it (:func:`_drop_units`), and is kept with them
          when one of them is never dropped.
       4. If still over, cut the middle of the messages step 3 could not drop,
@@ -1938,8 +2140,8 @@ def _trim_to_budget(body: dict, _reserve: int = 0) -> tuple:
 
     has_system = bool(messages and isinstance(messages[0], dict)
                       and messages[0].get('role') == 'system')
-    # Never dropped: the newest user message, the task turn and the newest
-    # tool result -- protected_messages, the one set the seats' context
+    # Never dropped: the newest user message, the task turn, the newest
+    # tool result and the current order -- protected_messages, the one set the seats' context
     # limiters keep too.  Each was added after a measured failure; the
     # reasons live on that function.
     protected = protected_messages(messages)
@@ -2630,8 +2832,8 @@ def _install_async_patch(httpx_module) -> None:
     async def _patched(self, request, **kwargs):
         if not _is_target_request(request.url, request.method):
             # Hosted chat/completions: lane and model headers, the day cap,
-            # the provider breaker (#106b b) and the dollar meter, as in
-            # _send_and_feed.
+            # the provider breaker (#106b b), the dollar meter and the
+            # no-completion answer, as in _send_and_feed.
             if _is_chat_completions_post(request):
                 _gateway = _is_configured_endpoint(request.url)
                 _hbody = _hosted_body(request) if _gateway else None
@@ -2645,6 +2847,9 @@ def _install_async_patch(httpx_module) -> None:
                 _feed_provider_breaker(request.url, _hstatus)
                 if _gateway:
                     _meter_response(_hbody, _resp, _hstatus)
+                    _answer = _no_completion_answer(httpx_module, request, _resp, _hstatus)
+                    if _answer is not None:
+                        return _answer
                 return _resp
             return await _orig(self, request, **kwargs)
         try:

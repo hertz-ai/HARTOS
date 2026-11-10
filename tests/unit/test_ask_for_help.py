@@ -2,7 +2,8 @@
 
 Both outer-loop exits (the NEEDS-INPUT escape and the user-input gate), and a
 loop-break on an unverified action through that gate, end in _ask_for_help.  A
-live user is asked directly, exactly as before (_needs_input_reply).  On an
+live user is asked directly (_needs_input_reply), and a step the gate did not
+already hold is held for her answer (_hold_for_the_person).  On an
 autonomous run nobody reads a question, so the action is held as waiting
 (PENDING, which the ledger records as BLOCKED, with blocked_reason
 input_required) and the goal that dispatched the turn is parked with the ask
@@ -40,7 +41,7 @@ PENDING = _State('pending')
 
 def _functions(names):
     tree = ast.parse(open(_SRC_PATH, encoding='utf-8').read())
-    wanted = {'_needs_input_reply', '_ask_for_help'}
+    wanted = {'_needs_input_reply', '_ask_for_help', '_hold_for_the_person'}
     nodes = [n for n in tree.body
              if isinstance(n, ast.FunctionDef) and n.name in wanted]
     assert {n.name for n in nodes} == wanted, 'helpers missing from create_recipe'
@@ -49,17 +50,34 @@ def _functions(names):
     return ns
 
 
-def _names(state=IN_PROGRESS, task=None):
+def _names(state=IN_PROGRESS, task=None, tasks=None):
     """The create_recipe globals _ask_for_help reads, and a record of the
     state changes it asks for."""
     # The reply prefixes are the real constants: the hive worker recognises
     # the reply by them (core.agent_tools.is_help_pause).
-    from core.constants import HELP_EXPERT_REPLY_PREFIX, HELP_PAUSED_REPLY_PREFIX
-    states = []
+    from core.constants import (
+        HELP_EXPERT_REPLY_PREFIX, HELP_PAUSED_REPLY_PREFIX,
+        USER_INPUT_GATE_AWAITING_REPLY, USER_INPUT_GATE_HUMAN_REQUIRED,
+        USER_INPUT_GATE_RECOVERABLE_STALL)
+    states, holds = [], []
     ledgers = {'7_1': types.SimpleNamespace(tasks={'action_2': task})} if task else {}
     return states, {
         'HELP_PAUSED_REPLY_PREFIX': HELP_PAUSED_REPLY_PREFIX,
         'HELP_EXPERT_REPLY_PREFIX': HELP_EXPERT_REPLY_PREFIX,
+        'USER_INPUT_GATE_AWAITING_REPLY': USER_INPUT_GATE_AWAITING_REPLY,
+        # The hold a live person's ask gets (_hold_for_the_person): the gate's
+        # kind, its terminal rule, and the wait recorded in both lifecycle
+        # authorities; `holds` records each mark_action_waiting_for_user.
+        'USER_INPUT_GATE_HUMAN_REQUIRED': USER_INPUT_GATE_HUMAN_REQUIRED,
+        'USER_INPUT_GATE_RECOVERABLE_STALL': USER_INPUT_GATE_RECOVERABLE_STALL,
+        'is_terminal_state': lambda s: False,
+        'holds': holds,
+        'mark_action_waiting_for_user': (
+            lambda up, aid, reason, flow=None, asked_in=None:
+            holds.append((up, aid, reason, flow, asked_in)) or True),
+        'request_id_list': {'7_1': 'her-request-1'},
+        # _ask_for_help reads the gate's kind off the session's task (G8).
+        'user_tasks': tasks if tasks is not None else {},
         'user_ledgers': ledgers,
         'get_action_state': lambda up, aid: state,
         'safe_set_state': (lambda up, aid, s, reason='':
@@ -98,6 +116,86 @@ def test_a_live_user_is_asked_the_question_as_before():
     assert reply == ns['_needs_input_reply'](2, 'Collect the sources')
     escalate.assert_not_called()
     assert states == [], 'a live user answers; the action is left as it was'
+
+
+def test_a_live_user_whose_step_already_asked_is_told_it_waits():
+    """G8: a `completed` + `no` step has already asked (its send went out),
+    so the loop's own line says the step waits for the reply, not that it
+    "isn't coming together" (hartos-00's mutant M8 survived without this)."""
+    from core.constants import USER_INPUT_GATE_AWAITING_REPLY
+    from tests.unit.module_swap import swap_modules
+    # The gate sets the action and the kind together (state_transition).
+    task = types.SimpleNamespace(_needs_user_input_action_id=2,
+                                 _needs_user_input_kind=USER_INPUT_GATE_AWAITING_REPLY)
+    states, names = _names(tasks={'7_1': task})
+    ns = _functions(names)
+    with swap_modules(_modules(autonomous=False)):
+        reply = ns['_ask_for_help']('7_1', 1, 2, 'Collect the sources', 'it looped')
+    assert reply == ns['_needs_input_reply'](2, 'Collect the sources', waiting=True)
+    assert 'is waiting for your reply before I continue' in reply, reply
+    assert states == []
+    # The gate's own hold stands: no second wait, its kind kept.
+    assert names['holds'] == []
+    assert task._needs_user_input_kind == USER_INPUT_GATE_AWAITING_REPLY
+
+
+def test_a_live_users_step_is_held_for_her_answer():
+    """Review of 4bcad9583, finding 2: an ask the gate did not raise (the
+    attempts bound on a freed run) holds the step the way the gate does, so
+    her next message is taken as its answer.  A `pending` verdict left the
+    step PENDING; the ledger blocks a running task, so it is resumed first."""
+    from core.constants import USER_INPUT_GATE_HUMAN_REQUIRED
+    from tests.unit.module_swap import swap_modules
+    task = types.SimpleNamespace()
+    states, names = _names(state=PENDING, tasks={'7_1': task})
+    ns = _functions(names)
+    escalate = mock.Mock()
+    with swap_modules(_modules(autonomous=False, escalate=escalate)):
+        reply = ns['_ask_for_help']('7_1', 1, 2, 'Collect the sources',
+                                    'it did not complete after 3 attempts')
+    assert reply == ns['_needs_input_reply'](2, 'Collect the sources')
+    escalate.assert_not_called()
+    assert (task._needs_user_input_action_id,
+            task._needs_user_input_kind) == (2, USER_INPUT_GATE_HUMAN_REQUIRED)
+    assert states == [(2, 'in_progress', 'held for the person')]
+    assert names['holds'] == [(
+        '7_1', 2, 'asked the person: it did not complete after 3 attempts',
+        0, 'her-request-1')]
+
+
+def test_a_step_the_loop_break_flagged_is_held_for_her():
+    """Review of 5dfba1d2a (Medium): the loop-break flags its step
+    (RECOVERABLE_STALL) and holds nothing.  On her turn the step is held for
+    her, and the kind becomes the person's: there is no expert to retry it."""
+    from core.constants import (USER_INPUT_GATE_HUMAN_REQUIRED,
+                                USER_INPUT_GATE_RECOVERABLE_STALL)
+    from tests.unit.module_swap import swap_modules
+    task = types.SimpleNamespace(
+        _needs_user_input_action_id=2,
+        _needs_user_input_kind=USER_INPUT_GATE_RECOVERABLE_STALL)
+    states, names = _names(tasks={'7_1': task})
+    ns = _functions(names)
+    with swap_modules(_modules(autonomous=False)):
+        reply = ns['_ask_for_help']('7_1', 1, 2, 'Collect the sources',
+                                    'the conversation looped without finishing it')
+    assert reply == ns['_needs_input_reply'](2, 'Collect the sources')
+    assert task._needs_user_input_kind == USER_INPUT_GATE_HUMAN_REQUIRED
+    assert names['holds'] == [(
+        '7_1', 2, 'asked the person: the conversation looped without finishing it',
+        0, 'her-request-1')]
+
+
+def test_a_finished_step_is_not_held_for_her():
+    """A terminal step waits for nobody (_should_block_on_user_input's rule)."""
+    from tests.unit.module_swap import swap_modules
+    task = types.SimpleNamespace()
+    states, names = _names(tasks={'7_1': task})
+    names['is_terminal_state'] = lambda s: True
+    ns = _functions(names)
+    with swap_modules(_modules(autonomous=False)):
+        ns['_ask_for_help']('7_1', 1, 2, 'Collect the sources', 'it looped')
+    assert getattr(task, '_needs_user_input_action_id', None) is None
+    assert states == [] and names['holds'] == []
 
 
 def test_an_autonomous_run_parks_the_goal_and_holds_the_action():

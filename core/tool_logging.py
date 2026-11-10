@@ -136,6 +136,46 @@ def _session_suffix() -> str:
     return ""
 
 
+def _action_in_progress():
+    """The action the session's turn is running, or None without context.
+
+    Same session key and same never-raise rule as `_session_suffix`."""
+    try:
+        from hartos.threadlocal import thread_local_data
+        from hartos.lifecycle_hooks import action_in_progress
+
+        user_id = thread_local_data.get_user_id()
+        prompt_id = thread_local_data.get_prompt_id()
+        if user_id and prompt_id:
+            return action_in_progress(f"{user_id}_{prompt_id}")
+    except Exception:
+        _emit_logger.debug("[tool_logging] action in progress unavailable",
+                           exc_info=True)
+    return None
+
+
+def log_refused_call(tool_name: str, reason: str) -> None:
+    """One WARNING for a model's call that was refused before the tool ran.
+
+    Called where the executor refuses arguments that do not fit the tool
+    (hartos/helper.py, tool_argument_error), the path every group's tool
+    call takes; the refusal never reaches `log_tool_execution`.  It names
+    the session and step so an omission is counted per day, e.g.
+    send_message_to_user without expects_reply after the hot-swap
+    (hartos-00's ruling on 7043d635e, finding 4).  ``reason`` is the
+    refusal the model reads, logged raw as a LOCAL record: it names the
+    tool's declared parameters, but any key the model wrote that is
+    unknown, invented, written twice, or read after a JSON repair is echoed
+    as written, and after a repair such a key can be a fragment of the
+    model's own text (the 2026-09-22 split turned "Consulting:" inside a
+    message into a key).  Local logs may hold raw values, as the wrapper's
+    "Arguments:" line already does; only egress is scrubbed.
+    """
+    tool_logger.warning(
+        f"[TOOL-CALL-REFUSED] {tool_name}: {reason} "
+        f"action={_action_in_progress()}{_session_suffix()}")
+
+
 def credential_vault():
     """The credential vault, or None when it cannot load.
 
@@ -160,18 +200,56 @@ def _mask(text: str) -> str:
     return vault.mask_secrets(text) if vault is not None else text
 
 
+def note_unhinted_refusal(tool_name: str, result) -> bool:
+    """Count a failed reply that tells the model nothing it can fix.
+
+    The enforcement half of core.tool_refusal (owner 2026-11-09: "enforce a
+    framework for tool call so that validation errors are semantically
+    understood by LLM so that retry can correct them").  Every registered
+    tool returns through log_tool_execution, so this is the one place that
+    sees every reply.  A reply that failed (core.constants.tool_reply_failed)
+    but carries no hint (core.tool_refusal.refusal_has_hint: not built by
+    refuse(), or refused JSON without a note) is logged once per call as
+    ``[TOOL-REFUSAL-NO-HINT] <tool>``, with the session, so each lane can
+    count and move its own.  Returns whether it logged.  Never raises: it
+    sits on every tool's return path."""
+    try:
+        from core.constants import tool_reply_failed
+        from core.tool_refusal import refusal_has_hint
+        body = '' if result is None else str(result)
+        if not tool_reply_failed(body) or refusal_has_hint(body):
+            return False
+        tool_logger.warning(
+            f"[TOOL-REFUSAL-NO-HINT] {tool_name}: {_mask(body[:160])!r}"
+            f"{_session_suffix()}")
+        return True
+    except Exception:
+        _emit_logger.debug("[tool_logging] refusal hint check failed",
+                           exc_info=True)
+        return False
+
+
 def _error_envelope(func_name: str, exc: BaseException) -> str:
     """Structured JSON error returned to the LLM on tool failure.
 
     Preserves the legacy contract from create_recipe.py:344-359 so the
     40+ existing tools using `@log_tool_execution` see identical output.
     """
+    # The suggestion is read by the MODEL, which cannot read logs.  "Check logs
+    # for detailed traceback information" told it nothing it could act on
+    # (owner 2026-11-09: a refusal must say what was wrong so a retry can
+    # correct it), so it says what the failure means for the next call.
     payload = {
         "status": "error",
         "tool_function": func_name,
         "error_type": type(exc).__name__,
         "error_message": str(exc),
-        "suggestion": "Check logs for detailed traceback information",
+        "suggestion": (
+            f"{func_name} failed while it ran, after its arguments were "
+            f"accepted. If error_message names one of your arguments or its "
+            f"value, call {func_name} again with that fixed. Otherwise the "
+            f"same call will fail the same way: do not repeat it; tell the "
+            f"person what could not be done."),
     }
     # The prefix lives in core.constants so tool_reply_failed, which CREATE's
     # trace banker and REUSE's fabrication gate both read, cannot drift from it.
@@ -300,6 +378,7 @@ def log_tool_execution(func=None, *, name=None, plain_errors=False):
                     f"Result: {result[:100]}..."
                     if len(result) > 100 else f"Result: {result}"
                 )
+                note_unhinted_refusal(tool_name, result)
                 return result
             except Exception as e:
                 return _on_error(e, _t0)
@@ -345,6 +424,7 @@ def log_tool_execution(func=None, *, name=None, plain_errors=False):
                 f"Result: {result[:100]}..."
                 if len(result) > 100 else f"Result: {result}"
             )
+            note_unhinted_refusal(tool_name, result)
             return result
         except Exception as e:
             return _on_error(e, _t0)

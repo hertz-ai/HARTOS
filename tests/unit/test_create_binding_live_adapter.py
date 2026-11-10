@@ -180,6 +180,26 @@ class TestCreateBindingWiresLiveAdapter:
         assert resp.status_code == 201
         wire_fn.assert_called_once_with('telegram', '123:ABC')
 
+    def test_the_start_is_recorded_with_its_value(self, client):
+        """create_binding records its start with the fingerprint of the
+        value it started, so post_to_channel never writes the owner's older
+        value over it (review of b6dcae15e, mutant N8)."""
+        from integrations.channels import agent_tools
+        agent_tools._STARTS.pop('telegram', None)
+        headers, _ = _register(client)
+        try:
+            with patch('integrations.social.api_channels._wire_live_adapter',
+                       return_value={'success': True}):
+                resp = client.post('/api/social/channels/bindings', headers=headers,
+                                   json={'channel_type': 'telegram',
+                                         'bot_token': '123:ABC'})
+            assert resp.status_code == 201
+            record = agent_tools.start_verdict('telegram')
+            assert record is not None
+            assert record['fp'] == agent_tools.credential_fingerprint('123:ABC')
+        finally:
+            agent_tools._STARTS.pop('telegram', None)
+
     def test_live_adapter_failure_does_not_break_binding_creation(self, client):
         """A dead/unreachable Telegram API must not prevent the binding
         itself from being saved (worse than before would be a regression)."""

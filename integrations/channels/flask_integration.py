@@ -25,6 +25,11 @@ from .registry import ChannelRegistry, ChannelRegistryConfig, get_registry
 logger = logging.getLogger(__name__)
 
 
+#: Seconds a caller of send_threadsafe waits for the channel to confirm a
+#: send.  A send still running then may yet be delivered: the caller says
+#: "pending, do not resend" (/channels/send's 202), never "not sent".
+CHANNEL_SEND_WAIT_S = 30
+
 #: The webhook secret names built from a channel's name
 #: ('{CHANNEL}' + suffix), read by the webhook signature gate below.
 _WEBHOOK_SECRET_SUFFIXES = ('_APP_SECRET', '_CHANNEL_SECRET', '_WEBHOOK_SECRET',
@@ -1433,19 +1438,22 @@ def register_status_routes(app, integration: FlaskChannelIntegration) -> None:
             return jsonify({"error": "Missing required fields"}), 400
 
         try:
-            result = integration.send_threadsafe(channel, chat_id, text, wait=30)
+            result = integration.send_threadsafe(
+                channel, chat_id, text, wait=CHANNEL_SEND_WAIT_S)
         except concurrent.futures.TimeoutError:
             # The send is still running on the adapter loop and may yet be
             # delivered.  Unhandled, this was a bare 500, which tells a
             # caller to retry -- and the retry sent the message twice.
             logger.warning(
-                "/channels/send to %s/%s still in progress after 30s; "
-                "answered 202, not retried", channel, chat_id)
+                "/channels/send to %s/%s still in progress after %ds; "
+                "answered 202, not retried", channel, chat_id,
+                CHANNEL_SEND_WAIT_S)
             return jsonify({
                 "success": None,
                 "pending": True,
-                "error": ("Send still in progress after 30s; it may still be "
-                          "delivered. Do not resend."),
+                "error": (f"Send still in progress after "
+                          f"{CHANNEL_SEND_WAIT_S}s; it may still be "
+                          f"delivered. Do not resend."),
             }), 202
         if result is None:
             return jsonify({"error": "Channels not running"}), 503

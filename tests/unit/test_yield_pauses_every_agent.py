@@ -892,7 +892,7 @@ def _first_dispatch(tmp_path, recipe_reply):
         'app': MagicMock(), 'thread_local_data': tld, 'chat_agent': MagicMock(),
         'user_id': 'u1', 'file_id': None, 'request_id': DAEMON_RID, 'prompt_id': '777',
         '_autonomous_gather_info': lambda *a: 'GATHER OUTPUT',
-        'recipe': recipe_reply if callable(recipe_reply) else (lambda *a: recipe_reply),
+        'recipe': recipe_reply if callable(recipe_reply) else (lambda *a, **k: recipe_reply),
         '_user_lock': threading.Lock(), 'review_agents': {}, '_ak': 'u1_777',
         'conversation_agent': {}, '_touch_agent_timestamp': lambda *a: None,
         '_create_social_agent_from_prompt': lambda *a: None,
@@ -915,6 +915,19 @@ class TestTheChatFirstDispatchAnswersThePause:
     def test_a_paused_create_answers_the_pause(self, tmp_path):
         text, payload = _first_dispatch(tmp_path, agent_tools.user_pause_reply(1))
         assert agent_tools.is_user_pause(text), text
+
+    def test_the_plan_it_wrote_runs_with_the_autonomous_flag(self, tmp_path):
+        """The block's recipe() runs the plan the autonomous gather just
+        wrote with autonomous=True (ed427a072): every flow's agents are
+        built freed (create_agents), the assistant with the AUTONOMOUS prompt
+        and the verifier without the HARD RULE."""
+        seen = []
+
+        def _recipe(*a, **k):
+            seen.append(k.get('autonomous'))
+            return 'Agent Created Successfully'
+        _first_dispatch(tmp_path, _recipe)
+        assert seen == [True]
 
     def test_a_finished_create_and_an_unfinished_one_answer_as_before(self, tmp_path):
         text, payload = _first_dispatch(tmp_path, 'Agent Created Successfully')
@@ -949,11 +962,50 @@ class TestTheChatFirstDispatchAnswersAFailedTurn:
         assert agent_tools.is_user_facing_error(text), text
 
     def test_a_recipe_that_raises_answers_a_failure(self, tmp_path):
-        def _boom(*a):
+        def _boom(*a, **k):
             raise RuntimeError('Error code: 429 - rate limit')
         text, payload = _first_dispatch(tmp_path, _boom)
         assert agent_tools.is_user_facing_error(text), text
         assert payload['Agent_status'] == 'Review Mode'
+
+
+_PAUSED_FOR_HELP = (f'{C.HELP_PAUSED_REPLY_PREFIX} step 2 ("post the digest") '
+                    f'could not be finished autonomously (3 attempts). It is '
+                    f'waiting for the owner or the co-pilot.')
+_HANDED_TO_EXPERT = (f'{C.HELP_EXPERT_REPLY_PREFIX} step 2 ("post the digest") '
+                     f'could not be finished autonomously (3 attempts). It takes '
+                     f"this goal's next turn.")
+_ERROR_ENVELOPE = ('{"status": "error", "action": "post the digest", '
+                   '"action_id": 2, "message": "the page refused the login"}')
+_ENVELOPE_IN_PROSE = 'Action 2 failed. ' + _ERROR_ENVELOPE
+_NOT_WORK = pytest.mark.parametrize(
+    'reply', [_PAUSED_FOR_HELP, _HANDED_TO_EXPERT, _ERROR_ENVELOPE, _ENVELOPE_IN_PROSE],
+    ids=['help_pause', 'expert_hand_off', 'error_envelope', 'envelope_in_prose'])
+
+
+class TestTheChatFirstDispatchAnswersAHandOffOrAnError:
+    """#170: a daemon's first dispatch whose recipe() handed its step on
+    (create_recipe._ask_for_help) or ended in the CREATE error envelope
+    ({"status": "error", ...}) was answered with the gather output.  The
+    daemon took the gather output for the turn's result and counted a
+    success, and the hive worker recorded it as the task's result while the
+    goal waited for help: the 2026-09-15 "Paused for help" contributions, by a
+    second route."""
+
+    @_NOT_WORK
+    def test_the_turn_answers_what_recipe_answered(self, tmp_path, reply):
+        text, payload = _first_dispatch(tmp_path, reply)
+        assert text == reply
+        assert payload['Agent_status'] == 'Review Mode'
+
+    @_NOT_WORK
+    def test_the_daemon_does_not_count_it_as_work_done(self, tmp_path, reply):
+        from integrations.agent_engine import agent_daemon, dispatch
+        text, _ = _first_dispatch(tmp_path, reply)
+        # dispatch_goal hands the reply on: it is neither held nor a failed turn...
+        assert dispatch._turn_failure(text) is None
+        # ...and the daemon reads what /chat answered as not work done.
+        assert agent_daemon._reply_failure(text) is not None, text
 
 
 # ─── The hive worker ──────────────────────────────────────────────────────────

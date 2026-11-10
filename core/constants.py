@@ -418,6 +418,19 @@ NUNBA_WEB_FETCH_POLICY: str = (
     "the limitation only if no tool can be attached."
 )
 
+# What send_message_to_user's expects_reply means has ONE home: this
+# constant.  The tool's parameter and tool descriptions
+# (core/agent_tools.py) and REUSE's rule 11.ii, the line beside the banked
+# steps, embed it, so the definition the model is shown cannot drift between
+# them (hartos-00's ruling on 7043d635e, finding 4).  It names the mixed case
+# because the live send that started this both told the person something and
+# ended "Ready to begin?" (agent 45620673143 action 3, 2026-10-31 17:13 IST).
+EXPECTS_REPLY_RULE: str = (
+    "Every call sets expects_reply: true whenever the message waits for the "
+    "person's answer, even if it also tells them something; false only when "
+    "it asks nothing."
+)
+
 NUNBA_BRAND_IDENTITY: str = (
     "You are Nunba, a friendly and helpful local AI assistant. "
     "Hevolve.ai is the web cloud version of Nunba — same intelligence, "
@@ -785,6 +798,17 @@ BUILD_INCOMPLETE_REPLY: str = (
 # hashed result.
 HELP_PAUSED_REPLY_PREFIX: str = "Paused for help:"
 HELP_EXPERT_REPLY_PREFIX: str = "Handed to the expert model:"
+#: The kinds of the create loop's user-input gate (create_recipe's
+#: _needs_user_input_kind): who may clear it and what the loop says while it
+#: holds.  HUMAN_REQUIRED: a `pending` + `no` verdict, the person answers.
+#: AWAITING_REPLY: a `completed` + `no` verdict, the step already asked and
+#: waits for the reply (the loop says so instead of "isn't coming together").
+#: RECOVERABLE_STALL: a loop-break on an unverified action, which the
+#: assigned expert's turn may also clear.  One home: CREATE writes and reads
+#: them at five sites, and _ask_for_help's tests import them from here.
+USER_INPUT_GATE_HUMAN_REQUIRED: str = 'human_required'
+USER_INPUT_GATE_AWAITING_REPLY: str = 'awaiting_reply'
+USER_INPUT_GATE_RECOVERABLE_STALL: str = 'recoverable_stall'
 #: The reply of a background turn that stopped BETWEEN STEPS because the owner
 #: is using this computer (yield-to-user, owner ruling 2026-10-04).  Not a
 #: result, not a failure, not a parked goal: the goal stays active, and its
@@ -800,6 +824,15 @@ PAUSED_FOR_USER_REPLY_PREFIX: str = "Paused for the user:"
 #: core.agent_tools.is_held_for_another_turn recognises it by this prefix;
 #: held_for_another_turn_reply writes it.
 HELD_FOR_ANOTHER_TURN_REPLY_PREFIX: str = "Held for another turn:"
+#: The reply of a background turn (daemon, hive, timer) that found the
+#: session's current REUSE step held for the person's reply (#161): the step
+#: asked them a question in their own turn and waits for the answer, so this
+#: turn neither ran the step nor asked again.  Not a result, not a failure,
+#: not a parked goal: the person's next turn resumes the step; a dispatcher
+#: holds it and counts nothing (the daemon a transient defer, no strike; the
+#: hive worker HeldForHelp).  core.agent_tools.is_waiting_for_person
+#: recognises it by this prefix; waiting_for_person_reply writes it.
+WAITING_FOR_PERSON_REPLY_PREFIX: str = "Waiting for the person:"
 
 
 # ── The per-request switch that turns a hybrid-reasoning model's thinking OFF ──
@@ -1414,6 +1447,18 @@ def tool_reply_failed(content) -> bool:
     body = "" if content is None else str(content)
     if body.lstrip().startswith(TOOL_ERROR_REPLY_PREFIXES):
         return True
+    # A tool that answers JSON refuses with a top-level {"status": "refused"}
+    # (core.tool_refusal.refusal_fields; person_ask's refusals).  Measured
+    # 2026-11-09: 66 refused ask_person calls in two days opened with '{', so
+    # neither rule above saw them, and the banker and the REUSE gate could
+    # count a refused call as the step's work (hevolve-66e6's finding).
+    # Top level and exact only: 'refused' means the CALL could not be done.
+    # A person's "no" is an answer and keeps its own status word (person_ask
+    # answers 'answered'), and a 'refused' entry inside a results list
+    # (aider_native_backend) is one item's outcome, not the call's.
+    from core.tool_refusal import is_json_refusal
+    if is_json_refusal(body):
+        return True
     return any(failure in body for failure in TOOL_FAILURE_RESULTS)
 
 
@@ -1553,6 +1598,14 @@ BOOKKEEPING_TOOLS: frozenset = frozenset({
 # equal to this one.
 AGENT_MENTIONS: tuple = ("@statusverifier", "@status verifier", "@verification",
                          "@helper", "@executor")
+
+# The agent's OWN role: the seat it sits in, never a person it talks with
+# (owner 11-07: a user persona is never an agent name, and the reverse).
+# CREATE's personality takes it through core.agent_personality, which
+# re-exports it; REUSE's "You are a helpful ..." line reads it here, so a
+# REUSE turn never imports agent_personality outside that module's own guard
+# (it asserts at import by design; review of 33d7dea57).
+AGENT_ROLE: str = 'assistant'
 
 # How much of what a tool OBSERVED may ride back in its return string.
 #
