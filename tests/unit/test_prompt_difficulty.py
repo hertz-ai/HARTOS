@@ -203,3 +203,73 @@ class TestOwnDataImperativesAreNotEasy:
         for p in ('hi', 'hii', 'thanks', 'good morning', 'nice one',
                   'ok cool', 'that worked', 'lol', 'see you'):
             assert is_casual(p) is True, p
+
+
+class TestTheWiringInChat:
+    """The resolver had ZERO callers for four months, so its CONTRACT was
+    never pinned where /chat relies on it.  REVIEW 2026-11-10 rejected the
+    first wiring (58be9ddfd) for two reproduced criticals; these pins are
+    what would have caught both.
+    """
+
+    def _entry_src(self):
+        import os
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__),
+                                            '..', '..'))
+        with open(os.path.join(root, 'hart_intelligence_entry.py'),
+                  encoding='utf-8', errors='surrogateescape') as fh:
+            return fh.read()
+
+    def test_a_false_hint_is_always_honoured(self):
+        """C1's contract.  An absent flag binds to False, and False must
+        never be second-guessed: ~11 internal callers omit it on purpose,
+        commercial_api.py:548 so a billed call never gets the casual tool
+        set.  If this ever returns True, those callers silently change tier.
+        """
+        for p in ('set an alarm for 6am', 'send an email to ravi',
+                  'take a screenshot', 'delete my account', 'continue',
+                  'approved, generate the recipe', 'why is the sky blue',
+                  'manaivikku oru email anuppu', 'envia un correo a ravi'):
+            casual, why = resolve_casual_conv(p, False)
+            assert casual is False, (p, why)
+
+    def test_chat_still_defaults_an_absent_flag_to_false(self):
+        """C1 itself.  Dropping the default made an absent flag mean
+        'assess', and every prompt above scores easy(0):short-and-plain --
+        53 of the reviewer's 84 probes flipped full -> casual, including
+        'delete my account' and every non-English prompt, because the
+        regexes are English-only.
+        """
+        assert "data.get('casual_conv', False)" in self._entry_src(), (
+            'the False default was removed again: an absent casual_conv '
+            'must keep meaning the FULL path, or every caller that omits '
+            'it is routed by an English-only regex')
+
+    def test_chat_does_not_assess_a_non_string_prompt(self):
+        """prompt is data.get('prompt', None) and callers do send
+        non-strings; assess() calls .strip(), so an unguarded resolve
+        raises AttributeError on a line every /chat call runs."""
+        assert 'if isinstance(prompt, str):' in self._entry_src(), (
+            'the isinstance guard around the resolve call was removed; '
+            'a non-string prompt now crashes /chat')
+
+    def test_an_ordinary_tool_prompt_with_a_casual_hint_is_still_casual(self):
+        """C2, pinned as the KNOWN HOLE it is, so that no one reads the
+        _TASK_VERB list and concludes these are handled.
+
+        The override fires at HARD (score >= 30) only, and these assess
+        ORDINARY, so a caller asserting 'casual' wins.  Nunba always sends
+        a bool (hartos_backend_adapter.py:917), so on the live path the
+        remember/forget/open verbs do NOTHING.  Closing this means
+        overriding on TOOL-NEED as well as on difficulty, which changes the
+        owner's 2026-08-24 session-shape design -- the owner's call.
+
+        If this test starts failing, the behaviour was changed: check that
+        the owner asked for it before making the test green again.
+        """
+        for p in ('remember that my exam is on friday',
+                  'open my downloads folder',
+                  "don't forget my dentist appointment",
+                  'find my resume', 'summarize the pdf'):
+            casual, why = resolve_casual_conv(p, True)
+            assert casual is True and why == 'client:True', (p, why)
