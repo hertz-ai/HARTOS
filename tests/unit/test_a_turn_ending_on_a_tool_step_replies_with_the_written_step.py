@@ -24,14 +24,18 @@ person.  The same shape on 11-07 (msg_1794040636536_3y7gjm) delivered "I
 apologize for the confusion. Let me try a different approach to save the
 learner's progress."
 
-The rule: a turn that ends on a step whose named tools are all SAVES (the
+The rule: a turn that ends on steps whose named tools are all SAVES (the
 save_ entries of core.constants.BOOKKEEPING_TOOLS) replies with the longest
-written answer of this turn's latest step that names no tool; a save is
-nothing the person reads.  A last step naming any other tool (google_search,
-a memory READ) keeps today's recovery, because its result is the answer: the
-first cut took every tool step and replied "Sure, let me look that up"
-(review of the uncommitted fix, F1).  The turn starts at the exact seed text
-_reuse_seed_message built for this request; nothing before it is ever
+written answer of the step just before those saves, whatever that step is (a
+writing step's lesson, or what a search or read step wrote after its result);
+a save is nothing the person reads.  When that step wrote nothing, no earlier
+step's text stands in (review of fffdffc96, F2/F3).  A message that carries a
+tool call is the model's note to its tool and is never the reply (F1, live on
+build 69).  A last step naming any other tool (google_search, a memory READ)
+keeps today's recovery, because its result is the answer: the first cut took
+every tool step and replied "Sure, let me look that up" (review of the
+uncommitted fix, F1).  The turn starts at the newest copy of the exact seed
+text _reuse_seed_message built for this request; nothing before it is ever
 delivered, and a seed that fell back to the bare words leaves no start at all
 (review F2).
 
@@ -517,3 +521,246 @@ def test_the_log_names_the_picker(make):
              if c.args]
     assert any('already wrote the answer' in line and 'picker=turn' in line
                for line in lines), lines
+
+
+# --- Probe P9 of the 11-10 proof: the save step's own line is the turn's last
+# message and no verdict follows it, so _reuse_needs_synthesis is False and the
+# first commit of this fix never asked the picker.
+
+def test_a_save_report_with_no_verdict_after_it_is_not_the_reply(make):
+    up = 'turnreply_p9'
+    task, agents = make(up, [WRITE, SAVE], ['save_data_in_memory'])
+    seed = rr._reuse_seed_message(up, 'Teach me the next page.')
+    task.current_action = 3
+    reply = 'REPLY: page 3 is about evaporation.'
+    log = [_seed_msg(seed), _assistant(reply), _verdict(1), _dispatch(2, SAVE),
+           _call('s1', 'save_data_in_memory'), _result('s1', 'Saved'),
+           _assistant(SAVED_REPORT)]
+    tail, _rec = _run(up, log, agents)
+    assert tail == reply, f'delivered {tail!r}'
+    lines = [str(c.args[0]) for c in rr.current_app.logger.info.call_args_list
+             if c.args]
+    assert any("save step's own line" in line and 'picker=turn' in line
+               for line in lines), lines
+
+
+def test_a_read_step_answer_with_no_verdict_after_it_stays_the_reply(make):
+    """A READ's answer is the reply: the P9 path only acts after a save."""
+    up = 'turnreply_p9_read'
+    a2 = ("Call get_data_by_key with the key teach.<user id> and tell the "
+          "learner which page they reached.")
+    task, agents = make(up, [WRITE, a2], ['get_data_by_key'])
+    seed = rr._reuse_seed_message(up, 'Where was I?')
+    task.current_action = 3
+    answer = 'You reached page 12 of How Rain Happens.'
+    log = [_seed_msg(seed), _assistant('REPLY: welcome back.'), _verdict(1),
+           _dispatch(2, a2), _call('r1', 'get_data_by_key'),
+           _result('r1', '{"page": 12}'), _assistant(answer)]
+    tail, _rec = _run(up, log, agents)
+    assert tail == answer, f'delivered {tail!r}'
+
+
+def test_a_turn_ending_on_its_writing_step_is_left_alone(make):
+    """No save step at the end: nothing is appended, the answer stands."""
+    up = 'turnreply_p9_write_last'
+    task, agents = make(up, [SAVE, WRITE], ['save_data_in_memory'])
+    seed = rr._reuse_seed_message(up, 'Teach me the next page.')
+    task.current_action = 3
+    reply = 'REPLY: page 3 is about evaporation.'
+    log = [_seed_msg(seed), _call('s1', 'save_data_in_memory'),
+           _result('s1', 'Saved'), _assistant(SAVED_REPORT), _verdict(1),
+           _dispatch(2, WRITE), _assistant(reply)]
+    chat = _Chat(log, agents)
+    rr._reuse_synthesis_turn(up, chat, _Manager(), _Recorder())
+    assert len(chat.messages) == len(log)
+    assert chat.messages[-1]['content'] == reply
+
+
+# --- The review of fffdffc96 (REJECTED, 11-10): the shapes it ran.
+
+def _note(cid, fn, text):
+    """An Assistant message whose words ride a tool call (build 69's shape)."""
+    return {'role': 'assistant', 'name': 'Assistant', 'content': text,
+            'tool_calls': [{'id': cid, 'type': 'function',
+                            'function': {'name': fn, 'arguments': '{}'}}]}
+
+
+NOTE = ("I need to save Arjun's attempt text to memory first. Since this is a "
+        "first visit and there's no prior attempt data, I'll save the text as "
+        "the last_attempt value before writing anything to the learner.")
+
+
+def test_a_note_riding_a_tool_call_is_never_the_reply(make):
+    """F1: the writing step's window holds the model's note to its save call
+    (longer than the answer) and then the answer.  The answer is the reply,
+    as it is when no save step follows."""
+    up = 'turnreply_r_f1'
+    task, agents = make(up, [WRITE, SAVE], ['save_data_in_memory'])
+    seed = rr._reuse_seed_message(up, 'Teach me the next page.')
+    task.current_action = 3
+    answer = 'Page 2: rain forms when vapour cools.'
+    assert len(NOTE) > len(answer)
+    log = [_seed_msg(seed), _note('n1', 'save_data_in_memory', NOTE),
+           _result('n1', 'Saved'), _assistant(answer), _verdict(1),
+           _dispatch(2, SAVE), _call('s1', 'save_data_in_memory'),
+           _result('s1', 'Saved'), _assistant(SAVED_REPORT), _verdict(2)]
+    tail, _rec = _run(up, log, agents)
+    assert tail == answer, f'delivered {tail!r}'
+
+
+@pytest.mark.parametrize('key', ['tool_calls', 'function_call'])
+def test_words_riding_a_call_are_not_an_answer(key):
+    """The one reply predicate refuses them, so every picker (the turn's, the
+    action's, the post-loop walk) and the synthesis gate read them alike."""
+    call = ([{'id': 'x', 'type': 'function',
+              'function': {'name': 'save_data_in_memory', 'arguments': '{}'}}]
+            if key == 'tool_calls'
+            else {'name': 'save_data_in_memory', 'arguments': '{}'})
+    msg = {'role': 'assistant', 'name': 'Assistant', 'content': NOTE, key: call}
+    assert rr._reuse_message_is_user_answer(msg) is False
+    assert rr._reuse_message_is_user_answer(
+        {'role': 'assistant', 'name': 'Assistant', 'content': NOTE}) is True
+
+
+def test_an_answer_key_beside_a_call_is_judged_by_the_key():
+    """Below the answer key, as the seats are: a message that carries
+    message2userfinal is judged by what that key holds."""
+    msg = {'role': 'assistant', 'name': 'Assistant',
+           'content': ('{"message2userfinal": "Page 2: rain forms when '
+                       'vapour cools."}'),
+           'tool_calls': [{'id': 'x', 'type': 'function',
+                           'function': {'name': 'save_data_in_memory',
+                                        'arguments': '{}'}}]}
+    assert rr._reuse_message_is_user_answer(msg) is True
+
+
+def test_the_last_actions_note_is_not_delivered(make):
+    """Build 69, msg_1794336534220_sim, picker=action: the last action's
+    window holds only the note riding its call, the result and the verdict.
+    The note is not the reply; the synthesis steer asks for one."""
+    up = 'turnreply_r_action'
+    a1 = "Call get_chat_history and tell the learner what they said last time."
+    task, agents = make(up, [a1], ['get_chat_history'])
+    seed = rr._reuse_seed_message(up, 'What did I say?')
+    task.current_action = 2
+    log = [_seed_msg(seed), _note('h1', 'get_chat_history', NOTE),
+           _result('h1', '[]'), _verdict(1)]
+    tail, rec = _run(up, log, agents)
+    assert tail != NOTE
+    assert rec.messages, 'the synthesis steer must be posted'
+
+
+def test_a_search_step_before_the_save_gives_the_reply(make):
+    """F2: a tool step whose result is the answer sits between the writing
+    step and the save; its answer is the reply, not the writing step's
+    opening line."""
+    up = 'turnreply_r_f2'
+    a1 = "Acknowledge the learner's question and tell them you will look it up."
+    a2 = ("Use google_search to find the population of Tokyo and tell the "
+          "learner the number.")
+    task, agents = make(up, [a1, a2, SAVE],
+                        ['google_search', 'save_data_in_memory'])
+    seed = rr._reuse_seed_message(up, 'How many people live in Tokyo?')
+    task.current_action = 4
+    answer = 'Tokyo has about 14 million people.'
+    log = [_seed_msg(seed), _assistant('Sure, let me look that up for you.'),
+           _verdict(1), _dispatch(2, a2), _call('g1', 'google_search'),
+           _result('g1', 'Tokyo: 14,000,000'), _assistant(answer), _verdict(2),
+           _dispatch(3, SAVE), _call('s1', 'save_data_in_memory'),
+           _result('s1', 'Saved'), _assistant(SAVED_REPORT), _verdict(3)]
+    tail, _rec = _run(up, log, agents)
+    assert tail == answer, f'delivered {tail!r}'
+
+
+def test_a_read_step_before_the_save_gives_the_reply(make):
+    """F3: no writing step at all (52 of the 89 save-ending desktop flows):
+    the read step's answer is the reply, not the save line."""
+    up = 'turnreply_r_f3'
+    a1 = ("Call get_data_by_key with the key teach.<user id> and tell the "
+          "learner which page they reached.")
+    task, agents = make(up, [a1, SAVE],
+                        ['get_data_by_key', 'save_data_in_memory'])
+    seed = rr._reuse_seed_message(up, 'Where was I?')
+    task.current_action = 3
+    answer = 'You reached page 12 of How Rain Happens.'
+    log = [_seed_msg(seed), _call('r1', 'get_data_by_key'),
+           _result('r1', '{"page": 12}'), _assistant(answer), _verdict(1),
+           _dispatch(2, SAVE), _call('s1', 'save_data_in_memory'),
+           _result('s1', 'Saved'), _assistant(SAVED_REPORT), _verdict(2)]
+    tail, _rec = _run(up, log, agents)
+    assert tail == answer, f'delivered {tail!r}'
+
+
+def test_a_step_before_the_saves_that_wrote_nothing_is_not_passed_over(make):
+    """When the step before the saves wrote nothing (its send delivered the
+    lesson), no earlier step's line stands in for it."""
+    up = 'turnreply_r_pass'
+    a2 = "Call send_message_to_user with this turn's lesson for the learner."
+    task, agents = make(up, [WRITE, a2, SAVE],
+                        ['send_message_to_user', 'save_data_in_memory'])
+    seed = rr._reuse_seed_message(up, 'Teach me the next page.')
+    task.current_action = 4
+    early = 'Sure, let me get your lesson ready.'
+    log = [_seed_msg(seed), _assistant(early), _verdict(1), _dispatch(2, a2),
+           _call('m1', 'send_message_to_user'),
+           _result('m1', 'Message sent successfully'), _verdict(2),
+           _dispatch(3, SAVE), _call('s1', 'save_data_in_memory'),
+           _result('s1', 'Saved'), _assistant(SAVED_REPORT), _verdict(3)]
+    assert rr._reuse_turn_written_reply(up, _Chat(log, agents)) is None
+    tail, _rec = _run(up, log, agents)
+    assert tail != early, f'delivered {tail!r}'
+
+
+def test_two_saves_at_the_end_reply_with_the_step_before_them(make):
+    up = 'turnreply_r_two_saves'
+    save2 = "Call save_to_long_term_memory to keep today's summary."
+    task, agents = make(up, [WRITE, SAVE, save2],
+                        ['save_data_in_memory', 'save_to_long_term_memory'])
+    seed = rr._reuse_seed_message(up, 'Teach me the next page.')
+    task.current_action = 4
+    reply = 'REPLY: page 3 is about evaporation.'
+    log = [_seed_msg(seed), _assistant(reply), _verdict(1), _dispatch(2, SAVE),
+           _call('s1', 'save_data_in_memory'), _result('s1', 'Saved'),
+           _assistant(SAVED_REPORT), _verdict(2), _dispatch(3, save2),
+           _call('s2', 'save_to_long_term_memory'), _result('s2', 'Saved'),
+           _assistant('Summary stored for next time.'), _verdict(3)]
+    tail, _rec = _run(up, log, agents)
+    assert tail == reply, f'delivered {tail!r}'
+
+
+def test_a_tie_goes_to_the_newer_answer(make):
+    """Two answers of equal length in the step's window: the newer is the
+    reply (the reviewer's tie_older mutant passed every earlier test)."""
+    up = 'turnreply_r_tie'
+    task, agents = make(up, [WRITE, SAVE], ['save_data_in_memory'])
+    seed = rr._reuse_seed_message(up, 'Teach me the next page.')
+    task.current_action = 3
+    older = 'OLDER: page 3 is evaporation.'
+    newer = 'NEWER: page 3 is evaporation.'
+    assert len(older) == len(newer)
+    log = [_seed_msg(seed), _assistant(older), _assistant(newer), _verdict(1),
+           _dispatch(2, SAVE), _call('s1', 'save_data_in_memory'),
+           _result('s1', 'Saved'), _assistant(SAVED_REPORT), _verdict(2)]
+    tail, _rec = _run(up, log, agents)
+    assert tail == newer, f'delivered {tail!r}'
+
+
+def test_the_turn_starts_at_the_newest_copy_of_its_seed(make):
+    """The same words twice build the same seed.  The previous turn ended on
+    the same step, so only the newest seed keeps its longer lesson out (the
+    reviewer's oldest_seed mutant passed every earlier test)."""
+    up = 'turnreply_r_seed'
+    task, agents = make(up, [WRITE, SAVE], ['save_data_in_memory'])
+    seed1 = rr._reuse_seed_message(up, 'Teach me the next page.')
+    old = 'OLD: ' + 'the previous lesson about clouds, ' * 6
+    task.current_action = 1
+    seed2 = rr._reuse_seed_message(up, 'Teach me the next page.')
+    assert seed1 == seed2
+    task.current_action = 3
+    new = 'NEW: page 4 is rain.'
+    log = [_seed_msg(seed1), _assistant(old), _seed_msg(seed2),
+           _assistant(new), _verdict(1), _dispatch(2, SAVE),
+           _call('s1', 'save_data_in_memory'), _result('s1', 'Saved'),
+           _assistant(SAVED_REPORT), _verdict(2)]
+    tail, _rec = _run(up, log, agents)
+    assert tail == new, f'delivered {tail!r}'

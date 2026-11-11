@@ -5099,6 +5099,42 @@ def _reuse_message_is_user_answer(message):
             # Markup, not a sentence — matching the SYNTAX, never prose that
             # merely names a tool, which stays a legitimate answer.
             return False
+        if last.get('tool_calls') or last.get('function_call'):
+            # The same call in its structured form: the words riding it are
+            # the model's note to its tool, not a reply.  Live 2026-11-10 on
+            # build 69 (agent 1793359802508, msg_1794336534220_sim) the whole
+            # reply was "I need to save the exercise_result to memory. Since
+            # Arjun's attempt was ..." -- the content of the Assistant message
+            # that carried the save_data_in_memory call.  Of the 75 distinct
+            # such messages in that proof's logs, every one narrates the call
+            # ("Let me try a different approach", "I see the issue"); none is
+            # a finished answer.  Below the answer key, as the seats are: a
+            # message that does carry message2userfinal is judged by it.
+            return False
+        if (('@' + str(last.get('name') or '').lower()) in _REUSE_AGENT_MENTIONS
+                and '@user' not in low):
+            # A SEAT THE ASSISTANT HANDS WORK TO (Helper, Executor: the same
+            # list that makes '@Helper' routing), speaking without '@user'.
+            # Its system message says it reaches the person only with
+            # '@user' or the send tools, and asks @StatusVerifier for the
+            # next step otherwise, so its plain prose is a note to the group.
+            # Live on build 72 (2026-11-11 07:46-07:54 IST, agent
+            # 1793366231447) four of the child's replies were the Helper's
+            # "The StatusVerifier indicates that Action 3 is still pending -
+            # Arjun hasn't responded yet ..." ([SYNTHESIS] picker=action and
+            # the last-real-one walk, from=Helper); across builds 70-72 all 5
+            # replies taken from the Helper were that line.  Below the answer
+            # key: a Helper message carrying message2userfinal is judged by it.
+            return False
+        if any(seat.lower() in low for seat in _REUSE_NON_ANSWER_SEATS):
+            # PROSE ABOUT THE PIPELINE: it names a seat whose voice is never
+            # the person's answer (StatusVerifier, ChatInstructor), as one
+            # word, the way only the group talks.  Nobody says
+            # "statusverifier" to a parent or a child.  Catches the same line
+            # when the #725 sync relabels its seat (measured 2026-09-10, see
+            # the note under _REUSE_NON_ANSWER_SEATS), which the seat check
+            # above cannot.
+            return False
         if any(m in low for m in _REUSE_AGENT_MENTIONS):
             return False                     # addressed to another agent
         parsed = retrieve_json(content)
@@ -5191,8 +5227,8 @@ _reuse_turn_start = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_turn_st
 
 
 def _reuse_turn_written_reply(user_prompt, group_chat):
-    """The reply this turn's writing step wrote, when the turn ends on a step
-    that only SAVES; else None, and the caller recovers as before.
+    """The reply the step before the turn's saves wrote, when the turn ends
+    on steps that only SAVE; else None, and the caller recovers as before.
 
     MEASURED live 2026-11-09 12:52 IST (agent 54, msg_1794208521422_odljlx):
     step 2 ("Write this turn's reply to the learner yourself ...") wrote the
@@ -5204,7 +5240,7 @@ def _reuse_turn_written_reply(user_prompt, group_chat):
     dispatch, delivered that line as the whole reply; on 11-07 the same shape
     delivered an apology for "the confusion".
 
-    Only a last step whose named tools are all saves (_REUSE_SAVE_ONLY_TOOLS,
+    Only when the last step's named tools are all saves (_REUSE_SAVE_ONLY_TOOLS,
     read from its own words as the gates read them,
     _reuse_step_referenced_tools): a save is nothing the person reads, so its
     lines answer the gate, not the person.  A last step naming any other tool
@@ -5212,12 +5248,22 @@ def _reuse_turn_written_reply(user_prompt, group_chat):
     tell the learner the number"; the first cut took every tool step and
     replied "Sure, let me look that up", review of the uncommitted fix).
 
-    The reply is then the longest written answer in the window of this turn's
-    latest step that names no tool and wrote one (the lesson, not a one-line
-    note after it; a tie goes to the newer), the choice
-    lifecycle_hooks._derive_written_answer makes.  Never earlier than this
-    request's seed: without a seed for this request (no entry, or the seed
-    fell back to the bare words) it returns None.
+    The reply is then read from the window of the step just before the
+    turn's trailing saves, whatever that step is: a writing step's lesson, or
+    what a search or memory read step wrote after its result.  Not an earlier
+    step: when that step wrote nothing, the person's answer is not in some
+    earlier step's opening line ("Sure, let me look that up"), so this
+    returns None (review of fffdffc96, F2 and F3: 10 of the 89 desktop flows
+    that end on a save have a tool step there, and 52 have no writing step
+    at all).  In that window, the longest written answer (the lesson, not a
+    one-line note after it; a tie goes to the newer), the choice
+    lifecycle_hooks._derive_written_answer makes.  _reuse_written_answer,
+    which reads the last action's tail, keeps its newest-first choice.  A
+    message that carries a tool call is the model's note to its tool and
+    never a candidate (_reuse_message_is_user_answer; F1, live on build 69).
+    Never earlier than this request's seed, the newest copy of it in the
+    log: without a seed for this request (no entry, or the seed fell back to
+    the bare words) it returns None.
     """
     try:
         from hartos.lifecycle_hooks import latest_dispatch_before
@@ -5228,31 +5274,39 @@ def _reuse_turn_written_reply(user_prompt, group_chat):
         boundary = next((idx for idx in range(len(messages) - 1, -1, -1)
                          if (messages[idx] or {}).get('content') == seed_text),
                         None)
+        if boundary is None:
+            return None
+        named = {}
+
+        def _saves_only(action):
+            if action not in named:
+                named[action] = set(_reuse_step_referenced_tools(
+                    user_prompt, action, group_chat))
+            return bool(named[action]) and named[action] <= _REUSE_SAVE_ONLY_TOOLS
+
         last = latest_dispatch_before(messages, len(messages))
-        if boundary is None or last is None:
+        if last is None or not _saves_only(last):
             return None
-        last_tools = set(_reuse_step_referenced_tools(user_prompt, last, group_chat))
-        if not last_tools or not last_tools <= _REUSE_SAVE_ONLY_TOOLS:
-            return None
-        writer, best, best_size = None, None, -1
+        step, best, best_size = None, None, -1
         for idx in range(len(messages) - 1, boundary, -1):
             action = latest_dispatch_before(messages, idx)
-            if action is None or (writer is not None and action != writer):
-                if writer is not None:
-                    break                    # past the writing step's window
-                continue
+            if step is None:
+                if action is None or _saves_only(action):
+                    continue                 # one of the turn's trailing saves
+                step = action
+            elif action != step:
+                break                        # past that step's window
             msg = messages[idx]
             if not (_reuse_message_is_user_answer(msg) and is_written_answer(msg)):
                 continue
-            if writer is None:
-                if _reuse_step_referenced_tools(user_prompt, action, group_chat):
-                    continue                 # a tool step's line is not the reply
-                writer = action
             size = len(str(msg.get('content') or '').strip())
             if size > best_size:             # walking back: a tie keeps the newer
                 best, best_size = msg, size
         return best
-    except Exception:
+    except Exception as err:
+        _ctx_safe_log('warning', f"[SYNTHESIS] turn reply unreadable for "
+                                 f"{user_prompt}: {err!r}; the action's "
+                                 f"recovery decides")
         return None
 
 
@@ -5707,6 +5761,34 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
     reply into no reply.
     """
     if not _reuse_needs_synthesis(group_chat):
+        # The tail reads as an answer, but when the turn ended on steps that
+        # only save, that answer is a save step's own line ("Great! The
+        # progress has been saved successfully"), and the reply is the one
+        # the step before them wrote (_reuse_turn_written_reply).  Probe P9
+        # of the 11-10 proof: with no verdict after the save step, this gate
+        # returned here and the save report reached the person.
+        _turn_reply = _reuse_turn_written_reply(user_prompt, group_chat)
+        if _turn_reply is not None:
+            try:
+                _msgs = group_chat.messages
+                _tail = (_msgs[-1] or {}).get('content') if _msgs else None
+                if _tail != _turn_reply.get('content'):
+                    _msgs.append(dict(_turn_reply))
+                    _txt = _turn_reply.get('content') or ''
+                    _ctx_safe_log(
+                        'info',
+                        f"[SYNTHESIS] the turn ended on a save step's own "
+                        f"line; the answer of the step before the saves goes "
+                        f"out instead "
+                        f"(session: {user_prompt}, picker=turn, "
+                        f"from={_turn_reply.get('name') or '?'}, "
+                        f"head={_txt[:120]!r})")
+            except Exception as _tr_err:
+                try:
+                    _ctx_safe_log('warning', f"[SYNTHESIS] turn-reply append "
+                                             f"failed: {_tr_err!r}")
+                except Exception:
+                    pass
         return False
     _before = len(getattr(group_chat, 'messages', None) or [])
 
@@ -5847,11 +5929,11 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
         # "successfully completed" the honest-report fix removed (#808).
         # Deliberately BELOW the _unrun branch for that reason.
         #
-        # A turn that ends on a step that only saves replies with the answer
-        # its writing step wrote (_reuse_turn_written_reply): the save step's
-        # own lines answer the gate, not the person (live 2026-11-09, agent
-        # 54: the save step's "progress has been saved successfully" replaced
-        # step 2's answer).
+        # A turn that ends on steps that only save replies with the answer
+        # the step before them wrote (_reuse_turn_written_reply): a save
+        # step's own lines answer the gate, not the person (live 2026-11-09,
+        # agent 54: the save step's "progress has been saved successfully"
+        # replaced step 2's answer).
         _written = _reuse_turn_written_reply(user_prompt, group_chat)
         _picker = 'turn'
         if _written is None:
@@ -5875,8 +5957,10 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
                 # delivered on 2026-09-10 04:42:04 — a count that cannot tell
                 # a right answer from a wrong one is not a measurement.
                 _txt = _written.get('content') or ''
+                _who = ('the step before the saves' if _picker == 'turn'
+                        else 'the action')
                 _say('info',
-                     f"[SYNTHESIS] the action already wrote the answer — "
+                     f"[SYNTHESIS] {_who} already wrote the answer — "
                      f"recovered {len(_txt)} chars from the group log, no "
                      f"steer posted (session: {user_prompt}, {_before} msgs, "
                      f"from={_written.get('name') or '?'}, "
