@@ -8353,6 +8353,32 @@ def _reuse_held_step_gate(user_prompt, request_id):
     return None
 
 
+_CAMERA_WINDOW_START = '<Last_5_Minutes_Visual_Context_Start>'
+_CAMERA_WINDOW_END = '<Last_5_Minutes_Visual_Context_End>'
+
+
+def _reuse_camera_window(user_prompt):
+    """This person's camera captions from the last five minutes, as the one
+    context builder renders them (core.user_context through
+    get_action_user_details, its tagged window and nothing else from it),
+    or '' when there are none or they cannot be read.  The person is the
+    turn's own account, so another person's camera, or the owner's screen,
+    never reaches this turn."""
+    user_id = str(user_prompt).rsplit('_', 1)[0]
+    try:
+        _details, actions = get_action_user_details(user_id)
+    except Exception:
+        current_app.logger.warning(
+            f"[REUSE-SEED] the camera window of {user_id} could not be read", exc_info=True)
+        return ''
+    actions = str(actions or '')
+    start = actions.find(_CAMERA_WINDOW_START)
+    end = actions.find(_CAMERA_WINDOW_END, start + 1)
+    if start < 0 or end < 0:
+        return ''
+    return actions[start:end + len(_CAMERA_WINDOW_END)]
+
+
 def _reuse_seed_message(user_prompt, message):
     """The opening turn's message: the user's words PLUS the current action's
     execution command.
@@ -8425,8 +8451,15 @@ def _reuse_seed_message(user_prompt, message):
         if (_ask and str(_ask.get('request_id') or '') != _rid
                 and _reuse_request_is_a_person(_rid)):
             words = f"{_REUSE_REPLY_PREFACE}{message}"
+        # What this person's camera showed in the last five minutes rides
+        # with their words, so a turn sees the child turn away or leave
+        # without the model having to think of calling the camera tool
+        # (live 2026-11-10 on build 69: a toy car and an empty chair changed
+        # nothing).  Nothing when there are no camera captions.
+        _camera = _reuse_camera_window(user_prompt)
         seeded = _build_reuse_action_message(
-            user_prompt, current_action_id, user_words=words)
+            user_prompt, current_action_id,
+            user_words=f"{words}\n\n{_camera}" if _camera else words)
         # Where this turn starts, for _reuse_turn_written_reply: the seed text
         # itself, found in the group log by exact content.
         _reuse_turn_start[user_prompt] = {'seed_text': seeded}
