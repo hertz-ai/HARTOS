@@ -538,19 +538,21 @@ def send_message_to_user1(user_id, response, inp, prompt_id, media_refs=None):
       via the local chat fan-out (no need to re-trigger here).
 
     - **Standalone central HARTOS** (sys.frozen absent — Docker, dev):
-      POST to the chatbot_pipeline backend's /autogen_response (handler
-      at chatbot_pipeline/chatbot.py:8009), at the ONE URL REUSE's copy
-      posts to too: hartos.helper.autogen_response_url.
+      hartos.helper.post_agent_message, the one send REUSE's copy uses
+      too: the chatbot_pipeline backend's /autogen_response (handler at
+      chatbot_pipeline/chatbot.py:8009), sent once, delivered only on a
+      2xx.
 
     Per user 2026-06-09: ``Agent_status`` field omitted on the local
     path — it was an artefact of the cloud server's per-user session
     dict and isn't needed by local subscribers.
 
     Returns "Message sent successfully to user with request_id: ..." or
-    "Failed to send message to user with request_id: ...", the same two
-    answers REUSE's copy gives.  The send_message_to_user tool
-    (core.agent_tools) returns it to the model, so the model is told whether
-    its message went out; the other callers here ignore it.
+    "Failed to send message to user with request_id: ..." (on central
+    followed by why), the same two answers REUSE's copy gives.  The
+    send_message_to_user tool (core.agent_tools) returns it to the model, so
+    the model is told whether its message went out; the other callers here
+    ignore it.
     """
     # Text for the user: an elided-text pointer a model copied into its
     # message never reaches them, on either branch below (owner ruling
@@ -578,25 +580,14 @@ def send_message_to_user1(user_id, response, inp, prompt_id, media_refs=None):
         return failed
 
     # Standalone central HARTOS: the chatbot_pipeline backend.
-    from hartos.helper import autogen_response_url
-    url = autogen_response_url()
-    body = json.dumps({
+    from hartos.helper import post_agent_message
+    delivered, why = post_agent_message({
         'user_id': user_id,
         'message': response,
         'inp': inp,
         'request_id': request_id,
     })
-    headers = {'Content-Type': 'application/json'}
-    try:
-        pooled_post(url, data=body, headers=headers, timeout=15)
-    except Exception as _e:
-        try:
-            current_app.logger.debug(
-                f'send_message_to_user1: azurekong forward failed ({_e})')
-        except Exception:
-            pass
-        return failed
-    return sent
+    return sent if delivered else f'{failed}: {why}'
 
 
 # No execute_python_file here: the scheduled-job dispatcher is

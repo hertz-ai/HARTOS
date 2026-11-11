@@ -27,7 +27,7 @@ import ast
 from core.optional_import import lazy_module
 # The fabrication gate in reuse_recipe keys on this EXACT string to tell a
 # back-filled stand-in from a real tool result — one definition, no drift.
-from core.constants import CENTRAL_HOST, HISTORICAL_TOOL_PLACEHOLDER
+from core.constants import HISTORICAL_TOOL_PLACEHOLDER
 autogen = lazy_module("autogen")
 transform_messages = lazy_module(
     "autogen.agentchat.contrib.capabilities.transform_messages")
@@ -5857,23 +5857,56 @@ MEDIA_KIND_MIMES = {
 }
 
 
-#: Where an agent's message to its person goes on a standalone HARTOS node
-#: (central): the chatbot_pipeline backend's /autogen_response.  ONE URL for
-#: CREATE's and REUSE's send_message_to_user1, which had drifted to two, and
-#: on central 2026-11-10 both were dead: REUSE posted to
-#: aws_rasa.hertzai.com:9890 (36 sends in the experiment's first 15 minutes,
-#: every one "Max retries exceeded") and CREATE to port 8443 of the same box,
-#: where nothing answers (Kong publishes its 8443 as 8543 and has no
-#: /autogen_response route).  AUTOGEN_RESPONSE_URL overrides it: central's
-#: deploy sets the backend's own published port, the e2e compose its mock.
-AUTOGEN_RESPONSE_URL_DEFAULT = f'https://{CENTRAL_HOST}:8443/autogen_response'
+def post_agent_message(body: dict):
+    """POST an agent's message to its person on a node that is not the
+    desktop (central): the chatbot_pipeline backend's /autogen_response, at
+    core.config_cache.get_autogen_response_url.  The ONE send for CREATE's
+    and REUSE's send_message_to_user1, which had two URLs and two failure
+    rules.
 
+    Returns ``(delivered, why)``.  ``delivered`` is True only when the
+    backend answered 2xx; ``why`` is '' then, else what went wrong in words
+    the agent can act on.  Both copies used to report "sent" for any answer,
+    and the backend answers 500 when the person has no session on it (review
+    of 983c98e14, its handler run against a real request), so the model was
+    told a message had arrived that had not.
 
-def autogen_response_url() -> str:
-    """The URL an agent's message to its person is POSTed to off the
-    desktop: AUTOGEN_RESPONSE_URL when set, else the default above."""
-    return (os.environ.get('AUTOGEN_RESPONSE_URL') or '').strip() or \
-        AUTOGEN_RESPONSE_URL_DEFAULT
+    Sent once (core.http_pool.pooled_post_once): the shared pool re-sends a
+    POST on a read timeout, and one slow send reached the backend three
+    times.  The backend replies only after it has made the message's audio
+    and video, so the read budget is LLM_COMPLETION_TIMEOUT, http_pool's
+    budget for a call that waits on generation.  How long central's backend
+    takes has not been measured.
+
+    The text is scrubbed of elided-text pointers here too: this is the last
+    step before it leaves the node (owner ruling 2026-09-27)."""
+    from core.config_cache import get_autogen_response_url
+    from core import http_pool
+    from core.llm_outbound_logger import strip_elided_pointers
+    url = get_autogen_response_url()
+    if not url:
+        _fallback_logger.warning(
+            'agent message not sent: AUTOGEN_RESPONSE_URL is not set on this node')
+        return False, ('this node has no AUTOGEN_RESPONSE_URL, the address of '
+                       'the service that delivers agent messages; the '
+                       "node's operator has to set it")
+    body = dict(body, message=strip_elided_pointers(body.get('message') or ''))
+    try:
+        res = http_pool.pooled_post_once(
+            url, data=json.dumps(body),
+            headers={'Content-Type': 'application/json'},
+            timeout=http_pool.LLM_COMPLETION_TIMEOUT)
+    except Exception as e:
+        _fallback_logger.warning(
+            'agent message not sent: %s unreachable (%s)', url, type(e).__name__)
+        return False, ('the service that delivers agent messages could not be '
+                       f'reached ({type(e).__name__})')
+    if 200 <= res.status_code < 300:
+        return True, ''
+    _fallback_logger.warning('agent message not sent: %s answered HTTP %s: %s',
+                             url, res.status_code, (res.text or '')[:200])
+    return False, ('the service that delivers agent messages refused it '
+                   f'(HTTP {res.status_code})')
 
 
 def media_items_for(user_id, refs, *, prompt_id, request_id):

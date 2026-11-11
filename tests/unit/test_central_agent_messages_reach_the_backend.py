@@ -1,36 +1,46 @@
 """On central, an agent's message to its person reaches the backend that
-delivers it.
+delivers it, once, and is reported delivered only when the backend took it.
 
 Measured on central 2026-11-10 (build f73df8f16), the first 15 minutes of
 the owner's earning experiment: the earning goals' REUSE turns called
 send_message_to_user 36 times and every one logged "Error sending message to
 user: HTTPConnectionPool(host='aws_rasa.hertzai.com', port=9890): Max retries
-exceeded".  REUSE's send_message_to_user1 posted to
-http://aws_rasa.hertzai.com:9890/autogen_response and CREATE's copy to
-https://azurekong.hertzai.com:8443/autogen_response: two URLs for one
-backend, and both dead from central (both names are the box's public
-address, where neither port answers; Kong publishes its 8443 as 8543 and has
-no /autogen_response route).  The backend, the chatbot_pipeline container,
-is published on the host's port 8001: from inside HARTOS's container,
-GET http://172.17.0.1:8001/autogen_response answered 405 (the POST-only
-route exists).
+exceeded".  REUSE's send_message_to_user1 posted to aws_rasa:9890 and CREATE's
+copy to port 8443 of the same box: two URLs for one backend, both dead from
+central.  The backend, the chatbot_pipeline container, is published on the
+host's port 8001 (GET from inside HARTOS's container answered 405: the
+POST-only route exists).
 
-Now both copies post to ONE URL, hartos.helper.autogen_response_url:
-AUTOGEN_RESPONSE_URL when set (central's deploy sets the backend's own port;
-the e2e compose already set it for its mock), else one default.
+The review of 983c98e14 (which pointed both copies at one URL) ran the
+senders against a local server and found three more defects:
+- both copies answered "Message sent successfully" whatever the backend
+  answered, and the backend answers 500 when the person has no session there;
+- the shared pool re-sends a POST on a read timeout or a 503, so one slow
+  send reached the backend three times;
+- a default URL (port 8443) that is known dead.
 
-The two senders are the real functions, called the way the existing desktop
-tests call them (test_agent_message_reaches_the_desktop_locally: REUSE's
-imported, CREATE's lifted with ast); the HTTP pool is the boundary.
-The deploy half runs the whole deploy script under bash with stub docker
+Now both copies send through hartos.helper.post_agent_message: the URL from
+core.config_cache.get_autogen_response_url (AUTOGEN_RESPONSE_URL, no
+default), core.http_pool.pooled_post_once (never re-sent), delivered only on
+a 2xx, and a failure says why.
+
+The senders are the real functions (REUSE's imported, CREATE's lifted with
+ast, as test_agent_message_reaches_the_desktop_locally does).  The wire is
+core.http_pool.pooled_post_once, except in the sent-once test, which runs the
+real transport against a real local HTTP server.  The deploy half runs the
+whole deploy script under bash with stub docker
 (test_a_deploy_cannot_fill_centrals_disk's harness).
 
     python -m pytest tests/unit/test_central_agent_messages_reach_the_backend.py -q
 """
 from __future__ import annotations
 
+import http.server
+import json
 import os
+import socket
 import sys
+import threading
 
 import pytest
 
@@ -39,10 +49,8 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from tests.unit.test_agent_message_reaches_the_desktop_locally import (  # noqa: E402,F401
-    _lift_create_send, _reuse_send, central, publisher, rr,
+    BACKEND, _answered, _lift_create_send, _reuse_send, central, publisher, rr,
 )
-
-BACKEND = 'http://172.17.0.1:8001/autogen_response'
 
 
 def _url(post):
@@ -51,54 +59,134 @@ def _url(post):
     return kwargs.get('url', args[0] if args else None)
 
 
-def test_reuse_posts_to_the_configured_backend(rr, central, publisher, monkeypatch):
-    """THE 11-10 SENDS: REUSE's copy went to aws_rasa:9890 whatever was set."""
-    monkeypatch.setenv('AUTOGEN_RESPONSE_URL', BACKEND)
-    out, post = _reuse_send(rr, 'cent-1', 'Your grocery order is ready to place.')
+def _send(which, rr, post, text='Your grocery order is ready to place.'):
+    """One message through REUSE's or CREATE's real sender; its reply."""
+    if which == 'reuse':
+        out, _post = _reuse_send(rr, 'cent-1', text, post=post)
+        return out
+    send, _post = _lift_create_send(post)
+    return send('cent-2', text, 'inp', 'p-1')
+
+
+@pytest.mark.parametrize('which', ['reuse', 'create'])
+def test_a_message_goes_to_the_configured_backend(which, rr, central, publisher):
+    """THE 11-10 SENDS: REUSE's copy went to aws_rasa:9890, CREATE's to
+    :8443, whatever was set."""
+    post = _answered(200)
+    out = _send(which, rr, post)
     assert _url(post) == BACKEND
+    assert post.call_count == 1
     assert out.startswith('Message sent successfully'), out
+    publisher.assert_not_called()
 
 
-def test_create_posts_to_the_configured_backend(central, publisher, monkeypatch):
-    monkeypatch.setenv('AUTOGEN_RESPONSE_URL', BACKEND)
-    send, post = _lift_create_send()
-    send('cent-2', 'Created your agent.', 'inp', 'p-1')
-    assert _url(post) == BACKEND
+@pytest.mark.parametrize('status', [500, 404])
+@pytest.mark.parametrize('which', ['reuse', 'create'])
+def test_a_refused_message_is_not_reported_delivered(which, status, rr, central,
+                                                     publisher):
+    """Review of 983c98e14: the backend answers 500 when the person has no
+    session there, and both copies said "sent".  The reply now says it was
+    not, and why, and the step is not counted as delivered."""
+    from hartos.lifecycle_hooks import send_delivered
+    out = _send(which, rr, _answered(status))
+    assert out.startswith('Failed to send message'), out
+    assert f'HTTP {status}' in out, out
+    assert send_delivered(out) is False
 
 
-def test_both_copies_post_to_one_url_when_nothing_is_set(rr, central, publisher,
-                                                         monkeypatch):
-    """The drift itself: two copies of one sender, two different URLs."""
+@pytest.mark.parametrize('which', ['reuse', 'create'])
+def test_no_backend_set_sends_nothing_and_names_the_setting(which, rr, central,
+                                                           publisher, monkeypatch):
+    """No default: a guessed URL fails the same quiet way the two dead ones
+    did.  Nothing is posted, and the agent is told which setting is
+    missing."""
     monkeypatch.delenv('AUTOGEN_RESPONSE_URL', raising=False)
-    from hartos.helper import AUTOGEN_RESPONSE_URL_DEFAULT
-    _out, reuse_post = _reuse_send(rr, 'cent-3', 'hello')
-    send, create_post = _lift_create_send()
-    send('cent-4', 'hello', 'inp', 'p-1')
-    assert _url(reuse_post) == _url(create_post) == AUTOGEN_RESPONSE_URL_DEFAULT
+    from core.config_cache import get_autogen_response_url
+    assert get_autogen_response_url() == ''
+    post = _answered(200)
+    out = _send(which, rr, post)
+    post.assert_not_called()
+    assert out.startswith('Failed to send message'), out
+    assert 'AUTOGEN_RESPONSE_URL' in out, out
 
 
-def test_a_blank_setting_falls_back_to_the_default(monkeypatch):
-    from hartos.helper import AUTOGEN_RESPONSE_URL_DEFAULT, autogen_response_url
+def test_a_blank_setting_is_no_setting(monkeypatch):
+    from core.config_cache import get_autogen_response_url
     monkeypatch.setenv('AUTOGEN_RESPONSE_URL', '   ')
-    assert autogen_response_url() == AUTOGEN_RESPONSE_URL_DEFAULT
+    assert get_autogen_response_url() == ''
+
+
+def _free_loopback_server(status):
+    """A real HTTP server on 127.0.0.2 (not 'localhost'/'127.0.0.1', which
+    the shared pool mounts with no retries, so the shared pool's remote
+    retries would apply to it as they do to central's 172.17.0.1).  Returns
+    (server, received bodies) or None when 127.0.0.2 cannot be bound."""
+    received = []
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            n = int(self.headers.get('Content-Length') or 0)
+            received.append(json.loads(self.rfile.read(n) or b'{}'))
+            self.send_response(status)
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+
+        def log_message(self, *_a):
+            pass
+
+    try:
+        server = http.server.HTTPServer(('127.0.0.2', 0), _Handler)
+    except (OSError, socket.error):
+        return None
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, received
+
+
+def test_one_send_reaches_a_struggling_backend_once(rr, central, publisher,
+                                                     monkeypatch):
+    """Review of 983c98e14: one send to a slow backend arrived three times
+    (the shared pool re-sends a POST twice).  A 503 makes the shared pool
+    re-send too, without waiting out a timeout.  The real transport, a real
+    server: one send, one POST, reported not delivered."""
+    up = _free_loopback_server(503)
+    if up is None:
+        pytest.skip('127.0.0.2 cannot be bound here (macOS has only 127.0.0.1)')
+    server, received = up
+    try:
+        monkeypatch.setenv('AUTOGEN_RESPONSE_URL',
+                           f'http://127.0.0.2:{server.server_port}/autogen_response')
+        from unittest.mock import patch
+        with patch.object(rr, 'scheduler') as sched:
+            sched.get_job.return_value = None
+            out = rr.send_message_to_user1('cent-9', 'one message', 'inp', 'p-9')
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert [r.get('message') for r in received] == ['one message']
+    assert out.startswith('Failed to send message'), out
+    assert 'HTTP 503' in out, out
 
 
 def test_centrals_deploy_points_both_starts_at_the_backend():
     """The deploy sets the URL on the HARTOS container's normal start and on
-    the rollback start: a rolled-back central must deliver too."""
+    the rollback start (a rolled-back central must deliver too), and an
+    operator can point it elsewhere."""
     from tests.unit.test_a_deploy_cannot_fill_centrals_disk import (
         _BASH, ADeployCannotFillCentralsDisk, _pairs)
     if not _BASH:
         pytest.skip('no bash: the deploy script cannot run here')
-    want = ('-e', 'AUTOGEN_RESPONSE_URL=' + BACKEND)
     case = ADeployCannotFillCentralsDisk('test_the_hartos_container_starts_with_a_bounded_log')
-    for status_up, n_runs in (('1', 1), ('0', 2)):
+    for status_up, n_runs, extra, url in (
+            ('1', 1, {}, 'http://172.17.0.1:8001/autogen_response'),
+            ('0', 2, {}, 'http://172.17.0.1:8001/autogen_response'),
+            ('1', 1, {'DEPLOY_AUTOGEN_RESPONSE_URL': 'http://10.0.0.5:8001/autogen_response'},
+             'http://10.0.0.5:8001/autogen_response')):
         case.setUp()
         try:
-            code, out, docker = case._deploy(DEPLOY_TEST_STATUS_UP=status_up)
+            code, out, docker = case._deploy(DEPLOY_TEST_STATUS_UP=status_up, **extra)
             runs = case._hartos_runs(docker)
             assert len(runs) == n_runs, out[-3000:]
             for run in runs:
-                assert want in _pairs(run), run
+                assert ('-e', 'AUTOGEN_RESPONSE_URL=' + url) in _pairs(run), run
         finally:
             case.doCleanups()

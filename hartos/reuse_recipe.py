@@ -951,27 +951,25 @@ def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_dela
             f'Local publish to user failed for request_id: {intermediate_request_id}')
         return f'Failed to send message to user with request_id: {original_request_id}'
 
-    # Standalone central HARTOS: forward to the chatbot_pipeline backend,
-    # at the one URL CREATE's copy posts to too.
-    from hartos.helper import autogen_response_url
-    url = autogen_response_url()
-    body = json.dumps({'user_id': user_id, 'message': response, 'inp': inp, 'request_id': intermediate_request_id, 'Agent_status': 'Reuse Mode'})
-    headers = {'Content-Type': 'application/json'}
+    # Standalone central HARTOS: the chatbot_pipeline backend, through the
+    # one send CREATE's copy uses too (sent once, delivered only on a 2xx).
+    from hartos.helper import post_agent_message
+    delivered, why = post_agent_message(
+        {'user_id': user_id, 'message': response, 'inp': inp,
+         'request_id': intermediate_request_id, 'Agent_status': 'Reuse Mode'})
 
     # Tool and scheduler threads call this with no Flask app context, so its
     # logs go through _ctx_safe_log.  With current_app.logger the success log
     # below raised after the POST, the except branch raised again, and the
     # caller was told a message it had sent had failed: central 2026-09-14,
     # 33 of 34 "Working outside of application context" errors.
-    try:
-        res = pooled_post(url, data=body, headers=headers)
-        _ctx_safe_log(
-            'info',
-            f'Message sent with request_id: {intermediate_request_id}, tracking will reset in {reset_tracking_delay}s')
-    except Exception as e:
-        _ctx_safe_log('error', f"Error sending message to user: {e}")
-        return f'Failed to send message to user with request_id: {original_request_id}'
-
+    if not delivered:
+        _ctx_safe_log('error', f"Error sending message to user: {why}")
+        return (f'Failed to send message to user with request_id: '
+                f'{original_request_id}: {why}')
+    _ctx_safe_log(
+        'info',
+        f'Message sent with request_id: {intermediate_request_id}, tracking will reset in {reset_tracking_delay}s')
     return f'Message sent successfully to user with request_id: {original_request_id}'
 
 
@@ -1001,28 +999,6 @@ def _reuse_speaker_says_to_user(user_id, message, prompt_id, inp=''):
     send_message_to_user1(user_id, json_obj['message2userfinal'], inp, prompt_id,
                           media_refs=json_obj.get(MEDIA_REPLY_KEY))
     return True
-
-
-def _reuse_answer_off_box(user_id, answer, prompt_id):
-    """The off-box leg for a /chat turn's finished answer, which the caller
-    RETURNS: the return value IS the reply.
-
-    On the desktop the reply is the answer's ONLY delivery.  get_agent_response
-    used to also hand it to send_message_to_user1, which since 57516f078
-    publishes on the local chat topic there, and the web client renders both
-    (Demopage appends every text on com.hertzai.hevolve.chat.{user_id} and
-    appends the HTTP reply as another bubble, each starting TTS): the answer
-    arrived twice.  CREATE never sends its main-loop answer, and REUSE's
-    post-loop extractor never did either; the out-of-band leg is for messages
-    that have no reply to ride on (a mid-turn question from the
-    send_message_to_user tool, timer and visual results, A2A replies).
-
-    Central keeps the off-box leg it has always had for this answer
-    (send_message_to_user1's chatbot_pipeline POST); whether it needs it is
-    tied to that URL, which is left to the owner.
-    """
-    if not is_bundled():
-        send_message_to_user1(user_id, answer, '', prompt_id)
 
 
 def _coerce_instruction_text(value) -> str:
@@ -7129,15 +7105,26 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                         # Nunba's empty-reply check then rerouted the user to
                         # the tool-less Tier-2 fallback, which answered from
                         # training data and contradicted the work this agent
-                        # had just done and saved (#797/D31, #803/D37).  What
-                        # else the answer is sent through, and why the desktop
-                        # gets nothing else: _reuse_answer_off_box.
+                        # had just done and saved (#797/D31, #803/D37).
+                        #
+                        # The reply is the answer's ONLY delivery, on every
+                        # node; send_message_to_user1 is for messages with no
+                        # reply to ride on (a mid-turn question from the
+                        # send_message_to_user tool, timer and visual results,
+                        # A2A replies), the rule CREATE's main loop and the
+                        # post-loop extractor already follow.  On the desktop
+                        # a second send published the answer on the chat topic
+                        # and the web client showed and spoke it twice (review
+                        # of 57516f078).  On central the second send POSTed it
+                        # to the chatbot_pipeline backend, whose /custom_gpt
+                        # already publishes the reply (review of 983c98e14);
+                        # that POST went to a dead host until 983c98e14, so no
+                        # person ever received it, and it stays off.  The
+                        # owner may turn it on.
                         _reuse_hold_ask_at_turn_exit(
                             user_prompt, group_chat,
                             returned_text=json_obj['message2userfinal'])
                         _carry_reply_media(user_id, json_obj, prompt_id, request_id)
-                        _reuse_answer_off_box(
-                            user_id, json_obj['message2userfinal'], prompt_id)
                         return json_obj['message2userfinal']
                 except Exception as e:
                     current_app.logger.error(f"Error extracting JSON: {e}")
@@ -7153,7 +7140,6 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                         # message2user was handed over as its JSON envelope.
                         _reuse_hold_ask_at_turn_exit(
                             user_prompt, group_chat, returned_text=json_obj[_key])
-                        _reuse_answer_off_box(user_id, json_obj[_key], prompt_id)
                         return json_obj[_key]
                 except Exception as e:
                     current_app.logger.error(f"Error extracting JSON: {e}")
