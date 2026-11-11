@@ -8823,6 +8823,17 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
     uses handles the review verdict at zero marginal cost.
     """
     from hartos.gather_agentdetails import gather_info
+    # Background or a person's own turn is the turn's request id's to say
+    # (dispatch.is_genuine_user_request, mirrored by core.chat_client
+    # .is_user_turn), not the caller's flag: Nunba sends 'autonomous' on a
+    # person's own forced create, and that branch passed background=True, so
+    # the person read "Waiting for the person: The plan ... waits for your
+    # approval" (review of 1c45e6829, probe p6); the reuse-route and
+    # Create_Agent sites passed none, so a daemon's create there counted its
+    # hold as work (probe p8).  A caller with no request id keeps its flag.
+    if request_id is not None:
+        from core.chat_client import is_user_turn
+        background = not is_user_turn({'request_id': request_id})
     # A plan of this id waiting on its creator's card is answered first.
     _held = _held_plan_turn(user_id, prompt_id, background, request_id)
     if _held is not None and _held[0] == 'reply':
@@ -10804,7 +10815,8 @@ def chat():
             # Reuse prompt_id from Plan Mode response if available
             new_prompt_id = _creation_prompt_id(
                 user_id, prompt_id if prompt_id else _next_prompt_id())
-            auto_response = _autonomous_gather_info(user_id, prompt, new_prompt_id)
+            auto_response = _autonomous_gather_info(user_id, prompt, new_prompt_id,
+                                                    request_id=request_id)
             _ak = f'{user_id}_{new_prompt_id}'
             review_agents[_ak] = True
             _touch_agent_timestamp(_ak)
@@ -11831,7 +11843,8 @@ def chat():
                 if is_auto:
                     # Autonomous: run gather_info with LLM-generated answers
                     new_prompt_id = _creation_prompt_id(user_id, new_prompt_id)
-                    auto_response = _autonomous_gather_info(user_id, agent_desc, new_prompt_id)
+                    auto_response = _autonomous_gather_info(user_id, agent_desc, new_prompt_id,
+                                                            request_id=request_id)
                     _ak_new = f'{user_id}_{new_prompt_id}'
                     review_agents[_ak_new] = True
                     _touch_agent_timestamp(_ak_new)
@@ -11987,7 +12000,8 @@ def chat():
         if is_autonomous:
             # Autonomous: run gather_info with LLM-generated answers
             new_prompt_id = _creation_prompt_id(user_id, new_prompt_id)
-            auto_response = _autonomous_gather_info(user_id, agent_description, new_prompt_id)
+            auto_response = _autonomous_gather_info(user_id, agent_description, new_prompt_id,
+                                                    request_id=request_id)
             _ak_new = f'{user_id}_{new_prompt_id}'
             review_agents[_ak_new] = True
             _touch_agent_timestamp(_ak_new)

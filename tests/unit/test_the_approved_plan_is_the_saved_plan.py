@@ -672,6 +672,44 @@ def test_a_persons_hold_reply_reads_as_written(run):
     assert reply.startswith('The plan for Syllable Coach')
 
 
+def test_a_persons_own_turn_sent_autonomous_is_a_persons_turn(run):
+    """Review of 1c45e6829, probe p6: Nunba sends 'autonomous' on a person's
+    own forced create, that branch passed background=True, and the person
+    read "Waiting for the person: The plan ... waits for your approval".
+    The turn's request id says it is the person's own."""
+    from core.agent_tools import is_waiting_for_person
+    from core.prompt_files import held_plan
+    _oscillate(run)
+    reply = run.call(background=True, request_id='1762822187123')
+    assert not is_waiting_for_person(reply), reply
+    assert reply.startswith('The plan for Syllable Coach'), reply
+    assert str(held_plan(USER)) == str(PID)        # kept for the person's next create
+
+
+def test_a_daemon_turn_where_no_flag_was_passed_still_waits(run):
+    """Probe p8: the reuse-route create signal and the Create_Agent tool
+    passed no background flag, so a daemon's create there answered the bare
+    hold sentence and dispatch counted it as work."""
+    from core.agent_tools import is_waiting_for_person
+    _oscillate(run)
+    reply = run.call(user='daemon-persona', request_id='daemon_g1')
+    assert is_waiting_for_person(reply), reply
+
+
+def test_source_guard_every_create_site_passes_its_turns_request_id(hie):
+    """Background is decided from the request id inside
+    _autonomous_gather_info, so every site must hand it the id.  A source
+    guard (CLAUDE.md Gate 5): the behaviour is pinned by the two tests above;
+    this keeps a fifth create site from being added without the id."""
+    import inspect
+    import re
+    src = inspect.getsource(hie)
+    calls = re.findall(r"(?<!def )_autonomous_gather_info\(user_id,[^)]*\)", src)
+    assert len(calls) == 4, calls
+    for call in calls:
+        assert 'request_id=request_id' in call, call
+
+
 def test_an_approved_plan_that_cannot_be_built_is_never_handed_to_the_planner(run):
     """Probe P4: approve on a staged plan with no buildable step cleared the
     hold, sent 'proceed' to the planner and saved its new, longer answer."""
