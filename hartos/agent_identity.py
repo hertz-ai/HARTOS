@@ -285,9 +285,17 @@ def build_identity_prompt(agent_config: Optional[dict] = None,
         agent_goal = agent_config.get('goal', '')
 
         if personality:
+            # One spoken name for the agent, the one the personality block
+            # says too (core.agent_personality.spoken_name): never its
+            # internal id, and the saved greeting says the same name.
+            from core.agent_personality import spoken_greeting, spoken_name
+            _who = dict(personality)
+            _who.setdefault('agent_name', agent_config.get('agent_name', ''))
+            display = agent_name
+            agent_name = spoken_name(_who, display)
             traits = personality.get('primary_traits', [])
             tone = personality.get('tone', 'warm-casual')
-            greeting = personality.get('greeting_style', '')
+            greeting = spoken_greeting(_who, display)
 
             parts.append(
                 f"\nYour name is {agent_name}. Your purpose: {agent_goal}."

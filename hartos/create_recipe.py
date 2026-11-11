@@ -1131,6 +1131,10 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
             _agent_personality = generate_personality(str(_role), str(_goal), _agent_name)
             save_personality(str(prompt_id), _agent_personality)
             tool_logger.info(f"Generated personality '{_agent_personality.persona_name}' for prompt {prompt_id}")
+        # The agent speaks the name the person gave it, never its internal id
+        # (core.agent_personality.spoken_name); the saved file is unchanged.
+        from core.agent_personality import with_spoken_name
+        _agent_personality = with_spoken_name(_agent_personality, config.get('name', ''))
     except Exception as e:
         tool_logger.warning(f"Personality generation skipped: {e}")
 

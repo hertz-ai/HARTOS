@@ -1895,6 +1895,11 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
         from core.agent_personality import load_personality, build_personality_prompt, build_proactive_vision_prompt
         _saved_personality = load_personality(str(prompt_id))
         if _saved_personality:
+            # The agent speaks the name the person gave it, never its
+            # internal id (core.agent_personality.spoken_name; live
+            # 2026-11-10 it opened "I'm skill.local.syllable_coach").
+            from core.agent_personality import with_spoken_name
+            _saved_personality = with_spoken_name(_saved_personality, config.get('name', ''))
             # Load resonance profile for continuous personality tuning
             _resonance_profile = None
             try:
