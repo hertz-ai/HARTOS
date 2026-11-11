@@ -408,9 +408,10 @@ def _validate_consent_type(consent_type: str):
 
 _AGENT_ID_RE = re.compile(r'[A-Za-z0-9_-]+')
 
-#: The placeholder the agent mirror builds from an id ("Agent <id>",
-#: "agent-<id>"), for ANY id: six digits or more, so "Agent 7" stays a name.
-_PLACEHOLDER_NAME_RE = re.compile(r'agent[ -]\d{6,}', re.IGNORECASE)
+#: The placeholder the agent mirrors build from an id ("Agent <id>",
+#: "agent-<id>", and agent_bridge's "agent_<id>_<n>"), for ANY id: six
+#: digits or more, so "Agent 7" stays a name.
+_PLACEHOLDER_NAME_RE = re.compile(r'agent[ _-]\d{6,}(?:_\d+)?', re.IGNORECASE)
 
 
 def known_agent_id(agent_id):
@@ -497,9 +498,14 @@ def agent_as_asker(name: str) -> str:
     """How a card names an AGENT that asks: 'Agent <name>'.  An agent may
     carry a person's name ("Vijai"), and "Vijai asks you" read as another
     person asking (owner 2026-11-11: "why does the question appear like
-    another user asking question instead of qualifying as agent").  The one
-    wording for the ask card (person_ask) and the consent push; a PERSON who
-    asks (a device ask's requester_name) keeps their own name."""
+    another user asking question instead of qualifying as agent").  The
+    wording for the ask card (person_ask), the consent push and the
+    computer-control reason (vlm.safety); a PERSON who asks (a device ask's
+    requester_name, a join request) keeps their own name.  A name that
+    already says it ("Agent Smith") is not prefixed twice."""
+    name = str(name or '').strip()
+    if re.match(r'agent\b', name, re.IGNORECASE):
+        return name
     return f'Agent {name}'
 
 

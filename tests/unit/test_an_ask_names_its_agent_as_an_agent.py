@@ -53,9 +53,11 @@ def _agent_named(agent_id, name, username=None):
                         api_token='tok-' + agent_id))
 
 
-def _ask(agent):
+def _ask(agent, person='10202'):
+    """A background ask; a person holds at most 3 open (person_ask), so a
+    test past the third asks someone else."""
     from integrations.agent_engine import person_ask
-    return person_ask.ask('10202', agent, dict(AS_SENT), prompt_id=agent,
+    return person_ask.ask(person, agent, dict(AS_SENT), prompt_id=agent,
                           background=True)
 
 
@@ -119,10 +121,78 @@ def test_an_unnamed_asker_stays_an_agent():
     assert push['title'] == 'An agent needs your OK'
 
 
+def test_a_name_that_already_says_agent_is_not_doubled(legs):
+    """Review of 11dbbd8ef, m1: 'Agent Agent Smith asks you'."""
+    _agent_named('93731340725', 'Agent Smith')
+    out = _ask('93731340725', person='10203')
+    assert out['ok'] is True, out
+    _agent, card, _user = legs['cards'][-1]
+    assert card['title'] == 'Agent Smith asks you'
+
+
+def test_the_bridge_placeholder_is_no_name(legs):
+    """Review of 11dbbd8ef, m2: agent_bridge's mirrors carry 'agent_<id>_<n>'
+    (303 of 322 local mirrors), which reached a card as a name."""
+    _agent_named('27130929014_0', 'agent_27130929014_0', username='agent_27130929014_0')
+    out = _ask('27130929014_0', person='10204')
+    assert out['ok'] is True, out
+    _agent, card, _user = legs['cards'][-1]
+    assert card['title'] == 'Your agent needs your answer'
+
+
+def test_the_consent_push_names_the_agent_when_the_scrub_cannot_run(monkeypatch):
+    """The reason is dropped when the egress scrub fails; the agent stays an
+    agent in what replaces it (review of 11dbbd8ef, surviving mutant M11)."""
+    import security.edge_privacy as ep
+    from integrations.social.consent_service import consent_prompt_push
+
+    def _broken(_text):
+        raise RuntimeError('scrub down')
+    monkeypatch.setattr(ep, 'scrub_text', _broken)
+    push = consent_prompt_push({'user_id': '10202', 'agent_name': 'Vijai',
+                                'consent_type': 'camera', 'reason': 'see the desk'}, 'r4')
+    assert push['body'] == 'Agent Vijai asks for camera.'
+
+
+def test_the_computer_control_ask_names_the_agent_not_its_id():
+    """Review of 11dbbd8ef, m4: the reason read 'Agent 70264903070 asks to
+    control this computer.' on the push and the desktop card."""
+    from integrations.vlm import safety
+    _agent_named(VIJAI, 'Vijai')
+    covers = safety.COMPUTER_CONTROL_COVERS
+    assert safety._computer_control_reason(VIJAI) == f'Agent Vijai asks to {covers}.'
+    # No name kept for it: no bare id either.
+    assert safety._computer_control_reason('93731340799') == (
+        f'One of your agents asks to {covers}.')
+    assert safety._computer_control_reason(None) == (
+        f'An agent that could not be identified asks to {covers}.')
+
+
+def test_the_computer_control_block_files_the_named_reason(monkeypatch):
+    """The reason the owner's ask carries comes from that one place."""
+    from integrations.vlm import safety
+    _agent_named(VIJAI, 'Vijai')
+    monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', '10202')
+    filed = []
+
+    def _answer(owner, agent, reason):
+        filed.append(reason)
+        return None                      # not answered yet
+    monkeypatch.setattr(safety, '_computer_control_answer', _answer)
+    out = safety.computer_control_block(VIJAI, wait=False)
+    assert out and out.startswith('Not run'), out
+    assert filed == [f'Agent Vijai asks to {safety.COMPUTER_CONTROL_COVERS}.']
+
+
 def test_placeholders_of_any_id_are_not_names():
     from integrations.social import consent_service as cs
     assert cs._is_a_name('Agent 69922589936', '93731340723') is False
     assert cs._is_a_name('agent-1793366231447', '93731340723') is False
+    assert cs._is_a_name('agent_27130929014_0', '27130929014_0') is False
+    # Six digits is a placeholder (surviving mutant M12: seven) ...
+    assert cs._is_a_name('Agent 123456', VIJAI) is False
+    # ... but only as the whole name (surviving mutant M8: a search).
+    assert cs._is_a_name('Backup of Agent 1234567', VIJAI) is True
     # Real names stay names, digits and all.
     assert cs._is_a_name('Vijai', VIJAI) is True
     assert cs._is_a_name('Agent Smith', VIJAI) is True

@@ -659,7 +659,10 @@ def _reuse_join_card(user_id, prompt_id, name):
     person, agent = _reuse_join_names(user_id, prompt_id)
     who = f'{person} (user {user_id})' if person else f'User {user_id}'
     which = f'{agent} (agent {prompt_id})' if agent else f'agent {prompt_id}'
+    # Its own title: a PERSON asks here, so the ask card must not title it
+    # with the agent ("Agent Vijai asks you"; review of 11dbbd8ef, M2).
     return {'type': 'approval', 'action': f'join_chat:{prompt_id}:{user_id}',
+            'title': f'{who} asks to join your chat',
             'description': (f'{who} asks to join your chat with {which} as {name}. '
                             f'If you allow it, they can talk with this agent in your chat '
                             f'and move your chat to another of its flows. It is for this '

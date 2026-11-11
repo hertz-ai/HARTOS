@@ -394,6 +394,23 @@ def test_the_join_card_says_who_by_name_and_id_and_for_which_agent(rr, pr):
         f'User {THERAPIST} asks to join your chat with agent {OTHER_P} as Therapist.')
 
 
+def test_the_join_card_is_titled_by_the_person_who_asks(rr, pr):
+    """Review of 11dbbd8ef, M2: a card with no title of its own is titled
+    'Agent <name> asks you' by person_ask, so a PERSON's join request read as
+    the agent asking ("Agent Speech Coach asks you")."""
+    from integrations.social.models import User, db_session
+    with db_session() as db:
+        db.add(User(id=PARENT, username='priya_k', display_name='Priya', user_type='human'))
+        db.add(User(id='agent-row-77', username='speech_coach_77', display_name='Speech Coach',
+                    user_type='agent', agent_id=str(P)))
+    # person_ask keeps a component's own title (it names the agent only when
+    # the card brings none), so this is the title the creator sees.
+    assert rr._reuse_join_card(PARENT, P, 'Parent')['title'] == (
+        f'Priya (user {PARENT}) asks to join your chat')
+    assert rr._reuse_join_card(THERAPIST, OTHER_P, 'Therapist')['title'] == (
+        f'User {THERAPIST} asks to join your chat')
+
+
 def test_get_role_finds_a_joiners_role_through_the_grant(rr, pr):
     rr.agents_session[f'{CHILD}_{P}'] = [
         {'agentInstanceID': 'x', 'user_id': CHILD, 'role': 'Child', 'deviceID': 'something'},
