@@ -3832,12 +3832,20 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
         return _json.dumps({'res': []})
 
 def parse_date(date_str):
-    return datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%S")
+    """A caption row's created_date, read as core.user_context reads it.
+    Nunba writes '2026-11-11T00:19:47.146774+00:00'; the old
+    strptime("%Y-%m-%dT%H:%M:%S") refused it ("unconverted data remains"),
+    so the camera tool, the screen tool and the visual-history search raised
+    on every desktop caption (review of HARTOS 3622c8310).  A bare
+    '2026-11-11T00:19:47' reads as before."""
+    from core.user_context import parse_date as _parse_stamp
+    return _parse_stamp(date_str)
 
 def get_visual_context(user_id,mins=5):
     '''
         This function help to extract action that user have perfomed till time
     '''
+    from core.user_context import _age, CAMERA_WINDOW_MAX_CAPTIONS
     # action_url = f"{ACTION_API}?user_id={user_id}"
     action_url = get_visual_context_api(user_id, mins)
     # Todo: get, and populate timezone from client
@@ -3862,15 +3870,16 @@ def get_visual_context(user_id,mins=5):
             date = parse_date(obj["created_date"])
             gpt3_label = obj["gpt3_label"]
             if gpt3_label == 'Visual Context':
-                now = datetime.now()
-                # Check if the action is older than 5 minutes
-                if (now - date) > timedelta(minutes=mins):
+                # Older than `mins`, each stamp read in its own zone
+                # (core.user_context._age: a UTC stamp against the UTC clock).
+                if _age(date) > timedelta(minutes=mins):
                     continue
             first_action_text = f"{action} on {date.astimezone(india_tz).strftime('%Y-%m-%dT%H:%M:%S')}"
 
             video_context_texts.append(first_action_text)
         if video_context_texts:
-            return video_context_texts[:10]
+            # The store answers newest first (Nunba get_visual_bymins).
+            return video_context_texts[:CAMERA_WINDOW_MAX_CAPTIONS]
         else:
             return None
     else:
@@ -3896,11 +3905,11 @@ def get_screen_context(user_id, mins=2):
         filtered_data_screen = [
             obj for obj in data if obj["zeroshot_label"] == 'Screen Reasoning']
         screen_context_texts = []
+        from core.user_context import _age
         for obj in filtered_data_screen:
             action = obj["action"]
             date = parse_date(obj["created_date"])
-            now = datetime.now()
-            if (now - date) > timedelta(minutes=mins):
+            if _age(date) > timedelta(minutes=mins):
                 continue
             screen_text = f"{action} on {date.astimezone(india_tz).strftime('%Y-%m-%dT%H:%M:%S')}"
             screen_context_texts.append(screen_text)
@@ -3929,6 +3938,7 @@ def search_visual_history(user_id, query, mins=30, channel='both'):
     if response.status_code != 200:
         return None
 
+    from core.user_context import _age
     data = response.json()
     query_lower = query.lower()
     results = []
@@ -3949,8 +3959,7 @@ def search_visual_history(user_id, query, mins=30, channel='both'):
             continue
 
         date = parse_date(obj["created_date"])
-        now = datetime.now()
-        if (now - date) > timedelta(minutes=mins):
+        if _age(date) > timedelta(minutes=mins):
             continue
 
         ch = 'camera' if label == 'Video Reasoning' else 'screen'

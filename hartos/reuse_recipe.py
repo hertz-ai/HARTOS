@@ -1110,8 +1110,15 @@ def call_visual_task(task_description: str, user_id: int, prompt_id: int):
             for obj in api_data:
                 if obj.get("zeroshot_label") == 'Video Reasoning':
                     try:
-                        # Parse the created_date (assuming UTC)
-                        created_date = datetime.strptime(obj["created_date"], "%Y-%m-%dT%H:%M:%S")
+                        # Parse the created_date (a bare stamp is UTC, as
+                        # before).  Nunba writes '...146774+00:00', which
+                        # strptime refused, so no desktop caption ever
+                        # counted and the visual task never ran (review of
+                        # 3622c8310): a stamp naming its zone is read in it.
+                        from core.user_context import parse_date as _parse_stamp
+                        created_date = _parse_stamp(obj["created_date"])
+                        if created_date.tzinfo is not None:
+                            created_date = created_date.astimezone(pytz.utc).replace(tzinfo=None)
 
                         # Check if within last 5 minutes
                         time_diff = now_utc - created_date

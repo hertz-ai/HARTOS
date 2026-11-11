@@ -91,3 +91,115 @@ def test_a_stamp_without_a_zone_is_read_as_local_time_as_before(ist):
 def test_the_screen_window_reads_utc_stamps_too(ist):
     assert SCREEN_START in uc._format_action_rich([_caption(_utc(1), 'screen')])
     assert SCREEN_START not in uc._format_action_rich([_caption(_utc(3), 'screen')])
+
+
+def _nunba(minutes_ago, offset=timedelta(0)):
+    """A stamp as Nunba writes it, microseconds and a zone
+    ('2026-11-10T23:59:00.146774+00:00'), in the zone ``offset``."""
+    when = UTC_NOW - timedelta(minutes=minutes_ago) + timedelta(microseconds=146774)
+    return when.astimezone(timezone(offset)).isoformat()
+
+
+def test_a_stamp_in_another_zone_is_read_in_that_zone(ist):
+    """Review of 3622c8310, mutant M3d (every zone read as UTC) survived:
+    ten minutes ago written in IST is stale, one minute ago written at
+    UTC-4 is fresh."""
+    assert CAMERA_START not in uc._format_action_rich(
+        [_caption(_nunba(10, timedelta(hours=5, minutes=30)))])
+    assert CAMERA_START in uc._format_action_rich(
+        [_caption(_nunba(1, timedelta(hours=-4)))])
+
+
+# ── The other readers of the same rows (review of 3622c8310) ───────────────
+#
+# hartos.helper's camera tool (get_visual_context, behind reuse's
+# get_user_camera_inp_by_mins), screen tool and visual-history search, and
+# reuse_recipe's visual poll, parsed created_date with
+# strptime("%Y-%m-%dT%H:%M:%S"): every caption Nunba writes raised
+# "unconverted data remains: .146774+00:00", so on a desktop the agent's camera
+# tool raised and the visual task never ran.
+
+
+class _Reply:
+    status_code = 200
+
+    def __init__(self, rows):
+        self._rows = rows
+
+    def json(self):
+        return self._rows
+
+
+@pytest.fixture
+def store(monkeypatch):
+    from hartos import helper
+    rows = []
+    monkeypatch.setattr(helper, 'get_visual_context_api',
+                        lambda user_id, mins=5: 'http://store/get_visual_bymins')
+    monkeypatch.setattr(helper, 'pooled_request', lambda *a, **k: _Reply(rows))
+    return helper, rows
+
+
+def test_the_camera_tool_answers_from_nunba_stamps(ist, store):
+    helper, rows = store
+    rows += [_caption(_nunba(1)), _caption(_nunba(10))]
+    assert helper.get_visual_context('child-1', 5) == [
+        'A brown square sits on a beige surface. on 2026-11-11T05:29:00']
+
+
+def test_the_camera_tool_keeps_the_newest_captions_by_the_one_cap(ist, store):
+    """The store answers newest first (Nunba get_visual_bymins); the tool keeps
+    CAMERA_WINDOW_MAX_CAPTIONS of them, the same cap as the camera window."""
+    helper, rows = store
+    rows += [dict(_caption(_nunba(n / 10)), action=f'scene {n}') for n in range(13)]
+    got = helper.get_visual_context('child-1', 5)
+    assert [line.split(' on ')[0] for line in got] == [
+        f'scene {n}' for n in range(uc.CAMERA_WINDOW_MAX_CAPTIONS)]
+
+
+def test_the_screen_tool_and_the_history_search_read_nunba_stamps(ist, store):
+    helper, rows = store
+    rows += [_caption(_nunba(1), 'screen'), _caption(_nunba(3), 'screen'),
+             _caption(_nunba(1))]
+    assert helper.get_screen_context('child-1', 2) == ['a code editor on 2026-11-11T05:29:00']
+    assert helper.search_visual_history('child-1', 'brown', 30, 'camera') == [
+        '[camera] A brown square sits on a beige surface. at 2026-11-11T05:29:00']
+
+
+@pytest.fixture
+def poll(monkeypatch):
+    from hartos import reuse_recipe as rr
+    rows, posted = [], []
+    monkeypatch.setattr(rr, 'ACTION_API', 'http://store/create_action')
+    monkeypatch.setattr(rr, '_visual_poll_paused_until', {})
+    monkeypatch.setattr(rr, 'pooled_request', lambda *a, **k: _Reply(rows))
+    monkeypatch.setattr(rr, 'pooled_post',
+                        lambda url, data=None, headers=None: posted.append(data) or _Reply([]))
+    return rr, rows, posted
+
+
+def _real(minutes_ago, offset=timedelta(0)):
+    """The poll reads the real clock: a stamp ``minutes_ago`` from now."""
+    when = datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)
+    return when.astimezone(timezone(offset)).isoformat(timespec='microseconds')
+
+
+def test_the_visual_poll_runs_on_a_fresh_nunba_caption(poll):
+    rr, rows, posted = poll
+    rows.append(_caption(_real(1)))
+    assert rr.call_visual_task('look at the child', 7, 42) == 'done'
+    assert len(posted) == 1
+
+
+def test_the_visual_poll_reads_a_stamp_in_its_own_zone(poll):
+    rr, rows, posted = poll
+    rows.append(_caption(_real(10, timedelta(hours=5, minutes=30))))
+    assert rr.call_visual_task('look at the child', 7, 42) is None
+    assert posted == []
+
+
+def test_the_visual_poll_still_reads_a_bare_stamp_as_utc(poll):
+    rr, rows, posted = poll
+    bare = (datetime.now(timezone.utc) - timedelta(minutes=1)).strftime('%Y-%m-%dT%H:%M:%S')
+    rows.append(_caption(bare))
+    assert rr.call_visual_task('look at the child', 7, 42) == 'done'

@@ -95,6 +95,12 @@ DEFAULT_BUDGET_SECONDS = 1.5
 #: the session that's driving the UI.
 MAX_CACHED_USERS = 256
 
+#: The newest camera captions any one read hands the model: the camera
+#: tool (hartos.helper.get_visual_context, its old ``[:10]``) and the
+#: five-minute camera window below.  A busy scene writes a caption every
+#: 4 s, 73 in five minutes (2,276 tokens; review of HARTOS 65ffa46b7).
+CAMERA_WINDOW_MAX_CAPTIONS = 10
+
 #: Actions the agent system produces as noise during training and
 #: should not be echoed back to the LLM as "past user actions".
 _UNWANTED_ACTIONS = frozenset([
