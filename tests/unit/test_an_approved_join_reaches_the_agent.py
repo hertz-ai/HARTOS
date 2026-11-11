@@ -233,6 +233,85 @@ def test_a_join_that_could_not_be_saved_keeps_the_approval_and_tries_again(rr, a
     assert rr.get_role(PARENT, P) == 'Parent' and len(asks.sent) == 1
 
 
+# -- R4: the turn that asks to join builds nothing -------------------------
+# Live 2026-11-11 05:34 IST (build 71, agent 1793366231447): the father's
+# persona chat asked the child's side (update_persona with new=False), the
+# chat ended on TERMINATE and the same turn built his own session; his next
+# turn skipped the join check (it runs only before a session exists), so the
+# child's yes was never read and the join stayed pending.
+
+class _AskingRoleGroup(_RoleGroup):
+    """The persona chat whose model picks 'Parent' for an existing chat: the
+    Helper runs update_persona(new=False), which asks the child's side, and
+    the chat ends on TERMINATE."""
+
+    def __init__(self, rr):
+        super().__init__()
+        self.rr = rr
+
+    def initiate_chat(self, manager, message=None, **_k):
+        self.calls.append(message)
+        self.messages.append({'role': 'user', 'content': message})
+        self.messages.append({'role': 'tool', 'content': self.rr._reuse_ask_to_join(
+            PARENT, P, 'Parent', CHILD)})
+        self.messages.append({'role': 'assistant', 'name': 'assistant', 'content': 'TERMINATE'})
+
+
+def _asking_from_the_persona_group(rr):
+    group = _AskingRoleGroup(rr)
+    rr.user_journey[PKEY] = 'Roles'
+    rr.role_agents[PKEY] = (object(), group, group, object(), object(), False)
+    return group
+
+
+def test_the_turn_that_asks_to_join_says_it_waits_and_builds_nothing(rr, asks, turn):
+    from core.flow_progress import pending_join
+    _child_chat(rr)
+    group = _asking_from_the_persona_group(rr)
+    reply = turn('Parent. Please add me to my son\'s chat, user id u-child')
+    assert len(group.calls) == 1 and len(asks.sent) == 1
+    assert str(reply).startswith('Still waiting for the account holder of u-child')
+    assert turn.built == []                                    # no session of his own
+    assert pending_join(PARENT, P)['ask_id'] == 'ask-1'
+    assert [m['user_id'] for m in rr.agents_session[f'{CHILD}_{P}']] == [CHILD]
+
+
+def test_the_childs_yes_after_the_asking_turn_joins_on_the_next_message(rr, asks, turn):
+    from core.flow_progress import pending_join
+    _child_chat(rr)
+    group = _asking_from_the_persona_group(rr)
+    turn('Parent. Please add me to my son\'s chat, user id u-child')
+    asks.state = APPROVED
+    assert turn('Has my son allowed me to join?', 'msg_6_parent') is None
+    assert [m['user_id'] for m in rr.agents_session[f'{CHILD}_{P}']] == [CHILD, PARENT]
+    assert rr.get_role(PARENT, P) == 'Parent' and pending_join(PARENT, P) is None
+    assert turn.built == ['create_schedule', 'create_agents_for_user']   # built once, as a member
+    assert len(group.calls) == 1 and len(asks.sent) == 1
+
+
+def test_a_yes_already_given_when_the_persona_chat_ends_joins_in_that_turn(rr, asks, turn):
+    from core.flow_progress import pending_join
+    _child_chat(rr)
+    _asking_from_the_persona_group(rr)
+    asks.state = APPROVED                                      # answered before the chat ended
+    assert turn('Parent. Please add me to my son\'s chat, user id u-child') is None
+    assert [m['user_id'] for m in rr.agents_session[f'{CHILD}_{P}']] == [CHILD, PARENT]
+    assert pending_join(PARENT, P) is None
+    assert turn.built == ['create_agents_for_user']           # the turn goes on as a member
+
+
+def test_a_persona_chat_that_picked_a_new_chat_still_builds_the_session(rr, asks, turn):
+    class _NewChatGroup(_RoleGroup):
+        def initiate_chat(self, manager, message=None, **_k):
+            self.calls.append(message)
+            self.messages.append({'role': 'assistant', 'name': 'assistant', 'content': 'TERMINATE'})
+    group = _NewChatGroup()
+    rr.user_journey[PKEY] = 'Roles'
+    rr.role_agents[PKEY] = (object(), group, group, object(), object(), False)
+    assert turn('Parent, a new chat') is None
+    assert turn.built == ['create_agents_for_user'] and asks.sent == []
+
+
 # -- R3: an older run judged late never moves the child back ---------------
 
 @pytest.fixture

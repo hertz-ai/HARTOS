@@ -9219,6 +9219,16 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
             if helper_fun.pause_requested():
                 return helper_fun.answer_the_pause(
                     user_prompt, None, 'reuse persona selection')
+            # A join this chat asked for waits on the child's side: the turn
+            # says so and builds nothing, so the joiner's next turn reads the
+            # answer.  Live 2026-11-11 (build 71): the asking turn went on to
+            # build the father's own session, his next turn skipped the join
+            # check (it runs only before a session exists) and the child's yes
+            # was never read.  A yes already given joins here and the turn
+            # goes on as a member, as the cold path does.
+            _join_reply = _reuse_pending_join_turn(user_id, prompt_id)
+            if _join_reply:
+                return _join_reply
             # Print the chat summary
             current_app.logger.info("\n=== Chat Summary ===")
             # current_app.logger.info(result.summary)
