@@ -1690,6 +1690,10 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
     with open(helper_fun.safe_prompt_path(prompt_id), 'r') as f:
         config = json.load(f)
         goal = config['goal']
+        # The name the person gave the agent, kept here: ``config`` is
+        # reassigned to each per-action file below, and the spoken name read
+        # it there (review of 4b9ba08ad: REUSE said a hash-picked name).
+        agent_display_name = config.get('name', '')
         # Optional semantic tags stamped on the agent record at creation
         # (Lever 2, owner 2026-09-01).  Absent on legacy records — the
         # gate below then resolves to pure detection, exactly as before.
@@ -1885,7 +1889,8 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
             # internal id (core.agent_personality.spoken_name; live
             # 2026-11-10 it opened "I'm skill.local.syllable_coach").
             from core.agent_personality import with_spoken_name
-            _saved_personality = with_spoken_name(_saved_personality, config.get('name', ''))
+            _saved_personality = with_spoken_name(_saved_personality, agent_display_name,
+                                                  agent_id=prompt_id)
             # Load resonance profile for continuous personality tuning
             _resonance_profile = None
             try:

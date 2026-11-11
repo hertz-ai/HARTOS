@@ -408,12 +408,6 @@ def _validate_consent_type(consent_type: str):
 
 _AGENT_ID_RE = re.compile(r'[A-Za-z0-9_-]+')
 
-#: The placeholder the agent mirrors build from an id ("Agent <id>",
-#: "agent-<id>", and agent_bridge's "agent_<id>_<n>"), for ANY id: six
-#: digits or more, so "Agent 7" stays a name.
-_PLACEHOLDER_NAME_RE = re.compile(r'agent[ _-]\d{6,}(?:_\d+)?', re.IGNORECASE)
-
-
 def known_agent_id(agent_id):
     """The asking agent's id for a consent row, or None when no agent is
     known.
@@ -432,18 +426,15 @@ def _is_a_name(name, aid):
     """False for the placeholders the agent mirror manufactures when a
     prompt has no name ("Agent <id>", "agent-<id>", hart_intelligence_entry
     _create_social_agent_from_prompt :10993/:11005) and for the bare id:
-    those are the identifier the owner cannot read, dressed as a name.
-    Exact matches only: a real name may contain a digit sequence that
-    happens to be a short id ("Studio 1 Assistant" with id 1).  The same
-    placeholder built from ANOTHER id is no name either: measured on central
-    2026-11-10, agent 93731340723's mirror carried "Agent 69922589936" and
-    the owner's card read "Agent 69922589936 asks you"."""
-    name = (name or '').strip()
-    if not name or name == aid:
-        return False
-    if name.lower() in (f'agent {aid}'.lower(), f'agent-{aid}'.lower()):
-        return False
-    return _PLACEHOLDER_NAME_RE.fullmatch(name) is None
+    those are the identifier the owner cannot read, dressed as a name.  The
+    same placeholder built from ANOTHER id is no name either: measured on
+    central 2026-11-10, agent 93731340723's mirror carried "Agent
+    69922589936" and the owner's card read "Agent 69922589936 asks you".
+
+    The rule itself is core.agent_personality.is_a_name, the one name rule
+    the agent's own spoken name reads too (review of 4b9ba08ad)."""
+    from core.agent_personality import is_a_name
+    return is_a_name(name, aid)
 
 
 def agent_display_name(db, agent_id):

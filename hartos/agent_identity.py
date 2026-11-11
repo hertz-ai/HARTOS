@@ -292,10 +292,11 @@ def build_identity_prompt(agent_config: Optional[dict] = None,
             _who = dict(personality)
             _who.setdefault('agent_name', agent_config.get('agent_name', ''))
             display = agent_name
-            agent_name = spoken_name(_who, display)
+            _aid = agent_config.get('prompt_id', '')
+            agent_name = spoken_name(_who, display, _aid)
             traits = personality.get('primary_traits', [])
             tone = personality.get('tone', 'warm-casual')
-            greeting = spoken_greeting(_who, display)
+            greeting = spoken_greeting(_who, display, _aid)
 
             parts.append(
                 f"\nYour name is {agent_name}. Your purpose: {agent_goal}."

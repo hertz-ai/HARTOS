@@ -17,6 +17,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional
 
@@ -616,47 +617,81 @@ def _field(personality, name) -> str:
     return str(getattr(personality, name, '') or '')
 
 
-def spoken_name(personality, display_name: str = '') -> str:
+#: The placeholders the agent mirror manufactures for a prompt with no name
+#: ("Agent <id>", "agent-<id>", hart_intelligence_entry
+#: _create_social_agent_from_prompt), also built from ANOTHER agent's id.
+_PLACEHOLDER_NAME_RE = re.compile(r'agent[ _-]\d{6,}(?:_\d+)?', re.IGNORECASE)
+
+
+def is_a_name(name, agent_id='') -> bool:
+    """False for what only looks like a name: empty, the agent's id, the
+    placeholder built from an id ("Agent <id>", "agent-<id>", "agent_<id>",
+    any id of six or more digits), or digits alone.  The one name rule:
+    what a person is told an agent is called (consent_service
+    agent_display_name) and what the agent says it is called (spoken_name)
+    both read it.  Exact matches only: a real name may contain a digit
+    sequence that happens to be a short id ("Studio 1 Assistant" with id 1).
+    Moved here from integrations.social.consent_service._is_a_name (review
+    of 4b9ba08ad: "Agent 11470436451" was spoken)."""
+    name = str(name or '').strip()
+    aid = str(agent_id or '').strip()
+    if not name or (aid and name == aid) or name.isdigit():
+        return False
+    if aid and name.lower() in (f'agent {aid}'.lower(), f'agent-{aid}'.lower(),
+                                f'agent_{aid}'.lower()):
+        return False
+    return _PLACEHOLDER_NAME_RE.fullmatch(name) is None
+
+
+def _looks_like_an_id(name: str) -> bool:
+    """An internal agent id, not a name: no space, and dotted or underscored
+    ('skill.local.syllable_coach', 'swift.falcon', 'auto.agent4201').  A
+    one-word human name ('Coach', 'Ivy') is a name."""
+    return ' ' not in name and ('.' in name or '_' in name)
+
+
+def spoken_name(personality, display_name: str = '', agent_id='') -> str:
     """The name the agent says it has.  What the person called the agent (its
-    config's display 'name') first; else its saved persona name, unless that
-    is its internal id; else a pick from _PERSONA_NAMES, the same for the
-    same agent every turn.
+    config's display 'name') first; else its saved persona name; either only
+    when it is a name (is_a_name) and not an internal id; else a pick from
+    _PERSONA_NAMES, the same for the same agent every turn.
 
     generate_personality took the internal id (config 'agent_name',
     'skill.local.<x>') as the persona name, so agents opened with "I'm
     skill.local.syllable_coach" (live 2026-11-10; 916 of 920 saved
     personalities on that desktop).  Read here, where the prompt is built,
-    so the saved files are right without rewriting them."""
-    display = str(display_name or '').strip()
-    if display:
-        return display
-    persona = _field(personality, 'persona_name').strip()
+    so the saved files are right without rewriting them.  A persona that
+    is a human name is kept even when the agent's id is the same word
+    ('Coach'); 427 of 1236 desktop configs are named "Agent <id>", and that
+    is never spoken (review of 4b9ba08ad)."""
+    for candidate in (display_name, _field(personality, 'persona_name')):
+        candidate = str(candidate or '').strip()
+        if is_a_name(candidate, agent_id) and not _looks_like_an_id(candidate):
+            return candidate
     internal = _field(personality, 'agent_name').strip()
-    if persona and persona != internal:
-        return persona
     seed = hashlib.sha256(f"{_field(personality, 'role')}:{internal}".encode()).hexdigest()
     return _PERSONA_NAMES[int(seed[:8], 16) % len(_PERSONA_NAMES)]
 
 
-def spoken_greeting(personality, display_name: str = '') -> str:
+def spoken_greeting(personality, display_name: str = '', agent_id='') -> str:
     """The saved greeting, saying spoken_name.  The greeting was formatted
     with the persona name when it was generated and saved; where that name
     is not the one spoken, that known value is replaced."""
     greeting = _field(personality, 'greeting_style')
     persona = _field(personality, 'persona_name').strip()
-    name = spoken_name(personality, display_name)
+    name = spoken_name(personality, display_name, agent_id)
     if greeting and persona and persona != name:
         greeting = greeting.replace(persona, name)
     return greeting
 
 
-def with_spoken_name(personality, display_name: str = ''):
+def with_spoken_name(personality, display_name: str = '', agent_id=''):
     """A copy of ``personality`` whose persona name and greeting are the
     spoken ones, for a turn's prompt; the saved personality is unchanged."""
     from dataclasses import replace
     return replace(personality,
-                   persona_name=spoken_name(personality, display_name),
-                   greeting_style=spoken_greeting(personality, display_name))
+                   persona_name=spoken_name(personality, display_name, agent_id),
+                   greeting_style=spoken_greeting(personality, display_name, agent_id))
 
 
 def _get_role_category(role: str) -> str:

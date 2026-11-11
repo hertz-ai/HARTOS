@@ -1125,7 +1125,8 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
         # The agent speaks the name the person gave it, never its internal id
         # (core.agent_personality.spoken_name); the saved file is unchanged.
         from core.agent_personality import with_spoken_name
-        _agent_personality = with_spoken_name(_agent_personality, config.get('name', ''))
+        _agent_personality = with_spoken_name(_agent_personality, config.get('name', ''),
+                                              agent_id=prompt_id)
     except Exception as e:
         tool_logger.warning(f"Personality generation skipped: {e}")
 

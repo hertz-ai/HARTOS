@@ -95,6 +95,50 @@ class TestTheGreetingSaysTheSpokenName:
         assert ap.spoken_greeting(p, _DISPLAY) == ''
 
 
+class TestOnlyANameIsSpoken:
+    """Review of 4b9ba08ad, must-fixes 2 and 3: placeholders built from an id
+    were spoken ("Agent 11470436451"; 427 of 1236 desktop configs are named
+    so), and a persona that is a human name was replaced because the agent's
+    id was the same word."""
+
+    _PID = '70264903070'
+
+    def _bare(self, persona=_ID):
+        return ap.AgentPersonality(agent_name=_ID, role='assistant', persona_name=persona,
+                                   primary_traits=[], tone='warm-casual',
+                                   greeting_style='', self_awareness_prompt='')
+
+    def test_a_placeholder_display_name_is_never_spoken(self):
+        p = self._bare()
+        for placeholder in (f'Agent {self._PID}', f'agent_{self._PID}', f'agent-{self._PID}',
+                            self._PID, 'Agent 11470436451', '424201'):
+            spoken = ap.spoken_name(p, placeholder, self._PID)
+            assert spoken in ap._PERSONA_NAMES, (placeholder, spoken)
+
+    def test_a_placeholder_persona_is_never_spoken(self):
+        p = self._bare(persona=f'Agent {self._PID}')
+        assert ap.spoken_name(p, '', self._PID) in ap._PERSONA_NAMES
+
+    def test_a_human_persona_equal_to_the_agent_id_is_kept(self):
+        p = ap.AgentPersonality(agent_name='Coach', role='assistant', persona_name='Coach',
+                                primary_traits=[], tone='warm-casual',
+                                greeting_style='', self_awareness_prompt='')
+        assert ap.spoken_name(p) == 'Coach'
+
+    def test_a_short_number_in_a_real_name_is_still_a_name(self):
+        assert ap.spoken_name(self._bare(), 'Studio 1 Assistant', '1') == 'Studio 1 Assistant'
+
+    def test_the_one_rule_is_the_consent_cards_rule_too(self):
+        """consent_service.agent_display_name reads the same rule (hartos-d9:
+        'agent_99_0' for id '99_0' and 'agent_65' for '65' were accepted)."""
+        from integrations.social import consent_service as cs
+        for name, aid in (('agent_99_0', '99_0'), ('agent_65', '65'), ('Agent 69922589936', '1'),
+                          ('70264903070', '1'), ('', '1')):
+            assert cs._is_a_name(name, aid) is False, (name, aid)
+            assert ap.is_a_name(name, aid) is False, (name, aid)
+        assert cs._is_a_name('Syllable Coach', '65') is True
+
+
 class TestBothPromptBuildersSayOneName:
 
     def test_the_personality_block_never_says_the_id(self):
