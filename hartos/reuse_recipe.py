@@ -751,7 +751,10 @@ def _reuse_pending_join_turn(user_id, prompt_id):
         clear_pending_join(user_id, prompt_id)
         return f'The account holder of {creator} did not allow you to join as {name}.'
     if status == 'open':
-        return f'Still waiting for the account holder of {creator} to allow you to join as {name}.'
+        # Also the reply of the turn that just asked (9ac502a23), so it says
+        # what to do next, as the ask itself does (review of 9ac502a23).
+        return (f'Still waiting for the account holder of {creator} to allow you to join '
+                f'as {name}. Message me again once they have allowed it.')
     return _reuse_ask_to_join(user_id, prompt_id, name, creator)
 
 

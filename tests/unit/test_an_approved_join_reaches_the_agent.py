@@ -271,6 +271,7 @@ def test_the_turn_that_asks_to_join_says_it_waits_and_builds_nothing(rr, asks, t
     reply = turn('Parent. Please add me to my son\'s chat, user id u-child')
     assert len(group.calls) == 1 and len(asks.sent) == 1
     assert str(reply).startswith('Still waiting for the account holder of u-child')
+    assert str(reply).endswith('Message me again once they have allowed it.')  # what to do next
     assert turn.built == []                                    # no session of his own
     assert pending_join(PARENT, P)['ask_id'] == 'ask-1'
     assert [m['user_id'] for m in rr.agents_session[f'{CHILD}_{P}']] == [CHILD]
