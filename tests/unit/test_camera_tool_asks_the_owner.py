@@ -248,11 +248,22 @@ def test_a_consent_store_failure_still_says_no_frame(helper, emitted, monkeypatc
     assert _camera_rows() == [] and _asks(emitted) == []
 
 
-@pytest.mark.parametrize('answer', [None, 'allowed', 'said no', 'daemon', 'failed'])
-def test_every_no_frame_reply_says_what_to_do(helper, emitted, monkeypatch, answer):
+def _retry_sentence(retry):
+    """The closing sentence core.tool_refusal.refuse writes for ``retry``."""
+    from core.tool_refusal import refuse
+    return refuse('get_user_camera_inp', 'p', 'f', retry=retry).split(' f. ', 1)[1]
+
+
+@pytest.mark.parametrize('answer, retry', [
+    (None, 'later'), ('allowed', 'later'), ('said no', 'never'),
+    ('daemon', 'never'), ('failed', 'never')])
+def test_every_no_frame_reply_says_what_to_do(helper, emitted, monkeypatch,
+                                              answer, retry):
     """F4.  Owner 2026-11-09: every tool refusal says what was wrong and what
-    to do (core.tool_refusal).  The 28 calls of 11-07 retried a reply that
-    said neither."""
+    to do (core.tool_refusal), and whether calling again can help: an ask on
+    screen or an allowed camera may change ("later"); a No, or a turn no
+    camera here serves, will not ("never").  The 28 calls of 11-07 retried a
+    reply that said none of it."""
     from core.tool_refusal import refusal_has_hint
     from integrations.social import models
     from integrations.social.consent_service import ConsentService
@@ -271,7 +282,70 @@ def test_every_no_frame_reply_says_what_to_do(helper, emitted, monkeypatch, answ
     text = _call(helper, user)
     assert refusal_has_hint(text), text
     assert text.startswith('Error: the get_user_camera_inp call'), text
+    assert text.endswith(_retry_sentence(retry)), text
     assert 'camera' in text.lower() and 'redis' not in text.lower(), text
+
+
+def test_a_no_from_a_previous_owner_is_not_the_new_owners(helper, emitted,
+                                                         monkeypatch):
+    """f40e02e1a review F1.  The owner 10202 refused agent 54; then 20000
+    signs in on this computer.  20000 never answered, so 20000 is asked --
+    not told "the owner said no".  (Their Allow opens the camera for this
+    node: the capture gate follows the latest answer from anyone.)"""
+    from integrations.social.consent_service import ConsentService
+    with _as_agent('54'):
+        _call(helper, OWNER)
+    with db_session(commit=True) as db:
+        ConsentService.decline(db, OWNER, 'camera_capture', agent_id='54')
+    monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', '20000')
+    emitted.clear()
+    with _as_agent('54'):
+        text = _call(helper, '20000')
+    asks = _asks(emitted)
+    assert len(asks) == 1 and asks[0]['user_id'] == '20000', emitted
+    assert _camera_rows('20000') == [(False, False, '54')], _camera_rows('20000')
+    assert 'asked' in text.lower() and 'said no' not in text.lower(), text
+
+
+def test_an_agents_own_ask_on_screen_is_not_reported_as_a_no(helper, emitted):
+    """f40e02e1a review F2.  Agent 54 was refused; agent 55 then asked in so
+    many words (Request_Camera_Access) and its card is on screen.  Agent 55's
+    no-frame call says the owner has been asked and sends that same card
+    again -- it does not tell the model the owner said no."""
+    from integrations.social import consent_service as cs
+    from integrations.social.consent_service import ConsentService
+    with db_session(commit=True) as db:
+        ConsentService.request_consent(db, OWNER, 'camera_capture', agent_id='54')
+        ConsentService.decline(db, OWNER, 'camera_capture', agent_id='54')
+    assert cs.ask_owner('camera_capture', 'look', '55') == cs.OWNER_ASKED
+    emitted.clear()
+    with _as_agent('55'):
+        text = _call(helper, OWNER)
+    assert 'asked' in text.lower() and 'said no' not in text.lower(), text
+    asks = _asks(emitted)
+    assert len(asks) == 1 and asks[0]['agent_id'] == '55', emitted
+    assert sorted(a or '' for _, _, a in _camera_rows()) == ['54', '55']
+
+
+@pytest.mark.parametrize('nobody', [None, '', '  '])
+def test_a_turn_of_nobody_asks_nobody(helper, emitted, nobody):
+    """f40e02e1a review item 4.  A turn with no user id is no one's; before
+    that commit it filed nothing, and it files nothing now."""
+    text = _call(helper, nobody)
+    assert _camera_rows() == [] and _asks(emitted) == []
+    assert 'camera' in text.lower(), text
+
+
+def test_ask_owner_never_lets_a_store_error_out(monkeypatch):
+    """F3.  ask_owner's own promise, tested on ask_owner: a store that cannot
+    be opened is ASK_FAILED, not an exception."""
+    from integrations.social import consent_service as cs
+    from integrations.social import models
+    monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', OWNER)
+    monkeypatch.setattr(models, 'db_session', _broken_store)
+    assert cs.ask_owner('camera_capture', 'look', '54') == cs.ASK_FAILED
+    assert cs.ask_owner('camera_capture', 'look', '54',
+                        stop_at_last_no=True) == cs.ASK_FAILED
 
 
 def test_the_deliberate_ask_keeps_a_no_to_one_agent_that_agents():
@@ -293,7 +367,7 @@ def test_the_deliberate_ask_keeps_a_no_to_one_agent_that_agents():
     assert sorted(a or '' for _, _, a in _camera_rows()) == ['54', '55']
 
 
-def test_the_two_camera_asks_are_one_ask():
+def test_source_guard_the_two_camera_asks_are_one_ask():
     """F1 (Gate 4).  The camera tool's ask was a copy of Request_Camera_Access's
     (hart_intelligence_entry._request_consent), without its central check.
     Both now call consent_service.ask_owner and neither asks by itself."""
