@@ -13,8 +13,15 @@ RUN apt-get update && apt-get install -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Layer 2a: Upgrade pip ──
-RUN pip install --upgrade pip
+# ── Layer 2a: pip ──
+# pip is PINNED, not upgraded to the newest.  pip 26.3 refuses autobahn==23.1.2
+# (requirements.txt): "Distributions from PyPI cannot declare direct URL
+# dependencies" (its metadata names web3 by a git URL under the `all` extra).
+# The floating upgrade took 26.3 on 2026-11-10 and central's deploy of
+# ca0852c0f failed at the requirements step; 26.2.2 is what the last good
+# deploy (9180ba44d, 2026-10-30) built with.  Raise the pin only together
+# with an autobahn pin that 26.3+ accepts.
+RUN pip install "pip==26.2.2"
 
 # ── Layer 2b: Google/gRPC stack (biggest backtracking source — install first) ──
 #    Installing these first pins all their transitive deps, so the main install
