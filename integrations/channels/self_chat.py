@@ -42,6 +42,29 @@ logger = logging.getLogger(__name__)
 _PHONE_STRIP = re.compile(r"[+\-\s]|:\d+@[a-z.]+$|@[a-z.]+$", re.IGNORECASE)
 
 
+def saved_self_chat_setting(channel: str) -> bool | None:
+    """The owner's saved self-chat switch for ``channel``, or None.
+
+    The Add Channel wizard saves it in the channel's admin config
+    (``config.enable_self_chat_agent``).  The WhatsApp adapter is built at
+    pairing time, before that config exists, so its own ``config.extra``
+    never carries the owner's answer; this reads the saved one at message
+    time, the way FlaskChannelIntegration._get_channel_prompt_id reads the
+    per-channel prompt.  None when nothing is saved or the admin config
+    cannot be read.
+    """
+    try:
+        from .admin.api import get_api
+        entry = (getattr(get_api(), "_channels", None) or {}).get(channel)
+    except Exception:
+        logger.warning("self-chat: saved channel settings unreadable",
+                       exc_info=True)
+        return None
+    config = entry.get("config") if isinstance(entry, dict) else None
+    value = config.get("enable_self_chat_agent") if isinstance(config, dict) else None
+    return value if isinstance(value, bool) else None
+
+
 def normalize_phone(s: Optional[str]) -> str:
     """Reduce a phone / JID / LID to its pure digit form for equality checks.
 
@@ -97,8 +120,9 @@ class SelfChatHandler:
     # ── Detection ─────────────────────────────────────────────────
     def is_self_message(self, message: "Message") -> bool:
         """True iff this message's sender matches the owner's identity as
-        configured on the adapter *and* the feature is enabled on that
-        adapter (``config.extra['enable_self_chat_agent']`` default True).
+        configured on the adapter *and* the feature is enabled: the owner's
+        saved switch (saved_self_chat_setting) when there is one, else the
+        adapter's ``config.extra['enable_self_chat_agent']``, default True.
 
         Checked against BOTH the owner's phone-based JID and their LID
         (WhatsApp's newer privacy-ID scheme) — for LID-enabled accounts, a
@@ -110,7 +134,10 @@ class SelfChatHandler:
         if adapter is None:
             return False
         extra = getattr(adapter.config, "extra", None) or {}
-        if extra.get("enable_self_chat_agent", True) is False:
+        enabled = saved_self_chat_setting(message.channel)
+        if enabled is None:
+            enabled = extra.get("enable_self_chat_agent", True) is not False
+        if not enabled:
             return False
         owners = [
             extra.get("owner_phone") or extra.get("phone_number"),

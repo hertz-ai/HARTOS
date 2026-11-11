@@ -2,7 +2,8 @@
 
 Tests cover:
   * Phone normalization (+, spaces, @c.us, @s.whatsapp.net)
-  * is_self_message detection (match, mismatch, disabled, no config)
+  * is_self_message detection (match, mismatch, disabled, no config,
+    the owner's saved setting from the Add Channel wizard)
   * handle(): persist → dispatch → reply-in-thread (mocked)
   * handle(): fan-out is NOT invoked (private thread)
   * handle(): agent-API failure returns None and logs
@@ -34,6 +35,18 @@ def fake_message():
     m.content = "remind me to call dad at 6pm"
     m.id = "msg-1"
     return m
+
+
+@pytest.fixture(autouse=True)
+def saved_channels(monkeypatch):
+    """The owner's saved channel settings (admin channel config).  Empty
+    by default so no test reads this machine's real admin_config.json."""
+    channels = {}
+    api = MagicMock()
+    api._channels = channels
+    monkeypatch.setattr("integrations.channels.admin.api.get_api",
+                        lambda: api)
+    return channels
 
 
 @pytest.fixture
@@ -113,6 +126,43 @@ def test_is_self_message_mismatch_returns_false(handler, fake_message):
 
 def test_is_self_message_disabled_returns_false(handler, fake_message,
                                                  fake_adapter_with_owner):
+    fake_adapter_with_owner.config.extra["enable_self_chat_agent"] = False
+    assert handler.is_self_message(fake_message) is False
+
+
+def test_saved_setting_off_turns_self_chat_off(handler, fake_message,
+                                               saved_channels):
+    """The Add Channel wizard saves the owner's switch in the channel's
+    config; the adapter is built at pairing without it."""
+    saved_channels["whatsapp"] = {
+        "channel_type": "whatsapp", "enabled": True,
+        "config": {"enable_self_chat_agent": False},
+    }
+    assert handler.is_self_message(fake_message) is False
+
+
+def test_saved_setting_on_wins_over_adapter_extra(handler, fake_message,
+                                                  fake_adapter_with_owner,
+                                                  saved_channels):
+    fake_adapter_with_owner.config.extra["enable_self_chat_agent"] = False
+    saved_channels["whatsapp"] = {
+        "config": {"enable_self_chat_agent": True},
+    }
+    assert handler.is_self_message(fake_message) is True
+
+
+def test_saved_entry_without_setting_keeps_default_on(handler, fake_message,
+                                                      saved_channels):
+    saved_channels["whatsapp"] = {"config": {"phone_number": ""}}
+    assert handler.is_self_message(fake_message) is True
+
+
+def test_unreadable_saved_settings_fall_back_to_adapter(
+        handler, fake_message, fake_adapter_with_owner, monkeypatch):
+    def _boom():
+        raise RuntimeError("admin config unavailable")
+    monkeypatch.setattr("integrations.channels.admin.api.get_api", _boom)
+    assert handler.is_self_message(fake_message) is True
     fake_adapter_with_owner.config.extra["enable_self_chat_agent"] = False
     assert handler.is_self_message(fake_message) is False
 
