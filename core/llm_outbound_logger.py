@@ -541,11 +541,14 @@ def _is_chat_completions_post(request) -> bool:
         return False
 
 
-def _feed_provider_breaker(url, status) -> None:
+def _feed_provider_breaker(url, status, response=None) -> None:
     """Record LLM provider standing per host from a chat/completions response
     (#106b b).  401/402/403 = account refusal (a failure); 2xx = success
-    (clears/half-open-closes).  Every other status and all exceptions are
-    ignored: a 429 is a rate limit not a standing refusal, and a transport
+    (clears/half-open-closes).  A 429 is a rate limit, not a standing
+    refusal, and is ignored, except when its body says the provider's quota
+    is spent until a reset further off than the breaker's own cooldown
+    (_quota_spent_until): that refuses every call until then, exactly like
+    a 402.  Every other status and all exceptions are ignored: a transport
     error says nothing about the account.  This is the SOLE consumer that
     resolves the breaker's half-open probe, so it must run on the real wire
     response, never at an upstream pre-flight check."""
@@ -558,10 +561,53 @@ def _feed_provider_breaker(url, status) -> None:
             return
         if status in (401, 402, 403):
             llm_provider_breaker.record_failure(host)
+        elif status == 429 and response is not None:
+            until = _quota_spent_until(response)
+            if until is not None and until - time.time() > _QUOTA_SPENT_MIN_WAIT_S:
+                llm_provider_breaker.record_failure(host)
         elif 200 <= status < 300:
             llm_provider_breaker.record_success(host)
     except Exception:
         pass
+
+
+#: A spent quota counts as a refusal only when it resets later than this:
+#: the provider breaker's cooldown (core.circuit_breaker.llm_provider_breaker),
+#: so a window that reopens before the breaker would ends no goal's turn early.
+_QUOTA_SPENT_MIN_WAIT_S = 600.0
+
+
+def _quota_spent_until(response) -> Optional[float]:
+    """When a provider's spent request quota resets (epoch seconds), read
+    from a 429's ALREADY-BUFFERED body, or None.
+
+    Measured on central 2026-11-11: once its 50 free calls of the day were
+    used, openrouter answered every call with 429 "Rate limit exceeded:
+    free-models-per-day" and ``error.metadata.headers`` X-RateLimit-Remaining
+    '0', X-RateLimit-Reset (milliseconds) = the next 00:00 UTC.  Read as a
+    passing rate limit, every goal turn kept dispatching into it, failed and
+    counted toward the 5-strike auto-pause: 19 of the 24 goals resumed on
+    11-10 paused themselves that way.  None for anything else, so an
+    ordinary 429 stays ignored."""
+    text = _buffered_text(response)
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    err = data.get('error') if isinstance(data, dict) else None
+    meta = err.get('metadata') if isinstance(err, dict) else None
+    headers = meta.get('headers') if isinstance(meta, dict) else None
+    if not isinstance(headers, dict):
+        return None
+    if str(headers.get('X-RateLimit-Remaining', '')).strip() != '0':
+        return None
+    try:
+        reset = float(headers.get('X-RateLimit-Reset'))
+    except (TypeError, ValueError):
+        return None
+    return reset / 1000.0 if reset > 1e11 else reset
 
 
 def _response_usage(response):
@@ -943,7 +989,7 @@ def _send_and_feed(httpx_module, orig_send, client, request, kwargs):
             return refusal
     response = orig_send(client, request, **kwargs)
     _status = getattr(response, 'status_code', None)
-    _feed_provider_breaker(request.url, _status)
+    _feed_provider_breaker(request.url, _status, response)
     if gateway:
         _meter_response(body, response, _status)
         answer = _no_completion_answer(httpx_module, request, response, _status)
@@ -2474,6 +2520,20 @@ _RESP_ARG_CAP = 600
 _RESP_ERROR_CAP = 1200
 
 
+def _buffered_text(response) -> Optional[str]:
+    """A response body as text, only when httpx has ALREADY buffered it
+    (``_content``), else None.  The one read rule for the error readers
+    here: touching ``.content`` would raise on an unread response and drain
+    the bytes the real caller is waiting for."""
+    try:
+        raw = getattr(response, '_content', None)
+        if raw is None:
+            return None
+        return bytes(raw).decode('utf-8', 'replace').strip()
+    except Exception:
+        return None
+
+
 def _response_error(response, status) -> Optional[str]:
     """What the server SAID on a non-2xx, from an ALREADY-BUFFERED body.
 
@@ -2503,10 +2563,7 @@ def _response_error(response, status) -> Optional[str]:
     try:
         if isinstance(status, int) and 200 <= status < 300:
             return None
-        raw = getattr(response, '_content', None)
-        if raw is None:
-            return None
-        text = bytes(raw).decode('utf-8', 'replace').strip()
+        text = _buffered_text(response)
         if not text:
             return None
         try:
@@ -2803,7 +2860,7 @@ def _install_sync_patch(httpx_module) -> None:
             # Local llama-server is a provider too (host 127.0.0.1); feed the
             # breaker the real status (#106b b) before logging.
             _status = getattr(response, 'status_code', None)
-            _feed_provider_breaker(request.url, _status)
+            _feed_provider_breaker(request.url, _status, response)
             _meter_response(body, response, _status)
             elapsed = (time.time() - start) * 1000
             log_outbound(body or {},
@@ -2844,7 +2901,7 @@ def _install_async_patch(httpx_module) -> None:
                         return _refusal
                 _resp = await _orig(self, request, **kwargs)
                 _hstatus = getattr(_resp, 'status_code', None)
-                _feed_provider_breaker(request.url, _hstatus)
+                _feed_provider_breaker(request.url, _hstatus, _resp)
                 if _gateway:
                     _meter_response(_hbody, _resp, _hstatus)
                     _answer = _no_completion_answer(httpx_module, request, _resp, _hstatus)
@@ -2865,7 +2922,7 @@ def _install_async_patch(httpx_module) -> None:
         try:
             response = await _orig(self, request, **kwargs)
             _status = getattr(response, 'status_code', None)
-            _feed_provider_breaker(request.url, _status)
+            _feed_provider_breaker(request.url, _status, response)
             _meter_response(body, response, _status)
             elapsed = (time.time() - start) * 1000
             log_outbound(body or {},

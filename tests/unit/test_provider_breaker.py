@@ -77,6 +77,63 @@ def test_a_busy_or_broken_provider_does_not_count(fresh_breaker, status):
         breaker_mod.CircuitState.CLOSED
 
 
+def _quota_429(remaining='0', reset_in_s=6 * 3600.0, ms=True):
+    """openrouter's answer once its free calls for the day are used, as
+    measured on central 2026-11-11 (the reset is the next 00:00 UTC, in ms)."""
+    reset = time.time() + reset_in_s
+    return httpx.Response(429, json={'error': {
+        'message': 'Rate limit exceeded: free-models-per-day. Add 10 credits '
+                   'to unlock 1000 free model requests per day',
+        'code': 429,
+        'metadata': {'headers': {
+            'X-RateLimit-Limit': '50', 'X-RateLimit-Remaining': remaining,
+            'X-RateLimit-Reset': str(int(reset * 1000 if ms else reset))},
+            'limit_source': 'openrouter_free_tier_daily'}}})
+
+
+def test_a_quota_spent_for_the_day_counts_like_a_refusal(fresh_breaker):
+    """Central 2026-11-11: past the Claude cap, goal turns ran on the free
+    model, whose daily quota was gone; every turn failed and 19 of 24 goals
+    paused themselves.  A quota spent until a reset hours away now holds
+    goal dispatch like a 402."""
+    for _ in range(3):
+        _send_through_hook(_quota_429())
+    assert fresh_breaker.state('api.provider.example') is \
+        breaker_mod.CircuitState.OPEN
+
+
+def test_a_quota_reset_in_seconds_since_the_epoch_counts_too(fresh_breaker):
+    for _ in range(3):
+        _send_through_hook(_quota_429(ms=False))
+    assert fresh_breaker.state('api.provider.example') is \
+        breaker_mod.CircuitState.OPEN
+
+
+@pytest.mark.parametrize('remaining,reset_in_s', [
+    ('3', 6 * 3600.0),     # calls left: an ordinary rate limit
+    ('0', 60.0),           # spent, but back before the breaker would be
+])
+def test_a_429_that_passes_soon_still_does_not_count(fresh_breaker, remaining,
+                                                     reset_in_s):
+    for _ in range(5):
+        _send_through_hook(_quota_429(remaining=remaining, reset_in_s=reset_in_s))
+    assert fresh_breaker.state('api.provider.example') is \
+        breaker_mod.CircuitState.CLOSED
+
+
+def test_a_spent_quota_makes_the_goal_wait_not_fail(fresh_breaker):
+    """The end the owner sees: the goal waits for the reset instead of
+    counting a strike toward its auto-pause."""
+    for _ in range(3):
+        _send_through_hook(_quota_429())
+    with patch('integrations.agent_engine.model_registry._own_llm_target',
+               return_value=('https://api.provider.example', 'm')), \
+            patch.object(dispatch_mod, 'is_user_recently_active',
+                         return_value=False), \
+            patch.object(dispatch_mod, '_cb_is_open', return_value=False):
+        assert dispatch_mod.is_transient_deferral() is True
+
+
 def test_an_answer_clears_the_count(fresh_breaker):
     _send_through_hook(httpx.Response(402))
     _send_through_hook(httpx.Response(402))
