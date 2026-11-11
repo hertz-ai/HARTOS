@@ -208,6 +208,41 @@ def is_held_for_another_turn(reply) -> bool:
     return reply.strip().startswith(HELD_FOR_ANOTHER_TURN_REPLY_PREFIX)
 
 
+def turn_may_see_the_camera(request_id) -> bool:
+    """True only on a person's own turn: the one turn that may read what that
+    person's camera and screen show (the live frame, the caption window, the
+    caption search).  The rule is dispatch.is_genuine_user_request, the sole
+    authority on "is this a person", read the way REUSE's camera window
+    reads it (_reuse_request_is_a_person): a goal turn (daemon_<goal>), a
+    peer agent's A2A turn (daemon_a2a_<task>, run as the owner) and an
+    untagged turn are not, and an unreadable classifier is not.
+
+    Unlike create_scheduled_jobs, an empty id is refused: a person's camera
+    is only ever opened from a /chat turn, which carries an id, while ~88% of
+    empty ids are daemon turns that lost their tag (dispatch's own note).
+    Review of HARTOS 23ccd0eb3 (critical): once that commit made these tools
+    read Nunba's stamps, a peer's A2A turn got the owner's camera and screen
+    captions through them."""
+    try:
+        from integrations.agent_engine.dispatch import is_genuine_user_request
+        return bool(is_genuine_user_request(str(request_id or '')))
+    except Exception:
+        return False
+
+
+def camera_refusal(tool_name: str) -> str:
+    """What a camera or screen tool answers on a turn that is not the
+    person's own (turn_may_see_the_camera): a failure the gates read as one
+    (TOOL_FAILURE_RESULTS[0], so no step is credited with it), what was
+    wrong, and what to do instead."""
+    from core.constants import TOOL_FAILURE_RESULTS
+    return (f"{TOOL_FAILURE_RESULTS[0]}\nNot looked: {tool_name} reads what "
+            f"the person's camera or screen shows, and only the person's own "
+            f"turn may do that. This turn is a background one (a goal, another "
+            f"agent, or no person's request). Do the step without it, or wait "
+            f"for the person's own message.")
+
+
 def waiting_for_person_reply(action_id) -> str:
     """The sentence a background turn answers when the session's current
     REUSE step is held for the person's reply (#161): the step asked them in
@@ -779,7 +814,12 @@ def build_core_tool_closures(ctx):
         # 10/10 on 2026-09-07).  The callee never needs an int: helper.py:2163
         # does get_frame(str(user_id)) and :2165 interpolates it into a
         # filename.  An integer id still passes through unchanged.
-        return helper_fun.get_user_camera_inp(inp, user_id, request_id_list[user_prompt])
+        _rid = request_id_list.get(user_prompt)
+        if not turn_may_see_the_camera(_rid):
+            tool_logger.warning(f"get_user_camera_inp refused on turn {_rid!r}: "
+                                f"not the person's own")
+            return camera_refusal('get_user_camera_inp')
+        return helper_fun.get_user_camera_inp(inp, user_id, _rid)
 
     # The schema says what the tool does.  It read "Get user's visual
     # information to process somethings" with one argument "The Question to
@@ -2287,6 +2327,11 @@ def build_core_tool_closures(ctx):
         channel: Annotated[str, "Which feed: 'camera', 'screen', or 'both' (default)"] = "both",
     ) -> str:
         """Search past camera/screen descriptions. Use for questions about what happened earlier visually."""
+        _rid = request_id_list.get(user_prompt)
+        if not turn_may_see_the_camera(_rid):
+            tool_logger.warning(f"search_visual_history refused on turn {_rid!r}: "
+                                f"not the person's own")
+            return camera_refusal('search_visual_history')
         results = helper_fun.search_visual_history(user_id, query, mins=minutes_back, channel=channel)
         if results:
             return '\n'.join(results)

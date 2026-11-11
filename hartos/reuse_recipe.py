@@ -2344,6 +2344,15 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
     def get_user_camera_inp_by_mins(minutes: Annotated[
         int, "Time range (in minutes) for fetching the camera visual data. for e.g. 5 will get you last 5 mins data"]) -> str:
         current_app.logger.info('INSIDE get user camera inp by mins')
+        # Only the person's own turn reads their camera captions (review of
+        # 23ccd0eb3, critical: a peer's A2A turn got them through this tool).
+        from core.agent_tools import turn_may_see_the_camera, camera_refusal
+        _rid = request_id_list.get(user_prompt)
+        if not turn_may_see_the_camera(_rid):
+            current_app.logger.warning(
+                f'get_user_camera_inp_by_mins refused on turn {_rid!r}: not '
+                f"the person's own")
+            return camera_refusal('get_user_camera_inp_by_mins')
         current_app.logger.info(f'CHECKING FOR VIDEO FOR PAST {minutes} MINS')
         visual_context = helper_fun.get_visual_context(user_id, minutes)
         current_app.logger.info(f'GOT RESPONSE AS {visual_context}')
