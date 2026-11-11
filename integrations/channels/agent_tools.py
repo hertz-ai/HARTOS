@@ -577,7 +577,14 @@ def build_channel_tool_closures(ctx):
             api = get_api()
 
             if channel_type in api._channels:
-                api._channels[channel_type].update({'config': saved, 'enabled': True})
+                # Merged over the saved config, not in place of it: a setting
+                # this call does not carry stays (the owner's WhatsApp
+                # self-chat switch from the Add Channel wizard, read by
+                # self_chat.saved_self_chat_setting, was erased by every chat
+                # connect and re-pair).  Values sent here still win.
+                entry = api._channels[channel_type]
+                entry.update({'config': {**(entry.get('config') or {}), **saved},
+                              'enabled': True})
                 # Its own config now: no longer an entry that only holds the
                 # announcement target.
                 api._channels[channel_type].pop(ANNOUNCE_ONLY_KEY, None)
