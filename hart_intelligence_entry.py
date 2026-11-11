@@ -11748,7 +11748,14 @@ def chat():
             # approved plan runs with the AUTONOMOUS prompt (2026-11-04: on
             # the person's request id it read INTERACTIVE and Reel Studio,
             # agent 342, stalled on step 2 asking her questions).
-            response = recipe(user_id, prompt, prompt_id, file_id, request_id, autonomous=True)
+            # The build resumes on the agent's OWN creation input, the goal its
+            # saved config carries, never this turn's text: live 2026-11-10 a
+            # parent typed to an unfinished speech agent and the build took
+            # his words as the child's turn and praised them.
+            _build_input = created_json.get('goal')
+            if not isinstance(_build_input, str) or not _build_input.strip():
+                _build_input = 'Continue building this agent from its saved plan.'
+            response = recipe(user_id, _build_input, prompt_id, file_id, request_id, autonomous=True)
             if response in ('Agent Created Successfully',
                             'Agent Already Created Successfully'):
                 with _rr_lock:
@@ -11770,8 +11777,26 @@ def chat():
                 )
             _record_lifecycle('Creation Mode', user_id, prompt_id,
                               'Autonomous recipe generation in progress (from reuse routing)')
+            # A build that failed, paused for a person or was held says so in
+            # its own words, as before: the notice below is for a build still
+            # under way, and must not hide a failure behind "being completed".
+            from core.agent_tools import (is_help_pause, is_held_for_another_turn,
+                                          is_user_facing_error, is_user_pause)
+            if (is_user_facing_error(response) or is_user_pause(response)
+                    or is_help_pause(response) or is_held_for_another_turn(response)):
+                return _chat_reply(
+                    user_id, request_id, response,
+                    intent=['FINAL_ANSWER'],
+                    req_token_count=0, res_token_count=0, history_request_id=[],
+                    Agent_status='Creation Mode', prompt_id=prompt_id,
+                )
+            # The build's own output answered its input, not this person, so
+            # they are told plainly where their agent stands instead.
             return _chat_reply(
-                user_id, request_id, response,
+                user_id, request_id,
+                f'"{_agent_label}" is not finished yet, so it cannot answer this. '
+                f'Its build is being completed from its saved plan; your message '
+                f'was not used for it.',
                 intent=['FINAL_ANSWER'],
                 req_token_count=0, res_token_count=0, history_request_id=[],
                 Agent_status='Creation Mode', prompt_id=prompt_id,
