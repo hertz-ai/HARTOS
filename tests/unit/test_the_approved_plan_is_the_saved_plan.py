@@ -12,10 +12,14 @@ force-approve and the escalation after three rounds.  The re-emission is a new
 LLM answer, so the saved agent was not the plan anyone reviewed, and its reuse
 read the child's attempt before asking for it.
 
-Now each site finalizes the plan in code (status 'completed', review_required
-dropped).  The escalation saves the refinement that answered the last feedback,
-staged as its own round; only when nothing parses as a plan does it still ask
-gather_info, as before.
+Now an approved plan is finalized in code (status 'completed', review_required
+dropped), and a plan nobody approved waits on its creator's approval card (the
+oscillation, three rounds without agreement, a reviewer that gave no verdict, a
+refinement that failed).  When the last answer holds no plan, nothing is built
+and the turn says so.  Review of 06f729559 (hartos-16's reviewer, 11-10): a card
+that was never filed no longer traps the creator, a background hold is waiting
+and not work, an approved plan that cannot be built is never handed back to the
+planner, and only the creator's account acts on a held plan.
 
     python -m pytest tests/unit/test_the_approved_plan_is_the_saved_plan.py -q
 """
@@ -118,14 +122,18 @@ def run(hie, tmp_path, monkeypatch):
         return {'ok': True, 'ask_id': f'ask-{len(asks.sent)}', 'refused': None, 'card': True}
     monkeypatch.setattr(person_ask, 'ask', ask)
     monkeypatch.setattr(person_ask, 'ask_state', lambda ask_id, user_id: dict(asks.state))
-    monkeypatch.setattr(person_ask, 'person_to_ask',
-                        lambda user_id, request_id=None: OWNER if str(user_id).startswith('daemon')
-                        else str(user_id))
+    asks.to_ask = []
+
+    def person_to_ask(user_id, request_id=None):
+        asks.to_ask.append((user_id, request_id))
+        return OWNER if str(user_id).startswith('daemon') else str(user_id)
+    monkeypatch.setattr(person_ask, 'person_to_ask', person_to_ask)
     state.asks = asks
 
-    def call(user=USER, pid=PID, background=False):
+    def call(user=USER, pid=PID, background=False, request_id=None,
+             description='Create an agent named "Syllable Coach"'):
         return hie._autonomous_gather_info(
-            user, 'Create an agent named "Syllable Coach"', pid, background=background)
+            user, description, pid, background=background, request_id=request_id)
 
     def go():
         call()
@@ -399,15 +407,28 @@ def test_an_answer_no_longer_kept_is_asked_again_never_built(run):
     assert not run.saved_path.exists()
 
 
-def test_an_ask_that_could_not_be_filed_still_holds_and_asks_again(run):
+def test_an_ask_that_could_not_be_filed_holds_nothing_and_the_next_create_plans_afresh(run, hie):
+    """A card nobody was shown held the plan anyway, and every later create
+    of that person, even with a new description, was told to approve it
+    (review of 06f729559, probe P2).  Now nothing is held, nothing is built,
+    the turn fails in words, and the next create reaches the planner."""
+    from core.agent_tools import is_user_facing_error
+    from core.prompt_files import held_plan
     run.asks.filed = False
     _oscillate(run)
-    run.call()
-    assert not run.saved_path.exists() and _held(run)[1]['ask_id'] is None
-    run.asks.filed = True
-    run.call()
-    assert len(run.asks.sent) == 2 and _held(run)[1]['ask_id'] == 'ask-2'
+    reply = run.call()
+    assert is_user_facing_error(reply) and 'approval card' in reply
+    assert 'nothing was built' in reply
+    assert _held(run)[1] is None and held_plan(USER) is None
     assert not run.saved_path.exists()
+    assert hie._creation_prompt_id(USER, 999) == 999
+    run.asks.filed = True
+    run.answers = [_plan('proposed_plan', CREATOR)]
+    run.verdicts = [('approved', '')]
+    run.call(description='A new description: Arjun says ball')
+    assert run.sent[-1] == 'A new description: Arjun says ball'
+    with open(run.saved_path, encoding='utf-8') as f:
+        assert _actions(json.load(f)) == CREATOR
 
 
 # -- whose hold, under which id ------------------------------------------------
@@ -459,7 +480,8 @@ def test_the_background_create_keeps_its_goals_own_id(hie):
     import inspect
     import re
     src = inspect.getsource(hie)
-    assert re.search(r"_autonomous_gather_info\(user_id, prompt, prompt_id,\s*background=True\)", src)
+    assert re.search(r"_autonomous_gather_info\(user_id, prompt, prompt_id,\s*background=True,"
+                     r"\s*request_id=request_id\)", src)
     assert not re.search(r"\bprompt_id = _creation_prompt_id\(", src)
 
 
@@ -582,9 +604,133 @@ def test_only_the_one_plan_parser_capitalises_true_and_false():
     assert sites == ['_parse_plan_reply', '_parse_plan_reply'], sites
 
 
-def test_an_escalation_with_no_plan_to_save_still_asks_gather_as_before(run):
+def test_an_escalation_with_no_plan_builds_nothing_and_says_so(run):
+    """Asking the planner to "approve" after three rounds saved its next
+    answer, a plan nobody reviewed (review of 06f729559, must-fix 4)."""
+    from core.agent_tools import is_user_facing_error
     run.answers = [_plan('proposed_plan', CREATOR)] * 3 + ['I could not refine it.']
     run.verdicts = [('needs_refinement', 'tighten the feedback step')] * 3
+    reply = run.call()
+    assert is_user_facing_error(reply) and 'no plan to review' in reply
+    assert _asked_to_approve(run) == []
+    assert not run.saved_path.exists() and run.asks.sent == []
+
+
+# -- review of 06f729559 (hartos-16's reviewer, 11-10) -------------------------
+
+@pytest.mark.parametrize('why', ['the reviewer could not be reached',
+                                 'the reviewer answered no verdict'])
+def test_a_plan_the_reviewer_could_not_review_waits_on_the_card(run, why):
+    run.answers = [_plan('proposed_plan', CREATOR)]
+    run.verdicts = [('unreviewed', why)]
+    reply = run.call()
+    assert 'waits for your approval' in reply and why in reply
+    assert not run.saved_path.exists()
+    assert _held(run)[1]['why'] == why
+    _approve_and_build(run, CREATOR)
+
+
+@pytest.mark.parametrize('reply_text', [None, 'Looks fine to me, ship it.'])
+def test_the_real_reviewer_never_approves_without_a_verdict(hie, monkeypatch, reply_text):
+    """Probe P1: an outage and a prose answer both returned 'approved'."""
+    if reply_text is None:
+        post = MagicMock(side_effect=ConnectionError('reviewer down'))
+    else:
+        post = MagicMock(return_value=SimpleNamespace(
+            json=lambda: {'choices': [{'message': {'content': reply_text}}]}))
+    monkeypatch.setattr(hie, 'pooled_post', post)
+    monkeypatch.setattr(hie, 'retrieve_json', lambda text: None)
+    verdict, why = hie._review_proposed_plan(json.loads(_plan('proposed_plan', CREATOR)), 3)
+    assert verdict == 'unreviewed' and why
+    assert post.called
+
+
+def test_a_background_hold_answers_waiting_never_work(run):
+    """Probe P5: the hold sentence passed every recogniser dispatch and the
+    daemon use, so a goal's turn ending on it was counted as work done."""
+    from core.agent_tools import (is_help_pause, is_held_for_another_turn,
+                                  is_user_facing_error, is_user_pause,
+                                  is_waiting_for_person)
+    _oscillate(run)
+    replies = [run.call(user='daemon-persona', background=True, request_id='daemon_g1')]
+    replies.append(run.call(user='daemon-persona', background=True, request_id='daemon_g1'))
+    run.asks.state = {'status': 'answered', 'answer': {'decision': 'deny'}}
+    replies.append(run.call(user='daemon-persona', background=True, request_id='daemon_g1'))
+    for reply in replies:
+        assert is_waiting_for_person(reply), reply
+        assert not (is_user_pause(reply) or is_held_for_another_turn(reply)
+                    or is_user_facing_error(reply) or is_help_pause(reply))
+    assert 'Syllable Coach' in replies[0] and 'waiting on the card' in replies[1]
+    assert 'Dropped the plan' in replies[2]
+
+
+def test_a_persons_hold_reply_reads_as_written(run):
+    from core.agent_tools import is_waiting_for_person
+    _oscillate(run)
+    reply = run.call()
+    assert not is_waiting_for_person(reply)
+    assert reply.startswith('The plan for Syllable Coach')
+
+
+def test_an_approved_plan_that_cannot_be_built_is_never_handed_to_the_planner(run):
+    """Probe P4: approve on a staged plan with no buildable step cleared the
+    hold, sent 'proceed' to the planner and saved its new, longer answer."""
+    from core.agent_tools import is_user_facing_error
+    from core.prompt_files import held_plan
+    run.answers = [_plan('proposed_plan', [])]
+    run.verdicts = [('unreviewed', 'the reviewer could not be reached')]
+    run.call()
+    assert _held(run)[1] is not None
+    sent_before = list(run.sent)
+    run.asks.state = APPROVE
+    run.answers = [_plan('completed', LONGER)]
+    reply = run.call()
+    assert is_user_facing_error(reply) and 'no step that can be built' in reply
+    assert run.sent == sent_before, 'the approval was spent on a new planner answer'
+    assert not run.saved_path.exists()
+    assert _held(run)[1] is None and held_plan(USER) is None
+
+
+def test_only_the_creator_acts_on_a_held_plan(run):
+    """Probe P3: another account naming the held id built the approved plan
+    as its own, took an expired hold over, and read the plan's name."""
+    _oscillate(run)
+    run.call()
+    sent, asked = list(run.sent), list(run.asks.sent)
+    for state in ({'status': 'open'}, APPROVE, {'status': 'expired', 'answer': None}):
+        run.asks.state = state
+        reply = run.call(user='u-other')
+        assert "waiting on its creator's approval" in reply
+        assert 'Syllable Coach' not in reply
+        assert not run.saved_path.exists()
+        assert run.sent == sent and run.asks.sent == asked
+        staged, hold = _held(run)
+        assert staged['creator_user_id'] == USER and hold['ask_id'] == 'ask-1'
+    run.asks.state = APPROVE
     saved = run.go()
-    assert len(_asked_to_approve(run)) == 1
-    assert _actions(saved) == REWRITTEN
+    assert saved['creator_user_id'] == USER and _actions(saved) == LONGER
+
+
+def test_a_background_plan_reads_the_answer_of_the_person_asked(run, monkeypatch):
+    """Mutant M of the review survived: nothing pinned WHOSE answer is read.
+    A daemon goal's card goes to the owner, so the owner's Approve is read as
+    the owner's, never as the daemon persona's."""
+    from integrations.agent_engine import person_ask
+    _oscillate(run)
+    run.call(user='daemon-persona', background=True, request_id='daemon_g1')
+    assert _held(run)[1]['asked'] == OWNER
+    monkeypatch.setattr(person_ask, 'ask_state', lambda ask_id, user_id: (
+        dict(APPROVE) if (ask_id, user_id) == ('ask-1', OWNER)
+        else {'status': 'not_found', 'answer': None}))
+    run.call(user='daemon-persona', background=True, request_id='daemon_g1')
+    with open(run.saved_path, encoding='utf-8') as f:
+        saved = json.load(f)
+    assert _actions(saved) == LONGER and saved['creator_user_id'] == 'daemon-persona'
+
+
+def test_a_background_card_goes_to_the_goals_person(run):
+    """person_to_ask is given the turn's request id, so a daemon goal's card
+    reaches its goal's person (review of 06f729559, should-fix 10)."""
+    _oscillate(run)
+    run.call(user='daemon-persona', background=True, request_id='daemon_g1')
+    assert run.asks.to_ask == [('daemon-persona', 'daemon_g1')]

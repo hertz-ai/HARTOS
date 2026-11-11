@@ -891,7 +891,10 @@ def _first_dispatch(tmp_path, recipe_reply):
         'PROMPTS_DIR': str(tmp_path), 'os': os, 'logging': logging,
         'app': MagicMock(), 'thread_local_data': tld, 'chat_agent': MagicMock(),
         'user_id': 'u1', 'file_id': None, 'request_id': DAEMON_RID, 'prompt_id': '777',
-        '_autonomous_gather_info': lambda *a: 'GATHER OUTPUT',
+        # **k: the daemon's create passes background=True (06f729559: a
+        # held plan asks under the background limit); a stand-in that took
+        # no keywords failed 16 tests on main with a TypeError.
+        '_autonomous_gather_info': lambda *a, **k: 'GATHER OUTPUT',
         'recipe': recipe_reply if callable(recipe_reply) else (lambda *a, **k: recipe_reply),
         '_user_lock': threading.Lock(), 'review_agents': {}, '_ak': 'u1_777',
         'conversation_agent': {}, '_touch_agent_timestamp': lambda *a: None,

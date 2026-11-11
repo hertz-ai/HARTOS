@@ -8449,8 +8449,9 @@ def _review_proposed_plan(plan, max_rounds_remaining):
 
     Single-shot local-LLM call against the same Qwen3-VL endpoint that
     gather_info uses — same model competence as the plan author.  Applies
-    quality gates and returns ('approved', None) or
-    ('needs_refinement', feedback_text).
+    quality gates and returns ('approved', None),
+    ('needs_refinement', feedback_text) or ('unreviewed', why) when no
+    verdict came back.
 
     Quality gates (mirrors StatusVerifier verdict shape):
       1. Each step is ONE concrete tool call; a genuine multi-step GUI task is
@@ -8462,9 +8463,11 @@ def _review_proposed_plan(plan, max_rounds_remaining):
       4. Steps in logical order (open before click, login before post)
       5. Tool names in the registered catalog
 
-    Fail-open: if the reviewer endpoint is down, returns 'approved' so a
-    reviewer outage doesn't block the autonomous flow indefinitely.  The
-    autogen Helper team applies stricter checks again at execution time.
+    No verdict is never an approval: a reviewer that is down, or that
+    answers no verdict, returns 'unreviewed' and the caller holds the plan
+    for its creator's card (owner 11-04: the whole plan reviewed, no forced
+    approval).  Until 2026-11-11 both cases answered 'approved' and the plan
+    was saved with nobody approving it (review of 06f729559, probe P1).
     """
     try:
         from core.port_registry import get_local_llm_url
@@ -8534,14 +8537,11 @@ def _review_proposed_plan(plan, max_rounds_remaining):
                 fb = f"In flow '{_flow.strip()}': {fb}"
             app.logger.info(f'Plan review: needs_refinement — {fb[:200]}')
             return ('needs_refinement', fb)
-        # Couldn't parse — fail-open
-        app.logger.debug('Plan review: unparseable, fail-open')
-        return ('approved', None)
+        app.logger.warning('Plan review: the reviewer answered no verdict')
+        return ('unreviewed', 'the reviewer answered no verdict')
     except Exception as e:
-        # Reviewer outage — fail-open (Helper team's strict checks still apply
-        # at execution time).  Don't block flywheel on reviewer health.
-        app.logger.warning(f'Plan review failed (fail-open): {e}')
-        return ('approved', None)
+        app.logger.warning(f'Plan review failed: {e}')
+        return ('unreviewed', 'the reviewer could not be reached')
 
 
 def _approved_plan_response(plan):
@@ -8591,7 +8591,20 @@ def _write_staged_plan(prompt_id, plan) -> None:
         json.dump(plan, f)
 
 
-def _hold_for_the_creator(plan, prompt_id, user_id, why, background):
+def _plan_wait_reply(text, background):
+    """What a hold tells its turn.  A background turn's reply carries the
+    waiting prefix (core.agent_tools.is_waiting_for_person), so dispatch, the
+    daemon and the hive worker count no work and no strike while the plan
+    waits on its card: unprefixed, the hold sentence passed every recogniser
+    and a parallel subtask ending on it was marked complete (review of
+    06f729559, probe P5)."""
+    if not background:
+        return text
+    from core.constants import WAITING_FOR_PERSON_REPLY_PREFIX
+    return f'{WAITING_FOR_PERSON_REPLY_PREFIX} {text}'
+
+
+def _hold_for_the_creator(plan, prompt_id, user_id, why, background, request_id=None):
     """A plan nobody approved waits on its creator's approval card; it is
     never saved unapproved (owner 11-04: the whole plan reviewed, no forced
     approval).  Before this the oscillation guard and the three-round
@@ -8603,12 +8616,20 @@ def _hold_for_the_creator(plan, prompt_id, user_id, why, background):
     paths mint a new prompt id on every create (_creation_prompt_id); a
     background create resumes by its goal's own stable prompt id and keeps
     none, since one daemon persona serves many goals (hartos-16, 11-07).  The
-    card's buttons are the ones every client draws: approve builds the plan,
-    deny drops it.  An ask that could not be filed (ok False: a database
-    lock on a daemon tick) still holds, and the next turn asks again.  What
-    to tell the creator."""
+    card goes to whom an ask of this turn reaches (person_ask.person_to_ask
+    with the turn's request id: a daemon goal's turn asks its goal's person).
+    The card's buttons are the ones every client draws: approve builds the
+    plan, deny drops it.
+
+    An ask that could not be filed holds nothing: the plan stays staged for
+    the record, nothing is built, and the turn says so as a failed turn
+    (core.agent_tools.user_facing_error), so the person's next create plans
+    afresh and a daemon goal counts the failure.  Holding it instead trapped
+    the creator: every later create, even with a new description, was sent
+    back to the held plan and told to approve a card nobody had shown them
+    (review of 06f729559, probe P2).  What to tell the turn."""
     from integrations.agent_engine import person_ask
-    from core.prompt_files import hold_plan
+    from core.prompt_files import clear_held_plan, hold_plan
     held = {k: v for k, v in plan.items() if k not in ('review_required', 'hold')}
     held.update(status='proposed_plan', prompt_id=prompt_id, creator_user_id=user_id)
     name = _plan_name(held, prompt_id)
@@ -8617,15 +8638,29 @@ def _hold_for_the_creator(plan, prompt_id, user_id, why, background):
                             f'Approve to build it on your next message, or deny to drop it.')}
     asked, out = None, {'ok': False, 'refused': 'no_person'}
     try:
-        asked = person_ask.person_to_ask(user_id)
+        asked = person_ask.person_to_ask(user_id, request_id)
         if asked:
             out = person_ask.ask(asked, prompt_id, card, prompt_id=prompt_id,
                                  background=background)
     except Exception as e:
         app.logger.warning(f'Plan {prompt_id}: the approval could not be asked: {e}')
         out = {'ok': False, 'refused': 'error'}
-    held['hold'] = {'ask_id': out.get('ask_id') if out.get('ok') else None,
-                    'asked': asked, 'why': why}
+    if not (out.get('ok') and out.get('ask_id')):
+        refused = out.get('refused') or 'not filed'
+        try:
+            _write_staged_plan(prompt_id, held)
+            if not background:
+                clear_held_plan(user_id)
+        except Exception as e:
+            app.logger.warning(f'Plan {prompt_id}: the unasked plan could not be staged: {e}')
+        app.logger.warning(
+            f'Plan {prompt_id} did not settle in review ({why}) and its approval card '
+            f'was not filed ({refused}): nothing held, nothing built')
+        from core.agent_tools import user_facing_error
+        return user_facing_error(RuntimeError(
+            f'the plan for {name[:40]} was not put on an approval card ({refused}); '
+            f'nothing was built, so ask again to re-plan'))
+    held['hold'] = {'ask_id': out['ask_id'], 'asked': asked, 'why': why}
     try:
         _write_staged_plan(prompt_id, held)
         if not background:
@@ -8633,25 +8668,37 @@ def _hold_for_the_creator(plan, prompt_id, user_id, why, background):
     except Exception as e:
         app.logger.warning(f'Plan {prompt_id}: the hold could not be kept: {e}')
     app.logger.warning(
-        f'Plan {prompt_id} held for approval ({why}): ask {held["hold"]["ask_id"]} to {asked}'
-        + ('' if out.get('ok') else f'; not filed ({out.get("refused")}), asked again next turn'))
-    return (f'The plan for {name} did not settle in review ({why}), so it waits for '
-            f'your approval: approve it on the card and it is built on your next '
-            f'message, or deny it to drop it.')
+        f'Plan {prompt_id} held for approval ({why}): ask {out["ask_id"]} to {asked}')
+    return _plan_wait_reply(
+        f'The plan for {name} did not settle in review ({why}), so it waits for '
+        f'your approval: approve it on the card and it is built on your next '
+        f'message, or deny it to drop it.', background)
 
 
-def _held_plan_turn(user_id, prompt_id, background):
+def _held_plan_turn(user_id, prompt_id, background, request_id=None):
     """A creator's turn on a plan of ``prompt_id`` that waits on their card:
     ('approved', response), the staged plan finalized in code, never a
     re-emission; ('reply', text), what to tell them (still waiting, dropped,
-    or asked again because the answer is no longer kept); None when no plan
-    of this id waits."""
+    approved but not buildable, or asked again because the answer is no
+    longer kept); None when no plan of this id waits.
+
+    Only its creator's turn acts on a held plan.  Another account naming the
+    id (the agentic-execute path takes it from the request) is told it waits
+    on someone else's approval and learns nothing of it: before, it could
+    build the approved plan as its own, take an expired hold over, or read
+    the plan's name (review of 06f729559, probe P3)."""
     from integrations.agent_engine import person_ask
     from core.prompt_files import clear_held_plan, staged_plan
     staged = staged_plan(PROMPTS_DIR, prompt_id)
     hold = (staged or {}).get('hold')
     if not isinstance(hold, dict):
         return None
+    creator = staged.get('creator_user_id')
+    if creator not in (None, '') and str(creator) != str(user_id):
+        app.logger.warning(f'Plan {prompt_id} waits on its creator; a turn of {user_id} '
+                           f'named it and was refused')
+        return 'reply', ("That agent's plan is waiting on its creator's approval, so it "
+                         "cannot be built or changed from this account.")
     name = _plan_name(staged, prompt_id)
     plan = {k: v for k, v in staged.items() if k != 'hold'}
 
@@ -8673,21 +8720,37 @@ def _held_plan_turn(user_id, prompt_id, background):
     decision = str((state.get('answer') or {}).get('decision') or '').strip().lower()
     if status == 'answered' and decision == 'approve':
         _end()
+        approved = _approved_plan_response(plan)
+        if _buildable_completed_config(json.loads(approved), prompt_id) is None:
+            # Approved but nothing in it can be built: said, never handed back
+            # to the planner, whose next answer would be saved as the agent
+            # with the approval spent on another plan (probe P4).
+            app.logger.warning(f'Plan {prompt_id} approved on its card but has no '
+                               f'buildable step; nothing built')
+            from core.agent_tools import user_facing_error
+            return 'reply', user_facing_error(RuntimeError(
+                f'the approved plan for {name[:40]} has no step that can be built; '
+                f'nothing was built, so ask again to re-plan'))
         app.logger.info(f'Plan {prompt_id} approved on its card; building the staged plan')
-        return 'approved', _approved_plan_response(plan)
+        return 'approved', approved
+    # "Later" on a client dismisses the ask everywhere, as its X does (owner
+    # 2026-11-04, Nunba AgentOverlay), so a dismissal drops the plan as a
+    # deny does.
     if status == 'dismissed' or (status == 'answered' and decision == 'deny'):
         _end()
         app.logger.info(f'Plan {prompt_id} dropped on its card')
-        return 'reply', (f'Dropped the plan for {name}. Tell me what you want and '
-                         f'I will plan it again.')
+        return 'reply', _plan_wait_reply(
+            f'Dropped the plan for {name}. Tell me what you want and I will plan '
+            f'it again.', background)
     if status == 'open':
-        return 'reply', (f'Your plan for {name} is waiting on the card: approve it '
-                         f'to build it, or deny it to drop it.')
-    # The answer is no longer kept (an hour passed, a restart), or the ask
-    # was never filed: ask again; nothing is built without an approval.
+        return 'reply', _plan_wait_reply(
+            f'Your plan for {name} is waiting on the card: approve it to build it, '
+            f'or deny it to drop it.', background)
+    # The answer is no longer kept (an hour passed, a restart): ask again;
+    # nothing is built without an approval.
     return 'reply', _hold_for_the_creator(plan, prompt_id, user_id,
                                           hold.get('why') or 'review did not settle',
-                                          background)
+                                          background, request_id)
 
 
 def _creation_prompt_id(user_id, proposed):
@@ -8708,7 +8771,8 @@ def _creation_prompt_id(user_id, proposed):
     return proposed
 
 
-def _autonomous_gather_info(user_id, description, prompt_id, background=False):
+def _autonomous_gather_info(user_id, description, prompt_id, background=False,
+                            request_id=None):
     """Run gather_info autonomously with HART OS peer-review pattern.
 
     Four-stage flow (matches gather_agentdetails.py PLAN_FIRST prompt
@@ -8726,11 +8790,13 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False):
       STAGE 3 (auto): if needs_refinement, send feedback to gather_info
         which refines and re-emits.  Loop up to 3 rounds.  After 3
         rounds, the newest plan (the refinement that answered the last
-        feedback, never reviewed) is staged as its own round and saved
-        as it stands; an oscillating plan is saved the same way.  A
-        refinement call that fails leaves the rejected plan proposed,
-        handed to a peer reviewer, never saved.  Asking the owner
-        instead is a follow-up.
+        feedback, never reviewed) is staged as its own round and waits
+        on its creator's approval card (_hold_for_the_creator); so does
+        an oscillating plan, a plan the reviewer could not review, and
+        the rejected plan when a refinement call fails.  Nothing is
+        saved that neither the reviewer nor the creator approved; when
+        the last answer after 3 rounds holds no plan at all, nothing is
+        built and the turn says so.
 
       STAGE 4: on approved, the approved plan itself is finalized in code
         (_approved_plan_response, no LLM call) → status 'completed' →
@@ -8749,7 +8815,7 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False):
     """
     from hartos.gather_agentdetails import gather_info
     # A plan of this id waiting on its creator's card is answered first.
-    _held = _held_plan_turn(user_id, prompt_id, background)
+    _held = _held_plan_turn(user_id, prompt_id, background, request_id)
     if _held is not None and _held[0] == 'reply':
         return _held[1]
     _resumed = _held is not None
@@ -8833,7 +8899,7 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False):
                     return _hold_for_the_creator(
                         parsed, prompt_id, user_id,
                         'the reviewer and the planner kept changing the step count',
-                        background)
+                        background, request_id)
                 _prev_action_count = _action_count
                 # Stage plan for audit + run auto-review
                 parsed['prompt_id'] = prompt_id
@@ -8851,6 +8917,13 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False):
                     _approved = True
                     response = _approved_plan_response(parsed)
                     continue  # re-parse on next iteration: completed
+                elif verdict == 'unreviewed':
+                    # No verdict is no approval: the creator's card reviews it.
+                    app.logger.warning(
+                        f'Plan round {review_rounds}: {feedback}; holding the '
+                        f'plan for its creator\'s approval')
+                    return _hold_for_the_creator(
+                        parsed, prompt_id, user_id, feedback, background, request_id)
                 else:
                     # Send feedback to gather_info for refinement.  A
                     # refinement call that fails (the model down) ends the
@@ -8889,10 +8962,12 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False):
 
     # After MAX_REVIEW_ROUNDS without convergence, the newest plan (the
     # refinement that answered the last feedback, never reviewed) is staged
-    # as its own round and saved as it stands, whether the model marked it
-    # 'proposed_plan' or 'completed' (review of cdeca7500, F1: a 'completed'
-    # refinement was re-asked and the re-emission saved).  Only when the
-    # last answer holds no plan is gather_info asked to approve, as before.
+    # as its own round and waits on its creator's card, whether the model
+    # marked it 'proposed_plan' or 'completed' (review of cdeca7500, F1: a
+    # 'completed' refinement was re-asked and the re-emission saved).  When
+    # the last answer holds no plan, nothing is built and the turn says so:
+    # asking gather_info to "approve" saved its next answer, a plan nobody
+    # reviewed (review of 06f729559, must-fix 4).
     if review_rounds >= MAX_REVIEW_ROUNDS:
         try:
             _newest = _parse_plan_reply(response)
@@ -8913,17 +8988,15 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False):
             _stage_review_round(_newest, prompt_id, review_rounds)
             return _hold_for_the_creator(
                 _newest, prompt_id, user_id,
-                f'{MAX_REVIEW_ROUNDS} review rounds did not agree', background)
-        else:
-            app.logger.warning(
-                f'Plan review hit {MAX_REVIEW_ROUNDS} rounds without '
-                f'convergence and the last answer holds no plan: asking '
-                f'gather_info to approve')
-            try:
-                response = gather_info(user_id, 'approved (escalated after 3 review rounds)',
-                                       prompt_id, autonomous=True)
-            except Exception as e:
-                app.logger.error(f'Escalation gather_info failed: {e}')
+                f'{MAX_REVIEW_ROUNDS} review rounds did not agree', background,
+                request_id)
+        app.logger.warning(
+            f'Plan review hit {MAX_REVIEW_ROUNDS} rounds without convergence '
+            f'and the last answer holds no plan: nothing built')
+        from core.agent_tools import user_facing_error
+        return user_facing_error(RuntimeError(
+            f'after {MAX_REVIEW_ROUNDS} review rounds the planner gave no plan to '
+            f'review; nothing was built, so ask again to re-plan'))
 
     # Single-shot: LLM should emit a complete plan on first call.
     # If status is "proposed_plan" we return the plan to the peer
@@ -8950,7 +9023,7 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False):
                 # "approved" that nothing read (hartos-16, 11-07).
                 return _hold_for_the_creator(
                     parsed, prompt_id, user_id, 'the review could not finish',
-                    background)
+                    background, request_id)
 
             # Only a config that can be built is saved as built (#206); one
             # that cannot falls to the legacy loop below, as unfinished.
@@ -11192,7 +11265,8 @@ def chat():
                 # Background work: its goal's own stable prompt id, and a
                 # held plan asks under the background limit (hartos-16).
                 auto_response = _autonomous_gather_info(user_id, prompt, prompt_id,
-                                                        background=True)
+                                                        background=True,
+                                                        request_id=request_id)
 
                 # Now immediately create the recipe so next dispatch enters REUSE
                 recipe_response = None
