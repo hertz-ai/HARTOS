@@ -319,6 +319,19 @@ def _format_action_simple(raw_actions: list) -> str:
     return ", ".join(texts)
 
 
+def _age(date) -> timedelta:
+    """How long ago ``date`` was, read in its own frame: a stamp that names
+    its zone against the UTC clock, a naive one against the local clock (as
+    before).  Nunba writes created_date in UTC ('...+00:00'), and the windows
+    below compared it, zone dropped, with the naive local clock: on a desktop
+    east of UTC every caption looked hours old and the camera and screen
+    windows were always empty (IST: 5.5 h; measured 2026-11-11 on the
+    owner's desktop), and west of UTC every caption ever written stayed in."""
+    if date.tzinfo is not None:
+        return datetime.now(pytz.utc) - date
+    return datetime.now() - date
+
+
 def _format_action_rich(raw_actions: list) -> str:
     """REUSE-mode action formatter with dedup + visual + screen context.
 
@@ -332,7 +345,6 @@ def _format_action_rich(raw_actions: list) -> str:
       style questions.
     """
     tz = _get_tz()
-    now = datetime.now()
 
     filtered = [
         obj for obj in raw_actions
@@ -379,7 +391,7 @@ def _format_action_rich(raw_actions: list) -> str:
         except Exception:
             continue
         if obj.get("gpt3_label") == 'Visual Context':
-            if (now - date.replace(tzinfo=None)) > timedelta(minutes=5):
+            if _age(date) > timedelta(minutes=5):
                 continue
         date_r = date.astimezone(tz) if tz else date
         video_texts.append(
@@ -400,7 +412,7 @@ def _format_action_rich(raw_actions: list) -> str:
             date = parse_date(obj["created_date"])
         except Exception:
             continue
-        if (now - date.replace(tzinfo=None)) > timedelta(minutes=2):
+        if _age(date) > timedelta(minutes=2):
             continue
         date_r = date.astimezone(tz) if tz else date
         screen_texts.append(
