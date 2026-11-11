@@ -150,3 +150,39 @@ def test_a_tell_that_ends_on_punctuation_is_reported(cdc, tmp_path):
 def test_plain_words_are_not_reported(cdc, tmp_path):
     assert _found(cdc, tmp_path, 'The node keeps a ledger per agent.\n',
                   kinds=('tell', 'filler', 'dash', 'no-x-no-y')) == []
+
+
+# ── broken-path: a path under the user's home is runtime state, not the repo ──
+#
+# Run against an empty repo (tmp_path): on a developer's box an ignored
+# agent_data/ directory exists, and resolve() finds a path by its last name
+# anywhere in the tree, so the check passed locally and failed on a clean CI
+# checkout (the asymmetry resolve()'s own comment describes).
+
+def test_a_path_under_the_users_home_is_not_a_repo_path(cdc, tmp_path, monkeypatch):
+    """docs/CAPABILITIES.md names where the coding benchmark DB lands on a
+    Windows install (~/Documents/Nunba/data/agent_data/).  resolve() already
+    treats agent_data/ and *.db as runtime state; a ~/ path is the same kind
+    of thing and can never exist in a checkout, so it is no "broken path"."""
+    monkeypatch.setattr(cdc, 'REPO', str(tmp_path))
+    assert cdc.resolve('~/Documents/Nunba/data/agent_data/') is True
+
+
+def test_a_repo_path_that_does_not_exist_is_still_broken(cdc, tmp_path, monkeypatch):
+    """The control: the rule above must not turn the check off."""
+    monkeypatch.setattr(cdc, 'REPO', str(tmp_path))
+    assert cdc.resolve('integrations/agent_engine/no_such_module_zzz.py') is False
+
+
+def test_the_capabilities_sentence_has_no_broken_path(cdc, tmp_path, monkeypatch):
+    monkeypatch.setattr(cdc, 'REPO', str(tmp_path))
+    doc = tmp_path / 'docs' / 'CAPABILITIES.md'
+    doc.parent.mkdir()
+    doc.write_text(
+        '| **Coding benchmark tracker** | stored in SQLite at '
+        '`<data dir>/data/agent_data/coding_benchmarks.db` '
+        '(`core.platform_paths.get_agent_data_dir()`, e.g. '
+        '`~/Documents/Nunba/data/agent_data/` on Windows) | '
+        '`integrations/coding_agent/benchmark_tracker.py` |\n', encoding='utf-8')
+    assert [f for f in cdc.check('docs/CAPABILITIES.md') if f[2] == 'broken-path'
+            and 'agent_data' in f[3]] == []

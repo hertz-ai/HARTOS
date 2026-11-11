@@ -388,7 +388,10 @@ _RESUME_BATCH = 3
 #: With nothing succeeding, one paused goal is re-tried per this interval as a
 #: probe of whether the cause has gone.
 _RESUME_RETRY_INTERVAL_S = 1800
-_last_probe_resume_at = 0.0
+#: time.monotonic() when the last probe resumed a goal; None until one has.  Not
+#: 0.0: monotonic() is the host's uptime, so a node up for less than the
+#: interval would read "0.0" as "a probe ran a moment ago" and skip its first.
+_last_probe_resume_at = None
 
 
 #: The structured record of why a goal is paused lives with the ONE pause
@@ -692,7 +695,8 @@ def _resume_goals_paused_for_a_cleared_cause(db, cause_cleared, now=None,
         if cause_cleared:
             budget = _RESUME_BATCH
         else:
-            if time.monotonic() - _last_probe_resume_at < _RESUME_RETRY_INTERVAL_S:
+            if (_last_probe_resume_at is not None
+                    and time.monotonic() - _last_probe_resume_at < _RESUME_RETRY_INTERVAL_S):
                 return []
             active_ids = {str(row[0]) for row in db.query(AgentGoal.id).filter(
                 AgentGoal.status == 'active').all()}

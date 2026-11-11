@@ -79,7 +79,7 @@ MAX_SECURITY_SWALLOWS = 60      # was 68 -> 63 -> 62 -> 61 -> 60.
                                 # tree is at 61 and the staleness check below will
                                 # say so on the next run -- which is the correct
                                 # way to find out, not a guess made here.
-MAX_GOD_MODULES = 9             # SOURCE files > 3000 lines (tests excluded —
+MAX_GOD_MODULES = 13            # SOURCE files > 3000 lines (tests excluded —
                                 # the first draft said 11 by counting
                                 # test_nixos_configs.py and test_agent_engine.py,
                                 # and this guard's own staleness check caught it)
@@ -87,6 +87,15 @@ MAX_GOD_MODULES = 9             # SOURCE files > 3000 lines (tests excluded —
                                 # (tool menu/attach -> core/agent_tool_menu.py)
                                 # and integrations/social/peer_discovery.py
                                 # (AutoDiscovery -> lan_discovery.py) were split.
+                                # 2026-11-04: 13, decided in the review of #165: a
+                                # line count alone is not a functional defect, so
+                                # these are not split for it.  Main (9180ba44) has
+                                # 13 tracked source files over 3000 lines, the
+                                # nearest the line being goal_manager (3224),
+                                # lifecycle_hooks (3183), hive_benchmark_prover
+                                # (3142), agent_tools (3122) and world_model_bridge
+                                # (3071).  Still a ratchet: a 14th fails, and a
+                                # split lowers it in the same commit.
 MAX_DUP_PUBLIC_NAMES = 122      # one public name defined in >1 SOURCE module
 
 #: The core-pipeline helpers that are verbatim-duplicated across the CREATE/REUSE
