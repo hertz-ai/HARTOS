@@ -537,6 +537,7 @@ load_dotenv()
 
 try:
     from hartos.create_recipe import recipe, time_based_execution as time_execution, visual_execution
+    from hartos.create_recipe import build_holds_a_step_for_the_person
     from hartos.reuse_recipe import chat_agent, crossbar_multiagent, time_based_execution, visual_based_execution
 except ImportError as e:
     # print() went nowhere: frozen windowed builds have no real stdout, so the
@@ -550,6 +551,7 @@ except ImportError as e:
         "Could not import recipe modules -- agent creation and recipe "
         "execution are DISABLED for this process: %s", e, exc_info=True)
     recipe = None
+    build_holds_a_step_for_the_person = None
     time_execution = None
     visual_execution = None
     chat_agent = None
@@ -8391,6 +8393,55 @@ INTERMEDIATE_CONTINUATION = "You are Hevolve, a versatile personal AI developed 
 first_promts = []
 review_agents = {}  # keyed by f'{user_id}_{prompt_id}' to avoid cross-prompt collision
 conversation_agent = {}  # keyed by f'{user_id}_{prompt_id}'
+# What an unfinished agent's build resumes on, keyed like review_agents:
+# {'input': its own build input, 'label': what the person is told it is
+# called}.  Set when a turn to an agent whose recipe is not finished routes
+# into creation (the reuse route's unfinished-agent block, and the flow
+# ladder when the turn did not arrive mid-build), read by Phase 2 in place of
+# the turn's text, dropped when the build finishes.  The person's words are
+# never the build's input (review of cfa9e29ee: the second message reached
+# recipe() there), except as the answer to a step the build asked them for.
+resume_build_input = {}
+
+
+def _own_build_input(config):
+    """What an unfinished agent's build resumes on: its saved config's goal
+    (the gather schema's "ultimate goal of the agent"), else a fixed neutral
+    sentence.  Never a person's words."""
+    goal = (config or {}).get('goal')
+    if isinstance(goal, str) and goal.strip():
+        return goal
+    return 'Continue building this agent from its saved plan.'
+
+
+def _unfinished_agent_label(config, prompt_id):
+    """What a person is told an unfinished agent is called: its display name,
+    quoted, when that is a name (core.agent_personality.is_a_name, the one
+    name rule), else "This agent"; never the bare prompt id (review of
+    cfa9e29ee)."""
+    from core.agent_personality import is_a_name
+    config = config or {}
+    name = config.get('name') or config.get('agent_name')
+    return f'"{name}"' if is_a_name(name, prompt_id) else 'This agent'
+
+
+def _resumed_build_reply(response, user_id, prompt_id, label):
+    """The reply to a person's turn on which an unfinished agent's build ran
+    on its own saved input and did not finish.  One reply for both sites that
+    resume (the reuse route's unfinished-agent block and Phase 2).  A build
+    that stopped (core.agent_tools.is_build_stop_reply: a pause for the
+    person, a held turn, an error, a help pause, the CREATE error envelope)
+    or that asked this person for a step (build_holds_a_step_for_the_person)
+    answers in its own words.  Anything else answered the build's own input,
+    not this person, so they are told plainly where their agent stands."""
+    from core.agent_tools import is_build_stop_reply
+    if is_build_stop_reply(response) or (
+            build_holds_a_step_for_the_person is not None
+            and build_holds_a_step_for_the_person(user_id, prompt_id)):
+        return response
+    return (f'{label} is not finished yet, so it cannot answer you. Its build '
+            f'ran again from its saved plan and is still not finished. '
+            f'Messages you send before it is finished are not given to it.')
 _state_lock = threading.Lock()  # Protects review_agents, conversation_agent, first_promts
 
 # --- Interactive gather_info turn limit ---
@@ -10911,6 +10962,8 @@ def chat():
                     if os.path.exists(os.path.join(PROMPTS_DIR, f'{prompt_id}_{no_of_flow}_recipe.json')):
                         # All flows complete → REUSE
                         create_agent = set_flags_to_enter_reuse_mode(no_of_flow, user_id, prompt_id) #returns false
+                        # A finished agent has no build to resume.
+                        resume_build_input.pop(f'{user_id}_{prompt_id}', None)
                     else:
                         # Some flows complete, some not.
                         # Enter CREATE — recipe() has resume logic (initialize_with_resume)
@@ -10920,6 +10973,16 @@ def chat():
                         app.logger.info(f'{no_of_flow} Recipe JSON does not exist — resuming CREATE for remaining flows')
                         create_agent = True
                         _ak = f'{user_id}_{prompt_id}'
+                        # A turn that did not arrive mid-build (a person
+                        # writing to a partly built agent, or the first turn
+                        # after a restart) resumes the build on the agent's
+                        # own input, never this turn's words (review of
+                        # cfa9e29ee, probe c2b).  A creator's turns during
+                        # their ongoing build are untouched.
+                        if not review_agents.get(_ak):
+                            resume_build_input[_ak] = {
+                                'input': _own_build_input(data),
+                                'label': _unfinished_agent_label(data, prompt_id)}
                         review_agents[_ak] = True
                         conversation_agent[_ak] = False
                         _touch_agent_timestamp(_ak)
@@ -11367,16 +11430,10 @@ def chat():
                 # (#170): the daemon counted the gather output as work done,
                 # and the hive worker recorded it as the task's result while
                 # the goal waited for help.
-                from core.agent_tools import (is_action_error_reply, is_help_pause,
-                                              is_held_for_another_turn,
-                                              is_user_facing_error, is_user_pause)
+                from core.agent_tools import is_build_stop_reply
                 return _chat_reply(
                     user_id, request_id,
-                    recipe_response if (is_user_pause(recipe_response)
-                                        or is_held_for_another_turn(recipe_response)
-                                        or is_user_facing_error(recipe_response)
-                                        or is_help_pause(recipe_response)
-                                        or is_action_error_reply(recipe_response))
+                    recipe_response if is_build_stop_reply(recipe_response)
                     else auto_response,
                     intent=['FINAL_ANSWER'],
                     req_token_count=0, res_token_count=0,
@@ -11667,8 +11724,23 @@ def chat():
                 # the after-restart branch below runs it.  Owner 2026-11-05:
                 # Phase 2 is freed too; the Pad sends create_agent on every
                 # turn, so its approved Reel Studio plan runs here.
-                response = recipe(user_id, prompt, prompt_id, file_id, request_id,
-                                  autonomous=True)
+                # An unfinished agent's resumed build runs on its own input,
+                # never this turn's text, and that input answers no step
+                # (resume_build_input; review of cfa9e29ee: the parent's
+                # second message reached recipe() here and the build answered
+                # it as the child's speech).  When the build asked this person
+                # for a step, their words are that answer and go as before.
+                _resume = resume_build_input.get(_ak)
+                _resumed = bool(_resume) and not (
+                    build_holds_a_step_for_the_person is not None
+                    and build_holds_a_step_for_the_person(user_id, prompt_id))
+                if _resumed:
+                    response = recipe(user_id, _resume['input'], prompt_id, file_id,
+                                      request_id, autonomous=True,
+                                      text_is_the_persons=False)
+                else:
+                    response = recipe(user_id, prompt, prompt_id, file_id, request_id,
+                                      autonomous=True)
             finally:
                 try:
                     from integrations.agent_engine.dispatch import mark_create_end as _mce
@@ -11677,6 +11749,7 @@ def chat():
                     logging.getLogger(__name__).debug("chat: swallowed ImportError")
             if response in ('Agent Created Successfully',
                             'Agent Already Created Successfully'):
+                resume_build_input.pop(_ak, None)
                 with _user_lock:
                     conversation_agent[_ak] = True
                 _touch_agent_timestamp(_ak)
@@ -11695,7 +11768,12 @@ def chat():
                 )
             _record_lifecycle('Review Mode', user_id, prompt_id, 'Agent details being reviewed')
             return _chat_reply(
-                user_id, request_id, response,
+                user_id, request_id,
+                # A resumed build's output answered its own input, not this
+                # person (the one reply rule, _resumed_build_reply).  The
+                # creator's ordinary turns keep the build's reply as before.
+                _resumed_build_reply(response, user_id, prompt_id, _resume['label'])
+                if _resumed else response,
                 intent=['FINAL_ANSWER'],
                 req_token_count=0, res_token_count=0, history_request_id=[],
                 Agent_status='Review Mode',
@@ -11748,7 +11826,7 @@ def chat():
             # per-action recipes count as done — and its completion path is
             # the one that banks {pid}_{flow}_recipe.json, syncs to central
             # (update_agent_creation_to_db), and adverts to peers.
-            _agent_label = created_json.get('name') or created_json.get('agent_name') or prompt_id
+            _agent_label = _unfinished_agent_label(created_json, prompt_id)
             # No importability speculation here (steward, 2026-08-22): a
             # missing recipe FILE is agent state, and this branch's whole
             # job is routing that state into recipe().  Whether the module
@@ -11772,13 +11850,16 @@ def chat():
             # The build resumes on the agent's OWN creation input, the goal its
             # saved config carries, never this turn's text: live 2026-11-10 a
             # parent typed to an unfinished speech agent and the build took
-            # his words as the child's turn and praised them.
-            _build_input = created_json.get('goal')
-            if not isinstance(_build_input, str) or not _build_input.strip():
-                _build_input = 'Continue building this agent from its saved plan.'
-            response = recipe(user_id, _build_input, prompt_id, file_id, request_id, autonomous=True)
+            # his words as the child's turn and praised them.  That input
+            # answers no step (text_is_the_persons=False), and the next turns
+            # resume on it too (resume_build_input, read by Phase 2).
+            _build_input = _own_build_input(created_json)
+            resume_build_input[_ak] = {'input': _build_input, 'label': _agent_label}
+            response = recipe(user_id, _build_input, prompt_id, file_id, request_id,
+                              autonomous=True, text_is_the_persons=False)
             if response in ('Agent Created Successfully',
                             'Agent Already Created Successfully'):
+                resume_build_input.pop(_ak, None)
                 with _rr_lock:
                     conversation_agent[_ak] = True
                     _touch_agent_timestamp(_ak)
@@ -11790,7 +11871,7 @@ def chat():
                                   'Recipe finished autonomously from reuse routing')
                 return _chat_reply(
                     user_id, request_id,
-                    f'"{_agent_label}" is ready — its recipe is now complete. '
+                    f'{_agent_label} is ready — its recipe is now complete. '
                     f'Ask it again and it will run.',
                     intent=['FINAL_ANSWER'],
                     req_token_count=0, res_token_count=0, history_request_id=[],
@@ -11798,26 +11879,13 @@ def chat():
                 )
             _record_lifecycle('Creation Mode', user_id, prompt_id,
                               'Autonomous recipe generation in progress (from reuse routing)')
-            # A build that failed, paused for a person or was held says so in
-            # its own words, as before: the notice below is for a build still
-            # under way, and must not hide a failure behind "being completed".
-            from core.agent_tools import (is_help_pause, is_held_for_another_turn,
-                                          is_user_facing_error, is_user_pause)
-            if (is_user_facing_error(response) or is_user_pause(response)
-                    or is_help_pause(response) or is_held_for_another_turn(response)):
-                return _chat_reply(
-                    user_id, request_id, response,
-                    intent=['FINAL_ANSWER'],
-                    req_token_count=0, res_token_count=0, history_request_id=[],
-                    Agent_status='Creation Mode', prompt_id=prompt_id,
-                )
-            # The build's own output answered its input, not this person, so
-            # they are told plainly where their agent stands instead.
+            # A build that stopped or asked this person says so in its own
+            # words; anything else answered its own input, not this person,
+            # so they are told plainly where their agent stands (the one
+            # reply rule, shared with Phase 2: _resumed_build_reply).
             return _chat_reply(
                 user_id, request_id,
-                f'"{_agent_label}" is not finished yet, so it cannot answer this. '
-                f'Its build is being completed from its saved plan; your message '
-                f'was not used for it.',
+                _resumed_build_reply(response, user_id, prompt_id, _agent_label),
                 intent=['FINAL_ANSWER'],
                 req_token_count=0, res_token_count=0, history_request_id=[],
                 Agent_status='Creation Mode', prompt_id=prompt_id,

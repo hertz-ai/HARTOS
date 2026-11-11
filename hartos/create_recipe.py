@@ -4566,6 +4566,22 @@ def _hold_for_the_person(user_prompt, action_id, reason,
             f'the ledger refused the block')
 
 
+def build_holds_a_step_for_the_person(user_id, prompt_id) -> bool:
+    """True when this agent's build holds a step for the person's reply: the
+    gate flag _hold_for_the_person set on their session, so they were shown
+    the step's question ("I need your input ...", "... is waiting for your
+    reply").  Their next message is that answer and reaches recipe() as their
+    own words; any other message to an unfinished agent does not
+    (hart_intelligence_entry resume_build_input; review of cfa9e29ee).  A
+    loop-break's flag (USER_INPUT_GATE_RECOVERABLE_STALL) asked nobody.  The
+    session's flag only: after a restart between the ask and the reply, the
+    build asks again."""
+    task = user_tasks.get(f'{user_id}_{prompt_id}')
+    return (isinstance(getattr(task, '_needs_user_input_action_id', None), int)
+            and getattr(task, '_needs_user_input_kind', None)
+            != USER_INPUT_GATE_RECOVERABLE_STALL)
+
+
 def _ask_for_help(user_prompt, prompt_id, action_id, action_text, reason):
     """Hand an action the agent could not finish to someone who can (#106).
 
@@ -4829,6 +4845,14 @@ def _resume_prior_user_input_block(user_prompt, text, failure=False):
     65db06972 and c906283b6).
     """
     if failure:
+        return False
+    # Only the person's own words answer a step.  A build resuming on the
+    # agent's saved input runs on the person's request id (it must not yield
+    # to the person who is chatting), and below, a person's turn's text
+    # answers a held step and any question the window holds ("any later
+    # request answers it"): the agent's goal sentence was recorded as the
+    # child's answer (review of cfa9e29ee).
+    if not turn_text_is_the_persons.get():
         return False
     task = user_tasks.get(user_prompt)
     if task is None:
@@ -7173,6 +7197,17 @@ def track_lifecycle_hooks(current_action_id, group_chat, user_prompt):
 messages = TTLCache(ttl_seconds=7200, max_size=500, name='create_messages')
 recent_file_id = TTLCache(ttl_seconds=7200, max_size=500, name='create_recent_file_id')
 request_id_list = TTLCache(ttl_seconds=7200, max_size=500, name='create_request_id_list')
+# Whether the text recipe() was given this turn is what the person sent.
+# False only for an unfinished agent's build resuming on its own saved input
+# on a person's turn (hart_intelligence_entry resume_build_input): the gate
+# (_resume_prior_user_input_block) takes that text as nobody's answer.  It
+# belongs to the turn, not the session: recipe() sets it at every call, in
+# the turn's own thread, so a second turn of the same agent running at the
+# same time (nothing serializes them) cannot flip it, and a resumed build's
+# False never outlives its own call (hartos-d9, 11-11).
+import contextvars  # noqa: E402
+turn_text_is_the_persons = contextvars.ContextVar(
+    'create_turn_text_is_the_persons', default=True)
 recipe_for_persona = TTLCache(
     ttl_seconds=7200, max_size=500,
     name='create_recipe_for_persona',
@@ -7519,7 +7554,8 @@ from core.llm_outbound_logger import with_llm_context as _with_llm_context
 
 
 @_with_llm_context('autogen.create')
-def recipe(user_id, text, prompt_id, file_id, request_id, autonomous=False):
+def recipe(user_id, text, prompt_id, file_id, request_id, autonomous=False,
+           text_is_the_persons=True):
     """Run one CREATE turn of this agent's plan.  ``autonomous``: the caller
     runs the plan without stopping for the person at each step, so every
     flow's agents are built freed (create_agents): the assistant's AUTONOMOUS
@@ -7528,9 +7564,12 @@ def recipe(user_id, text, prompt_id, file_id, request_id, autonomous=False):
     Phase 1's salvaged config, which she has not seen), the after-restart
     branch, and the autonomous pipeline (the daemon's own plan).  A step
     that needs her is still put to her at the attempts bound
-    (_ask_for_help)."""
+    (_ask_for_help).  ``text_is_the_persons``: False when ``text`` is not
+    what the person sent this turn (an unfinished agent's build resuming on
+    its saved input on their turn); the text then answers no step."""
     user_prompt = f'{user_id}_{prompt_id}'
     request_id_list[user_prompt] = request_id
+    turn_text_is_the_persons.set(bool(text_is_the_persons))
     # A turn begins with no pause pending (helper_fun.clear_pause_request).
     helper_fun.clear_pause_request()
     current_app.logger.info('--' * 100)

@@ -260,6 +260,18 @@ def is_action_error_reply(reply) -> bool:
     return '"action_id"' in text and re.search(r'"status"\s*:\s*"error"', text) is not None
 
 
+def is_build_stop_reply(reply) -> bool:
+    """True when a build's reply says it stopped and why: a pause for the
+    person, a turn held for another, an error the person reads, a help pause,
+    or the CREATE error envelope.  Such a reply is shown as written, is never
+    counted as work, and is never hidden behind a progress notice.  One list
+    for every site that asks (review of HARTOS cfa9e29ee: a second copy left
+    out the error envelope and showed a failed build as "being completed")."""
+    return (is_user_pause(reply) or is_held_for_another_turn(reply)
+            or is_user_facing_error(reply) or is_help_pause(reply)
+            or is_action_error_reply(reply))
+
+
 # The tool menu, schema fitting, registration and runtime attach live in
 # core.agent_tool_menu (split out when this module crossed the 3000-line
 # god-module ratchet).  Re-exported so every `from core.agent_tools import X`
