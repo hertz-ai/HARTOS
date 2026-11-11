@@ -87,8 +87,10 @@ class FlaskChannelIntegration:
 
         # Self-chat handler — owner messaging their own WhatsApp number
         # becomes a private notebook-to-agent flow (persist + dispatch +
-        # reply-in-thread, no fan-out). Feature gate on the adapter
-        # config: extra.enable_self_chat_agent (default True).
+        # reply-in-thread, no fan-out). Feature gate: the owner's saved
+        # switch in the admin channel config (self_chat.
+        # saved_self_chat_setting), else the adapter's
+        # extra.enable_self_chat_agent, default True.
         from .self_chat import SelfChatHandler
         self._self_chat = SelfChatHandler(
             agent_api_url=self.agent_api_url,
@@ -122,7 +124,8 @@ class FlaskChannelIntegration:
             # ── Self-chat short-circuit ──────────────────────────
             # Owner messaging their own number → private notebook-to-
             # agent flow (persist + dispatch + reply-in-thread, no
-            # fan-out). Gated per-adapter via extra.enable_self_chat_agent.
+            # fan-out). Gated by the owner's saved switch (see
+            # SelfChatHandler.is_self_message).
             if self._self_chat.is_self_message(message):
                 logger.debug("self-chat from %s", message.sender_id)
                 # SelfChatHandler.handle() ALREADY sends its own reply

@@ -41,6 +41,10 @@ logger = logging.getLogger(__name__)
 # doesn't — so both forms must reduce to the same bare id to compare).
 _PHONE_STRIP = re.compile(r"[+\-\s]|:\d+@[a-z.]+$|@[a-z.]+$", re.IGNORECASE)
 
+# saved_self_chat_setting runs for every inbound message: an unreadable
+# admin config is logged once, not once per message.
+_saved_setting_warned = False
+
 
 def saved_self_chat_setting(channel: str) -> bool | None:
     """The owner's saved self-chat switch for ``channel``, or None.
@@ -53,12 +57,15 @@ def saved_self_chat_setting(channel: str) -> bool | None:
     per-channel prompt.  None when nothing is saved or the admin config
     cannot be read.
     """
+    global _saved_setting_warned
     try:
         from .admin.api import get_api
         entry = (getattr(get_api(), "_channels", None) or {}).get(channel)
     except Exception:
-        logger.warning("self-chat: saved channel settings unreadable",
-                       exc_info=True)
+        if not _saved_setting_warned:
+            _saved_setting_warned = True
+            logger.warning("self-chat: saved channel settings unreadable; "
+                           "using the adapter's setting", exc_info=True)
         return None
     config = entry.get("config") if isinstance(entry, dict) else None
     value = config.get("enable_self_chat_agent") if isinstance(config, dict) else None

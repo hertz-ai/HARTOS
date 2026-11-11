@@ -157,6 +157,14 @@ def test_saved_entry_without_setting_keeps_default_on(handler, fake_message,
     assert handler.is_self_message(fake_message) is True
 
 
+def test_nothing_saved_and_nothing_on_adapter_means_on(
+        handler, fake_message, fake_adapter_with_owner):
+    """The production case: the pairing path builds the adapter without
+    the setting and the owner never touched the switch."""
+    del fake_adapter_with_owner.config.extra["enable_self_chat_agent"]
+    assert handler.is_self_message(fake_message) is True
+
+
 def test_unreadable_saved_settings_fall_back_to_adapter(
         handler, fake_message, fake_adapter_with_owner, monkeypatch):
     def _boom():
