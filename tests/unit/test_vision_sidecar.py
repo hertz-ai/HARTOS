@@ -682,13 +682,16 @@ class TestIntelligentSampling:
         svc = vs.VisionService(callback_url='http://node')
         svc.store.put_frame('u1', b'cam', source='ws:127.0.0.1:61167')
         svc.store.put_screen_frame('u1', b'scr', source='desktop-capture')
-        assert svc._caption_source('u1', 'camera') == 'camera|ws:127.0.0.1:61167'
-        assert svc._caption_source('u1', 'screen') == 'screen|desktop-capture'
-        assert svc._caption_source('nobody', 'camera') == 'camera|unstated'
+        cam, cam_sender = svc.store.latest('u1', 'camera')
+        scr, scr_sender = svc.store.latest('u1', 'screen')
+        assert (cam, scr) == (b'cam', b'scr')
+        assert svc._caption_source('camera', cam_sender) == 'camera|ws:127.0.0.1:61167'
+        assert svc._caption_source('screen', scr_sender) == 'screen|desktop-capture'
+        assert svc._caption_source('camera', None) == 'camera|unstated'
         with patch.object(vs, 'pooled_post') as post:
             svc._post_description_to_db(
                 'u1', 'child looks at the screen',
-                source=svc._caption_source('u1', 'camera'))
+                source=svc._caption_source('camera', cam_sender))
             svc._post_description_to_db('u1', 'old caller')
         with_source, without = (c.kwargs['json'] for c in post.call_args_list)
         assert with_source == {
@@ -718,6 +721,37 @@ class TestIntelligentSampling:
         for seconds in (9.0, 9.0, 9.0, 9.0, 9.0, 0.1):
             slow._settle_interval(seconds)
         assert slow._description_interval == 12.0
+
+    def test_a_settled_interval_never_passes_the_longest_one(self):
+        """Review of a7d79664d: a 10 s describe settled at 42 s, over the
+        30 s max_description_interval the constructor takes."""
+        from integrations.vision.vision_service import VisionService
+        svc = VisionService(description_interval=4.0, max_description_interval=30.0)
+        for seconds in (20.0, 10.0, 10.5, 9.5, 11.0):
+            svc._settle_interval(seconds)
+        assert svc._description_interval == 30.0
+
+    def test_a_restart_settles_again_from_the_configured_interval(self):
+        """Settled once per start: a restart may run on another backend.  The
+        describing start is driven with a backend that has nothing to run, so
+        no thread starts (a headless start describes nothing and resets
+        nothing)."""
+        from integrations.vision import vision_service as vs
+        from integrations.vision.vision_service import VisionService
+        svc = VisionService(description_interval=4.0)
+        for seconds in (20.0, 3.0, 2.0, 2.5, 3.5):
+            svc._settle_interval(seconds)
+        assert svc._description_interval == 12.0
+        with patch.object(vs, 'get_vision_backend', return_value=MagicMock(name='none-backend')) as gb:
+            gb.return_value.name = 'none'
+            svc.start(mode='lite')
+        try:
+            assert svc._description_interval == 4.0
+            for seconds in (1.0, 0.5, 0.6, 0.4, 0.5):
+                svc._settle_interval(seconds)
+            assert svc._description_interval == 4.0
+        finally:
+            svc._running = False
 
     def test_scene_change_resets_interval(self):
         from integrations.vision.vision_service import VisionService
@@ -1030,3 +1064,133 @@ class TestSearchVisualHistory:
         from hartos.helper import search_visual_history
         results = search_visual_history('u1', 'test', mins=30)
         assert results is None
+
+
+# ─── One real tick of the description loop ───
+#
+# Review of a7d79664d, and build 7f8504b7 live 2026-11-10.  The loop runs for
+# one pass with the slow parts stood in: the describe is a function the test
+# writes, and what the loop posts is recorded.
+
+def _jpeg_of(height, width, value):
+    import cv2
+    ok, buf = cv2.imencode('.jpg', np.full((height, width, 3), value, dtype=np.uint8))
+    assert ok
+    return buf.tobytes()
+
+
+def _one_tick(svc, describe):
+    """Run svc's description loop for one pass; return the caption rows it
+    posted as (channel, caption, source)."""
+    from integrations.vision import vision_service as vs
+    posted = []
+
+    def _post(user_id, desc, label='Visual Context',
+              zeroshot_label='Video Reasoning', source=None):
+        posted.append((source.split('|')[0] if source else None, desc, source))
+
+    def _stop_after_the_pass(_seconds):
+        svc._running = False
+
+    svc._running = True
+    with patch.object(svc, '_describe_frame', side_effect=describe), \
+            patch.object(svc, '_post_description_to_db', side_effect=_post), \
+            patch.object(svc, '_enroll_face_signature'), \
+            patch.object(svc, '_record_to_world_model'), \
+            patch.object(svc, '_save_to_memory_graph'), \
+            patch.object(svc, '_emit_perception_event'), \
+            patch.object(svc, '_evaluate_visual_triggers'), \
+            patch.object(vs.time, 'sleep', side_effect=_stop_after_the_pass):
+        svc._description_loop()
+    return posted
+
+
+class TestTheDescriptionLoopTick:
+
+    def test_a_caption_names_the_sender_of_the_frame_it_describes(self):
+        """B's frame lands while A's is being described: the caption of A's
+        frame is A's (it was posted as B's)."""
+        from integrations.vision.vision_service import VisionService
+        svc = VisionService(description_interval=0.0)
+        svc.store.put_frame('u1', _jpeg_of(8, 8, 40), source='ws:phone-A')
+
+        def describe(user_id, frame_bytes, prompt=None):
+            svc.store.put_frame('u1', _jpeg_of(8, 8, 200), source='ws:phone-B')
+            return 'a child holds a red ball'
+
+        posted = _one_tick(svc, describe)
+        assert posted == [('camera', 'a child holds a red ball', 'camera|ws:phone-A')]
+
+    def test_a_frame_of_another_size_is_described_and_the_screen_still_is(self):
+        """Live on build 7f8504b7: a 640x480 frame was captioned, then the
+        camera sent 480x360 frames; every tick raised 'operands could not be
+        broadcast' and nothing more was captioned, screen included."""
+        from integrations.vision.vision_service import VisionService
+        svc = VisionService(description_interval=0.0)
+        svc.store.put_frame('u1', _jpeg_of(48, 64, 40), source='ws:page')
+        assert svc._should_describe('u1', svc.store.get_frame('u1'), 'camera')
+        svc.store.put_frame('u1', _jpeg_of(36, 48, 200), source='http:phone')
+        svc.store.put_screen_frame('u1', _jpeg_of(8, 8, 90), source='desktop-capture')
+        posted = _one_tick(svc, lambda user_id, frame_bytes, prompt=None: 'seen')
+        assert [p[2] for p in posted] == ['camera|http:phone', 'screen|desktop-capture']
+
+    def test_a_describe_that_captioned_nothing_does_not_set_the_interval(self):
+        """Review of a7d79664d: five 15 s timeouts settled the interval at
+        60 s for the life of the process."""
+        from integrations.vision.vision_service import VisionService
+        svc = VisionService(description_interval=0.0)
+        for value in (10, 60, 110, 160, 210):
+            svc.store.put_frame('u1', _jpeg_of(8, 8, value), source='ws:page')
+            _one_tick(svc, lambda user_id, frame_bytes, prompt=None: None)
+        assert svc._describe_times == []
+        assert svc._description_interval == 0.0
+
+
+class TestFramesOfDifferentSizes:
+
+    def test_frames_of_different_sizes_differ_completely(self):
+        from integrations.vision.frame_store import compute_frame_difference
+        a = np.zeros((480, 640, 3), dtype=np.uint8)
+        b = np.zeros((360, 480, 3), dtype=np.uint8)
+        assert compute_frame_difference(a, b) == 1.0
+        assert compute_frame_difference(b, a) == 1.0
+
+    def test_frames_of_one_size_are_compared_as_before(self):
+        from integrations.vision.frame_store import compute_frame_difference
+        a = np.zeros((8, 8, 3), dtype=np.uint8)
+        assert compute_frame_difference(a, a) == 0.0
+        assert compute_frame_difference(a, np.full((8, 8, 3), 255, np.uint8)) == pytest.approx(1.0, abs=0.01)
+
+
+class TestAFrameKeepsItsOwnSender:
+
+    def test_the_latest_frame_comes_with_its_own_sender(self):
+        from integrations.vision.frame_store import FrameStore
+        store = FrameStore()
+        store.put_frame('u1', b'a', source='ws:A')
+        store.put_frame('u1', b'b')
+        assert store.latest('u1') == (b'b', FrameStore.UNSTATED)
+        store.put_frame('u1', b'c', source='ws:C')
+        assert store.latest('u1') == (b'c', 'ws:C')
+        assert store.latest('nobody') is None
+
+    def test_a_stopped_camera_is_told_apart_from_no_camera(self):
+        from integrations.vision.frame_store import FrameStore
+        store = FrameStore(frame_ttl=0.05)
+        assert store.camera_stopped('u1') is False
+        store.put_frame('u1', b'a', source='ws:A')
+        assert store.camera_stopped('u1') is False
+        time.sleep(0.12)
+        assert store.camera_stopped('u1') is True
+        assert store.latest('u1') is None and store.frame_source('u1') is None
+        store.put_frame('u1', b'b', source='ws:A')
+        assert store.camera_stopped('u1') is False
+
+    def test_a_clock_set_back_does_not_keep_a_stopped_camera_live(self):
+        """Frame age is measured on the monotonic clock (review minor)."""
+        from integrations.vision import frame_store as fsmod
+        store = fsmod.FrameStore(frame_ttl=0.05)
+        store.put_frame('u1', b'a', source='ws:A')
+        time.sleep(0.12)
+        with patch.object(fsmod.time, 'time', return_value=0.0):
+            assert store.get_frame('u1') is None

@@ -158,6 +158,9 @@ class VisionService:
         self._minicpm_port = int(os.environ.get('HEVOLVE_MINICPM_PORT', minicpm_port or get_port('vision')))
         self._ws_port = int(os.environ.get('VISION_WS_PORT', ws_port or get_port('websocket')))
         self._description_interval = description_interval
+        # What start() goes back to before settling again (_settle_interval).
+        self._configured_interval = description_interval
+        self._describe_times: List[float] = []
         self._max_interval = max_description_interval
         self._min_scene_change = min_scene_change
         self.store = frame_store or FrameStore()
@@ -220,6 +223,12 @@ class VisionService:
         if mode == 'headless':
             logger.info("VisionService started in headless mode (FrameStore only)")
             return
+
+        # Settled once per start (_settle_interval): a restart may run on
+        # another backend, so it measures again from the configured interval.
+        # Headless describes nothing, so only a describing start resets it.
+        self._describe_times = []
+        self._description_interval = self._configured_interval
 
         if mode == 'lite':
             # Use lightweight CPU backend instead of MiniCPM sidecar
@@ -604,15 +613,19 @@ class VisionService:
         one and _SETTLE_FACTOR times the middle describe time, and it stays
         there (owner 2026-11-10: the hardware does not change between
         seconds, so the sampling rate must not either).  A fast backend keeps
-        the configured interval; a slow one gets a longer, fixed one."""
-        times = self.__dict__.setdefault('_describe_times', [])
+        the configured interval; a slow one gets a longer, fixed one, never
+        past max_description_interval (review of a7d79664d: a 10 s describe
+        settled at 42 s, over the 30 s the constructor promises).  Only
+        describes that produced a caption are counted (the caller's rule)."""
+        times = self._describe_times
         if len(times) >= self._SETTLE_AFTER:
             return
         times.append(describe_seconds)
         if len(times) < self._SETTLE_AFTER:
             return
         middle = sorted(times)[len(times) // 2]
-        settled = max(self._description_interval, self._SETTLE_FACTOR * middle)
+        settled = min(self._max_interval,
+                      max(self._description_interval, self._SETTLE_FACTOR * middle))
         if settled != self._description_interval:
             logger.info(
                 f"Description interval settled at {settled:.1f} s "
@@ -874,8 +887,11 @@ class VisionService:
                     if not self._running:
                         return
 
-                    # Camera channel
-                    frame_bytes = self.store.get_frame(user_id)
+                    # Camera channel.  The frame and who sent it are read
+                    # together: read after the describe, the sender was
+                    # whoever had sent a frame since (review of a7d79664d).
+                    got = self.store.latest(user_id, 'camera')
+                    frame_bytes, cam_sender = got if got else (None, None)
                     logger.info(
                         f"Description loop tick: user={user_id} "
                         f"cam_frame={'yes' if frame_bytes else 'no'} "
@@ -889,7 +905,10 @@ class VisionService:
                             _t0 = time.monotonic()
                             desc = self._describe_frame(user_id, frame_bytes)
                             _elapsed_ms = int((time.monotonic() - _t0) * 1000)
-                            self._settle_interval(_elapsed_ms / 1000.0)
+                            if desc:
+                                # Only a describe that captioned says how
+                                # long this machine takes; a timeout does not.
+                                self._settle_interval(_elapsed_ms / 1000.0)
                             logger.info(
                                 f"Camera describe: {len(frame_bytes)}B → "
                                 f"{len(desc or '')} chars in {_elapsed_ms} ms"
@@ -898,7 +917,7 @@ class VisionService:
                                 self.store.put_description(user_id, desc)
                                 self._post_description_to_db(
                                     user_id, desc,
-                                    source=self._caption_source(user_id, 'camera'))
+                                    source=self._caption_source('camera', cam_sender))
                                 self._record_to_world_model(user_id, desc, 'camera', frame_bytes)
                                 self._save_to_memory_graph(user_id, desc, 'camera')
                                 self._emit_perception_event(user_id, desc, 'camera')
@@ -909,8 +928,9 @@ class VisionService:
                         else:
                             self._frames_skipped += 1
 
-                    # Screen channel
-                    screen_bytes = self.store.get_screen_frame(user_id)
+                    # Screen channel (frame and sender read together, as above)
+                    got = self.store.latest(user_id, 'screen')
+                    screen_bytes, screen_sender = got if got else (None, None)
                     if screen_bytes:
                         if self._should_describe(user_id, screen_bytes, 'screen'):
                             desc = self._describe_frame(
@@ -923,7 +943,7 @@ class VisionService:
                                     user_id, desc,
                                     label='Screen Context',
                                     zeroshot_label='Screen Reasoning',
-                                    source=self._caption_source(user_id, 'screen'),
+                                    source=self._caption_source('screen', screen_sender),
                                 )
                                 self._record_to_world_model(user_id, desc, 'screen', screen_bytes)
                                 self._save_to_memory_graph(user_id, desc, 'screen')
@@ -1012,14 +1032,14 @@ class VisionService:
         except requests.RequestException:
             pass
 
-    def _caption_source(self, user_id: str, channel: str) -> str:
+    @staticmethod
+    def _caption_source(channel: str, sent_by: Optional[str]) -> str:
         """Where a caption's frame came from: '<channel>|<who sent it>', e.g.
         'camera|ws:127.0.0.1:61167' or 'screen|desktop-capture'.  Kept on the
         caption row so a reader can tell a child's camera from a screen grab
-        or from a frame filed by something else (owner 2026-11-10)."""
-        # A store handed in by an embedder may predate frame_source.
-        read = getattr(self.store, 'frame_source', None)
-        sent_by = read(user_id, channel) if callable(read) else None
+        or from a frame filed by something else (owner 2026-11-10).
+        ``sent_by`` is the sender the store returned WITH the frame
+        (FrameStore.latest)."""
         return f"{channel}|{sent_by if isinstance(sent_by, str) and sent_by else FrameStore.UNSTATED}"
 
     # ─── World Model Integration ───

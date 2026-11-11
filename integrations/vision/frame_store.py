@@ -56,6 +56,21 @@ else:
         except Exception:
             return None
 
+_pixel_difference = compute_frame_difference
+
+
+def compute_frame_difference(frame1, frame2) -> float:
+    """How different two frames are, 0.0 (same) to 1.0.  Two frames of
+    different sizes (another camera, a phone turned on its side) are a change
+    of scene, 1.0: compared pixel by pixel they raised, and the description
+    loop's tick for that person died on every frame until a frame of the old
+    size came back, screen captions included (measured live 2026-11-10 on
+    build 7f8504b7: a 640x480 page camera frame, then 480x360 frames, 84
+    'operands could not be broadcast' tracebacks and not one caption)."""
+    if getattr(frame1, 'shape', None) != getattr(frame2, 'shape', None):
+        return 1.0
+    return _pixel_difference(frame1, frame2)
+
 
 class FrameStore:
     """Thread-safe frame + description store, replaces Redis for desktop apps.
@@ -77,7 +92,8 @@ class FrameStore:
     ):
         self._lock = threading.RLock()
         # Camera channel (default, backward compatible)
-        self._frames: Dict[str, deque] = {}       # user_id → deque of (timestamp, frame_bytes)
+        # user_id → deque of (monotonic time taken, frame_bytes, who sent it)
+        self._frames: Dict[str, deque] = {}
         self._descriptions: Dict[str, tuple] = {}  # user_id → (timestamp, text)
         # Screen channel
         self._screen_frames: Dict[str, deque] = {}
@@ -87,8 +103,6 @@ class FrameStore:
         self._screen_desc_history: Dict[str, deque] = {}
         self._max_desc_history = 20  # Keep last 20 descriptions per channel
 
-        # (user_id, 'camera' | 'screen') -> who sent the latest frame
-        self._frame_source: Dict[tuple, str] = {}
         self._max_frames = max_frames
         # A camera frame older than this is not "the latest frame": nothing
         # takes a frame out when the camera stops, so the last one was read
@@ -127,37 +141,62 @@ class FrameStore:
                 return
             if user_id not in self._frames:
                 self._frames[user_id] = deque(maxlen=self._max_frames)
-            self._frames[user_id].append((time.time(), frame_bytes))
-            self._frame_source[(user_id, 'camera')] = source or self.UNSTATED
+            # Each frame keeps who sent it: kept per person instead, a caption
+            # of A's frame was posted as B's when B's frame landed while A's
+            # was being described (review of a7d79664d).  Monotonic time, so
+            # a clock set back does not keep a stopped camera live.
+            self._frames[user_id].append(
+                (time.monotonic(), frame_bytes, source or self.UNSTATED))
 
     #: The source of a frame whose producer did not say who it is.
     UNSTATED = 'unstated'
 
-    def frame_source(self, user_id: str, channel: str = 'camera') -> Optional[str]:
-        """Who sent ``user_id``'s latest frame on ``channel`` ('camera' or
-        'screen'), as the producer stated it; UNSTATED when it did not; None
-        when there is no frame.  A frame carried only (time, bytes): a caption
-        could not be traced to a camera, a screen grab or a connection, and
-        the receiver takes the account id on trust (owner 2026-11-10: "my
-        images do not have source provenance?")."""
+    def latest(self, user_id: str, channel: str = 'camera') -> Optional[Tuple[bytes, str]]:
+        """``user_id``'s latest frame on ``channel`` ('camera' or 'screen') and
+        who sent it, read together, so a caption names the sender of the
+        frame it describes; None when there is none, when the sense is off,
+        or for a camera frame older than the frame age limit."""
         with self._lock:
-            held = self._screen_frames if channel == 'screen' else self._frames
-            if not held.get(user_id):
+            sensor = 'screen' if channel == 'screen' else 'camera'
+            held = self._screen_frames if sensor == 'screen' else self._frames
+            if not self._open(sensor, held):
                 return None
-            return self._frame_source.get((user_id, channel))
+            buf = held.get(user_id)
+            if not buf:
+                return None
+            taken, frame_bytes, sent_by = buf[-1]
+            if (sensor == 'camera' and self._frame_ttl
+                    and time.monotonic() - taken > self._frame_ttl):
+                return None
+            return frame_bytes, sent_by
+
+    def frame_source(self, user_id: str, channel: str = 'camera') -> Optional[str]:
+        """Who sent ``user_id``'s latest frame on ``channel``, as the producer
+        stated it; UNSTATED when it did not; None when there is no frame (see
+        latest).  A frame carried only (time, bytes): a caption could not be
+        traced to a camera, a screen grab or a connection, and the receiver
+        takes the account id on trust (owner 2026-11-10: "my images do not
+        have source provenance?")."""
+        got = self.latest(user_id, channel)
+        return got[1] if got else None
 
     def get_frame(self, user_id: str) -> Optional[bytes]:
-        """Get the latest camera frame for a user, or None."""
+        """Get the latest camera frame for a user, or None (see latest)."""
+        got = self.latest(user_id, 'camera')
+        return got[0] if got else None
+
+    def camera_stopped(self, user_id: str) -> bool:
+        """True when ``user_id``'s camera sent frames here and the latest is
+        older than the frame age limit: the camera stopped, as opposed to
+        there being no camera.  A camera question is then answered "the
+        camera stopped", never from something else (review of a7d79664d:
+        hart_intelligence_entry.get_frame answered it from a screenshot)."""
         with self._lock:
-            if not self._open('camera', self._frames):
-                return None
             buf = self._frames.get(user_id)
-            if buf:
-                taken, frame_bytes = buf[-1]
-                if self._frame_ttl and time.time() - taken > self._frame_ttl:
-                    return None
-                return frame_bytes
-            return None
+            if not buf:
+                return False
+            return bool(self._frame_ttl) and (
+                time.monotonic() - buf[-1][0] > self._frame_ttl)
 
     def get_frame_count(self, user_id: str) -> int:
         """Number of buffered camera frames for a user."""
@@ -201,18 +240,13 @@ class FrameStore:
                 return
             if user_id not in self._screen_frames:
                 self._screen_frames[user_id] = deque(maxlen=self._max_frames)
-            self._screen_frames[user_id].append((time.time(), frame_bytes))
-            self._frame_source[(user_id, 'screen')] = source or self.UNSTATED
+            self._screen_frames[user_id].append(
+                (time.monotonic(), frame_bytes, source or self.UNSTATED))
 
     def get_screen_frame(self, user_id: str) -> Optional[bytes]:
-        """Get the latest screen frame for a user, or None."""
-        with self._lock:
-            if not self._open('screen', self._screen_frames):
-                return None
-            buf = self._screen_frames.get(user_id)
-            if buf:
-                return buf[-1][1]
-            return None
+        """Get the latest screen frame for a user, or None (see latest)."""
+        got = self.latest(user_id, 'screen')
+        return got[0] if got else None
 
     def put_screen_description(self, user_id: str, text: str):
         """Store a screen description for a user (shorter TTL than camera)."""
@@ -280,8 +314,6 @@ class FrameStore:
             self._screen_descriptions.pop(user_id, None)
             self._camera_desc_history.pop(user_id, None)
             self._screen_desc_history.pop(user_id, None)
-            self._frame_source.pop((user_id, 'camera'), None)
-            self._frame_source.pop((user_id, 'screen'), None)
 
     def active_users(self) -> list:
         """Return list of user_ids with stored frames (either channel)."""

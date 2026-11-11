@@ -7216,6 +7216,15 @@ def get_frame(user_id):
                 app.logger.info(
                     f"Frame for user_id {user_id} from FrameStore")
                 return frame[:, :, ::-1]  # BGR → RGB
+        if fs.camera_stopped(str(user_id)):
+            # This person's camera sent frames and stopped.  A camera question
+            # is not answered from the desktop: once the store refused the
+            # stopped camera's old frame, the screenshot below answered
+            # Visual_Context_Camera under no screen-capture consent (review
+            # of a7d79664d, measured).
+            app.logger.info(
+                f"No frame for user_id {user_id}: the camera stopped sending")
+            return None
 
     # Desktop screenshot fallback (for computer use mode), behind the same
     # gate _handle_screenshot_tool reads (core.ai_sensing.allowed: the eye
