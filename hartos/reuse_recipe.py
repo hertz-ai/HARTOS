@@ -8351,17 +8351,27 @@ def _reuse_held_step_gate(user_prompt, request_id):
     return None
 
 
-_CAMERA_WINDOW_START = '<Last_5_Minutes_Visual_Context_Start>'
-_CAMERA_WINDOW_END = '<Last_5_Minutes_Visual_Context_End>'
+_CAMERA_WINDOW_HEADER = ("What this person's camera showed in the last 5 minutes "
+                         "(captions of the camera, not their words):")
 
 
-def _reuse_camera_window(user_prompt):
+def _reuse_camera_window(user_prompt, request_id):
     """This person's camera captions from the last five minutes, as the one
     context builder renders them (core.user_context through
-    get_action_user_details, its tagged window and nothing else from it),
-    or '' when there are none or they cannot be read.  The person is the
-    turn's own account, so another person's camera, or the owner's screen,
-    never reaches this turn."""
+    get_action_user_details: its tagged window, capped at the newest
+    CAMERA_WINDOW_MAX_CAPTIONS, and nothing else from it), under a header
+    that says they are captions, or '' when there are none or they cannot
+    be read.  The person is the turn's own account, so another person's
+    camera, or the owner's screen, never reaches this turn.
+
+    Only a person's own turn reads it.  A background turn runs as the
+    agent's owner (daemon_<goal>), and an A2A turn from a peer
+    (daemon_a2a_<task>, google_a2a dynamic_agent_registry) sends its answer
+    to another node, so a peer could ask a shared agent what it sees (review
+    of 65ffa46b7).  Those turns read nothing."""
+    if not _reuse_request_is_a_person(request_id):
+        return ''
+    from core.user_context import VISUAL_WINDOW_END, VISUAL_WINDOW_START
     user_id = str(user_prompt).rsplit('_', 1)[0]
     try:
         _details, actions = get_action_user_details(user_id)
@@ -8370,11 +8380,11 @@ def _reuse_camera_window(user_prompt):
             f"[REUSE-SEED] the camera window of {user_id} could not be read", exc_info=True)
         return ''
     actions = str(actions or '')
-    start = actions.find(_CAMERA_WINDOW_START)
-    end = actions.find(_CAMERA_WINDOW_END, start + 1)
+    start = actions.find(VISUAL_WINDOW_START)
+    end = actions.find(VISUAL_WINDOW_END, start + 1)
     if start < 0 or end < 0:
         return ''
-    return actions[start:end + len(_CAMERA_WINDOW_END)]
+    return f"{_CAMERA_WINDOW_HEADER}\n{actions[start:end + len(VISUAL_WINDOW_END)]}"
 
 
 def _reuse_seed_message(user_prompt, message):
@@ -8453,8 +8463,9 @@ def _reuse_seed_message(user_prompt, message):
         # with their words, so a turn sees the child turn away or leave
         # without the model having to think of calling the camera tool
         # (live 2026-11-10 on build 69: a toy car and an empty chair changed
-        # nothing).  Nothing when there are no camera captions.
-        _camera = _reuse_camera_window(user_prompt)
+        # nothing).  Nothing when there are no camera captions, and nothing
+        # on a turn that is not this person's own.
+        _camera = _reuse_camera_window(user_prompt, _rid)
         seeded = _build_reuse_action_message(
             user_prompt, current_action_id,
             user_words=f"{words}\n\n{_camera}" if _camera else words)

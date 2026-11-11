@@ -15,18 +15,28 @@ Now the opening message carries that window, between the person's words and
 the steps (the token cap keeps a message's head, so the steps go first), read
 for the turn's own account only.  With no camera captions the message is as
 before.
+
+Review of the first version (65ffa46b7, REJECTED): the window went into every
+turn, so a background or A2A peer turn on a shared agent carried the owner's
+camera and could answer another node with it; it had no header, right after
+"their reply follows"; and a busy scene put 73 captions in the message head.
+Now only a person's own turn reads it, under a header that says these are
+camera captions, and the renderer keeps the newest CAMERA_WINDOW_MAX_CAPTIONS.
 """
 import os
 import sys
 import types
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
+from core import user_context  # noqa: E402
 from hartos import reuse_recipe  # noqa: E402
 
 _UP = 'child-1_4242'
+_PERSON_RID = '1762822187123'      # the Nunba adapter's timestamp id for a person's turn
 _ACTION = 'Ask the child to say "ball" and wait for the attempt.'
 _WORDS = 'car! vroom vroom... ba'
 _WINDOW = ('<Last_5_Minutes_Visual_Context_Start>, '
@@ -52,9 +62,11 @@ class TestTheTurnSeesTheCamera(unittest.TestCase):
     def setUp(self):
         self._saved_task = reuse_recipe.user_tasks.get(_UP)
         self._saved_recipe = reuse_recipe.recipes.get(_UP)
+        self._saved_rid = reuse_recipe.request_id_list.get(_UP)
         reuse_recipe.user_tasks[_UP] = _FakeTask()
         reuse_recipe.recipes[_UP] = {'actions': [{'recipe': [
             {'steps': 'send the child a prompt', 'tool_name': 'send_message_to_user'}]}]}
+        reuse_recipe.request_id_list[_UP] = _PERSON_RID
         self._app = mock.patch.object(reuse_recipe, 'current_app',
                                       types.SimpleNamespace(logger=mock.MagicMock()))
         self._app.start()
@@ -62,7 +74,8 @@ class TestTheTurnSeesTheCamera(unittest.TestCase):
     def tearDown(self):
         self._app.stop()
         for store, saved in ((reuse_recipe.user_tasks, self._saved_task),
-                             (reuse_recipe.recipes, self._saved_recipe)):
+                             (reuse_recipe.recipes, self._saved_recipe),
+                             (reuse_recipe.request_id_list, self._saved_rid)):
             if saved is None:
                 store.pop(_UP, None)
             else:
@@ -83,6 +96,48 @@ class TestTheTurnSeesTheCamera(unittest.TestCase):
         self.assertIn(_WORDS, head)
         self.assertIn(_WINDOW, head, 'the window sits before the steps, where the cap keeps it')
         self.assertLess(head.index(_WORDS), head.index(_WINDOW))
+
+    def test_the_window_says_it_is_the_camera_not_their_words(self):
+        seed = self._seed(mock.MagicMock(return_value=('details', _ACTIONS_WITH_WINDOW)))
+        header = reuse_recipe._CAMERA_WINDOW_HEADER
+        self.assertIn('not their words', header)
+        self.assertIn(f'{header}\n{_WINDOW}', seed)
+        self.assertLess(seed.index(_WORDS), seed.index(header))
+
+    def test_a_background_or_peer_turn_reads_no_camera(self):
+        """daemon_<goal> runs as the agent's owner; daemon_a2a_<task> answers
+        another node; an untagged id is background (dispatch's one rule)."""
+        for rid in ('daemon_goal-7', 'daemon_a2a_task-9', ''):
+            with self.subTest(request_id=rid):
+                reuse_recipe.request_id_list[_UP] = rid
+                details = mock.MagicMock(return_value=('details', _ACTIONS_WITH_WINDOW))
+                seed = self._seed(details)
+                self.assertEqual(seed, self._plain())
+                details.assert_not_called()
+
+    def _rendered(self, captions):
+        """The window as the one renderer writes it, from caption rows stamped
+        the way Nunba stamps them (UTC, zone named), newest first."""
+        now = datetime.now(timezone.utc)
+        rows = [{'action': text, 'zeroshot_label': 'Video Reasoning',
+                 'gpt3_label': 'Visual Context',
+                 'created_date': (now - timedelta(seconds=5 * n)).isoformat()}
+                for n, text in enumerate(captions)]
+        return ('details', user_context._format_action_rich(rows))
+
+    def test_the_renderers_own_window_rides_with_the_words(self):
+        """Mutant M2d (the tag renamed in core.user_context alone) survived the
+        first version: it searched for its own copy of the tag."""
+        seed = self._seed(mock.MagicMock(return_value=self._rendered(
+            ['A child holds a toy car'])))
+        self.assertIn('A child holds a toy car', seed)
+        self.assertIn(user_context.VISUAL_WINDOW_START, seed)
+
+    def test_the_window_carries_the_newest_captions_only(self):
+        cap = user_context.CAMERA_WINDOW_MAX_CAPTIONS
+        captions = [f'scene {n:02d}' for n in range(cap + 3)]      # newest first
+        seed = self._seed(mock.MagicMock(return_value=self._rendered(captions)))
+        self.assertEqual([c for c in captions if c in seed], captions[:cap])
 
     def test_only_the_camera_window_is_taken(self):
         seed = self._seed(mock.MagicMock(return_value=('details', _ACTIONS_WITH_WINDOW)))

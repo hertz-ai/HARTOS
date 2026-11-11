@@ -338,6 +338,13 @@ def _age(date) -> timedelta:
     return datetime.now() - date
 
 
+#: The camera window's tags in the rendered context.  A reader that takes the
+#: window alone (reuse_recipe's turn seed) imports these, so a renamed tag
+#: cannot silently empty it (review of HARTOS 65ffa46b7, mutant M2d).
+VISUAL_WINDOW_START = '<Last_5_Minutes_Visual_Context_Start>'
+VISUAL_WINDOW_END = '<Last_5_Minutes_Visual_Context_End>'
+
+
 def _format_action_rich(raw_actions: list) -> str:
     """REUSE-mode action formatter with dedup + visual + screen context.
 
@@ -390,22 +397,30 @@ def _format_action_rich(raw_actions: list) -> str:
             action_texts.append(f"{action} on {last_r.strftime('%Y-%m-%dT%H:%M:%S')}")
 
     # Visual context window (last 5 minutes).
-    video_texts = []
+    video_rows = []
     for obj in filtered_video:
         try:
             date = parse_date(obj["created_date"])
         except Exception:
             continue
+        age = _age(date)
         if obj.get("gpt3_label") == 'Visual Context':
-            if _age(date) > timedelta(minutes=5):
+            if age > timedelta(minutes=5):
                 continue
         date_r = date.astimezone(tz) if tz else date
-        video_texts.append(
-            f"{obj.get('action', '')} on {date_r.strftime('%Y-%m-%dT%H:%M:%S')}")
+        video_rows.append(
+            (age, f"{obj.get('action', '')} on {date_r.strftime('%Y-%m-%dT%H:%M:%S')}"))
+    # The newest CAMERA_WINDOW_MAX_CAPTIONS only, in the order they came: a
+    # busy scene wrote 73 captions in five minutes (2,276 tokens, all in the
+    # head of the message that the per-message token cap keeps whole; review
+    # of 65ffa46b7).
+    newest = set(sorted(range(len(video_rows)),
+                        key=lambda i: video_rows[i][0])[:CAMERA_WINDOW_MAX_CAPTIONS])
+    video_texts = [text for i, (_age_of, text) in enumerate(video_rows) if i in newest]
     if video_texts:
-        action_texts.append('<Last_5_Minutes_Visual_Context_Start>')
+        action_texts.append(VISUAL_WINDOW_START)
         action_texts.extend(video_texts)
-        action_texts.append('<Last_5_Minutes_Visual_Context_End>')
+        action_texts.append(VISUAL_WINDOW_END)
         action_texts.append(
             "If a person is identified in Visual_Context section "
             "that's most probably the user (me) & most likely not "
