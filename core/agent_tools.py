@@ -13,6 +13,7 @@ Pattern mirrors:
 import json
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -208,21 +209,12 @@ def is_held_for_another_turn(reply) -> bool:
     return reply.strip().startswith(HELD_FOR_ANOTHER_TURN_REPLY_PREFIX)
 
 
-def turn_may_see_the_camera(request_id) -> bool:
-    """True only on a person's own turn: the one turn that may read what that
-    person's camera and screen show (the live frame, the caption window, the
-    caption search).  The rule is dispatch.is_genuine_user_request, the sole
-    authority on "is this a person", read the way REUSE's camera window
-    reads it (_reuse_request_is_a_person): a goal turn (daemon_<goal>), a
-    peer agent's A2A turn (daemon_a2a_<task>, run as the owner) and an
-    untagged turn are not, and an unreadable classifier is not.
-
-    Unlike create_scheduled_jobs, an empty id is refused: a person's camera
-    is only ever opened from a /chat turn, which carries an id, while ~88% of
-    empty ids are daemon turns that lost their tag (dispatch's own note).
-    Review of HARTOS 23ccd0eb3 (critical): once that commit made these tools
-    read Nunba's stamps, a peer's A2A turn got the owner's camera and screen
-    captions through them."""
+def is_a_persons_request(request_id) -> bool:
+    """Whether ``request_id`` is a person's request: dispatch
+    .is_genuine_user_request, the sole authority on "is this a person".  A
+    goal turn (daemon_<goal>), a peer agent's A2A turn (daemon_a2a_<task>),
+    '' and an unreadable classifier are not.  The one copy of the rule:
+    REUSE's camera window (_reuse_request_is_a_person) reads it too."""
     try:
         from integrations.agent_engine.dispatch import is_genuine_user_request
         return bool(is_genuine_user_request(str(request_id or '')))
@@ -230,17 +222,54 @@ def turn_may_see_the_camera(request_id) -> bool:
         return False
 
 
+def camera_turn_id() -> str:
+    """The id of the turn a camera or screen tool runs in: what
+    with_llm_context bound for the running chat_agent / recipe() turn
+    (core.llm_outbound_logger.turn_request_id), '' when none runs.  Never
+    request_id_list, which holds the session's LAST /chat id: a scheduled
+    run read the person's id there for as long as the schedule kept the
+    cached entry fresh, a goal turn gained the camera when the person's
+    message arrived mid-turn, and the person's own turn lost it when a goal
+    turn started (review of efd223acf, findings 1-3)."""
+    from core.llm_outbound_logger import turn_request_id
+    return str(turn_request_id() or '')
+
+
+def turn_may_see_the_camera() -> bool:
+    """True only inside a person's own turn: the one turn that may read what
+    that person's camera and screen show (the live frame, the caption window,
+    the caption search).  The running turn's own id, by the person rule
+    (is_a_persons_request).  A scheduled run, an agent-to-agent relay and a
+    worker thread run in no chat_agent / recipe() turn, so their id is ''.
+
+    Review of HARTOS 23ccd0eb3 (critical): once that commit made these tools
+    read Nunba's stamps, a peer's A2A turn got the owner's camera and screen
+    captions through them."""
+    return is_a_persons_request(camera_turn_id())
+
+
 def camera_refusal(tool_name: str) -> str:
     """What a camera or screen tool answers on a turn that is not the
-    person's own (turn_may_see_the_camera): a failure the gates read as one
-    (TOOL_FAILURE_RESULTS[0], so no step is credited with it), what was
-    wrong, and what to do instead."""
-    from core.constants import TOOL_FAILURE_RESULTS
-    return (f"{TOOL_FAILURE_RESULTS[0]}\nNot looked: {tool_name} reads what "
-            f"the person's camera or screen shows, and only the person's own "
-            f"turn may do that. This turn is a background one (a goal, another "
-            f"agent, or no person's request). Do the step without it, or wait "
-            f"for the person's own message.")
+    person's own: a core.tool_refusal refusal (the reply gates read it as a
+    failed call, so no step is credited with it) naming what the turn is and
+    what to do.  A person's own turn is never refused, so it is never told it
+    is a background one (review of efd223acf, finding 4)."""
+    from core.tool_refusal import RETRY_LATER, refuse
+    rid = camera_turn_id()
+    if not rid:
+        what = ("this run answers no person's message (a scheduled run, or "
+                "work started without one)")
+    elif rid.startswith('daemon_a2a_'):
+        what = "this turn is another agent's request"
+    elif rid.startswith('daemon_'):
+        what = "this turn works on a goal in the background"
+    else:
+        what = "this turn could not be confirmed as the person's own message"
+    return refuse(tool_name,
+                  f"{what}, and only the person's own turn may look at what "
+                  f"their camera or screen shows",
+                  "Do this step without what the camera or screen shows",
+                  retry=RETRY_LATER)
 
 
 def waiting_for_person_reply(action_id) -> str:
@@ -666,6 +695,41 @@ def unfilled_key_placeholder(key) -> Optional[str]:
     return None
 
 
+# A fill-in mark left in a message for a person: an identifier joined by '_'
+# inside <> or [] ('<parent_name>', '[REVENUE_AMOUNT]').
+_TEXT_PLACEHOLDER = re.compile(
+    r'<[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+>'
+    r'|\[[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+\]')
+
+
+def unfilled_text_placeholder(text) -> Optional[str]:
+    """The first fill-in mark still left in a message for a person, or None.
+
+    Narrower than unfilled_key_placeholder on purpose.  A key never holds
+    '<' or '>' of its own, so any '<...>' in it is a placeholder; a message
+    does: a maths lesson's "3 < 5 and 7 > 2", a coding lesson's <div>, a
+    citation [1].  So only an identifier joined by '_' counts, the one shape
+    measured: live 2026-11-11 01:59 IST on build 69 (request
+    msg_1794342560815_sim) the parent received "Thank you, <parent_name>!",
+    and of the 1061 send texts in this desktop's llm_outbound logs the other
+    unfilled marks were '[REVENUE_AMOUNT]', '[TOTAL_COSTS]' and three more
+    in one send, plus '<tool_call>' call markup in two.  A single word in
+    brackets ('<name>', '[NAME]') is not caught."""
+    match = _TEXT_PLACEHOLDER.search(str(text or ''))
+    return match.group(0) if match else None
+
+
+def _placeholder_text_refusal(tool, placeholder) -> str:
+    """The failed-call reply for a message unfilled_text_placeholder found
+    a mark in; nothing is sent.  Built by core.tool_refusal.refuse, so it
+    reads as a failed call and says what to change before calling again."""
+    from core.tool_refusal import refuse
+    return refuse(tool, f"the text still holds {placeholder}, which the "
+                        f"person would read as it is",
+                  "Put the real value in its place, or leave that part out "
+                  "when it is not known, then send the text")
+
+
 def _placeholder_key_refusal(tool, key, placeholder) -> str:
     """The failed-call reply for a key ``unfilled_key_placeholder`` found,
     built by core.tool_refusal.refuse: it starts with "Error:", so
@@ -814,8 +878,8 @@ def build_core_tool_closures(ctx):
         # 10/10 on 2026-09-07).  The callee never needs an int: helper.py:2163
         # does get_frame(str(user_id)) and :2165 interpolates it into a
         # filename.  An integer id still passes through unchanged.
-        _rid = request_id_list.get(user_prompt)
-        if not turn_may_see_the_camera(_rid):
+        _rid = camera_turn_id()
+        if not turn_may_see_the_camera():
             tool_logger.warning(f"get_user_camera_inp refused on turn {_rid!r}: "
                                 f"not the person's own")
             return camera_refusal('get_user_camera_inp')
@@ -2217,6 +2281,11 @@ def build_core_tool_closures(ctx):
             tool_logger.info(
                 f'Message directed to agent ({mention}), not sending to user: {text[:50]}...')
             return f'Message directed to {mention} agent, not sending to user'
+        _placeholder = unfilled_text_placeholder(text)
+        if _placeholder:
+            tool_logger.warning(f'send_message_to_user refused: the text holds '
+                                f'the placeholder {_placeholder!r}')
+            return _placeholder_text_refusal('send_message_to_user', _placeholder)
         tool_logger.info('INSIDE send_message_to_user')
         # One line per send with what decides the step: which act it was,
         # the turn it ran in and the action it ran for, so the share of sends
@@ -2289,6 +2358,11 @@ def build_core_tool_closures(ctx):
     ) -> str:
         tool_logger.info('INSIDE send_message_in_seconds')
         tool_logger.info(f'with text:{text}. and waiting time: {delay} conv_id: {conv_id}')
+        _placeholder = unfilled_text_placeholder(text)
+        if _placeholder:
+            tool_logger.warning(f'send_message_in_seconds refused: the text '
+                                f'holds the placeholder {_placeholder!r}')
+            return _placeholder_text_refusal('send_message_in_seconds', _placeholder)
         run_time = datetime.fromtimestamp(time.time() + delay)
         scheduler.add_job(send_message_to_user1, 'date', run_date=run_time, args=[user_id, text, '', prompt_id])
         return 'Message scheduled successfully'
@@ -2327,8 +2401,8 @@ def build_core_tool_closures(ctx):
         channel: Annotated[str, "Which feed: 'camera', 'screen', or 'both' (default)"] = "both",
     ) -> str:
         """Search past camera/screen descriptions. Use for questions about what happened earlier visually."""
-        _rid = request_id_list.get(user_prompt)
-        if not turn_may_see_the_camera(_rid):
+        _rid = camera_turn_id()
+        if not turn_may_see_the_camera():
             tool_logger.warning(f"search_visual_history refused on turn {_rid!r}: "
                                 f"not the person's own")
             return camera_refusal('search_visual_history')

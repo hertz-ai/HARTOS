@@ -5320,6 +5320,13 @@ def force_apply_autogen_json_fix():
                 except Exception as e:
                     content = executor_refusal(func_name, self._function_map, raised=e)
                     print(f" EXECUTION FAILED: {func_name}: {e}")
+                if is_exec_success:
+                    # A plain callable's refusal that says nothing the model
+                    # can fix is counted here (a wrapped tool counted its
+                    # own).  Outside the try: the count can never turn a
+                    # tool that ran into a failed call.
+                    from core.tool_logging import note_executor_reply
+                    note_executor_reply(func, func_name, content)
         else:
             content = executor_refusal(func_name, self._function_map)
 
@@ -5377,6 +5384,9 @@ def force_apply_autogen_json_fix():
                 except Exception as e:
                     content = executor_refusal(func_name, self._function_map, raised=e)
                     print(f" EXECUTION ASYNC FAILED: {func_name}: {e}")
+                if is_exec_success:
+                    from core.tool_logging import note_executor_reply
+                    note_executor_reply(func, func_name, content)
         else:
             content = executor_refusal(func_name, self._function_map)
 
@@ -5874,11 +5884,21 @@ def post_agent_message(body: dict):
     rules.
 
     Returns ``(delivered, why)``.  ``delivered`` is True only when the
-    backend answered 2xx; ``why`` is '' then, else what went wrong in words
-    the agent can act on.  Both copies used to report "sent" for any answer,
-    and the backend answers 500 when the person has no session on it (review
-    of 983c98e14, its handler run against a real request), so the model was
-    told a message had arrived that had not.
+    backend answered 2xx, and ``why`` is '' then.  Otherwise ``why`` says
+    what went wrong in words the agent can act on, and ``delivered`` is:
+
+    - False: the message did not arrive (no URL set, the backend could not
+      be reached, or it refused), so sending it again is safe;
+    - None: it was sent but no answer came in time.  It may have arrived:
+      chatbot_pipeline publishes the text to the person before it makes the
+      video (chatbot.py:970), so ``why`` tells the agent not to send it
+      again (review of f1d599dd9: a resend after a read timeout reached the
+      backend twice).
+
+    Both copies used to report "sent" for any answer, and the backend
+    answers 500 when the person has no session on it (review of 983c98e14,
+    its handler run against a real request), so the model was told a
+    message had arrived that had not.
 
     Sent once (core.http_pool.pooled_post_once): the shared pool re-sends a
     POST on a read timeout, and one slow send reached the backend three
@@ -5905,6 +5925,13 @@ def post_agent_message(body: dict):
             url, data=json.dumps(body),
             headers={'Content-Type': 'application/json'},
             timeout=http_pool.LLM_COMPLETION_TIMEOUT)
+    except requests.exceptions.ReadTimeout:
+        # The request went out whole; only the answer is missing.
+        _fallback_logger.warning(
+            'agent message unconfirmed: %s took it but did not answer in time', url)
+        return None, ('the service that delivers agent messages took the '
+                      'message but did not answer in time; it may still reach '
+                      'the person, so do not send it again')
     except Exception as e:
         _fallback_logger.warning(
             'agent message not sent: %s unreachable (%s)', url, type(e).__name__)

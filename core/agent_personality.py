@@ -646,30 +646,54 @@ def is_a_name(name, agent_id='') -> bool:
 def _looks_like_an_id(name: str) -> bool:
     """An internal agent id, not a name: no space, and dotted or underscored
     ('skill.local.syllable_coach', 'swift.falcon', 'auto.agent4201').  A
-    one-word human name ('Coach', 'Ivy') is a name."""
+    one-word human name ('Coach', 'Ivy') is a name.  Asked of the saved
+    persona name only (spoken_name): that is where generate_personality
+    copied the internal agent_name."""
     return ' ' not in name and ('.' in name or '_' in name)
 
 
 def spoken_name(personality, display_name: str = '', agent_id='') -> str:
-    """The name the agent says it has.  What the person called the agent (its
-    config's display 'name') first; else its saved persona name; either only
-    when it is a name (is_a_name) and not an internal id; else a pick from
-    _PERSONA_NAMES, the same for the same agent every turn.
+    """The name the agent says it has, the same on every path that builds
+    its prompt (CREATE, REUSE, the casual identity in hartos.agent_identity).
 
-    generate_personality took the internal id (config 'agent_name',
-    'skill.local.<x>') as the persona name, so agents opened with "I'm
-    skill.local.syllable_coach" (live 2026-11-10; 916 of 920 saved
-    personalities on that desktop).  Read here, where the prompt is built,
-    so the saved files are right without rewriting them.  A persona that
-    is a human name is kept even when the agent's id is the same word
-    ('Coach'); 427 of 1236 desktop configs are named "Agent <id>", and that
-    is never spoken (review of 4b9ba08ad)."""
-    for candidate in (display_name, _field(personality, 'persona_name')):
-        candidate = str(candidate or '').strip()
-        if is_a_name(candidate, agent_id) and not _looks_like_an_id(candidate):
-            return candidate
-    internal = _field(personality, 'agent_name').strip()
-    seed = hashlib.sha256(f"{_field(personality, 'role')}:{internal}".encode()).hexdigest()
+    1. What the person called the agent (its config's display 'name'),
+       when it is a name (is_a_name): kept exactly as given, underscores and
+       dots included ('HARTOS_KidAttention_SpeechTherapy'), because that is
+       the name the consent card shows too (consent_service
+       agent_display_name reads the same is_a_name).  One rule for both
+       (review of f3db01f44: dropping such names split the card and the
+       agent for 233 agents).
+    2. Else its saved persona name, when it is a name and not an internal id
+       (_looks_like_an_id): generate_personality took the internal
+       agent_name ('skill.local.<x>') as the persona name, so agents opened
+       with "I'm skill.local.syllable_coach" (live 2026-11-10; 916 of 920
+       saved personalities on that desktop).  A one-word human persona
+       ('Coach') is kept even when it equals the agent's id word.
+    3. Else a pick from _PERSONA_NAMES seeded by the agent's id, so each
+       agent keeps one name on every path and agents that share a role and
+       an internal name do not all get the same one (review of f3db01f44:
+       seeded by role and agent_name, 452 of 792 agents said "Cleo").
+       Without an id (a caller that has none), role and agent_name seed it.
+
+    427 of 1236 desktop configs are named "Agent <id>"; that is never
+    spoken (is_a_name; review of 4b9ba08ad).
+
+    A turn's copy made by with_spoken_name already carries the chosen name;
+    it is said as it is.  Both prompt builders make that copy and then
+    build_personality_prompt reads it again here with no display name, so
+    judging it again turned a given 'Math_Tutor' into a pick on CREATE and
+    REUSE while the casual turn said 'Math_Tutor'."""
+    display = str(display_name or '').strip()
+    if is_a_name(display, agent_id):
+        return display
+    persona = _field(personality, 'persona_name').strip()
+    if isinstance(personality, _NamedForATurn) and persona:
+        return persona
+    if is_a_name(persona, agent_id) and not _looks_like_an_id(persona):
+        return persona
+    basis = str(agent_id or '').strip() or (
+        f"{_field(personality, 'role')}:{_field(personality, 'agent_name').strip()}")
+    seed = hashlib.sha256(basis.encode()).hexdigest()
     return _PERSONA_NAMES[int(seed[:8], 16) % len(_PERSONA_NAMES)]
 
 
@@ -685,13 +709,21 @@ def spoken_greeting(personality, display_name: str = '', agent_id='') -> str:
     return greeting
 
 
+@dataclass
+class _NamedForATurn(AgentPersonality):
+    """A turn's copy of a personality whose persona name and greeting are
+    the spoken ones (with_spoken_name).  spoken_name says its name as it is;
+    it is never saved (save_personality is called before the copy is made)."""
+
+
 def with_spoken_name(personality, display_name: str = '', agent_id=''):
     """A copy of ``personality`` whose persona name and greeting are the
     spoken ones, for a turn's prompt; the saved personality is unchanged."""
-    from dataclasses import replace
-    return replace(personality,
-                   persona_name=spoken_name(personality, display_name, agent_id),
-                   greeting_style=spoken_greeting(personality, display_name, agent_id))
+    from dataclasses import fields
+    named = {f.name: getattr(personality, f.name) for f in fields(AgentPersonality)}
+    named.update(persona_name=spoken_name(personality, display_name, agent_id),
+                 greeting_style=spoken_greeting(personality, display_name, agent_id))
+    return _NamedForATurn(**named)
 
 
 def _get_role_category(role: str) -> str:

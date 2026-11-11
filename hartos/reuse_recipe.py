@@ -398,8 +398,9 @@ from hartos.lifecycle_hooks import (
     action_is_autonomous, action_named_tools, action_own_text,
     is_written_answer, ANSWER_KEYS, user_output_receipt,
     SEND_TOOL, send_is_ask, verdict_waits_on_person, send_delivered,
-    delivered_text, sent_text, window_asked, tool_call_names,
+    delivered_text, sent_text, window_asked, window_question, tool_call_names,
     recorded_answers,
+    hand_goal_to_its_person,
     mark_action_waiting_for_user, resume_from_user_input,
     record_ask_delivered, ledger_open_ask, person_waits_on, is_terminal_state,
 )
@@ -952,6 +953,8 @@ def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_dela
         _ctx_safe_log(
             'error',
             f'Local publish to user failed for request_id: {intermediate_request_id}')
+        # Not published, so the same text may be sent again this turn.
+        clear_message_tracking(user_prompt, unique_message_key)
         return f'Failed to send message to user with request_id: {original_request_id}'
 
     # Standalone central HARTOS: the chatbot_pipeline backend, through the
@@ -967,6 +970,13 @@ def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_dela
     # caller was told a message it had sent had failed: central 2026-09-14,
     # 33 of 34 "Working outside of application context" errors.
     if not delivered:
+        if delivered is False:
+            # It did not arrive, so a resend of the same text must go out:
+            # drop the sent mark set above.  Kept, the resend was answered
+            # "already sent" with nothing delivered (review of f1d599dd9: a
+            # 500, then a resend).  None (no answer in time) keeps the mark:
+            # it may have arrived, and post_agent_message says not to resend.
+            clear_message_tracking(user_prompt, unique_message_key)
         _ctx_safe_log('error', f"Error sending message to user: {why}")
         return (f'Failed to send message to user with request_id: '
                 f'{original_request_id}: {why}')
@@ -2346,9 +2356,9 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
         current_app.logger.info('INSIDE get user camera inp by mins')
         # Only the person's own turn reads their camera captions (review of
         # 23ccd0eb3, critical: a peer's A2A turn got them through this tool).
-        from core.agent_tools import turn_may_see_the_camera, camera_refusal
-        _rid = request_id_list.get(user_prompt)
-        if not turn_may_see_the_camera(_rid):
+        from core.agent_tools import camera_refusal, camera_turn_id, turn_may_see_the_camera
+        _rid = camera_turn_id()
+        if not turn_may_see_the_camera():
             current_app.logger.warning(
                 f'get_user_camera_inp_by_mins refused on turn {_rid!r}: not '
                 f"the person's own")
@@ -5220,6 +5230,85 @@ def _reuse_written_answer(group_chat):
 # do not outlive the session.
 _reuse_turn_start = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_turn_start')
 
+
+def _reuse_turn_seed_index(user_prompt, messages):
+    """Where this request's turn starts in the group log: the index of the
+    newest copy of the seed it posted (_reuse_turn_start), by that exact
+    text; None when this request recorded no seed or it is not in the log."""
+    seed_text = (_reuse_turn_start.get(user_prompt) or {}).get('seed_text')
+    if not seed_text:
+        return None
+    return next((idx for idx in range(len(messages) - 1, -1, -1)
+                 if (messages[idx] or {}).get('content') == seed_text), None)
+
+
+# The seats whose prose is written for the person even when the answer rules
+# refuse it: the Assistant, and the Helper reporting to the owner (live
+# 2026-11-11 11:24 IST, daemon_8ccfa1d5: "I've identified the issue - the
+# system is missing a valid GitHub token ... You need to: 1. Generate ...").
+_REUSE_PROSE_SEATS = ('Assistant', 'Helper')
+
+
+def _reuse_turn_refused_prose(user_prompt, messages):
+    """This turn's newest prose for the person that the answer rules refused,
+    or None: the finaliser's last resort when no message of THIS turn passes
+    _reuse_message_is_user_answer.  Without it the walk back crossed the
+    request's seed and delivered an earlier turn's reply, or left raw verdict
+    JSON or the synthesis steer as the tail (review of f9fc16bc6, F1: the
+    11-11 11:24 Helper report to the owner, refused by the seat rule).
+
+    Only after this request's seed, and only an Assistant's or the Helper's
+    words: never pipeline text, a verdict or other JSON, a tool result, the
+    model's call markup, or a line handing work to another agent."""
+    start = _reuse_turn_seed_index(user_prompt, messages)
+    if start is None:
+        return None
+    for msg in reversed(messages[start + 1:]):
+        m = msg or {}
+        content = m.get('content')
+        if (not isinstance(content, str) or not content.strip()
+                or m.get('role') == 'tool'
+                or str(m.get('name') or '') not in _REUSE_PROSE_SEATS
+                or _reuse_is_pipeline_text(content)
+                or '<tool_call>' in content or '<function=' in content
+                or any(mention in content.lower() for mention in _REUSE_AGENT_MENTIONS)):
+            continue
+        if isinstance(retrieve_json(content), (dict, list)):
+            continue
+        return m
+    return None
+
+
+def _reuse_turn_delivered_send(user_prompt, messages):
+    """The text of this turn's newest send_message_to_user that reached the
+    person (lifecycle_hooks.send_delivered), or None: the finaliser's answer
+    for a turn whose words went out only through the send tool.  Such a turn
+    reached the person, so it is not a failed turn (hartos-16's criticism of
+    this rework: an ask sent mid-turn, then a pending verdict and an empty
+    synthesis round, would otherwise be answered "I couldn't finish that").
+    Only after this request's seed; the text is the call's own ``text``
+    (_reuse_send_text)."""
+    start = _reuse_turn_seed_index(user_prompt, messages)
+    if start is None:
+        return None
+    window = messages[start + 1:]
+    call_fn = _reuse_call_id_to_tool_name([window])
+    for msg in reversed(window):
+        m = msg or {}
+        if m.get('role') != 'tool':
+            continue
+        responses = m.get('tool_responses')
+        for result in reversed(responses if isinstance(responses, list) and responses else [m]):
+            if not isinstance(result, dict):
+                continue
+            call_id = result.get('tool_call_id') or m.get('tool_call_id')
+            body = str(result.get('content') or m.get('content') or '')
+            if call_fn.get(call_id) == SEND_TOOL and send_delivered(body):
+                text = _reuse_send_text(window, call_id)
+                if isinstance(text, str) and text.strip():
+                    return text
+    return None
+
 # _REUSE_SAVE_ONLY_TOOLS (imported above) is core.constants
 # .BOOKKEEPING_SAVE_TOOLS: the saves of the agent's own notes, whose result
 # the person never reads.  It is imported, not built here, because the
@@ -5267,13 +5356,8 @@ def _reuse_turn_written_reply(user_prompt, group_chat):
     """
     try:
         from hartos.lifecycle_hooks import latest_dispatch_before
-        seed_text = (_reuse_turn_start.get(user_prompt) or {}).get('seed_text')
         messages = list(getattr(group_chat, 'messages', None) or [])
-        if not seed_text or not messages:
-            return None
-        boundary = next((idx for idx in range(len(messages) - 1, -1, -1)
-                         if (messages[idx] or {}).get('content') == seed_text),
-                        None)
+        boundary = _reuse_turn_seed_index(user_prompt, messages)
         if boundary is None:
             return None
         named = {}
@@ -7352,23 +7436,63 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
         #
         # Ask the SAME predicate the synthesis gate asks, so "is this an
         # answer?" has one definition here and there, and walk back to the
-        # last message that really is one.  Unbounded by the action dispatch
-        # on purpose: this is the turn being finalised, not an action being
-        # credited (that is _reuse_written_answer's bounded job).  If nothing
-        # qualifies, the tail stands — this narrows what is delivered and
-        # never returns '' (#797/D31).
+        # last message that really is one.  Not bounded by the action
+        # dispatch: this is the turn being finalised, not an action being
+        # credited (that is _reuse_written_answer's bounded job).  Bounded by
+        # this request's seed: past it lies an earlier turn, whose reply the
+        # person already read (review of f9fc16bc6, F1: the walk delivered
+        # "Yesterday's lesson ..." for a turn whose only answer the seat rule
+        # refused).  When nothing of this turn passes, this turn's own prose
+        # the rules refused (_reuse_turn_refused_prose), never raw verdict
+        # JSON or the steer.  With no seed recorded for this request the walk
+        # reads the whole log as before.  When this turn wrote no prose, the
+        # text of its newest send that reached the person
+        # (_reuse_turn_delivered_send): the turn did reach them.  When it
+        # reached them with nothing at all, the reply is the one honest
+        # failed-turn sentence (core.agent_tools.user_facing_error, which
+        # is_user_facing_error recognises downstream), never the tail: live on build 69
+        # (msg_1794342560815_sim, task #291) every Assistant message of the
+        # parent's steer turn carried tool calls and the raw
+        # {"status": "requires_breakdown", ...} went out.  It never returns ''
+        # (#797/D31).
         if not _reuse_message_is_user_answer(last_message):
-            for _cand in reversed(group_chat.messages):
+            _msgs = group_chat.messages
+            _start = _reuse_turn_seed_index(user_prompt, _msgs)
+            _picked, _why = None, 'the last real one'
+            for _cand in reversed(_msgs[(_start + 1) if _start is not None else 0:]):
                 if _reuse_message_is_user_answer(_cand):
+                    _picked = _cand
+                    break
+            if _picked is None:
+                _picked = _reuse_turn_refused_prose(user_prompt, _msgs)
+                _why = "this turn's own words the answer rules refused"
+            if _picked is not None:
+                current_app.logger.info(
+                    f"[SYNTHESIS] tail is not an answer "
+                    f"({str((last_message or {}).get('name') or '?')}); "
+                    f"delivering {_why} instead "
+                    f"(session: {user_prompt}, "
+                    f"from={_picked.get('name') or '?'}, "
+                    f"head={str(_picked.get('content'))[:120]!r})")
+                last_message = _picked
+            else:
+                _sent = _reuse_turn_delivered_send(user_prompt, _msgs)
+                if _sent is not None:
                     current_app.logger.info(
                         f"[SYNTHESIS] tail is not an answer "
                         f"({str((last_message or {}).get('name') or '?')}); "
-                        f"delivering the last real one instead "
-                        f"(session: {user_prompt}, "
-                        f"from={_cand.get('name') or '?'}, "
-                        f"head={str(_cand.get('content'))[:120]!r})")
-                    last_message = _cand
-                    break
+                        f"this turn's words reached the person through the "
+                        f"send tool, delivering the newest of them "
+                        f"(session: {user_prompt}, head={_sent[:120]!r})")
+                    return _sent
+                current_app.logger.info(
+                    f"[SYNTHESIS] tail is not an answer "
+                    f"({str((last_message or {}).get('name') or '?')}) and "
+                    f"this turn wrote nothing for the person; delivering the "
+                    f"could-not-finish reply instead (session: {user_prompt})")
+                from core.agent_tools import user_facing_error
+                return user_facing_error(RuntimeError(
+                    'I did not get an answer ready for you. Please ask me again.'))
         # len>1 matters: a lone TERMINATE would send [-2] off the front.
         if last_message['content'] == 'TERMINATE' and len(group_chat.messages) > 1:
             last_message = group_chat.messages[-2]
@@ -7662,23 +7786,21 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
         if _gc is not None:
             _agents = list(getattr(_gc, 'agents', None) or [])
             # A question asked on a turn nobody can answer (a daemon or hive
-            # turn records no ask, #161) is never the step's output, and a
-            # re-steer only sends it again.  The step ends GAVE_UP for retry;
-            # the owner's 2026-10-31 ruling routes such a question to the
-            # goal's owner (parts B1-B3).
+            # turn) is never the step's output, and a re-steer only sends it
+            # again.  It goes to the goal's person (Part B; the owner's
+            # 2026-10-31 ruling: park, notify, resume): the step holds and
+            # the goal parks.  31ec05d14 ended it GAVE_UP for retry, the
+            # option the owner rejected, and each tick asked again.
             if (not _reuse_person_turn(user_prompt)
-                    and window_asked(list(getattr(_gc, 'messages', None) or []),
-                                     current_action_id,
-                                     recorded_answers(user_prompt, current_action_id,
-                                                      _reuse_action_flow(
-                                                          user_prompt, current_action_id)))):
-                current_app.logger.warning(
-                    f"[REUSE] action {current_action_id} asked on a turn nobody "
-                    f"can answer; recording GAVE_UP for retry")
-                force_state_through_valid_path(
-                    user_prompt, current_action_id, ActionState.GAVE_UP,
-                    f"{reason}: asked on a turn nobody can answer")
-                return None, False
+                    and str(request_id_list.get(user_prompt) or '').startswith('daemon_')):
+                _asked = window_question(
+                    list(getattr(_gc, 'messages', None) or []), current_action_id,
+                    recorded_answers(user_prompt, current_action_id,
+                                     _reuse_action_flow(user_prompt, current_action_id)))
+                if _asked is not None:
+                    _reuse_hand_background_ask(user_prompt, current_action_id,
+                                               _asked, prompt_id, reason)
+                    return None, False
             # The person's reply to this step's open ask stands in for the
             # ask's own send (#161): a question the model returned to the
             # person instead of sending was answered all the same, so the gate
@@ -7942,12 +8064,10 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
 def _reuse_request_is_a_person(request_id):
     """The sole authority on "is this a person's turn", as CREATE's resume
     reads it; an unreadable classifier reads False, which holds a step rather
-    than closing it."""
-    try:
-        from integrations.agent_engine.dispatch import is_genuine_user_request
-        return bool(is_genuine_user_request(str(request_id or '')))
-    except Exception:
-        return False
+    than closing it.  One copy of the rule, core.agent_tools
+    .is_a_persons_request, which the camera and screen tools read too."""
+    from core.agent_tools import is_a_persons_request
+    return is_a_persons_request(request_id)
 
 
 def _reuse_session_ledger(user_prompt):
@@ -8342,6 +8462,51 @@ def _reuse_wait_for_the_person(user_prompt, action_id, reason):
     return held
 
 
+def _reuse_hand_background_ask(user_prompt, action_id, asked, prompt_id, reason):
+    """A background step's question (Part B): record it as asked via the
+    escalation, hold the step through the canonical wait, and park its goal
+    with its person told once (_reuse_park_for_its_person).
+
+    Never recorded as delivered (hartos-c9's condition 1): measured on the
+    owner's desktop 2026-11-02, a background goal's REUSE session runs as an
+    agent row (agent_27130929014_0), so the step's send reached no one; the
+    escalation's notice is the delivery."""
+    index, question = asked
+    flow = _reuse_action_flow(user_prompt, action_id)
+    request_id = request_id_list.get(user_prompt)
+    record_ask_delivered(user_prompt, action_id, request_id, index, flow,
+                         via='escalation', question=question)
+    _reuse_wait_for_the_person(user_prompt, action_id,
+                               'asked on a background turn; its person is told')
+    _reuse_park_for_its_person(user_prompt, action_id, question, request_id,
+                               f'{reason}: asked its person a question', prompt_id)
+
+
+def _reuse_park_for_its_person(user_prompt, action_id, question, request_id,
+                               reason, prompt_id=None):
+    """Park the goal behind a background request whose step waits for its
+    person, through the one hand-off CREATE uses
+    (lifecycle_hooks.hand_goal_to_its_person, record shape shared).  The
+    same action asked again tells no one again (escalate_goal keeps told_at
+    for it), so a dashboard resume of the goal only parks it again."""
+    from core.chat_client import daemon_goal_id
+    goal_id = daemon_goal_id(request_id)
+    if prompt_id is None and '_' in str(user_prompt):
+        prompt_id = str(user_prompt).rsplit('_', 1)[1]
+    try:
+        action_text = action_own_text(user_tasks[user_prompt].get_action(int(action_id) - 1))
+    except Exception:
+        action_text = ''
+    stage = hand_goal_to_its_person(goal_id, user_prompt, prompt_id, action_id,
+                                    action_text, reason,
+                                    _reuse_action_flow(user_prompt, action_id),
+                                    ask=question or '')
+    current_app.logger.warning(
+        f"[REUSE-WAIT] action {action_id} of {user_prompt} asks its person on a "
+        f"background turn; goal {goal_id or 'none'} handed to {stage or 'nobody'}")
+    return stage
+
+
 def _reuse_note_ask_and_wait(user_prompt, action_id, group_chat, returned_text=None):
     """At a hold or a turn exit on a PERSON's turn: record the ask this
     step's window delivered, if any, and take the canonical wait when an ask
@@ -8353,6 +8518,24 @@ def _reuse_note_ask_and_wait(user_prompt, action_id, group_chat, returned_text=N
     recorded from the model's "Arjun replied.")."""
     try:
         if not _reuse_person_turn(user_prompt):
+            # A background turn that ends with its step's question out, by
+            # any exit (Part B): the same hand-off the advance gate makes,
+            # so the next tick finds the step held and the goal parked
+            # instead of asking again.  Live 2026-11-02 14:14-14:15 on the
+            # owner's desktop, goal 072ad02d sent one question 3 times in
+            # one background request.
+            if (str(request_id_list.get(user_prompt) or '').startswith('daemon_')
+                    and not is_terminal_state(get_action_state(user_prompt, action_id))
+                    and not ledger_open_ask(user_prompt, action_id,
+                                            _reuse_action_flow(user_prompt, action_id))):
+                _asked = window_question(
+                    list(getattr(group_chat, 'messages', None) or []), action_id,
+                    recorded_answers(user_prompt, action_id,
+                                     _reuse_action_flow(user_prompt, action_id)))
+                if _asked is not None:
+                    _reuse_hand_background_ask(user_prompt, action_id, _asked, None,
+                                               'turn exit')
+                    return True
             return False
         if is_terminal_state(get_action_state(user_prompt, action_id)):
             return False
@@ -8429,6 +8612,17 @@ def _reuse_held_step_gate(user_prompt, request_id):
             current_app.logger.info(
                 f"[REUSE-WAIT] action {action_id} still waits for the person; "
                 f"background request {request_id!r} neither runs nor re-asks it")
+            # A goal resumed from the dashboard while its step still waits
+            # parks again; its person was told already and is not told
+            # twice (Part B, hartos-c9's condition 4).  Only for an ask the
+            # background hand-off recorded: an ask put to the person on
+            # their own turn is answered in their chat, which resumes the
+            # step, and nothing would un-park a goal parked for it.
+            _ask = ledger_open_ask(user_prompt, action_id,
+                                   _reuse_action_flow(user_prompt, action_id)) or {}
+            if _ask.get('via') == 'escalation':
+                _reuse_park_for_its_person(user_prompt, action_id, _ask.get('question'),
+                                           request_id, 'still waits for its person')
             from core.agent_tools import waiting_for_person_reply
             return waiting_for_person_reply(action_id)
         # A turn with no request id (standalone /chat without one, #46) may

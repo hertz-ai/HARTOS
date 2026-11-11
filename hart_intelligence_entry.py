@@ -8480,6 +8480,9 @@ def _cleanup_stale_agents():
         if now - _agent_timestamps[key] > _AGENT_TTL:
             review_agents.pop(key, None)
             conversation_agent.pop(key, None)
+            # Set beside review_agents, so it ages out with it (review of
+            # 49eee800d: unbounded, never evicted).
+            resume_build_input.pop(key, None)
             _agent_timestamps.pop(key, None)
     # Also clean stale gather turn counters
     # Both _gather_turn_counts and _agent_timestamps now use '{user_id}_{prompt_id}' keys
@@ -10254,8 +10257,16 @@ def _a_turns_model_ends_with_its_request(_exc=None):
     in-process test client (dispatch._native_chat, on the daemon's own
     thread).  /time_agent and /visual_agent never set it, so a scheduled run
     on a reused worker thread inherited an earlier expert turn's model and
-    spent it outside the day-cap check (review of 75dc20add, P2)."""
+    spent it outside the day-cap check (review of 75dc20add, P2).
+
+    The request's id ends with it too.  /chat and /response_ack set it on
+    the thread and nothing cleared it, so a later request on a reused worker
+    thread inherited it: with_llm_context binds the thread's id for a turn
+    called without one, and the camera and screen tools judge the turn by
+    that id (core.agent_tools.camera_turn_id; review of efd223acf, finding 5:
+    an untagged turn inherited a stale id)."""
     thread_local_data.clear_model_config_override()
+    thread_local_data.set_request_id(None)
 
 
 @app.route('/chat', methods=['POST'])
@@ -10992,6 +11003,22 @@ def chat():
                     # file-state alone (broke chat-mode for finished agents).
                     if create_agent or autonomous:
                         _ak = f'{user_id}_{prompt_id}'
+                        # The same rule as the partly built branch above: a
+                        # turn that did not arrive mid-build resumes the
+                        # build on the agent's own input, whatever flag the
+                        # client sent (review of 49eee800d, must-fix 1: a
+                        # request carrying create_agent handed the person's
+                        # words to recipe() here).
+                        if not review_agents.get(_ak):
+                            try:
+                                with open(os.path.join(PROMPTS_DIR, f'{prompt_id}.json'),
+                                          'r') as _bf:
+                                    _bdata = json.load(_bf)
+                            except Exception:
+                                _bdata = {}
+                            resume_build_input[_ak] = {
+                                'input': _own_build_input(_bdata),
+                                'label': _unfinished_agent_label(_bdata, prompt_id)}
                         review_agents[_ak] = True
                         conversation_agent[_ak] = False
                         _touch_agent_timestamp(_ak)

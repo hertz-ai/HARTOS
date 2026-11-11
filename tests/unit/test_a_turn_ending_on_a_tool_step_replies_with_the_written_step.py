@@ -560,6 +560,36 @@ def test_a_read_step_answer_with_no_verdict_after_it_stays_the_reply(make):
     assert tail == answer, f'delivered {tail!r}'
 
 
+def test_a_last_step_naming_another_tool_keeps_its_own_tail(make):
+    """Review of f9fc16bc6, F4 (mutant M18 survived): the turn picker and P9
+    act only when the last step's named tools are all saves.  A search step
+    whose window holds a longer note before its call and the short answer
+    after its result, with no verdict after it, keeps that answer as the
+    tail: nothing is appended and no steer is posted."""
+    up = 'turnreply_m18'
+    a2 = ("Use google_search to find the population of Tokyo and tell the "
+          "learner the number.")
+    task, agents = make(up, [WRITE, a2], ['google_search'])
+    seed = rr._reuse_seed_message(up, 'How many people live in Tokyo?')
+    task.current_action = 3
+    opening = ("REPLY: Great question! Tokyo is the capital of Japan and one "
+               "of the largest cities in the world; I will find the latest "
+               "figure for you.")
+    preamble = ("I'll search for the latest population figure for Tokyo, the "
+                "metropolis and the wider prefecture, and then tell you the "
+                "number.")
+    answer = 'Tokyo has about 14 million people.'
+    log = [_seed_msg(seed), _assistant(opening), _verdict(1), _dispatch(2, a2),
+           _assistant(preamble), _call('g1', 'google_search'),
+           _result('g1', 'Tokyo: 14,000,000'), _assistant(answer)]
+    chat = _Chat(log, agents)
+    rec = _Recorder()
+    rr._reuse_synthesis_turn(up, chat, _Manager(), rec)
+    assert [m.get('content') for m in chat.messages[len(log):]] == []
+    assert chat.messages[-1]['content'] == answer
+    assert rec.messages == []
+
+
 def test_a_turn_ending_on_its_writing_step_is_left_alone(make):
     """No save step at the end: nothing is appended, the answer stands."""
     up = 'turnreply_p9_write_last'

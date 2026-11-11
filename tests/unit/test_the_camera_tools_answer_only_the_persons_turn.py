@@ -67,25 +67,59 @@ class _Reply:
         return self._data
 
 
+def _in_a_turn(rid, fn, *args):
+    """Run ``fn`` inside a turn whose own id is ``rid``: what with_llm_context
+    binds around chat_agent and recipe() (core.llm_outbound_logger
+    .request_id_context).  A goal's and a peer's turns run through those
+    entries too, with their own ids."""
+    from core.llm_outbound_logger import request_id_context
+    with request_id_context(rid):
+        return fn(*args)
+
+
 class TestTheRule:
 
     def test_a_persons_turn_may_look(self):
         from core.agent_tools import turn_may_see_the_camera
-        assert turn_may_see_the_camera(PERSON) is True
+        assert _in_a_turn(PERSON, turn_may_see_the_camera) is True
 
     @pytest.mark.parametrize('kind', list(NOT_A_PERSON))
     def test_no_other_turn_may(self, kind):
         from core.agent_tools import turn_may_see_the_camera
-        assert turn_may_see_the_camera(NOT_A_PERSON[kind]) is False
-        assert turn_may_see_the_camera(None) is False
+        assert _in_a_turn(NOT_A_PERSON[kind], turn_may_see_the_camera) is False
 
-    def test_the_refusal_is_a_failure_that_says_what_to_do(self):
+    def test_outside_any_turn_nothing_may(self):
+        """A scheduled run, a relay and a worker thread run in no turn."""
+        from core.agent_tools import turn_may_see_the_camera
+        assert turn_may_see_the_camera() is False
+
+    def test_an_unreadable_classifier_refuses(self, monkeypatch):
+        """Fail closed (review of efd223acf, surviving mutant M2)."""
+        import integrations.agent_engine.dispatch as dispatch
+        from core.agent_tools import turn_may_see_the_camera
+
+        def boom(_rid):
+            raise RuntimeError('classifier down')
+        monkeypatch.setattr(dispatch, 'is_genuine_user_request', boom)
+        assert _in_a_turn(PERSON, turn_may_see_the_camera) is False
+
+    @pytest.mark.parametrize('rid, says', [
+        ('', 'a scheduled run'),
+        (NOT_A_PERSON['a2a peer'], "another agent's request"),
+        (NOT_A_PERSON['daemon goal'], 'a goal in the background'),
+    ])
+    def test_the_refusal_names_the_turn_and_says_what_to_do(self, rid, says):
+        """Built with core.tool_refusal.refuse (review of efd223acf, finding 4):
+        a failed call the gates read, a hint the framework counts, no "try
+        later", and what the turn is."""
         from core.agent_tools import camera_refusal
-        from core.constants import TOOL_FAILURE_RESULTS, tool_reply_failed
-        text = camera_refusal('search_visual_history')
-        assert text.startswith(TOOL_FAILURE_RESULTS[0])
+        from core.constants import tool_reply_failed
+        from core.tool_refusal import refusal_has_hint
+        text = _in_a_turn(rid, camera_refusal, 'search_visual_history')
         assert tool_reply_failed(text), "a refused look must never credit a step"
-        assert 'background' in text and "person's own" in text
+        assert refusal_has_hint(text), text
+        assert says in text and "person's own" in text, text
+        assert 'try later' not in text and 'background one' not in text, text
 
 
 @pytest.fixture
@@ -122,7 +156,10 @@ def reuse_agents(create_env, monkeypatch):
     monkeypatch.setattr(h, 'get_visual_context_api',
                         lambda user_id, mins=5: 'http://store/get_visual_bymins')
     monkeypatch.setattr(h, 'pooled_request', lambda *a, **k: _Reply(rows))
-    monkeypatch.setattr(h, 'get_user_camera_inp', lambda inp, uid, rid: LIVE)
+    # The live frame is filed under the turn's own id (output_images/{user}_{rid}_call.jpg),
+    # so a tool that passed another id is a wrong answer (review of efd223acf, mutant M6).
+    monkeypatch.setattr(h, 'get_user_camera_inp',
+                        lambda inp, uid, rid: LIVE if rid == PERSON else f'WRONG ID {rid!r}')
     with env.app.app_context():
         built = rr.create_agents_for_user(USER_ID, PROMPT_ID)
     rr.user_agents[CUP] = built
@@ -148,10 +185,13 @@ def _call(env, rr, built, tool, rid):
     agent = _holder(built, tool)
     assert agent is not None, f"{tool} is not in any built agent's function map"
     rr.request_id_list[CUP] = rid
-    with env.app.app_context():
-        _ok, result = agent.execute_function(
-            {'name': tool, 'arguments': json.dumps(TOOLS[tool])})
-    return str(result.get('content'))
+
+    def run():
+        with env.app.app_context():
+            _ok, result = agent.execute_function(
+                {'name': tool, 'arguments': json.dumps(TOOLS[tool])})
+        return str(result.get('content'))
+    return _in_a_turn(rid, run)
 
 
 @pytest.mark.parametrize('tool', list(TOOLS))

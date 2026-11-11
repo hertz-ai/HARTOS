@@ -290,6 +290,26 @@ def _agent_name(agent_id) -> Optional[str]:
         return None
 
 
+def _unfilled_blank(body, component) -> Optional[str]:
+    """The reason (``body``) or a field's label that is still, as a whole, a
+    '<...>' blank, or None.  What a blank is, is the memory keys' rule
+    (core.agent_tools.unfilled_key_placeholder).  The tool's example writes
+    the reason and the question as "<why you ask>" and "<your question>", and
+    the 4B copies the example word for word (live 2026-11-07); sent as they
+    are, the card read "<why you ask>" over a box labelled "<your question>"
+    (review of ab68963ea, MF-1).  Words that only hold a '<' or a '>' ('Is
+    the parcel <2 kg?') are asked."""
+    from core.agent_tools import unfilled_key_placeholder
+    fields = component.get('fields') if isinstance(component, dict) else None
+    labels = ([f.get('label') for f in fields if isinstance(f, dict)]
+              if isinstance(fields, list) else [])
+    for text in [body, *labels]:
+        text = text.strip() if isinstance(text, str) else ''
+        if text and unfilled_key_placeholder(text) == text:
+            return text
+    return None
+
+
 def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
         body: str = '',
         background: bool = False) -> dict:
@@ -303,8 +323,9 @@ def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
     when the same question is already open).  ``refused`` names why nothing
     was sent: 'no_person', 'not_an_object', 'secrets_go_to_the_vault',
     'unknown_purpose', 'no_agent', 'say_why_in_description' (no reason given:
-    neither ``body`` nor the component's description), 'too_many_open_asks',
-    'not_shown' (the
+    neither ``body`` nor the component's description), 'unfilled_placeholder'
+    (the reason, or a field's label, is still a whole '<...>' blank, as the
+    tool's example writes it), 'too_many_open_asks', 'not_shown' (the
     Liquid UI gates refused the card: switched off, the hive halted, unsafe
     content, an unknown type, too many pushes; the log says which) or
     'not_filed' (its row could not be written).
@@ -321,14 +342,20 @@ def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
     agent_id = str(agent_id if agent_id is not None else (prompt_id or ''))
     # The card says who asks and why (owner 2026-11-03: "Your agent asks for
     # files ... not why, for what"): the reason is the agent's own words, so an
-    # ask without one is not sent; with no title of its own, the title names
-    # the agent as the person knows it.  The card, the bell row and the push
-    # carry the same title and reason.
+    # ask without one is not sent, nor one whose reason or question is still
+    # the tool example's blank; with no title of its own, the title names the
+    # agent as the person knows it.  The card and the push carry the title and
+    # the reason; the bell row carries the title.
     body = (body or component.get('description') or '').strip()
     if not body:
         logger.info("person ask refused (say_why_in_description) for user %s by "
                     "agent %s", user_id, agent_id)
         return _refused('say_why_in_description')
+    blank = _unfilled_blank(body, component)
+    if blank:
+        logger.info("person ask refused (unfilled_placeholder %s) for user %s by "
+                    "agent %s", blank, user_id, agent_id)
+        return _refused('unfilled_placeholder')
     title = (title or component.get('title') or '').strip()
     if not title:
         name = _agent_name(agent_id)
@@ -810,8 +837,8 @@ _SAY_WHY = ('Not sent: say why you ask in the component\'s "description", in you
 #: to do instead (owner 11-09: "all refusals shd hint llm on what was wrong
 #: with tool call").  A bare code made the 4B ask again: 66 of the desktop's
 #: 135 failing tool replies were this tool's too_many_open_asks (measured by
-#: hartos-16 in llm_outbound.jsonl).  not_an_object and too_many_open_asks
-#: are worded per call, in _refusal_note.
+#: hartos-16 in llm_outbound.jsonl).  not_an_object, unfilled_placeholder
+#: and too_many_open_asks are worded per call, in _refusal_note.
 _REFUSAL_NOTES = {
     'no_person': ('Not sent: this turn has no person to ask. Do the step without '
                   'asking, or say in your reply that it needs a person.'),
@@ -850,6 +877,12 @@ def _refusal_note(refused, comp, person, asker, background) -> str:
                else 'what you sent is not JSON' if comp is None
                else 'what you sent is JSON but not an object')
         return f'Not sent: component must be a JSON object with a "type"; {got}. {_ASK_SHAPE}'
+    if refused == 'unfilled_placeholder':
+        blank = _unfilled_blank(comp.get('description') if isinstance(comp, dict) else '',
+                                comp) or 'a <...> blank'
+        return (f'Not sent: {blank} is the example\'s blank, not your words, and the '
+                'person would read it as it is. Write in its place, in your own words, '
+                'why you ask ("description") and what you ask (each field\'s "label").')
     if refused == 'too_many_open_asks':
         whose = 'from background work ' if background else ''
         said = (f'Not sent: this person already has {MAX_OPEN_PER_PERSON} questions '

@@ -89,11 +89,13 @@ def post_preview(platform: str, content: str, handle: Optional[str] = None,
         'dry_run': False,
         'connection_mechanism': 'unimplemented_write',
         'error': (
-            f'post action for {platform!r} is preview-only in this build. '
-            'Per-platform POST implementation pending — preview-confirm '
-            'contract is in place but real write is intentionally gated. '
-            'Track in memory/project_browser_research_subsystem.md.'
+            f'nothing was posted to {platform}: posting is preview-only in '
+            'this build, which has no per-platform write path yet. The text '
+            'was not sent anywhere and comes back unchanged under "content", '
+            'so the person can post it themselves now; for the agent to post '
+            'it, a reviewed per-platform write path has to land first.'
         ),
+        'content': content,
     }
 
 
@@ -104,30 +106,59 @@ def fetch_with_session(url: str, platform: str, handle: Optional[str] = None,
     Looks up the AccountVault for the (platform, handle) cookie jar, picks
     the B2/B1 mode from env, and calls the canonical crawler.
 
-    Returns the crawler dict augmented with `platform`/`handle` so the audit
-    log can attribute the call.
+    Returns the crawler dict augmented with `platform`, `handle` and
+    `authenticated`.  `handle` is the handle whose cookies were ACTUALLY
+    sent, or None when the crawl went out logged out — it is never the
+    handle that was merely asked for.  When no cookies resolve, the result
+    is relabelled `logged_out_public` and carries a `notice` the agent must
+    repeat, because a logged-out fetch returns the public view or a login
+    wall, never the person's own signed-in session.
     """
     from ..vault import get_vault
     from integrations.web_crawler import crawl_url_with_cookies
 
+    # An entry with an empty cookie list is not a session, so it must not
+    # count as one — `authenticated` is about cookies on the wire, not about
+    # a row existing in the vault.
     cookies: list = []
+    session_handle: Optional[str] = None
+    v = get_vault()
     if handle:
-        acc = get_vault().get(platform, handle)
-        if acc:
+        acc = v.get(platform, handle)
+        if acc and acc.cookies:
             cookies = acc.cookies
+            session_handle = handle
     else:
-        # No handle given — pick the first vault entry for the platform
-        v = get_vault()
-        handles = v.list_handles(platform)
-        if handles:
-            handle = handles[0]
-            acc = v.get(platform, handle)
-            if acc:
+        # No handle given — first vault entry for the platform that has cookies
+        for candidate in v.list_handles(platform):
+            acc = v.get(platform, candidate)
+            if acc and acc.cookies:
                 cookies = acc.cookies
+                session_handle = candidate
+                break
 
     cdp = get_cdp_endpoint()
     result = crawl_url_with_cookies(url, cookies=cookies, timeout=timeout,
                                     cdp_endpoint=cdp)
     result['platform'] = platform
-    result['handle'] = handle
+    result['handle'] = session_handle
+    result['authenticated'] = bool(cookies)
+    if not cookies:
+        # Was: the handle that was asked for got stamped on the result and the
+        # crawler's own mechanism was left in place, so a logged-out crawl was
+        # handed to the agent as the person's signed-in session.  Nothing
+        # writes to the vault in this build (AccountVault.add has no caller),
+        # so this is the path every T2 read actually takes.
+        result['connection_mechanism'] = 'logged_out_public'
+        result['notice'] = (
+            f'This is NOT the person\'s signed-in {platform} session. No '
+            f'stored {platform} session was found, so the page was fetched '
+            f'logged out and may be the public view or a login wall. Say that '
+            f'when using it; do not present it as their own feed, account or '
+            f'private data. To fix: a {platform} account has to be in the '
+            f'vault, and this build can only list stored sessions (GET '
+            f'/api/web-research/vault) and revoke them (DELETE '
+            f'/api/web-research/vault/<platform>) — no sign-in path writes '
+            f'one yet, so this needs the owner.'
+        )
     return result

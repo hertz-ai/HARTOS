@@ -38,6 +38,7 @@ tests/unit/test_yield_pauses_every_agent.py does for the autonomous create.
 import ast
 import functools
 import io
+import json
 import os
 import threading
 from unittest.mock import MagicMock
@@ -92,10 +93,14 @@ _HELPERS = ('_own_build_input', '_unfinished_agent_label', '_resumed_build_reply
 
 @functools.lru_cache(maxsize=1)
 def _helpers():
+    """Whichever of the shared helpers the source has.  No existence check:
+    on a tree without them the blocks run as that tree wrote them, so the
+    behaviour tests fail by their assertions there, not on a missing name
+    (review of 49eee800d, must-fix 3: 26 of its 36 parent failures were
+    this check)."""
     tree = ast.parse(io.open(_HIE, encoding='utf-8', errors='replace').read())
     fns = [n for n in tree.body
            if isinstance(n, ast.FunctionDef) and n.name in _HELPERS]
-    assert sorted(f.name for f in fns) == sorted(_HELPERS), [f.name for f in fns]
     module = ast.Module(body=fns, type_ignores=[])
     ast.fix_missing_locations(module)
     return compile(module, _HIE, 'exec')
@@ -445,6 +450,43 @@ class TestAPartlyBuiltAgentResumesOnItsOwnInput:
         assert ns['resume_build_input'] == {}
 
 
+# ── The ladder with no step built yet, on a request's create flag ───────────
+
+def _flagged(tmp_path, mid_build=False, create_agent=True, autonomous=False):
+    """The REAL `if create_agent or autonomous:` block of the flow ladder: the
+    agent's config exists and no flow-0 recipe does.  Review of 49eee800d,
+    must-fix 1: a request carrying create_agent handed the person's words to
+    recipe() here, unlike the partly built branch."""
+    pdir = tmp_path / 'prompts'
+    pdir.mkdir()
+    (pdir / f'{_PID}.json').write_text(json.dumps(_speech_config()), encoding='utf-8')
+    ns = _names(_BUILD_CHATTER, [], os=os, json=json, PROMPTS_DIR=str(pdir),
+                create_agent=create_agent, autonomous=autonomous)
+    if mid_build:
+        ns['review_agents'][f'u1_{_PID}'] = True
+    exec(_block('create_agent or autonomous', '_flagged_turn', tail='return None'), ns)
+    ns['_flagged_turn']()
+    return ns
+
+
+class TestARequestsCreateFlagDoesNotMakeItsWordsTheBuilds:
+
+    def test_a_create_request_not_mid_build_resumes_on_the_agents_input(self, tmp_path):
+        ns = _flagged(tmp_path)
+        assert ns['resume_build_input'].get(f'u1_{_PID}') == {
+            'input': _GOAL, 'label': f'"{_LABEL}"'}, ns['resume_build_input']
+        assert ns['review_agents'][f'u1_{_PID}'] is True
+
+    def test_an_autonomous_request_not_mid_build_resumes_on_it_too(self, tmp_path):
+        ns = _flagged(tmp_path, create_agent=False, autonomous=True)
+        assert ns['resume_build_input'].get(f'u1_{_PID}', {}).get('input') == _GOAL
+
+    def test_the_creators_turn_mid_build_is_untouched(self, tmp_path):
+        ns = _flagged(tmp_path, mid_build=True)
+        assert ns['resume_build_input'] == {}
+        assert ns['review_agents'][f'u1_{_PID}'] is True
+
+
 # ── The create loop's gate: a resumed build's text answers no step ─────────
 
 class TestTheGateTakesOnlyThePersonsWords:
@@ -722,3 +764,108 @@ class TestTheGateTakesOnlyThePersonsWords:
                   and n.func.id == 'get_response_group']
         assert len(marks) == 1, 'recipe() does not write the mark on every call'
         assert rounds and marks[0] < min(rounds)
+
+
+# ── A reply after a restart is still the person's answer (review of 49eee800d,
+#    must-fix 2): the ladder's predicate reads the ledger the gate reads ────
+
+class TestAReplyAfterARestartIsStillTaken:
+    """build_holds_a_step_for_the_person with no gate flag: the real
+    lifecycle_hooks wait (mark_action_waiting_for_user on a person's turn,
+    which records the ask) on a real SmartLedger registered for the session.
+    Without it, a restart between the build's question and the person's reply
+    sent the reply nowhere: the ladder resumed the build on its saved input."""
+
+    _UP = 'u7_p7'
+
+    def setup_method(self):
+        import sys
+        sys.path.insert(0, os.path.join(_ROOT, 'agent-ledger-opensource'))
+        from agent_ledger.core import SmartLedger, Task, TaskType
+        import hartos.lifecycle_hooks as L
+        import tempfile
+        self._dir = tempfile.mkdtemp(prefix='restart_reply_')
+        self.led = SmartLedger(agent_id='p7', session_id='u7_p7_1', ledger_dir=self._dir)
+        for n in (1, 2):
+            self.led.tasks[f'action_{n}'] = Task(task_id=f'action_{n}', description=f'a{n}',
+                                                 task_type=TaskType.PRE_ASSIGNED)
+        L.register_ledger_for_session(self._UP, self.led)
+        with L._state_lock:
+            L.action_states.pop(self._UP, None)
+
+    def teardown_method(self):
+        import shutil
+        import hartos.lifecycle_hooks as L
+        from hartos import create_recipe as cr
+        with L._state_lock:
+            L.action_states.pop(self._UP, None)
+            L._ledger_registry.pop(self._UP, None)
+        for cache in (cr.user_tasks, cr.recipe_for_persona):
+            try:
+                del cache[self._UP]
+            except KeyError:
+                pass
+        shutil.rmtree(self._dir, ignore_errors=True)
+
+    def _wait(self, action, asked_in):
+        import hartos.lifecycle_hooks as L
+        assert L.safe_set_state(self._UP, action, L.ActionState.IN_PROGRESS, 'start') is True
+        assert L.mark_action_waiting_for_user(self._UP, action, "need the child's word",
+                                              flow=0, asked_in=asked_in) is True
+
+    def test_with_the_session_but_no_flag_the_ledgers_wait_is_seen(self):
+        from types import SimpleNamespace
+        from hartos import create_recipe as cr
+        self._wait(2, '1762822187123')
+        cr.user_tasks[self._UP] = SimpleNamespace(current_action=2)
+        cr.recipe_for_persona[self._UP] = 0
+        assert cr.build_holds_a_step_for_the_person('u7', 'p7') is True
+
+    def test_after_a_restart_the_saved_place_and_the_ledger_say_it(self, monkeypatch):
+        """No session at all: where the build stands comes from its saved
+        progress (detect_and_resume_progress, stood in here; it scans the
+        prompts folder), the wait from the ledger."""
+        from hartos import create_recipe as cr
+        self._wait(2, '1762822187123')
+        monkeypatch.setattr(cr, 'detect_and_resume_progress',
+                            lambda pid, up: (0, 2, {}, []))
+        assert self._UP not in cr.user_tasks
+        assert cr.build_holds_a_step_for_the_person('u7', 'p7') is True
+
+    def test_a_wait_nobody_was_asked_about_is_not_a_held_step(self, monkeypatch):
+        """A goal's turn parked the step: blocked, but no ask recorded."""
+        from hartos import create_recipe as cr
+        self._wait(2, 'daemon_goal-7')
+        monkeypatch.setattr(cr, 'detect_and_resume_progress',
+                            lambda pid, up: (0, 2, {}, []))
+        assert cr.build_holds_a_step_for_the_person('u7', 'p7') is False
+
+    def test_a_wait_on_another_action_is_not_this_step(self, monkeypatch):
+        from hartos import create_recipe as cr
+        self._wait(1, '1762822187123')
+        monkeypatch.setattr(cr, 'detect_and_resume_progress',
+                            lambda pid, up: (0, 2, {}, []))
+        assert cr.build_holds_a_step_for_the_person('u7', 'p7') is False
+
+
+def test_the_saved_build_input_ages_out_with_the_agents_build_state():
+    """Review of 49eee800d (minor): resume_build_input was never evicted.
+    The REAL _cleanup_stale_agents, on an agent idle past _AGENT_TTL."""
+    import time as _time
+    tree = ast.parse(io.open(_HIE, encoding='utf-8', errors='replace').read())
+    fns = [n for n in tree.body
+           if isinstance(n, ast.FunctionDef) and n.name == '_cleanup_stale_agents']
+    assert len(fns) == 1
+    ns = {'time': _time, '_AGENT_TTL': 3600,
+          '_agent_timestamps': {'u1_4242': _time.time() - 7200, 'u2_4242': _time.time()},
+          'review_agents': {'u1_4242': True, 'u2_4242': True},
+          'conversation_agent': {'u1_4242': False, 'u2_4242': False},
+          'resume_build_input': {'u1_4242': {'input': _GOAL, 'label': 'x'},
+                                 'u2_4242': {'input': _GOAL, 'label': 'x'}},
+          '_gather_turn_counts': {}, '_gather_reviews_shown': {}}
+    module = ast.Module(body=fns, type_ignores=[])
+    ast.fix_missing_locations(module)
+    exec(compile(module, _HIE, 'exec'), ns)
+    ns['_cleanup_stale_agents']()
+    assert 'u1_4242' not in ns['resume_build_input'], ns['resume_build_input']
+    assert 'u2_4242' in ns['resume_build_input'], 'a live build lost its input'

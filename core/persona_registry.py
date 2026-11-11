@@ -166,10 +166,14 @@ def record_join(creator: Any, prompt_id: Any, joiner: Any) -> Optional[bool]:
     approval (scope '<joiner>#<time>'): consent rows are append-only and
     unique per scope, so a join allowed again after a revoke needs a row of
     its own (hartos-16).  True when kept (or already kept); None when this
-    node has no consent store (central), so the join lasts this process
-    only, as joins always did there; False when the store is there but the
-    grant was not written: then the join must not go ahead, because
-    joined_chats reads the store and would not see it."""
+    node keeps no consent rows at all (_consent_store_kept_here), so the join
+    lasts this process only; False when the store is there but the grant was
+    not written: then the join must not go ahead, because joined_chats reads
+    the store and would not see it.  Central is NOT a no-store node: its
+    langchain container keeps consent rows in its own social database
+    (/app/logs/hartos_social.db), apart from every desktop's, and consent
+    rows are not synced between nodes, so a join is read on the node that
+    approved it."""
     try:
         from integrations.social.consent_service import ConsentService
         from integrations.social.models import db_session
@@ -181,9 +185,7 @@ def record_join(creator: Any, prompt_id: Any, joiner: Any) -> Optional[bool]:
                                          agent_id=str(prompt_id))
         return True
     except Exception:
-        try:
-            _kept_joins(joiner, prompt_id)
-        except Exception:
+        if not _consent_store_kept_here():
             logger.info("record_join: no consent store on this node; %s's join to "
                         "%s's chat of agent %s lasts this process only",
                         joiner, creator, prompt_id)
@@ -193,19 +195,63 @@ def record_join(creator: Any, prompt_id: Any, joiner: Any) -> Optional[bool]:
         return False
 
 
+def _consent_store_kept_here() -> bool:
+    """Whether this node keeps consent rows at all (the consent table exists),
+    asked after a read or write of them failed.  It tells a node with no store
+    (a join lasts this process only) from a store that is there but did not
+    answer (locked, busy; central's SQLite has logged "database is locked"
+    under load).  Only the first may fall back to this
+    process's chat_joinees, which a revoke never clears: with the second, the
+    fallback brought a revoked join back (review of 86f4c71f8).  A failure to
+    tell counts as a store that is there, so a revoke always wins."""
+    try:
+        from integrations.social.models import UserConsent, get_engine
+    except ImportError:
+        return False
+    try:
+        from sqlalchemy import inspect
+        return bool(inspect(get_engine()).has_table(UserConsent.__tablename__))
+    except Exception:
+        logger.warning("could not tell whether this node keeps consent rows; "
+                       "treating it as one that does", exc_info=True)
+        return True
+
+
+def _this_process_join(joiner: Any, prompt_id: Any) -> Optional[str]:
+    """This process's record of whose chat ``joiner`` joined for agent
+    ``prompt_id``.  Matched as text: a join written with integer ids is found
+    by the string ids /chat and _still_joined use, and the other way round."""
+    for who, chats in list(chat_joinees.items()):
+        if str(who) != str(joiner):
+            continue
+        for pid, creator in list((chats or {}).items()):
+            if str(pid) == str(prompt_id) and creator:
+                return str(creator)
+    return None
+
+
 def joined_chats(joiner: Any, prompt_id: Any) -> List[str]:
     """Whose chats with agent ``prompt_id`` ``joiner`` has joined, oldest
     first: the one reader of the join link (_resolve_session_for_user,
     reuse_recipe.get_role and move_person_to_flow_impl all ask here).  The
     kept chat_join grants (record_join) when they can be read, so a revoked
-    grant ends the join at once; else this process's chat_joinees entry."""
+    grant ends the join at once.  When they cannot: on a node with no consent
+    store, this process's chat_joinees entry; on a node whose store is there
+    but did not answer, no chat at all, because a revoke never clears
+    chat_joinees and the entry would bring the revoked join back (review of
+    86f4c71f8)."""
     try:
         return _kept_joins(joiner, prompt_id)
     except Exception:
-        logger.debug("joined_chats: grants unreadable for %s; using this "
-                     "process's joins", joiner, exc_info=True)
-    creator = (chat_joinees.get(joiner) or {}).get(prompt_id)
-    return [str(creator)] if creator else []
+        if _consent_store_kept_here():
+            logger.warning("joined_chats: %s's joins to agent %s could not be read; "
+                           "none reached until they can", joiner, prompt_id,
+                           exc_info=True)
+            return []
+        logger.debug("joined_chats: no consent store on this node; using this "
+                     "process's joins for %s", joiner)
+    creator = _this_process_join(joiner, prompt_id)
+    return [creator] if creator else []
 
 
 def _still_joined(entries, creator: Any, prompt_id: Any) -> List[Dict[str, Any]]:

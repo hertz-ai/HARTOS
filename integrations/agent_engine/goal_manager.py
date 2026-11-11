@@ -652,6 +652,19 @@ class GoalManager:
         the dashboard, whose record then stands with the ask on it; config
         writes go through update_goal.  Returns the writer's result with
         'stage' set to 'expert' or 'human'.
+
+        ``ask`` (the question a background step's output asked; the owner's
+        ruling of 2026-10-31: it goes to the owner, never "done") selects the
+        human stage directly: the question is the owner's to answer, not the
+        expert model's.  The person told is the goal's person
+        (_person_to_tell: a goal with no owner, or an agent's, is the node's
+        owner's).  Only when the node itself has no owner with an account
+        here does the goal park with the consent gate's own cause,
+        PAUSE_CAUSE_NO_OWNER: nothing is sent, and a warning names the goal
+        and the cause.  The question rides
+        the in-app notification only; a push leg must never carry it raw
+        (its title and body are built from the scrubbed goal title; any new
+        leg, #197, goes through security.edge_privacy.scrub_text, #208).
         """
         from datetime import datetime
         from integrations.social.models import AgentGoal
@@ -672,7 +685,8 @@ class GoalManager:
             if step not in tried:
                 tried.append(step)
         record['tried'] = tried
-        expert = None if 'expert' in tried else GoalManager._escalation_expert(
+        ask = str(record.get('ask') or '').strip()
+        expert = None if ('expert' in tried or ask) else GoalManager._escalation_expert(
             getattr(goal, 'goal_type', None))
         if expert is not None:
             record.update(next='expert', expert=expert.model_id)
@@ -690,9 +704,28 @@ class GoalManager:
         if already_told:
             record['told_at'] = prior['told_at']
         cfg['escalation'] = record
-        reason = (f"Needs help: action {record.get('action_id')} "
-                  f"({str(record.get('action') or '')[:120]}) could not be done "
-                  f"autonomously: {record.get('reason')}")
+        if ask:
+            # Says what works today and nothing more (hartos-c9's condition
+            # 2): the goal's own session is an agent's, so no reply reaches
+            # it, and the owner's answer route is Part B3, not built yet.
+            reason = (f"Paused: action {record.get('action_id')} "
+                      f"({str(record.get('action') or '')[:120]}) asks: {ask} "
+                      f"There is no way to answer it from the app yet; "
+                      f"resuming the goal only pauses it again.")
+        else:
+            reason = (f"Needs help: action {record.get('action_id')} "
+                      f"({str(record.get('action') or '')[:120]}) could not be done "
+                      f"autonomously: {record.get('reason')}")
+        # A question nobody on this node can be told about parks the way the
+        # consent gate parks for the same reason, and tells no one; never
+        # silently (hartos-c9's condition 3): the cause is on the goal, which
+        # the goal list shows, and this warning names both.
+        nobody_to_ask = bool(ask) and GoalManager._person_to_tell(db, goal) is None
+        if nobody_to_ask:
+            logger.warning(
+                "goal %s parked with cause %s: action %s asks its person a "
+                "question and this node has no owner account to tell",
+                goal_id, PAUSE_CAUSE_NO_OWNER, record.get('action_id'))
         if goal.status == 'paused' and cfg.get('pause_cause') == PAUSE_CAUSE_PERSON:
             # Its person paused it from the dashboard and a worker re-asks
             # (#194): the ask goes on the record, the person's own pause
@@ -704,16 +737,47 @@ class GoalManager:
             # (PAUSE_CAUSE_NEEDS_HELP), so the daemon, which resumes only its
             # own dispatch-failure pauses, leaves it alone (hartos-73's S1).
             result = GoalManager.pause_goal(
-                db, goal, cause=PAUSE_CAUSE_NEEDS_HELP, by='daemon',
-                reason=reason, config=cfg, at=now)
+                db, goal,
+                cause=PAUSE_CAUSE_NO_OWNER if nobody_to_ask else PAUSE_CAUSE_NEEDS_HELP,
+                by='daemon', reason=reason, config=cfg, at=now)
         if not result.get('success'):
             return result
         cfg = result.get('config', cfg)
-        if not already_told and GoalManager._tell_its_person(db, goal, reason):
+        if (not already_told and not nobody_to_ask
+                and GoalManager._tell_its_person(db, goal, reason)):
             # New dicts, so the JSON column sees a change.
             cfg = dict(cfg, escalation=dict(record, told_at=now))
             GoalManager.update_goal(db, goal_id, config_json=cfg)
         return dict(result, stage='human')
+
+    @staticmethod
+    def _person_to_tell(db: Session, goal) -> Optional[str]:
+        """Who a goal that stopped for a person tells: the person behind the
+        goal's owner (core.event_attribution.person_for: a human is their own
+        person; an agent or system row, or no owner at all, is the node's
+        owner), when they have an account on this node; else None, logged.
+        Measured on the owner's desktop 2026-11-02: 38 of 38 active goals
+        name no owner (system_bootstrap), so this is the node's owner for
+        nearly every background question."""
+        try:
+            from core.event_attribution import goal_owner_user_id, person_for
+            from integrations.social.models import User
+            person = person_for(goal_owner_user_id(goal), db)
+            if not person:
+                logger.warning(
+                    "goal %s needs a person and nobody can be told: the goal "
+                    "names no owner and HEVOLVE_OWNER_USER_ID is not set", goal.id)
+                return None
+            if not db.query(User).filter_by(id=str(person)).first():
+                logger.warning(
+                    "goal %s needs a person, but %s has no account on this "
+                    "node to tell", goal.id, person)
+                return None
+            return str(person)
+        except Exception:
+            logger.warning("goal %s: could not find whom to tell",
+                           getattr(goal, 'id', '?'), exc_info=True)
+            return None
 
     @staticmethod
     def _tell_its_person(db: Session, goal, reason: str) -> bool:
@@ -730,20 +794,9 @@ class GoalManager:
         undo or fail the pause.
         """
         try:
-            from core.event_attribution import goal_owner_user_id
-            from integrations.agent_engine.capability_setup import setup_owner
-            from integrations.social.models import User
             from integrations.social.services import NotificationService
-            person = goal_owner_user_id(goal) or setup_owner()
-            if not person:
-                logger.warning(
-                    "goal %s needs a person and nobody can be told: the goal "
-                    "names no owner and HEVOLVE_OWNER_USER_ID is not set", goal.id)
-                return False
-            if not db.query(User).filter_by(id=str(person)).first():
-                logger.warning(
-                    "goal %s needs a person, but %s has no account on this "
-                    "node to tell", goal.id, person)
+            person = GoalManager._person_to_tell(db, goal)
+            if person is None:
                 return False
             # The push leaves for Google or central's relay: the one egress
             # scrub (secrets, then PII), or no title at all.

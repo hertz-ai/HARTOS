@@ -36,11 +36,12 @@ hartos/helper.py tool_argument_error, in their own words ("Error: <tool> was
 not run: ...", each naming the argument and what to send instead); they do
 not carry REFUSAL_MARK and never reach the count below, since the tool did
 not run.  core.tool_logging
-counts every failed reply that came back without a hint from a tool wrapped
-by log_tool_execution ([TOOL-REFUSAL-NO-HINT]), which is how this framework
-is enforced: each lane can see the refusals it has not moved here yet.
-Tools registered as plain callables are not counted yet (review of
-2ddf102da); counting in the executor is the follow-up.
+counts every failed reply that came back without a hint
+([TOOL-REFUSAL-NO-HINT]), which is how this framework is enforced: each lane
+can see the refusals it has not moved here yet.  A tool wrapped by
+log_tool_execution is counted on its own return; a tool registered as a
+plain callable is counted by the autogen executor (hartos.helper,
+note_executor_reply), once either way.
 """
 from __future__ import annotations
 

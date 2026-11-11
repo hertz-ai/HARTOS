@@ -901,15 +901,24 @@ def is_transient_deferral(goal_id=None) -> bool:
                 return True
         if is_user_recently_active() or _cb_is_open():
             return True
-        # The node's own LLM provider refusing the account (#106b b) is a
-        # transient wait, not a dispatch failure: the goal should hold for the
-        # top-up, never accrue the 5-strike auto-pause (which would need a
-        # manual resume of every goal after the balance is restored).
+        # The turn's LLM provider refusing calls (#106b b: the account, or a
+        # quota spent until its reset) is a transient wait, not a dispatch
+        # failure: the goal should hold for the top-up, never accrue the
+        # 5-strike auto-pause (which would need a manual resume of every goal
+        # after the balance is restored).  The provider is the one THIS
+        # goal's turn used (_dispatched_host): a turn on the configured
+        # expert that failed is a failure, whatever the node's own provider
+        # says (review of 5c6b899a5: with the free model's quota spent, 20
+        # failing expert turns in 570 s took no strike and no backoff).  The
+        # node's own backend answers when no dispatch from this thread
+        # recorded one.
         try:
             from core.circuit_breaker import (llm_provider_breaker,
                                               provider_host, CircuitState)
-            from integrations.agent_engine.model_registry import _own_llm_target
-            _h = provider_host(str((_own_llm_target() or ('', ''))[0] or ''))
+            _h = _dispatched_host(goal_id) if goal_id is not None else None
+            if not _h:
+                from integrations.agent_engine.model_registry import _own_llm_target
+                _h = provider_host(str((_own_llm_target() or ('', ''))[0] or ''))
             if _h and llm_provider_breaker.state(_h) == CircuitState.OPEN:
                 return True
         except Exception:
@@ -999,6 +1008,7 @@ def _clear_turn_record(goal_id) -> None:
     with _turn_failures_lock:
         _turn_failures.pop(_failure_key(goal_id), None)
         _dispatch_routes.pop(_failure_key(goal_id), None)
+        _dispatch_hosts.pop(_failure_key(goal_id), None)
 
 
 def _record_turn_failure(goal_id, reason) -> None:
@@ -1068,6 +1078,27 @@ def _record_route(goal_id, route, why='') -> None:
                     f"{'to the hive' if route == 'hive' else 'here'}"
                     f"{f' ({why})' if why else ''}; was "
                     f"{was or 'not dispatched yet'}")
+
+
+# The LLM provider host the latest dispatch_goal for a goal used (the
+# configured expert's endpoint, or this node's own backend), keyed like
+# _turn_failures by goal AND thread, cleared with them.  is_transient_deferral
+# reads it: a goal waits only for the provider ITS turn used.
+_dispatch_hosts: Dict[tuple, str] = {}
+
+
+def _record_dispatch_host(goal_id, host) -> None:
+    with _turn_failures_lock:
+        _dispatch_hosts[_failure_key(goal_id)] = host
+        while len(_dispatch_hosts) > _TURN_FAILURES_MAX:
+            _dispatch_hosts.pop(next(iter(_dispatch_hosts)))
+
+
+def _dispatched_host(goal_id) -> Optional[str]:
+    """The provider host the latest dispatch_goal for ``goal_id``, from this
+    thread, used; None when it recorded none."""
+    with _turn_failures_lock:
+        return _dispatch_hosts.get(_failure_key(goal_id))
 
 
 def handed_to_hive(goal_id) -> bool:
@@ -1887,6 +1918,7 @@ def _dispatch_goal_turn(prompt: str, user_id: str, goal_id: str,
     # of accruing auto-pause strikes; on central 2026-09-14 every hosted call
     # 402'd and the daemon re-tried every tick.
     _prov_host = _dispatch_provider_host(model_config)
+    _record_dispatch_host(goal_id, _prov_host)
     if _prov_host:
         try:
             from core.circuit_breaker import (llm_provider_breaker,

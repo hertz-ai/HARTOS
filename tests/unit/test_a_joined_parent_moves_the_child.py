@@ -152,19 +152,93 @@ def test_a_join_says_whether_it_was_kept(pr, monkeypatch):
     monkeypatch.setattr(ConsentService, 'grant_consent', staticmethod(broken))
     # The store is there but the grant was not written: not kept.
     assert pr.record_join(CHILD, P, PARENT) is False
-    # No consent store on this node (central): process-only, as before.
+    # The store is there and cannot be read either (locked): still not kept,
+    # never "this process only".
     monkeypatch.setattr(pr, '_kept_joins', broken)
+    assert pr.record_join(CHILD, P, PARENT) is False
+    # No consent store on this node (central): process-only, as before.
+    monkeypatch.setattr(pr, '_consent_store_kept_here', lambda: False)
     assert pr.record_join(CHILD, P, PARENT) is None
 
 
-def test_unreadable_grants_fall_back_to_this_process_joins(pr, monkeypatch):
+def test_on_a_node_without_a_consent_store_this_process_joins_are_read(pr, monkeypatch):
     from integrations.social.consent_service import ConsentService
 
     def unreadable(*_a, **_k):
         raise RuntimeError('no consent table on this node')
     monkeypatch.setattr(ConsentService, 'granted_by', staticmethod(unreadable))
+    monkeypatch.setattr(pr, '_consent_store_kept_here', lambda: False)
     pr.chat_joinees[PARENT] = {P: CHILD}
     assert pr.joined_chats(PARENT, P) == [CHILD]
+
+
+def test_a_revoked_join_stays_ended_while_the_store_cannot_be_read(pr, monkeypatch):
+    """Review of 86f4c71f8, must-fix: join, revoke, then the store read fails
+    (a locked database) while this process still remembers the join.  The
+    join does not come back: no chat is named and the child's agent does not
+    reach the parent."""
+    from integrations.social.consent_service import ConsentService
+    assert pr.record_join(CHILD, P, PARENT) is True
+    pr.chat_joinees[PARENT] = {P: CHILD}
+    _members_of_the_childs_chat(pr)
+    _revoke(CHILD, PARENT)
+
+    def locked(*_a, **_k):
+        raise RuntimeError('database is locked')
+    monkeypatch.setattr(ConsentService, 'granted_by', staticmethod(locked))
+    assert pr.joined_chats(PARENT, P) == []
+    out, topics = _childs_agent_sends(pr, 'Parent')
+    assert topics == []
+    assert _childs_agent_sends(pr, 'Child') == (
+        'Message sent Successfully', [pr.multichat_topic_for(CHILD)])
+
+
+def test_an_allowed_join_is_not_reached_while_the_store_cannot_be_read(pr, monkeypatch):
+    """The same rule without a revoke: a store that does not answer names no
+    chat, rather than trusting what this process remembers."""
+    from integrations.social.consent_service import ConsentService
+    assert pr.record_join(CHILD, P, PARENT) is True
+    pr.chat_joinees[PARENT] = {P: CHILD}
+
+    def locked(*_a, **_k):
+        raise RuntimeError('database is locked')
+    monkeypatch.setattr(ConsentService, 'granted_by', staticmethod(locked))
+    assert pr.joined_chats(PARENT, P) == []
+
+
+def test_the_consent_store_is_known_by_its_table(pr, monkeypatch):
+    """Kept here = the consent table exists.  No table = no store; a check
+    that itself fails counts as a store, so a revoke always wins."""
+    assert pr._consent_store_kept_here() is True
+    import sqlalchemy
+
+    class NoTable:
+        def has_table(self, _name):
+            return False
+    monkeypatch.setattr(sqlalchemy, 'inspect', lambda _e: NoTable())
+    assert pr._consent_store_kept_here() is False
+
+    def boom(_e):
+        raise RuntimeError('database is locked')
+    monkeypatch.setattr(sqlalchemy, 'inspect', boom)
+    assert pr._consent_store_kept_here() is True
+
+
+def test_on_a_node_without_a_store_a_join_kept_with_number_ids_is_found(pr, monkeypatch):
+    """Review of 86f4c71f8, should-fix: chat_joinees keyed with integer ids
+    (an entry point that does not stringify) and asked with the string ids
+    /chat uses, and the other way round."""
+    monkeypatch.setattr(pr, '_consent_store_kept_here', lambda: False)
+
+    def no_store(*_a, **_k):
+        raise RuntimeError('no consent store on this node')
+    monkeypatch.setattr(pr, '_kept_joins', no_store)
+    pr.chat_joinees[9] = {77: 7}
+    assert pr.joined_chats('9', '77') == ['7']
+    pr.chat_joinees.pop(9, None)
+    pr.chat_joinees['9'] = {'77': '7'}
+    assert pr.joined_chats(9, 77) == ['7']
+    assert pr.joined_chats(99, 77) == []
 
 
 def test_a_joiners_messages_reach_the_childs_session_through_the_grant(pr):
@@ -245,11 +319,13 @@ def test_a_joiner_reaches_no_one_whose_join_to_the_same_chat_was_revoked(pr):
 
 
 def test_on_a_node_without_a_consent_store_this_process_join_still_reaches(pr, monkeypatch):
-    """Central keeps no grants: the join lives in this process
+    """A node that keeps no consent rows (no consent table; central is not
+    one, it has its own social database): the join lives in this process
     (chat_joinees), and the child's agent still reaches the joiner."""
     def no_store(*_a, **_k):
         raise RuntimeError('no consent store on this node')
     monkeypatch.setattr(pr, '_kept_joins', no_store)
+    monkeypatch.setattr(pr, '_consent_store_kept_here', lambda: False)
     _members_of_the_childs_chat(pr)
     pr.chat_joinees[PARENT] = {P: CHILD}
     assert _childs_agent_sends(pr, 'Parent') == (
@@ -266,6 +342,7 @@ def test_a_joiner_whose_join_cannot_be_read_is_not_reached(pr, monkeypatch):
     def no_store(*_a, **_k):
         raise RuntimeError('no consent store on this node')
     monkeypatch.setattr(pr, '_kept_joins', no_store)
+    monkeypatch.setattr(pr, '_consent_store_kept_here', lambda: False)
     monkeypatch.setattr(pr, 'chat_joinees', Unreadable())
     _members_of_the_childs_chat(pr)
     out, topics = _childs_agent_sends(pr, 'Parent')

@@ -527,3 +527,147 @@ def test_an_image_link_the_filter_refuses_says_what_to_pass(store_dir, monkeypat
     reply = _tools(_store())['get_text_from_image']('http://10.0.0.5/a.png')
     assert tool_reply_failed(reply) and refusal_has_hint(reply), reply
     assert 'private address' in reply and 'public http or https link' in reply
+
+
+# ---------------------------------------------------------------------------
+# Enforcement in the executor: tools registered as plain callables.
+# ---------------------------------------------------------------------------
+# Review of 2ddf102da, F2: the count lived only in log_tool_execution, so the
+# families that register plain callables (reel studio, news, finance,
+# commerce, remote desktop, media, ...) never reached it -- its probe logged 0
+# lines for a plain tool and 1 once the same tool was wrapped.  The patched
+# executor is the path every autogen tool reply takes, so it counts what the
+# wrapper did not.
+@pytest.mark.parametrize('run_async', [False, True])
+def test_a_plain_tools_unhinted_refusal_is_counted_by_the_executor(
+        executor, tool_log, run_async):
+    def list_reel_clips(project: str) -> str:
+        return 'Error: project not found'
+
+    reply = _executed(executor, {'list_reel_clips': list_reel_clips},
+                      'list_reel_clips', '{"project": "p1"}', run_async=run_async)
+    assert reply == 'Error: project not found'       # the reply is not changed
+    lines = _no_hint_lines(tool_log)
+    assert len(lines) == 1, tool_log
+    assert 'list_reel_clips' in lines[0], lines
+
+
+def test_an_async_plain_tool_is_counted_by_the_executor(executor, tool_log):
+    async def list_reel_clips(project: str) -> str:
+        return ASK_REFUSED
+
+    reply = _executed(executor, {'list_reel_clips': list_reel_clips},
+                      'list_reel_clips', '{"project": "p1"}', run_async=True)
+    assert reply == ASK_REFUSED
+    assert len(_no_hint_lines(tool_log)) == 1, tool_log
+
+
+@pytest.mark.parametrize('run_async', [False, True])
+def test_a_wrapped_tool_is_counted_once_through_the_executor(
+        executor, tool_log, run_async):
+    """A tool wrapped by log_tool_execution counted its own reply; the
+    executor does not count it a second time."""
+    @log_tool_execution
+    def ask_person(question: str) -> str:
+        return ASK_REFUSED
+
+    _executed(executor, {'ask_person': ask_person}, 'ask_person',
+              '{"question": "Which day?"}', run_async=run_async)
+    assert len(_no_hint_lines(tool_log)) == 1, tool_log
+
+
+@pytest.mark.parametrize('reply', [
+    refuse('list_reel_clips', 'no project named p1',
+           'call list_reel_projects and use one of its names'),
+    'clip_1.mp4, clip_2.mp4',
+])
+def test_a_plain_tools_hinted_refusal_or_result_is_not_counted(
+        executor, tool_log, reply):
+    def list_reel_clips(project: str) -> str:
+        return reply
+
+    assert _executed(executor, {'list_reel_clips': list_reel_clips},
+                     'list_reel_clips', '{"project": "p1"}') == reply
+    assert _no_hint_lines(tool_log) == [], tool_log
+
+
+# ---------------------------------------------------------------------------
+# A message to the person that still holds a fill-in mark.
+# ---------------------------------------------------------------------------
+# Live 2026-11-11 01:59 IST on build 69 (hevolve-66e6's two-person proof,
+# agent 1793366231447, request msg_1794342560815_sim): send_message_to_user
+# delivered "Thank you, <parent_name>! ..." to the parent.  Measured on this
+# desktop's llm_outbound logs (1061 send texts): the other unfilled shape is
+# '[REVENUE_AMOUNT]' (one send carried five), and '<tool_call>' markup went
+# out in two.  Every one is an identifier joined by '_' inside <> or [].
+from core.session_cache import TTLCache as _SendStore  # noqa: E402
+from tests.unit.test_a_memory_key_with_a_placeholder_is_refused import (  # noqa: E402
+    _DiskHelper)
+
+
+def _send_tools():
+    """The real core tool closures with a sender and a scheduler that record
+    what would have reached the person."""
+    import core.agent_tools as agent_tools
+    sent, scheduled = [], []
+
+    class _Scheduler:
+        def add_job(self, func, trigger, run_date=None, args=None):
+            scheduled.append(list(args or []))
+
+    def _sender(user_id, text, *rest, **kw):
+        sent.append(text)
+        return 'Message sent successfully to user with request_id: r1'
+
+    ctx = {
+        'building_agent': False, 'user_id': '10202', 'prompt_id': '54',
+        'agent_data': _SendStore(ttl_seconds=60, max_size=10, name='t_send'),
+        'helper_fun': _DiskHelper(), 'user_prompt': '10202_54',
+        'request_id_list': {}, 'recent_file_id': None,
+        'scheduler': _Scheduler(), 'send_message_to_user1': _sender,
+        'retrieve_json': json.loads, 'strip_json_values': lambda d: d,
+        'save_conversation_db': lambda *a, **k: None,
+    }
+    tools = {n: f for n, _d, f in agent_tools.build_core_tool_closures(ctx)}
+    return tools, sent, scheduled
+
+
+@pytest.mark.parametrize('text, placeholder', [
+    ("Thank you, <parent_name>! Arjun did well today.", '<parent_name>'),
+    ("Revenue this week: [REVENUE_AMOUNT] against costs of [TOTAL_COSTS].",
+     '[REVENUE_AMOUNT]'),
+    ("<tool_call>\n<function=google_search>\n<parameter=text>shoes",
+     '<tool_call>'),
+])
+def test_a_message_that_still_holds_a_placeholder_is_refused_and_not_sent(
+        tool_log, text, placeholder):
+    tools, sent, _scheduled = _send_tools()
+    reply = tools['send_message_to_user'](text, False)
+    assert sent == [], 'the person must not receive the fill-in mark'
+    assert tool_reply_failed(reply) and refusal_has_hint(reply), reply
+    assert placeholder in reply, reply
+    assert 'send_message_to_user' in reply, reply
+
+
+@pytest.mark.parametrize('text', [
+    "Is 3 < 5 and 7 > 2? Yes, both are true!",
+    "Use the <div> tag to group the page, and <b> for bold words.",
+    "See [1] for the source, and [Note] keep practising.",
+    "Say 'ball' slowly: <ball> rhymes with <call>.",
+    "Great try, Arjun! Now say 'buh-buh-ball' with me.",
+])
+def test_a_message_without_a_placeholder_is_sent_as_written(tool_log, text):
+    tools, sent, _scheduled = _send_tools()
+    reply = tools['send_message_to_user'](text, False)
+    assert sent == [text], reply
+    assert not tool_reply_failed(reply), reply
+
+
+def test_a_timed_message_with_a_placeholder_is_refused_and_not_scheduled(
+        tool_log):
+    tools, _sent, scheduled = _send_tools()
+    reply = tools['send_message_in_seconds'](
+        "Good morning, <child_name>! Ready for today's sounds?", 30)
+    assert scheduled == [], scheduled
+    assert tool_reply_failed(reply) and refusal_has_hint(reply), reply
+    assert '<child_name>' in reply, reply

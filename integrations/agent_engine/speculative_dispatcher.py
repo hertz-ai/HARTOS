@@ -1685,13 +1685,17 @@ class SpeculativeDispatcher:
         """
         # #162 — re-bind the originating rid on THIS worker thread so every
         # LLM call the expert issues (recipe/autogen via _dispatch_expert_*)
-        # is classified foreground, not background-and-preemptible.
-        if request_id:
-            try:
-                from hartos.threadlocal import thread_local_data as _tl
-                _tl.set_request_id(request_id=request_id)
-            except Exception:
-                pass
+        # is classified foreground, not background-and-preemptible.  Set
+        # for every task and cleared after it: this is a pooled thread, so a
+        # task with no rid kept the previous task's, and with_llm_context
+        # binds that for an entry called without one, which the camera and
+        # screen tools then judged as that earlier person's turn (review of
+        # efd223acf, finding 5; hartos-d9's thread-local audit).
+        try:
+            from hartos.threadlocal import thread_local_data as _tl
+            _tl.set_request_id(request_id=request_id or None)
+        except Exception:
+            _tl = None
         try:
             # GUARDRAIL: circuit breaker (check again — may have been halted)
             from security.hive_guardrails import HiveCircuitBreaker
@@ -1715,6 +1719,8 @@ class SpeculativeDispatcher:
             with self._lock:
                 self._active.pop(speculation_id, None)
             self._release_expert_reservation(speculation_id, goal_id)
+            if _tl is not None:
+                _tl.set_request_id(None)
 
     @staticmethod
     def _release_expert_reservation(speculation_id: str, goal_id) -> None:

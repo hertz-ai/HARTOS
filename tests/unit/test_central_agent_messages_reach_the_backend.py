@@ -41,15 +41,20 @@ import os
 import socket
 import sys
 import threading
+import time
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from tests.unit.test_agent_message_reaches_the_desktop_locally import (  # noqa: E402,F401
-    BACKEND, _answered, _lift_create_send, _reuse_send, central, publisher, rr,
+    BACKEND, _answered, _lift_create_send, _reuse_send, bundled, central,
+    publisher, rr,
 )
 
 
@@ -116,10 +121,12 @@ def test_a_blank_setting_is_no_setting(monkeypatch):
     assert get_autogen_response_url() == ''
 
 
-def _free_loopback_server(status):
+def _free_loopback_server(status, delay=0.0):
     """A real HTTP server on 127.0.0.2 (not 'localhost'/'127.0.0.1', which
     the shared pool mounts with no retries, so the shared pool's remote
-    retries would apply to it as they do to central's 172.17.0.1).  Returns
+    retries would apply to it as they do to central's 172.17.0.1).  It
+    records each body as it arrives, then waits ``delay`` seconds before it
+    answers, as chatbot_pipeline does while it makes the video.  Returns
     (server, received bodies) or None when 127.0.0.2 cannot be bound."""
     received = []
 
@@ -127,6 +134,7 @@ def _free_loopback_server(status):
         def do_POST(self):  # noqa: N802
             n = int(self.headers.get('Content-Length') or 0)
             received.append(json.loads(self.rfile.read(n) or b'{}'))
+            time.sleep(delay)
             self.send_response(status)
             self.send_header('Content-Length', '0')
             self.end_headers()
@@ -165,6 +173,110 @@ def test_one_send_reaches_a_struggling_backend_once(rr, central, publisher,
     assert [r.get('message') for r in received] == ['one message']
     assert out.startswith('Failed to send message'), out
     assert 'HTTP 503' in out, out
+
+
+def _same_turn(rr, monkeypatch, user_id):
+    """Pin the turn's request id, as /chat does: REUSE keys its sent mark by
+    it, so two sends of one text in one turn share the mark."""
+    monkeypatch.setitem(rr.request_id_list, f'{user_id}_p-9', 'turn-1')
+
+
+def _answers(*statuses):
+    return MagicMock(name='pooled_post_once', side_effect=[
+        SimpleNamespace(status_code=s, text='') for s in statuses])
+
+
+def test_a_resend_after_a_refusal_goes_out(rr, central, publisher, monkeypatch):
+    """Review of f1d599dd9: the first send got a 500 and the agent was told;
+    its resend of the same text in the same turn made no POST and was told
+    "Message already sent successfully", with nothing delivered.  A refusal
+    now drops the sent mark."""
+    _same_turn(rr, monkeypatch, 'cent-7')
+    post = _answers(500, 200)
+    first, _ = _reuse_send(rr, 'cent-7', 'Your order is ready.', post=post)
+    again, _ = _reuse_send(rr, 'cent-7', 'Your order is ready.', post=post)
+    assert first.startswith('Failed to send message'), first
+    assert post.call_count == 2
+    assert again.startswith('Message sent successfully'), again
+
+
+def test_a_delivered_message_is_not_sent_twice(rr, central, publisher,
+                                               monkeypatch):
+    """The mark still does its job: a delivered text sent again in the same
+    turn is not posted a second time."""
+    _same_turn(rr, monkeypatch, 'cent-6')
+    post = _answers(200, 200)
+    _reuse_send(rr, 'cent-6', 'Your order is ready.', post=post)
+    again, _ = _reuse_send(rr, 'cent-6', 'Your order is ready.', post=post)
+    assert post.call_count == 1
+    assert again.startswith('Message already sent'), again
+
+
+def test_a_resend_after_a_failed_local_publish_goes_out(rr, bundled, monkeypatch):
+    """The desktop branch had the same trap: a publish that failed kept the
+    sent mark, so the agent's resend was answered "already sent"."""
+    from core.peer_link import crossbar_publish
+    _same_turn(rr, monkeypatch, 'desk-7')
+    pub = MagicMock(side_effect=[False, True])
+    monkeypatch.setattr(crossbar_publish, 'publish_agent_message', pub)
+    first, _ = _reuse_send(rr, 'desk-7', 'Which month?')
+    again, _ = _reuse_send(rr, 'desk-7', 'Which month?')
+    assert first.startswith('Failed to send message'), first
+    assert pub.call_count == 2
+    assert again.startswith('Message sent successfully'), again
+
+
+@pytest.mark.parametrize('which', ['reuse', 'create'])
+def test_no_answer_in_time_tells_the_agent_not_to_resend(which, rr, central,
+                                                        publisher):
+    """Review of f1d599dd9: a read timeout was reported as "could not be
+    reached", but the request had gone out whole and chatbot_pipeline
+    publishes the text before it makes the video, so the resend it invited
+    reached the person twice."""
+    post = MagicMock(name='pooled_post_once',
+                     side_effect=requests.exceptions.ReadTimeout('slow'))
+    out = _send(which, rr, post)
+    assert out.startswith('Failed to send message'), out
+    assert 'do not send it again' in out, out
+    assert 'could not be reached' not in out, out
+
+
+def test_unreachable_is_still_safe_to_resend(rr, central, publisher):
+    """A refused connection never reached the backend: that reply must not
+    tell the agent to hold back."""
+    post = MagicMock(name='pooled_post_once',
+                     side_effect=requests.exceptions.ConnectionError('refused'))
+    out = _send('reuse', rr, post)
+    assert 'could not be reached' in out, out
+    assert 'do not send it again' not in out, out
+
+
+def test_a_slow_backend_gets_one_copy_across_a_resend(rr, central, publisher,
+                                                      monkeypatch):
+    """The real transport against a real server that takes the message and
+    answers after the read budget: one POST, the agent is told not to send
+    it again, and its resend in the same turn posts nothing."""
+    from core import http_pool
+    up = _free_loopback_server(200, delay=2.0)
+    if up is None:
+        pytest.skip('127.0.0.2 cannot be bound here (macOS has only 127.0.0.1)')
+    server, received = up
+    _same_turn(rr, monkeypatch, 'cent-8')
+    monkeypatch.setattr(http_pool, 'LLM_COMPLETION_TIMEOUT', (3, 0.5))
+    try:
+        monkeypatch.setenv('AUTOGEN_RESPONSE_URL',
+                           f'http://127.0.0.2:{server.server_port}/autogen_response')
+        with patch.object(rr, 'scheduler') as sched:
+            sched.get_job.return_value = None
+            first = rr.send_message_to_user1('cent-8', 'one message', 'inp', 'p-9')
+            again = rr.send_message_to_user1('cent-8', 'one message', 'inp', 'p-9')
+        time.sleep(2.5)  # let the server finish answering the one it took
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert [r.get('message') for r in received] == ['one message']
+    assert 'do not send it again' in first, first
+    assert again.startswith('Message already sent'), again
 
 
 def test_centrals_deploy_points_both_starts_at_the_backend():

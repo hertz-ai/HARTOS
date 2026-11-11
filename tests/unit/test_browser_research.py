@@ -725,5 +725,163 @@ class TestT1AdapterIsolation(unittest.TestCase):
                          f'channel adapters must not import browser_research; offenders: {offenders}')
 
 
+class TestLoggedOutIsNeverThePersonsSession(unittest.TestCase):
+    """A fetch with no stored cookies must not come back wearing the
+    person's handle.
+
+    Nothing in this build writes to the vault -- AccountVault.add has no
+    production caller, only the four calls in this very file -- so this is
+    the path every T2 read actually takes.  Before the fix,
+    fetch_with_session stamped the asked-for handle onto the result and
+    left the crawler's own connection_mechanism in place, so a logged-out
+    crawl reached the agent as the person's signed-in session.
+    """
+
+    def _dispatch(self, tmp, seeded_cookies=None, handle='@me'):
+        from integrations.browser_research import vault, tools
+        from integrations.browser_research.vault import Account
+        audit_path = os.path.join(tmp, 'audit.log')
+        v = vault.reset_vault_for_tests(path=audit_path + '.vault.enc')
+        if seeded_cookies is not None:
+            v.add(Account(platform='twitter', handle='@me',
+                          cookies=seeded_cookies, capabilities={'read'}))
+
+        def fake_crawler(url, cookies=None, timeout=30, cdp_endpoint=None, **_):
+            return {'success': True, 'url': url, 'markdown': 'body',
+                    'connection_mechanism': 'obscura_b1_headless_profile'}
+
+        with patch('integrations.browser_research.audit._log_path',
+                   return_value=audit_path):
+            with patch('integrations.web_crawler.crawl_url_with_cookies',
+                       side_effect=fake_crawler):
+                result = tools.dispatch(
+                    tool='Search_Platform', user_id='u1',
+                    platform='twitter', query='ai news', handle=handle,
+                    consent_check=lambda uid, scope: True,
+                )
+        return result, audit_path
+
+    def test_empty_vault_fetch_is_labelled_logged_out(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _ = self._dispatch(tmp)
+        self.assertFalse(result['authenticated'])
+        self.assertIsNone(
+            result['handle'],
+            'a logged-out crawl must not wear the handle it was asked for')
+        self.assertEqual(result['connection_mechanism'], 'logged_out_public')
+        self.assertIn('notice', result)
+        self.assertIn('NOT', result['notice'])
+
+    def test_vault_row_with_no_cookies_is_not_a_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _ = self._dispatch(tmp, seeded_cookies=[])
+        self.assertFalse(result['authenticated'],
+                         'a vault row with an empty cookie list is not a session')
+        self.assertIsNone(result['handle'])
+        self.assertEqual(result['connection_mechanism'], 'logged_out_public')
+
+    def test_real_cookies_keep_the_handle_and_mechanism(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _ = self._dispatch(
+                tmp, seeded_cookies=[{'name': 'auth_token', 'value': 'T'}])
+        self.assertTrue(result['authenticated'])
+        self.assertEqual(result['handle'], '@me')
+        self.assertEqual(result['connection_mechanism'],
+                         'obscura_b1_headless_profile')
+        self.assertNotIn('notice', result)
+
+    def test_audit_trail_does_not_claim_a_session_either(self):
+        from integrations.browser_research import audit
+        with tempfile.TemporaryDirectory() as tmp:
+            _, audit_path = self._dispatch(tmp)
+            with patch('integrations.browser_research.audit._log_path',
+                       return_value=audit_path):
+                records = audit.read_recent(limit=10)
+        self.assertEqual(records[-1]['connection_mechanism'],
+                         'logged_out_public')
+
+
+class TestRoutablePlatformDriftGuard(unittest.TestCase):
+    """Every routable platform must really exist.
+
+    'douyin' sat in _PER_PLATFORM_ALLOWED with no scripts/douyin.py, so
+    dispatch passed the known-platform check and died inside importlib,
+    refusing with a raw ImportError instead of naming the platforms that
+    work.  The comment above the set claimed a drift-guard that no code
+    performed -- this test is that guard.
+    """
+
+    def test_every_routable_platform_has_a_script_module(self):
+        from importlib import import_module
+        from integrations.browser_research import tools
+        missing = []
+        for platform in sorted(tools._PER_PLATFORM_ALLOWED):
+            try:
+                import_module(f'integrations.browser_research.scripts.{platform}')
+            except ImportError:
+                missing.append(platform)
+        self.assertEqual(
+            missing, [],
+            f'routable platforms with no scripts/<name>.py: {missing}')
+
+    def test_every_routable_platform_has_an_allowlist_entry(self):
+        from integrations.browser_research import tools, domain_allowlist
+        missing = [p for p in sorted(tools._PER_PLATFORM_ALLOWED)
+                   if not domain_allowlist.ALLOWLIST.get(p)]
+        self.assertEqual(
+            missing, [],
+            f'routable platforms with no domain allowlist entry: {missing}')
+
+    def test_every_routable_platform_exposes_the_three_actions(self):
+        from importlib import import_module
+        from integrations.browser_research import tools
+        for platform in sorted(tools._PER_PLATFORM_ALLOWED):
+            mod = import_module(f'integrations.browser_research.scripts.{platform}')
+            for action in ('search', 'timeline', 'post'):
+                self.assertTrue(
+                    callable(getattr(mod, action, None)),
+                    f'{platform}.{action} must be callable for dispatch to route')
+
+    def test_refusal_for_an_unroutable_platform_names_the_working_ones(self):
+        """Owner rule 11-09 -- a refusal says what was wrong and how to fix."""
+        from integrations.browser_research import tools
+        result = tools.dispatch(tool='Search_Platform', user_id='u1',
+                                platform='douyin', query='x')
+        self.assertFalse(result['success'])
+        self.assertIn('twitter', result['error'],
+                      'the refusal must name the platforms that do work')
+        self.assertNotIn('ImportError', result['error'])
+
+
+class TestRefusalsPointSomewhereReal(unittest.TestCase):
+    """Owner rule 11-09: a refusal says what was wrong and how to fix it.
+
+    The dry_run=False refusal told the person to 'Track in
+    memory/project_browser_research_subsystem.md' -- a file that does not
+    exist in this repo -- and dropped the text they had written.
+    """
+
+    def test_post_refusal_does_not_cite_a_missing_doc(self):
+        from integrations.browser_research.scripts import _base
+        result = _base.post_preview('twitter', 'my draft', handle='@me',
+                                    dry_run=False)
+        self.assertFalse(result['success'])
+        doc = os.path.join(HARTOS_ROOT, 'memory',
+                           'project_browser_research_subsystem.md')
+        self.assertFalse(
+            os.path.exists(doc),
+            'that doc now exists -- re-check what the refusal should say')
+        self.assertNotIn('project_browser_research_subsystem', result['error'])
+
+    def test_post_refusal_hands_the_text_back_unsent(self):
+        from integrations.browser_research.scripts import _base
+        result = _base.post_preview('twitter', 'my draft', handle='@me',
+                                    dry_run=False)
+        self.assertEqual(
+            result['content'], 'my draft',
+            'the refusal promises the text comes back unchanged')
+        self.assertIn('nothing was posted', result['error'])
+
+
 if __name__ == '__main__':
     unittest.main()

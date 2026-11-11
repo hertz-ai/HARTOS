@@ -2245,8 +2245,9 @@ def window_asked(messages, action_id, answers=()) -> bool:
 
 def window_question(messages, action_id, answers=()):
     """The open question window_asked finds, as (message index, the text
-    sent), or None.  The one scan: window_asked reads it, and
-    step_open_question reads the request it went out in."""
+    sent), or None.  The one scan: window_asked reads it, and a background
+    step that asked hands this text to its goal's person (Part B,
+    hand_goal_to_its_person)."""
     names = tool_call_names([messages or []])
     answers = [_answer_and_request(answer) for answer in (answers or ())]
     # The requests whose answers were posted after the point the scan has
@@ -2289,6 +2290,46 @@ def window_question(messages, action_id, answers=()):
                        for request in answered_in):
                     return None
                 return index, str(sent_text(messages, call_id) or '')
+    return None
+
+
+def hand_goal_to_its_person(goal_id, user_prompt, prompt_id, action_id,
+                            action_text, reason, flow, ask=None):
+    """Park a background goal whose step stopped for a person and tell that
+    person, through GoalManager.escalate_goal: the one hand-off for CREATE
+    (create_recipe._ask_for_help) and REUSE (a background step that asked,
+    Part B), so both write one record shape.  ``ask`` is the question the
+    step put out; it selects the person directly (the owner's 2026-10-31
+    ruling: a background step's question goes to the goal's owner) instead
+    of the expert model first.  Returns the stage ('expert' or 'human'), or
+    None when there is no goal to park or the hand-off failed (logged)."""
+    if not goal_id:
+        return None
+    record = {
+        'action_id': int(action_id),
+        'action': str(action_text or '')[:500],
+        'reason': reason,
+        'tried': ['local'],
+        # So the daemon can tell whether the expert's turn banked this
+        # action (#106d).
+        'user_prompt': user_prompt,
+        'prompt_id': prompt_id,
+        'flow': flow,
+    }
+    if ask is not None:
+        record['ask'] = str(ask)
+    try:
+        from integrations.agent_engine.goal_manager import GoalManager
+        from integrations.social.models import db_session
+        with db_session(commit=True) as _db:
+            handed = GoalManager.escalate_goal(_db, goal_id, record)
+            if handed.get('success'):
+                return handed.get('stage') or 'human'
+            logger.warning("goal %s: the hand-off for action %s was refused: %s",
+                           goal_id, action_id, handed.get('error'))
+    except Exception:
+        logger.warning("goal %s: could not hand action %s on", goal_id,
+                       action_id, exc_info=True)
     return None
 
 

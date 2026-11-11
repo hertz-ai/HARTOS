@@ -310,6 +310,17 @@ def request_id_context(request_id: str):
         _request_id_var.reset(token)
 
 
+def turn_request_id() -> str:
+    """The id of the turn this code runs in: what ``with_llm_context`` bound
+    for the running ``chat_agent`` / ``recipe()`` turn, '' outside any such
+    turn (a scheduled run, an agent-to-agent relay, a worker thread).
+
+    Reads the contextvar only.  ``_get_request_id`` prefers the thread-local,
+    which names the request a thread last served and, read from later work on
+    that thread, names the wrong one (review of efd223acf, finding 5)."""
+    return _request_id_var.get()
+
+
 def with_llm_context(source_name: str, request_id_arg: str = 'request_id'):
     """Decorator for the autogen entry points (``create_recipe.recipe`` /
     ``reuse_recipe.chat_agent``): set the outbound ``source`` label AND
@@ -546,9 +557,12 @@ def _feed_provider_breaker(url, status, response=None) -> None:
     (#106b b).  401/402/403 = account refusal (a failure); 2xx = success
     (clears/half-open-closes).  A 429 is a rate limit, not a standing
     refusal, and is ignored, except when its body says the provider's quota
-    is spent until a reset further off than the breaker's own cooldown
-    (_quota_spent_until): that refuses every call until then, exactly like
-    a 402.  Every other status and all exceptions are ignored: a transport
+    is spent until a reset still ahead (_quota_spent_until): that refuses
+    every call until then, exactly like a 402.  Any reset still ahead
+    counts, however near: a threshold let the breaker reopen in the last
+    minutes before the reset, where every goal turn failed and took a strike
+    (review of 5c6b899a5: 4 strikes before the reset, and a goal paused as
+    early as without the fix).  Every other status and all exceptions are ignored: a transport
     error says nothing about the account.  This is the SOLE consumer that
     resolves the breaker's half-open probe, so it must run on the real wire
     response, never at an upstream pre-flight check."""
@@ -563,18 +577,12 @@ def _feed_provider_breaker(url, status, response=None) -> None:
             llm_provider_breaker.record_failure(host)
         elif status == 429 and response is not None:
             until = _quota_spent_until(response)
-            if until is not None and until - time.time() > _QUOTA_SPENT_MIN_WAIT_S:
+            if until is not None and until > time.time():
                 llm_provider_breaker.record_failure(host)
         elif 200 <= status < 300:
             llm_provider_breaker.record_success(host)
     except Exception:
         pass
-
-
-#: A spent quota counts as a refusal only when it resets later than this:
-#: the provider breaker's cooldown (core.circuit_breaker.llm_provider_breaker),
-#: so a window that reopens before the breaker would ends no goal's turn early.
-_QUOTA_SPENT_MIN_WAIT_S = 600.0
 
 
 def _quota_spent_until(response) -> Optional[float]:
@@ -601,10 +609,12 @@ def _quota_spent_until(response) -> Optional[float]:
     headers = meta.get('headers') if isinstance(meta, dict) else None
     if not isinstance(headers, dict):
         return None
-    if str(headers.get('X-RateLimit-Remaining', '')).strip() != '0':
+    # Header names are case-insensitive on the wire; read them that way.
+    headers = {str(k).lower(): v for k, v in headers.items()}
+    if str(headers.get('x-ratelimit-remaining', '')).strip() != '0':
         return None
     try:
-        reset = float(headers.get('X-RateLimit-Reset'))
+        reset = float(headers.get('x-ratelimit-reset'))
     except (TypeError, ValueError):
         return None
     return reset / 1000.0 if reset > 1e11 else reset

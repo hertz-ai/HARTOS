@@ -241,6 +241,8 @@ from agent_ledger import (
 from agent_ledger.factory import create_production_ledger, get_or_create_ledger
 # Add to your create_recipe.py after imports
 from hartos.lifecycle_hooks import (
+    get_registered_groupchat, hand_goal_to_its_person, window_question,
+    recorded_answers,
     stale_for_unstarted_action, settled_action_id,
     initialize_deterministic_actions,
     lifecycle_hook_track_action_assignment,
@@ -4573,13 +4575,32 @@ def build_holds_a_step_for_the_person(user_id, prompt_id) -> bool:
     reply").  Their next message is that answer and reaches recipe() as their
     own words; any other message to an unfinished agent does not
     (hart_intelligence_entry resume_build_input; review of cfa9e29ee).  A
-    loop-break's flag (USER_INPUT_GATE_RECOVERABLE_STALL) asked nobody.  The
-    session's flag only: after a restart between the ask and the reply, the
-    build asks again."""
-    task = user_tasks.get(f'{user_id}_{prompt_id}')
-    return (isinstance(getattr(task, '_needs_user_input_action_id', None), int)
-            and getattr(task, '_needs_user_input_kind', None)
-            != USER_INPUT_GATE_RECOVERABLE_STALL)
+    loop-break's flag (USER_INPUT_GATE_RECOVERABLE_STALL) asked nobody.
+
+    With no flag (a restart, or an evicted session, between the ask and the
+    reply) it asks what the gate itself asks then
+    (_resume_prior_user_input_block): whether the action the build stands on
+    waits for this person in the ledger (person_waits_on).  The action is
+    the session's, or, with no session, where the saved progress says the
+    build stands (detect_and_resume_progress, what initialize_with_resume
+    reads).  Review of 49eee800d, must-fix 2: reading the flag only lost the
+    reply after a restart, which the gate's ledger read had taken."""
+    user_prompt = f'{user_id}_{prompt_id}'
+    task = user_tasks.get(user_prompt)
+    if isinstance(getattr(task, '_needs_user_input_action_id', None), int):
+        return (getattr(task, '_needs_user_input_kind', None)
+                != USER_INPUT_GATE_RECOVERABLE_STALL)
+    try:
+        if task is not None:
+            current, flow = getattr(task, 'current_action', None), get_current_flow(user_prompt)
+        else:
+            flow, current, _progress, _done = detect_and_resume_progress(prompt_id, user_prompt)
+        return isinstance(current, int) and bool(person_waits_on(user_prompt, current, flow))
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            '[USER-INPUT-GATE] could not read whether %s waits for the person: %s',
+            user_prompt, exc)
+        return False
 
 
 def _ask_for_help(user_prompt, prompt_id, action_id, action_text, reason):
@@ -4628,28 +4649,23 @@ def _ask_for_help(user_prompt, prompt_id, action_id, action_text, reason):
     from core.chat_client import daemon_goal_id
     from hartos.threadlocal import thread_local_data
     goal_id = daemon_goal_id(thread_local_data.get_request_id())
-    stage = None
-    if goal_id:
-        try:
-            from integrations.agent_engine.goal_manager import GoalManager
-            from integrations.social.models import db_session
-            with db_session(commit=True) as _db:
-                _handed = GoalManager.escalate_goal(_db, goal_id, {
-                    'action_id': int(action_id),
-                    'action': str(action_text or '')[:500],
-                    'reason': reason,
-                    'tried': ['local'],
-                    # So the daemon can tell whether the expert's turn banked
-                    # this action (#106d).
-                    'user_prompt': user_prompt,
-                    'prompt_id': prompt_id,
-                    'flow': get_current_flow(user_prompt),
-                })
-                if _handed.get('success'):
-                    stage = _handed.get('stage') or 'human'
-        except Exception as _park_err:
-            current_app.logger.warning(
-                f'[ASK-FOR-HELP] could not hand on goal {goal_id}: {_park_err}')
+    # A question the step put out goes to the goal's person, not the expert
+    # model (Part B; the owner's 2026-10-31 ruling).  The one hand-off REUSE
+    # uses too, so both write one record shape.
+    _question = None
+    try:
+        _gc = get_registered_groupchat(user_prompt)
+        _asked = window_question(list(getattr(_gc, 'messages', None) or []),
+                                 action_id, recorded_answers(user_prompt, action_id)
+                                 ) if _gc is not None else None
+        _question = _asked[1] if _asked else None
+    except Exception:
+        current_app.logger.debug(
+            f'[ASK-FOR-HELP] action {action_id}: the window could not be read '
+            f'for a question', exc_info=True)
+    stage = hand_goal_to_its_person(goal_id, user_prompt, prompt_id, action_id,
+                                    action_text, reason,
+                                    get_current_flow(user_prompt), ask=_question)
     current_app.logger.warning(
         f'[ASK-FOR-HELP] action {action_id} of {user_prompt}: {reason}; '
         f'goal {goal_id or "unknown"} handed to {stage or "nobody"}')

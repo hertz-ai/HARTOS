@@ -540,6 +540,7 @@ def join(request, monkeypatch, track_keys):
         def _no_store(*_a, **_k):
             raise RuntimeError('no consent store on this node')
         monkeypatch.setattr(pr, '_kept_joins', _no_store)
+        monkeypatch.setattr(pr, '_consent_store_kept_here', lambda: False)
 
     def _join(creator, prompt_id, joiner):
         if request.param == 'kept_grant':
@@ -695,6 +696,10 @@ class TestCrossUserJoinResolution:
         # only when those cannot be read (persona_registry.joined_chats), so
         # both readers fail here.
         monkeypatch.setattr(pr, '_kept_joins', _no_grants)
+        # A node with no consent store at all: only then is chat_joinees read
+        # (review of 86f4c71f8).  An earlier test in this file may have made
+        # the consent table, so say it, rather than depend on file order.
+        monkeypatch.setattr(pr, '_consent_store_kept_here', lambda: False)
         monkeypatch.setattr(pr, 'chat_joinees', _Raiser())
         with caplog.at_level(logging.WARNING, logger='core.persona_registry'):
             sessions, key = pr._resolve_session_for_user('whoever', 'pexc')
