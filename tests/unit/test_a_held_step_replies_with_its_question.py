@@ -65,6 +65,15 @@ VERDICT = {
 }
 
 
+NARRATION = {
+    'role': 'assistant', 'name': 'Assistant',
+    'content': ("I see that the conversation is currently waiting for Arjun "
+                "(the child) to respond to the question about whether the "
+                "person is \"Amma\" or \"Appa.\" Since the child hasn't "
+                "responded yet, I should wait for their reply."),
+}
+
+
 def _history():
     return [dict(DISPATCH), dict(SEND_CALL), dict(RECEIPT), dict(VERDICT)]
 
@@ -116,7 +125,7 @@ def _ask(**over):
     return ask
 
 
-def _run(rr, monkeypatch, held=1, ask=None, this_turn=THIS_TURN):
+def _run(rr, monkeypatch, held=1, ask=None, this_turn=THIS_TURN, history=None):
     monkeypatch.setattr(rr, '_reuse_outstanding_tools',
                         lambda *a, **k: [], raising=True)
     monkeypatch.setattr(rr, '_reuse_held_action',
@@ -128,7 +137,7 @@ def _run(rr, monkeypatch, held=1, ask=None, this_turn=THIS_TURN):
     monkeypatch.setattr(rr, 'request_id_list',
                         {SESSION: this_turn} if this_turn else {}, raising=True)
     monkeypatch.setitem(rr.user_tasks, SESSION, _Task())
-    chat = _Chat(_history())
+    chat = _Chat(history if history is not None else _history())
     rec = _Recorder()
     posted = rr._reuse_synthesis_turn(SESSION, chat, _Manager(), rec)
     return posted, chat, rec
@@ -155,6 +164,30 @@ class TestAHeldStepRepliesWithItsQuestion:
     def test_a_question_returned_as_the_reply_counts_too(self, rr, monkeypatch):
         _posted, chat, rec = _run(rr, monkeypatch, ask=_ask(via='reply'))
         assert rec.messages == []
+        assert chat.messages[-1]['content'] == QUESTION
+
+    def test_a_narration_tail_is_replaced_by_the_question(self, rr, monkeypatch):
+        """THE SECOND SHAPE, live 22:4x IST on build 74 (18582f23e): the
+        tail was the model's narration, which reads as an answer, so the
+        gate returned before the held-step branch and the narration was the
+        reply.  RED on 18582f23e."""
+        history = _history()[:-1] + [dict(NARRATION)]
+        posted, chat, rec = _run(rr, monkeypatch, ask=_ask(), history=history)
+        assert rr._reuse_needs_synthesis(_Chat(history)) is False, (
+            'precondition: the narration reads as an answer to the gate')
+        assert rec.messages == []
+        assert posted is False
+        assert chat.messages[-1]['content'] == QUESTION, (
+            'the step holds with its question out this turn, and the reply '
+            'was the narration written after it')
+
+    def test_a_tail_that_already_is_the_question_is_not_doubled(
+            self, rr, monkeypatch):
+        history = _history()[:-1] + [{'role': 'assistant', 'name': 'Assistant',
+                                       'content': QUESTION}]
+        _posted, chat, rec = _run(rr, monkeypatch, ask=_ask(), history=history)
+        assert rec.messages == []
+        assert len(chat.messages) == len(history)
         assert chat.messages[-1]['content'] == QUESTION
 
 
@@ -189,6 +222,16 @@ class TestEverythingElseSteersAsBefore:
 
     def test_no_open_ask(self, rr, monkeypatch):
         self._assert_steered(*_run(rr, monkeypatch, ask=None))
+
+    def test_without_a_held_step_a_written_answer_stays(self, rr, monkeypatch):
+        """The branch runs first now; a turn that is not held keeps the
+        answer its group wrote."""
+        history = _history()[:-1] + [dict(NARRATION)]
+        posted, chat, rec = _run(rr, monkeypatch, held=None, ask=_ask(),
+                                 history=history)
+        assert rec.messages == []
+        assert posted is False
+        assert chat.messages[-1]['content'] == NARRATION['content']
 
     def test_a_reader_that_fails_steers_instead_of_raising(
             self, rr, monkeypatch):
