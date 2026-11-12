@@ -1041,3 +1041,84 @@ def test_ft23_pythonpath_propagates_library_zip():
             os.unlink(tmp_zip)
         except OSError:
             pass
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Regression: a cold start slower than startup_timeout is not killed
+# ═══════════════════════════════════════════════════════════════════
+# Nunba 2026-10-01: with llama-server holding the CPU, whisper's cold
+# import took longer than startup_timeout.  The worker was killed on the
+# timeout and the next request spawned a new one from zero -- every 60s,
+# for minutes -- so the mic returned empty text.
+
+def test_slow_cold_start_keeps_the_same_process_and_becomes_ready(monkeypatch):
+    # Interpreter start + 3s load + the post-load torch import (READY comes
+    # after it) outlast startup_timeout (4s) and stay well inside the
+    # give-up budget (4s x STARTUP_GIVE_UP_FACTOR = 20s).
+    monkeypatch.setenv('HEVOLVE_TEST_ECHO_LOAD_S', '3')
+    w = _make_echo_worker(name='slow', startup_timeout=4.0)
+    try:
+        with pytest.raises(WorkerTimeout, match='still starting'):
+            w.start()
+        assert w.is_starting()
+        pid = w._proc.pid
+        deadline = time.monotonic() + 30
+        while True:
+            try:
+                w.start()
+                break
+            except WorkerTimeout:
+                assert time.monotonic() < deadline, 'never became ready'
+        assert w._proc.pid == pid  # waited on it; no second spawn
+        assert w.is_alive()
+        assert w.call({'op': 'echo', 'x': 1})['echo']['x'] == 1
+    finally:
+        w.stop(timeout=2.0)
+
+
+def test_a_start_that_never_finishes_is_still_reaped(monkeypatch):
+    monkeypatch.setenv('HEVOLVE_TEST_ECHO_LOAD_S', '60')
+    w = _make_echo_worker(name='hung', startup_timeout=0.5)
+    try:
+        give_up = w.startup_timeout * w.STARTUP_GIVE_UP_FACTOR
+        t0 = time.monotonic()
+        with pytest.raises(WorkerTimeout):
+            while True:
+                try:
+                    w.start()
+                except WorkerTimeout as e:
+                    if 'still starting' not in str(e):
+                        raise
+                    assert time.monotonic() - t0 < give_up + 10
+        assert w._proc is None and not w.is_starting()
+    finally:
+        w.stop(timeout=2.0)
+
+
+def test_toolworker_waits_on_a_slow_cold_start_instead_of_respawning(monkeypatch):
+    monkeypatch.setenv('HEVOLVE_TEST_ECHO_LOAD_S', '3')
+    t = ToolWorker(
+        tool_name='slow_tool',
+        tool_module=ECHO_MODULE,
+        vram_budget='tts_f5',
+        output_subdir='slow_tool',
+        engine='test',
+        startup_timeout=4.0,
+        request_timeout=5.0,
+        idle_timeout=0,
+    )
+    try:
+        r1 = t.call({'op': 'echo', 'n': 1})
+        assert 'still starting' in r1.get('error', '')
+        first = t._worker
+        pid = first._proc.pid
+        deadline = time.monotonic() + 30
+        while True:
+            r = t.call({'op': 'echo', 'n': 2})
+            if 'error' not in r:
+                break
+            assert 'still starting' in r['error'] and time.monotonic() < deadline
+        assert r['echo']['n'] == 2
+        assert t._worker is first and t._worker._proc.pid == pid
+    finally:
+        t.stop()

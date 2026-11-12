@@ -10,8 +10,9 @@ each pasted the SAME ``_run`` skeleton:
 
 …differing only in (a) the command/env they build, (b) how they format a stdout
 line, and (c) what they do when the child exits. hevolveai additionally needs the
-#59 circuit breakers (disable after N unhealthy exits), Windows Job-Object binding,
-governor registration, and a backoff-reset after healthy uptime.
+#59 circuit breakers (disable after N unhealthy exits), a Windows Job Object of its
+own, governor registration, and a backoff-reset after healthy uptime.  Every other
+child is bound to this process's job by the default ``_on_started``.
 
 This base owns the loop + the lifecycle boilerplate (thread, stop, terminate→kill);
 subclasses supply ONLY the differences via the hooks below. No subprocess is
@@ -70,8 +71,26 @@ class ProcessSupervisor:
         raise NotImplementedError
 
     def _on_started(self, proc: subprocess.Popen) -> None:
-        """Called immediately after a successful Popen (before output stream) —
-        e.g. bind a Windows Job Object, register with the resource governor."""
+        """Called immediately after a successful Popen (before output stream).
+
+        Default (Windows only; a no-op elsewhere): bind the child to this
+        process's job (core.child_lifecycle.bind_to_parent), so it dies when
+        this process does.  Nunba quits with os._exit(0), so stop() never
+        runs on a tray quit; measured 2026-11-12, the WhatsApp gateway (node
+        gateway.js, spawned here) outlived three Quits on :3000.
+
+        The job is the resource governor's, so a bound child counts against
+        its memory ceiling, as llama-server already does.  A subclass that
+        overrides this without calling super() is NOT bound: hevolveai does
+        that on purpose (its own job, CREATE_BREAKAWAY_FROM_JOB); any other
+        override must call super()._on_started(proc).  A failed binding never
+        fails the spawn."""
+        try:
+            from core.child_lifecycle import bind_to_parent
+            bind_to_parent(proc)
+        except Exception as e:  # noqa: BLE001 -- never let binding stop a spawn
+            logger.warning('%s_supervisor: child not bound to this process: %s',
+                           self.name, e)
 
     def _format_stdout_line(self, line: str) -> None:
         """Emit one decoded, stripped, non-empty stdout line. Default: log it
