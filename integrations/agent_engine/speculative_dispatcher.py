@@ -1774,27 +1774,38 @@ class SpeculativeDispatcher:
                 self._evict_old_results()
             return
 
-        # A failed turn does not raise: the pipeline answers with
-        # user_facing_error()'s sentence, which is right for a person and
-        # wrong here.  Measured on central 9ce6023f: every spec_expert TTS
-        # marker since boot (30) spoke "I couldn't finish that: 'NoneType'
-        # object is not iterable" over the draft, recorded it for continual
-        # learning and closed the speculation improved=True.  Treat it as
-        # the empty reply it is: the draft standby stays, nothing is
-        # recorded, and /diag can see the expert ran and failed.
-        from core.agent_tools import is_user_facing_error
-        if is_user_facing_error(expert_response):
+        # A reply that is not the turn's result never replaces the draft,
+        # judged by dispatch's one rule (_turn_failure).  A failed turn does
+        # not raise: the pipeline answers with user_facing_error()'s
+        # sentence, which is right for a person and wrong here.  Measured on
+        # central 9ce6023f: every spec_expert TTS marker since boot (30)
+        # spoke "I couldn't finish that: 'NoneType' object is not iterable"
+        # over the draft, recorded it for continual learning and closed the
+        # speculation improved=True.  A turn that did not run answers a
+        # sentence too: held for another turn of its conversation (#172),
+        # paused for the person, waiting for the person's reply.  Measured on
+        # central 2026-11-12: a goal's Claude turn was held behind a fast
+        # turn still running, and the held sentence reached the goal owner's
+        # chat as the expert's answer.  Either way the draft standby stays,
+        # nothing is recorded, and /diag can tell a failed expert from one
+        # that did not run.
+        from integrations.agent_engine.dispatch import (_DEFERRED_PREFIX,
+                                                        _turn_failure)
+        not_a_result = _turn_failure(expert_response)
+        if not_a_result is not None:
+            held = not_a_result.startswith(_DEFERRED_PREFIX)
             logger.warning(
-                "collapsed expert for %s failed (%s); draft standby remains "
+                "collapsed expert for %s %s (%s); draft standby remains "
                 "the final reply, nothing delivered or recorded",
-                speculation_id, expert_response.strip()[:120])
+                speculation_id, 'did not run' if held else 'failed',
+                not_a_result[:140])
             with self._lock:
                 self._results[speculation_id] = {
                     'response': fast_response,
                     'model': expert_model.model_id,
                     'latency_ms': round(elapsed_ms, 1),
                     'improved': False,
-                    'expert_failed': True,
+                    ('expert_held' if held else 'expert_failed'): True,
                 }
                 self._evict_old_results()
             return
@@ -2228,17 +2239,29 @@ class SpeculativeDispatcher:
         # returns '' on every dispatch.
         import requests as req
         from integrations.agent_engine.dispatch import _internal_auth_headers
+        from integrations.channels.chat_contract import agent_turn_timeout
         base_url = os.environ.get('HEVOLVE_BASE_URL', f'http://localhost:{get_port("backend")}')
         try:
+            # The whole turn, on the agent-turn budget the expert leg waits
+            # too (120 s by default, dispatch_goal's own wait).  A turn given
+            # up on keeps running on the server and holds its conversation:
+            # measured on central 2026-11-12, two goals' fast turns outlived
+            # the old 30 s, the daemon counted each as failed, and the Claude
+            # expert scheduled next was refused for "another turn of this
+            # group" (#172).
             resp = req.post(f'{base_url}/chat', json=payload,
-                            headers=_internal_auth_headers(), timeout=30)
+                            headers=_internal_auth_headers(),
+                            timeout=agent_turn_timeout())
             if resp.status_code == 200:
                 return resp.json().get('response', '')
             logger.warning(
                 f"Model dispatch ({model.model_id}) /chat returned "
                 f"{resp.status_code}")
         except req.RequestException as e:
-            logger.debug(f"Model dispatch failed ({model.model_id}): {e}")
+            # WARNING, not DEBUG: central logs nothing below WARNING after
+            # boot, and the caller only sees ''.
+            logger.warning(f"Model dispatch ({model.model_id}) /chat gave no "
+                           f"reply: {e}")
         return ''
 
     def _deliver_expert_response(self, user_id: str, prompt_id: str,
