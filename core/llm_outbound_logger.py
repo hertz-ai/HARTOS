@@ -633,8 +633,11 @@ def _quota_spent_until(response) -> Optional[float]:
 
 
 def _response_usage(response):
-    """``(prompt_tokens, completion_tokens)`` from an ALREADY-BUFFERED
-    chat/completions response, or None.  Same read discipline as
+    """``(prompt_tokens, completion_tokens, cache_written, cache_read)`` from
+    an ALREADY-BUFFERED chat/completions response, or None.  The last two are
+    how many of the prompt tokens were written to and read from Claude's
+    prompt cache (core.claude_native puts them in the usage block; any other
+    provider's reply reads as 0, 0).  Same read discipline as
     _response_tool_calls: only ``_content``, never ``.content`` (which would
     consume a stream the real caller is waiting for)."""
     try:
@@ -649,7 +652,8 @@ def _response_usage(response):
         tout = int(usage.get('completion_tokens') or 0)
         if tin <= 0 and tout <= 0:
             return None
-        return tin, tout
+        return (tin, tout, int(usage.get('cache_creation_input_tokens') or 0),
+                int(usage.get('cache_read_input_tokens') or 0))
     except Exception:
         return None
 
@@ -670,9 +674,15 @@ def _meter_response(body, response, status) -> None:
         usage = _response_usage(response)
         if usage is None:
             return
+        tokens_in, tokens_out, written, read = usage
+        # Cached prompt tokens cost a different price (budget_gate prices
+        # them); a call that used no cache is metered exactly as before.
+        cached = ({'cache_write_tokens': written, 'cache_read_tokens': read}
+                  if written or read else {})
         from integrations.agent_engine.budget_gate import meter_llm_call
         meter_llm_call(model=(body or {}).get('model') if isinstance(body, dict) else None,
-                       tokens_in=usage[0], tokens_out=usage[1], task_source='own')
+                       tokens_in=tokens_in, tokens_out=tokens_out, task_source='own',
+                       **cached)
     except Exception as e:
         logger.debug("[outbound] metering skipped: %s", e)
 
@@ -872,6 +882,57 @@ def _hosted_body(request):
         return None
 
 
+_native_skips_reported = set()
+
+
+def _claude_native_request(httpx_module, request, body):
+    """The Messages API request that replaces a configured endpoint's call to
+    Anthropic's OpenAI compatibility layer, so the prompt can be cached
+    (core.claude_native), or None to send the request as it came.
+
+    None for any other host, and for a request core.claude_native does not
+    map one to one (it goes to the compatibility layer unchanged).  A request
+    that cannot be built is sent as it came too: a hook may never fail an LLM
+    call.  Each reason is logged once."""
+    try:
+        from core import claude_native
+        if not claude_native.is_compat_call(request.url):
+            return None
+        return claude_native.native_request(
+            httpx_module, request, claude_native.messages_body(body))
+    except Exception as e:
+        why = '%s: %s' % (type(e).__name__, e)
+        if why not in _native_skips_reported:
+            _native_skips_reported.add(why)
+            logger.warning("[outbound] Claude call sent without prompt caching "
+                           "(compatibility layer, as it came): %s", why)
+        return None
+
+
+def _send_claude_native(httpx_module, orig_send, client, request, native, kwargs):
+    """Send the Messages API request ``native`` on the caller's own client
+    and return its reply as the chat/completions response the caller reads,
+    bound to the caller's ``request``."""
+    from core import claude_native
+    reply = orig_send(client, native, **kwargs)
+    try:
+        reply.read()
+    finally:
+        reply.close()
+    return claude_native.chat_response(httpx_module, request, reply)
+
+
+async def _asend_claude_native(httpx_module, orig_send, client, request, native, kwargs):
+    """The AsyncClient twin of _send_claude_native."""
+    from core import claude_native
+    reply = await orig_send(client, native, **kwargs)
+    try:
+        await reply.aread()
+    finally:
+        await reply.aclose()
+    return claude_native.chat_response(httpx_module, request, reply)
+
+
 _CONFIGURED_ENDPOINTS_TTL = 30.0
 _configured_endpoints_cache = (0.0, frozenset())
 
@@ -1000,16 +1061,25 @@ def _send_and_feed(httpx_module, orig_send, client, request, kwargs):
     and Kong routed the calls to its default lane.  Of the calls it meters,
     those that hold the configured expert are the ones the day cap can refuse
     (_day_cap_refusal), and a 2xx reply that carries no completion is
-    answered as a failed call (_no_completion_answer).  Any other host is
-    left exactly as it was (_is_configured_endpoint)."""
+    answered as a failed call (_no_completion_answer).  A Claude call to
+    Anthropic's compatibility layer goes to the Messages API instead, with
+    its prompt cached (_claude_native_request), and its reply comes back as
+    the chat completion the caller reads.  Any other host is left exactly as
+    it was (_is_configured_endpoint)."""
     gateway = _is_configured_endpoint(request.url)
     body = _hosted_body(request) if gateway else None
+    native = None
     if gateway:
         _annotate_request(request, body)
         refusal = _day_cap_refusal(httpx_module, request, body)
         if refusal is not None:
             return refusal
-    response = orig_send(client, request, **kwargs)
+        native = _claude_native_request(httpx_module, request, body)
+    if native is not None:
+        response = _send_claude_native(httpx_module, orig_send, client, request,
+                                       native, kwargs)
+    else:
+        response = orig_send(client, request, **kwargs)
     _status = getattr(response, 'status_code', None)
     _feed_provider_breaker(request.url, _status, response)
     if gateway:
@@ -2916,12 +2986,18 @@ def _install_async_patch(httpx_module) -> None:
             if _is_chat_completions_post(request):
                 _gateway = _is_configured_endpoint(request.url)
                 _hbody = _hosted_body(request) if _gateway else None
+                _native = None
                 if _gateway:
                     _annotate_request(request, _hbody)
                     _refusal = _day_cap_refusal(httpx_module, request, _hbody)
                     if _refusal is not None:
                         return _refusal
-                _resp = await _orig(self, request, **kwargs)
+                    _native = _claude_native_request(httpx_module, request, _hbody)
+                if _native is not None:
+                    _resp = await _asend_claude_native(httpx_module, _orig, self, request,
+                                                       _native, kwargs)
+                else:
+                    _resp = await _orig(self, request, **kwargs)
                 _hstatus = getattr(_resp, 'status_code', None)
                 _feed_provider_breaker(request.url, _hstatus, _resp)
                 if _gateway:

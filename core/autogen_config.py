@@ -338,6 +338,13 @@ EXPERT_MODEL_VAR = 'HEVOLVE_EXPERT_LLM_MODEL_NAME'
 EXPERT_API_KEY_VAR = 'HEVOLVE_EXPERT_LLM_API_KEY'
 EXPERT_LANES_VAR = 'HEVOLVE_EXPERT_LANES'
 DEFAULT_EXPERT_LANES = 'revenue'
+# How hard the expert thinks, for a Claude model on the Messages API
+# (core.claude_native sends it as output_config.effort).  Unset: the model's
+# own default.  Owner 2026-11-11 "find the right bang for the buck": on
+# central's agent tasks Haiku 5.5 at 'high' passed 17 of 17, at its default
+# 'medium' 13 of 14 (it logged an email that had failed to send).
+EXPERT_EFFORT_VAR = 'HEVOLVE_EXPERT_LLM_EFFORT'
+EXPERT_EFFORT_LEVELS = ('low', 'medium', 'high', 'xhigh', 'max')
 # Dollars per 1k tokens (input, output) by model family, list prices.  The
 # ONE price table: the expert entry's autogen ``price`` below and the
 # budget gate's dollar meter (integrations.agent_engine.budget_gate) both
@@ -346,6 +353,43 @@ EXPERT_USD_PER_1K = {
     'claude': (0.003, 0.015),     # Sonnet-class
 }
 OTHER_MODEL_FAMILY = 'other'
+# A model whose list price is not its family's (Anthropic, 2026-11), matched
+# by substring like the family; read with model_usd_per_1k.  Claude Haiku 5.5
+# has a second rate card above 100K prompt tokens.
+EXPERT_USD_PER_1K_BY_MODEL = {
+    'claude-sonnet-5-5': (0.002, 0.010),
+    'claude-haiku-5-5': (0.0001, 0.0005),
+}
+EXPERT_LONG_PROMPT_USD_PER_1K = {
+    # model: (prompt tokens above which the rate applies, (input, output))
+    'claude-haiku-5-5': (100_000, (0.0005, 0.0025)),
+}
+
+# Claude's prompt cache, priced as multiples of a model's input price
+# (Anthropic's list prices, 2026-11): a 5-minute cache write costs 1.25x, a
+# cache read 0.1x, except the models named below.  core.claude_native writes
+# 5-minute entries only.  Read with cache_price_factors.
+CACHE_WRITE_PRICE_FACTOR = 1.25
+CACHE_READ_PRICE_FACTOR = 0.1
+CACHE_READ_PRICE_FACTOR_BY_MODEL = {
+    'claude-sonnet-5-5': 0.05,
+    'claude-opus-5-5': 0.05,
+    'claude-fable-5-1': 0.025,
+    'claude-fable-5-2': 0.025,
+    'claude-mythos-5-1': 0.025,
+    'claude-mythos-5-2': 0.025,
+}
+
+
+def cache_price_factors(model_name) -> tuple:
+    """(write, read) multiples of ``model_name``'s input price for tokens
+    written to and read from Claude's prompt cache.  Substring match on the
+    model name, the same way model_family matches."""
+    lower = str(model_name or '').lower()
+    for name, read in CACHE_READ_PRICE_FACTOR_BY_MODEL.items():
+        if name in lower:
+            return (CACHE_WRITE_PRICE_FACTOR, read)
+    return (CACHE_WRITE_PRICE_FACTOR, CACHE_READ_PRICE_FACTOR)
 
 
 def model_family(model_name) -> str:
@@ -369,7 +413,11 @@ def family_usd_per_1k(family):
     base = EXPERT_USD_PER_1K.get(family)
     if base is None:
         return None
+    return _owner_pinned(family, base)
 
+
+def _owner_pinned(family, base):
+    """``base`` (input, output) with the owner's pin for ``family`` applied."""
     def _pinned(name, default):
         try:
             return float(os.environ.get(name, '') or default)
@@ -378,6 +426,46 @@ def family_usd_per_1k(family):
     upper = str(family).upper()
     return (_pinned('HEVOLVE_%s_USD_PER_1K_IN' % upper, base[0]),
             _pinned('HEVOLVE_%s_USD_PER_1K_OUT' % upper, base[1]))
+
+
+def model_usd_per_1k(model_name, prompt_tokens=None):
+    """(input, output) dollars per 1k tokens for ``model_name``: its own list
+    price where the table has one (EXPERT_USD_PER_1K_BY_MODEL, and the long-
+    prompt rate when ``prompt_tokens`` is above that model's threshold), else
+    its family's; the owner's family pin wins over both.  None for an
+    unpriced family.  Before this, every Claude model was priced as Sonnet-
+    class ($3/$15): Haiku 5.5 ($0.10/$0.50) would have been metered 30x too
+    high, and the day cap would have stopped its goals at a thirtieth of the
+    budget."""
+    family = model_family(model_name)
+    if family == OTHER_MODEL_FAMILY:
+        return None
+    lower = str(model_name or '').lower()
+    base = next((p for name, p in EXPERT_USD_PER_1K_BY_MODEL.items() if name in lower),
+                EXPERT_USD_PER_1K[family])
+    for name, (threshold, long_price) in EXPERT_LONG_PROMPT_USD_PER_1K.items():
+        if name in lower and prompt_tokens is not None and prompt_tokens > threshold:
+            base = long_price
+    return _owner_pinned(family, base)
+
+
+def expert_effort(model_name):
+    """The effort the owner set for the configured expert
+    (HEVOLVE_EXPERT_LLM_EFFORT) when ``model_name`` is that expert's model,
+    else None: any other model, and an unset or unknown level (reported
+    once), keep the model's own default."""
+    configured = os.environ.get(EXPERT_MODEL_VAR, '').strip().lower()
+    if not configured or str(model_name or '').strip().lower() != configured:
+        return None
+    raw = os.environ.get(EXPERT_EFFORT_VAR, '').strip().lower()
+    if not raw:
+        return None
+    if raw not in EXPERT_EFFORT_LEVELS:
+        _report_once('expert-effort', "%s=%r is not one of %s; the model's own "
+                     "default effort is used" % (EXPERT_EFFORT_VAR, raw,
+                                                  ', '.join(EXPERT_EFFORT_LEVELS)))
+        return None
+    return raw
 
 
 def resolve_expert_backend():
@@ -407,7 +495,7 @@ def resolve_expert_backend():
     }
     # autogen's ``price`` is optional: a priced family gets the table's (pinned)
     # price, an unpriced one gets no invented number.
-    price = family_usd_per_1k(model_family(model))
+    price = model_usd_per_1k(model)
     if price:
         entry["price"] = list(price)
     return entry
