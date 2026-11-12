@@ -366,9 +366,9 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
     # try/except so a check error never blocks a dispatch.
     _prov_host = local_dispatch_provider_breaker_open(model_config)
     if _prov_host:
-        logger.info(f"Provider {_prov_host} refusing the account (breaker "
-                    f"open), deferring local /chat for "
-                    f"{daemon_id or prompt_id}")
+        logger.info(f"Provider {_prov_host} refusing calls (account refused "
+                    f"or quota spent; breaker open), deferring local /chat "
+                    f"for {daemon_id or prompt_id}")
         return 'deferred', None
 
     # Any error resolving the path still lets the caller fall through to its
@@ -1924,8 +1924,8 @@ def _dispatch_goal_turn(prompt: str, user_id: str, goal_id: str,
             from core.circuit_breaker import (llm_provider_breaker,
                                               CircuitState)
             if llm_provider_breaker.state(_prov_host) == CircuitState.OPEN:
-                _reason = (f'provider {_prov_host} is refusing the account '
-                           f'(breaker open)')
+                _reason = (f'provider {_prov_host} is refusing calls (account '
+                           f'refused or quota spent; breaker open)')
                 _record_turn_failure(goal_id, _reason)
                 logger.warning(f"Goal {goal_id}: {_reason}; not dispatching "
                                f"this tick")

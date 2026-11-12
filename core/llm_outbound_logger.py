@@ -557,13 +557,19 @@ def _feed_provider_breaker(url, status, response=None) -> None:
     (#106b b).  401/402/403 = account refusal (a failure); 2xx = success
     (clears/half-open-closes).  A 429 is a rate limit, not a standing
     refusal, and is ignored, except when its body says the provider's quota
-    is spent until a reset still ahead (_quota_spent_until): that refuses
-    every call until then, exactly like a 402.  Any reset still ahead
-    counts, however near: a threshold let the breaker reopen in the last
-    minutes before the reset, where every goal turn failed and took a strike
-    (review of 5c6b899a5: 4 strikes before the reset, and a goal paused as
-    early as without the fix).  Every other status and all exceptions are ignored: a transport
-    error says nothing about the account.  This is the SOLE consumer that
+    is spent until a reset more than QUOTA_WINDOW_MIN_S away
+    (_quota_spent_until): that refuses every call until then, exactly like
+    a 402.  A window that reopens within that time (a per-minute limit) is
+    an ordinary rate limit and stays ignored: counted, a 45 s window held
+    every goal on the host for 585 s, the breaker's whole cooldown (review
+    of 0516f3981, A-2).  The cost, named: in the last QUOTA_WINDOW_MIN_S
+    before a daily reset a refused call no longer reopens the breaker, so a
+    goal turn there can fail and take a strike, at most 2 at one turn a
+    minute (the 600 s floor it replaced cost 4 and an early pause, review of
+    5c6b899a5).  And after a reset the breaker stays open for the rest of
+    its cooldown, so a goal's first turn can start up to 600 s late.  Every
+    other status and all exceptions are ignored: a transport error says
+    nothing about the account.  This is the SOLE consumer that
     resolves the breaker's half-open probe, so it must run on the real wire
     response, never at an upstream pre-flight check."""
     try:
@@ -577,12 +583,18 @@ def _feed_provider_breaker(url, status, response=None) -> None:
             llm_provider_breaker.record_failure(host)
         elif status == 429 and response is not None:
             until = _quota_spent_until(response)
-            if until is not None and until > time.time():
+            if until is not None and until - time.time() > QUOTA_WINDOW_MIN_S:
                 llm_provider_breaker.record_failure(host)
         elif 200 <= status < 300:
             llm_provider_breaker.record_success(host)
     except Exception:
         pass
+
+
+#: A spent request quota holds its provider's host (_feed_provider_breaker)
+#: only when it resets more than this many seconds away: a per-minute window
+#: reopens sooner than any goal turn would wait for it.
+QUOTA_WINDOW_MIN_S = 120
 
 
 def _quota_spent_until(response) -> Optional[float]:

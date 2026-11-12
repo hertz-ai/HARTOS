@@ -7,6 +7,11 @@ hook only watched the local llama-server's ports, so a hosted call on :443
 never reached it.  Every chat/completions response now feeds a per-host
 breaker (401/402/403 count against the host, 2xx clears it), and
 dispatch_goal does not start a turn on a host whose breaker is open.
+
+Measured on central on 2026-11-11: a 429 whose body says the quota is spent
+until a reset (openrouter's free calls of the day) refused every call until
+then, and goals kept failing into it.  Such a 429 now counts like a 402 when
+the reset is more than QUOTA_WINDOW_MIN_S away; a per-minute window does not.
 """
 import os
 import sys
@@ -121,16 +126,29 @@ def test_a_429_with_calls_left_or_a_past_reset_does_not_count(fresh_breaker,
         breaker_mod.CircuitState.CLOSED
 
 
-@pytest.mark.parametrize('reset_in_s', [60.0, 3600.0, 21599.0])
+@pytest.mark.parametrize('reset_in_s', [180.0, 3600.0, 21599.0])   # beyond QUOTA_WINDOW_MIN_S (120)
 def test_a_quota_spent_until_a_near_reset_counts_too(fresh_breaker, reset_in_s):
     """Review of 5c6b899a5: a quota counted only when its reset was more than
     600 s away let the breaker reopen in the last minutes before every reset,
     where each goal turn failed and took a strike (4 measured, and a goal
-    paused as early as without the fix).  Any reset still ahead counts."""
+    paused as early as without the fix).  A reset beyond a per-minute window
+    counts, however near the day's end."""
     for _ in range(3):
         _send_through_hook(_quota_429(reset_in_s=reset_in_s))
     assert fresh_breaker.state('api.provider.example') is \
         breaker_mod.CircuitState.OPEN
+
+
+@pytest.mark.parametrize('reset_in_s', [45.0, 119.0])   # within QUOTA_WINDOW_MIN_S (120)
+def test_a_per_minute_window_stays_an_ordinary_rate_limit(fresh_breaker, reset_in_s):
+    """Review of 0516f3981, A-2: counted, a spent window 45 s from its reset
+    held every goal on the host for 585 s, the breaker's whole cooldown,
+    where the base ran the next turn 15 s after the reset.  A window that
+    reopens within QUOTA_WINDOW_MIN_S is a rate limit, ignored as before."""
+    for _ in range(3):
+        _send_through_hook(_quota_429(reset_in_s=reset_in_s))
+    assert fresh_breaker.state('api.provider.example') is \
+        breaker_mod.CircuitState.CLOSED
 
 
 def test_the_quota_headers_are_read_whatever_their_case(fresh_breaker):
@@ -193,12 +211,7 @@ def test_a_spent_quota_makes_the_goal_wait_not_fail(fresh_breaker):
     counting a strike toward its auto-pause."""
     for _ in range(3):
         _send_through_hook(_quota_429())
-    with patch('integrations.agent_engine.model_registry._own_llm_target',
-               return_value=('https://api.provider.example', 'm')), \
-            patch.object(dispatch_mod, 'is_user_recently_active',
-                         return_value=False), \
-            patch.object(dispatch_mod, '_cb_is_open', return_value=False):
-        assert dispatch_mod.is_transient_deferral() is True
+    assert _deferral(None) is True
 
 
 def test_an_answer_clears_the_count(fresh_breaker):
@@ -279,12 +292,7 @@ def test_no_turn_starts_on_a_refusing_provider(fresh_breaker):
 
 def test_a_goal_waits_rather_than_counting_toward_auto_pause(fresh_breaker):
     _open(fresh_breaker, 'api.provider.example')
-    with patch('integrations.agent_engine.model_registry._own_llm_target',
-               return_value=('https://api.provider.example', 'm')), \
-            patch.object(dispatch_mod, 'is_user_recently_active',
-                         return_value=False), \
-            patch.object(dispatch_mod, '_cb_is_open', return_value=False):
-        assert dispatch_mod.is_transient_deferral() is True
+    assert _deferral(None) is True
 
 
 def test_an_expert_on_another_host_still_runs(fresh_breaker):
@@ -296,14 +304,28 @@ def test_an_expert_on_another_host_still_runs(fresh_breaker):
 
 def _deferral(goal_id):
     """is_transient_deferral(goal_id) asked as the daemon asks it, from the
-    thread that dispatched, with no person active and the Tier-2 breaker
-    closed."""
+    thread that dispatched, with no person active, the Tier-2 breaker closed
+    and no turn preempted in the last 30 s.  The preempt signal is
+    process-wide: test_preempt_requeue.py leaves it set, and in a suite run
+    after it every deferral answered True by that arm alone, so the pins
+    below passed or failed by test order (review of 0516f3981, A-1)."""
     with patch('integrations.agent_engine.model_registry._own_llm_target',
                return_value=('https://api.provider.example', 'm')), \
             patch.object(dispatch_mod, 'is_user_recently_active',
                          return_value=False), \
-            patch.object(dispatch_mod, '_cb_is_open', return_value=False):
+            patch.object(dispatch_mod, '_cb_is_open', return_value=False), \
+            patch('core.foreground.preempted_recently', return_value=False):
         return dispatch_mod.is_transient_deferral(goal_id)
+
+
+def test_a_new_turn_forgets_the_last_turns_host():
+    """Review of 0516f3981, A-5 (mutant MA5 survived): a goal's next turn on
+    the same thread must not be judged by the provider an earlier turn used.
+    _clear_turn_record, run at the start of every goal turn, drops it."""
+    dispatch_mod._record_dispatch_host('g-stale', 'expert.example')
+    assert dispatch_mod._dispatched_host('g-stale') == 'expert.example'
+    dispatch_mod._clear_turn_record('g-stale')
+    assert dispatch_mod._dispatched_host('g-stale') is None
 
 
 def test_a_failed_expert_turn_is_a_failure_while_the_own_provider_waits(fresh_breaker):
