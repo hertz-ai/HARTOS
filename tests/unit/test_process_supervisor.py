@@ -135,10 +135,22 @@ def test_a_child_is_bound_to_die_with_this_process(monkeypatch):
             return True
 
     s = S()
-    t = threading.Thread(target=s._run)
-    t.start()
-    t.join(timeout=3)
+    t = threading.Thread(target=s._run, daemon=True)
+    try:
+        t.start()
+        t.join(timeout=3)
+    finally:
+        s.stop_event.set()
     assert bound == [child]
+
+
+def test_the_gateway_and_livekit_keep_the_binding_hook():
+    """An override that skips super() silently opts out of the binding
+    (hevolveai does it on purpose, with its own job).  The two supervisors
+    that rely on the default must keep it."""
+    from integrations.social import livekit_supervisor, whatsapp_supervisor
+    for mod in (whatsapp_supervisor, livekit_supervisor):
+        assert mod._Supervisor._on_started is ProcessSupervisor._on_started, mod.__name__
 
 
 def test_a_failed_binding_does_not_stop_the_spawn(monkeypatch):
@@ -163,9 +175,12 @@ def test_a_failed_binding_does_not_stop_the_spawn(monkeypatch):
             return True
 
     s = S()
-    t = threading.Thread(target=s._run)
-    t.start()
-    t.join(timeout=3)
+    t = threading.Thread(target=s._run, daemon=True)
+    try:
+        t.start()
+        t.join(timeout=3)
+    finally:
+        s.stop_event.set()
     assert seen == ['still streams']
 
 
