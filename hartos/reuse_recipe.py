@@ -5888,6 +5888,44 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
         except Exception:
             pass
 
+    # A STEP HOLDING FOR THE PERSON'S ANSWER, ITS QUESTION OUT THIS TURN.  The
+    # turn's exit hold (_reuse_hold_ask_at_turn_exit) runs before this gate,
+    # so the hold and its open ask are already recorded; the verifier's
+    # verdict is still the tail, and the steer below hands the group another
+    # round WITH ITS TOOLS for a turn that is waiting on the person.  Measured
+    # live 2026-11-12 21:17:44-21:18:38 IST on build 72 (agent 1793366231447,
+    # a test learner's Parent Helper turn): action 1 sent "Please tell me
+    # Arjun's mother and father names" and held, then the steered round took
+    # 54 s, sent a second meta message, opened two ask cards, and the reply
+    # the person read was the raw {"status": "requires_breakdown", ...} JSON.
+    # The reply to a held turn is its question: the ask record's own text,
+    # taken only when it was put in THIS turn's request and reached the
+    # person ('send' or 'reply', record_ask_delivered), else the gate goes on
+    # as before.  Appended as the tail like the recoveries below, so the
+    # extractor delivers it.
+    try:
+        _held = _reuse_held_action(user_prompt)
+        _ask = (ledger_open_ask(user_prompt, _held,
+                                _reuse_action_flow(user_prompt, _held))
+                if _held is not None else None) or {}
+        _question = _ask.get('question')
+        _this_turn = str(request_id_list.get(user_prompt) or '')
+        if (isinstance(_question, str) and _question.strip()
+                and _this_turn and str(_ask.get('request_id') or '') == _this_turn
+                and _ask.get('via') in ('send', 'reply')):
+            group_chat.messages.append({'content': _question,
+                                        'name': 'Assistant',
+                                        'role': 'assistant'})
+            _say('info', f"[SYNTHESIS] action {_held} holds for the person "
+                         f"and its question went out this turn; the question "
+                         f"is the reply, no steer posted (session: "
+                         f"{user_prompt}, {_before} msgs, "
+                         f"via={_ask.get('via')}, head={_question[:120]!r})")
+            return False
+    except Exception as _held_err:
+        _say('warning', f"[SYNTHESIS] held-step read failed: {_held_err!r}; "
+                        f"steering as before")
+
     # WHAT ACTUALLY RAN decides what we are allowed to assert.  Asked of
     # _reuse_outstanding_tools — the fabrication gate's own predicate, one
     # function below — so the sentence the user reads is bound to the same
