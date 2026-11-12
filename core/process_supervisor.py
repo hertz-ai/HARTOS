@@ -70,8 +70,21 @@ class ProcessSupervisor:
         raise NotImplementedError
 
     def _on_started(self, proc: subprocess.Popen) -> None:
-        """Called immediately after a successful Popen (before output stream) —
-        e.g. bind a Windows Job Object, register with the resource governor."""
+        """Called immediately after a successful Popen (before output stream).
+
+        Default: bind the child to this process's job
+        (core.child_lifecycle.bind_to_parent), so it dies when this process
+        does.  Nunba quits with os._exit(0), so stop() never runs on a tray
+        quit; measured 2026-11-12, the WhatsApp gateway (node gateway.js,
+        spawned here) outlived two Quits on :3000.  A subclass that needs a
+        job of its own (hevolveai_supervisor) overrides this.  A failed
+        binding never fails the spawn."""
+        try:
+            from core.child_lifecycle import bind_to_parent
+            bind_to_parent(proc)
+        except Exception as e:  # noqa: BLE001 -- never let binding stop a spawn
+            logger.warning('%s_supervisor: child not bound to this process: %s',
+                           self.name, e)
 
     def _format_stdout_line(self, line: str) -> None:
         """Emit one decoded, stripped, non-empty stdout line. Default: log it
