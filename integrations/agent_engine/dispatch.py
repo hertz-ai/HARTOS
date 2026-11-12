@@ -964,6 +964,10 @@ _HELD_FOR_ANOTHER_TURN = (f'{_DEFERRED_PREFIX} another turn of this '
                           f'conversation is running on a different model')
 _WAITING_FOR_THE_PERSON = (f'{_DEFERRED_PREFIX} the current step waits for the '
                            f"person's reply to its question")
+#: Why a goal's speculative turn returned nothing yet: it outlived its wait
+#: and is still running on the server (SpeculativeDispatcher, TurnStillRunning).
+_STILL_RUNNING = (f'{_DEFERRED_PREFIX} its turn is still running, so its '
+                  f'conversation is busy until that turn ends')
 
 
 def _failure_key(goal_id) -> tuple:
@@ -1129,10 +1133,19 @@ def speculative_turn_result(goal_id, spec) -> Optional[str]:
     names the model, which is what an operator has to look at; 'error' is
     set only when dispatch_speculative refused or raised.  The turn ran on
     this node, so the route is 'local'.
+
+    A turn that outlived even the dispatcher's whole-turn wait
+    (``still_running``) has no result yet and is held like a paused one:
+    no strike, retried on a later tick.
     """
     _clear_turn_record(goal_id)
     _record_route(goal_id, 'local', 'the speculative fast model ran it')
     spec = spec if isinstance(spec, dict) else {}
+    if spec.get('still_running'):
+        _record_turn_failure(goal_id, _STILL_RUNNING)
+        logger.info(f"Goal {goal_id}: {_STILL_RUNNING} "
+                    f"({spec.get('error') or 'no detail'}); held for a later tick")
+        return None
     reply = spec.get('response')
     if not isinstance(reply, str) or not reply.strip():
         why = spec.get('error') or (

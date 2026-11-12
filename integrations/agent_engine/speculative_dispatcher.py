@@ -49,8 +49,10 @@ When a turn escalates, ``_expert_background_task`` dispatches via
 
 When the expert returns, ``_deliver_expert_response`` bubble-replaces
 the standby via the existing ``speculation_id`` channel: SSE for the
-chat UI + TTS pupit topic for voice. The fast_response stays only when
-the expert returned empty or got guardrail-blocked.
+chat UI + TTS pupit topic for voice. The fast_response stays when the
+expert returned empty, got guardrail-blocked, or answered something that
+is not the turn's result (dispatch._turn_failure: a failed turn, or one
+that did not run).
 
 Guardrails at every layer
 -------------------------
@@ -104,6 +106,20 @@ except ImportError:
 from integrations.agent_engine.escalation_reasons import EscalationReason
 
 logger = logging.getLogger('hevolve_social')
+
+
+# What a person waits, inside their own /chat turn, for the fast leg on an
+# HTTP-mode node (the draft classifier, or a person's speculative fast turn)
+# before their turn falls through.  A goal's fast turn runs on the daemon
+# thread and waits for its whole turn instead (_dispatch_to_model,
+# turn_wait_s).
+_FAST_LEG_WAIT_S = 30
+
+
+class TurnStillRunning(Exception):
+    """A goal's /chat turn outlived the wait its caller gave it.  The server
+    accepted it and is still running it, so it still holds its conversation:
+    another turn of that conversation started now would not run (#172)."""
 
 
 # Minimum draft confidence required to commit the draft's reply as the
@@ -395,8 +411,42 @@ class SpeculativeDispatcher:
                     'error': 'No fast model available', 'expert_pending': False}
 
         start = time.time()
-        fast_response = self._dispatch_to_model(
-            fast_model, prompt, user_id, prompt_id, goal_type, goal_id)
+        # A goal's turn (the daemon's speculative branch, the only caller
+        # that passes goal_id) is waited for as long as it runs, up to the
+        # watchdog's bound for one LLM call on a daemon thread, the bound
+        # its in-process tier (local_chat_dispatch) already runs under.
+        # Given up on, it kept running on the server and holding its
+        # conversation: measured on central 2026-11-12, two goals' fast turns
+        # ran 153.7 s and 223.6 s, the client stopped waiting at 30 s, and
+        # the Claude expert scheduled next was refused for "another turn of
+        # this group" (#172).  A person's turn keeps its short wait.
+        if goal_id:
+            from security.node_watchdog import LLM_CALL_TIMEOUT_SECONDS
+            turn_wait_s = LLM_CALL_TIMEOUT_SECONDS
+        else:
+            turn_wait_s = None
+        try:
+            fast_response = self._dispatch_to_model(
+                fast_model, prompt, user_id, prompt_id, goal_type, goal_id,
+                turn_wait_s=turn_wait_s)
+        except TurnStillRunning as e:
+            # Still running past even that: no result yet, and no expert
+            # either, which would be refused behind it (measured: the held
+            # expert still spent 5 calls first).  The daemon holds the goal
+            # for a later tick with no strike (speculative_turn_result).
+            elapsed_ms = (time.time() - start) * 1000
+            self._track_call_telemetry(fast_model, elapsed_ms, node_id)
+            logger.warning("Goal %s: %s; no expert scheduled behind it",
+                           goal_id, e)
+            return {
+                'response': '',
+                'speculation_id': speculation_id,
+                'fast_model': fast_model.model_id,
+                'expert_pending': False,
+                'still_running': True,
+                'error': str(e),
+                'latency_ms': round(elapsed_ms, 1),
+            }
         elapsed_ms = (time.time() - start) * 1000
         self._track_call_telemetry(fast_model, elapsed_ms, node_id)
 
@@ -2090,14 +2140,24 @@ class SpeculativeDispatcher:
                 'HEVOLVE_BASE_URL',
                 f'http://localhost:{get_port("backend")}',
             )
+            # A person's expert: the budget every channel's own /chat call
+            # uses (this runs the same full agent turn, which routinely
+            # exceeds 60 s on a local model; the old hardcoded 60 silently
+            # discarded a real answer still being generated).  A goal's
+            # expert waits for its whole turn, up to the watchdog's bound
+            # for one LLM call, as its fast leg does: measured on central
+            # 2026-11-12, a Claude turn ran 462.9 s, this wait gave up at
+            # 120 s and its answer was lost, and the next expert leg of the
+            # conversation was refused while it still ran.  It runs on a
+            # spec_expert pool thread, so the wait holds a pool worker.
+            if goal_id:
+                from security.node_watchdog import LLM_CALL_TIMEOUT_SECONDS
+                expert_wait_s = LLM_CALL_TIMEOUT_SECONDS
+            else:
+                expert_wait_s = agent_turn_timeout()
             resp = _req.post(f'{base}/chat', json=payload,
                              headers=_internal_auth_headers(),
-                             # Same budget every channel's own /chat call
-                             # uses: this runs the same full agent turn,
-                             # which routinely exceeds 60 s on a local model
-                             # -- the old hardcoded 60 silently discarded a
-                             # real answer still being generated.
-                             timeout=agent_turn_timeout())
+                             timeout=expert_wait_s)
             if resp.status_code == 200:
                 return (resp.json() or {}).get('response') or ''
             # WARNING, not DEBUG: central emits no INFO/DEBUG after boot,
@@ -2131,8 +2191,15 @@ class SpeculativeDispatcher:
 
     def _dispatch_to_model(self, model: 'ModelBackend', prompt: str,
                            user_id: str, prompt_id: Optional[str],
-                           goal_type: str, goal_id: str = None) -> str:
+                           goal_type: str, goal_id: str = None,
+                           turn_wait_s: Optional[float] = None) -> str:
         """Send prompt to a specific model via /chat endpoint with config override.
+
+        HTTP mode waits ``_FAST_LEG_WAIT_S`` (a person's own turn is waiting)
+        and answers '' when the call fails.  ``turn_wait_s`` is for a goal's
+        turn on the daemon thread: wait that long for the whole turn, mark
+        the thread as in an LLM call for the watchdog meanwhile, and raise
+        TurnStillRunning when the turn is still running at the end.
 
         Always passes ``speculative=False`` and ``draft_first=False`` on the
         inner call so the dispatcher can never recursively re-enter itself
@@ -2238,30 +2305,36 @@ class SpeculativeDispatcher:
         # it the central tier's gate 2 answers 401 and the fast path
         # returns '' on every dispatch.
         import requests as req
-        from integrations.agent_engine.dispatch import _internal_auth_headers
-        from integrations.channels.chat_contract import agent_turn_timeout
+        from integrations.agent_engine.dispatch import (
+            _internal_auth_headers, _notify_watchdog_llm_end,
+            _notify_watchdog_llm_start)
         base_url = os.environ.get('HEVOLVE_BASE_URL', f'http://localhost:{get_port("backend")}')
+        goal_turn = turn_wait_s is not None
+        if goal_turn:
+            # The daemon thread blocks on this turn for as long as it runs;
+            # unmarked, the watchdog calls it frozen after 300 s.
+            _notify_watchdog_llm_start()
         try:
-            # The whole turn, on the agent-turn budget the expert leg waits
-            # too (120 s by default, dispatch_goal's own wait).  A turn given
-            # up on keeps running on the server and holds its conversation:
-            # measured on central 2026-11-12, two goals' fast turns outlived
-            # the old 30 s, the daemon counted each as failed, and the Claude
-            # expert scheduled next was refused for "another turn of this
-            # group" (#172).
             resp = req.post(f'{base_url}/chat', json=payload,
                             headers=_internal_auth_headers(),
-                            timeout=agent_turn_timeout())
+                            timeout=turn_wait_s if goal_turn else _FAST_LEG_WAIT_S)
             if resp.status_code == 200:
                 return resp.json().get('response', '')
             logger.warning(
                 f"Model dispatch ({model.model_id}) /chat returned "
                 f"{resp.status_code}")
         except req.RequestException as e:
-            # WARNING, not DEBUG: central logs nothing below WARNING after
-            # boot, and the caller only sees ''.
+            if goal_turn and isinstance(e, req.exceptions.ReadTimeout):
+                raise TurnStillRunning(
+                    f"the fast model {model.model_id}'s turn is still running "
+                    f"after {turn_wait_s:.0f} s") from e
+            # WARNING, not DEBUG: DEBUG is not in central's log, and the
+            # caller only sees ''.
             logger.warning(f"Model dispatch ({model.model_id}) /chat gave no "
                            f"reply: {e}")
+        finally:
+            if goal_turn:
+                _notify_watchdog_llm_end()
         return ''
 
     def _deliver_expert_response(self, user_id: str, prompt_id: str,
