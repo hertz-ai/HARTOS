@@ -16,7 +16,6 @@ Real blueprint, real PaymentLedger and StripePaymentGateway, a real
 api_keys table (tests/unit/commercial_db); the Stripe SDK handle (the wire
 to Stripe) is stubbed.
 """
-import contextlib
 import logging
 import sys
 import threading
@@ -25,7 +24,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from flask import Flask
-from sqlalchemy import event
 
 import integrations.ap2 as ap2_pkg
 from integrations.ap2.ap2_protocol import (
@@ -473,30 +471,6 @@ class TestTheBrowserRouteSharesTheFinalizer:
         assert ctx['ledger'].payments == {} and ctx['db'].key() == FREE
 
 
-@contextlib.contextmanager
-def _database_gone_after_the_failed_bump(db):
-    """The bump's commit fails and the database stays unreachable from then
-    on (a lost connection, not a locked file): every statement after the
-    failed commit raises.  The rollback the bump runs is not a statement."""
-    gone = {'now': False}
-
-    def fail_the_commit(session):
-        gone['now'] = True
-        raise RuntimeError('database connection lost')
-
-    def refuse_every_statement(conn, cursor, statement, params, context, executemany):
-        if gone['now']:
-            raise RuntimeError('database unreachable')
-
-    event.listen(db.Session, 'before_commit', fail_the_commit)
-    event.listen(db.engine, 'before_cursor_execute', refuse_every_statement)
-    try:
-        yield
-    finally:
-        event.remove(db.Session, 'before_commit', fail_the_commit)
-        event.remove(db.engine, 'before_cursor_execute', refuse_every_statement)
-
-
 class TestAFailedBumpIsNamedWithTheDatabaseGone:
     """A failed bump rolls the session back, which expires the key row; the
     finish read api_key.id after that, so with the database gone the read
@@ -518,7 +492,7 @@ class TestAFailedBumpIsNamedWithTheDatabaseGone:
 
     def test_the_webhook_names_it(self, ctx):
         log = logging.getLogger('hevolve_social')
-        with _database_gone_after_the_failed_bump(ctx['db']), \
+        with ctx['db'].lost_at_next_commit(), \
                 patch.object(log, 'error') as said:
             r = _deliver(ctx, _event(_session()))
         self._assert_named(r, said)
@@ -529,7 +503,7 @@ class TestAFailedBumpIsNamedWithTheDatabaseGone:
     def test_the_buyers_first_visit_names_it(self, ctx):
         ctx['stripe'].checkout.Session.retrieve.return_value = _session()
         log = logging.getLogger('hevolve_social')
-        with _database_gone_after_the_failed_bump(ctx['db']), \
+        with ctx['db'].lost_at_next_commit(), \
                 patch.object(log, 'error') as said:
             r = _complete(ctx)
         self._assert_named(r, said)
@@ -541,13 +515,106 @@ class TestAFailedBumpIsNamedWithTheDatabaseGone:
         ctx['db'].fail_next_commit()
         assert _deliver(ctx, _event(_session())).status_code == 500   # recorded, unbumped
         log = logging.getLogger('hevolve_social')
-        with _database_gone_after_the_failed_bump(ctx['db']), \
+        with ctx['db'].lost_at_next_commit(), \
                 patch.object(log, 'error') as said:
             r = _complete(ctx)
         self._assert_named(r, said)
         assert ctx['db'].key() == FREE and len(ctx['ledger'].payments) == 1
         reload = _complete(ctx)
         assert reload.status_code == 200 and ctx['db'].key() == PRO
+        ctx['stripe'].checkout.Session.retrieve.assert_not_called()
+
+
+class TestABumpWrittenBeforeTheDatabaseWentIsAnUpgrade:
+    """The tier write COMMITTED, then the database went away before the key
+    row was read back (task #214).  The table holds the bought tier, so the
+    buyer's success page gets the upgrade, Stripe gets its 200, and no line
+    asks a person to finish a bump that is finished.  The read back shared
+    the write's try, so all three paths answered 500 bump_failed and logged
+    MANUAL RECONCILIATION over a key already on pro."""
+
+    def _assert_upgraded(self, r, said):
+        assert r.status_code == 200, r.data[:300]
+        body = r.get_json()
+        assert body['success'] is True
+        assert body['api_key'] == {'id': KEY, 'tier': PRO[0],
+                                   'rate_limit_per_day': PRO[1], 'monthly_quota': PRO[2]}
+        said.assert_not_called()
+        return body
+
+    def test_the_webhook(self, ctx):
+        log = logging.getLogger('hevolve_social')
+        with ctx['db'].lost_after_next_commit(), \
+                patch.object(log, 'error') as said, patch.object(log, 'warning') as warned:
+            r = _deliver(ctx, _event(_session()))
+        self._assert_upgraded(r, said)
+        assert ctx['db'].key() == PRO and len(ctx['ledger'].payments) == 1
+        (line,) = [c.args[0] % c.args[1:] for c in warned.call_args_list]
+        assert 'the bought tier pro is written' in line and 'refund' not in line
+
+    def test_a_key_already_above_stays_and_names_the_refund(self, ctx):
+        """An enterprise key buys pro and the database goes after the
+        commit: the reply shows the key's own tier, the WARNING does not
+        claim the bought tier was written (no row moved), and the refund
+        line names the case (the review of 2cd3c6720, findings 2 and 3)."""
+        ctx['db'].put_key_on('enterprise')
+        log = logging.getLogger('hevolve_social')
+        with ctx['db'].lost_after_next_commit(), \
+                patch.object(log, 'error') as said, patch.object(log, 'warning') as warned:
+            r = _deliver(ctx, _event(_session()))
+        assert r.status_code == 200, r.data[:300]
+        assert r.get_json()['api_key']['tier'] == 'enterprise'
+        said.assert_not_called()
+        lines = [c.args[0] % c.args[1:] for c in warned.call_args_list]
+        assert not any('is written' in l for l in lines), lines
+        assert any('stays on enterprise' in l and 'may need a refund' in l for l in lines), lines
+        assert ctx['db'].key() == tier_tuple('enterprise')
+
+    def test_a_payment_that_raced_another_names_the_refund(self, ctx):
+        """The key is read on free, another payment raises it to pro, this
+        starter write moves no row, and the read back fails.  The reply
+        floor is starter (the key holds at least that); the refund question
+        is asked by the read-back WARNING, since the "stays on" line only
+        sees the earlier read.  It was suppressed: the line said starter
+        "is written" (the review of 2cd3c6720, finding 1)."""
+        from integrations.agent_engine.commercial_api import _apply_bought_tier
+        from integrations.social.models import CommercialAPIKey
+        s = ctx['db'].session()
+        try:
+            api_key = s.query(CommercialAPIKey).filter_by(id=KEY).first()
+            assert api_key.tier == 'free'
+            ctx['db'].put_key_on('pro')                   # the other payment
+            log = logging.getLogger('hevolve_social')
+            with ctx['db'].lost_after_next_commit(), patch.object(log, 'warning') as warned:
+                key, failure = _apply_bought_tier(s, api_key, 'starter')
+        finally:
+            s.close()
+        assert failure is None
+        assert key['tier'] == 'starter'
+        lines = [c.args[0] % c.args[1:] for c in warned.call_args_list]
+        assert any('no row moved' in l and 'refund' in l for l in lines), lines
+        assert not any('is written' in l for l in lines), lines
+        assert ctx['db'].key() == PRO
+
+    def test_the_buyers_first_visit(self, ctx):
+        ctx['stripe'].checkout.Session.retrieve.return_value = _session()
+        log = logging.getLogger('hevolve_social')
+        with ctx['db'].lost_after_next_commit(), \
+                patch.object(log, 'error') as said:
+            r = _complete(ctx)
+        self._assert_upgraded(r, said)
+        assert ctx['db'].key() == PRO and len(ctx['ledger'].payments) == 1
+
+    def test_the_buyers_reload(self, ctx):
+        ctx['db'].fail_next_commit()
+        assert _deliver(ctx, _event(_session())).status_code == 500   # recorded, unbumped
+        log = logging.getLogger('hevolve_social')
+        with ctx['db'].lost_after_next_commit(), \
+                patch.object(log, 'error') as said:
+            r = _complete(ctx)
+        body = self._assert_upgraded(r, said)
+        assert body['already_completed'] is True
+        assert ctx['db'].key() == PRO and len(ctx['ledger'].payments) == 1
         ctx['stripe'].checkout.Session.retrieve.assert_not_called()
 
 

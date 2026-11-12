@@ -11,6 +11,7 @@ Tier 3 (Runtime): delegate_to_specialist finds agents with needed skills via A2A
 import json
 import logging
 import re
+import threading
 from types import MappingProxyType
 from typing import Annotated, Optional
 
@@ -75,8 +76,536 @@ def _consent_required_result(channel: str) -> str:
     })
 
 
-def _publish_instagram_feed(user_id, media_url, caption='', *,
-                            _adapter=None, _consent=None):
+def _is_video_url(url) -> bool:
+    """Does ``url`` name a video file?  The channels' one media rule
+    (integrations.channels.registry.media_kind)."""
+    from integrations.channels.base import MessageType
+    from integrations.channels.registry import media_kind
+    kind = media_kind(url)
+    return kind is not None and kind[1] == MessageType.VIDEO
+
+
+def _not_posted(channel, error, **extra) -> str:
+    """The answer for a post that did not happen."""
+    return json.dumps(dict({'success': False, 'sent': False,
+                            'channel': channel, 'error': error}, **extra))
+
+
+#: What the agent is told while a post waits on the owner: the step is not
+#: done, and calling again is how it carries on.
+_NOT_DONE = ("Until it posts, this post has not happened; do not report it "
+             "as done. Call post_to_channel again later: it carries on from "
+             "the owner's answer.")
+
+#: post_to_channel's own connects of a channel run one at a time:
+#: _connect_or_ask holds the channel's lock from its "still connecting?"
+#: check through register_channel, so two posts at once start it once
+#: (review of 1feb76f14: both registered, the second rebuilding the adapter
+#: mid-connect).  Connect_Channel, the connect form and OAuth do not take
+#: this lock (#226).
+_CONNECT_LOCKS = {}
+_CONNECT_LOCKS_GUARD = threading.Lock()
+
+
+def _connect_lock(channel: str) -> threading.Lock:
+    with _CONNECT_LOCKS_GUARD:
+        return _CONNECT_LOCKS.setdefault(channel, threading.Lock())
+
+
+def _connecting_now(channel: str) -> bool:
+    """Whether the latest start of ``channel`` (agent_tools.start_verdict)
+    is still being watched.  Only Discord reports CONNECTING, so the watch
+    is what says the others are mid-connect."""
+    from integrations.channels.agent_tools import START_WATCHING, start_verdict
+    return (start_verdict(channel) or {}).get('state') == START_WATCHING
+
+
+def _owner_declined(owner, name) -> bool:
+    """Whether credential ``name`` stands refused: the owner said no to
+    providing it or took it back, or the vault stopped asking after the
+    values they gave were refused too often (request_credential revokes the
+    grant then).  The vault's own record: ConsentService.declined on scope
+    'secret:NAME'."""
+    try:
+        from integrations.social.consent_service import (
+            CREDENTIAL_SCOPE_PREFIX, ConsentService)
+        from integrations.social.models import db_session
+        with db_session(commit=False) as db:
+            return bool(ConsentService.declined(
+                db, str(owner), 'credential',
+                scope=CREDENTIAL_SCOPE_PREFIX + name, agent_id=None))
+    except Exception:
+        logger.warning("credential %s: the owner's answer could not be read",
+                       name, exc_info=True)
+        return False
+
+
+def _owner_entered_at(owner, name):
+    """When the owner last entered credential ``name``: the newest entry
+    row for scope 'secret:NAME', by the vault's own rule for what an entry
+    is (ai_key_vault._recent_entries: granted_at set, not taken back with
+    "Allow asking again").  None when they never did or it cannot be read."""
+    try:
+        from hartos.ai_key_vault import _reopened
+        from integrations.social.consent_service import (
+            CREDENTIAL_SCOPE_PREFIX, ConsentService)
+        from integrations.social.models import db_session
+        scope = CREDENTIAL_SCOPE_PREFIX + name
+        with db_session(commit=False) as db:
+            times = [row.granted_at for row in ConsentService.list_consents(
+                         db, str(owner), 'credential')
+                     if row.scope == scope and row.granted_at is not None
+                     and not _reopened(row)]
+        return max(times) if times else None
+    except Exception:
+        logger.warning("credential %s: when the owner entered it could not be "
+                       "read", name, exc_info=True)
+        return None
+
+
+def _channel_turned_off(channel: str, meta: dict) -> Optional[str]:
+    """The answer when the owner turned ``channel`` off in its channel
+    settings (its admin entry says enabled false), else None.  Such a
+    channel is not posted on, not reconnected (register_channel would turn
+    it back on) and not asked about; before, it was asked about on every
+    post (review of 506a79c1f)."""
+    try:
+        from integrations.channels.admin.api import get_api
+        cfg = (getattr(get_api(), '_channels', {}) or {}).get(channel)
+    except Exception:
+        logger.warning("post_to_channel %s: channel settings unreadable",
+                       channel, exc_info=True)
+        return None
+    if not isinstance(cfg, dict) or cfg.get('enabled', True) is not False:
+        return None
+    display = meta.get('display_name') or channel
+    return _not_posted(
+        channel, (f"{display} is turned off in its channel settings, so "
+                  f"nothing was posted."),
+        needs_owner=False, channel_off=True,
+        next=(f"Nothing asked and nothing reconnected: the owner turned "
+              f"{display} off. Do not post on {display} until they turn it "
+              f"back on."))
+
+
+def _connect_or_ask(channel: str, meta: dict, adapter=None) -> str:
+    """``channel`` is not running here: connect it from what the owner
+    entered, or ask the owner for it.  ``adapter`` is the channel's adapter
+    in the live registry, if any.
+
+    A channel mid-connect is left alone: an adapter reporting CONNECTING, or
+    a start register_channel scheduled that is still being watched
+    (_connecting_now).  Which channels can be connected from one value the
+    owner types is integrations.channels.agent_tools.chat_connect_blocker,
+    the rule register_channel starts adapters by; no card is filed for any
+    other (a question whose answer can never start the channel).  The value
+    is asked for through hartos.ai_key_vault.request_credential, the one
+    credential ask: one card per credential, not one per agent.  Once the
+    owner has entered it, the channel is connected through register_channel
+    (the one registration path, as Connect_Channel calls it) under the
+    owner's account, with the value itself: the model never holds it, and
+    no unresolved {{secret:NAME}} ever becomes a token.
+
+    The channel's latest start in this process (agent_tools.start_verdict:
+    the value's fingerprint, the owner's stored value at that moment, when
+    it started, how it ended) decides what the owner's value gets.  It is
+    always tried when the owner entered it after that start, or when their
+    stored value has changed since, by any path (review of b6dcae15e).
+    Otherwise:
+      * no start yet: connect with it;
+      * started with this value and connected, since dropped: connect again;
+      * started with this value and failed: not tried again; the owner is
+        asked for a new one (request_credential's "rejected");
+      * started with ANOTHER value (Connect_Channel, the connect form,
+        OAuth): that newer choice is left alone and nothing is asked
+        (review of 1feb76f14).
+    Starts before a restart are not known here (#226).  A start
+    register_channel did not schedule for this value (it refused, or the
+    adapter could not be started here) asks nothing: no value the owner
+    types would change it.  An owner who said no is not asked again.  A node
+    with no owner connects nothing: there is nobody to connect it for.
+    post_to_channel's own connects of a channel run one at a time
+    (_connect_lock); other connect paths do not take that lock.
+    """
+    with _connect_lock(channel):
+        return _connect_or_ask_locked(channel, meta, adapter)
+
+
+def _connect_or_ask_locked(channel: str, meta: dict, adapter) -> str:
+    """_connect_or_ask, under the channel's connect lock."""
+    from integrations.channels.agent_tools import (
+        LINKED_FROM_PHONE, SEVERAL_CREDENTIALS, START_FAILED,
+        build_channel_tool_closures, chat_connect_blocker,
+        credential_fingerprint, owner_credential_name, start_verdict)
+    from integrations.channels.base import ChannelStatus
+    from integrations.channels.metadata import required_setup_keys
+    display = meta.get('display_name') or channel
+    status = getattr(adapter, 'get_status', lambda: None)()
+    if status == ChannelStatus.CONNECTING or _connecting_now(channel):
+        # Started and not finished: a second register now would rebuild the
+        # adapter mid-connect.
+        return _not_posted(
+            channel, f"{display} is still connecting, so nothing was posted yet.",
+            connecting=True, next=_NOT_DONE)
+    blocker = chat_connect_blocker(channel, meta)
+    if blocker:
+        kind, detail = blocker
+        why = ({LINKED_FROM_PHONE: (f"{display} is linked from the owner's "
+                                    f"phone (Connect_Channel starts it), not "
+                                    f"from a value they type"),
+                SEVERAL_CREDENTIALS: (f"{display} needs several credentials "
+                                      f"({', '.join(detail or [])}), and "
+                                      f"those cannot be connected from here")}
+               .get(kind) or (f"this server cannot run {display} until the "
+                              f"operator sets {', '.join(detail or [])}"))
+        return _not_posted(
+            channel, f"{display} is not connected, so nothing was posted: {why}.",
+            needs_owner=False, cannot_connect_here=True,
+            next=(f"Nothing asked: an answer would not start {display}. For a "
+                  f"site the owner is signed in to on the desktop, "
+                  f"post_to_channel_via_browser posts through their browser."))
+
+    from hartos.ai_key_vault import get_ai_key_vault, request_credential
+    from integrations.agent_engine.capability_setup import setup_owner
+    owner = setup_owner()
+    if not owner:
+        return _not_posted(
+            channel, (f"{display} is not connected, and this node has no owner "
+                      f"to connect it for or to ask (HEVOLVE_OWNER_USER_ID is "
+                      f"not set), so nothing was posted."),
+            needs_owner=True,
+            next=f"Nothing was asked. Do not report a post on {display}.")
+    key = required_setup_keys(meta)[0]
+    labels = {f.get('key'): f.get('label') or f.get('key')
+              for f in meta.get('setup_fields') or []}
+    label = f"{display} {labels.get(key) or key}"
+    vault = get_ai_key_vault()
+    # The name a start records the owner's value under (one derivation).
+    name = owner_credential_name(channel, meta)
+    if _owner_declined(owner, name):
+        return _not_posted(
+            channel, (f"{display} is not connected, so nothing was posted: the "
+                      f"owner said no to giving the {label} or took it back, "
+                      f"or the values they gave were refused too many times "
+                      f"and asking stopped."),
+            needs_owner=False, owner_declined=True,
+            next=(f"Do not post on {display} and do not ask for the {label} "
+                  f"again. The owner can choose \"Allow asking again\" for it "
+                  f"in Privacy settings."))
+
+    def _ask(rejected=False):
+        return request_credential(json.dumps(dict({
+            'resource_type': 'channel_secret',
+            'channel_type': channel,
+            'key_name': key,
+            'label': label,
+            'used_by': 'post_to_channel',
+            'description': f"Needed to post on {display}.",
+        }, **({'rejected': True} if rejected else {}))), agent_id=None,
+            tell_alias=False)
+
+    value = vault.owner_credential(name)
+    if value:
+        fp = credential_fingerprint(value)
+        latest = start_verdict(channel)
+        entered = _owner_entered_at(owner, name)
+        fresh = (latest is not None and entered is not None
+                 and entered > latest['at'])
+        owner_changed = (latest is not None
+                         and latest.get('owner_fp') is not None
+                         and latest['owner_fp'] != fp)
+        if latest is not None and not fresh and not owner_changed:
+            if latest.get('fp') != fp:
+                # Last started with another value (Connect_Channel, the
+                # connect form, OAuth), and the owner's own value is the
+                # one they had then: writing it back would replace the
+                # token that start chose, in the binding too (review of
+                # 1feb76f14).  That start's own watcher told the owner how
+                # it went.  An owner value changed since, by any path, is
+                # theirs and is tried (owner_changed; review of b6dcae15e).
+                return _not_posted(
+                    channel, (f"{display} is not running, and it was last "
+                              f"connected with a different {label} than the "
+                              f"one the owner entered here, so nothing was "
+                              f"posted."),
+                    needs_owner=False, connected_elsewhere=True,
+                    next=(f"Nothing asked and nothing reconnected: {display} "
+                          f"was last connected another way, and that connect "
+                          f"tells the owner how it went. Do not report a post "
+                          f"on {display}."))
+            if latest['state'] == START_FAILED:
+                # This very value's start failed, and the owner has entered
+                # nothing since: ask for another.
+                return _not_posted(
+                    channel, (f"{display} could not connect with the {label} "
+                              f"the owner entered, so nothing was posted."),
+                    needs_owner=True, asked_owner_for=name, value_refused=True,
+                    owner_answer=_ask(rejected=True), next=_NOT_DONE)
+            # It connected with this value and has since dropped.
+        register = next(t[2] for t in build_channel_tool_closures(
+            {'user_id': owner}) if t[0] == 'register_channel')
+        started = vault.mask_secrets(register(channel, json.dumps({key: value})))
+        after = start_verdict(channel)
+        if (after is None or after.get('fp') != fp
+                or after['start'] == (latest or {}).get('start')):
+            # No start of this value was scheduled: register_channel
+            # refused, or the adapter could not be started here.  Nothing
+            # the owner types would change that, so nothing is asked.  A
+            # start of another value landing meanwhile is not taken as
+            # ours (review of 1feb76f14).  The agent never sees the value.
+            return _not_posted(
+                channel, (f"{display} could not be started here, so nothing "
+                          f"was posted: {started}"),
+                needs_owner=False, cannot_connect_here=True,
+                next=(f"Nothing asked: a value from the owner would not "
+                      f"start {display}. Do not report a post on {display}."))
+        return _not_posted(
+            channel, f"{display} was not connected, so nothing was posted yet.",
+            connecting=True, register_channel=started,
+            next=f"{display} is being connected with what the owner entered. "
+                 + _NOT_DONE)
+    return _not_posted(
+        channel, f"{display} is not connected, so nothing was posted.",
+        needs_owner=True, asked_owner_for=name, owner_answer=_ask(),
+        next=_NOT_DONE)
+
+
+#: post_to_channel's open question to the owner about where a channel's
+#: posts go: channel -> ask id (integrations.agent_engine.person_ask keeps
+#: the ask and its answer in this process, so this map lives beside it).
+_DESTINATION_ASKS = {}
+#: What the owner's last answer for a channel got when it could not be used
+#: (set_announcement_target's refusal), told to them in the next question.
+_DESTINATION_SAID = {}
+_DESTINATION_LOCK = threading.Lock()
+
+
+def _take_destination_answer(channel: str, answer, owner) -> Optional[str]:
+    """Write the owner's answer for ``channel`` through
+    set_announcement_target, the one writer.  None when the channel now has
+    a destination, else what the writer said (kept for the next question)."""
+    from integrations.channels.agent_tools import set_announcement_target
+    chat_id = str(((answer or {}).get('values') or {}).get('chat_id') or '').strip()
+    said = set_announcement_target(channel, chat_id, owner)
+    if _announcement_targets(channel):
+        with _DESTINATION_LOCK:
+            _DESTINATION_SAID.pop(channel, None)
+        return None
+    with _DESTINATION_LOCK:
+        _DESTINATION_SAID[channel] = said
+    return said
+
+
+def _apply_answer_when_given(channel: str, ask_id: str, owner) -> None:
+    """Wait for the owner's answer to ``ask_id`` and write it the moment it
+    comes.  person_ask keeps an answered ask for an hour and nothing across
+    a restart, so leaving the answer for the agent's next call lost it when
+    that call came later (review of f8fdb9c64).  Runs on a daemon thread."""
+    from integrations.agent_engine import person_ask
+    try:
+        answer = person_ask.wait_for_answer(ask_id, person_ask.OPEN_KEEP_S)
+        if answer is not None:
+            _take_destination_answer(channel, answer, owner)
+    except Exception:
+        logger.warning("post_to_channel %s: the owner's destination answer "
+                       "could not be saved", channel, exc_info=True)
+
+
+def _announcement_targets(channel: str) -> list:
+    """The chat ids ``channel``'s announcements go to, by
+    announcement_broadcaster's destination rule (the owner's
+    announce_chat_id; a one-to-one chat only with a subscription)."""
+    from integrations.channels.announcement_broadcaster import (
+        _collect_announcement_targets)
+    return [chat_id for ch, chat_id in _collect_announcement_targets()
+            if ch == channel]
+
+
+def _ask_where_to_post(channel: str, meta: dict) -> Optional[str]:
+    """No announcement destination is set for ``channel``: apply the owner's
+    answer if they gave one (None then, so the post goes ahead), else ask
+    them where posts go and say so.
+
+    The question goes through person_ask (one card on every surface, a
+    Firebase push, the answer back by its id); the answer is written the
+    moment it comes (_apply_answer_when_given) by
+    integrations.channels.agent_tools.set_announcement_target, the one
+    writer of announce_chat_id, which refuses what the broadcaster would.
+    A refused answer is named in the next question, so the owner knows why
+    they are asked again."""
+    from integrations.agent_engine import person_ask
+    from integrations.agent_engine.capability_setup import setup_owner
+    display = meta.get('display_name') or channel
+    owner = setup_owner()
+    if not owner:
+        return _not_posted(
+            channel, (f"{display} has no announcement destination and this "
+                      f"node has no owner to ask (HEVOLVE_OWNER_USER_ID is not "
+                      f"set), so nothing was posted."),
+            needs_owner=True)
+    with _DESTINATION_LOCK:
+        ask_id = _DESTINATION_ASKS.get(channel)
+    if ask_id:
+        state = person_ask.ask_state(ask_id, owner)
+        if state['status'] == 'open':
+            return _not_posted(
+                channel, (f"{display} has no announcement destination yet; "
+                          f"the owner has been asked where posts go."),
+                needs_owner=True, ask_id=ask_id, next=_NOT_DONE)
+        with _DESTINATION_LOCK:
+            _DESTINATION_ASKS.pop(channel, None)
+        if state['status'] == 'answered' and _take_destination_answer(
+                channel, state.get('answer'), owner) is None:
+            return None
+    with _DESTINATION_LOCK:
+        refused = _DESTINATION_SAID.get(channel)
+    description = (f"Your agent is ready to post on {display}. Give the group "
+                   f"or channel it posts to.")
+    if refused:
+        description = f"Your last answer could not be used: {refused} " + description
+    out = person_ask.ask(owner, 'post_to_channel', {
+        'type': 'form',
+        'title': f"Where should posts on {display} go?",
+        'description': description,
+        'fields': [{'name': 'chat_id', 'label': f"{display} group or channel",
+                    'help': ("A group or channel people joined. Telegram groups "
+                             "and channels have negative ids."),
+                    'type': 'text'}],
+        'submit_label': 'Save',
+    })
+    if not out.get('ok'):
+        return _not_posted(
+            channel, (f"{display} has no announcement destination, and the "
+                      f"owner could not be asked ({out.get('refused')}), so "
+                      f"nothing was posted."), needs_owner=True)
+    new_ask = out['ask_id']
+    with _DESTINATION_LOCK:
+        first = _DESTINATION_ASKS.get(channel) != new_ask
+        _DESTINATION_ASKS[channel] = new_ask
+    if first and not out.get('reused'):
+        threading.Thread(target=_apply_answer_when_given,
+                         args=(channel, new_ask, owner),
+                         name=f'post-destination-{channel}', daemon=True).start()
+    return _not_posted(
+        channel, (f"{display} has no announcement destination, so nothing was "
+                  f"posted; the owner has been asked where posts go."),
+        needs_owner=True, ask_id=new_ask, next=_NOT_DONE)
+
+
+def _media_for(media_url):
+    """The channel attachment for ``media_url``: a URL rides as a url, a
+    file on this node as a file_path, through the reply path's [[MEDIA:]]
+    rule (registry.extract_media_markers: files under the app's data dir
+    only, a sendable type only).  A URL whose name does not say its type
+    (no extension: a share page, a CDN id) is not an attachment; the post
+    carries it as a link (_post_to_channel), as it did before the media
+    rule, which refused the whole post for it (review of f8fdb9c64).
+    Returns (attachments, error)."""
+    if not media_url:
+        return None, None
+    from integrations.channels.base import MediaAttachment
+    from integrations.channels.registry import extract_media_markers, media_kind
+    text = str(media_url).strip()
+    if text.lower().startswith(('http://', 'https://')):
+        kind = media_kind(text)
+        if kind is None:
+            return None, None
+        return [MediaAttachment(type=kind[1], url=text, mime_type=kind[0])], None
+    _clean, media = extract_media_markers(f'[[MEDIA:{text}]]')
+    if not media:
+        return None, (f"{text} cannot be attached: a file on this node is sent "
+                      f"only from the app's data folder, and only as an image, "
+                      f"video, audio or PDF")
+    return media, None
+
+
+def _post_to_channel(channel, content, media_url=None) -> str:
+    """Post ``content`` on ``channel``'s announcement destination, or ask
+    the owner for what is missing (_connect_or_ask, _ask_where_to_post).
+
+    The send goes through the live channel registry, the one every channel
+    send uses (FlaskChannelIntegration.send_threadsafe), and each answer is
+    the channel's own SendResult: a post is reported sent only when the
+    channel says it was.  A send the channel has not confirmed within
+    CHANNEL_SEND_WAIT_S may still go out, so it is reported pending with
+    "do not post it again", never as not sent (a retry posted it twice).
+    """
+    import concurrent.futures
+    from integrations.channels.flask_integration import (
+        CHANNEL_SEND_WAIT_S, get_channel_integration)
+    from integrations.channels.metadata import get_channel_metadata, list_all_channels
+    channel = str(channel or '').strip().lower()
+    meta = get_channel_metadata(channel)
+    if not meta:
+        return _not_posted(channel, (
+            f"There is no {channel} channel to post through, so nothing was "
+            f"posted. Channels: {', '.join(sorted(list_all_channels()))}. "
+            f"For a site the owner is signed in to on the desktop, "
+            f"post_to_channel_via_browser posts through their browser."))
+    turned_off = _channel_turned_off(channel, meta)
+    if turned_off:
+        return turned_off
+    from integrations.channels.announcement_broadcaster import (
+        every_destination_needs_subscription)
+    targets = _announcement_targets(channel)
+    if not targets and every_destination_needs_subscription(channel):
+        # No answer the owner can give on a card would be used, so nothing
+        # is connected and nothing is asked (review of f8fdb9c64: every
+        # answer was refused and asked again on every post).
+        display = meta.get('display_name') or channel
+        return _not_posted(
+            channel, (f"{display} has no announcement destination, and on "
+                      f"{display} announcements go only to a destination that "
+                      f"subscribed to them, so nothing was posted."),
+            needs_owner=False, cannot_post_here=True,
+            next=(f"Nothing asked: no answer would let {display} post. Post on "
+                  f"a channel with groups or channels people joined."))
+    integration = get_channel_integration()
+    adapter = integration.registry.get(channel)
+    if adapter is None or not adapter.is_running():
+        return _connect_or_ask(channel, meta, adapter)
+    if not targets:
+        waiting = _ask_where_to_post(channel, meta)
+        if waiting is not None:
+            return waiting
+        targets = _announcement_targets(channel)
+    media, problem = _media_for(media_url)
+    if problem:
+        return _not_posted(channel, f"Nothing was posted: {problem}.")
+    if media_url and media is None:
+        # A URL that is not a file of a sendable type: sent as a link.
+        content = f"{content}\n{str(media_url).strip()}"
+    posts = []
+    for chat_id in targets:
+        try:
+            result = integration.send_threadsafe(
+                channel, chat_id, content, wait=CHANNEL_SEND_WAIT_S, media=media)
+        except concurrent.futures.TimeoutError:
+            logger.warning("post_to_channel %s/%s: not confirmed after %ds; it "
+                           "may still go out", channel, chat_id,
+                           CHANNEL_SEND_WAIT_S)
+            posts.append({'chat_id': chat_id, 'sent': None, 'pending': True})
+            continue
+        if result is None:
+            return _not_posted(channel, (
+                'The channel adapters are not running on this node, so nothing '
+                'was posted.'), posts=posts)
+        posts.append({'chat_id': chat_id, 'sent': bool(result.success),
+                      'message_id': result.message_id, 'error': result.error})
+    pending = any(p.get('pending') for p in posts)
+    # None while a send may still land, as /channels/send's 202 answers it
+    # (review of f8fdb9c64: a pending post was reported "sent": false).
+    sent = (True if any(p['sent'] for p in posts)
+            else None if pending else False)
+    out = {'success': sent, 'sent': sent, 'pending': pending,
+           'channel': channel, 'posts': posts}
+    if pending:
+        out['note'] = (f"{channel} has not confirmed every post yet; it may "
+                       f"still appear. Do not post it again.")
+    return json.dumps(out)
+
+
+def _publish_instagram_feed(user_id, media_url, caption='', *, _consent=None):
     """Publish media to the Instagram FEED (Content Publishing API).
 
     DISTINCT from post_to_channel, which is messaging (send_message = a DM).  A
@@ -84,15 +613,17 @@ def _publish_instagram_feed(user_id, media_url, caption='', *,
     (``publish_reel``), an image becomes a feed photo (``publish_photo``) — the
     daemon video-editor's whole output is reels, which had no code path before.
     Gated on the same standing ``public_exposure`` consent as every external
-    post.  The adapter methods are async; this drives them from sync agent-tool
-    code through the canonical ``core.event_loop.run_async`` bridge (the same
-    one search_long_term_memory uses), so no new async plumbing and no touch of
-    the shared wamp_bridge dispatcher.
+    post.
 
-    ``_adapter`` / ``_consent`` are injection seams for tests; production
-    resolves the live Instagram adapter from get_available_adapters and reads
-    real operator consent.
+    It posts through the live Instagram adapter in the channel registry (the
+    one every channel send uses), on the channel loop; a post not confirmed
+    within CHANNEL_SEND_WAIT_S is pending, never failed.  It used to build a
+    fresh adapter from the extension factory, which nothing ever connected,
+    so every call answered "Not connected" (review of f8fdb9c64).
+    ``_consent`` is a test seam; production reads real operator consent.
     """
+    import asyncio
+    import concurrent.futures
     consent = _consent or _external_post_allowed
     if not consent(user_id):
         return _consent_required_result('instagram')
@@ -100,28 +631,32 @@ def _publish_instagram_feed(user_id, media_url, caption='', *,
         return json.dumps({'success': False,
                            'error': 'media_url is required for a feed post'})
     try:
-        adapter = _adapter
-        if adapter is None:
-            from integrations.channels.extensions import get_available_adapters
-            factories = get_available_adapters()
-            factory = next((f for n, f in factories.items()
-                            if 'instagram' in n.lower()), None)
-            if factory is None:
-                return json.dumps({
-                    'success': False,
-                    'error': ('no instagram adapter available; connect an '
-                              'Instagram business account first'),
-                    'available_channels': list(factories.keys()),
-                })
-            adapter = factory()
-
-        from core.event_loop import run_async
-        base = str(media_url).split('?', 1)[0].lower()
-        is_video = base.endswith(('.mp4', '.mov', '.m4v', '.webm'))
+        from integrations.channels.flask_integration import (
+            CHANNEL_SEND_WAIT_S, get_channel_integration)
+        from integrations.channels.metadata import get_channel_metadata
+        is_video = _is_video_url(media_url)
+        meta = get_channel_metadata('instagram') or {}
+        turned_off = _channel_turned_off('instagram', meta)
+        if turned_off:
+            return turned_off
+        integration = get_channel_integration()
+        adapter = integration.registry.get('instagram')
+        loop = integration.running_loop()
+        if adapter is None or not adapter.is_running() or loop is None:
+            return _connect_or_ask('instagram', meta, adapter)
         coro = (adapter.publish_reel(media_url, caption or '')
                 if is_video else
                 adapter.publish_photo(media_url, caption or ''))
-        res = run_async(coro)
+        try:
+            res = asyncio.run_coroutine_threadsafe(coro, loop).result(
+                timeout=CHANNEL_SEND_WAIT_S)
+        except concurrent.futures.TimeoutError:
+            return json.dumps({
+                'success': None, 'sent': None, 'pending': True,
+                'channel': 'instagram',
+                'kind': 'reel' if is_video else 'photo',
+                'note': ("Instagram has not confirmed the post yet; it may "
+                         "still appear. Do not post it again.")})
         return json.dumps({
             'success': bool(getattr(res, 'success', False)),
             'channel': 'instagram',
@@ -131,6 +666,18 @@ def _publish_instagram_feed(user_id, media_url, caption='', *,
         })
     except Exception as e:
         return json.dumps({'success': False, 'error': str(e)})
+
+
+def _channel_arg_text() -> str:
+    """post_to_channel's channel argument, naming the channels where no
+    announcement can go out (announcement_broadcaster.PERSON_TO_PERSON_CHANNELS,
+    the one list)."""
+    from integrations.channels.announcement_broadcaster import (
+        PERSON_TO_PERSON_CHANNELS)
+    return ("Chat channel to post on: telegram, discord, viber ... (not "
+            f"{', '.join(sorted(PERSON_TO_PERSON_CHANNELS))}: there "
+            "announcements reach only people who subscribed; for twitter, "
+            "linkedin and other sites, use post_to_channel_via_browser)")
 
 
 def register_marketing_tools(helper, assistant, user_id: str):
@@ -144,6 +691,7 @@ def register_marketing_tools(helper, assistant, user_id: str):
         assistant: AutoGen assistant agent (registers for execution)
         user_id: Current user ID for ownership
     """
+    _CHANNEL_ARG = _channel_arg_text()
 
     def create_social_post(
         title: Annotated[str, "Post title"],
@@ -234,15 +782,19 @@ def register_marketing_tools(helper, assistant, user_id: str):
             return json.dumps({'success': False, 'error': str(e)})
 
     def post_to_channel(
-        channel: Annotated[str, "Channel name: twitter|instagram|email|discord|telegram|whatsapp|slack|linkedin|nostr|matrix"],
+        channel: Annotated[str, _CHANNEL_ARG],
         content: Annotated[str, "Content to post — write as one real person to another; never AI/marketing-speak (it gets scrolled past)"],
-        media_url: Annotated[Optional[str], "Media URL to include (optional)"] = None,
-        extra_config: Annotated[Optional[str], "JSON string with channel-specific config (optional)"] = None,
+        media_url: Annotated[Optional[str], "Media to include (optional): a URL, or a file this node made"] = None,
+        extra_config: Annotated[Optional[str], "Not used: posts go to the group or channel the owner chose for this channel"] = None,
     ) -> str:
-        """Post content to an external channel via the unified channel adapter system.
+        """Post content on an external channel, in the group or channel the
+        owner chose for it.
 
-        Routes to the appropriate channel adapter (Twitter, Instagram, Email, etc.).
-        If the channel adapter is not available, delegates to a specialist agent.
+        The answer says whether the channel accepted it (sent true/false, or
+        pending: not confirmed yet, may still appear, do not post again).
+        When the channel is not connected, or no destination is set, nothing
+        is posted: the owner is asked for what is missing, and calling again
+        later carries on from their answer.
 
         Gated on standing operator ``public_exposure`` consent — returns a
         consent_required result (no post) until a human opts in.
@@ -250,35 +802,10 @@ def register_marketing_tools(helper, assistant, user_id: str):
         if not _external_post_allowed(user_id):
             return _consent_required_result(channel)
         try:
-            from integrations.channels.extensions import get_available_adapters
-            adapters = get_available_adapters()
-
-            # Find matching adapter
-            adapter_name = f"{channel}_adapter"
-            adapter_factory = None
-            for name, factory in adapters.items():
-                if channel.lower() in name.lower():
-                    adapter_factory = factory
-                    break
-
-            if adapter_factory:
-                adapter = adapter_factory()
-                config = json.loads(extra_config) if extra_config else {}
-                result = adapter.send_message(
-                    content=content,
-                    media_url=media_url,
-                    **config,
-                )
-                return json.dumps({'success': True, 'channel': channel, 'result': str(result)})
-            else:
-                return json.dumps({
-                    'success': False,
-                    'error': f'Channel adapter for {channel} not available. '
-                             f'Use delegate_to_specialist to find an agent with {channel} skills.',
-                    'available_channels': list(adapters.keys()),
-                })
+            return _post_to_channel(channel, content, media_url)
         except Exception as e:
-            return json.dumps({'success': False, 'error': str(e)})
+            logger.warning("post_to_channel %s: not posted: %s", channel, e)
+            return _not_posted(channel, str(e))
 
     def publish_to_instagram_feed(
         media_url: Annotated[str, "URL of the video (.mp4/.mov -> Reel) or image (-> feed photo) to publish"],
@@ -430,8 +957,9 @@ def register_marketing_tools(helper, assistant, user_id: str):
         across every platform in marketing/intents (NOT LinkedIn-only): it opens
         the platform's composer URL, types the content, and clicks Post.
 
-        Use this when post_to_channel reports the adapter has no credentials but
-        the user is logged into that site in their desktop browser.  Gated on
+        Use this when post_to_channel reports the channel cannot be connected
+        here (or has no catalog entry) and the user is logged into that site in
+        their desktop browser.  Gated on
         standing operator ``public_exposure`` consent — returns a consent_required
         result (no post) until a human opts in.  Returns JSON
         {ok, platform, code, status, detail}.
@@ -485,7 +1013,7 @@ def register_marketing_tools(helper, assistant, user_id: str):
         ('create_social_post', 'Create a post on the HART social platform for marketing', create_social_post),
         ('create_campaign', 'Create a marketing campaign with strategy, targeting, and budget', create_campaign),
         ('create_ad', 'Create a targeted ad unit with budget and audience targeting', create_ad),
-        ('post_to_channel', 'Post content to external channels (Twitter, Instagram, Email, Discord, etc.)', post_to_channel),
+        ('post_to_channel', 'Post content on a connected external channel (Telegram, Discord, Slack, ...); when it is not connected, asks the owner for what connecting it needs', post_to_channel),
         ('publish_to_instagram_feed', 'Publish a video Reel or photo to the Instagram FEED (Content Publishing API) — the daemon video-editor publish step; consent-gated, needs a connected IG business account', publish_to_instagram_feed),
         ('create_referral_campaign', 'Create a referral-driven growth campaign with auto-generated referral code', create_referral_campaign),
         ('get_growth_metrics', 'Get platform growth metrics including viral coefficient (K factor)', get_growth_metrics),

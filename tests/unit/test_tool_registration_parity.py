@@ -651,6 +651,13 @@ class TestCrossUserJoinResolution:
             def get(self, *a, **k):
                 raise RuntimeError('cache boom')
 
+        def _no_grants(*_a, **_k):
+            raise RuntimeError('no consent store')
+
+        # The join is read from the kept grants first and from chat_joinees
+        # only when those cannot be read (persona_registry.joined_chats), so
+        # both readers fail here.
+        monkeypatch.setattr(pr, '_kept_joins', _no_grants)
         monkeypatch.setattr(pr, 'chat_joinees', _Raiser())
         with caplog.at_level(logging.WARNING, logger='core.persona_registry'):
             sessions, key = pr._resolve_session_for_user('whoever', 'pexc')

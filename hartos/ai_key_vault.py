@@ -271,7 +271,7 @@ class AIKeyVault:
             return type(value)(cls._map_strings(v, fn) for v in value)
         return value
 
-    def owner_credential_names(self) -> set:
+    def owner_credential_names(self, strict: bool = False) -> set:
         """The names of the credentials the owner of this computer entered:
         the only names an alias resolves and "is stored" answers for.
 
@@ -290,12 +290,17 @@ class AIKeyVault:
         Never "any environment variable": os.environ also holds API keys,
         database URLs and key material nobody entered for an agent, and an
         alias that reached them let a model (or a page it read) put them in
-        a tool URL.  A consent lookup that fails counts no grants.
+        a tool URL.  A consent lookup that fails counts no grants, unless
+        ``strict``: then it raises, for a caller that must tell "the owner
+        has none" from "it cannot be told" (channels.agent_tools
+        _owner_value_fingerprint).
         """
         names = set(self._stored)
         try:
             names |= self._granted_names()
         except Exception:
+            if strict:
+                raise
             logger.warning("credential grants could not be read; only "
                            "credentials stored this session resolve",
                            exc_info=True)
@@ -609,10 +614,12 @@ def _recent_entries(rows) -> int:
                and not _reopened(row))
 
 
-def request_credential(resource_description, agent_id=None) -> str:
-    """What Request_Resource (both the LangChain tool and core.agent_tools
-    request_resource) does: get the agent a credential without the agent
-    ever seeing it.
+def request_credential(resource_description, agent_id=None, *,
+                       tell_alias=True) -> str:
+    """Get the agent a credential without the agent ever seeing it.  The
+    agent tools (Request_Resource and core.agent_tools request_resource) come
+    here through request_credential_for_agent; code that asks for its own
+    fixed credential (post_to_channel) calls it directly.
 
     A stored credential is answered with its {{secret:NAME}} alias.  A
     missing one is asked for through ConsentService, like every other ask:
@@ -621,6 +628,11 @@ def request_credential(resource_description, agent_id=None) -> str:
     consent card shows with a password field.  Accept stores the value and
     grants the row.  The agent is told the alias either way; resolve_aliases
     puts the value in where a tool runs.
+
+    ``tell_alias=False`` is for a tool that uses the value itself once the
+    owner enters it (post_to_channel connects the channel with it): the
+    agent is told that tool carries on, never the alias, which would invite
+    it to pass the credential somewhere itself (review of f8fdb9c64).
     """
     req = _parse_resource_request(resource_description)
     label = str(req.get('label') or req.get('key_name') or 'a credential')[:100]
@@ -629,10 +641,15 @@ def request_credential(resource_description, agent_id=None) -> str:
     name = vault.credential_name(req.get('key_name') or label,
                                  req.get('channel_type') or '')
     alias = '{{secret:' + name + '}}'
-    use = (f"use {alias} wherever the value is needed: it is filled in only "
-           f"when a tool runs, and you never see it. Do not ask for it in chat. "
-           f"If signing in with it fails, call this tool again with the same "
-           f'key_name and "rejected": true, and the owner is asked for it again.')
+    if tell_alias:
+        use = (f"use {alias} wherever the value is needed: it is filled in "
+               f"only when a tool runs, and you never see it. Do not ask for "
+               f"it in chat. If signing in with it fails, call this tool again "
+               f'with the same key_name and "rejected": true, and the owner is '
+               f'asked for it again.')
+    else:
+        use = (f"{used_by} uses it itself: you never see it and never need "
+               f"it. Do not ask for it in chat.")
     # The site refused the stored value: never hand it back, ask again.
     rejected = req.get('rejected') is True
 
@@ -663,7 +680,9 @@ def request_credential(resource_description, agent_id=None) -> str:
         (f"{label} was rejected when {used_by} tried it; enter it again."
          if rejected else f"{label} is needed for {used_by}."),
         str(req.get('description') or '').strip(),
-        f"It is kept encrypted on this computer; the agent only sees {alias}.",
+        (f"It is kept encrypted on this computer; the agent only sees {alias}."
+         if tell_alias else
+         "It is kept encrypted on this computer; the agent never sees it."),
     ]))
     try:
         from integrations.social.consent_service import (
@@ -740,6 +759,207 @@ def request_credential(resource_description, agent_id=None) -> str:
                 f"again\" for it in Privacy settings.")
     return (f"Asked the owner of this computer for '{label}' on the consent "
             f"card. Once they enter it, {use}")
+
+
+# ── An agent's ask, before it reaches a person ─────────────────────
+
+#: The input an agent's credential tool takes, and what the tool is for: ONE
+#: text, read by core.agent_tools request_resource and the Request_Resource
+#: tool in hart_intelligence_entry, so both say the same.  It used to invite
+#: "any configuration value", and on 2026-11-02 a background goal asked the
+#: owner for 'Hive Network Configuration'.
+REQUEST_RESOURCE_INPUT = (
+    'JSON: {"resource_type": "api_key", "key_name": "OPENWEATHER_API_KEY", '
+    '"label": "OpenWeather API key", '
+    '"service": "OpenWeather (openweathermap.org)", "used_by": "the forecast step", '
+    '"description": "what you will do with it, in plain words", '
+    '"where_to_get": "where the person finds it, e.g. openweathermap.org, My API keys"}')
+#: No braces in it: hart_intelligence_entry hands it to LangChain, whose chat
+#: agent prompt is an f-string template, so a brace would be read as a slot
+#: and every chat turn with tools would fail ("Missing some input keys",
+#: live 2026-11-03).  The JSON example stays in REQUEST_RESOURCE_INPUT, which
+#: only core.agent_tools reads, as its input's description.
+REQUEST_RESOURCE_DESCRIPTION = (
+    "Ask the person for a credential of an OUTSIDE service they have an account "
+    "with (an API key, a bot token, a login for a website or app) when a step "
+    "needs one and it is not stored yet. Say which service, what you will do with "
+    "it and where they get it, so they can act on it. The value is kept encrypted "
+    "on this computer and you only get an alias that tools fill in. Never ask for "
+    "this computer's own settings, network or configuration: it already has them, "
+    "and such an ask is not shown to anyone. Input: one JSON object with "
+    "resource_type (api_key, token or channel_secret), key_name (for example "
+    "OPENWEATHER_API_KEY), label, service, used_by, description (what you will do "
+    "with it, in plain words) and where_to_get (where the person finds it).")
+
+#: Seconds the node's own model gets to judge one ask.
+_ASK_CHECK_TIMEOUT_S = 20
+#: The model first names who gives the person this secret, then answers.
+#: Measured 2026-11-03 on the desktop's own model (Qwen3.5-2B): asked for a
+#: free-text "YES / NO: reason", it judged right but wrote "NO, because ...",
+#: so no exact word ever matched; asked for a bare verdict, it refused 5 of 10
+#: real outside-service asks (bot tokens, a Stripe key) as "system
+#: credentials".  Naming the issuer first: 0 wrong of 51 asks (27 real, 21
+#: made up, 3 sets) once the keys this computer reads skip the check.
+#: This question alone decides a refusal.  Folding "is it the person's own
+#: account" into it (6a1f2e46d, REJECTED on review 2026-11-03) made the
+#: desktop's Qwen3.5-4B refuse 10 of 41 real asks a reviewer wrote (Datadog,
+#: B2, S3, a Hugging Face download ...) with no card; this check refused 1.
+_ASK_CHECK_PROMPT = (
+    "A software agent on a person's computer wants to ask the person to type in a "
+    "secret: an API key, token, password or similar.\n"
+    "Step 1, issued_by: the outside company, website or app where the person has an "
+    "account and gets this secret (for example Telegram, Stripe, AWS, Zoom, their "
+    "email provider or online shop). Write NONE only if the secret belongs to the "
+    "computer itself or to the agent software (its own settings, network, "
+    "configuration, storage, scheduler, model server, node identity, certificates "
+    "or internal keys), which the system already has.\n"
+    "Step 2, answer: YES if issued_by names a company, website or app; NO if "
+    "issued_by is NONE.\nThe request:\n{request}\n")
+#: The reply's exact shape, enforced by the server (llama.cpp makes it a
+#: grammar; OpenAI-style APIs take it as structured output), so the answer is
+#: one of two words and never free text to pattern-match.
+_ASK_CHECK_SCHEMA = {
+    'type': 'object',
+    'properties': {'issued_by': {'type': 'string', 'maxLength': 80},
+                   'answer': {'type': 'string', 'enum': ['YES', 'NO']}},
+    'required': ['issued_by', 'answer'], 'additionalProperties': False}
+#: The second question, put only to an ask the first one lets through: is the
+#: stated use done on the person's account at the company it names?  It never
+#: refuses; a NO puts ASK_DOUBT_NOTE on the card right after the line naming
+#: the key, ahead of the agent's own words, so the person still decides.  The live case (2026-11-03 17:53:49 IST, desktop): an agent that
+#: had googled "Hivenet API" five times asked for HIVENET_API_KEY "to monitor
+#: idle nodes and onboard models via POST /api/models/onboard", this
+#: computer's own work, and the first question passed it (Hivenet is real).
+_ASK_USE_PROMPT = (
+    "A software agent on a person's computer wants the person to type in a secret "
+    "for an outside company, website or app.\n"
+    "their_account_used: read what the secret will be used for. YES if that use "
+    "is done at that company, on the person's account there (for example posting, "
+    "paying, sending, storing or backing up files there, downloading from it, "
+    "monitoring or alerting through it, or renting or using its service). NO if "
+    "the use is only this computer's own work, with no outside account in it: "
+    "monitoring, restarting, configuring or reading its own nodes, hive, peers, "
+    "models, memory, GPU, scheduler or settings, or calling its own addresses "
+    "such as /api/...\nThe request:\n{request}\n")
+_ASK_USE_SCHEMA = {
+    'type': 'object',
+    'properties': {'their_account_used': {'type': 'string', 'enum': ['YES', 'NO']}},
+    'required': ['their_account_used'], 'additionalProperties': False}
+#: What the card says first when the second question answers NO.
+ASK_DOUBT_NOTE = (
+    "Check before you enter anything: what this is for sounds like work this "
+    "computer does on its own, which needs no outside key. Enter it only if you "
+    "use this service for this.")
+_ASK_FIELDS = ('label', 'key_name', 'service', 'used_by', 'description',
+               'where_to_get')
+
+
+def _ask_model(req, prompt, schema, name) -> Optional[dict]:
+    """The node's own model's reply to ``prompt`` about ask ``req``, held to
+    ``schema`` by the server; None when it cannot be asked or the reply is not
+    the asked-for object.  The one stateless JSON call is
+    core.llm_json.ask_model_json (the model this node's turns run on, so it
+    works where there is no local model too); this only writes the ask out."""
+    from core.llm_json import ask_model_json
+    request = '\n'.join(f'{key}: {str(req.get(key))[:300]}' for key in _ASK_FIELDS
+                        if str(req.get(key) or '').strip())
+    return ask_model_json(prompt.format(request=request), schema, name,
+                          max_tokens=80, timeout=_ASK_CHECK_TIMEOUT_S)
+
+
+def _ask_verdict(req) -> Optional[str]:
+    """'yes' | 'no' | None: the node's own model's word on whether an outside
+    company, website or app gives the person this secret.
+
+    'no' only when both fields say so (issued_by NONE and answer NO); a NO that
+    names a company contradicts itself and counts as no answer, as does any
+    reply that is not the asked-for object, an error or a model that is down
+    (None).  Refusing a real ask costs the person a working agent; asking a
+    made-up one costs them a puzzling card, which is what happened before."""
+    reply = _ask_model(req, _ASK_CHECK_PROMPT, _ASK_CHECK_SCHEMA, 'credential_ask_check')
+    if reply is None:
+        return None
+    answer = reply.get('answer')
+    issuer = str(reply.get('issued_by') or '').strip().upper()
+    if answer == 'YES':
+        return 'yes'
+    if answer == 'NO' and issuer == 'NONE':
+        return 'no'
+    return None
+
+
+def _ask_doubted(req) -> bool:
+    """True when the node's own model says the stated use is NOT done on the
+    person's account at the company it names (this computer's own work).
+    False for YES, and for any failure or other reply: a doubt only adds
+    ASK_DOUBT_NOTE to a card, so not knowing adds nothing."""
+    reply = _ask_model(req, _ASK_USE_PROMPT, _ASK_USE_SCHEMA, 'credential_ask_use')
+    return bool(reply) and reply.get('their_account_used') == 'NO'
+
+
+def request_credential_for_agent(resource_description, agent_id=None) -> str:
+    """What an agent's credential tool does (core.agent_tools request_resource
+    and Request_Resource in hart_intelligence_entry): request_credential,
+    unless no person could act on the ask.
+
+    Owner, 2026-11-02: agents ask for credentials at runtime, while being
+    created or in any task, but never for a made-up one "as if everyone else
+    understands what it asks for".  Live that day: a background goal asked the
+    owner for 'Hive Network Configuration' (hive_network_config, used_by
+    network_discovery), names nothing in the code reads.
+
+    A credential this computer's code reads (reads_from_env: API keys, channel
+    tokens) or one the owner already stored goes straight on, with no model
+    call.  Any other ask is judged by the node's own model (_ask_verdict): YES
+    is asked, with the service and where to get it put on the card; NO (no
+    outside company gives it out) goes back to the agent with no card; no
+    answer (model down, or not the asked-for reply) is asked as before and
+    logged.  An ask that goes to the person is put the second question
+    (_ask_doubted): when its stated use is this computer's own work, as the
+    17:53 IST HIVENET_API_KEY card of 2026-11-03 was, the card says so
+    (ASK_DOUBT_NOTE) right after the line naming the key, ahead of the
+    agent's own words, and the person decides; it is never refused on that
+    alone.  Code that asks for its own fixed credential (post_to_channel, the
+    trending-songs job) calls request_credential itself.
+    """
+    req = _parse_resource_request(resource_description)
+    vault = get_ai_key_vault()
+    label = str(req.get('label') or req.get('key_name') or 'a credential')[:100]
+    # The name request_credential gives it (its own two lines), so a stored or
+    # declared credential is recognised as the same one.
+    name = vault.credential_name(req.get('key_name') or label,
+                                 req.get('channel_type') or '')
+    doubted = False
+    if not (reads_from_env(name) or vault.owner_credential(name)):
+        verdict = _ask_verdict(req)
+        if verdict == 'no':
+            logger.info("credential %s not asked: no outside company, website or "
+                        "app gives it out", name)
+            return (f"Did not ask the owner for '{label}': no outside company, "
+                    f"website or app gives it out, so no person could find it. "
+                    f"Ask a person only for a credential of an outside service "
+                    f"they have an account with, and say which service, what you "
+                    f"will do with it and where they get it. This computer's own "
+                    f"settings, network and configuration need no secret from "
+                    f"anyone.")
+        if verdict is None:
+            logger.warning("credential %s could not be checked (the model gave no "
+                           "answer): asked as before", name)
+        doubted = _ask_doubted(req)
+        if doubted:
+            logger.info("credential %s asked with a doubt: its stated use sounds "
+                        "like this computer's own work", name)
+    # The card shows what the person needs to act on it (request_credential
+    # puts the description in the card's reason).
+    extra = [f"Service: {req['service']}." if str(req.get('service') or '').strip()
+             else '',
+             f"Where to get it: {req['where_to_get']}."
+             if str(req.get('where_to_get') or '').strip() else '']
+    if any(extra) or doubted:
+        req = dict(req, description=' '.join(filter(None, [
+            ASK_DOUBT_NOTE if doubted else '',
+            str(req.get('description') or '').strip()] + extra)))
+    return request_credential(json.dumps(req), agent_id=agent_id)
 
 
 # ── Localhost enforcement ──────────────────────────────────────────

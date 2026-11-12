@@ -143,7 +143,8 @@ class CodingAgentDaemon:
         from integrations.social.models import get_db, AgentGoal
         from .idle_detection import IdleDetectionService
         from integrations.agent_engine.goal_manager import (
-            GoalManager, CODING_GOAL_TYPES, PAUSE_CAUSE_DISPATCH_FAILURES)
+            GoalManager, CODING_GOAL_TYPES, PAUSE_CAUSE_DISPATCH_FAILURES,
+            dispatch_failure_pause_reason)
         from .task_distributor import dispatch_to_chat
 
         self._tick_count += 1
@@ -300,7 +301,7 @@ class CodingAgentDaemon:
                         _res = GoalManager.pause_goal(
                             db, goal, cause=PAUSE_CAUSE_DISPATCH_FAILURES,
                             by='coding_daemon',
-                            reason=f'Auto-paused: {fails} consecutive dispatch failures',
+                            reason=dispatch_failure_pause_reason(fails),
                             config=cfg)
                         if _res.get('success'):
                             logger.warning(f"Coding goal {goal.id} AUTO-PAUSED after {fails} failures")

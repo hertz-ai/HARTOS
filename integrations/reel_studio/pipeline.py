@@ -56,6 +56,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
+from core.agent_tool_menu import ASK_PERSON_TOOL
+from core.user_file_store import REEL_SOURCE
 # Free disk where the work dir goes: the one rule (D27), read by _make.
 from core.platform_paths import free_bytes
 from integrations.reel_studio import contracts as C
@@ -347,8 +349,14 @@ def produce_reel(sources: Sequence[Any], *, style: Mapping, workdir: str, out_pa
 
 # ── what she gets ─────────────────────────────────────────────────────────
 
-NEEDS_CLIPS_MESSAGE = ('There are no clips to make a reel from. Ask her to attach the videos '
-                       'for this reel (1 to 10 from her gallery), then call reel_make again.')
+# Names the existing way to ask, so an agent that calls reel_make before it
+# has clips is pointed at ask_person's file_request, not told only to "ask her
+# to attach".  The clips her answer sends are bound to this agent, and
+# reel_make without clips= uses her newest unused batch.
+NEEDS_CLIPS_MESSAGE = ('There are no clips to make a reel from. Ask her for them with '
+                       '%s: a file_request with purpose "%s" (1 to %d videos from her '
+                       'gallery). When she has answered, call reel_make again; it uses the '
+                       'clips she sent.' % (ASK_PERSON_TOOL, REEL_SOURCE, MAX_CLIPS))
 BUSY_MESSAGE = ('This desktop is making another reel right now. Tell her it will be free in a '
                 'few minutes, then try again.')
 RENDER_FAILED_MESSAGE = ('The desktop could not render the reel. Try once more; if it fails '

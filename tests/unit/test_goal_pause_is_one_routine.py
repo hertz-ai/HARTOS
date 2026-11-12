@@ -183,6 +183,104 @@ def test_the_dashboards_pause_verb_stamps_the_person(db):
     assert _record(goal)[:2] == (gm.PAUSE_CAUSE_PERSON, 'person:owner')
 
 
+def test_a_resume_retires_every_key_the_pause_wrote(db):
+    """Review of d73463359 by claude-autostart-71: the resume's key list was
+    kept by hand, and pause_signature was missing from it until that commit,
+    so a resumed goal carried the old pause's detail into its next pause.
+    Whatever pause_goal and its writers put on the record (the escalation's
+    told_at, the daemon's pause_signature) leaves the config on resume and is
+    kept under last_*."""
+    goal = _goal(db, 'k1', {'goal_note': 'kept'})
+    before = set(goal.config_json)
+    GoalManager.pause_goal(db, goal, cause=gm.PAUSE_CAUSE_DISPATCH_FAILURES,
+                           by='agent_daemon', reason='five turns failed',
+                           extra={'pause_signature': 'turn failed: 400',
+                                  'told_at': '2026-10-31T00:00:00'})
+    written = set(goal.config_json) - before
+    assert written == {'pause_reason', 'paused_at', 'pause_cause', 'paused_by',
+                       'told_at', 'pause_signature'}
+    assert GoalManager.resume_goal(db, 'k1', 'person:a')['success']
+    cfg = goal.config_json
+    assert not written & set(cfg), sorted(written & set(cfg))
+    assert {('last_' + k) for k in written} <= set(cfg)
+    assert cfg['last_pause_signature'] == 'turn failed: 400'
+    assert cfg['goal_note'] == 'kept'
+
+
+def test_every_key_a_pause_writes_is_retired_by_the_resume(db):
+    """Residual from claude-autostart-71's review of 0706cabb2: the record's
+    tuple was one list on the retire side only, so a key a writer added
+    would be retired by nobody (the pause_signature miss).  The daemon's own
+    pause at its retry cap writes every optional key (its signature, and
+    told_at once its person is told); every top-level key it adds is in the
+    tuple the resume retires.  It covers the daemon's pause path only:
+    escalate_goal and the budget gate write keys of their own (their pause
+    records are read and retired by their own tests), so a key added there
+    is not caught here (claude-autostart-71's nit on cd49395bc)."""
+    goal = _goal(db, 'w1', {'goal_note': 'kept', 'daemon_resume_count': ad._RESUME_CAP})
+    before = set(goal.config_json)
+    with patch.object(GoalManager, '_tell_its_person', return_value=True):
+        ad._auto_pause_for_dispatch_failures(db, goal, 'w1', 5, 'turn failed: 400')
+    added = set(goal.config_json) - before
+    assert {'pause_signature', 'told_at'} <= added, sorted(added)
+    assert added <= set(gm.PAUSE_RECORD_KEYS), sorted(added - set(gm.PAUSE_RECORD_KEYS))
+
+
+def test_the_daemons_pause_is_read_by_its_cause_not_its_words(db):
+    """Review of 3d4c5b3a3's set by claude-autostart-71, item 3:
+    _paused_for_dispatch_failures required the daemon's sentence even when
+    the record's cause already said whose pause it was, so rewording either
+    writer's sentence would have left every new dispatch-failure pause
+    unresumed, silently.  The cause decides; the words are read only for a
+    row paused before pause_cause existed, and never make a pause the
+    daemon's on their own."""
+    goal = _goal(db, 'c1', {'pause_cause': gm.PAUSE_CAUSE_DISPATCH_FAILURES,
+                            'paused_by': 'daemon', 'paused_at': 'x',
+                            'pause_reason': 'Paused after five failed turns'},
+                 status='paused')
+    assert ad._paused_for_dispatch_failures(goal)
+    other = _goal(db, 'c2', {'pause_cause': gm.PAUSE_CAUSE_PERSON,
+                             'paused_by': 'person:a', 'paused_at': 'x',
+                             'pause_reason': 'Auto-paused: 5 consecutive dispatch failures'},
+                  status='paused')
+    assert not ad._paused_for_dispatch_failures(other)
+
+
+def _old_row(db, gid, reason):
+    """A row paused before pause_cause existed, right after its own last
+    dispatch, never resumed: the only shape whose words are read."""
+    goal = _goal(db, gid, status='paused')
+    goal.last_dispatched_at = datetime(2026, 10, 20, 10, 0, 0)
+    goal.config_json = {'pause_reason': reason,
+                        'paused_at': (goal.last_dispatched_at
+                                      + timedelta(minutes=5)).isoformat()}
+    db.commit()
+    return goal
+
+
+def test_an_old_row_with_other_words_is_not_the_daemons(db):
+    """hartos-00's review of cd49395bc, F2: no test read an old row whose
+    words are another pause's, paused within the hour of its dispatch (the
+    one fixture with other words had no dispatch time, so it failed the
+    timing check anyway).  Its words are not the daemon's sentence: it is
+    not the daemon's to resume."""
+    assert ad._paused_for_dispatch_failures(
+        _old_row(db, 'o1', 'Auto-paused: 5 consecutive dispatch failures'))
+    assert not ad._paused_for_dispatch_failures(
+        _old_row(db, 'o2', 'Auto-paused: 3 consecutive no-op dispatches'))
+
+
+def test_an_old_row_is_read_by_the_sentence_it_was_written_with(db, monkeypatch):
+    """hartos-00's review of cd49395bc, F3: old rows hold the sentence as it
+    was written, but the reader matched today's writer constants, so
+    rewording the writer would have changed which old rows the daemon
+    resumes.  The reader keeps a frozen copy of the historical sentence."""
+    goal = _old_row(db, 'h1', 'Auto-paused: 5 consecutive dispatch failures')
+    monkeypatch.setattr(gm, 'DISPATCH_FAILURE_PAUSE_PREFIX', 'Paused: ')
+    monkeypatch.setattr(gm, 'DISPATCH_FAILURE_PAUSE_WORDS', 'failed turns in a row')
+    assert ad._paused_for_dispatch_failures(goal)
+
+
 def test_update_goal_status_paused_to_active_goes_through_resume_goal(db):
     goal = _goal(db, 'u1', {'pause_cause': 'person', 'paused_by': 'person:a',
                             'pause_reason': 'r', 'paused_at': 'x'}, status='paused')

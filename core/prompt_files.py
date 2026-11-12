@@ -42,6 +42,60 @@ def proposed_plan_filename(prompt_id, review_round=None):
     return name + '.json'
 
 
+def staged_plan(prompts_dir, prompt_id):
+    """The plan staged for review of ``prompt_id`` ({prompt_id}.proposed.json),
+    as the CREATE path wrote it, or None.  The one reader of that file."""
+    path = os.path.join(prompts_dir, proposed_plan_filename(prompt_id))
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        logger.warning('staged plan %s could not be read: %s', path, e)
+        return None
+    return data if isinstance(data, dict) else None
+
+
+# A person's plan that waits on their approval card: one per creating person.
+# The person paths mint a new prompt id on every create, so a hold kept only
+# under the plan's id would never be found again (hartos-16, 11-07).  Keyed by
+# the user who CREATES, never by whom the card goes to.
+def _hold_path(user_id):
+    from core.platform_paths import get_data_dir
+    safe = re.sub(r'[^A-Za-z0-9_.-]', '_', str(user_id))
+    return os.path.join(get_data_dir(), 'plan_holds', f'{safe}.json')
+
+
+def hold_plan(user_id, prompt_id):
+    """Keep that ``user_id``'s plan ``prompt_id`` waits on their card."""
+    from core.file_cache import atomic_json_write
+    path = _hold_path(user_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    atomic_json_write(path, {'prompt_id': prompt_id})
+
+
+def held_plan(user_id):
+    """The prompt id of ``user_id``'s plan waiting on their card (as it was
+    given: the creating path's own type), or None."""
+    try:
+        with open(_hold_path(user_id), 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        logger.warning('plan hold of %s could not be read: %s', user_id, e)
+        return None
+    return data.get('prompt_id') if isinstance(data, dict) and data.get('prompt_id') else None
+
+
+def clear_held_plan(user_id):
+    try:
+        os.remove(_hold_path(user_id))
+    except FileNotFoundError:
+        pass
+
+
 def is_proposed_plan_filename(fname):
     """True for exactly the names ``proposed_plan_filename`` makes."""
     return _PROPOSED_PLAN_RE.fullmatch(fname) is not None

@@ -68,7 +68,9 @@ COPY agent-ledger-opensource/ ./agent-ledger-opensource/
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-RUN pip install --upgrade pip wheel setuptools && \
+# pip is PINNED, not upgraded to the newest.  pip 26.3 refuses autobahn==23.1.2
+# (the same pin and its reason are in the root Dockerfile, layer 2a).
+RUN pip install "pip==26.2.2" wheel setuptools && \
     pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir ./agent-ledger-opensource && \
     pip install --no-cache-dir \

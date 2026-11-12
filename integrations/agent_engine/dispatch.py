@@ -544,9 +544,19 @@ def _user_chat_marker_recent() -> bool:
 # it may use the expert model and falls back to the free model when the day
 # fuse trips, so it never stops.  Every other goal type is background work on
 # the free model.  HEVOLVE_REVENUE_GOAL_TYPES (comma list) replaces the set.
+#
+# Owner 2026-10-21: "autonomous marketing and sales and seller onboarding and
+# buyer onboarding shd be goals" (revenue); owner 2026-11-03: the marketing,
+# sales and customer care agents run on the Claude credits.  So the two sales
+# goal types registered at boot earn too: 'outreach' (outreach_crm_tools) and
+# 'sales' (journey_engine).  The customer-care reply (hive_signal_bridge
+# 'support') and buyer onboarding (app_marketplace) have no live producer yet;
+# they join when one exists, so that a stranger's "help" in a group chat can
+# never start a Claude turn unseen (review of 865afa851, M3).
 REVENUE_GOAL_TYPES = frozenset({
     'marketing', 'seo', 'revenue', 'hive_growth', 'hive_economics',
     'mcgroce_merchant', 'mcgroce_shopper',
+    'outreach', 'sales',
 })
 REVENUE_GOAL_TYPE_PREFIXES = ('p2p_',)
 
@@ -567,6 +577,97 @@ def lane_for_goal_type(goal_type) -> str:
     'daemon'.  The daemon-side twin of core.request_lane.lane_for_chat."""
     from core.llm_outbound_logger import LANE_REVENUE, LANE_DAEMON
     return LANE_REVENUE if is_revenue_goal_type(goal_type) else LANE_DAEMON
+
+
+def revenue_expert_config(goal_type) -> Optional[list]:
+    """The model a local turn of a goal that earns names: the configured
+    expert's ONE entry, or None when the turn runs on the node's own model
+    as before.
+
+    The policy written above REVENUE_GOAL_TYPES: a goal that earns may use the
+    expert and falls back to the free model when the day fuse trips.  The
+    lane was registered and nothing ever used it: a turn dispatched with no
+    model_config ran on the node's default model.  Measured on central
+    2026-11-03: the expert offered to the revenue lane with $0.00 of $3.30
+    spent, while 21 revenue goals sat paused after five failed turns each on
+    openrouter/free.
+
+    One entry, as every producer sends (ModelBackend.to_config_list): /chat
+    is the one consumer that puts this node's own model after it
+    (hart_intelligence_entry, with_local_fallback), so an expert call the
+    wire refuses at the cap (llm_outbound_logger._day_cap_refusal) or that
+    fails falls to the own model there.  Composing it here put the own
+    entry's live http_client in the /chat body, which no transport can
+    encode: every revenue dispatch raised (review of 865afa851, C1).
+
+    Only the CONFIGURED expert (the owner's trio, central only by
+    configuration), never another expert-tier backend such as the owner's
+    Claude Code subscription.  Offered by the registry's own lane and day-cap
+    gate (ModelRegistry.get_configured_expert); past the cap or with no trio,
+    None.  None too while the expert's provider is refusing the account (its
+    breaker OPEN): the turn then runs on the own model instead of waiting on
+    the expert's host and striking the goal (review of 865afa851, C2).
+
+    None too for an expert whose spend no day cap holds: the cap
+    (budget_gate.expert_budget_allows) is kept for the claude family only, so
+    any other configured model would run every earning turn with no limit
+    (second review of 865afa851, M1).
+
+    ``goal_type`` is the goal's OWN type, and only for a goal that is the
+    node's own (_org_goal); a caller passes None for any other goal."""
+    if not is_revenue_goal_type(goal_type):
+        return None
+    try:
+        from core.autogen_config import model_family
+        from core.llm_outbound_logger import LANE_REVENUE
+        from integrations.agent_engine.budget_gate import CAPPED_FAMILY
+        from integrations.agent_engine.model_registry import model_registry
+        expert = model_registry.get_configured_expert(LANE_REVENUE)
+        if expert is None:
+            return None
+        config = expert.to_config_list()
+        model = config[0].get('model') if config else ''
+        if model_family(model) != CAPPED_FAMILY:
+            logger.warning("revenue goal (%s) runs on the node's own model: "
+                           "the configured expert %s is not in the capped "
+                           "family '%s', so no day cap would hold its spend",
+                           goal_type, model, CAPPED_FAMILY)
+            return None
+        host = _dispatch_provider_host(config)
+        if host:
+            from core.circuit_breaker import CircuitState, llm_provider_breaker
+            if llm_provider_breaker.state(host) == CircuitState.OPEN:
+                logger.info("revenue goal (%s) runs on the node's own model: "
+                            "the expert's provider %s is refusing the account",
+                            goal_type, host)
+                return None
+        return config
+    except Exception as e:
+        logger.warning("revenue goal (%s) runs on the node's own model: the "
+                       "configured expert could not be read (%s)",
+                       goal_type, type(e).__name__)
+        return None
+
+
+def _org_goal(goal, db=None) -> bool:
+    """Is ``goal`` the node's own work, which the owner's expert credits are
+    for: seeded by the node (it names no owner), or owned by the node's
+    owner (core.event_attribution.person_for, so an agent row the owner
+    owns counts as the owner's)?
+
+    The policy above REVENUE_GOAL_TYPES is for an ORG goal that earns.  Any
+    signed-in account can create a goal of an earning type (POST /api/goals
+    names it created_by), and the daemon dispatches every active goal
+    whoever owns it, so without this a stranger's goal would spend the
+    owner's day cap (second review of 865afa851, M2).  Measured on central
+    2026-11-03: all 299 earning goals name no owner."""
+    from core.event_attribution import goal_owner_user_id, person_for
+    from integrations.agent_engine.capability_setup import setup_owner
+    uid = goal_owner_user_id(goal)
+    if uid is None:
+        return True
+    owner = setup_owner()
+    return bool(owner) and person_for(uid, db) == owner
 
 
 def is_genuine_user_request(request_id) -> bool:
@@ -852,6 +953,8 @@ _PAUSED_FOR_THE_PERSON = (f'{_DEFERRED_PREFIX} paused between steps; a person '
 #: "the expert model did not finish it" by a turn the expert never ran.
 _HELD_FOR_ANOTHER_TURN = (f'{_DEFERRED_PREFIX} another turn of this '
                           f'conversation is running on a different model')
+_WAITING_FOR_THE_PERSON = (f'{_DEFERRED_PREFIX} the current step waits for the '
+                           f"person's reply to its question")
 
 
 def _failure_key(goal_id) -> tuple:
@@ -873,11 +976,16 @@ def _turn_failure(reply) -> Optional[str]:
     ('turn failed: ...').  core.agent_tools holds the one recogniser of
     each; worker_loop._after_response uses them the same way."""
     from core.agent_tools import (is_held_for_another_turn,
-                                  is_user_facing_error, is_user_pause)
+                                  is_user_facing_error, is_user_pause,
+                                  is_waiting_for_person)
     if is_user_pause(reply):
         return _PAUSED_FOR_THE_PERSON
     if is_held_for_another_turn(reply):
         return _HELD_FOR_ANOTHER_TURN
+    # The session's REUSE step waits for the person's reply (#161): the turn
+    # did not run it.  Held like the two above: no strike, no completion.
+    if is_waiting_for_person(reply):
+        return _WAITING_FOR_THE_PERSON
     if not is_user_facing_error(reply):
         return None
     return f'turn failed: {reply.strip()[:160]}'
@@ -1625,24 +1733,45 @@ def _dispatch_goal_turn(prompt: str, user_id: str, goal_id: str,
                          'restriction', goal_id, exc_info=True)
 
     # GUARDRAIL: full pre-dispatch gate (fail-closed: block if guardrails unavailable)
-    # Pass the goal dict + user_id so before_dispatch's goal-specific checks
+    # Pass the goal dict so before_dispatch's goal-specific checks
     # (constitutional, ethos, require_consent — #698) actually run on this
-    # path; agent_daemon.py:1268 passes goal.to_dict() the same way, and
-    # prompt-only here left those checks dormant for dispatch_goal.
+    # path; prompt-only here left those checks dormant for dispatch_goal.
+    #
+    # The requester the gate asks for consent is the goal's OWNER
+    # (core.event_attribution.goal_owner_user_id), the person agent_daemon's
+    # own gate names too, never this function's user_id: the daemon
+    # dispatches with agent['user_id'], an agent account, which can neither
+    # grant consent nor see the ask.  Measured on the owner's desktop
+    # 2026-11-04/05: every consent-flagged seeded goal was refused here 44
+    # times ("pending request filed") although the owner had granted
+    # data_access and the daemon's gate had passed them, and 25 agent
+    # accounts held pending requests nobody could answer.  A seeded goal
+    # names no owner, so the gate asks the boot owner (HEVOLVE_OWNER_USER_ID).
     _guard_goal_dict = None
+    _consent_requester = None
+    # The same read says whether the turn may use the owner's expert: the
+    # goal's OWN type, kept only for a goal that is the node's own
+    # (_org_goal).  The goal_type argument defaults to 'marketing', so a
+    # caller naming none would otherwise earn its turn the expert (second
+    # review of 865afa851, M2).  No row, or a row that cannot be read: None.
+    _expert_goal_type = None
     try:
         from integrations.social.models import db_session, AgentGoal
         with db_session(commit=False) as _gdb:
             _grow = _gdb.query(AgentGoal).filter_by(id=goal_id).first()
             if _grow is not None:
                 _guard_goal_dict = _grow.to_dict()
+                from core.event_attribution import goal_owner_user_id
+                _consent_requester = goal_owner_user_id(_grow)
+                if _org_goal(_grow, _gdb):
+                    _expert_goal_type = _grow.goal_type
     except Exception as _gerr:
         logger.debug(f"Goal row unavailable for guardrail checks "
                      f"({goal_id}): {_gerr}")
     try:
         from security.hive_guardrails import GuardrailEnforcer
         allowed, reason, prompt = GuardrailEnforcer.before_dispatch(
-            prompt, goal_dict=_guard_goal_dict, user_id=user_id)
+            prompt, goal_dict=_guard_goal_dict, user_id=_consent_requester)
         if not allowed:
             logger.warning(f"Dispatch blocked for {goal_type} goal {goal_id}: {reason}")
             return None
@@ -1704,6 +1833,15 @@ def _dispatch_goal_turn(prompt: str, user_id: str, goal_id: str,
         else:
             _why_here = ('no coordinator' if not coordinator
                          else 'no other active node')
+
+    # A goal that earns runs the turn it runs HERE on the configured expert
+    # while the owner's cap and the expert's provider allow
+    # (revenue_expert_config).  Chosen after the hive routing above, which
+    # stays exactly as it was (review of 865afa851, M2).  A caller that names
+    # its model (the daemon's escalation turn) keeps its own choice.  Only
+    # the node's own goals, by their own type (_expert_goal_type above).
+    if model_config is None:
+        model_config = revenue_expert_config(_expert_goal_type)
 
     # NUMERIC prompt_id (same format as hart_intelligence_entry._next_prompt_id)
     # so it passes the isdigit() check in the adapter and /chat handler.

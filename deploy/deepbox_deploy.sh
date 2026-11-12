@@ -320,7 +320,14 @@ echo "=== Build Docker image ==="
 # traffic, so it is moved (further down) after the new container
 # answers /status -- not by the build. Tagging :latest here meant a
 # broken build silently overwrote the one good image on the box.
-docker build --no-cache \
+#
+# --force-rm: this box builds with the legacy builder, which KEEPS a
+# failed step's container, and with it everything the step wrote.
+# Deploy 42864357071 (2026-11-10) died on "no space left on device" and
+# left a 7.05 GB pip-install container behind. The prune above cannot
+# reclaim it (an image a container uses is not prunable), so each failed
+# build left the next one less room.
+docker build --no-cache --force-rm \
   --build-arg GIT_SHA="$DEPLOY_COMMIT" \
   -t langchain_gpt:"$DEPLOY_COMMIT_SHORT" \
   .
@@ -476,6 +483,11 @@ fi
 echo "advertise URL: ${ADVERTISE_URL:-unset}"
 ADV_ARGS=""
 [ -n "$ADVERTISE_URL" ] && ADV_ARGS="-e HEVOLVE_BASE_URL=$ADVERTISE_URL"
+# The container's own log, bounded: at most 5 files of 200 MB. With no
+# size set it grew without limit, 9.4 GB in 11 days on central, measured
+# 2026-11-10 when the disk was full and the deploy could not build. The
+# rollback start below uses the same bound.
+LOG_ARGS="--log-driver json-file --log-opt max-size=200m --log-opt max-file=5"
 # Flywheel state (goals DB, prospects, node keys) must survive rebuilds.
 AD="${DEPLOY_AGENT_DATA_PATH}"; [ -z "$AD" ] && AD=/opt/hzai-LLM-Langchain-Chatbot-Agent/agent_data; sudo mkdir -p "$AD"
 
@@ -498,6 +510,7 @@ sudo docker run -d --name langchain --restart unless-stopped \
   --env-file .env \
   --env-file oauth.env \
   $ADV_ARGS \
+  $LOG_ARGS \
   -e HEVOLVE_MASTER_PRIVATE_KEY="$(sudo cat ${DEPLOY_MASTER_KEY_PATH})" \
   -e HARTOS_GIT_SHA="$DEPLOY_COMMIT" \
   -e HARTOS_IMAGE_TAG="$DEPLOY_COMMIT_SHORT" \
@@ -645,6 +658,7 @@ if [ -z "$STATUS_JSON" ]; then
        --env-file .env \
        --env-file oauth.env \
        $ADV_ARGS \
+       $LOG_ARGS \
        -e HEVOLVE_MASTER_PRIVATE_KEY="$(sudo cat ${DEPLOY_MASTER_KEY_PATH})" \
        -e HARTOS_GIT_SHA="${ROLLBACK_SHA:-$ROLLBACK_VERSION}" \
        -e HARTOS_IMAGE_TAG="$ROLLBACK_VERSION" \

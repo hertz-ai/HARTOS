@@ -280,6 +280,44 @@ def file_device_access_ask(db, owner_id: str, public_key: str, claims: dict) -> 
                "Allow it only if the phone is yours.",
         requester_name=name)
 
+
+def allowed_device_owner(token: str):
+    """This desktop's owner, when ``token`` is from a phone they allowed and
+    signed as them; else None.  Never files an ask (the API gate does, on
+    the phone's first call).
+
+    The person-ask door's answerer for a phone
+    (integrations.agent_engine.person_ask.answer_from_request).  The token
+    is checked here by verify_device_jwt, the gate's own check, and not read
+    off the gate's verdict on flask.g: Nunba runs this node's routes
+    in-process through test_client(), which carries the Authorization header
+    and nothing the gate set on g, so on a desktop the verdict never reached
+    the door (review of ec468c821, C1).
+
+    The grant is the owner's ("Allow it only if the phone is yours",
+    file_device_access_ask), so the phone speaks for that owner and nobody
+    else.  A token signed as any other user names nobody: its user_id is
+    whatever the phone signs (review of ec468c821, C2).
+    """
+    owner = (os.environ.get('HEVOLVE_OWNER_USER_ID') or '').strip()
+    if not token or not owner:
+        return None
+    from .models import db_session
+    try:
+        with db_session(commit=False) as db:
+            verdict = verify_device_jwt(db, token, owner)
+    except Exception:
+        logger.warning("device token check failed; it names nobody", exc_info=True)
+        return None
+    if verdict.get('status') != 'ok':
+        return None
+    signed_as = str((verdict.get('payload') or {}).get('user_id') or '')
+    if signed_as != owner:
+        logger.warning("device %s... signed as user %r, not this desktop's owner; "
+                       "it names nobody", verdict['public_key'][:16], signed_as)
+        return None
+    return owner
+
 def generate_token_pair(user_id: str, username: str, role: str = 'flat') -> dict:
     """Generate access + refresh token pair."""
     mgr = _get_jwt_manager()

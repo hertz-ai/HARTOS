@@ -36,6 +36,10 @@ _HARTOS = os.path.dirname(os.path.dirname(os.path.dirname(
 if _HARTOS not in sys.path:
     sys.path.insert(0, _HARTOS)
 
+# The lifted function names SEND_TOOL (since 31ec05d14); this file already
+# loads core.agent_tools through its patches, so the import costs nothing new.
+from hartos.lifecycle_hooks import SEND_TOOL  # noqa: E402
+
 _SRC = os.environ.get('HARTOS_REUSE_SRC') or os.path.join(
     _HARTOS, 'hartos', 'reuse_recipe.py')
 
@@ -74,6 +78,7 @@ class FitRunsWheneverTheSessionHasAgents(unittest.TestCase):
             'recipes': {},
             '_ctx_safe_log': MagicMock(),
             '_reuse_action_tool_names': lambda up, aid: [],
+            'SEND_TOOL': SEND_TOOL,
         }
         names = ['_attach_named_tools_for_action']
         try:
@@ -132,6 +137,7 @@ class FitRunsWheneverTheSessionHasAgents(unittest.TestCase):
             'recipes': {},
             '_ctx_safe_log': _log,
             '_reuse_action_tool_names': lambda up, aid: ['crawl4ai_crawl'],
+            'SEND_TOOL': SEND_TOOL,
         }
         src = _lift('_attach_named_tools_for_action')
         import sys as _sys

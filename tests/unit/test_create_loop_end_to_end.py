@@ -352,8 +352,8 @@ def create_env(tmp_path, monkeypatch, idle_desktop):
     script = _Script()
     real_create = cr.create_agents
 
-    def _create(user_id, task, prompt_id):
-        out = real_create(user_id, task, prompt_id)
+    def _create(user_id, task, prompt_id, autonomous=False):
+        out = real_create(user_id, task, prompt_id, autonomous=autonomous)
         group_chat, agents_object = out[3], out[6]
         script.gc = group_chat
         for key, fn in (('assistant', script.assistant),

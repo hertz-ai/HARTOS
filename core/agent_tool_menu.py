@@ -16,6 +16,10 @@ import re as _re
 
 tool_logger = logging.getLogger('tool_execution')
 
+#: The name the ask tool is registered under (integrations.agent_engine.
+#: person_ask.ask_person_tool), read by this menu and by every reply that tells
+#: the model to use it, so none of them can name a tool that is not there.
+ASK_PERSON_TOOL = 'ask_person'
 
 
 def register_dual(helper, executor, func, name: str, description: str):
@@ -80,7 +84,7 @@ MAIN_LEG_CORE_TOOLS = frozenset({
     # person_ask.  On the main leg because the step that needs the person is
     # a recipe action; like send_message_to_user it only puts something in
     # front of the person, and it refuses to ask for a secret.
-    'ask_person',
+    ASK_PERSON_TOOL,
 })
 
 # The closures the CREATE leg registers always-on, on top of

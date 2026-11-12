@@ -456,17 +456,63 @@ def block_for_user_input(user_prompt: str, action_id: int,
     return True
 
 
-def mark_action_waiting_for_user(user_prompt: str, action_id: int, reason: str) -> bool:
+def mark_action_waiting_for_user(user_prompt: str, action_id: int, reason: str,
+                                 flow=None, asked_in=None) -> bool:
     """Project an existing input dependency into both lifecycle authorities.
 
     The ledger is blocked first while the action is still in progress; then
     the canonical ActionState projection becomes ``PENDING``.  This preserves
     the existing ``input_required`` reason instead of creating a second queue
     or allowing the generic pending projection to relabel it as a dependency.
+
+    When a PERSON was asked (``asked_in`` is a genuine user request; None
+    reads this thread's request), the ask is recorded too
+    (record_ask_delivered), the one record of "this action waits for the
+    person's reply" that CREATE and REUSE both read (person_waits_on,
+    ledger_open_ask).  A daemon turn's wait asks nobody and records no ask:
+    _ask_for_help's park, the verifier hook and this function all leave a
+    task BLOCKED with input_required, and only the ask tells a person's wait
+    from a park (hartos-00's review of cb13208d2, items 1 and 4).
     """
     if not block_for_user_input(user_prompt, action_id, reason):
         return False
+    _record_the_persons_ask(user_prompt, action_id, flow, asked_in)
     return safe_set_state(user_prompt, action_id, ActionState.PENDING, reason)
+
+
+def _record_the_persons_ask(user_prompt: str, action_id: int, flow, asked_in) -> bool:
+    """record_ask_delivered for a wait a person was asked in, else nothing.
+
+    ``flow`` comes from the caller (CREATE's current flow, REUSE's task
+    flow).  Without one it falls back to the task's recipe_flow_id, which is
+    the flow the task was CREATED in: action_N is one ledger task across
+    flows, so in a later flow that value is stale, the ask is filed under the
+    earlier flow, and person_waits_on in the later flow does not find it.
+    That mismatch only ever re-asks the person; it never takes a wrong
+    answer."""
+    if asked_in is None:
+        try:
+            from hartos.threadlocal import thread_local_data
+            asked_in = thread_local_data.get_request_id()
+        except Exception:
+            asked_in = None
+    try:
+        from integrations.agent_engine.dispatch import is_genuine_user_request
+    except Exception:
+        return False
+    if not is_genuine_user_request(str(asked_in or '')):
+        return False
+    if flow is None:
+        ledger = _ledger_registry.get(user_prompt)
+        task = ledger.tasks.get(f"action_{action_id}") if ledger else None
+        flow = getattr(task, 'recipe_flow_id', None) or 0
+    if not record_ask_delivered(user_prompt, action_id, asked_in, None, flow):
+        logger.error(
+            "Could not record that the person was asked for action %s in %s: "
+            "the block holds, but after a restart their reply is not "
+            "recognised and they are asked again", action_id, user_prompt)
+        return False
+    return True
 
 
 def resume_blocked_action(user_prompt: str, action_id: int,
@@ -490,12 +536,25 @@ def resume_blocked_action(user_prompt: str, action_id: int,
     before = copy.deepcopy(task.__dict__)
     if not task.resume(reason):
         return False
-    evidence_items = None
     if evidence is not None:
         context = getattr(task, 'context', None)
         if isinstance(context, dict):
-            evidence_items = context.setdefault(evidence_key, [])
-            evidence_items.append(evidence)
+            # #159: `context` is part of Task.compute_data_hash, and the
+            # ledger seals that hash only in add_actions_to_ledger and
+            # update_task_context; ledger.save() does not.  Appending the
+            # person's answer straight into task.context and saving left the
+            # stored hash describing the task from BEFORE the answer, and the
+            # completion claim's verify_integrity then read the reply itself
+            # as corruption: live 2026-10-30 "[CLAIM REJECTED] ... data_hash
+            # mismatch" 21 times between 20:13 and 20:36 on four agents, each
+            # followed by the same question to the person again.  The ledger's
+            # own context setter carries the seal, so the evidence goes
+            # through it (in memory here; the one save below persists it).
+            new_context = dict(context)
+            items = list(new_context.get(evidence_key) or [])
+            items.append(evidence)
+            new_context[evidence_key] = items
+            ledger.update_task_context(task_id, new_context, defer_save=True)
     task.blocked_reason = None
     if ledger.save() is False:
         task.__dict__.clear()
@@ -522,20 +581,520 @@ def ledger_holds_no_block(user_prompt: str, action_id: int) -> bool:
             and task.status != _get_ledger_task_status().BLOCKED)
 
 
+#: The key under which the person's answer is recorded on the ledger task's
+#: context (record_user_answer, for CREATE's reply and REUSE's user_reply
+#: alike): the one durable record that a step stopped for the person and was
+#: answered.
+USER_INPUT_EVIDENCE_KEY = 'user_input_evidence'
+
+
+def _flow_index(flow):
+    try:
+        return int(flow)
+    except (TypeError, ValueError):
+        return flow
+
+
+def record_user_answer(user_prompt: str, action_id: int, answer: str,
+                       flow, request_id=None, sent_in=None) -> bool:
+    """Record that the person answered this action in this flow, on the
+    registered ledger task, through the ledger's own context setter so the
+    integrity seal holds (#159).
+
+    The ONE writer.  The create loop calls it once the wait is over, for a
+    durable resume and for a block the ledger never held alike:
+    block_for_user_input refuses a task that is not in progress, the reply
+    then releases the gate with no resume (live 2026-10-10, agent 54), and
+    without this record the next `completed` + `no` asked the same question
+    again.  Tagged with the flow because action_id restarts per flow while
+    the flow boundary keeps the ledger (create_action_with_ledger's reuse
+    branch; add_actions_to_ledger skips a task id it already holds), so a
+    later flow's action_N is the same task.  False when there is no ledger or
+    no such task.
+
+    ``request_id`` is the person's request whose turn posts the answer into
+    the chat (CREATE's gate); the entry keeps it, so a retry of that request
+    posting the same words again closes no question that request put out
+    (window_question; review of 328ad07d0, must-fix 1).  ``sent_in`` is the
+    request an answer kept unsaved came in, when a later request saved it
+    (create_recipe._keep_unsaved_answer); the entry keeps it beside
+    ``request_id``, so a late retry of it is no second answer either
+    (reply_closes_open_question; review of 9cd51ded9, finding a).  Recorded
+    under ``sent_in`` instead, the saving request's own retry posted the
+    words after the question its round asked and closed it, and its later
+    words were recorded as a second answer (review of b1fb02abd, must-fixes
+    1 and 2).  REUSE's reply, recorded by the verifier hook, carries
+    neither.
+
+    The answer closes the oldest open ask of this action in this flow
+    (ASK_DELIVERED_KEY) in the SAME context update and the same save: the
+    ask closes when, and only when, the answer is recorded.  A failed save
+    therefore leaves the ask open for the retry, and a reply the verifier
+    refused (no record) leaves it open for the next one."""
+    ledger = _ledger_registry.get(user_prompt)
+    task_id = f"action_{action_id}"
+    task = ledger.tasks.get(task_id) if ledger else None
+    if task is None:
+        logger.warning("Cannot record the person's answer: %s holds no task "
+                       "%s", user_prompt, task_id)
+        return False
+    before = dict(getattr(task, 'context', None) or {})
+    context = dict(before)
+    items = list(context.get(USER_INPUT_EVIDENCE_KEY) or [])
+    items.append({
+        'action_id': int(action_id),
+        'flow': _flow_index(flow),
+        'answer': str(answer),
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+    })
+    if request_id:
+        items[-1]['request_id'] = str(request_id)
+    if sent_in and str(sent_in) != str(request_id or ''):
+        items[-1]['sent_in'] = str(sent_in)
+    context[USER_INPUT_EVIDENCE_KEY] = items
+    asks = [dict(e) if isinstance(e, dict) else e
+            for e in (context.get(ASK_DELIVERED_KEY) or [])]
+    for entry in asks:
+        if _is_open_ask(entry, flow):
+            entry['answered'] = True
+            context[ASK_DELIVERED_KEY] = asks
+            break
+    if not ledger.update_task_context(task_id, context, defer_save=True):
+        return False
+    if ledger.save() is False:
+        # The write is not durable, so it is not a record: put the sealed
+        # context back the way resume_blocked_action restores its task, and
+        # let the caller keep the gate so the same answer can be retried
+        # (G3: an answer that lives only in memory must not clear the ask).
+        ledger.update_task_context(task_id, before, defer_save=True)
+        logger.error("Could not persist the person's answer for %s: ledger "
+                     "persistence failed; the gate stays", task_id)
+        return False
+    logger.info(f"Recorded the person's answer for {task_id} (flow {flow})")
+    return True
+
+
+def ledger_user_answered(user_prompt: str, action_id: int, flow) -> bool:
+    """Whether the person has answered this action in this flow
+    (record_user_answer).  One reader: CREATE's state_transition, through
+    create_recipe._completed_verdict_still_waits, asks whether a `completed`
+    + `no` verdict still has the person to hear from.  The trace bank does
+    not read it while the #160 stamp is held (a3820a8fe).  An expert's
+    resume (unblock_evidence) is not a person's answer; an entry without a
+    flow matches nothing."""
+    ledger = _ledger_registry.get(user_prompt)
+    task = ledger.tasks.get(f"action_{action_id}") if ledger else None
+    context = getattr(task, 'context', None) if task is not None else None
+    if not isinstance(context, dict):
+        return False
+    wanted = _flow_index(flow)
+    return any(isinstance(entry, dict) and entry.get('flow') == wanted
+               for entry in (context.get(USER_INPUT_EVIDENCE_KEY) or []))
+
+
+def recorded_answer_requests(user_prompt: str, action_id: int,
+                             flow=None) -> list:
+    """The person's answers recorded for this action (record_user_answer),
+    oldest first, each as (answer, the request whose turn carried it, None
+    when none was recorded): in ``flow``, or in any flow when it is None.
+    Blank answers are left out.
+
+    What window_asked reads to know a message in a step's window came from
+    the person.  The seat it was posted from does not say so: CREATE posts
+    every turn's text from the user proxy, a daemon tick's "Build the agent
+    now" too, and the model's "Noted." after that tick completed a step
+    whose question was still open (review of ec41bdbf6, P5).  Only a
+    genuine reply is recorded (the gate's is_genuine_user_request), so a
+    daemon, expert or visual turn's text is never among these."""
+    return [(str(entry.get('answer')),
+             str(entry['request_id']) if entry.get('request_id') else None)
+            for entry in _recorded_answer_entries(user_prompt, action_id, flow)]
+
+
+def _recorded_answer_entries(user_prompt: str, action_id: int,
+                             flow=None) -> list:
+    """The answer entries record_user_answer kept on this action's ledger
+    task, oldest first: in ``flow``, or in any flow when it is None.  Blank
+    answers are left out.  The walk recorded_answer_requests and
+    _requests_that_answered both read (ledger_user_answered keeps its own:
+    it counts a blank answer too)."""
+    ledger = _ledger_registry.get(user_prompt)
+    task = ledger.tasks.get(f"action_{action_id}") if ledger else None
+    context = getattr(task, 'context', None) if task is not None else None
+    if not isinstance(context, dict):
+        return []
+    wanted = None if flow is None else _flow_index(flow)
+    return [entry for entry in (context.get(USER_INPUT_EVIDENCE_KEY) or [])
+            if isinstance(entry, dict)
+            and (wanted is None or entry.get('flow') == wanted)
+            and str(entry.get('answer') or '').strip()]
+
+
+def _requests_that_answered(user_prompt: str, action_id: int) -> set:
+    """Every request that already gave this action an answer, in any flow:
+    the request each recorded answer's turn posted it in, and for an answer
+    kept unsaved first, the request it came in (record_user_answer's
+    ``sent_in``).  A retry of either is no second answer
+    (reply_closes_open_question)."""
+    found = set()
+    for entry in _recorded_answer_entries(user_prompt, action_id):
+        for key in ('request_id', 'sent_in'):
+            if entry.get(key):
+                found.add(str(entry[key]))
+    return found
+
+
+def recorded_answers(user_prompt: str, action_id: int, flow=None) -> list:
+    """The words of recorded_answer_requests alone, for the readers that
+    close a question on them (REUSE's scans, whose own words ride inside a
+    dispatch and close nothing)."""
+    return [answer for answer, _request in
+            recorded_answer_requests(user_prompt, action_id, flow)]
+
+
+def _carries_recorded_answer(content, answers) -> bool:
+    """``content`` holds one of ``answers`` as whole lines: the person's
+    recorded words as their turn posted them, alone, or after the words an
+    earlier unsaved answer owed the turn, one per line
+    (create_recipe._answer_for_this_turn).  An answer of several lines must
+    appear as the same run of lines.  Lines compare with surrounding spaces
+    ignored, as create_recipe._same_message compares a resend."""
+    def lines(text):
+        return [line.strip() for line in str(text or '').strip().splitlines()]
+    posted = lines(content)
+    for answer in answers or ():
+        wanted = lines(answer)
+        if wanted and any(posted[i:i + len(wanted)] == wanted
+                          for i in range(len(posted) - len(wanted) + 1)):
+            return True
+    return False
+
+
+def _answer_and_request(answer) -> tuple:
+    """One recorded answer as window_question reads it: (its words, the
+    request whose turn carried it).  A plain string is an answer whose
+    request is not known (recorded_answers, REUSE's scans): it closes every
+    question before it, as every answer did before requests were kept."""
+    if isinstance(answer, (tuple, list)) and len(answer) == 2:
+        words, request = answer
+        return str(words or ''), (str(request) if request else None)
+    return str(answer or ''), None
+
+
+def _receipt_request(body) -> Optional[str]:
+    """The request a send went out in, read off the send tool's own success
+    reply ("Message sent successfully to user with request_id: <id>",
+    SEND_DELIVERED_PREFIX).  CREATE's copy (create_recipe.
+    send_message_to_user1) writes the turn's request with '-intermediate'
+    after it; REUSE's writes it bare.  None when ``body`` is not a delivered
+    send; '' when it names no request."""
+    if not send_delivered(body):
+        return None
+    _, found, request_id = str(body).partition('with request_id:')
+    request_id = request_id.strip() if found else ''
+    if request_id.endswith('-intermediate'):
+        request_id = request_id[:-len('-intermediate')]
+    return request_id
+
+
+def _receipt_request_id(message) -> str:
+    """The request a delivered send in tool message ``message`` went out in
+    (_receipt_request).  Every result in one tool message comes from one
+    round of one turn, so any delivered one names it.  '' when none does."""
+    if not isinstance(message, dict):
+        return ''
+    responses = message.get('tool_responses')
+    bodies = ([r.get('content') for r in responses if isinstance(r, dict)]
+              if isinstance(responses, list) else [])
+    bodies.append(message.get('content'))
+    for body in bodies:
+        request_id = _receipt_request(body)
+        if request_id:
+            return request_id
+    return ''
+
+
+def step_open_question(user_prompt: str, action_id: int):
+    """The question ``action_id``'s window holds open in the session's
+    registered group chat, as (message index, the text sent, the request it
+    went out in), or None: window_question with the answers recorded for the
+    action in any flow, each with the request that carried it
+    (recorded_answer_requests; CREATE's ledger keeps one task per action id
+    across flows).
+
+    CREATE's one reader of "the step's question is still open":
+    derive_completion_evidence (no line in the window is the step's output
+    yet), create_recipe._completed_verdict_still_waits (a `completed` + `no`
+    still waits when the step asked again after the person's answer) and
+    reply_closes_open_question (the person's reply answers it)."""
+    group_chat = get_registered_groupchat(user_prompt)
+    if group_chat is None:
+        return None
+    messages = list(getattr(group_chat, 'messages', None) or [])
+    found = window_question(messages, action_id,
+                            recorded_answer_requests(user_prompt, action_id))
+    if found is None:
+        return None
+    index, text = found
+    return index, text, _receipt_request_id(messages[index])
+
+
+def reply_closes_open_question(user_prompt: str, action_id: int, text,
+                               request_id) -> bool:
+    """Whether the person's message ``text``, sent in their request
+    ``request_id``, answers the question ``action_id``'s window holds open
+    (step_open_question).  False for a blank message and for the asking
+    request's own retry: the request that asked is not its own answer, the
+    rule REUSE (_user_reply_is_the_evidence) and the held gate
+    (create_recipe._resume_prior_user_input_block, by the ask record) apply,
+    read here off the asking send's receipt because nothing recorded an ask
+    (the 10-19 web retry storm re-posts a request id with its words).  Any
+    later request answers it, whatever its words: a "yes" after an earlier
+    "yes" is an answer (review of c906283b6, must-fix 2: the words were
+    compared, and a person who said the same thing twice was not heard).
+    Also False when this request already gave the step its answer (a turn
+    refused before its words were posted, then retried, recorded it twice),
+    including an answer it sent that a later request saved (a kept answer's
+    late retry; _requests_that_answered), and when the chat's newest order
+    is another action's: a question left from an earlier order of the same
+    action id (flow 0's action 3 seen from flow 1 before its action 3 runs)
+    is no question of the current step (review of 328ad07d0).
+
+    The create loop takes such a reply into its gate when nothing holds the
+    step for the person (review of 65db06972, must-fix 3), so the one writer
+    records it: only a recorded answer closes a question (window_asked;
+    review of ec41bdbf6, P5)."""
+    if not str(text or '').strip():
+        return False
+    request_id = str(request_id or '')
+    if request_id and request_id in _requests_that_answered(user_prompt, action_id):
+        return False
+    group_chat = get_registered_groupchat(user_prompt)
+    messages = list(getattr(group_chat, 'messages', None) or [])
+    if latest_dispatch_before(messages, len(messages)) != action_id:
+        return False
+    question = step_open_question(user_prompt, action_id)
+    return question is not None and question[2] != request_id
+
+
+def person_waits_on(user_prompt: str, action_id: int, flow) -> bool:
+    """Whether this one action waits for the PERSON's reply in this flow: its
+    ledger task is BLOCKED with blocked_reason input_required AND it holds an
+    open ask in the flow (ledger_open_ask).  The one reader of that question
+    for CREATE (the reply after a restart, G5) and REUSE (_reuse_held_action).
+
+    The block alone does not say it: _ask_for_help's park, the verifier hook
+    and mark_action_waiting_for_user all write it, and only the last records
+    an ask, and only when a person was asked.  Asked of one action, never a
+    scan: the lowest blocked task answered action 2 with a reply meant for 3
+    (hartos-00's review of cb13208d2, item 5)."""
+    ledger = _ledger_registry.get(user_prompt)
+    task = ledger.tasks.get(f"action_{action_id}") if ledger else None
+    if task is None:
+        return False
+    if (getattr(task, 'status', None) != _get_ledger_task_status().BLOCKED
+            or getattr(task, 'blocked_reason', None) != 'input_required'):
+        return False
+    return ledger_open_ask(user_prompt, action_id, flow) is not None
+
+
+#: The key under which a delivered question is recorded on the action's
+#: ledger task (record_ask_delivered): REUSE's ask step when its question
+#: reaches the person, and mark_action_waiting_for_user when a person's turn
+#: asked.  One open entry per step and flow, closed when the person's answer
+#: is recorded (record_user_answer, same save).  Read by ledger_open_ask and
+#: person_waits_on.
+ASK_DELIVERED_KEY = 'ask_delivered'
+
+#: The group chat's own seats.  A message from one of them is pipeline text,
+#: never the person's reply (the seed the person's words ride in is posted by
+#: the user proxy, whatever name a resynced log gives it).
+_PIPELINE_SEATS = frozenset({'ChatInstructor', 'StatusVerifier', 'Assistant',
+                             'Helper', 'Executor'})
+
+#: The seat the person's words arrive from: CREATE's user proxy
+#: (create_recipe.create_agents, 'UserProxy') and REUSE's ('User').  In a
+#: native group log every seat's text is role 'user', so the role alone
+#: never says it came from the person.
+_PERSON_SEATS = frozenset({'UserProxy', 'User'})
+
+
+def _is_open_ask(entry, flow=None) -> bool:
+    """THE open-ask rule: an ask record that is neither answered nor
+    abandoned, in ``flow`` (any flow when None).  ledger_open_ask,
+    record_user_answer and _abandon_open_asks all read an ask through it
+    (hartos-00's review of 077e779b7, item 1: written out three times with
+    three rules, the answer closed an abandoned ask and left the fresh one
+    open)."""
+    return (isinstance(entry, dict)
+            and not entry.get('answered') and not entry.get('abandoned')
+            and (flow is None or entry.get('flow') == _flow_index(flow)))
+
+
+def ledger_open_ask(user_prompt: str, action_id: int, flow) -> Optional[dict]:
+    """The OLDEST open ask recorded for this action in this flow, or None.
+
+    Oldest, not latest: the reply turn's seed re-posts the step and the model
+    may send the question again, which would otherwise open a fresh ask under
+    the reply's own request id and the answer would never match (hartos-f9's
+    review, change 2).  record_ask_delivered opens no second ask while one is
+    open, so normally there is exactly one."""
+    ledger = _ledger_registry.get(user_prompt)
+    task = ledger.tasks.get(f"action_{action_id}") if ledger else None
+    context = getattr(task, 'context', None) if task is not None else None
+    if not isinstance(context, dict):
+        return None
+    for entry in (context.get(ASK_DELIVERED_KEY) or []):
+        if _is_open_ask(entry, flow):
+            return entry
+    return None
+
+
+def _abandon_open_asks(user_prompt: str, action_id: int) -> bool:
+    """Mark every open ask of this action abandoned, in any flow (_is_open_ask
+    with no flow: a give-up ends the step's question whatever flow raised
+    it), through the ledger's own context setter (the seal holds), when the
+    step gives up.  Best effort: a failed save is reverted and logged, never
+    raised into the state write that called it.  The ask then stays open
+    (review of 077e779b7, item 8): after a re-open it is the step's open ask
+    again, record_ask_delivered opens no second one beside it, and the
+    person's next answer closes it (the oldest open ask), so it never
+    outlives an answer, but the step is held on its old request id, via and
+    question until then."""
+    try:
+        ledger = _ledger_registry.get(user_prompt)
+        task_id = f"action_{action_id}"
+        task = ledger.tasks.get(task_id) if ledger else None
+        if task is None:
+            return False
+        before = dict(getattr(task, 'context', None) or {})
+        asks = [dict(e) if isinstance(e, dict) else e
+                for e in (before.get(ASK_DELIVERED_KEY) or [])]
+        changed = False
+        for entry in asks:
+            if _is_open_ask(entry):
+                entry['abandoned'] = True
+                changed = True
+        if not changed:
+            return True
+        context = dict(before)
+        context[ASK_DELIVERED_KEY] = asks
+        if not ledger.update_task_context(task_id, context, defer_save=True):
+            return False
+        if ledger.save() is False:
+            ledger.update_task_context(task_id, before, defer_save=True)
+            logger.error("Could not abandon the open ask of %s after it gave "
+                         "up: ledger persistence failed", task_id)
+            return False
+        logger.info(f"Abandoned the open ask of {task_id}: the step gave up")
+        return True
+    except Exception as exc:
+        logger.error("Abandoning the open ask of action %s in %s failed: %s",
+                     action_id, user_prompt, exc)
+        return False
+
+
+def record_ask_delivered(user_prompt: str, action_id: int, request_id,
+                         message_index, flow, via=None, question=None) -> bool:
+    """Record that this ask step's question reached the person in the turn
+    `request_id`, pointing at the send receipt or written question at
+    `message_index`.  One open ask per step and flow: while one is open this
+    is a no-op that still answers True.  Written through the ledger's own
+    context setter so the integrity seal holds (#159); False when there is no
+    ledger or task, or the save fails (the write is reverted).
+
+    ``via`` says how it reached the person: 'send' (a send_message_to_user
+    receipt that did not fail), 'reply' (the text the turn returned to them),
+    'written' (a written answer that was neither), None when the caller
+    knows no more (CREATE's wait).  Only 'send' and 'reply' let REUSE take
+    the reply in place of the step's send (hartos-00's review of c26ae7932,
+    item 1).  ``question`` is the text they were asked, which an id-less turn
+    on the held step gets back (item 4)."""
+    ledger = _ledger_registry.get(user_prompt)
+    task_id = f"action_{action_id}"
+    task = ledger.tasks.get(task_id) if ledger else None
+    if task is None:
+        return False
+    if ledger_open_ask(user_prompt, action_id, flow) is not None:
+        return True
+    before = dict(getattr(task, 'context', None) or {})
+    context = dict(before)
+    items = list(context.get(ASK_DELIVERED_KEY) or [])
+    items.append({
+        'action_id': int(action_id),
+        'flow': _flow_index(flow),
+        'request_id': str(request_id or ''),
+        'message_index': message_index,
+        'via': via,
+        'question': str(question)[:1000] if question else None,
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+        'answered': False,
+    })
+    context[ASK_DELIVERED_KEY] = items
+    if not ledger.update_task_context(task_id, context, defer_save=True):
+        return False
+    if ledger.save() is False:
+        ledger.update_task_context(task_id, before, defer_save=True)
+        logger.error("Could not persist the ask record for %s: ledger "
+                     "persistence failed", task_id)
+        return False
+    logger.info(f"Recorded the ask of {task_id} (flow {flow}, request {request_id})")
+    return True
+
+
+def _user_reply_is_the_evidence(user_prompt: str, action_id: int, evidence: dict,
+                                message: dict, agent) -> bool:
+    """Whether a `user_reply` receipt is the person's answer to this step.
+
+    The reply never completes a step by itself: the verifier's `completed`
+    brought the caller here, and this only decides whether the cited reply
+    may stand as that completion's evidence (#161; hartos-f9's contract).
+    Four things have to hold.  The reply is non-empty (the seed's marker is
+    always there, so the captured words are checked, not the message).  It
+    came in a GENUINE user request (integrations.agent_engine.dispatch.
+    is_genuine_user_request, the sole authority: a daemon or timer turn is a
+    later request on the same session and an empty id is a standalone or
+    WhatsApp turn; both hold the step rather than close it).  The step has an
+    open ask recorded in an EARLIER request than the reply's (the 10-19 web
+    retry storm re-posts the same request id, so a retried first message is
+    not an answer).  And the step's words name no tool other than
+    send_message_to_user: a 'no' step that names another tool still needs
+    that tool's receipt, or "confirm, then pay" would close on the reply with
+    the tool unrun; the ask's own send is the one tool a reply may stand in
+    for."""
+    reply = str(evidence.get('reply') or '').strip()
+    request_id = str(evidence.get('request_id') or '')
+    if not reply or agent is not None:
+        return False
+    if (message.get('role') != 'user'
+            or str(message.get('name') or '') in _PIPELINE_SEATS):
+        return False
+    try:
+        from integrations.agent_engine.dispatch import is_genuine_user_request
+    except Exception:
+        return False
+    if not is_genuine_user_request(request_id):
+        logger.info("[REUSE-WAIT] action %s in %s: request %r is not a "
+                    "person's turn, so its words are not the reply (standalone "
+                    "and WhatsApp turns carry no id, #46)", action_id,
+                    user_prompt, request_id)
+        return False
+    ask = ledger_open_ask(user_prompt, action_id, evidence.get('flow'))
+    if ask is None or str(ask.get('request_id') or '') == request_id:
+        return False
+    _text, named = _tools_this_action_names(user_prompt, action_id)
+    return not (set(named) - {SEND_TOOL})
+
+
 def resume_from_user_input(user_prompt: str, action_id: int,
-                           reason: str = "User responded",
-                           answer: Optional[str] = None) -> bool:
-    """Resume a blocked task with evidence from a genuine user turn."""
-    evidence = None
-    if answer is not None:
-        evidence = {
-            'action_id': action_id,
-            'answer': str(answer),
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-        }
-    return resume_blocked_action(
-        user_prompt, action_id, reason, evidence=evidence,
-        evidence_key='user_input_evidence')
+                           reason: str = "User responded") -> bool:
+    """Resume a task the gate blocked for the person, through the one
+    validated BLOCKED -> IN_PROGRESS edge.  The answer itself is recorded by
+    record_user_answer, the create loop's one writer, tagged with the flow it
+    answers; an `answer` argument here used to be a second writer whose
+    entries carried no flow, so ledger_user_answered ignored them
+    (hartos-f9's review of 94354c536, G7)."""
+    return resume_blocked_action(user_prompt, action_id, reason)
 
 # Add new states to ActionState enum:
 class FlowState(Enum):
@@ -956,6 +1515,13 @@ def set_action_state(user_prompt: str, action_id: int, state: ActionState,
             action_states[user_prompt] = {}
         action_states[user_prompt][action_id] = state
     logger.info(f"[TARGET] Action {action_id}: {current_state.value} → {state.value} ({reason})")
+
+    # A step that gave up asks nobody any more: its open ask is abandoned, or
+    # the walk's retry of the step would read the person's next words as the
+    # answer to a question from before the give-up (hartos-00's review of
+    # c26ae7932, item 2).
+    if state == ActionState.GAVE_UP:
+        _abandon_open_asks(user_prompt, action_id)
 
     # Advisory consent check — log when data_access consent is missing (never blocks)
     if state == ActionState.IN_PROGRESS:
@@ -1565,6 +2131,203 @@ def tool_call_names(msg_lists) -> Dict[str, str]:
     return out
 
 
+#: The send the person reads; its expects_reply argument says whether it asked
+#: them something (core/agent_tools.py send_message_to_user).
+SEND_TOOL = 'send_message_to_user'
+
+
+def _send_call_args(messages, call_id) -> Optional[dict]:
+    """The arguments of the send_message_to_user call ``call_id``, read off
+    the PROPOSING message's tool_calls (joined by call id as tool_call_names
+    joins the function), or None when the call is not a send or cannot be
+    read."""
+    import json
+    for m in (messages or []):
+        if not isinstance(m, dict):
+            continue
+        for tc in (m.get('tool_calls') or []):
+            if (tc or {}).get('id') != call_id:
+                continue
+            fn = (tc or {}).get('function') or {}
+            if fn.get('name') != SEND_TOOL:
+                return None
+            args = fn.get('arguments')
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    return None
+            return args if isinstance(args, dict) else None
+    return None
+
+
+def send_expects_reply(messages, call_id) -> Optional[bool]:
+    """What a send_message_to_user call declared: True (it asks the person
+    something), False (it only tells them), None when it declared nothing (a
+    call made before the argument existed).  The act decides, never the
+    words.  A JSON string 'true'/'false' is read as its value."""
+    value = (_send_call_args(messages, call_id) or {}).get('expects_reply')
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in ('true', 'false'):
+        return value.strip().lower() == 'true'
+    return None
+
+
+def sent_text(messages, call_id) -> Optional[str]:
+    """The ``text`` a send_message_to_user call carried to the person, or
+    None."""
+    text = (_send_call_args(messages, call_id) or {}).get('text')
+    return text if isinstance(text, str) else None
+
+
+#: The send tool's own success reply, from both send_message_to_user1
+#: copies (create_recipe.py, reuse_recipe.py): "Message sent successfully to
+#: user with request_id: ...".  Every other reply reached nobody: "Failed to
+#: send message to user ...", "Message directed to @x agent, not sending to
+#: user", "... its delivery was not confirmed".
+SEND_DELIVERED_PREFIX = 'Message sent successfully to user'
+
+
+def send_delivered(body) -> bool:
+    """The send's result says the person got it: the tool's own success
+    reply and nothing else.  hartos-00's review of 476bbd5d8 (critical):
+    failure was judged by tool_reply_failed, which misses the tool's own
+    non-delivery replies, so a send that reached nobody completed the step
+    and "Failed to send message ..." was promoted as a verified success."""
+    return str(body or '').strip().startswith(SEND_DELIVERED_PREFIX)
+
+
+def delivered_text(messages, call_id, body) -> Optional[str]:
+    """The text a send delivered as the step's output, or None: its result
+    is the tool's own success reply (send_delivered) and its text is written
+    work by the rule a written answer is held to (written_text_is_answer),
+    so an empty send or a send of ``{"status": "completed"}`` is no output
+    (hartos-00's review of 476bbd5d8, Medium).  Whether it asked is
+    send_is_ask's question, asked separately."""
+    if not send_delivered(body):
+        return None
+    text = sent_text(messages, call_id)
+    return text if written_text_is_answer(text) else None
+
+
+def window_asked(messages, action_id, answers=()) -> bool:
+    """``action_id``'s dispatch window in ``messages`` holds a question that
+    reached the person (a delivered send that asks, send_is_ask): the action
+    waits for their answer, so no line written after it is the action's
+    output.  hartos-00's review of 7043d635e: on a daemon tick a step that
+    names no tool asked, then completed on the model's next line ("Noted.").
+    Newest first; the first result outside the window ends the search.
+
+    The person's answer closes every question before it, so a line written
+    after the answer is the action's output again (review of 31ec05d14,
+    finding 3: a step that asked, was answered and then wrote its lesson
+    lost the lesson).  The answer is a message from their seat
+    (_PERSON_SEATS), not a dispatch, that carries one of ``answers``, the
+    answers recorded for this action (recorded_answers).  The seat alone is
+    not the person: CREATE posts every turn's text from it, daemon ticks
+    included, and a tick's "Build the agent now" closed the question so the
+    model's "Noted." became the step's output (review of ec41bdbf6, P5).
+    With no recorded answer nothing closes: a step whose question was never
+    held keeps it open until the create loop records the person's reply
+    (reply_closes_open_question), and with no reply ends GAVE_UP rather than
+    completing on a non-answer.  An answer known with the request that
+    carried it (recorded_answer_requests) never closes a question that same
+    request put out: a retried request posts its words again after the
+    question its first round asked (review of 328ad07d0, must-fix 1).  A
+    message counts toward the newest recorded answer with its words only: a
+    person who said "yes" twice, then a retry of the second request, is not
+    also the first request's answer (review of 9cd51ded9, must-fix 1).  A
+    REUSE turn's words ride inside its dispatch
+    (reuse_recipe._reuse_seed_message), which closes nothing either way."""
+    return window_question(messages, action_id, answers) is not None
+
+
+def window_question(messages, action_id, answers=()):
+    """The open question window_asked finds, as (message index, the text
+    sent), or None.  The one scan: window_asked reads it, and
+    step_open_question reads the request it went out in."""
+    names = tool_call_names([messages or []])
+    answers = [_answer_and_request(answer) for answer in (answers or ())]
+    # The requests whose answers were posted after the point the scan has
+    # reached (it runs newest first): each closes the questions before it
+    # that another request put out.
+    answered_in = []
+    for index in range(len(messages or []) - 1, -1, -1):
+        msg = messages[index]
+        if not isinstance(msg, dict):
+            continue
+        if (msg.get('role') == 'user'
+                and str(msg.get('name') or '') in _PERSON_SEATS
+                and dispatch_action_id(msg.get('content')) is None):
+            # The newest recorded answer with these words only: a retry of
+            # the person's second "yes" is not their first one too, whose
+            # request would close the question the second's request put out
+            # (review of 9cd51ded9, must-fix 1).
+            carried = [request for words, request in answers
+                       if _carries_recorded_answer(msg.get('content'), [words])][-1:]
+            if None in carried:
+                return None
+            answered_in += carried
+            continue
+        if msg.get('role') != 'tool':
+            continue
+        if latest_dispatch_before(messages, index + 1) != action_id:
+            break
+        responses = msg.get('tool_responses')
+        for result in (responses if isinstance(responses, list) and responses
+                       else [msg]):
+            if not isinstance(result, dict):
+                continue
+            call_id = result.get('tool_call_id') or msg.get('tool_call_id')
+            body = result.get('content')
+            if body is None:
+                body = msg.get('content')
+            if (names.get(call_id) == SEND_TOOL and send_delivered(body)
+                    and send_is_ask(messages, call_id)):
+                if any(request != _receipt_request(body)
+                       for request in answered_in):
+                    return None
+                return index, str(sent_text(messages, call_id) or '')
+    return None
+
+
+def verdict_waits_on_person(verdict) -> bool:
+    """This run's verdict says the step waits on the person: status 'pending',
+    or a can_perform_without_user_input autonomy_needs_user reads as 'no'."""
+    if not isinstance(verdict, dict):
+        return False
+    return (str(verdict.get('status') or '').strip().lower() == 'pending'
+            or autonomy_needs_user(verdict.get('can_perform_without_user_input')))
+
+
+def send_is_ask(messages, call_id, verdict=None) -> bool:
+    """THE ONE RULE for whether a send asked the person something, read by
+    every reader of a send (the gate's _work_results, user_output_receipt,
+    REUSE's ask finder and named-tool receipt).  The owner on 476bbd5d8:
+    "when the output is a question to get the job done, how can that be
+    counted as that step is done?"  Live 2026-10-31 17:13 IST, agent
+    45620673143 action 3: its only output was a send ending "Ready to
+    begin?".  An ask is never a step's receipt; the person's answer is
+    (kind user_reply).
+
+    A send is an ask unless it declared expects_reply=false, and a declared
+    delivery is an ask too when this run's verdict says the step waits on the
+    person.  Undeclared counts as an ask: the fail-safe is a person
+    answering "ok", never a step closed on its own question."""
+    return (send_expects_reply(messages, call_id) is not False
+            or verdict_waits_on_person(verdict))
+
+
+def action_in_progress(user_prompt) -> Optional[int]:
+    """The action this session is working on (IN_PROGRESS or awaiting its
+    verdict), or None; for the per-send log line."""
+    for aid, st in (action_states.get(user_prompt) or {}).items():
+        if st in (ActionState.IN_PROGRESS, ActionState.STATUS_VERIFICATION_REQUESTED):
+            return aid
+    return None
+
+
 def action_own_text(action) -> str:
     """The words one action says: an action dict's own 'action' text, a string
     as it is, '' for None.  The text action_named_tools reads.
@@ -1776,17 +2539,20 @@ def _receipt_is_real_work(user_prompt: str, action_id: int, messages,
     """
     action_text, named = _tools_this_action_names(user_prompt, action_id)
     return any(True for _ in _work_results(
-        message, tool_call_names([messages]), action_text, named))
+        message, tool_call_names([messages]), action_text, named, messages))
 
 
 def _work_results(message: dict, names: Dict[str, str], action_text: str,
-                  named):
+                  named, messages=None):
     """The tool name of each result in a role='tool' ``message`` that is the
     action's work, by _receipt_is_real_work's rule (its docstring gives the
-    four exclusions); None for a result whose function cannot be resolved,
-    which only an action naming no tool accepts.  ``names`` is
-    tool_call_names of the message's list; ``action_text`` and ``named`` are
-    _tools_this_action_names of the action."""
+    four exclusions), and never a send that asked the person something
+    (send_is_ask, read in ``messages``, the message's list): a question is
+    not the action done, whatever the verifier wrote.  None for a result
+    whose function cannot be resolved, which only an action naming no tool
+    accepts.  ``names`` is tool_call_names of the message's list;
+    ``action_text`` and ``named`` are _tools_this_action_names of the
+    action."""
     responses = message.get('tool_responses')
     results = responses if isinstance(responses, list) and responses else [message]
     for result in results:
@@ -1798,7 +2564,13 @@ def _work_results(message: dict, names: Dict[str, str], action_text: str,
         if (not str(body or '').strip() or tool_reply_failed(body)
                 or HISTORICAL_TOOL_PLACEHOLDER in str(body)):
             continue
-        name = names.get(result.get('tool_call_id') or message.get('tool_call_id'))
+        call_id = result.get('tool_call_id') or message.get('tool_call_id')
+        name = names.get(call_id)
+        if name == SEND_TOOL and (send_is_ask(messages, call_id)
+                                  or delivered_text(messages, call_id, body) is None):
+            # An ask is not the action done; a send that reached nobody, or
+            # carried no written work, is no work at all (delivered_text).
+            continue
         if name in BOOKKEEPING_TOOLS and name.lower() not in action_text:
             continue
         if named and name not in named:
@@ -1818,7 +2590,7 @@ def _verifier_completion_has_conversation_evidence(
     if not isinstance(evidence, dict):
         return False
     kind = evidence.get('kind')
-    if kind not in ('tool_receipt', 'user_visible_result'):
+    if kind not in ('tool_receipt', 'user_visible_result', 'user_reply'):
         return False
     resolved = resolve_receipt(user_prompt, evidence)
     if resolved is None:
@@ -1833,6 +2605,11 @@ def _verifier_completion_has_conversation_evidence(
     # (which also carries older turns) is held to the same rule as the log.
     if latest_dispatch_before(messages, index + 1) != action_id:
         return False
+    if kind == 'user_reply':
+        # The person's answer to an ask step, cited at the seed that carried
+        # it (#161).  _user_reply_is_the_evidence holds the rules.
+        return _user_reply_is_the_evidence(user_prompt, action_id, evidence,
+                                           message, agent)
     if kind == 'tool_receipt':
         return (message.get('role') == 'tool'
                 and _receipt_is_real_work(user_prompt, action_id, messages,
@@ -1867,7 +2644,8 @@ def tool_result_is_action_work(user_prompt: str, action_id: int,
     Assistant, as every action did before.
 
     False for an action that names no tool: it is done by its written
-    answer, and a tool reply in its window is not its receipt
+    answer, or by the send that delivered it (user_output_receipt), which the
+    verdict path finds; no tool reply in its window is its receipt here
     (derive_completion_evidence splits the same way).  Never raises: it sits
     on the speaker-selection path."""
     try:
@@ -1884,7 +2662,7 @@ def tool_result_is_action_work(user_prompt: str, action_id: int,
         for i, msg in enumerate(messages[:index + 1]):
             if (isinstance(msg, dict) and msg.get('role') == 'tool'
                     and latest_dispatch_before(messages, i + 1) == action_id):
-                done.update(_work_results(msg, names, action_text, named))
+                done.update(_work_results(msg, names, action_text, named, messages))
         return set(named) <= done
     except Exception:
         logger.warning(
@@ -2013,7 +2791,44 @@ def is_written_answer(message) -> bool:
     if not (isinstance(message, dict) and message.get('name') == 'Assistant'
             and message.get('role') in _ASSISTANT_WRITTEN_ROLES):
         return False
-    text = str(message.get('content') or '').strip()
+    return written_text_is_answer(message.get('content'))
+
+
+def receipt_result_text(resolved) -> str:
+    """What a receipt (resolve_receipt's tuple) says the step produced: for
+    the send that delivered the step's output, the words the person got;
+    for any other receipt its content.  hartos-00's review of 476bbd5d8
+    (Medium): the tool's "Message sent successfully ..." became the step's
+    result and the world model's record, and with a send that reached nobody
+    "Failed to send message ..." was promoted as a verified success."""
+    if not resolved:
+        return ''
+    messages, _index, message, _agent = resolved
+    if isinstance(message, dict) and message.get('role') == 'tool':
+        names = tool_call_names([messages])
+        responses = message.get('tool_responses')
+        for result in (responses if isinstance(responses, list) and responses
+                       else [message]):
+            if not isinstance(result, dict):
+                continue
+            call_id = result.get('tool_call_id') or message.get('tool_call_id')
+            if names.get(call_id) != SEND_TOOL:
+                continue
+            body = result.get('content')
+            if body is None:
+                body = message.get('content')
+            text = delivered_text(messages, call_id, body)
+            if text is not None:
+                return text
+    return str((message or {}).get('content') or '')
+
+
+def written_text_is_answer(text) -> bool:
+    """The words alone, by is_written_answer's rule: not empty, not
+    TERMINATE, not a dispatch, not routing to another agent, not unexecuted
+    tool-call markup, not a control JSON.  The one judgment for words the
+    Assistant wrote and for words it sent the person (delivered_text)."""
+    text = str(text or '').strip()
     low = text.lower()
     if (not text or text == 'TERMINATE' or _DISPATCH_MARKER.match(text)
             or any(mention in low for mention in _ROUTING_MENTIONS)
@@ -2059,8 +2874,107 @@ def _derive_written_answer(user_prompt: str, action_id: int,
     return best
 
 
-def derive_completion_evidence(user_prompt: str,
-                               action_id: int) -> Optional[dict]:
+def user_output_receipt(user_prompt: str, action_id: int, group_chat,
+                        seen=(), waits_on_person=False) -> Optional[dict]:
+    """The send that delivered a no-tool action's output to the person, as
+    evidence, or None.  The one rule both projectors read after their
+    written-answer miss (derive_completion_evidence for CREATE,
+    reuse_recipe._reuse_completion_evidence for REUSE).
+
+    None for an action that waits on the person (``waits_on_person``: the
+    verdict's can_perform_without_user_input in CREATE, the recipe's flag in
+    REUSE, both read by autonomy_needs_user): its send is its question, and a
+    question is not the step done.  Each path supplies the fact from where it
+    holds it, so a banked step is not "done by its send" in CREATE and an ask
+    in REUSE.
+
+    A no-tool action is done by its written answer, or by the
+    send_message_to_user call that put that answer in front of the person,
+    and by no other tool's result.  Live 2026-10-31 17:13 IST, desktop
+    4B, agent 45620673143 action 3 ("Confirm user's topic focus and preferred
+    detail level before proceeding with guided discovery."): the Assistant's
+    output was one send, answered "Message sent successfully ...", inside
+    the action's window; no written answer existed, so the action GAVE_UP and
+    action 4 was never reached.  A search or a note saved to memory still
+    does not complete "write X" (owner ruling 2026-09-14: never record a
+    completion that did not happen).
+
+    Newest first, in the group log and then each participant's buffer
+    (evidence_sources): a result of send_message_to_user (resolved on its
+    proposal, tool_call_names) that is not failed, not the placeholder, and
+    whose call id is not in ``seen`` (REUSE's watermark of the calls present
+    at the dispatch).  Those are read per result, because an aggregate
+    message the gate accepts for any one result may carry a failed send
+    beside another tool's reply.  The candidate then faces the completion
+    gate, which holds it to the action's own dispatch window in its own list,
+    as every derived receipt does; a list's search ends at its first result
+    outside that window (the gate's latest_dispatch_before).  The gate also
+    refuses a send for an action that names a tool (_receipt_is_real_work),
+    whose receipt is that tool's work; both callers reach this only for an
+    action that names none.  Never raises: it sits on the verdict path.
+    """
+    try:
+        if waits_on_person:
+            return None
+        seen = set(seen or ())
+        for source, msgs in evidence_sources(
+                group_chat, getattr(group_chat, 'agents', None)):
+            if not isinstance(msgs, list):
+                continue
+            names = tool_call_names([msgs])
+            for index in range(len(msgs) - 1, -1, -1):
+                msg = msgs[index]
+                if not isinstance(msg, dict) or msg.get('role') != 'tool':
+                    continue
+                # Newest first, the action's window is the list's tail: the
+                # first result outside it ends this list's search, so a long
+                # session is not one gate call per older send (hartos-00).
+                if latest_dispatch_before(msgs, index + 1) != action_id:
+                    break
+                responses = msg.get('tool_responses')
+                for result in (responses if isinstance(responses, list)
+                               and responses else [msg]):
+                    if not isinstance(result, dict):
+                        continue
+                    call_id = result.get('tool_call_id') or msg.get('tool_call_id')
+                    # The aggregate's content only for a result that carries
+                    # none at all, as _work_results reads it: an empty result
+                    # never borrows its neighbour's "sent" (hartos-00's review
+                    # of 476bbd5d8).
+                    body = result.get('content')
+                    if body is None:
+                        body = msg.get('content')
+                    body = str(body or '')
+                    if (names.get(call_id) != SEND_TOOL
+                            or send_is_ask(msgs, call_id)
+                            or call_id in seen
+                            or delivered_text(msgs, call_id, body) is None):
+                        continue
+                    candidate = {**(source or {}), 'message_index': index,
+                                 'kind': 'tool_receipt'}
+                    if _verifier_completion_has_conversation_evidence(
+                            user_prompt, action_id, {'evidence': candidate}):
+                        logger.info(
+                            "[COMPLETION-RECEIPT] action %s in %s: no written "
+                            "answer; the send that delivered its output (call "
+                            "%s, %s message %s) stands in", action_id,
+                            user_prompt, call_id,
+                            'group log' if source is None else
+                            f"{source['agent']}->{source['peer']} buffer",
+                            index)
+                        return candidate
+        logger.warning(
+            "[COMPLETION-RECEIPT] action %s in %s: no written answer and no "
+            "send of its output in its window", action_id, user_prompt)
+    except Exception:
+        logger.warning(
+            "[COMPLETION-RECEIPT] action %s in %s: the send search failed",
+            action_id, user_prompt, exc_info=True)
+    return None
+
+
+def derive_completion_evidence(user_prompt: str, action_id: int,
+                               waits_on_person=False) -> Optional[dict]:
     """The action's own tool receipt, found by the pipeline.
 
     A completion has to cite a result from this action's dispatch window
@@ -2080,11 +2994,15 @@ def derive_completion_evidence(user_prompt: str,
     no receipt here either.  Returns the evidence in the shape resolve_receipt
     reads, or None.
 
-    An action that names no tool is done by its WRITTEN ANSWER, not by a tool
-    reply (_derive_written_answer): measured live on the same 4B 2026-10-06
-    01:11, agent 54 as one prose action ("Teach exactly one next step ...
-    Write the lesson as your reply to the learner") -- the Assistant wrote a
-    good lesson and the verdict that cited the dispatch instead was refused.
+    An action that names no tool is done by its WRITTEN ANSWER
+    (_derive_written_answer), or else by the send that delivered its output
+    to the person (user_output_receipt; not when the verdict says the action
+    waits on the person, ``waits_on_person``, since that send is its
+    question), and by no other tool reply: measured
+    live on the same 4B 2026-10-06 01:11, agent 54 as one prose action
+    ("Teach exactly one next step ... Write the lesson as your reply to the
+    learner") -- the Assistant wrote a good lesson and the verdict that cited
+    the dispatch instead was refused.
 
     It never raises -- it sits on the verdict path -- and a miss says what
     was looked at.
@@ -2094,10 +3012,17 @@ def derive_completion_evidence(user_prompt: str,
         if group_chat is None:
             return None
         # REUSE splits the same way: a tool receipt for an action that names a
-        # tool, the written answer for one that does not.  A tool reply in a
-        # prose action's window is not its receipt.
+        # tool, the written answer (or the send that delivered it) for one
+        # that does not.  No other tool reply in a prose action's window is
+        # its receipt.
         if not _tools_this_action_names(user_prompt, action_id)[1]:
-            return _derive_written_answer(user_prompt, action_id, group_chat)
+            # A question out and no answer yet: nothing in the window is the
+            # action's output (step_open_question); its answer will be.
+            if step_open_question(user_prompt, action_id) is not None:
+                return None
+            return (_derive_written_answer(user_prompt, action_id, group_chat)
+                    or user_output_receipt(user_prompt, action_id, group_chat,
+                                           waits_on_person=waits_on_person))
         looked = []
         for source, msgs in evidence_sources(
                 group_chat, getattr(group_chat, 'agents', None)):
@@ -2266,7 +3191,7 @@ def _promote_verified_outcome(user_prompt: str, action_id: int,
             prompt_id=prompt_id or user_prompt,
             prompt=str(getattr(task, 'description', '') or
                        f'Complete action {action_id}'),
-            response=str(receipt.get('content') or ''),
+            response=receipt_result_text(resolved),
             model_id=str(receipt.get('name') or 'verified-agent'),
             goal_id=(context.get('goal_id') or context.get('parent_task_id')),
             verification={
@@ -2297,6 +3222,44 @@ def _flow_has_action(user_prompt: str, action_id: int) -> bool:
         getattr(get_registered_ledger(user_prompt), 'tasks', None) or {})
 
 
+def claimed_action_int(claimed_action_id) -> Optional[int]:
+    """The action id a verdict names, as an int; None when it names none an
+    int can hold: missing, words ('action_1'), 'inf', '1e999', 'nan'.
+
+    The one parse of a verdict's action_id, for settled_action_id and
+    verdict_names_another_action.  int(float(x)) raised OverflowError on
+    'inf' and '1e999' out of both (task #168, review of 1ca1fbaa5)."""
+    try:
+        return int(float(claimed_action_id))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def verdict_names_another_action(user_prompt: str, action_id,
+                                 claimed_action_id):
+    """The other action of this flow a verdict names, or None.
+
+    A verdict completes only the action it names (the rule and its live
+    cases are on commit_verified_action_completion, which asks this).  None
+    when the verdict names no id, names the posted action, names an id the
+    flow does not have, or names something no int can hold ('inf',
+    '1e999', 'nan': a number the verifier cannot have meant as an action).
+    One answer for both readers: the gate that refuses the completion and
+    reuse's walk, which asks the verifier again instead of ending the turn
+    on the refusal.
+    """
+    claimed = claimed_action_int(claimed_action_id)
+    try:
+        posted = int(action_id)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if claimed is None:
+        return None
+    if claimed != posted and _flow_has_action(user_prompt, claimed):
+        return claimed
+    return None
+
+
 def commit_verified_action_completion(user_prompt: str, action_id: int,
                                       evidence: dict,
                                       reason: str = 'verified complete',
@@ -2324,17 +3287,13 @@ def commit_verified_action_completion(user_prompt: str, action_id: int,
     verdict that names no action_id, or one the flow does not have, is not
     contradicting anything.
     """
-    if claimed_action_id is not None:
-        try:
-            _claimed = int(float(claimed_action_id))
-        except (TypeError, ValueError):
-            _claimed = None
-        if (_claimed is not None and _claimed != int(action_id)
-                and _flow_has_action(user_prompt, _claimed)):
-            logger.warning(
-                "Refusing completion of action %s in %s: the verdict names "
-                "action %s", action_id, user_prompt, _claimed)
-            return False
+    _other = verdict_names_another_action(user_prompt, action_id,
+                                          claimed_action_id)
+    if _other is not None:
+        logger.warning(
+            "Refusing completion of action %s in %s: the verdict names "
+            "action %s", action_id, user_prompt, _other)
+        return False
     if get_action_state(user_prompt, action_id) != \
             ActionState.STATUS_VERIFICATION_REQUESTED:
         logger.warning(
@@ -2357,19 +3316,41 @@ def commit_verified_action_completion(user_prompt: str, action_id: int,
     if not validate_state_transition(
             user_prompt, action_id, ActionState.COMPLETED):
         return False
-    receipt = resolve_receipt(user_prompt, evidence)[2]
+    _resolved = resolve_receipt(user_prompt, evidence)
+    _is_reply = evidence.get('kind') == 'user_reply'
     # The proof must be durable before a completion can release dependents or
     # feed any learning system. A retry deduplicates the same receipt hash.
     if not _record_verifier_evidence(user_prompt, action_id, verdict):
         return False
+    # A reply's receipt is the seed (pipeline text plus the person's words
+    # plus the steps); the step's RESULT is the person's words alone.  A
+    # send's receipt is the tool's "Message sent ..."; the RESULT is the
+    # words it delivered (receipt_result_text).
+    _result = (str(evidence.get('reply') or '') if _is_reply
+               else receipt_result_text(_resolved))
     if not safe_set_state(
             user_prompt, action_id, ActionState.COMPLETED, reason,
-            result=str(receipt.get('content') or '')):
+            result=_result):
         return False
 
-    # Learning follows both durable evidence and the successful canonical
-    # state write. Never credit a receipt which failed either boundary.
-    _promote_verified_outcome(user_prompt, action_id, verdict)
+    if _is_reply:
+        # The person's words are nobody's success: never promoted to the
+        # bridge as the agent's output, no Agent Lightning credit (hartos-f9's
+        # review, change 4; the raw chat path already owns history and
+        # consented writes).  The answer is recorded the way CREATE records
+        # it, and that one record closes the ask it answers (same save).
+        # It lands after the COMPLETED write and cannot undo it, so a refusal
+        # is said at error: ledger_user_answered then reads False for a step
+        # that did take its answer, and the ask stays open.
+        if not record_user_answer(user_prompt, action_id, evidence.get('reply'),
+                                  evidence.get('flow')):
+            logger.error("[REUSE-WAIT] action %s in %s completed on the person's "
+                         "reply but the answer record (and the ask's close) "
+                         "was refused", action_id, user_prompt)
+    else:
+        # Learning follows both durable evidence and the successful canonical
+        # state write. Never credit a receipt which failed either boundary.
+        _promote_verified_outcome(user_prompt, action_id, verdict)
     retry_tracker.reset_count(user_prompt, action_id)
     return True
 
@@ -2431,7 +3412,9 @@ def lifecycle_hook_process_verifier_response(user_prompt: str, json_obj: dict, u
         if not _verifier_completion_has_conversation_evidence(
                 user_prompt, current_action_id, json_obj):
             evidence = derive_completion_evidence(
-                user_prompt, current_action_id) or evidence
+                user_prompt, current_action_id,
+                waits_on_person=autonomy_needs_user(
+                    json_obj.get('can_perform_without_user_input'))) or evidence
         if not commit_verified_action_completion(
                 user_prompt, current_action_id, evidence,
                 "hook tracking lifecycle_hook_process_verifier_response",
@@ -2458,7 +3441,10 @@ def lifecycle_hook_process_verifier_response(user_prompt: str, json_obj: dict, u
                     f"StatusVerifier must report action_id {current_action_id} "
                     "and cite an earlier tool receipt that did this action's "
                     "work (not a note saved to memory, not a failed call) or a "
-                    "user-visible result from this conversation.")
+                    "user-visible result from this conversation.  If this "
+                    "action asked the person something and waits for their "
+                    "answer, report status pending: a question is not the "
+                    "action done.")
             }
         # Automatically request fallback after completion
         return {
@@ -2643,26 +3629,56 @@ def dispatch_action_id(content) -> Optional[int]:
     return int(m.group('action_id')) if m else None
 
 
-def latest_dispatch_before(messages, index) -> Optional[int]:
-    """The action id of the latest dispatch posted before ``messages[index]``,
-    or None when none precedes it.
+# A dispatch marker opening a turn that hartos.helper's ROLE-ORDER-GUARD joined
+# behind another user turn: the join is a blank line, so the order no longer
+# leads the merged message and _DISPATCH_MARKER cannot see it.
+_JOINED_DISPATCH_MARKER = re.compile(r'\n\n' + _DISPATCH_MARKER.pattern)
 
-    Seeded messages (``_from_shared``) do not count: an earlier run's marker in
-    the shared history says nothing about which action this run is on.
+
+def latest_dispatch(messages, before=None, user_turns_only=False,
+                    joined=False) -> Optional[dict]:
+    """The newest dispatch in ``messages[:before]`` (all of them when
+    ``before`` is None), or None when there is none.
+
+    The one walk for "which order is on the floor": latest_dispatch_before
+    reads its action id, and core.llm_outbound_logger keeps it out of every
+    trim.  Seeded messages (``_from_shared``) do not count: an earlier run's
+    marker in the shared history says nothing about which action this run is
+    on.  ``user_turns_only``: an order reaches a seat as a role='user' turn, so
+    in the Assistant's own seat a reply of its own that opens by repeating one
+    is not taken for it.  In the other seats every agent's text arrives as a
+    user turn, so there such an echo still passes (task #270).
+    ``joined``: also a message the ROLE-ORDER-GUARD built by joining an order
+    on behind another user turn.  The wire trim reads bodies after that join:
+    live 2026-11-01 (agent 54, rid msg_1793520815330_r11p3) a verdict and the
+    step-2 order were one message, the trim dropped it, and action 2 re-ran
+    its tools 12 times.  The group chat itself holds no joined messages, so
+    latest_dispatch_before leaves this off.
     """
     try:
-        earlier = messages[:index]
+        earlier = messages[:before]
     except Exception:
-        logger.warning("latest_dispatch_before: cannot slice messages at %r",
-                       index, exc_info=True)
+        logger.warning("latest_dispatch: cannot slice messages at %r",
+                       before, exc_info=True)
         return None
     for m in reversed(earlier):
         if not isinstance(m, dict) or m.get('_from_shared'):
             continue
-        aid = dispatch_action_id(m.get('content'))
-        if aid is not None:
-            return aid
+        if user_turns_only and m.get('role') != 'user':
+            continue
+        content = m.get('content')
+        if dispatch_action_id(content) is not None or (
+                joined and isinstance(content, str)
+                and _JOINED_DISPATCH_MARKER.search(content)):
+            return m
     return None
+
+
+def latest_dispatch_before(messages, index) -> Optional[int]:
+    """The action id of the latest dispatch posted before ``messages[index]``,
+    or None when none precedes it (latest_dispatch, read for its id)."""
+    m = latest_dispatch(messages, before=index)
+    return dispatch_action_id(m.get('content')) if m is not None else None
 
 
 def stale_for_unstarted_action(messages, index, user_prompt,
@@ -2719,9 +3735,8 @@ def settled_action_id(claimed_action_id, current_action_id) -> int:
         logger.warning("settled_action_id: the posted action %r is not an int; "
                        "leaving it as it is", current_action_id)
         return current_action_id
-    try:
-        claimed = int(float(claimed_action_id))
-    except (TypeError, ValueError):
+    claimed = claimed_action_int(claimed_action_id)
+    if claimed is None:
         return current
     if claimed != current:
         logger.warning(

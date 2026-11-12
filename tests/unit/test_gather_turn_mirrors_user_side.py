@@ -123,7 +123,7 @@ def _drive(tmp_path, gather_reply, *, turn_before=0, first_turn_cloud=None,
     if reviews_shown is None:
         reviews_shown = {f'{USER_ID}_{PROMPT_ID}': None}
 
-    def gather_info(user_id, user_message, prompt_id, autonomous=False):
+    def gather_info(user_id, user_message, prompt_id, autonomous=False, goal_tags=()):
         gather_calls.append(user_message)
         return replies[min(len(gather_calls), len(replies)) - 1]
 
@@ -169,7 +169,8 @@ def _drive(tmp_path, gather_reply, *, turn_before=0, first_turn_cloud=None,
     ns.update(extra_ns or {})
     exec(compile(_lift({'chat', '_chat_reply', '_config_is_buildable',
                         '_EMPTY_BUILD_REPLY'},
-                       optional={'_decode_config_lists',
+                       optional={'_decode_config_lists', '_decoded_config',
+                                 '_parse_plan_reply',
                                  '_CONFIG_LIST_FIELDS', '_read_gather_config',
                                  '_BUILDABLE_REASK', '_config_review_text',
                                  '_STEP_NUMBER', '_step_text',

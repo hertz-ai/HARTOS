@@ -580,6 +580,35 @@ def get_regional_tone_prompt(language: str = '') -> str:
 # Personality Generation
 # ═══════════════════════════════════════════════════════════════════════
 
+# The agent's OWN role: the seat it sits in, never a person it talks with.
+# A plan's personas are people (the child, a parent); the agent's personality
+# role was taken from personas[0] and read "You are <name>, a the child"
+# (review of 494d5a4e1, must-fix 1; owner 11-07: a user persona is never an
+# agent name and the reverse).  'assistant' is _ROLE_TONE_MAP's own key and
+# its default, so the tone is the one an agent with no role always got; no
+# category is guessed from the goal's words (owner, 10-20).  One value, in
+# core.constants (REUSE's "You are a helpful ..." line reads it there); this
+# module re-exports it for CREATE's personality.
+from core.constants import AGENT_ROLE  # noqa: E402,F401  (re-exported)
+
+
+def _role_phrase(role) -> str:
+    """', an assistant' / ', a Researcher'; '' for an empty role (one saved
+    personality has one), so the line never reads 'a ' before nothing.  The
+    article follows the role's first letter: of the desktop's 748 saved roles
+    starting with a vowel or h, that is right for every one (hartos-16, 11-07)."""
+    role = str(role or '').strip()
+    if not role:
+        return ''
+    return f", {'an' if role[0].lower() in 'aeiou' else 'a'} {role}"
+
+
+def describe_agent(personality) -> str:
+    """Who the agent is, for its personality line: 'Coach, an assistant', or
+    the name alone when the saved role is empty."""
+    return f"{personality.persona_name}{_role_phrase(personality.role)}"
+
+
 def _get_role_category(role: str) -> str:
     """Map a role string to a broad category for trait/tone selection."""
     role_lower = role.lower().strip()
@@ -698,7 +727,7 @@ def build_personality_prompt(personality: AgentPersonality,
     base_prompt = f"""
 
 YOUR PERSONALITY:
-You are {personality.persona_name}, a {personality.role} who embodies these cultural traditions:
+You are {describe_agent(personality)} who embodies these cultural traditions:
 {traits_block}
 
 COMMUNICATION STYLE:

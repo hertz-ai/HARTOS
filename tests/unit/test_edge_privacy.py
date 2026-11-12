@@ -334,10 +334,13 @@ def test_a_short_secret_word_is_not_read_inside_a_glued_name(name):
 
 
 @pytest.mark.parametrize('key', ['newPassword', 'accessToken', 'clientsecret',
-                                 'secretKey'])
+                                 'secretKey', 'API-Key', 'x-api-key', 'private-key',
+                                 'user-pwd'])
 def test_a_value_under_a_glued_secret_name_never_leaves_the_node(key):
-    """The egress scrub reads the raw key lowercased: 'accessToken' reaches
-    it as 'accesstoken', so a glued name is the one it meets."""
+    """The egress scrub reads a key as the one rule does (secret_key_form),
+    so a name person_ask refuses never leaves here: lowercased alone,
+    'API-Key', 'x-api-key', 'private-key' and 'user-pwd' left raw
+    (claude-autostart-71's review of 14e8e7907)."""
     from security.edge_privacy import redact_secret_leaves, scrub_for_egress
     data = {'note': 'hello', key: 'opaque-value-1234'}
     out = scrub_for_egress(data)

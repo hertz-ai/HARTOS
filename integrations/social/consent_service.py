@@ -140,6 +140,14 @@ CONSENT_TYPES = frozenset({
                          # names the ONE credential ('secret:SITE_PASSWORD'),
                          # and the agent only ever gets its alias
                          # {{secret:SITE_PASSWORD}} (hartos.ai_key_vault).
+    'chat_join',         # Another account joins this account's chat with an
+                         # agent (a parent or therapist joining a child's,
+                         # owner 2026-11-06).  Granted when this account's
+                         # side approves the join card; agent_id is the
+                         # agent, scope '<joiner's user id>#<approval time>'
+                         # (one row per approval, so a join can be allowed
+                         # again after a revoke).  Revoking it ends the join
+                         # (core.persona_registry.joined_chats).
 })
 
 #: A credential ask's scope is this prefix + the credential's name, the same
@@ -1284,6 +1292,29 @@ class ConsentService:
         return record.scope if record else ''
 
     @staticmethod
+    def granted_by(db, consent_type: str, scope: str, agent_id=None,
+                   prefix: bool = False) -> list:
+        """The user ids holding an active grant of ``consent_type`` for
+        ``scope`` (or, with ``prefix``, any scope starting with it) and
+        ``agent_id``, oldest grant first: the reverse of active_grant, for a
+        grant whose scope names who it lets in (chat_join: whose chats a
+        joiner may use)."""
+        _validate_consent_type(consent_type)
+        q = db.query(UserConsent.user_id).filter(
+            UserConsent.consent_type == consent_type,
+            UserConsent.agent_id == agent_id,
+            UserConsent.granted == True,
+            UserConsent.revoked_at.is_(None),
+        )
+        q = q.filter(UserConsent.scope.startswith(scope, autoescape=True) if prefix
+                     else UserConsent.scope == scope)
+        out = []
+        for (uid,) in q.order_by(UserConsent.granted_at.asc()).all():
+            if uid not in out:
+                out.append(uid)
+        return out
+
+    @staticmethod
     def list_consents(db, user_id: str, consent_type: str = None,
                       agent_id=None):
         """List consent records for a user, optionally filtered."""
@@ -1294,6 +1325,71 @@ class ConsentService:
         if agent_id is not None:
             q = q.filter(UserConsent.agent_id == agent_id)
         return q.order_by(UserConsent.created_at.desc()).all()
+
+
+# ── Asking this computer's owner for a capability ─────────────────────────
+
+#: What ask_owner found.
+OWNER_ALLOWED = 'allowed'      # the consent is on file
+OWNER_SAID_NO = 'said_no'      # the owner said no; nothing was asked
+OWNER_ASKED = 'asked'          # the ask is on file (filed now, or sent again)
+NO_OWNER = 'no_owner'          # nobody is signed in on this computer
+NOT_THE_OWNER = 'not_owner'    # the turn is not the owner's; nobody was asked
+NOT_HERE = 'not_here'          # central has no such part (central_lacks)
+ASK_FAILED = 'failed'          # the consent store could not be read or written
+
+
+def ask_owner(consent_type: str, reason: str = '', prompt_id=None, *,
+              turn_user=None, stop_at_last_no: bool = False) -> str:
+    """Ask this computer's owner for ``consent_type``; return what came of it.
+
+    The one ask for a part of this machine (the camera, the screen), shared
+    by the Request_Camera_Access / Request_Screen_Access tools
+    (hart_intelligence_entry._request_consent) and by the camera tool when it
+    finds no frame (hartos.helper.get_user_camera_inp), so the two cannot
+    drift apart.  Whose permission: the desktop's owner
+    (HEVOLVE_OWNER_USER_ID, which Nunba exports at boot and keeps in step
+    with sign-in), never the caller.  Which agent asks: the turn's prompt id
+    (known_agent_id).  The ask itself is request_consent: one row, one card,
+    and nothing asked again once the owner answered.
+
+    ``turn_user``: the user whose turn needs the part.  When given and not
+    the owner, nobody is asked (NOT_THE_OWNER): the camera's frames are keyed
+    by the owner's own window, so no answer could serve that turn.
+
+    ``stop_at_last_no``: for an ask the agent did not make in so many words
+    (the camera tool asking on its own).  When the latest answer on file for
+    this feed is a No (feed_said_no: any agent, any surface, a "Don't allow"
+    or a revoke), nothing is filed and the outcome is OWNER_SAID_NO.  Without
+    it a No to one agent stays that agent's (declined), as the card promises.
+
+    Returns one of the outcomes above.  Never raises: a store error is logged
+    here and returned as ASK_FAILED.
+    """
+    if central_lacks(consent_type):
+        return NOT_HERE
+    owner = (os.environ.get('HEVOLVE_OWNER_USER_ID') or '').strip()
+    if not owner:
+        return NO_OWNER
+    if turn_user is not None and str(turn_user).strip() != owner:
+        return NOT_THE_OWNER
+    agent = known_agent_id(prompt_id)
+    try:
+        from .models import db_session
+        with db_session(commit=True) as db:
+            if ConsentService.check_consent(db, owner, consent_type,
+                                            agent_id=agent):
+                return OWNER_ALLOWED
+            if stop_at_last_no and ConsentService.feed_said_no(db, consent_type):
+                return OWNER_SAID_NO
+            ConsentService.request_consent(db, owner, consent_type,
+                                           agent_id=agent, reason=reason)
+            if ConsentService.declined(db, owner, consent_type, agent_id=agent):
+                return OWNER_SAID_NO
+    except Exception:
+        _logger.exception("%s ask for the owner could not be filed", consent_type)
+        return ASK_FAILED
+    return OWNER_ASKED
 
 
 # ──────────────────────────────────────────────────────────────────────

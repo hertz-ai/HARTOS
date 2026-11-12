@@ -398,3 +398,49 @@ class TestTraceBankingIsNotBoundedByLastNMessages:
         ])
         assert ok is True
         assert 'print(42)' in data['recipe'][0]['generalized_functions'], data
+
+
+class TestABankedActionStillReadsYesWhileTheStampIsHeld:
+    """#160 is OPEN.  94354c536 stamped a banked step the person answered
+    with a 'no' constant read from the ledger's answer record; it is held out
+    again because a 'no' step must first be shown to advance on the person's
+    reply in REUSE, and the live walk of 2026-10-30 22:24-22:28 IST on the
+    installed build (HARTOS 19836e605, agent 45620673143) re-asked the person
+    and recorded GAVE_UP instead.  Until that walk is fixed the bank writes
+    'yes' whatever the ledger holds, so new recipes behave as origin's do;
+    this pins the hold so re-landing the stamp is a deliberate act."""
+
+    STEP = [
+        {'content': 'Execute Action 2: synthesize weekly recap'},
+        {'tool_calls': [{'function': {
+            'name': 'execute_windows_or_android_command',
+            'arguments': '{"instructions": "query revenue"}'}}]},
+        {'content': 'numbers retrieved'},
+    ]
+
+    def test_an_answered_step_still_banks_yes_while_the_stamp_is_held(
+            self, banked, tmp_path):
+        import hartos.lifecycle_hooks as L
+        from agent_ledger.core import SmartLedger, Task, TaskStatus, TaskType
+        led = SmartLedger(agent_id='999', session_id='u_test_0',
+                          ledger_dir=str(tmp_path))
+        led.tasks['action_2'] = Task(task_id='action_2',
+                                     description='synthesize weekly recap',
+                                     task_type=TaskType.PRE_ASSIGNED)
+        led.tasks['action_2'].status = TaskStatus.IN_PROGRESS
+        L.register_ledger_for_session('u_test', led)
+        try:
+            assert L.record_user_answer('u_test', 2, 'the Kumar week', 0)
+            assert L.ledger_user_answered('u_test', 2, 0) is True
+            ok, data, _ = banked(list(self.STEP))
+        finally:
+            with L._state_lock:
+                L._ledger_registry.pop('u_test', None)
+        assert ok is True
+        assert data['can_perform_without_user_input'] == 'yes'
+        assert 'Kumar' not in json.dumps(data)
+
+    def test_a_step_that_never_stopped_banks_yes(self, banked):
+        ok, data, _ = banked(list(self.STEP))
+        assert ok is True
+        assert data['can_perform_without_user_input'] == 'yes'

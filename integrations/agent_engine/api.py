@@ -7,7 +7,7 @@ Unified endpoints for products + goals of any type.
 import logging
 from flask import Blueprint, request, jsonify, g
 
-from integrations.social.auth import require_auth, require_admin
+from integrations.social.auth import holds_central_role, require_auth, require_admin
 from core.auth_local import require_local_or_token
 
 logger = logging.getLogger('hevolve_social')
@@ -17,13 +17,34 @@ agent_engine_bp = Blueprint('agent_engine', __name__)
 
 # ─── Products ───
 
+#: What a person may write on their own product.  is_platform_product (a
+#: product of HevolveAI's own: its sales prompt is signed by HevolveAI's
+#: founder, and the platform's self-marketing takes the first such row) is
+#: the steward's alone (holds_central_role); the row's id, owner and times
+#: are the server's.  Review of d2ad38b22: any signed-in person set the
+#: flag on POST or PUT and got their product signed as HevolveAI's founder.
+_PRODUCT_WRITABLE = ('name', 'description', 'tagline', 'product_url', 'logo_url',
+                     'category', 'target_audience', 'unique_value_prop',
+                     'keywords', 'status')
+
+
+def _platform_flag(data) -> bool:
+    """The is_platform_product a request may set: the steward's word, else
+    False."""
+    return bool((data or {}).get('is_platform_product')) and holds_central_role(g.user)
+
+
+def _blank_name(data) -> bool:
+    return not str((data or {}).get('name') or '').strip()
+
+
 @agent_engine_bp.route('/api/marketing/products', methods=['POST'])
 @require_auth
 def create_product():
     from .goal_manager import ProductManager
 
     data = request.get_json() or {}
-    if not data.get('name'):
+    if _blank_name(data):
         return jsonify({'success': False, 'error': 'name is required'}), 400
 
     result = ProductManager.create_product(
@@ -38,7 +59,7 @@ def create_product():
         target_audience=data.get('target_audience', ''),
         unique_value_prop=data.get('unique_value_prop', ''),
         keywords=data.get('keywords', []),
-        is_platform_product=data.get('is_platform_product', False),
+        is_platform_product=_platform_flag(data),
     )
     return jsonify(result), 201 if result.get('success') else 400
 
@@ -74,7 +95,12 @@ def update_product(product_id):
         return jsonify({'success': False, 'error': 'Not authorized'}), 403
 
     data = request.get_json() or {}
-    result = ProductManager.update_product(g.db, product_id, **data)
+    if 'name' in data and _blank_name(data):
+        return jsonify({'success': False, 'error': 'name is required'}), 400
+    changes = {k: v for k, v in data.items() if k in _PRODUCT_WRITABLE}
+    if 'is_platform_product' in data and holds_central_role(g.user):
+        changes['is_platform_product'] = bool(data['is_platform_product'])
+    result = ProductManager.update_product(g.db, product_id, **changes)
     return jsonify(result)
 
 
