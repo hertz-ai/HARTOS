@@ -5876,6 +5876,14 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
                 and _this_turn and str(_ask.get('request_id') or '') == _this_turn
                 and _ask.get('via') in ('send', 'reply')):
             _msgs = group_chat.messages
+            # A sent question is the send's own text: the record keeps only
+            # its first 1000 characters (record_ask_delivered), so a long
+            # send whose question comes last would reply without the
+            # question (review of f821c3942, MF-2: a 1313-char send).  The
+            # record's text stays the answer when the window has no send.
+            if _ask.get('via') == 'send':
+                _question = (_reuse_turn_delivered_send(user_prompt, _msgs)
+                             or _question)
             if not _msgs or (_msgs[-1] or {}).get('content') != _question:
                 _msgs.append({'content': _question,
                               'name': 'Assistant',

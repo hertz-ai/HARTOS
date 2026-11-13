@@ -239,11 +239,15 @@ class TestTheAskTurnWaits:
         run = speech(ask_verdict='pending')
         reply = run.turn('hi, I am ready', 'request-1')
         assert run.state['sends'] == [ASK_LINE]
-        # The person got the question through the send; the turn's reply is
-        # the synthesis round's line after it (hartos-f9's item 6 on
-        # b9edfd90a, carried: a second message after a send).  Pinned exactly
-        # so a fix there shows.
-        assert reply == FINAL, reply
+        # The person got the question through the send, and the held turn's
+        # reply is that question, with no synthesis round steered after it
+        # (18582f23e, f821c3942).  Before them the steer ran and the reply was
+        # FINAL, praise for an attempt the child never made (hartos-f9's item
+        # 6 on b9edfd90a; review of f821c3942, MF-1).
+        assert reply == ASK_LINE, reply
+        assert not any(run.rr._REUSE_SYNTHESIS_ANSWER_VALUE in s
+                       for s in run.state['steers']), (
+            'a synthesis round was steered on a turn holding for the child')
         assert run.rr.user_tasks[run.key].current_action == 1
         assert _task(run, 1).status == TaskStatus.BLOCKED
         assert _task(run, 1).blocked_reason == 'input_required'

@@ -181,6 +181,61 @@ class TestAHeldStepRepliesWithItsQuestion:
             'the step holds with its question out this turn, and the reply '
             'was the narration written after it')
 
+    def test_a_long_send_replies_with_its_whole_text(self, rr, monkeypatch):
+        """Review of f821c3942, MF-2: the ask record keeps the first 1000
+        characters of the question (record_ask_delivered), so a 1313-char
+        send whose question comes last replied without the question, and TTS
+        spoke the cut text.  A sent question is the send's own text, read
+        from this turn's window.  RED on f821c3942."""
+        import json
+        long_text = ('Today we will practise family names together. ' * 27
+                     + 'Arjun, who is this, Amma or Appa?')
+        assert len(long_text) > 1000 and not long_text[:1000].endswith('Appa?')
+        seed = 'seed of ' + THIS_TURN
+        send = dict(SEND_CALL, tool_calls=[{
+            'id': 'call_1', 'type': 'function', 'function': {
+                'name': 'send_message_to_user',
+                'arguments': json.dumps({'text': long_text,
+                                         'expects_reply': True})}}])
+        history = [{'role': 'user', 'name': 'ChatInstructor', 'content': seed},
+                   dict(DISPATCH), send, dict(RECEIPT), dict(VERDICT)]
+        monkeypatch.setattr(rr, '_reuse_turn_start',
+                            {SESSION: {'seed_text': seed}}, raising=True)
+        posted, chat, rec = _run(rr, monkeypatch,
+                                 ask=_ask(question=long_text[:1000]),
+                                 history=history)
+        assert rec.messages == []
+        assert posted is False
+        assert chat.messages[-1]['content'] == long_text, (
+            'the reply is the record\'s 1000-char cut, and the question at '
+            'the end of the send is lost')
+
+    def test_with_no_send_in_this_turn_the_record_is_the_reply(
+            self, rr, monkeypatch):
+        """The record's question stays the answer when this turn's window
+        holds no delivered send (no seed recorded: the reader finds none)."""
+        monkeypatch.setattr(rr, '_reuse_turn_start', {}, raising=True)
+        _posted, chat, rec = _run(rr, monkeypatch, ask=_ask())
+        assert rec.messages == []
+        assert chat.messages[-1]['content'] == QUESTION
+
+    def test_a_question_returned_as_the_reply_never_takes_a_send(
+            self, rr, monkeypatch):
+        """Only a question that went out by send is read from the send: a
+        question that was the reply itself keeps the record's text, whatever
+        else the turn sent."""
+        seed = 'seed of ' + THIS_TURN
+        history = [{'role': 'user', 'name': 'ChatInstructor', 'content': seed}
+                   ] + _history()
+        monkeypatch.setattr(rr, '_reuse_turn_start',
+                            {SESSION: {'seed_text': seed}}, raising=True)
+        returned = 'Arjun, who is this, Amma or Appa?'
+        _posted, chat, rec = _run(rr, monkeypatch,
+                                  ask=_ask(via='reply', question=returned),
+                                  history=history)
+        assert rec.messages == []
+        assert chat.messages[-1]['content'] == returned
+
     def test_a_tail_that_already_is_the_question_is_not_doubled(
             self, rr, monkeypatch):
         history = _history()[:-1] + [{'role': 'assistant', 'name': 'Assistant',
