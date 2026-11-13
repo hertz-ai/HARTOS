@@ -3274,6 +3274,9 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
         from integrations.agent_engine.thought_experiment_tools import (
             ExperimentVoteTool)
         ExperimentVoteTool.register()  # native: the agent's own vote
+        from integrations.coding_agent.backend_repair_tools import (
+            BackendRepairTool)
+        BackendRepairTool.register()   # native: repair_backend_venv & co
         service_tool_registry.load_config()  # load any user-added tools from service_tools.json
 
         svc_tools = service_tool_registry.get_all_tool_functions()

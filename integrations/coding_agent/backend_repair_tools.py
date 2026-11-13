@@ -383,3 +383,83 @@ def register_backend_repair_tools(helper, assistant, user_id: str,
 
     logger.info(f"Registered {len(BACKEND_REPAIR_TOOLS)} backend repair "
                 f"tools for user {user_id}")
+
+
+#: JSON-schema types for the repair functions' parameter annotations.
+_JSON_TYPES = {str: 'string', bool: 'boolean', int: 'integer', float: 'number'}
+
+
+def _params_schema(func) -> dict:
+    """The registry's flat params_schema for ``func``, read from its own
+    signature so the two cannot drift."""
+    import inspect
+    return {name: {'type': _JSON_TYPES.get(p.annotation, 'string'),
+                   'description': name.replace('_', ' ')}
+            for name, p in inspect.signature(func).parameters.items()}
+
+
+def _native_handler(entry):
+    """The registry's native handler for one BACKEND_REPAIR_TOOLS entry: the
+    model's JSON arguments go to the entry's own function, and an argument
+    the model left out (None) keeps the function's default."""
+    def handler(payload: str) -> str:
+        params = json.loads(payload or '{}')
+        return entry['func'](**{k: v for k, v in params.items()
+                                if v is not None})
+    return handler
+
+
+class BackendRepairTool:
+    """Service-tool registration shim for BACKEND_REPAIR_TOOLS (mirrors
+    ExperimentVoteTool / GhPrTool / SeoAuditTool).
+
+    The door every turn opens on both pipelines is
+    core.agent_tool_menu.attach_for_turn: it resolves the turn's own words
+    and attaches the registry tools whose tags meet the capability tags
+    goal_manager.get_tool_tags gives them.  A self-heal turn names
+    repair_backend_venv, which detect_goal_tags tags 'backend_repair', and
+    goal_manager._CAPABILITY_TAGS maps that to the 'backend_repair' tag these
+    entries carry.  Measured live 13 Nov 2026 (Nunba build 75): the turn
+    resolved 'backend_repair' and attached 0 tools, because these were not
+    in the registry.
+
+    One registry tool per function, its endpoint named after it, so the
+    model sees the names the prompts use.  Tagged 'backend_repair' only, not
+    the entries' documentary tags: 'tts' is unlocked by every 'media' turn
+    and 'coding' by every coding turn, and neither should carry an
+    installer.  The tool asks the owner before it installs or wipes.
+    """
+
+    TAGS = ('backend_repair',)
+
+    @classmethod
+    def create_tool_infos(cls):
+        from integrations.service_tools.registry import ServiceToolInfo
+        return [
+            ServiceToolInfo(
+                name=entry['name'],
+                description=entry['description'],
+                base_url='native://in-process',
+                endpoints={entry['name']: {
+                    'path': f"/{entry['name']}",
+                    'method': 'POST',
+                    'description': entry['description'],
+                    'params_schema': _params_schema(entry['func']),
+                    'native_handler': _native_handler(entry),
+                }},
+                health_endpoint=None,  # native: no HTTP service to ping
+                tags=list(cls.TAGS),
+            )
+            for entry in BACKEND_REPAIR_TOOLS
+        ]
+
+    @classmethod
+    def register(cls) -> bool:
+        """Register on the global service_tool_registry.  Idempotent."""
+        try:
+            from integrations.service_tools import registry as _reg
+            return all([_reg.service_tool_registry.register_tool(info)
+                        for info in cls.create_tool_infos()])
+        except Exception as exc:
+            logger.warning('backend repair tools registration skipped: %s', exc)
+            return False

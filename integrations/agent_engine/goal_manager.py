@@ -3367,6 +3367,9 @@ _CAPABILITY_TAGS = {
     'sales': ['web'],
     'news': ['web', 'scraping'],
     'media': ['tts', 'speech', 'music', 'audio', 'generation', 'voice-cloning'],
+    # repair_backend_venv / next_tts_venv_to_provision
+    # (backend_repair_tools.BackendRepairTool carries only this tag).
+    'backend_repair': ['backend_repair'],
 }
 for _gt, _caps in _CAPABILITY_TAGS.items():
     _tool_tags[_gt] = sorted(set(_tool_tags.get(_gt, [])) | set(_caps))
