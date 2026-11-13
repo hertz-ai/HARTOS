@@ -103,6 +103,11 @@ class FrameStore:
         self._screen_desc_history: Dict[str, deque] = {}
         self._max_desc_history = 20  # Keep last 20 descriptions per channel
 
+        # user_id -> monotonic time of that person's last phone camera frame
+        # (a 'device:' source: a phone the owner allowed), see
+        # phone_camera_live.
+        self._phone_frame_at: Dict[str, float] = {}
+
         self._max_frames = max_frames
         # A camera frame older than this is not "the latest frame": nothing
         # takes a frame out when the camera stops, so the last one was read
@@ -145,11 +150,30 @@ class FrameStore:
             # of A's frame was posted as B's when B's frame landed while A's
             # was being described (review of a7d79664d).  Monotonic time, so
             # a clock set back does not keep a stopped camera live.
+            now = time.monotonic()
             self._frames[user_id].append(
-                (time.monotonic(), frame_bytes, source or self.UNSTATED))
+                (now, frame_bytes, source or self.UNSTATED))
+            if str(source or '').startswith('device:'):
+                self._phone_frame_at[str(user_id)] = now
 
     #: The source of a frame whose producer did not say who it is.
     UNSTATED = 'unstated'
+
+    #: How long after a phone's last camera frame that phone is still the
+    #: person's camera.  The phone sends the desktop one frame in ~2 s
+    #: (Android DesktopCameraFrames.EVERY_MS), so a few missed frames do not
+    #: hand the camera back.
+    PHONE_CAMERA_WINDOW_S = 10.0
+
+    def phone_camera_live(self, user_id) -> bool:
+        """True while ``user_id``'s phone streams its camera here: one camera
+        per person, so the page on this desktop frees the desktop camera for
+        other apps (a Zoom call) and its frames do not take turns with the
+        phone's in that person's captions (owner 2026-11-13)."""
+        with self._lock:
+            seen = self._phone_frame_at.get(str(user_id))
+            return (seen is not None
+                    and time.monotonic() - seen <= self.PHONE_CAMERA_WINDOW_S)
 
     def latest(self, user_id: str, channel: str = 'camera') -> Optional[Tuple[bytes, str]]:
         """``user_id``'s latest frame on ``channel`` ('camera' or 'screen') and

@@ -812,16 +812,38 @@ class VisionService:
             2. Client sends "video_start" (camera, default) or "screen_start"
             3. Client sends binary JPEG frames
             4. Client sends "video_stop" to end
+
+        One camera per person: while the person's phone streams its camera
+        here (FrameStore.phone_camera_live), this socket's camera frames are
+        dropped and the client is told "video_pause" once, so the page frees
+        this desktop's camera for other apps (a Zoom call) and its frames do
+        not take turns with the phone's in the captions.  A paused client
+        sends "video_paused" every few seconds; once the phone has stopped it
+        is told "video_resume" and takes the camera back (owner 2026-11-13).
         """
         import cv2
 
-        _CONTROL_MESSAGES = {'screen_start', 'video_start', 'video_stop'}
+        _CONTROL_MESSAGES = {'screen_start', 'video_start', 'video_stop',
+                             'video_paused'}
 
         user_id = None
         channel = 'camera'  # default channel
+        paused = False      # this client was told to free its camera
         try:
             async for message in websocket:
                 if isinstance(message, bytes):
+                    if user_id and channel == 'camera':
+                        if self.store.phone_camera_live(user_id):
+                            if not paused:
+                                paused = True
+                                logger.info(
+                                    f"Phone camera live for user {user_id}: "
+                                    f"this client frees its camera")
+                                await websocket.send('video_pause')
+                            continue
+                        if paused:
+                            paused = False
+                            await websocket.send('video_resume')
                     frame = cv2.imdecode(
                         np.frombuffer(message, np.uint8), cv2.IMREAD_COLOR,
                     )
@@ -855,6 +877,13 @@ class VisionService:
                         logger.info(f"User {user_id} switched to screen channel")
                     elif message == 'video_start':
                         channel = 'camera'
+                    elif message == 'video_paused':
+                        if user_id and not self.store.phone_camera_live(user_id):
+                            paused = False
+                            logger.info(
+                                f"Phone camera stopped for user {user_id}: "
+                                f"this client takes its camera back")
+                            await websocket.send('video_resume')
                     elif message == 'video_stop':
                         break
         except Exception as e:
