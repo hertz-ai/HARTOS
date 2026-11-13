@@ -712,6 +712,49 @@ def _reuse_ask_to_join(user_id, prompt_id, name, creator):
             f'Message me again once they have allowed it.')
 
 
+def _reuse_account_on_node(user_id) -> bool:
+    """True when ``user_id`` is a users row on this node.  person_for returns
+    an id with no row as it is (core.event_attribution), so a caller that must
+    reach someone checks the row itself.  A read that fails keeps the join
+    as it was before this check (logged)."""
+    try:
+        from integrations.social.models import User, db_session
+        with db_session(commit=False) as db:
+            return db.query(User.id).filter_by(id=str(user_id)).first() is not None
+    except Exception:
+        current_app.logger.warning(f'[REUSE] whether account {user_id} is on this node could '
+                                   f'not be read; the join is asked as before', exc_info=True)
+        return True
+
+
+def _reuse_join_by_tool(user_id, prompt_id, name, contact_number):
+    """update_persona(new=False): ``user_id`` asks to join, as ``name``, the
+    chat of the person ``contact_number`` names (a contact number the node
+    mapped, else a user id).  Live 13 Nov 2026 12:30 IST on Claude Sonnet
+    5.5: one persona turn called update_persona six times, inventing
+    contact_number '1234567890'; approval asks went to that nonexistent
+    account and the child was told he was waiting on its holder.  The next
+    person's turn called it 19 times.  So the named account must be on this
+    node before anyone is asked, and a join already asked for the same chat
+    and persona is not asked again (the joiner's next turn re-asks a lost
+    ask: _reuse_pending_join_turn).  What to tell the model."""
+    from core.flow_progress import pending_join
+    creator = temp_users.get(contact_number) or str(contact_number or '').strip()
+    if not creator or creator == str(user_id):
+        return 'Ask the person for the user id of the chat they want to join.'
+    if not _reuse_account_on_node(creator):
+        current_app.logger.info(f'[REUSE] {user_id} named no account on this node '
+                                f'({creator}) to join for agent {prompt_id}; no one asked')
+        return (f'There is no account {creator} on this computer, so no one was asked and '
+                f'nothing was changed. Only if the person said they want to join someone '
+                f"else's chat, ask them for that person's user id; never make one up.")
+    held = pending_join(user_id, prompt_id) or {}
+    if str(held.get('creator')) == creator and str(held.get('persona')) == str(name):
+        return (f'I have asked the account holder of {creator} to allow you to join as {name}. '
+                f'Message me again once they have allowed it.')
+    return _reuse_ask_to_join(user_id, prompt_id, name, creator)
+
+
 def _reuse_pending_join_turn(user_id, prompt_id):
     """At the start of a turn of someone whose join waits on the child's
     side: their answer completes the join (None: the turn goes on, now as a
@@ -1426,8 +1469,8 @@ def create_agents_for_role(user_id: str, prompt_id):
         @log_tool_execution
         def update_persona(name: Annotated[str, "The persona name user selected"],
                            description: Annotated[str, "The persona description user selected"],
-                           new: Annotated[bool, "Wethere it is a new chat or no"],
-                           contact_number: Annotated[str, "the user id (or contact number) of the person whose chat this user joins"]) -> str:
+                           new: Annotated[bool, "True: this person starts their own chat with the agent. False: they join the chat of the person named in contact_number"],
+                           contact_number: Annotated[str, "Only when new is False: the user id (or contact number) the person gave for the chat they join. Never make one up"]) -> str:
             current_app.logger.info('INSIDE update_persona')
             current_app.logger.info(f'agents_session {agents_session}')
             current_app.logger.info(f'chat_joinees {chat_joinees}')
@@ -1465,10 +1508,7 @@ def create_agents_for_role(user_id: str, prompt_id):
                 # Joining another person's chat waits on their consent
                 # (owner 2026-11-06): the child's side is asked first.
                 current_app.logger.info('adding in existing chat')
-                creator = temp_users.get(contact_number) or str(contact_number or '').strip()
-                if not creator or creator == str(user_id):
-                    return 'Ask the person for the user id of the chat they want to join.'
-                return _reuse_ask_to_join(user_id, prompt_id, name, creator)
+                return _reuse_join_by_tool(user_id, prompt_id, name, contact_number)
 
         assistant.description = 'Agent that is designed ask the roles to the user agent'
         user_proxy.description = 'agent will act as user & perform task assigned to user'
