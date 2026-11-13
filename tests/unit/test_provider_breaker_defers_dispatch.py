@@ -55,7 +55,7 @@ def _dispatch():
             patch.object(dispatch, '_dispatch_provider_host', return_value=HOST), \
             patch.object(dispatch, '_local_llm_semaphore', sem), \
             patch.object(dispatch, '_notify_watchdog_llm_start', lambda: None), \
-            patch.object(dispatch, '_notify_watchdog_llm_end', lambda: None):
+            patch.object(dispatch, '_notify_watchdog_llm_end', lambda *a: None):
         status, text = dispatch.local_chat_dispatch(
             'hello', 1, 2, daemon_id='d1')
     return status, text, inner

@@ -96,14 +96,34 @@ def test_a_hevolveai_product_keeps_hevolveai_as_the_seller(store):
 def test_the_default_prompt_is_the_old_one_word_for_word(store):
     """No product and no goal words: the prompt is byte for byte the one
     before #233 (sha256 of ff45f77a4's, 8320 characters), so a cut or
-    changed line of the default pitch fails here."""
+    changed line of the default pitch fails here.  One change since, on
+    purpose: #280 replaced the INFRASTRUCTURE lines that named an email
+    service, a crawler and an Erxes CRM at fixed addresses the node never
+    reaches (8320 -> 8424 characters; the diff of the two prompts is those
+    lines only)."""
     import hashlib
     from integrations.agent_engine.journey_engine import _build_sales_prompt
     prompt = _build_sales_prompt({})
 
-    assert len(prompt) == 8320
+    assert len(prompt) == 8424
     assert hashlib.sha256(prompt.encode('utf-8')).hexdigest() == (
-        'd62beafea85ea766147def96c7c6b0bbe7e6beed3abc1a2059eade930064864f')
+        '5e37e529df24e46db7e8423edacd658129e73761a46ac9a22baafed50e33d5ec')
+
+
+@pytest.mark.parametrize('product', [None, GROCERY])
+def test_the_sales_prompt_names_no_address_the_node_never_reaches(store, product):
+    """FAILS BEFORE #280: every sales prompt named an email service, a
+    crawler and an Erxes CRM at fixed LAN addresses, and said the CRM
+    synced itself.  Central reached none of them (2026-11-12: Erxes 'no
+    route to host', EMAIL_SERVICE_URL and ERXES_API_URL unset).  The prompt
+    now says what the send tool does when no sender is set up."""
+    prompt = _prompt('sales', product)
+
+    for address in ('172.17.0.1', '192.168.0.83', ':4000', ':8094', ':3300',
+                    'Auto-syncs'):
+        assert address not in prompt, address
+    assert ('If it answers that no sender is set up, do not send again this\n'
+            '  dispatch') in prompt
 
 
 @pytest.mark.parametrize('keywords, shown', [

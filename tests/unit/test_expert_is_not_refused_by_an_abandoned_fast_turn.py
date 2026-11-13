@@ -17,12 +17,14 @@ of the eight four-business goals resumed that morning:
   * a later Claude turn ran 462.9 s; the expert leg stopped waiting at
     120 s and its answer was lost.
 
-Now (review of f523d160c, MF1-MF3): a goal's fast turn and its expert turn
-are waited for as long as they run, up to the watchdog's bound for one LLM
-call (security.node_watchdog.LLM_CALL_TIMEOUT_SECONDS), with the daemon
-thread marked as in an LLM call while its fast turn runs.  A goal turn
-still running past that has no result yet: no expert is scheduled behind
-it and the daemon holds the goal with no strike.  A person's own fast leg
+Now (review of f523d160c, MF1-MF3; review of 313ff63fc, M1-M2): a goal's
+fast turn and its expert turn are waited for as long as they run, up to the
+watchdog's bound for one LLM call
+(security.node_watchdog.LLM_CALL_TIMEOUT_SECONDS), with the daemon thread
+marked as in an LLM call while its fast turn runs and only that mark
+cleared after.  A goal turn still running past that bound has no result: no
+expert is scheduled behind it and the daemon counts it as a failed turn,
+so a goal whose turns never end is paused.  A person's own fast leg
 (the draft classifier, a person's speculative turn) keeps its 30 s.  The
 collapsed path judges the expert's reply by dispatch's one "not a result"
 rule (_turn_failure): a turn that did not run is not delivered or recorded.
@@ -94,12 +96,24 @@ def http_mode(monkeypatch):
 
 @pytest.fixture
 def watchdog_marks():
-    """The two watchdog markers, recorded in order with each POST."""
+    """The two watchdog markers, recorded in order with each POST: the
+    start marks the daemon thread ('agent_daemon') and returns its name;
+    an end that clears a name records it (an end with None is a no-op by
+    contract, pinned in test_dispatch.py, and is not recorded)."""
     events = []
+
+    def start():
+        events.append('marked')
+        return 'agent_daemon'
+
+    def end(name=None):
+        if name:
+            events.append(('cleared', name))
+
     with patch('integrations.agent_engine.dispatch._notify_watchdog_llm_start',
-               side_effect=lambda: events.append('marked')), \
+               side_effect=start), \
             patch('integrations.agent_engine.dispatch._notify_watchdog_llm_end',
-                  side_effect=lambda: events.append('cleared')), \
+                  side_effect=end), \
             patch('integrations.agent_engine.dispatch._internal_auth_headers',
                   return_value={}):
         yield events
@@ -155,24 +169,29 @@ def test_a_goal_turn_of_223_s_returns_its_reply_and_then_its_expert_runs(
 def test_the_daemon_thread_is_marked_in_an_llm_call_around_the_goal_turn(
         dispatcher, http_mode, watchdog_marks):
     """Unmarked, the watchdog calls the daemon thread frozen after 300 s.
-    The mark is cleared even when the turn outlives the wait."""
+    The end clears the mark its start set, and only that one (review of
+    313ff63fc, M1), even when the turn outlives the wait."""
     post, _ = _server_taking(223.6, events=watchdog_marks)
     with patch('requests.post', side_effect=post):
         _speculate(dispatcher)
-    assert watchdog_marks == ['marked', 'post', 'cleared']
+    assert watchdog_marks == ['marked', 'post', ('cleared', 'agent_daemon')]
 
     watchdog_marks.clear()
     post, _ = _server_taking(10_000, events=watchdog_marks)
     with patch('requests.post', side_effect=post):
         _speculate(dispatcher)
-    assert watchdog_marks == ['marked', 'post', 'cleared']
+    assert watchdog_marks == ['marked', 'post', ('cleared', 'agent_daemon')]
 
 
-def test_a_goal_turn_still_running_is_held_with_no_expert_behind_it(
+def test_a_goal_turn_still_running_is_a_failed_turn_with_no_expert_behind_it(
         dispatcher, http_mode, watchdog_marks):
+    """Past the whole-turn wait the turn has no result: no expert is
+    scheduled behind it (it would be refused), and the daemon counts the
+    turn as failed, so a goal whose turns never end is paused after the
+    usual five instead of dispatched again every tick (review of 313ff63fc,
+    M2)."""
     from integrations.agent_engine.dispatch import (
-        dispatch_failure_reason, is_transient_deferral,
-        speculative_turn_result)
+        dispatch_failure_reason, speculative_turn_result)
     post, _ = _server_taking(10_000)
     with patch('requests.post', side_effect=post):
         out, schedule = _speculate(dispatcher)
@@ -180,11 +199,9 @@ def test_a_goal_turn_still_running_is_held_with_no_expert_behind_it(
     assert out['still_running'] is True
     assert out['response'] == '' and out['expert_pending'] is False
 
-    # What the daemon then does with it (agent_daemon's speculative branch
-    # and its failure arm): no result, held, no strike.
     assert speculative_turn_result(GOAL, out) is None
-    assert is_transient_deferral(GOAL) is True
-    assert dispatch_failure_reason(GOAL).startswith('deferred:')
+    reason = dispatch_failure_reason(GOAL)
+    assert reason.startswith('turn failed:') and 'still running' in reason
 
 
 def test_a_goal_turn_that_fails_is_still_a_failure(dispatcher, http_mode,

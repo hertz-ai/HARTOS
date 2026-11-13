@@ -696,26 +696,45 @@ def unfilled_key_placeholder(key) -> Optional[str]:
 
 
 # A fill-in mark left in a message for a person: an identifier joined by '_'
-# inside <> or [] ('<parent_name>', '[REVENUE_AMOUNT]').
+# inside <> or [] ('<parent_name>', '[REVENUE_AMOUNT]'), not glued to a word
+# before it (my_list[item_index], std::vector<my_type> are code) and, in [],
+# not the text of a markdown link ([click_here](url)).
 _TEXT_PLACEHOLDER = re.compile(
-    r'<[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+>'
-    r'|\[[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+\]')
+    r'(?<!\w)(?:<[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+>'
+    r'|\[[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+\](?!\())')
 
 
 def unfilled_text_placeholder(text) -> Optional[str]:
-    """The first fill-in mark still left in a message for a person, or None.
+    """The fill-in mark still left in text a person will read, or None.
 
-    Narrower than unfilled_key_placeholder on purpose.  A key never holds
-    '<' or '>' of its own, so any '<...>' in it is a placeholder; a message
-    does: a maths lesson's "3 < 5 and 7 > 2", a coding lesson's <div>, a
-    citation [1].  So only an identifier joined by '_' counts, the one shape
-    measured: live 2026-11-11 01:59 IST on build 69 (request
-    msg_1794342560815_sim) the parent received "Thank you, <parent_name>!",
-    and of the 1061 send texts in this desktop's llm_outbound logs the other
-    unfilled marks were '[REVENUE_AMOUNT]', '[TOTAL_COSTS]' and three more
-    in one send, plus '<tool_call>' call markup in two.  A single word in
-    brackets ('<name>', '[NAME]') is not caught."""
-    match = _TEXT_PLACEHOLDER.search(str(text or ''))
+    The one rule for every such text: a message (send_message_to_user,
+    send_message_in_seconds) and an ask's reason and field labels
+    (person_ask).  Two rules in one commit let each tool send what the other
+    refused (review C-1 of 0516f3981: "Hi <parent_name>, which day suits
+    you?" went out as an ask, "<why you ask>" as a message).  Two shapes:
+
+    - The whole text is one blank, as the ask tool's example writes it
+      ("<why you ask>", "<your question>"; the 4B copied it word for word,
+      live 2026-11-07).  What a blank is, is the memory keys' rule
+      (unfilled_key_placeholder).
+    - An identifier joined by '_' inside <> or [] anywhere in it.  Narrower
+      than the keys' rule on purpose: a key never holds '<' or '>' of its
+      own, but a message does (a maths lesson's "3 < 5 and 7 > 2", a coding
+      lesson's <div>, a citation [1]).  Measured: live 2026-11-11 01:59 IST
+      on build 69 (request msg_1794342560815_sim) the parent received
+      "Thank you, <parent_name>!", and of the 1061 send texts in this
+      desktop's llm_outbound logs the other unfilled marks were
+      '[REVENUE_AMOUNT]', '[TOTAL_COSTS]' and three more in one send, plus
+      '<tool_call>' call markup in two.  A mark glued to the word before it
+      is code (my_list[item_index], os.environ[GITHUB_TOKEN],
+      std::vector<my_type>) and [words](link) is a markdown link; neither
+      is caught (review C-2), so a placeholder glued to a word ("Hi<name>")
+      is not caught either.  Nor is a single word in brackets inside a
+      longer text ("say <ball>", "[Note]")."""
+    body = str(text or '').strip()
+    if body and unfilled_key_placeholder(body) == body:
+        return body
+    match = _TEXT_PLACEHOLDER.search(body)
     return match.group(0) if match else None
 
 
@@ -899,6 +918,111 @@ def build_core_tool_closures(ctx):
         "answer anything else, and it fails when the user is not sharing a "
         "camera.",
         get_user_camera_inp,
+    ))
+
+    # ------------------------------------------------------------------
+    # 2b. start_demonstration / stop_demonstration
+    # ------------------------------------------------------------------
+    # Owner 2026-11-11: when the person says "I'll show you how", the agent
+    # invokes the demonstration recorder (integrations/vlm/demo_session.py);
+    # the ribbon shows a recording symbol, Stop is the ribbon's own.  Not in
+    # MAIN_LEG_CORE_TOOLS on purpose: an agent that needs it attaches it by
+    # name or through request_tools, so the main leg's schema budget is
+    # untouched.  Both tools answer only the person's OWN turn, on the desktop
+    # owner's own account: a goal, a peer agent's relay or another user must
+    # never watch the owner's mouse and keyboard, or read what they did.
+    def _demonstration_refusal(tool_name):
+        """None when this turn may start or read a demonstration, else the
+        refusal that says what is wrong and what to do."""
+        from core.tool_refusal import RETRY_LATER, RETRY_NEVER, refuse
+        if not is_a_persons_request(camera_turn_id()):
+            return refuse(
+                tool_name,
+                "this turn is not the person's own message (it is a goal running "
+                "in the background, another agent's request, or a scheduled "
+                "run), and only the person may start or read a recording of what "
+                "they do on their own computer",
+                "Do this step without a demonstration; if the person wants to "
+                "show you something, wait for them to say so in chat",
+                retry=RETRY_LATER)
+        from integrations.agent_engine.capability_setup import setup_owner
+        owner = setup_owner()
+        if not owner:
+            return refuse(
+                tool_name,
+                "no one is signed in as this computer's owner, so there is "
+                "nobody whose mouse and keyboard may be recorded",
+                "Ask the person to sign in to the desktop app, then try again",
+                retry=RETRY_LATER)
+        if str(user_id) != str(owner):
+            return refuse(
+                tool_name,
+                "a recording would capture the desktop owner's mouse and "
+                "keyboard, and the person asking is not the owner",
+                "Ask the owner to show it from their own account; you cannot "
+                "record someone else's computer",
+                retry=RETRY_NEVER)
+        return None
+
+    @log_tool_execution
+    def start_demonstration(
+        what_will_be_shown: Annotated[str, "What the person is about to show you, in a few words, e.g. 'how I file my expenses'"],
+    ) -> str:
+        refusal = _demonstration_refusal('start_demonstration')
+        if refusal:
+            return refusal
+        from core.tool_refusal import RETRY_LATER, refuse
+        from integrations.vlm import demo_session
+        try:
+            session = demo_session.begin(user_id, prompt_id)
+        except demo_session.DemoRefused as refused:
+            return refuse('start_demonstration', refused.problem, refused.fix,
+                          retry=RETRY_LATER)
+        return (f"Recording started. The person's screen shows the red "
+                f"recording ribbon, and it ends by itself after "
+                f"{int(session.max_seconds // 60)} minutes or when they press "
+                f"Stop AI control. Tell them to go ahead and show you, and to say "
+                f"when they are done, then call stop_demonstration. It records "
+                f"which windows and controls they use (clicks, scrolls, key "
+                f"presses like Enter or Ctrl+S, and that they typed), never what "
+                f"they type. It does not record screenshots or captions of the "
+                f"screen, or middle and side mouse buttons, so do not promise "
+                f"those.")
+
+    tools.append((
+        "start_demonstration",
+        "Start recording while the person shows you how to do something on "
+        "their own computer. Call it only when they say they will show you. "
+        "A recording ribbon is shown to them and they can stop it any time.",
+        start_demonstration,
+    ))
+
+    @log_tool_execution
+    def stop_demonstration() -> str:
+        refusal = _demonstration_refusal('stop_demonstration')
+        if refusal:
+            return refusal
+        from core.tool_refusal import RETRY_AFTER_FIX, refuse
+        from integrations.vlm import demo_session
+        session = demo_session.active_session()
+        if session is None:
+            return refuse(
+                'stop_demonstration', "no demonstration is being recorded right now",
+                "Call start_demonstration first, and only when the person says "
+                "they will show you how", retry=RETRY_AFTER_FIX)
+        result = session.stop('person')
+        return (f"The demonstration is over ({result.seconds:g} seconds). What the "
+                f"person did, in order (what they typed is never recorded, only "
+                f"that they typed):\n{result.transcript}\n"
+                f"Turn this into the steps of the agent you are building: ask "
+                f"the person for any text they typed, and use their vault "
+                f"({{{{secret:NAME}}}}) for a secret.")
+
+    tools.append((
+        "stop_demonstration",
+        "Stop the recording the person's demonstration started, and get what "
+        "they did as numbered steps in words.",
+        stop_demonstration,
     ))
 
     # ------------------------------------------------------------------
@@ -3065,20 +3189,32 @@ def build_core_tool_closures(ctx):
             YouTube_Transcript,
         ))
 
-        # T2: cookie-authenticated read on user's logged-in platform sessions.
-        # Routes through web_crawler.crawl_url_with_cookies (extending the
-        # canonical crawler) with AccountVault cookies + optional CDP attach.
+        # T2: a platform read that uses the person's stored cookies WHEN the
+        # vault holds some.  Routes through web_crawler.crawl_url_with_cookies
+        # (extending the canonical crawler) with AccountVault cookies +
+        # optional CDP attach.  Nothing writes to that vault in this build
+        # (AccountVault.add has no production caller), so today every call goes
+        # out logged out and the result says so: connection_mechanism
+        # 'logged_out_public', authenticated False, and a 'notice'.  Keep the
+        # text below honest about that -- the model reads these descriptions
+        # before it ever sees a result.
         @log_tool_execution
         def Search_Platform(
             platform: Annotated[str, "twitter / reddit / linkedin / bilibili / xiaohongshu / weibo"],
             query: Annotated[str, "Search keywords/phrase."],
             handle: Annotated[Optional[str], "Vault handle whose cookies to use; first if omitted."] = None,
         ) -> str:
-            """Search a platform using the user's logged-in session cookies.
+            """Search a platform, with the person's stored session cookies if
+            the vault holds any for it.
 
-            Returns JSON with success/markdown/connection_mechanism — the
-            connection_mechanism tells the agent (and user) how access happened
-            (obscura_b2_cdp_user_chrome / obscura_b1_headless_profile).
+            Returns JSON with success/markdown/connection_mechanism/
+            authenticated.  connection_mechanism says how access REALLY
+            happened: obscura_b2_cdp_user_chrome or
+            obscura_b1_headless_profile when cookies were sent, and
+            'logged_out_public' when none were — then authenticated is False,
+            a 'notice' explains it, and the page is the public view or a login
+            wall, never the person's own feed.  Nothing writes to the vault in
+            this build, so logged_out_public is what every call returns today.
             Consent-gated on `web_research:<platform>`.
             """
             result = br_tools_module.dispatch(
@@ -3089,10 +3225,10 @@ def build_core_tool_closures(ctx):
 
         tools.append((
             "Search_Platform",
-            "Search a social platform (twitter/reddit/linkedin/bilibili/xiaohongshu/weibo) "
-            "using the user's logged-in session. Input: platform, query, optional handle. "
-            "Returns JSON with markdown content + connection_mechanism describing how the "
-            "agent accessed it (your Chrome, headless profile, or public). Consent-gated.",
+            "Search a social platform (twitter/reddit/linkedin/bilibili/xiaohongshu/weibo), "
+            "with the person's stored session if one exists. Input: platform, query, optional "
+            "handle. Returns JSON with markdown + connection_mechanism + authenticated; if "
+            "false it is the logged-out public view, not their feed — say so. Consent-gated.",
             Search_Platform,
         ))
 
@@ -3102,7 +3238,9 @@ def build_core_tool_closures(ctx):
             target_handle: Annotated[str, "Whose timeline to read (e.g. '@elonmusk')."],
             handle: Annotated[Optional[str], "Vault handle whose cookies to use; first if omitted."] = None,
         ) -> str:
-            """Read another user's public timeline via your logged-in browser session."""
+            """Read someone's public timeline, with the person's stored session
+            if the vault has one; otherwise it is a logged-out public read and
+            the result says so (authenticated False)."""
             result = br_tools_module.dispatch(
                 tool='Read_Timeline', user_id=str(user_id),
                 platform=platform, target_handle=target_handle, handle=handle,
@@ -3111,9 +3249,10 @@ def build_core_tool_closures(ctx):
 
         tools.append((
             "Read_Timeline",
-            "Read someone's public timeline on a platform via your logged-in session. "
-            "Input: platform, target_handle. Returns markdown + connection_mechanism. "
-            "Consent-gated on web_research:<platform>.",
+            "Read someone's public timeline on a platform, with the person's stored session "
+            "if one exists. Input: platform, target_handle. Returns markdown + "
+            "connection_mechanism + authenticated; if false it is the logged-out public view "
+            "— say so. Consent-gated on web_research:<platform>.",
             Read_Timeline,
         ))
 
@@ -3122,15 +3261,19 @@ def build_core_tool_closures(ctx):
             platform: Annotated[str, "twitter / reddit / linkedin / bilibili / xiaohongshu / weibo"],
             content: Annotated[str, "Text to post on the user's behalf."],
             handle: Annotated[Optional[str], "Vault handle to post as; first if omitted."] = None,
-            dry_run: Annotated[bool, "TRUE returns a preview card; FALSE actually posts (requires prior confirm)."] = True,
+            dry_run: Annotated[bool, "TRUE returns a preview card; FALSE is the confirmed post, which this build cannot send."] = True,
         ) -> str:
-            """Post on the user's behalf on a social platform.
+            """Offer to post on the person's behalf — this build cannot send it.
 
             **Preview-confirm gate**: dry_run defaults to TRUE.  First invocation
             returns a `liquid_ui: post_preview` component for the UI to render
             with explicit Cancel/Confirm buttons.  The agent MUST re-invoke with
             dry_run=False after the user taps Confirm.  Same canonical pattern
             as Invite_Friend and channel_send.
+
+            dry_run=False does NOT post: no per-platform write path exists, so
+            it returns success False with the text back under 'content'.  Tell
+            the person nothing was posted and hand them their text.
 
             Consent-gated on `web_research:<platform>`.
             """
@@ -3142,10 +3285,10 @@ def build_core_tool_closures(ctx):
 
         tools.append((
             "Post_As_User",
-            "Post on the user's behalf on a social platform via their logged-in "
-            "browser session. PREVIEW-CONFIRM gated: dry_run=True (default) returns "
-            "a preview card the user must explicitly confirm before the actual post "
-            "happens with dry_run=False. Consent-gated on web_research:<platform>. "
+            "Offer to post on the person's behalf on a social platform. This build CANNOT "
+            "post: dry_run=True (default) returns a preview card to confirm, and dry_run=False "
+            "returns the text unsent because no write path exists — say nothing was posted and "
+            "hand their text back. Consent-gated on web_research:<platform>. "
             "Input: platform, content, optional handle, dry_run.",
             Post_As_User,
         ))

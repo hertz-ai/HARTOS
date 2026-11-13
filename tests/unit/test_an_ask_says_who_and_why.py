@@ -239,8 +239,9 @@ def test_a_reason_still_a_blank_is_not_sent(legs):
 
 
 def test_words_with_angle_brackets_in_them_are_still_asked(legs):
-    """Only a reason or question that IS a blank is refused: the person's
-    own words may hold '<' and '>' (a size, a comparison)."""
+    """A '<' or '>' in the person's own words (a size, a comparison) is not
+    a blank: only a whole '<...>' or a fill-in mark such as '<parent_name>'
+    is (core.agent_tools.unfilled_text_placeholder, the one rule)."""
     out = _ask({'type': 'form', 'description': 'To pick the box size: <30 cm or >50 cm?',
                 'fields': [{'name': 'answer', 'label': 'Is the parcel <2 kg?',
                             'type': 'text'}]})

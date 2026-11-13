@@ -357,8 +357,19 @@ OTHER_MODEL_FAMILY = 'other'
 # by substring like the family; read with model_usd_per_1k.  Claude Haiku 5.5
 # has a second rate card above 100K prompt tokens.
 EXPERT_USD_PER_1K_BY_MODEL = {
+    # Most specific name first: the first substring match wins, and
+    # 'claude-fable-5' is a substring of 'claude-fable-5-2'.
     'claude-sonnet-5-5': (0.002, 0.010),
+    'claude-sonnet-5': (0.002, 0.010),
     'claude-haiku-5-5': (0.0001, 0.0005),
+    'claude-opus-5-5': (0.004, 0.020),
+    'claude-opus-5': (0.005, 0.025),
+    'claude-fable-5-2': (0.008, 0.040),
+    'claude-mythos-5-2': (0.008, 0.040),
+    'claude-fable-5-1': (0.010, 0.050),
+    'claude-mythos-5-1': (0.010, 0.050),
+    'claude-fable-5': (0.010, 0.050),
+    'claude-mythos-5': (0.010, 0.050),
 }
 EXPERT_LONG_PROMPT_USD_PER_1K = {
     # model: (prompt tokens above which the rate applies, (input, output))

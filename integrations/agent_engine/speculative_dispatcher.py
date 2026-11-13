@@ -430,10 +430,11 @@ class SpeculativeDispatcher:
                 fast_model, prompt, user_id, prompt_id, goal_type, goal_id,
                 turn_wait_s=turn_wait_s)
         except TurnStillRunning as e:
-            # Still running past even that: no result yet, and no expert
-            # either, which would be refused behind it (measured: the held
-            # expert still spent 5 calls first).  The daemon holds the goal
-            # for a later tick with no strike (speculative_turn_result).
+            # Still running past even that: no result, and no expert either,
+            # which would be refused behind it (measured: the held expert
+            # still spent 5 calls first).  The daemon counts it as a failed
+            # turn (speculative_turn_result), so a goal whose turns never end
+            # is paused after the usual five instead of retried forever.
             elapsed_ms = (time.time() - start) * 1000
             self._track_call_telemetry(fast_model, elapsed_ms, node_id)
             logger.warning("Goal %s: %s; no expert scheduled behind it",
@@ -2160,8 +2161,8 @@ class SpeculativeDispatcher:
                              timeout=expert_wait_s)
             if resp.status_code == 200:
                 return (resp.json() or {}).get('response') or ''
-            # WARNING, not DEBUG: central emits no INFO/DEBUG after boot,
-            # so a dead leg at DEBUG is invisible to every operator.
+            # WARNING, not DEBUG: DEBUG is not in central's log, so a dead
+            # leg at DEBUG is invisible to every operator.
             logger.warning(
                 "local expert /chat HTTP returned %s", resp.status_code)
         except Exception as e:
@@ -2310,10 +2311,10 @@ class SpeculativeDispatcher:
             _notify_watchdog_llm_start)
         base_url = os.environ.get('HEVOLVE_BASE_URL', f'http://localhost:{get_port("backend")}')
         goal_turn = turn_wait_s is not None
-        if goal_turn:
-            # The daemon thread blocks on this turn for as long as it runs;
-            # unmarked, the watchdog calls it frozen after 300 s.
-            _notify_watchdog_llm_start()
+        # The daemon thread blocks on this turn for as long as it runs;
+        # unmarked, the watchdog calls it frozen after 300 s.  The end clears
+        # only the mark this start set.
+        marked = _notify_watchdog_llm_start() if goal_turn else None
         try:
             resp = req.post(f'{base_url}/chat', json=payload,
                             headers=_internal_auth_headers(),
@@ -2333,8 +2334,7 @@ class SpeculativeDispatcher:
             logger.warning(f"Model dispatch ({model.model_id}) /chat gave no "
                            f"reply: {e}")
         finally:
-            if goal_turn:
-                _notify_watchdog_llm_end()
+            _notify_watchdog_llm_end(marked)
         return ''
 
     def _deliver_expert_response(self, user_id: str, prompt_id: str,

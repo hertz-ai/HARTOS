@@ -576,6 +576,22 @@ def test_a_wrapped_tool_is_counted_once_through_the_executor(
     assert len(_no_hint_lines(tool_log)) == 1, tool_log
 
 
+def test_an_async_wrapped_tool_is_counted_once_through_the_executor(
+        executor, tool_log):
+    """An async def gets log_tool_execution's other wrapper (async_wrapper),
+    which must carry the same mark, or the async executor counts its reply a
+    second time.  The proof run of 2026-11-12 left that mark's removal
+    (mutant E5) alive: every wrapped tool above is a plain def."""
+    @log_tool_execution
+    async def ask_person(question: str) -> str:
+        return ASK_REFUSED
+
+    reply = _executed(executor, {'ask_person': ask_person}, 'ask_person',
+                      '{"question": "Which day?"}', run_async=True)
+    assert reply == ASK_REFUSED
+    assert len(_no_hint_lines(tool_log)) == 1, tool_log
+
+
 @pytest.mark.parametrize('reply', [
     refuse('list_reel_clips', 'no project named p1',
            'call list_reel_projects and use one of its names'),
@@ -638,6 +654,11 @@ def _send_tools():
      '[REVENUE_AMOUNT]'),
     ("<tool_call>\n<function=google_search>\n<parameter=text>shoes",
      '<tool_call>'),
+    # The whole text is one blank, the shape ask_person's example writes
+    # ("<why you ask>"): one rule for every text that reaches a person
+    # (review C-1 of 0516f3981).
+    ("<your message to the parent>", '<your message to the parent>'),
+    ("  <why you ask>\n", '<why you ask>'),
 ])
 def test_a_message_that_still_holds_a_placeholder_is_refused_and_not_sent(
         tool_log, text, placeholder):
@@ -655,6 +676,15 @@ def test_a_message_that_still_holds_a_placeholder_is_refused_and_not_sent(
     "See [1] for the source, and [Note] keep practising.",
     "Say 'ball' slowly: <ball> rhymes with <call>.",
     "Great try, Arjun! Now say 'buh-buh-ball' with me.",
+    # A coding lesson's own text: a mark glued to the word before it is an
+    # index or a type, and [words](link) is a markdown link (review C-2 of
+    # 0516f3981 measured all five refused).
+    "Index the list as my_list[item_index], then print it.",
+    "Read each cell with row[col_name] inside the loop.",
+    "Your key is read from os.environ[GITHUB_TOKEN] when it starts.",
+    "Declare it as std::vector<my_type> before the loop.",
+    "Open [click_here](https://example.org/lesson) to see the page.",
+    "Is the parcel <2 kg?",
 ])
 def test_a_message_without_a_placeholder_is_sent_as_written(tool_log, text):
     tools, sent, _scheduled = _send_tools()
@@ -671,3 +701,57 @@ def test_a_timed_message_with_a_placeholder_is_refused_and_not_scheduled(
     assert scheduled == [], scheduled
     assert tool_reply_failed(reply) and refusal_has_hint(reply), reply
     assert '<child_name>' in reply, reply
+
+
+# ---------------------------------------------------------------------------
+# One rule for every text a person reads: a message and an ask agree.
+# ---------------------------------------------------------------------------
+# Review C-1 of 0516f3981: the send tools and ask_person held two rules, so
+# "Hi <parent_name>, which day suits you?" was refused as a message and sent
+# as an ask, and "<why you ask>" the other way round.
+def _asked(monkeypatch, text, where):
+    """person_ask.ask with ``text`` as the reason or as the question's label.
+    The card push is the boundary: it refuses, so an ask that passed every
+    check before it reads 'not_shown' and nothing is stored or sent."""
+    from integrations.agent_engine import liquid_ui_service, person_ask
+    monkeypatch.setattr(liquid_ui_service, 'push_agent_ui', lambda *a, **k: False)
+    reason = text if where == 'description' else 'To plan the next lesson.'
+    label = text if where == 'label' else 'Which day suits you?'
+    component = {'type': 'form', 'description': reason,
+                 'fields': [{'name': 'answer', 'label': label, 'type': 'text'}]}
+    return person_ask.ask('10202', '54', component, prompt_id='54', title='A question')
+
+
+@pytest.mark.parametrize('where', ['description', 'label'])
+@pytest.mark.parametrize('text, blank', [
+    ("Hi <parent_name>, which day suits you?", '<parent_name>'),
+    ("Revenue is [REVENUE_AMOUNT] today?", '[REVENUE_AMOUNT]'),
+    ("<why you ask>", '<why you ask>'),
+    ("<your question>", '<your question>'),
+])
+def test_a_blank_a_message_refuses_an_ask_refuses_too(
+        tool_log, monkeypatch, where, text, blank):
+    tools, sent, _scheduled = _send_tools()
+    reply = tools['send_message_to_user'](text, False)
+    assert sent == [] and blank in reply, reply
+    out = _asked(monkeypatch, text, where)
+    assert out['refused'] == 'unfilled_placeholder', out
+    from integrations.agent_engine.person_ask import _refusal_note
+    component = {'description': text if where == 'description' else 'x',
+                 'fields': [{'label': text if where == 'label' else 'y'}]}
+    assert blank in _refusal_note('unfilled_placeholder', component, '10202', '54', False)
+
+
+@pytest.mark.parametrize('where', ['description', 'label'])
+@pytest.mark.parametrize('text', [
+    "Is the parcel <2 kg?",
+    "To pick the box size: <30 cm or >50 cm?",
+    "Use my_list[item_index] to read the third word.",
+    "Say <ball> slowly, then tell me the word you heard.",
+])
+def test_words_a_message_sends_an_ask_asks_too(tool_log, monkeypatch, where, text):
+    tools, sent, _scheduled = _send_tools()
+    tools['send_message_to_user'](text, False)
+    assert sent == [text]
+    out = _asked(monkeypatch, text, where)
+    assert out['refused'] == 'not_shown', out      # past the blank check

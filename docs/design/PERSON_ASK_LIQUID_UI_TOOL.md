@@ -93,9 +93,11 @@ no owner today):
   3. Says who asks and why, or is not sent. The reason is the agent's own
      words: `body`, else the component's `description`; an ask with none
      is refused (`say_why_in_description`), and so is one whose reason or
-     a field's label is still a whole `<...>` blank, such as the tool
-     hint's "<why you ask>" (`unfilled_placeholder`; what counts as a blank
-     is `core.agent_tools.unfilled_key_placeholder`, the memory keys' rule).
+     a field's label still holds a blank: the whole text a `<...>`, such as
+     the tool hint's "<why you ask>", or a fill-in mark such as
+     `<parent_name>` (`unfilled_placeholder`; what counts as a blank is
+     `core.agent_tools.unfilled_text_placeholder`, the one rule the send
+     tools use too, review C-1 of 0516f3981).
      Live 2026-11-03 and 11-07/09: cards with no reason, titled "Your agent
      asks for files"; review of ab68963ea: a word-for-word copy of the new
      hint's example reached the person as "<why you ask>". With no title

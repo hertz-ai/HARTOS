@@ -291,22 +291,25 @@ def _agent_name(agent_id) -> Optional[str]:
 
 
 def _unfilled_blank(body, component) -> Optional[str]:
-    """The reason (``body``) or a field's label that is still, as a whole, a
-    '<...>' blank, or None.  What a blank is, is the memory keys' rule
-    (core.agent_tools.unfilled_key_placeholder).  The tool's example writes
-    the reason and the question as "<why you ask>" and "<your question>", and
-    the 4B copies the example word for word (live 2026-11-07); sent as they
-    are, the card read "<why you ask>" over a box labelled "<your question>"
-    (review of ab68963ea, MF-1).  Words that only hold a '<' or a '>' ('Is
-    the parcel <2 kg?') are asked."""
-    from core.agent_tools import unfilled_key_placeholder
+    """The blank still left in the reason (``body``) or a field's label, or
+    None.  What a blank is, is the one rule for every text a person reads
+    (core.agent_tools.unfilled_text_placeholder, which the send tools use
+    too): the whole text one '<...>' blank, or an identifier joined by '_'
+    in <> or [] anywhere in it.  The tool's example writes the reason and the
+    question as "<why you ask>" and "<your question>", and the 4B copies the
+    example word for word (live 2026-11-07); sent as they are, the card read
+    "<why you ask>" over a box labelled "<your question>" (review of
+    ab68963ea, MF-1).  "Hi <parent_name>, which day suits you?" was sent as
+    an ask while the send tools refused it (review C-1 of 0516f3981).  Words
+    that only hold a '<' or a '>' ('Is the parcel <2 kg?') are asked."""
+    from core.agent_tools import unfilled_text_placeholder
     fields = component.get('fields') if isinstance(component, dict) else None
     labels = ([f.get('label') for f in fields if isinstance(f, dict)]
               if isinstance(fields, list) else [])
     for text in [body, *labels]:
-        text = text.strip() if isinstance(text, str) else ''
-        if text and unfilled_key_placeholder(text) == text:
-            return text
+        blank = unfilled_text_placeholder(text) if isinstance(text, str) else None
+        if blank:
+            return blank
     return None
 
 
@@ -324,8 +327,9 @@ def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
     was sent: 'no_person', 'not_an_object', 'secrets_go_to_the_vault',
     'unknown_purpose', 'no_agent', 'say_why_in_description' (no reason given:
     neither ``body`` nor the component's description), 'unfilled_placeholder'
-    (the reason, or a field's label, is still a whole '<...>' blank, as the
-    tool's example writes it), 'too_many_open_asks', 'not_shown' (the
+    (the reason, or a field's label, still holds a blank: the tool example's
+    whole '<...>', or a fill-in mark such as '<parent_name>'),
+    'too_many_open_asks', 'not_shown' (the
     Liquid UI gates refused the card: switched off, the hive halted, unsafe
     content, an unknown type, too many pushes; the log says which) or
     'not_filed' (its row could not be written).
@@ -345,7 +349,8 @@ def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
     # ask without one is not sent, nor one whose reason or question is still
     # the tool example's blank; with no title of its own, the title names the
     # agent as the person knows it.  The card and the push carry the title and
-    # the reason; the bell row carries the title.
+    # the reason; the bell row carries the title.  A reason or question that
+    # still holds a fill-in mark ('<parent_name>') is not sent either.
     body = (body or component.get('description') or '').strip()
     if not body:
         logger.info("person ask refused (say_why_in_description) for user %s by "
@@ -880,9 +885,10 @@ def _refusal_note(refused, comp, person, asker, background) -> str:
     if refused == 'unfilled_placeholder':
         blank = _unfilled_blank(comp.get('description') if isinstance(comp, dict) else '',
                                 comp) or 'a <...> blank'
-        return (f'Not sent: {blank} is the example\'s blank, not your words, and the '
+        return (f'Not sent: {blank} is a blank to fill in, not your words, and the '
                 'person would read it as it is. Write in its place, in your own words, '
-                'why you ask ("description") and what you ask (each field\'s "label").')
+                'why you ask ("description") and what you ask (each field\'s "label"), '
+                'with the real value where a name or number goes.')
     if refused == 'too_many_open_asks':
         whose = 'from background work ' if background else ''
         said = (f'Not sent: this person already has {MAX_OPEN_PER_PERSON} questions '

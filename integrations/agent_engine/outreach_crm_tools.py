@@ -44,6 +44,14 @@ OUTREACH_SEND_ATTEMPTS = 3
 OUTREACH_RETRY_WAIT = timedelta(hours=1)
 #: Longest sender error kept on a planned email.
 _SEND_ERROR_CAP = 200
+#: What a send refused for want of any sender tells the agent: what the
+#: owner sets up, and what to do meanwhile.  The email channel's setup asks
+#: for these four (integrations/channels/metadata.py, 'email').
+NO_EMAIL_SENDER_FIX = (
+    'To send email the owner sets up a sender on this node: connect its email '
+    'channel (IMAP host, SMTP host, address and password), or point '
+    'EMAIL_SERVICE_URL at a mailer this node can reach. Until then do not try '
+    'to send again; keep finding and researching prospects.')
 
 # ── Thread lock for prospect file access (daemon + request thread) ──
 _prospect_lock = threading.Lock()
@@ -147,6 +155,7 @@ def _send_email(to_email: str, subject: str, html_body: str) -> Dict:
 
     # Tier 1: Email channel adapter (user's SMTP), run on the channel
     # integration's loop, which owns the adapters (ChannelRegistry has none).
+    have_channel = False
     try:
         from integrations.channels.flask_integration import get_channel_integration
         import asyncio
@@ -154,6 +163,7 @@ def _send_email(to_email: str, subject: str, html_body: str) -> Dict:
         adapter = integration.registry.get('email')
         loop = integration.running_loop()
         if adapter is not None and hasattr(adapter, 'send_email') and loop is not None:
+            have_channel = True
             future = asyncio.run_coroutine_threadsafe(
                 adapter.send_email(
                     to=to_email, subject=subject,
@@ -187,7 +197,18 @@ def _send_email(to_email: str, subject: str, html_body: str) -> Dict:
         return {'success': resp.status_code < 400, 'via': 'mailer_service',
                 'status_code': resp.status_code, 'response': body}
     except Exception as e:
-        return {'success': False, 'error': str(e)}
+        if have_channel:
+            return {'success': False, 'error': str(e)}
+        # Neither sender exists for this node: say so, and what the owner
+        # sets up (owner rule 2026-11-09: a refusal says what was wrong and
+        # how to fix it).  Central, 2026-11-12: no email channel and
+        # EMAIL_SERVICE_URL unset, so every send ended on the default
+        # localhost mailer's "connection refused", which told nobody what
+        # to do (#280).
+        return {'success': False, 'via': 'no sender',
+                'error': (f'no email channel is connected and the mailer at '
+                          f'{EMAIL_SERVICE_URL} did not answer ({type(e).__name__})'),
+                'fix': NO_EMAIL_SENDER_FIX}
 
 
 # ── One rule for a planned email that was, or was not, delivered ──
@@ -196,9 +217,11 @@ def _send_email(to_email: str, subject: str, html_body: str) -> Dict:
 # JourneyEngine._action_send_email all count a delivery and a refusal here.
 
 def _send_error_text(result: Dict) -> str:
-    """Why _send_email did not deliver, in words the agent can read."""
+    """Why _send_email did not deliver, in words the agent can read, and
+    what to do about it when _send_email knows (its 'fix')."""
     if result.get('error'):
-        return str(result['error'])[:_SEND_ERROR_CAP]
+        why = str(result['error'])[:_SEND_ERROR_CAP]
+        return f"{why}. {result['fix']}" if result.get('fix') else why
     sender = result.get('via') or 'no sender'
     if result.get('status_code') is not None:
         return f"{sender} answered {result['status_code']}"
@@ -402,7 +425,9 @@ def register_outreach_tools(helper, assistant, user_id: str):
     ) -> str:
         """Send an outreach email to a prospect and log it.
 
-        Uses the HertzAI email service (cortext@hertzai.com).
+        Sends through this node's email sender: its connected email
+        channel, else the HertzAI mailer.  A refused send says why and, when
+        no sender exists, what the owner sets up.
         Updates prospect stage to 'contacted' on first email.
         """
         data = _load_prospects()

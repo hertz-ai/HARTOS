@@ -26,12 +26,13 @@ rules are followed one by one:
     a ``tool`` message becomes a ``tool_result`` block in a user turn.
 Two things the layer cannot do are added: the effort the owner set for the
 configured expert (HEVOLVE_EXPERT_LLM_EFFORT, as output_config.effort), and
-leaving out a temperature or top_p the model would refuse (Claude Haiku 5.5).
+leaving out a temperature or top_p the model would refuse (_SAMPLING_FIXED_MODELS).
 Anything not mapped one to one here (streaming, ``response_format``, audio or
 file parts, legacy ``function_call`` messages, ``n`` other than 1, a field this
-module does not know) raises Untranslatable, and the hook sends the request
-to the compatibility layer exactly as it came: that call loses caching,
-nothing else.
+module does not know, a conversation that does not start with a user turn or
+ends on an assistant one) raises Untranslatable, and the hook sends the
+request to the compatibility layer exactly as it came: that call loses
+caching and the owner's effort setting, nothing else.
 
 Where the cache breakpoints go (a cache hit is a byte-identical prefix of
 tools, then system, then messages):
@@ -67,11 +68,16 @@ MAX_TOKENS_WHEN_UNSET = 32000
 
 _EPHEMERAL = {'type': 'ephemeral'}
 
-# Models that answer 400 to a non-default temperature or top_p (Anthropic's
-# reference, Claude Haiku 5.5).  The compatibility layer passes both through,
-# so there such a call fails; here they are left out and the model samples at
-# its default.
-_SAMPLING_FIXED_MODELS = ('claude-haiku-5-5',)
+# Models that answer 400 to a sampling parameter (Anthropic's reference):
+# a non-default temperature or top_p on Claude Sonnet 5 / 5.5 and Haiku 5.5,
+# any value on Claude Opus 4.7 and later and on every Fable and Mythos.  The
+# compatibility layer passes both through, so there such a call fails; here
+# they are left out and the model samples at its default, which is what an
+# omitted value means.  Matched by substring, like core.autogen_config's
+# model_family.
+_SAMPLING_FIXED_MODELS = ('claude-sonnet-5', 'claude-haiku-5', 'claude-opus-4-7',
+                          'claude-opus-4-8', 'claude-opus-5', 'claude-fable',
+                          'claude-mythos')
 
 # Request fields the compatibility layer documents as ignored.
 _IGNORED_FIELDS = frozenset({
@@ -227,6 +233,15 @@ def _conversation(messages):
             turns.append({'role': native_role, 'content': blocks})
     if not turns:
         raise Untranslatable('no user or assistant message')
+    # The Messages API answers 400 to a first message that is not the user's
+    # and, on Claude 5 models, to a last assistant message (a prefill).  Sent
+    # as they came, the compatibility layer is the one to judge them: 114 of
+    # 1,101 real request bodies on the owner's desktop started with an
+    # assistant turn (review of 2fc216a38, MF-1).
+    if turns[0]['role'] != 'user':
+        raise Untranslatable('the conversation does not start with a user turn')
+    if turns[-1]['role'] == 'assistant':
+        raise Untranslatable('the conversation ends with an assistant turn (a prefill)')
     return system_texts, system_leads, turns
 
 

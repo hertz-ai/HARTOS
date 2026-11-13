@@ -194,7 +194,19 @@ def _compat_reply():
     {'messages': [{'role': 'user', 'content': [
         {'type': 'input_audio', 'input_audio': {'data': 'AAAA', 'format': 'wav'}}]}]},
     {'messages': [{'role': 'function', 'name': 'f', 'content': 'x'}]},
-], ids=['response_format', 'n', 'audio', 'function_role'])
+    # The Messages API answers 400 to a first message that is not the
+    # user's and to a last assistant message (a prefill); 114 of 1,101 real
+    # request bodies on the owner's desktop started with an assistant turn
+    # (review of 2fc216a38, MF-1).
+    {'messages': [{'role': 'assistant', 'content': 'Hello, how can I help?'},
+                  {'role': 'user', 'content': 'hi'}]},
+    {'messages': [{'role': 'system', 'content': SYSTEM},
+                  {'role': 'assistant', 'content': 'Hello, how can I help?'},
+                  {'role': 'user', 'content': 'hi'}]},
+    {'messages': [{'role': 'user', 'content': 'hi'},
+                  {'role': 'assistant', 'content': 'Sure, here is'}]},
+], ids=['response_format', 'n', 'audio', 'function_role', 'leading_assistant',
+        'assistant_after_system', 'trailing_assistant'])
 def test_a_request_not_mapped_one_to_one_goes_to_the_layer_as_it_came(metered, extra):
     seen = []
 
@@ -260,6 +272,24 @@ def test_a_2xx_that_is_not_a_message_is_a_failed_call(metered):
 
 
 # ─── The meter ──────────────────────────────────────────────────────────
+
+def test_each_native_call_logs_its_cache_use(metered, caplog):
+    """Review of 2fc216a38, MF-4: nothing recorded the cache counts, so a
+    deploy could not show whether caching happened.  Each native call now
+    leaves one INFO line in the node's log with its prompt tokens and how
+    many were written to and read from the cache."""
+    import logging
+    handler, _ = _anthropic(_message([{'type': 'text', 'text': 'ok'}], usage={
+        'input_tokens': 100, 'output_tokens': 50,
+        'cache_creation_input_tokens': 1000, 'cache_read_input_tokens': 9000}))
+    with caplog.at_level(logging.INFO, logger='llm_outbound'):
+        _claude(handler).chat.completions.create(
+            model=MODEL, messages=[{'role': 'user', 'content': 'hi'}])
+    lines = [r.getMessage() for r in caplog.records if '[claude-native]' in r.getMessage()]
+    assert len(lines) == 1, lines
+    assert ('model=%s' % MODEL) in lines[0]
+    assert 'prompt=10100 output=50 cache_write=1000 cache_read=9000' in lines[0]
+
 
 def test_cache_reads_and_writes_are_metered_at_their_own_prices(metered, monkeypatch):
     monkeypatch.setenv('HEVOLVE_CLAUDE_USD_PER_1K_IN', '0.002')
@@ -379,13 +409,20 @@ def test_the_effort_is_only_the_configured_experts(monkeypatch):
     assert 'output_config' not in body
 
 
-def test_haiku_is_not_sent_a_temperature_it_would_refuse(metered, monkeypatch):
-    body = _sent_body(monkeypatch, HAIKU, temperature=0.2, top_p=0.9)
+@pytest.mark.parametrize('model', [HAIKU, 'claude-sonnet-5-5', 'claude-sonnet-5',
+                                   'claude-opus-5-5', 'claude-opus-4-8',
+                                   'claude-fable-5-2', 'claude-mythos-5-1'])
+def test_no_model_is_sent_a_sampling_value_it_would_refuse(metered, monkeypatch, model):
+    """Anthropic's reference: Sonnet 5 / 5.5 and Haiku 5.5 refuse a
+    non-default temperature or top_p, Opus 4.7 and later, Fable and Mythos
+    refuse any (review of 2fc216a38, MF-2).  Left out, the model samples at
+    its default."""
+    body = _sent_body(monkeypatch, model, temperature=0.2, top_p=0.9)
     assert 'temperature' not in body and 'top_p' not in body
 
 
-def test_sonnet_keeps_its_temperature(metered, monkeypatch):
-    assert _sent_body(monkeypatch, MODEL, temperature=0.2)['temperature'] == 0.2
+def test_an_older_claude_keeps_its_temperature(metered, monkeypatch):
+    assert _sent_body(monkeypatch, 'claude-sonnet-4-6', temperature=0.2)['temperature'] == 0.2
 
 
 def test_each_claude_model_is_priced_at_its_own_list_price(monkeypatch):
@@ -396,6 +433,14 @@ def test_each_claude_model_is_priced_at_its_own_list_price(monkeypatch):
     assert ac.model_usd_per_1k(HAIKU, prompt_tokens=150_000) == (0.0005, 0.0025)
     assert ac.model_usd_per_1k(HAIKU, prompt_tokens=100_000) == (0.0001, 0.0005)
     assert ac.model_usd_per_1k(MODEL) == (0.002, 0.010)
+    # Review of 2fc216a38, MF-3: every current model at its own list price
+    # (Anthropic, 2026-11), the most specific name winning over its prefix.
+    assert ac.model_usd_per_1k('claude-opus-5-5') == (0.004, 0.020)
+    assert ac.model_usd_per_1k('claude-opus-5') == (0.005, 0.025)
+    assert ac.model_usd_per_1k('claude-fable-5-2') == (0.008, 0.040)
+    assert ac.model_usd_per_1k('claude-mythos-5-2') == (0.008, 0.040)
+    assert ac.model_usd_per_1k('claude-fable-5-1') == (0.010, 0.050)
+    assert ac.model_usd_per_1k('claude-fable-5') == (0.010, 0.050)
     assert ac.model_usd_per_1k('claude-opus-4-1') == (0.003, 0.015)   # the family's
     assert ac.model_usd_per_1k('gpt-4o') is None
     # The meter: 1,000 fresh prompt tokens and 1,000 output tokens on Haiku 5.5.

@@ -62,6 +62,8 @@ def speech(monkeypatch, tmp_path):
     InMemoryBackend = pytest.importorskip('agent_ledger.backends').InMemoryBackend
 
     monkeypatch.chdir(tmp_path)
+    import core.cache_loaders as _cl
+    monkeypatch.setattr(_cl, 'AGENT_DATA_DIR', str(tmp_path / 'agent_data'))
     created_keys = []
     for name in ('user_agents', 'role_agents', 'user_journey', 'user_tasks',
                  'user_ledgers', 'recipes', 'agent_data', 'llm_call_track',
@@ -481,29 +483,45 @@ class TestAProseNoStepThatOnlyWritesOutputCompletesAsBefore:
 class TestADaemonTurnWalksTheParentsPaths:
     """Critical 2 left a daemon turn on the parent's paths until the owner
     ruled on daemon replay of 'no' steps.  The owner ruled on 31 Oct: a
-    background step whose output is a question goes to the owner, never
-    "done".  476bbd5d8's rework part A: the question is never the step's
-    receipt on any turn; part B parks the goal and asks the owner (not yet
-    landed, so no ask is recorded and nothing is held on a daemon turn)."""
+    background step whose output is a question pauses the goal and goes to
+    its person, never "done".  476bbd5d8's rework part A: the question is
+    never the step's receipt on any turn.  Part B (_reuse_hand_background_ask,
+    landed inside the sweep 0516f3981): the question is recorded as asked
+    through the escalation, the step holds through the canonical wait, and
+    the goal is handed to its person once (who is told: the tests of
+    test_a_daemon_ask_goes_to_the_owner.py).  These two pinned the interim
+    "no ask, nothing held" and went red when Part B landed."""
 
-    def test_a_daemon_tick_never_closes_the_ask_step_on_its_question(self, speech):
+    def _handed(self, run, monkeypatch):
+        handed = Mock(return_value='person')
+        monkeypatch.setattr(run.rr, 'hand_goal_to_its_person', handed)
+        return handed
+
+    def test_a_daemon_tick_never_closes_the_ask_step_and_hands_its_question_on(
+            self, speech, monkeypatch):
         from agent_ledger.core import TaskStatus
         run = speech(ask_verdict='completed')
+        handed = self._handed(run, monkeypatch)
         with patch.object(run.L, '_promote_verified_outcome') as promote:
             run.turn('tick', 'daemon_goal_turn')
         assert run.state['sends'] == [ASK_LINE]
         assert 1 not in [c.args[1] for c in promote.call_args_list]
-        assert _task(run, 1).status not in (TaskStatus.COMPLETED, TaskStatus.TERMINATED)
+        assert _task(run, 1).status == TaskStatus.BLOCKED
         assert run.rr.user_tasks[run.key].current_action == 1
-        assert all(_task(run, a).status != TaskStatus.BLOCKED for a in (1, 2, 3))
-        assert run.L.ledger_open_ask(run.key, 1, 0) is None
+        assert all(_task(run, a).status != TaskStatus.BLOCKED for a in (2, 3))
+        assert run.L.ledger_open_ask(run.key, 1, 0) is not None
+        assert [c.kwargs.get('ask') for c in handed.call_args_list] == [ASK_LINE], (
+            "the background step's question was not handed to the goal's person once")
 
-    def test_a_daemon_tick_with_a_pending_verdict_records_no_ask_and_holds_nothing(self, speech):
+    def test_a_daemon_tick_with_a_pending_verdict_holds_and_hands_its_question_on(
+            self, speech, monkeypatch):
         from agent_ledger.core import TaskStatus
         run = speech(ask_verdict='pending')
+        handed = self._handed(run, monkeypatch)
         run.turn('tick', 'daemon_goal_turn')
-        assert _task(run, 1).status != TaskStatus.BLOCKED
-        assert run.L.ledger_open_ask(run.key, 1, 0) is None
+        assert _task(run, 1).status == TaskStatus.BLOCKED
+        assert run.L.ledger_open_ask(run.key, 1, 0) is not None
+        assert [c.kwargs.get('ask') for c in handed.call_args_list] == [ASK_LINE]
 
 
 class TestAQuestionWrittenInThePromptedFormatIsRecorded:

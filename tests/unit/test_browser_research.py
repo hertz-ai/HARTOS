@@ -883,5 +883,130 @@ class TestRefusalsPointSomewhereReal(unittest.TestCase):
         self.assertIn('nothing was posted', result['error'])
 
 
+
+class TestTheToolTextNeverPromisesASignedInSession(unittest.TestCase):
+    """The text the model reads BEFORE it has any result to go on.
+
+    The result-level fix (connection_mechanism / authenticated / notice) can
+    only speak after a call has already gone out.  The three T2 tool texts
+    speak first, and they said the opposite of what the code does:
+
+      * all three advertised "the user's logged-in session";
+      * Search_Platform's docstring enumerated only the two AUTHENTICATED
+        connection_mechanism values (obscura_b2_cdp_user_chrome,
+        obscura_b1_headless_profile) and omitted logged_out_public -- the
+        only value production can return, because nothing writes to the
+        vault (AccountVault.add has no production caller);
+      * Post_As_User promised "the actual post happens with dry_run=False"
+        when there is no per-platform write path at all.
+
+    Both build_core_tool_closures sites in this file discard ``_desc``, so
+    none of that text was held by any test and it drifted from the behaviour
+    in silence.  This class holds it.
+    """
+
+    T2_TOOLS = ('Search_Platform', 'Read_Timeline', 'Post_As_User')
+
+    # Wordings that assert, with NO condition attached, that the call rides a
+    # session the person is signed in to.  "with the person's stored session
+    # if the vault holds one" is honest and must keep passing; these are not.
+    SIGNED_IN_CLAIMS = (
+        'logged-in session',
+        'logged in session',
+        'logged-in browser session',
+        'logged-in platform session',
+        "user's logged-in",
+        'your logged-in',
+    )
+
+    def _t2_text(self):
+        """{tool: (description, docstring)} for the three T2 tools, as registered."""
+        from core import agent_tools
+
+        class _FakeHelper:
+            def __init__(self): self.tools = []
+            def txt2img(self, *a, **kw): return ''
+            def get_user_camera_inp(self, *a, **kw): return ''
+            def save_agent_data_to_file(self, *a, **kw): return True
+
+        ctx = {
+            'user_id': 1, 'prompt_id': 'p1', 'agent_data': {},
+            'helper_fun': _FakeHelper(),
+            'user_prompt': 'x', 'request_id_list': {'x': 'r1'},
+            'recent_file_id': '', 'scheduler': None,
+            'log_tool_execution': (lambda f: f),
+            'send_message_to_user1': (lambda *a, **kw: None),
+            'retrieve_json': (lambda s: {}),
+            'strip_json_values': (lambda x: x),
+            'save_conversation_db': (lambda *a, **kw: None),
+        }
+        # Deliberately NOT self.skipTest() on a build failure, unlike the two
+        # older closure tests above: this class exists to READ the registered
+        # text, so a build that does not happen is a failure, not a quiet pass.
+        closures = agent_tools.build_core_tool_closures(ctx)
+        found = {}
+        for name, desc, fn in closures:
+            if name in self.T2_TOOLS:
+                found[name] = (desc or '', getattr(fn, '__doc__', '') or '')
+        missing = sorted(set(self.T2_TOOLS) - set(found))
+        self.assertFalse(missing,
+                         'T2 tools are not registered at all: %s' % missing)
+        return found
+
+    def test_no_t2_tool_text_promises_a_session_the_person_is_signed_in_to(self):
+        """Nothing writes to the vault, so every T2 call goes out logged out.
+
+        The text may offer the stored session CONDITIONALLY.  It may not
+        state as fact that the call rides one.
+        """
+        offenders = []
+        for name, (desc, doc) in sorted(self._t2_text().items()):
+            blob = (desc + '\n' + doc).lower()
+            for claim in self.SIGNED_IN_CLAIMS:
+                if claim.lower() in blob:
+                    offenders.append('%s says %r' % (name, claim))
+        self.assertEqual(
+            [], offenders,
+            'A T2 tool tells the model it has the person\'s signed-in '
+            'session. It does not: AccountVault.add has no production '
+            'caller, so the vault is empty and every call is the public '
+            'view or a login wall. Offenders: %s' % offenders)
+
+    def test_search_platform_names_the_mechanism_production_returns(self):
+        """Enumerating only the two authenticated values hides the real one."""
+        desc, doc = self._t2_text()['Search_Platform']
+        blob = desc + '\n' + doc
+        self.assertIn(
+            'logged_out_public', blob,
+            "Search_Platform's text lists connection_mechanism values but "
+            'not logged_out_public, which is the value every call returns '
+            'today. The model is told to expect a value it will never see.')
+        self.assertIn(
+            'authenticated', blob,
+            "Search_Platform's text must name the 'authenticated' field, "
+            'which is how the model knows whether the read was the public '
+            "view or the person's own.")
+
+    def test_post_as_user_text_does_not_promise_that_the_post_happens(self):
+        """dry_run=False has no write path: it returns the text unsent."""
+        desc, doc = self._t2_text()['Post_As_User']
+        low = (desc + '\n' + doc).lower()
+        for promise in ('actually posts', 'the actual post happens'):
+            self.assertNotIn(
+                promise, low,
+                'Post_As_User tells the model that dry_run=False posts. No '
+                'per-platform write path exists, so it returns success '
+                'False with the text back under "content" and nothing is '
+                'sent anywhere. Offending wording: %r' % promise)
+        says_it_cannot = any(s in low for s in (
+            'cannot post', 'cannot send', 'nothing was posted',
+            'does not post', 'unsent'))
+        self.assertTrue(
+            says_it_cannot,
+            'Post_As_User must tell the model, before it calls, that this '
+            'build cannot send the post -- otherwise the model offers to '
+            'post, calls with dry_run=False, and has to explain the refusal '
+            'afterwards.')
+
 if __name__ == '__main__':
     unittest.main()

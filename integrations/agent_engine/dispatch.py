@@ -412,9 +412,10 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
     # permanently -- one permit, so the node's background LLM would have been
     # wedged for the life of the process.
     _bound = None
+    _marked = None
     try:
         # Signal to the watchdog that this thread is in a legitimate LLM call.
-        _notify_watchdog_llm_start()
+        _marked = _notify_watchdog_llm_start()
         # A daemon-specific request_id keeps background thinking traces out of
         # user responses via drain_thinking_traces(), and is what
         # dispatch.is_genuine_user_request reads to classify the turn.
@@ -447,7 +448,7 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
                 logger.info(f"unbind_cancel({_bound}) failed: {e}")
         _local_llm_semaphore.release()
         try:
-            _notify_watchdog_llm_end()
+            _notify_watchdog_llm_end(_marked)
         except Exception:
             logger.debug('watchdog LLM-end notify failed', exc_info=True)
 
@@ -964,10 +965,6 @@ _HELD_FOR_ANOTHER_TURN = (f'{_DEFERRED_PREFIX} another turn of this '
                           f'conversation is running on a different model')
 _WAITING_FOR_THE_PERSON = (f'{_DEFERRED_PREFIX} the current step waits for the '
                            f"person's reply to its question")
-#: Why a goal's speculative turn returned nothing yet: it outlived its wait
-#: and is still running on the server (SpeculativeDispatcher, TurnStillRunning).
-_STILL_RUNNING = (f'{_DEFERRED_PREFIX} its turn is still running, so its '
-                  f'conversation is busy until that turn ends')
 
 
 def _failure_key(goal_id) -> tuple:
@@ -1131,21 +1128,17 @@ def speculative_turn_result(goal_id, spec) -> Optional[str]:
     empty reply is a failed turn too: the fast /chat call itself failed (a
     401, a timeout).  _dispatch_to_model swallows that cause, so the reason
     names the model, which is what an operator has to look at; 'error' is
-    set only when dispatch_speculative refused or raised.  The turn ran on
+    set when dispatch_speculative refused or raised, and when the turn was
+    still running at the end of its whole-turn wait (``still_running``).
+    That one is a failed turn too, struck like any other: held without a
+    strike, a goal whose turns never end was dispatched again every tick
+    with nothing to stop it, each time starting another turn on a
+    conversation still busy (review of 313ff63fc, M2).  The turn ran on
     this node, so the route is 'local'.
-
-    A turn that outlived even the dispatcher's whole-turn wait
-    (``still_running``) has no result yet and is held like a paused one:
-    no strike, retried on a later tick.
     """
     _clear_turn_record(goal_id)
     _record_route(goal_id, 'local', 'the speculative fast model ran it')
     spec = spec if isinstance(spec, dict) else {}
-    if spec.get('still_running'):
-        _record_turn_failure(goal_id, _STILL_RUNNING)
-        logger.info(f"Goal {goal_id}: {_STILL_RUNNING} "
-                    f"({spec.get('error') or 'no detail'}); held for a later tick")
-        return None
     reply = spec.get('response')
     if not isinstance(reply, str) or not reply.strip():
         why = spec.get('error') or (
@@ -1401,27 +1394,29 @@ except Exception:
                  'accessor fails open', exc_info=True)
 
 
-def _notify_watchdog_llm_start():
+def _notify_watchdog_llm_start() -> Optional[str]:
     """Tell the watchdog the current thread is blocked on a legitimate LLM call.
 
     The watchdog will extend the heartbeat threshold for threads marked
-    'in_llm_call' instead of restarting them.
+    'in_llm_call' instead of restarting them.  Returns the registered name
+    it marked, or None when it marked none; hand it to
+    _notify_watchdog_llm_end.
     """
     try:
         from security.node_watchdog import get_watchdog
         wd = get_watchdog()
         if not wd:
-            return
+            return None
         thread_name = threading.current_thread().name
         # Match by thread name — works for all daemon threads
         if wd.is_registered(thread_name):
             wd.mark_in_llm_call(thread_name)
-            return
+            return thread_name
         # Partial match (thread name might have suffix like 'agent_daemon-1')
         for name in wd.registered_names():
             if name in thread_name:
                 wd.mark_in_llm_call(name)
-                return
+                return name
         # Fallback: in-process/bundled mode — dispatch runs on a
         # different thread (e.g. Flask worker). Mark the calling daemon
         # via threadlocal source hint if available.
@@ -1430,22 +1425,33 @@ def _notify_watchdog_llm_start():
             source = get_task_source()
             if source and wd.is_registered(source):
                 wd.mark_in_llm_call(source)
-                return
+                return source
         except Exception:
             logger.debug('watchdog task-source lookup failed', exc_info=True)
     except Exception:
         logger.debug('watchdog LLM-start marker failed', exc_info=True)
+    return None
 
 
-def _notify_watchdog_llm_end():
-    """Clear the LLM call marker and send a heartbeat for all registered daemons."""
+def _notify_watchdog_llm_end(name: Optional[str] = None) -> None:
+    """Clear the LLM-call mark ``name`` (what _notify_watchdog_llm_start
+    returned) and heartbeat that thread, and only that one.  None: nothing
+    was marked, nothing to do.
+
+    It used to clear every registered thread's mark and heartbeat them all,
+    so any turn's end hid a thread that had frozen meanwhile.  Replayed over
+    central's turn ends on 2026-11-12 (review of 313ff63fc, M1), a frozen
+    thread with a 600 s threshold was restarted after 11,676 s instead of
+    606 s, and with the real watchdog one turn's end restarted a coding
+    daemon mid-call by clearing its mark."""
+    if not name:
+        return
     try:
         from security.node_watchdog import get_watchdog
         wd = get_watchdog()
         if wd:
-            for name in wd.registered_names():
-                wd.clear_llm_call(name)
-                wd.heartbeat(name)
+            wd.clear_llm_call(name)
+            wd.heartbeat(name)
     except Exception:
         logger.debug('watchdog LLM-end marker clear failed', exc_info=True)
 

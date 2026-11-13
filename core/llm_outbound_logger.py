@@ -909,6 +909,24 @@ def _claude_native_request(httpx_module, request, body):
         return None
 
 
+def _log_claude_cache_use(body, response) -> None:
+    """One INFO line per Claude call sent natively: its prompt tokens and how
+    many were written to and read from the prompt cache, so the cache hit
+    rate can be read from the node's log after a deploy (review of
+    2fc216a38, MF-4: nothing recorded the cache counts).  Never raises."""
+    try:
+        usage = _response_usage(response)
+        if usage is None:
+            return
+        tokens_in, tokens_out, written, read = usage
+        logger.info("[claude-native] model=%s request_id=%s prompt=%d output=%d "
+                    "cache_write=%d cache_read=%d",
+                    (body or {}).get('model') if isinstance(body, dict) else None,
+                    _get_request_id(), tokens_in, tokens_out, written, read)
+    except Exception as e:
+        logger.debug("[claude-native] usage line skipped: %s", e)
+
+
 def _send_claude_native(httpx_module, orig_send, client, request, native, kwargs):
     """Send the Messages API request ``native`` on the caller's own client
     and return its reply as the chat/completions response the caller reads,
@@ -919,7 +937,9 @@ def _send_claude_native(httpx_module, orig_send, client, request, native, kwargs
         reply.read()
     finally:
         reply.close()
-    return claude_native.chat_response(httpx_module, request, reply)
+    response = claude_native.chat_response(httpx_module, request, reply)
+    _log_claude_cache_use(_hosted_body(request), response)
+    return response
 
 
 async def _asend_claude_native(httpx_module, orig_send, client, request, native, kwargs):
@@ -930,7 +950,9 @@ async def _asend_claude_native(httpx_module, orig_send, client, request, native,
         await reply.aread()
     finally:
         await reply.aclose()
-    return claude_native.chat_response(httpx_module, request, reply)
+    response = claude_native.chat_response(httpx_module, request, reply)
+    _log_claude_cache_use(_hosted_body(request), response)
+    return response
 
 
 _CONFIGURED_ENDPOINTS_TTL = 30.0

@@ -219,6 +219,30 @@ def _unregister_session(user_id: str, prompt_id: str) -> None:
         _vlm_stop_flags.pop(key, None)
 
 
+def register_stop_session(user_id: str, prompt_id: str):
+    """Register something that is NOT a loop run but must end at Stop: a
+    demonstration recording (integrations.vlm.demo_session).  The ribbon's
+    Stop reaches it through /api/vlm/stop with no new route.
+
+    Returns the Event, or None when the key is already held.  It never clears
+    an existing flag the way _register_session does for a fresh run: a
+    registration that cleared a live loop's flag would silently un-set the
+    owner's Stop while that loop still drives the mouse.  The caller uses a
+    key no loop can have (a 'demo-<hex>' prompt id).
+    """
+    key = _stop_key(user_id, prompt_id)
+    with _vlm_stop_lock:
+        if key in _vlm_stop_flags:
+            return None
+        ev = _vlm_stop_flags[key] = _threading.Event()
+    return ev
+
+
+def unregister_stop_session(user_id: str, prompt_id: str) -> None:
+    """The pair of register_stop_session: drop the entry once it has ended."""
+    _unregister_session(user_id, prompt_id)
+
+
 def _background_run_must_yield() -> bool:
     """dispatch.background_work_must_yield for the loop: a background run stops
     between steps while the owner is using the computer (#129); a run the
