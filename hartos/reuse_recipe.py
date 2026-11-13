@@ -6018,6 +6018,50 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
     except Exception:
         _unrun = ['<unknown>']
 
+    # THE TURN'S WORDS ALREADY REACHED THE PERSON THROUGH THE SEND TOOL.  Then
+    # the reply is the newest of those sends (_reuse_turn_delivered_send, the
+    # finaliser's answer for such a turn), never what the group writes about
+    # them: asked for "the ANSWER for the user" after its sends went out, the
+    # model describes the sends or writes its working notes.  Measured live
+    # 2026-11-13 on build 75, three turns whose sends had reached the person:
+    #   18:49:37 (agent 1793373034536, local 4B; its send went out before the
+    #            steer)  "I see the system is now waiting for Arjun to respond
+    #            to the question "Sing a rhyme". The action to ask him is
+    #            pending his response on his device. ..."
+    #   18:50:28 (same agent; its send went out IN the steered round)  "I've
+    #            sent you a warm greeting and a fun rhyme about "Twinkle
+    #            twinkle little star" - ready for you to sing along! ..."
+    #   15:56:39 (Tamil speech agent, on Claude; three sends before the steer)
+    #            "I sent Arjun three messages: ..." in Tamil.
+    # The recovery below reads the same group prose: on 12-13 Nov most of the
+    # replies recovered or walked back to in a turn with a delivered send
+    # describe the sends ("I've sent a message to the user requesting ...",
+    # "The message has been sent to the child!").  Not when a tool the step
+    # named did not run: then the honest report of that goes out as before,
+    # whatever was sent (#808), so this answers False.  No send found, or one
+    # that cannot be read, leaves everything below as it was.
+    def _reply_with_the_send(when):
+        if _unrun:
+            return False
+        try:
+            _msgs = group_chat.messages
+            _sent = _reuse_turn_delivered_send(user_prompt, _msgs)
+            if not _sent:
+                return False
+            if not _msgs or (_msgs[-1] or {}).get('content') != _sent:
+                _msgs.append({'content': _sent,
+                              'name': 'Assistant',
+                              'role': 'assistant'})
+        except Exception as _send_err:
+            _say('warning', f"[SYNTHESIS] this turn's sends unreadable: "
+                            f"{_send_err!r}; going on as before")
+            return False
+        _say('info', f"[SYNTHESIS] this turn's words reached the person "
+                     f"through the send tool {when}; the newest send is the "
+                     f"reply, not the group's words about it (session: "
+                     f"{user_prompt}, head={_sent[:120]!r})")
+        return True
+
     # WHAT THE LIFECYCLE RECORDED decides it too.  The tool predicate above
     # answers "did this action's NAMED tools run", and returns [] for a prose
     # action that names none -- so on its own it let a GAVE_UP action, or a
@@ -6072,6 +6116,8 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
         _unfinished = ['the state of the actions could not be read']
 
     if _unrun or _unfinished:
+        if _reply_with_the_send('and part of the turn did not finish'):
+            return False
         _clauses = []
         if _unrun:
             _clauses.append(
@@ -6121,6 +6167,12 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
                              f"answer there is no data for (session: "
                              f"{user_prompt}, {_before} msgs)")
                 return False
+
+        # Below the no-data report (its honest sentence outranks a send that
+        # may have filled the gap), above the recovery (which reads the
+        # group's words about the sends; see _reply_with_the_send).
+        if _reply_with_the_send('and every step it ran finished'):
+            return False
 
         # THE ACTION MAY HAVE ALREADY WRITTEN THE ANSWER.  Only asked once
         # everything really ran — a recovered message asserts whatever the
@@ -6189,6 +6241,10 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
     _after = len(getattr(group_chat, 'messages', None) or [])
     _say('info', f"[SYNTHESIS] round returned ({_before} -> {_after} msgs); "
                  f"still control JSON: {_reuse_needs_synthesis(group_chat)}")
+    # The round itself can send, though the steer says to run no tool (live
+    # 18:50:28 above): no send had gone out before it, so a send now is the
+    # round's, and it is the reply, not the round's words about it.
+    _reply_with_the_send('in the steered round')
     return True
 
 
