@@ -3521,6 +3521,12 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
             from integrations.commerce.commerce_tools import register_commerce_tools
             register_commerce_tools(helper, assistant, user_id, executor=executor)
             current_app.logger.info("Commerce tools loaded (Tier 2) for reuse agent")
+        if 'backend_repair' in goal_tags:
+            # Parity with create_recipe.py: a self-heal or TTS provisioning
+            # recipe that names repair_backend_venv replays with it.
+            from integrations.coding_agent.backend_repair_tools import register_backend_repair_tools
+            register_backend_repair_tools(helper, assistant, user_id, executor=executor)
+            current_app.logger.info("Backend repair tools loaded (Tier 2) for reuse agent")
     except Exception as e:
         # Same observability promotion as create_recipe.py — a failure
         # here strips the agent of goal-specific tools, agent talks

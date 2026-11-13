@@ -24,6 +24,11 @@ Wired in
   ``AUTOEVOLVE_CODE_TOOLS`` / ``AUTO_EVOLVE_TOOLS`` /
   ``THOUGHT_EXPERIMENT_TOOLS`` — see
   ``mcp_http_bridge._load_tools`` around the registration tuple list.
+  That serves outside callers only.
+* In-process agents get them from ``register_backend_repair_tools``,
+  which ``create_recipe`` and ``reuse_recipe`` call for a goal tagged
+  ``backend_repair`` (``marketing_tools.detect_goal_tags``: the goal's
+  words name one of these tools).
 * ``goal_manager._build_self_heal_prompt`` mentions
   ``repair_backend_venv`` when the goal's ``category`` is one of the
   TTS / subprocess install-failure shapes AND ``context.backend`` is
@@ -346,3 +351,35 @@ BACKEND_REPAIR_TOOLS = [
         'tags': ['provision', 'self_heal', 'tts'],
     },
 ]
+
+
+def register_backend_repair_tools(helper, assistant, user_id: str,
+                                  executor=None):
+    """Register BACKEND_REPAIR_TOOLS on an in-process autogen agent (Tier 2).
+
+    The MCP bridge serves outside callers only.  An agent HARTOS builds
+    in-process gets a tool family through the Tier-2 goal gate alone:
+    marketing_tools.detect_goal_tags tags a goal whose words name one of
+    these tools 'backend_repair', and create_recipe and reuse_recipe call
+    this under ``if 'backend_repair' in goal_tags``.  Measured live 13 Nov
+    2026 (Nunba build 75): a self_heal goal told its agent to call
+    repair_backend_venv(backend_name='mms_tts'), the tool was never
+    attached, and the action failed with "tool 'repair_backend_venv' does
+    not exist" and was retried 148 times.
+
+    The news family's shape (news_tools.register_news_tools): schema on the
+    Helper and the Assistant, execution on the Assistant and, when given, on
+    a distinct ``executor`` so the Assistant's own call does not strand.
+    The functions are this module's own, so the bridge and the agents run
+    one implementation.
+    """
+    for tool in BACKEND_REPAIR_TOOLS:
+        name, desc, func = tool['name'], tool['description'], tool['func']
+        helper.register_for_llm(name=name, description=desc)(func)
+        assistant.register_for_llm(name=name, description=desc)(func)
+        assistant.register_for_execution(name=name)(func)
+        if executor is not None:
+            executor.register_for_execution(name=name)(func)
+
+    logger.info(f"Registered {len(BACKEND_REPAIR_TOOLS)} backend repair "
+                f"tools for user {user_id}")

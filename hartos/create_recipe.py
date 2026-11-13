@@ -2179,6 +2179,16 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
             from integrations.commerce.commerce_tools import register_commerce_tools
             register_commerce_tools(helper, assistant, user_id)
             tool_logger.info("Commerce tools loaded (Tier 2) based on prompt content")
+        if 'backend_repair' in goal_tags:
+            # repair_backend_venv / next_tts_venv_to_provision: the tools a
+            # self_heal goal's backend branch and the TTS provisioning seed
+            # tell the agent to call.  Only the MCP bridge registered them,
+            # so a self-heal agent was told to call a tool it did not have
+            # (build 75, 13 Nov 2026: one action retried 148 times).  The
+            # executor as the reel family below passes it.
+            from integrations.coding_agent.backend_repair_tools import register_backend_repair_tools
+            register_backend_repair_tools(helper, assistant, user_id, executor=executor)
+            tool_logger.info("Backend repair tools loaded (Tier 2) based on prompt content")
     except Exception as e:
         # Promoted from debug to warning: a failure here means the agent
         # boots without its goal-specific tools, so it can talk about the

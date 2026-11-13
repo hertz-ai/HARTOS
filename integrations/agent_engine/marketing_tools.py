@@ -1302,6 +1302,20 @@ def detect_goal_tags(prompt) -> list:
     if _mentions(lower, commerce_keywords):
         tags.append('commerce')
 
+    # Backend repair (integrations/coding_agent/backend_repair_tools): the
+    # tools a self_heal goal's backend branch (goal_manager.
+    # _build_self_heal_prompt) and the TTS provisioning seed tell the agent
+    # to call.  Their EXACT names only: the tag grants a tool that installs
+    # and wipes venvs (after the owner's yes), and these names occur in no
+    # other goal's words.  Measured live 13 Nov 2026 (Nunba build 75): a
+    # self_heal agent told to call repair_backend_venv(backend_name='mms_tts')
+    # never had it, and the action was retried 148 times.
+    backend_repair_keywords = [
+        'repair_backend_venv', 'next_tts_venv_to_provision',
+    ]
+    if _mentions(lower, backend_repair_keywords):
+        tags.append('backend_repair')
+
     # Reel Studio: her own reel editor (integrations/reel_studio).  ONLY
     # phrases that mean editing HER OWN videos (amendment A8): the tag grants
     # the reel tools.  Words about an audience or about marketing content --
