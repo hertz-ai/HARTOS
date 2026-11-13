@@ -32,7 +32,12 @@ CONFIG = {
                'actions': [f"send_message_to_user to Arjun: '{TAMIL}'"],
                'sub_goal': 'Arjun names his mother'}],
 }
-FILES = ('hartos/create_recipe.py', 'hartos/reuse_recipe.py', 'hart_intelligence_entry.py')
+FILES = ('hartos/create_recipe.py', 'hartos/reuse_recipe.py', 'hart_intelligence_entry.py',
+         # the agent listing, the recipe experience merge and the baseline snapshots
+         # read the same agent files (claude-autostart-93's audit of 14924596a: the
+         # listing dropped both Tamil agents and garbled 392 of 2558 records)
+         'core/prompt_files.py', 'hartos/recipe_experience.py',
+         'integrations/agent_engine/agent_baseline_service.py')
 
 
 @pytest.fixture
@@ -67,6 +72,13 @@ def test_the_reuse_path_reads_a_tamil_agent(agent_file, windows_default, monkeyp
     from hartos import reuse_recipe as rr
     monkeypatch.setattr(rr.helper_fun, 'safe_prompt_path', lambda *a, **k: agent_file)
     assert rr._reuse_flow_persona(4242, 0) == 'Child'
+
+
+def test_the_agent_listing_keeps_a_tamil_agent_whole(agent_file, windows_default):
+    from core.prompt_files import local_agent_prompts
+    listed = dict(local_agent_prompts(os.path.dirname(agent_file)))
+    assert set(listed) == {'4242'}, listed
+    assert TAMIL in listed['4242']['flows'][0]['actions'][0]
 
 
 def _text_reads_without_encoding(rel):
