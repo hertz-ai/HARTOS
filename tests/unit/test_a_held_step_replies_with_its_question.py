@@ -210,10 +210,34 @@ class TestAHeldStepRepliesWithItsQuestion:
             'the reply is the record\'s 1000-char cut, and the question at '
             'the end of the send is lost')
 
+    def test_a_later_send_in_the_turn_is_not_the_question(self, rr, monkeypatch):
+        """Review of 6e1c93995: the reply read the turn's NEWEST delivered
+        send, so a turn that asked and then sent "Take your time, Arjun!"
+        replied with that line and the question was lost from the reply.
+        Only the send that asked (its text begins with the recorded question)
+        is the reply.  RED on 6e1c93995 (reviewer's probe_two_sends)."""
+        import json
+        later = 'Take your time, Arjun!'
+        seed = 'seed of ' + THIS_TURN
+        later_call = dict(SEND_CALL, tool_calls=[{
+            'id': 'call_2', 'type': 'function', 'function': {
+                'name': 'send_message_to_user',
+                'arguments': json.dumps({'text': later, 'expects_reply': False})}}])
+        history = [{'role': 'user', 'name': 'ChatInstructor', 'content': seed},
+                   dict(DISPATCH), dict(SEND_CALL), dict(RECEIPT),
+                   later_call, dict(RECEIPT, tool_call_id='call_2'), dict(VERDICT)]
+        monkeypatch.setattr(rr, '_reuse_turn_start',
+                            {SESSION: {'seed_text': seed}}, raising=True)
+        _posted, chat, rec = _run(rr, monkeypatch, ask=_ask(), history=history)
+        assert rec.messages == []
+        assert chat.messages[-1]['content'] == QUESTION, (
+            'the reply is a later send, not the question the step asked')
+
     def test_with_no_send_in_this_turn_the_record_is_the_reply(
             self, rr, monkeypatch):
         """The record's question stays the answer when this turn's window
-        holds no delivered send (no seed recorded: the reader finds none)."""
+        holds no seed (the reader finds no delivered send).  The record's
+        question also stays when no delivered send begins with it."""
         monkeypatch.setattr(rr, '_reuse_turn_start', {}, raising=True)
         _posted, chat, rec = _run(rr, monkeypatch, ask=_ask())
         assert rec.messages == []

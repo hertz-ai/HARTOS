@@ -5279,7 +5279,7 @@ def _reuse_turn_refused_prose(user_prompt, messages):
     return None
 
 
-def _reuse_turn_delivered_send(user_prompt, messages):
+def _reuse_turn_delivered_send(user_prompt, messages, starts_with=None):
     """The text of this turn's newest send_message_to_user that reached the
     person (lifecycle_hooks.send_delivered), or None: the finaliser's answer
     for a turn whose words went out only through the send tool.  Such a turn
@@ -5287,7 +5287,10 @@ def _reuse_turn_delivered_send(user_prompt, messages):
     this rework: an ask sent mid-turn, then a pending verdict and an empty
     synthesis round, would otherwise be answered "I couldn't finish that").
     Only after this request's seed; the text is the call's own ``text``
-    (_reuse_send_text)."""
+    (_reuse_send_text).  With ``starts_with``, only a send whose text begins
+    with it counts: a held step's recorded question is the first 1000
+    characters of the send that asked it, and a later send in the same turn
+    ("Take your time, Arjun!") is not that question (review of 6e1c93995)."""
     start = _reuse_turn_seed_index(user_prompt, messages)
     if start is None:
         return None
@@ -5305,7 +5308,9 @@ def _reuse_turn_delivered_send(user_prompt, messages):
             body = str(result.get('content') or m.get('content') or '')
             if call_fn.get(call_id) == SEND_TOOL and send_delivered(body):
                 text = _reuse_send_text(window, call_id)
-                if isinstance(text, str) and text.strip():
+                if (isinstance(text, str) and text.strip()
+                        and (starts_with is None
+                             or text.strip().startswith(str(starts_with).strip()))):
                     return text
     return None
 
@@ -5881,8 +5886,11 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
             # send whose question comes last would reply without the
             # question (review of f821c3942, MF-2: a 1313-char send).  The
             # record's text stays the answer when the window has no send.
+            # Only the send that asked it: a later send this turn is not the
+            # question (review of 6e1c93995).
             if _ask.get('via') == 'send':
-                _question = (_reuse_turn_delivered_send(user_prompt, _msgs)
+                _question = (_reuse_turn_delivered_send(user_prompt, _msgs,
+                                                        starts_with=_question)
                              or _question)
             if not _msgs or (_msgs[-1] or {}).get('content') != _question:
                 _msgs.append({'content': _question,
