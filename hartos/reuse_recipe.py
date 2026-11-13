@@ -591,7 +591,7 @@ def _reuse_agent_personas(prompt_id):
     """The persona names this agent declares (its prompt file's 'personas');
     [] when it declares none or the file cannot be read."""
     try:
-        with open(helper_fun.safe_prompt_path(prompt_id), 'r') as f:
+        with open(helper_fun.safe_prompt_path(prompt_id), 'r', encoding='utf-8') as f:
             data = json.load(f) or {}
     except Exception:
         return []
@@ -1382,7 +1382,7 @@ def create_agents_for_role(user_id: str, prompt_id):
 
     personas = []
     try:
-        with open(helper_fun.safe_prompt_path(prompt_id), 'r') as f:
+        with open(helper_fun.safe_prompt_path(prompt_id), 'r', encoding='utf-8') as f:
             config = json.load(f)
             personas = config['personas']
             current_app.logger.info(f'Available Personas {personas}')
@@ -1690,14 +1690,14 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
     # role = get_role(user_id,prompt_id)
     role_number, role = get_flow_number(user_id, prompt_id)
 
-    with open(helper_fun.safe_prompt_path(prompt_id, role_number, 'recipe'), 'r') as f:
+    with open(helper_fun.safe_prompt_path(prompt_id, role_number, 'recipe'), 'r', encoding='utf-8') as f:
         config = json.load(f)
         config = _normalize_flow_recipe(config)  # tolerate per-action recipe in flow slot
         recipes[user_prompt] = config
         final_recipe[prompt_id] = config
     goal = ''
     stored_goal_tags = None
-    with open(helper_fun.safe_prompt_path(prompt_id), 'r') as f:
+    with open(helper_fun.safe_prompt_path(prompt_id), 'r', encoding='utf-8') as f:
         config = json.load(f)
         goal = config['goal']
         # The name the person gave the agent, kept here: ``config`` is
@@ -1875,7 +1875,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
     for i in range(1, (len(recipes[user_prompt]['actions']) + 1)):
         current_app.logger.info(f'checking for {helper_fun.safe_prompt_path(prompt_id, role_number, i)}')
         try:
-            with open(helper_fun.safe_prompt_path(prompt_id, role_number, i), 'r') as f:
+            with open(helper_fun.safe_prompt_path(prompt_id, role_number, i), 'r', encoding='utf-8') as f:
                 config = json.load(f)
                 individual_recipe.append(_saved_action_without_values(config))
         except Exception as e:
@@ -2230,7 +2230,7 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
             person: Annotated[str, "The user id of the one to move, only when the person you are serving joined more than one chat with this agent; else empty"] = '',
         ) -> str:
             try:
-                with open(helper_fun.safe_prompt_path(prompt_id), 'r') as f:
+                with open(helper_fun.safe_prompt_path(prompt_id), 'r', encoding='utf-8') as f:
                     data = json.load(f) or {}
             except Exception as e:
                 current_app.logger.warning(f'[REUSE] move_person_to_flow: agent {prompt_id} unreadable: {e}')
@@ -2704,7 +2704,7 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
                                 if os.path.exists(vlm_agent_path):
                                     file_size = os.path.getsize(vlm_agent_path)
                                     current_app.logger.info(f"Confirmed VLM file exists with size: {file_size} bytes")
-                                    with open(vlm_agent_path, 'r') as f:
+                                    with open(vlm_agent_path, 'r', encoding='utf-8') as f:
                                         test_read = json.load(f)
                                         current_app.logger.info(f"Successfully read back VLM file with action: {test_read.get('action', 'unknown')}")
                                 else:
@@ -7610,7 +7610,7 @@ def get_flow_number(user_id, prompt_id):
         role = None
     current_app.logger.info(f'Got role as {role}')
     file_path = helper_fun.safe_prompt_path(prompt_id)
-    with open(file_path, 'r') as f:
+    with open(file_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
         # .get(), not [].  These two subscripts killed the whole /chat POST:
         # 2026-09-11 02:50:43, "Some ERROR IN REUSE RECIPE 'personas'" ->
@@ -7696,7 +7696,7 @@ def create_schedule(prompt_id, user_id):
     _ctx_safe_log('info', 'INSIDE Create Schedule')
     user_prompt = f'{user_id}_{prompt_id}'
     role_number, role = get_flow_number(user_id, prompt_id)
-    with open(helper_fun.safe_prompt_path(prompt_id, role_number, 'recipe'), 'r') as f:
+    with open(helper_fun.safe_prompt_path(prompt_id, role_number, 'recipe'), 'r', encoding='utf-8') as f:
         config = json.load(f)
         config = _normalize_flow_recipe(config)  # tolerate per-action recipe in flow slot
         recipes[user_prompt] = config
@@ -8176,7 +8176,7 @@ def _reuse_flow_persona(prompt_id, flow):
     """The persona flow number ``flow`` of this agent belongs to (its prompt
     file's 'flows'); None when there is no such flow.  Raises when the file
     cannot be read: both callers keep their own never-fail handling."""
-    with open(helper_fun.safe_prompt_path(prompt_id), 'r') as f:
+    with open(helper_fun.safe_prompt_path(prompt_id), 'r', encoding='utf-8') as f:
         flows = (json.load(f) or {}).get('flows') or []
     return (flows[flow] or {}).get('persona') if 0 <= flow < len(flows) else None
 
@@ -8234,7 +8234,7 @@ def _reuse_settle_person_flow(user_id, prompt_id, user_prompt):
         return
     try:
         from core.flow_progress import settle
-        with open(helper_fun.safe_prompt_path(prompt_id), 'r') as f:
+        with open(helper_fun.safe_prompt_path(prompt_id), 'r', encoding='utf-8') as f:
             flows = (json.load(f) or {}).get('flows') or []
         flow = settle(user_id, prompt_id, flows,
                       _reuse_place_persona(user_id, prompt_id, _reuse_agent_personas(prompt_id)))

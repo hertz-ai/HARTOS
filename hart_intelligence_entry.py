@@ -401,7 +401,7 @@ def hevolve_verify_boot():
         _boot_logger.warning(msg)
         return
 
-    with open(manifest_path) as f:
+    with open(manifest_path, encoding='utf-8') as f:
         d = json.load(f)
 
     pub_hex = d.get("master_public_key")
@@ -1774,7 +1774,7 @@ except Exception as e:
 config = {}
 for _cfg_name in ('langchain_config.json', 'config.json'):
     try:
-        with open(_cfg_name, 'r') as f:
+        with open(_cfg_name, 'r', encoding='utf-8') as f:
             _loaded = json.load(f)
         # Distinguish langchain config (has API keys) from Nunba URL config (has IP_ADDRESS)
         if 'IP_ADDRESS' not in _loaded or any(k.endswith('_API_KEY') for k in _loaded):
@@ -3197,7 +3197,7 @@ def _push_workflow_flowchart(user_id, prompt_id, request_id=None):
         recipe_path = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
         if not os.path.isfile(recipe_path):
             return
-        with open(recipe_path) as f:
+        with open(recipe_path, encoding='utf-8') as f:
             recipe_data = json.load(f)
         crossbar_message = {
             "text": ["Agent workflow ready"],
@@ -10927,7 +10927,7 @@ def chat():
         # instead of entering gather_info/CREATE mode
         if os.path.exists(_prompt_path):
             try:
-                with open(_prompt_path, 'r') as _pf:
+                with open(_prompt_path, 'r', encoding='utf-8') as _pf:
                     _agent_meta = json.load(_pf)
                 if _agent_meta.get('is_system_agent'):
                     # System agent: use its system_prompt for langchain casual chat
@@ -10966,7 +10966,7 @@ def chat():
                 if os.path.exists(os.path.join(PROMPTS_DIR, f'{prompt_id}_0_recipe.json')):
                     app.logger.info('0 Recipe JSON EXISTS')
                     file_path = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
-                    with open(file_path, 'r') as f:
+                    with open(file_path, 'r', encoding='utf-8') as f:
                         data = json.load(f)
                         no_of_flow = len(data['flows'])-1
                         app.logger.info(f'GOT LEN OF FLOW AS {no_of_flow}')
@@ -11012,7 +11012,7 @@ def chat():
                         if not review_agents.get(_ak):
                             try:
                                 with open(os.path.join(PROMPTS_DIR, f'{prompt_id}.json'),
-                                          'r') as _bf:
+                                          'r', encoding='utf-8') as _bf:
                                     _bdata = json.load(_bf)
                             except Exception:
                                 _bdata = {}
@@ -11024,7 +11024,7 @@ def chat():
                         _touch_agent_timestamp(_ak)
                     else:
                         try:
-                            with open(os.path.join(PROMPTS_DIR, f'{prompt_id}.json'), 'r') as _gpf:
+                            with open(os.path.join(PROMPTS_DIR, f'{prompt_id}.json'), 'r', encoding='utf-8') as _gpf:
                                 _gate_meta = json.load(_gpf)
                             if _gate_meta.get('flows') and _gate_meta['flows'][0].get('system_prompt'):
                                 custom_prompt = _gate_meta['flows'][0]['system_prompt']
@@ -11811,7 +11811,7 @@ def chat():
 
     if prompt_id and os.path.exists(os.path.join(PROMPTS_DIR, f'{prompt_id}.json')):
         _ak = f'{user_id}_{prompt_id}'  # Ensure compound key available for reuse path
-        with open(os.path.join(PROMPTS_DIR, f'{prompt_id}.json'), "r") as file:
+        with open(os.path.join(PROMPTS_DIR, f'{prompt_id}.json'), "r", encoding="utf-8") as file:
             created_json = json.load(file)
 
 
@@ -12699,7 +12699,7 @@ def _create_social_agent_from_prompt(user_id, prompt_id):
     prompt_file = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
     if not os.path.exists(prompt_file):
         return
-    with open(prompt_file, 'r') as f:
+    with open(prompt_file, 'r', encoding='utf-8') as f:
         data = json.load(f)
 
     agent_display_name = data.get('name', f'Agent {prompt_id}')
@@ -12948,7 +12948,7 @@ def create_prompts():
         local_path = os.path.join(PROMPTS_DIR, f'{pid}.json')
         local_data = {}
         if os.path.exists(local_path):
-            with open(local_path, 'r') as f:
+            with open(local_path, 'r', encoding='utf-8') as f:
                 local_data = json.load(f)
 
         local_data['name'] = item.get('name', local_data.get('name', ''))

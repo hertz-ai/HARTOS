@@ -1084,7 +1084,7 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
 
     custom_agents = []
     agents_object = {}
-    with open(helper_fun.safe_prompt_path(prompt_id), 'r') as f:
+    with open(helper_fun.safe_prompt_path(prompt_id), 'r', encoding='utf-8') as f:
             config = json.load(f)
             list_of_persona = config['flows'][get_current_flow(user_prompt)]['persona']
             current_app.logger.info(f'WORKING persona as {list_of_persona}')
@@ -6538,20 +6538,20 @@ def after_all_actions_terminated(assistant_agent, chat_instructor, group_chat, j
                 action_ids = ast.literal_eval(match.group())
 
                 file_path = helper_fun.safe_prompt_path(prompt_id, flow, num)
-                with open(file_path, 'r') as f:
+                with open(file_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                 data['actions_this_action_depends_on'] = action_ids
                 atomic_json_write(file_path, data, indent=4)
             else:
                 file_path = helper_fun.safe_prompt_path(prompt_id, flow, num)
-                with open(file_path, 'r') as f:
+                with open(file_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                 data['actions_this_action_depends_on'] = []
                 atomic_json_write(file_path, data, indent=4)
         except (ValueError, SyntaxError) as e:
             current_app.logger.info(f'GOT ERROR AT EVAL OF LIST :{e}')
             file_path = helper_fun.safe_prompt_path(prompt_id, flow, num)
-            with open(file_path, 'r') as f:
+            with open(file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             data['actions_this_action_depends_on'] = []
             atomic_json_write(file_path, data, indent=4)
@@ -6597,13 +6597,13 @@ def after_all_actions_terminated_from_exception(assistant_agent, chat_instructor
             except (ValueError, SyntaxError):
                 action_ids = []
             file_path = helper_fun.safe_prompt_path(prompt_id, flow, num)
-            with open(file_path, 'r') as f:
+            with open(file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             data['actions_this_action_depends_on'] = action_ids
             atomic_json_write(file_path, data, indent=4)
         else:
             file_path = helper_fun.safe_prompt_path(prompt_id, flow, num)
-            with open(file_path, 'r') as f:
+            with open(file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             data['actions_this_action_depends_on'] = []
             atomic_json_write(file_path, data, indent=4)
@@ -7190,7 +7190,7 @@ def set_individual_recipes(flow, individual_recipe, prompt_id, user_prompt):
         _recipe_path = helper_fun.safe_prompt_path(prompt_id, flow, i)
         current_app.logger.info(f'checking for {_recipe_path}')
         try:
-            with open(_recipe_path, 'r') as f:
+            with open(_recipe_path, 'r', encoding='utf-8') as f:
                 config = json.load(f)
                 individual_recipe.append(config)
         except FileNotFoundError:
@@ -7561,7 +7561,7 @@ def load_existing_metadata(prompt_id, user_prompt, flow_progress, user_id):
             for action_id in sorted(progress['completed_actions'], reverse=True):
                 action_file = helper_fun.safe_prompt_path(prompt_id, flow_idx, action_id)
                 try:
-                    with open(action_file, 'r') as f:
+                    with open(action_file, 'r', encoding='utf-8') as f:
                         action_data = json.load(f)
                         if 'metadata' in action_data and action_data['metadata']:
                             # Merge metadata into the creator's own memory
@@ -7769,7 +7769,7 @@ def get_current_flow(user_prompt):
 def create_time_agents_and_create_scheduled_jobs(flows, number_of_flows, prompt_id, user_id, user_prompt):
     for i in range(number_of_flows):
         _recipe_file = helper_fun.safe_prompt_path(prompt_id, i, 'recipe')
-        with open(_recipe_file, 'r') as f:
+        with open(_recipe_file, 'r', encoding='utf-8') as f:
             merged_dict = json.load(f)
             final_recipe[prompt_id] = merged_dict
             current_app.logger.info(f'updating the final recipe with {_recipe_file}')
@@ -7828,7 +7828,7 @@ def _drop_non_flow_entries(config, prompt_id):
 
 
 def get_prompt_config_json(prompt_id):
-    with open(helper_fun.safe_prompt_path(prompt_id), 'r') as f:
+    with open(helper_fun.safe_prompt_path(prompt_id), 'r', encoding='utf-8') as f:
         config = json.load(f)
     return _drop_non_flow_entries(config, prompt_id)
 
