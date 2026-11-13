@@ -907,6 +907,67 @@ def _carry_reply_media(user_id, json_obj, prompt_id, request_id):
         return []
 
 
+# The greeting a REUSE session's prompt carries (its "Opening:" line, which
+# core.agent_personality.spoken_greeting writes), recorded where the session's
+# agents are built (create_agents_for_user), and whether the agent has already
+# said something to the person in this session.  A TTLCache like the agents.
+_reuse_greeting = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_greeting')
+
+
+def _reuse_remember_greeting(user_prompt, personality):
+    """Record the greeting the session's prompt opens with: the "Opening:"
+    line build_personality_prompt writes for ``personality``, from the one
+    source, spoken_greeting.  A rebuild of the session's agents keeps whether
+    it was already said."""
+    try:
+        from core.agent_personality import spoken_greeting
+        _reuse_greeting[user_prompt] = {
+            'greeting': spoken_greeting(personality),
+            'said': bool((_reuse_greeting.get(user_prompt) or {}).get('said'))}
+    except Exception as err:
+        _ctx_safe_log('warning', f"greeting not recorded for {user_prompt}: "
+                                 f"{err!r}; later messages keep it as written")
+
+
+def _reuse_greet_once(user_prompt, text):
+    """``text`` without the session's greeting at its start when the agent
+    has already said something to the person in this session; else ``text``.
+
+    The prompt gives the greeting as the opening, and the local 4B opens
+    later messages with it too.  Live 2026-11-13 on build 75: the tutor
+    (agent 54) began its 3rd and 4th replies (18:59:16, 19:01:04) and the
+    singing agent (1793373034536) its 2nd and 3rd turns' sends (18:50:07,
+    18:52:00) with "Hey there! I'm <name>, and I'm genuinely excited to work
+    with you on this."  So a repeat is dropped here, not left to the model.
+    Only the exact greeting, only at the start, and never down to nothing: a
+    message that is only the greeting stays (an empty reply is a failed
+    turn, #797)."""
+    try:
+        record = _reuse_greeting.get(user_prompt)
+        if not isinstance(text, str) or not isinstance(record, dict):
+            return text
+        greeting = str(record.get('greeting') or '').strip()
+        if not record.get('said') or not greeting:
+            return text
+        body = text.lstrip()
+        if not body.startswith(greeting):
+            return text
+        return body[len(greeting):].lstrip() or text
+    except Exception:
+        return text
+
+
+def _reuse_spoke(user_prompt):
+    """The agent has said something to the person in this session: a send
+    that reached them, or a turn's reply."""
+    try:
+        record = _reuse_greeting.get(user_prompt)
+        if isinstance(record, dict):
+            record['said'] = True
+    except Exception:
+        pass
+
+
 def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_delay=50,
                           media_refs=None):
     """
@@ -939,6 +1000,8 @@ def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_dela
     # 2026-09-27; review of d99b1aa88: the central POST sent it).
     from core.llm_outbound_logger import strip_elided_pointers
     response = strip_elided_pointers(response)
+    # The greeting once per session, not again in a later send.
+    response = _reuse_greet_once(user_prompt, response)
 
     message_hash = get_message_hash(response, original_request_id)
     unique_message_key = f"{original_request_id}_{message_hash}"
@@ -992,6 +1055,7 @@ def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_dela
             _ctx_safe_log(
                 'info',
                 f'Message published locally with request_id: {intermediate_request_id}')
+            _reuse_spoke(user_prompt)
             return f'Message sent successfully to user with request_id: {original_request_id}'
         _ctx_safe_log(
             'error',
@@ -1026,6 +1090,7 @@ def send_message_to_user1(user_id, response, inp, prompt_id, reset_tracking_dela
     _ctx_safe_log(
         'info',
         f'Message sent with request_id: {intermediate_request_id}, tracking will reset in {reset_tracking_delay}s')
+    _reuse_spoke(user_prompt)
     return f'Message sent successfully to user with request_id: {original_request_id}'
 
 
@@ -1941,6 +2006,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
             from core.agent_personality import with_spoken_name
             _saved_personality = with_spoken_name(_saved_personality, agent_display_name,
                                                   agent_id=prompt_id)
+            _reuse_remember_greeting(user_prompt, _saved_personality)
             # Load resonance profile for continuous personality tuning
             _resonance_profile = None
             try:
@@ -9786,6 +9852,11 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                 return held_for_another_turn_reply()
             response = get_agent_response(assistant, chat_instructor, helper, user_proxy, manager, group_chat,
                                           user_message, role, user_id, prompt_id, request_id)
+        # The greeting once per session, not again at the start of a later
+        # reply (live 18:59:16 and 19:01:04, see _reuse_greet_once).
+        response = _reuse_greet_once(user_prompt, response)
+        if isinstance(response, str) and response.strip():
+            _reuse_spoke(user_prompt)
         llm_call_track[user_prompt]['count'] = 0
         llm_call_track[user_prompt]['original_prompt'] = True
         return response
