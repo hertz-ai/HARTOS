@@ -19,7 +19,7 @@ sudo, git, curl, python3, sleep, ip and file commands first on PATH that record
 their arguments and answer like the box does. What is asserted is what the
 script asks docker to do.
 
-Runs standalone (`python tests/unit/test_a_deploy_cannot_fill_centrals_disk.py`).
+Run from the repo root: `python -m pytest tests/unit/test_a_deploy_cannot_fill_centrals_disk.py -q`.
 """
 import os
 import subprocess
