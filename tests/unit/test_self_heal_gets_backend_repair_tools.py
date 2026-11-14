@@ -17,8 +17,18 @@ What this pins, behaviourally:
     TTS provisioning seed, 'backend_repair', and nothing else does;
   * each recipe's own Tier-2 block (cut out of the file with ast and run with
     recording agents, since the constructors around it cannot be driven in a
-    unit test) attaches the real repair functions, the module's own objects,
-    for that tag, and not for a marketing goal or a plain chat.
+    unit test) attaches NO repair tool, for that tag or any other.
+
+Why the second point changed (review of ea8e9b3a4, REJECTED 14 Nov 2026):
+8e944550b attached them here, and ea8e9b3a4 then put them in the
+ServiceToolRegistry, tagged 'backend_repair', so the per-turn attach both
+pipelines run could reach CREATE, whose build-time gate resolves the record's
+stored tags and gave the live self-heal agent goal_tags=[].  On a REUSE build
+whose goal names the tool, the Tier-1 filter kept the registry copies and this
+block then replaced them on the Helper: one tool, two attach paths, two
+schemas.  The registry path is the one that reaches a live turn on both
+pipelines, so it is the only one
+(test_a_self_heal_turn_attaches_the_repair_tool pins it attaching).
 """
 import ast
 import logging
@@ -154,30 +164,26 @@ class TestTheTagComesFromTheToolName:
         assert 'backend_repair' not in detect_goal_tags(text)
 
 
+@pytest.mark.parametrize('text', ['self_heal', 'provision_seed'])
 @pytest.mark.parametrize('leg', LEGS)
-def test_a_backend_repair_self_heal_goal_gets_the_repair_tools(leg, caplog):
-    from integrations.coding_agent import backend_repair_tools as brt
+def test_the_tier2_block_leaves_the_repair_tools_to_the_registry(
+        leg, text, caplog):
+    """One attach path: a goal tagged 'backend_repair' gets the repair tools
+    from the registry (BackendRepairTool, through the Tier-1 filter and the
+    per-turn attach), never a second copy with a second schema from here."""
+    from integrations.agent_engine.marketing_tools import resolve_goal_tags
+    words = (_self_heal_prompt() if text == 'self_heal'
+             else _provision_seed_text())
+    assert 'backend_repair' in resolve_goal_tags(None, words)
     with caplog.at_level(logging.WARNING, logger=LOG.name):
-        helper, assistant, executor = _attach(leg, _self_heal_prompt())
+        helper, assistant, executor = _attach(leg, words)
     assert not [r for r in caplog.records if 'FAILED' in r.getMessage()], (
         f'{leg}: the Tier-2 block raised: {caplog.text}')
-    assert REPAIR_NAMES <= set(helper.llm), (
-        f'{leg}: the self-heal agent was told to call repair_backend_venv '
-        f'but its Helper carries only {sorted(helper.llm)}')
-    assert REPAIR_NAMES <= set(assistant.llm)
-    assert REPAIR_NAMES <= set(assistant.exec)
-    assert REPAIR_NAMES <= set(executor.exec)
-    # The module's own functions, reused, never copies.
-    real = {t['name']: t['func'] for t in brt.BACKEND_REPAIR_TOOLS}
-    for name in REPAIR_NAMES:
-        assert helper.llm[name] is real[name]
-        assert assistant.exec[name] is real[name]
-
-
-@pytest.mark.parametrize('leg', LEGS)
-def test_the_provision_seed_gets_the_repair_tools(leg):
-    helper, _assistant, _executor = _attach(leg, _provision_seed_text())
-    assert REPAIR_NAMES <= set(helper.llm)
+    attached = (set(helper.llm) | set(assistant.llm) | set(assistant.exec)
+                | set(executor.exec))
+    assert not (REPAIR_NAMES & attached), (
+        f'{leg}: the Tier-2 block attached {sorted(REPAIR_NAMES & attached)} '
+        f'beside the registry copies')
 
 
 @pytest.mark.parametrize('leg', LEGS)
