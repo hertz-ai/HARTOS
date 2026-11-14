@@ -1998,6 +1998,16 @@ def create_agents_for_user(user_id: str, prompt_id) -> "Tuple[autogen.AssistantA
         except Exception as e:
             current_app.logger.error(f'Got error as :{e} while checking for {helper_fun.safe_prompt_path(prompt_id, role_number, i)}')
 
+    # The Actions list every seat is shown: a trace-saved step names its tool
+    # and argument names, never the creation run's values, the same as the
+    # generalized-functions block above and the dispatch message
+    # (_saved_action_without_values).  The cafe coach 1793372451267 sent its
+    # creation run's "Of course, Meera! A cappuccino and croissant ..." to a
+    # new person from this list (build 75, 14 Nov, llm_outbound.jsonl).  The
+    # action titles are unchanged, so words a step quotes still reach the
+    # model; role_actions itself stays as saved for the ledger.
+    role_actions_shown = [_saved_action_without_values(a) for a in role_actions]
+
     # Build experience hints from accumulated recipe experience data
     experience_hints = ''
     try:
@@ -2130,7 +2140,7 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
             the new agent should do. If the user wants it done autonomously (e.g., "automatically", "do it for me"),
             include "autonomous" in the description.
 
-        Actions: <actionsStart>{role_actions}<actionEnd>
+        Actions: <actionsStart>{role_actions_shown}<actionEnd>
         Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{individual_recipe}<generalized_functionsEnd><recipeEnd>
 
         PREVIOUS EXPERIENCE (use to avoid dead ends and improve efficiency):
@@ -2196,7 +2206,7 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
             11. Always request the next action from the @StatusVerifier agent—do not determine the next action on your own.
             12. After completing the current action, request the @StatusVerifier agent to verify its completion. It will then provide the next action.
 
-            Actions: <actionsStart>{role_actions}<actionEnd>
+            Actions: <actionsStart>{role_actions_shown}<actionEnd>
             Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{individual_recipe}<generalized_functionsEnd><recipeEnd>
 
             When writing code, always print the final response just before returning it.
@@ -2223,7 +2233,7 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
             11. Always request the next action from the @StatusVerifier agent—do not determine the next action on your own.
             12. After completing the current action, request the @StatusVerifier agent to verify its completion. It will then provide the next action.
             13. If you get any request to call a tool always ask @Helper to perfor it.
-            Actions: <actionsStart>{role_actions}<actionEnd>
+            Actions: <actionsStart>{role_actions_shown}<actionEnd>
             Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{individual_recipe}<generalized_functionsEnd><recipeEnd>
 
             Note: Your Working Directory is "{os.getcwd()}" - use this as the base path for all file operations. Always use absolute paths by joining with this directory,
@@ -2972,7 +2982,7 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
         code_execution_config={"work_dir": get_coding_workspace_dir(), "use_docker": False},
         system_message="You are an helpful AI assistant used to perform time based tasks given to you. "
                        f"""You can refer below details to perform task:
-            Actions: <actionsStart>{role_actions}<actionEnd>
+            Actions: <actionsStart>{role_actions_shown}<actionEnd>
             Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{individual_recipe}<generalized_functionsEnd><recipeEnd>
 
         """
@@ -3007,7 +3017,7 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
             8. IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code.
             9. IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: @user {response_format}
             10. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
-            Actions: <actionsStart>{role_actions}<actionEnd>
+            Actions: <actionsStart>{role_actions_shown}<actionEnd>
             Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{individual_recipe}<generalized_functionsEnd><recipeEnd>
 
             When writing code, always print the final response just before returning it.
@@ -3030,7 +3040,7 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
             8. IMPORTANT INSTRUCTION FOR CODING: Avoid using time.sleep in any code.
             9. IMPORTANT instruction: If you want to ask something or send something to the {role}, always use this format: @user {response_format}
             10. the response of Generate_video tool will be conv_id you should save that conv_id along with the text you used to generate video so that the next you can use the conv_id to use the generated video.
-            Actions: <actionsStart>{role_actions}<actionEnd>
+            Actions: <actionsStart>{role_actions_shown}<actionEnd>
             Recipe  & generalized_functions: <recipeStart><generalized_functionsStart>{individual_recipe}<generalized_functionsEnd><recipeEnd>
 
             Note: Your Working Directory is "{os.getcwd()}" - use this as the base path for all file operations. Always use absolute paths by joining with this directory,
