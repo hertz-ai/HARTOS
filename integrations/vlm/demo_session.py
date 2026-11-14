@@ -342,6 +342,24 @@ _active: Optional['DemoSession'] = None
 _FINISHED_SECONDS = 1800.0
 _finished: Dict[str, Tuple[float, 'DemoResult']] = {}
 
+# How each ending the recorder itself raises (_watch below) is told to the agent
+# that asks for the steps afterwards.  The one place for these words: the
+# stop_demonstration tool reads them through how_it_ended.
+ENDED_BY_TOLD = {
+    'stop button': ', the person pressed Stop AI control',
+    'time box': ', the time limit ended it',
+    'ribbon lost': ', the recording ribbon could not be kept up so it stopped itself',
+}
+
+
+def how_it_ended(ended_by) -> str:
+    """The clause that tells the agent how a recording ended: nothing for the
+    agent's own stop ('person'), the words above for the endings the recorder
+    raises, and a plain fallback for any other reason."""
+    if ended_by == 'person':
+        return ''
+    return ENDED_BY_TOLD.get(ended_by, ', it ended on its own')
+
 
 def active_session() -> Optional['DemoSession']:
     """The recording in progress on this machine, if any."""
@@ -353,7 +371,13 @@ def take_finished(user_id) -> Optional['DemoResult']:
     """What a recording that ended by itself (the person's Stop, the time box,
     a lost ribbon) saw, for ``user_id`` only, once: it is removed as it is
     returned, and None when there is none or it is older than
-    _FINISHED_SECONDS."""
+    _FINISHED_SECONDS.
+
+    Kept per USER, not per conversation: another conversation of the same
+    owner that calls stop_demonstration takes it, and the conversation that
+    recorded it is then refused (review of 9c7fc3072, probe E).  Any
+    conversation of the owner can already stop a running recording, so the
+    desktop's one owner is the unit here, as it is for start_demonstration."""
     with _active_lock:
         kept = _finished.pop(str(user_id), None)
     if kept is None or time.monotonic() - kept[0] > _FINISHED_SECONDS:
@@ -705,8 +729,13 @@ class DemoSession:
             steps = [{k: v for k, v in s.items() if not k.startswith('_')}
                      for s in self.steps]
             self._result = DemoResult(steps, render_transcript(steps), why, seconds)
-            self.ended_by = why
             with _active_lock:
+                # ended_by and the kept result change together, under the lock
+                # every reader takes (active_session, take_finished, begin): set
+                # before it, a stop_demonstration landing in between saw no
+                # active recording and no kept result, was refused, and the next
+                # start_demonstration dropped the steps (review of 9c7fc3072).
+                self.ended_by = why
                 if _active is self:
                     _active = None
                 if why != 'person':

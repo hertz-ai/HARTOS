@@ -830,6 +830,81 @@ def test_the_stored_copy_is_discarded_when_the_agents_stop_loses_a_race(world, t
     assert ds.take_finished(USER) is None, 'the same steps must not be offered a second time'
 
 
+def test_the_reply_says_how_it_ended_when_the_ribbon_wins_the_race(world, turn, monkeypatch):
+    """Review of 9c7fc3072, should-fix 3: when the ribbon's Stop lands between the
+    tool finding the session and stopping it, the result is the ribbon's, and the
+    reply must say the person pressed Stop like it does on the other path."""
+    tools = _tools()
+    tools['start_demonstration']('x')
+    racing = ds.active_session()
+    _click(racing)
+    racing.stop('stop button')
+    monkeypatch.setattr(ds, 'active_session', lambda: racing)
+    assert 'Stop AI control' in tools['stop_demonstration']()
+
+
+def test_the_agents_own_stop_does_not_say_the_person_or_the_clock_ended_it(world, turn):
+    tools = _tools()
+    tools['start_demonstration']('x')
+    _click(ds.active_session())
+    reply = tools['stop_demonstration']()
+    assert 'Untitled - Notepad' in reply
+    for words in ('Stop AI control', 'time limit', 'ribbon', 'on its own'):
+        assert words not in reply, f'the agent ended it itself, so the reply must not say: {words}'
+
+
+def test_how_a_recording_ended_is_told_from_one_table(world, turn, monkeypatch):
+    """Review of 9c7fc3072, should-fix 4: the words for each ending live in one
+    place next to where the endings are raised, not as a second copy in the tool."""
+    assert {'stop button', 'time box', 'ribbon lost'} <= set(ds.ENDED_BY_TOLD)
+    monkeypatch.setitem(ds.ENDED_BY_TOLD, 'time box', ', MARKER-FROM-THE-TABLE')
+    tools = _tools()
+    tools['start_demonstration']('x')
+    _click(ds.active_session())
+    ds.active_session().stop('time box')
+    assert 'MARKER-FROM-THE-TABLE' in tools['stop_demonstration']()
+
+
+def test_a_stop_in_progress_is_never_seen_as_no_recording_at_all(world, turn, monkeypatch):
+    """Review of 9c7fc3072, should-fix 1: stop() set ended_by, then took the module
+    lock to store the result.  A stop_demonstration landing in between found no
+    active session and no stored result, was refused ('call start_demonstration
+    first'), and the next start_demonstration dropped the steps.  Held here with a
+    gate on the lock: the stopping thread waits at the module lock, a
+    stop_demonstration arrives, and it must get the steps."""
+    tools = _tools()
+    tools['start_demonstration']('x')
+    racing = ds.active_session()
+    _click(racing)
+    real = ds._active_lock
+    at_gate, go, who = threading.Event(), threading.Event(), {}
+
+    class GatedLock:
+        def __enter__(self):
+            if threading.current_thread() is who.get('stopper') and not at_gate.is_set():
+                at_gate.set()
+                assert go.wait(10), 'the test never released the gate'
+            real.acquire()
+
+        def __exit__(self, *exc):
+            real.release()
+
+    monkeypatch.setattr(ds, '_active_lock', GatedLock())
+    stopper = threading.Thread(target=lambda: racing.stop('stop button'))
+    who['stopper'] = stopper
+    stopper.start()
+    assert at_gate.wait(10), 'stop() never reached the module lock'
+    out = {}
+    caller = threading.Thread(target=lambda: out.update(reply=tools['stop_demonstration']()))
+    caller.start()
+    caller.join(0.5)               # a refusal comes straight back; a correct reply waits for the stop
+    go.set()
+    stopper.join(10)
+    caller.join(10)
+    assert 'reply' in out and not out['reply'].startswith('Error'), out
+    assert 'Untitled - Notepad' in out['reply'], 'the steps the person showed were lost in the window'
+
+
 def test_a_finished_recording_is_kept_for_its_own_user_only(world, turn):
     ds.begin(USER, PROMPT)
     _click(ds.active_session())

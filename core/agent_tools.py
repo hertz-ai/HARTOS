@@ -1008,7 +1008,6 @@ def build_core_tool_closures(ctx):
         from core.tool_refusal import RETRY_AFTER_FIX, refuse
         from integrations.vlm import demo_session
         session = demo_session.active_session()
-        how = ''
         if session is not None:
             result = session.stop('person')
             demo_session.take_finished(user_id)      # the ribbon may have ended it first
@@ -1021,11 +1020,9 @@ def build_core_tool_closures(ctx):
                     'stop_demonstration', "no demonstration is being recorded right now",
                     "Call start_demonstration first, and only when the person says "
                     "they will show you how", retry=RETRY_AFTER_FIX)
-            how = {'stop button': ', the person pressed Stop AI control',
-                   'time box': ', the time limit ended it',
-                   'ribbon lost': ', the recording ribbon could not be kept up so '
-                                  'it stopped itself'}.get(
-                result.ended_by, ', it ended on its own')
+        # Read from the result on both paths: when the ribbon's Stop wins the race
+        # inside session.stop('person'), the result is the ribbon's.
+        how = demo_session.how_it_ended(result.ended_by)
         return (f"The demonstration is over ({result.seconds:g} seconds{how}). What the "
                 f"person did, in order (what they typed is never recorded, only "
                 f"that they typed):\n{result.transcript}\n"
