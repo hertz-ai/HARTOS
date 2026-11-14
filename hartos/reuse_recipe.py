@@ -939,9 +939,9 @@ def _reuse_greet_once(user_prompt, text):
     singing agent (1793373034536) its 2nd and 3rd turns' sends (18:50:07,
     18:52:00) with "Hey there! I'm <name>, and I'm genuinely excited to work
     with you on this."  So a repeat is dropped here, not left to the model.
-    Only the exact greeting, only at the start, and never down to nothing: a
-    message that is only the greeting stays (an empty reply is a failed
-    turn, #797)."""
+    Only the exact greeting, only at the start, only where it ends a word,
+    and never down to nothing: a message that is only the greeting stays (an
+    empty reply is a failed turn, #797)."""
     try:
         record = _reuse_greeting.get(user_prompt)
         if not isinstance(text, str) or not isinstance(record, dict):
@@ -952,7 +952,19 @@ def _reuse_greet_once(user_prompt, text):
         body = text.lstrip()
         if not body.startswith(greeting):
             return text
-        return body[len(greeting):].lstrip() or text
+        rest = body[len(greeting):]
+
+        # A letter, digit or combining mark (a Tamil vowel sign or virama
+        # is one): a word goes on across it.
+        def _in_a_word(ch):
+            import unicodedata
+            return (ch.isalnum() or ch == '_'
+                    or unicodedata.category(ch).startswith('M'))
+        # Review of 0da57d374, nit (b): a greeting 'Hi' turned 'History is
+        # fun today.' into 'story is fun today.'.
+        if rest and _in_a_word(greeting[-1]) and _in_a_word(rest[0]):
+            return text
+        return rest.lstrip() or text
     except Exception:
         return text
 

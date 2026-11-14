@@ -221,6 +221,47 @@ class TestWhatTheGreetingKeeps:
         assert _chat_agent_says(rr, monkeypatch, TUTOR_ID,
                                 greeting + "\n\n") == greeting + "\n\n"
 
+    def test_only_a_whole_greeting_comes_off_never_the_start_of_a_word(
+            self, rr, monkeypatch):
+        """Nit (b) of the review of 0da57d374: a greeting 'Hi' turned
+        'History is fun today.' into 'story is fun today.'.  The greeting
+        comes off only where it ends a word."""
+        rr._reuse_greeting[f'{LEARNER}_{TUTOR_ID}'] = {'greeting': 'Hi',
+                                                       'said': True}
+        assert _chat_agent_says(rr, monkeypatch, TUTOR_ID,
+                                'History is fun today.') == (
+            'History is fun today.'), 'the greeting cut a word in half'
+        assert _chat_agent_says(rr, monkeypatch, TUTOR_ID,
+                                'Hi Arjun, history is fun today.') == (
+            'Arjun, history is fun today.'), (
+            'anti-vacuity: a whole greeting still comes off')
+        # Tamil: the greeting ends on a virama, a combining mark, and the
+        # word goes on after it.
+        rr._reuse_greeting[f'{LEARNER}_{TUTOR_ID}'] = {'greeting': 'வணக்கம்',
+                                                       'said': True}
+        assert _chat_agent_says(rr, monkeypatch, TUTOR_ID,
+                                'வணக்கம்மா, இன்று பாடலாம்.') == (
+            'வணக்கம்மா, இன்று பாடலாம்.')
+        assert _chat_agent_says(rr, monkeypatch, TUTOR_ID,
+                                'வணக்கம் அர்ஜுன்!') == 'அர்ஜுன்!'
+        # The live greeting ends on '.', so a word right after it is a new
+        # one and the greeting still comes off.
+        greeting = _greeting(TUTOR_ID, TUTOR_NAME)
+        rr._reuse_greeting[f'{LEARNER}_{TUTOR_ID}'] = {'greeting': greeting,
+                                                       'said': True}
+        assert _chat_agent_says(rr, monkeypatch, TUTOR_ID,
+                                greeting + 'Ready?') == 'Ready?'
+
+    def test_a_later_reply_opening_on_a_new_line_drops_it_too(
+            self, rr, monkeypatch):
+        """The model often opens with a blank line; the greeting after it
+        is still the opening."""
+        greeting = _greeting(TUTOR_ID, TUTOR_NAME)
+        _session_built(rr, TUTOR_ID, TUTOR_NAME)
+        _chat_agent_says(rr, monkeypatch, TUTOR_ID, 'Hello again.')
+        assert _chat_agent_says(rr, monkeypatch, TUTOR_ID,
+                                '\n' + greeting + '\n\nOn we go.') == 'On we go.'
+
     def test_the_greeting_inside_a_reply_is_left_alone(self, rr, monkeypatch):
         greeting = _greeting(TUTOR_ID, TUTOR_NAME)
         _session_built(rr, TUTOR_ID, TUTOR_NAME)
