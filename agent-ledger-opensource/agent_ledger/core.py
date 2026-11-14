@@ -1387,20 +1387,22 @@ class SmartLedger:
     - Pluggable storage backends (Redis, MongoDB, JSON)
     """
 
-    def __init__(self, agent_id: str, session_id: str, ledger_dir: str = "agent_data", backend: Optional[Any] = None):
+    def __init__(self, agent_id: str, session_id: str, ledger_dir: Optional[str] = None, backend: Optional[Any] = None):
         """
         Initialize SmartLedger.
 
         Args:
             agent_id: Unique identifier for the agent
             session_id: Unique identifier for this session
-            ledger_dir: Directory for file-based storage (default: "agent_data")
+            ledger_dir: Directory for file-based storage (default:
+                default_ledger_dir(), the folder the node's readers use)
             backend: Optional storage backend (RedisBackend, MongoDBBackend, etc.)
         """
         self.agent_id = agent_id
         self.session_id = session_id
         self.ledger_key = f"ledger_{agent_id}_{session_id}"
-        self.ledger_dir = Path(ledger_dir)
+        self.ledger_dir = Path(ledger_dir if ledger_dir is not None
+                               else default_ledger_dir())
         # WRITABILITY IS NOT IMPLIED BY mkdir SUCCEEDING.
         #
         # This used to fall back only when mkdir RAISED. But `exist_ok=True`
@@ -2696,7 +2698,7 @@ class SmartLedger:
     @classmethod
     def list_grouped_by_recipe_hierarchy(
         cls,
-        ledger_dir: str = "agent_data",
+        ledger_dir: Optional[str] = None,
     ) -> Dict[str, Dict[str, Dict[int, List[Tuple[int, Dict[str, Any]]]]]]:
         """Walk ``ledger_dir`` and return tasks grouped by recipe hierarchy.
 
@@ -2727,16 +2729,15 @@ class SmartLedger:
 
         Args:
             ledger_dir: Directory containing ``ledger_*_*.json`` files.
-                Defaults to ``"agent_data"`` to match the SmartLedger
-                default; pass an absolute path when reading from a
-                non-CWD location.
+                Defaults to default_ledger_dir(), the SmartLedger default.
 
         Returns:
             The nested grouping described above.  Empty dict when the
             directory doesn't exist or contains no matching files.
         """
         groups: Dict[str, Dict[str, Dict[int, List[Tuple[int, Dict[str, Any]]]]]] = {}
-        ledger_path = Path(ledger_dir)
+        ledger_path = Path(ledger_dir if ledger_dir is not None
+                           else default_ledger_dir())
         if not ledger_path.exists():
             return groups
 
@@ -2801,7 +2802,7 @@ class SmartLedger:
         return groups
 
     @staticmethod
-    def keys_in_progress(ledger_dir: str = "agent_data") -> List[str]:
+    def keys_in_progress(ledger_dir: Optional[str] = None) -> List[str]:
         """Keys (``ledger_{agent_id}_{session_id}``) of the ledgers in
         ``ledger_dir`` whose saved state holds a WORK_IN_PROGRESS task.
 
@@ -2829,7 +2830,8 @@ class SmartLedger:
         is returned either way.  A mark whose ledger file is gone is cleared.
         """
         from agent_ledger.backends import JSONBackend
-        ledger_path = Path(ledger_dir)
+        ledger_path = Path(ledger_dir if ledger_dir is not None
+                           else default_ledger_dir())
         backend = JSONBackend(storage_dir=str(ledger_path))
         marked = set(backend.marked_keys())
         folder = os.path.normcase(os.path.abspath(str(ledger_path)))
@@ -4238,6 +4240,89 @@ def _drop_marks_of_deleted_ledgers(backend, marked: set) -> List[str]:
     return alive
 
 
+#: Old ledger folders this process has already brought into the data folder
+#: (or found already brought, or found absent), by resolved path.
+_OLD_FOLDERS_COPIED: set = set()
+_OLD_FOLDERS_LOCK = threading.Lock()
+#: A file in the data folder naming, one per line, each old folder whose
+#: ledgers were copied in, so a restart does not copy them again.  No .json
+#: suffix, so no ledger glob ever reads it.
+_COPIED_FROM_MARK = '.copied_from'
+
+
+def default_ledger_dir() -> str:
+    """The folder a ledger lives in when its caller names none.
+
+    On a HARTOS node it is the agent-data folder the node's readers use,
+    core.cache_loaders.AGENT_DATA_DIR (on a desktop ~/Documents/Nunba/data/
+    agent_data): load_current_flow, the dashboard and the zombie reaper all
+    read there.  It used to be the bare relative "agent_data", and Nunba runs
+    in its program's own folder, so a person's steps were saved inside the
+    program and lost to every rebuild or reinstall (desktop 2026-11-11: all 24
+    REUSE sessions logged between 01:15 and 07:30 IST were gone the next
+    morning, and the agent asked those people again).  The ledgers an earlier
+    build saved in the program folder are copied in once
+    (_copy_old_folder_once).  This package used on its own, without HARTOS's
+    core, keeps the relative "agent_data".
+    """
+    try:
+        from core.cache_loaders import AGENT_DATA_DIR
+    except ImportError:
+        return "agent_data"
+    _copy_old_folder_once(Path("agent_data"), Path(AGENT_DATA_DIR))
+    return AGENT_DATA_DIR
+
+
+def _copy_old_folder_once(old: Path, new: Path) -> None:
+    """Copy the ledgers saved in ``old`` (the relative "agent_data" of the
+    folder this process runs in) into ``new``, once per old folder.
+
+    Nothing is deleted, and a ledger already in ``new`` is never overwritten:
+    the data folder's copy is the newer one.  The old folder is recorded in
+    ``new``/.copied_from after its files are copied, so a later start does
+    not copy again; a copy that fails part-way leaves it unrecorded, and the
+    next start copies the rest.
+    """
+    try:
+        old, new = old.resolve(), new.resolve()
+    except OSError:
+        return
+    if old == new:
+        return
+    key = str(old)
+    with _OLD_FOLDERS_LOCK:
+        if key in _OLD_FOLDERS_COPIED:
+            return
+        _OLD_FOLDERS_COPIED.add(key)
+        if not old.is_dir():
+            return
+        mark = new / _COPIED_FROM_MARK
+        try:
+            done = set(mark.read_text(encoding='utf-8').splitlines())
+        except OSError:
+            done = set()
+        if key in done:
+            return
+        import shutil
+        copied = 0
+        try:
+            new.mkdir(parents=True, exist_ok=True)
+            for src in old.glob('ledger_*_*.json'):
+                dst = new / src.name
+                if dst.exists():
+                    continue
+                shutil.copy2(src, dst)
+                copied += 1
+            with open(mark, 'a', encoding='utf-8') as fh:
+                fh.write(key + '\n')
+        except OSError as e:
+            logger.warning(f"Copied {copied} ledger(s) from {old} into {new}, "
+                           f"then stopped: {e}; the next start copies the rest")
+            return
+        logger.info(f"Copied {copied} ledger(s) saved in {old} into {new} "
+                    f"(once; nothing deleted or overwritten)")
+
+
 _TERMINAL_TASK_STATUSES = frozenset({
     "completed", "failed", "terminated", "user_stopped",
     "rolled_back",
@@ -4291,7 +4376,7 @@ def _is_same_build(flow_tasks: List[Tuple[int, Dict[str, Any]]],
 def _find_resumable_session(
     agent_id: str,
     user_id: Optional[int],
-    ledger_dir: str = "agent_data",
+    ledger_dir: Optional[str] = None,
     flow_id: Optional[int] = None,
     actions: Optional[List[Any]] = None,
 ) -> Optional[str]:

@@ -30,12 +30,22 @@ logger = logging.getLogger(__name__)
 _state_lock = threading.RLock()
 
 def _load_ledger_on_miss(user_prompt: str) -> Optional[Any]:
-    """Cache-miss loader: recover ledger from persistent storage."""
+    """Cache-miss loader: reopen the person's in-flight session from disk.
+
+    The session is the one create_ledger_from_actions resumes (agent_id =
+    prompt_id, session_id = '<user>_<prompt>_<ts>'), found by its own scan.
+    None when nothing is in flight.  It used to call
+    get_or_create_ledger(user_id, prompt_id) positionally (agent_id=user_id,
+    session_id=prompt_id): a key nothing saves, so a miss handed back a new
+    empty ledger that the registry then served as the person's for 8 hours.
+    """
     try:
-        from agent_ledger.factory import get_or_create_ledger
+        from agent_ledger.core import SmartLedger, _find_resumable_session
         user_id, prompt_id = _extract_ownership_from_prompt(user_prompt)
         if user_id and prompt_id:
-            return get_or_create_ledger(user_id, prompt_id)
+            session_id = _find_resumable_session(str(prompt_id), user_id)
+            if session_id is not None:
+                return SmartLedger(str(prompt_id), session_id)
     except Exception:
         pass
     return None
