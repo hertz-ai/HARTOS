@@ -987,7 +987,10 @@ def build_core_tool_closures(ctx):
                 f"presses like Enter or Ctrl+S, and that they typed), never what "
                 f"they type. It does not record screenshots or captions of the "
                 f"screen, or middle and side mouse buttons, so do not promise "
-                f"those.")
+                f"those. Nothing is saved to disk, but the words you get back "
+                f"(window titles and control names, never what they type) go to "
+                f"the AI model running this chat, which may be an online model: "
+                f"tell the person that before they start.")
 
     tools.append((
         "start_demonstration",
@@ -1005,13 +1008,25 @@ def build_core_tool_closures(ctx):
         from core.tool_refusal import RETRY_AFTER_FIX, refuse
         from integrations.vlm import demo_session
         session = demo_session.active_session()
-        if session is None:
-            return refuse(
-                'stop_demonstration', "no demonstration is being recorded right now",
-                "Call start_demonstration first, and only when the person says "
-                "they will show you how", retry=RETRY_AFTER_FIX)
-        result = session.stop('person')
-        return (f"The demonstration is over ({result.seconds:g} seconds). What the "
+        how = ''
+        if session is not None:
+            result = session.stop('person')
+            demo_session.take_finished(user_id)      # the ribbon may have ended it first
+        else:
+            # The person's own Stop, the time box or a lost ribbon ended the
+            # recording before this call: what they showed was kept for it.
+            result = demo_session.take_finished(user_id)
+            if result is None:
+                return refuse(
+                    'stop_demonstration', "no demonstration is being recorded right now",
+                    "Call start_demonstration first, and only when the person says "
+                    "they will show you how", retry=RETRY_AFTER_FIX)
+            how = {'stop button': ', the person pressed Stop AI control',
+                   'time box': ', the time limit ended it',
+                   'ribbon lost': ', the recording ribbon could not be kept up so '
+                                  'it stopped itself'}.get(
+                result.ended_by, ', it ended on its own')
+        return (f"The demonstration is over ({result.seconds:g} seconds{how}). What the "
                 f"person did, in order (what they typed is never recorded, only "
                 f"that they typed):\n{result.transcript}\n"
                 f"Turn this into the steps of the agent you are building: ask "
@@ -3213,8 +3228,11 @@ def build_core_tool_closures(ctx):
             obscura_b1_headless_profile when cookies were sent, and
             'logged_out_public' when none were — then authenticated is False,
             a 'notice' explains it, and the page is the public view or a login
-            wall, never the person's own feed.  Nothing writes to the vault in
-            this build, so logged_out_public is what every call returns today.
+            wall, not the person's own feed.  Nothing writes to the vault in
+            this build, so logged_out_public is what a default install returns
+            today.  Trust 'authenticated', not the absence of cookies: with
+            HEVOLVE_BROWSER_USE_B2 the crawler attaches to the person's own
+            Chrome, and then it IS their session and authenticated is True.
             Consent-gated on `web_research:<platform>`.
             """
             result = br_tools_module.dispatch(

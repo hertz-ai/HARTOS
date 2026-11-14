@@ -82,6 +82,7 @@ def world(monkeypatch):
     monkeypatch.setattr(ds, '_describe_point', lambda x, y: w.point)
     monkeypatch.setattr(ds, '_describe_focus', lambda hwnd: w.focus)
     monkeypatch.setattr(ds, '_msaa_focus_is_protected', protected)
+    monkeypatch.setattr(ds, '_finished', {}, raising=False)   # no result survives into the next test
     yield w
     session = ds.active_session()
     if session is not None:
@@ -725,6 +726,124 @@ def test_stopping_when_nothing_is_recording_says_what_to_do(world, turn):
     reply = _tools()['stop_demonstration']()
     assert reply.startswith('Error: the stop_demonstration call could not be done: ')
     assert 'start_demonstration' in reply
+
+
+# ── The person's own Stop (or the time box) must not lose what they showed ──
+# The reviewer of 63abdc857 measured it: the ribbon text and the start tool both
+# tell the person to press Stop AI control, which ends the session; the agent's
+# next stop_demonstration then found no active session, refused, and the steps
+# never reached the agent.
+
+@pytest.mark.parametrize('why', ['stop button', 'time box', 'ribbon lost'])
+def test_what_the_person_showed_reaches_the_agent_after_the_recording_ended_itself(
+        world, turn, why):
+    tools = _tools()
+    tools['start_demonstration']('how I file my expenses')
+    _click(ds.active_session())
+    ds.active_session().stop(why)                       # the ribbon, the clock, or a lost ribbon
+    assert ds.active_session() is None
+    reply = tools['stop_demonstration']()
+    assert not reply.startswith('Error'), reply
+    assert 'Untitled - Notepad' in reply, 'the steps the person showed must come back'
+    assert 'Nothing was recorded' not in reply
+
+
+def test_the_reply_says_how_the_recording_ended(world, turn):
+    tools = _tools()
+    tools['start_demonstration']('x')
+    _click(ds.active_session())
+    ds.active_session().stop('stop button')
+    assert 'Stop AI control' in tools['stop_demonstration']()
+    tools['start_demonstration']('x')
+    _click(ds.active_session())
+    ds.active_session().stop('time box')
+    assert 'time' in tools['stop_demonstration']().lower()
+
+
+def test_a_finished_recording_is_handed_over_once(world, turn):
+    tools = _tools()
+    tools['start_demonstration']('x')
+    _click(ds.active_session())
+    ds.active_session().stop('stop button')
+    assert 'Untitled - Notepad' in tools['stop_demonstration']()
+    again = tools['stop_demonstration']()
+    assert again.startswith('Error: the stop_demonstration call could not be done: ')
+    assert 'Notepad' not in again, 'a second read must not hand the same steps out again'
+
+
+def test_the_agents_own_stop_is_not_kept_for_a_second_read(world, turn):
+    tools = _tools()
+    tools['start_demonstration']('x')
+    _click(ds.active_session())
+    assert 'Untitled - Notepad' in tools['stop_demonstration']()
+    assert tools['stop_demonstration']().startswith('Error: ')
+
+
+def test_a_finished_recording_is_not_offered_after_its_time_is_up(world, turn, monkeypatch):
+    tools = _tools()
+    tools['start_demonstration']('x')
+    _click(ds.active_session())
+    ds.active_session().stop('stop button')
+    monkeypatch.setattr(ds, '_FINISHED_SECONDS', 0.0)
+    time.sleep(0.02)
+    reply = tools['stop_demonstration']()
+    assert reply.startswith('Error: ') and 'Notepad' not in reply
+
+
+def test_a_new_recording_drops_a_stale_finished_one(world, turn):
+    tools = _tools()
+    tools['start_demonstration']('first')
+    _click(ds.active_session())
+    ds.active_session().stop('stop button')
+    tools['start_demonstration']('second')
+    ds.active_session().stop('person')
+    assert ds.take_finished(USER) is None, 'the first recording must not be offered after a second began'
+
+
+@pytest.mark.parametrize('rid', ['daemon_goal-1', 'daemon_a2a_task-9', ''])
+def test_a_background_turn_cannot_read_a_finished_recording_and_does_not_consume_it(
+        world, turn, rid):
+    tools = _tools()
+    tools['start_demonstration']('x')
+    _click(ds.active_session())
+    ds.active_session().stop('stop button')
+    turn.rid = rid
+    reply = tools['stop_demonstration']()
+    assert reply.startswith('Error: the stop_demonstration call could not be done: ')
+    assert 'Notepad' not in reply
+    turn.rid = '1731330000000'                                    # the person's own turn again
+    assert 'Untitled - Notepad' in tools['stop_demonstration'](), \
+        'a refused background read must leave the steps for the person\'s turn'
+
+
+def test_the_stored_copy_is_discarded_when_the_agents_stop_loses_a_race(world, turn, monkeypatch):
+    """The ribbon's Stop can land between the tool finding the session and
+    stopping it: stop('person') then returns the result the ribbon's stop made,
+    and the copy kept for a later read must not hand the same steps out again."""
+    tools = _tools()
+    tools['start_demonstration']('x')
+    racing = ds.active_session()
+    _click(racing)
+    racing.stop('stop button')                           # the ribbon won
+    monkeypatch.setattr(ds, 'active_session', lambda: racing)   # the tool had already found it
+    assert 'Untitled - Notepad' in tools['stop_demonstration']()
+    assert ds.take_finished(USER) is None, 'the same steps must not be offered a second time'
+
+
+def test_a_finished_recording_is_kept_for_its_own_user_only(world, turn):
+    ds.begin(USER, PROMPT)
+    _click(ds.active_session())
+    ds.active_session().stop('stop button')
+    assert ds.take_finished('someone-else') is None
+    assert ds.take_finished(USER) is not None
+
+
+def test_the_start_reply_says_where_the_words_go(world, turn):
+    """'Local only' was overstated: the recorder keeps nothing and sends nothing
+    itself, but the words it returns go to the model running the turn."""
+    started = _tools()['start_demonstration']('x')
+    assert 'model' in started.lower()
+    assert 'local only' not in started.lower()
 
 
 def test_a_session_survives_a_tool_call_on_another_thread(world, turn):

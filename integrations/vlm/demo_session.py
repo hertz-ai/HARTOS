@@ -4,8 +4,15 @@ Owner 2026-11-11: "so you can start and complete it", on the design he agreed
 on 11-10 -- when the person says "I'll show you how", the agent invokes the
 demonstration tool; the same computer-use ribbon shows a recording symbol so
 the person knows their screen actions are being recorded; it is time-boxed,
-has an obvious Stop, keeps no key content, is local only, and extends the
-existing resource_governor hooks (no second listener).
+has an obvious Stop, keeps no key content, saves nothing to disk, and extends
+the existing resource_governor hooks (no second listener).
+
+"Local only" was said here before and overstated: the recorder itself keeps no
+file and sends nothing anywhere, but the words it returns (window titles and
+control names, never typed text) are handed to the model that runs the agent's
+turn, and that model may be a hosted one.  The start tool tells the person
+and the agent so (tests/unit/test_demo_session.py).  Whether the recorder
+should refuse when the model in use is hosted is the owner's decision.
 
 What a recording IS: WORDS.  integrations/vlm/local_loop.py re-grounds every
 step from a fresh screenshot and OmniParser parse; coordinates are born and die
@@ -42,7 +49,7 @@ import sys
 import threading
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from integrations.vlm.activity_stream import show_ribbon
 
@@ -326,11 +333,32 @@ class DemoResult:
 _active_lock = threading.Lock()
 _active: Optional['DemoSession'] = None
 
+# A recording the PERSON ended (the ribbon's Stop, the time box, a lost ribbon)
+# is over before the agent asks for it: the agent's stop_demonstration comes on
+# the person's next message.  Its result is kept here, per user, until it is
+# read once or this long passes (a recording read half an hour later belongs to
+# a different conversation), and a new recording drops it.  A recording the
+# agent itself stopped is returned to it directly and is not kept.
+_FINISHED_SECONDS = 1800.0
+_finished: Dict[str, Tuple[float, 'DemoResult']] = {}
+
 
 def active_session() -> Optional['DemoSession']:
     """The recording in progress on this machine, if any."""
     with _active_lock:
         return _active if _active is not None and _active.ended_by is None else None
+
+
+def take_finished(user_id) -> Optional['DemoResult']:
+    """What a recording that ended by itself (the person's Stop, the time box,
+    a lost ribbon) saw, for ``user_id`` only, once: it is removed as it is
+    returned, and None when there is none or it is older than
+    _FINISHED_SECONDS."""
+    with _active_lock:
+        kept = _finished.pop(str(user_id), None)
+    if kept is None or time.monotonic() - kept[0] > _FINISHED_SECONDS:
+        return None
+    return kept[1]
 
 
 class DemoSession:
@@ -681,6 +709,8 @@ class DemoSession:
             with _active_lock:
                 if _active is self:
                     _active = None
+                if why != 'person':
+                    _finished[self.user_id] = (time.monotonic(), self._result)
             logger.info('demonstration %s ended by %s: %d steps in %.0fs',
                         self.id, why, sum(1 for s in steps if 'action' in s), seconds)
             return self._result
@@ -711,4 +741,5 @@ def begin(user_id, prompt_id, *, max_seconds: Optional[float] = None) -> DemoSes
         session = DemoSession(user_id, prompt_id, seconds)
         session._open()
         _active = session
+        _finished.pop(str(user_id), None)      # a new recording supersedes an unread old one
     return session

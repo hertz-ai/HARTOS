@@ -48,12 +48,18 @@ def append(
     Connection mechanism values:
       "obscura_b2_cdp_user_chrome"   — attached to user's running Chrome
       "obscura_b1_headless_profile"  — our managed profile
-      "logged_out_public"            — a T2 script ran with NO vault cookies:
-                                       the public view or a login wall, never
-                                       the person's own session.  Today this is
-                                       every T2 read, because nothing writes to
-                                       the vault (AccountVault.add has no
-                                       production caller).
+      "logged_out_public"            — a T2 script ran with NO vault cookies
+                                       AND did not attach to the person's own
+                                       browser: the public view or a login
+                                       wall, not their own session.  Today this
+                                       is every T2 read on a default install,
+                                       because nothing writes to the vault
+                                       (AccountVault.add has no production
+                                       caller).  It is NOT written when
+                                       HEVOLVE_BROWSER_USE_B2 attached over
+                                       CDP: that really is their signed-in
+                                       Chrome, and it is logged as
+                                       obscura_b2_cdp_user_chrome.
       "public_http"                  — T3 plain fetch, no auth, no browser
       "ytdlp"                        — T3 yt-dlp
       "channel_websocket"            — T1 adapter (rare — this module mostly logs T2/T3)
