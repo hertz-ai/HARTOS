@@ -5388,7 +5388,8 @@ def _reuse_turn_refused_prose(user_prompt, messages):
     return None
 
 
-def _reuse_turn_delivered_send(user_prompt, messages, starts_with=None):
+def _reuse_turn_delivered_send(user_prompt, messages, starts_with=None,
+                               asks=False):
     """The text of this turn's newest send_message_to_user that reached the
     person (lifecycle_hooks.send_delivered), or None: the finaliser's answer
     for a turn whose words went out only through the send tool.  Such a turn
@@ -5399,7 +5400,10 @@ def _reuse_turn_delivered_send(user_prompt, messages, starts_with=None):
     (_reuse_send_text).  With ``starts_with``, only a send whose text begins
     with it counts: a held step's recorded question is the first 1000
     characters of the send that asked it, and a later send in the same turn
-    ("Take your time, Arjun!") is not that question (review of 6e1c93995)."""
+    ("Take your time, Arjun!") is not that question (review of 6e1c93995).
+    With ``asks``, the newest delivered send counts only when it asks the
+    person something (lifecycle_hooks.send_is_ask), else None: the question
+    an unfinished action waits on (review of 7188e162e)."""
     start = _reuse_turn_seed_index(user_prompt, messages)
     if start is None:
         return None
@@ -5420,6 +5424,8 @@ def _reuse_turn_delivered_send(user_prompt, messages, starts_with=None):
                 if (isinstance(text, str) and text.strip()
                         and (starts_with is None
                              or text.strip().startswith(str(starts_with).strip()))):
+                    if asks and not send_is_ask(window, call_id):
+                        return None
                     return text
     return None
 
@@ -6103,18 +6109,34 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
     # named did not run: then the honest report of that goes out as before,
     # whatever was sent (#808), so this answers False.  No send found, or one
     # that cannot be read, leaves everything below as it was.
-    def _reply_with_the_send(when):
+    #
+    # Review of 7188e162e: neither is a send whose text the answer rules
+    # refuse (it names a seat): appended, it was refused as the tail and the
+    # extractor walked back to the group's prose ("I have prepared the report
+    # for the user."), with no steer.  ``asks``: only a send that asks the
+    # person (the question an unfinished action waits on).  ``after``: only a
+    # send newer than the one the log held at that index (the steered round's
+    # own), since a send before the round no longer always ends the turn.
+    def _reply_with_the_send(when, asks=False, after=None):
         if _unrun:
             return False
         try:
             _msgs = group_chat.messages
-            _sent = _reuse_turn_delivered_send(user_prompt, _msgs)
+            _sent = _reuse_turn_delivered_send(user_prompt, _msgs, asks=asks)
             if not _sent:
                 return False
+            if after is not None and _sent == _reuse_turn_delivered_send(
+                    user_prompt, list(_msgs)[:after]):
+                return False
+            _reply = {'content': _sent, 'name': 'Assistant',
+                      'role': 'assistant'}
+            if not _reuse_message_is_user_answer(_reply):
+                _say('info', f"[SYNTHESIS] this turn's newest send is text the "
+                             f"answer rules refuse; going on as before "
+                             f"(session: {user_prompt}, head={_sent[:120]!r})")
+                return False
             if not _msgs or (_msgs[-1] or {}).get('content') != _sent:
-                _msgs.append({'content': _sent,
-                              'name': 'Assistant',
-                              'role': 'assistant'})
+                _msgs.append(_reply)
         except Exception as _send_err:
             _say('warning', f"[SYNTHESIS] this turn's sends unreadable: "
                             f"{_send_err!r}; going on as before")
@@ -6147,6 +6169,10 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
     # treated as unfinished, the same rule the tool predicate's sentinel
     # follows.
     _unfinished = []
+    # The action is still working, so a question it sent can be what it
+    # waits on.  Not when it gave up or errored, nor when its state could not
+    # be read: then the turn failed, and the person is told so.
+    _still_working = False
     try:
         _task = user_tasks.get(user_prompt)
         if _task is not None:
@@ -6172,6 +6198,7 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
                     pass
                 else:
                     _unfinished.append(f"action {_at} did not finish")
+                    _still_working = _state != ActionState.ERROR
                 if _unfinished and _at < _total:
                     _unfinished.append(
                         f"actions {_at + 1} to {_total} were not reached")
@@ -6179,7 +6206,16 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
         _unfinished = ['the state of the actions could not be read']
 
     if _unrun or _unfinished:
-        if _reply_with_the_send('and part of the turn did not finish'):
+        # A SEND ENDS AN UNFINISHED TURN ONLY AS THE QUESTION IT WAITS ON: the
+        # action is still working and the newest send asks the person (the
+        # live singing and Tamil turns above).  Anything else keeps the honest
+        # report.  Review of 7188e162e, its probe: action 2 of 4 GAVE_UP after
+        # an early progress note ("Sure, let me look up your order status. One
+        # moment.", expects_reply false), and with no steer the person read
+        # the note again, never told the turn gave up or that actions 3 to 4
+        # were not reached; the same with the action still in progress.
+        if _still_working and _reply_with_the_send(
+                'and the action waits on the question it sent', asks=True):
             return False
         _clauses = []
         if _unrun:
@@ -6305,9 +6341,11 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
     _say('info', f"[SYNTHESIS] round returned ({_before} -> {_after} msgs); "
                  f"still control JSON: {_reuse_needs_synthesis(group_chat)}")
     # The round itself can send, though the steer says to run no tool (live
-    # 18:50:28 above): no send had gone out before it, so a send now is the
-    # round's, and it is the reply, not the round's words about it.
-    _reply_with_the_send('in the steered round')
+    # 18:50:28 above): a send newer than the log held before the steer is the
+    # round's, and it is the reply, not the round's words about it.  A send
+    # from before the steer is not: the honest report the steer asked for
+    # stays the reply.
+    _reply_with_the_send('in the steered round', after=_before)
     return True
 
 

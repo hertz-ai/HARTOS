@@ -430,3 +430,90 @@ class TestWhatStaysAsItWas:
         assert posted is False
         assert len(chat.messages) == len(history)
         assert chat.messages[-1]['content'] == answer
+
+
+# ── Review of 7188e162e (REJECTED 14 Nov 2026), MUST-FIX 1 and the nit ──
+# A send ends an unfinished turn only when it is the question the action
+# still waits on.  The reviewer's probe, with this file's harness: action 2
+# of 4 GAVE_UP after an early progress note (expects_reply False); on the
+# parent the incomplete steer was posted and the person read the honest
+# report, on 7188e162e no steer was posted and the person read the progress
+# note again, never told the turn gave up or that actions 3 to 4 were not
+# reached.  The same with the action still in progress.
+ORDER = 'order-desk_1794600000001'
+ORDER_TURN = 'msg_1794600000002_sim'
+PROGRESS_SEND = 'Sure, let me look up your order status. One moment.'
+WHICH_ORDER = 'Which order do you mean, the one from Monday or from Friday?'
+HONEST = ("I could not finish that: the order lookup stopped before it found "
+          "your order, and the next steps were not done.")
+SEAT_SEND = 'The StatusVerifier has your report ready, Arjun. Shall I read it?'
+GROUP_PROSE = 'I have prepared the report for the user.'
+
+
+def _order_turn(text=PROGRESS_SEND, expects_reply=False, before=()):
+    return ([{'role': 'user', 'name': 'ChatInstructor',
+              'content': 'Perform this action -> Action #2 for request '
+                         + ORDER_TURN}]
+            + list(before)
+            + [_send('call_o', text, expects_reply=expects_reply),
+               _receipt('call_o', ORDER_TURN), _verdict()])
+
+
+class TestAnUnfinishedTurnKeepsItsHonestReport:
+
+    @pytest.mark.parametrize('state', ['gave_up', 'in_progress'])
+    def test_a_progress_note_before_the_failure_is_not_the_reply(
+            self, rr, monkeypatch, state):
+        posted, chat, seat = _run(rr, monkeypatch, ORDER, ORDER_TURN,
+                                  _order_turn(), state=state,
+                                  task=_Task(current_action=2, total=4),
+                                  round_messages=[_prose(HONEST)])
+        assert len(seat.messages) == 1, (
+            'no steer: the person was never told the turn did not finish')
+        assert 'actions 3 to 4 were not reached' in seat.messages[0]
+        assert posted is True
+        assert _what_the_person_reads(rr, ORDER, chat) == HONEST, (
+            'the person read the progress note again instead of the report')
+
+    @pytest.mark.parametrize('state', ['gave_up', 'error'])
+    def test_a_question_before_a_failure_is_not_the_reply(
+            self, rr, monkeypatch, state):
+        """The action failed: its question waits on nothing, so the person
+        is told what did not finish, not asked it again."""
+        _posted, chat, seat = _run(rr, monkeypatch, ORDER, ORDER_TURN,
+                                   _order_turn(WHICH_ORDER, True), state=state,
+                                   task=_Task(current_action=2, total=4),
+                                   round_messages=[_prose(HONEST)])
+        assert len(seat.messages) == 1
+        assert _what_the_person_reads(rr, ORDER, chat) == HONEST
+
+    def test_a_question_the_action_waits_on_is_still_the_reply(
+            self, rr, monkeypatch):
+        """Anti-vacuity, the case 7188e162e was for: the action is still in
+        progress and its newest send asks the person; the question ends the
+        turn properly."""
+        posted, chat, seat = _run(rr, monkeypatch, ORDER, ORDER_TURN,
+                                  _order_turn(WHICH_ORDER, True),
+                                  task=_Task(current_action=2, total=4),
+                                  round_messages=[_prose(HONEST)])
+        assert seat.messages == []
+        assert posted is False
+        assert _what_the_person_reads(rr, ORDER, chat) == WHICH_ORDER
+
+    def test_a_send_the_answer_rules_refuse_is_not_the_reply(
+            self, rr, monkeypatch):
+        """The nit: a send whose text the answer rules refuse (it names a
+        seat) was appended, refused as the tail, and the walk-back delivered
+        the group's prose, with no steer.  It is not the reply; the turn
+        goes on as before 7188e162e."""
+        posted, chat, seat = _run(
+            rr, monkeypatch, ORDER, ORDER_TURN,
+            _order_turn(SEAT_SEND, True, before=[_prose(GROUP_PROSE)]),
+            task=_Task(current_action=2, total=4),
+            round_messages=[_prose(HONEST)])
+        assert len(seat.messages) == 1, (
+            'a refused send stood in for the reply and no steer was posted')
+        assert posted is True
+        assert _what_the_person_reads(rr, ORDER, chat) == HONEST
+        assert not any(m.get('content') == SEAT_SEND and not m.get('tool_calls')
+                       for m in chat.messages)
