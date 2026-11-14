@@ -556,26 +556,20 @@ class ThoughtExperimentService:
         - physical_ai:  uses visual context (hypothesis → observe → measure)
         - research:     uses web search (search → synthesize → score)
 
-        GATED HERE, for every caller, by voting_rules.may_evaluate_here:
-          - an experiment the vote approved (approval_verdict, the ONE
-            approval rule: a quorum of distinct identities (>= 3, >= 2 FOR),
-            a FOR share of at least max(2/3, the context's threshold) with
-            one vote per identity, and the steward's FOR where the context
-            requires one) may be evaluated;
-          - this node's OWN experiment (node_own_creator_ids) may be
-            evaluated with no vote -- owner ruling 2026-11-14, "voting shd
-            not be a prerequisite to evolve locally untill we cross the
-            intelligence barrier" -- unless its context requires the steward;
-          - anyone else's unvoted experiment is refused.  Measured live
-            2026-09-25 (AE-7): with the gate only in auto-evolve's ranking,
-            one authenticated non-admin POSTed /evaluate on another user's
-            unvoted experiment and started an autonomous agent goal alone.
-        Its lifecycle must also be able to reach 'evaluating'
-        (advance_status: never backwards from decided/archived).  A refusal
+        GATED HERE, for every caller.  The experiment must be approved by
+        the vote -- voting_rules.approval_verdict, the ONE rule: a quorum
+        of distinct identities (>= 3, >= 2 FOR), a FOR share of at least
+        max(2/3, the context's threshold) with one vote per identity (an
+        owner and all their agents are one), and the steward's FOR where
+        the context requires one -- and its lifecycle must be able to reach
+        'evaluating' (advance_status: never backwards from decided/archived).
+        Measured live 2026-09-25 (AE-7): with the gate only in auto-evolve's
+        ranking, one authenticated non-admin POSTed /evaluate on an unvoted
+        experiment and started an autonomous agent goal alone.  A refusal
         mutates nothing.
         """
         from .models import ThoughtExperiment
-        from .voting_rules import approval_verdict, may_evaluate_here
+        from .voting_rules import approval_verdict
 
         experiment = db.query(ThoughtExperiment).filter_by(
             id=experiment_id).first()
@@ -584,13 +578,9 @@ class ThoughtExperimentService:
 
         tally = ThoughtExperimentService.tally_votes(db, experiment_id)
         verdict = approval_verdict(tally)
-        this_nodes_own = experiment.creator_id in \
-            ThoughtExperimentService.node_own_creator_ids(
-                db, [experiment.creator_id])
-        if not may_evaluate_here(verdict, this_nodes_own):
+        if not verdict['approved']:
             return {'success': False, 'reason': 'not_approved',
                     'verdict': verdict,
-                    'this_nodes_own': this_nodes_own,
                     'distinct_voters': tally.get('distinct_voters'),
                     'distinct_supporters': tally.get('distinct_supporters')}
 
@@ -617,7 +607,6 @@ class ThoughtExperimentService:
                 'success': True,
                 'goal_id': existing.id,
                 'reused': True,
-                'approved_by_vote': verdict['approved'],
                 'experiment_type': getattr(
                     experiment, 'experiment_type', 'traditional') or 'traditional',
             }
@@ -666,7 +655,6 @@ class ThoughtExperimentService:
             return {
                 'success': True,
                 'goal_id': goal.get('goal', {}).get('id') if goal else None,
-                'approved_by_vote': verdict['approved'],
                 'experiment_type': exp_type,
                 'iteration_strategy': recipe['strategy'],
             }
@@ -1097,25 +1085,6 @@ class ThoughtExperimentService:
         return {u.id: voter_identity(u, owner_of, node) for u in users}, node
 
     @staticmethod
-    def node_own_creator_ids(db: Session, creator_ids) -> set:
-        """Of these creator ids, the ones whose experiments are this node's
-        OWN: the creator counts as this node's identity (voter_identities --
-        the node's owner, or a machine account such as the 'nunba' system
-        user that no other person owns).  voting_rules.may_evaluate_here
-        lets those evaluate here without a vote (owner ruling 2026-11-14).
-        An id with no users row here is not this node's: it may have come
-        from elsewhere, and a made-up id must not be a free pass."""
-        from .models import User
-        ids = {c for c in creator_ids if c}
-        if not ids:
-            return set()
-        users = db.query(User).filter(User.id.in_(ids)).all()
-        if not users:
-            return set()
-        identity_of, node = ThoughtExperimentService.voter_identities(db, users)
-        return {uid for uid, identity in identity_of.items() if identity == node}
-
-    @staticmethod
     def _open_agent_votable(db: Session, query=None) -> List:
         """The ONE selection of experiments an agent may vote on now, shared
         by the world model's round and the coordinator's ballot: open
@@ -1158,8 +1127,7 @@ class ThoughtExperimentService:
     @staticmethod
     def get_active_experiments(db: Session, status: str = None,
                                 limit: int = 50,
-                                with_votes_only: bool = False,
-                                creator_ids=None) -> List[Dict]:
+                                with_votes_only: bool = False) -> List[Dict]:
         """List experiments filtered by status, newest first.
 
         with_votes_only: only experiments with at least one vote.  This is
@@ -1167,10 +1135,6 @@ class ThoughtExperimentService:
         can never pass it -- and without it the newest-`limit` window hid
         every voted row once unvoted rows piled up (measured on a live
         node: the three human-voted experiments sat at rank ~693 of 807).
-
-        creator_ids: only experiments by these creators (auto-evolve passes
-        node_own_creator_ids, the experiments that need no vote here), so
-        other people's newer rows cannot push them out of the window.
         """
         from .models import ThoughtExperiment, ExperimentVote
 
@@ -1180,9 +1144,6 @@ class ThoughtExperimentService:
         else:
             query = query.filter(
                 ThoughtExperiment.status != 'archived')
-        if creator_ids is not None:
-            query = query.filter(
-                ThoughtExperiment.creator_id.in_(list(creator_ids)))
         if with_votes_only:
             query = query.filter(
                 db.query(ExperimentVote.id).filter(

@@ -309,32 +309,6 @@ def approval_verdict(tally: dict) -> dict:
     }
 
 
-def may_evaluate_here(verdict: dict, this_nodes_own: bool) -> bool:
-    """Whether an experiment may be evaluated on this node: the ONE rule
-    auto-evolve's ranking and the evaluation-goal writer both ask.
-
-    Owner ruling 2026-11-14: "voting shd not be a prerequisite to evolve
-    locally untill we cross the intelligence barrier".  So:
-      - an experiment the vote approved (``verdict`` is approval_verdict's
-        result) may be evaluated, as before;
-      - this node's OWN experiment -- its creator counts as this node's
-        identity (voter_identity / node_identity: the node's owner, or a
-        machine account no other person owns) -- may be evaluated with no
-        vote at all, unless its decision context requires the steward
-        (security_guardrail): changes to security stay with people;
-      - anyone else's experiment still needs the vote, so another person
-        cannot spend this node's compute alone (AE-7, 2026-09-25).
-    Evaluating is local work on this node; deciding an experiment
-    (decide()) and anything shared with the hive keep the vote.
-
-    The intelligence barrier has no measure yet (none in code or docs on
-    2026-11-14).  When the owner defines it, this is the one place the
-    vote becomes a prerequisite again."""
-    if verdict.get('approved'):
-        return True
-    return bool(this_nodes_own) and not verdict.get('steward_required')
-
-
 def recommendation(tally: dict) -> str:
     """tally_votes' decision_recommendation, read from approval_verdict so
     the two cannot disagree: 'approve' exactly when it approves;
