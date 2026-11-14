@@ -6261,8 +6261,13 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None,autonomou
                 # TERMINATE hook closed such an action (without a receipt);
                 # left open, it spun here silently to the stall guard.  Re-
                 # posting it is bounded by the three attempts below.
+                # ERROR too: an 'error' verdict ends its round (state_transition
+                # hands it to the UserProxy) with nothing else to re-post the
+                # step.  Live 2026-11-14 21:04 the Research Assistant's step 2
+                # spun here 300 times and the person got the verdict JSON as
+                # the reply (tests/unit/test_a_failed_step_is_retried_then_asked.py).
                 if _ca_pending_state in (ActionState.ASSIGNED, ActionState.PENDING, ActionState.IN_PROGRESS,
-                                         ActionState.STATUS_VERIFICATION_REQUESTED):
+                                         ActionState.STATUS_VERIFICATION_REQUESTED, ActionState.ERROR):
                     # Track retries to detect actions stuck needing user input
                     if not hasattr(user_tasks[user_prompt], '_exec_retries'):
                         user_tasks[user_prompt]._exec_retries = {}
