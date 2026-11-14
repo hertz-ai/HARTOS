@@ -43,8 +43,10 @@ Review of ea8e9b3a4 (REJECTED, 14 Nov 2026):
     resolved 'backend_repair' ('text' is inside 'context.backend' in the
     description).  They are offered by their tag and by their name only;
   * a call without backend_name (or with a name the function does not take)
-    is refused with what was missing and how to call it, not a bare
-    TypeError; the offered schema types each parameter, and wipe_first
+    is refused by the one refusal every tool call goes through
+    (hartos.helper.tool_argument_error, on the patched execute_function),
+    not a bare TypeError: the schema marks backend_name required, as the
+    function does.  The offered schema types each parameter, and wipe_first
     reaches the function.
 """
 import ast
@@ -188,24 +190,74 @@ def test_the_offered_schema_types_each_parameter(registry):
     params = inspect.signature(helper.llm['repair_backend_venv']).parameters
     assert params['backend_name'].annotation in (str, Optional[str])
     assert params['wipe_first'].annotation in (bool, Optional[bool])
+    # backend_name is required on the schema the model reads, as on the
+    # function; wipe_first may be left out.
+    assert params['backend_name'].default is inspect.Parameter.empty
+    assert params['wipe_first'].default is None
+    # A function with no parameters is offered an empty object, never the
+    # bare **kwargs that llama-server refuses (registry.py, the zero-param
+    # endpoint note).
+    assert not inspect.signature(
+        helper.llm['next_tts_venv_to_provision']).parameters
 
 
-@pytest.mark.parametrize('kwargs, wrong', [
-    ({}, 'backend_name is missing'),
-    ({'backend': 'mms_tts'}, 'backend is not a parameter'),
+@pytest.fixture
+def patched_executor():
+    """autogen's execute_function as every live agent runs it: patched by
+    hartos.helper.force_apply_autogen_json_fix, so each call is bound to the
+    tool's signature (bind_tool_call_arguments -> tool_argument_error)
+    before it runs.  Restored afterwards."""
+    from autogen.agentchat.conversable_agent import ConversableAgent
+    from hartos.helper import force_apply_autogen_json_fix
+    saved = (ConversableAgent.execute_function,
+             ConversableAgent.a_execute_function)
+    assert force_apply_autogen_json_fix()
+    yield ConversableAgent
+    (ConversableAgent.execute_function,
+     ConversableAgent.a_execute_function) = saved
+
+
+@pytest.mark.parametrize('arguments, wrong', [
+    ('{}', 'Missing required argument(s): backend_name'),
+    ('{"backend": "mms_tts"}', 'Unknown argument(s): backend'),
 ], ids=['no_backend_name', 'a_name_it_does_not_take'])
-def test_a_call_it_cannot_run_is_told_how_to_call(kwargs, wrong, registry):
-    """A call the function cannot take answers a refusal that says what was
-    wrong and how to call it (owner rule: every tool refusal tells the model
-    what to do), not the bare TypeError text.  The function never runs."""
-    _helper, executor, _tags, _n = _turn(_self_heal_prompt(), registry)
-    out = json.loads(executor.exe['repair_backend_venv'](**kwargs))
-    assert out.get('success') is False
-    text = out.get('message') or ''
-    assert wrong in text, out
-    assert 'repair_backend_venv(backend_name=' in text, out
-    assert 'positional argument' not in json.dumps(out)
-    assert 'keyword argument' not in json.dumps(out)
+def test_a_call_it_cannot_run_gets_the_one_refusal(
+        arguments, wrong, monkeypatch, patched_executor):
+    """A call the function cannot take is refused by the refusal every tool
+    call goes through, which says what was wrong and how to call again
+    (owner rule), and the function does not run.  The model used to read
+    the bare TypeError: the flat schema marked backend_name optional, so the
+    bind passed and the call reached the function."""
+    from integrations.service_tools import registry as reg_mod
+    from integrations.coding_agent import backend_repair_tools as brt
+    calls = []
+    entry = next(t for t in brt.BACKEND_REPAIR_TOOLS
+                 if t['name'] == 'repair_backend_venv')
+
+    def _recording(backend_name: str, wipe_first: bool = False) -> str:
+        calls.append(backend_name)
+        return '{"success": true}'
+
+    monkeypatch.setitem(entry, 'func', _recording)
+    fresh = reg_mod.ServiceToolRegistry(config_file=os.devnull)
+    for info in brt.BackendRepairTool.create_tool_infos():
+        fresh.register_tool(info)
+    helper, _executor, _tags, _n = _turn(_self_heal_prompt(), fresh)
+    agent = patched_executor('executor', llm_config=False,
+                             human_input_mode='NEVER')
+    agent.register_function({'repair_backend_venv': agent._wrap_function(
+        helper.llm['repair_backend_venv'])})
+    ok, reply = agent.execute_function({'name': 'repair_backend_venv',
+                                        'arguments': arguments})
+    assert ok is False
+    assert calls == [], 'the function ran on a call it cannot take'
+    assert wrong in reply['content'], reply
+    assert 'backend_name (required)' in reply['content']
+    assert 'Call repair_backend_venv again' in reply['content']
+    ok, reply = agent.execute_function(
+        {'name': 'repair_backend_venv',
+         'arguments': '{"backend_name": "mms_tts"}'})
+    assert calls == ['mms_tts'], reply     # anti-vacuity: a good call runs
 
 
 # ── Offered by their tag only (review of ea8e9b3a4, MUST-FIX 2) ─────────

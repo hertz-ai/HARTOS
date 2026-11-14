@@ -361,57 +361,37 @@ _JSON_TYPES = {str: 'string', bool: 'boolean', int: 'integer', float: 'number'}
 
 
 def _params_schema(func) -> dict:
-    """The registry's flat params_schema for ``func``, read from its own
-    signature so the two cannot drift."""
+    """The registry's params_schema for ``func``, read from its own signature
+    so the two cannot drift: each parameter typed, and the ones with no
+    default listed as required.  The registry turns 'required' into a
+    parameter with no default (registry._synthesize_signature_from_schema),
+    so the one refusal every tool call goes through (hartos.helper
+    tool_argument_error, from the patched execute_function) answers a call
+    without backend_name: "Missing required argument(s): backend_name ...
+    Call repair_backend_venv again".  The flat form marked every parameter
+    optional, the call reached the function, and the model read the bare
+    TypeError (review of ea8e9b3a4).  A function with no parameters keeps
+    the empty schema, which the registry renders as an empty object."""
     import inspect
-    return {name: {'type': _JSON_TYPES.get(p.annotation, 'string'),
-                   'description': name.replace('_', ' ')}
-            for name, p in inspect.signature(func).parameters.items()}
-
-
-def _refusal(name, sig, missing, unknown) -> str:
-    """What a call the function cannot take is told: what was wrong and how
-    to call it (owner rule: every tool refusal tells the model what to do).
-    Before this the model read the bare TypeError text ("missing 1 required
-    positional argument") and nothing about the call that works."""
-    params = list(sig.parameters.items())
-    wrong = []
-    if missing:
-        wrong.append(f"{', '.join(missing)} "
-                     f"{'is' if len(missing) == 1 else 'are'} missing")
-    if unknown:
-        wrong.append(f"{', '.join(unknown)} "
-                     f"{'is not a parameter' if len(unknown) == 1 else 'are not parameters'}"
-                     f" of {name}")
-    call = (f"{name}("
-            + ', '.join(f'{n}=...' for n, p in params if p.default is p.empty)
-            + ')')
-    takes = (', '.join(f"{n} ({_JSON_TYPES.get(p.annotation, 'string')}, "
-                       f"{'required' if p.default is p.empty else 'optional'})"
-                       for n, p in params) or 'no parameters')
-    return (f"{name} was not run: {'; '.join(wrong)}. Call it again as "
-            f"{call}. It takes {takes}.")
+    params = inspect.signature(func).parameters
+    if not params:
+        return {}
+    return {'properties': {name: {'type': _JSON_TYPES.get(p.annotation,
+                                                          'string'),
+                                  'description': name.replace('_', ' ')}
+                           for name, p in params.items()},
+            'required': [name for name, p in params.items()
+                         if p.default is p.empty]}
 
 
 def _native_handler(entry):
     """The registry's native handler for one BACKEND_REPAIR_TOOLS entry: the
     model's JSON arguments go to the entry's own function, and an argument
-    the model left out (None) keeps the function's default.  A call the
-    function cannot take (a required argument missing, a name it does not
-    take) is refused with how to call it, and the function does not run."""
-    import inspect
-
+    the model left out (None) keeps the function's default."""
     def handler(payload: str) -> str:
-        params = {k: v for k, v in json.loads(payload or '{}').items()
-                  if v is not None}
-        sig = inspect.signature(entry['func'])
-        unknown = sorted(set(params) - set(sig.parameters))
-        missing = [n for n, p in sig.parameters.items()
-                   if p.default is p.empty and n not in params]
-        if missing or unknown:
-            return json.dumps({'success': False, 'message': _refusal(
-                entry['name'], sig, missing, unknown)})
-        return entry['func'](**params)
+        params = json.loads(payload or '{}')
+        return entry['func'](**{k: v for k, v in params.items()
+                                if v is not None})
     return handler
 
 
