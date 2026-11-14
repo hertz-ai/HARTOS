@@ -90,6 +90,26 @@ it.  Approved needs all of:
   signed-in human account holding the central (steward) role; an abstain is
   no answer, and `decide()` waits for a FOR or AGAINST
 
+### Evaluating here: this node's own experiments need no vote
+
+Owner ruling, 2026-11-14: *"voting shd not be a prerequisite to evolve
+locally untill we cross the intelligence barrier"*.
+`voting_rules.may_evaluate_here(verdict, this_nodes_own)` is the one rule the
+evaluation-goal writer and auto-evolve both ask:
+
+- an experiment the vote approved may be evaluated, as before;
+- this node's **own** experiment (its creator counts as this node's identity:
+  the node's owner, an agent the owner owns, or a machine account such as
+  `nunba` that no person owns; `ThoughtExperimentService.node_own_creator_ids`)
+  is evaluated here with **no vote**, unless its context is
+  `steward_required` (`security_guardrail`): security stays with people;
+- anyone else's unvoted experiment is still refused, so another person cannot
+  spend this node's compute alone.
+
+Evaluating is local work. `decide()` and anything shared with the hive keep
+the vote. The intelligence barrier has no measure yet; when the owner defines
+one, `may_evaluate_here` is where the vote returns.
+
 ### Tally
 
 ```python
@@ -129,10 +149,10 @@ The agent's autogen conversation loop drives iteration. See [auto-evolve.md](aut
 
 A single "Auto Evolve" button triggers democratic selection and dispatch:
 
-1. Gather eligible experiments
+1. Gather eligible experiments (voted ones, and this node's own)
 2. Constitutional filter
-3. Democratic vote tally
-4. Select top-N by approval score
+3. Democratic vote tally (this node's own need no vote; see above)
+4. Select top-N: vote-approved by score, then this node's own, newest first
 5. Dispatch to type-aware iteration loops
 
 Owner can pause/resume their experiment mid-iteration. See [auto-evolve.md](auto-evolve.md).

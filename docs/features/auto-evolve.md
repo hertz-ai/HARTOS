@@ -4,7 +4,9 @@ Democratic thought experiment selection with autonomous iteration at hive scale.
 
 ## Purpose
 
-Auto Evolve is the single entry point for autonomous system improvement. One button press triggers a full democratic cycle: eligible thought experiments are gathered, constitutionally filtered, democratically ranked, and the winners are dispatched to type-aware agent iteration loops. The system evolves through structured deliberation, not unilateral action.
+Auto Evolve is the single entry point for autonomous system improvement. One button press (or the agent daemon's cadence) triggers a full cycle: eligible thought experiments are gathered, constitutionally filtered, ranked, and the winners are dispatched to type-aware agent iteration loops.
+
+**This node's own experiments evolve here without a vote.** Owner ruling, 2026-11-14: *"voting shd not be a prerequisite to evolve locally untill we cross the intelligence barrier"*. An experiment created by this node's identity (its owner, an agent the owner owns, or a machine account such as `nunba`) runs with no vote unless its context requires the steward (`security_guardrail`). Anyone else's experiment still needs the democratic vote to use this node's compute. The rule is `voting_rules.may_evaluate_here`; see [thought-experiments.md](thought-experiments.md#evaluating-here-this-nodes-own-experiments-need-no-vote).
 
 ## How It Works
 
@@ -16,7 +18,7 @@ Auto Evolve is the single entry point for autonomous system improvement. One but
                              │
               ┌──────────────▼──────────────┐
               │  1. GATHER                   │
-              │  Pull eligible experiments   │
+              │  voted + this node's own     │
               │  (voting/evaluating status)  │
               └──────────────┬──────────────┘
                              │
@@ -29,13 +31,13 @@ Auto Evolve is the single entry point for autonomous system improvement. One but
               ┌──────────────▼──────────────┐
               │  3. DEMOCRATIC VOTE TALLY   │
               │  Human + agent votes        │
-              │  Context-aware weighting    │
+              │  (own: no vote needed)      │
               └──────────────┬──────────────┘
                              │
               ┌──────────────▼──────────────┐
               │  4. SELECT top-N winners    │
-              │  by approval score          │
-              │  (above min threshold)      │
+              │  voted by score, then own   │
+              │  newest first               │
               └──────────────┬──────────────┘
                              │
               ┌──────────────▼──────────────┐
@@ -266,6 +268,7 @@ Response:
 |-----------|-------|----------|
 | `tests/unit/test_auto_evolve.py` | 20 | Session state, singleton, pause/resume ownership, constitutional filter, vote ranking, tools |
 | `tests/unit/test_autoresearch.py` | 53 | Session management, metric extraction, budget gating, type-aware recipes, iteration tools, benchmark integration |
+| `tests/unit/test_local_evolution_needs_no_vote.py` | 17 | This node's own experiments run without a vote (writer, gather, rank, full cycle); others' and security ones still need it |
 
 ## Source Files
 
