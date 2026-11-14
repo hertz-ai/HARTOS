@@ -330,16 +330,52 @@ def _make_storage_view(group_chat):
     return view
 
 
+# The step lines the two loops send, as their producers write them:
+# create_recipe.step_instruction 'Execute Action N: <step> ,Latest User message:
+# <words>' and reuse_recipe._build_reuse_action_message '<_REUSE_ACTION_MESSAGE_
+# PREFIX>N:<step>[\n\n<words>]<ACTION_STEPS_SEPARATOR><steps>'.  The test file
+# below builds them with those producers, so a format change fails it.
+_CREATE_STEP_START = 'Execute Action '
+_CREATE_WORDS_MARK = ',Latest User message:'
+_REUSE_STEP_START = 'Perform this action -> Action #'
+
+
+def _persons_words_in_step_line(content):
+    """The person's words a step line carries ('' for none), or None when
+    ``content`` is not a step line."""
+    from core.constants import ACTION_STEPS_SEPARATOR
+    if content.startswith(_CREATE_STEP_START) and _CREATE_WORDS_MARK in content:
+        return content.split(_CREATE_WORDS_MARK, 1)[1].strip()
+    if content.startswith(_REUSE_STEP_START):
+        head = content.split(ACTION_STEPS_SEPARATOR, 1)[0]
+        return head.split('\n\n', 1)[1].strip() if '\n\n' in head else ''
+    return None
+
+
 def graph_conversation_sink(memory_graph, session_id):
     """The one MemoryGraph sink for a group chat's write-back.
 
     Each stored message becomes a conversation row under ``session_id``,
     spoken by the message's name. create_agents and reuse's group builder
     carried identical private copies of this; both use this one now.
+
+    The group's own control traffic is not a memory: a StatusVerifier verdict
+    is never stored, and a step line the loop sends is stored as the person's
+    words only.  Live on desktop build 75 the Research Assistant's
+    search_long_term_memory('saved research notes') returned its own step line
+    (13 Nov 19:15) and a verdict JSON (14 Nov 21:03), and the step failed every
+    turn (tests/unit/test_the_memory_graph_keeps_no_control_text.py).  Only
+    this sink: the seed history and SimpleMem keep what they stored before.
     """
     def _sink(msg):
         content = msg.get('content', '') if isinstance(msg, dict) else str(msg)
         speaker = msg.get('name', 'Agent') if isinstance(msg, dict) else 'Agent'
+        if speaker == 'StatusVerifier':
+            return
+        if speaker == 'ChatInstructor' and isinstance(content, str):
+            words = _persons_words_in_step_line(content)
+            if words is not None:
+                content, speaker = words, 'User'
         if content and len(content.strip()) > 5:
             memory_graph.register_conversation(speaker, content, session_id)
     return _sink
