@@ -6,6 +6,8 @@ Democratic thought experiment selection with autonomous iteration at hive scale.
 
 Auto Evolve is the single entry point for autonomous system improvement. One button press triggers a full democratic cycle: eligible thought experiments are gathered, constitutionally filtered, democratically ranked, and the winners are dispatched to type-aware agent iteration loops. The system evolves through structured deliberation, not unilateral action.
 
+**On a flat node, this node's own experiments evolve here without a vote.** Owner rulings: 2026-11-14 *"voting shd not be a prerequisite to evolve locally untill we cross the intelligence barrier"*, narrowed 2026-11-15 to *"the no ovite experiment applies only for topology flat, for regional and central it shd remain with voites"*. "Own" means the creator is an account only this node holds: the owner `HEVOLVE_OWNER_USER_ID` names, or a `system` account owned by no one that no one can sign in to (the node's `nunba` account). Never an agent and never a `system` account with a password, because `POST /api/social/auth/register` can make both for anyone. A security (`steward_required`) experiment, or one someone voted against, still needs the vote. Regional and central nodes keep the vote for everything. The rule is `voting_rules.evaluation_permit`; see [thought-experiments.md](thought-experiments.md#evaluating-here-on-a-flat-node-this-nodes-own-experiments-need-no-vote).
+
 ## How It Works
 
 ```
@@ -16,7 +18,8 @@ Auto Evolve is the single entry point for autonomous system improvement. One but
                              │
               ┌──────────────▼──────────────┐
               │  1. GATHER                   │
-              │  Pull eligible experiments   │
+              │  voted + (flat) this node's  │
+              │  own                         │
               │  (voting/evaluating status)  │
               └──────────────┬──────────────┘
                              │
@@ -29,13 +32,13 @@ Auto Evolve is the single entry point for autonomous system improvement. One but
               ┌──────────────▼──────────────┐
               │  3. DEMOCRATIC VOTE TALLY   │
               │  Human + agent votes        │
-              │  Context-aware weighting    │
+              │  (flat, own: no vote needed)│
               └──────────────┬──────────────┘
                              │
               ┌──────────────▼──────────────┐
               │  4. SELECT top-N winners    │
-              │  by approval score          │
-              │  (above min threshold)      │
+              │  voted by score, then own   │
+              │  newest first               │
               └──────────────┬──────────────┘
                              │
               ┌──────────────▼──────────────┐
@@ -266,6 +269,7 @@ Response:
 |-----------|-------|----------|
 | `tests/unit/test_auto_evolve.py` | 20 | Session state, singleton, pause/resume ownership, constitutional filter, vote ranking, tools |
 | `tests/unit/test_autoresearch.py` | 53 | Session management, metric extraction, budget gating, type-aware recipes, iteration tools, benchmark integration |
+| `tests/unit/test_local_evolution_needs_no_vote.py` | 49 | Flat node's own experiments run without a vote (writer, gather, rank, full cycle); regional/central, agents, signed-in or synced system accounts, strangers, security and vote-against still need it; register -> create -> evaluate through the real routes; the create tool cannot name this node as creator |
 
 ## Source Files
 

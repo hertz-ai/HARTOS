@@ -309,6 +309,125 @@ def approval_verdict(tally: dict) -> dict:
     }
 
 
+# ─── Evaluating here without a vote: flat nodes, this node's own ─────
+#
+# Owner rulings (verbatim): 2026-11-14 "voting shd not be a prerequisite to
+# evolve locally untill we cross the intelligence barrier"; 2026-11-15 "the
+# no ovite experiment applies only for topology flat, for regional and
+# central it shd remain with voites".  The intelligence barrier has no
+# measure yet (none in code, docs or memory on 2026-11-14); when the owner
+# defines one, evaluation_permit is the one place the vote returns.
+#: The one topology where this node's own experiments need no vote.
+VOTE_FREE_TOPOLOGY = 'flat'
+
+
+def evolves_without_vote_here(node_tier=None) -> bool:
+    """Whether this node's own experiments may evaluate here with no vote:
+    only on a flat node (owner ruling 2026-11-15).
+
+    Reads the topology the node CLAIMS (HEVOLVE_NODE_TIER, unset = 'flat',
+    as every other reader in the tree), never key_delegation.get_node_tier:
+    that one answers 'flat' for a node that claims central without proving
+    it with the master key, which here would turn the vote OFF on exactly
+    the node that said it is central.  Any value but 'flat' -- regional,
+    central, one this rule does not know, an empty string -- keeps the
+    vote."""
+    if node_tier is None:
+        import os
+        node_tier = os.environ.get('HEVOLVE_NODE_TIER', VOTE_FREE_TOPOLOGY)
+    return str(node_tier or '').strip().lower() == VOTE_FREE_TOPOLOGY
+
+
+def node_holds(user, owner_of) -> bool:
+    """Whether ``user`` (a users row, or None) is an account only this node
+    holds, so an experiment it created is this node's OWN:
+      - this node's owner, the person HEVOLVE_OWNER_USER_ID names
+        (node_identity), or
+      - the node's own machine account as UserService.ensure_system_user
+        makes it (the 'nunba' account): user_type 'system', owned by no
+        one, no password, is_verified.  Its api_token is a credential, but
+        no route hands it out: the only replies that carry a token
+        (/auth/register, agent create, /bots/register) return the account
+        that request just made.
+    Never an agent: POST /auth/register makes an agent with no sign-in for
+    anyone and takes its owner_id from the request body, so "owned by the
+    owner" is a claim anyone can make (review of e7b769936, which counted
+    every account no person owns as the node).  Never a 'system' account
+    with a password: the same route takes user_type from the body and
+    always sets one, so that is someone's sign-in.  Never a row an inbound
+    sync made: sync_engine._handle_sync_user creates users with the
+    payload's own id and user_type, no owner, no password, and never sets
+    is_verified ("verification is a trusted local act").
+    ``owner_of(owner_id)`` returns that users row, or None."""
+    if user is None:
+        return False
+    if is_person(user):
+        return node_identity(owner_of) == user.id
+    return (getattr(user, 'user_type', None) == 'system'
+            and getattr(user, 'owner_id', None) is None
+            and not getattr(user, 'password_hash', None)
+            and getattr(user, 'is_verified', None) is True)
+
+
+#: Why the own path refuses, and what would let the experiment run.  Shown to
+#: whoever asked (owner ruling 2026-11-09: a refusal says what was wrong).
+_PERMIT_HINTS = {
+    'approved': 'the vote approved it',
+    'this_nodes_own': "this node's own experiment, evaluated here with no "
+                      'vote (flat node)',
+    'not_this_nodes_own': "not this node's own experiment: it runs once the "
+                          'vote approves it (>= 3 distinct voters, >= 2 FOR, '
+                          'a 2/3 FOR share)',
+    'topology_keeps_the_vote': 'this node is not flat (HEVOLVE_NODE_TIER): '
+                               'on regional and central every experiment '
+                               'needs the vote',
+    'steward_required': 'a security decision: it needs the vote and the '
+                        "steward's FOR, even on this node",
+    'vote_against': 'someone voted against it: it now runs only if the '
+                    'vote approves it',
+}
+
+
+def evaluation_permit(tally: dict, this_nodes_own: bool,
+                      node_tier=None) -> dict:
+    """Whether an experiment may be EVALUATED on this node: the ONE rule the
+    evaluation-goal writer and auto-evolve's ranking both ask.
+
+      - the vote approved it (approval_verdict): yes, on every topology;
+      - otherwise yes only when ALL hold: this is a flat node
+        (evolves_without_vote_here), the experiment is this node's own
+        (``this_nodes_own``, from node_holds), its context does not require
+        the steward (security stays with people), and no vote is against it
+        (a vote against sends it back to the vote; e7b769936 ignored one).
+
+    Evaluating is local work.  decide() and anything shared with the hive
+    keep the vote.  Returns {'allowed', 'approved_by_vote',
+    'own_without_vote', 'reason', 'hint'}: reason is 'approved',
+    'this_nodes_own', or the first own-path condition that failed
+    ('not_this_nodes_own', 'topology_keeps_the_vote', 'steward_required',
+    'vote_against'); hint says it in words."""
+    verdict = approval_verdict(tally)
+    if not this_nodes_own:
+        why = 'not_this_nodes_own'
+    elif not evolves_without_vote_here(node_tier):
+        why = 'topology_keeps_the_vote'
+    elif verdict['steward_required']:
+        why = 'steward_required'
+    elif (tally.get('total_against') or 0) > 0:
+        why = 'vote_against'
+    else:
+        why = 'this_nodes_own'
+    own_without_vote = why == 'this_nodes_own'
+    reason = 'approved' if verdict['approved'] else why
+    return {
+        'allowed': verdict['approved'] or own_without_vote,
+        'approved_by_vote': verdict['approved'],
+        'own_without_vote': own_without_vote,
+        'reason': reason,
+        'hint': _PERMIT_HINTS[reason],
+    }
+
+
 def recommendation(tally: dict) -> str:
     """tally_votes' decision_recommendation, read from approval_verdict so
     the two cannot disagree: 'approve' exactly when it approves;

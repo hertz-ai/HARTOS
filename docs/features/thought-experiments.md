@@ -90,6 +90,33 @@ it.  Approved needs all of:
   signed-in human account holding the central (steward) role; an abstain is
   no answer, and `decide()` waits for a FOR or AGAINST
 
+### Evaluating here: on a flat node, this node's own experiments need no vote
+
+Owner rulings: 2026-11-14 *"voting shd not be a prerequisite to evolve
+locally untill we cross the intelligence barrier"*; 2026-11-15 *"the no ovite
+experiment applies only for topology flat, for regional and central it shd
+remain with voites"*.  `voting_rules.evaluation_permit(tally, this_nodes_own)`
+is the one rule the evaluation-goal writer and auto-evolve both ask:
+
+- an experiment the vote approved may be evaluated, on every topology;
+- otherwise only when ALL hold: the node is flat (`HEVOLVE_NODE_TIER` unset
+  or `flat`; anything else keeps the vote), the experiment is this node's
+  **own**, its context is not `steward_required` (security stays with
+  people), and no vote is against it (a vote against sends it back to the
+  vote);
+- **own** (`voting_rules.node_holds`): the creator is the owner
+  `HEVOLVE_OWNER_USER_ID` names, or a `system` account owned by no one with no
+  password (the node's `nunba` account, made by `ensure_system_user`).  Never
+  an agent (`/auth/register` makes ownerless agents for anyone and takes
+  `owner_id` from the request body) and never a `system` account with a
+  password (the same route takes `user_type` from the body);
+- a refusal says why (`permit.reason`, `hint`): `not_this_nodes_own`,
+  `topology_keeps_the_vote`, `steward_required` or `vote_against`.
+
+Evaluating is local work. `decide()` and anything shared with the hive keep
+the vote. The intelligence barrier has no measure yet; when the owner defines
+one, `evaluation_permit` is where the vote returns.
+
 ### Tally
 
 ```python
@@ -129,10 +156,10 @@ The agent's autogen conversation loop drives iteration. See [auto-evolve.md](aut
 
 A single "Auto Evolve" button triggers democratic selection and dispatch:
 
-1. Gather eligible experiments
+1. Gather eligible experiments (voted ones, and on a flat node this node's own)
 2. Constitutional filter
-3. Democratic vote tally
-4. Select top-N by approval score
+3. Democratic vote tally (on a flat node this node's own need no vote; see above)
+4. Select top-N: vote-approved by score, then this node's own, newest first
 5. Dispatch to type-aware iteration loops
 
 Owner can pause/resume their experiment mid-iteration. See [auto-evolve.md](auto-evolve.md).

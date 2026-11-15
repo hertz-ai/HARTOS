@@ -4,8 +4,10 @@ Auto Evolve Orchestrator — Democratic thought experiment → autonomous iterat
 Single entry point for the full evolution loop:
 1. GATHER  — collect eligible thought experiments
 2. FILTER  — constitutional gate (ConstitutionalFilter)
-3. VOTE    — tally democratic votes (human + agent, weighted)
-4. SELECT  — top-N experiments by approval score
+3. VOTE    — tally democratic votes (human + agent, weighted); on a FLAT
+             node only, this node's OWN experiments need no vote (owner
+             rulings 2026-11-14/15, voting_rules.evaluation_permit)
+4. SELECT  — top-N: vote-approved by score, then this node's own
 5. DISPATCH — route each winner to its type-aware iteration loop
 6. TRACK   — monitor progress, feed results back to evolution stack
 
@@ -370,7 +372,9 @@ class AutoEvolveOrchestrator:
         if not ranked:
             session.status = 'completed'
             session.errors.append(
-                f'No experiments met approval threshold ({min_approval_score})')
+                'No experiment may run here: none met the vote (approval '
+                f'threshold {min_approval_score}) and none is this flat '
+                "node's own")
             self._emit_event('auto_evolve.none_approved', session)
             return
 
@@ -396,32 +400,54 @@ class AutoEvolveOrchestrator:
                            statuses: List[str]) -> List[Dict]:
         """Gather eligible thought experiments from DB."""
         try:
-            from integrations.social.models import db_session
+            from integrations.social.models import (
+                ThoughtExperiment, db_session)
             from integrations.social.thought_experiment_service import (
                 ThoughtExperimentService)
+            from integrations.social.voting_rules import (
+                evolves_without_vote_here)
 
             with db_session(commit=False) as db:
+                # On a flat node this node's own experiments may run with no
+                # vote (voting_rules.evaluation_permit), so they are gathered
+                # whether or not anyone voted.  Off flat, none are.
+                own_ids = set()
+                if evolves_without_vote_here():
+                    own_ids = ThoughtExperimentService.node_own_creator_ids(
+                        db, [row[0] for row in db.query(
+                            ThoughtExperiment.creator_id)
+                            .filter(ThoughtExperiment.status.in_(list(statuses)))
+                            .distinct()])
                 all_experiments = []
+                seen = set()
                 for status in statuses:
-                    # Only experiments that HAVE votes: a zero-vote row can
-                    # never pass _rank_by_votes (score 0, super-majority 0).
-                    # The newest-50 window used to hide every voted row once
+                    # Everyone else's only when they HAVE votes: an unvoted
+                    # row of theirs can never pass _rank_by_votes.  The
+                    # newest-50 window used to hide every voted row once
                     # unvoted ones piled up -- measured on a live node, the
                     # human-voted experiments sat at rank ~693 of 807 and
-                    # every cycle ended none_approved.  This changes what is
-                    # looked at, never what is approved: the gate is intact.
+                    # every cycle ended none_approved.  What is looked at
+                    # here never decides what runs: _rank_by_votes does.
                     exps = ThoughtExperimentService.get_active_experiments(
                         db, status=status, limit=200, with_votes_only=True)
-                    # One evaluation goal already contains the experiment's
-                    # type-aware iteration loop.  Re-dispatching an evaluating
-                    # row that has recorded an evaluation creates duplicate
-                    # goals forever because the explicit decide step belongs to
-                    # the steward/API.  A failed goal records no evaluation and
-                    # therefore remains eligible for retry.
-                    all_experiments.extend(
-                        exp for exp in exps
-                        if not (status == 'evaluating'
-                                and exp.get('agent_evaluations_json')))
+                    if own_ids:
+                        exps = exps + ThoughtExperimentService.get_active_experiments(
+                            db, status=status, limit=200, creator_ids=own_ids)
+                    for exp in exps:
+                        if exp['id'] in seen:
+                            continue
+                        seen.add(exp['id'])
+                        # One evaluation goal already contains the
+                        # experiment's type-aware iteration loop.
+                        # Re-dispatching an evaluating row that has recorded
+                        # an evaluation creates duplicate goals forever
+                        # because the explicit decide step belongs to the
+                        # steward/API.  A failed goal records no evaluation
+                        # and therefore remains eligible for retry.
+                        if (status == 'evaluating'
+                                and exp.get('agent_evaluations_json')):
+                            continue
+                        all_experiments.append(exp)
                 return all_experiments
         except Exception as e:
             logger.warning(f"[{session.session_id}] Gather failed: {e}")
@@ -449,15 +475,22 @@ class AutoEvolveOrchestrator:
     def _rank_by_votes(self, session: EvolveSession,
                        candidates: List[Dict],
                        min_score: float) -> List[Dict]:
-        """Tally votes and rank by approval score.
+        """Tally votes and rank the experiments that may run here.
 
-        Two gates apply per PRODUCT_MAP §10:
-          1. weighted_score >= min_score (caller-provided absolute floor)
-          2. total_for / (total_for + total_against) >= 2/3 super-majority
-
-        Both must hold for an experiment to qualify for dispatch.  The
-        super-majority gate protects against a small but highly-weighted
-        vocal minority flipping a low-participation tally into approval.
+        The ONE rule is voting_rules.evaluation_permit (the evaluation-goal
+        writer asks it too, so ranking and dispatch cannot disagree):
+          - an experiment qualifies by the vote when approval_verdict
+            approves it (quorum + 2/3 super-majority per PRODUCT_MAP §10,
+            the context's threshold and steward) AND weighted_score >=
+            min_score, auto-evolve's extra floor on the vote path.  The
+            super-majority gate protects against a small but
+            highly-weighted vocal minority flipping a low-participation
+            tally into approval;
+          - on a FLAT node only, this node's own experiment qualifies with
+            no vote, unless its context requires the steward or a vote is
+            against it (owner rulings 2026-11-14/15).
+        Vote-approved experiments rank first, by score; this node's own
+        follow, by score, then newest first.
 
         The gate FAILS CLOSED.  If the tally cannot be read at all -- a
         locked SQLite database, a schema error -- nothing is dispatched
@@ -474,9 +507,12 @@ class AutoEvolveOrchestrator:
             from integrations.social.models import db_session
             from integrations.social.thought_experiment_service import (
                 ThoughtExperimentService)
-            from integrations.social.voting_rules import approval_verdict
+            from integrations.social.voting_rules import (
+                approval_verdict, evaluation_permit)
 
             with db_session(commit=False) as db:
+                own_ids = ThoughtExperimentService.node_own_creator_ids(
+                    db, [exp.get('creator_id') for exp in candidates])
                 for exp in candidates:
                     tally = ThoughtExperimentService.tally_votes(
                         db, exp['id'])
@@ -487,15 +523,21 @@ class AutoEvolveOrchestrator:
                     # closed -- AND a FOR share of the decisive weight of at
                     # least max(2/3, the context's threshold), one vote per
                     # identity -- AND the steward's FOR where the context
-                    # requires one.  The evaluation-goal writer asks the same
-                    # rule, so ranking and dispatch cannot disagree.
+                    # requires one.  evaluation_permit adds the flat node's
+                    # own path; min_score floors only the vote path (an own
+                    # experiment has no score to clear).
                     verdict = approval_verdict(tally)
+                    permit = evaluation_permit(
+                        tally, exp.get('creator_id') in own_ids)
                     super_ratio = verdict['super_majority']
                     quorate = verdict['quorum_met']
+                    by_vote = permit['approved_by_vote'] and score >= min_score
                     exp['_approval_score'] = score
                     exp['_super_majority'] = super_ratio
                     exp['_tally'] = tally
-                    if score >= min_score and verdict['approved']:
+                    exp['_this_nodes_own'] = permit['own_without_vote']
+                    exp['_approved_by_vote'] = by_vote
+                    if by_vote or permit['own_without_vote']:
                         scored.append(exp)
                     else:
                         logger.debug(
@@ -534,10 +576,13 @@ class AutoEvolveOrchestrator:
             exp['_active_learning_multiplier'] = round(al_mult, 4)
             exp['_biased_score'] = round(biased, 4)
 
-        # Sort by biased score (falls back to unbiased when al_mult=1.0)
+        # Vote-approved first, by biased score (falls back to unbiased when
+        # al_mult=1.0); then this node's own, by score, newest first.
         scored.sort(
-            key=lambda e: e.get('_biased_score',
-                                e.get('_approval_score', 0)),
+            key=lambda e: (bool(e.get('_approved_by_vote')),
+                           e.get('_biased_score',
+                                 e.get('_approval_score', 0)),
+                           e.get('created_at') or ''),
             reverse=True,
         )
         return scored
@@ -686,6 +731,8 @@ class AutoEvolveOrchestrator:
                                 'type': exp.get('experiment_type', 'traditional'),
                                 'approval_score': exp.get('_approval_score', 0),
                                 'super_majority': exp.get('_super_majority', 0),
+                                'approved_by_vote': bool(exp.get('_approved_by_vote')),
+                                'this_nodes_own': bool(exp.get('_this_nodes_own')),
                                 'goal_id': goal_result.get('goal_id')
                                 if isinstance(goal_result, dict) else None,
                                 'status': 'dispatched',
