@@ -5089,6 +5089,15 @@ def tool_argument_error(func, func_name, arguments, repaired, as_written=None):
     emptied = ([p.name for p in params
                 if p.default is p.empty and blank(bound.get(p.name))]
                if repaired and bound is not None else [])
+    # Strict JSON null for a REQUIRED value binds too, and the call then
+    # reached the tool without it: repair_backend_venv's handler dropped the
+    # None and the model read the bare "missing 1 required positional
+    # argument" TypeError (review of c58a17460).  Refused like a missing one;
+    # a blank string the model wrote stays its own choice.
+    if not repaired and bound is not None:
+        emptied = [p.name for p in params
+                   if p.default is p.empty and p.name in bound
+                   and bound[p.name] is None]
     # Any value, required or not, that the repair emptied: empty now, but
     # not left empty by the model (review of 30042a2b6: "cwd": /tmp ran a
     # **kwargs tool with cwd='').

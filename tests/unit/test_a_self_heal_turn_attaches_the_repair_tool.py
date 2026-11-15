@@ -220,7 +220,10 @@ def patched_executor():
 @pytest.mark.parametrize('arguments, wrong', [
     ('{}', 'Missing required argument(s): backend_name'),
     ('{"backend": "mms_tts"}', 'Unknown argument(s): backend'),
-], ids=['no_backend_name', 'a_name_it_does_not_take'])
+    # Strict JSON null for the required name binds; the handler then drops
+    # the None and the model read the bare TypeError (review of c58a17460).
+    ('{"backend_name": null}', 'Required argument(s) left empty: backend_name'),
+], ids=['no_backend_name', 'a_name_it_does_not_take', 'backend_name_null'])
 def test_a_call_it_cannot_run_gets_the_one_refusal(
         arguments, wrong, monkeypatch, patched_executor):
     """A call the function cannot take is refused by the refusal every tool
@@ -258,6 +261,12 @@ def test_a_call_it_cannot_run_gets_the_one_refusal(
         {'name': 'repair_backend_venv',
          'arguments': '{"backend_name": "mms_tts"}'})
     assert calls == ['mms_tts'], reply     # anti-vacuity: a good call runs
+    # Null is refused only for a REQUIRED value: an optional one given null
+    # still runs (the review of c58a17460 measured wipe_first: null running).
+    ok, reply = agent.execute_function(
+        {'name': 'repair_backend_venv',
+         'arguments': '{"backend_name": "mms_tts", "wipe_first": null}'})
+    assert calls == ['mms_tts', 'mms_tts'], reply
 
 
 # ── Offered by their tag only (review of ea8e9b3a4, MUST-FIX 2) ─────────
