@@ -43,7 +43,8 @@ _DEFAULT_VOICE = 'af_bella'
 def _load():
     """Load Kokoro once at subprocess startup (~3-5s).
 
-    Uses the GPU if CUDA is available, otherwise CPU. This is the right
+    Uses the GPU if CUDA is available and has room for it, otherwise the
+    CPU (tts_router.gpu_preferred_device). This is the right
     place to burn one warm-up cost — subsequent synth calls amortise
     over the life of the worker process. On a modest consumer CPU the
     warm 82M model produces ~1x real-time speech, which beats every
@@ -58,7 +59,9 @@ def _load():
             "Install with: pip install kokoro"
         ) from e
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    # The GPU only when it has room (the registry says kokoro runs on the CPU).
+    from integrations.channels.media.tts_router import gpu_preferred_device
+    device = gpu_preferred_device('kokoro')
     # lang_code='a' = American English, 'b' = British English.
     # The worker is registered once with lang_code='a'; multi-accent
     # support would spawn a second worker — out of scope for MVP.
