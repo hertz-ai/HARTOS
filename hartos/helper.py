@@ -400,6 +400,31 @@ def _mojeek_serp(query: str, max_results: int = 5) -> List[dict]:
         return []
 
 
+def _ddgs_rows(DDGS, query: str, max_results: int, backend: str = None) -> List[dict]:
+    """One ddgs text search as [{'title','url','snippet'}]; [] when it finds
+    nothing or fails.  No ``backend`` = the package's own default, as before."""
+    try:
+        with DDGS() as ddg:
+            found = (ddg.text(query, max_results=max_results) if backend is None
+                     else ddg.text(query, max_results=max_results, backend=backend))
+        rows = [{'title': r.get('title', ''),
+                 'url': r.get('href') or r.get('link', ''),
+                 'snippet': r.get('body', '')} for r in (found or [])]
+        return [r for r in rows if r['url']]
+    except Exception:
+        return []
+
+
+def _ddgs_text_engines() -> List[str]:
+    """ddgs's own text engine names, in its order; [] when the installed
+    package does not expose them (the older duckduckgo_search)."""
+    try:
+        from ddgs.engines import ENGINES
+        return list(ENGINES.get('text', {}).keys())
+    except Exception:
+        return []
+
+
 def _keyless_serp(query: str, max_results: int = 5) -> List[dict]:
     """Keyless SERP, tier-ordered.  A: ``ddgs`` lib if installed (multi-source);
     B: Mojeek html scrape (no dep, independent index, returns 200 to a plain GET);
@@ -411,14 +436,21 @@ def _keyless_serp(query: str, max_results: int = 5) -> List[dict]:
             from ddgs import DDGS
         except ImportError:
             from duckduckgo_search import DDGS
-        with DDGS() as ddg:
-            rows = [{'title': r.get('title', ''),
-                     'url': r.get('href') or r.get('link', ''),
-                     'snippet': r.get('body', '')}
-                    for r in ddg.text(query, max_results=max_results)]
-        rows = [r for r in rows if r['url']]
+        rows = _ddgs_rows(DDGS, query, max_results)
         if rows:
             return rows
+        # ddgs's auto mode runs two engines at a time, stops waiting at the
+        # first exception and never collects the futures still running in its
+        # last batch.  Measured on desktop build 75 (15 Nov 2026, ddgs 9.16):
+        # auto 'No results found' while yandex alone returned 3 rows, so the
+        # Research Assistant's every search came back empty.  Ask ddgs's own
+        # text engines one at a time (the same engines auto would contact)
+        # and keep the first that answers
+        # (tests/unit/test_keyless_search_tries_each_engine.py).
+        for engine in _ddgs_text_engines():
+            rows = _ddgs_rows(DDGS, query, max_results, backend=engine)
+            if rows:
+                return rows
     except Exception:
         pass
     rows = _mojeek_serp(query, max_results)             # Tier B — Mojeek (primary)
