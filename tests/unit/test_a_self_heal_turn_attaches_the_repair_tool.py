@@ -48,6 +48,17 @@ Review of ea8e9b3a4 (REJECTED, 14 Nov 2026):
     not a bare TypeError: the schema marks backend_name required, as the
     function does.  The offered schema types each parameter, and wipe_first
     reaches the function.
+
+Review of 2d48b6fb7 (REJECTED, 14 Nov 2026), the seat that proposes:
+  * ONE seat is offered the call: the Helper gets the schema, the seat that
+    runs tools (the executor on REUSE, the Assistant on CREATE) gets the
+    function, and no other seat gets the schema.  8e944550b's Tier-2 loader
+    also put the schema on the ASSISTANT and the function on a separate
+    executor; that is RETIRED with the loader, by design: attach_for_tags
+    offers a tool's schema to the Helper only, so the model is offered the
+    repair call once, from the seat that proposes every tool call;
+  * a session that once got the tools adds no second copy when request_tools
+    is asked for something else later.
 """
 import ast
 import json
@@ -334,6 +345,51 @@ def test_creates_own_turn_attach_gives_the_self_heal_turn_the_tool(registry):
         {'helper': helper, 'assistant': assistant}, _self_heal_prompt(), 'u1')
     assert REPAIR_NAMES <= set(helper.llm)
     assert REPAIR_NAMES <= set(assistant.exe)
+    # The Helper proposes; the Assistant runs and is not offered the schema
+    # (review of 2d48b6fb7: the Tier-2 Assistant-seat schema is retired).
+    assert not (REPAIR_NAMES & set(assistant.llm)), sorted(assistant.llm)
+
+
+def test_only_the_helper_is_offered_the_repair_call(registry):
+    """REUSE's turn: the schema on the Helper, the function on the executor,
+    no schema on the executor (review of 2d48b6fb7)."""
+    helper, executor, _tags, _n = _turn(_self_heal_prompt(), registry)
+    assert REPAIR_NAMES <= set(helper.llm)
+    assert REPAIR_NAMES <= set(executor.exe)
+    assert not (REPAIR_NAMES & set(executor.llm)), sorted(executor.llm)
+    assert not (REPAIR_NAMES & set(helper.exe)), sorted(helper.exe)
+
+
+def test_request_tools_after_a_self_heal_turn_adds_no_second_copy(registry):
+    """A session that once got the repair tools asks request_tools for
+    something else: the tools it holds are not attached again (the review of
+    2d48b6fb7 measured a re-attach on the parent and could not run this on
+    the commit)."""
+    from core.agent_tool_menu import discover_and_attach
+    helper, executor, _tags, _n = _turn(_self_heal_prompt(), registry)
+    held_llm = {n: helper.llm[n] for n in REPAIR_NAMES}
+    held_exe = {n: executor.exe[n] for n in REPAIR_NAMES}
+    attached = set()
+    reply = discover_and_attach('text to speech', helper, executor, registry,
+                                attached)
+    assert not (REPAIR_NAMES & attached), reply
+    for n in REPAIR_NAMES:
+        assert helper.llm[n] is held_llm[n], f'{n} schema attached again'
+        assert executor.exe[n] is held_exe[n], f'{n} function attached again'
+
+
+def test_a_second_self_heal_turn_on_the_session_adds_no_second_copy(registry):
+    """The next self-heal turn on the same session finds the repair tools
+    already held (the turn's attach ledger, armed once per session) and
+    attaches nothing again."""
+    from core.agent_tool_menu import attach_for_turn
+    helper, executor, _tags, _n = _turn(_self_heal_prompt(), registry)
+    held_llm = {n: helper.llm[n] for n in REPAIR_NAMES}
+    held_exe = {n: executor.exe[n] for n in REPAIR_NAMES}
+    attach_for_turn(_self_heal_prompt(), helper, executor, registry)
+    for n in REPAIR_NAMES:
+        assert helper.llm[n] is held_llm[n], f'{n} schema attached again'
+        assert executor.exe[n] is held_exe[n], f'{n} function attached again'
 
 
 @pytest.mark.parametrize('message', [
