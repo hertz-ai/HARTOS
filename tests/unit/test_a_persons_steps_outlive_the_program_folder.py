@@ -141,6 +141,111 @@ def test_a_registry_miss_with_nothing_in_flight_returns_nothing(folders):
         "the registry then serves as the person's for 8 hours")
 
 
+OLD_BUILD = [
+    {"action_id": 1, "action": "Show the child a picture of a cat"},
+    {"action_id": 2, "action": "Ask the child to name it"},
+    {"action_id": 3, "action": "Say well done"},
+]
+
+
+def _finish(ledger):
+    for task_id in list(ledger.tasks):
+        ledger.update_task_status(task_id, TaskStatus.IN_PROGRESS)
+        ledger.update_task_status(task_id, TaskStatus.COMPLETED)
+
+
+def test_a_registry_miss_never_opens_an_older_builds_session(folders):
+    """Review of b48cd6693, must-fix 1 (its probe): an earlier build's session
+    is left in progress, the agent is rebuilt, the current build's session is
+    done.  A miss must not reopen the earlier build's session (lifecycle syncs
+    would then write this turn's states into another build's steps)."""
+    import time as _time
+    from hartos.lifecycle_hooks import _load_ledger_on_miss
+    old = create_ledger_from_actions(user_id=CHILD, prompt_id=PROMPT,
+                                     actions=OLD_BUILD)
+    old.update_task_status("action_1", TaskStatus.IN_PROGRESS)
+    _time.sleep(0.01)
+    current = create_ledger_from_actions(user_id=CHILD, prompt_id=PROMPT,
+                                         actions=ACTIONS)
+    assert current.session_id != old.session_id
+    _finish(current)
+    reopened = _load_ledger_on_miss(f"{CHILD}_{PROMPT}")
+    assert reopened is None, (
+        f"a miss reopened {getattr(reopened, 'session_id', None)}, the earlier "
+        f"build's session, while the current build's ({current.session_id}) is done")
+
+
+def test_a_registry_miss_never_takes_another_persons_session(folders):
+    """Another person's session of the same agent is in progress, this person
+    has none: the miss gives this person nothing (review of b48cd6693: the
+    mutant that drops the person from the scan survived)."""
+    from hartos.lifecycle_hooks import _load_ledger_on_miss
+    _start(user="d0000000-other-0000-0000-000000000002")
+    assert _load_ledger_on_miss(f"{CHILD}_{PROMPT}") is None, (
+        "a miss handed this person another person's session")
+
+
+def test_a_miss_reads_only_the_persons_own_steps(folders, monkeypatch):
+    """Review of b48cd6693, must-fix 2: a miss parsed every ledger in the
+    folder (3,074 on the owner's desktop; 19 s cold, 1.8 s warm on 3,000)
+    while the registry's lock was held.  It reads this person's ledgers of
+    this agent only."""
+    import agent_ledger.core as alc
+    from hartos.lifecycle_hooks import _load_ledger_on_miss
+    for n in range(12):
+        _start(user=f"d0000000-other-0000-0000-{n:012d}")
+        SmartLedger(str(PROMPT + 1 + n), f"{CHILD}_{PROMPT + 1 + n}_1").save()
+    mine = _start()
+    parsed = []
+    real_load = alc.json.load
+
+    def _counting_load(fh, *a, **kw):
+        parsed.append(os.path.basename(getattr(fh, 'name', '?')))
+        return real_load(fh, *a, **kw)
+
+    monkeypatch.setattr(alc.json, 'load', _counting_load)
+    reopened = _load_ledger_on_miss(f"{CHILD}_{PROMPT}")
+    assert reopened is not None and reopened.session_id == mine.session_id
+    others = [p for p in parsed if p.startswith('ledger_')
+              and p != _ledger_file(folders["data"], mine).name]
+    assert not others, f"a miss parsed {len(others)} other ledgers: {sorted(others)[:4]}"
+
+
+def test_a_miss_with_nothing_in_flight_is_not_read_again_at_once(folders, monkeypatch):
+    """Lifecycle hooks read the registry on every state change, and a session
+    that owns no ledger misses every time: the second miss within a short
+    window does not read the folder again; a registered ledger is served at
+    once all the same."""
+    from agent_ledger.core import SmartLedger as _SL
+    import hartos.lifecycle_hooks as lh
+    reads = []
+    real = _SL.list_grouped_by_recipe_hierarchy.__func__
+
+    def _counting(cls, *a, **kw):
+        reads.append(1)
+        return real(cls, *a, **kw)
+
+    monkeypatch.setattr(_SL, 'list_grouped_by_recipe_hierarchy', classmethod(_counting))
+    key = f"{CHILD}_{PROMPT}"
+    lh._ledger_registry.pop(key, None)
+    assert lh.get_registered_ledger(key) is None
+    assert lh.get_registered_ledger(key) is None
+    assert len(reads) == 1, f"the folder was read {len(reads)} times for two misses"
+    ledger = _start()
+    lh.register_ledger_for_session(key, ledger)
+    try:
+        assert lh.get_registered_ledger(key) is ledger
+        # The registration forgot the remembered miss: with the entry gone
+        # (evicted), the next read reopens the session from disk at once.
+        lh._ledger_registry.pop(key, None)
+        reopened = lh.get_registered_ledger(key)
+        assert reopened is not None and reopened.session_id == ledger.session_id, (
+            "after a registration the old miss was still remembered, so the "
+            "person's session in progress was not reopened")
+    finally:
+        lh._ledger_registry.pop(key, None)
+
+
 def test_the_program_folders_old_steps_are_copied_once_never_overwritten(folders, monkeypatch):
     import agent_ledger.core as alc
     old = folders["program"] / "agent_data"
