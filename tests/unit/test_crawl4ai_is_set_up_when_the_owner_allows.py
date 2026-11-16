@@ -227,3 +227,53 @@ def test_a_browser_folder_already_named_is_kept(host, monkeypatch):
     wc._use_installed_browsers()
     import os
     assert os.environ['PLAYWRIGHT_BROWSERS_PATH'] == 'E:\\browsers'
+
+
+# ── Ready means the package AND its browser (forward fix, 2026-11-16) ──────
+# Live on build 75, 06:28-06:33: the setup's pip step landed crawl4ai 0.9.5
+# but was recorded failed before Chromium (a false import-check failure,
+# Nunba dbe17a7f).  An import-only availability check would have called
+# crawl4ai ready after the next restart and never offered the setup again,
+# while every crawl failed for want of a browser.
+
+def test_crawl4ai_without_its_browser_is_not_ready_and_is_offered(monkeypatch):
+    asked = []
+    _answer(monkeypatch, 'asked', asked)
+    monkeypatch.setattr(wc, '_crawler_available', None)
+    monkeypatch.setattr(wc, '_crawl4ai_importable', lambda: True)
+    monkeypatch.setattr(wc, '_browser_installed', lambda: False)
+    result = wc.crawl_url('https://example.com', timeout=5)
+    assert result['markdown'] == 'static text', 'a crawl was tried with no browser'
+    assert [c for c, _ in asked] == ['crawl:crawl4ai']
+
+
+def test_with_the_package_present_the_setup_installs_only_the_browser(monkeypatch):
+    calls = []
+    monkeypatch.setattr(wc, '_setup_target', lambda: (None, 'D:\.nunba\ms-playwright'))
+    monkeypatch.setattr(wc, '_crawl4ai_importable', lambda: True)
+    monkeypatch.setattr(wc, '_pip_install_crawl4ai', lambda site: calls.append('pip') or True)
+    monkeypatch.setattr(wc, '_install_chromium',
+                        lambda browsers: calls.append(('chromium', browsers)) or True)
+    wc._install_crawl4ai()
+    assert calls == [('chromium', 'D:\.nunba\ms-playwright')], calls
+    assert wc._crawler_available is None
+
+
+def test_a_browser_in_playwrights_default_folder_is_found(monkeypatch, tmp_path):
+    monkeypatch.delenv('PLAYWRIGHT_BROWSERS_PATH', raising=False)
+    monkeypatch.setattr(sys, 'platform', 'win32')
+    monkeypatch.setenv('LOCALAPPDATA', str(tmp_path))
+    monkeypatch.setitem(sys.modules, 'tts.package_installer',
+                        types.SimpleNamespace(_D_DRIVE_ROOT=str(tmp_path / 'nod')))
+    assert wc._browser_installed() is False
+    (tmp_path / 'ms-playwright' / 'chromium-1200').mkdir(parents=True)
+    assert wc._browser_installed() is True
+
+
+def test_ready_needs_both_the_package_and_the_browser(monkeypatch):
+    for importable, browser, ready in ((False, True, False), (True, False, False),
+                                       (True, True, True)):
+        monkeypatch.setattr(wc, '_crawler_available', None)
+        monkeypatch.setattr(wc, '_crawl4ai_importable', lambda v=importable: v)
+        monkeypatch.setattr(wc, '_browser_installed', lambda v=browser: v)
+        assert wc._check_available() is ready, (importable, browser)

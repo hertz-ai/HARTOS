@@ -33,17 +33,63 @@ _crawler_available = None  # None = not checked yet
 
 
 def _check_available() -> bool:
-    """Check if crawl4ai library is installed (cached)."""
+    """Whether crawl4ai can crawl here (cached): it imports AND a Playwright
+    Chromium is installed.  The package without its browser cannot open a
+    page: live 2026-11-16 the setup's pip step landed crawl4ai but stopped
+    before Chromium, and an import-only check would have called it ready and
+    never offered the setup again."""
     global _crawler_available
     if _crawler_available is not None:
         return _crawler_available
-    try:
-        import crawl4ai  # noqa: F401
-        _crawler_available = True
-    except ImportError:
+    if not _crawl4ai_importable():
         logger.info("crawl4ai not installed, using requests+BeautifulSoup fallback")
         _crawler_available = False
+    elif not _browser_installed():
+        logger.info("crawl4ai has no Chromium installed, using requests+BeautifulSoup fallback")
+        _crawler_available = False
+    else:
+        _crawler_available = True
     return _crawler_available
+
+
+def _crawl4ai_importable() -> bool:
+    try:
+        import crawl4ai  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _playwright_browser_folders() -> List[str]:
+    """Where Playwright keeps its browsers: PLAYWRIGHT_BROWSERS_PATH when it
+    names a folder, the setup's D: folder, and the platform default."""
+    folders = []
+    named = os.environ.get('PLAYWRIGHT_BROWSERS_PATH')
+    if named and named != '0':
+        folders.append(named)
+    try:
+        from tts.package_installer import _D_DRIVE_ROOT  # type: ignore
+        folders.append(os.path.join(_D_DRIVE_ROOT, 'ms-playwright'))
+    except ImportError:
+        pass
+    if sys.platform == 'win32':
+        folders.append(os.path.join(os.environ.get('LOCALAPPDATA', ''), 'ms-playwright'))
+    elif sys.platform == 'darwin':
+        folders.append(os.path.expanduser('~/Library/Caches/ms-playwright'))
+    else:
+        folders.append(os.path.join(os.environ.get('XDG_CACHE_HOME')
+                                    or os.path.expanduser('~/.cache'), 'ms-playwright'))
+    return folders
+
+
+def _browser_installed() -> bool:
+    for folder in _playwright_browser_folders():
+        try:
+            if any(e.startswith('chromium') for e in os.listdir(folder)):
+                return True
+        except OSError:
+            continue
+    return False
 
 
 # ── Setting crawl4ai up when a crawl needs it ──────────────────────────────
@@ -159,8 +205,15 @@ def _install_crawl4ai() -> None:
     global _crawler_available, _setup_failed
     try:
         site, browsers = _setup_target()
-        logger.info(f"crawl4ai setup: installing into {site or 'the user site'}")
-        ok = _pip_install_crawl4ai(site) and _install_chromium(browsers)
+        if _crawl4ai_importable():
+            # Installed already (an earlier setup's pip step): only the
+            # browser is missing, and a second copy on another drive would
+            # be shadowed by the first anyway.
+            logger.info("crawl4ai setup: package present, installing Chromium only")
+            ok = _install_chromium(browsers)
+        else:
+            logger.info(f"crawl4ai setup: installing into {site or 'the user site'}")
+            ok = _pip_install_crawl4ai(site) and _install_chromium(browsers)
     except Exception as e:
         logger.warning(f"crawl4ai setup failed: {type(e).__name__}: {e}")
         ok = False
