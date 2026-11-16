@@ -685,6 +685,14 @@ def discover_and_attach(need, helper, executor, registry, attached_names,
         hay = ' '.join([tool_name, ' '.join(tool.tags or []),
                         getattr(tool, 'description', '') or '']).lower()
         for ep_name, ep in tool.endpoints.items():
+            # An endpoint marked 'tag_only' is offered by its capability tag
+            # (attach_for_tags, filter_service_tools) and by its name
+            # (attach_for_names) only, never by this keyword match: the
+            # backend repair tools install and wipe, and one request_tools
+            # ('text to speech') attached them on a media turn (review of
+            # ea8e9b3a4).  No other entry carries the mark.
+            if ep.get('tag_only'):
+                continue
             fn = (tool_name if ep_name == tool_name
                   else f"{tool_name}_{ep_name}")
             hay_ep = hay + ' ' + str(ep.get('description', '')).lower()

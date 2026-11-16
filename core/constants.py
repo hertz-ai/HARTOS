@@ -1496,6 +1496,14 @@ def action_is_autonomous(value) -> bool:
     return str(value or '').strip().lower() == 'yes'
 
 
+#: The one value the trace bank stamps on a banked action the person answered
+#: at creation (#160).  Reads as a pause to both rules above (a leading 'no').
+#: A constant, never the verifier's or the person's words: a recipe bundle
+#: leaves the node (CREATE's push_recipe, peer_reuse's export) and the owner's
+#: rule of 2026-10-17 is that CREATE shares templates, never a person's data.
+USER_ANSWERS_THIS_STEP = 'no - the person answers this step'
+
+
 # ── Where a chat reply came from: the THREE values a client badge reads ──
 # Owner, 2026-10-04: 'local' is a reply this node's own LLM wrote, 'hive' is a
 # reply that was escalated to a hive peer, 'cloud' is a reply from a cloud
@@ -1586,6 +1594,14 @@ BOOKKEEPING_TOOLS: frozenset = frozenset({
     'save_to_long_term_memory', 'search_long_term_memory',
     'get_user_id', 'get_prompt_id', 'get_chat_history', 'request_tools',
 })
+
+# The saves among them: calls whose result the person never reads (the agent's
+# own notes).  A READ (get_data_by_key, get_chat_history,
+# search_long_term_memory) is not one: its result is what a step answers from.
+# Read by the REUSE turn-reply picker
+# (hartos.reuse_recipe._reuse_turn_written_reply).
+BOOKKEEPING_SAVE_TOOLS: frozenset = frozenset(
+    t for t in BOOKKEEPING_TOOLS if t.startswith('save_'))
 
 # The agents the Assistant hands work to.  A message that tags one of them is
 # addressed to that agent, never to the person: routing, not an answer.

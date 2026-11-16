@@ -39,6 +39,9 @@ IN_PROGRESS = _State('in_progress')
 PENDING = _State('pending')
 
 
+_HOOKS_PATH = os.path.join(ROOT, 'hartos/lifecycle_hooks.py')
+
+
 def _functions(names):
     tree = ast.parse(open(_SRC_PATH, encoding='utf-8').read())
     wanted = {'_needs_input_reply', '_ask_for_help', '_hold_for_the_person'}
@@ -46,6 +49,15 @@ def _functions(names):
              if isinstance(n, ast.FunctionDef) and n.name in wanted]
     assert {n.name for n in nodes} == wanted, 'helpers missing from create_recipe'
     ns = dict(names)
+    # The hand-off _ask_for_help shares with REUSE (Part B), lifted from
+    # lifecycle_hooks as it ships, so the record it writes is the real one.
+    # Before Part B _ask_for_help escalated inline and there is none to lift.
+    hooks = ast.parse(open(_HOOKS_PATH, encoding='utf-8').read())
+    hand_off = [n for n in hooks.body if isinstance(n, ast.FunctionDef)
+                and n.name == 'hand_goal_to_its_person']
+    ns.setdefault('logger', logging.getLogger('test_ask_for_help'))
+    if hand_off:
+        exec(compile(ast.Module(body=hand_off, type_ignores=[]), _HOOKS_PATH, 'exec'), ns)
     exec(compile(ast.Module(body=nodes, type_ignores=[]), _SRC_PATH, 'exec'), ns)
     return ns
 
@@ -87,6 +99,11 @@ def _names(state=IN_PROGRESS, task=None, tasks=None):
         'get_current_flow': lambda up: 0,
         'current_app': types.SimpleNamespace(
             logger=logging.getLogger('test_ask_for_help')),
+        # The step's window (Part B): no session group chat here, so no
+        # question unless a test gives one.
+        'get_registered_groupchat': lambda up: None,
+        'window_question': lambda messages, action_id, answers=(): None,
+        'recorded_answers': lambda up, aid, flow=None: [],
     }
 
 
@@ -219,6 +236,30 @@ def test_an_autonomous_run_parks_the_goal_and_holds_the_action():
     assert task.blocked_reason == 'input_required'
     assert states == [(2, 'pending', 'asked for help: it looped')]
     assert reply.startswith('Paused for help: step 2'), reply
+
+
+def test_a_step_whose_window_asked_hands_the_question_to_the_goals_person():
+    """Part B: on an autonomous run whose step put a question out, the
+    hand-off carries it as ``ask``, so escalate_goal sends it to the goal's
+    person instead of the expert model first.  The same record shape REUSE
+    writes (lifecycle_hooks.hand_goal_to_its_person, lifted as it ships)."""
+    task = types.SimpleNamespace(blocked_reason=None)
+    task.set_blocked_reason = lambda r: setattr(task, 'blocked_reason', r)
+    states, names = _names(task=task)
+    window = [{'role': 'tool'}]
+    names['get_registered_groupchat'] = lambda up: types.SimpleNamespace(messages=window)
+    names['window_question'] = (
+        lambda messages, action_id, answers=(): (0, 'Which topic should I cover?')
+        if messages is not window or action_id != 2 else (0, 'Which topic next?'))
+    ns = _functions(names)
+    asks = []
+    with mock.patch.dict(sys.modules, _modules(
+            autonomous=True,
+            escalate=lambda db, g, e: asks.append(e) or {'success': True})):
+        ns['_ask_for_help']('7_1', 1, 2, 'Ask the learner the topic', 'it asked')
+    assert [e.get('ask') for e in asks] == ['Which topic next?']
+    assert {k for k in asks[0]} == {'action_id', 'action', 'reason', 'tried',
+                                    'user_prompt', 'prompt_id', 'flow', 'ask'}
 
 
 def test_a_node_with_an_expert_hands_the_step_to_it():

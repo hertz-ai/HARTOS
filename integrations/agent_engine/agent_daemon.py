@@ -2468,6 +2468,17 @@ class AgentDaemon:
                 _cfg_pre['spark_at_dispatch'] = _spark_on_work
                 goal.config_json = _cfg_pre
 
+                # Committed before the turn runs.  This tick's session has
+                # written by now (these stamps; the settle of the goal before
+                # this one flushes), and on SQLite a flushed write holds the
+                # one write lock until its transaction ends.  The turn runs in
+                # this thread for minutes and writes through sessions of its
+                # own (the person ask, the audit log); with the lock still
+                # held each of those waited busy_timeout and failed.  Measured
+                # on the owner's desktop 2026-11-07 09:31-09:56 IST: 17 asks
+                # of goal e0f826dc 'NOT filed', 'database is locked'.
+                db.commit()
+
                 # Speculative dispatch if enabled and budget allows.
                 #
                 # NO `continue` HERE ANY MORE — that word was defect (b),

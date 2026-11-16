@@ -564,6 +564,25 @@ class TestROSBridgeAdapter:
         assert '640x480' in received[0].text
         assert received[0].raw['encoding'] == 'rgb8'
 
+    def test_handle_image_reaches_the_real_frame_store(self, monkeypatch):
+        """The stand-in above takes any keyword, so it passed while the bridge
+        called put_frame(frame_data=...) and the real store raised TypeError
+        (logged at debug level): no ROS frame ever reached the store."""
+        import core.ai_sensing as ai_sensing
+        from integrations.vision.frame_store import FrameStore
+        monkeypatch.setattr(ai_sensing, 'allowed', lambda sensor: True)
+        adapter = ROSBridgeAdapter()
+        store = FrameStore()
+        adapter._frame_store = store
+        img = MagicMock()
+        img.data = b'\xff\xd8\xff\xe0' + b'\x00\xff' * 100 + b'\xff\xd9'
+        img.width, img.height, img.encoding, img.step = 640, 480, 'rgb8', 1920
+
+        adapter._handle_image_message('/camera/image_raw', img)
+
+        assert store.latest('ros:/camera/image_raw', 'camera') == (
+            bytes(img.data), 'ros:/camera/image_raw')
+
     def test_handle_image_no_framestore(self):
         adapter = ROSBridgeAdapter()
         received = []

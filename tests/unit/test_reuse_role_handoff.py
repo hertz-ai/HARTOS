@@ -19,9 +19,12 @@ def replay(monkeypatch, tmp_path):
     from integrations.agent_engine import budget_gate
     InMemoryBackend = pytest.importorskip('agent_ledger.backends').InMemoryBackend
 
-    # create_ledger_from_actions scans ./agent_data for a resumable session;
-    # a stale one from an earlier run in the real tree must not be adopted.
+    # create_ledger_from_actions scans the node's agent-data folder for a
+    # resumable session; a stale one from an earlier run in the real tree
+    # must not be adopted.
     monkeypatch.chdir(tmp_path)
+    import core.cache_loaders as _cl
+    monkeypatch.setattr(_cl, 'AGENT_DATA_DIR', str(tmp_path / 'agent_data'))
     created_keys = []
 
     for name in ('user_agents', 'role_agents', 'user_journey', 'user_tasks',

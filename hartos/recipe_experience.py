@@ -141,7 +141,7 @@ class RecipeExperienceRecorder:
                 return
 
         try:
-            with open(recipe_path, 'r') as f:
+            with open(recipe_path, 'r', encoding='utf-8') as f:
                 recipe = json.load(f)
         except Exception as e:
             logger.error(f"Failed to read recipe for experience merge: {e}")
