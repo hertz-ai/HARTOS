@@ -1235,12 +1235,21 @@ class SpeculativeDispatcher:
             "X' → answer directly with the code/text.  'run this code', "
             "'execute X', 'what does this output', 'set up an agent that X' "
             "→ delegate.  Writing vs running.\n"
+            # Live 2026-11-16 on the desktop 4B: asked to write a 140-word
+            # email, the draft sent a description of it ("Here is a draft
+            # email to ... The message highlights ..."); the reply field
+            # below was capped at 1-3 sentences and the 4B kept the cap.
+            "- When you answer a writing task directly (an email, a "
+            "message, code, a translation, a summary), your reply IS that "
+            "text, written out in full: never a description of it.\n"
             "- Refusals are not your call.  If you ever feel the urge to "
             "refuse: pick a standby instead and delegate.\n\n"
             + history_block
             + f"User: {user_prompt}\n\n"
             "Respond with ONE JSON object on a single line and NOTHING else:\n"
-            '{"reply": "<your short reply to the user, 1-3 sentences>", '
+            '{"reply": "<your reply to the user: 1-3 sentences for chat, '
+            'a standby or a quick answer; for a writing task you answer '
+            'directly, the whole text written out>", '
             '"delegate": "none" OR "local" OR "hive", '
             '"confidence": <float 0-1>, '
             '"is_correction": true OR false, '
