@@ -435,7 +435,14 @@ from core.cache_loaders import load_agent_data, load_user_ledger, load_recipe, l
 
 config = _get_config()
 STUDENT_API = config.get('STUDENT_API', '')
-ACTION_API = config.get('ACTION_API', '')
+# A configured value first; else the one resolver (core.config_cache), which on
+# a desktop is this node's own /create_action.  The raw read was '' on every
+# desktop, so the 2 s camera poll and every flow's visual task never ran while
+# the desktop's own caption server was writing 'Video Reasoning' rows (live
+# 2026-11-16: 500 rows, 'Skipping 2s visual-poll job' 7 times in one day).
+# Off the desktop nothing changes: a node without the key keeps ''.
+from core.config_cache import get_action_api as _get_action_api, is_bundled as _is_bundled
+ACTION_API = config.get('ACTION_API') or (_get_action_api() if _is_bundled() else '')
 
 def parse_date(date_str):
     return datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%S")
@@ -7941,14 +7948,19 @@ def create_schedule(prompt_id, user_id):
         config = json.load(f)
         config = _normalize_flow_recipe(config)  # tolerate per-action recipe in flow slot
         recipes[user_prompt] = config
+    # One job per person, agent and task: the id names them, and a new session
+    # REPLACES its earlier job.  The ids were job_<second>, so every session
+    # start added another job nothing removed, and two jobs added in the same
+    # second collided (ConflictingIdError) and the except below skipped the rest.
     try:
         if 'scheduled_tasks' in config and len(config['scheduled_tasks']) > 0:
             _ctx_safe_log('info', 'Creating scheduled tasks')
-            for i in config['scheduled_tasks']:
+            for _n, i in enumerate(config['scheduled_tasks']):
                 if role and i['persona'].lower() == role.lower():
                     trigger = CronTrigger.from_crontab(i['cron_expression'])
-                    job_id = f"job_{int(time.time())}"
+                    job_id = f"sched_{user_prompt}_{_n}"
                     scheduler.add_job(execute_python_file, trigger=trigger, id=job_id,
+                                      replace_existing=True,
                                       args=[i['job_description'], user_id, prompt_id, i['action_entry_point']])
                     _ctx_safe_log('info', f'Successfully created scheduler job {i["persona"]}')
 
@@ -7959,18 +7971,20 @@ def create_schedule(prompt_id, user_id):
         if ACTION_API:
             _ctx_safe_log('info', 'Creating Visual scheduled tasks')
             trigger = IntervalTrigger(seconds=int(2))
-            job_id = f"job_{int(time.time())}"
+            job_id = f"visual_poll_{user_prompt}"
             scheduler.add_job(call_visual_task, trigger=trigger, id=job_id,
+                              replace_existing=True,
                               args=['get past 1 mins visual information', user_id, prompt_id])
             _ctx_safe_log('info', 'Successfully created scheduler job')
         else:
             _ctx_safe_log('info', 'Skipping 2s visual-poll job — ACTION_API not configured')
         if 'visual_scheduled_tasks' in config and len(config['visual_scheduled_tasks']) > 0:
-            for i in config['visual_scheduled_tasks']:
+            for _n, i in enumerate(config['visual_scheduled_tasks']):
                 if role and i['persona'].lower() == role.lower():
                     trigger = CronTrigger.from_crontab(i['cron_expression'])
-                    job_id = f"job_{int(time.time())}"
+                    job_id = f"visual_task_{user_prompt}_{_n}"
                     scheduler.add_job(call_visual_task, trigger=trigger, id=job_id,
+                                      replace_existing=True,
                                       args=[i['job_description'], user_id, prompt_id])
                     _ctx_safe_log('info', f'Successfully created scheduler job {i["persona"]}')
     except Exception as e:
