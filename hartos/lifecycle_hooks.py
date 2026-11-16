@@ -471,6 +471,19 @@ def _get_ledger_task_status():
     return LedgerTaskStatus
 
 
+def _blocked_on_own_substeps(ledger, task, LedgerTaskStatus) -> bool:
+    """Whether ``task`` is BLOCKED only on sub-steps of its own that are not
+    done yet: the block ledger.add_subtasks leaves on a parent (no blocked
+    reason of its own) while at least one child still has work to do."""
+    if task.status != LedgerTaskStatus.BLOCKED or getattr(task, 'blocked_reason', None):
+        return False
+    done = (LedgerTaskStatus.COMPLETED, LedgerTaskStatus.SKIPPED,
+            LedgerTaskStatus.NOT_APPLICABLE)
+    return any(getattr(child, 'parent_task_id', None) == task.task_id
+               and child.status not in done
+               for child in ledger.tasks.values())
+
+
 def block_for_user_input(user_prompt: str, action_id: int,
                          reason: str = "Waiting for user input") -> bool:
     """Block a task in the ledger when the agent needs user consent/input.
@@ -485,10 +498,22 @@ def block_for_user_input(user_prompt: str, action_id: int,
     LedgerTaskStatus = _get_ledger_task_status()
     task_id = f"action_{action_id}"
     task = ledger.tasks.get(task_id)
-    if not task or task.status != LedgerTaskStatus.IN_PROGRESS:
+    if not task:
+        return False
+    # A step split into sub-steps (ledger.add_subtasks) is BLOCKED on its own
+    # pending sub-steps, with no reason of its own.  When its question to the
+    # person is out, that is still the step waiting for the person: it takes
+    # the input block in place (no transition, sub-steps kept), so the next
+    # person turn resumes it through the one held-step gate and records the
+    # answer.  Live 2026-11-16 (speech agent, build 75): refused here, the
+    # REUSE sub-step hold steered on and one turn asked the name 8 times
+    # (review of 8ddff06f7, rv_hartos_2575_8ddf).  Any other block keeps the
+    # refusal it always had.
+    on_own_substeps = _blocked_on_own_substeps(ledger, task, LedgerTaskStatus)
+    if task.status != LedgerTaskStatus.IN_PROGRESS and not on_own_substeps:
         return False
     before = copy.deepcopy(task.__dict__)
-    if not task.block(reason):
+    if not on_own_substeps and not task.block(reason):
         return False
     task.set_blocked_reason('input_required')
     if ledger.save() is False:

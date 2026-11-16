@@ -6595,8 +6595,12 @@ def _advance_or_steer(user_prompt, action_id, reason, prompt_id,
         # records the ask and takes the canonical wait (on a background turn,
         # the hand-off to the goal's person); the sub-steps stay pending for
         # the turn that carries the reply.
-        if _reuse_note_ask_and_wait(user_prompt, action_id,
-                                    getattr(manager, 'groupchat', None)):
+        # The turn that brings the person's reply to that question works
+        # the sub-steps the reply was waited for; it does not wait again.
+        _gc = getattr(manager, 'groupchat', None)
+        if (not _reuse_reply_evidence(user_prompt, action_id,
+                                      list(getattr(_gc, 'messages', None) or []))
+                and _reuse_note_ask_and_wait(user_prompt, action_id, _gc)):
             current_app.logger.info(
                 f"[SUBTASK-HOLD] action {action_id} keeps {len(_outstanding)} unrun "
                 f"subtask(s) for the person's reply; ending the turn for "
@@ -7355,6 +7359,25 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                                 f"{user_prompt}: {_bd_add_e}")
                     _pending = get_pending_subtasks(
                         user_prompt, _reuse_current_action, user_ledgers)
+                    # A step whose flow action waits for the person (its
+                    # question is out, no reply yet) waits here too: steering
+                    # its first sub-step made the model ask again before
+                    # anyone could answer (rv_hartos_2575_8ddf's probe; live
+                    # 2026-11-16, the name asked 8 times in one turn).  Only a
+                    # step that waits holds (_reuse_note_ask_and_wait: flag
+                    # 'no', a question recorded); one that does not wait keeps
+                    # steering and re-prompting as its action says.
+                    if (_pending
+                            and not _reuse_reply_evidence(
+                                user_prompt, _reuse_current_action,
+                                list(group_chat.messages or []))
+                            and _reuse_note_ask_and_wait(
+                                user_prompt, _reuse_current_action, group_chat)):
+                        current_app.logger.info(
+                            f"[BREAKDOWN] action {_reuse_current_action} keeps "
+                            f"{len(_pending)} subtask(s) for the person's reply; "
+                            f"ending the turn for session: {user_prompt}")
+                        break
                     if _pending:
                         _next_sub = _pending[0]
                         # Mark it STARTED before handing it over.  The ledger
