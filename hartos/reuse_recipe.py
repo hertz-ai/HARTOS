@@ -1204,6 +1204,21 @@ def execute_python_file(task_description: str, user_id: int, prompt_id: int, act
 _VISUAL_POLL_PAUSE_S = 300
 _visual_poll_paused_until: dict = {}
 
+# One visual turn at a time per person and agent: (str(user_id),
+# str(prompt_id)) -> time.monotonic() when visual_based_execution began it,
+# removed when it ends.  The turn runs inside the /visual_agent request, so a
+# poll whose POST stopped waiting (it waited 15 s) used to post again on the
+# next 2 s tick while the first turn still ran (review of 25758b0f7).  Older
+# than the turn budget, a mark is ignored, so a turn that never ended does
+# not stop the poll for good.
+_VISUAL_TURN_MAX_S = 300
+_visual_turn_running: dict = {}
+
+
+def _visual_turn_is_running(user_id, prompt_id) -> bool:
+    started = _visual_turn_running.get((str(user_id), str(prompt_id)))
+    return started is not None and time.monotonic() - started < _VISUAL_TURN_MAX_S
+
 
 def call_visual_task(task_description: str, user_id: int, prompt_id: int):
     # NOTE on logging: this function runs inside the APScheduler
@@ -1224,6 +1239,10 @@ def call_visual_task(task_description: str, user_id: int, prompt_id: int):
     # box-busy → governor-throttle which starves the flywheel.  The visual
     # task cannot work without the action API, so skip cheaply.
     if not ACTION_API:
+        return None
+    # A visual turn for this person and agent is still running: nothing to
+    # post, and nothing to log every 2 s.
+    if _visual_turn_is_running(user_id, prompt_id):
         return None
 
     headers = {'Content-Type': 'application/json'}
@@ -1260,14 +1279,14 @@ def call_visual_task(task_description: str, user_id: int, prompt_id: int):
                         if created_date.tzinfo is not None:
                             created_date = created_date.astimezone(pytz.utc).replace(tzinfo=None)
 
-                        # Check if within last 5 minutes
+                        # Check if within last 5 minutes.  No line per
+                        # caption: a desktop keeps hundreds of them and this
+                        # runs every 2 s (review of 25758b0f7: 500 old rows
+                        # gave 502 INFO lines a poll); the dispatch line
+                        # below says how many were recent.
                         time_diff = now_utc - created_date
-                        logger.info(
-                            f"Found video Reasoning entry: {obj['action']} (created {time_diff} ago)")
                         if time_diff <= timedelta(minutes=5):
                             recent_video_reasoning_entries.append(obj)
-                            logger.info(
-                                f"Found recent Video Reasoning entry: {obj['action']} (created {time_diff} ago)")
                     except (ValueError, KeyError) as e:
                         logger.warning(f"Error parsing date for entry {obj.get('action_id')}: {e}")
                         continue
@@ -1284,16 +1303,25 @@ def call_visual_task(task_description: str, user_id: int, prompt_id: int):
                     'request_from': 'Reuse'
                 })
 
+                # The visual turn runs inside this request and marks itself
+                # running (_visual_turn_running), so a POST that stops waiting
+                # before the turn ends no longer leads the next tick to start a
+                # second one; that read timeout is a turn still running, not a
+                # failure (review of 25758b0f7).
+                import requests as _requests
                 try:
-                    # Send the POST request to the visual agent
                     res = pooled_post(url, data=data_to_send, headers=headers)
                     logger.info(f"Visual agent response: {res.status_code}")
+                    return 'done'
+                except _requests.exceptions.ReadTimeout:
+                    logger.info("Visual task started; it runs on in the server")
                     return 'done'
                 except Exception as e:
                     logger.error(f"Failed to call visual agent: {e}")
                     return 'error'
             else:
-                logger.info(
+                # Every 2 s on every desktop with the camera off: not INFO.
+                logger.debug(
                     "No recent Video Reasoning entries found (within last 5 minutes) - skipping visual task")
                 return None
 
@@ -1382,6 +1410,17 @@ def get_action_user_details(user_id):
 
 
 def visual_based_execution(task_description: str, user_id: int, prompt_id: int):
+    """One visual turn for a person and agent, marked running while it runs
+    so the 2 s camera poll (call_visual_task) starts no second one."""
+    key = (str(user_id), str(prompt_id))
+    _visual_turn_running[key] = time.monotonic()
+    try:
+        return _run_visual_turn(task_description, user_id, prompt_id)
+    finally:
+        _visual_turn_running.pop(key, None)
+
+
+def _run_visual_turn(task_description: str, user_id: int, prompt_id: int):
     current_app.logger.info(f'INSIDE Visual_BASED_EXECUTION')
     user_prompt = f'{user_id}_{prompt_id}'
 

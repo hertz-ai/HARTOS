@@ -132,3 +132,130 @@ def test_another_person_or_agent_gets_its_own_jobs(rr):
     rr.create_schedule(1794540972213, 'u-other')
     rr.create_schedule(1794818852965, 'u-child')
     assert len([j for j in rr._sched.jobs if j.startswith('visual_poll_')]) == 3
+
+
+# -- the poll once it runs on every desktop (review of 25758b0f7) ------------
+#
+# rv_hartos_2575_8ddf measured on the commit: 500 stored captions older than
+# five minutes gave 502 INFO lines per 2 s poll, and the /visual_agent POST
+# gave up after its 15 s read while the turn ran on, so the next tick posted a
+# second visual turn.
+
+UID, PID = 'u-child', 1794540972213
+
+
+class _Resp:
+    def __init__(self, rows):
+        self.status_code, self._rows = 200, rows
+
+    def json(self):
+        return self._rows
+
+
+def _rows(n, minutes_ago):
+    from datetime import datetime, timedelta
+    stamp = (datetime.utcnow() - timedelta(minutes=minutes_ago)).strftime('%Y-%m-%dT%H:%M:%S')
+    return [{'zeroshot_label': 'Video Reasoning', 'action': f'a child plays {i}',
+             'action_id': i, 'created_date': stamp} for i in range(n)]
+
+
+@pytest.fixture
+def poll(monkeypatch):
+    from hartos import reuse_recipe as rr
+    got = {'gets': 0, 'posts': []}
+    state = {'rows': []}
+
+    def _get(method, url, **_k):
+        got['gets'] += 1
+        return _Resp(state['rows'])
+
+    def _post_once(url, **k):
+        got['posts'].append(k.get('timeout'))
+        if state.get('post_raises'):
+            raise state['post_raises']
+        return _Resp([])
+
+    monkeypatch.setattr(rr, 'ACTION_API', 'http://localhost:5000/create_action')
+    monkeypatch.setattr(rr, 'pooled_request', _get)
+    monkeypatch.setattr(rr, 'pooled_post', _post_once)
+    monkeypatch.setattr(rr, '_visual_poll_paused_until', {})
+    monkeypatch.setattr(rr, '_visual_turn_running', {})
+    return rr, got, state
+
+
+def _info_lines(caplog):
+    import logging
+    return [r for r in caplog.records
+            if r.levelno >= logging.INFO and r.name == 'hartos.reuse_recipe']
+
+
+def test_old_captions_log_nothing_per_caption_and_post_nothing(poll, caplog):
+    import logging
+    rr, got, state = poll
+    state['rows'] = _rows(500, minutes_ago=30)
+    with caplog.at_level(logging.DEBUG, logger='hartos.reuse_recipe'):
+        assert rr.call_visual_task('engage', UID, PID) is None
+    assert got['posts'] == []
+    assert _info_lines(caplog) == [], [r.getMessage() for r in _info_lines(caplog)]
+
+
+def test_recent_captions_start_one_visual_turn_with_one_line(poll, caplog):
+    import logging
+    rr, got, state = poll
+    state['rows'] = _rows(120, minutes_ago=1)
+    with caplog.at_level(logging.INFO, logger='hartos.reuse_recipe'):
+        assert rr.call_visual_task('engage', UID, PID) == 'done'
+    assert len(got['posts']) == 1
+    assert len(_info_lines(caplog)) <= 2      # the dispatch line and the response
+
+
+def test_a_running_visual_turn_keeps_the_poll_from_starting_another(poll):
+    import time
+    rr, got, state = poll
+    state['rows'] = _rows(3, minutes_ago=1)
+    rr._visual_turn_running[(UID, str(PID))] = time.monotonic()
+    for _tick in range(5):
+        assert rr.call_visual_task('engage', UID, PID) is None
+    assert got['posts'] == [] and got['gets'] == 0
+    rr._visual_turn_running.clear()
+    assert rr.call_visual_task('engage', UID, PID) == 'done'
+    assert len(got['posts']) == 1
+
+
+def test_a_mark_older_than_the_turn_budget_no_longer_holds_the_poll(poll):
+    import time
+    rr, got, state = poll
+    state['rows'] = _rows(3, minutes_ago=1)
+    rr._visual_turn_running[(UID, str(PID))] = time.monotonic() - rr._VISUAL_TURN_MAX_S - 1
+    assert rr.call_visual_task('engage', UID, PID) == 'done'
+
+
+def test_a_post_that_stops_waiting_is_a_started_turn_not_an_error(poll, caplog):
+    import logging
+    import requests
+    rr, got, state = poll
+    state['rows'] = _rows(3, minutes_ago=1)
+    state['post_raises'] = requests.exceptions.ReadTimeout('read timed out')
+    with caplog.at_level(logging.INFO, logger='hartos.reuse_recipe'):
+        assert rr.call_visual_task('engage', UID, PID) == 'done'
+    assert len(got['posts']) == 1
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+def test_the_visual_turn_marks_itself_running_and_always_clears(monkeypatch):
+    from hartos import reuse_recipe as rr
+    monkeypatch.setattr(rr, '_visual_turn_running', {})
+    seen = []
+
+    def _turn(task, uid, pid):
+        seen.append(dict(rr._visual_turn_running))
+        if task == 'boom':
+            raise RuntimeError('turn failed')
+        return 'done'
+
+    monkeypatch.setattr(rr, '_run_visual_turn', _turn)
+    assert rr.visual_based_execution('engage', UID, PID) == 'done'
+    assert (UID, str(PID)) in seen[0] and rr._visual_turn_running == {}
+    with pytest.raises(RuntimeError):
+        rr.visual_based_execution('boom', UID, PID)
+    assert rr._visual_turn_running == {}
