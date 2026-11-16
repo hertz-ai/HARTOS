@@ -126,7 +126,8 @@ def test_a_429_with_calls_left_or_a_past_reset_does_not_count(fresh_breaker,
         breaker_mod.CircuitState.CLOSED
 
 
-@pytest.mark.parametrize('reset_in_s', [180.0, 3600.0, 21599.0])   # beyond QUOTA_WINDOW_MIN_S (120)
+@pytest.mark.parametrize('reset_in_s', [hook.QUOTA_WINDOW_MIN_S + 60.0,
+                                        3600.0, 21599.0])   # beyond the window
 def test_a_quota_spent_until_a_near_reset_counts_too(fresh_breaker, reset_in_s):
     """Review of 5c6b899a5: a quota counted only when its reset was more than
     600 s away let the breaker reopen in the last minutes before every reset,
@@ -139,7 +140,8 @@ def test_a_quota_spent_until_a_near_reset_counts_too(fresh_breaker, reset_in_s):
         breaker_mod.CircuitState.OPEN
 
 
-@pytest.mark.parametrize('reset_in_s', [45.0, 119.0])   # within QUOTA_WINDOW_MIN_S (120)
+@pytest.mark.parametrize('reset_in_s', [hook.QUOTA_WINDOW_MIN_S - 75.0,
+                                        hook.QUOTA_WINDOW_MIN_S - 1.0])   # within the window
 def test_a_per_minute_window_stays_an_ordinary_rate_limit(fresh_breaker, reset_in_s):
     """Review of 0516f3981, A-2: counted, a spent window 45 s from its reset
     held every goal on the host for 585 s, the breaker's whole cooldown,

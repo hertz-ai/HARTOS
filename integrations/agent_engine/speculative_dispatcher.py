@@ -305,7 +305,9 @@ class SpeculativeDispatcher:
 
     def should_speculate(self, user_id: str, prompt_id: str,
                          prompt: str, goal: dict = None) -> bool:
-        """Gate: expert model available + budget remaining + not halted + not casual."""
+        """Gate: expert model available + budget remaining + not halted + not casual,
+        and, for a goal (the daemon's speculative branch, the only caller
+        that passes one), a fast model whose provider is taking calls."""
         # GUARDRAIL: circuit breaker
         from security.hive_guardrails import HiveCircuitBreaker
         if HiveCircuitBreaker.is_halted():
@@ -323,6 +325,32 @@ class SpeculativeDispatcher:
         fast, expert = self._registry.speculation_pair()
         if not fast or not expert:
             return False
+
+        # A goal's fast turn never starts on a provider that is refusing
+        # calls (its breaker OPEN: the account refused, or a quota spent until
+        # its reset).  The daemon then dispatches the goal the ordinary way,
+        # where dispatch.goal_turn_model decides once for both styles: the
+        # configured expert where it is offered, else a wait with no strike
+        # (owner 2026-11-16).  Review of 8da02382, R1, measured with the real
+        # tick: this branch read no breaker, so with the free model's quota
+        # spent a goal's fast turn ran into it every tick, 52 turns and 52
+        # experts in 30 minutes.  A person's turn passes no goal and is not
+        # gated here.  HALF_OPEN lets one turn through (state() is
+        # non-consuming; the wire feed resolves the probe).
+        if goal is not None:
+            from .dispatch import local_dispatch_provider_breaker_open
+            try:
+                fast_config = fast.to_config_list()
+            except Exception:
+                fast_config = None   # unreadable: a check never blocks a turn
+            refusing = (local_dispatch_provider_breaker_open(fast_config)
+                        if fast_config else '')
+            if refusing:
+                logger.info("Goal %s not speculated: the fast model %s's "
+                            "provider %s is refusing calls; dispatched the "
+                            "ordinary way", goal.get('id'), fast.model_id,
+                            refusing)
+                return False
 
         # Budget check (if goal has spark budget)
         if goal and goal.get('spark_budget', 0) > 0:
@@ -419,7 +447,9 @@ class SpeculativeDispatcher:
         # conversation: measured on central 2026-11-12, two goals' fast turns
         # ran 153.7 s and 223.6 s, the client stopped waiting at 30 s, and
         # the Claude expert scheduled next was refused for "another turn of
-        # this group" (#172).  A person's turn keeps its short wait.
+        # this group" (#172).  A person's turn keeps its short wait.  A goal
+        # reaches here only past should_speculate, which steps aside while
+        # the fast model's provider is refusing calls (review of 8da02382, R1).
         if goal_id:
             from security.node_watchdog import LLM_CALL_TIMEOUT_SECONDS
             turn_wait_s = LLM_CALL_TIMEOUT_SECONDS
