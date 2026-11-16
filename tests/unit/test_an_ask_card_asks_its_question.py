@@ -85,6 +85,15 @@ ASKS_SOMETHING = [
      'fields': [{'name': 'n', 'label': '名前', 'type': 'text'}]},
     {'type': 'form', 'description': 'ما اسم طفلك؟',
      'fields': [{'name': 'n', 'label': 'الاسم', 'type': 'text'}]},
+    # Greek (U+037E, review of eb6e8053c: refused on the commit), Armenian
+    # (U+055E, over the stressed vowel) and Ethiopic (U+1367).  Written as
+    # code points: the Greek mark looks like, and normalises to, a semicolon.
+    {'type': 'form', 'description': 'Πώς λέγεται το παιδί σας' + chr(0x037E),
+     'fields': [{'name': 'n', 'label': 'Όνομα', 'type': 'text'}]},
+    {'type': 'form', 'description': 'Ինչպե' + chr(0x055E) + 'ս է ձեր երեխայի անունը',
+     'fields': [{'name': 'n', 'label': 'Անուն', 'type': 'text'}]},
+    {'type': 'form', 'description': 'የልጅዎ ስም ማን ነው' + chr(0x1367),
+     'fields': [{'name': 'n', 'label': 'ስም', 'type': 'text'}]},
 ]
 
 
@@ -107,6 +116,29 @@ def test_a_card_that_asks_nothing_never_reaches_the_person(legs, component):
     assert legs['cards'] == []
     _settle()
     assert legs['pushes'] == []
+
+
+def test_a_refused_card_leaves_none_of_its_words_in_the_log(legs, caplog):
+    """The card's reason can carry a child's name; the refusal is logged by
+    code, user and agent only (review of eb6e8053c: the first 120
+    characters of the reason went to the INFO log)."""
+    import logging
+    card = {'type': 'form', 'description': "Record Arjun's first sounds today",
+            'fields': [{'name': 's', 'label': 'Sounds', 'type': 'text'}]}
+    with caplog.at_level(logging.DEBUG):
+        reply = _send(card)
+    assert reply['refused'] == 'no_question', reply
+    logged = [r.getMessage() for r in caplog.records]
+    assert any('no_question' in m for m in logged), logged
+    assert not [m for m in logged if 'Arjun' in m or 'first sounds' in m], logged
+
+
+def test_a_semicolon_is_not_a_question_mark(legs):
+    """The Greek question mark normalises to ';', but a ';' in English is
+    not a question."""
+    reply = _send({'type': 'form', 'description': 'Capture the metrics; then report',
+                   'fields': [{'name': 'm', 'label': 'Metrics', 'type': 'text'}]})
+    assert reply['refused'] == 'no_question', reply
 
 
 def test_the_note_says_what_the_card_said_and_what_to_do_instead(legs):

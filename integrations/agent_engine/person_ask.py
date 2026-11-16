@@ -318,8 +318,12 @@ def _unfilled_blank(body, component) -> Optional[str]:
 #: what it asks for ("Send the clips for your reel." is a fair ask).
 _QUESTION_TYPES = ('form', 'approval')
 #: A question mark in the scripts the cards are written in: ASCII, the
-#: full-width one (Chinese, Japanese) and the Arabic one.
-_QUESTION_MARKS = ('?', '？', '؟')
+#: full-width one (Chinese, Japanese), the Arabic one, and the Greek (U+037E),
+#: Armenian (U+055E) and Ethiopic (U+1367) ones (review of eb6e8053c: a Greek
+#: question was refused).  Not ';': U+037E normalises to it, but in English
+#: a semicolon asks nothing.  The three are written as code points so no
+#: editor or normaliser turns the Greek one into that semicolon.
+_QUESTION_MARKS = ('?', '？', '؟', chr(0x037E), chr(0x055E), chr(0x1367))
 
 
 def _asks_its_question(component, title, body) -> bool:
@@ -396,8 +400,10 @@ def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
     # the post destination, are not held to it).
     if question_required and not _asks_its_question(
             component, title or component.get('title'), body):
-        logger.info("person ask refused (no_question) for user %s by agent %s: %r",
-                    user_id, agent_id, body[:120])
+        # No card text in the log: the reason can carry a child's name
+        # (review of eb6e8053c).  The agent gets the text back in its note.
+        logger.info("person ask refused (no_question) for user %s by agent %s",
+                    user_id, agent_id)
         return _refused('no_question')
     title = (title or component.get('title') or '').strip()
     if not title:
