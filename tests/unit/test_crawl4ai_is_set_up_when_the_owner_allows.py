@@ -172,7 +172,8 @@ def host(monkeypatch, tmp_path):
 
 
 def _free(monkeypatch, free_bytes):
-    monkeypatch.setattr(wc.shutil, 'disk_usage',
+    import shutil
+    monkeypatch.setattr(shutil, 'disk_usage',
                         lambda path: _Usage(500 * GIB, 0, free_bytes))
 
 
@@ -192,15 +193,17 @@ def test_with_c_low_crawl4ai_and_its_browser_go_to_the_private_d_site(host, monk
     assert wc._crawler_available is None
 
 
-def test_with_room_on_c_the_usual_places_are_used(host, monkeypatch):
+def test_with_room_on_c_the_install_still_goes_to_d(host, monkeypatch):
+    """Owner, 2026-11-16: "Always D: when possible".  The 06:28 install went
+    to C: because C: showed 5.0 GB free, just over the old 5 GiB line."""
     pi, runs, d_root = host
     _free(monkeypatch, 40 * GIB)
     wc._install_crawl4ai()
     pip = [r for r in runs if r[0] == 'pip']
     chromium = [r for r in runs if r[0] == 'chromium']
-    assert pip and '--target' not in pip[0][1]
-    assert chromium and chromium[0][2] is None
-    assert not (d_root / 'site-packages').exists()
+    assert pip and pip[0][1][pip[0][1].index('--target') + 1] == str(
+        d_root / 'site-packages')
+    assert chromium and chromium[0][2] == str(d_root / 'ms-playwright')
 
 
 def test_a_d_site_that_cannot_be_made_private_is_not_used(host, monkeypatch):

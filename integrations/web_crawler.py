@@ -17,7 +17,6 @@ import asyncio
 import importlib
 import logging
 import os
-import shutil
 import sys
 import threading
 import time
@@ -108,9 +107,6 @@ _SETUP_REASON = (
     "JavaScript, needs crawl4ai and a headless Chromium browser, and they are "
     "not installed on this computer. Set them up? They download and install "
     "here (a few hundred MB); until then pages are read without JavaScript.")
-#: Under this much free space on the user site's drive, the install goes to
-#: the private D: site instead (the threshold the owner is asked about).
-_LOW_DISK_BYTES = 5 * 1024 ** 3
 _setup_lock = threading.Lock()
 _setup_thread: Optional[threading.Thread] = None
 _setup_failed = False
@@ -143,23 +139,21 @@ def _offer_setup(log: '_ProgressLog') -> None:
 
 def _setup_target():
     """(site, browsers) for the install: the private D: site and a browsers
-    folder beside it when the user site's drive has under 5 GiB free and D:
-    can be made private (tts.package_installer, the CUDA-torch fallback's
-    folder); otherwise (None, None), pip's own target and Playwright's
-    default folder."""
+    folder beside it whenever D: can be made private (tts.package_installer,
+    the CUDA-torch fallback's folder); otherwise (None, None), pip's own
+    target and Playwright's default folder.
+
+    Owner, 2026-11-16: "Always D: when possible".  The first rule (D: only
+    under 5 GiB free on C:) sent the 06:28 install to C:, which showed
+    5.0 GB free at that moment and 4.1 GB after."""
     if sys.platform != 'win32':
         return None, None
     try:
         from tts.package_installer import (  # type: ignore
-            _D_DRIVE_ROOT, _make_private_d_drive_site, get_user_site_packages)
+            _D_DRIVE_ROOT, _make_private_d_drive_site)
     except ImportError:
         return None, None
-    drive = os.path.splitdrive(os.path.abspath(get_user_site_packages()))[0]
-    try:
-        free = shutil.disk_usage((drive or '') + os.sep).free
-    except OSError:
-        return None, None
-    if free >= _LOW_DISK_BYTES or not _make_private_d_drive_site():
+    if not _make_private_d_drive_site():
         return None, None
     return (os.path.join(_D_DRIVE_ROOT, 'site-packages'),
             os.path.join(_D_DRIVE_ROOT, 'ms-playwright'))
