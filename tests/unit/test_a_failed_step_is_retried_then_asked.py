@@ -166,3 +166,136 @@ def test_a_step_that_succeeds_on_retry_is_banked_and_the_flow_goes_on(create_env
     assert _action_file(env, _FAILED) is not None, (
         'the step that succeeded on its retry was not banked')
     assert _action_file(env, 3) is not None, 'the flow did not go on past it'
+
+
+# ── The loop's two give-up guards ask too (forward fix, 2026-11-16) ─────────
+# Live on build 75, 2026-11-15 21:07 IST: the Research Assistant's step 3 sat
+# open for 121 iterations, [STALL-GUARD] broke the loop, and the person was
+# sent the group chat's last message, the StatusVerifier's verdict ("Action
+# completed. The user has explicitly provided the research topic ...").  The
+# stall and cycle guards now ask for help the way the input gate does.
+
+_STUCK = 2
+
+
+def _guard_gives_up_at(real, step):
+    """The real guard, made to give up the first time it looks at ``step``."""
+    def guard(prev_key, prev, action_id, state, *args, **kwargs):
+        key, seen, gives_up = real(prev_key, prev, action_id, state, *args, **kwargs)
+        return key, seen, gives_up or action_id == step
+    return guard
+
+
+def _stuck_step_held_not_done(env):
+    assert _action_file(env, 1) is not None, 'action 1 ran and should be banked'
+    assert _action_file(env, _STUCK) is None, 'a stuck step was banked'
+    done = [s for aid, s, _ in env.events if aid == _STUCK and s in _DONE_STATES]
+    assert not done, f'the stuck step was recorded as done: {done}'
+
+
+@pytest.mark.parametrize('guard', ['stall_guard_step', 'cycle_guard_step'])
+def test_a_guard_that_gives_up_asks_the_person(create_env, monkeypatch, caplog, guard):
+    env = create_env
+    monkeypatch.setattr(env.cr, guard,
+                        _guard_gives_up_at(getattr(env.cr, guard), _STUCK))
+    from hartos.threadlocal import thread_local_data
+    thread_local_data.set_request_id('msg_e2e_person')
+    caplog.set_level(logging.INFO)
+    with env.app.app_context():
+        reply = env.cr.recipe(USER_ID, 'Find what local AI costs, with sources',
+                              PROMPT_ID, None, 'msg_e2e_person')
+    reply = reply if isinstance(reply, str) else json.dumps(reply)
+    assert '"status"' not in reply and '"action_id"' not in reply, (
+        f"the person was handed a verifier verdict: {reply[:300]}")
+    # The question _ask_for_help puts to a person (_needs_input_reply).
+    assert ('need your input' in reply or 'waiting for your reply' in reply), (
+        f'the guard gave up and the person was not asked; reply: {reply[:300]}')
+    assert f'Step {_STUCK} ' in reply, reply[:300]
+    _stuck_step_held_not_done(env)
+
+
+def _guard_gives_up_once_at(real, step, spent):
+    """The real guard, made to give up the first time it looks at ``step``,
+    handing back the count it would hold at that moment (``spent``: the
+    count past the cap)."""
+    fired = []
+
+    def guard(prev_key, prev, action_id, state, *args, **kwargs):
+        key, seen, gives_up = real(prev_key, prev, action_id, state, *args, **kwargs)
+        if action_id == step and not fired:
+            fired.append(state)
+            return (action_id, state), spent(state), True
+        return key, seen, gives_up
+    guard.fired = fired
+    return guard
+
+
+@pytest.mark.parametrize('guard,spent', [
+    ('stall_guard_step', lambda state: 10 ** 6),
+    ('cycle_guard_step', lambda state: {state: 10 ** 6}),
+])
+def test_a_guard_that_asked_counts_again_from_zero(create_env, monkeypatch, guard, spent):
+    """Review of b972e755b: the guards' counts live on user_tasks, which
+    outlives the turn; kept, they asked the person the same question one
+    round after her answer.  The ask clears both."""
+    env = create_env
+    gated = _guard_gives_up_once_at(getattr(env.cr, guard), _STUCK, spent)
+    monkeypatch.setattr(env.cr, guard, gated)
+    from hartos.threadlocal import thread_local_data
+    thread_local_data.set_request_id('msg_e2e_person')
+    with env.app.app_context():
+        env.cr.recipe(USER_ID, 'Find what local AI costs, with sources',
+                      PROMPT_ID, None, 'msg_e2e_person')
+    assert gated.fired, 'the guard never gave up'
+    task = env.cr.user_tasks[UP]
+    assert (getattr(task, '_stall_key', None), getattr(task, '_stall_iters', 0)) == (None, 0)
+    assert (getattr(task, '_cycle_key', None), getattr(task, '_cycle_entries', None)) == (None, None)
+
+
+def test_the_answer_to_a_cycle_guard_ask_gets_a_fresh_round(create_env, monkeypatch, caplog):
+    """Two turns: the cycle guard gives up on step 2 and asks; the person
+    answers; her turn runs step 2 again without the guard asking again at once
+    (review of b972e755b: 10 of 10 answers were met by the same question)."""
+    env = create_env
+    gated = _guard_gives_up_once_at(env.cr.cycle_guard_step, _STUCK,
+                                    lambda state: {state: 10 ** 6})
+    monkeypatch.setattr(env.cr, 'cycle_guard_step', gated)
+    from hartos.threadlocal import thread_local_data
+    caplog.set_level(logging.WARNING)
+    with env.app.app_context():
+        thread_local_data.set_request_id('msg_e2e_person')
+        first = env.cr.recipe(USER_ID, 'Find what local AI costs, with sources',
+                              PROMPT_ID, None, 'msg_e2e_person')
+        assert f'Step {_STUCK} ' in str(first), str(first)[:300]
+        thread_local_data.set_request_id('msg_e2e_answer')
+        env.cr.recipe(USER_ID, 'Use the three sources you found in step 1.',
+                      PROMPT_ID, None, 'msg_e2e_answer')
+    gave_up = [r for r in caplog.records if '[CYCLE-GUARD]' in r.getMessage()]
+    assert len(gave_up) == 1, (
+        f'the cycle guard gave up {len(gave_up)} times; the answer turn should '
+        'start counting from zero')
+
+
+def test_a_stalled_step_on_a_daemon_turn_parks_the_goal(create_env, monkeypatch, caplog):
+    env = create_env
+    monkeypatch.setattr(env.cr, 'stall_guard_step',
+                        _guard_gives_up_at(env.cr.stall_guard_step, _STUCK))
+    asks = []
+    import integrations.agent_engine.goal_manager as gm
+    monkeypatch.setattr(gm.GoalManager, 'escalate_goal', staticmethod(
+        lambda db, goal_id, escalation: asks.append((goal_id, escalation))
+        or {'success': True}))
+    import integrations.social.models as models
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _no_db(commit=False):
+        yield None
+    monkeypatch.setattr(models, 'db_session', _no_db)
+    caplog.set_level(logging.INFO)
+    replies = _run(env, turns=1)
+    for reply in replies:
+        text = reply if isinstance(reply, str) else json.dumps(reply)
+        assert '"status"' not in text and '"action_id"' not in text, text[:300]
+    assert [(goal, e['action_id']) for goal, e in asks] == [('e2e_create', _STUCK)], asks
+    _stuck_step_held_not_done(env)

@@ -135,9 +135,10 @@ def _load():
     """
     from transformers import VitsTokenizer, VitsModel
 
+    # The GPU only when it has room (the registry says mms_tts runs on the CPU).
     try:
-        import torch
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        from integrations.channels.media.tts_router import gpu_preferred_device
+        device = gpu_preferred_device('mms_tts')
     except Exception:
         device = 'cpu'
 

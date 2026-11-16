@@ -4685,6 +4685,37 @@ def _ask_for_help(user_prompt, prompt_id, action_id, action_text, reason):
             f"the co-pilot.")
 
 
+def _ask_when_a_guard_gives_up(user_prompt, prompt_id, action_id, group_chat, reason):
+    """The stall or cycle guard gave up on a step that is not done: ask for
+    help, as the user-input gate does, instead of breaking out of the loop.
+
+    `break` fell to the tail of get_response_group, which hands the person the
+    group chat's last message.  Live on build 75, 2026-11-15 21:07 IST, the
+    Research Assistant (93676680129) stalled on step 3 for 121 iterations and
+    the person was sent the StatusVerifier's verdict: "Action completed. The
+    user has explicitly provided the research topic: 'The integration of
+    artificial intelligence with renewable energy ...'" (a topic nobody gave).
+    ac44d6bfd closed the same leak for a step in ERROR; these two guards were
+    the other exits.  The messages are stored as the break's tail stored them,
+    so the next turn resumes from the same window.
+
+    Both guards' counts start again from zero, as the attempts bound resets
+    _exec_retries before it asks: they live on user_tasks, which outlives the
+    turn, so a kept count gave the person's answer one round and the same
+    question again (review of b972e755b: the cycle guard asked again after 10
+    of 10 answers)."""
+    _ut = user_tasks.get(user_prompt)
+    if _ut is not None:
+        _ut._stall_key, _ut._stall_iters = None, 0
+        _ut._cycle_key, _ut._cycle_entries = None, None
+    messages[user_prompt] = group_chat.messages
+    try:
+        action_text = user_tasks[user_prompt].get_action(action_id - 1)
+    except Exception:
+        action_text = ''
+    return _ask_for_help(user_prompt, prompt_id, action_id, action_text, reason)
+
+
 def _is_serving_escalation_expert(user_prompt, action_id, request_id):
     """Whether this daemon turn is the expert assigned to this exact block.
 
@@ -5541,7 +5572,9 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None,autonomou
                     f"[STALL-GUARD] action {current_action_id} stuck in "
                     f"{current_state.value} for {_sg_iters} iterations with no "
                     f"recipe — breaking clean (was spinning to max_iterations)")
-                break
+                return _ask_when_a_guard_gives_up(
+                    user_prompt, prompt_id, current_action_id, group_chat,
+                    'the step made no progress')
 
             # Second no-progress SIGNAL feeding the SAME break decision above —
             # not a second guard.  stall_guard_step counts consecutive iterations
@@ -5566,7 +5599,9 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None,autonomou
                     f"same states without finishing "
                     f"({dict((s.value, n) for s, n in _cg_entries.items())}) — "
                     f"breaking clean instead of draining max_iterations")
-                break
+                return _ask_when_a_guard_gives_up(
+                    user_prompt, prompt_id, current_action_id, group_chat,
+                    'the step went round without finishing')
 
             # A verdict left over from the previous action is not this one's
             # (#101): after [ADVANCE] the old verdict and TERMINATE stay last,
