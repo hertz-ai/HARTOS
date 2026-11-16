@@ -646,14 +646,12 @@ def configured_expert_offer(asker='an earning turn') -> Optional[list]:
                            "not in the capped family '%s', so no day cap "
                            "would hold its spend", asker, model, CAPPED_FAMILY)
             return None
-        host = _dispatch_provider_host(config)
+        host = local_dispatch_provider_breaker_open(config)
         if host:
-            from core.circuit_breaker import CircuitState, llm_provider_breaker
-            if llm_provider_breaker.state(host) == CircuitState.OPEN:
-                logger.info("%s gets no expert: the expert's provider %s is "
-                            "refusing calls (account refused or quota spent; "
-                            "breaker open)", asker, host)
-                return None
+            logger.info("%s gets no expert: the expert's provider %s is "
+                        "refusing calls (account refused or quota spent; "
+                        "breaker open)", asker, host)
+            return None
         return config
     except Exception as e:
         logger.warning("%s gets no expert: the configured expert could not "
@@ -672,44 +670,81 @@ def expert_goal_type(goal, db=None) -> Optional[str]:
 
 
 def goal_turn_model(goal_type, model_config=None):
-    """``(model_config, refusing_host)`` for a goal turn about to start on
-    this node: the ONE rule for a turn whose provider is refusing calls.
+    """``(model_config, held)`` for a goal turn about to start on this node:
+    the ONE rule for a turn whose model is refusing calls.
 
     ``model_config`` is the model the turn would run on (None: the node's
-    own model).  When that provider's breaker is OPEN (the account refused,
-    or a quota spent until its reset; local_dispatch_provider_breaker_open)
-    the turn does not start on it.  The node's own model then hands an
-    earning goal of the node's own (``goal_type`` from expert_goal_type) to
-    the configured expert where it is offered (revenue_expert_config: the
-    revenue lane, the owner's Claude day cap, the expert's own breaker),
-    and the turn runs there: owner decision 2026-11-16, "Fall back to
-    Haiku".  Otherwise ``refusing_host`` names the refusing host and the
-    turn must wait: a transient hold, never a strike (is_transient_deferral
-    reads the host recorded for it).
+    own model).  The turn does not start on a model that is refusing calls
+    (_model_refusing): its provider's breaker OPEN (the account refused, or
+    a quota spent until its reset), or the configured expert while the
+    owner's Claude day cap withholds it.  The node's own model refusing
+    hands an earning goal of the node's own (``goal_type`` from
+    expert_goal_type) to the configured expert where it is offered
+    (revenue_expert_config: the revenue lane, the day cap, the expert's own
+    breaker), and the turn runs there: owner decision 2026-11-16, "Fall
+    back to Haiku".  Otherwise ``held`` is why the turn waits, a 'deferred:'
+    reason (a transient hold, never a strike: is_transient_deferral reads
+    the prefix); '' when the turn may start.
+
+    It decides at the turn's start only: a turn that started on a model
+    which then begins refusing keeps its model for the rest of the turn
+    (the expert is reached only through with_local_fallback's order).
 
     Consumers, so no path keeps a copy: dispatch_goal's pre-flight; the
     daemon's speculative branch, which steps aside to dispatch_goal while
     its fast model's provider refuses (SpeculativeDispatcher
-    .should_speculate); the hive worker's claimed task
-    (worker_loop._execute_task); and the daemon's grounding wait
-    (goal_turn_held), whose clock does not run while a goal's turn could
-    not start.  The expert's calls still pass the wire's
-    per-call day-cap gate (core.llm_outbound_logger._day_cap_refusal), as
-    every call that holds the configured expert does."""
-    refusing = local_dispatch_provider_breaker_open(model_config)
-    if refusing and model_config is None:
+    .should_speculate); the hive worker, before it claims (goal_turns_held)
+    and for each task it claims (worker_loop._execute_task); and the
+    daemon's grounding wait (goal_turn_held).  The expert's calls still pass
+    the wire's per-call day-cap gate (core.llm_outbound_logger
+    ._day_cap_refusal), as every call that holds the configured expert
+    does."""
+    held = _model_refusing(model_config)
+    if held and model_config is None:
         expert = revenue_expert_config(goal_type)
         if expert is not None:
-            logger.info("The node's own provider %s is refusing calls; the "
-                        "turn runs on the configured expert", refusing)
+            logger.info("The node's own model is refusing calls (%s); the "
+                        "turn runs on the configured expert", held)
             return expert, ''
-    return model_config, refusing
+    return model_config, held
+
+
+def _model_refusing(model_config) -> str:
+    """Why a turn on ``model_config`` (None: the node's own model) cannot
+    start now, as a 'deferred:' reason, or ''.  Its provider refusing calls
+    (local_dispatch_provider_breaker_open), or, for a turn whose model is
+    the configured expert, the owner's day cap withholding it: every call of
+    such a turn is refused at the wire and falls to whatever model is left,
+    so the turn would run as a retry of the node's own model.  Review of
+    242654db3, MF2, measured: an escalated goal on the configured expert ran
+    one such turn every tick past the cap, no strike, no pause."""
+    host = local_dispatch_provider_breaker_open(model_config)
+    if host:
+        return (f'{_DEFERRED_PREFIX} provider {host} is refusing calls '
+                f'(account refused or quota spent; breaker open)')
+    why = _expert_cap_why(model_config=model_config) if model_config else ''
+    if why:
+        return f'{_DEFERRED_PREFIX} the configured expert is withheld: {why}'
+    return ''
+
+
+def goal_turns_held() -> str:
+    """The 'deferred:' reason while NO goal turn could start on this node:
+    the node's own model refusing calls (_model_refusing) and the configured
+    expert offered to no goal (configured_expert_offer); else ''.  The hive
+    worker asks it before it claims, so it claims nothing only when
+    goal_turn_model would hold every task; each task it claims is then
+    decided by goal_turn_model itself, for that task's goal."""
+    held = _model_refusing(None)
+    if held and configured_expert_offer('the hive worker') is None:
+        return held
+    return ''
 
 
 def goal_turn_held(goal, db=None) -> str:
-    """The refusing host while ``goal``'s turn could not start on this node
-    (goal_turn_model for the node's own model: its provider refusing calls
-    and no expert offered for the goal), else ''.  For a caller with no turn
+    """The 'deferred:' reason while ``goal``'s turn could not start on this
+    node (goal_turn_model for the node's own model: it is refusing calls and
+    no expert is offered for the goal), else ''.  For a caller with no turn
     to start: the daemon's grounding wait, which does not count that time
     (agent_daemon._settle_dispatched_goal).  Read at each check, so a wait
     that began mid-interval delays a real stall's pause by at most one
@@ -993,21 +1028,13 @@ def is_transient_deferral(goal_id=None) -> bool:
         # expert override, so the own provider is the one it waited on.
         # Without this the turn in flight when the ledger crossed the cap took
         # a strike although nothing could have run it (owner 2026-11-16: past
-        # the cap, goals wait with no strike).
-        try:
-            from core.circuit_breaker import (llm_provider_breaker,
-                                              provider_host, CircuitState)
-            _h = _dispatched_host(goal_id) if goal_id is not None else None
-            if _h and _expert_withheld_by_day_cap(_h):
-                _h = None
-            if not _h:
-                from integrations.agent_engine.model_registry import _own_llm_target
-                _h = provider_host(str((_own_llm_target() or ('', ''))[0] or ''))
-            if _h and llm_provider_breaker.state(_h) == CircuitState.OPEN:
-                return True
-        except Exception:
-            logger.debug('provider-breaker check failed in '
-                         'is_transient_deferral', exc_info=True)
+        # the cap, goals wait with no strike).  A turn the rule held before it
+        # started carries a 'deferred:' reason and was answered above.
+        _h = _dispatched_host(goal_id) if goal_id is not None else None
+        if _h and _expert_cap_why(host=_h):
+            _h = None
+        if _provider_refusing(_h or _dispatch_provider_host(None)):
+            return True
         # A goal whose in-flight LLM call was just PREEMPTED for a live user turn
         # (foreground abort / llama_scheduler eviction) is a transient defer too —
         # re-queue it next tick, never count it toward auto-pause.  The user may
@@ -1019,24 +1046,33 @@ def is_transient_deferral(goal_id=None) -> bool:
         return False
 
 
-def _expert_withheld_by_day_cap(host) -> bool:
-    """Is ``host`` the configured expert's provider while the owner's Claude
-    day cap withholds that expert (budget_gate.expert_budget_allows, the gate
-    the wire asks before every call that holds it)?  False when it cannot be
-    read: the turn is then judged by the host it recorded, as before."""
+def _expert_cap_why(model_config=None, host=None) -> str:
+    """Why the owner's Claude day cap withholds the configured expert
+    (budget_gate.expert_budget_allows, the gate the wire asks before every
+    call that holds it), when the turn's model is that expert: its entry
+    is ``model_config``'s (the same llm_target rule as the wire's
+    _holds_the_expert), or, for a turn already judged, its provider is the
+    recorded ``host``.  Else ''.  The ledger is read only for the expert.
+    '' when it cannot be read: the turn goes, or is judged, as before, and
+    the wire still refuses every call past the cap."""
     try:
-        from core.autogen_config import resolve_expert_backend
+        from core.autogen_config import llm_target, resolve_expert_backend
         from core.circuit_breaker import provider_host
         expert = resolve_expert_backend()
-        if not expert or provider_host(str(expert.get('base_url') or '')) != host:
-            return False
+        if not expert:
+            return ''
+        if model_config:
+            if llm_target(model_config[0]) != llm_target(expert):
+                return ''
+        elif not host or provider_host(str(expert.get('base_url') or '')) != host:
+            return ''
         from integrations.agent_engine.budget_gate import expert_budget_allows
-        allowed, _why = expert_budget_allows(expert.get('model'))
-        return not allowed
+        allowed, why = expert_budget_allows(expert.get('model'))
+        return '' if allowed else (why or 'day budget spent')
     except Exception:
-        logger.debug('day-cap check failed in is_transient_deferral',
+        logger.debug('day-cap check failed for the configured expert',
                      exc_info=True)
-        return False
+        return ''
 
 
 # Why dispatch_goal last returned None for a goal whose turn ran and failed
@@ -1339,15 +1375,38 @@ def local_dispatch_provider_breaker_open(model_config=None) -> str:
     stays the sole resolver of the half-open probe.  A check error is '' --
     a breaker-check error must never block a dispatch.
     """
+    host = _dispatch_provider_host(model_config)
+    return host if _provider_refusing(host) else ''
+
+
+def _provider_refusing(host) -> bool:
+    """Is the provider breaker of ``host`` OPEN?  The one read of it for a
+    dispatch (local_dispatch_provider_breaker_open) and for judging a turn
+    (is_transient_deferral).  state() is non-consuming: the httpx feed
+    stays the sole resolver of the half-open probe, and HALF_OPEN reads as
+    not refusing, so one turn goes through.  A check error is False: a
+    breaker-check error must never block a dispatch."""
+    if not host:
+        return False
     try:
         from core.circuit_breaker import llm_provider_breaker, CircuitState
-        host = _dispatch_provider_host(model_config)
-        if host and llm_provider_breaker.state(host) == CircuitState.OPEN:
-            return host
+        return llm_provider_breaker.state(host) == CircuitState.OPEN
     except Exception:
         logger.debug('provider-breaker check failed; not blocking the '
                      'dispatch', exc_info=True)
-    return ''
+        return False
+
+
+def provider_retry_after_s() -> float:
+    """How long a task no model can take waits before it is offered again:
+    the provider breaker's cooldown, the soonest a refusing provider is
+    tried again (HALF_OPEN).  The hive worker defers such a task this long
+    so it leaves the head of the queue (worker_loop._tick)."""
+    try:
+        from core.circuit_breaker import llm_provider_breaker
+        return float(getattr(llm_provider_breaker, '_cooldown'))
+    except Exception:
+        return 600.0          # core.circuit_breaker's own cooldown for it
 
 
 # Concurrency ceiling for autonomous dispatch — single source both daemons call
@@ -2008,16 +2067,14 @@ def _dispatch_goal_turn(prompt: str, user_id: str, goal_id: str,
     # goals hold for the top-up or the reset instead of accruing auto-pause
     # strikes; on central 2026-09-14 every hosted call 402'd and the daemon
     # re-tried every tick.  local_chat_dispatch checks the same breaker again
-    # for every caller, the worker included.
-    model_config, _prov_refusing = goal_turn_model(_expert_goal_type,
-                                                   model_config)
+    # for every caller, the worker included.  The expert was offered or not
+    # just above, so no goal type is passed: revenue_expert_config is read
+    # once per turn (review of 242654db3, N1: twice doubled its WARNING).
+    model_config, _held = goal_turn_model(None, model_config)
     _record_dispatch_host(goal_id, _dispatch_provider_host(model_config))
-    if _prov_refusing:
-        _reason = (f'provider {_prov_refusing} is refusing calls (account '
-                   f'refused or quota spent; breaker open)')
-        _record_turn_failure(goal_id, _reason)
-        logger.warning(f"Goal {goal_id}: {_reason}; not dispatching this "
-                       f"tick")
+    if _held:
+        _record_turn_failure(goal_id, _held)
+        logger.warning(f"Goal {goal_id}: {_held}; not dispatching this tick")
         return None
 
     # NUMERIC prompt_id (same format as hart_intelligence_entry._next_prompt_id)

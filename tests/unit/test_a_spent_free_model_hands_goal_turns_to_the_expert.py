@@ -327,6 +327,44 @@ def test_a_persons_turn_is_not_gated_by_the_breaker(expert, spent_free):
     assert len(d._expert_pool.jobs) == 1
 
 
+# ── an escalated goal whose expert is refused ───────────────────────────────
+
+@pytest.mark.parametrize('why', ['cap_spent_free_refusing',
+                                 'cap_spent_free_answering',
+                                 'experts_breaker_open'])
+def test_an_escalated_goal_on_a_refused_expert_starts_no_turn(expert, breaker,
+                                                             why):
+    """A goal whose stuck action was handed to the configured expert (#106d:
+    config 'escalation', expert 'configured-expert').  When that expert is
+    refused, by the owner's day cap or by its own provider's breaker, no
+    turn starts: the goal waits, a transient hold, no strike.  Review of
+    242654db3, MF2 (its probe P13): past the cap with the free model
+    refusing, the goal ran a doomed turn every tick (each expert call
+    refused at the wire and fell to the spent free model), no strike, no
+    pause.  FAILS BEFORE THE FIX for the cap: 10 turns in 10 ticks (free
+    refusing), or turns and strikes until a pause (free answering)."""
+    from integrations.agent_engine.model_registry import CONFIGURED_EXPERT_ID
+    from tests.unit.test_revenue_goal_turn_runs_on_the_expert import EXPERT_HOST
+    usd = CAP + 0.01 if why.startswith('cap_spent') else 0.0
+    if why != 'cap_spent_free_answering':
+        for _ in range(3):
+            breaker.record_failure(EXPERT_HOST if why == 'experts_breaker_open'
+                                   else FREE_HOST)
+    goal = Goal(gid=GOAL_ID)
+    goal.config_json = dict(goal.config_json, escalation={
+        'next': 'expert', 'expert': CONFIGURED_EXPERT_ID, 'at': 't-1',
+        'action_id': 3, 'action': 'Post the offer', 'user_prompt': 'grow',
+        'prompt_id': '1234', 'flow': 0})
+    d, fast, seen = _speculator(), _FastChat(QUOTA_SPENT), []
+    for _ in range(10):
+        _tick(goal, d, fast, _own_chat(seen, QUOTA_SPENT), {'usd': usd})
+    assert (len(seen), len(fast.turns)) == (0, 0), 'a turn started on a refused expert'
+    assert _strikes() == 0
+    assert goal.status == 'active', goal.config_json.get('pause_reason')
+    assert goal.config_json['escalation']['next'] == 'expert', \
+        'the action stays with the expert for when it is offered again'
+
+
 # ── a turn in flight when the ledger crosses the cap ────────────────────────
 
 @pytest.mark.parametrize('crossed', [True, False],
