@@ -185,6 +185,64 @@ def test_a_registry_miss_never_takes_another_persons_session(folders):
         "a miss handed this person another person's session")
 
 
+def _session(minted_ms, actions=ACTIONS, flow_id=0, in_progress=True):
+    """A session of this person minted at ``minted_ms`` (the id
+    create_ledger_from_actions mints), of ``flow_id`` and that build."""
+    ledger = create_ledger_from_actions(
+        agent_id=str(PROMPT), session_id=f"{CHILD}_{PROMPT}_{minted_ms}",
+        actions=actions, flow_id=flow_id)
+    if in_progress:
+        ledger.update_task_status("action_1", TaskStatus.IN_PROGRESS)
+    else:
+        _finish(ledger)
+    return ledger
+
+
+def test_a_miss_reopens_an_older_session_of_the_newest_ones_flow_and_build(folders):
+    """Review of 17b251c11, S3g: the newest session is done and an older one
+    of the same flow and build is in progress; the turn resumes the older
+    one, so the miss reopens it (24 of 97 live multi-session groups)."""
+    from hartos.lifecycle_hooks import _load_ledger_on_miss
+    older = _session(1794000000000)
+    _session(1794000000500, in_progress=False)
+    reopened = _load_ledger_on_miss(f"{CHILD}_{PROMPT}")
+    assert reopened is not None and reopened.session_id == older.session_id, (
+        f"the turn resumes {older.session_id}, the miss opened "
+        f"{getattr(reopened, 'session_id', None)}")
+
+
+def test_a_miss_with_two_flows_in_progress_opens_neither(folders):
+    """Review of 17b251c11, S3d: a flow-0 session and a newer flow-1 one are
+    both in progress.  A flow-0 turn resumes the first, a flow-1 turn the
+    second; the miss knows neither flow, so it opens neither."""
+    from hartos.lifecycle_hooks import _load_ledger_on_miss
+    _session(1794000000000, flow_id=0)
+    _session(1794000000500, flow_id=1)
+    reopened = _load_ledger_on_miss(f"{CHILD}_{PROMPT}")
+    assert reopened is None, (
+        f"the miss opened {reopened.session_id}, which a turn on the other flow "
+        f"would not resume")
+
+
+def test_a_miss_after_a_build_revert_with_both_in_progress_opens_neither(folders):
+    """Review of 17b251c11, S3c: an older build's session and the newer
+    build's are both in progress, and the agent may have been reverted to
+    the older build.  The miss cannot tell, so it opens neither."""
+    from hartos.lifecycle_hooks import _load_ledger_on_miss
+    _session(1794000000000, actions=OLD_BUILD)
+    _session(1794000000500, actions=ACTIONS)
+    assert _load_ledger_on_miss(f"{CHILD}_{PROMPT}") is None
+
+
+def test_a_miss_never_opens_the_one_in_progress_of_another_flow_than_the_newest(folders):
+    """The one session in progress is older and of another flow than the
+    newest (done) one: not the newest's flow, so not reopened."""
+    from hartos.lifecycle_hooks import _load_ledger_on_miss
+    _session(1794000000000, flow_id=1)
+    _session(1794000000500, flow_id=0, in_progress=False)
+    assert _load_ledger_on_miss(f"{CHILD}_{PROMPT}") is None
+
+
 def test_a_miss_reads_only_the_persons_own_steps(folders, monkeypatch):
     """Review of b48cd6693, must-fix 2: a miss parsed every ledger in the
     folder (3,074 on the owner's desktop; 19 s cold, 1.8 s warm on 3,000)

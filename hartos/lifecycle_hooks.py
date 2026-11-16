@@ -40,15 +40,19 @@ _recent_misses_lock = threading.Lock()
 
 def _load_ledger_on_miss(user_prompt: str) -> Optional[Any]:
     """Cache-miss loader: reopen the person's session from disk when it is
-    their newest session of this agent and is still in progress; else None.
+    the one session of this agent they have in progress, and it is their
+    newest session or holds the newest session's flow and build; else None
+    (_find_resumable_session(newest_only=True)).
 
     A miss knows only '<user>_<prompt>', not the flow or the build that
-    create_ledger_from_actions scopes its resume by.  A build or flow change
-    mints a new session there, so the newest session is the current one and
-    an older one still in progress is another build's or flow's: reopening
-    it would write this turn's states into its steps (review of b48cd6693,
-    must-fix 1: an older build's session reopened while the current build's
-    was done).  Only this person's files of this agent are read, not the
+    create_ledger_from_actions scopes its resume by, so where the session a
+    turn would resume cannot be told from the files (two in progress, or
+    the one in progress of another flow or build than the newest) it opens
+    nothing: reopening the wrong one writes this turn's states into its
+    steps (review of b48cd6693, must-fix 1; review of 17b251c11: a flow
+    change, a build revert), and nothing open costs only until the turn
+    registers its own.  An older session of the newest one's flow and build
+    is the one the turn resumes, and is reopened.  Only this person's files of this agent are read, not the
     whole folder, and a miss with nothing in progress is remembered for
     _MISS_MEMORY_SECONDS (must-fix 2: a miss parsed all 3,074 ledgers inside
     the registry's lock, every time).  The read stays under the registry's
