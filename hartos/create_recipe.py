@@ -4697,7 +4697,17 @@ def _ask_when_a_guard_gives_up(user_prompt, prompt_id, action_id, group_chat, re
     artificial intelligence with renewable energy ...'" (a topic nobody gave).
     ac44d6bfd closed the same leak for a step in ERROR; these two guards were
     the other exits.  The messages are stored as the break's tail stored them,
-    so the next turn resumes from the same window."""
+    so the next turn resumes from the same window.
+
+    Both guards' counts start again from zero, as the attempts bound resets
+    _exec_retries before it asks: they live on user_tasks, which outlives the
+    turn, so a kept count gave the person's answer one round and the same
+    question again (review of b972e755b: the cycle guard asked again after 10
+    of 10 answers)."""
+    _ut = user_tasks.get(user_prompt)
+    if _ut is not None:
+        _ut._stall_key, _ut._stall_iters = None, 0
+        _ut._cycle_key, _ut._cycle_entries = None, None
     messages[user_prompt] = group_chat.messages
     try:
         action_text = user_tasks[user_prompt].get_action(action_id - 1)

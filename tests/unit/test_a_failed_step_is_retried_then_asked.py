@@ -214,6 +214,68 @@ def test_a_guard_that_gives_up_asks_the_person(create_env, monkeypatch, caplog, 
     _stuck_step_held_not_done(env)
 
 
+def _guard_gives_up_once_at(real, step, spent):
+    """The real guard, made to give up the first time it looks at ``step``,
+    handing back the count it would hold at that moment (``spent``: the
+    count past the cap)."""
+    fired = []
+
+    def guard(prev_key, prev, action_id, state, *args, **kwargs):
+        key, seen, gives_up = real(prev_key, prev, action_id, state, *args, **kwargs)
+        if action_id == step and not fired:
+            fired.append(state)
+            return (action_id, state), spent(state), True
+        return key, seen, gives_up
+    guard.fired = fired
+    return guard
+
+
+@pytest.mark.parametrize('guard,spent', [
+    ('stall_guard_step', lambda state: 10 ** 6),
+    ('cycle_guard_step', lambda state: {state: 10 ** 6}),
+])
+def test_a_guard_that_asked_counts_again_from_zero(create_env, monkeypatch, guard, spent):
+    """Review of b972e755b: the guards' counts live on user_tasks, which
+    outlives the turn; kept, they asked the person the same question one
+    round after her answer.  The ask clears both."""
+    env = create_env
+    gated = _guard_gives_up_once_at(getattr(env.cr, guard), _STUCK, spent)
+    monkeypatch.setattr(env.cr, guard, gated)
+    from hartos.threadlocal import thread_local_data
+    thread_local_data.set_request_id('msg_e2e_person')
+    with env.app.app_context():
+        env.cr.recipe(USER_ID, 'Find what local AI costs, with sources',
+                      PROMPT_ID, None, 'msg_e2e_person')
+    assert gated.fired, 'the guard never gave up'
+    task = env.cr.user_tasks[UP]
+    assert (getattr(task, '_stall_key', None), getattr(task, '_stall_iters', 0)) == (None, 0)
+    assert (getattr(task, '_cycle_key', None), getattr(task, '_cycle_entries', None)) == (None, None)
+
+
+def test_the_answer_to_a_cycle_guard_ask_gets_a_fresh_round(create_env, monkeypatch, caplog):
+    """Two turns: the cycle guard gives up on step 2 and asks; the person
+    answers; her turn runs step 2 again without the guard asking again at once
+    (review of b972e755b: 10 of 10 answers were met by the same question)."""
+    env = create_env
+    gated = _guard_gives_up_once_at(env.cr.cycle_guard_step, _STUCK,
+                                    lambda state: {state: 10 ** 6})
+    monkeypatch.setattr(env.cr, 'cycle_guard_step', gated)
+    from hartos.threadlocal import thread_local_data
+    caplog.set_level(logging.WARNING)
+    with env.app.app_context():
+        thread_local_data.set_request_id('msg_e2e_person')
+        first = env.cr.recipe(USER_ID, 'Find what local AI costs, with sources',
+                              PROMPT_ID, None, 'msg_e2e_person')
+        assert f'Step {_STUCK} ' in str(first), str(first)[:300]
+        thread_local_data.set_request_id('msg_e2e_answer')
+        env.cr.recipe(USER_ID, 'Use the three sources you found in step 1.',
+                      PROMPT_ID, None, 'msg_e2e_answer')
+    gave_up = [r for r in caplog.records if '[CYCLE-GUARD]' in r.getMessage()]
+    assert len(gave_up) == 1, (
+        f'the cycle guard gave up {len(gave_up)} times; the answer turn should '
+        'start counting from zero')
+
+
 def test_a_stalled_step_on_a_daemon_turn_parks_the_goal(create_env, monkeypatch, caplog):
     env = create_env
     monkeypatch.setattr(env.cr, 'stall_guard_step',
