@@ -313,9 +313,37 @@ def _unfilled_blank(body, component) -> Optional[str]:
     return None
 
 
+#: The card types whose text is the question itself: a form's field is what
+#: the person answers, an approval is a yes or no.  A file ask's purpose says
+#: what it asks for ("Send the clips for your reel." is a fair ask).
+_QUESTION_TYPES = ('form', 'approval')
+#: A question mark in the scripts the cards are written in: ASCII, the
+#: full-width one (Chinese, Japanese) and the Arabic one.
+_QUESTION_MARKS = ('?', '？', '؟')
+
+
+def _asks_its_question(component, title, body) -> bool:
+    """Whether a card an agent wrote says what it asks: for a form or an
+    approval, a question mark in its title, its reason (``body``) or a field's
+    label.  Measured 2026-11-16 on the desktop (build 75, the local 4B): of
+    the 26 cards that reached a person, about half asked nothing; the reason
+    was the agent's own step and the one field a noun ("Capture pre-upgrade
+    benchmark metrics for performance baseline" over a box labelled
+    "Benchmark Capture", "Creating social media post for HART Guardian
+    Angels campaign" over "Social Media Post Content").  Owner, the same day:
+    "most question does not have detail on what the ask is"."""
+    if not isinstance(component, dict) or component.get('type') not in _QUESTION_TYPES:
+        return True
+    fields = component.get('fields')
+    labels = ([f.get('label') for f in fields if isinstance(f, dict)]
+              if isinstance(fields, list) else [])
+    return any(isinstance(t, str) and any(m in t for m in _QUESTION_MARKS)
+               for t in (title, body, *labels))
+
+
 def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
         body: str = '',
-        background: bool = False) -> dict:
+        background: bool = False, question_required: bool = False) -> dict:
     """Put ``component`` in front of ``user_id`` on every surface they have.
 
     ``background``: asked by background work (a daemon goal's turn), so it
@@ -332,7 +360,9 @@ def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
     'too_many_open_asks', 'not_shown' (the
     Liquid UI gates refused the card: switched off, the hive halted, unsafe
     content, an unknown type, too many pushes; the log says which) or
-    'not_filed' (its row could not be written).
+    'not_filed' (its row could not be written), or 'no_question' (asked
+    with ``question_required``: a form or an approval whose title, reason
+    and field labels hold no question, see _asks_its_question).
     """
     user_id = str(user_id or '').strip()
     if not user_id:
@@ -361,6 +391,14 @@ def ask(user_id, agent_id, component, *, prompt_id=None, title: str = '',
         logger.info("person ask refused (unfilled_placeholder %s) for user %s by "
                     "agent %s", blank, user_id, agent_id)
         return _refused('unfilled_placeholder')
+    # An agent's card says what it asks (the ask_person tool asks for it; the
+    # cards the framework writes itself, the join card, the plan approval and
+    # the post destination, are not held to it).
+    if question_required and not _asks_its_question(
+            component, title or component.get('title'), body):
+        logger.info("person ask refused (no_question) for user %s by agent %s: %r",
+                    user_id, agent_id, body[:120])
+        return _refused('no_question')
     title = (title or component.get('title') or '').strip()
     if not title:
         name = _agent_name(agent_id)
@@ -794,7 +832,8 @@ def ask_person_tool(user_id, prompt_id, agent_id=None, request_id=None):
         # rule dispatch uses): its ask is background work's.
         background = not is_user_turn({'request_id': rid})
         asker = agent_id if agent_id is not None else prompt_id
-        out = ask(person, asker, comp, prompt_id=prompt_id, background=background)
+        out = ask(person, asker, comp, prompt_id=prompt_id, background=background,
+                  question_required=True)
         if not out['ok']:
             # The failed shape stays ('refused', status 'refused'); the note
             # says what was wrong and what to do instead (owner 11-09).
@@ -828,12 +867,20 @@ def ask_person_tool(user_id, prompt_id, agent_id=None, request_id=None):
 
 
 #: How an ask is shaped, as the tool's component parameter tells the model: a
-#: reason always, and no agent's purpose held up as the example.
-_ASK_SHAPE = ('Liquid UI component JSON. Always put why you ask in "description", '
-              'in your own words: the person reads it on the card. A question: '
+#: reason always, and no agent's purpose held up as the example.  "type" is
+#: named first: opening on the reason, the 4B started its JSON there and
+#: dropped the type, and the ask was refused not_an_object before it reached
+#: anyone (hartos-94, live 11-10; 157 of 318 asks on 2026-11-16).  Its replay
+#: of the real requests on the 4B (hint_ab, 11-12): asks with a type and a
+#: reason 28 of 53 under the reason-first hint, 39 of 46 with this one.  The
+#: example's question is one whole blank holding its "?", so a word-for-word
+#: copy is still refused (unfilled_placeholder) and a filled one asks.
+_ASK_SHAPE = ('Liquid UI component JSON. Its first key is "type": "form" to ask a '
+              'question, "file_request" to ask for files. Then "description": why you '
+              'ask, in your own words; the person reads it on the card. A question: '
               '{"type": "form", "description": "<why you ask>", "fields": '
-              '[{"name": "answer", "label": "<your question>", "type": "text"}]}. '
-              'Files: type "file_request", with the "description" and the "purpose" '
+              '[{"name": "answer", "label": "<your question?>", "type": "text"}]}. '
+              'Files: "type": "file_request", with the "description" and the "purpose" '
               'that fits, from the tool description.')
 #: The refusal note of an ask with no reason.
 _SAY_WHY = ('Not sent: say why you ask in the component\'s "description", in your '
@@ -882,6 +929,14 @@ def _refusal_note(refused, comp, person, asker, background) -> str:
                else 'what you sent is not JSON' if comp is None
                else 'what you sent is JSON but not an object')
         return f'Not sent: component must be a JSON object with a "type"; {got}. {_ASK_SHAPE}'
+    if refused == 'no_question':
+        said = str(comp.get('description') or '').strip()[:160]
+        return (f'Not sent: the card asks the person nothing; it reads "{said}". '
+                'Write the question itself, as they will read it and ending with "?", '
+                'in a field\'s "label" (an approval: in "description"). If this is your '
+                'own step\'s work (searching, reading, extracting, generating, checking '
+                'a status, judging your own output), do it with your tools instead: '
+                'the person cannot see what your tools found.')
     if refused == 'unfilled_placeholder':
         blank = _unfilled_blank(comp.get('description') if isinstance(comp, dict) else '',
                                 comp) or 'a <...> blank'
