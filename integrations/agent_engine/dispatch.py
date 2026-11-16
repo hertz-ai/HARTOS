@@ -366,9 +366,9 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
     # try/except so a check error never blocks a dispatch.
     _prov_host = local_dispatch_provider_breaker_open(model_config)
     if _prov_host:
-        logger.info(f"Provider {_prov_host} refusing the account (breaker "
-                    f"open), deferring local /chat for "
-                    f"{daemon_id or prompt_id}")
+        logger.info(f"Provider {_prov_host} refusing calls (account refused "
+                    f"or quota spent; breaker open), deferring local /chat "
+                    f"for {daemon_id or prompt_id}")
         return 'deferred', None
 
     # Any error resolving the path still lets the caller fall through to its
@@ -412,9 +412,10 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
     # permanently -- one permit, so the node's background LLM would have been
     # wedged for the life of the process.
     _bound = None
+    _marked = None
     try:
         # Signal to the watchdog that this thread is in a legitimate LLM call.
-        _notify_watchdog_llm_start()
+        _marked = _notify_watchdog_llm_start()
         # A daemon-specific request_id keeps background thinking traces out of
         # user responses via drain_thinking_traces(), and is what
         # dispatch.is_genuine_user_request reads to classify the turn.
@@ -447,7 +448,7 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
                 logger.info(f"unbind_cancel({_bound}) failed: {e}")
         _local_llm_semaphore.release()
         try:
-            _notify_watchdog_llm_end()
+            _notify_watchdog_llm_end(_marked)
         except Exception:
             logger.debug('watchdog LLM-end notify failed', exc_info=True)
 
@@ -901,15 +902,24 @@ def is_transient_deferral(goal_id=None) -> bool:
                 return True
         if is_user_recently_active() or _cb_is_open():
             return True
-        # The node's own LLM provider refusing the account (#106b b) is a
-        # transient wait, not a dispatch failure: the goal should hold for the
-        # top-up, never accrue the 5-strike auto-pause (which would need a
-        # manual resume of every goal after the balance is restored).
+        # The turn's LLM provider refusing calls (#106b b: the account, or a
+        # quota spent until its reset) is a transient wait, not a dispatch
+        # failure: the goal should hold for the top-up, never accrue the
+        # 5-strike auto-pause (which would need a manual resume of every goal
+        # after the balance is restored).  The provider is the one THIS
+        # goal's turn used (_dispatched_host): a turn on the configured
+        # expert that failed is a failure, whatever the node's own provider
+        # says (review of 5c6b899a5: with the free model's quota spent, 20
+        # failing expert turns in 570 s took no strike and no backoff).  The
+        # node's own backend answers when no dispatch from this thread
+        # recorded one.
         try:
             from core.circuit_breaker import (llm_provider_breaker,
                                               provider_host, CircuitState)
-            from integrations.agent_engine.model_registry import _own_llm_target
-            _h = provider_host(str((_own_llm_target() or ('', ''))[0] or ''))
+            _h = _dispatched_host(goal_id) if goal_id is not None else None
+            if not _h:
+                from integrations.agent_engine.model_registry import _own_llm_target
+                _h = provider_host(str((_own_llm_target() or ('', ''))[0] or ''))
             if _h and llm_provider_breaker.state(_h) == CircuitState.OPEN:
                 return True
         except Exception:
@@ -999,6 +1009,7 @@ def _clear_turn_record(goal_id) -> None:
     with _turn_failures_lock:
         _turn_failures.pop(_failure_key(goal_id), None)
         _dispatch_routes.pop(_failure_key(goal_id), None)
+        _dispatch_hosts.pop(_failure_key(goal_id), None)
 
 
 def _record_turn_failure(goal_id, reason) -> None:
@@ -1070,6 +1081,27 @@ def _record_route(goal_id, route, why='') -> None:
                     f"{was or 'not dispatched yet'}")
 
 
+# The LLM provider host the latest dispatch_goal for a goal used (the
+# configured expert's endpoint, or this node's own backend), keyed like
+# _turn_failures by goal AND thread, cleared with them.  is_transient_deferral
+# reads it: a goal waits only for the provider ITS turn used.
+_dispatch_hosts: Dict[tuple, str] = {}
+
+
+def _record_dispatch_host(goal_id, host) -> None:
+    with _turn_failures_lock:
+        _dispatch_hosts[_failure_key(goal_id)] = host
+        while len(_dispatch_hosts) > _TURN_FAILURES_MAX:
+            _dispatch_hosts.pop(next(iter(_dispatch_hosts)))
+
+
+def _dispatched_host(goal_id) -> Optional[str]:
+    """The provider host the latest dispatch_goal for ``goal_id``, from this
+    thread, used; None when it recorded none."""
+    with _turn_failures_lock:
+        return _dispatch_hosts.get(_failure_key(goal_id))
+
+
 def handed_to_hive(goal_id) -> bool:
     """True when the latest dispatch_goal for ``goal_id``, from this thread,
     handed the goal to the hive rather than running its turn here."""
@@ -1096,7 +1128,12 @@ def speculative_turn_result(goal_id, spec) -> Optional[str]:
     empty reply is a failed turn too: the fast /chat call itself failed (a
     401, a timeout).  _dispatch_to_model swallows that cause, so the reason
     names the model, which is what an operator has to look at; 'error' is
-    set only when dispatch_speculative refused or raised.  The turn ran on
+    set when dispatch_speculative refused or raised, and when the turn was
+    still running at the end of its whole-turn wait (``still_running``).
+    That one is a failed turn too, struck like any other: held without a
+    strike, a goal whose turns never end was dispatched again every tick
+    with nothing to stop it, each time starting another turn on a
+    conversation still busy (review of 313ff63fc, M2).  The turn ran on
     this node, so the route is 'local'.
     """
     _clear_turn_record(goal_id)
@@ -1357,27 +1394,29 @@ except Exception:
                  'accessor fails open', exc_info=True)
 
 
-def _notify_watchdog_llm_start():
+def _notify_watchdog_llm_start() -> Optional[str]:
     """Tell the watchdog the current thread is blocked on a legitimate LLM call.
 
     The watchdog will extend the heartbeat threshold for threads marked
-    'in_llm_call' instead of restarting them.
+    'in_llm_call' instead of restarting them.  Returns the registered name
+    it marked, or None when it marked none; hand it to
+    _notify_watchdog_llm_end.
     """
     try:
         from security.node_watchdog import get_watchdog
         wd = get_watchdog()
         if not wd:
-            return
+            return None
         thread_name = threading.current_thread().name
         # Match by thread name — works for all daemon threads
         if wd.is_registered(thread_name):
             wd.mark_in_llm_call(thread_name)
-            return
+            return thread_name
         # Partial match (thread name might have suffix like 'agent_daemon-1')
         for name in wd.registered_names():
             if name in thread_name:
                 wd.mark_in_llm_call(name)
-                return
+                return name
         # Fallback: in-process/bundled mode — dispatch runs on a
         # different thread (e.g. Flask worker). Mark the calling daemon
         # via threadlocal source hint if available.
@@ -1386,22 +1425,33 @@ def _notify_watchdog_llm_start():
             source = get_task_source()
             if source and wd.is_registered(source):
                 wd.mark_in_llm_call(source)
-                return
+                return source
         except Exception:
             logger.debug('watchdog task-source lookup failed', exc_info=True)
     except Exception:
         logger.debug('watchdog LLM-start marker failed', exc_info=True)
+    return None
 
 
-def _notify_watchdog_llm_end():
-    """Clear the LLM call marker and send a heartbeat for all registered daemons."""
+def _notify_watchdog_llm_end(name: Optional[str] = None) -> None:
+    """Clear the LLM-call mark ``name`` (what _notify_watchdog_llm_start
+    returned) and heartbeat that thread, and only that one.  None: nothing
+    was marked, nothing to do.
+
+    It used to clear every registered thread's mark and heartbeat them all,
+    so any turn's end hid a thread that had frozen meanwhile.  Replayed over
+    central's turn ends on 2026-11-12 (review of 313ff63fc, M1), a frozen
+    thread with a 600 s threshold was restarted after 11,676 s instead of
+    606 s, and with the real watchdog one turn's end restarted a coding
+    daemon mid-call by clearing its mark."""
+    if not name:
+        return
     try:
         from security.node_watchdog import get_watchdog
         wd = get_watchdog()
         if wd:
-            for name in wd.registered_names():
-                wd.clear_llm_call(name)
-                wd.heartbeat(name)
+            wd.clear_llm_call(name)
+            wd.heartbeat(name)
     except Exception:
         logger.debug('watchdog LLM-end marker clear failed', exc_info=True)
 
@@ -1887,13 +1937,14 @@ def _dispatch_goal_turn(prompt: str, user_id: str, goal_id: str,
     # of accruing auto-pause strikes; on central 2026-09-14 every hosted call
     # 402'd and the daemon re-tried every tick.
     _prov_host = _dispatch_provider_host(model_config)
+    _record_dispatch_host(goal_id, _prov_host)
     if _prov_host:
         try:
             from core.circuit_breaker import (llm_provider_breaker,
                                               CircuitState)
             if llm_provider_breaker.state(_prov_host) == CircuitState.OPEN:
-                _reason = (f'provider {_prov_host} is refusing the account '
-                           f'(breaker open)')
+                _reason = (f'provider {_prov_host} is refusing calls (account '
+                           f'refused or quota spent; breaker open)')
                 _record_turn_failure(goal_id, _reason)
                 logger.warning(f"Goal {goal_id}: {_reason}; not dispatching "
                                f"this tick")

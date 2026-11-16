@@ -352,11 +352,14 @@ def produce_reel(sources: Sequence[Any], *, style: Mapping, workdir: str, out_pa
 # Names the existing way to ask, so an agent that calls reel_make before it
 # has clips is pointed at ask_person's file_request, not told only to "ask her
 # to attach".  The clips her answer sends are bound to this agent, and
-# reel_make without clips= uses her newest unused batch.
+# reel_make without clips= uses her newest unused batch.  It names the
+# description too: ask_person refuses an ask that does not say why.
 NEEDS_CLIPS_MESSAGE = ('There are no clips to make a reel from. Ask her for them with '
                        '%s: a file_request with purpose "%s" (1 to %d videos from her '
-                       'gallery). When she has answered, call reel_make again; it uses the '
-                       'clips she sent.' % (ASK_PERSON_TOOL, REEL_SOURCE, MAX_CLIPS))
+                       'gallery) and a description that says, in your own words, what '
+                       'reel you will make from them. When she has answered, call '
+                       'reel_make again; it uses the clips she sent.'
+                       % (ASK_PERSON_TOOL, REEL_SOURCE, MAX_CLIPS))
 BUSY_MESSAGE = ('This desktop is making another reel right now. Tell her it will be free in a '
                 'few minutes, then try again.')
 RENDER_FAILED_MESSAGE = ('The desktop could not render the reel. Try once more; if it fails '

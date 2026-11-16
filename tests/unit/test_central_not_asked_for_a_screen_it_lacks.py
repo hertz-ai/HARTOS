@@ -253,6 +253,45 @@ def test_visual_agent_on_a_hive_node_with_no_screen_asks_the_owner(
     assert _rows() == 1
 
 
+# ── Request_Camera_Access: the agent asking in so many words ──────────────
+# (review of HARTOS f40e02e1a, F3: _request_consent had no behaviour test.)
+
+def _camera_no_for_agent(monkeypatch, agent):
+    """The owner pressed "Don't allow this agent" on ``agent``'s camera card."""
+    from integrations.social import consent_service, models
+    from integrations.social.consent_service import ConsentService
+    monkeypatch.setattr(consent_service, '_embodied_feed_from_consent',
+                        lambda *a, **k: None)
+    with models.db_session() as db:
+        ConsentService.request_consent(db, OWNER, 'camera_capture', agent_id=agent)
+        ConsentService.decline(db, OWNER, 'camera_capture', agent_id=agent)
+
+
+def test_request_camera_access_after_a_no_says_so(consents, monkeypatch):
+    import hart_intelligence_entry as hie  # noqa: TID251 -- the tool under test lives here
+    from hartos.threadlocal import thread_local_data
+    _camera_no_for_agent(monkeypatch, '54')
+    with thread_local_data.turn_of('54'):
+        reply = hie._request_capability_consent('look at me')
+    assert reply == 'The owner of this computer said no to camera access.'
+
+
+def test_request_camera_access_from_another_agent_still_asks(consents,
+                                                             monkeypatch):
+    """The card's "Don't allow this agent" is per agent: another agent that
+    asks in so many words is asked (the camera tool's own ask stops at the
+    owner's last No; this one does not)."""
+    import hart_intelligence_entry as hie  # noqa: TID251 -- the tool under test lives here
+    from hartos.threadlocal import thread_local_data
+    _camera_no_for_agent(monkeypatch, '54')
+    del consents[:]
+    with thread_local_data.turn_of('55'):
+        reply = hie._request_capability_consent('look at me')
+    assert 'request sent' in reply, reply
+    assert [a['agent_id'] for a in consents] == ['55']
+    assert _rows('camera_capture') == 2
+
+
 # ── the probe: can this process reach a screen ────────────────────────────
 
 @pytest.mark.parametrize('env, expected', [

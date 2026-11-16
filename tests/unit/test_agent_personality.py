@@ -332,10 +332,14 @@ class TestPersonalityIntegration:
     """Test personality injection into agent system messages."""
 
     def test_assistant_gets_personality_in_system_message(self):
-        """Personality prompt contains the persona name and traits."""
+        """Personality prompt contains the name the agent speaks and its traits.
+        'swift.falcon' is the agent's internal id: the prompt says the spoken
+        name instead, never the id (tests/unit/test_the_agent_says_its_own_name.py)."""
+        from core.agent_personality import spoken_name
         p = generate_personality('coder', 'Build a website', 'swift.falcon')
         prompt = build_personality_prompt(p)
-        assert 'swift.falcon' in prompt
+        assert spoken_name(p) in prompt
+        assert 'swift.falcon' not in prompt
         assert 'PROACTIVE BEHAVIORS' in prompt
         assert 'SELF-AWARENESS' in prompt
 

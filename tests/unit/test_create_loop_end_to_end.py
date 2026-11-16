@@ -77,6 +77,12 @@ class _Script:
         self.pending_ids = set()
         # the tool the helper runs for each step
         self.tool = 'google_search'
+        # step -> (tool, arguments) for a step that runs another tool than
+        # ``tool``; send_message_to_user is delivered as the real tool says
+        self.tools = {}
+        # the model's line after a turn's text that is no dispatch (a
+        # daemon tick's "Build the agent now"); None keeps TERMINATE
+        self.after_turn_text = None
 
     # -- helpers ---------------------------------------------------------
     def _msgs(self):
@@ -102,13 +108,18 @@ class _Script:
             return True, f'Working on step {n}. @Helper please save step {n}.'
         if last.get('tool_calls'):
             tc = last['tool_calls'][0]
+            body = (f'Message sent successfully to user with request_id: e2e_{n}'
+                    if tc.get('function', {}).get('name') == 'send_message_to_user'
+                    else f'saved step {n}')
             return True, {
-                'role': 'tool', 'content': f'saved step {n}',
+                'role': 'tool', 'content': body,
                 'tool_responses': [{'tool_call_id': tc.get('id'),
-                                    'role': 'tool',
-                                    'content': f'saved step {n}'}]}
+                                    'role': 'tool', 'content': body}]}
         if last.get('role') == 'tool' or last.get('tool_responses'):
             return True, f'Step {n} done. @StatusVerifier please verify.'
+        if (self.after_turn_text is not None and last.get('role') == 'user'
+                and last.get('name') == 'UserProxy'):
+            return True, self.after_turn_text
         if c.startswith('@Assistant: To Get Action'):
             return True, 'TERMINATE'
         if 'Check if the current_action depends' in c:
@@ -122,10 +133,10 @@ class _Script:
     def helper(self, recipient, messages=None, sender=None, config=None):
         n = self.current()
         if '@Helper' in _content(self._last()):
+            tool, args = self.tools.get(n, (self.tool, {'query': f'e2e.step{n}'}))
             return True, {'content': '', 'tool_calls': [{
                 'id': f'call_step_{n}', 'type': 'function',
-                'function': {'name': self.tool,
-                             'arguments': json.dumps({'query': f'e2e.step{n}'})}}]}
+                'function': {'name': tool, 'arguments': json.dumps(args)}}]}
         self.unexpected.append(('Helper', _content(self._last())[:200]))
         return True, 'TERMINATE'
 

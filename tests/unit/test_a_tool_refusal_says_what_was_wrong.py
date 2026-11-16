@@ -39,9 +39,10 @@ import core.tool_logging as tl  # noqa: E402
 from core.constants import (  # noqa: E402
     TOOL_EXECUTION_FAILED_PREFIX, tool_reply_failed)
 from core.tool_logging import log_tool_execution  # noqa: E402
+import core.tool_refusal as tool_refusal  # noqa: E402
 from core.tool_refusal import (  # noqa: E402
-    NOTE_KEY, RETRY_AFTER_FIX, RETRY_LATER, RETRY_NEVER, is_json_refusal,
-    refusal_fields, refusal_has_hint, refuse)
+    NOTE_KEY, RETRY_AFTER_FIX, RETRY_LATER, RETRY_NEVER, RETRY_OTHER_TOOL,
+    is_json_refusal, refusal_fields, refusal_has_hint, refuse)
 from tests.unit.test_trace_action_banking import banked  # noqa: E402,F401
 
 NO_HINT = '[TOOL-REFUSAL-NO-HINT]'
@@ -98,6 +99,7 @@ def test_a_refusal_names_the_problem_the_fix_and_the_retry():
     (RETRY_AFTER_FIX, 'again only with that changed'),
     (RETRY_LATER, 'do not call ask_person again now'),
     (RETRY_NEVER, 'tell the person what could not be done'),
+    (RETRY_OTHER_TOOL, 'There is no ask_person to call again'),
 ])
 def test_each_retry_mode_says_whether_calling_again_can_help(retry, words):
     reply = refuse('ask_person', 'three questions are already waiting',
@@ -154,6 +156,27 @@ def test_a_json_reply_with_status_refused_is_a_failed_call():
 ])
 def test_a_reply_that_only_mentions_a_refusal_is_not_a_failed_call(reply):
     assert not tool_reply_failed(reply), reply
+
+
+def test_a_reply_that_cannot_be_a_refusal_is_never_parsed(monkeypatch):
+    """Both checks run on every wrapped tool's reply; the review of
+    2ddf102da measured a 1.2 MB JSON reply going from 0.38 ms to 33 ms when
+    each one was parsed.  A reply without the word they look for is
+    answered without a parse; one with it is still parsed and read."""
+    parsed = []
+    real = tool_refusal._json_object
+
+    def counting(body):
+        parsed.append(len(body))
+        return real(body)
+
+    monkeypatch.setattr(tool_refusal, '_json_object', counting)
+    big = json.dumps({'status': 'ok', 'rows': ['x' * 64] * 20000})
+    assert not is_json_refusal(big)
+    assert not refusal_has_hint(big)
+    assert parsed == [], parsed
+    assert is_json_refusal(ASK_REFUSED)
+    assert parsed, 'a reply naming "refused" must still be read'
 
 
 def test_a_refused_ask_is_not_banked_as_a_recipe_step(banked):
@@ -265,7 +288,8 @@ def test_a_tool_that_raised_tells_the_model_what_to_do(tool_log):
 # core/agent_tools' own refusals, called through the real tool closures.
 # ---------------------------------------------------------------------------
 from tests.unit.test_a_memory_key_with_a_placeholder_is_refused import (  # noqa: E402
-    LEARNER, PROGRESS, _store, _tools, store_dir)  # noqa: F401
+    AGENT, LEARNER, PROGRESS, _store, _tools, store_dir)  # noqa: F401
+from core import cache_loaders  # noqa: E402
 
 # Agents' saved steps quote this sentence ("'Key not found' means a new
 # learner"), so the answer keeps it first.
@@ -277,7 +301,8 @@ def test_a_read_of_an_unsaved_key_names_the_keys_that_are_saved(store_dir):
     tools['save_data_in_memory'](f'teach.{LEARNER}', PROGRESS)
     reply = tools['get_data_by_key']('teach.10203')
     assert reply.startswith(KEY_NOT_FOUND), reply
-    assert f'The keys saved under teach are: {LEARNER}.' in reply, reply
+    assert f"This person's keys under teach are: {LEARNER}." in reply, reply
+    assert 'If you meant one of those, read that key.' in reply, reply
     # A key nobody saved yet is how a first visit looks: an answer, not a
     # failed call, so a step that reads it is not re-steered.
     assert not tool_reply_failed(reply), reply
@@ -286,17 +311,58 @@ def test_a_read_of_an_unsaved_key_names_the_keys_that_are_saved(store_dir):
 def test_a_first_visit_read_says_nothing_is_saved_yet(store_dir):
     reply = _tools(_store())['get_data_by_key']('teach')
     assert reply.startswith(KEY_NOT_FOUND), reply
-    assert 'Nothing is saved in this memory yet.' in reply, reply
+    assert 'This person has nothing saved in this memory yet.' in reply, reply
     assert 'first visit' in reply, reply
+    # No key was named, so none is offered to read.
+    assert 'read that key' not in reply, reply
     assert not tool_reply_failed(reply), reply
 
 
-def test_a_read_through_a_single_value_says_to_read_the_value(store_dir):
+def test_a_read_through_a_single_value_says_it_is_a_single_value(store_dir):
     tools = _tools(_store())
     tools['save_data_in_memory']('name', 'Ada')
     reply = tools['get_data_by_key']('name.first')
     assert reply.startswith(KEY_NOT_FOUND), reply
-    assert 'name holds a value, not keys under it: read name itself.' in reply
+    assert ("This person's saved name is a single value, with no keys under "
+            "it.") in reply, reply
+    assert 'read that key' not in reply, reply
+
+
+OTHER = '96985'
+
+
+@pytest.mark.parametrize('shared', [
+    # Another person's record kept in the agent's shared store before the
+    # per-person ruling (agent 96985165407's shared 'tutor', 11-09).
+    {'teach': {OTHER: PROGRESS}},
+    # The creator's own progress saved straight under 'teach' (agent 54's
+    # shared 'teach', 11-09): a single value there.
+    {'teach': PROGRESS},
+])
+def test_a_new_learner_is_never_steered_to_a_record_in_the_shared_store(
+        store_dir, shared):
+    """Review of 2ddf102da, F1, measured on the owner's agent_data: the
+    first cut walked the whole memory view, so a new learner's read of
+    teach.<id> named the shared store's keys and said to read them -- the
+    creator's progress, or another person's id.  Only this person's own
+    store is described."""
+    cache_loaders.save_agent_data(AGENT, shared)
+    tools = _tools(_store(), user_id='10203')
+    reply = tools['get_data_by_key']('teach.10203')
+    assert reply.startswith(KEY_NOT_FOUND), reply
+    assert 'This person has nothing saved in this memory yet.' in reply, reply
+    assert OTHER not in reply, reply
+    assert 'single value' not in reply and 'read that key' not in reply, reply
+    assert not tool_reply_failed(reply), reply
+
+
+def test_a_learner_with_records_is_shown_only_their_own_keys(store_dir):
+    cache_loaders.save_agent_data(AGENT, {'teach': {OTHER: PROGRESS}})
+    tools = _tools(_store())
+    tools['save_data_in_memory'](f'teach.{LEARNER}', PROGRESS)
+    reply = tools['get_data_by_key']('teach.10203')
+    assert f"This person's keys under teach are: {LEARNER}." in reply, reply
+    assert OTHER not in reply, reply
 
 
 @pytest.mark.parametrize('tool', ['save_data_in_memory', 'get_data_by_key'])
@@ -408,6 +474,29 @@ def test_a_call_to_a_tool_that_does_not_exist_names_the_ones_that_do(
     assert reply.startswith('Error: the huggingface_search_models call could not '
                             'be done: no tool named huggingface_search_models'), reply
     assert 'by its exact name: get_item, save_note.' in reply, reply
+    # Review of 2ddf102da, F3: the reply pointed back at the missing tool
+    # ("Call huggingface_search_models again only with that changed").
+    assert 'There is no huggingface_search_models to call again' in reply, reply
+    assert 'again only with that changed' not in reply, reply
+    assert 'request_tools' not in reply, reply
+    assert tool_reply_failed(reply) and refusal_has_hint(reply), reply
+
+
+def test_an_unknown_tool_reply_names_request_tools_when_the_agent_has_it(executor):
+    tools = dict(_two_tools(), request_tools=lambda need: 'attached')
+    reply = _executed(executor, tools, 'huggingface_search_models')
+    assert 'get_item, request_tools, save_note' in reply, reply
+    assert ('call request_tools with a short description of that capability'
+            in reply), reply
+    assert 'There is no huggingface_search_models to call again' in reply, reply
+
+
+def test_an_unknown_tool_on_an_agent_with_no_tools_says_to_answer_in_writing():
+    from hartos.helper import executor_refusal
+    reply = executor_refusal('huggingface_search_models', {})
+    assert 'This agent has no tools: answer in writing instead.' in reply, reply
+    assert 'Calling huggingface_search_models again cannot work' in reply, reply
+    assert 'one of the tool names given' not in reply, reply
     assert tool_reply_failed(reply) and refusal_has_hint(reply), reply
 
 
@@ -438,3 +527,231 @@ def test_an_image_link_the_filter_refuses_says_what_to_pass(store_dir, monkeypat
     reply = _tools(_store())['get_text_from_image']('http://10.0.0.5/a.png')
     assert tool_reply_failed(reply) and refusal_has_hint(reply), reply
     assert 'private address' in reply and 'public http or https link' in reply
+
+
+# ---------------------------------------------------------------------------
+# Enforcement in the executor: tools registered as plain callables.
+# ---------------------------------------------------------------------------
+# Review of 2ddf102da, F2: the count lived only in log_tool_execution, so the
+# families that register plain callables (reel studio, news, finance,
+# commerce, remote desktop, media, ...) never reached it -- its probe logged 0
+# lines for a plain tool and 1 once the same tool was wrapped.  The patched
+# executor is the path every autogen tool reply takes, so it counts what the
+# wrapper did not.
+@pytest.mark.parametrize('run_async', [False, True])
+def test_a_plain_tools_unhinted_refusal_is_counted_by_the_executor(
+        executor, tool_log, run_async):
+    def list_reel_clips(project: str) -> str:
+        return 'Error: project not found'
+
+    reply = _executed(executor, {'list_reel_clips': list_reel_clips},
+                      'list_reel_clips', '{"project": "p1"}', run_async=run_async)
+    assert reply == 'Error: project not found'       # the reply is not changed
+    lines = _no_hint_lines(tool_log)
+    assert len(lines) == 1, tool_log
+    assert 'list_reel_clips' in lines[0], lines
+
+
+def test_an_async_plain_tool_is_counted_by_the_executor(executor, tool_log):
+    async def list_reel_clips(project: str) -> str:
+        return ASK_REFUSED
+
+    reply = _executed(executor, {'list_reel_clips': list_reel_clips},
+                      'list_reel_clips', '{"project": "p1"}', run_async=True)
+    assert reply == ASK_REFUSED
+    assert len(_no_hint_lines(tool_log)) == 1, tool_log
+
+
+@pytest.mark.parametrize('run_async', [False, True])
+def test_a_wrapped_tool_is_counted_once_through_the_executor(
+        executor, tool_log, run_async):
+    """A tool wrapped by log_tool_execution counted its own reply; the
+    executor does not count it a second time."""
+    @log_tool_execution
+    def ask_person(question: str) -> str:
+        return ASK_REFUSED
+
+    _executed(executor, {'ask_person': ask_person}, 'ask_person',
+              '{"question": "Which day?"}', run_async=run_async)
+    assert len(_no_hint_lines(tool_log)) == 1, tool_log
+
+
+def test_an_async_wrapped_tool_is_counted_once_through_the_executor(
+        executor, tool_log):
+    """An async def gets log_tool_execution's other wrapper (async_wrapper),
+    which must carry the same mark, or the async executor counts its reply a
+    second time.  The proof run of 2026-11-12 left that mark's removal
+    (mutant E5) alive: every wrapped tool above is a plain def."""
+    @log_tool_execution
+    async def ask_person(question: str) -> str:
+        return ASK_REFUSED
+
+    reply = _executed(executor, {'ask_person': ask_person}, 'ask_person',
+                      '{"question": "Which day?"}', run_async=True)
+    assert reply == ASK_REFUSED
+    assert len(_no_hint_lines(tool_log)) == 1, tool_log
+
+
+@pytest.mark.parametrize('reply', [
+    refuse('list_reel_clips', 'no project named p1',
+           'call list_reel_projects and use one of its names'),
+    'clip_1.mp4, clip_2.mp4',
+])
+def test_a_plain_tools_hinted_refusal_or_result_is_not_counted(
+        executor, tool_log, reply):
+    def list_reel_clips(project: str) -> str:
+        return reply
+
+    assert _executed(executor, {'list_reel_clips': list_reel_clips},
+                     'list_reel_clips', '{"project": "p1"}') == reply
+    assert _no_hint_lines(tool_log) == [], tool_log
+
+
+# ---------------------------------------------------------------------------
+# A message to the person that still holds a fill-in mark.
+# ---------------------------------------------------------------------------
+# Live 2026-11-11 01:59 IST on build 69 (hevolve-66e6's two-person proof,
+# agent 1793366231447, request msg_1794342560815_sim): send_message_to_user
+# delivered "Thank you, <parent_name>! ..." to the parent.  Measured on this
+# desktop's llm_outbound logs (1061 send texts): the other unfilled shape is
+# '[REVENUE_AMOUNT]' (one send carried five), and '<tool_call>' markup went
+# out in two.  Every one is an identifier joined by '_' inside <> or [].
+from core.session_cache import TTLCache as _SendStore  # noqa: E402
+from tests.unit.test_a_memory_key_with_a_placeholder_is_refused import (  # noqa: E402
+    _DiskHelper)
+
+
+def _send_tools():
+    """The real core tool closures with a sender and a scheduler that record
+    what would have reached the person."""
+    import core.agent_tools as agent_tools
+    sent, scheduled = [], []
+
+    class _Scheduler:
+        def add_job(self, func, trigger, run_date=None, args=None):
+            scheduled.append(list(args or []))
+
+    def _sender(user_id, text, *rest, **kw):
+        sent.append(text)
+        return 'Message sent successfully to user with request_id: r1'
+
+    ctx = {
+        'building_agent': False, 'user_id': '10202', 'prompt_id': '54',
+        'agent_data': _SendStore(ttl_seconds=60, max_size=10, name='t_send'),
+        'helper_fun': _DiskHelper(), 'user_prompt': '10202_54',
+        'request_id_list': {}, 'recent_file_id': None,
+        'scheduler': _Scheduler(), 'send_message_to_user1': _sender,
+        'retrieve_json': json.loads, 'strip_json_values': lambda d: d,
+        'save_conversation_db': lambda *a, **k: None,
+    }
+    tools = {n: f for n, _d, f in agent_tools.build_core_tool_closures(ctx)}
+    return tools, sent, scheduled
+
+
+@pytest.mark.parametrize('text, placeholder', [
+    ("Thank you, <parent_name>! Arjun did well today.", '<parent_name>'),
+    ("Revenue this week: [REVENUE_AMOUNT] against costs of [TOTAL_COSTS].",
+     '[REVENUE_AMOUNT]'),
+    ("<tool_call>\n<function=google_search>\n<parameter=text>shoes",
+     '<tool_call>'),
+    # The whole text is one blank, the shape ask_person's example writes
+    # ("<why you ask>"): one rule for every text that reaches a person
+    # (review C-1 of 0516f3981).
+    ("<your message to the parent>", '<your message to the parent>'),
+    ("  <why you ask>\n", '<why you ask>'),
+])
+def test_a_message_that_still_holds_a_placeholder_is_refused_and_not_sent(
+        tool_log, text, placeholder):
+    tools, sent, _scheduled = _send_tools()
+    reply = tools['send_message_to_user'](text, False)
+    assert sent == [], 'the person must not receive the fill-in mark'
+    assert tool_reply_failed(reply) and refusal_has_hint(reply), reply
+    assert placeholder in reply, reply
+    assert 'send_message_to_user' in reply, reply
+
+
+@pytest.mark.parametrize('text', [
+    "Is 3 < 5 and 7 > 2? Yes, both are true!",
+    "Use the <div> tag to group the page, and <b> for bold words.",
+    "See [1] for the source, and [Note] keep practising.",
+    "Say 'ball' slowly: <ball> rhymes with <call>.",
+    "Great try, Arjun! Now say 'buh-buh-ball' with me.",
+    # A coding lesson's own text: a mark glued to the word before it is an
+    # index or a type, and [words](link) is a markdown link (review C-2 of
+    # 0516f3981 measured all five refused).
+    "Index the list as my_list[item_index], then print it.",
+    "Read each cell with row[col_name] inside the loop.",
+    "Your key is read from os.environ[GITHUB_TOKEN] when it starts.",
+    "Declare it as std::vector<my_type> before the loop.",
+    "Open [click_here](https://example.org/lesson) to see the page.",
+    "Is the parcel <2 kg?",
+])
+def test_a_message_without_a_placeholder_is_sent_as_written(tool_log, text):
+    tools, sent, _scheduled = _send_tools()
+    reply = tools['send_message_to_user'](text, False)
+    assert sent == [text], reply
+    assert not tool_reply_failed(reply), reply
+
+
+def test_a_timed_message_with_a_placeholder_is_refused_and_not_scheduled(
+        tool_log):
+    tools, _sent, scheduled = _send_tools()
+    reply = tools['send_message_in_seconds'](
+        "Good morning, <child_name>! Ready for today's sounds?", 30)
+    assert scheduled == [], scheduled
+    assert tool_reply_failed(reply) and refusal_has_hint(reply), reply
+    assert '<child_name>' in reply, reply
+
+
+# ---------------------------------------------------------------------------
+# One rule for every text a person reads: a message and an ask agree.
+# ---------------------------------------------------------------------------
+# Review C-1 of 0516f3981: the send tools and ask_person held two rules, so
+# "Hi <parent_name>, which day suits you?" was refused as a message and sent
+# as an ask, and "<why you ask>" the other way round.
+def _asked(monkeypatch, text, where):
+    """person_ask.ask with ``text`` as the reason or as the question's label.
+    The card push is the boundary: it refuses, so an ask that passed every
+    check before it reads 'not_shown' and nothing is stored or sent."""
+    from integrations.agent_engine import liquid_ui_service, person_ask
+    monkeypatch.setattr(liquid_ui_service, 'push_agent_ui', lambda *a, **k: False)
+    reason = text if where == 'description' else 'To plan the next lesson.'
+    label = text if where == 'label' else 'Which day suits you?'
+    component = {'type': 'form', 'description': reason,
+                 'fields': [{'name': 'answer', 'label': label, 'type': 'text'}]}
+    return person_ask.ask('10202', '54', component, prompt_id='54', title='A question')
+
+
+@pytest.mark.parametrize('where', ['description', 'label'])
+@pytest.mark.parametrize('text, blank', [
+    ("Hi <parent_name>, which day suits you?", '<parent_name>'),
+    ("Revenue is [REVENUE_AMOUNT] today?", '[REVENUE_AMOUNT]'),
+    ("<why you ask>", '<why you ask>'),
+    ("<your question>", '<your question>'),
+])
+def test_a_blank_a_message_refuses_an_ask_refuses_too(
+        tool_log, monkeypatch, where, text, blank):
+    tools, sent, _scheduled = _send_tools()
+    reply = tools['send_message_to_user'](text, False)
+    assert sent == [] and blank in reply, reply
+    out = _asked(monkeypatch, text, where)
+    assert out['refused'] == 'unfilled_placeholder', out
+    from integrations.agent_engine.person_ask import _refusal_note
+    component = {'description': text if where == 'description' else 'x',
+                 'fields': [{'label': text if where == 'label' else 'y'}]}
+    assert blank in _refusal_note('unfilled_placeholder', component, '10202', '54', False)
+
+
+@pytest.mark.parametrize('where', ['description', 'label'])
+@pytest.mark.parametrize('text', [
+    "Is the parcel <2 kg?",
+    "To pick the box size: <30 cm or >50 cm?",
+    "Use my_list[item_index] to read the third word.",
+    "Say <ball> slowly, then tell me the word you heard.",
+])
+def test_words_a_message_sends_an_ask_asks_too(tool_log, monkeypatch, where, text):
+    tools, sent, _scheduled = _send_tools()
+    tools['send_message_to_user'](text, False)
+    assert sent == [text]
+    out = _asked(monkeypatch, text, where)
+    assert out['refused'] == 'not_shown', out      # past the blank check

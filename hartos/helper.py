@@ -3406,14 +3406,11 @@ def get_frame(user_id, frame_store=None):
     if frame_store is not None:
         frame_bytes = frame_store.get_frame(str(user_id))
         if frame_bytes is not None:
-            import cv2
-            frame = cv2.imdecode(
-                np.frombuffer(frame_bytes, np.uint8), cv2.IMREAD_COLOR,
-            )
+            frame = _decode_stored_frame(frame_bytes)
             if frame is not None:
                 current_app.logger.info(
                     f"Frame for user_id {user_id} from injected FrameStore")
-                return frame[:, :, ::-1]  # BGR → RGB
+                return frame
 
     # Primary: FrameStore via get_frame_store (in-process, zero latency).
     # Go through the helper so there's one accessor for the store, not
@@ -3425,16 +3422,20 @@ def get_frame(user_id, frame_store=None):
         if fs is not None:
             frame_bytes = fs.get_frame(str(user_id))
             if frame_bytes is not None:
-                import cv2
-                frame = cv2.imdecode(
-                    np.frombuffer(frame_bytes, np.uint8), cv2.IMREAD_COLOR,
-                )
+                frame = _decode_stored_frame(frame_bytes)
                 if frame is not None:
                     current_app.logger.info(
                         f"Frame for user_id {user_id} from FrameStore")
-                    return frame[:, :, ::-1]  # BGR → RGB
+                    return frame
     except Exception:
-        pass
+        # Never silent.  This guard used to be `except Exception: pass`, and
+        # it hid a NameError on every stored frame for ten weeks: the decode
+        # used `np` and this module never bound it (since 3200888d3,
+        # 2026-08-30), so the agent was told "no camera frame" while frames
+        # sat in the store (measured live 2026-11-10 12:40:03).
+        current_app.logger.warning(
+            f"get_frame: the stored camera frame for user_id {user_id} could "
+            f"not be read", exc_info=True)
 
     # Fallback: Redis (legacy path).  Only a cloud camera pipeline writes
     # frames there; a desktop runs no Redis, and redis_client is built lazily
@@ -3468,6 +3469,16 @@ def get_frame(user_id, frame_store=None):
             return None
     except ModuleNotFoundError as e:
         raise e
+
+def _decode_stored_frame(frame_bytes):
+    """The RGB array of a JPEG the FrameStore holds, or None when it does not
+    decode.  The one decode both FrameStore branches of get_frame use; it
+    imports what it uses, so it cannot depend on a module-level name."""
+    import cv2
+    import numpy as np
+    frame = cv2.imdecode(np.frombuffer(frame_bytes, np.uint8), cv2.IMREAD_COLOR)
+    return None if frame is None else frame[:, :, ::-1]  # BGR -> RGB
+
 
 def get_user_camera_inp(inp: Annotated[str, "The Question to check from visual context"],user_id:int,request_id:str) -> str:
     """Answer ``inp`` from the user's latest camera frame.
@@ -3577,6 +3588,10 @@ def _no_camera_frame_reason(inp, user_id) -> str:
         "This tool only answers questions about what the user's live camera "
         "shows and cannot answer anything else; answer without it",
         retry=RETRY_NEVER)
+    if user_id is None or not str(user_id).strip():
+        # A turn of nobody: no camera here is keyed to it, so nobody is
+        # asked (ask_owner reads a missing turn user as "no turn check").
+        return nothing
     try:
         from integrations.social.consent_service import (
             OWNER_ALLOWED, OWNER_ASKED, OWNER_SAID_NO, ask_owner)
@@ -3817,12 +3832,20 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
         return _json.dumps({'res': []})
 
 def parse_date(date_str):
-    return datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%S")
+    """A caption row's created_date, read as core.user_context reads it.
+    Nunba writes '2026-11-11T00:19:47.146774+00:00'; the old
+    strptime("%Y-%m-%dT%H:%M:%S") refused it ("unconverted data remains"),
+    so the camera tool, the screen tool and the visual-history search raised
+    on every desktop caption (review of HARTOS 3622c8310).  A bare
+    '2026-11-11T00:19:47' reads as before."""
+    from core.user_context import parse_date as _parse_stamp
+    return _parse_stamp(date_str)
 
 def get_visual_context(user_id,mins=5):
     '''
         This function help to extract action that user have perfomed till time
     '''
+    from core.user_context import _age, CAMERA_WINDOW_MAX_CAPTIONS
     # action_url = f"{ACTION_API}?user_id={user_id}"
     action_url = get_visual_context_api(user_id, mins)
     # Todo: get, and populate timezone from client
@@ -3847,15 +3870,16 @@ def get_visual_context(user_id,mins=5):
             date = parse_date(obj["created_date"])
             gpt3_label = obj["gpt3_label"]
             if gpt3_label == 'Visual Context':
-                now = datetime.now()
-                # Check if the action is older than 5 minutes
-                if (now - date) > timedelta(minutes=mins):
+                # Older than `mins`, each stamp read in its own zone
+                # (core.user_context._age: a UTC stamp against the UTC clock).
+                if _age(date) > timedelta(minutes=mins):
                     continue
             first_action_text = f"{action} on {date.astimezone(india_tz).strftime('%Y-%m-%dT%H:%M:%S')}"
 
             video_context_texts.append(first_action_text)
         if video_context_texts:
-            return video_context_texts[:10]
+            # The store answers newest first (Nunba get_visual_bymins).
+            return video_context_texts[:CAMERA_WINDOW_MAX_CAPTIONS]
         else:
             return None
     else:
@@ -3881,11 +3905,11 @@ def get_screen_context(user_id, mins=2):
         filtered_data_screen = [
             obj for obj in data if obj["zeroshot_label"] == 'Screen Reasoning']
         screen_context_texts = []
+        from core.user_context import _age
         for obj in filtered_data_screen:
             action = obj["action"]
             date = parse_date(obj["created_date"])
-            now = datetime.now()
-            if (now - date) > timedelta(minutes=mins):
+            if _age(date) > timedelta(minutes=mins):
                 continue
             screen_text = f"{action} on {date.astimezone(india_tz).strftime('%Y-%m-%dT%H:%M:%S')}"
             screen_context_texts.append(screen_text)
@@ -3914,6 +3938,7 @@ def search_visual_history(user_id, query, mins=30, channel='both'):
     if response.status_code != 200:
         return None
 
+    from core.user_context import _age
     data = response.json()
     query_lower = query.lower()
     results = []
@@ -3934,8 +3959,7 @@ def search_visual_history(user_id, query, mins=30, channel='both'):
             continue
 
         date = parse_date(obj["created_date"])
-        now = datetime.now()
-        if (now - date) > timedelta(minutes=mins):
+        if _age(date) > timedelta(minutes=mins):
             continue
 
         ch = 'camera' if label == 'Video Reasoning' else 'screen'
@@ -4912,9 +4936,15 @@ def executor_refusal(func_name, function_map, raised=None) -> str:
       raised while it ran.  It was "Error: <exception text>", with no word on
       whether calling again could help.
 
+    The unknown-tool reply ends with RETRY_OTHER_TOOL, not "call it again
+    with that changed" (review of 2ddf102da, F3: that told the model to call
+    the missing tool again), and, when request_tools is registered, names it
+    as the way to find a tool for a capability none of the listed ones has.
+    With no tools at all no call can work, so it ends with RETRY_NEVER.
+
     Both open with "Error:", so core.constants.tool_reply_failed still reads
     them as failed calls.  Used by the sync and the async executor alike."""
-    from core.tool_refusal import refuse
+    from core.tool_refusal import (RETRY_NEVER, RETRY_OTHER_TOOL, refuse)
     name = str(func_name or '').strip() or 'unnamed'
     if raised is not None:
         return refuse(name, f"it raised {type(raised).__name__}: {raised}",
@@ -4922,10 +4952,17 @@ def executor_refusal(func_name, function_map, raised=None) -> str:
                       "otherwise do not repeat the call and tell the person "
                       "what could not be done")
     names = sorted(str(n) for n in (function_map or {}))
+    problem = f"no tool named {name} is registered with this agent"
+    if not names:
+        return refuse(name, problem,
+                      "This agent has no tools: answer in writing instead",
+                      retry=RETRY_NEVER)
     shown = ', '.join(names[:40]) + (', ...' if len(names) > 40 else '')
-    fix = (f"Use one of this agent's tools, by its exact name: {shown}" if names
-           else "This agent has no tools: answer in writing instead")
-    return refuse(name, f"no tool named {name} is registered with this agent", fix)
+    fix = f"Use one of this agent's tools, by its exact name: {shown}"
+    if 'request_tools' in names:
+        fix += ("; if none of them does what you need, call request_tools "
+                "with a short description of that capability")
+    return refuse(name, problem, fix, retry=RETRY_OTHER_TOOL)
 
 
 def tool_argument_error(func, func_name, arguments, repaired, as_written=None):
@@ -5283,6 +5320,13 @@ def force_apply_autogen_json_fix():
                 except Exception as e:
                     content = executor_refusal(func_name, self._function_map, raised=e)
                     print(f" EXECUTION FAILED: {func_name}: {e}")
+                if is_exec_success:
+                    # A plain callable's refusal that says nothing the model
+                    # can fix is counted here (a wrapped tool counted its
+                    # own).  Outside the try: the count can never turn a
+                    # tool that ran into a failed call.
+                    from core.tool_logging import note_executor_reply
+                    note_executor_reply(func, func_name, content)
         else:
             content = executor_refusal(func_name, self._function_map)
 
@@ -5340,6 +5384,9 @@ def force_apply_autogen_json_fix():
                 except Exception as e:
                     content = executor_refusal(func_name, self._function_map, raised=e)
                     print(f" EXECUTION ASYNC FAILED: {func_name}: {e}")
+                if is_exec_success:
+                    from core.tool_logging import note_executor_reply
+                    note_executor_reply(func, func_name, content)
         else:
             content = executor_refusal(func_name, self._function_map)
 
@@ -5827,6 +5874,75 @@ MEDIA_KIND_MIMES = {
     'video': {'.mp4': 'video/mp4', '.webm': 'video/webm'},
     'html': {'.html': 'text/html', '.htm': 'text/html'},
 }
+
+
+def post_agent_message(body: dict):
+    """POST an agent's message to its person on a node that is not the
+    desktop (central): the chatbot_pipeline backend's /autogen_response, at
+    core.config_cache.get_autogen_response_url.  The ONE send for CREATE's
+    and REUSE's send_message_to_user1, which had two URLs and two failure
+    rules.
+
+    Returns ``(delivered, why)``.  ``delivered`` is True only when the
+    backend answered 2xx, and ``why`` is '' then.  Otherwise ``why`` says
+    what went wrong in words the agent can act on, and ``delivered`` is:
+
+    - False: the message did not arrive (no URL set, the backend could not
+      be reached, or it refused), so sending it again is safe;
+    - None: it was sent but no answer came in time.  It may have arrived:
+      chatbot_pipeline publishes the text to the person before it makes the
+      video (chatbot.py:970), so ``why`` tells the agent not to send it
+      again (review of f1d599dd9: a resend after a read timeout reached the
+      backend twice).
+
+    Both copies used to report "sent" for any answer, and the backend
+    answers 500 when the person has no session on it (review of 983c98e14,
+    its handler run against a real request), so the model was told a
+    message had arrived that had not.
+
+    Sent once (core.http_pool.pooled_post_once): the shared pool re-sends a
+    POST on a read timeout, and one slow send reached the backend three
+    times.  The backend replies only after it has made the message's audio
+    and video, so the read budget is LLM_COMPLETION_TIMEOUT, http_pool's
+    budget for a call that waits on generation.  How long central's backend
+    takes has not been measured.
+
+    The text is scrubbed of elided-text pointers here too: this is the last
+    step before it leaves the node (owner ruling 2026-09-27)."""
+    from core.config_cache import get_autogen_response_url
+    from core import http_pool
+    from core.llm_outbound_logger import strip_elided_pointers
+    url = get_autogen_response_url()
+    if not url:
+        _fallback_logger.warning(
+            'agent message not sent: AUTOGEN_RESPONSE_URL is not set on this node')
+        return False, ('this node has no AUTOGEN_RESPONSE_URL, the address of '
+                       'the service that delivers agent messages; the '
+                       "node's operator has to set it")
+    body = dict(body, message=strip_elided_pointers(body.get('message') or ''))
+    try:
+        res = http_pool.pooled_post_once(
+            url, data=json.dumps(body),
+            headers={'Content-Type': 'application/json'},
+            timeout=http_pool.LLM_COMPLETION_TIMEOUT)
+    except requests.exceptions.ReadTimeout:
+        # The request went out whole; only the answer is missing.
+        _fallback_logger.warning(
+            'agent message unconfirmed: %s took it but did not answer in time', url)
+        return None, ('the service that delivers agent messages took the '
+                      'message but did not answer in time; it may still reach '
+                      'the person, so do not send it again')
+    except Exception as e:
+        _fallback_logger.warning(
+            'agent message not sent: %s unreachable (%s)', url, type(e).__name__)
+        return False, ('the service that delivers agent messages could not be '
+                       f'reached ({type(e).__name__})')
+    if 200 <= res.status_code < 300:
+        return True, ''
+    _fallback_logger.warning('agent message not sent: %s answered HTTP %s: %s',
+                             url, res.status_code, (res.text or '')[:200])
+    return False, ('the service that delivers agent messages refused it '
+                   f'(HTTP {res.status_code})')
 
 
 def media_items_for(user_id, refs, *, prompt_id, request_id):

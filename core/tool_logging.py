@@ -205,10 +205,12 @@ def note_unhinted_refusal(tool_name: str, result) -> bool:
 
     The enforcement half of core.tool_refusal (owner 2026-11-09: "enforce a
     framework for tool call so that validation errors are semantically
-    understood by LLM so that retry can correct them").  Every registered
-    tool returns through log_tool_execution, so this is the one place that
-    sees every reply.  A reply that failed (core.constants.tool_reply_failed)
-    but carries no hint (core.tool_refusal.refusal_has_hint: not built by
+    understood by LLM so that retry can correct them").  Called on the
+    return of every tool wrapped by log_tool_execution, and by the autogen
+    executor (note_executor_reply) for every tool registered as a plain
+    callable, which never returns through a wrapper (review of 2ddf102da,
+    probe: 0 lines for a plain tool, 1 once wrapped).  A reply that failed
+    (core.constants.tool_reply_failed) but carries no hint (core.tool_refusal.refusal_has_hint: not built by
     refuse(), or refused JSON without a note) is logged once per call as
     ``[TOOL-REFUSAL-NO-HINT] <tool>``, with the session, so each lane can
     count and move its own.  Returns whether it logged.  Never raises: it
@@ -227,6 +229,27 @@ def note_unhinted_refusal(tool_name: str, result) -> bool:
         _emit_logger.debug("[tool_logging] refusal hint check failed",
                            exc_info=True)
         return False
+
+
+# Set on every wrapper log_tool_execution returns: that tool counts its own
+# replies.  functools.wraps copies a function's __dict__, so the mark survives
+# autogen's own wrapping (ConversableAgent._wrap_function) into _function_map.
+_COUNTS_ITS_OWN_REPLIES = '_hart_counts_own_refusals'
+
+
+def note_executor_reply(func, tool_name: str, result) -> bool:
+    """The executor's half of the [TOOL-REFUSAL-NO-HINT] count.
+
+    hartos.helper's patched execute_function / a_execute_function, which
+    every autogen tool reply passes, call this with the function they ran.
+    A tool wrapped by log_tool_execution counted its reply on its own return
+    and is skipped; a plain callable (reel studio, news, finance, commerce,
+    remote desktop, media, ...) is counted here, by the same rule
+    (note_unhinted_refusal).  Review of 2ddf102da, F2: those families were
+    never counted.  Returns whether it logged; never raises."""
+    if getattr(func, _COUNTS_ITS_OWN_REPLIES, False):
+        return False
+    return note_unhinted_refusal(tool_name, result)
 
 
 def _error_envelope(func_name: str, exc: BaseException) -> str:
@@ -385,6 +408,7 @@ def log_tool_execution(func=None, *, name=None, plain_errors=False):
 
         if _resolved_hints:
             async_wrapper.__annotations__ = _resolved_hints
+        setattr(async_wrapper, _COUNTS_ITS_OWN_REPLIES, True)
         return async_wrapper
 
     @wraps(func)
@@ -431,6 +455,7 @@ def log_tool_execution(func=None, *, name=None, plain_errors=False):
 
     if _resolved_hints:
         sync_wrapper.__annotations__ = _resolved_hints
+    setattr(sync_wrapper, _COUNTS_ITS_OWN_REPLIES, True)
     return sync_wrapper
 
 
