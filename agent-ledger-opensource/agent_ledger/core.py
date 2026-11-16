@@ -3496,11 +3496,18 @@ RELATIONSHIP TYPES:
                 description = subtask.get('description', 'Subtask')
                 depends_on = subtask.get('depends_on', [])
 
+                # 'split_of' names these as the parent's own split, so a
+                # reader can tell them from a delegation's child
+                # (create_parent_child_task) or a dynamic child: only a
+                # split's pending sub-steps make the parent's block one the
+                # person's input wait may take in place (review of
+                # ede3b91c5, S2a).
                 child_task = Task(
                     task_id=child_task_id,
                     description=description,
                     task_type=TaskType.AUTONOMOUS,
-                    parent_task_id=parent_task_id
+                    parent_task_id=parent_task_id,
+                    context={'split_of': parent_task_id}
                 )
 
                 for dep in depends_on:

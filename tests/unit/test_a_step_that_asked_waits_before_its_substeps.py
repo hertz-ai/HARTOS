@@ -21,6 +21,18 @@ re-marked input_required, its sub-steps kept); any other block is still
 refused.  The next person turn then resumes it through the one held-step gate
 and the answer is recorded.
 
+Rework after rv_camask's review of ede3b91c5 (REJECTED, board 2026-11-16
+22:45:18Z), each case below taken from that review's probe:
+ - only a question that was SENT holds the sub-steps (M1): a line the model
+   wrote before the split reached no one, and the hold that took it ended the
+   turn with no question asked and failed the step on the next turn;
+ - only the parent's own split counts (S2a): add_subtasks stamps its
+   sub-steps context['split_of']; a delegation, a dynamic child or a FAILED
+   sub-step keeps the refusal (real SmartLedger, not fakes);
+ - on the reply turn, the answered question holds nothing, and a send after
+   the reply is a new question that waits (S2b);
+ - the live 'yes'-step shape is pinned, and the re-prompts are counted (S2d).
+
 Driven through the real chat_agent, state machine, ledger and autogen group
 chat of tests/unit/test_reuse_reply_is_evidence.py; only the model seats are
 scripted, and nothing the fix depends on is stubbed.
@@ -47,16 +59,36 @@ SUBS = [
     {'subtask_id': '1.2', 'description': "Once the child's name is received, respond in Tamil"},
     {'subtask_id': '1.3', 'description': 'Thank the parent for sharing the name'},
 ]
+NAME_Q = "What is your child's name?"
+#: The live speech agent's flow 0 (1794540972213_0_recipe.json, read
+#: 2026-11-16): every action is 'yes'; action 1 names send_message_to_user.
+LIVE_FLOW0 = [
+    {'action': ("send_message_to_user: get the child's name from memory key child_name; if it "
+                "is not saved, ask the parent 'What is your child's name?' and wait for the answer"),
+     'action_id': 1, 'can_perform_without_user_input': 'yes', 'recipe': []},
+    {'action': ("save_data_in_memory: if the child's name was just asked, save the name from the "
+                "parent's reply as child_name; then send_message_to_user '<child_name>!' and wait "
+                "for the child to respond"),
+     'action_id': 2, 'can_perform_without_user_input': 'yes', 'recipe': []},
+    {'action': ("send_message_to_user: read the child's reply to their name in the person's latest "
+                "message: if they responded, send 'Super <child_name>!'; if not, send "
+                "'<child_name>, look here!'"),
+     'action_id': 3, 'can_perform_without_user_input': 'yes', 'recipe': []},
+]
+
+
+def _send(state, text, expects=True):
+    return {'content': '', 'tool_calls': [{
+        'id': 'ask_%d' % len(state['sends']), 'type': 'function',
+        'function': {'name': 'send_message_to_user',
+                     'arguments': json.dumps({'text': text, 'expects_reply': expects})}}]}
 
 
 def _asks_every_time(state, aid, content):
     """The live 4B: on the ask turn it sends its question each time it is
     steered."""
     if aid == 1 and state['turn'] == 'ask':
-        return {'content': '', 'tool_calls': [{
-            'id': 'ask_%d' % len(state['sends']), 'type': 'function',
-            'function': {'name': 'send_message_to_user',
-                         'arguments': json.dumps({'text': ASK_LINE, 'expects_reply': True})}}]}
+        return _send(state, ASK_LINE)
     return None
 
 
@@ -71,6 +103,11 @@ def _splits_once(state, aid, content):
 
 def _task(run, task_id):
     return run.ledger.tasks[task_id]
+
+
+def _answers(run, action_id=1):
+    ctx = getattr(_task(run, f'action_{action_id}'), 'context', None) or {}
+    return [e.get('answer') for e in (ctx.get(run.L.USER_INPUT_EVIDENCE_KEY) or [])]
 
 
 def _substep_steers(run, since=0):
@@ -139,52 +176,215 @@ def test_a_step_split_on_the_reply_turn_works_its_substeps_with_the_answer(speec
     assert _substep_steers(run, before) or run.rr.user_tasks[run.key].current_action > 1
 
 
-def test_a_parent_blocked_for_any_other_reason_is_not_taken():
-    """The new edge is the parent blocked on its OWN pending sub-steps only:
-    a task blocked by anything else keeps the refusal it always had."""
+@pytest.fixture
+def real_ledger():
+    """A real SmartLedger (InMemoryBackend) with two steps, step 1 running,
+    registered where lifecycle_hooks finds a session's ledger."""
+    from agent_ledger.backends import InMemoryBackend
+    from agent_ledger.core import SmartLedger, Task, TaskStatus, TaskType
+    from hartos import lifecycle_hooks as L
+    keys = []
+
+    def make(key):
+        led = SmartLedger(agent_id='61', session_id=key, backend=InMemoryBackend())
+        for n in (1, 2):
+            led.add_task(Task(task_id=f'action_{n}', description=f'step {n}',
+                              task_type=TaskType.PRE_ASSIGNED))
+        led.update_task_status('action_1', TaskStatus.IN_PROGRESS)
+        L._ledger_registry[key] = led
+        keys.append(key)
+        return led
+
+    yield make
+    for key in keys:
+        L._ledger_registry.pop(key, None)
+
+
+def test_a_parent_blocked_on_its_own_split_takes_the_wait_in_place(real_ledger):
+    """The split (ledger.add_subtasks, the call the verifier's breakdown
+    makes) leaves the parent BLOCKED with no reason of its own; the wait is
+    taken in place, its sub-steps kept, and recorded as task.block() records
+    it (S2e): the reason in error_message and an entry in the state history."""
     from agent_ledger.core import TaskStatus
     from hartos import lifecycle_hooks as L
+    led = real_ledger('split_takes_the_wait')
+    led.add_subtasks(1, SUBS[:2])
+    parent = led.tasks['action_1']
+    assert parent.status == TaskStatus.BLOCKED and not parent.blocked_reason
+    history = len(parent.state_history)
+    assert L.block_for_user_input('split_takes_the_wait', 1, "waiting for the person's reply")
+    assert parent.status == TaskStatus.BLOCKED
+    assert parent.blocked_reason == 'input_required'
+    assert parent.error_message == "waiting for the person's reply"
+    assert len(parent.state_history) == history + 1
+    assert "waiting for the person's reply" in str(parent.state_history[-1])
+    assert {led.tasks[s['subtask_id']].status for s in SUBS[:2]} == {TaskStatus.PENDING}
 
-    class _Task:
-        def __init__(self, status, reason, task_id='action_1', parent=None):
-            self.task_id, self.status, self.blocked_reason = task_id, status, reason
-            self.parent_task_id = parent
 
-    class _Ledger:
-        def __init__(self, tasks):
-            self.tasks = {t.task_id: t for t in tasks}
+def test_a_parent_blocked_on_anything_but_its_own_split_keeps_the_refusal(real_ledger):
+    """Review of ede3b91c5, S2a, each block made by the ledger's own calls:
+    a delegation to another agent (create_parent_child_task and the bridge's
+    BLOCKED), a dynamic child (add_dynamic_task, relationship 'child'), a
+    split whose only sub-step FAILED, and a split parent already blocked for
+    a reason of its own.  None of them is the person's input wait."""
+    from agent_ledger.core import TaskStatus, TaskType
+    from hartos import lifecycle_hooks as L
 
-        def save(self):
-            return True
+    def refused(key, led):
+        parent = led.tasks['action_1']
+        before = (parent.status, parent.blocked_reason)
+        assert L.block_for_user_input(key, 1, 'q') is False, key
+        assert (parent.status, parent.blocked_reason) == before, key
 
-    key = 'blocked_other_reason_test'
+    led = real_ledger('delegation')
+    child = led.create_parent_child_task(
+        parent_task_id='action_1', child_description='look up the clinic hours',
+        child_type=TaskType.AUTONOMOUS, context={'delegated_to': 'specialist_agent'})
+    led.update_task_status('action_1', TaskStatus.BLOCKED,
+                           f'Waiting for delegated task: {child.task_id}')
+    refused('delegation', led)
 
-    def _refused(*tasks):
-        L._ledger_registry[key] = _Ledger(list(tasks))
-        try:
-            return L.block_for_user_input(key, 1, 'waiting') is False
-        finally:
-            L._ledger_registry.pop(key, None)
+    led = real_ledger('dynamic_child')
+    led._get_default_llm_client = lambda: None
+    # The classifier is the model's seat; it judged the new task a child.
+    led._classify_task_relationship = lambda **kw: {
+        'relationship': 'child', 'execution_mode': 'sequential',
+        'related_to_task_id': 'action_1'}
+    dyn = led.add_dynamic_task('follow up the clinic', {'current_action_id': 1})
+    assert dyn is not None and dyn.parent_task_id == 'action_1'
+    assert led.tasks['action_1'].status == TaskStatus.BLOCKED
+    refused('dynamic_child', led)
 
-    pending_own = _Task(TaskStatus.PENDING, None, 'action_1_1', parent='action_1')
+    led = real_ledger('failed_substep')
+    led.add_subtasks(1, SUBS[:1])
+    led.update_task_status('1.1', TaskStatus.IN_PROGRESS)
+    led.update_task_status('1.1', TaskStatus.FAILED, error_message='tool refused')
+    refused('failed_substep', led)
+
     for reason in ('approval_required', 'dependency', 'input_required'):
-        parent = _Task(TaskStatus.BLOCKED, reason)
-        assert _refused(parent), reason
-        assert parent.blocked_reason == reason
-        # Blocked for its own reason, even with a sub-step of its own still
-        # to run: the reason wins, the block is not re-marked.
-        parent = _Task(TaskStatus.BLOCKED, reason)
-        assert _refused(parent, pending_own), reason
-        assert parent.blocked_reason == reason
-    # Blocked with no reason and no sub-steps of its own: still refused.
-    assert _refused(_Task(TaskStatus.BLOCKED, None))
-    # Its sub-steps all done (the ledger unblocks such a parent itself).
-    assert _refused(_Task(TaskStatus.BLOCKED, None),
-                    _Task(TaskStatus.COMPLETED, None, 'action_1_1', parent='action_1'),
-                    _Task(TaskStatus.SKIPPED, None, 'action_1_2', parent='action_1'))
-    # The pending sub-step belongs to another step.
-    assert _refused(_Task(TaskStatus.BLOCKED, None),
-                    _Task(TaskStatus.PENDING, None, 'action_2_1', parent='action_2'))
+        key = 'own_reason_' + reason
+        led = real_ledger(key)
+        led.add_subtasks(1, SUBS[:2])
+        led.tasks['action_1'].set_blocked_reason(reason)
+        refused(key, led)
+
+
+@pytest.mark.parametrize('first', ['I will now ask Arjun to say ball.', ASK_LINE],
+                         ids=['its_plan', 'the_question_as_text'])
+def test_a_question_only_written_before_the_split_does_not_end_the_turn(speech, first):
+    """Review of ede3b91c5, M1 (probe p3a/p3b): a 'no' step naming
+    send_message_to_user whose model WRITES a line (its plan, or the question
+    as text) before the verifier splits it.  Nothing reached the person, so
+    the split does not hold; the sub-step steer makes the model send the
+    question, that send holds, and the reply is taken as the answer."""
+    def assistant(state, aid, content):
+        if aid == 1 and state['turn'] == 'ask':
+            if content.startswith('Work on subtask: '):
+                return _send(state, ASK_LINE)
+            return first
+        return None
+
+    run = speech(assistant_script=assistant, verdict_script=_splits_once)
+    run.turn('hi, I am ready', 'request-1')
+    assert run.state['sends'] == [ASK_LINE], run.state['sends']
+    ask = run.L.ledger_open_ask(run.key, 1, 0) or {}
+    assert ask.get('via') == 'send', ask
+    assert ask.get('question') == ASK_LINE, ask
+    assert run.L.person_waits_on(run.key, 1, 0) is True
+    run.turn('ba', 'request-2', kind='reply')
+    assert run.L.ledger_user_answered(run.key, 1, 0) is True
+    assert _answers(run) == ['ba'], _answers(run)
+    from agent_ledger.core import TaskStatus
+    assert _task(run, 'action_1').status != TaskStatus.FAILED
+
+
+def test_a_substeps_own_question_on_the_reply_turn_waits_for_its_answer(speech):
+    """Review of ede3b91c5, S2b (probe p5): on the turn that brings the
+    reply, a sub-step that asks the person something new ("how old is
+    he?") holds for that answer; the next sub-step does not run at once."""
+    subs = [
+        {'subtask_id': '1.1', 'description': 'Ask Arjun to say ball'},
+        {'subtask_id': '1.2', 'description': 'Ask the parent how old Arjun is'},
+        {'subtask_id': '1.3', 'description': 'Praise Arjun by name'},
+    ]
+    age_q = 'How old is Arjun?'
+
+    def assistant(state, aid, content):
+        if aid == 1 and state['turn'] == 'ask':
+            return _send(state, ASK_LINE)
+        if aid == 1 and 'how old' in content.lower() and age_q not in state['sends']:
+            return _send(state, age_q)
+        return None
+
+    def verdict(state, aid, content):
+        if aid == 1 and not state.get('broke'):
+            state['broke'] = True
+            return json.dumps({'status': 'requires_breakdown', 'action_id': 1,
+                               'subtasks': subs, 'message': 'split'})
+        return json.dumps({'status': 'completed', 'action_id': aid,
+                           'can_perform_without_user_input': 'no'})
+
+    run = speech(assistant_script=assistant, verdict_script=verdict)
+    run.turn('hi, I am ready', 'request-1')
+    assert run.state['sends'] == [ASK_LINE]
+    before = len(run.state['steers'])
+    run.turn('ba', 'request-2', kind='reply')
+    assert run.state['sends'] == [ASK_LINE, age_q], run.state['sends']
+    assert not any(subs[2]['description'] in s for s in _substep_steers(run, before)), \
+        'the sub-step after the new question ran before its answer came'
+    assert run.rr.user_tasks[run.key].current_action == 1
+    assert run.L.person_waits_on(run.key, 1, 0) is True
+    assert (run.L.ledger_open_ask(run.key, 1, 0) or {}).get('question') == age_q
+    run.turn('3 years', 'request-3', kind='reply')
+    assert '3 years' in _answers(run), _answers(run)
+    assert run.state['sends'] == [ASK_LINE, age_q], 'nobody is asked again'
+
+
+def test_a_model_that_asks_on_every_steer_asks_once_per_turn(speech):
+    """Review of ede3b91c5, S2b (probe p2): a 'no' step whose model re-sends
+    its question every time it is steered, on the reply turn as well.  The
+    reply turn sends it once (it was three times, once per sub-step) and
+    waits for the person, as the ask turn does."""
+    def assistant(state, aid, content):
+        return _send(state, ASK_LINE) if aid == 1 else None
+
+    run = speech(assistant_script=assistant, verdict_script=_splits_once)
+    run.turn('hi, I am ready', 'request-1')
+    assert run.state['sends'] == [ASK_LINE]
+    run.turn('ba', 'request-2', kind='reply')
+    assert run.state['sends'] == [ASK_LINE] * 2, run.state['sends']
+    assert 'ba' in _answers(run), _answers(run)
+    assert run.L.person_waits_on(run.key, 1, 0) is True
+
+
+def test_the_live_name_step_asks_once_and_takes_the_name(speech):
+    """Review of ede3b91c5, S2d (probe p1): the live flow 0 as banked (every
+    step 'yes'), the 4B sending the name question with expects_reply on every
+    steer of the ask turn, the verifier splitting step 1 once.  One question,
+    the reply saved as the name, and the child's sound next turn is not."""
+    def assistant(state, aid, content):
+        if aid == 1 and state['turn'] == 'ask':
+            return _send(state, NAME_Q)
+        if aid == 1:
+            return 'Thank you, I will call him Arjun.'
+        return None
+
+    def verdict(state, aid, content):
+        if aid == 1 and not state.get('broke'):
+            state['broke'] = True
+            return json.dumps({'status': 'requires_breakdown', 'action_id': 1,
+                               'subtasks': SUBS, 'message': 'split'})
+        return json.dumps({'status': 'completed', 'action_id': aid})
+
+    run = speech(actions=LIVE_FLOW0, assistant_script=assistant, verdict_script=verdict)
+    run.turn('hi', 'request-1')
+    assert run.state['sends'] == [NAME_Q], run.state['sends']
+    assert run.L.person_waits_on(run.key, 1, 0) is True
+    run.turn('Arjun', 'request-2', kind='reply')
+    assert _answers(run) == ['Arjun'], _answers(run)
+    assert run.state['sends'] == [NAME_Q]
+    run.turn('Aaa!', 'request-3', kind='reply')
+    assert 'Aaa!' not in _answers(run), _answers(run)
 
 
 def test_a_step_that_does_not_wait_keeps_every_reprompt(speech):
@@ -224,7 +424,11 @@ def test_a_step_that_does_not_wait_keeps_every_reprompt(speech):
          'can_perform_without_user_input': 'yes', 'recipe': []},
     ], assistant_script=_calls_every_time, verdict_script=_splits_once_needs_nobody)
     run.turn('hi, I am ready', 'request-1')
-    assert run.state['sends'], 'the call went out'
+    # Every re-prompt went out: one call when the step was dispatched and one
+    # each time a sub-step was steered (review of ede3b91c5, S2d), and no
+    # sub-step was held back.
+    assert len(_substep_steers(run)) == len(SUBS), run.state['steers']
+    assert run.state['sends'] == ['Arjun!'] * (1 + len(SUBS)), run.state['sends']
     assert _task(run, 'action_1').blocked_reason != 'input_required'
     assert run.L.person_waits_on(run.key, 1, 0) is False
 

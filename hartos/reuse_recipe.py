@@ -403,6 +403,7 @@ from hartos.lifecycle_hooks import (
     hand_goal_to_its_person,
     mark_action_waiting_for_user, resume_from_user_input,
     record_ask_delivered, ledger_open_ask, person_waits_on, is_terminal_state,
+    record_user_answer,
 )
 from hartos.cultural_wisdom import get_cultural_prompt
 
@@ -6596,11 +6597,10 @@ def _advance_or_steer(user_prompt, action_id, reason, prompt_id,
         # the hand-off to the goal's person); the sub-steps stay pending for
         # the turn that carries the reply.
         # The turn that brings the person's reply to that question works
-        # the sub-steps the reply was waited for; it does not wait again.
-        _gc = getattr(manager, 'groupchat', None)
-        if (not _reuse_reply_evidence(user_prompt, action_id,
-                                      list(getattr(_gc, 'messages', None) or []))
-                and _reuse_note_ask_and_wait(user_prompt, action_id, _gc)):
+        # the sub-steps the reply was waited for, unless one of them asks
+        # again (_reuse_hold_substeps_for_the_reply, the rule BREAKDOWN uses).
+        if _reuse_hold_substeps_for_the_reply(
+                user_prompt, action_id, getattr(manager, 'groupchat', None)):
             current_app.logger.info(
                 f"[SUBTASK-HOLD] action {action_id} keeps {len(_outstanding)} unrun "
                 f"subtask(s) for the person's reply; ending the turn for "
@@ -7366,12 +7366,11 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                     # 2026-11-16, the name asked 8 times in one turn).  Only a
                     # step that waits holds (_reuse_note_ask_and_wait: flag
                     # 'no', a question recorded); one that does not wait keeps
-                    # steering and re-prompting as its action says.
+                    # steering and re-prompting as its action says.  Only a
+                    # question that was SENT holds, the same rule as
+                    # SUBTASK-HOLD (_reuse_hold_substeps_for_the_reply).
                     if (_pending
-                            and not _reuse_reply_evidence(
-                                user_prompt, _reuse_current_action,
-                                list(group_chat.messages or []))
-                            and _reuse_note_ask_and_wait(
+                            and _reuse_hold_substeps_for_the_reply(
                                 user_prompt, _reuse_current_action, group_chat)):
                         current_app.logger.info(
                             f"[BREAKDOWN] action {_reuse_current_action} keeps "
@@ -8897,7 +8896,8 @@ def _reuse_park_for_its_person(user_prompt, action_id, question, request_id,
     return stage
 
 
-def _reuse_note_ask_and_wait(user_prompt, action_id, group_chat, returned_text=None):
+def _reuse_note_ask_and_wait(user_prompt, action_id, group_chat, returned_text=None,
+                             answered=None):
     """At a hold or a turn exit on a PERSON's turn: record the ask this
     step's window delivered, if any, and take the canonical wait when an ask
     is open.  The written answer counts as the ask on a pending verdict, or
@@ -8905,7 +8905,15 @@ def _reuse_note_ask_and_wait(user_prompt, action_id, group_chat, returned_text=N
     High 3).  False on any other turn, so a daemon turn holds nothing, and
     for a step that is over or gave up: its window is no longer a question
     (hartos-00's review of c26ae7932, item 2: a FAILED step kept an open ask
-    recorded from the model's "Arjun replied.")."""
+    recorded from the model's "Arjun replied.").
+
+    ``answered`` is this turn's reply evidence (_reuse_reply_evidence) when
+    the step asked again after reading the reply: the reply is recorded
+    first, through the one writer that closes the ask it answers, so the new
+    question is the open one the next reply answers.  Otherwise the reply
+    is recorded only when the step completes on it, and a hold here left the
+    first ask open, the reply unrecorded, and the next answer filed under the
+    old question (review of ede3b91c5, S2b)."""
     try:
         if not _reuse_person_turn(user_prompt):
             # A background turn that ends with its step's question out, by
@@ -8931,6 +8939,9 @@ def _reuse_note_ask_and_wait(user_prompt, action_id, group_chat, returned_text=N
             return False
         if not _reuse_ask_only_step(user_prompt, action_id, group_chat):
             return False
+        if answered is not None:
+            record_user_answer(user_prompt, action_id, answered.get('reply'),
+                               answered.get('flow'))
         messages = list(getattr(group_chat, 'messages', None) or [])
         written_counts = (_reuse_verdict_is_pending(group_chat)
                           or _reuse_step_names_the_ask_tool(user_prompt, action_id, group_chat))
@@ -8948,6 +8959,35 @@ def _reuse_note_ask_and_wait(user_prompt, action_id, group_chat, returned_text=N
             f"[REUSE-WAIT] action {action_id}: the ask could not be recorded or "
             f"held ({_err!r}); the step stays as the loop left it")
         return False
+
+
+def _reuse_hold_substeps_for_the_reply(user_prompt, action_id, group_chat):
+    """The one rule for both sub-step holds (SUBTASK-HOLD in _advance_or_steer,
+    BREAKDOWN in the loop): True when this step's question reached the person
+    by a send in its window and is not the one this turn's reply answers,
+    after taking the canonical wait (_reuse_note_ask_and_wait); its sub-steps
+    then stay pending for the turn that carries the reply.
+
+    Only a send holds (review of ede3b91c5, M1): a line the model WROTE before
+    the split reached no one, and ending the turn on it showed the person no
+    question and failed the step on their next turn; a written ask is never
+    one a reply can close (_REUSE_ASK_REACHED_THE_PERSON).  On the turn that
+    carries the reply, the send it answers holds nothing; a send after the
+    reply asks again and holds (S2b: a sub-step's own question, "How old is
+    she?", waits for its answer instead of the next sub-step running at once)."""
+    messages = list(getattr(group_chat, 'messages', None) or [])
+    dispatch_index = _reuse_latest_dispatch_index(messages, action_id)
+    if dispatch_index is None:
+        return False
+    sent = _reuse_ask_index(
+        group_chat, messages, dispatch_index, False,
+        step_waits=_reuse_action_declares_user_pause(user_prompt, action_id))
+    if sent is None:
+        return False
+    reply = _reuse_reply_evidence(user_prompt, action_id, messages)
+    if reply is not None and sent[0] <= reply['message_index']:
+        return False
+    return _reuse_note_ask_and_wait(user_prompt, action_id, group_chat, answered=reply)
 
 
 def _reuse_hold_ask_at_turn_exit(user_prompt, group_chat, returned_text=None):
