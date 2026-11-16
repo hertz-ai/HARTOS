@@ -371,10 +371,15 @@ class AutoEvolveOrchestrator:
 
         if not ranked:
             session.status = 'completed'
+            from integrations.social.voting_rules import (
+                evolves_without_vote_here)
             session.errors.append(
                 'No experiment may run here: none met the vote (approval '
-                f'threshold {min_approval_score}) and none is this flat '
-                "node's own")
+                f'threshold {min_approval_score}) and '
+                + ("none is this node's own without a vote against it"
+                   if evolves_without_vote_here() else
+                   'this node is not flat, so every experiment needs the '
+                   'vote'))
             self._emit_event('auto_evolve.none_approved', session)
             return
 
@@ -413,7 +418,7 @@ class AutoEvolveOrchestrator:
                 # whether or not anyone voted.  Off flat, none are.
                 own_ids = set()
                 if evolves_without_vote_here():
-                    own_ids = ThoughtExperimentService.node_own_creator_ids(
+                    own_ids = ThoughtExperimentService.node_held_ids(
                         db, [row[0] for row in db.query(
                             ThoughtExperiment.creator_id)
                             .filter(ThoughtExperiment.status.in_(list(statuses)))
@@ -487,8 +492,10 @@ class AutoEvolveOrchestrator:
             highly-weighted vocal minority flipping a low-participation
             tally into approval;
           - on a FLAT node only, this node's own experiment qualifies with
-            no vote, unless its context requires the steward or a vote is
-            against it (owner rulings 2026-11-14/15).
+            no vote, unless its context requires the steward or a voter is
+            against it (owner rulings 2026-11-14/15).  This cycle is the
+            node asking (asked_by_this_node), and it is paced:
+            max_experiments per cycle, one cycle at a time.
         Vote-approved experiments rank first, by score; this node's own
         follow, by score, then newest first.
 
@@ -511,7 +518,7 @@ class AutoEvolveOrchestrator:
                 approval_verdict, evaluation_permit)
 
             with db_session(commit=False) as db:
-                own_ids = ThoughtExperimentService.node_own_creator_ids(
+                own_ids = ThoughtExperimentService.node_held_ids(
                     db, [exp.get('creator_id') for exp in candidates])
                 for exp in candidates:
                     tally = ThoughtExperimentService.tally_votes(
@@ -528,7 +535,9 @@ class AutoEvolveOrchestrator:
                     # experiment has no score to clear).
                     verdict = approval_verdict(tally)
                     permit = evaluation_permit(
-                        tally, exp.get('creator_id') in own_ids)
+                        tally,
+                        this_nodes_own=exp.get('creator_id') in own_ids,
+                        asked_by_this_node=True)  # this node's own cycle
                     super_ratio = verdict['super_majority']
                     quorate = verdict['quorum_met']
                     by_vote = permit['approved_by_vote'] and score >= min_score
@@ -783,8 +792,10 @@ class AutoEvolveOrchestrator:
             ThoughtExperimentService)
 
         with db_session(commit=False) as db:
+            # This node's own cycle asks: the one caller whose no-vote path
+            # is paced (max_experiments, one cycle at a time).
             result = ThoughtExperimentService.request_agent_evaluation(
-                db, exp['id'])
+                db, exp['id'], this_nodes_cycle=True)
             if result.get('success'):
                 db.commit()
             return result

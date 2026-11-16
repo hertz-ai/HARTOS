@@ -276,14 +276,20 @@ def advance_experiment(experiment_id):
                                methods=['POST'])
 @require_auth
 def evaluate_experiment(experiment_id):
-    """Trigger agent evaluation for an experiment (auth required)."""
+    """Trigger agent evaluation for an experiment (auth required).
+
+    The signed-in account is the asker (voting_rules.evaluation_permit): an
+    experiment the vote approved starts whoever asks; on a flat node this
+    node's own experiment starts with no vote only for an account the node
+    holds (its owner).  Anyone else gets the vote (review rv_9dd0 of
+    9dd0d25d7, F1: a passwordless agent started the node's goals here)."""
     from .models import get_db
     from .thought_experiment_service import ThoughtExperimentService
 
     db = get_db()
     try:
         result = ThoughtExperimentService.request_agent_evaluation(
-            db, experiment_id)
+            db, experiment_id, asked_by=_current_user_id() or None)
         if result.get('success'):
             db.commit()
         return jsonify(result), 200 if result.get('success') else 400

@@ -44,7 +44,7 @@ def create_thought_experiment(creator_id: str, title: str,
         from integrations.social.thought_experiment_service import ThoughtExperimentService
 
         with db_session() as db:
-            if ThoughtExperimentService.node_own_creator_ids(db, [creator_id]):
+            if ThoughtExperimentService.node_held_ids(db, [creator_id]):
                 return json.dumps({
                     'success': False,
                     'reason': 'creator_is_this_node',
