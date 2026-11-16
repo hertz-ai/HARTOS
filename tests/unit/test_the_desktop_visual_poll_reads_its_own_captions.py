@@ -171,6 +171,10 @@ def poll(monkeypatch):
 
     def _post_once(url, **k):
         got['posts'].append(k.get('timeout'))
+        if state.get('server_begins_the_turn'):
+            # What /visual_agent's visual_based_execution does on entry.
+            import time
+            rr._visual_turn_running[(UID, str(PID))] = time.monotonic()
         if state.get('post_raises'):
             raise state['post_raises']
         return _Resp([])
@@ -231,15 +235,34 @@ def test_a_mark_older_than_the_turn_budget_no_longer_holds_the_poll(poll):
 
 
 def test_a_post_that_stops_waiting_is_a_started_turn_not_an_error(poll, caplog):
+    """The server began the turn (it marked itself running) and the POST
+    stopped waiting for it: a turn still running, not a failure."""
+    import logging
+    import time
+    import requests
+    rr, got, state = poll
+    state['rows'] = _rows(3, minutes_ago=1)
+    state['post_raises'] = requests.exceptions.ReadTimeout('read timed out')
+    state['server_begins_the_turn'] = True
+    with caplog.at_level(logging.INFO, logger='hartos.reuse_recipe'):
+        assert rr.call_visual_task('engage', UID, PID) == 'done'
+    assert len(got['posts']) == 1
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+def test_a_post_that_times_out_with_no_turn_running_is_an_error(poll, caplog):
+    """Review of 06f4aaea9, S1a: a server that never began the turn times
+    out too; that is not 'started'."""
     import logging
     import requests
     rr, got, state = poll
     state['rows'] = _rows(3, minutes_ago=1)
     state['post_raises'] = requests.exceptions.ReadTimeout('read timed out')
     with caplog.at_level(logging.INFO, logger='hartos.reuse_recipe'):
-        assert rr.call_visual_task('engage', UID, PID) == 'done'
+        assert rr.call_visual_task('engage', UID, PID) == 'error'
     assert len(got['posts']) == 1
-    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert not [r for r in caplog.records if 'Visual task started' in r.getMessage()]
 
 
 def test_the_visual_turn_marks_itself_running_and_always_clears(monkeypatch):
@@ -258,4 +281,107 @@ def test_the_visual_turn_marks_itself_running_and_always_clears(monkeypatch):
     assert (UID, str(PID)) in seen[0] and rr._visual_turn_running == {}
     with pytest.raises(RuntimeError):
         rr.visual_based_execution('boom', UID, PID)
+    assert rr._visual_turn_running == {}
+
+
+@pytest.fixture
+def blocking_turn(monkeypatch):
+    """visual_based_execution over a _run_visual_turn that holds until
+    released, counting how many turns ran."""
+    import threading
+    from hartos import reuse_recipe as rr
+    monkeypatch.setattr(rr, '_visual_turn_running', {})
+    state = {'runs': 0, 'inside': threading.Event(), 'release': threading.Event(),
+             'each': [threading.Event() for _ in range(4)]}
+
+    def _turn(task, uid, pid):
+        mine = state['each'][state['runs']]
+        state['runs'] += 1
+        state['inside'].set()
+        for _ in range(200):   # ends on the shared release or its own
+            if state['release'].is_set() or mine.wait(0.05):
+                break
+        return 'done'
+
+    monkeypatch.setattr(rr, '_run_visual_turn', _turn)
+    yield rr, state
+    state['release'].set()
+
+
+def test_a_second_visual_turn_while_one_runs_is_not_started(blocking_turn):
+    """Review of 06f4aaea9, S1b: the visual_poll_ and visual_task_ jobs of
+    one person and agent both reach /visual_agent; the second turn does not
+    start, and its return leaves the running turn's mark in place."""
+    import threading
+    rr, state = blocking_turn
+    first = threading.Thread(target=rr.visual_based_execution, args=('engage', UID, PID), daemon=True)
+    first.start()
+    assert state['inside'].wait(10)
+    reply = rr.visual_based_execution('engage', UID, PID)
+    assert state['runs'] == 1, 'a second visual turn ran beside the first'
+    assert 'already running' in reply
+    assert (UID, str(PID)) in rr._visual_turn_running, \
+        "the refused turn cleared the running turn's mark"
+    state['release'].set()
+    first.join(10)
+    assert rr._visual_turn_running == {}
+
+
+def test_two_visual_turns_arriving_together_run_once(blocking_turn, monkeypatch):
+    """The check and the mark are one step: two turns that both look before
+    either marks (held here at the look) still start only one."""
+    import threading
+    rr, state = blocking_turn
+    real_check = rr._visual_turn_is_running
+    both_looked = threading.Barrier(2)
+
+    def _look(uid, pid):
+        seen = real_check(uid, pid)
+        try:
+            both_looked.wait(0.5)
+        except threading.BrokenBarrierError:
+            pass
+        return seen
+
+    monkeypatch.setattr(rr, '_visual_turn_is_running', _look)
+    threads = [threading.Thread(target=rr.visual_based_execution, args=('engage', UID, PID), daemon=True)
+               for _ in range(2)]
+    for t in threads:
+        t.start()
+    assert state['inside'].wait(10)
+    for t in threads:
+        if t.is_alive() and state['runs'] == 1:
+            t.join(2)
+    assert state['runs'] == 1, 'both turns ran'
+    state['release'].set()
+    for t in threads:
+        t.join(10)
+
+
+def test_a_turn_that_ends_late_leaves_the_newer_turns_mark(blocking_turn):
+    """A mark older than the turn budget no longer holds (a turn that never
+    ended must not stop the poll for good), so a newer turn starts beside
+    it; when the old turn finally ends, it clears its own mark only, not
+    the newer turn's (review of 06f4aaea9, S1b)."""
+    import threading
+    import time
+    rr, state = blocking_turn
+    key = (UID, str(PID))
+    old = threading.Thread(target=rr.visual_based_execution, args=('engage', UID, PID), daemon=True)
+    old.start()
+    assert state['inside'].wait(10)
+    rr._visual_turn_running[key] = time.monotonic() - rr._VISUAL_TURN_MAX_S - 1
+    new = threading.Thread(target=rr.visual_based_execution, args=('engage', UID, PID), daemon=True)
+    new.start()
+    for _ in range(100):
+        if state['runs'] == 2:
+            break
+        time.sleep(0.02)
+    assert state['runs'] == 2
+    state['each'][0].set()
+    old.join(10)
+    assert key in rr._visual_turn_running, "the old turn cleared the newer turn's mark"
+    assert rr._visual_turn_is_running(UID, PID)
+    state['each'][1].set()
+    new.join(10)
     assert rr._visual_turn_running == {}

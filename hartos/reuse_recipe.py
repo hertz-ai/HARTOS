@@ -1214,6 +1214,10 @@ _visual_poll_paused_until: dict = {}
 # not stop the poll for good.
 _VISUAL_TURN_MAX_S = 300
 _visual_turn_running: dict = {}
+# The check and the mark are one step (review of 06f4aaea9, S1b): the
+# visual_poll_ and visual_task_ jobs of one person and agent fire together,
+# and both POSTs found no mark and started a turn each.
+_visual_turn_lock = threading.Lock()
 
 
 def _visual_turn_is_running(user_id, prompt_id) -> bool:
@@ -1315,8 +1319,15 @@ def call_visual_task(task_description: str, user_id: int, prompt_id: int):
                     logger.info(f"Visual agent response: {res.status_code}")
                     return 'done'
                 except _requests.exceptions.ReadTimeout:
-                    logger.info("Visual task started; it runs on in the server")
-                    return 'done'
+                    # Started only if the server's turn marked itself
+                    # running: a server that never began the turn timed out
+                    # too (review of 06f4aaea9, S1a).
+                    if _visual_turn_is_running(user_id, prompt_id):
+                        logger.info("Visual task started; it runs on in the server")
+                        return 'done'
+                    logger.error(f"Visual agent did not answer in time and no visual "
+                                 f"turn is running for {user_id}_{prompt_id}")
+                    return 'error'
                 except Exception as e:
                     logger.error(f"Failed to call visual agent: {e}")
                     return 'error'
@@ -1412,13 +1423,26 @@ def get_action_user_details(user_id):
 
 def visual_based_execution(task_description: str, user_id: int, prompt_id: int):
     """One visual turn for a person and agent, marked running while it runs
-    so the 2 s camera poll (call_visual_task) starts no second one."""
+    so the 2 s camera poll (call_visual_task) starts no second one.  A turn
+    that finds another one running does not start, and a turn clears only
+    its own mark (review of 06f4aaea9, S1b: the second turn's end cleared
+    the first one's mark while it still ran)."""
     key = (str(user_id), str(prompt_id))
-    _visual_turn_running[key] = time.monotonic()
+    with _visual_turn_lock:
+        if _visual_turn_is_running(user_id, prompt_id):
+            logger.info(f"A visual turn for {user_id}_{prompt_id} is already "
+                        f"running; this one is not started")
+            return 'A visual turn for this agent is already running.'
+        mark = time.monotonic()
+        _visual_turn_running[key] = mark
     try:
         return _run_visual_turn(task_description, user_id, prompt_id)
     finally:
-        _visual_turn_running.pop(key, None)
+        with _visual_turn_lock:
+            # 'is': the mark this turn wrote, not an equal clock reading
+            # (Windows' monotonic clock moves in 15.6 ms steps).
+            if _visual_turn_running.get(key) is mark:
+                del _visual_turn_running[key]
 
 
 def _run_visual_turn(task_description: str, user_id: int, prompt_id: int):
