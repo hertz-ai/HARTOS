@@ -78,7 +78,7 @@ def _extract_credential(data: dict, meta: dict):
     return cred_key, value
 
 
-def _wire_live_adapter(channel_type: str, credential) -> dict:
+def _wire_live_adapter(channel_type: str, credential, extras: dict = None) -> dict:
     """Construct + register a live channel adapter so inbound messages
     from a freshly-connected token-based channel (Telegram/Discord/Slack/
     ...) actually reach the agent.
@@ -106,14 +106,25 @@ def _wire_live_adapter(channel_type: str, credential) -> dict:
     credential and was never retried until the server restarted.
     An adapter is now reused ONLY when it is both healthy AND holding
     the same credential; otherwise it is torn down and rebuilt.
+
+    ``extras``: the channel's other settings, for a channel started from
+    several (FlaskChannelIntegration._CHANNEL_SPECS extras).  When they name
+    an account (channel_account: email's address), only that account's
+    adapter is replaced; the channel's other accounts keep running.
     """
     if not credential:
         return {'success': True, 'message': 'no credential to wire (binding-only channel)'}
     try:
         import asyncio as _aio
         from integrations.channels.base import ChannelStatus
-        from integrations.channels.flask_integration import get_channel_integration
+        from integrations.channels.flask_integration import (
+            FlaskChannelIntegration, get_channel_integration)
         integration = get_channel_integration()
+        account = FlaskChannelIntegration.channel_account(channel_type, extras)
+
+        def _live():
+            return (integration.registry.get_account(channel_type, account)
+                    if account else integration.registry.get(channel_type))
 
         # The background loop has to exist before EITHER path below:
         # tearing a stale adapter down needs it (stop() is a coroutine),
@@ -128,7 +139,7 @@ def _wire_live_adapter(channel_type: str, credential) -> dict:
             # ensure_running() already warned why.
             return {'success': False, 'error': 'channel event loop failed to start'}
 
-        existing = integration.registry.get(channel_type)
+        existing = _live()
         if existing is not None:
             status = existing.get_status()
             # CONNECTING counts as healthy: an attempt started seconds ago
@@ -152,12 +163,16 @@ def _wire_live_adapter(channel_type: str, credential) -> dict:
                 # An adapter that never finished connecting can fail to shut
                 # down cleanly; that must not block its replacement.
                 logger.warning("stopping stale %s adapter failed: %s", channel_type, e)
-            integration.registry.unregister(channel_type)
+            if account:
+                integration.registry.unregister(channel_type, account=account)
+            else:
+                integration.registry.unregister(channel_type)
 
-        if not integration.register_channel(channel_type, token=credential):
+        if not integration.register_channel(channel_type, token=credential,
+                                            **(extras or {})):
             return {'success': False, 'error': 'register_channel returned False (see server log)'}
 
-        adapter = integration.registry.get(channel_type)
+        adapter = _live()
         if adapter is None:
             logger.warning("%s registered but missing from the registry; the "
                            "binding is saved but not live", channel_type)
@@ -182,6 +197,15 @@ def create_binding():
     meta = get_channel_metadata(channel_type)
     if not meta:
         return jsonify({'success': False, 'error': f'Unknown channel: {channel_type}'}), 400
+
+    # One account of a channel that holds several (an email mailbox, keyed
+    # by its address): this route keeps ONE credential per channel, which
+    # drops the mailbox's other settings.  The mobile setup form sends every
+    # field here, so the account goes to the one writer of such accounts,
+    # the register_channel tool, as the chat form's submit does.
+    from integrations.channels.flask_integration import FlaskChannelIntegration
+    if FlaskChannelIntegration.channel_account(channel_type, data):
+        return _connect_from_form(channel_type, data)
 
     sender_id = data.get('channel_sender_id', '')
     chat_id = data.get('channel_chat_id', '')
@@ -649,9 +673,16 @@ def whatsapp_request_pair_code():
 @require_auth
 def channel_connect_submit(channel_type: str):
     """Register ``channel_type`` for the current user from the form's fields."""
+    return _connect_from_form(channel_type, request.get_json(silent=True) or {})
+
+
+def _connect_from_form(channel_type: str, data: dict):
+    """Hand a setup form's fields to the register_channel tool, as the
+    current user (g.user_id); the Flask reply.  Used by the chat form's
+    submit and by /bindings for one account of a channel that holds several
+    (create_binding)."""
     import json as _json
     from integrations.channels.agent_tools import build_channel_tool_closures
-    data = request.get_json(silent=True) or {}
     config = {k: v for k, v in data.items()
               if k != 'channel_type' and isinstance(v, (str, bool, int, float))}
     tools = build_channel_tool_closures({'user_id': g.user_id, 'prompt_id': None}) or []

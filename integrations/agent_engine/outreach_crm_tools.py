@@ -5,13 +5,16 @@ These tools are loaded ONLY when the agent is working on an 'outreach' goal.
 They connect HARTOS agents to Erxes CRM for:
   - Lead/contact management
   - Deal pipeline tracking
-  - Automated email outreach via cortext@hertzai.com
+  - Automated email outreach, each goal's from the mailbox its config names
+    (sender_email; _send_email)
   - Follow-up sequence automation
   - Reply detection and pipeline stage updates
 
 Integrates with:
   - Erxes GraphQL API (http://192.168.0.9:3300)
-  - HertzAI email service (http://192.168.0.9:4000/sendEmail)
+  - The node's email channel: one adapter per connected mailbox
+  - HertzAI email service (EMAIL_SERVICE_URL), only for email that serves
+    no goal on a node that holds no goal mailbox
 
 Tier 1 (Default): google_search, text_2_image, delegate_to_specialist, etc.
 Tier 2 (Category): create_lead, send_outreach, check_replies, move_deal_stage
@@ -25,7 +28,7 @@ import re
 import threading
 import time
 from datetime import datetime, timedelta
-from typing import Annotated, Optional, Dict, List
+from typing import Annotated, Optional, Dict, List, NamedTuple
 
 logger = logging.getLogger('hevolve_outreach')
 
@@ -52,6 +55,89 @@ NO_EMAIL_SENDER_FIX = (
     'channel (IMAP host, SMTP host, address and password), or point '
     'EMAIL_SERVICE_URL at a mailer this node can reach. Until then do not try '
     'to send again; keep finding and researching prospects.')
+
+#: The channel each mailbox is an account of (ChannelRegistry accounts).
+EMAIL_CHANNEL = 'email'
+#: Longest goal title a refusal quotes, so the refusal fits _SEND_ERROR_CAP.
+_TITLE_CAP = 60
+#: How every per-goal sender refusal ends (owner, 2026-11-16: a goal's
+#: email never falls back to another company's mailbox or the shared mailer).
+_NEVER_ANOTHER_MAILBOX = (
+    ' The email is never sent from another mailbox or the shared mailer '
+    'instead. Do not try to send it again until then; keep researching '
+    'prospects.')
+
+
+class Sender(NamedTuple):
+    """Whom a goal's email goes from: the goal (``goal_id``, ``title``) and
+    the mailbox its config names under "sender_email" (``address``, None
+    when it names none).  ``found`` is False when the goal is not on this
+    node or could not be read."""
+    goal_id: str
+    address: Optional[str]
+    title: str = ''
+    found: bool = True
+
+
+def goal_sender(goal_id) -> Optional[Sender]:
+    """The one reader of a goal's sender: the "sender_email" of its config
+    (AgentGoal.config_json).  None when ``goal_id`` is empty: the email
+    serves no goal.
+
+    Owner, 2026-11-16: central sends the email of every lane, each goal's
+    from the company mailbox its config names (sathish@hevolve.ai for
+    speech and spoken English, registration@mcgroce.com for the HertzAI
+    lanes), and Hevolve mail never goes out from the HertzAI address, nor
+    the reverse."""
+    if not goal_id:
+        return None
+    goal_id = str(goal_id)
+    try:
+        from integrations.social.models import AgentGoal, db_session
+        with db_session(commit=False) as db:
+            goal = db.query(AgentGoal).filter_by(id=goal_id).first()
+            if goal is None:
+                return Sender(goal_id, None, found=False)
+            address = (goal.config_json or {}).get('sender_email')
+            address = address.strip() if isinstance(address, str) else ''
+            return Sender(goal_id, address or None, goal.title or '')
+    except Exception:
+        logger.warning("Goal %s: the mailbox it sends from could not be read",
+                       goal_id, exc_info=True)
+        return Sender(goal_id, None, found=False)
+
+
+def prospect_sender(prospect: Dict) -> Optional[Sender]:
+    """Whom email to ``prospect`` goes from: the sender of the goal the
+    prospect belongs to (its 'goal_id', stamped by the goal turn that
+    created it: _turn_goal_id), or None for a prospect no goal holds.
+    Every send to a prospect resolves its sender here: the agent's
+    send_outreach_email, the follow-up checker and the journey engine."""
+    return goal_sender((prospect or {}).get('goal_id'))
+
+
+def _turn_goal_id() -> Optional[str]:
+    """The goal the running turn works for, when that goal is on this node;
+    None in any other turn.  A goal's turn runs under the request id
+    daemon_<goal id> (core.chat_client.daemon_goal_id), read from the
+    turn's own context (core.llm_outbound_logger.turn_request_id), never a
+    thread's last request, which can name another turn (review of
+    efd223acf)."""
+    from core.chat_client import daemon_goal_id
+    from core.llm_outbound_logger import turn_request_id
+    goal_id = daemon_goal_id(turn_request_id())
+    if not goal_id:
+        return None
+    sender = goal_sender(goal_id)
+    return goal_id if sender is not None and sender.found else None
+
+
+def _for_turn_goal(prospect: Dict, goal_id: Optional[str]) -> Dict:
+    """``prospect`` as one of ``goal_id``'s (its 'goal_id', which
+    prospect_sender reads), unchanged when the turn works for no goal."""
+    if goal_id:
+        prospect['goal_id'] = goal_id
+    return prospect
 
 # ── Thread lock for prospect file access (daemon + request thread) ──
 _prospect_lock = threading.Lock()
@@ -143,15 +229,106 @@ def _sanitize_html(html_body: str) -> str:
     return cleaned
 
 
-def _send_email(to_email: str, subject: str, html_body: str) -> Dict:
-    """Send email via the channel system (user's configured SMTP).
+def _refused_send(problem: str, fix: str) -> Dict:
+    """A send that was not tried, in _send_email's result shape: what was
+    wrong (``error``) and what the owner does about it (``fix``), read by
+    _send_error_text (owner rule 2026-11-09: a refusal says both)."""
+    return {'success': False, 'via': 'no sender', 'error': problem, 'fix': fix}
 
-    Tries the email channel adapter first (user's own SMTP config).
-    Falls back to the HertzAI mailer service if no email channel is configured.
+
+def _goal_mailboxes() -> Dict:
+    """The mailboxes this node holds for goals: {address: adapter}."""
+    try:
+        from integrations.channels.flask_integration import get_channel_integration
+        boxes = get_channel_integration().registry.accounts(EMAIL_CHANNEL)
+        return boxes if isinstance(boxes, dict) else {}
+    except Exception:
+        logger.warning("The node's goal mailboxes could not be read",
+                       exc_info=True)
+        return {}
+
+
+def _send_from_goal_mailbox(sender: Sender, to_email: str, subject: str,
+                            plain_text: str, html: str) -> Dict:
+    """Send a goal's email from the mailbox its config names, and from no
+    other; refuse, saying what to fix, when it names none, the goal is not
+    here, or that mailbox is not connected.  Never the mailer."""
+    title = (sender.title or sender.goal_id)[:_TITLE_CAP]
+    if not sender.found:
+        return _refused_send(
+            f"the goal this email is for ({sender.goal_id}) is not on this "
+            f"node or could not be read, so the mailbox it goes from is unknown",
+            "Create the prospect again in the turn of the goal it is for, so it "
+            "carries that goal." + _NEVER_ANOTHER_MAILBOX)
+    if not sender.address:
+        return _refused_send(
+            f"goal '{title}' names no mailbox: its config has no sender_email",
+            "The owner adds \"sender_email\" (the address this goal's email "
+            "goes from) to the goal's config, and connects that mailbox in "
+            "the channel setup form." + _NEVER_ANOTHER_MAILBOX)
+    adapter = loop = None
+    try:
+        from integrations.channels.flask_integration import get_channel_integration
+        integration = get_channel_integration()
+        adapter = integration.registry.get_account(EMAIL_CHANNEL, sender.address)
+        loop = integration.running_loop()
+    except Exception:
+        logger.warning("The mailbox of goal %s could not be looked up",
+                       sender.goal_id, exc_info=True)
+    if (adapter is None or loop is None or not hasattr(adapter, 'send_email')
+            or not adapter.is_running()):
+        return _refused_send(
+            f"the mailbox {sender.address} that goal '{title}' sends from is "
+            f"not connected on this node",
+            f"Connect {sender.address} in the channel setup form (Email: IMAP "
+            f"server, SMTP server, address and password)."
+            + _NEVER_ANOTHER_MAILBOX)
+    import asyncio
+    try:
+        result = asyncio.run_coroutine_threadsafe(
+            adapter.send_email(to=to_email, subject=subject,
+                               body=plain_text, html_body=html),
+            loop).result(timeout=30)
+    except Exception as e:
+        return {'success': False, 'via': 'email_channel',
+                'from': sender.address, 'error': str(e) or type(e).__name__}
+    return {'success': result.success, 'via': 'email_channel',
+            'from': sender.address,
+            'error': result.error if not result.success else None}
+
+
+def _send_email(to_email: str, subject: str, html_body: str,
+                sender: Optional[Sender] = None) -> Dict:
+    """Send one outreach email from the mailbox it belongs to.
+
+    ``sender``: the goal the email is for and the mailbox its config names
+    (prospect_sender / goal_sender, the one reader of a goal's
+    sender_email).  A goal's email goes from that mailbox only; when the
+    goal names none, is not on this node, or its mailbox is not connected
+    here, the send is refused with what to fix, and never sent from another
+    mailbox or the mailer (owner, 2026-11-16).
+
+    No sender: the email serves no goal.  It goes through the node's own
+    email channel, else the HertzAI mailer, as every send did before
+    senders were per goal; refused on a node that holds goal mailboxes,
+    since which one it should go from cannot be told.
     """
     sanitized_body = _sanitize_html(html_body)
     # Strip HTML for plain-text fallback
     plain_text = re.sub(r'<[^>]+>', '', sanitized_body).strip()
+
+    if sender is not None:
+        return _send_from_goal_mailbox(sender, to_email, subject,
+                                       plain_text, sanitized_body)
+    mailboxes = _goal_mailboxes()
+    if mailboxes:
+        return _refused_send(
+            f"this email is for no goal, and this node sends only goals' "
+            f"email, each from its goal's own mailbox ({len(mailboxes)} "
+            f"connected)",
+            "Create or import the prospect in the turn of the goal it is for; "
+            "its email then goes from that goal's sender_email. No mailbox is "
+            "guessed for it." + _NEVER_ANOTHER_MAILBOX)
 
     # Tier 1: Email channel adapter (user's SMTP), run on the channel
     # integration's loop, which owns the adapters (ChannelRegistry has none).
@@ -386,7 +563,7 @@ def register_outreach_tools(helper, assistant, user_id: str):
         data = _load_prospects()
         prospect_id = f"{company.lower().replace(' ', '_')}_{int(time.time())}"
 
-        prospect = {
+        prospect = _for_turn_goal({
             'id': prospect_id,
             'company': company,
             'contact_name': contact_name,
@@ -402,7 +579,7 @@ def register_outreach_tools(helper, assistant, user_id: str):
             'emails_sent': 0,
             'last_email_at': None,
             'last_reply_at': None,
-        }
+        }, _turn_goal_id())
 
         data['prospects'][prospect_id] = prospect
         _save_prospects(data)
@@ -425,9 +602,9 @@ def register_outreach_tools(helper, assistant, user_id: str):
     ) -> str:
         """Send an outreach email to a prospect and log it.
 
-        Sends through this node's email sender: its connected email
-        channel, else the HertzAI mailer.  A refused send says why and, when
-        no sender exists, what the owner sets up.
+        Sends from the mailbox of the prospect's goal (the sender_email its
+        config names); a prospect no goal holds goes through this node's own
+        email sender.  A refused send says why and what the owner sets up.
         Updates prospect stage to 'contacted' on first email.
         """
         data = _load_prospects()
@@ -435,11 +612,11 @@ def register_outreach_tools(helper, assistant, user_id: str):
         if not prospect:
             return json.dumps({'success': False, 'error': f'Prospect {prospect_id} not found'})
 
-        # Send via HertzAI
         result = _send_email(
             to_email=prospect['email'],
             subject=subject,
             html_body=body_html,
+            sender=prospect_sender(prospect),
         )
         if not result.get('success'):
             # Not sent: the prospect stays as it was and the agent reads
@@ -677,6 +854,9 @@ def register_outreach_tools(helper, assistant, user_id: str):
 
         imported, skipped, failed = [], [], []
         created_sequences = []
+        # Every row imported in a goal's turn is that goal's prospect: its
+        # email goes from the goal's own mailbox (prospect_sender).
+        turn_goal = _turn_goal_id()
 
         for idx, row in enumerate(rows):
             try:
@@ -691,7 +871,7 @@ def register_outreach_tools(helper, assistant, user_id: str):
                     continue
 
                 prospect_id = f"{company.lower().replace(' ', '_')}_{int(time.time()*1000)}_{idx}"
-                prospect = {
+                prospect = _for_turn_goal({
                     'id': prospect_id,
                     'company': company,
                     'contact_name': contact_name,
@@ -707,7 +887,7 @@ def register_outreach_tools(helper, assistant, user_id: str):
                     'emails_sent': 0,
                     'last_email_at': None,
                     'last_reply_at': None,
-                }
+                }, turn_goal)
                 data['prospects'][prospect_id] = prospect
                 existing_emails.add(email.lower())
                 imported.append({'row': idx, 'id': prospect_id,
@@ -885,6 +1065,7 @@ def send_due_followups(data: Dict, now: datetime,
                 to_email=prospect['email'],
                 subject=step['subject'],
                 html_body=step['body_html'],
+                sender=prospect_sender(prospect),
             )
             if result.get('success'):
                 step['status'] = 'sent'
@@ -1125,35 +1306,40 @@ def _dispatch_response_draft(prospect: Dict, context: Dict):
         logger.error(f"Failed to dispatch response draft: {e}")
 
 
+async def _outreach_reply_hook(message):
+    """Post-process an inbound email for prospect matching: the Message the
+    email adapter builds, the subject in ``raw``, the message id in ``id``."""
+    sender = getattr(message, 'sender_id', '') or ''
+    subject = (getattr(message, 'raw', None) or {}).get('subject', '')
+    body = getattr(message, 'text', '') or ''
+    msg_id = getattr(message, 'id', '') or ''
+    if '@' in sender:
+        handle_inbound_email(sender, subject, body, msg_id)
+
+
 def register_reply_handler():
-    """Register the inbound email handler with the email channel adapter,
-    once per adapter.
+    """Register the inbound email handler with every email adapter: the
+    node's own email channel and each goal mailbox (ChannelRegistry
+    accounts), once per adapter, so a reply to any of them reaches its
+    prospect.
 
     Called at boot (from register_outreach_goal_type), before channels are
     restored, and again on every outreach tick
-    (check_pending_followups_daemon), which is what attaches it once the
-    email channel is up.  The hook reads the Message the email adapter
-    builds: the subject in ``raw``, the message id in ``id``.
+    (check_pending_followups_daemon), which is what attaches it once a
+    mailbox is up, and to each mailbox connected later.
     """
     try:
         from integrations.channels.registry import get_registry
-        adapter = get_registry().get('email')
-        if adapter is None or not hasattr(adapter, 'on_message'):
-            return
-        if getattr(adapter, '_outreach_reply_hooked', False):
-            return
-
-        async def _outreach_reply_hook(message):
-            """Post-process inbound emails for prospect matching."""
-            sender = getattr(message, 'sender_id', '') or ''
-            subject = (getattr(message, 'raw', None) or {}).get('subject', '')
-            body = getattr(message, 'text', '') or ''
-            msg_id = getattr(message, 'id', '') or ''
-            if '@' in sender:
-                handle_inbound_email(sender, subject, body, msg_id)
-
-        adapter.on_message(_outreach_reply_hook)
-        adapter._outreach_reply_hooked = True
-        logger.info("Outreach reply handler registered with email adapter")
+        registry = get_registry()
+        adapters = [registry.get(EMAIL_CHANNEL)]
+        adapters += list(registry.accounts(EMAIL_CHANNEL).values())
+        for adapter in adapters:
+            if adapter is None or not hasattr(adapter, 'on_message'):
+                continue
+            if getattr(adapter, '_outreach_reply_hooked', False):
+                continue
+            adapter.on_message(_outreach_reply_hook)
+            adapter._outreach_reply_hooked = True
+            logger.info("Outreach reply handler registered with an email adapter")
     except Exception as e:
         logger.warning(f"Could not register the outreach reply handler: {e}")

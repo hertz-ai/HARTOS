@@ -428,8 +428,10 @@ class JourneyEngine:
         """Send a message via a specific channel adapter."""
         if channel == 'email':
             try:
-                from integrations.agent_engine.outreach_crm_tools import _send_email
-                result = _send_email(prospect['email'], 'Update from HevolveAI', message)
+                from integrations.agent_engine.outreach_crm_tools import (
+                    _send_email, prospect_sender)
+                result = _send_email(prospect['email'], 'Update from HevolveAI',
+                                     message, sender=prospect_sender(prospect))
                 return {'success': result.get('success', False), 'channel': 'email'}
             except Exception as e:
                 return {'success': False, 'error': str(e)}
@@ -567,7 +569,8 @@ class JourneyEngine:
 
         try:
             from integrations.agent_engine.outreach_crm_tools import (
-                _send_email, count_delivered, note_refused, retry_due)
+                _send_email, count_delivered, note_refused, prospect_sender,
+                retry_due)
             if draft.get('status') == 'failed':
                 return {'skipped': True, 'reason': 'given up',
                         'error': draft.get('last_error')}
@@ -575,7 +578,8 @@ class JourneyEngine:
             if not retry_due(draft, now):
                 return {'skipped': True, 'reason': 'waiting to try again',
                         'retry_after': draft.get('retry_after')}
-            result = _send_email(prospect['email'], draft['subject'], draft['body'])
+            result = _send_email(prospect['email'], draft['subject'], draft['body'],
+                                 sender=prospect_sender(prospect))
             # 'via' names the sender on a refused send too: only success
             # counts as sent.
             if result.get('success'):
@@ -654,7 +658,8 @@ class JourneyEngine:
             return {'skipped': True}
 
         try:
-            from integrations.agent_engine.outreach_crm_tools import _send_email
+            from integrations.agent_engine.outreach_crm_tools import (
+                _send_email, prospect_sender)
             result = _send_email(
                 prospect['email'],
                 're: HARTOS partnership',
@@ -665,6 +670,7 @@ class JourneyEngine:
                 '</ul>'
                 '<p>happy to adjust to your timezone.</p>'
                 '<p>sathish</p>',
+                sender=prospect_sender(prospect),
             )
             # Proposed only when the email went out.  A refused proposal is
             # not retried on its own: tick() has no 'engaged' branch, so

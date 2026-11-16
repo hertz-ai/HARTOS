@@ -73,7 +73,7 @@ def _emit_to_user(owner, payload: dict) -> None:
 
 def _report_when_live(channel_type: str, meta: dict, owner,
                       wait_seconds: float = _LIVE_WAIT_SECONDS,
-                      poll_seconds: float = 1.0) -> bool:
+                      poll_seconds: float = 1.0, account=None) -> bool:
     """Watch a just-started adapter and tell the user how it ended.
 
     register_channel schedules adapter.start() on the channel loop and
@@ -83,17 +83,24 @@ def _report_when_live(channel_type: str, meta: dict, owner,
     time: an error toast in chat plus a channel_unhealthy fleet banner on the
     user's other devices, with the adapter's own status as the reason.
     Returns whether it connected.  Runs on a daemon thread.
+
+    ``account``: for a channel that holds several (email), the account just
+    started; it is the one watched, and named in what the user is told.
     """
     import time as _time
     from integrations.channels.base import ChannelStatus
     from integrations.channels.registry import get_registry
 
     name = meta.get('display_name') or channel_type
+    if account:
+        name = f"{name} ({account})"
     deadline = _time.monotonic() + wait_seconds
     status = None
     while True:
         try:
-            adapter = get_registry().get(channel_type)
+            registry = get_registry()
+            adapter = (registry.get_account(channel_type, account) if account
+                       else registry.get(channel_type))
             status = adapter.get_status() if adapter is not None else None
         except Exception as e:
             # Unknown this round; the deadline still ends the watch loudly.
@@ -238,14 +245,17 @@ def _owner_value_fingerprint(channel_type: str, meta: dict):
         return None
 
 
-def _watch_start(channel_type: str, meta: dict, owner, fp=None) -> int:
+def _watch_start(channel_type: str, meta: dict, owner, fp=None,
+                 account=None) -> int:
     """Record a just-scheduled start of ``channel_type`` (``fp``: the
     credential_fingerprint of the value it started with) as being watched,
     then watch it on a daemon thread (_report_when_live) and record how it
     ended.  Returns the start's number.  A later start replaces the record;
     an earlier watcher ending after that leaves the later record alone.
     The owner's stored value at this moment is kept beside it ('owner_fp'),
-    so a later change of that value, by any path, is seen as theirs."""
+    so a later change of that value, by any path, is seen as theirs.
+    ``account``: the account started, for a channel that holds several
+    (_report_when_live watches that one)."""
     owner_fp = _owner_value_fingerprint(channel_type, meta)
     with _STARTS_LOCK:
         start = next(_START_NUMBERS)
@@ -256,7 +266,9 @@ def _watch_start(channel_type: str, meta: dict, owner, fp=None) -> int:
     def _watch():
         connected = False
         try:
-            connected = bool(_report_when_live(channel_type, meta, owner))
+            connected = bool(_report_when_live(
+                channel_type, meta, owner,
+                **({'account': account} if account else {})))
         except Exception:
             logger.warning("%s: start watcher failed; the start counts as "
                            "failed", channel_type, exc_info=True)
@@ -595,8 +607,21 @@ def build_channel_tool_closures(ctx):
             # place the /bindings form stores it, so a channel connected
             # from chat or OAuth comes back after a restart.  Encrypted when
             # the vault has a key (seal_binding_credential).
+            from integrations.channels.flask_integration import (
+                FlaskChannelIntegration)
+            # A channel that holds several accounts (email: one mailbox per
+            # address) keeps each on its own binding, under the account, with
+            # every setting its adapter is started from (sealed as in
+            # ``saved``): boot restore rebuilds each account from its row, and
+            # a second mailbox never overwrites the first's.
+            account = FlaskChannelIntegration.channel_account(channel_type, config)
             cred_meta = {}
-            if (len(required) == 1 and meta['auth_method'] != 'gateway_qr'
+            if account:
+                cred_meta = {
+                    k: saved[k] for k in sorted(
+                        FlaskChannelIntegration.credential_metadata_keys(channel_type))
+                    if config.get(k)}
+            elif (len(required) == 1 and meta['auth_method'] != 'gateway_qr'
                     and config.get(required[0])):
                 cred_meta = {required[0]: saved[required[0]]}
 
@@ -607,14 +632,16 @@ def build_channel_tool_closures(ctx):
                     from integrations.social.models import get_db, UserChannelBinding
                     db = get_db()
                     try:
+                        _row = {'user_id': str(uid), 'channel_type': channel_type}
+                        if account:
+                            _row['channel_sender_id'] = account
                         existing = db.query(UserChannelBinding).filter_by(
-                            user_id=str(uid), channel_type=channel_type,
-                        ).first()
+                            **_row).first()
                         if not existing:
                             db.add(UserChannelBinding(
                                 user_id=str(uid),
                                 channel_type=channel_type,
-                                channel_sender_id='agent_registered',
+                                channel_sender_id=account or 'agent_registered',
                                 auth_method=meta['auth_method'],
                                 metadata_json=cred_meta or None,
                                 is_active=True,
@@ -649,6 +676,30 @@ def build_channel_tool_closures(ctx):
                 # starts the link says which.
                 return (f"{name} registered and enabled! Auth: gateway_qr. "
                         f"Link it from your phone to finish.")
+
+            if account:
+                # One account of a channel that holds several (an email
+                # mailbox), started live from all its settings, beside the
+                # channel's other accounts (owner, 2026-11-16: central holds
+                # one mailbox per company and sends each goal's mail from its
+                # own).  The same wiring as below, given every setting.
+                from integrations.social.api_channels import _wire_live_adapter
+                token, extras = FlaskChannelIntegration._binding_credentials(
+                    channel_type, config)
+                label = f"{name} ({account})"
+                wired = _wire_live_adapter(channel_type, token, extras)
+                if not wired.get('success'):
+                    logger.warning("register_channel: %s saved but not started: %s",
+                                   label, wired.get('error'))
+                    return (f"{label} was saved, but it could not be started: "
+                            f"{wired.get('error')}. Nothing will be sent or "
+                            f"received on it until this is fixed.")
+                _watch_start(channel_type, meta,
+                             user_id or _get_user_id_from_threadlocal() or None,
+                             account=account)
+                return (f"{label} registered and enabled! Auth: "
+                        f"{meta['auth_method']}. Connecting now; you'll see a "
+                        f"confirmation here once it's live.")
 
             blocker = chat_connect_blocker(channel_type, meta)
             if blocker and blocker[0] == SEVERAL_CREDENTIALS:

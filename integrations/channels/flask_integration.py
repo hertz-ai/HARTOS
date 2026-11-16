@@ -482,7 +482,27 @@ class FlaskChannelIntegration:
     #          (param doubles as the caller-supplied kwarg name)
     #          resolution order per extra: explicit kwarg -> env -> default;
     #          a missing `required` extra skips registration with a warning.
+    #   account_param: for a channel that holds several accounts on one node,
+    #          the setting that names the account (channel_account); each
+    #          account gets its own adapter (ChannelRegistry accounts).
     _CHANNEL_SPECS: Dict[str, Dict[str, Any]] = {
+        'email': {
+            # One mailbox per adapter (EmailAdapter: one IMAP + SMTP login),
+            # and a node may hold several, keyed by address: central sends
+            # each goal's mail from the mailbox its config names (owner,
+            # 2026-11-16).  The "token" is the IMAP host, the first field of
+            # the setup form, which is what the bindings form already hands
+            # over; the extras are optional so a node that keeps them in the
+            # environment (create_email_adapter's EMAIL_* fallback) still
+            # registers exactly as before.
+            'token_param': 'imap_host',
+            'account_param': 'email_address',
+            'extra': [
+                {'param': 'smtp_host'},
+                {'param': 'email_address'},
+                {'param': 'password'},
+            ],
+        },
         'slack': {
             'token_param': 'bot_token',
             'extra': [
@@ -694,7 +714,13 @@ class FlaskChannelIntegration:
                 call_kwargs.update(self._credential_kwarg(factory_fn, token))
 
             adapter = factory_fn(**call_kwargs)
-            self.registry.register(adapter)
+            account = self.channel_account(channel_type, call_kwargs)
+            if account is None:
+                self.registry.register(adapter)
+            else:
+                # Beside the channel's other accounts: a second mailbox never
+                # replaces the first.
+                self.registry.register(adapter, account=account)
             logger.info(f"{channel_type} adapter registered")
             return True
         except Exception as e:
@@ -723,6 +749,21 @@ class FlaskChannelIntegration:
                 continue
             unmet.append(p.get('env') or p['param'])
         return unmet
+
+    @classmethod
+    def channel_account(cls, channel_type: str,
+                        settings: Dict[str, Any] = None) -> Optional[str]:
+        """The account ``settings`` connect, for a channel that holds several
+        on one node (its spec's ``account_param``: email's address),
+        normalised as the registry keys it; None for every other channel and
+        for settings that name no account.  The one reader: register_channel
+        registers the adapter under it, and the connect form, live wiring and
+        boot restore find that account's adapter and binding by it."""
+        from .registry import normalize_account
+        param = (cls._CHANNEL_SPECS.get(channel_type) or {}).get('account_param')
+        if not param:
+            return None
+        return normalize_account((settings or {}).get(param))
 
     @staticmethod
     def _credential_kwarg(factory_fn, token: str) -> Dict[str, str]:
@@ -1090,7 +1131,9 @@ class FlaskChannelIntegration:
         on adapter.name), so where several bindings share a channel_type the
         most recently updated active one wins — the same row a manual rebind
         would pick.  Channels already registered are left alone, so explicit
-        env/code registration keeps precedence and this is idempotent.
+        env/code registration keeps precedence and this is idempotent.  A
+        channel that holds several accounts (_CHANNEL_SPECS account_param:
+        email) is restored per account instead (_restore_accounts).
 
         Never raises: a binding that cannot be restored is logged and skipped,
         because one bad row must not stop the server from booting.
@@ -1142,6 +1185,12 @@ class FlaskChannelIntegration:
                         continue
                     if ct not in self._ADAPTER_FACTORIES:
                         summary['skipped'][ct] = 'no adapter factory'
+                        continue
+                    if (self._CHANNEL_SPECS.get(ct) or {}).get('account_param'):
+                        restored, reason = self._restore_accounts(ct, candidates)
+                        summary['restored'].extend([ct] * restored)
+                        if reason:
+                            summary['skipped'][ct] = reason
                         continue
                     if self.registry.get(ct) is not None:
                         summary['skipped'][ct] = 'already registered'
@@ -1200,6 +1249,33 @@ class FlaskChannelIntegration:
                 f"(skipped: {summary['skipped'] or 'none'})"
             )
         return summary
+
+    def _restore_accounts(self, channel_type: str, candidates: list) -> tuple:
+        """Restore every account of a channel that holds several (email):
+        each from the newest of its bindings (``candidates`` come newest
+        first) that carries a credential and names the account.  Returns
+        ``(how many were registered, why the channel is not fully back or
+        None)``; an account already registered is left alone."""
+        restored, seen, failed, already = 0, set(), False, False
+        for row in candidates:
+            meta = unseal_binding_metadata(channel_type, row.metadata_json)
+            token, extras = self._binding_credentials(channel_type, meta)
+            account = self.channel_account(channel_type, extras)
+            if not token or account is None or account in seen:
+                continue
+            seen.add(account)
+            if self.registry.get_account(channel_type, account) is not None:
+                already = True
+                continue
+            if self.register_channel(channel_type, token=token, **extras):
+                restored += 1
+            else:
+                failed = True       # register_channel already logged why
+        if failed:
+            return restored, 'registration failed'
+        if not restored:
+            return 0, 'already registered' if already else 'no stored credential'
+        return restored, None
 
     def start(self) -> None:
         """Start all channel adapters in background thread."""
