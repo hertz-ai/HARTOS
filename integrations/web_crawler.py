@@ -630,6 +630,13 @@ def crawl_url_for_agent(url: str, timeout: int = 30) -> str:
     else:
         parts.append(f"FAILED: {url}")
         parts.append(f"Error: {result['error']}")
+        # Owner rule 2026-11-09: a refusal says what to do.  Live 2026-11-16
+        # the desktop 4B crawled two page paths it made up (both 404) and the
+        # step was given up with nothing telling it why.
+        parts.append(
+            "What to do: crawl a link exactly as the search results gave it; "
+            "never guess or edit a page path. If no result link can be read, "
+            "say so plainly instead of answering from memory.")
 
     return "\n".join(parts)
 
