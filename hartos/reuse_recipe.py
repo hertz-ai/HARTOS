@@ -6503,7 +6503,11 @@ def _advance_or_steer(user_prompt, action_id, reason, prompt_id,
         True  — the next action's message, or a re-steer, was posted; the
                 caller should keep looping.
         False — no next action and nothing to steer; the caller should end
-                the turn.
+                the turn.  Also when the action's question to the person is
+                out and its sub-steps wait for the reply: the four callers
+                `break` to the exit every break reaches, where
+                _reuse_hold_ask_at_turn_exit takes the same wait again (a
+                no-op once held) and nothing records the action or flow done.
 
     False is what a SUCCESSFULLY FINISHED recipe looks like: the last action
     advanced, so there is no next action, and it was not fabricated, so
@@ -6541,13 +6545,29 @@ def _advance_or_steer(user_prompt, action_id, reason, prompt_id,
         if LedgerTaskStatus is not None else []
     if _outstanding:
         _next_sub = _outstanding[0]
+        if advanced_latch is not None:
+            advanced_latch.discard(action_id)
+        # A step whose question to the person is out waits for the answer
+        # before its own sub-steps run: they are the model's split of this
+        # step and some need the reply ("Once the child's name is received,
+        # ...").  Steering them asked the person again and again in one turn
+        # (live 2026-11-16, speech agent 1794540972213, 8 asks in one turn,
+        # no [REUSE-WAIT]).  The one helper for "at a hold or a turn exit"
+        # records the ask and takes the canonical wait (on a background turn,
+        # the hand-off to the goal's person); the sub-steps stay pending for
+        # the turn that carries the reply.
+        if _reuse_note_ask_and_wait(user_prompt, action_id,
+                                    getattr(manager, 'groupchat', None)):
+            current_app.logger.info(
+                f"[SUBTASK-HOLD] action {action_id} keeps {len(_outstanding)} unrun "
+                f"subtask(s) for the person's reply; ending the turn for "
+                f"session: {user_prompt}")
+            return False
         current_app.logger.info(
             f"[SUBTASK-HOLD] action {action_id} keeps {len(_outstanding)} unrun "
             f"subtask(s) (closed={_closed_subtask}); steering "
             f"'{str(_next_sub.description)[:60]}' instead of advancing "
             f"for session: {user_prompt}")
-        if advanced_latch is not None:
-            advanced_latch.discard(action_id)
         _narrow_assistant_to_current_action(user_prompt)
         chat_instructor.initiate_chat(
             recipient=manager,
