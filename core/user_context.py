@@ -95,6 +95,12 @@ DEFAULT_BUDGET_SECONDS = 1.5
 #: the session that's driving the UI.
 MAX_CACHED_USERS = 256
 
+#: The newest camera captions any one read hands the model: the camera
+#: tool (hartos.helper.get_visual_context, its old ``[:10]``) and the
+#: five-minute camera window below.  A busy scene writes a caption every
+#: 4 s, 73 in five minutes (2,276 tokens; review of HARTOS 65ffa46b7).
+CAMERA_WINDOW_MAX_CAPTIONS = 10
+
 #: Actions the agent system produces as noise during training and
 #: should not be echoed back to the LLM as "past user actions".
 _UNWANTED_ACTIONS = frozenset([
@@ -319,6 +325,26 @@ def _format_action_simple(raw_actions: list) -> str:
     return ", ".join(texts)
 
 
+def _age(date) -> timedelta:
+    """How long ago ``date`` was, read in its own frame: a stamp that names
+    its zone against the UTC clock, a naive one against the local clock (as
+    before).  Nunba writes created_date in UTC ('...+00:00'), and the windows
+    below compared it, zone dropped, with the naive local clock: on a desktop
+    east of UTC every caption looked hours old and the camera and screen
+    windows were always empty (IST: 5.5 h; measured 2026-11-11 on the
+    owner's desktop), and west of UTC every caption ever written stayed in."""
+    if date.tzinfo is not None:
+        return datetime.now(pytz.utc) - date
+    return datetime.now() - date
+
+
+#: The camera window's tags in the rendered context.  A reader that takes the
+#: window alone (reuse_recipe's turn seed) imports these, so a renamed tag
+#: cannot silently empty it (review of HARTOS 65ffa46b7, mutant M2d).
+VISUAL_WINDOW_START = '<Last_5_Minutes_Visual_Context_Start>'
+VISUAL_WINDOW_END = '<Last_5_Minutes_Visual_Context_End>'
+
+
 def _format_action_rich(raw_actions: list) -> str:
     """REUSE-mode action formatter with dedup + visual + screen context.
 
@@ -332,7 +358,6 @@ def _format_action_rich(raw_actions: list) -> str:
       style questions.
     """
     tz = _get_tz()
-    now = datetime.now()
 
     filtered = [
         obj for obj in raw_actions
@@ -372,22 +397,30 @@ def _format_action_rich(raw_actions: list) -> str:
             action_texts.append(f"{action} on {last_r.strftime('%Y-%m-%dT%H:%M:%S')}")
 
     # Visual context window (last 5 minutes).
-    video_texts = []
+    video_rows = []
     for obj in filtered_video:
         try:
             date = parse_date(obj["created_date"])
         except Exception:
             continue
+        age = _age(date)
         if obj.get("gpt3_label") == 'Visual Context':
-            if (now - date.replace(tzinfo=None)) > timedelta(minutes=5):
+            if age > timedelta(minutes=5):
                 continue
         date_r = date.astimezone(tz) if tz else date
-        video_texts.append(
-            f"{obj.get('action', '')} on {date_r.strftime('%Y-%m-%dT%H:%M:%S')}")
+        video_rows.append(
+            (age, f"{obj.get('action', '')} on {date_r.strftime('%Y-%m-%dT%H:%M:%S')}"))
+    # The newest CAMERA_WINDOW_MAX_CAPTIONS only, in the order they came: a
+    # busy scene wrote 73 captions in five minutes (2,276 tokens, all in the
+    # head of the message that the per-message token cap keeps whole; review
+    # of 65ffa46b7).
+    newest = set(sorted(range(len(video_rows)),
+                        key=lambda i: video_rows[i][0])[:CAMERA_WINDOW_MAX_CAPTIONS])
+    video_texts = [text for i, (_age_of, text) in enumerate(video_rows) if i in newest]
     if video_texts:
-        action_texts.append('<Last_5_Minutes_Visual_Context_Start>')
+        action_texts.append(VISUAL_WINDOW_START)
         action_texts.extend(video_texts)
-        action_texts.append('<Last_5_Minutes_Visual_Context_End>')
+        action_texts.append(VISUAL_WINDOW_END)
         action_texts.append(
             "If a person is identified in Visual_Context section "
             "that's most probably the user (me) & most likely not "
@@ -400,7 +433,7 @@ def _format_action_rich(raw_actions: list) -> str:
             date = parse_date(obj["created_date"])
         except Exception:
             continue
-        if (now - date.replace(tzinfo=None)) > timedelta(minutes=2):
+        if _age(date) > timedelta(minutes=2):
             continue
         date_r = date.astimezone(tz) if tz else date
         screen_texts.append(

@@ -1177,6 +1177,21 @@ def _can_fit_on_gpu(engine_id: str) -> bool:  # TODO REFACTOR: remove — duplic
         return False
 
 
+def gpu_preferred_device(engine_id: str) -> str:
+    """The torch device a GPU_PREFERRED engine's worker loads on: 'cuda' when
+    torch sees a GPU with room for it (_can_fit_on_gpu, this router's own
+    rule), else 'cpu'.  The workers took CUDA whenever a GPU was visible, so
+    on a GPU the local LLMs had filled (1 GB of 8 free on the owner's desktop,
+    14 Nov 2026) an engine this registry says runs on the CPU loaded onto the
+    full GPU instead (review of Nunba f885318e)."""
+    try:
+        import torch
+        has_cuda = bool(torch.cuda.is_available())
+    except Exception:
+        has_cuda = False
+    return 'cuda' if has_cuda and _can_fit_on_gpu(engine_id) else 'cpu'
+
+
 def _get_compute_policy() -> Dict[str, Any]:
     """Get user's compute policy (local_only / local_preferred / any)."""
     try:

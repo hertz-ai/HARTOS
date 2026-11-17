@@ -141,10 +141,33 @@ def pipelines(create_env, tmp_path, monkeypatch):
 
 
 def test_a_plan_that_names_people_gives_the_agent_its_own_role(pipelines):
+    """The agent has no display name here, so it speaks a picked human name
+    (core.agent_personality.spoken_name), never its internal id; the role is
+    its own, never a person's."""
     line = _line(pipelines.create().system_message)
-    assert line.startswith('You are speech.local.coach, an assistant who embodies'), line
+    assert line.startswith('You are '), line
+    assert ', an assistant who embodies' in line, line
+    assert 'speech.local.coach' not in line, line
     for person in PEOPLE:
         assert person.lower() not in line.lower(), line
+
+
+def test_create_and_reuse_say_the_name_the_person_gave(pipelines, create_env):
+    """Review of 4b9ba08ad, must-fix 1: REUSE read the display name from
+    ``config`` after the per-action file loop had reassigned it to the last
+    action file, which has no name, so REUSE spoke a hash-picked name while
+    CREATE said the agent's own ("Syllable Coach Ball Exercise" vs "Ren")."""
+    record = json.loads((create_env.prompts / f'{PROMPT_ID}.json').read_text(encoding='utf-8'))
+    record['name'] = 'Syllable Coach'
+    (create_env.prompts / f'{PROMPT_ID}.json').write_text(json.dumps(record), encoding='utf-8')
+    for i, text in enumerate(ACTIONS, 1):
+        (create_env.prompts / f'{PROMPT_ID}_0_{i}.json').write_text(json.dumps({
+            'action_id': i, 'action': text, 'status': 'done', 'persona': 'the child',
+            'recipe': [{'steps': 'step %d' % i, 'tool_name': 'google_search'}]}),
+            encoding='utf-8')
+    created = _line(pipelines.create().system_message)
+    assert created.startswith('You are Syllable Coach, an assistant'), created
+    assert _line(pipelines.reuse().system_message) == created
 
 
 def test_a_reuse_turn_carries_the_same_role_create_saved(pipelines):

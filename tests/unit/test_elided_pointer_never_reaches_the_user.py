@@ -80,16 +80,22 @@ def test_the_chat_reply_carries_no_pointer():
 # ── review of d99b1aa88: central, the hive expert, channel replies ──────
 
 def _central_send(modname):
+    """The real sender's central branch; the wire is core.http_pool.
+    pooled_post_once, the one transport hartos.helper.post_agent_message
+    uses for both copies."""
     import json as _json
+    import os as _os
     mod = __import__(modname, fromlist=['send_message_to_user1'])
     sent = []
 
     def fake_post(url, data=None, **kw):
         sent.append(_json.loads(data))
-        return MagicMock()
+        return MagicMock(status_code=200, text='')
 
     with patch.object(mod, 'is_bundled', return_value=False), \
-            patch.object(mod, 'pooled_post', side_effect=fake_post):
+            patch.dict(_os.environ, {'AUTOGEN_RESPONSE_URL':
+                                     'http://backend.test/autogen_response'}), \
+            patch('core.http_pool.pooled_post_once', side_effect=fake_post):
         mod.send_message_to_user1('u1', _ECHO, '', 'p1')
     assert sent, 'nothing was sent'
     return sent[0]['message']

@@ -820,14 +820,20 @@ def test_a_resent_question_is_not_progress_for_the_round_budget():
 
 
 @pytest.mark.parametrize('flag', ['yes', 'no'])
-def test_a_daemon_tick_never_completes_a_step_on_the_line_after_its_question(
-        speech, flag):
-    """Finding 3: on a daemon tick nobody can answer, so no ask is recorded
-    (the owner's 2026-10-31 ruling routes a background step's question to
-    the goal's owner, parts B1-B3).  The step that asked still never
-    completes on the model's next line, and a model that re-sends puts its
-    question out once in the tick."""
+def test_a_daemon_tick_hands_its_question_to_the_goals_person(speech, flag,
+                                                              monkeypatch):
+    """Part B (the owner's 2026-10-31 ruling: a background step's question
+    goes to the goal's owner; park, notify, resume).  On a daemon tick the
+    step that asked never completes on the model's next line, puts its
+    question out once, holds through the canonical wait, records the ask
+    as asked via the escalation (the session is an agent row, so its send
+    reached no one), and hands its goal to its person with the question.
+    31ec05d14 ended it GAVE_UP, and each tick asked again (live on the
+    owner's desktop 2026-11-02 14:14-14:15: one goal, 3 copies)."""
     from agent_ledger.core import TaskStatus
+    handed = []
+    monkeypatch.setattr(rr, 'hand_goal_to_its_person',
+                        lambda *a, **k: handed.append((a, k)) or 'human')
     flow = [dict(_FLOW[0], can_perform_without_user_input=flag), _FLOW[1]]
     holder = {}
     run = speech(actions=flow, verdict_script=_completed,
@@ -835,9 +841,45 @@ def test_a_daemon_tick_never_completes_a_step_on_the_line_after_its_question(
     holder['fn'] = _register_send(run, True, resend=True)
     run.turn('tick', 'daemon_goal_turn')
     assert run.state['sends'] == [_LIVE_TEXT]
-    assert _task(run, 1).status not in (TaskStatus.COMPLETED, TaskStatus.TERMINATED)
+    assert _task(run, 1).status == TaskStatus.BLOCKED, _task(run, 1).status
+    assert _task(run, 1).blocked_reason == 'input_required'
     assert run.rr.user_tasks[run.key].current_action == 1
-    assert run.L.ledger_open_ask(run.key, 1, 0) is None
+    ask = run.L.ledger_open_ask(run.key, 1, 0)
+    assert ask is not None and ask['via'] == 'escalation', ask
+    assert ask['question'] == _LIVE_TEXT
+    assert len(handed) == 1
+    (goal_id, user_prompt, _pid, action_id, _text, _reason, _flow), kwargs = handed[0]
+    assert (goal_id, user_prompt, action_id) == ('goal_turn', run.key, 1)
+    assert kwargs['ask'] == _LIVE_TEXT
+    # The next tick (a goal resumed from the dashboard) neither runs nor
+    # re-asks the held step: it parks the goal again, with the same
+    # question, which escalate_goal tells nobody twice.
+    run.turn('tick', 'daemon_goal_turn')
+    assert run.state['sends'] == [_LIVE_TEXT]
+    assert len(handed) == 2 and handed[1][1]['ask'] == _LIVE_TEXT
+    assert _task(run, 1).status == TaskStatus.BLOCKED
+
+
+def test_a_daemon_tick_leaves_a_goal_alone_whose_step_asked_in_the_persons_chat(
+        speech, monkeypatch):
+    """An ask put to the person on their own turn is answered in their chat,
+    which resumes the step.  A background tick meanwhile neither re-asks it
+    nor parks the goal: nothing would un-park a goal parked for it, and the
+    notice's "no way to answer it from the app yet" would be false."""
+    from agent_ledger.core import TaskStatus
+    handed = []
+    monkeypatch.setattr(rr, 'hand_goal_to_its_person',
+                        lambda *a, **k: handed.append((a, k)) or 'human',
+                        raising=False)
+    run = _walk(speech, True)
+    run.turn('basic algebra, beginner level', 'request-1')
+    assert run.L.ledger_open_ask(run.key, 1, 0)['via'] == 'send'
+    run.turn('tick', 'daemon_goal_turn')
+    assert handed == []
+    assert run.state['sends'] == [_LIVE_TEXT]
+    assert _task(run, 1).status == TaskStatus.BLOCKED
+    run.turn('yes, ready', 'request-2', kind='reply')
+    assert _task(run, 1).status in (TaskStatus.COMPLETED, TaskStatus.TERMINATED)
 
 
 @pytest.mark.parametrize('flag', ['yes', 'no'])

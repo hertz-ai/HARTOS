@@ -1195,18 +1195,19 @@ class APersonsReplyToAnUnheldQuestionIsItsAnswer(unittest.TestCase):
         request 3 saved it, request 3's turn was refused before its words
         were posted, and request 3 was retried.  Recorded under request 2,
         request 3's own words ("what time is it") were recorded as a second
-        answer.  The retry records nothing.  The refused turn took the kept
-        answer's words for its round (get_response_group takes them before
-        it can be refused), as the real loop does; that those words are then
-        lost is task #260, not pinned here (review of 5a311e2ef, nit 1)."""
+        answer.  The retry records nothing, and its round is the one that
+        gets the kept answer's words: the refused turn took none of them
+        (#260; the whole turn through get_response_group is pinned in
+        AnAnswerTheLedgerCannotSaveIsKeptAndRetried)."""
         self._window()
         self.assertFalse(self._turn('user-request-2', 'the b sound', saves=False))
         self.assertTrue(self._turn('user-request-3', 'what time is it'))
-        create_recipe._answer_for_this_turn(_UP, 'what time is it')
         self.assertFalse(self._turn('user-request-3', 'what time is it'),
                          'the retry is no answer')
         self.assertEqual(self._answers(), ['the b sound'])
         self.assertIsNone(self._flag())
+        self.assertEqual(create_recipe._answer_for_this_turn(_UP, 'what time is it'),
+                         'the b sound\nwhat time is it')
 
     def test_a_refused_turn_retried_records_its_answer_once_in_a_later_flow_too(self):
         """The one-answer-per-request guard reads every flow's answers: in
@@ -1220,6 +1221,35 @@ class APersonsReplyToAnUnheldQuestionIsItsAnswer(unittest.TestCase):
         entries = self.ledger.tasks['action_3'].context[self.L.USER_INPUT_EVIDENCE_KEY]
         self.assertEqual([(e.get('answer'), e.get('flow')) for e in entries],
                          [('the b sound', 1)])
+
+    def test_a_late_retry_from_an_earlier_flow_is_no_answer_in_a_later_one(self):
+        """Flow 0's action 3 was answered "yes" in request 2; flow 1's
+        action 3 asks in request 5; request 2 is retried late.  It answered
+        once already, in flow 0, so it is no answer to flow 1's question
+        (review of 40e62c4c0, nit 2: a guard reading the current flow's
+        answers only recorded "yes" as flow 1's answer too)."""
+        create_recipe.recipe_for_persona[_UP] = 1
+        self._window()
+        self.gc.messages.append({'role': 'user', 'name': 'UserProxy', 'content': 'yes'})
+        self.assertTrue(self.L.record_user_answer(_UP, 3, 'yes', 0,
+                                                  request_id='user-request-2'))
+        self.gc.messages += [
+            {'role': 'assistant', 'name': 'Assistant',
+             'content': 'Great, the b sound. Say ball with me.'},
+            {'role': 'assistant', 'name': 'ChatInstructor',
+             'content': 'Execute Action 1: say Hello Arjun'},
+            {'role': 'assistant', 'name': 'Assistant', 'content': 'Hello Arjun!'},
+            {'role': 'assistant', 'name': 'ChatInstructor',
+             'content': 'Execute Action 3: ask the child which sound to practise'},
+            *self._send('s13', 'Shall we practise the m sound today?', 'user-request-5')]
+        self.assertFalse(self._turn('user-request-2', 'yes'), 'a late retry from flow 0')
+        entries = self.ledger.tasks['action_3'].context[self.L.USER_INPUT_EVIDENCE_KEY]
+        self.assertEqual([(e.get('flow'), e.get('answer'), e.get('request_id')) for e in entries],
+                         [(0, 'yes', 'user-request-2')])
+        self.assertFalse(self.L.ledger_user_answered(_UP, 3, 1))
+        found = self.L.step_open_question(_UP, 3)
+        self.assertEqual((found or (None, None, None))[1:],
+                         ('Shall we practise the m sound today?', 'user-request-5'))
 
     def test_a_reply_taken_for_an_unheld_question_is_no_warning(self):
         """Every reply to a question the gate never held is released here,
@@ -1377,6 +1407,62 @@ class AnAnswerTheLedgerCannotSaveIsKeptAndRetried(unittest.TestCase):
             finally:
                 create_recipe.user_agents.pop(_UP, None)
         return 'reply', reply
+
+    def _refused_round(self, request, text, refusal):
+        """The WHOLE turn through get_response_group on the session's
+        existing agents, refused before its round: ``refusal`` 'model' is
+        a turn held for another one on a different model (#172), 'tool' a
+        turn met by another turn's tool call still running.  Returns what it
+        answered; a round that starts fails the test."""
+        from flask import Flask
+        user_id, prompt_id = _UP.rsplit('_', 1)
+        create_recipe.request_id_list[_UP] = request
+        agents = tuple(MagicMock() for _ in range(7))
+        agents[3].messages = []
+        if refusal == 'tool':
+            agents[3].messages = [
+                {'role': 'user', 'content': 'Execute Action 3: ask the child to say ball'},
+                {'role': 'assistant', 'content': 'Say ball with me.'},
+                {'role': 'assistant', 'content': '', 'tool_calls': [{
+                    'id': 'c1', 'type': 'function',
+                    'function': {'name': 'save_data_in_memory', 'arguments': '{}'}}]}]
+        create_recipe.user_agents[_UP] = agents
+        with ExitStack() as stack:
+            stack.enter_context(Flask(__name__).app_context())
+            stack.enter_context(patch.object(
+                create_recipe, '_attach_for_create_turn',
+                side_effect=AssertionError('a refused turn ran its round')))
+            stack.enter_context(patch.object(
+                create_recipe.helper_fun, 'bind_agents_to_turn_model',
+                return_value=refusal != 'model'))
+            stack.enter_context(patch.object(
+                create_recipe, '_another_turn_in_flight', return_value=True))
+            try:
+                return create_recipe.get_response_group(user_id, text, prompt_id)
+            finally:
+                create_recipe.user_agents.pop(_UP, None)
+
+    def test_a_turn_refused_before_its_round_leaves_the_kept_words_owed(self):
+        """#260: 'ba' could not be saved; the next turn saved it and was
+        then refused before its round, by its model binding or by another
+        turn's tool call still running.  The words owed to the person's round
+        were taken at the top of the turn and lost with it: the retry's round
+        got 'what time is it' alone, so the model never saw 'ba' and asked
+        again.  Now the round that runs gets them."""
+        from core.agent_tools import held_for_another_turn_reply
+        refused_with = {'model': held_for_another_turn_reply(),
+                        'tool': 'Processing a tool now please try later'}
+        for refusal, said in refused_with.items():
+            with self.subTest(refusal=refusal):
+                self.tearDown()
+                self.setUp()
+                self.assertFalse(self._turn('user-request-2', 'ba', saves=False))
+                self.assertEqual(
+                    self._refused_round('user-request-3', 'what time is it', refusal), said)
+                self.assertEqual(self._answers(), ['ba'], 'the kept answer saved')
+                self.assertEqual(self._round('user-request-3', 'what time is it'),
+                                 ('round', 'ba\nwhat time is it'))
+                self.assertEqual(self._answers(), ['ba'])
 
     def _ask_on_action_4(self, request='user-request-5'):
         """The flow moved on to a NEW ask step (action 4) waiting on this

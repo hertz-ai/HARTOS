@@ -51,8 +51,6 @@ def _say(rr, message):
 def test_the_agents_real_message_is_sent(rr):
     sent, send = _say(rr, _msg('Assistant', 'Which month should I check?'))
     assert sent is True
-    # media_refs=None: the message names no file (_reuse_speaker_says_to_user
-    # forwards whatever the agent wrote under MEDIA_REPLY_KEY).
     send.assert_called_once_with('u7', 'Which month should I check?', '', 42,
                                  media_refs=None)
 
@@ -176,7 +174,7 @@ def test_a_visual_run_never_sends_plumbing(rr, monkeypatch, tail):
 
 # ── source guard, by behaviour: every sender of message2userfinal ──────
 
-_GATE_OWNERS = {'_reuse_speaker_says_to_user', '_reuse_answer_off_box'}
+_GATE_OWNERS = {'_reuse_speaker_says_to_user'}
 
 
 def ungated_senders(src):
@@ -185,8 +183,8 @@ def ungated_senders(src):
 
     Such a function is delivering a group member's message2userfinal, so it
     must hand it to _reuse_speaker_says_to_user (mid-round / out-of-band)
-    or return it through _reuse_answer_off_box (the /chat reply), never
-    send it itself.  Whatever the function is called."""
+    or return it (the /chat reply), never send it itself.  Whatever the
+    function is called."""
     import ast
     out = []
 

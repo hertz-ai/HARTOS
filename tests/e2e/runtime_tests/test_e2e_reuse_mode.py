@@ -83,16 +83,14 @@ class TestReuseModeE2E:
         )
 
         assert reuse_response.status_code == 200
-        time.sleep(3)
 
-        # Verify execution happened
-        messages_response = requests.get(f"{MOCK_API_URL}/autogen_response/messages")
-        reuse_messages = messages_response.json()
-
-        assert len(reuse_messages) > 0, "No messages sent in reuse mode"
+        # A REUSE turn's finished answer reaches the person as the /chat
+        # reply only (f1d599dd9 removed the second copy that was also POSTed
+        # to /autogen_response), so the reply is where to look, not the mock.
+        reuse_answer = (reuse_response.json() or {}).get('response')
+        assert reuse_answer, "Reuse mode returned no answer"
 
         print(f"✓ Reuse mode executed successfully")
-        print(f"  - Messages sent: {len(reuse_messages)}")
 
     def test_reuse_mode_faster_than_create(
         self,
@@ -224,18 +222,16 @@ class TestReuseModeE2E:
         }
 
         reuse_response = requests.post(f"{APP_URL}/chat", json=reuse_request, timeout=60)
-        time.sleep(3)
 
-        # Get reuse mode messages
-        reuse_messages = requests.get(f"{MOCK_API_URL}/autogen_response/messages").json()
+        # CREATE's mid-turn messages are POSTed to /autogen_response; a REUSE
+        # turn's answer is its /chat reply (f1d599dd9 removed the second copy).
+        reuse_answer = (reuse_response.json() or {}).get('response')
 
-        # Both should have sent messages
         assert len(create_messages) > 0, "Create mode sent no messages"
-        assert len(reuse_messages) > 0, "Reuse mode sent no messages"
+        assert reuse_answer, "Reuse mode returned no answer"
 
         print(f"✓ Output consistency validated")
         print(f"  - Create messages: {len(create_messages)}")
-        print(f"  - Reuse messages: {len(reuse_messages)}")
 
 
 @pytest.mark.runtime

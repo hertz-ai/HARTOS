@@ -446,3 +446,46 @@ def test_each_phone_has_its_own_rate_budget_on_the_desktop(desktop_app, phone, m
     assert [call(phone, first, f'p-{n}') for n in range(limit + 1)] == [200] * limit + [429]
     second = _device_link(tablet)
     assert call(tablet, second, 't-0') == 200
+
+
+def test_a_phones_camera_frame_runs_the_desktops_frame_route_and_its_204_reaches_the_phone(
+        monkeypatch, phone):
+    """The shipped row for the phone's camera frames (Android
+    DesktopCameraFrames): POST https://azurekong.hertzai.com/api/vision/frame
+    ?user_id=&channel=camera with a JPEG body runs this desktop's own
+    /api/vision/frame (Nunba vision_frame_ingest, stood in for here) as the
+    phone's user, query and bytes as sent; its 204 with no body is the
+    phone's reply (DesktopCameraFrames reads a 2xx as taken).  The handshake
+    names the row with a frame's 5 s wait."""
+    monkeypatch.setenv('NUNBA_BUNDLED', '1')
+    monkeypatch.setenv('HEVOLVE_NODE_TIER', 'flat')
+    for name in ('HEVOLVE_API_KEY', 'TRUSTED_PROXY', 'NUNBA_CI'):
+        monkeypatch.delenv(name, raising=False)
+    url = f'https://{CLOUD}/api/vision/frame?user_id={PHONE_USER}&channel=camera'
+    assert aliases.resolve('POST', url) == \
+        f'/api/vision/frame?user_id={PHONE_USER}&channel=camera'
+    app = Flask('nunba')
+    got = []
+
+    def vision_frame_ingest():
+        got.append((request.args.to_dict(), request.get_data(), request.content_type,
+                    getattr(g, 'auth_source', None)))
+        return '', 204
+    app.add_url_rule('/api/vision/frame', 'vision_frame_ingest', vision_frame_ingest,
+                     methods=['POST'])
+    _apply_api_auth(app)
+    jpeg = b'\xff\xd8\xff\xe0' + bytes(range(256)) + b'\xff\xd9'
+    frame = {'type': 'api_request', 'method': 'POST', 'url': url,
+             'device_token': phone.token(), 'headers': {'Content-Type': 'image/jpeg'},
+             'body_b64': base64.b64encode(jpeg).decode()}
+    secrets = {'security.secrets_manager': types.SimpleNamespace(get_secret=lambda name: '')}
+    with swap_modules(secrets):
+        assert adapter.install(app)
+        assert PeerLink._get_local_capabilities()['mobile_paths'] == [
+            f'POST {CLOUD} /api/vision/frame 5']
+        link = _device_link(phone)
+        replies = _ask(link, frame)
+    assert len(replies) == 1
+    assert replies[0]['type'] == 'api_reply'
+    assert replies[0]['status'] == 204 and replies[0]['body_b64'] == ''
+    assert got == [({'user_id': PHONE_USER, 'channel': 'camera'}, jpeg, 'image/jpeg', 'device')]

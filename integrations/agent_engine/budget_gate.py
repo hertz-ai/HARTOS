@@ -838,7 +838,8 @@ def record_metered_usage(node_id: str, model_id: str, task_source: str,
 
 def meter_llm_call(model: str, tokens_in: int, tokens_out: int,
                    task_source: str = 'own', goal_id: str = None,
-                   requester_node_id: str = None) -> Optional[str]:
+                   requester_node_id: str = None, cache_write_tokens: int = 0,
+                   cache_read_tokens: int = 0) -> Optional[str]:
     """Meter ONE completed LLM call through record_metered_usage.
 
     Derives the two arguments callers could not supply correctly: this node's
@@ -854,6 +855,11 @@ def meter_llm_call(model: str, tokens_in: int, tokens_out: int,
     S1/S2). task_source is 'own' | 'hive' | 'idle' (MeteredAPIUsage column);
     anything but 'own' is settled by the revenue aggregator.
 
+    ``tokens_in`` counts every prompt token; ``cache_write_tokens`` and
+    ``cache_read_tokens`` say how many of them were written to and read from
+    Claude's prompt cache, which a priced family prices at its own rates
+    (blended_usd_per_1k).
+
     Never raises: metering must not break the call it meters.
     """
     try:
@@ -862,10 +868,11 @@ def meter_llm_call(model: str, tokens_in: int, tokens_out: int,
             usd_per_1k = 0.0
         else:
             # A family with a real dollar price (Claude) is metered at it,
-            # blended over this call's input and output tokens so the stored
-            # actual_usd_cost is exact; every other cloud family keeps the
-            # Spark-derived rate.
-            blended = blended_usd_per_1k(_resolve_model_name(model), tokens_in, tokens_out)
+            # blended over this call's input, cached and output tokens so the
+            # stored actual_usd_cost is exact; every other cloud family keeps
+            # the Spark-derived rate.
+            blended = blended_usd_per_1k(_resolve_model_name(model), tokens_in, tokens_out,
+                                         cache_write_tokens, cache_read_tokens)
             if blended is not None:
                 usd_per_1k = blended
             else:
@@ -905,8 +912,8 @@ def meter_llm_call(model: str, tokens_in: int, tokens_out: int,
 # expert entry whose autogen ``price`` they also fill; imported here, never a
 # second copy.
 from core.autogen_config import (  # noqa: E402
-    EXPERT_USD_PER_1K as USD_PER_1K_BY_FAMILY, OTHER_MODEL_FAMILY, family_usd_per_1k,
-    model_family,
+    EXPERT_USD_PER_1K as USD_PER_1K_BY_FAMILY, OTHER_MODEL_FAMILY, cache_price_factors,
+    family_usd_per_1k, model_family, model_usd_per_1k,
 )
 CLAUDE_USD_PER_1K_IN_VAR = 'HEVOLVE_CLAUDE_USD_PER_1K_IN'      # read by family_usd_per_1k
 CLAUDE_USD_PER_1K_OUT_VAR = 'HEVOLVE_CLAUDE_USD_PER_1K_OUT'
@@ -922,28 +929,34 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-def usd_price_per_1k(model_name) -> Optional[Tuple[float, float]]:
+def usd_price_per_1k(model_name, prompt_tokens=None) -> Optional[Tuple[float, float]]:
     """(input, output) dollars per 1k tokens for a model with a real price
-    table row, else None (the Spark-derived rate applies).  The family and
-    its (pinned) price come from the one rule in core.autogen_config."""
-    family = model_family(model_name)
-    if family == OTHER_MODEL_FAMILY:
-        return None
-    return family_usd_per_1k(family)
+    table row, else None (the Spark-derived rate applies).  The model's own
+    list price, its family's otherwise, and the owner's pin come from the one
+    rule in core.autogen_config (model_usd_per_1k)."""
+    return model_usd_per_1k(model_name, prompt_tokens)
 
 
-def blended_usd_per_1k(model_name, tokens_in, tokens_out) -> Optional[float]:
+def blended_usd_per_1k(model_name, tokens_in, tokens_out, cache_write_tokens=0,
+                       cache_read_tokens=0) -> Optional[float]:
     """One cost_per_1k that makes ``(tin+tout)/1000 * rate`` equal the exact
-    input-plus-output dollar cost of this call; None for an unpriced family."""
-    price = usd_price_per_1k(model_name)
-    if price is None:
-        return None
+    dollar cost of this call; None for an unpriced family.  Of the ``tin``
+    prompt tokens, those written to Claude's prompt cache and those read from
+    it are priced at their multiples of the input price
+    (core.autogen_config.cache_price_factors); the rest at the input price."""
     tin = max(0, int(tokens_in or 0))
     tout = max(0, int(tokens_out or 0))
+    price = usd_price_per_1k(model_name, tin)
+    if price is None:
+        return None
     total = tin + tout
     if total <= 0:
         return price[0]
-    return (tin * price[0] + tout * price[1]) / total
+    written = min(max(0, int(cache_write_tokens or 0)), tin)
+    read = min(max(0, int(cache_read_tokens or 0)), tin - written)
+    write_factor, read_factor = cache_price_factors(model_name)
+    usd_in = price[0] * ((tin - written - read) + written * write_factor + read * read_factor)
+    return (usd_in + tout * price[1]) / total
 
 
 def usd_spent_since(since, family: str) -> Optional[float]:

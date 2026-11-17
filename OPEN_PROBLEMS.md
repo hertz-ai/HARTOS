@@ -241,10 +241,22 @@ line without being told to. Which raises the questions that make it hard:
   spending twenty minutes on something a 4B model would have answered in two
   seconds? Cheap escalation is safe; this one is not.
 
-`core/prompt_difficulty.py` is a first step at the signal, deliberately a
-narrow one: deterministic, no model call, and it only decides fast-vs-full
-routing when no draft model is loaded to decide it properly. It does not
-attempt the question above. Nobody has.
+`core/prompt_difficulty.py` used to be named here as a first step at this
+signal. It was **deleted on 2026-11-10** (`c821bc722`). It was eight regex
+word lists scoring fast-vs-full routing, which is the keyword matching the
+owner had just had removed from the Nunba route one layer up; it had no
+production caller for the four months it existed, and the only one it ever
+got was added the day before it went.
+
+The routing decision belongs to the session shape the route sends and to
+the draft classifier's own escalation -- `speculative_dispatcher` promotes
+`delegate='none'` to `'local'` on `memory_query`, `channel_connect`,
+`is_create_agent`, `language_change`, `invite_intent`, `join_room_intent`.
+A model reads the sentence; no word list does.
+
+None of that answers the question above, and the deletion did not make it
+smaller. Nothing scores "was this reasoning any good", and nothing measures
+the cost of being wrong in the expensive direction. Nobody has.
 
 ---
 

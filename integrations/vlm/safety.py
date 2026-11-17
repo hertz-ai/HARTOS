@@ -382,6 +382,30 @@ COMPUTER_CONTROL_WAIT_SECONDS = 90.0
 COMPUTER_CONTROL_POLL_SECONDS = 3.0
 
 
+def _computer_control_reason(agent: Optional[str]) -> str:
+    """What the ask says, the push body and the desktop card alike: the agent
+    by the name its person knows it ("Agent Vijai asks to ..."), never the
+    bare prompt id the owner has never seen ("Agent 70264903070 asks to
+    ..."; review of 11dbbd8ef, m4).  The name is consent_service's one
+    lookup; a failed lookup reads as no name."""
+    if not agent:
+        return ('An agent that could not be identified asks to '
+                f'{COMPUTER_CONTROL_COVERS}.')
+    name = None
+    try:
+        from integrations.social.models import db_session
+        from integrations.social.consent_service import agent_display_name
+        with db_session(commit=False) as db:
+            name = agent_display_name(db, agent)
+    except Exception:  # noqa: BLE001 -- the ask still goes, unnamed
+        logger.debug(f'computer control: no name for agent {agent}',
+                     exc_info=True)
+    if not name:
+        return f'One of your agents asks to {COMPUTER_CONTROL_COVERS}.'
+    from integrations.social.consent_service import agent_as_asker
+    return f'{agent_as_asker(name)} asks to {COMPUTER_CONTROL_COVERS}.'
+
+
 def _computer_control_answer(owner: str, agent: Optional[str],
                              reason: str) -> Optional[bool]:
     """One look at the owner's answer: True allowed, False said no ("Don't
@@ -441,9 +465,7 @@ def computer_control_block(agent_id, *, wait=True,
         return ('Not run: the permission to control this computer '
                 f'could not be checked ({e}).')
     agent = known_agent_id(agent_id)
-    reason = (f'Agent {agent} asks to {COMPUTER_CONTROL_COVERS}.' if agent
-              else 'An agent that could not be identified asks to '
-                   f'{COMPUTER_CONTROL_COVERS}.')
+    reason = _computer_control_reason(agent)
     try:
         from integrations.agent_engine.dispatch import (
             is_current_request_autonomous)

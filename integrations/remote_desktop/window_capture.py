@@ -154,6 +154,38 @@ class WindowCaptureConfig:
 
 # ── Window Enumerator ──────────────────────────────────────────
 
+def process_name_for_pid(pid: int) -> str:
+    """The executable file name behind a Windows process id, or '' when it
+    cannot be read (a protected process, a gone pid, another platform).
+
+    The one implementation: WindowEnumerator reads it for each window it lists,
+    and the demonstration recorder (integrations.vlm.demo_session) for each
+    window an event lands in.  Moved here from the enumerator's private method
+    so a caller outside this module does not reach into one that carries no
+    contract; the method still exists and calls this.
+    """
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
+                                      False, pid)
+        if handle:
+            try:
+                import ctypes.wintypes
+                buf = ctypes.create_unicode_buffer(260)
+                size = ctypes.wintypes.DWORD(260)
+                kernel32.QueryFullProcessImageNameW(handle, 0,
+                                                   buf, ctypes.byref(size))
+                full_path = buf.value
+                return os.path.basename(full_path) if full_path else ''
+            finally:
+                kernel32.CloseHandle(handle)
+    except Exception:
+        pass
+    return ''
+
+
 class WindowEnumerator:
     """Cross-platform window enumeration.
 
@@ -291,28 +323,8 @@ class WindowEnumerator:
         return results
 
     def _get_process_name_win32(self, pid: int) -> str:
-        """Get process name from PID on Windows."""
-        try:
-            import ctypes
-            kernel32 = ctypes.windll.kernel32
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
-                                          False, pid)
-            if handle:
-                try:
-                    import os
-                    import ctypes.wintypes
-                    buf = ctypes.create_unicode_buffer(260)
-                    size = ctypes.wintypes.DWORD(260)
-                    kernel32.QueryFullProcessImageNameW(handle, 0,
-                                                       buf, ctypes.byref(size))
-                    full_path = buf.value
-                    return os.path.basename(full_path) if full_path else ''
-                finally:
-                    kernel32.CloseHandle(handle)
-        except Exception:
-            pass
-        return ''
+        """Get process name from PID on Windows (process_name_for_pid)."""
+        return process_name_for_pid(pid)
 
     def _refresh_win32(self, window: WindowInfo) -> Optional[WindowInfo]:
         """Refresh window info for an existing handle."""

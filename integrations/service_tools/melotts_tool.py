@@ -80,9 +80,10 @@ def _load():
     # Pick device based on CUDA availability.  Worker self-reports
     # post-load VRAM via the __WORKER_VRAM_GB__ marker so vram_manager
     # auto-tightens the budget if we declared too high.
+    # The GPU only when it has room (the registry says melotts runs on the CPU).
     try:
-        import torch
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        from integrations.channels.media.tts_router import gpu_preferred_device
+        device = gpu_preferred_device('melotts')
     except Exception:
         device = 'cpu'
 

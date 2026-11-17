@@ -11,10 +11,11 @@ on the card, and nothing asked the agent for its reason, so the desktop card
 fell back to its own "Your agent asks for files".
 
 Now an ask carries its reason (the component's description, in the agent's
-words) or is not sent, and the card, the bell row and the push carry the same
-title and reason; with no title of its own, the title names the agent by the
-name the person knows it by (consent_service.agent_display_name, the one
-lookup consent cards use).
+words) or is not sent; the card and the push carry the same title and reason,
+and the bell row the title.  With no title of its own, the title names the
+agent by the name the person knows it by (consent_service.agent_display_name,
+the one lookup consent cards use).  A reason or question still written as the
+hint's '<...>' blank is not sent either (review of ab68963ea, MF-1).
 
 The tool's hint (owner, 2026-11-07, of the speech-therapy agent's "choose
 video" cards): it no longer holds up Reel Studio's file request as the one
@@ -166,17 +167,104 @@ def test_the_tool_holds_up_no_one_agents_purpose():
     assert len(set(counts.values())) == 1 and min(counts.values()) >= 1, counts
 
 
-def test_the_shape_the_tool_shows_is_an_ask_it_takes(legs):
-    """The hint shows the model the shape of an ask, and that shape is one
-    the tool sends: with a reason (the hint's example had none, so the tool
-    refused its own example)."""
+def _filled(value):
+    """``value`` with every '<...>' blank written over in words of the
+    agent's own, the way a model that fills the hint's template would."""
+    import re
+    if isinstance(value, dict):
+        return {k: _filled(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_filled(v) for v in value]
+    if isinstance(value, str):
+        return re.sub(r'<([^<>]+)>', lambda m: 'Arjun %s' % m.group(1), value)
+    return value
+
+
+def test_the_shape_the_tool_shows_is_an_ask_it_takes_once_filled_in(legs):
+    """The hint shows the model the shape of an ask with its reason; filled
+    in with the agent's own words, that shape is one the tool sends (the
+    first hint's example had no reason, so the tool refused its own
+    example)."""
+    import json
+    desc, params, func = _what_the_model_reads()
+    shown = [o for t in [desc] + params for o in _json_objects(t)]
+    assert shown, 'the hint shows no ask'
+    for component in shown:
+        reply = json.loads(func(json.dumps(_filled(component)), 0))
+        assert reply.get('status') == 'waiting_for_person', (component, reply)
+
+
+def test_the_hints_example_copied_word_for_word_never_reaches_her(legs):
+    """REVIEW OF ab68963ea, MF-1: the example's blanks ("<why you ask>",
+    "<your question>") sent as they are put a card in front of her that
+    said "<why you ask>" over a box labelled "<your question>", and its push
+    said "<why you ask>".  The 4B model copies the example word for word
+    (the cause of the 11-07 cards), so a copy is refused, nothing reaches
+    her, and the note names the blank to write over."""
     import json
     desc, params, func = _what_the_model_reads()
     shown = [o for t in [desc] + params for o in _json_objects(t)]
     assert shown, 'the hint shows no ask'
     for component in shown:
         reply = json.loads(func(json.dumps(component), 0))
-        assert reply.get('status') == 'waiting_for_person', (component, reply)
+        assert reply.get('status') == 'refused', (component, reply)
+        assert reply['refused'] == 'unfilled_placeholder', reply
+        blanks = [v for v in (component.get('description'),
+                              *(f.get('label') for f in component.get('fields') or []))
+                  if isinstance(v, str) and v.startswith('<')]
+        assert any(b in reply['note'] for b in blanks), reply
+    assert legs['cards'] == []
+    _settle()
+    assert legs['pushes'] == []
+
+
+def test_a_question_label_still_a_blank_is_not_sent(legs):
+    """The reason is the agent's own, but the question is the template's."""
+    out = _ask({'type': 'form', 'description': WHY,
+                'fields': [{'name': 'answer', 'label': '<your question>', 'type': 'text'}]})
+    assert out['ok'] is False and out['refused'] == 'unfilled_placeholder'
+    assert legs['cards'] == []
+
+
+def test_a_reason_still_a_blank_is_not_sent(legs):
+    """The question is the agent's own, but the reason is the template's;
+    a file ask has no question at all, so its reason is all she reads."""
+    for component in ({'type': 'form', 'description': '<why you ask>',
+                       'fields': [{'name': 'answer', 'label': 'Which word did Arjun say?',
+                                   'type': 'text'}]},
+                      dict(AS_SENT, description=' <why you ask> ')):
+        out = _ask(component)
+        assert out['ok'] is False and out['refused'] == 'unfilled_placeholder', component
+    assert legs['cards'] == []
+
+
+def test_words_with_angle_brackets_in_them_are_still_asked(legs):
+    """A '<' or '>' in the person's own words (a size, a comparison) is not
+    a blank: only a whole '<...>' or a fill-in mark such as '<parent_name>'
+    is (core.agent_tools.unfilled_text_placeholder, the one rule)."""
+    out = _ask({'type': 'form', 'description': 'To pick the box size: <30 cm or >50 cm?',
+                'fields': [{'name': 'answer', 'label': 'Is the parcel <2 kg?',
+                            'type': 'text'}]})
+    assert out['ok'] is True, out
+
+
+def test_a_reason_given_as_the_body_reaches_the_card(legs):
+    """REVIEW OF ab68963ea, SF-4: a caller's body= is the card's reason too
+    (hartos/reuse_recipe.py's join card asks that way)."""
+    from integrations.agent_engine import person_ask
+    out = person_ask.ask('10202', COACH, dict(AS_SENT), prompt_id=COACH, body=WHY)
+    assert out['ok'] is True, out
+    _agent, card, _user = legs['cards'][-1]
+    assert card['description'] == WHY
+
+
+def test_the_tool_says_what_each_purpose_is_for():
+    """REVIEW OF ab68963ea, SF-4: the model picks a purpose by what it is
+    for, so the description it reads carries each purpose's own words."""
+    from core.user_file_store import INBOUND_PURPOSES, PURPOSES
+    desc, _params, _func = _what_the_model_reads()
+    for p in INBOUND_PURPOSES:
+        assert PURPOSES[p].use and PURPOSES[p].use in desc, p
 
 
 def test_an_ask_with_no_reason_tells_the_agent_to_give_one(legs):
