@@ -945,10 +945,16 @@ def register_outreach_goal_type():
     Call this during HARTOS boot to enable outreach automation.
     """
     from integrations.agent_engine.goal_manager import register_goal_type
+    # 'sales' too: this goal type's prompt IS the sales prompt
+    # (build_outreach_prompt), which tells the agent to call the journey tools
+    # (view_journey_pipeline, run_journey_tick) beside the CRM ones, and its
+    # goal turns get exactly these tags (goal_manager.daemon_turn_stored_tags,
+    # #284).  No ServiceToolRegistry tool carries a 'sales' tag, so the Tier-1
+    # filter unlocks nothing new for a detected 'outreach'.
     register_goal_type(
         goal_type='outreach',
         build_prompt=build_outreach_prompt,
-        tool_tags=['outreach', 'email', 'crm'],
+        tool_tags=['outreach', 'sales', 'email', 'crm'],
     )
     logger.info("Registered 'outreach' goal type with prompt builder and tool tags")
     # Wire reply detection into email channel
