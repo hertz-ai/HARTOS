@@ -795,6 +795,26 @@ class FlaskChannelIntegration:
         meta = getattr(row, 'metadata_json', None)
         return bool(param) and isinstance(meta, dict) and param in meta
 
+    @classmethod
+    def accounts_connecting(cls, db, channel_type: str, account) -> set:
+        """The ids of the accounts that CONNECTED ``account`` of
+        ``channel_type`` (a mailbox): the owners of its active binding rows
+        that record a connect (binding_connects_the_channel), found by the
+        account as the registry keys it (channel_account).  The one reader of
+        who holds a mailbox: it decides who may send from it
+        (outreach_crm_tools._may_use_mailbox) and whether another account may
+        connect it (agent_tools.register_channel)."""
+        from .registry import normalize_account
+        from integrations.social.models import UserChannelBinding
+        key = normalize_account(account)
+        if key is None:
+            return set()
+        rows = db.query(UserChannelBinding).filter_by(
+            channel_type=channel_type, channel_sender_id=key,
+            is_active=True).all()
+        return {str(row.user_id) for row in rows
+                if cls.binding_connects_the_channel(channel_type, row)}
+
     @staticmethod
     def _credential_kwarg(factory_fn, token: str) -> Dict[str, str]:
         """Map the caller's credential to the factory's OWN first parameter

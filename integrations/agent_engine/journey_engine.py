@@ -766,11 +766,19 @@ def register_journey_tools(helper, assistant, user_id: str):
 
         Executes all auto-actions for the new stage.
         """
-        from integrations.agent_engine.outreach_crm_tools import _load_prospects, _save_prospects
+        from integrations.agent_engine.outreach_crm_tools import (
+            _load_prospects, _save_prospects, refuse_other_goals_prospect)
         data = _load_prospects()
         prospect = data['prospects'].get(prospect_id)
         if not prospect:
             return json.dumps({'error': 'prospect not found'})
+        # A goal's turn moves only its own goal's prospects: the stage's
+        # auto-actions ('outreach', 'engaged') email the prospect from its
+        # goal's mailbox with copy this turn's goal never wrote (review of
+        # 88b6821f2, M1).
+        refused = refuse_other_goals_prospect('advance_prospect_stage', prospect)
+        if refused is not None:
+            return json.dumps(refused)
 
         result = engine.advance_prospect(prospect, force_stage=target_stage,
                                          store=data)

@@ -203,9 +203,17 @@ def create_binding():
     # drops the mailbox's other settings.  The mobile setup form sends every
     # field here, so the account goes to the one writer of such accounts,
     # the register_channel tool, as the chat form's submit does.
+    # The account may also arrive nested under 'metadata', which this route
+    # stores verbatim: a row that names a mailbox there was written with no
+    # connect and no credential, yet reads as "the account that connected it"
+    # (FlaskChannelIntegration.binding_connects_the_channel), which entitles a
+    # goal to send from it (outreach_crm_tools._may_use_mailbox).  So a
+    # mailbox named anywhere in the body goes to its one writer.
     from integrations.channels.flask_integration import FlaskChannelIntegration
-    if FlaskChannelIntegration.channel_account(channel_type, data):
-        return _connect_from_form(channel_type, data)
+    nested = data.get('metadata')
+    flat = {**(nested if isinstance(nested, dict) else {}), **data}
+    if FlaskChannelIntegration.channel_account(channel_type, flat):
+        return _connect_from_form(channel_type, flat)
 
     sender_id = data.get('channel_sender_id', '')
     chat_id = data.get('channel_chat_id', '')

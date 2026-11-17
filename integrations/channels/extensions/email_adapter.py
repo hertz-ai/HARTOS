@@ -74,6 +74,32 @@ logger = logging.getLogger(__name__)
 #: False) marks only those read: the rest stay unread for its owner.
 HANDLED = 'handled'
 
+#: Longest IMAP sequence-set (characters) one FETCH names: servers cap a
+#: command line (typically 8 KB), and a big inbox's set is split under it.
+_SEQUENCE_SET_LIMIT = 1000
+
+
+def _sequence_sets(message_nums, limit: int = _SEQUENCE_SET_LIMIT) -> List[str]:
+    """IMAP sequence-sets naming ``message_nums`` (the b'7' items of a SEARCH
+    reply): consecutive numbers as ranges ('3:9,12'), split into sets of at
+    most ``limit`` characters; one set for any inbox a command line holds."""
+    numbers = sorted({int(n) for n in message_nums})
+    sets, parts, size, i = [], [], 0, 0
+    while i < len(numbers):
+        j = i
+        while j + 1 < len(numbers) and numbers[j + 1] == numbers[j] + 1:
+            j += 1
+        part = str(numbers[i]) if i == j else f'{numbers[i]}:{numbers[j]}'
+        if parts and size + len(part) + 1 > limit:
+            sets.append(','.join(parts))
+            parts, size = [], 0
+        parts.append(part)
+        size += len(part) + 1
+        i = j + 1
+    if parts:
+        sets.append(','.join(parts))
+    return sets
+
 
 @dataclass
 class EmailConfig(ChannelConfig):
@@ -168,6 +194,9 @@ class EmailAdapter(ChannelAdapter):
         self._idle_task: Optional[asyncio.Task] = None
         self._threads: Dict[str, EmailThread] = {}
         self._seen_message_ids: set = set()
+        # The UIDs of processed mail that has no Message-ID (a mailbox that
+        # leaves its mail unread; _unprocessed).
+        self._seen_uids: set = set()
         # A mailbox that leaves its mail unread reads through imaplib, where
         # its peek-and-mark-when-handled read is written (_check_messages_sync).
         self._use_async = HAS_AIOIMAP and HAS_AIOSMTP and config.mark_as_read
@@ -402,23 +431,59 @@ class EmailAdapter(ChannelAdapter):
             logger.error(f"Async message check error: {e}")
             raise
 
+    def _unprocessed(self, message_nums) -> List[Tuple[bytes, Optional[bytes], str]]:
+        """For a mailbox that leaves mail unread: of the UNSEEN message
+        numbers, the ones not processed yet, as (number, UID, Message-ID).
+
+        Unhandled mail stays UNSEEN, so every poll meets the owner's whole
+        unread inbox again.  One FETCH of the UID and Message-ID headers per
+        sequence set (_sequence_sets: one for a whole inbox, not one per
+        mail) says which are new; only those are fetched whole.  A mail with
+        no Message-ID is known by its UID (the server's stable number for
+        it), so it is not fetched whole on every poll either (review of
+        88b6821f2, S2)."""
+        fresh = []
+        for message_set in _sequence_sets(message_nums):
+            status, head = self._imap.fetch(
+                message_set, '(UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])')
+            if status != 'OK' or not head:
+                # Unknown: every mail is fetched whole, as before.
+                return [(num, None, '') for num in message_nums]
+            for at, item in enumerate(head):
+                if not isinstance(item, tuple):
+                    continue
+                prefix = bytes(item[0])
+                number = re.match(rb'\s*(\d+)', prefix)
+                # Where the server puts the UID varies: before the header
+                # literal, or in the closing ' UID 11)' after it.
+                uid = re.search(rb'UID\s+(\d+)', prefix)
+                closing = head[at + 1] if at + 1 < len(head) else None
+                if uid is None and isinstance(closing, bytes):
+                    uid = re.search(rb'UID\s+(\d+)', closing)
+                uid = uid.group(1) if uid else None
+                msg_id = str(email.message_from_bytes(bytes(item[1])).get(
+                    'Message-ID', '') or '').strip()
+                if number is None:
+                    continue
+                if msg_id and msg_id in self._seen_message_ids:
+                    continue
+                if not msg_id and uid is not None and uid in self._seen_uids:
+                    continue
+                fresh.append((number.group(1), uid, msg_id))
+        return fresh
+
     async def _check_messages_sync(self) -> None:
         """Check messages using sync IMAP."""
         loop = asyncio.get_event_loop()
 
         peek = not self.email_config.mark_as_read
-
-        def already_read(num) -> bool:
-            """For a mailbox that leaves mail unread: whether this message
-            was processed already, from its Message-ID alone.  Unhandled
-            mail stays UNSEEN, and fetching each one whole on every poll
-            would download the owner's whole unread inbox every 30 s."""
-            status, head = self._imap.fetch(
-                num, '(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])')
-            if status != 'OK' or not head or not isinstance(head[0], tuple):
-                return False
-            msg_id = email.message_from_bytes(bytes(head[0][1])).get('Message-ID', '')
-            return bool(msg_id) and msg_id in self._seen_message_ids
+        if peek and not self._message_handlers:
+            # A mailbox that leaves its mail unread is read only for a
+            # handler to take it (the outreach reply hook).  With none
+            # attached yet, polling would record each Message-ID as seen and
+            # a prospect's reply already waiting here would never be matched
+            # once the hook arrives (review of 88b6821f2, S1).
+            return
 
         def check_sync():
             # Select inbox
@@ -430,11 +495,13 @@ class EmailAdapter(ChannelAdapter):
                 return []
 
             message_nums = data[0].split()
+            if peek:
+                wanted = self._unprocessed(message_nums)
+            else:
+                wanted = [(num, None, '') for num in message_nums]
             messages = []
 
-            for num in message_nums:
-                if peek and already_read(num):
-                    continue
+            for num, uid, msg_id in wanted:
                 # Fetch message.  RFC822 sets \Seen on the server; BODY.PEEK[]
                 # leaves the message unread.
                 status, msg_data = self._imap.fetch(
@@ -443,14 +510,16 @@ class EmailAdapter(ChannelAdapter):
                     continue
 
                 raw_email = msg_data[0][1]
-                messages.append((raw_email, num))
+                messages.append((raw_email, num, uid, msg_id))
 
             return messages
 
         messages = await loop.run_in_executor(None, check_sync)
 
-        for raw_email, num in messages:
+        for raw_email, num, uid, msg_id in messages:
             await self._process_email(raw_email, num)
+            if uid is not None and not msg_id:
+                self._seen_uids.add(uid)
 
     async def _process_email(self, raw_email: bytes, msg_num: bytes) -> None:
         """Process a raw email message."""
@@ -461,11 +530,13 @@ class EmailAdapter(ChannelAdapter):
             # Get message ID
             message_id = msg.get('Message-ID', '')
 
-            # Skip if already seen
-            if message_id in self._seen_message_ids:
-                return
-
-            self._seen_message_ids.add(message_id)
+            # Skip if already seen.  A mail with no Message-ID has no id to
+            # remember: '' recorded as seen dropped every later such mail
+            # (a mailbox that leaves its mail unread tracks them by UID).
+            if message_id:
+                if message_id in self._seen_message_ids:
+                    return
+                self._seen_message_ids.add(message_id)
 
             # Convert to unified message
             unified_msg = self._convert_message(msg)

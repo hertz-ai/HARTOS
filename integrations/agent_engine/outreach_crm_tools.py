@@ -72,22 +72,29 @@ class Sender(NamedTuple):
     """Whom a goal's email goes from: the goal (``goal_id``, ``title``) and
     the mailbox its config names under "sender_email" (``address``, None
     when it names none).  ``found`` is False when the goal is not on this
-    node or could not be read."""
+    node or could not be read.  ``creator`` is the account that made the
+    goal (AgentGoal.created_by): which mailbox the goal may use depends on
+    it (_may_use_mailbox)."""
     goal_id: str
     address: Optional[str]
     title: str = ''
     found: bool = True
+    creator: Optional[str] = None
 
 
 def goal_sender(goal_id) -> Optional[Sender]:
     """The one reader of a goal's sender: the "sender_email" of its config
-    (AgentGoal.config_json).  None when ``goal_id`` is empty: the email
-    serves no goal.
+    (AgentGoal.config_json) and the account that made the goal.  None when
+    ``goal_id`` is empty: the email serves no goal.
 
     Owner, 2026-11-16: central sends the email of every lane, each goal's
     from the company mailbox its config names, and never from another
-    company's.  Which mailbox a goal uses lives only in its config: the
-    owner moves a lane to another company by changing that one value."""
+    company's.  The owner moves a lane to another company by changing that
+    one value.  The config is not the owner's alone (any signed-in account
+    writes a goal's config through POST /api/goals), so naming a mailbox
+    does not entitle a goal to it: _send_from_goal_mailbox lets a goal send
+    from a mailbox only when _may_use_mailbox says its creator may (review
+    of 88b6821f2, M2)."""
     if not goal_id:
         return None
     goal_id = str(goal_id)
@@ -99,7 +106,8 @@ def goal_sender(goal_id) -> Optional[Sender]:
                 return Sender(goal_id, None, found=False)
             address = (goal.config_json or {}).get('sender_email')
             address = address.strip() if isinstance(address, str) else ''
-            return Sender(goal_id, address or None, goal.title or '')
+            return Sender(goal_id, address or None, goal.title or '',
+                          creator=str(goal.created_by) if goal.created_by else None)
     except Exception:
         logger.warning("Goal %s: the mailbox it sends from could not be read",
                        goal_id, exc_info=True)
@@ -154,16 +162,17 @@ def refuse_other_goals_prospect(tool: str, prospect: Dict) -> Optional[Dict]:
     from the prospect's goal: a lashes turn writing to a speech prospect
     sent lashes copy from the Hevolve mailbox (review of ae390514f, P2).  So
     a goal's prospects are emailed, sequenced and messaged only in that
-    goal's own turns.  send_outreach_email, create_followup_sequence and the
-    journey's send_prospect_message ask here; the follow-up checker sends
-    steps their goal's turn wrote."""
+    goal's own turns.  send_outreach_email, create_followup_sequence,
+    move_prospect_stage and the journey's send_prospect_message and
+    advance_prospect_stage (whose stage actions email the prospect) ask
+    here; the follow-up checker sends steps their goal's turn wrote."""
     owner_goal = (prospect or {}).get('goal_id')
     if not owner_goal:
         return None
     turn_goal = _turn_goal_id()
     if owner_goal == turn_goal:
         return None
-    from core.tool_refusal import RETRY_AFTER_FIX, refusal_fields
+    from core.tool_refusal import RETRY_AFTER_FIX, RETRY_NEVER, refusal_fields
 
     def _title(gid):
         sender = goal_sender(gid)
@@ -171,15 +180,28 @@ def refuse_other_goals_prospect(tool: str, prospect: Dict) -> Optional[Dict]:
 
     this_turn = (f"'{_title(turn_goal)}', the goal this turn works for"
                  if turn_goal else "this turn, which is not one of that goal's own")
-    fields = refusal_fields(
-        tool, 'another_goals_prospect',
+    problem = (
         f"prospect '{prospect.get('company', '?')}' belongs to goal "
         f"'{_title(owner_goal)}', not to {this_turn}: a goal's prospects are "
-        f"written to only in that goal's own turns, from its own mailbox",
-        "Work on this turn's own goal's prospects (get_pipeline_status shows "
-        "each prospect's goal_id); that goal's own turns and its follow-ups "
-        "write to this one",
-        retry=RETRY_AFTER_FIX)
+        f"written to only in that goal's own turns, from its own mailbox")
+    if turn_goal:
+        # Another goal's turn: it can still work its own prospects.
+        fields = refusal_fields(
+            tool, 'another_goals_prospect', problem,
+            "Work on this turn's own goal's prospects (get_pipeline_status "
+            "shows each prospect's goal_id); that goal's own turns and its "
+            "follow-ups write to this one",
+            retry=RETRY_AFTER_FIX)
+    else:
+        # A person's turn (or one that only names a goal) has no goal of its
+        # own: say what the person can do instead (owner rule 2026-11-09).
+        fields = refusal_fields(
+            tool, 'another_goals_prospect', problem,
+            f"Tell the person: to reach or change this prospect, steer goal "
+            f"'{_title(owner_goal)}' (ask it, from its page or with "
+            f"steer_goal, to write to them); that goal's next turn does it "
+            f"from its own mailbox, and its follow-ups continue meanwhile",
+            retry=RETRY_NEVER)
     return dict(fields, success=False, sent=False, error=fields['note'])
 
 
@@ -190,9 +212,16 @@ _TEMPLATE_BLANK = re.compile(r'\{\{?\s*[A-Za-z_][A-Za-z0-9_ ]*\s*\}?\}')
 
 
 def verify_outgoing_email(to_email: str, subject: str, html: str) -> Optional[Dict]:
-    """The one check every outgoing email passes before it leaves, whatever
+    """The one check every OUTREACH email passes before it leaves, whatever
     the mailbox: None when it may go, else the refusal (_send_email's
-    result shape: what is wrong and how to fix it).
+    result shape: what is wrong and how to fix it).  Only the outreach
+    sends reach it (send_outreach_email, the follow-up checker, the
+    journey's emails: everything that goes through _send_email); the
+    node-wide email adapter's chat replies, send_to_channel('email') and
+    email_campaign do not, and the template-blank rule is a pattern, not
+    a review: a promo code written in braces ("{SAVE10}") is refused, a
+    blank written "[First Name]" or "%FIRSTNAME%" is not (review of
+    88b6821f2, S5).
 
     Owner, 16 Nov 2026: "You verify all the outgoing emails on my behalf
     from central."  Checked here, deterministically:
@@ -329,11 +358,51 @@ def _goal_mailboxes() -> Dict:
         return {}
 
 
+def _may_use_mailbox(creator, address) -> bool:
+    """Whether a goal made by account ``creator`` may send from the mailbox
+    ``address``: the ONE rule of who may use a company mailbox (review of
+    88b6821f2, M2).  Only when ``creator`` is
+
+      * the account that CONNECTED that mailbox: its active binding row,
+        the one register_channel writes under the connecting account
+        (FlaskChannelIntegration.binding_connects_the_channel: a row of the
+        channel's own account, not a person who writes in on it), or
+      * an account only this node holds (voting_rules.node_holds, through
+        ThoughtExperimentService.node_held_ids: the node's owner, or its
+        system account).
+
+    A goal's config names its mailbox, but any signed-in account writes a
+    goal's config (POST /api/goals), and the daemon runs every active goal:
+    without this a stranger's goal sent a stranger's words from the
+    company's address.  False for a goal with no creator, and when the
+    lookup fails (it fails closed)."""
+    from integrations.channels.registry import normalize_account
+    creator = str(creator) if creator else ''
+    key = normalize_account(address)
+    if not creator or key is None:
+        return False
+    try:
+        from integrations.channels.flask_integration import FlaskChannelIntegration
+        from integrations.social.models import db_session
+        from integrations.social.thought_experiment_service import (
+            ThoughtExperimentService)
+        with db_session(commit=False) as db:
+            if ThoughtExperimentService.node_held_ids(db, [creator]):
+                return True
+            return creator in FlaskChannelIntegration.accounts_connecting(
+                db, EMAIL_CHANNEL, key)
+    except Exception:
+        logger.warning("Who may use the mailbox of a goal could not be read",
+                       exc_info=True)
+        return False
+
+
 def _send_from_goal_mailbox(sender: Sender, to_email: str, subject: str,
                             plain_text: str, html: str) -> Dict:
     """Send a goal's email from the mailbox its config names, and from no
     other; refuse, saying what to fix, when it names none, the goal is not
-    here, or that mailbox is not connected.  Never the mailer."""
+    here, that mailbox is not connected, or the goal's creator may not use
+    it (_may_use_mailbox).  Never the mailer."""
     title = (sender.title or sender.goal_id)[:_TITLE_CAP]
     if not sender.found:
         return _refused_send(
@@ -364,6 +433,14 @@ def _send_from_goal_mailbox(sender: Sender, to_email: str, subject: str,
             f"Connect {sender.address} in the channel setup form (Email: IMAP "
             f"server, SMTP server, address and password)."
             + _NEVER_ANOTHER_MAILBOX)
+    if not _may_use_mailbox(sender.creator, sender.address):
+        return _refused_send(
+            f"goal '{title}' may not send from {sender.address}: the account "
+            f"that made it did not connect that mailbox",
+            f"A mailbox is used only by goals made by the account that "
+            f"connected it, or by this node's owner. Have that account (or "
+            f"the owner) create this goal, or connect {sender.address} from "
+            f"the account that made it." + _NEVER_ANOTHER_MAILBOX)
     import asyncio
     try:
         result = asyncio.run_coroutine_threadsafe(
@@ -395,7 +472,7 @@ def _send_email(to_email: str, subject: str, html_body: str,
     since which one it should go from cannot be told.
 
     Either way the email first passes verify_outgoing_email, the one check
-    every outgoing email passes (owner, 2026-11-16).
+    every outreach email passes (owner, 2026-11-16).
     """
     sanitized_body = _sanitize_html(html_body)
     # Strip HTML for plain-text fallback
@@ -831,6 +908,12 @@ def register_outreach_tools(helper, assistant, user_id: str):
         prospect = data['prospects'].get(prospect_id)
         if not prospect:
             return json.dumps({'success': False, 'error': f'Prospect {prospect_id} not found'})
+        # A goal's prospects are written to only in that goal's own turns:
+        # another goal's (or a person's) turn moved a speech prospect to
+        # 'won' / 'lost' (review of 88b6821f2, S6).
+        refused = refuse_other_goals_prospect('move_prospect_stage', prospect)
+        if refused is not None:
+            return json.dumps(refused)
 
         old_stage = prospect['stage']
         prospect['stage'] = new_stage

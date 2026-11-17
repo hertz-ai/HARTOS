@@ -52,6 +52,39 @@ def _get_user_id_from_threadlocal():
         return None
 
 
+def _account_claim(channel_type: str, account: str, uid) -> tuple:
+    """For a channel that holds several accounts (email: one mailbox per
+    address): ``(held_by_another, uid_is_the_nodes)`` -- whether an ACTIVE
+    binding of ``account`` belongs to a different account than ``uid``
+    (FlaskChannelIntegration.binding_connects_the_channel: a row written by a
+    connect, not a person who writes in), and whether ``uid`` is an account
+    only this node holds (the owner or the system account:
+    ThoughtExperimentService.node_held_ids).
+
+    Who connected a mailbox decides who may send from it
+    (outreach_crm_tools._may_use_mailbox), so one address has one account:
+    a second account's connect is refused (register_channel), and the
+    node's own takes it over.  A lookup that fails answers (False, False):
+    the connect goes on, and the send side stays closed on its own."""
+    try:
+        from integrations.channels.flask_integration import FlaskChannelIntegration
+        from integrations.social.models import get_db
+        from integrations.social.thought_experiment_service import (
+            ThoughtExperimentService)
+        db = get_db()
+        try:
+            another = bool(FlaskChannelIntegration.accounts_connecting(
+                db, channel_type, account) - {str(uid)})
+            return another, bool(
+                ThoughtExperimentService.node_held_ids(db, [str(uid)]))
+        finally:
+            db.close()
+    except Exception:
+        logger.warning("%s: who holds account %s could not be read",
+                       channel_type, account, exc_info=True)
+        return False, False
+
+
 #: How long _report_when_live waits for a freshly started adapter to connect.
 #: Discord allows itself 30s to connect (discord_adapter.connect).
 _LIVE_WAIT_SECONDS = 35
@@ -540,6 +573,27 @@ def build_channel_tool_closures(ctx):
                         f"{', '.join(unresolved)} has not been entered by the "
                         f"owner yet. Connect it once they have entered it.")
 
+            # One account of a channel that holds several (an email mailbox)
+            # has one connecting account: who connected it decides who may
+            # send from it (outreach_crm_tools._may_use_mailbox).  Another
+            # account's connect of the same address is refused before
+            # anything is saved or replaced; this node's own account (the
+            # owner) always may, and takes the mailbox over below.
+            from integrations.channels.flask_integration import (
+                FlaskChannelIntegration)
+            account = FlaskChannelIntegration.channel_account(channel_type, config)
+            connecting = user_id or _get_user_id_from_threadlocal()
+            takes_over = False
+            if account and connecting:
+                held_by_another, takes_over = _account_claim(
+                    channel_type, account, connecting)
+                if held_by_another and not takes_over:
+                    return (f"{meta['display_name']} ({account}) was not "
+                            f"connected: another account on this node already "
+                            f"holds it, and one mailbox has one account. Ask "
+                            f"the account that connected it, or this node's "
+                            f"owner, to use it or to disconnect it first.")
+
             # Auto-fill auto:True fields from env-var defaults so the
             # user doesn't have to know about gateway infrastructure
             # (WAHA api_url for WhatsApp, etc).  Order:
@@ -614,7 +668,6 @@ def build_channel_tool_closures(ctx):
             # every setting its adapter is started from (sealed as in
             # ``saved``): boot restore rebuilds each account from its row, and
             # a second mailbox never overwrites the first's.
-            account = FlaskChannelIntegration.channel_account(channel_type, config)
             cred_meta = {}
             if account:
                 cred_meta = {
@@ -626,7 +679,7 @@ def build_channel_tool_closures(ctx):
                 cred_meta = {required[0]: saved[required[0]]}
 
             # Create user binding
-            uid = user_id or _get_user_id_from_threadlocal()
+            uid = connecting
             if uid:
                 try:
                     from integrations.social.models import get_db, UserChannelBinding
@@ -651,6 +704,16 @@ def build_channel_tool_closures(ctx):
                             if cred_meta:
                                 existing.metadata_json = {
                                     **(existing.metadata_json or {}), **cred_meta}
+                        if account and takes_over:
+                            # The node's own account connected it: any other
+                            # account's claim on this address (a squatter's,
+                            # made before the owner connected it) ends, so
+                            # its goals can no longer send from it.
+                            db.query(UserChannelBinding).filter(
+                                UserChannelBinding.channel_type == channel_type,
+                                UserChannelBinding.channel_sender_id == account,
+                                UserChannelBinding.user_id != str(uid),
+                            ).update({'is_active': False})
                         db.commit()
                     finally:
                         db.close()
@@ -699,7 +762,12 @@ def build_channel_tool_closures(ctx):
                              account=account)
                 return (f"{label} registered and enabled! Auth: "
                         f"{meta['auth_method']}. Connecting now; you'll see a "
-                        f"confirmation here once it's live.")
+                        f"confirmation here once it's live. This is a goal "
+                        f"mailbox: it sends the outreach email of goals whose "
+                        f"sender_email is this address and reads its inbox "
+                        f"only for prospects' replies. It does not chat with "
+                        f"the agent or answer mail, and every other mail stays "
+                        f"unread for you.")
 
             blocker = chat_connect_blocker(channel_type, meta)
             if blocker and blocker[0] == SEVERAL_CREDENTIALS:

@@ -65,6 +65,7 @@ class _MailWorld:
         self.inbox = {}      # imap host -> [[raw bytes, seen], ...]
         self.sent = []       # one dict per message an SMTP server accepted
         self.bodies = []     # (imap host, fetch spec) per whole message fetched
+        self.header_fetches = []   # (imap host, message set) per header FETCH
         self.lock = threading.Lock()
 
     def seen(self, host):
@@ -96,15 +97,35 @@ def _fake_servers(world):
                         if not seen]
             return 'OK', [b' '.join(nums)]
 
+        @staticmethod
+        def _numbers(message_set):
+            """The message numbers of an IMAP sequence-set ('3:9,12')."""
+            text = (message_set.decode() if isinstance(message_set, bytes)
+                    else str(message_set))
+            numbers = []
+            for part in text.split(','):
+                low, _, high = part.partition(':')
+                numbers.extend(range(int(low), int(high or low) + 1))
+            return numbers
+
         def fetch(self, num, parts):
             with world.lock:
+                if 'HEADER.FIELDS' in parts:
+                    # A header FETCH of a sequence-set, one reply item per
+                    # message, each with its UID (the server's stable number,
+                    # the message number plus 1000 here so the two differ).
+                    world.header_fetches.append((self.host, num))
+                    out = []
+                    for n in self._numbers(num):
+                        raw = world.inbox[self.host][n - 1][0]
+                        head = ('Message-ID: %s\r\n\r\n' % email.message_from_bytes(
+                            raw).get('Message-ID', '')).encode()
+                        prefix = ('%d (UID %d BODY[HEADER.FIELDS (MESSAGE-ID)] {%d}'
+                                  % (n, n + 1000, len(head))).encode()
+                        out.extend([(prefix, head), b')'])
+                    return 'OK', out
                 entry = world.inbox[self.host][int(num) - 1]
                 raw = entry[0]
-                if 'HEADER.FIELDS' in parts:
-                    head = ('Message-ID: %s\r\n\r\n' % email.message_from_bytes(
-                        raw).get('Message-ID', '')).encode()
-                    return 'OK', [(num + b' (BODY[HEADER.FIELDS (MESSAGE-ID)])', head),
-                                  b')']
                 if 'PEEK' not in parts:
                     entry[1] = True     # a plain fetch sets \Seen, as servers do
                 world.bodies.append((self.host, parts))
@@ -663,6 +684,7 @@ def test_a_goal_mailbox_is_never_answered_through_the_nodes_own_email_channel(no
     _legacy_mailbox(node, monkeypatch)
     _connect(HEVOLVE)
     box = _mailbox(node.channels, HEVOLVE)
+    node.store.register_reply_handler()      # a mailbox is read only once a hook is on it
     _deliver(node.mail, HEVOLVE, *PEOPLE)
 
     _poll(node.channels, box)
@@ -670,6 +692,7 @@ def test_a_goal_mailbox_is_never_answered_through_the_nodes_own_email_channel(no
 
     agent.assert_not_called()
     assert node.mail.sent == []
+    assert len(node.mail.bodies) == len(PEOPLE)          # the poll did read it
 
 
 def test_two_goal_mailboxes_never_mail_each_other(node):
@@ -679,6 +702,7 @@ def test_two_goal_mailboxes_never_mail_each_other(node):
     for address in (HEVOLVE, MCGROCE):
         _connect(address)
         boxes[address] = _mailbox(node.channels, address)
+    node.store.register_reply_handler()      # a mailbox is read only once a hook is on it
     _deliver(node.mail, MCGROCE, (HEVOLVE, 'hello', 'from the other mailbox'))
     _deliver(node.mail, HEVOLVE, (MCGROCE, 'hello', 'from the other mailbox'))
 
@@ -688,6 +712,7 @@ def test_two_goal_mailboxes_never_mail_each_other(node):
 
     assert node.mail.sent == []
     agent.assert_not_called()
+    assert len(node.mail.bodies) == 2                    # each read once, by the hook only
 
 
 # ── 6c. an inbound From is never the owner ───────────────────────────
@@ -874,6 +899,362 @@ def test_the_node_mailboxs_email_is_verified_too(node, monkeypatch):
 
     assert out['success'] is False and 'blank' in out['error']
     assert node.mail.sent == [] and node.mailer == []
+
+
+# ── 6g. review of 88b6821f2: the journey, the mailbox's owner, the poll ─
+
+def _quiet_journey(monkeypatch, store):
+    """The journey's side doors a stage change knocks on, stubbed: the agent
+    dispatch (deep research, draft response) and the owner's push."""
+    from integrations.agent_engine import dispatch
+    from integrations.channels.response import router
+    monkeypatch.setattr(dispatch, 'dispatch_goal', MagicMock(), raising=False)
+    monkeypatch.setattr(store, '_dispatch_response_draft', MagicMock())
+    monkeypatch.setattr(router, 'get_response_router', lambda *a, **k: MagicMock())
+
+
+def test_a_goals_turn_moves_only_its_own_goals_prospects_through_the_journey(node, monkeypatch):
+    """M1: advance_prospect_stage ran a stage's auto-actions for any goal's
+    prospect, so another goal's turn made this goal's mailbox send ('engaged':
+    a meeting proposal; 'outreach': the journey's template email) while its
+    sibling send_prospect_message refused."""
+    _quiet_journey(monkeypatch, node.store)
+    for address in (HEVOLVE, MCGROCE):
+        _connect(address)
+        _mailbox(node.channels, address)
+    tools = _tools(monkeypatch, node.store)
+    journey = _journey_tools(monkeypatch)
+    speech = _prospect(tools, 'Clinic', 'ana@clinic.example', 'g-speech')
+    speech2 = _prospect(tools, 'Clinic Two', 'bo@clinic2.example', 'g-speech')
+    advance = journey['advance_prospect_stage']
+
+    engaged = json.loads(_in_turn('g-lashes', advance, speech, 'engaged'))
+    research = json.loads(_in_turn('g-lashes', advance, speech2, 'research'))
+    outreach = json.loads(_in_turn('g-lashes', advance, speech2, 'outreach'))
+    named = json.loads(_named_turn('g-speech', advance, speech, 'engaged'))
+    person = json.loads(advance(speech, 'engaged'))
+
+    for out in (engaged, research, outreach, named, person):
+        assert out.get('success') is False and 'moved' not in out, out
+        assert 'Speech therapy centres' in json.dumps(out)
+    prospects = node.store._load_prospects()['prospects']
+    assert all('journey_stage' not in prospects[p] for p in (speech, speech2))
+    assert node.mail.sent == []
+    own = json.loads(_in_turn('g-speech', advance, speech2, 'research'))
+    assert own.get('moved') is True
+
+
+def test_a_goals_prospect_changes_stage_only_in_its_own_goals_turn(node, monkeypatch):
+    """S6: move_prospect_stage was the one writer left unguarded; another
+    goal's turn (and a person's) moved a speech prospect to 'won' / 'lost'."""
+    tools = _tools(monkeypatch, node.store)
+    speech = _prospect(tools, 'Clinic', 'ana@clinic.example', 'g-speech')
+    move = tools['move_prospect_stage']
+
+    other = json.loads(_in_turn('g-lashes', move, speech, 'won'))
+    person = json.loads(move(speech, 'lost', 'not interested'))
+
+    for out in (other, person):
+        assert out['success'] is False and 'Speech therapy centres' in json.dumps(out)
+    stage = lambda: node.store._load_prospects()['prospects'][speech]['stage']  # noqa: E731
+    assert stage() == 'new'
+    own = json.loads(_in_turn('g-speech', move, speech, 'contacted'))
+    assert own['success'] is True and stage() == 'contacted'
+
+
+def test_a_persons_turn_is_told_what_the_person_can_do(node, monkeypatch):
+    """S3: a person's turn has no goal, so "work on this turn's own goal's
+    prospects" tells it nothing.  It reads what to tell the person; another
+    goal's turn still reads to work on its own goal's prospects."""
+    tools = _tools(monkeypatch, node.store)
+    speech = _prospect(tools, 'Clinic', 'ana@clinic.example', 'g-speech')
+    args = (speech, 'a question', '<p>hello</p>')
+
+    person = json.loads(tools['send_outreach_email'](*args))
+    other = json.loads(_in_turn('g-lashes', tools['send_outreach_email'], *args))
+
+    assert person['refused'] == 'another_goals_prospect' and person['retry'] == 'never'
+    assert 'Tell the person' in person['note'] and 'steer' in person['note']
+    assert 'Speech therapy centres' in person['note']
+    assert 'get_pipeline_status' not in person['note']
+    assert other['retry'] == 'after_fix' and 'get_pipeline_status' in other['note']
+
+
+def test_the_pipeline_lists_each_prospects_goal(node, monkeypatch):
+    """S7: the refusals point the agent to get_pipeline_status's goal_id."""
+    monkeypatch.setattr(node.store, '_get_erxes', lambda: None)
+    tools = _tools(monkeypatch, node.store)
+    speech = _prospect(tools, 'Clinic', 'ana@clinic.example', 'g-speech')
+    lashes = _prospect(tools, 'Salon', 'ravi@salon.example', 'g-lashes')
+    nobody = _prospect(tools, 'Shop', 'mo@shop.example')
+
+    status = json.loads(tools['get_pipeline_status']())
+
+    listed = {p['id']: p['goal_id'] for rows in status['pipeline'].values() for p in rows}
+    assert listed == {speech: 'g-speech', lashes: 'g-lashes', nobody: None}
+
+
+def test_connecting_a_mailbox_says_what_a_goal_mailbox_is_for(node):
+    """S4: the connect form reads like every chat channel; the reply says
+    this mailbox sends goals' email, reads only prospects' replies and never
+    chats."""
+    said = _connect(HEVOLVE)
+
+    assert 'registered and enabled' in said
+    assert 'goal mailbox' in said and "prospects' replies" in said
+    assert 'does not chat with the agent' in said
+
+
+# ── 6h. who may use a company mailbox (review of 88b6821f2, M2) ──────
+
+def _api():
+    """The real routes a signed-in account reaches: sign-up, goals and the
+    channel setup form."""
+    from flask import Flask
+    from integrations.agent_engine.api import agent_engine_bp
+    from integrations.social.api import social_bp
+    from integrations.social.api_channels import channel_user_bp
+    from integrations.social.rate_limiter import get_limiter
+    app = Flask(__name__)
+    app.config['TESTING'] = True
+    for blueprint in (social_bp, channel_user_bp, agent_engine_bp):
+        app.register_blueprint(blueprint)
+    get_limiter()._buckets.clear()
+    return app.test_client()
+
+
+@pytest.fixture
+def web(node):
+    """Accounts that sign up, create goals and connect mailboxes through the
+    real routes; their goals and bindings are removed afterwards."""
+    import uuid
+    from integrations.agent_engine import goal_manager
+    from integrations.social.models import AgentGoal, UserChannelBinding, db_session
+    if 'outreach' not in goal_manager.get_registered_types():
+        node.store.register_outreach_goal_type()
+    made = SimpleNamespace(client=_api(), users=[], goals=[])
+
+    def sign_up(name):
+        reg = made.client.post('/api/social/auth/register', json={
+            'username': f'{name}_{uuid.uuid4().hex[:6]}', 'password': 'testpass123',
+            'display_name': name}).get_json()['data']
+        made.users.append(str(reg['id']))
+        return {'id': str(reg['id']),
+                'auth': {'Authorization': f"Bearer {reg['api_token']}"}}
+
+    def connect(who, address, password=None):
+        host = HOSTS[address]
+        return made.client.post(
+            '/api/social/channels/email/connect', headers=who['auth'],
+            json={'imap_host': f'imap.{host}', 'smtp_host': f'smtp.{host}',
+                  'email_address': address,
+                  'password': password or PASSWORDS[address]})
+
+    def goal(who, title, sender):
+        resp = made.client.post('/api/goals', headers=who['auth'], json={
+            'goal_type': 'outreach', 'title': title,
+            'description': 'tell people about it',
+            'config': {'sender_email': sender}})
+        assert resp.status_code == 201, resp.get_json()
+        made.goals.append(resp.get_json()['goal']['id'])
+        return made.goals[-1]
+
+    made.sign_up, made.connect, made.goal = sign_up, connect, goal
+    yield made
+    with db_session() as db:
+        for gid in made.goals:
+            db.query(AgentGoal).filter_by(id=gid).delete()
+        for uid in made.users:
+            db.query(UserChannelBinding).filter_by(user_id=uid).delete()
+
+
+def _send_in(goal, tools, to='victim@anywhere.example', subject='cheap watches'):
+    """A goal's agent creates a prospect and emails it, in the goal's own turn."""
+    pid = _prospect(tools, 'Anyone', to, goal)
+    return json.loads(_in_turn(goal, tools['send_outreach_email'], pid, subject,
+                               '<p>buy our watches</p>'))
+
+
+def test_a_strangers_goal_cannot_send_from_a_company_mailbox(node, web, monkeypatch):
+    """M2: any signed-in account creates a goal through POST /api/goals with
+    config sender_email set to a company mailbox, and the daemon runs it:
+    mail then left the company's address with a stranger's words."""
+    _connect(HEVOLVE)
+    _mailbox(node.channels, HEVOLVE)
+    stranger = web.sign_up('stranger')
+    goal = web.goal(stranger, 'Spring watch sale', HEVOLVE)
+
+    out = _send_in(goal, _tools(monkeypatch, node.store))
+
+    assert out['success'] is False and out['sent'] is False
+    assert HEVOLVE in out['error'] and "owner" in out['error']     # who may use it
+    assert node.mail.sent == [] and node.mailer == []
+
+
+def test_the_account_that_connected_a_mailbox_may_make_a_goal_that_sends_from_it(node, web, monkeypatch):
+    seller = web.sign_up('seller')
+    resp = web.connect(seller, MCGROCE)
+    assert resp.get_json()['success'] is True, resp.get_json()
+    _mailbox(node.channels, MCGROCE)
+    goal = web.goal(seller, 'My own lash outreach', MCGROCE)
+
+    out = _send_in(goal, _tools(monkeypatch, node.store))
+
+    assert out['success'] is True, out
+    assert [m['to'] for m in node.mail.sent_from(MCGROCE)] == ['victim@anywhere.example']
+
+
+def test_a_goal_made_by_the_nodes_owner_may_use_a_mailbox_another_account_connected(node, web, monkeypatch):
+    owner = web.sign_up('theowner')
+    monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', owner['id'])
+    _connect(HEVOLVE)                      # connected by the 'owner-ee' account
+    _mailbox(node.channels, HEVOLVE)
+    goal = web.goal(owner, 'Speech therapy centres, the owner\'s own', HEVOLVE)
+
+    out = _send_in(goal, _tools(monkeypatch, node.store), to='ana@clinic.example')
+
+    assert out['success'] is True, out
+    assert [m['to'] for m in node.mail.sent_from(HEVOLVE)] == ['ana@clinic.example']
+
+
+def test_a_second_account_cannot_connect_a_mailbox_another_account_holds(node, web):
+    from integrations.social.models import UserChannelBinding, db_session
+    _connect(HEVOLVE)
+    first = _mailbox(node.channels, HEVOLVE)
+    intruder = web.sign_up('intruder')
+
+    resp = web.connect(intruder, HEVOLVE, password='intruder-SECRET')
+
+    assert resp.status_code == 400 and 'another account' in resp.get_json()['error']
+    assert node.channels.registry.accounts('email')[HEVOLVE] is first and first.is_running()
+    with db_session(commit=False) as db:
+        assert db.query(UserChannelBinding).filter_by(
+            user_id=intruder['id'], channel_type='email').count() == 0
+        assert db.query(UserChannelBinding).filter_by(
+            user_id=OWNER, channel_type='email', channel_sender_id=HEVOLVE,
+            is_active=True).count() == 1
+
+
+def test_a_mailbox_named_in_a_bindings_metadata_is_not_a_connect(node, web, monkeypatch):
+    """POST /api/social/channels/bindings stores 'metadata' verbatim: a row
+    naming a mailbox there needs no credential and no connect, yet read as
+    "the account that connected it"."""
+    from integrations.social.models import UserChannelBinding, db_session
+    _connect(HEVOLVE)
+    _mailbox(node.channels, HEVOLVE)
+    forger = web.sign_up('forger')
+
+    resp = web.client.post('/api/social/channels/bindings', headers=forger['auth'], json={
+        'channel_type': 'email', 'channel_sender_id': HEVOLVE,
+        'metadata': {'email_address': HEVOLVE}})
+    goal = web.goal(forger, 'Spring watch sale', HEVOLVE)
+    out = _send_in(goal, _tools(monkeypatch, node.store))
+
+    assert resp.status_code == 400
+    with db_session(commit=False) as db:
+        assert db.query(UserChannelBinding).filter_by(user_id=forger['id']).count() == 0
+    assert out['success'] is False and node.mail.sent == []
+
+
+def test_the_nodes_owner_connecting_a_mailbox_ends_a_squatters_claim(node, web, monkeypatch):
+    """A stranger connects the company address before the owner does (with
+    credentials of their own); once the owner connects it for real, the
+    stranger's goals cannot send from it."""
+    owner = web.sign_up('theowner')
+    monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', owner['id'])
+    squatter = web.sign_up('squatter')
+    assert web.connect(squatter, HEVOLVE, password='squatter-SECRET').get_json()['success']
+    squatted = web.goal(squatter, 'Spring watch sale', HEVOLVE)
+
+    resp = web.connect(owner, HEVOLVE)
+    assert resp.get_json()['success'] is True, resp.get_json()
+    _mailbox(node.channels, HEVOLVE)
+    tools = _tools(monkeypatch, node.store)
+    refused = _send_in(squatted, tools)
+    own = _send_in(web.goal(owner, 'Speech therapy centres, the owner\'s own', HEVOLVE),
+                   tools, to='ana@clinic.example')
+
+    assert refused['success'] is False
+    assert own['success'] is True, own
+    assert [m['to'] for m in node.mail.sent_from(HEVOLVE)] == ['ana@clinic.example']
+
+
+# ── 6i. the poll: a reply is not lost, an unread inbox is cheap ──────
+
+def test_a_reply_waiting_before_the_hook_is_attached_is_matched_once_it_is(node, monkeypatch):
+    """S1: a prospect's reply already in the mailbox when it connects (a
+    restart, or mail that came while the node was down) was recorded as seen
+    by a poll that had no handler, so it was never matched and the prospect
+    kept getting follow-ups."""
+    store = node.store
+    drafts = MagicMock()
+    monkeypatch.setattr(store, '_dispatch_response_draft', drafts)
+    monkeypatch.setattr(store, '_notify_prospect_replied', MagicMock())
+    tools = _tools(monkeypatch, store)
+    speech = _prospect(tools, 'Clinic', 'ana@clinic.example', 'g-speech')
+    host = _deliver(node.mail, HEVOLVE,
+                    ('ana@clinic.example', 'Re: a question', 'yes please'))
+    _connect(HEVOLVE)
+    box = _mailbox(node.channels, HEVOLVE)
+
+    _poll(node.channels, box)                  # no hook on the mailbox yet
+    assert node.mail.seen(host) == [False] and node.mail.bodies == []
+    store.check_pending_followups_daemon()     # the tick that attaches the hook
+    _poll(node.channels, box)
+
+    assert store._load_prospects()['prospects'][speech]['stage'] == 'replied'
+    assert drafts.call_count == 1
+    assert node.mail.seen(host) == [True]
+
+
+def test_an_unhandled_inbox_costs_one_header_fetch_per_poll(node, monkeypatch):
+    """S2: the owner's unread mail stays unread, so every poll meets all of
+    it again: one header FETCH for the whole set (not one per mail), and a
+    mail with no Message-ID known by its UID (it was fetched whole on every
+    poll)."""
+    _connect(HEVOLVE)
+    box = _mailbox(node.channels, HEVOLVE)
+    node.store.register_reply_handler()
+    host = _deliver(node.mail, HEVOLVE,
+                    *[(f'p{i}@x.example', f's{i}', 'b') for i in range(50)])
+    with node.mail.lock:
+        node.mail.inbox[host].append(
+            [email.mime.text.MIMEText('no id').as_bytes(), False])   # no Message-ID
+
+    per_poll = []
+    for _ in range(3):
+        headers, bodies = len(node.mail.header_fetches), len(node.mail.bodies)
+        _poll(node.channels, box)
+        per_poll.append((len(node.mail.header_fetches) - headers,
+                         len(node.mail.bodies) - bodies))
+
+    assert per_poll == [(1, 51), (1, 0), (1, 0)]
+    assert node.mail.seen(host).count(False) == 51          # still the owner's
+
+
+def test_a_server_that_puts_the_uid_after_the_header_is_read_too():
+    """Where a server puts the UID in a header FETCH reply varies: after the
+    header literal, in the closing ' UID 12)', is as valid as before it."""
+    from integrations.channels.extensions.email_adapter import (
+        EmailAdapter, EmailConfig, _sequence_sets)
+
+    class _Imap:
+        def fetch(self, message_set, parts):
+            return 'OK', [(b'1 (BODY[HEADER.FIELDS (MESSAGE-ID)] {20}',
+                           b'Message-ID: <a@x>\r\n\r\n'), b' UID 11)',
+                          (b'2 (BODY[HEADER.FIELDS (MESSAGE-ID)] {4}', b'\r\n\r\n'),
+                          b' UID 12)']
+
+    adapter = EmailAdapter(EmailConfig(mark_as_read=False))
+    adapter._imap = _Imap()
+    assert adapter._unprocessed([b'1', b'2']) == [
+        (b'1', b'11', '<a@x>'), (b'2', b'12', '')]
+    adapter._seen_uids.add(b'12')
+    adapter._seen_message_ids.add('<a@x>')
+    assert adapter._unprocessed([b'1', b'2']) == []
+    assert _sequence_sets([b'1', b'2', b'3', b'7', b'9', b'10']) == ['1:3,7,9:10']
+    assert _sequence_sets([b'1', b'3', b'5', b'7'], limit=4) == ['1,3', '5,7']
+    assert _sequence_sets([]) == []
 
 
 # ── 7. no password in a refusal, a tool result or a log line ─────────
