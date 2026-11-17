@@ -1883,6 +1883,12 @@ class _PhysicalInputMonitor:
 
     GetLastInputInfo includes injected automation. Low-level event flags
     distinguish it from hardware input. No keys/text/coordinates are stored.
+
+    One optional SINK may also listen (attach_sink), for a demonstration the
+    owner started (integrations.vlm.demo_session): a person showing an agent
+    how to do something.  It is the same hook and the same hardware-only
+    filter, not a second listener.  What reaches a sink never contains what was
+    typed: see _classify_key.
     """
     def __init__(self):
         self._lock = threading.Lock()
@@ -1891,6 +1897,15 @@ class _PhysicalInputMonitor:
         self._available = False
         self._generation = 0
         self._last_input = None
+        self._sink = None
+
+    def attach_sink(self, sink) -> bool:
+        """Offer hardware input events to ``sink``; False when this platform's
+        monitor cannot classify keys inside its hook (only Windows can)."""
+        return False
+
+    def detach_sink(self, sink) -> None:
+        """Stop offering events to ``sink`` (a no-op for anyone else's)."""
 
     def record_activity(self):
         with self._lock:
@@ -1911,13 +1926,226 @@ class _PhysicalInputMonitor:
                 return None
             return self._generation, self._last_input
 
+import re as _re   # kept beside its only user, the demonstration sink below
+
+# ── What a demonstration sink may be told (owner 2026-11-11) ─────────────
+# A left or right button down, the vertical wheel, and a key down.  Moves (0x200)
+# are in the monitor's "presses" for takeover detection, but 300 seconds of them
+# would be tens of thousands of queue entries; releases never arrive at all, so a
+# hotkey is built from its key down.  The middle and X buttons and the horizontal
+# wheel are not offered: the action names the computer-use loop has
+# (integrations.vlm.activity_stream._ACTION_LABELS) have no word for them, and a
+# recorder must not do work only to throw it away.  They still count as takeover
+# activity above.
+_SINK_MOUSE = frozenset((0x201, 0x204, 0x20A))
+_SINK_KEYBOARD = frozenset((0x100, 0x104))
+
+# STRUCTURAL: a character-producing key is handed on as the token 'char' and
+# nothing else, so what a person typed never exists on the sink's side: no
+# queue, log line or crash dump of it can hold a password.  Anything this table
+# does not name is a character (fail closed).
+_VK_MODIFIERS = frozenset((0x10, 0x11, 0x12, 0x5B, 0x5C,
+                           0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5))
+_VK_KEY_NAMES = {
+    0x08: 'backspace', 0x09: 'tab', 0x0D: 'enter', 0x13: 'pause', 0x14: 'capslock',
+    0x1B: 'esc', 0x21: 'pageup', 0x22: 'pagedown', 0x23: 'end', 0x24: 'home',
+    0x25: 'left', 0x26: 'up', 0x27: 'right', 0x28: 'down', 0x2C: 'printscreen',
+    0x2D: 'insert', 0x2E: 'delete', 0x5D: 'menu', 0x90: 'numlock',
+    0x91: 'scrolllock'}
+_SAFE_KEY_TOKEN = _re.compile(
+    r'^(?:char|key:[a-z0-9_]{1,16}'
+    r'|hotkey:(?:(?:ctrl|alt|win)\+)+[a-z0-9_]{1,16})$')
+# A modifier pressed alone: takeover activity, never a sink event.
+_MODIFIER_ONLY = ('modifier', 0, None)
+
+
+def _vk_key_name(vk):
+    """The name of a NON-character key, or None for a character key."""
+    if vk in _VK_KEY_NAMES:
+        return _VK_KEY_NAMES[vk]
+    if 0x70 <= vk <= 0x87:
+        return 'f%d' % (vk - 0x6F)
+    return None
+
+
+def _vk_chord_name(vk):
+    """The key a Ctrl/Alt/Win chord names: a command, not typed content."""
+    name = _vk_key_name(vk)
+    if name:
+        return name
+    if 0x41 <= vk <= 0x5A or 0x30 <= vk <= 0x39:
+        return chr(vk).lower()
+    return 'space' if vk == 0x20 else 'other'
+
+
+def _classify_key(vk, ctrl=False, alt=False, win=False):
+    """The one thing a keystroke becomes before it leaves the hook.
+
+    ``None`` for a modifier alone; 'key:<name>' for a named non-character key;
+    'hotkey:<mods>+<key>' for a chord with Ctrl, Alt or Win; and 'char' for
+    everything else, including unknown codes and Ctrl+Alt together (AltGr
+    types characters on many layouts, so that chord is content, not a command).
+    """
+    if vk in _VK_MODIFIERS:
+        return None
+    if ctrl and alt:
+        return 'char'
+    if ctrl or alt or win:
+        mods = '+'.join(name for name, on in
+                        (('ctrl', ctrl), ('alt', alt), ('win', win)) if on)
+        return 'hotkey:%s+%s' % (mods, _vk_chord_name(vk))
+    name = _vk_key_name(vk)
+    return 'key:' + name if name else 'char'
+
+
+def _safe_key_detail(detail):
+    """(token, focus hwnd, native password flag), whatever the caller passed.
+
+    A detail that is not a well-formed token (a raw code, a character,
+    nothing) arrives as 'char': the sink can never be handed a key.
+    """
+    token, hwnd, native = 'char', 0, None
+    try:
+        if isinstance(detail, tuple) and len(detail) == 3:
+            candidate, focus, flag = detail
+            if isinstance(candidate, str) and _SAFE_KEY_TOKEN.match(candidate):
+                token = candidate
+            if isinstance(focus, int) and not isinstance(focus, bool):
+                hwnd = focus
+            if flag is True or flag is False:
+                native = flag
+    except Exception:
+        pass
+    return token, hwnd, native
+
+
+def _safe_mouse_detail(detail):
+    """(x, y, wheel delta) as integers, or (None, None, 0)."""
+    try:
+        x, y, delta = detail
+        return int(x), int(y), int(delta)
+    except Exception:
+        return None, None, 0
+
+
+_gui_thread_info_type = None
+
+
+def _gui_thread_info():
+    """A GUITHREADINFO instance (built once): which window has the keyboard
+    focus.  Windows only; read from inside the hook, so it must stay cheap."""
+    global _gui_thread_info_type
+    from ctypes import wintypes
+    if _gui_thread_info_type is None:
+        class GUITHREADINFO(ctypes.Structure):
+            _fields_ = [('cbSize', wintypes.DWORD), ('flags', wintypes.DWORD),
+                        ('hwndActive', wintypes.HWND), ('hwndFocus', wintypes.HWND),
+                        ('hwndCapture', wintypes.HWND),
+                        ('hwndMenuOwner', wintypes.HWND),
+                        ('hwndMoveSize', wintypes.HWND), ('hwndCaret', wintypes.HWND),
+                        ('rcCaret', wintypes.RECT)]
+        _gui_thread_info_type = GUITHREADINFO
+    info = _gui_thread_info_type()
+    info.cbSize = ctypes.sizeof(info)
+    return info
+
+
 class _WindowsPhysicalInputMonitor(_PhysicalInputMonitor):
-    def record_event(self, kind, flags, message):
+    def attach_sink(self, sink):
+        with self._lock:
+            if self._sink is not None:
+                return False
+            self._sink = sink
+            return True
+
+    def detach_sink(self, sink):
+        with self._lock:
+            if self._sink == sink:
+                self._sink = None
+
+    def _emit(self, kind, message, detail):
+        sink = self._sink
+        if sink is None:
+            return
+        try:
+            sink((time.monotonic(), kind, message, detail))
+        except Exception:
+            # A consumer's bug must never reach the hook: Windows removes a
+            # low-level hook that misbehaves, and takeover detection with it.
+            logger.debug('physical input sink failed', exc_info=True)
+
+    def record_event(self, kind, flags, message, detail=None):
         injected = 0x10 if kind == 'keyboard' else 0x01
         presses = (0x100, 0x104) if kind == 'keyboard' else (
             0x200, 0x201, 0x204, 0x207, 0x20A, 0x20B, 0x20E)
         if not flags & injected and message in presses:
             self.record_activity()
+            if (self._sink is not None and detail is not _MODIFIER_ONLY
+                    and message in (_SINK_KEYBOARD if kind == 'keyboard'
+                                    else _SINK_MOUSE)):
+                self._emit(kind, message, _safe_key_detail(detail)
+                           if kind == 'keyboard' else _safe_mouse_detail(detail))
+
+    @staticmethod
+    def _modifier_state():
+        """(ctrl, alt, win) as held right now."""
+        down = ctypes.windll.user32.GetAsyncKeyState
+        return (bool(down(0x11) & 0x8000), bool(down(0x12) & 0x8000),
+                bool(down(0x5B) & 0x8000 or down(0x5C) & 0x8000))
+
+    @staticmethod
+    def _focus_state():
+        """(focus hwnd, native password flag) for the keystroke being pressed.
+
+        The flag is True for a classic Edit control with ES_PASSWORD, False for
+        one without, None when the control is not a classic Edit (a browser's
+        own widget, say): the consumer then asks for a second opinion, and an
+        unknown answer counts as a secret.  No message is sent to the window,
+        so a hung application cannot stall the hook.
+        """
+        try:
+            user32 = ctypes.windll.user32
+            info = _gui_thread_info()
+            if not user32.GetGUIThreadInfo(0, ctypes.byref(info)):
+                return 0, None
+            hwnd = info.hwndFocus or info.hwndActive
+            if not hwnd:
+                return 0, None
+            name = ctypes.create_unicode_buffer(64)
+            user32.GetClassNameW(hwnd, name, 64)
+            if name.value.lower() == 'edit' or name.value.lower().startswith('richedit'):
+                style = user32.GetWindowLongW(hwnd, -16)    # GWL_STYLE
+                return int(hwnd), bool(style & 0x20)         # ES_PASSWORD
+            return int(hwnd), None
+        except Exception:
+            return 0, None
+
+    def _on_hook_event(self, kind, event, message):
+        """What the hook callback does with one event: the ONLY place the raw
+        key structure is read, and it hands on a token, never the code.
+
+        With no sink attached nothing extra is read, so takeover detection costs
+        what it always did.  Any failure here leaves the detail empty, which
+        reaches the sink as the token 'char', never as a key.
+        """
+        detail = None
+        if self._sink is not None:
+            try:
+                if kind == 'mouse':
+                    delta = (ctypes.c_short((event.data >> 16) & 0xFFFF).value
+                             if message == 0x20A else 0)
+                    detail = (event.point.x, event.point.y, delta)
+                else:
+                    ctrl, alt, win = self._modifier_state()
+                    token = _classify_key(event.vkCode, ctrl, alt, win)
+                    if token is None:
+                        detail = _MODIFIER_ONLY
+                    else:
+                        hwnd, native = self._focus_state()
+                        detail = (token, hwnd, native)
+            except Exception:
+                detail = None
+        self.record_event(kind, event.flags, message, detail)
 
     def _listen(self):
         from ctypes import wintypes
@@ -1953,7 +2181,7 @@ class _WindowsPhysicalInputMonitor(_PhysicalInputMonitor):
                 def receive(code, message, data):
                     if code >= 0:
                         event = ctypes.cast(data, ctypes.POINTER(structure)).contents
-                        self.record_event(kind, event.flags, message)
+                        self._on_hook_event(kind, event, message)
                     return user32.CallNextHookEx(None, code, message, data)
                 return hook_proc(receive)
             # Callbacks must remain referenced throughout the message pump.
@@ -2157,3 +2385,25 @@ def get_physical_input_state(*, start=True):
     if _physical_input_monitor is None:
         return None
     return _physical_input_monitor.snapshot(start=start)
+
+
+def attach_physical_input_sink(sink) -> bool:
+    """Offer this machine's HARDWARE input events to ``sink``, for one
+    demonstration the owner started (integrations.vlm.demo_session).
+
+    Starts the one monitor if it is not running and refuses when it is
+    unavailable or this platform cannot classify keys inside its hook.  The
+    sink gets ``(time.monotonic(), kind, message, detail)`` and must never block;
+    no character a person typed is ever in ``detail`` (_classify_key).
+    """
+    monitor = _physical_input_monitor
+    if monitor is None or monitor.snapshot(start=True) is None:
+        return False
+    return bool(monitor.attach_sink(sink))
+
+
+def detach_physical_input_sink(sink) -> None:
+    """Stop offering events to ``sink``; harmless for a sink not attached."""
+    monitor = _physical_input_monitor
+    if monitor is not None:
+        monitor.detach_sink(sink)

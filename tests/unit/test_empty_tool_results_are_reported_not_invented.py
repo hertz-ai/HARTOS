@@ -98,9 +98,10 @@ def _ns():
 
     # _reuse_registered_and_referenced_tools delegates to the one rule in
     # hartos.lifecycle_hooks (#147), which imports without autogen.
-    from hartos.lifecycle_hooks import action_named_tools
+    # A lifted _REUSE_* constant may name SEND_TOOL (_REUSE_ASK_TOOLS).
+    from hartos.lifecycle_hooks import SEND_TOOL, action_named_tools
     ns = {'retrieve_json': retrieve_json, 'json': json,
-          'action_named_tools': action_named_tools,
+          'action_named_tools': action_named_tools, 'SEND_TOOL': SEND_TOOL,
           '_reuse_evidence_msg_lists': lambda gc, ag: [gc]}
     mod = ast.Module(body=body, type_ignores=[])
     exec(compile(ast.fix_missing_locations(mod), MODULE, 'exec'), ns)

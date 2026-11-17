@@ -243,13 +243,13 @@ def create_binding():
     elif credential:
         # Started, not yet connected: tell the user how it ends (the same
         # watcher register_channel uses), so a wrong token is a visible toast
-        # instead of a "connected" binding that never receives anything.
-        import threading
-        from integrations.channels.agent_tools import _report_when_live
-        threading.Thread(
-            target=_report_when_live, args=(channel_type, meta, g.user_id),
-            name=f'channel-probe-{channel_type}', daemon=True,
-        ).start()
+        # instead of a "connected" binding that never receives anything.  The
+        # start is recorded with its value's fingerprint (start_verdict), so
+        # post_to_channel never writes an older value over this one.
+        from integrations.channels.agent_tools import (
+            _watch_start, credential_fingerprint)
+        _watch_start(channel_type, meta, g.user_id,
+                     credential_fingerprint(credential))
 
     # `live` says whether the adapter could be started, so a caller never
     # reads a saved binding as a working channel.

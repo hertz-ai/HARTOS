@@ -52,7 +52,7 @@ def test_execute_pending_after_a_user_reply_starts_the_action(session):
     assert L.get_action_state(up, 1) == S.PENDING
     assert led.tasks['action_1'].status == TaskStatus.BLOCKED
 
-    assert L.resume_from_user_input(up, 1, 'user replied', 'Yes, proceed')
+    assert L.resume_from_user_input(up, 1, 'user replied')
     assert led.tasks['action_1'].status == TaskStatus.IN_PROGRESS
 
     # The call create_recipe's [EXECUTE-PENDING] makes, verbatim.

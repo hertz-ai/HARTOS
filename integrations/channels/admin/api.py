@@ -650,6 +650,17 @@ def activate_channel(channel_type: str):
         raise FileNotFoundError(f"Channel {channel_type} not found")
     if not config.get('enabled'):
         raise ValueError(f"Channel {channel_type} is disabled — enable it first")
+    from integrations.channels.agent_tools import ANNOUNCE_ONLY_KEY
+    if config.get(ANNOUNCE_ONLY_KEY):
+        # The entry only holds where announcements go; the channel runs from
+        # the environment or a saved binding.  Registering from it would
+        # replace that adapter with one that has no credential (review of
+        # 506a79c1f; boot skips the same entries, hartos_bootstrap).
+        raise ValueError(
+            f"Channel {channel_type} has no credential here to start it "
+            f"with: this entry only holds its announcement destination, and "
+            f"the channel runs from its own settings. Connect it with its "
+            f"credential instead.")
 
     token = config.get('token') or config.get('api_key')
 

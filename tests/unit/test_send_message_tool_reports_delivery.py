@@ -52,14 +52,14 @@ def _tool(send1, request_id_list=None):
 
 def test_a_failed_send_is_reported_as_failed():
     send1 = MagicMock(return_value=_FAILED)
-    out = _tool(send1)('Which month should I use?')
+    out = _tool(send1)('Which month should I use?', expects_reply=True)
     assert out == _FAILED, out
     send1.assert_called_once_with('u1', 'Which month should I use?', '', 'p1')
 
 
 def test_a_delivered_message_is_reported_with_the_senders_own_words():
     send1 = MagicMock(return_value=_SENT)
-    assert _tool(send1)('hello') == _SENT
+    assert _tool(send1)('hello', expects_reply=False) == _SENT
 
 
 def test_the_send_has_finished_before_the_tool_answers():
@@ -71,7 +71,7 @@ def test_the_send_has_finished_before_the_tool_answers():
         ran_on.append(threading.current_thread())
         return _SENT
 
-    _tool(send1)('hello')
+    _tool(send1)('hello', expects_reply=False)
     assert ran_on == [threading.current_thread()]
 
 
@@ -79,19 +79,19 @@ def test_no_request_id_on_record_does_not_break_the_tool():
     """The tool used to build its own receipt from request_id_list[user_prompt]
     and raised KeyError when there was none; the sender owns the id."""
     send1 = MagicMock(return_value=_SENT)
-    assert _tool(send1, request_id_list={})('hello') == _SENT
+    assert _tool(send1, request_id_list={})('hello', expects_reply=False) == _SENT
 
 
 @pytest.mark.parametrize('result', [None, '', 42])
 def test_a_sender_that_reports_nothing_is_never_read_as_success(result):
-    out = _tool(MagicMock(return_value=result))('hello')
+    out = _tool(MagicMock(return_value=result))('hello', expects_reply=False)
     assert 'successfully' not in out.lower(), out
     assert 'not confirmed' in out, out
 
 
 def test_a_message_for_another_agent_is_still_not_sent():
     send1 = MagicMock(return_value=_SENT)
-    out = _tool(send1)('@helper please run it')
+    out = _tool(send1)('@helper please run it', expects_reply=False)
     send1.assert_not_called()
     assert 'not sending to user' in out
 
@@ -107,6 +107,7 @@ def bundled(monkeypatch):
 def central(monkeypatch):
     monkeypatch.delenv('NUNBA_BUNDLED', raising=False)
     monkeypatch.delattr(sys, 'frozen', raising=False)
+    monkeypatch.setenv('AUTOGEN_RESPONSE_URL', 'http://backend.test/autogen_response')
 
 
 def _publisher(monkeypatch, pub):
@@ -120,18 +121,25 @@ def _publisher(monkeypatch, pub):
 
 
 def _lift_create_send(post):
+    """CREATE's real function, lifted; each call runs with the one
+    transport an agent message takes off the desktop (core.http_pool.
+    pooled_post_once, through hartos.helper.post_agent_message) replaced
+    by ``post``."""
+    from unittest.mock import patch
     path = os.path.join(_ROOT, 'hartos', 'create_recipe.py')
     src = open(path, encoding='utf-8').read()
     fn = next(n for n in ast.parse(src).body
               if isinstance(n, ast.FunctionDef)
               and n.name == 'send_message_to_user1')
     from core.config_cache import is_bundled
-    ns = {'json': json, 'pooled_post': post,
-          'request_id_list': {'c1_p1': 'req9'},
-          'is_bundled': is_bundled,
-          'current_app': SimpleNamespace(logger=MagicMock())}
+    ns = {'json': json, 'request_id_list': {'c1_p1': 'req9'},
+          'is_bundled': is_bundled}
     exec(ast.get_source_segment(src, fn), ns)
-    return ns['send_message_to_user1']
+
+    def send(*args, **kwargs):
+        with patch('core.http_pool.pooled_post_once', post):
+            return ns['send_message_to_user1'](*args, **kwargs)
+    return send
 
 
 def test_create_desktop_publish_is_reported_sent(bundled, monkeypatch):
@@ -151,7 +159,7 @@ def test_create_desktop_publish_that_did_not_happen_is_reported_failed(
 
 def test_create_central_post_is_reported_sent(central, monkeypatch):
     _publisher(monkeypatch, MagicMock())
-    post = MagicMock()
+    post = MagicMock(return_value=SimpleNamespace(status_code=200, text=''))
     out = _lift_create_send(post)('c1', 'hi', '', 'p1')
     assert post.call_count == 1
     assert out == 'Message sent successfully to user with request_id: req9-intermediate'
@@ -162,4 +170,6 @@ def test_create_central_post_that_raised_is_reported_failed(
     _publisher(monkeypatch, MagicMock())
     post = MagicMock(side_effect=OSError('refused'))
     out = _lift_create_send(post)('c1', 'hi', '', 'p1')
-    assert out == 'Failed to send message to user with request_id: req9-intermediate'
+    assert out == ('Failed to send message to user with request_id: '
+                   'req9-intermediate: the service that delivers agent '
+                   'messages could not be reached (OSError)')

@@ -18,9 +18,13 @@ All tools reuse existing infrastructure:
 - thread_local_data for channel context
 """
 
+import hashlib
+import itertools
 import json
 import logging
 import re
+import threading
+from datetime import datetime
 from typing import Annotated, Optional
 
 logger = logging.getLogger(__name__)
@@ -147,6 +151,261 @@ def _report_when_live(channel_type: str, meta: dict, owner,
     return False
 
 
+#: How a live start scheduled by register_channel ended, as its watcher
+#: (_report_when_live) saw it.  start_verdict answers with one of these.
+START_WATCHING = 'watching'
+START_CONNECTED = 'connected'
+START_FAILED = 'failed'
+
+#: channel -> {'start': n, 'state': START_*, 'fp': fingerprint of the value
+#: it started with (None when unknown), 'owner_fp': fingerprint of the
+#: owner's own stored value at that moment ('' when the name was not theirs
+#: at all, None when it could not be told: _owner_value_fingerprint), 'at':
+#: when it started (naive UTC, as the consent
+#: table's granted_at)} for the latest start of each channel.  n grows with
+#: every start.
+_STARTS = {}
+_STARTS_LOCK = threading.Lock()
+_START_NUMBERS = itertools.count(1)
+
+
+def credential_fingerprint(value) -> str:
+    """Which credential value a start used, comparable without keeping the
+    value itself (sha256 hex)."""
+    return hashlib.sha256(str(value).encode('utf-8')).hexdigest()
+
+
+def start_verdict(channel_type: str) -> Optional[dict]:
+    """The latest live start of ``channel_type`` in this process (a copy:
+    {'start', 'state', 'fp', 'owner_fp', 'at'}), or None when there was
+    none.
+
+    Every start that wires an adapter from one credential records itself
+    here: register_channel (the agent tool, Connect_Channel, OAuth) and the
+    connect form's create_binding.  post_to_channel decides from it: still
+    being watched is connecting; a start with the owner's value that
+    CONNECTED proves the value, so a later drop is connected again; one that
+    FAILED is a value the channel refused; a start with ANOTHER value is a
+    newer choice, which the owner's stored value replaces only once that
+    value has changed since ('owner_fp'; reviews of 506a79c1f, 1feb76f14 and
+    b6dcae15e)."""
+    with _STARTS_LOCK:
+        entry = _STARTS.get(channel_type)
+        return dict(entry) if entry else None
+
+
+def owner_credential_name(channel_type: str, meta: dict) -> Optional[str]:
+    """The vault name the owner's value for ``channel_type``'s one
+    credential goes by (its alias and consent scope), or None for a channel
+    that does not take exactly one.  The one derivation: post_to_channel
+    reads the owner's value under it, and a start records that value's
+    fingerprint under it, so the two compare the same name (review of
+    f6978d245, N3)."""
+    from hartos.ai_key_vault import get_ai_key_vault
+    from integrations.channels.metadata import required_setup_keys
+    keys = required_setup_keys(meta or {})
+    if len(keys) != 1:
+        return None
+    return get_ai_key_vault().credential_name(keys[0], channel_type)
+
+
+def _owner_value_fingerprint(channel_type: str, meta: dict):
+    """The credential_fingerprint of the value the owner has stored for
+    ``channel_type``'s one credential (the vault's owner_credential); ''
+    only when the name is not the owner's at all (no grant, nothing
+    stored); None when it cannot be told: the grants could not be read, or
+    the owner granted the name and the value has not reached this process
+    yet (Nunba's vault hands it over after the grant).  '' for either of
+    those let the owner's older value replace a newer start (review of
+    f6978d245, N1)."""
+    try:
+        from hartos.ai_key_vault import get_ai_key_vault
+        name = owner_credential_name(channel_type, meta)
+        if name is None:
+            return None
+        vault = get_ai_key_vault()
+        value = vault.owner_credential(name)
+        if value:
+            return credential_fingerprint(value)
+        # No value here: none at all, or not knowable now.  Raises when the
+        # grants cannot be read.
+        if name in vault.owner_credential_names(strict=True):
+            return None       # granted, not handed over yet
+        return ''
+    except Exception:
+        logger.warning("%s: the owner's stored value could not be read",
+                       channel_type, exc_info=True)
+        return None
+
+
+def _watch_start(channel_type: str, meta: dict, owner, fp=None) -> int:
+    """Record a just-scheduled start of ``channel_type`` (``fp``: the
+    credential_fingerprint of the value it started with) as being watched,
+    then watch it on a daemon thread (_report_when_live) and record how it
+    ended.  Returns the start's number.  A later start replaces the record;
+    an earlier watcher ending after that leaves the later record alone.
+    The owner's stored value at this moment is kept beside it ('owner_fp'),
+    so a later change of that value, by any path, is seen as theirs."""
+    owner_fp = _owner_value_fingerprint(channel_type, meta)
+    with _STARTS_LOCK:
+        start = next(_START_NUMBERS)
+        _STARTS[channel_type] = {'start': start, 'state': START_WATCHING,
+                                 'fp': fp, 'owner_fp': owner_fp,
+                                 'at': datetime.utcnow()}
+
+    def _watch():
+        connected = False
+        try:
+            connected = bool(_report_when_live(channel_type, meta, owner))
+        except Exception:
+            logger.warning("%s: start watcher failed; the start counts as "
+                           "failed", channel_type, exc_info=True)
+        with _STARTS_LOCK:
+            entry = _STARTS.get(channel_type)
+            if entry is not None and entry['start'] == start:
+                entry['state'] = START_CONNECTED if connected else START_FAILED
+
+    threading.Thread(target=_watch, name=f'channel-probe-{channel_type}',
+                     daemon=True).start()
+    return start
+
+
+#: What chat_connect_blocker answers, beside None.
+LINKED_FROM_PHONE = 'linked_from_phone'
+SEVERAL_CREDENTIALS = 'several_credentials'
+SERVER_SETTINGS = 'server_settings'
+
+
+def chat_connect_blocker(channel_type: str, meta: dict = None):
+    """Why ``channel_type`` cannot be connected from one value its owner
+    types, or None when it can.
+
+    The one statement of which channels register_channel starts live
+    (``(kind, detail)``):
+      * (LINKED_FROM_PHONE, None): a gateway_qr channel (WhatsApp) is linked
+        by scanning or a pair code from the phone, not by a value;
+      * (SEVERAL_CREDENTIALS, keys): live connect hands the adapter ONE
+        credential, so a channel that needs several is saved, never started;
+      * (SERVER_SETTINGS, names): a setting only the operator can supply
+        (Slack's SLACK_APP_TOKEN) is missing on this server.
+    register_channel refuses on it, and post_to_channel asks the owner for
+    a channel's value only when this answers None: a card for a channel
+    that can never be started from the answer is a question with no use.
+    """
+    from integrations.channels.metadata import get_channel_metadata, required_setup_keys
+    meta = meta if meta is not None else get_channel_metadata(channel_type)
+    if (meta or {}).get('auth_method') == 'gateway_qr':
+        return LINKED_FROM_PHONE, None
+    required = required_setup_keys(meta)
+    if len(required) != 1:
+        return SEVERAL_CREDENTIALS, required
+    from integrations.channels.flask_integration import FlaskChannelIntegration
+    unmet = FlaskChannelIntegration.unmet_required_settings(channel_type)
+    if unmet:
+        return SERVER_SETTINGS, unmet
+    return None
+
+
+#: Marks an admin channel entry that exists only to hold the channel's
+#: announcement target: the channel runs from the environment or a saved
+#: binding, which start it at boot.  The boot loop that activates admin
+#: entries (hartos_bootstrap) skips it, and register_channel drops the mark
+#: when it writes the channel's own config.
+ANNOUNCE_ONLY_KEY = 'announce_only'
+
+
+def _running_here(channel_type: str) -> bool:
+    """Whether a live adapter for ``channel_type`` is registered."""
+    try:
+        from integrations.channels.flask_integration import get_channel_integration
+        return get_channel_integration().registry.get(channel_type) is not None
+    except Exception:
+        return False
+
+
+def set_announcement_target(channel_type: str, chat_id: str, user_id=None) -> str:
+    """Set where announcements for ``channel_type`` are posted: the
+    channel's ``announce_chat_id``, which announcement_broadcaster's
+    destination rule reads.  Returns what happened, in words.  The one
+    writer in code: the set_announcement_channel tool and post_to_channel
+    (with the owner's answer) call it.  Not yet the admin page's PUT
+    /api/admin/channels/<type>, which merges any key, this one included,
+    without this check (task #222); the broadcaster applies the same rule
+    at send time, so a target written there that this would refuse is
+    refused at send, never used.
+
+    Refuses exactly what the broadcaster would refuse at send time
+    (announcement_broadcaster.needs_subscription with no subscription
+    record), so "set" means it will be used.  A channel running here with no
+    admin entry (started from the environment or a saved binding) gets one
+    that only holds the target (ANNOUNCE_ONLY_KEY); before that, the owner's
+    answer for such a channel was dropped as "not registered" and they were
+    asked again on every post (review of f8fdb9c64, H1).
+
+    Setting a destination is deliberately NOT authorising broadcast: with
+    public_exposure consent absent, a configured destination still sends
+    nothing.  Granting the consent itself is not a tool, and should not
+    become one -- an autonomous goal able to grant its own permission to
+    post publicly is the fail-closed gate flipping its own switch.
+    """
+    from integrations.channels.announcement_broadcaster import (
+        is_subscribed, needs_subscription)
+    from integrations.channels.admin.api import get_api
+
+    channel_type = (channel_type or '').strip().lower()
+    chat_id = (chat_id or '').strip()
+    if not channel_type or not chat_id:
+        return "Both channel_type and chat_id are required."
+
+    if needs_subscription(channel_type, chat_id) and not is_subscribed(
+            channel_type, chat_id):
+        if channel_type == 'telegram':
+            return (f"Refused: {chat_id} is a private one-to-one chat on "
+                    f"telegram. Announcements go to groups or channels people "
+                    f"joined, not to individuals who did not ask. Telegram "
+                    f"groups and channels have negative ids.")
+        return (f"Refused: on {channel_type}, announcements go only to a "
+                f"destination that subscribed to them, and {chat_id} has no "
+                f"subscription record.")
+
+    api = get_api()
+    cfg = api._channels.get(channel_type)
+    if cfg is None:
+        if not _running_here(channel_type):
+            return (f"Channel '{channel_type}' is not registered. "
+                    f"Register it first, then set its announcement target.")
+        from integrations.channels.metadata import get_channel_metadata
+        cfg = {'channel_type': channel_type,
+               'name': (get_channel_metadata(channel_type) or {}).get(
+                   'display_name') or channel_type,
+               'enabled': True, ANNOUNCE_ONLY_KEY: True}
+    cfg['announce_chat_id'] = chat_id
+    api._channels[channel_type] = cfg
+    api._save_config()
+    if cfg.get('enabled', True) is False:
+        return (f"Announcement target for {channel_type} set to {chat_id}. "
+                f"NOTE: {channel_type} is disabled in its channel settings, so "
+                f"nothing is sent there until it is enabled.")
+
+    # Say plainly whether this will actually broadcast yet. Reporting
+    # "configured" when nothing can send would be the same false success
+    # this system has been bitten by before.
+    try:
+        from integrations.agent_engine.marketing_tools import (
+            _external_post_allowed)
+        consented = bool(_external_post_allowed(
+            user_id or _get_user_id_from_threadlocal()))
+    except Exception:
+        consented = False
+
+    status = ("Announcements are ENABLED and will post here."
+              if consented else
+              "NOTE: public_exposure consent is not granted, so nothing "
+              "will actually be sent yet. That grant is an operator "
+              "action, deliberately not an agent tool.")
+    return f"Announcement target for {channel_type} set to {chat_id}. {status}"
+
+
 # ---------------------------------------------------------------------------
 # Tool closure factory
 # ---------------------------------------------------------------------------
@@ -192,9 +451,18 @@ def build_channel_tool_closures(ctx):
 
             # The channel integration owns the adapters' loop; ChannelRegistry
             # has none (tests/unit/test_channel_loop_owner.py).
-            from integrations.channels.flask_integration import get_channel_integration
-            result = get_channel_integration().send_threadsafe(
-                channel_type, chat_id, message, wait=30)
+            import concurrent.futures
+            from integrations.channels.flask_integration import (
+                CHANNEL_SEND_WAIT_S, get_channel_integration)
+            try:
+                result = get_channel_integration().send_threadsafe(
+                    channel_type, chat_id, message, wait=CHANNEL_SEND_WAIT_S)
+            except concurrent.futures.TimeoutError:
+                # Still running on the adapter loop: it may yet arrive, and
+                # an "error" here made the agent send it a second time.
+                return (f"The message to {channel_type}:{chat_id} was not "
+                        f"confirmed after {CHANNEL_SEND_WAIT_S}s; it may still "
+                        f"arrive. Do not send it again.")
             if result is None:
                 return ("Channel adapters are not running, so the message "
                         "was not sent.")
@@ -247,6 +515,19 @@ def build_channel_tool_closures(ctx):
                 else:
                     return f"Could not parse config. Expected JSON. Required fields: {[f['key'] for f in meta.get('setup_fields', [])]}"
 
+            # A {{secret:NAME}} still here was not resolved where the tool
+            # runs (log_tool_execution resolves every owner-entered one), so
+            # the owner has not entered it.  Saved, it became the channel's
+            # token: a dead adapter, an unhealthy banner and a failed restore
+            # on every boot.  Nothing is saved.
+            from hartos.ai_key_vault import SECRET_ALIAS_RE
+            unresolved = sorted({m for v in config.values() if isinstance(v, str)
+                                 for m in SECRET_ALIAS_RE.findall(v)})
+            if unresolved:
+                return (f"{meta['display_name']} was not saved: "
+                        f"{', '.join(unresolved)} has not been entered by the "
+                        f"owner yet. Connect it once they have entered it.")
+
             # Auto-fill auto:True fields from env-var defaults so the
             # user doesn't have to know about gateway infrastructure
             # (WAHA api_url for WhatsApp, etc).  Order:
@@ -273,23 +554,41 @@ def build_channel_tool_closures(ctx):
                 else:
                     config[key] = ''
 
+            from integrations.channels.flask_integration import (
+                seal_binding_credential,
+            )
+            from integrations.channels.metadata import required_setup_keys
+            required = required_setup_keys(meta)
+
+            # The copy kept in admin_config.json carries each credential
+            # sealed, as the binding below does (seal_binding_credential):
+            # nothing starts a channel from this copy (boot reads the
+            # binding), and the card that asked the owner for the value said
+            # it is kept encrypted (review of f8fdb9c64: it was written in
+            # plain text).  The live connect below uses ``config`` itself.
+            saved = dict(config)
+            if meta['auth_method'] != 'gateway_qr':
+                for k in required:
+                    if saved.get(k):
+                        saved[k] = seal_binding_credential(channel_type, saved[k])
+
             # Save via admin API singleton
             from integrations.channels.admin.api import get_api
             api = get_api()
 
             if channel_type in api._channels:
-                api._channels[channel_type].update({'config': config, 'enabled': True})
+                api._channels[channel_type].update({'config': saved, 'enabled': True})
+                # Its own config now: no longer an entry that only holds the
+                # announcement target.
+                api._channels[channel_type].pop(ANNOUNCE_ONLY_KEY, None)
             else:
                 api._channels[channel_type] = {
                     'channel_type': channel_type,
                     'name': meta['display_name'],
                     'enabled': True,
-                    'config': config,
+                    'config': saved,
                 }
             api._save_config()
-
-            from integrations.channels.metadata import required_setup_keys
-            required = required_setup_keys(meta)
             # A single-credential channel's token is also kept on the user's
             # binding: that row is what restore_persisted_channels reads at
             # boot (flask_integration._binding_credentials), and the same
@@ -299,11 +598,7 @@ def build_channel_tool_closures(ctx):
             cred_meta = {}
             if (len(required) == 1 and meta['auth_method'] != 'gateway_qr'
                     and config.get(required[0])):
-                from integrations.channels.flask_integration import (
-                    seal_binding_credential,
-                )
-                cred_meta = {required[0]: seal_binding_credential(
-                    channel_type, config[required[0]])}
+                cred_meta = {required[0]: saved[required[0]]}
 
             # Create user binding
             uid = user_id or _get_user_id_from_threadlocal()
@@ -355,7 +650,8 @@ def build_channel_tool_closures(ctx):
                 return (f"{name} registered and enabled! Auth: gateway_qr. "
                         f"Link it from your phone to finish.")
 
-            if len(required) != 1:
+            blocker = chat_connect_blocker(channel_type, meta)
+            if blocker and blocker[0] == SEVERAL_CREDENTIALS:
                 # Live connect hands the adapter ONE credential (the shape
                 # /api/social/channels/bindings wires and boot restore
                 # reads).  A channel that needs several is saved but NOT
@@ -365,15 +661,11 @@ def build_channel_tool_closures(ctx):
                         f"it needs several credentials, and connecting those "
                         f"live isn't supported yet. Nothing will arrive on "
                         f"{name} until an operator starts it.")
-
-            # A setting only the operator can supply (Slack's app-level
-            # SLACK_APP_TOKEN, Zalo's ZALO_OA_ID): name it, instead of the
-            # adapter's bare "returned False".
-            from integrations.channels.flask_integration import (
-                FlaskChannelIntegration,
-            )
-            unmet = FlaskChannelIntegration.unmet_required_settings(channel_type)
-            if unmet:
+            if blocker and blocker[0] == SERVER_SETTINGS:
+                # A setting only the operator can supply (Slack's app-level
+                # SLACK_APP_TOKEN, Zalo's ZALO_OA_ID): name it, instead of
+                # the adapter's bare "returned False".
+                unmet = blocker[1]
                 logger.warning("register_channel: %s saved but cannot run, "
                                "server lacks %s", channel_type, unmet)
                 return (f"{name} was saved, but this server can't run it yet: "
@@ -398,15 +690,11 @@ def build_channel_tool_closures(ctx):
             # The adapter's start() is scheduled, not finished.  Watch its
             # status and tell the user how it ended: a success card when it
             # is live, a toast (and a fleet banner on their other devices)
-            # when it is not.  A daemon thread so the tool returns now.
+            # when it is not.  A daemon thread so the tool returns now; the
+            # verdict is kept (start_verdict).
             owner = user_id or _get_user_id_from_threadlocal() or None
-            import threading as _threading
-            _threading.Thread(
-                target=_report_when_live,
-                args=(channel_type, meta, owner),
-                name=f'channel-probe-{channel_type}',
-                daemon=True,
-            ).start()
+            _watch_start(channel_type, meta, owner,
+                         credential_fingerprint(credential) if credential else None)
             return (f"{name} registered and enabled! Auth: {meta['auth_method']}. "
                     f"Connecting now; you'll see a confirmation here once it's live.")
 
@@ -819,9 +1107,11 @@ def build_channel_tool_closures(ctx):
 
             # Dispatch through the channel integration, which owns the
             # adapters' loop (the same plumbing as send_to_channel).
-            from integrations.channels.flask_integration import get_channel_integration
+            from integrations.channels.flask_integration import (
+                CHANNEL_SEND_WAIT_S, get_channel_integration)
             result = get_channel_integration().send_threadsafe(
-                channel_type_n, resolved_chat_id, message, wait=30)
+                channel_type_n, resolved_chat_id, message,
+                wait=CHANNEL_SEND_WAIT_S)
 
             if result is not None:
                 if getattr(result, 'success', False):
@@ -1001,67 +1291,20 @@ def build_channel_tool_closures(ctx):
     # set_announcement_channel — where growth announcements get posted
     # ------------------------------------------------------------------
     #
-    # Setting a destination is deliberately NOT the same as authorising
-    # broadcast. With public_exposure consent absent, a configured
-    # destination still sends nothing, so exposing this as an agent tool
-    # cannot escalate anything: the worst case is an address written down
-    # that never gets used. Granting the consent itself is not a tool, and
-    # should not become one -- an autonomous goal able to grant its own
-    # permission to post publicly is the fail-closed gate flipping its own
-    # switch.
+    # Exposing this as an agent tool cannot escalate anything: without
+    # public_exposure consent a configured destination sends nothing
+    # (set_announcement_target).
     @log_tool_execution
     def set_announcement_channel(
         channel_type: Annotated[str, "Channel to announce on (telegram, discord, slack, whatsapp)"],
-        chat_id: Annotated[str, "Destination id. Telegram groups/channels are NEGATIVE ids; WhatsApp groups end in @g.us"],
+        chat_id: Annotated[str, "Destination id. Telegram groups/channels are NEGATIVE ids; on WhatsApp, Signal and iMessage only a destination that subscribed is accepted"],
     ) -> str:
         """Set where HARTOS posts growth announcements for a channel.
 
         Refuses private one-to-one destinations: broadcasting into somebody's
         DM is unsolicited messaging regardless of who configured it."""
         try:
-            from integrations.channels.announcement_broadcaster import (
-                destination_shape, is_subscribed)
-            from integrations.channels.admin.api import get_api
-
-            channel_type = (channel_type or '').strip().lower()
-            chat_id = (chat_id or '').strip()
-            if not channel_type or not chat_id:
-                return "Both channel_type and chat_id are required."
-
-            shape = destination_shape(channel_type, chat_id)
-            if shape == 'one_to_one' and not is_subscribed(channel_type, chat_id):
-                return (f"Refused: {chat_id} is a private one-to-one chat on "
-                        f"{channel_type}. Announcements go to groups or channels "
-                        f"people joined, not to individuals who did not ask. "
-                        f"Use a group id (Telegram groups are negative; WhatsApp "
-                        f"groups end in @g.us).")
-
-            api = get_api()
-            cfg = api._channels.get(channel_type)
-            if cfg is None:
-                return (f"Channel '{channel_type}' is not registered. "
-                        f"Register it first, then set its announcement target.")
-            cfg['announce_chat_id'] = chat_id
-            api._channels[channel_type] = cfg
-            api._save_config()
-
-            # Say plainly whether this will actually broadcast yet. Reporting
-            # "configured" when nothing can send would be the same false
-            # success this system has been bitten by before.
-            try:
-                from integrations.agent_engine.marketing_tools import (
-                    _external_post_allowed)
-                consented = bool(_external_post_allowed(
-                    user_id or _get_user_id_from_threadlocal()))
-            except Exception:
-                consented = False
-
-            status = ("Announcements are ENABLED and will post here."
-                      if consented else
-                      "NOTE: public_exposure consent is not granted, so nothing "
-                      "will actually be sent yet. That grant is an operator "
-                      "action, deliberately not an agent tool.")
-            return f"Announcement target for {channel_type} set to {chat_id}. {status}"
+            return set_announcement_target(channel_type, chat_id, user_id)
         except Exception as e:
             logger.error("set_announcement_channel error: %s", e)
             return f"Error setting announcement channel: {e}"

@@ -206,7 +206,7 @@ def _disclosure_copy(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {**payload, 'agent_id': '', 'disclosure_only': True}
 
 
-def _ribbon(show: bool, text: str = None) -> None:
+def _ribbon(show: bool, text: str = None) -> bool:
     """Nunba's AI-control ribbon — the SECOND surface of an announcement.
 
     Moved here from local_loop 2026-09-21.  It lived beside the loop and was
@@ -226,17 +226,32 @@ def _ribbon(show: bool, text: str = None) -> None:
 
     Best effort, and only inside Nunba: standalone HARTOS has no ribbon, and a
     refused localhost connect costs seconds on Windows.
+
+    Returns whether Nunba ANSWERED that the ribbon is showing (or hidden): the
+    loop and every announcement ignore it, but a demonstration recording
+    (integrations.vlm.demo_session) must not capture a person's input unless
+    the ribbon that says so is up, and keeps asking while it runs.
     """
     try:
         from core.config_cache import is_bundled, _local_base
         if not is_bundled():
-            return
+            return False
         from core.http_pool import pooled_get
-        pooled_get(f"{_local_base()}/indicator/{'show' if show else 'hide'}",
-                   timeout=2, params={'text': text} if text else None)
+        resp = pooled_get(f"{_local_base()}/indicator/{'show' if show else 'hide'}",
+                          timeout=2, params={'text': text} if text else None)
+        return (getattr(resp, 'status_code', None) == 200
+                and (resp.json() or {}).get('success') is True)
     except Exception as e:
         logger.debug(f"AI-control ribbon {'show' if show else 'hide'} "
                      f"skipped: {e}")
+        return False
+
+
+def show_ribbon(show: bool, text: str = None) -> bool:
+    """The ribbon, for a caller outside this module that must know whether it
+    showed (the demonstration recorder).  It is ``_ribbon``, not a second way
+    to reach Nunba's indicator."""
+    return _ribbon(show, text)
 
 
 #: Step phases the ribbon speaks, and how.  ``executing`` is the step's intent,

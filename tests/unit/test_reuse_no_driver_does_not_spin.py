@@ -46,7 +46,8 @@ already synthesises the user-facing reply (observed live at 07:27:31,844,
 answer').  No new mechanism, no change to the autonomy predicate, no parallel
 path.
 
-ANTI-VACUITY: the exit must be guarded by `not _reuse_action_is_autonomous`.
+ANTI-VACUITY: the exit must be guarded by `not _reuse_runs_alone` (since
+31ec05d14: the autonomy predicate AND no question in this turn's window).
 An AUTONOMOUS action legitimately falls through here — its next pass re-drives
 the group through initiate_chat, which is real progress.  Breaking on that path
 would truncate working agents, so the guard is the whole point.
@@ -96,8 +97,17 @@ def _branch_body(branch):
     return list(branch.body)
 
 
+# The predicate the break is guarded by.  Since 31ec05d14 it is
+# _reuse_runs_alone: the canonical autonomy predicate AND no question in this
+# turn's window (a 'yes' step that asked is driven as a 'no' step).  The
+# behaviour is pinned in tests/unit/test_a_send_that_asks_never_completes.py
+# (a step that asked holds with no nudge; a progress line keeps its nudge);
+# this file only pins that the exit stays guarded.
+_GUARD = '_reuse_runs_alone'
+
+
 def _guarded_break_nodes(branch):
-    """`break` statements inside a `not _reuse_action_is_autonomous(...)` test.
+    """`break` statements inside a `not _reuse_runs_alone(...)` test.
 
     Returns the Break nodes themselves so the anti-vacuity check can compare
     identity rather than line numbers.
@@ -113,7 +123,7 @@ def _guarded_break_nodes(branch):
             if not [c for c in ast.walk(t.operand)
                     if isinstance(c, ast.Call)
                     and isinstance(c.func, ast.Name)
-                    and c.func.id == '_reuse_action_is_autonomous']:
+                    and c.func.id == _GUARD]:
                 continue
             found.extend(s for s in ast.walk(node) if isinstance(s, ast.Break))
     return found
@@ -144,8 +154,8 @@ class ReuseNoDriverDoesNotSpin(unittest.TestCase):
         """THE DEFECT. RED before the fix.
 
         At least one '@user' branch must carry a `break` guarded by
-        `not _reuse_action_is_autonomous(...)`, so an action nothing can drive
-        ends the turn instead of re-looping unchanged.
+        `not _reuse_runs_alone(...)`, so an action nothing can drive ends the
+        turn instead of re-looping unchanged.
         """
         hits = [n for b in _at_user_branches(self.tree)
                 for n in _guarded_break_nodes(b)]
@@ -155,7 +165,7 @@ class ReuseNoDriverDoesNotSpin(unittest.TestCase):
             "break: for a NON-autonomous action nothing changes between passes, "
             "so the loop spins until the round cap (measured live 2026-09-09: "
             "13 passes in 10 ms, 2 LLM calls, allowance gone). It must break to "
-            "the post-loop extractor when _reuse_action_is_autonomous is False.")
+            "the post-loop extractor when _reuse_runs_alone is False.")
 
     def test_the_exit_is_guarded_not_unconditional(self):
         """Anti-vacuity: an AUTONOMOUS action must still fall through.
@@ -170,15 +180,24 @@ class ReuseNoDriverDoesNotSpin(unittest.TestCase):
                 self.assertIn(
                     id(node), guarded,
                     f"line {node.lineno}: a break in the '@user' branch body is "
-                    "not guarded by `not _reuse_action_is_autonomous(...)` — "
+                    "not guarded by `not _reuse_runs_alone(...)` — "
                     "that would end the turn for autonomous actions too, which "
                     "make real progress on their next pass")
 
     def test_predicate_is_the_existing_one(self):
-        """Reuse the canonical autonomy predicate — do not add a second."""
+        """Reuse the canonical autonomy predicate — do not add a second.  The
+        guard reads it: _reuse_runs_alone calls _reuse_action_is_autonomous."""
         self.assertEqual(
             self.src.count('def _reuse_action_is_autonomous('), 1,
             'one autonomy predicate, no parallel copy')
+        guard = [n for n in ast.walk(self.tree)
+                 if isinstance(n, ast.FunctionDef) and n.name == _GUARD]
+        self.assertEqual(len(guard), 1, f'one {_GUARD}')
+        self.assertTrue(
+            [c for c in ast.walk(guard[0]) if isinstance(c, ast.Call)
+             and isinstance(c.func, ast.Name)
+             and c.func.id == '_reuse_action_is_autonomous'],
+            f'{_GUARD} must read the canonical autonomy predicate')
 
 
 if __name__ == '__main__':

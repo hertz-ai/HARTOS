@@ -612,8 +612,8 @@ class TestRecipeHierarchyStamping:
         # the helper takes ledger_dir as a kwarg with default "agent_data",
         # so we redirect via the SmartLedger.list_grouped helper too.
         original_helper = _core.SmartLedger.list_grouped_by_recipe_hierarchy
-        def _scoped_helper(cls=None, ledger_dir=None):
-            return original_helper.__func__(_core.SmartLedger, str(tmp_path))
+        def _scoped_helper(cls=None, ledger_dir=None, name_glob='ledger_*_*.json'):
+            return original_helper.__func__(_core.SmartLedger, str(tmp_path), name_glob)
         monkeypatch.setattr(
             _core.SmartLedger,
             'list_grouped_by_recipe_hierarchy',
@@ -648,8 +648,8 @@ class TestRecipeHierarchyStamping:
         from agent_ledger.core import create_ledger_from_actions
         import agent_ledger.core as _core
         original_helper = _core.SmartLedger.list_grouped_by_recipe_hierarchy
-        def _scoped_helper(cls=None, ledger_dir=None):
-            return original_helper.__func__(_core.SmartLedger, str(tmp_path))
+        def _scoped_helper(cls=None, ledger_dir=None, name_glob='ledger_*_*.json'):
+            return original_helper.__func__(_core.SmartLedger, str(tmp_path), name_glob)
         monkeypatch.setattr(
             _core.SmartLedger,
             'list_grouped_by_recipe_hierarchy',
@@ -671,8 +671,8 @@ class TestRecipeHierarchyStamping:
         from agent_ledger.core import create_ledger_from_actions
         import agent_ledger.core as _core
         original_helper = _core.SmartLedger.list_grouped_by_recipe_hierarchy
-        def _scoped_helper(cls=None, ledger_dir=None):
-            return original_helper.__func__(_core.SmartLedger, str(tmp_path))
+        def _scoped_helper(cls=None, ledger_dir=None, name_glob='ledger_*_*.json'):
+            return original_helper.__func__(_core.SmartLedger, str(tmp_path), name_glob)
         monkeypatch.setattr(
             _core.SmartLedger,
             'list_grouped_by_recipe_hierarchy',
@@ -710,8 +710,8 @@ class TestRecipeHierarchyStamping:
         from agent_ledger.core import create_ledger_from_actions
         import agent_ledger.core as _core
         original_helper = _core.SmartLedger.list_grouped_by_recipe_hierarchy
-        def _scoped_helper(cls=None, ledger_dir=None):
-            return original_helper.__func__(_core.SmartLedger, str(tmp_path))
+        def _scoped_helper(cls=None, ledger_dir=None, name_glob='ledger_*_*.json'):
+            return original_helper.__func__(_core.SmartLedger, str(tmp_path), name_glob)
         monkeypatch.setattr(
             _core.SmartLedger,
             'list_grouped_by_recipe_hierarchy',
@@ -749,8 +749,8 @@ class TestRecipeHierarchyStamping:
         from agent_ledger.core import create_ledger_from_actions
         import agent_ledger.core as _core
         original_helper = _core.SmartLedger.list_grouped_by_recipe_hierarchy
-        def _scoped_helper(cls=None, ledger_dir=None):
-            return original_helper.__func__(_core.SmartLedger, str(tmp_path))
+        def _scoped_helper(cls=None, ledger_dir=None, name_glob='ledger_*_*.json'):
+            return original_helper.__func__(_core.SmartLedger, str(tmp_path), name_glob)
         monkeypatch.setattr(
             _core.SmartLedger,
             'list_grouped_by_recipe_hierarchy',
@@ -773,8 +773,8 @@ class TestRecipeHierarchyStamping:
         from agent_ledger.core import create_ledger_from_actions
         import agent_ledger.core as _core
         original_helper = _core.SmartLedger.list_grouped_by_recipe_hierarchy
-        def _scoped_helper(cls=None, ledger_dir=None):
-            return original_helper.__func__(_core.SmartLedger, str(tmp_path))
+        def _scoped_helper(cls=None, ledger_dir=None, name_glob='ledger_*_*.json'):
+            return original_helper.__func__(_core.SmartLedger, str(tmp_path), name_glob)
         monkeypatch.setattr(
             _core.SmartLedger,
             'list_grouped_by_recipe_hierarchy',

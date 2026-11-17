@@ -40,6 +40,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from core.subprocess_safe import run_probe
+from core.user_file_store import INBOUND_PURPOSES
 
 logger = logging.getLogger('hevolve.liquid_ui')
 
@@ -1015,7 +1016,7 @@ COMPONENT_TYPES = {
         'required': ['purpose'],
         'doc': ('Asks the person for files, on whichever of their devices they '
                 'answer. `purpose` is one of core.user_file_store INBOUND_PURPOSES '
-                '(reel_source, logo, song_audio, chat_attachment). The surface '
+                '(' + ', '.join(INBOUND_PURPOSES) + '). The surface '
                 'sends the picked files to the user file store for the ask '
                 '(`ask_id`), then answers it with their ids, and the files become '
                 'the asking agent\'s. Sent by integrations.agent_engine.person_ask.'),

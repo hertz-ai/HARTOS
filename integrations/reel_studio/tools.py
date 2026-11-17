@@ -721,6 +721,17 @@ def build_reel_tools(user_id, *, prompt_id,
             ('reel_motion', reel_motion)]
 
 
+def describe_reel_tools() -> List[Tuple[str, str]]:
+    """(name, description) of REEL_TOOL_NAMES exactly as register_reel_studio_tools
+    puts them on her agent's schema (_describe of the same closures): what a
+    plan writer is shown (gather_agentdetails.family_tool_catalog), so a
+    Reel Studio plan names the tool that does each step.  No user is bound:
+    the closures are only read, never run."""
+    return [(name, _describe(func))
+            for name, func in build_reel_tools('', prompt_id=None)
+            if name in REEL_TOOL_NAMES]
+
+
 def _first_registration() -> None:
     """Once per process: sweep jobs a restart interrupted (jobs.sweep_once).
     The store's own once-per-process retention pass is the device door's
@@ -804,4 +815,4 @@ def register_reel_studio_tools(helper, assistant, user_id: str, *, prompt_id, st
 
 
 __all__ = ['REEL_TOOL_NAMES', 'REEL_ON_DEMAND_TOOL_NAMES', 'HOOK_TEXT_MAX_CHARS',
-           'build_reel_tools', 'register_reel_studio_tools']
+           'build_reel_tools', 'describe_reel_tools', 'register_reel_studio_tools']

@@ -17,6 +17,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional
 
@@ -580,6 +581,151 @@ def get_regional_tone_prompt(language: str = '') -> str:
 # Personality Generation
 # ═══════════════════════════════════════════════════════════════════════
 
+# The agent's OWN role: the seat it sits in, never a person it talks with.
+# A plan's personas are people (the child, a parent); the agent's personality
+# role was taken from personas[0] and read "You are <name>, a the child"
+# (review of 494d5a4e1, must-fix 1; owner 11-07: a user persona is never an
+# agent name and the reverse).  'assistant' is _ROLE_TONE_MAP's own key and
+# its default, so the tone is the one an agent with no role always got; no
+# category is guessed from the goal's words (owner, 10-20).  One value, in
+# core.constants (REUSE's "You are a helpful ..." line reads it there); this
+# module re-exports it for CREATE's personality.
+from core.constants import AGENT_ROLE  # noqa: E402,F401  (re-exported)
+
+
+def _role_phrase(role) -> str:
+    """', an assistant' / ', a Researcher'; '' for an empty role (one saved
+    personality has one), so the line never reads 'a ' before nothing.  The
+    article follows the role's first letter: of the desktop's 748 saved roles
+    starting with a vowel or h, that is right for every one (hartos-16, 11-07)."""
+    role = str(role or '').strip()
+    if not role:
+        return ''
+    return f", {'an' if role[0].lower() in 'aeiou' else 'a'} {role}"
+
+
+def describe_agent(personality) -> str:
+    """Who the agent is, for its personality line: 'Coach, an assistant', or
+    the name alone when the saved role is empty.  The name is spoken_name's."""
+    return f"{spoken_name(personality)}{_role_phrase(_field(personality, 'role'))}"
+
+
+def _field(personality, name) -> str:
+    """A personality's field, from the dataclass or a dict kept in a config."""
+    if isinstance(personality, dict):
+        return str(personality.get(name) or '')
+    return str(getattr(personality, name, '') or '')
+
+
+#: The placeholders the agent mirror manufactures for a prompt with no name
+#: ("Agent <id>", "agent-<id>", hart_intelligence_entry
+#: _create_social_agent_from_prompt), also built from ANOTHER agent's id.
+_PLACEHOLDER_NAME_RE = re.compile(r'agent[ _-]\d{6,}(?:_\d+)?', re.IGNORECASE)
+
+
+def is_a_name(name, agent_id='') -> bool:
+    """False for what only looks like a name: empty, the agent's id, the
+    placeholder built from an id ("Agent <id>", "agent-<id>", "agent_<id>",
+    any id of six or more digits), or digits alone.  The one name rule:
+    what a person is told an agent is called (consent_service
+    agent_display_name) and what the agent says it is called (spoken_name)
+    both read it.  Exact matches only: a real name may contain a digit
+    sequence that happens to be a short id ("Studio 1 Assistant" with id 1).
+    Moved here from integrations.social.consent_service._is_a_name (review
+    of 4b9ba08ad: "Agent 11470436451" was spoken)."""
+    name = str(name or '').strip()
+    aid = str(agent_id or '').strip()
+    if not name or (aid and name == aid) or name.isdigit():
+        return False
+    if aid and name.lower() in (f'agent {aid}'.lower(), f'agent-{aid}'.lower(),
+                                f'agent_{aid}'.lower()):
+        return False
+    return _PLACEHOLDER_NAME_RE.fullmatch(name) is None
+
+
+def _looks_like_an_id(name: str) -> bool:
+    """An internal agent id, not a name: no space, and dotted or underscored
+    ('skill.local.syllable_coach', 'swift.falcon', 'auto.agent4201').  A
+    one-word human name ('Coach', 'Ivy') is a name.  Asked of the saved
+    persona name only (spoken_name): that is where generate_personality
+    copied the internal agent_name."""
+    return ' ' not in name and ('.' in name or '_' in name)
+
+
+def spoken_name(personality, display_name: str = '', agent_id='') -> str:
+    """The name the agent says it has, the same on every path that builds
+    its prompt (CREATE, REUSE, the casual identity in hartos.agent_identity).
+
+    1. What the person called the agent (its config's display 'name'),
+       when it is a name (is_a_name): kept exactly as given, underscores and
+       dots included ('HARTOS_KidAttention_SpeechTherapy'), because that is
+       the name the consent card shows too (consent_service
+       agent_display_name reads the same is_a_name).  One rule for both
+       (review of f3db01f44: dropping such names split the card and the
+       agent for 233 agents).
+    2. Else its saved persona name, when it is a name and not an internal id
+       (_looks_like_an_id): generate_personality took the internal
+       agent_name ('skill.local.<x>') as the persona name, so agents opened
+       with "I'm skill.local.syllable_coach" (live 2026-11-10; 916 of 920
+       saved personalities on that desktop).  A one-word human persona
+       ('Coach') is kept even when it equals the agent's id word.
+    3. Else a pick from _PERSONA_NAMES seeded by the agent's id, so each
+       agent keeps one name on every path and agents that share a role and
+       an internal name do not all get the same one (review of f3db01f44:
+       seeded by role and agent_name, 452 of 792 agents said "Cleo").
+       Without an id (a caller that has none), role and agent_name seed it.
+
+    427 of 1236 desktop configs are named "Agent <id>"; that is never
+    spoken (is_a_name; review of 4b9ba08ad).
+
+    A turn's copy made by with_spoken_name already carries the chosen name;
+    it is said as it is.  Both prompt builders make that copy and then
+    build_personality_prompt reads it again here with no display name, so
+    judging it again turned a given 'Math_Tutor' into a pick on CREATE and
+    REUSE while the casual turn said 'Math_Tutor'."""
+    display = str(display_name or '').strip()
+    if is_a_name(display, agent_id):
+        return display
+    persona = _field(personality, 'persona_name').strip()
+    if isinstance(personality, _NamedForATurn) and persona:
+        return persona
+    if is_a_name(persona, agent_id) and not _looks_like_an_id(persona):
+        return persona
+    basis = str(agent_id or '').strip() or (
+        f"{_field(personality, 'role')}:{_field(personality, 'agent_name').strip()}")
+    seed = hashlib.sha256(basis.encode()).hexdigest()
+    return _PERSONA_NAMES[int(seed[:8], 16) % len(_PERSONA_NAMES)]
+
+
+def spoken_greeting(personality, display_name: str = '', agent_id='') -> str:
+    """The saved greeting, saying spoken_name.  The greeting was formatted
+    with the persona name when it was generated and saved; where that name
+    is not the one spoken, that known value is replaced."""
+    greeting = _field(personality, 'greeting_style')
+    persona = _field(personality, 'persona_name').strip()
+    name = spoken_name(personality, display_name, agent_id)
+    if greeting and persona and persona != name:
+        greeting = greeting.replace(persona, name)
+    return greeting
+
+
+@dataclass
+class _NamedForATurn(AgentPersonality):
+    """A turn's copy of a personality whose persona name and greeting are
+    the spoken ones (with_spoken_name).  spoken_name says its name as it is;
+    it is never saved (save_personality is called before the copy is made)."""
+
+
+def with_spoken_name(personality, display_name: str = '', agent_id=''):
+    """A copy of ``personality`` whose persona name and greeting are the
+    spoken ones, for a turn's prompt; the saved personality is unchanged."""
+    from dataclasses import fields
+    named = {f.name: getattr(personality, f.name) for f in fields(AgentPersonality)}
+    named.update(persona_name=spoken_name(personality, display_name, agent_id),
+                 greeting_style=spoken_greeting(personality, display_name, agent_id))
+    return _NamedForATurn(**named)
+
+
 def _get_role_category(role: str) -> str:
     """Map a role string to a broad category for trait/tone selection."""
     role_lower = role.lower().strip()
@@ -698,12 +844,12 @@ def build_personality_prompt(personality: AgentPersonality,
     base_prompt = f"""
 
 YOUR PERSONALITY:
-You are {personality.persona_name}, a {personality.role} who embodies these cultural traditions:
+You are {describe_agent(personality)} who embodies these cultural traditions:
 {traits_block}
 
 COMMUNICATION STYLE:
 - Tone: {personality.tone}
-- Opening: {personality.greeting_style}
+- Opening: {spoken_greeting(personality)}
 - Adapt your formality to match the user ({personality.formality_preference})
 - Detail level: {personality.verbosity_preference}
 

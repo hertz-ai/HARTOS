@@ -58,6 +58,7 @@ def asked(app, monkeypatch):
     assert out['ok'], out
     clips = person_ask.ask('10202', '342', {
         'type': 'file_request', 'title': 'Send me the clips', 'purpose': 'reel_source',
+        'description': 'Pick the clips for your reel.',
         'accept': 'video', 'max_files': 5}, prompt_id='342')
     assert clips['ok'], clips
     yield {'client': app.test_client(), 'ask_id': out['ask_id'],

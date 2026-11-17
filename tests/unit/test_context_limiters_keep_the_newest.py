@@ -113,8 +113,12 @@ def test_the_recipe_request_reaches_the_verifier():
     got = token_limiter(**_TOKENS).apply_transform(msgs)
     assert got[-1]['name'] == 'ChatInstructor'
     assert got[-1]['content'] == _RECIPE_REQUEST
-    # everything before it is autogen's own window
-    assert got[:-1] == ag.MessageTokenLimiter(**_TOKENS).apply_transform(msgs)
+    # the order for the action being judged, put back in its place: the
+    # live 11:27:21 verifier was not told which action it judged
+    # (protected_messages' current order, test_limiters_keep_the_current_order)
+    assert got[0]['content'] == msgs[0]['content']
+    # and between the two, autogen's own window
+    assert got[1:-1] == ag.MessageTokenLimiter(**_TOKENS).apply_transform(msgs)
 
 
 def test_history_limiter_keeps_the_newest_behind_an_orphan_first_message():

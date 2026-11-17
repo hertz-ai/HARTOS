@@ -138,6 +138,8 @@ class TestKeywordCallMintsARealSession:
         # Isolate the ledger directory so a resumable session from the real
         # agent_data/ cannot influence this assertion either way.
         monkeypatch.chdir(tmp_path)
+        import core.cache_loaders as _cl
+        monkeypatch.setattr(_cl, 'AGENT_DATA_DIR', str(tmp_path / 'agent_data'))
 
         user_id, prompt_id = 4242, 99887766
         actions = [{'action_id': 1, 'action': 'search', 'description': 'search'}]

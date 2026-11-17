@@ -13,6 +13,7 @@ Pattern mirrors:
 import json
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -208,6 +209,94 @@ def is_held_for_another_turn(reply) -> bool:
     return reply.strip().startswith(HELD_FOR_ANOTHER_TURN_REPLY_PREFIX)
 
 
+def is_a_persons_request(request_id) -> bool:
+    """Whether ``request_id`` is a person's request: dispatch
+    .is_genuine_user_request, the sole authority on "is this a person".  A
+    goal turn (daemon_<goal>), a peer agent's A2A turn (daemon_a2a_<task>),
+    '' and an unreadable classifier are not.  The one copy of the rule:
+    REUSE's camera window (_reuse_request_is_a_person) reads it too."""
+    try:
+        from integrations.agent_engine.dispatch import is_genuine_user_request
+        return bool(is_genuine_user_request(str(request_id or '')))
+    except Exception:
+        return False
+
+
+def camera_turn_id() -> str:
+    """The id of the turn a camera or screen tool runs in: what
+    with_llm_context bound for the running chat_agent / recipe() turn
+    (core.llm_outbound_logger.turn_request_id), '' when none runs.  Never
+    request_id_list, which holds the session's LAST /chat id: a scheduled
+    run read the person's id there for as long as the schedule kept the
+    cached entry fresh, a goal turn gained the camera when the person's
+    message arrived mid-turn, and the person's own turn lost it when a goal
+    turn started (review of efd223acf, findings 1-3)."""
+    from core.llm_outbound_logger import turn_request_id
+    return str(turn_request_id() or '')
+
+
+def turn_may_see_the_camera() -> bool:
+    """True only inside a person's own turn: the one turn that may read what
+    that person's camera and screen show (the live frame, the caption window,
+    the caption search).  The running turn's own id, by the person rule
+    (is_a_persons_request).  A scheduled run, an agent-to-agent relay and a
+    worker thread run in no chat_agent / recipe() turn, so their id is ''.
+
+    Review of HARTOS 23ccd0eb3 (critical): once that commit made these tools
+    read Nunba's stamps, a peer's A2A turn got the owner's camera and screen
+    captions through them."""
+    return is_a_persons_request(camera_turn_id())
+
+
+def camera_refusal(tool_name: str) -> str:
+    """What a camera or screen tool answers on a turn that is not the
+    person's own: a core.tool_refusal refusal (the reply gates read it as a
+    failed call, so no step is credited with it) naming what the turn is and
+    what to do.  A person's own turn is never refused, so it is never told it
+    is a background one (review of efd223acf, finding 4)."""
+    from core.tool_refusal import RETRY_LATER, refuse
+    rid = camera_turn_id()
+    if not rid:
+        what = ("this run answers no person's message (a scheduled run, or "
+                "work started without one)")
+    elif rid.startswith('daemon_a2a_'):
+        what = "this turn is another agent's request"
+    elif rid.startswith('daemon_'):
+        what = "this turn works on a goal in the background"
+    else:
+        what = "this turn could not be confirmed as the person's own message"
+    return refuse(tool_name,
+                  f"{what}, and only the person's own turn may look at what "
+                  f"their camera or screen shows",
+                  "Do this step without what the camera or screen shows",
+                  retry=RETRY_LATER)
+
+
+def waiting_for_person_reply(action_id) -> str:
+    """The sentence a background turn answers when the session's current
+    REUSE step is held for the person's reply (#161): the step asked them in
+    their own turn, and this turn neither ran it nor asked again.  Written
+    here, beside the predicate that recognises it, so a reworded sentence
+    cannot stop being recognised."""
+    from core.constants import WAITING_FOR_PERSON_REPLY_PREFIX
+    return (f"{WAITING_FOR_PERSON_REPLY_PREFIX} step {action_id} asked them a "
+            f"question and waits for their reply; this turn did not run it or "
+            f"ask again.")
+
+
+def is_waiting_for_person(reply) -> bool:
+    """True when ``reply`` is waiting_for_person_reply: the turn did not run
+    its step because the step waits for the person.  Neither a result nor a
+    failure nor a parked goal: the daemon counts no strike and keeps the goal
+    active (dispatch treats it as a transient defer), the hive worker holds
+    the task (HeldForHelp), nobody records it as work.  Recognised by the
+    prefix in core.constants."""
+    if not isinstance(reply, str):
+        return False
+    from core.constants import WAITING_FOR_PERSON_REPLY_PREFIX
+    return reply.strip().startswith(WAITING_FOR_PERSON_REPLY_PREFIX)
+
+
 def is_action_error_reply(reply) -> bool:
     """True when ``reply`` is the CREATE pipeline's structured error envelope,
     {"status": "error", "action": ..., "action_id": ..., "message": ...} — the
@@ -233,6 +322,18 @@ def is_action_error_reply(reply) -> bool:
     # The envelope with prose around it: both protocol keys present.
     import re
     return '"action_id"' in text and re.search(r'"status"\s*:\s*"error"', text) is not None
+
+
+def is_build_stop_reply(reply) -> bool:
+    """True when a build's reply says it stopped and why: a pause for the
+    person, a turn held for another, an error the person reads, a help pause,
+    or the CREATE error envelope.  Such a reply is shown as written, is never
+    counted as work, and is never hidden behind a progress notice.  One list
+    for every site that asks (review of HARTOS cfa9e29ee: a second copy left
+    out the error envelope and showed a failed build as "being completed")."""
+    return (is_user_pause(reply) or is_held_for_another_turn(reply)
+            or is_user_facing_error(reply) or is_help_pause(reply)
+            or is_action_error_reply(reply))
 
 
 # The tool menu, schema fitting, registration and runtime attach live in
@@ -556,6 +657,160 @@ def memory_view(agent_data, prompt_id, user_prompt):
                     own if isinstance(own, dict) else {})
 
 
+def unfilled_key_placeholder(key) -> Optional[str]:
+    """The first ``<...>`` still left in a memory key, or None.
+
+    A placeholder is a '<', then something other than spaces, then the next
+    '>': the shape a saved step uses for "fill this in" ("teach.<that same
+    user id>").  It is found anywhere in the key, because the model copies
+    it in more than one shape: whole ('teach.<user_id>'), holding a dot
+    ('teach.<user.id>', twice on 10-10, each read answered by a loose match
+    as if it were the record) and glued to text ('<experiment_id>_state',
+    agent 29023956042's saved step).  A lone '<' or '>' and an empty '<>'
+    are not placeholders.  This reads the tool's own argument, not the
+    model's words.  Measured 2026-11-09 by the change's reviewer: all 48
+    logged placeholder calls have this shape, and no stored key outside the
+    incident's own record does.
+
+    Measured live 2026-11-07 14:12 IST (request msg_1794040636536_3y7gjm,
+    agent 54): save_data_in_memory(key='teach.<user_id>') stored the
+    learner's progress under the literal part '<user_id>', not teach.10202,
+    and the fabrication gate credited the save because the tool reported
+    success.  Read shape: get_data_by_key('teach.<d68c9dee-...>') on
+    2026-10-14 23:10, the real id in brackets.
+    """
+    text = str(key or '')
+    start = text.find('<')
+    while start != -1:
+        end = text.find('>', start + 1)
+        if end == -1:
+            return None
+        inner = text[start + 1:end]
+        if '<' in inner:                 # a later '<' opens the nearer pair
+            start = text.find('<', start + 1)
+            continue
+        if inner.strip():
+            return text[start:end + 1]
+        start = text.find('<', end + 1)
+    return None
+
+
+# A fill-in mark left in a message for a person: an identifier joined by '_'
+# inside <> or [] ('<parent_name>', '[REVENUE_AMOUNT]'), not glued to a word
+# before it (my_list[item_index], std::vector<my_type> are code) and, in [],
+# not the text of a markdown link ([click_here](url)).
+_TEXT_PLACEHOLDER = re.compile(
+    r'(?<!\w)(?:<[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+>'
+    r'|\[[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+\](?!\())')
+
+
+def unfilled_text_placeholder(text) -> Optional[str]:
+    """The fill-in mark still left in text a person will read, or None.
+
+    The one rule for every such text: a message (send_message_to_user,
+    send_message_in_seconds) and an ask's reason and field labels
+    (person_ask).  Two rules in one commit let each tool send what the other
+    refused (review C-1 of 0516f3981: "Hi <parent_name>, which day suits
+    you?" went out as an ask, "<why you ask>" as a message).  Two shapes:
+
+    - The whole text is one blank, as the ask tool's example writes it
+      ("<why you ask>", "<your question>"; the 4B copied it word for word,
+      live 2026-11-07).  What a blank is, is the memory keys' rule
+      (unfilled_key_placeholder).
+    - An identifier joined by '_' inside <> or [] anywhere in it.  Narrower
+      than the keys' rule on purpose: a key never holds '<' or '>' of its
+      own, but a message does (a maths lesson's "3 < 5 and 7 > 2", a coding
+      lesson's <div>, a citation [1]).  Measured: live 2026-11-11 01:59 IST
+      on build 69 (request msg_1794342560815_sim) the parent received
+      "Thank you, <parent_name>!", and of the 1061 send texts in this
+      desktop's llm_outbound logs the other unfilled marks were
+      '[REVENUE_AMOUNT]', '[TOTAL_COSTS]' and three more in one send, plus
+      '<tool_call>' call markup in two.  A mark glued to the word before it
+      is code (my_list[item_index], os.environ[GITHUB_TOKEN],
+      std::vector<my_type>) and [words](link) is a markdown link; neither
+      is caught (review C-2), so a placeholder glued to a word ("Hi<name>")
+      is not caught either.  Nor is a single word in brackets inside a
+      longer text ("say <ball>", "[Note]")."""
+    body = str(text or '').strip()
+    if body and unfilled_key_placeholder(body) == body:
+        return body
+    match = _TEXT_PLACEHOLDER.search(body)
+    return match.group(0) if match else None
+
+
+def _placeholder_text_refusal(tool, placeholder) -> str:
+    """The failed-call reply for a message unfilled_text_placeholder found
+    a mark in; nothing is sent.  Built by core.tool_refusal.refuse, so it
+    reads as a failed call and says what to change before calling again."""
+    from core.tool_refusal import refuse
+    return refuse(tool, f"the text still holds {placeholder}, which the "
+                        f"person would read as it is",
+                  "Put the real value in its place, or leave that part out "
+                  "when it is not known, then send the text")
+
+
+def _placeholder_key_refusal(tool, key, placeholder) -> str:
+    """The failed-call reply for a key ``unfilled_key_placeholder`` found,
+    built by core.tool_refusal.refuse: it starts with "Error:", so
+    core.constants.tool_reply_failed reads it as a failed call and the
+    fabrication gate re-steers instead of crediting it, and it says what to
+    change before calling again."""
+    from core.tool_refusal import refuse
+    return refuse(tool, f"the key {key} still holds the placeholder {placeholder}",
+                  "Look up the real value and put it in the placeholder's place "
+                  "(for example, a user id comes from get_user_id)")
+
+
+def key_not_found_reply(own, key) -> str:
+    """get_data_by_key's answer when nothing is saved at ``key``.
+
+    It opens with the sentence agents' saved steps already quote ("'Key not
+    found' means a new learner"), so those steps read it as before, and adds
+    what THIS PERSON has saved where the key's path stopped, so the next call
+    can use a real key instead of guessing another (owner 2026-11-09: every
+    refusal says what was wrong; measured that day, 22 'Key not found'
+    replies in two days and no hint of which keys exist).  It is a real
+    answer, not a failed call: a key nobody saved yet is how a first visit
+    looks.
+
+    ``own`` is the person's OWN store (person_store_id), never the agent's
+    shared store.  The shared store holds templates and, on older agents,
+    records saved before the per-person ruling, other people's among them:
+    measured on the owner's desktop 2026-11-09 (review of 2ddf102da), agent
+    54's shared 'teach' is the creator's own progress and agent
+    96985165407's shared 'tutor' holds another person's id.  The first cut
+    named keys from the whole view and told the model to read them, steering
+    a new learner's turn to someone else's record.  It also said "read that
+    key" when no key was named; now that is said only after a list.
+    """
+    node, walked = own if isinstance(own, dict) else {}, []
+    for part in str(key or '').split('.'):
+        if isinstance(node, dict) and part in node:
+            node, walked = node[part], walked + [part]
+        else:
+            break
+    where = '.'.join(walked)
+    names = sorted(str(k) for k in node) if isinstance(node, dict) else []
+    if walked and not isinstance(node, dict):
+        known = (f" This person's saved {where} is a single value, with no keys "
+                 f"under it.")
+    elif not names:
+        known = (f" This person has nothing saved under {where}." if where
+                 else " This person has nothing saved in this memory yet.")
+    else:
+        shown = ', '.join(names[:20]) + (', ...' if len(names) > 20 else '')
+        known = ((f" This person's keys under {where} are: {shown}." if where
+                  else f" This person's saved top-level keys are: {shown}.")
+                 + " If you meant one of those, read that key.")
+    return (f"{KEY_NOT_FOUND} Nothing is saved at {key}.{known} If nothing was "
+            f"saved yet, this is a first visit: carry on without it.")
+
+
+#: The opening sentence of get_data_by_key's not-found answer, quoted by
+#: agents' saved steps, and the sentinel code here compares against.
+KEY_NOT_FOUND = "Key not found in stored data."
+
+
 def build_core_tool_closures(ctx):
     """Build session-scoped tool closures.  Returns list of (name, desc, func).
 
@@ -642,7 +897,12 @@ def build_core_tool_closures(ctx):
         # 10/10 on 2026-09-07).  The callee never needs an int: helper.py:2163
         # does get_frame(str(user_id)) and :2165 interpolates it into a
         # filename.  An integer id still passes through unchanged.
-        return helper_fun.get_user_camera_inp(inp, user_id, request_id_list[user_prompt])
+        _rid = camera_turn_id()
+        if not turn_may_see_the_camera():
+            tool_logger.warning(f"get_user_camera_inp refused on turn {_rid!r}: "
+                                f"not the person's own")
+            return camera_refusal('get_user_camera_inp')
+        return helper_fun.get_user_camera_inp(inp, user_id, _rid)
 
     # The schema says what the tool does.  It read "Get user's visual
     # information to process somethings" with one argument "The Question to
@@ -658,6 +918,123 @@ def build_core_tool_closures(ctx):
         "answer anything else, and it fails when the user is not sharing a "
         "camera.",
         get_user_camera_inp,
+    ))
+
+    # ------------------------------------------------------------------
+    # 2b. start_demonstration / stop_demonstration
+    # ------------------------------------------------------------------
+    # Owner 2026-11-11: when the person says "I'll show you how", the agent
+    # invokes the demonstration recorder (integrations/vlm/demo_session.py);
+    # the ribbon shows a recording symbol, Stop is the ribbon's own.  Not in
+    # MAIN_LEG_CORE_TOOLS on purpose: an agent that needs it attaches it by
+    # name or through request_tools, so the main leg's schema budget is
+    # untouched.  Both tools answer only the person's OWN turn, on the desktop
+    # owner's own account: a goal, a peer agent's relay or another user must
+    # never watch the owner's mouse and keyboard, or read what they did.
+    def _demonstration_refusal(tool_name):
+        """None when this turn may start or read a demonstration, else the
+        refusal that says what is wrong and what to do."""
+        from core.tool_refusal import RETRY_LATER, RETRY_NEVER, refuse
+        if not is_a_persons_request(camera_turn_id()):
+            return refuse(
+                tool_name,
+                "this turn is not the person's own message (it is a goal running "
+                "in the background, another agent's request, or a scheduled "
+                "run), and only the person may start or read a recording of what "
+                "they do on their own computer",
+                "Do this step without a demonstration; if the person wants to "
+                "show you something, wait for them to say so in chat",
+                retry=RETRY_LATER)
+        from integrations.agent_engine.capability_setup import setup_owner
+        owner = setup_owner()
+        if not owner:
+            return refuse(
+                tool_name,
+                "no one is signed in as this computer's owner, so there is "
+                "nobody whose mouse and keyboard may be recorded",
+                "Ask the person to sign in to the desktop app, then try again",
+                retry=RETRY_LATER)
+        if str(user_id) != str(owner):
+            return refuse(
+                tool_name,
+                "a recording would capture the desktop owner's mouse and "
+                "keyboard, and the person asking is not the owner",
+                "Ask the owner to show it from their own account; you cannot "
+                "record someone else's computer",
+                retry=RETRY_NEVER)
+        return None
+
+    @log_tool_execution
+    def start_demonstration(
+        what_will_be_shown: Annotated[str, "What the person is about to show you, in a few words, e.g. 'how I file my expenses'"],
+    ) -> str:
+        refusal = _demonstration_refusal('start_demonstration')
+        if refusal:
+            return refusal
+        from core.tool_refusal import RETRY_LATER, refuse
+        from integrations.vlm import demo_session
+        try:
+            session = demo_session.begin(user_id, prompt_id)
+        except demo_session.DemoRefused as refused:
+            return refuse('start_demonstration', refused.problem, refused.fix,
+                          retry=RETRY_LATER)
+        return (f"Recording started. The person's screen shows the red "
+                f"recording ribbon, and it ends by itself after "
+                f"{int(session.max_seconds // 60)} minutes or when they press "
+                f"Stop AI control. Tell them to go ahead and show you, and to say "
+                f"when they are done, then call stop_demonstration. It records "
+                f"which windows and controls they use (clicks, scrolls, key "
+                f"presses like Enter or Ctrl+S, and that they typed), never what "
+                f"they type. It does not record screenshots or captions of the "
+                f"screen, or middle and side mouse buttons, so do not promise "
+                f"those. Nothing is saved to disk, but the words you get back "
+                f"(window titles and control names, never what they type) go to "
+                f"the AI model running this chat, which may be an online model: "
+                f"tell the person that before they start.")
+
+    tools.append((
+        "start_demonstration",
+        "Start recording while the person shows you how to do something on "
+        "their own computer. Call it only when they say they will show you. "
+        "A recording ribbon is shown to them and they can stop it any time.",
+        start_demonstration,
+    ))
+
+    @log_tool_execution
+    def stop_demonstration() -> str:
+        refusal = _demonstration_refusal('stop_demonstration')
+        if refusal:
+            return refusal
+        from core.tool_refusal import RETRY_AFTER_FIX, refuse
+        from integrations.vlm import demo_session
+        session = demo_session.active_session()
+        if session is not None:
+            result = session.stop('person')
+            demo_session.take_finished(user_id)      # the ribbon may have ended it first
+        else:
+            # The person's own Stop, the time box or a lost ribbon ended the
+            # recording before this call: what they showed was kept for it.
+            result = demo_session.take_finished(user_id)
+            if result is None:
+                return refuse(
+                    'stop_demonstration', "no demonstration is being recorded right now",
+                    "Call start_demonstration first, and only when the person says "
+                    "they will show you how", retry=RETRY_AFTER_FIX)
+        # Read from the result on both paths: when the ribbon's Stop wins the race
+        # inside session.stop('person'), the result is the ribbon's.
+        how = demo_session.how_it_ended(result.ended_by)
+        return (f"The demonstration is over ({result.seconds:g} seconds{how}). What the "
+                f"person did, in order (what they typed is never recorded, only "
+                f"that they typed):\n{result.transcript}\n"
+                f"Turn this into the steps of the agent you are building: ask "
+                f"the person for any text they typed, and use their vault "
+                f"({{{{secret:NAME}}}}) for a secret.")
+
+    tools.append((
+        "stop_demonstration",
+        "Stop the recording the person's demonstration started, and get what "
+        "they did as numbered steps in words.",
+        stop_demonstration,
     ))
 
     # ------------------------------------------------------------------
@@ -681,6 +1058,11 @@ def build_core_tool_closures(ctx):
         save reaches another user.
         """
         tool_logger.info('INSIDE save_data_in_memory')
+        _placeholder = unfilled_key_placeholder(key)
+        if _placeholder:
+            tool_logger.warning(f"save_data_in_memory refused: key {key!r} holds "
+                                f"the placeholder {_placeholder!r}")
+            return _placeholder_key_refusal('save_data_in_memory', key, _placeholder)
         try:
             if isinstance(value, str) and (value.startswith('{') or value.startswith('[')):
                 value = _retrieve_json(value)
@@ -1423,7 +1805,7 @@ def build_core_tool_closures(ctx):
     # ------------------------------------------------------------------
     # 5. get_data_by_key
     # ------------------------------------------------------------------
-    _KEY_NOT_FOUND = "Key not found in stored data."
+    _KEY_NOT_FOUND = KEY_NOT_FOUND
 
     def _read_saved(key):
         """The value saved at ``key``, whole, or the not-found sentinel.
@@ -1494,7 +1876,15 @@ def build_core_tool_closures(ctx):
                 return (f'Nothing is stored for {key}: the elided text is kept '
                         f'for a day, and this one is gone or never existed.')
         else:
+            _placeholder = unfilled_key_placeholder(key)
+            if _placeholder:
+                tool_logger.warning(f"get_data_by_key refused: key {key!r} holds "
+                                    f"the placeholder {_placeholder!r}")
+                return _placeholder_key_refusal('get_data_by_key', key, _placeholder)
             value = _read_saved(key)
+            if value == _KEY_NOT_FOUND:
+                return key_not_found_reply(
+                    agent_data.get(person_store_id(user_prompt)) or {}, key)
         try:
             start = max(0, int(offset or 0))
         except (TypeError, ValueError):
@@ -1924,7 +2314,10 @@ def build_core_tool_closures(ctx):
             image_url = validate_url(image_url)
         except (ImportError, ValueError) as e:
             tool_logger.warning(f"Image URL blocked by SSRF filter: {image_url} — {e}")
-            return f"Error: URL blocked by security filter: {e}"
+            from core.tool_refusal import refuse
+            return refuse('get_text_from_image',
+                          f"image_url was refused by the security filter ({e})",
+                          "Pass a public http or https link to the image itself")
         # Try local Qwen Vision first (bundled mode), fall back to cloud
         from core.config_cache import get_vision_api, is_bundled
         url = get_vision_api()
@@ -1942,8 +2335,21 @@ def build_core_tool_closures(ctx):
             response = requests.request("POST", url, headers={}, data=payload, files=[], timeout=300)
         if response.status_code == 200:
             return response.text
-        else:
-            return 'Not able to get this page details try later'
+        # Was 'Not able to get this page details try later': not a failure to
+        # core.constants.tool_reply_failed, so a step could be credited with
+        # it, and it did not say whether the link or the service was at fault
+        # (owner 2026-11-09: every refusal says what was wrong).
+        from core.tool_refusal import RETRY_LATER, refuse
+        code = response.status_code
+        if 400 <= code < 500:
+            return refuse('get_text_from_image',
+                          f"the image service could not read image_url (HTTP {code})",
+                          "Check that image_url is a direct link to an image file "
+                          "that opens without signing in")
+        return refuse('get_text_from_image',
+                      f"the image service is failing (HTTP {code})",
+                      "Carry on without this image's details, or tell the person "
+                      "the image could not be read", retry=RETRY_LATER)
 
     tools.append((
         "get_text_from_image",
@@ -1985,9 +2391,23 @@ def build_core_tool_closures(ctx):
     _AGENT_MENTIONS = ("@statusverifier", "@status verifier", "@verification",
                       "@helper", "@executor")
 
+    # expects_reply is REQUIRED and has no default: a message that asks the
+    # person something and one that only tells them something are different
+    # acts, and the step's completion is decided from which act was called,
+    # never from the words (lifecycle_hooks.send_is_ask).  Live 2026-10-31
+    # 17:13 IST, agent 45620673143 action 3: the step's only output was a
+    # send ending "Ready to begin?", and reading every send as delivery would
+    # have closed the step on its own question.  A call that omits it fails
+    # here (the tool_logging error envelope names the argument) and sends
+    # nothing, so an omission is a visible failed call, never a silent ask
+    # or a silent completion.  What it means is EXPECTS_REPLY_RULE's one
+    # definition, shared with the tool description and REUSE's rule 11.ii.
+    from core.constants import EXPECTS_REPLY_RULE
+
     @log_tool_execution
     def send_message_to_user(
         text: Annotated[str, "Text you want to send to the user"],
+        expects_reply: Annotated[bool, EXPECTS_REPLY_RULE],
         avatar_id: Annotated[Optional[str], "Unique identifier for the avatar"] = None,
         response_type: Annotated[Optional[str], "Response mode: 'Realistic' (slower, better quality) or 'Realtime' (faster, lower quality)"] = 'Realtime',
     ) -> str:
@@ -1997,7 +2417,34 @@ def build_core_tool_closures(ctx):
             tool_logger.info(
                 f'Message directed to agent ({mention}), not sending to user: {text[:50]}...')
             return f'Message directed to {mention} agent, not sending to user'
+        _placeholder = unfilled_text_placeholder(text)
+        if _placeholder:
+            tool_logger.warning(f'send_message_to_user refused: the text holds '
+                                f'the placeholder {_placeholder!r}')
+            return _placeholder_text_refusal('send_message_to_user', _placeholder)
         tool_logger.info('INSIDE send_message_to_user')
+        # One line per send with what decides the step: which act it was,
+        # the turn it ran in and the action it ran for, so the share of sends
+        # that ask is measured, not guessed (hartos-00's review of the
+        # 476bbd5d8 rework).
+        # Attribution is evidence, not behaviour: an unresolved id is logged
+        # as None and never stops the send (tool_logging._session_suffix's
+        # rule, at debug for the same reason: a daemon tick has no request).
+        try:
+            from hartos.threadlocal import thread_local_data as _tld
+            _rid = _tld.get_request_id()
+        except Exception:
+            tool_logger.debug('[SEND-KIND] request id unavailable', exc_info=True)
+            _rid = None
+        try:
+            from hartos.lifecycle_hooks import action_in_progress
+            _aid = action_in_progress(user_prompt)
+        except Exception:
+            tool_logger.debug('[SEND-KIND] action id unavailable', exc_info=True)
+            _aid = None
+        tool_logger.info(
+            f'[SEND-KIND] {user_prompt} action={_aid} request={_rid} '
+            f'expects_reply={expects_reply}')
         tool_logger.info(f'SENDING DATA 2 user with values text:{text}, avatar_id:{avatar_id}, response_type:{response_type}')
         # The send runs HERE and its result is the tool's result.  This used
         # to start the send on a thread and return "sent successfully" before
@@ -2013,7 +2460,9 @@ def build_core_tool_closures(ctx):
 
     tools.append((
         "send_message_to_user",
-        "Sends a message/information to user. You can use this if you want to ask a question",
+        "Sends a message to the user. " + EXPECTS_REPLY_RULE
+        + " A message that waits for their answer holds your step until "
+        "they answer.",
         send_message_to_user,
     ))
 
@@ -2045,6 +2494,11 @@ def build_core_tool_closures(ctx):
     ) -> str:
         tool_logger.info('INSIDE send_message_in_seconds')
         tool_logger.info(f'with text:{text}. and waiting time: {delay} conv_id: {conv_id}')
+        _placeholder = unfilled_text_placeholder(text)
+        if _placeholder:
+            tool_logger.warning(f'send_message_in_seconds refused: the text '
+                                f'holds the placeholder {_placeholder!r}')
+            return _placeholder_text_refusal('send_message_in_seconds', _placeholder)
         run_time = datetime.fromtimestamp(time.time() + delay)
         scheduler.add_job(send_message_to_user1, 'date', run_date=run_time, args=[user_id, text, '', prompt_id])
         return 'Message scheduled successfully'
@@ -2083,6 +2537,11 @@ def build_core_tool_closures(ctx):
         channel: Annotated[str, "Which feed: 'camera', 'screen', or 'both' (default)"] = "both",
     ) -> str:
         """Search past camera/screen descriptions. Use for questions about what happened earlier visually."""
+        _rid = camera_turn_id()
+        if not turn_may_see_the_camera():
+            tool_logger.warning(f"search_visual_history refused on turn {_rid!r}: "
+                                f"not the person's own")
+            return camera_refusal('search_visual_history')
         results = helper_fun.search_visual_history(user_id, query, mins=minutes_back, channel=channel)
         if results:
             return '\n'.join(results)
@@ -2594,20 +3053,22 @@ def build_core_tool_closures(ctx):
     # ------------------------------------------------------------------
     # request_resource — Parity with LangChain Request_Resource
     # ------------------------------------------------------------------
+    # The one description of a credential ask, shared with Request_Resource in
+    # hart_intelligence_entry; the ask goes through the same gate there too.
+    from hartos.ai_key_vault import (
+        REQUEST_RESOURCE_DESCRIPTION, REQUEST_RESOURCE_INPUT)
+
     @log_tool_execution
     def request_resource(
-        resource_description: Annotated[str, "JSON or plain text describing the needed resource. JSON format: {\"resource_type\": \"api_key\", \"key_name\": \"GOOGLE_API_KEY\", \"label\": \"Google API Key\", \"used_by\": \"search tool\", \"description\": \"needed for web search\"}"],
+        resource_description: Annotated[str, REQUEST_RESOURCE_INPUT],
     ) -> str:
-        """Request an API key, credential, token, or config value that is not currently available."""
-        from hartos.ai_key_vault import request_credential
-        return request_credential(resource_description, agent_id=prompt_id)
+        """Ask the person for an outside service's credential a step needs."""
+        from hartos.ai_key_vault import request_credential_for_agent
+        return request_credential_for_agent(resource_description, agent_id=prompt_id)
 
     tools.append((
         "request_resource",
-        "Request an API key, credential, token, or config value. Checks vault/env first, "
-        "then prompts the user if not found. Handles: API keys (OpenAI, Google, Slack), "
-        "OAuth tokens, channel secrets, service credentials. "
-        "Input: JSON with resource_type, key_name, label, used_by, description.",
+        REQUEST_RESOURCE_DESCRIPTION,
         request_resource,
     ))
 
@@ -2740,20 +3201,35 @@ def build_core_tool_closures(ctx):
             YouTube_Transcript,
         ))
 
-        # T2: cookie-authenticated read on user's logged-in platform sessions.
-        # Routes through web_crawler.crawl_url_with_cookies (extending the
-        # canonical crawler) with AccountVault cookies + optional CDP attach.
+        # T2: a platform read that uses the person's stored cookies WHEN the
+        # vault holds some.  Routes through web_crawler.crawl_url_with_cookies
+        # (extending the canonical crawler) with AccountVault cookies +
+        # optional CDP attach.  Nothing writes to that vault in this build
+        # (AccountVault.add has no production caller), so today every call goes
+        # out logged out and the result says so: connection_mechanism
+        # 'logged_out_public', authenticated False, and a 'notice'.  Keep the
+        # text below honest about that -- the model reads these descriptions
+        # before it ever sees a result.
         @log_tool_execution
         def Search_Platform(
             platform: Annotated[str, "twitter / reddit / linkedin / bilibili / xiaohongshu / weibo"],
             query: Annotated[str, "Search keywords/phrase."],
             handle: Annotated[Optional[str], "Vault handle whose cookies to use; first if omitted."] = None,
         ) -> str:
-            """Search a platform using the user's logged-in session cookies.
+            """Search a platform, with the person's stored session cookies if
+            the vault holds any for it.
 
-            Returns JSON with success/markdown/connection_mechanism — the
-            connection_mechanism tells the agent (and user) how access happened
-            (obscura_b2_cdp_user_chrome / obscura_b1_headless_profile).
+            Returns JSON with success/markdown/connection_mechanism/
+            authenticated.  connection_mechanism says how access REALLY
+            happened: obscura_b2_cdp_user_chrome or
+            obscura_b1_headless_profile when cookies were sent, and
+            'logged_out_public' when none were — then authenticated is False,
+            a 'notice' explains it, and the page is the public view or a login
+            wall, not the person's own feed.  Nothing writes to the vault in
+            this build, so logged_out_public is what a default install returns
+            today.  Trust 'authenticated', not the absence of cookies: with
+            HEVOLVE_BROWSER_USE_B2 the crawler attaches to the person's own
+            Chrome, and then it IS their session and authenticated is True.
             Consent-gated on `web_research:<platform>`.
             """
             result = br_tools_module.dispatch(
@@ -2764,10 +3240,10 @@ def build_core_tool_closures(ctx):
 
         tools.append((
             "Search_Platform",
-            "Search a social platform (twitter/reddit/linkedin/bilibili/xiaohongshu/weibo) "
-            "using the user's logged-in session. Input: platform, query, optional handle. "
-            "Returns JSON with markdown content + connection_mechanism describing how the "
-            "agent accessed it (your Chrome, headless profile, or public). Consent-gated.",
+            "Search a social platform (twitter/reddit/linkedin/bilibili/xiaohongshu/weibo), "
+            "with the person's stored session if one exists. Input: platform, query, optional "
+            "handle. Returns JSON with markdown + connection_mechanism + authenticated; if "
+            "false it is the logged-out public view, not their feed — say so. Consent-gated.",
             Search_Platform,
         ))
 
@@ -2777,7 +3253,9 @@ def build_core_tool_closures(ctx):
             target_handle: Annotated[str, "Whose timeline to read (e.g. '@elonmusk')."],
             handle: Annotated[Optional[str], "Vault handle whose cookies to use; first if omitted."] = None,
         ) -> str:
-            """Read another user's public timeline via your logged-in browser session."""
+            """Read someone's public timeline, with the person's stored session
+            if the vault has one; otherwise it is a logged-out public read and
+            the result says so (authenticated False)."""
             result = br_tools_module.dispatch(
                 tool='Read_Timeline', user_id=str(user_id),
                 platform=platform, target_handle=target_handle, handle=handle,
@@ -2786,9 +3264,10 @@ def build_core_tool_closures(ctx):
 
         tools.append((
             "Read_Timeline",
-            "Read someone's public timeline on a platform via your logged-in session. "
-            "Input: platform, target_handle. Returns markdown + connection_mechanism. "
-            "Consent-gated on web_research:<platform>.",
+            "Read someone's public timeline on a platform, with the person's stored session "
+            "if one exists. Input: platform, target_handle. Returns markdown + "
+            "connection_mechanism + authenticated; if false it is the logged-out public view "
+            "— say so. Consent-gated on web_research:<platform>.",
             Read_Timeline,
         ))
 
@@ -2797,15 +3276,19 @@ def build_core_tool_closures(ctx):
             platform: Annotated[str, "twitter / reddit / linkedin / bilibili / xiaohongshu / weibo"],
             content: Annotated[str, "Text to post on the user's behalf."],
             handle: Annotated[Optional[str], "Vault handle to post as; first if omitted."] = None,
-            dry_run: Annotated[bool, "TRUE returns a preview card; FALSE actually posts (requires prior confirm)."] = True,
+            dry_run: Annotated[bool, "TRUE returns a preview card; FALSE is the confirmed post, which this build cannot send."] = True,
         ) -> str:
-            """Post on the user's behalf on a social platform.
+            """Offer to post on the person's behalf — this build cannot send it.
 
             **Preview-confirm gate**: dry_run defaults to TRUE.  First invocation
             returns a `liquid_ui: post_preview` component for the UI to render
             with explicit Cancel/Confirm buttons.  The agent MUST re-invoke with
             dry_run=False after the user taps Confirm.  Same canonical pattern
             as Invite_Friend and channel_send.
+
+            dry_run=False does NOT post: no per-platform write path exists, so
+            it returns success False with the text back under 'content'.  Tell
+            the person nothing was posted and hand them their text.
 
             Consent-gated on `web_research:<platform>`.
             """
@@ -2817,10 +3300,10 @@ def build_core_tool_closures(ctx):
 
         tools.append((
             "Post_As_User",
-            "Post on the user's behalf on a social platform via their logged-in "
-            "browser session. PREVIEW-CONFIRM gated: dry_run=True (default) returns "
-            "a preview card the user must explicitly confirm before the actual post "
-            "happens with dry_run=False. Consent-gated on web_research:<platform>. "
+            "Offer to post on the person's behalf on a social platform. This build CANNOT "
+            "post: dry_run=True (default) returns a preview card to confirm, and dry_run=False "
+            "returns the text unsent because no write path exists — say nothing was posted and "
+            "hand their text back. Consent-gated on web_research:<platform>. "
             "Input: platform, content, optional handle, dry_run.",
             Post_As_User,
         ))
@@ -3077,10 +3560,13 @@ def build_core_tool_closures(ctx):
     # The person's answer, asked on whichever of their devices they answer
     # (a file_request for clips, a form, a choice), for every agent alike:
     # integrations.agent_engine.person_ask (owner 2026-10-27, "liquid ui is
-    # asked as a tool by server").
+    # asked as a tool by server").  The turn's request id is read at each
+    # call: a background turn asks its goal's person (person_to_ask).
     try:
         from integrations.agent_engine.person_ask import ask_person_tool
-        _name, _desc, _ask_fn = ask_person_tool(user_id, prompt_id)
+        _name, _desc, _ask_fn = ask_person_tool(
+            user_id, prompt_id,
+            request_id=lambda: request_id_list.get(user_prompt))
         tools.append((_name, _desc, log_tool_execution(_ask_fn)))
     except Exception as e:
         tool_logger.warning("ask_person tool not registered: %s", e)

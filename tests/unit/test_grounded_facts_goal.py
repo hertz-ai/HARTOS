@@ -67,7 +67,7 @@ class TestGoalReachesItsTools(unittest.TestCase):
         helper = _Recorder()
         register_marketing_tools(helper, _Recorder(), 'u1')
         text = _goal()['description']
-        for tool in ('verify_facts', 'post_to_channel'):
+        for tool in ('verify_facts', 'publish_to_instagram_feed'):
             self.assertIn(tool, text, f'{tool} not named in the goal text')
             self.assertIn(tool, helper.names, f'{tool} named but not registered')
 
@@ -135,7 +135,8 @@ class TestGoalShape(unittest.TestCase):
         steps so slides are made first, the gate becomes advisory."""
         text = _goal()['description']
         self.assertLess(text.index('verify_facts'), text.index('text_2_image'))
-        self.assertLess(text.index('verify_facts'), text.index('post_to_channel'))
+        self.assertLess(text.index('verify_facts'),
+                        text.index('publish_to_instagram_feed'))
 
 
 if __name__ == '__main__':

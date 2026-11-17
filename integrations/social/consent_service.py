@@ -140,6 +140,14 @@ CONSENT_TYPES = frozenset({
                          # names the ONE credential ('secret:SITE_PASSWORD'),
                          # and the agent only ever gets its alias
                          # {{secret:SITE_PASSWORD}} (hartos.ai_key_vault).
+    'chat_join',         # Another account joins this account's chat with an
+                         # agent (a parent or therapist joining a child's,
+                         # owner 2026-11-06).  Granted when this account's
+                         # side approves the join card; agent_id is the
+                         # agent, scope '<joiner's user id>#<approval time>'
+                         # (one row per approval, so a join can be allowed
+                         # again after a revoke).  Revoking it ends the join
+                         # (core.persona_registry.joined_chats).
 })
 
 #: A credential ask's scope is this prefix + the credential's name, the same
@@ -294,7 +302,9 @@ def consent_prompt_push(data: dict, request_id) -> dict:
     if the scrub cannot run, the reason is left out.
     """
     user_id = str(data.get('user_id', ''))
-    who = str(data.get('agent_name') or data.get('requester_name') or 'An agent')
+    agent = str(data.get('agent_name') or '').strip()
+    who = (agent_as_asker(agent) if agent
+           else str(data.get('requester_name') or 'An agent'))
     what = str(data.get('consent_type') or 'your permission').replace('_', ' ')
     title = f"{who} needs your OK"
     body = str(data.get('reason') or '').strip() or f"{who} asks for {what}."
@@ -398,7 +408,6 @@ def _validate_consent_type(consent_type: str):
 
 _AGENT_ID_RE = re.compile(r'[A-Za-z0-9_-]+')
 
-
 def known_agent_id(agent_id):
     """The asking agent's id for a consent row, or None when no agent is
     known.
@@ -417,13 +426,15 @@ def _is_a_name(name, aid):
     """False for the placeholders the agent mirror manufactures when a
     prompt has no name ("Agent <id>", "agent-<id>", hart_intelligence_entry
     _create_social_agent_from_prompt :10993/:11005) and for the bare id:
-    those are the identifier the owner cannot read, dressed as a name.
-    Exact matches only: a real name may contain a digit sequence that
-    happens to be a short id ("Studio 1 Assistant" with id 1)."""
-    name = (name or '').strip()
-    if not name or name == aid:
-        return False
-    return name.lower() not in (f'agent {aid}'.lower(), f'agent-{aid}'.lower())
+    those are the identifier the owner cannot read, dressed as a name.  The
+    same placeholder built from ANOTHER id is no name either: measured on
+    central 2026-11-10, agent 93731340723's mirror carried "Agent
+    69922589936" and the owner's card read "Agent 69922589936 asks you".
+
+    The rule itself is core.agent_personality.is_a_name, the one name rule
+    the agent's own spoken name reads too (review of 4b9ba08ad)."""
+    from core.agent_personality import is_a_name
+    return is_a_name(name, aid)
 
 
 def agent_display_name(db, agent_id):
@@ -472,6 +483,21 @@ def agent_display_name(db, agent_id):
         _logger.debug("agent_display_name: prompt file read failed for %s",
                       aid, exc_info=True)
     return None
+
+
+def agent_as_asker(name: str) -> str:
+    """How a card names an AGENT that asks: 'Agent <name>'.  An agent may
+    carry a person's name ("Vijai"), and "Vijai asks you" read as another
+    person asking (owner 2026-11-11: "why does the question appear like
+    another user asking question instead of qualifying as agent").  The
+    wording for the ask card (person_ask), the consent push and the
+    computer-control reason (vlm.safety); a PERSON who asks (a device ask's
+    requester_name, a join request) keeps their own name.  A name that
+    already says it ("Agent Smith") is not prefixed twice."""
+    name = str(name or '').strip()
+    if re.match(r'agent\b', name, re.IGNORECASE):
+        return name
+    return f'Agent {name}'
 
 
 def _copilot_switch_from_consent(consent_type: str, granted: bool) -> None:
@@ -1147,9 +1173,14 @@ class ConsentService:
         _embodied_feed_from_consent(consent_type, False)
 
     @staticmethod
-    def feed_said_no(db, consent_type: str) -> bool:
+    def feed_said_no(db, consent_type: str, user_id=None) -> bool:
         """True when the latest answer on file for a camera/screen feed is a
         No, whoever gave it and for whichever agent or scope.
+
+        ``user_id``: only that person's answers count.  The node-wide default
+        is what the capture gate follows; ask_owner passes the owner, so a
+        No given by a previous owner of this computer is not read as the
+        current owner's.
 
         The feed is this node's hardware and its capture gate is node-wide:
         every answer, from any surface, reaches the same gate
@@ -1168,9 +1199,12 @@ class ConsentService:
         from sqlalchemy import func, inspect
         if not inspect(db.get_bind()).has_table(UserConsent.__tablename__):
             return False
-        last_yes, last_no = db.query(
+        query = db.query(
             func.max(UserConsent.granted_at), func.max(UserConsent.revoked_at),
-        ).filter(UserConsent.consent_type == consent_type).one()
+        ).filter(UserConsent.consent_type == consent_type)
+        if user_id is not None:
+            query = query.filter(UserConsent.user_id == str(user_id))
+        last_yes, last_no = query.one()
         return last_no is not None and (last_yes is None or last_no >= last_yes)
 
     @staticmethod
@@ -1284,6 +1318,29 @@ class ConsentService:
         return record.scope if record else ''
 
     @staticmethod
+    def granted_by(db, consent_type: str, scope: str, agent_id=None,
+                   prefix: bool = False) -> list:
+        """The user ids holding an active grant of ``consent_type`` for
+        ``scope`` (or, with ``prefix``, any scope starting with it) and
+        ``agent_id``, oldest grant first: the reverse of active_grant, for a
+        grant whose scope names who it lets in (chat_join: whose chats a
+        joiner may use)."""
+        _validate_consent_type(consent_type)
+        q = db.query(UserConsent.user_id).filter(
+            UserConsent.consent_type == consent_type,
+            UserConsent.agent_id == agent_id,
+            UserConsent.granted == True,
+            UserConsent.revoked_at.is_(None),
+        )
+        q = q.filter(UserConsent.scope.startswith(scope, autoescape=True) if prefix
+                     else UserConsent.scope == scope)
+        out = []
+        for (uid,) in q.order_by(UserConsent.granted_at.asc()).all():
+            if uid not in out:
+                out.append(uid)
+        return out
+
+    @staticmethod
     def list_consents(db, user_id: str, consent_type: str = None,
                       agent_id=None):
         """List consent records for a user, optionally filtered."""
@@ -1294,6 +1351,81 @@ class ConsentService:
         if agent_id is not None:
             q = q.filter(UserConsent.agent_id == agent_id)
         return q.order_by(UserConsent.created_at.desc()).all()
+
+
+# ── Asking this computer's owner for a capability ─────────────────────────
+
+#: What ask_owner found.
+OWNER_ALLOWED = 'allowed'      # the consent is on file
+OWNER_SAID_NO = 'said_no'      # the owner said no; nothing was asked
+OWNER_ASKED = 'asked'          # the ask is on file (filed now, or sent again)
+NO_OWNER = 'no_owner'          # nobody is signed in on this computer
+NOT_THE_OWNER = 'not_owner'    # the turn is not the owner's; nobody was asked
+NOT_HERE = 'not_here'          # central has no such part (central_lacks)
+ASK_FAILED = 'failed'          # the consent store could not be read or written
+
+
+def ask_owner(consent_type: str, reason: str = '', prompt_id=None, *,
+              turn_user=None, stop_at_last_no: bool = False) -> str:
+    """Ask this computer's owner for ``consent_type``; return what came of it.
+
+    The ask shared by the Request_Camera_Access / Request_Screen_Access tools
+    (hart_intelligence_entry._request_consent) and by the camera tool when it
+    finds no frame (hartos.helper.get_user_camera_inp), so those two cannot
+    drift apart.  The screen-capture loop, /visual_agent and computer
+    control still ask by themselves: they carry a scope or a requester name
+    this function does not take.  Whose permission: the desktop's owner
+    (HEVOLVE_OWNER_USER_ID, which Nunba exports at boot and keeps in step
+    with sign-in), never the caller.  Which agent asks: the turn's prompt id
+    (known_agent_id).  The ask itself is request_consent: one row, one card,
+    and nothing asked again once the owner answered.
+
+    ``turn_user``: the user whose turn needs the part.  When given and not
+    the owner, nobody is asked (NOT_THE_OWNER): the camera's frames are keyed
+    by the owner's own window, so no answer could serve that turn.
+
+    ``stop_at_last_no``: for an ask the agent did not make in so many words
+    (the camera tool asking on its own).  When the owner's latest answer for
+    this feed is a No (feed_said_no for the owner: any agent, any surface, a
+    "Don't allow" or a revoke), nothing new is filed and the outcome is
+    OWNER_SAID_NO -- unless this agent's own ask is still on screen,
+    unanswered (it asked in so many words after that No): then the outcome
+    is OWNER_ASKED and the card is sent again.  Without the flag a No to one
+    agent stays that agent's (declined), as the card promises.
+
+    Returns one of the outcomes above.  Never raises: a store error is logged
+    here and returned as ASK_FAILED.
+    """
+    if central_lacks(consent_type):
+        return NOT_HERE
+    owner = (os.environ.get('HEVOLVE_OWNER_USER_ID') or '').strip()
+    if not owner:
+        return NO_OWNER
+    if turn_user is not None and str(turn_user).strip() != owner:
+        return NOT_THE_OWNER
+    agent = known_agent_id(prompt_id)
+    try:
+        from .models import db_session
+        with db_session(commit=True) as db:
+            if ConsentService.check_consent(db, owner, consent_type,
+                                            agent_id=agent):
+                return OWNER_ALLOWED
+            if stop_at_last_no and ConsentService.feed_said_no(
+                    db, consent_type, user_id=owner):
+                waiting = (ConsentService.ask_on_file(
+                               db, owner, consent_type, agent_id=agent) is not None
+                           and not ConsentService.declined(
+                               db, owner, consent_type, agent_id=agent))
+                if not waiting:
+                    return OWNER_SAID_NO
+            ConsentService.request_consent(db, owner, consent_type,
+                                           agent_id=agent, reason=reason)
+            if ConsentService.declined(db, owner, consent_type, agent_id=agent):
+                return OWNER_SAID_NO
+    except Exception:
+        _logger.exception("%s ask for the owner could not be filed", consent_type)
+        return ASK_FAILED
+    return OWNER_ASKED
 
 
 # ──────────────────────────────────────────────────────────────────────

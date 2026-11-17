@@ -220,9 +220,14 @@ class ROSBridgeAdapter(ChannelAdapter):
         # Inject into FrameStore if available
         if self._frame_store:
             try:
+                # FrameStore.put_frame(user_id, frame_bytes, source): the
+                # keyword was frame_data, a TypeError swallowed at debug
+                # level, so no ROS frame ever reached the store (review of
+                # Nunba 11bde41f's side finding).
                 self._frame_store.put_frame(
                     user_id=f'ros:{topic}',
-                    frame_data=frame_data,
+                    frame_bytes=frame_data,
+                    source=f'ros:{topic}',
                 )
             except Exception as e:
                 logger.debug(f"ROS bridge: FrameStore inject failed: {e}")

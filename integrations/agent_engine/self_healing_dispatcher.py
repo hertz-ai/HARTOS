@@ -239,14 +239,25 @@ class SelfHealingDispatcher:
         return archived
 
     def _is_already_being_fixed(self, db: Session, pattern_key: str) -> bool:
-        """Check if an active goal already targets this exception pattern."""
+        """Check if an open goal (active or paused) already targets this
+        exception pattern.
+
+        Paused counts: the daemon pauses a self_heal goal that keeps failing
+        or makes no progress, and when only active goals were checked the
+        next occurrence of the same error filed a new goal, which was paused
+        in turn.  Measured 2026-11-04 on the owner's desktop: 181 paused
+        goals for ReadTimeout::world_model_bridge::ingest_sensor_batch, and
+        205 of this writer's 207 repeat goals filed while an earlier one for
+        the same pattern was paused.  A completed or archived goal is closed,
+        so a recurrence after it is new work and still gets a goal.
+        core.error_advice keeps the same check, keyed on the fingerprint."""
         try:
             from integrations.social.models import AgentGoal
         except ImportError:
             return False
 
         active_goals = db.query(AgentGoal).filter(
-            AgentGoal.status == 'active',
+            AgentGoal.status.in_(('active', 'paused')),
             AgentGoal.goal_type == 'self_heal',
         ).all()
 

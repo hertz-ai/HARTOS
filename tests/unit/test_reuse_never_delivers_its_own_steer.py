@@ -103,7 +103,11 @@ def _ns():
             return None
         return v if isinstance(v, dict) else None
 
-    ns = {'retrieve_json': retrieve_json}
+    # A lifted _REUSE_* constant may name another module's constant
+    # (_REUSE_ASK_TOOLS reads SEND_TOOL): bind the shipped value.
+    from tests.unit.source_constants import module_constant
+    ns = {'retrieve_json': retrieve_json,
+          'SEND_TOOL': module_constant('SEND_TOOL', 'hartos/lifecycle_hooks.py')}
     mod = ast.Module(body=body, type_ignores=[])
     exec(compile(ast.fix_missing_locations(mod), MODULE, 'exec'), ns)
     for name in _WANTED_FUNCS:

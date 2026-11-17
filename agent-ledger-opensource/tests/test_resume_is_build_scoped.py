@@ -39,6 +39,14 @@ NEW_BUILD = ['Call get_user_id, then get_data_by_key.',
 def _leave_unfinished(tmp_path, monkeypatch, actions):
     # agent_data/ resolves against the CWD; isolate it from the real one.
     monkeypatch.chdir(tmp_path)
+    # On a HARTOS node the default is the node's agent-data folder
+    # (default_ledger_dir); isolate that one too.
+    try:
+        import core.cache_loaders as _cl
+    except ImportError:              # the package on its own: CWD only
+        pass
+    else:
+        monkeypatch.setattr(_cl, 'AGENT_DATA_DIR', str(tmp_path / 'agent_data'))
     return create_ledger_from_actions(agent_id=AGENT, session_id=OLD_SESSION,
                                       actions=actions, flow_id=0)
 

@@ -1,0 +1,526 @@
+"""An agent the person already approved is finished with the AUTONOMOUS prompt.
+
+chat()'s config-without-recipe branch (hart_intelligence_entry, steward rule
+2026-08-22) "finishes the recipe AUTONOMOUSLY".  Measured live 2026-11-04 on
+the owner's desktop: Reel Studio (agent 342) went down that branch on her own
+request id, CREATE's only autonomy test was the daemon_ prefix, so the
+assistant was told "INTERACTIVE MODE: You may ask the user clarifying
+questions" and the approved plan stalled on step 2 asking her for clips it
+already had.  Owner 2026-11-04: "approved plan shd run autonomously".
+
+The flag travels recipe() -> get_response_group() -> create_agents() ->
+instantiate_assistant_agent(autonomous=...).  The first tests drive the real
+functions with autogen's classes replaced (the seam
+tests/unit/test_agent_creation.py uses, with its prompt-config fixtures) and
+read what the assistant is built with.
+
+The last two run the whole create loop with scripted agents and no LLM
+(tests/unit/test_create_loop_end_to_end.py's harness) and read each
+verifier the run builds.  Review of ed427a072, probe P2: the next flow's
+agents were rebuilt INTERACTIVE.  Probe P1 (a daemon step that needs a
+person is retried 3 times before the owner is asked) is what the owner
+chose on 2026-11-05: "Retry first, then ask".
+
+    python -m pytest tests/unit/test_an_approved_plan_runs_autonomously.py -q
+"""
+import faulthandler
+import json
+from contextlib import contextmanager
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+pytest.importorskip('autogen', reason='autogen not installed')
+
+from hartos import create_recipe as cr  # noqa: E402
+from hartos.helper import Action  # noqa: E402
+# The scripted whole-loop harness; its fixture is used by name below.
+from tests.unit.test_create_loop_end_to_end import (  # noqa: E402,F401
+    ACTIONS, PROMPT_ID, UP, USER_ID, _MARKER, _content, create_env)
+
+PLAN = ['Verify the clips are accessible.', 'Make the reel from the clips she sent.']
+
+
+@pytest.fixture
+def assistant_mode(test_user_id, test_prompt_id, mock_flask_app, sample_config_json):
+    """create_agents(..., autonomous=?) -> the ``autonomous`` it hands
+    instantiate_assistant_agent."""
+    up = f'{test_user_id}_{test_prompt_id}'
+
+    def run(autonomous):
+        task = Action(PLAN)
+        with patch.object(cr, 'user_tasks', {up: task}), \
+                patch.object(cr, 'config_list', [{'model': 'test', 'api_key': 'test'}]), \
+                patch('hartos.create_recipe.autogen.AssistantAgent', return_value=MagicMock()), \
+                patch('hartos.create_recipe.autogen.UserProxyAgent', return_value=MagicMock()), \
+                patch('hartos.create_recipe.autogen.GroupChat', return_value=MagicMock()), \
+                patch('hartos.create_recipe.autogen.GroupChatManager', return_value=MagicMock()), \
+                patch.object(cr, 'instantiate_assistant_agent',
+                             return_value=MagicMock()) as built:
+            cr.create_agents(test_user_id, task, test_prompt_id, autonomous=autonomous)
+        return built.call_args.kwargs['autonomous']
+    return run
+
+
+def test_an_approved_plan_gets_the_autonomous_assistant(assistant_mode):
+    assert assistant_mode(True) is True
+
+
+def test_a_person_turn_without_the_flag_stays_interactive(assistant_mode):
+    # No daemon_ request id in this thread: the existing rule still decides.
+    assert assistant_mode(False) is False
+
+
+def test_get_response_group_hands_the_flag_to_create_agents(mock_flask_app):
+    seen = {}
+
+    class _Built(Exception):
+        pass
+
+    def _create(user_id, task, prompt_id, autonomous=False):
+        seen['autonomous'] = autonomous
+        raise _Built()
+
+    with patch.object(cr, 'user_tasks', {'10202_342': Action(PLAN)}), \
+            patch.object(cr, 'user_agents', {}), \
+            patch.object(cr, 'create_agents', side_effect=_create):
+        try:
+            cr.get_response_group('10202', 'make my reel', '342', autonomous=True)
+        except _Built:
+            pass
+    assert seen == {'autonomous': True}
+
+
+# ── the whole loop ────────────────────────────────────────────────────────────
+
+def _verifier_hard_rules(env, monkeypatch):
+    """One entry per verifier the run builds: is the HARD RULE in its prompt?"""
+    built = []
+    real = env.cr.instantiate_status_verifier_agent
+
+    def _build(user_prompt, autonomous=False):
+        agent = real(user_prompt, autonomous=autonomous)
+        built.append(env.cr._USER_INPUT_HARD_RULE in agent.system_message)
+        return agent
+    monkeypatch.setattr(env.cr, 'instantiate_status_verifier_agent', _build)
+    return built
+
+
+def _finish_approved_plan(env, request_id, turns=3, text='Build the agent now'):
+    """The turns of a caller finishing an approved plan:
+    recipe(..., autonomous=True), as chat() calls it."""
+    from hartos.threadlocal import thread_local_data
+    thread_local_data.set_request_id(request_id)
+    faulthandler.dump_traceback_later(300, exit=True)
+    replies = []
+    with env.app.app_context():
+        for _ in range(turns):
+            replies.append(env.cr.recipe(USER_ID, text, PROMPT_ID,
+                                         None, request_id, autonomous=True))
+            if env.cr.scheduler_check.get(UP):
+                break
+    return replies
+
+
+def _owner_asks(monkeypatch):
+    """Every hand-off of a daemon step to the owner (GoalManager.escalate_goal),
+    with no database behind it."""
+    asks = []
+    import integrations.agent_engine.goal_manager as gm
+    monkeypatch.setattr(gm.GoalManager, 'escalate_goal', staticmethod(
+        lambda db, goal_id, escalation: asks.append(escalation) or {'success': True}))
+    import integrations.social.models as models
+
+    @contextmanager
+    def _no_db(commit=False):
+        yield None
+    monkeypatch.setattr(models, 'db_session', _no_db)
+    return asks
+
+
+def _two_flow_plan(env):
+    """The harness's one-flow plan with a second flow (same steps, another
+    persona) after it."""
+    cfg_path = env.prompts / f'{PROMPT_ID}.json'
+    cfg = json.loads(cfg_path.read_text(encoding='utf-8'))
+    cfg['personas'].append({'name': 'Reviewer', 'description': 'Reviews the summary.'})
+    cfg['flows'].append({'persona': 'Reviewer', 'sub_goal': 'review the summary',
+                         'actions': list(ACTIONS)})
+    cfg_path.write_text(json.dumps(cfg), encoding='utf-8')
+
+
+def test_every_flow_of_a_plan_she_approved_is_built_freed(create_env, monkeypatch):
+    """A two-flow plan she approved, finished on her request id: flow 1's
+    agents are built as flow 0's were, with no HARD RULE in the verifier."""
+    env = create_env
+    _two_flow_plan(env)
+    hard_rule = _verifier_hard_rules(env, monkeypatch)
+
+    replies = _finish_approved_plan(env, 'her-request-1')
+
+    assert (env.prompts / f'{PROMPT_ID}_1_recipe.json').exists(), (
+        f'the run never finished flow 1; replies {replies!r}')
+    assert len(hard_rule) >= 2, f'one verifier per flow expected: {hard_rule!r}'
+    assert not any(hard_rule), (
+        f'a flow of her approved plan was built with the HARD RULE: {hard_rule!r}')
+
+
+def test_a_plan_resumed_after_a_restart_moves_to_its_next_flow_freed(
+        create_env, monkeypatch):
+    """After a restart the run resumes where its files say.  Flow 0's three
+    steps are saved but its flow recipe is not, so the turn starts past flow
+    0's last step and the boundary check (safe_action_boundary_check) moves
+    the run to flow 1 and rebuilds its agents.  They are built freed, as
+    flow 0's were.  Rework of ed427a072, mutants M4c/M4d (the boundary check
+    not given the flag, or dropping it on its way to the next flow) survived
+    the test above, which ends flow 0 on the loop's own path.
+
+    The run is stopped where recipe() turns to the timer agents, after every
+    flow ran: that step opens each flow's recipe, and the boundary check
+    moved on without writing flow 0's (measured: FileNotFoundError on
+    424201_0_recipe.json, with or without this change).  That is reported
+    on its own; this test is about how flow 1 was built."""
+    env = create_env
+    _two_flow_plan(env)
+    for n, action in enumerate(ACTIONS, start=1):
+        (env.prompts / f'{PROMPT_ID}_0_{n}.json').write_text(json.dumps({
+            'status': 'done', 'action_id': n, 'action': action,
+            'recipe': [{'steps': f'search step {n}', 'tool_name': 'google_search'}]}),
+            encoding='utf-8')
+    hard_rule = _verifier_hard_rules(env, monkeypatch)
+
+    class _EveryFlowRan(Exception):
+        pass
+
+    def _timer_step(flows, number_of_flows, *a, **k):
+        raise _EveryFlowRan(number_of_flows)
+    monkeypatch.setattr(env.cr, 'create_time_agents_and_create_scheduled_jobs', _timer_step)
+
+    with pytest.raises(_EveryFlowRan):
+        _finish_approved_plan(env, 'her-request-2', turns=1)
+
+    assert (env.prompts / f'{PROMPT_ID}_1_recipe.json').exists(), 'flow 1 never finished'
+    assert len(hard_rule) >= 2, f'flow 1 was never built: {hard_rule!r}'
+    assert not any(hard_rule), (
+        f'the resumed plan moved to flow 1 with the HARD RULE: {hard_rule!r}')
+
+
+def test_a_daemon_step_that_needs_a_person_is_retried_then_handed_to_the_owner(
+        create_env, monkeypatch):
+    """Owner 2026-11-05 ("Retry first, then ask"): a daemon run is freed
+    too.  Its verifier has no HARD RULE, and a step it holds for a person
+    goes back to the agent before the owner is asked, once, with the
+    attempts as the reason (ruling 2026-10-31: the ask reaches the owner)."""
+    env = create_env
+    env.script.pending_ids = {2}          # the verifier: action 2 needs a person
+    asks = _owner_asks(monkeypatch)
+    hard_rule = _verifier_hard_rules(env, monkeypatch)
+
+    replies = _finish_approved_plan(env, 'daemon_e2e_create', turns=1)
+
+    posts = [int(n) for m in env.script.gc.messages
+             for n in _MARKER.findall(_content(m))]
+    assert posts.count(2) > 1, f'action 2 was not retried: {posts!r}'
+    assert [e.get('action_id') for e in asks] == [2], (asks, replies)
+    assert 'attempts' in asks[0].get('reason', ''), asks
+    assert 'Paused for help' in str(replies), replies
+    assert hard_rule and not any(hard_rule), hard_rule
+
+
+# ── a step that needs her, on a freed run (review of 4bcad9583) ──────────────
+
+HER_ANSWER = 'Yes, those three sources are the right ones.'
+
+
+def _flow_1_step_2_needs_a_person(env):
+    """Flow 1's step 2 is held for a person (`pending` + `no`) at every
+    verdict; every other step is verified as the harness does."""
+    real = env.script.verifier
+
+    def verifier(recipient, messages=None, sender=None, config=None):
+        if (env.cr.get_current_flow(UP) == 1 and env.script.current() == 2
+                and 'please verify' in _content(env.script._last())):
+            return True, json.dumps({
+                'status': 'pending', 'action': ACTIONS[1], 'action_id': 2,
+                'message': 'a person has to confirm the sources',
+                'can_perform_without_user_input': 'no'})
+        return real(recipient, messages, sender, config)
+    env.script.verifier = verifier
+
+
+def test_a_flow_1_step_that_needs_her_is_put_to_her(create_env):
+    """Review of 4bcad9583, finding 1: on her request id, flow 1's step 2
+    needs her.  The next flow's run asks her (attempts bound, _ask_for_help)
+    and holds the step for her answer; the turn hands her that question.
+    Measured on 4bcad9583: "I couldn't finish that: Action 2 must be
+    terminal before incrementing" (the next-flow site dropped the reply and
+    went on with flow 0's agents)."""
+    env = create_env
+    _two_flow_plan(env)
+    _flow_1_step_2_needs_a_person(env)
+
+    replies = _finish_approved_plan(env, 'her-request-4', turns=1)
+
+    assert 'need your input' in replies[0] and 'Step 2' in replies[0], replies
+    with env.app.app_context():
+        assert env.cr.person_waits_on(UP, 2, 1), (
+            'flow 1 step 2 is not held for her answer')
+
+
+def test_a_flow_1_step_on_a_daemon_run_is_handed_to_the_owner(
+        create_env, monkeypatch):
+    """The same plan on a daemon turn: flow 1's step 2 is handed to the owner
+    once, and the turn says the goal is paused for help (the hive worker
+    holds its task on that prefix, core.agent_tools.is_help_pause).
+    Measured on 4bcad9583 (and before it): the escalation was recorded, the
+    turn answered "Action 2 must be terminal before incrementing"."""
+    env = create_env
+    _two_flow_plan(env)
+    _flow_1_step_2_needs_a_person(env)
+    asks = _owner_asks(monkeypatch)
+
+    replies = _finish_approved_plan(env, 'daemon_e2e_create', turns=1)
+
+    assert [(e.get('action_id'), e.get('flow')) for e in asks] == [(2, 1)], asks
+    assert 'Paused for help' in str(replies), replies
+
+
+def _her_answer_closes_step_2(env):
+    """Step 2 asks her to confirm the sources.  Until her answer is in the
+    conversation the verifier holds it (`pending` + `no`); once it is there
+    the verifier says `completed` + `no` (the step itself asks her)."""
+    real_verifier = env.script.verifier
+    real_assistant = env.script.assistant
+
+    def her_answer_seen():
+        return any(HER_ANSWER in _content(m) for m in env.script._msgs())
+
+    def verifier(recipient, messages=None, sender=None, config=None):
+        if (env.script.current() == 2
+                and 'please verify' in _content(env.script._last())):
+            if not her_answer_seen():
+                return True, json.dumps({
+                    'status': 'pending', 'action': ACTIONS[1], 'action_id': 2,
+                    'message': 'she has to confirm the sources',
+                    'can_perform_without_user_input': 'no'})
+            receipt = max(i for i, m in enumerate(env.script._msgs())
+                          if isinstance(m, dict) and m.get('role') == 'tool')
+            return True, json.dumps({
+                'status': 'completed', 'action': ACTIONS[1], 'action_id': 2,
+                'message': 'she confirmed the sources',
+                'evidence': {'message_index': receipt, 'kind': 'tool_receipt'},
+                'can_perform_without_user_input': 'no',
+                'persona_name': 'Researcher', 'fallback_action': 'retry once'})
+        return real_verifier(recipient, messages, sender, config)
+
+    def assistant(recipient, messages=None, sender=None, config=None):
+        c = _content(env.script._last())
+        if HER_ANSWER in c and not _MARKER.search(c):
+            n = env.script.current()
+            return True, f'Working on step {n}. @Helper please save step {n}.'
+        return real_assistant(recipient, messages, sender, config)
+
+    env.script.verifier = verifier
+    env.script.assistant = assistant
+
+
+def test_her_answer_to_the_step_she_was_asked_about_is_taken_once(create_env):
+    """Review of 4bcad9583, finding 2: on a freed run the attempts bound
+    asks her about step 2.  Her next message is that step's answer: it is
+    recorded, the step closes, and she is not asked again.  Measured on
+    4bcad9583: nothing held the step, so her answer was not recorded and
+    the step's `completed` + `no` answered "Step 2 ... is waiting for your
+    reply before I continue." after she had replied."""
+    env = create_env
+    _her_answer_closes_step_2(env)
+
+    first = _finish_approved_plan(env, 'her-request-5', turns=1)
+    assert 'need your input' in first[0] and 'Step 2' in first[0], first
+
+    second = _finish_approved_plan(env, 'her-request-6', turns=1, text=HER_ANSWER)
+
+    with env.app.app_context():
+        assert env.cr.ledger_user_answered(UP, 2, 0), 'her answer was not recorded'
+    assert (env.prompts / f'{PROMPT_ID}_0_2.json').exists(), (
+        f'step 2 did not close on her answer: {second!r}')
+    assert not any(ask in second[0] for ask in ('need your input',
+                                                'waiting for your reply')), (
+        f'she was asked again after answering: {second!r}')
+
+
+# ── one hold for the person (review of 5dfba1d2a) ────────────────────────────
+
+def _step_2_asks_her_after_a_pending_verdict(env):
+    """Step 2's first verdict holds it for a person (`pending` + `no`: on a
+    freed run the step goes back to the agent, PENDING).  The agent then
+    reports the question sent, and the verifier says `completed` + `no`
+    with no answer from her yet: the gate holds the step."""
+    real_verifier = env.script.verifier
+    real_assistant = env.script.assistant
+    verdicts = []
+
+    def verifier(recipient, messages=None, sender=None, config=None):
+        if (env.script.current() == 2
+                and 'please verify' in _content(env.script._last())):
+            verdicts.append(2)
+            if len(verdicts) == 1:
+                return True, json.dumps({
+                    'status': 'pending', 'action': ACTIONS[1], 'action_id': 2,
+                    'message': 'she has to confirm the sources',
+                    'can_perform_without_user_input': 'no'})
+            receipt = max(i for i, m in enumerate(env.script._msgs())
+                          if isinstance(m, dict) and m.get('role') == 'tool')
+            return True, json.dumps({
+                'status': 'completed', 'action': ACTIONS[1], 'action_id': 2,
+                'message': 'the question went to her',
+                'evidence': {'message_index': receipt, 'kind': 'tool_receipt'},
+                'can_perform_without_user_input': 'no',
+                'persona_name': 'Researcher', 'fallback_action': 'retry once'})
+        return real_verifier(recipient, messages, sender, config)
+
+    def assistant(recipient, messages=None, sender=None, config=None):
+        c = _content(env.script._last())
+        if env.script.current() == 2 and '"status": "pending"' in c:
+            return True, 'I asked her to confirm the sources. @StatusVerifier please verify.'
+        return real_assistant(recipient, messages, sender, config)
+
+    env.script.verifier = verifier
+    env.script.assistant = assistant
+    return verdicts
+
+
+def test_the_gate_records_her_wait_on_a_step_a_pending_verdict_left_waiting(
+        create_env):
+    """The gate holds through _hold_for_the_person, as _ask_for_help does.
+    On a freed run a `pending` verdict leaves the step PENDING, and the
+    ledger blocks only a running task, so the gate's own block used to be
+    refused there: the wait lived only in the in-memory flag (lost on a
+    restart, and the ask unrecorded).  Held through the one helper, the step
+    is resumed first and the ledger records her wait."""
+    env = create_env
+    verdicts = _step_2_asks_her_after_a_pending_verdict(env)
+
+    replies = _finish_approved_plan(env, 'her-request-7', turns=1)
+
+    assert verdicts == [2, 2], verdicts
+    assert 'waiting for your reply' in replies[0], replies
+    with env.app.app_context():
+        assert env.cr.person_waits_on(UP, 2, 0), 'her wait is not in the ledger'
+
+
+def _loop_break_on_step_2(env):
+    """What the loop-break leaves for an unverified step (state_transition,
+    #485): the gate flag with kind RECOVERABLE_STALL, a help reason, and the
+    round ended.  Set at step 2's verdict until her answer is in the chat;
+    after it, `completed` + `no` (the step asked her to confirm)."""
+    from core.constants import USER_INPUT_GATE_RECOVERABLE_STALL
+    real_verifier = env.script.verifier
+    real_assistant = env.script.assistant
+
+    def her_answer_seen():
+        return any(HER_ANSWER in _content(m) for m in env.script._msgs())
+
+    def verifier(recipient, messages=None, sender=None, config=None):
+        if (env.script.current() == 2
+                and 'please verify' in _content(env.script._last())):
+            if not her_answer_seen():
+                task = env.cr.user_tasks[UP]
+                task._needs_user_input_action_id = 2
+                task._needs_user_input_kind = USER_INPUT_GATE_RECOVERABLE_STALL
+                task._needs_help_reason = (
+                    'the conversation looped without finishing it')
+                return True, 'TERMINATE'
+            receipt = max(i for i, m in enumerate(env.script._msgs())
+                          if isinstance(m, dict) and m.get('role') == 'tool')
+            return True, json.dumps({
+                'status': 'completed', 'action': ACTIONS[1], 'action_id': 2,
+                'message': 'she confirmed the sources',
+                'evidence': {'message_index': receipt, 'kind': 'tool_receipt'},
+                'can_perform_without_user_input': 'no',
+                'persona_name': 'Researcher', 'fallback_action': 'retry once'})
+        return real_verifier(recipient, messages, sender, config)
+
+    def assistant(recipient, messages=None, sender=None, config=None):
+        c = _content(env.script._last())
+        if HER_ANSWER in c and not _MARKER.search(c):
+            n = env.script.current()
+            return True, f'Working on step {n}. @Helper please save step {n}.'
+        return real_assistant(recipient, messages, sender, config)
+
+    env.script.verifier = verifier
+    env.script.assistant = assistant
+
+
+def _lose_the_flag(env):
+    """A restart between the ask and her answer: the in-memory flag is gone."""
+    task = env.cr.user_tasks[UP]
+    task._needs_user_input_action_id = None
+    task._needs_user_input_kind = None
+
+
+@pytest.mark.parametrize('between', ['her_ask_is_re_posted', 'the_flag_is_lost'])
+def test_a_step_the_loop_break_put_to_her_is_held_for_her_answer(
+        create_env, between):
+    """Review of 5dfba1d2a (Medium): the loop-break only flags its step
+    (RECOVERABLE_STALL) and holds nothing, and _ask_for_help left a flagged
+    step alone, so on her turn the ask was never recorded and the ledger
+    held no wait.  Measured on 5dfba1d2a: a re-post of the asking request
+    ("Build the agent now", the web retry) was recorded as her answer to
+    step 2, and with the flag lost before her answer she was asked twice
+    over three turns.  Held for her, the re-post answers nothing, and her
+    answer is taken once whether or not the flag survived."""
+    env = create_env
+    _loop_break_on_step_2(env)
+
+    first = _finish_approved_plan(env, 'her-request-8', turns=1)
+    assert 'need your input' in first[0] and 'Step 2' in first[0], first
+    with env.app.app_context():
+        assert env.cr.person_waits_on(UP, 2, 0), 'her wait is not in the ledger'
+
+    if between == 'her_ask_is_re_posted':
+        _finish_approved_plan(env, 'her-request-8', turns=1)
+        with env.app.app_context():
+            assert not env.cr.ledger_user_answered(UP, 2, 0), (
+                'the re-posted ask was recorded as her answer')
+    else:
+        _lose_the_flag(env)
+
+    answer = _finish_approved_plan(env, 'her-request-9', turns=1, text=HER_ANSWER)
+
+    with env.app.app_context():
+        assert env.cr.ledger_user_answered(UP, 2, 0), 'her answer was not recorded'
+    assert (env.prompts / f'{PROMPT_ID}_0_2.json').exists(), (
+        f'step 2 did not close on her answer: {answer!r}')
+    assert not any(ask in answer[0] for ask in ('need your input',
+                                                'waiting for your reply')), (
+        f'she was asked again after answering: {answer!r}')
+
+
+def test_source_guard_one_hold_for_the_person():
+    """DRY guard for the fold above (review of 5dfba1d2a): the person's wait
+    is written by _hold_for_the_person alone, so the gate's hold and the
+    attempts bound's cannot drift apart again.  A source guard by design: a
+    second caller of mark_action_waiting_for_user anywhere in create_recipe
+    is the regression, and no single behaviour test sees all call sites."""
+    import ast
+    import inspect
+
+    class _Callers(ast.NodeVisitor):
+        """Each call of mark_action_waiting_for_user, named by the innermost
+        function it sits in (state_transition is nested in create_agents)."""
+        def __init__(self):
+            self.stack, self.found = [], []
+
+        def visit_FunctionDef(self, node):
+            self.stack.append(node.name)
+            self.generic_visit(node)
+            self.stack.pop()
+
+        def visit_Call(self, node):
+            if getattr(node.func, 'id', None) == 'mark_action_waiting_for_user':
+                self.found.append(self.stack[-1] if self.stack else '<module>')
+            self.generic_visit(node)
+
+    callers = _Callers()
+    callers.visit(ast.parse(inspect.getsource(cr)))
+    assert callers.found == ['_hold_for_the_person'], callers.found

@@ -100,6 +100,16 @@ def _tool(ctx, name):
     raise AssertionError(f'{name} was not built by the factory')
 
 
+def _on_the_persons_turn(request_id, fn, *args):
+    """The camera tool answers only inside a person's own turn: the turn id
+    with_llm_context binds around chat_agent / recipe()
+    (core.llm_outbound_logger.request_id_context; HARTOS camera gate,
+    2026-11-11)."""
+    from core.llm_outbound_logger import request_id_context
+    with request_id_context(request_id):
+        return fn(*args)
+
+
 class CoreToolsAcceptUuidUserId(unittest.TestCase):
 
     def test_camera_tool_runs_for_a_uuid_user(self):
@@ -109,7 +119,7 @@ class CoreToolsAcceptUuidUserId(unittest.TestCase):
         """
         helper = _RecordingHelperFun()
         fn = _tool(_ctx(UUID_USER, helper_fun=helper), 'get_user_camera_inp')
-        result = fn('what is on my desk?')
+        result = _on_the_persons_turn('r1', fn, 'what is on my desk?')
         self.assertEqual(result, 'visual answer')
         self.assertEqual(
             helper.camera_calls[0][1], UUID_USER,
@@ -121,7 +131,7 @@ class CoreToolsAcceptUuidUserId(unittest.TestCase):
         """No regression for integer-keyed (cloud) deployments."""
         helper = _RecordingHelperFun()
         fn = _tool(_ctx(7, helper_fun=helper), 'get_user_camera_inp')
-        fn('what is on my desk?')
+        _on_the_persons_turn('r1', fn, 'what is on my desk?')
         self.assertEqual(helper.camera_calls[0][1], 7)
 
     def test_uploaded_file_tool_answers_honestly_when_nothing_uploaded(self):

@@ -165,6 +165,69 @@ def test_a_secret_in_the_failure_text_never_reaches_the_experiment(db):
     assert 'sk-proj-' not in (exp.hypothesis or '') and 'AAAA' not in (exp.hypothesis or '')
 
 
+def test_a_secret_cut_in_half_by_the_signature_never_reaches_the_experiment(db):
+    """Review of 3d4c5b3a3's fix by claude-autostart-71: the signature was cut
+    to 80 characters BEFORE the egress scrub, so a key straddling the cut
+    left a fragment too short for the secret patterns (sk-proj- plus 27
+    characters, where the pattern wants 40), and the proposer's scrub of the
+    cut text published it.  The scrub runs on the whole failure text, then
+    the cut."""
+    why = 'turn failed: 401 Incorrect API key provided: sk-proj-' + 'B' * 60
+    for gid in ('s1', 's2', 's3'):
+        _pause(db, _active(db, gid), why=why)
+    [exp] = _harness_experiments(db)
+    assert exp.title.startswith('Harness: turn failed: 401 Incorrect API key provided: ')
+    for text in (exp.title, exp.hypothesis or ''):
+        assert 'sk-proj-' not in text and 'BBBB' not in text, text
+    stored = db.get(AgentGoal, 's1').config_json['pause_signature']
+    assert 'sk-proj-' not in stored and 'BBBB' not in stored, stored
+
+
+def test_a_scrubber_failure_still_pauses_and_publishes_nothing(db):
+    """Residual from claude-autostart-71's review of 6d557b153: only an
+    ImportError was caught, so any other scrub_text failure escaped
+    _failure_signature into the pause arm before pause_goal, and the goal
+    kept failing unpaused.  The pause stands, its signature cut as written
+    (it stays on the goal's own row); the proposer, which scrubs again,
+    publishes nothing."""
+    with patch('security.edge_privacy.scrub_text',
+               side_effect=RuntimeError('scrubber down')):
+        for gid in ('f1', 'f2', 'f3'):
+            _pause(db, _active(db, gid))
+    for gid in ('f1', 'f2', 'f3'):
+        goal = db.get(AgentGoal, gid)
+        assert goal.status == 'paused'
+        assert goal.config_json['pause_cause'] == 'dispatch_failures'
+        assert goal.config_json['pause_signature'] == WHY[:80].rstrip()
+    assert _harness_experiments(db) == []
+
+
+def test_an_unscrubbed_signature_is_never_proposed(db):
+    """hartos-00's review of cd49395bc, F1 (blocking, privacy): with a
+    scrubber that fails on the whole failure text but not on the 80-char cut,
+    the pause kept the raw cut and handed it to the proposer, whose own scrub
+    of those 80 chars passed: 'sk-proj-' plus 27 key characters reached a
+    public ThoughtExperiment title and hypothesis.  Raw stays local, on the
+    goal's own row; a signature the scrub did not clean is never proposed."""
+    keyed = ('turn failed: upstream refused the call, key in the url: '
+             'sk-proj-' + 'B' * 40)
+
+    def fails_on_the_whole_text(text):
+        if len(text) > 80:
+            raise RuntimeError('scrubber failed on the long text')
+        return text
+
+    with patch('security.edge_privacy.scrub_text',
+               side_effect=fails_on_the_whole_text):
+        for gid in ('k1', 'k2', 'k3'):
+            _pause(db, _active(db, gid), why=keyed)
+    for gid in ('k1', 'k2', 'k3'):
+        goal = db.get(AgentGoal, gid)
+        assert goal.status == 'paused'
+        assert goal.config_json['pause_signature'] == keyed[:80].rstrip()
+    assert _harness_experiments(db) == []
+
+
 def test_no_signature_is_stored_for_a_failure_with_no_reason(db):
     """Minor from the review: an empty signature is no key at all."""
     _pause(db, _active(db, 'n1'), why=None)

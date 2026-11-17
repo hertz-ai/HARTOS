@@ -271,6 +271,67 @@ def test_a_charge_whose_tier_bump_fails_asks_for_a_person_now(client, key_db, tm
     assert _tier_of(key_db) == 'free'
 
 
+def test_with_the_database_gone_the_charged_card_is_still_named(client, key_db, tmp_path,
+                                                                 monkeypatch):
+    """The card was charged, the tier write failed, and the database stays
+    unreachable (a lost connection, not a locked file).  The failed bump
+    rolls the session back, which expires the key row; the route then read
+    api_key.id for the reconciliation line, so the read raised inside the
+    report: Flask's HTML 500 and no MANUAL RECONCILIATION line, on the one
+    rail where nothing retries, so that line is the only record of a
+    charged card (task #211; the Stripe finish was fixed the same way in
+    094feb0ad, measured by the review of 2971c00db)."""
+    ledger = PaymentLedger(ledger_path=str(tmp_path / 'ledger.json'))
+    ledger.add_gateway(_AuthorizingStripe())
+    monkeypatch.delenv('HEVOLVE_DEV_MODE', raising=False)
+    log = logging.getLogger('hevolve_social')
+    with _as_owner(key_db), patch('integrations.ap2.payment_ledger', ledger), \
+            key_db.lost_at_next_commit(), patch.object(log, 'error') as said:
+        r = client.post(f'/api/v1/intelligence/keys/{KEY}/upgrade',
+                        json={'target_tier': 'pro', 'payment_method': 'pm_card_visa'},
+                        headers={'Authorization': 'Bearer tok'})
+    assert r.status_code == 500
+    body = r.get_json(silent=True)
+    assert body is not None, r.data[:200]
+    assert body['success'] is False and body['status'] == 'bump_failed'
+    (payment,) = ledger.payments.values()
+    assert payment.status == PaymentStatus.COMPLETED          # the money was taken
+    assert body['payment_request_id'] == payment.payment_id
+    assert said.call_count == 1
+    line = said.call_args.args[0]
+    assert 'MANUAL RECONCILIATION NEEDED' in line and 'if this repeats' not in line
+    assert payment.payment_id in line and f'api_key {KEY}' in line
+    assert _tier_of(key_db) == 'free'
+
+
+def test_a_bump_written_before_the_database_went_is_an_upgrade(client, key_db, tmp_path,
+                                                                monkeypatch):
+    """The card was charged and the tier write COMMITTED; then the database
+    went away before the key row could be read back.  The table holds the
+    bought tier, so the buyer is told the upgrade happened, with the tier's
+    limits, and no line asks a person to apply by hand what is already
+    applied.  The read back shared the write's try, so its failure was
+    reported as a failed bump: a 500 bump_failed to the buyer and "apply the
+    bought tier by hand" to the operator (task #214)."""
+    ledger = PaymentLedger(ledger_path=str(tmp_path / 'ledger.json'))
+    ledger.add_gateway(_AuthorizingStripe())
+    monkeypatch.delenv('HEVOLVE_DEV_MODE', raising=False)
+    log = logging.getLogger('hevolve_social')
+    with _as_owner(key_db), patch('integrations.ap2.payment_ledger', ledger), \
+            key_db.lost_after_next_commit(), patch.object(log, 'error') as said:
+        r = client.post(f'/api/v1/intelligence/keys/{KEY}/upgrade',
+                        json={'target_tier': 'pro', 'payment_method': 'pm_card_visa'},
+                        headers={'Authorization': 'Bearer tok'})
+    assert r.status_code == 200, r.data[:300]
+    body = r.get_json()
+    assert body['success'] is True and body['payment']['status'] == 'completed'
+    held = key_db.key()
+    assert held[0] == 'pro'
+    assert body['api_key'] == {'id': KEY, 'tier': held[0],
+                               'rate_limit_per_day': held[1], 'monthly_quota': held[2]}
+    said.assert_not_called()
+
+
 def test_the_mock_gate_reads_the_one_dev_mode_switch(client, key_db, tmp_path, monkeypatch):
     """security.master_key.is_dev_mode is the switch the security layer reads;
     the money gate must read the same one, not its own copy of the env rule."""

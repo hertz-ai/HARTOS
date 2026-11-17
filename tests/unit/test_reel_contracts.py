@@ -679,6 +679,12 @@ def test_trending_lists_carry_no_urls_and_no_session_data():
     'sessionid', 'csrftoken', 'cookies', 'authorization_data', 'preview_url',
     'accesstoken', 'authtoken', 'apitoken', 'refreshtoken', 'bearertoken',
     'userpassword', 'igpassword',
+    # a secret word not last, or plural, which the one rule does not read;
+    # 2f3d2255e let these through (its review)
+    'tokens', 'auth_tokens', 'access_tokens', 'refresh_tokens', 'token_value',
+    'tokenValue',
+    # a song list has no count of tokens: refused with them
+    'max_tokens',
 ])
 def test_a_song_list_carries_no_secret_under_any_name(key):
     doc = _client()

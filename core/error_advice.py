@@ -150,15 +150,19 @@ def _try_agent_remediation(
             # accumulated since 2026-03-29, never dispatched, flooding the goal
             # table + contending for the shared LLM slot once the daemon runs).
             # Mirror self_healing_dispatcher._is_already_being_fixed — skip if an
-            # active self_heal goal already targets this fingerprint.  Best-effort.
+            # open (active or paused) self_heal goal already targets this
+            # fingerprint.  Paused counts: the daemon pauses a goal that keeps
+            # failing, and while only active goals were checked each repeat
+            # filed a new goal (measured 2026-11-04: all 22 repeats since this
+            # check landed came while an earlier goal was paused).  Best-effort.
             try:
                 from integrations.social.models import AgentGoal
                 for _g in db.query(AgentGoal).filter(
-                        AgentGoal.status == 'active',
+                        AgentGoal.status.in_(('active', 'paused')),
                         AgentGoal.goal_type == 'self_heal').all():
                     if (_g.config_json or {}).get('fingerprint') == _fp:
                         logger.debug(
-                            f"[error_advice/{category}] active self_heal goal "
+                            f"[error_advice/{category}] open self_heal goal "
                             f"already targets {_fp[:12]} — skipping duplicate")
                         return
             except Exception:

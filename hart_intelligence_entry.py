@@ -260,6 +260,8 @@ from bs4 import BeautifulSoup
 from enum import Enum
 from hartos.cultural_wisdom import get_cultural_prompt_compact
 from hartos.agent_identity import build_identity_prompt, SECRETS_GUARDRAIL, extract_owner_name
+# The one description of an agent's credential ask (core.agent_tools shares it).
+from hartos.ai_key_vault import REQUEST_RESOURCE_DESCRIPTION
 
 # langchain_classic — pydantic v2-compatible fork of langchain 0.0.230.
 # Fail-safe (#99): in a frozen env where langchain_classic is absent (the HART OS
@@ -399,7 +401,7 @@ def hevolve_verify_boot():
         _boot_logger.warning(msg)
         return
 
-    with open(manifest_path) as f:
+    with open(manifest_path, encoding='utf-8') as f:
         d = json.load(f)
 
     pub_hex = d.get("master_public_key")
@@ -535,6 +537,7 @@ load_dotenv()
 
 try:
     from hartos.create_recipe import recipe, time_based_execution as time_execution, visual_execution
+    from hartos.create_recipe import build_holds_a_step_for_the_person
     from hartos.reuse_recipe import chat_agent, crossbar_multiagent, time_based_execution, visual_based_execution
 except ImportError as e:
     # print() went nowhere: frozen windowed builds have no real stdout, so the
@@ -548,6 +551,7 @@ except ImportError as e:
         "Could not import recipe modules -- agent creation and recipe "
         "execution are DISABLED for this process: %s", e, exc_info=True)
     recipe = None
+    build_holds_a_step_for_the_person = None
     time_execution = None
     visual_execution = None
     chat_agent = None
@@ -1770,7 +1774,7 @@ except Exception as e:
 config = {}
 for _cfg_name in ('langchain_config.json', 'config.json'):
     try:
-        with open(_cfg_name, 'r') as f:
+        with open(_cfg_name, 'r', encoding='utf-8') as f:
             _loaded = json.load(f)
         # Distinguish langchain config (has API keys) from Nunba URL config (has IP_ADDRESS)
         if 'IP_ADDRESS' not in _loaded or any(k.endswith('_API_KEY') for k in _loaded):
@@ -3193,7 +3197,7 @@ def _push_workflow_flowchart(user_id, prompt_id, request_id=None):
         recipe_path = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
         if not os.path.isfile(recipe_path):
             return
-        with open(recipe_path) as f:
+        with open(recipe_path, encoding='utf-8') as f:
             recipe_data = json.load(f)
         crossbar_message = {
             "text": ["Agent workflow ready"],
@@ -3236,13 +3240,11 @@ def _request_consent(action: str, label: str, input_text: str) -> str:
     /visual_agent (#66).  Which agent is asking comes from the request's own
     prompt id, not the capability label the tool wrapper passes.
     """
-    # ONE normaliser for "is this a real agent id", shared with the
-    # computer_control and credential asks rather than copied (it already
-    # handles the '0' and 'None' spellings this codebase passes around).
+    # The ask itself is consent_service.ask_owner, shared with the camera
+    # tool's own ask (hartos.helper), so the two cannot drift apart.
     from integrations.social.consent_service import (
-        ConsentService, central_lacks, consent_type_for_action,
-        known_agent_id)
-    from integrations.social.models import db_session
+        ASK_FAILED, NO_OWNER, NOT_HERE, OWNER_ALLOWED, OWNER_SAID_NO,
+        ask_owner, central_lacks, consent_type_for_action)
 
     log = logging.getLogger(__name__)
     consent_type = consent_type_for_action(action)
@@ -3250,29 +3252,21 @@ def _request_consent(action: str, label: str, input_text: str) -> str:
         log.error('_request_consent: %r maps to no consent type', action)
         return (f"Could not request {label.lower()} access — this computer "
                 f"records no permission for '{action}'.")
-    part = central_lacks(consent_type)
-    if part:
-        return f"Not asked: central has no {part}."
-
-    owner = os.environ.get('HEVOLVE_OWNER_USER_ID')
-    if not owner:
+    outcome = ask_owner(consent_type, f'{label} access needed: {input_text}'.strip(),
+                        thread_local_data.get_prompt_id())
+    if outcome == NOT_HERE:
+        return f"Not asked: central has no {central_lacks(consent_type)}."
+    if outcome == NO_OWNER:
         log.warning('%s consent not asked: no owner identity '
                     '(HEVOLVE_OWNER_USER_ID is not set)', label)
         return (f"Not asked: nobody is signed in on this computer who could "
                 f"allow {label.lower()} access.")
-
-    agent = known_agent_id(thread_local_data.get_prompt_id())
-    reason = f'{label} access needed: {input_text}'.strip()
-    try:
-        with db_session(commit=True) as db:
-            if ConsentService.check_or_request(db, owner, consent_type,
-                                               agent_id=agent, reason=reason):
-                return f"{label} access is already allowed — go ahead."
-            if ConsentService.declined(db, owner, consent_type, agent_id=agent):
-                return (f"The owner of this computer said no to "
-                        f"{label.lower()} access.")
-    except Exception:
-        log.exception('_request_consent: %s ask could not be filed', label)
+    if outcome == OWNER_ALLOWED:
+        return f"{label} access is already allowed — go ahead."
+    if outcome == OWNER_SAID_NO:
+        return (f"The owner of this computer said no to "
+                f"{label.lower()} access.")
+    if outcome == ASK_FAILED:
         return (f"Could not request {label.lower()} access — the permission "
                 f"system is unavailable.")
     return (f"{label} access request sent to the owner of this computer. "
@@ -4572,6 +4566,9 @@ def _handle_connect_channel_tool(input_text: str) -> str:
                 visible_fields = [f for f in setup_fields if not f.get('auto')]
                 if visible_fields:
                     from core.platform.registry import get_registry
+                    from security.edge_privacy import (
+                        is_secret_key as _is_secret_key,
+                        secret_key_form as _secret_key_form)
                     _lui = get_registry().get_or_none('LiquidUIService')
                     if _lui:
                         _lui.agent_ui_update(
@@ -4585,10 +4582,15 @@ def _handle_connect_channel_tool(input_text: str) -> str:
                                         'name': f.get('key'),
                                         'label': f.get('label') or f.get('key'),
                                         'placeholder': f.get('placeholder') or '',
+                                        # The one secret-name rule, with any
+                                        # '*_key' masked too: a channel's
+                                        # signing or app key is typed into
+                                        # this box ('password' was not).
                                         'secret': bool(
                                             f.get('secret')
-                                            or (f.get('key') or '').endswith(
-                                                ('_token', '_secret', '_key'))
+                                            or _is_secret_key(
+                                                _secret_key_form(f.get('key') or ''),
+                                                ('key',))
                                         ),
                                         'help': f.get('help') or '',
                                         'type': f.get('type') or 'text',
@@ -5042,13 +5044,14 @@ def _handle_agentic_router_tool(input_text):
 def _handle_request_resource(input_text: str) -> str:
     """Request_Resource: the agent needs a credential, API key or token.
 
-    hartos.ai_key_vault.request_credential does the work, for this tool and
-    for core.agent_tools request_resource alike: the owner is asked on the
+    hartos.ai_key_vault.request_credential_for_agent does the work, for this
+    tool and for core.agent_tools request_resource alike: an ask no person
+    could act on goes back to the agent; any other is asked on the owner's
     consent card and the agent gets only the {{secret:NAME}} alias.
     """
-    from hartos.ai_key_vault import request_credential
+    from hartos.ai_key_vault import request_credential_for_agent
     from integrations.social.consent_service import known_agent_id
-    return request_credential(
+    return request_credential_for_agent(
         input_text, agent_id=known_agent_id(thread_local_data.get_prompt_id()))
 
 
@@ -5569,17 +5572,7 @@ def get_tools(req_tool, is_first: bool = False, agent_tools=None):
             labeled_tool(
                 name="Request_Resource",
                 func=_handle_request_resource,
-                description=(
-                    "Use this tool when you need an API key, credential, token, or any external "
-                    "resource that is not currently available. This handles ALL resource types: "
-                    "API keys (OpenAI, Google, Slack, Discord, etc.), OAuth tokens, service "
-                    "credentials, channel secrets, or any configuration value. "
-                    "Input should be a JSON string with: resource_type (api_key, channel_secret, "
-                    "token, config), key_name (e.g. GOOGLE_API_KEY), label (human-readable name), "
-                    "used_by (which tool/service needs it), description (why it's needed). "
-                    "If the resource is already configured, it returns immediately. "
-                    "If not, the user will be prompted securely."
-                ),
+                description=REQUEST_RESOURCE_DESCRIPTION,
                 ui_label='Requesting a resource…',
             ),
             labeled_tool(
@@ -6041,17 +6034,7 @@ def get_tools(req_tool, is_first: bool = False, agent_tools=None):
             Tool(
                 name="Request_Resource",
                 func=_handle_request_resource,
-                description=(
-                    "Use this tool when you need an API key, credential, token, or any external "
-                    "resource that is not currently available. This handles ALL resource types: "
-                    "API keys (OpenAI, Google, Slack, Discord, etc.), OAuth tokens, service "
-                    "credentials, channel secrets, or any configuration value. "
-                    "Input should be a JSON string with: resource_type (api_key, channel_secret, "
-                    "token, config), key_name (e.g. GOOGLE_API_KEY), label (human-readable name), "
-                    "used_by (which tool/service needs it), description (why it's needed). "
-                    "If the resource is already configured, it returns immediately. "
-                    "If not, the user will be prompted securely."
-                ),
+                description=REQUEST_RESOURCE_DESCRIPTION,
             ),
             Tool(
                 name="Suggest_Share_Worthy_Content",
@@ -7235,6 +7218,15 @@ def get_frame(user_id):
                 app.logger.info(
                     f"Frame for user_id {user_id} from FrameStore")
                 return frame[:, :, ::-1]  # BGR → RGB
+        if fs.camera_stopped(str(user_id)):
+            # This person's camera sent frames and stopped.  A camera question
+            # is not answered from the desktop: once the store refused the
+            # stopped camera's old frame, the screenshot below answered
+            # Visual_Context_Camera under no screen-capture consent (review
+            # of a7d79664d, measured).
+            app.logger.info(
+                f"No frame for user_id {user_id}: the camera stopped sending")
+            return None
 
     # Desktop screenshot fallback (for computer use mode), behind the same
     # gate _handle_screenshot_tool reads (core.ai_sensing.allowed: the eye
@@ -8401,6 +8393,55 @@ INTERMEDIATE_CONTINUATION = "You are Hevolve, a versatile personal AI developed 
 first_promts = []
 review_agents = {}  # keyed by f'{user_id}_{prompt_id}' to avoid cross-prompt collision
 conversation_agent = {}  # keyed by f'{user_id}_{prompt_id}'
+# What an unfinished agent's build resumes on, keyed like review_agents:
+# {'input': its own build input, 'label': what the person is told it is
+# called}.  Set when a turn to an agent whose recipe is not finished routes
+# into creation (the reuse route's unfinished-agent block, and the flow
+# ladder when the turn did not arrive mid-build), read by Phase 2 in place of
+# the turn's text, dropped when the build finishes.  The person's words are
+# never the build's input (review of cfa9e29ee: the second message reached
+# recipe() there), except as the answer to a step the build asked them for.
+resume_build_input = {}
+
+
+def _own_build_input(config):
+    """What an unfinished agent's build resumes on: its saved config's goal
+    (the gather schema's "ultimate goal of the agent"), else a fixed neutral
+    sentence.  Never a person's words."""
+    goal = (config or {}).get('goal')
+    if isinstance(goal, str) and goal.strip():
+        return goal
+    return 'Continue building this agent from its saved plan.'
+
+
+def _unfinished_agent_label(config, prompt_id):
+    """What a person is told an unfinished agent is called: its display name,
+    quoted, when that is a name (core.agent_personality.is_a_name, the one
+    name rule), else "This agent"; never the bare prompt id (review of
+    cfa9e29ee)."""
+    from core.agent_personality import is_a_name
+    config = config or {}
+    name = config.get('name') or config.get('agent_name')
+    return f'"{name}"' if is_a_name(name, prompt_id) else 'This agent'
+
+
+def _resumed_build_reply(response, user_id, prompt_id, label):
+    """The reply to a person's turn on which an unfinished agent's build ran
+    on its own saved input and did not finish.  One reply for both sites that
+    resume (the reuse route's unfinished-agent block and Phase 2).  A build
+    that stopped (core.agent_tools.is_build_stop_reply: a pause for the
+    person, a held turn, an error, a help pause, the CREATE error envelope)
+    or that asked this person for a step (build_holds_a_step_for_the_person)
+    answers in its own words.  Anything else answered the build's own input,
+    not this person, so they are told plainly where their agent stands."""
+    from core.agent_tools import is_build_stop_reply
+    if is_build_stop_reply(response) or (
+            build_holds_a_step_for_the_person is not None
+            and build_holds_a_step_for_the_person(user_id, prompt_id)):
+        return response
+    return (f'{label} is not finished yet, so it cannot answer you. Its build '
+            f'ran again from its saved plan and is still not finished. '
+            f'Messages you send before it is finished are not given to it.')
 _state_lock = threading.Lock()  # Protects review_agents, conversation_agent, first_promts
 
 # --- Interactive gather_info turn limit ---
@@ -8439,6 +8480,9 @@ def _cleanup_stale_agents():
         if now - _agent_timestamps[key] > _AGENT_TTL:
             review_agents.pop(key, None)
             conversation_agent.pop(key, None)
+            # Set beside review_agents, so it ages out with it (review of
+            # 49eee800d: unbounded, never evicted).
+            resume_build_input.pop(key, None)
             _agent_timestamps.pop(key, None)
     # Also clean stale gather turn counters
     # Both _gather_turn_counts and _agent_timestamps now use '{user_id}_{prompt_id}' keys
@@ -8468,8 +8512,9 @@ def _review_proposed_plan(plan, max_rounds_remaining):
 
     Single-shot local-LLM call against the same Qwen3-VL endpoint that
     gather_info uses — same model competence as the plan author.  Applies
-    quality gates and returns ('approved', None) or
-    ('needs_refinement', feedback_text).
+    quality gates and returns ('approved', None),
+    ('needs_refinement', feedback_text) or ('unreviewed', why) when no
+    verdict came back.
 
     Quality gates (mirrors StatusVerifier verdict shape):
       1. Each step is ONE concrete tool call; a genuine multi-step GUI task is
@@ -8481,9 +8526,11 @@ def _review_proposed_plan(plan, max_rounds_remaining):
       4. Steps in logical order (open before click, login before post)
       5. Tool names in the registered catalog
 
-    Fail-open: if the reviewer endpoint is down, returns 'approved' so a
-    reviewer outage doesn't block the autonomous flow indefinitely.  The
-    autogen Helper team applies stricter checks again at execution time.
+    No verdict is never an approval: a reviewer that is down, or that
+    answers no verdict, returns 'unreviewed' and the caller holds the plan
+    for its creator's card (owner 11-04: the whole plan reviewed, no forced
+    approval).  Until 2026-11-11 both cases answered 'approved' and the plan
+    was saved with nobody approving it (review of 06f729559, probe P1).
     """
     try:
         from core.port_registry import get_local_llm_url
@@ -8513,10 +8560,17 @@ def _review_proposed_plan(plan, max_rounds_remaining):
             "you see a malformed brace, stray quote, or syntax error, assume it's\n"
             "a serialization artifact and ignore it.\n\n"
             "Plan to review (JSON):\n"
-            + json.dumps(plan, indent=2)[:6000]  # cap to keep ctx small
+            # Whole, never cut: a task that names its own flows keeps one
+            # flow per named flow, and seven flows of nine real steps come
+            # to about 8.9k even compact, so the old 6000 cut ended the plan
+            # mid-JSON and the reviewer judged a different plan.  No cap is
+            # needed for the context: the plan is this same endpoint's own
+            # output, written after a longer prompt than these rules, and a
+            # call that still fails is fail-open below.  Compact for tokens.
+            + json.dumps(plan, separators=(',', ':'))
             + "\n\nRespond with ONLY a JSON object:\n"
             "  {\"status\":\"approved\"} if all gates pass\n"
-            "  {\"status\":\"needs_refinement\",\"feedback\":\"specific fix needed\"} otherwise\n"
+            "  {\"status\":\"needs_refinement\",\"flow_name\":\"the flow to fix\",\"feedback\":\"specific fix needed\"} otherwise\n"
             "ASCII only.  No prose.  Start with { end with }."
         )
         # Reuse pooled_post that gather_info uses; same endpoint
@@ -8538,19 +8592,250 @@ def _review_proposed_plan(plan, max_rounds_remaining):
                 app.logger.info('Plan review: approved')
                 return ('approved', None)
             fb = verdict.get('feedback') or 'plan needs more atomic detail'
+            # The planner applies feedback to the flow it names
+            # (gather_agentdetails' autonomous prompt), so the flow travels
+            # inside the feedback text, the one thing passed back.
+            _flow = verdict.get('flow_name')
+            if isinstance(_flow, str) and _flow.strip():
+                fb = f"In flow '{_flow.strip()}': {fb}"
             app.logger.info(f'Plan review: needs_refinement — {fb[:200]}')
             return ('needs_refinement', fb)
-        # Couldn't parse — fail-open
-        app.logger.debug('Plan review: unparseable, fail-open')
-        return ('approved', None)
+        app.logger.warning('Plan review: the reviewer answered no verdict')
+        return ('unreviewed', 'the reviewer answered no verdict')
     except Exception as e:
-        # Reviewer outage — fail-open (Helper team's strict checks still apply
-        # at execution time).  Don't block flywheel on reviewer health.
-        app.logger.warning(f'Plan review failed (fail-open): {e}')
-        return ('approved', None)
+        app.logger.warning(f'Plan review failed: {e}')
+        return ('unreviewed', 'the reviewer could not be reached')
 
 
-def _autonomous_gather_info(user_id, description, prompt_id):
+def _approved_plan_response(plan):
+    """The approved ``plan`` as the response the save path reads: status
+    'completed', review_required dropped, nothing else changed.
+
+    Finalized here, in code.  Sending 'approved' to gather_info and saving
+    its re-emission saved a new LLM answer, not the reviewed plan: on
+    2026-10-30 the Syllable Coach (prompt 1793359802508) was saved with
+    "read Arjun's latest attempt" ahead of "ask him to say ball", reworded,
+    though all three staged rounds kept the creator's order (hartos-c9).
+    """
+    final = {k: v for k, v in plan.items() if k != 'review_required'}
+    final['status'] = 'completed'
+    return json.dumps(final)
+
+
+def _stage_review_round(plan, prompt_id, review_round):
+    """Write one auto-review round's plan to its proposed-plan file (audit)."""
+    try:
+        from core.prompt_files import proposed_plan_filename
+        _plan_path = os.path.join(
+            PROMPTS_DIR,
+            proposed_plan_filename(prompt_id, review_round))
+        os.makedirs(os.path.dirname(_plan_path), exist_ok=True)
+        with open(_plan_path, 'w') as f:
+            json.dump(plan, f)
+        app.logger.info(
+            f'Plan round {review_round} staged at {_plan_path}')
+    except Exception as e:
+        app.logger.warning(f'Plan stage write failed: {e}')
+
+
+def _plan_name(plan, prompt_id):
+    plan = plan if isinstance(plan, dict) else {}
+    return str(plan.get('name') or plan.get('agent_name') or f'agent {prompt_id}')
+
+
+def _write_staged_plan(prompt_id, plan) -> None:
+    """The one writer of the plan staged under ``prompt_id``, held or ended
+    (core.prompt_files.staged_plan reads it back).  Raises on failure; the
+    callers say what was lost."""
+    from core.prompt_files import proposed_plan_filename
+    path = os.path.join(PROMPTS_DIR, proposed_plan_filename(prompt_id))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w') as f:
+        json.dump(plan, f)
+
+
+def _plan_wait_reply(text, background):
+    """What a hold tells its turn.  A background turn's reply carries the
+    waiting prefix (core.agent_tools.is_waiting_for_person), so dispatch, the
+    daemon and the hive worker count no work and no strike while the plan
+    waits on its card: unprefixed, the hold sentence passed every recogniser
+    and a parallel subtask ending on it was marked complete (review of
+    06f729559, probe P5)."""
+    if not background:
+        return text
+    from core.constants import WAITING_FOR_PERSON_REPLY_PREFIX
+    return f'{WAITING_FOR_PERSON_REPLY_PREFIX} {text}'
+
+
+def _hold_for_the_creator(plan, prompt_id, user_id, why, background, request_id=None):
+    """A plan nobody approved waits on its creator's approval card; it is
+    never saved unapproved (owner 11-04: the whole plan reviewed, no forced
+    approval).  Before this the oscillation guard and the three-round
+    escalation saved it as it stood (live 11-07, agent 1794031134533).
+
+    The plan is staged as the peer-review plan with the ask kept in it
+    (core.prompt_files.staged_plan reads it back).  A person's create also
+    keeps a hold under the CREATING user, one per person, because the person
+    paths mint a new prompt id on every create (_creation_prompt_id); a
+    background create resumes by its goal's own stable prompt id and keeps
+    none, since one daemon persona serves many goals (hartos-16, 11-07).  The
+    card goes to whom an ask of this turn reaches (person_ask.person_to_ask
+    with the turn's request id: a daemon goal's turn asks its goal's person).
+    The card's buttons are the ones every client draws: approve builds the
+    plan, deny drops it.
+
+    An ask that could not be filed holds nothing: the plan stays staged for
+    the record, nothing is built, and the turn says so as a failed turn
+    (core.agent_tools.user_facing_error), so the person's next create plans
+    afresh and a daemon goal counts the failure.  Holding it instead trapped
+    the creator: every later create, even with a new description, was sent
+    back to the held plan and told to approve a card nobody had shown them
+    (review of 06f729559, probe P2).  What to tell the turn."""
+    from integrations.agent_engine import person_ask
+    from core.prompt_files import clear_held_plan, hold_plan
+    held = {k: v for k, v in plan.items() if k not in ('review_required', 'hold')}
+    held.update(status='proposed_plan', prompt_id=prompt_id, creator_user_id=user_id)
+    name = _plan_name(held, prompt_id)
+    card = {'type': 'approval', 'action': f'approve_plan:{prompt_id}',
+            'description': (f'The plan for {name} did not settle in review ({why}). '
+                            f'Approve to build it on your next message, or deny to drop it.')}
+    asked, out = None, {'ok': False, 'refused': 'no_person'}
+    try:
+        asked = person_ask.person_to_ask(user_id, request_id)
+        if asked:
+            out = person_ask.ask(asked, prompt_id, card, prompt_id=prompt_id,
+                                 background=background)
+    except Exception as e:
+        app.logger.warning(f'Plan {prompt_id}: the approval could not be asked: {e}')
+        out = {'ok': False, 'refused': 'error'}
+    if not (out.get('ok') and out.get('ask_id')):
+        refused = out.get('refused') or 'not filed'
+        try:
+            _write_staged_plan(prompt_id, held)
+            if not background:
+                clear_held_plan(user_id)
+        except Exception as e:
+            app.logger.warning(f'Plan {prompt_id}: the unasked plan could not be staged: {e}')
+        app.logger.warning(
+            f'Plan {prompt_id} did not settle in review ({why}) and its approval card '
+            f'was not filed ({refused}): nothing held, nothing built')
+        from core.agent_tools import user_facing_error
+        return user_facing_error(RuntimeError(
+            f'the plan for {name[:40]} was not put on an approval card ({refused}); '
+            f'nothing was built, so ask again to re-plan'))
+    held['hold'] = {'ask_id': out['ask_id'], 'asked': asked, 'why': why}
+    try:
+        _write_staged_plan(prompt_id, held)
+        if not background:
+            hold_plan(user_id, prompt_id)
+    except Exception as e:
+        app.logger.warning(f'Plan {prompt_id}: the hold could not be kept: {e}')
+    app.logger.warning(
+        f'Plan {prompt_id} held for approval ({why}): ask {out["ask_id"]} to {asked}')
+    return _plan_wait_reply(
+        f'The plan for {name} did not settle in review ({why}), so it waits for '
+        f'your approval: approve it on the card and it is built on your next '
+        f'message, or deny it to drop it.', background)
+
+
+def _held_plan_turn(user_id, prompt_id, background, request_id=None):
+    """A creator's turn on a plan of ``prompt_id`` that waits on their card:
+    ('approved', response), the staged plan finalized in code, never a
+    re-emission; ('reply', text), what to tell them (still waiting, dropped,
+    approved but not buildable, or asked again because the answer is no
+    longer kept); None when no plan of this id waits.
+
+    Only its creator's turn acts on a held plan.  Another account naming the
+    id (the agentic-execute path takes it from the request) is told it waits
+    on someone else's approval and learns nothing of it: before, it could
+    build the approved plan as its own, take an expired hold over, or read
+    the plan's name (review of 06f729559, probe P3)."""
+    from integrations.agent_engine import person_ask
+    from core.prompt_files import clear_held_plan, staged_plan
+    staged = staged_plan(PROMPTS_DIR, prompt_id)
+    hold = (staged or {}).get('hold')
+    if not isinstance(hold, dict):
+        return None
+    creator = staged.get('creator_user_id')
+    if creator not in (None, '') and str(creator) != str(user_id):
+        app.logger.warning(f'Plan {prompt_id} waits on its creator; a turn of {user_id} '
+                           f'named it and was refused')
+        return 'reply', ("That agent's plan is waiting on its creator's approval, so it "
+                         "cannot be built or changed from this account.")
+    name = _plan_name(staged, prompt_id)
+    plan = {k: v for k, v in staged.items() if k != 'hold'}
+
+    def _end():
+        try:
+            _write_staged_plan(prompt_id, plan)
+        except Exception as e:
+            app.logger.warning(f'Plan {prompt_id}: the ended hold could not be written: {e}')
+        if not background:
+            clear_held_plan(user_id)
+
+    state = {'status': None}
+    if hold.get('ask_id') and hold.get('asked'):
+        try:
+            state = person_ask.ask_state(hold['ask_id'], hold['asked'])
+        except Exception as e:
+            app.logger.warning(f'Plan {prompt_id}: its approval could not be read: {e}')
+    status = state.get('status')
+    decision = str((state.get('answer') or {}).get('decision') or '').strip().lower()
+    if status == 'answered' and decision == 'approve':
+        _end()
+        approved = _approved_plan_response(plan)
+        if _buildable_completed_config(json.loads(approved), prompt_id) is None:
+            # Approved but nothing in it can be built: said, never handed back
+            # to the planner, whose next answer would be saved as the agent
+            # with the approval spent on another plan (probe P4).
+            app.logger.warning(f'Plan {prompt_id} approved on its card but has no '
+                               f'buildable step; nothing built')
+            from core.agent_tools import user_facing_error
+            return 'reply', user_facing_error(RuntimeError(
+                f'the approved plan for {name[:40]} has no step that can be built; '
+                f'nothing was built, so ask again to re-plan'))
+        app.logger.info(f'Plan {prompt_id} approved on its card; building the staged plan')
+        return 'approved', approved
+    # "Later" on a client dismisses the ask everywhere, as its X does (owner
+    # 2026-11-04, Nunba AgentOverlay), so a dismissal drops the plan as a
+    # deny does.
+    if status == 'dismissed' or (status == 'answered' and decision == 'deny'):
+        _end()
+        app.logger.info(f'Plan {prompt_id} dropped on its card')
+        return 'reply', _plan_wait_reply(
+            f'Dropped the plan for {name}. Tell me what you want and I will plan '
+            f'it again.', background)
+    if status == 'open':
+        return 'reply', _plan_wait_reply(
+            f'Your plan for {name} is waiting on the card: approve it to build it, '
+            f'or deny it to drop it.', background)
+    # The answer is no longer kept (an hour passed, a restart): ask again;
+    # nothing is built without an approval.
+    return 'reply', _hold_for_the_creator(plan, prompt_id, user_id,
+                                          hold.get('why') or 'review did not settle',
+                                          background, request_id)
+
+
+def _creation_prompt_id(user_id, proposed):
+    """The id a PERSON's create runs under: the plan waiting on their card
+    when they have one (one per person, core.prompt_files.held_plan), else
+    ``proposed``.  Not for background creates (:11033 keeps its goal's id).
+    A hold record whose plan no longer waits is cleared, never followed."""
+    from core.prompt_files import clear_held_plan, held_plan, staged_plan
+    try:
+        held = held_plan(user_id)
+        if held is None:
+            return proposed
+        if isinstance((staged_plan(PROMPTS_DIR, held) or {}).get('hold'), dict):
+            return held
+        clear_held_plan(user_id)
+    except Exception as e:
+        app.logger.warning(f'Plan hold of {user_id} could not be read: {e}')
+    return proposed
+
+
+def _autonomous_gather_info(user_id, description, prompt_id, background=False,
+                            request_id=None):
     """Run gather_info autonomously with HART OS peer-review pattern.
 
     Four-stage flow (matches gather_agentdetails.py PLAN_FIRST prompt
@@ -8562,15 +8847,23 @@ def _autonomous_gather_info(user_id, description, prompt_id):
       STAGE 2 (auto, no human in loop): _review_proposed_plan calls
         a single-shot StatusVerifier-style LLM review against quality
         gates.  Returns 'approved' or 'needs_refinement' + feedback.
+        Every plan is reviewed, including one the model marked
+        'completed' itself.
 
       STAGE 3 (auto): if needs_refinement, send feedback to gather_info
         which refines and re-emits.  Loop up to 3 rounds.  After 3
-        rounds, escalate (currently auto-approve with metadata flag;
-        future: FCM push to Android via the path restored in this
-        session for human verdict with 30-min timeout).
+        rounds, the newest plan (the refinement that answered the last
+        feedback, never reviewed) is staged as its own round and waits
+        on its creator's approval card (_hold_for_the_creator); so does
+        an oscillating plan, a plan the reviewer could not review, and
+        the rejected plan when a refinement call fails.  Nothing is
+        saved that neither the reviewer nor the creator approved; when
+        the last answer after 3 rounds holds no plan at all, nothing is
+        built and the turn says so.
 
-      STAGE 4: on approved, send 'approved' to gather_info → status
-        becomes 'completed' → persona JSON saved → next /chat call
+      STAGE 4: on approved, the approved plan itself is finalized in code
+        (_approved_plan_response, no LLM call) → status 'completed' →
+        persona JSON saved → next /chat call
         dispatches to the autogen multi-agent team (Helper + Executor
         + StatusVerifier) which executes the atomic steps using
         execute_windows_or_android_command and saves per-step recipe
@@ -8584,7 +8877,24 @@ def _autonomous_gather_info(user_id, description, prompt_id):
     uses handles the review verdict at zero marginal cost.
     """
     from hartos.gather_agentdetails import gather_info
-    response = gather_info(user_id, description, prompt_id, autonomous=True)
+    # Background or a person's own turn is the turn's request id's to say
+    # (dispatch.is_genuine_user_request, mirrored by core.chat_client
+    # .is_user_turn), not the caller's flag: Nunba sends 'autonomous' on a
+    # person's own forced create, and that branch passed background=True, so
+    # the person read "Waiting for the person: The plan ... waits for your
+    # approval" (review of 1c45e6829, probe p6); the reuse-route and
+    # Create_Agent sites passed none, so a daemon's create there counted its
+    # hold as work (probe p8).  A caller with no request id keeps its flag.
+    if request_id is not None:
+        from core.chat_client import is_user_turn
+        background = not is_user_turn({'request_id': request_id})
+    # A plan of this id waiting on its creator's card is answered first.
+    _held = _held_plan_turn(user_id, prompt_id, background, request_id)
+    if _held is not None and _held[0] == 'reply':
+        return _held[1]
+    _resumed = _held is not None
+    response = (_held[1] if _resumed
+                else gather_info(user_id, description, prompt_id, autonomous=True))
 
     # Auto-review + refinement loop (no human in path)
     review_rounds = 0
@@ -8606,10 +8916,10 @@ def _autonomous_gather_info(user_id, description, prompt_id):
         OSC_DELTA as _OSC_DELTA,
     )
     _prev_action_count = None
+    _approved = _resumed            # approved on its card: finalized, saved below
     while review_rounds < MAX_REVIEW_ROUNDS:
         try:
-            new_response = response.replace('true', 'True').replace('false', 'False')
-            parsed = retrieve_json(new_response)
+            parsed = _parse_plan_reply(response)
             if isinstance(parsed, list):
                 for item in reversed(parsed):
                     if isinstance(item, dict) and 'status' in item:
@@ -8622,9 +8932,23 @@ def _autonomous_gather_info(user_id, description, prompt_id):
 
             _status = (parsed.get('status') or '').lower()
 
-            if _status == 'completed':
-                # Already approved + finalized (single-shot success)
+            if _status == 'completed' and _approved:
+                # The plan the reviewer approved, finalized; saved below.
                 break
+            if _status == 'completed':
+                # A plan the model marked completed that no reviewer
+                # approved is reviewed like any other.  The autonomous
+                # system message's STAGE 1 has the first call emit a plan
+                # for review, so 'completed' at round 0 or on a refinement
+                # is the model skipping review; it was saved unreviewed and
+                # unstaged (review of a88258c98, F-d).
+                _status = 'proposed_plan'
+                # The reply itself is relabelled: every exit below reads
+                # `response`, and a break after a failed refinement saved
+                # this unreviewed plan as 'completed' while the log said
+                # "not saved" (review of 7e130b0df, must-fix 2).
+                parsed['status'] = 'proposed_plan'
+                response = json.dumps(parsed)
 
             if _status == 'proposed_plan':
                 # Oscillation guard — must run BEFORE the reviewer is
@@ -8637,52 +8961,71 @@ def _autonomous_gather_info(user_id, description, prompt_id):
                         f'action_count {_prev_action_count} -> {_action_count} '
                         f'(delta {abs(_action_count - _prev_action_count)} > '
                         f'threshold {_OSC_DELTA}). Reviewer is yo-yoing the '
-                        f'planner. Force-approving the most recent plan to '
-                        f'stop the cycle.'
+                        f'planner. Holding the most recent plan for its '
+                        f'creator\'s approval to stop the cycle.'
                     )
-                    try:
-                        response = gather_info(
-                            user_id,
-                            'approved (oscillation-detected after '
-                            f'{review_rounds + 1} rounds)',
-                            prompt_id, autonomous=True)
-                    except Exception as _osc_err:
-                        app.logger.error(
-                            f'Oscillation force-approve failed: {_osc_err}')
-                    break
+                    # Never reviewed, so staged as its own round, like the
+                    # escalation's (review of cdeca7500, F4), and held for
+                    # the creator's approval, never saved as it stands.
+                    parsed['prompt_id'] = prompt_id
+                    parsed['creator_user_id'] = user_id
+                    _stage_review_round(parsed, prompt_id, review_rounds)
+                    return _hold_for_the_creator(
+                        parsed, prompt_id, user_id,
+                        'the reviewer and the planner kept changing the step count',
+                        background, request_id)
                 _prev_action_count = _action_count
                 # Stage plan for audit + run auto-review
                 parsed['prompt_id'] = prompt_id
                 parsed['creator_user_id'] = user_id
-                try:
-                    from core.prompt_files import proposed_plan_filename
-                    _plan_path = os.path.join(
-                        PROMPTS_DIR,
-                        proposed_plan_filename(prompt_id, review_rounds))
-                    os.makedirs(os.path.dirname(_plan_path), exist_ok=True)
-                    with open(_plan_path, 'w') as f:
-                        json.dump(parsed, f)
-                    app.logger.info(
-                        f'Plan round {review_rounds} staged at {_plan_path}')
-                except Exception as e:
-                    app.logger.warning(f'Plan stage write failed: {e}')
+                _stage_review_round(parsed, prompt_id, review_rounds)
 
                 verdict, feedback = _review_proposed_plan(
                     parsed, MAX_REVIEW_ROUNDS - review_rounds)
 
                 if verdict == 'approved':
-                    # Tell gather_info we approve → it re-emits status=completed
+                    # The plan the reviewer approved is the one saved.
                     app.logger.info(
                         f'Plan approved by StatusVerifier after '
                         f'{review_rounds + 1} rounds, finalizing')
-                    response = gather_info(user_id, 'approved',
-                                           prompt_id, autonomous=True)
-                    continue  # re-parse on next iteration; should be completed
+                    _approved = True
+                    response = _approved_plan_response(parsed)
+                    continue  # re-parse on next iteration: completed
+                elif verdict == 'unreviewed':
+                    # No verdict is no approval: the creator's card reviews it.
+                    app.logger.warning(
+                        f'Plan round {review_rounds}: {feedback}; holding the '
+                        f'plan for its creator\'s approval')
+                    return _hold_for_the_creator(
+                        parsed, prompt_id, user_id, feedback, background, request_id)
                 else:
-                    # Send feedback to gather_info for refinement
+                    # Send feedback to gather_info for refinement.  A
+                    # refinement call that fails (the model down) ends the
+                    # loop before the round is counted, so the plan the
+                    # reviewer rejected stays a proposed plan and is never
+                    # saved; counted first, the escalation saved it as the
+                    # "never reviewed" newest (review of a88258c98, F-c).
+                    # gather_info does not raise on a model failure: it
+                    # returns the failed turn as a sentence ("I couldn't
+                    # finish that: ..."), which counted as round 3 and let the
+                    # escalation save the plan just rejected (review of
+                    # 7e130b0df, must-fix 1, measured with the real
+                    # gather_info).  Either form ends the loop uncounted.
+                    from core.agent_tools import is_user_facing_error
+                    try:
+                        refined = gather_info(user_id, feedback,
+                                              prompt_id, autonomous=True)
+                        _failed = refined if is_user_facing_error(refined) else None
+                    except Exception as e:
+                        _failed = str(e)
+                    if _failed is not None:
+                        app.logger.warning(
+                            f'Plan refinement round {review_rounds + 1} failed: '
+                            f'{str(_failed)[:200]}; the plan the reviewer '
+                            f'rejected stays proposed, not saved')
+                        break
                     review_rounds += 1
-                    response = gather_info(user_id, feedback,
-                                           prompt_id, autonomous=True)
+                    response = refined
                     continue
             # Unknown status — exit the auto-review loop, fall to legacy below
             break
@@ -8691,19 +9034,43 @@ def _autonomous_gather_info(user_id, description, prompt_id):
                 f'Auto-review round {review_rounds} parse error: {e}')
             break
 
-    # After MAX_REVIEW_ROUNDS without convergence, escalate by force-approving
-    # the latest plan with metadata flag (future: FCM push to Android, wait
-    # 30 min for human verdict, fall back to auto-approve on timeout).
+    # After MAX_REVIEW_ROUNDS without convergence, the newest plan (the
+    # refinement that answered the last feedback, never reviewed) is staged
+    # as its own round and waits on its creator's card, whether the model
+    # marked it 'proposed_plan' or 'completed' (review of cdeca7500, F1: a
+    # 'completed' refinement was re-asked and the re-emission saved).  When
+    # the last answer holds no plan, nothing is built and the turn says so:
+    # asking gather_info to "approve" saved its next answer, a plan nobody
+    # reviewed (review of 06f729559, must-fix 4).
     if review_rounds >= MAX_REVIEW_ROUNDS:
-        app.logger.warning(
-            f'Plan review hit {MAX_REVIEW_ROUNDS} rounds without '
-            f'convergence — escalating to auto-approve with '
-            f'metadata flag auto_approved_timeout=true')
         try:
-            response = gather_info(user_id, 'approved (escalated after 3 review rounds)',
-                                   prompt_id, autonomous=True)
-        except Exception as e:
-            app.logger.error(f'Escalation gather_info failed: {e}')
+            _newest = _parse_plan_reply(response)
+            if isinstance(_newest, list):
+                _newest = next((item for item in reversed(_newest)
+                                if isinstance(item, dict) and 'status' in item), {})
+        except Exception:
+            _newest = None
+        if (isinstance(_newest, dict)
+                and (_newest.get('status') or '').lower() in ('proposed_plan',
+                                                              'completed')):
+            app.logger.warning(
+                f'Plan review hit {MAX_REVIEW_ROUNDS} rounds without '
+                f'convergence: holding the newest plan, round {review_rounds}, '
+                f'which was never reviewed, for its creator\'s approval')
+            _newest['prompt_id'] = prompt_id
+            _newest['creator_user_id'] = user_id
+            _stage_review_round(_newest, prompt_id, review_rounds)
+            return _hold_for_the_creator(
+                _newest, prompt_id, user_id,
+                f'{MAX_REVIEW_ROUNDS} review rounds did not agree', background,
+                request_id)
+        app.logger.warning(
+            f'Plan review hit {MAX_REVIEW_ROUNDS} rounds without convergence '
+            f'and the last answer holds no plan: nothing built')
+        from core.agent_tools import user_facing_error
+        return user_facing_error(RuntimeError(
+            f'after {MAX_REVIEW_ROUNDS} review rounds the planner gave no plan to '
+            f'review; nothing was built, so ask again to re-plan'))
 
     # Single-shot: LLM should emit a complete plan on first call.
     # If status is "proposed_plan" we return the plan to the peer
@@ -8711,8 +9078,7 @@ def _autonomous_gather_info(user_id, description, prompt_id):
     # (including stale "pending" Q&A behavior) falls back to the
     # legacy partial-config rescue at end of this function.
     try:
-        new_response = response.replace('true', 'True').replace('false', 'False')
-        parsed = retrieve_json(new_response)
+        parsed = _parse_plan_reply(response)
         if isinstance(parsed, list):
             for item in reversed(parsed):
                 if isinstance(item, dict) and 'status' in item:
@@ -8725,36 +9091,21 @@ def _autonomous_gather_info(user_id, description, prompt_id):
             _status = (parsed.get('status') or '').lower()
 
             if _status == 'proposed_plan':
-                # Stash the plan so the next /chat (with "approved" /
-                # feedback) can refine; surface it to the peer reviewer.
-                parsed['prompt_id'] = prompt_id
-                parsed['creator_user_id'] = user_id
-                from core.prompt_files import proposed_plan_filename
-                _plan_path = os.path.join(
-                    PROMPTS_DIR, proposed_plan_filename(prompt_id))
-                try:
-                    os.makedirs(os.path.dirname(_plan_path), exist_ok=True)
-                    with open(_plan_path, 'w') as f:
-                        json.dump(parsed, f)
-                    app.logger.info(
-                        f'Proposed plan staged at {_plan_path} '
-                        f'awaiting peer review')
-                except Exception as e:
-                    app.logger.warning(f'Could not stage proposed plan: {e}')
-                # Return the plan as JSON string so /chat caller can
-                # render the atomic steps for the reviewing peer agent.
-                return json.dumps({
-                    'status': 'proposed_plan',
-                    'plan': parsed,
-                    'instructions_for_reviewer': (
-                        'Review the atomic steps in plan.flows[].actions[]. '
-                        'Reply with "approved" to commit and dispatch to '
-                        'the autogen execution team, or reply with feedback '
-                        'text to refine the plan.'),
-                })
+                # A plan the review could not finish (its model failed) waits
+                # on its creator's card like the other two; the card is the
+                # only approval.  The reply used to ask for a free-text
+                # "approved" that nothing read (hartos-16, 11-07).
+                return _hold_for_the_creator(
+                    parsed, prompt_id, user_id, 'the review could not finish',
+                    background, request_id)
 
-            if _status == 'completed':
+            # Only a config that can be built is saved as built (#206); one
+            # that cannot falls to the legacy loop below, as unfinished.
+            _built = (_buildable_completed_config(parsed, prompt_id)
+                      if _status == 'completed' else None)
+            if _built is not None:
                 # Save final agent config and dispatch
+                parsed = _built
                 parsed['prompt_id'] = prompt_id
                 parsed['creator_user_id'] = user_id
                 name = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
@@ -8788,8 +9139,7 @@ def _autonomous_gather_info(user_id, description, prompt_id):
     iteration = 0
     while iteration < max_iterations:
         try:
-            new_response = response.replace('true', 'True').replace('false', 'False')
-            parsed = retrieve_json(new_response)
+            parsed = _parse_plan_reply(response)
             if isinstance(parsed, list):
                 for item in reversed(parsed):
                     if isinstance(item, dict) and 'status' in item:
@@ -8797,7 +9147,9 @@ def _autonomous_gather_info(user_id, description, prompt_id):
                         break
                 else:
                     parsed = {}
-            if isinstance(parsed, dict) and parsed.get('status', '').lower() == 'completed':
+            _built = _buildable_completed_config(parsed, prompt_id)
+            if _built is not None:
+                parsed = _built
                 parsed['prompt_id'] = prompt_id
                 parsed['creator_user_id'] = user_id
                 name = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
@@ -9725,6 +10077,32 @@ _BUILDABLE_REASK = (
     'person confirmed, each step as its own string in "actions".')
 
 
+def _parse_plan_reply(text):
+    """A gather_info reply, parsed: the one parse every gather site uses.
+
+    A reply that is valid JSON is taken as the model wrote it.  Anything
+    else is read as before: JSON's true/false capitalised for
+    helper.retrieve_json's literal fallback, then retrieve_json.  That
+    rewrite is blind, so it also changed words inside the plan ("construe"
+    became "consTrue", "true or false" became "True or False").
+
+    Measured 2026-11-02 on the owner's desktop (review of a88258c98, F-e):
+    of 2,328 saved configs and staged plans written as JSON, the rewrite
+    then retrieve_json returned 1,922 exactly and 406 with words changed;
+    JSON first returns all 2,328.  Written as Python dicts, with True/False
+    or with true/false, both parses read the same.  Of 326 real replies in
+    the outbound LLM log (288 valid JSON), 324 parse the same and 2 keep
+    words the rewrite changed.  The cost: a reply that is valid JSON keeps
+    its curly quotes and dashes, which retrieve_json flattens to ASCII.
+
+    The only place the rewrite remains; a source guard
+    (tests/unit/test_the_approved_plan_is_the_saved_plan.py) keeps it so."""
+    try:
+        return json.loads(text)
+    except (TypeError, ValueError):
+        return retrieve_json(text.replace('true', 'True').replace('false', 'False'))
+
+
 def _read_gather_config(response, prompt_id):
     """The agent config in a gather_info reply, with its list fields decoded
     (_decode_config_lists).  Raises ValueError when the reply holds none.
@@ -9735,9 +10113,8 @@ def _read_gather_config(response, prompt_id):
     if 'Context size has been exceeded' in response:
         raise ValueError('LLM context size exceeded — cannot parse gather_info response')
 
-    new_response = response.replace('true','True').replace("false", "False")
     try:
-        new_res = retrieve_json(new_response)
+        new_res = _parse_plan_reply(response)
         app.logger.info(f"new_res: {new_res}")
     except Exception as e:
         app.logger.error(f'Got some error while will try with re match error:{e}')
@@ -9774,12 +10151,44 @@ def _read_gather_config(response, prompt_id):
     if new_res is None:
         raise ValueError('new_res is None after parsing')
 
-    new_res, _decoded = _decode_config_lists(new_res)
-    if _decoded:
+    return _decoded_config(new_res, prompt_id)
+
+
+def _decoded_config(cfg, prompt_id):
+    """``cfg`` with its list fields decoded (_decode_config_lists), and the
+    decoding logged.  The one reading of a config's lists, for the
+    interactive reply (_read_gather_config) and the autonomous save
+    (_buildable_completed_config)."""
+    cfg, decoded = _decode_config_lists(cfg)
+    if decoded:
         app.logger.info(
             "[GATHER] %s came as JSON text for %s - decoded",
-            ', '.join(_decoded), prompt_id)
-    return new_res
+            ', '.join(decoded), prompt_id)
+    return cfg
+
+
+def _buildable_completed_config(cfg, prompt_id):
+    """``cfg`` ready to save as a built agent, or None.
+
+    The autonomous creation's save rule, the same as the interactive one
+    (#205/#718): list fields written as JSON text are decoded, and a
+    'completed' config that is not _config_is_buildable is not saved as
+    built (#206).  F2 of the cdeca7500 review (ran by its reviewer,
+    2026-11-02): once _autonomous_gather_info finalized an approved plan in
+    code instead of asking the model to re-emit it, a plan with no `flows`
+    reached the save as 'completed', and recipe() fails on config['flows']
+    (hartos/create_recipe.py:1097, :7131).  None for anything that is not a
+    'completed' config, so the caller treats it as not finished."""
+    if not isinstance(cfg, dict) or (cfg.get('status') or '').lower() != 'completed':
+        return None
+    config = _decoded_config(cfg, prompt_id)
+    if _config_is_buildable(config):
+        return config
+    app.logger.warning(
+        "[EMPTY-BUILD] autonomous creation of %s finished without a step for "
+        "every action (flows: %.300s) - not saved as built (#206)",
+        prompt_id, config.get('flows'))
+    return None
 
 
 #: A step's own number, as the model sometimes writes it ("1. Call ...").
@@ -9848,8 +10257,16 @@ def _a_turns_model_ends_with_its_request(_exc=None):
     in-process test client (dispatch._native_chat, on the daemon's own
     thread).  /time_agent and /visual_agent never set it, so a scheduled run
     on a reused worker thread inherited an earlier expert turn's model and
-    spent it outside the day-cap check (review of 75dc20add, P2)."""
+    spent it outside the day-cap check (review of 75dc20add, P2).
+
+    The request's id ends with it too.  /chat and /response_ack set it on
+    the thread and nothing cleared it, so a later request on a reused worker
+    thread inherited it: with_llm_context binds the thread's id for a turn
+    called without one, and the camera and screen tools judge the turn by
+    that id (core.agent_tools.camera_turn_id; review of efd223acf, finding 5:
+    an untagged turn inherited a stale id)."""
     thread_local_data.clear_model_config_override()
+    thread_local_data.set_request_id(None)
 
 
 @app.route('/chat', methods=['POST'])
@@ -10123,7 +10540,34 @@ def chat():
     thread_local_data.clear_agentic_flags()
 
     create_agent = data.get('create_agent', None)
+    # The caller's value, believed.  OWNER 2026-11-10: "do propr review and
+    # delete these hardcodings".  A resolver lived here from 11-09 to 11-10
+    # (core/prompt_difficulty.resolve_casual_conv) that re-decided this flag
+    # from EIGHT regex word lists.  That was keyword matching one layer down
+    # from the Nunba tuple the owner had just had deleted, not a replacement
+    # for it, and the module is gone with this change.
+    #
+    # What decides the tier instead, and already did: the route sends SESSION
+    # SHAPE (not bool(prompt_id or create_agent), the owner's 2026-08-24
+    # design), and the model-based classifier escalates per turn --
+    # speculative_dispatcher.py promotes delegate='none' to 'local' on
+    # memory_query, channel_connect, is_create_agent, language_change,
+    # invite_intent and join_room_intent, so the expert turn binds the full
+    # registry.  A model reads the sentence; no word list does.
+    #
+    # The False default is NOT cosmetic: ~11 internal callers omit this flag
+    # deliberately (commercial_api.py:548 omits it so a billed call never
+    # gets the casual tool set).  The None coercion below is kept for the
+    # same reason -- a client sending {"casual_conv": null} is not stating
+    # an opinion, and the key being present stops the default from firing.
     casual_conv = data.get('casual_conv', False)
+    if casual_conv is None:
+        # A literal JSON null is not 'no opinion' -- it is a client that
+        # sent the key and left it empty, and the default above cannot
+        # see it because the key IS present.  REVIEW 11-10 caught this
+        # as the remainder of C1: {"casual_conv": null} with "hi" went
+        # casual where the old code went full.  Same rule as absent.
+        casual_conv = False
     autonomous = data.get('autonomous', False)
     probe = data.get('probe', None)
     intermediate = data.get('intermediate', None)
@@ -10322,6 +10766,7 @@ def chat():
 
     prompt = data.get('prompt', None)
 
+
     # GUARDRAIL: full pre-dispatch gate on every /chat call
     if prompt:
         try:
@@ -10430,8 +10875,10 @@ def chat():
         else:
             # No matching agent — auto-create one, then execute
             # Reuse prompt_id from Plan Mode response if available
-            new_prompt_id = prompt_id if prompt_id else _next_prompt_id()
-            auto_response = _autonomous_gather_info(user_id, prompt, new_prompt_id)
+            new_prompt_id = _creation_prompt_id(
+                user_id, prompt_id if prompt_id else _next_prompt_id())
+            auto_response = _autonomous_gather_info(user_id, prompt, new_prompt_id,
+                                                    request_id=request_id)
             _ak = f'{user_id}_{new_prompt_id}'
             review_agents[_ak] = True
             _touch_agent_timestamp(_ak)
@@ -10480,7 +10927,7 @@ def chat():
         # instead of entering gather_info/CREATE mode
         if os.path.exists(_prompt_path):
             try:
-                with open(_prompt_path, 'r') as _pf:
+                with open(_prompt_path, 'r', encoding='utf-8') as _pf:
                     _agent_meta = json.load(_pf)
                 if _agent_meta.get('is_system_agent'):
                     # System agent: use its system_prompt for langchain casual chat
@@ -10519,13 +10966,15 @@ def chat():
                 if os.path.exists(os.path.join(PROMPTS_DIR, f'{prompt_id}_0_recipe.json')):
                     app.logger.info('0 Recipe JSON EXISTS')
                     file_path = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
-                    with open(file_path, 'r') as f:
+                    with open(file_path, 'r', encoding='utf-8') as f:
                         data = json.load(f)
                         no_of_flow = len(data['flows'])-1
                         app.logger.info(f'GOT LEN OF FLOW AS {no_of_flow}')
                     if os.path.exists(os.path.join(PROMPTS_DIR, f'{prompt_id}_{no_of_flow}_recipe.json')):
                         # All flows complete → REUSE
                         create_agent = set_flags_to_enter_reuse_mode(no_of_flow, user_id, prompt_id) #returns false
+                        # A finished agent has no build to resume.
+                        resume_build_input.pop(f'{user_id}_{prompt_id}', None)
                     else:
                         # Some flows complete, some not.
                         # Enter CREATE — recipe() has resume logic (initialize_with_resume)
@@ -10535,6 +10984,16 @@ def chat():
                         app.logger.info(f'{no_of_flow} Recipe JSON does not exist — resuming CREATE for remaining flows')
                         create_agent = True
                         _ak = f'{user_id}_{prompt_id}'
+                        # A turn that did not arrive mid-build (a person
+                        # writing to a partly built agent, or the first turn
+                        # after a restart) resumes the build on the agent's
+                        # own input, never this turn's words (review of
+                        # cfa9e29ee, probe c2b).  A creator's turns during
+                        # their ongoing build are untouched.
+                        if not review_agents.get(_ak):
+                            resume_build_input[_ak] = {
+                                'input': _own_build_input(data),
+                                'label': _unfinished_agent_label(data, prompt_id)}
                         review_agents[_ak] = True
                         conversation_agent[_ak] = False
                         _touch_agent_timestamp(_ak)
@@ -10544,12 +11003,28 @@ def chat():
                     # file-state alone (broke chat-mode for finished agents).
                     if create_agent or autonomous:
                         _ak = f'{user_id}_{prompt_id}'
+                        # The same rule as the partly built branch above: a
+                        # turn that did not arrive mid-build resumes the
+                        # build on the agent's own input, whatever flag the
+                        # client sent (review of 49eee800d, must-fix 1: a
+                        # request carrying create_agent handed the person's
+                        # words to recipe() here).
+                        if not review_agents.get(_ak):
+                            try:
+                                with open(os.path.join(PROMPTS_DIR, f'{prompt_id}.json'),
+                                          'r', encoding='utf-8') as _bf:
+                                    _bdata = json.load(_bf)
+                            except Exception:
+                                _bdata = {}
+                            resume_build_input[_ak] = {
+                                'input': _own_build_input(_bdata),
+                                'label': _unfinished_agent_label(_bdata, prompt_id)}
                         review_agents[_ak] = True
                         conversation_agent[_ak] = False
                         _touch_agent_timestamp(_ak)
                     else:
                         try:
-                            with open(os.path.join(PROMPTS_DIR, f'{prompt_id}.json'), 'r') as _gpf:
+                            with open(os.path.join(PROMPTS_DIR, f'{prompt_id}.json'), 'r', encoding='utf-8') as _gpf:
                                 _gate_meta = json.load(_gpf)
                             if _gate_meta.get('flows') and _gate_meta['flows'][0].get('system_prompt'):
                                 custom_prompt = _gate_meta['flows'][0]['system_prompt']
@@ -10898,7 +11373,11 @@ def chat():
                 # Autonomous dispatch (from daemon or API): LLM self-generates agent config
                 # AND immediately creates recipe — no human review step needed.
                 # Full pipeline: gather_info → save config → recipe() → completed
-                auto_response = _autonomous_gather_info(user_id, prompt, prompt_id)
+                # Background work: its goal's own stable prompt id, and a
+                # held plan asks under the background limit (hartos-16).
+                auto_response = _autonomous_gather_info(user_id, prompt, prompt_id,
+                                                        background=True,
+                                                        request_id=request_id)
 
                 # Now immediately create the recipe so next dispatch enters REUSE
                 recipe_response = None
@@ -10910,7 +11389,8 @@ def chat():
                             mark_create_start(request_id=request_id)
                         except ImportError:
                             mark_create_end = None
-                        recipe_response = recipe(user_id, prompt, prompt_id, file_id, request_id)
+                        recipe_response = recipe(user_id, prompt, prompt_id, file_id, request_id,
+                                                 autonomous=True)
                         if recipe_response == 'Agent Created Successfully':
                             with _user_lock:
                                 review_agents[_ak] = True
@@ -10972,13 +11452,15 @@ def chat():
                 # conversation runs on a different model, #172) answers that
                 # too, so the dispatcher holds it instead of judging the
                 # gather output.
-                from core.agent_tools import (is_held_for_another_turn,
-                                              is_user_facing_error, is_user_pause)
+                # So does a recipe() that handed its step to a person or the
+                # expert (_ask_for_help) or ended in the CREATE error envelope
+                # (#170): the daemon counted the gather output as work done,
+                # and the hive worker recorded it as the task's result while
+                # the goal waited for help.
+                from core.agent_tools import is_build_stop_reply
                 return _chat_reply(
                     user_id, request_id,
-                    recipe_response if (is_user_pause(recipe_response)
-                                        or is_held_for_another_turn(recipe_response)
-                                        or is_user_facing_error(recipe_response))
+                    recipe_response if is_build_stop_reply(recipe_response)
                     else auto_response,
                     intent=['FINAL_ANSWER'],
                     req_token_count=0, res_token_count=0,
@@ -11026,7 +11508,11 @@ def chat():
                 # saw last: the exits below write the mark for a review,
                 # and leave it clear for anything else.
                 _gather_reviews_shown.pop(turn_key, None)
-                response = gather_info(user_id, prompt, prompt_id)
+                # The tags the agent is saved with (_save_and_enter_review
+                # stamps _creation_hint): its plan is written with its own
+                # tools (gather_agentdetails.plan_writer_tools; 342, 2026-11-04).
+                response = gather_info(user_id, prompt, prompt_id,
+                                       goal_tags=_creation_hint)
                 app.logger.info('AFTER GATHER INFO')
 
             # --- Helper: save completed agent config and transition to Review ---
@@ -11260,7 +11746,28 @@ def chat():
             except ImportError:
                 mark_create_end = None
             try:
-                response = recipe(user_id,prompt,prompt_id,file_id,request_id)
+                # The plan saved here is one the person approved (or the
+                # gather's own after repeated failures): it runs freed, as
+                # the after-restart branch below runs it.  Owner 2026-11-05:
+                # Phase 2 is freed too; the Pad sends create_agent on every
+                # turn, so its approved Reel Studio plan runs here.
+                # An unfinished agent's resumed build runs on its own input,
+                # never this turn's text, and that input answers no step
+                # (resume_build_input; review of cfa9e29ee: the parent's
+                # second message reached recipe() here and the build answered
+                # it as the child's speech).  When the build asked this person
+                # for a step, their words are that answer and go as before.
+                _resume = resume_build_input.get(_ak)
+                _resumed = bool(_resume) and not (
+                    build_holds_a_step_for_the_person is not None
+                    and build_holds_a_step_for_the_person(user_id, prompt_id))
+                if _resumed:
+                    response = recipe(user_id, _resume['input'], prompt_id, file_id,
+                                      request_id, autonomous=True,
+                                      text_is_the_persons=False)
+                else:
+                    response = recipe(user_id, prompt, prompt_id, file_id, request_id,
+                                      autonomous=True)
             finally:
                 try:
                     from integrations.agent_engine.dispatch import mark_create_end as _mce
@@ -11269,6 +11776,7 @@ def chat():
                     logging.getLogger(__name__).debug("chat: swallowed ImportError")
             if response in ('Agent Created Successfully',
                             'Agent Already Created Successfully'):
+                resume_build_input.pop(_ak, None)
                 with _user_lock:
                     conversation_agent[_ak] = True
                 _touch_agent_timestamp(_ak)
@@ -11287,7 +11795,12 @@ def chat():
                 )
             _record_lifecycle('Review Mode', user_id, prompt_id, 'Agent details being reviewed')
             return _chat_reply(
-                user_id, request_id, response,
+                user_id, request_id,
+                # A resumed build's output answered its own input, not this
+                # person (the one reply rule, _resumed_build_reply).  The
+                # creator's ordinary turns keep the build's reply as before.
+                _resumed_build_reply(response, user_id, prompt_id, _resume['label'])
+                if _resumed else response,
                 intent=['FINAL_ANSWER'],
                 req_token_count=0, res_token_count=0, history_request_id=[],
                 Agent_status='Review Mode',
@@ -11298,7 +11811,7 @@ def chat():
 
     if prompt_id and os.path.exists(os.path.join(PROMPTS_DIR, f'{prompt_id}.json')):
         _ak = f'{user_id}_{prompt_id}'  # Ensure compound key available for reuse path
-        with open(os.path.join(PROMPTS_DIR, f'{prompt_id}.json'), "r") as file:
+        with open(os.path.join(PROMPTS_DIR, f'{prompt_id}.json'), "r", encoding="utf-8") as file:
             created_json = json.load(file)
 
 
@@ -11340,7 +11853,7 @@ def chat():
             # per-action recipes count as done — and its completion path is
             # the one that banks {pid}_{flow}_recipe.json, syncs to central
             # (update_agent_creation_to_db), and adverts to peers.
-            _agent_label = created_json.get('name') or created_json.get('agent_name') or prompt_id
+            _agent_label = _unfinished_agent_label(created_json, prompt_id)
             # No importability speculation here (steward, 2026-08-22): a
             # missing recipe FILE is agent state, and this branch's whole
             # job is routing that state into recipe().  Whether the module
@@ -11357,9 +11870,23 @@ def chat():
                 review_agents[_ak] = True
                 conversation_agent[_ak] = False
                 _touch_agent_timestamp(_ak)
-            response = recipe(user_id, prompt, prompt_id, file_id, request_id)
+            # autonomous=True carries the steward rule above into CREATE: the
+            # approved plan runs with the AUTONOMOUS prompt (2026-11-04: on
+            # the person's request id it read INTERACTIVE and Reel Studio,
+            # agent 342, stalled on step 2 asking her questions).
+            # The build resumes on the agent's OWN creation input, the goal its
+            # saved config carries, never this turn's text: live 2026-11-10 a
+            # parent typed to an unfinished speech agent and the build took
+            # his words as the child's turn and praised them.  That input
+            # answers no step (text_is_the_persons=False), and the next turns
+            # resume on it too (resume_build_input, read by Phase 2).
+            _build_input = _own_build_input(created_json)
+            resume_build_input[_ak] = {'input': _build_input, 'label': _agent_label}
+            response = recipe(user_id, _build_input, prompt_id, file_id, request_id,
+                              autonomous=True, text_is_the_persons=False)
             if response in ('Agent Created Successfully',
                             'Agent Already Created Successfully'):
+                resume_build_input.pop(_ak, None)
                 with _rr_lock:
                     conversation_agent[_ak] = True
                     _touch_agent_timestamp(_ak)
@@ -11371,7 +11898,7 @@ def chat():
                                   'Recipe finished autonomously from reuse routing')
                 return _chat_reply(
                     user_id, request_id,
-                    f'"{_agent_label}" is ready — its recipe is now complete. '
+                    f'{_agent_label} is ready — its recipe is now complete. '
                     f'Ask it again and it will run.',
                     intent=['FINAL_ANSWER'],
                     req_token_count=0, res_token_count=0, history_request_id=[],
@@ -11379,8 +11906,13 @@ def chat():
                 )
             _record_lifecycle('Creation Mode', user_id, prompt_id,
                               'Autonomous recipe generation in progress (from reuse routing)')
+            # A build that stopped or asked this person says so in its own
+            # words; anything else answered its own input, not this person,
+            # so they are told plainly where their agent stands (the one
+            # reply rule, shared with Phase 2: _resumed_build_reply).
             return _chat_reply(
-                user_id, request_id, response,
+                user_id, request_id,
+                _resumed_build_reply(response, user_id, prompt_id, _agent_label),
                 intent=['FINAL_ANSWER'],
                 req_token_count=0, res_token_count=0, history_request_id=[],
                 Agent_status='Creation Mode', prompt_id=prompt_id,
@@ -11405,7 +11937,9 @@ def chat():
                 new_prompt_id = _next_prompt_id()
                 if is_auto:
                     # Autonomous: run gather_info with LLM-generated answers
-                    auto_response = _autonomous_gather_info(user_id, agent_desc, new_prompt_id)
+                    new_prompt_id = _creation_prompt_id(user_id, new_prompt_id)
+                    auto_response = _autonomous_gather_info(user_id, agent_desc, new_prompt_id,
+                                                            request_id=request_id)
                     _ak_new = f'{user_id}_{new_prompt_id}'
                     review_agents[_ak_new] = True
                     _touch_agent_timestamp(_ak_new)
@@ -11560,7 +12094,9 @@ def chat():
 
         if is_autonomous:
             # Autonomous: run gather_info with LLM-generated answers
-            auto_response = _autonomous_gather_info(user_id, agent_description, new_prompt_id)
+            new_prompt_id = _creation_prompt_id(user_id, new_prompt_id)
+            auto_response = _autonomous_gather_info(user_id, agent_description, new_prompt_id,
+                                                    request_id=request_id)
             _ak_new = f'{user_id}_{new_prompt_id}'
             review_agents[_ak_new] = True
             _touch_agent_timestamp(_ak_new)
@@ -11578,9 +12114,8 @@ def chat():
             # Interactive: start gather_info, return first question
             from hartos.gather_agentdetails import gather_info
             response = gather_info(user_id, agent_description, new_prompt_id)
-            new_response = response.replace('true', 'True').replace("false", "False")
             try:
-                new_res = retrieve_json(new_response)
+                new_res = _parse_plan_reply(response)
                 if isinstance(new_res, list):
                     for item in reversed(new_res):
                         if isinstance(item, dict) and 'status' in item:
@@ -12164,7 +12699,7 @@ def _create_social_agent_from_prompt(user_id, prompt_id):
     prompt_file = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
     if not os.path.exists(prompt_file):
         return
-    with open(prompt_file, 'r') as f:
+    with open(prompt_file, 'r', encoding='utf-8') as f:
         data = json.load(f)
 
     agent_display_name = data.get('name', f'Agent {prompt_id}')
@@ -12413,7 +12948,7 @@ def create_prompts():
         local_path = os.path.join(PROMPTS_DIR, f'{pid}.json')
         local_data = {}
         if os.path.exists(local_path):
-            with open(local_path, 'r') as f:
+            with open(local_path, 'r', encoding='utf-8') as f:
                 local_data = json.load(f)
 
         local_data['name'] = item.get('name', local_data.get('name', ''))

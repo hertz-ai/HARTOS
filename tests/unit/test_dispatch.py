@@ -669,15 +669,17 @@ class TestNotifyWatchdog:
                 'security': MagicMock(),
                 'security.node_watchdog': mock_watchdog_mod,
             }):
-                dispatch_mod._notify_watchdog_llm_start()
+                marked = dispatch_mod._notify_watchdog_llm_start()
             # Exact match: is_registered('coding_daemon_worker') == True
             # → mark_in_llm_call('coding_daemon_worker')
             mock_wd.mark_in_llm_call.assert_called_with('coding_daemon_worker')
+            assert marked == 'coding_daemon_worker', 'the end needs the name'
         finally:
             threading.current_thread().name = original_name
 
-    def test_llm_end_clears_and_heartbeats(self):
-        """_notify_watchdog_llm_end clears markers and sends heartbeats."""
+    def test_llm_end_clears_only_the_mark_its_start_set(self):
+        """_notify_watchdog_llm_end clears the one mark and heartbeats the one
+        thread its start named, never the others (review of 313ff63fc, M1)."""
         mock_wd = MagicMock()
         mock_watchdog_mod = MagicMock()
         mock_wd.registered_names.return_value = ['agent_daemon', 'coding_daemon']
@@ -687,11 +689,49 @@ class TestNotifyWatchdog:
             'security': MagicMock(),
             'security.node_watchdog': mock_watchdog_mod,
         }):
-            dispatch_mod._notify_watchdog_llm_end()
+            dispatch_mod._notify_watchdog_llm_end('agent_daemon')
 
-        # Called for all registered daemons
-        assert mock_wd.clear_llm_call.call_count == 2
-        assert mock_wd.heartbeat.call_count == 2
+        mock_wd.clear_llm_call.assert_called_once_with('agent_daemon')
+        mock_wd.heartbeat.assert_called_once_with('agent_daemon')
+
+    def test_llm_end_with_nothing_marked_touches_no_thread(self):
+        mock_wd = MagicMock()
+        mock_watchdog_mod = MagicMock()
+        mock_wd.registered_names.return_value = ['agent_daemon', 'coding_daemon']
+        mock_watchdog_mod.get_watchdog.return_value = mock_wd
+
+        with patch.dict('sys.modules', {
+            'security': MagicMock(),
+            'security.node_watchdog': mock_watchdog_mod,
+        }):
+            dispatch_mod._notify_watchdog_llm_end(None)
+
+        mock_wd.clear_llm_call.assert_not_called()
+        mock_wd.heartbeat.assert_not_called()
+
+    def test_one_turns_end_does_not_hide_another_frozen_thread(self):
+        """The real watchdog: a goal turn's end used to heartbeat every
+        registered thread, so a thread that froze meanwhile looked alive
+        (replayed on central's turns: a 600 s thread restarted after
+        11,676 s).  Now the frozen thread's age keeps growing."""
+        from security.node_watchdog import NodeWatchdog
+        wd = NodeWatchdog(check_interval=30)
+        wd.register('agent_daemon', 30, restart_fn=MagicMock())
+        wd.register('coding_daemon', 30, restart_fn=MagicMock())
+        frozen_since = time.monotonic() - 5000.0
+        wd._threads['coding_daemon'].last_heartbeat_mono = frozen_since
+        original_name = threading.current_thread().name
+        threading.current_thread().name = 'agent_daemon'
+        try:
+            with patch('security.node_watchdog.get_watchdog', return_value=wd):
+                marked = dispatch_mod._notify_watchdog_llm_start()
+                assert wd._threads['agent_daemon'].in_llm_call is True
+                dispatch_mod._notify_watchdog_llm_end(marked)
+        finally:
+            threading.current_thread().name = original_name
+        assert marked == 'agent_daemon'
+        assert wd._threads['agent_daemon'].in_llm_call is False
+        assert wd._threads['coding_daemon'].last_heartbeat_mono == frozen_since
 
     def test_llm_start_no_watchdog(self):
         """_notify_watchdog_llm_start handles None watchdog gracefully."""
@@ -719,7 +759,7 @@ class TestNotifyWatchdog:
             'security.node_watchdog': None,
         }):
             # Should not raise
-            dispatch_mod._notify_watchdog_llm_end()
+            dispatch_mod._notify_watchdog_llm_end('agent_daemon')
 
     def test_llm_start_agent_daemon_thread(self):
         """Thread named agent_daemon_tick matches via partial registered_names lookup."""
@@ -736,9 +776,10 @@ class TestNotifyWatchdog:
                 'security': MagicMock(),
                 'security.node_watchdog': mock_watchdog_mod,
             }):
-                dispatch_mod._notify_watchdog_llm_start()
+                marked = dispatch_mod._notify_watchdog_llm_start()
             # Partial match: 'agent_daemon' in 'agent_daemon_tick'
             mock_wd.mark_in_llm_call.assert_called_with('agent_daemon')
+            assert marked == 'agent_daemon'
         finally:
             threading.current_thread().name = original_name
 

@@ -38,6 +38,14 @@ def _is_recoverable_generation_failure(exc) -> bool:
     other engines fail their own way).  A connection dropped or timed out
     mid-generation is the same class of event.  4xx is the caller's request
     (context overflow, auth) and is left to its own handlers.
+
+    Not recoverable: the wire hook's own 502 for a 2xx reply that carried no
+    completion (core.llm_outbound_logger.is_no_completion_answer, read by
+    its error code).  The provider sent nothing, so a re-sample only spends
+    calls; the hook already tells the SDK not to retry it.  Re-sampled, one
+    entry answering 200 with no choices cost 3 calls and the person got this
+    wrapper's fallback sentence as the Assistant's answer (review of
+    f8af9b3af); propagated, the turn fails as a failed turn.
     """
     try:
         import openai
@@ -45,7 +53,10 @@ def _is_recoverable_generation_failure(exc) -> bool:
         return False
     if isinstance(exc, openai.APIConnectionError):
         return True
-    return isinstance(exc, openai.APIStatusError) and exc.status_code >= 500
+    if not (isinstance(exc, openai.APIStatusError) and exc.status_code >= 500):
+        return False
+    from core.llm_outbound_logger import is_no_completion_answer
+    return not is_no_completion_answer(exc)
 
 
 def _describe_llm_failure(exc) -> str:

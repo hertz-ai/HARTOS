@@ -89,8 +89,30 @@ _MEDIA_MARKER = re.compile(r"\[\[MEDIA:([^\[\]]+)\]\]")
 _MEDIA_MIME = {
     '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
     '.webp': 'image/webp', '.gif': 'image/gif', '.pdf': 'application/pdf',
-    '.mp4': 'video/mp4', '.mp3': 'audio/mpeg', '.ogg': 'audio/ogg',
+    '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.m4v': 'video/x-m4v',
+    '.webm': 'video/webm', '.mp3': 'audio/mpeg', '.ogg': 'audio/ogg',
 }
+
+
+def media_kind(name):
+    """``(mime, MessageType)`` of the file ``name`` names (a path or a URL;
+    case is ignored, and so are a URL's query string and fragment), or None
+    for a type no channel is sent.  The one rule for what kind of attachment
+    a file is: the reply path's [[MEDIA:]] markers and the marketing tools'
+    posts read it.  A path is a name as it stands: '?' and '#' are ordinary
+    characters in a file name, and cutting at them dropped "clip#1.mp4" from
+    the reply path (review of f8fdb9c64)."""
+    from .base import MessageType
+    base = str(name or '')
+    if '://' in base:
+        base = base.split('?', 1)[0].split('#', 1)[0]
+    mime = _MEDIA_MIME.get(os.path.splitext(base)[1].lower())
+    if mime is None:
+        return None
+    return mime, (MessageType.IMAGE if mime.startswith('image')
+                  else MessageType.VIDEO if mime.startswith('video')
+                  else MessageType.AUDIO if mime.startswith('audio')
+                  else MessageType.DOCUMENT)
 
 
 def _media_allowlist_root() -> str:
@@ -107,7 +129,6 @@ def extract_media_markers(text):
     """
     if not text or '[[MEDIA:' not in text:
         return text, []
-    from .base import MessageType
     from core.platform_paths import is_within
     root = _media_allowlist_root()
     media = []
@@ -119,15 +140,12 @@ def extract_media_markers(text):
         if not os.path.isfile(path):
             logger.warning('media marker file missing, dropped: %s', path)
             continue
-        ext = os.path.splitext(path)[1].lower()
-        mime = _MEDIA_MIME.get(ext)
-        if mime is None:
-            logger.warning('media marker type %s not sendable, dropped', ext)
+        kind = media_kind(path)
+        if kind is None:
+            logger.warning('media marker type %s not sendable, dropped',
+                           os.path.splitext(path)[1].lower())
             continue
-        mtype = (MessageType.IMAGE if mime.startswith('image')
-                 else MessageType.VIDEO if mime.startswith('video')
-                 else MessageType.AUDIO if mime.startswith('audio')
-                 else MessageType.DOCUMENT)
+        mime, mtype = kind
         media.append(MediaAttachment(
             type=mtype, file_path=path, mime_type=mime,
             file_name=os.path.basename(path)))

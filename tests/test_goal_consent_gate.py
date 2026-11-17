@@ -6,8 +6,8 @@ enforcement sites.  First attempt (4bbb1758) added a standalone gate in
 dispatch.py — owner called the parallel path: before_dispatch step 3 is
 the designed goal-specific policy point (constitutional, ethos) and the
 consent check belongs there.  This rework folds it in: ONE policy gate,
-N policies.  dispatch_goal now passes goal.to_dict() + user_id the same
-way agent_daemon.py:1268 always has.
+N policies.  dispatch_goal now passes goal.to_dict() and names the goal's
+owner as the requester, the same person agent_daemon's own gate names.
 
 The denied case was proven RED before any enforcement existed.
 """
@@ -139,15 +139,20 @@ def test_daemon_goal_with_boot_owner_and_granted_consent_dispatches(monkeypatch)
     assert req_spy.call_count == 0
 
 
-def test_dispatch_goal_feeds_goal_dict_and_user_to_the_one_gate(monkeypatch):
+def test_dispatch_goal_feeds_goal_dict_and_owner_to_the_one_gate(monkeypatch):
     """dispatch_goal must load the goal row and pass it to before_dispatch —
-    prompt-only left the goal-specific policies dormant on this path."""
+    prompt-only left the goal-specific policies dormant on this path.
+
+    The requester it names is the goal's OWNER, not dispatch_goal's user_id:
+    the daemon passes its agent account there (agent['user_id']), and an
+    agent account can neither grant consent nor see the ask."""
     from integrations.agent_engine import dispatch
     from integrations.social import models as social_models
     from security import hive_guardrails as hg
 
     goal = types.SimpleNamespace(
-        id='g-1', to_dict=lambda: dict(FLAGGED))
+        id='g-1', owner_id='owner-3', created_by='owner-3',
+        goal_type='marketing', to_dict=lambda: dict(FLAGGED))
     db = MagicMock()
     db.query.return_value.filter_by.return_value.first.return_value = goal
 
@@ -171,11 +176,71 @@ def test_dispatch_goal_feeds_goal_dict_and_user_to_the_one_gate(monkeypatch):
     monkeypatch.setattr(bg, 'pre_dispatch_budget_gate',
                         lambda *a, **k: (True, 'ok'))
 
-    result = dispatch.dispatch_goal('p', 'user-1', 'g-1', 'marketing')
+    result = dispatch.dispatch_goal('p', 'agent-account-1', 'g-1', 'marketing')
 
     assert result is None
     assert seen['goal_dict'] == FLAGGED
-    assert seen['user_id'] == 'user-1'
+    assert seen['user_id'] == 'owner-3', (
+        "the gate was handed the dispatching account, not the goal's owner")
+
+
+def test_a_daemon_dispatch_asks_the_owner_never_its_agent_account(monkeypatch):
+    """The measured failure, through the real gate.
+
+    Owner's desktop, Nunba started 2026-11-04 15:29: every consent-flagged
+    daemon goal (english_learning, spoken_english, speech_therapy, two
+    content_gen, seo, paper_explanation; seeded, no owner) was refused 44
+    times by this path with "consent 'data_access' not granted - pending
+    request filed for the user", and auto-paused after five, although the
+    owner had granted data_access ('*') on 11-01 and agent_daemon's own gate
+    passed every one of those goals.  The daemon dispatches with
+    agent['user_id'], an agent account, and this gate checked and filed
+    against it: 25 agent accounts held pending data_access requests that no
+    person can see or answer.  A seeded goal has no owner, so the gate must
+    fall back to the boot owner, as agent_daemon's gate does.
+    """
+    from integrations.agent_engine import budget_gate as bg
+    from integrations.agent_engine import dispatch
+    from integrations.social import models as social_models
+    from integrations.social.consent_service import ConsentService
+    from security import immutable_audit_log
+
+    _quiet_other_policies(monkeypatch)
+    goal = types.SimpleNamespace(
+        id='g-2', owner_id=None, created_by='system_bootstrap',
+        goal_type='english_learning', to_dict=lambda: dict(FLAGGED, id='g-2'))
+    db = MagicMock()
+    db.query.return_value.filter_by.return_value.first.return_value = goal
+
+    @contextlib.contextmanager
+    def db_session(commit=False):
+        yield db
+
+    monkeypatch.setattr(social_models, 'db_session', db_session)
+    monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', 'owner-9')
+    asked = []
+    monkeypatch.setattr(
+        ConsentService, 'check_consent',
+        staticmethod(lambda _db, uid, *a, **k: asked.append(uid) or uid == 'owner-9'))
+    filed = MagicMock()
+    monkeypatch.setattr(ConsentService, 'request_consent', staticmethod(filed))
+    monkeypatch.setattr(bg, 'pre_dispatch_budget_gate',
+                        lambda *a, **k: (True, 'ok'))
+
+    class _PastTheGate(BaseException):
+        """Raised by the first step after the gate (the audit write), which
+        swallows Exception, so only a turn the gate let through reaches it."""
+
+    def _audit(*a, **k):
+        raise _PastTheGate()
+
+    monkeypatch.setattr(immutable_audit_log, 'get_audit_log', _audit)
+
+    with pytest.raises(_PastTheGate):
+        dispatch.dispatch_goal('p', 'agent-account-1', 'g-2', 'english_learning')
+    assert asked == ['owner-9'], f'the gate asked {asked}, not the owner'
+    assert filed.call_count == 0, (
+        'a consent request was filed although the owner had granted it')
 
 
 # ── #96: ONE spelling, `require_consent` ────────────────────────────────
@@ -377,9 +442,10 @@ def test_daemon_path_passes_the_goals_owner_as_requester():
     The daemon loop has the goal in hand and AgentGoal.owner_id is a real
     column, but it used to call before_dispatch(prompt, goal.to_dict()) with no
     user_id — so on any topology without HEVOLVE_OWNER_USER_ID every
-    consent-flagged goal hit the dead end above. dispatch_goal already passes
-    its user_id (dispatch.py); this pins that the daemon path does too, since a
-    silent regression here stops goals with no way to grant.
+    consent-flagged goal hit the dead end above. dispatch_goal names the goal's
+    owner too (test_a_daemon_dispatch_asks_the_owner_never_its_agent_account);
+    this pins the daemon path, since a silent regression here stops goals with
+    no way to grant.
     """
     import inspect
     from integrations.agent_engine import agent_daemon

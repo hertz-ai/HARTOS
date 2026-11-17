@@ -236,10 +236,12 @@ _DATE = re.compile(r'\d{4}-\d{2}-\d{2}')
 _URL = re.compile(r'(?i)^\s*https?://')
 #: Beyond a secret's name (security.edge_privacy.is_secret_key), what a
 #: published or cached song list never carries under a key: an address, or a
-#: login, whose names are often glued (instagrapi's 'sessionid', 'csrftoken',
-#: 'authorization_data'; 'accesstoken', 'userpassword'), so these match
-#: anywhere in the key.  A song list has no count of tokens either, so
-#: 'max_tokens' is refused with them.
+#: login whose names the secret rule does not read (instagrapi's 'sessionid',
+#: 'csrftoken', 'authorization_data'; 'auth_tokens', 'token_value'), so these
+#: match anywhere in the key.  The secret rule reads 'token' only as the whole
+#: name or its last word, so without 'token' here a list carrying
+#: 'access_tokens' passed (review of 2f3d2255e).  A song list has no count of
+#: tokens, so 'max_tokens' is refused with them.
 _SONG_LIST_KEY_PARTS = ('url', 'session', 'cookie', 'csrf', 'authorization',
                         'token', 'password')
 

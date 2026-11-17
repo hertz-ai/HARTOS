@@ -1077,3 +1077,28 @@ class TestConfidenceFloor:
             dispatcher.schedule_expert_for_draft(result)
         assert result['delegate'] == 'local'
         mock_submit.assert_called_once()
+
+
+class TestWritingTasksAreWrittenOut:
+    """Live on the desktop 4B, 2026-11-16 (a peer's six-turn test, user
+    990001): asked to write a first-touch email under 140 words, the draft
+    answered "Here is a draft email to the owner of ... The message
+    highlights ...", a description of the email, not the email.  The
+    ANSWERING RULES told it to answer writing tasks directly, and the reply
+    field it had to fill was capped at "1-3 sentences"; the 4B kept the cap.
+
+    A writing task answered directly is answered with the text itself."""
+
+    ASK = ('Write a first-touch email (under 140 words) to the owner of a '
+           'speech clinic, offering a free 14-day pilot.')
+
+    def test_the_reply_field_does_not_cap_a_written_answer(self, dispatcher):
+        built = dispatcher._build_draft_classifier_prompt(self.ASK)
+        field = built[built.index('{"reply":'):built.index('"delegate":')]
+        assert '1-3 sentences>' not in field, field
+        assert 'written out' in field, field
+
+    def test_the_rules_say_the_answer_is_the_text_not_a_description(self, dispatcher):
+        built = dispatcher._build_draft_classifier_prompt(self.ASK)
+        rules = built[built.index('ANSWERING RULES'):built.index('Respond with ONE JSON')]
+        assert 'never a description of it' in rules, rules[-800:]

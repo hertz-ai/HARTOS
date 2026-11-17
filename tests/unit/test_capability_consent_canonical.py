@@ -180,10 +180,15 @@ def _function_code(src, name):
 
 def test_request_consent_goes_through_consent_service():
     """RED pre-migration: _request_consent's whole body was
-    LiquidUIService.agent_request_approval + broadcast_sse_safe."""
-    body = _function_src(_hie_source(), '_request_consent')
+    LiquidUIService.agent_request_approval + broadcast_sse_safe.
+
+    The CODE is read, not the docstring (which names ConsentService to
+    explain the history).  Since f40e02e1a the ask is
+    consent_service.ask_owner, the owner ask shared with the camera tool,
+    which files through ConsentService.request_consent."""
+    body = _function_code(_hie_source(), '_request_consent')
     assert body, '_request_consent not found in hart_intelligence_entry.py'
-    assert 'ConsentService' in body, (
+    assert 'ask_owner(' in body or 'ConsentService.' in body, (
         'the camera/screen ask must be filed through ConsentService — without '
         'a UserConsent row the grant cannot be revoked, shows on no privacy '
         'page, and the ask never reaches the floating companion (#863)'

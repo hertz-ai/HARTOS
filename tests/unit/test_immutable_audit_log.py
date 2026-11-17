@@ -6,6 +6,7 @@ Run: pytest tests/unit/test_immutable_audit_log.py -v --noconftest
 import os
 import sys
 import types
+import json
 import unittest
 import threading
 from unittest.mock import MagicMock, patch
@@ -141,6 +142,70 @@ class TestRedactSensitive(unittest.TestCase):
 
     def test_none_detail(self):
         self.assertIsNone(_redact_sensitive(None))
+
+    def test_a_secret_is_named_by_the_one_rule(self):
+        """The log's own substring list kept 'passwd', 'pwd', 'cookie' and
+        'apikey' (claude-autostart-71's review of 14e8e7907); the one rule
+        (security.edge_privacy.is_secret_key) names them."""
+        detail = {'passwd': 'p1', 'user-pwd': 'p2', 'sessionCookie': 'c1',
+                  'apikey': 'k1', 'x-api-key': 'k2', 'ssn': '123-45-6789',
+                  'card_number': '4111', 'name': 'john'}
+        result = json.loads(_redact_sensitive(detail))
+        for key in ('passwd', 'user-pwd', 'sessionCookie', 'apikey', 'x-api-key',
+                    'ssn', 'card_number'):
+            self.assertEqual(result[key], '[REDACTED]', key)
+        self.assertEqual(result['name'], 'john')
+
+    def test_a_secret_word_anywhere_in_the_key_is_withheld(self):
+        """The one rule reads a secret word only as the whole name or its
+        last word; the log is hash-chained, so these stay withheld by the
+        log's own catch (review of 2f3d2255e, which kept them raw).  A count
+        of tokens is withheld with them."""
+        names = ('tokens', 'auth_tokens', 'access_tokens', 'refresh_tokens',
+                 'token_value', 'secrets', 'client_secrets', 'api_keys',
+                 'secret_answer', 'credential_id', 'ssn_last4', 'max_tokens')
+        result = json.loads(_redact_sensitive(
+            dict({n: 'raw-' + n for n in names}, name='john')))
+        for key in names:
+            self.assertEqual(result[key], '[REDACTED]', key)
+        self.assertEqual(result['name'], 'john')
+
+    def test_the_catch_reads_every_spelling_and_a_number_only_as_a_word(self):
+        """Read only lowercased, 'apiKeys' and 'privateKeys' stayed raw while
+        'api_keys' was withheld; read as three letters anywhere, 'ssn'
+        withheld 'classname' and 'processName' (review of fbae5ea36)."""
+        withheld = ('apiKeys', 'API-Keys', 'privateKeys', 'private-key-pem',
+                    'ssn_last4', 'ssnLast4', 'mySSN', 'user_ssn', 'SSN')
+        kept = ('classname', 'className', 'processName', 'businessName',
+                'addressName', 'witnessNode')
+        result = json.loads(_redact_sensitive(
+            {n: 'raw-' + n for n in withheld + kept}))
+        for key in withheld:
+            self.assertEqual(result[key], '[REDACTED]', key)
+        for key in kept:
+            self.assertEqual(result[key], 'raw-' + key, key)
+
+    def test_a_number_glued_or_plural_and_a_glued_plural_secret_are_withheld(self):
+        """Read only as a word of its own, 'ssn' let through raw ten spellings
+        the log had withheld ('ssns', 'SSNumber', 'userssn'), and the glued
+        plurals of the two-word secrets were never caught (review of
+        d2a2f2ad4, M-1 and m-1).  Everyday names that hold the same letters
+        stay readable."""
+        withheld = ('ssns', 'SSNs', 'SSNumber', 'ssNumber', 'ssnumber',
+                    'ssnlast4', 'ssnhash', 'userssn', 'customerssn',
+                    'encryptedssn', 'mySsnValue', 'apikeys', 'privatekeys',
+                    'creditcards', 'cardnumbers')
+        kept = ('accessNumber', 'accessnumber', 'unlessNested', 'crossNet',
+                'glassNode', 'harnessName', 'fitnessNote', 'chessNotation',
+                'missingNodes', 'bossName', 'lessonNumber', 'successNotice',
+                'businessNumber', 'progressNote', 'processNode', 'pressNumber',
+                'assignee', 'sessionName', 'card_count', 'publicKey')
+        result = json.loads(_redact_sensitive(
+            {n: 'raw-' + n for n in withheld + kept}))
+        for key in withheld:
+            self.assertEqual(result[key], '[REDACTED]', key)
+        for key in kept:
+            self.assertEqual(result[key], 'raw-' + key, key)
 
 
 class TestBorrowedSessionContract(unittest.TestCase):

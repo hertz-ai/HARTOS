@@ -138,3 +138,49 @@ def test_node_stop_is_logged_with_its_count(hie, client, loops):
     finally:
         hie.app.logger.removeHandler(handler)
     assert len(seen) == 1 and '2 loop(s)' in seen[0], seen
+
+
+# ── A demonstration is stopped by the same button ─────────────────────────
+# Owner 2026-11-11: the recorder shows the computer-use ribbon with a recording
+# symbol, and its Stop is the ribbon's own: Nunba GET /indicator/stop ->
+# call_stop_api -> POST /api/vlm/stop {"scope": "node", "user_id": <owner>}.  A
+# demonstration registers in the same registry through the public
+# register_stop_session, so no route and no Nunba change are needed.
+
+def test_node_stop_halts_a_demonstration_too(client, loops):
+    local_loop, pairs = loops
+    event = local_loop.register_stop_session('owner-1', 'demo-abc123')
+    try:
+        resp = client.post('/api/vlm/stop',
+                           json={'scope': 'node', 'user_id': 'owner-1'})
+        assert resp.status_code == 200, resp.get_data(as_text=True)
+        stopped = [(s['user_id'], s['prompt_id'])
+                   for s in resp.get_json()['stopped_sessions']]
+        assert ('owner-1', 'demo-abc123') in stopped
+        assert event.is_set()
+    finally:
+        local_loop.unregister_stop_session('owner-1', 'demo-abc123')
+    assert ('owner-1', 'demo-abc123') not in local_loop.list_active_sessions()
+
+
+def test_a_per_user_stop_halts_that_users_demonstration(client, loops):
+    local_loop, pairs = loops
+    event = local_loop.register_stop_session('owner-1', 'demo-def456')
+    try:
+        resp = client.post('/api/vlm/stop', json={'user_id': 'owner-1'},
+                           environ_overrides=LAN,
+                           headers={'Authorization': f'Bearer {TOKEN}'})
+        assert resp.status_code == 200, resp.get_data(as_text=True)
+        assert event.is_set()
+    finally:
+        local_loop.unregister_stop_session('owner-1', 'demo-def456')
+
+
+def test_registering_a_demonstration_never_clears_a_running_loops_stop(loops):
+    """_register_session clears an existing flag on a key collision (it starts
+    a fresh run).  A demonstration must not inherit that: it would silently
+    un-set the owner's Stop for a loop that is still driving the mouse."""
+    local_loop, pairs = loops
+    local_loop.request_stop('owner-1', '101')
+    assert local_loop.register_stop_session('owner-1', '101') is None
+    assert local_loop._is_stop_requested('owner-1', '101') is True

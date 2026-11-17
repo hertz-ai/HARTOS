@@ -13,6 +13,7 @@ never the node's.  The metered routes (require_api_key, check_rate_limit,
 log_usage) also write api_usage_log, which is NOT created here: a test of
 those through this fixture needs that table added (the review of d3ac22782).
 """
+import contextlib
 import threading
 from unittest.mock import patch
 
@@ -116,6 +117,58 @@ class ApiKeyDb:
         recorded payment fails, which is the case a retry must finish."""
         with self._fail_lock:
             self._fail_commits = times
+
+    @contextlib.contextmanager
+    def lost_at_next_commit(self):
+        """The next commit ITSELF fails and the database stays unreachable
+        from then on (a lost connection, not a locked file): every
+        statement after the failed commit raises.  The rollback the bump
+        runs is not a statement.  A route that reads the key row after the
+        failed bump (the rollback expired it) raises while it builds its
+        failure report, which is what the reconciliation line must
+        survive.  Not the case of a commit that succeeds and is followed
+        by an outage: there the bump happened."""
+        gone = {'now': False}
+
+        def fail_the_commit(session):
+            gone['now'] = True
+            raise RuntimeError('database connection lost')
+
+        def refuse_every_statement(conn, cursor, statement, params, context, executemany):
+            if gone['now']:
+                raise RuntimeError('database unreachable')
+
+        event.listen(self.Session, 'before_commit', fail_the_commit)
+        event.listen(self.engine, 'before_cursor_execute', refuse_every_statement)
+        try:
+            yield
+        finally:
+            event.remove(self.Session, 'before_commit', fail_the_commit)
+            event.remove(self.engine, 'before_cursor_execute', refuse_every_statement)
+
+    @contextlib.contextmanager
+    def lost_after_next_commit(self):
+        """The next commit SUCCEEDS and the database is unreachable from then
+        on: every statement after it raises.  The bump happened (the table
+        holds the bought tier); what fails is the read back of the key row,
+        which the commit expired.  The case lost_at_next_commit is not
+        (task #214)."""
+        gone = {'now': False}
+
+        def lose_it(session):
+            gone['now'] = True
+
+        def refuse_every_statement(conn, cursor, statement, params, context, executemany):
+            if gone['now']:
+                raise RuntimeError('database unreachable')
+
+        event.listen(self.Session, 'after_commit', lose_it)
+        event.listen(self.engine, 'before_cursor_execute', refuse_every_statement)
+        try:
+            yield
+        finally:
+            event.remove(self.Session, 'after_commit', lose_it)
+            event.remove(self.engine, 'before_cursor_execute', refuse_every_statement)
 
     def dispose(self):
         event.remove(self.Session, 'before_commit', self._maybe_fail)
