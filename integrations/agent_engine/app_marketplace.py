@@ -961,9 +961,11 @@ class AppMarketplace:
             if response is None:
                 # Nothing was set up on the channel, so it is not recorded as
                 # one the app is distributed on.
-                from integrations.agent_engine.dispatch import dispatch_failure_reason
+                from integrations.agent_engine.dispatch import (
+                    dispatch_failure_reason, plain_reason)
                 return {'error': 'Distribution failed: '
-                        + (dispatch_failure_reason(goal_id) or 'no response')}
+                        + (plain_reason(dispatch_failure_reason(goal_id))
+                           or 'no response')}
             # Track distribution
             with self._lock:
                 listings = self._listings()
