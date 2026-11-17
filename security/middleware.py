@@ -138,6 +138,11 @@ def _apply_csrf_protection(app: Flask):
         # It reads nothing and changes nothing, so there is no request for a
         # forger to make on anyone's behalf (task #145).
         '/api/v1/intelligence/phonepe/return',
+        # Cashfree's payment-link webhook (integrations.ap2.ap2_protocol.
+        # CASHFREE_WEBHOOK_PATH): Cashfree says it posts link events as form
+        # data, with no cookie or token.  The route trusts nothing until the
+        # HMAC signature made with the node's Cashfree secret checks out.
+        '/api/v1/intelligence/cashfree/webhook',
     )
 
     @app.before_request
