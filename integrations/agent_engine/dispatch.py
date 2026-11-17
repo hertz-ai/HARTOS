@@ -366,9 +366,9 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
     # try/except so a check error never blocks a dispatch.
     _prov_host = local_dispatch_provider_breaker_open(model_config)
     if _prov_host:
-        logger.info(f"Provider {_prov_host} refusing the account (breaker "
-                    f"open), deferring local /chat for "
-                    f"{daemon_id or prompt_id}")
+        logger.info(f"Provider {_prov_host} refusing calls (account refused "
+                    f"or quota spent; breaker open), deferring local /chat "
+                    f"for {daemon_id or prompt_id}")
         return 'deferred', None
 
     # Any error resolving the path still lets the caller fall through to its
@@ -412,9 +412,10 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
     # permanently -- one permit, so the node's background LLM would have been
     # wedged for the life of the process.
     _bound = None
+    _marked = None
     try:
         # Signal to the watchdog that this thread is in a legitimate LLM call.
-        _notify_watchdog_llm_start()
+        _marked = _notify_watchdog_llm_start()
         # A daemon-specific request_id keeps background thinking traces out of
         # user responses via drain_thinking_traces(), and is what
         # dispatch.is_genuine_user_request reads to classify the turn.
@@ -447,7 +448,7 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
                 logger.info(f"unbind_cancel({_bound}) failed: {e}")
         _local_llm_semaphore.release()
         try:
-            _notify_watchdog_llm_end()
+            _notify_watchdog_llm_end(_marked)
         except Exception:
             logger.debug('watchdog LLM-end notify failed', exc_info=True)
 
@@ -614,9 +615,22 @@ def revenue_expert_config(goal_type) -> Optional[list]:
     (second review of 865afa851, M1).
 
     ``goal_type`` is the goal's OWN type, and only for a goal that is the
-    node's own (_org_goal); a caller passes None for any other goal."""
+    node's own (_org_goal, expert_goal_type); a caller passes None for any
+    other goal."""
     if not is_revenue_goal_type(goal_type):
         return None
+    return configured_expert_offer(f'revenue goal ({goal_type})')
+
+
+def configured_expert_offer(asker='an earning turn') -> Optional[list]:
+    """The configured expert's ONE entry while it may take an earning turn
+    right now, else None: revenue_expert_config without the goal's type, for
+    a caller that must know before it has a goal (the hive worker deciding
+    whether to claim).  Offered by the registry's own
+    lane and day-cap gate (ModelRegistry.get_configured_expert), kept for
+    the capped family only, and withheld while the expert's own provider is
+    refusing calls (its breaker OPEN).  ``asker`` only names the caller in
+    the log line."""
     try:
         from core.autogen_config import model_family
         from core.llm_outbound_logger import LANE_REVENUE
@@ -628,25 +642,86 @@ def revenue_expert_config(goal_type) -> Optional[list]:
         config = expert.to_config_list()
         model = config[0].get('model') if config else ''
         if model_family(model) != CAPPED_FAMILY:
-            logger.warning("revenue goal (%s) runs on the node's own model: "
-                           "the configured expert %s is not in the capped "
-                           "family '%s', so no day cap would hold its spend",
-                           goal_type, model, CAPPED_FAMILY)
+            logger.warning("%s gets no expert: the configured expert %s is "
+                           "not in the capped family '%s', so no day cap "
+                           "would hold its spend", asker, model, CAPPED_FAMILY)
             return None
         host = _dispatch_provider_host(config)
         if host:
             from core.circuit_breaker import CircuitState, llm_provider_breaker
             if llm_provider_breaker.state(host) == CircuitState.OPEN:
-                logger.info("revenue goal (%s) runs on the node's own model: "
-                            "the expert's provider %s is refusing the account",
-                            goal_type, host)
+                logger.info("%s gets no expert: the expert's provider %s is "
+                            "refusing calls (account refused or quota spent; "
+                            "breaker open)", asker, host)
                 return None
         return config
     except Exception as e:
-        logger.warning("revenue goal (%s) runs on the node's own model: the "
-                       "configured expert could not be read (%s)",
-                       goal_type, type(e).__name__)
+        logger.warning("%s gets no expert: the configured expert could not "
+                       "be read (%s)", asker, type(e).__name__)
         return None
+
+
+def expert_goal_type(goal, db=None) -> Optional[str]:
+    """The goal type that decides whether ``goal``'s turns may use the
+    owner's expert: the goal's OWN type when it is the node's own work
+    (_org_goal), else None.  No row: None.  The one reading dispatch_goal,
+    the hive worker and the daemon's grounding wait all make."""
+    if goal is None:
+        return None
+    return goal.goal_type if _org_goal(goal, db) else None
+
+
+def goal_turn_model(goal_type, model_config=None):
+    """``(model_config, refusing_host)`` for a goal turn about to start on
+    this node: the ONE rule for a turn whose provider is refusing calls.
+
+    ``model_config`` is the model the turn would run on (None: the node's
+    own model).  When that provider's breaker is OPEN (the account refused,
+    or a quota spent until its reset; local_dispatch_provider_breaker_open)
+    the turn does not start on it.  The node's own model then hands an
+    earning goal of the node's own (``goal_type`` from expert_goal_type) to
+    the configured expert where it is offered (revenue_expert_config: the
+    revenue lane, the owner's Claude day cap, the expert's own breaker),
+    and the turn runs there: owner decision 2026-11-16, "Fall back to
+    Haiku".  Otherwise ``refusing_host`` names the refusing host and the
+    turn must wait: a transient hold, never a strike (is_transient_deferral
+    reads the host recorded for it).
+
+    Consumers, so no path keeps a copy: dispatch_goal's pre-flight; the
+    daemon's speculative branch, which steps aside to dispatch_goal while
+    its fast model's provider refuses (SpeculativeDispatcher
+    .should_speculate); the hive worker's claimed task
+    (worker_loop._execute_task); and the daemon's grounding wait
+    (goal_turn_held), whose clock does not run while a goal's turn could
+    not start.  The expert's calls still pass the wire's
+    per-call day-cap gate (core.llm_outbound_logger._day_cap_refusal), as
+    every call that holds the configured expert does."""
+    refusing = local_dispatch_provider_breaker_open(model_config)
+    if refusing and model_config is None:
+        expert = revenue_expert_config(goal_type)
+        if expert is not None:
+            logger.info("The node's own provider %s is refusing calls; the "
+                        "turn runs on the configured expert", refusing)
+            return expert, ''
+    return model_config, refusing
+
+
+def goal_turn_held(goal, db=None) -> str:
+    """The refusing host while ``goal``'s turn could not start on this node
+    (goal_turn_model for the node's own model: its provider refusing calls
+    and no expert offered for the goal), else ''.  For a caller with no turn
+    to start: the daemon's grounding wait, which does not count that time
+    (agent_daemon._settle_dispatched_goal).  Read at each check, so a wait
+    that began mid-interval delays a real stall's pause by at most one
+    check, never pauses earlier.  '' when it cannot be read: the wait then
+    counts, as before."""
+    try:
+        return goal_turn_model(expert_goal_type(goal, db))[1]
+    except Exception as e:
+        logger.warning("Goal %s: could not tell whether its turn is held by a "
+                       "refusing provider (%s); its grounding wait counts",
+                       getattr(goal, 'id', '?'), e)
+        return ''
 
 
 def _org_goal(goal, db=None) -> bool:
@@ -901,15 +976,33 @@ def is_transient_deferral(goal_id=None) -> bool:
                 return True
         if is_user_recently_active() or _cb_is_open():
             return True
-        # The node's own LLM provider refusing the account (#106b b) is a
-        # transient wait, not a dispatch failure: the goal should hold for the
-        # top-up, never accrue the 5-strike auto-pause (which would need a
-        # manual resume of every goal after the balance is restored).
+        # The turn's LLM provider refusing calls (#106b b: the account, or a
+        # quota spent until its reset) is a transient wait, not a dispatch
+        # failure: the goal should hold for the top-up, never accrue the
+        # 5-strike auto-pause (which would need a manual resume of every goal
+        # after the balance is restored).  The provider is the one THIS
+        # goal's turn used (_dispatched_host): a turn on the configured
+        # expert that failed is a failure, whatever the node's own provider
+        # says (review of 5c6b899a5: with the free model's quota spent, 20
+        # failing expert turns in 570 s took no strike and no backoff).  The
+        # node's own backend answers when no dispatch from this thread
+        # recorded one, and for a turn that held the configured expert when
+        # the owner's day cap ran out: the wire refused its later calls
+        # (core.llm_outbound_logger._day_cap_refusal) and the turn went on on
+        # the node's own model, the last entry with_local_fallback gives every
+        # expert override, so the own provider is the one it waited on.
+        # Without this the turn in flight when the ledger crossed the cap took
+        # a strike although nothing could have run it (owner 2026-11-16: past
+        # the cap, goals wait with no strike).
         try:
             from core.circuit_breaker import (llm_provider_breaker,
                                               provider_host, CircuitState)
-            from integrations.agent_engine.model_registry import _own_llm_target
-            _h = provider_host(str((_own_llm_target() or ('', ''))[0] or ''))
+            _h = _dispatched_host(goal_id) if goal_id is not None else None
+            if _h and _expert_withheld_by_day_cap(_h):
+                _h = None
+            if not _h:
+                from integrations.agent_engine.model_registry import _own_llm_target
+                _h = provider_host(str((_own_llm_target() or ('', ''))[0] or ''))
             if _h and llm_provider_breaker.state(_h) == CircuitState.OPEN:
                 return True
         except Exception:
@@ -923,6 +1016,26 @@ def is_transient_deferral(goal_id=None) -> bool:
         from core.foreground import preempted_recently
         return preempted_recently()
     except Exception:
+        return False
+
+
+def _expert_withheld_by_day_cap(host) -> bool:
+    """Is ``host`` the configured expert's provider while the owner's Claude
+    day cap withholds that expert (budget_gate.expert_budget_allows, the gate
+    the wire asks before every call that holds it)?  False when it cannot be
+    read: the turn is then judged by the host it recorded, as before."""
+    try:
+        from core.autogen_config import resolve_expert_backend
+        from core.circuit_breaker import provider_host
+        expert = resolve_expert_backend()
+        if not expert or provider_host(str(expert.get('base_url') or '')) != host:
+            return False
+        from integrations.agent_engine.budget_gate import expert_budget_allows
+        allowed, _why = expert_budget_allows(expert.get('model'))
+        return not allowed
+    except Exception:
+        logger.debug('day-cap check failed in is_transient_deferral',
+                     exc_info=True)
         return False
 
 
@@ -999,6 +1112,7 @@ def _clear_turn_record(goal_id) -> None:
     with _turn_failures_lock:
         _turn_failures.pop(_failure_key(goal_id), None)
         _dispatch_routes.pop(_failure_key(goal_id), None)
+        _dispatch_hosts.pop(_failure_key(goal_id), None)
 
 
 def _record_turn_failure(goal_id, reason) -> None:
@@ -1070,6 +1184,27 @@ def _record_route(goal_id, route, why='') -> None:
                     f"{was or 'not dispatched yet'}")
 
 
+# The LLM provider host the latest dispatch_goal for a goal used (the
+# configured expert's endpoint, or this node's own backend), keyed like
+# _turn_failures by goal AND thread, cleared with them.  is_transient_deferral
+# reads it: a goal waits only for the provider ITS turn used.
+_dispatch_hosts: Dict[tuple, str] = {}
+
+
+def _record_dispatch_host(goal_id, host) -> None:
+    with _turn_failures_lock:
+        _dispatch_hosts[_failure_key(goal_id)] = host
+        while len(_dispatch_hosts) > _TURN_FAILURES_MAX:
+            _dispatch_hosts.pop(next(iter(_dispatch_hosts)))
+
+
+def _dispatched_host(goal_id) -> Optional[str]:
+    """The provider host the latest dispatch_goal for ``goal_id``, from this
+    thread, used; None when it recorded none."""
+    with _turn_failures_lock:
+        return _dispatch_hosts.get(_failure_key(goal_id))
+
+
 def handed_to_hive(goal_id) -> bool:
     """True when the latest dispatch_goal for ``goal_id``, from this thread,
     handed the goal to the hive rather than running its turn here."""
@@ -1096,7 +1231,12 @@ def speculative_turn_result(goal_id, spec) -> Optional[str]:
     empty reply is a failed turn too: the fast /chat call itself failed (a
     401, a timeout).  _dispatch_to_model swallows that cause, so the reason
     names the model, which is what an operator has to look at; 'error' is
-    set only when dispatch_speculative refused or raised.  The turn ran on
+    set when dispatch_speculative refused or raised, and when the turn was
+    still running at the end of its whole-turn wait (``still_running``).
+    That one is a failed turn too, struck like any other: held without a
+    strike, a goal whose turns never end was dispatched again every tick
+    with nothing to stop it, each time starting another turn on a
+    conversation still busy (review of 313ff63fc, M2).  The turn ran on
     this node, so the route is 'local'.
     """
     _clear_turn_record(goal_id)
@@ -1357,27 +1497,29 @@ except Exception:
                  'accessor fails open', exc_info=True)
 
 
-def _notify_watchdog_llm_start():
+def _notify_watchdog_llm_start() -> Optional[str]:
     """Tell the watchdog the current thread is blocked on a legitimate LLM call.
 
     The watchdog will extend the heartbeat threshold for threads marked
-    'in_llm_call' instead of restarting them.
+    'in_llm_call' instead of restarting them.  Returns the registered name
+    it marked, or None when it marked none; hand it to
+    _notify_watchdog_llm_end.
     """
     try:
         from security.node_watchdog import get_watchdog
         wd = get_watchdog()
         if not wd:
-            return
+            return None
         thread_name = threading.current_thread().name
         # Match by thread name — works for all daemon threads
         if wd.is_registered(thread_name):
             wd.mark_in_llm_call(thread_name)
-            return
+            return thread_name
         # Partial match (thread name might have suffix like 'agent_daemon-1')
         for name in wd.registered_names():
             if name in thread_name:
                 wd.mark_in_llm_call(name)
-                return
+                return name
         # Fallback: in-process/bundled mode — dispatch runs on a
         # different thread (e.g. Flask worker). Mark the calling daemon
         # via threadlocal source hint if available.
@@ -1386,22 +1528,33 @@ def _notify_watchdog_llm_start():
             source = get_task_source()
             if source and wd.is_registered(source):
                 wd.mark_in_llm_call(source)
-                return
+                return source
         except Exception:
             logger.debug('watchdog task-source lookup failed', exc_info=True)
     except Exception:
         logger.debug('watchdog LLM-start marker failed', exc_info=True)
+    return None
 
 
-def _notify_watchdog_llm_end():
-    """Clear the LLM call marker and send a heartbeat for all registered daemons."""
+def _notify_watchdog_llm_end(name: Optional[str] = None) -> None:
+    """Clear the LLM-call mark ``name`` (what _notify_watchdog_llm_start
+    returned) and heartbeat that thread, and only that one.  None: nothing
+    was marked, nothing to do.
+
+    It used to clear every registered thread's mark and heartbeat them all,
+    so any turn's end hid a thread that had frozen meanwhile.  Replayed over
+    central's turn ends on 2026-11-12 (review of 313ff63fc, M1), a frozen
+    thread with a 600 s threshold was restarted after 11,676 s instead of
+    606 s, and with the real watchdog one turn's end restarted a coding
+    daemon mid-call by clearing its mark."""
+    if not name:
+        return
     try:
         from security.node_watchdog import get_watchdog
         wd = get_watchdog()
         if wd:
-            for name in wd.registered_names():
-                wd.clear_llm_call(name)
-                wd.heartbeat(name)
+            wd.clear_llm_call(name)
+            wd.heartbeat(name)
     except Exception:
         logger.debug('watchdog LLM-end marker clear failed', exc_info=True)
 
@@ -1763,8 +1916,7 @@ def _dispatch_goal_turn(prompt: str, user_id: str, goal_id: str,
                 _guard_goal_dict = _grow.to_dict()
                 from core.event_attribution import goal_owner_user_id
                 _consent_requester = goal_owner_user_id(_grow)
-                if _org_goal(_grow, _gdb):
-                    _expert_goal_type = _grow.goal_type
+                _expert_goal_type = expert_goal_type(_grow, _gdb)
     except Exception as _gerr:
         logger.debug(f"Goal row unavailable for guardrail checks "
                      f"({goal_id}): {_gerr}")
@@ -1843,6 +1995,31 @@ def _dispatch_goal_turn(prompt: str, user_id: str, goal_id: str,
     if model_config is None:
         model_config = revenue_expert_config(_expert_goal_type)
 
+    # #106b (b): don't start a turn on a provider that is refusing calls.
+    # The httpx feed (core.llm_outbound_logger) opens a per-host breaker on
+    # 401/402/403 and on a quota spent until its reset, and closes it on a
+    # 2xx; this only READS it (state(), which does not consume the half-open
+    # probe; the feed is its sole consumer), keyed by the host THIS turn will
+    # use.  goal_turn_model is the one rule for that (owner 2026-11-16): the
+    # node's own model refusing hands an earning goal of the node's own to
+    # the configured expert where it is offered; otherwise no turn, and the
+    # reason names the host.  A refusal is a transient wait
+    # (is_transient_deferral reads the recorded host), not a failure, so
+    # goals hold for the top-up or the reset instead of accruing auto-pause
+    # strikes; on central 2026-09-14 every hosted call 402'd and the daemon
+    # re-tried every tick.  local_chat_dispatch checks the same breaker again
+    # for every caller, the worker included.
+    model_config, _prov_refusing = goal_turn_model(_expert_goal_type,
+                                                   model_config)
+    _record_dispatch_host(goal_id, _dispatch_provider_host(model_config))
+    if _prov_refusing:
+        _reason = (f'provider {_prov_refusing} is refusing calls (account '
+                   f'refused or quota spent; breaker open)')
+        _record_turn_failure(goal_id, _reason)
+        logger.warning(f"Goal {goal_id}: {_reason}; not dispatching this "
+                       f"tick")
+        return None
+
     # NUMERIC prompt_id (same format as hart_intelligence_entry._next_prompt_id)
     # so it passes the isdigit() check in the adapter and /chat handler.
     # Deterministic from goal_id so the SAME goal always gets the SAME
@@ -1869,38 +2046,6 @@ def _dispatch_goal_turn(prompt: str, user_id: str, goal_id: str,
     #   Tier 2: HTTP proxy to backend port
     #   Tier 3: llama.cpp fallback (direct LLM, no agent pipeline)
     resp = None
-
-    # #106b (b): goal-level early-out that also records dispatch_failure_reason.
-    # The AUTHORITATIVE consumer is in local_chat_dispatch (the convergence
-    # layer every dispatch path uses, including the worker that never calls
-    # dispatch_goal); this checks the SAME breaker with the SAME key
-    # (_dispatch_provider_host) first, so it cannot diverge -- it just lets a
-    # goal turn skip the local_chat_dispatch call and names the host in the
-    # reason.  Don't start a turn on a provider that is refusing the account.
-    # The httpx feed (core.llm_outbound_logger) opens a per-host breaker on
-    # 401/402/403 and closes it on a 2xx.  Here we only READ it via state()
-    # (which does NOT consume the half-open probe — the feed is the sole
-    # consumer that resolves it), and refuse only when OPEN, keyed by the host
-    # THIS turn will use (the expert override's endpoint, else this node's own
-    # configured backend).  A refusal is a transient wait (is_transient_deferral
-    # counts it), not a dispatch failure, so goals hold for the top-up instead
-    # of accruing auto-pause strikes; on central 2026-09-14 every hosted call
-    # 402'd and the daemon re-tried every tick.
-    _prov_host = _dispatch_provider_host(model_config)
-    if _prov_host:
-        try:
-            from core.circuit_breaker import (llm_provider_breaker,
-                                              CircuitState)
-            if llm_provider_breaker.state(_prov_host) == CircuitState.OPEN:
-                _reason = (f'provider {_prov_host} is refusing the account '
-                           f'(breaker open)')
-                _record_turn_failure(goal_id, _reason)
-                logger.warning(f"Goal {goal_id}: {_reason}; not dispatching "
-                               f"this tick")
-                return None
-        except Exception:
-            logger.debug('provider-breaker check failed for goal %s',
-                         goal_id, exc_info=True)
 
     # Tier 1: the canonical in-process /chat call.  The adapter resolution,
     # the user-priority gate and the local-LLM semaphore all live in

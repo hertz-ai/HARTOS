@@ -42,7 +42,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -551,15 +550,10 @@ def _machine_owner() -> Optional[str]:
     -- Nunba exports the variable on every tier, so its presence says
     nothing about whose machine it is.
 
-    Flat means flat both as claimed and as proven.  The claim
-    (HEVOLVE_NODE_TIER) withholds the right: the product's own promotions
-    set 'regional' with no certificate and leave an upgraded central with
-    no key, and get_node_tier, which asks what a node has PROVEN, answers
-    'flat' for both.  The proof catches the converse, a node promoted to
-    central by its key with no claim set."""
-    from security.key_delegation import get_node_tier
-    claimed = (os.environ.get('HEVOLVE_NODE_TIER') or 'flat').strip().lower()
-    if claimed != 'flat' or get_node_tier() != 'flat':
+    Flat means flat both as claimed and as proven: node_topology.
+    is_flat_node, the one rule (voting_rules asks it too)."""
+    from .node_topology import is_flat_node
+    if not is_flat_node():
         return None
     from integrations.agent_engine.capability_setup import setup_owner
     return setup_owner()

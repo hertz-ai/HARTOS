@@ -241,6 +241,8 @@ from agent_ledger import (
 from agent_ledger.factory import create_production_ledger, get_or_create_ledger
 # Add to your create_recipe.py after imports
 from hartos.lifecycle_hooks import (
+    get_registered_groupchat, hand_goal_to_its_person, window_question,
+    recorded_answers,
     stale_for_unstarted_action, settled_action_id,
     initialize_deterministic_actions,
     lifecycle_hook_track_action_assignment,
@@ -538,22 +540,21 @@ def send_message_to_user1(user_id, response, inp, prompt_id, media_refs=None):
       via the local chat fan-out (no need to re-trigger here).
 
     - **Standalone central HARTOS** (sys.frozen absent — Docker, dev):
-      POST to https://azurekong.hertzai.com:8443/autogen_response — the
-      canonical Kong gateway in front of the chatbot_pipeline backend
-      that historically owned this endpoint (handler at
-      chatbot_pipeline/chatbot.py:8009).  Same backend as the prior
-      aws_rasa.hertzai.com:9890, just via the TLS+auth+rate-limited
-      gateway instead of the raw HTTP backend.
+      hartos.helper.post_agent_message, the one send REUSE's copy uses
+      too: the chatbot_pipeline backend's /autogen_response (handler at
+      chatbot_pipeline/chatbot.py:8009), sent once, delivered only on a
+      2xx.
 
     Per user 2026-06-09: ``Agent_status`` field omitted on the local
     path — it was an artefact of the cloud server's per-user session
     dict and isn't needed by local subscribers.
 
     Returns "Message sent successfully to user with request_id: ..." or
-    "Failed to send message to user with request_id: ...", the same two
-    answers REUSE's copy gives.  The send_message_to_user tool
-    (core.agent_tools) returns it to the model, so the model is told whether
-    its message went out; the other callers here ignore it.
+    "Failed to send message to user with request_id: ..." (on central
+    followed by why), the same two answers REUSE's copy gives.  The
+    send_message_to_user tool (core.agent_tools) returns it to the model, so
+    the model is told whether its message went out; the other callers here
+    ignore it.
     """
     # Text for the user: an elided-text pointer a model copied into its
     # message never reaches them, on either branch below (owner ruling
@@ -580,25 +581,15 @@ def send_message_to_user1(user_id, response, inp, prompt_id, media_refs=None):
             return sent
         return failed
 
-    # Standalone central HARTOS — canonical Kong gateway.
-    url = 'https://azurekong.hertzai.com:8443/autogen_response'
-    body = json.dumps({
+    # Standalone central HARTOS: the chatbot_pipeline backend.
+    from hartos.helper import post_agent_message
+    delivered, why = post_agent_message({
         'user_id': user_id,
         'message': response,
         'inp': inp,
         'request_id': request_id,
     })
-    headers = {'Content-Type': 'application/json'}
-    try:
-        pooled_post(url, data=body, headers=headers, timeout=15)
-    except Exception as _e:
-        try:
-            current_app.logger.debug(
-                f'send_message_to_user1: azurekong forward failed ({_e})')
-        except Exception:
-            pass
-        return failed
-    return sent
+    return sent if delivered else f'{failed}: {why}'
 
 
 # No execute_python_file here: the scheduled-job dispatcher is
@@ -1093,7 +1084,7 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
 
     custom_agents = []
     agents_object = {}
-    with open(helper_fun.safe_prompt_path(prompt_id), 'r') as f:
+    with open(helper_fun.safe_prompt_path(prompt_id), 'r', encoding='utf-8') as f:
             config = json.load(f)
             list_of_persona = config['flows'][get_current_flow(user_prompt)]['persona']
             current_app.logger.info(f'WORKING persona as {list_of_persona}')
@@ -1133,6 +1124,11 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
             _agent_personality = generate_personality(str(_role), str(_goal), _agent_name)
             save_personality(str(prompt_id), _agent_personality)
             tool_logger.info(f"Generated personality '{_agent_personality.persona_name}' for prompt {prompt_id}")
+        # The agent speaks the name the person gave it, never its internal id
+        # (core.agent_personality.spoken_name); the saved file is unchanged.
+        from core.agent_personality import with_spoken_name
+        _agent_personality = with_spoken_name(_agent_personality, config.get('name', ''),
+                                              agent_id=prompt_id)
     except Exception as e:
         tool_logger.warning(f"Personality generation skipped: {e}")
 
@@ -1909,6 +1905,9 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
         from integrations.agent_engine.thought_experiment_tools import (
             ExperimentVoteTool)
         ExperimentVoteTool.register()  # native: the agent's own vote
+        from integrations.coding_agent.backend_repair_tools import (
+            BackendRepairTool)
+        BackendRepairTool.register()   # native: repair_backend_venv & co
         service_tool_registry.load_config()  # load any user-added tools from service_tools.json
 
         svc_tools = service_tool_registry.get_all_tool_functions()
@@ -4572,6 +4571,41 @@ def _hold_for_the_person(user_prompt, action_id, reason,
             f'the ledger refused the block')
 
 
+def build_holds_a_step_for_the_person(user_id, prompt_id) -> bool:
+    """True when this agent's build holds a step for the person's reply: the
+    gate flag _hold_for_the_person set on their session, so they were shown
+    the step's question ("I need your input ...", "... is waiting for your
+    reply").  Their next message is that answer and reaches recipe() as their
+    own words; any other message to an unfinished agent does not
+    (hart_intelligence_entry resume_build_input; review of cfa9e29ee).  A
+    loop-break's flag (USER_INPUT_GATE_RECOVERABLE_STALL) asked nobody.
+
+    With no flag (a restart, or an evicted session, between the ask and the
+    reply) it asks what the gate itself asks then
+    (_resume_prior_user_input_block): whether the action the build stands on
+    waits for this person in the ledger (person_waits_on).  The action is
+    the session's, or, with no session, where the saved progress says the
+    build stands (detect_and_resume_progress, what initialize_with_resume
+    reads).  Review of 49eee800d, must-fix 2: reading the flag only lost the
+    reply after a restart, which the gate's ledger read had taken."""
+    user_prompt = f'{user_id}_{prompt_id}'
+    task = user_tasks.get(user_prompt)
+    if isinstance(getattr(task, '_needs_user_input_action_id', None), int):
+        return (getattr(task, '_needs_user_input_kind', None)
+                != USER_INPUT_GATE_RECOVERABLE_STALL)
+    try:
+        if task is not None:
+            current, flow = getattr(task, 'current_action', None), get_current_flow(user_prompt)
+        else:
+            flow, current, _progress, _done = detect_and_resume_progress(prompt_id, user_prompt)
+        return isinstance(current, int) and bool(person_waits_on(user_prompt, current, flow))
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            '[USER-INPUT-GATE] could not read whether %s waits for the person: %s',
+            user_prompt, exc)
+        return False
+
+
 def _ask_for_help(user_prompt, prompt_id, action_id, action_text, reason):
     """Hand an action the agent could not finish to someone who can (#106).
 
@@ -4618,28 +4652,23 @@ def _ask_for_help(user_prompt, prompt_id, action_id, action_text, reason):
     from core.chat_client import daemon_goal_id
     from hartos.threadlocal import thread_local_data
     goal_id = daemon_goal_id(thread_local_data.get_request_id())
-    stage = None
-    if goal_id:
-        try:
-            from integrations.agent_engine.goal_manager import GoalManager
-            from integrations.social.models import db_session
-            with db_session(commit=True) as _db:
-                _handed = GoalManager.escalate_goal(_db, goal_id, {
-                    'action_id': int(action_id),
-                    'action': str(action_text or '')[:500],
-                    'reason': reason,
-                    'tried': ['local'],
-                    # So the daemon can tell whether the expert's turn banked
-                    # this action (#106d).
-                    'user_prompt': user_prompt,
-                    'prompt_id': prompt_id,
-                    'flow': get_current_flow(user_prompt),
-                })
-                if _handed.get('success'):
-                    stage = _handed.get('stage') or 'human'
-        except Exception as _park_err:
-            current_app.logger.warning(
-                f'[ASK-FOR-HELP] could not hand on goal {goal_id}: {_park_err}')
+    # A question the step put out goes to the goal's person, not the expert
+    # model (Part B; the owner's 2026-10-31 ruling).  The one hand-off REUSE
+    # uses too, so both write one record shape.
+    _question = None
+    try:
+        _gc = get_registered_groupchat(user_prompt)
+        _asked = window_question(list(getattr(_gc, 'messages', None) or []),
+                                 action_id, recorded_answers(user_prompt, action_id)
+                                 ) if _gc is not None else None
+        _question = _asked[1] if _asked else None
+    except Exception:
+        current_app.logger.debug(
+            f'[ASK-FOR-HELP] action {action_id}: the window could not be read '
+            f'for a question', exc_info=True)
+    stage = hand_goal_to_its_person(goal_id, user_prompt, prompt_id, action_id,
+                                    action_text, reason,
+                                    get_current_flow(user_prompt), ask=_question)
     current_app.logger.warning(
         f'[ASK-FOR-HELP] action {action_id} of {user_prompt}: {reason}; '
         f'goal {goal_id or "unknown"} handed to {stage or "nobody"}')
@@ -4654,6 +4683,37 @@ def _ask_for_help(user_prompt, prompt_id, action_id, action_text, reason):
     return (f"{HELP_PAUSED_REPLY_PREFIX} step {action_id}{step} could not be "
             f"finished autonomously ({reason}). It is waiting for the owner or "
             f"the co-pilot.")
+
+
+def _ask_when_a_guard_gives_up(user_prompt, prompt_id, action_id, group_chat, reason):
+    """The stall or cycle guard gave up on a step that is not done: ask for
+    help, as the user-input gate does, instead of breaking out of the loop.
+
+    `break` fell to the tail of get_response_group, which hands the person the
+    group chat's last message.  Live on build 75, 2026-11-15 21:07 IST, the
+    Research Assistant (93676680129) stalled on step 3 for 121 iterations and
+    the person was sent the StatusVerifier's verdict: "Action completed. The
+    user has explicitly provided the research topic: 'The integration of
+    artificial intelligence with renewable energy ...'" (a topic nobody gave).
+    ac44d6bfd closed the same leak for a step in ERROR; these two guards were
+    the other exits.  The messages are stored as the break's tail stored them,
+    so the next turn resumes from the same window.
+
+    Both guards' counts start again from zero, as the attempts bound resets
+    _exec_retries before it asks: they live on user_tasks, which outlives the
+    turn, so a kept count gave the person's answer one round and the same
+    question again (review of b972e755b: the cycle guard asked again after 10
+    of 10 answers)."""
+    _ut = user_tasks.get(user_prompt)
+    if _ut is not None:
+        _ut._stall_key, _ut._stall_iters = None, 0
+        _ut._cycle_key, _ut._cycle_entries = None, None
+    messages[user_prompt] = group_chat.messages
+    try:
+        action_text = user_tasks[user_prompt].get_action(action_id - 1)
+    except Exception:
+        action_text = ''
+    return _ask_for_help(user_prompt, prompt_id, action_id, action_text, reason)
 
 
 def _is_serving_escalation_expert(user_prompt, action_id, request_id):
@@ -4800,7 +4860,8 @@ def _answer_for_this_turn(user_prompt, text):
     the PERSON's round only: a daemon or expert turn gets ``text`` unchanged
     and leaves the words for the person (hartos-00's review of ca2e52c91,
     finding 1: a daemon tick's round got 'ba\\nhello\\ntick').  Owed to one
-    round only."""
+    round only, and taken only when that round starts (get_response_group):
+    a turn refused before its round leaves them owed (#260)."""
     task = user_tasks.get(user_prompt)
     owed = getattr(task, '_answer_owed_to_turn', None) if task is not None else None
     if owed is None:
@@ -4834,6 +4895,14 @@ def _resume_prior_user_input_block(user_prompt, text, failure=False):
     65db06972 and c906283b6).
     """
     if failure:
+        return False
+    # Only the person's own words answer a step.  A build resuming on the
+    # agent's saved input runs on the person's request id (it must not yield
+    # to the person who is chatting), and below, a person's turn's text
+    # answers a held step and any question the window holds ("any later
+    # request answers it"): the agent's goal sentence was recorded as the
+    # child's answer (review of cfa9e29ee).
+    if not turn_text_is_the_persons.get():
         return False
     task = user_tasks.get(user_prompt)
     if task is None:
@@ -5195,7 +5264,6 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None,autonomou
                 f"[USER-INPUT-GATE] {user_prompt}: the person's answer is kept "
                 f"unsaved; answering without a model round")
             return _unsaved_reply
-        text = _answer_for_this_turn(user_prompt, text)
     # Get or create agents for this user
     if user_prompt not in user_agents:
         current_app.logger.info(f"Creating new agents for user_prompt={user_prompt}")
@@ -5252,6 +5320,12 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None,autonomou
             except Exception:
                 message = ""
                 text = f'Properly Execute Action {user_tasks[user_prompt].current_action}: {message} '
+    if not Failure:
+        # The words a kept answer owes the person's round are taken here,
+        # once nothing above can still refuse the turn: taken at the top, a
+        # turn held for another one (#172) or for a tool call still running
+        # lost them, and the person was asked again (#260).
+        text = _answer_for_this_turn(user_prompt, text)
     _attach_for_create_turn(agents_object, text, user_prompt)
 
     # Initiate or resume chat
@@ -5498,7 +5572,9 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None,autonomou
                     f"[STALL-GUARD] action {current_action_id} stuck in "
                     f"{current_state.value} for {_sg_iters} iterations with no "
                     f"recipe — breaking clean (was spinning to max_iterations)")
-                break
+                return _ask_when_a_guard_gives_up(
+                    user_prompt, prompt_id, current_action_id, group_chat,
+                    'the step made no progress')
 
             # Second no-progress SIGNAL feeding the SAME break decision above —
             # not a second guard.  stall_guard_step counts consecutive iterations
@@ -5523,7 +5599,9 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None,autonomou
                     f"same states without finishing "
                     f"({dict((s.value, n) for s, n in _cg_entries.items())}) — "
                     f"breaking clean instead of draining max_iterations")
-                break
+                return _ask_when_a_guard_gives_up(
+                    user_prompt, prompt_id, current_action_id, group_chat,
+                    'the step went round without finishing')
 
             # A verdict left over from the previous action is not this one's
             # (#101): after [ADVANCE] the old verdict and TERMINATE stay last,
@@ -6218,8 +6296,13 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None,autonomou
                 # TERMINATE hook closed such an action (without a receipt);
                 # left open, it spun here silently to the stall guard.  Re-
                 # posting it is bounded by the three attempts below.
+                # ERROR too: an 'error' verdict ends its round (state_transition
+                # hands it to the UserProxy) with nothing else to re-post the
+                # step.  Live 2026-11-14 21:04 the Research Assistant's step 2
+                # spun here 300 times and the person got the verdict JSON as
+                # the reply (tests/unit/test_a_failed_step_is_retried_then_asked.py).
                 if _ca_pending_state in (ActionState.ASSIGNED, ActionState.PENDING, ActionState.IN_PROGRESS,
-                                         ActionState.STATUS_VERIFICATION_REQUESTED):
+                                         ActionState.STATUS_VERIFICATION_REQUESTED, ActionState.ERROR):
                     # Track retries to detect actions stuck needing user input
                     if not hasattr(user_tasks[user_prompt], '_exec_retries'):
                         user_tasks[user_prompt]._exec_retries = {}
@@ -6498,20 +6581,20 @@ def after_all_actions_terminated(assistant_agent, chat_instructor, group_chat, j
                 action_ids = ast.literal_eval(match.group())
 
                 file_path = helper_fun.safe_prompt_path(prompt_id, flow, num)
-                with open(file_path, 'r') as f:
+                with open(file_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                 data['actions_this_action_depends_on'] = action_ids
                 atomic_json_write(file_path, data, indent=4)
             else:
                 file_path = helper_fun.safe_prompt_path(prompt_id, flow, num)
-                with open(file_path, 'r') as f:
+                with open(file_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                 data['actions_this_action_depends_on'] = []
                 atomic_json_write(file_path, data, indent=4)
         except (ValueError, SyntaxError) as e:
             current_app.logger.info(f'GOT ERROR AT EVAL OF LIST :{e}')
             file_path = helper_fun.safe_prompt_path(prompt_id, flow, num)
-            with open(file_path, 'r') as f:
+            with open(file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             data['actions_this_action_depends_on'] = []
             atomic_json_write(file_path, data, indent=4)
@@ -6557,13 +6640,13 @@ def after_all_actions_terminated_from_exception(assistant_agent, chat_instructor
             except (ValueError, SyntaxError):
                 action_ids = []
             file_path = helper_fun.safe_prompt_path(prompt_id, flow, num)
-            with open(file_path, 'r') as f:
+            with open(file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             data['actions_this_action_depends_on'] = action_ids
             atomic_json_write(file_path, data, indent=4)
         else:
             file_path = helper_fun.safe_prompt_path(prompt_id, flow, num)
-            with open(file_path, 'r') as f:
+            with open(file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             data['actions_this_action_depends_on'] = []
             atomic_json_write(file_path, data, indent=4)
@@ -7004,19 +7087,30 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
                 'generalized_functions': '',
                 'agent_to_perform_this_action': 'Assistant',
             }]
-        # #160 (open): 'yes' is stamped on every banked action, so a step that
-        # stopped for the person at creation replays on its own in REUSE
-        # (_reuse_action_is_autonomous reads this field).  The ledger task
-        # records whether the person answered this action in THIS flow
-        # (lifecycle_hooks.record_user_answer / ledger_user_answered); a stamp
-        # read from it was written in 94354c536 and HELD OUT again, because a
-        # 'no' step must first be shown to advance on the person's reply in
-        # REUSE, and the live walk measured 2026-10-30 22:24-22:28 IST on the
-        # installed build (HARTOS 19836e605, agent 45620673143 flow 0) did the
-        # opposite: the reply turn restarted at action 1, closed it on a
-        # send_message_to_user receipt with its named tool never run, then
-        # recorded GAVE_UP for the 'no' ask step and re-asked the person.
-        # Until that walk is fixed, 'yes' here keeps new recipes as they are.
+        # #160: 'yes' was stamped on every banked action, so a step that
+        # stopped for the person at creation replayed on its own in REUSE
+        # (_reuse_action_is_autonomous reads this field): the walk posted the
+        # autonomy nudge ("complete this task independently, make reasonable
+        # assumptions"), invented the person's answers and ran the whole flow
+        # in one message.  Measured live 2026-11-12 19:22-19:27 IST on build
+        # 72 (agent 1793366231447, every step 'yes'): one child message, 23
+        # model calls, 361 s, the parents' names invented.
+        #
+        # The ledger task records whether the person answered this action in
+        # THIS flow (lifecycle_hooks.record_user_answer / ledger_user_answered,
+        # the create gate's own reader).  The stamp was held out of 94354c536
+        # by a3820a8fe until a 'no' step was shown to advance on the person's
+        # reply in REUSE; that walk was measured live 2026-11-12 20:44-20:47
+        # IST on the same build with the agent's two ask steps 'no': the turn
+        # held at the question (24 s, 5 calls), the reply turn closed the step
+        # on the person's answer and held at the next ask (91 s), and the next
+        # reply closed that one (30 s).  The stamp is one constant: a recipe
+        # bundle leaves the node (push_recipe, peer_reuse's export) and the
+        # owner's rule of 2026-10-17 is that CREATE shares templates, never a
+        # person's data.
+        from core.constants import USER_ANSWERS_THIS_STEP
+        from hartos.lifecycle_hooks import ledger_user_answered
+        _answered = ledger_user_answered(user_prompt, action_id, flow)
         json_obj = {
             'status': 'done',
             'action': action_obj.get('action', ''),
@@ -7029,7 +7123,8 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
             'persona': '',
             'action_id': int(action_id),
             'recipe': steps,
-            'can_perform_without_user_input': 'yes',
+            'can_perform_without_user_input': (
+                USER_ANSWERS_THIS_STEP if _answered else 'yes'),
             'scheduled_tasks': [],
             'metadata': {},
             'recipe_source': 'execution_trace',
@@ -7138,7 +7233,7 @@ def set_individual_recipes(flow, individual_recipe, prompt_id, user_prompt):
         _recipe_path = helper_fun.safe_prompt_path(prompt_id, flow, i)
         current_app.logger.info(f'checking for {_recipe_path}')
         try:
-            with open(_recipe_path, 'r') as f:
+            with open(_recipe_path, 'r', encoding='utf-8') as f:
                 config = json.load(f)
                 individual_recipe.append(config)
         except FileNotFoundError:
@@ -7173,6 +7268,17 @@ def track_lifecycle_hooks(current_action_id, group_chat, user_prompt):
 messages = TTLCache(ttl_seconds=7200, max_size=500, name='create_messages')
 recent_file_id = TTLCache(ttl_seconds=7200, max_size=500, name='create_recent_file_id')
 request_id_list = TTLCache(ttl_seconds=7200, max_size=500, name='create_request_id_list')
+# Whether the text recipe() was given this turn is what the person sent.
+# False only for an unfinished agent's build resuming on its own saved input
+# on a person's turn (hart_intelligence_entry resume_build_input): the gate
+# (_resume_prior_user_input_block) takes that text as nobody's answer.  It
+# belongs to the turn, not the session: recipe() sets it at every call, in
+# the turn's own thread, so a second turn of the same agent running at the
+# same time (nothing serializes them) cannot flip it, and a resumed build's
+# False never outlives its own call (hartos-d9, 11-11).
+import contextvars  # noqa: E402
+turn_text_is_the_persons = contextvars.ContextVar(
+    'create_turn_text_is_the_persons', default=True)
 recipe_for_persona = TTLCache(
     ttl_seconds=7200, max_size=500,
     name='create_recipe_for_persona',
@@ -7498,7 +7604,7 @@ def load_existing_metadata(prompt_id, user_prompt, flow_progress, user_id):
             for action_id in sorted(progress['completed_actions'], reverse=True):
                 action_file = helper_fun.safe_prompt_path(prompt_id, flow_idx, action_id)
                 try:
-                    with open(action_file, 'r') as f:
+                    with open(action_file, 'r', encoding='utf-8') as f:
                         action_data = json.load(f)
                         if 'metadata' in action_data and action_data['metadata']:
                             # Merge metadata into the creator's own memory
@@ -7519,7 +7625,8 @@ from core.llm_outbound_logger import with_llm_context as _with_llm_context
 
 
 @_with_llm_context('autogen.create')
-def recipe(user_id, text, prompt_id, file_id, request_id, autonomous=False):
+def recipe(user_id, text, prompt_id, file_id, request_id, autonomous=False,
+           text_is_the_persons=True):
     """Run one CREATE turn of this agent's plan.  ``autonomous``: the caller
     runs the plan without stopping for the person at each step, so every
     flow's agents are built freed (create_agents): the assistant's AUTONOMOUS
@@ -7528,9 +7635,12 @@ def recipe(user_id, text, prompt_id, file_id, request_id, autonomous=False):
     Phase 1's salvaged config, which she has not seen), the after-restart
     branch, and the autonomous pipeline (the daemon's own plan).  A step
     that needs her is still put to her at the attempts bound
-    (_ask_for_help)."""
+    (_ask_for_help).  ``text_is_the_persons``: False when ``text`` is not
+    what the person sent this turn (an unfinished agent's build resuming on
+    its saved input on their turn); the text then answers no step."""
     user_prompt = f'{user_id}_{prompt_id}'
     request_id_list[user_prompt] = request_id
+    turn_text_is_the_persons.set(bool(text_is_the_persons))
     # A turn begins with no pause pending (helper_fun.clear_pause_request).
     helper_fun.clear_pause_request()
     current_app.logger.info('--' * 100)
@@ -7702,7 +7812,7 @@ def get_current_flow(user_prompt):
 def create_time_agents_and_create_scheduled_jobs(flows, number_of_flows, prompt_id, user_id, user_prompt):
     for i in range(number_of_flows):
         _recipe_file = helper_fun.safe_prompt_path(prompt_id, i, 'recipe')
-        with open(_recipe_file, 'r') as f:
+        with open(_recipe_file, 'r', encoding='utf-8') as f:
             merged_dict = json.load(f)
             final_recipe[prompt_id] = merged_dict
             current_app.logger.info(f'updating the final recipe with {_recipe_file}')
@@ -7761,7 +7871,7 @@ def _drop_non_flow_entries(config, prompt_id):
 
 
 def get_prompt_config_json(prompt_id):
-    with open(helper_fun.safe_prompt_path(prompt_id), 'r') as f:
+    with open(helper_fun.safe_prompt_path(prompt_id), 'r', encoding='utf-8') as f:
         config = json.load(f)
     return _drop_non_flow_entries(config, prompt_id)
 

@@ -198,8 +198,10 @@ def provider_host(url: str) -> str:
 # 2026-09-14: every hosted call 402 insufficient_quota).  Fed ONLY by the
 # httpx wire (core.llm_outbound_logger), which sees the real status of every
 # framework's call; read non-consumingly by dispatch_goal.  Threshold 3,
-# cooldown 10 min; 429 is deliberately NOT counted (rate-limit, not a
-# standing refusal).
+# cooldown 10 min.  A 429 is a rate limit, not a standing refusal, and is
+# not counted, except one that says the quota is spent until a reset still
+# ahead (llm_outbound_logger._quota_spent_until): until then every call is
+# refused, as with a 402.
 llm_provider_breaker = KeyedCircuitBreaker(
     threshold=3, cooldown=600.0, name='llm-provider')
 

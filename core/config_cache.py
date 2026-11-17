@@ -299,6 +299,21 @@ def get_central_db_url() -> str:
     return _DEFAULT_CENTRAL_DB_URL
 
 
+def get_autogen_response_url() -> str:
+    """Where a node that is not the desktop (central, a dev server) POSTs an
+    agent's message to its person: the chatbot_pipeline backend's
+    autogen_response route, from AUTOGEN_RESPONSE_URL.
+
+    No default.  The two the senders carried were both dead from central
+    (measured 2026-11-10: aws_rasa.hertzai.com:9890 and port 8443 of the same
+    box; 36 sends in 15 minutes, none arrived), and a guessed default fails
+    the same quiet way.  '' means "not configured": hartos.helper.
+    post_agent_message then reports the message as not delivered and names
+    this setting.  Central's deploy (deploy/deepbox_deploy.sh) sets it.
+    """
+    return str(get_secret('AUTOGEN_RESPONSE_URL', '') or '').strip()
+
+
 def get_stop_api_url() -> str:
     """VLM computer-use stop endpoint URL.
 

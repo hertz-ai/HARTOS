@@ -137,13 +137,16 @@ def _started_capture_callbacks(monkeypatch, owner):
     monkeypatch.setattr(vsmod, 'run_screen_capture_loop', fake_loop)
     monkeypatch.setitem(sys.modules, 'integrations.social.models',
                         SimpleNamespace(db_session=fake_db_session))
+    # central_lacks: what _start_screen_capture reads first ('' = this node
+    # can capture); the store takes who sent the frame, as FrameStore does.
     monkeypatch.setitem(sys.modules, 'integrations.social.consent_service',
-                        SimpleNamespace(ConsentService=FakeConsent))
+                        SimpleNamespace(ConsentService=FakeConsent,
+                                        central_lacks=lambda consent_type: ''))
     monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', owner)
     vs = VisionService.__new__(VisionService)
     vs._running = True
     vs.store = SimpleNamespace(
-        put_screen_frame=lambda uid, jpeg: stored.append(uid))
+        put_screen_frame=lambda uid, jpeg, source=None: stored.append(uid))
     vs._start_screen_capture(interval=0)
     vs._screen_capture_thread.join(timeout=5)
     return got, asked, stored

@@ -447,6 +447,57 @@ Special cases requiring extra audit:
 - cx_Freeze-bundled modules → every `import X` in app.py, main.py,
   routes/, and `scripts/setup_freeze_nunba.py:packages[]`.
 
+### Gate 1b -- Read the Whole File, Then the Call Tree (BLOCKING)
+
+Gate 1 finds WHERE a symbol is used.  It does not tell you what the
+module can already DO.  Those are different questions and a grep only
+answers the first.
+
+1. When a file is central to the question, **read it entirely** before
+   proposing anything.  Under ~1500 lines there is no excuse -- the
+   read is cheaper than one wrong proposal.
+2. **List the definitions first, then read.**  Never theorise from a
+   head read.  If any name in that list could already do what you are
+   about to propose building, read that function BEFORE proposing it:
+
+```bash
+grep -n '^def \|^class \|^    def ' <file>
+```
+
+3. **A docstring describes the author's intended use, not the module's
+   surface.**  Never conclude "X does not exist here" from a module
+   docstring, a header comment, or the first N lines.
+4. **Walk the call tree in BOTH directions** before proposing a change:
+   who calls this (Gate 1), and what this calls.  The fix is usually a
+   missing BRANCH between two things that both already exist.
+5. Before proposing to BUILD any capability, grep the owning subsystem
+   for its VERB -- dispatch / route / call / send / invoke / handle --
+   not just its noun.  In this codebase the composition almost always
+   already exists; see Gate 2 and `feedback_engineering_principles.md`.
+
+**The incident that bought this gate (2026-11-11).**  Asked why a
+casual turn never reaches the user's learning agent, a session
+identified `integrations/agentic_router.py` as central, read **lines
+1-45 of 813**, and trusted the module docstring ("detects multi-step
+execution ... returns plan data for the frontend Plan Mode UI").
+Accurate but PARTIAL: it documents the LangChain tool's use and never
+mentions the Phase 7b dispatch half 250 lines below.  On that partial
+read the session shipped two wrong recommendations in consecutive
+messages -- first "register `Agentic_Router` in the casual tool
+registry" (it yields a Plan Mode card, not a handoff), then "write a
+call-an-agent tool" -- when `dispatch_to_agent`, `dispatch_via_chat`
+and `_call_turn_reply` were already in that same file and already live
+for the @mention, voice-bridge and morphable-agent paths.
+`dispatch_via_chat` was *already* the agent-binding being asked for.
+Six rounds of greps cost more context than one full read would have,
+the owner had to walk the session to the answer across four prompts,
+and the real fix was one missing branch between two existing halves.
+
+**The cost asymmetry, so nobody argues it:** reading an 800-line file
+is seconds and a few thousand tokens.  A wrong proposal costs the owner
+a prompt, the session a correction, and risks building the parallel
+path Gate 2 exists to prevent.
+
 ### Gate 2 — DRY Gate (BLOCKING)
 
 Before introducing ANY new:

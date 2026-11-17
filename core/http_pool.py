@@ -12,6 +12,8 @@ Typical improvement: 40-60% latency reduction on repeated calls to same host.
 Retry policy:
   - localhost: 0 retries (dead local services should fail instantly, not block 15s)
   - remote:    2 retries with 0.5s backoff (network can be flaky)
+  - pooled_post_once: 0 retries anywhere, for a POST whose effect must not
+    happen twice (an agent's message to a person)
 """
 
 import logging
@@ -477,6 +479,40 @@ def pooled_post(url: str, timeout=DEFAULT_TIMEOUT, **kwargs) -> requests.Respons
         except Exception:
             pass
     return resp
+
+
+_once_session = None
+_once_session_lock = threading.Lock()
+
+
+def _get_once_session() -> requests.Session:
+    """A pooled session that never re-sends: Retry(total=0) on every host."""
+    global _once_session
+    if _once_session is not None:
+        return _once_session
+    with _once_session_lock:
+        if _once_session is None:
+            s = requests.Session()
+            adapter = HTTPAdapter(pool_connections=4, pool_maxsize=8,
+                                  max_retries=Retry(total=0))
+            s.mount('http://', adapter)
+            s.mount('https://', adapter)
+            s.headers.update({'Content-Type': 'application/json'})
+            _once_session = s
+        return _once_session
+
+
+def pooled_post_once(url: str, timeout=DEFAULT_TIMEOUT, **kwargs) -> requests.Response:
+    """POST that is sent at most once: no retry on a refused connection, a
+    read timeout or a 502/503/504.
+
+    For a request the receiver acts on, where a second copy is a second
+    effect.  The shared session's remote adapter retries POST twice, so an
+    agent's message to a person reached a backend slower than the read
+    timeout three times (review of 983c98e14: one send, 3 POSTs of the same
+    text, then "Failed" after 46 s).  The caller decides what a failure
+    means; nothing here re-sends."""
+    return _get_once_session().post(url, timeout=timeout, **kwargs)
 
 
 def _prompt_text_preview(content, limit: int = 200) -> str:

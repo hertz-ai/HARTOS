@@ -24,6 +24,14 @@ Wired in
   ``AUTOEVOLVE_CODE_TOOLS`` / ``AUTO_EVOLVE_TOOLS`` /
   ``THOUGHT_EXPERIMENT_TOOLS`` — see
   ``mcp_http_bridge._load_tools`` around the registration tuple list.
+  That serves outside callers only.
+* In-process agents get them from the ServiceToolRegistry:
+  ``BackendRepairTool`` (bottom of this module), which ``create_recipe``
+  and ``reuse_recipe`` register beside the other native tools, tagged
+  ``backend_repair``.  A goal or a turn whose words name one of these
+  tools resolves that tag (``marketing_tools.detect_goal_tags``), and the
+  build-time Tier-1 filter or the per-turn ``attach_for_turn`` attaches
+  them.  Keyword discovery (``request_tools``) never offers them.
 * ``goal_manager._build_self_heal_prompt`` mentions
   ``repair_backend_venv`` when the goal's ``category`` is one of the
   TTS / subprocess install-failure shapes AND ``context.backend`` is
@@ -346,3 +354,109 @@ BACKEND_REPAIR_TOOLS = [
         'tags': ['provision', 'self_heal', 'tts'],
     },
 ]
+
+
+#: JSON-schema types for the repair functions' parameter annotations.
+_JSON_TYPES = {str: 'string', bool: 'boolean', int: 'integer', float: 'number'}
+
+
+def _params_schema(func) -> dict:
+    """The registry's params_schema for ``func``, read from its own signature
+    so the two cannot drift: each parameter typed, and the ones with no
+    default listed as required.  The registry turns 'required' into a
+    parameter with no default (registry._synthesize_signature_from_schema),
+    so the one refusal every tool call goes through (hartos.helper
+    tool_argument_error, from the patched execute_function) answers a call
+    without backend_name: "Missing required argument(s): backend_name ...
+    Call repair_backend_venv again".  The flat form marked every parameter
+    optional, the call reached the function, and the model read the bare
+    TypeError (review of ea8e9b3a4).  A function with no parameters keeps
+    the empty schema, which the registry renders as an empty object."""
+    import inspect
+    params = inspect.signature(func).parameters
+    if not params:
+        return {}
+    return {'properties': {name: {'type': _JSON_TYPES.get(p.annotation,
+                                                          'string'),
+                                  'description': name.replace('_', ' ')}
+                           for name, p in params.items()},
+            'required': [name for name, p in params.items()
+                         if p.default is p.empty]}
+
+
+def _native_handler(entry):
+    """The registry's native handler for one BACKEND_REPAIR_TOOLS entry: the
+    model's JSON arguments go to the entry's own function, and an argument
+    the model left out (None) keeps the function's default."""
+    def handler(payload: str) -> str:
+        params = json.loads(payload or '{}')
+        return entry['func'](**{k: v for k, v in params.items()
+                                if v is not None})
+    return handler
+
+
+class BackendRepairTool:
+    """Service-tool registration shim for BACKEND_REPAIR_TOOLS (mirrors
+    ExperimentVoteTool / GhPrTool / SeoAuditTool).
+
+    The door every turn opens on both pipelines is
+    core.agent_tool_menu.attach_for_turn: it resolves the turn's own words
+    and attaches the registry tools whose tags meet the capability tags
+    goal_manager.get_tool_tags gives them.  A self-heal turn names
+    repair_backend_venv, which detect_goal_tags tags 'backend_repair', and
+    goal_manager._CAPABILITY_TAGS maps that to the 'backend_repair' tag these
+    entries carry.  Measured live 13 Nov 2026 (Nunba build 75): the turn
+    resolved 'backend_repair' and attached 0 tools, because these were not
+    in the registry.
+
+    One registry tool per function, its endpoint named after it, so the
+    model sees the names the prompts use.  Tagged 'backend_repair' only, not
+    the entries' documentary tags: 'tts' is unlocked by every 'media' turn
+    and 'coding' by every coding turn, and neither should carry an
+    installer.  The tool asks the owner before it installs or wipes.
+
+    Offered by that tag and by name only ('tag_only' on the endpoint):
+    request_tools' keyword discovery never attaches them.  Review of
+    ea8e9b3a4: one request_tools('text to speech') call attached
+    repair_backend_venv ('text' is inside 'context.backend' in its
+    description), so did 'install a package', 'use a model' and 'context',
+    and 'set up the next engine' attached next_tts_venv_to_provision, on
+    turns that never resolved 'backend_repair'.  This is the only path the
+    agents get them by: 8e944550b's Tier-2 loader, a second copy with a
+    second schema, is gone.
+    """
+
+    TAGS = ('backend_repair',)
+
+    @classmethod
+    def create_tool_infos(cls):
+        from integrations.service_tools.registry import ServiceToolInfo
+        return [
+            ServiceToolInfo(
+                name=entry['name'],
+                description=entry['description'],
+                base_url='native://in-process',
+                endpoints={entry['name']: {
+                    'path': f"/{entry['name']}",
+                    'method': 'POST',
+                    'description': entry['description'],
+                    'params_schema': _params_schema(entry['func']),
+                    'native_handler': _native_handler(entry),
+                    'tag_only': True,
+                }},
+                health_endpoint=None,  # native: no HTTP service to ping
+                tags=list(cls.TAGS),
+            )
+            for entry in BACKEND_REPAIR_TOOLS
+        ]
+
+    @classmethod
+    def register(cls) -> bool:
+        """Register on the global service_tool_registry.  Idempotent."""
+        try:
+            from integrations.service_tools import registry as _reg
+            return all([_reg.service_tool_registry.register_tool(info)
+                        for info in cls.create_tool_infos()])
+        except Exception as exc:
+            logger.warning('backend repair tools registration skipped: %s', exc)
+            return False

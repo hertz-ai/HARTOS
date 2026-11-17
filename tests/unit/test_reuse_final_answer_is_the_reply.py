@@ -90,8 +90,11 @@ def _drive_turn(rr, monkeypatch, answer_key='message2userfinal',
     posted after the answer in the first round only (the verifier's verdict
     that ends it).  ``tails`` are the Assistant's messages in the first
     rounds, one per round; later rounds give the answer.  Returns (reply,
-    pooled_post mock)."""
+    the mock of core.http_pool.pooled_post_once, the one transport an agent
+    message to central's backend takes; it answers 200 to whatever is
+    sent)."""
     from flask import Flask
+    monkeypatch.setenv('AUTOGEN_RESPONSE_URL', 'http://backend.test/autogen_response')
 
     user_prompt = f'{_USER}_{_PROMPT}'
     action = {'action_id': 1, 'action': 'Report the overdue invoices',
@@ -127,7 +130,9 @@ def _drive_turn(rr, monkeypatch, answer_key='message2userfinal',
     assistant = SimpleNamespace(name='Assistant')
     helper = SimpleNamespace(name='helper')
 
-    with patch.object(rr, 'pooled_post') as post, \
+    with patch.object(rr, 'pooled_post'), \
+            patch('core.http_pool.pooled_post_once',
+                  return_value=SimpleNamespace(status_code=200, text='')) as post, \
             patch.object(rr, 'scheduler') as sched, \
             Flask('reuse-final-answer').app_context():
         sched.get_job.return_value = None
@@ -212,16 +217,33 @@ def test_an_unwritten_message2user_is_not_the_reply(
     assert reply == _ANSWER
 
 
-def test_central_sends_no_unwritten_message2user_on_its_chatbot_leg(
-        rr, central, publisher, monkeypatch):
-    """Central's off-box leg never carries the empty message2user the loop
-    used to stop on."""
-    reply, post = _drive_turn(
-        rr, monkeypatch, tails=[json.dumps({'message2user': ''})])
+@pytest.mark.parametrize('tails,tail', [
+    ((), None),
+    ((), json.dumps({'message2user': _ANSWER})),
+    ((json.dumps({'message2user': ''}),), None),
+], ids=['message2userfinal', 'message2user', 'after an unwritten message2user'])
+def test_central_delivers_the_finished_answer_only_as_the_reply(
+        rr, central, publisher, monkeypatch, tails, tail):
+    """The rule the desktop already follows (review of 57516f078), now on
+    central too.  get_agent_response also POSTed the answer it returned to
+    the chatbot_pipeline backend; until 983c98e14 that POST went to a dead
+    host, so no person ever received it, and with the backend reachable it
+    would publish the answer a second time (review of 983c98e14).  No POST,
+    nothing published here; the reply carries the answer."""
+    reply, post = _drive_turn(rr, monkeypatch, tails=tails, tail=tail)
     assert reply == _ANSWER
-    sent = [json.loads(c.kwargs['data']).get('message')
-            for c in post.call_args_list]
-    assert '' not in sent, sent
+    post.assert_not_called()
+    assert _chat_texts(publisher) == []
+
+
+def test_central_still_posts_a_mid_turn_question(
+        rr, central, publisher, monkeypatch):
+    """A question sent DURING the turn has no reply to ride on, so on
+    central it still goes to the backend, once; the answer does not."""
+    reply, post = _drive_turn(rr, monkeypatch, mid_turn_question=True)
+    assert reply == _ANSWER
+    assert [json.loads(c.kwargs['data'])['message']
+            for c in post.call_args_list] == [_QUESTION]
 
 
 def test_a_mid_turn_question_still_reaches_the_desktop(
@@ -234,28 +256,3 @@ def test_a_mid_turn_question_still_reaches_the_desktop(
     payload = publisher.call_args[0][1]
     # The id a client could correlate on, as it is on the wire today.
     assert payload['request_id'].startswith(f'{_SPA_REQUEST_ID}-intermediate-')
-
-
-def test_central_keeps_its_chatbot_pipeline_leg(
-        rr, central, publisher, monkeypatch):
-    """Central is not the desktop: its off-box leg for the answer is left as
-    it was (the URL is an owner decision); nothing is published locally."""
-    reply, post = _drive_turn(rr, monkeypatch)
-    assert reply == _ANSWER
-    assert post.call_count == 1
-    body = json.loads(post.call_args.kwargs['data'])
-    assert body['message'] == _ANSWER
-    assert _chat_texts(publisher) == []
-
-
-def test_central_sends_a_message2user_answer_on_its_chatbot_leg(
-        rr, central, publisher, monkeypatch):
-    """A message2user answer ends the turn where it is written, as the
-    other answer keys do, and so takes central's off-box leg with it.  Left
-    to the post-loop extractor the learner still got the text, but nothing
-    went out on that leg."""
-    reply, post = _drive_turn(
-        rr, monkeypatch, tail=json.dumps({'message2user': _ANSWER}))
-    assert reply == _ANSWER
-    assert post.call_count == 1
-    assert json.loads(post.call_args.kwargs['data'])['message'] == _ANSWER

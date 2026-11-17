@@ -51,7 +51,8 @@ def _say(rr, message):
 def test_the_agents_real_message_is_sent(rr):
     sent, send = _say(rr, _msg('Assistant', 'Which month should I check?'))
     assert sent is True
-    send.assert_called_once_with('u7', 'Which month should I check?', '', 42)
+    send.assert_called_once_with('u7', 'Which month should I check?', '', 42,
+                                 media_refs=None)
 
 
 @pytest.mark.parametrize('message', [
@@ -112,7 +113,8 @@ def _run_timer(rr, monkeypatch, timer_tail, main_tail=None):
 def test_a_scheduled_run_sends_its_own_result(rr, monkeypatch):
     send = _run_timer(rr, monkeypatch,
                       _msg('time_agent', 'Time to drink water.'))
-    send.assert_called_once_with(_UID, 'Time to drink water.', _TASK, _PID)
+    send.assert_called_once_with(_UID, 'Time to drink water.', _TASK, _PID,
+                                 media_refs=None)
 
 
 def test_a_scheduled_run_never_sends_the_main_conversation(rr, monkeypatch):
@@ -158,7 +160,7 @@ def test_a_visual_run_sends_its_real_message(rr, monkeypatch):
     send = _run_visual(rr, monkeypatch,
                        _msg('visual_agent', 'You look tired; take a break.'))
     send.assert_called_once_with(_UID, 'You look tired; take a break.',
-                                 _TASK, _PID)
+                                 _TASK, _PID, media_refs=None)
 
 
 @pytest.mark.parametrize('tail', [
@@ -172,7 +174,7 @@ def test_a_visual_run_never_sends_plumbing(rr, monkeypatch, tail):
 
 # ── source guard, by behaviour: every sender of message2userfinal ──────
 
-_GATE_OWNERS = {'_reuse_speaker_says_to_user', '_reuse_answer_off_box'}
+_GATE_OWNERS = {'_reuse_speaker_says_to_user'}
 
 
 def ungated_senders(src):
@@ -181,8 +183,8 @@ def ungated_senders(src):
 
     Such a function is delivering a group member's message2userfinal, so it
     must hand it to _reuse_speaker_says_to_user (mid-round / out-of-band)
-    or return it through _reuse_answer_off_box (the /chat reply), never
-    send it itself.  Whatever the function is called."""
+    or return it (the /chat reply), never send it itself.  Whatever the
+    function is called."""
     import ast
     out = []
 
