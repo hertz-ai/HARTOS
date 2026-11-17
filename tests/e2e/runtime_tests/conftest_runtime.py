@@ -16,6 +16,10 @@ REDIS_PORT = 6379
 MOCK_LLM_URL = "http://localhost:8000"
 MOCK_CROSSBAR_URL = "http://localhost:8088"
 MOCK_API_URL = "http://localhost:9890"
+# The app under test posts agent messages only to AUTOGEN_RESPONSE_URL, which
+# has no default (core.config_cache.get_autogen_response_url), so start it with
+# AUTOGEN_RESPONSE_URL=http://localhost:9890/autogen_response or the tests that
+# count messages at the mock see none.
 
 @pytest.fixture(scope="session")
 def wait_for_services():

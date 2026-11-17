@@ -117,7 +117,7 @@ def local_agent_prompts(prompts_dir):
                 or is_proposed_plan_filename(fname)):
             continue
         try:
-            with open(os.path.join(prompts_dir, fname), 'r') as f:
+            with open(os.path.join(prompts_dir, fname), 'r', encoding='utf-8') as f:
                 data = json.load(f)
         except Exception as e:
             logger.debug('local_agent_prompts: skipped %s: %s', fname, e)

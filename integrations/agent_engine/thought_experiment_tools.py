@@ -25,12 +25,36 @@ def create_thought_experiment(creator_id: str, title: str,
                                expected_outcome: str = '',
                                intent_category: str = 'technology',
                                is_core_ip: bool = False) -> str:
-    """Create a new constitutional thought experiment."""
+    """Create a new constitutional thought experiment.
+
+    ``creator_id`` comes from the caller, so it may never name an account
+    only this node holds (voting_rules.node_holds: the owner, the node's
+    'nunba' machine account).  On a flat node such an experiment evaluates
+    with no vote (voting_rules.evaluation_permit); a caller naming the owner
+    or the node would start that with no one voting.  No turn may use it
+    either: a goal dispatched through MCP runs AS the 'nunba' account
+    (mcp_server), so "the turn is that account" would let goal text mint a
+    no-vote experiment (claude-autostart-d2, 2026-11-15).  The owner's own
+    experiments come through the signed-in route, creator from the JWT
+    (api_thought_experiments); the node's from its own code
+    (hive_benchmark_prover, agent_daemon), which calls create_experiment
+    directly."""
     try:
         from integrations.social.models import db_session
         from integrations.social.thought_experiment_service import ThoughtExperimentService
 
         with db_session() as db:
+            if ThoughtExperimentService.node_held_ids(db, [creator_id]):
+                return json.dumps({
+                    'success': False,
+                    'reason': 'creator_is_this_node',
+                    'detail': "creator_id names this node's own account "
+                              '(its owner or its machine account), which this '
+                              'tool never creates as: on a flat node that '
+                              'experiment would run with no vote. Create it '
+                              'as yourself (it then needs the vote); the owner '
+                              'creates their own through the signed-in app.',
+                })
             result = ThoughtExperimentService.create_experiment(
                 db, creator_id, title, hypothesis,
                 expected_outcome=expected_outcome,

@@ -90,22 +90,36 @@ no owner today):
      kind of file the store takes for the purpose (video for `reel_source`,
      image for `logo`, audio for `song_audio`; none for a chat attachment,
      which takes several kinds), so every surface opens the right picker.
-  3. The same question already open is the same ask (no second push),
+  3. Says who asks and why, or is not sent. The reason is the agent's own
+     words: `body`, else the component's `description`; an ask with none
+     is refused (`say_why_in_description`), and so is one whose reason or
+     a field's label still holds a blank: the whole text a `<...>`, such as
+     the tool hint's "<why you ask>", or a fill-in mark such as
+     `<parent_name>` (`unfilled_placeholder`; what counts as a blank is
+     `core.agent_tools.unfilled_text_placeholder`, the one rule the send
+     tools use too, review C-1 of 0516f3981).
+     Live 2026-11-03 and 11-07/09: cards with no reason, titled "Your agent
+     asks for files"; review of ab68963ea: a word-for-word copy of the new
+     hint's example reached the person as "<why you ask>". With no title
+     of its own, the title names the agent the way the person knows it
+     (`consent_service.agent_display_name`). The card and the push carry
+     the title and the reason; the bell row carries the title.
+  4. The same question already open is the same ask (no second push),
      whichever kind of turn asks it. A person has at most
      `MAX_OPEN_PER_PERSON` (3) open asks of each kind: 3 from their own
      turns and 3 from background work (a turn that is not theirs by
      `core.chat_client.is_user_turn`: a `daemon_` request id, or none), so
      6 open asks and 6 pushes at most, and background work never takes the
      place of the person's own asks.
-  4. Pushes the card FIRST, through `push_agent_ui`, with `ask_id` on it;
+  5. Pushes the card FIRST, through `push_agent_ui`, with `ask_id` on it;
      `agent_ui_compose` keeps a card's `ask_id` as its `msg_id`, so every
      copy on every surface is the ask. The card's gates are the human's and
      come before everything: the Liquid UI kill switch, the hive halt,
      unsafe content, the allowlist (a type an agent registered at runtime
      counts) and the rate cap. A refused card means no row and no push
      (`not_shown`).
-  5. Files the ask as ONE `Notification` row (type `agent_ask`, bell title
-     "Your agent asks you something") through
+  6. Files the ask as ONE `Notification` row (type `agent_ask`, bell title
+     the ask's title) through
      `NotificationService.create(..., push=)`. The row id is the ask_id
      (H-1022), so the Firebase push goes out once (570b6c43a's leg, not a
      second one). The push carries the ask's id as `ask_id` (central's
@@ -227,9 +241,17 @@ names them again under `purposes`, so the agent's next ask can name one.
 Nothing is guessed for it. Live 2026-11-01: agent 342 made seven
 `file_request` asks under five purposes it made up ('reel_clips',
 'make_reel' and others); each was refused, and the refusal named no
-purpose. The tool's component example already showed `reel_source`; no
-list of the purposes was given. Whether the list changes what the model
-picks is not yet measured live.
+purpose. The tool's component example then showed `reel_source`; no
+list of the purposes was given. Each purpose is now named once, with the
+few words of what it is for (`UploadPurpose.use`).
+
+The component hint holds up no agent's purpose: its one example was Reel
+Studio's video request, and the speech-therapy agent sent it word for word
+(live 2026-11-07 and 11-09, "choose video" cards in a speech session). Its
+example is now a form whose reason and question are `<...>` blanks to fill
+in; a copy sent with the blanks unfilled is refused with a note naming the
+blank (step 3 above). Whether the hint changes what the model sends is
+measured live, not in tests.
 
 Not done yet: an answer that comes after the turn ended does not start a
 new turn by itself; the agent reads it when it next runs.

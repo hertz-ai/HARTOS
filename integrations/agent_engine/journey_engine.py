@@ -1040,6 +1040,12 @@ def _build_sales_prompt(goal_dict: Dict, product_dict: Dict = None) -> str:
     when the goal names none: a sales goal for any other business used to
     cold-email robotics companies (#233).  It also shows the goal's own
     title and description (_sales_goal_section).
+
+    It names no service address.  It used to name an email service, a
+    crawler and an Erxes CRM at fixed LAN addresses; measured on central
+    2026-11-12, the node used none of them (Erxes: no route to host;
+    EMAIL_SERVICE_URL and ERXES_API_URL unset), so the agent was told about
+    infrastructure its tools never reach (#280).
     """
     from integrations.agent_engine.outreach_crm_tools import _load_prospects
     data = _load_prospects()
@@ -1198,12 +1204,14 @@ General tools:
 ============================================================
 INFRASTRUCTURE
 ============================================================
-Email service: http://172.17.0.1:4000 (cortext@hertzai.com via SES)
-Crawl4AI: http://172.17.0.1:8094 (website scraping)
-Erxes CRM: http://192.168.0.83:3300 (deal pipeline)
+Email: send_outreach_email sends through this node's own email sender.
+  If it answers that no sender is set up, do not send again this
+  dispatch: its answer says what the owner sets up. Keep discovering
+  and researching prospects meanwhile.
+Pipeline: this node's own prospect store (get_pipeline_status,
+  move_prospect_stage).
 %(crm_line)s
   Stages: New > Contacted > Replied > Meeting > Negotiation > Won | Lost
-  Auto-syncs: prospect create, stage move, deal update
 Channels: email (primary), slack, discord, telegram, whatsapp
 
 ============================================================

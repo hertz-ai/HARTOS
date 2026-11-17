@@ -25,22 +25,35 @@ def _scheduler_stub(rr):
     return sched
 
 
-def test_a_sent_message_is_reported_sent_without_an_app_context():
+@pytest.fixture()
+def central(monkeypatch):
+    """A node that is not the desktop, with its backend configured; the wire
+    is core.http_pool.pooled_post_once (hartos.helper.post_agent_message)."""
+    monkeypatch.delenv('NUNBA_BUNDLED', raising=False)
+    monkeypatch.setenv('AUTOGEN_RESPONSE_URL', 'http://backend.test/autogen_response')
+
+
+def test_a_sent_message_is_reported_sent_without_an_app_context(central):
+    from types import SimpleNamespace
     from hartos import reuse_recipe as rr
-    with patch.object(rr, 'pooled_post') as post, _scheduler_stub(rr) as sched:
+    with patch('core.http_pool.pooled_post_once',
+               return_value=SimpleNamespace(status_code=200, text='')) as post, \
+            _scheduler_stub(rr) as sched:
         sched.get_job.return_value = None
         out = rr.send_message_to_user1('ctx-user-1', 'hello', 'inp', 'ctx-prompt')
     assert post.called, 'the message must still be POSTed'
     assert out.startswith('Message sent successfully'), out
 
 
-def test_a_failed_send_is_reported_not_raised_without_an_app_context():
+def test_a_failed_send_is_reported_not_raised_without_an_app_context(central):
     from hartos import reuse_recipe as rr
-    with patch.object(rr, 'pooled_post', side_effect=OSError('endpoint down')), \
+    with patch('core.http_pool.pooled_post_once',
+               side_effect=OSError('endpoint down')), \
          _scheduler_stub(rr) as sched:
         sched.get_job.return_value = None
         out = rr.send_message_to_user1('ctx-user-2', 'hello again', 'inp', 'ctx-prompt')
     assert out.startswith('Failed to send message'), out
+    assert 'could not be reached (OSError)' in out, out
 
 
 def test_the_function_logs_only_through_the_context_safe_logger():

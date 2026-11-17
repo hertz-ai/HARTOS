@@ -725,5 +725,440 @@ class TestT1AdapterIsolation(unittest.TestCase):
                          f'channel adapters must not import browser_research; offenders: {offenders}')
 
 
+class TestLoggedOutIsNeverThePersonsSession(unittest.TestCase):
+    """A fetch with no stored cookies must not come back wearing the
+    person's handle.
+
+    Nothing in this build writes to the vault -- AccountVault.add has no
+    production caller, only the calls in this very file -- so this is
+    the path every T2 read actually takes.  Before the fix,
+    fetch_with_session stamped the asked-for handle onto the result and
+    left the crawler's own connection_mechanism in place, so a logged-out
+    crawl reached the agent as the person's signed-in session.
+    """
+
+    def _dispatch(self, tmp, seeded_cookies=None, handle='@me'):
+        from integrations.browser_research import vault, tools
+        from integrations.browser_research.vault import Account
+        audit_path = os.path.join(tmp, 'audit.log')
+        v = vault.reset_vault_for_tests(path=audit_path + '.vault.enc')
+        if seeded_cookies is not None:
+            v.add(Account(platform='twitter', handle='@me',
+                          cookies=seeded_cookies, capabilities={'read'}))
+
+        def fake_crawler(url, cookies=None, timeout=30, cdp_endpoint=None, **_):
+            return {'success': True, 'url': url, 'markdown': 'body',
+                    'connection_mechanism': 'obscura_b1_headless_profile'}
+
+        with patch('integrations.browser_research.audit._log_path',
+                   return_value=audit_path):
+            with patch('integrations.web_crawler.crawl_url_with_cookies',
+                       side_effect=fake_crawler):
+                result = tools.dispatch(
+                    tool='Search_Platform', user_id='u1',
+                    platform='twitter', query='ai news', handle=handle,
+                    consent_check=lambda uid, scope: True,
+                )
+        return result, audit_path
+
+    def test_empty_vault_fetch_is_labelled_logged_out(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _ = self._dispatch(tmp)
+        self.assertFalse(result['authenticated'])
+        self.assertIsNone(
+            result['handle'],
+            'a logged-out crawl must not wear the handle it was asked for')
+        self.assertEqual(result['connection_mechanism'], 'logged_out_public')
+        self.assertIn('notice', result)
+        self.assertIn('NOT', result['notice'])
+
+    def test_vault_row_with_no_cookies_is_not_a_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _ = self._dispatch(tmp, seeded_cookies=[])
+        self.assertFalse(result['authenticated'],
+                         'a vault row with an empty cookie list is not a session')
+        self.assertIsNone(result['handle'])
+        self.assertEqual(result['connection_mechanism'], 'logged_out_public')
+
+    def test_real_cookies_keep_the_handle_and_mechanism(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _ = self._dispatch(
+                tmp, seeded_cookies=[{'name': 'auth_token', 'value': 'T'}])
+        self.assertTrue(result['authenticated'])
+        self.assertEqual(result['handle'], '@me')
+        self.assertEqual(result['connection_mechanism'],
+                         'obscura_b1_headless_profile')
+        self.assertNotIn('notice', result)
+
+    def test_audit_trail_does_not_claim_a_session_either(self):
+        from integrations.browser_research import audit
+        with tempfile.TemporaryDirectory() as tmp:
+            _, audit_path = self._dispatch(tmp)
+            with patch('integrations.browser_research.audit._log_path',
+                       return_value=audit_path):
+                records = audit.read_recent(limit=10)
+        self.assertEqual(records[-1]['connection_mechanism'],
+                         'logged_out_public')
+
+
+class TestRoutablePlatformDriftGuard(unittest.TestCase):
+    """Every routable platform must really exist.
+
+    'douyin' sat in _PER_PLATFORM_ALLOWED with no scripts/douyin.py, so
+    dispatch passed the known-platform check and died inside importlib,
+    refusing with a raw ImportError instead of naming the platforms that
+    work.  The comment above the set claimed a drift-guard that no code
+    performed -- this test is that guard.
+    """
+
+    def test_every_routable_platform_has_a_script_module(self):
+        from importlib import import_module
+        from integrations.browser_research import tools
+        missing = []
+        for platform in sorted(tools._PER_PLATFORM_ALLOWED):
+            try:
+                import_module(f'integrations.browser_research.scripts.{platform}')
+            except ImportError:
+                missing.append(platform)
+        self.assertEqual(
+            missing, [],
+            f'routable platforms with no scripts/<name>.py: {missing}')
+
+    def test_every_routable_platform_has_an_allowlist_entry(self):
+        from integrations.browser_research import tools, domain_allowlist
+        missing = [p for p in sorted(tools._PER_PLATFORM_ALLOWED)
+                   if not domain_allowlist.ALLOWLIST.get(p)]
+        self.assertEqual(
+            missing, [],
+            f'routable platforms with no domain allowlist entry: {missing}')
+
+    def test_every_routable_platform_exposes_the_three_actions(self):
+        from importlib import import_module
+        from integrations.browser_research import tools
+        for platform in sorted(tools._PER_PLATFORM_ALLOWED):
+            mod = import_module(f'integrations.browser_research.scripts.{platform}')
+            for action in ('search', 'timeline', 'post'):
+                self.assertTrue(
+                    callable(getattr(mod, action, None)),
+                    f'{platform}.{action} must be callable for dispatch to route')
+
+    def test_refusal_for_an_unroutable_platform_names_the_working_ones(self):
+        """Owner rule 11-09 -- a refusal says what was wrong and how to fix."""
+        from integrations.browser_research import tools
+        result = tools.dispatch(tool='Search_Platform', user_id='u1',
+                                platform='douyin', query='x')
+        self.assertFalse(result['success'])
+        self.assertIn('twitter', result['error'],
+                      'the refusal must name the platforms that do work')
+        self.assertNotIn('ImportError', result['error'])
+
+
+class TestRefusalsPointSomewhereReal(unittest.TestCase):
+    """Owner rule 11-09: a refusal says what was wrong and how to fix it.
+
+    The dry_run=False refusal told the person to 'Track in
+    memory/project_browser_research_subsystem.md' -- a file that does not
+    exist in this repo -- and dropped the text they had written.
+    """
+
+    def test_post_refusal_does_not_cite_a_missing_doc(self):
+        from integrations.browser_research.scripts import _base
+        result = _base.post_preview('twitter', 'my draft', handle='@me',
+                                    dry_run=False)
+        self.assertFalse(result['success'])
+        doc = os.path.join(HARTOS_ROOT, 'memory',
+                           'project_browser_research_subsystem.md')
+        self.assertFalse(
+            os.path.exists(doc),
+            'that doc now exists -- re-check what the refusal should say')
+        self.assertNotIn('project_browser_research_subsystem', result['error'])
+
+    def test_post_refusal_hands_the_text_back_unsent(self):
+        from integrations.browser_research.scripts import _base
+        result = _base.post_preview('twitter', 'my draft', handle='@me',
+                                    dry_run=False)
+        self.assertEqual(
+            result['content'], 'my draft',
+            'the refusal promises the text comes back unchanged')
+        self.assertIn('nothing was posted', result['error'])
+
+
+
+class TestTheToolTextNeverPromisesASignedInSession(unittest.TestCase):
+    """The text the model reads BEFORE it has any result to go on.
+
+    The result-level fix (connection_mechanism / authenticated / notice) can
+    only speak after a call has already gone out.  The three T2 tool texts
+    speak first, and they said the opposite of what the code does:
+
+      * all three advertised "the user's logged-in session";
+      * Search_Platform's docstring enumerated only the two AUTHENTICATED
+        connection_mechanism values (obscura_b2_cdp_user_chrome,
+        obscura_b1_headless_profile) and omitted logged_out_public -- the
+        only value production can return, because nothing writes to the
+        vault (AccountVault.add has no production caller);
+      * Post_As_User promised "the actual post happens with dry_run=False"
+        when there is no per-platform write path at all.
+
+    Every build_core_tool_closures site in this file discards ``_desc`` (6
+    call sites once this class is counted, 5 before it), so none of that text
+    was held by any test and it drifted from the behaviour in silence.  This
+    class holds it.
+    """
+
+    T2_TOOLS = ('Search_Platform', 'Read_Timeline', 'Post_As_User')
+
+    # Wordings that assert, with NO condition attached, that the call rides a
+    # session the person is signed in to.  "with the person's stored session
+    # if the vault holds one" is honest and must keep passing; these are not.
+    SIGNED_IN_CLAIMS = (
+        'logged-in session',
+        'logged in session',
+        'logged-in browser session',
+        'logged-in platform session',
+        "user's logged-in",
+        'your logged-in',
+    )
+
+    def _t2_text(self):
+        """{tool: (description, docstring)} for the three T2 tools, as registered."""
+        from core import agent_tools
+
+        class _FakeHelper:
+            def __init__(self): self.tools = []
+            def txt2img(self, *a, **kw): return ''
+            def get_user_camera_inp(self, *a, **kw): return ''
+            def save_agent_data_to_file(self, *a, **kw): return True
+
+        ctx = {
+            'user_id': 1, 'prompt_id': 'p1', 'agent_data': {},
+            'helper_fun': _FakeHelper(),
+            'user_prompt': 'x', 'request_id_list': {'x': 'r1'},
+            'recent_file_id': '', 'scheduler': None,
+            'log_tool_execution': (lambda f: f),
+            'send_message_to_user1': (lambda *a, **kw: None),
+            'retrieve_json': (lambda s: {}),
+            'strip_json_values': (lambda x: x),
+            'save_conversation_db': (lambda *a, **kw: None),
+        }
+        # Deliberately NOT self.skipTest() on a build failure, unlike the two
+        # older closure tests above: this class exists to READ the registered
+        # text, so a build that does not happen is a failure, not a quiet pass.
+        closures = agent_tools.build_core_tool_closures(ctx)
+        found = {}
+        for name, desc, fn in closures:
+            if name in self.T2_TOOLS:
+                found[name] = (desc or '', getattr(fn, '__doc__', '') or '')
+        missing = sorted(set(self.T2_TOOLS) - set(found))
+        self.assertFalse(missing,
+                         'T2 tools are not registered at all: %s' % missing)
+        return found
+
+    def test_no_t2_tool_text_promises_a_session_the_person_is_signed_in_to(self):
+        """Nothing writes to the vault, so every T2 call goes out logged out.
+
+        The text may offer the stored session CONDITIONALLY.  It may not
+        state as fact that the call rides one.
+        """
+        offenders = []
+        for name, (desc, doc) in sorted(self._t2_text().items()):
+            blob = (desc + '\n' + doc).lower()
+            for claim in self.SIGNED_IN_CLAIMS:
+                if claim.lower() in blob:
+                    offenders.append('%s says %r' % (name, claim))
+        self.assertEqual(
+            [], offenders,
+            'A T2 tool tells the model it has the person\'s signed-in '
+            'session. It does not: AccountVault.add has no production '
+            'caller, so the vault is empty and every call is the public '
+            'view or a login wall. Offenders: %s' % offenders)
+
+    def test_search_platform_names_the_mechanism_production_returns(self):
+        """Enumerating only the two authenticated values hides the real one."""
+        desc, doc = self._t2_text()['Search_Platform']
+        blob = desc + '\n' + doc
+        self.assertIn(
+            'logged_out_public', blob,
+            "Search_Platform's text lists connection_mechanism values but "
+            'not logged_out_public, which is the value every call returns '
+            'today. The model is told to expect a value it will never see.')
+        self.assertIn(
+            'authenticated', blob,
+            "Search_Platform's text must name the 'authenticated' field, "
+            'which is how the model knows whether the read was the public '
+            "view or the person's own.")
+
+    def test_post_as_user_text_does_not_promise_that_the_post_happens(self):
+        """dry_run=False has no write path: it returns the text unsent."""
+        desc, doc = self._t2_text()['Post_As_User']
+        low = (desc + '\n' + doc).lower()
+        for promise in ('actually posts', 'the actual post happens'):
+            self.assertNotIn(
+                promise, low,
+                'Post_As_User tells the model that dry_run=False posts. No '
+                'per-platform write path exists, so it returns success '
+                'False with the text back under "content" and nothing is '
+                'sent anywhere. Offending wording: %r' % promise)
+        says_it_cannot = any(s in low for s in (
+            'cannot post', 'cannot send', 'nothing was posted',
+            'does not post', 'unsent'))
+        self.assertTrue(
+            says_it_cannot,
+            'Post_As_User must tell the model, before it calls, that this '
+            'build cannot send the post -- otherwise the model offers to '
+            'post, calls with dry_run=False, and has to explain the refusal '
+            'afterwards.')
+
+
+class TestTheLabelFollowsHowAccessHappened(unittest.TestCase):
+    """Review of 2026-11-13, must-fixes F1/F2/F3: the first fix labelled the
+    result by the WRONG fact.
+
+    ``fetch_with_session`` keyed its relabel off "the vault is empty".  But
+    under ``HEVOLVE_BROWSER_USE_B2`` the crawler attaches over CDP to the
+    person's OWN Chrome and reads their own profile, so an empty vault still
+    returns a genuinely signed-in page.  The fix relabelled that
+    ``logged_out_public``, with ``authenticated`` False and a notice denying
+    it was their feed, and the AUDIT LOG recorded the same -- understating
+    the one access path that drives the person's browser.  Only the crawler
+    knows how it reached the page, so the label must follow that, not the
+    vault.
+    """
+
+    def _dispatch(self, tmp, mechanism, rows=(), handle='@me'):
+        """Search_Platform against a crawler that reports ``mechanism``.
+
+        ``rows`` are (handle, cookies) pairs seeded into the vault.  Returns
+        (result, audit_path, sent), where ``sent`` captures the cookies the
+        crawler was actually handed.
+        """
+        from integrations.browser_research import vault, tools
+        from integrations.browser_research.vault import Account
+        audit_path = os.path.join(tmp, 'audit.log')
+        v = vault.reset_vault_for_tests(path=audit_path + '.vault.enc')
+        for row_handle, row_cookies in rows:
+            v.add(Account(platform='twitter', handle=row_handle,
+                          cookies=row_cookies, capabilities={'read'}))
+        sent = {}
+
+        def fake_crawler(url, cookies=None, timeout=30, cdp_endpoint=None, **_):
+            sent['cookies'] = cookies
+            return {'success': True, 'url': url, 'markdown': 'body',
+                    'connection_mechanism': mechanism}
+
+        with patch('integrations.browser_research.audit._log_path',
+                   return_value=audit_path):
+            with patch('integrations.web_crawler.crawl_url_with_cookies',
+                       side_effect=fake_crawler):
+                result = tools.dispatch(
+                    tool='Search_Platform', user_id='u1',
+                    platform='twitter', query='ai news', handle=handle,
+                    consent_check=lambda uid, scope: True,
+                )
+        return result, audit_path, sent
+
+    # ---------------- F1: a real session must not be denied ----------------
+
+    def test_their_own_chrome_over_cdp_is_their_session(self):
+        """B2 attach with an EMPTY vault is still the person's signed-in page."""
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _, _ = self._dispatch(tmp, 'obscura_b2_cdp_user_chrome')
+        self.assertEqual(
+            result['connection_mechanism'], 'obscura_b2_cdp_user_chrome',
+            'the crawler attached to the person own Chrome; relabelling that '
+            'logged_out_public tells the agent and the audit log that their '
+            'own browser was not their own browser')
+        self.assertTrue(
+            result['authenticated'],
+            'cookies on the wire are not the only way to be signed in: the '
+            'attached profile carries the session')
+        self.assertNotIn(
+            'notice', result,
+            'the notice denies this is their feed, which is false here')
+
+    def test_the_audit_log_does_not_understate_the_cdp_path(self):
+        """The audit is the record of HOW access happened; it must not lie."""
+        from integrations.browser_research import audit
+        with tempfile.TemporaryDirectory() as tmp:
+            _, audit_path, _ = self._dispatch(tmp, 'obscura_b2_cdp_user_chrome')
+            with patch('integrations.browser_research.audit._log_path',
+                       return_value=audit_path):
+                records = audit.read_recent(limit=10)
+        self.assertEqual(
+            records[-1]['connection_mechanism'], 'obscura_b2_cdp_user_chrome',
+            'the audit log recorded logged_out_public for a read that drove '
+            'the person own Chrome')
+
+    def test_plain_http_keeps_its_own_label(self):
+        """public_http already says no browser and no auth; keep it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _, _ = self._dispatch(tmp, 'public_http')
+        self.assertEqual(
+            result['connection_mechanism'], 'public_http',
+            'overwriting public_http with logged_out_public loses which path '
+            'ran, so the audit log says less than the crawler already knew')
+        self.assertFalse(result['authenticated'])
+        self.assertIn('notice', result)
+
+    # ---------------- F3: the no-handle branch is the default --------------
+
+    def test_no_handle_takes_the_first_row_that_has_cookies(self):
+        """``handle`` omitted is what both read tools pass; it had no test.
+
+        A row with an empty cookie list must be skipped rather than counted,
+        and the handle reported must be the one whose cookies went out.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _, sent = self._dispatch(
+                tmp, 'obscura_b1_headless_profile',
+                rows=(('@a', []),
+                      ('@b', [{'name': 'auth_token', 'value': 'B'}])),
+                handle=None)
+        self.assertTrue(
+            result['authenticated'],
+            'a stored session exists under @b, so the read is authenticated')
+        self.assertEqual(
+            result['handle'], '@b',
+            'the handle reported must be whose cookies were sent, not the '
+            'first row in the vault')
+        self.assertEqual(
+            [c['value'] for c in (sent['cookies'] or [])], ['B'],
+            'the cookieless @a row must be skipped, not sent as a session')
+
+    # ---------------- F2: a refusal the pipeline can read ------------------
+
+    def test_the_unsent_post_reads_as_a_failed_call(self):
+        """Nothing was posted has to BE a failure, not merely say so.
+
+        The reply is read by core.constants.tool_reply_failed, which the
+        CREATE trace banker and the REUSE credit gates use to decide whether
+        a call did any work.  A prose-only 'error' leaves status unset, so a
+        post that was never sent banked as a completed recipe step.
+        """
+        import json
+        from core.constants import tool_reply_failed
+        from core.tool_refusal import refusal_has_hint
+        from integrations.browser_research import tools
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch('integrations.browser_research.audit._log_path',
+                       return_value=os.path.join(tmp, 'a.log')):
+                result = tools.dispatch(
+                    tool='Post_As_User', user_id='u1',
+                    platform='twitter', content='hello', dry_run=False,
+                    consent_check=lambda uid, scope: True,
+                )
+        reply = json.dumps(result, ensure_ascii=False)
+        self.assertTrue(
+            tool_reply_failed(reply),
+            'the pipeline reads this unsent post as a SUCCESSFUL call, so '
+            'the banker credits work that never happened')
+        self.assertTrue(
+            refusal_has_hint(reply),
+            'owner rule 11-09: a refusal says what was wrong and how to fix '
+            'it, and the framework has to be able to see that it does')
+        self.assertEqual(
+            result['content'], 'hello',
+            'the person text must come back so they can post it themselves')
+
 if __name__ == '__main__':
     unittest.main()

@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import threading
+import time
 from datetime import datetime, timezone
 from typing import Dict, Optional, Any
 from core.constants import (AGENT_MENTIONS, BOOKKEEPING_TOOLS,
@@ -29,13 +30,55 @@ logger = logging.getLogger(__name__)
 # Lock protecting _ledger_registry and action_states (accessed by multiple Waitress/Gunicorn threads)
 _state_lock = threading.RLock()
 
+#: How long a miss with nothing in progress is remembered, so the hooks that
+#: read the registry on every state change of a session that owns no ledger
+#: do not read the folder each time.  register_ledger_for_session forgets it.
+_MISS_MEMORY_SECONDS = 30.0
+_recent_misses = {}            # (user_prompt, ledger folder) -> monotonic time
+_recent_misses_lock = threading.Lock()
+
+
 def _load_ledger_on_miss(user_prompt: str) -> Optional[Any]:
-    """Cache-miss loader: recover ledger from persistent storage."""
+    """Cache-miss loader: reopen the person's session from disk when it is
+    their newest session of this agent and is still in progress; else None.
+
+    A miss knows only '<user>_<prompt>', not the flow or the build that
+    create_ledger_from_actions scopes its resume by.  A build or flow change
+    mints a new session there, so the newest session is the current one and
+    an older one still in progress is another build's or flow's: reopening
+    it would write this turn's states into its steps (review of b48cd6693,
+    must-fix 1: an older build's session reopened while the current build's
+    was done).  Only this person's files of this agent are read, not the
+    whole folder, and a miss with nothing in progress is remembered for
+    _MISS_MEMORY_SECONDS (must-fix 2: a miss parsed all 3,074 ledgers inside
+    the registry's lock, every time).  The read stays under the registry's
+    lock: TTLCache.forget_everywhere relies on that ordering, and the read is
+    one listing plus the person's own files.
+
+    It used to call get_or_create_ledger(user_id, prompt_id) positionally (a
+    key nothing saves), so a miss handed back a new empty ledger that the
+    registry then served as the person's for 8 hours.
+    """
     try:
-        from agent_ledger.factory import get_or_create_ledger
+        from agent_ledger.core import (
+            SmartLedger, _find_resumable_session, default_ledger_dir)
         user_id, prompt_id = _extract_ownership_from_prompt(user_prompt)
-        if user_id and prompt_id:
-            return get_or_create_ledger(user_id, prompt_id)
+        if not (user_id and prompt_id):
+            return None
+        memo_key = (user_prompt, default_ledger_dir())
+        now = time.monotonic()
+        with _recent_misses_lock:
+            missed_at = _recent_misses.get(memo_key)
+            if missed_at is not None and now - missed_at < _MISS_MEMORY_SECONDS:
+                return None
+        session_id = _find_resumable_session(str(prompt_id), user_id,
+                                             newest_only=True)
+        if session_id is not None:
+            return SmartLedger(str(prompt_id), session_id)
+        with _recent_misses_lock:
+            _recent_misses[memo_key] = now
+            if len(_recent_misses) > 10000:
+                _recent_misses.clear()
     except Exception:
         pass
     return None
@@ -48,6 +91,9 @@ _ledger_registry = TTLCache(
 
 def register_ledger_for_session(user_prompt: str, ledger: Any):
     """Register a ledger instance for a session to enable auto-sync."""
+    with _recent_misses_lock:
+        for memo_key in [k for k in _recent_misses if k[0] == user_prompt]:
+            del _recent_misses[memo_key]
     with _state_lock:
         _ledger_registry[user_prompt] = ledger
     logger.debug(f"Registered ledger for {user_prompt}")
@@ -2245,8 +2291,9 @@ def window_asked(messages, action_id, answers=()) -> bool:
 
 def window_question(messages, action_id, answers=()):
     """The open question window_asked finds, as (message index, the text
-    sent), or None.  The one scan: window_asked reads it, and
-    step_open_question reads the request it went out in."""
+    sent), or None.  The one scan: window_asked reads it, and a background
+    step that asked hands this text to its goal's person (Part B,
+    hand_goal_to_its_person)."""
     names = tool_call_names([messages or []])
     answers = [_answer_and_request(answer) for answer in (answers or ())]
     # The requests whose answers were posted after the point the scan has
@@ -2289,6 +2336,46 @@ def window_question(messages, action_id, answers=()):
                        for request in answered_in):
                     return None
                 return index, str(sent_text(messages, call_id) or '')
+    return None
+
+
+def hand_goal_to_its_person(goal_id, user_prompt, prompt_id, action_id,
+                            action_text, reason, flow, ask=None):
+    """Park a background goal whose step stopped for a person and tell that
+    person, through GoalManager.escalate_goal: the one hand-off for CREATE
+    (create_recipe._ask_for_help) and REUSE (a background step that asked,
+    Part B), so both write one record shape.  ``ask`` is the question the
+    step put out; it selects the person directly (the owner's 2026-10-31
+    ruling: a background step's question goes to the goal's owner) instead
+    of the expert model first.  Returns the stage ('expert' or 'human'), or
+    None when there is no goal to park or the hand-off failed (logged)."""
+    if not goal_id:
+        return None
+    record = {
+        'action_id': int(action_id),
+        'action': str(action_text or '')[:500],
+        'reason': reason,
+        'tried': ['local'],
+        # So the daemon can tell whether the expert's turn banked this
+        # action (#106d).
+        'user_prompt': user_prompt,
+        'prompt_id': prompt_id,
+        'flow': flow,
+    }
+    if ask is not None:
+        record['ask'] = str(ask)
+    try:
+        from integrations.agent_engine.goal_manager import GoalManager
+        from integrations.social.models import db_session
+        with db_session(commit=True) as _db:
+            handed = GoalManager.escalate_goal(_db, goal_id, record)
+            if handed.get('success'):
+                return handed.get('stage') or 'human'
+            logger.warning("goal %s: the hand-off for action %s was refused: %s",
+                           goal_id, action_id, handed.get('error'))
+    except Exception:
+        logger.warning("goal %s: could not hand action %s on", goal_id,
+                       action_id, exc_info=True)
     return None
 
 

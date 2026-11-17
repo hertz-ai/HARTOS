@@ -50,6 +50,13 @@ ALIASES: tuple = (
     # the door's payment, draft and game-sound branches
     # (commerce.approvals.approver_from_request).
     Alias('POST', CLOUD, '/api/agent/approval', '/api/agent/approval'),
+    # The phone's camera frames (Android DesktopCameraFrames, desktop-only,
+    # one frame in 2 s): the desktop keeps each in its own frame store for
+    # captions (Nunba routes/chatbot_routes.py vision_frame_ingest: JPEG
+    # body, user_id and channel in the query, 204).  The cloud has no such
+    # route, so a frame this desktop does not take goes to the phone's vision
+    # WebSocket instead.  A frame is stale in seconds: the phone waits 5.
+    Alias('POST', CLOUD, '/api/vision/frame', '/api/vision/frame', 5),
 )
 
 

@@ -36,12 +36,16 @@ def get_frame(monkeypatch):
     """The entry's get_frame, an empty FrameStore behind it, no Redis, and a
     grab() that records each call and returns a small image."""
     from integrations.vision.frame_store import FrameStore
+    return _lifted_get_frame(monkeypatch, FrameStore())
+
+
+def _lifted_get_frame(monkeypatch, store):
+    """(the entry's get_frame reading ``store``, the list of grab() calls)."""
     with open(_ENTRY, encoding='utf-8') as f:
         tree = ast.parse(f.read())
     nodes = [n for n in tree.body
              if isinstance(n, ast.FunctionDef) and n.name == 'get_frame']
     assert len(nodes) == 1
-    store = FrameStore()
     grabs = []
 
     class _Shot:
@@ -88,4 +92,54 @@ def test_with_the_screen_allowed_the_fallback_still_grabs(get_frame, gate):
     fn, grabs = get_frame
     frame = fn('u1')
     assert frame is not None and frame.shape == (4, 4, 3)
+    assert grabs == [1]
+
+
+# ─── A camera that stopped is not answered from the screen ───
+#
+# Review of a7d79664d (measured): once the store refused a stopped camera's
+# old frame (the frame age limit), get_frame fell through to the screenshot
+# below it, so Visual_Context_Camera answered a camera question from the
+# desktop, under no screen-capture consent.
+
+def _jpeg():
+    cv2 = pytest.importorskip('cv2')
+    ok, buf = cv2.imencode('.jpg', np.full((8, 8, 3), 120, dtype=np.uint8))
+    assert ok
+    return buf.tobytes()
+
+
+@pytest.fixture
+def camera(monkeypatch):
+    """(get_frame, grabs, store) over a store whose frames age out at 50 ms."""
+    from integrations.vision.frame_store import FrameStore
+    store = FrameStore(frame_ttl=0.05)
+    fn, grabs = _lifted_get_frame(monkeypatch, store)
+    return fn, grabs, store
+
+
+def test_a_stopped_camera_is_not_answered_from_the_screen(camera, gate):
+    import time
+    fn, grabs, store = camera
+    store.put_frame('u1', _jpeg(), source='ws:test')
+    time.sleep(0.12)
+    assert fn('u1') is None, 'a stopped camera was answered with something else'
+    assert grabs == [], 'the desktop was grabbed for a camera question'
+
+
+def test_a_streaming_camera_is_answered_from_its_frame(camera, gate):
+    fn, grabs, store = camera
+    store.put_frame('u1', _jpeg(), source='ws:test')
+    frame = fn('u1')
+    assert frame is not None and frame.shape == (8, 8, 3)
+    assert grabs == []
+
+
+def test_another_persons_stopped_camera_leaves_this_fallback_alone(camera, gate):
+    """Only the asking person's own camera counts as stopped."""
+    import time
+    fn, grabs, store = camera
+    store.put_frame('u2', _jpeg(), source='ws:test')
+    time.sleep(0.12)
+    assert fn('u1') is not None
     assert grabs == [1]

@@ -158,6 +158,9 @@ class VisionService:
         self._minicpm_port = int(os.environ.get('HEVOLVE_MINICPM_PORT', minicpm_port or get_port('vision')))
         self._ws_port = int(os.environ.get('VISION_WS_PORT', ws_port or get_port('websocket')))
         self._description_interval = description_interval
+        # What start() goes back to before settling again (_settle_interval).
+        self._configured_interval = description_interval
+        self._describe_times: List[float] = []
         self._max_interval = max_description_interval
         self._min_scene_change = min_scene_change
         self.store = frame_store or FrameStore()
@@ -220,6 +223,12 @@ class VisionService:
         if mode == 'headless':
             logger.info("VisionService started in headless mode (FrameStore only)")
             return
+
+        # Settled once per start (_settle_interval): a restart may run on
+        # another backend, so it measures again from the configured interval.
+        # Headless describes nothing, so only a describing start resets it.
+        self._describe_times = []
+        self._description_interval = self._configured_interval
 
         if mode == 'lite':
             # Use lightweight CPU backend instead of MiniCPM sidecar
@@ -352,7 +361,7 @@ class VisionService:
         def _put(jpeg):
             owner = state['owner']
             if owner:
-                self.store.put_screen_frame(owner, jpeg)
+                self.store.put_screen_frame(owner, jpeg, source='desktop-capture')
 
         def _grab():
             if state['capture'] is None:
@@ -583,10 +592,47 @@ class VisionService:
             self._last_describe_time[key] = now
             return True
         else:
-            # Static — back off (×1.5, capped)
-            self._user_intervals[key] = min(interval * 1.5, self._max_interval)
+            # Static: nothing to describe, and the next look comes after the
+            # SAME interval (owner 2026-11-10: sampling is deterministic for
+            # a machine; the x1.5 back-off to max_description_interval made
+            # "how soon is a change described" anything from 4 s to 30 s).
+            # Skipping costs a decode and a difference, never a describe.
+            self._user_intervals[key] = interval
             self._last_describe_time[key] = now
             return False
+
+    #: The interval is settled once per start from this many describe times
+    #: (the first is the model loading; the middle one is the machine).
+    _SETTLE_AFTER = 5
+    #: A describe must fit this many times into the interval.
+    _SETTLE_FACTOR = 4.0
+
+    def _settle_interval(self, describe_seconds: float) -> None:
+        """Fix the description interval for this machine: after the first
+        _SETTLE_AFTER describes, the interval is the larger of the configured
+        one and _SETTLE_FACTOR times the middle describe time, and it stays
+        there (owner 2026-11-10: the hardware does not change between
+        seconds, so the sampling rate must not either).  A fast backend keeps
+        the configured interval; a slow one gets a longer, fixed one, never
+        past max_description_interval (review of a7d79664d: a 10 s describe
+        settled at 42 s, over the 30 s the constructor promises).  Only
+        describes that produced a caption are counted (the caller's rule)."""
+        times = self._describe_times
+        if len(times) >= self._SETTLE_AFTER:
+            return
+        times.append(describe_seconds)
+        if len(times) < self._SETTLE_AFTER:
+            return
+        middle = sorted(times)[len(times) // 2]
+        settled = min(self._max_interval,
+                      max(self._description_interval, self._SETTLE_FACTOR * middle))
+        if settled != self._description_interval:
+            logger.info(
+                f"Description interval settled at {settled:.1f} s "
+                f"(describe takes {middle:.2f} s on this machine)")
+        self._description_interval = settled
+        for key in list(self._user_intervals):
+            self._user_intervals[key] = settled
 
     # ─── Visual Triggers ───
 
@@ -766,16 +812,38 @@ class VisionService:
             2. Client sends "video_start" (camera, default) or "screen_start"
             3. Client sends binary JPEG frames
             4. Client sends "video_stop" to end
+
+        One camera per person: while the person's phone streams its camera
+        here (FrameStore.phone_camera_live), this socket's camera frames are
+        dropped and the client is told "video_pause" once, so the page frees
+        this desktop's camera for other apps (a Zoom call) and its frames do
+        not take turns with the phone's in the captions.  A paused client
+        sends "video_paused" every few seconds; once the phone has stopped it
+        is told "video_resume" and takes the camera back (owner 2026-11-13).
         """
         import cv2
 
-        _CONTROL_MESSAGES = {'screen_start', 'video_start', 'video_stop'}
+        _CONTROL_MESSAGES = {'screen_start', 'video_start', 'video_stop',
+                             'video_paused'}
 
         user_id = None
         channel = 'camera'  # default channel
+        paused = False      # this client was told to free its camera
         try:
             async for message in websocket:
                 if isinstance(message, bytes):
+                    if user_id and channel == 'camera':
+                        if self.store.phone_camera_live(user_id):
+                            if not paused:
+                                paused = True
+                                logger.info(
+                                    f"Phone camera live for user {user_id}: "
+                                    f"this client frees its camera")
+                                await websocket.send('video_pause')
+                            continue
+                        if paused:
+                            paused = False
+                            await websocket.send('video_resume')
                     frame = cv2.imdecode(
                         np.frombuffer(message, np.uint8), cv2.IMREAD_COLOR,
                     )
@@ -785,10 +853,15 @@ class VisionService:
                         )
                         _, encoded = cv2.imencode('.jpg', frame)
                         jpeg_bytes = encoded.tobytes()
+                        # Who sent it: this socket, by the peer's address.
+                        sender = 'ws:%s' % (
+                            ':'.join(str(p) for p in (
+                                getattr(websocket, 'remote_address', None) or ())[:2])
+                            or 'unknown')
                         if channel == 'screen':
-                            self.store.put_screen_frame(user_id, jpeg_bytes)
+                            self.store.put_screen_frame(user_id, jpeg_bytes, source=sender)
                         else:
-                            self.store.put_frame(user_id, jpeg_bytes)
+                            self.store.put_frame(user_id, jpeg_bytes, source=sender)
                 elif isinstance(message, str):
                     # First string message is always the user_id, whatever
                     # its format — SPA clients (Demopage.js,
@@ -804,6 +877,13 @@ class VisionService:
                         logger.info(f"User {user_id} switched to screen channel")
                     elif message == 'video_start':
                         channel = 'camera'
+                    elif message == 'video_paused':
+                        if user_id and not self.store.phone_camera_live(user_id):
+                            paused = False
+                            logger.info(
+                                f"Phone camera stopped for user {user_id}: "
+                                f"this client takes its camera back")
+                            await websocket.send('video_resume')
                     elif message == 'video_stop':
                         break
         except Exception as e:
@@ -836,8 +916,11 @@ class VisionService:
                     if not self._running:
                         return
 
-                    # Camera channel
-                    frame_bytes = self.store.get_frame(user_id)
+                    # Camera channel.  The frame and who sent it are read
+                    # together: read after the describe, the sender was
+                    # whoever had sent a frame since (review of a7d79664d).
+                    got = self.store.latest(user_id, 'camera')
+                    frame_bytes, cam_sender = got if got else (None, None)
                     logger.info(
                         f"Description loop tick: user={user_id} "
                         f"cam_frame={'yes' if frame_bytes else 'no'} "
@@ -851,13 +934,19 @@ class VisionService:
                             _t0 = time.monotonic()
                             desc = self._describe_frame(user_id, frame_bytes)
                             _elapsed_ms = int((time.monotonic() - _t0) * 1000)
+                            if desc:
+                                # Only a describe that captioned says how
+                                # long this machine takes; a timeout does not.
+                                self._settle_interval(_elapsed_ms / 1000.0)
                             logger.info(
                                 f"Camera describe: {len(frame_bytes)}B → "
                                 f"{len(desc or '')} chars in {_elapsed_ms} ms"
                             )
                             if desc:
                                 self.store.put_description(user_id, desc)
-                                self._post_description_to_db(user_id, desc)
+                                self._post_description_to_db(
+                                    user_id, desc,
+                                    source=self._caption_source('camera', cam_sender))
                                 self._record_to_world_model(user_id, desc, 'camera', frame_bytes)
                                 self._save_to_memory_graph(user_id, desc, 'camera')
                                 self._emit_perception_event(user_id, desc, 'camera')
@@ -868,8 +957,9 @@ class VisionService:
                         else:
                             self._frames_skipped += 1
 
-                    # Screen channel
-                    screen_bytes = self.store.get_screen_frame(user_id)
+                    # Screen channel (frame and sender read together, as above)
+                    got = self.store.latest(user_id, 'screen')
+                    screen_bytes, screen_sender = got if got else (None, None)
                     if screen_bytes:
                         if self._should_describe(user_id, screen_bytes, 'screen'):
                             desc = self._describe_frame(
@@ -882,6 +972,7 @@ class VisionService:
                                     user_id, desc,
                                     label='Screen Context',
                                     zeroshot_label='Screen Reasoning',
+                                    source=self._caption_source('screen', screen_sender),
                                 )
                                 self._record_to_world_model(user_id, desc, 'screen', screen_bytes)
                                 self._save_to_memory_graph(user_id, desc, 'screen')
@@ -947,24 +1038,38 @@ class VisionService:
         self, user_id: str, description: str,
         label: str = 'Visual Context',
         zeroshot_label: str = 'Video Reasoning',
+        source: Optional[str] = None,
     ):
-        """POST description to main server DB (/create_action pattern)."""
+        """POST description to main server DB (/create_action pattern).
+        ``source`` (see _caption_source) rides as one extra field: a server
+        that does not keep it ignores it."""
         if not self._callback_url:
             return
+        row = {
+            'user_id': user_id,
+            'conv_id': '0',
+            'action': description[:100],
+            'zeroshot_label': zeroshot_label,
+            'gpt3_label': label,
+        }
+        if source:
+            row['source'] = source
         try:
             pooled_post(
-                f'{self._callback_url}/create_action',
-                json={
-                    'user_id': user_id,
-                    'conv_id': '0',
-                    'action': description[:100],
-                    'zeroshot_label': zeroshot_label,
-                    'gpt3_label': label,
-                },
-                timeout=5,
+                f'{self._callback_url}/create_action', json=row, timeout=5,
             )
         except requests.RequestException:
             pass
+
+    @staticmethod
+    def _caption_source(channel: str, sent_by: Optional[str]) -> str:
+        """Where a caption's frame came from: '<channel>|<who sent it>', e.g.
+        'camera|ws:127.0.0.1:61167' or 'screen|desktop-capture'.  Kept on the
+        caption row so a reader can tell a child's camera from a screen grab
+        or from a frame filed by something else (owner 2026-11-10).
+        ``sent_by`` is the sender the store returned WITH the frame
+        (FrameStore.latest)."""
+        return f"{channel}|{sent_by if isinstance(sent_by, str) and sent_by else FrameStore.UNSTATED}"
 
     # ─── World Model Integration ───
 

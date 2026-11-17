@@ -813,3 +813,70 @@ def test_a_journey_tick_sends_only_its_nurture_prospects_steps(channels, store, 
     journey_daemon_tick()
 
     assert email.emails == []
+
+
+# ── no sender at all (#280) ────────────────────────────────────────
+
+@pytest.fixture
+def mailer_down(monkeypatch):
+    """The mailer fallback cannot be reached: central, 2026-11-12, posted
+    to the default http://localhost:4000 inside its container."""
+    from core import http_pool
+
+    def _refused(*a, **k):
+        raise ConnectionError('[Errno 111] Connection refused')
+    monkeypatch.setattr(http_pool, 'pooled_post', _refused)
+
+
+class _BrokenEmailChannel(_EmailChannel):
+    """A connected email channel whose send raises (a dropped SMTP link)."""
+
+    async def send_email(self, *a, **k):
+        raise RuntimeError('smtp connection dropped')
+
+
+def test_with_no_sender_the_refusal_says_what_the_owner_sets_up(channels, store, mailer_down, monkeypatch):
+    """FAILS BEFORE #280: with no email channel and the mailer unreachable
+    the agent read only the HTTP client's 'Connection refused', so it
+    neither knew why nor what anyone could do about it."""
+    _seed(store)
+
+    out = json.loads(_tools(store, monkeypatch)['send_outreach_email'](
+        'p1', 'your shop on mcgroce', '<p>hello Ana</p>'))
+
+    assert out['success'] is False and out['sent'] is False
+    assert out['prospect_stage'] == 'new'
+    assert 'no email channel is connected' in out['error']
+    assert store.EMAIL_SERVICE_URL in out['error']
+    assert store.NO_EMAIL_SENDER_FIX in out['error']
+    p = store._load_prospects()['prospects']['p1']
+    assert (p['stage'], p['emails_sent']) == ('new', 0)
+
+
+def test_a_follow_up_refused_for_want_of_a_sender_keeps_the_fix(channels, store, mailer_down):
+    """The follow-up checker keeps the same answer on the step, so a later
+    list of the sequence still says what the owner sets up."""
+    _due_sequence(store)
+
+    store.check_pending_followups_daemon()
+
+    step = store._load_prospects()['sequences']['s1']['steps'][0]
+    assert step['status'] != 'sent'
+    assert step['last_error'].startswith('no email channel is connected')
+    assert store.NO_EMAIL_SENDER_FIX in step['last_error']
+
+
+def test_a_connected_channel_that_fails_is_not_called_no_sender(channels, store, mailer_down, monkeypatch):
+    """A channel IS connected and its send raised: saying 'no email channel
+    is connected' would send the owner to set up what already exists."""
+    channels.registry.register(_BrokenEmailChannel())
+    _seed(store)
+
+    out = json.loads(_tools(store, monkeypatch)['send_outreach_email'](
+        'p1', 'your shop on mcgroce', '<p>hello Ana</p>'))
+
+    assert out['success'] is False
+    assert 'no email channel is connected' not in out['error']
+    # getattr: on the commit before #280 this guard passes by behaviour too,
+    # not by a missing name.
+    assert getattr(store, 'NO_EMAIL_SENDER_FIX', 'owner sets up a sender') not in out['error']

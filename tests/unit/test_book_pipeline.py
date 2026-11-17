@@ -450,6 +450,51 @@ class TestFailures:
         assert 'Acceleration is the rate of change of velocity.' in result['whole_text']
         assert bp.list_books('42') == []
 
+    def test_a_book_with_nowhere_to_store_it_leaves_no_pages_behind(
+            self, book_node, tmp_path, monkeypatch):
+        """_read_unstored's claim: the page images of a book that cannot be
+        stored "go to a scratch dir, for the vision model only, and are
+        removed after".
+
+        Neither half was held. The one test on this path -- the one above --
+        asserts the text and an empty library and never looks at a file, so a
+        read that left its pages in %TEMP%, or wrote them into the uploads
+        tree where they are served at a guessable URL, passed every test in
+        this file. The route is not exotic: an ordinary refusal reaches it,
+        a reader id the column cannot hold, and on a real node those pages
+        are the person's own document.
+
+        The render count is asserted FIRST because every assertion after it
+        is satisfied by a pipeline that never made an image at all.
+        """
+        import tempfile
+
+        systemp = tmp_path / 'systemp'
+        systemp.mkdir()
+        monkeypatch.setattr(tempfile, 'tempdir', str(systemp))
+
+        rendered, real_write_jpeg = [], bp._write_jpeg
+
+        def recording(image, out_path):
+            written = real_write_jpeg(image, out_path)
+            rendered.append(Path(written))
+            return written
+
+        monkeypatch.setattr(bp, '_write_jpeg', recording)
+
+        result = bp.parse_book(make_pdf(tmp_path / 'book.pdf'),
+                               'u' * (READER_ID_CHARS + 1))
+
+        assert result['stored'] is False
+        assert len(rendered) == 3, rendered          # it really did render
+        for page in rendered:
+            assert systemp in page.parents, page     # the scratch dir, not uploads
+            assert not page.exists(), f'{page.name} outlived the read'
+        assert list(systemp.iterdir()) == [], 'the scratch dir itself was left'
+        # And not ALSO into the served tree: a read that renders to the
+        # scratch dir and copies into uploads satisfies every line above.
+        assert not (bp.uploads_dir() / 'pdf_parse').exists()
+
     def _db_error(self, statement, params, message='disk I/O error'):
         """A real SQLAlchemy failure: str() renders the statement and the
         parameters into it, which is the whole of this defect."""
