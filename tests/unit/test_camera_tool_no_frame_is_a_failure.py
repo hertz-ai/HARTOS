@@ -117,6 +117,16 @@ def _camera_tool(ctx):
     raise AssertionError('get_user_camera_inp was not built by the factory')
 
 
+def _on_the_persons_turn(request_id, fn, *args):
+    """The camera tool answers only inside a person's own turn: the turn id
+    with_llm_context binds around chat_agent / recipe()
+    (core.llm_outbound_logger.request_id_context; HARTOS camera gate,
+    2026-11-11)."""
+    from core.llm_outbound_logger import request_id_context
+    with request_id_context(request_id):
+        return fn(*args)
+
+
 # ---------------------------------------------------------------------------
 # No frame
 # ---------------------------------------------------------------------------
@@ -142,7 +152,7 @@ def test_through_the_tool_wrapper_it_is_a_failed_call(helper, caplog):
     _desc, tool = _camera_tool(_ctx(helper))
     with patch.object(helper, 'redis_client') as rc:
         rc.get.side_effect = _refused()
-        reply = tool(NON_VISUAL_QUESTION)
+        reply = _on_the_persons_turn('r-1', tool, NON_VISUAL_QUESTION)
 
     assert reply != OLD_SENTENCE
     assert tool_reply_failed(reply), reply

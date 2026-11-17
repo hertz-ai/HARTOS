@@ -258,6 +258,16 @@ def test_the_media_catalogue_teaches_src_the_source_the_overlay_plays(svc):
     assert [i['path'] for i in issues if i['code'] == 'unknown_prop'] == ['url']
 
 
+def test_the_file_request_catalogue_names_the_purposes_the_store_keeps(svc):
+    # The line a model reads for file_request listed the purposes by hand; it
+    # is read from the store, so the catalogue and the store cannot disagree.
+    from core.user_file_store import INBOUND_PURPOSES
+    line = svc.component_prompt(['file_request'])
+    assert [p for p in INBOUND_PURPOSES if p not in line] == []
+    schema = svc.component_json_schema('file_request')
+    assert [p for p in INBOUND_PURPOSES if p not in schema['description']] == []
+
+
 # ── agent_ui_compose: a verdict the model can read ─────────────────────────
 
 def test_a_good_push_is_ok_valid_and_stored(svc):

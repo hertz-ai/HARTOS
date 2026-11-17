@@ -281,13 +281,33 @@ def build_identity_prompt(agent_config: Optional[dict] = None,
         # path (this branch now runs for real — load_agent_config feeds it).
         if not isinstance(personality, dict):
             personality = {}
-        agent_name = agent_config.get('name', '')
         agent_goal = agent_config.get('goal', '')
+        # One spoken name for the agent on every path: the name CREATE and
+        # REUSE say (core.agent_personality.spoken_name), read from the same
+        # saved personality file they read, with the agent's id.  Both
+        # branches below say it; the raw config name was said here before,
+        # so a casual turn named the agent differently from its REUSE turn
+        # for 338 of 519 agents, "Agent <id>" for 427 (review of f3db01f44).
+        # The config's own 'personality' dict (48 of 1238 configs) is read
+        # only when the agent has no saved file.
+        from core.agent_personality import load_personality, spoken_greeting, spoken_name
+        _aid = str(agent_config.get('prompt_id', '') or '')
+        try:
+            _saved = load_personality(_aid) if _aid else None
+        except Exception:
+            _saved = None
+        if _saved is not None:
+            _who = _saved
+        else:
+            _who = dict(personality)
+            _who.setdefault('agent_name', agent_config.get('agent_name', ''))
+        display = agent_config.get('name', '')
+        agent_name = spoken_name(_who, display, _aid)
 
         if personality:
             traits = personality.get('primary_traits', [])
             tone = personality.get('tone', 'warm-casual')
-            greeting = personality.get('greeting_style', '')
+            greeting = spoken_greeting(_who, display, _aid)
 
             parts.append(
                 f"\nYour name is {agent_name}. Your purpose: {agent_goal}."

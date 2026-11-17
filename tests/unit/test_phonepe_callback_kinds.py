@@ -181,6 +181,26 @@ def test_a_tier_bump_that_raises_is_one_record_and_the_payment_waits(ctx, key_db
     assert key_db.key() == _tier('free')
 
 
+def test_a_tier_bump_written_before_the_database_went_completes(ctx, key_db):
+    """The status check confirmed the money and the tier write COMMITTED;
+    the database then went away before the key row was read back.  The key
+    holds the bought tier, so the payment completes and PhonePe is answered
+    200: no ERROR line asks a person to bump what is bumped, and no 500 sends
+    PhonePe's retries into a bump that is done.  The read back shared the
+    write's try, so its failure was reported as a failed bump (task #214)."""
+    import logging
+    p = _processing(ctx['ledger'], {'kind': 'tier_upgrade', 'api_key_id': 'k1',
+                                    'target_tier': 'starter'})
+    log = logging.getLogger('hevolve_social')
+    with key_db.lost_after_next_commit(), patch.object(log, 'error') as said:
+        r = _callback(ctx['client'])
+    assert r.status_code == 200, r.get_json()
+    assert r.get_json()['status'] == 'completed' and r.get_json()['new_tier'] == 'starter'
+    said.assert_not_called()
+    assert ctx['ledger'].get_payment(p.payment_id).status == PaymentStatus.COMPLETED
+    assert key_db.key() == _tier('starter')
+
+
 def test_a_tier_upgrade_callback_never_lowers_the_key(ctx, key_db):
     """The PhonePe rail writes the tier through the same rule as the card
     rails: a confirmed payment for a cheaper tier completes (the money is

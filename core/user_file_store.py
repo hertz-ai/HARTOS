@@ -128,7 +128,9 @@ class UploadPurpose:
     a file goes ``after_use_s`` after a turn used it (mark_consumed), or
     ``unused_s`` after its upload if no turn did; None keeps it until it is
     deleted.  With ``newest_only`` the newest file of the purpose is kept and
-    any older one goes (a new logo replaces the old).
+    any older one goes (a new logo replaces the old).  ``use`` says in a few
+    words what the purpose is for: an agent asking for files reads it
+    (person_ask's ask_person tool) to pick the purpose.
     """
     name: str
     types: Mapping[str, str]
@@ -137,6 +139,7 @@ class UploadPurpose:
     after_use_s: Optional[int]
     unused_s: Optional[int]
     newest_only: bool = False
+    use: str = ''
 
 
 #: What a store's ``purposes`` argument may change (tests, operators).
@@ -164,17 +167,19 @@ PURPOSES = MappingProxyType({p.name: p for p in (
         REEL_SOURCE,
         MappingProxyType({'video/mp4': '.mp4', 'video/quicktime': '.mov',
                           'video/3gpp': '.3gp'}),
-        max_file=1 << 30, quota=5 << 30, after_use_s=24 * _HOUR, unused_s=72 * _HOUR),
+        max_file=1 << 30, quota=5 << 30, after_use_s=24 * _HOUR, unused_s=72 * _HOUR,
+        use='video clips to make a reel from'),
     UploadPurpose(
         LOGO,
         MappingProxyType({'image/png': '.png', 'image/jpeg': '.jpg', 'image/webp': '.webp'}),
         max_file=50 << 20, quota=200 << 20, after_use_s=None, unused_s=None,
-        newest_only=True),
+        newest_only=True, use='the brand image to put on what is made'),
     UploadPurpose(
         SONG_AUDIO,
         MappingProxyType({'audio/mpeg': '.mp3', 'audio/mp4': '.m4a', 'audio/aac': '.aac',
                           'audio/ogg': '.ogg', 'audio/wav': '.wav', 'audio/x-wav': '.wav'}),
-        max_file=200 << 20, quota=1 << 30, after_use_s=24 * _HOUR, unused_s=72 * _HOUR),
+        max_file=200 << 20, quota=1 << 30, after_use_s=24 * _HOUR, unused_s=72 * _HOUR,
+        use='a song to set a reel to'),
     UploadPurpose(
         CHAT_ATTACHMENT,
         MappingProxyType({
@@ -196,7 +201,9 @@ PURPOSES = MappingProxyType({p.name: p for p in (
             'video/mp4': '.mp4', 'video/quicktime': '.mov', 'video/3gpp': '.3gp',
             'video/webm': '.webm', 'video/x-matroska': '.mkv',
         }),
-        max_file=50 << 20, quota=500 << 20, after_use_s=None, unused_s=None),
+        max_file=50 << 20, quota=500 << 20, after_use_s=None, unused_s=None,
+        use=('any other file the person sends you: a photo, a document, a voice '
+             'note, audio or a video')),
 )})
 INBOUND_PURPOSES = tuple(PURPOSES)
 INBOUND_MIMES = MappingProxyType({p: frozenset(k.types) for p, k in PURPOSES.items()})

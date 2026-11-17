@@ -52,10 +52,22 @@ def bundled(monkeypatch):
     monkeypatch.setenv('NUNBA_BUNDLED', '1')
 
 
+#: Where a central node posts (core.config_cache.get_autogen_response_url,
+#: which has no default).
+BACKEND = 'http://backend.test/autogen_response'
+
+
+def _answered(status=200):
+    """The one transport's stand-in: core.http_pool.pooled_post_once."""
+    return MagicMock(name='pooled_post_once',
+                     return_value=SimpleNamespace(status_code=status, text=''))
+
+
 @pytest.fixture()
 def central(monkeypatch):
     monkeypatch.delenv('NUNBA_BUNDLED', raising=False)
     monkeypatch.delattr(sys, 'frozen', raising=False)
+    monkeypatch.setenv('AUTOGEN_RESPONSE_URL', BACKEND)
 
 
 def _published(pub):
@@ -114,8 +126,9 @@ def rr():
     return reuse_recipe
 
 
-def _reuse_send(rr, user_id, text):
-    with patch.object(rr, 'pooled_post') as post, \
+def _reuse_send(rr, user_id, text, post=None):
+    post = post or _answered()
+    with patch('core.http_pool.pooled_post_once', post), \
             patch.object(rr, 'scheduler') as sched:
         sched.get_job.return_value = None
         out = rr.send_message_to_user1(user_id, text, 'inp', 'p-9')
@@ -150,19 +163,23 @@ def test_reuse_on_central_still_forwards_over_http(rr, central, publisher):
 
 # ── CREATE: hartos.create_recipe.send_message_to_user1 (lifted) ────────
 
-def _lift_create_send():
+def _lift_create_send(post=None):
+    """CREATE's real function, lifted; each call runs with the one
+    transport (core.http_pool.pooled_post_once) replaced by ``post``."""
     path = os.path.join(_ROOT, 'hartos', 'create_recipe.py')
     src = open(path, encoding='utf-8').read()
     fn = next(n for n in ast.parse(src).body
               if isinstance(n, ast.FunctionDef)
               and n.name == 'send_message_to_user1')
-    post = MagicMock(name='pooled_post')
+    post = post or _answered()
     from core.config_cache import is_bundled
-    ns = {'json': json, 'pooled_post': post, 'request_id_list': {},
-          'is_bundled': is_bundled,
-          'current_app': SimpleNamespace(logger=MagicMock())}
+    ns = {'json': json, 'request_id_list': {}, 'is_bundled': is_bundled}
     exec(ast.get_source_segment(src, fn), ns)
-    return ns['send_message_to_user1'], post
+
+    def send(*args, **kwargs):
+        with patch('core.http_pool.pooled_post_once', post):
+            return ns['send_message_to_user1'](*args, **kwargs)
+    return send, post
 
 
 def test_create_on_the_desktop_publishes_through_the_same_publisher(

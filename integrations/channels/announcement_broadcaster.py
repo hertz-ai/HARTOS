@@ -29,8 +29,12 @@ field set.  Uses the existing FlaskChannelIntegration's background
 asyncio loop — fire-and-forget so a slow Discord API can't block the
 EventBus emit chain.
 
-Operators configure announcement targets via the standard admin
-channel-config endpoint: set the channel's `announce_chat_id` to the
+Announcement targets are set through channels.agent_tools
+.set_announcement_target (the set_announcement_channel tool, and
+post_to_channel with the owner's answer), which refuses up front what
+needs_subscription refuses here; the admin channel-config endpoint can
+also set it, without that check (task #222): set the channel's
+`announce_chat_id` to the
 target chat where Nunba should post benchmark proofs (e.g. Discord
 channel ID, Telegram chat ID, Slack channel ID).  No new model — the
 field rides inside the existing channel-config dict so the admin UI
@@ -40,6 +44,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from types import MappingProxyType
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger('hevolve_channels')
@@ -139,14 +144,35 @@ def destination_shape(channel: str, chat_id: str) -> Optional[str]:
     None means "cannot determine here", NOT "safe".  Callers keep whatever
     other gate applies; None never grants anything on its own.
     """
-    if channel == 'telegram':
-        try:
-            return 'one_to_one' if int(str(chat_id).strip()) > 0 else 'multi_person'
-        except (TypeError, ValueError):
-            return None  # @channelname and similar — not decidable from the id
     # Discord/Slack channel-vs-DM is decidable, but only via an API call
     # (channel type lookup). Until that is wired, say so rather than guess.
-    return None
+    classify = _SHAPE_FROM_ID.get(channel)
+    return classify(chat_id) if classify is not None else None
+
+
+def _telegram_shape(chat_id) -> Optional[str]:
+    try:
+        return 'one_to_one' if int(str(chat_id).strip()) > 0 else 'multi_person'
+    except (TypeError, ValueError):
+        return None  # @channelname and similar — not decidable from the id
+
+
+#: The channels whose destination ids show their shape (destination_shape),
+#: and how.
+_SHAPE_FROM_ID = MappingProxyType({'telegram': _telegram_shape})
+
+
+def every_destination_needs_subscription(channel: str) -> bool:
+    """Whether no destination on ``channel`` can receive announcements
+    without a subscription record: a person-to-person channel whose ids do
+    not show their shape (no _SHAPE_FROM_ID entry), so needs_subscription
+    is True for every id.
+
+    post_to_channel neither connects such a channel nor asks where its posts
+    go while it has no destination: the owner cannot give a subscription on
+    a card, so every answer was refused and they were asked again on every
+    post."""
+    return channel in PERSON_TO_PERSON_CHANNELS and channel not in _SHAPE_FROM_ID
 
 
 SUBSCRIPTION_CONSENT = 'announcement_subscription'
@@ -250,6 +276,23 @@ def is_subscribed(channel: str, chat_id: str) -> bool:
             pass
 
 
+def needs_subscription(channel: str, chat_id: str) -> bool:
+    """Whether ``chat_id`` on ``channel`` may receive announcements only with
+    a subscription record (is_subscribed): a one-to-one chat, or any
+    destination on a person-to-person channel whose id does not show it to
+    be multi-person.
+
+    The one rule.  _collect_announcement_targets refuses on it at send time,
+    and channels.agent_tools.set_announcement_target, the one writer of
+    announce_chat_id, refuses the same destinations up front.  The two used
+    to disagree: the writer refused only what destination_shape calls
+    one-to-one, so a WhatsApp id (no shape) was written, reported as set,
+    then refused at every send (review of f8fdb9c64)."""
+    shape = destination_shape(channel, chat_id)
+    return (shape == 'one_to_one'
+            or (channel in PERSON_TO_PERSON_CHANNELS and shape != 'multi_person'))
+
+
 def looks_like_unsubscribe(text: str) -> bool:
     """Does an inbound message mean 'stop messaging me'?
 
@@ -316,11 +359,8 @@ def _collect_announcement_targets(subscribed_check=None) -> List[Tuple[str, str]
         # only credential is a claim that people opted in cannot be defended,
         # so the flag is removed rather than kept as a fallback -- two sources
         # of truth for consent is worse than one real one.
-        shape = destination_shape(channel_type, chat_id)
-        needs_record = (shape == 'one_to_one'
-                        or (channel_type in PERSON_TO_PERSON_CHANNELS
-                            and shape != 'multi_person'))
-        if needs_record and not subscribed(channel_type, chat_id):
+        if (needs_subscription(channel_type, chat_id)
+                and not subscribed(channel_type, chat_id)):
             logger.warning(
                 "refusing announcement target %s/%s: one-to-one destination "
                 "with no subscription record. It becomes eligible the moment "

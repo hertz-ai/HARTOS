@@ -452,6 +452,24 @@ class DistributedWorkerLoop:
         return f"the goal is {row[0]}" + (f": {why}" if why else '')
 
     @staticmethod
+    def _expert_goal_type(goal_id):
+        """dispatch.expert_goal_type of the task's goal when this node holds
+        it, else None: a peer's work never spends this node owner's expert.
+        Unreadable: None, and the task runs on the node's own model."""
+        try:
+            from integrations.agent_engine.dispatch import expert_goal_type
+            from integrations.social.models import AgentGoal, db_session
+            with db_session(commit=False) as db:
+                row = db.query(AgentGoal).filter(
+                    AgentGoal.id == str(goal_id)).first()
+                return expert_goal_type(row, db)
+        except Exception as e:
+            logger.warning("Worker could not read goal %s for its expert "
+                           "(%s); its task runs on the node's own model",
+                           goal_id, e)
+            return None
+
+    @staticmethod
     def _dispatch_would_defer():
         """Why a task claimed right now could only be deferred, or None.
 
@@ -463,8 +481,12 @@ class DistributedWorkerLoop:
             model pressure, the governor).  The worker is a daemon and had
             never asked it.
           * local_dispatch_provider_breaker_open(): the node's own LLM
-            provider refusing the account, the first check
-            local_chat_dispatch makes.
+            provider refusing calls (the account, or a quota spent until its
+            reset), the first check local_chat_dispatch makes -- unless the
+            configured expert is offered (dispatch.configured_expert_offer):
+            then a claimed task of an earning goal of the node's own runs on
+            it (dispatch.goal_turn_model, owner 2026-11-16), and any other
+            claimed task is deferred (_execute_task).
           * local_dispatch_llm_busy(): every local LLM slot taken.  Added
             2026-09-21 after the first three shipped and the churn carried
             on through this hole: 18 claims and 18 deferrals in eight
@@ -485,9 +507,9 @@ class DistributedWorkerLoop:
             logger.debug('worker gate: yield check failed', exc_info=True)
         try:
             from integrations.agent_engine.dispatch import (
-                local_dispatch_provider_breaker_open)
+                configured_expert_offer, local_dispatch_provider_breaker_open)
             host = local_dispatch_provider_breaker_open()
-            if host:
+            if host and configured_expert_offer('the hive worker') is None:
                 return f'provider breaker open ({host})'
         except Exception:
             logger.debug('worker gate: provider-breaker check failed',
@@ -545,7 +567,8 @@ class DistributedWorkerLoop:
             return None
 
         from integrations.agent_engine.dispatch import (
-            _internal_auth_headers, local_chat_dispatch, prompt_id_for_goal,
+            _internal_auth_headers, goal_turn_model, local_chat_dispatch,
+            prompt_id_for_goal,
         )
 
         base_url = os.environ.get('HEVOLVE_BASE_URL', f'http://localhost:{get_port("backend")}')
@@ -561,6 +584,25 @@ class DistributedWorkerLoop:
         goal_id = task.parent_task_id or task.task_id
         prompt_id = prompt_id_for_goal(goal_id)
 
+        # The model the task runs on: the node's own, or, while its provider
+        # is refusing calls, the configured expert for an earning goal of the
+        # node's own where it is offered (owner 2026-11-16, "Fall back to
+        # Haiku"); the same rule dispatch_goal and the daemon's speculative
+        # branch follow (dispatch.goal_turn_model).  Measured on central
+        # 2026-11-16 07:23-07:30Z: the worker held on the free model's OPEN
+        # breaker while 0 calls went to the expert, and five goals whose work
+        # it held were paused for ledger grounding.  A task no model can take
+        # (a peer's goal, a goal that does not earn, the day cap spent) waits
+        # on the canonical DEFERRED lifecycle: nothing ran, nothing failed.
+        model_config, refusing = goal_turn_model(self._expert_goal_type(goal_id))
+        if refusing:
+            logger.info(f"Worker deferring task {task.task_id}: provider "
+                        f"{refusing} is refusing calls and no expert is "
+                        f"offered for its goal")
+            return DeferredForRetry(f'provider {refusing} is refusing calls '
+                                    f'(account refused or quota spent; '
+                                    f'breaker open)')
+
         body = {
             'user_id': user_id,
             'prompt_id': prompt_id,
@@ -569,6 +611,8 @@ class DistributedWorkerLoop:
             'autonomous': True,
             'casual_conv': False,
         }
+        if model_config:
+            body['model_config'] = model_config
 
         # Canonical in-process route first — the SAME call dispatch_goal
         # makes.  On a bundled desktop the raw POST below does not reach
@@ -588,7 +632,7 @@ class DistributedWorkerLoop:
         # daemon turns).
         _status, _text = local_chat_dispatch(
             prompt, user_id, prompt_id, daemon_id=goal_id,
-            native_fallback=False)
+            native_fallback=False, model_config=model_config)
         if _status == 'ok' and _text:
             return self._after_response(
                 _text, task, user_id=user_id, prompt_id=prompt_id,
@@ -695,11 +739,15 @@ class DistributedWorkerLoop:
         # create loop just parked.  _tick holds the task.  Measured on the
         # Nunba desktop 2026-09-15: three "Paused for help" replies were
         # submitted, hashed and notified as completed contributions.
-        if is_help_pause(response):
+        # ...or the session's REUSE step waits for the person's reply to a
+        # question it asked them (#161, core.agent_tools.is_waiting_for_person):
+        # the same hold, since a retry claim would only find it waiting again.
+        from core.agent_tools import is_waiting_for_person
+        if is_help_pause(response) or is_waiting_for_person(response):
             logger.warning(
-                f"Worker task {task.task_id}: the action was handed on "
-                f"({response[:120]!r}); holding the task instead of "
-                f"recording it as a result")
+                f"Worker task {task.task_id}: the action was handed on or waits "
+                f"for the person ({response[:120]!r}); holding the task instead "
+                f"of recording it as a result")
             return HeldForHelp(response)
 
         # GUARDRAIL: post-response check (fail-closed)

@@ -178,7 +178,7 @@ class TestThePermitIsAlwaysGivenBack:
              patch.object(dispatch, '_notify_watchdog_llm_start',
                           side_effect=notify), \
              patch.object(dispatch, '_notify_watchdog_llm_end',
-                          side_effect=lambda: None):
+                          side_effect=lambda *a: None):
             return dispatch.local_chat_dispatch('p', 'u', 'a',
                                                 native_fallback=False)
 

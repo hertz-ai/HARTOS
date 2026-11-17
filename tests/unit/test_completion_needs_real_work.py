@@ -243,6 +243,24 @@ class TestAVerdictNamingNoActionOfTheFlowIsNotContradicting(_Harness):
                 self._flow(1)
                 self.assertTrue(self._commit(claimed))
 
+    def test_a_number_no_int_can_hold_is_no_id(self):
+        """'inf' and '1e999' parse as floats that int() cannot take: they
+        raised OverflowError out of the completion gate instead of being
+        read as no id at all (task #168)."""
+        for claimed in ('inf', '1e999', float('inf'), 'nan'):
+            with self.subTest(claimed=claimed):
+                self._flow(2)
+                self.assertTrue(self._commit(claimed))
+
+    def test_settling_a_number_no_int_can_hold_names_the_posted_action(self):
+        """settled_action_id runs BEFORE the gate (reuse's _advance_or_steer,
+        create's verdict pickup), so it raised OverflowError on the same ids
+        the gate now reads as no id (review of 1ca1fbaa5)."""
+        for claimed in ('inf', '1e999', float('inf'), '-inf', 'nan', None,
+                        'action_1'):
+            with self.subTest(claimed=claimed):
+                self.assertEqual(lh.settled_action_id(claimed, 1), 1)
+
     def test_a_flow_that_has_the_named_action_still_refuses_it(self):
         self._flow(2)
         self.assertFalse(self._commit(2))

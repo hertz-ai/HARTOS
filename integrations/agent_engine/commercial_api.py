@@ -1151,13 +1151,15 @@ def upgrade_key(key_id):
                 'error': f'Payment error: {pay_err}',
             }), 502
 
-        # Payment succeeded — the bought tier, through the one writer.
-        _changed, failure = _apply_bought_tier(db, api_key, target_tier)
+        # Payment succeeded — the bought tier, through the one writer, which
+        # hands the key back as plain values (_apply_bought_tier: never the
+        # row, tasks #211 and #214).
+        key, failure = _apply_bought_tier(db, api_key, target_tier)
         if failure is not None:
             # No retry follows on this rail: a re-POST of /upgrade would
             # charge the card again, so the line asks for a person now.
             payload, status = _bump_failed(
-                f'payment {payment_req.payment_id}', api_key.id, failure,
+                f'payment {payment_req.payment_id}', key['id'], failure,
                 retry='no retry follows: a re-POST of /upgrade would charge the card '
                       'again; apply the bought tier by hand',
                 retries=False, payment_request_id=payment_req.payment_id)
@@ -1165,12 +1167,7 @@ def upgrade_key(key_id):
 
         return jsonify({
             'success': True,
-            'api_key': {
-                'id': str(api_key.id),
-                'tier': api_key.tier,
-                'rate_limit_per_day': api_key.rate_limit_per_day,
-                'monthly_quota': api_key.monthly_quota,
-            },
+            'api_key': key,
             'payment': {
                 'request_id': payment_req.payment_id,
                 'amount_usd': amount_usd,
@@ -1663,7 +1660,7 @@ def phonepe_callback():
                     'error': 'API key not found',
                     'payment_request_id': payment_req.payment_id,
                 }), 200
-            _changed, failure = _apply_bought_tier(db, api_key, target_tier)
+            _key, failure = _apply_bought_tier(db, api_key, target_tier)
         finally:
             db.close()
     except Exception as db_err:
@@ -2034,7 +2031,15 @@ def _bump_failed(what_paid: str, api_key_id, failure: str, *, retry: str,
     it" on every rail (the review of 7c8431c2e, which measured the sync
     route and PhonePe's return page against it).  ``exc_info`` is the
     exception the caller caught, when it caught one, so the traceback rides
-    on this line and not on a second ERROR record."""
+    on this line and not on a second ERROR record.  ``api_key_id`` is a plain
+    value, never read off the key row in the call: the card and Stripe
+    callers pass the id _apply_bought_tier hands back (read before the
+    write), the PhonePe callback the id its payment record carries.
+    Writing ``api_key.id`` off the row in the call re-loads it after
+    the failed bump's rollback expired it, while Python evaluates the
+    arguments, in the CALLER, before this function runs; with the database
+    gone that load raised and the charged card got Flask's HTML 500 with no
+    line (task #211).  Each caller's database-gone test holds it."""
     logger.error(f"MANUAL RECONCILIATION NEEDED{' if this repeats' if retries else ''}: "
                  f"{what_paid} paid but the tier bump failed for api_key {api_key_id}: "
                  f"{failure}; {retry}", exc_info=exc_info)
@@ -2065,7 +2070,7 @@ def _recorded_checkout(session_id: str):
         return _recorded_checkout_unlocked(session_id)
 
 
-def _checkout_payload(payment, api_key, already_completed: bool = False) -> dict:
+def _checkout_payload(payment, key: dict, already_completed: bool = False) -> dict:
     """The one answer a finalized Checkout gets, whichever caller asks and
     however many times: the tier and its limits, the amount, the split and
     the receipt ids the landing page's success screen renders
@@ -2073,18 +2078,14 @@ def _checkout_payload(payment, api_key, already_completed: bool = False) -> dict
     api_key.monthly_quota, payment.amount_usd, payment.stripe_payment_intent,
     revenue_split.* and payment_request_id).  A replay used to answer a bare
     already_completed envelope, on which that page threw (the review of
-    3153761b3 ran it)."""
+    3153761b3 ran it).  ``key`` is the key as _apply_bought_tier hands it
+    back (_key_fields)."""
     meta = payment.metadata or {}
     amount_usd = float(payment.amount)
     body = {
         'success': True,
         'payment_request_id': payment.payment_id,
-        'api_key': {
-            'id': str(api_key.id),
-            'tier': api_key.tier,
-            'rate_limit_per_day': api_key.rate_limit_per_day,
-            'monthly_quota': api_key.monthly_quota,
-        },
+        'api_key': dict(key),
         'payment': {
             'amount_usd': amount_usd,
             'stripe_session_id': meta.get('stripe_session_id'),
@@ -2098,8 +2099,20 @@ def _checkout_payload(payment, api_key, already_completed: bool = False) -> dict
     return body
 
 
+def _key_fields(api_key) -> dict:
+    """The key as every upgrade reply shows it, as plain values read off the
+    loaded row: its id, tier and the tier's two limits (the landing page's
+    success screen, UpgradeSuccess.js, reads these four)."""
+    return {
+        'id': str(api_key.id),
+        'tier': api_key.tier,
+        'rate_limit_per_day': api_key.rate_limit_per_day,
+        'monthly_quota': api_key.monthly_quota,
+    }
+
+
 def _apply_bought_tier(db, api_key, target_tier: str):
-    """Put ``api_key`` on the tier it bought; ``(changed, error)``.  The ONE
+    """Put ``api_key`` on the tier it bought; ``(key, error)``.  The ONE
     writer of a key's tier for every rail.
 
     One conditional UPDATE: the row moves only while its tier costs less
@@ -2111,38 +2124,83 @@ def _apply_bought_tier(db, api_key, target_tier: str):
     that race when the two landed together (the starter delivery read
     'free', waited on the ledger lock while the pro bump committed, then
     wrote starter: 16 to 23 of 40 rounds, the review of fd2b4773c).  On a
-    failure the session is rolled back, so a later call (Stripe's retry
-    after the 500, the buyer's reload) finds the key still below the
-    bought tier and finishes the bump.  ``api_key`` is refreshed from the
-    row afterwards, so the caller's payload shows what the table holds."""
+    failed write the session is rolled back, so a later call (Stripe's
+    retry after the 500, the buyer's reload) finds the key still below the
+    bought tier and finishes the bump.
+
+    ``key`` is the key as the reply shows it (_key_fields), plain values the
+    caller reports and names in a failure line, never the ORM row: the
+    commit and any rollback expire the row, and with the database gone a
+    read of it raises (tasks #211 and #214).  After a failed write it is the
+    key as read before it, which is what the rolled-back table holds.  After
+    a committed write it is the row read back.  When that read back fails
+    (the database went away after the commit), the write still happened, so
+    there is no error, and ``key`` is the least the table holds: the bought
+    tier, or the key's own when it was already there or above (no writer
+    ever lowers a tier, so the higher of the two is a floor).  The read
+    back shared the write's try, so a bump that was done was reported as
+    failed and a person was asked to apply it by hand (task #214).
+
+    ``before`` reads attributes the caller already loaded and touches no
+    database: every caller loads ``api_key`` on the session it passes, with
+    no commit between that load and this call (the payment ledger the rails
+    record into is a JSON file, not this session).  A caller that adds a
+    commit there must read the key before it."""
     from sqlalchemy import or_
     from integrations.social.models import CommercialAPIKey
+
+    def roll_back(after):
+        try:
+            db.rollback()
+        except Exception as rb:
+            logger.debug("tier bump: rollback after %s also failed: %s", after, rb)
+
+    before = _key_fields(api_key)
     if target_tier not in TIER_CONFIG:
         # Only a hand-edited ledger record lacks its target_tier (every
         # writer stamps it); it is a reconciliation case for the caller, not
         # a KeyError outside this try (the review of ec0dbe7be).
-        return False, f'bought tier {target_tier!r} is not a tier'
+        return before, f'bought tier {target_tier!r} is not a tier'
     cfg = TIER_CONFIG[target_tier]
+    # What the bought tier writes: the UPDATE's values and the reply's when
+    # the row cannot be read back.
+    bought = {'tier': target_tier,
+              'rate_limit_per_day': cfg['rate_limit_per_day'],
+              'monthly_quota': cfg['monthly_quota']}
     try:
         rows = db.query(CommercialAPIKey).filter(
-            CommercialAPIKey.id == api_key.id,
+            CommercialAPIKey.id == before['id'],
             or_(CommercialAPIKey.tier.is_(None),
                 CommercialAPIKey.tier.notin_(_tiers_at_least(target_tier))),
-        ).update({
-            CommercialAPIKey.tier: target_tier,
-            CommercialAPIKey.rate_limit_per_day: cfg['rate_limit_per_day'],
-            CommercialAPIKey.monthly_quota: cfg['monthly_quota'],
-        }, synchronize_session=False)
+        ).update({getattr(CommercialAPIKey, column): value
+                  for column, value in bought.items()},
+                 synchronize_session=False)
         db.commit()
-        db.refresh(api_key)
     except Exception as e:
-        try:
-            db.rollback()
-        except Exception as rb:
-            logger.debug("tier bump: rollback after %s also failed: %s", e, rb)
-        return False, str(e)
-    current = getattr(api_key, 'tier', None)
-    if not rows and current != target_tier:
+        roll_back(e)
+        return before, str(e)
+    try:
+        db.refresh(api_key)
+        key = _key_fields(api_key)
+    except Exception as e:
+        roll_back(e)
+        below = _is_tier_upgrade(before['tier'], target_tier)
+        key = dict(before, **bought) if below else before
+        if rows:
+            done = f'the bought tier {target_tier} is written'
+        elif below:
+            # Read below the bought tier, yet no row moved: another payment
+            # raised the key between that read and this write, to this tier
+            # or one that costs more.  Which, the lost read cannot say, so
+            # the refund question is asked here; the "stays on" line below
+            # cannot see it (the review of 2cd3c6720, finding 1).
+            done = (f'no row moved for the bought tier {target_tier}: another payment '
+                    f'raised the key meanwhile, so check whether this payment needs a refund')
+        else:
+            done = f'no row moved for the bought tier {target_tier}'
+        logger.warning("api_key %s: %s, and the row could not be read back: %s",
+                       before['id'], done, e)
+    if not rows and key['tier'] != target_tier:
         # Money was taken for a tier the key is already above: a refund
         # case the operator must see.  A replay of an applied session (the
         # key is already there) is routine and says nothing; one INFO line
@@ -2150,8 +2208,8 @@ def _apply_bought_tier(db, api_key, target_tier: str):
         # of ec0dbe7be).
         logger.warning("api_key %s stays on %s: it paid for %s, which costs less; "
                        "the payment is recorded and may need a refund",
-                       getattr(api_key, 'id', None), current, target_tier)
-    return bool(rows), None
+                       key['id'], key['tier'], target_tier)
+    return key, None
 
 
 def _finalize_paid_checkout_session(session, db):
@@ -2248,20 +2306,21 @@ def _finish_recorded_checkout(db, payment, api_key, target_tier, *,
     answered already_completed over a key still on the old tier, the review
     of 3153761b3).  Never a downgrade.  ``target_tier`` is the caller's:
     Stripe's signed metadata for the finalizer, the ledger record for the
-    fast path.  The key's id is read before the bump: a failed bump rolls
-    the session back, which expires the row, and with the database gone a
-    read after it raised inside the report, so the 500 carried no
-    reconciliation line (the review of 2971c00db)."""
-    api_key_id = api_key.id
-    _changed, failure = _apply_bought_tier(db, api_key, target_tier)
+    fast path.  The key is reported from the plain values the writer hands
+    back, never the row: a failed bump rolls the session back and a
+    committed one expires it, and with the database gone a read of it
+    raised inside the report, so the 500 carried no reconciliation line
+    (the review of 2971c00db), or a bump that was done answered 500 (task
+    #214)."""
+    key, failure = _apply_bought_tier(db, api_key, target_tier)
     if failure is not None:
-        return _bump_failed(f'Stripe session {session_id}', api_key_id, failure,
+        return _bump_failed(f'Stripe session {session_id}', key['id'], failure,
                             retry="the buyer's reload re-POSTs the session, and Stripe "
                                   'redelivers the event to a registered webhook until '
                                   'it is answered 200; either runs the bump again',
                             retries=True, payment_request_id=payment.payment_id,
                             session_id=session_id)
-    return _checkout_payload(payment, api_key, already_completed=already), 200
+    return _checkout_payload(payment, key, already_completed=already), 200
 
 
 @commercial_api_bp.route('/api/v1/intelligence/upgrade/checkout/complete',

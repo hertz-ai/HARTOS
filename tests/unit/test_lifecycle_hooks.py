@@ -1094,20 +1094,6 @@ class TestBlockResumeUserInput:
         assert task.state_history == []
         set_state.assert_not_called()
 
-    def test_resume_records_answer_on_the_blocked_task(self):
-        task = MagicMock()
-        task.status = _LedgerTaskStatus.BLOCKED
-        task.context = {}
-        ledger = MagicMock()
-        ledger.tasks = {"action_1": task}
-        _ledger_registry[UP] = ledger
-
-        assert resume_from_user_input(UP, 1, 'User chose account', 'Use account A') is True
-
-        task.resume.assert_called_once_with('User chose account')
-        assert task.context['user_input_evidence'][0]['action_id'] == 1
-        assert task.context['user_input_evidence'][0]['answer'] == 'Use account A'
-
     def test_resume_rejection_restores_exact_blocked_task(self):
         class Task:
             def __init__(self):
@@ -1128,8 +1114,7 @@ class TestBlockResumeUserInput:
         ledger.save.return_value = False
         _ledger_registry[UP] = ledger
 
-        assert resume_from_user_input(
-            UP, 1, 'User chose account', 'Use account A') is False
+        assert resume_from_user_input(UP, 1, 'User chose account') is False
         assert task.__dict__ == before
 
 

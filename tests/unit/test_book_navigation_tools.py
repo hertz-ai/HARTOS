@@ -107,13 +107,30 @@ class BookToolSurface(unittest.TestCase):
             self.assertIn(name, MAIN_LEG_CORE_TOOLS, f'{name} would never reach the assistant')
 
     def test_a_turn_with_no_user_sees_no_books(self):
-        """list_books answers EVERY user's books for an empty id."""
+        """The property this has always guarded, unchanged: an empty id must
+        NEVER reach the backend, or list_books answers EVERY user's books.
+        CORRECTED: I wrote that the assert_not_called below was that
+        pin and was untouched. It is not -- list_books now returns
+        before _books(), so this call never reaches the shared guard
+        and this line pins only the early return. The shared guard is
+        pinned by test_a_navigation_tool_with_no_user_never_reads_the
+        _library below, which goes through a tool that has no early
+        return. Both are needed; neither covers the other.
+
+        What changed 2026-11-10 is only the words. This used to assert "No
+        books parsed yet", which told a turn with no user to go and ask for
+        a PDF upload -- the wrong problem, since there is nobody to upload
+        it for. That is this module's THIRD instance of the same conflation
+        (see the header: a backend outage was once reported as "no books"
+        too), so the wording is now a refusal naming the real cause.
+        """
         list_books, get_layouts = _library()
         with patch.object(bp, 'list_books', list_books), \
              patch.object(bp, 'get_layouts', get_layouts):
             out = _tools(user_id='')['list_books']()
         list_books.assert_not_called()
-        self.assertIn('No books parsed yet', out)
+        self.assertIn('no user id', out)
+        self.assertNotIn('No books parsed yet', out)
 
     def test_the_library_is_read_for_the_turns_user(self):
         list_books, get_layouts = _library()
@@ -411,5 +428,168 @@ class PublisherCarriesTheImage(unittest.TestCase):
         self.assertNotIn('page_image_url', sent['envelope'])
 
 
+
+
+# ── A named book that is not there is refused, never swapped ────────────────
+OTHER_BOOK = {
+    'file_id': 9,
+    'user_id': '42',
+    'filename': 'rain.pdf',
+    'book_name': 'How Rain Happens',
+    'total_pages': 1,
+    'status': 'completed',
+}
+
+
+class ANamedBookIsNeverSwapped(unittest.TestCase):
+    """_find_book used to fall through to books[0] for a non-empty name, so a
+    book the user does not have was answered with the most recent book's
+    chapters and pages and nothing in the reply said so.  The three callers'
+    "No matching book" refusals were therefore unreachable whenever the
+    library held anything.  MEASURED LIVE by hartos-16, turn
+    msg_1794208521422_odljlx: list_book_chapters(book_name='The Art of
+    Computer Programming') returned the chapters of 'How Rain Happens'.
+    """
+
+    def test_a_book_the_user_does_not_have_is_refused(self):
+        out = _call('list_book_chapters', 'The Art of Computer Programming',
+                    _books=[OTHER_BOOK] + BOOKS)
+        self.assertTrue(out.startswith('Error:'), out)
+        # the swap itself: no chapter of another book may appear
+        self.assertNotIn('Chapter 1: Units', out)
+        self.assertNotIn('"chapters"', out)
+
+    def test_the_refusal_names_the_ask_and_the_real_names(self):
+        """Owner rule 2026-11-09: a refusal says what was wrong and how to fix
+        it, so the next call can be corrected."""
+        out = _call('read_book_page', 1, 'The Art of Computer Programming',
+                    _books=[OTHER_BOOK] + BOOKS)
+        self.assertIn('read_book_page', out)
+        self.assertIn('The Art of Computer Programming', out)   # what was wrong
+        self.assertIn('How Rain Happens', out)                   # how to fix it
+        self.assertIn('NCERT Physics Class 11', out)
+
+    def test_read_book_chapter_refuses_in_its_own_name(self):
+        out = _call('read_book_chapter', 'Chapter 1', 'Nonexistent Title')
+        self.assertTrue(out.startswith('Error: the read_book_chapter'), out)
+
+    def test_an_empty_name_still_means_the_most_recent_book(self):
+        """All three signatures document "Empty = most recent book" -- the
+        fallback belongs to the empty name, and only to it."""
+        out = _call('list_book_chapters', '')
+        self.assertIn('NCERT Physics Class 11', out)
+        self.assertFalse(out.startswith('Error:'), out)
+
+    def test_a_partial_name_and_a_filename_still_resolve(self):
+        by_part = _call('list_book_chapters', 'physics')
+        by_file = _call('list_book_chapters', 'ncert_physics_11.pdf')
+        for out in (by_part, by_file):
+            self.assertIn('Chapter 1: Units', out)
+
+    def test_no_books_at_all_says_what_to_do_first(self):
+        out = _call('list_book_chapters', 'anything', _books=[])
+        self.assertTrue(out.startswith('Error:'), out)
+        self.assertIn('parse_book_pdf', out)
+
+
+    def test_a_turn_with_no_user_is_not_told_to_upload_a_book(self):
+        """_books() returns [] both for "no user" and "no books", so the two
+        looked alike at the refusal and a turn with no user id was sent to
+        ask for a PDF upload -- which cannot help, there being nobody to
+        upload it for."""
+        list_books, get_layouts = _library()
+        with patch.object(bp, 'list_books', list_books), \
+             patch.object(bp, 'get_layouts', get_layouts):
+            tools = dict((n, f)
+                         for n, _d, f in build_book_tools({'user_id': None}))
+            out = tools['list_book_chapters']('anything')
+        self.assertTrue(out.startswith('Error:'), out)
+        self.assertIn('no user id', out)
+        self.assertNotIn('parse_book_pdf', out)
+
+    def test_more_than_twenty_books_says_there_are_more(self):
+        """Naming 20 as if they were all of them makes the agent tell the
+        person their book is not there when it is just number 21."""
+        many = [dict(OTHER_BOOK, file_id=i, book_name='Book %d' % i)
+                for i in range(1, 26)]
+        out = _call('list_book_chapters', 'not here at all', _books=many)
+        self.assertTrue(out.startswith('Error:'), out)
+        self.assertIn('and 5 more', out)
+        self.assertIn('list_books', out)
+
+    def test_a_refused_call_reads_the_library_once(self):
+        """_find_book read it, then _no_book read it again for the names."""
+        list_books, get_layouts = _library()
+        with patch.object(bp, 'list_books', list_books), \
+             patch.object(bp, 'get_layouts', get_layouts):
+            out = _tools()['list_book_chapters'](
+                'The Art of Computer Programming')
+        self.assertTrue(out.startswith('Error:'), out)
+        self.assertEqual(list_books.call_count, 1)
+
+
+    def test_list_books_itself_does_not_tell_a_no_user_turn_to_upload(self):
+        """The sibling of the _no_book fix: list_books had the same
+        confusion, because _books() returns [] for a turn with no user AND
+        for a user with no books, and only one of those is fixed by
+        uploading a PDF."""
+        list_books, get_layouts = _library()
+        with patch.object(bp, 'list_books', list_books), \
+             patch.object(bp, 'get_layouts', get_layouts):
+            tools = dict((n, f)
+                         for n, _d, f in build_book_tools({'user_id': None}))
+            out = tools['list_books']()
+        self.assertTrue(out.startswith('Error:'), out)
+        self.assertIn('no user id', out)
+        self.assertNotIn('upload a PDF', out)
+        self.assertEqual(list_books.call_count, 0)
+
+    def test_a_user_with_no_books_is_still_told_to_upload(self):
+        """The other half: this one IS fixed by uploading, so the wording
+        must not have moved with the fix above."""
+        out = _call('list_books', _books=[])
+        self.assertIn('upload a PDF', out)
+        self.assertIn('parse_book_pdf', out)
+
+
+    def test_a_navigation_tool_with_no_user_never_reads_the_library(self):
+        """The must-fix from REVIEW 2026-11-10, and the coverage I removed
+        without noticing.
+
+        The guard that matters lives in _books() and protects all four
+        tools. test_a_turn_with_no_user_sees_no_books used to pin it
+        TRANSITIVELY, because list_books went through _books(). Since
+        38dda7ba5 list_books returns before that call, so its
+        assert_not_called pins only the new early return -- measured:
+        delete the guard inside _books() and all 48 tests in this file
+        still pass while these three tools call the backend and answer
+        with another user's book, because book_pipeline.list_books
+        answers EVERY user's books for an empty id.
+
+        So pin it where it actually lives, through a tool that has no
+        early return of its own.
+        """
+        for name, args in (('list_book_chapters', ('',)),
+                           ('read_book_page', (1, '')),
+                           ('read_book_chapter', ('Chapter 1', ''))):
+            list_books, get_layouts = _library()
+            with patch.object(bp, 'list_books', list_books), \
+                 patch.object(bp, 'get_layouts', get_layouts):
+                out = _tools(user_id='')[name](*args)
+            list_books.assert_not_called()
+            self.assertTrue(out.startswith('Error:'), (name, out))
+            self.assertNotIn('NCERT', out)
+            self.assertNotIn('Units', out)
+
+
 if __name__ == '__main__':
+    # Run as a script there is no pytest, so the autouse `_uploads` fixture
+    # above never fires and `_render_images` would write page jpegs into the
+    # REAL uploads directory -- the owner's own books.  Redirect it here
+    # for the same reason the fixture exists, and by the same name, so the
+    # two modes cannot drift.  (The class below this guard used to be
+    # unreachable in script mode: the guard was above it.)
+    import tempfile
+    import core.platform_paths as _pp
+    _pp.get_uploads_dir = lambda _d=tempfile.mkdtemp(prefix='book_nav_'): _d
     unittest.main()

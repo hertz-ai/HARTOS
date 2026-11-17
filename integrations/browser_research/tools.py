@@ -39,12 +39,16 @@ _TOOL_ROUTES: dict[str, tuple[str, str]] = {
 }
 
 
-# Allowed platforms for the per-platform routes.  Drift-guarded against
-# domain_allowlist so a new script must declare both its allowed domains AND
-# its tool-route eligibility (fail-closed default).
+# Allowed platforms for the per-platform routes.  Every name here MUST have
+# both a scripts/<name>.py module and a domain_allowlist entry.  The guard is
+# the drift test in tests/unit/test_browser_research.py — this comment used to
+# claim a drift-guard that no code performed, and 'douyin' sat in this set
+# from the start with no scripts/douyin.py behind it, so dispatch got past the
+# known-platform check and died in importlib, refusing with a raw ImportError
+# instead of naming the platforms that do work (removed 2026-11-11).
 _PER_PLATFORM_ALLOWED = {
     'twitter', 'reddit', 'linkedin',
-    'bilibili', 'xiaohongshu', 'weibo', 'douyin',
+    'bilibili', 'xiaohongshu', 'weibo',
 }
 
 

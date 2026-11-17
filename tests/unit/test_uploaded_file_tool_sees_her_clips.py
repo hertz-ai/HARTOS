@@ -98,6 +98,14 @@ def test_another_agents_clips_are_not_this_agents(store):
     assert _ask() == 'No file uploaded from user'
 
 
+def test_clips_sent_with_no_turn_are_not_this_agents(store):
+    """Clips that reached her desktop on no turn (her 11-02 18:37 upload,
+    whose answer never came) are bound to no agent, so this one is told
+    there is no file of hers."""
+    _upload(store, b'clip sent with no turn' * 40, 'VID_1837.mp4')
+    assert _ask() == 'No file uploaded from user'
+
+
 def test_clips_a_reel_already_used_are_not_offered_again(store):
     store.mark_consumed(USER, _her_five_clips(store))
     assert _ask() == 'No file uploaded from user'

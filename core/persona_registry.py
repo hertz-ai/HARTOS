@@ -26,6 +26,7 @@ reuse_recipe.py:1203-1240.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 from core.session_cache import TTLCache
@@ -140,21 +141,163 @@ def register_persona_for_session(
     return len(session_entries)
 
 
+#: The consent a child's side grants when it lets another account join its
+#: chat with an agent (integrations.social.consent_service.CONSENT_TYPES).
+JOIN_CONSENT_TYPE = 'chat_join'
+
+
+def _kept_joins(joiner: Any, prompt_id: Any) -> List[str]:
+    """The creators whose chat_join grants for ``joiner`` and agent
+    ``prompt_id`` are active, oldest first.  Raises when this node has no
+    consent store to read."""
+    from integrations.social.consent_service import ConsentService
+    from integrations.social.models import db_session
+    with db_session(commit=False) as db:
+        return [str(c) for c in ConsentService.granted_by(
+            db, JOIN_CONSENT_TYPE, f'{joiner}#', agent_id=str(prompt_id), prefix=True)]
+
+
+def record_join(creator: Any, prompt_id: Any, joiner: Any) -> Optional[bool]:
+    """Keep that ``creator``'s side let ``joiner`` into its chat with agent
+    ``prompt_id`` (owner 2026-11-06: "multiple persons multiple accounts
+    associated via consent"): a chat_join grant on the creator's account,
+    which ends the join when revoked (the consent API's revoke; the
+    privacy page does not list chat_join rows yet).  One row per
+    approval (scope '<joiner>#<time>'): consent rows are append-only and
+    unique per scope, so a join allowed again after a revoke needs a row of
+    its own (hartos-16).  True when kept (or already kept); None when this
+    node keeps no consent rows at all (_consent_store_kept_here), so the join
+    lasts this process only; False when the store is there but the grant was
+    not written: then the join must not go ahead, because joined_chats reads
+    the store and would not see it.  Central is NOT a no-store node: its
+    langchain container keeps consent rows in its own social database
+    (/app/logs/hartos_social.db), apart from every desktop's, and consent
+    rows are not synced between nodes, so a join is read on the node that
+    approved it."""
+    try:
+        from integrations.social.consent_service import ConsentService
+        from integrations.social.models import db_session
+        if str(creator) in _kept_joins(joiner, prompt_id):
+            return True
+        with db_session() as db:
+            ConsentService.grant_consent(db, str(creator), JOIN_CONSENT_TYPE,
+                                         scope=f'{joiner}#{time.time_ns()}',
+                                         agent_id=str(prompt_id))
+        return True
+    except Exception:
+        if not _consent_store_kept_here():
+            logger.info("record_join: no consent store on this node; %s's join to "
+                        "%s's chat of agent %s lasts this process only",
+                        joiner, creator, prompt_id)
+            return None
+        logger.warning("record_join: %s's join to %s's chat of agent %s not kept",
+                       joiner, creator, prompt_id, exc_info=True)
+        return False
+
+
+def _consent_store_kept_here() -> bool:
+    """Whether this node keeps consent rows at all (the consent table exists),
+    asked after a read or write of them failed.  It tells a node with no store
+    (a join lasts this process only) from a store that is there but did not
+    answer (locked, busy; central's SQLite has logged "database is locked"
+    under load).  Only the first may fall back to this
+    process's chat_joinees, which a revoke never clears: with the second, the
+    fallback brought a revoked join back (review of 86f4c71f8).  A failure to
+    tell counts as a store that is there, so a revoke always wins."""
+    try:
+        from integrations.social.models import UserConsent, get_engine
+    except ImportError:
+        return False
+    try:
+        from sqlalchemy import inspect
+        return bool(inspect(get_engine()).has_table(UserConsent.__tablename__))
+    except Exception:
+        logger.warning("could not tell whether this node keeps consent rows; "
+                       "treating it as one that does", exc_info=True)
+        return True
+
+
+def _this_process_join(joiner: Any, prompt_id: Any) -> Optional[str]:
+    """This process's record of whose chat ``joiner`` joined for agent
+    ``prompt_id``.  Matched as text: a join written with integer ids is found
+    by the string ids /chat and _still_joined use, and the other way round."""
+    for who, chats in list(chat_joinees.items()):
+        if str(who) != str(joiner):
+            continue
+        for pid, creator in list((chats or {}).items()):
+            if str(pid) == str(prompt_id) and creator:
+                return str(creator)
+    return None
+
+
+def joined_chats(joiner: Any, prompt_id: Any) -> List[str]:
+    """Whose chats with agent ``prompt_id`` ``joiner`` has joined, oldest
+    first: the one reader of the join link (_resolve_session_for_user,
+    reuse_recipe.get_role and move_person_to_flow_impl all ask here).  The
+    kept chat_join grants (record_join) when they can be read, so a revoked
+    grant ends the join at once.  When they cannot: on a node with no consent
+    store, this process's chat_joinees entry; on a node whose store is there
+    but did not answer, no chat at all, because a revoke never clears
+    chat_joinees and the entry would bring the revoked join back (review of
+    86f4c71f8)."""
+    try:
+        return _kept_joins(joiner, prompt_id)
+    except Exception:
+        if _consent_store_kept_here():
+            logger.warning("joined_chats: %s's joins to agent %s could not be read; "
+                           "none reached until they can", joiner, prompt_id,
+                           exc_info=True)
+            return []
+        logger.debug("joined_chats: no consent store on this node; using this "
+                     "process's joins for %s", joiner)
+    creator = _this_process_join(joiner, prompt_id)
+    return [creator] if creator else []
+
+
+def _still_joined(entries, creator: Any, prompt_id: Any) -> List[Dict[str, Any]]:
+    """The members of ``creator``'s chat of agent ``prompt_id`` that may still
+    be reached: the creator's own entries, and a joiner's only while
+    joined_chats still names this chat.  The join wrote the joiner into the
+    creator's member list (reuse_recipe._reuse_join_chat) and nothing takes
+    it out, so a revoked grant left the child's agent still sending to the
+    parent (review of 31c54b71b, MF1).  A joiner whose join cannot be read is
+    not reached."""
+    creator = str(creator)
+    kept, joined = [], {}
+    for entry in entries or []:
+        member = str(entry.get('user_id') or creator)
+        if member == creator:
+            kept.append(entry)
+            continue
+        if member not in joined:
+            try:
+                joined[member] = creator in [str(c) for c in joined_chats(member, prompt_id)]
+            except Exception:
+                logger.warning("_still_joined: %s's join to %s's chat of agent %s could "
+                               "not be read; not reached", member, creator, prompt_id,
+                               exc_info=True)
+                joined[member] = False
+        if joined[member]:
+            kept.append(entry)
+    return kept
+
+
 def _resolve_session_for_user(user_id: Any, prompt_id: Any):
     """Return (session_entries, key) for the user, falling back to the
-    chat-creator's session if this user joined another user's chat."""
+    chat-creator's session if this user joined another user's chat.  Only
+    members still joined are returned (_still_joined): every send to a
+    persona looks members up here."""
     key = f"{user_id}_{prompt_id}"
-    sessions = agents_session.get(key, [])
+    sessions = _still_joined(agents_session.get(key, []), user_id, prompt_id)
     if sessions:
         return sessions, key
 
-    # Cross-user join fallback
+    # Cross-user join fallback.  A lookup that raises never reaches the live
+    # send path; it is logged and the caller gets no session.
     try:
-        joinees_for_user = chat_joinees.get(user_id, {}) or {}
-        creator = joinees_for_user.get(prompt_id)
-        if creator:
+        for creator in joined_chats(user_id, prompt_id):
             creator_key = f"{creator}_{prompt_id}"
-            sessions = agents_session.get(creator_key, [])
+            sessions = _still_joined(agents_session.get(creator_key, []), creator, prompt_id)
             if sessions:
                 return sessions, creator_key
     except Exception:
@@ -163,6 +306,54 @@ def _resolve_session_for_user(user_id: Any, prompt_id: Any):
             key, exc_info=True)
 
     return [], key
+
+
+def move_person_to_flow_impl(joiner: Any, prompt_id: Any, flows: List[dict],
+                             personas: List[str], flow_name: str,
+                             person: Optional[str] = None) -> str:
+    """A parent or therapist who joined a child's chat moves the child to
+    another of the child's own flows (owner 2026-11-04: "may move the child
+    to another flow by telling the agent in their own chat").  ``person``
+    names the child when the joiner joined more than one chat of this agent.
+    The move is core.flow_progress.set_person_flow, by the joiner; the
+    child's next run starts there.  What to tell the joiner (autogen tool
+    contract)."""
+    from core.flow_progress import _flow_name, persona_flows, set_person_flow, stored_persona
+    joined = [c for c in joined_chats(joiner, prompt_id) if c != str(joiner)]
+    # Told to the agent, about the person it serves: the agent never joined
+    # anything (owner 11-07: a person is never the agent).
+    if not joined:
+        return ("Not moved: the person you are serving has not joined anyone's chat "
+                "with this agent, so there is no one to move. Whoever's chat they want "
+                "to join has to allow the join first.")
+    wanted = str(person or '').strip()
+    if wanted:
+        if wanted not in joined:
+            return (f"Not moved: the person you are serving has not joined {wanted}'s chat "
+                    f"with this agent; they joined {', '.join(joined)}. Call again with "
+                    f"one of those as person.")
+        child = wanted
+    elif len(joined) == 1:
+        child = joined[0]
+    else:
+        return (f"Not moved: the person you are serving joined more than one chat with "
+                f"this agent ({', '.join(joined)}). Call again with person set to the "
+                f"one to move.")
+    persona = stored_persona(child, prompt_id, personas)
+    if not persona:
+        return (f"{child} has not used this agent yet, so they are on no flow to move from; "
+                f"ask again after their first session.")
+    own = {i: _flow_name(flows, i) for i in persona_flows(flows, persona)}
+    wanted_flow = str(flow_name or '').strip().lower()
+    target = next((i for i, name in own.items() if name.strip().lower() == wanted_flow), None)
+    if target is None:
+        return (f"'{flow_name}' is not one of {child}'s flows; their flows are: "
+                f"{', '.join(own.values())}.")
+    if not set_person_flow(child, prompt_id, flows, persona, target, by=str(joiner)):
+        return f"{child} could not be moved to '{own[target]}'; nothing was changed."
+    logger.info("move_person_to_flow: %s moved %s to flow %s of agent %s",
+                joiner, child, target, prompt_id)
+    return f"{child} is now on '{own[target]}'; their next turn starts there."
 
 
 def _send_message_to_roles_impl(
@@ -262,4 +453,8 @@ __all__ = [
     'multichat_topic_for',
     'register_persona_for_session',
     '_send_message_to_roles_impl',
+    'JOIN_CONSENT_TYPE',
+    'record_join',
+    'joined_chats',
+    'move_person_to_flow_impl',
 ]

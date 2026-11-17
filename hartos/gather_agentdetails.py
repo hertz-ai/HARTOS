@@ -117,6 +117,50 @@ def select_autonomous_tool_catalog() -> str:
     return AUTONOMOUS_TOOL_CATALOG
 
 
+#: Every plan step names the way it is done, so CREATE runs it and its recipe
+#: replays it.  Owner 2026-11-04: "if there is a will there is way should be
+#: the mantra for the agents"; "a tool could be a online github repo, a open
+#: source software like ffmpeg etc, it could be anything but shd find the
+#: recipe for reproducability".  Measured that day: Reel Studio (342) was
+#: planned with no tool shown, got 9 steps no tool does one at a time, and
+#: CREATE stalled on step 2 asking her for clips it already had.
+#: No braces: the autonomous system message is an f-string.
+PLAN_WAYS_RULE = """
+EVERY STEP NAMES ITS WAY - if there is a will there is a way. Write each action as
+the tool that does it, from the tools above (e.g. "get_chat_history: the last 15
+days"). When no listed
+tool does a step, name the way you know: an open-source program or library (ffmpeg,
+OpenCV, a GitHub project) found with google_search or crawl4ai and run with
+execute_coding_task, so the commands that worked are saved and replayed. Use as few
+steps as the tools need. Never write a step with no way, and never ask for something
+already given or that a tool can get.
+"""
+
+
+def family_tool_catalog(goal_tags) -> str:
+    """The tools the agent's own family adds, by its goal tags, for the plan
+    writer: what the agent will be built with, read from the family's own
+    registration (one source), and only where the one tag rule keeps the tag
+    (marketing_tools.resolve_goal_tags; reel_studio is inert on central)."""
+    from integrations.agent_engine.marketing_tools import REEL_STUDIO_TAG, resolve_goal_tags
+    tags = resolve_goal_tags(list(goal_tags or ()), '') if goal_tags else []
+    lines = []
+    if REEL_STUDIO_TAG in tags:
+        from integrations.reel_studio.tools import describe_reel_tools
+        lines += describe_reel_tools()
+    if not lines:
+        return ''
+    return ("\nTHIS AGENT'S OWN TOOLS (its kind of agent also gets these):\n"
+            + ''.join('  - %-22s %s\n' % (name, desc) for name, desc in lines))
+
+
+def plan_writer_tools(goal_tags=()) -> str:
+    """What every plan writer is shown about doing the work: the tool list
+    (select_autonomous_tool_catalog, its opt-out kept), the agent's family
+    tools, and PLAN_WAYS_RULE."""
+    return select_autonomous_tool_catalog() + family_tool_catalog(goal_tags) + PLAN_WAYS_RULE
+
+
 # Store user-specific agents & their chat history
 user_agents: Dict[str, Tuple[Any, Any]] = {}
 
@@ -165,13 +209,17 @@ AGENT_CREATOR_SYSTEM_MESSAGE = """You are a custom agent bot creator. Your task 
         """
 
 
-def create_agents_for_user(user_id: str, autonomous=False, initial_description=None) -> Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]:
+def create_agents_for_user(user_id: str, autonomous=False, initial_description=None,
+                           goal_tags=()) -> Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]:
     """Create new assistant & user proxy agents for a user with basic configuration.
 
     Args:
         user_id: The user identifier
         autonomous: If True, the LLM answers its own questions (no human input)
         initial_description: When autonomous, the user's description of the desired agent
+        goal_tags: the goal tags the agent will be saved with (the turn's
+            creation hint), so its plan is written with its own tools
+            (plan_writer_tools)
     """
     # The ONE configured LLM, decided in core.autogen_config: the configured
     # endpoint, or the local llama-server when none is configured.  The
@@ -193,7 +241,7 @@ def create_agents_for_user(user_id: str, autonomous=False, initial_description=N
         # The planner MUST know the full tool set at its disposal so it plans
         # with the RIGHT tool per step instead of forcing GUI automation
         # (see select_autonomous_tool_catalog — ON by default).
-        _tool_map = select_autonomous_tool_catalog()
+        _tool_map = plan_writer_tools(goal_tags)
         # AUTONOMOUS MODE: REPLACE the interactive system message entirely.
         # Live test 2026-05-16 13:04 showed that APPENDING the PLAN_FIRST
         # suffix to AGENT_CREATOR_SYSTEM_MESSAGE was diluted by the older
@@ -211,7 +259,21 @@ STAGE 1 — FIRST CALL: emit a COMPLETE proposed plan with atomic steps.
 Response shape (EXACT keys, JSON only):
 {{"status":"proposed_plan","name":"<short readable name>","agent_name":"skill.local.name","goal":"<one-line goal>","broadcast_agent":false,"personas":[{{"name":"Executor","description":"<one line>"}}],"flows":[{{"flow_name":"main","persona":"Executor","actions":["<atomic step 1>","<atomic step 2>","..."],"sub_goal":"<one line>"}}],"extra_information":"<optional>","review_required":true}}
 
-RULES for flows[0].actions[]:
+FLOWS: "flows" is a list.  A simple task is ONE flow named "main".  A task
+description that names its own flows or stages (e.g. "Flow 1 ... Flow 7")
+gets ONE entry per named flow, in the order given, each with its own
+flow_name, sub_goal and actions, and every one of them is kept: never fold
+the named flows into one flow or into extra_information.  Each flow names
+its own persona: the PERSON that flow talks with, as the task names them
+(e.g. the child, a parent, a therapist), never the agent itself, because a
+person picks their persona when they first chat; and "personas" lists every
+persona a flow names.  Use "Executor" only when the task names no person
+for that flow.  Each flow's sub_goal is a result one turn can show, so its
+completion can be checked from that turn's evidence (e.g. "Arjun says ball"
+or "the parent sent three family photos"), never a vague aim ("improves
+speech").
+
+RULES for the actions[] of EACH flow:
 - ONE concrete observable action per item.  No "and then" compounds.
 - USE THE RIGHT TOOL from "AVAILABLE TOOLS" above for each step — do NOT default
   to GUI automation. Map the intent to the dedicated tool: recall / "what did we
@@ -229,13 +291,13 @@ RULES for flows[0].actions[]:
     "execute_windows_or_android_command: click the blue 'Post' button at the bottom-right of the compose modal"
     "execute_windows_or_android_command: take a screenshot to verify the post appeared in the feed"
 - Use AS FEW steps as the task needs: a question / recall / lookup is often ONE
-  tool step; only a genuine multi-step GUI task needs many (up to ~15). Do NOT pad
-  a tool-satisfiable task into a long GUI sequence.
+  tool step; only a genuine multi-step GUI task needs many (up to ~15 per flow).
+  Do NOT pad a tool-satisfiable task into a long GUI sequence.
 - Preserve EVERY detail of the task description in the plan.
 
 STAGE 2 — SUBSEQUENT CALL (incoming message is review verdict):
 - If incoming message is "approved" or starts with "approved": re-emit the SAME plan but with "status":"completed" and remove the "review_required" key.
-- Otherwise the message is refinement feedback: re-emit with "status":"proposed_plan" and apply the feedback to flows[0].actions[].
+- Otherwise the message is refinement feedback: re-emit with "status":"proposed_plan" and apply the feedback to the actions[] of the flow it names (flows[0] when it names none), keeping every other flow as it was.
 
 STAGE 3 — Downstream: on "completed", the dispatcher saves persona JSON and hands the atomic-step list to the autogen team (Helper + Executor), which calls the tool named in each step (get_chat_history, google_search, execute_coding_task, execute_windows_or_android_command, etc.).
 
@@ -246,7 +308,10 @@ ABSOLUTE RULES:
 - The user is sick / asleep / away.  You are talking to another agent.
 """
     else:
-        system_message = AGENT_CREATOR_SYSTEM_MESSAGE
+        # A person's plan is written with the same tools and rule as an
+        # autonomous one: shown no tool, Reel Studio (342) got 9 tool-less
+        # steps and its CREATE stalled (2026-11-04, see PLAN_WAYS_RULE).
+        system_message = AGENT_CREATOR_SYSTEM_MESSAGE + plan_writer_tools(goal_tags)
 
     # Create the assistant agent with context awareness
     assistant = autogen.AssistantAgent(
@@ -322,7 +387,7 @@ from core.llm_outbound_logger import with_source as _with_source
 
 
 @_with_source('autogen.gather')
-def gather_info(user_id, user_message, prompt_id, autonomous=False):
+def gather_info(user_id, user_message, prompt_id, autonomous=False, goal_tags=()):
     """Gather agent details via autogen conversation.
 
     Args:
@@ -330,6 +395,8 @@ def gather_info(user_id, user_message, prompt_id, autonomous=False):
         user_message: The user's message/description
         prompt_id: The prompt ID for this agent creation session
         autonomous: If True, LLM answers its own questions (no human input needed)
+        goal_tags: the turn's creation hint, the tags the agent is saved with;
+            the plan writer is shown that family's tools (plan_writer_tools)
     """
     # lazy_module never yields None, so the old `if autogen is None` check is not
     # just dead — it would silently stop guarding. Touch one attribute to force
@@ -358,7 +425,8 @@ def gather_info(user_id, user_message, prompt_id, autonomous=False):
             user_agents[user_prompt] = create_agents_for_user(
                 user_id,
                 autonomous=autonomous,
-                initial_description=user_message if autonomous else None
+                initial_description=user_message if autonomous else None,
+                goal_tags=goal_tags,
             )
 
         assistant, user_proxy = user_agents[user_prompt]

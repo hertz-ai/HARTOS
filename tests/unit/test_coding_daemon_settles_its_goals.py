@@ -418,3 +418,61 @@ def test_the_fifth_failed_dispatch_pauses_through_the_one_routine(db_path):
         PAUSE_CAUSE_DISPATCH_FAILURES, 'coding_daemon')
     assert cfg.get('paused_at')
     db2.close()
+
+
+def test_a_resumed_coding_goal_starts_its_strike_count_again(db_path, monkeypatch):
+    """Review of d73463359 by claude-autostart-71, item 1: this daemon keeps
+    its strike count on the row (_dispatch_failures) and only a turn that ran
+    clears it.  resume_goal moved the pause record to history but left the
+    count at 5, so the first failure after a person resumed the goal made it 6
+    and paused it again: one strike, not five.  A resume ends the count."""
+    from integrations.agent_engine.goal_manager import GoalManager
+    from integrations.social.migrations import run_migrations
+    from integrations.social.models import AgentGoal, get_db
+
+    monkeypatch.setenv('HEVOLVE_CODING_POLL_INTERVAL', '0')
+    run_migrations()
+    db = get_db()
+    row = AgentGoal(id='fix-resumed', goal_type='self_heal', title='Self-heal',
+                    status='active')
+    row.config_json = dict(_FIX_CONFIG, _dispatch_failures=4)
+    row.spark_budget = 200
+    row.spark_spent = 0
+    db.add(row)
+    db.commit()
+    db.close()
+
+    def _failed_tick():
+        with patch('integrations.coding_agent.idle_detection.'
+                   'IdleDetectionService.get_idle_agent_personas',
+                   return_value=[{'user_id': 'agent-1', 'username': 'a1'}]), \
+                patch('integrations.agent_engine.dispatch.should_yield_to_user',
+                      return_value=False), \
+                patch('integrations.agent_engine.budget_gate.'
+                      'check_platform_affordability', return_value=(True, {})), \
+                patch('integrations.agent_engine.dispatch.'
+                      'max_autonomous_concurrency', side_effect=lambda cap: cap), \
+                patch('integrations.agent_engine.dispatch.is_transient_deferral',
+                      return_value=False), \
+                patch('integrations.coding_agent.task_distributor.'
+                      'dispatch_to_chat', MagicMock(return_value=None)):
+            CodingAgentDaemon()._tick()
+
+    _failed_tick()                       # the fifth failure pauses it
+    db = get_db()
+    row = db.query(AgentGoal).filter_by(id='fix-resumed').first()
+    assert row.status == 'paused'
+    assert GoalManager.resume_goal(db, 'fix-resumed', 'owner').get('success')
+    db.commit()
+    resumed = dict(db.query(AgentGoal).filter_by(id='fix-resumed').first().config_json or {})
+    db.close()
+    assert '_dispatch_failures' not in resumed, resumed
+
+    _failed_tick()                       # one failure after the resume
+    db2 = get_db()
+    back = db2.query(AgentGoal).filter_by(id='fix-resumed').first()
+    cfg = back.config_json or {}
+    assert back.status == 'active', (
+        f'one failure after a resume paused the goal again: {cfg}')
+    assert cfg.get('_dispatch_failures') == 1, cfg
+    db2.close()

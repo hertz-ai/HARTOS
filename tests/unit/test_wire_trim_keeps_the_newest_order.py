@@ -15,9 +15,14 @@ the tool-carrying seats made during action 3:
     (get_user_id, get_data_by_key) and send_message_to_user.
   * 1 (the Assistant seat, 21:33:27) carried no Action #3 order at all: the
     seats' token limiter dropped ChatInstructor's dispatch before the wire.
-    Not covered here: whether the current order joins the protected set is
-    the owner's call (2026-10-28: what to protect "should ideally be learnt
-    by the auto evolve loop").
+    The protected set keeps the current order since 2f407f3de (the same
+    drop, measured again 2026-11-01 on the TTS provisioning goal; see
+    tests/unit/test_limiters_keep_the_current_order.py), but only while the
+    order leads its own turn: once the ROLE-ORDER-GUARD has merged it behind
+    a verdict, as at 21:33:14 above, the wire trim can still drop that turn
+    (review of 2f407f3de, finding 2; open).  The owner's
+    2026-10-28 note stands: what to protect "should ideally be learnt by
+    the auto evolve loop".
   * 1 (21:33:14) carried it, merged after a verdict as that turn's first
     order; the model started on it (get_user_id).
 

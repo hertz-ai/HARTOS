@@ -44,6 +44,11 @@ def _by_page(file_id, field='passage'):
 #: together, so this literal cannot drift from the column either.
 READER_ID_CHARS = 64
 
+#: 1.0 s after the epoch, a multiple of 100 ns so it round-trips exactly on
+#: NTFS (measured). Nothing real carries this mtime, so finding it unchanged
+#: proves nothing rewrote the file after it was published.
+_MTIME_SENTINEL = 1_000_000_000
+
 
 def _row(file_id):
     return bp.get_book(file_id)
@@ -149,7 +154,15 @@ class TestPageImages:
                 # Recorded only if it SUCCEEDED. shutil.move tries os.rename
                 # first and falls back to copy+delete on EXDEV, so counting
                 # the attempt let a cross-volume copy pass as a publish.
-                published.append((Path(dst), existed, Path(dst).stat().st_mtime_ns))
+                # A rewrite inside one clock tick leaves st_mtime_ns
+                # untouched (~15.6 ms on Windows), so comparing the
+                # publish-time mtime to the end-time mtime cannot see the
+                # rewrite it is here to catch: measured, an immediate second
+                # write_bytes left the value identical. A sentinel the OS
+                # would never produce has no resolution to lose, because any
+                # write at all resets mtime to now.
+                os.utime(dst, ns=(_MTIME_SENTINEL, _MTIME_SENTINEL))
+                published.append((Path(dst), existed))
                 return result
             return spy
 
@@ -181,7 +194,7 @@ class TestPageImages:
         # the copy -- exactly what this test's name forbids -- and survived all
         # 195 (MC_copy_publish). An atomic rename has no such window.
         assert len(published) == 1, published
-        target, served_existed, at_publish = published[0]
+        target, served_existed = published[0]
         assert target == out
         # Nothing had reached the served name before that atomic publish. A
         # copy into place FOLLOWED by a same-folder rename counts one rename
@@ -198,7 +211,7 @@ class TestPageImages:
         # And nothing touched the served name AFTER the publish. An atomic
         # publish followed by an in-place rewrite serves a half-written file
         # just as surely, and passed because nothing looked past the rename.
-        assert out.stat().st_mtime_ns == at_publish
+        assert out.stat().st_mtime_ns == _MTIME_SENTINEL
         assert list(tmp_path.iterdir()) == [out]
 
     def test_every_page_gets_an_image(self, book_node, tmp_path):
@@ -436,6 +449,51 @@ class TestFailures:
         assert result['stored'] is False and 'unavailable' in result['store_error']
         assert 'Acceleration is the rate of change of velocity.' in result['whole_text']
         assert bp.list_books('42') == []
+
+    def test_a_book_with_nowhere_to_store_it_leaves_no_pages_behind(
+            self, book_node, tmp_path, monkeypatch):
+        """_read_unstored's claim: the page images of a book that cannot be
+        stored "go to a scratch dir, for the vision model only, and are
+        removed after".
+
+        Neither half was held. The one test on this path -- the one above --
+        asserts the text and an empty library and never looks at a file, so a
+        read that left its pages in %TEMP%, or wrote them into the uploads
+        tree where they are served at a guessable URL, passed every test in
+        this file. The route is not exotic: an ordinary refusal reaches it,
+        a reader id the column cannot hold, and on a real node those pages
+        are the person's own document.
+
+        The render count is asserted FIRST because every assertion after it
+        is satisfied by a pipeline that never made an image at all.
+        """
+        import tempfile
+
+        systemp = tmp_path / 'systemp'
+        systemp.mkdir()
+        monkeypatch.setattr(tempfile, 'tempdir', str(systemp))
+
+        rendered, real_write_jpeg = [], bp._write_jpeg
+
+        def recording(image, out_path):
+            written = real_write_jpeg(image, out_path)
+            rendered.append(Path(written))
+            return written
+
+        monkeypatch.setattr(bp, '_write_jpeg', recording)
+
+        result = bp.parse_book(make_pdf(tmp_path / 'book.pdf'),
+                               'u' * (READER_ID_CHARS + 1))
+
+        assert result['stored'] is False
+        assert len(rendered) == 3, rendered          # it really did render
+        for page in rendered:
+            assert systemp in page.parents, page     # the scratch dir, not uploads
+            assert not page.exists(), f'{page.name} outlived the read'
+        assert list(systemp.iterdir()) == [], 'the scratch dir itself was left'
+        # And not ALSO into the served tree: a read that renders to the
+        # scratch dir and copies into uploads satisfies every line above.
+        assert not (bp.uploads_dir() / 'pdf_parse').exists()
 
     def _db_error(self, statement, params, message='disk I/O error'):
         """A real SQLAlchemy failure: str() renders the statement and the

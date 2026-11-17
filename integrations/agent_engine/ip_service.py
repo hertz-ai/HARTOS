@@ -27,6 +27,34 @@ from sqlalchemy.orm import Session
 
 logger = logging.getLogger('hevolve_social')
 
+#: The checks in IPService.get_loop_health that can report each loophole
+#: type.  A check that failed, or could not measure, leaves only these types
+#: unconfirmed (goal_seeding.remediation_still_open); before this map any
+#: failed check blocked every type (review of 6047bcf19, finding 3).  A type
+#: no check reports (gossip_partition, learning_stall) cannot be confirmed
+#: fixed from here.  Every type goal_seeding.LOOPHOLE_REMEDIATION_MAP can seed
+#: has an entry (tests/unit/test_paused_remediation_is_judged_again.py).
+#: single_node lists only the hive-agent check: the goal-volume check reports
+#: it at medium, which never holds a goal (SEVERE_SEVERITIES), so its failing
+#: says nothing about the high report (review of 3bb05b2e8).
+LOOPHOLE_CHECKS = {
+    'cold_start': ('world_model', 'ralt_propagation'),
+    'feedback_staleness': ('world_model',),
+    'single_node': ('hivemind_agents',),
+    'guardrail_drift': ('ralt_propagation',),
+    'recipe_drift': ('recipe_adoption',),
+    'gossip_partition': (),
+    'learning_stall': (),
+}
+
+#: The severities that make a loophole severe, in one place: the daemon
+#: seeds a remediation goal for them (goal_seeding.auto_remediate_loopholes),
+#: a remediation goal stays open while its loophole is reported at one
+#: (goal_seeding.remediation_still_open), and verify_exponential_improvement
+#: fails its fifth check on one.  Seeding and completion read two different
+#: rules until 2026-11-02 (review of 6047bcf19, finding 2).
+SEVERE_SEVERITIES = ('critical', 'high')
+
 
 class IPService:
     """Static service for IP protection operations."""
@@ -186,6 +214,13 @@ class IPService:
             'loop_verified': False,
             'improvement_rate': 0.0,
             'flywheel_loopholes': [],
+            # The checks below that raised or could not measure.  Each one
+            # swallows its error, so a failed check reports nothing it
+            # measures (the world-model check reports cold_start in its
+            # place): a type missing from flywheel_loopholes means "fixed"
+            # only when none of its checks (LOOPHOLE_CHECKS) is listed here
+            # (goal_seeding.remediation_still_open reads both).
+            'failed_checks': [],
         }
 
         # Loophole ownership map — which agent is responsible for fixing each
@@ -198,18 +233,37 @@ class IPService:
             'gossip_partition': 'guardrails',  # Guardrails agent monitors network health
         }
 
-        # 1. World model health
+        def _cold_start(message):
+            return {
+                'type': 'cold_start',
+                'owner': loophole_owners['cold_start'],
+                'severity': 'critical',
+                'message': message,
+                'remediation': 'HiveMind bootstrap: connect to collective for instant knowledge',
+            }
+
+        # 1. World model health.  A world model that does not answer is the
+        # cold start itself, the same loophole as a bridge that raises.  Until
+        # 2026-11-02 it was reported only through check 3's zero skill
+        # counter, which the bridge keeps whether or not anything answers.
+        # Checks 3 and 5 read the world model, so they measure nothing while
+        # it does not answer (``answering``).
+        answering = False
         try:
             from integrations.agent_engine.world_model_bridge import get_world_model_bridge
             bridge = get_world_model_bridge()
             health = bridge.check_health()
-            stats = bridge.get_learning_stats()
+            answering = bool(health.get('healthy', False))
+            stats = bridge.get_learning_stats() if answering else {}
             bridge_stats = bridge.get_stats()
             result['world_model'] = {
-                'healthy': health.get('healthy', False),
+                'healthy': answering,
                 'learning': stats.get('learning', {}),
                 'bridge': bridge_stats,
             }
+            if not answering:
+                result['flywheel_loopholes'].append(_cold_start(
+                    'World model does not answer — no learning happening'))
             # Loophole: queue backup → coding agent should fix flush pipeline
             queue_size = bridge_stats.get('queue_size', 0)
             if queue_size > 500:
@@ -221,13 +275,10 @@ class IPService:
                     'remediation': 'Coding agent: optimize _flush_to_world_model batch size or add workers',
                 })
         except Exception:
-            result['flywheel_loopholes'].append({
-                'type': 'cold_start',
-                'owner': loophole_owners['cold_start'],
-                'severity': 'critical',
-                'message': 'World model bridge unavailable — no learning happening',
-                'remediation': 'HiveMind bootstrap: connect to collective for instant knowledge',
-            })
+            answering = False
+            result['failed_checks'].append('world_model')
+            result['flywheel_loopholes'].append(_cold_start(
+                'World model bridge unavailable — no learning happening'))
 
         # 2. Agent performance
         try:
@@ -252,38 +303,45 @@ class IPService:
             finally:
                 db.close()
         except Exception:
-            pass
+            result['failed_checks'].append('agent_performance')
 
-        # 3. RALT propagation
-        try:
-            from integrations.agent_engine.world_model_bridge import get_world_model_bridge
-            bridge = get_world_model_bridge()
-            bs = bridge.get_stats()
-            distributed = bs.get('total_skills_distributed', 0)
-            blocked = bs.get('total_skills_blocked', 0)
-            result['ralt_propagation'] = {
-                'total_distributed': distributed,
-                'total_blocked': blocked,
-            }
-            if distributed == 0:
-                result['flywheel_loopholes'].append({
-                    'type': 'cold_start',
-                    'owner': loophole_owners['cold_start'],
-                    'severity': 'high',
-                    'message': 'Zero RALT skills distributed — hive is not learning from peers',
-                    'remediation': 'HiveMind bootstrap: first node seeds RALT from collective tensor fusion',
-                })
-            if blocked > distributed and distributed > 0:
-                result['flywheel_loopholes'].append({
-                    'type': 'guardrail_drift',
-                    'owner': loophole_owners['guardrail_drift'],
-                    'severity': 'medium',
-                    'message': f'More skills blocked ({blocked}) than distributed ({distributed})',
-                    'remediation': 'Guardrails agent: review filter thresholds — '
-                                  'deterministic gates may be too restrictive',
-                })
-        except Exception:
-            pass
+        # 3. RALT propagation.  The bridge's skill counters are its own and
+        # are kept whether or not a world model answers; with none answering
+        # they stay 0 and say nothing about the hive.  Measured on central
+        # 2026-11-02 (HevolveAI absent): that 0 was a cold-start loophole
+        # every hour.  Not measured, then: listed, never a loophole.
+        if not answering:
+            result['failed_checks'].append('ralt_propagation')
+        else:
+            try:
+                from integrations.agent_engine.world_model_bridge import get_world_model_bridge
+                bridge = get_world_model_bridge()
+                bs = bridge.get_stats()
+                distributed = bs.get('total_skills_distributed', 0)
+                blocked = bs.get('total_skills_blocked', 0)
+                result['ralt_propagation'] = {
+                    'total_distributed': distributed,
+                    'total_blocked': blocked,
+                }
+                if distributed == 0:
+                    result['flywheel_loopholes'].append({
+                        'type': 'cold_start',
+                        'owner': loophole_owners['cold_start'],
+                        'severity': 'high',
+                        'message': 'Zero RALT skills distributed — hive is not learning from peers',
+                        'remediation': 'HiveMind bootstrap: first node seeds RALT from collective tensor fusion',
+                    })
+                if blocked > distributed and distributed > 0:
+                    result['flywheel_loopholes'].append({
+                        'type': 'guardrail_drift',
+                        'owner': loophole_owners['guardrail_drift'],
+                        'severity': 'medium',
+                        'message': f'More skills blocked ({blocked}) than distributed ({distributed})',
+                        'remediation': 'Guardrails agent: review filter thresholds — '
+                                      'deterministic gates may be too restrictive',
+                    })
+            except Exception:
+                result['failed_checks'].append('ralt_propagation')
 
         # 4. Recipe adoption
         try:
@@ -312,25 +370,32 @@ class IPService:
                                       'staleness check before probabilistic re-creation',
                     })
         except Exception:
-            pass
+            result['failed_checks'].append('recipe_adoption')
 
-        # 5. HiveMind agents
-        try:
-            from integrations.agent_engine.world_model_bridge import get_world_model_bridge
-            bridge = get_world_model_bridge()
-            agents = bridge.get_hivemind_agents()
-            result['hivemind_agents'] = agents
-            if len(agents) < 3:
-                result['flywheel_loopholes'].append({
-                    'type': 'single_node',
-                    'owner': loophole_owners['single_node'],
-                    'severity': 'high',
-                    'message': f'Only {len(agents)} HiveMind agents connected — need 3+',
-                    'remediation': 'Marketing agent: grow node count; HiveMind bootstraps '
-                                  'new nodes with collective knowledge instantly',
-                })
-        except Exception:
-            pass
+        # 5. HiveMind agents, asked of the world model (its hive mind in
+        # process, or its HTTP API).  With none answering the bridge returns
+        # an empty list, which read as "0 agents connected": the high
+        # single_node loophole behind the 269 'Remediate Single Node' goals
+        # central completed by 2026-11-02.  Not measured, then.
+        if not answering:
+            result['failed_checks'].append('hivemind_agents')
+        else:
+            try:
+                from integrations.agent_engine.world_model_bridge import get_world_model_bridge
+                bridge = get_world_model_bridge()
+                agents = bridge.get_hivemind_agents()
+                result['hivemind_agents'] = agents
+                if len(agents) < 3:
+                    result['flywheel_loopholes'].append({
+                        'type': 'single_node',
+                        'owner': loophole_owners['single_node'],
+                        'severity': 'high',
+                        'message': f'Only {len(agents)} HiveMind agents connected — need 3+',
+                        'remediation': 'Marketing agent: grow node count; HiveMind bootstraps '
+                                      'new nodes with collective knowledge instantly',
+                    })
+            except Exception:
+                result['failed_checks'].append('hivemind_agents')
 
         return result
 
@@ -491,7 +556,11 @@ class IPService:
 
         # Check 3: RALT propagation
         ralt = health['ralt_propagation']
-        if ralt.get('total_distributed', 0) >= 3:
+        if 'ralt_propagation' in health.get('failed_checks', []):
+            # Not run (no world model answering): its 0 is no count.
+            evidence.append('FAIL: RALT propagation not measured (the world '
+                            'model does not answer)')
+        elif ralt.get('total_distributed', 0) >= 3:
             checks_passed += 1
             evidence.append(
                 f'RALT distributed {ralt["total_distributed"]} skills across hive')
@@ -514,7 +583,7 @@ class IPService:
         loopholes = health.get('flywheel_loopholes', [])
         critical_loopholes = [l for l in loopholes
                               if isinstance(l, dict) and
-                              l.get('severity') in ('critical', 'high')]
+                              l.get('severity') in SEVERE_SEVERITIES]
         if not critical_loopholes:
             checks_passed += 1
             evidence.append('No critical flywheel loopholes detected')

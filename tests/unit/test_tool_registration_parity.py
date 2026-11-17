@@ -522,6 +522,45 @@ def track_keys():
             pass
 
 
+@pytest.fixture(params=['kept_grant', 'no_consent_store'])
+def join(request, monkeypatch, track_keys):
+    """Make a cross-user join the way a node does, in both states of the
+    node's consent store (review of 31c54b71b, MF3): joined_chats reads the
+    kept chat_join grants whenever the store is readable, and this process's
+    chat_joinees only when it is not, so a join written to chat_joinees alone
+    is invisible once an earlier test has created the social tables.
+    'kept_grant': the store is there and the join is a grant (record_join).
+    'no_consent_store': no store (central), the join lives in chat_joinees."""
+    import core.persona_registry as pr
+    written: list = []
+    if request.param == 'kept_grant':
+        from integrations.social.models import Base, get_engine
+        Base.metadata.create_all(get_engine())
+    else:
+        def _no_store(*_a, **_k):
+            raise RuntimeError('no consent store on this node')
+        monkeypatch.setattr(pr, '_kept_joins', _no_store)
+        monkeypatch.setattr(pr, '_consent_store_kept_here', lambda: False)
+
+    def _join(creator, prompt_id, joiner):
+        if request.param == 'kept_grant':
+            assert pr.record_join(creator, prompt_id, joiner) is True
+            written.append((creator, prompt_id))
+        else:
+            track_keys.append((pr.chat_joinees, joiner))
+            pr.chat_joinees[joiner] = {prompt_id: creator}
+
+    yield _join
+    if written:
+        from integrations.social.models import UserConsent, db_session
+        with db_session() as db:
+            for creator, prompt_id in written:
+                db.query(UserConsent).filter(
+                    UserConsent.user_id == str(creator),
+                    UserConsent.consent_type == pr.JOIN_CONSENT_TYPE,
+                    UserConsent.agent_id == str(prompt_id)).delete()
+
+
 class TestCrossUserJoinResolution:
     """_resolve_session_for_user: own-session hit, join fallback, and the
     isolation guarantees that keep one tenant out of another's session."""
@@ -539,21 +578,20 @@ class TestCrossUserJoinResolution:
         assert key == 'alice_pown'
         assert [e['role'] for e in sessions] == ['student']
 
-    def test_cross_user_join_returns_creator_session_and_key(self, track_keys):
-        """Joinee with an empty own session + a chat_joinees mapping to a
-        creator that HAS a session resolves to the creator's session,
-        under the CREATOR's key (creator_key), not the joinee's."""
+    def test_cross_user_join_returns_creator_session_and_key(
+            self, track_keys, join):
+        """Joinee with an empty own session, joined to a creator that HAS a
+        session, resolves to the creator's session, under the CREATOR's key
+        (creator_key), not the joinee's."""
         from core.persona_registry import (
-            agents_session, agents_roles, chat_joinees,
+            agents_session, agents_roles,
             register_persona_for_session, _resolve_session_for_user,
         )
         track_keys.append((agents_session, 'creator_pj'))
         track_keys.append((agents_roles, 'creator_pj'))
-        track_keys.append((chat_joinees, 'joinee'))
         register_persona_for_session(
             'creator', 'pj', [{'name': 'student'}, {'name': 'parent'}])
-        # reuse_recipe.py:855 shape: {joinee: {prompt_id: creator}}
-        chat_joinees['joinee'] = {'pj': 'creator'}
+        join('creator', 'pj', 'joinee')
 
         sessions, key = _resolve_session_for_user('joinee', 'pj')
         assert key == 'creator_pj', (
@@ -651,6 +689,17 @@ class TestCrossUserJoinResolution:
             def get(self, *a, **k):
                 raise RuntimeError('cache boom')
 
+        def _no_grants(*_a, **_k):
+            raise RuntimeError('no consent store')
+
+        # The join is read from the kept grants first and from chat_joinees
+        # only when those cannot be read (persona_registry.joined_chats), so
+        # both readers fail here.
+        monkeypatch.setattr(pr, '_kept_joins', _no_grants)
+        # A node with no consent store at all: only then is chat_joinees read
+        # (review of 86f4c71f8).  An earlier test in this file may have made
+        # the consent table, so say it, rather than depend on file order.
+        monkeypatch.setattr(pr, '_consent_store_kept_here', lambda: False)
         monkeypatch.setattr(pr, 'chat_joinees', _Raiser())
         with caplog.at_level(logging.WARNING, logger='core.persona_registry'):
             sessions, key = pr._resolve_session_for_user('whoever', 'pexc')
@@ -667,15 +716,15 @@ class TestPersonaOwnerTopicRouting:
     never leaks onto the caller's own topic, and an unrelated caller can
     reach no personas at all."""
 
-    def test_joinee_broadcast_routes_to_persona_owner_topic(self, track_keys):
+    def test_joinee_broadcast_routes_to_persona_owner_topic(
+            self, track_keys, join):
         from core.persona_registry import (
-            agents_session, agents_roles, chat_joinees,
+            agents_session, agents_roles,
             register_persona_for_session, _send_message_to_roles_impl,
             multichat_topic_for,
         )
         track_keys.append((agents_session, 'alice_pmix'))
         track_keys.append((agents_roles, 'alice_pmix'))
-        track_keys.append((chat_joinees, 'bob'))
         register_persona_for_session(
             'alice', 'pmix', [{'name': 'student'}, {'name': 'parent'}])
         # bob joins alice's chat: his persona is appended to ALICE's
@@ -684,7 +733,7 @@ class TestPersonaOwnerTopicRouting:
             'agentInstanceID': 'com.hertzai.hevolve.chat.pmix.bob',
             'user_id': 'bob', 'role': 'guest', 'deviceID': 'something',
         })
-        chat_joinees['bob'] = {'pmix': 'alice'}
+        join('alice', 'pmix', 'bob')
 
         captured = []
 
@@ -710,24 +759,23 @@ class TestPersonaOwnerTopicRouting:
         assert payload['message'] == 'hi teacher'
 
     def test_broadcast_to_joinee_owned_persona_routes_to_joinee_topic(
-            self, track_keys):
+            self, track_keys, join):
         """Same shared session, but the target persona is the JOINEE's own
         entry (user_id='bob'): topic must be bob's, proving the topic is
         derived per-entry from the owner, not a single session-wide user."""
         from core.persona_registry import (
-            agents_session, agents_roles, chat_joinees,
+            agents_session, agents_roles,
             register_persona_for_session, _send_message_to_roles_impl,
             multichat_topic_for,
         )
         track_keys.append((agents_session, 'alice_pmix2'))
         track_keys.append((agents_roles, 'alice_pmix2'))
-        track_keys.append((chat_joinees, 'bob'))
         register_persona_for_session('alice', 'pmix2', [{'name': 'student'}])
         agents_session['alice_pmix2'].append({
             'agentInstanceID': 'com.hertzai.hevolve.chat.pmix2.bob',
             'user_id': 'bob', 'role': 'guest', 'deviceID': 'something',
         })
-        chat_joinees['bob'] = {'pmix2': 'alice'}
+        join('alice', 'pmix2', 'bob')
 
         captured = []
         result = _send_message_to_roles_impl(

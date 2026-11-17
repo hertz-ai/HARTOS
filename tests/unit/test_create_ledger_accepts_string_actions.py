@@ -94,7 +94,9 @@ def test_a_fresh_process_resuming_flow_1_gets_its_own_ledger(tmp_path, monkeypat
     from the old numbering).  The factory resumed THAT session, so flow 1's
     action_1 was flow 0's COMPLETED task, and AUTO-ADVANCE (create_recipe.py,
     _ca_ledger_done) requested flow 1 action 1's recipe before it ever ran."""
-    monkeypatch.chdir(tmp_path)          # agent_data/ resolves against the CWD
+    monkeypatch.chdir(tmp_path)
+    import core.cache_loaders as _cl     # ledgers live in the node's agent-data folder
+    monkeypatch.setattr(_cl, 'AGENT_DATA_DIR', str(tmp_path / 'agent_data'))
     old_session = 'u_87400889007_1000'
     create_ledger_from_actions(agent_id=PROMPT, session_id=old_session,
                                actions=FLOW_0, flow_id=0)

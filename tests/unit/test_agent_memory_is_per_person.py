@@ -113,7 +113,7 @@ def test_another_persons_save_never_erases_mine(store_dir):
 def test_a_person_cannot_read_what_another_saved(store_dir):
     store = _store()
     _tools(store, CREATOR)['save_data_in_memory']('notes', {'secret': 'mine'})
-    assert _tools(store, VISITOR)['get_data_by_key']('notes') == NOT_FOUND
+    assert _tools(store, VISITOR)['get_data_by_key']('notes').startswith(NOT_FOUND)
 
 
 def test_a_save_is_written_under_the_person_and_agent_key(store_dir):
@@ -129,7 +129,7 @@ def test_a_persons_memory_survives_a_restart(store_dir):
     # A new process: a fresh cache restores from disk.
     after = _store()
     assert '3' in _tools(after, CREATOR)['get_data_by_key']('progress.chapter')
-    assert _tools(after, VISITOR)['get_data_by_key']('progress') == NOT_FOUND
+    assert _tools(after, VISITOR)['get_data_by_key']('progress').startswith(NOT_FOUND)
 
 
 def test_a_first_save_after_a_restart_adds_to_the_file(store_dir):
@@ -174,7 +174,7 @@ def test_while_building_a_template_can_be_saved_for_everyone(store_dir,
     visitor = _tools(_store(), VISITOR)
     assert visitor['get_data_by_key']('receipt_template') == \
         'Bill for {service}: {amount}'
-    assert visitor['get_data_by_key']('client') == NOT_FOUND
+    assert visitor['get_data_by_key']('client').startswith(NOT_FOUND)
     assert cache_loaders.load_agent_data(AGENT) == {
         'receipt_template': 'Bill for {service}: {amount}'}
 
@@ -187,7 +187,7 @@ def test_outside_building_for_everyone_stays_personal(store_dir):
         'teach', [{'topic': 'Fractions'}], for_everyone=True)
     assert 'for this person only' in out
     assert cache_loaders.load_agent_data(AGENT) is None
-    assert _tools(store, CREATOR)['get_data_by_key']('teach') == NOT_FOUND
+    assert _tools(store, CREATOR)['get_data_by_key']('teach').startswith(NOT_FOUND)
 
 
 def test_a_non_creator_in_create_cannot_save_for_everyone(store_dir,
@@ -214,7 +214,7 @@ def test_the_string_false_shares_nothing(store_dir, creator_config):
     _tools(store, CREATOR, building=True)['save_data_in_memory'](
         'client', {'name': 'Priya'}, for_everyone='false')
     assert cache_loaders.load_agent_data(AGENT) is None
-    assert _tools(store, VISITOR)['get_data_by_key']('client') == NOT_FOUND
+    assert _tools(store, VISITOR)['get_data_by_key']('client').startswith(NOT_FOUND)
 
 
 @pytest.mark.parametrize('config', [None, {'prompt_id': AGENT}],

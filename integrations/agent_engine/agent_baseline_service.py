@@ -167,7 +167,7 @@ class AgentBaselineService:
             recipe_path = os.path.join(PROMPTS_DIR, f'{prompt_id}_{flow_id}_recipe.json')
             if not os.path.exists(recipe_path):
                 return {}
-            with open(recipe_path, 'r') as f:
+            with open(recipe_path, 'r', encoding='utf-8') as f:
                 recipe = json.load(f)
 
             actions = recipe.get('actions', [])
@@ -498,7 +498,7 @@ class AgentBaselineService:
         if not os.path.isfile(fpath):
             return None
         try:
-            with open(fpath, 'r') as f:
+            with open(fpath, 'r', encoding='utf-8') as f:
                 return json.load(f)
         except Exception:
             return None
@@ -519,7 +519,7 @@ class AgentBaselineService:
             if not m:
                 continue
             try:
-                with open(os.path.join(agent_dir, fname), 'r') as f:
+                with open(os.path.join(agent_dir, fname), 'r', encoding='utf-8') as f:
                     snap = json.load(f)
                 results.append({
                     'version': snap.get('version'),

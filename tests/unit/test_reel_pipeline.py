@@ -358,10 +358,16 @@ def test_a_second_reel_while_one_is_being_made_is_busy(turn):
 
 
 def test_no_clips_is_needs_clips(turn):
+    """The agent is told how to ask her for clips, the reason included.
+    ask_person refuses a file_request with no reason (ab68963ea), so the
+    instruction names the description the ask needs: followed literally
+    without one, it cost the agent a refused round-trip (review of
+    ab68963ea, SF-2)."""
     from integrations.reel_studio import pipeline as P
     result = P.make_reel(user_id=UID, prompt_id=PID, request_id='r', clips=[],
                          style=C.make_style({}))
     assert result['status'] == 'needs_clips' and result['message']
+    assert 'description' in result['message']
 
 
 def _canned_ffmpeg(mp, path, fixture):

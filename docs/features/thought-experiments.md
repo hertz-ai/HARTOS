@@ -90,6 +90,55 @@ it.  Approved needs all of:
   signed-in human account holding the central (steward) role; an abstain is
   no answer, and `decide()` waits for a FOR or AGAINST
 
+### Evaluating here: on a flat node, this node's own experiments need no vote
+
+Owner rulings: 2026-11-14 *"voting shd not be a prerequisite to evolve
+locally untill we cross the intelligence barrier"*; 2026-11-15 *"the no ovite
+experiment applies only for topology flat, for regional and central it shd
+remain with voites"*.  `voting_rules.evaluation_permit(tally,
+this_nodes_own=..., asked_by_this_node=...)` is the one rule the
+evaluation-goal writer and auto-evolve both ask:
+
+- an experiment the vote approved may be evaluated, whoever asks, on every
+  topology;
+- otherwise only when ALL hold:
+  - the experiment is this node's **own**;
+  - the node is flat, as claimed AND as proven (`node_topology.is_flat_node`,
+    the same rule a call grant's machine owner uses): `HEVOLVE_NODE_TIER`
+    unset, empty or `flat`, and `key_delegation.get_node_tier()` says flat.
+    Any other claim (`regional`, `central`, `local`, a typo) keeps the vote,
+    and so does a node its master key made central;
+  - **this node asked**: its own auto-evolve cycle (paced: `max_experiments`
+    per cycle, one cycle at a time), or the owner signed in.  Anyone else's
+    `POST /evaluate` gets the vote, so no other account can start the node's
+    experiments;
+  - its context is not `steward_required` (security stays with people);
+  - no voter is against it: any vote AGAINST holds it, at any weight (0
+    included) and whether or not the voter id has an account here
+    (`voting_rules.identities_holding`, counted from the votes before they
+    are merged per identity, so another agent's FOR cannot cancel an agent's
+    AGAINST; a hold counts on the safe side, the quorum does not).  It is
+    released when that vote is changed to FOR or to an abstain (0), when the
+    person an agent's vote counts as votes FOR themself, or when the vote
+    approves it;
+- **own** and **this node asked** (`voting_rules.node_holds`): the account
+  is the owner `HEVOLVE_OWNER_USER_ID` names, or a `system` account owned by
+  no one with no password (the node's `nunba` account, made by
+  `ensure_system_user`).  Never an agent (`/auth/register` makes ownerless
+  agents for anyone and takes `owner_id` from the request body) and never a
+  `system` account with a password (the same route takes `user_type` from
+  the body);
+- a refusal says why and what would let it run (`permit.reason`, `hint`):
+  `not_this_nodes_own`, `topology_keeps_the_vote`, `not_asked_by_this_node`,
+  `steward_required` or `vote_against`.
+
+The permit decides whether the evaluation goal is made; `decide()` keeps the
+vote.  Where that goal then runs is the daemon's ordinary dispatch, which can
+hand a goal to hive peers when a shared (Redis) coordinator and peers exist
+(`dispatch.dispatch_goal`; not measured for these goals).  The intelligence
+barrier has no measure yet; when the owner defines one, `evaluation_permit`
+is where the vote returns.
+
 ### Tally
 
 ```python
@@ -129,10 +178,10 @@ The agent's autogen conversation loop drives iteration. See [auto-evolve.md](aut
 
 A single "Auto Evolve" button triggers democratic selection and dispatch:
 
-1. Gather eligible experiments
+1. Gather eligible experiments (voted ones, and on a flat node this node's own)
 2. Constitutional filter
-3. Democratic vote tally
-4. Select top-N by approval score
+3. Democratic vote tally (on a flat node this node's own need no vote; see above)
+4. Select top-N: vote-approved by score, then this node's own, newest first
 5. Dispatch to type-aware iteration loops
 
 Owner can pause/resume their experiment mid-iteration. See [auto-evolve.md](auto-evolve.md).

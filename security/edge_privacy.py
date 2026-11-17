@@ -285,7 +285,11 @@ def _leaf_policy(key: Any, value: str, gossip: bool) -> str:
     lk = key.lower()
     if _is_contact_key(lk):
         return _CONTACT
-    if is_secret_key(lk):
+    # The name as the one rule reads it (secret_key_form): lowercased alone,
+    # 'API-Key', 'x-api-key', 'private-key' and 'user-pwd' were no secrets
+    # here and secrets to person_ask (claude-autostart-71's review of
+    # 14e8e7907).  The gossip exemption stays on the exact key.
+    if is_secret_key(secret_key_form(key)):
         if gossip and lk in _GOSSIP_SECRET_KEYS:
             return _EXEMPT
         return _SECRET

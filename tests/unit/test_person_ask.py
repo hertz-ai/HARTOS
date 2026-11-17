@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -661,6 +662,19 @@ def test_a_file_request_names_the_kind_of_file_its_store_takes(legs, purpose, ac
     assert legs['cards'][-1][1].get('accept') == accept
 
 
+@pytest.mark.parametrize('purpose, written, shown', [
+    ('logo', 'video', 'image'), ('reel_source', 'image', 'video'),
+    ('song_audio', 'video/mp4', 'audio'),
+    ('chat_attachment', 'image', 'image'), ('chat_attachment', 'font', None)])
+def test_an_agents_accept_never_contradicts_its_store(legs, purpose, written, shown):
+    """An agent's ``accept`` that names a kind the store refuses for the
+    purpose opened a picker whose every pick the store then turned away
+    (review of ec468c821): the kind shown is the store's."""
+    out = _ask(component=dict(CLIPS, purpose=purpose, accept=written))
+    assert out['ok'], out
+    assert legs['cards'][-1][1].get('accept') == shown
+
+
 @pytest.fixture
 def store(monkeypatch):
     """A real user file store in a temp dir (no disk margin: the test files
@@ -775,6 +789,10 @@ def test_the_tool_holds_the_ask_when_the_person_has_not_answered(legs):
     func = _tool()
     reply = json.loads(func(json.dumps(POST), 0))
     assert reply['answered'] is False and reply['status'] == 'waiting_for_person'
+    # The held reply names the tool to read the answer with by its
+    # registered name, as a whole word (it was hand-written).
+    name = person_ask.ask_person_tool('10202', '342')[0]
+    assert re.search(r'\b%s\(ask_id=' % re.escape(name), reply['note']), reply['note']
     ask_id = reply['ask_id']
     assert person_ask.answer_ask(ask_id, {'decision': 'approve'}, '10202')[1] == 200
     later = json.loads(func('', 0, ask_id))
@@ -802,6 +820,185 @@ def test_the_tool_reports_a_refusal_instead_of_asking(legs):
     reply = json.loads(func('not json', 0))
     assert reply['answered'] is False and reply['refused'] == 'not_an_object'
     assert legs['cards'] == []
+
+
+def test_the_tool_names_the_purposes_a_file_request_takes():
+    """Live, 2026-11-01 (agent 342, request 5da92036): seven file_requests
+    under five purposes the model made up ('reel_clips' twice), all refused.
+    The store takes 'reel_source'; the tool's component example showed it,
+    but nothing listed the purposes there are."""
+    from core.user_file_store import INBOUND_PURPOSES
+    from integrations.agent_engine import person_ask
+    _name, desc, _func = person_ask.ask_person_tool('10202', '342')
+    assert [p for p in INBOUND_PURPOSES if p not in desc] == []
+
+
+def test_a_wrong_purpose_is_told_the_purposes_there_are(legs):
+    """The refusal of a purpose the store does not keep names the ones it
+    does, so the agent's next ask can name one; nothing is guessed for it."""
+    from core.user_file_store import INBOUND_PURPOSES
+    func = _tool()
+    wrong = {'type': 'file_request', 'purpose': 'reel_clips', 'accept': 'video'}
+    reply = json.loads(func(json.dumps(wrong), 0))
+    assert reply['refused'] == 'unknown_purpose'
+    assert reply['purposes'] == list(INBOUND_PURPOSES)
+    assert legs['cards'] == []
+    # Its reason too: an ask with none is not sent (test_an_ask_says_who_and_why).
+    again = json.loads(func(json.dumps(dict(wrong, purpose='reel_source',
+                                            description='Send the clips for your reel.')), 0))
+    assert again['status'] == 'waiting_for_person', again
+    assert legs['cards'][-1][1]['purpose'] == 'reel_source'
+
+
+def test_the_main_leg_menu_offers_the_tool_under_the_name_it_registers():
+    """The menu that decides what a turn's agent sees and the tool's own
+    registration read one name (core.agent_tool_menu.ASK_PERSON_TOOL)."""
+    from core.agent_tool_menu import MAIN_LEG_CORE_TOOLS
+    from integrations.agent_engine import person_ask
+    assert person_ask.ask_person_tool('10202', '342')[0] in MAIN_LEG_CORE_TOOLS
+
+
+def test_other_refusals_name_no_purposes(legs):
+    reply = json.loads(_tool()('not json', 0))
+    assert 'purposes' not in reply
+
+
+# -- every refusal says what was wrong and what to do (owner 11-09) ------------------
+
+def _refused_reply(func, component):
+    """The tool's refused reply: the failed shape it always had, plus a note."""
+    sent = component if isinstance(component, str) else json.dumps(component)
+    reply = json.loads(func(sent, 0))
+    assert reply['answered'] is False and reply['status'] == 'refused', reply
+    assert reply['note'].startswith('Not sent'), reply
+    return reply
+
+
+def test_too_many_open_asks_names_the_agents_own_questions_to_read(legs):
+    """Owner 11-09: "all refusals shd hint llm on what was wrong with tool
+    call".  66 of the desktop's 135 failing tool replies were this refusal
+    as a bare code, and the 4B asked again (hartos-16, llm_outbound.jsonl).
+    The note says how many are open, not to ask again, and which of this
+    agent's own asks to read; another agent is never shown them."""
+    from integrations.agent_engine import person_ask
+    func = _tool()
+    ids = [json.loads(func(json.dumps(dict(POST, action=f'a{i}')), 0))['ask_id']
+           for i in range(person_ask.MAX_OPEN_PER_PERSON)]
+    reply = _refused_reply(func, dict(POST, action='one_more'))
+    assert reply['refused'] == 'too_many_open_asks'
+    note = reply['note']
+    assert f'{person_ask.MAX_OPEN_PER_PERSON} questions' in note, note
+    assert 'Do not ask again' in note and all(i in note for i in ids), note
+    assert re.search(r'\bask_person\(ask_id=', note), note
+    theirs = _refused_reply(person_ask.ask_person_tool('10202', '999')[2],
+                            dict(POST, action='theirs'))
+    assert theirs['refused'] == 'too_many_open_asks'
+    assert not any(i in theirs['note'] for i in ids), theirs['note']
+    assert "other agents' questions" in theirs['note'], theirs['note']
+    person_ask.answer_ask(ids[0], {'decision': 'approve'}, '10202')
+    again = json.loads(func(json.dumps(dict(POST, action='one_more')), 0))
+    assert again['status'] == 'waiting_for_person', again
+
+
+@pytest.mark.parametrize('sent, says', [
+    ('not json', 'not JSON'),
+    ('[1, 2]', 'not an object'),
+    ('{"description": "Why I ask."}', 'no "type"'),
+])
+def test_a_component_that_is_not_an_ask_is_told_its_shape(legs, sent, says):
+    reply = _refused_reply(_tool(), sent)
+    assert reply['refused'] == 'not_an_object'
+    assert says in reply['note'] and '"type": "form"' in reply['note'], reply['note']
+    assert legs['cards'] == []
+
+
+SECRET = {'type': 'form', 'description': 'To sign you in.',
+          'fields': [{'name': 'password', 'type': 'password'}]}
+FILES = {'type': 'file_request', 'purpose': 'reel_source',
+         'description': 'Send the clips for your reel.'}
+
+
+@pytest.mark.parametrize('case, code, says', [
+    ('no_person', 'no_person', 'no person to ask'),
+    # request_resource is not on the main leg (MAIN_LEG_CORE_TOOLS), so the
+    # note also names request_tools, which attaches it by name (review of
+    # dead56131: a model told only "request_resource" got "tool not found").
+    ('secret', 'secrets_go_to_the_vault', 'request_tools with need="request_resource"'),
+    ('purpose', 'unknown_purpose', 'one of purposes'),
+    ('no_reason', 'say_why_in_description', '"description"'),
+    ('no_agent', 'no_agent', 'without the files'),
+    ('not_shown', 'not_shown', 'carry on without asking'),
+    ('not_filed', 'not_filed', 'Try once more later'),
+])
+def test_every_refusal_says_what_was_wrong_and_what_to_do(legs, monkeypatch, case, code, says):
+    from integrations.agent_engine import person_ask
+    import integrations.agent_engine.liquid_ui_service as lui
+    from integrations.social.services import NotificationService
+    func, comp = _tool(), dict(POST)
+    if case == 'no_person':
+        monkeypatch.setattr(person_ask, 'person_to_ask', lambda *a, **k: '')
+    elif case == 'secret':
+        comp = dict(SECRET)
+    elif case == 'purpose':
+        comp = dict(FILES, purpose='reel_clips')
+    elif case == 'no_reason':
+        comp = {'type': 'approval', 'action': 'post_the_reel'}
+    elif case == 'no_agent':
+        func, comp = person_ask.ask_person_tool('10202', None)[2], dict(FILES)
+    elif case == 'not_shown':
+        monkeypatch.setattr(lui, 'push_agent_ui', lambda *a, **k: False)
+    elif case == 'not_filed':
+        def _no_row(*a, **k):
+            raise RuntimeError('the row could not be written')
+        monkeypatch.setattr(NotificationService, 'create', _no_row)
+    reply = _refused_reply(func, comp)
+    assert reply['refused'] == code, reply
+    assert says in reply['note'], reply['note']
+
+
+def test_an_ask_id_she_has_no_question_under_says_which_id_to_use(legs):
+    """5 of the 6 ask_id reads measured were made-up ids (review of
+    dead56131): the note says how to ask instead."""
+    reply = json.loads(_tool()('', 0, 'no-such-ask'))
+    assert reply['answered'] is False and reply['status'] == 'not_found', reply
+    assert 'leave ask_id empty' in reply['note'], reply
+
+
+def test_the_secret_note_names_tools_the_agent_can_reach():
+    """The note's route works from the main leg: request_tools is registered
+    on both legs (register_request_tools) and attaches a core closure the
+    need names; request_resource is one (build_core_tool_closures)."""
+    from core.agent_tool_menu import MAIN_LEG_CORE_TOOLS
+    from integrations.agent_engine import person_ask
+    note = person_ask._refusal_note('secrets_go_to_the_vault', {}, '10202', '342', False)
+    assert 'request_resource' not in MAIN_LEG_CORE_TOOLS
+    assert 'request_tools with need="request_resource"' in note, note
+
+
+def test_too_many_open_asks_lists_only_this_persons_questions(legs):
+    """Review of dead56131 (mutant M7 survived): the same agent asking two
+    people; the one refused is shown only the questions open with them."""
+    from integrations.agent_engine import person_ask
+    hers, his = _tool('10202'), _tool('777')
+    her_ids = [json.loads(hers(json.dumps(dict(POST, action=f'h{i}')), 0))['ask_id']
+               for i in range(person_ask.MAX_OPEN_PER_PERSON)]
+    his_ids = [json.loads(his(json.dumps(dict(POST, action=f'm{i}')), 0))['ask_id']
+               for i in range(person_ask.MAX_OPEN_PER_PERSON)]
+    note = _refused_reply(his, dict(POST, action='one_more'))['note']
+    assert all(i in note for i in his_ids), note
+    assert not any(i in note for i in her_ids), note
+
+
+def test_an_own_turn_refusal_lists_own_turn_questions(legs):
+    """The person's own turn counts and lists the asks of the person's own
+    turns, never background work's (the open-ask limit is per kind)."""
+    from integrations.agent_engine import person_ask
+    own = person_ask.ask_person_tool('10202', '342', request_id=lambda: 'req-own-turn')[2]
+    ids = [json.loads(own(json.dumps(dict(POST, action=f'o{i}')), 0))['ask_id']
+           for i in range(person_ask.MAX_OPEN_PER_PERSON)]
+    note = _refused_reply(own, dict(POST, action='one_more'))['note']
+    assert 'from background work' not in note, note
+    assert all(i in note for i in ids), note
 
 
 def test_the_tool_never_waits_longer_than_its_ceiling(legs, monkeypatch):
