@@ -27,6 +27,8 @@ import os
 import re
 import threading
 import time
+import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Annotated, Optional, Dict, List, NamedTuple
 
@@ -74,12 +76,15 @@ class Sender(NamedTuple):
     when it names none).  ``found`` is False when the goal is not on this
     node or could not be read.  ``creator`` is the account that made the
     goal (AgentGoal.created_by): which mailbox the goal may use depends on
-    it (_may_use_mailbox)."""
+    it (_may_use_mailbox).  ``copy_verified``: the owner has verified the
+    goal's copy (config copy_verified, mark_goal_copy_verified), so its
+    follow-up sequences go out; until then they are held."""
     goal_id: str
     address: Optional[str]
     title: str = ''
     found: bool = True
     creator: Optional[str] = None
+    copy_verified: bool = False
 
 
 def goal_sender(goal_id) -> Optional[Sender]:
@@ -104,10 +109,12 @@ def goal_sender(goal_id) -> Optional[Sender]:
             goal = db.query(AgentGoal).filter_by(id=goal_id).first()
             if goal is None:
                 return Sender(goal_id, None, found=False)
-            address = (goal.config_json or {}).get('sender_email')
+            config = goal.config_json or {}
+            address = config.get('sender_email')
             address = address.strip() if isinstance(address, str) else ''
             return Sender(goal_id, address or None, goal.title or '',
-                          creator=str(goal.created_by) if goal.created_by else None)
+                          creator=str(goal.created_by) if goal.created_by else None,
+                          copy_verified=config.get('copy_verified') is True)
     except Exception:
         logger.warning("Goal %s: the mailbox it sends from could not be read",
                        goal_id, exc_info=True)
@@ -397,21 +404,22 @@ def _may_use_mailbox(creator, address) -> bool:
         return False
 
 
-def _send_from_goal_mailbox(sender: Sender, to_email: str, subject: str,
-                            plain_text: str, html: str) -> Dict:
-    """Send a goal's email from the mailbox its config names, and from no
-    other; refuse, saying what to fix, when it names none, the goal is not
-    here, that mailbox is not connected, or the goal's creator may not use
-    it (_may_use_mailbox).  Never the mailer."""
+def _goal_mailbox(sender: Sender) -> tuple:
+    """``(adapter, loop, None)``: the live mailbox a goal sends from, and the
+    loop that owns it; or ``(None, None, refusal)`` saying what to fix when
+    the goal is not here, names no mailbox, that mailbox is not connected,
+    or the goal's creator may not use it (_may_use_mailbox).  Asked before an
+    email is held as well as before one is sent: an email that could never
+    leave is not put in front of the owner."""
     title = (sender.title or sender.goal_id)[:_TITLE_CAP]
     if not sender.found:
-        return _refused_send(
+        return None, None, _refused_send(
             f"the goal this email is for ({sender.goal_id}) is not on this "
             f"node or could not be read, so the mailbox it goes from is unknown",
             "Create the prospect again in the turn of the goal it is for, so it "
             "carries that goal." + _NEVER_ANOTHER_MAILBOX)
     if not sender.address:
-        return _refused_send(
+        return None, None, _refused_send(
             f"goal '{title}' names no mailbox: its config has no sender_email",
             "The owner adds \"sender_email\" (the address this goal's email "
             "goes from) to the goal's config, and connects that mailbox in "
@@ -427,20 +435,27 @@ def _send_from_goal_mailbox(sender: Sender, to_email: str, subject: str,
                        sender.goal_id, exc_info=True)
     if (adapter is None or loop is None or not hasattr(adapter, 'send_email')
             or not adapter.is_running()):
-        return _refused_send(
+        return None, None, _refused_send(
             f"the mailbox {sender.address} that goal '{title}' sends from is "
             f"not connected on this node",
             f"Connect {sender.address} in the channel setup form (Email: IMAP "
             f"server, SMTP server, address and password)."
             + _NEVER_ANOTHER_MAILBOX)
     if not _may_use_mailbox(sender.creator, sender.address):
-        return _refused_send(
+        return None, None, _refused_send(
             f"goal '{title}' may not send from {sender.address}: the account "
             f"that made it did not connect that mailbox",
             f"A mailbox is used only by goals made by the account that "
             f"connected it, or by this node's owner. Have that account (or "
             f"the owner) create this goal, or connect {sender.address} from "
             f"the account that made it." + _NEVER_ANOTHER_MAILBOX)
+    return adapter, loop, None
+
+
+def _send_from_goal_mailbox(sender: Sender, adapter, loop, to_email: str,
+                            subject: str, plain_text: str, html: str) -> Dict:
+    """Send a goal's email from its mailbox (_goal_mailbox: the one that
+    names it and says whether it may) and from no other.  Never the mailer."""
     import asyncio
     try:
         result = asyncio.run_coroutine_threadsafe(
@@ -456,7 +471,9 @@ def _send_from_goal_mailbox(sender: Sender, to_email: str, subject: str,
 
 
 def _send_email(to_email: str, subject: str, html_body: str,
-                sender: Optional[Sender] = None) -> Dict:
+                sender: Optional[Sender] = None,
+                prospect_id: Optional[str] = None,
+                verified: bool = False) -> Dict:
     """Send one outreach email from the mailbox it belongs to.
 
     ``sender``: the goal the email is for and the mailbox its config names
@@ -465,6 +482,14 @@ def _send_email(to_email: str, subject: str, html_body: str,
     goal names none, is not on this node, or its mailbox is not connected
     here, the send is refused with what to fix, and never sent from another
     mailbox or the mailer (owner, 2026-11-16).
+
+    ``verified``: the words are the owner's to trust: a follow-up step of a
+    goal whose copy the owner verified (send_due_followups), or a held draft
+    the owner approved (approve_held_draft).  A goal's email that is not is
+    HELD, not sent: ``{'success': False, 'held': True, 'draft_id': ...}``,
+    kept for the owner (_hold_email), which needs ``prospect_id`` (the
+    prospect it is for).  The caller reads 'held' before it reads a refusal:
+    a held email is not a refused try.  An email for no goal is not held.
 
     No sender: the email serves no goal.  It goes through the node's own
     email channel, else the HertzAI mailer, as every send did before
@@ -483,7 +508,12 @@ def _send_email(to_email: str, subject: str, html_body: str,
     if refused is not None:
         return refused
     if sender is not None:
-        return _send_from_goal_mailbox(sender, to_email, subject,
+        adapter, loop, unable = _goal_mailbox(sender)
+        if unable is not None:
+            return unable
+        if not verified:
+            return _hold_email(sender, prospect_id, subject, sanitized_body)
+        return _send_from_goal_mailbox(sender, adapter, loop, to_email, subject,
                                        plain_text, sanitized_body)
     mailboxes = _goal_mailboxes()
     if mailboxes:
@@ -703,6 +733,253 @@ def undelivered_summary(data: Dict, limit: int = UNDELIVERED_LIST_LIMIT) -> Dict
             'latest': entries[:limit]}
 
 
+# ── Verified before it leaves: held drafts and goal copy ──
+# Owner, 16 Nov 2026: "You verify all the outgoing emails on my behalf from
+# central."  What a goal's email says is the owner's to approve, in two ways:
+#   * the goal's TEMPLATES, the follow-up sequences its agent writes: created
+#     'held' while the goal's copy is not verified (config copy_verified);
+#     the owner verifies the goal (mark_goal_copy_verified) and its held
+#     sequences go 'active', the one state the follow-up checker sends;
+#   * every OTHER email of a goal -- words a model wrote this turn
+#     (send_outreach_email, a reply), or the journey's own copy -- is kept as
+#     a held draft and not sent, until the owner approves it
+#     (approve_held_draft), which sends exactly that text.
+# A held email costs no send attempt, and the agent is told it goes out once
+# approved so it does not send it again.  The owner reads the held drafts
+# (list_held_drafts) with subject and body, never the recipient's address.
+
+#: What the agent that wrote a held email is told (the tool's 'note').
+HELD_NOTE = (
+    "This email is held for verification: it goes out once the owner "
+    "approves it, exactly as written. It is not sent yet and nothing is "
+    "lost. Do not send it again and do not send another version of it; keep "
+    "working on other prospects.")
+_HELD_FILE_NAME = 'outreach_held_drafts.json'
+#: Longest reason a rejection keeps.
+_REASON_CAP = 500
+_held_lock = threading.RLock()
+
+
+def _held_file() -> str:
+    """The held drafts' file: beside the prospect store, in its own file, so
+    a journey tick saving its older copy of the prospect store can never
+    take a draft written meanwhile with it."""
+    return os.path.join(os.path.dirname(os.path.abspath(_PROSPECT_FILE)),
+                        _HELD_FILE_NAME)
+
+
+def _read_held(path: str) -> Dict:
+    """The held drafts file as a dict with 'drafts' (empty when there is
+    none).  A file that cannot be read raises: reading it as empty and
+    saving over it would lose the owner's drafts."""
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            loaded = json.load(f)
+    except FileNotFoundError:
+        return {'drafts': {}}
+    except (OSError, json.JSONDecodeError):
+        logger.error("The held outreach drafts could not be read (%s); "
+                     "nothing was changed", path, exc_info=True)
+        raise
+    if isinstance(loaded, dict) and isinstance(loaded.get('drafts'), dict):
+        return loaded
+    return {'drafts': {}}
+
+
+@contextmanager
+def _held_drafts():
+    """The held drafts (a dict by draft id), locked for the caller's
+    read-modify-write and saved when the block ends without raising."""
+    with _held_lock:
+        path = _held_file()
+        data = _read_held(path)
+        yield data['drafts']
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{uuid.uuid4().hex[:8]}.tmp"
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, default=str)
+        os.replace(tmp, path)
+
+
+def _hold_email(sender: Sender, prospect_id: Optional[str], subject: str,
+                body_html: str) -> Dict:
+    """Keep a goal's email for the owner's approval instead of sending it:
+    ``{'success': False, 'held': True, 'draft_id': ...}`` (_send_email's
+    result shape).  The same email asked again is the same draft; one the
+    owner already rejected or sent is refused, saying so.  The recipient's
+    address is not kept (the prospect is: approve_held_draft resolves it)
+    and is never logged."""
+    if not prospect_id:
+        return _refused_send(
+            "this email names no prospect, so it cannot be held for the "
+            "owner's verification",
+            "Send it to a prospect of the goal (create_prospect first), so "
+            "the owner can approve it." + _NEVER_ANOTHER_MAILBOX, via='held')
+    with _held_drafts() as drafts:
+        for draft_id, draft in drafts.items():
+            if (draft.get('prospect_id'), draft.get('subject'),
+                    draft.get('body_html')) != (prospect_id, subject, body_html):
+                continue
+            if draft.get('status') == 'held':
+                return {'success': False, 'held': True, 'draft_id': draft_id,
+                        'via': 'held'}
+            if draft.get('status') == 'rejected':
+                return _refused_send(
+                    f"the owner rejected this exact email: "
+                    f"{draft.get('reason') or 'no reason given'}",
+                    "Write a different email that answers that, and send "
+                    "that one.", via='held')
+            return _refused_send(
+                "this exact email was already sent to this prospect",
+                "Write a different email, or move on to the next prospect.",
+                via='held')
+        draft_id = uuid.uuid4().hex[:12]
+        drafts[draft_id] = {
+            'draft_id': draft_id, 'goal_id': sender.goal_id,
+            'prospect_id': prospect_id, 'subject': subject,
+            'body_html': body_html, 'status': 'held',
+            'created_at': datetime.utcnow().isoformat()}
+    logger.info("Outreach email held for verification: draft %s of goal %s",
+                draft_id, sender.goal_id)
+    return {'success': False, 'held': True, 'draft_id': draft_id, 'via': 'held'}
+
+
+def list_held_drafts(goal_id: Optional[str] = None,
+                     status: str = 'held') -> List[Dict]:
+    """The held drafts (``status``: held, sent or rejected; ``goal_id``
+    narrows to one goal), oldest first, as the owner reads them: the
+    subject and body as written, the prospect's company, and for a rejected
+    one its reason.  Never the recipient's address."""
+    with _held_lock:
+        drafts = _read_held(_held_file())['drafts']
+    rows = [dict(d) for d in drafts.values()
+            if d.get('status') == status
+            and (goal_id is None or d.get('goal_id') == goal_id)]
+    prospects = _load_prospects().get('prospects', {})
+    for row in rows:
+        row['company'] = (prospects.get(row.get('prospect_id')) or {}).get('company')
+    rows.sort(key=lambda d: d.get('created_at') or '')
+    return rows
+
+
+def approve_held_draft(draft_id: str, approved_by: str) -> Dict:
+    """The owner approves a held draft: its exact text is sent to its
+    prospect through _send_email (verified: held no more), so the outgoing
+    check and the goal's mailbox rules still apply.  ``{'sent': True, ...}``;
+    otherwise ``{'sent': False, 'error': ...}`` and a draft that could not go
+    stays held.  One writer: the admin route and anything else that
+    approves comes here."""
+    with _held_drafts() as drafts:
+        draft = drafts.get(str(draft_id))
+        if draft is None:
+            return {'sent': False, 'error': f'no held draft {draft_id}'}
+        if draft.get('status') != 'held':
+            return {'sent': False, 'draft_id': draft['draft_id'],
+                    'error': f"draft {draft_id} is {draft.get('status')}, not held"}
+        draft['status'] = 'sending'      # a second approval cannot send it twice
+        draft = dict(draft)
+    sent = False
+    try:
+        data = _load_prospects()
+        prospect = data['prospects'].get(draft['prospect_id'])
+        if not prospect:
+            return {'sent': False, 'draft_id': draft['draft_id'],
+                    'error': 'its prospect is no longer in the store'}
+        result = _send_email(prospect['email'], draft['subject'],
+                             draft['body_html'], sender=prospect_sender(prospect),
+                             prospect_id=draft['prospect_id'], verified=True)
+        if not result.get('success'):
+            return {'sent': False, 'draft_id': draft['draft_id'],
+                    'error': _send_error_text(result)}
+        sent = True
+        now = datetime.utcnow()
+        data = _load_prospects()
+        prospect = data['prospects'].get(draft['prospect_id'])
+        if prospect:
+            data.setdefault('sent_log', []).append({
+                'prospect_id': draft['prospect_id'], 'to': prospect['email'],
+                'subject': draft['subject'], 'sequence_step': 1,
+                'sent_at': now.isoformat(), 'send_result': result})
+            count_delivered(prospect, now)
+            if prospect.get('stage') == 'new':
+                prospect['stage'] = 'contacted'
+            _save_prospects(data)
+        return {'sent': True, 'draft_id': draft['draft_id'], 'send_result': result}
+    finally:
+        with _held_drafts() as drafts:
+            kept = drafts.get(draft['draft_id'])
+            if kept is not None:
+                kept['status'] = 'sent' if sent else 'held'
+                if sent:
+                    kept['approved_by'] = str(approved_by)
+                    kept['sent_at'] = datetime.utcnow().isoformat()
+
+
+def reject_held_draft(draft_id: str, reason: Optional[str],
+                      rejected_by: str) -> Dict:
+    """The owner turns a held draft down; ``reason`` (required) is kept with
+    it, and the agent that writes the same email again is told why."""
+    reason = (reason or '').strip()[:_REASON_CAP]
+    if not reason:
+        return {'success': False,
+                'error': 'a rejection needs its reason: say what is wrong '
+                         'with the email, so the agent can write a better one'}
+    with _held_drafts() as drafts:
+        draft = drafts.get(str(draft_id))
+        if draft is None:
+            return {'success': False, 'error': f'no held draft {draft_id}'}
+        if draft.get('status') != 'held':
+            return {'success': False,
+                    'error': f"draft {draft_id} is {draft.get('status')}, not held"}
+        draft.update(status='rejected', reason=reason,
+                     rejected_by=str(rejected_by),
+                     rejected_at=datetime.utcnow().isoformat())
+    return {'success': True, 'draft_id': str(draft_id), 'status': 'rejected'}
+
+
+def mark_goal_copy_verified(goal_id: str, verified_by: str) -> Dict:
+    """The owner verifies a goal's copy: ``copy_verified`` is written into
+    the goal's config (GoalManager.update_goal), and the goal's held
+    follow-up sequences go 'active' (the follow-up checker sends only those;
+    sequences created from now on are active).  Emails the agent writes
+    outside a sequence are still held, verified goal or not."""
+    from integrations.agent_engine.goal_manager import GoalManager
+    from integrations.social.models import AgentGoal, db_session
+    goal_id = str(goal_id)
+    with db_session() as db:
+        goal = db.query(AgentGoal).filter_by(id=goal_id).first()
+        if goal is None:
+            return {'success': False, 'error': f'no goal {goal_id} on this node'}
+        config = dict(goal.config_json or {})
+        config.update(copy_verified=True, copy_verified_by=str(verified_by),
+                      copy_verified_at=datetime.utcnow().isoformat())
+        updated = GoalManager.update_goal(db, goal_id, config_json=config)
+    if not updated.get('success'):
+        return {'success': False, 'error': updated.get('error') or 'not updated'}
+    data = _load_prospects()
+    released = 0
+    for sequence in data.get('sequences', {}).values():
+        owner = data['prospects'].get(sequence.get('prospect_id')) or {}
+        if sequence.get('status') == 'held' and owner.get('goal_id') == goal_id:
+            sequence['status'] = 'active'
+            released += 1
+    if released:
+        _save_prospects(data)
+    logger.info("Goal %s: copy verified, %d held sequence(s) released",
+                goal_id, released)
+    return {'success': True, 'goal_id': goal_id, 'sequences_released': released}
+
+
+def _new_sequence_status(prospect: Dict) -> str:
+    """The status a follow-up sequence of ``prospect`` starts in: 'active'
+    when its goal's copy is verified, or when it belongs to no goal; else
+    'held' (a goal that is not on this node counts as unverified)."""
+    sender = prospect_sender(prospect)
+    if sender is None:
+        return 'active'
+    return 'active' if sender.found and sender.copy_verified else 'held'
+
+
 def register_outreach_tools(helper, assistant, user_id: str):
     """Register outreach CRM tools with the agent (Tier 2).
 
@@ -769,8 +1046,11 @@ def register_outreach_tools(helper, assistant, user_id: str):
 
         Sends from the mailbox of the prospect's goal (the sender_email its
         config names); a prospect no goal holds goes through this node's own
-        email sender.  A refused send says why and what the owner sets up.
-        Updates prospect stage to 'contacted' on first email.
+        email sender.  A goal's email is HELD for the owner's verification
+        and goes out once approved, exactly as written: the reply says so, and
+        the email is not to be sent again.  A refused send says why and what
+        the owner sets up.  Updates prospect stage to 'contacted' on first
+        email (when it is sent).
         """
         data = _load_prospects()
         prospect = data['prospects'].get(prospect_id)
@@ -785,7 +1065,15 @@ def register_outreach_tools(helper, assistant, user_id: str):
             subject=subject,
             html_body=body_html,
             sender=prospect_sender(prospect),
+            prospect_id=prospect_id,
         )
+        if result.get('held'):
+            # Kept for the owner, not sent and not refused: the prospect
+            # stays as it was, and the agent is told not to send it again.
+            return json.dumps({
+                'success': True, 'sent': False, 'held': True,
+                'draft_id': result['draft_id'], 'note': HELD_NOTE,
+                'prospect_stage': prospect['stage']})
         if not result.get('success'):
             # Not sent: the prospect stays as it was and the agent reads
             # why.  Counting it moved prospects nobody had reached to
@@ -874,17 +1162,26 @@ def register_outreach_tools(helper, assistant, user_id: str):
             'name': sequence_name,
             'steps': scheduled_steps,
             'created_at': datetime.utcnow().isoformat(),
+            # held -> active when the owner verifies the goal's copy
+            # (mark_goal_copy_verified; a sequence of a goal whose copy is
+            # not verified starts held, and only an active one is sent);
             # active -> completed (every step done, or a reply), or
             # failed (a step given up: the address or the sender is not
             # taking mail, so later steps are not sent to it).
-            'status': 'active',
+            'status': _new_sequence_status(prospect),
             'exit_on_reply': True,
         }
 
         data['sequences'][sequence_id] = sequence
         _save_prospects(data)
 
-        return json.dumps({'success': True, 'sequence': sequence})
+        reply = {'success': True, 'sequence': sequence}
+        if sequence['status'] == 'held':
+            reply['note'] = (
+                "This follow-up sequence is held for verification: its emails "
+                "are sent once the owner verifies this goal's copy. Nothing is "
+                "lost; do not create it again.")
+        return json.dumps(reply)
 
     def check_pending_followups() -> str:
         """Check all active sequences for follow-ups that are due.
@@ -1036,6 +1333,9 @@ def register_outreach_tools(helper, assistant, user_id: str):
         # Every row imported in a goal's turn is that goal's prospect: its
         # email goes from the goal's own mailbox (prospect_sender).
         turn_goal = _turn_goal_id()
+        # What every sequence of this batch starts as (they all share the
+        # goal): held until the owner verifies the goal's copy.
+        new_sequence_status = _new_sequence_status({'goal_id': turn_goal})
 
         for idx, row in enumerate(rows):
             try:
@@ -1098,7 +1398,7 @@ def register_outreach_tools(helper, assistant, user_id: str):
                         'name': f'Bulk-import sequence for {company}',
                         'steps': scheduled,
                         'created_at': datetime.utcnow().isoformat(),
-                        'status': 'active',
+                        'status': new_sequence_status,
                         'exit_on_reply': True,
                     }
                     created_sequences.append(seq_id)
@@ -1204,6 +1504,7 @@ def send_due_followups(data: Dict, now: datetime,
     as often as OUTREACH_SEND_ATTEMPTS allows.
     """
     actions_taken = []
+    senders = {}        # goal id -> Sender, one read per goal per check
 
     for seq_id, sequence in data.get('sequences', {}).items():
         if sequence['status'] != 'active':
@@ -1213,6 +1514,24 @@ def send_due_followups(data: Dict, now: datetime,
 
         prospect = data['prospects'].get(sequence['prospect_id'])
         if not prospect:
+            continue
+
+        # Only a goal whose copy the owner verified has its sequences sent
+        # (owner, 16 Nov: every goal email is verified before it leaves).  A
+        # sequence made active before that rule, or by hand, waits too, and
+        # its steps use no send attempt.
+        goal_id = prospect.get('goal_id')
+        if goal_id and goal_id not in senders:
+            senders[goal_id] = prospect_sender(prospect)
+        sender = senders.get(goal_id) if goal_id else None
+        if goal_id and not (sender is not None and sender.found
+                            and sender.copy_verified):
+            sequence['status'] = 'held'
+            actions_taken.append({
+                'action': 'sequence_held',
+                'reason': 'copy_not_verified',
+                'prospect': prospect['company'],
+            })
             continue
 
         # Exit condition: prospect already replied
@@ -1244,7 +1563,9 @@ def send_due_followups(data: Dict, now: datetime,
                 to_email=prospect['email'],
                 subject=step['subject'],
                 html_body=step['body_html'],
-                sender=prospect_sender(prospect),
+                sender=sender,
+                prospect_id=sequence['prospect_id'],
+                verified=True,
             )
             if result.get('success'):
                 step['status'] = 'sent'
@@ -1390,7 +1711,8 @@ def handle_inbound_email(sender_email: str, subject: str, body: str,
 
     # ── Pause all active sequences for this prospect ──
     for seq_id, sequence in data.get('sequences', {}).items():
-        if sequence.get('prospect_id') == matched_prospect['id'] and sequence['status'] == 'active':
+        if (sequence.get('prospect_id') == matched_prospect['id']
+                and sequence['status'] in ('active', 'held')):
             sequence['status'] = 'completed'
             logger.info(f"Sequence {seq_id} auto-completed: prospect {matched_prospect['company']} replied")
 
@@ -1495,13 +1817,20 @@ def _dispatch_response_draft(prospect: Dict, context: Dict):
             f"2. Reference what they said specifically.\n"
             f"3. Propose a concrete next step (call, demo, meeting link).\n"
             f"4. Keep it short — 3-5 sentences max.\n"
-            f"5. Do NOT send the email automatically — present the draft for user approval.\n"
+            f"5. Write the reply with send_outreach_email for this prospect. "
+            f"It is held for the owner's approval and goes out only once "
+            f"approved, so it is safe to write; do not send it again.\n"
         )
 
+        # A prospect of a goal is answered in that goal's own turn: only
+        # there may a tool write to its prospects, and the reply is held for
+        # the owner like any email the goal's agent writes.  One no goal
+        # holds keeps a turn of its own (it can write nothing to a goal).
         dispatch_goal(
             prompt=prompt,
             user_id=user_id,
-            goal_id=f"outreach_reply_{prospect['id']}_{int(time.time())}",
+            goal_id=(prospect.get('goal_id')
+                     or f"outreach_reply_{prospect['id']}_{int(time.time())}"),
             goal_type='outreach',
         )
     except Exception as e:

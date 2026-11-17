@@ -429,9 +429,15 @@ class JourneyEngine:
         if channel == 'email':
             try:
                 from integrations.agent_engine.outreach_crm_tools import (
-                    _send_email, prospect_sender)
+                    HELD_NOTE, _send_email, prospect_sender)
                 result = _send_email(prospect['email'], 'Update from HevolveAI',
-                                     message, sender=prospect_sender(prospect))
+                                     message, sender=prospect_sender(prospect),
+                                     prospect_id=prospect.get('id'))
+                if result.get('held'):
+                    # Held for the owner, not lost: no other channel is tried.
+                    return {'success': True, 'sent': False, 'held': True,
+                            'channel': 'email', 'draft_id': result['draft_id'],
+                            'note': HELD_NOTE}
                 return {'success': result.get('success', False), 'channel': 'email'}
             except Exception as e:
                 return {'success': False, 'error': str(e)}
@@ -579,7 +585,12 @@ class JourneyEngine:
                 return {'skipped': True, 'reason': 'waiting to try again',
                         'retry_after': draft.get('retry_after')}
             result = _send_email(prospect['email'], draft['subject'], draft['body'],
-                                 sender=prospect_sender(prospect))
+                                 sender=prospect_sender(prospect),
+                                 prospect_id=prospect.get('id'))
+            if result.get('held'):
+                # Held for the owner's verification: not sent, and not a
+                # refused try (approve_held_draft sends and counts it).
+                return {'sent': False, 'held': True, 'draft_id': result['draft_id']}
             # 'via' names the sender on a refused send too: only success
             # counts as sent.
             if result.get('success'):
@@ -671,7 +682,10 @@ class JourneyEngine:
                 '<p>happy to adjust to your timezone.</p>'
                 '<p>sathish</p>',
                 sender=prospect_sender(prospect),
+                prospect_id=prospect.get('id'),
             )
+            if result.get('held'):
+                return {'proposed': False, 'held': True, 'draft_id': result['draft_id']}
             # Proposed only when the email went out.  A refused proposal is
             # not retried on its own: tick() has no 'engaged' branch, so
             # this runs again only when the prospect enters 'engaged' again

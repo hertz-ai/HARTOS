@@ -752,6 +752,59 @@ def update_channel_security(channel_type: str):
 
 
 # ============================================================================
+# OUTREACH VERIFICATION (owner, 2026-11-16: "You verify all the outgoing
+# emails on my behalf from central")
+# ============================================================================
+# The owner's side of the held drafts and goal copy kept by
+# integrations.agent_engine.outreach_crm_tools.  On this blueprint so the one
+# admin gate above (_admin_auth_gate: on central, the operator only) covers
+# them; each is a thin call of that module's one function.
+
+@admin_bp.route("/outreach/held", methods=["GET"])
+@api_response
+def list_held_outreach():
+    """Held drafts (?status=held|sent|rejected, ?goal_id=), with subject and
+    body as written; never the recipient's address."""
+    from integrations.agent_engine.outreach_crm_tools import list_held_drafts
+    return {"drafts": list_held_drafts(goal_id=request.args.get("goal_id") or None,
+                                       status=request.args.get("status") or "held")}
+
+
+@admin_bp.route("/outreach/held/<draft_id>/approve", methods=["POST"])
+@api_response
+def approve_held_outreach(draft_id: str):
+    """Send one held draft exactly as written."""
+    from integrations.agent_engine.outreach_crm_tools import approve_held_draft
+    out = approve_held_draft(draft_id, approved_by=g.user_id)
+    if not out.get("sent"):
+        raise ValueError(out.get("error") or "not sent")
+    return out
+
+
+@admin_bp.route("/outreach/held/<draft_id>/reject", methods=["POST"])
+@api_response
+def reject_held_outreach(draft_id: str):
+    """Turn a held draft down; body {"reason": "..."} (required)."""
+    from integrations.agent_engine.outreach_crm_tools import reject_held_draft
+    out = reject_held_draft(draft_id, (request.get_json(silent=True) or {}).get("reason"),
+                            rejected_by=g.user_id)
+    if not out.get("success"):
+        raise ValueError(out.get("error"))
+    return out
+
+
+@admin_bp.route("/outreach/goals/<goal_id>/copy-verified", methods=["POST"])
+@api_response
+def verify_goal_copy(goal_id: str):
+    """Mark a goal's copy verified: its held follow-up sequences go active."""
+    from integrations.agent_engine.outreach_crm_tools import mark_goal_copy_verified
+    out = mark_goal_copy_verified(goal_id, verified_by=g.user_id)
+    if not out.get("success"):
+        raise ValueError(out.get("error"))
+    return out
+
+
+# ============================================================================
 # QUEUE/PIPELINE ENDPOINTS (15+ endpoints)
 # ============================================================================
 

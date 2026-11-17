@@ -152,10 +152,13 @@ def _fake_servers(world):
             self.user = user
 
         def send_message(self, msg, *a, **k):
+            html = next((p.get_payload(decode=True).decode('utf-8')
+                         for p in msg.walk()
+                         if p.get_content_type() == 'text/html'), None)
             with world.lock:
                 world.sent.append({'host': self.host, 'login': self.user,
                                    'from': msg['From'], 'to': msg['To'],
-                                   'subject': msg['Subject']})
+                                   'subject': msg['Subject'], 'html': html})
 
         def quit(self):
             return 221, b'bye'
@@ -306,14 +309,30 @@ def _prospect(tools, company, address, goal_id=None):
     return json.loads(out)['prospect']['id']
 
 
+def _approved(out):
+    """A send tool's reply, as if the owner approved at once what it held.
+    A goal's email is held for the owner (HELD_NOTE) and goes out when the
+    one approver sends it, exactly as written: ``out`` with the approval's
+    outcome folded into the tool's own reply shape (success, sent,
+    send_result, error).  A reply that is not held (a refusal, or an email
+    for no goal) is returned as it was."""
+    if not out.get('held'):
+        return out
+    from integrations.agent_engine import outreach_crm_tools
+    approved = outreach_crm_tools.approve_held_draft(out['draft_id'], approved_by=OWNER)
+    return dict(out, success=approved['sent'], sent=approved['sent'],
+                send_result=approved.get('send_result'), error=approved.get('error'))
+
+
 def _send(tools, pid):
     """send_outreach_email to ``pid`` as its goal's own agent would: in that
-    goal's turn when the prospect has a goal, else outside any turn."""
+    goal's turn when the prospect has a goal, else outside any turn; a held
+    email approved at once (_approved)."""
     from integrations.agent_engine import outreach_crm_tools
     goal = outreach_crm_tools._load_prospects()['prospects'][pid].get('goal_id')
     args = (pid, 'a question about your centre', '<p>hello</p>')
     send = tools['send_outreach_email']
-    return json.loads(_in_turn(goal, send, *args) if goal else send(*args))
+    return _approved(json.loads(_in_turn(goal, send, *args) if goal else send(*args)))
 
 
 def _reply(frm, to, subject, body):
@@ -415,6 +434,8 @@ def test_follow_ups_and_the_journeys_first_email_go_from_the_prospects_goal_mail
         _connect(address)
         _mailbox(node.channels, address)
     tools = _tools(monkeypatch, node.store)
+    for goal in ('g-speech', 'g-lashes'):        # the owner verified both goals' copy
+        node.store.mark_goal_copy_verified(goal, verified_by=OWNER)
     speech = _prospect(tools, 'Clinic', 'ana@clinic.example', 'g-speech')
     lashes = _prospect(tools, 'Salon', 'ravi@salon.example', 'g-lashes')
     step = json.dumps([{'delay_days': 0, 'subject': 'bump',
@@ -431,9 +452,12 @@ def test_follow_ups_and_the_journeys_first_email_go_from_the_prospects_goal_mail
     data = node.store._load_prospects()
     first = dict(data['prospects'][lashes], emails_sent=0,
                  email_draft={'subject': 'hello', 'body': '<p>hello</p>'})
-    result = JourneyEngine()._action_send_email(first, {})
+    held = JourneyEngine()._action_send_email(first, {})      # held for the owner
+    assert held.get('held') is True and node.mail.sent_from(MCGROCE)[1:] == []
+    approved = node.store.approve_held_draft(held['draft_id'], approved_by=OWNER)
+    result = {'sent': approved['sent']}
 
-    assert result.get('sent') is True, result
+    assert result.get('sent') is True, approved
     assert [m['to'] for m in node.mail.sent_from(MCGROCE)] == [
         'ravi@salon.example', 'ravi@salon.example']
     assert len(node.mail.sent_from(HEVOLVE)) == 1
@@ -775,9 +799,9 @@ def test_a_goals_turn_sends_only_to_its_own_goals_prospects(node, monkeypatch):
         assert "Speech therapy centres" in json.dumps(out)
     assert node.store._load_prospects()['sequences'] == {}
     assert node.mail.sent == []
-    own = json.loads(_in_turn('g-speech', tools['send_outreach_email'],
-                              speech, 'a question', '<p>hello</p>'))
-    assert own['success'] is True
+    own = _approved(json.loads(_in_turn('g-speech', tools['send_outreach_email'],
+                                        speech, 'a question', '<p>hello</p>')))
+    assert own['success'] is True and own['held'] is True
     assert [m['to'] for m in node.mail.sent_from(HEVOLVE)] == ['ana@clinic.example']
 
 
@@ -1071,8 +1095,8 @@ def web(node):
 def _send_in(goal, tools, to='victim@anywhere.example', subject='cheap watches'):
     """A goal's agent creates a prospect and emails it, in the goal's own turn."""
     pid = _prospect(tools, 'Anyone', to, goal)
-    return json.loads(_in_turn(goal, tools['send_outreach_email'], pid, subject,
-                               '<p>buy our watches</p>'))
+    return _approved(json.loads(_in_turn(goal, tools['send_outreach_email'], pid,
+                                         subject, '<p>buy our watches</p>')))
 
 
 def test_a_strangers_goal_cannot_send_from_a_company_mailbox(node, web, monkeypatch):
