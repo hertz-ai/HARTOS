@@ -14,9 +14,15 @@ Consumers:
 """
 
 import asyncio
+import importlib
 import logging
+import os
+import sys
+import threading
 import time
 from typing import List, Optional
+
+from core.subprocess_safe import run_bounded
 
 logger = logging.getLogger(__name__)
 
@@ -26,17 +32,205 @@ _crawler_available = None  # None = not checked yet
 
 
 def _check_available() -> bool:
-    """Check if crawl4ai library is installed (cached)."""
+    """Whether crawl4ai can crawl here (cached): it imports AND a Playwright
+    Chromium is installed.  The package without its browser cannot open a
+    page: live 2026-11-16 the setup's pip step landed crawl4ai but stopped
+    before Chromium, and an import-only check would have called it ready and
+    never offered the setup again."""
     global _crawler_available
     if _crawler_available is not None:
         return _crawler_available
-    try:
-        import crawl4ai  # noqa: F401
-        _crawler_available = True
-    except ImportError:
+    if not _crawl4ai_importable():
         logger.info("crawl4ai not installed, using requests+BeautifulSoup fallback")
         _crawler_available = False
+    elif not _browser_installed():
+        logger.info("crawl4ai has no Chromium installed, using requests+BeautifulSoup fallback")
+        _crawler_available = False
+    else:
+        _crawler_available = True
     return _crawler_available
+
+
+def _crawl4ai_importable() -> bool:
+    try:
+        import crawl4ai  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _playwright_browser_folders() -> List[str]:
+    """Where Playwright keeps its browsers: PLAYWRIGHT_BROWSERS_PATH when it
+    names a folder, the setup's D: folder, and the platform default."""
+    folders = []
+    named = os.environ.get('PLAYWRIGHT_BROWSERS_PATH')
+    if named and named != '0':
+        folders.append(named)
+    try:
+        from tts.package_installer import _D_DRIVE_ROOT  # type: ignore
+        folders.append(os.path.join(_D_DRIVE_ROOT, 'ms-playwright'))
+    except ImportError:
+        pass
+    if sys.platform == 'win32':
+        folders.append(os.path.join(os.environ.get('LOCALAPPDATA', ''), 'ms-playwright'))
+    elif sys.platform == 'darwin':
+        folders.append(os.path.expanduser('~/Library/Caches/ms-playwright'))
+    else:
+        folders.append(os.path.join(os.environ.get('XDG_CACHE_HOME')
+                                    or os.path.expanduser('~/.cache'), 'ms-playwright'))
+    return folders
+
+
+def _browser_installed() -> bool:
+    for folder in _playwright_browser_folders():
+        try:
+            if any(e.startswith('chromium') for e in os.listdir(folder)):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+# ── Setting crawl4ai up when a crawl needs it ──────────────────────────────
+# Nothing installed crawl4ai on a desktop, or offered to, so every crawl there
+# ran the fallback and pages that build themselves with JavaScript came back
+# empty (owner, 2026-11-15: "restore auto-setup"; with C: at 4.8 GB free,
+# "install crawl4ai on D: instead").  A crawl that finds it missing asks the
+# owner on the one setup card (capability_setup.ask_owner_for_setup); on yes,
+# ONE background install runs with the host's pip runner (pip_install's
+# frozen route, Nunba's _run_pip) and then Playwright's Chromium.  This crawl
+# is answered by the fallback either way: nothing waits on the card or the
+# install.  A failed install is not retried until the app starts again.
+_SETUP_CAPABILITY = 'crawl:crawl4ai'
+_SETUP_REASON = (
+    "Reading web pages fully, including pages that build themselves with "
+    "JavaScript, needs crawl4ai and a headless Chromium browser, and they are "
+    "not installed on this computer. Set them up? They download and install "
+    "here (a few hundred MB); until then pages are read without JavaScript.")
+_setup_lock = threading.Lock()
+_setup_thread: Optional[threading.Thread] = None
+_setup_failed = False
+
+
+def _offer_setup(log: '_ProgressLog') -> None:
+    """crawl4ai is missing: ask the owner (one card, deduped) and, once they
+    have said yes, start the one background install.  Never raises."""
+    global _setup_thread
+    if _setup_failed:
+        return
+    try:
+        from integrations.agent_engine.capability_setup import ask_owner_for_setup
+        answer = ask_owner_for_setup(_SETUP_CAPABILITY, reason=_SETUP_REASON)
+    except Exception as e:
+        logger.debug(f"crawl4ai setup not offered: {e}")
+        return
+    if answer != 'granted':
+        if answer == 'asked':
+            log.step("Asked the owner to set crawl4ai up (JavaScript pages)")
+        return
+    with _setup_lock:
+        if _setup_failed or (_setup_thread is not None and _setup_thread.is_alive()):
+            return
+        _setup_thread = threading.Thread(
+            target=_install_crawl4ai, name='crawl4ai-setup', daemon=True)
+        _setup_thread.start()
+    log.step("Setting crawl4ai up in the background (the owner allowed it)")
+
+
+def _setup_target():
+    """(site, browsers) for the install: the private D: site and a browsers
+    folder beside it whenever D: can be made private (tts.package_installer,
+    the CUDA-torch fallback's folder); otherwise (None, None), pip's own
+    target and Playwright's default folder.
+
+    Owner, 2026-11-16: "Always D: when possible".  The first rule (D: only
+    under 5 GiB free on C:) sent the 06:28 install to C:, which showed
+    5.0 GB free at that moment and 4.1 GB after."""
+    if sys.platform != 'win32':
+        return None, None
+    try:
+        from tts.package_installer import (  # type: ignore
+            _D_DRIVE_ROOT, _make_private_d_drive_site)
+    except ImportError:
+        return None, None
+    if not _make_private_d_drive_site():
+        return None, None
+    return (os.path.join(_D_DRIVE_ROOT, 'site-packages'),
+            os.path.join(_D_DRIVE_ROOT, 'ms-playwright'))
+
+
+def _pip_install_crawl4ai(site: Optional[str]) -> bool:
+    """pip install crawl4ai: in a frozen host with its runner (_run_pip,
+    python-embed, the HARTOS pins), into ``site`` when one is given; else
+    integrations.coding_agent.installer.pip_install."""
+    if getattr(sys, 'frozen', False):
+        from tts.package_installer import _run_pip  # type: ignore
+        args = ['install', 'crawl4ai'] + (['--target', site] if site else [])
+        ok, msg = _run_pip(args, timeout=1800, stall_timeout=600)
+        if not ok:
+            logger.warning(f"crawl4ai setup: pip failed: {str(msg)[-500:]}")
+        return bool(ok)
+    from integrations.coding_agent.installer import pip_install
+    result = pip_install('crawl4ai')
+    if not result.get('success'):
+        logger.warning(f"crawl4ai setup: pip failed: {result.get('error')}")
+    return bool(result.get('success'))
+
+
+def _install_chromium(browsers: Optional[str]) -> bool:
+    """Playwright's Chromium, into ``browsers`` when one is given."""
+    python = sys.executable
+    if getattr(sys, 'frozen', False):
+        from tts.package_installer import get_embed_python  # type: ignore
+        python = get_embed_python()
+    env = os.environ.copy()
+    if browsers:
+        env['PLAYWRIGHT_BROWSERS_PATH'] = browsers
+    result = run_bounded([python, '-m', 'playwright', 'install', 'chromium'],
+                         timeout=1800, env=env)
+    if result.returncode != 0:
+        logger.warning(f"crawl4ai setup: Chromium install failed "
+                       f"(timed out: {result.timed_out}): {result.stderr[-500:]}")
+    return result.returncode == 0
+
+
+def _install_crawl4ai() -> None:
+    """The one background install (see _offer_setup)."""
+    global _crawler_available, _setup_failed
+    try:
+        site, browsers = _setup_target()
+        if _crawl4ai_importable():
+            # Installed already (an earlier setup's pip step): only the
+            # browser is missing, and a second copy on another drive would
+            # be shadowed by the first anyway.
+            logger.info("crawl4ai setup: package present, installing Chromium only")
+            ok = _install_chromium(browsers)
+        else:
+            logger.info(f"crawl4ai setup: installing into {site or 'the user site'}")
+            ok = _pip_install_crawl4ai(site) and _install_chromium(browsers)
+    except Exception as e:
+        logger.warning(f"crawl4ai setup failed: {type(e).__name__}: {e}")
+        ok = False
+    if not ok:
+        _setup_failed = True
+        return
+    importlib.invalidate_caches()
+    _crawler_available = None   # the next crawl imports it
+    logger.info("crawl4ai setup: done; the next crawl uses it")
+
+
+def _use_installed_browsers() -> None:
+    """Launch the Chromium the setup put beside the D: site, unless a
+    browsers folder is already named (PLAYWRIGHT_BROWSERS_PATH)."""
+    if os.environ.get('PLAYWRIGHT_BROWSERS_PATH'):
+        return
+    try:
+        from tts.package_installer import _D_DRIVE_ROOT  # type: ignore
+    except ImportError:
+        return
+    folder = os.path.join(_D_DRIVE_ROOT, 'ms-playwright')
+    if os.path.isdir(folder) and os.listdir(folder):
+        os.environ['PLAYWRIGHT_BROWSERS_PATH'] = folder
 
 
 class _ProgressLog:
@@ -62,6 +256,7 @@ async def _get_crawler(log: _ProgressLog):
     if _crawler is not None:
         return _crawler
     log.step("Initializing browser engine (first run)...")
+    _use_installed_browsers()
     from crawl4ai import AsyncWebCrawler
     _crawler = AsyncWebCrawler(
         headless=True,
@@ -354,6 +549,7 @@ def crawl_url(url: str, timeout: int = 30) -> dict:
             log.step(f"crawl4ai failed: {e}, falling back to requests")
     else:
         log.step("crawl4ai not installed, using requests+BeautifulSoup")
+        _offer_setup(log)
 
     result = _fallback_fetch(url, timeout, log)
     result['progress'] = log.text()
@@ -392,6 +588,7 @@ def crawl_urls(urls: List[str], timeout: int = 30, max_concurrent: int = 3) -> L
             log.step(f"crawl4ai batch failed: {e}, falling back")
     else:
         log.step("crawl4ai not installed, sequential fallback")
+        _offer_setup(log)
 
     results = []
     for u in urls:
@@ -433,6 +630,13 @@ def crawl_url_for_agent(url: str, timeout: int = 30) -> str:
     else:
         parts.append(f"FAILED: {url}")
         parts.append(f"Error: {result['error']}")
+        # Owner rule 2026-11-09: a refusal says what to do.  Live 2026-11-16
+        # the desktop 4B crawled two page paths it made up (both 404) and the
+        # step was given up with nothing telling it why.
+        parts.append(
+            "What to do: crawl a link exactly as the search results gave it; "
+            "never guess or edit a page path. If no result link can be read, "
+            "say so plainly instead of answering from memory.")
 
     return "\n".join(parts)
 

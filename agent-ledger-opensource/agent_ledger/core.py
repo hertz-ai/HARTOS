@@ -23,6 +23,7 @@ import threading
 import time
 from datetime import datetime
 from enum import Enum
+from glob import escape as _glob_escape
 from typing import Dict, List, Optional, Any, Callable, Tuple
 from pathlib import Path
 import logging
@@ -2699,6 +2700,7 @@ class SmartLedger:
     def list_grouped_by_recipe_hierarchy(
         cls,
         ledger_dir: Optional[str] = None,
+        name_glob: str = 'ledger_*_*.json',
     ) -> Dict[str, Dict[str, Dict[int, List[Tuple[int, Dict[str, Any]]]]]]:
         """Walk ``ledger_dir`` and return tasks grouped by recipe hierarchy.
 
@@ -2730,6 +2732,11 @@ class SmartLedger:
         Args:
             ledger_dir: Directory containing ``ledger_*_*.json`` files.
                 Defaults to default_ledger_dir(), the SmartLedger default.
+            name_glob: Which files to read.  Every ledger by default; a
+                caller that wants one person's sessions of one agent passes
+                ``ledger_<agent>_<user>_*.json`` and reads those files only
+                (_find_resumable_session: the whole folder is 3,074 ledgers
+                on a desktop, 19 s cold, review of b48cd6693).
 
         Returns:
             The nested grouping described above.  Empty dict when the
@@ -2758,7 +2765,7 @@ class SmartLedger:
         #                              non-greedy: agent=123,session=goal_abc (RIGHT)
         fname_re = re.compile(r'^ledger_(.+?)_(.+?)\.json$')
 
-        for f in ledger_path.glob('ledger_*_*.json'):
+        for f in ledger_path.glob(name_glob):
             m = fname_re.match(f.name)
             if not m:
                 continue
@@ -4379,6 +4386,7 @@ def _find_resumable_session(
     ledger_dir: Optional[str] = None,
     flow_id: Optional[int] = None,
     actions: Optional[List[Any]] = None,
+    newest_only: bool = False,
 ) -> Optional[str]:
     """Return session_id of an in-flight ledger for this (agent_id, user_id),
     or ``None`` if every prior session is fully terminal / no priors exist.
@@ -4423,11 +4431,28 @@ def _find_resumable_session(
     and texts (``_is_same_build``).  ``None`` or an empty list compares
     nothing and keeps the unscoped meaning.
 
+    ``newest_only`` looks at the person's newest session only: it is returned
+    when it is in progress, and nothing otherwise.  For a caller that knows
+    neither the flow nor the build (the ledger registry's cache miss, which
+    has only '<user>_<prompt>'): a build or a flow change mints a new session
+    here, so an older session still in progress is another build's or another
+    flow's, and opening it would write this turn's states into its steps
+    (review of b48cd6693, must-fix 1).
+
+    Only this agent's files are read (``ledger_<agent>_<user>_*.json`` for a
+    person, ``ledger_<agent>_*.json`` without one), not the whole folder: a
+    desktop holds thousands of ledgers (review of b48cd6693, must-fix 2).
+
     Returns:
         session_id string of the resumable session, or None.
     """
+    name_glob = (f"ledger_{_glob_escape(str(agent_id))}_"
+                 f"{_glob_escape(str(user_id))}_*.json"
+                 if user_id is not None
+                 else f"ledger_{_glob_escape(str(agent_id))}_*.json")
     try:
-        groups = SmartLedger.list_grouped_by_recipe_hierarchy(ledger_dir)
+        groups = SmartLedger.list_grouped_by_recipe_hierarchy(
+            ledger_dir, name_glob=name_glob)
     except Exception as e:
         logger.debug(f"_find_resumable_session: helper unavailable ({e})")
         return None
@@ -4451,6 +4476,8 @@ def _find_resumable_session(
             logger.info(
                 f"_find_resumable_session: not resuming {session_id} for "
                 f"prompt={agent_id}: its steps are another build's")
+            if newest_only:
+                return None
             continue
         # Walk the flows' actions; any non-terminal task → resumable.
         for flow_tasks in flows.values():
@@ -4458,6 +4485,8 @@ def _find_resumable_session(
                 status = str(task_dict.get("status") or "").lower()
                 if status and status not in _TERMINAL_TASK_STATUSES:
                     return session_id
+        if newest_only:
+            return None
     return None
 
 

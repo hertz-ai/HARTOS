@@ -1028,9 +1028,16 @@ def attach_for_names(names, helper, executor, registry, attached_names,
         return 1 if got and (got[0] or got[1]) else 0
 
     for tool_name, tool in registry._tools.items():
+        # A tool with ONE endpoint is named unambiguously by its tool name:
+        # live 2026-11-16 a research agent's steps said "crawl4ai: fetch ...",
+        # the in-process crawler's one endpoint is crawl4ai_crawl, and every
+        # round logged "names ['google_search', 'crawl4ai'] -> 0 tools", so
+        # the step never had a page reader.  Several endpoints still need the
+        # endpoint name, so naming a tool never hands over all of them.
+        _by_tool = tool_name in want and len(tool.endpoints) == 1
         for ep_name, ep in tool.endpoints.items():
             fn = tool_name if ep_name == tool_name else f"{tool_name}_{ep_name}"
-            if fn not in want:
+            if fn not in want and not _by_tool:
                 continue
             n += _count(_attach_tool(
                 helper, executor, fn,

@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import threading
+import time
 from datetime import datetime, timezone
 from typing import Dict, Optional, Any
 from core.constants import (AGENT_MENTIONS, BOOKKEEPING_TOOLS,
@@ -29,23 +30,55 @@ logger = logging.getLogger(__name__)
 # Lock protecting _ledger_registry and action_states (accessed by multiple Waitress/Gunicorn threads)
 _state_lock = threading.RLock()
 
-def _load_ledger_on_miss(user_prompt: str) -> Optional[Any]:
-    """Cache-miss loader: reopen the person's in-flight session from disk.
+#: How long a miss with nothing in progress is remembered, so the hooks that
+#: read the registry on every state change of a session that owns no ledger
+#: do not read the folder each time.  register_ledger_for_session forgets it.
+_MISS_MEMORY_SECONDS = 30.0
+_recent_misses = {}            # (user_prompt, ledger folder) -> monotonic time
+_recent_misses_lock = threading.Lock()
 
-    The session is the one create_ledger_from_actions resumes (agent_id =
-    prompt_id, session_id = '<user>_<prompt>_<ts>'), found by its own scan.
-    None when nothing is in flight.  It used to call
-    get_or_create_ledger(user_id, prompt_id) positionally (agent_id=user_id,
-    session_id=prompt_id): a key nothing saves, so a miss handed back a new
-    empty ledger that the registry then served as the person's for 8 hours.
+
+def _load_ledger_on_miss(user_prompt: str) -> Optional[Any]:
+    """Cache-miss loader: reopen the person's session from disk when it is
+    their newest session of this agent and is still in progress; else None.
+
+    A miss knows only '<user>_<prompt>', not the flow or the build that
+    create_ledger_from_actions scopes its resume by.  A build or flow change
+    mints a new session there, so the newest session is the current one and
+    an older one still in progress is another build's or flow's: reopening
+    it would write this turn's states into its steps (review of b48cd6693,
+    must-fix 1: an older build's session reopened while the current build's
+    was done).  Only this person's files of this agent are read, not the
+    whole folder, and a miss with nothing in progress is remembered for
+    _MISS_MEMORY_SECONDS (must-fix 2: a miss parsed all 3,074 ledgers inside
+    the registry's lock, every time).  The read stays under the registry's
+    lock: TTLCache.forget_everywhere relies on that ordering, and the read is
+    one listing plus the person's own files.
+
+    It used to call get_or_create_ledger(user_id, prompt_id) positionally (a
+    key nothing saves), so a miss handed back a new empty ledger that the
+    registry then served as the person's for 8 hours.
     """
     try:
-        from agent_ledger.core import SmartLedger, _find_resumable_session
+        from agent_ledger.core import (
+            SmartLedger, _find_resumable_session, default_ledger_dir)
         user_id, prompt_id = _extract_ownership_from_prompt(user_prompt)
-        if user_id and prompt_id:
-            session_id = _find_resumable_session(str(prompt_id), user_id)
-            if session_id is not None:
-                return SmartLedger(str(prompt_id), session_id)
+        if not (user_id and prompt_id):
+            return None
+        memo_key = (user_prompt, default_ledger_dir())
+        now = time.monotonic()
+        with _recent_misses_lock:
+            missed_at = _recent_misses.get(memo_key)
+            if missed_at is not None and now - missed_at < _MISS_MEMORY_SECONDS:
+                return None
+        session_id = _find_resumable_session(str(prompt_id), user_id,
+                                             newest_only=True)
+        if session_id is not None:
+            return SmartLedger(str(prompt_id), session_id)
+        with _recent_misses_lock:
+            _recent_misses[memo_key] = now
+            if len(_recent_misses) > 10000:
+                _recent_misses.clear()
     except Exception:
         pass
     return None
@@ -58,6 +91,9 @@ _ledger_registry = TTLCache(
 
 def register_ledger_for_session(user_prompt: str, ledger: Any):
     """Register a ledger instance for a session to enable auto-sync."""
+    with _recent_misses_lock:
+        for memo_key in [k for k in _recent_misses if k[0] == user_prompt]:
+            del _recent_misses[memo_key]
     with _state_lock:
         _ledger_registry[user_prompt] = ledger
     logger.debug(f"Registered ledger for {user_prompt}")

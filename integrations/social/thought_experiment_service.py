@@ -544,7 +544,9 @@ class ThoughtExperimentService:
     # ─── Agent Evaluation ───
 
     @staticmethod
-    def request_agent_evaluation(db: Session, experiment_id: str) -> Dict:
+    def request_agent_evaluation(db: Session, experiment_id: str,
+                                 asked_by: Optional[str] = None,
+                                 this_nodes_cycle: bool = False) -> Dict:
         """Request agent-native iterative evaluation of a thought experiment.
 
         Creates an AgentGoal with a type-aware iteration recipe. The agent
@@ -556,20 +558,34 @@ class ThoughtExperimentService:
         - physical_ai:  uses visual context (hypothesis → observe → measure)
         - research:     uses web search (search → synthesize → score)
 
-        GATED HERE, for every caller.  The experiment must be approved by
-        the vote -- voting_rules.approval_verdict, the ONE rule: a quorum
-        of distinct identities (>= 3, >= 2 FOR), a FOR share of at least
-        max(2/3, the context's threshold) with one vote per identity (an
-        owner and all their agents are one), and the steward's FOR where
-        the context requires one -- and its lifecycle must be able to reach
-        'evaluating' (advance_status: never backwards from decided/archived).
-        Measured live 2026-09-25 (AE-7): with the gate only in auto-evolve's
-        ranking, one authenticated non-admin POSTed /evaluate on an unvoted
-        experiment and started an autonomous agent goal alone.  A refusal
-        mutates nothing.
+        GATED HERE, for every caller, by voting_rules.evaluation_permit:
+          - an experiment the vote approved (approval_verdict, the ONE
+            approval rule: a quorum of distinct identities (>= 3, >= 2 FOR),
+            a FOR share of at least max(2/3, the context's threshold) with
+            one vote per identity, and the steward's FOR where the context
+            requires one) may be evaluated, whoever asks, on every topology;
+          - on a FLAT node only, this node's OWN experiment (its creator is
+            an account only this node holds, node_held_ids) may be
+            evaluated with no vote when THIS NODE asks, unless its context
+            requires the steward or a voter is against it (owner rulings
+            2026-11-14/15);
+          - anything else is refused.  Measured live 2026-09-25 (AE-7): with
+            the gate only in auto-evolve's ranking, one authenticated
+            non-admin POSTed /evaluate on an unvoted experiment and started
+            an autonomous agent goal alone.
+        Who asks: ``this_nodes_cycle`` is True only from this node's own
+        auto-evolve cycle (in-process, paced: max_experiments per cycle, one
+        cycle at a time); ``asked_by`` is the signed-in account of an HTTP
+        caller, and counts as this node only when node_holds it (the owner).
+        Neither given asks as no one in particular, and gets the vote:
+        9dd0d25d7 asked only whose experiment it was, and any signed-in
+        account started the node's own goals (review rv_9dd0, F1).
+        Its lifecycle must also be able to reach 'evaluating'
+        (advance_status: never backwards from decided/archived).  A refusal
+        mutates nothing and carries the permit's reason and hint.
         """
         from .models import ThoughtExperiment
-        from .voting_rules import approval_verdict
+        from .voting_rules import evaluation_permit
 
         experiment = db.query(ThoughtExperiment).filter_by(
             id=experiment_id).first()
@@ -577,10 +593,19 @@ class ThoughtExperimentService:
             return {'success': False, 'reason': 'not_found'}
 
         tally = ThoughtExperimentService.tally_votes(db, experiment_id)
-        verdict = approval_verdict(tally)
-        if not verdict['approved']:
+        held = ThoughtExperimentService.node_held_ids(
+            db, [experiment.creator_id, asked_by])
+        this_nodes_own = experiment.creator_id in held
+        asked_by_this_node = this_nodes_cycle or (
+            asked_by is not None and asked_by in held)
+        permit = evaluation_permit(tally, this_nodes_own=this_nodes_own,
+                                   asked_by_this_node=asked_by_this_node)
+        if not permit['allowed']:
             return {'success': False, 'reason': 'not_approved',
-                    'verdict': verdict,
+                    'permit': permit, 'hint': permit['hint'],
+                    'verdict': permit['verdict'],
+                    'this_nodes_own': this_nodes_own,
+                    'asked_by_this_node': asked_by_this_node,
                     'distinct_voters': tally.get('distinct_voters'),
                     'distinct_supporters': tally.get('distinct_supporters')}
 
@@ -607,6 +632,7 @@ class ThoughtExperimentService:
                 'success': True,
                 'goal_id': existing.id,
                 'reused': True,
+                'approved_by_vote': permit['approved_by_vote'],
                 'experiment_type': getattr(
                     experiment, 'experiment_type', 'traditional') or 'traditional',
             }
@@ -655,6 +681,7 @@ class ThoughtExperimentService:
             return {
                 'success': True,
                 'goal_id': goal.get('goal', {}).get('id') if goal else None,
+                'approved_by_vote': permit['approved_by_vote'],
                 'experiment_type': exp_type,
                 'iteration_strategy': recipe['strategy'],
             }
@@ -881,8 +908,8 @@ class ThoughtExperimentService:
         # no identity for the quorum.
         from .models import User
         from .voting_rules import (
-            is_steward, one_vote_per_identity, quorum_met, recommendation,
-            vote_is_persons)
+            identities_holding, is_steward, one_vote_per_identity, quorum_met,
+            recommendation, vote_is_persons)
         voter_ids = {v.voter_id for v in votes}
         users = {u.id: u for u in
                  (db.query(User).filter(User.id.in_(voter_ids)).all()
@@ -973,6 +1000,13 @@ class ThoughtExperimentService:
             'decision_context': decision_context,
             'distinct_voters': len(voters),
             'distinct_supporters': len(supporters),
+            # Identities holding a node's own experiment back, from the raw
+            # ballots (voting_rules.identities_holding: any AGAINST, any
+            # weight, registered or not, unless that identity's person voted
+            # FOR).  Not total_against, which rounds an agent's 0.0006 to 0.0
+            # (review rv_9dd0 F2), and not the collapsed votes, where another
+            # agent's FOR cancels an AGAINST (claude-autostart-d2).
+            'identities_against': identities_holding(ballots),
             'quorum_met': quorate,
             'steward_vote': steward_vote,
         }
@@ -1085,6 +1119,30 @@ class ThoughtExperimentService:
         return {u.id: voter_identity(u, owner_of, node) for u in users}, node
 
     @staticmethod
+    def node_held_ids(db: Session, account_ids) -> set:
+        """Of these account ids, the ones only this node holds (voting_rules.
+        node_holds: the owner HEVOLVE_OWNER_USER_ID names, or a 'system'
+        account owned by no one that no one can sign in to).  Asked of an
+        experiment's creator (is it this node's OWN?) and of whoever asks to
+        evaluate it (is it this node asking?).  An id with no users row here
+        is not this node's, so a made-up id is no free pass; None and ''
+        are skipped.  One query for the accounts, one for the owner row."""
+        from .models import User
+        from .voting_rules import node_holds
+        ids = {c for c in account_ids if c}
+        if not ids:
+            return set()
+        users = db.query(User).filter(User.id.in_(ids)).all()
+        loaded = {}
+
+        def owner_of(owner_id):
+            if owner_id not in loaded:
+                loaded[owner_id] = db.query(User).filter(
+                    User.id == owner_id).first()
+            return loaded[owner_id]
+        return {u.id for u in users if node_holds(u, owner_of)}
+
+    @staticmethod
     def _open_agent_votable(db: Session, query=None) -> List:
         """The ONE selection of experiments an agent may vote on now, shared
         by the world model's round and the coordinator's ballot: open
@@ -1127,7 +1185,8 @@ class ThoughtExperimentService:
     @staticmethod
     def get_active_experiments(db: Session, status: str = None,
                                 limit: int = 50,
-                                with_votes_only: bool = False) -> List[Dict]:
+                                with_votes_only: bool = False,
+                                creator_ids=None) -> List[Dict]:
         """List experiments filtered by status, newest first.
 
         with_votes_only: only experiments with at least one vote.  This is
@@ -1135,6 +1194,11 @@ class ThoughtExperimentService:
         can never pass it -- and without it the newest-`limit` window hid
         every voted row once unvoted rows piled up (measured on a live
         node: the three human-voted experiments sat at rank ~693 of 807).
+
+        creator_ids: only experiments by these creators (auto-evolve passes
+        node_held_ids on a flat node, the experiments its own cycle may run
+        with no vote there), so other people's newer rows cannot push them
+        out of the window.
         """
         from .models import ThoughtExperiment, ExperimentVote
 
@@ -1144,6 +1208,9 @@ class ThoughtExperimentService:
         else:
             query = query.filter(
                 ThoughtExperiment.status != 'archived')
+        if creator_ids is not None:
+            query = query.filter(
+                ThoughtExperiment.creator_id.in_(list(creator_ids)))
         if with_votes_only:
             query = query.filter(
                 db.query(ExperimentVote.id).filter(

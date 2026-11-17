@@ -215,6 +215,26 @@ def one_vote_per_identity(ballots):
     return out
 
 
+def identities_holding(ballots) -> int:
+    """How many identities hold back an experiment that would otherwise
+    evaluate with no vote (evaluation_permit's own path).  An identity holds
+    when ANY of its ballots is AGAINST -- any weight, 0 included, and an
+    unregistered voter id too -- unless that identity's PERSON voted FOR as
+    themself (``own``).  ``ballots`` as one_vote_per_identity takes.
+
+    Counted from the ballots, not from one_vote_per_identity, where a tie
+    between a FOR and an AGAINST of one identity is no vote and a majority
+    of FORs wins: /auth/register makes an agent for anyone with any owner_id
+    (a made-up one maps to this node), so a stranger's agent FOR cancelled,
+    or outvoted, the owner's agent's AGAINST (claude-autostart-d2).  So only
+    that identity's person, or the voter who cast the AGAINST, releases it.
+    It only ever holds something back, so it counts on the safe side, unlike
+    the quorum, where a made-up id must not be a free voter."""
+    own_for = {b['identity'] for b in ballots if b['own'] and b['value'] > 0}
+    return len({b['identity'] for b in ballots
+                if b['value'] < 0 and b['identity'] not in own_for})
+
+
 def quorum_met(distinct_voters: int, distinct_supporters: int) -> bool:
     """True when enough distinct identities voted, and enough voted FOR."""
     return (distinct_voters >= MIN_DISTINCT_VOTERS
@@ -306,6 +326,156 @@ def approval_verdict(tally: dict) -> dict:
         'steward_required': steward_required,
         'steward_approved': steward_approved,
         'steward_missing': steward_required and steward_vote == 0,
+    }
+
+
+# ─── Evaluating here without a vote: flat nodes, this node's own ─────
+#
+# Owner rulings (verbatim): 2026-11-14 "voting shd not be a prerequisite to
+# evolve locally untill we cross the intelligence barrier"; 2026-11-15 "the
+# no ovite experiment applies only for topology flat, for regional and
+# central it shd remain with voites".  The intelligence barrier has no
+# measure yet (none in code, docs or memory on 2026-11-14); when the owner
+# defines one, evaluation_permit is the one place the vote returns.
+
+
+def evolves_without_vote_here() -> bool:
+    """Whether this node's own experiments may evaluate here with no vote:
+    only on a flat node (owner ruling 2026-11-15), flat by the one rule the
+    tree has for "one person's machine" (node_topology.is_flat_node: the
+    claim HEVOLVE_NODE_TIER says flat, unset or empty, AND the proof
+    key_delegation.get_node_tier says flat).  A claim of regional or central
+    keeps the vote whatever was proven; a node its master key made central
+    keeps it whatever was claimed (review rv_9dd0 F4: the claim alone missed
+    it).  Any other claim -- 'local', a value no rule knows -- keeps it."""
+    from .node_topology import is_flat_node
+    return is_flat_node()
+
+
+def node_holds(user, owner_of) -> bool:
+    """Whether ``user`` (a users row, or None) is an account only this node
+    holds, so an experiment it created is this node's OWN:
+      - this node's owner, the person HEVOLVE_OWNER_USER_ID names
+        (node_identity), or
+      - the node's own machine account as UserService.ensure_system_user
+        makes it (the 'nunba' account): user_type 'system', owned by no
+        one, no password, is_verified.  Its api_token is a credential, but
+        no route hands it out: the only replies that carry a token
+        (/auth/register, agent create, /bots/register) return the account
+        that request just made.
+    Never an agent: POST /auth/register makes an agent with no sign-in for
+    anyone and takes its owner_id from the request body, so "owned by the
+    owner" is a claim anyone can make (review of e7b769936, which counted
+    every account no person owns as the node).  Never a 'system' account
+    with a password: the same route takes user_type from the body and
+    always sets one, so that is someone's sign-in.  Never a row an inbound
+    sync made: sync_engine._handle_sync_user creates users with the
+    payload's own id and user_type, no owner, no password, and never sets
+    is_verified ("verification is a trusted local act").
+    ``owner_of(owner_id)`` returns that users row, or None."""
+    if user is None:
+        return False
+    if is_person(user):
+        return node_identity(owner_of) == user.id
+    return (getattr(user, 'user_type', None) == 'system'
+            and getattr(user, 'owner_id', None) is None
+            and not getattr(user, 'password_hash', None)
+            and getattr(user, 'is_verified', None) is True)
+
+
+def _permit_hint(reason: str, verdict: dict, tally: dict) -> str:
+    """What a permit's reason means and what would let the experiment run,
+    in words, for whoever asked (owner ruling 2026-11-09: a refusal says
+    what was wrong and how to fix it).  The vote's numbers are the rule's
+    own (the constants above, the verdict's threshold and steward), never a
+    copy that drifts from them (review rv_9dd0 F6)."""
+    vote = (f'the vote approves it: >= {MIN_DISTINCT_VOTERS} distinct voters, '
+            f'>= {MIN_DISTINCT_SUPPORTERS} FOR, a FOR share of at least '
+            f"{verdict['threshold']:.2f}"
+            + (", and the steward's FOR" if verdict['steward_required'] else ''))
+    opponents = tally.get('identities_against')
+    who = (f'{opponents} voter(s)' if isinstance(opponents, int)
+           else 'the tally does not say how many voters; any')
+    return {
+        'approved': 'the vote approved it',
+        'this_nodes_own': "this node's own experiment, asked for by this "
+                          'node, evaluated here with no vote (flat node)',
+        'not_this_nodes_own': f"not this node's own experiment: it runs once "
+                              f'{vote}',
+        'topology_keeps_the_vote': 'this node is not flat (HEVOLVE_NODE_TIER '
+                                   'names another tier, or its key proves '
+                                   'one): on regional and central every '
+                                   f'experiment runs only once {vote}',
+        'not_asked_by_this_node': "this node's own experiment runs with no vote "
+                                  'only when this node starts it: its '
+                                  'auto-evolve cycle, or its owner signed in. '
+                                  f'Asked by anyone else, it runs once {vote}',
+        'steward_required': 'a security decision: even this node\'s own runs '
+                            f'only once {vote}',
+        'vote_against': f'{who} voted against it: it runs once {vote}, or '
+                        'with no vote again once every vote against is '
+                        'changed to FOR or to an abstain (0), or the person '
+                        "an agent's vote counts as votes FOR themself",
+    }[reason]
+
+
+def evaluation_permit(tally: dict, *, this_nodes_own: bool,
+                      asked_by_this_node: bool) -> dict:
+    """Whether an experiment may be EVALUATED on this node: the ONE rule the
+    evaluation-goal writer and auto-evolve's ranking both ask.
+
+      - the vote approved it (approval_verdict): yes, whoever asks, on every
+        topology;
+      - otherwise yes only when ALL hold:
+          * the experiment is this node's own (``this_nodes_own``: its
+            creator is an account node_holds);
+          * this is a flat node (evolves_without_vote_here);
+          * THIS NODE asked (``asked_by_this_node``: its own auto-evolve
+            cycle, or an account node_holds -- the owner signed in).  On
+            9dd0d25d7 the permit never asked who asked, and any signed-in
+            account, a passwordless agent from /auth/register included,
+            started the node's own goals ten at once, past the cycle's pace
+            (review rv_9dd0, F1);
+          * its context does not require the steward (security stays with
+            people);
+          * no voter is against it: tally['identities_against'] == 0
+            (identities_holding: any AGAINST ballot of an identity, at any
+            weight and registered or not, unless that identity's person
+            voted FOR as themself).  total_against is rounded to 2 places,
+            so an agent's AGAINST weighing under 0.005 read as none and did
+            not hold it (rv_9dd0, F2); and it is counted after
+            one_vote_per_identity, where another agent's FOR could cancel
+            an AGAINST.  A tally that does not answer holds it.
+
+    What this decides is whether the evaluation goal is made; decide() keeps
+    the vote.  Returns {'allowed', 'approved_by_vote', 'own_without_vote',
+    'reason', 'hint', 'verdict'}: reason is 'approved', 'this_nodes_own', or
+    the first own-path condition that failed ('not_this_nodes_own',
+    'topology_keeps_the_vote', 'not_asked_by_this_node', 'steward_required',
+    'vote_against'); hint says it in words and what would let it run;
+    verdict is approval_verdict(tally)."""
+    verdict = approval_verdict(tally)
+    if not this_nodes_own:
+        why = 'not_this_nodes_own'
+    elif not evolves_without_vote_here():
+        why = 'topology_keeps_the_vote'
+    elif not asked_by_this_node:
+        why = 'not_asked_by_this_node'
+    elif verdict['steward_required']:
+        why = 'steward_required'
+    elif tally.get('identities_against') != 0:
+        why = 'vote_against'
+    else:
+        why = 'this_nodes_own'
+    own_without_vote = why == 'this_nodes_own'
+    reason = 'approved' if verdict['approved'] else why
+    return {
+        'allowed': verdict['approved'] or own_without_vote,
+        'approved_by_vote': verdict['approved'],
+        'own_without_vote': own_without_vote,
+        'reason': reason,
+        'hint': _permit_hint(reason, verdict, tally),
+        'verdict': verdict,
     }
 
 

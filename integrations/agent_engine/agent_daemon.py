@@ -13,7 +13,7 @@ import time
 import random
 import logging
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 
 logger = logging.getLogger('hevolve_social')
 
@@ -221,6 +221,16 @@ def _seconds_since_iso(iso_str):
     except (TypeError, ValueError):
         return None
     return (datetime.utcnow() - stamp).total_seconds()
+
+
+def _later_iso(iso_str, seconds):
+    """``iso_str`` moved ``seconds`` later, never past now (unreadable: as is)."""
+    try:
+        moved = datetime.fromisoformat(str(iso_str).replace('Z', '')) + \
+            timedelta(seconds=float(seconds))
+    except (TypeError, ValueError):
+        return iso_str
+    return min(moved, datetime.utcnow()).isoformat()
 
 
 def _goal_ledger_grounding(goal_id):
@@ -945,10 +955,18 @@ def _settle_dispatched_goal(db, goal, goal_key, served_escalation=None,
         # In flight. Not a noop — do not touch the noop counter, and do
         # not re-spin the goal — but do not sit here silently forever
         # either: the pause below is the bound.
+        from .dispatch import goal_turn_held
         since = cfg.get('awaiting_verification_since')
         if not since:
             since = datetime.utcnow().isoformat()
-            cfg['awaiting_verification_since'] = since
+        elif goal_turn_held(goal, db):
+            # The provider's wait, not the work's: while the goal's turn could
+            # not start here (dispatch.goal_turn_held) the time since the last
+            # check never counts (central 2026-11-16: 5 goals paused while the
+            # worker held on the free model's OPEN breaker).
+            since = _later_iso(since, _seconds_since_iso(
+                cfg.get('last_verification_check')))
+        cfg['awaiting_verification_since'] = since
         cfg['last_verification_check'] = datetime.utcnow().isoformat()
         waited = _seconds_since_iso(since)
         timeout_s = int(os.environ.get(
