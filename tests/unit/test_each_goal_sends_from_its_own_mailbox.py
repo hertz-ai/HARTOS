@@ -15,6 +15,14 @@ adapter per channel name, so a second mailbox replaced the first; and the
 channel setup form's connect (the register_channel tool) saved an email
 channel without starting it, because it takes four settings.
 
+Review of ae390514f (rejected): a connected mailbox was bound to the chat
+agent's auto-responder (4 unread mails got 4 automatic replies from the
+company address; two mailboxes answered each other 8 times), another goal's
+turn could send from this goal's mailbox, a From carrying the mailbox
+address resolved to the owner, and 4 of 5 mutants survived.  Owner, 16 Nov:
+"You verify all the outgoing emails on my behalf from central": every
+outgoing email passes one check before it leaves.
+
 These tests run the real connect tool, the real channel registry and
 FlaskChannelIntegration on a running loop, the real EmailAdapter, the real
 outreach tools, follow-up checker and journey engine, and the real social DB
@@ -56,7 +64,12 @@ class _MailWorld:
     def __init__(self):
         self.inbox = {}      # imap host -> [[raw bytes, seen], ...]
         self.sent = []       # one dict per message an SMTP server accepted
+        self.bodies = []     # (imap host, fetch spec) per whole message fetched
         self.lock = threading.Lock()
+
+    def seen(self, host):
+        with self.lock:
+            return [s for _raw, s in self.inbox.get(host, [])]
 
     def sent_from(self, address):
         return [m for m in self.sent
@@ -85,7 +98,16 @@ def _fake_servers(world):
 
         def fetch(self, num, parts):
             with world.lock:
-                raw = world.inbox[self.host][int(num) - 1][0]
+                entry = world.inbox[self.host][int(num) - 1]
+                raw = entry[0]
+                if 'HEADER.FIELDS' in parts:
+                    head = ('Message-ID: %s\r\n\r\n' % email.message_from_bytes(
+                        raw).get('Message-ID', '')).encode()
+                    return 'OK', [(num + b' (BODY[HEADER.FIELDS (MESSAGE-ID)])', head),
+                                  b')']
+                if 'PEEK' not in parts:
+                    entry[1] = True     # a plain fetch sets \Seen, as servers do
+                world.bodies.append((self.host, parts))
             return 'OK', [(num + b' (RFC822)', raw)]
 
         def store(self, num, op, flag):
@@ -255,20 +277,22 @@ def _tools(monkeypatch, store):
 
 
 def _prospect(tools, company, address, goal_id=None):
-    """create_prospect, in the turn of ``goal_id`` (daemon_<goal id>) when
-    given: the turn a goal's agent works in."""
-    from core.llm_outbound_logger import request_id_context
-    if goal_id:
-        with request_id_context(f'daemon_{goal_id}'):
-            out = json.loads(tools['create_prospect'](company, 'Contact', address))
-    else:
-        out = json.loads(tools['create_prospect'](company, 'Contact', address))
-    return out['prospect']['id']
+    """create_prospect, in the turn of ``goal_id`` when given: the turn a
+    goal's agent works in."""
+    create = tools['create_prospect']
+    out = (_in_turn(goal_id, create, company, 'Contact', address) if goal_id
+           else create(company, 'Contact', address))
+    return json.loads(out)['prospect']['id']
 
 
 def _send(tools, pid):
-    return json.loads(tools['send_outreach_email'](
-        pid, 'a question about your centre', '<p>hello</p>'))
+    """send_outreach_email to ``pid`` as its goal's own agent would: in that
+    goal's turn when the prospect has a goal, else outside any turn."""
+    from integrations.agent_engine import outreach_crm_tools
+    goal = outreach_crm_tools._load_prospects()['prospects'][pid].get('goal_id')
+    args = (pid, 'a question about your centre', '<p>hello</p>')
+    send = tools['send_outreach_email']
+    return json.loads(_in_turn(goal, send, *args) if goal else send(*args))
 
 
 def _reply(frm, to, subject, body):
@@ -276,6 +300,70 @@ def _reply(frm, to, subject, body):
     msg['From'], msg['To'], msg['Subject'] = frm, to, subject
     msg['Message-ID'] = email.utils.make_msgid()
     return msg.as_bytes()
+
+
+def _deliver(world, address, *mails):
+    """Unread mails, (from, subject, body) each, into ``address``'s inbox."""
+    host = f"imap.{HOSTS[address]}"
+    with world.lock:
+        world.inbox.setdefault(host, []).extend(
+            [_reply(frm, address, subject, body), False]
+            for frm, subject, body in mails)
+    return host
+
+
+def _poll(channels, *adapters):
+    """One inbox check of each adapter: the step its poll loop repeats."""
+    for adapter in adapters:
+        asyncio.run_coroutine_threadsafe(
+            adapter._check_new_messages(), channels.loop).result(timeout=10)
+
+
+def _legacy_mailbox(node, monkeypatch):
+    """A node's one email channel, wired the way the bindings form wires it
+    (its IMAP host as the credential, the rest from the environment)."""
+    from integrations.social.api_channels import _wire_live_adapter
+    monkeypatch.setenv('EMAIL_SMTP_HOST', 'smtp.desktop.example')
+    monkeypatch.setenv('EMAIL_ADDRESS', 'owner@desktop.example')
+    monkeypatch.setenv('EMAIL_PASSWORD', PASSWORDS['owner@desktop.example'])
+    assert _wire_live_adapter('email', 'imap.desktop.example')['success']
+    deadline = time.monotonic() + 10
+    while True:
+        adapter = node.channels.registry.get('email')
+        if adapter is not None and adapter.is_running():
+            return adapter
+        assert time.monotonic() < deadline, 'the email channel never connected'
+        time.sleep(0.05)
+
+
+def _journey_tools(monkeypatch):
+    from core import labeled_autogen_function
+    from integrations.agent_engine.journey_engine import register_journey_tools
+    tools = {}
+    monkeypatch.setattr(labeled_autogen_function, 'register_labeled_function',
+                        lambda func, **kw: tools.__setitem__(func.__name__, func))
+    register_journey_tools(object(), object(), OWNER)
+    return tools
+
+
+def _in_turn(goal_id, fn, *args):
+    """``fn(*args)`` inside ``goal_id``'s own turn: the request id
+    daemon_<goal> bound the way the turn binds it, and marked as this node's
+    own dispatch (core.chat_client.own_daemon_turn, what
+    dispatch.local_chat_dispatch does)."""
+    from core.chat_client import own_daemon_turn
+    from core.llm_outbound_logger import request_id_context
+    rid = f'daemon_{goal_id}'
+    with request_id_context(rid), own_daemon_turn(rid):
+        return fn(*args)
+
+
+def _named_turn(goal_id, fn, *args):
+    """``fn(*args)`` in a turn that only NAMES ``goal_id`` (a client's /chat
+    body can carry request_id daemon_<goal>); this node did not start it."""
+    from core.llm_outbound_logger import request_id_context
+    with request_id_context(f'daemon_{goal_id}'):
+        return fn(*args)
 
 
 # ── 1. two mailboxes, each goal's mail from its own ──────────────────
@@ -310,8 +398,8 @@ def test_follow_ups_and_the_journeys_first_email_go_from_the_prospects_goal_mail
     lashes = _prospect(tools, 'Salon', 'ravi@salon.example', 'g-lashes')
     step = json.dumps([{'delay_days': 0, 'subject': 'bump',
                         'body_html': '<p>hi again</p>'}])
-    for pid in (speech, lashes):
-        tools['create_followup_sequence'](pid, 'bump', step)
+    for pid, goal in ((speech, 'g-speech'), (lashes, 'g-lashes')):
+        _in_turn(goal, tools['create_followup_sequence'], pid, 'bump', step)
 
     tick = node.store.check_pending_followups_daemon()
 
@@ -389,16 +477,7 @@ def test_a_single_mailbox_node_is_unchanged(node, monkeypatch):
     """The node's one email channel, wired the way the bindings form wires
     it (its IMAP host as the credential, the rest from the environment),
     still sends the mail that names no goal, as before."""
-    from integrations.social.api_channels import _wire_live_adapter
-    monkeypatch.setenv('EMAIL_SMTP_HOST', 'smtp.desktop.example')
-    monkeypatch.setenv('EMAIL_ADDRESS', 'owner@desktop.example')
-    monkeypatch.setenv('EMAIL_PASSWORD', PASSWORDS['owner@desktop.example'])
-    assert _wire_live_adapter('email', 'imap.desktop.example')['success']
-    deadline = time.monotonic() + 10
-    while not (node.channels.registry.get('email') or SimpleNamespace(
-            is_running=lambda: False)).is_running():
-        assert time.monotonic() < deadline, 'the email channel never connected'
-        time.sleep(0.05)
+    _legacy_mailbox(node, monkeypatch)
     tools = _tools(monkeypatch, node.store)
     pid = _prospect(tools, 'Shop', 'mo@shop.example')
 
@@ -507,28 +586,294 @@ def test_replies_to_each_mailbox_reach_handle_inbound_email(node, monkeypatch):
     assert prospects[speech]['stage'] == 'replied'
     assert prospects[lashes]['stage'] == 'replied'
     assert sorted(c.args[0]['id'] for c in drafts.call_args_list) == sorted([speech, lashes])
+    # A reply the outreach hook took is read; nothing else answered it.
+    assert node.mail.seen('imap.hevolve.example') == [True]
+    assert node.mail.seen('imap.mcgroce.example') == [True]
+    assert node.mail.sent == []
 
 
-def test_an_inbound_email_is_answered_from_the_mailbox_it_reached(node):
-    """The channel's agent reply goes out from the mailbox the email came
-    to, never from the node's other mailbox."""
+def test_a_reply_moves_the_prospect_of_the_mailbox_it_reached(node, monkeypatch):
+    """One address can be a prospect of two goals; its reply to the McGroce
+    mailbox is a reply to the lashes outreach, not to the speech one."""
+    store = node.store
+    monkeypatch.setattr(store, '_dispatch_response_draft', MagicMock())
+    monkeypatch.setattr(store, '_notify_prospect_replied', MagicMock())
     boxes = {}
     for address in (HEVOLVE, MCGROCE):
         _connect(address)
         boxes[address] = _mailbox(node.channels, address)
-    node.channels.registry.set_agent_handler(lambda message: 'thank you, noted')
-    with node.mail.lock:
-        node.mail.inbox['imap.mcgroce.example'] = [[_reply(
-            'ravi@salon.example', MCGROCE, 'lash prices', 'what do they cost'), False]]
+    tools = _tools(monkeypatch, store)
+    speech = _prospect(tools, 'Both Clinic', 'buyer@both.example', 'g-speech')
+    lashes = _prospect(tools, 'Both Salon', 'buyer@both.example', 'g-lashes')
+    assert [_send(tools, pid)['success'] for pid in (speech, lashes)] == [True, True]
+    store.check_pending_followups_daemon()
+    _deliver(node.mail, MCGROCE, ('buyer@both.example', 'Re: lashes', 'prices?'))
 
-    asyncio.run_coroutine_threadsafe(
-        boxes[MCGROCE]._check_new_messages(), node.channels.loop).result(timeout=10)
-    deadline = time.monotonic() + 10
-    while not node.mail.sent and time.monotonic() < deadline:
-        time.sleep(0.05)
+    _poll(node.channels, boxes[MCGROCE])
 
-    assert [m['to'] for m in node.mail.sent_from(MCGROCE)] == ['ravi@salon.example']
-    assert node.mail.sent_from(HEVOLVE) == []
+    prospects = store._load_prospects()['prospects']
+    assert (prospects[speech]['stage'], prospects[lashes]['stage']) == (
+        'contacted', 'replied')
+
+
+# ── 6b. a company mailbox never answers, and leaves its mail unread ──
+
+PEOPLE = [('bank@bank.example', 'Your statement', 'balance attached'),
+          ('newsletter@news.example', 'Weekly digest', 'this week'),
+          ('customer@acme.example', 'Invoice query', 'please check')]
+
+
+def test_a_goal_mailbox_never_answers_its_mail_and_leaves_what_it_did_not_handle_unread(node, monkeypatch):
+    """Owner, 16 Nov: a company outreach mailbox never auto-replies.  Its
+    inbound goes only to the outreach reply hook (a prospect's reply: stage,
+    draft for the owner); everything else stays unread for the owner, and is
+    fetched whole once, not on every poll."""
+    store = node.store
+    drafts = MagicMock()
+    monkeypatch.setattr(store, '_dispatch_response_draft', drafts)
+    monkeypatch.setattr(store, '_notify_prospect_replied', MagicMock())
+    agent = MagicMock(return_value='thank you, noted')
+    node.channels.registry.set_agent_handler(agent)
+    _connect(HEVOLVE)
+    box = _mailbox(node.channels, HEVOLVE)
+    tools = _tools(monkeypatch, store)
+    speech = _prospect(tools, 'Clinic', 'ana@clinic.example', 'g-speech')
+    store.check_pending_followups_daemon()
+    host = _deliver(node.mail, HEVOLVE, *PEOPLE,
+                    ('ana@clinic.example', 'Re: a question', 'yes please'))
+
+    _poll(node.channels, box)
+    _poll(node.channels, box)
+    time.sleep(0.5)          # time for any reply the registry might send
+
+    assert node.mail.sent == []
+    agent.assert_not_called()
+    assert node.mail.seen(host) == [False, False, False, True]
+    assert store._load_prospects()['prospects'][speech]['stage'] == 'replied'
+    assert drafts.call_count == 1
+    assert len(node.mail.bodies) == 4                  # each mail fetched once
+
+
+def test_a_goal_mailbox_is_never_answered_through_the_nodes_own_email_channel(node, monkeypatch):
+    """A node with its own email channel and a goal mailbox: mail to the
+    goal mailbox reaches no chat agent, so it is answered from neither
+    address."""
+    agent = MagicMock(return_value='thank you, noted')
+    node.channels.registry.set_agent_handler(agent)
+    _legacy_mailbox(node, monkeypatch)
+    _connect(HEVOLVE)
+    box = _mailbox(node.channels, HEVOLVE)
+    _deliver(node.mail, HEVOLVE, *PEOPLE)
+
+    _poll(node.channels, box)
+    time.sleep(0.5)
+
+    agent.assert_not_called()
+    assert node.mail.sent == []
+
+
+def test_two_goal_mailboxes_never_mail_each_other(node):
+    agent = MagicMock(return_value='thank you, noted')
+    node.channels.registry.set_agent_handler(agent)
+    boxes = {}
+    for address in (HEVOLVE, MCGROCE):
+        _connect(address)
+        boxes[address] = _mailbox(node.channels, address)
+    _deliver(node.mail, MCGROCE, (HEVOLVE, 'hello', 'from the other mailbox'))
+    _deliver(node.mail, HEVOLVE, (MCGROCE, 'hello', 'from the other mailbox'))
+
+    for _round in range(4):
+        _poll(node.channels, *boxes.values())
+    time.sleep(0.5)
+
+    assert node.mail.sent == []
+    agent.assert_not_called()
+
+
+# ── 6c. an inbound From is never the owner ───────────────────────────
+
+def test_a_from_header_carrying_a_mailbox_address_is_never_the_owner(node):
+    """The owner's binding of a mailbox names who connected it, never who
+    writes in: a From that spoofs the company address (or the connect tool's
+    placeholder) resolves like any stranger.  A real sender's own binding
+    still resolves."""
+    from integrations.social.models import UserChannelBinding, db_session
+    _connect(HEVOLVE)
+    _mailbox(node.channels, HEVOLVE)
+    with db_session() as db:
+        db.add(UserChannelBinding(user_id=OWNER, channel_type='email',
+                                  channel_sender_id='agent_registered',
+                                  auth_method='credentials', is_active=True))
+        db.add(UserChannelBinding(user_id='u-ana', channel_type='email',
+                                  channel_sender_id='ana@clinic.example',
+                                  is_active=True))
+    resolve = node.channels.integration._resolve_user_id_for_sender
+    try:
+        assert resolve(channel='email', sender_id=HEVOLVE, fallback='stranger') == 'stranger'
+        assert resolve(channel='email', sender_id='agent_registered',
+                       fallback='stranger') == 'stranger'
+        assert resolve(channel='email', sender_id='ana@clinic.example',
+                       fallback='stranger') == 'u-ana'
+    finally:
+        with db_session() as db:
+            db.query(UserChannelBinding).filter_by(user_id='u-ana').delete()
+
+
+# ── 6d. a goal's turn emails only its own goal's prospects ───────────
+
+def test_a_goals_turn_sends_only_to_its_own_goals_prospects(node, monkeypatch):
+    for address in (HEVOLVE, MCGROCE):
+        _connect(address)
+        _mailbox(node.channels, address)
+    tools = _tools(monkeypatch, node.store)
+    journey = _journey_tools(monkeypatch)
+    speech = _prospect(tools, 'Clinic', 'ana@clinic.example', 'g-speech')
+    step = json.dumps([{'delay_days': 0, 'subject': 'lash prices',
+                        'body_html': '<p>lashes</p>'}])
+
+    sent = json.loads(_in_turn('g-lashes', tools['send_outreach_email'],
+                               speech, 'lash extensions wholesale', '<p>lashes</p>'))
+    seq = json.loads(_in_turn('g-lashes', tools['create_followup_sequence'],
+                              speech, 'lashes', step))
+    msg = json.loads(_in_turn('g-lashes', journey['send_prospect_message'],
+                              speech, 'lash prices inside', 'email'))
+
+    # A turn that only names the speech goal (a client's /chat body can),
+    # and a person's turn outside any goal, are not the speech goal's own.
+    named = json.loads(_named_turn('g-speech', tools['send_outreach_email'],
+                                   speech, 'a question', '<p>hello</p>'))
+    person = json.loads(tools['send_outreach_email'](
+        speech, 'a question', '<p>hello</p>'))
+
+    for out in (sent, seq, msg, named, person):
+        assert out.get('success') is False, out
+        assert "Speech therapy centres" in json.dumps(out)
+    assert node.store._load_prospects()['sequences'] == {}
+    assert node.mail.sent == []
+    own = json.loads(_in_turn('g-speech', tools['send_outreach_email'],
+                              speech, 'a question', '<p>hello</p>'))
+    assert own['success'] is True
+    assert [m['to'] for m in node.mail.sent_from(HEVOLVE)] == ['ana@clinic.example']
+
+
+def test_a_turn_that_only_names_a_goal_never_files_prospects_under_it(node, monkeypatch):
+    """A prospect created in a turn this node did not start is no goal's:
+    its email cannot go from a goal's mailbox."""
+    _connect(HEVOLVE)
+    _mailbox(node.channels, HEVOLVE)
+    tools = _tools(monkeypatch, node.store)
+
+    pid = json.loads(_named_turn('g-speech', tools['create_prospect'],
+                                 'Clinic', 'Contact', 'ana@clinic.example'))['prospect']['id']
+
+    assert 'goal_id' not in node.store._load_prospects()['prospects'][pid]
+    assert _send(tools, pid)['success'] is False
+    assert node.mail.sent == []
+
+
+# ── 6e. no goal's email leaves from the node's own or a stray mailbox ─
+
+def test_a_node_mailbox_never_carries_a_goals_email(node, monkeypatch):
+    """On a node with its own email channel, a goal that names no mailbox,
+    a goal that is gone, and a goal whose mailbox is not connected are each
+    refused; none of their email leaves from the node's mailbox."""
+    from integrations.agent_engine.journey_engine import JourneyEngine
+    _legacy_mailbox(node, monkeypatch)
+    tools = _tools(monkeypatch, node.store)
+    plain = _prospect(tools, 'Shop', 'mo@shop.example', 'g-plain')
+    speech = _prospect(tools, 'Clinic', 'ana@clinic.example', 'g-speech')
+    old = _prospect(tools, 'Old', 'old@old.example', 'g-speech')
+    gone = dict(node.store._load_prospects()['prospects'][old], goal_id='g-deleted',
+                email_draft={'subject': 'hello', 'body': '<p>hi</p>'})
+
+    outs = {pid: _send(tools, pid) for pid in (plain, speech)}
+    first = JourneyEngine()._action_send_email(gone, {})   # no turn: the journey tick
+
+    assert all(o['success'] is False for o in outs.values()), outs
+    assert 'names no mailbox' in outs[plain]['error']
+    assert f'{HEVOLVE} that goal' in outs[speech]['error']
+    assert first.get('sent') is False and 'is not on this node' in first['result']['error']
+    assert node.mail.sent == []
+    assert node.mailer == []
+
+
+def test_a_mailbox_that_is_not_connected_sends_nothing_even_when_its_smtp_answers(node, monkeypatch):
+    """The mailbox is still registered, but its connection is down (the
+    state a failed connect leaves, ChannelAdapter.start: ERROR); its SMTP
+    server would still take mail.  Nothing goes out until it is connected
+    again.  (Set directly: in this test venv, 3.12.3 on the 3.12.6 stdlib,
+    an exception raised in an executor never reaches the awaiting
+    coroutine, so neither a refused IMAP login nor stop() can end.)"""
+    from integrations.channels.base import ChannelStatus
+    _connect(HEVOLVE)
+    box = _mailbox(node.channels, HEVOLVE)
+    box.status = ChannelStatus.ERROR
+    assert node.channels.registry.accounts('email').get(HEVOLVE) is box
+    tools = _tools(monkeypatch, node.store)
+
+    out = _send(tools, _prospect(tools, 'Clinic', 'ana@clinic.example', 'g-speech'))
+
+    assert out['success'] is False and 'not connected' in out['error']
+    assert node.mail.sent == []
+
+
+def test_a_send_that_names_no_mailbox_never_leaves_from_a_goal_mailbox(node):
+    """The channel tools send through 'email' with no mailbox named: that
+    is never one of the goals' company mailboxes."""
+    from integrations.channels.agent_tools import build_channel_tool_closures
+    for address in (HEVOLVE, MCGROCE):
+        _connect(address)
+        _mailbox(node.channels, address)
+    send = next(t[2] for t in build_channel_tool_closures({'user_id': OWNER})
+                if t[0] == 'send_to_channel')
+
+    out = send('email', 'Your order is ready', 'mo@shop.example')
+
+    assert 'successfully' not in out, out
+    assert node.mail.sent == []
+
+
+# ── 6f. every outgoing email is verified before it leaves ────────────
+
+def test_every_outgoing_email_is_verified_before_it_leaves(node, monkeypatch):
+    """Owner, 16 Nov: "You verify all the outgoing emails on my behalf from
+    central."  One check every email passes before it leaves: a template
+    blank left in it, or an address of the node's own mailboxes, stops it
+    with what to fix; a clean email goes."""
+    for address in (HEVOLVE, MCGROCE):
+        _connect(address)
+        _mailbox(node.channels, address)
+    tools = _tools(monkeypatch, node.store)
+    ana = _prospect(tools, 'Clinic', 'ana@clinic.example', 'g-speech')
+    own = _prospect(tools, 'Us', MCGROCE, 'g-speech')
+
+    send = tools['send_outreach_email']
+    footer = json.loads(_in_turn('g-speech', send, ana, 'a question',
+                                 '<p>hello</p><p>{POSTAL ADDRESS}</p>'))
+    subject = json.loads(_in_turn('g-speech', send, ana,
+                                  'quick question about {product_keyword}',
+                                  '<p>hello</p>'))
+    to_self = _send(tools, own)
+
+    for out in (footer, subject):
+        assert out['success'] is False and 'blank' in out['error'], out
+    assert '{POSTAL ADDRESS}' in footer['error']
+    assert "node's own" in to_self['error']
+    assert node.mail.sent == []
+    assert _send(tools, ana)['success'] is True
+    assert len(node.mail.sent) == 1
+
+
+def test_the_node_mailboxs_email_is_verified_too(node, monkeypatch):
+    _legacy_mailbox(node, monkeypatch)
+    tools = _tools(monkeypatch, node.store)
+    pid = _prospect(tools, 'Shop', 'mo@shop.example')
+
+    out = json.loads(tools['send_outreach_email'](
+        pid, 'hello', '<p>hi {first_name}</p>'))
+
+    assert out['success'] is False and 'blank' in out['error']
+    assert node.mail.sent == [] and node.mailer == []
 
 
 # ── 7. no password in a refusal, a tool result or a log line ─────────

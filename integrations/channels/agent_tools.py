@@ -608,7 +608,7 @@ def build_channel_tool_closures(ctx):
             # from chat or OAuth comes back after a restart.  Encrypted when
             # the vault has a key (seal_binding_credential).
             from integrations.channels.flask_integration import (
-                FlaskChannelIntegration)
+                CONNECTED_BY_TOOL, FlaskChannelIntegration)
             # A channel that holds several accounts (email: one mailbox per
             # address) keeps each on its own binding, under the account, with
             # every setting its adapter is started from (sealed as in
@@ -641,7 +641,7 @@ def build_channel_tool_closures(ctx):
                             db.add(UserChannelBinding(
                                 user_id=str(uid),
                                 channel_type=channel_type,
-                                channel_sender_id=account or 'agent_registered',
+                                channel_sender_id=account or CONNECTED_BY_TOOL,
                                 auth_method=meta['auth_method'],
                                 metadata_json=cred_meta or None,
                                 is_active=True,

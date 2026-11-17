@@ -7,7 +7,6 @@ Handles routing messages to/from the agent system.
 
 import asyncio
 import concurrent.futures
-import functools
 import inspect
 import logging
 import os
@@ -213,12 +212,22 @@ class ChannelRegistry:
                 the same account; the channel's other accounts and its
                 node-wide adapter stay.  None: the channel's one adapter,
                 which replaces the one before it.
+
+        An account is a business mailbox a goal sends from, not a chat: it
+        is never routed to the chat agent, so nothing ever answers its mail
+        automatically.  Its inbound reaches only the handlers attached to it
+        (the outreach reply hook).  Review of ae390514f: bound to the agent,
+        four unread mails got four automatic replies from the company
+        address, and two connected mailboxes answered each other without
+        end.
         """
         key = normalize_account(account)
         if key is None:
             if adapter.name in self._adapters:
                 logger.warning(f"Replacing existing adapter for {adapter.name}")
             self._adapters[adapter.name] = adapter
+            # Set up message routing
+            adapter.on_message(self._route_to_agent)
         else:
             accounts = self._accounts.setdefault(adapter.name, {})
             if key in accounts:
@@ -226,13 +235,8 @@ class ChannelRegistry:
                                adapter.name, key)
             accounts[key] = adapter
 
-        # Set up message routing.  The reply goes out through the adapter the
-        # message came in on: with several accounts on one channel, looking
-        # the adapter up by channel name would answer from another account.
-        adapter.on_message(functools.partial(self._route_to_agent, adapter=adapter))
-
         logger.info(f"Registered channel adapter: {adapter.name}"
-                    + (f" ({key})" if key else ""))
+                    + (" (an account)" if key else ""))
 
         # Wake the realtime router for channels registered AFTER boot.
         # Nunba's _wamp_is_needed() gate runs once at startup, so a channel
@@ -311,21 +315,17 @@ class ChannelRegistry:
         """
         self._agent_handler = handler
 
-    async def _route_to_agent(self, message: Message,
-                              adapter: Optional[ChannelAdapter] = None) -> None:
+    async def _route_to_agent(self, message: Message) -> None:
         """
         Route incoming message to agent and send response.
 
         This is the core integration point between channels and the agent system.
-        ``adapter``: the one the message came in on (register binds it), so
-        the reply leaves from the same account; without it, the channel's
-        node-wide adapter.
         """
         if not self._agent_handler:
             logger.warning("No agent handler set, ignoring message")
             return
 
-        adapter = adapter or self._adapters.get(message.channel)
+        adapter = self._adapters.get(message.channel)
         if not adapter:
             logger.error(f"No adapter found for channel: {message.channel}")
             return

@@ -25,6 +25,11 @@ from .registry import ChannelRegistry, ChannelRegistryConfig, get_registry
 logger = logging.getLogger(__name__)
 
 
+#: The sender id of the binding the connect tool (register_channel) writes
+#: for the person who connected a channel: a placeholder, never an inbound
+#: sender (FlaskChannelIntegration.binding_connects_the_channel).
+CONNECTED_BY_TOOL = 'agent_registered'
+
 #: Seconds a caller of send_threadsafe waits for the channel to confirm a
 #: send.  A send still running then may yet be delivered: the caller says
 #: "pending, do not resend" (/channels/send's 202), never "not sent".
@@ -311,12 +316,15 @@ class FlaskChannelIntegration:
         try:
             db = get_db()
             try:
-                row = db.query(UserChannelBinding).filter_by(
+                rows = db.query(UserChannelBinding).filter_by(
                     channel_type=str(channel).lower(),
                     channel_sender_id=str(sender_id),
                     is_active=True,
-                ).first()
-                if row and row.user_id:
+                ).all()
+                for row in rows:
+                    if not row.user_id or self.binding_connects_the_channel(
+                            str(channel).lower(), row):
+                        continue
                     logger.debug(
                         f"Channel binding resolved: {channel}:{sender_id} "
                         f"→ user_id={row.user_id}"
@@ -485,6 +493,8 @@ class FlaskChannelIntegration:
     #   account_param: for a channel that holds several accounts on one node,
     #          the setting that names the account (channel_account); each
     #          account gets its own adapter (ChannelRegistry accounts).
+    #   account_settings: factory settings every account adapter is built
+    #          with.
     _CHANNEL_SPECS: Dict[str, Dict[str, Any]] = {
         'email': {
             # One mailbox per adapter (EmailAdapter: one IMAP + SMTP login),
@@ -497,6 +507,9 @@ class FlaskChannelIntegration:
             # registers exactly as before.
             'token_param': 'imap_host',
             'account_param': 'email_address',
+            # A goal's company mailbox reads its inbox for prospects' replies
+            # only: the rest of its owner's mail stays unread there.
+            'account_settings': {'mark_as_read': False},
             'extra': [
                 {'param': 'smtp_host'},
                 {'param': 'email_address'},
@@ -713,8 +726,10 @@ class FlaskChannelIntegration:
             if not spec and token:
                 call_kwargs.update(self._credential_kwarg(factory_fn, token))
 
-            adapter = factory_fn(**call_kwargs)
             account = self.channel_account(channel_type, call_kwargs)
+            if account is not None:
+                call_kwargs.update(spec.get('account_settings') or {})
+            adapter = factory_fn(**call_kwargs)
             if account is None:
                 self.registry.register(adapter)
             else:
@@ -764,6 +779,21 @@ class FlaskChannelIntegration:
         if not param:
             return None
         return normalize_account((settings or {}).get(param))
+
+    @classmethod
+    def binding_connects_the_channel(cls, channel_type: str, row) -> bool:
+        """Whether a UserChannelBinding row records who CONNECTED the node's
+        own channel rather than who writes in on it: the connect tool's
+        placeholder sender (CONNECTED_BY_TOOL), or one of the channel's
+        accounts (a mailbox the node sends from, whose settings it holds).
+        Such a row never names an inbound sender's identity: an email From
+        is anyone's to write, and resolving the company address to the
+        owner let a stranger be the owner (review of ae390514f)."""
+        if getattr(row, 'channel_sender_id', None) == CONNECTED_BY_TOOL:
+            return True
+        param = (cls._CHANNEL_SPECS.get(channel_type) or {}).get('account_param')
+        meta = getattr(row, 'metadata_json', None)
+        return bool(param) and isinstance(meta, dict) and param in meta
 
     @staticmethod
     def _credential_kwarg(factory_fn, token: str) -> Dict[str, str]:

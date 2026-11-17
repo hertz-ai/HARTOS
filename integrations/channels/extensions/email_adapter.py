@@ -69,6 +69,11 @@ from ..base import (
 
 logger = logging.getLogger(__name__)
 
+#: The key a message handler sets in ``Message.raw`` (True) when it took an
+#: inbound email.  A mailbox that leaves its mail unread (mark_as_read
+#: False) marks only those read: the rest stay unread for its owner.
+HANDLED = 'handled'
+
 
 @dataclass
 class EmailConfig(ChannelConfig):
@@ -101,6 +106,9 @@ class EmailConfig(ChannelConfig):
     # Behavior
     poll_interval: int = 30  # Seconds between IMAP polls
     use_idle: bool = True  # Use IMAP IDLE if available
+    # True: every polled email is marked read.  False: emails are read with
+    # PEEK and marked read only when a handler took one (HANDLED); a goal's
+    # company mailbox leaves its owner's other mail unread.
     mark_as_read: bool = True
     archive_after_reply: bool = False
     html_emails: bool = True
@@ -160,7 +168,9 @@ class EmailAdapter(ChannelAdapter):
         self._idle_task: Optional[asyncio.Task] = None
         self._threads: Dict[str, EmailThread] = {}
         self._seen_message_ids: set = set()
-        self._use_async = HAS_AIOIMAP and HAS_AIOSMTP
+        # A mailbox that leaves its mail unread reads through imaplib, where
+        # its peek-and-mark-when-handled read is written (_check_messages_sync).
+        self._use_async = HAS_AIOIMAP and HAS_AIOSMTP and config.mark_as_read
 
     @property
     def name(self) -> str:
@@ -396,6 +406,20 @@ class EmailAdapter(ChannelAdapter):
         """Check messages using sync IMAP."""
         loop = asyncio.get_event_loop()
 
+        peek = not self.email_config.mark_as_read
+
+        def already_read(num) -> bool:
+            """For a mailbox that leaves mail unread: whether this message
+            was processed already, from its Message-ID alone.  Unhandled
+            mail stays UNSEEN, and fetching each one whole on every poll
+            would download the owner's whole unread inbox every 30 s."""
+            status, head = self._imap.fetch(
+                num, '(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])')
+            if status != 'OK' or not head or not isinstance(head[0], tuple):
+                return False
+            msg_id = email.message_from_bytes(bytes(head[0][1])).get('Message-ID', '')
+            return bool(msg_id) and msg_id in self._seen_message_ids
+
         def check_sync():
             # Select inbox
             self._imap.select(self.email_config.inbox_folder)
@@ -409,8 +433,12 @@ class EmailAdapter(ChannelAdapter):
             messages = []
 
             for num in message_nums:
-                # Fetch message
-                status, msg_data = self._imap.fetch(num, '(RFC822)')
+                if peek and already_read(num):
+                    continue
+                # Fetch message.  RFC822 sets \Seen on the server; BODY.PEEK[]
+                # leaves the message unread.
+                status, msg_data = self._imap.fetch(
+                    num, '(BODY.PEEK[])' if peek else '(RFC822)')
                 if status != 'OK':
                     continue
 
@@ -448,6 +476,11 @@ class EmailAdapter(ChannelAdapter):
 
             # Dispatch to handlers
             await self._dispatch_message(unified_msg)
+
+            # A mailbox that leaves its mail unread marks only what a handler
+            # took (HANDLED); the rest stays unread for its owner.
+            if not self.email_config.mark_as_read and unified_msg.raw.get(HANDLED):
+                await self._mark_as_read(msg_num)
 
         except Exception as e:
             logger.error(f"Error processing email: {e}")

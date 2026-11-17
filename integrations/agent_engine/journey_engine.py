@@ -798,11 +798,16 @@ def register_journey_tools(helper, assistant, user_id: str):
         Channels: email, slack, discord, telegram, whatsapp.
         If no channel specified, uses the best one for the prospect's journey stage.
         """
-        from integrations.agent_engine.outreach_crm_tools import _load_prospects
+        from integrations.agent_engine.outreach_crm_tools import (
+            _load_prospects, refuse_other_goals_prospect)
         data = _load_prospects()
         prospect = data['prospects'].get(prospect_id)
         if not prospect:
             return json.dumps({'error': 'prospect not found'})
+        # A goal's turn writes only to its own goal's prospects.
+        refused = refuse_other_goals_prospect('send_prospect_message', prospect)
+        if refused is not None:
+            return json.dumps(refused)
 
         result = engine.send_via_channel(prospect, message, channel)
         if result.get('pending'):
