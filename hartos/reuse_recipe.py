@@ -3309,7 +3309,17 @@ You are a helpful {AGENT_ROLE}. Your primary role is to assist the user efficien
         # rendered defs cost 5,820 of the 6,144-token slot (2026-08-31).
         from integrations.agent_engine.marketing_tools import resolve_goal_tags
         from core.agent_tools import filter_service_tools
-        goal_tags = resolve_goal_tags(stored_goal_tags, goal or '')
+        # The node's own daemon turn for a goal is also resolved with its goal
+        # TYPE's tool tags, beside the record's own (#284): a goal's record
+        # stores none and its gathered goal text need not name a family, so
+        # an outreach goal ran without its CRM tools.  One rule for both
+        # builders (goal_manager.daemon_turn_stored_tags); a person's turn
+        # resolves exactly as before.
+        from integrations.agent_engine.goal_manager import daemon_turn_stored_tags
+        goal_tags = resolve_goal_tags(
+            daemon_turn_stored_tags(stored_goal_tags,
+                                    request_id_list.get(user_prompt)),
+            goal or '')
         _n_all_svc = len(svc_tools)
         svc_tools = filter_service_tools(goal_tags, svc_tools, svc_defs,
                                          service_tool_registry)
