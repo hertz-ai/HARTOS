@@ -243,6 +243,34 @@ def test_a_miss_never_opens_the_one_in_progress_of_another_flow_than_the_newest(
     assert _load_ledger_on_miss(f"{CHILD}_{PROMPT}") is None
 
 
+def test_a_miss_reopens_the_newest_beside_older_leftovers_of_its_flow_and_build(folders):
+    """Review of 12453be4f, S3z: the newest session is in progress beside an
+    older one of the same flow and build, also in progress (a leftover; 88
+    of 103 such older sessions live).  The turn resumes the newest, so the
+    miss reopens it, and an ask it holds is found after a restart."""
+    from hartos.lifecycle_hooks import _load_ledger_on_miss
+    _session(1794000000000)
+    newest = _session(1794000000500)
+    reopened = _load_ledger_on_miss(f"{CHILD}_{PROMPT}")
+    assert reopened is not None and reopened.session_id == newest.session_id, (
+        f"the turn resumes {newest.session_id}, the miss opened "
+        f"{getattr(reopened, 'session_id', None)}")
+
+
+def test_a_miss_reopens_the_newer_of_two_older_sessions_when_the_newest_is_done(folders):
+    """Review of 12453be4f, S3y: two older sessions of the newest one's flow
+    and build are in progress and the newest is done.  The resume walk takes
+    the newer of the two, so the miss reopens that one (15 live pairs)."""
+    from hartos.lifecycle_hooks import _load_ledger_on_miss
+    _session(1794000000000)
+    newer_of_two = _session(1794000000250)
+    _session(1794000000500, in_progress=False)
+    reopened = _load_ledger_on_miss(f"{CHILD}_{PROMPT}")
+    assert reopened is not None and reopened.session_id == newer_of_two.session_id, (
+        f"the turn resumes {newer_of_two.session_id}, the miss opened "
+        f"{getattr(reopened, 'session_id', None)}")
+
+
 def test_a_miss_reads_only_the_persons_own_steps(folders, monkeypatch):
     """Review of b48cd6693, must-fix 2: a miss parsed every ledger in the
     folder (3,074 on the owner's desktop; 19 s cold, 1.8 s warm on 3,000)

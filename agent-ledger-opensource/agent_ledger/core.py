@@ -4403,30 +4403,43 @@ def _flows_in_progress(flows: Dict[Any, List[Tuple[int, Dict[str, Any]]]]) -> bo
     return False
 
 
+def _session_build(flows: Dict[Any, List[Tuple[int, Dict[str, Any]]]]) -> Dict[Any, Dict[str, str]]:
+    """A session's flows and the build each holds (_held_build_steps)."""
+    return {flow: _held_build_steps(flow_tasks) for flow, flow_tasks in flows.items()}
+
+
 def _the_one_session_in_progress(prompt_sessions: Dict[str, Dict[Any, Any]],
                                  user_prefix: Optional[str]) -> Optional[str]:
-    """``newest_only``: the person's session in progress when it is the only
-    one, and it is their newest session or holds the newest session's flows
-    and build; else None.  A caller that knows neither the flow nor the build
-    cannot choose between two sessions in progress (a flow-0 turn resumes
-    the flow-0 one, a flow-1 turn the other), nor tell an older build's
-    session from the current one's; refusing gives no wrong writes and the
-    turn registers its own (review of 17b251c11: S3c, S3d, S3e).  An older
-    session of the newest one's flow and build is the one the turn resumes
-    (S3g: 24 of 97 live multi-session groups)."""
+    """``newest_only``: the person's newest session in progress, when every
+    session of theirs in progress holds the same flows and build, and that
+    one is their newest session or holds the newest session's flows and
+    build; else None.
+
+    Sessions in progress of one flows-and-build are one candidate: the resume
+    walk takes the newest of them, the older ones are leftovers (review of
+    12453be4f, S3z: 88 of 103 live older sessions beside a newest in
+    progress; S3y: the newer of two older ones when the newest is done).  A
+    caller that knows neither the flow nor the build cannot choose between
+    sessions in progress of different flows (a flow-0 turn resumes the
+    flow-0 one, a flow-1 turn the other) or builds (a revert); refusing
+    gives no wrong writes and the turn registers its own (review of
+    17b251c11: S3c, S3d, S3e).  An older session of the newest one's flow
+    and build is the one the turn resumes (S3g).
+
+    Not closed without the turn's own build: an agent rebuilt after its
+    newest session, with an older session of the old build in progress
+    (S3i, 0 live), reopens that old-build session."""
     mine = [s for s in sorted(prompt_sessions, reverse=True)
             if user_prefix is None or s.startswith(user_prefix)]
     in_progress = [s for s in mine if _flows_in_progress(prompt_sessions[s])]
-    if len(in_progress) != 1:
+    if not in_progress:
         return None
-    only = in_progress[0]
-    if only == mine[0]:
-        return only
-    newest, held = prompt_sessions[mine[0]], prompt_sessions[only]
-    if set(newest) == set(held) and all(
-            _held_build_steps(held[flow]) == _held_build_steps(newest[flow])
-            for flow in newest):
-        return only
+    candidate = in_progress[0]
+    build = _session_build(prompt_sessions[candidate])
+    if any(_session_build(prompt_sessions[s]) != build for s in in_progress[1:]):
+        return None
+    if candidate == mine[0] or _session_build(prompt_sessions[mine[0]]) == build:
+        return candidate
     return None
 
 
@@ -4483,9 +4496,9 @@ def _find_resumable_session(
 
     ``newest_only`` is for a caller that knows neither the flow nor the build
     (the ledger registry's cache miss, which has only '<user>_<prompt>'): the
-    person's session in progress only when it is the one in progress and is
-    their newest session, or holds the newest session's flows and build
-    (_the_one_session_in_progress); else None.  Opening another build's or
+    person's newest session in progress, when all of theirs in progress hold
+    one flows-and-build and it is their newest session or holds the newest
+    session's flows and build (_the_one_session_in_progress); else None.  Opening another build's or
     flow's session would write this turn's states into its steps (review of
     b48cd6693, must-fix 1; review of 17b251c11).  ``flow_id`` and ``actions``
     are not read with it.
