@@ -2449,6 +2449,35 @@ def send_is_ask(messages, call_id, verdict=None) -> bool:
             or verdict_waits_on_person(verdict))
 
 
+def send_declared_ask(messages, call_id) -> bool:
+    """Whether a send DECLARED that it asks the person (expects_reply=true).
+
+    The reply pick's question, beside send_is_ask on purpose.  send_is_ask
+    counts an undeclared send as an ask, the right fail-safe for completion
+    (a step never closes on its own question).  As "an open question is the
+    reply" that fail-safe would let any undeclared narration beat the turn's
+    answer (hartos-43's review, 18 Nov 2026), so the reply pick reads only a
+    declaration.  Its price: an answer followed by a send that declares a
+    question ("Anything else I can help with?") replies with the question."""
+    return send_expects_reply(messages, call_id) is True
+
+
+def longest_answer(candidates, text_of=str):
+    """The candidate whose text is longest, a tie going to the newer, or None.
+
+    ``candidates`` are already filtered by the caller's own rules, oldest
+    first.  THE pick for "which of these is the answer": the lesson, not the
+    one-line note after it.  Read by _derive_written_answer,
+    reuse_recipe._reuse_turn_written_reply and the reply pick in
+    reuse_recipe._reuse_turn_delivered_send."""
+    best, best_size = None, -1
+    for candidate in (candidates or []):
+        size = len(str(text_of(candidate) or '').strip())
+        if size >= best_size:
+            best, best_size = candidate, size
+    return best
+
+
 def action_in_progress(user_prompt) -> Optional[int]:
     """The action this session is working on (IN_PROGRESS or awaiting its
     verdict), or None; for the per-send log line."""
@@ -3025,17 +3054,16 @@ def _derive_written_answer(user_prompt: str, action_id: int,
     msgs = getattr(group_chat, 'messages', None)
     if not isinstance(msgs, list):
         return None
-    best, best_size = None, -1
+    accepted = []
     for index, msg in enumerate(msgs):
         if not is_written_answer(msg):
-            continue
-        size = len(str(msg.get('content')).strip())
-        if size < best_size:
             continue
         candidate = {'message_index': index, 'kind': 'user_visible_result'}
         if _verifier_completion_has_conversation_evidence(
                 user_prompt, action_id, {'evidence': candidate}):
-            best, best_size = candidate, size
+            accepted.append(candidate)
+    best = longest_answer(
+        accepted, text_of=lambda c: msgs[c['message_index']].get('content'))
     if best is not None:
         logger.info(
             "[COMPLETION-RECEIPT] action %s in %s: the verdict cited no "

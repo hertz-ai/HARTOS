@@ -398,6 +398,7 @@ from hartos.lifecycle_hooks import (
     action_is_autonomous, action_named_tools, action_own_text,
     is_written_answer, ANSWER_KEYS, user_output_receipt,
     SEND_TOOL, send_is_ask, verdict_waits_on_person, send_delivered,
+    send_declared_ask, longest_answer,
     delivered_text, sent_text, window_asked, window_question, tool_call_names,
     recorded_answers,
     hand_goal_to_its_person,
@@ -5492,7 +5493,7 @@ def _reuse_turn_refused_prose(user_prompt, messages):
 
 
 def _reuse_turn_delivered_send(user_prompt, messages, starts_with=None,
-                               asks=False):
+                               asks=False, since_calls=None):
     """The text of this turn's newest send_message_to_user that reached the
     person (lifecycle_hooks.send_delivered), or None: the finaliser's answer
     for a turn whose words went out only through the send tool.  Such a turn
@@ -5515,13 +5516,33 @@ def _reuse_turn_delivered_send(user_prompt, messages, starts_with=None,
     1794540972213, local 4B): the steered round put "What is your mother
     called in Tamil?" on the child's card, then wrote "Good! The person is
     now being asked the question ..." and ended on a verdict; this reader saw
-    only sends, so that narration was the reply in the chat."""
+    only sends, so that narration was the reply in the chat.
+
+    ``since_calls``: the tool-call ids the log held before a steer; a send
+    or card among them is not the steered round's, so it does not count.
+    Call ids, not a message index or the text: the trim can rebuild the
+    window between the steer and this read, and the same text can be sent
+    twice (hartos-43's review, 18 Nov 2026).
+
+    THE PLAIN PICK (no ``starts_with``, no ``asks``) is the turn's ANSWER,
+    not its last send.  An open question wins, newest first: a card still
+    waiting, or a send that DECLARED expects_reply=true
+    (lifecycle_hooks.send_declared_ask; an undeclared send is not taken for
+    a question here).  Otherwise the longest delivered send the answer rules
+    accept, a tie to the newer (lifecycle_hooks.longest_answer).  Live
+    18 Nov 2026 22:26-22:27 IST, research agent 1795014914479 on the local
+    4B: the steered round sent the answer (about 1,350 characters) and then
+    "I'm ready to continue gathering ..." (146), both declared
+    expects_reply=false, and the newest-first pick spoke the narration."""
     from core.agent_tool_menu import ASK_PERSON_TOOL
     start = _reuse_turn_seed_index(user_prompt, messages)
     if start is None:
         return None
     window = messages[start + 1:]
     call_fn = _reuse_call_id_to_tool_name([window])
+    skip = set(since_calls or ())
+    plain = starts_with is None and not asks
+    answers = []                     # newest first, the plain pick's
     closed_asks = set()
     for msg in reversed(window):
         m = msg or {}
@@ -5534,20 +5555,32 @@ def _reuse_turn_delivered_send(user_prompt, messages, starts_with=None,
             call_id = result.get('tool_call_id') or m.get('tool_call_id')
             body = str(result.get('content') or m.get('content') or '')
             if call_fn.get(call_id) == SEND_TOOL and send_delivered(body):
+                if call_id in skip:
+                    continue
                 text = _reuse_send_text(window, call_id)
                 if (isinstance(text, str) and text.strip()
                         and (starts_with is None
                              or text.strip().startswith(str(starts_with).strip()))):
+                    if plain:
+                        if send_declared_ask(window, call_id):
+                            return text
+                        if _reuse_message_is_user_answer(
+                                {'content': text, 'name': 'Assistant',
+                                 'role': 'assistant'}):
+                            answers.append(text)
+                        continue
                     if asks and not send_is_ask(window, call_id):
                         return None
                     return text
             elif call_fn.get(call_id) == ASK_PERSON_TOOL:
                 question = _reuse_card_question(window, call_id, body,
                                                 closed_asks)
+                if call_id in skip:
+                    continue
                 if question and (starts_with is None
                                  or question.startswith(str(starts_with).strip())):
                     return question
-    return None
+    return longest_answer(list(reversed(answers))) if answers else None
 
 
 def _reuse_card_question(messages, call_id, body, closed_asks):
@@ -5674,7 +5707,7 @@ def _reuse_turn_written_reply(user_prompt, group_chat):
         last = latest_dispatch_before(messages, len(messages))
         if last is None or not _saves_only(last):
             return None
-        step, best, best_size = None, None, -1
+        step, found = None, []           # found: newest first
         for idx in range(len(messages) - 1, boundary, -1):
             action = latest_dispatch_before(messages, idx)
             if step is None:
@@ -5686,10 +5719,9 @@ def _reuse_turn_written_reply(user_prompt, group_chat):
             msg = messages[idx]
             if not (_reuse_message_is_user_answer(msg) and is_written_answer(msg)):
                 continue
-            size = len(str(msg.get('content') or '').strip())
-            if size > best_size:             # walking back: a tie keeps the newer
-                best, best_size = msg, size
-        return best
+            found.append(msg)
+        return longest_answer(list(reversed(found)),
+                              text_of=lambda m: m.get('content'))
     except Exception as err:
         _ctx_safe_log('warning', f"[SYNTHESIS] turn reply unreadable for "
                                  f"{user_prompt}: {err!r}; the action's "
@@ -6242,6 +6274,10 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
                     pass
         return False
     _before = len(getattr(group_chat, 'messages', None) or [])
+    # The calls the log held before the steer: the steered round's own sends
+    # are the ones not among them (_reply_with_the_send's ``after``).
+    _before_calls = set(_reuse_call_id_to_tool_name(
+        [list(getattr(group_chat, 'messages', None) or [])]))
 
     def _say(level, msg):
         # Logging is NEVER on the path that can skip the steer.  The first cut
@@ -6297,19 +6333,18 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
     # refuse (it names a seat): appended, it was refused as the tail and the
     # extractor walked back to the group's prose ("I have prepared the report
     # for the user."), with no steer.  ``asks``: only a send that asks the
-    # person (the question an unfinished action waits on).  ``after``: only a
-    # send newer than the one the log held at that index (the steered round's
-    # own), since a send before the round no longer always ends the turn.
+    # person (the question an unfinished action waits on).  ``after``: the
+    # tool-call ids the log held before the steer; only a send that is not
+    # among them is the steered round's own, since a send before the round no
+    # longer always ends the turn.
     def _reply_with_the_send(when, asks=False, after=None):
         if _unrun:
             return False
         try:
             _msgs = group_chat.messages
-            _sent = _reuse_turn_delivered_send(user_prompt, _msgs, asks=asks)
+            _sent = _reuse_turn_delivered_send(user_prompt, _msgs, asks=asks,
+                                               since_calls=after)
             if not _sent:
-                return False
-            if after is not None and _sent == _reuse_turn_delivered_send(
-                    user_prompt, list(_msgs)[:after]):
                 return False
             _reply = {'content': _sent, 'name': 'Assistant',
                       'role': 'assistant'}
@@ -6528,7 +6563,7 @@ def _reuse_synthesis_turn(user_prompt, group_chat, manager, chat_instructor):
     # round's, and it is the reply, not the round's words about it.  A send
     # from before the steer is not: the honest report the steer asked for
     # stays the reply.
-    _reply_with_the_send('in the steered round', after=_before)
+    _reply_with_the_send('in the steered round', after=_before_calls)
     return True
 
 
