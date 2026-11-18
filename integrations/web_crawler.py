@@ -294,8 +294,11 @@ async def _crawl_single(url: str, timeout: int, log: _ProgressLog) -> dict:
         log.step(f"Crawl returned no content: {error}")
         return {'success': False, 'url': url, 'error': error}
     except Exception as e:
-        log.step(f"Crawl error: {e}")
-        return {'success': False, 'url': url, 'error': str(e)}
+        # An exception with no message (Windows: NotImplementedError when the
+        # loop cannot start the browser) is named, never an empty error.
+        reason = str(e) or type(e).__name__
+        log.step(f"Crawl error: {reason}")
+        return {'success': False, 'url': url, 'error': reason}
 
 
 #: One picture in a page's markdown, as both read paths write it.
@@ -625,8 +628,13 @@ def crawl_url(url: str, timeout: int = 30) -> dict:
         log.step("Using crawl4ai (in-process, JS rendering enabled)")
         try:
             result = _run_async(_crawl_single(url, timeout, log))
-            result['progress'] = log.text()
-            return result
+            # _crawl_single reports its own failure instead of raising; a
+            # failed browser read still gets the read without a browser.
+            if result.get('success'):
+                result['progress'] = log.text()
+                return result
+            log.step(f"crawl4ai could not read it ({result.get('error')}), "
+                     f"falling back to requests")
         except Exception as e:
             log.step(f"crawl4ai failed: {e}, falling back to requests")
     else:
@@ -662,6 +670,9 @@ def crawl_urls(urls: List[str], timeout: int = 30, max_concurrent: int = 3) -> L
             results = _run_async(_batch())
             success_count = sum(1 for r in results if r['success'])
             log.step(f"Batch complete: {success_count}/{len(urls)} succeeded")
+            # A page the browser could not read is read without one.
+            results = [r if r['success'] else _fallback_fetch(u, timeout, log)
+                       for u, r in zip(urls, results)]
             batch_progress = log.text()
             for r in results:
                 r['progress'] = batch_progress
