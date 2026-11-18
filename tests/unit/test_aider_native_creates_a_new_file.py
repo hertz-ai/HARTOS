@@ -107,6 +107,54 @@ def test_a_created_file_is_the_receipt(tmp_path):
     assert (work / 'hello.py').read_text(encoding='utf-8') == 'print("hi")\n'
 
 
+@pytest.mark.parametrize('blank_line', [True, False],
+                         ids=['blank-search-line', 'aider-form'])
+def test_an_empty_search_never_touches_an_existing_file(tmp_path, blank_line):
+    """Review of 85735cb3: an empty SEARCH reached str.replace('', X) on an
+    existing file and interleaved X between every character ('ab' became
+    'XaXbX'), reported as applied.  An empty SEARCH only creates."""
+    work = tmp_path / 'repo'
+    work.mkdir()
+    (work / 'hello.py').write_text('ab\n', encoding='utf-8')
+    res = _backend()._apply_edits(_new_file('hello.py', 'X', blank_line),
+                                  str(work), [])
+    assert res[0]['status'] == 'skipped', res
+    assert 'exists' in res[0]['reason']
+    assert (work / 'hello.py').read_text(encoding='utf-8') == 'ab\n'
+
+
+def test_an_empty_search_on_an_existing_file_is_no_success(tmp_path):
+    from integrations.coding_agent.aider_native_backend import AiderNativeBackend
+    from integrations.coding_agent.aider_core import hart_model_adapter as hma
+    work = tmp_path / 'repo'
+    work.mkdir()
+    (work / 'hello.py').write_text('ab\n', encoding='utf-8')
+    with patch.object(AiderNativeBackend, 'is_installed', return_value=True), \
+            patch.object(hma, 'send_completion',
+                         return_value=_new_file('hello.py', 'X', False)), \
+            patch.object(hma.HartModelAdapter, 'from_hartos_config',
+                         return_value=object()):
+        result = AiderNativeBackend().execute(
+            'Create hello.py', {'working_dir': str(work), 'files': ['hello.py']})
+    assert result['success'] is False
+    assert result['files_changed'] == []
+    assert (work / 'hello.py').read_text(encoding='utf-8') == 'ab\n'
+
+
+def test_an_empty_new_file_does_not_swallow_the_next_block(tmp_path):
+    """An empty REPLACE (an empty __init__.py) ends at its own marker."""
+    work = tmp_path / 'repo'
+    work.mkdir()
+    (work / 'b.py').write_text('p\n', encoding='utf-8')
+    reply = ("`pkg/__init__.py`\n<<<<<<< SEARCH\n=======\n>>>>>>> REPLACE\n"
+             "`b.py`\n<<<<<<< SEARCH\np\n=======\nq\n>>>>>>> REPLACE\n")
+    res = _backend()._apply_edits(reply, str(work), [])
+    assert [(r['file'], r['status']) for r in res] == [
+        ('pkg/__init__.py', 'applied'), ('b.py', 'applied')], res
+    assert (work / 'pkg' / '__init__.py').read_text(encoding='utf-8') == ''
+    assert (work / 'b.py').read_text(encoding='utf-8') == 'q\n'
+
+
 def test_the_system_prompt_says_how_to_create_a_file():
     prompt = _backend()._build_system_prompt('feature', '')
     assert 'new file' in prompt.lower()
