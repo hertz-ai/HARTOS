@@ -301,6 +301,10 @@ class SpeculativeDispatcher:
         # hot-path latency budget is preserved).  Capped at 1000 entries
         # via the same eviction helper as `_results`.
         self._last_hive_consult: Dict[str, dict] = {}
+        # The fast model's refusing provider host while goal turns step aside
+        # from speculation ('' while they speculate): should_speculate logs
+        # only when it changes.
+        self._stepped_aside_for = ''
 
     # ─── Gate: should we speculate? ───
 
@@ -346,11 +350,21 @@ class SpeculativeDispatcher:
                 fast_config = None   # unreadable: a check never blocks a turn
             refusing = (local_dispatch_provider_breaker_open(fast_config)
                         if fast_config else '')
+            # Said once per change, at WARNING: central logs nothing below
+            # it after boot, and a line per goal per tick would repeat what
+            # dispatch_goal already says (review of 242654db3, N5).
+            if refusing != getattr(self, '_stepped_aside_for', ''):
+                self._stepped_aside_for = refusing
+                if refusing:
+                    logger.warning("Goal turns are not speculated while the "
+                                   "fast model %s's provider %s is refusing "
+                                   "calls; they are dispatched the ordinary "
+                                   "way", fast.model_id, refusing)
+                else:
+                    logger.warning("Goal turns are speculated again: the "
+                                   "fast model %s's provider takes calls",
+                                   fast.model_id)
             if refusing:
-                logger.info("Goal %s not speculated: the fast model %s's "
-                            "provider %s is refusing calls; dispatched the "
-                            "ordinary way", goal.get('id'), fast.model_id,
-                            refusing)
                 return False
 
         # Budget check (if goal has spark budget)

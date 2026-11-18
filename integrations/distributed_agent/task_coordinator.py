@@ -21,7 +21,7 @@ import logging
 import uuid
 import os
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from agent_ledger.core import (
     BlockedReason, SmartLedger, Task, TaskStatus, TaskType)
@@ -506,11 +506,23 @@ class DistributedTaskCoordinator:
         self,
         agent_id: str,
         capabilities: Optional[List[str]] = None,
+        can_run: Optional[Callable[[Task], bool]] = None,
     ) -> Optional[Task]:
         """
         Atomically claim the next available task matching capabilities.
 
         Uses DistributedTaskLock to prevent double-claiming.
+
+        ``can_run`` (task -> bool) is the claimant's own word on whether it
+        can run a task right now, asked after the capability match and
+        before the lock.  A task it cannot run is skipped, never claimed: it
+        stays PENDING for every other node and costs no ledger write.  Review
+        of 4642245a7, NF1, measured: a node whose model was refusing claimed
+        and deferred such tasks for 600 s, up to 50 a tick, so a healthy peer
+        could claim none of them for 10 minutes, and the first tick
+        re-serialised a 5,122-task ledger 100 times (1.1 GB of JSON).  A
+        check that raises reads as "can run": a broken check must not strand
+        the queue.
         """
         for task_id in self._ledger.task_order:
             task = self._ledger.get_task(task_id)
@@ -614,6 +626,15 @@ class DistributedTaskCoordinator:
                 required = task.context.get("capabilities_required", [])
                 if required and not any(c in capabilities for c in required):
                     continue
+
+            # The claimant's own check, before anything is locked or written.
+            if can_run is not None:
+                try:
+                    if not can_run(task):
+                        continue
+                except Exception as e:
+                    logger.warning("can_run check failed for %s (%s); "
+                                   "claiming it", task_id, e)
 
             # Try atomic claim — with heartbeat so the lock is renewed
             # every HEARTBEAT_INTERVAL until submit_result / release_task.
