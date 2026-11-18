@@ -46,17 +46,17 @@ def test_an_engine_whose_key_follows_the_old_rule_is_unchanged(fresh):
 
 
 def _stale_install(path):
-    """The owner's catalog as written 2026-09-23: NeuTTS at 0.0 GB, a wrong
-    language list, and the owner's own choice to keep it off."""
+    """The owner's catalog as written 2026-09-23: a real seeded row, saved,
+    then carrying what an older seed wrote (NeuTTS at 0.0 GB, a wrong
+    language list, the old vram_key) and the owner's own choice to keep it
+    off; read back by a new catalog, as the next boot does."""
     cat = ModelCatalog(catalog_path=str(path))
-    cat.register(ModelEntry(
-        id='tts-neutts-air', name='NeuTTS Air', model_type='tts',
-        vram_gb=0.0, ram_gb=0.1, languages=['xx'], language_priority={},
-        capabilities={'tool_module': 'integrations.service_tools.neutts_tool',
-                      'tool_function': 'neutts_synthesize',
-                      'sample_rate': 24000, 'voice_clone': True,
-                      'vram_key': 'tts_neutts_air'},
-        enabled=False, tags=['tts', 'local']))
+    tr.populate_tts_catalog(cat)
+    row = cat.get('tts-neutts-air')
+    cat.override('tts-neutts-air', persist=False, vram_gb=0.0, languages=['xx'],
+                 enabled=False,
+                 capabilities={**(row.capabilities or {}), 'vram_key': 'tts_neutts_air'})
+    cat._save()
     return ModelCatalog(catalog_path=str(path))
 
 

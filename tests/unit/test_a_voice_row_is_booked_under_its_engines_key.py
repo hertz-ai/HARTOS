@@ -55,7 +55,10 @@ def test_neutts_books_its_budget_not_zero(orch):
     try:
         o._register_vram(entry, 'gpu')
         assert key == 'tts_neutts'
-        assert vram_manager._allocations.get(key) == VRAM_BUDGETS['tts_neutts'][0]
+        # The budget row's GPU or CPU figure, whichever this machine books;
+        # the defect was 0.0 under the catalog id.
+        booked = vram_manager._allocations.get(key)
+        assert booked in VRAM_BUDGETS['tts_neutts'] and booked > 0
     finally:
         vram_manager._allocations.pop(key, None)
 
