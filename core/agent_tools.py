@@ -1042,7 +1042,7 @@ def build_core_tool_closures(ctx):
     # ------------------------------------------------------------------
     @log_tool_execution
     def save_data_in_memory(
-        key: Annotated[str, "Key path for storing data now & retrieving data later. Use dot notation for nested keys (e.g., 'user.info.name')."],
+        key: Annotated[str, "Key path for storing data now & retrieving data later, a name you choose for this value. Use dot notation for nested keys. Read it back later with this same key."],
         value: Annotated[Optional[Any], "Value you want to store; strictly should be one of int, float, bool, json array or json object."] = None,
         for_everyone: Annotated[bool, "True only when the agent's creator is building it, and only for a template, or an example every user of the agent can start from (a form to fill, a sample lesson). Never a person's own data. Otherwise the value is this person's alone."] = False,
     ) -> str:
@@ -1851,7 +1851,7 @@ def build_core_tool_closures(ctx):
 
     @log_tool_execution
     def get_data_by_key(
-        key: Annotated[str, "Key path for retrieving data. Use dot notation for nested keys (e.g., 'user.info.name')."],
+        key: Annotated[str, "Key path for retrieving data: the key it was saved under. Use dot notation for nested keys. get_saved_metadata lists the keys saved so far."],
         offset: Annotated[int, "Where to start reading a long value, in characters. Leave 0 to read from the start."] = 0,
     ) -> str:
         # One page of the value, not all of it (#104): a key like 'hive'
