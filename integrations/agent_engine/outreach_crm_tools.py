@@ -20,6 +20,7 @@ Tier 1 (Default): google_search, text_2_image, delegate_to_specialist, etc.
 Tier 2 (Category): create_lead, send_outreach, check_replies, move_deal_stage
 Tier 3 (Runtime): delegate_to_specialist for channel-specific follow-ups
 """
+import hashlib
 import html
 import json
 import logging
@@ -76,15 +77,16 @@ class Sender(NamedTuple):
     when it names none).  ``found`` is False when the goal is not on this
     node or could not be read.  ``creator`` is the account that made the
     goal (AgentGoal.created_by): which mailbox the goal may use depends on
-    it (_may_use_mailbox).  ``copy_verified``: the owner has verified the
-    goal's copy (config copy_verified, mark_goal_copy_verified), so its
-    follow-up sequences go out; until then they are held."""
+    it (_may_use_mailbox).  ``verified``: the content hashes
+    (step_content_hash) of the copy the owner has verified for this goal
+    (config verified_copy, mark_goal_copy_verified): a follow-up sequence goes
+    out only when every one of its steps' hashes is in it."""
     goal_id: str
     address: Optional[str]
     title: str = ''
     found: bool = True
     creator: Optional[str] = None
-    copy_verified: bool = False
+    verified: frozenset = frozenset()
 
 
 def goal_sender(goal_id) -> Optional[Sender]:
@@ -114,7 +116,9 @@ def goal_sender(goal_id) -> Optional[Sender]:
             address = address.strip() if isinstance(address, str) else ''
             return Sender(goal_id, address or None, goal.title or '',
                           creator=str(goal.created_by) if goal.created_by else None,
-                          copy_verified=config.get('copy_verified') is True)
+                          verified=frozenset(
+                              h for h in (config.get('verified_copy') or [])
+                              if isinstance(h, str)))
     except Exception:
         logger.warning("Goal %s: the mailbox it sends from could not be read",
                        goal_id, exc_info=True)
@@ -483,18 +487,20 @@ def _send_email(to_email: str, subject: str, html_body: str,
     here, the send is refused with what to fix, and never sent from another
     mailbox or the mailer (owner, 2026-11-16).
 
-    ``verified``: the words are the owner's to trust: a follow-up step of a
-    goal whose copy the owner verified (send_due_followups), or a held draft
-    the owner approved (approve_held_draft).  A goal's email that is not is
+    ``verified``: the words are the owner's to trust: a follow-up step whose
+    exact copy the owner verified for its goal (send_due_followups), or a held
+    draft the owner approved (approve_held_draft).  An email that is not is
     HELD, not sent: ``{'success': False, 'held': True, 'draft_id': ...}``,
     kept for the owner (_hold_email), which needs ``prospect_id`` (the
     prospect it is for).  The caller reads 'held' before it reads a refusal:
-    a held email is not a refused try.  An email for no goal is not held.
+    a held email is not a refused try.
 
     No sender: the email serves no goal.  It goes through the node's own
     email channel, else the HertzAI mailer, as every send did before
     senders were per goal; refused on a node that holds goal mailboxes,
-    since which one it should go from cannot be told.
+    since which one it should go from cannot be told.  Held too on a node
+    that is not flat (_goalless_email_is_held: central, regional); a flat
+    node is one person's machine, and the email is that person's own.
 
     Either way the email first passes verify_outgoing_email, the one check
     every outreach email passes (owner, 2026-11-16).
@@ -512,7 +518,7 @@ def _send_email(to_email: str, subject: str, html_body: str,
         if unable is not None:
             return unable
         if not verified:
-            return _hold_email(sender, prospect_id, subject, sanitized_body)
+            return _hold_email(sender.goal_id, prospect_id, subject, sanitized_body)
         return _send_from_goal_mailbox(sender, adapter, loop, to_email, subject,
                                        plain_text, sanitized_body)
     mailboxes = _goal_mailboxes()
@@ -524,6 +530,8 @@ def _send_email(to_email: str, subject: str, html_body: str,
             "Create or import the prospect in the turn of the goal it is for; "
             "its email then goes from that goal's sender_email. No mailbox is "
             "guessed for it." + _NEVER_ANOTHER_MAILBOX)
+    if not verified and _goalless_email_is_held():
+        return _hold_email(None, prospect_id, subject, sanitized_body)
 
     # Tier 1: Email channel adapter (user's SMTP), run on the channel
     # integration's loop, which owns the adapters (ChannelRegistry has none).
@@ -736,14 +744,22 @@ def undelivered_summary(data: Dict, limit: int = UNDELIVERED_LIST_LIMIT) -> Dict
 # ── Verified before it leaves: held drafts and goal copy ──
 # Owner, 16 Nov 2026: "You verify all the outgoing emails on my behalf from
 # central."  What a goal's email says is the owner's to approve, in two ways:
-#   * the goal's TEMPLATES, the follow-up sequences its agent writes: created
-#     'held' while the goal's copy is not verified (config copy_verified);
-#     the owner verifies the goal (mark_goal_copy_verified) and its held
-#     sequences go 'active', the one state the follow-up checker sends;
-#   * every OTHER email of a goal -- words a model wrote this turn
-#     (send_outreach_email, a reply), or the journey's own copy -- is kept as
-#     a held draft and not sent, until the owner approves it
-#     (approve_held_draft), which sends exactly that text.
+#   * the goal's TEMPLATES, the follow-up sequences its agent writes.  What the
+#     owner verifies is the EXACT copy: the goal's config keeps the content
+#     hash of each verified step (verified_copy; step_content_hash: subject
+#     and body, whitespace normalised).  A sequence is created 'active' only
+#     when every one of its steps' hashes is verified, else 'held', and its
+#     steps show in the held list (list_held_sequence_steps).  The owner
+#     verifies what is held for a goal (mark_goal_copy_verified): those
+#     steps' hashes are added, and the held sequences whose steps are all
+#     verified go 'active', the one state the follow-up checker sends.  It is
+#     never a pass for the goal's future copy: new or changed text is held
+#     again;
+#   * every OTHER email -- words a model wrote this turn (send_outreach_email,
+#     a reply), or the journey's own copy -- is kept as a held draft and not
+#     sent, until the owner approves it (approve_held_draft), which sends
+#     exactly that text.  On a node that is not flat this covers an email for
+#     no goal too (_goalless_email_is_held).
 # A held email costs no send attempt, and the agent is told it goes out once
 # approved so it does not send it again.  The owner reads the held drafts
 # (list_held_drafts) with subject and body, never the recipient's address.
@@ -801,9 +817,48 @@ def _held_drafts():
         os.replace(tmp, path)
 
 
-def _hold_email(sender: Sender, prospect_id: Optional[str], subject: str,
+def _goalless_email_is_held() -> bool:
+    """Whether an email for no goal is held for the owner like a goal's:
+    on a node that is not flat (node_topology.is_flat_node: central,
+    regional, or any tier the rule does not know), where the owner verifies
+    what leaves.  A flat node is one person's machine and its email is that
+    person's own."""
+    from integrations.social.node_topology import is_flat_node
+    return not is_flat_node()
+
+
+def step_content_hash(subject, body_html) -> str:
+    """The identity of one follow-up step's copy: a hash of its subject and
+    body with whitespace normalised (runs of it are one space, ends cut), so
+    re-wrapping the same words is the same copy and any other character is
+    not.  What the owner verifies (config verified_copy) and what a
+    sequence's steps are checked against."""
+    normalised = '\n'.join(' '.join(str(part or '').split())
+                           for part in (subject, body_html))
+    return hashlib.sha256(normalised.encode('utf-8')).hexdigest()
+
+
+def _steps_hashes(steps) -> set:
+    """The content hashes of a sequence's steps (dicts with 'subject' and
+    'body_html')."""
+    return {step_content_hash(s.get('subject'), s.get('body_html'))
+            for s in steps or []}
+
+
+def _steps_verified(sender: Optional[Sender], steps, goalless_held: bool) -> bool:
+    """Whether every step of a sequence is verified copy: its goal's
+    ``verified`` hashes name them all.  A sequence of no goal has nothing to
+    verify it against: fine on a flat node, never on one that holds
+    goal-less email (``goalless_held``)."""
+    if sender is None:
+        return not goalless_held
+    return sender.found and _steps_hashes(steps) <= sender.verified
+
+
+def _hold_email(goal_id: Optional[str], prospect_id: Optional[str], subject: str,
                 body_html: str) -> Dict:
-    """Keep a goal's email for the owner's approval instead of sending it:
+    """Keep an email (a goal's, ``goal_id``; None: no goal, on a node that
+    holds those too) for the owner's approval instead of sending it:
     ``{'success': False, 'held': True, 'draft_id': ...}`` (_send_email's
     result shape).  The same email asked again is the same draft; one the
     owner already rejected or sent is refused, saying so.  The recipient's
@@ -835,12 +890,12 @@ def _hold_email(sender: Sender, prospect_id: Optional[str], subject: str,
                 via='held')
         draft_id = uuid.uuid4().hex[:12]
         drafts[draft_id] = {
-            'draft_id': draft_id, 'goal_id': sender.goal_id,
+            'draft_id': draft_id, 'goal_id': goal_id,
             'prospect_id': prospect_id, 'subject': subject,
             'body_html': body_html, 'status': 'held',
             'created_at': datetime.utcnow().isoformat()}
     logger.info("Outreach email held for verification: draft %s of goal %s",
-                draft_id, sender.goal_id)
+                draft_id, goal_id)
     return {'success': False, 'held': True, 'draft_id': draft_id, 'via': 'held'}
 
 
@@ -937,47 +992,102 @@ def reject_held_draft(draft_id: str, reason: Optional[str],
     return {'success': True, 'draft_id': str(draft_id), 'status': 'rejected'}
 
 
-def mark_goal_copy_verified(goal_id: str, verified_by: str) -> Dict:
-    """The owner verifies a goal's copy: ``copy_verified`` is written into
-    the goal's config (GoalManager.update_goal), and the goal's held
-    follow-up sequences go 'active' (the follow-up checker sends only those;
-    sequences created from now on are active).  Emails the agent writes
-    outside a sequence are still held, verified goal or not."""
+def _held_sequences(data: Dict, goal_id: str) -> List[Dict]:
+    """The held follow-up sequences of ``goal_id``'s prospects, in ``data``."""
+    prospects = data.get('prospects', {})
+    return [seq for seq in data.get('sequences', {}).values()
+            if seq.get('status') == 'held'
+            and (prospects.get(seq.get('prospect_id')) or {}).get('goal_id') == goal_id]
+
+
+def list_held_sequence_steps(goal_id: Optional[str] = None) -> List[Dict]:
+    """The copy waiting for the owner's verification: one row per distinct
+    step (its content hash) of the held follow-up sequences (``goal_id``
+    narrows to one goal; None: every goal, and the sequences of prospects no
+    goal holds): subject and body as written, how many held sequences use it,
+    and the companies they are for.  Never an address.  Read-only: what the
+    owner sees here is what mark_goal_copy_verified verifies."""
+    data = _load_prospects()
+    prospects = data.get('prospects', {})
+    rows = {}
+    for seq_id, seq in data.get('sequences', {}).items():
+        if seq.get('status') != 'held':
+            continue
+        prospect = prospects.get(seq.get('prospect_id')) or {}
+        owner_goal = prospect.get('goal_id')
+        if goal_id is not None and owner_goal != goal_id:
+            continue
+        for step in seq.get('steps', []):
+            content_hash = step_content_hash(step.get('subject'), step.get('body_html'))
+            row = rows.setdefault((owner_goal, content_hash), {
+                'goal_id': owner_goal, 'content_hash': content_hash,
+                'subject': step.get('subject'), 'body_html': step.get('body_html'),
+                'sequence_ids': set(), 'companies': set()})
+            row['sequence_ids'].add(seq_id)
+            if prospect.get('company'):
+                row['companies'].add(prospect['company'])
+    return [dict({k: v for k, v in row.items() if k not in ('sequence_ids', 'companies')},
+                 sequences=len(row['sequence_ids']),
+                 companies=sorted(row['companies']))
+            for row in rows.values()]
+
+
+def mark_goal_copy_verified(goal_id: str, verified_by: str,
+                            content_hashes=None) -> Dict:
+    """The owner verifies the copy held for a goal: the content hashes of the
+    steps of its HELD follow-up sequences, as they are at this moment, are
+    added to the goal's config ``verified_copy`` (GoalManager.update_goal),
+    and the held sequences whose steps are now all verified go 'active' (the
+    follow-up checker sends only those).  ``content_hashes`` limits it to the
+    steps the owner saw in list_held_sequence_steps, so a sequence made since
+    is not verified unseen.  It is never a pass for the goal's future copy: a
+    sequence made later is active only if each of its steps has the same
+    copy (whitespace aside) as one verified; any other is held.  Emails the
+    agent writes outside a sequence are held (held drafts), verified or
+    not."""
     from integrations.agent_engine.goal_manager import GoalManager
     from integrations.social.models import AgentGoal, db_session
     goal_id = str(goal_id)
+    data = _load_prospects()
+    held = _held_sequences(data, goal_id)
+    wanted = set()
+    for seq in held:
+        wanted |= _steps_hashes(seq.get('steps'))
+    if content_hashes is not None:
+        wanted &= {str(h) for h in content_hashes}
     with db_session() as db:
         goal = db.query(AgentGoal).filter_by(id=goal_id).first()
         if goal is None:
             return {'success': False, 'error': f'no goal {goal_id} on this node'}
         config = dict(goal.config_json or {})
-        config.update(copy_verified=True, copy_verified_by=str(verified_by),
+        verified = set(config.get('verified_copy') or []) | wanted
+        config.update(verified_copy=sorted(verified),
+                      copy_verified_by=str(verified_by),
                       copy_verified_at=datetime.utcnow().isoformat())
         updated = GoalManager.update_goal(db, goal_id, config_json=config)
     if not updated.get('success'):
         return {'success': False, 'error': updated.get('error') or 'not updated'}
-    data = _load_prospects()
     released = 0
-    for sequence in data.get('sequences', {}).values():
-        owner = data['prospects'].get(sequence.get('prospect_id')) or {}
-        if sequence.get('status') == 'held' and owner.get('goal_id') == goal_id:
-            sequence['status'] = 'active'
+    for seq in held:
+        if _steps_hashes(seq.get('steps')) <= verified:
+            seq['status'] = 'active'
             released += 1
     if released:
         _save_prospects(data)
-    logger.info("Goal %s: copy verified, %d held sequence(s) released",
-                goal_id, released)
-    return {'success': True, 'goal_id': goal_id, 'sequences_released': released}
+    logger.info("Goal %s: %d step(s) of copy verified, %d held sequence(s) "
+                "released", goal_id, len(wanted), released)
+    return {'success': True, 'goal_id': goal_id, 'steps_verified': len(wanted),
+            'sequences_released': released}
 
 
-def _new_sequence_status(prospect: Dict) -> str:
-    """The status a follow-up sequence of ``prospect`` starts in: 'active'
-    when its goal's copy is verified, or when it belongs to no goal; else
-    'held' (a goal that is not on this node counts as unverified)."""
+def _new_sequence_status(prospect: Dict, steps) -> str:
+    """The status a follow-up sequence of ``prospect`` with these ``steps``
+    starts in: 'active' only when every step's copy is verified for its goal
+    (_steps_verified), else 'held' (a goal that is not on this node counts as
+    unverified)."""
     sender = prospect_sender(prospect)
-    if sender is None:
-        return 'active'
-    return 'active' if sender.found and sender.copy_verified else 'held'
+    goalless_held = _goalless_email_is_held() if sender is None else False
+    return 'active' if _steps_verified(sender, steps, goalless_held) else 'held'
 
 
 def register_outreach_tools(helper, assistant, user_id: str):
@@ -1162,13 +1272,13 @@ def register_outreach_tools(helper, assistant, user_id: str):
             'name': sequence_name,
             'steps': scheduled_steps,
             'created_at': datetime.utcnow().isoformat(),
-            # held -> active when the owner verifies the goal's copy
-            # (mark_goal_copy_verified; a sequence of a goal whose copy is
-            # not verified starts held, and only an active one is sent);
+            # Active only when every step's exact copy is verified for the
+            # goal (_new_sequence_status), else held until the owner verifies
+            # it (mark_goal_copy_verified); only an active one is sent.
             # active -> completed (every step done, or a reply), or
             # failed (a step given up: the address or the sender is not
             # taking mail, so later steps are not sent to it).
-            'status': _new_sequence_status(prospect),
+            'status': _new_sequence_status(prospect, scheduled_steps),
             'exit_on_reply': True,
         }
 
@@ -1178,9 +1288,15 @@ def register_outreach_tools(helper, assistant, user_id: str):
         reply = {'success': True, 'sequence': sequence}
         if sequence['status'] == 'held':
             reply['note'] = (
-                "This follow-up sequence is held for verification: its emails "
-                "are sent once the owner verifies this goal's copy. Nothing is "
-                "lost; do not create it again.")
+                "This follow-up sequence is held for verification: the owner "
+                "sees its steps, and its emails are sent once the owner "
+                "verifies that copy. Nothing is lost; do not create it again. "
+                "Changed text is held again, so reuse the verified wording "
+                "where you can."
+                + ("" if prospect.get('goal_id') else
+                   " This prospect belongs to no goal, so on this node it "
+                   "cannot be verified: create it in the turn of the goal it "
+                   "is for."))
         return json.dumps(reply)
 
     def check_pending_followups() -> str:
@@ -1333,9 +1449,10 @@ def register_outreach_tools(helper, assistant, user_id: str):
         # Every row imported in a goal's turn is that goal's prospect: its
         # email goes from the goal's own mailbox (prospect_sender).
         turn_goal = _turn_goal_id()
-        # What every sequence of this batch starts as (they all share the
-        # goal): held until the owner verifies the goal's copy.
-        new_sequence_status = _new_sequence_status({'goal_id': turn_goal})
+        # What every sequence of this batch starts as (they share the goal
+        # and the steps): held until the owner verifies that copy.
+        new_sequence_status = (_new_sequence_status({'goal_id': turn_goal}, seq_steps)
+                               if seq_steps else 'active')
 
         for idx, row in enumerate(rows):
             try:
@@ -1505,6 +1622,7 @@ def send_due_followups(data: Dict, now: datetime,
     """
     actions_taken = []
     senders = {}        # goal id -> Sender, one read per goal per check
+    goalless_held = None    # _goalless_email_is_held, read once when needed
 
     for seq_id, sequence in data.get('sequences', {}).items():
         if sequence['status'] != 'active':
@@ -1516,16 +1634,19 @@ def send_due_followups(data: Dict, now: datetime,
         if not prospect:
             continue
 
-        # Only a goal whose copy the owner verified has its sequences sent
-        # (owner, 16 Nov: every goal email is verified before it leaves).  A
-        # sequence made active before that rule, or by hand, waits too, and
-        # its steps use no send attempt.
+        # Only a sequence whose every step is verified copy is sent (owner,
+        # 16 Nov: every outgoing email is verified before it leaves): the
+        # goal's verified hashes name each step's exact text.  One made
+        # active before that rule, by hand, or with its text changed since,
+        # waits too, and its steps use no send attempt.  A prospect of no
+        # goal is sent only on a flat node (_steps_verified).
         goal_id = prospect.get('goal_id')
         if goal_id and goal_id not in senders:
             senders[goal_id] = prospect_sender(prospect)
         sender = senders.get(goal_id) if goal_id else None
-        if goal_id and not (sender is not None and sender.found
-                            and sender.copy_verified):
+        if goalless_held is None and sender is None:
+            goalless_held = _goalless_email_is_held()
+        if not _steps_verified(sender, sequence.get('steps'), bool(goalless_held)):
             sequence['status'] = 'held'
             actions_taken.append({
                 'action': 'sequence_held',

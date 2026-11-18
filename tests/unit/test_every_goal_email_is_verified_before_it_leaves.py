@@ -2,10 +2,13 @@
 
 Owner, 16 Nov 2026: "You verify all the outgoing emails on my behalf from
 central."  Coordinator, 17 Nov (the shape):
-  * a goal's templates: its follow-up sequences are created 'held' while
-    the goal's copy is not verified (config copy_verified, written through
-    GoalManager.update_goal); the follow-up checker sends only 'active'
-    sequences; marking the goal verified releases its held sequences;
+  * a goal's templates: its follow-up sequences are created 'held' unless
+    every step's exact copy is verified (config verified_copy: the content
+    hash of each verified step, written through GoalManager.update_goal); the
+    follow-up checker sends only 'active' sequences; verifying a goal adds
+    the hashes of what is held for it and releases the sequences whose steps
+    are then all verified; text written later, or changed by one character,
+    is held again;
   * an email whose words did not come from a verified sequence step (the
     agent's send_outreach_email, a reply, the journey's first email) is held
     as a draft and not sent, without using up a send attempt; the tool says
@@ -27,8 +30,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from tests.unit.test_each_goal_sends_from_its_own_mailbox import (  # noqa: F401
-    HEVOLVE, MCGROCE, OWNER, _connect, _in_turn, _journey_tools, _mailbox,
-    _prospect, _tools, channels, mail, mailer, node)
+    HEVOLVE, MCGROCE, OWNER, _connect, _in_turn, _journey_tools, _legacy_mailbox,
+    _mailbox, _prospect, _tools, channels, mail, mailer, node)
 
 ANA = 'ana@clinic.example'
 BODY = '<p>Hello Ana,</p><p>would a short call next week help?</p>'
@@ -46,6 +49,17 @@ def _write(tools, pid, goal='g-speech', subject='a question', body=BODY):
 
 def _held(store, goal='g-speech'):
     return store.list_held_drafts(goal_id=goal)
+
+
+def _sequence(tools, pid, subject='checking in', body='<p>a quick follow-up</p>',
+              goal='g-speech', steps=None):
+    """The goal's agent creates a follow-up sequence in its own turn (one step
+    of this copy, or ``steps``); the sequence as the tool stored it."""
+    steps = steps or [{'delay_days': 0, 'subject': subject, 'body_html': body}]
+    out = json.loads(_in_turn(goal, tools['create_followup_sequence'], pid,
+                              'bump', json.dumps(steps)))
+    assert out['success'] is True, out
+    return out['sequence']
 
 
 def _step(store, tools, pid, goal='g-speech'):
@@ -183,7 +197,8 @@ def test_verifying_a_goal_releases_its_sequences_and_only_its_own(node, monkeypa
     assert out['success'] is True and out['sequences_released'] == 1
     with db_session(commit=False) as db:
         assert db.query(AgentGoal).filter_by(id='g-speech').one().config_json[
-            'copy_verified'] is True
+            'verified_copy'] == [node.store.step_content_hash(
+                'checking in', '<p>a quick follow-up</p>')]
     seqs = node.store._load_prospects()['sequences']
     assert seqs[lashes['id']]['status'] == 'held'
     assert tick['sent'] == 1
@@ -331,6 +346,235 @@ def test_a_draft_survives_a_stale_save_of_the_prospect_store(node, monkeypatch):
     node.store._save_prospects(stale)
 
     assert [d['draft_id'] for d in _held(node.store)] == [draft_id]
+
+
+# ── verification is of the exact copy, never of the goal's future ────
+
+OFFER = ('a different offer', '<p>something else entirely</p>')
+
+
+def _verified_goal(node, tools, store_goal='g-speech'):
+    """A goal whose one sequence (the _sequence default copy) the owner has
+    verified; returns that first sequence's id."""
+    first = _sequence(tools, _prospect(tools, 'Clinic', ANA, store_goal), goal=store_goal)
+    assert first['status'] == 'held'
+    assert node.store.mark_goal_copy_verified(store_goal, verified_by=OWNER)['success']
+    return first['id']
+
+
+def test_after_a_goal_is_verified_a_new_sequence_with_different_text_is_held(node, monkeypatch):
+    _speech_box(node)
+    tools = _tools(monkeypatch, node.store)
+    first_id = _verified_goal(node, tools)
+
+    other = _sequence(tools, _prospect(tools, 'Shop', 'mo@shop.example', 'g-speech'),
+                      subject=OFFER[0], body=OFFER[1])
+    tick = node.store.check_pending_followups_daemon()
+
+    stored = node.store._load_prospects()['sequences']
+    assert other['status'] == 'held' and stored[other['id']]['status'] == 'held'
+    assert stored[first_id]['status'] in ('active', 'completed')
+    assert tick['sent'] == 1
+    assert [m['subject'] for m in node.mail.sent_from(HEVOLVE)] == ['checking in']
+
+
+def test_after_a_goal_is_verified_a_sequence_with_identical_text_is_active(node, monkeypatch):
+    _speech_box(node)
+    tools = _tools(monkeypatch, node.store)
+    _verified_goal(node, tools)
+
+    same = _sequence(tools, _prospect(tools, 'Shop', 'mo@shop.example', 'g-speech'))
+    node.store.check_pending_followups_daemon()
+
+    assert same['status'] == 'active'
+    assert [m['to'] for m in node.mail.sent_from(HEVOLVE)] == [ANA, 'mo@shop.example']
+
+
+@pytest.mark.parametrize('subject, body', [
+    ('checking in!', '<p>a quick follow-up</p>'),         # one character of the subject
+    ('checking in', '<p>a quick follow-up.</p>'),         # one character of the body
+    ('checking in', '<p>a quick follow-up</p> '
+                    '<a href="https://x.example/a">see</a>'),     # a link added
+])
+def test_any_change_to_verified_text_is_held(node, monkeypatch, subject, body):
+    _speech_box(node)
+    tools = _tools(monkeypatch, node.store)
+    _verified_goal(node, tools)
+
+    changed = _sequence(tools, _prospect(tools, 'Shop', 'mo@shop.example', 'g-speech'),
+                        subject=subject, body=body)
+    node.store.check_pending_followups_daemon()
+
+    assert changed['status'] == 'held'
+    assert [m['to'] for m in node.mail.sent_from(HEVOLVE)] == [ANA]
+
+
+def test_the_same_words_wrapped_differently_are_the_same_copy(node, monkeypatch):
+    _speech_box(node)
+    tools = _tools(monkeypatch, node.store)
+    _verified_goal(node, tools)
+
+    rewrapped = _sequence(tools, _prospect(tools, 'Shop', 'mo@shop.example', 'g-speech'),
+                          subject='  checking   in ', body='<p>a quick\n   follow-up</p>\n')
+
+    assert rewrapped['status'] == 'active'
+
+
+def test_a_sequence_is_active_only_when_every_step_is_verified(node, monkeypatch):
+    _speech_box(node)
+    tools = _tools(monkeypatch, node.store)
+    _verified_goal(node, tools)
+    known = {'delay_days': 0, 'subject': 'checking in', 'body_html': '<p>a quick follow-up</p>'}
+    new = {'delay_days': 3, 'subject': OFFER[0], 'body_html': OFFER[1]}
+
+    mixed = _sequence(tools, _prospect(tools, 'Shop', 'mo@shop.example', 'g-speech'),
+                      steps=[known, new])
+    node.store.check_pending_followups_daemon()
+
+    assert mixed['status'] == 'held'
+    assert [m['to'] for m in node.mail.sent_from(HEVOLVE)] == [ANA]
+
+
+def test_verifying_with_nothing_held_passes_nothing_for_the_future(node, monkeypatch):
+    from integrations.social.models import AgentGoal, db_session
+    _speech_box(node)
+    tools = _tools(monkeypatch, node.store)
+
+    out = node.store.mark_goal_copy_verified('g-speech', verified_by=OWNER)
+    later = _sequence(tools, _prospect(tools, 'Clinic', ANA, 'g-speech'))
+    node.store.check_pending_followups_daemon()
+
+    assert out['success'] is True and out['steps_verified'] == 0
+    assert later['status'] == 'held' and node.mail.sent == []
+    with db_session(commit=False) as db:
+        assert db.query(AgentGoal).filter_by(id='g-speech').one().config_json[
+            'verified_copy'] == []
+
+
+def test_the_owner_verifies_only_the_copy_he_was_shown(node, monkeypatch):
+    """A sequence made after the owner read the held list is not verified by
+    the click that verifies what he read."""
+    _speech_box(node)
+    tools = _tools(monkeypatch, node.store)
+    seen = _sequence(tools, _prospect(tools, 'Clinic', ANA, 'g-speech'))
+    unseen = _sequence(tools, _prospect(tools, 'Shop', 'mo@shop.example', 'g-speech'),
+                       subject=OFFER[0], body=OFFER[1])
+    shown = node.store.step_content_hash('checking in', '<p>a quick follow-up</p>')
+
+    out = node.store.mark_goal_copy_verified('g-speech', verified_by=OWNER,
+                                             content_hashes=[shown])
+
+    stored = node.store._load_prospects()['sequences']
+    assert out['steps_verified'] == 1 and out['sequences_released'] == 1
+    assert stored[seen['id']]['status'] == 'active'
+    assert stored[unseen['id']]['status'] == 'held'
+    again = _sequence(tools, _prospect(tools, 'Cafe', 'jo@cafe.example', 'g-speech'),
+                      subject=OFFER[0], body=OFFER[1])
+    assert again['status'] == 'held'
+
+
+def test_a_verified_sequence_whose_text_is_changed_afterwards_is_held_again(node, monkeypatch):
+    """The checker asks the goal's verified copy at every send: an 'active'
+    sequence whose step text changed since (by hand, or a writer that skipped
+    this rule) is held, not sent."""
+    _speech_box(node)
+    tools = _tools(monkeypatch, node.store)
+    _verified_goal(node, tools)
+    fresh = _sequence(tools, _prospect(tools, 'Shop', 'mo@shop.example', 'g-speech'))
+    data = node.store._load_prospects()
+    data['sequences'][fresh['id']]['steps'][0]['body_html'] = '<p>buy my watches</p>'
+    node.store._save_prospects(data)
+
+    node.store.check_pending_followups_daemon()
+
+    assert node.store._load_prospects()['sequences'][fresh['id']]['status'] == 'held'
+    assert [m['to'] for m in node.mail.sent_from(HEVOLVE)] == [ANA]
+
+
+def test_the_held_list_shows_the_copy_waiting_for_verification(node, monkeypatch):
+    monkeypatch.setenv('HEVOLVE_NODE_TIER', 'central')
+    _speech_box(node)
+    tools = _tools(monkeypatch, node.store)
+    for company, address in (('Clinic', ANA), ('Shop', 'mo@shop.example')):
+        _sequence(tools, _prospect(tools, company, address, 'g-speech'))
+    _sequence(tools, _prospect(tools, 'Cafe', 'jo@cafe.example', 'g-speech'),
+              subject=OFFER[0], body=OFFER[1])
+
+    rows = {r['subject']: r for r in node.store.list_held_sequence_steps('g-speech')}
+    shown = _as(_person(role='central'), 'get', '/api/admin/outreach/held?goal_id=g-speech')
+
+    assert sorted(rows) == ['a different offer', 'checking in']
+    assert rows['checking in']['sequences'] == 2
+    assert rows['checking in']['companies'] == ['Clinic', 'Shop']
+    assert rows['checking in']['content_hash'] == node.store.step_content_hash(
+        'checking in', '<p>a quick follow-up</p>')
+    assert rows['a different offer']['body_html'] == OFFER[1]
+    assert node.store.list_held_sequence_steps('g-lashes') == []
+    body = shown.get_data(as_text=True)
+    assert shown.status_code == 200 and len(shown.get_json()['data']['sequence_steps']) == 2
+    assert ANA not in body and 'mo@shop.example' not in body and 'jo@cafe.example' not in body
+
+
+# ── a prospect of no goal: held on a node that is not flat ───────────
+
+@pytest.mark.parametrize('tier', ['central', 'regional'])
+def test_an_email_for_no_goal_is_held_on_a_node_that_is_not_flat(node, monkeypatch, tier):
+    monkeypatch.setenv('HEVOLVE_NODE_TIER', tier)
+    _legacy_mailbox(node, monkeypatch)
+    tools = _tools(monkeypatch, node.store)
+    pid = _prospect(tools, 'Shop', 'mo@shop.example')                     # no goal
+
+    out = json.loads(tools['send_outreach_email'](pid, 'hello', '<p>hi there</p>'))
+
+    assert out['held'] is True and out['sent'] is False
+    assert node.mail.sent == [] and node.mailer == []
+    (draft,) = node.store.list_held_drafts()
+    assert draft['goal_id'] is None and 'mo@shop.example' not in json.dumps(draft)
+    approved = node.store.approve_held_draft(draft['draft_id'], approved_by=OWNER)
+    assert approved['sent'] is True and approved['send_result']['via'] == 'email_channel'
+    assert [m['to'] for m in node.mail.sent_from('owner@desktop.example')] == ['mo@shop.example']
+
+
+def test_an_email_for_no_goal_on_a_flat_node_is_sent_as_before(node, monkeypatch):
+    _legacy_mailbox(node, monkeypatch)
+    tools = _tools(monkeypatch, node.store)
+    pid = _prospect(tools, 'Shop', 'mo@shop.example')
+
+    out = json.loads(tools['send_outreach_email'](pid, 'hello', '<p>hi there</p>'))
+
+    assert out['success'] is True and 'held' not in out
+    assert [m['to'] for m in node.mail.sent_from('owner@desktop.example')] == ['mo@shop.example']
+    assert node.store.list_held_drafts() == []
+
+
+@pytest.mark.parametrize('tier', ['central', 'regional'])
+def test_a_sequence_of_no_goal_is_held_on_a_node_that_is_not_flat(node, monkeypatch, tier):
+    """A prospect of no goal has no goal to verify its copy for: its sequence
+    is held (and says why), never sent, on a node the owner verifies."""
+    monkeypatch.setenv('HEVOLVE_NODE_TIER', tier)
+    _legacy_mailbox(node, monkeypatch)
+    tools = _tools(monkeypatch, node.store)
+    pid = _prospect(tools, 'Shop', 'mo@shop.example')
+    steps = json.dumps([{'delay_days': 0, 'subject': 'bump', 'body_html': '<p>hi</p>'}])
+
+    made = json.loads(tools['create_followup_sequence'](pid, 'bump', steps))
+    node.store.check_pending_followups_daemon()
+
+    assert made['sequence']['status'] == 'held' and 'no goal' in made['note']
+    assert node.mail.sent == []
+
+
+def test_a_sequence_of_no_goal_goes_out_on_a_flat_node(node, monkeypatch):
+    _legacy_mailbox(node, monkeypatch)
+    tools = _tools(monkeypatch, node.store)
+    pid = _prospect(tools, 'Shop', 'mo@shop.example')
+    steps = json.dumps([{'delay_days': 0, 'subject': 'bump', 'body_html': '<p>hi</p>'}])
+
+    made = json.loads(tools['create_followup_sequence'](pid, 'bump', steps))
+    node.store.check_pending_followups_daemon()
+
+    assert made['sequence']['status'] == 'active'
+    assert [m['to'] for m in node.mail.sent_from('owner@desktop.example')] == ['mo@shop.example']
 
 
 # ── the owner's routes ───────────────────────────────────────────────

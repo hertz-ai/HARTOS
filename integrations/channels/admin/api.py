@@ -764,10 +764,16 @@ def update_channel_security(channel_type: str):
 @api_response
 def list_held_outreach():
     """Held drafts (?status=held|sent|rejected, ?goal_id=), with subject and
-    body as written; never the recipient's address."""
-    from integrations.agent_engine.outreach_crm_tools import list_held_drafts
-    return {"drafts": list_held_drafts(goal_id=request.args.get("goal_id") or None,
-                                       status=request.args.get("status") or "held")}
+    body as written; never the recipient's address.  While status is held,
+    also ``sequence_steps``: the distinct copy of the held follow-up
+    sequences, each with its content_hash, which copy-verified verifies."""
+    from integrations.agent_engine.outreach_crm_tools import (
+        list_held_drafts, list_held_sequence_steps)
+    goal_id = request.args.get("goal_id") or None
+    status = request.args.get("status") or "held"
+    return {"drafts": list_held_drafts(goal_id=goal_id, status=status),
+            "sequence_steps": (list_held_sequence_steps(goal_id=goal_id)
+                               if status == "held" else [])}
 
 
 @admin_bp.route("/outreach/held/<draft_id>/approve", methods=["POST"])
@@ -796,9 +802,17 @@ def reject_held_outreach(draft_id: str):
 @admin_bp.route("/outreach/goals/<goal_id>/copy-verified", methods=["POST"])
 @api_response
 def verify_goal_copy(goal_id: str):
-    """Mark a goal's copy verified: its held follow-up sequences go active."""
+    """Verify the copy held for a goal: the steps of its held follow-up
+    sequences (as listed, or only body {"content_hashes": [...]}) are
+    verified by content, and the sequences whose steps are all verified go
+    active.  Text written later is held again."""
     from integrations.agent_engine.outreach_crm_tools import mark_goal_copy_verified
-    out = mark_goal_copy_verified(goal_id, verified_by=g.user_id)
+    hashes = (request.get_json(silent=True) or {}).get("content_hashes")
+    if hashes is not None and not isinstance(hashes, list):
+        raise ValueError('content_hashes must be a list of the content_hash '
+                         'values the held list shows')
+    out = mark_goal_copy_verified(goal_id, verified_by=g.user_id,
+                                  content_hashes=hashes)
     if not out.get("success"):
         raise ValueError(out.get("error"))
     return out

@@ -434,14 +434,14 @@ def test_follow_ups_and_the_journeys_first_email_go_from_the_prospects_goal_mail
         _connect(address)
         _mailbox(node.channels, address)
     tools = _tools(monkeypatch, node.store)
-    for goal in ('g-speech', 'g-lashes'):        # the owner verified both goals' copy
-        node.store.mark_goal_copy_verified(goal, verified_by=OWNER)
     speech = _prospect(tools, 'Clinic', 'ana@clinic.example', 'g-speech')
     lashes = _prospect(tools, 'Salon', 'ravi@salon.example', 'g-lashes')
     step = json.dumps([{'delay_days': 0, 'subject': 'bump',
                         'body_html': '<p>hi again</p>'}])
     for pid, goal in ((speech, 'g-speech'), (lashes, 'g-lashes')):
         _in_turn(goal, tools['create_followup_sequence'], pid, 'bump', step)
+    for goal in ('g-speech', 'g-lashes'):        # the owner verifies what is held
+        node.store.mark_goal_copy_verified(goal, verified_by=OWNER)
 
     tick = node.store.check_pending_followups_daemon()
 
