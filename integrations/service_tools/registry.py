@@ -214,6 +214,29 @@ class ServiceToolInfo:
         )
 
 
+def sole_endpoint_function(tool_name: str, tool: Any) -> Optional[str]:
+    """The function a tool with exactly ONE endpoint is called by, or None.
+
+    A step may name a service tool by its tool name ("crawl4ai: fetch the
+    top result pages").  With one endpoint that names its one function
+    unambiguously, by create_endpoint_function's flat-name rule (the tool's
+    name when the endpoint shares it, else ``<tool>_<endpoint>``).  With
+    several endpoints the tool name names none of them.
+
+    The ONE rule for this, read by the attach (core.agent_tool_menu.
+    attach_for_names) and by the check of which tools a step names
+    (hartos.lifecycle_hooks.action_named_tools), so a tool the attach hands
+    over for a step is a tool the completion check expects a result from.
+    Live 18 Nov 2026 22:26 IST (research agent 1795014914479, local 4B): the
+    crawl was attached and ran, and the step still GAVE_UP as naming no tool.
+    """
+    endpoints = getattr(tool, 'endpoints', None) or {}
+    if len(endpoints) != 1:
+        return None
+    ep_name = next(iter(endpoints))
+    return tool_name if ep_name == tool_name else f"{tool_name}_{ep_name}"
+
+
 class ServiceToolRegistry:
     """
     Registry for HTTP microservice tools.

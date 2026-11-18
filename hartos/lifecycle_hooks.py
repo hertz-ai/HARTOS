@@ -2549,7 +2549,53 @@ def action_named_tools(agents, action_text):
                 names.add(_cn)
     text = action_own_text(action_text).lower()
     referenced = [n for n in names if _text_names_tool(text, n)]
+    for fn in _service_functions_named_by_tool(text, names):
+        if fn not in referenced:
+            referenced.append(fn)
     return names, referenced
+
+
+def _service_functions_named_by_tool(text, served):
+    """The served functions a step names through their service TOOL's name.
+
+    The attach hands a step the one function of a service tool it names by
+    the tool's name (core.agent_tool_menu.attach_for_names, through
+    integrations.service_tools.registry.sole_endpoint_function).  This reads
+    the same rule, so the completion check expects that function's result.
+    Live 18 Nov 2026 22:26 IST, research agent 1795014914479 on the local 4B:
+    action 2 read "crawl4ai: fetch and read the top result pages ...",
+    crawl4ai_crawl was attached and ran (HTTP 200, 1181 words), the check saw
+    no tool named, the fabrication gate passed with nothing to check, and the
+    step GAVE_UP with "no canonical receipt in its dispatch window".
+
+    A named tool that counts as nothing is said, not silent (hartos-43's
+    review): one with several endpoints names none of them, and one whose
+    function this group does not serve cannot have its result required.
+    """
+    try:
+        from integrations.service_tools.registry import (
+            service_tool_registry, sole_endpoint_function)
+        tools = dict(getattr(service_tool_registry, '_tools', None) or {})
+    except Exception:
+        return []
+    found = []
+    for tool_name, tool in tools.items():
+        if tool_name in served or not _text_names_tool(text, tool_name):
+            continue
+        fn = sole_endpoint_function(tool_name, tool)
+        if fn is None:
+            logger.warning(
+                f"[FAB-GUARD] the step names service tool {tool_name!r}, "
+                f"which has {len(getattr(tool, 'endpoints', None) or {})} "
+                f"endpoints; none counts as named, so no result of it is "
+                f"required")
+        elif fn not in served:
+            logger.warning(
+                f"[FAB-GUARD] the step names {tool_name!r}; its function "
+                f"{fn!r} is not served here, so no result of it is required")
+        else:
+            found.append(fn)
+    return found
 
 
 #: A verb that calls a one-word tool name, with an optional article between:
