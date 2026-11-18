@@ -863,9 +863,17 @@ def strip_json_values(obj: Any) -> Any:
     Recursively walk obj.
     - If dict: recurse on each value, preserving keys.
     - If list/tuple: recurse on each element, preserving order & type.
-    - Otherwise (leaf): return redacted marker.
+    - A string that holds a JSON object or list: recurse into it.
+    - Otherwise (leaf): return the marker "<saved_<type>>".
+
+    The marker says a value is saved here without showing it.  Its shape is
+    one the text-placeholder rule (core.agent_tools.unfilled_text_placeholder)
+    already refuses, so a model that copies it into a message is told to fill
+    it in.  A plain-text leaf used to fall off the end of this function and
+    come back as None, so every outline showed saved text as empty and the 4B
+    re-asked for what it had already saved (email agent, live 2026-11-18
+    22:21 IST; tests/unit/test_a_memory_outline_is_never_restored_as_values.py).
     """
-    #current_app.logger.info(f"GOT JSON FOR STRIPPING: {obj}")
     # 1. Dig into dict
     if isinstance(obj, dict):
         return { key: strip_json_values(val) for key, val in obj.items() }
@@ -876,19 +884,21 @@ def strip_json_values(obj: Any) -> Any:
     elif isinstance(obj, tuple):
         return tuple(strip_json_values(item) for item in obj)
 
-    # 3. Optional: if you know some strings actually contain JSON and you want to descend into them,
-    #    uncomment this block.
+    # 3. A string holding a JSON object or list is outlined as that JSON;
+    #    any other string (plain text, or text that parses as a JSON number
+    #    or word, like "123") is a saved string.
     elif isinstance(obj, str):
         try:
             parsed = json.loads(obj)
         except json.JSONDecodeError:
-            pass
-        else:
+            parsed = None
+        if isinstance(parsed, (dict, list)):
             return strip_json_values(parsed)
+        return "<saved_str>"
 
-    # 4. Everything else is a true leaf → redact it
+    # 4. Everything else is a true leaf → mark it
     else:
-        return f"redacted {type(obj).__name__}"
+        return f"<saved_{type(obj).__name__}>"
 
 
 # A registry tool name as `attach_for_names` compares it: the registry key, or

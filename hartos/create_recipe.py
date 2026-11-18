@@ -7639,50 +7639,25 @@ def initialize_with_resume(prompt_id, user_prompt, user_id):
 
 
 def load_existing_metadata(prompt_id, user_prompt, flow_progress, user_id):
-    """
-    Load metadata from existing action JSONs to restore agent_data state
+    """Load this agent's saved memory from persistent storage.
+
+    Nothing is restored from action JSONs.  An action JSON's 'metadata' is an
+    OUTLINE of memory: it is always written as strip_json_values(memory_view
+    (...)), every value replaced by a marker.  This function used to merge
+    that outline into the creator's own memory when their store was empty,
+    and save it, so the person's memory held a placeholder in every field
+    (None, before strip_json_values marked text).  Live 2026-11-18 22:21 IST
+    the email agent read back {'email_brief': {'recipient': None, 'subject':
+    None, 'body': None}}, took its draft for lost and re-asked the person.
+    hartos-43 checked: in git the outline restore goes back to the root commit
+    (8b1706db5), and the 133 action files with metadata on this desktop hold
+    only None and "redacted <type>" leaves, so no values format exists to keep.
+    flow_progress, user_prompt and user_id stay for the one caller
+    (initialize_with_resume).
     """
     try:
-        # First, try to load from persistent storage
         if helper_fun.load_agent_data_from_file(prompt_id, agent_data):
             current_app.logger.info(f" Successfully loaded persistent agent data for prompt_id {prompt_id}")
-            return
-        # An action JSON's metadata is a saved-key snapshot (the memory_view
-        # of whoever completed that action, the creator unless a visitor
-        # built on a half-built agent, task #239), so it restores the
-        # creator's own memory for this agent and nobody else's: in the
-        # shared store it read back as values (None) for every other user
-        # (review of 7121264b1), and in a visitor's store, when a visitor
-        # resumed CREATE on a half-built agent, it gave them the creator's
-        # keys and shadowed later shared templates with None (review of
-        # c8aea38e7).  Nothing to restore when that memory exists.
-        from core.agent_tools import is_agent_creator, person_store_id
-        if not is_agent_creator(user_id, prompt_id):
-            current_app.logger.info(
-                f" No saved-key snapshot restored for {user_prompt}: not "
-                f"the creator of agent {prompt_id}")
-            return
-        own_id = person_store_id(user_prompt)
-        if agent_data.get(own_id):
-            return
-        # Look for the most recent action JSON with metadata
-        for flow_idx, progress in flow_progress.items():
-            for action_id in sorted(progress['completed_actions'], reverse=True):
-                action_file = helper_fun.safe_prompt_path(prompt_id, flow_idx, action_id)
-                try:
-                    with open(action_file, 'r', encoding='utf-8') as f:
-                        action_data = json.load(f)
-                        if 'metadata' in action_data and action_data['metadata']:
-                            # Merge metadata into the creator's own memory
-                            own = agent_data.setdefault(own_id, {})
-                            own.update(action_data['metadata'])
-                            current_app.logger.info(f" Loaded metadata from {action_file}")
-                            # Save to persistent storage for future use
-                            helper_fun.save_agent_data_to_file(own_id, agent_data)
-                            return  # Load from most recent only
-                except Exception as e:
-                    current_app.logger.warning(f"⚠️ Could not load metadata from {action_file}: {e}")
-                    continue
     except Exception as e:
         current_app.logger.error(f"❌ Error loading existing metadata: {e}")
 
