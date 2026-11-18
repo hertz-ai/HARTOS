@@ -155,9 +155,10 @@ def dispatch_goal(goal_id: str, goal_type: str = 'marketing') -> str:
         if response is None:
             # A turn that failed, or never ran, dispatched nothing; reporting
             # it as dispatched with a "None" preview read as success.
-            from integrations.agent_engine.dispatch import dispatch_failure_reason
+            from integrations.agent_engine.dispatch import (
+                dispatch_failure_reason, plain_reason)
             return json.dumps({"dispatched": False, "goal_id": goal_id,
-                               "error": dispatch_failure_reason(goal_id)
+                               "error": plain_reason(dispatch_failure_reason(goal_id))
                                or "dispatch returned no response"})
         return json.dumps({"dispatched": True, "goal_id": goal_id, "response_preview": str(response)[:500]}, default=str)
     except Exception as e:
