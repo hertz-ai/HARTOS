@@ -5212,6 +5212,51 @@ def _attach_for_create_turn(agents_object, text, user_prompt):
             exc_info=True)
 
 
+def _attach_named_for_create_step(agents_object, action_text, user_prompt):
+    """The tools a CREATE step names, attached before the step is posted,
+    by the helpers REUSE's per-action named attach uses
+    (reuse_recipe._attach_named_tools_for_action): _tool_name_candidates
+    reads the `<tool>: <argument>` title, attach_for_names gives the Helper
+    the schema and the Assistant the function, and the schema is fitted to
+    the live n_ctx with the named tools and the send kept.
+
+    Live 2026-11-18 19:13-19:17 IST, research agent 1795008854159 created on
+    the local 4B: the build gate kept 0 of 8 service tools (goal_tags=[]),
+    and "Execute Action 2: crawl4ai: Fetch the top result pages" ran with no
+    crawl4ai to call; the model asked the person instead, and the step was
+    banked with an empty tool.  The per-turn attach (_attach_for_create_turn)
+    reads only the person's words, once per turn, and a creation turn walks
+    several steps.  Returns the number of tools attached; never raises."""
+    try:
+        assistant = agents_object['assistant']
+        helper = agents_object['helper']
+        attached = getattr(assistant, '_hart_attached_tools', None)
+        if attached is None:
+            return 0
+        from hartos.reuse_recipe import _tool_name_candidates
+        names = _tool_name_candidates(action_text)
+        if not names:
+            return 0
+        from core.agent_tool_menu import attach_for_names, fit_schema_to_ctx
+        from hartos.lifecycle_hooks import SEND_TOOL
+        from integrations.service_tools import service_tool_registry
+        _n = attach_for_names(names, helper, assistant, service_tool_registry,
+                              attached,
+                              core_tools=getattr(assistant, '_hart_core_tools', None))
+        _protect = set(names) | {SEND_TOOL}
+        fit_schema_to_ctx(helper, protect=_protect, turn_protect=True)
+        fit_schema_to_ctx(assistant, protect=_protect, turn_protect=True)
+        current_app.logger.info(
+            f"Tier-1 named attach: create step names {names} -> {_n} tools "
+            f"for session: {user_prompt}")
+        return _n
+    except Exception as _e:
+        current_app.logger.warning(
+            f"create step named attach skipped: {_e} for session: {user_prompt}",
+            exc_info=True)
+        return 0
+
+
 def _answer_the_pause(user_prompt, group_chat, where):
     """get_response_group's reply once a round ended for the person
     (helper_fun.pause_requested): the transcript is kept for the session's
@@ -5395,6 +5440,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None,autonomou
 
             message = user_tasks[user_prompt].get_action(current_action_id - 1)
             current_state = get_action_state(user_prompt, current_action_id)
+            _attach_named_for_create_step(agents_object, message, user_prompt)
 
             message = step_instruction(user_tasks[user_prompt].current_action, message, text)
             _push_thinking(user_id, f'Executing action {user_tasks[user_prompt].current_action} of {_action_count}...')
@@ -6352,6 +6398,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None,autonomou
                     actions_prompt = user_tasks[user_prompt].get_action(_ca_pending - 1)
                     current_app.logger.info(f'[EXECUTE-PENDING] Starting action {_ca_pending} (attempt {_attempt}): {actions_prompt}')
                     safe_set_state(user_prompt, _ca_pending, ActionState.IN_PROGRESS, "executing pending action")
+                    _attach_named_for_create_step(agents_object, actions_prompt, user_prompt)
                     _exec_msg = step_instruction(_ca_pending, actions_prompt, text)
                     try:
                         result = chat_instructor.initiate_chat(
