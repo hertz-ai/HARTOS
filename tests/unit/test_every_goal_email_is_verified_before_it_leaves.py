@@ -31,7 +31,7 @@ import pytest
 
 from tests.unit.test_each_goal_sends_from_its_own_mailbox import (  # noqa: F401
     HEVOLVE, MCGROCE, OWNER, _connect, _in_turn, _journey_tools, _legacy_mailbox,
-    _mailbox, _prospect, _tools, channels, mail, mailer, node)
+    _mailbox, _prospect, _tools, channels, mail, mailer, node, web)
 
 ANA = 'ana@clinic.example'
 BODY = '<p>Hello Ana,</p><p>would a short call next week help?</p>'
@@ -513,6 +513,123 @@ def test_the_held_list_shows_the_copy_waiting_for_verification(node, monkeypatch
     body = shown.get_data(as_text=True)
     assert shown.status_code == 200 and len(shown.get_json()['data']['sequence_steps']) == 2
     assert ANA not in body and 'mo@shop.example' not in body and 'jo@cafe.example' not in body
+
+
+# ── the verified copy has one writer: the owner's verification ───────
+
+FORGED_KEYS = ('verified_copy', 'copy_verified', 'copy_verified_by', 'copy_verified_at')
+
+
+def _goal_config(goal_id):
+    from integrations.social.models import AgentGoal, db_session
+    with db_session(commit=False) as db:
+        return dict(db.query(AgentGoal).filter_by(id=goal_id).one().config_json or {})
+
+
+def _owner_verifies_one_step(node, tools):
+    """The owner verifies the default copy for g-speech through the writer;
+    returns its content hash."""
+    _sequence(tools, _prospect(tools, 'Clinic', ANA, 'g-speech'))
+    assert node.store.mark_goal_copy_verified('g-speech', verified_by=OWNER)['steps_verified'] == 1
+    return node.store.step_content_hash('checking in', '<p>a quick follow-up</p>')
+
+
+def test_a_goal_created_through_the_api_holding_verified_copy_is_created_without_it(node, web, monkeypatch):
+    """POST /api/goals stores the body's config, and goal_sender reads
+    verified_copy from it: an account made a goal whose config already held
+    the hashes of its own steps, and its sequences started active with no
+    owner verification (review of c6343fb17).  Here the account legitimately
+    connected the mailbox, so nothing else stands in the way."""
+    seller = web.sign_up('seller')
+    assert web.connect(seller, MCGROCE).get_json()['success'] is True
+    _mailbox(node.channels, MCGROCE)
+    forged = [node.store.step_content_hash('checking in', '<p>a quick follow-up</p>')]
+
+    goal = web.goal(seller, 'My own lash outreach', MCGROCE, verified_copy=forged,
+                    copy_verified=True, copy_verified_by='the-owner',
+                    copy_verified_at='2026-11-17T00:00:00')
+    tools = _tools(monkeypatch, node.store)
+    sequence = _sequence(tools, _prospect(tools, 'Salon', 'ravi@salon.example', goal), goal=goal)
+    node.store.check_pending_followups_daemon()
+
+    config = _goal_config(goal)
+    assert config['sender_email'] == MCGROCE
+    assert not set(FORGED_KEYS) & set(config)
+    assert sequence['status'] == 'held' and node.mail.sent == []
+
+
+def test_no_update_path_writes_the_verified_copy_and_none_drops_it(node, web, monkeypatch):
+    """update_goal, whichever caller: a config that carries the keys changes
+    nothing about them, and one that leaves them out does not drop them.  The
+    status route takes no config; one sent along is ignored."""
+    from integrations.agent_engine.goal_manager import GoalManager
+    from integrations.social.models import db_session
+    _speech_box(node)
+    tools = _tools(monkeypatch, node.store)
+    verified = _owner_verifies_one_step(node, tools)
+    mine = web.sign_up('mine')
+    own = web.goal(mine, 'A goal of my own', HEVOLVE)          # its creator is not the owner
+
+    with db_session() as db:
+        GoalManager.update_goal(db, 'g-speech', config_json={
+            'sender_email': HEVOLVE, 'verified_copy': ['forged-hash'],
+            'copy_verified': True, 'copy_verified_by': 'someone'})
+    after_forgery = _goal_config('g-speech')
+    with db_session() as db:
+        GoalManager.update_goal(db, 'g-speech', config_json={'sender_email': HEVOLVE})
+    after_rewrite = _goal_config('g-speech')
+    with db_session() as db:
+        GoalManager.update_goal(db, own, config_json={
+            'sender_email': HEVOLVE, 'verified_copy': ['forged-hash']})
+    web.client.patch(f'/api/goals/{own}/status', headers=mine['auth'], json={
+        'status': 'paused', 'config': {'verified_copy': ['forged-hash']}})
+    with db_session() as db:        # the writer's parameter carries those keys only
+        GoalManager.update_goal(db, 'g-speech', _verified_copy={
+            'sender_email': 'evil@else.example', 'verified_copy': after_rewrite['verified_copy']})
+
+    assert after_forgery['verified_copy'] == [verified]
+    assert after_forgery['copy_verified_by'] == OWNER and 'copy_verified' not in after_forgery
+    assert after_rewrite['verified_copy'] == [verified]
+    assert 'verified_copy' not in _goal_config(own)
+    assert _goal_config('g-speech')['sender_email'] == HEVOLVE
+
+
+def test_a_goal_made_by_the_goal_manager_never_holds_verified_copy(node):
+    from integrations.agent_engine import goal_manager
+    from integrations.agent_engine.goal_manager import GoalManager
+    from integrations.social.models import AgentGoal, db_session
+    if 'outreach' not in goal_manager.get_registered_types():
+        node.store.register_outreach_goal_type()
+    with db_session() as db:
+        made = GoalManager.create_goal(
+            db, 'outreach', 'Made in code', config={
+                'sender_email': HEVOLVE, 'verified_copy': ['forged-hash'],
+                'copy_verified': True})
+        gid = made['goal']['id']
+    try:
+        assert made['success'] is True
+        assert _goal_config(gid) == {'sender_email': HEVOLVE}
+    finally:
+        with db_session() as db:
+            db.query(AgentGoal).filter_by(id=gid).delete()
+
+
+def test_only_the_gated_writer_sets_the_verified_copy(node, monkeypatch):
+    """The writer is reached through the admin route: a person without the
+    operator role is refused on central and nothing is written."""
+    monkeypatch.setenv('HEVOLVE_NODE_TIER', 'central')
+    _speech_box(node)
+    tools = _tools(monkeypatch, node.store)
+    _sequence(tools, _prospect(tools, 'Clinic', ANA, 'g-speech'))
+    path = '/api/admin/outreach/goals/g-speech/copy-verified'
+
+    refused = _as(_person(), 'post', path)
+    assert refused.status_code == 403
+    assert 'verified_copy' not in _goal_config('g-speech')
+
+    allowed = _as(_person(role='central'), 'post', path)
+    assert allowed.status_code == 200 and allowed.get_json()['data']['steps_verified'] == 1
+    assert len(_goal_config('g-speech')['verified_copy']) == 1
 
 
 # ── a prospect of no goal: held on a node that is not flat ───────────

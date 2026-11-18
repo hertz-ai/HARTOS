@@ -1074,11 +1074,13 @@ def web(node):
                   'email_address': address,
                   'password': password or PASSWORDS[address]})
 
-    def goal(who, title, sender):
+    def goal(who, title, sender, **config):
+        """POST /api/goals as ``who``; ``config`` is the body's config beside
+        sender_email (a client can write anything there)."""
         resp = made.client.post('/api/goals', headers=who['auth'], json={
             'goal_type': 'outreach', 'title': title,
             'description': 'tell people about it',
-            'config': {'sender_email': sender}})
+            'config': {'sender_email': sender, **config}})
         assert resp.status_code == 201, resp.get_json()
         made.goals.append(resp.get_json()['goal']['id'])
         return made.goals[-1]
@@ -1178,6 +1180,93 @@ def test_a_mailbox_named_in_a_bindings_metadata_is_not_a_connect(node, web, monk
     with db_session(commit=False) as db:
         assert db.query(UserChannelBinding).filter_by(user_id=forger['id']).count() == 0
     assert out['success'] is False and node.mail.sent == []
+
+
+@pytest.mark.parametrize('metadata', [
+    {'email_address': ''},                         # the key, no value
+    {'email_address': None},
+    {'email_address': '   '},
+    {'imap_host': 'imap.evil.example', 'email_address': ''},
+    {'email_address': 'someone@else.example'},     # another address entirely
+], ids=['empty', 'null', 'blank', 'empty+host', 'another-address'])
+def test_a_binding_posted_with_no_value_for_the_mailbox_is_not_a_connect(node, web, monkeypatch, metadata):
+    """POST /bindings stored 'metadata' verbatim when it named no usable
+    address, and a row counted as the connect of a mailbox when
+    'email_address' was merely a KEY of its metadata: any signed-in account
+    posted {channel_sender_id: <company mailbox>, metadata: {email_address: ''}}
+    and held the mailbox with no password (review of ab8e0c840)."""
+    from integrations.channels.flask_integration import FlaskChannelIntegration
+    from integrations.social.models import UserChannelBinding, db_session
+    _connect(HEVOLVE)
+    _mailbox(node.channels, HEVOLVE)
+    forger = web.sign_up('forger')
+
+    web.client.post('/api/social/channels/bindings', headers=forger['auth'], json={
+        'channel_type': 'email', 'channel_sender_id': HEVOLVE, 'metadata': metadata})
+    goal = web.goal(forger, 'Spring watch sale', HEVOLVE)
+    out = _send_in(goal, _tools(monkeypatch, node.store))
+
+    assert out['success'] is False and node.mail.sent == []
+    with db_session(commit=False) as db:
+        assert FlaskChannelIntegration.accounts_connecting(db, 'email', HEVOLVE) == {OWNER}
+        for row in db.query(UserChannelBinding).filter_by(user_id=forger['id']).all():
+            if row.channel_sender_id == HEVOLVE:        # what the route stored for it
+                assert 'email_address' not in (row.metadata_json or {})
+
+
+def test_only_a_row_naming_the_mailbox_is_a_connect_of_it(node):
+    """The reader of who holds a mailbox: a row counts when the address its
+    metadata holds is the mailbox (any case); the key alone, an empty or
+    another value, and no metadata do not, whoever wrote the row."""
+    from integrations.channels.flask_integration import FlaskChannelIntegration
+    from integrations.social.models import UserChannelBinding, db_session
+    _connect(HEVOLVE)
+    shapes = {'u-empty': {'email_address': ''}, 'u-null': {'email_address': None},
+              'u-other': {'email_address': 'other@else.example'}, 'u-bare': None,
+              'u-other-key': {'smtp_host': 'smtp.hevolve.example'},
+              'u-same': {'email_address': HEVOLVE.upper()}}
+    with db_session() as db:
+        for user, meta in shapes.items():
+            db.add(UserChannelBinding(user_id=user, channel_type='email',
+                                      channel_sender_id=HEVOLVE, is_active=True,
+                                      metadata_json=meta))
+    try:
+        with db_session(commit=False) as db:
+            held = FlaskChannelIntegration.accounts_connecting(db, 'email', HEVOLVE)
+        assert held == {OWNER, 'u-same'}
+    finally:
+        with db_session() as db:
+            db.query(UserChannelBinding).filter(
+                UserChannelBinding.user_id.in_(list(shapes))).delete(
+                synchronize_session=False)
+
+
+def test_a_connect_sealed_by_the_vault_still_counts(node, monkeypatch, tmp_path):
+    """On a node with HEVOLVE_MASTER_KEY the connect tool stores the address
+    SEALED (it is a required setup field); the reader opens it, so the
+    account that connected a mailbox on such a node can still use it."""
+    from integrations.social.models import UserChannelBinding, db_session
+    from security import secrets_manager
+    from security.secrets_manager import SecretsManager
+    monkeypatch.setattr(secrets_manager, '_SALT_PATH', str(tmp_path / 'salt'))
+    monkeypatch.setattr(secrets_manager, '_VAULT_PATH', str(tmp_path / 'vault'))
+    monkeypatch.setenv('HEVOLVE_MASTER_KEY', 'test-only-vault-passphrase')
+    SecretsManager.reset()
+    try:
+        _connect(HEVOLVE)
+        _mailbox(node.channels, HEVOLVE)
+        with db_session(commit=False) as db:
+            row = db.query(UserChannelBinding).filter_by(
+                user_id=OWNER, channel_type='email', channel_sender_id=HEVOLVE).one()
+            assert row.metadata_json['email_address'].startswith('fernet:')
+
+        tools = _tools(monkeypatch, node.store)
+        out = _send(tools, _prospect(tools, 'Clinic', 'ana@clinic.example', 'g-speech'))
+
+        assert out['success'] is True, out
+        assert [m['to'] for m in node.mail.sent_from(HEVOLVE)] == ['ana@clinic.example']
+    finally:
+        SecretsManager.reset()
 
 
 def test_the_nodes_owner_connecting_a_mailbox_ends_a_squatters_claim(node, web, monkeypatch):

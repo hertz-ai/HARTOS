@@ -205,10 +205,10 @@ def create_binding():
     # the register_channel tool, as the chat form's submit does.
     # The account may also arrive nested under 'metadata', which this route
     # stores verbatim: a row that names a mailbox there was written with no
-    # connect and no credential, yet reads as "the account that connected it"
-    # (FlaskChannelIntegration.binding_connects_the_channel), which entitles a
-    # goal to send from it (outreach_crm_tools._may_use_mailbox).  So a
-    # mailbox named anywhere in the body goes to its one writer.
+    # connect and no credential, yet read as "the account that connected it"
+    # (FlaskChannelIntegration.accounts_connecting), which entitles a goal to
+    # send from it (outreach_crm_tools._may_use_mailbox).  So a mailbox named
+    # anywhere in the body goes to its one writer.
     from integrations.channels.flask_integration import FlaskChannelIntegration
     nested = data.get('metadata')
     flat = {**(nested if isinstance(nested, dict) else {}), **data}
@@ -226,7 +226,15 @@ def create_binding():
     # Encrypted when the vault has a key (seal_binding_credential); the live
     # adapter below still gets the credential itself.
     cred_key, credential = _extract_credential(data, meta)
-    metadata_payload = dict(data.get('metadata') or {})
+    # Whatever 'metadata' names as the account (email's email_address) is
+    # dropped, with an empty value too: a mailbox named there holds no
+    # connect.  This route stores no credential for it and starts nothing
+    # with one, so the row it writes must never read as "the account that
+    # connected it" (FlaskChannelIntegration.accounts_connecting); only
+    # register_channel writes that.  A non-empty one never gets here (above).
+    nested_metadata = data.get('metadata')
+    metadata_payload = FlaskChannelIntegration.without_account_setting(
+        channel_type, nested_metadata if isinstance(nested_metadata, dict) else {})
     if cred_key and credential:
         from integrations.channels.flask_integration import (
             seal_binding_credential,

@@ -788,7 +788,11 @@ class FlaskChannelIntegration:
         accounts (a mailbox the node sends from, whose settings it holds).
         Such a row never names an inbound sender's identity: an email From
         is anyone's to write, and resolving the company address to the
-        owner let a stranger be the owner (review of ae390514f)."""
+        owner let a stranger be the owner (review of ae390514f).
+
+        This is only the KIND of a row, enough to keep it from naming an
+        inbound sender.  It proves nothing about who holds a mailbox: a row
+        counts as connecting one only through accounts_connecting."""
         if getattr(row, 'channel_sender_id', None) == CONNECTED_BY_TOOL:
             return True
         param = (cls._CHANNEL_SPECS.get(channel_type) or {}).get('account_param')
@@ -796,24 +800,40 @@ class FlaskChannelIntegration:
         return bool(param) and isinstance(meta, dict) and param in meta
 
     @classmethod
+    def without_account_setting(cls, channel_type: str, metadata) -> Dict[str, Any]:
+        """``metadata`` without the key that names an account of
+        ``channel_type`` (email's email_address), for a writer that stores a
+        client's metadata verbatim (POST /api/social/channels/bindings).  A
+        row that names a mailbox is a connect, and only register_channel,
+        which starts the adapter with the credential, writes one."""
+        param = (cls._CHANNEL_SPECS.get(channel_type) or {}).get('account_param')
+        return {k: v for k, v in (metadata or {}).items() if k != param}
+
+    @classmethod
     def accounts_connecting(cls, db, channel_type: str, account) -> set:
         """The ids of the accounts that CONNECTED ``account`` of
         ``channel_type`` (a mailbox): the owners of its active binding rows
-        that record a connect (binding_connects_the_channel), found by the
-        account as the registry keys it (channel_account).  The one reader of
-        who holds a mailbox: it decides who may send from it
-        (outreach_crm_tools._may_use_mailbox) and whether another account may
-        connect it (agent_tools.register_channel)."""
+        for that account (found by the account as the registry keys it,
+        channel_account) whose metadata names it: a non-empty address that
+        equals it, opened when sealed (unseal_binding_metadata).  A row that
+        merely has the key, with no value, another value or a value that
+        cannot be opened, is not a connect: it holds no credential for the
+        mailbox.  The one reader of who holds a mailbox: it decides who may
+        send from it (outreach_crm_tools._may_use_mailbox) and whether
+        another account may connect it (agent_tools.register_channel)."""
         from .registry import normalize_account
         from integrations.social.models import UserChannelBinding
         key = normalize_account(account)
-        if key is None:
+        param = (cls._CHANNEL_SPECS.get(channel_type) or {}).get('account_param')
+        if key is None or not param:
             return set()
         rows = db.query(UserChannelBinding).filter_by(
             channel_type=channel_type, channel_sender_id=key,
             is_active=True).all()
         return {str(row.user_id) for row in rows
-                if cls.binding_connects_the_channel(channel_type, row)}
+                if cls.binding_connects_the_channel(channel_type, row)
+                and normalize_account(unseal_binding_metadata(
+                    channel_type, row.metadata_json).get(param)) == key}
 
     @staticmethod
     def _credential_kwarg(factory_fn, token: str) -> Dict[str, str]:

@@ -342,8 +342,41 @@ def is_dispatch_failure_pause_reason(reason) -> bool:
     return text.startswith(prefix) and words in text
 
 
+#: The goal config keys that hold the owner's verification of a goal's
+#: follow-up copy: ``verified_copy`` (the content hash of each verified
+#: step, read by outreach_crm_tools.goal_sender) and the record of who
+#: verified and when.  Exactly one writer sets them,
+#: outreach_crm_tools.mark_goal_copy_verified, after the owner/admin gate of
+#: its route.  A goal's config is client input (POST /api/goals stores the
+#: body's), so a config that arrived holding them would start its sequences
+#: active with nobody having verified anything (review of c6343fb17).  Every
+#: other writer neither adds, changes nor drops them: create_goal strips
+#: them, update_goal keeps what is stored (GoalManager._config_keeping_verified_copy).
+VERIFIED_COPY_KEYS = frozenset({
+    'verified_copy', 'copy_verified', 'copy_verified_by', 'copy_verified_at'})
+
+
+def without_verified_copy(config) -> Dict:
+    """``config`` as a new dict without the VERIFIED_COPY_KEYS."""
+    return {k: v for k, v in (config or {}).items() if k not in VERIFIED_COPY_KEYS}
+
+
 class GoalManager:
     """Unified CRUD for agent goals. All execution goes through /chat."""
+
+    @staticmethod
+    def _config_keeping_verified_copy(stored, incoming, verified=None) -> Dict:
+        """The config to store: ``incoming`` with the VERIFIED_COPY_KEYS
+        taken from ``stored`` (what the goal holds now), whatever
+        ``incoming`` says about them.  ``verified`` (a dict of those keys) is
+        the one writer's own values, laid over last."""
+        config = without_verified_copy(incoming)
+        for key in VERIFIED_COPY_KEYS:
+            if key in (stored or {}):
+                config[key] = stored[key]
+        config.update({k: v for k, v in (verified or {}).items()
+                       if k in VERIFIED_COPY_KEYS})
+        return config
 
     @staticmethod
     def create_goal(db: Session, goal_type: str, title: str,
@@ -368,6 +401,9 @@ class GoalManager:
             except Exception:
                 pass  # Rate limiter unavailable — allow through
 
+        # The caller's config is client input: the owner's verification of
+        # the goal's copy is not something it can arrive holding.
+        config = without_verified_copy(config)
         goal_dict = {'title': title, 'description': description,
                      'config': config or {}, 'goal_type': goal_type}
 
@@ -584,6 +620,7 @@ class GoalManager:
         db: Session,
         goal_id: str,
         _skip_consensus: bool = False,
+        _verified_copy: Optional[Dict] = None,
         **kwargs,
     ) -> Dict:
         """Update goal fields.
@@ -673,6 +710,14 @@ class GoalManager:
                     'error': f'consensus error: {exc}',
                 }
 
+        # The owner's verification of the goal's copy has ONE writer: a
+        # caller's config_json never adds, changes or drops it (the stored
+        # values stay), and only mark_goal_copy_verified passes
+        # ``_verified_copy``, its own values for those keys.
+        if 'config_json' in kwargs or _verified_copy is not None:
+            kwargs['config_json'] = GoalManager._config_keeping_verified_copy(
+                goal.config_json, kwargs.get('config_json', goal.config_json),
+                _verified_copy)
         for key, value in kwargs.items():
             if hasattr(goal, key):
                 setattr(goal, key, value)

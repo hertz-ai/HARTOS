@@ -1044,7 +1044,12 @@ def mark_goal_copy_verified(goal_id: str, verified_by: str,
     sequence made later is active only if each of its steps has the same
     copy (whitespace aside) as one verified; any other is held.  Emails the
     agent writes outside a sequence are held (held drafts), verified or
-    not."""
+    not.
+
+    The ONLY writer of the goal's verified_copy (and its who and when): its
+    route is behind the admin gate (on central, the operator), and
+    GoalManager.create_goal and update_goal keep every other caller from
+    writing those keys, a POST /api/goals body included."""
     from integrations.agent_engine.goal_manager import GoalManager
     from integrations.social.models import AgentGoal, db_session
     goal_id = str(goal_id)
@@ -1061,10 +1066,13 @@ def mark_goal_copy_verified(goal_id: str, verified_by: str,
             return {'success': False, 'error': f'no goal {goal_id} on this node'}
         config = dict(goal.config_json or {})
         verified = set(config.get('verified_copy') or []) | wanted
-        config.update(verified_copy=sorted(verified),
-                      copy_verified_by=str(verified_by),
-                      copy_verified_at=datetime.utcnow().isoformat())
-        updated = GoalManager.update_goal(db, goal_id, config_json=config)
+        # The ONE writer of these keys: update_goal takes them only from here
+        # (``_verified_copy``); any other caller's config keeps what is stored.
+        updated = GoalManager.update_goal(
+            db, goal_id, config_json=config,
+            _verified_copy={'verified_copy': sorted(verified),
+                            'copy_verified_by': str(verified_by),
+                            'copy_verified_at': datetime.utcnow().isoformat()})
     if not updated.get('success'):
         return {'success': False, 'error': updated.get('error') or 'not updated'}
     released = 0
