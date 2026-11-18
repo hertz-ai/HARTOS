@@ -31,6 +31,57 @@ logger = logging.getLogger(__name__)
 _crawler = None
 _crawler_available = None  # None = not checked yet
 
+#: The links each request's web search gave, so a failed crawl of a link no
+#: search gave can say so and name them.  Keyed by request id, bounded, and
+#: dropped after a while; one request never sees another's links.  The turn's
+#: window holds them too, but a tool cannot reach the window (hartos-43,
+#: 2026-11-18).  Live 2026-11-18 21:05 IST the search gave
+#: speechblubs.com/blog/9-effective-apps-for-speech-delay-to-help-your-child-speak
+#: and the local 4B crawled speechblubs.com/apps-for-delayed-speech (404).
+_SEARCH_LINKS = {}
+_SEARCH_LINKS_MAX = 64
+_SEARCH_LINKS_TTL_S = 900
+_search_links_lock = threading.Lock()
+
+
+def remember_search_links(request_id, links) -> None:
+    """Keep the links a search gave this request (newest searches win)."""
+    links = [l for l in (links or []) if isinstance(l, str) and l]
+    logger.info(f"search links kept: {len(links)} for request {request_id!r}")
+    if not request_id or not links:
+        return
+    with _search_links_lock:
+        _SEARCH_LINKS.pop(request_id, None)
+        _SEARCH_LINKS[request_id] = (time.monotonic(), links)
+        while len(_SEARCH_LINKS) > _SEARCH_LINKS_MAX:
+            _SEARCH_LINKS.pop(next(iter(_SEARCH_LINKS)))
+
+
+def _searched_links() -> list:
+    """The links this request's search gave, or [] (none, expired, or no
+    request id)."""
+    try:
+        from hartos.threadlocal import thread_local_data
+        request_id = thread_local_data.get_request_id()
+    except Exception:
+        return []
+    with _search_links_lock:
+        kept = _SEARCH_LINKS.get(request_id) if request_id else None
+    if not kept or time.monotonic() - kept[0] > _SEARCH_LINKS_TTL_S:
+        logger.info(f"no search links for request {request_id!r}")
+        return []
+    return kept[1]
+
+
+def _not_searched_note(url: str) -> str:
+    """'This link was not in the search results ...' when this request
+    searched and the failed link is not one it gave; '' otherwise."""
+    links = _searched_links()
+    if not links or url in links:
+        return ''
+    return ("This link was not in the search results. The search gave: "
+            + ", ".join(links[:5]) + ". Crawl one of these exactly.")
+
 
 def _check_available() -> bool:
     """Whether crawl4ai can crawl here (cached): it imports AND a Playwright
@@ -724,6 +775,9 @@ def crawl_url_for_agent(url: str, timeout: int = 30) -> str:
             "What to do: crawl a link exactly as the search results gave it; "
             "never guess or edit a page path. If no result link can be read, "
             "say so plainly instead of answering from memory.")
+        note = _not_searched_note(url)
+        if note:
+            parts.append(note)
 
     return "\n".join(parts)
 
@@ -749,7 +803,9 @@ def crawl_urls_for_agent(urls: List[str], timeout: int = 30) -> str:
             content = _fit_for_agent(r['markdown'], 4000, " [truncated]")
             parts.append(f"\n## {r['url']}\nWords: {r['word_count']}\n{content}")
         else:
-            parts.append(f"\n## {r['url']}\nFailed: {r['error']}")
+            note = _not_searched_note(r['url'])
+            parts.append(f"\n## {r['url']}\nFailed: {r['error']}"
+                         + (f"\n{note}" if note else ''))
 
     header = f"Crawled {success_count}/{len(urls)} URLs successfully"
     return header + "\n" + "\n".join(parts)

@@ -560,6 +560,17 @@ def top5_results(query):
     # we fall through to the optional BYO-key Google CSE path below.
     _keyless = _keyless_top5(query)
     if _keyless:
+        # The links this request's search gave, so a crawl of a link no
+        # search gave can name them (integrations.web_crawler).
+        try:
+            from hartos.threadlocal import thread_local_data
+            from integrations.web_crawler import remember_search_links
+            remember_search_links(
+                thread_local_data.get_request_id(),
+                [l for r in _keyless if isinstance(r, dict)
+                 for l in (r.get('source') or [])])
+        except Exception as e:
+            current_app.logger.debug(f"search links not kept: {e}")
         return _keyless
 
     final_res = []
@@ -567,7 +578,20 @@ def top5_results(query):
     try:
         # Your existing Google search
         if search is None:
-            return []
+            # Every desktop without a Google key ends here when the keyless
+            # engines answer nothing.  A bare [] gave the model no links and
+            # no word of what happened; live 2026-11-18 the 4B then crawled
+            # two links it made up (404) and asked the person
+            # (tests/unit/test_an_empty_keyless_search_says_so.py).  Same
+            # answer the entry's own top5_results gives for its empty exits.
+            current_app.logger.warning(
+                "top5_results: keyless search found nothing and no Google key "
+                f"is set, for: {query}")
+            return ("The web search found no results for this query: the "
+                    "keyless search engines answered nothing and no Google "
+                    "search key is set on this machine.  Do not make up a "
+                    "link or cite a source.  Search again with different "
+                    "words, or tell the person plainly that nothing was found.")
         top_2_search_res = search.results(query, 2)
         top_2_search_res_link = [res['link'] for res in top_2_search_res]
 
