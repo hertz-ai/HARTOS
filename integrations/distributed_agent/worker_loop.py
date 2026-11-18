@@ -84,19 +84,6 @@ class DeferredForRetry:
         self.reason = reason
 
 
-class NoModelForTask(DeferredForRetry):
-    """A claimed task no model can take right now: its goal's turn is held
-    by dispatch.goal_turn_model (the node's own model refusing calls and no
-    expert offered for that goal, or the expert withheld by the day cap).
-    Deferred until the refusing provider is tried again
-    (dispatch.provider_retry_after_s), and the tick claims on: such a task
-    must never block the queue behind it.  Review of 242654db3, MF1,
-    measured on the real coordinator: with 4 or more of them ahead (60 s
-    deferrals, one claim per 15 s tick) an earning goal's task was never
-    claimed in 40 min, and its goal was paused for ledger grounding."""
-    __slots__ = ()
-
-
 class DistributedWorkerLoop:
     """Background loop: claim tasks from shared Redis, execute via local /chat, submit results."""
 
@@ -115,11 +102,6 @@ class DistributedWorkerLoop:
     # A reason for claiming nothing that was said this recently is not said
     # again when the worker comes back to it (_note_idle).
     _IDLE_RESAY_S: float = 600.0
-    # Claims one tick may make while every task it claims is one no model can
-    # take (NoModelForTask, deferred, the tick claims on).  Bounds a tick over
-    # a long queue; the rest is reached on the next ticks, while the deferred
-    # ones stay out of the way.
-    _MAX_CLAIMS_PER_TICK: int = 50
 
     def __init__(self):
         self._interval = int(os.environ.get('HEVOLVE_WORKER_POLL_INTERVAL', '15'))
@@ -322,8 +304,7 @@ class DistributedWorkerLoop:
                                       self._BACKOFF_MAX)
 
     def _tick(self):
-        """Try to claim and execute one task per tick, claiming past any
-        task no model can take right now (NoModelForTask)."""
+        """Try to claim and execute one task per tick."""
         if not self._node_id:
             self._node_id = _worker_node_id()
         if not self._node_id:
@@ -350,29 +331,33 @@ class DistributedWorkerLoop:
             self._note_idle(f'waiting ({deferral})')
             return
 
-        # Claim the next matching task.  One that no model can take right now
-        # (NoModelForTask, decided per task by dispatch.goal_turn_model) is
-        # deferred and the tick claims on, so it never blocks the queue.
-        held = ''
-        for _ in range(self._MAX_CLAIMS_PER_TICK):
-            task = coordinator.claim_next_task(
-                agent_id=self._node_id,
-                capabilities=self._capabilities,
-            )
-            if not task:
-                self._note_idle(f'waiting ({held})' if held else
-                                f'no pending task its capabilities '
-                                f'{sorted(self._capabilities)} can claim')
-                return
-            outcome = self._work_claimed(coordinator, task)
-            if not isinstance(outcome, NoModelForTask):
-                self._note_idle(None)
-                return
-            held = outcome.reason
+        # Claim the next matching task THIS node can run now.  The coordinator
+        # asks _held_for before it claims: a task no model here can take
+        # (dispatch.goal_turn_model, for that task's goal) is skipped, never
+        # claimed, so it stays PENDING for every other node and costs no
+        # ledger write, and the earning task behind it is reached this tick.
+        # Review of 4642245a7, NF1, measured: claiming and deferring such
+        # tasks for 600 s hid them from healthy peers for 10 minutes and
+        # re-serialised the whole ledger 100 times in one tick.
+        held = []
 
-    def _work_claimed(self, coordinator, task):
-        """Run one claimed task and hand its outcome to the coordinator;
-        returns the outcome (what _execute_task returned, or None)."""
+        def _can_run(task):
+            why = self._held_for(task)
+            if why:
+                held.append(why)
+            return not why
+        task = coordinator.claim_next_task(
+            agent_id=self._node_id,
+            capabilities=self._capabilities,
+            can_run=_can_run,
+        )
+        if not task:
+            self._note_idle(f'waiting ({held[-1]})' if held else
+                            f'no pending task its capabilities '
+                            f'{sorted(self._capabilities)} can claim')
+            return
+
+        self._note_idle(None)
         logger.info(f"Worker claimed task {task.task_id}: {task.description[:80]}")
 
         # HIVE_DEPTH enforcement — defense in depth.  Coordinators stamp
@@ -410,17 +395,9 @@ class DistributedWorkerLoop:
             # the goal and comes back on the goal's next dispatch.
             self._hold(coordinator, task, result.reason)
         elif isinstance(result, DeferredForRetry):
-            # A task no model can take waits until the refusing provider is
-            # tried again, not the 60 s default: it leaves the head of the
-            # queue, and a long queue of them is claimed once per cooldown.
-            extra = {}
-            if isinstance(result, NoModelForTask):
-                from integrations.agent_engine.dispatch import (
-                    provider_retry_after_s)
-                extra = {'retry_after_s': provider_retry_after_s()}
             try:
                 if coordinator.defer_task(task.task_id, self._node_id,
-                                          result.reason, **extra):
+                                          result.reason):
                     logger.info("Worker deferred task %s: %s",
                                 task.task_id, result.reason)
                 else:
@@ -447,7 +424,18 @@ class DistributedWorkerLoop:
             except Exception as e:
                 logger.warning(
                     f"Worker could not release {task.task_id}: {e}")
-        return result
+
+    def _held_for(self, task) -> str:
+        """Why no model on this node can take ``task``'s goal turn right
+        now, in plain words, or '' when one can: dispatch.goal_turn_model
+        for the task's goal (the goal is the task's parent, as
+        _execute_task reads it), the goal's row read only while the node's
+        own model is refusing calls."""
+        from integrations.agent_engine.dispatch import (goal_turn_model,
+                                                        plain_reason)
+        goal_id = getattr(task, 'parent_task_id', None) or task.task_id
+        held = goal_turn_model(lambda: self._expert_goal_type(goal_id))[1]
+        return plain_reason(held) or ''
 
     def _hold(self, coordinator, task, reason, history=None) -> None:
         """Hold a claimed task until its goal's next dispatch
@@ -530,9 +518,10 @@ class DistributedWorkerLoop:
           * dispatch.goal_turns_held(): no goal turn could start here at all
             (the node's own model refusing calls, the first check
             local_chat_dispatch makes, and the configured expert offered to
-            no goal).  Each task claimed otherwise is decided for its own
-            goal by dispatch.goal_turn_model, the one rule (_execute_task),
-            and one no model takes is deferred past (_tick).
+            no goal).  Otherwise each task is decided for its own goal by
+            dispatch.goal_turn_model, the one rule, before it is claimed
+            (_held_for, the coordinator's can_run check): one no model takes
+            is never claimed.
           * local_dispatch_llm_busy(): every local LLM slot taken.  Added
             2026-09-21 after the first three shipped and the churn carried
             on through this hole: 18 claims and 18 deferrals in eight
@@ -553,10 +542,10 @@ class DistributedWorkerLoop:
             logger.debug('worker gate: yield check failed', exc_info=True)
         try:
             from integrations.agent_engine.dispatch import (
-                _DEFERRED_PREFIX, goal_turns_held)
+                goal_turns_held, plain_reason)
             held = goal_turns_held()
             if held:
-                return held[len(_DEFERRED_PREFIX):].strip()
+                return plain_reason(held)
         except Exception:
             logger.debug('worker gate: provider-breaker check failed',
                          exc_info=True)
@@ -614,7 +603,7 @@ class DistributedWorkerLoop:
 
         from integrations.agent_engine.dispatch import (
             _internal_auth_headers, goal_turn_model, local_chat_dispatch,
-            prompt_id_for_goal,
+            plain_reason, prompt_id_for_goal,
         )
 
         base_url = os.environ.get('HEVOLVE_BASE_URL', f'http://localhost:{get_port("backend")}')
@@ -638,13 +627,18 @@ class DistributedWorkerLoop:
         # 2026-11-16 07:23-07:30Z: the worker held on the free model's OPEN
         # breaker while 0 calls went to the expert, and five goals whose work
         # it held were paused for ledger grounding.  A task no model can take
-        # (a peer's goal, a goal that does not earn, the day cap spent) waits
-        # on the canonical DEFERRED lifecycle: nothing ran, nothing failed.
-        model_config, held = goal_turn_model(self._expert_goal_type(goal_id))
+        # (a peer's goal, a goal that does not earn, the day cap spent) is not
+        # claimed at all (_held_for, before the claim).
+        model_config, held = goal_turn_model(
+            lambda: self._expert_goal_type(goal_id))
         if held:
+            # Checked again at the turn's start: the provider may have turned
+            # since the claim's can_run check.  Rare, so the ordinary 60 s
+            # deferral.
+            held = plain_reason(held)
             logger.info(f"Worker deferring task {task.task_id}: no model "
                         f"takes its goal's turn now ({held})")
-            return NoModelForTask(held)
+            return DeferredForRetry(held)
 
         body = {
             'user_id': user_id,

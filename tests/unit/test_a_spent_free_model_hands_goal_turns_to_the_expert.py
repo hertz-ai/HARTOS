@@ -365,6 +365,41 @@ def test_an_escalated_goal_on_a_refused_expert_starts_no_turn(expert, breaker,
         'the action stays with the expert for when it is offered again'
 
 
+# ── what a person reads ─────────────────────────────────────────────────────
+
+def test_a_person_reads_the_wait_without_the_internal_marker(no_expert,
+                                                             spent_free,
+                                                             tmp_path,
+                                                             monkeypatch):
+    """The marketplace's distribution runs the real dispatch_goal; the free
+    model is refusing and no expert is configured, so the turn is held.
+    The person reads why in plain words.  Review of 4642245a7, NF4: the
+    held reason's internal 'deferred:' marker reached people ('Distribution
+    failed: deferred: provider ...', and the MCP tool's error)."""
+    from integrations.agent_engine import app_marketplace as market
+    monkeypatch.setattr(market, '_MARKETPLACE_DIR', str(tmp_path))
+    monkeypatch.setattr(market, '_LISTINGS_PATH', str(tmp_path / 'listings.json'))
+    place = market.AppMarketplace()
+    place._save_listings({'L1': {
+        'name': 'Tutor', 'description': 'A tutor app', 'owner_id': 'o1',
+        'recipe_id': 'r1', 'tagline': 'Learn anything'}})
+    with patch('integrations.agent_engine.model_registry._own_llm_target',
+               return_value=(FREE_URL, FREE_MODEL)), \
+            patch.object(budget_gate, 'pre_dispatch_budget_gate',
+                         return_value=(True, 'ok')), \
+            patch.object(budget_gate, 'release_goal_reservations',
+                         return_value=0), \
+            patch('security.hive_guardrails.GuardrailEnforcer.before_dispatch',
+                  side_effect=lambda prompt, *a, **k: (True, '', prompt)), \
+            patch('security.immutable_audit_log.get_audit_log'), \
+            patch.object(dispatch, '_get_distributed_coordinator',
+                         return_value=None):
+        out = place.distribute_to_channel('L1', 'telegram')
+    assert out == {'error': f'Distribution failed: provider {FREE_HOST} is '
+                            f'refusing calls (account refused or quota spent; '
+                            f'breaker open)'}, out
+
+
 # ── a turn in flight when the ledger crosses the cap ────────────────────────
 
 @pytest.mark.parametrize('crossed', [True, False],

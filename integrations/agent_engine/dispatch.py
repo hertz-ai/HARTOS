@@ -690,7 +690,10 @@ def goal_turn_model(goal_type, model_config=None):
     breaker), and the turn runs there: owner decision 2026-11-16, "Fall
     back to Haiku".  Otherwise ``held`` is why the turn waits, a 'deferred:'
     reason (a transient hold, never a strike: is_transient_deferral reads
-    the prefix); '' when the turn may start.
+    the prefix); '' when the turn may start.  ``goal_type`` may be a
+    zero-argument callable: it is then read only when that fallback needs
+    it (the hive worker asks for every task it scans, and the goal's row is
+    read only while its own model is refusing).
 
     It decides at the turn's start only: a turn that started on a model
     which then begins refusing keeps its model for the rest of the turn
@@ -699,14 +702,18 @@ def goal_turn_model(goal_type, model_config=None):
     Consumers, so no path keeps a copy: dispatch_goal's pre-flight; the
     daemon's speculative branch, which steps aside to dispatch_goal while
     its fast model's provider refuses (SpeculativeDispatcher
-    .should_speculate); the hive worker, before it claims (goal_turns_held)
-    and for each task it claims (worker_loop._execute_task); and the
-    daemon's grounding wait (goal_turn_held).  The expert's calls still pass
+    .should_speculate); the hive worker, before it claims (goal_turns_held),
+    for each task it might claim (its can_run check, which the coordinator's
+    claim_next_task asks before it claims) and for the task it runs
+    (worker_loop._execute_task); and the daemon's grounding wait
+    (goal_turn_held).  The expert's calls still pass
     the wire's per-call day-cap gate (core.llm_outbound_logger
     ._day_cap_refusal), as every call that holds the configured expert
     does."""
     held = _model_refusing(model_config)
     if held and model_config is None:
+        if callable(goal_type):
+            goal_type = goal_type()
         expert = revenue_expert_config(goal_type)
         if expert is not None:
             logger.info("The node's own model is refusing calls (%s); the "
@@ -1190,9 +1197,25 @@ def _failed_turn(goal_id, reply) -> bool:
 def dispatch_failure_reason(goal_id) -> Optional[str]:
     """Why the latest dispatch_goal for ``goal_id`` returned None after its
     turn ran and failed or stopped, or None.  Read once, from the thread
-    that dispatched: the entry is removed."""
+    that dispatched: the entry is removed.  A held turn's reason keeps its
+    'deferred:' marker; plain_reason gives the words to show a person."""
     with _turn_failures_lock:
         return _turn_failures.pop(_failure_key(goal_id), None)
+
+
+def plain_reason(reason) -> Optional[str]:
+    """``reason`` in the words a person reads: without the internal
+    'deferred:' marker that tells is_transient_deferral a turn was held, not
+    failed.  For every reader that shows a reason (the marketplace's
+    'Distribution failed: ...', the MCP tool's error, the hive worker's
+    idle line), so the same wait reads one way everywhere (review of
+    4642245a7, NF4).  Empty stays as it is."""
+    if not reason:
+        return reason
+    text = str(reason)
+    if text.startswith(_DEFERRED_PREFIX):
+        text = text[len(_DEFERRED_PREFIX):].strip()
+    return text
 
 
 # Where the latest dispatch_goal for a goal went: 'hive' (handed to the
@@ -1401,18 +1424,6 @@ def _provider_refusing(host) -> bool:
         logger.debug('provider-breaker check failed; not blocking the '
                      'dispatch', exc_info=True)
         return False
-
-
-def provider_retry_after_s() -> float:
-    """How long a task no model can take waits before it is offered again:
-    the provider breaker's cooldown, the soonest a refusing provider is
-    tried again (HALF_OPEN).  The hive worker defers such a task this long
-    so it leaves the head of the queue (worker_loop._tick)."""
-    try:
-        from core.circuit_breaker import llm_provider_breaker
-        return float(getattr(llm_provider_breaker, '_cooldown'))
-    except Exception:
-        return 600.0          # core.circuit_breaker's own cooldown for it
 
 
 # Concurrency ceiling for autonomous dispatch — single source both daemons call
