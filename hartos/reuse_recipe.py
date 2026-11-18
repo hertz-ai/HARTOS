@@ -7962,6 +7962,20 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
             if _picked is None:
                 _picked = _reuse_turn_refused_prose(user_prompt, _msgs)
                 _why = "this turn's own words the answer rules refused"
+                # Words riding a tool call are the model's note to its tool
+                # (_reuse_message_is_user_answer).  When this turn's send
+                # reached the person, that send is the reply (the branch
+                # below), not the note.  Live 2026-11-18 17:53 IST, speech
+                # agent 1794540972213 on the local 4B: "Arun!" reached the
+                # child, then the child read "I see the child responded with
+                # \"Aaa!\" ... Let me save the child's response:", the words
+                # on the save call.  A lesson written into a save call in a
+                # turn that sent nothing is still delivered (p3c in
+                # tests/unit/test_a_reply_is_never_a_seats_own_note.py).
+                if (_picked is not None
+                        and (_picked.get('tool_calls') or _picked.get('function_call'))
+                        and _reuse_turn_delivered_send(user_prompt, _msgs) is not None):
+                    _picked = None
             if _picked is not None:
                 current_app.logger.info(
                     f"[SYNTHESIS] tail is not an answer "
