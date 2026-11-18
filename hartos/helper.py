@@ -410,9 +410,19 @@ def _ddgs_rows(DDGS, query: str, max_results: int, backend: str = None) -> List[
         rows = [{'title': r.get('title', ''),
                  'url': r.get('href') or r.get('link', ''),
                  'snippet': r.get('body', '')} for r in (found or [])]
-        return [r for r in rows if r['url']]
+        # An ad click is not a result.  Live 18 Nov 2026 (source Nunba, local
+        # 4B): two of five rows were https://www.bing.com/aclick?... (~600
+        # chars each) ahead of the real pages, and the fetch step went to a
+        # page in no result.  Only Bing's form was measured.  An engine whose
+        # rows are all ads returns [] here, so the next engine is asked
+        # (tests/unit/test_a_search_drops_ad_clicks.py).
+        return [r for r in rows
+                if r['url'] and not r['url'].startswith(_BING_AD_CLICK)]
     except Exception:
         return []
+
+
+_BING_AD_CLICK = ('https://www.bing.com/aclick?', 'https://bing.com/aclick?')
 
 
 def _ddgs_text_engines() -> List[str]:
