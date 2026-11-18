@@ -956,12 +956,24 @@ class ModelOrchestrator:
     def notify_downloaded(self, model_type: str, model_name: str) -> None:
         """Called when a model is downloaded outside the orchestrator."""
         entry = self._find_entry_by_name(model_type, model_name)
-        if entry and not entry.downloaded:
+        # A row already downloaded may still hold a failed setup
+        # (mark_setup_failed); a successful install outside the orchestrator
+        # clears it, as one through it does.
+        if entry and (not entry.downloaded or entry.error_build):
             self._catalog.mark_downloaded(entry.id)
             logger.info(f"Catalog synced: {entry.id} downloaded (external)")
 
     def _find_entry_by_name(self, model_type: str, model_name: str) -> Optional[ModelEntry]:
-        """Find a catalog entry by type + display name, partial name, or file name."""
+        """Find a catalog entry by type + display name, partial name, or file name.
+
+        A voice engine's registry id names its row exactly ('neutts_air' is
+        tts-neutts-air): its words are joined by '_' in the id and '-' in the
+        row, so the partial matches below never found it (rv_b9, 2026-11-18)."""
+        if model_type == 'tts':
+            from integrations.channels.media.tts_router import catalog_id_to_engine_id
+            for entry in self._catalog.list_by_type(model_type):
+                if catalog_id_to_engine_id(entry.id) == model_name:
+                    return entry
         name_lower = model_name.lower()
         for entry in self._catalog.list_by_type(model_type):
             if entry.name == model_name or model_name in entry.id:
