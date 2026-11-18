@@ -22,7 +22,16 @@ THE RULE
     * a picture with no web link, or inside the nav/header/footer that are
       already dropped, is left out;
     * "too little content" is still judged on the words alone, so a page
-      whose HTML is only a logo still fails as before.
+      whose HTML is only a logo still fails as before;
+    * every distinct link is kept once, as crawl4ai keeps them.
+
+  What the agent's text budget leaves out is decided where the budget is
+  (crawl_url_for_agent 8000, crawl_urls_for_agent 4000 per page): a page
+  that fits reaches the agent whole; one that does not keeps the first 3
+  pictures of each row of pictures with no words between (a gallery, a row
+  of share icons) and is told how many more stood there, so a picture
+  standing among the words stays; the text is cut at a sentence end, never
+  inside a picture link.
 
 Nothing here reaches the network: requests.get is replaced by a fake page.
 
@@ -189,23 +198,125 @@ def test_the_word_count_counts_what_the_reader_gets(monkeypatch):
 
 # The links share the agent's text budget with the page's words (rv_b9,
 # 2026-11-18: a 40-picture gallery before an article cut the article from 93
-# sentences to 54 under the 8000-character cap).  The first
-# _FALLBACK_MAX_IMAGES distinct links are kept; a repeat is kept once.
+# sentences to 54 under the 8000-character budget; rv_66web, same day: a cap
+# on the page's first 12 pictures won the words back and lost the article's
+# chart behind a header's logo, share icons and tracking pixel).
 
-def _gallery(n, repeat_logo=False):
+def _gallery(n, repeat_logo=False, sentences=30):
     pics = ''.join(f'<img src="/media/photo-{i}.jpg" alt="photo {i}">' for i in range(n))
     logo = '<img src="/media/logo.png" alt="logo">' * (3 if repeat_logo else 0)
-    words = ' '.join(f'Sentence {i} of the article.' for i in range(30))
+    words = ' '.join(f'Sentence {i} of the article.' for i in range(sentences))
     return f'<html><body>{logo}{pics}<p>{words}</p></body></html>'
 
 
-def test_a_gallery_keeps_only_the_first_pictures_links(monkeypatch):
+def _agent_view(monkeypatch, html):
+    _serve(monkeypatch, html)
+    monkeypatch.setattr(wc, '_crawler_available', False)
+    monkeypatch.setattr(wc, '_offer_setup', lambda log: None)
+    return wc.crawl_url_for_agent(PAGE).split('Content:\n', 1)[1]
+
+
+CHART = '<img src="/media/charts/demand-2026.png" alt="Demand chart 2026">'
+LONG_WORDS = ' '.join(f'Paragraph sentence {i} about lash extension demand.' for i in range(120))
+DECORATED_ARTICLE = (
+    '<html><body><div class="site-header"><img src="/static/logo.svg" alt="News">'
+    + ''.join(f'<a href="#"><img src="/static/icons/{n}.svg" alt="{n}"></a>'
+              for n in ('facebook', 'x', 'linkedin', 'whatsapp', 'email', 'print'))
+    + '<img src="https://px.tracker.example/t.gif?id=42" width="1" height="1" alt="">'
+    + '<img src="/media/authors/meena.jpg" alt="Meena, reporter"></div>'
+    + '<div class="related">'
+    + ''.join(f'<img src="/media/related/r{i}.jpg" alt="related {i}">' for i in range(4))
+    + '</div><article><p>{words}</p>' + CHART + '<p>{words}</p></article></body></html>')
+
+
+def test_the_read_keeps_every_distinct_picture_as_crawl4ai_does(monkeypatch):
     _serve(monkeypatch, _gallery(40))
     md = _read()['markdown']
-    assert md.count('![') == wc._FALLBACK_MAX_IMAGES
-    assert 'photo-0.jpg' in md
-    assert f'photo-{wc._FALLBACK_MAX_IMAGES}.jpg' not in md
-    assert 'Sentence 29 of the article.' in md
+    assert md.count('![') == 40, md.count('![')
+    assert 'photo-39.jpg' in md and 'Sentence 29 of the article.' in md
+
+
+def test_a_chart_behind_more_than_twelve_decorative_pictures_reaches_the_agent(monkeypatch):
+    """rv_66web's page: 13 pictures in the header and related strip come
+    before the article's chart; the page fits the budget."""
+    words = ' '.join(f'Demand grew in month {i} of the year.' for i in range(6))
+    view = _agent_view(monkeypatch, DECORATED_ARTICLE.replace('{words}', words))
+    assert '![Demand chart 2026](https://www.example.org/media/charts/demand-2026.png)' in view, view
+    assert view.count('![') == 14 and 'not shown' not in view, view
+
+
+def test_over_the_budget_a_chart_among_the_words_stays_and_a_row_is_thinned(monkeypatch):
+    view = _agent_view(monkeypatch, DECORATED_ARTICLE.replace('{words}', LONG_WORDS))
+    assert 'demand-2026.png' in view, view
+    assert view.count('![') == 4, view
+    assert '[10 more pictures here not shown]' in view, view
+
+
+def test_a_gallery_before_a_long_article_leaves_the_article_its_budget(monkeypatch):
+    """The words the agent gets are those of the same page with no gallery,
+    less the room of the three pictures shown and the note (~210 characters,
+    under 10 of these sentences)."""
+    plain = _agent_view(monkeypatch, _gallery(0, sentences=400))
+    view = _agent_view(monkeypatch, _gallery(40, sentences=400))
+    assert view.count('![') == 3, view[:600]
+    assert 'photo-0.jpg' in view and 'photo-3.jpg' not in view, view[:600]
+    assert '[37 more pictures here not shown]' in view, view[:600]
+    said = view.count('of the article.')
+    assert said >= plain.count('of the article.') - 10, (said, plain.count('of the article.'))
+
+
+def test_a_picture_leading_a_gallery_stays_over_the_budget(monkeypatch):
+    html = ('<html><body><article><p>' + LONG_WORDS + '</p>' + CHART + '</article><div>'
+            + ''.join(f'<img src="/g/{i}.jpg" alt="g{i}">' for i in range(40))
+            + '</div><p>' + LONG_WORDS + '</p></body></html>')
+    view = _agent_view(monkeypatch, html)
+    assert 'demand-2026.png' in view, view
+    assert '[38 more pictures here not shown]' in view, view
+
+
+def test_a_page_inside_the_budget_reaches_the_agent_whole(monkeypatch):
+    html = ('<html><body><p>' + ' '.join(f'Item note {i}.' for i in range(40)) + '</p>'
+            + ''.join(f'<img src="/p/item-{i:02d}.jpg" alt="item {i}">' for i in range(1, 21))
+            + '</body></html>')
+    _serve(monkeypatch, html)
+    md = _read()['markdown']
+    view = _agent_view(monkeypatch, html)
+    assert view == md, view
+    assert view.count('![') == 20 and 'item-15.jpg' in view
+
+
+def test_the_cut_never_ends_inside_a_picture_link(monkeypatch):
+    """rv_b9 F2: words with no full stop, pictures, more words: the last '.'
+    before the budget is inside a link."""
+    words = ' '.join(['word'] * 1550)
+    pics = ''.join(f'<img src="/media/photo-{i}.jpg" alt="p{i}">' for i in range(2))
+    view = _agent_view(monkeypatch, '<html><body><p>Intro sentence. ' + words + '</p>'
+                       + pics + '<p>' + words + '</p></body></html>')
+    body = view.rsplit('\n[Content truncated]', 1)[0]
+    assert view.endswith('\n[Content truncated]'), view[-120:]
+    assert body.count('](') == body.count(')') and not body.endswith('.'), body[-120:]
+    assert len(body) <= 8000
+
+
+def test_a_hard_cut_never_lands_inside_a_picture_link():
+    """No sentence end late enough, and the budget falls inside a link: the
+    cut is made before the link, not through it."""
+    head = 'Intro sentence. ' + 'word ' * 1594
+    link = '![p](https://x.example/a.jpg)'
+    content = head + link + ' ' + 'word ' * 2000
+    assert content.index(link) < 8000 < content.index(link) + len(link)
+    out = wc._fit_for_agent(content, 8000, '\n[Content truncated]')
+    assert out == head + '\n[Content truncated]', out[-80:]
+
+
+def test_several_pages_get_the_same_fit_per_page(monkeypatch):
+    md = ''.join(f'![g{i}](https://x.example/g{i}.jpg) ' for i in range(10)) + ' '.join(
+        f'Line {i} of the page.' for i in range(400))
+    monkeypatch.setattr(wc, 'crawl_urls', lambda urls, timeout=30: [
+        {'success': True, 'url': u, 'markdown': md, 'word_count': len(md.split())} for u in urls])
+    out = wc.crawl_urls_for_agent(['https://x.example/1', 'https://x.example/2'])
+    assert out.count('more pictures here not shown]') == 2, out[:400]
+    assert out.count(' [truncated]') == 2, out[-200:]
 
 
 def test_a_picture_repeated_on_the_page_is_linked_once(monkeypatch):

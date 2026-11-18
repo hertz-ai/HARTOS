@@ -17,6 +17,7 @@ import asyncio
 import importlib
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -297,23 +298,68 @@ async def _crawl_single(url: str, timeout: int, log: _ProgressLog) -> dict:
         return {'success': False, 'url': url, 'error': str(e)}
 
 
-# Picture links kept by the browserless read: the first this many distinct
-# ones.  They share the agent's text budget with the page's words; measured
-# 2026-11-18 by rv_b9 on a 40-picture gallery before an article (8000-char
-# budget), keeping every link cut the article from 93 sentences to 54.
-_FALLBACK_MAX_IMAGES = 12
+#: One picture in a page's markdown, as both read paths write it.
+_PICTURE_LINK = r'!\[[^\]]*\]\([^)\s]*\)'
+_PICTURE_RE = re.compile(_PICTURE_LINK)
+#: Pictures standing next to each other with no words between: a gallery,
+#: a row of share icons, a strip of thumbnails.
+_PICTURE_RUN_RE = re.compile(rf'{_PICTURE_LINK}(?:\s*{_PICTURE_LINK})+')
+#: How many pictures of such a row the agent still sees when the page is
+#: over its budget.  The first stays, so a chart leading a gallery is kept.
+_RUN_PICTURES_SHOWN = 3
+
+
+def _fit_for_agent(content: str, budget: int, marker: str) -> str:
+    """The page's text as the agent sees it, in at most ``budget``
+    characters plus the notes.
+
+    A page that fits is handed over whole.  One that does not first loses
+    the pictures past the first few of each row of pictures, and a note
+    says how many were left out, so a picture standing among the words
+    (an article's chart) stays.  Then the text is cut at a sentence end,
+    never inside a picture link.  Measured 2026-11-18 (rv_b9, rv_66web): a
+    40-picture gallery before an article cut it from 93 sentences to 54,
+    and a cap on the first 12 pictures of the page won the words back but
+    dropped the article's chart behind a header's logo, share icons and
+    tracking pixel."""
+    if len(content) <= budget:
+        return content
+
+    def _thin(run):
+        pics = _PICTURE_RE.findall(run.group(0))
+        if len(pics) <= _RUN_PICTURES_SHOWN:
+            return run.group(0)
+        return (' '.join(pics[:_RUN_PICTURES_SHOWN])
+                + f' [{len(pics) - _RUN_PICTURES_SHOWN} more pictures here not shown]')
+
+    content = _PICTURE_RUN_RE.sub(_thin, content)
+    if len(content) <= budget:
+        return content
+    links = [m.span() for m in _PICTURE_RE.finditer(content, 0, budget + 2048)]
+
+    def _link_start(i):
+        return next((s for s, e in links if s <= i < e), None)
+
+    cut = content.rfind('.', 0, budget)
+    while cut != -1 and _link_start(cut) is not None:
+        cut = content.rfind('.', 0, _link_start(cut))
+    if cut > budget * 3 // 4:
+        return content[:cut + 1] + marker
+    end = budget if _link_start(budget) is None else _link_start(budget)
+    return content[:end] + marker
 
 
 def _fallback_fetch(url: str, timeout: int, log: _ProgressLog) -> dict:
     """Fallback: requests + BeautifulSoup. No browser needed.
 
     The page's pictures stay in its text as ``![alt](link)``, where they
-    stood, the shape crawl4ai's markdown gives, so a caller reads the same
-    kind of page from either path.  Live 2026-11-17 (research agent, build
-    75, crawl4ai not installed) a step that reads a chart with
-    get_text_from_image got page text only, had no picture link to pass,
-    failed three times and asked the person for one."""
-    import re
+    stood, each distinct link once, the shape crawl4ai's markdown gives, so
+    a caller reads the same kind of page from either path (what the agent's
+    budget leaves out is decided where the budget is, _fit_for_agent).
+    Live 2026-11-17 (research agent, build 75, crawl4ai not installed) a
+    step that reads a chart with get_text_from_image got page text only,
+    had no picture link to pass, failed three times and asked the person
+    for one."""
     from urllib.parse import urljoin
     import requests as _req
     log.step(f"Fetching {url} (requests fallback)...")
@@ -338,9 +384,8 @@ def _fallback_fetch(url: str, timeout: int, log: _ProgressLog) -> dict:
             src = next((v.strip() for v in (img.get('src'), img.get('data-src'))
                         if v and v.strip() and not v.strip().startswith('data:')), '')
             link = urljoin(page_url, src) if src else ''
-            # A repeat (a logo on every card) or one past the cap is dropped.
-            if (not link.startswith(('http://', 'https://')) or link in kept
-                    or len(kept) >= _FALLBACK_MAX_IMAGES):
+            # A repeat (a logo on every card) is dropped.
+            if not link.startswith(('http://', 'https://')) or link in kept:
                 img.decompose()
                 continue
             kept.add(link)
@@ -353,7 +398,7 @@ def _fallback_fetch(url: str, timeout: int, log: _ProgressLog) -> dict:
         cleaned = ' '.join(c for c in chunks if c)
         # Too little content is judged on the words alone: a page whose HTML
         # holds only a logo still needs JavaScript to be read.
-        words_only = re.sub(r' ?!\[[^\]]*\]\([^)\s]*\)', '', cleaned).strip()
+        words_only = re.sub(r' ?' + _PICTURE_LINK, '', cleaned).strip()
 
         if not words_only or len(words_only) < 50:
             log.step("Too little content after cleanup")
@@ -653,14 +698,8 @@ def crawl_url_for_agent(url: str, timeout: int = 30) -> str:
         parts.append("--- Result ---")
 
     if result['success']:
-        content = result['markdown']
-        # Truncate for agent context window
-        if len(content) > 8000:
-            truncate_pos = content.rfind('.', 0, 8000)
-            if truncate_pos > 6000:
-                content = content[:truncate_pos + 1] + "\n[Content truncated]"
-            else:
-                content = content[:8000] + "\n[Content truncated]"
+        # Fitted to the agent's context window
+        content = _fit_for_agent(result['markdown'], 8000, "\n[Content truncated]")
         parts.append(f"URL: {url}")
         parts.append(f"Words extracted: {result['word_count']}")
         parts.append(f"Content:\n{content}")
@@ -696,13 +735,7 @@ def crawl_urls_for_agent(urls: List[str], timeout: int = 30) -> str:
     for r in results:
         if r['success']:
             success_count += 1
-            content = r['markdown']
-            if len(content) > 4000:
-                truncate_pos = content.rfind('.', 0, 4000)
-                if truncate_pos > 3000:
-                    content = content[:truncate_pos + 1] + " [truncated]"
-                else:
-                    content = content[:4000] + " [truncated]"
+            content = _fit_for_agent(r['markdown'], 4000, " [truncated]")
             parts.append(f"\n## {r['url']}\nWords: {r['word_count']}\n{content}")
         else:
             parts.append(f"\n## {r['url']}\nFailed: {r['error']}")
