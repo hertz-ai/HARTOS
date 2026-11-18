@@ -178,9 +178,10 @@ def test_a_card_the_framework_builds_is_untouched(legs):
 
 
 def test_the_earlier_refusals_keep_their_order(legs):
-    """A card with no type, or no reason, is told that first: the note it
-    gets is the one for what is missing."""
-    assert _send({'fields': [{'name': 'a', 'label': 'Facts', 'type': 'text'}],
+    """A card with no type its props name, or no reason, is told that first:
+    the note it gets is the one for what is missing.  (With "fields" and no
+    type it is a form, test_an_ask_whose_shape_names_one_type_is_sent.)"""
+    assert _send({'questions': [{'name': 'a', 'label': 'Facts', 'type': 'text'}],
                   'description': 'Extract facts'})['refused'] == 'not_an_object'
     assert _send({'type': 'form', 'fields': [{'name': 'a', 'label': 'Facts',
                                               'type': 'text'}]})['refused'] == \

@@ -191,7 +191,23 @@ def _marked_secret(marker) -> bool:
 def _refusal(component, prompt_id) -> Optional[str]:
     """Why ``component`` cannot be asked, before anything is sent.  Which
     component types exist is the card gate's to say (agent_ui_compose), so a
-    type an agent registered at runtime is asked like a builtin."""
+    type an agent registered at runtime is asked like a builtin.
+
+    A component sent with no "type" is given the one builtin type whose
+    required props it all carries ("fields" is a form's, "purpose" a
+    file_request's), set on ``component`` itself so every check after this
+    one reads it, and it is then asked exactly as if the agent had written
+    that type.  The local 4B drops the type and keeps the fields: on
+    2026-11-16 the Email Draft Helper's 8 asks were all refused this way and
+    it asked again and again.  When no type, or more than one, carries all
+    its required props, it is refused not_an_object as before."""
+    if isinstance(component, dict) and not component.get('type'):
+        from integrations.agent_engine.liquid_ui_service import COMPONENT_TYPES
+        fits = [t for t, entry in COMPONENT_TYPES.items()
+                if isinstance(entry, dict) and entry.get('required')
+                and all(component.get(p) is not None for p in entry['required'])]
+        if len(fits) == 1:
+            component['type'] = fits[0]
     if not isinstance(component, dict) or not component.get('type'):
         return 'not_an_object'
     if _asks_for_a_secret(component):
