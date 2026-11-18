@@ -71,6 +71,7 @@ Usage:
         run_worker(name='f5_tts', load=load_model, handle=synthesize)
 """
 
+import collections
 import json
 import logging
 import os
@@ -97,16 +98,6 @@ logger = logging.getLogger(__name__)
 # (Indic Parler, NeuTTS) never carried it, and its startup failure reached
 # the caller as a raw 401 with nobody asked for the key.
 
-def _owner_hf_token() -> str:
-    """The stored Hugging Face token (environment, then the vault)."""
-    try:
-        from hartos.ai_key_vault import get_ai_key_vault
-        return get_ai_key_vault().get_tool_key('HEVOLVE_HF_TOKEN') or ''
-    except Exception as e:  # a worker that needs no token must still start
-        logger.debug("Hugging Face token lookup failed: %s", e)
-        return ''
-
-
 def _gated_repo_in(text: str) -> str:
     """The Hugging Face repo a startup error says is gated, or ''."""
     import re
@@ -117,25 +108,6 @@ def _gated_repo_in(text: str) -> str:
     m = (re.search(r'huggingface\.co/(?:api/models/)?([\w.-]+/[\w.-]+)', text)
          or re.search(r'(?:repo|model)\s+([\w.-]+/[\w.-]+)', text))
     return m.group(1).rstrip('.') if m else ''
-
-
-def _needs_hf_token_answer(tool_name: str, repo: str) -> str:
-    """The answer for a gated start with no token stored, after asking the
-    owner for it once (the vault's request_credential; has_pending keeps a
-    second worker start from asking again)."""
-    import json
-    from hartos.ai_key_vault import get_ai_key_vault, request_credential
-    answer = (f"needs HEVOLVE_HF_TOKEN: {repo} is gated; accept its terms "
-              f"at https://huggingface.co/{repo}")
-    if not get_ai_key_vault().has_pending('HEVOLVE_HF_TOKEN'):
-        request_credential(json.dumps({
-            'resource_type': 'api_key',
-            'key_name': 'HEVOLVE_HF_TOKEN',
-            'label': 'Hugging Face access token',
-            'used_by': f'the {tool_name} voice',
-            'description': f"Needed to start {tool_name}: {answer}",
-        }), agent_id=None, tell_alias=False)
-    return answer
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -301,6 +273,9 @@ class GPUWorker:
         self._lock = threading.Lock()
         self._ready = False
         self._stderr_thread: Optional[threading.Thread] = None
+        # The child's last stderr lines: a startup death carries them, so the
+        # parent can read why (a gated repo) and not only the exit code.
+        self._stderr_tail: collections.deque = collections.deque(maxlen=40)
         self._stdout_thread: Optional[threading.Thread] = None
         self._stdout_queue: queue.Queue = queue.Queue()
 
@@ -425,7 +400,8 @@ class GPUWorker:
         # Gated weights loaded in the worker read HF_TOKEN; the vault keeps
         # the owner's token as HEVOLVE_HF_TOKEN.
         if not env.get('HF_TOKEN'):
-            _hf = _owner_hf_token()
+            from hartos.ai_key_vault import hf_token
+            _hf = hf_token()
             if _hf:
                 env['HF_TOKEN'] = _hf
 
@@ -475,6 +451,7 @@ class GPUWorker:
 
         # Drain stderr in a thread so it doesn't fill the pipe buffer.
         # Also forward worker log lines to our logger.
+        self._stderr_tail.clear()
         self._stderr_thread = threading.Thread(
             target=self._drain_stderr,
             daemon=True,
@@ -527,6 +504,7 @@ class GPUWorker:
                 line = line.rstrip()
                 if line:
                     logger.info(f"[{self.name}] {line}")
+                    self._stderr_tail.append(line)
                     self._maybe_self_heal_from_line(line)
         except Exception:
             logger.exception("_drain_stderr: swallowed Exception")  # pipe closed, process dead
@@ -874,7 +852,12 @@ class GPUWorker:
         while time.monotonic() < deadline:
             if self._proc is None or self._proc.poll() is not None:
                 code = self._proc.returncode if self._proc else -1
-                raise WorkerCrash(f"{self.name}: died during startup (exit={code})")
+                # Let the drain read the dead child's last words first.
+                if self._stderr_thread is not None:
+                    self._stderr_thread.join(timeout=2.0)
+                crash = WorkerCrash(f"{self.name}: died during startup (exit={code})")
+                crash.stderr_tail = '\n'.join(self._stderr_tail)
+                raise crash
 
             line = self._read_line_with_timeout(0.5)
             if line is None:
@@ -1358,9 +1341,11 @@ class ToolWorker:
         try:
             worker = self._get_or_start()
         except (WorkerCrash, WorkerTimeout, WorkerError) as e:
-            gated = _gated_repo_in(str(e))
-            if gated and not _owner_hf_token():
-                return {'error': _needs_hf_token_answer(self.tool_name, gated)}
+            gated = _gated_repo_in(f"{e}\n{getattr(e, 'stderr_tail', '')}")
+            from hartos.ai_key_vault import gated_weights_answer, hf_token
+            if gated and not hf_token():
+                return {'error': gated_weights_answer(
+                    gated, f'the {self.tool_name} voice')}
             return {'error': f'{self.tool_name} worker startup failed: {e}'}
 
         try:

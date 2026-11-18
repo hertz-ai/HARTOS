@@ -978,3 +978,41 @@ def is_local_request() -> bool:
     """
     from core.auth_local import _is_local_request
     return _is_local_request()
+
+
+# ── The Hugging Face token ────────────────────────────────────────────
+# The vault keeps it as HEVOLVE_HF_TOKEN, a name huggingface_hub does not
+# read (it reads HF_TOKEN); a caller passes the value on.  One lookup and one
+# gated-weights answer for every caller: the voice worker's start
+# (integrations/service_tools/gpu_worker.py) and Nunba's weight download
+# (tts/package_installer.py) each carried a copy, Nunba's without the
+# ask-once guard (rv_b9, review of Nunba 247c65dc, 2026-11-18).
+HF_TOKEN_KEY = 'HEVOLVE_HF_TOKEN'
+
+
+def hf_token() -> str:
+    """The owner's Hugging Face token (environment, then the vault), or ''."""
+    try:
+        return get_ai_key_vault().get_tool_key(HF_TOKEN_KEY) or ''
+    except Exception as e:  # a public repo needs no token: never block one
+        logger.debug("Hugging Face token lookup failed: %s", e)
+        return ''
+
+
+def gated_weights_answer(repo: str, used_by: str) -> str:
+    """The answer for weights in a gated repo when no token is stored, after
+    asking the owner for the token once (has_pending keeps a second start or
+    download from asking again).  A catalog row that keeps this answer comes
+    back by itself once the key is stored: it reads the ``needs <KEY>:``
+    prefix (ModelEntry.setup_failure_current)."""
+    answer = (f"needs {HF_TOKEN_KEY}: {repo} is gated; accept its terms "
+              f"at https://huggingface.co/{repo}")
+    if not get_ai_key_vault().has_pending(HF_TOKEN_KEY):
+        request_credential(json.dumps({
+            'resource_type': 'api_key',
+            'key_name': HF_TOKEN_KEY,
+            'label': 'Hugging Face access token',
+            'used_by': used_by,
+            'description': f"Needed for {used_by}: {answer}",
+        }), agent_id=None, tell_alias=False)
+    return answer
