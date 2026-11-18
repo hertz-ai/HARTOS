@@ -5506,12 +5506,23 @@ def _reuse_turn_delivered_send(user_prompt, messages, starts_with=None,
     ("Take your time, Arjun!") is not that question (review of 6e1c93995).
     With ``asks``, the newest delivered send counts only when it asks the
     person something (lifecycle_hooks.send_is_ask), else None: the question
-    an unfinished action waits on (review of 7188e162e)."""
+    an unfinished action waits on (review of 7188e162e).
+
+    An ask_person card still waiting for the person is a send that asks: it
+    reached their devices and its question is open, so its question
+    (_reuse_card_question) counts here as a send that asks would.  Measured
+    live 2026-11-17 09:29:44-09:30:47 IST on build 75 (speech agent
+    1794540972213, local 4B): the steered round put "What is your mother
+    called in Tamil?" on the child's card, then wrote "Good! The person is
+    now being asked the question ..." and ended on a verdict; this reader saw
+    only sends, so that narration was the reply in the chat."""
+    from core.agent_tool_menu import ASK_PERSON_TOOL
     start = _reuse_turn_seed_index(user_prompt, messages)
     if start is None:
         return None
     window = messages[start + 1:]
     call_fn = _reuse_call_id_to_tool_name([window])
+    closed_asks = set()
     for msg in reversed(window):
         m = msg or {}
         if m.get('role') != 'tool':
@@ -5530,7 +5541,76 @@ def _reuse_turn_delivered_send(user_prompt, messages, starts_with=None,
                     if asks and not send_is_ask(window, call_id):
                         return None
                     return text
+            elif call_fn.get(call_id) == ASK_PERSON_TOOL:
+                question = _reuse_card_question(window, call_id, body,
+                                                closed_asks)
+                if question and (starts_with is None
+                                 or question.startswith(str(starts_with).strip())):
+                    return question
     return None
+
+
+def _reuse_card_question(messages, call_id, body, closed_asks):
+    """The question the ask_person call ``call_id`` put on the person's
+    card, when its result ``body`` says the card is on their devices and not
+    answered ('waiting_for_person'); else None.
+
+    The walk that calls this goes newest first, so ``closed_asks`` holds the
+    ask ids a newer result of the tool said are no longer open (answered,
+    dismissed, expired): a card answered later in the turn is not the
+    question.  A call that reads an earlier ask by its ``ask_id`` puts no
+    new card out, so it is never the question; the card's own call is.
+
+    The question is read off the call's own ``component``, the card
+    person_ask showed: a field's label that asks, else its title or reason
+    that asks (an approval asks in its reason), else its reason (a file ask
+    says what it asks for).  Asking means a question mark person_ask itself
+    counts (_QUESTION_MARKS)."""
+    from core.agent_tool_menu import ASK_PERSON_TOOL
+    from integrations.agent_engine.person_ask import _QUESTION_MARKS
+    try:
+        reply = json.loads(body)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(reply, dict):
+        return None
+    ask_id = str(reply.get('ask_id') or '')
+    if reply.get('status') != 'waiting_for_person':
+        if ask_id:
+            closed_asks.add(ask_id)
+        return None
+    if not ask_id or ask_id in closed_asks:
+        return None
+    args = None
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        for tc in (m.get('tool_calls') or []):
+            fn = (tc or {}).get('function') or {}
+            if (tc or {}).get('id') == call_id and fn.get('name') == ASK_PERSON_TOOL:
+                args = fn.get('arguments')
+    try:
+        if isinstance(args, str):
+            args = json.loads(args)
+        if not isinstance(args, dict) or str(args.get('ask_id') or '').strip():
+            return None
+        card = args.get('component')
+        if isinstance(card, str):
+            card = json.loads(card)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(card, dict):
+        return None
+    fields = card.get('fields')
+    labels = ([f.get('label') for f in fields if isinstance(f, dict)]
+              if isinstance(fields, list) else [])
+    texts = [t.strip() for t in (*labels, card.get('title'), card.get('description'))
+             if isinstance(t, str) and t.strip()]
+    asking = next((t for t in texts
+                   if any(mark in t for mark in _QUESTION_MARKS)), None)
+    reason = card.get('description')
+    return asking or (reason.strip() if isinstance(reason, str) and reason.strip()
+                      else None)
 
 # _REUSE_SAVE_ONLY_TOOLS (imported above) is core.constants
 # .BOOKKEEPING_SAVE_TOOLS: the saves of the agent's own notes, whose result
