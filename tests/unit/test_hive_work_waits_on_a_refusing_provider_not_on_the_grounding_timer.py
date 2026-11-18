@@ -47,6 +47,10 @@ from tests.unit.test_revenue_goal_turn_runs_on_the_expert import (  # noqa: F401
 from tests.unit.test_speculative_turn_is_judged_by_its_reply import Goal
 
 HIVE_GOAL = 'goal-hive-held-1'
+#: The worker's idle line for this wait, the same words whether it holds
+#: at the gate or finds every task held (review of 4642245a7, NF4).
+HELD_WORDS = (f'waiting (provider {FREE_HOST} is refusing calls (account '
+              f'refused or quota spent; breaker open))')
 
 
 class _Rows:
@@ -83,19 +87,27 @@ class _Rows:
 
 
 class _Coordinator:
-    """The shared coordinator at its boundary: one task to claim, and what
-    the worker did with it."""
+    """The shared coordinator at its boundary: one task to claim (once), and
+    what the worker did with it; a deferral records its retry_after_s."""
 
     def __init__(self, goal_id):
         self.claims = 0
+        self.asked = 0
         self.results, self.deferred, self.abandoned = [], [], []
+        self.retry_after = []
         self.task = types.SimpleNamespace(
             task_id=f'{goal_id}_task_0', parent_task_id=goal_id,
             description='Find parents for the speech therapy at home offer',
             context={'prompt': 'Find parents for the speech therapy offer',
                      'hop': 0, 'goal_type': 'marketing'})
 
-    def claim_next_task(self, agent_id, capabilities=None):
+    def claim_next_task(self, agent_id, capabilities=None, can_run=None):
+        """``claims`` counts tasks handed out: the one task, once, and only
+        when the claimant's can_run check takes it (as the real one asks).
+        ``asked`` counts the calls."""
+        self.asked += 1
+        if self.claims or (can_run is not None and not can_run(self.task)):
+            return None
         self.claims += 1
         return self.task
 
@@ -104,6 +116,7 @@ class _Coordinator:
 
     def defer_task(self, task_id, agent_id, reason, **kw):
         self.deferred.append(reason)
+        self.retry_after.append(kw.get('retry_after_s'))
         return True
 
     def abandon_task(self, task_id, agent_id):
@@ -181,26 +194,30 @@ def test_past_the_day_cap_the_worker_holds_and_claims_nothing(expert,
                                                               spent_free):
     coord, seen, w = _worker_tick(Goal(gid=HIVE_GOAL), {'usd': CAP + 0.01})
     assert coord.claims == 0, 'a task was claimed that nothing could run'
+    assert coord.asked == 0, ('no turn could start here, so the queue is not '
+                              'even scanned (dispatch.goal_turns_held)')
     assert seen == []
-    assert w._idle_reason == f'waiting (provider breaker open ({FREE_HOST}))'
+    assert w._idle_reason == HELD_WORDS, w._idle_reason
 
 
 def test_with_no_expert_the_worker_holds_as_before(no_expert, spent_free):
     coord, seen, w = _worker_tick(Goal(gid=HIVE_GOAL), {'usd': 0.0})
     assert coord.claims == 0
-    assert w._idle_reason == f'waiting (provider breaker open ({FREE_HOST}))'
+    assert w._idle_reason == HELD_WORDS, w._idle_reason
 
 
-def test_a_claimed_task_the_expert_is_not_offered_for_is_deferred(expert,
-                                                                  spent_free):
+def test_a_task_the_expert_is_not_offered_for_is_never_claimed(expert,
+                                                               spent_free):
     """A peer's goal (no row here) never spends this node owner's expert;
-    while the free model refuses, its task waits on the DEFERRED lifecycle
-    (nothing ran, nothing failed) instead of running into the refusal."""
-    coord, seen, _w = _worker_tick(None, {'usd': 0.0})
-    assert coord.claims == 1
+    while the free model refuses, this node cannot run its task, so it does
+    not claim it: nothing is written, and the task stays for a node that
+    can (review of 4642245a7, NF1).  The idle line says why, in plain
+    words.  FAILS BEFORE THE FIX: claimed and deferred."""
+    coord, seen, w = _worker_tick(None, {'usd': 0.0})
+    assert coord.claims == 0, 'a task this node cannot run was claimed'
     assert seen == []
-    assert coord.results == [] and coord.abandoned == []
-    assert len(coord.deferred) == 1 and FREE_HOST in coord.deferred[0]
+    assert (coord.results, coord.deferred, coord.abandoned) == ([], [], [])
+    assert w._idle_reason == HELD_WORDS, w._idle_reason
 
 
 def test_with_the_free_model_answering_the_task_runs_on_it(expert):
@@ -215,6 +232,289 @@ def test_with_the_free_model_answering_the_task_runs_on_it(expert):
     assert http.call_count == 1
     assert 'model_config' not in http.call_args.kwargs['json']
     assert coord.results == [REPLY]
+
+
+# ── a queue of tasks no model can take does not starve the one that can ────
+# Review of 242654db3, MF1 (its probe P6b, the shape pinned here): on the real
+# coordinator, 20 tasks of this node's non-earning goals sat ahead of one
+# earning goal's task, the free model OPEN and the expert offered.  The worker
+# claimed and deferred the first four for 60 s each, forever: 160 claims in
+# 40 min, the earning task never claimed, 0 expert turns, its goal paused for
+# ledger grounding at 1800 s (the 07:23Z incident).
+
+
+class _GoalRows:
+    """db_session() answering each AgentGoal query by the id it filters on
+    (``AgentGoal.id == x``, or filter_by(id=x))."""
+
+    def __init__(self, goals):
+        self.goals = goals
+        self._cols = False
+        self._id = None
+
+    @contextlib.contextmanager
+    def session(self, *a, **k):
+        yield self
+
+    def query(self, *models):
+        self._cols = len(models) > 1
+        return self
+
+    def filter(self, *exprs, **kw):
+        for e in exprs:
+            try:
+                self._id = str(e.right.value)
+            except Exception:
+                pass
+        return self
+
+    def filter_by(self, **kw):
+        if 'id' in kw:
+            self._id = str(kw['id'])
+        return self
+
+    def first(self):
+        g = self.goals.get(self._id)
+        if g is None:
+            return None
+        return (g.status, g.config_json) if self._cols else g
+
+    def count(self):
+        return 0
+
+
+def test_tasks_no_model_takes_do_not_starve_the_earning_task_behind_them(
+        expert, spent_free, monkeypatch):
+    """FAILS BEFORE THE FIX: origin's worker claims and defers the first 4
+    tasks for 60 s in turn (160 claims in 40 min), never reaches the
+    earning task, and its goal is paused at 1800 s; 4642245a7's claimed
+    and deferred all 60 for 600 s, re-serialising the ledger on every one.
+    Now the first tick claims the earning task alone (the coordinator asks
+    the worker's can_run check before it claims), it runs on the expert,
+    none of the 60 is ever claimed, and the tick saves the ledger twice
+    (the claim and the result), as a tick with an empty queue ahead would."""
+    sim = _sim_datetime()
+    from agent_ledger.core import SmartLedger, TaskStatus
+    from integrations.distributed_agent import task_coordinator as tc
+    from integrations.distributed_agent.coordinator_backends import (
+        InMemoryTaskLock)
+    monkeypatch.setenv('HEVOLVE_GOAL_VERIFY_TIMEOUT_S', '1800')
+
+    goals = {}
+    for i in range(60):
+        g = Goal(gid=f'goal-learn-{i}')
+        g.goal_type = 'learning'
+        goals[g.id] = g
+    earn = Goal(gid='goal-earn-0')
+    goals[earn.id] = earn
+    mem = _Mem()
+    led = SmartLedger(agent_id='coord', session_id='s', backend=mem)
+    co = tc.DistributedTaskCoordinator(ledger=led, task_lock=InMemoryTaskLock(),
+                                       verifier=MagicMock(), baseline=MagicMock())
+    with patch.object(tc, 'datetime', sim):
+        for gid, g in goals.items():
+            co.submit_goal('Do the goal', [{'task_id': f'{gid}_task_0',
+                                            'description': 'Do the goal',
+                                            'capabilities': []}],
+                           {'goal_type': g.goal_type, 'user_id': 'u1',
+                            'prompt': 'Do the goal', 'source_node': 'node-here'},
+                           goal_id=gid)
+    seen, claims = [], []
+    orig_claim = co.claim_next_task
+
+    def _claim(*a, **k):
+        t = orig_claim(*a, **k)
+        if t is not None:
+            claims.append(t.parent_task_id)
+        return t
+    w = DistributedWorkerLoop()
+    w._node_id = 'node-test'
+    with contextlib.ExitStack() as st:
+        for p in [
+            patch.object(tc, 'datetime', sim),
+            patch.object(co, 'claim_next_task', side_effect=_claim),
+            patch.object(w, '_get_coordinator', return_value=co),
+            patch.object(dispatch, '_get_distributed_coordinator', return_value=co),
+            patch('integrations.agent_engine.model_registry._own_llm_target',
+                  return_value=(FREE_URL, FREE_MODEL)),
+            patch('integrations.social.models.db_session',
+                  _GoalRows(goals).session),
+            patch.object(budget_gate, 'usd_spent_since',
+                         side_effect=lambda since, family: 0.0),
+            patch.object(dispatch, 'should_yield_to_user', return_value=False),
+            patch.object(dispatch, 'is_user_recently_active', return_value=False),
+            patch.object(dispatch, 'local_dispatch_llm_busy', return_value=False),
+            patch.object(dispatch, '_internal_auth_headers', return_value={}),
+            patch('security.hive_guardrails.GuardrailEnforcer.before_dispatch',
+                  side_effect=lambda prompt, *a, **k: (True, '', prompt)),
+            patch('security.hive_guardrails.GuardrailEnforcer.after_response',
+                  return_value=(True, '')),
+            patch('integrations.agent_engine.world_model_bridge.'
+                  'get_world_model_bridge'),
+            patch('integrations.distributed_agent.worker_loop.pooled_post',
+                  MagicMock(side_effect=AssertionError('no HTTP fallback'))),
+            swap_modules({'hart_intelligence_entry': _own_chat(seen),
+                          'hartos_backend_adapter': None,
+                          'routes.hartos_backend_adapter': None}),
+        ]:
+            st.enter_context(p)
+        agent_daemon._settle_dispatched_goal(_Db(), earn, earn.id,
+                                             handed_to_hive=True)
+        first_tick_saves = None
+        for i in range(160):                        # 40 min of 15 s ticks
+            sim.offset = i * 15.0
+            before = mem.saves
+            w._tick()
+            if i == 0:
+                first_tick_saves = mem.saves - before
+            done = led.get_task(f'{earn.id}_task_0').status == TaskStatus.COMPLETED
+            if i and i % 20 == 0 and not done:      # the daemon's settle
+                _back(earn.config_json, 300)
+                agent_daemon._settle_dispatched_goal(_Db(), earn, earn.id,
+                                                     handed_to_hive=True)
+    assert claims == [earn.id], claims[:30]
+    assert seen == [[EXPERT_MODEL]], 'the earning task did not run on the expert'
+    assert led.get_task(f'{earn.id}_task_0').status == TaskStatus.COMPLETED
+    assert earn.status == 'active', earn.config_json.get('pause_reason')
+    assert all(led.get_task(f'{g}_task_0').status == TaskStatus.PENDING
+               for g in goals if g != earn.id), 'a task no model takes was touched'
+    assert first_tick_saves == 2, first_tick_saves
+
+
+# ── shared helpers for the real coordinator ─────────────────────────────────
+
+class _Mem:
+    """The ledger's backend, in memory, counting its saves (each one a full
+    serialisation of the ledger in production)."""
+
+    def __init__(self):
+        self.data = {}
+        self.saves = 0
+
+    def load(self, key):
+        return self.data.get(key)
+
+    def save(self, key, data):
+        self.saves += 1
+        self.data[key] = data
+
+    def exists(self, key):
+        return key in self.data
+
+
+def _sim_datetime():
+    """A datetime whose now() is a simulated clock (``.offset`` seconds)."""
+    import datetime as _dt
+
+    class _SimDT(_dt.datetime):
+        offset = 0.0
+
+        @classmethod
+        def now(cls, tz=None):
+            return (_dt.datetime(2026, 11, 16, 8, 0, 0)
+                    + _dt.timedelta(seconds=cls.offset))
+    return _SimDT
+
+
+def test_tasks_this_node_cannot_run_stay_claimable_by_a_healthy_peer(
+        expert, spent_free):
+    """Review of 4642245a7, NF1, its probe P19's shape: one tick of a node
+    whose free model is refusing and whose expert is offered, over 10 tasks
+    of goals it does not hold (no row here, so the expert is not for them).
+    A healthy peer then claims all 10 at once.  FAILS BEFORE THE FIX:
+    origin's worker claims the first and defers it 60 s (the peer gets 9);
+    4642245a7's claimed and deferred all 10 for 600 s (the peer got 0 until
+    601 s).  No task is touched, so the tick writes nothing."""
+    from agent_ledger.core import SmartLedger
+    from integrations.distributed_agent import task_coordinator as tc
+    from integrations.distributed_agent.coordinator_backends import (
+        InMemoryTaskLock)
+    sim = _sim_datetime()
+    mem = _Mem()
+    led = SmartLedger(agent_id='coord', session_id='s', backend=mem)
+    co = tc.DistributedTaskCoordinator(ledger=led, task_lock=InMemoryTaskLock(),
+                                       verifier=MagicMock(), baseline=MagicMock())
+    with patch.object(tc, 'datetime', sim):
+        for i in range(10):
+            gid = f'goal-of-a-peer-{i}'
+            co.submit_goal('Do the goal', [{'task_id': f'{gid}_task_0',
+                                            'description': 'Do the goal',
+                                            'capabilities': []}],
+                           {'goal_type': 'marketing', 'user_id': 'u1',
+                            'prompt': 'Do the goal', 'source_node': 'node-peer'},
+                           goal_id=gid)
+    w = DistributedWorkerLoop()
+    w._node_id = 'node-refusing'
+    seen = []
+    with contextlib.ExitStack() as st:
+        for p in [
+            patch.object(tc, 'datetime', sim),
+            patch.object(w, '_get_coordinator', return_value=co),
+            patch('integrations.agent_engine.model_registry._own_llm_target',
+                  return_value=(FREE_URL, FREE_MODEL)),
+            patch('integrations.social.models.db_session', _GoalRows({}).session),
+            patch.object(budget_gate, 'usd_spent_since',
+                         side_effect=lambda since, family: 0.0),
+            patch.object(dispatch, 'should_yield_to_user', return_value=False),
+            patch.object(dispatch, 'is_user_recently_active', return_value=False),
+            patch.object(dispatch, 'local_dispatch_llm_busy', return_value=False),
+            patch.object(dispatch, '_internal_auth_headers', return_value={}),
+            patch('security.hive_guardrails.GuardrailEnforcer.before_dispatch',
+                  side_effect=lambda prompt, *a, **k: (True, '', prompt)),
+            patch('integrations.distributed_agent.worker_loop.pooled_post',
+                  MagicMock(side_effect=AssertionError('no HTTP fallback'))),
+            swap_modules({'hart_intelligence_entry': _own_chat(seen),
+                          'hartos_backend_adapter': None,
+                          'routes.hartos_backend_adapter': None}),
+        ]:
+            st.enter_context(p)
+        before = mem.saves
+        w._tick()                                   # the refusing node, t = 0
+        tick_saves = mem.saves - before
+        sim.offset = 15.0                            # a healthy peer, t = 15 s
+        peer = []
+        while True:
+            task = co.claim_next_task('node-healthy', [])
+            if task is None:
+                break
+            peer.append(task.task_id)
+    assert seen == []
+    assert tick_saves == 0, f'the refusing node wrote the ledger {tick_saves} times'
+    assert len(peer) == 10, f'a healthy peer could claim {len(peer)} of 10 at 15 s'
+
+
+def test_the_worker_thread_carries_the_watchdogs_llm_mark():
+    """A turn the worker runs in-process marks its thread as in an LLM call,
+    so the watchdog judges it by LLM_CALL_TIMEOUT_SECONDS, not 10 x 60 s:
+    the thread start() runs the loop on is named as the watchdog registers
+    it.  Review of 242654db3, P8: unnamed, nothing was marked and a fallback
+    Claude turn past 600 s was called frozen and restarted.  FAILS BEFORE
+    THE FIX: nothing marked."""
+    import threading
+    from security.node_watchdog import NodeWatchdog
+    wd = NodeWatchdog(check_interval=30)
+    wd.register('distributed_worker', expected_interval=60,
+                restart_fn=lambda: None, stop_fn=lambda: None)
+    w = DistributedWorkerLoop()
+    w._node_id = 'node-test'
+    seen, done = {}, threading.Event()
+
+    def _loop():
+        try:
+            marked = dispatch._notify_watchdog_llm_start()
+            seen['marked'] = marked
+            seen['in_llm_call'] = wd._threads['distributed_worker'].in_llm_call
+            dispatch._notify_watchdog_llm_end(marked)
+        finally:
+            done.set()
+    with patch('security.node_watchdog.get_watchdog', return_value=wd), \
+            patch.object(DistributedWorkerLoop, '_is_enabled',
+                         return_value=True), \
+            patch.object(w, '_loop', _loop):
+        w.start()
+        assert done.wait(10)
+    w._running = False
+    assert seen == {'marked': 'distributed_worker', 'in_llm_call': True}
 
 
 # ── the fallback's Claude call is the cached native one ────────────────────
