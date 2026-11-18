@@ -1063,6 +1063,26 @@ def build_core_tool_closures(ctx):
             tool_logger.warning(f"save_data_in_memory refused: key {key!r} holds "
                                 f"the placeholder {_placeholder!r}")
             return _placeholder_key_refusal('save_data_in_memory', key, _placeholder)
+        # An outline's mark ("<saved_str>") stands where a saved value is; it
+        # is never the value.  rv_88d7's review of 88d7e3aac: a copied
+        # '<saved_str>' was saved over the email's body, "Saved", and the
+        # real body was gone.  Only that mark: a template the agent saves on
+        # purpose may hold other fill-in marks.
+        from core.constants import OUTLINE_MARKER_RE
+        try:
+            _flat = value if isinstance(value, str) else json.dumps(value, default=str)
+        except Exception:
+            _flat = str(value)
+        _marker = OUTLINE_MARKER_RE.search(_flat or '')
+        if _marker:
+            tool_logger.warning(f"save_data_in_memory refused: the value for {key!r} "
+                                f"holds the outline mark {_marker.group(0)!r}")
+            from core.tool_refusal import refuse
+            return refuse('save_data_in_memory',
+                          f"the value holds {_marker.group(0)}, the outline's mark "
+                          f"for a value saved there, not the value itself",
+                          f"Read the saved value with get_data_by_key('{key}') "
+                          f"first, then save the real value")
         try:
             if isinstance(value, str) and (value.startswith('{') or value.startswith('[')):
                 value = _retrieve_json(value)

@@ -27,7 +27,7 @@ import ast
 from core.optional_import import lazy_module
 # The fabrication gate in reuse_recipe keys on this EXACT string to tell a
 # back-filled stand-in from a real tool result — one definition, no drift.
-from core.constants import HISTORICAL_TOOL_PLACEHOLDER
+from core.constants import HISTORICAL_TOOL_PLACEHOLDER, outline_marker
 autogen = lazy_module("autogen")
 transform_messages = lazy_module(
     "autogen.agentchat.contrib.capabilities.transform_messages")
@@ -894,11 +894,11 @@ def strip_json_values(obj: Any) -> Any:
             parsed = None
         if isinstance(parsed, (dict, list)):
             return strip_json_values(parsed)
-        return "<saved_str>"
+        return outline_marker("str")
 
     # 4. Everything else is a true leaf → mark it
     else:
-        return f"<saved_{type(obj).__name__}>"
+        return outline_marker(type(obj).__name__)
 
 
 # A registry tool name as `attach_for_names` compares it: the registry key, or

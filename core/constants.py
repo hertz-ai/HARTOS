@@ -1373,6 +1373,21 @@ VERDICT_ROUND_TERMINAL_STATUSES = frozenset({
 # placeholder would read as a real result again.
 HISTORICAL_TOOL_PLACEHOLDER: str = "Placeholder response for historical tool call"
 
+# The mark a memory OUTLINE puts where a saved value is: "<saved_str>",
+# "<saved_int>", ... (hartos.helper.strip_json_values writes it; the model
+# reads outlines from get_saved_metadata and the seat prompts).  An outline
+# says a value is saved there without showing it, so the mark is never a
+# value: save_data_in_memory refuses a value that carries it (rv_88d7's
+# review of 88d7e3aac: a copied '<saved_str>' was saved as the email's body
+# and the real body was gone).  ONE definition, so the writer and the
+# refusal cannot drift apart.
+def outline_marker(type_name: str) -> str:
+    """The outline's mark for a saved value of type ``type_name``."""
+    return f"<saved_{type_name}>"
+
+
+OUTLINE_MARKER_RE = _vis_re.compile(r"<saved_[A-Za-z_][A-Za-z0-9_]*>")
+
 # Results a tool returns when it RAN and could not do the work.
 #
 # Sibling of HISTORICAL_TOOL_PLACEHOLDER above, and read by the same gate for
