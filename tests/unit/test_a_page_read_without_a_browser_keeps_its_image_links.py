@@ -185,3 +185,31 @@ def test_the_word_count_counts_what_the_reader_gets(monkeypatch):
     _serve(monkeypatch, ARTICLE_WITH_A_CHART)
     result = _read()
     assert result['word_count'] == len(result['markdown'].split()), result
+
+
+# The links share the agent's text budget with the page's words (rv_b9,
+# 2026-11-18: a 40-picture gallery before an article cut the article from 93
+# sentences to 54 under the 8000-character cap).  The first
+# _FALLBACK_MAX_IMAGES distinct links are kept; a repeat is kept once.
+
+def _gallery(n, repeat_logo=False):
+    pics = ''.join(f'<img src="/media/photo-{i}.jpg" alt="photo {i}">' for i in range(n))
+    logo = '<img src="/media/logo.png" alt="logo">' * (3 if repeat_logo else 0)
+    words = ' '.join(f'Sentence {i} of the article.' for i in range(30))
+    return f'<html><body>{logo}{pics}<p>{words}</p></body></html>'
+
+
+def test_a_gallery_keeps_only_the_first_pictures_links(monkeypatch):
+    _serve(monkeypatch, _gallery(40))
+    md = _read()['markdown']
+    assert md.count('![') == wc._FALLBACK_MAX_IMAGES
+    assert 'photo-0.jpg' in md
+    assert f'photo-{wc._FALLBACK_MAX_IMAGES}.jpg' not in md
+    assert 'Sentence 29 of the article.' in md
+
+
+def test_a_picture_repeated_on_the_page_is_linked_once(monkeypatch):
+    _serve(monkeypatch, _gallery(2, repeat_logo=True))
+    md = _read()['markdown']
+    assert md.count('logo.png') == 1
+    assert md.count('![') == 3

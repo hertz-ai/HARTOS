@@ -297,6 +297,13 @@ async def _crawl_single(url: str, timeout: int, log: _ProgressLog) -> dict:
         return {'success': False, 'url': url, 'error': str(e)}
 
 
+# Picture links kept by the browserless read: the first this many distinct
+# ones.  They share the agent's text budget with the page's words; measured
+# 2026-11-18 by rv_b9 on a 40-picture gallery before an article (8000-char
+# budget), keeping every link cut the article from 93 sentences to 54.
+_FALLBACK_MAX_IMAGES = 12
+
+
 def _fallback_fetch(url: str, timeout: int, log: _ProgressLog) -> dict:
     """Fallback: requests + BeautifulSoup. No browser needed.
 
@@ -326,13 +333,17 @@ def _fallback_fetch(url: str, timeout: int, log: _ProgressLog) -> dict:
         # redirect).  A lazy picture keeps a data: stand-in in src and its
         # real link in data-src.  A picture with no web link is left out.
         page_url = getattr(resp, 'url', None) or url
+        kept = set()
         for img in soup.find_all('img'):
             src = next((v.strip() for v in (img.get('src'), img.get('data-src'))
                         if v and v.strip() and not v.strip().startswith('data:')), '')
             link = urljoin(page_url, src) if src else ''
-            if not link.startswith(('http://', 'https://')):
+            # A repeat (a logo on every card) or one past the cap is dropped.
+            if (not link.startswith(('http://', 'https://')) or link in kept
+                    or len(kept) >= _FALLBACK_MAX_IMAGES):
                 img.decompose()
                 continue
+            kept.add(link)
             alt = ' '.join((img.get('alt') or '').split()).replace('[', '').replace(']', '')
             link = link.replace(' ', '%20').replace('(', '%28').replace(')', '%29')
             img.replace_with(f' ![{alt}]({link}) ')
