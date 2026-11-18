@@ -74,6 +74,17 @@ logger = logging.getLogger(__name__)
 #: False) marks only those read: the rest stay unread for its owner.
 HANDLED = 'handled'
 
+def _message_id(header_value) -> str:
+    """The id a mail goes by, from its Message-ID header value: with no
+    whitespace in it.  An id has none; a header folded onto a second line
+    (Exchange and Outlook do it) arrives with a line break and spaces in
+    front of it, and with them the same mail read from its header alone and
+    from the whole message gave two ids, so it was downloaded again on every
+    poll (review of ab8e0c840, S2).  One reader for both, so the two agree.
+    '' for a mail with no Message-ID."""
+    return ''.join(str(header_value or '').split())
+
+
 #: Longest IMAP sequence-set (characters) one FETCH names: servers cap a
 #: command line (typically 8 KB), and a big inbox's set is split under it.
 _SEQUENCE_SET_LIMIT = 1000
@@ -461,8 +472,8 @@ class EmailAdapter(ChannelAdapter):
                 if uid is None and isinstance(closing, bytes):
                     uid = re.search(rb'UID\s+(\d+)', closing)
                 uid = uid.group(1) if uid else None
-                msg_id = str(email.message_from_bytes(bytes(item[1])).get(
-                    'Message-ID', '') or '').strip()
+                msg_id = _message_id(email.message_from_bytes(
+                    bytes(item[1])).get('Message-ID'))
                 if number is None:
                     continue
                 if msg_id and msg_id in self._seen_message_ids:
@@ -528,7 +539,7 @@ class EmailAdapter(ChannelAdapter):
             msg = email.message_from_bytes(raw_email)
 
             # Get message ID
-            message_id = msg.get('Message-ID', '')
+            message_id = _message_id(msg.get('Message-ID'))
 
             # Skip if already seen.  A mail with no Message-ID has no id to
             # remember: '' recorded as seen dropped every later such mail

@@ -39,7 +39,12 @@ mailbox (the goal's config `sender_email`), and from no other.  A mailbox is an
 account of the email channel, connected once through the channel setup form; it
 sends goals' email and reads its inbox only for prospects' replies (it never
 chats with the agent or answers mail).  A goal may send from a mailbox only when
-its creator is the account that connected it, or this node's owner.
+its creator is the account that connected it, or this node's owner.  A connect
+counts only once it is proven: every setting is given and the mail server
+accepts the IMAP and SMTP login (tried on a throwaway adapter).  A wrong or
+missing password is refused with what to fix, and nothing is recorded: no
+binding, no config, no adapter, and a running adapter of the same mailbox is
+left as it was.
 
 Every goal email is verified before it leaves:
 
@@ -53,6 +58,10 @@ Every goal email is verified before it leaves:
   exactly as written.  The agent is told it goes out once approved.  On a node
   that is not flat (central, regional) this covers an email for a prospect of no
   goal too, and a goal-less sequence is held (it has no goal to verify it for).
+- A prospect has one pending first email: while it is held, the agent cannot
+  write a second first email for that person (it is told why), and approving a
+  first email never sends one to a person already emailed.  A prospect is
+  'contacted' only when an email reaches them, by every path.
 
 ```
 GET  /api/admin/outreach/held?goal_id=&status=held   -- Held drafts and the held sequences' steps (subject and body, never the recipient's address)

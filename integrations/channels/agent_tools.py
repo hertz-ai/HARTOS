@@ -85,6 +85,38 @@ def _account_claim(channel_type: str, account: str, uid) -> tuple:
         return False, False
 
 
+def _account_refusal(channel_type: str, meta: dict, config: dict,
+                     required: list, account: str) -> Optional[str]:
+    """Why an account of a channel that holds several (a mailbox) may not be
+    connected yet, in words that say what is wrong and what to do; None when
+    it may.  A connect holds the account only once it is PROVEN: every
+    required setting is given and the server accepts the login
+    (FlaskChannelIntegration.probe_login, on a throwaway adapter).  Until
+    then nothing is recorded: no binding, no admin config, no adapter.  A
+    stranger's connect with a wrong or missing password used to hold the
+    mailbox, and only this node's owner could take it back (review of
+    ab8e0c840, S1).  Never names a password."""
+    from integrations.channels.flask_integration import (
+        FlaskChannelIntegration, get_channel_integration)
+    label = f"{meta['display_name']} ({account})"
+    missing = [k for k in required if not config.get(k)]
+    if missing:
+        return (f"{label} was not connected: it still needs "
+                f"{', '.join(missing)}. Give every setting (IMAP server, SMTP "
+                f"server, address and password) and connect again. Nothing "
+                f"was saved.")
+    token, extras = FlaskChannelIntegration._binding_credentials(
+        channel_type, config)
+    ok, why = get_channel_integration().probe_login(
+        channel_type, token, **extras)
+    if ok:
+        return None
+    return (f"{label} was not connected: {why}. Check the address, the "
+            f"password (Gmail with 2-step verification needs an App "
+            f"Password) and both server names, then connect again. Nothing "
+            f"was saved.")
+
+
 #: How long _report_when_live waits for a freshly started adapter to connect.
 #: Discord allows itself 30s to connect (discord_adapter.connect).
 _LIVE_WAIT_SECONDS = 35
@@ -625,6 +657,18 @@ def build_channel_tool_closures(ctx):
             )
             from integrations.channels.metadata import required_setup_keys
             required = required_setup_keys(meta)
+
+            # An account of a channel that holds several (a mailbox) is held
+            # by whoever CONNECTED it, so a connect counts only once it is
+            # proven (_account_refusal): nothing below is written for one
+            # that is not.
+            if account:
+                refusal = _account_refusal(channel_type, meta, config,
+                                           required, account)
+                if refusal:
+                    logger.warning("register_channel: %s not connected: %s",
+                                   channel_type, refusal.split(': ', 1)[-1][:120])
+                    return refusal
 
             # The copy kept in admin_config.json carries each credential
             # sealed, as the binding below does (seal_binding_credential):

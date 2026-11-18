@@ -35,6 +35,10 @@ CONNECTED_BY_TOOL = 'agent_registered'
 #: "pending, do not resend" (/channels/send's 202), never "not sent".
 CHANNEL_SEND_WAIT_S = 30
 
+#: How long probe_login waits for a mail server to accept or refuse a login
+#: before the connect is refused as "did not answer".
+ACCOUNT_LOGIN_WAIT_S = 30
+
 #: The webhook secret names built from a channel's name
 #: ('{CHANNEL}' + suffix), read by the webhook signature gate below.
 _WEBHOOK_SECRET_SUFFIXES = ('_APP_SECRET', '_CHANNEL_SECRET', '_WEBHOOK_SECRET',
@@ -669,16 +673,39 @@ class FlaskChannelIntegration:
         Generic factory — replaces per-channel register_* methods.
         Falls back to env var if no token provided.  Returns True on success.
         """
+        built = self._build_adapter(channel_type, token, **kwargs)
+        if built is None:
+            return False
+        adapter, account = built
+        try:
+            if account is None:
+                self.registry.register(adapter)
+            else:
+                # Beside the channel's other accounts: a second mailbox never
+                # replaces the first.
+                self.registry.register(adapter, account=account)
+            logger.info(f"{channel_type} adapter registered")
+            return True
+        except Exception as e:
+            logger.warning(f"{channel_type} adapter registration failed: {e}")
+            return False
+
+    def _build_adapter(self, channel_type: str, token: str = None, **kwargs):
+        """``(adapter, account)`` built from the channel's factory and these
+        settings (``account``: the account it is, for a channel that holds
+        several, else None), or None with the reason logged.  Registers
+        nothing: register_channel registers it, probe_login only tries it.
+        """
         factory_info = self._ADAPTER_FACTORIES.get(channel_type)
         if not factory_info:
             logger.warning(f"Unknown channel type: {channel_type}")
-            return False
+            return None
 
         module_path, factory_name = factory_info
         token = token or os.getenv(self._ENV_FALLBACKS.get(channel_type, ''))
         if not token and channel_type not in self._NO_TOKEN_CHANNELS:
             logger.warning(f"{channel_type} token not provided, skipping")
-            return False
+            return None
 
         # Build the factory call kwargs.  Multi-input channels (see
         # _CHANNEL_SPECS) map the generic `token` to their real param name and
@@ -691,7 +718,7 @@ class FlaskChannelIntegration:
             unmet = self.unmet_required_settings(channel_type, call_kwargs)
             if unmet:
                 logger.warning(f"{channel_type} requires {', '.join(unmet)} — skipping")
-                return False
+                return None
             if token:
                 call_kwargs[spec['token_param']] = token
             for p in spec.get('extra', ()):
@@ -729,18 +756,49 @@ class FlaskChannelIntegration:
             account = self.channel_account(channel_type, call_kwargs)
             if account is not None:
                 call_kwargs.update(spec.get('account_settings') or {})
-            adapter = factory_fn(**call_kwargs)
-            if account is None:
-                self.registry.register(adapter)
-            else:
-                # Beside the channel's other accounts: a second mailbox never
-                # replaces the first.
-                self.registry.register(adapter, account=account)
-            logger.info(f"{channel_type} adapter registered")
-            return True
+            return factory_fn(**call_kwargs), account
         except Exception as e:
             logger.warning(f"{channel_type} adapter registration failed: {e}")
-            return False
+            return None
+
+    def probe_login(self, channel_type: str, token: str = None,
+                    wait_s: float = None, **kwargs) -> tuple:
+        """``(ok, why)``: whether an adapter built from these settings logs in
+        to its server (a mailbox: IMAP and SMTP).  Tried on a throwaway
+        adapter on the adapters' loop, so nothing is registered, replaced or
+        recorded, and a refused login leaves a running adapter of the same
+        account as it was.  ``why`` says what went wrong, never a setting's
+        value.  A server that has not answered in ``wait_s`` (default
+        ACCOUNT_LOGIN_WAIT_S) is "not answering": a login is not proven."""
+        wait_s = ACCOUNT_LOGIN_WAIT_S if wait_s is None else wait_s
+        built = self._build_adapter(channel_type, token, **kwargs)
+        if built is None:
+            return False, 'its settings cannot be used to connect (see the server log)'
+        adapter, _account = built
+        loop, _started = self.ensure_running()
+        if loop is None:
+            return False, 'the channel event loop is not running on this node'
+        future = asyncio.run_coroutine_threadsafe(adapter.connect(), loop)
+        try:
+            if future.result(timeout=wait_s):
+                return True, ''
+            return False, ('the server refused the login or could not be '
+                           'reached')
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            return False, f'the server did not answer within {wait_s:g} seconds'
+        except Exception as e:
+            logger.warning("%s login probe failed: %s", channel_type,
+                           type(e).__name__)
+            return False, 'the login could not be tried (see the server log)'
+        finally:
+            # Closed in the background: the probe's answer does not wait on a
+            # server that is slow to log out.
+            closing = asyncio.run_coroutine_threadsafe(adapter.disconnect(), loop)
+            closing.add_done_callback(
+                lambda f: f.exception() and logger.warning(
+                    "%s login probe: closing failed: %s", channel_type,
+                    type(f.exception()).__name__))
 
     @classmethod
     def unmet_required_settings(cls, channel_type: str,

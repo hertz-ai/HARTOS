@@ -615,6 +615,26 @@ def count_delivered(prospect: Dict, when: datetime):
     prospect['updated_at'] = when.isoformat()
 
 
+def mark_contacted(prospect: Dict):
+    """The ONE rule for 'contacted': a prospect nobody has reached ('new')
+    becomes 'contacted' when an email REACHES them, and not before: not when
+    an email is written, held for the owner, or refused.  send_outreach_email,
+    approve_held_draft and the journey's first email all end here, so a held
+    first email leaves the prospect 'new' by whichever path wrote it (review
+    of a93ead3cf, S1: the journey path said 'contacted' with nothing sent)."""
+    if prospect.get('stage') == 'new':
+        prospect['stage'] = 'contacted'
+
+
+def stage_for_move(prospect: Dict, crm_stage: str) -> str:
+    """The CRM stage a journey move gives ``prospect``: ``crm_stage``, except
+    'contacted' until an email has reached them (mark_contacted says when);
+    until then the prospect keeps the stage it has."""
+    if crm_stage == 'contacted' and not prospect.get('emails_sent'):
+        return prospect.get('stage') or 'new'
+    return crm_stage
+
+
 def retry_due(planned: Dict, now: datetime) -> bool:
     """May a planned email that was refused before be tried again now?"""
     after = planned.get('retry_after')
@@ -855,6 +875,24 @@ def _steps_verified(sender: Optional[Sender], steps, goalless_held: bool) -> boo
     return sender.found and _steps_hashes(steps) <= sender.verified
 
 
+def _pending_first_touch(drafts: Dict, prospect_id) -> Optional[str]:
+    """The id of ``prospect_id``'s first email that is waiting on the owner
+    (held, or being sent), in ``drafts``; None when there is none."""
+    for draft_id, draft in drafts.items():
+        if (draft.get('prospect_id') == prospect_id and draft.get('first_touch')
+                and draft.get('status') in ('held', 'sending')):
+            return draft_id
+    return None
+
+
+def held_first_touch(prospect_id) -> Optional[str]:
+    """The id of ``prospect_id``'s first email waiting on the owner, or None:
+    what the journey asks before it writes its own first email."""
+    with _held_lock:
+        return _pending_first_touch(_read_held(_held_file())['drafts'],
+                                    prospect_id)
+
+
 def _hold_email(goal_id: Optional[str], prospect_id: Optional[str], subject: str,
                 body_html: str) -> Dict:
     """Keep an email (a goal's, ``goal_id``; None: no goal, on a node that
@@ -888,11 +926,28 @@ def _hold_email(goal_id: Optional[str], prospect_id: Optional[str], subject: str
                 "this exact email was already sent to this prospect",
                 "Write a different email, or move on to the next prospect.",
                 via='held')
+        # A prospect nobody has emailed has ONE pending first email: while it
+        # is held it counts as that prospect's first touch, so the next turn
+        # does not write a second (review of a93ead3cf, S2: both were listed,
+        # and approving both sent two first emails to one person).
+        first_touch = not ((_load_prospects().get('prospects') or {}).get(
+            prospect_id) or {}).get('emails_sent')
+        pending = _pending_first_touch(drafts, prospect_id) if first_touch else None
+        if pending is not None:
+            return dict(_refused_send(
+                "a first email for this prospect is already held for the "
+                "owner's approval",
+                "Do not write another: it goes out once the owner approves "
+                "it, exactly as written. If it is wrong, the owner rejects it "
+                "with a reason and you then write a better one. Keep working "
+                "on other prospects.", via='held'),
+                pending_first_touch=True, draft_id=pending)
         draft_id = uuid.uuid4().hex[:12]
         drafts[draft_id] = {
             'draft_id': draft_id, 'goal_id': goal_id,
             'prospect_id': prospect_id, 'subject': subject,
             'body_html': body_html, 'status': 'held',
+            'first_touch': first_touch,
             'created_at': datetime.utcnow().isoformat()}
     logger.info("Outreach email held for verification: draft %s of goal %s",
                 draft_id, goal_id)
@@ -940,6 +995,14 @@ def approve_held_draft(draft_id: str, approved_by: str) -> Dict:
         if not prospect:
             return {'sent': False, 'draft_id': draft['draft_id'],
                     'error': 'its prospect is no longer in the store'}
+        if draft.get('first_touch') and prospect.get('emails_sent'):
+            # Another email reached this person since this one was held as
+            # their first: sending it would be a second first email.
+            return {'sent': False, 'draft_id': draft['draft_id'],
+                    'error': 'this prospect has been emailed since this first '
+                             'email was held, so it would be a second first '
+                             'email: reject it with a reason, and the agent '
+                             'can write a follow-up instead'}
         result = _send_email(prospect['email'], draft['subject'],
                              draft['body_html'], sender=prospect_sender(prospect),
                              prospect_id=draft['prospect_id'], verified=True)
@@ -956,8 +1019,7 @@ def approve_held_draft(draft_id: str, approved_by: str) -> Dict:
                 'subject': draft['subject'], 'sequence_step': 1,
                 'sent_at': now.isoformat(), 'send_result': result})
             count_delivered(prospect, now)
-            if prospect.get('stage') == 'new':
-                prospect['stage'] = 'contacted'
+            mark_contacted(prospect)
             _save_prospects(data)
         return {'sent': True, 'draft_id': draft['draft_id'], 'send_result': result}
     finally:
@@ -1216,8 +1278,7 @@ def register_outreach_tools(helper, assistant, user_id: str):
 
         # Update prospect state
         count_delivered(prospect, now)
-        if prospect['stage'] == 'new':
-            prospect['stage'] = 'contacted'
+        mark_contacted(prospect)
 
         _save_prospects(data)
         return json.dumps({'success': True, 'sent': True, 'send_result': result,
