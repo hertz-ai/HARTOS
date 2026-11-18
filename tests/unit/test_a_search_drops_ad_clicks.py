@@ -16,10 +16,25 @@ THE RULE
 
     python -m pytest tests/unit/test_a_search_drops_ad_clicks.py -q --noconftest
 """
+import logging
 import sys
 import types
 
+import pytest
+
 import hartos.helper as helper
+
+
+@pytest.fixture(autouse=True)
+def no_other_tiers(monkeypatch):
+    """Tiers B, C and D stay on this machine: if tier A ever comes back empty
+    here (a regression of this very filter), no request reaches Mojeek,
+    DuckDuckGo or a SearXNG (rv_66web S5, measured under a mutant)."""
+    called = []
+    monkeypatch.setattr(helper, '_mojeek_serp', lambda q, n=5: called.append('B') or [])
+    monkeypatch.setattr(helper, '_ddg_html_serp', lambda q, n=5: called.append('C') or [])
+    monkeypatch.delenv('SEARXNG_URL', raising=False)
+    return called
 
 _AD = {'title': 'Apps For Speech Therapy For Toddlers',
        'href': 'https://www.bing.com/aclick?ld=e8_H10KiIK9kMKwPscW6T1yDVUCUy&u=aHR0cHM',
@@ -59,10 +74,13 @@ def _fake_ddgs(monkeypatch, auto_rows, engine_rows=None, engines=('bing', 'yande
     return asked
 
 
-def test_the_rows_hold_no_ad_click(monkeypatch):
-    _fake_ddgs(monkeypatch, [_AD, dict(_AD, href=_AD['href'] + '2')] + _REAL)
-    urls = [r['url'] for r in helper._keyless_serp('speech apps', max_results=5)]
+def test_the_rows_hold_no_ad_click(monkeypatch, caplog):
+    bare = dict(_AD, href=_AD['href'].replace('https://www.bing.com', 'https://bing.com'))
+    _fake_ddgs(monkeypatch, [_AD, bare] + _REAL)
+    with caplog.at_level(logging.INFO, logger=helper.__name__):
+        urls = [r['url'] for r in helper._keyless_serp('speech apps', max_results=5)]
     assert urls == [r['href'] for r in _REAL]
+    assert f'ddgs auto: dropped 2 of {2 + len(_REAL)} rows' in caplog.text, caplog.text
 
 
 def test_the_answer_the_model_reads_cites_only_results(monkeypatch):
@@ -78,6 +96,17 @@ def test_an_engine_that_answers_only_with_ads_is_passed_over(monkeypatch):
     urls = [r['url'] for r in helper._keyless_serp('speech apps', max_results=5)]
     assert urls == [r['href'] for r in _REAL]
     assert asked == ['auto', 'bing', 'yandex']
+
+
+def test_an_all_ads_search_says_what_it_dropped_and_asks_nobody_outside(
+        monkeypatch, caplog, no_other_tiers):
+    asked = _fake_ddgs(monkeypatch, [_AD], engine_rows={'bing': [_AD], 'yandex': [_AD]})
+    with caplog.at_level(logging.INFO, logger=helper.__name__):
+        rows = helper._keyless_serp('speech apps', max_results=5)
+    assert rows == [] and asked == ['auto', 'bing', 'yandex']
+    for backend in asked:
+        assert f'ddgs {backend}: dropped 1 of 1 rows' in caplog.text, caplog.text
+    assert no_other_tiers == ['B', 'C'], no_other_tiers
 
 
 def test_a_result_that_merely_mentions_bing_is_kept(monkeypatch):

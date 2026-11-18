@@ -415,9 +415,16 @@ def _ddgs_rows(DDGS, query: str, max_results: int, backend: str = None) -> List[
         # chars each) ahead of the real pages, and the fetch step went to a
         # page in no result.  Only Bing's form was measured.  An engine whose
         # rows are all ads returns [] here, so the next engine is asked
-        # (tests/unit/test_a_search_drops_ad_clicks.py).
-        return [r for r in rows
+        # (tests/unit/test_a_search_drops_ad_clicks.py).  ddgs's own aclick
+        # filter runs before it unwraps Yahoo's /RU= links, so a Yahoo-wrapped
+        # ad reaches here as exactly this prefix (rv_66web, ddgs 9.16).
+        kept = [r for r in rows
                 if r['url'] and not r['url'].startswith(_BING_AD_CLICK)]
+        if len(kept) < len(rows):
+            _fallback_logger.info(
+                f"[SEARCH] ddgs {backend or 'auto'}: dropped {len(rows) - len(kept)} "
+                f"of {len(rows)} rows (ad clicks or no link)")
+        return kept
     except Exception:
         return []
 
