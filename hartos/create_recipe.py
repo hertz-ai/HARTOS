@@ -4634,6 +4634,21 @@ def _ask_for_help(user_prompt, prompt_id, action_id, action_text, reason):
     they see it.
     """
     from integrations.agent_engine.dispatch import is_current_request_autonomous
+    # The question the step put out and the person has not answered, read
+    # once for both branches: on her turn it means the step waits for her
+    # reply; on a daemon turn it goes to the goal's person, not the expert
+    # model (Part B; the owner's 2026-10-31 ruling).
+    _question = None
+    try:
+        _gc = get_registered_groupchat(user_prompt)
+        _asked = window_question(list(getattr(_gc, 'messages', None) or []),
+                                 action_id, recorded_answers(user_prompt, action_id)
+                                 ) if _gc is not None else None
+        _question = _asked[1] if _asked else None
+    except Exception:
+        current_app.logger.debug(
+            f'[ASK-FOR-HELP] action {action_id}: the window could not be read '
+            f'for a question', exc_info=True)
     if not is_current_request_autonomous():
         # A step the gate already holds keeps its own hold and kind.  The
         # loop-break only flags its step (RECOVERABLE_STALL, a stall an
@@ -4648,8 +4663,14 @@ def _ask_for_help(user_prompt, prompt_id, action_id, action_text, reason):
             _hold_for_the_person(user_prompt, action_id,
                                  f'asked the person: {reason}')
         _kind = getattr(user_tasks.get(user_prompt), '_needs_user_input_kind', None)
+        # A step whose question already reached her waits for her reply; it
+        # has not failed to come together.  Live 2026-11-18 18:09 IST, email
+        # agent 1794820266612 (local 4B): step 2 sent its draft asking for
+        # her review, and she was told "Step 2 ... isn't coming together ...
+        # tell me more about how this step should work".
         return _needs_input_reply(action_id, action_text,
-                                  waiting=(_kind == USER_INPUT_GATE_AWAITING_REPLY))
+                                  waiting=(_kind == USER_INPUT_GATE_AWAITING_REPLY
+                                           or _question is not None))
     _ledger = user_ledgers.get(user_prompt)
     _task = _ledger.tasks.get(f"action_{action_id}") if _ledger else None
     if _task is not None:
@@ -4662,20 +4683,8 @@ def _ask_for_help(user_prompt, prompt_id, action_id, action_text, reason):
     from core.chat_client import daemon_goal_id
     from hartos.threadlocal import thread_local_data
     goal_id = daemon_goal_id(thread_local_data.get_request_id())
-    # A question the step put out goes to the goal's person, not the expert
-    # model (Part B; the owner's 2026-10-31 ruling).  The one hand-off REUSE
-    # uses too, so both write one record shape.
-    _question = None
-    try:
-        _gc = get_registered_groupchat(user_prompt)
-        _asked = window_question(list(getattr(_gc, 'messages', None) or []),
-                                 action_id, recorded_answers(user_prompt, action_id)
-                                 ) if _gc is not None else None
-        _question = _asked[1] if _asked else None
-    except Exception:
-        current_app.logger.debug(
-            f'[ASK-FOR-HELP] action {action_id}: the window could not be read '
-            f'for a question', exc_info=True)
+    # The step's open question (read above) goes to the goal's person; the
+    # one hand-off REUSE uses too, so both write one record shape.
     stage = hand_goal_to_its_person(goal_id, user_prompt, prompt_id, action_id,
                                     action_text, reason,
                                     get_current_flow(user_prompt), ask=_question)
