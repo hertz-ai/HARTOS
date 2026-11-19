@@ -2887,9 +2887,45 @@ class ToolMessageHandler:
         assistant_tool_calls = {}  # Track tool calls grouped by assistant message index
         consolidated_responses = []  # Track consolidated responses for later processing
 
+        # A bundle answering no call in this window (the context trim cut the
+        # assistant message that made the calls and kept their results) has
+        # no call to follow.  It becomes a user message WHERE IT STOOD, in the
+        # main pass.  STEP 3 used to append it at the END, behind the
+        # Assistant's newest tool calls: autogen's executor reads only the
+        # last message (generate_tool_calls_reply), so it saw a user message,
+        # ran none of them, and the model was asked again; Claude refused the
+        # shape with a 400 (central 2026-11-19 21:01:14, #293).
+        announced_call_ids = {
+            tc['id'] for m in processed_messages
+            if m.get('role') == 'assistant' and 'tool_calls' in m
+            for tc in (m.get('tool_calls') or []) if isinstance(tc, dict) and 'id' in tc}
+        # remember which consolidated-ID sets we have already accepted
+        seen_consolidated_id_sets: set[frozenset[str]] = set()
+
         # First sweep: Identify consolidated responses to prevent them from being processed as regular tool messages
         for i, msg in enumerate(processed_messages):
             if msg.get('role') == 'tool' and self.is_consolidated_response(msg):
+                bundle = self.validate_consolidated_response(msg)
+                bundle_ids = self.get_tool_call_ids_from_consolidated(bundle)
+                if not announced_call_ids.intersection(bundle_ids):
+                    id_set = frozenset(bundle_ids)
+                    if id_set and id_set in seen_consolidated_id_sets:
+                        current_app.logger.info(
+                            "Duplicate consolidated response detected – skipping second copy")
+                        processed_messages[i] = {"__skip__": True, "original_index": i}
+                        continue
+                    if id_set:
+                        seen_consolidated_id_sets.add(id_set)
+                    current_app.logger.warning(
+                        f"Consolidated response at index {i} answers no call in this "
+                        f"window (tool_call_ids: {bundle_ids}). Converting to user "
+                        f"message in place.")
+                    processed_messages[i] = {
+                        'role': 'user',
+                        'name': 'Helper',
+                        'content': bundle.get('content', '')
+                    }
+                    continue
                 consolidated_responses.append((i, msg))
                 # Mark this message to be skipped in the main processing
                 processed_messages[i] = {"__skip__": True, "original_index": i}
@@ -3031,28 +3067,14 @@ class ToolMessageHandler:
         # STEP 3: Process consolidated responses with improved handling
         current_app.logger.info(f"Processing {len(consolidated_responses)} consolidated responses")
 
-        # ────────────────────────────────────────────────────────────────
-        #  remember which consolidated-ID sets we have already accepted
-        # ────────────────────────────────────────────────────────────────
-        seen_consolidated_id_sets: set[frozenset[str]] = set()
-
+        # Every bundle here answers a call in this window: one with no ids,
+        # or none in the window, became a user message in place (first sweep).
         for orig_idx, consolidated_msg in consolidated_responses:
             # Validate and fix the consolidated response structure
             fixed_consolidated = self.validate_consolidated_response(consolidated_msg)
 
             # Get all tool call IDs from this consolidated response
             tool_call_ids = self.get_tool_call_ids_from_consolidated(fixed_consolidated)
-
-            if not tool_call_ids:
-                current_app.logger.warning(
-                    f"Consolidated response at original index {orig_idx} "
-                    f"has no valid tool_call_ids. Converting to user message.")
-                final_messages.append({
-                    'role': 'user',
-                    'name': 'Helper',
-                    'content': fixed_consolidated.get('content', '')
-                })
-                continue
 
             # ─── Duplicate guard ───────────────────────────────────────
             id_set = frozenset(tool_call_ids)
@@ -3099,13 +3121,11 @@ class ToolMessageHandler:
                 most_likely_assistant_idx = self.find_assistant_for_tool_call_ids(final_messages, tool_call_ids)
 
             if most_likely_assistant_idx is None:
+                # Not expected: the first sweep kept only bundles whose call is
+                # in this window.  Appending it would put a user message after
+                # the newest tool calls (#293), so it is left out of this request.
                 current_app.logger.warning(
-                    f"Could not find corresponding assistant for consolidated response with tool_call_ids: {tool_call_ids}. Converting to user message.")
-                final_messages.append({
-                    'role': 'user',
-                    'name': 'Helper',
-                    'content': fixed_consolidated.get('content', '')
-                })
+                    f"Could not find corresponding assistant for consolidated response with tool_call_ids: {tool_call_ids}. Left out of this request.")
                 continue
 
             current_app.logger.info(

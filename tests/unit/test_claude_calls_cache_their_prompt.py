@@ -429,8 +429,11 @@ def test_a_tool_call_with_no_result_right_after_it_is_left_out(metered, monkeypa
     the seats' own ToolMessageHandler: the token limiter's window opened on a
     bundled result whose call it had cut, the handler turned that bundle into
     a user message and appended it AFTER the Assistant's three new calls, so
-    those calls had no result after them.  The orphaned calls are left out;
-    the answered calls keep their results right behind them."""
+    those calls had no result after them.  The handler now keeps it where it
+    stood (#293, test_a_cut_calls_results_never_strand_the_new_calls), so
+    the history ends on the three calls, still with no result after them.
+    The orphaned calls are left out; the answered calls keep their results
+    right behind them."""
     from unittest.mock import MagicMock
     monkeypatch.setattr('hartos.helper.current_app', MagicMock())
     from hartos.helper import ToolMessageHandler
@@ -460,7 +463,9 @@ def test_a_tool_call_with_no_result_right_after_it_is_left_out(metered, monkeypa
     sent_calls = [b['id'] for t in turns for b in t['content'] if b['type'] == 'tool_use']
     assert sent_calls == answered
     texts = [b['text'] for t in turns for b in t['content'] if b['type'] == 'text']
-    assert 'r1\n\nr2' in texts          # the cut call's results still reach the model
+    # the cut call's results still reach the model (behind the task turn
+    # they stood after, which the role-order guard joins them to)
+    assert any('r1\n\nr2' in t for t in texts)
     # The calls left out stay in the Assistant's own turn, as what it did.
     assert [b['text'] for b in turns[-2]['content']] == [
         '[called post_to_channel with {"channel": "email", "text": "%s"}; '
