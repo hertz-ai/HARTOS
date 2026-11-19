@@ -2066,7 +2066,7 @@ def _engine_vram_gb(engine_id: str) -> float:
         key = (spec.vram_key if spec is not None and spec.vram_key
                else f'tts_{engine_id}')
         if key in VRAM_BUDGETS:
-            vram = VRAM_BUDGETS[key][0]  # (gpu_gb, cpu_gb)
+            vram = VRAM_BUDGETS[key][0]  # (min_vram_gb, model_size_gb): the room it needs
             _ENGINE_VRAM_GB[engine_id] = vram
             return vram
         # Engine not registered in vram_manager — log once, assume CPU
