@@ -24,7 +24,8 @@ import requests
 from typing import Dict, List, Optional
 
 from core.http_pool import pooled_post
-from core.chat_client import daemon_request_id, normalize_chat_body
+from core.chat_client import (
+    daemon_request_id, normalize_chat_body, own_daemon_turn, own_http_turn)
 from core.constants import SYSTEM_DAEMON_IDENTITY
 from core.port_registry import get_port
 
@@ -424,12 +425,17 @@ def local_chat_dispatch(prompt, user_id, prompt_id, daemon_id=None,
             from core.llama_scheduler import get_scheduler
             get_scheduler().bind_cancel(request_id, cancel_event)
             _bound = request_id
-        result = hevolve_chat(
-            text=prompt, user_id=user_id, agent_id=prompt_id,
-            create_agent=True, casual_conv=False, autonomous=True,
-            request_id=request_id,
-            **({'model_config': model_config} if model_config else {}),
-        )
+        # The in-process /chat runs the turn in THIS thread, so this is the
+        # node's own daemon turn for exactly this call, which nothing a client
+        # sends can say (core.chat_client.own_daemon_turn; #284: its goal
+        # type's tools, goal_manager.daemon_turn_stored_tags).
+        with own_daemon_turn(request_id):
+            result = hevolve_chat(
+                text=prompt, user_id=user_id, agent_id=prompt_id,
+                create_agent=True, casual_conv=False, autonomous=True,
+                request_id=request_id,
+                **({'model_config': model_config} if model_config else {}),
+            )
     except Exception as e:
         if cancel_event is not None and cancel_event.is_set():
             logger.info(f"Local /chat for {daemon_id or prompt_id} cancelled "
@@ -2139,10 +2145,14 @@ def _dispatch_goal_turn(prompt: str, user_id: str, goal_id: str,
 
     try:
         # Tagged like Tier 1 (daemon_<goal_id>) so the create pipeline runs the
-        # turn AUTONOMOUS; an untagged body reads as a live user (#97).
-        resp = pooled_post(f'{base_url}/chat',
-                           json=normalize_chat_body(body, daemon_id=goal_id),
-                           headers=_internal_auth_headers(), timeout=120)
+        # turn AUTONOMOUS; an untagged body reads as a live user (#97).  The
+        # turn's own secret rides with the credential: served on another
+        # thread, this POST is the node's own turn only by it (#284,
+        # core.chat_client.own_http_turn).
+        _body = normalize_chat_body(body, daemon_id=goal_id)
+        with own_http_turn(_body['request_id'], _internal_auth_headers()) as _headers:
+            resp = pooled_post(f'{base_url}/chat', json=_body,
+                               headers=_headers, timeout=120)
         if resp.status_code == 200:
             _cb_record_success()
             result = resp.get_json() if hasattr(resp, 'get_json') else resp.json()

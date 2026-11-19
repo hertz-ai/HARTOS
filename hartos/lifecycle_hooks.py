@@ -39,16 +39,23 @@ _recent_misses_lock = threading.Lock()
 
 
 def _load_ledger_on_miss(user_prompt: str) -> Optional[Any]:
-    """Cache-miss loader: reopen the person's session from disk when it is
-    their newest session of this agent and is still in progress; else None.
+    """Cache-miss loader: reopen the person's newest session of this agent in
+    progress, when all of theirs in progress hold one flows-and-build and it
+    is their newest session or holds the newest session's flow and build;
+    else None (_find_resumable_session(newest_only=True)).
 
     A miss knows only '<user>_<prompt>', not the flow or the build that
-    create_ledger_from_actions scopes its resume by.  A build or flow change
-    mints a new session there, so the newest session is the current one and
-    an older one still in progress is another build's or flow's: reopening
-    it would write this turn's states into its steps (review of b48cd6693,
-    must-fix 1: an older build's session reopened while the current build's
-    was done).  Only this person's files of this agent are read, not the
+    create_ledger_from_actions scopes its resume by, so where the session a
+    turn would resume cannot be told from the files (sessions in progress of
+    different flows or builds, or the one in progress of another flow or
+    build than the newest) it opens nothing: reopening the wrong one writes
+    this turn's states into its steps (review of b48cd6693, must-fix 1;
+    review of 17b251c11: a flow change, a build revert), and nothing open
+    costs only until the turn registers its own.  Older sessions in progress
+    of the same flows and build are leftovers the resume walk passes over
+    for the newest of them (review of 12453be4f, S3z/S3y), and an older
+    session of the newest one's flow and build is the one the turn resumes;
+    both are reopened.  Only this person's files of this agent are read, not the
     whole folder, and a miss with nothing in progress is remembered for
     _MISS_MEMORY_SECONDS (must-fix 2: a miss parsed all 3,074 ledgers inside
     the registry's lock, every time).  The read stays under the registry's
@@ -471,13 +478,29 @@ def _get_ledger_task_status():
     return LedgerTaskStatus
 
 
+def _blocked_on_own_substeps(ledger, task, LedgerTaskStatus) -> bool:
+    """Whether ``task`` is BLOCKED only on its own split: the block
+    ledger.add_subtasks leaves on a parent (no blocked reason of its own)
+    while at least one sub-step of that split is not over yet.  A sub-step
+    of the split carries context['split_of'] (add_subtasks stamps it); a
+    delegation's child, a dynamic child, or a sub-step that FAILED does not
+    count, so those blocks keep their refusal (review of ede3b91c5, S2a)."""
+    if task.status != LedgerTaskStatus.BLOCKED or getattr(task, 'blocked_reason', None):
+        return False
+    return any((getattr(child, 'context', None) or {}).get('split_of') == task.task_id
+               and not LedgerTaskStatus.is_terminal_state(child.status)
+               for child in ledger.tasks.values())
+
+
 def block_for_user_input(user_prompt: str, action_id: int,
                          reason: str = "Waiting for user input") -> bool:
     """Block a task in the ledger when the agent needs user consent/input.
 
     Call this when send_message_to_user is invoked and the action's
     can_perform_without_user_input == "no". The task transitions to BLOCKED
-    with BlockedReason.INPUT_REQUIRED until the user responds.
+    with BlockedReason.INPUT_REQUIRED until the user responds; a task
+    already BLOCKED on its own split (_blocked_on_own_substeps) takes the
+    same wait in place, recorded in its state history.
     """
     ledger = _ledger_registry.get(user_prompt)
     if not ledger:
@@ -485,10 +508,30 @@ def block_for_user_input(user_prompt: str, action_id: int,
     LedgerTaskStatus = _get_ledger_task_status()
     task_id = f"action_{action_id}"
     task = ledger.tasks.get(task_id)
-    if not task or task.status != LedgerTaskStatus.IN_PROGRESS:
+    if not task:
+        return False
+    # A step split into sub-steps (ledger.add_subtasks) is BLOCKED on its own
+    # pending sub-steps, with no reason of its own.  When its question to the
+    # person is out, that is still the step waiting for the person: it takes
+    # the input block in place (no transition, sub-steps kept), so the next
+    # person turn resumes it through the one held-step gate and records the
+    # answer.  Live 2026-11-16 (speech agent, build 75): refused here, the
+    # REUSE sub-step hold steered on and one turn asked the name 8 times
+    # (review of 8ddff06f7, rv_hartos_2575_8ddf).  Any other block keeps the
+    # refusal it always had.
+    on_own_substeps = _blocked_on_own_substeps(ledger, task, LedgerTaskStatus)
+    if task.status != LedgerTaskStatus.IN_PROGRESS and not on_own_substeps:
         return False
     before = copy.deepcopy(task.__dict__)
-    if not task.block(reason):
+    if on_own_substeps:
+        # The same record task.block() leaves, for the edge it does not
+        # take (BLOCKED is already the state): the reason in error_message
+        # and an entry in the state history (review of ede3b91c5, S2e).
+        task.error_message = reason
+        task._record_state_transition(
+            LedgerTaskStatus.BLOCKED,
+            f"waiting for the person while its sub-steps wait: {reason}")
+    elif not task.block(reason):
         return False
     task.set_blocked_reason('input_required')
     if ledger.save() is False:

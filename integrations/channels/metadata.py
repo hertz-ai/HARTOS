@@ -757,7 +757,10 @@ CHANNEL_CATALOG = {
              'help': 'e.g. imap.gmail.com'},
             {'key': 'smtp_host', 'label': 'SMTP Server', 'type': 'text',
              'help': 'e.g. smtp.gmail.com'},
-            {'key': 'email', 'label': 'Email Address', 'type': 'text'},
+            # The adapter's own setting name (create_email_adapter,
+            # FlaskChannelIntegration._CHANNEL_SPECS['email']): the address is
+            # also the account a node keeps this mailbox under.
+            {'key': 'email_address', 'label': 'Email Address', 'type': 'text'},
             {'key': 'password', 'label': 'Password / App Password', 'type': 'password',
              'help': 'Use an App Password for Gmail (2FA required).'},
         ],

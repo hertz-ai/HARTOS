@@ -14,15 +14,18 @@ Features:
 - Integration with A2A for multi-agent coordination
 """
 
+import base64
+import hmac
 import json
 import logging
 import threading
+import time
 import uuid
 import os
 from typing import Dict, List, Any, Optional, Callable
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from enum import Enum
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 import hashlib
 
 from core.public_url import PUBLIC_URL_VAR, internet_base_url
@@ -42,6 +45,11 @@ PHONEPE_REFUND_CALLBACK_PATH = '/api/v1/intelligence/phonepe/refund-callback'
 # Kong's 404 (measured 2026-10-27), so a buyer who had just paid landed on an
 # error page (task #145).
 PHONEPE_RETURN_PATH = '/api/v1/intelligence/phonepe/return'
+# Where Cashfree posts its signed payment-link events on this node
+# (commercial_api.cashfree_webhook), on the same public route as PhonePe's.
+# A link names it as its notify_url when this node has an https public
+# address; the owner can also register it in Cashfree's dashboard.
+CASHFREE_WEBHOOK_PATH = '/api/v1/intelligence/cashfree/webhook'
 
 
 def own_gateway_urls() -> Dict[str, str]:
@@ -102,6 +110,7 @@ class PaymentGateway(str, Enum):
     SQUARE = "square"
     BRAINTREE = "braintree"
     PHONEPE = "phonepe"  # India UPI / cards / netbanking via PhonePe PG
+    CASHFREE = "cashfree"  # India payment links (UPI / cards / netbanking)
     MOCK = "mock"  # For testing
 
 
@@ -183,16 +192,18 @@ def mock_would_settle(gateway, user=None) -> bool:
 NO_LIVE_GATEWAY_REASON = 'no live payment gateway'
 
 
-def refuse_no_live_gateway(where: str, user_id, payment_id=None) -> None:
+def refuse_no_live_gateway(where: str, user_id, payment_id=None,
+                           settings: str = LIVE_GATEWAY_SETTINGS) -> None:
     """The operator's side of every no-live-gateway refusal: ONE WARNING
     shape, on this module's logger, naming the settings to set
-    (LIVE_GATEWAY_SETTINGS) and never a value.  The person's reply or card
+    (LIVE_GATEWAY_SETTINGS, or ``settings`` for a rail of its own such as
+    CASHFREE_SETTINGS) and never a value.  The person's reply or card
     names no setting.  ``where`` is the path that refused ('ap2' for the
     generic settler and the agent's request, 'commerce' for the cart,
-    'upgrade' for the paid tier)."""
+    'upgrade' for the paid tier, 'cashfree' for a payment link)."""
     logger.warning('%s: payment%s for %s refused: %s (set %s)', where,
                    f' {payment_id}' if payment_id else '', user_id,
-                   NO_LIVE_GATEWAY, LIVE_GATEWAY_SETTINGS)
+                   NO_LIVE_GATEWAY, settings)
 
 
 #: Metadata keys that are credentials: kept in memory for the gateway call,
@@ -536,6 +547,21 @@ class StripePaymentGateway(PaymentGatewayConnector):
 #: amount check (expected_paise) reads.
 PHONEPE_SENT_AMOUNT_KEY = 'phonepe_amount_paise'
 
+#: The operator's rupees per US dollar.  PhonePe prices a USD tier in rupees
+#: with it, and the revenue sum (revenue_aggregator.query_revenue_streams)
+#: states rupees in dollars with it, so the two can never use two rates.
+USD_INR_RATE_VAR = 'PHONEPE_USD_INR_RATE'
+DEFAULT_USD_INR_RATE = 84.0
+
+
+def operator_usd_inr_rate() -> float:
+    """The ONE reader of the operator's USD to INR rate (USD_INR_RATE_VAR,
+    DEFAULT_USD_INR_RATE when unset or not a number)."""
+    try:
+        return float(os.environ.get(USD_INR_RATE_VAR, DEFAULT_USD_INR_RATE))
+    except (TypeError, ValueError):
+        return DEFAULT_USD_INR_RATE
+
 
 class PhonePePaymentGateway(PaymentGatewayConnector):
     """PhonePe Payment Gateway (Standard Checkout / Hermes API).
@@ -588,11 +614,8 @@ class PhonePePaymentGateway(PaymentGatewayConnector):
         env_choice = (env or _os.environ.get('PHONEPE_ENV', 'PROD')).upper()
         self.base_url = self.PROD_BASE if env_choice == 'PROD' else self.UAT_BASE
         self.env = env_choice
-        # USD→INR conversion (PhonePe is INR-only).  Operator can override.
-        try:
-            self.usd_inr_rate = float(_os.environ.get('PHONEPE_USD_INR_RATE', '84.0'))
-        except Exception:
-            self.usd_inr_rate = 84.0
+        # USD→INR conversion (PhonePe is INR-only): the operator's rate.
+        self.usd_inr_rate = operator_usd_inr_rate()
 
     def _sign(self, base64_payload: str, endpoint: str) -> str:
         """Compute X-VERIFY checksum per PhonePe docs."""
@@ -858,6 +881,304 @@ class PhonePePaymentGateway(PaymentGatewayConnector):
             return {'success': False, 'error': f'PhonePe refund failed: {e}'}
 
 
+# ── Cashfree payment links ───────────────────────────────────────────
+# Every endpoint, header and field below was read from Cashfree's docs on
+# 2026-11-17 (www.cashfree.com/docs: payment-links/create-payment-link,
+# fetch-payment-link-details, get-orders-for-a-payment-link, payment-links/
+# webhooks, webhooks/payloads-and-signatures, webhooks/reliability-and-
+# operations), never from memory.
+
+#: The credentials the owner enters (ENV_SECRETS below; the vault delivers
+#: them to the environment) and the mode switch.  There is no separate
+#: webhook secret: Cashfree signs its webhooks with the client secret.
+CASHFREE_APP_ID = 'CASHFREE_APP_ID'
+CASHFREE_SECRET_KEY = 'CASHFREE_SECRET_KEY'
+CASHFREE_ENV = 'CASHFREE_ENV'
+#: What the operator's WARNING names (refuse_no_live_gateway's settings).
+CASHFREE_SETTINGS = (f'{CASHFREE_APP_ID} with {CASHFREE_SECRET_KEY}; '
+                     f'{CASHFREE_ENV}=production for live money')
+#: The x-api-version this node speaks: the default of Cashfree's current
+#: OpenAPI (openapi/payments/v2026-01-01.yaml).
+CASHFREE_API_VERSION = '2026-01-01'
+#: Cashfree's webhook guidance: reject a request whose x-webhook-timestamp
+#: (milliseconds since the epoch) is more than five minutes old.
+CASHFREE_WEBHOOK_MAX_AGE_S = 300
+#: The ledger 'kind' of a payment a payer makes on a link this node minted.
+PAYMENT_LINK_KIND = 'payment_link'
+#: The fields every payment-link record carries (the owner's billing model:
+#: a pilot runs under a centre's client ID; later, families subscribe).
+#: transaction_id is filled when Cashfree confirms the payment.
+PAYMENT_LINK_RECORD_FIELDS = ('payer_name', 'payer_phone', 'payer_email',
+                              'child', 'plan', 'period', 'next_due_date',
+                              'transaction_id', 'client_id')
+#: Ledger kinds that are money IN to this node's owner (PaymentLedger.
+#: revenue): a payer's payment link and a bought API tier (task #210: the
+#: canonical sum missed tier upgrades).  A McGroce cart (commerce_checkout)
+#: and an agent's request_payment are not counted.
+REVENUE_KINDS = frozenset({PAYMENT_LINK_KIND, 'tier_upgrade'})
+
+
+def cashfree_link_id(payment_id: str) -> str:
+    """The link_id this node gives Cashfree for a payment: unique per
+    payment, 43 characters of letters, digits, '-' and '_' (Cashfree allows
+    50 of those)."""
+    return f'hartos_{payment_id}'
+
+
+class CashfreePaymentGateway(PaymentGatewayConnector):
+    """Cashfree Payment Gateway: hosted payment links (UPI, cards,
+    netbanking) a payer opens and pays; the money moves then, and Cashfree
+    confirms it with a signed webhook.
+
+    The credentials are read when they are used (core.config_cache.
+    get_secret: the environment, then the config or vault), never kept on
+    the object, so a key the owner enters after boot works without a
+    restart and a rotated key takes effect on the next call.
+    ``CASHFREE_ENV`` 'production' (or 'prod') selects the live API; anything
+    else, unset included, is the sandbox.
+
+    Not in select_gateway's order: no cart mandate or request_payment is
+    routed here.  Payments reach it through create_payment_link only.
+    """
+
+    SANDBOX_BASE = 'https://sandbox.cashfree.com/pg'
+    PRODUCTION_BASE = 'https://api.cashfree.com/pg'
+    LINKS_ENDPOINT = '/links'
+    HTTP_TIMEOUT = (5, 20)
+
+    def __init__(self, **kwargs):
+        super().__init__(PaymentGateway.CASHFREE, **kwargs)
+
+    @staticmethod
+    def _setting(name: str) -> str:
+        from core.config_cache import get_secret
+        return str(get_secret(name, '') or '').strip()
+
+    @property
+    def app_id(self) -> str:
+        return self._setting(CASHFREE_APP_ID)
+
+    @property
+    def secret_key(self) -> str:
+        return self._setting(CASHFREE_SECRET_KEY)
+
+    @property
+    def env(self) -> str:
+        raw = self._setting(CASHFREE_ENV).lower()
+        if raw in ('production', 'prod'):
+            return 'PRODUCTION'
+        if raw and raw not in ('sandbox', 'test'):
+            logger.warning('CashfreePaymentGateway: %s=%r is not production or '
+                           'sandbox; using the sandbox', CASHFREE_ENV, raw)
+        return 'SANDBOX'
+
+    @property
+    def base_url(self) -> str:
+        return self.PRODUCTION_BASE if self.env == 'PRODUCTION' else self.SANDBOX_BASE
+
+    def missing_settings(self) -> List[str]:
+        """The credential names that are not set now."""
+        return [n for n in (CASHFREE_APP_ID, CASHFREE_SECRET_KEY) if not self._setting(n)]
+
+    def connect(self) -> bool:
+        """Connected while both credentials are set; Cashfree has no session
+        handshake."""
+        self.connected = not self.missing_settings()
+        if not self.connected:
+            # DEBUG: every node builds the ledger, and most have no Cashfree
+            # account; a refused link says it at WARNING (refuse_no_live_gateway).
+            logger.debug('CashfreePaymentGateway: %s not set, gateway disabled',
+                         CASHFREE_SETTINGS)
+        return self.connected
+
+    @staticmethod
+    def _refusal(status, data) -> str:
+        """Cashfree's refusal as its HTTP status and its machine codes
+        (``code``, ``type``).  Never its ``message``: that free text may echo
+        what was sent, a payer's phone or name, and this sentence reaches
+        logs and the agent."""
+        codes = [str(data.get(k)) for k in ('code', 'type')
+                 if isinstance(data, dict) and data.get(k)]
+        return f'HTTP {status}' + (f' ({", ".join(codes)})' if codes else '')
+
+    def _request(self, method: str, path: str, body=None,
+                 idempotency_key: Optional[str] = None):
+        """``(http_status, json_body)``; ``(None, {'message': why})`` when the
+        request could not be made.  The credentials travel in headers only."""
+        from core.http_pool import pooled_get, pooled_post
+        headers = {'x-api-version': CASHFREE_API_VERSION,
+                   'x-client-id': self.app_id,
+                   'x-client-secret': self.secret_key,
+                   'Content-Type': 'application/json',
+                   'Accept': 'application/json'}
+        if idempotency_key:
+            # A retry with the same key never makes a second link (Cashfree
+            # x-idempotency-key); the pooled session retries a 502/503/504.
+            headers['x-idempotency-key'] = idempotency_key
+        url = self.base_url + path
+        try:
+            if method == 'POST':
+                resp = pooled_post(url, json=body, headers=headers,
+                                   timeout=self.HTTP_TIMEOUT)
+            else:
+                resp = pooled_get(url, headers=headers, timeout=self.HTTP_TIMEOUT)
+        except Exception as e:
+            return None, {'message': f'{type(e).__name__}: {e}'[:300]}
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {}
+        return resp.status_code, data if isinstance(data, (dict, list)) else {}
+
+    def create_payment(self, payment_request: PaymentRequest) -> Dict[str, Any]:
+        """Create a payment link for ``payment_request`` (POST /pg/links).
+
+        The payer's name, phone and email come from the payment's metadata
+        (create_payment_link writes them).  Partial payments are off and
+        Cashfree sends no SMS or email: the agent hands the link over in
+        its own reply.  notify_url is this node's webhook when it has an
+        https public address (Cashfree requires https there); otherwise the
+        confirmation comes from a webhook registered in Cashfree's dashboard
+        or from check_payment_link.  Returns ``transaction_id`` (the link_id)
+        and ``redirect_url`` (the link) on success.
+        """
+        if not self.connect():
+            return {'success': False, 'error': 'Cashfree gateway not connected'}
+        meta = payment_request.metadata or {}
+        link_id = cashfree_link_id(payment_request.payment_id)
+        customer = {'customer_phone': str(meta.get('payer_phone') or '')}
+        if meta.get('payer_name'):
+            customer['customer_name'] = str(meta['payer_name'])[:100]
+        if meta.get('payer_email'):
+            customer['customer_email'] = str(meta['payer_email'])
+        # Up to five string pairs; nothing about the payer or a child.
+        notes = {'hartos_payment_id': payment_request.payment_id}
+        for key in ('client_id', 'plan', 'period'):
+            if meta.get(key):
+                notes[key] = str(meta[key])[:100]
+        body = {
+            'link_id': link_id,
+            'link_amount': float(payment_request.amount.quantize(Decimal('0.01'))),
+            'link_currency': payment_request.currency,
+            'link_purpose': str(payment_request.description or '')[:500],
+            'customer_details': customer,
+            'link_partial_payments': False,
+            'link_notify': {'send_sms': False, 'send_email': False},
+            'link_notes': notes,
+        }
+        base = internet_base_url()
+        if base.startswith('https://'):
+            body['link_meta'] = {'notify_url': base + CASHFREE_WEBHOOK_PATH}
+        else:
+            logger.warning('ap2: Cashfree link %s has no notify_url: this node has no '
+                           'https public address (set %s); its payment is confirmed '
+                           'by a webhook registered in the Cashfree dashboard or by '
+                           'check_payment_link', link_id, PUBLIC_URL_VAR)
+        status, data = self._request('POST', self.LINKS_ENDPOINT, body,
+                                     idempotency_key=payment_request.payment_id)
+        if status is None:
+            return {'success': False,
+                    'error': f'Cashfree could not be reached: {data["message"]}'}
+        if status != 200 or not isinstance(data, dict) or not data.get('link_url'):
+            return {'success': False, 'http_status': status,
+                    'error': f'Cashfree refused the link: {self._refusal(status, data)}'}
+        return {'success': True,
+                'transaction_id': data.get('link_id') or link_id,
+                'status': 'pending',
+                'redirect_url': data['link_url'],
+                'cf_link_id': data.get('cf_link_id'),
+                'link_status': data.get('link_status'),
+                'link_expiry_time': data.get('link_expiry_time')}
+
+    def fetch_link(self, link_id: str) -> Dict[str, Any]:
+        """Cashfree's own word on a link (GET /pg/links/{link_id}):
+        ``{'success': True, 'link': {...}}``, or ``success`` False with
+        ``reachable`` False when Cashfree could not be asked."""
+        from urllib.parse import quote
+        status, data = self._request('GET', f'{self.LINKS_ENDPOINT}/{quote(link_id, safe="")}')
+        if status is None:
+            return {'success': False, 'reachable': False, 'error': data['message']}
+        if status != 200 or not isinstance(data, dict):
+            return {'success': False, 'reachable': True, 'http_status': status,
+                    'error': self._refusal(status, data)}
+        return {'success': True, 'link': data}
+
+    def paid_orders(self, link_id: str) -> List[Dict[str, Any]]:
+        """The PAID orders of a link (GET /pg/links/{link_id}/orders, whose
+        default is PAID); [] when they could not be read."""
+        from urllib.parse import quote
+        status, data = self._request(
+            'GET', f'{self.LINKS_ENDPOINT}/{quote(link_id, safe="")}/orders')
+        if status != 200 or not isinstance(data, list):
+            logger.warning('ap2: Cashfree orders of link %s could not be read (HTTP %s)',
+                           link_id, status)
+            return []
+        return [o for o in data if isinstance(o, dict)
+                and str(o.get('order_status') or '').upper() == 'PAID']
+
+    def capture_payment(self, payment_id: str, gateway_transaction_id: str) -> Dict[str, Any]:
+        """Confirm a link is paid: the money moves when the payer pays, so
+        "capture" is Cashfree's PAID status."""
+        looked = self.fetch_link(gateway_transaction_id)
+        if not looked['success']:
+            return {'success': False, 'error': looked['error']}
+        state = str(looked['link'].get('link_status') or '').upper()
+        if state == 'PAID':
+            return {'success': True, 'status': 'captured', 'gateway_response': looked['link']}
+        return {'success': False, 'status': state or 'unknown',
+                'error': f'Cashfree link status {state or "unknown"}'}
+
+    def refund_payment(self, payment_id: str, gateway_transaction_id: str,
+                       amount: Optional[Decimal] = None) -> Dict[str, Any]:
+        """Not wired: a person refunds from the Cashfree merchant dashboard."""
+        return {'success': False,
+                'error': 'Cashfree refunds are made from the Cashfree merchant dashboard'}
+
+    def webhook_refusal(self, raw_body: bytes, timestamp: str, signature: str,
+                        now: Optional[float] = None) -> Optional[str]:
+        """Why a webhook is not Cashfree's, or None when it is.
+
+        Cashfree's scheme: base64(HMAC-SHA256(x-webhook-timestamp + raw body,
+        client secret)) in x-webhook-signature, compared in constant time
+        over the body exactly as received.  The timestamp (milliseconds) must
+        be within CASHFREE_WEBHOOK_MAX_AGE_S of ``now`` either way, so a
+        captured delivery cannot be replayed later."""
+        secret = self.secret_key
+        if not secret:
+            return 'no secret key is set'
+        ts = str(timestamp or '').strip()
+        sig = str(signature or '').strip()
+        if not raw_body or not ts or not sig:
+            return 'the body, x-webhook-timestamp or x-webhook-signature is missing'
+        if not ts.isdigit():
+            return 'x-webhook-timestamp is not a number'
+        expected = base64.b64encode(hmac.new(
+            secret.encode('utf-8'), ts.encode('utf-8') + raw_body,
+            hashlib.sha256).digest())
+        if not hmac.compare_digest(expected, sig.encode('utf-8')):
+            return 'the signature does not match'
+        age_s = abs((time.time() if now is None else now) - int(ts) / 1000.0)
+        if age_s > CASHFREE_WEBHOOK_MAX_AGE_S:
+            return f'the timestamp is {int(age_s)} s away from now'
+        return None
+
+
+def cashfree_gateway(ledger: 'PaymentLedger') -> Optional[CashfreePaymentGateway]:
+    """The ledger's Cashfree connector while its credentials are set, else
+    None.  A key the owner entered after boot registers it here, so the
+    first payment link after the entry works with no restart (task #216's
+    rule, for this rail)."""
+    with ledger.lock:
+        gateway = ledger.gateways.get(PaymentGateway.CASHFREE)
+    if gateway is None:
+        gateway = CashfreePaymentGateway()
+        if not gateway.connect():
+            return None
+        ledger.add_gateway(gateway)
+        return gateway
+    return gateway if gateway.connect() else None
+
+
 class PaymentLedger:
     """
     Payment transaction ledger with audit trail
@@ -948,6 +1269,17 @@ class PaymentLedger:
                         "failed — staying on existing gateways")
         except Exception as _phonepe_err:
             logger.debug(f"PaymentLedger: phonepe auto-register skipped: {_phonepe_err}")
+
+        # Cashfree when its credentials are set at boot, the same rule as
+        # above; a key entered later registers on first use (cashfree_gateway).
+        try:
+            _cashfree_gateway = CashfreePaymentGateway()
+            if _cashfree_gateway.connect():
+                self.add_gateway(_cashfree_gateway)
+                logger.info("PaymentLedger: Cashfree gateway auto-registered "
+                            f"({_cashfree_gateway.env} mode, payment links)")
+        except Exception as _cashfree_err:
+            logger.warning(f"PaymentLedger: cashfree auto-register skipped: {_cashfree_err}")
 
         self.load_ledger()
         self._merge_legacy()
@@ -1256,6 +1588,24 @@ class PaymentLedger:
             self.save_ledger()
             return True
 
+    def revenue(self, period_days: int = 30) -> Dict[str, Decimal]:
+        """The money this node's owner took in through the ledger in the last
+        ``period_days``, by currency: COMPLETED payments of a REVENUE_KINDS
+        kind on a live gateway (never the mock, which moves no money).
+        The ONE reader of "ledger revenue"; revenue_aggregator.
+        query_revenue_streams adds it to the canonical sum.  Counted from
+        completed_at, on the ledger's own clock (datetime.now)."""
+        cutoff = datetime.now() - timedelta(days=period_days)
+        totals: Dict[str, Decimal] = {}
+        with self.lock:
+            for p in self.payments.values():
+                if (p.status == PaymentStatus.COMPLETED
+                        and p.gateway not in (None, PaymentGateway.MOCK)
+                        and (p.metadata or {}).get('kind') in REVENUE_KINDS
+                        and p.completed_at is not None and p.completed_at >= cutoff):
+                    totals[p.currency] = totals.get(p.currency, Decimal('0')) + p.amount
+        return totals
+
     def list_payments(
         self,
         agent_id: Optional[str] = None,
@@ -1416,6 +1766,95 @@ def get_payment_ledger() -> PaymentLedger:
     did not exist, so every ``hart pay`` command reported "AP2 not
     available"."""
     return payment_ledger
+
+
+def _money(value) -> Optional[Decimal]:
+    """A Cashfree amount (a JSON number or string) as rupees and paise, or
+    None when it is not a number."""
+    try:
+        return Decimal(str(value)).quantize(Decimal('0.01'))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def settle_cashfree_link(link_id: str, ledger: 'PaymentLedger',
+                         transaction_id: Optional[str] = None) -> Dict[str, Any]:
+    """Record what Cashfree says of payment link ``link_id``: the ONE
+    finalizer, shared by the signed webhook (commercial_api.cashfree_webhook)
+    and the agents' check_payment_link.
+
+    Nothing a webhook body says about the money is believed: Cashfree is
+    asked (fetch_link), as the PhonePe callback asks PhonePe.  Paid in full,
+    in the link's currency: the payment COMPLETES once (complete_once; a
+    redelivery or a concurrent check answers already_completed and records
+    nothing again) with its transaction id: ``transaction_id`` (the signed
+    webhook's order.transaction_id) or else the paid order's id.  Paid
+    another amount: FAILED with MONEY_TAKEN and a reconciliation line, never
+    revenue.  Expired or cancelled: so marked.  Not paid yet: left waiting.
+    ``retry`` True means Cashfree could not be asked, so the webhook answers
+    non-2xx and Cashfree delivers again.
+    """
+    payment = ledger.find_by_gateway_transaction(link_id)
+    if payment is None or payment.gateway != PaymentGateway.CASHFREE:
+        return {'status': 'not_ours', 'retry': False}
+    out = {'payment_id': payment.payment_id, 'retry': False}
+    if payment.status == PaymentStatus.COMPLETED:
+        return dict(out, status='already_completed')
+    if payment.status != PaymentStatus.PROCESSING:
+        return dict(out, status=payment.status.value)
+    gateway = cashfree_gateway(ledger)
+    if gateway is None:
+        refuse_no_live_gateway('cashfree', (payment.metadata or {}).get('user_id'),
+                               payment.payment_id, settings=CASHFREE_SETTINGS)
+        return dict(out, status='not_configured', retry=True)
+    looked = gateway.fetch_link(link_id)
+    if not looked['success']:
+        logger.warning('ap2: Cashfree link %s could not be checked (%s); payment %s '
+                       'stays waiting', link_id, looked['error'], payment.payment_id)
+        return dict(out, status='status_check_failed', retry=True)
+    link = looked['link']
+    state = str(link.get('link_status') or '').upper()
+    if state == 'PAID':
+        paid = _money(link.get('link_amount_paid'))
+        currency = str(link.get('link_currency') or '').upper()
+        expected = payment.amount.quantize(Decimal('0.01'))
+        if paid != expected or currency != payment.currency:
+            logger.error('MANUAL RECONCILIATION NEEDED: Cashfree link %s paid %s %s for '
+                         'payment %s, which asked %s %s; not counted', link_id,
+                         link.get('link_amount_paid'), currency, payment.payment_id,
+                         expected, payment.currency)
+            with ledger.lock:
+                if payment.status == PaymentStatus.PROCESSING:
+                    payment.update_status(
+                        PaymentStatus.FAILED,
+                        f'amount mismatch: paid {link.get("link_amount_paid")} {currency}, '
+                        f'asked {expected} {payment.currency}')
+                    payment.metadata = {**(payment.metadata or {}), MONEY_TAKEN: True}
+                    ledger.save_ledger()
+            return dict(out, status='amount_mismatch')
+        orders = gateway.paid_orders(link_id)
+        order_id = (orders[0].get('cf_order_id') or orders[0].get('order_id')) if orders else None
+        txn = str(transaction_id) if transaction_id else (str(order_id) if order_id else None)
+        if txn is None:
+            logger.warning('ap2: Cashfree link %s is paid but no transaction id could be '
+                           'read; payment %s is recorded without one', link_id,
+                           payment.payment_id)
+        with ledger.lock:
+            if payment.status == PaymentStatus.PROCESSING:
+                payment.metadata = {**(payment.metadata or {}), 'transaction_id': txn,
+                                    'cashfree_order_id': str(order_id) if order_id else None}
+        done = ledger.complete_once(payment.payment_id, 'Cashfree payment link paid')
+        return dict(out, status='completed' if done else 'already_completed',
+                    transaction_id=txn)
+    if state in ('EXPIRED', 'CANCELLED'):
+        with ledger.lock:
+            if payment.status == PaymentStatus.PROCESSING:
+                payment.update_status(PaymentStatus.EXPIRED if state == 'EXPIRED'
+                                      else PaymentStatus.CANCELLED,
+                                      f'Cashfree link {state.lower()}')
+                ledger.save_ledger()
+        return dict(out, status=state.lower())
+    return dict(out, status='pending', link_status=state or 'unknown')
 
 
 def create_payment_request_function(agent_name: str,
@@ -1614,6 +2053,200 @@ def create_payment_processing_function() -> Callable:
     return process_payment
 
 
+#: What the agent is told when no payment link can be made: no setting named
+#: (the person reads the agent's reply), and the owner has been asked.
+_NO_CASHFREE = ('payment links cannot be made yet: this node has no Cashfree '
+                'account set up. The owner has been asked for the Cashfree keys; '
+                'no link was made and nobody was charged. Tell the payer the link '
+                'will follow, then try again later.')
+
+
+def _ask_owner_for_cashfree(missing: List[str]) -> None:
+    """Ask this computer's owner for each missing Cashfree credential through
+    the one credential ask (hartos.ai_key_vault.request_credential: a
+    consent card, the value kept in the vault).  tell_alias False: the
+    gateway reads the value itself, so the agent is never handed an alias."""
+    from hartos.ai_key_vault import request_credential
+    labels = {CASHFREE_APP_ID: 'Cashfree App ID', CASHFREE_SECRET_KEY: 'Cashfree Secret Key'}
+    for name in missing:
+        try:
+            request_credential(json.dumps({
+                'resource_type': 'api_key', 'key_name': name,
+                'label': labels.get(name, name),
+                'service': 'Cashfree Payments (merchant.cashfree.com)',
+                'used_by': 'payment links that sales and customer-care agents send',
+                'description': 'so payers can pay through a Cashfree payment link',
+                'where_to_get': 'Cashfree Merchant Dashboard, Payment Gateway, '
+                                'Developers, API Keys'}), tell_alias=False)
+        except Exception:
+            logger.exception('ap2: the owner could not be asked for %s', name)
+
+
+def _digits(text) -> str:
+    return ''.join(ch for ch in str(text or '') if ch.isdigit())
+
+
+def create_payment_link_function(agent_name: str,
+                                 user_id: Optional[str] = None) -> Callable:
+    """The ``create_payment_link`` tool: a Cashfree link a named payer opens
+    to pay this node's owner, recorded in the ledger with the owner's billing
+    fields (PAYMENT_LINK_RECORD_FIELDS)."""
+
+    def create_payment_link(
+        payer_name: str,
+        payer_phone: str,
+        amount_inr: float,
+        purpose: str,
+        plan: str = '',
+        period: str = '',
+        next_due_date: str = '',
+        child_name: str = '',
+        client_id: str = '',
+        payer_email: str = '',
+    ) -> str:
+        """
+        Make a payment link the payer opens to pay, and record it.
+
+        Args:
+            payer_name: Who pays (a centre's name, or a parent's name)
+            payer_phone: The payer's phone number (Cashfree needs it)
+            amount_inr: The amount in rupees, up to two decimals
+            purpose: What the payment is for; the payer sees it
+            plan: The plan bought, e.g. 'speech therapy pilot'
+            period: The period it covers, e.g. '2026-12'
+            next_due_date: When the next payment is due, YYYY-MM-DD
+            child_name: The child it is for, when there is one
+            client_id: The centre's client ID the payment runs under
+            payer_email: The payer's email, optional
+
+        Returns:
+            JSON with link_url to send to the payer, and payment_id
+        """
+        name = str(payer_name or '').strip()
+        phone = _digits(payer_phone)
+        what = str(purpose or '').strip()
+        problems = []
+        if not name:
+            problems.append('payer_name is empty')
+        if not 10 <= len(phone) <= 15:
+            problems.append('payer_phone needs 10 to 15 digits')
+        if not what:
+            problems.append('purpose is empty')
+        try:
+            amount = Decimal(str(amount_inr))
+            if not amount.is_finite() or amount <= 0 or amount != amount.quantize(Decimal('0.01')):
+                problems.append('amount_inr must be more than 0 with at most two decimals')
+        except (InvalidOperation, TypeError, ValueError):
+            amount = None
+            problems.append('amount_inr is not a number')
+        due = str(next_due_date or '').strip()
+        if due:
+            try:
+                due = date.fromisoformat(due).isoformat()
+            except ValueError:
+                problems.append('next_due_date must be a date as YYYY-MM-DD')
+        if problems:
+            return json.dumps({'success': False, 'error': '; '.join(problems)
+                               + '. Nothing was made; fix these and call again.'}, indent=2)
+
+        ledger = get_payment_ledger()
+        gateway = cashfree_gateway(ledger)
+        if gateway is None:
+            refuse_no_live_gateway('cashfree', user_id, settings=CASHFREE_SETTINGS)
+            _ask_owner_for_cashfree(CashfreePaymentGateway().missing_settings())
+            return json.dumps({'success': False, 'error': _NO_CASHFREE}, indent=2)
+
+        record = {
+            'kind': PAYMENT_LINK_KIND,
+            'user_id': str(user_id) if user_id else None,
+            'payer_name': name, 'payer_phone': phone,
+            'payer_email': str(payer_email or '').strip() or None,
+            'child': str(child_name or '').strip() or None,
+            'plan': str(plan or '').strip() or None,
+            'period': str(period or '').strip() or None,
+            'next_due_date': due or None,
+            'transaction_id': None,
+            'client_id': str(client_id or '').strip() or None,
+        }
+        payment = ledger.create_payment_request(
+            amount=amount, currency='INR', description=what[:500],
+            requester_agent_id=agent_name, gateway=PaymentGateway.CASHFREE,
+            metadata=record)
+        made = gateway.create_payment(payment)
+        with ledger.lock:
+            if not made.get('success'):
+                payment.update_status(PaymentStatus.FAILED, made.get('error'))
+            else:
+                payment.gateway_transaction_id = made['transaction_id']
+                payment.metadata = {**(payment.metadata or {}),
+                                    'link_url': made['redirect_url'],
+                                    'cf_link_id': made.get('cf_link_id'),
+                                    'link_expiry_time': made.get('link_expiry_time')}
+                payment.update_status(PaymentStatus.PROCESSING,
+                                      'awaiting payment on the Cashfree link')
+            ledger.save_ledger()
+        if not made.get('success'):
+            return json.dumps({'success': False, 'payment_id': payment.payment_id,
+                               'error': f"no link was made: {made.get('error')}"}, indent=2)
+        return json.dumps({
+            'success': True,
+            'payment_id': payment.payment_id,
+            'link_url': made['redirect_url'],
+            'amount': str(amount.quantize(Decimal('0.01'))),
+            'currency': 'INR',
+            'expires_at': made.get('link_expiry_time'),
+            'message': 'Send link_url to the payer in your reply. The payment is '
+                       'recorded when Cashfree confirms it; check_payment_link '
+                       'with this payment_id says whether it is paid.'}, indent=2)
+
+    # The payer's contact details and the child's name stay in the ledger
+    # file: the tool-execution log line withholds them (core.tool_logging).
+    from core.tool_logging import PRIVATE_ARGUMENTS_ATTR
+    setattr(create_payment_link, PRIVATE_ARGUMENTS_ATTR,
+            ('payer_name', 'payer_phone', 'payer_email', 'child_name'))
+    return create_payment_link
+
+
+def check_payment_link_function(user_id: Optional[str] = None) -> Callable:
+    """The ``check_payment_link`` tool: asks Cashfree whether a link this
+    node made is paid, through the one finalizer (settle_cashfree_link), so
+    a payment is recorded even when no webhook reaches the node."""
+
+    def check_payment_link(payment_id: str) -> str:
+        """
+        Say whether a payment link has been paid.
+
+        Args:
+            payment_id: The payment_id create_payment_link returned
+
+        Returns:
+            JSON with status ('completed' means paid) and transaction_id
+        """
+        ledger = get_payment_ledger()
+        payment = ledger.get_payment(str(payment_id or '').strip())
+        meta = (payment.metadata or {}) if payment is not None else {}
+        if (payment is None or meta.get('kind') != PAYMENT_LINK_KIND
+                or (user_id and meta.get('user_id') not in (None, str(user_id)))):
+            return json.dumps({'success': False, 'error': 'no payment link has that '
+                               'payment_id; use the one create_payment_link returned'},
+                              indent=2)
+        settled = {}
+        if payment.status == PaymentStatus.PROCESSING and payment.gateway_transaction_id:
+            settled = settle_cashfree_link(payment.gateway_transaction_id, ledger)
+        payment = ledger.get_payment(payment.payment_id)
+        meta = payment.metadata or {}
+        body = {'success': True, 'payment_id': payment.payment_id,
+                'status': payment.status.value,
+                'paid': payment.status == PaymentStatus.COMPLETED,
+                'amount': str(payment.amount), 'currency': payment.currency,
+                'transaction_id': meta.get('transaction_id')}
+        if settled.get('retry'):
+            body['note'] = 'Cashfree could not be asked just now; try again later'
+        return json.dumps(body, indent=2)
+
+    return check_payment_link
+
+
 def get_ap2_tools_for_autogen(agent_name: str,
                               user_id: Optional[str] = None,
                               allow_llm_authorize: Optional[bool] = None
@@ -1661,6 +2294,21 @@ def get_ap2_tools_for_autogen(agent_name: str,
             'function': create_payment_processing_function(),
             'name': 'process_payment',
             'description': 'Process a payment the person has approved (approving usually completes it already). Requires payment_id.'
+        },
+        {
+            'function': create_payment_link_function(agent_name, user_id),
+            'name': 'create_payment_link',
+            'description': ('Make a Cashfree payment link a customer (a centre or a '
+                            'family) opens to pay in rupees, and send its link_url in '
+                            'your reply. Needs payer_name, payer_phone, amount_inr and '
+                            'purpose; also records plan, period, next_due_date, '
+                            'child_name and client_id.')
+        },
+        {
+            'function': check_payment_link_function(user_id),
+            'name': 'check_payment_link',
+            'description': ('Say whether a payment link from create_payment_link has '
+                            'been paid. Requires payment_id.')
         }
     ]
 
@@ -1677,6 +2325,10 @@ __all__ = [
     'PHONEPE_RETURN_PATH', 'PHONEPE_SENT_AMOUNT_KEY',
     'mock_settlement_allowed', 'mock_would_settle', 'NO_LIVE_GATEWAY',
     'LIVE_GATEWAY_SETTINGS', 'NO_LIVE_GATEWAY_REASON', 'refuse_no_live_gateway',
+    'CashfreePaymentGateway', 'cashfree_gateway', 'settle_cashfree_link',
+    'create_payment_link_function', 'check_payment_link_function',
+    'CASHFREE_WEBHOOK_PATH', 'CASHFREE_SETTINGS', 'PAYMENT_LINK_KIND',
+    'REVENUE_KINDS', 'operator_usd_inr_rate',
 ]
 
 
@@ -1684,7 +2336,11 @@ __all__ = [
 # owner stored in the vault is delivered there for these names
 # (hartos.ai_key_vault.reads_from_env); tests/unit/
 # test_env_secrets_declared.py fails on a secret read not declared.
+# The Cashfree App ID is not secret, but the owner enters it on the same
+# card, so it is delivered the same way.
 ENV_SECRETS = (
+    'CASHFREE_APP_ID',
+    'CASHFREE_SECRET_KEY',
     'PHONEPE_SALT_KEY',
     'STRIPE_API_KEY',
     'STRIPE_WEBHOOK_SECRET',

@@ -137,6 +137,63 @@ def get_registered_types() -> List[str]:
     return list(_prompt_builders.keys())
 
 
+def daemon_turn_stored_tags(stored_tags, request_id):
+    """The stored goal tags this turn's agent is resolved with
+    (marketing_tools.resolve_goal_tags' first argument): the agent record's
+    own ``stored_tags``, plus, on this node's own daemon turn for a goal, the
+    tool tags of that goal's TYPE (get_tool_tags, the per-type table
+    register_goal_type fills).  Both builders resolve with it,
+    create_recipe.create_agents and reuse_recipe.create_agents_for_user, so
+    the goal type's tags are resolved like the record's own: unioned with the
+    words, under resolve_goal_tags' rules, and seen alike by the Tier-1
+    service filter, the per-turn attach ledger and the Tier-2 family loaders.
+    The record's own value still goes, unchanged, wherever the builders pass
+    it on (the per-turn attach, her Reel Studio family).
+
+    Measured on central 2026-11-16 (#284): an outreach goal's agent record
+    stores no goal_tags and its words name no family, so its turns ran
+    without the CRM tools its prompt names ("no tool named
+    get_pipeline_status is registered with this agent", 32 times in 25
+    minutes).  The goal's type is the one rule: AgentGoal.goal_type from the
+    goal's row, never the turn's words and never the request body.
+
+    ``request_id`` is the turn's id (daemon_<goal id> on a goal turn).  A
+    client can name that id, so the type's tags are added only when
+    core.chat_client.is_own_daemon_turn says this node's own dispatch started
+    the turn.  Anything else (a person's turn, a client naming a goal's id, a
+    goal with no row, a row that cannot be read) returns ``stored_tags``
+    itself, unchanged."""
+    from core.chat_client import daemon_goal_id, is_own_daemon_turn
+    goal_id = daemon_goal_id(request_id)
+    if goal_id is None:
+        return stored_tags
+    if not is_own_daemon_turn(request_id):
+        logger.info("turn %s names goal %s but this node's dispatch did not "
+                    "start it: the goal type's tools are not added",
+                    request_id, goal_id)
+        return stored_tags
+    try:
+        from integrations.social.models import AgentGoal, db_session
+        with db_session(commit=False) as db:
+            row = db.query(AgentGoal.goal_type).filter(
+                AgentGoal.id == goal_id).first()
+    except Exception as e:
+        logger.warning("goal %s unreadable, its daemon turn is built without "
+                       "its goal type's tools: %s", goal_id, e)
+        return stored_tags
+    type_tags = get_tool_tags(row[0]) if row and row[0] else []
+    if not type_tags:
+        return stored_tags
+    # The record's own tags as resolve_goal_tags reads them: a list of
+    # names; anything else (user-writable JSON) is not tags.
+    own = ([t for t in stored_tags if isinstance(t, str) and t]
+           if isinstance(stored_tags, (list, tuple, set, frozenset)) else [])
+    tags = sorted(set(own) | set(type_tags))
+    logger.info("daemon turn of goal %s (%s): stored goal tags %s", goal_id,
+                row[0], tags)
+    return tags
+
+
 # ─── Prompt Injection Sanitization ───
 
 # Patterns that indicate potential prompt injection in goal titles/descriptions
@@ -285,8 +342,41 @@ def is_dispatch_failure_pause_reason(reason) -> bool:
     return text.startswith(prefix) and words in text
 
 
+#: The goal config keys that hold the owner's verification of a goal's
+#: follow-up copy: ``verified_copy`` (the content hash of each verified
+#: step, read by outreach_crm_tools.goal_sender) and the record of who
+#: verified and when.  Exactly one writer sets them,
+#: outreach_crm_tools.mark_goal_copy_verified, after the owner/admin gate of
+#: its route.  A goal's config is client input (POST /api/goals stores the
+#: body's), so a config that arrived holding them would start its sequences
+#: active with nobody having verified anything (review of c6343fb17).  Every
+#: other writer neither adds, changes nor drops them: create_goal strips
+#: them, update_goal keeps what is stored (GoalManager._config_keeping_verified_copy).
+VERIFIED_COPY_KEYS = frozenset({
+    'verified_copy', 'copy_verified', 'copy_verified_by', 'copy_verified_at'})
+
+
+def without_verified_copy(config) -> Dict:
+    """``config`` as a new dict without the VERIFIED_COPY_KEYS."""
+    return {k: v for k, v in (config or {}).items() if k not in VERIFIED_COPY_KEYS}
+
+
 class GoalManager:
     """Unified CRUD for agent goals. All execution goes through /chat."""
+
+    @staticmethod
+    def _config_keeping_verified_copy(stored, incoming, verified=None) -> Dict:
+        """The config to store: ``incoming`` with the VERIFIED_COPY_KEYS
+        taken from ``stored`` (what the goal holds now), whatever
+        ``incoming`` says about them.  ``verified`` (a dict of those keys) is
+        the one writer's own values, laid over last."""
+        config = without_verified_copy(incoming)
+        for key in VERIFIED_COPY_KEYS:
+            if key in (stored or {}):
+                config[key] = stored[key]
+        config.update({k: v for k, v in (verified or {}).items()
+                       if k in VERIFIED_COPY_KEYS})
+        return config
 
     @staticmethod
     def create_goal(db: Session, goal_type: str, title: str,
@@ -311,6 +401,9 @@ class GoalManager:
             except Exception:
                 pass  # Rate limiter unavailable — allow through
 
+        # The caller's config is client input: the owner's verification of
+        # the goal's copy is not something it can arrive holding.
+        config = without_verified_copy(config)
         goal_dict = {'title': title, 'description': description,
                      'config': config or {}, 'goal_type': goal_type}
 
@@ -527,6 +620,7 @@ class GoalManager:
         db: Session,
         goal_id: str,
         _skip_consensus: bool = False,
+        _verified_copy: Optional[Dict] = None,
         **kwargs,
     ) -> Dict:
         """Update goal fields.
@@ -616,6 +710,14 @@ class GoalManager:
                     'error': f'consensus error: {exc}',
                 }
 
+        # The owner's verification of the goal's copy has ONE writer: a
+        # caller's config_json never adds, changes or drops it (the stored
+        # values stay), and only mark_goal_copy_verified passes
+        # ``_verified_copy``, its own values for those keys.
+        if 'config_json' in kwargs or _verified_copy is not None:
+            kwargs['config_json'] = GoalManager._config_keeping_verified_copy(
+                goal.config_json, kwargs.get('config_json', goal.config_json),
+                _verified_copy)
         for key, value in kwargs.items():
             if hasattr(goal, key):
                 setattr(goal, key, value)
