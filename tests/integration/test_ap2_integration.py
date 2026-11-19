@@ -204,13 +204,15 @@ def test_autogen_tool_functions():
     # ledger refuses 'system' / the requesting agent as an approver anyway.
     tools = get_ap2_tools_for_autogen("test_agent", allow_llm_authorize=False)
 
-    assert len(tools) == 3  # request, authorize (ask-only), process
+    # request, authorize (ask-only), process, and the Cashfree payment link pair
+    assert len(tools) == 5
     assert all('function' in tool for tool in tools)
     assert all('name' in tool for tool in tools)
     assert all('description' in tool for tool in tools)
 
     tool_names = [tool['name'] for tool in tools]
-    assert tool_names == ['request_payment', 'authorize_payment', 'process_payment']
+    assert tool_names == ['request_payment', 'authorize_payment', 'process_payment',
+                          'create_payment_link', 'check_payment_link']
     ask = next(t for t in tools if t['name'] == 'authorize_payment')
     assert 'cannot approve' in ask['description']
 

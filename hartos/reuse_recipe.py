@@ -403,6 +403,7 @@ from hartos.lifecycle_hooks import (
     hand_goal_to_its_person,
     mark_action_waiting_for_user, resume_from_user_input,
     record_ask_delivered, ledger_open_ask, person_waits_on, is_terminal_state,
+    record_user_answer,
 )
 from hartos.cultural_wisdom import get_cultural_prompt
 
@@ -435,7 +436,14 @@ from core.cache_loaders import load_agent_data, load_user_ledger, load_recipe, l
 
 config = _get_config()
 STUDENT_API = config.get('STUDENT_API', '')
-ACTION_API = config.get('ACTION_API', '')
+# A configured value first; else the one resolver (core.config_cache), which on
+# a desktop is this node's own /create_action.  The raw read was '' on every
+# desktop, so the 2 s camera poll and every flow's visual task never ran while
+# the desktop's own caption server was writing 'Video Reasoning' rows (live
+# 2026-11-16: 500 rows, 'Skipping 2s visual-poll job' 7 times in one day).
+# Off the desktop nothing changes: a node without the key keeps ''.
+from core.config_cache import get_action_api as _get_action_api, is_bundled as _is_bundled
+ACTION_API = config.get('ACTION_API') or (_get_action_api() if _is_bundled() else '')
 
 def parse_date(date_str):
     return datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%S")
@@ -1197,6 +1205,25 @@ def execute_python_file(task_description: str, user_id: int, prompt_id: int, act
 _VISUAL_POLL_PAUSE_S = 300
 _visual_poll_paused_until: dict = {}
 
+# One visual turn at a time per person and agent: (str(user_id),
+# str(prompt_id)) -> time.monotonic() when visual_based_execution began it,
+# removed when it ends.  The turn runs inside the /visual_agent request, so a
+# poll whose POST stopped waiting (it waited 15 s) used to post again on the
+# next 2 s tick while the first turn still ran (review of 25758b0f7).  Older
+# than the turn budget, a mark is ignored, so a turn that never ended does
+# not stop the poll for good.
+_VISUAL_TURN_MAX_S = 300
+_visual_turn_running: dict = {}
+# The check and the mark are one step (review of 06f4aaea9, S1b): the
+# visual_poll_ and visual_task_ jobs of one person and agent fire together,
+# and both POSTs found no mark and started a turn each.
+_visual_turn_lock = threading.Lock()
+
+
+def _visual_turn_is_running(user_id, prompt_id) -> bool:
+    started = _visual_turn_running.get((str(user_id), str(prompt_id)))
+    return started is not None and time.monotonic() - started < _VISUAL_TURN_MAX_S
+
 
 def call_visual_task(task_description: str, user_id: int, prompt_id: int):
     # NOTE on logging: this function runs inside the APScheduler
@@ -1217,6 +1244,10 @@ def call_visual_task(task_description: str, user_id: int, prompt_id: int):
     # box-busy → governor-throttle which starves the flywheel.  The visual
     # task cannot work without the action API, so skip cheaply.
     if not ACTION_API:
+        return None
+    # A visual turn for this person and agent is still running: nothing to
+    # post, and nothing to log every 2 s.
+    if _visual_turn_is_running(user_id, prompt_id):
         return None
 
     headers = {'Content-Type': 'application/json'}
@@ -1253,14 +1284,14 @@ def call_visual_task(task_description: str, user_id: int, prompt_id: int):
                         if created_date.tzinfo is not None:
                             created_date = created_date.astimezone(pytz.utc).replace(tzinfo=None)
 
-                        # Check if within last 5 minutes
+                        # Check if within last 5 minutes.  No line per
+                        # caption: a desktop keeps hundreds of them and this
+                        # runs every 2 s (review of 25758b0f7: 500 old rows
+                        # gave 502 INFO lines a poll); the dispatch line
+                        # below says how many were recent.
                         time_diff = now_utc - created_date
-                        logger.info(
-                            f"Found video Reasoning entry: {obj['action']} (created {time_diff} ago)")
                         if time_diff <= timedelta(minutes=5):
                             recent_video_reasoning_entries.append(obj)
-                            logger.info(
-                                f"Found recent Video Reasoning entry: {obj['action']} (created {time_diff} ago)")
                     except (ValueError, KeyError) as e:
                         logger.warning(f"Error parsing date for entry {obj.get('action_id')}: {e}")
                         continue
@@ -1277,16 +1308,32 @@ def call_visual_task(task_description: str, user_id: int, prompt_id: int):
                     'request_from': 'Reuse'
                 })
 
+                # The visual turn runs inside this request and marks itself
+                # running (_visual_turn_running), so a POST that stops waiting
+                # before the turn ends no longer leads the next tick to start a
+                # second one; that read timeout is a turn still running, not a
+                # failure (review of 25758b0f7).
+                import requests as _requests
                 try:
-                    # Send the POST request to the visual agent
                     res = pooled_post(url, data=data_to_send, headers=headers)
                     logger.info(f"Visual agent response: {res.status_code}")
                     return 'done'
+                except _requests.exceptions.ReadTimeout:
+                    # Started only if the server's turn marked itself
+                    # running: a server that never began the turn timed out
+                    # too (review of 06f4aaea9, S1a).
+                    if _visual_turn_is_running(user_id, prompt_id):
+                        logger.info("Visual task started; it runs on in the server")
+                        return 'done'
+                    logger.error(f"Visual agent did not answer in time and no visual "
+                                 f"turn is running for {user_id}_{prompt_id}")
+                    return 'error'
                 except Exception as e:
                     logger.error(f"Failed to call visual agent: {e}")
                     return 'error'
             else:
-                logger.info(
+                # Every 2 s on every desktop with the camera off: not INFO.
+                logger.debug(
                     "No recent Video Reasoning entries found (within last 5 minutes) - skipping visual task")
                 return None
 
@@ -1375,6 +1422,30 @@ def get_action_user_details(user_id):
 
 
 def visual_based_execution(task_description: str, user_id: int, prompt_id: int):
+    """One visual turn for a person and agent, marked running while it runs
+    so the 2 s camera poll (call_visual_task) starts no second one.  A turn
+    that finds another one running does not start, and a turn clears only
+    its own mark (review of 06f4aaea9, S1b: the second turn's end cleared
+    the first one's mark while it still ran)."""
+    key = (str(user_id), str(prompt_id))
+    with _visual_turn_lock:
+        if _visual_turn_is_running(user_id, prompt_id):
+            logger.info(f"A visual turn for {user_id}_{prompt_id} is already "
+                        f"running; this one is not started")
+            return 'A visual turn for this agent is already running.'
+        mark = time.monotonic()
+        _visual_turn_running[key] = mark
+    try:
+        return _run_visual_turn(task_description, user_id, prompt_id)
+    finally:
+        with _visual_turn_lock:
+            # 'is': the mark this turn wrote, not an equal clock reading
+            # (Windows' monotonic clock moves in 15.6 ms steps).
+            if _visual_turn_running.get(key) is mark:
+                del _visual_turn_running[key]
+
+
+def _run_visual_turn(task_description: str, user_id: int, prompt_id: int):
     current_app.logger.info(f'INSIDE Visual_BASED_EXECUTION')
     user_prompt = f'{user_id}_{prompt_id}'
 
@@ -5435,12 +5506,23 @@ def _reuse_turn_delivered_send(user_prompt, messages, starts_with=None,
     ("Take your time, Arjun!") is not that question (review of 6e1c93995).
     With ``asks``, the newest delivered send counts only when it asks the
     person something (lifecycle_hooks.send_is_ask), else None: the question
-    an unfinished action waits on (review of 7188e162e)."""
+    an unfinished action waits on (review of 7188e162e).
+
+    An ask_person card still waiting for the person is a send that asks: it
+    reached their devices and its question is open, so its question
+    (_reuse_card_question) counts here as a send that asks would.  Measured
+    live 2026-11-17 09:29:44-09:30:47 IST on build 75 (speech agent
+    1794540972213, local 4B): the steered round put "What is your mother
+    called in Tamil?" on the child's card, then wrote "Good! The person is
+    now being asked the question ..." and ended on a verdict; this reader saw
+    only sends, so that narration was the reply in the chat."""
+    from core.agent_tool_menu import ASK_PERSON_TOOL
     start = _reuse_turn_seed_index(user_prompt, messages)
     if start is None:
         return None
     window = messages[start + 1:]
     call_fn = _reuse_call_id_to_tool_name([window])
+    closed_asks = set()
     for msg in reversed(window):
         m = msg or {}
         if m.get('role') != 'tool':
@@ -5459,7 +5541,76 @@ def _reuse_turn_delivered_send(user_prompt, messages, starts_with=None,
                     if asks and not send_is_ask(window, call_id):
                         return None
                     return text
+            elif call_fn.get(call_id) == ASK_PERSON_TOOL:
+                question = _reuse_card_question(window, call_id, body,
+                                                closed_asks)
+                if question and (starts_with is None
+                                 or question.startswith(str(starts_with).strip())):
+                    return question
     return None
+
+
+def _reuse_card_question(messages, call_id, body, closed_asks):
+    """The question the ask_person call ``call_id`` put on the person's
+    card, when its result ``body`` says the card is on their devices and not
+    answered ('waiting_for_person'); else None.
+
+    The walk that calls this goes newest first, so ``closed_asks`` holds the
+    ask ids a newer result of the tool said are no longer open (answered,
+    dismissed, expired): a card answered later in the turn is not the
+    question.  A call that reads an earlier ask by its ``ask_id`` puts no
+    new card out, so it is never the question; the card's own call is.
+
+    The question is read off the call's own ``component``, the card
+    person_ask showed: a field's label that asks, else its title or reason
+    that asks (an approval asks in its reason), else its reason (a file ask
+    says what it asks for).  Asking means a question mark person_ask itself
+    counts (_QUESTION_MARKS)."""
+    from core.agent_tool_menu import ASK_PERSON_TOOL
+    from integrations.agent_engine.person_ask import _QUESTION_MARKS
+    try:
+        reply = json.loads(body)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(reply, dict):
+        return None
+    ask_id = str(reply.get('ask_id') or '')
+    if reply.get('status') != 'waiting_for_person':
+        if ask_id:
+            closed_asks.add(ask_id)
+        return None
+    if not ask_id or ask_id in closed_asks:
+        return None
+    args = None
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        for tc in (m.get('tool_calls') or []):
+            fn = (tc or {}).get('function') or {}
+            if (tc or {}).get('id') == call_id and fn.get('name') == ASK_PERSON_TOOL:
+                args = fn.get('arguments')
+    try:
+        if isinstance(args, str):
+            args = json.loads(args)
+        if not isinstance(args, dict) or str(args.get('ask_id') or '').strip():
+            return None
+        card = args.get('component')
+        if isinstance(card, str):
+            card = json.loads(card)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(card, dict):
+        return None
+    fields = card.get('fields')
+    labels = ([f.get('label') for f in fields if isinstance(f, dict)]
+              if isinstance(fields, list) else [])
+    texts = [t.strip() for t in (*labels, card.get('title'), card.get('description'))
+             if isinstance(t, str) and t.strip()]
+    asking = next((t for t in texts
+                   if any(mark in t for mark in _QUESTION_MARKS)), None)
+    reason = card.get('description')
+    return asking or (reason.strip() if isinstance(reason, str) and reason.strip()
+                      else None)
 
 # _REUSE_SAVE_ONLY_TOOLS (imported above) is core.constants
 # .BOOKKEEPING_SAVE_TOOLS: the saves of the agent's own notes, whose result
@@ -6506,7 +6657,11 @@ def _advance_or_steer(user_prompt, action_id, reason, prompt_id,
         True  — the next action's message, or a re-steer, was posted; the
                 caller should keep looping.
         False — no next action and nothing to steer; the caller should end
-                the turn.
+                the turn.  Also when the action's question to the person is
+                out and its sub-steps wait for the reply: the four callers
+                `break` to the exit every break reaches, where
+                _reuse_hold_ask_at_turn_exit takes the same wait again (a
+                no-op once held) and nothing records the action or flow done.
 
     False is what a SUCCESSFULLY FINISHED recipe looks like: the last action
     advanced, so there is no next action, and it was not fabricated, so
@@ -6544,13 +6699,32 @@ def _advance_or_steer(user_prompt, action_id, reason, prompt_id,
         if LedgerTaskStatus is not None else []
     if _outstanding:
         _next_sub = _outstanding[0]
+        if advanced_latch is not None:
+            advanced_latch.discard(action_id)
+        # A step whose question to the person is out waits for the answer
+        # before its own sub-steps run: they are the model's split of this
+        # step and some need the reply ("Once the child's name is received,
+        # ...").  Steering them asked the person again and again in one turn
+        # (live 2026-11-16, speech agent 1794540972213, 8 asks in one turn,
+        # no [REUSE-WAIT]).  The one helper for "at a hold or a turn exit"
+        # records the ask and takes the canonical wait (on a background turn,
+        # the hand-off to the goal's person); the sub-steps stay pending for
+        # the turn that carries the reply.
+        # The turn that brings the person's reply to that question works
+        # the sub-steps the reply was waited for, unless one of them asks
+        # again (_reuse_hold_substeps_for_the_reply, the rule BREAKDOWN uses).
+        if _reuse_hold_substeps_for_the_reply(
+                user_prompt, action_id, getattr(manager, 'groupchat', None)):
+            current_app.logger.info(
+                f"[SUBTASK-HOLD] action {action_id} keeps {len(_outstanding)} unrun "
+                f"subtask(s) for the person's reply; ending the turn for "
+                f"session: {user_prompt}")
+            return False
         current_app.logger.info(
             f"[SUBTASK-HOLD] action {action_id} keeps {len(_outstanding)} unrun "
             f"subtask(s) (closed={_closed_subtask}); steering "
             f"'{str(_next_sub.description)[:60]}' instead of advancing "
             f"for session: {user_prompt}")
-        if advanced_latch is not None:
-            advanced_latch.discard(action_id)
         _narrow_assistant_to_current_action(user_prompt)
         chat_instructor.initiate_chat(
             recipient=manager,
@@ -7299,6 +7473,24 @@ def get_agent_response(assistant: "autogen.AssistantAgent", chat_instructor: "au
                                 f"{user_prompt}: {_bd_add_e}")
                     _pending = get_pending_subtasks(
                         user_prompt, _reuse_current_action, user_ledgers)
+                    # A step whose flow action waits for the person (its
+                    # question is out, no reply yet) waits here too: steering
+                    # its first sub-step made the model ask again before
+                    # anyone could answer (rv_hartos_2575_8ddf's probe; live
+                    # 2026-11-16, the name asked 8 times in one turn).  Only a
+                    # step that waits holds (_reuse_note_ask_and_wait: flag
+                    # 'no', a question recorded); one that does not wait keeps
+                    # steering and re-prompting as its action says.  Only a
+                    # question that was SENT holds, the same rule as
+                    # SUBTASK-HOLD (_reuse_hold_substeps_for_the_reply).
+                    if (_pending
+                            and _reuse_hold_substeps_for_the_reply(
+                                user_prompt, _reuse_current_action, group_chat)):
+                        current_app.logger.info(
+                            f"[BREAKDOWN] action {_reuse_current_action} keeps "
+                            f"{len(_pending)} subtask(s) for the person's reply; "
+                            f"ending the turn for session: {user_prompt}")
+                        break
                     if _pending:
                         _next_sub = _pending[0]
                         # Mark it STARTED before handing it over.  The ledger
@@ -7951,14 +8143,19 @@ def create_schedule(prompt_id, user_id):
         config = json.load(f)
         config = _normalize_flow_recipe(config)  # tolerate per-action recipe in flow slot
         recipes[user_prompt] = config
+    # One job per person, agent and task: the id names them, and a new session
+    # REPLACES its earlier job.  The ids were job_<second>, so every session
+    # start added another job nothing removed, and two jobs added in the same
+    # second collided (ConflictingIdError) and the except below skipped the rest.
     try:
         if 'scheduled_tasks' in config and len(config['scheduled_tasks']) > 0:
             _ctx_safe_log('info', 'Creating scheduled tasks')
-            for i in config['scheduled_tasks']:
+            for _n, i in enumerate(config['scheduled_tasks']):
                 if role and i['persona'].lower() == role.lower():
                     trigger = CronTrigger.from_crontab(i['cron_expression'])
-                    job_id = f"job_{int(time.time())}"
+                    job_id = f"sched_{user_prompt}_{_n}"
                     scheduler.add_job(execute_python_file, trigger=trigger, id=job_id,
+                                      replace_existing=True,
                                       args=[i['job_description'], user_id, prompt_id, i['action_entry_point']])
                     _ctx_safe_log('info', f'Successfully created scheduler job {i["persona"]}')
 
@@ -7969,18 +8166,20 @@ def create_schedule(prompt_id, user_id):
         if ACTION_API:
             _ctx_safe_log('info', 'Creating Visual scheduled tasks')
             trigger = IntervalTrigger(seconds=int(2))
-            job_id = f"job_{int(time.time())}"
+            job_id = f"visual_poll_{user_prompt}"
             scheduler.add_job(call_visual_task, trigger=trigger, id=job_id,
+                              replace_existing=True,
                               args=['get past 1 mins visual information', user_id, prompt_id])
             _ctx_safe_log('info', 'Successfully created scheduler job')
         else:
             _ctx_safe_log('info', 'Skipping 2s visual-poll job — ACTION_API not configured')
         if 'visual_scheduled_tasks' in config and len(config['visual_scheduled_tasks']) > 0:
-            for i in config['visual_scheduled_tasks']:
+            for _n, i in enumerate(config['visual_scheduled_tasks']):
                 if role and i['persona'].lower() == role.lower():
                     trigger = CronTrigger.from_crontab(i['cron_expression'])
-                    job_id = f"job_{int(time.time())}"
+                    job_id = f"visual_task_{user_prompt}_{_n}"
                     scheduler.add_job(call_visual_task, trigger=trigger, id=job_id,
+                                      replace_existing=True,
                                       args=[i['job_description'], user_id, prompt_id])
                     _ctx_safe_log('info', f'Successfully created scheduler job {i["persona"]}')
     except Exception as e:
@@ -8811,7 +9010,8 @@ def _reuse_park_for_its_person(user_prompt, action_id, question, request_id,
     return stage
 
 
-def _reuse_note_ask_and_wait(user_prompt, action_id, group_chat, returned_text=None):
+def _reuse_note_ask_and_wait(user_prompt, action_id, group_chat, returned_text=None,
+                             answered=None):
     """At a hold or a turn exit on a PERSON's turn: record the ask this
     step's window delivered, if any, and take the canonical wait when an ask
     is open.  The written answer counts as the ask on a pending verdict, or
@@ -8819,7 +9019,15 @@ def _reuse_note_ask_and_wait(user_prompt, action_id, group_chat, returned_text=N
     High 3).  False on any other turn, so a daemon turn holds nothing, and
     for a step that is over or gave up: its window is no longer a question
     (hartos-00's review of c26ae7932, item 2: a FAILED step kept an open ask
-    recorded from the model's "Arjun replied.")."""
+    recorded from the model's "Arjun replied.").
+
+    ``answered`` is this turn's reply evidence (_reuse_reply_evidence) when
+    the step asked again after reading the reply: the reply is recorded
+    first, through the one writer that closes the ask it answers, so the new
+    question is the open one the next reply answers.  Otherwise the reply
+    is recorded only when the step completes on it, and a hold here left the
+    first ask open, the reply unrecorded, and the next answer filed under the
+    old question (review of ede3b91c5, S2b)."""
     try:
         if not _reuse_person_turn(user_prompt):
             # A background turn that ends with its step's question out, by
@@ -8845,6 +9053,9 @@ def _reuse_note_ask_and_wait(user_prompt, action_id, group_chat, returned_text=N
             return False
         if not _reuse_ask_only_step(user_prompt, action_id, group_chat):
             return False
+        if answered is not None:
+            record_user_answer(user_prompt, action_id, answered.get('reply'),
+                               answered.get('flow'))
         messages = list(getattr(group_chat, 'messages', None) or [])
         written_counts = (_reuse_verdict_is_pending(group_chat)
                           or _reuse_step_names_the_ask_tool(user_prompt, action_id, group_chat))
@@ -8862,6 +9073,35 @@ def _reuse_note_ask_and_wait(user_prompt, action_id, group_chat, returned_text=N
             f"[REUSE-WAIT] action {action_id}: the ask could not be recorded or "
             f"held ({_err!r}); the step stays as the loop left it")
         return False
+
+
+def _reuse_hold_substeps_for_the_reply(user_prompt, action_id, group_chat):
+    """The one rule for both sub-step holds (SUBTASK-HOLD in _advance_or_steer,
+    BREAKDOWN in the loop): True when this step's question reached the person
+    by a send in its window and is not the one this turn's reply answers,
+    after taking the canonical wait (_reuse_note_ask_and_wait); its sub-steps
+    then stay pending for the turn that carries the reply.
+
+    Only a send holds (review of ede3b91c5, M1): a line the model WROTE before
+    the split reached no one, and ending the turn on it showed the person no
+    question and failed the step on their next turn; a written ask is never
+    one a reply can close (_REUSE_ASK_REACHED_THE_PERSON).  On the turn that
+    carries the reply, the send it answers holds nothing; a send after the
+    reply asks again and holds (S2b: a sub-step's own question, "How old is
+    she?", waits for its answer instead of the next sub-step running at once)."""
+    messages = list(getattr(group_chat, 'messages', None) or [])
+    dispatch_index = _reuse_latest_dispatch_index(messages, action_id)
+    if dispatch_index is None:
+        return False
+    sent = _reuse_ask_index(
+        group_chat, messages, dispatch_index, False,
+        step_waits=_reuse_action_declares_user_pause(user_prompt, action_id))
+    if sent is None:
+        return False
+    reply = _reuse_reply_evidence(user_prompt, action_id, messages)
+    if reply is not None and sent[0] <= reply['message_index']:
+        return False
+    return _reuse_note_ask_and_wait(user_prompt, action_id, group_chat, answered=reply)
 
 
 def _reuse_hold_ask_at_turn_exit(user_prompt, group_chat, returned_text=None):

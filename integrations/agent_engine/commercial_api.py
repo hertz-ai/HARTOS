@@ -1723,6 +1723,78 @@ def phonepe_refund_callback():
                     'code': code}), 200
 
 
+def _cashfree_event_link(raw_body: bytes):
+    """``(link_id, transaction_id)`` named by a VERIFIED Cashfree event, or
+    ``(None, None)``.  The payment-link event (type PAYMENT_LINK_EVENT) is
+    JSON with data.link_id and, when paid, data.order.transaction_id
+    (Cashfree's payment-link webhook page).  The same page says link events
+    come "in a form data format", with no field list, so a form body is read
+    for a link_id field, or a data field holding that JSON object.  Only the
+    link is taken from the body; the money is read from Cashfree's API."""
+    import json as _json
+    from urllib.parse import parse_qs
+    text = raw_body.decode('utf-8', errors='replace')
+    event = None
+    try:
+        event = _json.loads(text)
+    except ValueError:
+        form = {k: v[0] for k, v in parse_qs(text).items() if v}
+        if form.get('link_id'):
+            return str(form['link_id']), form.get('transaction_id')
+        try:
+            event = {'data': _json.loads(form.get('data') or '')}
+        except ValueError:
+            return None, None
+    data = event.get('data') if isinstance(event, dict) else None
+    if not isinstance(data, dict) or not data.get('link_id'):
+        return None, None
+    order = data.get('order') if isinstance(data.get('order'), dict) else {}
+    txn = order.get('transaction_id')
+    return str(data['link_id']), (str(txn) if txn not in (None, '') else None)
+
+
+@commercial_api_bp.route('/api/v1/intelligence/cashfree/webhook', methods=['POST'])
+def cashfree_webhook():
+    """Cashfree's signed event for a payment link this node made
+    (ap2_protocol.create_payment_link_function), the path
+    ap2_protocol.CASHFREE_WEBHOOK_PATH names.
+
+    Nothing is read before the signature checks out
+    (CashfreePaymentGateway.webhook_refusal: HMAC over x-webhook-timestamp
+    plus the raw body with the secret key, constant-time, at most five
+    minutes old).  Then the link the event names is settled through the one
+    finalizer (ap2_protocol.settle_cashfree_link), which asks Cashfree's API
+    and never believes the body about the money.  Answers: 503 when Cashfree
+    is not set up on this node or Cashfree's API could not be asked
+    (Cashfree retries a non-2xx, so nothing is lost while it is fixed); 401
+    on a refused signature; 200 otherwise (completed, already_completed,
+    pending, expired, amount_mismatch, not_ours, ignored), so a redelivery
+    records nothing twice.
+    """
+    from integrations.ap2.ap2_protocol import (
+        cashfree_gateway, get_payment_ledger, settle_cashfree_link)
+    ledger = get_payment_ledger()
+    gateway = cashfree_gateway(ledger)
+    if gateway is None:
+        logger.error("Cashfree webhook received but Cashfree is not set up on this "
+                     "node; not trusted, Cashfree will deliver it again")
+        return jsonify({'success': False, 'error': 'Cashfree is not set up on this node'}), 503
+    raw = request.get_data(cache=True)
+    refusal = gateway.webhook_refusal(raw, request.headers.get('x-webhook-timestamp', ''),
+                                      request.headers.get('x-webhook-signature', ''))
+    if refusal is not None:
+        logger.warning(f"Cashfree webhook refused: {refusal}")
+        return jsonify({'success': False, 'error': 'Invalid signature'}), 401
+    link_id, transaction_id = _cashfree_event_link(raw)
+    if not link_id:
+        logger.info("Cashfree webhook: a signed event that names no payment link; ignored")
+        return jsonify({'success': True, 'status': 'ignored'}), 200
+    settled = settle_cashfree_link(link_id, ledger, transaction_id=transaction_id)
+    body = {'success': settled['status'] in ('completed', 'already_completed'),
+            'status': settled['status'], 'payment_request_id': settled.get('payment_id')}
+    return jsonify(body), (503 if settled.get('retry') else 200)
+
+
 #: The page a buyer's browser lands on when PhonePe's checkout sends it back.
 #: Plain HTML with no style or script (the node's CSP allows neither inline)
 #: and nothing from the request in it.
