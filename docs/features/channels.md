@@ -44,7 +44,13 @@ counts only once it is proven: every setting is given and the mail server
 accepts the IMAP and SMTP login (tried on a throwaway adapter).  A wrong or
 missing password is refused with what to fix, and nothing is recorded: no
 binding, no config, no adapter, and a running adapter of the same mailbox is
-left as it was.
+left as it was.  `POST /api/social/channels/bindings` never binds a mailbox: a
+form naming one (top level, `metadata` or the wizards' `config`) goes to that
+connect, and a body that names a mailbox this node holds only by its sender id
+is refused, saying so.  Every reply that returns a binding
+(`flask_integration.binding_for_client`) carries only its non-secret display
+fields (address, servers, name): no password, token or sealed blob leaves the
+server.
 
 Every goal email is verified before it leaves:
 
