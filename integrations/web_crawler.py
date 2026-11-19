@@ -298,7 +298,16 @@ async def _crawl_single(url: str, timeout: int, log: _ProgressLog) -> dict:
 
 
 def _fallback_fetch(url: str, timeout: int, log: _ProgressLog) -> dict:
-    """Fallback: requests + BeautifulSoup. No browser needed."""
+    """Fallback: requests + BeautifulSoup. No browser needed.
+
+    The page's pictures stay in its text as ``![alt](link)``, where they
+    stood, the shape crawl4ai's markdown gives, so a caller reads the same
+    kind of page from either path.  Live 2026-11-17 (research agent, build
+    75, crawl4ai not installed) a step that reads a chart with
+    get_text_from_image got page text only, had no picture link to pass,
+    failed three times and asked the person for one."""
+    import re
+    from urllib.parse import urljoin
     import requests as _req
     log.step(f"Fetching {url} (requests fallback)...")
     try:
@@ -313,12 +322,29 @@ def _fallback_fetch(url: str, timeout: int, log: _ProgressLog) -> dict:
         soup = BeautifulSoup(resp.text, 'html.parser')
         for tag in soup(["script", "style", "nav", "header", "footer"]):
             tag.decompose()
+        # A link is made whole against the page actually reached (after any
+        # redirect).  A lazy picture keeps a data: stand-in in src and its
+        # real link in data-src.  A picture with no web link is left out.
+        page_url = getattr(resp, 'url', None) or url
+        for img in soup.find_all('img'):
+            src = next((v.strip() for v in (img.get('src'), img.get('data-src'))
+                        if v and v.strip() and not v.strip().startswith('data:')), '')
+            link = urljoin(page_url, src) if src else ''
+            if not link.startswith(('http://', 'https://')):
+                img.decompose()
+                continue
+            alt = ' '.join((img.get('alt') or '').split()).replace('[', '').replace(']', '')
+            link = link.replace(' ', '%20').replace('(', '%28').replace(')', '%29')
+            img.replace_with(f' ![{alt}]({link}) ')
         text = soup.get_text()
         lines = (line.strip() for line in text.splitlines())
         chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
         cleaned = ' '.join(c for c in chunks if c)
+        # Too little content is judged on the words alone: a page whose HTML
+        # holds only a logo still needs JavaScript to be read.
+        words_only = re.sub(r' ?!\[[^\]]*\]\([^)\s]*\)', '', cleaned).strip()
 
-        if not cleaned or len(cleaned) < 50:
+        if not words_only or len(words_only) < 50:
             log.step("Too little content after cleanup")
             return {'success': False, 'url': url, 'error': 'Too little content extracted'}
 

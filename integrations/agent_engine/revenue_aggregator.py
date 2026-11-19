@@ -31,11 +31,35 @@ _PROFIT_PLATFORM_SHARE = REVENUE_SPLIT_INFRA + REVENUE_SPLIT_CENTRAL  # backward
 
 # ─── Shared revenue query (used by both RevenueAggregator and finance_tools) ──
 
+def payment_revenue_in_usd(by_currency: Dict) -> float:
+    """Ledger revenue (PaymentLedger.revenue: currency -> amount) as dollars:
+    USD as it is, INR at the operator's rate (ap2_protocol.
+    operator_usd_inr_rate, the rate PhonePe prices with).  A currency with
+    no rate is left out and said at WARNING, never counted as dollars."""
+    from integrations.ap2.ap2_protocol import operator_usd_inr_rate
+    usd = 0.0
+    for currency, amount in (by_currency or {}).items():
+        code = str(currency or '').upper()
+        if code == 'USD':
+            usd += float(amount)
+        elif code == 'INR' and operator_usd_inr_rate() > 0:
+            usd += float(amount) / operator_usd_inr_rate()
+        else:
+            logger.warning("revenue: %s %s taken through the payment ledger has no "
+                           "rate to dollars; left out of total_gross", amount, code)
+    return usd
+
+
 def query_revenue_streams(db, period_days: int = 30) -> Dict:
     """Core revenue query — single source of truth for revenue data.
 
-    Returns: {period_days, api_revenue, ad_revenue, hosting_payouts,
-              total_gross, platform_share}
+    Returns: {period_days, api_revenue, ad_revenue, payment_revenue,
+              payment_revenue_usd, hosting_payouts, total_gross, shares}
+
+    payment_revenue is what payers paid through the AP2 payment ledger
+    (Cashfree payment links, bought API tiers; PaymentLedger.revenue), by
+    currency; payment_revenue_usd is the same in dollars
+    (payment_revenue_in_usd), and is what total_gross adds.
 
     Used by: RevenueAggregator.get_revenue_streams(), finance_tools.get_financial_health()
     """
@@ -46,6 +70,8 @@ def query_revenue_streams(db, period_days: int = 30) -> Dict:
         'period_days': period_days,
         'api_revenue': 0.0,
         'ad_revenue': 0.0,
+        'payment_revenue': {},
+        'payment_revenue_usd': 0.0,
         'hosting_payouts': 0.0,
         'total_gross': 0.0,
         'user_pool_share': 0.0,
@@ -84,7 +110,17 @@ def query_revenue_streams(db, period_days: int = 30) -> Dict:
     except Exception as e:
         logger.debug(f"Hosting reward query: {e}")
 
-    gross = result['api_revenue'] + result['ad_revenue']
+    # Payments taken through the AP2 ledger: payment links and bought API
+    # tiers (task #210: a paid tier upgrade used to count as 0 here).
+    try:
+        from integrations.ap2.ap2_protocol import get_payment_ledger
+        by_currency = get_payment_ledger().revenue(period_days)
+        result['payment_revenue'] = {c: float(v) for c, v in by_currency.items()}
+        result['payment_revenue_usd'] = payment_revenue_in_usd(by_currency)
+    except Exception as e:
+        logger.warning(f"Payment ledger revenue query: {e}")
+
+    gross = result['api_revenue'] + result['ad_revenue'] + result['payment_revenue_usd']
     result['total_gross'] = gross
     result['user_pool_share'] = gross * REVENUE_SPLIT_USERS
     result['infra_pool_share'] = gross * REVENUE_SPLIT_INFRA

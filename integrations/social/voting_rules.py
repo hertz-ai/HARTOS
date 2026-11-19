@@ -347,7 +347,8 @@ def evolves_without_vote_here() -> bool:
     key_delegation.get_node_tier says flat).  A claim of regional or central
     keeps the vote whatever was proven; a node its master key made central
     keeps it whatever was claimed (review rv_9dd0 F4: the claim alone missed
-    it).  Any other claim -- 'local', a value no rule knows -- keeps it."""
+    it).  'local' counts as flat (owner 2026-11-17, node_topology.
+    FLAT_TIERS); any other claim -- a value no rule knows -- keeps it."""
     from .node_topology import is_flat_node
     return is_flat_node()
 
@@ -402,9 +403,10 @@ def _permit_hint(reason: str, verdict: dict, tally: dict) -> str:
                           'node, evaluated here with no vote (flat node)',
         'not_this_nodes_own': f"not this node's own experiment: it runs once "
                               f'{vote}',
-        'topology_keeps_the_vote': 'this node is not flat (HEVOLVE_NODE_TIER '
-                                   'names another tier, or its key proves '
-                                   'one): on regional and central every '
+        'topology_keeps_the_vote': 'this node is not flat or local '
+                                   '(HEVOLVE_NODE_TIER names another tier, or '
+                                   'its key proves one): on regional and '
+                                   'central every '
                                    f'experiment runs only once {vote}',
         'not_asked_by_this_node': "this node's own experiment runs with no vote "
                                   'only when this node starts it: its '
