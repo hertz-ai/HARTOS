@@ -54,6 +54,14 @@ def test_the_answer_is_not_the_empty_list_the_model_cannot_read(monkeypatch):
     assert out != [] and str(out) != '[]'
 
 
+def test_the_sentence_is_the_one_shared_constant(monkeypatch):
+    """rv_4301 S1: the REUSE gate reads this exact sentence as an empty
+    lookup, so it has one definition (core.constants.EMPTY_SEARCH_RESULT)."""
+    from core.constants import EMPTY_SEARCH_RESULT
+    _rig(monkeypatch, [])
+    assert helper.top5_results('speech therapy apps for children') is EMPTY_SEARCH_RESULT
+
+
 def test_a_search_that_found_results_returns_them_unchanged(monkeypatch):
     _rig(monkeypatch, ROWS)
     assert helper.top5_results('speech therapy apps for children') is ROWS

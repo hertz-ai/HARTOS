@@ -1388,6 +1388,18 @@ def outline_marker(type_name: str) -> str:
 
 OUTLINE_MARKER_RE = _vis_re.compile(r"<saved_[A-Za-z_][A-Za-z0-9_]*>")
 
+# What a web search returns when it found nothing (hartos.helper.top5_results:
+# the keyless engines answered nothing and no Google key is set).  A bare "[]"
+# gave the model no word of what happened, so it made up links (live
+# 2026-11-18).  ONE definition, because the REUSE gate that answers "the
+# lookup came back empty" (reuse_recipe._reuse_result_is_vacuous) must read
+# this sentence as empty, as it read "[]" (rv_4301's review of 4301d1b26, S1).
+EMPTY_SEARCH_RESULT: str = (
+    "The web search found no results for this query: the keyless search "
+    "engines answered nothing and no Google search key is set on this "
+    "machine.  Do not make up a link or cite a source.  Search again with "
+    "different words, or tell the person plainly that nothing was found.")
+
 # Results a tool returns when it RAN and could not do the work.
 #
 # Sibling of HISTORICAL_TOOL_PLACEHOLDER above, and read by the same gate for

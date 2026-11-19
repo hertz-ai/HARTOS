@@ -27,7 +27,8 @@ import ast
 from core.optional_import import lazy_module
 # The fabrication gate in reuse_recipe keys on this EXACT string to tell a
 # back-filled stand-in from a real tool result — one definition, no drift.
-from core.constants import HISTORICAL_TOOL_PLACEHOLDER, outline_marker
+from core.constants import (
+    EMPTY_SEARCH_RESULT, HISTORICAL_TOOL_PLACEHOLDER, outline_marker)
 autogen = lazy_module("autogen")
 transform_messages = lazy_module(
     "autogen.agentchat.contrib.capabilities.transform_messages")
@@ -548,6 +549,22 @@ def _keyless_top5(query: str):
              'method': 'serp_links_only', 'sources_processed': len(links)}]
 
 
+def _remember_links(query, links):
+    """Keep the links this request's search gave, so a crawl of a link no
+    search gave can name them (integrations.web_crawler).  Keyed by the
+    turn's user and request; the query itself is never stored as a found
+    link (rv_4301 M1)."""
+    try:
+        from hartos.threadlocal import thread_local_data
+        from integrations.web_crawler import remember_search_links
+        remember_search_links(
+            thread_local_data.get_request_id(), links,
+            user_id=thread_local_data.get_user_id(), query=query)
+    except Exception as e:
+        current_app.logger.warning(
+            f"search links not kept, a later crawl cannot name them: {e!r}")
+
+
 def top5_results(query):
     """
     Enhanced top5_results using Crawl4AI API service
@@ -561,16 +578,12 @@ def top5_results(query):
     _keyless = _keyless_top5(query)
     if _keyless:
         # The links this request's search gave, so a crawl of a link no
-        # search gave can name them (integrations.web_crawler).
-        try:
-            from hartos.threadlocal import thread_local_data
-            from integrations.web_crawler import remember_search_links
-            remember_search_links(
-                thread_local_data.get_request_id(),
-                [l for r in _keyless if isinstance(r, dict)
-                 for l in (r.get('source') or [])])
-        except Exception as e:
-            current_app.logger.debug(f"search links not kept: {e}")
+        # search gave can name them (integrations.web_crawler).  A
+        # 'direct_url' row is the model's own link read back, not a search
+        # result (rv_4301 M1).
+        _remember_links(query, [l for r in _keyless if isinstance(r, dict)
+                                and r.get('method') != 'direct_url'
+                                for l in (r.get('source') or [])])
         return _keyless
 
     final_res = []
@@ -582,18 +595,17 @@ def top5_results(query):
             # engines answer nothing.  A bare [] gave the model no links and
             # no word of what happened; live 2026-11-18 the 4B then crawled
             # two links it made up (404) and asked the person
-            # (tests/unit/test_an_empty_keyless_search_says_so.py).  Same
-            # answer the entry's own top5_results gives for its empty exits.
+            # (tests/unit/test_an_empty_keyless_search_says_so.py).  The
+            # sentence lives in core.constants so the REUSE empty-result gate
+            # reads it as empty (rv_4301 S1).
             current_app.logger.warning(
                 "top5_results: keyless search found nothing and no Google key "
                 f"is set, for: {query}")
-            return ("The web search found no results for this query: the "
-                    "keyless search engines answered nothing and no Google "
-                    "search key is set on this machine.  Do not make up a "
-                    "link or cite a source.  Search again with different "
-                    "words, or tell the person plainly that nothing was found.")
+            return EMPTY_SEARCH_RESULT
         top_2_search_res = search.results(query, 2)
         top_2_search_res_link = [res['link'] for res in top_2_search_res]
+        # The Google path's links count as searched too (rv_4301 S5).
+        _remember_links(query, top_2_search_res_link)
 
         if not top_2_search_res_link:
             current_app.logger.warning("No search links found")

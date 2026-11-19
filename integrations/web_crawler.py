@@ -38,35 +38,73 @@ _crawler_available = None  # None = not checked yet
 #: 2026-11-18).  Live 2026-11-18 21:05 IST the search gave
 #: speechblubs.com/blog/9-effective-apps-for-speech-delay-to-help-your-child-speak
 #: and the local 4B crawled speechblubs.com/apps-for-delayed-speech (404).
+#: Keyed by (user id, request id) (rv_4301 S4). Every search of a request ADDS
+#: its links to what the request's earlier searches gave (rv_4301 M1: a
+#: replace-on-search store told the model a link from its FIRST search "was
+#: not in the search results").
 _SEARCH_LINKS = {}
 _SEARCH_LINKS_MAX = 64
+_SEARCH_LINKS_PER_REQUEST = 20
 _SEARCH_LINKS_TTL_S = 900
 _search_links_lock = threading.Lock()
 
 
-def remember_search_links(request_id, links) -> None:
-    """Keep the links a search gave this request (newest searches win)."""
-    links = [l for l in (links or []) if isinstance(l, str) and l]
-    logger.info(f"search links kept: {len(links)} for request {request_id!r}")
+def _link_form(url) -> str:
+    """The form two links are compared in: no case, no trailing slash."""
+    return str(url or '').strip().rstrip('/').lower()
+
+
+def _search_key(request_id, user_id) -> tuple:
+    return (str(user_id or ''), str(request_id or ''))
+
+
+def remember_search_links(request_id, links, *, user_id=None, query=None) -> None:
+    """Add the links a search gave this person's request to the ones its
+    earlier searches gave (no repeats, newest last, at most
+    _SEARCH_LINKS_PER_REQUEST); the request becomes the newest in the store.
+
+    The query itself is never kept as a link (rv_4301 M1): a model that
+    searches with a URL it made up gets that URL echoed back as a "result",
+    and keeping it would let a failed crawl of the made-up page pass as one
+    the search gave."""
+    asked = _link_form(query) if query else ''
+    links = [l for l in (links or []) if isinstance(l, str) and l
+             and (not asked or _link_form(l) != asked)]
     if not request_id or not links:
+        logger.info(f"search links kept: 0 for request {request_id!r}")
         return
+    key = _search_key(request_id, user_id)
     with _search_links_lock:
-        _SEARCH_LINKS.pop(request_id, None)
-        _SEARCH_LINKS[request_id] = (time.monotonic(), links)
+        old = _SEARCH_LINKS.pop(key, None)
+        merged = (list(old[1]) if old
+                  and time.monotonic() - old[0] <= _SEARCH_LINKS_TTL_S else [])
+        seen = {_link_form(l) for l in merged}
+        for link in links:
+            if _link_form(link) not in seen:
+                merged.append(link)
+                seen.add(_link_form(link))
+        merged = merged[-_SEARCH_LINKS_PER_REQUEST:]
+        _SEARCH_LINKS[key] = (time.monotonic(), merged)
         while len(_SEARCH_LINKS) > _SEARCH_LINKS_MAX:
             _SEARCH_LINKS.pop(next(iter(_SEARCH_LINKS)))
+    logger.info(f"search links kept: {len(merged)} for request {request_id!r}")
 
 
 def _searched_links() -> list:
-    """The links this request's search gave, or [] (none, expired, or no
-    request id)."""
+    """The links this person's request's searches gave, or [] (none,
+    expired, or no request id)."""
     try:
         from hartos.threadlocal import thread_local_data
         request_id = thread_local_data.get_request_id()
-    except Exception:
+        user_id = thread_local_data.get_user_id()
+    except Exception as err:
+        logger.warning(f"search links: the turn's ids cannot be read ({err!r}); "
+                       f"a failed crawl gets no note")
+        return []
+    if not request_id:
         return []
     with _search_links_lock:
-        kept = _SEARCH_LINKS.get(request_id) if request_id else None
+        kept = _SEARCH_LINKS.get(_search_key(request_id, user_id))
     if not kept or time.monotonic() - kept[0] > _SEARCH_LINKS_TTL_S:
         logger.info(f"no search links for request {request_id!r}")
         return []
@@ -75,12 +113,13 @@ def _searched_links() -> list:
 
 def _not_searched_note(url: str) -> str:
     """'This link was not in the search results ...' when this request
-    searched and the failed link is not one it gave; '' otherwise."""
+    searched and the failed link is not one any of its searches gave; ''
+    otherwise."""
     links = _searched_links()
-    if not links or url in links:
+    if not links or _link_form(url) in {_link_form(l) for l in links}:
         return ''
     return ("This link was not in the search results. The search gave: "
-            + ", ".join(links[:5]) + ". Crawl one of these exactly.")
+            + ", ".join(links[-5:]) + ". Crawl one of these exactly.")
 
 
 def _check_available() -> bool:
