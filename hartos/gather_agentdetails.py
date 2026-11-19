@@ -269,9 +269,18 @@ its own persona: the PERSON that flow talks with, as the task names them
 person picks their persona when they first chat; and "personas" lists every
 persona a flow names.  Use "Executor" only when the task names no person
 for that flow.  Each flow's sub_goal is a result one turn can show, so its
-completion can be checked from that turn's evidence (e.g. "Arjun says ball"
+completion can be checked from that turn's evidence (e.g. "<child_name> says ball"
 or "the parent sent three family photos"), never a vague aim ("improves
 speech").
+
+PEOPLE ARE BLANKS, NOT PART OF THE AGENT: the agent is built once and used by
+many people.  A name or personal detail of a person it serves (the child's
+name, a parent's name, the language spoken at home, the words the child
+already knows) is never written into the name, goal, personas, sub_goals or
+steps as one particular person's: write its blank instead (<child_name>,
+<mother_name>, <father_name>, <home_language>, <known_words>), and keep a step
+that gets the value from the person or their parent and saves it to memory.
+The agent fills every blank per person when it runs.
 
 RULES for the actions[] of EACH flow:
 - ONE concrete observable action per item.  No "and then" compounds.
@@ -293,7 +302,7 @@ RULES for the actions[] of EACH flow:
 - Use AS FEW steps as the task needs: a question / recall / lookup is often ONE
   tool step; only a genuine multi-step GUI task needs many (up to ~15 per flow).
   Do NOT pad a tool-satisfiable task into a long GUI sequence.
-- Preserve EVERY detail of the task description in the plan.
+- Preserve EVERY detail of the task description in the plan (a person's name or personal detail is kept as its blank).
 
 STAGE 2 — SUBSEQUENT CALL (incoming message is review verdict):
 - If incoming message is "approved" or starts with "approved": re-emit the SAME plan but with "status":"completed" and remove the "review_required" key.

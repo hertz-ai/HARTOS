@@ -105,9 +105,11 @@ evaluation-goal writer and auto-evolve both ask:
   - the experiment is this node's **own**;
   - the node is flat, as claimed AND as proven (`node_topology.is_flat_node`,
     the same rule a call grant's machine owner uses): `HEVOLVE_NODE_TIER`
-    unset, empty or `flat`, and `key_delegation.get_node_tier()` says flat.
-    Any other claim (`regional`, `central`, `local`, a typo) keeps the vote,
-    and so does a node its master key made central;
+    unset, empty, `flat` or `local`, and `key_delegation.get_node_tier()`
+    says flat or local.  `local` counts as flat by owner ruling 2026-11-17
+    (*"yes but can accept peers from the same network"*;
+    `node_topology.FLAT_TIERS`).  Any other claim (`regional`, `central`, a
+    typo) keeps the vote, and so does a node its master key made central;
   - **this node asked**: its own auto-evolve cycle (paced: `max_experiments`
     per cycle, one cycle at a time), or the owner signed in.  Anyone else's
     `POST /evaluate` gets the vote, so no other account can start the node's

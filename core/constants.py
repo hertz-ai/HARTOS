@@ -1014,6 +1014,8 @@ TOOL_LABELS: dict = {
     'request_payment':             'Requesting payment authorization…',
     'authorize_payment':           'Authorizing payment…',
     'process_payment':             'Processing payment via gateway…',
+    'create_payment_link':         'Making a payment link…',
+    'check_payment_link':          'Checking whether the link is paid…',
 }
 
 

@@ -137,15 +137,36 @@ def _in_process_turn(node, monkeypatch, goal_id, goal_type, on_turn):
     return seen[0]
 
 
+def _served(seats, pipeline, body, headers):
+    """What the node's HTTP server does with a POST of /chat: serves it on
+    ITS OWN thread, never the poster's, in that request's context.  So a
+    fix that only marks the dispatching thread proves nothing here, as it
+    proves nothing live (review of 30835cbfa, mutant 'threadmark')."""
+    out = {}
+
+    def serve():
+        try:
+            with seats.env.app.test_request_context(
+                    '/chat', method='POST', json=body, headers=headers or {}):
+                out['built'] = _build(seats, pipeline, body['request_id'])
+        except BaseException as e:  # handed back to the test's thread
+            out['error'] = e
+    server = threading.Thread(target=serve, name='http-server')
+    server.start()
+    server.join(600)
+    if 'error' in out:
+        raise out['error']
+    assert 'built' in out, 'the server thread did not build'
+    return out['built']
+
+
 def _http_turn(node, seats, pipeline, goal_id, goal_type):
     """dispatch_goal's Tier 2: the loopback POST of /chat, served on the
     HTTP server's thread with the headers the POST sent."""
     posts = []
 
     def post(url, json=None, headers=None, timeout=None, **_kw):
-        with seats.env.app.test_request_context(
-                '/chat', method='POST', json=json, headers=headers or {}):
-            built = _build(seats, pipeline, json['request_id'])
+        built = _served(seats, pipeline, json, headers)
         posts.append(SimpleNamespace(body=json, headers=dict(headers or {}),
                                      built=built))
         return SimpleNamespace(status_code=200,
@@ -217,9 +238,7 @@ def test_the_hive_workers_http_turn_carries_the_families(seats, goal_row,
     built = []
 
     def post(url, json=None, headers=None, timeout=None, **_kw):
-        with seats.env.app.test_request_context(
-                '/chat', method='POST', json=json, headers=headers or {}):
-            built.append(_build(seats, 'create', json['request_id']))
+        built.append(_served(seats, 'create', json, headers))
         return SimpleNamespace(status_code=200,
                                json=lambda: {'response': 'Imported three prospects.'})
     with _allow_dispatch(), \
@@ -299,9 +318,7 @@ def test_a_replay_of_an_earlier_self_posts_headers_gets_no_family(
     goal_row(GOAL, 'outreach')
     turn = _http_turn(node, seats, 'create', GOAL, 'outreach')
     assert CRM <= schema(turn.built.helper)
-    with seats.env.app.test_request_context(
-            '/chat', method='POST', json=turn.body, headers=turn.headers):
-        replayed = _build(seats, 'create', turn.body['request_id'])
+    replayed = _served(seats, 'create', turn.body, turn.headers)
     assert not FAMILIES & schema(replayed.helper)
 
 

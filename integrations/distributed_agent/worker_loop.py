@@ -16,7 +16,7 @@ import threading
 import requests
 from typing import Union
 from core.http_pool import pooled_post
-from core.chat_client import normalize_chat_body
+from core.chat_client import normalize_chat_body, own_http_turn
 
 from core.constants import HIVE_DEPTH, HIVE_WORKER_BASE_CAPABILITIES
 from core.port_registry import get_port
@@ -698,10 +698,16 @@ class DistributedWorkerLoop:
         # the INTERACTIVE prompt. On central (native HARTOS, where this POST is
         # the only route) both rebuilt agents greeted, asked a clarifying
         # question nobody could answer, and saved no step (#97).
+        #
+        # The turn's own secret rides with the credential (#284,
+        # core.chat_client.own_http_turn): served on another thread, this POST
+        # is the node's own goal turn only by it, which is what gives the agent
+        # its goal type's tools (goal_manager.daemon_turn_stored_tags).
         try:
-            resp = pooled_post(f'{base_url}/chat',
-                               json=normalize_chat_body(body, daemon_id=goal_id),
-                               headers=_internal_auth_headers(), timeout=120)
+            _body = normalize_chat_body(body, daemon_id=goal_id)
+            with own_http_turn(_body['request_id'], _internal_auth_headers()) as _headers:
+                resp = pooled_post(f'{base_url}/chat', json=_body,
+                                   headers=_headers, timeout=120)
             if resp.status_code == 200:
                 result = resp.json()
                 return self._after_response(

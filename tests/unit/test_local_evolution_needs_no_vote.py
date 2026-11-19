@@ -413,10 +413,11 @@ class TestTheWriterOnAFlatNode:
 
 
 class TestRegionalAndCentralKeepTheVote:
-    @pytest.mark.parametrize('tier', ['regional', 'central', 'local', 'garbage'])
+    @pytest.mark.parametrize('tier', ['regional', 'central', 'garbage'])
     def test_the_nodes_own_experiment_needs_the_vote(self, db, monkeypatch, tier):
-        """Owner 2026-11-15.  Any claim but flat keeps the vote, including
-        'local' and a value this rule does not know."""
+        """Owner 2026-11-15.  Any claim but flat (or local, owner
+        2026-11-17) keeps the vote, including a value this rule does not
+        know."""
         monkeypatch.setenv('HEVOLVE_NODE_TIER', tier)
         result, goals = _evaluate(db, _experiment(db, _nunba(db).id))
         _refused(result, goals, 'topology_keeps_the_vote')
@@ -466,6 +467,48 @@ def test_calls_and_votes_ask_one_flat_rule(db, monkeypatch):
     assert call_service._machine_owner() is None
     result, goals = _evaluate(db, _experiment(db, _nunba(db).id))
     _refused(result, goals, 'topology_keeps_the_vote')
+
+
+class TestALocalNodeCountsAsFlat:
+    """Owner 2026-11-17 (verbatim): 'Should a node set to "local" count as
+    flat?- yes but can accept peers from the same network'.  A local node's
+    own experiments evolve with no vote, as on a flat node, by the same one
+    rule; a local claim whose key proves central still keeps the vote."""
+
+    @pytest.mark.parametrize('claim', ['local', ' Local '])
+    def test_the_nodes_own_experiment_starts_without_a_vote(
+            self, db, monkeypatch, proven, claim):
+        monkeypatch.setenv('HEVOLVE_NODE_TIER', claim)
+        proven['tier'] = 'local'
+        result, goals = _evaluate(db, _experiment(db, _nunba(db).id))
+        assert result['success'] is True and goals == 1
+
+    def test_a_local_claim_its_key_proves_central_keeps_the_vote(
+            self, db, monkeypatch, proven):
+        monkeypatch.setenv('HEVOLVE_NODE_TIER', 'local')
+        proven['tier'] = 'central'
+        result, goals = _evaluate(db, _experiment(db, _nunba(db).id))
+        _refused(result, goals, 'topology_keeps_the_vote')
+
+    def test_a_vote_against_still_holds_on_a_local_node(
+            self, db, monkeypatch, proven):
+        """Only the topology changed: every other condition still applies."""
+        monkeypatch.setenv('HEVOLVE_NODE_TIER', 'local')
+        proven['tier'] = 'local'
+        e = _experiment(db, _nunba(db).id)
+        _vote(db, e.id, -1)
+        result, goals = _evaluate(db, e)
+        _refused(result, goals, 'vote_against')
+
+    def test_the_machine_owner_gets_calls_on_a_local_node(
+            self, db, monkeypatch, proven):
+        """One flat rule: the call grant's machine owner follows it."""
+        from integrations.social import call_service
+        owner = _user(db)
+        monkeypatch.setenv('HEVOLVE_OWNER_USER_ID', owner.id)
+        monkeypatch.setenv('HEVOLVE_NODE_TIER', 'local')
+        proven['tier'] = 'local'
+        assert call_service._machine_owner() == owner.id
 
 
 # ── the live hole, through the real routes ──────────────────────────────
@@ -858,6 +901,8 @@ _NO_OPPONENT_COUNT = {k: v for k, v in _tally().items()
     (_tally(), True, True, 'central', 'flat', False, 'topology_keeps_the_vote'),
     (_tally(), True, True, None, 'central', False, 'topology_keeps_the_vote'),
     (_tally(), True, True, 'nonsense', 'flat', False, 'topology_keeps_the_vote'),
+    (_tally(), True, True, 'local', 'local', True, 'this_nodes_own'),
+    (_tally(), True, True, 'local', 'central', False, 'topology_keeps_the_vote'),
     (_tally(), True, False, None, 'flat', False, 'not_asked_by_this_node'),
     (_tally(decision_context='security_guardrail'), True, True, None, 'flat',
      False, 'steward_required'),
@@ -868,7 +913,8 @@ _NO_OPPONENT_COUNT = {k: v for k, v in _tally().items()
     (_NO_OPPONENT_COUNT, True, True, None, 'flat', False, 'vote_against'),
 ], ids=['approved_central', 'approved_flat', 'own', 'own_one_for', 'not_own',
         'claims_regional', 'claims_central', 'key_proves_central',
-        'unknown_claim', 'someone_else_asked', 'security', 'against',
+        'unknown_claim', 'claims_local', 'local_key_proves_central',
+        'someone_else_asked', 'security', 'against',
         'against_rounded_to_zero', 'tally_does_not_say'])
 def test_evaluation_permit(monkeypatch, proven, tally, own, asked, claim,
                            proof, allowed, reason):
