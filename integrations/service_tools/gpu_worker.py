@@ -89,6 +89,56 @@ logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Gated Hugging Face weights loaded inside a worker
+# ═══════════════════════════════════════════════════════════════════
+#
+# The vault keeps the owner's Hugging Face token as HEVOLVE_HF_TOKEN, a
+# name huggingface_hub does not read, so a worker that loads gated weights
+# (Indic Parler, NeuTTS) never carried it, and its startup failure reached
+# the caller as a raw 401 with nobody asked for the key.
+
+def _owner_hf_token() -> str:
+    """The stored Hugging Face token (environment, then the vault)."""
+    try:
+        from hartos.ai_key_vault import get_ai_key_vault
+        return get_ai_key_vault().get_tool_key('HEVOLVE_HF_TOKEN') or ''
+    except Exception as e:  # a worker that needs no token must still start
+        logger.debug("Hugging Face token lookup failed: %s", e)
+        return ''
+
+
+def _gated_repo_in(text: str) -> str:
+    """The Hugging Face repo a startup error says is gated, or ''."""
+    import re
+    low = text.lower()
+    if not ('gated' in low or 'restricted' in low
+            or ('401' in low and 'huggingface' in low)):
+        return ''
+    m = (re.search(r'huggingface\.co/(?:api/models/)?([\w.-]+/[\w.-]+)', text)
+         or re.search(r'(?:repo|model)\s+([\w.-]+/[\w.-]+)', text))
+    return m.group(1).rstrip('.') if m else ''
+
+
+def _needs_hf_token_answer(tool_name: str, repo: str) -> str:
+    """The answer for a gated start with no token stored, after asking the
+    owner for it once (the vault's request_credential; has_pending keeps a
+    second worker start from asking again)."""
+    import json
+    from hartos.ai_key_vault import get_ai_key_vault, request_credential
+    answer = (f"needs HEVOLVE_HF_TOKEN: {repo} is gated; accept its terms "
+              f"at https://huggingface.co/{repo}")
+    if not get_ai_key_vault().has_pending('HEVOLVE_HF_TOKEN'):
+        request_credential(json.dumps({
+            'resource_type': 'api_key',
+            'key_name': 'HEVOLVE_HF_TOKEN',
+            'label': 'Hugging Face access token',
+            'used_by': f'the {tool_name} voice',
+            'description': f"Needed to start {tool_name}: {answer}",
+        }), agent_id=None, tell_alias=False)
+    return answer
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Cross-worker VRAM eviction registry
 # ═══════════════════════════════════════════════════════════════════
 #
@@ -395,6 +445,12 @@ class GPUWorker:
         env.update(self.env)
         # Unbuffered so stdout/stderr come through immediately
         env['PYTHONUNBUFFERED'] = '1'
+        # Gated weights loaded in the worker read HF_TOKEN; the vault keeps
+        # the owner's token as HEVOLVE_HF_TOKEN.
+        if not env.get('HF_TOKEN'):
+            _hf = _owner_hf_token()
+            if _hf:
+                env['HF_TOKEN'] = _hf
 
         # Propagate parent sys.path via PYTHONPATH so the child inherits
         # runtime-added package dirs (e.g. ~/.nunba/site-packages for CUDA
@@ -1338,6 +1394,9 @@ class ToolWorker:
         try:
             worker = self._get_or_start()
         except (WorkerCrash, WorkerTimeout, WorkerError) as e:
+            gated = _gated_repo_in(str(e))
+            if gated and not _owner_hf_token():
+                return {'error': _needs_hf_token_answer(self.tool_name, gated)}
             return {'error': f'{self.tool_name} worker startup failed: {e}'}
 
         try:

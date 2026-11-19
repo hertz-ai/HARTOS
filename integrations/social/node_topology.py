@@ -13,6 +13,12 @@ the guardrails' PROTECTED_FILES.
 """
 import os
 
+# The tiers that count as flat.  'local' joined 2026-11-17, owner (verbatim):
+# "Should a node set to "local" count as flat?- yes but can accept peers
+# from the same network".  key_delegation.get_node_tier returns 'local' as
+# claimed (no certificate is asked for it), so the proof half reads it too.
+FLAT_TIERS = frozenset({'flat', 'local'})
+
 
 def is_flat_node() -> bool:
     """True only when this node is flat both as CLAIMED and as PROVEN.
@@ -22,11 +28,12 @@ def is_flat_node() -> bool:
     promotions set 'regional' with no certificate and leave an upgraded
     central with no key, and get_node_tier, which asks what a node has
     PROVEN, answers 'flat' for both.  The proof catches the converse, a node
-    promoted to central by its key with no claim set.  Any claim but 'flat'
-    -- 'local', a value no rule knows -- is not flat.  get_node_tier is asked
-    only when the claim is flat."""
+    promoted to central by its key with no claim set.  'flat' and 'local'
+    (FLAT_TIERS) count; any other claim -- regional, central, a value no
+    rule knows -- is not flat.  get_node_tier is asked only when the claim
+    counts."""
     claimed = (os.environ.get('HEVOLVE_NODE_TIER') or 'flat').strip().lower()
-    if claimed != 'flat':
+    if claimed not in FLAT_TIERS:
         return False
     from security.key_delegation import get_node_tier
-    return get_node_tier() == 'flat'
+    return get_node_tier() in FLAT_TIERS
