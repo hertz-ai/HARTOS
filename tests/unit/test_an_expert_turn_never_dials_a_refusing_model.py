@@ -202,3 +202,101 @@ def test_a_turn_that_names_no_model_keeps_the_nodes_own(endpoints):
     """No model named for the turn: get_llm builds the node's own as before."""
     thread_local_data.clear_model_config_override()
     assert autogen_config.turn_chat_model(_ChatModel) is None
+
+
+# ── through get_llm, and across dispatch_to_agent's thread hop ────────────
+# Review of 610da67b5: the tests above call turn_chat_model only, so they
+# pass with get_llm's own lines gone; and dispatch_to_agent runs its
+# get_llm on a new thread, which starts with no turn model and built the
+# node's own (openrouter on central).
+
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+
+
+def _lift(rel, name, **inject):
+    """One top-level function out of a module a bare pytest env cannot
+    import (hart_intelligence_entry starts the app), exec'd with its
+    collaborators injected, as test_agent_votes_in_its_own_turn lifts its
+    functions."""
+    import ast
+    src = open(os.path.join(_ROOT, rel), encoding='utf-8').read()
+    fn = next(n for n in ast.parse(src).body
+              if isinstance(n, ast.FunctionDef) and n.name == name)
+    ns = dict(inject)
+    exec(ast.get_source_segment(src, fn), ns)
+    return ns[name]
+
+
+class _NodeModel:
+    """get_llm's model for a turn that names none (ChatQwen3VL)."""
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+class _Reply:
+    def __init__(self, text):
+        self.content = text
+
+
+class _AnsweringChatModel(_ChatModel):
+    """The chat class at its boundary, answering with the model it dials."""
+
+    def invoke(self, prompt):
+        return _Reply('answered by %s' % self.kwargs.get('model_name'))
+
+
+def _get_llm(chat_model_cls=_ChatModel):
+    import logging
+    return _lift('hart_intelligence_entry.py', 'get_llm', os=os,
+                 logging=logging, ChatOpenAI=chat_model_cls,
+                 ChatQwen3VL=_NodeModel, LLM_MODEL_NAME='openrouter/free',
+                 _llm_entry={})
+
+
+def test_get_llm_runs_an_expert_turn_on_the_expert(endpoints, monkeypatch):
+    """The real get_llm: an expert turn's LangChain model dials the expert
+    only while the own model refuses; a turn naming no model keeps the
+    node's own."""
+    monkeypatch.delenv('HEVOLVE_ACTIVE_CLOUD_PROVIDER', raising=False)
+    expert, own = endpoints
+    get_llm = _get_llm()
+    _own_model_refusing()
+    _expert_turn(expert)
+    model = get_llm(temperature=0.1, max_tokens=300)
+    assert isinstance(model, _ChatModel), (
+        'get_llm built the node\'s own model for an expert turn (on central '
+        'the matcher posted to openrouter/free).  got %r' % (model,))
+    assert _dials(model) == [('claude-haiku-5-5', expert['base_url'])]
+    thread_local_data.clear_model_config_override()
+    assert isinstance(get_llm(), _NodeModel)
+
+
+def test_a_mention_reply_on_its_own_thread_runs_on_the_turns_model(
+        endpoints, monkeypatch):
+    """dispatch_to_agent's worker thread asks get_llm as the turn that
+    dispatched it: the expert, never the refusing own model."""
+    import core.safe_hartos_attr as sha
+    from integrations import agentic_router
+    monkeypatch.delenv('HEVOLVE_ACTIVE_CLOUD_PROVIDER', raising=False)
+    monkeypatch.delenv('HEVOLVE_FLAG_DISPATCH_VIA_CHAT', raising=False)
+    expert, own = endpoints
+    get_llm = _get_llm(_AnsweringChatModel)
+    monkeypatch.setattr(sha, 'safe_hartos_attr',
+                        lambda name: get_llm if name == 'get_llm' else None)
+    posted, done = [], threading.Event()
+
+    def _post(agent_id, context, reply_text):
+        posted.append(reply_text)
+        done.set()
+
+    monkeypatch.setattr(agentic_router, '_post_agent_reply', _post)
+    _own_model_refusing()
+    _expert_turn(expert)
+    agentic_router.dispatch_to_agent(
+        'agent-1', 'what is 2+2?',
+        {'source_kind': 'post', 'source_id': 'p1', 'author_id': 'u1'})
+    assert done.wait(30), 'the mention worker posted no reply'
+    assert posted == ['answered by claude-haiku-5-5'], (
+        'the mention worker started with no turn model and dialled the '
+        'node\'s own (openrouter/free on central).  got %r' % (posted,))
