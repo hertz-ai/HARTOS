@@ -400,11 +400,23 @@ def _mojeek_serp(query: str, max_results: int = 5) -> List[dict]:
         return []
 
 
-def _ddgs_rows(DDGS, query: str, max_results: int, backend: str = None) -> List[dict]:
+# Tier A's time limits, from the central measurement of 19 Nov 2026 (ddgs
+# 9.16, tests/unit/test_keyless_search_tries_each_engine.py): an engine that
+# answers took 1.5 to 1.8 s, one that finds nothing 0.5 to 1.2 s, and a hung
+# one (duckduckgo) the whole of ddgs's 5 s default.
+_DDGS_ENGINE_TIMEOUT_S = 4
+_DDGS_TIER_BUDGET_S = 15
+# The ddgs engine that answered last in this process, asked first next time.
+_DDGS_ANSWERED_LAST = {}
+
+
+def _ddgs_rows(DDGS, query: str, max_results: int, backend: str = None,
+               timeout: int = _DDGS_ENGINE_TIMEOUT_S) -> List[dict]:
     """One ddgs text search as [{'title','url','snippet'}]; [] when it finds
-    nothing or fails.  No ``backend`` = the package's own default, as before."""
+    nothing or fails.  No ``backend`` = the package's own default, as before.
+    ``timeout`` is how long ddgs waits for that search."""
     try:
-        with DDGS() as ddg:
+        with DDGS(timeout=timeout) as ddg:
             found = (ddg.text(query, max_results=max_results) if backend is None
                      else ddg.text(query, max_results=max_results, backend=backend))
         rows = [{'title': r.get('title', ''),
@@ -426,8 +438,8 @@ def _ddgs_text_engines() -> List[str]:
 
 
 def _keyless_serp(query: str, max_results: int = 5) -> List[dict]:
-    """Keyless SERP, tier-ordered.  A: ``ddgs`` lib if installed (multi-source);
-    B: Mojeek html scrape (no dep, independent index, returns 200 to a plain GET);
+    """Keyless SERP, tier-ordered.  A: ``ddgs`` lib if installed, one engine at
+    a time; B: Mojeek html scrape (no dep, independent index, returns 200 to a plain GET);
     C: DDG html scrape (no dep, but often 202-bot-blocked → weak fallback);
     D: a self-hosted SearXNG when SEARXNG_URL is set (per-node / OS-node).  [] if
     all empty."""
@@ -436,20 +448,36 @@ def _keyless_serp(query: str, max_results: int = 5) -> List[dict]:
             from ddgs import DDGS
         except ImportError:
             from duckduckgo_search import DDGS
-        rows = _ddgs_rows(DDGS, query, max_results)
-        if rows:
-            return rows
+        engines = _ddgs_text_engines()
+        if not engines:          # a package that names no engines: its default
+            rows = _ddgs_rows(DDGS, query, max_results)
+            if rows:
+                return rows
         # ddgs's auto mode runs two engines at a time, stops waiting at the
         # first exception and never collects the futures still running in its
         # last batch.  Measured on desktop build 75 (15 Nov 2026, ddgs 9.16):
-        # auto 'No results found' while yandex alone returned 3 rows, so the
-        # Research Assistant's every search came back empty.  Ask ddgs's own
-        # text engines one at a time (the same engines auto would contact)
-        # and keep the first that answers
+        # auto 'No results found' while yandex alone returned 3 rows.  On
+        # central (19 Nov) auto took 9.5 to 11.3 s, timed out once in three,
+        # and only yahoo answered when asked alone.  So ask ddgs's own text
+        # engines one at a time, each with a short timeout, the engine that
+        # answered last on this node first, and keep the first that answers;
+        # stop once the tier's budget is spent so tiers B-D still run
         # (tests/unit/test_keyless_search_tries_each_engine.py).
-        for engine in _ddgs_text_engines():
+        last = _DDGS_ANSWERED_LAST.get('engine')
+        if last in engines:
+            engines = [last] + [e for e in engines if e != last]
+        started = time.monotonic()
+        for engine in engines:
+            if time.monotonic() - started >= _DDGS_TIER_BUDGET_S:
+                _safe_log('warning', f"[SEARCH] ddgs: no engine answered within "
+                                     f"{_DDGS_TIER_BUDGET_S} s; stopped before {engine!r}")
+                break
             rows = _ddgs_rows(DDGS, query, max_results, backend=engine)
             if rows:
+                if engine != last:
+                    _safe_log('info', f"[SEARCH] ddgs: {engine} answered, asked "
+                                      f"first from now on in this process")
+                _DDGS_ANSWERED_LAST['engine'] = engine
                 return rows
     except Exception:
         pass
