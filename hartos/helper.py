@@ -406,17 +406,19 @@ def _mojeek_serp(query: str, max_results: int = 5) -> List[dict]:
 # one (duckduckgo) the whole of ddgs's 5 s default.
 _DDGS_ENGINE_TIMEOUT_S = 4
 _DDGS_TIER_BUDGET_S = 15
-# The ddgs engine that answered last in this process, asked first next time.
+# The ddgs engine that last filled a request on its own in this process,
+# asked first next time.
 _DDGS_ANSWERED_LAST = {}
 
 
 def _ddgs_rows(DDGS, query: str, max_results: int, backend: str = None,
-               timeout: int = _DDGS_ENGINE_TIMEOUT_S) -> List[dict]:
+               timeout: int = None) -> List[dict]:
     """One ddgs text search as [{'title','url','snippet'}]; [] when it finds
     nothing or fails.  No ``backend`` = the package's own default, as before.
-    ``timeout`` is how long ddgs waits for that search."""
+    ``timeout`` is how long ddgs waits for that search; None = the package's
+    own default."""
     try:
-        with DDGS(timeout=timeout) as ddg:
+        with (DDGS() if timeout is None else DDGS(timeout=timeout)) as ddg:
             found = (ddg.text(query, max_results=max_results) if backend is None
                      else ddg.text(query, max_results=max_results, backend=backend))
         rows = [{'title': r.get('title', ''),
@@ -459,26 +461,43 @@ def _keyless_serp(query: str, max_results: int = 5) -> List[dict]:
         # auto 'No results found' while yandex alone returned 3 rows.  On
         # central (19 Nov) auto took 9.5 to 11.3 s, timed out once in three,
         # and only yahoo answered when asked alone.  So ask ddgs's own text
-        # engines one at a time, each with a short timeout, the engine that
-        # answered last on this node first, and keep the first that answers;
-        # stop once the tier's budget is spent so tiers B-D still run
+        # engines one at a time, the remembered engine first, and add their
+        # rows (one per link) until the request is filled.  grokipedia and
+        # wikipedia give at most one row and grokipedia comes before yahoo
+        # (review rv_bfe4, live), so a first answer is not enough, and only an
+        # engine that filled the request on its own is remembered.  No engine
+        # waits past what is left of the tier's budget, so tiers B-D still run
         # (tests/unit/test_keyless_search_tries_each_engine.py).
         last = _DDGS_ANSWERED_LAST.get('engine')
         if last in engines:
             engines = [last] + [e for e in engines if e != last]
+        rows, links, filled_by = [], set(), {}
         started = time.monotonic()
         for engine in engines:
-            if time.monotonic() - started >= _DDGS_TIER_BUDGET_S:
-                _safe_log('warning', f"[SEARCH] ddgs: no engine answered within "
-                                     f"{_DDGS_TIER_BUDGET_S} s; stopped before {engine!r}")
+            left = int(_DDGS_TIER_BUDGET_S - (time.monotonic() - started))
+            if left < 1:
+                _safe_log('warning', f"[SEARCH] ddgs: {_DDGS_TIER_BUDGET_S} s spent "
+                                     f"with {len(rows)} of {max_results} rows; "
+                                     f"stopped before {engine!r}")
                 break
-            rows = _ddgs_rows(DDGS, query, max_results, backend=engine)
-            if rows:
-                if engine != last:
-                    _safe_log('info', f"[SEARCH] ddgs: {engine} answered, asked "
-                                      f"first from now on in this process")
-                _DDGS_ANSWERED_LAST['engine'] = engine
-                return rows
+            got = _ddgs_rows(DDGS, query, max_results, backend=engine,
+                             timeout=min(_DDGS_ENGINE_TIMEOUT_S, left))
+            if len(got) >= max_results:
+                filled_by[engine] = len(got)
+            for r in got:
+                if r['url'] not in links:
+                    links.add(r['url'])
+                    rows.append(r)
+            if len(rows) >= max_results:
+                break
+        if filled_by:
+            best = max(filled_by, key=filled_by.get)
+            if best != last:
+                _safe_log('info', f"[SEARCH] ddgs: {best} filled the request, asked "
+                                  f"first from now on in this process")
+            _DDGS_ANSWERED_LAST['engine'] = best
+        if rows:
+            return rows[:max_results]
     except Exception:
         pass
     rows = _mojeek_serp(query, max_results)             # Tier B — Mojeek (primary)
