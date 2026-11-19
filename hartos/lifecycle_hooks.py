@@ -2511,11 +2511,14 @@ def action_own_text(action) -> str:
     return str(action)
 
 
-def action_named_tools(agents, action_text):
+def action_named_tools(agents, action_text, where=''):
     """(every tool these agents can SERVE, the ones the action's TEXT names).
 
     ``action_text`` is the action's words, or the action itself, which
-    action_own_text reads its words from.
+    action_own_text reads its words from.  ``where``: the session and action
+    this reading is for, named in any warning it logs (rv_942a S3: one
+    server.log holds every agent's lines); without it the warning names the
+    turn's request and user.
 
     The ONE rule for "this action names that tool".  Read by the REUSE
     fabrication gate (reuse_recipe._reuse_fabricated_tools, through
@@ -2578,13 +2581,31 @@ def action_named_tools(agents, action_text):
                 names.add(_cn)
     text = action_own_text(action_text).lower()
     referenced = [n for n in names if _text_names_tool(text, n)]
-    for fn in _service_functions_named_by_tool(text, names, referenced):
+    for fn in _service_functions_named_by_tool(text, names, referenced, where):
         if fn not in referenced:
             referenced.append(fn)
     return names, referenced
 
 
-def _service_functions_named_by_tool(text, served, referenced=()):
+def _where_for_log(where=''):
+    """``where``, or the turn's request and user when the caller gave none."""
+    if where:
+        return str(where)
+    try:
+        from hartos.threadlocal import thread_local_data
+        return (f"request {thread_local_data.get_request_id()!r} "
+                f"user {thread_local_data.get_user_id()!r}")
+    except Exception:
+        return 'an unknown turn'
+
+
+#: Whether the service tool registry's last read failed: its warning is said
+#: once per failure, not once per gate call (rv_942a S3), and said again after
+#: a read succeeds and a later one fails.
+_REGISTRY_UNREADABLE_SAID = [False]
+
+
+def _service_functions_named_by_tool(text, served, referenced=(), where=''):
     """The served functions a step names through their service TOOL's name.
 
     The attach hands a step the one function of a service tool it names by
@@ -2607,33 +2628,47 @@ def _service_functions_named_by_tool(text, served, referenced=()):
         tools = dict(getattr(service_tool_registry, '_tools', None) or {})
     except Exception as err:
         # Not silent (rv_b06b's review): without the registry no step can be
-        # held to a tool it names by its service name.
-        logger.warning(f"[FAB-GUARD] service tool registry unreadable ({err!r}); "
-                       f"no step is held to a tool it names by its service name")
+        # held to a tool it names by its service name.  Said once per failure
+        # (rv_942a S3), not once per gate call.
+        if not _REGISTRY_UNREADABLE_SAID[0]:
+            _REGISTRY_UNREADABLE_SAID[0] = True
+            logger.warning(f"[FAB-GUARD] service tool registry unreadable "
+                           f"({err!r}); no step is held to a tool it names by "
+                           f"its service name until it can be read")
         return []
+    _REGISTRY_UNREADABLE_SAID[0] = False
     found = []
     for tool_name, tool in tools.items():
         if tool_name in served or not _text_names_tool(text, tool_name):
             continue
         fn = sole_endpoint_function(tool_name, tool)
         if fn is None:
+            own = sorted({endpoint_function_name(tool_name, ep)
+                          for ep in (getattr(tool, 'endpoints', None) or {})})
             # The text may name one of its endpoints outright
             # ('wan2gp_generate' contains 'wan2gp'): that function is already
-            # required, so naming the tool counted nothing it should have
-            # (rv_b06b's review: a false warning on every such step).
-            own = {endpoint_function_name(tool_name, ep)
-                   for ep in (getattr(tool, 'endpoints', None) or {})}
-            if own & set(referenced or ()):
+            # required, so naming it counted nothing it should have (rv_b06b's
+            # review: a false warning on every such step).  Only when EVERY
+            # mention of the tool is inside such a name (rv_942a S4): "wan2gp:
+            # make the clip, then wan2gp_check_result" still names the tool on
+            # its own for the clip, and that part is not held.
+            rest = text
+            for name in sorted(set(own) & set(referenced or ()), key=len,
+                               reverse=True):
+                rest = re.sub(r'(?<![a-z0-9_])' + re.escape(name.lower())
+                              + r'(?![a-z0-9_])', ' ', rest)
+            if rest != text and not _text_names_tool(rest, tool_name):
                 continue
             logger.warning(
-                f"[FAB-GUARD] the step names service tool {tool_name!r}, "
-                f"which has {len(getattr(tool, 'endpoints', None) or {})} "
-                f"endpoints; none counts as named, so no result of it is "
-                f"required")
+                f"[FAB-GUARD] {_where_for_log(where)}: the step names service "
+                f"tool {tool_name!r}, which has {len(own)} endpoints "
+                f"({', '.join(own)}); none counts as named, so no result of it "
+                f"is required. Name the one the step needs.")
         elif fn not in served:
             logger.warning(
-                f"[FAB-GUARD] the step names {tool_name!r}; its function "
-                f"{fn!r} is not served here, so no result of it is required")
+                f"[FAB-GUARD] {_where_for_log(where)}: the step names "
+                f"{tool_name!r}; its function {fn!r} is not served here, so no "
+                f"result of it is required")
         else:
             found.append(fn)
     return found
@@ -2719,7 +2754,8 @@ def _tools_this_action_names(user_prompt: str, action_id: int):
     action_text = str(getattr(task, 'description', '') or '').lower()
     group_chat = get_registered_groupchat(user_prompt)
     return action_text, action_named_tools(
-        getattr(group_chat, 'agents', None), action_text)[1]
+        getattr(group_chat, 'agents', None), action_text,
+        where=f"session {user_prompt} action {action_id}")[1]
 
 
 def _receipt_is_real_work(user_prompt: str, action_id: int, messages,
