@@ -236,7 +236,8 @@ class TestToolsAndCli:
         store = MandateStore(str(tmp_path / 'm.json'), ledger=ledger, key=b'k' * 32)
         tools = {t['name']: t['function']
                  for t in ap2.get_ap2_tools_for_autogen('agent', user_id='u1')}
-        assert list(tools) == ['request_payment', 'authorize_payment', 'process_payment']
+        assert list(tools) == ['request_payment', 'authorize_payment', 'process_payment',
+                               'create_payment_link', 'check_payment_link']
         with patch.object(ap2, 'payment_ledger', ledger), \
                 patch('integrations.ap2.ap2_mandate.get_mandate_store', return_value=store), \
                 patch('integrations.agent_engine.liquid_ui_service.push_agent_ui',

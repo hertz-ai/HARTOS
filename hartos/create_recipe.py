@@ -1923,7 +1923,17 @@ def create_agents(user_id: str,task,prompt_id, autonomous: bool = False) -> Tupl
         # a repr, so detection on it finds nothing (plan C7).  The keyword leg
         # is unchanged; a record without stored tags resolves exactly as
         # before.
-        goal_tags = resolve_goal_tags(stored_goal_tags, task)
+        # The node's own daemon turn for a goal is also resolved with its goal
+        # TYPE's tool tags, beside the record's own (#284): a goal's record
+        # stores none and this leg's words are a repr, so an outreach goal
+        # ran without its CRM tools.  One rule for both builders
+        # (goal_manager.daemon_turn_stored_tags); a person's turn resolves
+        # exactly as before.
+        from integrations.agent_engine.goal_manager import daemon_turn_stored_tags
+        goal_tags = resolve_goal_tags(
+            daemon_turn_stored_tags(stored_goal_tags,
+                                    request_id_list.get(user_prompt)),
+            task)
         _n_all_svc = len(svc_tools)
         svc_tools = filter_service_tools(goal_tags, svc_tools, svc_defs,
                                          service_tool_registry)

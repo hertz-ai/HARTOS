@@ -669,7 +669,21 @@ class ModelOrchestrator:
         """
         if entry.model_type == 'llm':
             return self.LLM_VRAM_KEY
-        return self._CATALOG_TO_VRAM_KEY.get(entry.id, entry.id)
+        key = self._CATALOG_TO_VRAM_KEY.get(entry.id)
+        if key:
+            return key
+        if entry.model_type == 'tts':
+            # A voice row the map does not list books under the key its
+            # engine's spec declares, the key the voice worker and Nunba book
+            # ('tts_neutts' for tts-neutts-air).  The catalog id has no
+            # budget, so NeuTTS, MeloTTS, XTTS, MMS and OmniVoice were booked
+            # at 0.0 GB beside the worker's real row.
+            from integrations.channels.media.tts_router import (
+                ENGINE_REGISTRY, catalog_id_to_engine_id)
+            spec = ENGINE_REGISTRY.get(catalog_id_to_engine_id(entry.id))
+            if spec is not None and spec.vram_key:
+                return spec.vram_key
+        return entry.id
 
     def _llm_resident(self) -> bool:
         """True while the main LLM holds its VRAM row (LLM_VRAM_KEY in the

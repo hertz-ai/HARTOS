@@ -598,7 +598,9 @@ def build_reel_tools(user_id, *, prompt_id,
         use_logo: Annotated[str, "yes, no, or '' = her instructions"] = '',
         clips: Annotated[str, "Clip ids; '' = attached clips"] = '',
     ) -> str:
-        """Make an Instagram reel video from her attached makeup clips and send it to her phone.
+        # Only the first docstring line reaches the model and the plan writer
+        # (_describe), so what reel_make does by itself is said there.
+        """Make an Instagram reel video from her attached makeup clips and send it to her phone. It watches each clip and picks the best moments itself with the vision model, so no separate step needs to look at the clips first.
 
         Plays her clips in the order she filmed them and ends on the
         finished look.  Takes minutes; the reel also arrives on her phone

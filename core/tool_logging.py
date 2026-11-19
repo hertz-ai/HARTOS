@@ -236,6 +236,28 @@ def note_unhinted_refusal(tool_name: str, result) -> bool:
 # autogen's own wrapping (ConversableAgent._wrap_function) into _function_map.
 _COUNTS_ITS_OWN_REPLIES = '_hart_counts_own_refusals'
 
+#: A tool sets this attribute on its function to the names of the parameters
+#: that carry a person's private details (a payer's phone or email, a child's
+#: name: integrations.ap2.ap2_protocol create_payment_link).  The
+#: "Arguments:" line logs '<withheld>' for them; every other tool's line is
+#: as before.
+PRIVATE_ARGUMENTS_ATTR = '_hart_private_arguments'
+
+
+def _arguments_line(func, args, kwargs) -> str:
+    """The "Arguments:" log line for a call of ``func``, with the values of
+    the parameters it marks private (PRIVATE_ARGUMENTS_ATTR) withheld.  A
+    call whose arguments cannot be matched to the parameters logs none."""
+    private = getattr(func, PRIVATE_ARGUMENTS_ATTR, ())
+    if not private:
+        return f"Arguments: {args}, Keyword Arguments: {kwargs}"
+    try:
+        bound = inspect.signature(func).bind_partial(*args, **kwargs).arguments
+    except TypeError:
+        return "Arguments: <withheld: they do not match the tool's parameters>"
+    return "Arguments: " + str({k: ('<withheld>' if k in private else v)
+                                for k, v in bound.items()})
+
 
 def note_executor_reply(func, tool_name: str, result) -> bool:
     """The executor's half of the [TOOL-REFUSAL-NO-HINT] count.
@@ -376,8 +398,7 @@ def log_tool_execution(func=None, *, name=None, plain_errors=False):
         @wraps(func)
         async def async_wrapper(*args, **kwargs):
             tool_logger.info(f"TOOL EXECUTION START: {tool_name}")
-            tool_logger.info(
-                f"Arguments: {args}, Keyword Arguments: {kwargs}")
+            tool_logger.info(_arguments_line(func, args, kwargs))
             _emit_tool_call_stage(tool_name)
             _t0 = time.perf_counter()
             vault = credential_vault()
@@ -414,8 +435,7 @@ def log_tool_execution(func=None, *, name=None, plain_errors=False):
     @wraps(func)
     def sync_wrapper(*args, **kwargs):
         tool_logger.info(f"TOOL EXECUTION START: {tool_name}")
-        tool_logger.info(
-            f"Arguments: {args}, Keyword Arguments: {kwargs}")
+        tool_logger.info(_arguments_line(func, args, kwargs))
         _emit_tool_call_stage(tool_name)
         _t0 = time.perf_counter()
         vault = credential_vault()
@@ -509,4 +529,5 @@ def timed_stage(name: str, logger=None, warn_over_ms: float | None = None,
             _log.info(_line)
 
 
-__all__ = ['credential_vault', 'log_tool_execution', 'timed_stage', 'tool_logger']
+__all__ = ['credential_vault', 'log_tool_execution', 'timed_stage', 'tool_logger',
+           'PRIVATE_ARGUMENTS_ATTR']
