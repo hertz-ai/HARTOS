@@ -606,37 +606,40 @@ class TestGetDistributedCoordinator:
 # ── _has_hive_peers ───────────────────────────────────────────────────────
 
 class TestHasHivePeers:
-    def test_no_peers_returns_false(self):
-        """Returns False when peer count <= 1 (only self)."""
+    """The count is of OTHER nodes heard from within the gossip stale
+    threshold (this node's own row is excluded by id, not assumed to be
+    one of them); the real query is pinned against a real peer_nodes table
+    in tests/unit/test_a_hive_goal_finishes_on_central.py."""
+
+    @staticmethod
+    def _modules(count):
+        from types import SimpleNamespace
         mock_db = MagicMock()
         mock_db.__enter__ = MagicMock(return_value=mock_db)
         mock_db.__exit__ = MagicMock(return_value=False)
-        mock_db.query.return_value.filter.return_value.count.return_value = 1
-
+        mock_db.query.return_value.filter.return_value.count.return_value = count
         mock_models = MagicMock()
         mock_models.db_session.return_value = mock_db
-
-        with patch.dict('sys.modules', {
+        # The column comparison the freshness filter builds.
+        mock_models.PeerNode.last_seen.__ge__ = MagicMock(return_value=True)
+        discovery = MagicMock()
+        discovery.get_peer_discovery.return_value = SimpleNamespace(
+            stale_threshold=300, node_id='this-node')
+        return {
             'integrations.social': MagicMock(),
             'integrations.social.models': mock_models,
-        }):
+            'integrations.social.peer_discovery': discovery,
+        }
+
+    def test_no_peers_returns_false(self):
+        """Returns False when no other node is live."""
+        with patch.dict('sys.modules', self._modules(0)):
             result = dispatch_mod._has_hive_peers()
         assert result is False
 
     def test_has_peers_returns_true(self):
-        """Returns True when peer count > 1."""
-        mock_db = MagicMock()
-        mock_db.__enter__ = MagicMock(return_value=mock_db)
-        mock_db.__exit__ = MagicMock(return_value=False)
-        mock_db.query.return_value.filter.return_value.count.return_value = 3
-
-        mock_models = MagicMock()
-        mock_models.db_session.return_value = mock_db
-
-        with patch.dict('sys.modules', {
-            'integrations.social': MagicMock(),
-            'integrations.social.models': mock_models,
-        }):
+        """Returns True when another node is live."""
+        with patch.dict('sys.modules', self._modules(1)):
             result = dispatch_mod._has_hive_peers()
         assert result is True
 

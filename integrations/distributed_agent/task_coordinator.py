@@ -502,6 +502,50 @@ class DistributedTaskCoordinator:
             return 0
         return released
 
+    def complete_held_tasks(self, goal_id: str, agent_id: str,
+                            result: Any) -> int:
+        """Complete the goal's tasks held for help with ``result``, the reply
+        of the goal's turn that ran on this node.  Returns how many.
+
+        A held task (hold_task) is the goal's turn handed to a person or the
+        expert.  The expert's step then runs as a local turn (a turn on a
+        named model never goes to the hive, dispatch_goal), and nothing
+        released or completed the task: the goal's hive set stayed open and
+        the daemon's grounding wait paused it.  Measured on central
+        2026-11-18: goals 2669bc6c and 561bcef9.  The task's turn is the
+        goal's own (every child carries the goal's prompt), so the local
+        turn's reply is its result.
+
+        The same edges a worker's run takes, through the existing calls:
+        _release_held_tasks (BLOCKED to PENDING), the claim
+        (_stage_task_claim, IN_PROGRESS), then submit_result, the one
+        completion.  A task another worker claims in between is left to it.
+        """
+        parent = self._ledger.get_task(goal_id)
+        held = [c for c in (self._ledger.get_task(cid) for cid in
+                            (getattr(parent, 'child_task_ids', None) or []))
+                if c is not None and c.status == TaskStatus.BLOCKED
+                and c.blocked_reason == BlockedReason.INPUT_REQUIRED.value]
+        if not held or not self._release_held_tasks(goal_id):
+            return 0
+        completed = 0
+        for task in held:
+            try:
+                snapshots = self._stage_task_claim(task, agent_id)
+                if snapshots is None:
+                    continue
+                if not self._commit_deferred(
+                        f"claim of held task {task.task_id} by {agent_id}",
+                        snapshots):
+                    self._lock.release_task(task.task_id, agent_id)
+                    continue
+                self.submit_result(task.task_id, agent_id, result)
+                completed += 1
+            except Exception as exc:
+                logger.warning("Held task %s of goal %s not completed: %s",
+                               task.task_id, goal_id, exc)
+        return completed
+
     def claim_next_task(
         self,
         agent_id: str,

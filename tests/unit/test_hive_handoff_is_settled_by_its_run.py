@@ -275,7 +275,8 @@ def test_a_goal_whose_hive_set_is_finished_runs_here(coord):
 
     assert chat.call_count == 1, 'the goal never ran: the finished set took it'
     assert goal.status == 'completed'
-    assert goal.config_json['completion_grounding'] == 'ledger_tasks_complete'
+    # The turn ran here: its own spend grounds it, not the September set.
+    assert goal.config_json['completion_grounding'] == 'local_dispatch_spend'
 
 
 def test_a_finished_run_still_waiting_to_be_settled_is_not_run_again(coord):
@@ -336,14 +337,16 @@ def test_a_wait_that_runs_out_pauses_and_a_resume_starts_a_fresh_wait():
     assert 'awaiting_verification_since' in goal.config_json
 
 
-def test_the_timeout_pause_names_the_route_the_work_took():
-    """A hive handoff that never finished says it was handed to the hive; a
-    local dispatch that spent spark with tasks outstanding says so, as it did
-    before the hive route existed (review of 3d11fac5a, hartos-77, 3.i)."""
+def test_the_timeout_pause_is_a_hive_runs_and_a_local_turn_completes():
+    """A hive handoff that never finished says it was handed to the hive.  A
+    turn that ran here and spent spark is judged by its spend: hive tasks an
+    earlier handoff left outstanding are not its work, so they never hold
+    it (central 2026-11-18, goals 2669bc6c and 561bcef9, paused "work was
+    dispatched and spark was spent")."""
     from datetime import datetime, timedelta
     stale = (datetime.utcnow() - timedelta(seconds=3600)).isoformat()
     outstanding = _Progress({'total_tasks': 1, 'completed': 0})
-    reasons = {}
+    goals = {}
     for to_hive in (True, False):
         goal = Goal(cfg={'spark_at_dispatch': 0,
                          'awaiting_verification_since': stale},
@@ -352,11 +355,13 @@ def test_the_timeout_pause_names_the_route_the_work_took():
                           return_value=outstanding):
             agent_daemon._settle_dispatched_goal(_Db(), goal, GOAL,
                                                  handed_to_hive=to_hive)
-        assert goal.status == 'paused'
-        reasons[to_hive] = goal.config_json['pause_reason']
-    assert reasons[True].startswith('Auto-paused: work was handed to the hive')
-    assert reasons[False].startswith(
-        'Auto-paused: work was dispatched and spark was spent')
+        goals[to_hive] = goal
+    assert goals[True].status == 'paused'
+    assert goals[True].config_json['pause_reason'].startswith(
+        'Auto-paused: work was handed to the hive')
+    assert goals[False].status == 'completed', goals[False].config_json
+    assert goals[False].config_json['completion_grounding'] == \
+        'local_dispatch_spend'
 
 
 # ── the local route is unchanged ─────────────────────────────────────────
