@@ -406,6 +406,8 @@ class MemoryStore:
                 params.append(max_results * 2)  # Get extra for filtering
 
                 rows = conn.execute(sql, params).fetchall()
+                if not rows:
+                    rows = self._rows_holding_most_words(conn, sql, params, query)
             else:
                 # Fallback to LIKE search
                 sql = """
@@ -730,6 +732,32 @@ class MemoryStore:
         # Quote each token and join with AND
         quoted = [f'"{t}"' for t in tokens if t]
         return " AND ".join(quoted)
+
+    def _rows_holding_most_words(self, conn, sql, params, raw: str) -> list:
+        """The rows a query finds when no row holds ALL its words: rows that
+        hold at least two of its words of four letters or more (one, when it
+        has only one such word).  search() orders them as it orders any FTS
+        rows.
+
+        Why: the AND query above is the whole search wherever the store has
+        no embedding_fn, and MemoryGraph builds it without one, so one word no
+        row holds hid every row.  Measured on central 2026-11-19 on a copy of
+        a goal's graph: 21 of its 54 rows hold 'textile' and 20 'compliance',
+        and 'textile compliance requirements for export buyers' found none,
+        so search_long_term_memory told the step nothing was saved.  Short
+        words ('for', 'the', 'on') are left out of the count because nearly
+        every row holds them."""
+        import re
+        words = {t.lower() for t in re.findall(r'[A-Za-z0-9_]+', raw)
+                 if len(t) >= 4}
+        if not words:
+            return []
+        need = min(2, len(words))
+        any_word = " OR ".join(f'"{w}"' for w in sorted(words))
+        rows = conn.execute(sql, [any_word] + list(params[1:])).fetchall()
+        return [r for r in rows
+                if len(words & {t.lower() for t in re.findall(
+                    r'[A-Za-z0-9_]+', r['content'] or '')}) >= need]
 
     def _bm25_to_score(self, rank: float) -> float:
         """Convert BM25 rank to a 0-1 score (higher is better)."""

@@ -870,7 +870,21 @@ def build_core_tool_closures(ctx):
     # ------------------------------------------------------------------
     @log_tool_execution
     def text_2_image(text: Annotated[str, "Text to create image"]) -> str:
-        return helper_fun.txt2img(text)
+        url = helper_fun.txt2img(text)
+        if url:
+            return url
+        # txt2img answers '' for a failed request, an open circuit breaker
+        # and a reply with no image alike.  Handed that '' as is, the model
+        # called again: central 2026-11-19, two goals paused needs_help on a
+        # text_2_image step ('did not complete after 3 attempts', 'looped').
+        from core.tool_refusal import RETRY_LATER, refuse
+        return refuse('text_2_image',
+                      "the image service did not deliver an image for this "
+                      "prompt (it is unreachable or busy)",
+                      "Carry on without the image: put the image prompt and "
+                      "what the picture should show into the step's result "
+                      "as text, and finish the step",
+                      retry=RETRY_LATER)
 
     tools.append((
         "text_2_image",
@@ -2589,6 +2603,24 @@ def build_core_tool_closures(ctx):
     if simplemem_store is not None or memory_graph is not None:
         from core.event_loop import get_or_create_event_loop
 
+        def _nothing_recalled(query):
+            """Finding nothing is an answer the step may end on, so it is no
+            refusal; it says what to do next.  A bare 'No relevant memories
+            found.' left central's daemon steps searching again until they
+            paused needs_help (2026-11-19)."""
+            return (f"No relevant memories found for {str(query)[:120]!r}. "
+                    f"Nothing saved matches it: carry on with this step from "
+                    f"what you already have; the same search again will find "
+                    f"nothing.")
+
+        def _recall_failed(store, e):
+            from core.tool_refusal import RETRY_LATER, refuse
+            return refuse('search_long_term_memory',
+                          f"the {store} memory store could not be read "
+                          f"({type(e).__name__})",
+                          "Carry on with this step without saved facts",
+                          retry=RETRY_LATER)
+
         @log_tool_execution
         def search_long_term_memory(
             query: Annotated[str, "Natural language query to search long-term memory"],
@@ -2603,10 +2635,10 @@ def build_core_tool_closures(ctx):
                     text = _bounded_recall(
                         [r.content for r in (results or [])], max_items=1,
                         skip_oversize=False)
-                    return text or "No relevant memories found."
+                    return text or _nothing_recalled(query)
                 except Exception as e:
                     tool_logger.info(f"SimpleMem search error: {e}")
-                    return "Memory search unavailable."
+                    return _recall_failed('SimpleMem', e)
             # MemoryGraph leg — same contract, local store, no API key.
             try:
                 # Fetch past the 5 shown: rows _bounded_recall skips as
@@ -2614,10 +2646,10 @@ def build_core_tool_closures(ctx):
                 results = memory_graph.recall(query, mode='hybrid', top_k=10)
                 text = _bounded_recall(
                     [r.content for r in (results or [])], max_items=5)
-                return text or "No relevant memories found."
+                return text or _nothing_recalled(query)
             except Exception as e:
                 tool_logger.info(f"MemoryGraph search error: {e}")
-                return "Memory search unavailable."
+                return _recall_failed('MemoryGraph', e)
 
         tools.append((
             "search_long_term_memory",
