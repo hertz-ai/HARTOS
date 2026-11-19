@@ -1514,35 +1514,45 @@ def seal_binding_credential(channel_type: str, value: str) -> str:
         return value
 
 
-#: The metadata keys of a binding that a client may be shown: where the
-#: channel is (the address, the servers) and what to call it.  An allowlist:
-#: a credential (a password, an app password, a token, a sealed blob) is
-#: never on it, and a key nobody listed is not shown.
+#: The metadata keys of a binding that a client may be shown, when they are
+#: stored plain: where the channel is (the servers, the ports) and what to
+#: call it.  An allowlist: a credential (a password, an app password, a
+#: token, a sealed blob) is never on it, and a key nobody listed is not shown.
 PUBLIC_BINDING_METADATA = frozenset({
-    'display_name', 'email_address', 'imap_host', 'smtp_host', 'imap_port',
-    'smtp_port'})
+    'display_name', 'imap_host', 'smtp_host', 'imap_port', 'smtp_port'})
 
 
 def binding_for_client(binding) -> Dict[str, Any]:
     """A UserChannelBinding as a client may read it: ``binding.to_dict()``
-    with its metadata_json cut to PUBLIC_BINDING_METADATA, each value opened
-    when it was sealed (a value that stays sealed is left out).  THE one
-    serializer of a binding for a client: GET /bindings, the create, preferred
-    and pairing replies all answer through it, so a credential does not leave
-    the server whatever route returns the row (design D8-c).  The model's own
-    to_dict lives in hevolve-database, where this cannot change it."""
+    with its metadata_json cut to what may be shown.  THE one serializer of a
+    binding for a client: GET /bindings, the create, preferred and pairing
+    replies all answer through it, so a credential does not leave the server
+    whatever route returns the row (design D8-c).  The model's own to_dict
+    lives in hevolve-database, where this cannot change it.
+
+    NOTHING IS DECRYPTED for a client.  metadata_json holds what a client
+    wrote as well as what register_channel wrote, so opening a sealed value
+    here made the listing a decryption oracle for any ciphertext the caller
+    holds, open to anyone who can sign up (review of fb9c8646d, M1).  What is
+    shown: the PUBLIC_BINDING_METADATA keys whose values are stored plain
+    (a sealed one is dropped), and, for a channel that holds several accounts
+    (a mailbox), the account itself, which is the row's own channel_sender_id,
+    on a row that carries the account setting."""
     out = binding.to_dict()
     meta = out.get('metadata_json')
     if not isinstance(meta, dict):
         return out
     from security.secrets_manager import SEALED_PREFIX
-    shown = unseal_binding_metadata(
-        getattr(binding, 'channel_type', None) or out.get('channel_type'),
-        {k: v for k, v in meta.items() if k in PUBLIC_BINDING_METADATA})
-    out['metadata_json'] = {
-        k: v for k, v in shown.items()
-        if isinstance(v, (str, int, float, bool))
-        and not str(v).startswith(SEALED_PREFIX)}
+    shown = {k: v for k, v in meta.items()
+             if k in PUBLIC_BINDING_METADATA
+             and isinstance(v, (str, int, float, bool))
+             and not str(v).startswith(SEALED_PREFIX)}
+    channel_type = getattr(binding, 'channel_type', None) or out.get('channel_type')
+    param = (FlaskChannelIntegration._CHANNEL_SPECS.get(channel_type) or {}).get(
+        'account_param')
+    if param and param in meta and out.get('channel_sender_id'):
+        shown[param] = out['channel_sender_id']
+    out['metadata_json'] = shown
     return out
 
 
