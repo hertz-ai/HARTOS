@@ -772,7 +772,16 @@ def get_llm(temperature=0.7, max_tokens=1500):
        through its vendor SDK.  The model is the one the vault exported; there
        is no vendor default to fall back on.
     2. ChatQwen3VL over the ONE configured backend (GPT_API / LLM_MODEL_NAME).
+
+    Before both: a turn that names its model (the thread's model_config
+    override, e.g. a goal turn on the expert) runs on that model, as the
+    turn's autogen agents do (core.autogen_config.turn_chat_model).
     """
+    from core.autogen_config import turn_chat_model
+    _turn = turn_chat_model(ChatOpenAI, temperature=temperature, max_tokens=max_tokens)
+    if _turn is not None:
+        return _turn
+
     _active = os.environ.get('HEVOLVE_ACTIVE_CLOUD_PROVIDER', '')
 
     if _active == 'anthropic' and os.environ.get('ANTHROPIC_API_KEY'):
