@@ -391,22 +391,29 @@ def _call(call_id):
                          'arguments': '{"channel": "email", "text": "%s"}' % call_id}}
 
 
-def test_the_models_own_last_turn_is_followed_by_a_user_turn(metered):
+def test_the_models_own_last_turn_is_followed_by_a_user_turn(metered, caplog):
     """Central 20:58:22: the StatusVerifier was asked to speak after the
     Assistant said nothing.  The role-order guard drops that empty turn, so
     the verifier's request ended on its own earlier verdict, and Claude 5
     models refuse a conversation that ends on the assistant ('This model does
     not support assistant message prefill').  The verdict stays where it was,
-    and the request ends on a user turn."""
+    and the request ends on a user turn, warned and counted like every user
+    turn the wire adds (ensure_user_turn; review of 70112e366)."""
+    import logging
     from core.constants import WIRE_USER_SEED_TEXT
+    seeds = hook.user_seed_count()
     handler, seen = _anthropic(_message([{'type': 'text', 'text': '{"status": "done"}'}]))
-    reply = _claude(handler).chat.completions.create(model=MODEL, messages=[
+    with caplog.at_level(logging.WARNING, logger='llm_outbound'):
+        reply = _claude(handler).chat.completions.create(model=MODEL, messages=[
         {'role': 'system', 'content': SYSTEM},
-        {'role': 'user', 'name': 'ChatInstructor', 'content': 'Execute Action 2: draft the post'},
-        {'role': 'assistant', 'content': '{"status": "pending"}'},
-        {'role': 'user', 'name': 'Assistant', 'content': 'Assistant called post_to_channel'},
-        {'role': 'assistant', 'content': '{"status": "pending", "reason": "no reply yet"}'},
-    ])
+            {'role': 'user', 'name': 'ChatInstructor', 'content': 'Execute Action 2: draft the post'},
+            {'role': 'assistant', 'content': '{"status": "pending"}'},
+            {'role': 'user', 'name': 'Assistant', 'content': 'Assistant called post_to_channel'},
+            {'role': 'assistant', 'content': '{"status": "pending", "reason": "no reply yet"}'},
+        ])
+    assert hook.user_seed_count() == seeds + 1
+    assert any(r.levelname == 'WARNING' and 'own turn' in r.getMessage()
+               for r in caplog.records)
     assert seen[-1].url.path == '/v1/messages'
     turns = _sent(seen)['messages']
     _assert_the_api_accepts(turns)
@@ -454,6 +461,10 @@ def test_a_tool_call_with_no_result_right_after_it_is_left_out(metered, monkeypa
     assert sent_calls == answered
     texts = [b['text'] for t in turns for b in t['content'] if b['type'] == 'text']
     assert 'r1\n\nr2' in texts          # the cut call's results still reach the model
+    # The calls left out stay in the Assistant's own turn, as what it did.
+    assert [b['text'] for b in turns[-2]['content']] == [
+        '[called post_to_channel with {"channel": "email", "text": "%s"}; '
+        'no result recorded]' % c for c in pending]
 
 
 def test_results_split_by_another_message_still_lead_their_turn(metered):
@@ -476,23 +487,33 @@ def test_results_split_by_another_message_still_lead_their_turn(metered):
 
 def test_a_result_whose_call_was_cut_reaches_the_model_as_text(metered):
     """A tool result with no call right before it (here two turns sit
-    between them) goes as text, and the call it answered, which had no result
-    right after it, is left out: the API refuses both."""
+    between them) goes as text where it is, and the call it answered, which
+    had no result right after it, goes as text in its own turn: the API
+    refuses both as they are, and the model must still read that it posted
+    (review of 70112e366: a call left out without a trace was a post it could
+    make again)."""
+    offer = {'id': 'toolu_1', 'type': 'function',
+             'function': {'name': 'post_to_channel',
+                          'arguments': '{"channel": "email", "text": "Offer: 20% off"}'}}
     handler, seen = _anthropic(_message([{'type': 'text', 'text': 'ok'}]))
     _claude(handler).chat.completions.create(model=MODEL, tools=[TOOL], messages=[
-        {'role': 'user', 'content': 'Post the note'},
-        {'role': 'assistant', 'content': None, 'tool_calls': [_call('toolu_1')]},
+        {'role': 'user', 'content': 'Post the offer'},
+        {'role': 'assistant', 'content': None, 'tool_calls': [offer]},
         {'role': 'user', 'name': 'StatusVerifier', 'content': '{"status": "pending"}'},
         {'role': 'assistant', 'content': 'Waiting for the channel.'},
-        {'role': 'tool', 'tool_call_id': 'toolu_1', 'content': 'posted 1'},
+        {'role': 'tool', 'tool_call_id': 'toolu_1',
+         'content': 'posted to email list (412 recipients)'},
     ])
     turns = _sent(seen)['messages']
     _assert_the_api_accepts(turns)
     assert turns == [
-        {'role': 'user', 'content': [{'type': 'text', 'text': 'Post the note'},
-                                     {'type': 'text', 'text': '{"status": "pending"}'}]},
+        {'role': 'user', 'content': [{'type': 'text', 'text': 'Post the offer'}]},
+        {'role': 'assistant', 'content': [{'type': 'text', 'text':
+            '[called post_to_channel with {"channel": "email", "text": "Offer: 20% off"}]'}]},
+        {'role': 'user', 'content': [{'type': 'text', 'text': '{"status": "pending"}'}]},
         {'role': 'assistant', 'content': [{'type': 'text', 'text': 'Waiting for the channel.'}]},
-        {'role': 'user', 'content': [{'type': 'text', 'text': 'posted 1'}]},
+        {'role': 'user', 'content': [{'type': 'text',
+                                      'text': 'posted to email list (412 recipients)'}]},
     ]
 
 
