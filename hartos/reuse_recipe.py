@@ -404,7 +404,7 @@ from hartos.lifecycle_hooks import (
     hand_goal_to_its_person,
     mark_action_waiting_for_user, resume_from_user_input,
     record_ask_delivered, ledger_open_ask, person_waits_on, is_terminal_state,
-    record_user_answer,
+    record_user_answer, credited_early_send, get_registered_groupchat,
 )
 from hartos.cultural_wisdom import get_cultural_prompt
 
@@ -5796,11 +5796,15 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
             seen = getattr(task, 'evidence_seen_call_ids', set()) if task else set()
             seen = seen if isinstance(seen, (set, frozenset)) else set()
             _every_msg = [m for _s, msgs in sources for m in msgs]
-            def _is_named_result(msg):
+            _terms = _reuse_early_send_terms(user_prompt)
+
+            def _is_named_result(msg, msgs=None, idx=None, early=False):
                 """This tool message carries an unseen, non-failed result of a
                 tool the action names -- the gate's own rule, one copy.  A send
                 that asked the person something is never one
-                (lifecycle_hooks.send_is_ask): its answer is the receipt."""
+                (lifecycle_hooks.send_is_ask): its answer is the receipt.
+                ``early``: the message sits before this action's dispatch, so
+                only a send credited_early_send credits to it counts."""
                 if not isinstance(msg, dict) or msg.get('role') != 'tool':
                     return False
                 responses = msg.get('tool_responses')
@@ -5817,7 +5821,11 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
                     if body is None:
                         body = msg.get('content')
                     body = str(body or '')
-                    if call_id in seen or HISTORICAL_TOOL_PLACEHOLDER in body:
+                    credited = msgs is not None and credited_early_send(
+                        user_prompt, msgs, idx, call_id, body, int(action_id), **_terms)
+                    if early and not credited:
+                        continue
+                    if (call_id in seen and not credited) or HISTORICAL_TOOL_PLACEHOLDER in body:
                         continue
                     if tool_reply_failed(body):
                         continue
@@ -5845,7 +5853,23 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
                 if start is None:
                     continue
                 for idx in range(len(msgs) - 1, start, -1):
-                    if _is_named_result(msgs[idx]):
+                    if _is_named_result(msgs[idx], msgs, idx):
+                        return {**(source or {}), 'message_index': idx,
+                                'kind': 'tool_receipt'}
+                # This action's own output sent while the step before it ran:
+                # back through that step's window (its re-steers included),
+                # credited sends only (credited_early_send holds the rule).
+                _before = None
+                for idx in range(start - 1, -1, -1):
+                    _m = msgs[idx]
+                    _aid = (dispatch_action_id(_m.get('content'))
+                            if isinstance(_m, dict) else None)
+                    if _aid is not None:
+                        if _before is None or _aid == _before:
+                            _before = _aid
+                            continue
+                        break
+                    if _is_named_result(_m, msgs, idx, early=True):
                         return {**(source or {}), 'message_index': idx,
                                 'kind': 'tool_receipt'}
             _ctx_safe_log('warning', (
@@ -6959,6 +6983,16 @@ def _reuse_call_id_to_tool_name(msg_lists):
     return tool_call_names(msg_lists)
 
 
+def _reuse_early_send_terms(user_prompt):
+    """What lifecycle_hooks.credited_early_send needs from REUSE, for the gate,
+    the receipt finder and the commit alike: this turn's request id, and
+    REUSE's own ask-step rule (_reuse_ask_only_step), which lifecycle_hooks
+    does not import."""
+    gc = get_registered_groupchat(user_prompt)
+    return {'request_id': request_id_list.get(user_prompt),
+            'is_ask_step': lambda aid: bool(_reuse_ask_only_step(user_prompt, aid, gc))}
+
+
 def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
     """Registered tool names the current action NAMES but that produced ZERO
     tool results anywhere in the group chat — i.e. a fabricated 'completed'.
@@ -7048,13 +7082,20 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
             _seen = None
         _seen = _seen if isinstance(_seen, (set, frozenset)) else set()
         _call_fn = _reuse_call_id_to_tool_name(_msg_lists)
+        _terms = _reuse_early_send_terms(user_prompt)
 
-        def _record_result(call_id, content, fallback_name=None):
+        def _record_result(call_id, content, fallback_name=None, msgs=None, idx=None):
             """Count one tool RESULT, resolved to its function name."""
             # This result belongs to an EARLIER action — its call id was
             # already on the wire when the current action was dispatched.
             # Crediting it is what let 15 actions advance on 0 dispatches.
-            if call_id and call_id in _seen:
+            # The one exception is this action's own output sent while the
+            # step before it ran (credited_early_send, the rule the receipt
+            # finder and the commit check read too).
+            if call_id and call_id in _seen and not (
+                    msgs is not None and credited_early_send(
+                        user_prompt, msgs, idx, call_id, content, current_action,
+                        **_terms)):
                 return
             _body = str(content or '')
             if HISTORICAL_TOOL_PLACEHOLDER in _body:
@@ -7082,7 +7123,7 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
                 executed.add(fn)
 
         for _ml in _msg_lists:
-            for m in (_ml or []):
+            for _i, m in enumerate(_ml or []):
                 if not isinstance(m, dict) or m.get('role') != 'tool':
                     continue
                 # Two shapes, both live: the aggregate envelope autogen puts
@@ -7095,10 +7136,10 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
                     for r in responses:
                         if isinstance(r, dict):
                             _record_result(r.get('tool_call_id'),
-                                           r.get('content'), r.get('name'))
+                                           r.get('content'), r.get('name'), _ml, _i)
                 else:
                     _record_result(m.get('tool_call_id'), m.get('content'),
-                                   m.get('name'))
+                                   m.get('name'), _ml, _i)
         unrun = [n for n in referenced if n not in executed]
         try:
             # 'for session:' suffix, same as "Retrieved current_action_id": one
@@ -8566,7 +8607,8 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt
     ok1 = commit_verified_action_completion(
         user_prompt, current_action_id, evidence,
         f"{reason}: evidence-backed completion",
-        claimed_action_id=claimed_action_id)
+        claimed_action_id=claimed_action_id,
+        **_reuse_early_send_terms(user_prompt))
     ok2 = ok1 and safe_set_state(
         user_prompt, current_action_id, ActionState.TERMINATED,
         f"{reason}: done")

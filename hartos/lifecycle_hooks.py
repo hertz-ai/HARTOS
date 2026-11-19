@@ -2795,8 +2795,29 @@ def _work_results(message: dict, names: Dict[str, str], action_text: str,
         yield name
 
 
+def _cites_credited_early_send(user_prompt, messages, index, message, action_id,
+                               request_id, is_ask_step) -> bool:
+    """Whether the cited tool message holds a send credited_early_send credits
+    to this action: any one of its results (an aggregate carries several)."""
+    responses = message.get('tool_responses')
+    for result in (responses if isinstance(responses, list) and responses
+                   else [message]):
+        if not isinstance(result, dict):
+            continue
+        body = result.get('content')
+        if body is None:
+            body = message.get('content')
+        if credited_early_send(user_prompt, messages, index,
+                               result.get('tool_call_id') or message.get('tool_call_id'),
+                               body, action_id, request_id=request_id,
+                               is_ask_step=is_ask_step):
+            return True
+    return False
+
+
 def _verifier_completion_has_conversation_evidence(
-        user_prompt: str, action_id: int, json_obj: dict) -> bool:
+        user_prompt: str, action_id: int, json_obj: dict, *,
+        request_id=None, is_ask_step=None) -> bool:
     """Return whether a completion cites a real, earlier GroupChat result.
 
     The StatusVerifier JSON alone is never a receipt. The GroupChat registry is
@@ -2820,7 +2841,13 @@ def _verifier_completion_has_conversation_evidence(
     # completing action 2.  A missing dispatch marker is not evidence.  The
     # window is read in the SAME list that holds the receipt, so a buffer
     # (which also carries older turns) is held to the same rule as the log.
-    if latest_dispatch_before(messages, index + 1) != action_id:
+    if latest_dispatch_before(messages, index + 1) != action_id and not (
+            kind == 'tool_receipt'
+            and _cites_credited_early_send(user_prompt, messages, index, message,
+                                           action_id, request_id, is_ask_step)):
+        # The one exception: this action's own output, sent while the step
+        # before it ran (credited_early_send, the rule the REUSE gate and its
+        # receipt finder read too).  CREATE passes no request id: no credit.
         return False
     if kind == 'user_reply':
         # The person's answer to an ask step, cited at the seed that carried
@@ -3479,7 +3506,8 @@ def verdict_names_another_action(user_prompt: str, action_id,
 def commit_verified_action_completion(user_prompt: str, action_id: int,
                                       evidence: dict,
                                       reason: str = 'verified complete',
-                                      claimed_action_id=None) -> bool:
+                                      claimed_action_id=None, *,
+                                      request_id=None, is_ask_step=None) -> bool:
     """Commit one evidence-backed successful action through the canonical FSM.
 
     CREATE and REUSE use different non-deterministic conversations, but a
@@ -3524,7 +3552,8 @@ def commit_verified_action_completion(user_prompt: str, action_id: int,
         'evidence': evidence,
     }
     if not _verifier_completion_has_conversation_evidence(
-            user_prompt, action_id, verdict):
+            user_prompt, action_id, verdict,
+            request_id=request_id, is_ask_step=is_ask_step):
         logger.warning(
             "Refusing ungrounded completed verdict for action %s in %s",
             action_id, user_prompt)
@@ -3895,6 +3924,75 @@ def latest_dispatch_before(messages, index) -> Optional[int]:
     or None when none precedes it (latest_dispatch, read for its id)."""
     m = latest_dispatch(messages, before=index)
     return dispatch_action_id(m.get('content')) if m is not None else None
+
+
+def credited_early_send(user_prompt, messages, index, call_id, body, action_id, *,
+                        request_id=None, is_ask_step=None) -> bool:
+    """Whether the send result at ``messages[index]`` -- delivered BEFORE
+    ``action_id``'s dispatch, while the step before it was running -- is that
+    action's own output, so it counts as its receipt once.
+
+    Live 19 Nov 2026 00:40-00:45 IST (local 4B, cafe and email agents): the
+    model sent step N's message while step N-1 ran, N's watermark excluded it,
+    FABRICATED-COMPLETE re-steered N and the person got the message twice.  The
+    commit check (_verifier_completion_has_conversation_evidence) refused it
+    too, so ONE rule is read by the REUSE gate (_reuse_fabricated_tools), its
+    receipt finder (_reuse_completion_evidence) and that check.
+
+    All must hold (agreed with hartos-43, 19 Nov 00:52-01:10 IST):
+      * ``request_id`` is given and the send's own result went out in that
+        request (_receipt_request): this turn.  CREATE passes none and so
+        credits nothing.
+      * it is a delivered send that did not ask (delivered_text, send_is_ask):
+        output sends only.  An early QUESTION is left to the ask readers.
+      * the step before is found by POSITION: the dispatch latest before the
+        send names some action M, and every dispatch between the send and
+        ``action_id``'s next dispatch is M's (a re-steer of M keeps it M's).
+        Never ``action_id - 1``: held steps, re-steers and dependency order
+        break the numbering.
+      * ``action_id`` names the send tool and M does not: M naming it takes
+        its own send.  ``is_ask_step(M)`` is False: an ask step's send is its
+        ask.  The caller passes that check (REUSE's rule lives in
+        reuse_recipe, which this module does not import).
+    A send lies in exactly one gap before one dispatch, so it is credited to
+    at most one action."""
+    if not request_id or not callable(is_ask_step):
+        return False
+    try:
+        if not isinstance(messages, list) or not (0 <= int(index) < len(messages)):
+            return False
+        index = int(index)
+        if tool_call_names([messages]).get(call_id) != SEND_TOOL:
+            return False
+        if _receipt_request(body) != str(request_id):
+            return False
+        if delivered_text(messages, call_id, body) is None or send_is_ask(messages, call_id):
+            return False
+        before = latest_dispatch_before(messages, index + 1)
+        if before is None or before == int(action_id):
+            return False
+        reached = False
+        for m in messages[index + 1:]:
+            if not isinstance(m, dict) or m.get('_from_shared'):
+                continue  # latest_dispatch's own rule for what is a dispatch
+            aid = dispatch_action_id(m.get('content'))
+            if aid is None:
+                continue
+            if aid == int(action_id):
+                reached = True
+                break
+            if aid != before:
+                return False
+        if not reached:
+            return False
+        if SEND_TOOL not in _tools_this_action_names(user_prompt, int(action_id))[1]:
+            return False
+        if SEND_TOOL in _tools_this_action_names(user_prompt, before)[1]:
+            return False
+        return not is_ask_step(before)
+    except Exception as err:
+        logger.warning(f"credited_early_send: unreadable ({err!r}); no credit")
+        return False
 
 
 def stale_for_unstarted_action(messages, index, user_prompt,
