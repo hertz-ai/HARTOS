@@ -8533,8 +8533,8 @@ def _get_user_lock(user_key):
 def _review_proposed_plan(plan, max_rounds_remaining):
     """StatusVerifier-style auto-reviewer for HART OS autonomous flow.
 
-    Single-shot local-LLM call against the same Qwen3-VL endpoint that
-    gather_info uses — same model competence as the plan author.  Applies
+    Single-shot call on the model the turn runs on (the expert on a goal
+    turn), else the node's own endpoint (GPT_API).  Applies
     quality gates and returns ('approved', None),
     ('needs_refinement', feedback_text) or ('unreviewed', why) when no
     verdict came back.
@@ -8596,19 +8596,39 @@ def _review_proposed_plan(plan, max_rounds_remaining):
             "  {\"status\":\"needs_refinement\",\"flow_name\":\"the flow to fix\",\"feedback\":\"specific fix needed\"} otherwise\n"
             "ASCII only.  No prose.  Start with { end with }."
         )
-        # Reuse pooled_post that gather_info uses; same endpoint
-        r = pooled_post(
-            GPT_API,
-            json={
-                'model': LLM_MODEL_NAME,
-                'messages': [{'role': 'user', 'content': review_prompt}],
-                'temperature': 0.0,
-                'max_tokens': 256,
-            },
-            headers=LLM_AUTH_HEADERS,
-            timeout=60,
-        )
-        text = r.json()['choices'][0]['message']['content']
+        # The turn's model when the turn names one (a goal turn on the
+        # expert): the same list its autogen agents and get_llm run on,
+        # which never names a provider that is refusing calls
+        # (core.autogen_config.turn_chat_model).  GPT_API is the node's own
+        # model whatever the turn runs on: on central 2026-11-19 that was
+        # openrouter/free with its day quota spent, so every expert turn's
+        # plan came back unreviewed and waited on the owner's card.  The
+        # cap leaves room for a thinking model's reasoning, which counts
+        # against max_tokens: on central (19-20 Nov) claude-haiku-5-5 stopped
+        # at exactly 300 output tokens on 13 calls, the cap of the agent
+        # matcher (get_llm max_tokens=300), whose answer is one agent id.
+        # A cap is not a charge; a verdict cut off is a plan held for the
+        # owner.
+        from core.autogen_config import turn_chat_model
+        _turn_llm = turn_chat_model(ChatOpenAI, temperature=0.0, max_tokens=4096)
+        if _turn_llm is not None:
+            text = _turn_llm.invoke(review_prompt).content
+        else:
+            # No turn model (a desktop turn): the node's own endpoint, as
+            # before.
+            # Reuse pooled_post that gather_info uses; same endpoint
+            r = pooled_post(
+                GPT_API,
+                json={
+                    'model': LLM_MODEL_NAME,
+                    'messages': [{'role': 'user', 'content': review_prompt}],
+                    'temperature': 0.0,
+                    'max_tokens': 256,
+                },
+                headers=LLM_AUTH_HEADERS,
+                timeout=60,
+            )
+            text = r.json()['choices'][0]['message']['content']
         verdict = retrieve_json(text)
         if isinstance(verdict, dict):
             if verdict.get('status', '').lower() == 'approved':
