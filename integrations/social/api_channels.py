@@ -228,12 +228,14 @@ def create_binding():
     for named in (data.get('channel_sender_id'), flat.get('channel_sender_id')):
         mailbox = FlaskChannelIntegration.mailbox_named(g.db, channel_type, named)
         if mailbox:
+            # The words do not say that this node holds the address (review of
+            # fb9c8646d, minor).  The 400 still differs from a 201, so a
+            # signed-in account can tell: open.
             return jsonify({'success': False, 'error': (
-                f"{mailbox} is a mailbox this node holds. A mailbox is "
-                f"connected through the Email connect form (IMAP server, SMTP "
-                f"server, address and password), which logs in with the "
-                f"password; this route does not bind it, so nothing was "
-                f"saved. Connect it there.")}), 400
+                f"A mailbox address is bound through the Email connect form "
+                f"(IMAP server, SMTP server, address and password), which "
+                f"logs in with the password; this route does not bind one, "
+                f"so nothing was saved. Connect {mailbox} there.")}), 400
 
     sender_id = data.get('channel_sender_id', '')
     chat_id = data.get('channel_chat_id', '')

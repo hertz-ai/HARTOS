@@ -65,9 +65,12 @@ def test_the_bindings_listing_carries_no_credential_of_a_mailbox(node, web, vaul
     assert listed.status_code == 200
     assert password not in text and 'fernet:' not in text
     (row,) = listed.get_json()['data']
-    assert row['metadata_json'] == {'email_address': MCGROCE,
-                                    'imap_host': f'imap.{HOSTS[MCGROCE]}',
-                                    'smtp_host': f'smtp.{HOSTS[MCGROCE]}'}
+    # The address is the row's sender id; a server is shown only when it is
+    # stored plain: nothing is ever decrypted for a client.
+    shown = {'email_address': MCGROCE}
+    if vault == 'plain':
+        shown.update(imap_host=f'imap.{HOSTS[MCGROCE]}', smtp_host=f'smtp.{HOSTS[MCGROCE]}')
+    assert row['metadata_json'] == shown
     assert row['is_active'] is True and row['channel_sender_id'] == MCGROCE
 
 
@@ -98,6 +101,39 @@ def test_no_route_that_returns_a_binding_carries_what_the_client_put_in_its_meta
         text = reply.get_data(as_text=True)
         assert not [v for v in secrets.values() if v in text] and 'fernet:' not in text
         assert 'My browser' in text
+
+
+def test_a_listing_never_decrypts_what_a_client_wrote(node, web, tmp_path, monkeypatch):
+    """A signed-in account stored a value sealed with THIS node's key under a
+    display key (smtp_host) of its own binding, and both the create reply and
+    the listing answered it opened: a decryption oracle for any ciphertext the
+    caller holds (a DB backup, a log line), open to anyone who can sign up
+    (review of fb9c8646d, M1).  Nothing is opened for a client."""
+    from security import secrets_manager
+    from security.secrets_manager import SecretsManager
+    monkeypatch.setattr(secrets_manager, '_SALT_PATH', str(tmp_path / 'salt'))
+    monkeypatch.setattr(secrets_manager, '_VAULT_PATH', str(tmp_path / 'vault'))
+    monkeypatch.setenv('HEVOLVE_MASTER_KEY', 'test-only-vault-passphrase')
+    SecretsManager.reset()
+    try:
+        secret = 'hunter2-ORACLE-PLAINTEXT'
+        blob = SecretsManager.get_instance().encrypt_value(secret)
+        person = web.sign_up('person')
+
+        made = web.client.post('/api/social/channels/bindings', headers=person['auth'], json={
+            'channel_type': 'email', 'channel_sender_id': 'not-a-mailbox',
+            'metadata': {'smtp_host': blob, 'imap_host': blob, 'display_name': blob,
+                         'smtp_port': 587}})
+        listed = web.client.get('/api/social/channels/bindings', headers=person['auth'])
+
+        assert made.status_code == 201
+        for reply in (made, listed):
+            text = reply.get_data(as_text=True)
+            assert secret not in text and 'fernet:' not in text
+        (row,) = listed.get_json()['data']
+        assert row['metadata_json'] == {'smtp_port': 587}      # what is stored plain
+    finally:
+        SecretsManager.reset()
 
 
 def test_a_name_that_is_a_sealed_blob_is_not_shown(node, web):
