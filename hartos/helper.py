@@ -531,6 +531,55 @@ def _keyless_top5(query: str):
              'method': 'serp_links_only', 'sources_processed': len(links)}]
 
 
+def _google_search_failure(error):
+    """(what was wrong, how the machine's owner fixes it) for a Google search
+    call that raised, from its HTTP status and its class only.
+
+    An HttpError's text is '<HttpError 401 when requesting <url> ...>' and the
+    url carries the key (measured with googleapiclient 2.190: '&key=...'), so
+    that text is never logged or handed to the model."""
+    status = getattr(error, 'status_code', None)
+    if status is None:
+        status = getattr(getattr(error, 'resp', None), 'status', None)
+    if status in (401, 403):
+        return (f"the Google search key was refused (HTTP {status})",
+                "set a valid GOOGLE_API_KEY and GOOGLE_CSE_ID in config.json "
+                "or the environment")
+    if status == 429:
+        return ("the Google search quota is used up (HTTP 429)",
+                "wait for the daily quota to reset, or raise the quota of "
+                "the GOOGLE_API_KEY project")
+    kind = type(error).__name__ + (f", HTTP {status}" if status else '')
+    return (f"the Google search call failed ({kind})",
+            "check this machine's network, its GOOGLE_API_KEY and its "
+            "GOOGLE_CSE_ID")
+
+
+def google_search_refusal(error, keyless_tried=True) -> str:
+    """What google_search answers when no search gave a result and the Google
+    call raised: a core.tool_refusal refusal that says what was wrong and how
+    to fix it, never the error's own text (it carries the key).
+
+    Live on central, 19 Nov 2026 (daemon_716cbcea, daemon_561bcef9): the
+    keyless engines answered nothing, Google refused the key with a 401, and
+    top5_results crashed on a name the 401 left unbound, so the agent got a
+    raise instead of a reason (tests/unit/test_a_refused_google_key_says_so.py).
+    ``keyless_tried`` is False for hart_intelligence_entry's copy, which has
+    no keyless search."""
+    from core.tool_refusal import refuse
+    what, owner_fix = _google_search_failure(error)
+    first = ("no keyless search engine answered for this query, and "
+             if keyless_tried else '')
+    keyless_fix = (", or set SEARXNG_URL to a SearXNG server for the keyless "
+                   "search" if keyless_tried else '')
+    return refuse(
+        'google_search',
+        f"{first}{what}, so no result came back",
+        "Search again with different words, or tell the person plainly that "
+        "the search failed; do not make up a link or cite a source.  The "
+        f"machine's owner can fix it: {owner_fix}{keyless_fix}")
+
+
 def top5_results(query):
     """
     Enhanced top5_results using Crawl4AI API service
@@ -546,17 +595,33 @@ def top5_results(query):
         return _keyless
 
     final_res = []
+    # Bound before the try: its except branch reads the links, and a Google
+    # call that raised used to leave them unbound (UnboundLocalError, live on
+    # central 19 Nov 2026).
+    top_2_search_res, top_2_search_res_link = [], []
 
     try:
         # Your existing Google search
         if search is None:
             return []
-        top_2_search_res = search.results(query, 2)
-        top_2_search_res_link = [res['link'] for res in top_2_search_res]
+        try:
+            top_2_search_res = search.results(query, 2) or []
+        except Exception as e:
+            # A refused key, a spent quota, no network: say which, and how
+            # to fix it.  Never the error's text: its url carries the key.
+            what, _ = _google_search_failure(e)
+            current_app.logger.warning(
+                f"top5_results: keyless search found nothing and {what}, "
+                f"for: {query}")
+            return google_search_refusal(e)
+        # langchain answers an empty search with [{'Result': 'No good Google
+        # Search Result was found'}], a row with no 'link'.
+        top_2_search_res_link = [res['link'] for res in top_2_search_res
+                                 if isinstance(res, dict) and res.get('link')]
 
         if not top_2_search_res_link:
             current_app.logger.warning("No search links found")
-            return search.results(query, 4)
+            return top_2_search_res
 
         current_app.logger.info(f"Processing {len(top_2_search_res_link)} URLs")
 
@@ -668,7 +733,15 @@ def top5_results(query):
     # Your original final fallback
     if len(final_res) == 0:
         current_app.logger.info("All methods failed, using Google API results")
-        return search.results(query, 4)
+        try:
+            return search.results(query, 4)
+        except Exception as e:
+            # The first call answered; keep its results (titles, links,
+            # snippets) rather than raise the second call's error.
+            current_app.logger.warning(
+                f"top5_results: the second Google search failed "
+                f"({_google_search_failure(e)[0]}); returning the first results")
+            return top_2_search_res
 
     current_app.logger.info(f"Returning {len(final_res)} results")
     return final_res

@@ -7585,9 +7585,13 @@ def top5_results(query):
     try:
         top_2_search_res = search.results(query, 2) or []
     except Exception as e:
-        app.logger.warning(f"top5_results: search.results() failed: {e}")
-        return (f"The web search call failed and returned no results: {e}.  "
-                f"Treat this as a failed step, not as 'nothing was found'.")
+        # Never the error's text: a Google HttpError's url carries the key.
+        # The same refusal as hartos.helper.top5_results (the agents' copy),
+        # without its keyless half: this copy has no keyless search.
+        from hartos.helper import google_search_refusal
+        app.logger.warning(
+            f"top5_results: search.results() failed: {type(e).__name__}")
+        return google_search_refusal(e, keyless_tried=False)
 
     top_2_search_res_link = [
         res['link'] for res in top_2_search_res
