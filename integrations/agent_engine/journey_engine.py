@@ -428,8 +428,16 @@ class JourneyEngine:
         """Send a message via a specific channel adapter."""
         if channel == 'email':
             try:
-                from integrations.agent_engine.outreach_crm_tools import _send_email
-                result = _send_email(prospect['email'], 'Update from HevolveAI', message)
+                from integrations.agent_engine.outreach_crm_tools import (
+                    HELD_NOTE, _send_email, prospect_sender)
+                result = _send_email(prospect['email'], 'Update from HevolveAI',
+                                     message, sender=prospect_sender(prospect),
+                                     prospect_id=prospect.get('id'))
+                if result.get('held'):
+                    # Held for the owner, not lost: no other channel is tried.
+                    return {'success': True, 'sent': False, 'held': True,
+                            'channel': 'email', 'draft_id': result['draft_id'],
+                            'note': HELD_NOTE}
                 return {'success': result.get('success', False), 'channel': 'email'}
             except Exception as e:
                 return {'success': False, 'error': str(e)}
@@ -567,7 +575,8 @@ class JourneyEngine:
 
         try:
             from integrations.agent_engine.outreach_crm_tools import (
-                _send_email, count_delivered, note_refused, retry_due)
+                _send_email, count_delivered, note_refused, prospect_sender,
+                retry_due)
             if draft.get('status') == 'failed':
                 return {'skipped': True, 'reason': 'given up',
                         'error': draft.get('last_error')}
@@ -575,7 +584,13 @@ class JourneyEngine:
             if not retry_due(draft, now):
                 return {'skipped': True, 'reason': 'waiting to try again',
                         'retry_after': draft.get('retry_after')}
-            result = _send_email(prospect['email'], draft['subject'], draft['body'])
+            result = _send_email(prospect['email'], draft['subject'], draft['body'],
+                                 sender=prospect_sender(prospect),
+                                 prospect_id=prospect.get('id'))
+            if result.get('held'):
+                # Held for the owner's verification: not sent, and not a
+                # refused try (approve_held_draft sends and counts it).
+                return {'sent': False, 'held': True, 'draft_id': result['draft_id']}
             # 'via' names the sender on a refused send too: only success
             # counts as sent.
             if result.get('success'):
@@ -654,7 +669,8 @@ class JourneyEngine:
             return {'skipped': True}
 
         try:
-            from integrations.agent_engine.outreach_crm_tools import _send_email
+            from integrations.agent_engine.outreach_crm_tools import (
+                _send_email, prospect_sender)
             result = _send_email(
                 prospect['email'],
                 're: HARTOS partnership',
@@ -665,7 +681,11 @@ class JourneyEngine:
                 '</ul>'
                 '<p>happy to adjust to your timezone.</p>'
                 '<p>sathish</p>',
+                sender=prospect_sender(prospect),
+                prospect_id=prospect.get('id'),
             )
+            if result.get('held'):
+                return {'proposed': False, 'held': True, 'draft_id': result['draft_id']}
             # Proposed only when the email went out.  A refused proposal is
             # not retried on its own: tick() has no 'engaged' branch, so
             # this runs again only when the prospect enters 'engaged' again
@@ -760,11 +780,19 @@ def register_journey_tools(helper, assistant, user_id: str):
 
         Executes all auto-actions for the new stage.
         """
-        from integrations.agent_engine.outreach_crm_tools import _load_prospects, _save_prospects
+        from integrations.agent_engine.outreach_crm_tools import (
+            _load_prospects, _save_prospects, refuse_other_goals_prospect)
         data = _load_prospects()
         prospect = data['prospects'].get(prospect_id)
         if not prospect:
             return json.dumps({'error': 'prospect not found'})
+        # A goal's turn moves only its own goal's prospects: the stage's
+        # auto-actions ('outreach', 'engaged') email the prospect from its
+        # goal's mailbox with copy this turn's goal never wrote (review of
+        # 88b6821f2, M1).
+        refused = refuse_other_goals_prospect('advance_prospect_stage', prospect)
+        if refused is not None:
+            return json.dumps(refused)
 
         result = engine.advance_prospect(prospect, force_stage=target_stage,
                                          store=data)
@@ -792,11 +820,16 @@ def register_journey_tools(helper, assistant, user_id: str):
         Channels: email, slack, discord, telegram, whatsapp.
         If no channel specified, uses the best one for the prospect's journey stage.
         """
-        from integrations.agent_engine.outreach_crm_tools import _load_prospects
+        from integrations.agent_engine.outreach_crm_tools import (
+            _load_prospects, refuse_other_goals_prospect)
         data = _load_prospects()
         prospect = data['prospects'].get(prospect_id)
         if not prospect:
             return json.dumps({'error': 'prospect not found'})
+        # A goal's turn writes only to its own goal's prospects.
+        refused = refuse_other_goals_prospect('send_prospect_message', prospect)
+        if refused is not None:
+            return json.dumps(refused)
 
         result = engine.send_via_channel(prospect, message, channel)
         if result.get('pending'):

@@ -25,6 +25,11 @@ from .registry import ChannelRegistry, ChannelRegistryConfig, get_registry
 logger = logging.getLogger(__name__)
 
 
+#: The sender id of the binding the connect tool (register_channel) writes
+#: for the person who connected a channel: a placeholder, never an inbound
+#: sender (FlaskChannelIntegration.binding_connects_the_channel).
+CONNECTED_BY_TOOL = 'agent_registered'
+
 #: Seconds a caller of send_threadsafe waits for the channel to confirm a
 #: send.  A send still running then may yet be delivered: the caller says
 #: "pending, do not resend" (/channels/send's 202), never "not sent".
@@ -311,12 +316,15 @@ class FlaskChannelIntegration:
         try:
             db = get_db()
             try:
-                row = db.query(UserChannelBinding).filter_by(
+                rows = db.query(UserChannelBinding).filter_by(
                     channel_type=str(channel).lower(),
                     channel_sender_id=str(sender_id),
                     is_active=True,
-                ).first()
-                if row and row.user_id:
+                ).all()
+                for row in rows:
+                    if not row.user_id or self.binding_connects_the_channel(
+                            str(channel).lower(), row):
+                        continue
                     logger.debug(
                         f"Channel binding resolved: {channel}:{sender_id} "
                         f"→ user_id={row.user_id}"
@@ -482,7 +490,32 @@ class FlaskChannelIntegration:
     #          (param doubles as the caller-supplied kwarg name)
     #          resolution order per extra: explicit kwarg -> env -> default;
     #          a missing `required` extra skips registration with a warning.
+    #   account_param: for a channel that holds several accounts on one node,
+    #          the setting that names the account (channel_account); each
+    #          account gets its own adapter (ChannelRegistry accounts).
+    #   account_settings: factory settings every account adapter is built
+    #          with.
     _CHANNEL_SPECS: Dict[str, Dict[str, Any]] = {
+        'email': {
+            # One mailbox per adapter (EmailAdapter: one IMAP + SMTP login),
+            # and a node may hold several, keyed by address: central sends
+            # each goal's mail from the mailbox its config names (owner,
+            # 2026-11-16).  The "token" is the IMAP host, the first field of
+            # the setup form, which is what the bindings form already hands
+            # over; the extras are optional so a node that keeps them in the
+            # environment (create_email_adapter's EMAIL_* fallback) still
+            # registers exactly as before.
+            'token_param': 'imap_host',
+            'account_param': 'email_address',
+            # A goal's company mailbox reads its inbox for prospects' replies
+            # only: the rest of its owner's mail stays unread there.
+            'account_settings': {'mark_as_read': False},
+            'extra': [
+                {'param': 'smtp_host'},
+                {'param': 'email_address'},
+                {'param': 'password'},
+            ],
+        },
         'slack': {
             'token_param': 'bot_token',
             'extra': [
@@ -693,8 +726,16 @@ class FlaskChannelIntegration:
             if not spec and token:
                 call_kwargs.update(self._credential_kwarg(factory_fn, token))
 
+            account = self.channel_account(channel_type, call_kwargs)
+            if account is not None:
+                call_kwargs.update(spec.get('account_settings') or {})
             adapter = factory_fn(**call_kwargs)
-            self.registry.register(adapter)
+            if account is None:
+                self.registry.register(adapter)
+            else:
+                # Beside the channel's other accounts: a second mailbox never
+                # replaces the first.
+                self.registry.register(adapter, account=account)
             logger.info(f"{channel_type} adapter registered")
             return True
         except Exception as e:
@@ -723,6 +764,76 @@ class FlaskChannelIntegration:
                 continue
             unmet.append(p.get('env') or p['param'])
         return unmet
+
+    @classmethod
+    def channel_account(cls, channel_type: str,
+                        settings: Dict[str, Any] = None) -> Optional[str]:
+        """The account ``settings`` connect, for a channel that holds several
+        on one node (its spec's ``account_param``: email's address),
+        normalised as the registry keys it; None for every other channel and
+        for settings that name no account.  The one reader: register_channel
+        registers the adapter under it, and the connect form, live wiring and
+        boot restore find that account's adapter and binding by it."""
+        from .registry import normalize_account
+        param = (cls._CHANNEL_SPECS.get(channel_type) or {}).get('account_param')
+        if not param:
+            return None
+        return normalize_account((settings or {}).get(param))
+
+    @classmethod
+    def binding_connects_the_channel(cls, channel_type: str, row) -> bool:
+        """Whether a UserChannelBinding row records who CONNECTED the node's
+        own channel rather than who writes in on it: the connect tool's
+        placeholder sender (CONNECTED_BY_TOOL), or one of the channel's
+        accounts (a mailbox the node sends from, whose settings it holds).
+        Such a row never names an inbound sender's identity: an email From
+        is anyone's to write, and resolving the company address to the
+        owner let a stranger be the owner (review of ae390514f).
+
+        This is only the KIND of a row, enough to keep it from naming an
+        inbound sender.  It proves nothing about who holds a mailbox: a row
+        counts as connecting one only through accounts_connecting."""
+        if getattr(row, 'channel_sender_id', None) == CONNECTED_BY_TOOL:
+            return True
+        param = (cls._CHANNEL_SPECS.get(channel_type) or {}).get('account_param')
+        meta = getattr(row, 'metadata_json', None)
+        return bool(param) and isinstance(meta, dict) and param in meta
+
+    @classmethod
+    def without_account_setting(cls, channel_type: str, metadata) -> Dict[str, Any]:
+        """``metadata`` without the key that names an account of
+        ``channel_type`` (email's email_address), for a writer that stores a
+        client's metadata verbatim (POST /api/social/channels/bindings).  A
+        row that names a mailbox is a connect, and only register_channel,
+        which starts the adapter with the credential, writes one."""
+        param = (cls._CHANNEL_SPECS.get(channel_type) or {}).get('account_param')
+        return {k: v for k, v in (metadata or {}).items() if k != param}
+
+    @classmethod
+    def accounts_connecting(cls, db, channel_type: str, account) -> set:
+        """The ids of the accounts that CONNECTED ``account`` of
+        ``channel_type`` (a mailbox): the owners of its active binding rows
+        for that account (found by the account as the registry keys it,
+        channel_account) whose metadata names it: a non-empty address that
+        equals it, opened when sealed (unseal_binding_metadata).  A row that
+        merely has the key, with no value, another value or a value that
+        cannot be opened, is not a connect: it holds no credential for the
+        mailbox.  The one reader of who holds a mailbox: it decides who may
+        send from it (outreach_crm_tools._may_use_mailbox) and whether
+        another account may connect it (agent_tools.register_channel)."""
+        from .registry import normalize_account
+        from integrations.social.models import UserChannelBinding
+        key = normalize_account(account)
+        param = (cls._CHANNEL_SPECS.get(channel_type) or {}).get('account_param')
+        if key is None or not param:
+            return set()
+        rows = db.query(UserChannelBinding).filter_by(
+            channel_type=channel_type, channel_sender_id=key,
+            is_active=True).all()
+        return {str(row.user_id) for row in rows
+                if cls.binding_connects_the_channel(channel_type, row)
+                and normalize_account(unseal_binding_metadata(
+                    channel_type, row.metadata_json).get(param)) == key}
 
     @staticmethod
     def _credential_kwarg(factory_fn, token: str) -> Dict[str, str]:
@@ -1090,7 +1201,9 @@ class FlaskChannelIntegration:
         on adapter.name), so where several bindings share a channel_type the
         most recently updated active one wins — the same row a manual rebind
         would pick.  Channels already registered are left alone, so explicit
-        env/code registration keeps precedence and this is idempotent.
+        env/code registration keeps precedence and this is idempotent.  A
+        channel that holds several accounts (_CHANNEL_SPECS account_param:
+        email) is restored per account instead (_restore_accounts).
 
         Never raises: a binding that cannot be restored is logged and skipped,
         because one bad row must not stop the server from booting.
@@ -1142,6 +1255,12 @@ class FlaskChannelIntegration:
                         continue
                     if ct not in self._ADAPTER_FACTORIES:
                         summary['skipped'][ct] = 'no adapter factory'
+                        continue
+                    if (self._CHANNEL_SPECS.get(ct) or {}).get('account_param'):
+                        restored, reason = self._restore_accounts(ct, candidates)
+                        summary['restored'].extend([ct] * restored)
+                        if reason:
+                            summary['skipped'][ct] = reason
                         continue
                     if self.registry.get(ct) is not None:
                         summary['skipped'][ct] = 'already registered'
@@ -1200,6 +1319,33 @@ class FlaskChannelIntegration:
                 f"(skipped: {summary['skipped'] or 'none'})"
             )
         return summary
+
+    def _restore_accounts(self, channel_type: str, candidates: list) -> tuple:
+        """Restore every account of a channel that holds several (email):
+        each from the newest of its bindings (``candidates`` come newest
+        first) that carries a credential and names the account.  Returns
+        ``(how many were registered, why the channel is not fully back or
+        None)``; an account already registered is left alone."""
+        restored, seen, failed, already = 0, set(), False, False
+        for row in candidates:
+            meta = unseal_binding_metadata(channel_type, row.metadata_json)
+            token, extras = self._binding_credentials(channel_type, meta)
+            account = self.channel_account(channel_type, extras)
+            if not token or account is None or account in seen:
+                continue
+            seen.add(account)
+            if self.registry.get_account(channel_type, account) is not None:
+                already = True
+                continue
+            if self.register_channel(channel_type, token=token, **extras):
+                restored += 1
+            else:
+                failed = True       # register_channel already logged why
+        if failed:
+            return restored, 'registration failed'
+        if not restored:
+            return 0, 'already registered' if already else 'no stored credential'
+        return restored, None
 
     def start(self) -> None:
         """Start all channel adapters in background thread."""

@@ -4997,6 +4997,42 @@ def executor_refusal(func_name, function_map, raised=None) -> str:
     return refuse(name, problem, fix, retry=RETRY_OTHER_TOOL)
 
 
+def _parameters_that_take_none(func) -> Set[str]:
+    """Names of ``func``'s parameters whose type admits None: Optional[X],
+    a Union or ``X | None`` with None in it, None itself, Any or object,
+    also inside Annotated[...].  Such a parameter given JSON null is given a
+    value it takes, so the required-null refusal leaves it alone (review of
+    927737ba2: Optional[str] with no default was refused).  An unannotated
+    parameter is not counted: nothing says it takes None."""
+    import inspect
+    import types
+    import typing
+    try:
+        hints = typing.get_type_hints(func)
+    except Exception:
+        hints = {}
+    union_types = (typing.Union,) + ((types.UnionType,)
+                                     if hasattr(types, 'UnionType') else ())
+
+    def takes_none(annotation) -> bool:
+        if annotation is inspect.Parameter.empty:
+            return False
+        if typing.get_origin(annotation) is Annotated:
+            return takes_none(typing.get_args(annotation)[0])
+        if annotation in (None, type(None), Any, object):
+            return True
+        if typing.get_origin(annotation) in union_types:
+            return any(takes_none(a) for a in typing.get_args(annotation))
+        return False
+
+    try:
+        params = inspect.signature(func).parameters.values()
+    except (TypeError, ValueError):
+        return set()
+    return {p.name for p in params
+            if takes_none(hints.get(p.name, p.annotation))}
+
+
 def tool_argument_error(func, func_name, arguments, repaired, as_written=None):
     """Why ``func`` cannot be called with ``arguments``, or None.
 
@@ -5093,11 +5129,14 @@ def tool_argument_error(func, func_name, arguments, repaired, as_written=None):
     # reached the tool without it: repair_backend_venv's handler dropped the
     # None and the model read the bare "missing 1 required positional
     # argument" TypeError (review of c58a17460).  Refused like a missing one;
-    # a blank string the model wrote stays its own choice.
+    # a blank string the model wrote stays its own choice.  A parameter
+    # whose type takes None (Optional[X], X | None, Any) is given a value it
+    # takes, so null runs there (review of 927737ba2).
     if not repaired and bound is not None:
+        takes_none = _parameters_that_take_none(func)
         emptied = [p.name for p in params
                    if p.default is p.empty and p.name in bound
-                   and bound[p.name] is None]
+                   and bound[p.name] is None and p.name not in takes_none]
     # Any value, required or not, that the repair emptied: empty now, but
     # not left empty by the model (review of 30042a2b6: "cwd": /tmp ran a
     # **kwargs tool with cwd='').

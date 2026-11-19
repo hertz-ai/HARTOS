@@ -624,10 +624,33 @@ def _generate_audio_speech(context: str, input_text: str, duration: int) -> dict
                 'output_modality': 'audio_speech'}
 
 
+# How a sing request reaches this module.  Nunba speaks a reply's <sing> and
+# <lyrics> segments by asking for 'audio_music' with the one text
+# "Singing: <the words>" (Nunba tts/tts_engine.py _synth_sing_segment), and
+# leaves telling a song from a tune to this module.  Compared lower case.
+SING_REQUEST_PREFIX = 'singing:'
+
+
+def _words_to_sing(text: str) -> str:
+    """The words a sing request asks for, or '' when it asks for music only.
+
+    AceStep sings only what its 'lyrics' field holds: an empty field is an
+    instrumental (its server_utils.is_instrumental).  The words of a sing
+    request went out as the description alone, so a sung segment could only
+    come back as a tune with no voice.
+    """
+    said = (text or '').strip()
+    if said[:len(SING_REQUEST_PREFIX)].lower() != SING_REQUEST_PREFIX:
+        return ''
+    return said[len(SING_REQUEST_PREFIX):].strip()
+
+
 def _generate_audio_music(context: str, input_text: str,
                           duration: int, style: str) -> dict:
     """Route to AceStep for AI music generation."""
     prompt = input_text or context
+    # Read before the style is put in front of the prompt.
+    lyrics = _words_to_sing(prompt)
     if style:
         prompt = f"[{style}] {prompt}"
 
@@ -688,6 +711,11 @@ def _generate_audio_music(context: str, input_text: str,
             # nothing downstream cares which of the two it is.
             'audio_format': 'wav',
         }
+        if lyrics:
+            # Only a sing request carries words.  Every music caller (game
+            # sounds, kids background music, the API) sends the same request
+            # as before and still gets an instrumental.
+            payload['lyrics'] = lyrics
         if style:
             payload['genre'] = style
         resp = pooled_post(

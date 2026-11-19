@@ -78,6 +78,11 @@ thing to change: anything arriving via Nunba reaches HARTOS with an id ALREADY
 SET, so this module sees it populated and passes through. Nunba's request must be
 byte-identical before and after.
 """
+import contextlib
+import contextvars
+import hmac
+import secrets
+import threading
 import time
 from typing import Any, Dict, Optional
 
@@ -121,6 +126,106 @@ def daemon_goal_id(request_id: Any) -> Optional[str]:
     if not rid.startswith(DAEMON_PREFIX):
         return None
     return rid[len(DAEMON_PREFIX):] or None
+
+
+# ── Which daemon turns are this node's own ─────────────────────────────────
+#
+# A daemon_<id> request id travels in the /chat body, so it NAMES a turn and
+# proves nothing about who started it.  Any client can send request_id=
+# 'daemon_<goal id>' (body auth on a flat node, a person's JWT anywhere), and
+# the node itself relays a client's own request id under the node's
+# credential (the speculative dispatcher's inner expert call, chat_contract's
+# person relay), so neither the id nor the node's key or system JWT says
+# "this node's dispatch started this turn".  A power only the node's own goal
+# turns may have (#284: the goal type's tool families,
+# goal_manager.daemon_turn_stored_tags) asks is_own_daemon_turn, and the
+# node's dispatch marks each turn it starts, one of two ways:
+#
+#   * in-process (own_daemon_turn): dispatch.local_chat_dispatch runs /chat
+#     through Flask's test client in its own thread (Nunba's adapter on a
+#     desktop, the native fallback on central), so the turn is marked in a
+#     context variable of that thread, for exactly that call;
+#   * over HTTP (own_http_turn): the self-POSTs (dispatch_goal's Tier 2, the
+#     hive worker's fallback) are served on another thread, so each carries
+#     a random secret minted for that one turn in OWN_TURN_HEADER, held in
+#     this process only while the POST is in flight.
+
+#: The header an HTTP self-POST carries its turn's secret in (own_http_turn).
+OWN_TURN_HEADER = 'X-Hart-Own-Turn'
+
+_own_inprocess_turn = contextvars.ContextVar('hart_own_daemon_turn', default=None)
+_own_http_turns = {}   # daemon request id -> the secrets of its POSTs in flight
+_own_http_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def own_daemon_turn(request_id: Any):
+    """Mark the daemon turn ``request_id`` as this node's own while the block
+    runs, on this thread only: for the in-process /chat call, which runs the
+    turn in the caller's thread.  An id that is not a daemon id marks
+    nothing."""
+    rid = str(request_id or '')
+    token = _own_inprocess_turn.set(rid) if rid.startswith(DAEMON_PREFIX) else None
+    try:
+        yield
+    finally:
+        if token is not None:
+            try:
+                _own_inprocess_turn.reset(token)
+            except ValueError:
+                # Reset from another context: clear the mark, never leave it.
+                _own_inprocess_turn.set(None)
+
+
+@contextlib.contextmanager
+def own_http_turn(request_id: Any, headers: Optional[Dict[str, str]] = None):
+    """The headers of this node's own HTTP self-POST of the daemon turn
+    ``request_id``: ``headers`` (the caller's credential; None is none) plus
+    a secret minted for this turn, which proves the turn while the block
+    runs and nothing after.  Yields a new dict, ``headers`` is not changed.
+    An id that is not a daemon id gets no secret."""
+    out = dict(headers or {})
+    rid = str(request_id or '')
+    if not rid.startswith(DAEMON_PREFIX):
+        yield out
+        return
+    secret = secrets.token_urlsafe(32)
+    with _own_http_lock:
+        _own_http_turns.setdefault(rid, set()).add(secret)
+    out[OWN_TURN_HEADER] = secret
+    try:
+        yield out
+    finally:
+        with _own_http_lock:
+            held = _own_http_turns.get(rid)
+            if held is not None:
+                held.discard(secret)
+                if not held:
+                    _own_http_turns.pop(rid, None)
+
+
+def is_own_daemon_turn(request_id: Any) -> bool:
+    """Did this node's own dispatch start the daemon turn ``request_id``, the
+    turn running here?  True inside own_daemon_turn on this thread, or while
+    serving a request that carries the secret own_http_turn minted for this
+    id and still holds.  False for any other id: a person's, and a daemon id
+    a client named, with or without a replayed copy of an earlier POST's
+    headers.  Never raises."""
+    rid = str(request_id or '')
+    if not rid.startswith(DAEMON_PREFIX):
+        return False
+    if _own_inprocess_turn.get() == rid:
+        return True
+    with _own_http_lock:
+        held = tuple(_own_http_turns.get(rid, ()))
+    if not held:
+        return False
+    try:
+        from flask import has_request_context, request
+        sent = request.headers.get(OWN_TURN_HEADER, '') if has_request_context() else ''
+    except Exception:
+        return False
+    return bool(sent) and any(hmac.compare_digest(sent, s) for s in held)
 
 
 def normalize_chat_body(body: Optional[Dict[str, Any]] = None,
