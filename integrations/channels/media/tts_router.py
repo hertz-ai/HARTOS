@@ -2047,8 +2047,11 @@ _ENGINE_VRAM_GB: Dict[str, float] = {}  # populated lazily by _engine_vram_gb
 def _engine_vram_gb(engine_id: str) -> float:
     """Single source of truth for engine VRAM requirement.
 
-    Reads from vram_manager.VRAM_BUDGETS — the canonical specs.
-    The vram_manager key convention is 'tts_<engine_id>' (e.g. 'tts_indic_parler').
+    Reads from vram_manager.VRAM_BUDGETS — the canonical specs — under the
+    key the engine's own spec declares (TTSEngineSpec.vram_key: 'tts_f5'
+    for f5_tts, 'tts_neutts' for neutts_air).  'tts_<engine_id>' is used
+    only when the spec declares none; guessing it for every engine read
+    F5 and NeuTTS as 0.0 GB, so they were picked as if they cost nothing.
     Returns 0.0 only if engine has no GPU requirement (CPU-only engine).
     Logs a warning if engine is GPU-capable but missing from VRAM_BUDGETS
     (catches drift between the two registries).
@@ -2057,7 +2060,11 @@ def _engine_vram_gb(engine_id: str) -> float:
         return _ENGINE_VRAM_GB[engine_id]
     try:
         from integrations.service_tools.vram_manager import VRAM_BUDGETS
-        key = f'tts_{engine_id}'
+        # The shipped spec first: ENGINE_REGISTRY may have been rebuilt
+        # from a persisted catalog row by an earlier populate.
+        spec = _SEED_SPECS.get(engine_id) or ENGINE_REGISTRY.get(engine_id)
+        key = (spec.vram_key if spec is not None and spec.vram_key
+               else f'tts_{engine_id}')
         if key in VRAM_BUDGETS:
             vram = VRAM_BUDGETS[key][0]  # (gpu_gb, cpu_gb)
             _ENGINE_VRAM_GB[engine_id] = vram
@@ -2171,19 +2178,6 @@ def populate_tts_catalog(catalog) -> int:
 
     added = 0
     for engine_id, spec in ENGINE_REGISTRY.items():
-        # Skip if already registered (preserves user edits from admin UI)
-        # Ask the CLAIMING question: skipping an engine to preserve the
-        # owner's admin-UI edits still means this populator owns it, and
-        # the catalogue's stale sweep removes what nobody claims.
-        if catalog.already_registered(_engine_id_to_catalog_id(engine_id)):
-            continue
-
-        device_value = spec.device.value
-        supports_gpu, supports_cpu = _DEVICE_TO_COMPUTE.get(
-            device_value, (False, True)
-        )
-        backend = _DEVICE_TO_BACKEND.get(device_value, 'in_process')
-
         # Build language_priority from LANG_ENGINE_PREFERENCE:
         # lower rank in the preference list → lower priority number → preferred
         lang_priority: Dict[str, int] = {}
@@ -2191,6 +2185,38 @@ def populate_tts_catalog(catalog) -> int:
             if engine_id in engine_list:
                 rank = engine_list.index(engine_id)   # 0 = most preferred
                 lang_priority[lang] = rank * 10       # 0, 10, 20, ...
+
+        # An existing row keeps the owner's admin-UI edits (enabled, pinned,
+        # auto_load, purposes) and its runtime state, but takes what the
+        # shipped seed owns, as the LLM seed does ("UPDATE, do not skip",
+        # model_catalog.py): a row persisted before a seed fix kept the old
+        # value forever (F5 and NeuTTS at 0.0 GB, written 2026-09-23), and
+        # ENGINE_REGISTRY is rebuilt from that row below.  Only shipped
+        # engines; a hive or admin row's values are its own.
+        # Ask the CLAIMING question: an engine this populator updates or
+        # skips is still owned by it, and the stale sweep removes what
+        # nobody claims.
+        catalog_id = _engine_id_to_catalog_id(engine_id)
+        if catalog.already_registered(catalog_id):
+            seed = _SEED_SPECS.get(engine_id)
+            row = catalog.get(catalog_id)
+            if seed is not None and row is not None:
+                catalog.override(
+                    catalog_id, persist=False,
+                    vram_gb=_engine_vram_gb(engine_id),
+                    ram_gb=_ENGINE_RAM_GB.get(engine_id, 0.5),
+                    languages=list(seed.languages),
+                    language_priority=lang_priority,
+                    capabilities={**(row.capabilities or {}),
+                                  'vram_key': seed.vram_key},
+                )
+            continue
+
+        device_value = spec.device.value
+        supports_gpu, supports_cpu = _DEVICE_TO_COMPUTE.get(
+            device_value, (False, True)
+        )
+        backend = _DEVICE_TO_BACKEND.get(device_value, 'in_process')
 
         # Pick the best latency figure for quality/speed scores
         best_latency_ms = min(

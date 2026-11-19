@@ -100,7 +100,17 @@ no owner today):
      tools use too, review C-1 of 0516f3981).
      Live 2026-11-03 and 11-07/09: cards with no reason, titled "Your agent
      asks for files"; review of ab68963ea: a word-for-word copy of the new
-     hint's example reached the person as "<why you ask>". With no title
+     hint's example reached the person as "<why you ask>". A `form` or
+     `approval` an agent sends through the `ask_person` tool also carries
+     its question: a question mark (`?`, or the full-width, Arabic, Greek,
+     Armenian or Ethiopic one) in its title, reason or a field's label, or
+     it is refused (`no_question`) and the note quotes the card and says to
+     write the question itself or do the step's own work with its tools.
+     A `file_request` is exempt (its purpose says what is asked), and so
+     are the cards the framework builds (the join card, the plan approval,
+     the post destination). The refusal is logged by code, user and agent
+     only, never the card's text. Live 2026-11-16: "Benchmark Capture" and
+     "Social Media Post Content" cards that asked nothing. With no title
      of its own, the title names the agent the way the person knows it
      (`consent_service.agent_display_name`). The card and the push carry
      the title and the reason; the bell row carries the title.

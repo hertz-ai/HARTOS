@@ -18,6 +18,7 @@ import logging
 import ntpath
 import os
 import struct
+import sys
 import threading
 import time
 from dataclasses import dataclass, field, asdict
@@ -26,6 +27,28 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger('ModelCatalog')
+
+_BUILD = []
+
+#: How long a remembered setup failure keeps select_best and the automatic
+#: installers away from a row.  A failure can be temporary (offline, an
+#: unreachable index, a full disk), and the same build would otherwise never
+#: try again.  The same bound Nunba keeps on a failed CUDA ctranslate2
+#: install (tts/package_installer.py _CT2_FAILURE_TTL_S).
+SETUP_FAILURE_TTL_S = 24 * 3600
+
+
+def _current_build() -> str:
+    """This install's build identity, the node's code hash (precomputed on
+    the Nunba bundle, cached on disk elsewhere), read once per process.  A
+    setup failure is remembered against it, so a newer build tries again."""
+    if not _BUILD:
+        try:
+            from security.node_integrity import compute_code_hash
+            _BUILD.append(compute_code_hash() or 'unknown')
+        except Exception:
+            _BUILD.append('unknown')
+    return _BUILD[0]
 
 
 # ── Model type enum — single source of truth ─────────────────────
@@ -731,6 +754,16 @@ class ModelEntry:
     device: str = 'unloaded'
     active_since: Optional[float] = None
     error: Optional[str] = None
+    # A failed SETUP (install or download) is the one error that is kept
+    # across restarts: mark_setup_failed stamps the build, platform and time
+    # it failed, and to_dict keeps the error only while these are set.
+    # A newer build or another platform reads the row as never failed, so a
+    # fix in that build is tried again, and the failure lapses after
+    # SETUP_FAILURE_TTL_S.  Live 11-17: NeuTTS's pip install failed at 107
+    # boots in a row because the failure lived in memory only.
+    error_build: Optional[str] = None
+    error_platform: Optional[str] = None
+    error_at: Optional[float] = None
 
     # ── Tags for filtering ────────────────────────────────────────
     tags: List[str] = field(default_factory=list)
@@ -742,18 +775,52 @@ class ModelEntry:
     purposes: List[str] = field(default_factory=list)  # e.g. ['draft', 'main', 'caption']
 
     def to_dict(self) -> dict:
-        """Serialize to JSON-safe dict (excludes runtime state)."""
+        """Serialize to JSON-safe dict (excludes runtime state).  A setup
+        failure (error_build set) is the one error that is kept."""
         d = asdict(self)
-        for key in ('downloaded', 'loaded', 'device', 'active_since', 'error'):
+        for key in ('downloaded', 'loaded', 'device', 'active_since'):
             d.pop(key, None)
+        if not self.error_build:
+            for key in ('error', 'error_build', 'error_platform', 'error_at'):
+                d.pop(key, None)
         return d
 
     @classmethod
     def from_dict(cls, d: dict) -> 'ModelEntry':
-        """Deserialize from JSON dict, ignoring unknown keys."""
+        """Deserialize from JSON dict, ignoring unknown keys.  A setup
+        failure written by another build or on another platform is dropped,
+        so the build that may have fixed it tries again."""
         known = {f.name for f in cls.__dataclass_fields__.values()}
         filtered = {k: v for k, v in d.items() if k in known}
-        return cls(**filtered)
+        entry = cls(**filtered)
+        if entry.error_build and (entry.error_build != _current_build()
+                                  or entry.error_platform != sys.platform):
+            entry.error = entry.error_build = entry.error_platform = entry.error_at = None
+        return entry
+
+    def setup_failure_current(self) -> bool:
+        """True when this row's setup failed on this build and platform, less
+        than SETUP_FAILURE_TTL_S ago, and nothing it asked for has arrived
+        since.  A failure whose text starts "needs <KEY>:" (a gated download)
+        stops counting once <KEY> is in the environment or the key vault, so
+        storing the key brings the row back with no other writer."""
+        if not (self.error_build and self.error
+                and self.error_build == _current_build()
+                and self.error_platform == sys.platform
+                and time.time() - (self.error_at or 0) < SETUP_FAILURE_TTL_S):
+            return False
+        text = str(self.error)
+        if text.startswith('needs ') and ':' in text:
+            key = text[len('needs '):text.index(':')].strip()
+            if key and os.environ.get(key):
+                return False
+            try:
+                from hartos.ai_key_vault import get_ai_key_vault
+                if key and get_ai_key_vault().get_tool_key(key):
+                    return False
+            except Exception:
+                pass
+        return True
 
     # Backends whose models are FETCHED as weight files.  Only these need
     # the download fields below; an `api` / `in_process` model has nothing
@@ -1010,6 +1077,10 @@ class ModelCatalog:
         # Filter by compute fit + capability tier
         scored = []
         for entry in candidates:
+            # A setup that failed on this build and platform fails again;
+            # choosing it would hand the caller the same failure every boot.
+            if entry.setup_failure_current():
+                continue
             # Capability tier gate
             if not self._tier_sufficient(current_tier, entry.min_capability_tier):
                 continue
@@ -1152,6 +1223,10 @@ class ModelCatalog:
         """mark_downloaded's in-memory half (it owns persistence)."""
         model_id = entry.id
         entry.downloaded = downloaded
+        if downloaded and entry.error_build:
+            # The setup that failed has now delivered the weights; the
+            # remembered failure no longer describes this row.
+            entry.error = entry.error_build = entry.error_platform = entry.error_at = None
         if local_path:
             entry.local_path = str(local_path)
         path = local_path or entry.local_path
@@ -1330,7 +1405,10 @@ class ModelCatalog:
             entry.loaded = True
             entry.device = device
             entry.active_since = time.time()
-            entry.error = None
+            remembered = bool(entry.error_build)
+            entry.error = entry.error_build = entry.error_platform = entry.error_at = None
+            if remembered:
+                self._save()   # a setup failure it had is no longer true
 
     def mark_unloaded(self, model_id: str) -> None:
         entry = self._entries.get(model_id)
@@ -1340,10 +1418,30 @@ class ModelCatalog:
             entry.active_since = None
 
     def mark_error(self, model_id: str, error: str) -> None:
+        """A runtime error (short VRAM, an install only starting): kept in
+        memory only.  A failed setup that should survive a restart goes
+        through mark_setup_failed instead."""
         entry = self._entries.get(model_id)
         if entry:
             entry.error = error
+            entry.error_build = entry.error_platform = entry.error_at = None
             entry.loaded = False
+
+    def mark_setup_failed(self, model_id: str, error: str) -> None:
+        """A setup (install or weight download) failed with ``error``.  The
+        row keeps it across restarts for this build and platform, so the
+        same failing install is not run again at every boot and select_best
+        moves on; a newer build, a successful load or download,
+        SETUP_FAILURE_TTL_S passing, or (for a "needs <KEY>: ..." failure)
+        the key arriving brings the row back."""
+        entry = self._entries.get(model_id)
+        if entry:
+            entry.error = str(error)
+            entry.error_build = _current_build()
+            entry.error_platform = sys.platform
+            entry.error_at = time.time()
+            entry.loaded = False
+            self._save()
 
     # ── Purpose assignment ──────────────────────────────────────
 

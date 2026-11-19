@@ -153,6 +153,16 @@ def extract_media_markers(text):
     return clean, media
 
 
+def normalize_account(account) -> Optional[str]:
+    """The key an account of a channel is kept under (an email address,
+    stripped and lower-cased), or None when ``account`` names none.  The one
+    normaliser: the registry stores and looks accounts up through it, so an
+    address written two ways is one mailbox."""
+    if not isinstance(account, str):
+        return None
+    return account.strip().lower() or None
+
+
 @dataclass
 class ChannelRegistryConfig:
     """Configuration for channel registry."""
@@ -180,25 +190,53 @@ class ChannelRegistry:
     def __init__(self, config: ChannelRegistryConfig = None):
         self.config = config or ChannelRegistryConfig()
         self._adapters: Dict[str, ChannelAdapter] = {}
+        # Channels that hold several accounts on one node (email: one adapter
+        # per mailbox, keyed by its address): channel name -> {account:
+        # adapter}.  Kept apart from _adapters, the channel's one node-wide
+        # adapter, so get(name) never hands one account's adapter to a caller
+        # that names no account (owner, 2026-11-16: a goal's email goes from
+        # its own mailbox and never from another company's).
+        self._accounts: Dict[str, Dict[str, ChannelAdapter]] = {}
         self._agent_handler: Optional[Callable] = None
         self._running = False
 
-    def register(self, adapter: ChannelAdapter) -> None:
+    def register(self, adapter: ChannelAdapter,
+                 account: Optional[str] = None) -> None:
         """
         Register a channel adapter.
 
         Args:
             adapter: Channel adapter instance
+            account: the account this adapter is, for a channel that holds
+                several (an email address).  It replaces only an adapter of
+                the same account; the channel's other accounts and its
+                node-wide adapter stay.  None: the channel's one adapter,
+                which replaces the one before it.
+
+        An account is a business mailbox a goal sends from, not a chat: it
+        is never routed to the chat agent, so nothing ever answers its mail
+        automatically.  Its inbound reaches only the handlers attached to it
+        (the outreach reply hook).  Review of ae390514f: bound to the agent,
+        four unread mails got four automatic replies from the company
+        address, and two connected mailboxes answered each other without
+        end.
         """
-        if adapter.name in self._adapters:
-            logger.warning(f"Replacing existing adapter for {adapter.name}")
+        key = normalize_account(account)
+        if key is None:
+            if adapter.name in self._adapters:
+                logger.warning(f"Replacing existing adapter for {adapter.name}")
+            self._adapters[adapter.name] = adapter
+            # Set up message routing
+            adapter.on_message(self._route_to_agent)
+        else:
+            accounts = self._accounts.setdefault(adapter.name, {})
+            if key in accounts:
+                logger.warning("Replacing existing %s adapter for account %s",
+                               adapter.name, key)
+            accounts[key] = adapter
 
-        self._adapters[adapter.name] = adapter
-
-        # Set up message routing
-        adapter.on_message(self._route_to_agent)
-
-        logger.info(f"Registered channel adapter: {adapter.name}")
+        logger.info(f"Registered channel adapter: {adapter.name}"
+                    + (" (an account)" if key else ""))
 
         # Wake the realtime router for channels registered AFTER boot.
         # Nunba's _wamp_is_needed() gate runs once at startup, so a channel
@@ -216,8 +254,18 @@ class ChannelRegistry:
             except Exception as _e:
                 logger.debug("channel.registered emit skipped: %s", _e)
 
-    def unregister(self, channel_name: str) -> None:
-        """Unregister a channel adapter."""
+    def unregister(self, channel_name: str,
+                   account: Optional[str] = None) -> None:
+        """Unregister a channel adapter: the channel's one adapter, or with
+        ``account`` only that account's."""
+        key = normalize_account(account)
+        if key is not None:
+            accounts = self._accounts.get(channel_name) or {}
+            if accounts.pop(key, None) is not None:
+                logger.info(f"Unregistered channel adapter: {channel_name} ({key})")
+            if not accounts:
+                self._accounts.pop(channel_name, None)
+            return
         if channel_name in self._adapters:
             del self._adapters[channel_name]
             logger.info(f"Unregistered channel adapter: {channel_name}")
@@ -225,6 +273,28 @@ class ChannelRegistry:
     def get(self, channel_name: str) -> Optional[ChannelAdapter]:
         """Get adapter by name."""
         return self._adapters.get(channel_name)
+
+    def get_account(self, channel_name: str,
+                    account: Optional[str]) -> Optional[ChannelAdapter]:
+        """The adapter of one account of a channel (an email address), or
+        None when that account is not registered here."""
+        key = normalize_account(account)
+        if key is None:
+            return None
+        return (self._accounts.get(channel_name) or {}).get(key)
+
+    def accounts(self, channel_name: str) -> Dict[str, ChannelAdapter]:
+        """Every account registered for a channel: {account: adapter}."""
+        return dict(self._accounts.get(channel_name) or {})
+
+    def _every_adapter(self) -> List[ChannelAdapter]:
+        """Each registered adapter once: the node-wide ones and every
+        account's."""
+        adapters = list(self._adapters.values())
+        for accounts in self._accounts.values():
+            adapters.extend(a for a in accounts.values()
+                            if all(a is not b for b in adapters))
+        return adapters
 
     def list_channels(self) -> List[str]:
         """List all registered channel names."""
@@ -441,11 +511,13 @@ class ChannelRegistry:
         """Start all registered channel adapters."""
         self._running = True
 
-        tasks = [adapter.start() for adapter in self._adapters.values()]
+        adapters = self._every_adapter()
+        tasks = [adapter.start() for adapter in adapters]
         await asyncio.gather(*tasks, return_exceptions=True)
 
         # Log status
-        for name, adapter in self._adapters.items():
+        for adapter in adapters:
+            name = adapter.name
             status = adapter.get_status()
             if status == ChannelStatus.CONNECTED:
                 logger.info(f"Channel {name} started successfully")
@@ -456,7 +528,7 @@ class ChannelRegistry:
         """Stop all channel adapters."""
         self._running = False
 
-        tasks = [adapter.stop() for adapter in self._adapters.values()]
+        tasks = [adapter.stop() for adapter in self._every_adapter()]
         await asyncio.gather(*tasks, return_exceptions=True)
 
         logger.info("All channels stopped")

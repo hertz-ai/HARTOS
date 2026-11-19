@@ -63,6 +63,7 @@ Review of 2d48b6fb7 (REJECTED, 14 Nov 2026), the seat that proposes:
 import ast
 import json
 import os
+from typing import Annotated, Any, Optional, Union
 
 import pytest
 
@@ -278,6 +279,42 @@ def test_a_call_it_cannot_run_gets_the_one_refusal(
         {'name': 'repair_backend_venv',
          'arguments': '{"backend_name": "mms_tts", "wipe_first": null}'})
     assert calls == ['mms_tts', 'mms_tts'], reply
+
+
+# A required parameter whose type takes None, given JSON null, is given a
+# value it takes (review of 927737ba2: Optional[str] with no default was
+# refused).  Defined here, not in the test, so their types resolve.
+def _note_optional(note: Optional[str]) -> str: return 'ran'
+def _note_union(note: Union[int, None]) -> str: return 'ran'
+def _note_pipe(note: str | None) -> str: return 'ran'
+def _note_any(note: Any) -> str: return 'ran'
+def _note_annotated_optional(note: Annotated[Optional[str], 'why']) -> str: return 'ran'
+# get_type_hints cannot resolve this signature (an unknown name on another
+# parameter), so the raw Annotated[...] is read and must be looked inside.
+def _note_annotated_unresolved(note: Annotated[Optional[str], 'why'],
+                               later: 'NameDefinedNowhere' = None) -> str:  # noqa: F821
+    return 'ran'
+def _note_str(note: str) -> str: return 'ran'
+def _note_annotated_str(note: Annotated[str, 'why']) -> str: return 'ran'
+def _note_untyped(note) -> str: return 'ran'
+
+
+@pytest.mark.parametrize('func', [_note_optional, _note_union, _note_pipe,
+                                  _note_any, _note_annotated_optional,
+                                  _note_annotated_unresolved],
+                         ids=lambda f: f.__name__)
+def test_null_runs_where_the_type_takes_none(func):
+    from hartos.helper import tool_argument_error
+    assert tool_argument_error(func, func.__name__, {'note': None},
+                               repaired=False) is None
+
+
+@pytest.mark.parametrize('func', [_note_str, _note_annotated_str, _note_untyped],
+                         ids=lambda f: f.__name__)
+def test_null_is_still_refused_where_the_type_does_not_take_none(func):
+    from hartos.helper import tool_argument_error
+    reply = tool_argument_error(func, func.__name__, {'note': None}, repaired=False)
+    assert reply and 'Required argument(s) left empty: note' in str(reply), reply
 
 
 # ── Offered by their tag only (review of ea8e9b3a4, MUST-FIX 2) ─────────
