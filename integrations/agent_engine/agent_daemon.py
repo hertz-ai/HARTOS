@@ -265,6 +265,23 @@ def _goal_ledger_grounding(goal_id):
         return None
 
 
+def _hive_work_held_for(goal_id, within_s):
+    """Why the goal's unfinished hive tasks wait on a person or an expert
+    over the last ``within_s`` seconds (DistributedTaskCoordinator
+    .held_for_help), or None: some task does not wait, there is no
+    coordinator, or it cannot say.  None keeps the grounding wait counting,
+    as before."""
+    try:
+        from .dispatch import _get_distributed_coordinator
+        coordinator = _get_distributed_coordinator()
+        if not coordinator:
+            return None
+        return coordinator.held_for_help(str(goal_id), within_s)
+    except Exception as e:
+        logger.debug(f"Hive hold unreadable for goal {goal_id}: {e}")
+        return None
+
+
 def _close_held_hive_tasks(goal_id, reply) -> int:
     """Complete the goal's hive tasks held for help with ``reply``, the
     reply of the goal's turn that just ran HERE and completed it
@@ -1004,6 +1021,23 @@ def _settle_dispatched_goal(db, goal, goal_key, served_escalation=None,
             # worker held on the free model's OPEN breaker).
             since = _later_iso(since, _seconds_since_iso(
                 cfg.get('last_verification_check')))
+        else:
+            # The person's wait, not the hive's: while every unfinished task
+            # of the run was held for help since the last check (a turn that
+            # waits on its person's card, hold_task), that time does not
+            # count either.  A turn waiting for the person keeps its goal
+            # active with no strike (core.agent_tools.is_waiting_for_person).
+            # Central 2026-11-19: goals fb84cdce and 5ba50f98 were paused
+            # "Check the distributed worker" while the plan waited on the
+            # owner's approval card.
+            checked = _seconds_since_iso(cfg.get('last_verification_check'))
+            held_for = _hive_work_held_for(goal_key, checked)
+            if held_for is not None:
+                since = _later_iso(since, checked)
+                logger.info(
+                    f"Goal {goal_key}: its hive work waits on a person or the "
+                    f"expert ({held_for[:200] or 'no reason recorded'}); that "
+                    f"wait is not counted as a stalled hive run")
         cfg['awaiting_verification_since'] = since
         cfg['last_verification_check'] = datetime.utcnow().isoformat()
         waited = _seconds_since_iso(since)

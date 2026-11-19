@@ -489,6 +489,10 @@ class DistributedTaskCoordinator:
                     "Rolled back held-task release for %s because task %s "
                     "refused the transition", goal_id, child.task_id)
                 return 0
+            # The release's own history entry keeps what the task was held
+            # with (its turn's reply), the one trace of the hold once it is
+            # PENDING again: held_for_help reads it.
+            child.state_history[-1]['held_for'] = child.error_message or ''
             child.set_blocked_reason(None)
             child.error_message = None
             child.started_at = None
@@ -501,6 +505,47 @@ class DistributedTaskCoordinator:
                 f"held-task release for goal {goal_id}", snapshots):
             return 0
         return released
+
+    def held_for_help(self, goal_id: str, within_s) -> Optional[str]:
+        """Why the goal's unfinished tasks wait on a person or an expert, or
+        None when any of them does not.  Read-only.
+
+        Every task of the goal's set that is not COMPLETED must be held for
+        help (hold_task).  It counts if it is still held (BLOCKED,
+        input_required), or if a release in the last ``within_s`` seconds
+        put it back to PENDING and nothing has claimed it since (the
+        release's history entry says so, _release_held_tasks).  Every
+        dispatch of the goal releases its held tasks before the daemon
+        settles it, so a turn that waits on its person's card reads as
+        PENDING by then.  A task nobody claimed after its release, a claimed
+        turn that never ends, and a failed task are not held.  Returns what
+        the first such task was held with (its turn's reply), or '' when no
+        reason was recorded.
+        """
+        parent = self._ledger.get_task(goal_id)
+        reasons = []
+        for child_id in list(getattr(parent, 'child_task_ids', None) or []):
+            child = self._ledger.get_task(child_id)
+            if child is None:
+                return None
+            if child.status == TaskStatus.COMPLETED:
+                continue
+            if (child.status == TaskStatus.BLOCKED and child.blocked_reason
+                    == BlockedReason.INPUT_REQUIRED.value):
+                reasons.append(child.error_message or '')
+                continue
+            last = (child.state_history or [{}])[-1]
+            if child.status != TaskStatus.PENDING or 'held_for' not in last:
+                return None
+            try:
+                age = (datetime.now() - datetime.fromisoformat(
+                    str(last.get('timestamp')))).total_seconds()
+            except (TypeError, ValueError):
+                return None
+            if within_s is None or age > float(within_s):
+                return None
+            reasons.append(str(last.get('held_for') or ''))
+        return reasons[0] if reasons else None
 
     def complete_held_tasks(self, goal_id: str, agent_id: str,
                             result: Any) -> int:
