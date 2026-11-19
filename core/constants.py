@@ -1464,6 +1464,25 @@ def tool_reply_failed(content) -> bool:
     return any(failure in body for failure in TOOL_FAILURE_RESULTS)
 
 
+def tool_reply_is_step_work(content) -> bool:
+    """Whether a tool call's reply counts as the step's work for a completion
+    gate: a reply that did not fail (tool_reply_failed), or a refusal that
+    says the step may finish without the tool's result
+    (core.tool_refusal.RETRY_FINISH_WITHOUT).
+
+    Read by the receipt readers -- REUSE's fabrication gate, its receipt
+    finder and its progress reader, and lifecycle_hooks._work_results for
+    CREATE -- in place of `not tool_reply_failed`.  CREATE's trace banker
+    keeps tool_reply_failed: such a call is not a step to replay.  Review of
+    e0b313bdd: text_2_image's "carry on without the image" refusal was no
+    receipt anywhere, so the step it told the agent to finish never could.
+    """
+    if not tool_reply_failed(content):
+        return True
+    from core.tool_refusal import refusal_lets_step_finish
+    return refusal_lets_step_finish(content)
+
+
 # ── A recipe action's can_perform_without_user_input: the TWO questions ──
 # One rule each, here in core.constants so every reader can ask without
 # importing the pipeline (hartos.lifecycle_hooks pulls hartos.helper:

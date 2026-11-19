@@ -17,7 +17,8 @@ import time
 from datetime import datetime, timezone
 from typing import Dict, Optional, Any
 from core.constants import (AGENT_MENTIONS, BOOKKEEPING_TOOLS,
-                            HISTORICAL_TOOL_PLACEHOLDER, tool_reply_failed)
+                            HISTORICAL_TOOL_PLACEHOLDER, tool_reply_failed,
+                            tool_reply_is_step_work)
 from core.session_cache import TTLCache
 
 try:
@@ -2645,7 +2646,9 @@ def _receipt_is_real_work(user_prompt: str, action_id: int, messages,
         "Error: ...", the tool_logging envelope, or a TOOL_FAILURE_RESULTS
         refusal -- which is what an 'incomplete' computer-use run returns.
         The gate used to accept any non-empty tool message, so a refusal
-        cited as the receipt completed the action it refused.
+        cited as the receipt completed the action it refused.  A refusal
+        that says the step may finish without the tool's result is the one
+        failed reply that counts (core.constants.tool_reply_is_step_work).
       * a BOOKKEEPING call (core.constants.BOOKKEEPING_TOOLS) the action does
         not itself name: live 2026-09-27, CREATE daemon_255bd83f, two
         execute_coding_task actions completed on save_data_in_memory writes of
@@ -2691,7 +2694,7 @@ def _work_results(message: dict, names: Dict[str, str], action_text: str,
         body = result.get('content')
         if body is None:
             body = message.get('content')
-        if (not str(body or '').strip() or tool_reply_failed(body)
+        if (not str(body or '').strip() or not tool_reply_is_step_work(body)
                 or HISTORICAL_TOOL_PLACEHOLDER in str(body)):
             continue
         call_id = result.get('tool_call_id') or message.get('tool_call_id')

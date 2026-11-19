@@ -25,6 +25,7 @@ from core.constants import (  # noqa: E402  (after io_guard, intentional)
     TOOL_OBSERVATION_MAX_CHARS,
     VERDICT_COMPLETION_STATUSES,
     tool_reply_failed,
+    tool_reply_is_step_work,
 )
 
 from enum import Enum
@@ -4861,7 +4862,7 @@ def _reuse_own_tool_progress(user_prompt, action_id, group_chat, agents):
             # this action either.
             if HISTORICAL_TOOL_PLACEHOLDER in body:
                 return
-            if tool_reply_failed(body):
+            if not tool_reply_is_step_work(body):
                 return
             fn = call_fn.get(call_id) or fallback_name
             if fn in wanted:
@@ -5787,7 +5788,7 @@ def _reuse_completion_evidence(user_prompt, action_id, group_chat):
                     body = str(body or '')
                     if call_id in seen or HISTORICAL_TOOL_PLACEHOLDER in body:
                         continue
-                    if tool_reply_failed(body):
+                    if not tool_reply_is_step_work(body):
                         continue
                     _fn = call_fn.get(call_id) or result.get('name')
                     if _fn == SEND_TOOL and (
@@ -7037,7 +7038,9 @@ def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):
             # CREATE's trace banker; it also covers a tool that RAISED
             # (core.tool_logging's envelope) or never ran (the executor's
             # "Error: ..."), which this gate used to credit as the work.
-            if tool_reply_failed(_body):
+            # A refusal that says the step may finish without the tool is
+            # the step's work done (core.constants.tool_reply_is_step_work).
+            if not tool_reply_is_step_work(_body):
                 return
             fn = _call_fn.get(call_id) or fallback_name
             # Only a REGISTERED tool name counts.  An agent name satisfies

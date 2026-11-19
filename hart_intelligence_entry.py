@@ -7009,17 +7009,27 @@ def parse_text_to_image(inp):
         headers = {}
         response = requests.request(
             "POST", url, headers=headers, data=payload, timeout=240)
+        # The one image refusal core.agent_tools.text_2_image answers too
+        # (core.tool_refusal.image_not_made): this returned None for any
+        # status but 200 and the exception's text when the call raised
+        # (review of e0b313bdd), so the model had nothing to act on.
+        from core.tool_refusal import image_not_made
         if response.status_code == 200:
-            return response.json()["img_url"]
+            img_url = response.json().get("img_url")
+            if img_url:
+                return img_url
+            return image_not_made('Text to image', 'its reply held no image')
         else:
             post_dict = {'user_id': thread_local_data.get_user_id(), 'status': TaskStatus.ERROR.value, 'task_name': TaskNames.STABLE_DIFF.value, 'uid': thread_local_data.get_request_id(
             ), 'task_id': f"{TaskNames.STABLE_DIFF.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': f'Exception happend at stable diff for req_id: {thread_local_data.get_request_id()}'}
             publish_async('com.hertzai.longrunning.log', post_dict)
+            return image_not_made('Text to image', f'HTTP {response.status_code}')
     except Exception as e:
         post_dict = {'user_id': thread_local_data.get_user_id(), 'status': TaskStatus.TIMEOUT.value, 'task_name': TaskNames.ANIMATE_CHARACTER.value, 'uid': thread_local_data.get_request_id(
         ), 'task_id': f"{TaskNames.ANIMATE_CHARACTER.value}_{str(thread_local_data.get_request_id())}", 'request_id': thread_local_data.get_request_id(), 'failure_reason': f'Exception happend at stable diff for req_id: {thread_local_data.get_request_id()} timed out'}
         publish_async('com.hertzai.longrunning.log', post_dict)
-        return f"{e} Not able to generating image at this moment please try later"
+        from core.tool_refusal import image_not_made
+        return image_not_made('Text to image', type(e).__name__)
 
 
 def parse_image_to_text(inp):

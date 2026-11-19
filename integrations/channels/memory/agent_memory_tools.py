@@ -121,12 +121,15 @@ def create_memory_tools(
         try:
             _since_ts = _parse_time_arg(since)
             _until_ts = _parse_time_arg(until)
+            # partial_match: a free-text recall, the same as
+            # search_long_term_memory's (core.agent_tools).
             nodes = graph.recall(
                 query, mode=mode, top_k=5,
-                since=_since_ts, until=_until_ts,
+                since=_since_ts, until=_until_ts, partial_match=True,
             )
             if not nodes:
-                return "No matching memories found."
+                from core.tool_refusal import nothing_recalled
+                return nothing_recalled(query)
 
             lines = []
             for i, node in enumerate(nodes, 1):
@@ -143,7 +146,8 @@ def create_memory_tools(
             return "\n".join(lines)
         except Exception as e:
             logger.warning(f"Recall failed: {e}")
-            return f"Memory recall failed: {e}"
+            from core.tool_refusal import recall_failed
+            return recall_failed('recall_memory', 'MemoryGraph', e)
 
     def backtrace_memory(
         memory_id_or_query: str,

@@ -18,8 +18,9 @@ A refusal built here carries the three things a retry needs:
     terms;
   * how to fix it: the change to make, or the tool to call first;
   * whether calling again can help at all (RETRY_AFTER_FIX, RETRY_LATER,
-    RETRY_NEVER, or RETRY_OTHER_TOOL when the named tool does not exist and
-    another one should be called), so a refusal no retry can fix is not
+    RETRY_NEVER, RETRY_OTHER_TOOL when the named tool does not exist and
+    another one should be called, or RETRY_FINISH_WITHOUT when the step may
+    end without the tool's result), so a refusal no retry can fix is not
     retried as it was.
 
 A text refusal opens with "Error:" (core.constants.TOOL_ERROR_REPLY_PREFIXES),
@@ -49,6 +50,13 @@ RETRY_AFTER_FIX = 'after_fix'
 RETRY_LATER = 'later'
 RETRY_NEVER = 'never'
 RETRY_OTHER_TOOL = 'other_tool'
+# The tool did all it could and the step may end without its result: the
+# image service delivered nothing, the memory store could not be read.  Still
+# a failed call (no recipe step is banked from it), but the completion gates
+# take it as the step's receipt (core.constants.tool_reply_is_step_work), so
+# the step the refusal says to finish can finish.  Review of e0b313bdd: told
+# to "carry on without the image", the step could never complete.
+RETRY_FINISH_WITHOUT = 'finish_without'
 
 # The words every text refusal built here carries, and the JSON key that
 # holds the sentence in a JSON refusal.  core.tool_logging reads both to tell
@@ -68,7 +76,10 @@ _RETRY_SENTENCES = {
     # 2ddf102da, F3), so this one points away from it.
     RETRY_OTHER_TOOL: ("There is no {tool} to call again; make the next call "
                        "with one of the tool names given."),
+    RETRY_FINISH_WITHOUT: ("Do not call {tool} again now; this step may "
+                           "finish without its result."),
 }
+_FINISH_WITHOUT_TAIL = "; this step may finish without its result."
 
 
 def _clause(text, what):
@@ -119,6 +130,54 @@ def refusal_has_hint(content) -> bool:
     return bool(payload and str(payload.get(NOTE_KEY) or '').strip())
 
 
+def refusal_lets_step_finish(content) -> bool:
+    """Whether ``content`` is a refusal built with RETRY_FINISH_WITHOUT: a
+    text refusal carrying REFUSAL_MARK and that mode's sentence, or a JSON
+    refusal whose ``retry`` is that mode."""
+    body = '' if content is None else str(content)
+    if REFUSAL_MARK in body and _FINISH_WITHOUT_TAIL in body:
+        return True
+    if not is_json_refusal(body):
+        return False
+    return (_json_object(body) or {}).get('retry') == RETRY_FINISH_WITHOUT
+
+
+def nothing_recalled(query) -> str:
+    """What a memory recall answers when nothing saved matches ``query``.
+
+    An answer, not a refusal: a step may end on it.  It names the query and
+    says what to do next, because a bare 'No relevant memories found.' left
+    central's daemon steps searching again until they paused needs_help
+    (2026-11-19).  search_long_term_memory and recall_memory both answer it."""
+    return (f"No relevant memories found for {str(query)[:120]!r}. Nothing "
+            f"saved matches it: carry on with this step from what you already "
+            f"have; the same search again will find nothing.")
+
+
+def recall_failed(tool: str, store: str, error) -> str:
+    """What a memory recall answers when ``store`` could not be read: a
+    refusal naming the error's class (never its text, which can carry a
+    path), and the step may finish without saved facts."""
+    return refuse(tool, f"the {store} memory store could not be read "
+                        f"({type(error).__name__})",
+                  "Carry on with this step without saved facts",
+                  retry=RETRY_FINISH_WITHOUT)
+
+
+def image_not_made(tool: str, why: str) -> str:
+    """What an image tool answers when the image service delivered no
+    image (``why``: unreachable, the HTTP status, the error's class): a
+    refusal saying to finish the step without the image.  text_2_image and
+    hart_intelligence_entry's 'Text to image' tool both answer it; it holds
+    no braces, so it is safe as LangChain tool text."""
+    return refuse(tool, f"the image service did not deliver an image for "
+                        f"this prompt ({why})",
+                  "Carry on without the image: put the image prompt and what "
+                  "the picture should show into the step's result as text, "
+                  "and finish the step",
+                  retry=RETRY_FINISH_WITHOUT)
+
+
 def is_json_refusal(content) -> bool:
     """Whether ``content`` is a JSON object whose top-level ``status`` is
     'refused' -- the shape JSON-answering tools refuse with.
@@ -146,6 +205,8 @@ def _json_object(body: str):
     return value if isinstance(value, dict) else None
 
 
-__all__ = ['NOTE_KEY', 'REFUSAL_MARK', 'RETRY_AFTER_FIX', 'RETRY_LATER',
-           'RETRY_NEVER', 'RETRY_OTHER_TOOL', 'is_json_refusal', 'refusal_fields',
-           'refusal_has_hint', 'refuse']
+__all__ = ['NOTE_KEY', 'REFUSAL_MARK', 'RETRY_AFTER_FIX', 'RETRY_FINISH_WITHOUT',
+           'RETRY_LATER', 'RETRY_NEVER', 'RETRY_OTHER_TOOL', 'image_not_made',
+           'is_json_refusal',
+           'nothing_recalled', 'recall_failed', 'refusal_fields',
+           'refusal_has_hint', 'refusal_lets_step_finish', 'refuse']

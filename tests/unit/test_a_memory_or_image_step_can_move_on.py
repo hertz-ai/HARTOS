@@ -73,7 +73,8 @@ def store(tmp_path):
 
 
 def test_a_query_with_a_word_no_row_holds_still_finds_its_rows(store):
-    found = store.search('textile compliance requirements for export buyers')
+    found = store.search('textile compliance requirements for export buyers',
+                         partial_match=True)
     contents = [r.item.content for r in found]
     # 'Export rules for rice.' holds one of the words: not enough to be found
     assert sorted(contents) == [
@@ -82,13 +83,96 @@ def test_a_query_with_a_word_no_row_holds_still_finds_its_rows(store):
 
 
 def test_a_query_that_matches_keeps_its_results(store):
-    found = store.search('rice moisture')
+    found = store.search('rice moisture', partial_match=True)
     assert [r.item.content for r in found] == [
         'Rice moisture must stay under 14 percent.']
 
 
 def test_a_query_none_of_whose_words_is_saved_finds_nothing(store):
-    assert store.search('seafood freight insurance') == []
+    assert store.search('seafood freight insurance', partial_match=True) == []
+
+
+# ── review of e0b313bdd ────────────────────────────────────────────────
+
+def test_a_search_is_exact_unless_it_asks_for_some_words(store):
+    """Review F1: the some-words match served every MemoryStore.search,
+    get_data_by_key's saved-value lookup among them."""
+    assert store.search('textile compliance requirements for export buyers') == []
+
+
+def test_a_key_never_saved_is_not_answered_by_a_row_sharing_its_words(tmp_path):
+    """Review F1 (CRITICAL): 'customer.email' answered with 'The customer
+    asked whether email delivery is slow on weekends.' and 'budget' with 'Our
+    budget talk went nowhere today.'; the parent answered Key not found."""
+    from core.agent_tools import KEY_NOT_FOUND
+    from integrations.channels.memory.memory_graph import MemoryGraph
+    g = MemoryGraph(db_path=str(tmp_path / 'g'), user_id='1')
+    try:
+        g.register('[KV] customer.name = "Ravi"', {'memory_type': 'fact'})
+        g.register('The customer asked whether email delivery is slow on '
+                   'weekends.', {'memory_type': 'conversation'})
+        g.register('Our budget talk went nowhere today.',
+                   {'memory_type': 'conversation'})
+        read = _tools(memory_graph=g)['get_data_by_key']
+        for key in ('customer.email', 'budget'):
+            out = read(key)
+            assert out.startswith(KEY_NOT_FOUND.strip().rstrip('.')), (key, out)
+            assert 'weekends' not in out and 'nowhere' not in out, (key, out)
+    finally:
+        g.close()
+
+
+def test_common_words_are_not_what_two_words_means(tmp_path):
+    """Review F3: 'what about seafood prices' found two rows that share only
+    'what' and 'about' with it."""
+    from integrations.channels.memory.memory_store import MemoryStore
+    s = MemoryStore(db_path=tmp_path / 's.db')
+    try:
+        s.add('What do you think about that, said the customer.')
+        s.add('Tell me about what happened with the shipment.')
+        assert s.search('what about seafood prices', partial_match=True) == []
+    finally:
+        s.close()
+
+
+def test_rows_holding_two_words_are_not_crowded_out_by_one_word_rows(tmp_path):
+    """Review: the limit was applied before the two-word filter, so 25
+    short rows holding one word pushed out the 3 that hold two."""
+    from integrations.channels.memory.memory_store import MemoryStore
+    s = MemoryStore(db_path=tmp_path / 'l.db')
+    try:
+        for i in range(25):
+            s.add(f'invoice {i}')
+        for i in range(3):
+            s.add(f'The freight forwarder sent the invoice for container {i} '
+                  + 'and more words ' * 20)
+        got = s.search('freight invoice overdue', max_results=10,
+                       partial_match=True)
+        assert len(got) == 3 and all('freight' in r.item.content for r in got),             [r.item.content[:30] for r in got]
+    finally:
+        s.close()
+
+
+def test_recall_memory_answers_like_search_long_term_memory(tmp_path):
+    """Review F4: the MemoryGraph tool set's recall_memory kept 'No matching
+    memories found.' and 'Memory recall failed: {e}'."""
+    from integrations.channels.memory.agent_memory_tools import create_memory_tools
+    from integrations.channels.memory.memory_graph import MemoryGraph
+    g = MemoryGraph(db_path=str(tmp_path / 'g'), user_id='1')
+    try:
+        g.register('Textile compliance: EU buyers ask for OEKO-TEX papers.',
+                   {'memory_type': 'fact'})
+        recall = create_memory_tools(g, '1', 's1')['recall_memory'][0]
+        assert 'OEKO-TEX' in recall('textile compliance rules for buyers')
+        empty = recall('seafood freight insurance')
+        assert empty.startswith('No relevant memories found'), empty
+        assert 'carry on' in empty.lower() and not tool_reply_failed(empty)
+        broken = mock.Mock()
+        broken.recall.side_effect = RuntimeError('database is locked')
+        out = create_memory_tools(broken, '1', 's1')['recall_memory'][0]('x')
+        assert tool_reply_failed(out) and refusal_has_hint(out), out
+    finally:
+        g.close()
 
 
 def test_an_empty_recall_names_the_query_and_says_carry_on():
@@ -117,6 +201,8 @@ def test_recalled_rows_are_still_returned():
     graph.recall.return_value = [SimpleNamespace(content='OEKO-TEX needed')]
     out = _tools(memory_graph=graph)['search_long_term_memory']('textile')
     assert out == 'OEKO-TEX needed'
+    # free-text recall is the one search that asks for some-words matching
+    assert graph.recall.call_args.kwargs.get('partial_match') is True
 
 
 @pytest.mark.parametrize('nothing', ['', None])

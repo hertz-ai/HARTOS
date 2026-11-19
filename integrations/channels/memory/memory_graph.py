@@ -291,6 +291,7 @@ class MemoryGraph:
         top_k: int = 5,
         since: Optional[float] = None,
         until: Optional[float] = None,
+        partial_match: bool = False,
     ) -> List[MemoryNode]:
         """
         Search memories by text, semantic, or hybrid search, optionally
@@ -304,6 +305,9 @@ class MemoryGraph:
                 with created_at < since are dropped from the result.
             until: Optional upper bound (UNIX epoch seconds). Memories
                 with created_at > until are dropped from the result.
+            partial_match: For a free-text recall: when no memory holds
+                every word, the ones holding two or more of its content
+                words (MemoryStore.search).  A lookup by key stays exact.
 
         Returns:
             List of MemoryNode results.
@@ -315,11 +319,13 @@ class MemoryGraph:
         # run out after filtering.
         fetch_k = top_k if since is None and until is None else top_k * 6
         if mode == "text":
-            results = self._store.search(query, max_results=fetch_k)
+            results = self._store.search(query, max_results=fetch_k,
+                                         partial_match=partial_match)
         elif mode == "semantic":
             results = self._store.search_semantic(query, max_results=fetch_k)
         else:
-            results = self._store.search_hybrid(query, max_results=fetch_k)
+            results = self._store.search_hybrid(query, max_results=fetch_k,
+                                                partial_match=partial_match)
 
         nodes = []
         for sr in results:

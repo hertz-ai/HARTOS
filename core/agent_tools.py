@@ -877,14 +877,8 @@ def build_core_tool_closures(ctx):
         # and a reply with no image alike.  Handed that '' as is, the model
         # called again: central 2026-11-19, two goals paused needs_help on a
         # text_2_image step ('did not complete after 3 attempts', 'looped').
-        from core.tool_refusal import RETRY_LATER, refuse
-        return refuse('text_2_image',
-                      "the image service did not deliver an image for this "
-                      "prompt (it is unreachable or busy)",
-                      "Carry on without the image: put the image prompt and "
-                      "what the picture should show into the step's result "
-                      "as text, and finish the step",
-                      retry=RETRY_LATER)
+        from core.tool_refusal import image_not_made
+        return image_not_made('text_2_image', 'it is unreachable or busy')
 
     tools.append((
         "text_2_image",
@@ -2603,23 +2597,7 @@ def build_core_tool_closures(ctx):
     if simplemem_store is not None or memory_graph is not None:
         from core.event_loop import get_or_create_event_loop
 
-        def _nothing_recalled(query):
-            """Finding nothing is an answer the step may end on, so it is no
-            refusal; it says what to do next.  A bare 'No relevant memories
-            found.' left central's daemon steps searching again until they
-            paused needs_help (2026-11-19)."""
-            return (f"No relevant memories found for {str(query)[:120]!r}. "
-                    f"Nothing saved matches it: carry on with this step from "
-                    f"what you already have; the same search again will find "
-                    f"nothing.")
-
-        def _recall_failed(store, e):
-            from core.tool_refusal import RETRY_LATER, refuse
-            return refuse('search_long_term_memory',
-                          f"the {store} memory store could not be read "
-                          f"({type(e).__name__})",
-                          "Carry on with this step without saved facts",
-                          retry=RETRY_LATER)
+        from core.tool_refusal import nothing_recalled, recall_failed
 
         @log_tool_execution
         def search_long_term_memory(
@@ -2635,21 +2613,25 @@ def build_core_tool_closures(ctx):
                     text = _bounded_recall(
                         [r.content for r in (results or [])], max_items=1,
                         skip_oversize=False)
-                    return text or _nothing_recalled(query)
+                    return text or nothing_recalled(query)
                 except Exception as e:
                     tool_logger.info(f"SimpleMem search error: {e}")
-                    return _recall_failed('SimpleMem', e)
+                    return recall_failed('search_long_term_memory', 'SimpleMem', e)
             # MemoryGraph leg — same contract, local store, no API key.
             try:
                 # Fetch past the 5 shown: rows _bounded_recall skips as
                 # over-size must not leave real memories unreturned (#104).
-                results = memory_graph.recall(query, mode='hybrid', top_k=10)
+                # partial_match: a free-text query finds rows holding some of
+                # its words; only this recall asks for it (a key lookup such
+                # as get_data_by_key's stays exact; review of e0b313bdd).
+                results = memory_graph.recall(query, mode='hybrid', top_k=10,
+                                              partial_match=True)
                 text = _bounded_recall(
                     [r.content for r in (results or [])], max_items=5)
-                return text or _nothing_recalled(query)
+                return text or nothing_recalled(query)
             except Exception as e:
                 tool_logger.info(f"MemoryGraph search error: {e}")
-                return _recall_failed('MemoryGraph', e)
+                return recall_failed('search_long_term_memory', 'MemoryGraph', e)
 
         tools.append((
             "search_long_term_memory",
