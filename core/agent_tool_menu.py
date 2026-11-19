@@ -680,6 +680,9 @@ def discover_and_attach(need, helper, executor, registry, attached_names,
             attached.append(fn)
         return got
 
+    # The flat-name rule is the registry's, not a copy (rv_942a's review of
+    # 942adc571: a drifted copy here survived all 24 neighbouring files).
+    from integrations.service_tools.registry import endpoint_function_name
     attached, startable = [], []
     for tool_name, tool in registry._tools.items():
         hay = ' '.join([tool_name, ' '.join(tool.tags or []),
@@ -693,8 +696,7 @@ def discover_and_attach(need, helper, executor, registry, attached_names,
             # ea8e9b3a4).  No other entry carries the mark.
             if ep.get('tag_only'):
                 continue
-            fn = (tool_name if ep_name == tool_name
-                  else f"{tool_name}_{ep_name}")
+            fn = endpoint_function_name(tool_name, ep_name)
             hay_ep = hay + ' ' + str(ep.get('description', '')).lower()
             # Substring alone misses morphological variants ('scrape' is not
             # a substring of 'scraping') — also match on shared 4-char stems.
@@ -850,12 +852,13 @@ def attach_for_tags(cap_tags, helper, executor, registry, attached_names):
     # Helper only: a tag is inferred from the turn's prose, never a request
     # that names the tool, so it does not reach the seat that speaks.
     helper_live = _schema_or_none(helper)
+    from integrations.service_tools.registry import endpoint_function_name
     n = 0
     for tool_name, tool in registry._tools.items():
         if not (set(tool.tags or []) & cap):
             continue
         for ep_name, ep in tool.endpoints.items():
-            fn = tool_name if ep_name == tool_name else f"{tool_name}_{ep_name}"
+            fn = endpoint_function_name(tool_name, ep_name)
             got = _attach_tool(
                 helper, executor, fn,
                 ep.get('description', f'{tool_name} {ep_name}'),
@@ -936,6 +939,35 @@ def attach_for_turn(message, helper, executor, registry):
         fit_schema_to_ctx(helper, protect=just)
         fit_schema_to_ctx(executor, protect=just)
     return new, n
+
+
+def named_function_names(names, registry):
+    """The function names a step's named tools stand for: each name as
+    written, plus the one function a single-endpoint service tool's name
+    names (registry.sole_endpoint_function).
+
+    THE selection attach_for_names attaches, and the set REUSE's and CREATE's
+    per-step schema fit protect.  A fit that protected only the step's words
+    ("crawl4ai") deferred the function the attach had just registered
+    ("crawl4ai_crawl") first under a tight context (rv_942a's review of
+    942adc571; the trim since f72eda5a0).  Never raises: a registry that
+    cannot be read yields the names as written, and says so.
+    """
+    out = {str(n) for n in (names or []) if n}
+    try:
+        from integrations.service_tools.registry import sole_endpoint_function
+        tools = getattr(registry, '_tools', None) or {}
+        for n in list(out):
+            tool = tools.get(n)
+            if tool is not None:
+                fn = sole_endpoint_function(n, tool)
+                if fn:
+                    out.add(fn)
+    except Exception as err:
+        tool_logger.warning(
+            f"named_function_names: service registry unreadable ({err!r}); "
+            f"only the names as written are protected/attached")
+    return out
 
 
 def attach_for_names(names, helper, executor, registry, attached_names,
@@ -1027,22 +1059,24 @@ def attach_for_names(names, helper, executor, registry, attached_names,
     def _count(got):
         return 1 if got and (got[0] or got[1]) else 0
 
-    from integrations.service_tools.registry import (
-        endpoint_function_name, sole_endpoint_function)
+    from integrations.service_tools.registry import endpoint_function_name
+    # A tool with ONE endpoint is named unambiguously by its tool name: live
+    # 2026-11-16 a research agent's steps said "crawl4ai: fetch ...", the
+    # in-process crawler's one endpoint is crawl4ai_crawl, and every round
+    # logged "names ['google_search', 'crawl4ai'] -> 0 tools", so the step
+    # never had a page reader.  Several endpoints still need the endpoint
+    # name, so naming a tool never hands over all of them.  The selection is
+    # named_function_names (sole_endpoint_function underneath, which the
+    # completion check lifecycle_hooks.action_named_tools reads too: the two
+    # agree on which function a tool name names, not on whether a step names
+    # the tool; prose such as "Use crawl4ai to fetch ..." is held by the check
+    # and is not in ``want`` here).  The per-step schema fits protect the
+    # same set, so what this attaches is never the first thing they defer.
+    wanted = named_function_names(want, registry)
     for tool_name, tool in registry._tools.items():
-        # A tool with ONE endpoint is named unambiguously by its tool name:
-        # live 2026-11-16 a research agent's steps said "crawl4ai: fetch ...",
-        # the in-process crawler's one endpoint is crawl4ai_crawl, and every
-        # round logged "names ['google_search', 'crawl4ai'] -> 0 tools", so
-        # the step never had a page reader.  Several endpoints still need the
-        # endpoint name, so naming a tool never hands over all of them.  The
-        # rule is sole_endpoint_function, which the completion check
-        # (lifecycle_hooks.action_named_tools) reads too.
-        _by_tool = (tool_name in want
-                    and sole_endpoint_function(tool_name, tool) is not None)
         for ep_name, ep in tool.endpoints.items():
             fn = endpoint_function_name(tool_name, ep_name)
-            if fn not in want and not _by_tool:
+            if fn not in wanted:
                 continue
             n += _count(_attach_tool(
                 helper, executor, fn,

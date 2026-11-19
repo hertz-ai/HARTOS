@@ -219,9 +219,12 @@ def endpoint_function_name(tool_name: str, endpoint_name: str) -> str:
     tool's own name when the endpoint shares it (seo_audit_score, gh_pr_open),
     else ``<tool>_<endpoint>`` (crawl4ai_crawl).  THE flat-name rule, read by
     create_endpoint_function (which names the function), get_tool_definitions,
-    sole_endpoint_function and core.agent_tool_menu.attach_for_names, so the
-    name a step is held to is the name the function was registered under
-    (rv_b06b's review of b06b29405: the rule was copied six times)."""
+    sole_endpoint_function and the three attaches in core.agent_tool_menu
+    (attach_for_names, discover_and_attach behind request_tools,
+    attach_for_tags), so the name a step is held to and the name any attach
+    offers are the name the function was registered under (rv_b06b's review
+    of b06b29405: the rule was copied six times; rv_942a's of 942adc571: two
+    copies were left)."""
     return tool_name if endpoint_name == tool_name else f"{tool_name}_{endpoint_name}"
 
 
@@ -234,12 +237,19 @@ def sole_endpoint_function(tool_name: str, tool: Any) -> Optional[str]:
     name when the endpoint shares it, else ``<tool>_<endpoint>``).  With
     several endpoints the tool name names none of them.
 
-    The ONE rule for this, read by the attach (core.agent_tool_menu.
-    attach_for_names) and by the check of which tools a step names
-    (hartos.lifecycle_hooks.action_named_tools), so a tool the attach hands
-    over for a step is a tool the completion check expects a result from.
-    Live 18 Nov 2026 22:26 IST (research agent 1795014914479, local 4B): the
-    crawl was attached and ran, and the step still GAVE_UP as naming no tool.
+    The ONE rule for which function a tool name names, read by the attach
+    (core.agent_tool_menu.attach_for_names) and by the check of which tools
+    a step names (hartos.lifecycle_hooks.action_named_tools).  Live 18 Nov
+    2026 22:26 IST (research agent 1795014914479, local 4B): the crawl was
+    attached and ran, and the step still GAVE_UP as naming no tool.
+
+    The two agree on WHICH function a tool name names, not on WHETHER a step
+    names the tool.  The attach is handed the names its caller reads off the
+    step (a leading "crawl4ai: ..."); the check also reads prose through
+    _text_names_tool ("Use crawl4ai to fetch ...", "... with crawl4ai").  On
+    such a step the check holds it to crawl4ai_crawl and the named attach
+    offers nothing (rv_942a's review of 942adc571: 18 saved desktop actions
+    have that shape, the same before and after it).
     """
     endpoints = getattr(tool, 'endpoints', None) or {}
     if len(endpoints) != 1:

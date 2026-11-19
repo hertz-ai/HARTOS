@@ -202,6 +202,37 @@ def test_the_attach_offers_a_flat_tool_under_its_registered_name():
     assert executor.exec_registered == ['ocr'], executor.exec_registered
 
 
+def _flat_registry(tags=()):
+    info = _info('ocr', 'ocr')
+    info.tags = list(tags)
+    reg = _registry(info)
+    reg.create_endpoint_function = lambda t, e: (lambda **kw: f'{t}.{e} ran')
+    return reg
+
+
+def test_request_tools_offers_a_flat_tool_under_its_registered_name():
+    """request_tools (discover_and_attach) found a flat tool by keyword and
+    named it with its own copy of the rule; rv_942a's drift mutant of that
+    copy survived all 24 neighbouring files of 942adc571."""
+    from core.agent_tools import discover_and_attach
+    helper, executor = _SeatAgent('helper'), _SeatAgent('assistant')
+    discover_and_attach('ocr this scanned page', helper, executor,
+                        _flat_registry(), set())
+    assert helper.llm_registered == ['ocr'], helper.llm_registered
+    assert executor.exec_registered == ['ocr'], executor.exec_registered
+
+
+def test_the_tag_attach_offers_a_flat_tool_under_its_registered_name():
+    """attach_for_tags held the last copy of the rule (rv_942a's S1)."""
+    from core.agent_tool_menu import attach_for_tags
+    helper, executor = _SeatAgent('helper'), _SeatAgent('assistant')
+    n = attach_for_tags(['vision'], helper, executor,
+                        _flat_registry(tags=['vision']), set())
+    assert n == 1, n
+    assert helper.llm_registered == ['ocr'], helper.llm_registered
+    assert executor.exec_registered == ['ocr'], executor.exec_registered
+
+
 @pytest.mark.parametrize('info', [_info('crawl4ai', 'crawl'), _info('ocr', 'ocr'),
                                   _info('wan2gp', 'generate', 'status')],
                          ids=['crawl4ai', 'flat', 'several'])

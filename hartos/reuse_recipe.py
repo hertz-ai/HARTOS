@@ -9927,6 +9927,28 @@ def _attach_named_tools_for_action(user_prompt):
             # schema, and only when the schema does not fit.
             from core.agent_tools import fit_schema_to_ctx
             _protect = set(named or ()) | {SEND_TOOL}
+            # What the attach handed those names to, and every function the
+            # completion check will demand of the current action: deferring
+            # either leaves the step held to a tool its seats no longer offer
+            # (rv_942a's review of 942adc571: "crawl4ai" was protected while
+            # the crawl4ai_crawl the attach registered was dropped first).
+            # Inline, like everything in _fit (the guard tests lift it out).
+            try:
+                from core.agent_tool_menu import named_function_names
+                from integrations.service_tools import (
+                    service_tool_registry as _svc_registry)
+                _protect |= named_function_names(named or (), _svc_registry)
+                _task = user_tasks.get(user_prompt)
+                _cur = getattr(_task, 'current_action', None) if _task else None
+                if _cur:
+                    _protect |= set(action_named_tools(
+                        [assistant, helper],
+                        action_own_text(_task.get_action(int(_cur) - 1)))[1])
+            except Exception as _perr:
+                _ctx_safe_log('warning', (
+                    f"schema fit: could not resolve the action's own tools to "
+                    f"protect ({_perr}); only the names as written are kept "
+                    f"for session: {user_prompt}"))
             # Her Reel Studio family, whole, while reel_studio is unlocked for
             # the session (arm_turn_attach at construction, or attach_for_turn
             # when a turn's words detect it) -- not only the tool this action

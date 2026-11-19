@@ -5243,7 +5243,15 @@ def _attach_named_for_create_step(agents_object, action_text, user_prompt):
         _n = attach_for_names(names, helper, assistant, service_tool_registry,
                               attached,
                               core_tools=getattr(assistant, '_hart_core_tools', None))
-        _protect = set(names) | {SEND_TOOL}
+        # The functions the attach handed those names to, and every function
+        # the completion check demands of this step: the same protect set as
+        # REUSE's _fit (core.agent_tool_menu.named_function_names), so the
+        # tool this step was just given is never the first one deferred.
+        from core.agent_tool_menu import named_function_names
+        from hartos.lifecycle_hooks import action_named_tools
+        _protect = (named_function_names(names, service_tool_registry)
+                    | set(action_named_tools([assistant, helper], action_text)[1])
+                    | {SEND_TOOL})
         fit_schema_to_ctx(helper, protect=_protect, turn_protect=True)
         fit_schema_to_ctx(assistant, protect=_protect, turn_protect=True)
         current_app.logger.info(
