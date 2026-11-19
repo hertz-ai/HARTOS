@@ -148,7 +148,24 @@ CONSENT_TYPES = frozenset({
                          # (one row per approval, so a join can be allowed
                          # again after a revoke).  Revoking it ends the join
                          # (core.persona_registry.joined_chats).
+    'mailbox_outreach',  # Agents find people to reach and send outreach
+                         # email from this person's own mailbox (owner
+                         # 2026-11-19: a connected email account starts the
+                         # marketing loop).  scope = the mailbox address.
+                         # Granted by the person's own connect of the
+                         # mailbox (owner: "as soon as the mailbox
+                         # connect"; outreach_crm_tools.mailbox_connected),
+                         # which starts its outreach; a revoke pauses every
+                         # goal that sends from it and the send gate refuses
+                         # (_mailbox_goals_from_consent).  Never auto-granted
+                         # by any other path (ASK_ONLY_CONSENT_TYPES).
 })
+
+#: Consent types only the person's own act grants: auto_grant_with_notice
+#: refuses them.  mailbox_outreach sends mail from the person's own account
+#: (hartos-43's review of the D8 design, 2026-11-19); the person's act that
+#: grants it is connecting that mailbox.
+ASK_ONLY_CONSENT_TYPES = frozenset({'mailbox_outreach'})
 
 #: A credential ask's scope is this prefix + the credential's name, the same
 #: name its {{secret:NAME}} alias carries.
@@ -586,6 +603,27 @@ def _announce_grant(db, user_id: str, consent_type: str, scope: str,
     after_commit(db, lambda: _emit('consent.granted', data))
     after_commit(db, lambda: _copilot_switch_from_consent(consent_type, True))
     after_commit(db, lambda: _embodied_feed_from_consent(consent_type, True))
+    after_commit(db, lambda: _mailbox_goals_from_consent(
+        user_id, consent_type, scope, True))
+
+
+def _mailbox_goals_from_consent(user_id, consent_type: str, scope: str,
+                                granted: bool) -> None:
+    """A mailbox_outreach yes starts the mailbox's outreach; a revoke stops
+    it (outreach_crm_tools.mailbox_consent_changed).  Nothing for any other
+    type.  Runs after the consent's commit: it writes goals, and run inside
+    the consent's transaction it would hold SQLite's one write lock (see
+    _announce_grant).  Never raises: the consent itself already stands."""
+    if consent_type != 'mailbox_outreach':
+        return
+    try:
+        from integrations.agent_engine.outreach_crm_tools import (
+            mailbox_consent_changed)
+        mailbox_consent_changed(user_id, scope, granted)
+    except Exception:
+        _logger.exception("mailbox_outreach %s for %s: the goals were not %s",
+                          'grant' if granted else 'revoke', user_id,
+                          'started' if granted else 'paused')
 
 
 def _named(db, data: dict, agent_id) -> dict:
@@ -1054,9 +1092,17 @@ class ConsentService:
             True  — caller may proceed (consent is now granted, possibly
                     silently auto-granted with notice).
             False — caller MUST refuse: user has explicitly revoked this
-                    consent and re-granting requires a fresh user action.
+                    consent and re-granting requires a fresh user action,
+                    or the type is one only an explicit yes grants
+                    (ASK_ONLY_CONSENT_TYPES); ask with request_consent.
         """
         _validate_consent_type(consent_type)
+        if consent_type in ASK_ONLY_CONSENT_TYPES:
+            _logger.warning(
+                "consent %s for user %s was not auto-granted: only the "
+                "person's own yes grants it (ask with request_consent)",
+                consent_type, user_id)
+            return False
 
         # 1. Active grant exists? Proceed silently.
         if ConsentService.check_consent(db, user_id, consent_type,
@@ -1146,12 +1192,13 @@ class ConsentService:
             row.revoked_at = now
         db.flush()
 
-        ConsentService.announce_revocation(user_id, consent_type, scope, agent_id)
+        ConsentService.announce_revocation(user_id, consent_type, scope,
+                                           agent_id, db=db)
         return rows[0]
 
     @staticmethod
     def announce_revocation(user_id: str, consent_type: str,
-                            scope: str = '*', agent_id=None):
+                            scope: str = '*', agent_id=None, db=None):
         """Fire the immutable-audit entry + ``consent.revoked`` broadcast for a
         revocation. PUBLIC on purpose: a surface that revokes by its own row
         model (the append-only ``consent_api`` UI path cannot delegate the WRITE
@@ -1171,6 +1218,14 @@ class ConsentService:
         })
         _copilot_switch_from_consent(consent_type, False)
         _embodied_feed_from_consent(consent_type, False)
+        # Writes goals, so after the revoke's commit when the caller hands
+        # its session (both revoke paths do); a caller outside any
+        # transaction gets it at once.
+        if db is not None:
+            after_commit(db, lambda: _mailbox_goals_from_consent(
+                user_id, consent_type, scope, False))
+        else:
+            _mailbox_goals_from_consent(user_id, consent_type, scope, False)
 
     @staticmethod
     def feed_said_no(db, consent_type: str, user_id=None) -> bool:

@@ -310,8 +310,45 @@ def _owner_value_fingerprint(channel_type: str, meta: dict):
         return None
 
 
+def _mailbox_next_step(owner, address) -> None:
+    """After a mailbox's login is proven, its outreach starts at once (owner
+    2026-11-19: "as soon as the mailbox connect"): the goals that already
+    name it send from it now, or one outreach agent starts on it
+    (outreach_crm_tools.mailbox_connected).  The owner is told which, here;
+    a mailbox whose sending they stopped earlier stays stopped, and they
+    are told how to allow it."""
+    from integrations.agent_engine.outreach_crm_tools import mailbox_connected
+    done = mailbox_connected(owner, address)
+    joined = done.get('joined') or []
+    if joined:
+        names = ', '.join(f'"{t}"' for t in joined[:5])
+        if len(joined) > 5:
+            names += f" and {len(joined) - 5} more"
+        many = len(joined) != 1
+        message = (f"{address} is connected. {len(joined)} "
+                   f"goal{'s' if many else ''} send{'' if many else 's'} from it "
+                   f"now: {names}.")
+    elif done.get('started'):
+        message = (f"{address} is connected. An outreach agent now works from "
+                   f"it: it works out which of your businesses this mailbox "
+                   f"speaks for and writes to businesses that offer is "
+                   f"relevant to.")
+    elif done.get('withdrawn'):
+        message = (f"{address} is connected, but you stopped agents sending "
+                   f"from it earlier, so nothing is sent. Allow it again in "
+                   f"privacy settings to start.")
+    else:
+        return
+    _emit_to_user(owner, {
+        'type': 'toast', 'severity': 'info',
+        'channel': 'email', 'channel_type': 'email',
+        'message': message + (" Every first email waits for your approval."
+                              if not done.get('withdrawn') else ''),
+    })
+
+
 def _watch_start(channel_type: str, meta: dict, owner, fp=None,
-                 account=None) -> int:
+                 account=None, on_connected=None) -> int:
     """Record a just-scheduled start of ``channel_type`` (``fp``: the
     credential_fingerprint of the value it started with) as being watched,
     then watch it on a daemon thread (_report_when_live) and record how it
@@ -320,7 +357,10 @@ def _watch_start(channel_type: str, meta: dict, owner, fp=None,
     The owner's stored value at this moment is kept beside it ('owner_fp'),
     so a later change of that value, by any path, is seen as theirs.
     ``account``: the account started, for a channel that holds several
-    (_report_when_live watches that one)."""
+    (_report_when_live watches that one).  ``on_connected``: called once,
+    on the watcher thread, only when the start connected (the email
+    mailbox's next step, _mailbox_next_step); a failure in it is logged and
+    leaves the start's record alone."""
     owner_fp = _owner_value_fingerprint(channel_type, meta)
     with _STARTS_LOCK:
         start = next(_START_NUMBERS)
@@ -341,6 +381,12 @@ def _watch_start(channel_type: str, meta: dict, owner, fp=None,
             entry = _STARTS.get(channel_type)
             if entry is not None and entry['start'] == start:
                 entry['state'] = START_CONNECTED if connected else START_FAILED
+        if connected and on_connected is not None:
+            try:
+                on_connected()
+            except Exception:
+                logger.warning("%s: the step after connecting failed",
+                               channel_type, exc_info=True)
 
     threading.Thread(target=_watch, name=f'channel-probe-{channel_type}',
                      daemon=True).start()
@@ -801,9 +847,11 @@ def build_channel_tool_closures(ctx):
                     return (f"{label} was saved, but it could not be started: "
                             f"{wired.get('error')}. Nothing will be sent or "
                             f"received on it until this is fixed.")
-                _watch_start(channel_type, meta,
-                             user_id or _get_user_id_from_threadlocal() or None,
-                             account=account)
+                _owner = user_id or _get_user_id_from_threadlocal() or None
+                _watch_start(channel_type, meta, _owner, account=account,
+                             on_connected=(
+                                 (lambda: _mailbox_next_step(_owner, account))
+                                 if channel_type == 'email' else None))
                 return (f"{label} registered and enabled! Auth: "
                         f"{meta['auth_method']}. Connecting now; you'll see a "
                         f"confirmation here once it's live. This is a goal "

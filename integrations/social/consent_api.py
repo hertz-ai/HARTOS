@@ -254,7 +254,7 @@ def revoke_consent():
     # cannot fail the revoke.
     from .consent_service import ConsentService
     ConsentService.announce_revocation(
-        uid, consent_type, scope, getattr(row, 'agent_id', None))
+        uid, consent_type, scope, getattr(row, 'agent_id', None), db=g.db)
 
     logger.info(
         'consent.revoke user=%s type=%s scope=%s id=%s',

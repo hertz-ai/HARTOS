@@ -125,6 +125,144 @@ def goal_sender(goal_id) -> Optional[Sender]:
         return Sender(goal_id, None, found=False)
 
 
+#: The consent a person gives for agents to find people and send outreach
+#: email from their own mailbox (consent_service.CONSENT_TYPES; scope = the
+#: mailbox address).  Only the person's own yes grants it.
+MAILBOX_CONSENT = 'mailbox_outreach'
+
+#: Statuses of a goal that can still send: a paused goal resumes and sends.
+_SENDING_STATUSES = ('active', 'paused')
+
+
+def _mailbox_form(address) -> str:
+    return str(address or '').strip().lower()
+
+
+def _goals_naming_mailbox(db, user_id, address, statuses=_SENDING_STATUSES):
+    """This user's goals whose config sender_email is ``address`` (the one
+    key goal_sender reads)."""
+    from integrations.social.models import AgentGoal
+    want = _mailbox_form(address)
+    rows = db.query(AgentGoal).filter(
+        AgentGoal.created_by == str(user_id),
+        AgentGoal.status.in_(statuses)).all()
+    return [g for g in rows
+            if _mailbox_form((g.config_json or {}).get('sender_email')) == want]
+
+
+def _titles(goals) -> List[str]:
+    return [str(g.title or g.id) for g in goals]
+
+
+def mailbox_connected(user_id, address) -> Dict:
+    """What a mailbox does once its login is proven.  Owner 2026-11-19:
+    "when user provides their email creds shd setup the marketing loop",
+    and, asked whether to wait for a yes: "as soon as the mailbox connect.
+    Each agent should understand to which bussines sit will be relevant and
+    talk to the appropriate bussiness".  Called once per connect by
+    register_channel's start watcher (channels.agent_tools._watch_start
+    on_connected); boot restore never calls it.
+
+    The connect is the person's yes: it is recorded as the mailbox_outreach
+    consent (ConsentService.grant_consent, scope = the address), so the
+    privacy page shows it and a revoke stops it.  The grant's effect
+    (mailbox_consent_changed) starts the loop: the user's goals that already
+    name the address (config sender_email) send from it now ('joined');
+    with none, ONE outreach goal starts on the mailbox ('started').  A
+    person who took that permission back earlier is not overruled
+    ('withdrawn'): nothing starts until they allow it again.
+
+    Returns {'joined': [titles], 'started': bool, 'withdrawn': bool}; never
+    raises (a connect must not fail on this)."""
+    out = {'joined': [], 'started': False, 'withdrawn': False}
+    address = _mailbox_form(address)
+    if not user_id or not address:
+        return out
+    try:
+        from integrations.social.consent_service import ConsentService
+        from integrations.social.models import db_session
+        if _mailbox_permission_withdrawn(user_id, address):
+            out['withdrawn'] = True
+            return out
+        with db_session(commit=True) as db:
+            joined = _goals_naming_mailbox(db, user_id, address)
+            out['joined'] = _titles(joined)
+            if not ConsentService.check_consent(db, str(user_id),
+                                                MAILBOX_CONSENT, scope=address):
+                ConsentService.grant_consent(db, str(user_id), MAILBOX_CONSENT,
+                                             scope=address)
+            out['started'] = not joined
+    except Exception:
+        logger.warning("mailbox %s connected for user %s: its outreach did "
+                       "not start", address, user_id, exc_info=True)
+    return out
+
+
+def mailbox_consent_changed(user_id, address, granted: bool) -> Dict:
+    """The mailbox_outreach permission was given (the mailbox connected, or
+    the person allowed it again on the privacy page) or taken back
+    (consent_service._mailbox_goals_from_consent, after the consent's
+    commit).
+
+    granted: when no goal of this user names the address yet, ONE outreach
+    goal is made for the mailbox (goal_type 'outreach': the type that has
+    the mailbox as its tool; the person's marketing goal hands it people
+    through dispatch_goal).  Its agent works out which of the owner's
+    businesses the mailbox speaks for and writes only to businesses it is
+    relevant to (owner 2026-11-19).  Goals that name no mailbox are never
+    bound to this one: a goal of one business must not mail from another
+    business's address; they name their mailbox themselves (on central,
+    from the owner's mailbox assignment).  Nothing new when a goal already
+    names it.
+    Revoked: every active goal of this user that sends from the address is
+    paused (GoalManager.pause_goal, cause 'person': the person's own act),
+    and the send gate (_mailbox_permission_withdrawn) refuses its
+    follow-ups, so nothing more leaves their mailbox.
+
+    Returns {'created': id or None, 'paused': [ids]}."""
+    from integrations.agent_engine.goal_manager import (
+        GoalManager, PAUSE_CAUSE_PERSON)
+    from integrations.social.models import db_session
+    out = {'created': None, 'paused': []}
+    address = _mailbox_form(address)
+    if not user_id or not address:
+        return out
+    with db_session(commit=True) as db:
+        if not granted:
+            for g in _goals_naming_mailbox(db, user_id, address, ('active',)):
+                done = GoalManager.pause_goal(
+                    db, g, cause=PAUSE_CAUSE_PERSON, by=str(user_id),
+                    reason=(f"You took back the permission to send from "
+                            f"{address}, so this goal, which sends from it, is "
+                            f"paused. Allow it again and resume the goal to "
+                            f"continue."))
+                if done.get('success'):
+                    out['paused'].append(g.id)
+                else:
+                    logger.warning("goal %s sends from %s and could not be "
+                                   "paused: %s", g.id, address, done.get('error'))
+            return out
+        if _goals_naming_mailbox(db, user_id, address):
+            return out
+        made = GoalManager.create_goal(
+            db, 'outreach', title=f"Outreach from {address}",
+            description=(
+                f"This goal sends from the owner's mailbox {address}. First "
+                f"work out which of the owner's businesses this mailbox speaks "
+                f"for: its domain, the owner's products and their other "
+                f"goals; if that is not clear, ask the owner. Then find "
+                f"businesses for whom that offer is relevant and write to "
+                f"them from {address}, about that business only. Every first "
+                f"email waits for the owner's approval before it is sent."),
+            config={'sender_email': address}, created_by=str(user_id))
+        if made.get('success'):
+            out['created'] = (made.get('goal') or {}).get('id')
+        else:
+            logger.warning("no outreach goal was made for %s: %s", address,
+                           made.get('error'))
+    return out
+
+
 def prospect_sender(prospect: Dict) -> Optional[Sender]:
     """Whom email to ``prospect`` goes from: the sender of the goal the
     prospect belongs to (its 'goal_id', stamped by the goal turn that
@@ -453,7 +591,50 @@ def _goal_mailbox(sender: Sender) -> tuple:
             f"connected it, or by this node's owner. Have that account (or "
             f"the owner) create this goal, or connect {sender.address} from "
             f"the account that made it." + _NEVER_ANOTHER_MAILBOX)
+    if _mailbox_permission_withdrawn(sender.creator, sender.address):
+        return None, None, _refused_send(
+            f"the person who made goal '{title}' took back the permission to "
+            f"send from {sender.address}",
+            f"Nothing is sent from {sender.address} until they allow it again "
+            f"(privacy settings: let agents send from {sender.address})."
+            + _NEVER_ANOTHER_MAILBOX)
     return adapter, loop, None
+
+
+def _mailbox_permission_withdrawn(creator, address) -> bool:
+    """Whether the account that made a goal said no to agents sending from
+    ``address`` (consent mailbox_outreach: a revoked grant or a declined
+    ask) and has not allowed it since.  A pause stops the goal's turns, but
+    follow-ups and held drafts send through this gate, so the "no" is read
+    here, at the send (hartos-43's review of the D8 design: after a revoke
+    the next check_pending_followups sends nothing).  A mailbox nobody was
+    asked about is not withdrawn: a goal naming its creator's own mailbox
+    sends as before.  Unreadable: withdrawn (mail from a person's own
+    account is not sent on a guess)."""
+    if not creator or not address:
+        return False
+    scope = _mailbox_form(address)
+    try:
+        from integrations.social.consent_service import ConsentService
+        from integrations.social.models import UserConsent, db_session
+        with db_session(commit=False) as db:
+            if ConsentService.check_consent(db, str(creator), MAILBOX_CONSENT,
+                                            scope=scope):
+                return False
+            # A "no" taken back (ConsentService.reopen: reopened_at after
+            # revoked_at) is undecided again, not withdrawn.
+            return any(
+                r.reopened_at is None or r.reopened_at < r.revoked_at
+                for r in db.query(UserConsent).filter(
+                    UserConsent.user_id == str(creator),
+                    UserConsent.consent_type == MAILBOX_CONSENT,
+                    UserConsent.scope == scope,
+                    UserConsent.revoked_at.isnot(None)).all())
+    except Exception:
+        logger.warning("The permission to send from %s could not be read; "
+                       "nothing is sent from it this time", address,
+                       exc_info=True)
+        return True
 
 
 def _send_from_goal_mailbox(sender: Sender, adapter, loop, to_email: str,
