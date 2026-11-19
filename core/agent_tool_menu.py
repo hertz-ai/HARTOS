@@ -1027,7 +1027,8 @@ def attach_for_names(names, helper, executor, registry, attached_names,
     def _count(got):
         return 1 if got and (got[0] or got[1]) else 0
 
-    from integrations.service_tools.registry import sole_endpoint_function
+    from integrations.service_tools.registry import (
+        endpoint_function_name, sole_endpoint_function)
     for tool_name, tool in registry._tools.items():
         # A tool with ONE endpoint is named unambiguously by its tool name:
         # live 2026-11-16 a research agent's steps said "crawl4ai: fetch ...",
@@ -1040,7 +1041,7 @@ def attach_for_names(names, helper, executor, registry, attached_names,
         _by_tool = (tool_name in want
                     and sole_endpoint_function(tool_name, tool) is not None)
         for ep_name, ep in tool.endpoints.items():
-            fn = tool_name if ep_name == tool_name else f"{tool_name}_{ep_name}"
+            fn = endpoint_function_name(tool_name, ep_name)
             if fn not in want and not _by_tool:
                 continue
             n += _count(_attach_tool(

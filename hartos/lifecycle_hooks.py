@@ -2578,13 +2578,13 @@ def action_named_tools(agents, action_text):
                 names.add(_cn)
     text = action_own_text(action_text).lower()
     referenced = [n for n in names if _text_names_tool(text, n)]
-    for fn in _service_functions_named_by_tool(text, names):
+    for fn in _service_functions_named_by_tool(text, names, referenced):
         if fn not in referenced:
             referenced.append(fn)
     return names, referenced
 
 
-def _service_functions_named_by_tool(text, served):
+def _service_functions_named_by_tool(text, served, referenced=()):
     """The served functions a step names through their service TOOL's name.
 
     The attach hands a step the one function of a service tool it names by
@@ -2603,9 +2603,13 @@ def _service_functions_named_by_tool(text, served):
     """
     try:
         from integrations.service_tools.registry import (
-            service_tool_registry, sole_endpoint_function)
+            endpoint_function_name, service_tool_registry, sole_endpoint_function)
         tools = dict(getattr(service_tool_registry, '_tools', None) or {})
-    except Exception:
+    except Exception as err:
+        # Not silent (rv_b06b's review): without the registry no step can be
+        # held to a tool it names by its service name.
+        logger.warning(f"[FAB-GUARD] service tool registry unreadable ({err!r}); "
+                       f"no step is held to a tool it names by its service name")
         return []
     found = []
     for tool_name, tool in tools.items():
@@ -2613,6 +2617,14 @@ def _service_functions_named_by_tool(text, served):
             continue
         fn = sole_endpoint_function(tool_name, tool)
         if fn is None:
+            # The text may name one of its endpoints outright
+            # ('wan2gp_generate' contains 'wan2gp'): that function is already
+            # required, so naming the tool counted nothing it should have
+            # (rv_b06b's review: a false warning on every such step).
+            own = {endpoint_function_name(tool_name, ep)
+                   for ep in (getattr(tool, 'endpoints', None) or {})}
+            if own & set(referenced or ()):
+                continue
             logger.warning(
                 f"[FAB-GUARD] the step names service tool {tool_name!r}, "
                 f"which has {len(getattr(tool, 'endpoints', None) or {})} "

@@ -214,6 +214,17 @@ class ServiceToolInfo:
         )
 
 
+def endpoint_function_name(tool_name: str, endpoint_name: str) -> str:
+    """The function name a service tool's endpoint is registered under: the
+    tool's own name when the endpoint shares it (seo_audit_score, gh_pr_open),
+    else ``<tool>_<endpoint>`` (crawl4ai_crawl).  THE flat-name rule, read by
+    create_endpoint_function (which names the function), get_tool_definitions,
+    sole_endpoint_function and core.agent_tool_menu.attach_for_names, so the
+    name a step is held to is the name the function was registered under
+    (rv_b06b's review of b06b29405: the rule was copied six times)."""
+    return tool_name if endpoint_name == tool_name else f"{tool_name}_{endpoint_name}"
+
+
 def sole_endpoint_function(tool_name: str, tool: Any) -> Optional[str]:
     """The function a tool with exactly ONE endpoint is called by, or None.
 
@@ -233,8 +244,7 @@ def sole_endpoint_function(tool_name: str, tool: Any) -> Optional[str]:
     endpoints = getattr(tool, 'endpoints', None) or {}
     if len(endpoints) != 1:
         return None
-    ep_name = next(iter(endpoints))
-    return tool_name if ep_name == tool_name else f"{tool_name}_{ep_name}"
+    return endpoint_function_name(tool_name, next(iter(endpoints)))
 
 
 class ServiceToolRegistry:
@@ -375,8 +385,7 @@ class ServiceToolRegistry:
         # doubled "seo_audit_score_seo_audit_score" would break the
         # prompt↔tool-name contract goal prompts rely on.  Every other
         # tool (crawl4ai_crawl, whisper_transcribe, …) is unchanged.
-        func_name = (tool_name if endpoint_name == tool_name
-                     else f"{tool_name}_{endpoint_name}")
+        func_name = endpoint_function_name(tool_name, endpoint_name)
         endpoint_executor.__name__ = func_name
         endpoint_executor.__doc__ = description
 
@@ -451,8 +460,7 @@ class ServiceToolRegistry:
                 defs.append({
                     # Mirror create_endpoint_function's flat-name rule for
                     # single-function tools (endpoint named after the tool).
-                    "name": (tool_name if ep_name == tool_name
-                             else f"{tool_name}_{ep_name}"),
+                    "name": endpoint_function_name(tool_name, ep_name),
                     "description": ep.get("description", f"{tool_name} {ep_name}"),
                     "parameters": ep.get("params_schema", {}),
                     "service_tool": tool_name,
