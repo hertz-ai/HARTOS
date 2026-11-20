@@ -294,14 +294,80 @@ def with_local_fallback(config_list) -> list:
     backend gets no duplicate: re-dialling the endpoint that just failed is a
     retry, not a fallback.  A falsy override stays falsy, because every consumer
     spells its default as ``override or config_list``.
+
+    Nor does a turn get this node's backend while its provider is refusing
+    calls (core.circuit_breaker.provider_refusing: the account refused, or a
+    quota spent until its reset).  Falling to it cannot answer, and it hides
+    the failure that ended the turn.  Measured on central 2026-11-19: the
+    goal turns ran on the expert because openrouter/free's day quota was
+    spent, and every Anthropic 400 fell to it as three 429s
+    (free-models-per-day), so the turns ended on RateLimitError and the 400's
+    own reason was never logged.  Decided once, when /chat composes the turn's
+    model, like goal_turn_model.  Healthy, the node's backend stays the last
+    entry: the owner's fallback for an expert call the day cap refuses
+    (integrations.agent_engine.dispatch.revenue_expert_config).
     """
     if not config_list:
         return config_list
+    from core.circuit_breaker import provider_refusing
     entries = list(config_list)
     for own in get_autogen_config_list():
-        if not any(_same_endpoint(own, e) for e in entries):
-            entries.append(own)
+        if any(_same_endpoint(own, e) for e in entries):
+            continue
+        if provider_refusing(own.get('base_url')):
+            log.info("The turn's model %s gets no fallback to this node's own "
+                     "model %s: its provider is refusing calls (breaker open)",
+                     [e.get('model') for e in entries], own.get('model'))
+            continue
+        entries.append(own)
     return entries
+
+
+def turn_chat_model(chat_model_cls, temperature=0.7, max_tokens=1500):
+    """The LangChain chat model for THIS turn's model list, or None when the
+    turn names no model (the caller then builds the node's own, as before).
+
+    The turn's list is the one every autogen agent of the turn runs on: the
+    thread's model_config override, which /chat composes with
+    with_local_fallback.  hart_intelligence_entry.get_llm, the factory the
+    agent matcher, the planner and dispatch_to_agent use, built the node's
+    own model whatever the turn's was: on central 2026-11-19 the matcher of
+    expert goal turns 5ba50f98 and fb84cdce posted to openrouter/free (quota
+    spent), and those turns never reached the expert.
+
+    One ``chat_model_cls`` (langchain's ChatOpenAI: openai SDK over httpx,
+    so each call passes the wire's day cap, breaker feed and meter exactly
+    as the autogen agents' do) per entry, the first tried first and the rest
+    its fallbacks, in order: the same ladder autogen's OpenAIWrapper walks."""
+    from hartos.threadlocal import thread_local_data
+    turn = thread_local_data.get_model_config_override()
+    if not turn:
+        return None
+    models = [chat_model_cls(**_chat_model_kwargs(entry, temperature, max_tokens))
+              for entry in turn]
+    return models[0].with_fallbacks(models[1:]) if len(models) > 1 else models[0]
+
+
+def _chat_model_kwargs(entry, temperature, max_tokens) -> dict:
+    """ChatOpenAI's arguments for one config_list entry: its model, key and
+    endpoint, and its retries where the entry sets them.  Not the entry's
+    shared ``http_client``: ChatOpenAI hands one client to both its sync and
+    async openai clients, and the async one refuses a sync client
+    (TypeError, measured on central's build).  Its own httpx client passes
+    the same patched wire (core.llm_outbound_logger patches httpx.Client)."""
+    kwargs = {
+        'model_name': entry.get('model'),
+        'openai_api_key': entry.get('api_key') or 'dummy',
+        'temperature': temperature,
+        'max_tokens': max_tokens,
+    }
+    if entry.get('base_url'):
+        kwargs['openai_api_base'] = entry['base_url']
+    if entry.get('max_retries') is not None:
+        kwargs['max_retries'] = entry['max_retries']
+    if entry.get('extra_body'):
+        kwargs['model_kwargs'] = {'extra_body': entry['extra_body']}
+    return kwargs
 
 
 def get_autogen_config_list() -> list:

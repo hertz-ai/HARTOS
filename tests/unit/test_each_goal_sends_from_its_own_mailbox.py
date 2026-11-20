@@ -1431,6 +1431,149 @@ def test_a_server_that_does_not_answer_is_not_a_login(node, monkeypatch):
         assert db.query(UserChannelBinding).filter_by(user_id=OWNER).count() == 0
 
 
+# ── 6k. the bindings route says so when a body names a mailbox (R1) ──
+
+@pytest.mark.parametrize('extra', [
+    {'metadata': {'email_address': ''}},
+    {'metadata': {'email_address': None}},
+    {},                                                   # the sender id alone
+    {'email_address': '', 'metadata': {'email_address': HEVOLVE}},   # an empty one overrides
+], ids=['empty', 'none', 'sender-id-only', 'override'])
+def test_a_binding_that_names_a_mailbox_of_this_node_is_refused_with_the_reason(node, web, extra):
+    """POST /bindings answered 201 to a body naming another account's mailbox
+    and stored a row with the address dropped, saying nothing (review of
+    68f9fa4b1, R1).  It refuses, and says a mailbox is connected through the
+    connect form, which logs in."""
+    from integrations.social.models import UserChannelBinding, db_session
+    _connect(HEVOLVE)
+    _mailbox(node.channels, HEVOLVE)
+    forger = web.sign_up('forger')
+
+    resp = web.client.post('/api/social/channels/bindings', headers=forger['auth'], json={
+        'channel_type': 'email', 'channel_sender_id': HEVOLVE, **extra})
+
+    body = resp.get_json()
+    assert resp.status_code == 400 and body['success'] is False, body
+    assert 'mailbox' in body['error'] and HEVOLVE in body['error']
+    if not extra.get('email_address') == '' or 'metadata' not in extra:
+        assert 'connect form' in body['error']
+    assert _held_by(HEVOLVE) == {OWNER}
+    with db_session(commit=False) as db:
+        assert db.query(UserChannelBinding).filter_by(user_id=forger['id']).count() == 0
+
+
+def test_a_mailbox_is_named_while_it_runs_even_when_no_row_connects_it(node, web):
+    """A mailbox that runs on this node (restored, or wired another way) is
+    this node's whoever's row says so."""
+    from integrations.social.models import UserChannelBinding, db_session
+    _connect(HEVOLVE)
+    _mailbox(node.channels, HEVOLVE)
+    with db_session() as db:
+        db.query(UserChannelBinding).filter_by(user_id=OWNER).delete()
+    forger = web.sign_up('forger')
+
+    resp = web.client.post('/api/social/channels/bindings', headers=forger['auth'], json={
+        'channel_type': 'email', 'channel_sender_id': HEVOLVE})
+
+    assert resp.status_code == 400 and 'connect form' in resp.get_json()['error']
+
+
+def test_a_mailbox_is_named_while_its_connect_remains_even_when_it_is_not_running(node, web):
+    """Held by an account, and not running now (the node restarted and has not
+    restored it yet): still a mailbox this node holds."""
+    _connect(HEVOLVE)
+    _mailbox(node.channels, HEVOLVE)
+    node.channels.registry.unregister('email', account=HEVOLVE)
+    forger = web.sign_up('forger')
+
+    resp = web.client.post('/api/social/channels/bindings', headers=forger['auth'], json={
+        'channel_type': 'email', 'channel_sender_id': HEVOLVE})
+
+    assert resp.status_code == 400 and 'connect form' in resp.get_json()['error']
+    assert _held_by(HEVOLVE) == {OWNER}
+
+
+def test_the_account_that_connected_a_mailbox_cannot_rewrite_its_row_through_bindings(node, web):
+    from integrations.channels.flask_integration import unseal_binding_metadata
+    from integrations.social.models import UserChannelBinding, db_session
+    seller = web.sign_up('seller')
+    assert web.connect(seller, MCGROCE).get_json()['success'] is True
+    _mailbox(node.channels, MCGROCE)
+
+    resp = web.client.post('/api/social/channels/bindings', headers=seller['auth'], json={
+        'channel_type': 'email', 'channel_sender_id': MCGROCE,
+        'metadata': {'note': 'a rewrite'}})
+
+    assert resp.status_code == 400 and 'connect form' in resp.get_json()['error']
+    assert _held_by(MCGROCE) == {seller['id']}
+    with db_session(commit=False) as db:
+        row = db.query(UserChannelBinding).filter_by(
+            user_id=seller['id'], channel_type='email', channel_sender_id=MCGROCE).one()
+        assert unseal_binding_metadata('email', row.metadata_json)[
+            'password'] == PASSWORDS[MCGROCE]
+
+
+def test_a_mailbox_named_in_the_config_the_wizards_send_is_connected_by_its_writer(node, web):
+    """Both Channels wizards post {channel_type, config: formData}: the form
+    was dropped, so an email set up from the Channels page saved no credential
+    and started nothing (design D8-a).  The config goes where a mailbox named
+    in 'metadata' goes: to register_channel, which logs in."""
+    operator = web.sign_up('operator')
+
+    resp = web.client.post('/api/social/channels/bindings', headers=operator['auth'], json={
+        'channel_type': 'email',
+        'config': {'imap_host': 'imap.mcgroce.example', 'smtp_host': 'smtp.mcgroce.example',
+                   'email_address': MCGROCE, 'password': PASSWORDS[MCGROCE]}})
+
+    assert resp.get_json()['success'] is True, resp.get_json()
+    _mailbox(node.channels, MCGROCE)
+    assert _held_by(MCGROCE) == {operator['id']}
+
+
+@pytest.mark.parametrize('config', [
+    {'email_address': ''},                                   # rv_ab8e's shape
+    {'email_address': HEVOLVE},                              # the address, no login
+    {'email_address': HEVOLVE, 'password': 'wrong-SECRET-9',
+     'imap_host': 'imap.hevolve.example', 'smtp_host': 'smtp.hevolve.example'},
+], ids=['empty', 'address-only', 'wrong-password'])
+def test_a_config_naming_a_mailbox_it_does_not_log_in_to_holds_nothing(node, web, config):
+    from integrations.social.models import UserChannelBinding, db_session
+    _connect(HEVOLVE)
+    _mailbox(node.channels, HEVOLVE)
+    forger = web.sign_up('forger')
+
+    resp = web.client.post('/api/social/channels/bindings', headers=forger['auth'], json={
+        'channel_type': 'email', 'channel_sender_id': HEVOLVE, 'config': config})
+
+    assert resp.status_code == 400 and resp.get_json()['success'] is False
+    assert 'wrong-SECRET-9' not in resp.get_data(as_text=True)
+    assert _held_by(HEVOLVE) == {OWNER}
+    with db_session(commit=False) as db:
+        assert db.query(UserChannelBinding).filter_by(user_id=forger['id']).count() == 0
+
+
+def test_a_persons_own_bindings_that_name_no_mailbox_are_still_stored(node, web):
+    """The refusal is for a mailbox this node holds; an email binding for the
+    poster's own address as a sender, and a binding on another channel, stay
+    as they were."""
+    from integrations.social.models import UserChannelBinding, db_session
+    _connect(HEVOLVE)
+    _mailbox(node.channels, HEVOLVE)
+    person = web.sign_up('person')
+
+    own_address = web.client.post('/api/social/channels/bindings', headers=person['auth'], json={
+        'channel_type': 'email', 'channel_sender_id': 'me@home.example'})
+    other_channel = web.client.post('/api/social/channels/bindings', headers=person['auth'], json={
+        'channel_type': 'telegram', 'channel_sender_id': 'tg-4411'})
+
+    assert own_address.status_code == 201 and other_channel.status_code == 201
+    with db_session(commit=False) as db:
+        stored = {(r.channel_type, r.channel_sender_id) for r in
+                  db.query(UserChannelBinding).filter_by(user_id=person['id']).all()}
+    assert stored == {('email', 'me@home.example'), ('telegram', 'tg-4411')}
+    assert _held_by(HEVOLVE) == {OWNER}
+
+
 # ── 6i. the poll: a reply is not lost, an unread inbox is cheap ──────
 
 def test_a_reply_waiting_before_the_hook_is_attached_is_matched_once_it_is(node, monkeypatch):

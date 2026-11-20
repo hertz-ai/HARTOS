@@ -56,7 +56,8 @@ def list_bindings():
     bindings = g.db.query(UserChannelBinding).filter_by(
         user_id=g.user_id,
     ).order_by(UserChannelBinding.created_at.desc()).all()
-    return jsonify({'success': True, 'data': [b.to_dict() for b in bindings]})
+    from integrations.channels.flask_integration import binding_for_client
+    return jsonify({'success': True, 'data': [binding_for_client(b) for b in bindings]})
 
 
 def _extract_credential(data: dict, meta: dict):
@@ -204,16 +205,37 @@ def create_binding():
     # field here, so the account goes to the one writer of such accounts,
     # the register_channel tool, as the chat form's submit does.
     # The account may also arrive nested under 'metadata', which this route
-    # stores verbatim: a row that names a mailbox there was written with no
-    # connect and no credential, yet read as "the account that connected it"
-    # (FlaskChannelIntegration.accounts_connecting), which entitles a goal to
-    # send from it (outreach_crm_tools._may_use_mailbox).  So a mailbox named
-    # anywhere in the body goes to its one writer.
-    from integrations.channels.flask_integration import FlaskChannelIntegration
+    # stores, or under 'config', where both Channels wizards put the form
+    # ({channel_type, config: formData}).  A row that names a mailbox there
+    # was written with no connect and no credential, yet read as "the account
+    # that connected it" (FlaskChannelIntegration.accounts_connecting), which
+    # entitles a goal to send from it (outreach_crm_tools._may_use_mailbox).
+    # So a mailbox named anywhere in the body goes to its one writer.  A top-
+    # level field that is empty never overrides one that is given.
+    from integrations.channels.flask_integration import (
+        FlaskChannelIntegration)
     nested = data.get('metadata')
-    flat = {**(nested if isinstance(nested, dict) else {}), **data}
+    config = data.get('config')
+    flat = {**(nested if isinstance(nested, dict) else {}),
+            **(config if isinstance(config, dict) else {}),
+            **{k: v for k, v in data.items() if v not in (None, '')}}
     if FlaskChannelIntegration.channel_account(channel_type, flat):
         return _connect_from_form(channel_type, flat)
+    # A body that names a mailbox this node holds only by its sender id (the
+    # address fields empty or absent) is not a connect either: refuse, and
+    # say where a mailbox is connected, instead of storing a row that says
+    # nothing (review of 68f9fa4b1, R1).
+    for named in (data.get('channel_sender_id'), flat.get('channel_sender_id')):
+        mailbox = FlaskChannelIntegration.mailbox_named(g.db, channel_type, named)
+        if mailbox:
+            # The words do not say that this node holds the address (review of
+            # fb9c8646d, minor).  The 400 still differs from a 201, so a
+            # signed-in account can tell: open.
+            return jsonify({'success': False, 'error': (
+                f"A mailbox address is bound through the Email connect form "
+                f"(IMAP server, SMTP server, address and password), which "
+                f"logs in with the password; this route does not bind one, "
+                f"so nothing was saved. Connect {mailbox} there.")}), 400
 
     sender_id = data.get('channel_sender_id', '')
     chat_id = data.get('channel_chat_id', '')
@@ -293,7 +315,8 @@ def create_binding():
 
     # `live` says whether the adapter could be started, so a caller never
     # reads a saved binding as a working channel.
-    return jsonify({'success': True, 'data': binding.to_dict(),
+    from integrations.channels.flask_integration import binding_for_client
+    return jsonify({'success': True, 'data': binding_for_client(binding),
                     'live': adapter_result}), 201
 
 
@@ -328,7 +351,8 @@ def set_preferred(binding_id):
     ).update({'is_preferred': False})
 
     binding.is_preferred = True
-    return jsonify({'success': True, 'data': binding.to_dict()})
+    from integrations.channels.flask_integration import binding_for_client
+    return jsonify({'success': True, 'data': binding_for_client(binding)})
 
 
 # ── Pairing ────────────────────────────────────────────────────
@@ -407,7 +431,8 @@ def verify_pair_code():
             g.db.add(binding)
         g.db.flush()
 
-        return jsonify({'success': True, 'data': binding.to_dict()})
+        from integrations.channels.flask_integration import binding_for_client
+        return jsonify({'success': True, 'data': binding_for_client(binding)})
     except Exception as e:
         logger.error("Pairing verification failed: %s", e)
         return jsonify({'success': False, 'error': 'Verification failed'}), 500

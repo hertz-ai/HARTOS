@@ -325,8 +325,13 @@ def dispatch_to_agent(agent_id: str, prompt: str,
         _dispatch_to_agent_worker(*args)
         return
     import threading
+    from hartos.threadlocal import thread_local_data
+    # The worker runs as the turn that dispatched it (thread_local_data.carry,
+    # as the plan's LLM calls do): its request id and lane, and its model, so
+    # get_llm builds the turn's model and not the node's own.  On central
+    # 2026-11-19 the node's own was openrouter/free with its quota spent.
     threading.Thread(
-        target=_dispatch_to_agent_worker,
+        target=thread_local_data.carry(_dispatch_to_agent_worker),
         args=args,
         daemon=True,
         name=f'mention_dispatch_{(agent_id or "?")[:8]}',
