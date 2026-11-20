@@ -555,6 +555,49 @@ def user_id_for_token(token):
             db.close()
 
 
+def user_for_hevolve_token(db, token, email=None, name='', phone_number=''):
+    """The account a Hevolve login token proves, found or created: ``(user,
+    created)``, or ``(None, False)`` when nothing is proven.
+
+    A Hevolve OTP login hands the client an opaque Kong OAuth2 token; Kong is
+    asked which account minted it (kong_identity.email_for_token), and only
+    that account's email is used.  ``email``, when given, must be the one the
+    token proves (link-hevolve passes the body's email).  The account is
+    found by email, the one field the legacy `user` table and User share, or
+    created under it.  The ONE place this question is answered: link-hevolve
+    mints a JWT on it, and central's API gate admits a phone's turn on it
+    (security.middleware), so the two can never disagree about who a token
+    is.  Whether the account may act is the caller's question (user_refusal).
+    """
+    import re
+    from .kong_identity import email_for_token
+    from .models import User
+
+    proven = email_for_token(token) if token else None
+    if not proven or (email is not None and email != proven):
+        return None, False
+    user = db.query(User).filter(User.email == proven).first()
+    if user:
+        return user, False
+    base = re.sub(r'[^a-z0-9_]', '', (name or phone_number or proven.split('@')[0])
+                  .strip().lower().replace(' ', '_')) or 'user'
+    username = base
+    while db.query(User).filter(User.username == username).first():
+        username = f"{base}_{secrets.token_hex(3)}"
+    user = User(
+        username=username,
+        display_name=name or username,
+        email=proven,
+        user_type='human',
+        api_token=generate_api_token(),
+        is_verified=True,
+    )
+    db.add(user)
+    db.flush()
+    db.commit()
+    return user, True
+
+
 def log_refused_credential(token=None, reason=None) -> None:
     """Say, once, that a request is refused because no way in accepted the
     credential it sent: where, why, and the credential's shape, never the

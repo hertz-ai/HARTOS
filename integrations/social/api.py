@@ -182,10 +182,8 @@ def link_hevolve():
     once they link to it.  A node without Kong (a desktop) can prove no email
     and refuses every call.
     """
-    import re
-    import secrets
-    from .auth import generate_jwt, generate_api_token, user_refusal, user_refusal_words
-    from .kong_identity import email_for_token
+    from .auth import (generate_jwt, user_for_hevolve_token, user_refusal,
+                       user_refusal_words)
 
     data = _get_json()
     email = (data.get('email') or '').strip().lower()
@@ -198,46 +196,30 @@ def link_hevolve():
     auth_header = request.headers.get('Authorization', '')
     hevolve_token = (auth_header[7:].strip()
                      if auth_header.startswith('Bearer ') else '')
-    if not hevolve_token or email_for_token(hevolve_token) != email:
-        # WARNING, not INFO: central logs nothing below it after boot, and a
-        # refusal here is the only trace of someone trying another's email.
-        logger.warning("link-hevolve refused: no Hevolve token proving the "
-                       "email was presented")
-        return _err("A Hevolve access token for this email is required", 401)
 
     db = get_db()
     try:
-        user = db.query(User).filter(User.email == email).first()
-        if user:
+        # The ONE "whose account does this Hevolve token prove" answer
+        # (auth.user_for_hevolve_token), shared with central's API gate.
+        user, created = user_for_hevolve_token(
+            db, hevolve_token, email=email, name=name, phone_number=phone_number)
+        if user is None:
+            # WARNING, not INFO: central logs nothing below it after boot, and
+            # a refusal here is the only trace of someone trying another's
+            # email.
+            logger.warning("link-hevolve refused: no Hevolve token proving the "
+                           "email was presented")
+            return _err("A Hevolve access token for this email is required", 401)
+        if not created:
             # This door mints a JWT, so it asks the ONE "may this person act
             # here" rule the Bearer doors ask (auth.user_refusal), in this
             # door's own reply shape ("Account banned", 403).
             why = user_refusal(user)
             if why:
                 return _err("Account " + user_refusal_words(why), 403)
-            token = generate_jwt(user.id, user.username, user.role or 'flat')
-            return _ok({'user': user.to_dict(), 'token': token})
-
-        base = re.sub(r'[^a-z0-9_]', '', (name or phone_number or email.split('@')[0])
-                      .strip().lower().replace(' ', '_')) or 'user'
-        username = base
-        while db.query(User).filter(User.username == username).first():
-            username = f"{base}_{secrets.token_hex(3)}"
-
-        user = User(
-            username=username,
-            display_name=name or username,
-            email=email,
-            user_type='human',
-            api_token=generate_api_token(),
-            is_verified=True,
-        )
-        db.add(user)
-        db.flush()
-        db.commit()
-
         token = generate_jwt(user.id, user.username, user.role or 'flat')
-        return _ok({'user': user.to_dict(), 'token': token}, status=201)
+        return _ok({'user': user.to_dict(), 'token': token},
+                   status=201 if created else 200)
     except Exception as e:
         db.rollback()
         logger.error(f"Hevolve link failed: {e}")

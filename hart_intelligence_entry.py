@@ -10283,6 +10283,10 @@ def chat():
     _api_key = os.environ.get('HEVOLVE_API_KEY', '')
     auth_header = request.headers.get('Authorization', '')
     _bearer_token = auth_header[7:] if auth_header.startswith('Bearer ') else ''
+    # The verdicts the API gate reaches on credentials this handler's HS256
+    # check cannot verify (a phone the owner allowed; a Hevolve login on
+    # central).  One set, owned by the gate.
+    from security.middleware import GATE_VERIFIED_AUTH
 
     if _api_key:
         # API key is configured — validate it first (Layer 0)
@@ -10302,12 +10306,12 @@ def chat():
         )
         if _api_key_match:
             g.auth_source = 'api_key'
-        elif getattr(g, 'auth_source', None) == 'device':
-            # A phone the desktop owner allowed (#111): security.middleware
-            # verified its Ed25519-signed token against the key on file and
-            # left the payload in g.jwt_payload.  The HS256 decode below
-            # cannot verify that token (the phone has no local secret), so
-            # the gate's verdict stands.
+        elif getattr(g, 'auth_source', None) in GATE_VERIFIED_AUTH:
+            # A phone the desktop owner allowed (#111), or a Hevolve login
+            # central's gate verified with Kong: security.middleware checked
+            # the credential and left the payload in g.jwt_payload.  The
+            # HS256 decode below cannot verify either token, so the gate's
+            # verdict stands.
             pass
         elif _bearer_token:
             # Try JWT decode (Layer 1 / Layer 2)
@@ -10339,7 +10343,7 @@ def chat():
                 'requests. Set HEVOLVE_API_KEY env var for production.'
             )
             chat._auth_warned = True
-        if getattr(g, 'auth_source', None) != 'device':
+        if getattr(g, 'auth_source', None) not in GATE_VERIFIED_AUTH:
             g.auth_source = 'none'
 
     # Rate limit: 30 req/min per user/IP
@@ -10377,16 +10381,18 @@ def chat():
     # Layer 1 (LOCAL): Bearer token signed by this node's HS256 secret
     # Layer 2 (HIVE): Bearer token with Ed25519 node_sig (cross-node)
     # Fallback: body user_id (backward compat for desktop/Nunba mode)
-    if g.auth_source == 'device':
-        # The user is the one the phone's verified token names; the gate
-        # already refused a body naming anyone else (#51).  Fail closed: a
-        # device verdict without its payload admits nobody, never the
-        # body's or a default user.
-        _device_uid = (getattr(g, 'jwt_payload', None) or {}).get('user_id')
+    if g.auth_source in GATE_VERIFIED_AUTH:
+        # The user is the one the verified token names.  For a device the
+        # gate already refused a body naming anyone else (#51); a Hevolve
+        # login's body names the phone's legacy id, a different id space, so
+        # the body's value is dropped.  Fail closed: a verdict without its
+        # payload admits nobody, never the body's or a default user.
+        _gate_payload = getattr(g, 'jwt_payload', None) or {}
+        _device_uid = _gate_payload.get('user_id')
         if not _device_uid:
             return jsonify({'error': 'Invalid or expired token.', 'response': None}), 401
         data['user_id'] = _device_uid
-        g.token_scope = 'hive'
+        g.token_scope = _gate_payload.get('scope') or 'hive'
     elif g.auth_source not in ('jwt', 'api_key'):
         if _bearer_token:
             try:

@@ -292,6 +292,13 @@ EXEMPT_PREFIXES = ('/status', '/a2a/', '/api/social/', '/.well-known/',
                    # which reports DB and identity checks, stays gated.
                    '/health')
 
+#: g.auth_source values this gate sets after verifying a credential /chat's
+#: own HS256 check cannot: 'device', a phone the desktop owner allowed (#111),
+#: and 'hevolve', a Hevolve login token Kong vouched for on central.  Both
+#: leave the verified identity in g.jwt_payload.  /chat (hart_intelligence_
+#: entry) honours exactly this set, so a source added here is honoured there.
+GATE_VERIFIED_AUTH = frozenset({'device', 'hevolve'})
+
 
 def _apply_api_auth(app: Flask, register: bool = True):
     """Tier-aware API authentication with a strict admin guard.
@@ -463,6 +470,42 @@ def _apply_api_auth(app: Flask, register: bool = True):
         return refused
 
 
+    def _admit_hevolve_login(refused):
+        """Central's answer to the phone's own login: a Hevolve token Kong
+        vouches for.
+
+        The phone carries the token its Hevolve OTP login returned, an opaque
+        Kong OAuth2 token.  Kong checks nothing on the routes that reach this
+        node, so this gate is the only check, and it asks the question
+        link-hevolve asks (auth.user_for_hevolve_token: Kong names the
+        account's email, the account is found or created under it).  The
+        turn runs as that account and may act only if the ONE rule allows it
+        (auth.user_refusal).  No header is read as an identity.
+
+        ``refused`` is the 401 the key/JWT check already produced; it is
+        returned unchanged for anything that is not such a token.
+        """
+        auth_header = request.headers.get('Authorization', '')
+        if not auth_header.startswith('Bearer '):
+            return refused
+        token = auth_header[7:].strip()
+        try:
+            from integrations.social.auth import (
+                user_for_hevolve_token, user_refusal)
+            from integrations.social.models import db_session
+            with db_session(commit=True) as db:
+                user, _created = user_for_hevolve_token(db, token)
+                if user is None or user_refusal(user) is not None:
+                    return refused
+                payload = {'user_id': str(user.id), 'username': user.username,
+                           'scope': 'hevolve'}
+        except Exception:
+            logger.warning("Hevolve login check failed; refusing", exc_info=True)
+            return refused
+        g.auth_source = 'hevolve'
+        g.jwt_payload = payload
+        return None
+
     def _expected_api_key() -> str:
         """HEVOLVE_API_KEY, the one credential both branches below accept."""
         try:
@@ -525,14 +568,13 @@ def _apply_api_auth(app: Flask, register: bool = True):
             return  # Not in either tuple → public
 
         node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
-        if expected_key:
+        if expected_key or node_tier == 'central':
             resp = _require_api_key_or_bearer(expected_key)
-            if resp is not None:
-                _say_refused()
-                return resp
-            return
-        if node_tier == 'central':
-            resp = _require_api_key_or_bearer(expected_key='')
+            if resp is not None and node_tier == 'central':
+                # The phone's own Hevolve login, after the key and the local
+                # JWT have not admitted it: every caller admitted today is
+                # admitted exactly as before.
+                resp = _admit_hevolve_login(resp)
             if resp is not None:
                 _say_refused()
                 return resp
