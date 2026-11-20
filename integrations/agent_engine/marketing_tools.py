@@ -680,6 +680,51 @@ def _channel_arg_text() -> str:
             "linkedin and other sites, use post_to_channel_via_browser)")
 
 
+def _ad_refused(user_id, budget, result) -> str:
+    """create_ad's answer when AdService.create_ad refused ``result``: the
+    service's own fields, success False, and a core.tool_refusal refusal
+    saying what was wrong and how to fix it.
+
+    Live on central 2026-11-20, McGroce goal 09bbc67a: its create_ad step
+    ran as 'system_daemon', which has no Spark (a wallet made for it starts
+    at 0), and the bare {"error": "Insufficient Spark", "spark_balance": 0}
+    was retried 3 times until the goal paused needs_help.  When no budget
+    the service accepts fits the balance, a background turn may finish the
+    step without the ad; a person's turn tells the person."""
+    from core.tool_refusal import (RETRY_AFTER_FIX, RETRY_FINISH_WITHOUT,
+                                   RETRY_NEVER, refusal_fields)
+    from integrations.social.ad_service import AD_COSTS
+    minimum = AD_COSTS['min_budget']
+    retry = RETRY_AFTER_FIX
+    if 'spark_balance' in result:
+        balance = result['spark_balance']
+        code = 'not_enough_spark'
+        problem = (f"the account {user_id!r} that pays for ads has {balance} "
+                   f"Spark, and this ad needs {budget} (its budget)")
+        if balance >= minimum:
+            fix = (f"Call create_ad with budget at most {balance} and at "
+                   f"least {minimum}")
+        else:
+            from core.agent_tools import camera_turn_id, is_a_persons_request
+            retry = (RETRY_NEVER if is_a_persons_request(camera_turn_id())
+                     else RETRY_FINISH_WITHOUT)
+            fix = (f"No call of create_ad can fix this: the smallest ad "
+                   f"budget is {minimum} Spark. The machine's owner gives the "
+                   f"account {user_id!r} Spark, or this step goes on without "
+                   f"the ad")
+    elif budget < minimum:
+        code = 'budget_below_minimum'
+        problem = (f"budget {budget} is under the minimum ad budget of "
+                   f"{minimum} Spark")
+        fix = f"Set budget to at least {minimum}"
+    else:
+        code = 'missing_title_or_link'
+        problem = f"the ad service refused it: {result.get('error')}"
+        fix = "Give the ad a title, and the URL it links to as target_url"
+    return json.dumps(dict(result, success=False, **refusal_fields(
+        'create_ad', code, problem, fix, retry=retry)))
+
+
 def register_marketing_tools(helper, assistant, user_id: str):
     """Register marketing-specific tools with the agent (Tier 2).
 
@@ -777,7 +822,7 @@ def register_marketing_tools(helper, assistant, user_id: str):
                 if 'error' in result:
                     # The service refused (budget under its minimum, not
                     # enough Spark): no ad was made and nothing charged.
-                    return json.dumps(dict(result, success=False))
+                    return _ad_refused(user_id, budget, result)
                 db.commit()
                 return json.dumps({'success': True, 'ad': result})
             finally:
