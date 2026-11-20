@@ -72,6 +72,24 @@ def _defer_is_due(task) -> bool:
         return True
 
 
+def _held_for_help(task) -> bool:
+    """Whether ``task`` is held for help: BLOCKED with blocked_reason
+    input_required, the mark hold_task makes.  The one test of that mark
+    (_release_held_tasks, held_for_help, complete_held_tasks).  A task blocked
+    on a prerequisite (parallel_dispatch's "Blocked by prerequisite ...") is
+    not held for help."""
+    return (task is not None and task.status == TaskStatus.BLOCKED
+            and task.blocked_reason == BlockedReason.INPUT_REQUIRED.value)
+
+
+def _waits_for_its_person(task) -> bool:
+    """Whether a task held for help was held because its turn waits for its
+    person's answer (core.agent_tools.is_waiting_for_person on the reply it
+    was held with), not handed to a person or an expert."""
+    from core.agent_tools import is_waiting_for_person
+    return is_waiting_for_person(getattr(task, 'error_message', None))
+
+
 class HiveDepthExceeded(ValueError):
     """Raised when a propagation request exceeds HIVE_DEPTH hops.
 
@@ -194,6 +212,7 @@ class DistributedTaskCoordinator:
         decomposed_tasks: List[Dict[str, Any]],
         context: Optional[Dict[str, Any]] = None,
         goal_id: Optional[str] = None,
+        ask_still_open: Optional[Callable[[], bool]] = None,
     ) -> str:
         """
         Submit a goal with pre-decomposed tasks.
@@ -211,6 +230,11 @@ class DistributedTaskCoordinator:
                      the live cause of the 9166-task ledger O(n²) save deadlock
                      that wedged both daemons (2026-06-12). Falls back to a
                      random id only when not provided.
+            ask_still_open: the caller's word, asked only on a re-dispatch
+                     that would release a task held because its turn waits
+                     for its person (_release_held_tasks): True while the
+                     ask that turn waits on is still unanswered.  None: every
+                     held task is released, as before.
 
         Returns:
             goal_id (parent task ID)
@@ -243,8 +267,9 @@ class DistributedTaskCoordinator:
             reopened = (self._reopen_finished_run(goal_id)
                         if context.get('continuous') else 0)
             # Work held for a person or an expert comes back when the goal
-            # is dispatched again; see _release_held_tasks.
-            released = self._release_held_tasks(goal_id)
+            # is dispatched again, unless its person has still not answered;
+            # see _release_held_tasks.
+            released = self._release_held_tasks(goal_id, ask_still_open)
             logger.info(
                 f"submit_goal: goal {goal_id} already has tasks — reusing "
                 f"(skipping duplicate task creation)"
@@ -448,7 +473,9 @@ class DistributedTaskCoordinator:
             return 0
         return reopened
 
-    def _release_held_tasks(self, goal_id: str) -> int:
+    def _release_held_tasks(self, goal_id: str,
+                            ask_still_open: Optional[Callable[[], bool]] = None
+                            ) -> int:
         """Put a goal's tasks held for help (hold_task) back to PENDING.
 
         Runs when the goal is submitted AGAIN.  The daemon dispatches only
@@ -463,18 +490,38 @@ class DistributedTaskCoordinator:
         task blocked on a prerequisite (parallel_dispatch's dependency
         chains write "Blocked by prerequisite ...") keeps its block.
 
+        Except a task held because its turn waits for its person
+        (_waits_for_its_person) while the caller's ``ask_still_open`` says
+        that ask is unanswered.  Such a goal stays active, so it is
+        dispatched every tick, and each release made the worker claim the
+        task and run a whole /chat turn only to hold it again: over 7200 s
+        with the card unanswered, 121 turns and 363 full ledger saves
+        (review of 6182b632a).  Kept held, it is claimed by nobody and
+        nothing is saved, and held_for_help still reads it as held, so the
+        wait does not count as a stalled run.  ``ask_still_open`` is asked
+        once, only when such a task exists; one that raises reads as
+        answered, so the task is released as before and its turn decides.
+
         Re-opens the SAME task id, as _reopen_finished_run does, so a goal
         that asks for help many times does not grow the ledger; the run
         counter and the state history record each return.
         """
         parent = self._ledger.get_task(goal_id)
-        candidates = []
-        for child_id in list(getattr(parent, 'child_task_ids', None) or []):
-            child = self._ledger.get_task(child_id)
-            if (child is None or child.status != TaskStatus.BLOCKED
-                    or child.blocked_reason != BlockedReason.INPUT_REQUIRED.value):
-                continue
-            candidates.append(child)
+        candidates = [child for child in (
+            self._ledger.get_task(child_id) for child_id in
+            list(getattr(parent, 'child_task_ids', None) or []))
+            if _held_for_help(child)]
+        waiting = [c for c in candidates if _waits_for_its_person(c)]
+        if waiting and ask_still_open is not None:
+            try:
+                still_open = bool(ask_still_open())
+            except Exception as e:
+                logger.warning("Goal %s: could not read whether its person "
+                               "answered (%s); releasing its held task(s)",
+                               goal_id, e)
+                still_open = False
+            if still_open:
+                candidates = [c for c in candidates if c not in waiting]
 
         snapshots = self._snapshot_tasks(candidates)
         released = 0
@@ -516,8 +563,10 @@ class DistributedTaskCoordinator:
         put it back to PENDING and nothing has claimed it since (the
         release's history entry says so, _release_held_tasks).  Every
         dispatch of the goal releases its held tasks before the daemon
-        settles it, so a turn that waits on its person's card reads as
-        PENDING by then.  A task nobody claimed after its release, a claimed
+        settles it, except one whose person has still not answered the ask
+        it waits on, so a turn held on its person reads as BLOCKED while the
+        ask is open and as PENDING once it is answered.  A task nobody
+        claimed after its release, a claimed
         turn that never ends, and a failed task are not held.  Returns what
         the first such task was held with (its turn's reply), or '' when no
         reason was recorded.
@@ -530,8 +579,7 @@ class DistributedTaskCoordinator:
                 return None
             if child.status == TaskStatus.COMPLETED:
                 continue
-            if (child.status == TaskStatus.BLOCKED and child.blocked_reason
-                    == BlockedReason.INPUT_REQUIRED.value):
+            if _held_for_help(child):
                 reasons.append(child.error_message or '')
                 continue
             last = (child.state_history or [{}])[-1]
@@ -569,8 +617,7 @@ class DistributedTaskCoordinator:
         parent = self._ledger.get_task(goal_id)
         held = [c for c in (self._ledger.get_task(cid) for cid in
                             (getattr(parent, 'child_task_ids', None) or []))
-                if c is not None and c.status == TaskStatus.BLOCKED
-                and c.blocked_reason == BlockedReason.INPUT_REQUIRED.value]
+                if _held_for_help(c)]
         if not held or not self._release_held_tasks(goal_id):
             return 0
         completed = 0

@@ -1786,6 +1786,10 @@ def dispatch_goal_distributed(prompt: str, user_id: str, goal_id: str,
             decomposed_tasks=tasks,
             context=context,
             goal_id=str(goal_id),  # STABLE id → re-dispatch dedups, no ledger flood
+            # A task held because its turn waits on its person's card stays
+            # held while the card is open (review of 6182b632a: released
+            # every tick, it cost a turn and three ledger saves each time).
+            ask_still_open=lambda: goal_plan_waits_on_its_card(goal_id),
         )
         # submit_goal dedups a goal it has seen onto the task set it already
         # holds, and re-opens that set only for a continuous goal.  For any
@@ -1808,6 +1812,27 @@ def dispatch_goal_distributed(prompt: str, user_id: str, goal_id: str,
     except Exception as e:
         logger.warning(f"Distributed dispatch error for {goal_type} goal {goal_id}: {e}")
         return None
+
+
+def goal_plan_waits_on_its_card(goal_id) -> bool:
+    """True while the plan of ``goal_id``'s agent waits on an approval card
+    its person has not answered: the plan staged under the goal's prompt id
+    (prompt_id_for_goal, in the recipe prompts dir hartos.helper writes to)
+    holds an ask (hart_intelligence_entry._hold_for_the_creator) whose state
+    is still 'open' (person_ask.ask_state).  That is exactly when the goal's
+    turn answers only "Waiting for the person: ... is waiting on the card"
+    (_held_plan_turn), so running it again does nothing but cost a turn.
+    False for no staged plan, no hold, or a card answered, dismissed, or no
+    longer kept (a restart): the turn then acts on it.  Read-only; raises
+    when the stores cannot be read (the caller decides what that means)."""
+    from core.platform_paths import get_recipe_prompts_dir
+    from core.prompt_files import staged_plan
+    from integrations.agent_engine import person_ask
+    hold = (staged_plan(os.path.abspath(get_recipe_prompts_dir()),
+                        prompt_id_for_goal(goal_id)) or {}).get('hold')
+    if not isinstance(hold, dict) or not hold.get('ask_id') or not hold.get('asked'):
+        return False
+    return person_ask.ask_state(hold['ask_id'], hold['asked']).get('status') == 'open'
 
 
 def _check_robot_capability_match(goal_type: str, goal_id: str) -> bool:
