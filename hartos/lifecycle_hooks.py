@@ -2905,7 +2905,8 @@ def _work_results(message: dict, names: Dict[str, str], action_text: str,
 
 
 def _cites_credited_early_send(user_prompt, messages, index, message, action_id,
-                               request_id, is_ask_step) -> bool:
+                               request_id, is_ask_step,
+                               answered_in_writing=None) -> bool:
     """Whether the cited tool message holds a send credited_early_send credits
     to this action: any one of its results (an aggregate carries several)."""
     responses = message.get('tool_responses')
@@ -2919,14 +2920,15 @@ def _cites_credited_early_send(user_prompt, messages, index, message, action_id,
         if credited_early_send(user_prompt, messages, index,
                                result.get('tool_call_id') or message.get('tool_call_id'),
                                body, action_id, request_id=request_id,
-                               is_ask_step=is_ask_step):
+                               is_ask_step=is_ask_step,
+                               answered_in_writing=answered_in_writing):
             return True
     return False
 
 
 def _verifier_completion_has_conversation_evidence(
         user_prompt: str, action_id: int, json_obj: dict, *,
-        request_id=None, is_ask_step=None) -> bool:
+        request_id=None, is_ask_step=None, answered_in_writing=None) -> bool:
     """Return whether a completion cites a real, earlier GroupChat result.
 
     The StatusVerifier JSON alone is never a receipt. The GroupChat registry is
@@ -2953,7 +2955,8 @@ def _verifier_completion_has_conversation_evidence(
     if latest_dispatch_before(messages, index + 1) != action_id and not (
             kind == 'tool_receipt'
             and _cites_credited_early_send(user_prompt, messages, index, message,
-                                           action_id, request_id, is_ask_step)):
+                                           action_id, request_id, is_ask_step,
+                                           answered_in_writing)):
         # The one exception: this action's own output, sent while the step
         # before it ran (credited_early_send, the rule the REUSE gate and its
         # receipt finder read too).  CREATE passes no request id: no credit.
@@ -3757,7 +3760,8 @@ def commit_verified_action_completion(user_prompt: str, action_id: int,
                                       evidence: dict,
                                       reason: str = 'verified complete',
                                       claimed_action_id=None, *,
-                                      request_id=None, is_ask_step=None) -> bool:
+                                      request_id=None, is_ask_step=None,
+                                      answered_in_writing=None) -> bool:
     """Commit one evidence-backed successful action through the canonical FSM.
 
     CREATE and REUSE use different non-deterministic conversations, but a
@@ -3803,7 +3807,8 @@ def commit_verified_action_completion(user_prompt: str, action_id: int,
     }
     if not _verifier_completion_has_conversation_evidence(
             user_prompt, action_id, verdict,
-            request_id=request_id, is_ask_step=is_ask_step):
+            request_id=request_id, is_ask_step=is_ask_step,
+            answered_in_writing=answered_in_writing):
         logger.warning(
             "Refusing ungrounded completed verdict for action %s in %s",
             action_id, user_prompt)
@@ -4180,7 +4185,8 @@ def latest_dispatch_before(messages, index) -> Optional[int]:
 
 
 def credited_early_send(user_prompt, messages, index, call_id, body, action_id, *,
-                        request_id=None, is_ask_step=None) -> bool:
+                        request_id=None, is_ask_step=None,
+                        answered_in_writing=None) -> bool:
     """Whether the send result at ``messages[index]`` -- delivered BEFORE
     ``action_id``'s dispatch, while the step before it was running -- is that
     action's own output, so it counts as its receipt once.
@@ -4204,11 +4210,16 @@ def credited_early_send(user_prompt, messages, index, call_id, body, action_id, 
         Never ``action_id - 1``: held steps, re-steers and dependency order
         break the numbering.
       * ``action_id`` names the send tool and M does not: M naming it takes
-        its own send, and so does an M naming no tool with no written
-        answer, which its own send finishes (rv_6d6e MF1; one with a written
-        answer leaves the send to N, rv_357d N1).  ``is_ask_step(M)`` is False: an ask step's send is its
-        ask.  The caller passes that check (REUSE's rule lives in
-        reuse_recipe, which this module does not import).
+        its own send, and so does an M naming no tool unless REUSE would
+        finish M without this send (rv_6d6e MF1; rv_357d N1).  That is
+        ``answered_in_writing(messages[:n])``, n being ``action_id``'s
+        dispatch: REUSE's own reader of a no-tool step's written answer
+        (_reuse_written_answer, bounded at M's latest dispatch, plus
+        is_written_answer), so a note riding a tool call or an earlier
+        turn's answer never counts (rv_cc80 F1).  ``is_ask_step(M)`` is
+        False: an ask step's send is its ask.  The caller passes both checks
+        (REUSE's rules live in reuse_recipe, which this module does not
+        import); without ``answered_in_writing`` a no-tool M keeps its send.
     A send lies in exactly one gap before one dispatch, so it is credited to
     at most one action."""
     if not request_id or not callable(is_ask_step):
@@ -4226,35 +4237,40 @@ def credited_early_send(user_prompt, messages, index, call_id, body, action_id, 
         before = latest_dispatch_before(messages, index + 1)
         if before is None or before == int(action_id):
             return False
-        reached = False
-        for m in messages[index + 1:]:
+        reached = None               # index of action_id's dispatch
+        for at in range(index + 1, len(messages)):
+            m = messages[at]
             if not isinstance(m, dict) or m.get('_from_shared'):
                 continue  # latest_dispatch's own rule for what is a dispatch
             aid = dispatch_action_id(m.get('content'))
             if aid is None:
                 continue
             if aid == int(action_id):
-                reached = True
+                reached = at
                 break
             if aid != before:
                 return False
-        if not reached:
+        if reached is None:
             return False
         if SEND_TOOL not in _tools_this_action_names(user_prompt, int(action_id))[1]:
             return False
         # The send is M's own receipt when M names the send, AND when M names
-        # no tool and has no written answer: such a step is finished by its
-        # own send (user_output_receipt, read only after the written-answer
-        # miss), so crediting it to N too completed both steps while N's own
-        # output never went out (rv_6d6e MF1).  An M finished by its written
-        # answer does not need the send, which stays N's (rv_357d N1: refusing
-        # there re-sent N's message).
+        # no tool and REUSE would not finish M without it: REUSE finishes a
+        # no-tool step by its written answer, else by the send that delivered
+        # its output (_reuse_completion_evidence), so crediting that send to N
+        # too completed both steps while N's own output never went out
+        # (rv_6d6e MF1).  An M REUSE finishes by its written answer does not
+        # need the send, which stays N's (rv_357d N1: refusing there re-sent
+        # N's message).  The written answer is REUSE's own reading, in M's
+        # window up to N's dispatch: not CREATE's finder, which took a note
+        # riding the send call, or M's answer from an earlier turn (rv_cc80
+        # F1: one greeting then finished both steps).
         before_tools = _tools_this_action_names(user_prompt, before)[1]
         if SEND_TOOL in before_tools:
             return False
-        if not before_tools and _derive_written_answer(
-                user_prompt, before,
-                get_registered_groupchat(user_prompt)) is None:
+        if not before_tools and not (
+                callable(answered_in_writing)
+                and answered_in_writing(messages[:reached])):
             return False
         return not is_ask_step(before)
     except Exception as err:

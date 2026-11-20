@@ -5395,8 +5395,11 @@ def _reuse_message_is_user_answer(message):
         return False
 
 
-def _reuse_written_answer(group_chat):
+def _reuse_written_answer(group_chat, messages=None):
     """The answer THIS action already wrote, or None.
+
+    ``messages``: read this list instead of the group log (the log cut at a
+    later step's dispatch, for _reuse_answered_in_writing); same walk.
 
     MEASURED live 2026-09-10 03:37:33 (agent 88094979291, "summarize into
     exactly three bullet points").  The closing history was:
@@ -5436,7 +5439,9 @@ def _reuse_written_answer(group_chat):
     exactly as before.
     """
     try:
-        for msg in reversed(list(getattr(group_chat, 'messages', None) or [])):
+        if messages is None:
+            messages = getattr(group_chat, 'messages', None) or []
+        for msg in reversed(list(messages)):
             _m = msg or {}
             # The verifier re-ask is not a bound: it asks the verifier to
             # judge the answer it FOLLOWS (a lesson written before it), and
@@ -6988,14 +6993,47 @@ def _reuse_call_id_to_tool_name(msg_lists):
     return tool_call_names(msg_lists)
 
 
+def _reuse_answered_in_writing(messages):
+    """Whether the step whose window ends these messages wrote its answer, as
+    REUSE's receipt finder reads a no-tool step (_reuse_completion_evidence):
+    _reuse_written_answer, which walks back to that step's own latest
+    dispatch, and is_written_answer.  So a note riding a tool call
+    (_reuse_message_is_user_answer refuses it) and an answer the step wrote
+    before its latest dispatch, in an earlier turn too, never count (rv_cc80
+    F1).  Read as the log stood at the step's last verdict, when REUSE judged
+    it: text written after that verdict was never the step's receipt, so it
+    cannot leave the send to the next step either (hartos-52, point 4).  No
+    verdict in the step's window (a seat name lost, a trimmed or resumed log)
+    means REUSE's judgment cannot be located: False, and the step keeps its
+    send, as before this rule."""
+    msgs = list(messages or [])
+    judged = None
+    for i in range(len(msgs) - 1, -1, -1):
+        m = msgs[i] if isinstance(msgs[i], dict) else {}
+        if str(m.get('name') or '') in _REUSE_VERIFIER_SEATS:
+            judged = msgs[:i + 1]             # the log as REUSE judged the step
+            break
+        if _reuse_is_verifier_reask(m.get('content')):
+            continue
+        if (str(m.get('name') or '') in _REUSE_STEER_INITIATOR_NAMES
+                or _reuse_is_pipeline_text(m.get('content'))):
+            break                             # the step's dispatch: no verdict
+    if judged is None:
+        return False
+    answer = _reuse_written_answer(None, judged)
+    return isinstance(answer, dict) and bool(is_written_answer(answer))
+
+
 def _reuse_early_send_terms(user_prompt):
     """What lifecycle_hooks.credited_early_send needs from REUSE, for the gate,
-    the receipt finder and the commit alike: this turn's request id, and
-    REUSE's own ask-step rule (_reuse_ask_only_step), which lifecycle_hooks
+    the receipt finder and the commit alike: this turn's request id, REUSE's
+    own ask-step rule (_reuse_ask_only_step) and its reading of a no-tool
+    step's written answer (_reuse_answered_in_writing), which lifecycle_hooks
     does not import."""
     gc = get_registered_groupchat(user_prompt)
     return {'request_id': request_id_list.get(user_prompt),
-            'is_ask_step': lambda aid: bool(_reuse_ask_only_step(user_prompt, aid, gc))}
+            'is_ask_step': lambda aid: bool(_reuse_ask_only_step(user_prompt, aid, gc)),
+            'answered_in_writing': _reuse_answered_in_writing}
 
 
 def _reuse_fabricated_tools(user_prompt, current_action, group_chat, agents):

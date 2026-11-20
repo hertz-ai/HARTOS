@@ -134,9 +134,13 @@ def _use(log):
 
 def _credited(log, index=4, call_id='c_draft', action_id=2, request_id=TURN,
               is_ask_step=lambda a: False):
+    """REUSE's own reading of a no-tool step's written answer, as its three
+    readers pass it (_reuse_early_send_terms)."""
     body = log[index]['tool_responses'][0]['content']
+    answered = reuse_recipe._reuse_early_send_terms(UP)['answered_in_writing']
     return lh.credited_early_send(UP, log, index, call_id, body, action_id,
-                                  request_id=request_id, is_ask_step=is_ask_step)
+                                  request_id=request_id, is_ask_step=is_ask_step,
+                                  answered_in_writing=answered)
 
 
 # ---- the rule ---------------------------------------------------------------
@@ -204,6 +208,260 @@ def test_an_earlier_no_tool_step_with_a_written_answer_leaves_the_send(session):
     ]
     _use(log)
     assert _credited(log, index=3) is True
+
+
+GREET = 'Greet the person warmly by name'
+GREETING = 'Hello Priya, it is lovely to meet you! Welcome aboard.'
+
+
+def test_a_note_riding_the_send_call_is_not_the_earlier_steps_answer(session):
+    """rv_cc80 F1 (P1): the 4B writes a line beside its send call. REUSE never
+    counts such a note as an answer (it narrates the call: all 75 on build 69
+    did), so REUSE finishes M on the send and the send stays M's. Crediting it
+    to N too finished both steps on one greeting while N's email never went
+    out."""
+    lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
+    narrated = _call('c_g', SEND, {'text': GREETING, 'expects_reply': False})
+    narrated.update(name='Assistant', content='Let me greet Priya warmly now.')
+    log = [
+        _dispatch(1, GREET),          # 0
+        narrated,                     # 1
+        _result('c_g', _sent()),      # 2
+        _verdict(1),                  # 3
+        _dispatch(2, TEXT_2),         # 4
+        _verdict(2),                  # 5
+    ]
+    _use(log)
+    assert _credited(log, index=2, call_id='c_g') is False
+
+
+def test_an_earlier_turns_answer_is_not_the_earlier_steps_answer(session):
+    """rv_cc80 F1 (P2): M wrote its greeting in turn 1 and only SENDS in turn
+    2 (the log keeps every turn, clear_history=False). REUSE reads M's answer
+    back to M's latest dispatch only, so turn 2's M is finished by its send,
+    which stays M's."""
+    lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
+    log = [
+        _dispatch(1, GREET),                                              # 0
+        {'role': 'assistant', 'name': 'Assistant',
+         'content': 'Hello Priya, it is lovely to meet you. Welcome aboard!'},  # 1
+        _verdict(1),                                                      # 2
+        _dispatch(2, TEXT_2),                                             # 3
+        _call('c_old', SEND, {'text': DRAFT, 'expects_reply': False}),    # 4
+        _result('c_old', _sent('req-turn-1')),                            # 5
+        _verdict(2),                                                      # 6
+        _dispatch(1, GREET),                                              # 7  turn 2
+        _call('c_g', SEND, {'text': GREETING, 'expects_reply': False}),   # 8
+        _result('c_g', _sent()),                                          # 9
+        _verdict(1),                                                      # 10
+        _dispatch(2, TEXT_2),                                             # 11
+        _verdict(2),                                                      # 12
+    ]
+    _use(log)
+    assert _credited(log, index=9, call_id='c_g') is False
+
+
+def test_an_earlier_steps_status_report_is_not_its_answer(session):
+    """REUSE's written answer is also is_written_answer: the Assistant's own
+    {"status": ...} report is control JSON, not work, so REUSE finishes M on
+    the send and the send stays M's."""
+    lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
+    log = [
+        _dispatch(1, GREET),                                              # 0
+        {'role': 'assistant', 'name': 'Assistant',
+         'content': json.dumps({'status': 'completed', 'action_id': 1})},  # 1
+        _call('c_g', SEND, {'text': GREETING, 'expects_reply': False}),   # 2
+        _result('c_g', _sent()),                                          # 3
+        _verdict(1),                                                      # 4
+        _dispatch(2, TEXT_2),                                             # 5
+        _verdict(2),                                                      # 6
+    ]
+    _use(log)
+    assert _credited(log, index=3, call_id='c_g') is False
+
+
+def _greet_shape(kind):
+    """(log, send result index, call id, index of M's last verdict) for one
+    shape of a no-tool greeting step M followed by the email step N."""
+    answer = {'role': 'assistant', 'name': 'Assistant',
+              'content': 'Hello Priya, it is lovely to meet you. Welcome aboard, '
+                         'I will help you write your email today.'}
+    narrated = _call('c_g', SEND, {'text': GREETING, 'expects_reply': False})
+    narrated.update(name='Assistant', content='Let me greet Priya warmly now.')
+    if kind == 'written_answer':      # rv_357d N1
+        return [_dispatch(1, GREET), answer,
+                _call('c_g', SEND, {'text': DRAFT, 'expects_reply': False}),
+                _result('c_g', _sent()), _verdict(1), _dispatch(2, TEXT_2),
+                _verdict(2)], 3, 'c_g', 4
+    if kind == 'no_answer':           # rv_6d6e MF1
+        return [_dispatch(1, GREET),
+                _call('c_g', SEND, {'text': GREETING, 'expects_reply': False}),
+                _result('c_g', _sent()), _verdict(1), _dispatch(2, TEXT_2),
+                _verdict(2)], 2, 'c_g', 3
+    if kind == 'narrated_call':       # rv_cc80 P1
+        return [_dispatch(1, GREET), narrated, _result('c_g', _sent()),
+                _verdict(1), _dispatch(2, TEXT_2), _verdict(2)], 2, 'c_g', 3
+    if kind == 'earlier_turn':        # rv_cc80 P2
+        return [_dispatch(1, GREET), answer, _verdict(1), _dispatch(2, TEXT_2),
+                _call('c_old', SEND, {'text': DRAFT, 'expects_reply': False}),
+                _result('c_old', _sent('req-turn-1')), _verdict(2),
+                _dispatch(1, GREET),
+                _call('c_g', SEND, {'text': GREETING, 'expects_reply': False}),
+                _result('c_g', _sent()), _verdict(1), _dispatch(2, TEXT_2),
+                _verdict(2)], 9, 'c_g', 10
+    if kind == 'echo':                # hartos-52 point 3
+        return [_dispatch(1, GREET),
+                _call('c_g', SEND, {'text': DRAFT, 'expects_reply': False}),
+                _result('c_g', _sent()),
+                {'role': 'assistant', 'name': 'Assistant', 'content': DRAFT},
+                _verdict(1), _dispatch(2, TEXT_2), _verdict(2)], 2, 'c_g', 4
+    if kind == 'late_text':           # hartos-52 point 4
+        return [_dispatch(1, GREET),
+                _call('c_g', SEND, {'text': GREETING, 'expects_reply': False}),
+                _result('c_g', _sent()), _verdict(1),
+                {'role': 'assistant', 'name': 'Assistant',
+                 'content': 'That was lovely, Priya. Shall we write the email now?'},
+                _dispatch(2, TEXT_2), _verdict(2)], 2, 'c_g', 3
+    if kind == 'helper_to_user':      # REUSE's reply filter passes it, is_written_answer not
+        return [_dispatch(1, GREET),
+                {'role': 'assistant', 'name': 'Helper',
+                 'content': '@user Hello Priya, it is lovely to meet you!'},
+                _call('c_g', SEND, {'text': GREETING, 'expects_reply': False}),
+                _result('c_g', _sent()), _verdict(1), _dispatch(2, TEXT_2),
+                _verdict(2)], 3, 'c_g', 4
+    if kind == 'status_json':
+        return [_dispatch(1, GREET),
+                {'role': 'assistant', 'name': 'Assistant',
+                 'content': json.dumps({'status': 'completed', 'action_id': 1})},
+                _call('c_g', SEND, {'text': GREETING, 'expects_reply': False}),
+                _result('c_g', _sent()), _verdict(1), _dispatch(2, TEXT_2),
+                _verdict(2)], 3, 'c_g', 4
+    raise ValueError(kind)
+
+
+@pytest.fixture
+def reuse_turn(monkeypatch):
+    """REUSE's per-session state for its own receipt finder, restored after."""
+    monkeypatch.setitem(reuse_recipe.request_id_list, UP, TURN)
+    monkeypatch.setattr(reuse_recipe, '_reuse_ask_only_step', lambda up, a, gc: False)
+    monkeypatch.setitem(reuse_recipe.user_tasks, UP,
+                        _ReuseTask([GREET, TEXT_2, TEXT_3], ()))
+
+
+@pytest.mark.parametrize('kind', ['written_answer', 'no_answer', 'narrated_call',
+                                  'earlier_turn', 'echo', 'late_text',
+                                  'status_json', 'helper_to_user'])
+def test_the_send_goes_to_the_next_step_exactly_when_reuse_did_not_use_it(
+        session, reuse_turn, kind):
+    """The rule's whole point (rv_6d6e MF1, rv_357d N1, rv_cc80 F1): one send
+    is one step's receipt.  REUSE judged M at M's last verdict; if its receipt
+    for M is that send, N must not get it (one greeting would finish both);
+    if it is anything else, N gets it (else N is re-steered and its message
+    goes out twice)."""
+    lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
+    log, send_at, call_id, m_verdict = _greet_shape(kind)
+    m_receipt = reuse_recipe._reuse_completion_evidence(
+        UP, 1, _use(log[:m_verdict + 1]))
+    m_used_the_send = isinstance(m_receipt, dict) and \
+        m_receipt.get('message_index') == send_at
+    _use(log)
+    assert m_receipt is not None, (kind, 'REUSE must finish M one way or the other')
+    assert _credited(log, index=send_at, call_id=call_id) is (not m_used_the_send)
+
+
+def test_an_echo_of_the_send_leaves_the_send_to_the_next_step(session):
+    """Decided (hartos-52 point 3): the 4B repeats the sent text as a plain
+    message.  REUSE has no echo rule, so it finishes M on that message, not on
+    the send; the send is N's, and refusing it would re-steer N and send the
+    email twice.  (That REUSE accepts an echo of another step's text as M's
+    work is its own question, outside this rule.)"""
+    lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
+    log, send_at, call_id, _v = _greet_shape('echo')
+    _use(log)
+    assert _credited(log, index=send_at, call_id=call_id) is True
+
+
+def test_text_after_the_earlier_steps_verdict_is_not_its_answer(session):
+    """hartos-52 point 4: REUSE judged M at its verdict, on the send; text the
+    Assistant writes after that verdict was never M's receipt, so it cannot
+    hand M's send to N."""
+    lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
+    log, send_at, call_id, _v = _greet_shape('late_text')
+    _use(log)
+    assert _credited(log, index=send_at, call_id=call_id) is False
+
+
+def test_a_helpers_note_to_the_person_is_not_the_earlier_steps_answer(session):
+    """REUSE's written answer is _reuse_message_is_user_answer AND
+    is_written_answer: the Helper's '@user ...' line passes the first (its
+    @user lets it through) but is not the Assistant's written work, so REUSE
+    finishes M on the send and the send stays M's."""
+    lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
+    log, send_at, call_id, _v = _greet_shape('helper_to_user')
+    _use(log)
+    assert _credited(log, index=send_at, call_id=call_id) is False
+
+
+def test_no_verdict_for_the_earlier_step_keeps_its_send(session):
+    """hartos-52: with no verifier message in M's window (a seat name lost, a
+    trimmed or resumed log), REUSE's judgment of M cannot be located, so the
+    rule fails closed: M keeps the send, even beside a written answer, and
+    late text can never hand it to N."""
+    lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
+    log, send_at, call_id, m_verdict = _greet_shape('written_answer')
+    del log[m_verdict]                        # M's verdict message is missing
+    _use(log)
+    assert _credited(log, index=send_at, call_id=call_id) is False
+
+
+def test_the_next_steps_own_answer_is_not_the_earlier_steps(session):
+    """hartos-52 point 1: the window ends at N's dispatch.  N's written answer
+    after it must not count as M's (M wrote none: the send is M's)."""
+    lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
+    log = [
+        _dispatch(1, GREET),                                              # 0
+        _call('c_g', SEND, {'text': GREETING, 'expects_reply': False}),   # 1
+        _result('c_g', _sent()),                                          # 2
+        _verdict(1),                                                      # 3
+        _dispatch(2, TEXT_2),                                             # 4
+        {'role': 'assistant', 'name': 'Assistant',
+         'content': 'Here is the email draft you asked for, Priya. ' + DRAFT},  # 5
+        _verdict(2),                                                      # 6
+    ]
+    _use(log)
+    assert _credited(log, index=2, call_id='c_g') is False
+
+
+def test_a_send_before_the_next_step_is_posted_stays_with_the_earlier_step(session):
+    """hartos-52 point 2: N not dispatched yet, so there is no window end;
+    the rule fails closed (no slice, no error) and M keeps its send, even with
+    a written answer."""
+    lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
+    log, send_at, call_id, m_verdict = _greet_shape('written_answer')
+    log = log[:m_verdict + 1]                 # nothing after M's verdict yet
+    _use(log)
+    assert _credited(log, index=send_at, call_id=call_id) is False
+
+
+def test_without_reuses_reader_a_no_tool_step_keeps_its_send(session):
+    """A caller that passes no reader (anything but REUSE's three) credits a
+    no-tool M nothing, even with a written answer: the parent's behaviour."""
+    lh.register_ledger_for_session(UP, _Ledger({1: GREET, 2: TEXT_2, 3: TEXT_3}))
+    log = [
+        _dispatch(1, GREET),
+        {'role': 'assistant', 'name': 'Assistant',
+         'content': 'Hello Priya, it is lovely to meet you. Welcome aboard, '
+                    'I will help you write your email today.'},
+        _call('c_draft', SEND, {'text': DRAFT, 'expects_reply': False}),
+        _result('c_draft', _sent()),
+        _verdict(1),
+        _dispatch(2, TEXT_2),
+        _verdict(2),
+    ]
+    _use(log)
+    body = log[3]['tool_responses'][0]['content']
+    assert lh.credited_early_send(UP, log, 3, 'c_draft', body, 2, request_id=TURN,
+                                  is_ask_step=lambda a: False) is False
 
 
 def test_an_earlier_ask_step_keeps_its_send(session):
