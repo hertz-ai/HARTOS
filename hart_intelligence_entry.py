@@ -8666,12 +8666,14 @@ def _autonomous_creation_status(user_id, prompt_id, auto_response, note):
     call this.
 
     A run that saved or held a plan goes to 'Review Mode', as before.  A run
-    that saved nothing answers the failed-turn sentence (is_user_facing_error).
-    It stays in 'Creation Mode' and sets no review flag, so its next turn plans
-    again.  Review of 38c753ea, F2: the sites put such a turn in review and
-    answered Agent_status='Review Mode' beside "nothing was built"."""
-    from core.agent_tools import is_user_facing_error
-    if is_user_facing_error(auto_response):
+    that saved nothing answers the failed-turn sentence (is_user_facing_error)
+    or, when its writer was held for another turn, the hold
+    (is_held_for_another_turn).  It stays in 'Creation Mode' and sets no
+    review flag, so its next turn plans again.  Review of 38c753ea, F2: the
+    sites put such a turn in review and answered Agent_status='Review Mode'
+    beside "nothing was built"."""
+    from core.agent_tools import is_held_for_another_turn, is_user_facing_error
+    if is_user_facing_error(auto_response) or is_held_for_another_turn(auto_response):
         _record_lifecycle('Creation Mode', user_id, prompt_id,
                           f'{note}: {NOTHING_BUILT_RE_PLAN}')
         return 'Creation Mode'
@@ -9248,7 +9250,8 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
     # We keep the loop but cap at fewer iterations now that plan-first
     # mode is primary; this only fires when an LLM ignores the new
     # PLAN_FIRST instructions (e.g. older Qwen variants).
-    from core.agent_tools import is_user_facing_error, user_facing_error
+    from core.agent_tools import (is_held_for_another_turn, is_user_facing_error,
+                                  user_facing_error)
     max_iterations = 5
     iteration = 0
     while iteration < max_iterations:
@@ -9288,6 +9291,13 @@ def _autonomous_gather_info(user_id, description, prompt_id, background=False,
         except (json.JSONDecodeError, AttributeError, Exception) as e:
             app.logger.debug(f'Autonomous gather iteration {iteration}: {e}')
 
+        # A writer held for another turn on a different model (its
+        # helper.group_turn) did not run: the hold is the answer, which the
+        # hive worker defers and the daemon keeps with no strike.
+        if is_held_for_another_turn(response):
+            app.logger.info(f'Autonomous gather_info for {prompt_id}: held for '
+                            f'another turn of its writer; nothing saved')
+            return response
         # A failed model answer is not asked again in this turn: 'proceed'
         # only spends another call on a model that just refused (central
         # 2026-11-20, goal 5ba50f98: five more 429s in 8 s).

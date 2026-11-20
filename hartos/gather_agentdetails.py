@@ -208,6 +208,9 @@ def plan_writer_tools(goal_tags=()) -> str:
 
 # Store user-specific agents & their chat history
 user_agents: Dict[str, Tuple[Any, Any]] = {}
+#: The writer's group for helper.group_turn, beside create_recipe's 'create'
+#: and reuse_recipe's 'reuse' groups.
+_GATHER_GROUP = 'gather'
 
 AGENT_CREATOR_SYSTEM_MESSAGE = """You are a custom agent bot creator. Your task is to interact with the user to gather all the necessary details to create an agent. Once you have collected all the required information, you will generate a complete agent configuration.
         Your role is to assist in a co-creative manner. You should actively suggest actions or improvements, but always confirm with the user before implementing them. Ensure that any actions or suggestions are realistic, humanly possible & ethical. Avoid proposing anything beyond practical feasibility, such as tasks like taking the user to the moon. Your primary goal is to enhance collaboration while adhering to these boundaries.
@@ -404,21 +407,45 @@ def _history_lengths(agent) -> dict:
             for peer, history in (getattr(agent, 'chat_messages', None) or {}).items()}
 
 
-def _take_back_history(agent, lengths) -> None:
+def _take_back_history(agent, lengths, keep=None) -> None:
     """Cut each of ``agent``'s histories back to ``lengths``
-    (_history_lengths).  A history begun after them is emptied."""
+    (_history_lengths).  A history begun after them is emptied.  ``keep``,
+    the message a failed send carried, stays where that send put it, once
+    and unanswered; only what came after it is taken back."""
     for peer, history in (getattr(agent, 'chat_messages', None) or {}).items():
-        del history[lengths.get(peer, 0):]
+        base = lengths.get(peer, 0)
+        if keep is not None and len(history) > base and history[base].get('content') == keep:
+            base += 1
+        del history[base:]
+
+
+def _drop_unanswered(agent, message, role) -> None:
+    """Take ``message`` off the end of ``agent``'s histories where a failed
+    send left it unanswered (its last entry, in ``role``), so the send about
+    to carry it again puts it back once."""
+    for history in (getattr(agent, 'chat_messages', None) or {}).values():
+        if (history and history[-1].get('role') == role
+                and history[-1].get('content') == message):
+            history.pop()
 
 
 def get_agent_response(assistant: autogen.AssistantAgent, user_proxy: autogen.UserProxyAgent, message: str) -> str:
     """Get a single response from the agent for the given message.
 
-    A send whose model call fails leaves both histories as they were, so the
-    cached writer keeps its task and its conversation, and the retry carries
-    one copy of its message.  Review of 30fb3b75 / 38c753ea, F1 (measured):
-    4 failed gathers left 4 copies of the prompt in the writer's history."""
-    _held = [(agent, _history_lengths(agent)) for agent in (user_proxy, assistant)]
+    A send whose model call fails keeps the message it carried, once and
+    unanswered, and takes back everything after it.  Sending that message
+    again does not add a second copy.  The writer keeps its task and the
+    person's request (a person's writer holds it only in its history), and
+    a retry carries one copy.  Review of 38c753ea, F1, measured: 4 failed
+    gathers left 4 copies of the prompt.  Review of 86e5185d, F1, measured:
+    taken back whole, a person's request was gone when they typed "try
+    again".  A failed "proper format" re-ask is taken back whole (F3)."""
+    # autogen keeps a sent message in the sender's history as 'assistant'
+    # and in the receiver's as 'user'.
+    _sides = ((user_proxy, 'assistant'), (assistant, 'user'))
+    for agent, role in _sides:
+        _drop_unanswered(agent, message, role)
+    _held = [(agent, _history_lengths(agent)) for agent, _role in _sides]
     try:
         # # Get the current chat history
         # current_chat = user_proxy.chat_messages.get(assistant.name, [])
@@ -441,6 +468,7 @@ def get_agent_response(assistant: autogen.AssistantAgent, user_proxy: autogen.Us
         
         key = list(user_proxy.chat_messages.keys())[0]
         response = user_proxy.chat_messages[key][-1]['content']
+        _asked = [(agent, _history_lengths(agent)) for agent, _role in _sides]
         try:
             new_res = retrieve_json(response)
             if new_res['status'].lower() == 'completed':
@@ -453,13 +481,17 @@ def get_agent_response(assistant: autogen.AssistantAgent, user_proxy: autogen.Us
                     key = list(user_proxy.chat_messages.keys())[0]
                     response = user_proxy.chat_messages[key][-1]['content']
         except Exception:
-            pass
+            # The reply stands as it came.  A re-ask whose send failed is
+            # taken back whole: it was this function's own message, not the
+            # person's (review of 86e5185d, F3: both histories went 4 to 7).
+            for agent, lengths in _asked:
+                _take_back_history(agent, lengths)
         
         return response
 
     except Exception as e:
         for agent, lengths in _held:
-            _take_back_history(agent, lengths)
+            _take_back_history(agent, lengths, keep=message)
         # #716: reply gets SPOKEN by TTS - never surface raw internals
         from core.agent_tools import user_facing_error
         return user_facing_error(e)
@@ -511,23 +543,26 @@ def gather_info(user_id, user_message, prompt_id, autonomous=False, goal_tags=()
                 goal_tags=goal_tags,
             )
 
-        else:
-            # A cached writer runs on THIS turn's model, the way CREATE's and
-            # REUSE's cached agents do (#172).  Built on an earlier turn, it
-            # kept that turn's model: 4 failed gathers for
-            # system_daemon_89682852097 stayed on ['local'] with attempts 3
-            # and 4 on the expert (review of 38c753ea, F1, measured).  Kept,
-            # not rebuilt, so the writer keeps its task and the person's
-            # conversation (review of 30fb3b75).
-            from core.autogen_config import get_autogen_config_list
-            from hartos.helper import bind_agents_to_turn_model
-            bind_agents_to_turn_model(user_agents[user_prompt],
-                                      get_autogen_config_list(), user_prompt, 'gather')
+        # The writer is picked up the one way a turn picks up a cached group
+        # (helper.group_turn): it runs on THIS turn's model, and a turn whose
+        # model differs from a running turn's is held, not switched under it
+        # (#172; create_recipe does the same for its group).  Built on an
+        # earlier turn, it kept that turn's model: 4 failed gathers for
+        # system_daemon_89682852097 stayed on ['local'] with attempts 3 and 4
+        # on the expert (review of 38c753ea, F1, measured).  Kept, not
+        # rebuilt, so it keeps its task and the person's conversation (review
+        # of 30fb3b75).
+        from core.autogen_config import get_autogen_config_list
+        from hartos.helper import group_turn
+        with group_turn(user_agents[user_prompt], get_autogen_config_list(),
+                        user_prompt, _GATHER_GROUP) as may_run:
+            if not may_run:
+                from core.agent_tools import held_for_another_turn_reply
+                return held_for_another_turn_reply()
+            assistant, user_proxy = user_agents[user_prompt]
 
-        assistant, user_proxy = user_agents[user_prompt]
-
-        # Get response from the agent
-        response = get_agent_response(assistant, user_proxy, user_message)
+            # Get response from the agent
+            response = get_agent_response(assistant, user_proxy, user_message)
 
         # Get chat history length for debugging
         # history_length = len(user_proxy.chat_messages.get(assistant.name, []))
